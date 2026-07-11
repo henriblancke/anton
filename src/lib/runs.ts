@@ -63,6 +63,43 @@ export async function listRuns(projectId: string): Promise<RunSummary[]> {
   return rows.map(toSummary);
 }
 
+/** A single run's summary for the read path (UI/API). Scoped to the project to avoid id leaks. */
+export async function getRunSummary(
+  projectId: string,
+  runId: string,
+): Promise<RunSummary | undefined> {
+  const rows = await getDb()
+    .select()
+    .from(schema.runs)
+    .where(and(eq(schema.runs.projectId, projectId), eq(schema.runs.id, runId)))
+    .limit(1);
+  return rows[0] ? toSummary(rows[0]) : undefined;
+}
+
+/** Full run summary including its lease/error/attempts, for the run meta grid. */
+export interface RunDetail extends RunSummary {
+  leaseExpiresAt?: number;
+  error?: string;
+}
+
+export async function getRunDetail(
+  projectId: string,
+  runId: string,
+): Promise<RunDetail | undefined> {
+  const rows = await getDb()
+    .select()
+    .from(schema.runs)
+    .where(and(eq(schema.runs.projectId, projectId), eq(schema.runs.id, runId)))
+    .limit(1);
+  const row = rows[0];
+  if (!row) return undefined;
+  return {
+    ...toSummary(row),
+    leaseExpiresAt: toEpoch(row.leaseExpiresAt),
+    error: row.error ?? undefined,
+  };
+}
+
 // ── Write path (anton-dzh.5): db-injectable so the runner/tests share one connection ──
 
 export interface CreateRunInput {
