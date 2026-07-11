@@ -15,10 +15,13 @@ export interface Bead {
   issue_type?: string; // epic | task | bug | ...
   description?: string;
   acceptance?: string;
+  acceptance_criteria?: string; // the field bd show/dep return
   context?: string;
   labels?: string[];
   external_ref?: string;
   priority?: number;
+  parent_id?: string;
+  dependency_type?: string; // set on beads returned by `bd dep list`
   [k: string]: unknown;
 }
 
@@ -65,6 +68,10 @@ export const beads = {
   children: (cwd: string, epicId: string) =>
     bd(cwd, ["children", epicId, "--json"]).then(asArray<Bead>),
 
+  /** Beads this one links to, each carrying its `dependency_type` (for the graph). */
+  depList: (cwd: string, id: string) =>
+    bd(cwd, ["dep", "list", id, "--json"]).then(asArray<Bead>),
+
   /** Create a bead; returns its id (bd prints the id on the last line). */
   async create(
     cwd: string,
@@ -105,6 +112,9 @@ export const beads = {
 
   note: (cwd: string, id: string, text: string) => bd(cwd, ["note", id, text]),
   close: (cwd: string, id: string) => bd(cwd, ["close", id]),
+  reopen: (cwd: string, id: string) => bd(cwd, ["reopen", id]),
+  setStatus: (cwd: string, id: string, status: string) =>
+    bd(cwd, ["update", id, "--status", status]),
 
   // ── convenience: anton's stage/approval semantics, all in beads ──
   approve: (cwd: string, epicId: string) => beads.tag(cwd, epicId, [LABELS.approved]),

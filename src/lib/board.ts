@@ -30,7 +30,7 @@ function parseSection(description: string | undefined, name: string): string | u
 }
 const parseGoal = (d: string | undefined) => parseSection(d, "Goal");
 const parseAcceptance = (bead: Bead) =>
-  parseSection(bead.description, "Acceptance") ?? bead.acceptance;
+  parseSection(bead.description, "Acceptance") ?? bead.acceptance_criteria ?? bead.acceptance;
 
 function labelValue(labels: string[] | undefined, prefix: string): string | undefined {
   const label = labels?.find((l) => l.startsWith(`${prefix}:`));

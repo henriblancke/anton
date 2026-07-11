@@ -44,3 +44,40 @@ export interface Board {
   /** Epics grouped by stage. Orphan tickets are wrapped as single-ticket epics. */
   columns: Record<Stage, Epic[]>;
 }
+
+// ── Tickets page ──
+export interface TicketRow extends Ticket {
+  type: string; // bead issue_type
+  domain?: string;
+  epicId?: string;
+  epicTitle?: string;
+}
+export interface TicketFilters {
+  agent?: string;
+  risk?: string;
+  size?: string;
+  domain?: string;
+  status?: string;
+  type?: string;
+  epic?: string;
+  q?: string; // free-text over title
+}
+
+// ── Board drag-and-drop ──
+export interface MoveRequest {
+  toStage: Stage;
+}
+
+// ── Epic detail + dependency graph ──
+export type DepType = "parent-child" | "blocks" | "related" | "discovered-from";
+export interface DepEdge {
+  from: string;
+  to: string;
+  type: DepType;
+}
+export interface EpicDetail {
+  epic: Epic;
+  description?: string; // the full bead description (markdown)
+  tickets: Ticket[];
+  edges: DepEdge[]; // among the epic + its tickets
+}
