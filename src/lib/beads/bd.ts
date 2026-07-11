@@ -20,9 +20,17 @@ export interface Bead {
   labels?: string[];
   external_ref?: string;
   priority?: number;
+  parent?: string; // parent epic id (present in `bd list --json` for structured boards)
   parent_id?: string;
+  dependencies?: BeadDep[]; // edges carried inline by `bd list --json`
   dependency_type?: string; // set on beads returned by `bd dep list`
   [k: string]: unknown;
+}
+
+export interface BeadDep {
+  issue_id: string; // the dependent
+  depends_on_id: string; // what it depends on / is a child of
+  type: string; // parent-child | blocks | related | discovered-from
 }
 
 export const LABELS = {
@@ -53,7 +61,11 @@ export const beads = {
   /** Truly claimable work (excludes in_progress/blocked/deferred). */
   ready: (cwd: string) => bd(cwd, ["ready", "--json"]).then(asArray<Bead>),
 
-  /** All open issues, optionally filtered (e.g. `["--label", "approved"]`). */
+  /**
+   * ONE call for the whole board: `bd list --json` carries each issue's `parent` and inline
+   * `dependencies`, so grouping + edges are derived in-process — no per-epic/per-ticket spawns.
+   * Reads the Dolt working set (reliable), unlike the JSONL export which lags uncommitted writes.
+   */
   list: (cwd: string, extra: string[] = []) =>
     bd(cwd, ["list", "--json", ...extra]).then(asArray<Bead>),
 
@@ -64,13 +76,18 @@ export const beads = {
     return parsed.issue ?? parsed;
   },
 
-  /** Child beads of an epic. */
-  children: (cwd: string, epicId: string) =>
-    bd(cwd, ["children", epicId, "--json"]).then(asArray<Bead>),
-
-  /** Beads this one links to, each carrying its `dependency_type` (for the graph). */
-  depList: (cwd: string, id: string) =>
-    bd(cwd, ["dep", "list", id, "--json"]).then(asArray<Bead>),
+  /** All parent-child + blocks + related edges among the given beads, from inline `dependencies`. */
+  edgesOf(beads: Bead[]): Array<{ from: string; to: string; type: string }> {
+    const out: Array<{ from: string; to: string; type: string }> = [];
+    for (const b of beads) {
+      for (const d of b.dependencies ?? []) {
+        if (d?.issue_id && d?.depends_on_id && d?.type) {
+          out.push({ from: d.issue_id, to: d.depends_on_id, type: d.type });
+        }
+      }
+    }
+    return out;
+  },
 
   /** Create a bead; returns its id (bd prints the id on the last line). */
   async create(

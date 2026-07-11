@@ -87,18 +87,12 @@ export async function getBoard(project: Project): Promise<Board> {
   const epicBeads = allBeads.filter((b) => beads.isEpic(b));
   const taskBeads = allBeads.filter((b) => !beads.isEpic(b));
 
+  // Group tickets under epics from the inline `parent` field — no per-epic bd calls.
   const childrenByEpic = new Map<string, Bead[]>();
-  for (const epic of epicBeads) {
-    let children: Bead[] = [];
-    try {
-      children = await beads.children(project.repoPath, epic.id);
-    } catch {
-      children = taskBeads.filter((t) => t.parent === epic.id || t.parent_id === epic.id);
-    }
-    if (children.length === 0) {
-      children = taskBeads.filter((t) => t.parent === epic.id || t.parent_id === epic.id);
-    }
-    childrenByEpic.set(epic.id, children);
+  for (const epic of epicBeads) childrenByEpic.set(epic.id, []);
+  for (const task of taskBeads) {
+    const parent = (task.parent ?? task.parent_id) as string | undefined;
+    if (parent && childrenByEpic.has(parent)) childrenByEpic.get(parent)!.push(task);
   }
 
   const claimedTaskIds = new Set<string>();

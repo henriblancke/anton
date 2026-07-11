@@ -88,18 +88,13 @@ export async function getTickets(project: Project, filters: TicketFilters): Prom
   const epicBeads = allBeads.filter((b) => beads.isEpic(b));
   const workBeads = allBeads.filter((b) => !beads.isEpic(b));
 
+  // Resolve each ticket's epic from its inline `parent` field — no per-epic bd calls.
+  const epicById = new Map(epicBeads.map((e) => [e.id, e]));
   const epicByTicketId = new Map<string, Bead>();
-  for (const epic of epicBeads) {
-    let children: Bead[] = [];
-    try {
-      children = await beads.children(project.repoPath, epic.id);
-    } catch {
-      children = workBeads.filter((t) => t.parent_id === epic.id);
-    }
-    if (children.length === 0) {
-      children = workBeads.filter((t) => t.parent_id === epic.id);
-    }
-    for (const child of children) epicByTicketId.set(child.id, epic);
+  for (const t of workBeads) {
+    const parent = (t.parent ?? t.parent_id) as string | undefined;
+    const epic = parent ? epicById.get(parent) : undefined;
+    if (epic) epicByTicketId.set(t.id, epic);
   }
 
   const rows = workBeads.map((bead) => toTicketRow(bead, epicByTicketId.get(bead.id)));

@@ -3,7 +3,6 @@ import type { Bead } from "./beads/bd";
 import type { Project } from "./types";
 
 const listMock = vi.fn();
-const childrenMock = vi.fn();
 
 vi.mock("./beads/bd", async () => {
   const actual = await vi.importActual<typeof import("./beads/bd")>("./beads/bd");
@@ -12,7 +11,6 @@ vi.mock("./beads/bd", async () => {
     beads: {
       ...actual.beads,
       list: (...args: unknown[]) => listMock(...args),
-      children: (...args: unknown[]) => childrenMock(...args),
     },
   };
 });
@@ -98,6 +96,7 @@ describe("getBoard", () => {
       id: "ticket-1",
       title: "Ticket One",
       status: "in_progress",
+      parent: "epic-1",
       labels: ["agent:nextjs", "risk:high", "size:S"],
       acceptance: "Works.",
     });
@@ -105,6 +104,7 @@ describe("getBoard", () => {
       id: "ticket-2",
       title: "Ticket Two",
       status: "closed",
+      parent: "epic-2",
       external_ref: "gh-42",
     });
     const orphan = makeBead({
@@ -115,11 +115,6 @@ describe("getBoard", () => {
     });
 
     listMock.mockResolvedValue([epic1, epic2, ticket1, ticket2, orphan]);
-    childrenMock.mockImplementation(async (_cwd: string, epicId: string) => {
-      if (epicId === "epic-1") return [ticket1];
-      if (epicId === "epic-2") return [ticket2];
-      return [];
-    });
 
     const board = await getBoard(project);
 
@@ -169,7 +164,6 @@ describe("getBoard", () => {
       if (extra.includes("closed")) return [closedEpic];
       return [openEpic];
     });
-    childrenMock.mockResolvedValue([]);
 
     const board = await getBoard(project);
 
