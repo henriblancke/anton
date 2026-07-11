@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { getDb, schema } from "./db";
+import type { AntonDb } from "./jobs/queue";
 import type { Project } from "./types";
 
 const execFileAsync = promisify(execFile);
@@ -73,6 +74,35 @@ export async function getProjectBySlug(slug: string): Promise<Project | null> {
     .where(eq(schema.projects.slug, slug))
     .limit(1);
   return rows[0] ? toProject(rows[0]) : null;
+}
+
+/** db-injectable lookup by id (the runner/handler shares its connection). */
+export async function getProjectById(db: AntonDb, id: string): Promise<Project | null> {
+  const rows = await db.select().from(schema.projects).where(eq(schema.projects.id, id)).limit(1);
+  return rows[0] ? toProject(rows[0]) : null;
+}
+
+/** Parsed project settings (settingsJson). All optional; sensible defaults applied by callers. */
+export interface ProjectSettings {
+  model?: string;
+  testCommand?: string;
+  permissionMode?: "default" | "acceptEdits" | "bypassPermissions" | "plan";
+  baseBranch?: string;
+}
+
+export async function getProjectSettings(db: AntonDb, id: string): Promise<ProjectSettings> {
+  const p = await getProjectById(db, id);
+  if (!p) return {};
+  const rows = await db
+    .select({ settingsJson: schema.projects.settingsJson })
+    .from(schema.projects)
+    .where(eq(schema.projects.id, id))
+    .limit(1);
+  try {
+    return rows[0] ? (JSON.parse(rows[0].settingsJson) as ProjectSettings) : {};
+  } catch {
+    return {};
+  }
 }
 
 export async function addProject(input: { name?: string; repoPath: string }): Promise<Project> {

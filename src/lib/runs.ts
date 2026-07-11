@@ -2,10 +2,19 @@
  * Read-only access to the machine-local `runs` table. Runs are execution plumbing (worktree,
  * lease, model, agent); stage/PR live in beads. See DESIGN.md §3.
  */
-import { desc, eq } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import { getDb, schema } from "./db";
+import type { AntonDb, Clock } from "./jobs/queue";
 
 export type RunStatus = "queued" | "running" | "parked" | "done" | "failed";
+/** Statuses a run can be in while still resumable (not terminal). */
+const OPEN_RUN_STATUSES: RunStatus[] = ["queued", "running", "parked"];
+
+export type RunRow = typeof schema.runs.$inferSelect;
+
+function secDate(ms: number): Date {
+  return new Date(Math.floor(ms / 1000) * 1000);
+}
 
 export interface RunSummary {
   id: string;
@@ -52,4 +61,90 @@ export async function listRuns(projectId: string): Promise<RunSummary[]> {
     .where(eq(schema.runs.projectId, projectId))
     .orderBy(desc(schema.runs.updatedAt));
   return rows.map(toSummary);
+}
+
+// ── Write path (anton-dzh.5): db-injectable so the runner/tests share one connection ──
+
+export interface CreateRunInput {
+  id: string;
+  projectId: string;
+  epicBeadId: string;
+  ticketBeadId?: string;
+  worktreePath?: string;
+  branch?: string;
+  model?: string;
+  agentTag?: string;
+  status?: RunStatus;
+}
+
+/** Record a run at the start of execution (status defaults to `running`, startedAt = now). */
+export async function createRun(db: AntonDb, clock: Clock, input: CreateRunInput): Promise<string> {
+  const nowMs = clock.now();
+  await db.insert(schema.runs).values({
+    id: input.id,
+    projectId: input.projectId,
+    epicBeadId: input.epicBeadId,
+    ticketBeadId: input.ticketBeadId,
+    worktreePath: input.worktreePath,
+    branch: input.branch,
+    model: input.model,
+    agentTag: input.agentTag,
+    status: input.status ?? "running",
+    startedAt: secDate(nowMs),
+    updatedAt: secDate(nowMs),
+  });
+  return input.id;
+}
+
+export type RunPatch = Partial<{
+  status: RunStatus;
+  ticketBeadId: string | null;
+  worktreePath: string | null;
+  branch: string | null;
+  model: string | null;
+  agentTag: string | null;
+  attempts: number;
+  error: string | null;
+  endedAt: number; // ms; converted to seconds
+}>;
+
+/** Patch a run row (touches updatedAt). Pass endedAt (ms) to close it out. */
+export async function updateRun(
+  db: AntonDb,
+  clock: Clock,
+  id: string,
+  patch: RunPatch,
+): Promise<void> {
+  const set: Record<string, unknown> = { updatedAt: secDate(clock.now()) };
+  for (const [k, v] of Object.entries(patch)) {
+    if (k === "endedAt" && typeof v === "number") set.endedAt = secDate(v);
+    else set[k] = v;
+  }
+  await db.update(schema.runs).set(set).where(eq(schema.runs.id, id));
+}
+
+export async function getRunById(db: AntonDb, id: string): Promise<RunRow | undefined> {
+  const rows = await db.select().from(schema.runs).where(eq(schema.runs.id, id)).limit(1);
+  return rows[0];
+}
+
+/** The most-recent still-open run for an epic — used to resume rather than start a duplicate. */
+export async function findOpenRunForEpic(
+  db: AntonDb,
+  projectId: string,
+  epicBeadId: string,
+): Promise<RunRow | undefined> {
+  const rows = await db
+    .select()
+    .from(schema.runs)
+    .where(
+      and(
+        eq(schema.runs.projectId, projectId),
+        eq(schema.runs.epicBeadId, epicBeadId),
+        inArray(schema.runs.status, OPEN_RUN_STATUSES),
+      ),
+    )
+    .orderBy(desc(schema.runs.updatedAt))
+    .limit(1);
+  return rows[0];
 }
