@@ -1,6 +1,6 @@
 import { notFound } from "next/navigation";
 
-import { getProjectBySlug } from "@/lib/projects";
+import { getProjectBySlug, getProjectSettingsBySlug } from "@/lib/projects";
 import { SettingsView } from "@/components/settings/settings-view";
 
 export const dynamic = "force-dynamic";
@@ -14,5 +14,7 @@ export default async function ProjectSettingsPage({
   const project = await getProjectBySlug(slug);
   if (!project) notFound();
 
-  return <SettingsView project={project} />;
+  const settings = await getProjectSettingsBySlug(slug);
+
+  return <SettingsView project={project} settings={settings} />;
 }

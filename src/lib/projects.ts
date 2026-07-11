@@ -91,8 +91,6 @@ export interface ProjectSettings {
 }
 
 export async function getProjectSettings(db: AntonDb, id: string): Promise<ProjectSettings> {
-  const p = await getProjectById(db, id);
-  if (!p) return {};
   const rows = await db
     .select({ settingsJson: schema.projects.settingsJson })
     .from(schema.projects)
@@ -103,6 +101,35 @@ export async function getProjectSettings(db: AntonDb, id: string): Promise<Proje
   } catch {
     return {};
   }
+}
+
+/** Read this project's settings via the shared anton.db (UI/API read path). */
+export async function getProjectSettingsBySlug(slug: string): Promise<ProjectSettings> {
+  const p = await getProjectBySlug(slug);
+  if (!p) return {};
+  return getProjectSettings(getDb(), p.id);
+}
+
+/** Merge a settings patch into the project's settingsJson. Returns the merged settings. */
+export async function updateProjectSettings(
+  slug: string,
+  patch: Partial<ProjectSettings>,
+): Promise<ProjectSettings> {
+  const db = getDb();
+  const p = await getProjectBySlug(slug);
+  if (!p) throw new Error(`Project not found: ${slug}`);
+  const current = await getProjectSettings(db, p.id);
+  // Drop keys explicitly set to undefined so "Default" clears rather than persists.
+  const next: ProjectSettings = { ...current };
+  for (const [k, v] of Object.entries(patch)) {
+    if (v === undefined || v === "") delete (next as Record<string, unknown>)[k];
+    else (next as Record<string, unknown>)[k] = v;
+  }
+  await db
+    .update(schema.projects)
+    .set({ settingsJson: JSON.stringify(next) })
+    .where(eq(schema.projects.id, p.id));
+  return next;
 }
 
 export async function addProject(input: { name?: string; repoPath: string }): Promise<Project> {
