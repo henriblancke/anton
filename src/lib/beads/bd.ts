@@ -54,8 +54,12 @@ export const beads = {
   list: (cwd: string, extra: string[] = []) =>
     bd(cwd, ["list", "--json", ...extra]).then(asArray<Bead>),
 
-  show: async (cwd: string, id: string): Promise<Bead> =>
-    JSON.parse(await bd(cwd, ["show", id, "--json"])),
+  show: async (cwd: string, id: string): Promise<Bead> => {
+    // `bd show --json` returns an array (one or more issues), not an object.
+    const parsed = JSON.parse(await bd(cwd, ["show", id, "--json"]));
+    if (Array.isArray(parsed)) return parsed[0];
+    return parsed.issue ?? parsed;
+  },
 
   /** Child beads of an epic. */
   children: (cwd: string, epicId: string) =>
@@ -78,15 +82,19 @@ export const beads = {
     if (opts.context) args.push("--context", opts.context);
     if (opts.deps?.length) args.push("--deps", opts.deps.join(","));
     if (opts.description) args.push("--description", opts.description);
+    args.push("--json"); // plain output appends tips/status lines after the id; JSON is clean
     const out = await bd(cwd, args);
-    const id = out.trim().split("\n").pop()?.trim();
-    if (!id) throw new Error("bd create: could not parse bead id from output");
-    return id;
+    const parsed = JSON.parse(out);
+    const bead = Array.isArray(parsed) ? parsed[0] : parsed;
+    if (!bead?.id) throw new Error("bd create: could not parse bead id from output");
+    return bead.id as string;
   },
 
-  tag: (cwd: string, id: string, labels: string[]) => bd(cwd, ["tag", id, ...labels]),
+  // `bd tag` takes a single label; use the repeatable --add-label/--remove-label instead.
+  tag: (cwd: string, id: string, labels: string[]) =>
+    bd(cwd, ["update", id, ...labels.flatMap((l) => ["--add-label", l])]),
   untag: (cwd: string, id: string, labels: string[]) =>
-    bd(cwd, ["label", "remove", id, ...labels]),
+    bd(cwd, ["update", id, ...labels.flatMap((l) => ["--remove-label", l])]),
 
   link: (cwd: string, a: string, b: string, type: string) =>
     bd(cwd, ["link", a, b, "--type", type]),
