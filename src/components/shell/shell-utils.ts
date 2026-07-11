@@ -24,3 +24,29 @@ export function isNavItemActive(pathname: string | null | undefined, item: Shell
   if (item.href === "/") return false;
   return pathname.startsWith(`${item.href}/`);
 }
+
+/** Human page label for the topbar breadcrumb's trailing segment, derived from the route
+ * under `/projects/[slug]`. Returns undefined for the workspace root. */
+export function pageLabelFromPath(pathname: string | null | undefined): string | undefined {
+  if (!pathname) return undefined;
+  const rest = /^\/projects\/[^/]+(\/.*)?$/.exec(pathname)?.[1];
+  if (rest === undefined) return undefined; // not a project route
+  if (rest === "" || rest === undefined) return "Board";
+  const seg = rest.replace(/^\//, "").split("/")[0];
+  switch (seg) {
+    case "tickets":
+      return "Tickets";
+    case "epics":
+      return "Epic";
+    case "runs":
+      return "Runs";
+    case "settings":
+      return "Settings";
+    case "dependencies":
+      return "Dependencies";
+    case "shape":
+      return "Add work";
+    default:
+      return "Board";
+  }
+}

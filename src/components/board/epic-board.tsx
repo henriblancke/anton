@@ -131,7 +131,7 @@ export function EpicBoard({ slug }: { slug: string }) {
       onDragEnd={handleDragEnd}
       onDragCancel={() => setActiveId(null)}
     >
-      <div className="grid flex-1 grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+      <div className="grid flex-1 grid-cols-1 gap-3.5 sm:grid-cols-2 xl:grid-cols-4">
         {STAGES.map((stage) => (
           <BoardColumn key={stage} stage={stage} epics={board.columns[stage] ?? []} slug={slug} />
         ))}

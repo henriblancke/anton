@@ -35,6 +35,9 @@ export interface Epic {
   acceptance?: string;
   approved: boolean; // has the `approved` label
   stage: Stage;
+  agent?: string; // from an agent:<x> label on the epic bead
+  risk?: string; // from risk:<x>
+  size?: string; // from size:<x>
   prRef?: string;
   tickets: Ticket[];
 }

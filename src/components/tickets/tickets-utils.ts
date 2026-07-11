@@ -63,6 +63,11 @@ export function hasActiveFilters(filters: TicketFilters): boolean {
   return TICKET_FILTER_KEYS.some((key) => Boolean(filters[key]?.trim()));
 }
 
+/** How many filters are currently active (for the "N filters" footer count). */
+export function countActiveFilters(filters: TicketFilters): number {
+  return TICKET_FILTER_KEYS.filter((key) => Boolean(filters[key]?.trim())).length;
+}
+
 export interface EpicOption {
   id: string;
   title: string;

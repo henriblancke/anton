@@ -7,9 +7,10 @@
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-sans);
-  --font-mono: var(--font-geist-mono);
-  --font-heading: var(--font-sans);
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-heading: var(--font-space-grotesk), ui-sans-serif, system-ui, sans-serif;
+  --font-display: var(--font-space-grotesk), ui-sans-serif, system-ui, sans-serif;
   --color-sidebar-ring: var(--sidebar-ring);
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
@@ -39,6 +40,25 @@
   --color-popover: var(--popover);
   --color-card-foreground: var(--card-foreground);
   --color-card: var(--card);
+
+  /* anton — semantic extensions (Atelier design system) */
+  --color-subtle: var(--subtle);
+  --color-raised: var(--raised);
+  --color-canvas: var(--canvas);
+  --color-stage-backlog: var(--stage-backlog);
+  --color-stage-implementing: var(--stage-implementing);
+  --color-stage-in-review: var(--stage-in-review);
+  --color-stage-done: var(--stage-done);
+  --color-risk-high: var(--risk-high);
+  --color-risk-med: var(--risk-med);
+  --color-blocked: var(--blocked);
+  --color-agent-fastapi: var(--agent-fastapi);
+  --color-agent-supabase: var(--agent-supabase);
+  --color-agent-pydantic: var(--agent-pydantic);
+  --color-agent-terraform: var(--agent-terraform);
+  --color-agent-docker: var(--agent-docker);
+  --color-agent-kubernetes: var(--agent-kubernetes);
+
   --radius-sm: calc(var(--radius) * 0.6);
   --radius-md: calc(var(--radius) * 0.8);
   --radius-lg: var(--radius);
@@ -48,83 +68,188 @@
   --radius-4xl: calc(var(--radius) * 2.6);
 }
 
+/* ── Light — warm-paper sibling ─────────────────────────────── */
 :root {
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.145 0 0);
-  --card: oklch(1 0 0);
-  --card-foreground: oklch(0.145 0 0);
-  --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.145 0 0);
-  --primary: oklch(0.205 0 0);
-  --primary-foreground: oklch(0.985 0 0);
-  --secondary: oklch(0.97 0 0);
-  --secondary-foreground: oklch(0.205 0 0);
-  --muted: oklch(0.97 0 0);
-  --muted-foreground: oklch(0.556 0 0);
-  --accent: oklch(0.97 0 0);
-  --accent-foreground: oklch(0.205 0 0);
-  --destructive: oklch(0.577 0.245 27.325);
-  --border: oklch(0.922 0 0);
-  --input: oklch(0.922 0 0);
-  --ring: oklch(0.708 0 0);
-  --chart-1: oklch(0.87 0 0);
-  --chart-2: oklch(0.556 0 0);
-  --chart-3: oklch(0.439 0 0);
-  --chart-4: oklch(0.371 0 0);
-  --chart-5: oklch(0.269 0 0);
+  --background: #f6f4ef;
+  --foreground: #1b1a16;
+  --canvas: #f6f4ef;
+  --card: #ffffff;
+  --card-foreground: #1b1a16;
+  --popover: #ffffff;
+  --popover-foreground: #1b1a16;
+  --primary: #6355e0;
+  --primary-foreground: #ffffff;
+  --secondary: #efece5;
+  --secondary-foreground: #1b1a16;
+  --muted: #efece5;
+  --muted-foreground: #6a675f;
+  --accent: #efece5;
+  --accent-foreground: #1b1a16;
+  --destructive: #d1483d;
+  --border: #e6e2da;
+  --input: #e6e2da;
+  --ring: #6355e0;
+
+  --raised: #efece5;
+  --subtle: #9a968d;
+  --stage-backlog: #8a8680;
+  --stage-implementing: #b7801f;
+  --stage-in-review: #2f7fd6;
+  --stage-done: #2c9d68;
+  --risk-high: #d1483d;
+  --risk-med: #b7801f;
+  --blocked: #c05070;
+  --agent-fastapi: #2f7fd6;
+  --agent-supabase: #2c9d68;
+  --agent-pydantic: #b7801f;
+  --agent-terraform: #c05070;
+  --agent-docker: #6a675f;
+  --agent-kubernetes: #6a675f;
+
+  --chart-1: #6355e0;
+  --chart-2: #2f7fd6;
+  --chart-3: #2c9d68;
+  --chart-4: #b7801f;
+  --chart-5: #c05070;
   --radius: 0.625rem;
-  --sidebar: oklch(0.985 0 0);
-  --sidebar-foreground: oklch(0.145 0 0);
-  --sidebar-primary: oklch(0.205 0 0);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.97 0 0);
-  --sidebar-accent-foreground: oklch(0.205 0 0);
-  --sidebar-border: oklch(0.922 0 0);
-  --sidebar-ring: oklch(0.708 0 0);
+
+  --sidebar: #f0ede7;
+  --sidebar-foreground: #1b1a16;
+  --sidebar-primary: #6355e0;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: color-mix(in oklch, var(--primary) 10%, transparent);
+  --sidebar-accent-foreground: #1b1a16;
+  --sidebar-border: #e6e2da;
+  --sidebar-ring: #6355e0;
 }
 
+/* ── Dark — warm-graphite default (dark-first) ──────────────── */
 .dark {
-  --background: oklch(0.145 0 0);
-  --foreground: oklch(0.985 0 0);
-  --card: oklch(0.205 0 0);
-  --card-foreground: oklch(0.985 0 0);
-  --popover: oklch(0.205 0 0);
-  --popover-foreground: oklch(0.985 0 0);
-  --primary: oklch(0.922 0 0);
-  --primary-foreground: oklch(0.205 0 0);
-  --secondary: oklch(0.269 0 0);
-  --secondary-foreground: oklch(0.985 0 0);
-  --muted: oklch(0.269 0 0);
-  --muted-foreground: oklch(0.708 0 0);
-  --accent: oklch(0.269 0 0);
-  --accent-foreground: oklch(0.985 0 0);
-  --destructive: oklch(0.704 0.191 22.216);
-  --border: oklch(1 0 0 / 10%);
-  --input: oklch(1 0 0 / 15%);
-  --ring: oklch(0.556 0 0);
-  --chart-1: oklch(0.87 0 0);
-  --chart-2: oklch(0.556 0 0);
-  --chart-3: oklch(0.439 0 0);
-  --chart-4: oklch(0.371 0 0);
-  --chart-5: oklch(0.269 0 0);
-  --sidebar: oklch(0.205 0 0);
-  --sidebar-foreground: oklch(0.985 0 0);
-  --sidebar-primary: oklch(0.488 0.243 264.376);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.269 0 0);
-  --sidebar-accent-foreground: oklch(0.985 0 0);
-  --sidebar-border: oklch(1 0 0 / 10%);
-  --sidebar-ring: oklch(0.556 0 0);
+  --background: #131210;
+  --foreground: #f3f0ea;
+  --canvas: #131210;
+  --card: #1c1a17;
+  --card-foreground: #f3f0ea;
+  --popover: #1c1a17;
+  --popover-foreground: #f3f0ea;
+  --primary: #8f82ff;
+  --primary-foreground: #0b0a09;
+  --secondary: #24221e;
+  --secondary-foreground: #f3f0ea;
+  --muted: #24221e;
+  --muted-foreground: #a5a199;
+  --accent: #24221e;
+  --accent-foreground: #f3f0ea;
+  --destructive: #f2685e;
+  --border: #2e2b27;
+  --input: #2e2b27;
+  --ring: #8f82ff;
+
+  --raised: #24221e;
+  --subtle: #726e66;
+  --stage-backlog: #8b8781;
+  --stage-implementing: #e6a94b;
+  --stage-in-review: #57a8f2;
+  --stage-done: #4fc08a;
+  --risk-high: #f2685e;
+  --risk-med: #e6a94b;
+  --blocked: #f26a86;
+  --agent-fastapi: #57a8f2;
+  --agent-supabase: #4fc08a;
+  --agent-pydantic: #e6a94b;
+  --agent-terraform: #f26a86;
+  --agent-docker: #8b8781;
+  --agent-kubernetes: #8b8781;
+
+  --chart-1: #8f82ff;
+  --chart-2: #57a8f2;
+  --chart-3: #4fc08a;
+  --chart-4: #e6a94b;
+  --chart-5: #f26a86;
+
+  --sidebar: #100f0e;
+  --sidebar-foreground: #f3f0ea;
+  --sidebar-primary: #8f82ff;
+  --sidebar-primary-foreground: #0b0a09;
+  --sidebar-accent: color-mix(in oklch, var(--primary) 14%, transparent);
+  --sidebar-accent-foreground: #f3f0ea;
+  --sidebar-border: #24221e;
+  --sidebar-ring: #8f82ff;
 }
 
 @layer base {
   * {
     @apply border-border outline-ring/50;
   }
+  html {
+    /* Explicit base family so body text resolves to Geist regardless of how Tailwind's
+     * `--font-sans` theme var is emitted (the `font-sans` utility maps to the same stack). */
+    font-family: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  }
   body {
     @apply bg-background text-foreground;
   }
-  html {
-    @apply font-sans;
+  code,
+  kbd,
+  samp,
+  pre {
+    font-family: var(--font-geist-mono), ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  ::selection {
+    background: color-mix(in oklch, var(--primary) 28%, transparent);
+  }
+}
+
+/* ── Motion — fast & subtle (from the design system) ────────── */
+@keyframes antonPulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+@keyframes antonShimmer {
+  0% {
+    background-position: -420px 0;
+  }
+  100% {
+    background-position: 420px 0;
+  }
+}
+@keyframes antonBlink {
+  0%,
+  49% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0;
+  }
+}
+
+.anton-pulse {
+  animation: antonPulse 1.6s ease-in-out infinite;
+}
+.anton-blink {
+  animation: antonBlink 1s step-end infinite;
+}
+.anton-shimmer {
+  background-image: linear-gradient(
+    90deg,
+    var(--raised) 25%,
+    var(--border) 37%,
+    var(--raised) 63%
+  );
+  background-size: 420px 100%;
+  animation: antonShimmer 1.4s infinite linear;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .anton-pulse,
+  .anton-blink,
+  .anton-shimmer {
+    animation: none;
   }
 }

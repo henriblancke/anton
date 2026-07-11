@@ -2,14 +2,12 @@
 
 import { useSyncExternalStore } from "react";
 import { useTheme } from "next-themes";
-import { MonitorIcon, MoonIcon, SunIcon } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 
 const OPTIONS = [
-  { value: "light", label: "Light", icon: SunIcon },
-  { value: "system", label: "System", icon: MonitorIcon },
-  { value: "dark", label: "Dark", icon: MoonIcon },
+  { value: "dark", label: "Dark" },
+  { value: "light", label: "Light" },
 ] as const;
 
 function noopSubscribe() {
@@ -26,33 +24,22 @@ function useHasMounted(): boolean {
   );
 }
 
-export function ThemeToggle({ collapsed = false }: { collapsed?: boolean }) {
-  const { theme, setTheme } = useTheme();
+export function ThemeToggle() {
+  const { resolvedTheme, setTheme } = useTheme();
   const mounted = useHasMounted();
 
   if (!mounted) {
-    return (
-      <div
-        className={cn(
-          "h-7 animate-pulse rounded-lg bg-muted",
-          collapsed ? "w-7" : "w-full",
-        )}
-        aria-hidden="true"
-      />
-    );
+    return <div className="h-8 w-full animate-pulse rounded-[10px] bg-muted" aria-hidden="true" />;
   }
 
   return (
     <div
       role="radiogroup"
       aria-label="Theme"
-      className={cn(
-        "flex items-center gap-0.5 rounded-lg border border-border bg-muted/40 p-0.5",
-        collapsed ? "flex-col" : "flex-row",
-      )}
+      className="flex items-center gap-0.5 rounded-[10px] border border-border bg-card p-0.5"
     >
-      {OPTIONS.map(({ value, label, icon: Icon }) => {
-        const active = theme === value;
+      {OPTIONS.map(({ value, label }) => {
+        const active = resolvedTheme === value;
         return (
           <button
             key={value}
@@ -60,14 +47,15 @@ export function ThemeToggle({ collapsed = false }: { collapsed?: boolean }) {
             role="radio"
             aria-checked={active}
             aria-label={label}
-            title={label}
             onClick={() => setTheme(value)}
             className={cn(
-              "inline-flex size-6 items-center justify-center rounded-md text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
-              active && "bg-background text-foreground shadow-xs",
+              "flex-1 rounded-md px-2 py-1.5 text-center text-xs transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
+              active
+                ? "bg-muted font-medium text-foreground"
+                : "text-subtle hover:text-foreground",
             )}
           >
-            <Icon className="size-3.5" aria-hidden="true" />
+            {label}
           </button>
         );
       })}

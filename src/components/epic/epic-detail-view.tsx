@@ -1,178 +1,59 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
-import {
-  ArrowLeftIcon,
-  CircleCheckIcon,
-  GitPullRequestIcon,
-  InboxIcon,
-  TriangleAlertIcon,
-} from "lucide-react";
+import { CheckIcon, GitPullRequestIcon, TriangleAlertIcon } from "lucide-react";
 
 import type { EpicDetail, Ticket } from "@/lib/types";
 import { cn } from "@/lib/utils";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  STAGE_ACCENT_DOT,
-  STAGE_LABELS,
-  badgeVariant,
-  isExternalUrl,
-  ticketBadges,
-} from "@/components/board/board-utils";
+import { agentDotClass, isExternalUrl, ticketProgress } from "@/components/board/board-utils";
+import { MetaChip, RiskChip, StagePill } from "@/components/atoms";
 import { DependencyGraph } from "@/components/epic/dependency-graph";
 
-type DescriptionBlock =
-  | { type: "heading"; level: number; text: string }
-  | { type: "list"; items: string[] }
-  | { type: "paragraph"; text: string };
+type AcceptanceItem = { text: string; checked: boolean };
 
-/** Turns a bead's raw markdown-ish description into readable blocks — headings, bullet lists,
- * and paragraphs — without pulling in a markdown parser dependency. Pure, no side effects. */
-function parseDescriptionBlocks(description: string): DescriptionBlock[] {
-  const blocks: DescriptionBlock[] = [];
-  let paragraphLines: string[] = [];
-  let listItems: string[] = [];
+/** Split an acceptance blob into checklist items, honoring `- [x]` / `- [ ]` markers. */
+function parseAcceptance(acceptance: string): AcceptanceItem[] {
+  return acceptance
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const m = /^(?:[-*]\s*)?\[( |x|X)\]\s*(.*)$/.exec(line);
+      if (m) return { text: m[2].trim(), checked: m[1].toLowerCase() === "x" };
+      return { text: line.replace(/^[-*]\s*/, ""), checked: false };
+    });
+}
 
-  const flushParagraph = () => {
-    if (paragraphLines.length > 0) {
-      blocks.push({ type: "paragraph", text: paragraphLines.join(" ") });
-      paragraphLines = [];
-    }
-  };
-  const flushList = () => {
-    if (listItems.length > 0) {
-      blocks.push({ type: "list", items: listItems });
-      listItems = [];
-    }
-  };
-
-  for (const rawLine of description.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    const headingMatch = /^(#{1,6})\s+(.*)$/.exec(line);
-    const bulletMatch = /^[-*]\s+(.*)$/.exec(line);
-
-    if (headingMatch) {
-      flushParagraph();
-      flushList();
-      blocks.push({ type: "heading", level: headingMatch[1].length, text: headingMatch[2].trim() });
-    } else if (bulletMatch) {
-      flushParagraph();
-      listItems.push(bulletMatch[1].trim());
-    } else if (line === "") {
-      flushParagraph();
-      flushList();
-    } else {
-      flushList();
-      paragraphLines.push(line);
-    }
+function StatusCircle({ ticket }: { ticket: Ticket }) {
+  if (ticket.stage === "done") {
+    return (
+      <span className="flex size-3.5 shrink-0 items-center justify-center rounded-full bg-stage-done">
+        <CheckIcon className="size-2 text-[#0b0a09]" strokeWidth={3} aria-hidden="true" />
+      </span>
+    );
   }
-  flushParagraph();
-  flushList();
-  return blocks;
+  if (ticket.stage === "implementing") {
+    return (
+      <span className="flex size-3.5 shrink-0 items-center justify-center rounded-full border-[1.5px] border-stage-implementing">
+        <span className="size-1.5 rounded-full bg-stage-implementing anton-pulse" />
+      </span>
+    );
+  }
+  if (ticket.stage === "in-review") {
+    return (
+      <span className="flex size-3.5 shrink-0 items-center justify-center rounded-full border-[1.5px] border-stage-in-review">
+        <span className="size-1.5 rounded-full bg-stage-in-review" />
+      </span>
+    );
+  }
+  return <span className="size-3.5 shrink-0 rounded-full border-[1.5px] border-subtle" />;
 }
 
-function DescriptionBlocks({ description }: { description: string }) {
-  const blocks = useMemo(() => parseDescriptionBlocks(description), [description]);
-  if (blocks.length === 0) return null;
-
+function SectionLabel({ children }: { children: React.ReactNode }) {
   return (
-    <div className="flex flex-col gap-2">
-      {blocks.map((block, index) => {
-        if (block.type === "heading") {
-          return (
-            <p
-              key={`heading-${index}-${block.text}`}
-              className={cn(
-                "leading-snug font-medium",
-                block.level <= 2 ? "text-sm text-foreground" : "text-xs text-muted-foreground uppercase tracking-wide",
-              )}
-            >
-              {block.text}
-            </p>
-          );
-        }
-        if (block.type === "list") {
-          return (
-            <ul key={`list-${index}-${block.items[0]}`} className="ml-4 list-disc text-sm leading-relaxed text-foreground/90">
-              {block.items.map((item, itemIndex) => (
-                <li key={`${index}-${itemIndex}-${item}`}>{item}</li>
-              ))}
-            </ul>
-          );
-        }
-        return (
-          <p key={`paragraph-${index}-${block.text.slice(0, 24)}`} className="text-sm leading-relaxed text-foreground/90">
-            {block.text}
-          </p>
-        );
-      })}
-    </div>
-  );
-}
-
-function BackLink({ slug }: { slug: string }) {
-  return (
-    <Link
-      href={`/projects/${slug}`}
-      className="inline-flex w-fit items-center gap-1.5 rounded-md text-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
-    >
-      <ArrowLeftIcon className="size-3.5" aria-hidden="true" />
-      Back to board
-    </Link>
-  );
-}
-
-function TicketListItem({ ticket }: { ticket: Ticket }) {
-  const badges = ticketBadges(ticket);
-
-  return (
-    <li className="flex flex-col gap-2 rounded-lg border border-border/70 bg-card p-3 transition-colors hover:bg-muted/50 sm:flex-row sm:items-center sm:justify-between">
-      <div className="flex min-w-0 flex-col gap-0.5">
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-muted-foreground">{ticket.id}</span>
-          <Badge variant="outline" className="h-4 px-1.5 text-[0.65rem]">
-            {STAGE_LABELS[ticket.stage]}
-          </Badge>
-        </div>
-        <p className="truncate text-sm font-medium" title={ticket.title}>
-          {ticket.title}
-        </p>
-        <p className="text-xs text-muted-foreground">{ticket.status}</p>
-      </div>
-      {badges.length > 0 && (
-        <div className="flex flex-wrap gap-1 sm:shrink-0">
-          {badges.map((badge) => (
-            <Badge key={badge.key} variant={badgeVariant(badge)}>
-              {badge.label}
-            </Badge>
-          ))}
-        </div>
-      )}
-    </li>
-  );
-}
-
-function EpicDetailSkeleton({ slug }: { slug: string }) {
-  return (
-    <div className="flex flex-1 flex-col gap-6" aria-busy="true" aria-label="Loading epic">
-      <BackLink slug={slug} />
-      <div className="flex flex-col gap-2">
-        <div className="h-3 w-24 animate-pulse rounded bg-muted" />
-        <div className="h-6 w-2/3 animate-pulse rounded bg-muted" />
-      </div>
-      <div className="grid gap-4 sm:grid-cols-2">
-        <div className="h-24 animate-pulse rounded-xl bg-card/60 ring-1 ring-border/60" />
-        <div className="h-24 animate-pulse rounded-xl bg-card/60 ring-1 ring-border/60" />
-      </div>
-      <div className="flex flex-col gap-2">
-        {[0, 1, 2].map((i) => (
-          <div key={i} className="h-16 animate-pulse rounded-lg bg-card/60 ring-1 ring-border/60" />
-        ))}
-      </div>
-      <div className="h-[520px] animate-pulse rounded-xl bg-card/60 ring-1 ring-border/60" />
-    </div>
+    <span className="font-mono text-[10px] tracking-[0.05em] text-subtle uppercase">{children}</span>
   );
 }
 
@@ -183,7 +64,6 @@ export function EpicDetailView({ slug, epicId }: { slug: string; epicId: string 
 
   useEffect(() => {
     let cancelled = false;
-
     async function load() {
       try {
         const res = await fetch(`/api/projects/${slug}/epics/${epicId}`);
@@ -194,12 +74,9 @@ export function EpicDetailView({ slug, epicId }: { slug: string; epicId: string 
           setError(null);
         }
       } catch (err) {
-        if (!cancelled) {
-          setError(err instanceof Error ? err.message : "Failed to load epic");
-        }
+        if (!cancelled) setError(err instanceof Error ? err.message : "Failed to load epic");
       }
     }
-
     void load();
     return () => {
       cancelled = true;
@@ -208,111 +85,225 @@ export function EpicDetailView({ slug, epicId }: { slug: string; epicId: string 
 
   if (error) {
     return (
-      <div className="flex flex-1 flex-col gap-4">
-        <BackLink slug={slug} />
-        <div className="flex flex-1 flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-destructive/30 p-8 text-center">
-          <TriangleAlertIcon className="size-6 text-destructive" aria-hidden="true" />
-          <p className="text-sm text-destructive">{error}</p>
-          <Button size="sm" variant="outline" onClick={() => setAttempt((n) => n + 1)}>
-            Try again
-          </Button>
-        </div>
+      <div className="flex flex-1 flex-col items-center justify-center gap-3 p-8 text-center">
+        <span className="flex size-11 items-center justify-center rounded-xl border border-risk-high/30 bg-risk-high/10">
+          <TriangleAlertIcon className="size-5 text-risk-high" aria-hidden="true" />
+        </span>
+        <p className="text-sm text-risk-high">{error}</p>
+        <Button size="sm" variant="outline" onClick={() => setAttempt((n) => n + 1)}>
+          Try again
+        </Button>
       </div>
     );
   }
 
-  if (!detail) {
-    return <EpicDetailSkeleton slug={slug} />;
-  }
+  if (!detail) return <EpicDetailSkeleton />;
 
-  const { epic, description, tickets, edges } = detail;
+  const { epic, tickets, edges } = detail;
+  const { done, total, pct } = ticketProgress({ tickets });
+  const inProgress = tickets.filter((t) => t.stage === "implementing").length;
+  const inProgressPct = total === 0 ? 0 : Math.round((inProgress / total) * 100);
+  const todo = Math.max(0, total - done - inProgress);
+  const acceptance = epic.acceptance ? parseAcceptance(epic.acceptance) : [];
 
   return (
-    <div className="flex flex-1 flex-col gap-6">
-      <BackLink slug={slug} />
-
-      <div className="flex flex-col gap-2">
-        <div className="flex flex-wrap items-center gap-2">
-          <span className={cn("size-1.5 rounded-full", STAGE_ACCENT_DOT[epic.stage])} aria-hidden="true" />
-          <span className="text-xs text-muted-foreground">{STAGE_LABELS[epic.stage]}</span>
-          {epic.approved && (
-            <Badge variant="outline" className="gap-1">
-              <CircleCheckIcon aria-hidden="true" />
-              Approved
-            </Badge>
-          )}
-          {epic.prRef &&
-            (isExternalUrl(epic.prRef) ? (
-              <a
-                href={epic.prRef}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
-              >
-                <Badge variant="outline" className="gap-1">
-                  <GitPullRequestIcon aria-hidden="true" />
-                  PR
-                </Badge>
-              </a>
-            ) : (
-              <Badge variant="outline" className="gap-1">
-                <GitPullRequestIcon aria-hidden="true" />
-                {epic.prRef}
-              </Badge>
-            ))}
+    <div className="flex flex-1 flex-col">
+      {/* header */}
+      <header className="flex h-14 shrink-0 items-center gap-2.5 border-b border-border px-5 sm:px-6">
+        <div className="flex min-w-0 items-center gap-2 text-[13px]">
+          <Link
+            href={`/projects/${slug}`}
+            className="shrink-0 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+          >
+            Board
+          </Link>
+          <span className="text-subtle">/</span>
+          <span className="truncate font-medium text-foreground" title={epic.title}>
+            {epic.title}
+          </span>
         </div>
-        <h1 className="text-lg font-semibold leading-snug" title={epic.title}>
-          {epic.title}
-        </h1>
-      </div>
-
-      {(epic.goal || epic.acceptance) && (
-        <div className="grid gap-4 sm:grid-cols-2">
-          {epic.goal && (
-            <section className="flex flex-col gap-1.5 rounded-xl border border-border/70 bg-card p-4">
-              <h2 className="text-sm font-medium">Goal</h2>
-              <p className="text-sm leading-relaxed text-muted-foreground">{epic.goal}</p>
-            </section>
-          )}
-          {epic.acceptance && (
-            <section className="flex flex-col gap-1.5 rounded-xl border border-border/70 bg-card p-4">
-              <h2 className="text-sm font-medium">Acceptance</h2>
-              <p className="text-sm leading-relaxed whitespace-pre-wrap text-muted-foreground">{epic.acceptance}</p>
-            </section>
-          )}
+        <StagePill stage={epic.stage} className="ml-1" />
+        <div className="ml-auto flex shrink-0 gap-2">
+          <Button size="sm" variant="outline">
+            {epic.stage === "implementing" ? "Pause run" : "Run epic"}
+          </Button>
+          <Button size="sm" variant="secondary">
+            Open worktree
+          </Button>
         </div>
-      )}
+      </header>
 
-      {description && (
-        <section className="flex flex-col gap-3 rounded-xl border border-border/70 bg-card p-4">
-          <h2 className="text-sm font-medium">Description</h2>
-          <DescriptionBlocks description={description} />
-        </section>
-      )}
-
-      <section className="flex flex-col gap-3">
-        <div className="flex items-center justify-between">
-          <h2 className="text-sm font-medium">Tickets</h2>
-          <span className="text-xs tabular-nums text-muted-foreground">{tickets.length}</span>
-        </div>
-        {tickets.length === 0 ? (
-          <div className="flex flex-col items-center justify-center gap-1 rounded-xl border border-dashed border-border/70 px-3 py-8 text-center">
-            <InboxIcon className="size-4 text-muted-foreground/60" aria-hidden="true" />
-            <p className="text-xs text-muted-foreground">No tickets</p>
+      {/* body: contract | graph */}
+      <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[400px_1fr]">
+        {/* LEFT — contract */}
+        <div className="flex flex-col gap-5 overflow-y-auto border-border p-5 sm:p-6 lg:border-r">
+          <div className="flex flex-col gap-2">
+            <span className="font-mono text-[11px] text-subtle">{epic.id} · epic</span>
+            <h1 className="font-display text-[22px] leading-tight font-bold tracking-[-0.01em]" title={epic.title}>
+              {epic.title}
+            </h1>
+            {(epic.agent || epic.risk || epic.size || epic.prRef) && (
+              <div className="flex flex-wrap gap-1.5">
+                {epic.agent && <MetaChip dotClass={agentDotClass(epic.agent)}>{epic.agent}</MetaChip>}
+                {epic.risk && <RiskChip risk={epic.risk} />}
+                {epic.size && <MetaChip>size:{epic.size}</MetaChip>}
+                {epic.prRef &&
+                  (isExternalUrl(epic.prRef) ? (
+                    <a href={epic.prRef} target="_blank" rel="noopener noreferrer" className="focus-visible:outline-none">
+                      <MetaChip tone="pr">
+                        <GitPullRequestIcon className="size-2.5" aria-hidden="true" />
+                        PR
+                      </MetaChip>
+                    </a>
+                  ) : (
+                    <MetaChip tone="pr">
+                      <GitPullRequestIcon className="size-2.5" aria-hidden="true" />
+                      {epic.prRef}
+                    </MetaChip>
+                  ))}
+              </div>
+            )}
           </div>
-        ) : (
-          <ul className="flex flex-col gap-2">
-            {tickets.map((ticket) => (
-              <TicketListItem key={ticket.id} ticket={ticket} />
-            ))}
-          </ul>
-        )}
-      </section>
 
-      <section className="flex flex-col gap-3">
-        <h2 className="text-sm font-medium">Dependency graph</h2>
-        <DependencyGraph epic={epic} tickets={tickets} edges={edges} />
-      </section>
+          {/* completion module */}
+          <div className="flex flex-col gap-3 rounded-xl border border-border bg-card p-4">
+            <div className="flex items-end gap-2.5">
+              <span className="font-display text-[30px] leading-none font-bold tracking-[-0.02em]">
+                {done}
+                <span className="text-[20px] text-subtle"> / {total}</span>
+              </span>
+              <span className="mb-0.5 text-xs text-muted-foreground">tickets complete</span>
+              <span className="mb-0.5 ml-auto font-mono text-xs text-stage-done">{pct}%</span>
+            </div>
+            <div className="flex h-1.5 overflow-hidden rounded-full bg-secondary">
+              <span className="bg-stage-done" style={{ width: `${pct}%` }} />
+              <span className="bg-stage-implementing" style={{ width: `${inProgressPct}%` }} />
+            </div>
+            <div className="flex flex-wrap gap-3.5">
+              <LegendItem className="bg-stage-done" label={`${done} done`} />
+              <LegendItem className="bg-stage-implementing" label={`${inProgress} in progress`} />
+              <LegendItem className="bg-subtle" label={`${todo} to do`} />
+            </div>
+          </div>
+
+          {epic.goal && (
+            <div className="flex flex-col gap-2">
+              <SectionLabel>Goal</SectionLabel>
+              <p className="text-[13px] leading-relaxed text-foreground/85">{epic.goal}</p>
+            </div>
+          )}
+
+          {acceptance.length > 0 && (
+            <div className="flex flex-col gap-2.5">
+              <SectionLabel>Acceptance</SectionLabel>
+              {acceptance.map((item, i) => (
+                <div key={i} className="flex items-start gap-2.5">
+                  {item.checked ? (
+                    <span className="mt-px flex size-[15px] shrink-0 items-center justify-center rounded bg-stage-done">
+                      <CheckIcon className="size-2 text-[#0b0a09]" strokeWidth={3} aria-hidden="true" />
+                    </span>
+                  ) : (
+                    <span className="mt-px size-[15px] shrink-0 rounded border-[1.5px] border-border" />
+                  )}
+                  <span
+                    className={cn(
+                      "text-[12.5px] leading-snug",
+                      item.checked ? "text-muted-foreground" : "text-foreground/85",
+                    )}
+                  >
+                    {item.text}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div className="flex flex-col gap-1">
+            <SectionLabel>Tickets · {tickets.length}</SectionLabel>
+            {tickets.length === 0 ? (
+              <p className="py-2 text-xs text-subtle">No linked tickets yet.</p>
+            ) : (
+              <ul className="flex flex-col divide-y divide-border/60">
+                {tickets.map((ticket) => (
+                  <li key={ticket.id} className="flex items-center gap-2.5 py-2">
+                    <StatusCircle ticket={ticket} />
+                    <span
+                      className={cn(
+                        "min-w-0 flex-1 truncate text-[12.5px]",
+                        ticket.stage === "done" ? "text-muted-foreground" : "text-foreground",
+                      )}
+                      title={ticket.title}
+                    >
+                      {ticket.title}
+                    </span>
+                    {ticket.size && (
+                      <span className="shrink-0 font-mono text-[10px] text-subtle">{ticket.size}</span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </div>
+
+        {/* RIGHT — dependency graph */}
+        <div className="flex min-h-[440px] flex-col">
+          <div className="flex items-center gap-2.5 border-b border-border px-5 py-3.5 sm:px-6">
+            <span className="text-[13px] font-semibold">Dependency graph</span>
+            <span className="font-mono text-[11px] text-subtle">dagre · left → right</span>
+            <div className="ml-auto hidden gap-3 sm:flex">
+              <LegendItem className="bg-stage-done" label="done" small />
+              <LegendItem className="bg-stage-implementing" label="active" small />
+              <LegendItem className="bg-stage-backlog" label="todo" small />
+            </div>
+          </div>
+          <div className="min-h-0 flex-1">
+            <DependencyGraph epic={epic} tickets={tickets} edges={edges} fill />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function LegendItem({
+  className,
+  label,
+  small = false,
+}: {
+  className: string;
+  label: string;
+  small?: boolean;
+}) {
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1.5 text-muted-foreground",
+        small ? "text-[11px] text-subtle" : "text-[11px]",
+      )}
+    >
+      <span className={cn("size-2 rounded-[3px]", className)} aria-hidden="true" />
+      {label}
+    </span>
+  );
+}
+
+function EpicDetailSkeleton() {
+  return (
+    <div className="flex flex-1 flex-col" aria-busy="true" aria-label="Loading epic">
+      <div className="flex h-14 items-center gap-3 border-b border-border px-6">
+        <span className="anton-shimmer h-3 w-40 rounded" />
+        <span className="anton-shimmer h-6 w-24 rounded-full" />
+      </div>
+      <div className="grid flex-1 grid-cols-1 lg:grid-cols-[400px_1fr]">
+        <div className="flex flex-col gap-5 border-border p-6 lg:border-r">
+          <span className="anton-shimmer h-6 w-3/4 rounded" />
+          <span className="anton-shimmer h-24 w-full rounded-xl" />
+          <span className="anton-shimmer h-3 w-1/3 rounded" />
+          <span className="anton-shimmer h-16 w-full rounded" />
+        </div>
+        <div className="anton-shimmer m-6 rounded-xl" />
+      </div>
     </div>
   );
 }

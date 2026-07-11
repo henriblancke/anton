@@ -58,6 +58,9 @@ function ticketAsEpic(bead: Bead): Epic {
     title: bead.title,
     approved: beads.isApproved(bead),
     stage: ticket.stage,
+    agent: ticket.agent,
+    risk: ticket.risk,
+    size: ticket.size,
     tickets: [ticket],
   };
 }
@@ -117,6 +120,9 @@ export async function getBoard(project: Project): Promise<Board> {
       acceptance: parseAcceptance(epic),
       approved: beads.isApproved(epic),
       stage: deriveStage(epic),
+      agent: labelValue(epic.labels, "agent"),
+      risk: labelValue(epic.labels, "risk"),
+      size: labelValue(epic.labels, "size"),
       prRef: epic.external_ref,
       tickets,
     };

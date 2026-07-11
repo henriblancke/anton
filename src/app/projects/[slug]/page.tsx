@@ -1,4 +1,8 @@
+import { getProjectBySlug } from "@/lib/projects";
 import { EpicBoard } from "@/components/board/epic-board";
+import { Topbar } from "@/components/shell/topbar";
+
+export const dynamic = "force-dynamic";
 
 export default async function ProjectBoardPage({
   params,
@@ -6,10 +10,14 @@ export default async function ProjectBoardPage({
   params: Promise<{ slug: string }>;
 }) {
   const { slug } = await params;
+  const project = await getProjectBySlug(slug);
 
   return (
-    <div className="flex flex-1 flex-col p-4 sm:p-6">
-      <EpicBoard slug={slug} />
+    <div className="flex flex-1 flex-col">
+      <Topbar projectSlug={slug} projectName={project?.name} />
+      <div className="flex flex-1 flex-col p-[18px]">
+        <EpicBoard slug={slug} />
+      </div>
     </div>
   );
 }

@@ -15,15 +15,21 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 
-import type { DepEdge, DepType, Epic, Ticket } from "@/lib/types";
-import { badgeVariant, ticketBadges } from "@/components/board/board-utils";
-import { Badge } from "@/components/ui/badge";
+import type { DepEdge, DepType, Epic, Stage, Ticket } from "@/lib/types";
+import { cn } from "@/lib/utils";
 import { layoutGraphNodes, type GraphLayoutNode } from "@/components/epic/graph-layout";
 
-const EPIC_NODE_WIDTH = 260;
-const EPIC_NODE_HEIGHT = 96;
-const TICKET_NODE_WIDTH = 232;
-const TICKET_NODE_HEIGHT = 118;
+const STAGE_VAR: Record<Stage, string> = {
+  backlog: "var(--stage-backlog)",
+  implementing: "var(--stage-implementing)",
+  "in-review": "var(--stage-in-review)",
+  done: "var(--stage-done)",
+};
+
+const EPIC_NODE_WIDTH = 168;
+const EPIC_NODE_HEIGHT = 52;
+const TICKET_NODE_WIDTH = 150;
+const TICKET_NODE_HEIGHT = 52;
 
 const REACT_FLOW_CHROME_CLASS = [
   "[&_.react-flow__attribution]:hidden",
@@ -57,53 +63,38 @@ type GraphFlowNode = EpicFlowNode | TicketFlowNode;
 function EpicGraphNode({ data }: NodeProps<EpicFlowNode>) {
   return (
     <div
-      className="flex flex-col gap-1 rounded-xl border border-primary/40 bg-card px-3 py-2.5 text-card-foreground shadow-xs ring-1 ring-primary/10"
+      className="flex flex-col justify-center gap-0.5 rounded-[9px] border border-primary/50 bg-card px-3 py-2 text-card-foreground ring-1 ring-primary/10"
       style={{ width: EPIC_NODE_WIDTH, height: EPIC_NODE_HEIGHT }}
     >
-      <Handle type="target" position={Position.Top} className="!size-2 !border-none !bg-border" />
-      <span className="text-[0.65rem] font-medium tracking-wide text-primary uppercase">Epic</span>
-      <h3 className="truncate text-sm font-medium leading-snug" title={data.title}>
+      <Handle type="target" position={Position.Left} className="!size-2 !border-none !bg-border" />
+      <span className="font-mono text-[9px] tracking-wide text-primary uppercase">epic</span>
+      <span className="truncate text-[12px] font-semibold leading-snug" title={data.title}>
         {data.title}
-      </h3>
-      {data.goal && (
-        <p className="line-clamp-2 text-xs text-muted-foreground" title={data.goal}>
-          {data.goal}
-        </p>
-      )}
-      <Handle type="source" position={Position.Bottom} className="!size-2 !border-none !bg-border" />
+      </span>
+      <Handle type="source" position={Position.Right} className="!size-2 !border-none !bg-border" />
     </div>
   );
 }
 
 function TicketGraphNode({ data }: NodeProps<TicketFlowNode>) {
   const { ticket } = data;
-  const badges = ticketBadges(ticket);
-
   return (
     <div
-      className="flex flex-col gap-1.5 rounded-xl border border-border/70 bg-card px-3 py-2.5 text-card-foreground shadow-xs"
-      style={{ width: TICKET_NODE_WIDTH, height: TICKET_NODE_HEIGHT }}
+      className="flex flex-col justify-center gap-0.5 rounded-[9px] border border-border bg-card px-3 py-2 text-card-foreground"
+      style={{
+        width: TICKET_NODE_WIDTH,
+        height: TICKET_NODE_HEIGHT,
+        borderLeft: `3px solid ${STAGE_VAR[ticket.stage]}`,
+      }}
     >
-      <Handle type="target" position={Position.Top} className="!size-2 !border-none !bg-border" />
-      <div className="flex items-center justify-between gap-2">
-        <span className="truncate text-xs text-muted-foreground" title={ticket.id}>
-          {ticket.id}
-        </span>
-        <span className="shrink-0 text-[0.65rem] text-muted-foreground">{ticket.stage}</span>
-      </div>
-      <h4 className="truncate text-sm font-medium leading-snug" title={ticket.title}>
+      <Handle type="target" position={Position.Left} className="!size-2 !border-none !bg-border" />
+      <span className="truncate font-mono text-[9px]" style={{ color: STAGE_VAR[ticket.stage] }}>
+        {ticket.id} · {ticket.stage}
+      </span>
+      <span className="truncate text-[11.5px] font-medium leading-snug" title={ticket.title}>
         {ticket.title}
-      </h4>
-      {badges.length > 0 && (
-        <div className="flex flex-wrap gap-1">
-          {badges.map((badge) => (
-            <Badge key={badge.key} variant={badgeVariant(badge)} className="h-4 px-1.5 text-[0.65rem]">
-              {badge.label}
-            </Badge>
-          ))}
-        </div>
-      )}
-      <Handle type="source" position={Position.Bottom} className="!size-2 !border-none !bg-border" />
+      </span>
+      <Handle type="source" position={Position.Right} className="!size-2 !border-none !bg-border" />
     </div>
   );
 }
@@ -129,6 +120,7 @@ function buildGraph(
   const positions = layoutGraphNodes(
     layoutInputs,
     edges.map((edge) => ({ source: edge.from, target: edge.to })),
+    { direction: "LR", nodeSep: 24, rankSep: 90 },
   );
 
   const nodes: GraphFlowNode[] = [
@@ -175,24 +167,38 @@ export function DependencyGraph({
   epic,
   tickets,
   edges,
+  fill = false,
 }: {
   epic: Epic;
   tickets: Ticket[];
   edges: DepEdge[];
+  /** Fill the parent container (used inside the epic-detail split panel) instead of a fixed,
+   * bordered card. */
+  fill?: boolean;
 }) {
   const { nodes, flowEdges } = useMemo(() => buildGraph(epic, tickets, edges), [epic, tickets, edges]);
 
   if (tickets.length === 0) {
     return (
-      <div className="flex h-40 flex-col items-center justify-center gap-1 rounded-xl border border-dashed border-border/70 text-center">
-        <p className="text-sm text-muted-foreground">No linked tickets yet</p>
+      <div
+        className={cn(
+          "flex flex-col items-center justify-center gap-1 text-center",
+          fill ? "h-full" : "h-40 rounded-xl border border-dashed border-border",
+        )}
+      >
+        <p className="text-sm text-subtle">No linked tickets yet</p>
       </div>
     );
   }
 
   return (
     <div
-      className={`h-[520px] w-full overflow-hidden rounded-xl border border-border/70 bg-card ${REACT_FLOW_CHROME_CLASS}`}
+      className={cn(
+        fill
+          ? "h-full w-full"
+          : "h-[520px] w-full overflow-hidden rounded-xl border border-border bg-card",
+        REACT_FLOW_CHROME_CLASS,
+      )}
     >
       <ReactFlow
         nodes={nodes}

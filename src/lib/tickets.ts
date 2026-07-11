@@ -1,7 +1,7 @@
 /**
- * The Tickets page: a flat, filterable view over every work bead (excludes epics and
- * `molecule` coordination artifacts). Mirrors board.ts's read + section-parsing patterns —
- * see DESIGN.md §2/§3.
+ * The Tickets page: a flat, filterable view over every work bead — epics included (each epic
+ * row is followed by its child tickets), excluding only `molecule` coordination artifacts.
+ * Mirrors board.ts's read + section-parsing patterns — see DESIGN.md §2/§3.
  */
 import { beads, type Bead } from "./beads/bd";
 import { deriveStage } from "./board";
@@ -97,6 +97,27 @@ export async function getTickets(project: Project, filters: TicketFilters): Prom
     if (epic) epicByTicketId.set(t.id, epic);
   }
 
-  const rows = workBeads.map((bead) => toTicketRow(bead, epicByTicketId.get(bead.id)));
+  // Group each epic row with its children; orphan tickets trail after. Epics themselves are
+  // rows too (type "epic", no parent epic of their own).
+  const childrenByEpic = new Map<string, Bead[]>();
+  for (const t of workBeads) {
+    const epic = epicByTicketId.get(t.id);
+    if (!epic) continue;
+    const list = childrenByEpic.get(epic.id) ?? [];
+    list.push(t);
+    childrenByEpic.set(epic.id, list);
+  }
+
+  const rows: TicketRow[] = [];
+  for (const epic of epicBeads) {
+    rows.push(toTicketRow(epic, undefined));
+    for (const child of childrenByEpic.get(epic.id) ?? []) {
+      rows.push(toTicketRow(child, epic));
+    }
+  }
+  for (const t of workBeads) {
+    if (!epicByTicketId.has(t.id)) rows.push(toTicketRow(t, undefined));
+  }
+
   return applyFilters(rows, filters);
 }

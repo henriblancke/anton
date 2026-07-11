@@ -1,18 +1,41 @@
 "use client";
 
 import Link from "next/link";
-import { FolderGitIcon, LayoutDashboardIcon, ListTodoIcon, XIcon, type LucideIcon } from "lucide-react";
+import { ChevronDownIcon, XIcon } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { isNavItemActive, type ShellNavItem } from "@/components/shell/shell-utils";
 import { ThemeToggle } from "@/components/shell/theme-toggle";
+import { AntonWordmark } from "@/components/shell/brand";
+import {
+  BoardIcon,
+  DependenciesIcon,
+  ProjectsIcon,
+  RunsIcon,
+  SettingsIcon,
+  TicketsIcon,
+} from "@/components/shell/icons";
 
-const PRIMARY_NAV: ShellNavItem[] = [{ label: "Projects", href: "/" }];
+type NavIcon = React.ComponentType<{ className?: string }>;
+type NavEntry = ShellNavItem & { icon: NavIcon; exact?: boolean };
 
-function projectNav(slug: string): ShellNavItem[] {
+function projectNav(slug: string): NavEntry[] {
   return [
-    { label: "Board", href: `/projects/${slug}` },
-    { label: "Tickets", href: `/projects/${slug}/tickets` },
+    { label: "Board", href: `/projects/${slug}`, icon: BoardIcon, exact: true },
+    { label: "Tickets", href: `/projects/${slug}/tickets`, icon: TicketsIcon },
+    { label: "Dependencies", href: `/projects/${slug}/dependencies`, icon: DependenciesIcon },
+  ];
+}
+
+function workspaceNav(slug?: string): NavEntry[] {
+  return [
+    { label: "Projects", href: "/", icon: ProjectsIcon, exact: true },
+    ...(slug
+      ? ([
+          { label: "Runs", href: `/projects/${slug}/runs`, icon: RunsIcon },
+          { label: "Settings", href: `/projects/${slug}/settings`, icon: SettingsIcon },
+        ] as NavEntry[])
+      : []),
   ];
 }
 
@@ -29,6 +52,8 @@ export function Sidebar({
   mobileOpen: boolean;
   onCloseMobile: () => void;
 }) {
+  const label = projectName ?? projectSlug;
+
   return (
     <>
       {mobileOpen && (
@@ -42,19 +67,16 @@ export function Sidebar({
 
       <aside
         className={cn(
-          "fixed inset-y-0 left-0 z-50 flex w-60 shrink-0 -translate-x-full flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground transition-transform duration-150 lg:static lg:z-auto lg:translate-x-0",
+          "fixed inset-y-0 left-0 z-50 flex w-58 shrink-0 -translate-x-full flex-col border-r border-sidebar-border bg-sidebar px-3 py-4 text-sidebar-foreground transition-transform duration-150 lg:static lg:z-auto lg:translate-x-0",
           mobileOpen && "translate-x-0",
         )}
       >
-        <div className="flex h-12 items-center justify-between gap-2 px-3">
+        <div className="flex items-center justify-between gap-2 px-1 pb-4">
           <Link
             href="/"
-            className="flex items-center gap-2 rounded-md px-1 py-1 text-sm font-semibold tracking-tight focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+            className="rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
           >
-            <span className="flex size-5 items-center justify-center rounded-md bg-primary text-[0.7rem] font-bold text-primary-foreground">
-              a
-            </span>
-            anton
+            <AntonWordmark />
           </Link>
           <button
             type="button"
@@ -66,64 +88,78 @@ export function Sidebar({
           </button>
         </div>
 
-        <nav className="flex flex-1 flex-col gap-4 overflow-y-auto px-2 py-2">
-          <ul className="flex flex-col gap-0.5">
-            {PRIMARY_NAV.map((item) => (
-              <NavLink key={item.href} item={item} pathname={pathname} icon={FolderGitIcon} />
-            ))}
-          </ul>
+        {projectSlug && (
+          <Link
+            href="/"
+            title={`${label} — switch project`}
+            className="mb-4 flex items-center gap-2.5 rounded-[10px] border border-border bg-card px-2.5 py-2 transition-colors hover:border-ring/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+          >
+            <span className="flex size-5 items-center justify-center rounded-md border border-border bg-muted font-mono text-[10px] font-medium text-primary">
+              {label?.[0]?.toLowerCase() ?? "a"}
+            </span>
+            <span className="min-w-0 flex-1 truncate text-[13px] font-medium">{label}</span>
+            <ChevronDownIcon className="size-3 shrink-0 text-muted-foreground" aria-hidden="true" />
+          </Link>
+        )}
 
+        <nav className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto">
           {projectSlug && (
-            <div className="flex flex-col gap-0.5">
-              <p className="truncate px-2 text-xs font-medium text-muted-foreground" title={projectName ?? projectSlug}>
-                {projectName ?? projectSlug}
-              </p>
-              <ul className="flex flex-col gap-0.5">
-                <NavLink
-                  item={projectNav(projectSlug)[0]}
-                  pathname={pathname}
-                  icon={LayoutDashboardIcon}
-                  exact
-                />
-                <NavLink item={projectNav(projectSlug)[1]} pathname={pathname} icon={ListTodoIcon} />
-              </ul>
-            </div>
+            <NavGroup label="Project">
+              {projectNav(projectSlug).map((item) => (
+                <NavLink key={item.href} item={item} pathname={pathname} />
+              ))}
+            </NavGroup>
           )}
+
+          <NavGroup label="Workspace">
+            {workspaceNav(projectSlug).map((item) => (
+              <NavLink key={item.href} item={item} pathname={pathname} />
+            ))}
+          </NavGroup>
         </nav>
 
-        <div className="border-t border-sidebar-border p-2">
+        <div className="mt-4 flex flex-col gap-3">
           <ThemeToggle />
+          <div className="flex items-center gap-2.5 px-1">
+            <span className="size-6 shrink-0 rounded-full bg-[linear-gradient(135deg,#4fc08a,#57a8f2)]" aria-hidden="true" />
+            <div className="flex min-w-0 flex-col leading-tight">
+              <span className="truncate text-xs">local machine</span>
+              <span className="font-mono text-[10px] text-subtle">idle</span>
+            </div>
+          </div>
         </div>
       </aside>
     </>
   );
 }
 
-function NavLink({
-  item,
-  pathname,
-  icon: Icon,
-  exact = false,
-}: {
-  item: ShellNavItem;
-  pathname: string | null;
-  icon: LucideIcon;
-  exact?: boolean;
-}) {
-  const active = exact ? pathname === item.href : isNavItemActive(pathname, item);
+function NavGroup({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="flex flex-col gap-0.5">
+      <p className="px-2 pb-1 font-mono text-[10px] tracking-[0.04em] text-subtle uppercase">
+        {label}
+      </p>
+      <ul className="flex flex-col gap-0.5">{children}</ul>
+    </div>
+  );
+}
+
+function NavLink({ item, pathname }: { item: NavEntry; pathname: string | null }) {
+  const active = item.exact ? pathname === item.href : isNavItemActive(pathname, item);
+  const Icon = item.icon;
   return (
     <li>
       <Link
         href={item.href}
         aria-current={active ? "page" : undefined}
         className={cn(
-          "flex items-center gap-2 rounded-md px-2 py-1.5 text-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
+          "group flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-[13px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
           active
             ? "bg-sidebar-accent font-medium text-sidebar-accent-foreground"
-            : "text-sidebar-foreground/80 hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground",
+            : "text-muted-foreground hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground",
         )}
       >
-        <Icon className="size-4 shrink-0" aria-hidden="true" />
+        <Icon className={cn("size-4 shrink-0", active ? "text-primary" : "text-subtle")} />
         {item.label}
       </Link>
     </li>

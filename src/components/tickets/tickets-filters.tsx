@@ -36,9 +36,8 @@ function optionsForField(
 }
 
 const selectClassName = cn(
-  "h-8 min-w-28 rounded-lg border border-input bg-transparent px-2 text-sm text-foreground outline-none transition-colors",
+  "h-8 min-w-24 rounded-lg border border-border bg-card px-2 text-xs text-foreground outline-none transition-colors",
   "focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50",
-  "dark:bg-input/30",
 );
 
 export function TicketsFilters({ tickets }: { tickets: TicketRow[] }) {
@@ -46,13 +45,16 @@ export function TicketsFilters({ tickets }: { tickets: TicketRow[] }) {
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const filters = filtersFromSearchParams(searchParams);
-  const [q, setQ] = useState(filters.q ?? "");
+  const urlQ = filters.q ?? "";
+  const [q, setQ] = useState(urlQ);
+  const [syncedQ, setSyncedQ] = useState(urlQ);
 
-  // Keep the local search box in sync when the URL changes from elsewhere (back/forward).
-  useEffect(() => {
-    setQ(filters.q ?? "");
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filters.q]);
+  // Keep the local search box in sync when the URL changes from elsewhere (back/forward) —
+  // adjusted during render, not in an effect, per React's set-state-in-effect guidance.
+  if (urlQ !== syncedQ) {
+    setSyncedQ(urlQ);
+    setQ(urlQ);
+  }
 
   const applyFilters = useCallback(
     (next: TicketFilters) => {
@@ -86,7 +88,7 @@ export function TicketsFilters({ tickets }: { tickets: TicketRow[] }) {
     <div
       role="search"
       aria-label="Filter tickets"
-      className="flex flex-wrap items-end gap-2 rounded-xl border border-border/70 bg-card p-3"
+      className="flex flex-wrap items-center gap-2.5 border-b border-border px-5 py-3 sm:px-6"
     >
       <div className="flex flex-col gap-1">
         <Label htmlFor="ticket-search" className="sr-only">
@@ -94,19 +96,21 @@ export function TicketsFilters({ tickets }: { tickets: TicketRow[] }) {
         </Label>
         <div className="relative">
           <SearchIcon
-            className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground"
+            className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-subtle"
             aria-hidden="true"
           />
           <Input
             id="ticket-search"
             type="search"
-            placeholder="Search titles…"
+            placeholder="Filter by title…"
             value={q}
             onChange={(event) => setQ(event.target.value)}
-            className="h-8 w-48 pl-7"
+            className="h-8 w-52 rounded-lg pl-8 text-xs"
           />
         </div>
       </div>
+
+      <span className="h-5 w-px bg-border" aria-hidden="true" />
 
       {TICKET_FILTER_FIELDS.map((field) => (
         <FilterSelect
@@ -120,8 +124,8 @@ export function TicketsFilters({ tickets }: { tickets: TicketRow[] }) {
       ))}
 
       {hasActiveFilters(filters) && (
-        <Button type="button" size="sm" variant="ghost" onClick={handleReset}>
-          Clear filters
+        <Button type="button" size="sm" variant="ghost" onClick={handleReset} className="ml-auto text-subtle">
+          Clear all
         </Button>
       )}
     </div>

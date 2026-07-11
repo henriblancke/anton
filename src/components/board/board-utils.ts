@@ -7,17 +7,74 @@ import { STAGES, type Epic, type Stage, type Ticket } from "@/lib/types";
 export const STAGE_LABELS: Record<Stage, string> = {
   backlog: "Backlog",
   implementing: "Implementing",
-  "in-review": "In Review",
+  "in-review": "In-review",
   done: "Done",
 };
 
-/** Quiet per-stage accent dot color. Theme-aware Tailwind palette classes, not raw hex. */
+/** Per-stage accent dot color — theme-aware semantic tokens from the Atelier design system. */
 export const STAGE_ACCENT_DOT: Record<Stage, string> = {
-  backlog: "bg-muted-foreground/50",
-  implementing: "bg-blue-500 dark:bg-blue-400",
-  "in-review": "bg-amber-500 dark:bg-amber-400",
-  done: "bg-emerald-500 dark:bg-emerald-400",
+  backlog: "bg-stage-backlog",
+  implementing: "bg-stage-implementing",
+  "in-review": "bg-stage-in-review",
+  done: "bg-stage-done",
 };
+
+/** Text color per stage, for stage-tinted labels/pills. */
+export const STAGE_TEXT: Record<Stage, string> = {
+  backlog: "text-stage-backlog",
+  implementing: "text-stage-implementing",
+  "in-review": "text-stage-in-review",
+  done: "text-stage-done",
+};
+
+/** Inset left-border color per stage — mirrors the board card's `box-shadow: inset 2px 0`. */
+export const STAGE_INSET_SHADOW: Record<Stage, string> = {
+  backlog: "shadow-[inset_2px_0_0_var(--stage-backlog)]",
+  implementing: "shadow-[inset_2px_0_0_var(--stage-implementing)]",
+  "in-review": "shadow-[inset_2px_0_0_var(--stage-in-review)]",
+  done: "shadow-[inset_2px_0_0_var(--stage-done)]",
+};
+
+/** Left-border color per stage — used by dependency-graph nodes (`border-l-3`). */
+export const STAGE_BORDER_LEFT: Record<Stage, string> = {
+  backlog: "border-l-stage-backlog",
+  implementing: "border-l-stage-implementing",
+  "in-review": "border-l-stage-in-review",
+  done: "border-l-stage-done",
+};
+
+/** Dot color per agent tag — a stable, warm-matched hue so an agent reads at a glance.
+ * Falls back to the neutral subtle color for unknown/absent agents. */
+export function agentDotClass(agent?: string): string {
+  switch (agent) {
+    case "fastapi":
+      return "bg-agent-fastapi";
+    case "supabase":
+      return "bg-agent-supabase";
+    case "pydantic":
+      return "bg-agent-pydantic";
+    case "terraform":
+      return "bg-agent-terraform";
+    case "docker":
+      return "bg-agent-docker";
+    case "kubernetes":
+      return "bg-agent-kubernetes";
+    default:
+      return "bg-subtle";
+  }
+}
+
+/** Ticket completion for an epic: how many of its tickets are `done`, and the total. */
+export function ticketProgress(epic: { tickets: Ticket[] }): {
+  done: number;
+  total: number;
+  pct: number;
+} {
+  const total = epic.tickets.length;
+  const done = epic.tickets.filter((t) => t.stage === "done").length;
+  const pct = total === 0 ? 0 : Math.round((done / total) * 100);
+  return { done, total, pct };
+}
 
 export interface TicketBadge {
   key: string;

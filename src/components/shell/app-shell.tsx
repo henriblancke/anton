@@ -3,9 +3,11 @@
 import { useCallback, useEffect, useState } from "react";
 import { usePathname } from "next/navigation";
 
+import { MenuIcon } from "lucide-react";
+
 import type { Project } from "@/lib/types";
 import { Sidebar } from "@/components/shell/sidebar";
-import { Topbar } from "@/components/shell/topbar";
+import { AntonWordmark } from "@/components/shell/brand";
 import { extractProjectSlug } from "@/components/shell/shell-utils";
 
 export function AppShell({ children }: { children: React.ReactNode }) {
@@ -54,10 +56,19 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         onCloseMobile={closeMobile}
       />
       <div className="flex min-w-0 flex-1 flex-col">
-        <Topbar projectSlug={projectSlug} projectName={projectName} onOpenMobile={openMobile} />
-        <main className="flex flex-1 flex-col">
-          <div className="mx-auto flex w-full max-w-[1600px] flex-1 flex-col">{children}</div>
-        </main>
+        {/* Mobile-only nav bar — desktop uses each screen's own single header (design parity). */}
+        <div className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-3 lg:hidden">
+          <button
+            type="button"
+            aria-label="Open navigation"
+            onClick={openMobile}
+            className="inline-flex size-8 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+          >
+            <MenuIcon className="size-4" aria-hidden="true" />
+          </button>
+          <AntonWordmark size={22} textClassName="text-base" />
+        </div>
+        <main className="flex min-w-0 flex-1 flex-col">{children}</main>
       </div>
     </div>
   );
