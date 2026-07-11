@@ -1,0 +1,165 @@
+"use client";
+
+import { useCallback, useEffect, useState } from "react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { SearchIcon } from "lucide-react";
+
+import type { TicketFilters, TicketRow } from "@/lib/types";
+import { cn } from "@/lib/utils";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Button } from "@/components/ui/button";
+import {
+  TICKET_FILTER_FIELDS,
+  filtersFromSearchParams,
+  hasActiveFilters,
+  ticketsQueryString,
+  uniqueEpicOptions,
+  uniqueFieldOptions,
+  type EpicOption,
+} from "@/components/tickets/tickets-utils";
+
+type SelectOption = { value: string; label: string };
+
+function optionsForField(
+  key: keyof TicketFilters,
+  tickets: TicketRow[],
+  epicOptions: EpicOption[],
+): SelectOption[] {
+  if (key === "epic") {
+    return epicOptions.map((epic) => ({ value: epic.id, label: epic.title }));
+  }
+  if (key === "agent" || key === "risk" || key === "size" || key === "domain" || key === "status" || key === "type") {
+    return uniqueFieldOptions(tickets, key).map((value) => ({ value, label: value }));
+  }
+  return [];
+}
+
+const selectClassName = cn(
+  "h-8 min-w-28 rounded-lg border border-input bg-transparent px-2 text-sm text-foreground outline-none transition-colors",
+  "focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50",
+  "dark:bg-input/30",
+);
+
+export function TicketsFilters({ tickets }: { tickets: TicketRow[] }) {
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const filters = filtersFromSearchParams(searchParams);
+  const [q, setQ] = useState(filters.q ?? "");
+
+  // Keep the local search box in sync when the URL changes from elsewhere (back/forward).
+  useEffect(() => {
+    setQ(filters.q ?? "");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filters.q]);
+
+  const applyFilters = useCallback(
+    (next: TicketFilters) => {
+      router.push(`${pathname}${ticketsQueryString(next)}`, { scroll: false });
+    },
+    [pathname, router],
+  );
+
+  function handleFieldChange(key: keyof TicketFilters, value: string) {
+    applyFilters({ ...filters, [key]: value || undefined });
+  }
+
+  useEffect(() => {
+    const trimmed = q.trim();
+    if ((filters.q ?? "") === trimmed) return;
+    const timeout = setTimeout(() => {
+      applyFilters({ ...filters, q: trimmed || undefined });
+    }, 300);
+    return () => clearTimeout(timeout);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [q]);
+
+  function handleReset() {
+    setQ("");
+    router.push(pathname, { scroll: false });
+  }
+
+  const epicOptions = uniqueEpicOptions(tickets);
+
+  return (
+    <div
+      role="search"
+      aria-label="Filter tickets"
+      className="flex flex-wrap items-end gap-2 rounded-xl border border-border/70 bg-card p-3"
+    >
+      <div className="flex flex-col gap-1">
+        <Label htmlFor="ticket-search" className="sr-only">
+          Search titles
+        </Label>
+        <div className="relative">
+          <SearchIcon
+            className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground"
+            aria-hidden="true"
+          />
+          <Input
+            id="ticket-search"
+            type="search"
+            placeholder="Search titles…"
+            value={q}
+            onChange={(event) => setQ(event.target.value)}
+            className="h-8 w-48 pl-7"
+          />
+        </div>
+      </div>
+
+      {TICKET_FILTER_FIELDS.map((field) => (
+        <FilterSelect
+          key={field.key}
+          field={field.key}
+          label={field.label}
+          value={filters[field.key] ?? ""}
+          options={optionsForField(field.key, tickets, epicOptions)}
+          onChange={(value) => handleFieldChange(field.key, value)}
+        />
+      ))}
+
+      {hasActiveFilters(filters) && (
+        <Button type="button" size="sm" variant="ghost" onClick={handleReset}>
+          Clear filters
+        </Button>
+      )}
+    </div>
+  );
+}
+
+function FilterSelect({
+  field,
+  label,
+  value,
+  options,
+  onChange,
+}: {
+  field: string;
+  label: string;
+  value: string;
+  options: { value: string; label: string }[];
+  onChange: (value: string) => void;
+}) {
+  const id = `ticket-filter-${field}`;
+  return (
+    <div className="flex flex-col gap-1">
+      <Label htmlFor={id} className="sr-only">
+        {label}
+      </Label>
+      <select
+        id={id}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        className={selectClassName}
+      >
+        <option value="">{label}</option>
+        {options.map((option) => (
+          <option key={option.value} value={option.value}>
+            {option.label}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
+}
