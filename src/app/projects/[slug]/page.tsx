@@ -8,7 +8,7 @@ export default async function ProjectBoardPage({
   const { slug } = await params;
 
   return (
-    <div className="flex flex-1 flex-col">
+    <div className="flex flex-1 flex-col p-4 sm:p-6">
       <EpicBoard slug={slug} />
     </div>
   );

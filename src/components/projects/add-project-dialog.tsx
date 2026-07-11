@@ -2,7 +2,7 @@
 
 import { useState, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
-import { PlusIcon } from "lucide-react";
+import { FolderGitIcon, PlusIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import type { Project } from "@/lib/types";
@@ -73,14 +73,19 @@ export function AddProjectDialog() {
       <DialogContent>
         <form onSubmit={handleSubmit} className="flex flex-col gap-4">
           <DialogHeader>
-            <DialogTitle>Add project</DialogTitle>
+            <DialogTitle className="flex items-center gap-2">
+              <FolderGitIcon className="size-4 text-muted-foreground" aria-hidden="true" />
+              Add project
+            </DialogTitle>
             <DialogDescription>
               Point anton at a local repo. It should have a .beads/ directory.
             </DialogDescription>
           </DialogHeader>
 
           <div className="flex flex-col gap-1.5">
-            <Label htmlFor="project-name">Name</Label>
+            <Label htmlFor="project-name" className="text-xs font-medium text-muted-foreground">
+              Name
+            </Label>
             <Input
               id="project-name"
               value={name}
@@ -90,7 +95,9 @@ export function AddProjectDialog() {
           </div>
 
           <div className="flex flex-col gap-1.5">
-            <Label htmlFor="project-repo-path">Repo path</Label>
+            <Label htmlFor="project-repo-path" className="text-xs font-medium text-muted-foreground">
+              Repo path
+            </Label>
             <Input
               id="project-repo-path"
               value={repoPath}
