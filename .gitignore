@@ -39,3 +39,8 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# anton local state (ephemeral, not shared)
+anton.db
+anton.db-*
+.anton/
