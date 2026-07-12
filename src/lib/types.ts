@@ -66,6 +66,17 @@ export interface TicketFilters {
   q?: string; // free-text over title
 }
 
+// ── Ticket detail popup ──
+export interface TicketDetail extends Ticket {
+  type: string; // bead issue_type
+  priority?: number; // 0-4 (0 = critical)
+  domain?: string; // from domain:<x>
+  goal?: string; // parsed from the bead description "## Goal" section
+  description?: string; // the full bead description (markdown)
+  epicId?: string; // parent epic id, if any
+  epicTitle?: string;
+}
+
 // ── Board drag-and-drop ──
 export interface MoveRequest {
   toStage: Stage;

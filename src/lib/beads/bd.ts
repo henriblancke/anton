@@ -39,6 +39,59 @@ export const LABELS = {
   source: (s: string) => `source:${s}`,
 } as const;
 
+/** The managed-metadata label prefixes anton edits. Control labels (approved, stage:*,
+ * source:*) are NOT in this set and are never touched by a patch. */
+export const LABEL_PREFIXES = ["agent", "risk", "size", "domain"] as const;
+export type LabelPrefix = (typeof LABEL_PREFIXES)[number];
+
+/**
+ * A field patch for a bead. Every field is optional; an undefined (or empty-string) field is a
+ * no-op that never clobbers the current value. `labels` carries new values for the managed
+ * prefixes only — each is diffed against the bead's current labels so a single prefix moves.
+ */
+export interface BeadPatch {
+  title?: string;
+  status?: string;
+  priority?: number;
+  acceptance?: string;
+  description?: string;
+  labels?: Partial<Record<LabelPrefix, string>>;
+}
+
+function labelValueOf(labels: string[] | undefined, prefix: string): string | undefined {
+  const label = labels?.find((l) => l.startsWith(`${prefix}:`));
+  return label ? label.slice(prefix.length + 1) : undefined;
+}
+
+/**
+ * Build the single `bd update` argv for a patch, or `null` when nothing changed (no write).
+ * Label edits diff each managed prefix against `currentLabels`, so only the prefix that
+ * actually changed is remove/add-labelled — approved, stage:*, and source:* are preserved.
+ */
+export function buildUpdateArgs(
+  id: string,
+  patch: BeadPatch,
+  currentLabels: string[] = [],
+): string[] | null {
+  const args = ["update", id];
+  if (patch.title) args.push("--title", patch.title);
+  if (patch.status) args.push("--status", patch.status);
+  if (patch.priority !== undefined) args.push("--priority", String(patch.priority));
+  if (patch.acceptance) args.push("--acceptance", patch.acceptance);
+  if (patch.description) args.push("--description", patch.description);
+  if (patch.labels) {
+    for (const prefix of LABEL_PREFIXES) {
+      const next = patch.labels[prefix];
+      if (!next) continue; // untouched (undefined) or empty prefix — no-op
+      const current = labelValueOf(currentLabels, prefix);
+      if (current === next) continue; // unchanged
+      if (current !== undefined) args.push("--remove-label", `${prefix}:${current}`);
+      args.push("--add-label", `${prefix}:${next}`);
+    }
+  }
+  return args.length > 2 ? args : null;
+}
+
 async function bd(cwd: string, args: string[]): Promise<string> {
   const { stdout } = await execFileAsync("bd", args, {
     cwd,
@@ -141,6 +194,25 @@ export const beads = {
   reopen: (cwd: string, id: string) => bd(cwd, ["reopen", id]),
   setStatus: (cwd: string, id: string, status: string) =>
     bd(cwd, ["update", id, "--status", status]),
+
+  /** Pure argv builder, exposed for testing and callers that want to inspect the write. */
+  buildUpdateArgs,
+
+  /**
+   * Apply a field patch as ONE `bd update` invocation. `currentLabels` are the bead's existing
+   * labels, needed to diff managed prefixes without disturbing control labels. A patch that
+   * touches nothing is a no-op (no bd is spawned).
+   */
+  update: async (
+    cwd: string,
+    id: string,
+    patch: BeadPatch,
+    currentLabels: string[] = [],
+  ): Promise<void> => {
+    const args = buildUpdateArgs(id, patch, currentLabels);
+    if (!args) return;
+    await bd(cwd, args);
+  },
 
   // ── convenience: anton's stage/approval semantics, all in beads ──
   approve: (cwd: string, epicId: string) => beads.tag(cwd, epicId, [LABELS.approved]),
