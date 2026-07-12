@@ -58,16 +58,25 @@ function asArray<T>(raw: string): T[] {
 }
 
 export const beads = {
-  /** Truly claimable work (excludes in_progress/blocked/deferred). */
-  ready: (cwd: string) => bd(cwd, ["ready", "--json"]).then(asArray<Bead>),
+  /**
+   * Truly claimable work (excludes in_progress/blocked/deferred). `--limit 0` = unlimited:
+   * `bd ready` (like `bd list`) defaults to 50 results, which would silently drop work in a
+   * repo with a large ready queue.
+   */
+  ready: (cwd: string) => bd(cwd, ["ready", "--json", "--limit", "0"]).then(asArray<Bead>),
 
   /**
    * ONE call for the whole board: `bd list --json` carries each issue's `parent` and inline
    * `dependencies`, so grouping + edges are derived in-process — no per-epic/per-ticket spawns.
    * Reads the Dolt working set (reliable), unlike the JSONL export which lags uncommitted writes.
+   *
+   * `--limit 0` (unlimited) is REQUIRED: `bd list` defaults to 50 results, so without it a repo
+   * with >50 issues returns a truncated slice — epics show only the children that happened to
+   * land in the window (wrong ticket counts + wrong completion), and the autonomous jobs operate
+   * on partial data. Callers may still override by passing their own `--limit` in `extra`.
    */
   list: (cwd: string, extra: string[] = []) =>
-    bd(cwd, ["list", "--json", ...extra]).then(asArray<Bead>),
+    bd(cwd, ["list", "--json", "--limit", "0", ...extra]).then(asArray<Bead>),
 
   show: async (cwd: string, id: string): Promise<Bead> => {
     // `bd show --json` returns an array (one or more issues), not an object.

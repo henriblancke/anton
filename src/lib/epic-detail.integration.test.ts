@@ -84,4 +84,52 @@ suite("epic-detail integration (real bd)", () => {
     );
     expect(blocksEdge, "blocks edge from A to B").toBeDefined();
   }, 30_000);
+
+  // Regression for anton-noc: `bd list` defaults to 50 results, so in a repo with >50 issues an
+  // epic's tickets were silently truncated (planar showed 3 of 5, 1 of 6). beads.list must pass
+  // --limit 0 so ALL children come back regardless of repo size.
+  it("returns ALL of an epic's tickets even when the repo has >50 issues", async () => {
+    const epicId = await beads.create(repo, {
+      title: "Big epic",
+      type: "epic",
+      description: "## Goal\nMany tickets.",
+    });
+    // Create 8 real children under the epic…
+    const childIds: string[] = [];
+    for (let i = 0; i < 8; i++) {
+      const id = await beads.create(repo, { title: `Child ${i}`, type: "task" });
+      await beads.link(repo, id, epicId, "parent-child");
+      childIds.push(id);
+    }
+    // …and enough unrelated beads to push the total well past bd's default 50-result cap.
+    for (let i = 0; i < 60; i++) {
+      await beads.create(repo, { title: `Filler ${i}`, type: "task" });
+    }
+
+    const detail = await getEpicDetail(project, epicId);
+    const got = new Set(detail.tickets.map((t) => t.id));
+    for (const id of childIds) {
+      expect(got.has(id), `child ${id} present`).toBe(true);
+    }
+    expect(detail.tickets.length).toBe(childIds.length);
+  }, 60_000);
+
+  // Regression for anton-noc (secondary): an orphan (parentless) non-epic bead is shown on the
+  // board as a single-ticket card; opening it must return a single-ticket detail, not 404/throw.
+  it("renders an orphan non-epic bead as a single-ticket detail instead of throwing", async () => {
+    const bugId = await beads.create(repo, {
+      title: "Standalone bug",
+      type: "bug",
+      description: "## Goal\nFix the thing.",
+    });
+
+    const detail = await getEpicDetail(project, bugId);
+    expect(detail.epic.id).toBe(bugId);
+    expect(detail.tickets.map((t) => t.id)).toEqual([bugId]);
+    expect(detail.edges).toEqual([]);
+  }, 30_000);
+
+  it("still throws for a genuinely missing id", async () => {
+    await expect(getEpicDetail(project, "does-not-exist-999")).rejects.toThrow(/not found/i);
+  }, 30_000);
 });

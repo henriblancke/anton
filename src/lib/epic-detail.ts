@@ -27,11 +27,32 @@ function toTicket(bead: Bead): Ticket {
 export async function getEpicDetail(project: Project, epicId: string): Promise<EpicDetail> {
   const all = await listAllBeads(project); // one call: carries parent + inline dependencies
   const lite = all.find((b) => b.id === epicId);
-  if (!lite || !beads.isEpic(lite)) {
+  if (!lite) {
     throw new Error(`Epic not found: ${epicId}`);
   }
-  // `bd list` omits the description, so fetch the epic once for its goal/acceptance.
+  // `bd list` omits the description, so fetch the bead once for its goal/acceptance.
   const full = await beads.show(project.repoPath, epicId).catch(() => lite);
+
+  // The board renders orphan (parentless) non-epic beads as single-ticket pseudo-epic cards
+  // (board.ts ticketAsEpic). Mirror that here so opening one shows its detail instead of 404ing —
+  // it becomes an epic whose only member is itself, with no children and no epic-graph edges.
+  if (!beads.isEpic(lite)) {
+    const self = toTicket(lite);
+    const epic: Epic = {
+      id: lite.id,
+      title: lite.title,
+      goal: parseGoal(full.description),
+      acceptance: parseAcceptance(full),
+      approved: beads.isApproved(lite),
+      stage: deriveStage(lite),
+      agent: labelValue(lite.labels, "agent"),
+      risk: labelValue(lite.labels, "risk"),
+      size: labelValue(lite.labels, "size"),
+      prRef: lite.external_ref,
+      tickets: [self],
+    };
+    return { epic, description: full.description, tickets: [self], edges: [] };
+  }
 
   const childBeads = all.filter(
     (b) => ((b.parent ?? b.parent_id) as string | undefined) === epicId,
