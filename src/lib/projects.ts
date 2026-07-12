@@ -150,13 +150,25 @@ export async function addProject(input: { name?: string; repoPath: string }): Pr
   const hasBeads = existsSync(join(repoPath, ".beads"));
   const id = randomUUID();
 
-  await getDb().insert(schema.projects).values({
+  const db = getDb();
+  await db.insert(schema.projects).values({
     id,
     slug,
     name,
     repoPath,
     defaultBranch,
   });
+
+  // Seed the default background-job schedules (nightly stringer, review-fix poll, orphan grooming)
+  // so the Phase 2 jobs run without manual setup. Best-effort — a scheduling hiccup must not fail
+  // project creation.
+  try {
+    const { seedDefaultSchedules } = await import("./schedules");
+    const { systemClock } = await import("./jobs/queue");
+    await seedDefaultSchedules(db, systemClock, id);
+  } catch {
+    // non-fatal — schedules can be added later.
+  }
 
   const createdAt = Math.floor(Date.now() / 1000);
 

@@ -1,11 +1,15 @@
 /**
- * The process-wide job runner singleton (anton-dzh.1/.4). Constructed once over the shared
- * anton.db, with every job handler registered. Started from `src/instrumentation.ts` on server
- * boot; API routes enqueue through it. See DESIGN.md §4.
+ * The process-wide job runner + scheduler singletons (anton-dzh/anton-3t2). Constructed once over
+ * the shared anton.db, with every job handler registered and the cron scheduler wired in. Started
+ * from `src/instrumentation.ts` on server boot; API routes enqueue through the runner. See DESIGN §4.
  */
 import { getDb } from "../db";
 import { makeExecuteEpicHandler } from "./execute-epic";
+import { makeReviewFixHandler } from "./review-fix";
+import { makeNightlyStringerHandler } from "./nightly-stringer";
+import { makeOrphanGroomingHandler } from "./orphan-grooming";
 import { JobRunner, type RunnerLogger } from "./runner";
+import { Scheduler } from "./scheduler";
 import { systemClock } from "./queue";
 
 const log: RunnerLogger = {
@@ -14,20 +18,30 @@ const log: RunnerLogger = {
 };
 
 let _runner: JobRunner | null = null;
+let _scheduler: Scheduler | null = null;
 
 export function getRunner(): JobRunner {
   if (_runner) return _runner;
   const db = getDb();
   const runner = new JobRunner({ db, clock: systemClock, log });
   runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db }));
-  // Future job types (review-fix / nightly-stringer / orphan-grooming) register here.
+  runner.registerHandler("review-fix", makeReviewFixHandler({ db }));
+  runner.registerHandler("nightly-stringer", makeNightlyStringerHandler({ db }));
+  runner.registerHandler("orphan-grooming", makeOrphanGroomingHandler({ db }));
   _runner = runner;
   return runner;
 }
 
-/** Idempotent: starts the background loop. Call once at server boot. */
+export function getScheduler(): Scheduler {
+  if (_scheduler) return _scheduler;
+  _scheduler = new Scheduler({ db: getDb(), clock: systemClock, log });
+  return _scheduler;
+}
+
+/** Idempotent: starts the background runner loop + the cron scheduler. Call once at server boot. */
 export function startRunner(): void {
   getRunner().start();
+  getScheduler().start();
 }
 
 /** Enqueue an execute-epic job for an approved epic. Returns the job id. */
