@@ -54,6 +54,8 @@ interface EpicNodeData extends Record<string, unknown> {
 
 interface TicketNodeData extends Record<string, unknown> {
   ticket: Ticket;
+  /** Opens the ticket popup; absent when the graph is read-only. */
+  onSelect?: () => void;
 }
 
 type EpicFlowNode = Node<EpicNodeData, "epic">;
@@ -77,23 +79,32 @@ function EpicGraphNode({ data }: NodeProps<EpicFlowNode>) {
 }
 
 function TicketGraphNode({ data }: NodeProps<TicketFlowNode>) {
-  const { ticket } = data;
+  const { ticket, onSelect } = data;
   return (
     <div
-      className="flex flex-col justify-center gap-0.5 rounded-[9px] border border-border bg-card px-3 py-2 text-card-foreground"
+      className="relative"
       style={{
         width: TICKET_NODE_WIDTH,
         height: TICKET_NODE_HEIGHT,
-        borderLeft: `3px solid ${STAGE_VAR[ticket.stage]}`,
       }}
     >
       <Handle type="target" position={Position.Left} className="!size-2 !border-none !bg-border" />
-      <span className="truncate font-mono text-[9px]" style={{ color: STAGE_VAR[ticket.stage] }}>
-        {ticket.id} · {ticket.stage}
-      </span>
-      <span className="truncate text-[11.5px] font-medium leading-snug" title={ticket.title}>
-        {ticket.title}
-      </span>
+      <button
+        type="button"
+        onClick={onSelect}
+        disabled={!onSelect}
+        title={ticket.title}
+        className={cn(
+          "flex size-full flex-col justify-center gap-0.5 rounded-[9px] border border-border bg-card px-3 py-2 text-left text-card-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
+          onSelect && "cursor-pointer hover:border-primary/40",
+        )}
+        style={{ borderLeft: `3px solid ${STAGE_VAR[ticket.stage]}` }}
+      >
+        <span className="truncate font-mono text-[9px]" style={{ color: STAGE_VAR[ticket.stage] }}>
+          {ticket.id} · {ticket.stage}
+        </span>
+        <span className="truncate text-[11.5px] font-medium leading-snug">{ticket.title}</span>
+      </button>
       <Handle type="source" position={Position.Right} className="!size-2 !border-none !bg-border" />
     </div>
   );
@@ -112,6 +123,7 @@ function buildGraph(
   epic: Epic,
   tickets: Ticket[],
   edges: DepEdge[],
+  onSelectTicket?: (ticketId: string) => void,
 ): { nodes: GraphFlowNode[]; flowEdges: Edge[] } {
   const layoutInputs: GraphLayoutNode[] = [
     { id: epic.id, width: EPIC_NODE_WIDTH, height: EPIC_NODE_HEIGHT },
@@ -135,7 +147,10 @@ function buildGraph(
         id: ticket.id,
         type: "ticket",
         position: positions.get(ticket.id) ?? { x: 0, y: 0 },
-        data: { ticket },
+        data: {
+          ticket,
+          onSelect: onSelectTicket ? () => onSelectTicket(ticket.id) : undefined,
+        },
       }),
     ),
   ];
@@ -168,6 +183,7 @@ export function DependencyGraph({
   tickets,
   edges,
   fill = false,
+  onSelectTicket,
 }: {
   epic: Epic;
   tickets: Ticket[];
@@ -175,8 +191,13 @@ export function DependencyGraph({
   /** Fill the parent container (used inside the epic-detail split panel) instead of a fixed,
    * bordered card. */
   fill?: boolean;
+  /** Called with a ticket id when its node is activated; enables the clickable ticket popup. */
+  onSelectTicket?: (ticketId: string) => void;
 }) {
-  const { nodes, flowEdges } = useMemo(() => buildGraph(epic, tickets, edges), [epic, tickets, edges]);
+  const { nodes, flowEdges } = useMemo(
+    () => buildGraph(epic, tickets, edges, onSelectTicket),
+    [epic, tickets, edges, onSelectTicket],
+  );
 
   if (tickets.length === 0) {
     return (
@@ -209,6 +230,7 @@ export function DependencyGraph({
         proOptions={{ hideAttribution: true }}
         nodesDraggable={false}
         nodesConnectable={false}
+        nodesFocusable={false}
         minZoom={0.3}
         maxZoom={1.5}
         aria-label={`Dependency graph for ${epic.title}`}

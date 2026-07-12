@@ -9,6 +9,7 @@ import type { Stage, TicketRow } from "@/lib/types";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { agentDotClass } from "@/components/board/board-utils";
+import { TicketDialog } from "@/components/ticket/ticket-dialog";
 import { TicketsFilters } from "@/components/tickets/tickets-filters";
 import {
   countActiveFilters,
@@ -30,6 +31,7 @@ export function TicketsView({ slug }: { slug: string }) {
     error: string | null;
   }>({ key: queryString, tickets: null, error: null });
   const [attempt, setAttempt] = useState(0);
+  const [openTicketId, setOpenTicketId] = useState<string | null>(null);
 
   if (state.key !== queryString) {
     setState({ key: queryString, tickets: null, error: null });
@@ -108,7 +110,7 @@ export function TicketsView({ slug }: { slug: string }) {
         </div>
       ) : (
         <>
-          <TicketsTable slug={slug} tickets={tickets} />
+          <TicketsTable slug={slug} tickets={tickets} onOpenTicket={setOpenTicketId} />
           <div className="mt-auto flex items-center justify-between border-t border-border px-5 py-3 sm:px-6">
             <span className="font-mono text-[11px] text-subtle">
               {tickets.length} matching
@@ -117,13 +119,29 @@ export function TicketsView({ slug }: { slug: string }) {
           </div>
         </>
       )}
+
+      <TicketDialog
+        slug={slug}
+        ticketId={openTicketId}
+        open={openTicketId !== null}
+        onClose={() => setOpenTicketId(null)}
+        onSaved={() => setAttempt((n) => n + 1)}
+      />
     </div>
   );
 }
 
 const GRID = "grid grid-cols-[26px_minmax(0,1fr)_92px_150px_120px_72px_60px] items-center gap-3";
 
-function TicketsTable({ slug, tickets }: { slug: string; tickets: TicketRow[] }) {
+function TicketsTable({
+  slug,
+  tickets,
+  onOpenTicket,
+}: {
+  slug: string;
+  tickets: TicketRow[];
+  onOpenTicket: (ticketId: string) => void;
+}) {
   return (
     <div className="flex flex-col">
       <div
@@ -144,13 +162,8 @@ function TicketsTable({ slug, tickets }: { slug: string; tickets: TicketRow[] })
         {tickets.map((ticket, i) => {
           const isDone = ticket.stage === "done";
           const isEpic = ticket.type === "epic";
-          const titleHref = isEpic
-            ? `/projects/${slug}/epics/${ticket.id}`
-            : ticket.epicId
-              ? `/projects/${slug}/epics/${ticket.epicId}`
-              : null;
           const titleClass = cn(
-            "truncate text-[13px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
+            "truncate text-left text-[13px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
             isDone
               ? "text-muted-foreground line-through decoration-border"
               : isEpic
@@ -163,14 +176,23 @@ function TicketsTable({ slug, tickets }: { slug: string; tickets: TicketRow[] })
               className={cn(GRID, "px-5 py-2.5 sm:px-6", i % 2 === 1 && "bg-card/40")}
             >
               <StatusCircle stage={ticket.stage} epic={isEpic} />
-              {titleHref ? (
-                <Link href={titleHref} className={titleClass} title={ticket.title}>
+              {isEpic ? (
+                <Link
+                  href={`/projects/${slug}/epics/${ticket.id}`}
+                  className={titleClass}
+                  title={ticket.title}
+                >
                   {ticket.title}
                 </Link>
               ) : (
-                <span className={titleClass} title={ticket.title}>
+                <button
+                  type="button"
+                  onClick={() => onOpenTicket(ticket.id)}
+                  className={cn(titleClass, "hover:underline hover:decoration-border")}
+                  title={ticket.title}
+                >
                   {ticket.title}
-                </span>
+                </button>
               )}
               <span className="font-mono text-[11px] text-subtle">{ticket.id}</span>
               {isEpic ? (
