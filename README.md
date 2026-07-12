@@ -1,8 +1,35 @@
-# anton
+<p align="center">
+  <img src="./public/anton-avatar.svg" alt="anton" width="140" />
+</p>
 
-**A local, single-user app that turns ideas and code-scan findings into approved epics and executes them autonomously.** anton shapes work into epics, waits for your approval, then runs each epic in an isolated git worktree — driving `claude` to implement it, running your tests, and opening a pull request per unit of work. It watches the PR and auto-resolves review comments and CI failures. Epic-first, approval-gated, agent-driven.
+<h1 align="center">anton</h1>
 
-> **Local, not deployed.** anton runs as a Next.js server on your machine and drives your local `claude`, `git`, `gh`, `bd`, and `stringer`. It is not a hosted service. See [`DESIGN.md`](./DESIGN.md) for the full architecture.
+<p align="center"><strong>Shape an idea into an epic, approve it, and let it ship itself.</strong></p>
+
+## What is anton
+
+anton is a local app that takes an idea — or a finding from scanning your code — and turns it into work that gets done while you watch. You describe what you want; anton **shapes** it into an epic with concrete tickets and sets it aside for your OK. Once you **approve**, it runs each ticket **autonomously**: it spins up an isolated git worktree, drives `claude` to write the code, runs your tests, and opens a **pull request**. Then it keeps working the PR for you — when a reviewer asks for changes or CI goes red, it **auto review-fixes** until the PR is clean.
+
+The loop, in one line:
+
+```
+shape → approve → autonomous run → PR → auto review-fix
+```
+
+You stay in control at exactly two points — approving the epic and merging the PR. Everything in between runs on its own.
+
+> **Local, not deployed.** anton runs as a Next.js server on your machine and drives your local `claude`, `git`, `gh`, `bd`, and `stringer`. It is not a hosted service — there's nothing to sign up for and nothing leaves your machine. See [`DESIGN.md`](./DESIGN.md) for the full architecture.
+
+## Quick start
+
+```bash
+bun install                       # or: npm install
+anton setup                       # check prereqs, migrate the DB, build native deps
+anton start                       # build if needed, then start the server
+open http://localhost:3000        # add a repo, shape an epic, approve, watch it run
+```
+
+New here? See [Install](#install) and [Run locally](#run-locally) for prerequisites and detail.
 
 ## What it does
 
