@@ -4,7 +4,6 @@
  * ONE PR via `gh` and move the epic to in-review. Idempotent/resumable — a re-run (crash, quota
  * backoff) skips tickets already closed and reuses the existing worktree. See DESIGN.md §4/§7.
  */
-import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { loadAgentPrompt } from "../claude/agent-prompt";
@@ -20,6 +19,7 @@ import {
 } from "../runs";
 import { appendSessionLog, createSession, endSession, sessionLogPath } from "../sessions";
 import { isUsageLimitError } from "./errors";
+import { runShell } from "./shell";
 import type { AntonDb, Clock } from "./queue";
 import { systemClock } from "./queue";
 import type { JobContext, JobHandler } from "./runner";
@@ -303,22 +303,6 @@ function prBody(epic: Bead, tickets: Bead[]): string {
     `🤖 Generated with [anton](https://github.com/) autonomous execution`,
   ];
   return lines.join("\n");
-}
-
-/** Run a shell command, capturing combined output. Aborts with the run's signal. */
-function runShell(
-  cmd: string,
-  cwd: string,
-  signal?: AbortSignal,
-): Promise<{ ok: boolean; code: number | null; output: string }> {
-  return new Promise((resolve, reject) => {
-    const child = spawn("sh", ["-c", cmd], { cwd, signal });
-    let out = "";
-    child.stdout?.on("data", (c: Buffer) => (out += c.toString("utf8")));
-    child.stderr?.on("data", (c: Buffer) => (out += c.toString("utf8")));
-    child.on("error", reject);
-    child.on("close", (code) => resolve({ ok: code === 0, code, output: out }));
-  });
 }
 
 /** Swallow errors from best-effort bd side effects (already-applied labels, etc.). */

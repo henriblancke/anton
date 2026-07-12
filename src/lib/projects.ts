@@ -93,6 +93,12 @@ export interface ProjectSettings {
    * (anton-cjs). Customizes how epics are approached; cannot override the base. Empty = none.
    */
   seedPrompt?: string;
+  /**
+   * Operator-editable reasoning prompt for the review-fix job (anton-f5n). Overrides the default
+   * `src/prompts/review-fix.md` when set; anton appends the concrete PR context beneath it. Empty
+   * = use the shipped default.
+   */
+  reviewFixPrompt?: string;
 }
 
 export async function getProjectSettings(db: AntonDb, id: string): Promise<ProjectSettings> {
@@ -150,13 +156,25 @@ export async function addProject(input: { name?: string; repoPath: string }): Pr
   const hasBeads = existsSync(join(repoPath, ".beads"));
   const id = randomUUID();
 
-  await getDb().insert(schema.projects).values({
+  const db = getDb();
+  await db.insert(schema.projects).values({
     id,
     slug,
     name,
     repoPath,
     defaultBranch,
   });
+
+  // Seed the default background-job schedules (nightly stringer, review-fix poll, orphan grooming)
+  // so the Phase 2 jobs run without manual setup. Best-effort — a scheduling hiccup must not fail
+  // project creation.
+  try {
+    const { seedDefaultSchedules } = await import("./schedules");
+    const { systemClock } = await import("./jobs/queue");
+    await seedDefaultSchedules(db, systemClock, id);
+  } catch {
+    // non-fatal — schedules can be added later.
+  }
 
   const createdAt = Math.floor(Date.now() / 1000);
 

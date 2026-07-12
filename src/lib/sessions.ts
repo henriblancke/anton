@@ -10,7 +10,13 @@ import { desc, eq } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import type { AntonDb, Clock } from "./jobs/queue";
 
-export type SessionKind = "shape" | "execute" | "review-fix" | "interactive";
+export type SessionKind =
+  | "shape"
+  | "execute"
+  | "review-fix"
+  | "nightly-stringer"
+  | "orphan-grooming"
+  | "interactive";
 export type SessionStatus = "running" | "done" | "failed";
 
 export type SessionRow = typeof schema.sessions.$inferSelect;

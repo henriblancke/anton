@@ -1,0 +1,52 @@
+# Release on tag (anton-wjf). anton is a local, single-user Next.js app shipped via npm `bin`
+# (`anton` launcher) — there is no compiled/deployed artifact. A `v*` tag runs the same quality
+# gates as CI and cuts a GitHub Release with auto-generated notes, so a tag always corresponds to
+# a green, buildable commit. Uncomment the publish step to also push to npm.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # create the GitHub Release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.2.20" # match package.json `packageManager`
+
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Test
+        # Integration suites that need bd/gh/stringer/claude self-skip when those CLIs are absent
+        # (see the `has(...)` guards); the unit + DB-backed suites still run.
+        run: bun run test
+
+      - name: Build
+        run: bun run build
+
+      - name: Verify the anton CLI launches
+        run: node bin/anton.mjs --help
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+
+      # Publish to npm so `npm i -g anton` works from the registry. Requires an NPM_TOKEN secret
+      # and dropping `"private": true` from package.json. Left off by default (local-first app).
+      # - name: Publish to npm
+      #   run: npm publish --provenance --access public
+      #   env:
+      #     NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

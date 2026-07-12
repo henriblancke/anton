@@ -1,0 +1,41 @@
+# CI (anton-1j1). Runs the quality gates on every push to main and every PR: lint, typecheck,
+# tests, and a production build. The release workflow (release.yml) runs the same gates on a `v*`
+# tag before cutting a Release, so a tag can only point at a green commit.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref (e.g. rapid pushes to a PR branch).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.2.20" # match package.json `packageManager`
+
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Test
+        # Integration suites that shell out to bd/gh/stringer/claude self-skip when those CLIs are
+        # absent (see the `has(...)` guards); the unit + DB-backed suites always run.
+        run: bun run test
+
+      - name: Build
+        run: bun run build

@@ -51,6 +51,25 @@ export async function pushBranch(repoPath: string, branch: string): Promise<void
   await git(repoPath, ["push", "-u", "origin", branch]);
 }
 
+/**
+ * True when `branch` has local commits not yet on `origin/<branch>` — i.e. there is work to push.
+ * Used by review-fix to decide whether a prior (crash/retry) fix is still unpushed even when the
+ * current claude run produced no new commit. If the remote-tracking ref is unknown, assume ahead
+ * (safer to attempt a no-op push than to silently skip real work).
+ */
+export async function branchAheadOfRemote(
+  repoPath: string,
+  branch: string,
+  remote = "origin",
+): Promise<boolean> {
+  try {
+    const out = await git(repoPath, ["rev-list", "--count", `${remote}/${branch}..${branch}`]);
+    return Number(out.trim()) > 0;
+  } catch {
+    return true;
+  }
+}
+
 export interface PullRequest {
   url: string;
   /** beads external-ref form: `gh-<number>` when the number is parseable, else the url. */

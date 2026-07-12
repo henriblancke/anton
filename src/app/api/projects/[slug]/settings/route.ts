@@ -17,8 +17,9 @@ export async function GET(_request: Request, { params }: { params: Promise<{ slu
   return NextResponse.json({ settings });
 }
 
-/** Upper bound on the operator seed prompt — generous for guidance, guards a runaway payload. */
+/** Upper bound on operator-editable prompts — generous for guidance, guards a runaway payload. */
 const MAX_SEED_PROMPT = 8000;
+const MAX_REVIEW_FIX_PROMPT = 8000;
 
 export async function PATCH(request: Request, { params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
@@ -48,6 +49,20 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
         { status: 400 },
       );
     } else patch.seedPrompt = seed;
+  }
+
+  if ("reviewFixPrompt" in body) {
+    const rf = body.reviewFixPrompt;
+    // "" / null → clear the override (fall back to the shipped default). Otherwise a bounded string.
+    if (rf == null || rf === "") patch.reviewFixPrompt = undefined;
+    else if (typeof rf !== "string") {
+      return NextResponse.json({ error: "reviewFixPrompt must be a string" }, { status: 400 });
+    } else if (rf.length > MAX_REVIEW_FIX_PROMPT) {
+      return NextResponse.json(
+        { error: `reviewFixPrompt too long (max ${MAX_REVIEW_FIX_PROMPT} chars)` },
+        { status: 400 },
+      );
+    } else patch.reviewFixPrompt = rf;
   }
 
   try {
