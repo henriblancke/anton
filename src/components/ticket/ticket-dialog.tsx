@@ -379,6 +379,31 @@ function EditForm({
         </Select>
       </div>
 
+      <ContractField
+        label="Goal"
+        value={draft.goal}
+        onChange={(v) => set("goal", v)}
+        rows={3}
+        placeholder="What this ticket accomplishes."
+      />
+
+      <ContractField
+        label="Acceptance"
+        value={draft.acceptance}
+        onChange={(v) => set("acceptance", v)}
+        rows={5}
+        placeholder={"One criterion per line, e.g.\n- [ ] Edit mode gains contract editing"}
+      />
+
+      <ContractField
+        label="Description"
+        hint="Context, Out of scope, Verify — the rest of the contract"
+        value={draft.body}
+        onChange={(v) => set("body", v)}
+        rows={6}
+        placeholder="The remaining contract markdown."
+      />
+
       <DialogFooter>
         <Button variant="outline" size="sm" onClick={onCancel} disabled={saving}>
           Cancel
@@ -416,6 +441,39 @@ function Select({
         </select>
         <span className="pointer-events-none absolute right-3 text-subtle">▾</span>
       </div>
+    </label>
+  );
+}
+
+function ContractField({
+  label,
+  hint,
+  value,
+  onChange,
+  rows,
+  placeholder,
+}: {
+  label: string;
+  hint?: string;
+  value: string;
+  onChange: (value: string) => void;
+  rows: number;
+  placeholder?: string;
+}) {
+  return (
+    <label className="flex flex-col gap-1.5">
+      <span className="flex items-baseline gap-2">
+        <span className="text-[11px] text-subtle">{label}</span>
+        {hint && <span className="text-[10px] text-subtle/70">{hint}</span>}
+      </span>
+      <textarea
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        rows={rows}
+        placeholder={placeholder}
+        aria-label={label}
+        className="w-full resize-y rounded-lg border border-border bg-card px-3 py-2.5 font-mono text-[12px] leading-relaxed text-foreground outline-none placeholder:text-subtle focus:border-primary/60"
+      />
     </label>
   );
 }

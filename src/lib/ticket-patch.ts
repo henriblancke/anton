@@ -7,7 +7,17 @@
 import { LABEL_PREFIXES, type BeadPatch, type LabelPrefix } from "./beads/bd";
 
 // The flat fields the ticket dialog is allowed to send. Anything else is rejected.
-const FIELDS = ["title", "status", "priority", "agent", "risk", "size", "domain"] as const;
+const FIELDS = [
+  "title",
+  "status",
+  "priority",
+  "agent",
+  "risk",
+  "size",
+  "domain",
+  "description",
+  "acceptance",
+] as const;
 
 // Allowed values, mirroring the beads conventions (see AGENTS/ethos cheatsheet).
 const STATUSES = ["open", "in_progress", "blocked", "closed"] as const;
@@ -53,6 +63,21 @@ export function parseTicketPatch(body: unknown): ParsedPatch {
       return { error: `Invalid priority: ${String(p)} (expected integer 0-4)` };
     }
     patch.priority = p;
+  }
+
+  // Contract markdown. The dialog composes the whole description (## Goal / ## Acceptance / body)
+  // and mirrors the acceptance text into the dedicated field; both are passed straight through.
+  if ("description" in input) {
+    if (typeof input.description !== "string" || input.description.trim() === "") {
+      return { error: "description must be a non-empty string" };
+    }
+    patch.description = input.description;
+  }
+  if ("acceptance" in input) {
+    if (typeof input.acceptance !== "string" || input.acceptance.trim() === "") {
+      return { error: "acceptance must be a non-empty string" };
+    }
+    patch.acceptance = input.acceptance;
   }
 
   // Managed labels: agent is free-form; risk/size/domain are constrained value sets.

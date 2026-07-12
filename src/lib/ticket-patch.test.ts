@@ -41,6 +41,17 @@ describe("parseTicketPatch", () => {
     expect("error" in parseTicketPatch("x")).toBe(true);
   });
 
+  it("passes contract markdown (description + acceptance) straight through", () => {
+    const r = parseTicketPatch({ description: "## Goal\n\ng", acceptance: "- [ ] a" });
+    expect(r).toEqual({ patch: { description: "## Goal\n\ng", acceptance: "- [ ] a" } });
+  });
+
+  it("rejects an empty or non-string description/acceptance", () => {
+    expect("error" in parseTicketPatch({ description: "  " })).toBe(true);
+    expect("error" in parseTicketPatch({ description: 5 })).toBe(true);
+    expect("error" in parseTicketPatch({ acceptance: "" })).toBe(true);
+  });
+
   it("treats an empty patch as valid (no-op)", () => {
     expect(parseTicketPatch({})).toEqual({ patch: {} });
   });
