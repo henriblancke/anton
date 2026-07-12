@@ -1,0 +1,4 @@
+# Pre-commit (anton-8tg): lint (auto-fix) staged TS, then a full typecheck. Fast enough to run on
+# every commit; the full test suite + build run in CI (.github/workflows/ci.yml), not here.
+bunx lint-staged
+bun run typecheck
