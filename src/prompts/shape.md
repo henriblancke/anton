@@ -13,7 +13,7 @@ description: >-
 You are the front of the funnel. The system's ceiling is how well you shape work: the executor
 has no context except the bead, and no reviewer has a rubric except the bead. Invest here.
 
-The loom operating context (ethos + bead conventions) is injected at session start. Read the
+anton's operating context (ETHOS + BEADS conventions) is injected at session start. Read the
 project's `.product/PRODUCT.md` + `.product/principles.md` before shaping. If `.product/` is
 missing, say so and run `/setup` — do not shape against a vacuum.
 
@@ -65,8 +65,8 @@ For every ticket, the description MUST contain, or it is not `shaped`:
 ## Verify        the tests that prove it; what to add
 ```
 
-Set labels (`domain:`, `risk:`, `agent:`, `size:`) per the injected bead cheatsheet (exact
-commands in the `bd` skill). Set dependency edges: `parent-child` to the epic, `blocks` for
+Set labels (`domain:`, `risk:`, `agent:`, `size:`) per the injected BEADS conventions (exact
+commands in `BEADS.md`). Set dependency edges: `parent-child` to the epic, `blocks` for
 hard ordering. `risk:high` for schema/auth/payments/migrations/infra. A `size:L` ticket is a
 smell — split it. (Model routing is the executor's call — don't set a `model:` label.)
 
@@ -75,7 +75,7 @@ executor plans in its own session. Over-specification goes stale before foolery 
 
 ## Phase 5 — Create the beads and confirm
 
-Use the `bd` wrapper (see `skills/bd`) to create the epic and tickets with their fields,
+Use `bd` (following anton's BEADS conventions) to create the epic and tickets with their fields,
 labels, and edges. Then show the user the graph (`bd list`/tree) and the epic's one-line
 scope, and confirm before finishing. The user approves what gets built — you don't merge
 scope silently.

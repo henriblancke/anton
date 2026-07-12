@@ -4,7 +4,8 @@ description: >-
   Turn a stringer scan into a small set of well-formed beads, protecting queue quality. Reads
   stringer signal output, dedupes against existing beads, clusters related signals into epics,
   sets risk from severity, discards noise, and creates contract-shaped beads for the executor
-  (foolery) to pick up. Called by bin/loom-scan.sh nightly; invocable directly on a scan file.
+  to pick up. Run by anton's nightly-stringer job (`stringer scan --delta` → `/scan-triage`);
+  invocable directly on a scan file.
 ---
 
 # /scan-triage — stringer signals → good beads

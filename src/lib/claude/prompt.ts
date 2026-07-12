@@ -1,5 +1,5 @@
 /**
- * Load a named prompt from anton's own `src/prompts/` (anton-3t2.3/.4). These are the loom-ported
+ * Load a named prompt from anton's own `src/prompts/` (anton-3t2.3/.4). These are anton's own
  * task prompts (`scan-triage.md`, …) claude runs as its `-p` instruction for a background job —
  * distinct from agent-tag specialist prompts (agent-prompt.ts) and the locked base contract
  * (system-prompt.ts). Frontmatter is stripped; the body is the prompt.
