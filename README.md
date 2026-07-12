@@ -46,13 +46,6 @@ anton setup      # check prerequisites, run DB migrations, rebuild node-pty
 anton start      # build if needed, then start the server on http://localhost:3000
 ```
 
-`anton` is the shipped CLI (wired via package.json `bin`). During local development you can also use the scripts directly:
-
-```bash
-anton dev        # or: bun run dev   — Next.js dev server (hot reload)
-anton start      # or: bun run build && bun run start
-```
-
 The **job runner and cron scheduler start automatically** with the server (via `src/instrumentation.ts`), so approved epics execute and scheduled jobs fire without any extra process. Set `ANTON_RUNNER=off` to boot the UI without them.
 
 ### CLI
@@ -65,15 +58,43 @@ anton start    build if needed, then run the server (next start)
 anton --help   show help
 ```
 
-## Using it
+## Using anton
 
-1. **Add a project** — point anton at a local repo that has a `.beads/` directory (run `bd init` in it if not).
-2. **Shape an epic** — "Add work" opens an interactive `/shape` session in the browser terminal; the result lands in **backlog**.
-3. **Approve** — review the epic's Goal + Acceptance + tickets on the board and click **Approve**. anton only ever executes approved epics.
-4. **Watch it run** — the epic moves to **implementing** with a live terminal, then to **in-review** with a PR link once all tickets are done.
-5. **Let review-fix work the PR** — it polls the PR, and when a reviewer requests changes or CI fails, it dispatches `claude` to resolve, pushes, and re-requests review.
+Once the server is up at `http://localhost:3000`, a full turn of work looks like this:
 
-Per-project settings (model, execution seed prompt, review-fix prompt, test command, base branch) are editable in the **Settings** page.
+1. **Add a project.** From the projects screen, add a local repo that has a `.beads/` directory (run `bd init` in it first if it doesn't). anton records the repo path and detects its default branch; beads and git in that repo are never modified by adding it.
+2. **Shape an epic.** Click **Add work** to open an interactive `/shape` session in the browser terminal. You talk through the idea with `claude`; it writes an epic — Goal, Acceptance, and child tickets — into the repo's beads. The epic lands in **backlog**, unapproved.
+3. **Review and approve.** Open the epic on the board and read its Goal, Acceptance, and tickets. When it's right, click **Approve**. This is the gate: **anton only ever executes approved epics.** Nothing runs against your code until you approve.
+4. **Watch it run.** On approval the epic moves to **implementing** and anton enqueues a run per ticket. Each run gets its own git worktree, drives `claude` (base contract + your seed prompt + the ticket's agent prompt) to implement the ticket, runs your test command, commits, and opens a PR. A live terminal streams the session; the board shows progress. When every ticket is done the epic moves to **in-review** with its PR link.
+5. **Let review-fix work the PR.** The **review-fix** job polls each open PR. When a reviewer requests changes or CI fails, it dispatches `claude` with the PR context (comments, failing checks) to resolve them, pushes, and re-requests review — repeating until the PR is clean. You review and merge; anton keeps the loop tidy in between.
+
+You stay in control at two points — approving the epic and merging the PR. Everything between is autonomous.
+
+### Project settings
+
+Each project has its own settings (under **Settings** for that project). Nothing here is required — sensible defaults apply when a field is empty.
+
+| Setting | What it controls |
+|---------|------------------|
+| **Model** | Which model the headless `claude` driver uses for runs (Opus / Sonnet / Haiku / Fable, or **Default** to use `claude`'s own configured model). |
+| **Seed prompt** | Extra operator guidance layered onto the locked base contract for every run — conventions, things to avoid, where key files live. It customizes *how* epics are approached; it can't override the base contract. Empty = base + agent prompt only. |
+| **Review-fix prompt** | Overrides the default review-fix reasoning prompt (`src/prompts/review-fix.md`). anton appends the concrete PR context beneath it. Empty = the shipped default. |
+| **Test command** | The command anton runs in a worktree to verify a ticket before committing. |
+| **Base branch** | The branch runs target and open their PRs against (defaults to the repo's detected default branch). |
+| **Max concurrent runs** | How many worktrees run in parallel (1–6). |
+| **Autonomous execution** | Whether approved epics run without further prompting. |
+
+The three background jobs (**review-fix**, **nightly-stringer**, **orphan-grooming**) can each be toggled on/off per project under **Automation**.
+
+### Default schedules
+
+Default per-project schedules are seeded on project creation:
+
+- **review-fix** — every 15 min (`*/15 * * * *`)
+- **nightly-stringer** — daily at 03:00 (`0 3 * * *`)
+- **orphan-grooming** — weekly, Mon 04:00 (`0 4 * * 1`)
+
+Edit the cron or disable any of them in project settings.
 
 ## Configuration
 
@@ -87,23 +108,28 @@ Environment variables (all optional):
 | `ANTON_SESSIONS_ROOT` | `./.anton/sessions` | claude session logs |
 | `ANTON_SCANS_ROOT` | `./.anton/scans` | stringer scan files |
 
-Default per-project schedules are seeded on project creation: review-fix every 15 min, nightly-stringer at 03:00, orphan-grooming weekly (Mon 04:00). Edit or disable them in project settings.
+## Troubleshooting
 
-## Development
+**`anton setup`/`doctor` reports a MISSING required tool.** anton can't run without `git`, `bd`, `claude`, and node ≥ 20. Install the flagged tool, make sure it's on your `PATH`, and re-run `anton doctor` until every required row shows `found`. `gh` and `stringer` are optional — without `gh` you lose PRs and review-fix; without `stringer` you lose the nightly scan.
+
+**The live terminal / interactive `/shape` session doesn't work.** anton uses `node-pty`, whose prebuilt binaries don't always match your local node ABI. `anton setup` rebuilds it best-effort, but if the rebuild was skipped or failed, rebuild it manually:
 
 ```bash
-bun run lint         # eslint
-bun run typecheck    # tsc --noEmit
-bun run test         # vitest (unit + integration; integration suites self-skip
-                     # when bd/gh/stringer/claude aren't installed)
-bun run build        # next build
+cd node_modules/node-pty && npx node-gyp rebuild
 ```
 
-- **Pre-commit** — a husky hook runs `lint-staged` (eslint --fix on staged `.ts`/`.tsx`) then `typecheck`. Installed automatically on `bun install`.
-- **CI** — `.github/workflows/ci.yml` runs lint + typecheck + test + build on every push to `main` and every PR.
-- **Release** — pushing a `v*` tag runs the same gates and cuts a GitHub Release (`.github/workflows/release.yml`).
-- **Issue tracking** — this repo uses **bd (beads)**, not markdown TODOs. `bd ready` to find work, `bd show <id>` for detail.
+Then restart the server. (A node upgrade can break the ABI again — re-run the rebuild after upgrading node.)
+
+**The UI boots but nothing executes.** Approved epics run only when the job runner is on. If you started with `ANTON_RUNNER=off`, the UI comes up but the runner and scheduler don't — restart without that variable so runs execute and scheduled jobs fire. Conversely, set `ANTON_RUNNER=off` when you *want* the UI without any background execution (e.g. inspecting state).
+
+**A run never opens a PR, or review-fix does nothing.** These need `gh` authenticated against the repo's remote. Check `gh auth status` and that the project's remote is reachable. review-fix also only acts once a PR exists and a reviewer has requested changes or a check has failed.
+
+**`anton doctor` shows `anton.db not created`.** Run `anton setup` — it applies the Drizzle migrations that create/update `anton.db`. `anton.db` is disposable machine-local state; deleting it and re-running `anton setup` is a safe reset (your work lives in beads + git, not here).
 
 ## Stack
 
 Next.js 16 (App Router, RSC) · React 19 · Tailwind 4 · shadcn/ui · Drizzle + better-sqlite3 · node-pty + @xterm/xterm · in-process durable job runner · bun (pm) / node (runtime).
+
+## Contributing
+
+Setup, quality gates, CI, and release process live in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
