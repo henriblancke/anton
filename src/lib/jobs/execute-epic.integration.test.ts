@@ -110,12 +110,16 @@ suite("execute-epic e2e (real handler · real bd/git · fake claude/gh)", () => 
     t1 = idOf(c1);
     t2 = idOf(c2);
 
-    // Fake claude: make a change in the worktree, emit valid stream-json, succeed.
+    // Fake claude: make a change in the worktree, dump its -p / --append-system-prompt args (so
+    // the test can assert the composed system prompt reached it), emit valid stream-json, succeed.
     const fakeClaude = writeBin(
       binDir,
       "claude",
       `const fs=require('fs');const path=require('path');
 fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work '+Date.now()+' '+Math.random()+'\\n');
+const a=process.argv.slice(2);const get=f=>{const i=a.indexOf(f);return i>=0?a[i+1]:undefined;};
+const dump=process.env.ANTON_TEST_CLAUDE_ARGV;
+if(dump){fs.appendFileSync(dump,JSON.stringify({prompt:get('-p'),append:get('--append-system-prompt')})+'\\n');}
 const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
 e({type:'system',subtype:'init',session_id:'s'});
 e({type:'assistant',message:{content:[{type:'text',text:'implemented the ticket'}]}});
@@ -135,6 +139,7 @@ process.exit(0);`,
     set("ANTON_GH_BIN", fakeGh);
     set("ANTON_WORKTREES_ROOT", join(sandbox, "worktrees"));
     set("ANTON_SESSIONS_ROOT", join(sandbox, "sessions"));
+    set("ANTON_TEST_CLAUDE_ARGV", join(sandbox, "claude-argv.jsonl"));
 
     // Test DB + project row.
     tdb = makeTestDb();
@@ -147,7 +152,11 @@ process.exit(0);`,
       repoPath: repo,
       defaultBranch: "main",
       // testCommand asserts claude ran before tests → proves ordering claude→tests.
-      settingsJson: JSON.stringify({ testCommand: "test -f AGENT_WORK.md" }),
+      // seedPrompt asserts the operator seed layers into the composed system prompt.
+      settingsJson: JSON.stringify({
+        testCommand: "test -f AGENT_WORK.md",
+        seedPrompt: "SEED_MARKER_QZX — prefer server components in this repo.",
+      }),
     });
   }, 60_000);
 
@@ -223,6 +232,25 @@ process.exit(0);`,
       expect(existsSync(s.logPath!)).toBe(true);
       expect(readFileSync(s.logPath!, "utf8")).toContain("[result]");
     }
+
+    // Composed system prompt reached claude for BOTH tickets: locked base + operator seed on
+    // every invocation, and the agent layer only for the agent-tagged ticket (t1: agent:nextjs).
+    const argvDump = join(sandbox, "claude-argv.jsonl");
+    const invocations = readFileSync(argvDump, "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as { prompt?: string; append?: string });
+    const forTicket = (id: string) => invocations.find((v) => v.prompt?.includes(id))!;
+
+    for (const id of [t1, t2]) {
+      const inv = forTicket(id);
+      expect(inv.append).toContain("operating contract"); // locked base
+      expect(inv.append).toContain("bd remember"); // learnings requirement
+      expect(inv.append).toContain("SEED_MARKER_QZX"); // operator seed layered in
+    }
+    // Agent layer present only where an agent:tag exists.
+    expect(forTicket(t1).append).toContain("Specialist guidance (agent)");
+    expect(forTicket(t2).append).not.toContain("Specialist guidance (agent)");
   }, 60_000);
 
   it("parks on a usage limit, then resumes the SAME run/worktree past the reset window", async () => {

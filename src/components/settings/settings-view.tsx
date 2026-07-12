@@ -12,6 +12,7 @@ import { agentDotClass } from "@/components/board/board-utils";
 /** Settings the UI can edit today. Kept local so this client module never imports server code. */
 interface EditableSettings {
   model?: string;
+  seedPrompt?: string;
 }
 
 /** Default model options for the headless claude driver. Empty value = the CLI's own default. */
@@ -26,6 +27,7 @@ const MODELS: { value: string; label: string; hint?: string }[] = [
 const SECTIONS = [
   { id: "general", label: "General" },
   { id: "agents", label: "Agents" },
+  { id: "prompt", label: "Prompt" },
   { id: "execution", label: "Execution" },
   { id: "automation", label: "Automation" },
 ] as const;
@@ -52,9 +54,12 @@ const AUTOMATIONS = [
 export function SettingsView({
   project,
   settings,
+  basePrompt,
 }: {
   project: Project;
   settings: EditableSettings;
+  /** The locked base system prompt, shown read-only so operators see what always applies. */
+  basePrompt: string;
 }) {
   const [active, setActive] = useState<(typeof SECTIONS)[number]["id"]>("general");
   const [agents, setAgents] = useState<Set<string>>(new Set(DEFAULT_ACTIVE));
@@ -64,6 +69,7 @@ export function SettingsView({
     Object.fromEntries(AUTOMATIONS.map((a) => [a.id, a.on])),
   );
   const [model, setModel] = useState(settings.model ?? "");
+  const [seedPrompt, setSeedPrompt] = useState(settings.seedPrompt ?? "");
   const [saving, setSaving] = useState(false);
 
   function toggleAgent(agent: string) {
@@ -81,8 +87,8 @@ export function SettingsView({
       const res = await fetch(`/api/projects/${project.slug}/settings`, {
         method: "PATCH",
         headers: { "content-type": "application/json" },
-        // "" clears the override → the driver runs claude with no --model.
-        body: JSON.stringify({ model: model || null }),
+        // "" clears the override → the driver runs claude with no --model / no seed layer.
+        body: JSON.stringify({ model: model || null, seedPrompt: seedPrompt.trim() || null }),
       });
       if (!res.ok) {
         const { error } = await res.json().catch(() => ({ error: "Save failed" }));
@@ -176,6 +182,55 @@ export function SettingsView({
                   </div>
                 );
               })}
+            </div>
+          </section>
+
+          <Divider />
+
+          {/* Prompt — locked base contract (read-only) + editable operator seed */}
+          <section className="flex flex-col gap-3.5">
+            <div className="flex items-baseline gap-2.5">
+              <h2 className="text-[15px] font-semibold">Execution prompt</h2>
+              <span className="text-xs text-subtle">what anton tells claude on every autonomous run</span>
+            </div>
+
+            <div className="flex max-w-2xl flex-col gap-2">
+              <div className="flex items-center gap-2">
+                <span className="text-[12.5px] font-medium">Seed prompt</span>
+                <span className="text-[11px] text-subtle">editable · project-specific guidance</span>
+                {seedPrompt.trim() !== (settings.seedPrompt ?? "").trim() && (
+                  <span className="font-mono text-[10px] text-primary">unsaved</span>
+                )}
+              </div>
+              <textarea
+                value={seedPrompt}
+                onChange={(e) => setSeedPrompt(e.target.value)}
+                rows={6}
+                maxLength={8000}
+                placeholder="e.g. Prefer server components. Our design tokens live in src/styles/tokens.css. Never touch the legacy /v1 API."
+                aria-label="Seed prompt"
+                className="w-full resize-y rounded-lg border border-border bg-card px-3 py-2.5 font-mono text-[12px] leading-relaxed text-foreground outline-none placeholder:text-subtle focus:border-primary/60"
+              />
+              <span className="text-[11px] text-subtle">
+                Layered on top of the base contract below. It refines behavior — it can’t override
+                the contract. Empty = base + agent prompt only. {seedPrompt.length}/8000
+              </span>
+            </div>
+
+            <div className="flex max-w-2xl flex-col gap-2">
+              <div className="flex items-center gap-2">
+                <span className="text-[12.5px] font-medium">Base contract</span>
+                <span className="inline-flex items-center gap-1 rounded-full border border-border bg-secondary px-2 py-0.5 font-mono text-[10px] text-muted-foreground">
+                  locked · always applied
+                </span>
+              </div>
+              <pre className="max-h-64 max-w-2xl overflow-auto rounded-lg border border-border bg-card px-3 py-2.5 font-mono text-[11px] leading-relaxed whitespace-pre-wrap text-muted-foreground">
+                {basePrompt || "(base prompt unavailable)"}
+              </pre>
+              <span className="text-[11px] text-subtle">
+                Core operating rules — git &amp; beads ownership, learnings capture, scope,
+                fail-loud. Defined in code; not editable here.
+              </span>
             </div>
           </section>
 

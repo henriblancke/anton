@@ -8,6 +8,7 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { loadAgentPrompt } from "../claude/agent-prompt";
+import { buildExecutionSystemPrompt } from "../claude/system-prompt";
 import { runClaude, type ClaudeEvent } from "../claude/driver";
 import { commitAll, openPullRequest } from "../git/ops";
 import { createWorktree, removeWorktree } from "../git/worktree";
@@ -161,7 +162,13 @@ async function runTicket(args: {
 }): Promise<void> {
   const { db, clock, ctx, projectId, repo, runId, worktreePath, ticket, settings } = args;
   const agentTag = labelValue(ticket.labels, "agent");
-  const appendSystemPrompt = await loadAgentPrompt(agentTag);
+  // Compose the system prompt: locked base contract + agent-tag prompt + operator seed. The base
+  // is mandatory (buildExecutionSystemPrompt throws if src/prompts/system-base.md is missing).
+  const agentPrompt = await loadAgentPrompt(agentTag);
+  const appendSystemPrompt = await buildExecutionSystemPrompt({
+    agentPrompt,
+    seedPrompt: settings.seedPrompt,
+  });
 
   const sessionId = randomUUID();
   const logPath = sessionLogPath(sessionId);
@@ -266,25 +273,23 @@ export function orderTickets(tickets: Bead[], all: Bead[]): Bead[] {
   return order.map((id) => byId.get(id)!);
 }
 
+/**
+ * The concrete task (`-p`) for one ticket: identity + acceptance only. The operating contract
+ * (git/beads ownership, scope, learnings, fail-loud) lives in the locked base system prompt
+ * (composeSystemPrompt), so it isn't duplicated here.
+ */
 function ticketPrompt(ticket: Bead): string {
   const acceptance = ticket.acceptance_criteria ?? ticket.acceptance ?? "(see `bd show`)";
   return [
-    `You are implementing a single beads ticket in THIS worktree as part of an autonomous run.`,
+    `Implement this beads ticket in the current worktree:`,
     ``,
     `Ticket: ${ticket.id} — ${ticket.title}`,
     ``,
     `Acceptance criteria:`,
     acceptance,
     ``,
-    `Run \`bd show ${ticket.id}\` for the full Goal / Context. Implement the ticket to satisfy`,
-    `its acceptance criteria, editing the working tree directly.`,
-    ``,
-    `Rules:`,
-    `- Do NOT commit, push, or open a PR — anton handles git after you finish.`,
-    `- Do NOT run \`bd close\` — anton closes the ticket once tests pass.`,
-    `- Keep changes scoped to this ticket.`,
-    ``,
-    `When done, briefly summarize what you changed.`,
+    `Run \`bd show ${ticket.id}\` for the full Goal / Context, then implement it to satisfy the`,
+    `acceptance criteria. Follow the operating contract in your system prompt.`,
   ].join("\n");
 }
 

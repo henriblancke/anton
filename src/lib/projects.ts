@@ -88,6 +88,11 @@ export interface ProjectSettings {
   testCommand?: string;
   permissionMode?: "default" | "acceptEdits" | "bypassPermissions" | "plan";
   baseBranch?: string;
+  /**
+   * Operator-editable seed prompt layered onto the locked base contract for autonomous runs
+   * (anton-cjs). Customizes how epics are approached; cannot override the base. Empty = none.
+   */
+  seedPrompt?: string;
 }
 
 export async function getProjectSettings(db: AntonDb, id: string): Promise<ProjectSettings> {
