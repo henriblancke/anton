@@ -77,9 +77,45 @@ export interface PullRequest {
   number?: number;
 }
 
+function prFromUrl(url: string): PullRequest {
+  const m = url.match(/\/pull\/(\d+)/);
+  const number = m ? Number(m[1]) : undefined;
+  return { url, ref: number ? `gh-${number}` : url, number };
+}
+
+/**
+ * Return the open PR already tracking `branch`, or undefined if there is none. Idempotency guard
+ * for openPullRequest: a resumed execute-epic run re-reaches the PR step against a branch whose PR
+ * already exists (the first run opened it), and `gh pr create` would otherwise error.
+ */
+async function findOpenPullRequest(
+  repoPath: string,
+  branch: string,
+): Promise<PullRequest | undefined> {
+  const gh = process.env[GH_BIN_ENV] ?? "gh";
+  try {
+    const { stdout } = await execFileAsync(
+      gh,
+      ["pr", "view", branch, "--json", "url,number,state"],
+      { cwd: repoPath, timeout: 120_000, maxBuffer: 4 * 1024 * 1024 },
+    );
+    const pr = JSON.parse(stdout) as { url?: string; number?: number; state?: string };
+    // `gh pr view <branch>` resolves the PR for that head branch; only reuse an OPEN one.
+    if (!pr?.url || (pr.state && pr.state !== "OPEN")) return undefined;
+    return { url: pr.url, ref: pr.number ? `gh-${pr.number}` : pr.url, number: pr.number };
+  } catch {
+    // No PR for the branch (gh exits non-zero) → nothing to reuse.
+    return undefined;
+  }
+}
+
 /**
  * Push the branch and open a PR with `gh`. Requires an `origin` remote. Parses the PR number
  * from the returned URL (…/pull/<n>). Throws a clear Error when there is no remote.
+ *
+ * Idempotent: if an open PR already tracks the branch (a resumed run that re-reaches this step),
+ * the branch is still pushed (to carry any new commits) and the existing PR is reused instead of
+ * calling `gh pr create`, which would error on a duplicate.
  */
 export async function openPullRequest(opts: {
   repoPath: string;
@@ -94,6 +130,9 @@ export async function openPullRequest(opts: {
     );
   }
   await pushBranch(opts.repoPath, opts.branch);
+
+  const existing = await findOpenPullRequest(opts.repoPath, opts.branch);
+  if (existing) return existing;
 
   const gh = process.env[GH_BIN_ENV] ?? "gh";
   const { stdout } = await execFileAsync(
@@ -114,7 +153,5 @@ export async function openPullRequest(opts: {
   );
 
   const url = stdout.trim().split("\n").filter(Boolean).pop() ?? "";
-  const m = url.match(/\/pull\/(\d+)/);
-  const number = m ? Number(m[1]) : undefined;
-  return { url, ref: number ? `gh-${number}` : url, number };
+  return prFromUrl(url);
 }
