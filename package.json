@@ -2,6 +2,18 @@
   "name": "anton",
   "version": "0.1.0",
   "private": true,
+  "bin": {
+    "anton": "bin/anton.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "drizzle",
+    "public",
+    "next.config.ts",
+    "drizzle.config.ts",
+    "tsconfig.json"
+  ],
   "scripts": {
     "dev": "next dev",
     "build": "next build",

@@ -13,6 +13,7 @@ import { beads, LABELS, type Bead } from "../beads/bd";
 import { loadAgentPrompt } from "../claude/agent-prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
 import { runClaude, type ClaudeEvent } from "../claude/driver";
+import { loadPrompt } from "../claude/prompt";
 import { branchAheadOfRemote, commitAll, pushBranch } from "../git/ops";
 import {
   classifyReview,
@@ -162,9 +163,14 @@ async function handleEpic(args: {
       seedPrompt: settings.seedPrompt,
     });
 
+    // The editable reasoning contract (per-project override, else the shipped default) followed by
+    // the concrete PR context anton fetched.
+    const reasoning = settings.reviewFixPrompt?.trim() || (await loadPrompt("review-fix"));
+    const prompt = [reasoning, "", "---", "", reviewFixContext(epic, pr, verdict.reasons)].join("\n");
+
     const result = await runClaude({
       cwd: worktree.path,
-      prompt: reviewFixPrompt(epic, pr, verdict.reasons),
+      prompt,
       appendSystemPrompt,
       model: settings.model,
       permissionMode: settings.permissionMode ?? "bypassPermissions",
@@ -219,15 +225,18 @@ function labelValue(labels: string[] | undefined, prefix: string): string | unde
   return l ? l.slice(prefix.length + 1) : undefined;
 }
 
-/** The concrete task for claude: resolve the PR's requested changes + failing CI in this worktree. */
-function reviewFixPrompt(epic: Bead, pr: PrReview, reasons: string[]): string {
+/**
+ * The concrete PR context appended beneath the (editable) reasoning contract: which epic/PR, why
+ * it needs action, the reviewer summaries + inline comments + failing checks. The reasoning of HOW
+ * to resolve lives in the review-fix prompt (default file or settings override), not here.
+ */
+function reviewFixContext(epic: Bead, pr: PrReview, reasons: string[]): string {
   const lines: string[] = [
-    `You are resolving review feedback on an open pull request in the current worktree.`,
+    `## This PR`,
     ``,
     `Epic: ${epic.id} — ${epic.title}`,
     `PR: #${pr.number} (${pr.url})`,
     `Branch: ${pr.headRefName}`,
-    ``,
     `Why this needs action: ${reasons.join("; ")}.`,
     ``,
   ];
@@ -250,15 +259,9 @@ function reviewFixPrompt(epic: Bead, pr: PrReview, reasons: string[]): string {
 
   if (pr.failingChecks.length > 0) {
     lines.push(`Failing CI checks: ${pr.failingChecks.join(", ")}.`);
-    lines.push(`Run the project's tests/build to reproduce and fix the failures.`);
-    lines.push(``);
   }
 
-  lines.push(
-    `Address every point above with real code changes in this worktree. Do NOT commit, push, or`,
-    `touch git — anton commits and pushes for you. Follow the operating contract in your system prompt.`,
-  );
-  return lines.join("\n");
+  return lines.join("\n").trimEnd();
 }
 
 async function safe(fn: () => Promise<unknown>): Promise<void> {

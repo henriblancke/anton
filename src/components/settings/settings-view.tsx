@@ -13,6 +13,7 @@ import { agentDotClass } from "@/components/board/board-utils";
 interface EditableSettings {
   model?: string;
   seedPrompt?: string;
+  reviewFixPrompt?: string;
 }
 
 /** Default model options for the headless claude driver. Empty value = the CLI's own default. */
@@ -70,6 +71,7 @@ export function SettingsView({
   );
   const [model, setModel] = useState(settings.model ?? "");
   const [seedPrompt, setSeedPrompt] = useState(settings.seedPrompt ?? "");
+  const [reviewFixPrompt, setReviewFixPrompt] = useState(settings.reviewFixPrompt ?? "");
   const [saving, setSaving] = useState(false);
 
   function toggleAgent(agent: string) {
@@ -87,8 +89,12 @@ export function SettingsView({
       const res = await fetch(`/api/projects/${project.slug}/settings`, {
         method: "PATCH",
         headers: { "content-type": "application/json" },
-        // "" clears the override → the driver runs claude with no --model / no seed layer.
-        body: JSON.stringify({ model: model || null, seedPrompt: seedPrompt.trim() || null }),
+        // "" clears the override → driver runs with no --model / no seed / the default review-fix prompt.
+        body: JSON.stringify({
+          model: model || null,
+          seedPrompt: seedPrompt.trim() || null,
+          reviewFixPrompt: reviewFixPrompt.trim() || null,
+        }),
       });
       if (!res.ok) {
         const { error } = await res.json().catch(() => ({ error: "Save failed" }));
@@ -214,6 +220,29 @@ export function SettingsView({
               <span className="text-[11px] text-subtle">
                 Layered on top of the base contract below. It refines behavior — it can’t override
                 the contract. Empty = base + agent prompt only. {seedPrompt.length}/8000
+              </span>
+            </div>
+
+            <div className="flex max-w-2xl flex-col gap-2">
+              <div className="flex items-center gap-2">
+                <span className="text-[12.5px] font-medium">Review-fix prompt</span>
+                <span className="text-[11px] text-subtle">editable · how claude resolves PR feedback</span>
+                {reviewFixPrompt.trim() !== (settings.reviewFixPrompt ?? "").trim() && (
+                  <span className="font-mono text-[10px] text-primary">unsaved</span>
+                )}
+              </div>
+              <textarea
+                value={reviewFixPrompt}
+                onChange={(e) => setReviewFixPrompt(e.target.value)}
+                rows={6}
+                maxLength={8000}
+                placeholder="Override the default review-fix reasoning prompt. Empty = anton's shipped default (src/prompts/review-fix.md)."
+                aria-label="Review-fix prompt"
+                className="w-full resize-y rounded-lg border border-border bg-card px-3 py-2.5 font-mono text-[12px] leading-relaxed text-foreground outline-none placeholder:text-subtle focus:border-primary/60"
+              />
+              <span className="text-[11px] text-subtle">
+                The reasoning contract for the review-fix job. anton appends the concrete PR context
+                (comments, failing checks) beneath it. Empty = shipped default. {reviewFixPrompt.length}/8000
               </span>
             </div>
 

@@ -10,6 +10,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
 import { makeTestDb, type TestDb } from "../db/testing";
 import { beads, LABELS } from "../beads/bd";
 import * as schema from "../db/schema";
@@ -202,6 +203,34 @@ process.exit(0);`,
     expect(sessions[0].kind).toBe("review-fix");
     expect(sessions[0].status).toBe("done");
     expect(sessions[0].beadId).toBe(epicId);
+  }, 60_000);
+
+  it("uses the per-project reviewFixPrompt override when set (else the default file)", async () => {
+    const marker = "RF_OVERRIDE_MARKER_QZX9";
+    await tdb.db
+      .update(schema.projects)
+      .set({ settingsJson: JSON.stringify({ reviewFixPrompt: `${marker}\nResolve it my way.` }) })
+      .where(eq(schema.projects.id, projectId));
+    try {
+      const runner = new JobRunner({ db: tdb.db, clock, config: { maxConcurrent: 1, leaseMs: 30_000 } });
+      runner.registerHandler("review-fix", makeReviewFixHandler({ db: tdb.db, clock }));
+      await runner.enqueue({ type: "review-fix", projectId, payload: { projectId } });
+      expect(await runner.tickOnce()).toBe(1);
+
+      const invocations = readFileSync(join(sandbox, "claude-argv.jsonl"), "utf8")
+        .trim()
+        .split("\n")
+        .map((l) => JSON.parse(l) as { prompt?: string });
+      const last = invocations[invocations.length - 1];
+      expect(last.prompt).toContain(marker); // operator override reached claude
+      expect(last.prompt).toContain("rename foo to bar"); // PR context still appended beneath it
+      expect(last.prompt).not.toContain("Triage every finding"); // default file was NOT used
+    } finally {
+      await tdb.db
+        .update(schema.projects)
+        .set({ settingsJson: "{}" })
+        .where(eq(schema.projects.id, projectId));
+    }
   }, 60_000);
 
   it("pushes an unpushed prior fix even when the new claude run produces no diff", async () => {

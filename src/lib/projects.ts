@@ -93,6 +93,12 @@ export interface ProjectSettings {
    * (anton-cjs). Customizes how epics are approached; cannot override the base. Empty = none.
    */
   seedPrompt?: string;
+  /**
+   * Operator-editable reasoning prompt for the review-fix job (anton-f5n). Overrides the default
+   * `src/prompts/review-fix.md` when set; anton appends the concrete PR context beneath it. Empty
+   * = use the shipped default.
+   */
+  reviewFixPrompt?: string;
 }
 
 export async function getProjectSettings(db: AntonDb, id: string): Promise<ProjectSettings> {
