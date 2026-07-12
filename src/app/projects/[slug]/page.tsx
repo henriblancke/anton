@@ -13,9 +13,9 @@ export default async function ProjectBoardPage({
   const project = await getProjectBySlug(slug);
 
   return (
-    <div className="flex flex-1 flex-col">
+    <div className="flex min-h-0 flex-1 flex-col">
       <Topbar projectSlug={slug} projectName={project?.name} />
-      <div className="flex flex-1 flex-col p-[18px]">
+      <div className="flex min-h-0 flex-1 flex-col p-[18px]">
         <EpicBoard slug={slug} />
       </div>
     </div>

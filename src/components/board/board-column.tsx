@@ -11,16 +11,18 @@ export function BoardColumn({
   stage,
   epics,
   slug,
+  onEpicDeleted,
 }: {
   stage: Stage;
   epics: Epic[];
   slug: string;
+  onEpicDeleted?: (epicId: string) => void;
 }) {
   const { setNodeRef, isOver } = useDroppable({ id: stage });
 
   return (
-    <div className="flex min-w-0 flex-col gap-3">
-      <div className="flex items-center gap-2 px-0.5">
+    <div className="flex min-h-0 min-w-0 flex-col gap-3">
+      <div className="flex shrink-0 items-center gap-2 px-0.5">
         <span
           className={cn(
             "size-2.5 rounded-full",
@@ -38,7 +40,7 @@ export function BoardColumn({
       <div
         ref={setNodeRef}
         className={cn(
-          "flex min-h-40 flex-1 flex-col gap-3 rounded-xl border border-transparent p-0.5 transition-colors",
+          "flex min-h-40 flex-1 flex-col gap-3 overflow-y-auto rounded-xl border border-transparent p-0.5 transition-colors",
           isOver && "border-primary/40 bg-primary/5",
         )}
       >
@@ -50,7 +52,9 @@ export function BoardColumn({
             <p className="text-xs text-subtle">No {STAGE_LABELS[stage].toLowerCase()} epics</p>
           </div>
         ) : (
-          epics.map((epic) => <DraggableEpicCard key={epic.id} slug={slug} epic={epic} />)
+          epics.map((epic) => (
+            <DraggableEpicCard key={epic.id} slug={slug} epic={epic} onDeleted={onEpicDeleted} />
+          ))
         )}
       </div>
     </div>

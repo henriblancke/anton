@@ -7,9 +7,11 @@ import { CircleCheckIcon, GitPullRequestIcon } from "lucide-react";
 
 import type { Epic } from "@/lib/types";
 import { Button } from "@/components/ui/button";
+import { ConfirmDeleteButton } from "@/components/ui/confirm-delete-button";
 import { cn } from "@/lib/utils";
 import { STAGE_INSET_SHADOW, agentDotClass, ticketProgress } from "@/components/board/board-utils";
-import { MetaChip, RiskChip } from "@/components/atoms";
+import { MetaChip, PrLink, RiskChip } from "@/components/atoms";
+import { CopyButton } from "@/components/ui/copy-button";
 
 /** Short PR label from a bead external-ref: `gh-218` / a URL ending in `/218` → `#218`. */
 function prLabel(ref: string): string {
@@ -21,13 +23,27 @@ export function EpicCard({
   slug,
   epic,
   overlay = false,
+  onDeleted,
 }: {
   slug: string;
   epic: Epic;
   overlay?: boolean;
+  /** Fired after this epic is deleted so the board can drop it from its columns. */
+  onDeleted?: (epicId: string) => void;
 }) {
   const [approved, setApproved] = useState(epic.approved);
   const [approving, setApproving] = useState(false);
+
+  async function handleDelete() {
+    const res = await fetch(`/api/projects/${slug}/epics/${epic.id}`, { method: "DELETE" });
+    if (!res.ok) {
+      const body = (await res.json().catch(() => null)) as { error?: string } | null;
+      toast.error(body?.error ?? `Delete failed (${res.status})`);
+      return;
+    }
+    toast.success(`Deleted "${epic.title}"`);
+    onDeleted?.(epic.id);
+  }
 
   async function handleApprove() {
     setApproving(true);
@@ -55,11 +71,13 @@ export function EpicCard({
     return (
       <CardShell epic={epic} overlay={overlay} slug={slug} muted>
         <div className="flex items-center gap-2">
-          <span className="font-mono text-[10px] text-subtle">{epic.id}</span>
+          <CopyButton value={epic.id} label="epic id" className="font-mono text-[10px]">
+          {epic.id}
+        </CopyButton>
           {epic.prRef && (
-            <MetaChip tone="done" className="ml-auto">
-              merged {prLabel(epic.prRef)}
-            </MetaChip>
+            <PrLink href={epic.prUrl} className="ml-auto">
+              <MetaChip tone="done">merged {prLabel(epic.prRef)}</MetaChip>
+            </PrLink>
           )}
         </div>
         <h4 className="text-[13px] leading-snug font-semibold" title={epic.title}>
@@ -78,13 +96,17 @@ export function EpicCard({
   return (
     <CardShell epic={epic} overlay={overlay} slug={slug}>
       <div className="flex items-center gap-1.5">
-        <span className="font-mono text-[10px] text-subtle">{epic.id}</span>
+        <CopyButton value={epic.id} label="epic id" className="font-mono text-[10px]">
+          {epic.id}
+        </CopyButton>
         <span className="ml-auto flex items-center gap-1.5">
           {epic.stage === "in-review" && epic.prRef && (
-            <MetaChip tone="pr">
-              <GitPullRequestIcon className="size-2.5" aria-hidden="true" />
-              {prLabel(epic.prRef)}
-            </MetaChip>
+            <PrLink href={epic.prUrl}>
+              <MetaChip tone="pr">
+                <GitPullRequestIcon className="size-2.5" aria-hidden="true" />
+                {prLabel(epic.prRef)}
+              </MetaChip>
+            </PrLink>
           )}
           {epic.stage === "implementing" && !epic.prRef && (
             <span className="inline-flex items-center gap-1 text-[10px] text-stage-implementing">
@@ -127,15 +149,28 @@ export function EpicCard({
         </div>
       )}
 
-      {showApprove && (
-        <Button
-          size="xs"
-          onClick={handleApprove}
-          disabled={approving}
-          className="pointer-events-auto mt-0.5 w-full"
-        >
-          {approving ? "Approving…" : "Approve"}
-        </Button>
+      {epic.stage === "backlog" && !overlay && (
+        <div className="mt-0.5 flex items-center gap-2">
+          {showApprove && (
+            <Button
+              size="xs"
+              onClick={handleApprove}
+              disabled={approving}
+              className="pointer-events-auto flex-1"
+            >
+              {approving ? "Approving…" : "Approve"}
+            </Button>
+          )}
+          <ConfirmDeleteButton
+            onConfirm={handleDelete}
+            iconOnly
+            size="xs"
+            stopPropagation
+            confirmLabel="Delete"
+            title="Delete epic"
+            className={cn("pointer-events-auto shrink-0", !showApprove && "ml-auto")}
+          />
+        </div>
       )}
     </CardShell>
   );

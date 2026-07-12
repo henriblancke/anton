@@ -2,6 +2,7 @@
  * Assembles the Board from beads. Stage/approval/PR are derived — never stored. See DESIGN.md §2/§3.
  */
 import { beads, type Bead } from "./beads/bd";
+import { attachPrUrl, githubBaseUrl } from "./git/remote";
 import { STAGES, type Board, type Epic, type Project, type Stage, type Ticket } from "./types";
 
 export function deriveStage(bead: Bead): Stage {
@@ -137,6 +138,15 @@ export async function getBoard(project: Project): Promise<Board> {
 
   for (const stage of STAGES) {
     if (!columns[stage]) columns[stage] = [];
+  }
+
+  // Resolve PR links from the repo's origin remote (once) so `gh-<n>` refs become clickable.
+  const base = await githubBaseUrl(project.repoPath);
+  for (const stage of STAGES) {
+    for (const epic of columns[stage]) {
+      attachPrUrl(epic, base);
+      for (const ticket of epic.tickets) attachPrUrl(ticket, base);
+    }
   }
 
   return {

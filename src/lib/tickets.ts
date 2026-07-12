@@ -5,6 +5,7 @@
  */
 import { beads, type Bead } from "./beads/bd";
 import { deriveStage } from "./board";
+import { attachPrUrl, githubBaseUrl } from "./git/remote";
 import type { Project, TicketFilters, TicketRow } from "./types";
 
 const NON_WORK = new Set(["molecule"]);
@@ -118,6 +119,9 @@ export async function getTickets(project: Project, filters: TicketFilters): Prom
   for (const t of workBeads) {
     if (!epicByTicketId.has(t.id)) rows.push(toTicketRow(t, undefined));
   }
+
+  const base = await githubBaseUrl(project.repoPath);
+  for (const row of rows) attachPrUrl(row, base);
 
   return applyFilters(rows, filters);
 }

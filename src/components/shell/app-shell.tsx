@@ -47,7 +47,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     : undefined;
 
   return (
-    <div className="flex min-h-screen w-full">
+    <div className="flex h-dvh w-full">
       <Sidebar
         pathname={pathname}
         projectSlug={projectSlug}
@@ -55,7 +55,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         mobileOpen={mobileOpen}
         onCloseMobile={closeMobile}
       />
-      <div className="flex min-w-0 flex-1 flex-col">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         {/* Mobile-only nav bar — desktop uses each screen's own single header (design parity). */}
         <div className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-3 lg:hidden">
           <button
@@ -68,7 +68,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           </button>
           <AntonWordmark size={22} textClassName="text-base" />
         </div>
-        <main className="flex min-w-0 flex-1 flex-col">{children}</main>
+        <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto">{children}</main>
       </div>
     </div>
   );

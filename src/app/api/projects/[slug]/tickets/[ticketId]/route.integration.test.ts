@@ -28,7 +28,7 @@ vi.mock("@/lib/projects", () => ({
   getProjectBySlug: async (slug: string) => (project && project.slug === slug ? project : null),
 }));
 
-const { GET, PATCH } = await import("./route");
+const { GET, PATCH, DELETE } = await import("./route");
 
 const ctx = (slug: string, ticketId: string) => ({ params: Promise.resolve({ slug, ticketId }) });
 
@@ -113,5 +113,24 @@ suite("ticket route (real bd)", () => {
     });
     const res = await PATCH(req, ctx("tmp", taskId));
     expect(res.status).toBe(400);
+  });
+
+  it("DELETE removes the ticket, then 404s on a repeat", async () => {
+    const doomed = await beads.create(repo, { title: "Delete me", type: "task" });
+
+    const res = await DELETE(new Request("http://t/"), ctx("tmp", doomed));
+    expect(res.status).toBe(200);
+    expect((await res.json()).ok).toBe(true);
+
+    // The bead is gone — a re-read (and a repeat DELETE) both 404.
+    const missing = await GET(new Request("http://t/"), ctx("tmp", doomed));
+    expect(missing.status).toBe(404);
+    const again = await DELETE(new Request("http://t/"), ctx("tmp", doomed));
+    expect(again.status).toBe(404);
+  }, 30_000);
+
+  it("DELETE 404s for an unknown project", async () => {
+    const res = await DELETE(new Request("http://t/"), ctx("nope", taskId));
+    expect(res.status).toBe(404);
   });
 });

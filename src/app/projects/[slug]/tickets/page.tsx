@@ -10,8 +10,8 @@ export default async function ProjectTicketsPage({
   const { slug } = await params;
 
   return (
-    <div className="flex flex-1 flex-col">
-      <Suspense fallback={<div className="flex flex-1 flex-col gap-4" aria-busy="true" />}>
+    <div className="flex min-h-0 flex-1 flex-col">
+      <Suspense fallback={<div className="flex min-h-0 flex-1 flex-col gap-4" aria-busy="true" />}>
         <TicketsView slug={slug} />
       </Suspense>
     </div>

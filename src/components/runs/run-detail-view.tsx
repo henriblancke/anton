@@ -6,6 +6,7 @@ import { TriangleAlertIcon } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { CopyButton } from "@/components/ui/copy-button";
 import { agentDotClass } from "@/components/board/board-utils";
 import { RunTerminal } from "@/components/runs/run-terminal";
 import {
@@ -179,12 +180,12 @@ export function RunDetailView({ slug, runId }: { slug: string; runId: string }) 
           <section className="flex flex-col gap-2.5">
             <SectionLabel>Run</SectionLabel>
             <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2">
-              <MetaRow label="epic" value={run.epicBeadId} mono />
-              <MetaRow label="ticket" value={run.ticketBeadId ?? "—"} mono />
+              <MetaRow label="epic" value={run.epicBeadId} mono copy />
+              <MetaRow label="ticket" value={run.ticketBeadId ?? "—"} mono copy />
               <MetaRow label="agent" value={run.agentTag} mono dotClass={run.agentTag ? agentDotClass(run.agentTag) : undefined} />
               <MetaRow label="model" value={run.model ?? "default"} mono />
-              <MetaRow label="branch" value={run.branch ?? "—"} mono />
-              <MetaRow label="worktree" value={run.worktreePath ?? "—"} mono title={run.worktreePath} />
+              <MetaRow label="branch" value={run.branch ?? "—"} mono copy />
+              <MetaRow label="worktree" value={run.worktreePath ?? "—"} mono title={run.worktreePath} copy />
               <MetaRow label="attempts" value={String(run.attempts)} mono />
               <MetaRow label="lease" value={fmtTime(run.leaseExpiresAt)} mono />
               <MetaRow label="started" value={fmtTime(run.startedAt)} mono />
@@ -240,13 +241,16 @@ function MetaRow({
   mono,
   dotClass,
   title,
+  copy = false,
 }: {
   label: string;
   value?: string;
   mono?: boolean;
   dotClass?: string;
   title?: string;
+  copy?: boolean;
 }) {
+  const canCopy = copy && value != null && value !== "—";
   return (
     <>
       <dt className="font-mono text-[11px] text-subtle">{label}</dt>
@@ -258,7 +262,13 @@ function MetaRow({
         title={title ?? value}
       >
         {dotClass && <span className={cn("size-1.5 shrink-0 rounded-full", dotClass)} aria-hidden="true" />}
-        <span className="truncate">{value ?? "—"}</span>
+        {canCopy ? (
+          <CopyButton value={value} label={label} className="min-w-0 text-foreground/90">
+            <span className="truncate">{value}</span>
+          </CopyButton>
+        ) : (
+          <span className="truncate">{value ?? "—"}</span>
+        )}
       </dd>
     </>
   );

@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { getProjectBySlug } from "@/lib/projects";
-import { getTicketDetail, updateTicket } from "@/lib/ticket-detail";
+import { deleteTicket, getTicketDetail, updateTicket } from "@/lib/ticket-detail";
 import { parseTicketPatch } from "@/lib/ticket-patch";
 
 export const dynamic = "force-dynamic";
@@ -48,6 +48,24 @@ export async function PATCH(
   try {
     const detail = await updateTicket(project, ticketId, parsed.patch);
     return NextResponse.json({ detail });
+  } catch {
+    return NextResponse.json({ error: "Ticket not found" }, { status: 404 });
+  }
+}
+
+export async function DELETE(
+  _request: Request,
+  { params }: { params: Promise<{ slug: string; ticketId: string }> },
+) {
+  const { slug, ticketId } = await params;
+  const project = await getProjectBySlug(slug);
+  if (!project) {
+    return NextResponse.json({ error: "Project not found" }, { status: 404 });
+  }
+
+  try {
+    await deleteTicket(project, ticketId);
+    return NextResponse.json({ ok: true });
   } catch {
     return NextResponse.json({ error: "Ticket not found" }, { status: 404 });
   }

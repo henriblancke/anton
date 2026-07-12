@@ -88,7 +88,7 @@ export function TicketsFilters({ tickets }: { tickets: TicketRow[] }) {
     <div
       role="search"
       aria-label="Filter tickets"
-      className="flex flex-wrap items-center gap-2.5 border-b border-border px-5 py-3 sm:px-6"
+      className="flex shrink-0 flex-wrap items-center gap-2.5 border-b border-border px-5 py-3 sm:px-6"
     >
       <div className="flex flex-col gap-1">
         <Label htmlFor="ticket-search" className="sr-only">

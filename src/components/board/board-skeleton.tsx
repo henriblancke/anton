@@ -5,7 +5,7 @@ import { cn } from "@/lib/utils";
 export function BoardSkeleton() {
   return (
     <div
-      className="grid flex-1 grid-cols-1 gap-3.5 sm:grid-cols-2 xl:grid-cols-4"
+      className="grid min-h-0 flex-1 grid-cols-1 gap-3.5 sm:grid-cols-2 xl:grid-cols-4"
       aria-busy="true"
       aria-label="Loading board"
     >

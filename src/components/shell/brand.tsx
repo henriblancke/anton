@@ -1,11 +1,13 @@
 import { cn } from "@/lib/utils";
 
 /**
- * The anton mark — an iris-gradient rounded tile with a small dark square notch, matching the
- * Atelier design system. Sizes are driven by the `size` prop (tile edge in px).
+ * The anton mark — the anton avatar (backwards cap + glasses) in white, set on the iris-gradient
+ * rounded tile of the Atelier design system. Sizes are driven by the `size` prop (tile edge in px).
+ * The avatar is painted via a CSS mask over `/anton-avatar.svg` so it inherits the white fill and
+ * stays crisp at any size; the same lockup is baked into `app/icon.png` / `app/apple-icon.png`.
  */
 export function AntonMark({ size = 26, className }: { size?: number; className?: string }) {
-  const notch = Math.round(size * 0.35);
+  const face = Math.round(size * 0.8);
   return (
     <span
       className={cn(
@@ -16,8 +18,19 @@ export function AntonMark({ size = 26, className }: { size?: number; className?:
       aria-hidden="true"
     >
       <span
-        className="rounded-[22%] bg-[#0b0a09]"
-        style={{ width: notch, height: notch }}
+        className="bg-white"
+        style={{
+          width: face,
+          height: face,
+          WebkitMaskImage: "url(/anton-avatar.svg)",
+          maskImage: "url(/anton-avatar.svg)",
+          WebkitMaskSize: "contain",
+          maskSize: "contain",
+          WebkitMaskRepeat: "no-repeat",
+          maskRepeat: "no-repeat",
+          WebkitMaskPosition: "center",
+          maskPosition: "center",
+        }}
       />
     </span>
   );

@@ -5,6 +5,7 @@
  */
 import { beads, type BeadPatch } from "./beads/bd";
 import { deriveStage } from "./board";
+import { attachPrUrl, githubBaseUrl } from "./git/remote";
 import { labelValue, listAllBeads, parseAcceptance, parseGoal } from "./tickets";
 import type { Bead } from "./beads/bd";
 import type { Project, TicketDetail } from "./types";
@@ -42,7 +43,8 @@ export async function getTicketDetail(project: Project, id: string): Promise<Tic
   const parentId = (lite.parent ?? lite.parent_id) as string | undefined;
   const epic = parentId ? all.find((b) => b.id === parentId) : undefined;
 
-  return toTicketDetail(lite, full, epic);
+  const base = await githubBaseUrl(project.repoPath);
+  return attachPrUrl(toTicketDetail(lite, full, epic), base);
 }
 
 /**
@@ -58,4 +60,14 @@ export async function updateTicket(
   const current = await beads.show(project.repoPath, id);
   await beads.update(project.repoPath, id, patch, current.labels ?? []);
   return getTicketDetail(project, id);
+}
+
+/**
+ * Permanently delete a ticket bead. Throws if the id doesn't resolve to a bead, so the API can
+ * answer 404 instead of silently succeeding. A ticket may have dependents (e.g. a sibling that
+ * `blocks`-links it); `bd delete --force` orphans those links rather than failing.
+ */
+export async function deleteTicket(project: Project, id: string): Promise<void> {
+  await beads.show(project.repoPath, id); // 404 guard — bd throws on an unknown id
+  await beads.delete(project.repoPath, id);
 }

@@ -49,6 +49,37 @@ export function MetaChip({
   );
 }
 
+/**
+ * Wraps a PR chip in a new-tab link when a URL is known, otherwise renders the chip inert. Safe
+ * inside clickable cards/rows: `pointer-events-auto` + `stopPropagation` keep the click on the link
+ * (opening the PR) instead of bubbling to a parent card link. `href` comes from an entity's `prUrl`.
+ */
+export function PrLink({
+  href,
+  className,
+  children,
+}: {
+  href?: string;
+  className?: string;
+  children: ReactNode;
+}) {
+  if (!href) {
+    return className ? <span className={className}>{children}</span> : <>{children}</>;
+  }
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      onClick={(e) => e.stopPropagation()}
+      className={cn("pointer-events-auto focus-visible:outline-none", className)}
+      title="Open pull request"
+    >
+      {children}
+    </a>
+  );
+}
+
 /** Agent chip — mono label with the agent's stable hue as a leading dot. */
 export function AgentChip({ agent, className }: { agent: string; className?: string }) {
   return (

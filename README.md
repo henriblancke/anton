@@ -2,8 +2,6 @@
 
 **A local, single-user app that turns ideas and code-scan findings into approved epics and executes them autonomously.** anton shapes work into epics, waits for your approval, then runs each epic in an isolated git worktree — driving `claude` to implement it, running your tests, and opening a pull request per unit of work. It watches the PR and auto-resolves review comments and CI failures. Epic-first, approval-gated, agent-driven.
 
-anton is the successor to the `loom` Claude Code plugin: it keeps loom's shaping and specialist agents and its execution/durability model, and wraps them in a Next.js UI with multi-project support, a live terminal, and durable background jobs.
-
 > **Local, not deployed.** anton runs as a Next.js server on your machine and drives your local `claude`, `git`, `gh`, `bd`, and `stringer`. It is not a hosted service. See [`DESIGN.md`](./DESIGN.md) for the full architecture.
 
 ## What it does

@@ -8,7 +8,15 @@ import type { Epic, Stage } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { EpicCard } from "@/components/board/epic-card";
 
-export function DraggableEpicCard({ slug, epic }: { slug: string; epic: Epic }) {
+export function DraggableEpicCard({
+  slug,
+  epic,
+  onDeleted,
+}: {
+  slug: string;
+  epic: Epic;
+  onDeleted?: (epicId: string) => void;
+}) {
   const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, isDragging } =
     useDraggable({
       id: epic.id,
@@ -30,7 +38,7 @@ export function DraggableEpicCard({ slug, epic }: { slug: string; epic: Epic }) 
       >
         <GripVerticalIcon className="size-3.5" aria-hidden="true" />
       </button>
-      <EpicCard slug={slug} epic={epic} />
+      <EpicCard slug={slug} epic={epic} onDeleted={onDeleted} />
     </div>
   );
 }

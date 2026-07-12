@@ -191,6 +191,14 @@ export const beads = {
 
   note: (cwd: string, id: string, text: string) => bd(cwd, ["note", id, text]),
   close: (cwd: string, id: string) => bd(cwd, ["close", id]),
+
+  /**
+   * Permanently delete a bead and clean up references (`bd delete --force`). `cascade` also
+   * deletes every dependent recursively — used for epics so their child tickets go with them;
+   * without it, deleting an issue that still has dependents fails. This is irreversible.
+   */
+  delete: (cwd: string, id: string, opts: { cascade?: boolean } = {}) =>
+    bd(cwd, ["delete", id, "--force", ...(opts.cascade ? ["--cascade"] : [])]),
   reopen: (cwd: string, id: string) => bd(cwd, ["reopen", id]),
   setStatus: (cwd: string, id: string, status: string) =>
     bd(cwd, ["update", id, "--status", status]),

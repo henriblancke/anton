@@ -26,6 +26,7 @@ export interface Ticket {
   size?: string; // from size:<x>
   acceptance?: string;
   prRef?: string; // bead external_ref, if any
+  prUrl?: string; // browser URL for the PR, resolved from prRef + the repo's origin remote
 }
 
 export interface Epic {
@@ -39,6 +40,7 @@ export interface Epic {
   risk?: string; // from risk:<x>
   size?: string; // from size:<x>
   prRef?: string;
+  prUrl?: string; // browser URL for the PR, resolved from prRef + the repo's origin remote
   tickets: Ticket[];
 }
 
@@ -94,4 +96,12 @@ export interface EpicDetail {
   description?: string; // the full bead description (markdown)
   tickets: Ticket[];
   edges: DepEdge[]; // among the epic + its tickets
+  run?: EpicRun; // the currently-open run for this epic, if any (for "View run" / worktree)
+}
+
+/** The open (queued/running/parked) run backing an epic, surfaced on the epic detail. */
+export interface EpicRun {
+  id: string;
+  status: string;
+  worktreePath?: string;
 }

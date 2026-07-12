@@ -2,11 +2,12 @@
 
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
-import { CheckIcon, GitPullRequestIcon, PencilIcon, TriangleAlertIcon } from "lucide-react";
+import { GitPullRequestIcon, TriangleAlertIcon } from "lucide-react";
 
 import type { TicketDetail } from "@/lib/types";
-import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { ConfirmDeleteButton } from "@/components/ui/confirm-delete-button";
+import { CopyButton } from "@/components/ui/copy-button";
 import {
   Dialog,
   DialogContent,
@@ -14,8 +15,7 @@ import {
   DialogFooter,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { MetaChip, RiskChip, StagePill } from "@/components/atoms";
-import { agentDotClass, isExternalUrl } from "@/components/board/board-utils";
+import { MetaChip, PrLink, StagePill } from "@/components/atoms";
 import {
   AGENT_OPTIONS,
   PRIORITY_LABELS,
@@ -38,14 +38,17 @@ export interface TicketDialogProps {
   onClose: () => void;
   /** Fired after a successful save, with the refreshed detail — so call sites can refetch lists. */
   onSaved?: (detail: TicketDetail) => void;
+  /** Fired after a successful delete — so call sites can drop the ticket from their lists. */
+  onDeleted?: (ticketId: string) => void;
 }
 
 /**
- * Controlled popup to view a ticket's contract and edit its scalar/label fields. Body is keyed
- * on `ticketId` so switching tickets fully remounts it (fresh fetch + view mode). Contract-markdown
- * (Goal/Acceptance/description) editing is out of scope here — a later ticket layers it on.
+ * Controlled popup showing a ticket's full contract in ONE always-editable form: every field is
+ * live (no view↔edit toggle), Save PATCHes only what changed, and Delete removes the bead behind
+ * an inline confirm. Body is keyed on `ticketId` so switching tickets fully remounts it (fresh
+ * fetch + fresh draft).
  */
-export function TicketDialog({ slug, ticketId, open, onClose, onSaved }: TicketDialogProps) {
+export function TicketDialog({ slug, ticketId, open, onClose, onSaved, onDeleted }: TicketDialogProps) {
   return (
     <Dialog
       open={open}
@@ -59,7 +62,14 @@ export function TicketDialog({ slug, ticketId, open, onClose, onSaved }: TicketD
           View and edit this ticket&apos;s fields.
         </DialogDescription>
         {open && ticketId ? (
-          <TicketDialogBody key={ticketId} slug={slug} ticketId={ticketId} onSaved={onSaved} />
+          <TicketDialogBody
+            key={ticketId}
+            slug={slug}
+            ticketId={ticketId}
+            onSaved={onSaved}
+            onDeleted={onDeleted}
+            onClose={onClose}
+          />
         ) : null}
       </DialogContent>
     </Dialog>
@@ -70,15 +80,18 @@ function TicketDialogBody({
   slug,
   ticketId,
   onSaved,
+  onDeleted,
+  onClose,
 }: {
   slug: string;
   ticketId: string;
   onSaved?: (detail: TicketDetail) => void;
+  onDeleted?: (ticketId: string) => void;
+  onClose: () => void;
 }) {
   const [detail, setDetail] = useState<TicketDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
-  const [mode, setMode] = useState<"view" | "edit">("view");
   const [draft, setDraft] = useState<TicketDraft | null>(null);
   const [saving, setSaving] = useState(false);
 
@@ -91,6 +104,7 @@ function TicketDialogBody({
         const data = (await res.json()) as { detail: TicketDetail };
         if (!cancelled) {
           setDetail(data.detail);
+          setDraft(draftFromDetail(data.detail));
           setError(null);
         }
       } catch (err) {
@@ -102,17 +116,6 @@ function TicketDialogBody({
       cancelled = true;
     };
   }, [slug, ticketId, attempt]);
-
-  function startEdit() {
-    if (!detail) return;
-    setDraft(draftFromDetail(detail));
-    setMode("edit");
-  }
-
-  function cancelEdit() {
-    setMode("view");
-    setDraft(null);
-  }
 
   async function save() {
     if (!detail || !draft) return;
@@ -132,8 +135,7 @@ function TicketDialogBody({
       }
       const data = (await res.json()) as { detail: TicketDetail };
       setDetail(data.detail);
-      setMode("view");
-      setDraft(null);
+      setDraft(draftFromDetail(data.detail));
       toast.success("Ticket updated");
       onSaved?.(data.detail);
     } catch (err) {
@@ -141,6 +143,18 @@ function TicketDialogBody({
     } finally {
       setSaving(false);
     }
+  }
+
+  async function remove() {
+    const res = await fetch(`/api/projects/${slug}/tickets/${ticketId}`, { method: "DELETE" });
+    if (!res.ok) {
+      const { error: message } = await res.json().catch(() => ({ error: "Delete failed" }));
+      toast.error(message ?? "Delete failed");
+      return;
+    }
+    toast.success("Ticket deleted");
+    onDeleted?.(ticketId);
+    onClose();
   }
 
   if (error) {
@@ -157,175 +171,43 @@ function TicketDialogBody({
     );
   }
 
-  if (!detail) return <TicketDialogSkeleton />;
+  if (!detail || !draft) return <TicketDialogSkeleton />;
 
-  if (mode === "edit" && draft) {
-    const changed = hasTicketChanges(draftFromDetail(detail), draft);
-    return (
-      <EditForm
-        detail={detail}
-        draft={draft}
-        onDraft={setDraft}
-        onCancel={cancelEdit}
-        onSave={save}
-        saving={saving}
-        changed={changed}
-      />
-    );
-  }
-
-  return <ViewMode detail={detail} onEdit={startEdit} />;
-}
-
-// ── View mode ──────────────────────────────────────────────────────────────
-
-function SectionLabel({ children }: { children: React.ReactNode }) {
-  return (
-    <span className="font-mono text-[10px] tracking-[0.05em] text-subtle uppercase">{children}</span>
-  );
-}
-
-type AcceptanceItem = { text: string; checked: boolean };
-
-/** Split an acceptance blob into checklist items, honoring `- [x]` / `- [ ]` markers. */
-function parseAcceptance(acceptance: string): AcceptanceItem[] {
-  return acceptance
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter(Boolean)
-    .map((line) => {
-      const m = /^(?:[-*]\s*)?\[( |x|X)\]\s*(.*)$/.exec(line);
-      if (m) return { text: m[2].trim(), checked: m[1].toLowerCase() === "x" };
-      return { text: line.replace(/^[-*]\s*/, ""), checked: false };
-    });
-}
-
-function ViewMode({ detail, onEdit }: { detail: TicketDetail; onEdit: () => void }) {
-  const acceptance = detail.acceptance ? parseAcceptance(detail.acceptance) : [];
-  return (
-    <div className="flex flex-col gap-5">
-      <div className="flex flex-col gap-2">
-        <div className="flex items-center gap-2.5 pr-8">
-          <span className="font-mono text-[11px] text-subtle">
-            {detail.id} · {detail.type}
-          </span>
-          <StagePill stage={detail.stage} />
-          <Button variant="outline" size="sm" className="ml-auto" onClick={onEdit}>
-            <PencilIcon aria-hidden="true" />
-            Edit
-          </Button>
-        </div>
-
-        <h2
-          className="font-display text-[18px] leading-tight font-bold tracking-[-0.01em]"
-          title={detail.title}
-        >
-          {detail.title}
-        </h2>
-
-        {(detail.agent || detail.risk || detail.size || detail.prRef) && (
-          <div className="flex flex-wrap gap-1.5">
-            {detail.agent && <MetaChip dotClass={agentDotClass(detail.agent)}>{detail.agent}</MetaChip>}
-            {detail.risk && <RiskChip risk={detail.risk} />}
-            {detail.size && <MetaChip>size:{detail.size}</MetaChip>}
-            {detail.prRef &&
-              (isExternalUrl(detail.prRef) ? (
-                <a
-                  href={detail.prRef}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="focus-visible:outline-none"
-                >
-                  <MetaChip tone="pr">
-                    <GitPullRequestIcon className="size-2.5" aria-hidden="true" />
-                    PR
-                  </MetaChip>
-                </a>
-              ) : (
-                <MetaChip tone="pr">
-                  <GitPullRequestIcon className="size-2.5" aria-hidden="true" />
-                  {detail.prRef}
-                </MetaChip>
-              ))}
-          </div>
-        )}
-      </div>
-
-      {detail.goal && (
-        <div className="flex flex-col gap-2">
-          <SectionLabel>Goal</SectionLabel>
-          <p className="text-[13px] leading-relaxed text-foreground/85">{detail.goal}</p>
-        </div>
-      )}
-
-      {acceptance.length > 0 && (
-        <div className="flex flex-col gap-2.5">
-          <SectionLabel>Acceptance</SectionLabel>
-          {acceptance.map((item, i) => (
-            <div key={i} className="flex items-start gap-2.5">
-              {item.checked ? (
-                <span className="mt-px flex size-[15px] shrink-0 items-center justify-center rounded bg-stage-done">
-                  <CheckIcon className="size-2 text-[#0b0a09]" strokeWidth={3} aria-hidden="true" />
-                </span>
-              ) : (
-                <span className="mt-px size-[15px] shrink-0 rounded border-[1.5px] border-border" />
-              )}
-              <span
-                className={cn(
-                  "text-[12.5px] leading-snug",
-                  item.checked ? "text-muted-foreground" : "text-foreground/85",
-                )}
-              >
-                {item.text}
-              </span>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ── Edit mode ──────────────────────────────────────────────────────────────
-
-function EditForm({
-  detail,
-  draft,
-  onDraft,
-  onCancel,
-  onSave,
-  saving,
-  changed,
-}: {
-  detail: TicketDetail;
-  draft: TicketDraft;
-  onDraft: (next: TicketDraft) => void;
-  onCancel: () => void;
-  onSave: () => void;
-  saving: boolean;
-  changed: boolean;
-}) {
+  const changed = hasTicketChanges(draftFromDetail(detail), draft);
   const set = <K extends keyof TicketDraft>(key: K, value: TicketDraft[K]) =>
-    onDraft({ ...draft, [key]: value });
+    setDraft({ ...draft, [key]: value });
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex items-center gap-2.5 pr-8">
-        <span className="font-mono text-[11px] text-subtle">
-          {detail.id} · {detail.type}
-        </span>
-        <span className="rounded-full border border-primary/30 bg-primary/10 px-2 py-0.5 font-mono text-[10px] text-primary">
-          editing
-        </span>
+      {/* header — read-only identity */}
+      <div className="flex flex-col gap-2.5">
+        <div className="flex flex-wrap items-center gap-2 pr-8">
+          <span className="flex items-center gap-1.5 font-mono text-[11px] text-subtle">
+            <CopyButton value={detail.id} label="ticket id">
+              {detail.id}
+            </CopyButton>
+            · {detail.type}
+          </span>
+          <StagePill stage={detail.stage} />
+          {detail.prRef && (
+            <PrLink href={detail.prUrl}>
+              <MetaChip tone="pr">
+                <GitPullRequestIcon className="size-2.5" aria-hidden="true" />
+                {detail.prUrl ? "PR" : detail.prRef}
+              </MetaChip>
+            </PrLink>
+          )}
+        </div>
       </div>
 
+      {/* editable form */}
       <label className="flex flex-col gap-1.5">
         <span className="text-[11px] text-subtle">Title</span>
         <input
           value={draft.title}
           onChange={(e) => set("title", e.target.value)}
           aria-label="Title"
-          className="rounded-lg border border-border bg-card px-3 py-2 text-[13px] text-foreground outline-none focus:border-primary/60"
+          className="rounded-lg border border-border bg-card px-3 py-2 text-[14px] font-medium text-foreground outline-none focus:border-primary/60"
         />
       </label>
 
@@ -404,13 +286,21 @@ function EditForm({
         placeholder="The remaining contract markdown."
       />
 
-      <DialogFooter>
-        <Button variant="outline" size="sm" onClick={onCancel} disabled={saving}>
-          Cancel
-        </Button>
-        <Button size="sm" onClick={onSave} disabled={saving || !changed}>
-          {saving ? "Saving…" : "Save"}
-        </Button>
+      <DialogFooter className="sm:justify-between">
+        <ConfirmDeleteButton onConfirm={remove} label="Delete ticket" />
+        <div className="flex gap-2">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => setDraft(draftFromDetail(detail))}
+            disabled={saving || !changed}
+          >
+            Reset
+          </Button>
+          <Button size="sm" onClick={save} disabled={saving || !changed}>
+            {saving ? "Saving…" : "Save"}
+          </Button>
+        </div>
       </DialogFooter>
     </div>
   );

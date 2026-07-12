@@ -2,13 +2,17 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { toast } from "sonner";
 import { CheckIcon, GitPullRequestIcon, TriangleAlertIcon } from "lucide-react";
 
 import type { EpicDetail, Ticket } from "@/lib/types";
 import { cn } from "@/lib/utils";
-import { Button } from "@/components/ui/button";
-import { agentDotClass, isExternalUrl, ticketProgress } from "@/components/board/board-utils";
-import { MetaChip, RiskChip, StagePill } from "@/components/atoms";
+import { Button, buttonVariants } from "@/components/ui/button";
+import { ConfirmDeleteButton } from "@/components/ui/confirm-delete-button";
+import { CopyButton } from "@/components/ui/copy-button";
+import { agentDotClass, ticketProgress } from "@/components/board/board-utils";
+import { MetaChip, PrLink, RiskChip, StagePill } from "@/components/atoms";
 import { DependencyGraph } from "@/components/epic/dependency-graph";
 import { TicketDialog } from "@/components/ticket/ticket-dialog";
 
@@ -59,10 +63,12 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
 }
 
 export function EpicDetailView({ slug, epicId }: { slug: string; epicId: string }) {
+  const router = useRouter();
   const [detail, setDetail] = useState<EpicDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
   const [openTicketId, setOpenTicketId] = useState<string | null>(null);
+  const [running, setRunning] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -99,9 +105,46 @@ export function EpicDetailView({ slug, epicId }: { slug: string; epicId: string 
     );
   }
 
+  async function handleRun(title: string, opts: { force?: boolean } = {}) {
+    setRunning(true);
+    try {
+      const res = await fetch(`/api/projects/${slug}/epics/${epicId}/approve`, { method: "POST" });
+      if (!res.ok) {
+        const body = (await res.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(body?.error ?? `Run failed (${res.status})`);
+      }
+      toast.success(opts.force ? `Re-running "${title}"` : `Run started for "${title}"`);
+      setAttempt((n) => n + 1);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to start run");
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  async function handleDelete(title: string) {
+    const res = await fetch(`/api/projects/${slug}/epics/${epicId}`, { method: "DELETE" });
+    if (!res.ok) {
+      const body = (await res.json().catch(() => null)) as { error?: string } | null;
+      toast.error(body?.error ?? `Delete failed (${res.status})`);
+      return;
+    }
+    toast.success(`Deleted "${title}"`);
+    router.push(`/projects/${slug}`);
+  }
+
+  async function handleOpenWorktree(worktreePath: string) {
+    try {
+      await navigator.clipboard.writeText(worktreePath);
+      toast.success("Worktree path copied", { description: worktreePath });
+    } catch {
+      toast.error("Couldn't copy worktree path");
+    }
+  }
+
   if (!detail) return <EpicDetailSkeleton />;
 
-  const { epic, tickets, edges } = detail;
+  const { epic, tickets, edges, run } = detail;
   const { done, total, pct } = ticketProgress({ tickets });
   const inProgress = tickets.filter((t) => t.stage === "implementing").length;
   const inProgressPct = total === 0 ? 0 : Math.round((inProgress / total) * 100);
@@ -109,7 +152,7 @@ export function EpicDetailView({ slug, epicId }: { slug: string; epicId: string 
   const acceptance = epic.acceptance ? parseAcceptance(epic.acceptance) : [];
 
   return (
-    <div className="flex flex-1 flex-col">
+    <div className="flex min-h-0 flex-1 flex-col">
       {/* header */}
       <header className="flex h-14 shrink-0 items-center gap-2.5 border-b border-border px-5 sm:px-6">
         <div className="flex min-w-0 items-center gap-2 text-[13px]">
@@ -125,13 +168,51 @@ export function EpicDetailView({ slug, epicId }: { slug: string; epicId: string 
           </span>
         </div>
         <StagePill stage={epic.stage} className="ml-1" />
-        <div className="ml-auto flex shrink-0 gap-2">
-          <Button size="sm" variant="outline">
-            {epic.stage === "implementing" ? "Pause run" : "Run epic"}
-          </Button>
-          <Button size="sm" variant="secondary">
+        <div className="ml-auto flex shrink-0 items-center gap-2">
+          {epic.stage === "implementing" ? (
+            <>
+              {run && (
+                <Link
+                  href={`/projects/${slug}/runs/${run.id}`}
+                  className={buttonVariants({ size: "sm", variant: "outline" })}
+                >
+                  View run
+                </Link>
+              )}
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => handleRun(epic.title, { force: true })}
+                disabled={running}
+                title="Re-trigger the execute-epic job (resumes from where it stopped)"
+              >
+                {running ? "Starting…" : "Force run"}
+              </Button>
+            </>
+          ) : (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => handleRun(epic.title)}
+              disabled={running}
+            >
+              {running ? "Starting…" : "Run epic"}
+            </Button>
+          )}
+          <Button
+            size="sm"
+            variant="secondary"
+            onClick={() => run?.worktreePath && handleOpenWorktree(run.worktreePath)}
+            disabled={!run?.worktreePath}
+            title={run?.worktreePath ?? "No active worktree"}
+          >
             Open worktree
           </Button>
+          <ConfirmDeleteButton
+            onConfirm={() => handleDelete(epic.title)}
+            iconOnly
+            title="Delete epic and all its tickets"
+          />
         </div>
       </header>
 
@@ -140,7 +221,12 @@ export function EpicDetailView({ slug, epicId }: { slug: string; epicId: string 
         {/* LEFT — contract */}
         <div className="flex flex-col gap-5 overflow-y-auto border-border p-5 sm:p-6 lg:border-r">
           <div className="flex flex-col gap-2">
-            <span className="font-mono text-[11px] text-subtle">{epic.id} · epic</span>
+            <span className="flex items-center gap-1.5 font-mono text-[11px] text-subtle">
+              <CopyButton value={epic.id} label="epic id">
+                {epic.id}
+              </CopyButton>
+              · epic
+            </span>
             <h1 className="font-display text-[22px] leading-tight font-bold tracking-[-0.01em]" title={epic.title}>
               {epic.title}
             </h1>
@@ -149,20 +235,14 @@ export function EpicDetailView({ slug, epicId }: { slug: string; epicId: string 
                 {epic.agent && <MetaChip dotClass={agentDotClass(epic.agent)}>{epic.agent}</MetaChip>}
                 {epic.risk && <RiskChip risk={epic.risk} />}
                 {epic.size && <MetaChip>size:{epic.size}</MetaChip>}
-                {epic.prRef &&
-                  (isExternalUrl(epic.prRef) ? (
-                    <a href={epic.prRef} target="_blank" rel="noopener noreferrer" className="focus-visible:outline-none">
-                      <MetaChip tone="pr">
-                        <GitPullRequestIcon className="size-2.5" aria-hidden="true" />
-                        PR
-                      </MetaChip>
-                    </a>
-                  ) : (
+                {epic.prRef && (
+                  <PrLink href={epic.prUrl}>
                     <MetaChip tone="pr">
                       <GitPullRequestIcon className="size-2.5" aria-hidden="true" />
-                      {epic.prRef}
+                      {epic.prUrl ? "PR" : epic.prRef}
                     </MetaChip>
-                  ))}
+                  </PrLink>
+                )}
               </div>
             )}
           </div>
@@ -283,6 +363,7 @@ export function EpicDetailView({ slug, epicId }: { slug: string; epicId: string 
         open={openTicketId !== null}
         onClose={() => setOpenTicketId(null)}
         onSaved={() => setAttempt((n) => n + 1)}
+        onDeleted={() => setAttempt((n) => n + 1)}
       />
     </div>
   );
@@ -312,8 +393,8 @@ function LegendItem({
 
 function EpicDetailSkeleton() {
   return (
-    <div className="flex flex-1 flex-col" aria-busy="true" aria-label="Loading epic">
-      <div className="flex h-14 items-center gap-3 border-b border-border px-6">
+    <div className="flex min-h-0 flex-1 flex-col" aria-busy="true" aria-label="Loading epic">
+      <div className="flex h-14 shrink-0 items-center gap-3 border-b border-border px-6">
         <span className="anton-shimmer h-3 w-40 rounded" />
         <span className="anton-shimmer h-6 w-24 rounded-full" />
       </div>

@@ -5,8 +5,23 @@
  */
 import { beads, type Bead } from "./beads/bd";
 import { deriveStage } from "./board";
+import { getDb } from "./db";
+import { attachPrUrl, githubBaseUrl } from "./git/remote";
+import { findOpenRunForEpic } from "./runs";
 import { labelValue, listAllBeads, parseAcceptance, parseGoal } from "./tickets";
-import type { DepEdge, DepType, Epic, EpicDetail, Project, Ticket } from "./types";
+import type { DepEdge, DepType, Epic, EpicDetail, EpicRun, Project, Ticket } from "./types";
+
+/** The open run backing this epic (if any), for the "View run" / worktree affordances. */
+async function openRunFor(project: Project, epicId: string): Promise<EpicRun | undefined> {
+  try {
+    const row = await findOpenRunForEpic(getDb(), project.id, epicId);
+    if (!row) return undefined;
+    return { id: row.id, status: row.status, worktreePath: row.worktreePath ?? undefined };
+  } catch {
+    // Run lookup is best-effort: never fail the epic view over the runs table.
+    return undefined;
+  }
+}
 
 const DEP_TYPES = new Set<DepType>(["parent-child", "blocks", "related", "discovered-from"]);
 
@@ -32,6 +47,8 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
   }
   // `bd list` omits the description, so fetch the bead once for its goal/acceptance.
   const full = await beads.show(project.repoPath, epicId).catch(() => lite);
+  const run = await openRunFor(project, epicId);
+  const base = await githubBaseUrl(project.repoPath);
 
   // The board renders orphan (parentless) non-epic beads as single-ticket pseudo-epic cards
   // (board.ts ticketAsEpic). Mirror that here so opening one shows its detail instead of 404ing —
@@ -51,7 +68,9 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
       prRef: lite.external_ref,
       tickets: [self],
     };
-    return { epic, description: full.description, tickets: [self], edges: [] };
+    attachPrUrl(epic, base);
+    attachPrUrl(self, base);
+    return { epic, description: full.description, tickets: [self], edges: [], run };
   }
 
   const childBeads = all.filter(
@@ -69,6 +88,8 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
     prRef: lite.external_ref,
     tickets,
   };
+  attachPrUrl(epic, base);
+  for (const t of tickets) attachPrUrl(t, base);
 
   const memberIds = new Set<string>([epic.id, ...tickets.map((t) => t.id)]);
   const seen = new Set<string>();
@@ -82,5 +103,15 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
     edges.push({ from: e.from, to: e.to, type: e.type as DepType });
   }
 
-  return { epic, description: full.description, tickets, edges };
+  return { epic, description: full.description, tickets, edges, run };
+}
+
+/**
+ * Permanently delete an epic and all of its child tickets (`bd delete --cascade`). Cascade is
+ * required because the children depend on the epic via parent-child edges — a plain delete would
+ * fail. Throws if the id doesn't resolve, so the API can answer 404.
+ */
+export async function deleteEpic(project: Project, epicId: string): Promise<void> {
+  await beads.show(project.repoPath, epicId); // 404 guard — bd throws on an unknown id
+  await beads.delete(project.repoPath, epicId, { cascade: true });
 }

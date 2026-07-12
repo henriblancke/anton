@@ -10,6 +10,7 @@ import { Button, buttonVariants } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { agentDotClass } from "@/components/board/board-utils";
 import { TicketDialog } from "@/components/ticket/ticket-dialog";
+import { CopyButton } from "@/components/ui/copy-button";
 import { TicketsFilters } from "@/components/tickets/tickets-filters";
 import {
   countActiveFilters,
@@ -66,7 +67,7 @@ export function TicketsView({ slug }: { slug: string }) {
   }, [slug, queryString, attempt]);
 
   return (
-    <div className="flex flex-1 flex-col">
+    <div className="flex min-h-0 flex-1 flex-col">
       <header className="flex h-14 shrink-0 items-center gap-2.5 border-b border-border px-5 sm:px-6">
         <div className="flex items-center gap-2 text-[13px]">
           <Link href={`/projects/${slug}`} className="text-muted-foreground hover:text-foreground">
@@ -111,7 +112,7 @@ export function TicketsView({ slug }: { slug: string }) {
       ) : (
         <>
           <TicketsTable slug={slug} tickets={tickets} onOpenTicket={setOpenTicketId} />
-          <div className="mt-auto flex items-center justify-between border-t border-border px-5 py-3 sm:px-6">
+          <div className="flex shrink-0 items-center justify-between border-t border-border px-5 py-3 sm:px-6">
             <span className="font-mono text-[11px] text-subtle">
               {tickets.length} matching
               {activeFilters > 0 && ` · ${activeFilters} filter${activeFilters === 1 ? "" : "s"}`}
@@ -126,6 +127,7 @@ export function TicketsView({ slug }: { slug: string }) {
         open={openTicketId !== null}
         onClose={() => setOpenTicketId(null)}
         onSaved={() => setAttempt((n) => n + 1)}
+        onDeleted={() => setAttempt((n) => n + 1)}
       />
     </div>
   );
@@ -143,11 +145,11 @@ function TicketsTable({
   onOpenTicket: (ticketId: string) => void;
 }) {
   return (
-    <div className="flex flex-col">
+    <div className="flex min-h-0 flex-1 flex-col">
       <div
         className={cn(
           GRID,
-          "border-b border-border px-5 py-2.5 font-mono text-[10px] tracking-[0.05em] text-subtle uppercase sm:px-6",
+          "shrink-0 border-b border-border px-5 py-2.5 font-mono text-[10px] tracking-[0.05em] text-subtle uppercase sm:px-6",
         )}
       >
         <span />
@@ -158,7 +160,7 @@ function TicketsTable({
         <span>Risk</span>
         <span>Size</span>
       </div>
-      <ul>
+      <ul className="min-h-0 flex-1 overflow-y-auto">
         {tickets.map((ticket, i) => {
           const isDone = ticket.stage === "done";
           const isEpic = ticket.type === "epic";
@@ -194,7 +196,9 @@ function TicketsTable({
                   {ticket.title}
                 </button>
               )}
-              <span className="font-mono text-[11px] text-subtle">{ticket.id}</span>
+              <CopyButton value={ticket.id} label="ticket id" className="font-mono text-[11px]">
+                {ticket.id}
+              </CopyButton>
               {isEpic ? (
                 <span className="font-mono text-[10px] tracking-wide text-primary uppercase">epic</span>
               ) : (
@@ -280,7 +284,7 @@ function StatusCircle({ stage, epic = false }: { stage: Stage; epic?: boolean })
 
 function TicketsSkeleton() {
   return (
-    <div className="flex flex-col" aria-busy="true" aria-label="Loading tickets">
+    <div className="flex min-h-0 flex-1 flex-col overflow-y-auto" aria-busy="true" aria-label="Loading tickets">
       {Array.from({ length: 8 }).map((_, i) => (
         <div key={i} className={cn(GRID, "px-5 py-3 sm:px-6", i % 2 === 1 && "bg-card/40")}>
           <span className="anton-shimmer size-[15px] rounded-full" />

@@ -73,6 +73,17 @@ export function EpicBoard({ slug }: { slug: string }) {
     setActiveId(String(event.active.id));
   }
 
+  function handleEpicDeleted(epicId: string) {
+    setBoard((prev) => {
+      if (!prev) return prev;
+      const columns = { ...prev.columns };
+      for (const stage of STAGES) {
+        columns[stage] = (columns[stage] ?? []).filter((e) => e.id !== epicId);
+      }
+      return { ...prev, columns };
+    });
+  }
+
   async function handleDragEnd(event: DragEndEvent) {
     setActiveId(null);
     const { active, over } = event;
@@ -131,9 +142,15 @@ export function EpicBoard({ slug }: { slug: string }) {
       onDragEnd={handleDragEnd}
       onDragCancel={() => setActiveId(null)}
     >
-      <div className="grid flex-1 grid-cols-1 gap-3.5 sm:grid-cols-2 xl:grid-cols-4">
+      <div className="grid min-h-0 flex-1 grid-cols-1 gap-3.5 sm:grid-cols-2 xl:grid-cols-4">
         {STAGES.map((stage) => (
-          <BoardColumn key={stage} stage={stage} epics={board.columns[stage] ?? []} slug={slug} />
+          <BoardColumn
+            key={stage}
+            stage={stage}
+            epics={board.columns[stage] ?? []}
+            slug={slug}
+            onEpicDeleted={handleEpicDeleted}
+          />
         ))}
       </div>
       <DragOverlay>{activeEpic ? <EpicCard slug={slug} epic={activeEpic} overlay /> : null}</DragOverlay>
