@@ -15,7 +15,8 @@ the executor ships noise faster. **The board is the product** — your job is to
 into the *few* beads worth doing, shaped to the contract, and drop the rest.
 
 Read `.product/principles.md` and `.product/PRODUCT.md` first. All bead writes go through the
-`bd` skill. Input: a stringer scan file (JSON) passed as the argument.
+**`bd` skill** (installed alongside this one) — it carries anton's label / edge / lifecycle
+conventions and the bead contract. Input: a stringer scan file (JSON) passed as the argument.
 
 ## 1. Read signals + existing board
 

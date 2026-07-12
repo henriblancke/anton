@@ -13,7 +13,7 @@ import { beads, LABELS, type Bead } from "../beads/bd";
 import { loadAgentPrompt } from "../claude/agent-prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
 import { runClaude, type ClaudeEvent } from "../claude/driver";
-import { loadPrompt } from "../claude/prompt";
+import { loadSkill } from "../claude/prompt";
 import { branchAheadOfRemote, commitAll, pushBranch } from "../git/ops";
 import {
   classifyReview,
@@ -165,7 +165,7 @@ async function handleEpic(args: {
 
     // The editable reasoning contract (per-project override, else the shipped default) followed by
     // the concrete PR context anton fetched.
-    const reasoning = settings.reviewFixPrompt?.trim() || (await loadPrompt("review-fix"));
+    const reasoning = settings.reviewFixPrompt?.trim() || (await loadSkill("review-fix"));
     const prompt = [reasoning, "", "---", "", reviewFixContext(epic, pr, verdict.reasons)].join("\n");
 
     const result = await runClaude({
