@@ -38,10 +38,28 @@ anton drives external CLIs. Install these and make sure they're on your `PATH`:
 
 Run `anton doctor` at any time to check what's present.
 
-## Install & run
+## Install
+
+anton ships as a Node package, **not a standalone compiled binary** — there's no single executable to download. Get it one of two ways:
+
+- **From a GitHub Release (today).** Download the source tarball from the [Releases page](https://github.com/henriblancke/anton/releases), extract it, and install dependencies:
+
+  ```bash
+  tar xzf anton-<version>.tar.gz && cd anton-<version>
+  bun install      # or: npm install
+  ```
+
+- **From npm (once publishing is enabled).** A global install will be the one-liner — anton isn't published yet, so use the Release tarball above for now:
+
+  ```bash
+  npm i -g anton
+  ```
+
+Installing exposes the `anton` CLI: on your `PATH` after a global `npm i -g`, or run it from the package directory with `bun run anton` / `npx anton`.
+
+## Run locally
 
 ```bash
-bun install      # install dependencies
 anton setup      # check prerequisites, run DB migrations, rebuild node-pty
 anton start      # build if needed, then start the server on http://localhost:3000
 ```
@@ -57,6 +75,17 @@ anton dev      run the dev server (next dev)
 anton start    build if needed, then run the server (next start)
 anton --help   show help
 ```
+
+### Agents & skills
+
+Run in a real terminal, `anton setup` is **interactive**: after the prereq and migration steps it provisions the agents and skills that `claude` uses to implement your tickets, writing them into the target repo's `.claude/` directory.
+
+- **Bundled agents — you choose.** anton ships specialist agent prompts (`alembic`, `docker`, `fastapi`, `kubernetes`, `nextjs`, `pydantic`, `supabase`, `terraform`). Setup lists them as a checklist with a one-line description each; select the ones that match your stack.
+- **Required skills — always installed.** The machinery anton itself needs — the `shape`, `scan-triage`, `review-fix`, and `bd` skills — is installed automatically and can't be deselected.
+- **Your own agents are respected.** Agents and skills you already have in the project's `.claude/` or your global `~/.claude/` are discovered, shown as *already present*, and **never overwritten**. Re-running `anton setup` is idempotent — no duplicate installs, no clobbering.
+- **Non-interactive / CI.** When stdin isn't a TTY (scripts, CI), setup skips the prompts and installs just the required defaults, so it stays scriptable.
+
+**How an agent tag resolves at run time.** When a ticket carries an `agent:<tag>` label, anton loads the prompt for `<tag>` and appends it to the run's system prompt. A user-provided `.claude/agents/<tag>.md` in the target repo takes precedence over anton's bundled prompt of the same name — your customization wins; the bundled prompt is the fallback.
 
 ## Using anton
 
@@ -107,6 +136,9 @@ Environment variables (all optional):
 | `ANTON_WORKTREES_ROOT` | sibling of the repo | where run worktrees are created |
 | `ANTON_SESSIONS_ROOT` | `./.anton/sessions` | claude session logs |
 | `ANTON_SCANS_ROOT` | `./.anton/scans` | stringer scan files |
+| `ANTON_CLAUDE_BIN` | `claude` (on `PATH`) | override the `claude` executable anton drives |
+| `ANTON_GH_BIN` | `gh` (on `PATH`) | override the GitHub CLI executable |
+| `ANTON_STRINGER_BIN` | `stringer` (on `PATH`) | override the `stringer` executable |
 
 ## Troubleshooting
 
