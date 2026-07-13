@@ -1,0 +1,5 @@
+# Beads/Dolt sync (anton-q3o): re-import Dolt data after `git pull`/merge. Chains the
+# bd-managed shim (guarded by `command -v bd`, so contributors without bd are unaffected).
+if [ -f .beads/hooks/post-merge ]; then
+  sh .beads/hooks/post-merge "$@"
+fi

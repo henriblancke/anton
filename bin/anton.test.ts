@@ -5,7 +5,7 @@
  */
 import { afterEach, describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -14,8 +14,10 @@ import {
   agentsFromArgs,
   applyMigrations,
   compareVersions,
+  configureBeadsDoltSync,
   ensureBetterSqlite3,
   nextArgs,
+  normalizeGitUrl,
   platformLabel,
   provisionAgentsSkills,
   REQUIRED_SKILLS,
@@ -195,5 +197,150 @@ describe("provisionAgentsSkills (into a temp ~/.claude)", () => {
     expect(r.installed).toBe(REQUIRED_SKILLS.length);
     expect(r.agents).toEqual([]);
     expect(await exists(join(claudeRoot, "agents"))).toBe(false);
+  });
+});
+
+describe("normalizeGitUrl", () => {
+  it("equates the git-origin form with what bd dolt remote list reports", () => {
+    // bd rewrites scp form to git+ssh:// with a literal /./ path segment.
+    expect(normalizeGitUrl("git@github.com:henriblancke/anton.git")).toBe(
+      normalizeGitUrl("git+ssh://git@github.com/./henriblancke/anton.git"),
+    );
+    expect(normalizeGitUrl("https://github.com/org/repo.git")).toBe(
+      normalizeGitUrl("git+https://github.com/org/repo.git"),
+    );
+    expect(normalizeGitUrl("/tmp/remote.git")).toBe(normalizeGitUrl("git+file:///tmp/remote.git"));
+    expect(normalizeGitUrl("https://github.com/a/b")).not.toBe(normalizeGitUrl("https://github.com/a/c"));
+  });
+});
+
+describe("configureBeadsDoltSync (bd/git stubbed — CI has no bd)", () => {
+  let repoDir: string;
+  afterEach(async () => {
+    if (repoDir) await rm(repoDir, { recursive: true, force: true });
+  });
+
+  /** A fake exec keyed by "<cmd> <subcommand…>" prefix; records every invocation. */
+  function fakeExec(responses: Record<string, { status: number; stdout?: string; stderr?: string }>) {
+    const calls: string[] = [];
+    const exec = (cmd: string, args: string[]) => {
+      const line = [cmd, ...args].join(" ");
+      calls.push(line);
+      for (const [prefix, res] of Object.entries(responses)) {
+        if (line.startsWith(prefix)) return { stdout: "", stderr: "", ...res };
+      }
+      throw new Error(`unexpected exec: ${line}`);
+    };
+    return { exec, calls };
+  }
+
+  async function beadsRepo(): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), "anton-dolt-"));
+    await mkdir(join(dir, ".beads"), { recursive: true });
+    return dir;
+  }
+
+  it("skips (no-workspace) when the root has no .beads", async () => {
+    repoDir = await mkdtemp(join(tmpdir(), "anton-dolt-"));
+    const { exec } = fakeExec({});
+    expect(configureBeadsDoltSync({ repoDir, exec })).toEqual({ status: "no-workspace" });
+  });
+
+  it("fails loud (no-remote) when .beads exists but git has no origin", async () => {
+    repoDir = await beadsRepo();
+    const { exec } = fakeExec({
+      "git remote get-url origin": { status: 2, stderr: "error: No such remote 'origin'" },
+    });
+    expect(configureBeadsDoltSync({ repoDir, exec })).toEqual({ status: "no-remote" });
+  });
+
+  it("adds the git origin as Dolt remote, hydrates (pull), and pushes refs/dolt", async () => {
+    repoDir = await beadsRepo();
+    const { exec, calls } = fakeExec({
+      "git remote get-url origin": { status: 0, stdout: "git@github.com:org/repo.git\n" },
+      "bd dolt remote list": { status: 0, stdout: "No remotes configured.\n" },
+      "bd dolt remote add origin": { status: 0, stdout: 'Added remote "origin"' },
+      "bd dolt pull": { status: 0, stdout: "Everything up-to-date." },
+      "bd dolt push": { status: 0, stdout: "Push complete." },
+    });
+    const r = configureBeadsDoltSync({ repoDir, exec });
+    expect(r).toMatchObject({
+      status: "configured",
+      url: "git@github.com:org/repo.git",
+      pulled: true,
+      pushed: true,
+    });
+    expect(calls).toContain("bd dolt remote add origin git@github.com:org/repo.git");
+    // A fresh clone has no JSONL to hydrate from (anton-hg9): the board must come from
+    // refs/dolt/data, so the pull runs before the push can publish anything local.
+    expect(calls.indexOf("bd dolt pull")).toBeLessThan(calls.indexOf("bd dolt push"));
+  });
+
+  it("treats a failed pull as benign (first-ever setup: no refs/dolt/data on the remote)", async () => {
+    repoDir = await beadsRepo();
+    const { exec } = fakeExec({
+      "git remote get-url origin": { status: 0, stdout: "git@github.com:org/repo.git\n" },
+      "bd dolt remote list": { status: 0, stdout: "No remotes configured.\n" },
+      "bd dolt remote add origin": { status: 0 },
+      "bd dolt pull": { status: 1, stderr: "remote ref refs/dolt/data not found" },
+      "bd dolt push": { status: 0 },
+    });
+    const r = configureBeadsDoltSync({ repoDir, exec });
+    expect(r).toMatchObject({ status: "configured", pulled: false, pushed: true });
+  });
+
+  it("is idempotent: skips add+push when origin already matches (bd's rewritten form)", async () => {
+    repoDir = await beadsRepo();
+    const { exec, calls } = fakeExec({
+      "git remote get-url origin": { status: 0, stdout: "git@github.com:org/repo.git\n" },
+      "bd dolt remote list": {
+        status: 0,
+        stdout: "origin               git+ssh://git@github.com/./org/repo.git\n",
+      },
+    });
+    const r = configureBeadsDoltSync({ repoDir, exec });
+    expect(r).toEqual({ status: "already", url: "git@github.com:org/repo.git" });
+    expect(calls.some((l) => l.startsWith("bd dolt remote add"))).toBe(false);
+    expect(calls.some((l) => l.startsWith("bd dolt push"))).toBe(false);
+  });
+
+  it("re-points a stale Dolt remote at the current git origin", async () => {
+    repoDir = await beadsRepo();
+    const { exec, calls } = fakeExec({
+      "git remote get-url origin": { status: 0, stdout: "git@github.com:org/new.git\n" },
+      "bd dolt remote list": { status: 0, stdout: "origin  git+ssh://git@github.com/./org/old.git\n" },
+      "bd dolt remote add origin": { status: 0 },
+      "bd dolt pull": { status: 0 },
+      "bd dolt push": { status: 0 },
+    });
+    const r = configureBeadsDoltSync({ repoDir, exec });
+    expect(r).toMatchObject({ status: "configured", url: "git@github.com:org/new.git" });
+    expect(calls).toContain("bd dolt remote add origin git@github.com:org/new.git");
+  });
+
+  it("reports a failed push (pushed: false) without hiding the remote configuration", async () => {
+    repoDir = await beadsRepo();
+    const { exec } = fakeExec({
+      "git remote get-url origin": { status: 0, stdout: "git@github.com:org/repo.git\n" },
+      "bd dolt remote list": { status: 0, stdout: "No remotes configured.\n" },
+      "bd dolt remote add origin": { status: 0 },
+      "bd dolt pull": { status: 0 },
+      "bd dolt push": { status: 1, stderr: "Error: push to origin/main: auth required" },
+    });
+    const r = configureBeadsDoltSync({ repoDir, exec });
+    expect(r).toMatchObject({ status: "configured", pushed: false });
+    expect((r as { pushOutput: string }).pushOutput).toContain("auth required");
+  });
+
+  it("surfaces a bd dolt remote add failure as an error", async () => {
+    repoDir = await beadsRepo();
+    const { exec } = fakeExec({
+      "git remote get-url origin": { status: 0, stdout: "git@github.com:org/repo.git\n" },
+      "bd dolt remote list": { status: 0, stdout: "No remotes configured.\n" },
+      "bd dolt remote add origin": { status: 1, stderr: "dolt server unreachable" },
+    });
+    const r = configureBeadsDoltSync({ repoDir, exec });
+    expect(r).toMatchObject({ status: "error" });
+    expect((r as { detail: string }).detail).toContain("dolt server unreachable");
   });
 });

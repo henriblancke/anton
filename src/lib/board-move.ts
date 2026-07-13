@@ -61,4 +61,10 @@ export async function moveCard(project: Project, cardId: string, toStage: Stage)
         break;
     }
   }
+
+  if (ops.length > 0) {
+    await beads
+      .sync(project.repoPath)
+      .catch((e) => console.error(`[board-move] beads dolt sync failed after moving ${cardId}`, e));
+  }
 }

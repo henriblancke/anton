@@ -36,10 +36,11 @@ the epic**, set by you in the UI. The execute job only ever touches approved epi
 
 Persistence splits by whether state is **shareable/durable** (belongs in git, follows the repo)
 or **ephemeral/machine-local** (execution plumbing, meaningless off this machine). This mirrors
-how foolery works: it keeps no work DB — beads is the source of truth, git-shareable via
-`.beads/*.jsonl` (Dolt-backed export); only machine-local config lives outside git.
+how foolery works: it keeps no work DB — beads is the source of truth, shared via Dolt sync
+(`refs/dolt/data` on the git remote; the `.beads/*.jsonl` files are passive, git-ignored
+local exports); only machine-local config lives outside git.
 
-**Shareable/durable → beads (`.beads/*.jsonl`, git-versioned):**
+**Shareable/durable → beads (Dolt DB, synced via `refs/dolt/data`):**
 - epics/tickets and their Goal/Acceptance/Context/labels/deps
 - **approval** — a label on the epic (`approved`)
 - **stage** — labels (`stage:implementing` / `in-review`) as needed

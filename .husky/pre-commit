@@ -1,3 +1,9 @@
+# Beads/Dolt sync (anton-q3o): chain the bd-managed shim first so the beads export is staged
+# into this commit. Guarded by `command -v bd` inside the shim — no-op without bd installed.
+if [ -f .beads/hooks/pre-commit ]; then
+  sh .beads/hooks/pre-commit "$@"
+fi
+
 # Pre-commit (anton-8tg): lint (auto-fix) staged TS, then a full typecheck. Fast enough to run on
 # every commit; the full test suite + build run in CI (.github/workflows/ci.yml), not here.
 bunx lint-staged

@@ -19,9 +19,10 @@ anton drives the mechanical lifecycle so runs stay deterministic and resumable. 
 
 - **Commit, push, or open a pull request.** anton commits your working-tree changes after the
   ticket's tests pass, and opens a single PR for the whole epic when every ticket is done.
-- **Move ticket state.** anton advances the beads lifecycle — `backlog → implementing → done` —
-  claims the ticket, and runs `bd close` once tests are green. Do not run `bd close`, change
-  `status:`/`stage:` labels, or touch the epic's approval or PR reference.
+- **Move ticket state.** anton advances the beads lifecycle — it has already claimed this
+  ticket (`in_progress` + `stage:implementing`) and runs `bd close` once tests are green. Do
+  not run `bd close`, change `status:`/`stage:` labels, or touch the epic's approval or PR
+  reference.
 - **Switch branches or manage the worktree.** You are already on the correct branch in the
   correct worktree; stay there.
 

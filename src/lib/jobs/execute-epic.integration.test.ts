@@ -82,8 +82,10 @@ suite("execute-epic e2e (real handler · real bd/git · fake claude/gh)", () => 
     g(["remote", "add", "origin", bare]);
     g(["push", "-q", "-u", "origin", "main"]);
 
-    // beads: epic (approved) + two tickets under it.
+    // beads: epic (approved) + two tickets under it. The git `origin` doubles as the Dolt
+    // remote (as `anton setup` wires it), so the run's explicit beads.sync is exercised too.
     execFileSync("bd", ["init"], { cwd: repo, stdio: "ignore" });
+    execFileSync("bd", ["dolt", "remote", "add", "origin", bare], { cwd: repo, stdio: "ignore" });
     epicId = await beads.create(repo, {
       title: "Ship feature X",
       type: "epic",
@@ -224,6 +226,11 @@ process.exit(0);`,
     expect(log).toContain(`${t1}:`);
     expect(log).toContain(`${t2}:`);
 
+    // The run's bd writes (claims, closes, stage labels) were pushed to the Dolt remote
+    // explicitly by beads.sync — refs/dolt/data exists on origin without any git hook firing.
+    const allRefs = execFileSync("git", ["-C", repo, "ls-remote", "origin"], { encoding: "utf8" });
+    expect(allRefs).toContain("refs/dolt/data");
+
     // Two execute sessions recorded + logged.
     const sessions = await tdb.db.select().from(schema.sessions);
     expect(sessions).toHaveLength(2);
@@ -317,7 +324,10 @@ process.exit(0);`,
       const run2 = runsForEpic.find((r) => r.epicBeadId === epic2)!;
       expect(run2.status).toBe("parked");
       expect(existsSync(run2.worktreePath!)).toBe(true); // worktree kept for resume
-      expect((await beads.show(repo, ticket2)).status).not.toBe("closed");
+      // The ticket was claimed before the session ran: visible in-flight state on the board.
+      const claimed = await beads.show(repo, ticket2);
+      expect(claimed.status).toBe("in_progress");
+      expect(claimed.labels ?? []).toContain("stage:implementing");
 
       // Not due yet.
       expect(await runner.tickOnce()).toBe(0);

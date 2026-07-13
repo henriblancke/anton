@@ -101,6 +101,85 @@ async function bd(cwd: string, args: string[]): Promise<string> {
   return stdout;
 }
 
+type BdExec = typeof bd;
+
+// ── Dolt sync: push every bd write to the remote explicitly (anton-nyf) ──
+//
+// refs/dolt/data only moves when `bd dolt push` runs; git hooks are per-machine and don't fire
+// for anton's own writes, so every write path syncs explicitly through here.
+
+/**
+ * Benign sync outcomes that must NOT fail a sync: a clean working set ("Nothing to commit.")
+ * and a workspace with no Dolt remote ("No remote is configured — skipping."). Current bd exits
+ * 0 for both; the matcher keeps sync tolerant if a bd version turns them into errors.
+ */
+const BENIGN_SYNC_OUTPUT = [/nothing to commit/i, /no remotes? (?:is )?configured/i];
+
+export function isBenignSyncOutput(output: string): boolean {
+  return BENIGN_SYNC_OUTPUT.some((re) => re.test(output));
+}
+
+/**
+ * One sync pass: `bd dolt commit` (a no-op under dolt.auto-commit, but catches externally-made
+ * changes) then `bd dolt push`. Benign outcomes resolve; a real failure (auth, network, remote
+ * conflict) rejects with the bd output attached — callers surface it, never swallow it.
+ * `exec` is injectable for tests.
+ */
+export async function runDoltSync(cwd: string, exec: BdExec = bd): Promise<void> {
+  for (const args of [
+    ["dolt", "commit"],
+    ["dolt", "push"],
+  ]) {
+    try {
+      await exec(cwd, args);
+    } catch (e) {
+      const err = e as Error & { stdout?: string; stderr?: string };
+      const output = `${err.stderr ?? ""}\n${err.stdout ?? ""}`.trim() || err.message;
+      if (isBenignSyncOutput(output)) continue;
+      throw new Error(`bd ${args.join(" ")} failed in ${cwd}: ${output}`, { cause: e });
+    }
+  }
+}
+
+/**
+ * Coalescing wrapper around runDoltSync, keyed by cwd: while a sync runs, every request that
+ * arrives shares ONE trailing sync (which starts after the current one and therefore sees all
+ * their writes) — a burst of writes costs one extra push, not one each. Exported for testing.
+ */
+export function createDoltSync(exec: BdExec = bd): (cwd: string) => Promise<void> {
+  const running = new Map<string, Promise<void>>();
+  const trailing = new Map<string, Promise<void>>();
+
+  const start = (cwd: string): Promise<void> => {
+    const p = runDoltSync(cwd, exec);
+    running.set(cwd, p);
+    // Bookkeeping only — callers hold `p` and see its rejection; this chain must not re-reject.
+    void p
+      .catch(() => {})
+      .finally(() => {
+        if (running.get(cwd) === p) running.delete(cwd);
+      });
+    return p;
+  };
+
+  return function sync(cwd: string): Promise<void> {
+    const queued = trailing.get(cwd);
+    if (queued) return queued;
+    const current = running.get(cwd);
+    if (!current) return start(cwd);
+    const next = current
+      .catch(() => {}) // the current run's failure belongs to its own callers
+      .then(() => {
+        trailing.delete(cwd);
+        return start(cwd);
+      });
+    trailing.set(cwd, next);
+    return next;
+  };
+}
+
+const doltSync = createDoltSync();
+
 /** bd --json returns either a top-level array or `{ issues: [...] }`. Normalize to an array. */
 function asArray<T>(raw: string): T[] {
   const d = JSON.parse(raw || "[]");
@@ -221,6 +300,13 @@ export const beads = {
     if (!args) return;
     await bd(cwd, args);
   },
+
+  /**
+   * Push beads to the Dolt remote (commit if needed, then push), coalescing concurrent calls
+   * per repo. Tolerant of a clean working set and of a workspace with no remote; REJECTS on a
+   * real push failure — call sites must log or rethrow, never ignore the promise.
+   */
+  sync: (cwd: string): Promise<void> => doltSync(cwd),
 
   // ── convenience: anton's stage/approval semantics, all in beads ──
   approve: (cwd: string, epicId: string) => beads.tag(cwd, epicId, [LABELS.approved]),
