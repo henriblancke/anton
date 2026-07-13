@@ -17,18 +17,115 @@
  *
  * Pure Node, zero deps. Native ESM.
  */
-import { spawnSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync } from "node:fs";
-import { homedir } from "node:os";
+import { spawn, spawnSync } from "node:child_process";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { arch as osArch, homedir, platform as osPlatform } from "node:os";
 import { dirname, join } from "node:path";
+import { createRequire } from "node:module";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { fileURLToPath } from "node:url";
+import { setTimeout as sleep } from "node:timers/promises";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 /** The anton package root = parent of bin/. All commands run here, not in the user's cwd. */
 const APP_ROOT = join(__dirname, "..");
 const BIN = join(APP_ROOT, "node_modules", ".bin");
+
+// ── Distribution / bundle mode (anton-1xp) ──────────────────────────────────────────────────
+// A prebuilt release bundle carries a RELEASE_VERSION marker at its root; a source checkout does
+// not. In bundle mode `start` daemonizes and `stop`/`status`/`update`/`uninstall` manage the
+// installed runtime, and — because the runtime dir is REPLACED wholesale on update — all writable
+// state (anton.db, sessions, scans, logs, pid) lives under a persistent state dir, never in APP_ROOT.
+const RELEASE_VERSION_FILE = join(APP_ROOT, "RELEASE_VERSION");
+const IS_BUNDLE = existsSync(RELEASE_VERSION_FILE);
+const INSTALL_ROOT = process.env.ANTON_HOME ?? join(homedir(), ".local", "share", "anton");
+const STATE_DIR = process.env.ANTON_STATE_DIR ?? join(homedir(), ".local", "state", "anton");
+const LOG_DIR = join(STATE_DIR, "logs");
+const PID_FILE = join(STATE_DIR, "anton.pid");
+const BIN_LINK = process.env.ANTON_BIN_LINK ?? join(homedir(), ".local", "bin", "anton");
+const RELEASE_OWNER = process.env.ANTON_RELEASE_OWNER ?? "henriblancke";
+const RELEASE_REPO = process.env.ANTON_RELEASE_REPO ?? "anton";
+
+/** The release-asset platform label (`<os>-<arch>`), matching scripts/build-bundle.mjs. */
+function platformLabel() {
+  const os = { darwin: "darwin", linux: "linux" }[osPlatform()] ?? osPlatform();
+  const arch = { arm64: "arm64", x64: "x64" }[osArch()] ?? osArch();
+  return `${os}-${arch}`;
+}
+
+/** The installed bundle's version (from RELEASE_VERSION), or null in a source checkout. */
+function bundleVersion() {
+  try {
+    return readFileSync(RELEASE_VERSION_FILE, "utf8").trim();
+  } catch {
+    return null;
+  }
+}
+
+/** Env that redirects anton's writable state OUT of the (replaceable) runtime dir in bundle mode. */
+function bundleStateEnv() {
+  return {
+    ANTON_DB: process.env.ANTON_DB ?? join(STATE_DIR, "anton.db"),
+    ANTON_SESSIONS_ROOT: process.env.ANTON_SESSIONS_ROOT ?? join(STATE_DIR, "sessions"),
+    ANTON_SCANS_ROOT: process.env.ANTON_SCANS_ROOT ?? join(STATE_DIR, "scans"),
+  };
+}
+
+/** Compare dotted versions. Returns 1 if a>b, -1 if a<b, 0 if equal (non-numeric parts ignored). */
+function compareVersions(a, b) {
+  const pa = String(a).replace(/^v/, "").split(".").map((n) => parseInt(n, 10) || 0);
+  const pb = String(b).replace(/^v/, "").split(".").map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (d) return d > 0 ? 1 : -1;
+  }
+  return 0;
+}
+
+/** Read the daemon PID if the process is actually alive; clears a stale pidfile otherwise. */
+function runningPid() {
+  let pid;
+  try {
+    pid = parseInt(readFileSync(PID_FILE, "utf8").trim(), 10);
+  } catch {
+    return null;
+  }
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    process.kill(pid, 0); // signal 0 = existence check
+    return pid;
+  } catch {
+    try { unlinkSync(PID_FILE); } catch {}
+    return null;
+  }
+}
+
+/** Poll until the server answers on the port, or timeout. Best-effort (uses global fetch). */
+async function waitForReady(port, timeoutMs = 30000) {
+  const url = `http://127.0.0.1:${port}/`;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await fetch(url, { signal: AbortSignal.timeout(1500) });
+      return true;
+    } catch {
+      await sleep(500);
+    }
+  }
+  return false;
+}
 
 const c = {
   bold: (s) => `\x1b[1m${s}\x1b[0m`,
@@ -263,6 +360,217 @@ async function provisionAgentsSkills(args, opts = {}) {
   return { installed, skipped, agents: selected };
 }
 
+// ── Bundle-mode migrations + daemon lifecycle (anton-1xp) ───────────────────────────────────
+
+/**
+ * Apply the committed drizzle migration SQL directly via better-sqlite3 (a production dep), so a
+ * prebuilt bundle needs no drizzle-kit (a devDep we don't ship). Idempotent: tracks applied files
+ * in `__anton_migrations` and only runs new ones. Mirrors the SQL-splitting in src/lib/db/testing.ts.
+ */
+function applyMigrations(dbPath, opts = {}) {
+  const appRoot = opts.appRoot ?? APP_ROOT;
+  const require = createRequire(join(appRoot, "package.json"));
+  const Database = require("better-sqlite3");
+  mkdirSync(dirname(dbPath), { recursive: true });
+  const sqlite = new Database(dbPath);
+  try {
+    sqlite.pragma("foreign_keys = ON");
+    sqlite.exec("CREATE TABLE IF NOT EXISTS __anton_migrations (name TEXT PRIMARY KEY, applied_at INTEGER)");
+    const applied = new Set(sqlite.prepare("SELECT name FROM __anton_migrations").all().map((r) => r.name));
+    const dir = join(appRoot, "drizzle");
+    const files = readdirSync(dir).filter((f) => f.endsWith(".sql")).sort();
+    let ran = 0;
+    for (const file of files) {
+      if (applied.has(file)) continue;
+      const raw = readFileSync(join(dir, file), "utf8");
+      const sql = raw.split("--> statement-breakpoint").map((s) => s.trim()).filter(Boolean).join(";\n");
+      const tx = sqlite.transaction(() => {
+        sqlite.exec(sql);
+        sqlite.prepare("INSERT INTO __anton_migrations (name, applied_at) VALUES (?, ?)").run(file, Date.now());
+      });
+      tx();
+      ran++;
+    }
+    return { ran, total: files.length };
+  } finally {
+    sqlite.close();
+  }
+}
+
+/** Daemonize `next start` from the bundle, redirecting output to the persistent state log dir. */
+async function startDaemon(args) {
+  const running = runningPid();
+  const port = resolvePort(args) ?? "3000";
+  if (running) {
+    console.log(c.yellow("anton is already running") + c.dim(` (pid ${running}) → http://localhost:${port}`));
+    return 0;
+  }
+
+  // Ensure the schema exists (idempotent) before the server touches the DB.
+  const stateEnv = bundleStateEnv();
+  try {
+    const { ran } = applyMigrations(stateEnv.ANTON_DB);
+    if (ran) console.log(c.dim(`applied ${ran} migration(s) → ${stateEnv.ANTON_DB}`));
+  } catch (e) {
+    console.log(c.yellow("migration step failed (continuing): ") + c.dim(String(e.message ?? e)));
+  }
+
+  mkdirSync(LOG_DIR, { recursive: true });
+  const nextBin = join(APP_ROOT, "node_modules", "next", "dist", "bin", "next");
+  const out = openSync(join(LOG_DIR, "stdout.log"), "a");
+  const err = openSync(join(LOG_DIR, "stderr.log"), "a");
+  const child = spawn("node", [nextBin, "start", "-p", String(port)], {
+    cwd: APP_ROOT,
+    detached: true,
+    stdio: ["ignore", out, err],
+    env: { ...process.env, NODE_ENV: "production", ...stateEnv },
+  });
+  child.unref();
+  mkdirSync(STATE_DIR, { recursive: true });
+  writeFileSync(PID_FILE, String(child.pid));
+  console.log(c.dim(`anton starting (pid ${child.pid})…`));
+
+  const ready = await waitForReady(port);
+  if (ready) {
+    console.log(c.green("✓ anton is up") + ` → ${c.bold(`http://localhost:${port}`)}`);
+  } else {
+    console.log(c.yellow(`started (pid ${child.pid}) but not answering yet`) + c.dim(` — see ${join(LOG_DIR, "stderr.log")}`));
+  }
+  return 0;
+}
+
+/** Stop the running daemon (SIGTERM, then SIGKILL if it lingers). */
+async function cmdStop() {
+  const pid = runningPid();
+  if (!pid) {
+    console.log(c.dim("anton is not running."));
+    return 0;
+  }
+  try { process.kill(pid, "SIGTERM"); } catch {}
+  for (let i = 0; i < 20 && runningPid(); i++) await sleep(150); // up to ~3s grace
+  if (runningPid()) {
+    try { process.kill(pid, "SIGKILL"); } catch {}
+  }
+  try { unlinkSync(PID_FILE); } catch {}
+  console.log(c.green("✓ anton stopped") + c.dim(` (pid ${pid})`));
+  return 0;
+}
+
+/** Print install/runtime/state paths and whether the daemon is running. */
+function cmdStatus(args) {
+  const pid = runningPid();
+  const port = resolvePort(args) ?? "3000";
+  console.log(c.bold("anton status"));
+  console.log(`  version   ${bundleVersion() ?? c.dim("(source checkout)")}`);
+  console.log(`  runtime   ${APP_ROOT}`);
+  console.log(`  state     ${STATE_DIR}`);
+  if (pid) console.log(`  server    ${c.green("running")}${c.dim(` (pid ${pid}) → http://localhost:${port}`)}`);
+  else console.log(`  server    ${c.dim("stopped")}`);
+  return 0;
+}
+
+/** Fetch the latest GitHub release metadata for owner/repo (best-effort; returns null on failure). */
+async function fetchLatestRelease() {
+  const url = `https://api.github.com/repos/${RELEASE_OWNER}/${RELEASE_REPO}/releases/latest`;
+  try {
+    const res = await fetch(url, {
+      headers: { "User-Agent": "anton-cli", Accept: "application/vnd.github+json" },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+/** Download the platform bundle for the newest release and swap the runtime dir in place. */
+async function cmdUpdate() {
+  if (!IS_BUNDLE) {
+    console.log(c.yellow("`anton update` applies to an installed bundle only.") + c.dim(" (source checkout — use git.)"));
+    return 1;
+  }
+  const current = bundleVersion();
+  console.log(c.dim(`current version: ${current}. Checking ${RELEASE_OWNER}/${RELEASE_REPO}…`));
+  const rel = await fetchLatestRelease();
+  if (!rel || !rel.tag_name) {
+    console.log(c.red("could not reach GitHub releases — try again later."));
+    return 1;
+  }
+  const latest = String(rel.tag_name).replace(/^v/, "");
+  if (compareVersions(latest, current) <= 0) {
+    console.log(c.green(`✓ already up to date (v${current}).`));
+    return 0;
+  }
+  const asset = (rel.assets ?? []).find((a) => a.name === `anton-${platformLabel()}.tar.gz`);
+  if (!asset) {
+    console.log(c.red(`no asset anton-${platformLabel()}.tar.gz in release ${rel.tag_name}.`));
+    return 1;
+  }
+
+  console.log(c.dim(`downloading ${asset.name} (v${latest})…`));
+  const tmp = join(INSTALL_ROOT, ".update");
+  rmSync(tmp, { recursive: true, force: true });
+  mkdirSync(tmp, { recursive: true });
+  const tarball = join(tmp, asset.name);
+  try {
+    const res = await fetch(asset.browser_download_url, {
+      headers: { "User-Agent": "anton-cli" },
+      signal: AbortSignal.timeout(120000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    writeFileSync(tarball, Buffer.from(await res.arrayBuffer()));
+  } catch (e) {
+    console.log(c.red(`download failed: ${e.message ?? e}`));
+    return 1;
+  }
+
+  const extractRc = spawnSync("tar", ["-xzf", tarball, "-C", tmp], { stdio: "inherit" }).status ?? 1;
+  const extracted = join(tmp, `anton-${platformLabel()}`);
+  if (extractRc !== 0 || !existsSync(extracted)) {
+    console.log(c.red("extract failed."));
+    return 1;
+  }
+
+  const wasRunning = !!runningPid();
+  if (wasRunning) await cmdStop();
+
+  const runtime = join(INSTALL_ROOT, "runtime");
+  const backup = join(INSTALL_ROOT, "runtime.old");
+  rmSync(backup, { recursive: true, force: true });
+  if (existsSync(runtime)) spawnSync("mv", [runtime, backup], { stdio: "inherit" });
+  spawnSync("mv", [extracted, runtime], { stdio: "inherit" });
+  rmSync(backup, { recursive: true, force: true });
+  rmSync(tmp, { recursive: true, force: true });
+  console.log(c.green(`✓ updated ${current} → ${latest}.`));
+
+  if (wasRunning) {
+    console.log(c.dim("restarting…"));
+    // Re-exec the freshly installed launcher so the new runtime serves.
+    spawnSync("node", [join(runtime, "bin", "anton.mjs"), "start"], { stdio: "inherit" });
+  }
+  return 0;
+}
+
+/** Remove the installed runtime + launcher symlink. Keeps state unless --purge is passed. */
+async function cmdUninstall(args = []) {
+  if (!IS_BUNDLE) {
+    console.log(c.yellow("`anton uninstall` applies to an installed bundle only."));
+    return 1;
+  }
+  if (runningPid()) await cmdStop();
+  rmSync(INSTALL_ROOT, { recursive: true, force: true });
+  try { unlinkSync(BIN_LINK); } catch {}
+  if (args.includes("--purge")) {
+    rmSync(STATE_DIR, { recursive: true, force: true });
+    console.log(c.green("✓ anton uninstalled") + c.dim(` (state purged: ${STATE_DIR})`));
+  } else {
+    console.log(c.green("✓ anton uninstalled."));
+    console.log(c.dim(`  Your data was kept at ${STATE_DIR} — delete it manually, or re-run with --purge.`));
+  }
+  return 0;
+}
+
 /** Prereq check. Returns true when all *required* tools are present. */
 function checkPrereqs() {
   console.log(c.bold("\nChecking prerequisites:"));
@@ -303,20 +611,34 @@ async function cmdSetup(args = []) {
     return 1;
   }
 
-  console.log(c.bold("\nApplying database migrations (drizzle-kit migrate):"));
-  const migrated = runLocal("drizzle-kit", ["migrate"]);
-  if (migrated !== 0) {
-    console.log(c.red("migration failed — see output above."));
-    return migrated;
-  }
+  if (IS_BUNDLE) {
+    // Prebuilt bundle: no drizzle-kit (devDep) is shipped, so apply migrations in-process to the
+    // PERSISTENT state DB, and skip the node-pty rebuild (it was built for this platform already).
+    const dbPath = bundleStateEnv().ANTON_DB;
+    console.log(c.bold("\nApplying database migrations:") + c.dim(` ${dbPath}`));
+    try {
+      const { ran, total } = applyMigrations(dbPath);
+      console.log(c.dim(`  ${ran} applied, ${total - ran} already current.`));
+    } catch (e) {
+      console.log(c.red(`migration failed: ${e.message ?? e}`));
+      return 1;
+    }
+  } else {
+    console.log(c.bold("\nApplying database migrations (drizzle-kit migrate):"));
+    const migrated = runLocal("drizzle-kit", ["migrate"]);
+    if (migrated !== 0) {
+      console.log(c.red("migration failed — see output above."));
+      return migrated;
+    }
 
-  // node-pty ships prebuilts that don't always match the local node ABI (DESIGN setup note).
-  // Rebuild it best-effort so the interactive xterm works; a failure here is a warning, not fatal.
-  console.log(c.bold("\nRebuilding node-pty for this node ABI:"));
-  const rebuilt = spawnSync("npm", ["rebuild", "node-pty"], { cwd: APP_ROOT, stdio: "inherit" });
-  if ((rebuilt.status ?? 1) !== 0) {
-    console.log(c.yellow("node-pty rebuild skipped/failed — interactive sessions may not work until you run:"));
-    console.log(c.dim("  cd node_modules/node-pty && npx node-gyp rebuild"));
+    // node-pty ships prebuilts that don't always match the local node ABI (DESIGN setup note).
+    // Rebuild it best-effort so the interactive xterm works; a failure here is a warning, not fatal.
+    console.log(c.bold("\nRebuilding node-pty for this node ABI:"));
+    const rebuilt = spawnSync("npm", ["rebuild", "node-pty"], { cwd: APP_ROOT, stdio: "inherit" });
+    if ((rebuilt.status ?? 1) !== 0) {
+      console.log(c.yellow("node-pty rebuild skipped/failed — interactive sessions may not work until you run:"));
+      console.log(c.dim("  cd node_modules/node-pty && npx node-gyp rebuild"));
+    }
   }
 
   await provisionAgentsSkills(args);
@@ -330,7 +652,11 @@ function cmdDev(args) {
   return runLocal("next", nextArgs("dev", args));
 }
 
-function cmdStart(args) {
+async function cmdStart(args) {
+  // Installed bundle: run as a background daemon (foolery-style) unless --foreground is passed.
+  if (IS_BUNDLE && !args.includes("--foreground")) {
+    return startDaemon(args);
+  }
   const built = existsSync(join(APP_ROOT, ".next"));
   if (!built) {
     console.log(c.dim("no build found — running `next build` first…"));
@@ -348,7 +674,11 @@ ${c.bold("Usage:")} anton <command>
   ${c.bold("setup")}    check prereqs, migrate DB, rebuild node-pty, install agents & skills  ${c.dim("[--agents <a,b,c>|all]")}
   ${c.bold("doctor")}   check prereqs + anton.db (non-destructive)
   ${c.bold("dev")}      run the dev server (next dev)          ${c.dim("[--port <n>]")}
-  ${c.bold("start")}    build if needed, then run the server   ${c.dim("[--port <n>]")}
+  ${c.bold("start")}    run the server ${c.dim("(installed: background; source: foreground)")}  ${c.dim("[--port <n>] [--foreground]")}
+  ${c.bold("stop")}     stop the background server             ${c.dim("(installed bundle)")}
+  ${c.bold("status")}   show version, paths, and whether the server is running
+  ${c.bold("update")}   download & install the latest release  ${c.dim("(installed bundle)")}
+  ${c.bold("uninstall")} remove the installed runtime + launcher ${c.dim("[--purge] (keeps data by default)")}
   ${c.bold("--help")}   show this help
 
 ${c.dim("Port: dev/start default to 3000; override with --port <n> (alias -p) or PORT=<n>.")}
@@ -367,6 +697,15 @@ function main(argv) {
       return cmdDev(rest);
     case "start":
       return cmdStart(rest);
+    case "stop":
+      return cmdStop();
+    case "status":
+      return cmdStatus(rest);
+    case "update":
+    case "upgrade":
+      return cmdUpdate();
+    case "uninstall":
+      return cmdUninstall(rest);
     case "-h":
     case "--help":
     case "help":
@@ -386,4 +725,14 @@ const invokedDirectly =
   process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
 if (invokedDirectly) Promise.resolve(main(process.argv)).then((code) => process.exit(code ?? 0));
 
-export { resolvePort, nextArgs, main, agentsFromArgs, provisionAgentsSkills, REQUIRED_SKILLS };
+export {
+  resolvePort,
+  nextArgs,
+  main,
+  agentsFromArgs,
+  provisionAgentsSkills,
+  REQUIRED_SKILLS,
+  compareVersions,
+  platformLabel,
+  applyMigrations,
+};

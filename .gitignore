@@ -50,3 +50,6 @@ anton.db-*
 .dolt/
 *.db
 .beads-credential-key
+
+# Prebuilt release bundles (anton-1xp) — built in CI, never committed
+dist/

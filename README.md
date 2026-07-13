@@ -87,31 +87,35 @@ Run `anton doctor` at any time to check what's present.
 
 ## Install
 
-anton ships as a Node package, **not a standalone compiled binary** — there's no single executable to download. Get it one of two ways:
+The quickest path is the **one-line installer**. It downloads a prebuilt, per-platform bundle — the built app plus its native modules — and drops the `anton` launcher on your `PATH`. No toolchain, no build step:
 
-- **From a GitHub Release (today).** Download the source tarball from the [Releases page](https://github.com/henriblancke/anton/releases), extract it, and install dependencies:
+```bash
+curl -fsSL https://raw.githubusercontent.com/henriblancke/anton/main/scripts/install.sh | bash
+```
 
-  ```bash
-  tar xzf anton-<version>.tar.gz && cd anton-<version>
-  bun install      # or: npm install
-  ```
+Then:
 
-- **From npm (once publishing is enabled).** A global install will be the one-liner — anton isn't published yet, so use the Release tarball above for now:
+```bash
+anton setup      # prereqs, create the local DB, install skills & agents
+anton start      # start the server in the background → http://localhost:3000
+```
 
-  ```bash
-  npm i -g anton
-  ```
+anton **isn't a single compiled binary** — it's a Next.js server with native addons (`node-pty`, `better-sqlite3`), so a release can't fold into one universal executable. Instead each release ships a **prebuilt bundle per platform** (macOS arm64/x64, Linux x64); the installer fetches the one matching your machine, installs it under `~/.local/share/anton`, and keeps your data in `~/.local/state/anton` (so it survives updates). Manage it with `anton stop` / `status` / `update` / `uninstall` — see [Run locally](#run-locally).
 
-Installing exposes the `anton` CLI: on your `PATH` after a global `npm i -g`, or run it from the package directory with `bun run anton` / `npx anton`.
+### From source (contributors)
 
-> **Testing locally from a clone.** `bun install` alone does **not** put `anton` on your `PATH` — a package manager only links a package's `bin` when it's installed as a dependency or globally, never for the repo's own root. To get the real `anton` command while iterating on a clone, link it once:
->
-> ```bash
-> bun link          # in the repo root — symlinks `anton` into ~/.bun/bin (npm: `npm link`)
-> anton doctor      # now resolves from anywhere; stays pointed at your working tree
-> ```
->
-> `bun link` keeps `anton` pointed at your checkout (edits are picked up on the next run); a global `npm i -g .` copies the package instead and won't track edits. Undo with `bun unlink` (or `rm ~/.bun/bin/anton`). Or skip linking entirely and run the launcher directly: `node bin/anton.mjs <command>`.
+Working on anton itself? Clone and run from the checkout instead of the installer:
+
+```bash
+git clone https://github.com/henriblancke/anton && cd anton
+bun install
+bun link          # symlinks `anton` into ~/.bun/bin so it resolves from anywhere (npm: `npm link`)
+anton setup && anton dev
+```
+
+`bun install` alone does **not** put `anton` on your `PATH` — a package manager only links a package's `bin` when it's installed as a dependency or globally, never for the repo's own root. `bun link` fixes that and keeps `anton` pointed at your working tree (edits are picked up on the next run; undo with `bun unlink`). Or skip linking and run the launcher directly: `node bin/anton.mjs <command>`. A source checkout has no `RELEASE_VERSION` marker, so `anton start` runs in the **foreground** (the daemon/`stop`/`update` commands are for installed bundles).
+
+> **npm (once publishing is enabled).** A global `npm i -g anton` will also work as a source-style install (builds locally on your machine); anton isn't published yet, so use the installer or a clone for now.
 
 ## Run locally
 
@@ -129,14 +133,20 @@ anton dev --port 4000         # same override for the dev server
 
 The **job runner and cron scheduler start automatically** with the server (via `src/instrumentation.ts`), so approved epics execute and scheduled jobs fire without any extra process. Set `ANTON_RUNNER=off` to boot the UI without them.
 
+**Installed bundle vs. source checkout.** From an installed bundle, `anton start` runs the server as a **background daemon** (logs under `~/.local/state/anton/logs`) and returns once it's up; use `anton stop` / `anton status` to manage it, `anton update` to pull the latest release, and `anton uninstall` to remove it (your data in `~/.local/state/anton` is kept unless you pass `--purge`). From a source checkout there's no bundle to daemonize, so `anton start` runs in the **foreground** (add `--foreground` to force that in a bundle too).
+
 ### CLI
 
 ```
-anton setup    check prereqs, migrate DB, rebuild node-pty, install agents & skills  [--agents <a,b,c>|all]
-anton doctor   check prereqs + anton.db (non-destructive)
-anton dev      run the dev server (next dev)                                          [--port <n>]
-anton start    build if needed, then run the server (next start)                      [--port <n>]
-anton --help   show help
+anton setup     check prereqs, migrate DB, install agents & skills   [--agents <a,b,c>|all]
+anton doctor    check prereqs + anton.db (non-destructive)
+anton dev       run the dev server (next dev)                         [--port <n>]
+anton start     run the server — bundle: background, source: foreground  [--port <n>] [--foreground]
+anton stop      stop the background server                            (installed bundle)
+anton status    show version, install/state paths, and running state
+anton update    download & install the latest release                (installed bundle)
+anton uninstall remove the installed runtime + launcher               [--purge]
+anton --help    show help
 ```
 
 ### Agents & skills

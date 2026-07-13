@@ -9,7 +9,17 @@ import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { agentsFromArgs, nextArgs, provisionAgentsSkills, REQUIRED_SKILLS, resolvePort } from "./anton.mjs";
+import { createRequire } from "node:module";
+import {
+  agentsFromArgs,
+  applyMigrations,
+  compareVersions,
+  nextArgs,
+  platformLabel,
+  provisionAgentsSkills,
+  REQUIRED_SKILLS,
+  resolvePort,
+} from "./anton.mjs";
 
 const CLI = join(dirname(fileURLToPath(import.meta.url)), "anton.mjs");
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -89,6 +99,62 @@ describe("agentsFromArgs", () => {
     expect(agentsFromArgs(["--no-agents"])).toEqual([]);
     expect(agentsFromArgs(["--agents", "nextjs,fastapi"])).toBe("nextjs,fastapi");
     expect(agentsFromArgs(["--agents=all"])).toBe("all");
+  });
+});
+
+describe("compareVersions", () => {
+  it("orders dotted versions, tolerating a leading v", () => {
+    expect(compareVersions("0.2.0", "0.1.9")).toBe(1);
+    expect(compareVersions("v1.0.0", "1.0.1")).toBe(-1);
+    expect(compareVersions("0.1.0", "0.1.0")).toBe(0);
+    expect(compareVersions("1.2", "1.2.0")).toBe(0); // missing parts treated as 0
+    expect(compareVersions("1.10.0", "1.9.0")).toBe(1); // numeric, not lexical
+  });
+});
+
+describe("platformLabel", () => {
+  it("is a <os>-<arch> label matching the running platform", () => {
+    const label = platformLabel();
+    expect(label).toMatch(/^[a-z0-9]+-[a-z0-9]+$/);
+    expect(label).toContain(process.arch === "x64" ? "x64" : process.arch);
+  });
+});
+
+describe("applyMigrations (in-process, no drizzle-kit)", () => {
+  let dir: string;
+  afterEach(async () => {
+    if (dir) await rm(dir, { recursive: true, force: true });
+  });
+
+  it("applies the real migration set to a temp DB, idempotently", async () => {
+    dir = await mkdtemp(join(tmpdir(), "anton-mig-"));
+    const dbPath = join(dir, "anton.db");
+
+    // Uses the repo's real drizzle/*.sql + better-sqlite3 (appRoot = REPO_ROOT).
+    const first = applyMigrations(dbPath, { appRoot: REPO_ROOT });
+    expect(first.total).toBeGreaterThan(0);
+    expect(first.ran).toBe(first.total);
+    expect(await exists(dbPath)).toBe(true);
+
+    // Second run is a no-op — the journal records what's applied.
+    const second = applyMigrations(dbPath, { appRoot: REPO_ROOT });
+    expect(second.ran).toBe(0);
+    expect(second.total).toBe(first.total);
+
+    // The schema is really there: journal table + more than one user table.
+    const require = createRequire(join(REPO_ROOT, "package.json"));
+    const Database = require("better-sqlite3");
+    const sqlite = new Database(dbPath);
+    try {
+      const journal = sqlite.prepare("SELECT COUNT(*) AS n FROM __anton_migrations").get() as { n: number };
+      expect(journal.n).toBe(first.total);
+      const tables = sqlite
+        .prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table'")
+        .get() as { n: number };
+      expect(tables.n).toBeGreaterThan(1);
+    } finally {
+      sqlite.close();
+    }
   });
 });
 
