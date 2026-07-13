@@ -6,7 +6,8 @@
  *
  *   anton setup    prereq checks → drizzle migrate (creates/updates anton.db) → node-pty rebuild →
  *                  install required skills + selected agents into global ~/.claude (interactive;
- *                  `--agents <a,b,c>` / `--agents all` / `--no-agents` for non-interactive/CI)
+ *                  `--agents <a,b,c>` / `--agents all` / `--no-agents` for non-interactive/CI) →
+ *                  wire beads Dolt sync (git origin as Dolt remote + initial refs/dolt push)
  *   anton doctor   prereq checks only (non-destructive)
  *   anton dev      next dev  (runner + scheduler auto-start via src/instrumentation.ts)
  *   anton start    next build (if stale) → next start
@@ -360,6 +361,65 @@ async function provisionAgentsSkills(args, opts = {}) {
   return { installed, skipped, agents: selected };
 }
 
+// ── Beads Dolt sync provisioning (anton-pns) ─────────────────────────────────────────────────
+
+/**
+ * Normalize a git remote URL for equality checks against what `bd dolt remote list` reports.
+ * bd rewrites URLs when storing them — `git+` scheme prefix, scp form (`git@host:org/repo`)
+ * becomes `git+ssh://git@host/./org/repo.git` — so a byte compare would re-add on every setup.
+ */
+function normalizeGitUrl(url) {
+  let s = url.trim().replace(/^git\+/, "").replace(/^file:\/\//, "");
+  const scp = s.match(/^([^@/]+@[^:/]+):(.+)$/);
+  if (scp) s = `ssh://${scp[1]}/${scp[2]}`;
+  return s.replace(/\/\.\//g, "/").replace(/\.git$/, "").replace(/\/+$/, "");
+}
+
+/**
+ * Point beads' Dolt sync at the repo's git `origin` remote (anton-pns). The Dolt-level remote
+ * lives in per-machine, gitignored state (.beads/embeddeddolt), so a clone can't carry it —
+ * setup must (re)apply it on every machine. Team defaults (dolt.auto-commit, export.git-add)
+ * are committed in .beads/config.yaml, not set here. After configuring, pushes once so
+ * refs/dolt/data exists on the git remote. Returns a status object the caller renders:
+ *   { status: "no-workspace" }                — no .beads/ at the root (installed bundle): skip
+ *   { status: "no-remote" }                   — .beads/ exists but git has no origin: fail loud
+ *   { status: "already", url }                — Dolt remote already matches origin: no-op
+ *   { status: "configured", url, pushed, pushOutput } — remote added/re-pointed, push attempted
+ *   { status: "error", detail }               — `bd dolt remote add` itself failed
+ */
+function configureBeadsDoltSync(opts = {}) {
+  const repoDir = opts.repoDir ?? APP_ROOT;
+  const exec =
+    opts.exec ?? ((cmd, args) => spawnSync(cmd, args, { cwd: repoDir, encoding: "utf8" }));
+
+  if (!existsSync(join(repoDir, ".beads"))) return { status: "no-workspace" };
+
+  const origin = exec("git", ["remote", "get-url", "origin"]);
+  const url = (origin.stdout ?? "").trim();
+  if ((origin.status ?? 1) !== 0 || !url) return { status: "no-remote" };
+
+  // `bd dolt remote list` prints `<name>  <url>` lines ("No remotes configured." when empty).
+  const list = exec("bd", ["dolt", "remote", "list"]);
+  const existing = ((list.stdout ?? "").match(/^origin\s+(\S+)$/m) ?? [])[1];
+  if (existing && normalizeGitUrl(existing) === normalizeGitUrl(url)) {
+    return { status: "already", url };
+  }
+
+  // Add-or-update: `bd dolt remote add` upserts, so a stale URL is simply re-pointed at origin.
+  const add = exec("bd", ["dolt", "remote", "add", "origin", url]);
+  if ((add.status ?? 1) !== 0) {
+    return { status: "error", detail: `${add.stdout ?? ""}${add.stderr ?? ""}`.trim() };
+  }
+
+  const push = exec("bd", ["dolt", "push"]);
+  return {
+    status: "configured",
+    url,
+    pushed: (push.status ?? 1) === 0,
+    pushOutput: `${push.stdout ?? ""}${push.stderr ?? ""}`.trim(),
+  };
+}
+
 // ── Bundle-mode migrations + daemon lifecycle (anton-1xp) ───────────────────────────────────
 
 /**
@@ -695,6 +755,37 @@ async function cmdSetup(args = []) {
 
   await provisionAgentsSkills(args);
 
+  // Beads Dolt sync (anton-pns): the Dolt remote is per-machine (gitignored) state, so every
+  // machine re-applies it here; the first push publishes refs/dolt/data to the git remote.
+  console.log(c.bold("\nConfiguring beads Dolt sync (git origin ↔ refs/dolt):"));
+  const dolt = configureBeadsDoltSync();
+  switch (dolt.status) {
+    case "no-workspace":
+      console.log(c.dim("  no .beads workspace at the package root — skipping."));
+      break;
+    case "no-remote":
+      console.log(c.red("  ✗ .beads exists but git has no `origin` remote — Dolt sync has nowhere to push."));
+      console.log(c.dim("    Add one (git remote add origin <url>), then re-run `anton setup`."));
+      return 1;
+    case "error":
+      console.log(c.red(`  ✗ bd dolt remote add failed: ${dolt.detail}`));
+      return 1;
+    case "already":
+      console.log(`  · Dolt remote ${c.bold("origin")} already → ${dolt.url} ${c.dim("(unchanged)")}`);
+      break;
+    case "configured":
+      console.log(`  ${c.green("✓")} Dolt remote ${c.bold("origin")} → ${dolt.url}`);
+      if (dolt.pushed) {
+        console.log(`  ${c.green("✓")} bd dolt push — refs/dolt/data is on origin`);
+      } else {
+        console.log(c.yellow("  ! bd dolt push failed — once auth/network is available, run:"));
+        console.log(c.dim("      bd dolt pull && bd dolt push"));
+        const lastLine = dolt.pushOutput.split("\n").filter(Boolean).at(-1);
+        if (lastLine) console.log(c.dim(`    (${lastLine})`));
+      }
+      break;
+  }
+
   console.log(c.green("\n✓ Setup complete.") + " Next: " + c.bold("anton start") + c.dim(" (or `anton dev`)\n"));
   return 0;
 }
@@ -723,7 +814,7 @@ const USAGE = `${c.bold("anton")} — local autonomous-coding orchestrator
 
 ${c.bold("Usage:")} anton <command>
 
-  ${c.bold("setup")}    check prereqs, migrate DB, rebuild node-pty, install agents & skills  ${c.dim("[--agents <a,b,c>|all]")}
+  ${c.bold("setup")}    check prereqs, migrate DB, rebuild node-pty, install agents & skills, wire beads Dolt sync  ${c.dim("[--agents <a,b,c>|all]")}
   ${c.bold("doctor")}   check prereqs + anton.db (non-destructive)
   ${c.bold("dev")}      run the dev server (next dev)          ${c.dim("[--port <n>]")}
   ${c.bold("start")}    run the server ${c.dim("(installed: background; source: foreground)")}  ${c.dim("[--port <n>] [--foreground]")}
@@ -788,4 +879,6 @@ export {
   platformLabel,
   applyMigrations,
   ensureBetterSqlite3,
+  configureBeadsDoltSync,
+  normalizeGitUrl,
 };

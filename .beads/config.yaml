@@ -3,6 +3,13 @@
 # All settings can also be set via environment variables (BD_* prefix)
 # or overridden with command-line flags
 
+# Dolt sync team defaults (anton-pns): every bd write commits to Dolt history so
+# `bd dolt push` always has data to carry over refs/dolt/*, and the passive JSONL
+# export is never auto-staged into git commits (refs/dolt/data is the sync channel,
+# not the JSONL). The Dolt remote itself is per-machine state applied by `anton setup`.
+dolt.auto-commit: "on"
+export.git-add: false
+
 # Issue prefix for this repository (used by bd init)
 # If not set, bd init will auto-detect from directory name
 # Example: issue-prefix: "myproject" creates issues like "myproject-1", "myproject-2", etc.
