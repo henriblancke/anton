@@ -416,14 +416,28 @@ async function startDaemon(args) {
   }
 
   mkdirSync(LOG_DIR, { recursive: true });
-  const nextBin = join(APP_ROOT, "node_modules", "next", "dist", "bin", "next");
   const out = openSync(join(LOG_DIR, "stdout.log"), "a");
   const err = openSync(join(LOG_DIR, "stderr.log"), "a");
-  const child = spawn("node", [nextBin, "start", "-p", String(port)], {
+
+  // A standalone bundle runs its traced `server.js` (reads PORT/HOSTNAME from the env); a source
+  // checkout falls back to the `next start` binary (-p flag). HOSTNAME is pinned explicitly so we
+  // never inherit the shell's ambient $HOSTNAME (often the machine name) as a bind address.
+  const standaloneServer = join(APP_ROOT, "server.js");
+  const useStandalone = existsSync(standaloneServer);
+  const spawnArgs = useStandalone
+    ? [standaloneServer]
+    : [join(APP_ROOT, "node_modules", "next", "dist", "bin", "next"), "start", "-p", String(port)];
+  const child = spawn("node", spawnArgs, {
     cwd: APP_ROOT,
     detached: true,
     stdio: ["ignore", out, err],
-    env: { ...process.env, NODE_ENV: "production", ...stateEnv },
+    env: {
+      ...process.env,
+      NODE_ENV: "production",
+      PORT: String(port),
+      HOSTNAME: process.env.ANTON_HOST ?? "127.0.0.1",
+      ...stateEnv,
+    },
   });
   child.unref();
   mkdirSync(STATE_DIR, { recursive: true });

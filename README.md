@@ -87,7 +87,7 @@ Run `anton doctor` at any time to check what's present.
 
 ## Install
 
-The quickest path is the **one-line installer**. It downloads a prebuilt, per-platform bundle — the built app plus its native modules — and drops the `anton` launcher on your `PATH`. No toolchain, no build step:
+The quickest path is the **one-line installer**. It downloads a small (~15 MB) prebuilt, per-platform bundle — the built app plus its native modules — and drops the `anton` launcher on your `PATH`. No toolchain, no build step:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/henriblancke/anton/main/scripts/install.sh | bash

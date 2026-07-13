@@ -6,20 +6,23 @@
  *
  * What it produces (under <out>/):
  *   anton-<os>-<arch>/            the runnable runtime dir (this is what install.sh extracts)
- *     .next/                      prebuilt Next.js production output (copied from a repo build)
- *     node_modules/               PRODUCTION deps only, native modules built for THIS platform
+ *     server.js                   Next.js STANDALONE server (run with `node server.js`, PORT env)
+ *     node_modules/               MINIMAL, dependency-traced deps (+ vendored node-pty)
+ *     .next/                      compiled server output + static/ (copied in — standalone omits it)
  *     bin/anton.mjs               the launcher (detects RELEASE_VERSION → bundle/daemon mode)
  *     src/prompts/                system-base.md + agents/ (read at runtime, cwd-rooted)
  *     skills/                     vendored SKILL.md assets (read at runtime, cwd-rooted)
  *     drizzle/                    migration SQL (applied in-process at setup — no drizzle-kit)
- *     public/ package.json next.config.ts drizzle.config.ts bun.lock
+ *     public/ package.json
  *     RELEASE_VERSION             marker the launcher keys bundle mode off of
- *   anton-<os>-<arch>.tar.gz      the release asset
+ *   anton-<os>-<arch>.tar.gz      the release asset (~14MB — Next standalone tracing, not a prod install)
  *
- * Why prod deps + an in-process migration applier: `next start` needs the production dep tree with
- * native addons (better-sqlite3, node-pty, sharp) built for the runner's os/arch — which is exactly
- * why the asset is per-platform. drizzle-kit is a devDep we deliberately do NOT ship; bundle-mode
- * `anton setup` applies the drizzle SQL directly via better-sqlite3 (see bin/anton.mjs).
+ * Why standalone: `output:'standalone'` (next.config.ts) traces only the files the server actually
+ * imports, so the bundle ships megabytes, not the whole prod dep tree. The tracer can't follow two
+ * things, which this script adds by hand: `.next/static` (standalone excludes it) and node-pty (lazy
+ * import for /shape). Native addons (better-sqlite3, node-pty) are per-os/arch, so the asset is too.
+ * drizzle-kit is a devDep we don't ship; bundle-mode `anton setup` applies the drizzle SQL directly
+ * via better-sqlite3 (see bin/anton.mjs).
  *
  * Usage:
  *   node scripts/build-bundle.mjs [--out dist] [--tag v0.1.0] [--platform darwin-arm64] [--skip-build]
@@ -81,56 +84,49 @@ function main(argv) {
     throw new Error("--skip-build set but repo has no .next/BUILD_ID — build first.");
   }
 
-  // 2) Stage the runtime tree (everything the server + launcher read at run time).
-  console.log(`[2/5] stage runtime → ${stage}`);
+  // 2) Assemble the stage from Next's STANDALONE output — a minimal, dependency-traced server whose
+  //    node_modules holds only what the app actually imports (the big size win vs. a prod install).
+  const standalone = join(REPO_ROOT, ".next", "standalone");
+  if (!existsSync(join(standalone, "server.js"))) {
+    throw new Error("no .next/standalone/server.js — is output:'standalone' set in next.config.ts?");
+  }
+  console.log(`[2/6] stage from standalone → ${stage}`);
   rmSync(stage, { recursive: true, force: true });
   mkdirSync(stage, { recursive: true });
-  const COPY = [
-    ".next",
-    "public",
-    "bin",
-    "skills",
-    "drizzle",
-    join("src", "prompts"), // system-base.md + agents/*.md, read cwd-rooted at runtime
-    "package.json",
-    "bun.lock",
-    "next.config.ts",
-    "drizzle.config.ts",
-  ];
-  // `next start` only needs the compiled output — NOT the dev-server / build caches, which can be
-  // hundreds of MB of Turbopack/webpack artifacts. Drop them so the asset stays lean.
-  const NEXT_DROP = new Set(["dev", "cache", "trace"].map((d) => join(REPO_ROOT, ".next", d)));
-  for (const rel of COPY) {
-    const from = join(REPO_ROOT, rel);
-    if (!existsSync(from)) {
-      if (rel === "bun.lock") continue; // optional; prod install falls back to package.json
-      throw new Error(`bundle source missing: ${rel}`);
-    }
-    cpSync(from, join(stage, rel), {
-      recursive: true,
-      filter: (src) => !NEXT_DROP.has(src),
-    });
+  // The traced server, its minimal deps, the compiled output, and the package manifest.
+  for (const rel of ["server.js", "node_modules", ".next", "package.json"]) {
+    cpSync(join(standalone, rel), join(stage, rel), { recursive: true });
   }
 
-  // 3) Install PRODUCTION deps into the stage — this builds native addons for THIS platform.
-  console.log("[3/5] bun install --production (native build for this platform)");
-  run("bun", ["install", "--production"], { cwd: stage });
+  // 3) Add what standalone omits or its tracer can't see: client assets (standalone excludes
+  //    .next/static), public/, and the files anton reads via process.cwd() at run time
+  //    (skills/, drizzle/ migrations, src/prompts + the base/agent prompts) plus the launcher.
+  console.log("[3/6] add static assets, public, and cwd-rooted runtime reads");
+  cpSync(join(REPO_ROOT, ".next", "static"), join(stage, ".next", "static"), { recursive: true });
+  for (const rel of ["public", "skills", "drizzle", join("src", "prompts"), "bin"]) {
+    cpSync(join(REPO_ROOT, rel), join(stage, rel), { recursive: true });
+  }
 
-  // 3b) node-pty vendors prebuilt binaries for EVERY platform (~60MB). Keep only this one.
-  const ptyPrebuilds = join(stage, "node_modules", "node-pty", "prebuilds");
+  // 4) Vendor node-pty (powers the interactive /shape terminal). It's imported lazily, so Next's
+  //    tracer skips it — copy the real package, then keep only this platform's prebuilt binary.
+  console.log("[4/6] vendor node-pty (+ prune foreign prebuilds)");
+  const ptyDst = join(stage, "node_modules", "node-pty");
+  if (!existsSync(ptyDst)) {
+    cpSync(join(REPO_ROOT, "node_modules", "node-pty"), ptyDst, { recursive: true });
+  }
+  const ptyPrebuilds = join(ptyDst, "prebuilds");
   if (existsSync(ptyPrebuilds)) {
-    const keep = platform; // e.g. darwin-arm64
     for (const entry of readdirSync(ptyPrebuilds)) {
-      if (entry !== keep) rmSync(join(ptyPrebuilds, entry), { recursive: true, force: true });
+      if (entry !== platform) rmSync(join(ptyPrebuilds, entry), { recursive: true, force: true });
     }
   }
 
-  // 4) Drop the marker the launcher keys bundle mode off of.
-  console.log("[4/5] write RELEASE_VERSION");
+  // 5) Drop the marker the launcher keys bundle mode off of.
+  console.log("[5/6] write RELEASE_VERSION");
   writeFileSync(join(stage, "RELEASE_VERSION"), `${version}\n`);
 
-  // 5) Tarball the stage dir (the stage dir name is the top-level entry, so it extracts cleanly).
-  console.log("[5/5] tar");
+  // 6) Tarball the stage dir (the stage dir name is the top-level entry, so it extracts cleanly).
+  console.log("[6/6] tar");
   const tarball = join(outRoot, `${stageName}.tar.gz`);
   run("tar", ["-czf", tarball, "-C", outRoot, stageName]);
 
