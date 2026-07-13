@@ -31,12 +31,29 @@ export function prNumberFromRef(ref: string | undefined): number | undefined {
   return m ? Number(m[1]) : undefined;
 }
 
+/** Prefix on every comment anton posts — the gate that keeps a replied-to thread quiet. */
+export const ANTON_MARK = "🤖";
+
+/** One inline review thread (GraphQL), with the REST ids needed to reply. */
+export interface ReviewThread {
+  /** GraphQL node id — used to resolve the thread. */
+  id: string;
+  isResolved: boolean;
+  isOutdated: boolean;
+  path?: string;
+  line?: number;
+  /** Comment chain, oldest first. `id` is the REST databaseId (for the replies endpoint). */
+  comments: Array<{ id: number; author: string; body: string }>;
+}
+
 export interface PrReview {
   number: number;
   /** OPEN | MERGED | CLOSED */
   state: string;
   /** APPROVED | CHANGES_REQUESTED | REVIEW_REQUIRED | null */
   reviewDecision: string | null;
+  /** MERGEABLE | CONFLICTING | UNKNOWN | null */
+  mergeable: string | null;
   /** The PR's head branch — the branch anton pushes fixes to. */
   headRefName: string;
   url: string;
@@ -45,14 +62,15 @@ export interface PrReview {
   /** Failing checks, by name. */
   failingChecks: string[];
   pendingChecks: number;
-  /** Inline review (line) comments. */
-  comments: Array<{ author: string; path?: string; line?: number; body: string }>;
+  /** Inline review threads (resolved ones included; filter with threadsNeedingAttention). */
+  threads: ReviewThread[];
 }
 
 interface GhPrView {
   number: number;
   state: string;
   reviewDecision: string | null;
+  mergeable?: string | null;
   headRefName: string;
   url: string;
   reviews?: Array<{ author?: { login?: string }; state?: string; body?: string }>;
@@ -97,7 +115,7 @@ export async function getPrReview(
       "view",
       String(number),
       "--json",
-      "number,state,reviewDecision,headRefName,url,reviews,statusCheckRollup",
+      "number,state,reviewDecision,mergeable,headRefName,url,reviews,statusCheckRollup",
     ],
     signal,
   );
@@ -120,43 +138,108 @@ export async function getPrReview(
     number: view.number,
     state: view.state,
     reviewDecision: view.reviewDecision ?? null,
+    mergeable: view.mergeable ?? null,
     headRefName: view.headRefName,
     url: view.url,
     reviews,
     failingChecks,
     pendingChecks,
-    comments: await getReviewComments(repoPath, number, signal),
+    threads: await getReviewThreads(repoPath, number, signal),
   };
 }
 
-/** Inline review (line) comments via the REST API. Best-effort — returns [] on any failure. */
-async function getReviewComments(
+/** `owner/repo` of the repo's default remote, or undefined when gh can't resolve it. */
+async function nameWithOwner(repoPath: string, signal?: AbortSignal): Promise<string | undefined> {
+  const nwo = (
+    await gh(repoPath, ["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"], signal)
+  ).trim();
+  return nwo || undefined;
+}
+
+/**
+ * Inline review threads via GraphQL — the only API that exposes thread resolution state and the
+ * node ids `resolveReviewThread` needs. Best-effort — returns [] on any failure (same contract as
+ * the old REST comment fetch), so a missing token degrades to "no inline feedback", not a crash.
+ */
+async function getReviewThreads(
   repoPath: string,
   number: number,
   signal?: AbortSignal,
-): Promise<PrReview["comments"]> {
+): Promise<ReviewThread[]> {
   try {
-    const nwo = (
-      await gh(repoPath, ["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"], signal)
-    ).trim();
+    const nwo = await nameWithOwner(repoPath, signal);
     if (!nwo) return [];
-    const raw = await gh(repoPath, ["api", `repos/${nwo}/pulls/${number}/comments`, "--paginate"], signal);
-    const arr = JSON.parse(raw || "[]") as Array<{
-      user?: { login?: string };
-      path?: string;
-      line?: number | null;
-      original_line?: number | null;
-      body?: string;
-    }>;
-    return arr.map((c) => ({
-      author: c.user?.login ?? "unknown",
-      path: c.path,
-      line: c.line ?? c.original_line ?? undefined,
-      body: c.body ?? "",
-    }));
+    const [owner, repo] = nwo.split("/");
+    const query = `query($owner:String!,$repo:String!,$number:Int!){
+      repository(owner:$owner,name:$repo){pullRequest(number:$number){
+        reviewThreads(first:100){nodes{
+          id isResolved isOutdated path line
+          comments(first:50){nodes{databaseId author{login} body}}
+        }}
+      }}
+    }`;
+    const raw = await gh(
+      repoPath,
+      [
+        "api", "graphql",
+        "-f", `query=${query}`,
+        "-f", `owner=${owner}`,
+        "-f", `repo=${repo}`,
+        "-F", `number=${number}`,
+      ],
+      signal,
+    );
+    const parsed = JSON.parse(raw) as {
+      data?: {
+        repository?: {
+          pullRequest?: {
+            reviewThreads?: {
+              nodes?: Array<{
+                id?: string;
+                isResolved?: boolean;
+                isOutdated?: boolean;
+                path?: string | null;
+                line?: number | null;
+                comments?: { nodes?: Array<{ databaseId?: number; author?: { login?: string } | null; body?: string }> };
+              }>;
+            };
+          };
+        };
+      };
+    };
+    const nodes = parsed.data?.repository?.pullRequest?.reviewThreads?.nodes ?? [];
+    return nodes
+      .filter((n) => typeof n?.id === "string")
+      .map((n) => ({
+        id: n.id!,
+        isResolved: n.isResolved ?? false,
+        isOutdated: n.isOutdated ?? false,
+        path: n.path ?? undefined,
+        line: n.line ?? undefined,
+        comments: (n.comments?.nodes ?? [])
+          .filter((c) => typeof c?.databaseId === "number")
+          .map((c) => ({
+            id: c.databaseId!,
+            author: c.author?.login ?? "unknown",
+            body: c.body ?? "",
+          })),
+      }));
   } catch {
     return [];
   }
+}
+
+/**
+ * Unresolved threads still waiting on anton: the last comment is not anton's. Once anton replies
+ * (every anton comment starts with ANTON_MARK) the thread stops being actionable until a human
+ * responds or resolves it — that's what prevents a reply loop across sweeps.
+ */
+export function threadsNeedingAttention(pr: PrReview): ReviewThread[] {
+  return pr.threads.filter((t) => {
+    if (t.isResolved) return false;
+    const last = t.comments[t.comments.length - 1];
+    return !last || !last.body.startsWith(ANTON_MARK);
+  });
 }
 
 export interface Actionable {
@@ -165,9 +248,11 @@ export interface Actionable {
 }
 
 /**
- * Pure classifier: does this PR need anton to act? Actionable when the PR is OPEN and either a
- * reviewer requested changes or a CI check is failing. Pending checks / approvals / a clean PR are
- * NOT actionable (nothing to fix yet). Kept pure so it's unit-testable without `gh`.
+ * Pure classifier: does this PR need anton to act? Actionable when the PR is OPEN and a reviewer
+ * requested changes, a CI check is failing, the branch conflicts with its base, or an unresolved
+ * review thread is still waiting on anton (see threadsNeedingAttention). Pending checks /
+ * approvals / a clean PR are NOT actionable (nothing to fix yet). Kept pure so it's unit-testable
+ * without `gh`.
  */
 export function classifyReview(pr: PrReview): Actionable {
   const reasons: string[] = [];
@@ -178,6 +263,13 @@ export function classifyReview(pr: PrReview): Actionable {
   }
   if (pr.failingChecks.length > 0) {
     reasons.push(`failing checks: ${pr.failingChecks.join(", ")}`);
+  }
+  if (pr.mergeable === "CONFLICTING") {
+    reasons.push("merge conflicts with the base branch");
+  }
+  const waiting = threadsNeedingAttention(pr);
+  if (waiting.length > 0) {
+    reasons.push(`${waiting.length} unresolved review thread(s)`);
   }
   return { actionable: reasons.length > 0, reasons };
 }
@@ -190,6 +282,33 @@ export async function commentOnPr(
   signal?: AbortSignal,
 ): Promise<void> {
   await gh(repoPath, ["pr", "comment", String(number), "--body", body], signal);
+}
+
+/** Reply within an inline review thread (REST replies endpoint, keyed by a comment databaseId). */
+export async function replyToReviewComment(
+  repoPath: string,
+  number: number,
+  commentId: number,
+  body: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const nwo = await nameWithOwner(repoPath, signal);
+  if (!nwo) return;
+  await gh(
+    repoPath,
+    ["api", "--method", "POST", `repos/${nwo}/pulls/${number}/comments/${commentId}/replies`, "-f", `body=${body}`],
+    signal,
+  );
+}
+
+/** Mark a review thread resolved (GraphQL — thread ids come from getReviewThreads). */
+export async function resolveReviewThread(
+  repoPath: string,
+  threadId: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const mutation = `mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{id}}}`;
+  await gh(repoPath, ["api", "graphql", "-f", `query=${mutation}`, "-f", `id=${threadId}`], signal);
 }
 
 /**

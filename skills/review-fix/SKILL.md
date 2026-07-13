@@ -18,10 +18,10 @@ PR. Follow the operating contract in your system prompt.
 
 ## 1. Triage every finding
 
-For each requested change / inline comment / failing check, decide:
+For each requested change / inline comment / failing check / merge conflict, decide:
 
-- **Valid** — it clearly improves correctness, security, or readability, or it's a real CI failure.
-  Fix it.
+- **Valid** — it clearly improves correctness, security, or readability, or it's a real CI failure
+  or merge conflict. Fix it.
 - **Invalid / low-value** — a style nit, a matter of taste, or a suggestion that doesn't clearly
   make the code better. The burden of proof is on the suggestion; resist churn. Leave it, and (if
   it matters) make the code self-explanatory so the concern doesn't recur.
@@ -43,12 +43,19 @@ running the project's tests/build first.
   no scope creep.
 - For a failing CI check, fix the underlying cause, not the symptom. Don't disable tests, loosen
   types, or delete assertions to make it pass.
+- If the context lists files with merge conflicts, anton already merged the base branch into the
+  worktree — resolve the `<<<<<<<`/`>>>>>>>` markers by picking the semantically correct result
+  (usually integrating both sides), never blindly one side. Don't run git; anton concludes the
+  merge when it commits.
 - Keep the change consistent with the surrounding code's conventions.
 
-## 4. Stop
+## 4. Stop and report
 
 When the valid findings are addressed, stop. anton runs the project's tests (if configured),
-commits, pushes, comments on each thread, and re-requests review. Report a short summary of what
-you changed and what you deliberately left (with the one-line reason), so anton's reply is accurate.
+commits, pushes, replies on each thread, resolves the fixed ones, and re-requests review. Report a
+short summary of what you changed and what you deliberately left (with the one-line reason), and —
+when the context lists review threads — end with the per-thread json report in the exact format the
+context specifies (`fixed` / `left` / `needs-human` + a one-line reply). anton posts each reply on
+its thread verbatim and resolves the `fixed` ones, so your report must be accurate.
 
 Never fabricate a fix you didn't make, and never claim a finding is resolved when it isn't.
