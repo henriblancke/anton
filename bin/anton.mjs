@@ -441,8 +441,11 @@ function configureBeadsDoltSync(opts = {}) {
  */
 function ensureBetterSqlite3(appRoot = APP_ROOT) {
   const require = createRequire(join(appRoot, "package.json"));
+  // better-sqlite3 loads its native addon LAZILY — on first `new Database()`, not at require() —
+  // so we must actually open a DB to surface an ABI mismatch (a bare require would falsely pass).
+  const probe = () => new (require("better-sqlite3"))(":memory:").close();
   try {
-    require("better-sqlite3");
+    probe();
     return "ok";
   } catch (e) {
     const msg = String((e && e.message) || e);
@@ -458,7 +461,7 @@ function ensureBetterSqlite3(appRoot = APP_ROOT) {
     if ((r.status ?? 1) !== 0) {
       throw new Error(`no prebuilt better-sqlite3 for Node ${process.version} on this platform — ${manualFix}`);
     }
-    require("better-sqlite3"); // re-verify the freshly downloaded binary loads (throwing require isn't cached)
+    probe(); // re-verify the freshly downloaded binary actually opens (a failed addon load isn't cached)
     console.log(c.green("  ✓ better-sqlite3 binary now matches Node ") + process.version);
     return "rebuilt";
   }
@@ -715,9 +718,25 @@ function checkPrereqs() {
   return ok && nodeOk;
 }
 
+/** Print anton's version — the bundle's RELEASE_VERSION when installed, else package.json. */
+function cmdVersion() {
+  let v = bundleVersion();
+  if (!v) {
+    try {
+      v = JSON.parse(readFileSync(join(APP_ROOT, "package.json"), "utf8")).version;
+    } catch {
+      v = "unknown";
+    }
+  }
+  console.log(v);
+  return 0;
+}
+
 function cmdDoctor() {
   const ok = checkPrereqs();
-  const dbPath = process.env.ANTON_DB ?? join(APP_ROOT, "anton.db");
+  // Resolve the DB the same way the server does: in a bundle it lives in the persistent state dir
+  // (where `anton setup` creates it), NOT under the runtime dir — so doctor must check there too.
+  const dbPath = IS_BUNDLE ? bundleStateEnv().ANTON_DB : (process.env.ANTON_DB ?? join(APP_ROOT, "anton.db"));
   console.log(
     `  ${existsSync(dbPath) ? "✓" : c.yellow("·")} ${"anton.db".padEnd(9)} ${existsSync(dbPath) ? c.green(dbPath) : c.yellow("not created — run `anton setup`")}`,
   );
@@ -837,6 +856,7 @@ ${c.bold("Usage:")} anton <command>
   ${c.bold("status")}   show version, paths, and whether the server is running
   ${c.bold("update")}   download & install the latest release  ${c.dim("(installed bundle)")}
   ${c.bold("uninstall")} remove the installed runtime + launcher ${c.dim("[--purge] (keeps data by default)")}
+  ${c.bold("version")}  print the anton version ${c.dim("(alias --version, -v)")}
   ${c.bold("--help")}   show this help
 
 ${c.dim("Port: dev/start default to 3000; override with --port <n> (alias -p) or PORT=<n>.")}
@@ -864,6 +884,10 @@ function main(argv) {
       return cmdUpdate();
     case "uninstall":
       return cmdUninstall(rest);
+    case "version":
+    case "--version":
+    case "-v":
+      return cmdVersion();
     case "-h":
     case "--help":
     case "help":
