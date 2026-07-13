@@ -4,17 +4,25 @@
  * anton is a local Next.js server; this launcher bootstraps and runs it from the installed package
  * dir (NOT the user's cwd), so `anton` works from anywhere once installed (`npm i -g` / `bunx`).
  *
- *   anton setup    prereq checks → drizzle migrate (creates/updates anton.db) → node-pty rebuild
+ *   anton setup    prereq checks → drizzle migrate (creates/updates anton.db) → node-pty rebuild →
+ *                  install required skills + selected agents into global ~/.claude (interactive;
+ *                  `--agents <a,b,c>` / `--agents all` / `--no-agents` for non-interactive/CI)
  *   anton doctor   prereq checks only (non-destructive)
  *   anton dev      next dev  (runner + scheduler auto-start via src/instrumentation.ts)
  *   anton start    next build (if stale) → next start
  *   anton --help   usage
  *
+ * `dev`/`start` accept `--port <n>` (alias `-p`, or `PORT=<n>` in the env) to run on a
+ * non-default port; without it the server listens on 3000.
+ *
  * Pure Node, zero deps. Native ESM.
  */
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { createInterface } from "node:readline/promises";
+import { stdin, stdout } from "node:process";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -50,6 +58,27 @@ function onPath(cmd) {
   return r.status === 0;
 }
 
+/**
+ * Resolve the port for `dev`/`start` from CLI args, falling back to `PORT`, then Next's own default
+ * (3000, applied by next when we pass nothing). Accepts `--port 4000`, `--port=4000`, or `-p 4000`.
+ * An explicit flag wins over `PORT`. Returns undefined when neither is set (let next default it).
+ */
+function resolvePort(args) {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--port" || a === "-p") return args[i + 1];
+    const m = a.match(/^(?:--port|-p)=(.+)$/);
+    if (m) return m[1];
+  }
+  return process.env.PORT || undefined;
+}
+
+/** Build the `next` arg list for `dev`/`start`, appending `-p <port>` when a port is resolved. */
+function nextArgs(sub, args) {
+  const port = resolvePort(args);
+  return port ? [sub, "-p", String(port)] : [sub];
+}
+
 /** Run a local package bin (next / drizzle-kit) from APP_ROOT, inheriting stdio. Returns exit code. */
 function runLocal(bin, args, env = {}) {
   const exe = join(BIN, bin);
@@ -60,6 +89,178 @@ function runLocal(bin, args, env = {}) {
     env: { ...process.env, ...env },
   });
   return r.status ?? 1;
+}
+
+// ── Agents & skills provisioning (anton setup) ──────────────────────────────────────────────
+// Mirrors src/lib/setup/installer.ts (which the in-app UI uses), reimplemented dependency-free so
+// the launcher stays pure Node and runs before any build. Install target is the user's GLOBAL
+// ~/.claude, so anton's agents/skills are discoverable from every repo `claude` runs in. No-clobber
+// is the invariant: an existing destination (a prior install OR the user's own file) is never
+// overwritten. Keep REQUIRED_SKILLS in sync with REQUIRED_SKILLS in src/lib/claude/prompt.ts.
+const AGENTS_SRC = join(APP_ROOT, "src", "prompts", "agents");
+const SKILLS_SRC = join(APP_ROOT, "skills");
+const REQUIRED_SKILLS = ["shape", "bd", "scan-triage", "review-fix"];
+const CLAUDE_ROOT = join(homedir(), ".claude");
+
+/** Bundled specialist agent tags (basenames of src/prompts/agents/*.md), sorted. */
+function listBundledAgents(agentsSrc = AGENTS_SRC) {
+  try {
+    return readdirSync(agentsSrc)
+      .filter((f) => f.endsWith(".md"))
+      .map((f) => f.slice(0, -".md".length))
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+/** Best-effort one-line description: frontmatter `description:`, else first non-empty body line. */
+function shortDescription(path) {
+  let md;
+  try {
+    md = readFileSync(path, "utf8");
+  } catch {
+    return "";
+  }
+  if (md.startsWith("---\n")) {
+    const end = md.indexOf("\n---", 4);
+    if (end !== -1) {
+      for (const line of md.slice(4, end).split("\n")) {
+        const m = line.match(/^description:\s*(.+)$/);
+        if (m) return m[1].replace(/^["']|["']$/g, "").trim();
+      }
+    }
+  }
+  const body = md.replace(/^---\n[\s\S]*?\n---\n?/, "");
+  for (const line of body.split("\n")) {
+    const t = line.replace(/^#+\s*/, "").trim();
+    if (t) return t;
+  }
+  return "";
+}
+
+/** Copy src→dest unless dest exists (no-clobber). Returns "installed" | "skipped". */
+function installFile(src, dest) {
+  if (existsSync(dest)) return "skipped";
+  mkdirSync(dirname(dest), { recursive: true });
+  copyFileSync(src, dest);
+  return "installed";
+}
+
+/** Parse `--agents <csv|all>` / `--no-agents` from the setup args, or null if unspecified. */
+function agentsFromArgs(args) {
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--no-agents") return [];
+    if (args[i] === "--agents") return args[i + 1];
+    const m = args[i].match(/^--agents=(.*)$/);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+/** Interactive single-shot agent picker over a plain TTY (no arrow-key deps). */
+async function pickAgents(agents, agentsSrc = AGENTS_SRC) {
+  console.log(c.bold("\nBundled specialist agents") + c.dim(" — pick the ones matching your stack:"));
+  agents.forEach((tag, i) => {
+    const desc = shortDescription(join(agentsSrc, `${tag}.md`));
+    const truncated = desc.length > 60 ? desc.slice(0, 57) + "…" : desc;
+    console.log(`  ${String(i + 1).padStart(2)}. ${c.bold(tag.padEnd(11))} ${c.dim(truncated)}`);
+  });
+  console.log(c.dim("  Enter numbers (e.g. 1 3 5), 'a' for all, or press Enter for none."));
+
+  const rl = createInterface({ input: stdin, output: stdout });
+  let answer;
+  try {
+    answer = (await rl.question(c.bold("agents> "))).trim();
+  } finally {
+    rl.close();
+  }
+
+  if (answer === "") return [];
+  if (/^a(ll)?$/i.test(answer)) return agents;
+  const picked = new Set();
+  for (const tok of answer.split(/[\s,]+/).filter(Boolean)) {
+    const n = Number(tok);
+    if (Number.isInteger(n) && n >= 1 && n <= agents.length) picked.add(agents[n - 1]);
+    else console.log(c.yellow(`  (ignoring "${tok}" — not a listed number)`));
+  }
+  return [...picked];
+}
+
+/** Resolve which agents to install: CLI flag > interactive TTY prompt > none (non-TTY). */
+async function resolveAgentSelection(args, agentsSrc = AGENTS_SRC) {
+  const bundled = listBundledAgents(agentsSrc);
+  if (bundled.length === 0) return [];
+
+  const flag = agentsFromArgs(args);
+  if (flag !== null) {
+    if (Array.isArray(flag)) return flag; // --no-agents
+    if (/^all$/i.test(flag)) return bundled;
+    const requested = flag.split(",").map((s) => s.trim()).filter(Boolean);
+    const known = requested.filter((t) => bundled.includes(t));
+    for (const t of requested.filter((t) => !bundled.includes(t))) {
+      console.log(c.yellow(`  (skipping unknown agent "${t}")`));
+    }
+    return known;
+  }
+
+  if (!stdin.isTTY) {
+    console.log(c.dim("\nNon-interactive (no TTY): installing required skills only; skipping agent picker."));
+    console.log(c.dim("  Pass --agents <a,b,c> or --agents all to select agents non-interactively."));
+    return [];
+  }
+  return pickAgents(bundled, agentsSrc);
+}
+
+/**
+ * Provision anton's required skills (always) + the selected specialist agents into the user's
+ * global ~/.claude, never overwriting existing files. Returns 0 (best-effort — a missing bundled
+ * asset warns but doesn't fail setup, since anton also loads its own skills from the package dir).
+ */
+async function provisionAgentsSkills(args, opts = {}) {
+  const claudeRoot = opts.claudeRoot ?? CLAUDE_ROOT;
+  const skillsSrc = opts.skillsSrc ?? (opts.appRoot ? join(opts.appRoot, "skills") : SKILLS_SRC);
+  const agentsSrc =
+    opts.agentsSrc ?? (opts.appRoot ? join(opts.appRoot, "src", "prompts", "agents") : AGENTS_SRC);
+
+  console.log(c.bold("\nInstalling agents & skills into ") + c.bold(claudeRoot) + c.dim(" (no-clobber):"));
+  const selected = await resolveAgentSelection(args, agentsSrc);
+
+  const jobs = [
+    ...REQUIRED_SKILLS.map((name) => ({
+      kind: "skill",
+      name,
+      required: true,
+      src: join(skillsSrc, name, "SKILL.md"),
+      dest: join(claudeRoot, "skills", name, "SKILL.md"),
+    })),
+    ...selected.map((tag) => ({
+      kind: "agent",
+      name: tag,
+      required: false,
+      src: join(agentsSrc, `${tag}.md`),
+      dest: join(claudeRoot, "agents", `${tag}.md`),
+    })),
+  ];
+
+  let installed = 0;
+  let skipped = 0;
+  for (const job of jobs) {
+    if (!existsSync(job.src)) {
+      console.log(`  ${c.yellow("!")} ${job.kind} ${c.bold(job.name)} ${c.yellow("missing from package")} ${c.dim(job.src)}`);
+      continue;
+    }
+    const outcome = installFile(job.src, job.dest);
+    if (outcome === "installed") installed++;
+    else skipped++;
+    const tag = outcome === "installed" ? c.green("installed") : c.dim("already present");
+    const req = job.required ? c.dim(" (required)") : "";
+    console.log(`  ${outcome === "installed" ? c.green("✓") : "·"} ${job.kind.padEnd(5)} ${c.bold(job.name.padEnd(12))} ${tag}${req}`);
+  }
+  console.log(
+    c.dim(`  → ${installed} installed, ${skipped} already present. Existing files are never overwritten.`),
+  );
+  return { installed, skipped, agents: selected };
 }
 
 /** Prereq check. Returns true when all *required* tools are present. */
@@ -94,7 +295,7 @@ function cmdDoctor() {
   return ok ? 0 : 1;
 }
 
-function cmdSetup() {
+async function cmdSetup(args = []) {
   console.log(c.bold("anton setup"));
   const ok = checkPrereqs();
   if (!ok) {
@@ -118,16 +319,18 @@ function cmdSetup() {
     console.log(c.dim("  cd node_modules/node-pty && npx node-gyp rebuild"));
   }
 
+  await provisionAgentsSkills(args);
+
   console.log(c.green("\n✓ Setup complete.") + " Next: " + c.bold("anton start") + c.dim(" (or `anton dev`)\n"));
   return 0;
 }
 
-function cmdDev() {
+function cmdDev(args) {
   console.log(c.dim("anton dev — starting Next.js dev server (runner + scheduler auto-start)…"));
-  return runLocal("next", ["dev"]);
+  return runLocal("next", nextArgs("dev", args));
 }
 
-function cmdStart() {
+function cmdStart(args) {
   const built = existsSync(join(APP_ROOT, ".next"));
   if (!built) {
     console.log(c.dim("no build found — running `next build` first…"));
@@ -135,33 +338,35 @@ function cmdStart() {
     if (b !== 0) return b;
   }
   console.log(c.dim("anton start — starting Next.js server (runner + scheduler auto-start)…"));
-  return runLocal("next", ["start"]);
+  return runLocal("next", nextArgs("start", args));
 }
 
 const USAGE = `${c.bold("anton")} — local autonomous-coding orchestrator
 
 ${c.bold("Usage:")} anton <command>
 
-  ${c.bold("setup")}    check prereqs, run DB migrations, rebuild node-pty
+  ${c.bold("setup")}    check prereqs, migrate DB, rebuild node-pty, install agents & skills  ${c.dim("[--agents <a,b,c>|all]")}
   ${c.bold("doctor")}   check prereqs + anton.db (non-destructive)
-  ${c.bold("dev")}      run the dev server (next dev)
-  ${c.bold("start")}    build if needed, then run the server (next start)
+  ${c.bold("dev")}      run the dev server (next dev)          ${c.dim("[--port <n>]")}
+  ${c.bold("start")}    build if needed, then run the server   ${c.dim("[--port <n>]")}
   ${c.bold("--help")}   show this help
 
+${c.dim("Port: dev/start default to 3000; override with --port <n> (alias -p) or PORT=<n>.")}
 The runner + scheduler start automatically with the server (set ANTON_RUNNER=off to disable).
 `;
 
 function main(argv) {
   const cmd = argv[2];
+  const rest = argv.slice(3);
   switch (cmd) {
     case "setup":
-      return cmdSetup();
+      return cmdSetup(rest);
     case "doctor":
       return cmdDoctor();
     case "dev":
-      return cmdDev();
+      return cmdDev(rest);
     case "start":
-      return cmdStart();
+      return cmdStart(rest);
     case "-h":
     case "--help":
     case "help":
@@ -175,4 +380,10 @@ function main(argv) {
   }
 }
 
-process.exit(main(process.argv));
+// Run only when invoked as a script (`anton …`), not when imported by tests. The bin is reached
+// through a symlink (node_modules/.bin or ~/.bun/bin), so compare realpaths.
+const invokedDirectly =
+  process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+if (invokedDirectly) Promise.resolve(main(process.argv)).then((code) => process.exit(code ?? 0));
+
+export { resolvePort, nextArgs, main, agentsFromArgs, provisionAgentsSkills, REQUIRED_SKILLS };

@@ -4,7 +4,7 @@
  *
  * Source layout (anton's own repo — the `bundledRoot`):
  *   - agents:  src/prompts/agents/<tag>.md   — Claude Code agent (flat file, name/description/model frontmatter)
- *   - skills:  src/prompts/<name>.md         — Claude Code skill (name/description frontmatter)
+ *   - skills:  skills/<name>/SKILL.md         — anton's vendored skill (name/description frontmatter)
  * Target layout (the project's `.claude/`, so `claude` resolves them):
  *   - agents:  <projectDir>/.claude/agents/<tag>.md
  *   - skills:  <projectDir>/.claude/skills/<name>/SKILL.md
@@ -20,11 +20,12 @@
  */
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { REQUIRED_SKILLS, SKILLS_DIR } from "../claude/prompt";
 
 /** Anton's bundled agent prompts, relative to the bundled root. */
 export const AGENTS_SRC_DIR = "src/prompts/agents";
-/** Anton's bundled skill prompts, relative to the bundled root. */
-export const SKILLS_SRC_DIR = "src/prompts";
+/** Anton's vendored skill assets, relative to the bundled root (each is `<name>/SKILL.md`). */
+export const SKILLS_SRC_DIR = SKILLS_DIR;
 /** Where agents land under a project (Claude Code reads flat `<tag>.md` files here). */
 export const CLAUDE_AGENTS_DIR = ".claude/agents";
 /** Where skills land under a project (Claude Code reads `<name>/SKILL.md` directories here). */
@@ -32,9 +33,10 @@ export const CLAUDE_SKILLS_DIR = ".claude/skills";
 
 /**
  * Skills anton always installs, regardless of selection — the machinery its own `claude` runs
- * depend on. Each name resolves to `src/prompts/<name>.md`, which carries skill frontmatter.
+ * depend on. Re-exported from the canonical list in `../claude/prompt`; each name resolves to
+ * `skills/<name>/SKILL.md`. Kept as a named re-export so `inventory.ts` and callers import it here.
  */
-export const REQUIRED_SKILLS = ["shape", "scan-triage", "review-fix"] as const;
+export { REQUIRED_SKILLS };
 
 /** What the caller (wizard/CLI) chose. Skills are additive over the always-required set. */
 export interface Selection {
@@ -111,7 +113,7 @@ export function planInstall(selection: Selection, options: InstallOptions): Plan
       kind: "skill",
       name,
       required: requiredSet.has(name),
-      source: join(root, SKILLS_SRC_DIR, `${name}.md`),
+      source: join(root, SKILLS_SRC_DIR, name, "SKILL.md"),
       target: join(projectDir, CLAUDE_SKILLS_DIR, name, "SKILL.md"),
     });
   }

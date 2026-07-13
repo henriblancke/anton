@@ -76,7 +76,7 @@ describe("installSelection", () => {
 
     for (const req of REQUIRED_SKILLS) {
       const body = await readFile(skillPath(projectDir, req), "utf8");
-      const src = await readFile(join(process.cwd(), `src/prompts/${req}.md`), "utf8");
+      const src = await readFile(join(process.cwd(), `skills/${req}/SKILL.md`), "utf8");
       expect(body).toBe(src);
     }
   });
@@ -119,11 +119,21 @@ describe("installSelection", () => {
   });
 
   it("installs optional extra skills from the selection", async () => {
-    const summary = await installSelection({ skills: ["system-base"] }, { projectDir });
-    const extra = summary.installed.find((e) => e.name === "system-base");
+    // Every vendored skill is required, so stand up a synthetic bundled root carrying the required
+    // skills plus one non-required "custom" skill to exercise the additive selection.skills path.
+    const bundledRoot = await mkdtemp(join(tmpdir(), "anton-bundled-"));
+    for (const name of [...REQUIRED_SKILLS, "custom"]) {
+      await mkdir(join(bundledRoot, "skills", name), { recursive: true });
+      await writeFile(join(bundledRoot, "skills", name, "SKILL.md"), `---\nname: ${name}\n---\n\nbody\n`);
+    }
+
+    const summary = await installSelection({ skills: ["custom"] }, { projectDir, bundledRoot });
+    const extra = summary.installed.find((e) => e.name === "custom");
     expect(extra).toBeDefined();
     expect(extra?.required).toBe(false);
-    expect(await exists(skillPath(projectDir, "system-base"))).toBe(true);
+    expect(await exists(skillPath(projectDir, "custom"))).toBe(true);
+
+    await rm(bundledRoot, { recursive: true, force: true });
   });
 
   it("fails loud when a selected agent has no bundled source", async () => {

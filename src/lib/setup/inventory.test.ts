@@ -27,7 +27,7 @@ async function installAgent(root: string, tag: string): Promise<void> {
 
 /** Copy anton's bundled skill verbatim into a scope root's `.claude/skills/<name>/SKILL.md`. */
 async function installSkill(root: string, name: string): Promise<void> {
-  const src = await readFile(join(bundledRoot, "src/prompts", `${name}.md`), "utf8");
+  const src = await readFile(join(bundledRoot, "skills", name, "SKILL.md"), "utf8");
   const dest = join(root, CLAUDE_SKILLS_DIR, name, "SKILL.md");
   await mkdir(join(root, CLAUDE_SKILLS_DIR, name), { recursive: true });
   await writeFile(dest, src);

@@ -8,6 +8,7 @@
   "files": [
     "bin",
     "src",
+    "skills",
     "drizzle",
     "public",
     "next.config.ts",

@@ -5,7 +5,7 @@
  *
  * Sources it reads:
  *   - anton's bundled agents:  <bundledRoot>/src/prompts/agents/<tag>.md   (name/description frontmatter)
- *   - anton's bundled skills:  <bundledRoot>/src/prompts/<name>.md         (the always-on REQUIRED_SKILLS)
+ *   - anton's bundled skills:  <bundledRoot>/skills/<name>/SKILL.md        (the always-on REQUIRED_SKILLS)
  *   - project `.claude/`:      <projectDir>/.claude/agents/<tag>.md, <projectDir>/.claude/skills/<name>/SKILL.md
  *   - global  `.claude/`:      <homeDir>/.claude/agents/<tag>.md,   <homeDir>/.claude/skills/<name>/SKILL.md
  *
@@ -303,7 +303,7 @@ export async function buildInventory(options: InventoryOptions): Promise<Invento
   const skillNameSet = new Set<string>(REQUIRED_SKILLS);
   const bundledSkills: InventoryItem[] = [];
   for (const name of REQUIRED_SKILLS) {
-    const src = await readMaybe(join(opts.bundledRoot, SKILLS_SRC_DIR, `${name}.md`));
+    const src = await readMaybe(join(opts.bundledRoot, SKILLS_SRC_DIR, name, "SKILL.md"));
     if (src === undefined) {
       throw new Error(`buildInventory: required skill "${name}" missing from bundled ${SKILLS_SRC_DIR}`);
     }
