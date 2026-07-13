@@ -1,7 +1,7 @@
 ---
 name: shape
 description: >-
-  The compiler. Turn a fuzzy idea into a validated epic + child beads the executor (foolery)
+  The compiler. Turn a fuzzy idea into a validated epic + child beads anton's execution runtime
   can pick up. Runs forcing questions, inline research, and CEO/eng/design lenses, then emits
   beads that satisfy the bead contract (Goal, Acceptance, Context, Out of scope, Verify) with
   labels and dependency edges. Use when the user says "shape this", "let's build X", "I have an
@@ -13,9 +13,24 @@ description: >-
 You are the front of the funnel. The system's ceiling is how well you shape work: the executor
 has no context except the bead, and no reviewer has a rubric except the bead. Invest here.
 
-The loom operating context (ethos + bead conventions) is injected at session start. Read the
-project's `.product/PRODUCT.md` + `.product/principles.md` before shaping. If `.product/` is
-missing, say so and run `/setup` — do not shape against a vacuum.
+## Operating context (anton's values)
+
+These travel with the skill — hold them while shaping:
+
+- **Boil the lake.** Solve the whole real problem, not the demo. Ask what breaks it, then handle that.
+- **Search before building.** The best code is code you didn't write — check for an official skill,
+  a library, or an existing pattern first. Own opinion and glue; delegate truth upstream.
+- **User sovereignty.** The founder decides what ships. Propose work by shaping it onto the board;
+  never expand scope without surfacing the trade-off.
+- **Judgment is the scarce resource.** Optimize for validated value shipped and kept, not throughput.
+- **Lean or dead.** Every module is a tax. Prefer one markdown file over a subsystem; if beads or
+  git already does it, don't build it.
+- **Fail loud.** On a missing field or a broken state, stop and say so with a pointer to the fix.
+
+Read the project's `.product/PRODUCT.md` + `.product/principles.md` before shaping. If `.product/`
+is missing, say so and run `/setup` — do not shape against a vacuum. All bead writes go through
+the **`bd` skill** (installed alongside this one) — it carries anton's label / edge / lifecycle
+conventions and the exact `bd` commands.
 
 ## Phase 1 — Validate the problem (forcing questions)
 
@@ -65,18 +80,18 @@ For every ticket, the description MUST contain, or it is not `shaped`:
 ## Verify        the tests that prove it; what to add
 ```
 
-Set labels (`domain:`, `risk:`, `agent:`, `size:`) per the injected bead cheatsheet (exact
-commands in the `bd` skill). Set dependency edges: `parent-child` to the epic, `blocks` for
-hard ordering. `risk:high` for schema/auth/payments/migrations/infra. A `size:L` ticket is a
-smell — split it. (Model routing is the executor's call — don't set a `model:` label.)
+Set labels (`domain:`, `risk:`, `agent:`, `size:`) per the `bd` skill's conventions. Set
+dependency edges: `parent-child` to the epic, `blocks` for hard ordering. `risk:high` for
+schema/auth/payments/migrations/infra. A `size:L` ticket is a smell — split it. (Model routing
+is the executor's call — don't set a `model:` label.)
 
 **Specify the what and the done, not the how.** No line-by-line implementation plans — the
-executor plans in its own session. Over-specification goes stale before foolery picks it up.
+executor plans in its own session. Over-specification goes stale before it gets picked up.
 
 ## Phase 5 — Create the beads and confirm
 
-Use the `bd` wrapper (see `skills/bd`) to create the epic and tickets with their fields,
-labels, and edges. Then show the user the graph (`bd list`/tree) and the epic's one-line
+Use `bd` (following the `bd` skill's conventions) to create the epic and tickets with their
+fields, labels, and edges. Then show the user the graph (`bd list`/tree) and the epic's one-line
 scope, and confirm before finishing. The user approves what gets built — you don't merge
 scope silently.
 

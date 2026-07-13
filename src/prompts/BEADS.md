@@ -1,9 +1,9 @@
 # BEADS — conventions
 
-How loom writes to [beads](https://github.com/gastownhall/beads). beads holds all work state as
-JSONL in `.beads/`, versioned by git. loom is the **producer** — it creates and links
-contract-shaped beads; the executor (foolery) claims, dispatches, reviews, and closes them.
-Everything below is convention. All `bd` calls go through the `bd` skill.
+How anton writes to [beads](https://github.com/gastownhall/beads). beads holds all work state as
+JSONL in `.beads/`, versioned by git. anton's shaping is the **producer** — it creates and links
+contract-shaped beads; anton's autonomous execution runtime claims, dispatches, reviews, and
+closes them. Everything below is convention. All `bd` calls follow the conventions in this doc.
 
 ## Issue types
 
@@ -25,7 +25,7 @@ Everything below is convention. All `bd` calls go through the `bd` skill.
 | `size:` | `S`, `M`, `L` | sanity check; `L` on a ticket is a smell — split it |
 | `source:` | `stringer`, or omitted | provenance; scan beads also carry `stringer:<collector>:<hash>` for dedup |
 
-(Model routing is the executor's concern — loom does not set a `model:` label.)
+(Model routing is the executor's concern — shaping does not set a `model:` label.)
 
 ## Dependency edges
 
@@ -39,14 +39,14 @@ beads gives four; use them deliberately:
 ## Lifecycle
 
 ```
-loom produces:   stub  → shaped → (ready when deps clear)
-foolery drives:  ready → in-progress → review → done   (and park/unpark on failure)
+shaping produces:   stub  → shaped → (ready when deps clear)
+execution drives:   ready → in-progress → review → done   (and park/unpark on failure)
 ```
 
 - `stub` — idea captured, not yet contract-complete. A `/shape` backlog item.
 - `shaped` — has Goal + Acceptance + Context + Out-of-scope + Verify + labels.
-- `ready` — shaped and unblocked; what `bd ready` returns. **loom's output ends here** — foolery
-  takes it from `ready`.
+- `ready` — shaped and unblocked; what `bd ready` returns. **shaping's output ends here** —
+  execution takes it from `ready`.
 
 ## The bead contract
 

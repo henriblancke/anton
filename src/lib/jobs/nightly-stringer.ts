@@ -2,7 +2,7 @@
  * nightly-stringer job (anton-3t2.3). On its cron: run `stringer scan --delta` on the project repo,
  * then — if there are new signals — dispatch claude with the /scan-triage prompt to convert the few
  * worth doing into contract-shaped beads (claude writes them via `bd`). One scan → a handful of
- * beads per project, deduped and clustered by the prompt. See DESIGN §4/§6 and src/prompts/scan-triage.md.
+ * beads per project, deduped and clustered by the prompt. See DESIGN §4/§6 and skills/scan-triage/SKILL.md.
  *
  * Idempotent: `--delta` means a re-run (crash / quota backoff) doesn't re-triage signals already
  * seen; the worst case is claude re-reading a scan and deduping against the board it already wrote.
@@ -10,7 +10,7 @@
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { getProjectById, getProjectSettings } from "../projects";
-import { loadPrompt } from "../claude/prompt";
+import { loadSkill } from "../claude/prompt";
 import { runClaude, type ClaudeEvent } from "../claude/driver";
 import { scan } from "../stringer";
 import { appendSessionLog, createSession, endSession, sessionLogPath } from "../sessions";
@@ -75,7 +75,7 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
       await appendSessionLog(logPath, `[stringer] ${result.signalCount} signal(s) → /scan-triage\n`);
 
       // 3. Dispatch claude with the scan-triage prompt to turn signals into beads (via bd).
-      const triagePrompt = await loadPrompt("scan-triage");
+      const triagePrompt = await loadSkill("scan-triage");
       const prompt = [
         triagePrompt,
         ``,
