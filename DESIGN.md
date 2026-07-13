@@ -93,8 +93,13 @@ Job types:
 - **Interactive** (node-pty) for `/shape` and any "take over" — a real terminal streamed to the
   browser xterm. Shaping is a conversation, so it runs interactively.
 
-Prompts live in `src/prompts/` (ported from loom): `shape.md`, `scan-triage.md`, `agents/*.md`,
-plus `ETHOS.md` and `BEADS.md` conventions injected as context.
+anton is standalone — it ships its own required skills and needs no external plugin. The
+`shape` / `bd` / `scan-triage` / `review-fix` skills live as self-contained assets in `skills/`
+(each a `SKILL.md`; `REQUIRED_SKILLS` in `src/lib/claude/prompt.ts` is the canonical list). The
+setup wizard (anton-3n5) always installs this set into a target project's `.claude/skills/`.
+Agent-tag specialist prompts and the locked base contract live in `src/prompts/` (`agents/*.md`,
+`system-base.md`); `ETHOS.md` / `BEADS.md` are anton's operating-context source, and the
+conventions they hold travel embedded in the `bd` and `shape` skills.
 
 ## 6. UI (Next.js 16 App Router + shadcn)
 

@@ -4,7 +4,8 @@ description: >-
   Turn a stringer scan into a small set of well-formed beads, protecting queue quality. Reads
   stringer signal output, dedupes against existing beads, clusters related signals into epics,
   sets risk from severity, discards noise, and creates contract-shaped beads for the executor
-  (foolery) to pick up. Called by bin/loom-scan.sh nightly; invocable directly on a scan file.
+  to pick up. Run by anton's nightly-stringer job (`stringer scan --delta` → `/scan-triage`);
+  invocable directly on a scan file.
 ---
 
 # /scan-triage — stringer signals → good beads
@@ -14,7 +15,8 @@ the executor ships noise faster. **The board is the product** — your job is to
 into the *few* beads worth doing, shaped to the contract, and drop the rest.
 
 Read `.product/principles.md` and `.product/PRODUCT.md` first. All bead writes go through the
-`bd` skill. Input: a stringer scan file (JSON) passed as the argument.
+**`bd` skill** (installed alongside this one) — it carries anton's label / edge / lifecycle
+conventions and the bead contract. Input: a stringer scan file (JSON) passed as the argument.
 
 ## 1. Read signals + existing board
 

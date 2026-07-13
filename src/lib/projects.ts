@@ -95,7 +95,7 @@ export interface ProjectSettings {
   seedPrompt?: string;
   /**
    * Operator-editable reasoning prompt for the review-fix job (anton-f5n). Overrides the default
-   * `src/prompts/review-fix.md` when set; anton appends the concrete PR context beneath it. Empty
+   * `skills/review-fix/SKILL.md` when set; anton appends the concrete PR context beneath it. Empty
    * = use the shipped default.
    */
   reviewFixPrompt?: string;
