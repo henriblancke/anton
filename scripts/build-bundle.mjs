@@ -65,6 +65,28 @@ function run(cmd, args, opts = {}) {
   execFileSync(cmd, args, { stdio: "inherit", ...opts });
 }
 
+/**
+ * Copy a package and its (hoisted) dependency closure from one node_modules to another. bun hoists
+ * deps to the top level, so a flat resolve is enough in practice; missing entries are skipped
+ * best-effort. Used to vendor prebuild-install, which the runtime never imports (so Next's tracer
+ * omits it) but `anton setup` needs to fetch an ABI-matched better-sqlite3.
+ */
+function copyModuleClosure(names, fromMods, toMods, seen = new Set()) {
+  for (const name of names) {
+    if (seen.has(name)) continue;
+    seen.add(name);
+    const src = join(fromMods, name);
+    if (!existsSync(src)) continue;
+    cpSync(src, join(toMods, name), { recursive: true });
+    try {
+      const pj = JSON.parse(readFileSync(join(src, "package.json"), "utf8"));
+      copyModuleClosure(Object.keys(pj.dependencies ?? {}), fromMods, toMods, seen);
+    } catch {
+      /* leaf or unreadable manifest — nothing more to follow */
+    }
+  }
+}
+
 function main(argv) {
   const args = parseArgs(argv.slice(2));
   const pkg = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8"));
@@ -120,6 +142,15 @@ function main(argv) {
       if (entry !== platform) rmSync(join(ptyPrebuilds, entry), { recursive: true, force: true });
     }
   }
+
+  // 4b) Vendor prebuild-install (+ closure). better-sqlite3 is a per-ABI addon (not N-API), so its
+  //     shipped binary is locked to the build's Node major; `anton setup` uses this to download an
+  //     ABI-matched prebuilt binary when the user's Node differs (no compiler required).
+  copyModuleClosure(
+    ["prebuild-install"],
+    join(REPO_ROOT, "node_modules"),
+    join(stage, "node_modules"),
+  );
 
   // 5) Drop the marker the launcher keys bundle mode off of.
   console.log("[5/6] write RELEASE_VERSION");

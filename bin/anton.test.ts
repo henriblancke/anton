@@ -14,6 +14,7 @@ import {
   agentsFromArgs,
   applyMigrations,
   compareVersions,
+  ensureBetterSqlite3,
   nextArgs,
   platformLabel,
   provisionAgentsSkills,
@@ -117,6 +118,13 @@ describe("platformLabel", () => {
     const label = platformLabel();
     expect(label).toMatch(/^[a-z0-9]+-[a-z0-9]+$/);
     expect(label).toContain(process.arch === "x64" ? "x64" : process.arch);
+  });
+});
+
+describe("ensureBetterSqlite3", () => {
+  it("returns 'ok' when the shipped binary matches the running Node (repo build)", () => {
+    // The repo's better-sqlite3 was built for this exact Node, so no ABI fix is needed.
+    expect(ensureBetterSqlite3(REPO_ROOT)).toBe("ok");
   });
 });
 

@@ -363,12 +363,45 @@ async function provisionAgentsSkills(args, opts = {}) {
 // ── Bundle-mode migrations + daemon lifecycle (anton-1xp) ───────────────────────────────────
 
 /**
+ * Ensure better-sqlite3's native binary matches the RUNNING Node's ABI. It's a per-ABI addon (not
+ * N-API), so a prebuilt bundle's binary is locked to the Node major it was built against; on a
+ * machine with a different Node major it fails with a NODE_MODULE_VERSION error. We recover WITHOUT
+ * a compiler by running the bundled `prebuild-install` to download the ABI-matched prebuilt binary.
+ * Returns "ok" | "rebuilt". Non-ABI errors re-throw. (node-pty is N-API, so it needs no such fix.)
+ */
+function ensureBetterSqlite3(appRoot = APP_ROOT) {
+  const require = createRequire(join(appRoot, "package.json"));
+  try {
+    require("better-sqlite3");
+    return "ok";
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    if (!/NODE_MODULE_VERSION|different Node\.js version|was compiled against/i.test(msg)) throw e;
+    const bsqlDir = dirname(require.resolve("better-sqlite3/package.json"));
+    const prebuild = join(appRoot, "node_modules", "prebuild-install", "bin.js");
+    const manualFix = `run:  cd ${bsqlDir} && npm rebuild better-sqlite3`;
+    if (!existsSync(prebuild)) {
+      throw new Error(`better-sqlite3 was built for a different Node version and prebuild-install isn't bundled — ${manualFix}`);
+    }
+    console.log(c.yellow("  better-sqlite3 was built for a different Node — fetching a matching prebuilt binary…"));
+    const r = spawnSync(process.execPath, [prebuild], { cwd: bsqlDir, stdio: "inherit" });
+    if ((r.status ?? 1) !== 0) {
+      throw new Error(`no prebuilt better-sqlite3 for Node ${process.version} on this platform — ${manualFix}`);
+    }
+    require("better-sqlite3"); // re-verify the freshly downloaded binary loads (throwing require isn't cached)
+    console.log(c.green("  ✓ better-sqlite3 binary now matches Node ") + process.version);
+    return "rebuilt";
+  }
+}
+
+/**
  * Apply the committed drizzle migration SQL directly via better-sqlite3 (a production dep), so a
  * prebuilt bundle needs no drizzle-kit (a devDep we don't ship). Idempotent: tracks applied files
  * in `__anton_migrations` and only runs new ones. Mirrors the SQL-splitting in src/lib/db/testing.ts.
  */
 function applyMigrations(dbPath, opts = {}) {
   const appRoot = opts.appRoot ?? APP_ROOT;
+  ensureBetterSqlite3(appRoot); // heal an ABI mismatch before the server (which also uses it) starts
   const require = createRequire(join(appRoot, "package.json"));
   const Database = require("better-sqlite3");
   mkdirSync(dirname(dbPath), { recursive: true });
@@ -749,4 +782,5 @@ export {
   compareVersions,
   platformLabel,
   applyMigrations,
+  ensureBetterSqlite3,
 };

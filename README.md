@@ -83,6 +83,23 @@ anton drives external CLIs. Install these and make sure they're on your `PATH`:
 | **gh** ([GitHub CLI](https://cli.github.com)) | ⬜ | PRs + review-fix |
 | **stringer** | ⬜ | nightly scan → beads |
 
+### Installing them
+
+- **node ≥ 20** — via [nvm](https://github.com/nvm-sh/nvm) (`nvm install 22`), [fnm](https://github.com/Schniz/fnm) (`fnm install 22`), Homebrew (`brew install node`), or [nodejs.org](https://nodejs.org). The prebuilt bundle self-heals its native modules for your Node version during `anton setup`, so any current major works.
+- **git** — `xcode-select --install` (macOS) · `brew install git` · `apt install git` / `dnf install git` (Linux).
+- **bd** (beads) — the work source of truth:
+  ```bash
+  curl -sSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
+  ```
+  Then run `bd init` inside each repo you point anton at.
+- **claude** (Claude Code) — `npm install -g @anthropic-ai/claude-code`, or the native installer at [claude.com/claude-code](https://claude.com/claude-code). Run `claude` once to sign in.
+- **gh** (GitHub CLI, optional) — `brew install gh` (macOS), or see [cli.github.com](https://cli.github.com) (Linux); then `gh auth login`. Without it you lose PRs + review-fix.
+- **stringer** (optional) — a git-archaeology tool that mines repos for beads issues, installed via [Homebrew](https://brew.sh):
+  ```bash
+  brew install davetashner/tap/stringer
+  ```
+  Without it you lose the nightly scan → beads job. Source: [github.com/davetashner/stringer](https://github.com/davetashner/stringer).
+
 Run `anton doctor` at any time to check what's present.
 
 ## Install
