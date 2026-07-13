@@ -159,7 +159,7 @@ async function handleEpic(args: {
     // obeys the operating contract. Use the epic's agent tag if it has one.
     const agentTag = labelValue(epic.labels, "agent");
     const appendSystemPrompt = await buildExecutionSystemPrompt({
-      agentPrompt: await loadAgentPrompt(agentTag),
+      agentPrompt: await loadAgentPrompt(agentTag, { projectDir: worktree.path }),
       seedPrompt: settings.seedPrompt,
     });
 

@@ -164,7 +164,7 @@ async function runTicket(args: {
   const agentTag = labelValue(ticket.labels, "agent");
   // Compose the system prompt: locked base contract + agent-tag prompt + operator seed. The base
   // is mandatory (buildExecutionSystemPrompt throws if src/prompts/system-base.md is missing).
-  const agentPrompt = await loadAgentPrompt(agentTag);
+  const agentPrompt = await loadAgentPrompt(agentTag, { projectDir: worktreePath });
   const appendSystemPrompt = await buildExecutionSystemPrompt({
     agentPrompt,
     seedPrompt: settings.seedPrompt,

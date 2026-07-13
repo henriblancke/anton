@@ -1,9 +1,14 @@
 /**
- * Agent prompt loading (anton-dzh.3): frontmatter stripping and tag-to-file resolution against
- * the real prompts under src/prompts/agents.
+ * Agent prompt loading (anton-dzh.3, anton-3n5.4): frontmatter stripping and tag-to-file
+ * resolution. Resolution honors user-provided agents by precedence: target-project
+ * `.claude/agents/<tag>.md` > global `~/.claude/agents/<tag>.md` > anton bundled
+ * `src/prompts/agents/<tag>.md`.
  */
-import { describe, expect, it } from "vitest";
-import { loadAgentPrompt, stripFrontmatter } from "./agent-prompt";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { USER_AGENTS_DIR, loadAgentPrompt, stripFrontmatter } from "./agent-prompt";
 
 describe("stripFrontmatter", () => {
   it("removes a --- delimited frontmatter block and leaves the body", () => {
@@ -21,7 +26,7 @@ describe("stripFrontmatter", () => {
 });
 
 describe("loadAgentPrompt", () => {
-  it("returns a non-empty string for a real tag, with frontmatter stripped", async () => {
+  it("returns a non-empty string for a real bundled tag, with frontmatter stripped", async () => {
     const prompt = await loadAgentPrompt("nextjs");
     expect(prompt).toBeDefined();
     expect(prompt!.length).toBeGreaterThan(0);
@@ -35,5 +40,56 @@ describe("loadAgentPrompt", () => {
   it("returns undefined for an empty or undefined tag", async () => {
     expect(await loadAgentPrompt("")).toBeUndefined();
     expect(await loadAgentPrompt(undefined)).toBeUndefined();
+  });
+});
+
+describe("loadAgentPrompt precedence", () => {
+  let projectDir: string;
+  let homeDir: string;
+  let bundledRoot: string;
+
+  /** Write `<root>/<agentsDir>/<tag>.md` with the given body, creating parents. */
+  async function writeAgent(root: string, agentsDir: string, tag: string, body: string) {
+    const dir = join(root, agentsDir);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, `${tag}.md`), body, "utf8");
+  }
+
+  beforeEach(async () => {
+    projectDir = await mkdtemp(join(tmpdir(), "anton-project-"));
+    homeDir = await mkdtemp(join(tmpdir(), "anton-home-"));
+    bundledRoot = await mkdtemp(join(tmpdir(), "anton-bundled-"));
+  });
+
+  afterEach(async () => {
+    await Promise.all(
+      [projectDir, homeDir, bundledRoot].map((d) => rm(d, { recursive: true, force: true })),
+    );
+  });
+
+  it("bundled-only: falls back to the shipped prompt when no user override exists", async () => {
+    await writeAgent(bundledRoot, "src/prompts/agents", "nextjs", "---\nname: n\n---\nbundled body");
+    const prompt = await loadAgentPrompt("nextjs", { projectDir, homeDir, bundledRoot });
+    expect(prompt).toBe("bundled body");
+  });
+
+  it("user-project-overrides-bundled: the project .claude agent wins", async () => {
+    await writeAgent(projectDir, USER_AGENTS_DIR, "nextjs", "---\nname: n\n---\nproject body");
+    await writeAgent(homeDir, USER_AGENTS_DIR, "nextjs", "global body");
+    await writeAgent(bundledRoot, "src/prompts/agents", "nextjs", "bundled body");
+    const prompt = await loadAgentPrompt("nextjs", { projectDir, homeDir, bundledRoot });
+    expect(prompt).toBe("project body");
+  });
+
+  it("global fallback: the ~/.claude agent wins over bundled when no project override exists", async () => {
+    await writeAgent(homeDir, USER_AGENTS_DIR, "nextjs", "---\nname: n\n---\nglobal body");
+    await writeAgent(bundledRoot, "src/prompts/agents", "nextjs", "bundled body");
+    const prompt = await loadAgentPrompt("nextjs", { projectDir, homeDir, bundledRoot });
+    expect(prompt).toBe("global body");
+  });
+
+  it("none-found: returns undefined when no source has the tag", async () => {
+    const prompt = await loadAgentPrompt("nextjs", { projectDir, homeDir, bundledRoot });
+    expect(prompt).toBeUndefined();
   });
 });
