@@ -1,5 +1,12 @@
 import { NextResponse } from "next/server";
-import { getProjectSettingsBySlug, updateProjectSettings } from "@/lib/projects";
+import {
+  CONCURRENCY_RANGE,
+  JOB_TIMEOUT_MINUTES_RANGE,
+  MAX_RETRIES_RANGE,
+  getProjectSettingsBySlug,
+  updateProjectSettings,
+  type ProjectSettings,
+} from "@/lib/projects";
 
 export const dynamic = "force-dynamic";
 
@@ -28,7 +35,35 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
     return NextResponse.json({ error: "Invalid body" }, { status: 400 });
   }
 
-  const patch: Record<string, string | undefined> = {};
+  const patch: Partial<ProjectSettings> = {};
+
+  // Numeric job-policy fields: null / "" clears to the default; a concrete value must be an
+  // integer within range. Shared handling so all three behave identically.
+  const numericFields: {
+    key: "concurrency" | "jobTimeoutMinutes" | "maxRetries";
+    range: { min: number; max: number };
+  }[] = [
+    { key: "concurrency", range: CONCURRENCY_RANGE },
+    { key: "jobTimeoutMinutes", range: JOB_TIMEOUT_MINUTES_RANGE },
+    { key: "maxRetries", range: MAX_RETRIES_RANGE },
+  ];
+  for (const { key, range } of numericFields) {
+    if (!(key in body)) continue;
+    const raw = (body as Record<string, unknown>)[key];
+    if (raw == null || raw === "") {
+      patch[key] = undefined; // clear → falls back to the default
+      continue;
+    }
+    const n = typeof raw === "number" ? raw : Number(raw);
+    if (!Number.isInteger(n) || n < range.min || n > range.max) {
+      return NextResponse.json(
+        { error: `${key} must be an integer in [${range.min}, ${range.max}]` },
+        { status: 400 },
+      );
+    }
+    patch[key] = n;
+  }
+
   if ("model" in body) {
     const model = body.model;
     // "" / null → clear (Default). A concrete value must be one we support.

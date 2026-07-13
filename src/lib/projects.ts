@@ -99,7 +99,34 @@ export interface ProjectSettings {
    * = use the shipped default.
    */
   reviewFixPrompt?: string;
+  /**
+   * Max concurrent execute-epic runs for this project (anton-xbk). The runner gates approved-epic
+   * execution per project against this; other job types (review-fix/nightly) don't count against
+   * it. Absent → DEFAULT_CONCURRENCY.
+   */
+  concurrency?: number;
+  /**
+   * Wall-clock timeout for a single job attempt, in minutes (anton-xbk). On expiry the run is
+   * aborted and retried/parked like any other failure. Absent → DEFAULT_JOB_TIMEOUT_MINUTES (2h).
+   */
+  jobTimeoutMinutes?: number;
+  /**
+   * Max attempts for a job before it is parked for a human (anton-xbk). A failed ticket fails the
+   * execute-epic job, which retries and resumes past already-closed tickets — so this is the
+   * effective per-task retry budget. Absent → DEFAULT_MAX_RETRIES.
+   */
+  maxRetries?: number;
 }
+
+/** Defaults for the per-project job policy when a setting is unset. */
+export const DEFAULT_CONCURRENCY = 3;
+export const DEFAULT_JOB_TIMEOUT_MINUTES = 120; // 2 hours
+export const DEFAULT_MAX_RETRIES = 3;
+
+/** Allowed ranges for the numeric job-policy settings (validated at the API boundary). */
+export const CONCURRENCY_RANGE = { min: 1, max: 6 } as const;
+export const JOB_TIMEOUT_MINUTES_RANGE = { min: 5, max: 720 } as const; // 5 min … 12 h
+export const MAX_RETRIES_RANGE = { min: 1, max: 10 } as const;
 
 export async function getProjectSettings(db: AntonDb, id: string): Promise<ProjectSettings> {
   const rows = await db

@@ -17,6 +17,7 @@ import {
   getJob,
   leaseDue,
   park,
+  projectIdsWithPendingJobs,
   renewLease,
   reschedule,
   systemClock,
@@ -53,6 +54,25 @@ export const DEFAULT_CONFIG: RunnerConfig = {
   maxConcurrent: 1,
   tickMs: 2_000,
 };
+
+/**
+ * The per-project execution policy the runner applies to a job. Resolved per job from project
+ * settings (anton-xbk), falling back to defaults. When no resolver is injected the runner keeps
+ * its config-driven behavior (global `maxConcurrent`, `config.maxAttempts`, no timeout).
+ */
+export interface JobPolicy {
+  /** Max concurrent execute-epic runs for this project. */
+  concurrency: number;
+  /** Wall-clock timeout for one job attempt, in ms. `Infinity` disables the timeout. */
+  timeoutMs: number;
+  /** Max attempts before the job is parked for a human. */
+  maxAttempts: number;
+}
+
+/** Resolve a project's job policy. May be async (reads settings from the DB). */
+export type JobPolicyResolver = (
+  projectId: string | undefined,
+) => Promise<JobPolicy> | JobPolicy;
 
 export interface JobContext {
   jobId: string;
@@ -136,6 +156,7 @@ export class JobRunner {
   private readonly config: RunnerConfig;
   private readonly handlers = new Map<JobType, JobHandler>();
   private readonly log: RunnerLogger;
+  private readonly resolvePolicy: JobPolicyResolver | null;
 
   private readonly inFlight = new Map<string, AbortController>();
   private timer: ReturnType<typeof setTimeout> | null = null;
@@ -147,11 +168,28 @@ export class JobRunner {
     clock?: Clock;
     config?: Partial<RunnerConfig>;
     log?: RunnerLogger;
+    /**
+     * Per-project policy source. When set, the runner gates execute-epic concurrency per project,
+     * applies each job's timeout, and parks after that project's retry budget. When omitted, the
+     * runner falls back to its config (global maxConcurrent / maxAttempts, no timeout).
+     */
+    resolvePolicy?: JobPolicyResolver;
   }) {
     this.db = deps.db;
     this.clock = deps.clock ?? systemClock;
     this.config = { ...DEFAULT_CONFIG, ...deps.config };
     this.log = deps.log ?? noopLog;
+    this.resolvePolicy = deps.resolvePolicy ?? null;
+  }
+
+  /** The effective policy for a job's project — the injected resolver, or config-derived defaults. */
+  private async policyFor(projectId: string | undefined): Promise<JobPolicy> {
+    if (this.resolvePolicy) return this.resolvePolicy(projectId);
+    return {
+      concurrency: this.config.maxConcurrent,
+      timeoutMs: Infinity,
+      maxAttempts: this.config.maxAttempts,
+    };
   }
 
   registerHandler(type: JobType, handler: JobHandler): this {
@@ -173,9 +211,26 @@ export class JobRunner {
     const capacity = this.config.maxConcurrent - this.inFlight.size;
     if (capacity <= 0) return 0;
 
+    // With a policy resolver, gate execute-epic concurrency per project. Precompute each pending
+    // project's cap so leaseDue can decide synchronously; other job types stay ungated (Infinity).
+    let capOf: ((job: JobRow) => number) | undefined;
+    if (this.resolvePolicy) {
+      const projectIds = await projectIdsWithPendingJobs(this.db, "execute-epic");
+      const concByProject = new Map<string, number>();
+      for (const pid of projectIds) {
+        const policy = await this.policyFor(pid ?? undefined);
+        concByProject.set(pid ?? "", policy.concurrency);
+      }
+      capOf = (job) =>
+        job.type === "execute-epic"
+          ? (concByProject.get(job.projectId ?? "") ?? DEFAULT_CONFIG.maxConcurrent)
+          : Infinity;
+    }
+
     const jobs = await leaseDue(this.db, this.clock, {
       leaseMs: this.config.leaseMs,
       limit: capacity,
+      capOf,
     });
     if (jobs.length === 0) return 0;
 
@@ -188,11 +243,26 @@ export class JobRunner {
     const controller = new AbortController();
     this.inFlight.set(job.id, controller);
 
+    const policy = await this.policyFor(job.projectId ?? undefined);
+
     // Keep the lease alive across long handlers so a working job isn't wrongly reclaimed.
     const renewEvery = Math.max(1_000, Math.floor(this.config.leaseMs / 3));
     const renewTimer = setInterval(() => {
       void renewLease(this.db, this.clock, job.id, this.config.leaseMs).catch(() => {});
     }, renewEvery);
+
+    // Wall-clock timeout: abort the handler if it runs past the project's budget, so one stuck run
+    // can't hold its concurrency slot forever (a heartbeating handler is never lease-reclaimed).
+    let timedOut = false;
+    const timeoutTimer =
+      Number.isFinite(policy.timeoutMs) && policy.timeoutMs > 0
+        ? setTimeout(() => {
+            timedOut = true;
+            controller.abort();
+          }, policy.timeoutMs)
+        : null;
+    // Don't let the timeout keep the process alive when idle.
+    if (timeoutTimer && typeof timeoutTimer.unref === "function") timeoutTimer.unref();
 
     let outcome: Outcome;
     try {
@@ -209,20 +279,26 @@ export class JobRunner {
       await handler(ctx);
       outcome = { kind: "success" };
     } catch (e) {
-      outcome = classifyError(e);
+      // A timeout abort is a retryable failure with a clear reason (not a poison/quota misread).
+      outcome = timedOut
+        ? { kind: "error", error: `timed out after ${Math.round(policy.timeoutMs / 60_000)}m` }
+        : classifyError(e);
       this.log.error(`job ${job.id} (${job.type}) failed: ${outcome.kind}`, e);
     } finally {
       clearInterval(renewTimer);
+      if (timeoutTimer) clearTimeout(timeoutTimer);
       this.inFlight.delete(job.id);
     }
 
-    await this.settle(job, outcome);
+    await this.settle(job, outcome, policy);
   }
 
-  private async settle(job: JobRow, outcome: Outcome): Promise<void> {
+  private async settle(job: JobRow, outcome: Outcome, policy: JobPolicy): Promise<void> {
     // Re-read attempts (a heartbeat/lease may have advanced updatedAt, not attempts, but be safe).
     const fresh = (await getJob(this.db, job.id)) ?? job;
-    const action = nextAction(this.config, fresh, outcome, this.clock.now());
+    // The project's retry budget governs when we park; backoff/quota stay from the runner config.
+    const config = { ...this.config, maxAttempts: policy.maxAttempts };
+    const action = nextAction(config, fresh, outcome, this.clock.now());
     switch (action.action) {
       case "complete":
         await complete(this.db, this.clock, job.id);

@@ -7,7 +7,7 @@
  * clock. Times are stored as unix SECONDS (the schema's timestamp mode); this module works in ms
  * and converts at the boundary.
  */
-import { and, eq, inArray, lte, or, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, lte, or, sql } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { randomUUID } from "node:crypto";
 import * as schema from "../db/schema";
@@ -83,17 +83,25 @@ export async function enqueue(
  *
  * The runner is single-process, so a read-then-write inside one better-sqlite3 transaction is
  * sufficient mutual exclusion.
+ *
+ * `capOf` opts in to per-bucket concurrency: for a candidate it returns the max jobs allowed to be
+ * in flight in that candidate's bucket (keyed by projectId). `Infinity` means ungated (only the
+ * global `limit` applies). Jobs whose bucket is already at capacity are skipped in favor of the
+ * next-due job for a different bucket. Currently the runner gates execute-epic per project.
  */
 export async function leaseDue(
   db: AntonDb,
   clock: Clock,
-  opts: { leaseMs: number; limit: number },
+  opts: { leaseMs: number; limit: number; capOf?: (job: JobRow) => number },
 ): Promise<JobRow[]> {
   const nowMs = clock.now();
   const nowDate = secDate(nowMs);
   const leaseDate = secDate(nowMs + opts.leaseMs);
 
-  const due = await db
+  // Without per-bucket caps, the DB `limit` alone bounds the result. With caps we must scan more
+  // candidates than `limit` (some get skipped for being at capacity), so widen the fetch.
+  const scanLimit = opts.capOf ? Math.max(opts.limit * 8, 200) : opts.limit;
+  const candidates = await db
     .select()
     .from(schema.jobs)
     .where(
@@ -103,7 +111,42 @@ export async function leaseDue(
       ),
     )
     .orderBy(schema.jobs.runAt)
-    .limit(opts.limit);
+    .limit(scanLimit);
+
+  if (candidates.length === 0) return [];
+
+  let due = candidates;
+  if (opts.capOf) {
+    const capOf = opts.capOf;
+    // Count jobs actively in flight (running, lease not yet expired) per bucket — the live load a
+    // new lease competes with. Only gated buckets are tracked.
+    const active = await db
+      .select({ projectId: schema.jobs.projectId, type: schema.jobs.type })
+      .from(schema.jobs)
+      .where(and(eq(schema.jobs.status, "running"), gt(schema.jobs.leaseExpiresAt, nowDate)));
+    const usedByBucket = new Map<string, number>();
+    for (const row of active) {
+      if (capOf(row as JobRow) === Infinity) continue;
+      const key = row.projectId ?? "";
+      usedByBucket.set(key, (usedByBucket.get(key) ?? 0) + 1);
+    }
+
+    const picked: JobRow[] = [];
+    for (const job of candidates) {
+      if (picked.length >= opts.limit) break;
+      const cap = capOf(job);
+      if (cap === Infinity) {
+        picked.push(job);
+        continue;
+      }
+      const key = job.projectId ?? "";
+      const used = usedByBucket.get(key) ?? 0;
+      if (used >= cap) continue; // bucket at capacity — leave queued, try the next candidate
+      usedByBucket.set(key, used + 1);
+      picked.push(job);
+    }
+    due = picked;
+  }
 
   if (due.length === 0) return [];
 
@@ -120,6 +163,22 @@ export async function leaseDue(
 
   // Return the leased rows re-read so callers see the incremented attempts + new lease.
   return db.select().from(schema.jobs).where(inArray(schema.jobs.id, ids));
+}
+
+/**
+ * Distinct project ids that currently have a `queued` or `running` job of the given type. Used by
+ * the runner to know which projects' concurrency caps it must resolve before leasing. A job with
+ * no project surfaces as `null`.
+ */
+export async function projectIdsWithPendingJobs(
+  db: AntonDb,
+  type: JobType,
+): Promise<(string | null)[]> {
+  const rows = await db
+    .selectDistinct({ projectId: schema.jobs.projectId })
+    .from(schema.jobs)
+    .where(and(eq(schema.jobs.type, type), inArray(schema.jobs.status, ["queued", "running"])));
+  return rows.map((r) => r.projectId);
 }
 
 /** Heartbeat: extend the lease on a running job while its handler works. */
