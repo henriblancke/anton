@@ -439,13 +439,18 @@ async function startDaemon(args) {
     return 0;
   }
 
-  // Ensure the schema exists (idempotent) before the server touches the DB.
+  // Heal the native ABI + ensure the schema exists before the server touches the DB. If this fails
+  // the server would only serve 500s (its every route needs better-sqlite3), so abort loudly here
+  // rather than daemonize a broken process.
   const stateEnv = bundleStateEnv();
   try {
     const { ran } = applyMigrations(stateEnv.ANTON_DB);
     if (ran) console.log(c.dim(`applied ${ran} migration(s) → ${stateEnv.ANTON_DB}`));
   } catch (e) {
-    console.log(c.yellow("migration step failed (continuing): ") + c.dim(String(e.message ?? e)));
+    console.log(c.red("\n✗ Cannot start: the database layer failed to initialize."));
+    console.log(c.red(`  ${String(e.message ?? e)}`));
+    console.log(c.dim("  (fix the above, then re-run `anton start`. This usually means a native-module ABI issue.)"));
+    return 1;
   }
 
   mkdirSync(LOG_DIR, { recursive: true });

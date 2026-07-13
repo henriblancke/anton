@@ -20,7 +20,7 @@ jobs:
   gates:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: "1.2.20" # match package.json `packageManager`
@@ -36,7 +36,7 @@ jobs:
       - name: Verify the anton CLI launches
         run: node bin/anton.mjs --help
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
 
@@ -49,13 +49,21 @@ jobs:
         include:
           - os: macos-14 # Apple silicon
             label: darwin-arm64
-          - os: macos-13 # Intel
-            label: darwin-x64
           - os: ubuntu-latest
             label: linux-x64
+          # Intel macOS (darwin-x64) is intentionally omitted: GitHub is retiring the `macos-13`
+          # runners (jobs queue indefinitely), and native addons can't be cleanly cross-compiled
+          # from an arm64 runner. Users on Intel Macs can install from source (see README).
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      # Pin Node so the native addons' prebuilt binaries target a KNOWN ABI (NODE_MODULE_VERSION).
+      # Without this the ABI tracks the runner's default Node, not the user's — the exact cause of
+      # the "compiled against a different Node.js version" failures. `anton setup` still heals a
+      # mismatch for users on other Node majors, but this makes the common (current-Node) case just work.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: "1.2.20"
@@ -66,7 +74,7 @@ jobs:
       - name: Assemble prebuilt bundle
         run: node scripts/build-bundle.mjs --skip-build --tag "${{ github.ref_name }}" --platform "${{ matrix.label }}"
       - name: Attach bundle to the Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/anton-${{ matrix.label }}.tar.gz
 
@@ -76,7 +84,7 @@ jobs:
   #   needs: gates
   #   runs-on: ubuntu-latest
   #   steps:
-  #     - uses: actions/checkout@v4
+  #     - uses: actions/checkout@v7
   #     - uses: oven-sh/setup-bun@v2
   #       with: { bun-version: "1.2.20" }
   #     - run: bun install --frozen-lockfile
