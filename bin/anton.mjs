@@ -647,7 +647,9 @@ function checkPrereqs() {
 
 function cmdDoctor() {
   const ok = checkPrereqs();
-  const dbPath = process.env.ANTON_DB ?? join(APP_ROOT, "anton.db");
+  // Resolve the DB the same way the server does: in a bundle it lives in the persistent state dir
+  // (where `anton setup` creates it), NOT under the runtime dir — so doctor must check there too.
+  const dbPath = IS_BUNDLE ? bundleStateEnv().ANTON_DB : (process.env.ANTON_DB ?? join(APP_ROOT, "anton.db"));
   console.log(
     `  ${existsSync(dbPath) ? "✓" : c.yellow("·")} ${"anton.db".padEnd(9)} ${existsSync(dbPath) ? c.green(dbPath) : c.yellow("not created — run `anton setup`")}`,
   );
