@@ -50,6 +50,26 @@ Plus two scheduled background jobs, per project:
 
 **beads is the source of truth for work.** Epics, tickets, approval, stage, and the PR link all live in each repo's `.beads/` (queried via `bd`). anton's own SQLite (`anton.db`) holds only machine-local execution state: projects, runs, jobs, schedules, and sessions — it's disposable and git-ignored.
 
+## Feature walkthrough
+
+### The board
+
+![The epics board — four stage columns derived live from beads](docs/images/board.png)
+
+A project's home is a four-column board — **backlog → implementing → in-review → done** — with a live count on each column. Every stage is derived from beads at read time (an epic's tickets and its PR state decide where it sits), so the board is never a cache to reconcile: approve an epic in backlog and it moves right on its own as its runs land. In-review cards carry their PR number, and backlog cards expose the **Approve** gate directly.
+
+### Epic detail
+
+![An epic's contract and its live dependency graph](docs/images/epic.png)
+
+Opening an epic shows its full contract — Goal, Acceptance, and child tickets with size labels — beside a live **dependency graph** of the ticket DAG (`blocks` / `part of` edges, laid out left→right). This is the review-and-approve gate from step 3 of the loop: you read exactly what anton will build before anything runs, then **Run epic** launches it (or **Open worktree** to inspect the isolated checkout).
+
+### Tickets
+
+![The filterable tickets list across all epics](docs/images/tickets.png)
+
+The tickets view is the flat, cross-epic index — every epic and ticket in the project with its id, parent epic, agent, risk, and size, filterable by any of those plus title, status, and type. It's the granular counterpart to the board: where the board tracks epics through stages, this is where you scan, filter, and drill into individual work items.
+
 ## Prerequisites
 
 anton drives external CLIs. Install these and make sure they're on your `PATH`:
@@ -84,6 +104,15 @@ anton ships as a Node package, **not a standalone compiled binary** — there's 
 
 Installing exposes the `anton` CLI: on your `PATH` after a global `npm i -g`, or run it from the package directory with `bun run anton` / `npx anton`.
 
+> **Testing locally from a clone.** `bun install` alone does **not** put `anton` on your `PATH` — a package manager only links a package's `bin` when it's installed as a dependency or globally, never for the repo's own root. To get the real `anton` command while iterating on a clone, link it once:
+>
+> ```bash
+> bun link          # in the repo root — symlinks `anton` into ~/.bun/bin (npm: `npm link`)
+> anton doctor      # now resolves from anywhere; stays pointed at your working tree
+> ```
+>
+> `bun link` keeps `anton` pointed at your checkout (edits are picked up on the next run); a global `npm i -g .` copies the package instead and won't track edits. Undo with `bun unlink` (or `rm ~/.bun/bin/anton`). Or skip linking entirely and run the launcher directly: `node bin/anton.mjs <command>`.
+
 ## Run locally
 
 ```bash
@@ -91,28 +120,35 @@ anton setup      # check prerequisites, run DB migrations, rebuild node-pty
 anton start      # build if needed, then start the server on http://localhost:3000
 ```
 
+The server listens on **port 3000** by default. Run it elsewhere with `--port` (alias `-p`) or the `PORT` env var — an explicit flag wins:
+
+```bash
+anton start --port 4000       # or: anton start -p 4000  /  PORT=4000 anton start
+anton dev --port 4000         # same override for the dev server
+```
+
 The **job runner and cron scheduler start automatically** with the server (via `src/instrumentation.ts`), so approved epics execute and scheduled jobs fire without any extra process. Set `ANTON_RUNNER=off` to boot the UI without them.
 
 ### CLI
 
 ```
-anton setup    check prereqs, run DB migrations, rebuild node-pty
+anton setup    check prereqs, migrate DB, rebuild node-pty, install agents & skills  [--agents <a,b,c>|all]
 anton doctor   check prereqs + anton.db (non-destructive)
-anton dev      run the dev server (next dev)
-anton start    build if needed, then run the server (next start)
+anton dev      run the dev server (next dev)                                          [--port <n>]
+anton start    build if needed, then run the server (next start)                      [--port <n>]
 anton --help   show help
 ```
 
 ### Agents & skills
 
-Run in a real terminal, `anton setup` is **interactive**: after the prereq and migration steps it provisions the agents and skills that `claude` uses to implement your tickets, writing them into the target repo's `.claude/` directory.
+Run in a real terminal, `anton setup` is **interactive**: after the prereq, migration, and native-build steps it provisions the agents and skills that `claude` uses, installing them into your **global `~/.claude/`** so they're discoverable from every repo `claude` runs in.
 
-- **Bundled agents — you choose.** anton ships specialist agent prompts (`alembic`, `docker`, `fastapi`, `kubernetes`, `nextjs`, `pydantic`, `supabase`, `terraform`). Setup lists them as a checklist with a one-line description each; select the ones that match your stack.
-- **Required skills — always installed.** The machinery anton itself needs — the `shape`, `scan-triage`, `review-fix`, and `bd` skills — is installed automatically and can't be deselected.
-- **Your own agents are respected.** Agents and skills you already have in the project's `.claude/` or your global `~/.claude/` are discovered, shown as *already present*, and **never overwritten**. Re-running `anton setup` is idempotent — no duplicate installs, no clobbering.
-- **Non-interactive / CI.** When stdin isn't a TTY (scripts, CI), setup skips the prompts and installs just the required defaults, so it stays scriptable.
+- **Bundled agents — you choose.** anton ships specialist agent prompts (`alembic`, `docker`, `fastapi`, `kubernetes`, `nextjs`, `pydantic`, `supabase`, `terraform`). Setup lists them with a one-line description each and prompts for the ones that match your stack (enter numbers, `a` for all, or Enter for none). They land in `~/.claude/agents/<tag>.md`.
+- **Required skills — always installed.** The machinery anton itself needs — the `shape`, `bd`, `scan-triage`, and `review-fix` skills — is installed automatically into `~/.claude/skills/<name>/SKILL.md` and can't be deselected.
+- **Your own files are respected.** Any agent or skill already present at the destination — a prior anton install *or* your own file — is left **byte-for-byte untouched** and reported as *already present*. Re-running `anton setup` is idempotent: no duplicate installs, no clobbering.
+- **Non-interactive / CI.** When stdin isn't a TTY, setup skips the picker and installs just the required skills. Select agents non-interactively with `anton setup --agents nextjs,fastapi` (or `--agents all`); `--no-agents` installs skills only.
 
-**How an agent tag resolves at run time.** When a ticket carries an `agent:<tag>` label, anton loads the prompt for `<tag>` and appends it to the run's system prompt. A user-provided `.claude/agents/<tag>.md` in the target repo takes precedence over anton's bundled prompt of the same name — your customization wins; the bundled prompt is the fallback.
+**How an agent tag resolves at run time.** When a ticket carries an `agent:<tag>` label, anton loads the prompt for `<tag>` and appends it to the run's system prompt, resolving in order: the target project's `.claude/agents/<tag>.md`, then your global `~/.claude/agents/<tag>.md`, then anton's bundled prompt. The first match wins — your customization takes precedence, and anton's bundled copy is always the fallback, so a run works even before setup installs anything.
 
 ## Using anton
 
@@ -134,7 +170,7 @@ Each project has its own settings (under **Settings** for that project). Nothing
 |---------|------------------|
 | **Model** | Which model the headless `claude` driver uses for runs (Opus / Sonnet / Haiku / Fable, or **Default** to use `claude`'s own configured model). |
 | **Seed prompt** | Extra operator guidance layered onto the locked base contract for every run — conventions, things to avoid, where key files live. It customizes *how* epics are approached; it can't override the base contract. Empty = base + agent prompt only. |
-| **Review-fix prompt** | Overrides the default review-fix reasoning prompt (`src/prompts/review-fix.md`). anton appends the concrete PR context beneath it. Empty = the shipped default. |
+| **Review-fix prompt** | Overrides the default review-fix reasoning prompt (`skills/review-fix/SKILL.md`). anton appends the concrete PR context beneath it. Empty = the shipped default. |
 | **Test command** | The command anton runs in a worktree to verify a ticket before committing. |
 | **Base branch** | The branch runs target and open their PRs against (defaults to the repo's detected default branch). |
 | **Max concurrent runs** | How many worktrees run in parallel (1–6). |
