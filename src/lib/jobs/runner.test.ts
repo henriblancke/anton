@@ -12,6 +12,8 @@ import {
   JobRunner,
   nextAction,
   type JobHandler,
+  type JobPolicy,
+  type JobPolicyResolver,
   type RunnerConfig,
 } from "./runner";
 
@@ -97,6 +99,39 @@ describe("JobRunner (live, in-memory db)", () => {
     const r = new JobRunner({ db: tdb.db, clock, config: { ...CONFIG, ...extra } });
     r.registerHandler("execute-epic", handler);
     return r;
+  }
+
+  /** A runner with an injected per-project policy resolver + a roomy global ceiling. */
+  function policyRunner(
+    handler: JobHandler,
+    resolvePolicy: JobPolicyResolver,
+    extra?: Partial<RunnerConfig>,
+  ) {
+    const r = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { ...CONFIG, maxConcurrent: 5, ...extra },
+      resolvePolicy,
+    });
+    r.registerHandler("execute-epic", handler);
+    return r;
+  }
+
+  const policy = (over: Partial<JobPolicy> = {}): JobPolicy => ({
+    concurrency: 1,
+    timeoutMs: Infinity,
+    maxAttempts: 3,
+    ...over,
+  });
+
+  /** Seed project rows so jobs.project_id FK is satisfied when a test scopes jobs to a project. */
+  async function seedProjects(...ids: string[]) {
+    const schema = await import("../db/schema");
+    for (const id of ids) {
+      await tdb.db
+        .insert(schema.projects)
+        .values({ id, slug: id.toLowerCase(), name: id, repoPath: `/tmp/${id}` });
+    }
   }
 
   it("runs a queued job to completion", async () => {
@@ -240,5 +275,64 @@ describe("JobRunner (live, in-memory db)", () => {
     for (let i = 0; i < 5; i++) await r.enqueue({ type: "execute-epic" });
     await r.tickOnce();
     expect(peak).toBeLessThanOrEqual(2);
+  });
+
+  it("gates execute-epic concurrency per project (not globally)", async () => {
+    // Concurrency 1 per project, roomy global ceiling. Two epics for A + one for B are due; a
+    // single tick may lease only one A (its cap) and one B — the second A stays queued.
+    await seedProjects("A", "B");
+    const r = policyRunner(async () => {}, () => policy({ concurrency: 1 }));
+    await r.enqueue({ type: "execute-epic", projectId: "A", payload: { n: 1 } });
+    await r.enqueue({ type: "execute-epic", projectId: "A", payload: { n: 2 } });
+    await r.enqueue({ type: "execute-epic", projectId: "B", payload: { n: 3 } });
+
+    const processed = await r.tickOnce();
+    expect(processed).toBe(2); // one A + one B, not both A's
+
+    const schema = await import("../db/schema");
+    const rows = await tdb.db.select().from(schema.jobs);
+    const queuedA = rows.filter(
+      (j) => j.projectId === "A" && j.status === "queued",
+    );
+    expect(queuedA).toHaveLength(1); // the over-cap A job was left for a later tick
+  });
+
+  it("aborts a job that exceeds its per-project timeout and retries it", async () => {
+    // Handler blocks until aborted; a 20ms timeout fires, aborts it → retryable 'timed out' error.
+    const r = policyRunner(
+      (ctx) =>
+        new Promise<void>((_resolve, reject) => {
+          if (ctx.signal.aborted) return reject(new Error("aborted"));
+          ctx.signal.addEventListener("abort", () => reject(new Error("aborted")));
+        }),
+      () => policy({ timeoutMs: 20 }),
+    );
+    await seedProjects("A");
+    const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
+
+    await r.tickOnce();
+    const job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("queued"); // rescheduled (attempt 1 < maxAttempts)
+    expect(job?.attempts).toBe(1);
+    expect(job?.lastError).toMatch(/timed out/);
+  });
+
+  it("parks after the project's retry budget (per-project maxAttempts overrides config)", async () => {
+    // maxAttempts 1 for this project → a failing job parks on the first attempt, even though the
+    // runner config's maxAttempts is 3.
+    const r = policyRunner(
+      async () => {
+        throw new Error("always fails");
+      },
+      () => policy({ maxAttempts: 1 }),
+    );
+    await seedProjects("A");
+    const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
+
+    await r.tickOnce();
+    const job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("parked");
+    expect(job?.attempts).toBe(1);
+    expect(job?.lastError).toMatch(/failed 1/);
   });
 });

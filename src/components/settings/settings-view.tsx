@@ -14,7 +14,16 @@ interface EditableSettings {
   model?: string;
   seedPrompt?: string;
   reviewFixPrompt?: string;
+  concurrency?: number;
+  jobTimeoutMinutes?: number;
+  maxRetries?: number;
 }
+
+// Defaults mirror the server (src/lib/projects.ts DEFAULT_*); duplicated so this client module
+// stays server-import-free. Keep in sync.
+const DEFAULT_CONCURRENCY = 3;
+const DEFAULT_JOB_TIMEOUT_MINUTES = 120; // 2h
+const DEFAULT_MAX_RETRIES = 3;
 
 /** Default model options for the headless claude driver. Empty value = the CLI's own default. */
 const MODELS: { value: string; label: string; hint?: string }[] = [
@@ -64,7 +73,11 @@ export function SettingsView({
 }) {
   const [active, setActive] = useState<(typeof SECTIONS)[number]["id"]>("general");
   const [agents, setAgents] = useState<Set<string>>(new Set(DEFAULT_ACTIVE));
-  const [concurrency, setConcurrency] = useState(3);
+  const [concurrency, setConcurrency] = useState(settings.concurrency ?? DEFAULT_CONCURRENCY);
+  const [jobTimeoutMinutes, setJobTimeoutMinutes] = useState(
+    settings.jobTimeoutMinutes ?? DEFAULT_JOB_TIMEOUT_MINUTES,
+  );
+  const [maxRetries, setMaxRetries] = useState(settings.maxRetries ?? DEFAULT_MAX_RETRIES);
   const [autonomy, setAutonomy] = useState(true);
   const [automations, setAutomations] = useState<Record<string, boolean>>(
     Object.fromEntries(AUTOMATIONS.map((a) => [a.id, a.on])),
@@ -94,6 +107,9 @@ export function SettingsView({
           model: model || null,
           seedPrompt: seedPrompt.trim() || null,
           reviewFixPrompt: reviewFixPrompt.trim() || null,
+          concurrency,
+          jobTimeoutMinutes,
+          maxRetries,
         }),
       });
       if (!res.ok) {
@@ -285,6 +301,42 @@ export function SettingsView({
                 />
                 <span className="text-[11px] text-subtle">1 — 6 · worktrees run in parallel</span>
               </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <label className="flex flex-col gap-1.5">
+                  <span className="text-[12.5px] text-muted-foreground">Job timeout</span>
+                  <div className="relative flex items-center rounded-[10px] border border-border bg-card focus-within:border-primary/60">
+                    <input
+                      type="number"
+                      min={5}
+                      max={720}
+                      value={jobTimeoutMinutes}
+                      onChange={(e) => setJobTimeoutMinutes(Number(e.target.value))}
+                      aria-label="Job timeout in minutes"
+                      className="w-full rounded-[10px] bg-transparent px-3 py-2 pr-9 font-mono text-[12.5px] text-foreground outline-none"
+                    />
+                    <span className="pointer-events-none absolute right-3 text-[11px] text-subtle">
+                      min
+                    </span>
+                  </div>
+                  <span className="text-[11px] text-subtle">per run · default 120 (2h)</span>
+                </label>
+
+                <label className="flex flex-col gap-1.5">
+                  <span className="text-[12.5px] text-muted-foreground">Retries</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={10}
+                    value={maxRetries}
+                    onChange={(e) => setMaxRetries(Number(e.target.value))}
+                    aria-label="Max retries"
+                    className="rounded-[10px] border border-border bg-card px-3 py-2 font-mono text-[12.5px] text-foreground outline-none focus:border-primary/60"
+                  />
+                  <span className="text-[11px] text-subtle">attempts before parking · default 3</span>
+                </label>
+              </div>
+
               <div className="flex items-center gap-2.5 rounded-[10px] border border-border bg-card px-3 py-2.5">
                 <div className="flex flex-col gap-0.5">
                   <span className="text-[12.5px]">Autonomous execution</span>

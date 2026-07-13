@@ -4,6 +4,12 @@
  * from `src/instrumentation.ts` on server boot; API routes enqueue through the runner. See DESIGN §4.
  */
 import { getDb } from "../db";
+import {
+  DEFAULT_CONCURRENCY,
+  DEFAULT_JOB_TIMEOUT_MINUTES,
+  DEFAULT_MAX_RETRIES,
+  getProjectSettings,
+} from "../projects";
 import { makeExecuteEpicHandler } from "./execute-epic";
 import { makeReviewFixHandler } from "./review-fix";
 import { makeNightlyStringerHandler } from "./nightly-stringer";
@@ -20,10 +26,33 @@ const log: RunnerLogger = {
 let _runner: JobRunner | null = null;
 let _scheduler: Scheduler | null = null;
 
+/**
+ * Global ceiling on total in-flight jobs across all projects — a safety bound above the per-project
+ * caps. Override with ANTON_MAX_CONCURRENT. Must be ≥ the largest project concurrency to not
+ * bottleneck it (default 8 comfortably covers the 1–6 per-project range).
+ */
+const GLOBAL_MAX_CONCURRENT = Number(process.env.ANTON_MAX_CONCURRENT) || 8;
+
+/** Read a project's job policy from its settings, filling in defaults for any unset field. */
+async function resolvePolicy(projectId: string | undefined) {
+  const settings = projectId ? await getProjectSettings(getDb(), projectId) : {};
+  return {
+    concurrency: settings.concurrency ?? DEFAULT_CONCURRENCY,
+    timeoutMs: (settings.jobTimeoutMinutes ?? DEFAULT_JOB_TIMEOUT_MINUTES) * 60_000,
+    maxAttempts: settings.maxRetries ?? DEFAULT_MAX_RETRIES,
+  };
+}
+
 export function getRunner(): JobRunner {
   if (_runner) return _runner;
   const db = getDb();
-  const runner = new JobRunner({ db, clock: systemClock, log });
+  const runner = new JobRunner({
+    db,
+    clock: systemClock,
+    log,
+    config: { maxConcurrent: GLOBAL_MAX_CONCURRENT },
+    resolvePolicy,
+  });
   runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db }));
   runner.registerHandler("review-fix", makeReviewFixHandler({ db }));
   runner.registerHandler("nightly-stringer", makeNightlyStringerHandler({ db }));
