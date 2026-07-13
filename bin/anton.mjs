@@ -379,12 +379,16 @@ function normalizeGitUrl(url) {
  * Point beads' Dolt sync at the repo's git `origin` remote (anton-pns). The Dolt-level remote
  * lives in per-machine, gitignored state (.beads/embeddeddolt), so a clone can't carry it —
  * setup must (re)apply it on every machine. Team defaults (dolt.auto-commit, export.git-add)
- * are committed in .beads/config.yaml, not set here. After configuring, pushes once so
- * refs/dolt/data exists on the git remote. Returns a status object the caller renders:
+ * are committed in .beads/config.yaml, not set here. After configuring, pulls once — the JSONL
+ * exports are gitignored (anton-hg9), so a fresh clone's board is empty until refs/dolt/data is
+ * hydrated — then pushes so refs/dolt/data exists on the git remote. A pull failure is expected
+ * on the very first setup (no refs/dolt/data on the remote yet) and reported, not fatal.
+ * Returns a status object the caller renders:
  *   { status: "no-workspace" }                — no .beads/ at the root (installed bundle): skip
  *   { status: "no-remote" }                   — .beads/ exists but git has no origin: fail loud
  *   { status: "already", url }                — Dolt remote already matches origin: no-op
- *   { status: "configured", url, pushed, pushOutput } — remote added/re-pointed, push attempted
+ *   { status: "configured", url, pulled, pushed, pushOutput } — remote added/re-pointed,
+ *     hydration pull + push attempted
  *   { status: "error", detail }               — `bd dolt remote add` itself failed
  */
 function configureBeadsDoltSync(opts = {}) {
@@ -411,10 +415,16 @@ function configureBeadsDoltSync(opts = {}) {
     return { status: "error", detail: `${add.stdout ?? ""}${add.stderr ?? ""}`.trim() };
   }
 
+  // Hydrate before publishing: with the JSONL exports untracked (anton-hg9), a fresh clone's
+  // board comes from refs/dolt/data, not from files in the clone. Fails benignly when the
+  // remote has no refs/dolt/data yet (first setup ever) — the push below then publishes it.
+  const pull = exec("bd", ["dolt", "pull"]);
+
   const push = exec("bd", ["dolt", "push"]);
   return {
     status: "configured",
     url,
+    pulled: (pull.status ?? 1) === 0,
     pushed: (push.status ?? 1) === 0,
     pushOutput: `${push.stdout ?? ""}${push.stderr ?? ""}`.trim(),
   };
@@ -775,6 +785,11 @@ async function cmdSetup(args = []) {
       break;
     case "configured":
       console.log(`  ${c.green("✓")} Dolt remote ${c.bold("origin")} → ${dolt.url}`);
+      if (dolt.pulled) {
+        console.log(`  ${c.green("✓")} bd dolt pull — board hydrated from refs/dolt/data`);
+      } else {
+        console.log(c.dim("  · bd dolt pull found nothing to hydrate (fine on a first-ever setup)"));
+      }
       if (dolt.pushed) {
         console.log(`  ${c.green("✓")} bd dolt push — refs/dolt/data is on origin`);
       } else {

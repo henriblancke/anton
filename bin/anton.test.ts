@@ -254,17 +254,39 @@ describe("configureBeadsDoltSync (bd/git stubbed — CI has no bd)", () => {
     expect(configureBeadsDoltSync({ repoDir, exec })).toEqual({ status: "no-remote" });
   });
 
-  it("adds the git origin as Dolt remote and pushes refs/dolt", async () => {
+  it("adds the git origin as Dolt remote, hydrates (pull), and pushes refs/dolt", async () => {
     repoDir = await beadsRepo();
     const { exec, calls } = fakeExec({
       "git remote get-url origin": { status: 0, stdout: "git@github.com:org/repo.git\n" },
       "bd dolt remote list": { status: 0, stdout: "No remotes configured.\n" },
       "bd dolt remote add origin": { status: 0, stdout: 'Added remote "origin"' },
+      "bd dolt pull": { status: 0, stdout: "Everything up-to-date." },
       "bd dolt push": { status: 0, stdout: "Push complete." },
     });
     const r = configureBeadsDoltSync({ repoDir, exec });
-    expect(r).toMatchObject({ status: "configured", url: "git@github.com:org/repo.git", pushed: true });
+    expect(r).toMatchObject({
+      status: "configured",
+      url: "git@github.com:org/repo.git",
+      pulled: true,
+      pushed: true,
+    });
     expect(calls).toContain("bd dolt remote add origin git@github.com:org/repo.git");
+    // A fresh clone has no JSONL to hydrate from (anton-hg9): the board must come from
+    // refs/dolt/data, so the pull runs before the push can publish anything local.
+    expect(calls.indexOf("bd dolt pull")).toBeLessThan(calls.indexOf("bd dolt push"));
+  });
+
+  it("treats a failed pull as benign (first-ever setup: no refs/dolt/data on the remote)", async () => {
+    repoDir = await beadsRepo();
+    const { exec } = fakeExec({
+      "git remote get-url origin": { status: 0, stdout: "git@github.com:org/repo.git\n" },
+      "bd dolt remote list": { status: 0, stdout: "No remotes configured.\n" },
+      "bd dolt remote add origin": { status: 0 },
+      "bd dolt pull": { status: 1, stderr: "remote ref refs/dolt/data not found" },
+      "bd dolt push": { status: 0 },
+    });
+    const r = configureBeadsDoltSync({ repoDir, exec });
+    expect(r).toMatchObject({ status: "configured", pulled: false, pushed: true });
   });
 
   it("is idempotent: skips add+push when origin already matches (bd's rewritten form)", async () => {
@@ -288,6 +310,7 @@ describe("configureBeadsDoltSync (bd/git stubbed — CI has no bd)", () => {
       "git remote get-url origin": { status: 0, stdout: "git@github.com:org/new.git\n" },
       "bd dolt remote list": { status: 0, stdout: "origin  git+ssh://git@github.com/./org/old.git\n" },
       "bd dolt remote add origin": { status: 0 },
+      "bd dolt pull": { status: 0 },
       "bd dolt push": { status: 0 },
     });
     const r = configureBeadsDoltSync({ repoDir, exec });
@@ -301,6 +324,7 @@ describe("configureBeadsDoltSync (bd/git stubbed — CI has no bd)", () => {
       "git remote get-url origin": { status: 0, stdout: "git@github.com:org/repo.git\n" },
       "bd dolt remote list": { status: 0, stdout: "No remotes configured.\n" },
       "bd dolt remote add origin": { status: 0 },
+      "bd dolt pull": { status: 0 },
       "bd dolt push": { status: 1, stderr: "Error: push to origin/main: auth required" },
     });
     const r = configureBeadsDoltSync({ repoDir, exec });
