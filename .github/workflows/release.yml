@@ -1,7 +1,10 @@
-# Release on tag (anton-wjf). anton is a local, single-user Next.js app shipped via npm `bin`
-# (`anton` launcher) — there is no compiled/deployed artifact. A `v*` tag runs the same quality
-# gates as CI and cuts a GitHub Release with auto-generated notes, so a tag always corresponds to
-# a green, buildable commit. Uncomment the publish step to also push to npm.
+# Release on tag (anton-wjf, anton-1xp). A `v*` tag runs the quality gates, cuts a GitHub Release,
+# and — the foolery-style install path — builds a PREBUILT per-platform runtime bundle on each
+# target runner and attaches it as a release asset. Users then install with one curl|bash line
+# (scripts/install.sh) and run `anton start` with no toolchain and no build.
+#
+# anton is NOT a compiled single binary: it's a Next.js server + native addons (node-pty,
+# better-sqlite3), so each asset is a prebuilt bundle for one os/arch, built on the matching runner.
 name: release
 
 on:
@@ -10,43 +13,73 @@ on:
       - "v*"
 
 permissions:
-  contents: write # create the GitHub Release
+  contents: write # create the GitHub Release + upload assets
 
 jobs:
-  release:
+  # Gate the tag on green lint/test/build and create the Release the bundle jobs attach to.
+  gates:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: "1.2.20" # match package.json `packageManager`
-
       - name: Install
         run: bun install --frozen-lockfile
-
       - name: Lint
         run: bun run lint
-
       - name: Test
-        # Integration suites that need bd/gh/stringer/claude self-skip when those CLIs are absent
-        # (see the `has(...)` guards); the unit + DB-backed suites still run.
+        # Integration suites that need bd/gh/stringer/claude self-skip when those CLIs are absent.
         run: bun run test
-
       - name: Build
         run: bun run build
-
       - name: Verify the anton CLI launches
         run: node bin/anton.mjs --help
-
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
 
-      # Publish to npm so `npm i -g anton` works from the registry. Requires an NPM_TOKEN secret
-      # and dropping `"private": true` from package.json. Left off by default (local-first app).
-      # - name: Publish to npm
-      #   run: npm publish --provenance --access public
-      #   env:
-      #     NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+  # Build the prebuilt bundle on each target platform and attach it to the Release.
+  bundle:
+    needs: gates
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14 # Apple silicon
+            label: darwin-arm64
+          - os: macos-13 # Intel
+            label: darwin-x64
+          - os: ubuntu-latest
+            label: linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.2.20"
+      - name: Install (with native addon builds for this platform)
+        run: bun install --frozen-lockfile
+      - name: Build Next.js
+        run: bun run build
+      - name: Assemble prebuilt bundle
+        run: node scripts/build-bundle.mjs --skip-build --tag "${{ github.ref_name }}" --platform "${{ matrix.label }}"
+      - name: Attach bundle to the Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/anton-${{ matrix.label }}.tar.gz
+
+  # Optional: publish to npm so `npm i -g anton` also works (source install; builds locally).
+  # Requires an NPM_TOKEN secret and dropping `"private": true` from package.json.
+  # publish-npm:
+  #   needs: gates
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: oven-sh/setup-bun@v2
+  #       with: { bun-version: "1.2.20" }
+  #     - run: bun install --frozen-lockfile
+  #     - run: npm publish --provenance --access public
+  #       env:
+  #         NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -4,23 +4,128 @@
  * anton is a local Next.js server; this launcher bootstraps and runs it from the installed package
  * dir (NOT the user's cwd), so `anton` works from anywhere once installed (`npm i -g` / `bunx`).
  *
- *   anton setup    prereq checks → drizzle migrate (creates/updates anton.db) → node-pty rebuild
+ *   anton setup    prereq checks → drizzle migrate (creates/updates anton.db) → node-pty rebuild →
+ *                  install required skills + selected agents into global ~/.claude (interactive;
+ *                  `--agents <a,b,c>` / `--agents all` / `--no-agents` for non-interactive/CI)
  *   anton doctor   prereq checks only (non-destructive)
  *   anton dev      next dev  (runner + scheduler auto-start via src/instrumentation.ts)
  *   anton start    next build (if stale) → next start
  *   anton --help   usage
  *
+ * `dev`/`start` accept `--port <n>` (alias `-p`, or `PORT=<n>` in the env) to run on a
+ * non-default port; without it the server listens on 3000.
+ *
  * Pure Node, zero deps. Native ESM.
  */
-import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { arch as osArch, homedir, platform as osPlatform } from "node:os";
 import { dirname, join } from "node:path";
+import { createRequire } from "node:module";
+import { createInterface } from "node:readline/promises";
+import { stdin, stdout } from "node:process";
 import { fileURLToPath } from "node:url";
+import { setTimeout as sleep } from "node:timers/promises";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 /** The anton package root = parent of bin/. All commands run here, not in the user's cwd. */
 const APP_ROOT = join(__dirname, "..");
 const BIN = join(APP_ROOT, "node_modules", ".bin");
+
+// ── Distribution / bundle mode (anton-1xp) ──────────────────────────────────────────────────
+// A prebuilt release bundle carries a RELEASE_VERSION marker at its root; a source checkout does
+// not. In bundle mode `start` daemonizes and `stop`/`status`/`update`/`uninstall` manage the
+// installed runtime, and — because the runtime dir is REPLACED wholesale on update — all writable
+// state (anton.db, sessions, scans, logs, pid) lives under a persistent state dir, never in APP_ROOT.
+const RELEASE_VERSION_FILE = join(APP_ROOT, "RELEASE_VERSION");
+const IS_BUNDLE = existsSync(RELEASE_VERSION_FILE);
+const INSTALL_ROOT = process.env.ANTON_HOME ?? join(homedir(), ".local", "share", "anton");
+const STATE_DIR = process.env.ANTON_STATE_DIR ?? join(homedir(), ".local", "state", "anton");
+const LOG_DIR = join(STATE_DIR, "logs");
+const PID_FILE = join(STATE_DIR, "anton.pid");
+const BIN_LINK = process.env.ANTON_BIN_LINK ?? join(homedir(), ".local", "bin", "anton");
+const RELEASE_OWNER = process.env.ANTON_RELEASE_OWNER ?? "henriblancke";
+const RELEASE_REPO = process.env.ANTON_RELEASE_REPO ?? "anton";
+
+/** The release-asset platform label (`<os>-<arch>`), matching scripts/build-bundle.mjs. */
+function platformLabel() {
+  const os = { darwin: "darwin", linux: "linux" }[osPlatform()] ?? osPlatform();
+  const arch = { arm64: "arm64", x64: "x64" }[osArch()] ?? osArch();
+  return `${os}-${arch}`;
+}
+
+/** The installed bundle's version (from RELEASE_VERSION), or null in a source checkout. */
+function bundleVersion() {
+  try {
+    return readFileSync(RELEASE_VERSION_FILE, "utf8").trim();
+  } catch {
+    return null;
+  }
+}
+
+/** Env that redirects anton's writable state OUT of the (replaceable) runtime dir in bundle mode. */
+function bundleStateEnv() {
+  return {
+    ANTON_DB: process.env.ANTON_DB ?? join(STATE_DIR, "anton.db"),
+    ANTON_SESSIONS_ROOT: process.env.ANTON_SESSIONS_ROOT ?? join(STATE_DIR, "sessions"),
+    ANTON_SCANS_ROOT: process.env.ANTON_SCANS_ROOT ?? join(STATE_DIR, "scans"),
+  };
+}
+
+/** Compare dotted versions. Returns 1 if a>b, -1 if a<b, 0 if equal (non-numeric parts ignored). */
+function compareVersions(a, b) {
+  const pa = String(a).replace(/^v/, "").split(".").map((n) => parseInt(n, 10) || 0);
+  const pb = String(b).replace(/^v/, "").split(".").map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (d) return d > 0 ? 1 : -1;
+  }
+  return 0;
+}
+
+/** Read the daemon PID if the process is actually alive; clears a stale pidfile otherwise. */
+function runningPid() {
+  let pid;
+  try {
+    pid = parseInt(readFileSync(PID_FILE, "utf8").trim(), 10);
+  } catch {
+    return null;
+  }
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    process.kill(pid, 0); // signal 0 = existence check
+    return pid;
+  } catch {
+    try { unlinkSync(PID_FILE); } catch {}
+    return null;
+  }
+}
+
+/** Poll until the server answers on the port, or timeout. Best-effort (uses global fetch). */
+async function waitForReady(port, timeoutMs = 30000) {
+  const url = `http://127.0.0.1:${port}/`;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await fetch(url, { signal: AbortSignal.timeout(1500) });
+      return true;
+    } catch {
+      await sleep(500);
+    }
+  }
+  return false;
+}
 
 const c = {
   bold: (s) => `\x1b[1m${s}\x1b[0m`,
@@ -50,6 +155,27 @@ function onPath(cmd) {
   return r.status === 0;
 }
 
+/**
+ * Resolve the port for `dev`/`start` from CLI args, falling back to `PORT`, then Next's own default
+ * (3000, applied by next when we pass nothing). Accepts `--port 4000`, `--port=4000`, or `-p 4000`.
+ * An explicit flag wins over `PORT`. Returns undefined when neither is set (let next default it).
+ */
+function resolvePort(args) {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--port" || a === "-p") return args[i + 1];
+    const m = a.match(/^(?:--port|-p)=(.+)$/);
+    if (m) return m[1];
+  }
+  return process.env.PORT || undefined;
+}
+
+/** Build the `next` arg list for `dev`/`start`, appending `-p <port>` when a port is resolved. */
+function nextArgs(sub, args) {
+  const port = resolvePort(args);
+  return port ? [sub, "-p", String(port)] : [sub];
+}
+
 /** Run a local package bin (next / drizzle-kit) from APP_ROOT, inheriting stdio. Returns exit code. */
 function runLocal(bin, args, env = {}) {
   const exe = join(BIN, bin);
@@ -60,6 +186,403 @@ function runLocal(bin, args, env = {}) {
     env: { ...process.env, ...env },
   });
   return r.status ?? 1;
+}
+
+// ── Agents & skills provisioning (anton setup) ──────────────────────────────────────────────
+// Mirrors src/lib/setup/installer.ts (which the in-app UI uses), reimplemented dependency-free so
+// the launcher stays pure Node and runs before any build. Install target is the user's GLOBAL
+// ~/.claude, so anton's agents/skills are discoverable from every repo `claude` runs in. No-clobber
+// is the invariant: an existing destination (a prior install OR the user's own file) is never
+// overwritten. Keep REQUIRED_SKILLS in sync with REQUIRED_SKILLS in src/lib/claude/prompt.ts.
+const AGENTS_SRC = join(APP_ROOT, "src", "prompts", "agents");
+const SKILLS_SRC = join(APP_ROOT, "skills");
+const REQUIRED_SKILLS = ["shape", "bd", "scan-triage", "review-fix"];
+const CLAUDE_ROOT = join(homedir(), ".claude");
+
+/** Bundled specialist agent tags (basenames of src/prompts/agents/*.md), sorted. */
+function listBundledAgents(agentsSrc = AGENTS_SRC) {
+  try {
+    return readdirSync(agentsSrc)
+      .filter((f) => f.endsWith(".md"))
+      .map((f) => f.slice(0, -".md".length))
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+/** Best-effort one-line description: frontmatter `description:`, else first non-empty body line. */
+function shortDescription(path) {
+  let md;
+  try {
+    md = readFileSync(path, "utf8");
+  } catch {
+    return "";
+  }
+  if (md.startsWith("---\n")) {
+    const end = md.indexOf("\n---", 4);
+    if (end !== -1) {
+      for (const line of md.slice(4, end).split("\n")) {
+        const m = line.match(/^description:\s*(.+)$/);
+        if (m) return m[1].replace(/^["']|["']$/g, "").trim();
+      }
+    }
+  }
+  const body = md.replace(/^---\n[\s\S]*?\n---\n?/, "");
+  for (const line of body.split("\n")) {
+    const t = line.replace(/^#+\s*/, "").trim();
+    if (t) return t;
+  }
+  return "";
+}
+
+/** Copy src→dest unless dest exists (no-clobber). Returns "installed" | "skipped". */
+function installFile(src, dest) {
+  if (existsSync(dest)) return "skipped";
+  mkdirSync(dirname(dest), { recursive: true });
+  copyFileSync(src, dest);
+  return "installed";
+}
+
+/** Parse `--agents <csv|all>` / `--no-agents` from the setup args, or null if unspecified. */
+function agentsFromArgs(args) {
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--no-agents") return [];
+    if (args[i] === "--agents") return args[i + 1];
+    const m = args[i].match(/^--agents=(.*)$/);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+/** Interactive single-shot agent picker over a plain TTY (no arrow-key deps). */
+async function pickAgents(agents, agentsSrc = AGENTS_SRC) {
+  console.log(c.bold("\nBundled specialist agents") + c.dim(" — pick the ones matching your stack:"));
+  agents.forEach((tag, i) => {
+    const desc = shortDescription(join(agentsSrc, `${tag}.md`));
+    const truncated = desc.length > 60 ? desc.slice(0, 57) + "…" : desc;
+    console.log(`  ${String(i + 1).padStart(2)}. ${c.bold(tag.padEnd(11))} ${c.dim(truncated)}`);
+  });
+  console.log(c.dim("  Enter numbers (e.g. 1 3 5), 'a' for all, or press Enter for none."));
+
+  const rl = createInterface({ input: stdin, output: stdout });
+  let answer;
+  try {
+    answer = (await rl.question(c.bold("agents> "))).trim();
+  } finally {
+    rl.close();
+  }
+
+  if (answer === "") return [];
+  if (/^a(ll)?$/i.test(answer)) return agents;
+  const picked = new Set();
+  for (const tok of answer.split(/[\s,]+/).filter(Boolean)) {
+    const n = Number(tok);
+    if (Number.isInteger(n) && n >= 1 && n <= agents.length) picked.add(agents[n - 1]);
+    else console.log(c.yellow(`  (ignoring "${tok}" — not a listed number)`));
+  }
+  return [...picked];
+}
+
+/** Resolve which agents to install: CLI flag > interactive TTY prompt > none (non-TTY). */
+async function resolveAgentSelection(args, agentsSrc = AGENTS_SRC) {
+  const bundled = listBundledAgents(agentsSrc);
+  if (bundled.length === 0) return [];
+
+  const flag = agentsFromArgs(args);
+  if (flag !== null) {
+    if (Array.isArray(flag)) return flag; // --no-agents
+    if (/^all$/i.test(flag)) return bundled;
+    const requested = flag.split(",").map((s) => s.trim()).filter(Boolean);
+    const known = requested.filter((t) => bundled.includes(t));
+    for (const t of requested.filter((t) => !bundled.includes(t))) {
+      console.log(c.yellow(`  (skipping unknown agent "${t}")`));
+    }
+    return known;
+  }
+
+  if (!stdin.isTTY) {
+    console.log(c.dim("\nNon-interactive (no TTY): installing required skills only; skipping agent picker."));
+    console.log(c.dim("  Pass --agents <a,b,c> or --agents all to select agents non-interactively."));
+    return [];
+  }
+  return pickAgents(bundled, agentsSrc);
+}
+
+/**
+ * Provision anton's required skills (always) + the selected specialist agents into the user's
+ * global ~/.claude, never overwriting existing files. Returns 0 (best-effort — a missing bundled
+ * asset warns but doesn't fail setup, since anton also loads its own skills from the package dir).
+ */
+async function provisionAgentsSkills(args, opts = {}) {
+  const claudeRoot = opts.claudeRoot ?? CLAUDE_ROOT;
+  const skillsSrc = opts.skillsSrc ?? (opts.appRoot ? join(opts.appRoot, "skills") : SKILLS_SRC);
+  const agentsSrc =
+    opts.agentsSrc ?? (opts.appRoot ? join(opts.appRoot, "src", "prompts", "agents") : AGENTS_SRC);
+
+  console.log(c.bold("\nInstalling agents & skills into ") + c.bold(claudeRoot) + c.dim(" (no-clobber):"));
+  const selected = await resolveAgentSelection(args, agentsSrc);
+
+  const jobs = [
+    ...REQUIRED_SKILLS.map((name) => ({
+      kind: "skill",
+      name,
+      required: true,
+      src: join(skillsSrc, name, "SKILL.md"),
+      dest: join(claudeRoot, "skills", name, "SKILL.md"),
+    })),
+    ...selected.map((tag) => ({
+      kind: "agent",
+      name: tag,
+      required: false,
+      src: join(agentsSrc, `${tag}.md`),
+      dest: join(claudeRoot, "agents", `${tag}.md`),
+    })),
+  ];
+
+  let installed = 0;
+  let skipped = 0;
+  for (const job of jobs) {
+    if (!existsSync(job.src)) {
+      console.log(`  ${c.yellow("!")} ${job.kind} ${c.bold(job.name)} ${c.yellow("missing from package")} ${c.dim(job.src)}`);
+      continue;
+    }
+    const outcome = installFile(job.src, job.dest);
+    if (outcome === "installed") installed++;
+    else skipped++;
+    const tag = outcome === "installed" ? c.green("installed") : c.dim("already present");
+    const req = job.required ? c.dim(" (required)") : "";
+    console.log(`  ${outcome === "installed" ? c.green("✓") : "·"} ${job.kind.padEnd(5)} ${c.bold(job.name.padEnd(12))} ${tag}${req}`);
+  }
+  console.log(
+    c.dim(`  → ${installed} installed, ${skipped} already present. Existing files are never overwritten.`),
+  );
+  return { installed, skipped, agents: selected };
+}
+
+// ── Bundle-mode migrations + daemon lifecycle (anton-1xp) ───────────────────────────────────
+
+/**
+ * Apply the committed drizzle migration SQL directly via better-sqlite3 (a production dep), so a
+ * prebuilt bundle needs no drizzle-kit (a devDep we don't ship). Idempotent: tracks applied files
+ * in `__anton_migrations` and only runs new ones. Mirrors the SQL-splitting in src/lib/db/testing.ts.
+ */
+function applyMigrations(dbPath, opts = {}) {
+  const appRoot = opts.appRoot ?? APP_ROOT;
+  const require = createRequire(join(appRoot, "package.json"));
+  const Database = require("better-sqlite3");
+  mkdirSync(dirname(dbPath), { recursive: true });
+  const sqlite = new Database(dbPath);
+  try {
+    sqlite.pragma("foreign_keys = ON");
+    sqlite.exec("CREATE TABLE IF NOT EXISTS __anton_migrations (name TEXT PRIMARY KEY, applied_at INTEGER)");
+    const applied = new Set(sqlite.prepare("SELECT name FROM __anton_migrations").all().map((r) => r.name));
+    const dir = join(appRoot, "drizzle");
+    const files = readdirSync(dir).filter((f) => f.endsWith(".sql")).sort();
+    let ran = 0;
+    for (const file of files) {
+      if (applied.has(file)) continue;
+      const raw = readFileSync(join(dir, file), "utf8");
+      const sql = raw.split("--> statement-breakpoint").map((s) => s.trim()).filter(Boolean).join(";\n");
+      const tx = sqlite.transaction(() => {
+        sqlite.exec(sql);
+        sqlite.prepare("INSERT INTO __anton_migrations (name, applied_at) VALUES (?, ?)").run(file, Date.now());
+      });
+      tx();
+      ran++;
+    }
+    return { ran, total: files.length };
+  } finally {
+    sqlite.close();
+  }
+}
+
+/** Daemonize `next start` from the bundle, redirecting output to the persistent state log dir. */
+async function startDaemon(args) {
+  const running = runningPid();
+  const port = resolvePort(args) ?? "3000";
+  if (running) {
+    console.log(c.yellow("anton is already running") + c.dim(` (pid ${running}) → http://localhost:${port}`));
+    return 0;
+  }
+
+  // Ensure the schema exists (idempotent) before the server touches the DB.
+  const stateEnv = bundleStateEnv();
+  try {
+    const { ran } = applyMigrations(stateEnv.ANTON_DB);
+    if (ran) console.log(c.dim(`applied ${ran} migration(s) → ${stateEnv.ANTON_DB}`));
+  } catch (e) {
+    console.log(c.yellow("migration step failed (continuing): ") + c.dim(String(e.message ?? e)));
+  }
+
+  mkdirSync(LOG_DIR, { recursive: true });
+  const out = openSync(join(LOG_DIR, "stdout.log"), "a");
+  const err = openSync(join(LOG_DIR, "stderr.log"), "a");
+
+  // A standalone bundle runs its traced `server.js` (reads PORT/HOSTNAME from the env); a source
+  // checkout falls back to the `next start` binary (-p flag). HOSTNAME is pinned explicitly so we
+  // never inherit the shell's ambient $HOSTNAME (often the machine name) as a bind address.
+  const standaloneServer = join(APP_ROOT, "server.js");
+  const useStandalone = existsSync(standaloneServer);
+  const spawnArgs = useStandalone
+    ? [standaloneServer]
+    : [join(APP_ROOT, "node_modules", "next", "dist", "bin", "next"), "start", "-p", String(port)];
+  const child = spawn("node", spawnArgs, {
+    cwd: APP_ROOT,
+    detached: true,
+    stdio: ["ignore", out, err],
+    env: {
+      ...process.env,
+      NODE_ENV: "production",
+      PORT: String(port),
+      HOSTNAME: process.env.ANTON_HOST ?? "127.0.0.1",
+      ...stateEnv,
+    },
+  });
+  child.unref();
+  mkdirSync(STATE_DIR, { recursive: true });
+  writeFileSync(PID_FILE, String(child.pid));
+  console.log(c.dim(`anton starting (pid ${child.pid})…`));
+
+  const ready = await waitForReady(port);
+  if (ready) {
+    console.log(c.green("✓ anton is up") + ` → ${c.bold(`http://localhost:${port}`)}`);
+  } else {
+    console.log(c.yellow(`started (pid ${child.pid}) but not answering yet`) + c.dim(` — see ${join(LOG_DIR, "stderr.log")}`));
+  }
+  return 0;
+}
+
+/** Stop the running daemon (SIGTERM, then SIGKILL if it lingers). */
+async function cmdStop() {
+  const pid = runningPid();
+  if (!pid) {
+    console.log(c.dim("anton is not running."));
+    return 0;
+  }
+  try { process.kill(pid, "SIGTERM"); } catch {}
+  for (let i = 0; i < 20 && runningPid(); i++) await sleep(150); // up to ~3s grace
+  if (runningPid()) {
+    try { process.kill(pid, "SIGKILL"); } catch {}
+  }
+  try { unlinkSync(PID_FILE); } catch {}
+  console.log(c.green("✓ anton stopped") + c.dim(` (pid ${pid})`));
+  return 0;
+}
+
+/** Print install/runtime/state paths and whether the daemon is running. */
+function cmdStatus(args) {
+  const pid = runningPid();
+  const port = resolvePort(args) ?? "3000";
+  console.log(c.bold("anton status"));
+  console.log(`  version   ${bundleVersion() ?? c.dim("(source checkout)")}`);
+  console.log(`  runtime   ${APP_ROOT}`);
+  console.log(`  state     ${STATE_DIR}`);
+  if (pid) console.log(`  server    ${c.green("running")}${c.dim(` (pid ${pid}) → http://localhost:${port}`)}`);
+  else console.log(`  server    ${c.dim("stopped")}`);
+  return 0;
+}
+
+/** Fetch the latest GitHub release metadata for owner/repo (best-effort; returns null on failure). */
+async function fetchLatestRelease() {
+  const url = `https://api.github.com/repos/${RELEASE_OWNER}/${RELEASE_REPO}/releases/latest`;
+  try {
+    const res = await fetch(url, {
+      headers: { "User-Agent": "anton-cli", Accept: "application/vnd.github+json" },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+/** Download the platform bundle for the newest release and swap the runtime dir in place. */
+async function cmdUpdate() {
+  if (!IS_BUNDLE) {
+    console.log(c.yellow("`anton update` applies to an installed bundle only.") + c.dim(" (source checkout — use git.)"));
+    return 1;
+  }
+  const current = bundleVersion();
+  console.log(c.dim(`current version: ${current}. Checking ${RELEASE_OWNER}/${RELEASE_REPO}…`));
+  const rel = await fetchLatestRelease();
+  if (!rel || !rel.tag_name) {
+    console.log(c.red("could not reach GitHub releases — try again later."));
+    return 1;
+  }
+  const latest = String(rel.tag_name).replace(/^v/, "");
+  if (compareVersions(latest, current) <= 0) {
+    console.log(c.green(`✓ already up to date (v${current}).`));
+    return 0;
+  }
+  const asset = (rel.assets ?? []).find((a) => a.name === `anton-${platformLabel()}.tar.gz`);
+  if (!asset) {
+    console.log(c.red(`no asset anton-${platformLabel()}.tar.gz in release ${rel.tag_name}.`));
+    return 1;
+  }
+
+  console.log(c.dim(`downloading ${asset.name} (v${latest})…`));
+  const tmp = join(INSTALL_ROOT, ".update");
+  rmSync(tmp, { recursive: true, force: true });
+  mkdirSync(tmp, { recursive: true });
+  const tarball = join(tmp, asset.name);
+  try {
+    const res = await fetch(asset.browser_download_url, {
+      headers: { "User-Agent": "anton-cli" },
+      signal: AbortSignal.timeout(120000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    writeFileSync(tarball, Buffer.from(await res.arrayBuffer()));
+  } catch (e) {
+    console.log(c.red(`download failed: ${e.message ?? e}`));
+    return 1;
+  }
+
+  const extractRc = spawnSync("tar", ["-xzf", tarball, "-C", tmp], { stdio: "inherit" }).status ?? 1;
+  const extracted = join(tmp, `anton-${platformLabel()}`);
+  if (extractRc !== 0 || !existsSync(extracted)) {
+    console.log(c.red("extract failed."));
+    return 1;
+  }
+
+  const wasRunning = !!runningPid();
+  if (wasRunning) await cmdStop();
+
+  const runtime = join(INSTALL_ROOT, "runtime");
+  const backup = join(INSTALL_ROOT, "runtime.old");
+  rmSync(backup, { recursive: true, force: true });
+  if (existsSync(runtime)) spawnSync("mv", [runtime, backup], { stdio: "inherit" });
+  spawnSync("mv", [extracted, runtime], { stdio: "inherit" });
+  rmSync(backup, { recursive: true, force: true });
+  rmSync(tmp, { recursive: true, force: true });
+  console.log(c.green(`✓ updated ${current} → ${latest}.`));
+
+  if (wasRunning) {
+    console.log(c.dim("restarting…"));
+    // Re-exec the freshly installed launcher so the new runtime serves.
+    spawnSync("node", [join(runtime, "bin", "anton.mjs"), "start"], { stdio: "inherit" });
+  }
+  return 0;
+}
+
+/** Remove the installed runtime + launcher symlink. Keeps state unless --purge is passed. */
+async function cmdUninstall(args = []) {
+  if (!IS_BUNDLE) {
+    console.log(c.yellow("`anton uninstall` applies to an installed bundle only."));
+    return 1;
+  }
+  if (runningPid()) await cmdStop();
+  rmSync(INSTALL_ROOT, { recursive: true, force: true });
+  try { unlinkSync(BIN_LINK); } catch {}
+  if (args.includes("--purge")) {
+    rmSync(STATE_DIR, { recursive: true, force: true });
+    console.log(c.green("✓ anton uninstalled") + c.dim(` (state purged: ${STATE_DIR})`));
+  } else {
+    console.log(c.green("✓ anton uninstalled."));
+    console.log(c.dim(`  Your data was kept at ${STATE_DIR} — delete it manually, or re-run with --purge.`));
+  }
+  return 0;
 }
 
 /** Prereq check. Returns true when all *required* tools are present. */
@@ -94,7 +617,7 @@ function cmdDoctor() {
   return ok ? 0 : 1;
 }
 
-function cmdSetup() {
+async function cmdSetup(args = []) {
   console.log(c.bold("anton setup"));
   const ok = checkPrereqs();
   if (!ok) {
@@ -102,32 +625,52 @@ function cmdSetup() {
     return 1;
   }
 
-  console.log(c.bold("\nApplying database migrations (drizzle-kit migrate):"));
-  const migrated = runLocal("drizzle-kit", ["migrate"]);
-  if (migrated !== 0) {
-    console.log(c.red("migration failed — see output above."));
-    return migrated;
+  if (IS_BUNDLE) {
+    // Prebuilt bundle: no drizzle-kit (devDep) is shipped, so apply migrations in-process to the
+    // PERSISTENT state DB, and skip the node-pty rebuild (it was built for this platform already).
+    const dbPath = bundleStateEnv().ANTON_DB;
+    console.log(c.bold("\nApplying database migrations:") + c.dim(` ${dbPath}`));
+    try {
+      const { ran, total } = applyMigrations(dbPath);
+      console.log(c.dim(`  ${ran} applied, ${total - ran} already current.`));
+    } catch (e) {
+      console.log(c.red(`migration failed: ${e.message ?? e}`));
+      return 1;
+    }
+  } else {
+    console.log(c.bold("\nApplying database migrations (drizzle-kit migrate):"));
+    const migrated = runLocal("drizzle-kit", ["migrate"]);
+    if (migrated !== 0) {
+      console.log(c.red("migration failed — see output above."));
+      return migrated;
+    }
+
+    // node-pty ships prebuilts that don't always match the local node ABI (DESIGN setup note).
+    // Rebuild it best-effort so the interactive xterm works; a failure here is a warning, not fatal.
+    console.log(c.bold("\nRebuilding node-pty for this node ABI:"));
+    const rebuilt = spawnSync("npm", ["rebuild", "node-pty"], { cwd: APP_ROOT, stdio: "inherit" });
+    if ((rebuilt.status ?? 1) !== 0) {
+      console.log(c.yellow("node-pty rebuild skipped/failed — interactive sessions may not work until you run:"));
+      console.log(c.dim("  cd node_modules/node-pty && npx node-gyp rebuild"));
+    }
   }
 
-  // node-pty ships prebuilts that don't always match the local node ABI (DESIGN setup note).
-  // Rebuild it best-effort so the interactive xterm works; a failure here is a warning, not fatal.
-  console.log(c.bold("\nRebuilding node-pty for this node ABI:"));
-  const rebuilt = spawnSync("npm", ["rebuild", "node-pty"], { cwd: APP_ROOT, stdio: "inherit" });
-  if ((rebuilt.status ?? 1) !== 0) {
-    console.log(c.yellow("node-pty rebuild skipped/failed — interactive sessions may not work until you run:"));
-    console.log(c.dim("  cd node_modules/node-pty && npx node-gyp rebuild"));
-  }
+  await provisionAgentsSkills(args);
 
   console.log(c.green("\n✓ Setup complete.") + " Next: " + c.bold("anton start") + c.dim(" (or `anton dev`)\n"));
   return 0;
 }
 
-function cmdDev() {
+function cmdDev(args) {
   console.log(c.dim("anton dev — starting Next.js dev server (runner + scheduler auto-start)…"));
-  return runLocal("next", ["dev"]);
+  return runLocal("next", nextArgs("dev", args));
 }
 
-function cmdStart() {
+async function cmdStart(args) {
+  // Installed bundle: run as a background daemon (foolery-style) unless --foreground is passed.
+  if (IS_BUNDLE && !args.includes("--foreground")) {
+    return startDaemon(args);
+  }
   const built = existsSync(join(APP_ROOT, ".next"));
   if (!built) {
     console.log(c.dim("no build found — running `next build` first…"));
@@ -135,33 +678,48 @@ function cmdStart() {
     if (b !== 0) return b;
   }
   console.log(c.dim("anton start — starting Next.js server (runner + scheduler auto-start)…"));
-  return runLocal("next", ["start"]);
+  return runLocal("next", nextArgs("start", args));
 }
 
 const USAGE = `${c.bold("anton")} — local autonomous-coding orchestrator
 
 ${c.bold("Usage:")} anton <command>
 
-  ${c.bold("setup")}    check prereqs, run DB migrations, rebuild node-pty
+  ${c.bold("setup")}    check prereqs, migrate DB, rebuild node-pty, install agents & skills  ${c.dim("[--agents <a,b,c>|all]")}
   ${c.bold("doctor")}   check prereqs + anton.db (non-destructive)
-  ${c.bold("dev")}      run the dev server (next dev)
-  ${c.bold("start")}    build if needed, then run the server (next start)
+  ${c.bold("dev")}      run the dev server (next dev)          ${c.dim("[--port <n>]")}
+  ${c.bold("start")}    run the server ${c.dim("(installed: background; source: foreground)")}  ${c.dim("[--port <n>] [--foreground]")}
+  ${c.bold("stop")}     stop the background server             ${c.dim("(installed bundle)")}
+  ${c.bold("status")}   show version, paths, and whether the server is running
+  ${c.bold("update")}   download & install the latest release  ${c.dim("(installed bundle)")}
+  ${c.bold("uninstall")} remove the installed runtime + launcher ${c.dim("[--purge] (keeps data by default)")}
   ${c.bold("--help")}   show this help
 
+${c.dim("Port: dev/start default to 3000; override with --port <n> (alias -p) or PORT=<n>.")}
 The runner + scheduler start automatically with the server (set ANTON_RUNNER=off to disable).
 `;
 
 function main(argv) {
   const cmd = argv[2];
+  const rest = argv.slice(3);
   switch (cmd) {
     case "setup":
-      return cmdSetup();
+      return cmdSetup(rest);
     case "doctor":
       return cmdDoctor();
     case "dev":
-      return cmdDev();
+      return cmdDev(rest);
     case "start":
-      return cmdStart();
+      return cmdStart(rest);
+    case "stop":
+      return cmdStop();
+    case "status":
+      return cmdStatus(rest);
+    case "update":
+    case "upgrade":
+      return cmdUpdate();
+    case "uninstall":
+      return cmdUninstall(rest);
     case "-h":
     case "--help":
     case "help":
@@ -175,4 +733,20 @@ function main(argv) {
   }
 }
 
-process.exit(main(process.argv));
+// Run only when invoked as a script (`anton …`), not when imported by tests. The bin is reached
+// through a symlink (node_modules/.bin or ~/.bun/bin), so compare realpaths.
+const invokedDirectly =
+  process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+if (invokedDirectly) Promise.resolve(main(process.argv)).then((code) => process.exit(code ?? 0));
+
+export {
+  resolvePort,
+  nextArgs,
+  main,
+  agentsFromArgs,
+  provisionAgentsSkills,
+  REQUIRED_SKILLS,
+  compareVersions,
+  platformLabel,
+  applyMigrations,
+};

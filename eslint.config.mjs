@@ -12,6 +12,8 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Prebuilt release bundles (anton-1xp) — generated output, never linted.
+    "dist/**",
   ]),
 ]);
 
