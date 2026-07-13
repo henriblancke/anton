@@ -51,6 +51,36 @@ export async function pushBranch(repoPath: string, branch: string): Promise<void
   await git(repoPath, ["push", "-u", "origin", branch]);
 }
 
+/** Fetch refs from origin (all refs when none given). */
+export async function fetchOrigin(repoPath: string, refs: string[] = []): Promise<void> {
+  await git(repoPath, ["fetch", "origin", ...refs]);
+}
+
+/**
+ * Merge `ref` into the branch checked out in `worktreePath`. A conflicted merge is left in
+ * progress (markers in the tree, MERGE_HEAD set) and the conflicted paths are returned — the
+ * caller has claude resolve the markers and a later `commitAll` concludes the merge. A merge that
+ * fails for any other reason (e.g. untracked files in the way) is aborted and rethrown.
+ */
+export async function mergeIntoCurrent(
+  worktreePath: string,
+  ref: string,
+  opts?: { ffOnly?: boolean },
+): Promise<{ ok: boolean; conflicts: string[] }> {
+  try {
+    await git(worktreePath, ["merge", "--no-edit", ...(opts?.ffOnly ? ["--ff-only"] : []), ref]);
+    return { ok: true, conflicts: [] };
+  } catch (e) {
+    const out = await git(worktreePath, ["diff", "--name-only", "--diff-filter=U"]).catch(() => "");
+    const conflicts = out.split("\n").map((l) => l.trim()).filter(Boolean);
+    if (conflicts.length === 0) {
+      await git(worktreePath, ["merge", "--abort"]).catch(() => {});
+      throw e;
+    }
+    return { ok: false, conflicts };
+  }
+}
+
 /**
  * True when `branch` has local commits not yet on `origin/<branch>` — i.e. there is work to push.
  * Used by review-fix to decide whether a prior (crash/retry) fix is still unpushed even when the

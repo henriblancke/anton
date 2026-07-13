@@ -14,14 +14,18 @@ import { loadAgentPrompt } from "../claude/agent-prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
 import { runClaude, type ClaudeEvent } from "../claude/driver";
 import { loadSkill } from "../claude/prompt";
-import { branchAheadOfRemote, commitAll, pushBranch } from "../git/ops";
+import { branchAheadOfRemote, commitAll, fetchOrigin, mergeIntoCurrent, pushBranch } from "../git/ops";
 import {
+  ANTON_MARK,
   classifyReview,
   commentOnPr,
   getPrReview,
   prNumberFromRef,
   reRequestReview,
+  replyToReviewComment,
+  resolveReviewThread,
   reviewersRequestingChanges,
+  threadsNeedingAttention,
   type PrReview,
 } from "../git/pr";
 import { createWorktree } from "../git/worktree";
@@ -91,7 +95,18 @@ export function makeReviewFixHandler(deps: ReviewFixDeps): JobHandler {
     for (const epic of epics) {
       await ctx.heartbeat();
       try {
-        await handleEpic({ db, clock, ctx, repo, projectId, epic, settings, branchPrefix, all });
+        await handleEpic({
+          db,
+          clock,
+          ctx,
+          repo,
+          projectId,
+          epic,
+          settings,
+          branchPrefix,
+          baseBranch: settings.baseBranch ?? project.defaultBranch,
+          all,
+        });
       } catch (e) {
         if (isUsageLimitError(e)) throw e; // stop the sweep; runner reschedules past the reset.
         lastError = e;
@@ -114,9 +129,11 @@ async function handleEpic(args: {
   epic: Bead;
   settings: ProjectSettings;
   branchPrefix: string;
+  /** Base branch for conflict pre-merges (project setting, else the repo's default branch). */
+  baseBranch: string | undefined;
   all: Bead[];
 }): Promise<void> {
-  const { db, clock, ctx, repo, projectId, epic, settings, branchPrefix, all } = args;
+  const { db, clock, ctx, repo, projectId, epic, settings, branchPrefix, baseBranch, all } = args;
   const number = prNumberFromRef(epic.external_ref);
   if (number === undefined) return;
 
@@ -133,6 +150,23 @@ async function handleEpic(args: {
     baseBranch: settings.baseBranch,
     warm: false,
   });
+  await ctx.heartbeat();
+
+  // Sync with origin (reviewers may have pushed to the PR branch) and, when GitHub reports the PR
+  // CONFLICTING, pre-merge the base so claude only has conflict markers to resolve. Both are
+  // best-effort: a repo with no reachable origin still gets the review-comment flow.
+  const base = baseBranch;
+  await safe(() => fetchOrigin(worktree.path, base ? [base, branch] : [branch]));
+  await safe(() => mergeIntoCurrent(worktree.path, `origin/${branch}`, { ffOnly: true }));
+  let conflicts: string[] = [];
+  if (pr.mergeable === "CONFLICTING" && base) {
+    try {
+      const merge = await mergeIntoCurrent(worktree.path, `origin/${base}`);
+      conflicts = merge.conflicts; // clean auto-merge → a merge commit is pushed below
+    } catch (e) {
+      consoleLog.error(`PR #${number}: merging origin/${base} failed`, e);
+    }
+  }
   await ctx.heartbeat();
 
   const sessionId = randomUUID();
@@ -166,7 +200,7 @@ async function handleEpic(args: {
     // The editable reasoning contract (per-project override, else the shipped default) followed by
     // the concrete PR context anton fetched.
     const reasoning = settings.reviewFixPrompt?.trim() || (await loadSkill("review-fix"));
-    const prompt = [reasoning, "", "---", "", reviewFixContext(epic, pr, verdict.reasons)].join("\n");
+    const prompt = [reasoning, "", "---", "", reviewFixContext(epic, pr, verdict.reasons, conflicts)].join("\n");
 
     const result = await runClaude({
       cwd: worktree.path,
@@ -188,23 +222,46 @@ async function handleEpic(args: {
       if (!test.ok) throw new Error(`tests failed after review-fix for PR #${number} (exit ${test.code})`);
     }
 
+    const report = parseThreadReport(result.text);
+
     const { committed } = await commitAll(worktree.path, `${epic.id}: address review feedback (PR #${number})`);
     // Push if this run committed OR a prior attempt left commits unpushed (e.g. a push failed after
     // committing, then the retry's claude produced no new diff). Otherwise there is genuinely
     // nothing to send — treat that as a clean no-op, not a silent skip of pending work.
-    const pending = committed || (await branchAheadOfRemote(repo, branch));
-    if (!pending) {
+    const pushed = committed || (await branchAheadOfRemote(repo, branch));
+    if (pushed) await pushBranch(repo, branch);
+
+    // Per-thread replies, resolving the fixed ones. Replying to declined threads (even when
+    // nothing was pushed) is what stops them being re-triaged every sweep — an unresolved thread
+    // whose last comment is anton's is no longer actionable (see threadsNeedingAttention). A
+    // "fixed" claim without a push is a fabrication — leave that thread untouched.
+    const waiting = threadsNeedingAttention(pr);
+    for (const item of report) {
+      const thread = waiting.find((t) => t.id === item.id);
+      const anchor = thread?.comments[0];
+      if (!thread || !anchor) continue;
+      if (item.outcome === "fixed" && !pushed) continue;
+      const note =
+        item.reply?.trim() ||
+        (item.outcome === "fixed" ? "addressed in the latest push" : "left as-is");
+      await safe(() => replyToReviewComment(repo, number, anchor.id, `${ANTON_MARK} ${note}`, ctx.signal));
+      if (item.outcome === "fixed") {
+        await safe(() => resolveReviewThread(repo, thread.id, ctx.signal));
+      }
+      await appendSessionLog(logPath, `[review-fix] thread ${thread.id}: ${item.outcome} — ${note}\n`);
+    }
+
+    if (!pushed) {
       await appendSessionLog(logPath, `[review-fix] no changes produced; leaving PR #${number} as-is\n`);
       await endSession(db, clock, sessionId, "done");
       return;
     }
 
-    await pushBranch(repo, branch);
     await safe(() =>
       commentOnPr(
         repo,
         number,
-        `🤖 anton pushed a fix for the review feedback (${verdict.reasons.join("; ")}). Please re-review.`,
+        `${ANTON_MARK} anton pushed a fix for the review feedback (${verdict.reasons.join("; ")}). Please re-review.`,
         ctx.signal,
       ),
     );
@@ -225,12 +282,47 @@ function labelValue(labels: string[] | undefined, prefix: string): string | unde
   return l ? l.slice(prefix.length + 1) : undefined;
 }
 
+/** One reported outcome for an inline review thread, parsed from claude's final message. */
+export interface ThreadOutcome {
+  id: string;
+  outcome: "fixed" | "left" | "needs-human";
+  reply?: string;
+}
+
+/**
+ * Parse the per-thread outcome report claude is asked (in reviewFixContext) to end its final
+ * message with: the LAST fenced ```json block containing {"threads":[…]}. Tolerant by design —
+ * any malformed/missing report yields [] and the job falls back to the generic PR comment.
+ */
+export function parseThreadReport(text: string | undefined): ThreadOutcome[] {
+  if (!text) return [];
+  const blocks = [...text.matchAll(/```json\s*\n([\s\S]*?)```/g)];
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    try {
+      const parsed = JSON.parse(blocks[i][1]) as { threads?: unknown };
+      if (!Array.isArray(parsed.threads)) continue;
+      return parsed.threads.filter(
+        (t): t is ThreadOutcome =>
+          typeof t === "object" &&
+          t !== null &&
+          typeof (t as ThreadOutcome).id === "string" &&
+          ["fixed", "left", "needs-human"].includes((t as ThreadOutcome).outcome),
+      );
+    } catch {
+      // not the report block — keep scanning backwards.
+    }
+  }
+  return [];
+}
+
 /**
  * The concrete PR context appended beneath the (editable) reasoning contract: which epic/PR, why
- * it needs action, the reviewer summaries + inline comments + failing checks. The reasoning of HOW
- * to resolve lives in the review-fix prompt (default file or settings override), not here.
+ * it needs action, the reviewer summaries + unresolved inline threads + failing checks + merge
+ * conflicts, and the per-thread reporting format anton parses afterwards. The reasoning of HOW to
+ * resolve lives in the review-fix prompt (default file or settings override), not here — the
+ * reporting format lives HERE so operator overrides of the reasoning can't break the protocol.
  */
-function reviewFixContext(epic: Bead, pr: PrReview, reasons: string[]): string {
+function reviewFixContext(epic: Bead, pr: PrReview, reasons: string[], conflicts: string[] = []): string {
   const lines: string[] = [
     `## This PR`,
     ``,
@@ -248,17 +340,45 @@ function reviewFixContext(epic: Bead, pr: PrReview, reasons: string[]): string {
     lines.push(``);
   }
 
-  if (pr.comments.length > 0) {
-    lines.push(`Inline review comments:`);
-    for (const c of pr.comments) {
-      const loc = c.path ? `${c.path}${c.line ? `:${c.line}` : ""}` : "(general)";
-      lines.push(`- ${loc} — @${c.author}: ${c.body.trim()}`);
+  const threads = threadsNeedingAttention(pr);
+  if (threads.length > 0) {
+    lines.push(`Unresolved review threads (already-resolved threads are omitted):`);
+    for (const t of threads) {
+      const loc = t.path ? `${t.path}${t.line ? `:${t.line}` : ""}` : "(general)";
+      lines.push(`- [thread ${t.id}] ${loc}${t.isOutdated ? " (outdated diff)" : ""}`);
+      for (const c of t.comments) lines.push(`  - @${c.author}: ${c.body.trim()}`);
     }
     lines.push(``);
   }
 
   if (pr.failingChecks.length > 0) {
-    lines.push(`Failing CI checks: ${pr.failingChecks.join(", ")}.`);
+    lines.push(`Failing CI checks: ${pr.failingChecks.join(", ")}.`, ``);
+  }
+
+  if (conflicts.length > 0) {
+    lines.push(
+      `Merge conflicts: the base branch was merged into this worktree and left conflict markers`,
+      `in the following files. Resolve the markers (pick the semantically correct result — never`,
+      `blindly one side); the merge is concluded for you afterwards:`,
+      ...conflicts.map((f) => `- ${f}`),
+      ``,
+    );
+  }
+
+  if (threads.length > 0) {
+    lines.push(
+      `## Reporting format (required)`,
+      ``,
+      `End your final message with a fenced json block reporting each thread listed above:`,
+      ``,
+      "```json",
+      `{"threads":[{"id":"<thread id>","outcome":"fixed" | "left" | "needs-human","reply":"one-line note for the reviewer"}]}`,
+      "```",
+      ``,
+      `Use "fixed" only for threads you actually changed code for, "left" for findings you`,
+      `deliberately did not act on, "needs-human" when a decision is required. The reply is posted`,
+      `on the thread verbatim.`,
+    );
   }
 
   return lines.join("\n").trimEnd();

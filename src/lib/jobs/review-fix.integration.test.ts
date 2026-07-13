@@ -93,7 +93,9 @@ suite("review-fix e2e (real handler · real bd/git · fake claude/gh)", () => {
     await beads.tag(repo, epicId, [LABELS.stage("in-review")]);
     await beads.setExternalRef(repo, epicId, "gh-7");
 
-    // Fake claude: apply a fix in the worktree + dump its args so we can assert the prompt.
+    // Fake claude: apply a fix in the worktree + dump its args so we can assert the prompt. Ends
+    // with the per-thread json report anton parses to reply/resolve threads.
+    const report = '{"threads":[{"id":"RT_1","outcome":"fixed","reply":"renamed foo to bar"}]}';
     const fakeClaude = writeBin(
       binDir,
       "claude",
@@ -104,25 +106,34 @@ if(process.env.ANTON_TEST_CLAUDE_ARGV) fs.appendFileSync(process.env.ANTON_TEST_
 const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
 e({type:'system',subtype:'init',session_id:'s'});
 e({type:'assistant',message:{content:[{type:'text',text:'resolved feedback'}]}});
-e({type:'result',subtype:'success',result:'done',session_id:'s',is_error:false});
+e({type:'result',subtype:'success',result:'done\\n\\n\`\`\`json\\n${report}\\n\`\`\`',session_id:'s',is_error:false});
 process.exit(0);`,
     );
 
-    // Fake gh: pr view (CHANGES_REQUESTED + failing build), repo view, api comments, pr comment,
-    // re-request reviewers. Logs the notify calls so the test can assert them.
+    // Fake gh: pr view (CHANGES_REQUESTED + failing build), repo view, graphql review threads +
+    // resolve mutation, thread replies, pr comment, re-request reviewers. Logs the notify calls so
+    // the test can assert them.
     const fakeGh = writeBin(
       binDir,
       "gh",
-      `const fs=require('fs');const a=process.argv.slice(2);
+      `const fs=require('fs');const a=process.argv.slice(2);const q=a.join(' ');
 const log=m=>{if(process.env.FAKE_GH_LOG)fs.appendFileSync(process.env.FAKE_GH_LOG,m+'\\n');};
 if(a[0]==='pr'&&a[1]==='view'){
-  console.log(JSON.stringify({number:7,state:'OPEN',reviewDecision:'CHANGES_REQUESTED',headRefName:process.env.FAKE_BRANCH,url:'https://github.com/acme/repo/pull/7',
+  console.log(JSON.stringify({number:7,state:'OPEN',reviewDecision:'CHANGES_REQUESTED',mergeable:'MERGEABLE',headRefName:process.env.FAKE_BRANCH,url:'https://github.com/acme/repo/pull/7',
     reviews:[{author:{login:'alice'},state:'CHANGES_REQUESTED',body:'rename foo to bar'}],
     statusCheckRollup:[{__typename:'CheckRun',name:'build',status:'COMPLETED',conclusion:'FAILURE'}]}));
   process.exit(0);
 }
 if(a[0]==='repo'&&a[1]==='view'){console.log('acme/repo');process.exit(0);}
-if(a[0]==='api'&&a.some(x=>String(x).endsWith('/comments'))){console.log('[]');process.exit(0);}
+if(a[0]==='api'&&a[1]==='graphql'){
+  if(q.includes('resolveReviewThread')){log('resolve');console.log('{}');process.exit(0);}
+  console.log(JSON.stringify({data:{repository:{pullRequest:{reviewThreads:{nodes:[
+    {id:'RT_1',isResolved:false,isOutdated:false,path:'feature.txt',line:1,
+     comments:{nodes:[{databaseId:100,author:{login:'alice'},body:'rename foo to bar here too'}]}}
+  ]}}}}}));
+  process.exit(0);
+}
+if(a.some(x=>String(x).includes('/replies'))){log('reply');console.log('{}');process.exit(0);}
 if(a[0]==='pr'&&a[1]==='comment'){log('comment');process.exit(0);}
 if(a[0]==='api'&&a.includes('--method')){log('rerequest');process.exit(0);}
 process.exit(0);`,
@@ -161,7 +172,7 @@ process.exit(0);`,
     rmSync(sandbox, { recursive: true, force: true });
   });
 
-  it("resolves an actionable PR: claude fix → commit → push → comment + re-request", async () => {
+  it("resolves an actionable PR: claude fix → commit → push → thread reply/resolve + comment + re-request", async () => {
     const runner = new JobRunner({ db: tdb.db, clock, config: { maxConcurrent: 1, leaseMs: 30_000 } });
     runner.registerHandler("review-fix", makeReviewFixHandler({ db: tdb.db, clock }));
 
@@ -184,6 +195,8 @@ process.exit(0);`,
     expect(invocations[0].prompt).toContain("review feedback");
     expect(invocations[0].prompt).toContain("rename foo to bar");
     expect(invocations[0].prompt).toContain("build"); // failing check surfaced
+    expect(invocations[0].prompt).toContain("thread RT_1"); // inline thread surfaced with its id
+    expect(invocations[0].prompt).toContain("Reporting format"); // per-thread report requested
     expect(invocations[0].append).toContain("operating contract"); // locked base system prompt
 
     // The fix was committed on the branch and pushed to origin.
@@ -192,8 +205,11 @@ process.exit(0);`,
     });
     expect(remoteLog).toContain("address review feedback");
 
-    // Notify calls fired.
+    // Notify calls fired: the fixed thread got a reply + was resolved, plus the PR-level comment
+    // and the reviewer re-request.
     const ghLog = readFileSync(join(sandbox, "gh.log"), "utf8");
+    expect(ghLog).toContain("reply");
+    expect(ghLog).toContain("resolve");
     expect(ghLog).toContain("comment");
     expect(ghLog).toContain("rerequest");
 
