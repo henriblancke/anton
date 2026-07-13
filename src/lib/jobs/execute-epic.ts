@@ -144,6 +144,13 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         });
       }
       throw e; // let the runner apply job-level durability
+    } finally {
+      // Every bd write above (claims, closes, stage labels, PR ref) must reach the remote even
+      // when the run failed mid-way. Logged, not thrown: a push failure must not mask the run's
+      // own error or fail a run whose real work (branch + PR) already landed.
+      await beads
+        .sync(repo)
+        .catch((e) => console.error(`[execute-epic] beads dolt sync failed for ${epicBeadId}`, e));
     }
   };
 }

@@ -82,8 +82,10 @@ suite("execute-epic e2e (real handler · real bd/git · fake claude/gh)", () => 
     g(["remote", "add", "origin", bare]);
     g(["push", "-q", "-u", "origin", "main"]);
 
-    // beads: epic (approved) + two tickets under it.
+    // beads: epic (approved) + two tickets under it. The git `origin` doubles as the Dolt
+    // remote (as `anton setup` wires it), so the run's explicit beads.sync is exercised too.
     execFileSync("bd", ["init"], { cwd: repo, stdio: "ignore" });
+    execFileSync("bd", ["dolt", "remote", "add", "origin", bare], { cwd: repo, stdio: "ignore" });
     epicId = await beads.create(repo, {
       title: "Ship feature X",
       type: "epic",
@@ -223,6 +225,11 @@ process.exit(0);`,
     );
     expect(log).toContain(`${t1}:`);
     expect(log).toContain(`${t2}:`);
+
+    // The run's bd writes (claims, closes, stage labels) were pushed to the Dolt remote
+    // explicitly by beads.sync — refs/dolt/data exists on origin without any git hook firing.
+    const allRefs = execFileSync("git", ["-C", repo, "ls-remote", "origin"], { encoding: "utf8" });
+    expect(allRefs).toContain("refs/dolt/data");
 
     // Two execute sessions recorded + logged.
     const sessions = await tdb.db.select().from(schema.sessions);

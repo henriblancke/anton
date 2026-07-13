@@ -98,6 +98,12 @@ export function makeReviewFixHandler(deps: ReviewFixDeps): JobHandler {
         consoleLog.error(`epic ${epic.id} (PR fix) failed; continuing sweep`, e);
       }
     }
+    // The claude sessions above may have written beads (notes, bd remember); push them.
+    // Logged, not thrown — a sync hiccup must not shadow (or fabricate) a sweep failure.
+    await beads
+      .sync(repo)
+      .catch((e) => consoleLog.error("beads dolt sync failed after review-fix sweep", e));
+
     // Surface a non-quota failure so the job retries/parks — but only after trying every epic.
     if (lastError) {
       throw lastError instanceof Error ? lastError : new Error(String(lastError));

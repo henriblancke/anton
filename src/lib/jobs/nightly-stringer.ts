@@ -9,6 +9,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
+import { beads } from "../beads/bd";
 import { getProjectById, getProjectSettings } from "../projects";
 import { loadSkill } from "../claude/prompt";
 import { runClaude, type ClaudeEvent } from "../claude/driver";
@@ -96,6 +97,11 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
       if (!claudeResult.ok) {
         throw new Error(`scan-triage reported an error: ${claudeResult.text ?? "unknown"}`);
       }
+
+      // The triage session wrote its beads via `bd`; push them to the Dolt remote.
+      await beads
+        .sync(project.repoPath)
+        .catch((e) => console.error("[nightly-stringer] beads dolt sync failed", e));
 
       await endSession(db, clock, sessionId, "done");
     } catch (e) {

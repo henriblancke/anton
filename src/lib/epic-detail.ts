@@ -114,4 +114,9 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
 export async function deleteEpic(project: Project, epicId: string): Promise<void> {
   await beads.show(project.repoPath, epicId); // 404 guard — bd throws on an unknown id
   await beads.delete(project.repoPath, epicId, { cascade: true });
+  await beads
+    .sync(project.repoPath)
+    .catch((e) =>
+      console.error(`[epic-detail] beads dolt sync failed after deleting ${epicId}`, e),
+    );
 }
