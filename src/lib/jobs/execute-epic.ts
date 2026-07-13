@@ -187,6 +187,10 @@ async function runTicket(args: {
     void appendSessionLog(logPath, line).catch(() => {});
   };
 
+  // Claim the ticket before the session so the board shows it in-flight (idempotent on resume).
+  await safe(() => beads.setStatus(repo, ticket.id, "in_progress"));
+  await safe(() => beads.tag(repo, ticket.id, [LABELS.stage("implementing")]));
+
   try {
     const result = await runClaude({
       cwd: worktreePath,

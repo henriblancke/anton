@@ -317,7 +317,10 @@ process.exit(0);`,
       const run2 = runsForEpic.find((r) => r.epicBeadId === epic2)!;
       expect(run2.status).toBe("parked");
       expect(existsSync(run2.worktreePath!)).toBe(true); // worktree kept for resume
-      expect((await beads.show(repo, ticket2)).status).not.toBe("closed");
+      // The ticket was claimed before the session ran: visible in-flight state on the board.
+      const claimed = await beads.show(repo, ticket2);
+      expect(claimed.status).toBe("in_progress");
+      expect(claimed.labels ?? []).toContain("stage:implementing");
 
       // Not due yet.
       expect(await runner.tickOnce()).toBe(0);
