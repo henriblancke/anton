@@ -66,6 +66,17 @@ export function ShapeView({ slug, projectName }: { slug: string; projectName: st
         const data = await res.json().catch(() => null);
         throw new Error(data?.error ?? `create failed (${res.status})`);
       }
+      // Navigating away unmounts PtyTerminal, which only aborts the SSE stream — the live pty
+      // (and the `claude` process behind it) outlives the page unless we kill it explicitly.
+      // `keepalive` lets the DELETE finish even though the push tears this component down.
+      if (sessionId) {
+        void fetch(`/api/projects/${slug}/sessions/${sessionId}/pty`, {
+          method: "DELETE",
+          keepalive: true,
+        }).catch(() => {
+          /* best-effort teardown — the pty exits on its own if this never lands */
+        });
+      }
       toast.success("Draft landed in backlog — approve it when you're ready.");
       router.push(`/projects/${slug}`);
     } catch (err) {
