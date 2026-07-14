@@ -20,6 +20,8 @@ export interface JobSummary {
   projectId?: string;
   /** Epic the job targets, when the payload names one (execute-epic, scoped review-fix). */
   epicBeadId?: string;
+  /** Schedule that fired this job, when cron-enqueued (nightly-stringer, orphan-grooming, review-fix). */
+  scheduleId?: string;
   attempts: number;
   lastError?: string;
   /** Epoch seconds. When the job entered the queue — its start marker. */
@@ -41,12 +43,15 @@ function toEpoch(value: unknown): number {
   return Number(value);
 }
 
-/** Pull `epicBeadId` out of the JSON payload without throwing on malformed data. */
-function epicFromPayload(payloadJson: string | null | undefined): string | undefined {
+/** Pull a string field out of the JSON payload without throwing on malformed data. */
+function stringFromPayload(
+  payloadJson: string | null | undefined,
+  key: "epicBeadId" | "scheduleId",
+): string | undefined {
   if (!payloadJson) return undefined;
   try {
-    const parsed = JSON.parse(payloadJson) as { epicBeadId?: unknown };
-    return typeof parsed.epicBeadId === "string" ? parsed.epicBeadId : undefined;
+    const parsed = JSON.parse(payloadJson) as Record<string, unknown>;
+    return typeof parsed[key] === "string" ? (parsed[key] as string) : undefined;
   } catch {
     return undefined;
   }
@@ -58,7 +63,8 @@ export function toJobSummary(row: typeof schema.jobs.$inferSelect): JobSummary {
     type: row.type as JobType,
     status: row.status as JobStatus,
     projectId: row.projectId ?? undefined,
-    epicBeadId: epicFromPayload(row.payloadJson),
+    epicBeadId: stringFromPayload(row.payloadJson, "epicBeadId"),
+    scheduleId: stringFromPayload(row.payloadJson, "scheduleId"),
     attempts: row.attempts,
     lastError: row.lastError ?? undefined,
     createdAt: toEpoch(row.createdAt),

@@ -47,6 +47,12 @@ describe("toJobSummary", () => {
     expect(s.epicBeadId).toBe("anton-abc");
   });
 
+  it("extracts scheduleId from a cron-enqueued payload (nightly-stringer etc.)", () => {
+    const s = toJobSummary(row({ payloadJson: JSON.stringify({ projectId: "p1", scheduleId: "sched-9" }) }));
+    expect(s.scheduleId).toBe("sched-9");
+    expect(s.epicBeadId).toBeUndefined();
+  });
+
   it("tolerates malformed or epic-less payloads without throwing", () => {
     expect(toJobSummary(row({ payloadJson: "not json" })).epicBeadId).toBeUndefined();
     expect(toJobSummary(row({ payloadJson: null as unknown as string })).epicBeadId).toBeUndefined();

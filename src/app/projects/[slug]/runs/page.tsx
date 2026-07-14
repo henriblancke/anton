@@ -4,14 +4,14 @@ import { SquareTerminalIcon } from "lucide-react";
 
 import { getProjectBySlug } from "@/lib/projects";
 import { listRuns, type RunStatus, type RunSummary } from "@/lib/runs";
-import { isActiveJob, listJobs, type JobStatus, type JobSummary } from "@/lib/jobs-view";
+import { listJobs } from "@/lib/jobs-view";
 import { cn } from "@/lib/utils";
 import { fmtDuration, isActiveRun } from "@/components/runs/run-view-utils";
-import { ResumeJobButton } from "@/components/runs/resume-job-button";
+import { JobGroup } from "@/components/runs/job-group";
 
 export const dynamic = "force-dynamic";
 
-const STATUS_STYLE: Record<RunStatus | JobStatus, { dot: string; text: string; pulse?: boolean }> = {
+const STATUS_STYLE: Record<RunStatus, { dot: string; text: string; pulse?: boolean }> = {
   running: { dot: "bg-stage-implementing", text: "text-stage-implementing", pulse: true },
   queued: { dot: "bg-stage-backlog", text: "text-muted-foreground" },
   parked: { dot: "bg-risk-med", text: "text-risk-med" },
@@ -96,64 +96,6 @@ function RunGroup({ label, runs, slug }: { label: string; runs: RunSummary[]; sl
         ))}
       </ul>
     </section>
-  );
-}
-
-/**
- * All queue activity from the `jobs` table — every type (execute-epic, review-fix,
- * nightly-stringer, orphan-grooming) and every status, so parked/failed jobs stay auditable even
- * when they never wrote a `runs` row. Reads the same table the runner mutates, so status is
- * always consistent with the runner (anton-ner.3).
- */
-function JobGroup({ jobs, slug }: { jobs: JobSummary[]; slug: string }) {
-  return (
-    <section>
-      <div className="flex items-center gap-2 border-b border-border bg-card/30 px-6 py-2">
-        <span className="font-mono text-[10px] tracking-[0.05em] text-subtle uppercase">Jobs</span>
-        <span className="font-mono text-[10px] text-subtle">{jobs.length}</span>
-      </div>
-      <ul className="flex flex-col divide-y divide-border">
-        {jobs.map((job) => (
-          <JobRow key={job.id} job={job} slug={slug} />
-        ))}
-      </ul>
-    </section>
-  );
-}
-
-function JobRow({ job, slug }: { job: JobSummary; slug: string }) {
-  const style = STATUS_STYLE[job.status];
-  const finished = !isActiveJob(job.status);
-  // Parked/failed jobs are recoverable but not self-healing — offer a manual resume (anton-ner.4).
-  const resumable = job.status === "parked" || job.status === "failed";
-  return (
-    <li className="flex items-center gap-4 px-6 py-3.5">
-      <span
-        className={cn("size-2 shrink-0 rounded-full", style.dot, style.pulse && "anton-pulse")}
-        aria-hidden="true"
-      />
-      <div className="flex min-w-0 flex-col gap-0.5">
-        <span className="truncate font-mono text-[13px]">{job.type}</span>
-        <span className="truncate font-mono text-[11px] text-subtle">
-          {job.epicBeadId ? `${job.epicBeadId} · ` : ""}
-          {job.attempts} {job.attempts === 1 ? "attempt" : "attempts"}
-          {job.lastError ? ` · ${job.lastError}` : ""}
-        </span>
-      </div>
-      {resumable && (
-        <div className="ml-auto shrink-0">
-          <ResumeJobButton slug={slug} jobId={job.id} />
-        </div>
-      )}
-      <div className={cn("flex shrink-0 flex-col items-end gap-0.5", !resumable && "ml-auto")}>
-        <span className={cn("font-mono text-[11px]", style.text)}>{job.status}</span>
-        <span className="font-mono text-[10px] text-subtle">
-          {finished
-            ? `${fmtDuration(job.createdAt, job.updatedAt)} · ${relativeTime(job.updatedAt)}`
-            : relativeTime(job.createdAt)}
-        </span>
-      </div>
-    </li>
   );
 }
 
