@@ -433,6 +433,29 @@ function applyMigrations(dbPath, opts = {}) {
   }
 }
 
+/**
+ * Apply any pending DB migrations before the server serves — so `anton start` never runs on a
+ * stale schema and operators don't have to remember `anton setup`. Mirrors cmdSetup's branching:
+ * a prebuilt bundle applies the committed SQL in-process (no drizzle-kit devDep is shipped), while
+ * a source checkout uses drizzle-kit. Idempotent — a start with nothing pending is a clean no-op.
+ * Throws on failure so the caller can abort rather than serve a stale schema. (The bundle DAEMON
+ * path migrates in startDaemon; this covers source `start` and bundle `--foreground`.)
+ */
+function ensureMigrated(opts = {}) {
+  const isBundle = opts.isBundle ?? IS_BUNDLE;
+  if (isBundle) {
+    const dbPath = opts.dbPath ?? bundleStateEnv().ANTON_DB;
+    const { ran } = applyMigrations(dbPath, { appRoot: opts.appRoot });
+    if (ran) console.log(c.dim(`applied ${ran} migration(s) → ${dbPath}`));
+    return { ran };
+  }
+  // Source checkout: drizzle-kit tracks applied migrations in __drizzle_migrations, so re-running
+  // with nothing pending is a no-op. A non-zero exit (bad SQL, unreachable DB) must fail start.
+  const rc = runLocal("drizzle-kit", ["migrate"]);
+  if (rc !== 0) throw new Error("drizzle-kit migrate failed — see output above");
+  return { ran: null };
+}
+
 /** Daemonize `next start` from the bundle, redirecting output to the persistent state log dir. */
 async function startDaemon(args) {
   const running = runningPid();
@@ -725,9 +748,22 @@ function cmdDev(args) {
 
 async function cmdStart(args) {
   // Installed bundle: run as a background daemon (foolery-style) unless --foreground is passed.
+  // (startDaemon applies pending migrations before spawning the server.)
   if (IS_BUNDLE && !args.includes("--foreground")) {
     return startDaemon(args);
   }
+
+  // Apply pending migrations before serving so start never runs on a stale schema and operators
+  // don't have to remember `anton setup`. Fail loud — a stale-schema server would only serve 500s.
+  try {
+    ensureMigrated();
+  } catch (e) {
+    console.log(c.red("\n✗ Cannot start: database migrations failed."));
+    console.log(c.red(`  ${String(e.message ?? e)}`));
+    console.log(c.dim("  (fix the above, then re-run `anton start`.)"));
+    return 1;
+  }
+
   const built = existsSync(join(APP_ROOT, ".next"));
   if (!built) {
     console.log(c.dim("no build found — running `next build` first…"));
@@ -811,5 +847,6 @@ export {
   compareVersions,
   platformLabel,
   applyMigrations,
+  ensureMigrated,
   ensureBetterSqlite3,
 };

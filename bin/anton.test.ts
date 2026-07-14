@@ -15,6 +15,7 @@ import {
   applyMigrations,
   compareVersions,
   ensureBetterSqlite3,
+  ensureMigrated,
   nextArgs,
   platformLabel,
   provisionAgentsSkills,
@@ -163,6 +164,27 @@ describe("applyMigrations (in-process, no drizzle-kit)", () => {
     } finally {
       sqlite.close();
     }
+  });
+});
+
+describe("ensureMigrated (bundle mode → in-process apply, before serving)", () => {
+  let dir: string;
+  afterEach(async () => {
+    if (dir) await rm(dir, { recursive: true, force: true });
+  });
+
+  it("applies pending migrations, then is a clean no-op on the next start", async () => {
+    dir = await mkdtemp(join(tmpdir(), "anton-start-mig-"));
+    const dbPath = join(dir, "anton.db");
+
+    // Bundle branch: apply the real committed SQL in-process (no drizzle-kit), like `anton start`.
+    const first = ensureMigrated({ isBundle: true, dbPath, appRoot: REPO_ROOT });
+    expect(first.ran).toBeGreaterThan(0);
+    expect(await exists(dbPath)).toBe(true);
+
+    // Re-running start with nothing pending applies zero migrations.
+    const second = ensureMigrated({ isBundle: true, dbPath, appRoot: REPO_ROOT });
+    expect(second.ran).toBe(0);
   });
 });
 
