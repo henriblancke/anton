@@ -74,3 +74,24 @@ export function SettingsIcon({ className }: { className?: string }) {
     </svg>
   );
 }
+
+export function JobsIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 16 16"
+      className={className}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.3}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M8 2l5.5 3L8 8 2.5 5 8 2z" />
+      <path d="M2.5 8L8 11l5.5-3" />
+      <path d="M2.5 11L8 14l5.5-3" />
+    </svg>
+  );
+}

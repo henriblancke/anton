@@ -42,21 +42,16 @@ function absTime(epoch?: number): string {
  * All queue activity from the `jobs` table — every type (execute-epic, review-fix,
  * nightly-stringer, orphan-grooming) and every status, so parked/failed jobs stay auditable even
  * when they never wrote a `runs` row (anton-ner.3). Rows expand to show the full lastError +
- * metadata, so a failed scan is diagnosable without touching the DB.
+ * metadata, so a failed scan is diagnosable without touching the DB. Rendered on its own paginated
+ * Jobs page, so no section chrome here — just the row list.
  */
-export function JobGroup({ jobs, slug }: { jobs: JobSummary[]; slug: string }) {
+export function JobList({ jobs, slug }: { jobs: JobSummary[]; slug: string }) {
   return (
-    <section>
-      <div className="flex items-center gap-2 border-b border-border bg-card/30 px-6 py-2">
-        <span className="font-mono text-[10px] tracking-[0.05em] text-subtle uppercase">Jobs</span>
-        <span className="font-mono text-[10px] text-subtle">{jobs.length}</span>
-      </div>
-      <ul className="flex flex-col divide-y divide-border">
-        {jobs.map((job) => (
-          <JobRow key={job.id} job={job} slug={slug} />
-        ))}
-      </ul>
-    </section>
+    <ul className="flex flex-col divide-y divide-border">
+      {jobs.map((job) => (
+        <JobRow key={job.id} job={job} slug={slug} />
+      ))}
+    </ul>
   );
 }
 
