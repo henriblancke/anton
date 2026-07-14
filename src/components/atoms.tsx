@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 
 import { cn } from "@/lib/utils";
 import type { Stage } from "@/lib/types";
+import { formatExactTime, formatRelativeTime } from "@/lib/time";
 import { STAGE_ACCENT_DOT, STAGE_LABELS, STAGE_TEXT, agentDotClass } from "@/components/board/board-utils";
 
 type ChipTone = "neutral" | "risk-high" | "risk-med" | "blocked" | "pr" | "done";
@@ -157,6 +158,22 @@ export function Toggle({
         )}
       />
     </button>
+  );
+}
+
+/**
+ * Relative "created" time ("3m ago") with the exact timestamp on hover, as a semantic `<time>`.
+ * Shared by every surface that shows when a ticket/epic was created so wording never diverges.
+ * Falls back to "unknown" when the timestamp is missing or unparseable.
+ */
+export function RelativeTime({ iso, className }: { iso: string | null | undefined; className?: string }) {
+  const relative = formatRelativeTime(iso);
+  const exact = formatExactTime(iso);
+  if (!relative) return <span className={className}>unknown</span>;
+  return (
+    <time dateTime={iso ?? undefined} title={exact ?? undefined} className={className}>
+      {relative}
+    </time>
   );
 }
 
