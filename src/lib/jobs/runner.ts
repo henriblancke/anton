@@ -14,6 +14,7 @@
 import {
   complete,
   enqueue,
+  enqueueExecuteEpicDeduped,
   getJob,
   leaseDue,
   park,
@@ -202,6 +203,15 @@ export class JobRunner {
   /** Enqueue a job on this runner's DB/clock. */
   enqueue(input: { type: JobType; projectId?: string; payload?: unknown; runAt?: number }) {
     return enqueue(this.db, this.clock, input);
+  }
+
+  /**
+   * Enqueue an execute-epic run, deduped against any active (queued|running) job for the same
+   * project + epic. Returns the existing job's id when one is active; else creates a fresh job.
+   * Race-safe via a transactional guard + partial unique index (anton-761).
+   */
+  enqueueExecuteEpic(projectId: string, epicBeadId: string): string {
+    return enqueueExecuteEpicDeduped(this.db, this.clock, projectId, epicBeadId);
   }
 
   /**

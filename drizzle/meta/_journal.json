@@ -8,6 +8,13 @@
       "when": 1783787807208,
       "tag": "0000_lumpy_captain_flint",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1783999392007,
+      "tag": "0001_dapper_kid_colt",
+      "breakpoints": true
     }
   ]
 }

@@ -73,11 +73,11 @@ export function startRunner(): void {
   getScheduler().start();
 }
 
-/** Enqueue an execute-epic job for an approved epic. Returns the job id. */
+/**
+ * Enqueue an execute-epic job for an approved epic. Returns the job id — the existing one when an
+ * active (queued|running) run for this epic already exists, so a double approval or retrigger can't
+ * spawn duplicate concurrent runs (anton-761).
+ */
 export function enqueueExecuteEpic(projectId: string, epicBeadId: string): Promise<string> {
-  return getRunner().enqueue({
-    type: "execute-epic",
-    projectId,
-    payload: { projectId, epicBeadId },
-  });
+  return Promise.resolve(getRunner().enqueueExecuteEpic(projectId, epicBeadId));
 }

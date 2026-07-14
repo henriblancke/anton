@@ -75,6 +75,87 @@ export async function enqueue(
   return id;
 }
 
+/** The active statuses that must hold at most one execute-epic job per (project, epic). */
+const ACTIVE_STATUSES = ["queued", "running"] as const;
+
+/** Is `e` a SQLite UNIQUE-constraint violation (the partial-index backstop firing)? */
+function isUniqueViolation(e: unknown): boolean {
+  const code = (e as { code?: string })?.code;
+  return code === "SQLITE_CONSTRAINT_UNIQUE" || code === "SQLITE_CONSTRAINT";
+}
+
+/** Id of the currently-active execute-epic job for this project + epic, if any. */
+function activeExecuteEpicId(
+  tx: Pick<AntonDb, "select">,
+  projectId: string,
+  epicBeadId: string,
+): string | undefined {
+  const rows = tx
+    .select({ id: schema.jobs.id })
+    .from(schema.jobs)
+    .where(
+      and(
+        eq(schema.jobs.type, "execute-epic"),
+        eq(schema.jobs.projectId, projectId),
+        inArray(schema.jobs.status, [...ACTIVE_STATUSES]),
+        eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
+      ),
+    )
+    .limit(1)
+    .all();
+  return rows[0]?.id;
+}
+
+/**
+ * Enqueue an execute-epic run, deduped against any already-active job for the same project + epic.
+ * Returns the existing job's id (inserting no new row) when a `queued`/`running` execute-epic job
+ * exists for that epic; otherwise inserts a fresh `queued` job and returns its id. Prior
+ * done/parked/failed jobs don't block a new run.
+ *
+ * The select-existing + insert run in one better-sqlite3 transaction. That connection is single and
+ * synchronous, so the read→write pair can't interleave — two near-simultaneous approvals serialize
+ * and yield exactly one active job. The partial unique index `jobs_active_epic_unique` is the
+ * DB-level backstop; if an insert ever races past the guard it raises UNIQUE, which we absorb by
+ * returning the row that won. See anton-761.
+ */
+export function enqueueExecuteEpicDeduped(
+  db: AntonDb,
+  clock: Clock,
+  projectId: string,
+  epicBeadId: string,
+): string {
+  const nowMs = clock.now();
+  try {
+    return db.transaction((tx) => {
+      const existing = activeExecuteEpicId(tx, projectId, epicBeadId);
+      if (existing) return existing;
+
+      const id = randomUUID();
+      tx.insert(schema.jobs)
+        .values({
+          id,
+          type: "execute-epic",
+          projectId,
+          payloadJson: JSON.stringify({ projectId, epicBeadId }),
+          status: "queued",
+          runAt: secDate(nowMs),
+          attempts: 0,
+          createdAt: secDate(nowMs),
+          updatedAt: secDate(nowMs),
+        })
+        .run();
+      return id;
+    });
+  } catch (e) {
+    // Backstop: the index rejected a concurrent insert. Return the job that won the race.
+    if (isUniqueViolation(e)) {
+      const winner = activeExecuteEpicId(db, projectId, epicBeadId);
+      if (winner) return winner;
+    }
+    throw e;
+  }
+}
+
 /**
  * Atomically lease up to `limit` runnable jobs and return them. Runnable =
  *   • `queued` and due (runAt ≤ now), OR
