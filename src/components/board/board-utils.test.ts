@@ -27,7 +27,15 @@ describe("STAGE_ACCENT_DOT", () => {
 });
 
 describe("ticketBadges", () => {
-  const base: Ticket = { id: "bd-1", title: "Do the thing", status: "open", stage: "backlog" };
+  const base: Ticket = {
+    id: "bd-1",
+    title: "Do the thing",
+    status: "open",
+    stage: "backlog",
+    assignee: null,
+    createdAt: "",
+    createdBy: null,
+  };
 
   it("returns no badges when no fields are set", () => {
     expect(ticketBadges(base)).toEqual([]);
@@ -61,7 +69,15 @@ describe("badgeVariant", () => {
 });
 
 describe("ticketDotTitle", () => {
-  const base: Ticket = { id: "bd-1", title: "Do the thing", status: "open", stage: "backlog" };
+  const base: Ticket = {
+    id: "bd-1",
+    title: "Do the thing",
+    status: "open",
+    stage: "backlog",
+    assignee: null,
+    createdAt: "",
+    createdBy: null,
+  };
 
   it("includes only the title when no metadata is set", () => {
     expect(ticketDotTitle(base)).toBe("Do the thing");
@@ -88,7 +104,18 @@ describe("isExternalUrl", () => {
 describe("moveEpicBetweenColumns", () => {
   function makeColumns(): Record<Stage, Epic[]> {
     return {
-      backlog: [{ id: "e1", title: "Epic 1", approved: false, stage: "backlog", tickets: [] }],
+      backlog: [
+        {
+          id: "e1",
+          title: "Epic 1",
+          approved: false,
+          stage: "backlog",
+          assignee: null,
+          createdAt: "",
+          createdBy: null,
+          tickets: [],
+        },
+      ],
       implementing: [],
       "in-review": [],
       done: [],
@@ -110,7 +137,16 @@ describe("moveEpicBetweenColumns", () => {
 
   it("prepends the moved epic in the destination column", () => {
     const columns = makeColumns();
-    columns.done.push({ id: "e2", title: "Epic 2", approved: true, stage: "done", tickets: [] });
+    columns.done.push({
+      id: "e2",
+      title: "Epic 2",
+      approved: true,
+      stage: "done",
+      assignee: null,
+      createdAt: "",
+      createdBy: null,
+      tickets: [],
+    });
     const next = moveEpicBetweenColumns(columns, "e1", "done");
     expect(next.done.map((e) => e.id)).toEqual(["e1", "e2"]);
   });

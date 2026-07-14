@@ -48,7 +48,7 @@ Plus two scheduled background jobs, per project:
 - **nightly-stringer** — scans the repo for actionable signals (`stringer scan --delta`) and triages the few worth doing into well-formed beads.
 - **orphan-grooming** — buckets loose tickets (no parent epic) under a grooming epic so they become approvable work.
 
-**beads is the source of truth for work.** Epics, tickets, approval, stage, and the PR link all live in each repo's `.beads/` (queried via `bd`). anton's own SQLite (`anton.db`) holds only machine-local execution state: projects, runs, jobs, schedules, and sessions — it's disposable and git-ignored.
+**beads is the source of truth for work.** Epics, tickets, approval, stage, and the PR link all live in each repo's `.beads/` (queried via `bd`). Beads state syncs between machines via Dolt — `refs/dolt/data` on the git remote, configured by `anton setup` — so a fresh clone hydrates its board with `bd dolt pull`, not from files in the clone. The `.beads/*.jsonl` files are passive local exports for viewers: git-ignored, regenerated, and never the source of truth. anton's own SQLite (`anton.db`) holds only machine-local execution state: projects, runs, jobs, schedules, and sessions — it's disposable and git-ignored.
 
 ## Feature walkthrough
 
@@ -156,6 +156,7 @@ The **job runner and cron scheduler start automatically** with the server (via `
 
 ```
 anton setup     check prereqs, migrate DB, install agents & skills   [--agents <a,b,c>|all]
+anton init      configure beads in a target repo + register it       [path] [--prefix <p>]
 anton doctor    check prereqs + anton.db (non-destructive)
 anton dev       run the dev server (next dev)                         [--port <n>]
 anton start     run the server — bundle: background, source: foreground  [--port <n>] [--foreground]
@@ -177,11 +178,20 @@ Run in a real terminal, `anton setup` is **interactive**: after the prereq, migr
 
 **How an agent tag resolves at run time.** When a ticket carries an `agent:<tag>` label, anton loads the prompt for `<tag>` and appends it to the run's system prompt, resolving in order: the target project's `.claude/agents/<tag>.md`, then your global `~/.claude/agents/<tag>.md`, then anton's bundled prompt. The first match wins — your customization takes precedence, and anton's bundled copy is always the fallback, so a run works even before setup installs anything.
 
+### `anton setup` vs `anton init`
+
+Two different scopes — run each at its own layer:
+
+- **`anton setup` configures the anton runtime itself** — once per machine. It checks prereqs, migrates `anton.db`, heals native modules, and installs anton's skills & agents into your global `~/.claude/`. It doesn't touch any of your repos.
+- **`anton init [path]` configures one target repo for anton to drive** — run it per project. It enforces anton's committed **beads** team-config (`bd init` when `.beads/` is absent → `config.yaml` keys → `.beads/.gitignore` → Dolt remote wiring over `origin`) and registers the repo with anton so it appears on the projects board. It's the terminal equivalent of adding a project from the UI — both converge to the same end state — and every step is idempotent, so a re-run (or a run on an already-configured repo) is a no-op. It needs `bd`, a git repo, and an `origin` remote; a missing one fails loud with the fix.
+
+**Git hooks are optional for anton-driven repos.** beads normally installs `post-merge`/`post-checkout` hooks to hydrate Dolt on pull/checkout, but anton's runner pushes Dolt explicitly on every write, so hydration hooks are redundant for a repo anton drives. If a hooks manager (husky/lefthook) or a custom `core.hooksPath` already owns the repo's hooks, `anton init` **warns and prints the manual chaining steps rather than rewriting your hooks** — you can safely ignore it for anton-driven repos, or chain `bd hooks run` in yourself if you also work the repo by hand.
+
 ## Using anton
 
 Once the server is up at `http://localhost:3000`, a full turn of work looks like this:
 
-1. **Add a project.** From the projects screen, add a local repo that has a `.beads/` directory (run `bd init` in it first if it doesn't). anton records the repo path and detects its default branch; beads and git in that repo are never modified by adding it.
+1. **Add a project.** From the projects screen, add a local repo that has a `.beads/` directory — or run **`anton init <path>`** in a terminal, which configures beads there and registers the repo in one step (see [`anton setup` vs `anton init`](#anton-setup-vs-anton-init)). Adding a repo from the UI records its path and detects its default branch; it self-heals the beads team-config but never rewrites your git history.
 2. **Shape an epic.** Click **Add work** to open an interactive `/shape` session in the browser terminal. You talk through the idea with `claude`; it writes an epic — Goal, Acceptance, and child tickets — into the repo's beads. The epic lands in **backlog**, unapproved.
 3. **Review and approve.** Open the epic on the board and read its Goal, Acceptance, and tickets. When it's right, click **Approve**. This is the gate: **anton only ever executes approved epics.** Nothing runs against your code until you approve.
 4. **Watch it run.** On approval the epic moves to **implementing** and anton enqueues a run per ticket. Each run gets its own git worktree, drives `claude` (base contract + your seed prompt + the ticket's agent prompt) to implement the ticket, runs your test command, commits, and opens a PR. A live terminal streams the session; the board shows progress. When every ticket is done the epic moves to **in-review** with its PR link.

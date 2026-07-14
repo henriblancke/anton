@@ -1,6 +1,7 @@
 /**
  * anton.db — ephemeral, machine-local execution state (git-ignored, disposable).
- * The shareable truth (epics/tickets, approval, stage, PR link) lives in beads (.beads/*.jsonl).
+ * The shareable truth (epics/tickets, approval, stage, PR link) lives in beads — a Dolt DB
+ * synced via refs/dolt/data on the git remote (.beads/*.jsonl is only a passive local export).
  * See DESIGN.md §3.
  */
 import { sql } from "drizzle-orm";

@@ -112,6 +112,10 @@ export function makeOrphanGroomingHandler(deps: OrphanGroomingDeps): JobHandler 
       ? `orphan-grooming: bucketed ${linked} loose ticket(s); ${failed.length} failed to link (${failed.join(", ")}).`
       : `orphan-grooming: bucketed ${linked} loose ticket(s).`;
     await safe(() => beads.note(repo, epicId!, noteBody));
+
+    await beads
+      .sync(repo)
+      .catch((e) => console.error("[orphan-grooming] beads dolt sync failed", e));
   };
 }
 

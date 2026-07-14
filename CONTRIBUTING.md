@@ -9,6 +9,8 @@ bun install          # install dependencies (also installs the husky pre-commit 
 anton setup          # prereq checks, DB migrations, node-pty rebuild
 ```
 
+`anton setup` configures **the anton runtime itself** (this machine's `anton.db` + global `~/.claude` skills/agents) and is run once. To configure **a target repo for anton to drive**, run `anton init <path>` in that repo instead — it enforces the beads team-config and registers the repo with anton (the terminal equivalent of adding a project from the UI; both are idempotent and converge to the same state). Note that git hooks are **optional** for anton-driven repos: the runner pushes Dolt on every write, so `anton init` only warns (never rewrites) when a hooks manager owns the repo's hooks. See the README's [`anton setup` vs `anton init`](./README.md#anton-setup-vs-anton-init) for the full breakdown.
+
 anton is a Next.js app; during development use the scripts directly:
 
 ```bash
@@ -55,3 +57,10 @@ bd close <id>        # complete work
 ```
 
 Run `bd prime` for the full workflow context and session-close protocol.
+
+**How beads state syncs:** the issue database is Dolt, and it syncs through
+`refs/dolt/data` on the git remote — not through committed files. `anton setup`
+points the Dolt remote at git `origin` and hydrates a fresh clone with
+`bd dolt pull`. The `.beads/*.jsonl` files are passive, git-ignored local
+exports for viewers; never commit them and never treat them as the source of
+truth.
