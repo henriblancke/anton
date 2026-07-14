@@ -12,7 +12,7 @@ import { Button, buttonVariants } from "@/components/ui/button";
 import { ConfirmDeleteButton } from "@/components/ui/confirm-delete-button";
 import { CopyButton } from "@/components/ui/copy-button";
 import { agentDotClass, ticketProgress } from "@/components/board/board-utils";
-import { MetaChip, PrLink, RiskChip, StagePill } from "@/components/atoms";
+import { MetaChip, PrLink, RelativeTime, RiskChip, StagePill } from "@/components/atoms";
 import { DependencyGraph } from "@/components/epic/dependency-graph";
 import { TicketDialog } from "@/components/ticket/ticket-dialog";
 
@@ -267,6 +267,27 @@ export function EpicDetailView({ slug, epicId }: { slug: string; epicId: string 
               <LegendItem className="bg-subtle" label={`${todo} to do`} />
             </div>
           </div>
+
+          {/* claimed-by + created — mirrors the ticket surfaces */}
+          <dl className="flex flex-col gap-2">
+            <div className="flex items-baseline gap-2 text-[12.5px]">
+              <dt className="w-20 shrink-0">
+                <SectionLabel>Claimed by</SectionLabel>
+              </dt>
+              <dd className={cn(epic.assignee ? "text-foreground/85" : "text-subtle")}>
+                {epic.assignee ?? "Unclaimed"}
+              </dd>
+            </div>
+            <div className="flex items-baseline gap-2 text-[12.5px]">
+              <dt className="w-20 shrink-0">
+                <SectionLabel>Created</SectionLabel>
+              </dt>
+              <dd className="text-foreground/85">
+                <RelativeTime iso={epic.createdAt} />
+                {epic.createdBy && <span className="text-subtle"> by {epic.createdBy}</span>}
+              </dd>
+            </div>
+          </dl>
 
           {epic.goal && (
             <div className="flex flex-col gap-2">

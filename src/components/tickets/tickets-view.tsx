@@ -3,19 +3,22 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { CheckIcon, ListTodoIcon, PlusIcon, TriangleAlertIcon } from "lucide-react";
+import { ArrowDownIcon, ArrowUpIcon, CheckIcon, ListTodoIcon, PlusIcon, TriangleAlertIcon } from "lucide-react";
 
 import type { Stage, TicketRow } from "@/lib/types";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { agentDotClass } from "@/components/board/board-utils";
+import { RelativeTime } from "@/components/atoms";
 import { TicketDialog } from "@/components/ticket/ticket-dialog";
 import { CopyButton } from "@/components/ui/copy-button";
 import { TicketsFilters } from "@/components/tickets/tickets-filters";
 import {
   countActiveFilters,
   filtersFromSearchParams,
+  sortTicketsByCreated,
   ticketsQueryString,
+  type TicketSort,
 } from "@/components/tickets/tickets-utils";
 
 export function TicketsView({ slug }: { slug: string }) {
@@ -133,7 +136,15 @@ export function TicketsView({ slug }: { slug: string }) {
   );
 }
 
-const GRID = "grid grid-cols-[26px_minmax(0,1fr)_92px_150px_120px_72px_60px] items-center gap-3";
+const GRID =
+  "grid grid-cols-[26px_minmax(0,1fr)_88px_128px_104px_104px_88px_52px_44px] items-center gap-3";
+
+/** Cycles the created-date sort: unsorted → newest first → oldest first → unsorted. */
+function nextSort(current: TicketSort | null): TicketSort | null {
+  if (current === null) return "created-desc";
+  if (current === "created-desc") return "created-asc";
+  return null;
+}
 
 function TicketsTable({
   slug,
@@ -144,6 +155,9 @@ function TicketsTable({
   tickets: TicketRow[];
   onOpenTicket: (ticketId: string) => void;
 }) {
+  const [sort, setSort] = useState<TicketSort | null>(null);
+  const rows = sort ? sortTicketsByCreated(tickets, sort) : tickets;
+
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div
@@ -157,11 +171,28 @@ function TicketsTable({
         <span>ID</span>
         <span>Epic</span>
         <span>Agent</span>
+        <span>Claimed by</span>
+        <button
+          type="button"
+          onClick={() => setSort(nextSort)}
+          aria-label={
+            sort === "created-desc"
+              ? "Sorted by created, newest first"
+              : sort === "created-asc"
+                ? "Sorted by created, oldest first"
+                : "Sort by created date"
+          }
+          className="inline-flex items-center gap-1 uppercase transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+        >
+          Created
+          {sort === "created-desc" && <ArrowDownIcon className="size-3" aria-hidden="true" />}
+          {sort === "created-asc" && <ArrowUpIcon className="size-3" aria-hidden="true" />}
+        </button>
         <span>Risk</span>
         <span>Size</span>
       </div>
       <ul className="min-h-0 flex-1 overflow-y-auto">
-        {tickets.map((ticket, i) => {
+        {rows.map((ticket, i) => {
           const isDone = ticket.stage === "done";
           const isEpic = ticket.type === "epic";
           const titleClass = cn(
@@ -216,6 +247,16 @@ function TicketsTable({
                   <span className="text-subtle">—</span>
                 )}
               </span>
+              <span
+                className={cn(
+                  "truncate font-mono text-[11px]",
+                  ticket.assignee ? "text-muted-foreground" : "text-subtle",
+                )}
+                title={ticket.assignee ?? "Unclaimed"}
+              >
+                {ticket.assignee ?? "Unclaimed"}
+              </span>
+              <RelativeTime iso={ticket.createdAt} className="font-mono text-[11px] text-muted-foreground" />
               <span
                 className={cn(
                   "font-mono text-[11px]",
@@ -292,6 +333,8 @@ function TicketsSkeleton() {
           <span className="anton-shimmer h-2.5 w-12 rounded" />
           <span className="anton-shimmer h-2.5 w-20 rounded" />
           <span className="anton-shimmer h-2.5 w-16 rounded" />
+          <span className="anton-shimmer h-2.5 w-16 rounded" />
+          <span className="anton-shimmer h-2.5 w-12 rounded" />
           <span className="anton-shimmer h-2.5 w-8 rounded" />
           <span className="anton-shimmer h-2.5 w-6 rounded" />
         </div>

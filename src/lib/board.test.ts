@@ -84,6 +84,9 @@ describe("getBoard", () => {
       description: "## Goal\nShip the thing.\n\n## Out of scope\nEverything else.",
       acceptance: "It ships.",
       labels: ["approved"],
+      assignee: "carol",
+      created_at: "2026-07-12T09:00:00Z",
+      created_by: "dave",
     });
     const epic2 = makeBead({
       id: "epic-2",
@@ -99,6 +102,9 @@ describe("getBoard", () => {
       parent: "epic-1",
       labels: ["agent:nextjs", "risk:high", "size:S"],
       acceptance: "Works.",
+      assignee: "alice",
+      created_at: "2026-07-13T10:00:00Z",
+      created_by: "bob",
     });
     const ticket2 = makeBead({
       id: "ticket-2",
@@ -136,6 +142,15 @@ describe("getBoard", () => {
       size: "S",
       acceptance: "Works.",
       stage: "implementing",
+      assignee: "alice",
+      createdAt: "2026-07-13T10:00:00Z",
+      createdBy: "bob",
+    });
+    // The epic itself carries the same claimed-by + created metadata.
+    expect(backlogEpic!).toMatchObject({
+      assignee: "carol",
+      createdAt: "2026-07-12T09:00:00Z",
+      createdBy: "dave",
     });
 
     const doneEpic = board.columns.done.find((e) => e.id === "epic-2");
@@ -148,6 +163,9 @@ describe("getBoard", () => {
     expect(orphanEpic!.tickets).toHaveLength(1);
     expect(orphanEpic!.tickets[0].id).toBe("orphan-1");
     expect(orphanEpic!.approved).toBe(true);
+    // Null-safe: an unclaimed orphan has no assignee/created_by and an empty createdAt.
+    expect(orphanEpic!.tickets[0]).toMatchObject({ assignee: null, createdAt: "", createdBy: null });
+    expect(orphanEpic!).toMatchObject({ assignee: null, createdAt: "", createdBy: null });
   });
 
   it("falls back to merging open + closed lists when --status all fails", async () => {

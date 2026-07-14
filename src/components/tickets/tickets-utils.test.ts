@@ -6,6 +6,7 @@ import {
   filtersFromSearchParams,
   hasActiveFilters,
   searchParamsFromFilters,
+  sortTicketsByCreated,
   ticketsQueryString,
   uniqueEpicOptions,
   uniqueFieldOptions,
@@ -17,6 +18,9 @@ const base: TicketRow = {
   status: "open",
   stage: "backlog",
   type: "task",
+  assignee: null,
+  createdAt: "",
+  createdBy: null,
 };
 
 describe("filtersFromSearchParams", () => {
@@ -91,6 +95,46 @@ describe("uniqueEpicOptions", () => {
       { id: "ep-1", title: "Alpha" },
       { id: "ep-2", title: "Zebra" },
     ]);
+  });
+});
+
+describe("sortTicketsByCreated", () => {
+  const rows: TicketRow[] = [
+    { ...base, id: "old", createdAt: "2026-07-10T12:00:00Z" },
+    { ...base, id: "new", createdAt: "2026-07-13T12:00:00Z" },
+    { ...base, id: "mid", createdAt: "2026-07-11T12:00:00Z" },
+  ];
+
+  it("orders newest first for created-desc", () => {
+    expect(sortTicketsByCreated(rows, "created-desc").map((t) => t.id)).toEqual(["new", "mid", "old"]);
+  });
+
+  it("orders oldest first for created-asc", () => {
+    expect(sortTicketsByCreated(rows, "created-asc").map((t) => t.id)).toEqual(["old", "mid", "new"]);
+  });
+
+  it("does not mutate the input array", () => {
+    const input = [...rows];
+    sortTicketsByCreated(input, "created-desc");
+    expect(input.map((t) => t.id)).toEqual(["old", "new", "mid"]);
+  });
+
+  it("sinks rows with missing/unparseable timestamps to the bottom in both directions", () => {
+    const withGaps: TicketRow[] = [
+      { ...base, id: "missing", createdAt: "" },
+      { ...base, id: "old", createdAt: "2026-07-10T12:00:00Z" },
+      { ...base, id: "bad", createdAt: "not-a-date" },
+      { ...base, id: "new", createdAt: "2026-07-13T12:00:00Z" },
+    ];
+    expect(sortTicketsByCreated(withGaps, "created-desc").map((t) => t.id)).toEqual([
+      "new",
+      "old",
+      "missing",
+      "bad",
+    ]);
+    const asc = sortTicketsByCreated(withGaps, "created-asc").map((t) => t.id);
+    expect(asc.slice(0, 2)).toEqual(["old", "new"]);
+    expect(asc.slice(2).sort()).toEqual(["bad", "missing"]);
   });
 });
 

@@ -15,7 +15,8 @@ import {
   DialogFooter,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { MetaChip, PrLink, StagePill } from "@/components/atoms";
+import { cn } from "@/lib/utils";
+import { MetaChip, PrLink, RelativeTime, StagePill } from "@/components/atoms";
 import {
   AGENT_OPTIONS,
   PRIORITY_LABELS,
@@ -197,6 +198,19 @@ function TicketDialogBody({
               </MetaChip>
             </PrLink>
           )}
+        </div>
+        {/* claimed-by + created — mirrors the epic detail + tickets list surfaces */}
+        <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1 text-[11px] text-subtle">
+          <span>
+            Claimed by{" "}
+            <span className={cn(detail.assignee ? "text-foreground/85" : "text-subtle")}>
+              {detail.assignee ?? "Unclaimed"}
+            </span>
+          </span>
+          <span>
+            Created <RelativeTime iso={detail.createdAt} className="text-foreground/85" />
+            {detail.createdBy && <> by {detail.createdBy}</>}
+          </span>
         </div>
       </div>
 

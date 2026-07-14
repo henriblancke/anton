@@ -20,6 +20,9 @@ export interface Bead {
   labels?: string[];
   external_ref?: string;
   priority?: number;
+  assignee?: string | null; // who claimed the bead; null/absent when unclaimed
+  created_at?: string; // ISO timestamp
+  created_by?: string | null; // who created the bead
   parent?: string; // parent epic id (present in `bd list --json` for structured boards)
   parent_id?: string;
   dependencies?: BeadDep[]; // edges carried inline by `bd list --json`

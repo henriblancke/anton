@@ -38,6 +38,16 @@ function labelValue(labels: string[] | undefined, prefix: string): string | unde
   return label ? label.slice(prefix.length + 1) : undefined;
 }
 
+/** Claimed-by + created metadata carried straight off the raw bead, null-safe. Kept local to
+ * board.ts so this module stays free of a tickets.ts ← board.ts import cycle. */
+function createdMeta(bead: Bead): { assignee: string | null; createdAt: string; createdBy: string | null } {
+  return {
+    assignee: bead.assignee ?? null,
+    createdAt: bead.created_at ?? "",
+    createdBy: bead.created_by ?? null,
+  };
+}
+
 function toTicket(bead: Bead): Ticket {
   return {
     id: bead.id,
@@ -48,6 +58,7 @@ function toTicket(bead: Bead): Ticket {
     risk: labelValue(bead.labels, "risk"),
     size: labelValue(bead.labels, "size"),
     acceptance: parseAcceptance(bead),
+    ...createdMeta(bead),
     prRef: bead.external_ref,
   };
 }
@@ -62,6 +73,7 @@ function ticketAsEpic(bead: Bead): Epic {
     agent: ticket.agent,
     risk: ticket.risk,
     size: ticket.size,
+    ...createdMeta(bead),
     tickets: [ticket],
   };
 }
@@ -124,6 +136,7 @@ export async function getBoard(project: Project): Promise<Board> {
       agent: labelValue(epic.labels, "agent"),
       risk: labelValue(epic.labels, "risk"),
       size: labelValue(epic.labels, "size"),
+      ...createdMeta(epic),
       prRef: epic.external_ref,
       tickets,
     };
