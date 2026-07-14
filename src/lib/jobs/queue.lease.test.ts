@@ -67,4 +67,48 @@ describe("leaseDue exclude", () => {
     });
     expect(leased.map((j) => j.id)).toEqual(["fresh"]);
   });
+
+  it("counts an excluded lease-lapsed in-flight job toward its project cap", async () => {
+    // "busy": still dispatched in-process for project P, but its DB lease lapsed (missed heartbeat)
+    // so it looks reclaimable. "queued": a second execute-epic queued for the SAME project.
+    t.db
+      .insert(schema.projects)
+      .values({ id: "P", slug: "P", name: "P", repoPath: "/tmp/P" })
+      .run();
+    const past = new Date(systemClock.now() - 100_000);
+    t.db
+      .insert(schema.jobs)
+      .values({
+        id: "busy",
+        type: "execute-epic",
+        projectId: "P",
+        status: "running",
+        runAt: past,
+        leaseExpiresAt: past, // expired → would count as reclaimable, but it's still in-flight
+        attempts: 1,
+      })
+      .run();
+    const soon = new Date(systemClock.now() - 1_000);
+    t.db
+      .insert(schema.jobs)
+      .values({
+        id: "queued",
+        type: "execute-epic",
+        projectId: "P",
+        status: "queued",
+        runAt: soon,
+        attempts: 0,
+      })
+      .run();
+
+    // Per-project cap of 1. The excluded in-flight job occupies P's only slot, so the queued job for
+    // P must NOT be leased — otherwise two handlers run for project P at once.
+    const leased = await leaseDue(t.db, systemClock, {
+      leaseMs: 30_000,
+      limit: 5,
+      capOf: () => 1,
+      exclude: ["busy"],
+    });
+    expect(leased).toHaveLength(0);
+  });
 });

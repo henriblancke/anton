@@ -217,12 +217,21 @@ export async function leaseDue(
   let due = candidates;
   if (opts.capOf) {
     const capOf = opts.capOf;
-    // Count jobs actively in flight (running, lease not yet expired) per bucket — the live load a
-    // new lease competes with. Only gated buckets are tracked.
+    // Count the live load a new lease competes with, per bucket. A `running` job counts if its lease
+    // hasn't expired OR it's still dispatched in-process (in `exclude`): an in-flight handler whose
+    // DB lease lapsed (missed heartbeat) is filtered out of the lease candidates above but is still
+    // genuinely occupying its bucket, so it must count toward the cap — otherwise a spare-capacity
+    // tick would lease a second job for a project already at its concurrency limit. The two
+    // conditions are OR'd in one query so a job that's both leased-and-unexpired and in-flight is
+    // counted once, not twice. Only gated buckets are tracked.
+    const liveLoad =
+      excludeIds.length > 0
+        ? or(gt(schema.jobs.leaseExpiresAt, nowDate), inArray(schema.jobs.id, excludeIds))
+        : gt(schema.jobs.leaseExpiresAt, nowDate);
     const active = await db
       .select({ projectId: schema.jobs.projectId, type: schema.jobs.type })
       .from(schema.jobs)
-      .where(and(eq(schema.jobs.status, "running"), gt(schema.jobs.leaseExpiresAt, nowDate)));
+      .where(and(eq(schema.jobs.status, "running"), liveLoad));
     const usedByBucket = new Map<string, number>();
     for (const row of active) {
       if (capOf(row as JobRow) === Infinity) continue;
