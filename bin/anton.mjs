@@ -917,8 +917,10 @@ const DEFAULT_SCHEDULE_DEFS = [
  * Register `dir` in anton.db so it appears on the projects board (anton-uez). The pure-node CLI
  * can't import the TypeScript addProject, so — like applyMigrations — it writes anton.db directly
  * via better-sqlite3, producing an equivalent projects row + default schedules. Idempotent by
- * repo_path: an already-registered repo is a no-op. Returns { ok, created, slug } or { ok:false,
- * error } — a registration failure is surfaced by the caller but never undoes the beads config.
+ * repo_path: re-registering an existing repo doesn't duplicate the project, but DOES backfill any
+ * missing default schedules (self-heal for projects registered before seeding existed, anton-mxy).
+ * Returns { ok, created, slug, backfilled } or { ok:false, error } — a registration failure is
+ * surfaced by the caller but never undoes the beads config.
  */
 function registerProject(dir, opts = {}) {
   const appRoot = opts.appRoot ?? APP_ROOT;
@@ -931,8 +933,31 @@ function registerProject(dir, opts = {}) {
     try {
       db.pragma("foreign_keys = ON");
       const repoPath = resolve(dir);
-      const existing = db.prepare("SELECT slug FROM projects WHERE repo_path = ?").get(repoPath);
-      if (existing) return { ok: true, created: false, slug: existing.slug };
+      const nowSec = Math.floor(Date.now() / 1000);
+
+      // NOT EXISTS guard makes schedule seeding idempotent per (project, type) — matching ensureSchedule.
+      const insertSchedule = db.prepare(
+        "INSERT INTO schedules (id, project_id, type, cron, enabled, next_run_at) " +
+          "SELECT ?, ?, ?, ?, 1, ? WHERE NOT EXISTS " +
+          "(SELECT 1 FROM schedules WHERE project_id = ? AND type = ?)",
+      );
+      /** Seed any missing default schedules for a project; returns how many rows were added. */
+      const seedSchedules = (projectId) => {
+        let added = 0;
+        for (const s of DEFAULT_SCHEDULE_DEFS) {
+          added += insertSchedule.run(randomUUID(), projectId, s.type, s.cron, nowSec, projectId, s.type).changes;
+        }
+        return added;
+      };
+
+      const existing = db.prepare("SELECT id, slug FROM projects WHERE repo_path = ?").get(repoPath);
+      if (existing) {
+        // Self-heal: a project registered before schedule seeding existed (or one that lost a
+        // default to an older version) has no rows to enqueue its background jobs. Backfill the
+        // missing defaults — idempotent, so a fully-seeded project stays a no-op.
+        const backfilled = db.transaction(() => seedSchedules(existing.id))();
+        return { ok: true, created: false, slug: existing.slug, backfilled };
+      }
 
       // Unique slug from the repo basename (matches addProject's toSlug + uniqueSlug).
       const base = slugify(basename(repoPath)) || "project";
@@ -942,23 +967,14 @@ function registerProject(dir, opts = {}) {
 
       const id = randomUUID();
       const branch = detectRepoDefaultBranch(repoPath);
-      const nowSec = Math.floor(Date.now() / 1000);
       const insertProject = db.prepare(
         "INSERT INTO projects (id, slug, name, repo_path, default_branch) VALUES (?, ?, ?, ?, ?)",
       );
-      // NOT EXISTS guard makes schedule seeding idempotent per (project, type) — matching ensureSchedule.
-      const insertSchedule = db.prepare(
-        "INSERT INTO schedules (id, project_id, type, cron, enabled, next_run_at) " +
-          "SELECT ?, ?, ?, ?, 1, ? WHERE NOT EXISTS " +
-          "(SELECT 1 FROM schedules WHERE project_id = ? AND type = ?)",
-      );
-      db.transaction(() => {
+      const backfilled = db.transaction(() => {
         insertProject.run(id, slug, basename(repoPath), repoPath, branch);
-        for (const s of DEFAULT_SCHEDULE_DEFS) {
-          insertSchedule.run(randomUUID(), id, s.type, s.cron, nowSec, id, s.type);
-        }
+        return seedSchedules(id);
       })();
-      return { ok: true, created: true, slug };
+      return { ok: true, created: true, slug, backfilled };
     } finally {
       db.close();
     }
@@ -1045,9 +1061,14 @@ async function cmdInit(args = []) {
   // Register with anton so the repo shows on the projects board — in the same command (anton-uez).
   const reg = registerProject(dir);
   if (reg.ok) {
+    const backfill =
+      !reg.created && reg.backfilled > 0
+        ? c.green(` — backfilled ${reg.backfilled} missing schedule${reg.backfilled === 1 ? "" : "s"}`)
+        : "";
     console.log(
       (reg.created ? c.green("✓ registered with anton") : c.dim("• already registered")) +
-        c.dim(` — project "${reg.slug}"`),
+        c.dim(` — project "${reg.slug}"`) +
+        backfill,
     );
   } else {
     console.log(c.yellow(`\n! could not register with anton: ${reg.error}`));
