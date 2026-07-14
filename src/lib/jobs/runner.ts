@@ -6,12 +6,14 @@
  *   • API-limit backoff      — `UsageLimitError` → reschedule past the reset window; the attempt is
  *                              refunded (you can't retry an exhausted quota).
  *   • Poison-pill            — a job that errors `maxAttempts` times (or throws `PoisonError`) is
- *                              parked for a human.
+ *                              parked for a human. Parking is recoverable, not terminal: `resume()`
+ *                              (queue.resumeJob) un-parks a job back to `queued` with a fresh budget.
  *
  * The decision logic (`nextAction`) is a pure function so it can be unit-tested without timers.
  * See DESIGN.md §4.
  */
 import {
+  activeExecuteEpicKeys,
   complete,
   enqueue,
   enqueueExecuteEpicDeduped,
@@ -19,14 +21,17 @@ import {
   leaseDue,
   park,
   projectIdsWithPendingJobs,
+  reclaimRunningJobs,
   renewLease,
   reschedule,
+  resumeJob,
   systemClock,
   type AntonDb,
   type Clock,
   type JobRow,
   type JobType,
 } from "./queue";
+import { reconcileInterruptedRuns } from "../runs";
 import { isPoisonError, isUsageLimitError } from "./errors";
 
 export interface RunnerConfig {
@@ -212,6 +217,48 @@ export class JobRunner {
    */
   enqueueExecuteEpic(projectId: string, epicBeadId: string): string {
     return enqueueExecuteEpicDeduped(this.db, this.clock, projectId, epicBeadId);
+  }
+
+  /**
+   * Un-park a parked job, returning it to `queued` with a fresh attempt budget so it is picked up
+   * on the next tick. The recovery path for a job that exhausted its retries (or hit a permanent
+   * error a human has since resolved). Resolves true if a parked job was resumed, false otherwise.
+   * The manual-resume UI (anton's separate ticket) drives this; parking is no longer terminal.
+   */
+  resume(jobId: string): Promise<boolean> {
+    return resumeJob(this.db, this.clock, jobId);
+  }
+
+  /**
+   * Crash/restart reconciliation (anton-nbd). Call ONCE at boot, before `start()`, while nothing is
+   * in flight. Two steps make the durable state consistent again:
+   *
+   *   1. Reclaim orphaned leases — every `running` job is a lease the dead process never released;
+   *      expiring the lease makes the next tick re-dispatch it immediately (rolling dispatch),
+   *      instead of stalling for the whole `leaseMs` window.
+   *   2. Reconcile orphaned runs — a `runs` row stuck in `running` whose execute-epic job is NOT
+   *      coming back (no active job for its epic) is marked `failed`; a run whose job WILL resume is
+   *      left untouched so the resume reuses it idempotently (no duplicate run / PR / commit).
+   *
+   * Best-effort: a reconciliation failure is logged but never blocks boot (the lease-expiry path
+   * still recovers jobs, just a window later).
+   */
+  async reconcile(): Promise<{ reclaimedJobs: number; reconciledRuns: number }> {
+    try {
+      const reclaimedJobs = await reclaimRunningJobs(this.db, this.clock);
+      const activeKeys = await activeExecuteEpicKeys(this.db);
+      const reconciledRuns = await reconcileInterruptedRuns(this.db, this.clock, activeKeys);
+      if (reclaimedJobs > 0 || reconciledRuns > 0) {
+        this.log.info(
+          `boot reconcile: reclaimed ${reclaimedJobs} orphaned job lease(s), ` +
+            `failed ${reconciledRuns} interrupted run(s)`,
+        );
+      }
+      return { reclaimedJobs, reconciledRuns };
+    } catch (e) {
+      this.log.error("boot reconcile failed (lease expiry will still recover jobs)", e);
+      return { reclaimedJobs: 0, reconciledRuns: 0 };
+    }
   }
 
   /**

@@ -149,6 +149,12 @@ export async function runClaude(opts: RunClaudeOptions): Promise<ClaudeResult> {
     let stdoutBuf = "";
     let stderrBuf = "";
     let resultRaw: Record<string, unknown> | undefined;
+    // All human-readable text Claude emitted (assistant + result), so the usage-limit scan sees
+    // the quota signal wherever it lands — Claude Code has surfaced "usage limit reached" in the
+    // final result field, in an assistant text block, or on stderr depending on how it exited.
+    // Scanning only the result field risked misclassifying a real quota hit as a plain error,
+    // which burns maxAttempts and parks instead of rescheduling (anton-ner.2).
+    let transcript = "";
 
     const handleLine = (line: string) => {
       const trimmed = line.trim();
@@ -161,6 +167,7 @@ export async function runClaude(opts: RunClaudeOptions): Promise<ClaudeResult> {
       }
       if (parsed.type === "result") resultRaw = parsed;
       for (const event of toEvents(parsed)) {
+        if (event.text) transcript += `${event.text}\n`;
         opts.onEvent?.(event);
       }
     };
@@ -187,12 +194,24 @@ export async function runClaude(opts: RunClaudeOptions): Promise<ClaudeResult> {
       }
 
       const resultText = resultRaw && typeof resultRaw.result === "string" ? resultRaw.result : undefined;
-      const combined = `${resultText ?? ""}\n${stderrBuf}`;
 
-      if (USAGE_LIMIT_RE.test(combined)) {
-        const message = resultText ?? stderrBuf.trim() ?? "Claude AI usage limit reached";
-        reject(new UsageLimitError(message, parseResetAt(combined)));
-        return;
+      // Only a run that did NOT cleanly succeed can be a quota hit. Gate the transcript scan on
+      // non-success so a healthy run whose assistant output merely *mentions* a usage limit (e.g.
+      // an agent editing this very file, or working the anton-ner epic) is never reclassified as
+      // UsageLimitError and rescheduled forever. Every real quota abort carries is_error / a
+      // non-zero exit, so nothing legitimate is lost (anton-ner.2).
+      const succeeded = code === 0 && resultRaw !== undefined && !resultRaw.is_error;
+
+      if (!succeeded) {
+        // Scan the full transcript (assistant + result text) plus stderr — the result field alone
+        // isn't a reliable place to find the quota signal. See `transcript` above.
+        const combined = `${transcript}\n${resultText ?? ""}\n${stderrBuf}`;
+
+        if (USAGE_LIMIT_RE.test(combined)) {
+          const message = resultText || stderrBuf.trim() || transcript.trim() || "Claude AI usage limit reached";
+          reject(new UsageLimitError(message, parseResetAt(combined)));
+          return;
+        }
       }
 
       if (code !== 0) {

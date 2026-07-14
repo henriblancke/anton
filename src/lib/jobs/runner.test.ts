@@ -4,6 +4,7 @@
  * quota backoff (park + reschedule, attempt refunded), and poison-pill parking after N attempts.
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
 import { makeTestDb, type TestDb } from "../db/testing";
 import { PoisonError, UsageLimitError } from "./errors";
 import { getJob, toMs, type Clock } from "./queue";
@@ -254,6 +255,157 @@ describe("JobRunner (live, in-memory db)", () => {
     // Parked jobs are not picked up again.
     clock.advance(1_000_000);
     expect(await r.tickOnce()).toBe(0);
+  });
+
+  it("resumes a parked job back to queued with a fresh attempt budget, then runs it to completion", async () => {
+    // anton-ner.2: parking must not be a permanent dead end. A transient error exhausts maxAttempts
+    // and parks; resume() un-parks it (attempts refunded to 0) and the next tick runs it.
+    let attempts = 0;
+    const r = runner(
+      async () => {
+        attempts += 1;
+        if (attempts <= 3) throw new Error("transient");
+      },
+      { maxAttempts: 3, backoffBaseMs: 1_000 },
+    );
+    const id = await r.enqueue({ type: "execute-epic" });
+
+    // Burn through the retry budget → parked.
+    await r.tickOnce();
+    await r.whenIdle();
+    clock.advance(2_000);
+    await r.tickOnce();
+    await r.whenIdle();
+    clock.advance(5_000);
+    await r.tickOnce();
+    await r.whenIdle();
+    let job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("parked");
+    expect(job?.attempts).toBe(3);
+
+    // Resume: parked → queued, due now, attempts refunded, lastError cleared.
+    expect(await r.resume(id)).toBe(true);
+    job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("queued");
+    expect(job?.attempts).toBe(0);
+    expect(job?.lastError).toBeNull();
+
+    // Runs again (4th attempt now succeeds) → done.
+    expect(await r.tickOnce()).toBe(1);
+    await r.whenIdle();
+    job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("done");
+    expect(attempts).toBe(4);
+  });
+
+  it("resume() is a no-op (returns false) for a job that isn't parked", async () => {
+    const r = runner(async () => {});
+    const id = await r.enqueue({ type: "execute-epic" });
+    // queued, not parked → refuse to touch its lifecycle.
+    expect(await r.resume(id)).toBe(false);
+    expect((await getJob(tdb.db, id))?.status).toBe("queued");
+    expect(await r.resume("does-not-exist")).toBe(false);
+  });
+
+  it("resume() also un-parks a `failed` (reserved terminal) job (anton-ner.4)", async () => {
+    const schema = await import("../db/schema");
+    const r = runner(async () => {});
+    const id = await r.enqueue({ type: "execute-epic" });
+    await tdb.db.update(schema.jobs).set({ status: "failed" }).where(eq(schema.jobs.id, id));
+    expect(await r.resume(id)).toBe(true);
+    const job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("queued");
+    expect(job?.attempts).toBe(0);
+  });
+
+  it("reconcile() reclaims orphaned running jobs and fails only truly-orphaned runs (anton-nbd)", async () => {
+    const schema = await import("../db/schema");
+    await seedProjects("A", "B");
+    const nowMs = clock.now();
+
+    // A running execute-epic job whose lease has NOT yet expired — a crash left it in flight. Its
+    // run must be kept (the job is about to be re-dispatched), and reconcile must clear its lease so
+    // the next tick reclaims it immediately instead of waiting out leaseMs.
+    const liveJobId = await tdb.db
+      .insert(schema.jobs)
+      .values({
+        id: "job-live",
+        type: "execute-epic",
+        projectId: "A",
+        payloadJson: JSON.stringify({ projectId: "A", epicBeadId: "epic-live" }),
+        status: "running",
+        runAt: new Date(nowMs - 1_000),
+        leaseExpiresAt: new Date(nowMs + 50_000), // not expired — only reconcile can free it
+        attempts: 1,
+      })
+      .returning({ id: schema.jobs.id })
+      .then((rows) => rows[0].id);
+
+    // Its run row — must survive reconciliation (the job resumes and reuses it).
+    await tdb.db.insert(schema.runs).values({
+      id: "run-live",
+      projectId: "A",
+      epicBeadId: "epic-live",
+      status: "running",
+      startedAt: new Date(nowMs),
+      updatedAt: new Date(nowMs),
+    });
+
+    // An orphaned run: stuck `running` with NO execute-epic job for its epic → nothing will resume
+    // it, so reconcile must mark it failed.
+    await tdb.db.insert(schema.runs).values({
+      id: "run-orphan",
+      projectId: "B",
+      epicBeadId: "epic-dead",
+      status: "running",
+      startedAt: new Date(nowMs),
+      updatedAt: new Date(nowMs),
+    });
+
+    let ran = false;
+    const r = runner(async () => {
+      ran = true;
+    });
+    const res = await r.reconcile();
+    expect(res.reclaimedJobs).toBe(1);
+    expect(res.reconciledRuns).toBe(1);
+
+    // The live job kept its `running` status but its lease was expired (≤ now) → reclaimable.
+    const job = await getJob(tdb.db, liveJobId);
+    expect(job?.status).toBe("running");
+    expect(toMs(job?.leaseExpiresAt)!).toBeLessThanOrEqual(nowMs);
+
+    const runsRows = await tdb.db.select().from(schema.runs);
+    expect(runsRows.find((x) => x.id === "run-live")?.status).toBe("running"); // kept
+    const orphan = runsRows.find((x) => x.id === "run-orphan");
+    expect(orphan?.status).toBe("failed"); // reconciled
+    expect(orphan?.error).toMatch(/interrupted/);
+
+    // The reclaimed job is re-dispatched on the very next tick.
+    expect(await r.tickOnce()).toBe(1);
+    await r.whenIdle();
+    expect(ran).toBe(true);
+  });
+
+  it("reschedules a quota hit past the attempt cap — a quota error NEVER parks", async () => {
+    // anton-ner.2 AC: even when attempts already reached maxAttempts, a UsageLimitError reschedules
+    // (attempt refunded) rather than parking — you can't retry an exhausted quota, so it isn't the
+    // job's fault and must not count against the poison budget.
+    const resetAt = Math.floor(clock.now() / 1000) + 3600;
+    const r = runner(
+      async () => {
+        throw new UsageLimitError("Claude AI usage limit reached", resetAt);
+      },
+      { maxAttempts: 1 }, // one attempt → would park a plain error immediately
+    );
+    const id = await r.enqueue({ type: "execute-epic" });
+
+    await r.tickOnce();
+    await r.whenIdle();
+    const job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("queued"); // rescheduled, never parked
+    expect(job?.attempts).toBe(0); // attempt refunded despite the cap
+    expect(toMs(job?.runAt)).toBe(resetAt * 1000);
   });
 
   it("parks immediately on PoisonError without exhausting attempts", async () => {

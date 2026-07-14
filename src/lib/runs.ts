@@ -165,6 +165,38 @@ export async function getRunById(db: AntonDb, id: string): Promise<RunRow | unde
   return rows[0];
 }
 
+/**
+ * Boot reconciliation (anton-nbd): a `runs` row left in `running` after a crash is only genuinely
+ * orphaned if no execute-epic job will resume it. `activeKeys` holds `${projectId}::${epicBeadId}`
+ * for every still-active job (see `activeExecuteEpicKeys`); a running run whose key is present is
+ * about to be re-dispatched and MUST be left alone (touching it would break the idempotent resume —
+ * `findOpenRunForEpic` reuses the same row). Any other running run has no job coming back, so mark
+ * it `failed` (`interrupted`) — that clears the stale "running" from the UI. Returns the count
+ * reconciled. Runs that are already `parked` are left as-is (their job resumes or a human un-parks).
+ */
+export async function reconcileInterruptedRuns(
+  db: AntonDb,
+  clock: Clock,
+  activeKeys: Set<string>,
+): Promise<number> {
+  const running = await db
+    .select()
+    .from(schema.runs)
+    .where(eq(schema.runs.status, "running"));
+  const orphaned = running.filter(
+    (r) => !activeKeys.has(`${r.projectId ?? ""}::${r.epicBeadId}`),
+  );
+  const nowMs = clock.now();
+  for (const run of orphaned) {
+    await updateRun(db, clock, run.id, {
+      status: "failed",
+      error: "interrupted by server restart",
+      endedAt: nowMs,
+    });
+  }
+  return orphaned.length;
+}
+
 /** The most-recent still-open run for an epic — used to resume rather than start a duplicate. */
 export async function findOpenRunForEpic(
   db: AntonDb,

@@ -7,6 +7,7 @@ import { listRuns, type RunStatus, type RunSummary } from "@/lib/runs";
 import { isActiveJob, listJobs, type JobStatus, type JobSummary } from "@/lib/jobs-view";
 import { cn } from "@/lib/utils";
 import { fmtDuration, isActiveRun } from "@/components/runs/run-view-utils";
+import { ResumeJobButton } from "@/components/runs/resume-job-button";
 
 export const dynamic = "force-dynamic";
 
@@ -75,7 +76,7 @@ export default async function ProjectRunsPage({
         <div className="flex flex-col">
           {active.length > 0 && <RunGroup label="Active" runs={active} slug={slug} />}
           {history.length > 0 && <RunGroup label="History" runs={history} slug={slug} />}
-          {jobs.length > 0 && <JobGroup jobs={jobs} />}
+          {jobs.length > 0 && <JobGroup jobs={jobs} slug={slug} />}
         </div>
       )}
     </div>
@@ -104,7 +105,7 @@ function RunGroup({ label, runs, slug }: { label: string; runs: RunSummary[]; sl
  * when they never wrote a `runs` row. Reads the same table the runner mutates, so status is
  * always consistent with the runner (anton-ner.3).
  */
-function JobGroup({ jobs }: { jobs: JobSummary[] }) {
+function JobGroup({ jobs, slug }: { jobs: JobSummary[]; slug: string }) {
   return (
     <section>
       <div className="flex items-center gap-2 border-b border-border bg-card/30 px-6 py-2">
@@ -113,16 +114,18 @@ function JobGroup({ jobs }: { jobs: JobSummary[] }) {
       </div>
       <ul className="flex flex-col divide-y divide-border">
         {jobs.map((job) => (
-          <JobRow key={job.id} job={job} />
+          <JobRow key={job.id} job={job} slug={slug} />
         ))}
       </ul>
     </section>
   );
 }
 
-function JobRow({ job }: { job: JobSummary }) {
+function JobRow({ job, slug }: { job: JobSummary; slug: string }) {
   const style = STATUS_STYLE[job.status];
   const finished = !isActiveJob(job.status);
+  // Parked/failed jobs are recoverable but not self-healing — offer a manual resume (anton-ner.4).
+  const resumable = job.status === "parked" || job.status === "failed";
   return (
     <li className="flex items-center gap-4 px-6 py-3.5">
       <span
@@ -137,7 +140,12 @@ function JobRow({ job }: { job: JobSummary }) {
           {job.lastError ? ` · ${job.lastError}` : ""}
         </span>
       </div>
-      <div className="ml-auto flex shrink-0 flex-col items-end gap-0.5">
+      {resumable && (
+        <div className="ml-auto shrink-0">
+          <ResumeJobButton slug={slug} jobId={job.id} />
+        </div>
+      )}
+      <div className={cn("flex shrink-0 flex-col items-end gap-0.5", !resumable && "ml-auto")}>
         <span className={cn("font-mono text-[11px]", style.text)}>{job.status}</span>
         <span className="font-mono text-[10px] text-subtle">
           {finished
