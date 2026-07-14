@@ -102,4 +102,16 @@ describe("addProject", () => {
   it("returns null for an unknown slug", async () => {
     expect(await getProjectBySlug("does-not-exist-slug")).toBeNull();
   });
+
+  it("is idempotent by repoPath — re-adding the same repo returns the existing row (anton-uez)", async () => {
+    const repoPath = makeRepoDir("idempotent-repo");
+    const first = await addProject({ name: "Idem", repoPath });
+    const second = await addProject({ name: "Idem Again", repoPath });
+
+    expect(second.id).toBe(first.id);
+    expect(second.slug).toBe(first.slug);
+
+    const matches = (await listProjects()).filter((p) => p.repoPath === repoPath);
+    expect(matches).toHaveLength(1);
+  });
 });
