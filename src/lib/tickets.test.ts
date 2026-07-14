@@ -7,6 +7,9 @@ function makeRow(overrides: Partial<TicketRow> & { id: string; title: string }):
     status: "open",
     stage: "backlog",
     type: "task",
+    assignee: null,
+    createdAt: "",
+    createdBy: null,
     ...overrides,
   };
 }

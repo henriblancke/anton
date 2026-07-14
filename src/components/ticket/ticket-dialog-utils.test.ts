@@ -14,6 +14,12 @@ import type { TicketDetail } from "@/lib/types";
 /** Minimal bead carrying just the fields parseAcceptance reads. */
 const asBead = (fields: Partial<Bead>): Bead => ({ id: "x", title: "t", status: "open", ...fields });
 
+/** The claimed-by + created metadata every TicketDetail now carries; incidental to these tests. */
+const meta = { assignee: null, createdAt: "", createdBy: null } satisfies Pick<
+  TicketDetail,
+  "assignee" | "createdAt" | "createdBy"
+>;
+
 const detail: TicketDetail = {
   id: "bd-1",
   title: "Do the thing",
@@ -24,13 +30,14 @@ const detail: TicketDetail = {
   agent: "nextjs",
   risk: "low",
   size: "M",
+  ...meta,
 };
 
 const base = draftFromDetail(detail);
 
 describe("draftFromDetail", () => {
   it("maps detail fields, defaulting absent labels and contract to empty strings", () => {
-    const bare = draftFromDetail({ id: "x", title: "t", status: "open", stage: "backlog", type: "task" });
+    const bare = draftFromDetail({ id: "x", title: "t", status: "open", stage: "backlog", type: "task", ...meta });
     expect(bare).toEqual({
       title: "t",
       status: "open",
@@ -51,6 +58,7 @@ describe("draftFromDetail", () => {
       status: "open",
       stage: "backlog",
       type: "task",
+      ...meta,
       goal: "Ship the widget",
       acceptance: "- [ ] It renders",
       description: "## Goal\n\nShip the widget\n\n## Acceptance\n\n- [ ] It renders\n\n## Verify\n\nRun the tests",
@@ -67,6 +75,7 @@ describe("draftFromDetail", () => {
       status: "open",
       stage: "backlog",
       type: "task",
+      ...meta,
       acceptance: "legacy field-only criteria",
       description: "## Goal\n\nDo it",
     });
@@ -115,7 +124,7 @@ describe("diffTicketPatch", () => {
   });
 
   it("sets a previously-absent label but never clears one to empty", () => {
-    const bare = draftFromDetail({ id: "x", title: "t", status: "open", stage: "backlog", type: "task" });
+    const bare = draftFromDetail({ id: "x", title: "t", status: "open", stage: "backlog", type: "task", ...meta });
     expect(diffTicketPatch(bare, { ...bare, agent: "docker" })).toEqual({ agent: "docker" });
     expect(diffTicketPatch(base, { ...base, agent: "" })).toEqual({});
   });
@@ -136,6 +145,7 @@ describe("contract editing", () => {
     status: "open",
     stage: "backlog",
     type: "task",
+    ...meta,
     goal: "Old goal",
     acceptance: "- [ ] old item",
     description: "## Goal\n\nOld goal\n\n## Acceptance\n\n- [ ] old item\n\n## Verify\n\ntests",
@@ -175,6 +185,7 @@ describe("contract editing", () => {
       status: "open",
       stage: "backlog",
       type: "task",
+      ...meta,
       acceptance: "field-only criteria",
       description: "## Goal\n\nDo it",
     });

@@ -25,6 +25,9 @@ export interface Ticket {
   risk?: string; // from risk:<x>
   size?: string; // from size:<x>
   acceptance?: string;
+  assignee: string | null; // who claimed the bead; null when unclaimed
+  createdAt: string; // ISO timestamp, from the raw bead's created_at
+  createdBy: string | null; // who created the bead
   prRef?: string; // bead external_ref, if any
   prUrl?: string; // browser URL for the PR, resolved from prRef + the repo's origin remote
 }
@@ -39,6 +42,9 @@ export interface Epic {
   agent?: string; // from an agent:<x> label on the epic bead
   risk?: string; // from risk:<x>
   size?: string; // from size:<x>
+  assignee: string | null; // who claimed the epic bead; null when unclaimed
+  createdAt: string; // ISO timestamp, from the raw bead's created_at
+  createdBy: string | null; // who created the epic bead
   prRef?: string;
   prUrl?: string; // browser URL for the PR, resolved from prRef + the repo's origin remote
   tickets: Ticket[];

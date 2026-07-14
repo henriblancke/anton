@@ -8,7 +8,7 @@ import { deriveStage } from "./board";
 import { getDb } from "./db";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
 import { findOpenRunForEpic } from "./runs";
-import { labelValue, listAllBeads, parseAcceptance, parseGoal } from "./tickets";
+import { createdMeta, labelValue, listAllBeads, parseAcceptance, parseGoal } from "./tickets";
 import type { DepEdge, DepType, Epic, EpicDetail, EpicRun, Project, Ticket } from "./types";
 
 /** The open run backing this epic (if any), for the "View run" / worktree affordances. */
@@ -35,6 +35,7 @@ function toTicket(bead: Bead): Ticket {
     risk: labelValue(bead.labels, "risk"),
     size: labelValue(bead.labels, "size"),
     acceptance: parseAcceptance(bead),
+    ...createdMeta(bead),
     prRef: bead.external_ref,
   };
 }
@@ -65,6 +66,7 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
       agent: labelValue(lite.labels, "agent"),
       risk: labelValue(lite.labels, "risk"),
       size: labelValue(lite.labels, "size"),
+      ...createdMeta(lite),
       prRef: lite.external_ref,
       tickets: [self],
     };
@@ -85,6 +87,7 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
     acceptance: parseAcceptance(full),
     approved: beads.isApproved(lite),
     stage: deriveStage(lite),
+    ...createdMeta(lite),
     prRef: lite.external_ref,
     tickets,
   };

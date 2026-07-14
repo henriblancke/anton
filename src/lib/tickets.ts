@@ -33,6 +33,20 @@ export function labelValue(labels: string[] | undefined, prefix: string): string
   return label ? label.slice(prefix.length + 1) : undefined;
 }
 
+/** The claimed-by + created metadata carried straight off the raw bead, null-safe (an unclaimed
+ * ticket has no assignee/created_by). Shared by every bead→view mapper. */
+export function createdMeta(bead: Bead): {
+  assignee: string | null;
+  createdAt: string;
+  createdBy: string | null;
+} {
+  return {
+    assignee: bead.assignee ?? null,
+    createdAt: bead.created_at ?? "",
+    createdBy: bead.created_by ?? null,
+  };
+}
+
 export async function listAllBeads(project: Project): Promise<Bead[]> {
   try {
     return await beads.list(project.repoPath, ["--status", "all"]);
@@ -61,6 +75,7 @@ function toTicketRow(bead: Bead, epic: Bead | undefined): TicketRow {
     size: labelValue(bead.labels, "size"),
     domain: labelValue(bead.labels, "domain"),
     acceptance: parseAcceptance(bead),
+    ...createdMeta(bead),
     prRef: bead.external_ref,
     type: bead.issue_type ?? "task",
     epicId: epic?.id,

@@ -17,6 +17,9 @@ const base: TicketRow = {
   status: "open",
   stage: "backlog",
   type: "task",
+  assignee: null,
+  createdAt: "",
+  createdBy: null,
 };
 
 describe("filtersFromSearchParams", () => {

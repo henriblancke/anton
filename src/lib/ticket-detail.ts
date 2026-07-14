@@ -6,7 +6,7 @@
 import { beads, type BeadPatch } from "./beads/bd";
 import { deriveStage } from "./board";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
-import { labelValue, listAllBeads, parseAcceptance, parseGoal } from "./tickets";
+import { createdMeta, labelValue, listAllBeads, parseAcceptance, parseGoal } from "./tickets";
 import type { Bead } from "./beads/bd";
 import type { Project, TicketDetail } from "./types";
 
@@ -21,6 +21,7 @@ function toTicketDetail(lite: Bead, full: Bead, epic: Bead | undefined): TicketD
     size: labelValue(lite.labels, "size"),
     domain: labelValue(lite.labels, "domain"),
     acceptance: parseAcceptance(full),
+    ...createdMeta(lite),
     prRef: lite.external_ref,
     type: lite.issue_type ?? "task",
     priority: lite.priority,
