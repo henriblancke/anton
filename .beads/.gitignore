@@ -2,6 +2,13 @@
 dolt/
 embeddeddolt/
 
+# Passive JSONL exports (anton-hg9): the Dolt DB is the source of truth and
+# refs/dolt/data on the git remote is the sync channel. These files are
+# regenerated locally for viewers and must never be committed — tracked, they
+# churn into every commit and cause constant merge conflicts.
+issues.jsonl
+interactions.jsonl
+
 # Runtime files
 bd.sock
 bd.sock.startlock

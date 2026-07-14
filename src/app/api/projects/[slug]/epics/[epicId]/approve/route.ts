@@ -18,6 +18,9 @@ export async function POST(
   }
 
   await beads.approve(project.repoPath, epicId);
+  await beads
+    .sync(project.repoPath)
+    .catch((err) => console.error(`[approve] beads dolt sync failed after approving ${epicId}`, err));
 
   // Approval is the trigger: enqueue the autonomous execute-epic run (DESIGN.md §2/§7).
   // Best-effort — approving must still succeed even if the runner enqueue hiccups.

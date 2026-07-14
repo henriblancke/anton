@@ -57,3 +57,10 @@ bd close <id>        # complete work
 ```
 
 Run `bd prime` for the full workflow context and session-close protocol.
+
+**How beads state syncs:** the issue database is Dolt, and it syncs through
+`refs/dolt/data` on the git remote — not through committed files. `anton setup`
+points the Dolt remote at git `origin` and hydrates a fresh clone with
+`bd dolt pull`. The `.beads/*.jsonl` files are passive, git-ignored local
+exports for viewers; never commit them and never treat them as the source of
+truth.

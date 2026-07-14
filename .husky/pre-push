@@ -1,0 +1,6 @@
+# Beads/Dolt sync (anton-q3o): core.hooksPath=.husky/_ shadows beads' own hooks, so chain
+# the bd-managed shim here so `git push` also carries Dolt data (refs/dolt) to the remote.
+# The shim is guarded by `command -v bd` — contributors without bd are unaffected.
+if [ -f .beads/hooks/pre-push ]; then
+  sh .beads/hooks/pre-push "$@"
+fi

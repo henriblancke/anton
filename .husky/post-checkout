@@ -1,0 +1,5 @@
+# Beads/Dolt sync (anton-q3o): keep Dolt in sync on branch switches. Chains the
+# bd-managed shim (guarded by `command -v bd`, so contributors without bd are unaffected).
+if [ -f .beads/hooks/post-checkout ]; then
+  sh .beads/hooks/post-checkout "$@"
+fi
