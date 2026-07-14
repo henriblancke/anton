@@ -1,11 +1,7 @@
-import { randomUUID } from "node:crypto";
 import { z } from "zod";
 
 import { getProjectBySlug } from "@/lib/projects";
-import { getDb } from "@/lib/db";
-import { createSession } from "@/lib/sessions";
-import { systemClock } from "@/lib/jobs/queue";
-import { getPtyManager, CLAUDE_BIN_ENV } from "@/lib/pty/manager";
+import { startInteractiveSession } from "@/lib/pty/interactive";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -16,8 +12,8 @@ export const dynamic = "force-dynamic";
  * come back over `POST …/pty`. The binary is always the claude bin (never client-chosen) — the
  * caller only supplies args (e.g. a `/shape` invocation, wired by bm4.2), initial size, and links.
  *
- * We create the `sessions` row (kind: interactive) before spawning so history/diagnostics see it,
- * then hand the live pty to the process-wide manager.
+ * The session row + pty wiring lives in {@link startInteractiveSession}, shared with the `/shape`
+ * spawn route.
  */
 const spawnSchema = z.object({
   args: z.array(z.string()).max(64).optional(),
@@ -49,37 +45,14 @@ export async function POST(
     // No/invalid JSON body → spawn with defaults.
   }
 
-  const sessionId = randomUUID();
-  const db = getDb();
-
-  await createSession(db, systemClock, {
-    id: sessionId,
-    projectId: project.id,
-    kind: "interactive",
-    beadId: body.beadId,
-    runId: body.runId,
-  });
-
-  const bin = process.env[CLAUDE_BIN_ENV] ?? "claude";
   try {
-    getPtyManager().spawn({
-      sessionId,
-      file: bin,
-      args: body.args ?? [],
-      cwd: project.repoPath,
-      env: { ...process.env, TERM: "xterm-256color" },
-      cols: body.cols ?? 80,
-      rows: body.rows ?? 24,
-    });
+    const sessionId = await startInteractiveSession(project, body);
+    return Response.json({ sessionId }, { status: 201 });
   } catch (err) {
-    // Spawn failed (e.g. claude not on PATH) — mark the just-created session failed and surface it.
-    const { endSession } = await import("@/lib/sessions");
-    await endSession(db, systemClock, sessionId, "failed");
+    // Spawn failed (e.g. claude not on PATH) — the session was already marked failed.
     return Response.json(
       { error: `Failed to start pty: ${(err as Error).message}` },
       { status: 500 },
     );
   }
-
-  return Response.json({ sessionId }, { status: 201 });
 }
