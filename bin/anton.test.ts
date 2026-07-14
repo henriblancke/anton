@@ -3,14 +3,14 @@
  * don't depend on external tools or a build — so it's deterministic in CI (where bd/gh/stringer
  * aren't installed). setup/start/doctor behavior is covered by the manual run + the prereq logic.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { createRequire } from "node:module";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import {
   agentsFromArgs,
   applyMigrations,
@@ -350,5 +350,186 @@ describe("provisionAgentsSkills (into a temp ~/.claude)", () => {
     expect(r.installed).toBe(REQUIRED_SKILLS.length);
     expect(r.agents).toEqual([]);
     expect(await exists(join(claudeRoot, "agents"))).toBe(false);
+  });
+});
+
+// `bd` isn't installed in CI, so the init flow is exercised end-to-end against a STUB `bd` placed
+// first on PATH (git stays real, run over a throwaway temp repo). The stub mutates the real .beads/
+// files (config.yaml, dolt-remote state) so config.mjs's file-reading logic — configYamlHas, the
+// idempotency skips, the drift patch — sees a realistic workspace. This is the "inject exec" seam the
+// ticket calls for, applied at the process boundary rather than by forking config.mjs's spawnSync.
+const FAKE_BD = [
+  "#!/usr/bin/env node",
+  'const fs = require("node:fs");',
+  'const path = require("node:path");',
+  "const a = process.argv.slice(2);",
+  'const beads = path.join(process.cwd(), ".beads");',
+  'const cfg = path.join(beads, "config.yaml");',
+  'const marker = path.join(beads, ".fake-dolt-remotes");',
+  // onPath() probes --version/--help.
+  'if (a[0] === "--version" || a[0] === "--help") { console.log("bd 0.0.0-fake"); process.exit(0); }',
+  // `bd init` creates the workspace; the team-config keys are intentionally left OUT so the
+  // subsequent `bd config set` calls (config.yaml enforcement) are exercised.
+  'if (a[0] === "init") {',
+  "  fs.mkdirSync(beads, { recursive: true });",
+  '  const pi = a.indexOf("--prefix");',
+  '  const prefix = pi >= 0 ? a[pi + 1] : "bd";',
+  '  if (!fs.existsSync(cfg)) fs.writeFileSync(cfg, "# beads config (fake)\\nprefix: " + prefix + "\\n");',
+  "  process.exit(0);",
+  "}",
+  // `bd config set` patches an existing uncommented `key:` line in place (drift), else appends it.
+  'if (a[0] === "config" && a[1] === "set") {',
+  "  const key = a[2], val = a[3];",
+  '  let text = ""; try { text = fs.readFileSync(cfg, "utf8"); } catch {}',
+  '  const lines = text.split("\\n");',
+  "  let replaced = false;",
+  "  for (let i = 0; i < lines.length; i++) {",
+  "    const t = lines[i].trimStart();",
+  '    if (!t.startsWith("#") && t.startsWith(key + ":")) { lines[i] = key + ": " + val; replaced = true; break; }',
+  "  }",
+  '  const out = replaced ? lines.join("\\n") : (text.length && !text.endsWith("\\n") ? text + "\\n" : text) + key + ": " + val + "\\n";',
+  "  fs.writeFileSync(cfg, out);",
+  "  process.exit(0);",
+  "}",
+  // Dolt remote state is tracked in a marker file so `remote list` reflects prior `remote add`s.
+  'if (a[0] === "dolt" && a[1] === "remote" && a[2] === "list") {',
+  '  let r = []; try { r = JSON.parse(fs.readFileSync(marker, "utf8")); } catch {}',
+  '  if (!r.length) console.log("no remotes configured");',
+  '  else for (const x of r) console.log(x.name + "\\t" + x.url);',
+  "  process.exit(0);",
+  "}",
+  'if (a[0] === "dolt" && a[1] === "remote" && a[2] === "add") {',
+  '  let r = []; try { r = JSON.parse(fs.readFileSync(marker, "utf8")); } catch {}',
+  "  r.push({ name: a[3], url: a[4] });",
+  "  fs.writeFileSync(marker, JSON.stringify(r));",
+  "  process.exit(0);",
+  "}",
+  'if (a[0] === "dolt" && (a[1] === "pull" || a[1] === "push")) process.exit(0);',
+  "process.exit(0);",
+].join("\n");
+
+describe("anton init (end-to-end, bd stubbed on PATH)", () => {
+  let fakeBin: string;
+  let dbPath: string;
+  const cleanups: string[] = [];
+
+  async function tmp(prefix: string): Promise<string> {
+    const d = await mkdtemp(join(tmpdir(), prefix));
+    cleanups.push(d);
+    return d;
+  }
+
+  beforeEach(async () => {
+    fakeBin = await tmp("anton-fakebin-");
+    const bd = join(fakeBin, "bd");
+    writeFileSync(bd, FAKE_BD);
+    chmodSync(bd, 0o755);
+    dbPath = join(await tmp("anton-initdb-"), "anton.db");
+  });
+
+  afterEach(async () => {
+    for (const d of cleanups.splice(0)) await rm(d, { recursive: true, force: true });
+  });
+
+  // Spawn the CLI under the SAME runtime as this test (so its native better-sqlite3 — already proven
+  // loadable in-process above — matches), with the stub `bd` first on PATH and a throwaway anton.db.
+  function runInit(target: string, extra: string[] = []) {
+    return spawnSync(process.execPath, [CLI, "init", target, ...extra], {
+      encoding: "utf8",
+      env: { ...process.env, PATH: `${fakeBin}${delimiter}${process.env.PATH ?? ""}`, ANTON_DB: dbPath },
+    });
+  }
+
+  function gitInit(dir: string, withOrigin: boolean) {
+    spawnSync("git", ["-C", dir, "init"], { stdio: "ignore" });
+    if (withOrigin) {
+      spawnSync("git", ["-C", dir, "remote", "add", "origin", join(dir, "origin.git")], { stdio: "ignore" });
+    }
+  }
+
+  function projectCount(repoPath?: string): number {
+    const require = createRequire(join(REPO_ROOT, "package.json"));
+    const Database = require("better-sqlite3");
+    const sqlite = new Database(dbPath);
+    try {
+      const sql = repoPath
+        ? "SELECT COUNT(*) AS n FROM projects WHERE repo_path = ?"
+        : "SELECT COUNT(*) AS n FROM projects";
+      const row = (repoPath ? sqlite.prepare(sql).get(repoPath) : sqlite.prepare(sql).get()) as { n: number };
+      return row.n;
+    } finally {
+      sqlite.close();
+    }
+  }
+
+  it("fails loud on a non-git directory (no-git)", async () => {
+    const dir = await tmp("anton-init-");
+    const r = runInit(dir);
+    expect(r.status).toBe(1);
+    expect(r.stdout).toContain("not a git repository");
+  });
+
+  it("fails loud on a git repo with no origin remote (no-origin)", async () => {
+    const dir = await tmp("anton-init-");
+    gitInit(dir, false);
+    const r = runInit(dir);
+    expect(r.status).toBe(1);
+    expect(r.stdout).toContain('no "origin" remote');
+  });
+
+  it("configures beads team-config + registers the repo on a fresh repo (fresh-init)", async () => {
+    const dir = await tmp("anton-init-");
+    gitInit(dir, true);
+
+    const r = runInit(dir);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("beads team-config enforced");
+    expect(r.stdout).toContain("registered with anton");
+
+    // config.yaml carries the enforced Dolt-first keys…
+    const cfg = await readFile(join(dir, ".beads", "config.yaml"), "utf8");
+    expect(cfg).toContain("dolt.auto-commit: on");
+    expect(cfg).toContain("export.git-add: false");
+    // …and .gitignore untracks the derived exports + Dolt runtime state.
+    const gi = await readFile(join(dir, ".beads", ".gitignore"), "utf8");
+    for (const e of ["issues.jsonl", "interactions.jsonl", "dolt/", "embeddeddolt/"]) {
+      expect(gi).toContain(e);
+    }
+    // The repo is registered exactly once in the (temp) anton.db.
+    expect(projectCount(resolve(dir))).toBe(1);
+  });
+
+  it("is a no-op on re-run — no clobber, no duplicate registration (idempotent)", async () => {
+    const dir = await tmp("anton-init-");
+    gitInit(dir, true);
+
+    const first = runInit(dir);
+    expect(first.status).toBe(0);
+    const cfgAfterFirst = await readFile(join(dir, ".beads", "config.yaml"), "utf8");
+
+    const second = runInit(dir);
+    expect(second.status).toBe(0);
+    expect(second.stdout).toContain("already registered");
+    // config.yaml is byte-identical — no key re-written on the second pass.
+    expect(await readFile(join(dir, ".beads", "config.yaml"), "utf8")).toBe(cfgAfterFirst);
+    // Still exactly one project row (idempotent by repo_path).
+    expect(projectCount()).toBe(1);
+  });
+
+  it("patches a drifted config.yaml key without clobbering the file (config-drift patch)", async () => {
+    const dir = await tmp("anton-init-");
+    gitInit(dir, true);
+    // A pre-existing workspace whose config.yaml has a DRIFTED value + a missing key. Because .beads/
+    // is present, init skips `bd init` and only enforces the team-config keys.
+    mkdirSync(join(dir, ".beads"), { recursive: true });
+    writeFileSync(join(dir, ".beads", "config.yaml"), "# beads config\ndolt.auto-commit: off\n");
+
+    const r = runInit(dir);
+    expect(r.status).toBe(0);
+
+    const cfg = await readFile(join(dir, ".beads", "config.yaml"), "utf8");
+    expect(cfg).toContain("dolt.auto-commit: on"); // drift patched in place…
+    expect(cfg).not.toContain("dolt.auto-commit: off"); // …not left alongside the stale value
+    expect(cfg).toContain("export.git-add: false"); // missing key appended
   });
 });

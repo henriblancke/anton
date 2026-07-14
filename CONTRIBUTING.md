@@ -9,6 +9,8 @@ bun install          # install dependencies (also installs the husky pre-commit 
 anton setup          # prereq checks, DB migrations, node-pty rebuild
 ```
 
+`anton setup` configures **the anton runtime itself** (this machine's `anton.db` + global `~/.claude` skills/agents) and is run once. To configure **a target repo for anton to drive**, run `anton init <path>` in that repo instead — it enforces the beads team-config and registers the repo with anton (the terminal equivalent of adding a project from the UI; both are idempotent and converge to the same state). Note that git hooks are **optional** for anton-driven repos: the runner pushes Dolt on every write, so `anton init` only warns (never rewrites) when a hooks manager owns the repo's hooks. See the README's [`anton setup` vs `anton init`](./README.md#anton-setup-vs-anton-init) for the full breakdown.
+
 anton is a Next.js app; during development use the scripts directly:
 
 ```bash
