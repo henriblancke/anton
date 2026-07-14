@@ -184,6 +184,7 @@ process.exit(0);`,
     });
 
     const processed = await runner.tickOnce();
+    await runner.whenIdle();
     expect(processed).toBe(1);
 
     // Job succeeded.
@@ -310,6 +311,7 @@ process.exit(0);`,
 
       // First tick → usage limit → job parked (rescheduled), run parked, ticket still open.
       await runner.tickOnce();
+      await runner.whenIdle();
       let job = await getJob(tdb.db, jobId);
       expect(job?.status).toBe("queued"); // rescheduled
       expect(job?.attempts).toBe(0); // quota attempt refunded
@@ -325,6 +327,7 @@ process.exit(0);`,
       // Advance past the reset window → resumes on the SAME run/worktree and completes.
       clock.set(resetSec * 1000 + 1);
       await runner.tickOnce();
+      await runner.whenIdle();
 
       job = await getJob(tdb.db, jobId);
       expect(job?.status).toBe("done");

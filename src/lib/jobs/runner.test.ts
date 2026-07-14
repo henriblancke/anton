@@ -141,6 +141,7 @@ describe("JobRunner (live, in-memory db)", () => {
     });
     const id = await r.enqueue({ type: "execute-epic", payload: { a: 1 } });
     const processed = await r.tickOnce();
+    await r.whenIdle();
     expect(processed).toBe(1);
     expect(ran).toBe(1);
     const job = await getJob(tdb.db, id);
@@ -157,6 +158,7 @@ describe("JobRunner (live, in-memory db)", () => {
     });
     await r.enqueue({ type: "execute-epic", payload: { epicBeadId: "e-1" } });
     await r.tickOnce();
+    await r.whenIdle();
     expect(seen).toEqual({ epicBeadId: "e-1" });
     expect(attempt).toBe(1);
   });
@@ -168,6 +170,7 @@ describe("JobRunner (live, in-memory db)", () => {
     });
     const id = await r.enqueue({ type: "execute-epic" });
     await r.tickOnce();
+    await r.whenIdle();
     const job = await getJob(tdb.db, id);
     expect(job?.status).toBe("queued"); // rescheduled, will auto-resume
     expect(job?.attempts).toBe(0); // attempt refunded — quota isn't the job's fault
@@ -183,6 +186,7 @@ describe("JobRunner (live, in-memory db)", () => {
       ranAfter = true;
     });
     expect(await r.tickOnce()).toBe(1);
+    await r.whenIdle();
     expect(ranAfter).toBe(true);
   });
 
@@ -206,6 +210,7 @@ describe("JobRunner (live, in-memory db)", () => {
       ran = true;
     });
     const processed = await r.tickOnce();
+    await r.whenIdle();
     expect(processed).toBe(1);
     expect(ran).toBe(true);
     const job = await getJob(tdb.db, id);
@@ -224,6 +229,7 @@ describe("JobRunner (live, in-memory db)", () => {
 
     // Attempt 1 → reschedule (backoff 1s)
     await r.tickOnce();
+    await r.whenIdle();
     let job = await getJob(tdb.db, id);
     expect(job?.status).toBe("queued");
     expect(job?.attempts).toBe(1);
@@ -231,6 +237,7 @@ describe("JobRunner (live, in-memory db)", () => {
     // Advance past backoff, attempt 2 → reschedule (backoff 2s)
     clock.advance(2_000);
     await r.tickOnce();
+    await r.whenIdle();
     job = await getJob(tdb.db, id);
     expect(job?.status).toBe("queued");
     expect(job?.attempts).toBe(2);
@@ -238,6 +245,7 @@ describe("JobRunner (live, in-memory db)", () => {
     // Advance past backoff, attempt 3 → maxAttempts reached → park
     clock.advance(5_000);
     await r.tickOnce();
+    await r.whenIdle();
     job = await getJob(tdb.db, id);
     expect(job?.status).toBe("parked");
     expect(job?.attempts).toBe(3);
@@ -254,6 +262,7 @@ describe("JobRunner (live, in-memory db)", () => {
     });
     const id = await r.enqueue({ type: "execute-epic" });
     await r.tickOnce();
+    await r.whenIdle();
     const job = await getJob(tdb.db, id);
     expect(job?.status).toBe("parked");
     expect(job?.attempts).toBe(1);
@@ -273,7 +282,9 @@ describe("JobRunner (live, in-memory db)", () => {
       { maxConcurrent: 2 },
     );
     for (let i = 0; i < 5; i++) await r.enqueue({ type: "execute-epic" });
-    await r.tickOnce();
+    // One tick leases only up to the global cap (2); the rest stay queued.
+    expect(await r.tickOnce()).toBe(2);
+    await r.whenIdle();
     expect(peak).toBeLessThanOrEqual(2);
   });
 
@@ -287,6 +298,7 @@ describe("JobRunner (live, in-memory db)", () => {
     await r.enqueue({ type: "execute-epic", projectId: "B", payload: { n: 3 } });
 
     const processed = await r.tickOnce();
+    await r.whenIdle();
     expect(processed).toBe(2); // one A + one B, not both A's
 
     const schema = await import("../db/schema");
@@ -311,6 +323,7 @@ describe("JobRunner (live, in-memory db)", () => {
     const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
 
     await r.tickOnce();
+    await r.whenIdle();
     const job = await getJob(tdb.db, id);
     expect(job?.status).toBe("queued"); // rescheduled (attempt 1 < maxAttempts)
     expect(job?.attempts).toBe(1);
@@ -330,9 +343,98 @@ describe("JobRunner (live, in-memory db)", () => {
     const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
 
     await r.tickOnce();
+    await r.whenIdle();
     const job = await getJob(tdb.db, id);
     expect(job?.status).toBe("parked");
     expect(job?.attempts).toBe(1);
     expect(job?.lastError).toMatch(/failed 1/);
   });
+
+  it("leases and settles a fast job while a long job is still in flight (rolling dispatch)", async () => {
+    // The core parallel-sessions fix: a long job in flight must not block the next lease.
+    let releaseSlow!: () => void;
+    const slowGate = new Promise<void>((resolve) => {
+      releaseSlow = resolve;
+    });
+    let slowFinished = false;
+    let fastFinished = false;
+
+    const r = new JobRunner({ db: tdb.db, clock, config: { ...CONFIG, maxConcurrent: 5 } });
+    r.registerHandler("execute-epic", async (ctx) => {
+      if ((ctx.payload as { slow?: boolean }).slow) {
+        await slowGate;
+        slowFinished = true;
+      } else {
+        fastFinished = true;
+      }
+    });
+
+    const slowId = await r.enqueue({ type: "execute-epic", payload: { slow: true } });
+    // Tick leases + dispatches the slow job without awaiting it.
+    expect(await r.tickOnce()).toBe(1);
+    expect(r.activeCount).toBe(1);
+
+    // A job enqueued while the slow one is still running is leased on the very next tick…
+    const fastId = await r.enqueue({ type: "execute-epic", payload: { slow: false } });
+    expect(await r.tickOnce()).toBe(1);
+
+    // …and settles to `done` before the slow job finishes.
+    await waitUntil(async () => (await getJob(tdb.db, fastId))?.status === "done");
+    expect(fastFinished).toBe(true);
+    expect(slowFinished).toBe(false); // slow job is still blocked in flight
+    expect((await getJob(tdb.db, slowId))?.status).toBe("running");
+    expect(r.activeCount).toBe(1); // only the slow job remains in flight
+
+    // Release the slow job and drain: it settles too.
+    releaseSlow();
+    await r.whenIdle();
+    expect(slowFinished).toBe(true);
+    expect((await getJob(tdb.db, slowId))?.status).toBe("done");
+    expect(r.activeCount).toBe(0);
+  });
+
+  it("never oversubscribes global capacity across rolling ticks", async () => {
+    // Six jobs, global cap 2, each blocked in flight. No tick may push the in-flight set past 2.
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let peak = 0;
+    const r = new JobRunner({ db: tdb.db, clock, config: { ...CONFIG, maxConcurrent: 2 } });
+    r.registerHandler("execute-epic", async () => {
+      peak = Math.max(peak, r.activeCount);
+      await gate;
+    });
+    for (let i = 0; i < 6; i++) await r.enqueue({ type: "execute-epic" });
+
+    // First tick fills the two slots; while they stay in flight, later ticks lease nothing.
+    expect(await r.tickOnce()).toBe(2);
+    expect(await r.tickOnce()).toBe(0);
+    expect(await r.tickOnce()).toBe(0);
+    expect(r.activeCount).toBe(2);
+    expect(peak).toBeLessThanOrEqual(2);
+
+    // Drain the two in flight; the remaining four are picked up two-at-a-time on later ticks.
+    release();
+    await r.whenIdle();
+    expect(peak).toBeLessThanOrEqual(2);
+    expect(await r.tickOnce()).toBe(2);
+    await r.whenIdle();
+    expect(await r.tickOnce()).toBe(2);
+    await r.whenIdle();
+    expect(await r.tickOnce()).toBe(0); // all six done
+  });
 });
+
+/** Poll `pred` on real timers until it holds (used with in-flight jobs the FakeClock can't drive). */
+async function waitUntil(
+  pred: () => boolean | Promise<boolean>,
+  { timeoutMs = 1_000, stepMs = 5 }: { timeoutMs?: number; stepMs?: number } = {},
+): Promise<void> {
+  const start = Date.now();
+  for (;;) {
+    if (await pred()) return;
+    if (Date.now() - start > timeoutMs) throw new Error("waitUntil: timed out");
+    await new Promise((resolve) => setTimeout(resolve, stepMs));
+  }
+}

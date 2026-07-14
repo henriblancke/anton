@@ -182,6 +182,7 @@ process.exit(0);`,
       payload: { projectId },
     });
     expect(await runner.tickOnce()).toBe(1);
+    await runner.whenIdle();
 
     // Job succeeded.
     expect((await getJob(tdb.db, jobId))?.status).toBe("done");
@@ -232,6 +233,7 @@ process.exit(0);`,
       runner.registerHandler("review-fix", makeReviewFixHandler({ db: tdb.db, clock }));
       await runner.enqueue({ type: "review-fix", projectId, payload: { projectId } });
       expect(await runner.tickOnce()).toBe(1);
+      await runner.whenIdle();
 
       const invocations = readFileSync(join(sandbox, "claude-argv.jsonl"), "utf8")
         .trim()
@@ -274,6 +276,7 @@ process.exit(0);`,
       runner.registerHandler("review-fix", makeReviewFixHandler({ db: tdb.db, clock }));
       const jobId = await runner.enqueue({ type: "review-fix", projectId, payload: { projectId } });
       expect(await runner.tickOnce()).toBe(1);
+      await runner.whenIdle();
       expect((await getJob(tdb.db, jobId))?.status).toBe("done");
 
       // The previously-unpushed commit is now on origin.
@@ -304,6 +307,7 @@ process.exit(0);`,
       runner.registerHandler("review-fix", makeReviewFixHandler({ db: tdb.db, clock }));
       const jobId = await runner.enqueue({ type: "review-fix", projectId, payload: { projectId } });
       expect(await runner.tickOnce()).toBe(1);
+      await runner.whenIdle();
       expect((await getJob(tdb.db, jobId))?.status).toBe("done");
       // Nothing actionable → no worktree/claude/session work happened.
       const after = await tdb.db.select().from(schema.sessions);
