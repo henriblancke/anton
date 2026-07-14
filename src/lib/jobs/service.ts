@@ -25,6 +25,7 @@ const log: RunnerLogger = {
 
 let _runner: JobRunner | null = null;
 let _scheduler: Scheduler | null = null;
+let _reconciled = false;
 
 /**
  * Global ceiling on total in-flight jobs across all projects — a safety bound above the per-project
@@ -69,12 +70,20 @@ export function getScheduler(): Scheduler {
 
 /**
  * Idempotent: reconcile crash-orphaned jobs/runs (anton-nbd), then start the background runner loop
- * + the cron scheduler. Call once at server boot. Reconciliation runs before the loop so a restart
+ * + the cron scheduler. Meant to be called once at server boot, but tolerant of re-entry (dev
+ * hot-reload, tests): reconciliation runs at most once — the first call only — because it expires
+ * every `running` lease, and a second call while this process already has jobs in flight would
+ * reclaim its own live leases and let the next tick dispatch those job ids a second time. `start()`
+ * and the scheduler are themselves idempotent. Reconciliation runs before the loop so a restart
  * re-dispatches in-flight work on the first tick rather than after a lease window; it's best-effort
  * and never blocks startup.
  */
 export async function startRunner(): Promise<void> {
-  await getRunner().reconcile();
+  if (!_reconciled) {
+    // Set before awaiting so a concurrent second call can't slip past into a second reconcile.
+    _reconciled = true;
+    await getRunner().reconcile();
+  }
   getRunner().start();
   getScheduler().start();
 }
