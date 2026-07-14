@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
-import { enqueueExecuteEpicDeduped, systemClock } from "./queue";
+import { enqueueExecuteEpicDeduped, getJob, resumeJob, systemClock } from "./queue";
 
 let t: TestDb;
 beforeEach(() => {
@@ -117,5 +117,38 @@ describe("jobs_active_epic_unique (DB backstop)", () => {
     const second = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-race");
     expect(second).toBe(winner);
     expect(activeRows()).toHaveLength(1);
+  });
+});
+
+describe("resumeJob vs the active-epic index (anton-ner)", () => {
+  it("no-ops (returns false) when a fresh active job already covers the epic", async () => {
+    // A job parks; the dedupe path (which ignores parked/failed) then spawns a fresh queued job for
+    // the same project + epic. Reviving the parked row would be a *second* active job for that epic
+    // and trip `jobs_active_epic_unique` — so resume must no-op cleanly rather than surface a 500.
+    const parked = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-1");
+    t.db.update(schema.jobs).set({ status: "parked" }).where(eq(schema.jobs.id, parked)).run();
+
+    const fresh = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-1"); // allowed after parked
+    expect(fresh).not.toBe(parked);
+
+    expect(await resumeJob(t.db, systemClock, parked)).toBe(false);
+    // The parked row is untouched; the fresh job stays the single active one for the epic.
+    expect((await getJob(t.db, parked))?.status).toBe("parked");
+    const active = activeRows().filter(
+      (j) => j.status === "queued" || j.status === "running",
+    );
+    expect(active).toHaveLength(1);
+    expect(active[0]?.id).toBe(fresh);
+  });
+
+  it("still un-parks an execute-epic job when no active duplicate exists", async () => {
+    // The guard is scoped to a genuine duplicate — with no active job for the epic, resume works.
+    const parked = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-solo");
+    t.db.update(schema.jobs).set({ status: "parked" }).where(eq(schema.jobs.id, parked)).run();
+
+    expect(await resumeJob(t.db, systemClock, parked)).toBe(true);
+    const job = await getJob(t.db, parked);
+    expect(job?.status).toBe("queued");
+    expect(job?.attempts).toBe(0);
   });
 });

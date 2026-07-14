@@ -7,7 +7,7 @@
  * Mirrors runs.ts: uses the shared `getDb()` connection and exposes a pure row→summary mapper so
  * the field extraction (JSON payload parse, timestamp normalization) is unit-testable.
  */
-import { desc, eq } from "drizzle-orm";
+import { count, desc, eq } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import type { JobStatus, JobType } from "./jobs/queue";
 
@@ -79,5 +79,29 @@ export async function listJobs(projectId: string): Promise<JobSummary[]> {
     .from(schema.jobs)
     .where(eq(schema.jobs.projectId, projectId))
     .orderBy(desc(schema.jobs.updatedAt));
+  return rows.map(toJobSummary);
+}
+
+/** Total job rows for a project — for pagination. */
+export async function countJobs(projectId: string): Promise<number> {
+  const rows = await getDb()
+    .select({ n: count() })
+    .from(schema.jobs)
+    .where(eq(schema.jobs.projectId, projectId));
+  return rows[0]?.n ?? 0;
+}
+
+/** One page of jobs, newest activity first, across every type and status. */
+export async function listJobsPaged(
+  projectId: string,
+  opts: { limit: number; offset: number },
+): Promise<JobSummary[]> {
+  const rows = await getDb()
+    .select()
+    .from(schema.jobs)
+    .where(eq(schema.jobs.projectId, projectId))
+    .orderBy(desc(schema.jobs.updatedAt))
+    .limit(opts.limit)
+    .offset(opts.offset);
   return rows.map(toJobSummary);
 }

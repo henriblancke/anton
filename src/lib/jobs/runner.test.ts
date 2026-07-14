@@ -576,6 +576,47 @@ describe("JobRunner (live, in-memory db)", () => {
     await r.whenIdle();
     expect(await r.tickOnce()).toBe(0); // all six done
   });
+
+  it("never re-leases an in-flight job whose lease has lapsed (rolling dispatch, anton-ner)", async () => {
+    // A long job stays in `inFlight` while its handler works. If its lease lapses mid-flight (a
+    // missed renewal from laptop sleep or a transient DB failure) its `running` row looks
+    // reclaimable — but a spare-capacity tick must NOT dispatch it a second time against the same
+    // worktree. leaseDue excludes the runner's in-flight ids, so nothing is leased.
+    let starts = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const r = new JobRunner({ db: tdb.db, clock, config: { ...CONFIG, maxConcurrent: 5 } });
+    r.registerHandler("execute-epic", async () => {
+      starts += 1;
+      await gate;
+    });
+
+    const id = await r.enqueue({ type: "execute-epic" });
+    expect(await r.tickOnce()).toBe(1);
+    await waitUntil(() => starts === 1); // handler is genuinely in flight
+    expect(r.activeCount).toBe(1);
+
+    // Let the lease lapse while the handler is still blocked in flight.
+    clock.advance(CONFIG.leaseMs + 1);
+
+    // Spare capacity + a reclaimable-looking row, yet the in-flight job is excluded → nothing leased.
+    expect(await r.tickOnce()).toBe(0);
+    expect(await r.tickOnce()).toBe(0);
+    expect(r.activeCount).toBe(1); // still just the one handler
+    expect(starts).toBe(1); // handler never re-entered
+
+    // Its lease/attempts weren't overwritten by a phantom re-lease.
+    const stillRunning = await getJob(tdb.db, id);
+    expect(stillRunning?.status).toBe("running");
+    expect(stillRunning?.attempts).toBe(1);
+
+    // Drain: releasing the gate lets the single handler settle to done.
+    release();
+    await r.whenIdle();
+    expect((await getJob(tdb.db, id))?.status).toBe("done");
+  });
 });
 
 /** Poll `pred` on real timers until it holds (used with in-flight jobs the FakeClock can't drive). */

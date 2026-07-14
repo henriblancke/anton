@@ -2,7 +2,7 @@
  * Read-only access to the machine-local `runs` table. Runs are execution plumbing (worktree,
  * lease, model, agent); stage/PR live in beads. See DESIGN.md §3.
  */
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, count, desc, eq, inArray } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import type { AntonDb, Clock } from "./jobs/queue";
 
@@ -60,6 +60,30 @@ export async function listRuns(projectId: string): Promise<RunSummary[]> {
     .from(schema.runs)
     .where(eq(schema.runs.projectId, projectId))
     .orderBy(desc(schema.runs.updatedAt));
+  return rows.map(toSummary);
+}
+
+/** Total run rows for a project — for pagination. */
+export async function countRuns(projectId: string): Promise<number> {
+  const rows = await getDb()
+    .select({ n: count() })
+    .from(schema.runs)
+    .where(eq(schema.runs.projectId, projectId));
+  return rows[0]?.n ?? 0;
+}
+
+/** One page of runs, newest activity first. */
+export async function listRunsPaged(
+  projectId: string,
+  opts: { limit: number; offset: number },
+): Promise<RunSummary[]> {
+  const rows = await getDb()
+    .select()
+    .from(schema.runs)
+    .where(eq(schema.runs.projectId, projectId))
+    .orderBy(desc(schema.runs.updatedAt))
+    .limit(opts.limit)
+    .offset(opts.offset);
   return rows.map(toSummary);
 }
 
