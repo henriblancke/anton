@@ -4,12 +4,13 @@ import { SquareTerminalIcon } from "lucide-react";
 
 import { getProjectBySlug } from "@/lib/projects";
 import { listRuns, type RunStatus, type RunSummary } from "@/lib/runs";
+import { isActiveJob, listJobs, type JobStatus, type JobSummary } from "@/lib/jobs-view";
 import { cn } from "@/lib/utils";
 import { fmtDuration, isActiveRun } from "@/components/runs/run-view-utils";
 
 export const dynamic = "force-dynamic";
 
-const STATUS_STYLE: Record<RunStatus, { dot: string; text: string; pulse?: boolean }> = {
+const STATUS_STYLE: Record<RunStatus | JobStatus, { dot: string; text: string; pulse?: boolean }> = {
   running: { dot: "bg-stage-implementing", text: "text-stage-implementing", pulse: true },
   queued: { dot: "bg-stage-backlog", text: "text-muted-foreground" },
   parked: { dot: "bg-risk-med", text: "text-risk-med" },
@@ -36,10 +37,11 @@ export default async function ProjectRunsPage({
   const project = await getProjectBySlug(slug);
   if (!project) notFound();
 
-  const runs = await listRuns(project.id);
+  const [runs, jobs] = await Promise.all([listRuns(project.id), listJobs(project.id)]);
   // Split active (queued/running/parked) from history (done/failed) for diagnostics browsing.
   const active = runs.filter((r) => isActiveRun(r.status));
   const history = runs.filter((r) => !isActiveRun(r.status));
+  const isEmpty = runs.length === 0 && jobs.length === 0;
 
   return (
     <div className="flex flex-1 flex-col">
@@ -52,7 +54,7 @@ export default async function ProjectRunsPage({
         <span className="ml-1 font-mono text-[11px] text-subtle">{runs.length}</span>
       </header>
 
-      {runs.length === 0 ? (
+      {isEmpty ? (
         <div className="flex flex-1 flex-col items-center justify-center gap-4 p-8 text-center">
           <span className="flex size-12 items-center justify-center rounded-xl border border-dashed border-border">
             <SquareTerminalIcon className="size-5 text-subtle" aria-hidden="true" />
@@ -73,6 +75,7 @@ export default async function ProjectRunsPage({
         <div className="flex flex-col">
           {active.length > 0 && <RunGroup label="Active" runs={active} slug={slug} />}
           {history.length > 0 && <RunGroup label="History" runs={history} slug={slug} />}
+          {jobs.length > 0 && <JobGroup jobs={jobs} />}
         </div>
       )}
     </div>
@@ -92,6 +95,57 @@ function RunGroup({ label, runs, slug }: { label: string; runs: RunSummary[]; sl
         ))}
       </ul>
     </section>
+  );
+}
+
+/**
+ * All queue activity from the `jobs` table — every type (execute-epic, review-fix,
+ * nightly-stringer, orphan-grooming) and every status, so parked/failed jobs stay auditable even
+ * when they never wrote a `runs` row. Reads the same table the runner mutates, so status is
+ * always consistent with the runner (anton-ner.3).
+ */
+function JobGroup({ jobs }: { jobs: JobSummary[] }) {
+  return (
+    <section>
+      <div className="flex items-center gap-2 border-b border-border bg-card/30 px-6 py-2">
+        <span className="font-mono text-[10px] tracking-[0.05em] text-subtle uppercase">Jobs</span>
+        <span className="font-mono text-[10px] text-subtle">{jobs.length}</span>
+      </div>
+      <ul className="flex flex-col divide-y divide-border">
+        {jobs.map((job) => (
+          <JobRow key={job.id} job={job} />
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+function JobRow({ job }: { job: JobSummary }) {
+  const style = STATUS_STYLE[job.status];
+  const finished = !isActiveJob(job.status);
+  return (
+    <li className="flex items-center gap-4 px-6 py-3.5">
+      <span
+        className={cn("size-2 shrink-0 rounded-full", style.dot, style.pulse && "anton-pulse")}
+        aria-hidden="true"
+      />
+      <div className="flex min-w-0 flex-col gap-0.5">
+        <span className="truncate font-mono text-[13px]">{job.type}</span>
+        <span className="truncate font-mono text-[11px] text-subtle">
+          {job.epicBeadId ? `${job.epicBeadId} · ` : ""}
+          {job.attempts} {job.attempts === 1 ? "attempt" : "attempts"}
+          {job.lastError ? ` · ${job.lastError}` : ""}
+        </span>
+      </div>
+      <div className="ml-auto flex shrink-0 flex-col items-end gap-0.5">
+        <span className={cn("font-mono text-[11px]", style.text)}>{job.status}</span>
+        <span className="font-mono text-[10px] text-subtle">
+          {finished
+            ? `${fmtDuration(job.createdAt, job.updatedAt)} · ${relativeTime(job.updatedAt)}`
+            : relativeTime(job.createdAt)}
+        </span>
+      </div>
+    </li>
   );
 }
 
