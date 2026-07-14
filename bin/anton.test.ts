@@ -5,17 +5,20 @@
  */
 import { afterEach, describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
+import { mkdirSync, writeFileSync } from "node:fs";
 import {
   agentsFromArgs,
   applyMigrations,
   compareVersions,
+  ensureBeadsGitignore,
   ensureBetterSqlite3,
   nextArgs,
+  parseInitArgs,
   platformLabel,
   provisionAgentsSkills,
   REQUIRED_SKILLS,
@@ -44,6 +47,7 @@ describe("anton CLI dispatch", () => {
     expect(r.status).toBe(0);
     expect(r.stdout).toContain("anton <command>");
     expect(r.stdout).toContain("setup");
+    expect(r.stdout).toContain("init");
     expect(r.stdout).toContain("start");
   });
 
@@ -100,6 +104,61 @@ describe("agentsFromArgs", () => {
     expect(agentsFromArgs(["--no-agents"])).toEqual([]);
     expect(agentsFromArgs(["--agents", "nextjs,fastapi"])).toBe("nextjs,fastapi");
     expect(agentsFromArgs(["--agents=all"])).toBe("all");
+  });
+});
+
+describe("parseInitArgs (anton init)", () => {
+  it("defaults path/prefix to null and parses a bare path", () => {
+    expect(parseInitArgs([])).toEqual({ path: null, prefix: null });
+    expect(parseInitArgs(["/repos/foo"])).toEqual({ path: "/repos/foo", prefix: null });
+  });
+
+  it("parses --prefix <p>, --prefix=<p>, and -p <p>, keeping the first bare token as path", () => {
+    expect(parseInitArgs(["/repos/foo", "--prefix", "acme"])).toEqual({ path: "/repos/foo", prefix: "acme" });
+    expect(parseInitArgs(["--prefix=acme", "/repos/foo"])).toEqual({ path: "/repos/foo", prefix: "acme" });
+    expect(parseInitArgs(["-p", "acme"])).toEqual({ path: null, prefix: "acme" });
+    // The prefix value is not mistaken for the path.
+    expect(parseInitArgs(["--prefix", "acme", "/repos/foo"])).toEqual({ path: "/repos/foo", prefix: "acme" });
+  });
+});
+
+describe("ensureBeadsGitignore (anton init)", () => {
+  let dir: string;
+  afterEach(async () => {
+    if (dir) await rm(dir, { recursive: true, force: true });
+  });
+
+  it("appends missing entries, preserves existing content, and is idempotent (no-clobber)", async () => {
+    dir = await mkdtemp(join(tmpdir(), "anton-gi-"));
+    const beadsDir = join(dir, ".beads");
+    mkdirSync(beadsDir, { recursive: true });
+    // A bd-init-style .gitignore already covers the Dolt runtime, but not the JSONL exports.
+    writeFileSync(join(beadsDir, ".gitignore"), "dolt/\nembeddeddolt/\n");
+
+    const first = ensureBeadsGitignore(beadsDir);
+    expect(first.added).toEqual(["issues.jsonl", "interactions.jsonl"]);
+    const after = await readFile(join(beadsDir, ".gitignore"), "utf8");
+    expect(after).toContain("dolt/"); // pre-existing content preserved
+    expect(after).toContain("issues.jsonl");
+    expect(after).toContain("interactions.jsonl");
+
+    // Re-run: everything present → no additions, file byte-identical.
+    const second = ensureBeadsGitignore(beadsDir);
+    expect(second.added).toEqual([]);
+    expect(await readFile(join(beadsDir, ".gitignore"), "utf8")).toBe(after);
+  });
+
+  it("creates the file with all required entries when absent", async () => {
+    dir = await mkdtemp(join(tmpdir(), "anton-gi-"));
+    const beadsDir = join(dir, ".beads");
+    mkdirSync(beadsDir, { recursive: true });
+
+    const r = ensureBeadsGitignore(beadsDir);
+    expect(r.added).toEqual(["issues.jsonl", "interactions.jsonl", "dolt/", "embeddeddolt/"]);
+    const text = await readFile(join(beadsDir, ".gitignore"), "utf8");
+    for (const e of ["issues.jsonl", "interactions.jsonl", "dolt/", "embeddeddolt/"]) {
+      expect(text).toContain(e);
+    }
   });
 });
 
