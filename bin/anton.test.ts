@@ -21,6 +21,7 @@ import {
   parseInitArgs,
   platformLabel,
   provisionAgentsSkills,
+  registerProject,
   REQUIRED_SKILLS,
   resolvePort,
 } from "./anton.mjs";
@@ -219,6 +220,46 @@ describe("applyMigrations (in-process, no drizzle-kit)", () => {
         .prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table'")
         .get() as { n: number };
       expect(tables.n).toBeGreaterThan(1);
+    } finally {
+      sqlite.close();
+    }
+  });
+});
+
+describe("registerProject (anton init → projects board, anton-uez)", () => {
+  let dir: string;
+  afterEach(async () => {
+    if (dir) await rm(dir, { recursive: true, force: true });
+  });
+
+  it("registers a repo in anton.db + seeds schedules, idempotently by repoPath", async () => {
+    dir = await mkdtemp(join(tmpdir(), "anton-reg-"));
+    const dbPath = join(dir, "anton.db");
+    const repoPath = join(dir, "repo");
+    mkdirSync(repoPath, { recursive: true });
+
+    const first = registerProject(repoPath, { appRoot: REPO_ROOT, dbPath });
+    expect(first.ok).toBe(true);
+    expect(first.created).toBe(true);
+    expect(first.slug).toBe("repo");
+
+    // Re-registering the same repoPath is a no-op — no duplicate row.
+    const second = registerProject(repoPath, { appRoot: REPO_ROOT, dbPath });
+    expect(second.ok).toBe(true);
+    expect(second.created).toBe(false);
+    expect(second.slug).toBe("repo");
+
+    const require = createRequire(join(REPO_ROOT, "package.json"));
+    const Database = require("better-sqlite3");
+    const sqlite = new Database(dbPath);
+    try {
+      const projects = sqlite
+        .prepare("SELECT COUNT(*) AS n FROM projects WHERE repo_path = ?")
+        .get(repoPath) as { n: number };
+      expect(projects.n).toBe(1);
+      // The three default schedules are seeded once (idempotent per type).
+      const schedules = sqlite.prepare("SELECT COUNT(*) AS n FROM schedules").get() as { n: number };
+      expect(schedules.n).toBe(3);
     } finally {
       sqlite.close();
     }

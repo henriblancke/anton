@@ -31,8 +31,14 @@ import {
   writeFileSync,
 } from "node:fs";
 import { arch as osArch, homedir, platform as osPlatform } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
+import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
+import {
+  beadsPrereqs,
+  configureBeadsForRepo,
+  ensureBeadsGitignore,
+} from "../src/lib/beads/config.mjs";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { fileURLToPath } from "node:url";
@@ -718,29 +724,14 @@ async function cmdSetup(args = []) {
   return 0;
 }
 
-// ── Per-project init (anton init — anton-9bo) ────────────────────────────────────────────────
-// The in-project half of `anton init`: given a target repo, enforce anton's committed beads
-// team-config so the executor can drive its board deterministically. Prereqs (bd + git repo +
-// origin remote) fail loud with the fix. `bd init` runs only when .beads/ is absent. config.yaml
-// and .beads/.gitignore are patched idempotently (never clobbered) so a re-run — or a run on an
-// already-configured repo — is a no-op. Dolt remote wiring + anton project registration are
-// separate tickets (anton-43b / anton-uez).
-//
-// The correct team-config is the Dolt-first model (issues live in Dolt, synced over refs/dolt/data;
-// the JSONL is a passive export): dolt.auto-commit "on", export.git-add false, and .gitignore that
-// keeps the derived exports + Dolt runtime state out of git.
-
-/** True when `dir` is inside a git work tree. */
-function isGitWorkTree(dir) {
-  const r = spawnSync("git", ["-C", dir, "rev-parse", "--is-inside-work-tree"], { stdio: "ignore" });
-  return r.status === 0;
-}
-
-/** True when `dir`'s repo has an `origin` remote configured. */
-function hasOriginRemote(dir) {
-  const r = spawnSync("git", ["-C", dir, "remote", "get-url", "origin"], { stdio: "ignore" });
-  return r.status === 0;
-}
+// ── Per-project init (anton init — anton-9bo / anton-uez) ────────────────────────────────────
+// `anton init <repo>` does two things: (1) enforce anton's committed beads team-config so the
+// executor can drive its board deterministically, and (2) register the repo with anton so it shows
+// on the projects board. Prereqs (bd + git repo + origin remote) fail loud with the fix. The
+// beads-config path is shared with `addProject` (src/lib/beads/config.mjs) so a repo configured here
+// and one added through the UI/API converge to the SAME end state — `bd init` (when absent) →
+// config.yaml enforcement → .beads/.gitignore → [Dolt remote wiring, anton-43b]. Every step is
+// idempotent, so a re-run — or a run on an already-configured/registered repo — is a no-op.
 
 /** Parse `anton init` args: first bare token is the target path; `--prefix <p>` / `-p <p>` the bd prefix. */
 function parseInitArgs(args) {
@@ -763,64 +754,88 @@ function parseInitArgs(args) {
   return { path, prefix };
 }
 
-/** The `.beads/.gitignore` entries anton's team-config requires: derived exports + Dolt runtime state. */
-const BEADS_GITIGNORE_ENTRIES = ["issues.jsonl", "interactions.jsonl", "dolt/", "embeddeddolt/"];
-
-/**
- * Idempotently ensure `.beads/.gitignore` untracks the JSONL exports + Dolt runtime state. Appends
- * only the missing entries (never clobbers existing lines/content) and creates the file if absent.
- * Returns { path, added } — `added` is empty on a no-op.
- */
-function ensureBeadsGitignore(beadsDir, entries = BEADS_GITIGNORE_ENTRIES) {
-  const path = join(beadsDir, ".gitignore");
-  let existing = "";
-  try {
-    existing = readFileSync(path, "utf8");
-  } catch {
-    existing = "";
-  }
-  const present = new Set(existing.split("\n").map((l) => l.trim()));
-  const added = entries.filter((e) => !present.has(e));
-  if (added.length === 0) return { path, added };
-
-  const header = "# anton: beads exports are derived from Dolt — never commit them";
-  const sep = existing.length === 0 ? "" : existing.endsWith("\n") ? "\n" : "\n\n";
-  writeFileSync(path, existing + sep + header + "\n" + added.join("\n") + "\n");
-  return { path, added };
+/** The anton.db the server reads — env override, else the persistent state dir (bundle) / APP_ROOT. */
+function resolveAntonDb() {
+  if (process.env.ANTON_DB) return process.env.ANTON_DB;
+  return IS_BUNDLE ? join(STATE_DIR, "anton.db") : join(APP_ROOT, "anton.db");
 }
 
-/**
- * True when `.beads/config.yaml` carries an *uncommented* `key: value` matching `want` (surrounding
- * quotes tolerated, e.g. `dolt.auto-commit: "on"`). We check the FILE — not `bd config get` — because
- * the team-config must be committed to config.yaml to travel to every clone; `bd config get` also
- * reflects the Dolt DB (where `bd init --dolt-auto-commit on` lands it), which is not portable.
- */
-function configYamlHas(beadsDir, key, want) {
-  let text = "";
-  try {
-    text = readFileSync(join(beadsDir, "config.yaml"), "utf8");
-  } catch {
-    return false;
-  }
-  const esc = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const re = new RegExp(`^\\s*${esc}:\\s*(.+?)\\s*$`);
-  for (const line of text.split("\n")) {
-    if (line.trimStart().startsWith("#")) continue;
-    const m = line.match(re);
-    if (m) return m[1].replace(/^["']|["']$/g, "") === want;
-  }
-  return false;
+/** The repo's current branch, defaulting to "main" (mirrors detectDefaultBranch in projects.ts). */
+function detectRepoDefaultBranch(dir) {
+  const r = spawnSync("git", ["-C", dir, "symbolic-ref", "--short", "HEAD"], { encoding: "utf8" });
+  return (r.stdout ?? "").trim() || "main";
 }
 
+/** Slugify a name the same way projects.ts's toSlug does. */
+function slugify(input) {
+  return input
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+// Mirror of DEFAULT_SCHEDULES in src/lib/schedules.ts — kept in sync manually (the pure-node CLI
+// can't import the TS). Seeded with next_run_at = now so the scheduler fires each once on its next
+// tick and then advances to the real cron slot; the same three rows addProject seeds via drizzle.
+const DEFAULT_SCHEDULE_DEFS = [
+  { type: "review-fix", cron: "*/15 * * * *" },
+  { type: "nightly-stringer", cron: "0 3 * * *" },
+  { type: "orphan-grooming", cron: "0 4 * * 1" },
+];
+
 /**
- * Idempotently ensure config.yaml carries `key: want`. `bd config set` patches config.yaml (appends a
- * single key line, never clobbering the rest); we skip the write when the file already matches so a
- * re-run is a true no-op. Returns "already" | "set" | "failed".
+ * Register `dir` in anton.db so it appears on the projects board (anton-uez). The pure-node CLI
+ * can't import the TypeScript addProject, so — like applyMigrations — it writes anton.db directly
+ * via better-sqlite3, producing an equivalent projects row + default schedules. Idempotent by
+ * repo_path: an already-registered repo is a no-op. Returns { ok, created, slug } or { ok:false,
+ * error } — a registration failure is surfaced by the caller but never undoes the beads config.
  */
-function ensureBdConfig(dir, beadsDir, key, want) {
-  if (configYamlHas(beadsDir, key, want)) return "already";
-  const r = spawnSync("bd", ["config", "set", key, want], { cwd: dir, stdio: "ignore" });
-  return (r.status ?? 1) === 0 ? "set" : "failed";
+function registerProject(dir, opts = {}) {
+  const appRoot = opts.appRoot ?? APP_ROOT;
+  const dbPath = opts.dbPath ?? resolveAntonDb();
+  try {
+    applyMigrations(dbPath, { appRoot }); // ensure anton.db exists + schema is current (idempotent)
+    const require = createRequire(join(appRoot, "package.json"));
+    const Database = require("better-sqlite3");
+    const db = new Database(dbPath);
+    try {
+      db.pragma("foreign_keys = ON");
+      const repoPath = resolve(dir);
+      const existing = db.prepare("SELECT slug FROM projects WHERE repo_path = ?").get(repoPath);
+      if (existing) return { ok: true, created: false, slug: existing.slug };
+
+      // Unique slug from the repo basename (matches addProject's toSlug + uniqueSlug).
+      const base = slugify(basename(repoPath)) || "project";
+      const taken = new Set(db.prepare("SELECT slug FROM projects").all().map((r) => r.slug));
+      let slug = base;
+      for (let n = 2; taken.has(slug); n++) slug = `${base}-${n}`;
+
+      const id = randomUUID();
+      const branch = detectRepoDefaultBranch(repoPath);
+      const nowSec = Math.floor(Date.now() / 1000);
+      const insertProject = db.prepare(
+        "INSERT INTO projects (id, slug, name, repo_path, default_branch) VALUES (?, ?, ?, ?, ?)",
+      );
+      // NOT EXISTS guard makes schedule seeding idempotent per (project, type) — matching ensureSchedule.
+      const insertSchedule = db.prepare(
+        "INSERT INTO schedules (id, project_id, type, cron, enabled, next_run_at) " +
+          "SELECT ?, ?, ?, ?, 1, ? WHERE NOT EXISTS " +
+          "(SELECT 1 FROM schedules WHERE project_id = ? AND type = ?)",
+      );
+      db.transaction(() => {
+        insertProject.run(id, slug, basename(repoPath), repoPath, branch);
+        for (const s of DEFAULT_SCHEDULE_DEFS) {
+          insertSchedule.run(randomUUID(), id, s.type, s.cron, nowSec, id, s.type);
+        }
+      })();
+      return { ok: true, created: true, slug };
+    } finally {
+      db.close();
+    }
+  } catch (e) {
+    return { ok: false, error: String(e?.message ?? e) };
+  }
 }
 
 async function cmdInit(args = []) {
@@ -828,61 +843,36 @@ async function cmdInit(args = []) {
   const dir = resolve(rawPath ?? process.cwd());
   console.log(c.bold("anton init") + c.dim(` ${dir}`));
 
-  // Prereqs — fail loud, each with the fix.
-  if (!onPath("bd")) {
-    console.log(c.red("\n✗ bd not found on PATH.") + " beads is anton's work source of truth.");
-    console.log(c.dim("  Install it, then re-run: https://github.com/gastownhall/beads"));
-    return 1;
-  }
-  if (!existsSync(dir)) {
-    console.log(c.red(`\n✗ no such directory: ${dir}`));
-    return 1;
-  }
-  if (!isGitWorkTree(dir)) {
-    console.log(c.red(`\n✗ ${dir} is not a git repository.`));
-    console.log(c.dim(`  Initialize one first:  git -C ${dir} init`));
-    return 1;
-  }
-  if (!hasOriginRemote(dir)) {
-    console.log(c.red(`\n✗ no "origin" remote in ${dir}.`) + " beads syncs its Dolt data over the git remote.");
-    console.log(c.dim(`  Add one:  git -C ${dir} remote add origin <url>`));
+  // Prereqs — fail loud, each with the fix (shared with addProject's self-heal gate).
+  const pre = beadsPrereqs(dir);
+  if (!pre.ok) {
+    console.log(c.red(`\n✗ ${pre.error.message}`));
+    if (pre.error.fix) console.log(c.dim(`  ${pre.error.fix}`));
     return 1;
   }
 
-  const beadsDir = join(dir, ".beads");
+  // Enforce beads team-config via the shared config path (bd init when absent → config.yaml → .gitignore).
+  const beads = configureBeadsForRepo(dir, { prefix, log: (m) => console.log(c.dim(`  ${m}`)) });
+  if (!beads.configured) {
+    console.log(c.red("\n✗ beads config failed — see output above."));
+    return 1;
+  }
+  for (const e of beads.errors) console.log(c.yellow(`  ${e}`));
+  console.log(c.green("\n✓ beads team-config enforced.") + c.dim(` (${dir})`));
 
-  // 1. bd init — only when .beads/ is absent (prefix from --prefix, else bd auto-detects from dir name).
-  if (existsSync(beadsDir)) {
-    console.log(c.dim("  .beads/ present — enforcing team-config only (no re-init)."));
+  // Register with anton so the repo shows on the projects board — in the same command (anton-uez).
+  const reg = registerProject(dir);
+  if (reg.ok) {
+    console.log(
+      (reg.created ? c.green("✓ registered with anton") : c.dim("• already registered")) +
+        c.dim(` — project "${reg.slug}"`),
+    );
   } else {
-    const initArgs = ["init", "--non-interactive", "--dolt-auto-commit", "on"];
-    if (prefix) initArgs.push("--prefix", prefix);
-    console.log(c.dim(`  bd ${initArgs.join(" ")}`));
-    // NOTE: bd's global `-C` flag mis-resolves for `init` ("no beads project found"); run with the
-    // target as cwd instead — equivalent, and it's what actually works. (bd 1.0.4)
-    const r = spawnSync("bd", initArgs, { cwd: dir, stdio: "inherit" });
-    if ((r.status ?? 1) !== 0) {
-      console.log(c.red("\nbd init failed — see output above."));
-      return 1;
-    }
+    console.log(c.yellow(`\n! could not register with anton: ${reg.error}`));
+    console.log(c.dim("  beads is configured; run `anton setup`, then add the repo from the UI."));
   }
 
-  // 2. Patch config.yaml idempotently (never clobber).
-  for (const [key, want] of [
-    ["dolt.auto-commit", "on"],
-    ["export.git-add", "false"],
-  ]) {
-    const r = ensureBdConfig(dir, beadsDir, key, want);
-    if (r === "failed") console.log(c.yellow(`  could not set ${key}=${want}`));
-    else console.log(c.dim(`  ${key}=${want} (${r})`));
-  }
-
-  // 3. Ensure .beads/.gitignore untracks the derived exports + Dolt runtime state.
-  const gi = ensureBeadsGitignore(beadsDir);
-  if (gi.added.length) console.log(c.dim(`  .beads/.gitignore += ${gi.added.join(", ")}`));
-  else console.log(c.dim("  .beads/.gitignore already untracks exports + Dolt state"));
-
-  console.log(c.green("\n✓ beads team-config enforced.") + c.dim(` (${dir})\n`));
+  console.log("");
   return 0;
 }
 
@@ -911,7 +901,7 @@ const USAGE = `${c.bold("anton")} — local autonomous-coding orchestrator
 ${c.bold("Usage:")} anton <command>
 
   ${c.bold("setup")}    check prereqs, migrate DB, rebuild node-pty, install agents & skills  ${c.dim("[--agents <a,b,c>|all]")}
-  ${c.bold("init")}     configure beads in a target repo (prereqs → bd init → team-config)  ${c.dim("[path] [--prefix <p>]")}
+  ${c.bold("init")}     configure beads in a target repo + register it with anton  ${c.dim("[path] [--prefix <p>]")}
   ${c.bold("doctor")}   check prereqs + anton.db (non-destructive)
   ${c.bold("dev")}      run the dev server (next dev)          ${c.dim("[--port <n>]")}
   ${c.bold("start")}    run the server ${c.dim("(installed: background; source: foreground)")}  ${c.dim("[--port <n>] [--foreground]")}
@@ -978,6 +968,8 @@ export {
   main,
   parseInitArgs,
   ensureBeadsGitignore,
+  registerProject,
+  resolveAntonDb,
   agentsFromArgs,
   provisionAgentsSkills,
   REQUIRED_SKILLS,

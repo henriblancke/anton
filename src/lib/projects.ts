@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { getDb, schema } from "./db";
+import { configureBeadsForRepo } from "./beads/config.mjs";
 import type { AntonDb } from "./jobs/queue";
 import type { Project } from "./types";
 
@@ -170,20 +171,57 @@ export async function updateProjectSettings(
   return next;
 }
 
+/**
+ * Best-effort beads self-heal for a registered repo (anton-uez). Runs the shared config path
+ * (bd init + config.yaml enforcement + .gitignore [+ Dolt wiring via anton-43b]) so a repo added
+ * through the UI/API converges to the same end state as one configured via `anton init`. Never
+ * throws: a plain directory with no git/origin is skipped, and a beads-config failure is surfaced
+ * (logged) but leaves the projects row intact. Returns whether `.beads/` exists afterwards.
+ */
+function healBeads(repoPath: string): boolean {
+  try {
+    const result = configureBeadsForRepo(repoPath);
+    if (result.errors.length) {
+      console.warn(
+        `[projects] beads config partial for ${repoPath}: ${result.errors.join("; ")}`,
+      );
+    } else if (result.configured && result.ranInit) {
+      console.log(`[projects] beads configured for ${repoPath}`);
+    }
+    return result.hasBeads;
+  } catch (err) {
+    console.warn(`[projects] beads self-heal failed for ${repoPath}: ${String(err)}`);
+    return existsSync(join(repoPath, ".beads"));
+  }
+}
+
 export async function addProject(input: { name?: string; repoPath: string }): Promise<Project> {
   const repoPath = resolve(input.repoPath);
   if (!existsSync(repoPath)) {
     throw new Error(`repoPath does not exist: ${repoPath}`);
   }
 
+  const db = getDb();
+
+  // Idempotent (anton-uez): a repo already registered returns its existing row rather than creating
+  // a duplicate — an `anton init` re-run, or POST /api/projects on a known repo, is a safe no-op.
+  // Still run the self-heal so a previously-misconfigured repo converges on every add.
+  const existing = await db
+    .select()
+    .from(schema.projects)
+    .where(eq(schema.projects.repoPath, repoPath))
+    .limit(1);
+  if (existing[0]) {
+    healBeads(repoPath);
+    return toProject(existing[0]);
+  }
+
   const name = input.name?.trim() || basename(repoPath);
   const baseSlug = toSlug(input.name?.trim() || basename(repoPath)) || "project";
   const slug = await uniqueSlug(baseSlug);
   const defaultBranch = await detectDefaultBranch(repoPath);
-  const hasBeads = existsSync(join(repoPath, ".beads"));
   const id = randomUUID();
 
-  const db = getDb();
   await db.insert(schema.projects).values({
     id,
     slug,
@@ -202,6 +240,10 @@ export async function addProject(input: { name?: string; repoPath: string }): Pr
   } catch {
     // non-fatal — schedules can be added later.
   }
+
+  // Self-heal beads so a UI/API-added repo converges to the same end state as `anton init`
+  // (anton-uez). Best-effort; `hasBeads` reflects the post-heal reality.
+  const hasBeads = healBeads(repoPath);
 
   const createdAt = Math.floor(Date.now() / 1000);
 
