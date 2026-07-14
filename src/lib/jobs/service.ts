@@ -17,6 +17,7 @@ import { makeOrphanGroomingHandler } from "./orphan-grooming";
 import { JobRunner, type RunnerLogger } from "./runner";
 import { Scheduler } from "./scheduler";
 import { systemClock } from "./queue";
+import { startSyncEngine } from "../beads/sync-engine";
 
 const log: RunnerLogger = {
   info: (msg, meta) => console.log(`[jobs] ${msg}`, meta ?? ""),
@@ -67,10 +68,12 @@ export function getScheduler(): Scheduler {
   return _scheduler;
 }
 
-/** Idempotent: starts the background runner loop + the cron scheduler. Call once at server boot. */
+/** Idempotent: starts the background runner loop + the cron scheduler + the beads sync engine.
+ * Call once at server boot. */
 export function startRunner(): void {
   getRunner().start();
   getScheduler().start();
+  startSyncEngine();
 }
 
 /** Enqueue an execute-epic job for an approved epic. Returns the job id. */

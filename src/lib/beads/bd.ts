@@ -95,11 +95,12 @@ export function buildUpdateArgs(
   return args.length > 2 ? args : null;
 }
 
-async function bd(cwd: string, args: string[]): Promise<string> {
+async function bd(cwd: string, args: string[], env?: Record<string, string>): Promise<string> {
   const { stdout } = await execFileAsync("bd", args, {
     cwd,
     maxBuffer: 32 * 1024 * 1024,
     timeout: 60_000,
+    ...(env ? { env: { ...process.env, ...env } } : {}),
   });
   return stdout;
 }
@@ -122,66 +123,156 @@ export function isBenignSyncOutput(output: string): boolean {
   return BENIGN_SYNC_OUTPUT.some((re) => re.test(output));
 }
 
+/** A workspace with no Dolt remote — not an error, but a distinct visible state (not-wired):
+ * the board must show "not wired to a shared remote" rather than pretending it's synced. */
+const NOT_WIRED_OUTPUT = [/no remotes? (?:is )?configured/i];
+
+export function isNotWiredOutput(output: string): boolean {
+  return NOT_WIRED_OUTPUT.some((re) => re.test(output));
+}
+
+// ── Sync status registry (anton-live-sync) ──
+//
+// Keyed on globalThis via Symbol.for: the instrumentation-started sync engine and Next.js API
+// route handlers can load DIFFERENT compiled instances of this module (separate bundles), so a
+// plain module-level Map would leave routes reading an empty registry forever.
+
+export type SyncState = "unknown" | "not-wired" | "syncing" | "synced" | "failing";
+
+export interface SyncStatus {
+  state: SyncState;
+  /** ms epoch of the last successful pass; survives later failures for "last synced Xs ago". */
+  lastSyncedAt: number | null;
+  lastError: string | null;
+}
+
+const SYNC_STATUS_KEY = Symbol.for("anton.beads.syncStatus");
+
+function statusRegistry(): Map<string, SyncStatus> {
+  const g = globalThis as unknown as Record<symbol, Map<string, SyncStatus> | undefined>;
+  return (g[SYNC_STATUS_KEY] ??= new Map());
+}
+
+export function getSyncStatus(cwd: string): SyncStatus {
+  return statusRegistry().get(cwd) ?? { state: "unknown", lastSyncedAt: null, lastError: null };
+}
+
+function recordStatus(cwd: string, patch: Partial<SyncStatus>): void {
+  statusRegistry().set(cwd, { ...getSyncStatus(cwd), ...patch });
+}
+
 /**
- * One sync pass: `bd dolt commit` (a no-op under dolt.auto-commit, but catches externally-made
- * changes) then `bd dolt push`. Benign outcomes resolve; a real failure (auth, network, remote
+ * Sync pass modes. "full" (write-nudged): pull → commit → push. "pull": pull only — used by the
+ * heartbeat, which must NOT push when there are no local changes; every anton instance pushing
+ * a shared remote every ~10s is the concurrent-push manifest-corruption pattern (beads GH#2466).
+ */
+export type SyncMode = "full" | "pull";
+
+export type SyncOutcome = "synced" | "not-wired";
+
+/**
+ * One sync pass. Full mode: `bd dolt pull` (remote changes land locally, and pull-before-push
+ * shrinks divergence windows), then `bd dolt commit` (a no-op under dolt.auto-commit, but
+ * catches externally-made changes), then `bd dolt push`. Pull mode runs only the pull.
+ *
+ * Outcomes: benign steps are skipped; a workspace with no remote resolves "not-wired" and stops
+ * the pass. A pull failure in FULL mode is tolerated (a never-pushed remote has no refs/dolt
+ * yet — the push that follows publishes it); a real commit/push failure (auth, network, remote
  * conflict) rejects with the bd output attached — callers surface it, never swallow it.
  * `exec` is injectable for tests.
  */
-export async function runDoltSync(cwd: string, exec: BdExec = bd): Promise<void> {
-  for (const args of [
-    ["dolt", "commit"],
-    ["dolt", "push"],
-  ]) {
+export async function runDoltSync(
+  cwd: string,
+  exec: BdExec = bd,
+  mode: SyncMode = "full",
+): Promise<SyncOutcome> {
+  const steps =
+    mode === "pull"
+      ? [["dolt", "pull"]]
+      : [
+          ["dolt", "pull"],
+          ["dolt", "commit"],
+          ["dolt", "push"],
+        ];
+  for (const args of steps) {
     try {
       await exec(cwd, args);
     } catch (e) {
       const err = e as Error & { stdout?: string; stderr?: string };
       const output = `${err.stderr ?? ""}\n${err.stdout ?? ""}`.trim() || err.message;
+      if (isNotWiredOutput(output)) return "not-wired";
       if (isBenignSyncOutput(output)) continue;
+      // A full pass survives pull failure: first-ever pull against a never-pushed remote fails
+      // until the first push publishes refs/dolt/data. The push step still fails loudly on real
+      // divergence, so nothing is masked. Pull-only passes reject so the heartbeat can surface it.
+      if (mode === "full" && args[1] === "pull") continue;
       throw new Error(`bd ${args.join(" ")} failed in ${cwd}: ${output}`, { cause: e });
     }
   }
+  return "synced";
 }
 
 /**
  * Coalescing wrapper around runDoltSync, keyed by cwd: while a sync runs, every request that
  * arrives shares ONE trailing sync (which starts after the current one and therefore sees all
- * their writes) — a burst of writes costs one extra push, not one each. Exported for testing.
+ * their writes) — a burst of writes costs one extra push, not one each. A "pull" request
+ * piggybacks on any in-flight or queued pass (full ⊃ pull); a "full" request upgrades a queued
+ * pull-only trailing pass. Updates the sync status registry on every pass. Exported for testing.
  */
-export function createDoltSync(exec: BdExec = bd): (cwd: string) => Promise<void> {
+export function createDoltSync(exec: BdExec = bd): (cwd: string, mode?: SyncMode) => Promise<void> {
   const running = new Map<string, Promise<void>>();
-  const trailing = new Map<string, Promise<void>>();
+  const trailing = new Map<string, { promise: Promise<void>; mode: SyncMode }>();
+  const trailingMode = new Map<string, SyncMode>(); // live handle so an upgrade reaches the queued run
 
-  const start = (cwd: string): Promise<void> => {
-    const p = runDoltSync(cwd, exec);
+  const start = (cwd: string, mode: SyncMode): Promise<void> => {
+    recordStatus(cwd, { state: "syncing" });
+    const p = runDoltSync(cwd, exec, mode).then((outcome) => {
+      if (outcome === "not-wired") {
+        recordStatus(cwd, { state: "not-wired", lastError: null });
+      } else {
+        recordStatus(cwd, { state: "synced", lastSyncedAt: Date.now(), lastError: null });
+      }
+    });
     running.set(cwd, p);
     // Bookkeeping only — callers hold `p` and see its rejection; this chain must not re-reject.
     void p
-      .catch(() => {})
+      .catch((e: Error) => {
+        recordStatus(cwd, { state: "failing", lastError: e.message });
+      })
       .finally(() => {
         if (running.get(cwd) === p) running.delete(cwd);
       });
     return p;
   };
 
-  return function sync(cwd: string): Promise<void> {
+  return function sync(cwd: string, mode: SyncMode = "full"): Promise<void> {
     const queued = trailing.get(cwd);
-    if (queued) return queued;
+    if (queued) {
+      if (mode === "full") trailingMode.set(cwd, "full");
+      return queued.promise;
+    }
     const current = running.get(cwd);
-    if (!current) return start(cwd);
+    if (!current) return start(cwd, mode);
+    trailingMode.set(cwd, mode);
     const next = current
       .catch(() => {}) // the current run's failure belongs to its own callers
       .then(() => {
         trailing.delete(cwd);
-        return start(cwd);
+        const m = trailingMode.get(cwd) ?? "full";
+        trailingMode.delete(cwd);
+        return start(cwd, m);
       });
-    trailing.set(cwd, next);
+    trailing.set(cwd, { promise: next, mode });
     return next;
   };
 }
 
-const doltSync = createDoltSync();
+// The singleton is globalThis-anchored for the same cross-bundle reason as the status registry:
+// two module instances with separate coalescing maps would defeat the never-overlap invariant.
+const DOLT_SYNC_KEY = Symbol.for("anton.beads.doltSync");
+const doltSync = ((globalThis as unknown as Record<symbol, ReturnType<typeof createDoltSync>>)[
+  DOLT_SYNC_KEY
+] ??= createDoltSync());
 
 /** bd --json returns either a top-level array or `{ issues: [...] }`. Normalize to an array. */
 function asArray<T>(raw: string): T[] {
@@ -285,6 +376,18 @@ export const beads = {
   setStatus: (cwd: string, id: string, status: string) =>
     bd(cwd, ["update", id, "--status", status]),
 
+  /**
+   * Atomically claim a bead: assignee + status in_progress, idempotent when already claimed by
+   * the same actor (`bd update --claim`). The actor is passed explicitly via BEADS_ACTOR (bd's
+   * highest-precedence identity) so the claim lands on the human operator who owns this anton
+   * instance — not whatever unix user the server happens to run as.
+   */
+  claim: (cwd: string, id: string, actor?: string) =>
+    bd(cwd, ["update", id, "--claim"], actor ? { BEADS_ACTOR: actor } : undefined),
+
+  /** Clear a bead's assignee (`bd assign <id> ""`) — used when releasing a stale claim. */
+  unassign: (cwd: string, id: string) => bd(cwd, ["assign", id, ""]),
+
   /** Pure argv builder, exposed for testing and callers that want to inspect the write. */
   buildUpdateArgs,
 
@@ -305,11 +408,17 @@ export const beads = {
   },
 
   /**
-   * Push beads to the Dolt remote (commit if needed, then push), coalescing concurrent calls
-   * per repo. Tolerant of a clean working set and of a workspace with no remote; REJECTS on a
-   * real push failure — call sites must log or rethrow, never ignore the promise.
+   * Full sync with the Dolt remote (pull, commit if needed, then push), coalescing concurrent
+   * calls per repo. Tolerant of a clean working set and of a workspace with no remote; REJECTS
+   * on a real push failure — call sites must log or rethrow, never ignore the promise.
    */
-  sync: (cwd: string): Promise<void> => doltSync(cwd),
+  sync: (cwd: string): Promise<void> => doltSync(cwd, "full"),
+
+  /**
+   * Pull-only sync (heartbeat): remote changes land locally without pushing. Never pushes —
+   * see SyncMode. Shares the per-repo coalescing with `sync`, so passes never overlap.
+   */
+  pull: (cwd: string): Promise<void> => doltSync(cwd, "pull"),
 
   // ── convenience: anton's stage/approval semantics, all in beads ──
   approve: (cwd: string, epicId: string) => beads.tag(cwd, epicId, [LABELS.approved]),

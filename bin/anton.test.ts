@@ -558,14 +558,19 @@ describe("configureBeadsDoltSync (bd/git stubbed — CI has no bd)", () => {
     if (repoDir) await rm(repoDir, { recursive: true, force: true });
   });
 
-  /** A fake exec keyed by "<cmd> <subcommand…>" prefix; records every invocation. */
+  /** A fake exec keyed by "<cmd> <subcommand…>" prefix; records every invocation. Unless a test
+   * overrides it, `sync.remote` reads as unset — bd's real "(not set…)" prose with exit 0. */
   function fakeExec(responses: Record<string, { status: number; stdout?: string; stderr?: string }>) {
     const calls: string[] = [];
+    const withDefaults = {
+      "bd config get sync.remote": { status: 0, stdout: "sync.remote (not set in config.yaml)\n" },
+      ...responses,
+    };
     const exec = (cmd: string, args: string[]) => {
       const line = [cmd, ...args].join(" ");
       calls.push(line);
-      for (const [prefix, res] of Object.entries(responses)) {
-        if (line.startsWith(prefix)) return { stdout: "", stderr: "", ...res };
+      for (const [prefix, res] of Object.entries(withDefaults)) {
+        if (line.startsWith(prefix)) return Object.assign({ stdout: "", stderr: "" }, res);
       }
       throw new Error(`unexpected exec: ${line}`);
     };
@@ -640,6 +645,38 @@ describe("configureBeadsDoltSync (bd/git stubbed — CI has no bd)", () => {
     expect(r).toEqual({ status: "already", url: "git@github.com:org/repo.git" });
     expect(calls.some((l) => l.startsWith("bd dolt remote add"))).toBe(false);
     expect(calls.some((l) => l.startsWith("bd dolt push"))).toBe(false);
+  });
+
+  it("respects a declared sync.remote (aws://) over the git origin — dynamic per project", async () => {
+    repoDir = await beadsRepo();
+    const declared = "aws://[optura-beads-dolt-manifest:optura-beads]/some-project";
+    const { exec, calls } = fakeExec({
+      "bd config get sync.remote": { status: 0, stdout: `sync.remote = ${declared}\n` },
+      "bd dolt remote list": { status: 0, stdout: "No remotes configured.\n" },
+      "bd dolt remote add origin": { status: 0 },
+      "bd dolt pull": { status: 0 },
+      "bd dolt push": { status: 0 },
+    });
+    const r = configureBeadsDoltSync({ repoDir, exec });
+    expect(r).toMatchObject({ status: "configured", url: declared });
+    expect(calls).toContain(`bd dolt remote add origin ${declared}`);
+    // git origin is never consulted when the beads config declares the remote.
+    expect(calls.some((l) => l.startsWith("git remote get-url"))).toBe(false);
+  });
+
+  it("treats bd's '(not set in config.yaml)' prose as absent — exit code is 0 either way", async () => {
+    repoDir = await beadsRepo();
+    const { exec, calls } = fakeExec({
+      "bd config get sync.remote": { status: 0, stdout: "sync.remote (not set in config.yaml)\n" },
+      "git remote get-url origin": { status: 0, stdout: "git@github.com:org/repo.git\n" },
+      "bd dolt remote list": { status: 0, stdout: "No remotes configured.\n" },
+      "bd dolt remote add origin": { status: 0 },
+      "bd dolt pull": { status: 0 },
+      "bd dolt push": { status: 0 },
+    });
+    const r = configureBeadsDoltSync({ repoDir, exec });
+    expect(r).toMatchObject({ status: "configured", url: "git@github.com:org/repo.git" });
+    expect(calls).toContain("bd dolt remote add origin git@github.com:org/repo.git");
   });
 
   it("re-points a stale Dolt remote at the current git origin", async () => {

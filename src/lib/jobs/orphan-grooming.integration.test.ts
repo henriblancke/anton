@@ -64,7 +64,7 @@ suite("orphan-grooming e2e (real handler · real bd)", () => {
     g(["add", "-A"]);
     g(["commit", "-q", "-m", "init"]);
 
-    execFileSync("bd", ["init"], { cwd: repo, stdio: "ignore" });
+    execFileSync("bd", ["init", "--skip-hooks"], { cwd: repo, stdio: "ignore" });
     // A real epic with a child (NOT an orphan) + two loose tickets (orphans).
     realEpic = await beads.create(repo, { title: "Real epic", type: "epic", description: "## Goal\nx" });
     childTicket = createTicket(repo, "Child of real epic", realEpic);

@@ -32,7 +32,7 @@ suite("board integration (real bd)", () => {
     execFileSync("git", ["init", "-q"], { cwd: repo });
     execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: repo });
     execFileSync("git", ["config", "user.name", "anton-test"], { cwd: repo });
-    execFileSync("bd", ["init"], { cwd: repo, stdio: "ignore" });
+    execFileSync("bd", ["init", "--skip-hooks"], { cwd: repo, stdio: "ignore" });
     project = {
       id: "x", slug: "tmp", name: "tmp", repoPath: repo,
       defaultBranch: "main", hasBeads: true, createdAt: 0,

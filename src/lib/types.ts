@@ -50,10 +50,20 @@ export interface Epic {
   tickets: Ticket[];
 }
 
+/** Per-project beads↔Dolt sync health, read from the sync-status registry (bd.ts). */
+export interface SyncStatusView {
+  state: "unknown" | "not-wired" | "syncing" | "synced" | "failing";
+  /** ms epoch of the last successful pass; null when never synced. */
+  lastSyncedAt: number | null;
+  lastError: string | null;
+}
+
 export interface Board {
   projectSlug: string;
   /** Epics grouped by stage. Orphan tickets are wrapped as single-ticket epics. */
   columns: Record<Stage, Epic[]>;
+  /** Sync health for this project's beads workspace. */
+  sync: SyncStatusView;
 }
 
 // ── Tickets page ──
