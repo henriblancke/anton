@@ -295,6 +295,11 @@ export class JobRunner {
       leaseMs: this.config.leaseMs,
       limit: capacity,
       capOf,
+      // Never re-lease a job already dispatched in this process. Rolling dispatch keeps a running
+      // job in `inFlight` while its handler works; if its lease lapses (missed renewal from sleep or
+      // a transient DB failure) its row looks reclaimable, and without this a spare-capacity tick
+      // would dispatch it twice against the same worktree.
+      exclude: this.inFlight.keys(),
     });
     if (jobs.length === 0) return 0;
 

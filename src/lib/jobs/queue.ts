@@ -7,7 +7,7 @@
  * clock. Times are stored as unix SECONDS (the schema's timestamp mode); this module works in ms
  * and converts at the boundary.
  */
-import { and, eq, gt, inArray, lte, or, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, lte, notInArray, or, sql } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { randomUUID } from "node:crypto";
 import * as schema from "../db/schema";
@@ -84,6 +84,16 @@ const ACTIVE_STATUSES = ["queued", "running"] as const;
 function isUniqueViolation(e: unknown): boolean {
   const code = (e as { code?: string })?.code;
   return code === "SQLITE_CONSTRAINT_UNIQUE" || code === "SQLITE_CONSTRAINT";
+}
+
+/** The `epicBeadId` carried in a job's payload, or undefined if absent/malformed. */
+function epicBeadIdOf(payloadJson: string | null): string | undefined {
+  try {
+    const parsed = JSON.parse(payloadJson ?? "{}") as { epicBeadId?: unknown };
+    return typeof parsed.epicBeadId === "string" ? parsed.epicBeadId : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Id of the currently-active execute-epic job for this project + epic, if any. */
@@ -171,28 +181,34 @@ export function enqueueExecuteEpicDeduped(
  * in flight in that candidate's bucket (keyed by projectId). `Infinity` means ungated (only the
  * global `limit` applies). Jobs whose bucket is already at capacity are skipped in favor of the
  * next-due job for a different bucket. Currently the runner gates execute-epic per project.
+ *
+ * `exclude` drops job ids that are already dispatched in-process (rolling dispatch keeps them in the
+ * runner's `inFlight` set while their handler runs). Without it, a still-running job whose lease
+ * lapsed — a missed renewal from laptop sleep or a transient DB failure — would look reclaimable and
+ * get leased a second time, running two handlers against the same job/worktree. Excluding it here
+ * also avoids burning an attempt and overwriting its live lease.
  */
 export async function leaseDue(
   db: AntonDb,
   clock: Clock,
-  opts: { leaseMs: number; limit: number; capOf?: (job: JobRow) => number },
+  opts: { leaseMs: number; limit: number; capOf?: (job: JobRow) => number; exclude?: Iterable<string> },
 ): Promise<JobRow[]> {
   const nowMs = clock.now();
   const nowDate = secDate(nowMs);
   const leaseDate = secDate(nowMs + opts.leaseMs);
+  const excludeIds = opts.exclude ? [...opts.exclude] : [];
 
   // Without per-bucket caps, the DB `limit` alone bounds the result. With caps we must scan more
   // candidates than `limit` (some get skipped for being at capacity), so widen the fetch.
   const scanLimit = opts.capOf ? Math.max(opts.limit * 8, 200) : opts.limit;
+  const runnable = or(
+    and(eq(schema.jobs.status, "queued"), lte(schema.jobs.runAt, nowDate)),
+    and(eq(schema.jobs.status, "running"), lte(schema.jobs.leaseExpiresAt, nowDate)),
+  );
   const candidates = await db
     .select()
     .from(schema.jobs)
-    .where(
-      or(
-        and(eq(schema.jobs.status, "queued"), lte(schema.jobs.runAt, nowDate)),
-        and(eq(schema.jobs.status, "running"), lte(schema.jobs.leaseExpiresAt, nowDate)),
-      ),
-    )
+    .where(excludeIds.length > 0 ? and(runnable, notInArray(schema.jobs.id, excludeIds)) : runnable)
     .orderBy(schema.jobs.runAt)
     .limit(scanLimit);
 
@@ -349,19 +365,37 @@ export async function resumeJob(db: AntonDb, clock: Clock, jobId: string): Promi
   // a human resolved) or `failed` (reserved terminal). A running/queued/done job must not be reset —
   // that would corrupt its lifecycle or duplicate work.
   if (!job || (job.status !== "parked" && job.status !== "failed")) return false;
-  await db
-    .update(schema.jobs)
-    .set({
-      status: "queued",
-      runAt: secDate(nowMs),
-      leaseExpiresAt: null,
-      attempts: 0,
-      lastError: null,
-      updatedAt: secDate(nowMs),
-    })
-    // Re-assert the resumable status in the WHERE so a concurrent settle can't race it between the
-    // read above and this write.
-    .where(and(eq(schema.jobs.id, jobId), inArray(schema.jobs.status, ["parked", "failed"])));
+
+  // Un-parking returns the job to `queued` — an active status. For execute-epic that competes with
+  // `jobs_active_epic_unique`: after this job parked/failed, the dedupe path (which ignores
+  // parked/failed) may have already spawned a fresh queued/running job for the same project + epic.
+  // Reviving this stale row would then be a *second* active job for that epic and raise UNIQUE. So
+  // no-op instead of surfacing a 500 — the fresh job already covers the work (anton-ner).
+  if (job.type === "execute-epic" && job.projectId) {
+    const epicBeadId = epicBeadIdOf(job.payloadJson);
+    if (epicBeadId && activeExecuteEpicId(db, job.projectId, epicBeadId)) return false;
+  }
+
+  try {
+    await db
+      .update(schema.jobs)
+      .set({
+        status: "queued",
+        runAt: secDate(nowMs),
+        leaseExpiresAt: null,
+        attempts: 0,
+        lastError: null,
+        updatedAt: secDate(nowMs),
+      })
+      // Re-assert the resumable status in the WHERE so a concurrent settle can't race it between the
+      // read above and this write.
+      .where(and(eq(schema.jobs.id, jobId), inArray(schema.jobs.status, ["parked", "failed"])));
+  } catch (e) {
+    // Backstop for the race the check above can't fully close: a concurrent enqueue could win the
+    // active slot between the check and this write. Absorb the index violation as a clean no-op.
+    if (isUniqueViolation(e)) return false;
+    throw e;
+  }
   return true;
 }
 
