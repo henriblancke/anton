@@ -26,6 +26,11 @@ import {
   resolvePort,
 } from "./anton.mjs";
 
+import {
+  configureBeadsDoltSync,
+  detectHooksManager,
+} from "../src/lib/beads/config.mjs";
+
 const CLI = join(dirname(fileURLToPath(import.meta.url)), "anton.mjs");
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -160,6 +165,56 @@ describe("ensureBeadsGitignore (anton init)", () => {
     for (const e of ["issues.jsonl", "interactions.jsonl", "dolt/", "embeddeddolt/"]) {
       expect(text).toContain(e);
     }
+  });
+});
+
+describe("detectHooksManager (anton init — hooks warning, anton-43b)", () => {
+  let dir: string;
+  afterEach(async () => {
+    if (dir) await rm(dir, { recursive: true, force: true });
+  });
+
+  it("flags a husky repo by its committed .husky/ dir", async () => {
+    dir = await mkdtemp(join(tmpdir(), "anton-hooks-"));
+    mkdirSync(join(dir, ".husky"), { recursive: true });
+    expect(detectHooksManager(dir)).toEqual({ manager: "husky", path: ".husky" });
+  });
+
+  it("flags a lefthook repo by its committed config file", async () => {
+    dir = await mkdtemp(join(tmpdir(), "anton-hooks-"));
+    writeFileSync(join(dir, "lefthook.yml"), "pre-commit:\n");
+    expect(detectHooksManager(dir)).toEqual({ manager: "lefthook", path: "lefthook.yml" });
+  });
+
+  it("flags a bare custom core.hooksPath captured before bd init clobbered it", async () => {
+    dir = await mkdtemp(join(tmpdir(), "anton-hooks-"));
+    expect(detectHooksManager(dir, ".config/hooks")).toEqual({ manager: "custom", path: ".config/hooks" });
+  });
+
+  it("does NOT flag a plain-git repo, nor bd's own .beads/hooks value", async () => {
+    dir = await mkdtemp(join(tmpdir(), "anton-hooks-"));
+    expect(detectHooksManager(dir, null)).toBeNull();
+    expect(detectHooksManager(dir, ".beads/hooks")).toBeNull();
+    expect(detectHooksManager(dir, ".git/hooks")).toBeNull();
+  });
+});
+
+describe("configureBeadsDoltSync (anton init — skip branches, anton-43b)", () => {
+  let dir: string;
+  afterEach(async () => {
+    if (dir) await rm(dir, { recursive: true, force: true });
+  });
+
+  it("returns no-workspace when there is no .beads/", async () => {
+    dir = await mkdtemp(join(tmpdir(), "anton-dolt-"));
+    expect(configureBeadsDoltSync({ repoDir: dir })).toEqual({ status: "no-workspace" });
+  });
+
+  it("returns no-remote when the repo has no origin remote", async () => {
+    dir = await mkdtemp(join(tmpdir(), "anton-dolt-"));
+    mkdirSync(join(dir, ".beads"), { recursive: true });
+    spawnSync("git", ["-C", dir, "init"], { stdio: "ignore" });
+    expect(configureBeadsDoltSync({ repoDir: dir })).toEqual({ status: "no-remote" });
   });
 });
 

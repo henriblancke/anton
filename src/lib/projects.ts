@@ -188,6 +188,17 @@ function healBeads(repoPath: string): boolean {
     } else if (result.configured && result.ranInit) {
       console.log(`[projects] beads configured for ${repoPath}`);
     }
+    if (result.doltSync?.status === "configured") {
+      console.log(`[projects] Dolt remote wired for ${repoPath} (refs/dolt/data on origin)`);
+    }
+    if (result.hooksWarning) {
+      // Hooks are optional for anton-driven repos (runner pushes Dolt explicitly); just note the
+      // manager so bd's post-merge/post-checkout hydration loss under it isn't a silent surprise.
+      console.warn(
+        `[projects] ${result.hooksWarning.manager} owns core.hooksPath in ${repoPath}; ` +
+          `bd hydration hooks won't run — chain 'bd hooks run <hook>' manually if you rely on them.`,
+      );
+    }
     return result.hasBeads;
   } catch (err) {
     console.warn(`[projects] beads self-heal failed for ${repoPath}: ${String(err)}`);

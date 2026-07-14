@@ -37,6 +37,18 @@ export function hasOriginRemote(dir) {
   return r.status === 0;
 }
 
+/** The `origin` remote's URL, or "" when there is none. */
+export function originRemoteUrl(dir) {
+  const r = spawnSync("git", ["-C", dir, "remote", "get-url", "origin"], { encoding: "utf8" });
+  return (r.status ?? 1) === 0 ? (r.stdout || "").trim() : "";
+}
+
+/** Read a single git config value for `dir`, or "" when unset. */
+function gitConfigGet(dir, key) {
+  const r = spawnSync("git", ["-C", dir, "config", "--get", key], { encoding: "utf8" });
+  return (r.status ?? 1) === 0 ? (r.stdout || "").trim() : "";
+}
+
 /** True when `dir` already carries a beads workspace (`.beads/`). */
 export function hasBeadsDir(dir) {
   return existsSync(join(dir, ".beads"));
@@ -145,6 +157,102 @@ const CONFIG_KEYS = [
   ["export.git-add", "false"],
 ];
 
+/** True when a Dolt remote named `name` is already configured in `dir`'s workspace. */
+export function doltRemoteConfigured(dir, name = "origin") {
+  const r = spawnSync("bd", ["dolt", "remote", "list"], { cwd: dir, encoding: "utf8" });
+  if ((r.status ?? 1) !== 0) return false;
+  const out = r.stdout || "";
+  if (/no remotes configured/i.test(out)) return false;
+  // Lines look like: "origin               git+file:///…" — first whitespace token is the remote name.
+  return out.split("\n").some((l) => l.trim().split(/\s+/)[0] === name);
+}
+
+/** Best-effort `{stderr||stdout}` detail from a spawnSync result, for surfacing a failed step. */
+function stepDetail(r) {
+  return (r.stderr || r.stdout || "").trim() || `exit ${r.status ?? "?"}`;
+}
+
+/**
+ * Wire the git-backed Dolt remote for `repoDir`, reusing bd's own `dolt` subcommands — no new sync
+ * code. beads stores issues in Dolt and syncs them over the git remote as `refs/dolt/data`; adding
+ * the remote points `bd dolt push/pull` at the repo's `origin` URL (bd records it as `git+<url>`).
+ *
+ * Steps (idempotent): remote add → hydrate pull → publish push. The pull is best-effort — a fresh
+ * origin has no `refs/dolt/data` yet, so it exits non-zero ("no branches found"); that's expected on
+ * the first machine, not an error. The push publishes local Dolt commits so `refs/dolt/data` exists
+ * on origin for the next machine to hydrate from. Dolt remotes live in `.beads/dolt/` (gitignored),
+ * so this must run once per machine — a clone doesn't inherit the remote config.
+ *
+ * Returns `{ status, ... }` where status is one of, matching cmdSetup's rendering:
+ *   - "no-workspace" — no `.beads/` (nothing to wire)
+ *   - "no-remote"    — repo has no `origin` remote
+ *   - "already"      — the Dolt `origin` remote is already configured (no-op)
+ *   - "configured"   — remote added + published (`{ url }`)
+ *   - "error"        — a step failed (`{ detail }`)
+ *
+ * @param {{ repoDir: string, log?: (msg: string) => void }} opts
+ */
+export function configureBeadsDoltSync(opts = {}) {
+  const { repoDir: dir, log } = opts;
+  const emit = typeof log === "function" ? log : () => {};
+
+  if (!existsSync(join(dir, ".beads"))) return { status: "no-workspace" };
+  const url = originRemoteUrl(dir);
+  if (!url) return { status: "no-remote" };
+  if (doltRemoteConfigured(dir, "origin")) {
+    emit("Dolt remote 'origin' already configured — no-op.");
+    return { status: "already", url };
+  }
+
+  const add = spawnSync("bd", ["dolt", "remote", "add", "origin", url], { cwd: dir, encoding: "utf8" });
+  if ((add.status ?? 1) !== 0) return { status: "error", detail: stepDetail(add) };
+  emit(`bd dolt remote add origin ${url}`);
+
+  // Hydrate: pull any existing refs/dolt/data (best-effort — a fresh remote has none yet).
+  const pull = spawnSync("bd", ["dolt", "pull"], { cwd: dir, encoding: "utf8" });
+  emit((pull.status ?? 1) === 0 ? "bd dolt pull — hydrated from origin" : "bd dolt pull — nothing to hydrate yet");
+
+  // Publish: push local Dolt commits so refs/dolt/data lands on origin for the next machine.
+  const push = spawnSync("bd", ["dolt", "push"], { cwd: dir, encoding: "utf8" });
+  if ((push.status ?? 1) !== 0) return { status: "error", detail: stepDetail(push) };
+  emit("bd dolt push — published refs/dolt/data to origin");
+
+  return { status: "configured", url };
+}
+
+/** Config files that mark a third-party git-hooks manager owning core.hooksPath. */
+const HOOK_MANAGERS = [
+  { manager: "husky", files: [".husky"] },
+  { manager: "lefthook", files: ["lefthook.yml", "lefthook.yaml", ".lefthook.yml", ".lefthook.yaml"] },
+];
+
+/**
+ * Detect a git-hooks manager (husky/lefthook) — or any custom `core.hooksPath` override — that would
+ * displace bd's own hooks. bd's native install points `core.hooksPath` at `.beads/hooks` and, when a
+ * manager already claims that setting, `bd init` silently CLOBBERS it (verified: husky's `.husky` →
+ * `.beads/hooks`). Either way one side wins: under a manager's hooksPath, bd's post-merge/post-checkout
+ * Dolt HYDRATION won't fire on pull/checkout. We only warn — anton never rewrites the user's hooks.
+ *
+ * Detection is by committed artifacts (a `.husky/` dir, a `lefthook.*` config) so it survives bd
+ * clobbering `core.hooksPath`; `priorHooksPath` (captured before `bd init` ran) catches a bare custom
+ * override with no manager config. Returns `{ manager, path } | null`.
+ *
+ * @param {string} dir
+ * @param {string|null} [priorHooksPath] core.hooksPath as it was BEFORE bd init (optional)
+ */
+export function detectHooksManager(dir, priorHooksPath = null) {
+  for (const { manager, files } of HOOK_MANAGERS) {
+    for (const f of files) {
+      if (existsSync(join(dir, f))) return { manager, path: f };
+    }
+  }
+  const p = (priorHooksPath || "").replace(/\/+$/, "");
+  if (p && !p.endsWith(".beads/hooks") && p !== ".git/hooks") {
+    return { manager: "custom", path: priorHooksPath };
+  }
+  return null;
+}
+
 /**
  * Run the full beads team-config path for `dir`, idempotently. Steps: `bd init` (only when `.beads/`
  * is absent) → config.yaml enforcement → `.beads/.gitignore`. Every step is best-effort and its
@@ -180,6 +288,10 @@ export function configureBeadsForRepo(dir, opts = {}) {
       hasBeads: existsSync(beadsDir),
     };
   }
+
+  // Capture core.hooksPath BEFORE bd init — bd's hooks install overwrites it with .beads/hooks, so a
+  // husky/lefthook (or bare custom) override is only observable here (anton-43b).
+  const priorHooksPath = gitConfigGet(dir, "core.hooksPath") || null;
 
   // 1. bd init — only when .beads/ is absent (prefix from caller, else bd auto-detects from dir name).
   let ranInit = false;
@@ -226,8 +338,22 @@ export function configureBeadsForRepo(dir, opts = {}) {
     steps.push({ name: ".beads/.gitignore", status: "already" });
   }
 
-  // Dolt remote wiring (configureBeadsDoltSync) is added to THIS path by anton-43b so both callers
-  // inherit it automatically.
+  // 4. Wire the git-backed Dolt remote (remote add → hydrate pull → publish push). Shared here so
+  //    both `anton init` and addProject inherit it (anton-43b). A failure is collected, not thrown.
+  const doltSync = configureBeadsDoltSync({ repoDir: dir, log: emit });
+  steps.push({ name: "dolt remote sync", status: doltSync.status, detail: doltSync.detail });
+  if (doltSync.status === "error") {
+    errors.push(`dolt remote sync failed: ${doltSync.detail}`);
+  }
+
+  // 5. Hooks are OPTIONAL for anton-driven repos — runDoltSync() pushes Dolt on every write, so the
+  //    pre-push hook is redundant and only post-merge/post-checkout hydration is lost under a hooks
+  //    manager. Detect husky/lefthook (or a custom hooksPath) and WARN; never auto-rewrite hooks.
+  //    A plain-git repo relies on bd init's native hooks install and needs nothing extra.
+  const hooksWarning = detectHooksManager(dir, priorHooksPath);
+  if (hooksWarning) {
+    emit(`core.hooksPath is managed by ${hooksWarning.manager} — bd hydration hooks won't run under it.`);
+  }
 
   return {
     configured: true,
@@ -236,5 +362,7 @@ export function configureBeadsForRepo(dir, opts = {}) {
     steps,
     errors,
     hasBeads: existsSync(beadsDir),
+    doltSync,
+    hooksWarning,
   };
 }

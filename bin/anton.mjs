@@ -838,6 +838,51 @@ function registerProject(dir, opts = {}) {
   }
 }
 
+/**
+ * Render the Dolt remote wiring outcome (from configureBeadsDoltSync). Every status branch is
+ * handled so `anton init` reports exactly what happened — configured, a no-op re-run, a skip when
+ * prereqs are absent, or a loud failure with the underlying detail (anton-43b).
+ */
+function renderDoltSync(sync) {
+  if (!sync) return;
+  switch (sync.status) {
+    case "configured":
+      console.log(c.green("✓ Dolt remote wired") + c.dim(` — refs/dolt/data published to origin (${sync.url})`));
+      break;
+    case "already":
+      console.log(c.dim("• Dolt remote already configured — nothing to do."));
+      break;
+    case "no-remote":
+      console.log(c.yellow("! no origin remote — skipped Dolt remote wiring.") + c.dim(" beads syncs over the git remote."));
+      break;
+    case "no-workspace":
+      console.log(c.yellow("! no .beads/ workspace — skipped Dolt remote wiring."));
+      break;
+    case "error":
+      console.log(c.yellow(`! Dolt remote wiring failed: ${sync.detail}`));
+      console.log(c.dim("  beads is configured; retry with `bd dolt remote add origin <url>` then `bd dolt push`."));
+      break;
+  }
+}
+
+/**
+ * Warn when a git-hooks manager (husky/lefthook) or a custom core.hooksPath owns the repo's hooks:
+ * bd's post-merge/post-checkout Dolt HYDRATION won't fire under it. Print manual chaining steps —
+ * anton never rewrites the user's hooks. Hooks are OPTIONAL for anton-driven repos because the
+ * runner pushes Dolt explicitly on every write, so this is informational, not a failure (anton-43b).
+ */
+function renderHooksWarning(warning) {
+  if (!warning) return;
+  console.log(
+    c.yellow(`\n! git hooks are managed by ${warning.manager}`) +
+      c.dim(` (${warning.path}) — bd's hydration hooks won't run under it.`),
+  );
+  console.log(c.dim("  anton won't rewrite your hooks. Hooks are OPTIONAL here — the runner pushes Dolt"));
+  console.log(c.dim("  explicitly on every write. To also keep hydration on pull/checkout, chain bd in:"));
+  console.log(c.dim(`    add to ${warning.manager === "lefthook" ? "your lefthook post-merge/post-checkout commands" : ".husky/post-merge and .husky/post-checkout"}:`));
+  console.log(c.dim('      bd hooks run post-merge "$@"      # (and post-checkout, respectively)'));
+}
+
 async function cmdInit(args = []) {
   const { path: rawPath, prefix } = parseInitArgs(args);
   const dir = resolve(rawPath ?? process.cwd());
@@ -859,6 +904,14 @@ async function cmdInit(args = []) {
   }
   for (const e of beads.errors) console.log(c.yellow(`  ${e}`));
   console.log(c.green("\n✓ beads team-config enforced.") + c.dim(` (${dir})`));
+
+  // Dolt remote wiring outcome — render every status branch, matching cmdSetup (anton-43b).
+  renderDoltSync(beads.doltSync);
+
+  // Hooks are optional for anton-driven repos (runDoltSync() pushes Dolt explicitly on every write).
+  // Under a husky/lefthook hooksPath, only post-merge/post-checkout hydration is lost — warn, don't
+  // auto-rewrite the user's hooks.
+  renderHooksWarning(beads.hooksWarning);
 
   // Register with anton so the repo shows on the projects board — in the same command (anton-uez).
   const reg = registerProject(dir);
