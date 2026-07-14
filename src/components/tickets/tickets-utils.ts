@@ -68,6 +68,29 @@ export function countActiveFilters(filters: TicketFilters): number {
   return TICKET_FILTER_KEYS.filter((key) => Boolean(filters[key]?.trim())).length;
 }
 
+/** Sort directions offered on the tickets list. Only "created" is sortable for now. */
+export type TicketSort = "created-desc" | "created-asc";
+
+/**
+ * Returns a new array sorted by the bead's created timestamp. Rows whose `createdAt` is missing
+ * or unparseable always sink to the bottom, regardless of direction, so the list degrades
+ * gracefully instead of throwing them to the top with a `NaN` comparison.
+ */
+export function sortTicketsByCreated(tickets: TicketRow[], direction: TicketSort): TicketRow[] {
+  const parse = (iso: string | null | undefined): number | null => {
+    const ms = iso ? Date.parse(iso) : NaN;
+    return Number.isNaN(ms) ? null : ms;
+  };
+  return [...tickets].sort((a, b) => {
+    const ta = parse(a.createdAt);
+    const tb = parse(b.createdAt);
+    if (ta === null && tb === null) return 0;
+    if (ta === null) return 1;
+    if (tb === null) return -1;
+    return direction === "created-asc" ? ta - tb : tb - ta;
+  });
+}
+
 export interface EpicOption {
   id: string;
   title: string;
