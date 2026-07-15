@@ -1,0 +1,29 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard",
+    ":semanticCommits"
+  ],
+  "schedule": ["before 6am on monday"],
+  "timezone": "UTC",
+  "prConcurrentLimit": 10,
+  "rangeStrategy": "bump",
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 6am on monday"]
+  },
+  "packageRules": [
+    {
+      "description": "Group all non-major npm/bun bumps into one reviewable PR (mirrors the old Dependabot minor-and-patch group). Majors stay separate so breaking bumps (a new Next/React/TS major) get their own review.",
+      "matchManagers": ["npm", "bun"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "minor-and-patch"
+    },
+    {
+      "description": "Keep the GitHub Actions themselves current (checkout, setup-bun, gitleaks, etc.).",
+      "matchManagers": ["github-actions"],
+      "groupName": "github-actions"
+    }
+  ]
+}
