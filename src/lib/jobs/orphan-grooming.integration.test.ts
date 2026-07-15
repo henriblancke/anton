@@ -93,6 +93,7 @@ suite("orphan-grooming e2e (real handler · real bd)", () => {
     runner.registerHandler("orphan-grooming", makeOrphanGroomingHandler({ db: tdb.db, clock }));
     await runner.enqueue({ type: "orphan-grooming", projectId, payload: { projectId } });
     expect(await runner.tickOnce()).toBe(1);
+    await runner.whenIdle();
 
     const board = await beads.list(repo, ["--status", "all"]);
 
@@ -127,6 +128,7 @@ suite("orphan-grooming e2e (real handler · real bd)", () => {
     runner.registerHandler("orphan-grooming", makeOrphanGroomingHandler({ db: tdb.db, clock }));
     await runner.enqueue({ type: "orphan-grooming", projectId, payload: { projectId } });
     await runner.tickOnce();
+    await runner.whenIdle();
 
     const after = await beads.list(repo, ["--status", "all"]);
     const epicCountAfter = after.filter((b) => beads.isEpic(b)).length;
@@ -136,6 +138,7 @@ suite("orphan-grooming e2e (real handler · real bd)", () => {
     const orphanC = createTicket(repo, "Loose ticket C");
     await runner.enqueue({ type: "orphan-grooming", projectId, payload: { projectId } });
     await runner.tickOnce();
+    await runner.whenIdle();
     const final = await beads.list(repo, ["--status", "all"]);
     expect(final.filter((b) => beads.isEpic(b)).length).toBe(epicCountBefore); // still one grooming epic
     const groomingEpic = final.find(

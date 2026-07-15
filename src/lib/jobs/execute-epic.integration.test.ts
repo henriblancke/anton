@@ -14,7 +14,7 @@ import { randomUUID } from "node:crypto";
 import { makeTestDb, type TestDb } from "../db/testing";
 import { beads } from "../beads/bd";
 import * as schema from "../db/schema";
-import { getJob, type Clock } from "./queue";
+import { getJob, park, type Clock } from "./queue";
 import { JobRunner } from "./runner";
 import { makeExecuteEpicHandler } from "./execute-epic";
 import { resetOperatorCache } from "../operator";
@@ -194,6 +194,7 @@ process.exit(0);`,
     });
 
     const processed = await runner.tickOnce();
+    await runner.whenIdle();
     expect(processed).toBe(1);
 
     // Job succeeded.
@@ -220,6 +221,12 @@ process.exit(0);`,
     const epic = await beads.show(repo, epicId);
     expect(epic.external_ref).toBe("gh-42");
     expect(epic.labels ?? []).toContain("stage:in-review");
+
+    // The run CLAIMED the epic + each ticket for the human operator (assignee set, not just
+    // in_progress) so the board shows who owns in-flight work — anton-ner.1 / anton-live-sync R6.
+    expect(epic.assignee).toBe("test-operator");
+    expect(bt1?.assignee).toBe("test-operator");
+    expect(bt2?.assignee).toBe("test-operator");
 
     // The branch was actually pushed to origin, and carries per-ticket commits.
     const remoteBranches = execFileSync("git", ["-C", repo, "ls-remote", "--heads", "origin"], {
@@ -325,6 +332,7 @@ process.exit(0);`,
 
       // First tick → usage limit → job parked (rescheduled), run parked, ticket still open.
       await runner.tickOnce();
+      await runner.whenIdle();
       let job = await getJob(tdb.db, jobId);
       expect(job?.status).toBe("queued"); // rescheduled
       expect(job?.attempts).toBe(0); // quota attempt refunded
@@ -345,6 +353,7 @@ process.exit(0);`,
       // Advance past the reset window → resumes on the SAME run/worktree and completes.
       clock.set(resetSec * 1000 + 1);
       await runner.tickOnce();
+      await runner.whenIdle();
 
       job = await getJob(tdb.db, jobId);
       expect(job?.status).toBe("done");
@@ -396,13 +405,15 @@ process.exit(0);`,
     runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
 
     process.env.ANTON_CLAUDE_BIN = failingClaude;
+    let jobId: string;
     try {
-      await runner.enqueue({
+      jobId = await runner.enqueue({
         type: "execute-epic",
         projectId,
         payload: { projectId, epicBeadId: epic3 },
       });
       await runner.tickOnce();
+      await runner.whenIdle(); // let the failed run settle (reschedule) before we park it below
 
       // R10: no bead left looking claimed by a dead session — status back to open, unassigned,
       // stage label removed. (No work was committed, so it returns to the ready pool.)
@@ -410,6 +421,128 @@ process.exit(0);`,
       expect(released.status).toBe("open");
       expect(released.assignee ?? null).toBeNull();
       expect(released.labels ?? []).not.toContain("stage:implementing");
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      // A failed run reschedules the job with backoff; park it so a later test's clock-advancing
+      // tick can't re-dispatch this doomed epic (the test DB is shared across the describe block).
+      if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  }, 60_000);
+
+  it("resumes past a usage limit skipping already-closed tickets and reusing the worktree", async () => {
+    // anton-ner.2 AC5: a two-ticket epic where the first ticket closes, then the second hits the
+    // usage limit. After the reset window the run resumes on the SAME worktree, skips the closed
+    // ticket (claude is NOT re-invoked for it), finishes the second, and opens the PR.
+    const epic3 = await beads.create(repo, {
+      title: "Feature Z",
+      type: "epic",
+      description: "## Goal\nZ",
+    });
+    await beads.approve(repo, epic3);
+    const mkTicket = (title: string) => {
+      const p = JSON.parse(
+        execFileSync(
+          "bd",
+          ["create", title, "--type", "task", "--parent", epic3, "--acceptance", "x", "--json"],
+          { cwd: repo, encoding: "utf8" },
+        ),
+      );
+      return (Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string;
+    };
+    const ta = mkTicket("Ticket A");
+    const tb = mkTicket("Ticket B");
+
+    const resetSec = Math.floor(clock.now() / 1000) + 3600;
+    const invLog = join(sandbox, "inv-log.jsonl");
+    // Counting claude: the 2nd invocation over the run's lifetime hits the usage limit; every other
+    // invocation succeeds. The counter lives in the worktree, so it only survives into the resume
+    // if the worktree is reused — completing at all proves reuse. Each invocation logs its ticket
+    // id, so we can assert the already-closed ticket is not re-invoked after the reset.
+    const countingClaude = writeBin(
+      binDir,
+      "claude-count",
+      `const fs=require('fs');const path=require('path');
+const a=process.argv.slice(2);const get=f=>{const i=a.indexOf(f);return i>=0?a[i+1]:undefined;};
+const prompt=get('-p')||'';const m=prompt.match(/Ticket: (\\S+)/);const ticket=m?m[1]:'unknown';
+const log=${JSON.stringify(invLog)};fs.appendFileSync(log,ticket+'\\n');
+const counter=path.join(process.cwd(),'.inv-count');
+let n=0;try{n=parseInt(fs.readFileSync(counter,'utf8'),10)||0;}catch(e){}
+n+=1;fs.writeFileSync(counter,String(n));
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+if(n===2){e({type:'result',subtype:'error_during_execution',result:'Claude AI usage limit reached|${resetSec}',is_error:true});process.exit(0);}
+fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work '+ticket+' '+n+'\\n');
+e({type:'system',subtype:'init',session_id:'s3'});
+e({type:'assistant',message:{content:[{type:'text',text:'done'}]}});
+e({type:'result',subtype:'success',result:'done',session_id:'s3',num_turns:1,is_error:false});
+process.exit(0);`,
+    );
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000, quotaCooloffMs: 60_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    process.env.ANTON_CLAUDE_BIN = countingClaude;
+    try {
+      const jobId = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: epic3 },
+      });
+
+      // First tick: one ticket succeeds + closes, the next hits the usage limit → job rescheduled
+      // (quota attempt refunded), run parked, worktree kept.
+      await runner.tickOnce();
+      await runner.whenIdle();
+      let job = await getJob(tdb.db, jobId);
+      expect(job?.status).toBe("queued");
+      expect(job?.attempts).toBe(0);
+      const run3 = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === epic3)!;
+      expect(run3.status).toBe("parked");
+      expect(existsSync(run3.worktreePath!)).toBe(true);
+
+      // Exactly one ticket closed before the park; the other is still open.
+      const statusAtPark = {
+        [ta]: (await beads.show(repo, ta)).status,
+        [tb]: (await beads.show(repo, tb)).status,
+      };
+      const closedAtPark = [ta, tb].filter((id) => statusAtPark[id] === "closed");
+      expect(closedAtPark).toHaveLength(1);
+      const closedFirst = closedAtPark[0];
+      const pending = closedFirst === ta ? tb : ta;
+
+      // Both tickets were invoked exactly once so far (the second one quota'd).
+      const before = readFileSync(invLog, "utf8").trim().split("\n");
+      expect(before.filter((t) => t === closedFirst)).toHaveLength(1);
+      expect(before.filter((t) => t === pending)).toHaveLength(1);
+
+      // Not due yet.
+      expect(await runner.tickOnce()).toBe(0);
+
+      // Advance past the reset window → resumes on the SAME run/worktree and completes.
+      clock.set(resetSec * 1000 + 1);
+      await runner.tickOnce();
+      await runner.whenIdle();
+
+      job = await getJob(tdb.db, jobId);
+      expect(job?.status).toBe("done");
+      const run3b = (await tdb.db.select().from(schema.runs)).filter((r) => r.epicBeadId === epic3);
+      expect(run3b).toHaveLength(1); // resumed, not duplicated
+      expect(run3b[0].id).toBe(run3.id);
+      expect(run3b[0].worktreePath).toBe(run3.worktreePath); // same worktree reused
+      expect(run3b[0].status).toBe("done");
+
+      // Both tickets closed; the already-closed ticket was SKIPPED on resume (invoked once total),
+      // while the previously-quota'd ticket was invoked twice (quota + resumed success).
+      expect((await beads.show(repo, ta)).status).toBe("closed");
+      expect((await beads.show(repo, tb)).status).toBe("closed");
+      const after = readFileSync(invLog, "utf8").trim().split("\n");
+      expect(after).toHaveLength(3);
+      expect(after.filter((t) => t === closedFirst)).toHaveLength(1); // not re-invoked
+      expect(after.filter((t) => t === pending)).toHaveLength(2);
+      expect((await beads.show(repo, epic3)).labels ?? []).toContain("stage:in-review");
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
     }

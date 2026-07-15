@@ -10,6 +10,7 @@ import { AntonWordmark } from "@/components/shell/brand";
 import {
   BoardIcon,
   DependenciesIcon,
+  JobsIcon,
   ProjectsIcon,
   RunsIcon,
   SettingsIcon,
@@ -33,6 +34,7 @@ function workspaceNav(slug?: string): NavEntry[] {
     ...(slug
       ? ([
           { label: "Runs", href: `/projects/${slug}/runs`, icon: RunsIcon },
+          { label: "Jobs", href: `/projects/${slug}/jobs`, icon: JobsIcon },
           { label: "Settings", href: `/projects/${slug}/settings`, icon: SettingsIcon },
         ] as NavEntry[])
       : []),

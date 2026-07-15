@@ -2,7 +2,7 @@
  * Read-only access to the machine-local `runs` table. Runs are execution plumbing (worktree,
  * lease, model, agent); stage/PR live in beads. See DESIGN.md §3.
  */
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, count, desc, eq, inArray } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import type { AntonDb, Clock } from "./jobs/queue";
 
@@ -60,6 +60,30 @@ export async function listRuns(projectId: string): Promise<RunSummary[]> {
     .from(schema.runs)
     .where(eq(schema.runs.projectId, projectId))
     .orderBy(desc(schema.runs.updatedAt));
+  return rows.map(toSummary);
+}
+
+/** Total run rows for a project — for pagination. */
+export async function countRuns(projectId: string): Promise<number> {
+  const rows = await getDb()
+    .select({ n: count() })
+    .from(schema.runs)
+    .where(eq(schema.runs.projectId, projectId));
+  return rows[0]?.n ?? 0;
+}
+
+/** One page of runs, newest activity first. */
+export async function listRunsPaged(
+  projectId: string,
+  opts: { limit: number; offset: number },
+): Promise<RunSummary[]> {
+  const rows = await getDb()
+    .select()
+    .from(schema.runs)
+    .where(eq(schema.runs.projectId, projectId))
+    .orderBy(desc(schema.runs.updatedAt))
+    .limit(opts.limit)
+    .offset(opts.offset);
   return rows.map(toSummary);
 }
 
@@ -163,6 +187,38 @@ export async function updateRun(
 export async function getRunById(db: AntonDb, id: string): Promise<RunRow | undefined> {
   const rows = await db.select().from(schema.runs).where(eq(schema.runs.id, id)).limit(1);
   return rows[0];
+}
+
+/**
+ * Boot reconciliation (anton-nbd): a `runs` row left in `running` after a crash is only genuinely
+ * orphaned if no execute-epic job will resume it. `activeKeys` holds `${projectId}::${epicBeadId}`
+ * for every still-active job (see `activeExecuteEpicKeys`); a running run whose key is present is
+ * about to be re-dispatched and MUST be left alone (touching it would break the idempotent resume —
+ * `findOpenRunForEpic` reuses the same row). Any other running run has no job coming back, so mark
+ * it `failed` (`interrupted`) — that clears the stale "running" from the UI. Returns the count
+ * reconciled. Runs that are already `parked` are left as-is (their job resumes or a human un-parks).
+ */
+export async function reconcileInterruptedRuns(
+  db: AntonDb,
+  clock: Clock,
+  activeKeys: Set<string>,
+): Promise<number> {
+  const running = await db
+    .select()
+    .from(schema.runs)
+    .where(eq(schema.runs.status, "running"));
+  const orphaned = running.filter(
+    (r) => !activeKeys.has(`${r.projectId ?? ""}::${r.epicBeadId}`),
+  );
+  const nowMs = clock.now();
+  for (const run of orphaned) {
+    await updateRun(db, clock, run.id, {
+      status: "failed",
+      error: "interrupted by server restart",
+      endedAt: nowMs,
+    });
+  }
+  return orphaned.length;
 }
 
 /** The most-recent still-open run for an epic — used to resume rather than start a duplicate. */

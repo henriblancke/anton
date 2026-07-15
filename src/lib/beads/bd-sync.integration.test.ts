@@ -96,12 +96,15 @@ suite("beads.sync integration (real bd · local bare remote)", () => {
     expect(doltDataRef()).not.toBe(afterEdit);
   }, 60_000);
 
-  it("sync rejects loudly on a real push failure", async () => {
-    // Re-point the Dolt remote at a path that doesn't exist (upsert) — push must fail, not skip.
+  it("sync rejects loudly on a real remote failure (unreachable remote is not swallowed)", async () => {
+    // Re-point the Dolt remote at a path that doesn't exist (upsert). This is NOT the benign
+    // first-publish case (a wired-but-unpushed remote) — the remote is unreachable, so the full
+    // pass must reject loudly rather than tolerate it. bd surfaces it at the pull step (which runs
+    // before push), so the sync fails there; push-failure rejection is covered in bd.test.ts.
     execFileSync("bd", ["dolt", "remote", "add", "origin", join(sandbox, "missing.git")], {
       cwd: repo,
       stdio: "ignore",
     });
-    await expect(beads.sync(repo)).rejects.toThrow(/bd dolt push failed/);
+    await expect(beads.sync(repo)).rejects.toThrow(/bd dolt (pull|push) failed/);
   }, 60_000);
 });

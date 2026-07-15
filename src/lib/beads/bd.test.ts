@@ -206,6 +206,18 @@ describe("runDoltSync", () => {
     ]);
   });
 
+  it("a full pass rejects a real (non-first-publish) pull failure before push", async () => {
+    const calls: string[][] = [];
+    await expect(
+      runDoltSync("/repo", async (_cwd, args) => {
+        calls.push(args);
+        if (args[1] === "pull") throw execError({ stderr: "Error: failed to get remote db\n" });
+        return "";
+      }),
+    ).rejects.toThrow(/bd dolt pull failed [\s\S]*failed to get remote db/);
+    expect(calls).toEqual([["dolt", "pull"]]); // never reached commit/push
+  });
+
   it("a pull-only pass rejects on a real pull failure", async () => {
     await expect(
       runDoltSync(
@@ -282,10 +294,12 @@ describe("createDoltSync", () => {
     const gate = new Promise<void>((r) => (release = r));
     let runs = 0;
     const sync = createDoltSync(async (_cwd, args) => {
-      if (args[1] === "commit") runs += 1;
-      if (runs === 1) {
-        await gate;
-        throw execError({ stderr: "Error: push failed: connection reset" });
+      if (args[1] === "push") {
+        runs += 1;
+        if (runs === 1) {
+          await gate;
+          throw execError({ stderr: "Error: push failed: connection reset" });
+        }
       }
       return "";
     });

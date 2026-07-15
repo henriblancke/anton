@@ -138,6 +138,7 @@ process.exit(0);`,
     runner.registerHandler("nightly-stringer", makeNightlyStringerHandler({ db: tdb.db, clock }));
     const jobId = await runner.enqueue({ type: "nightly-stringer", projectId, payload: { projectId } });
     expect(await runner.tickOnce()).toBe(1);
+    await runner.whenIdle();
 
     expect((await getJob(tdb.db, jobId))?.status).toBe("done");
 
@@ -166,6 +167,7 @@ process.exit(0);`,
     runner.registerHandler("nightly-stringer", makeNightlyStringerHandler({ db: tdb.db, clock }));
     const jobId = await runner.enqueue({ type: "nightly-stringer", projectId, payload: { projectId } });
     expect(await runner.tickOnce()).toBe(1);
+    await runner.whenIdle();
 
     expect((await getJob(tdb.db, jobId))?.status).toBe("done");
     // No beads created, claude never ran (no argv file written).

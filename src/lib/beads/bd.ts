@@ -131,6 +131,25 @@ export function isNotWiredOutput(output: string): boolean {
   return NOT_WIRED_OUTPUT.some((re) => re.test(output));
 }
 
+/**
+ * The ONLY `bd dolt pull` failure that is benign: a never-pushed remote has no refs/dolt/data yet,
+ * so the first pull finds no dolt branches on the remote ("no branches found in remote", or on some
+ * git backends "couldn't find remote ref"). In a full pass the push that follows publishes it; on a
+ * heartbeat it just means "nothing to pull yet" and must NOT mark the project failing. Every OTHER
+ * pull failure (auth, network, unreachable remote, dirty local state, real divergence) must reject —
+ * in a full pass, before push — or a pass that never applied inbound changes could still be recorded
+ * as "synced" whenever the trailing push happens to be a no-op (anton-live-sync review).
+ */
+const FIRST_PUBLISH_PULL_OUTPUT = [
+  /no branches found in remote/i,
+  /(?:could ?n['’]t|could not) find remote ref/i,
+  /remote ref .*does not exist/i,
+];
+
+export function isFirstPublishPullOutput(output: string): boolean {
+  return FIRST_PUBLISH_PULL_OUTPUT.some((re) => re.test(output));
+}
+
 // ── Sync status registry (anton-live-sync) ──
 //
 // Keyed on globalThis via Symbol.for: the instrumentation-started sync engine and Next.js API
@@ -202,10 +221,12 @@ export async function runDoltSync(
       const output = `${err.stderr ?? ""}\n${err.stdout ?? ""}`.trim() || err.message;
       if (isNotWiredOutput(output)) return "not-wired";
       if (isBenignSyncOutput(output)) continue;
-      // A full pass survives pull failure: first-ever pull against a never-pushed remote fails
-      // until the first push publishes refs/dolt/data. The push step still fails loudly on real
-      // divergence, so nothing is masked. Pull-only passes reject so the heartbeat can surface it.
-      if (mode === "full" && args[1] === "pull") continue;
+      // A pull tolerates ONLY the first-publish case (a never-pushed remote has no dolt branches
+      // yet): in a full pass the push that follows publishes them; on a heartbeat it's just
+      // "nothing to pull yet". Any OTHER pull failure (auth, network, unreachable remote, dirty
+      // local state, real divergence) rejects here — in a full pass, before push — so a pass that
+      // never applied inbound changes is never silently recorded as "synced" on a no-op push.
+      if (args[1] === "pull" && isFirstPublishPullOutput(output)) continue;
       throw new Error(`bd ${args.join(" ")} failed in ${cwd}: ${output}`, { cause: e });
     }
   }

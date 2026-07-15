@@ -6,26 +6,32 @@
  *   • API-limit backoff      — `UsageLimitError` → reschedule past the reset window; the attempt is
  *                              refunded (you can't retry an exhausted quota).
  *   • Poison-pill            — a job that errors `maxAttempts` times (or throws `PoisonError`) is
- *                              parked for a human.
+ *                              parked for a human. Parking is recoverable, not terminal: `resume()`
+ *                              (queue.resumeJob) un-parks a job back to `queued` with a fresh budget.
  *
  * The decision logic (`nextAction`) is a pure function so it can be unit-tested without timers.
  * See DESIGN.md §4.
  */
 import {
+  activeExecuteEpicKeys,
   complete,
   enqueue,
+  enqueueExecuteEpicDeduped,
   getJob,
   leaseDue,
   park,
   projectIdsWithPendingJobs,
+  reclaimRunningJobs,
   renewLease,
   reschedule,
+  resumeJob,
   systemClock,
   type AntonDb,
   type Clock,
   type JobRow,
   type JobType,
 } from "./queue";
+import { reconcileInterruptedRuns } from "../runs";
 import { isPoisonError, isUsageLimitError } from "./errors";
 
 export interface RunnerConfig {
@@ -159,6 +165,8 @@ export class JobRunner {
   private readonly resolvePolicy: JobPolicyResolver | null;
 
   private readonly inFlight = new Map<string, AbortController>();
+  /** Settlement promises for jobs dispatched but not yet settled — the drain set for whenIdle(). */
+  private readonly pending = new Set<Promise<void>>();
   private timer: ReturnType<typeof setTimeout> | null = null;
   private running = false;
   private ticking = false;
@@ -203,9 +211,65 @@ export class JobRunner {
   }
 
   /**
-   * Lease and fully process all currently-due jobs (up to available concurrency), awaiting each.
-   * This is the unit the background loop repeats — and what tests drive directly.
-   * Returns the number of jobs processed.
+   * Enqueue an execute-epic run, deduped against any active (queued|running) job for the same
+   * project + epic. Returns the existing job's id when one is active; else creates a fresh job.
+   * Race-safe via a transactional guard + partial unique index (anton-761).
+   */
+  enqueueExecuteEpic(projectId: string, epicBeadId: string): string {
+    return enqueueExecuteEpicDeduped(this.db, this.clock, projectId, epicBeadId);
+  }
+
+  /**
+   * Un-park a parked job, returning it to `queued` with a fresh attempt budget so it is picked up
+   * on the next tick. The recovery path for a job that exhausted its retries (or hit a permanent
+   * error a human has since resolved). Resolves true if a parked job was resumed, false otherwise.
+   * The manual-resume UI (anton's separate ticket) drives this; parking is no longer terminal.
+   */
+  resume(jobId: string): Promise<boolean> {
+    return resumeJob(this.db, this.clock, jobId);
+  }
+
+  /**
+   * Crash/restart reconciliation (anton-nbd). Call ONCE at boot, before `start()`, while nothing is
+   * in flight. Two steps make the durable state consistent again:
+   *
+   *   1. Reclaim orphaned leases — every `running` job is a lease the dead process never released;
+   *      expiring the lease makes the next tick re-dispatch it immediately (rolling dispatch),
+   *      instead of stalling for the whole `leaseMs` window.
+   *   2. Reconcile orphaned runs — a `runs` row stuck in `running` whose execute-epic job is NOT
+   *      coming back (no active job for its epic) is marked `failed`; a run whose job WILL resume is
+   *      left untouched so the resume reuses it idempotently (no duplicate run / PR / commit).
+   *
+   * Best-effort: a reconciliation failure is logged but never blocks boot (the lease-expiry path
+   * still recovers jobs, just a window later).
+   */
+  async reconcile(): Promise<{ reclaimedJobs: number; reconciledRuns: number }> {
+    try {
+      const reclaimedJobs = await reclaimRunningJobs(this.db, this.clock);
+      const activeKeys = await activeExecuteEpicKeys(this.db);
+      const reconciledRuns = await reconcileInterruptedRuns(this.db, this.clock, activeKeys);
+      if (reclaimedJobs > 0 || reconciledRuns > 0) {
+        this.log.info(
+          `boot reconcile: reclaimed ${reclaimedJobs} orphaned job lease(s), ` +
+            `failed ${reconciledRuns} interrupted run(s)`,
+        );
+      }
+      return { reclaimedJobs, reconciledRuns };
+    } catch (e) {
+      this.log.error("boot reconcile failed (lease expiry will still recover jobs)", e);
+      return { reclaimedJobs: 0, reconciledRuns: 0 };
+    }
+  }
+
+  /**
+   * Lease all currently-due jobs (up to available concurrency) and dispatch them **without awaiting
+   * completion** — rolling dispatch. A long-running job stays in flight while the loop keeps
+   * ticking every `tickMs`, so newly-enqueued work is leased within about one tick instead of after
+   * the long job finishes. Returns the number of jobs leased/dispatched this tick.
+   *
+   * In-flight jobs count against `maxConcurrent` (the global cap) and against `leaseDue`'s
+   * per-project `capOf` (via their `running` rows), so capacity never oversubscribes across the
+   * rolling set. Use `whenIdle()` to await settlement of everything dispatched (tests, shutdown).
    */
   async tickOnce(): Promise<number> {
     const capacity = this.config.maxConcurrent - this.inFlight.size;
@@ -231,66 +295,86 @@ export class JobRunner {
       leaseMs: this.config.leaseMs,
       limit: capacity,
       capOf,
+      // Never re-lease a job already dispatched in this process. Rolling dispatch keeps a running
+      // job in `inFlight` while its handler works; if its lease lapses (missed renewal from sleep or
+      // a transient DB failure) its row looks reclaimable, and without this a spare-capacity tick
+      // would dispatch it twice against the same worktree.
+      exclude: this.inFlight.keys(),
     });
     if (jobs.length === 0) return 0;
 
-    await Promise.all(jobs.map((job) => this.processJob(job)));
+    // Rolling dispatch: kick each leased job off without awaiting it, tracking its settlement
+    // promise so whenIdle() (tests) and stop() (shutdown) can drain deterministically.
+    for (const job of jobs) {
+      const p = this.processJob(job);
+      this.pending.add(p);
+      void p.finally(() => this.pending.delete(p));
+    }
     return jobs.length;
   }
 
   private async processJob(job: JobRow): Promise<void> {
     const handler = this.handlers.get(job.type as JobType);
     const controller = new AbortController();
+    // Held for the whole lifetime (handler + settle) so the slot isn't freed until the job is
+    // durably settled — that's what keeps global/per-project capacity from oversubscribing.
     this.inFlight.set(job.id, controller);
 
-    const policy = await this.policyFor(job.projectId ?? undefined);
-
-    // Keep the lease alive across long handlers so a working job isn't wrongly reclaimed.
-    const renewEvery = Math.max(1_000, Math.floor(this.config.leaseMs / 3));
-    const renewTimer = setInterval(() => {
-      void renewLease(this.db, this.clock, job.id, this.config.leaseMs).catch(() => {});
-    }, renewEvery);
-
-    // Wall-clock timeout: abort the handler if it runs past the project's budget, so one stuck run
-    // can't hold its concurrency slot forever (a heartbeating handler is never lease-reclaimed).
-    let timedOut = false;
-    const timeoutTimer =
-      Number.isFinite(policy.timeoutMs) && policy.timeoutMs > 0
-        ? setTimeout(() => {
-            timedOut = true;
-            controller.abort();
-          }, policy.timeoutMs)
-        : null;
-    // Don't let the timeout keep the process alive when idle.
-    if (timeoutTimer && typeof timeoutTimer.unref === "function") timeoutTimer.unref();
-
-    let outcome: Outcome;
     try {
-      if (!handler) throw new Error(`no handler registered for job type "${job.type}"`);
-      const ctx: JobContext = {
-        jobId: job.id,
-        type: job.type as JobType,
-        projectId: job.projectId ?? undefined,
-        payload: parsePayload(job.payloadJson),
-        attempt: job.attempts,
-        heartbeat: () => renewLease(this.db, this.clock, job.id, this.config.leaseMs),
-        signal: controller.signal,
-      };
-      await handler(ctx);
-      outcome = { kind: "success" };
+      const policy = await this.policyFor(job.projectId ?? undefined);
+
+      // Keep the lease alive across long handlers so a working job isn't wrongly reclaimed.
+      const renewEvery = Math.max(1_000, Math.floor(this.config.leaseMs / 3));
+      const renewTimer = setInterval(() => {
+        void renewLease(this.db, this.clock, job.id, this.config.leaseMs).catch(() => {});
+      }, renewEvery);
+
+      // Wall-clock timeout: abort the handler if it runs past the project's budget, so one stuck
+      // run can't hold its concurrency slot forever (a heartbeating handler is never reclaimed).
+      let timedOut = false;
+      const timeoutTimer =
+        Number.isFinite(policy.timeoutMs) && policy.timeoutMs > 0
+          ? setTimeout(() => {
+              timedOut = true;
+              controller.abort();
+            }, policy.timeoutMs)
+          : null;
+      // Don't let the timeout keep the process alive when idle.
+      if (timeoutTimer && typeof timeoutTimer.unref === "function") timeoutTimer.unref();
+
+      let outcome: Outcome;
+      try {
+        if (!handler) throw new Error(`no handler registered for job type "${job.type}"`);
+        const ctx: JobContext = {
+          jobId: job.id,
+          type: job.type as JobType,
+          projectId: job.projectId ?? undefined,
+          payload: parsePayload(job.payloadJson),
+          attempt: job.attempts,
+          heartbeat: () => renewLease(this.db, this.clock, job.id, this.config.leaseMs),
+          signal: controller.signal,
+        };
+        await handler(ctx);
+        outcome = { kind: "success" };
+      } catch (e) {
+        // A timeout abort is a retryable failure with a clear reason (not a poison/quota misread).
+        outcome = timedOut
+          ? { kind: "error", error: `timed out after ${Math.round(policy.timeoutMs / 60_000)}m` }
+          : classifyError(e);
+        this.log.error(`job ${job.id} (${job.type}) failed: ${outcome.kind}`, e);
+      } finally {
+        clearInterval(renewTimer);
+        if (timeoutTimer) clearTimeout(timeoutTimer);
+      }
+
+      await this.settle(job, outcome, policy);
     } catch (e) {
-      // A timeout abort is a retryable failure with a clear reason (not a poison/quota misread).
-      outcome = timedOut
-        ? { kind: "error", error: `timed out after ${Math.round(policy.timeoutMs / 60_000)}m` }
-        : classifyError(e);
-      this.log.error(`job ${job.id} (${job.type}) failed: ${outcome.kind}`, e);
+      // Policy resolution or the settle write itself failed — log and release the slot; the lease
+      // expires and the job is reclaimed on a later tick.
+      this.log.error(`job ${job.id} (${job.type}) did not settle`, e);
     } finally {
-      clearInterval(renewTimer);
-      if (timeoutTimer) clearTimeout(timeoutTimer);
       this.inFlight.delete(job.id);
     }
-
-    await this.settle(job, outcome, policy);
   }
 
   private async settle(job: JobRow, outcome: Outcome, policy: JobPolicy): Promise<void> {
@@ -352,6 +436,17 @@ export class JobRunner {
       await new Promise((r) => setTimeout(r, 50));
     }
     this.log.info("job runner stopped");
+  }
+
+  /**
+   * Resolve once every dispatched job has fully settled (handler run + durability write). The
+   * deterministic drain point: rolling dispatch never awaits a job itself, so tests await this to
+   * observe settled state and shutdown uses it to finish in-flight work.
+   */
+  async whenIdle(): Promise<void> {
+    while (this.pending.size > 0) {
+      await Promise.allSettled([...this.pending]);
+    }
   }
 
   get activeCount(): number {

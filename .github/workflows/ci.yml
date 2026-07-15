@@ -39,3 +39,40 @@ jobs:
 
       - name: Build
         run: bun run build
+
+  # Coverage (anton-7jy). Report-only — a separate, non-blocking job. V8 instrumentation adds ~5x
+  # runtime, so it's kept OFF the blocking `check` gate to avoid slowing/flaking it; the html+lcov
+  # report is uploaded as an artifact for inspection. `continue-on-error` means a coverage-induced
+  # timeout never blocks a merge.
+  coverage:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.2.20" # match package.json `packageManager`
+      - name: Install
+        run: bun install --frozen-lockfile
+      - name: Test with coverage
+        run: bun run test:coverage
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+          if-no-files-found: ignore
+
+  # Secret scan (anton-7jy). Fails the PR if a credential is committed. Free for personal repos;
+  # org-owned repos need a GITLEAKS_LICENSE secret (see the action's README).
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # gitleaks needs full history to scan the PR's commit range
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
