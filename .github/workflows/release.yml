@@ -61,7 +61,7 @@ jobs:
       # Without this the ABI tracks the runner's default Node, not the user's — the exact cause of
       # the "compiled against a different Node.js version" failures. `anton setup` still heals a
       # mismatch for users on other Node majors, but this makes the common (current-Node) case just work.
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: "24"
       - uses: oven-sh/setup-bun@v2
