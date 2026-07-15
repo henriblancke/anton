@@ -14,7 +14,9 @@
  */
 import {
   activeExecuteEpicKeys,
+  activeJobIdsForProject,
   complete,
+  deleteActiveJobsForProject,
   enqueue,
   enqueueExecuteEpicDeduped,
   getJob,
@@ -161,6 +163,7 @@ export class JobRunner {
   private readonly clock: Clock;
   private readonly config: RunnerConfig;
   private readonly handlers = new Map<JobType, JobHandler>();
+  private readonly quiescedProjects = new Set<string>();
   private readonly log: RunnerLogger;
   private readonly resolvePolicy: JobPolicyResolver | null;
 
@@ -207,6 +210,9 @@ export class JobRunner {
 
   /** Enqueue a job on this runner's DB/clock. */
   enqueue(input: { type: JobType; projectId?: string; payload?: unknown; runAt?: number }) {
+    if (input.projectId && this.quiescedProjects.has(input.projectId)) {
+      return Promise.reject(new Error(`Project is being deleted: ${input.projectId}`));
+    }
     return enqueue(this.db, this.clock, input);
   }
 
@@ -216,6 +222,9 @@ export class JobRunner {
    * Race-safe via a transactional guard + partial unique index (anton-761).
    */
   enqueueExecuteEpic(projectId: string, epicBeadId: string): string {
+    if (this.quiescedProjects.has(projectId)) {
+      throw new Error(`Project is being deleted: ${projectId}`);
+    }
     return enqueueExecuteEpicDeduped(this.db, this.clock, projectId, epicBeadId);
   }
 
@@ -225,7 +234,9 @@ export class JobRunner {
    * error a human has since resolved). Resolves true if a parked job was resumed, false otherwise.
    * The manual-resume UI (anton's separate ticket) drives this; parking is no longer terminal.
    */
-  resume(jobId: string): Promise<boolean> {
+  async resume(jobId: string): Promise<boolean> {
+    const job = await getJob(this.db, jobId);
+    if (job?.projectId && this.quiescedProjects.has(job.projectId)) return false;
     return resumeJob(this.db, this.clock, jobId);
   }
 
@@ -277,7 +288,7 @@ export class JobRunner {
 
     // With a policy resolver, gate execute-epic concurrency per project. Precompute each pending
     // project's cap so leaseDue can decide synchronously; other job types stay ungated (Infinity).
-    let capOf: ((job: JobRow) => number) | undefined;
+    let policyCapOf: ((job: JobRow) => number) | undefined;
     if (this.resolvePolicy) {
       const projectIds = await projectIdsWithPendingJobs(this.db, "execute-epic");
       const concByProject = new Map<string, number>();
@@ -285,11 +296,15 @@ export class JobRunner {
         const policy = await this.policyFor(pid ?? undefined);
         concByProject.set(pid ?? "", policy.concurrency);
       }
-      capOf = (job) =>
+      policyCapOf = (job) =>
         job.type === "execute-epic"
           ? (concByProject.get(job.projectId ?? "") ?? DEFAULT_CONFIG.maxConcurrent)
           : Infinity;
     }
+    const capOf = (job: JobRow) =>
+      job.projectId && this.quiescedProjects.has(job.projectId)
+        ? 0
+        : (policyCapOf?.(job) ?? Infinity);
 
     const jobs = await leaseDue(this.db, this.clock, {
       leaseMs: this.config.leaseMs,
@@ -436,6 +451,63 @@ export class JobRunner {
       await new Promise((r) => setTimeout(r, 50));
     }
     this.log.info("job runner stopped");
+  }
+
+  /**
+   * Project teardown (anton-adt): force-abort every in-flight job for `projectId`, then delete its
+   * `queued`/`running` rows so nothing re-claims the project's work mid-teardown. Sweeps until no
+   * active row remains — the polling loop can lease a row between one read and its delete, so a
+   * single pass isn't a guarantee. Row deletion makes an aborted handler's settle a no-op (its
+   * UPDATE hits nothing), and settled rows (done/parked/failed) hold no lease, so they're left for
+   * the caller's full project delete.
+   *
+   * Fails loud rather than half-stopping: throws if an aborted handler doesn't unwind within the
+   * grace window or active rows keep reappearing (a racing enqueue) — the caller must not proceed
+   * to worktree/db teardown while work may still be running.
+   */
+  async abortProject(projectId: string): Promise<void> {
+    const aborted = new Set<string>();
+    for (let sweep = 0; sweep < 5; sweep++) {
+      const activeIds = await activeJobIdsForProject(this.db, projectId);
+      if (activeIds.length === 0) break;
+      for (const id of activeIds) {
+        const controller = this.inFlight.get(id);
+        if (controller) {
+          controller.abort();
+          aborted.add(id);
+        }
+      }
+      await deleteActiveJobsForProject(this.db, projectId);
+    }
+
+    // Give aborted handlers a bounded window to unwind (mirrors stop()) so teardown doesn't race
+    // a live job — e.g. removing a worktree a child process is still writing to.
+    const start = Date.now();
+    while ([...aborted].some((id) => this.inFlight.has(id)) && Date.now() - start < 10_000) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const stuck = [...aborted].filter((id) => this.inFlight.has(id));
+    if (stuck.length > 0) {
+      throw new Error(
+        `abortProject(${projectId}): aborted job(s) ${stuck.join(", ")} did not unwind in time`,
+      );
+    }
+    const leftover = await activeJobIdsForProject(this.db, projectId);
+    if (leftover.length > 0) {
+      throw new Error(
+        `abortProject(${projectId}): active job(s) ${leftover.join(", ")} still present after abort`,
+      );
+    }
+  }
+
+  /**
+   * Permanently stop this process from accepting or leasing more work for a project, then drain
+   * all work that crossed the barrier before it was raised. Project deletion calls this before
+   * reading worktree state, closing the approval/tick race identified in PR review.
+   */
+  async quiesceProject(projectId: string): Promise<void> {
+    this.quiescedProjects.add(projectId);
+    await this.abortProject(projectId);
   }
 
   /**

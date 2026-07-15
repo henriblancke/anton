@@ -408,6 +408,39 @@ export async function resumeJob(db: AntonDb, clock: Clock, jobId: string): Promi
   return true;
 }
 
+/**
+ * Ids of a project's active (`queued`|`running`) jobs. Project teardown (anton-adt) uses this to
+ * find what must be aborted/removed before the project's rows and worktrees are deleted.
+ */
+export async function activeJobIdsForProject(db: AntonDb, projectId: string): Promise<string[]> {
+  const rows = await db
+    .select({ id: schema.jobs.id })
+    .from(schema.jobs)
+    .where(
+      and(
+        eq(schema.jobs.projectId, projectId),
+        inArray(schema.jobs.status, [...ACTIVE_STATUSES]),
+      ),
+    );
+  return rows.map((r) => r.id);
+}
+
+/**
+ * Delete a project's active (`queued`|`running`) job rows so nothing can re-lease its work
+ * mid-teardown (anton-adt). Settled rows (done/parked/failed) are left for the caller's full
+ * project-row delete — they hold no lease and can't be claimed.
+ */
+export async function deleteActiveJobsForProject(db: AntonDb, projectId: string): Promise<void> {
+  await db
+    .delete(schema.jobs)
+    .where(
+      and(
+        eq(schema.jobs.projectId, projectId),
+        inArray(schema.jobs.status, [...ACTIVE_STATUSES]),
+      ),
+    );
+}
+
 export async function getJob(db: AntonDb, jobId: string): Promise<JobRow | undefined> {
   const rows = await db.select().from(schema.jobs).where(eq(schema.jobs.id, jobId)).limit(1);
   return rows[0];

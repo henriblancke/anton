@@ -6,8 +6,9 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { makeTestDb, type TestDb } from "../db/testing";
+import * as schema from "../db/schema";
 import { PoisonError, UsageLimitError } from "./errors";
-import { getJob, toMs, type Clock } from "./queue";
+import { enqueue, getJob, toMs, type Clock } from "./queue";
 import {
   DEFAULT_CONFIG,
   JobRunner,
@@ -616,6 +617,72 @@ describe("JobRunner (live, in-memory db)", () => {
     release();
     await r.whenIdle();
     expect((await getJob(tdb.db, id))?.status).toBe("done");
+  });
+
+  it("abortProject force-aborts the in-flight job and removes the project's queued/running rows (anton-adt)", async () => {
+    await seedProjects("A", "B");
+    let sawAbort = false;
+    const r = runner(async (ctx) => {
+      // Block until force-aborted — a stand-in for a long execute-epic run.
+      await new Promise<void>((resolveWait) => {
+        ctx.signal.addEventListener("abort", () => {
+          sawAbort = true;
+          resolveWait();
+        });
+      });
+    });
+
+    const inFlightId = await r.enqueue({ type: "execute-epic", projectId: "A" });
+    expect(await r.tickOnce()).toBe(1);
+    await waitUntil(() => r.activeCount === 1);
+
+    // Queued work for the doomed project + an innocent bystander project.
+    const queuedId = await r.enqueue({ type: "execute-epic", projectId: "A" });
+    const otherId = await r.enqueue({ type: "execute-epic", projectId: "B" });
+
+    await r.abortProject("A");
+    await r.whenIdle();
+
+    expect(sawAbort).toBe(true);
+    expect(r.activeCount).toBe(0);
+    // No orphaned lease survives: the project's active rows are gone entirely.
+    expect(await getJob(tdb.db, inFlightId)).toBeUndefined();
+    expect(await getJob(tdb.db, queuedId)).toBeUndefined();
+    // The other project's work is untouched.
+    expect((await getJob(tdb.db, otherId))?.status).toBe("queued");
+  });
+
+  it("abortProject is a safe no-op for a project with no active jobs and leaves settled rows alone", async () => {
+    await seedProjects("A");
+    const r = runner(async () => {});
+    const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
+    await r.tickOnce();
+    await r.whenIdle();
+
+    await expect(r.abortProject("A")).resolves.toBeUndefined();
+    // Settled (done) rows are the caller's to delete, not abortProject's.
+    expect((await getJob(tdb.db, id))?.status).toBe("done");
+  });
+
+  it("quiesceProject rejects new enqueue/resume work and never leases the project again", async () => {
+    await seedProjects("A", "B");
+    const r = runner(async () => {});
+    const parked = await r.enqueue({ type: "execute-epic", projectId: "A" });
+    await tdb.db.update(schema.jobs).set({ status: "parked" }).where(eq(schema.jobs.id, parked));
+
+    await r.quiesceProject("A");
+
+    await expect(r.enqueue({ type: "review-fix", projectId: "A" })).rejects.toThrow(
+      /being deleted/,
+    );
+    expect(() => r.enqueueExecuteEpic("A", "epic-race")).toThrow(/being deleted/);
+    await expect(r.resume(parked)).resolves.toBe(false);
+    const bypassed = await enqueue(tdb.db, clock, { type: "review-fix", projectId: "A" });
+    const other = await r.enqueue({ type: "execute-epic", projectId: "B" });
+    expect(await r.tickOnce()).toBe(1);
+    await r.whenIdle();
+    expect((await getJob(tdb.db, bypassed))?.status).toBe("queued");
+    expect((await getJob(tdb.db, other))?.status).toBe("done");
   });
 });
 
