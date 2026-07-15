@@ -118,11 +118,13 @@ export interface ProjectSettings {
    */
   maxRetries?: number;
   /**
-   * Active-agents allowlist (anton-46w): which specialist agent prompts dispatch may assign.
-   * Each entry is a known agent id (KNOWN_AGENTS in src/lib/agents.ts). Enforced by dispatch
-   * (anton-dm7, execute-epic): a run whose ticket needs a disabled agent is PARKED with a clear
-   * reason — never silently run with the default agent. Absent or empty → all agents active
-   * (DEFAULT_ACTIVE_AGENTS is the UI's initial toggle state only, not an enforcement default).
+   * Active-agents allowlist (anton-46w): which specialist agent prompts dispatch may assign. Each
+   * entry is a discoverable agent id — bundled OR the project's own `.claude/agents` (anton-dvo.1,
+   * discoverAgents in src/lib/agents-discovery.ts). Enforced by dispatch (anton-dm7, execute-epic):
+   * a run whose ticket needs a disabled agent is PARKED with a clear reason — never silently run
+   * with the default agent. Absent (never persisted / cleared) → all agents active; empty `[]` →
+   * no agents active (the operator toggled every agent off), so any labeled ticket is parked. The
+   * UI seeds "all discovered on" when this is absent, so a no-op save stays all-active.
    */
   agents?: string[];
   /**

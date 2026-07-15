@@ -32,14 +32,28 @@ describe("inactiveAgentTickets", () => {
     expect(inactiveAgentTickets([ticket("t-1", ["agent:kubernetes"])], undefined)).toEqual([]);
   });
 
-  it("treats an EMPTY allowlist as all agents active (no regression for unset projects)", () => {
-    expect(inactiveAgentTickets([ticket("t-1", ["agent:kubernetes"])], [])).toEqual([]);
+  it("treats an EMPTY allowlist as no agents active — parks every labeled ticket", () => {
+    // The operator toggled every agent off; the API persists [] as a real "no agents" value
+    // distinct from clearing (undefined), so dispatch must honor it rather than run anyway.
+    // Both bundled and custom agents are parked; only unlabeled (default agent) tickets pass.
+    expect(
+      inactiveAgentTickets(
+        [ticket("t-1", ["agent:kubernetes"]), ticket("t-2", ["agent:my-custom"]), ticket("t-3")],
+        [],
+      ),
+    ).toEqual([
+      { id: "t-1", agent: "kubernetes" },
+      { id: "t-2", agent: "my-custom" },
+    ]);
   });
 
-  it("never blocks user-provided custom agents outside KNOWN_AGENTS", () => {
-    // The settings UI/API can only allowlist KNOWN_AGENTS, so a custom project agent
-    // (anton-3n5.4) could never be enabled — it stays outside the toggle system.
-    expect(inactiveAgentTickets([ticket("t-1", ["agent:my-custom"])], ["fastapi"])).toEqual([]);
+  it("gates user-provided custom agents like bundled ones (anton-dvo.1)", () => {
+    // Custom `.claude/agents` are discoverable and toggleable now, so a disabled custom agent
+    // parks; an enabled one passes.
+    expect(inactiveAgentTickets([ticket("t-1", ["agent:my-custom"])], ["fastapi"])).toEqual([
+      { id: "t-1", agent: "my-custom" },
+    ]);
+    expect(inactiveAgentTickets([ticket("t-1", ["agent:my-custom"])], ["my-custom"])).toEqual([]);
   });
 
   it("reports every offending ticket, not just the first", () => {

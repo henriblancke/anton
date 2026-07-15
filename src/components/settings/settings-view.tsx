@@ -4,7 +4,6 @@ import { useState } from "react";
 import { toast } from "sonner";
 
 import type { Project } from "@/lib/types";
-import { DEFAULT_ACTIVE_AGENTS, KNOWN_AGENTS } from "@/lib/agents";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Toggle } from "@/components/atoms";
@@ -59,11 +58,22 @@ interface AutomationSchedule {
   enabled: boolean;
 }
 
+/**
+ * One discoverable agent (anton-dvo.1), mirrored from the server's DiscoveredAgent. Kept local so
+ * this client module never imports the server-only discovery code.
+ */
+interface DiscoveredAgent {
+  id: string;
+  source: "project" | "global" | "bundled";
+  description?: string;
+}
+
 export function SettingsView({
   project,
   settings,
   basePrompt,
   schedules,
+  agents,
 }: {
   project: Project;
   settings: EditableSettings;
@@ -71,10 +81,14 @@ export function SettingsView({
   basePrompt: string;
   /** The project's schedule rows (schedules.enabled) backing the Automation toggles. */
   schedules: AutomationSchedule[];
+  /** Every agent this project can assign — bundled + the operator's own .claude/agents. */
+  agents: DiscoveredAgent[];
 }) {
   const [active, setActive] = useState<(typeof SECTIONS)[number]["id"]>("general");
-  const [agents, setAgents] = useState<Set<string>>(
-    () => new Set(settings.agents ?? DEFAULT_ACTIVE_AGENTS),
+  // The enabled allowlist. Absent persisted value → seed "all discovered on", matching the runtime
+  // rule that an absent allowlist means every agent is active (so a no-op save stays all-active).
+  const [activeAgents, setActiveAgents] = useState<Set<string>>(
+    () => new Set(settings.agents ?? agents.map((a) => a.id)),
   );
   const [concurrency, setConcurrency] = useState(settings.concurrency ?? DEFAULT_CONCURRENCY);
   const [jobTimeoutMinutes, setJobTimeoutMinutes] = useState(
@@ -118,7 +132,7 @@ export function SettingsView({
   }
 
   function toggleAgent(agent: string) {
-    setAgents((prev) => {
+    setActiveAgents((prev) => {
       const next = new Set(prev);
       if (next.has(agent)) next.delete(agent);
       else next.add(agent);
@@ -140,8 +154,9 @@ export function SettingsView({
           concurrency,
           jobTimeoutMinutes,
           maxRetries,
-          // canonical KNOWN_AGENTS order, whatever order the toggles were flipped in
-          agents: KNOWN_AGENTS.filter((a) => agents.has(a)),
+          // The enabled ids, in discovered order. Only ids we actually rendered — a stale id from
+          // a since-deleted agent (still in the seeded set) is pruned rather than re-persisted.
+          agents: agents.filter((a) => activeAgents.has(a.id)).map((a) => a.id),
           autonomy,
         }),
       });
@@ -216,28 +231,48 @@ export function SettingsView({
           <section className="flex flex-col gap-3.5">
             <div className="flex items-baseline gap-2.5">
               <h2 className="text-[15px] font-semibold">Active agents</h2>
-              <span className="text-xs text-subtle">which agent prompts anton may assign</span>
+              <span className="text-xs text-subtle">
+                which agent prompts anton may assign · bundled + your{" "}
+                <span className="font-mono">.claude/agents</span>
+              </span>
             </div>
-            <div className="grid max-w-2xl grid-cols-1 gap-2.5 sm:grid-cols-2">
-              {KNOWN_AGENTS.map((agent) => {
-                const on = agents.has(agent);
-                return (
-                  <div
-                    key={agent}
-                    className={cn(
-                      "flex items-center gap-2.5 rounded-[10px] border border-border bg-card px-3 py-2.5",
-                      !on && "opacity-70",
-                    )}
-                  >
-                    <span className={cn("size-2 rounded-full", agentDotClass(agent))} aria-hidden="true" />
-                    <span className="font-mono text-xs">{agent}</span>
-                    <span className="ml-auto">
-                      <Toggle checked={on} onChange={() => toggleAgent(agent)} label={`agent ${agent}`} />
-                    </span>
-                  </div>
-                );
-              })}
-            </div>
+            {agents.length === 0 ? (
+              <p className="max-w-2xl text-xs text-subtle">No agents discovered for this project.</p>
+            ) : (
+              <div className="grid max-w-2xl grid-cols-1 gap-2.5 sm:grid-cols-2">
+                {agents.map((agent) => {
+                  const on = activeAgents.has(agent.id);
+                  return (
+                    <div
+                      key={agent.id}
+                      className={cn(
+                        "flex items-center gap-2.5 rounded-[10px] border border-border bg-card px-3 py-2.5",
+                        !on && "opacity-70",
+                      )}
+                      title={agent.description}
+                    >
+                      <span
+                        className={cn("size-2 shrink-0 rounded-full", agentDotClass(agent.id))}
+                        aria-hidden="true"
+                      />
+                      <span className="truncate font-mono text-xs">{agent.id}</span>
+                      {agent.source !== "bundled" && (
+                        <span className="shrink-0 rounded-full border border-border px-1.5 py-0.5 text-[9.5px] text-subtle">
+                          {agent.source}
+                        </span>
+                      )}
+                      <span className="ml-auto shrink-0">
+                        <Toggle
+                          checked={on}
+                          onChange={() => toggleAgent(agent.id)}
+                          label={`agent ${agent.id}`}
+                        />
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </section>
 
           <Divider />

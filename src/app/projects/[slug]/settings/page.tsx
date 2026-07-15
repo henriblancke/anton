@@ -1,6 +1,7 @@
 import { notFound } from "next/navigation";
 
 import { getProjectBySlug, getProjectSettingsBySlug } from "@/lib/projects";
+import { discoverAgents } from "@/lib/agents-discovery";
 import { listSchedules } from "@/lib/schedules";
 import { loadBaseSystemPrompt } from "@/lib/claude/system-prompt";
 import { SettingsView } from "@/components/settings/settings-view";
@@ -24,8 +25,17 @@ export default async function ProjectSettingsPage({
     type: s.type,
     enabled: s.enabled,
   }));
+  // Every agent this project can assign — bundled + the operator's own .claude/agents (anton-dvo.1),
+  // so Settings → Agents toggles the real set, not just the hardcoded bundled ids.
+  const agents = await discoverAgents(project.repoPath).catch(() => []);
 
   return (
-    <SettingsView project={project} settings={settings} basePrompt={basePrompt} schedules={schedules} />
+    <SettingsView
+      project={project}
+      settings={settings}
+      basePrompt={basePrompt}
+      schedules={schedules}
+      agents={agents}
+    />
   );
 }

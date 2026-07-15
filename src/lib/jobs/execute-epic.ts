@@ -5,7 +5,6 @@
  * backoff) skips tickets already closed and reuses the existing worktree. See DESIGN.md §4/§7.
  */
 import { randomUUID } from "node:crypto";
-import { KNOWN_AGENTS } from "../agents";
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { loadAgentPrompt } from "../claude/agent-prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
@@ -322,23 +321,26 @@ function labelValue(labels: string[] | undefined, prefix: string): string | unde
 /**
  * Tickets whose `agent:` label names a specialist agent the project has disabled (anton-dm7).
  * `activeAgents` is settings.agents. Semantics:
- *   • absent or EMPTY allowlist → all agents active (projects that never persisted `agents`
- *     must not stall, and the API treats [] as clearable state — no restriction either way)
+ *   • absent (never persisted / cleared) → all agents active (a project that never touched
+ *     settings must not stall; the API persists a cleared value as `undefined`, never `[]`)
+ *   • EMPTY allowlist `[]` → no agents active: every ticket with an `agent:` label is parked.
+ *     The operator explicitly toggled every agent off, and the API persists `[]` as a real
+ *     value distinct from clearing (settings/route.ts) — honoring it is the whole point.
  *   • no `agent:` label → runs with the default agent, never blocked
- *   • a tag outside KNOWN_AGENTS is a user-provided custom agent (anton-3n5.4) the toggle UI
- *     can't enable — outside the allowlist system, runs as today
+ *   • the allowlist gates ALL agents — bundled AND the operator's own `.claude/agents` (anton-dvo.1).
+ *     Custom agents are discoverable and toggleable in Settings now, so a ticket needing a disabled
+ *     custom agent is parked just like a bundled one, rather than silently running.
  */
 export function inactiveAgentTickets(
   tickets: Bead[],
   activeAgents: string[] | undefined,
 ): { id: string; agent: string }[] {
-  if (!activeAgents || activeAgents.length === 0) return [];
+  if (activeAgents == null) return [];
   const active = new Set(activeAgents);
   const out: { id: string; agent: string }[] = [];
   for (const t of tickets) {
     const agent = labelValue(t.labels, "agent");
     if (!agent) continue;
-    if (!(KNOWN_AGENTS as readonly string[]).includes(agent)) continue;
     if (!active.has(agent)) out.push({ id: t.id, agent });
   }
   return out;
