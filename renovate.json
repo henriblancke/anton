@@ -5,13 +5,10 @@
     ":dependencyDashboard",
     ":semanticCommits"
   ],
-  "schedule": ["before 6am on monday"],
-  "timezone": "UTC",
   "prConcurrentLimit": 10,
   "rangeStrategy": "bump",
   "lockFileMaintenance": {
-    "enabled": true,
-    "schedule": ["before 6am on monday"]
+    "enabled": true
   },
   "packageRules": [
     {

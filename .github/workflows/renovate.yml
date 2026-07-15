@@ -1,0 +1,47 @@
+# Renovate (self-hosted). Runs the Renovate CLI on a schedule so dependency PRs get opened without
+# depending on the hosted Mend Renovate App. Config lives in renovate.json at the repo root.
+#
+# Requires a repo secret RENOVATE_TOKEN: a Personal Access Token (classic: `repo` + `workflow`
+# scopes, or a fine-grained PAT with Contents+Pull requests+Workflows read/write on this repo).
+# The default GITHUB_TOKEN is deliberately NOT used — PRs opened with GITHUB_TOKEN do not trigger
+# other workflows (`on: pull_request`), so CI would never run on Renovate PRs, which is the exact
+# failure this migration exists to fix.
+name: renovate
+
+on:
+  schedule:
+    - cron: "0 5 * * 1" # weekly, Monday 05:00 UTC
+  workflow_dispatch:
+    inputs:
+      logLevel:
+        description: "Renovate log level"
+        default: "info"
+        type: choice
+        options:
+          - debug
+          - info
+          - warn
+      dryRun:
+        description: "Dry run (log only, open no PRs)"
+        default: false
+        type: boolean
+
+# Never run two Renovate passes over the repo at once.
+concurrency:
+  group: renovate
+  cancel-in-progress: false
+
+jobs:
+  renovate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Renovate
+        uses: renovatebot/github-action@v46.1.19
+        with:
+          token: ${{ secrets.RENOVATE_TOKEN }}
+        env:
+          RENOVATE_REPOSITORIES: ${{ github.repository }}
+          LOG_LEVEL: ${{ inputs.logLevel || 'info' }}
+          RENOVATE_DRY_RUN: ${{ inputs.dryRun == true && 'full' || '' }}
