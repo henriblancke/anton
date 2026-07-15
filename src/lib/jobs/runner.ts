@@ -69,6 +69,14 @@ export const DEFAULT_CONFIG: RunnerConfig = {
 export interface JobPolicy {
   /** Max concurrent execute-epic runs for this project. */
   concurrency: number;
+  /**
+   * Autonomy master-switch (anton-y3l). `false` stops the runner from *claiming* execute-epic
+   * jobs for this project — they enqueue as usual (approval, retries, resumes) but stay `queued`
+   * until the switch is turned back on, when the next tick leases them. Gating at claim (not at
+   * enqueue) is deliberate: it covers every enqueue path with one gate, never touches jobs already
+   * in flight, and makes re-enabling resume paused work without re-approval. Absent → on.
+   */
+  autonomy?: boolean;
   /** Wall-clock timeout for one job attempt, in ms. `Infinity` disables the timeout. */
   timeoutMs: number;
   /** Max attempts before the job is parked for a human. */
@@ -283,7 +291,9 @@ export class JobRunner {
       const concByProject = new Map<string, number>();
       for (const pid of projectIds) {
         const policy = await this.policyFor(pid ?? undefined);
-        concByProject.set(pid ?? "", policy.concurrency);
+        // Autonomy master-switch: off → cap 0, so no execute-epic job for this project is leased
+        // (they stay queued and resume when the switch turns back on). See JobPolicy.autonomy.
+        concByProject.set(pid ?? "", policy.autonomy === false ? 0 : policy.concurrency);
       }
       capOf = (job) =>
         job.type === "execute-epic"

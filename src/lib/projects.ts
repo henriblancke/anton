@@ -127,7 +127,8 @@ export interface ProjectSettings {
   agents?: string[];
   /**
    * Autonomy master-switch (anton-46w): whether approved epics execute without asking. Absent →
-   * true (autonomous). Enforcement lives with the runner (anton-y3l), not here.
+   * true (autonomous). Enforced by the runner's claim gate (anton-y3l): off leaves execute-epic
+   * jobs `queued` (approval still enqueues), and turning it back on resumes them.
    */
   autonomy?: boolean;
 }

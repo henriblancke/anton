@@ -42,6 +42,9 @@ async function resolvePolicy(projectId: string | undefined) {
     concurrency: settings.concurrency ?? DEFAULT_CONCURRENCY,
     timeoutMs: (settings.jobTimeoutMinutes ?? DEFAULT_JOB_TIMEOUT_MINUTES) * 60_000,
     maxAttempts: settings.maxRetries ?? DEFAULT_MAX_RETRIES,
+    // Autonomy master-switch (anton-y3l): off pauses claiming of this project's execute-epic
+    // jobs (they stay queued); absent defaults to on. See JobPolicy.autonomy in runner.ts.
+    autonomy: settings.autonomy ?? true,
   };
 }
 
