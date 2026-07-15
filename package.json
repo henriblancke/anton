@@ -65,7 +65,7 @@
     "@vitejs/plugin-react": "^6.0.3",
     "@vitest/coverage-v8": "^4",
     "drizzle-kit": "^0.31.10",
-    "eslint": "^9",
+    "eslint": "^10",
     "eslint-config-next": "16.2.10",
     "husky": "^9.1.7",
     "lint-staged": "^17.0.8",
