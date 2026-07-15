@@ -8,6 +8,7 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Toggle } from "@/components/atoms";
 import { agentDotClass } from "@/components/board/board-utils";
+import { DeleteProjectDialog } from "@/components/settings/delete-project-dialog";
 
 /** Settings the UI can edit today. Kept local so this client module never imports server code. */
 interface EditableSettings {
@@ -387,21 +388,20 @@ export function SettingsView({
           <Divider />
 
           {/* Danger zone */}
-          <section className="flex max-w-2xl items-center gap-3.5 rounded-xl border border-risk-high/25 bg-risk-high/5 p-4">
-            <div className="flex flex-col gap-1">
-              <span className="text-[13px] font-semibold text-risk-high">Remove project</span>
-              <span className="text-xs text-muted-foreground">
-                Detaches anton from this repo. Beads &amp; git are untouched.
+          <section className="flex max-w-2xl flex-col gap-3.5">
+            <h2 className="text-[15px] font-semibold text-risk-high">Danger zone</h2>
+            <div className="flex items-center gap-3.5 rounded-xl border border-risk-high/25 bg-risk-high/5 p-4">
+              <div className="flex flex-col gap-1">
+                <span className="text-[13px] font-semibold text-risk-high">Delete project</span>
+                <span className="text-xs text-muted-foreground">
+                  Destroys anton&apos;s state — settings, runs, worktrees. Repo &amp; beads are
+                  untouched.
+                </span>
+              </div>
+              <span className="ml-auto">
+                <DeleteProjectDialog project={project} />
               </span>
             </div>
-            <Button
-              variant="destructive"
-              size="sm"
-              className="ml-auto"
-              onClick={() => toast("Removing a project isn't wired up yet.")}
-            >
-              Remove
-            </Button>
           </section>
         </div>
       </div>
