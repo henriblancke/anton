@@ -547,4 +547,84 @@ process.exit(0);`,
       process.env.ANTON_CLAUDE_BIN = successClaude;
     }
   }, 60_000);
+
+  it("hard-gates on a ticket claimed by another operator: aborts without stealing the claim", async () => {
+    // Shared-backlog safety: on a shared board a ticket may already be claimed by ANOTHER operator
+    // (e.g. picked up after a heartbeat pull). The run must not run Claude on a ticket it doesn't
+    // own, and must not clear the real owner's claim on the failure path. The ticket claim is a hard
+    // gate — a conflict aborts the run (run → failed, no PR) and leaves the foreign claim intact.
+    const epic4 = await beads.create(repo, {
+      title: "Feature W",
+      type: "epic",
+      description: "## Goal\nW",
+    });
+    await beads.approve(repo, epic4);
+    const owned = (() => {
+      const p = JSON.parse(
+        execFileSync(
+          "bd",
+          ["create", "Foreign ticket", "--type", "task", "--parent", epic4, "--acceptance", "x", "--json"],
+          { cwd: repo, encoding: "utf8" },
+        ),
+      );
+      return (Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string;
+    })();
+    // Another operator claims it before our run (bd's --claim fails for a different actor).
+    execFileSync("bd", ["update", owned, "--claim"], {
+      cwd: repo,
+      env: { ...process.env, BEADS_ACTOR: "other-operator" },
+      stdio: "ignore",
+    });
+
+    // A claude that logs every ticket it's invoked for — so we can prove it's NEVER run on `owned`.
+    const invLog = join(sandbox, "gate-inv.jsonl");
+    const loggingClaude = writeBin(
+      binDir,
+      "claude-gate",
+      `const fs=require('fs');const path=require('path');
+const a=process.argv.slice(2);const get=f=>{const i=a.indexOf(f);return i>=0?a[i+1]:undefined;};
+const prompt=get('-p')||'';const m=prompt.match(/Ticket: (\\S+)/);
+fs.appendFileSync(${JSON.stringify(invLog)},(m?m[1]:'unknown')+'\\n');
+fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work\\n');
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+e({type:'result',subtype:'success',result:'done',session_id:'sg',num_turns:1,is_error:false});
+process.exit(0);`,
+    );
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    process.env.ANTON_CLAUDE_BIN = loggingClaude;
+    let jobId: string;
+    try {
+      jobId = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: epic4 },
+      });
+      await runner.tickOnce();
+      await runner.whenIdle();
+
+      // Run failed (no partial PR); the epic never advanced to in-review.
+      const run4 = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === epic4)!;
+      expect(run4.status).toBe("failed");
+      expect((await beads.show(repo, epic4)).labels ?? []).not.toContain("stage:in-review");
+
+      // The foreign operator's claim is intact — we neither ran Claude on it nor cleared it.
+      const t = await beads.show(repo, owned);
+      expect(t.assignee).toBe("other-operator");
+      expect(t.status).toBe("in_progress");
+      const invoked = existsSync(invLog) ? readFileSync(invLog, "utf8") : "";
+      expect(invoked).not.toContain(owned);
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      // A failed run reschedules the job with backoff; park it so a later clock-advancing tick
+      // can't re-dispatch this epic (the test DB is shared across the describe block).
+      if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  }, 60_000);
 });

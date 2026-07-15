@@ -178,6 +178,31 @@ async function runTicket(args: {
 }): Promise<void> {
   const { db, clock, ctx, projectId, repo, runId, worktreePath, ticket, settings, operator } =
     args;
+
+  // Claim the ticket for the operator as a HARD GATE before doing any work. On a shared board
+  // the claim is the cross-operator coordination primitive (anton-live-sync R6): a failure here
+  // means the ticket was already claimed by another operator (e.g. after a heartbeat pull) or the
+  // local Dolt DB is locked. In either case we must NOT run Claude on a ticket this process does
+  // not own — and must NOT fall through to the failure path below, which would clear the real
+  // owner's claim. Claiming is idempotent for the same actor, so a resume re-claims cleanly. A
+  // conflict aborts the run before any session/worktree work; the job retries and either skips the
+  // now-closed ticket (already-closed check in the caller) or reclaims one whose owner released it.
+  try {
+    await beads.claim(repo, ticket.id, operator);
+  } catch (e) {
+    throw new Error(
+      `refusing to execute ${ticket.id}: could not claim it for ${operator ?? "this operator"} ` +
+        `— already claimed by another operator, or the beads DB is locked ` +
+        `(${e instanceof Error ? e.message : String(e)})`,
+    );
+  }
+  // Announce the stage + nudge a sync so the claim reaches teammates within a heartbeat
+  // (fire-and-forget; the end-of-run sync is the backstop).
+  await safe(() => beads.tag(repo, ticket.id, [LABELS.stage("implementing")]));
+  void beads
+    .sync(repo)
+    .catch((e) => console.error(`[execute-epic] claim sync failed for ${ticket.id}`, e));
+
   const agentTag = labelValue(ticket.labels, "agent");
   // Compose the system prompt: locked base contract + agent-tag prompt + operator seed. The base
   // is mandatory (buildExecutionSystemPrompt throws if src/prompts/system-base.md is missing).
@@ -203,14 +228,6 @@ async function runTicket(args: {
     const line = e.text ? `[${e.type}] ${e.text}\n` : `[${e.type}]\n`;
     void appendSessionLog(logPath, line).catch(() => {});
   };
-
-  // Claim the ticket for the operator before the session so the board shows who holds it
-  // (idempotent on resume). Nudge a sync so the claim reaches teammates within a heartbeat.
-  await safe(() => beads.claim(repo, ticket.id, operator));
-  await safe(() => beads.tag(repo, ticket.id, [LABELS.stage("implementing")]));
-  void beads
-    .sync(repo)
-    .catch((e) => console.error(`[execute-epic] claim sync failed for ${ticket.id}`, e));
 
   let committed = false;
   try {
