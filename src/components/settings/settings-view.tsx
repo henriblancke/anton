@@ -55,22 +55,32 @@ const AGENTS = [
 
 const DEFAULT_ACTIVE = new Set(["fastapi", "supabase", "pydantic", "nextjs"]);
 
-// Mirrors DEFAULT_SCHEDULES in src/lib/schedules.ts — keep the crons in sync.
+// Display copy for the scheduled automations. Ids match the schedule row `type`; crons mirror
+// DEFAULT_SCHEDULES in src/lib/schedules.ts — keep in sync. Enabled state comes from `schedules`.
 const AUTOMATIONS = [
-  { id: "nightly-stringer", label: "nightly-stringer", meta: "scan → triage · 0 3 * * *", on: true },
-  { id: "review-fix", label: "review-fix watcher", meta: "poll PRs every 15m", on: true },
-  { id: "orphan-grooming", label: "orphan-grooming", meta: "bucket loose tickets · 0 4 * * 1", on: true },
+  { id: "nightly-stringer", label: "nightly-stringer", meta: "scan → triage · 0 3 * * *" },
+  { id: "review-fix", label: "review-fix watcher", meta: "poll PRs every 15m" },
+  { id: "orphan-grooming", label: "orphan-grooming", meta: "bucket loose tickets · 0 4 * * 1" },
 ];
+
+/** Per-automation schedule state from the server; a missing row means "not scheduled yet". */
+interface AutomationSchedule {
+  type: string;
+  enabled: boolean;
+}
 
 export function SettingsView({
   project,
   settings,
   basePrompt,
+  schedules,
 }: {
   project: Project;
   settings: EditableSettings;
   /** The locked base system prompt, shown read-only so operators see what always applies. */
   basePrompt: string;
+  /** The project's schedule rows (schedules.enabled) backing the Automation toggles. */
+  schedules: AutomationSchedule[];
 }) {
   const [active, setActive] = useState<(typeof SECTIONS)[number]["id"]>("general");
   const [agents, setAgents] = useState<Set<string>>(new Set(DEFAULT_ACTIVE));
@@ -80,13 +90,40 @@ export function SettingsView({
   );
   const [maxRetries, setMaxRetries] = useState(settings.maxRetries ?? DEFAULT_MAX_RETRIES);
   const [autonomy, setAutonomy] = useState(true);
-  const [automations, setAutomations] = useState<Record<string, boolean>>(
-    Object.fromEntries(AUTOMATIONS.map((a) => [a.id, a.on])),
+  // null = no schedule row for this project yet (shown as "not scheduled"; toggling creates it).
+  const [automations, setAutomations] = useState<Record<string, boolean | null>>(() =>
+    Object.fromEntries(
+      AUTOMATIONS.map((a) => [a.id, schedules.find((s) => s.type === a.id)?.enabled ?? null]),
+    ),
   );
   const [model, setModel] = useState(settings.model ?? "");
   const [seedPrompt, setSeedPrompt] = useState(settings.seedPrompt ?? "");
   const [reviewFixPrompt, setReviewFixPrompt] = useState(settings.reviewFixPrompt ?? "");
   const [saving, setSaving] = useState(false);
+
+  /**
+   * Flip one automation's schedules.enabled row immediately (not via Save) — optimistic flip,
+   * reverted with a toast if the PATCH fails. A missing row is created server-side.
+   */
+  async function toggleAutomation(id: string, next: boolean) {
+    const prev = automations[id];
+    setAutomations((p) => ({ ...p, [id]: next }));
+    try {
+      const res = await fetch(`/api/projects/${project.slug}/schedules`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ type: id, enabled: next }),
+      });
+      if (!res.ok) {
+        const { error } = await res.json().catch(() => ({ error: "Update failed" }));
+        throw new Error(error ?? "Update failed");
+      }
+      toast.success(`${id} ${next ? "enabled" : "disabled"}`);
+    } catch (err) {
+      setAutomations((p) => ({ ...p, [id]: prev }));
+      toast.error(err instanceof Error ? err.message : `Failed to update ${id}`);
+    }
+  }
 
   function toggleAgent(agent: string) {
     setAgents((prev) => {
@@ -353,7 +390,9 @@ export function SettingsView({
               <h2 className="text-[15px] font-semibold">Automation</h2>
               <div className="flex flex-col gap-2.5">
                 {AUTOMATIONS.map((a) => {
-                  const on = automations[a.id];
+                  const state = automations[a.id];
+                  const on = state === true;
+                  const missing = state === null;
                   return (
                     <div
                       key={a.id}
@@ -368,12 +407,14 @@ export function SettingsView({
                       />
                       <div className="flex flex-col gap-0.5">
                         <span className="text-[12.5px]">{a.label}</span>
-                        <span className="font-mono text-[10.5px] text-subtle">{a.meta}</span>
+                        <span className="font-mono text-[10.5px] text-subtle">
+                          {missing ? `${a.meta} · not scheduled` : a.meta}
+                        </span>
                       </div>
                       <span className="ml-auto">
                         <Toggle
                           checked={on}
-                          onChange={(next) => setAutomations((p) => ({ ...p, [a.id]: next }))}
+                          onChange={(next) => toggleAutomation(a.id, next)}
                           label={a.label}
                         />
                       </span>
