@@ -2,6 +2,8 @@
  * Assembles the Board from beads. Stage/approval/PR are derived — never stored. See DESIGN.md §2/§3.
  */
 import { beads, getSyncStatus, type Bead } from "./beads/bd";
+import { allIssues } from "./beads/issues";
+import { issueSnapshotVersion } from "./beads/snapshot";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
 import { STAGES, type Board, type Epic, type Project, type Stage, type Ticket } from "./types";
 
@@ -79,21 +81,7 @@ function ticketAsEpic(bead: Bead): Epic {
 }
 
 export async function getBoard(project: Project): Promise<Board> {
-  let allBeads: Bead[];
-  try {
-    allBeads = await beads.list(project.repoPath, ["--status", "all"]);
-  } catch {
-    const [open, closed] = await Promise.all([
-      beads.list(project.repoPath),
-      beads.list(project.repoPath, ["--status", "closed"]),
-    ]);
-    const seen = new Set<string>();
-    allBeads = [...open, ...closed].filter((b) => {
-      if (seen.has(b.id)) return false;
-      seen.add(b.id);
-      return true;
-    });
-  }
+  let allBeads = await allIssues(project.repoPath);
 
   // Only work items land on the board. `molecule` (swarm coordination) and similar artifacts
   // are excluded; features/tasks/bugs are tickets.
@@ -164,6 +152,7 @@ export async function getBoard(project: Project): Promise<Board> {
 
   return {
     projectSlug: project.slug,
+    version: issueSnapshotVersion(project.repoPath),
     columns,
     // Read from the globalThis-anchored registry, so the API bundle sees passes run by the
     // instrumentation-started sync engine (see bd.ts).

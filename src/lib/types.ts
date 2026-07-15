@@ -60,6 +60,8 @@ export interface SyncStatusView {
 
 export interface Board {
   projectSlug: string;
+  /** Monotonic issue-snapshot version used for change-aware refreshes. */
+  version: number;
   /** Epics grouped by stage. Orphan tickets are wrapped as single-ticket epics. */
   columns: Record<Stage, Epic[]>;
   /** Sync health for this project's beads workspace. */

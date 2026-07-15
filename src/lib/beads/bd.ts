@@ -5,6 +5,7 @@
  */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { invalidateIssueSnapshot } from "./snapshot";
 
 const execFileAsync = promisify(execFile);
 
@@ -102,6 +103,13 @@ async function bd(cwd: string, args: string[], env?: Record<string, string>): Pr
     timeout: 60_000,
     ...(env ? { env: { ...process.env, ...env } } : {}),
   });
+  return stdout;
+}
+
+async function bdWrite(cwd: string, args: string[], env?: Record<string, string>): Promise<string> {
+  const stdout = await bd(cwd, args, env);
+  // Local callers expect their next read to observe the completed write, so discard old data.
+  invalidateIssueSnapshot(cwd, true);
   return stdout;
 }
 
@@ -251,6 +259,8 @@ export function createDoltSync(exec: BdExec = bd): (cwd: string, mode?: SyncMode
       if (outcome === "not-wired") {
         recordStatus(cwd, { state: "not-wired", lastError: null });
       } else {
+        // Retain the last valid data while a background read refreshes after the remote pull.
+        invalidateIssueSnapshot(cwd);
         recordStatus(cwd, { state: "synced", lastSyncedAt: Date.now(), lastError: null });
       }
     });
@@ -363,7 +373,7 @@ export const beads = {
     if (opts.deps?.length) args.push("--deps", opts.deps.join(","));
     if (opts.description) args.push("--description", opts.description);
     args.push("--json"); // plain output appends tips/status lines after the id; JSON is clean
-    const out = await bd(cwd, args);
+    const out = await bdWrite(cwd, args);
     const parsed = JSON.parse(out);
     const bead = Array.isArray(parsed) ? parsed[0] : parsed;
     if (!bead?.id) throw new Error("bd create: could not parse bead id from output");
@@ -372,19 +382,19 @@ export const beads = {
 
   // `bd tag` takes a single label; use the repeatable --add-label/--remove-label instead.
   tag: (cwd: string, id: string, labels: string[]) =>
-    bd(cwd, ["update", id, ...labels.flatMap((l) => ["--add-label", l])]),
+    bdWrite(cwd, ["update", id, ...labels.flatMap((l) => ["--add-label", l])]),
   untag: (cwd: string, id: string, labels: string[]) =>
-    bd(cwd, ["update", id, ...labels.flatMap((l) => ["--remove-label", l])]),
+    bdWrite(cwd, ["update", id, ...labels.flatMap((l) => ["--remove-label", l])]),
 
   link: (cwd: string, a: string, b: string, type: string) =>
-    bd(cwd, ["link", a, b, "--type", type]),
+    bdWrite(cwd, ["link", a, b, "--type", type]),
 
   /** Attach the PR to the bead as its external reference (git-shareable). */
   setExternalRef: (cwd: string, id: string, ref: string) =>
-    bd(cwd, ["update", id, "--external-ref", ref]),
+    bdWrite(cwd, ["update", id, "--external-ref", ref]),
 
-  note: (cwd: string, id: string, text: string) => bd(cwd, ["note", id, text]),
-  close: (cwd: string, id: string) => bd(cwd, ["close", id]),
+  note: (cwd: string, id: string, text: string) => bdWrite(cwd, ["note", id, text]),
+  close: (cwd: string, id: string) => bdWrite(cwd, ["close", id]),
 
   /**
    * Permanently delete a bead and clean up references (`bd delete --force`). `cascade` also
@@ -392,10 +402,10 @@ export const beads = {
    * without it, deleting an issue that still has dependents fails. This is irreversible.
    */
   delete: (cwd: string, id: string, opts: { cascade?: boolean } = {}) =>
-    bd(cwd, ["delete", id, "--force", ...(opts.cascade ? ["--cascade"] : [])]),
-  reopen: (cwd: string, id: string) => bd(cwd, ["reopen", id]),
+    bdWrite(cwd, ["delete", id, "--force", ...(opts.cascade ? ["--cascade"] : [])]),
+  reopen: (cwd: string, id: string) => bdWrite(cwd, ["reopen", id]),
   setStatus: (cwd: string, id: string, status: string) =>
-    bd(cwd, ["update", id, "--status", status]),
+    bdWrite(cwd, ["update", id, "--status", status]),
 
   /**
    * Atomically claim a bead: assignee + status in_progress, idempotent when already claimed by
@@ -404,10 +414,10 @@ export const beads = {
    * instance — not whatever unix user the server happens to run as.
    */
   claim: (cwd: string, id: string, actor?: string) =>
-    bd(cwd, ["update", id, "--claim"], actor ? { BEADS_ACTOR: actor } : undefined),
+    bdWrite(cwd, ["update", id, "--claim"], actor ? { BEADS_ACTOR: actor } : undefined),
 
   /** Clear a bead's assignee (`bd assign <id> ""`) — used when releasing a stale claim. */
-  unassign: (cwd: string, id: string) => bd(cwd, ["assign", id, ""]),
+  unassign: (cwd: string, id: string) => bdWrite(cwd, ["assign", id, ""]),
 
   /** Pure argv builder, exposed for testing and callers that want to inspect the write. */
   buildUpdateArgs,
@@ -425,7 +435,7 @@ export const beads = {
   ): Promise<void> => {
     const args = buildUpdateArgs(id, patch, currentLabels);
     if (!args) return;
-    await bd(cwd, args);
+    await bdWrite(cwd, args);
   },
 
   /**

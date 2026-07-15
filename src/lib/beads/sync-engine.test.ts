@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createDoltSync, getSyncStatus, type SyncMode } from "./bd";
 import { createSyncEngine, type SyncEngineDeps } from "./sync-engine";
 
@@ -139,6 +139,7 @@ describe("createSyncEngine", () => {
   });
 
   it("start() is idempotent and stop() halts the loop", async () => {
+    vi.useFakeTimers();
     let ticks = 0;
     const { engine } = engineWith({
       listProjects: () => {
@@ -149,8 +150,10 @@ describe("createSyncEngine", () => {
     });
     engine.start();
     engine.start(); // no double loop
-    await Promise.resolve(); // let the initial tick settle
+    expect(ticks).toBe(0);
+    await vi.advanceTimersByTimeAsync(10_000);
     engine.stop();
     expect(ticks).toBe(1);
+    vi.useRealTimers();
   });
 });

@@ -25,7 +25,7 @@ export interface SyncEngineDeps {
 const defaultDeps = (): SyncEngineDeps => ({
   listProjects,
   pull: (cwd) => beads.pull(cwd),
-  heartbeatMs: Number(process.env.ANTON_SYNC_HEARTBEAT_MS) || 10_000,
+  heartbeatMs: Number(process.env.ANTON_SYNC_HEARTBEAT_MS) || 30_000,
   notWiredRecheckMs: Number(process.env.ANTON_SYNC_NOT_WIRED_RECHECK_MS) || 60_000,
   maxBackoffMs: 60_000,
   log: {
@@ -110,7 +110,9 @@ export function createSyncEngine(overrides: Partial<SyncEngineDeps> = {}): SyncE
       if (!stopped) return;
       stopped = false;
       deps.log.info(`heartbeat started (every ${deps.heartbeatMs}ms)`);
-      void tick().finally(loop);
+      // Give the first user-facing read a chance to seed the snapshot before embedded Dolt pulls.
+      // Starting both at boot made a cold board request contend with the initial pull for seconds.
+      loop();
     },
     stop() {
       stopped = true;

@@ -27,27 +27,35 @@ import { Button } from "@/components/ui/button";
 
 /** Board freshness cadence — matches the sync engine's heartbeat so remote changes surface
  * within one beat + one poll (anton-live-sync R8). */
-const BOARD_POLL_MS = 10_000;
+const BOARD_POLL_MS = 30_000;
 
-export function EpicBoard({ slug }: { slug: string }) {
-  const [board, setBoard] = useState<Board | null>(null);
+export function EpicBoard({ slug, initialBoard }: { slug: string; initialBoard: Board | null }) {
+  const [board, setBoard] = useState<Board | null>(initialBoard);
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
   const [activeId, setActiveId] = useState<string | null>(null);
   // Poll guard: a poll result landing mid-drag would clobber the drag interaction; the ref
   // mirrors activeId so the polling closure sees the live value.
   const draggingRef = useRef(false);
+  const versionRef = useRef(initialBoard?.version);
+  const loadingRef = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
 
-    async function load() {
+    async function load(force = false) {
+      if (loadingRef.current) return;
+      loadingRef.current = true;
       try {
-        const res = await fetch(`/api/projects/${slug}/board`);
+        const version = versionRef.current;
+        const suffix = !force && version !== undefined ? `?version=${version}` : "";
+        const res = await fetch(`/api/projects/${slug}/board${suffix}`);
+        if (res.status === 304) return;
         if (!res.ok) throw new Error(`Failed to load board (${res.status})`);
         const data = (await res.json()) as { board: Board };
         if (!cancelled && !draggingRef.current) {
+          versionRef.current = data.board.version;
           setBoard(data.board);
           setError(null);
         }
@@ -61,6 +69,8 @@ export function EpicBoard({ slug }: { slug: string }) {
             return prev;
           });
         }
+      } finally {
+        loadingRef.current = false;
       }
     }
 
@@ -70,7 +80,8 @@ export function EpicBoard({ slug }: { slug: string }) {
       if (!cancelled) timer = setTimeout(() => void poll(), BOARD_POLL_MS);
     }
 
-    void poll();
+    if (initialBoard === null || attempt > 0) void load(true);
+    else timer = setTimeout(() => void poll(), BOARD_POLL_MS);
     const onVisible = () => {
       // Coming back to the tab refreshes immediately instead of waiting out the interval.
       if (document.visibilityState === "visible" && !cancelled) void load();
@@ -81,7 +92,7 @@ export function EpicBoard({ slug }: { slug: string }) {
       if (timer) clearTimeout(timer);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [slug, attempt]);
+  }, [slug, attempt, initialBoard]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
