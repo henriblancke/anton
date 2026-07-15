@@ -1,0 +1,38 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard",
+    ":semanticCommits"
+  ],
+  "prConcurrentLimit": 10,
+  "rangeStrategy": "bump",
+  "lockFileMaintenance": {
+    "enabled": true
+  },
+  "packageRules": [
+    {
+      "description": "Group all non-major npm/bun bumps into one reviewable PR (mirrors the old Dependabot minor-and-patch group). Majors stay separate so breaking bumps (a new Next/React/TS major) get their own review.",
+      "matchManagers": ["npm", "bun"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "minor-and-patch"
+    },
+    {
+      "description": "Keep the GitHub Actions themselves current (checkout, setup-bun, gitleaks, etc.).",
+      "matchManagers": ["github-actions"],
+      "groupName": "github-actions"
+    },
+    {
+      "description": "Hold TypeScript below 6.1 until typescript-eslint supports it. typescript-eslint (used via eslint-config-next) caps its peer at 'typescript <6.1.0' and crashes on the TS 7 native compiler, breaking `bun run lint`. Revisit when typescript-eslint ships TS 6/7 support.",
+      "matchManagers": ["npm", "bun"],
+      "matchPackageNames": ["typescript"],
+      "allowedVersions": "<6.1.0"
+    },
+    {
+      "description": "Hold ESLint below 10 until the Next.js lint stack supports it. eslint-plugin-react (pulled in by eslint-config-next) has no ESLint 10 release and calls the removed context.getFilename() API, breaking `bun run lint`. Revisit when eslint-config-next / eslint-plugin-react ship ESLint 10 support.",
+      "matchManagers": ["npm", "bun"],
+      "matchPackageNames": ["eslint"],
+      "allowedVersions": "<10.0.0"
+    }
+  ]
+}
