@@ -4,6 +4,7 @@ import { useState } from "react";
 import { toast } from "sonner";
 
 import type { Project } from "@/lib/types";
+import { DEFAULT_ACTIVE_AGENTS, KNOWN_AGENTS } from "@/lib/agents";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Toggle } from "@/components/atoms";
@@ -17,6 +18,8 @@ interface EditableSettings {
   concurrency?: number;
   jobTimeoutMinutes?: number;
   maxRetries?: number;
+  agents?: string[];
+  autonomy?: boolean;
 }
 
 // Defaults mirror the server (src/lib/projects.ts DEFAULT_*); duplicated so this client module
@@ -41,19 +44,6 @@ const SECTIONS = [
   { id: "execution", label: "Execution" },
   { id: "automation", label: "Automation" },
 ] as const;
-
-const AGENTS = [
-  "fastapi",
-  "supabase",
-  "pydantic",
-  "nextjs",
-  "alembic",
-  "terraform",
-  "docker",
-  "kubernetes",
-] as const;
-
-const DEFAULT_ACTIVE = new Set(["fastapi", "supabase", "pydantic", "nextjs"]);
 
 // Display copy for the scheduled automations. Ids match the schedule row `type`; crons mirror
 // DEFAULT_SCHEDULES in src/lib/schedules.ts — keep in sync. Enabled state comes from `schedules`.
@@ -83,13 +73,15 @@ export function SettingsView({
   schedules: AutomationSchedule[];
 }) {
   const [active, setActive] = useState<(typeof SECTIONS)[number]["id"]>("general");
-  const [agents, setAgents] = useState<Set<string>>(new Set(DEFAULT_ACTIVE));
+  const [agents, setAgents] = useState<Set<string>>(
+    () => new Set(settings.agents ?? DEFAULT_ACTIVE_AGENTS),
+  );
   const [concurrency, setConcurrency] = useState(settings.concurrency ?? DEFAULT_CONCURRENCY);
   const [jobTimeoutMinutes, setJobTimeoutMinutes] = useState(
     settings.jobTimeoutMinutes ?? DEFAULT_JOB_TIMEOUT_MINUTES,
   );
   const [maxRetries, setMaxRetries] = useState(settings.maxRetries ?? DEFAULT_MAX_RETRIES);
-  const [autonomy, setAutonomy] = useState(true);
+  const [autonomy, setAutonomy] = useState(settings.autonomy ?? true);
   // null = no schedule row for this project yet (shown as "not scheduled"; toggling creates it).
   const [automations, setAutomations] = useState<Record<string, boolean | null>>(() =>
     Object.fromEntries(
@@ -148,6 +140,9 @@ export function SettingsView({
           concurrency,
           jobTimeoutMinutes,
           maxRetries,
+          // canonical KNOWN_AGENTS order, whatever order the toggles were flipped in
+          agents: KNOWN_AGENTS.filter((a) => agents.has(a)),
+          autonomy,
         }),
       });
       if (!res.ok) {
@@ -224,7 +219,7 @@ export function SettingsView({
               <span className="text-xs text-subtle">which agent prompts anton may assign</span>
             </div>
             <div className="grid max-w-2xl grid-cols-1 gap-2.5 sm:grid-cols-2">
-              {AGENTS.map((agent) => {
+              {KNOWN_AGENTS.map((agent) => {
                 const on = agents.has(agent);
                 return (
                   <div

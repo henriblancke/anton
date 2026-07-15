@@ -117,6 +117,17 @@ export interface ProjectSettings {
    * effective per-task retry budget. Absent → DEFAULT_MAX_RETRIES.
    */
   maxRetries?: number;
+  /**
+   * Active-agents allowlist (anton-46w): which specialist agent prompts dispatch may assign.
+   * Each entry is a known agent id (KNOWN_AGENTS in src/lib/agents.ts). Absent →
+   * DEFAULT_ACTIVE_AGENTS. Enforcement lives with dispatch (anton-dm7), not here.
+   */
+  agents?: string[];
+  /**
+   * Autonomy master-switch (anton-46w): whether approved epics execute without asking. Absent →
+   * true (autonomous). Enforcement lives with the runner (anton-y3l), not here.
+   */
+  autonomy?: boolean;
 }
 
 /** Defaults for the per-project job policy when a setting is unset. */

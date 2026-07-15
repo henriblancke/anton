@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { KNOWN_AGENTS } from "@/lib/agents";
 import {
   CONCURRENCY_RANGE,
   JOB_TIMEOUT_MINUTES_RANGE,
@@ -17,6 +18,9 @@ const ALLOWED_MODELS = new Set([
   "claude-haiku-4-5",
   "claude-fable-5",
 ]);
+
+/** Agent ids the active-agents allowlist may contain — same source the UI toggles render from. */
+const KNOWN_AGENT_IDS = new Set<string>(KNOWN_AGENTS);
 
 export async function GET(_request: Request, { params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
@@ -98,6 +102,34 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
         { status: 400 },
       );
     } else patch.reviewFixPrompt = rf;
+  }
+
+  if ("agents" in body) {
+    const agents = body.agents;
+    // "" / null → clear (fall back to the default active set). Otherwise an array of known ids;
+    // [] is a real value ("no agents"), not a clear.
+    if (agents == null || agents === "") patch.agents = undefined;
+    else if (!Array.isArray(agents) || agents.some((a) => typeof a !== "string")) {
+      return NextResponse.json(
+        { error: "agents must be an array of agent ids" },
+        { status: 400 },
+      );
+    } else {
+      const unknown = agents.find((a) => !KNOWN_AGENT_IDS.has(a));
+      if (unknown !== undefined) {
+        return NextResponse.json({ error: `Unknown agent: ${unknown}` }, { status: 400 });
+      }
+      patch.agents = [...new Set<string>(agents)];
+    }
+  }
+
+  if ("autonomy" in body) {
+    const autonomy = body.autonomy;
+    // "" / null → clear (default: autonomous). Otherwise strictly a boolean.
+    if (autonomy == null || autonomy === "") patch.autonomy = undefined;
+    else if (typeof autonomy !== "boolean") {
+      return NextResponse.json({ error: "autonomy must be a boolean" }, { status: 400 });
+    } else patch.autonomy = autonomy;
   }
 
   try {
