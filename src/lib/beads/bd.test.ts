@@ -3,6 +3,7 @@ import {
   buildUpdateArgs,
   createDoltSync,
   getSyncStatus,
+  getSyncStatusToken,
   isBenignSyncOutput,
   isNotWiredOutput,
   runDoltSync,
@@ -377,17 +378,20 @@ describe("createDoltSync", () => {
     });
     await sync(cwd);
     const syncedAt = getSyncStatus(cwd).lastSyncedAt;
+    const healthyToken = getSyncStatusToken(cwd);
     fail = true;
     await expect(sync(cwd)).rejects.toThrow(/connection reset/);
     const status = getSyncStatus(cwd);
     expect(status.state).toBe("failing");
     expect(status.lastError).toMatch(/connection reset/);
     expect(status.lastSyncedAt).toBe(syncedAt);
+    expect(getSyncStatusToken(cwd)).not.toBe(healthyToken);
 
     fail = false; // recovery flips back to synced
     await sync(cwd);
     expect(getSyncStatus(cwd).state).toBe("synced");
     expect(getSyncStatus(cwd).lastError).toBeNull();
+    expect(getSyncStatusToken(cwd)).toBe(healthyToken);
   });
 
   it("records not-wired for a workspace with no remote", async () => {

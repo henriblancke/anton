@@ -1,7 +1,7 @@
 /**
  * Assembles the Board from beads. Stage/approval/PR are derived — never stored. See DESIGN.md §2/§3.
  */
-import { beads, getSyncStatus, type Bead } from "./beads/bd";
+import { beads, getSyncStatus, getSyncStatusToken, type Bead } from "./beads/bd";
 import { allIssues } from "./beads/issues";
 import { issueSnapshotVersion } from "./beads/snapshot";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
@@ -15,6 +15,10 @@ export function deriveStage(bead: Bead): Stage {
     return "implementing";
   }
   return "backlog";
+}
+
+export function getBoardVersion(repoPath: string): string {
+  return `${issueSnapshotVersion(repoPath)}:${getSyncStatusToken(repoPath)}`;
 }
 
 /** Extract a "## <name>" section from a bead description. `bd list --json` returns the
@@ -152,7 +156,7 @@ export async function getBoard(project: Project): Promise<Board> {
 
   return {
     projectSlug: project.slug,
-    version: issueSnapshotVersion(project.repoPath),
+    version: getBoardVersion(project.repoPath),
     columns,
     // Read from the globalThis-anchored registry, so the API bundle sees passes run by the
     // instrumentation-started sync engine (see bd.ts).

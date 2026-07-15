@@ -1,8 +1,7 @@
 import { NextResponse } from "next/server";
-import { getBoard } from "@/lib/board";
+import { getBoard, getBoardVersion } from "@/lib/board";
 import { getProjectBySlug } from "@/lib/projects";
 import { probeAllIssues, refreshAllIssues } from "@/lib/beads/issues";
-import { issueSnapshotVersion } from "@/lib/beads/snapshot";
 
 export const dynamic = "force-dynamic";
 
@@ -21,8 +20,8 @@ export async function GET(
     // A stale TTL or completed sync starts one background comparison. Unchanged data keeps the
     // same version and therefore never causes a full board download.
     probeAllIssues(project.repoPath);
-    const currentVersion = issueSnapshotVersion(project.repoPath);
-    if (knownVersion === String(currentVersion)) {
+    const currentVersion = getBoardVersion(project.repoPath);
+    if (knownVersion === currentVersion) {
       return new NextResponse(null, { status: 304 });
     }
     // Writes and completed pulls invalidate only after Dolt is done, so this refresh cannot

@@ -49,7 +49,7 @@ export function EpicBoard({ slug, initialBoard }: { slug: string; initialBoard: 
       loadingRef.current = true;
       try {
         const version = versionRef.current;
-        const suffix = !force && version !== undefined ? `?version=${version}` : "";
+        const suffix = !force && version !== undefined ? `?version=${encodeURIComponent(version)}` : "";
         const res = await fetch(`/api/projects/${slug}/board${suffix}`);
         if (res.status === 304) return;
         if (!res.ok) throw new Error(`Failed to load board (${res.status})`);

@@ -184,6 +184,15 @@ export function getSyncStatus(cwd: string): SyncStatus {
   return statusRegistry().get(cwd) ?? { state: "unknown", lastSyncedAt: null, lastError: null };
 }
 
+/**
+ * Compact token for board refreshes. Repeated successful heartbeats do not change it, while every
+ * user-visible health transition does (including gaining the first successful-sync timestamp).
+ */
+export function getSyncStatusToken(cwd: string): string {
+  const status = getSyncStatus(cwd);
+  return `${status.state}:${status.lastSyncedAt === null ? "never" : "seen"}:${status.lastError ?? ""}`;
+}
+
 function recordStatus(cwd: string, patch: Partial<SyncStatus>): void {
   statusRegistry().set(cwd, { ...getSyncStatus(cwd), ...patch });
 }

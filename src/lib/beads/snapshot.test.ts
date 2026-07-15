@@ -68,4 +68,23 @@ describe("issue snapshots", () => {
       bead("new"),
     ]);
   });
+
+  it("discards a pre-write refresh that resolves after hard invalidation", async () => {
+    await refreshIssueSnapshot("/repo", async () => [bead("initial")]);
+    let resolveOld!: (value: Bead[]) => void;
+    const oldRefresh = refreshIssueSnapshot(
+      "/repo",
+      () => new Promise<Bead[]>((resolve) => (resolveOld = resolve)),
+    );
+
+    invalidateIssueSnapshot("/repo", true);
+    const freshRead = getIssueSnapshot("/repo", async () => [bead("post-write")]);
+    resolveOld([bead("pre-write")]);
+
+    await oldRefresh;
+    await expect(freshRead).resolves.toEqual([bead("post-write")]);
+    await expect(getIssueSnapshot("/repo", async () => [])).resolves.toEqual([
+      bead("post-write"),
+    ]);
+  });
 });

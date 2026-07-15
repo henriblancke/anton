@@ -6,6 +6,7 @@ interface SnapshotEntry {
   beads: Bead[] | null;
   serialized: string | null;
   version: number;
+  generation: number;
   loadedAt: number;
   refresh: Promise<Bead[]> | null;
 }
@@ -25,6 +26,7 @@ function entryFor(cwd: string): SnapshotEntry {
     beads: null,
     serialized: null,
     version: 0,
+    generation: 0,
     loadedAt: 0,
     refresh: null,
   };
@@ -41,10 +43,13 @@ export function issueSnapshotVersion(cwd: string): number {
 export function invalidateIssueSnapshot(cwd: string, drop = false): void {
   const entry = entryFor(cwd);
   entry.loadedAt = 0;
+  entry.generation += 1;
   if (drop) {
     entry.version += 1;
     entry.beads = null;
     entry.serialized = null;
+    // A post-write read must start after the write, never share a loader that started before it.
+    entry.refresh = null;
   }
 }
 
@@ -59,9 +64,13 @@ export function refreshIssueSnapshot(
 ): Promise<Bead[]> {
   const entry = entryFor(cwd);
   if (entry.refresh) return entry.refresh;
+  const generation = entry.generation;
 
   const refresh = loader()
     .then((beads) => {
+      // A write or sync invalidated this loader while it was running. Its result predates that
+      // boundary and must never repopulate the current snapshot.
+      if (entry.generation !== generation) return entry.beads ?? beads;
       const serialized = JSON.stringify(beads);
       if (entry.serialized !== serialized) entry.version += 1;
       entry.beads = beads;
