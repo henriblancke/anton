@@ -10,6 +10,7 @@
  *     node_modules/               MINIMAL, dependency-traced deps (+ vendored node-pty)
  *     .next/                      compiled server output + static/ (copied in — standalone omits it)
  *     bin/anton.mjs               the launcher (detects RELEASE_VERSION → bundle/daemon mode)
+ *     src/lib/beads/config.mjs    shared Beads setup used by the CLI
  *     src/prompts/                system-base.md + agents/ (read at runtime, cwd-rooted)
  *     skills/                     vendored SKILL.md assets (read at runtime, cwd-rooted)
  *     drizzle/                    migration SQL (applied in-process at setup — no drizzle-kit)
@@ -125,7 +126,14 @@ function main(argv) {
   //    (skills/, drizzle/ migrations, src/prompts + the base/agent prompts) plus the launcher.
   console.log("[3/6] add static assets, public, and cwd-rooted runtime reads");
   cpSync(join(REPO_ROOT, ".next", "static"), join(stage, ".next", "static"), { recursive: true });
-  for (const rel of ["public", "skills", "drizzle", join("src", "prompts"), "bin"]) {
+  for (const rel of [
+    "public",
+    "skills",
+    "drizzle",
+    join("src", "lib", "beads", "config.mjs"),
+    join("src", "prompts"),
+    "bin",
+  ]) {
     cpSync(join(REPO_ROOT, rel), join(stage, rel), { recursive: true });
   }
 
@@ -155,6 +163,11 @@ function main(argv) {
   // 5) Drop the marker the launcher keys bundle mode off of.
   console.log("[5/6] write RELEASE_VERSION");
   writeFileSync(join(stage, "RELEASE_VERSION"), `${version}\n`);
+
+  // Smoke-test the staged launcher rather than the source checkout. This catches runtime files that
+  // were added as CLI imports but omitted from the hand-maintained bundle list above.
+  console.log("[5b/6] verify staged CLI launches");
+  run(process.execPath, [join(stage, "bin", "anton.mjs"), "--help"], { cwd: stage });
 
   // 6) Tarball the stage dir (the stage dir name is the top-level entry, so it extracts cleanly).
   console.log("[6/6] tar");
