@@ -5,6 +5,7 @@
  * backoff) skips tickets already closed and reuses the existing worktree. See DESIGN.md §4/§7.
  */
 import { randomUUID } from "node:crypto";
+import { KNOWN_AGENTS } from "../agents";
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { loadAgentPrompt } from "../claude/agent-prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
@@ -83,6 +84,24 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     }
 
     try {
+      // 0. Dispatch honors the active-agents allowlist (anton-dm7). PARK, don't skip: running
+      // the ticket with the default agent would silently produce work the operator disabled the
+      // specialist for, and skipping it would open the epic's single PR incomplete. Parking is
+      // recoverable — the operator enables the agent (Settings → Agents) or relabels the ticket,
+      // then resumes; tickets and settings are re-read on every attempt. Checked before any
+      // claim/worktree/session work so a run never half-executes into a config problem.
+      const inactive = inactiveAgentTickets(
+        tickets.filter((t) => t.status !== "closed"),
+        settings.agents,
+      );
+      if (inactive.length > 0) {
+        throw new PoisonEpic(
+          `epic ${epicBeadId} needs agents disabled in this project's settings: ` +
+            inactive.map((x) => `${x.id} → agent:${x.agent}`).join(", ") +
+            ` — enable them in Settings → Agents (or relabel the tickets), then resume the run`,
+        );
+      }
+
       // 1. Warm worktree (idempotent — reused on resume).
       const worktree = await createWorktree({
         repoPath: repo,
@@ -298,6 +317,31 @@ function childrenOf(all: Bead[], epicId: string): Bead[] {
 function labelValue(labels: string[] | undefined, prefix: string): string | undefined {
   const l = labels?.find((x) => x.startsWith(`${prefix}:`));
   return l ? l.slice(prefix.length + 1) : undefined;
+}
+
+/**
+ * Tickets whose `agent:` label names a specialist agent the project has disabled (anton-dm7).
+ * `activeAgents` is settings.agents. Semantics:
+ *   • absent or EMPTY allowlist → all agents active (projects that never persisted `agents`
+ *     must not stall, and the API treats [] as clearable state — no restriction either way)
+ *   • no `agent:` label → runs with the default agent, never blocked
+ *   • a tag outside KNOWN_AGENTS is a user-provided custom agent (anton-3n5.4) the toggle UI
+ *     can't enable — outside the allowlist system, runs as today
+ */
+export function inactiveAgentTickets(
+  tickets: Bead[],
+  activeAgents: string[] | undefined,
+): { id: string; agent: string }[] {
+  if (!activeAgents || activeAgents.length === 0) return [];
+  const active = new Set(activeAgents);
+  const out: { id: string; agent: string }[] = [];
+  for (const t of tickets) {
+    const agent = labelValue(t.labels, "agent");
+    if (!agent) continue;
+    if (!(KNOWN_AGENTS as readonly string[]).includes(agent)) continue;
+    if (!active.has(agent)) out.push({ id: t.id, agent });
+  }
+  return out;
 }
 
 /**

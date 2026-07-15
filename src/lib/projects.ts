@@ -119,8 +119,10 @@ export interface ProjectSettings {
   maxRetries?: number;
   /**
    * Active-agents allowlist (anton-46w): which specialist agent prompts dispatch may assign.
-   * Each entry is a known agent id (KNOWN_AGENTS in src/lib/agents.ts). Absent →
-   * DEFAULT_ACTIVE_AGENTS. Enforcement lives with dispatch (anton-dm7), not here.
+   * Each entry is a known agent id (KNOWN_AGENTS in src/lib/agents.ts). Enforced by dispatch
+   * (anton-dm7, execute-epic): a run whose ticket needs a disabled agent is PARKED with a clear
+   * reason — never silently run with the default agent. Absent or empty → all agents active
+   * (DEFAULT_ACTIVE_AGENTS is the UI's initial toggle state only, not an enforcement default).
    */
   agents?: string[];
   /**
