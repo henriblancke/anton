@@ -316,9 +316,11 @@ function childrenOf(all: Bead[], epicId: string): Bead[] {
  * Finalize an epic whose PR merged: close the epic + any still-open child tickets, drop the
  * `stage:in-review` label, remove the merged branch + its worktree, and finalize the run row.
  *
- * Idempotent by construction. Dropping `stage:in-review` means the next review-fix sweep no longer
- * treats the epic as in-review (inReviewEpics filters it out), so it is never finalized twice; and
- * every step here is individually safe to repeat — already-closed beads are skipped, removeWorktree
+ * Idempotent by construction. Dropping `stage:in-review` (only once every close succeeds) means the
+ * next review-fix sweep no longer treats the epic as in-review (inReviewEpics filters it out), so it
+ * is never finalized twice; if a close fails transiently the label is left in place and the epic is
+ * re-selected next sweep to retry. Every step here is individually safe to repeat — already-closed
+ * beads are skipped, removeWorktree
  * is a no-op when the worktree/branch are already gone (execute-epic removes the worktree at PR
  * open, so it is usually already gone by merge time), and an already-finalized run leaves no open
  * run to touch.
@@ -336,12 +338,16 @@ export async function finalizeMergedEpic(args: {
 }): Promise<void> {
   const { db, clock, repo, projectId, epic, children, branch } = args;
 
-  // 1. Close remaining open tickets, then the epic, then drop the in-review stage (it's done now).
+  // 1. Close remaining open tickets, then the epic. Only drop the in-review stage once every close
+  //    has actually succeeded — a transient `bd close` failure (swallowed by `safe`) must leave the
+  //    label in place so the next review-fix sweep re-selects the epic (inReviewEpics) and retries,
+  //    rather than orphaning a still-open ticket/epic behind a run already marked done.
+  let allClosed = true;
   for (const ticket of children) {
-    if (ticket.status !== "closed") await safe(() => beads.close(repo, ticket.id));
+    if (ticket.status !== "closed") allClosed = (await safe(() => beads.close(repo, ticket.id))) && allClosed;
   }
-  if (epic.status !== "closed") await safe(() => beads.close(repo, epic.id));
-  await safe(() => beads.untag(repo, epic.id, [IN_REVIEW]));
+  if (epic.status !== "closed") allClosed = (await safe(() => beads.close(repo, epic.id))) && allClosed;
+  if (allClosed) await safe(() => beads.untag(repo, epic.id, [IN_REVIEW]));
 
   // 2. Remove the merged branch and its worktree. If the worktree is already gone (the common case),
   //    removeWorktree still prunes and deletes the local branch off a synthetic descriptor.
@@ -464,10 +470,13 @@ function reviewFixContext(epic: Bead, pr: PrReview, reasons: string[], conflicts
   return lines.join("\n").trimEnd();
 }
 
-async function safe(fn: () => Promise<unknown>): Promise<void> {
+/** Run a best-effort side effect, swallowing failures. Returns true iff `fn` completed. */
+async function safe(fn: () => Promise<unknown>): Promise<boolean> {
   try {
     await fn();
+    return true;
   } catch {
     // best-effort
+    return false;
   }
 }

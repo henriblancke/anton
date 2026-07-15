@@ -1109,7 +1109,11 @@ async function cmdStart(args) {
     if (b !== 0) return b;
   }
   console.log(c.dim("anton start — starting Next.js server (runner + scheduler auto-start)…"));
-  return runLocal("next", nextArgs("start", args));
+  // In bundle mode the server's writable state — including the DB getDb() opens — must point at
+  // STATE_DIR (the same env startDaemon passes), so it opens the DB ensureMigrated() just migrated
+  // rather than falling back to a stray anton.db under the cwd. Source checkouts resolve their own DB.
+  const serverEnv = IS_BUNDLE ? bundleStateEnv() : {};
+  return runLocal("next", nextArgs("start", args), serverEnv);
 }
 
 const USAGE = `${c.bold("anton")} — local autonomous-coding orchestrator
