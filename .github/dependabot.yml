@@ -1,0 +1,24 @@
+# Dependabot (anton-7jy). Weekly dependency + security-advisory PRs. This repo lives on the
+# bleeding edge (Next 16, React 19), so grouped minor/patch bumps keep drift small and land as
+# reviewable PRs that go through the normal CI gates.
+version: 2
+updates:
+  # npm/bun manifest. Dependabot reads package.json + bun.lock (ecosystem "npm" covers bun).
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    groups:
+      # One PR for the noisy minor/patch churn; majors still come as individual PRs so breaking
+      # bumps (a new Next/React major) get their own review.
+      minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Keep the GitHub Actions themselves current (checkout, setup-bun, gitleaks, etc.).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

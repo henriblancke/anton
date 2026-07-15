@@ -4,9 +4,16 @@
  * worktree, dispatch claude to resolve the feedback, commit, push, and re-request review. See
  * DESIGN §2/§4 and git/pr.ts.
  *
+ * This same sweep also finalizes MERGED PRs (anton-ner.5): a merged PR is terminal, so instead of
+ * fixing review feedback the epic + its remaining open tickets move to done, `stage:in-review` is
+ * cleared, and the merged branch/worktree + run row are cleaned up. A PR merely CLOSED (not merged)
+ * is left alone. Living here — rather than in a new job type — means every existing project gets
+ * merge finalization on its next poll without re-seeding schedules.
+ *
  * Enqueued per-project by the scheduler (a polling job): each run sweeps every in-review epic once.
- * Idempotent — a PR with nothing actionable is skipped, and claude's fixes are plain commits on the
- * existing branch, so a re-run just pushes whatever is left.
+ * Idempotent — a PR with nothing actionable is skipped, claude's fixes are plain commits on the
+ * existing branch (a re-run just pushes whatever is left), and finalizing a merge clears
+ * `stage:in-review` so a later sweep no longer treats the epic as in-review (never finalized twice).
  */
 import { randomUUID } from "node:crypto";
 import { beads, LABELS, type Bead } from "../beads/bd";
@@ -28,10 +35,10 @@ import {
   threadsNeedingAttention,
   type PrReview,
 } from "../git/pr";
-import { createWorktree } from "../git/worktree";
+import { createWorktree, findWorktree, removeWorktree, worktreePathFor, type Worktree } from "../git/worktree";
 import { getProjectById, getProjectSettings, type ProjectSettings } from "../projects";
 import { runShell } from "./shell";
-import { findOpenRunForEpic } from "../runs";
+import { findOpenRunForEpic, updateRun } from "../runs";
 import { appendSessionLog, createSession, endSession, sessionLogPath } from "../sessions";
 import { PoisonError } from "./errors";
 import { isUsageLimitError } from "./errors";
@@ -144,6 +151,23 @@ async function handleEpic(args: {
   if (number === undefined) return;
 
   const pr = await getPrReview(repo, number, ctx.signal);
+
+  // A merged PR is terminal — finalize the epic (done + cleanup) rather than fixing feedback. A PR
+  // merely CLOSED (not merged) falls through to classifyReview, which treats any non-OPEN state as
+  // not-actionable, so it is left untouched.
+  if (pr.state === "MERGED") {
+    await finalizeMergedEpic({
+      db,
+      clock,
+      repo,
+      projectId,
+      epic,
+      children: childrenOf(all, epic.id),
+      branch: pr.headRefName || `${branchPrefix}/${epic.id}`,
+    });
+    return;
+  }
+
   const verdict = classifyReview(pr);
   if (!verdict.actionable) return; // nothing to fix on this PR yet.
 
@@ -281,6 +305,62 @@ async function handleEpic(args: {
   void all; // reserved (edge lookups if we later scope fixes to specific tickets)
 }
 
+// ── merge finalization (anton-ner.5) ──
+
+/** Children of an epic — beads whose parent (inline on `bd list --json`) is the epic. */
+function childrenOf(all: Bead[], epicId: string): Bead[] {
+  return all.filter((b) => ((b.parent ?? b.parent_id) as string | undefined) === epicId);
+}
+
+/**
+ * Finalize an epic whose PR merged: close the epic + any still-open child tickets, drop the
+ * `stage:in-review` label, remove the merged branch + its worktree, and finalize the run row.
+ *
+ * Idempotent by construction. Dropping `stage:in-review` (only once every close succeeds) means the
+ * next review-fix sweep no longer treats the epic as in-review (inReviewEpics filters it out), so it
+ * is never finalized twice; if a close fails transiently the label is left in place and the epic is
+ * re-selected next sweep to retry. Every step here is individually safe to repeat — already-closed
+ * beads are skipped, removeWorktree
+ * is a no-op when the worktree/branch are already gone (execute-epic removes the worktree at PR
+ * open, so it is usually already gone by merge time), and an already-finalized run leaves no open
+ * run to touch.
+ */
+export async function finalizeMergedEpic(args: {
+  db: AntonDb;
+  clock: Clock;
+  repo: string;
+  projectId: string;
+  epic: Bead;
+  /** The epic's child tickets (open ones are closed alongside the epic). */
+  children: Bead[];
+  /** The merged PR's head branch — the local branch + worktree to clean up. */
+  branch: string;
+}): Promise<void> {
+  const { db, clock, repo, projectId, epic, children, branch } = args;
+
+  // 1. Close remaining open tickets, then the epic. Only drop the in-review stage once every close
+  //    has actually succeeded — a transient `bd close` failure (swallowed by `safe`) must leave the
+  //    label in place so the next review-fix sweep re-selects the epic (inReviewEpics) and retries,
+  //    rather than orphaning a still-open ticket/epic behind a run already marked done.
+  let allClosed = true;
+  for (const ticket of children) {
+    if (ticket.status !== "closed") allClosed = (await safe(() => beads.close(repo, ticket.id))) && allClosed;
+  }
+  if (epic.status !== "closed") allClosed = (await safe(() => beads.close(repo, epic.id))) && allClosed;
+  if (allClosed) await safe(() => beads.untag(repo, epic.id, [IN_REVIEW]));
+
+  // 2. Remove the merged branch and its worktree. If the worktree is already gone (the common case),
+  //    removeWorktree still prunes and deletes the local branch off a synthetic descriptor.
+  const wt: Worktree =
+    (await findWorktree(repo, branch)) ??
+    { path: worktreePathFor(repo, branch), branch, baseBranch: branch, repoPath: repo };
+  await safe(() => removeWorktree(wt, { deleteBranch: true }));
+
+  // 3. Finalize the run row if one is still open (a run already marked done at PR-open is left as-is).
+  const run = await findOpenRunForEpic(db, projectId, epic.id);
+  if (run) await updateRun(db, clock, run.id, { status: "done", endedAt: clock.now(), error: null });
+}
+
 // ── helpers ──
 
 function labelValue(labels: string[] | undefined, prefix: string): string | undefined {
@@ -390,10 +470,13 @@ function reviewFixContext(epic: Bead, pr: PrReview, reasons: string[], conflicts
   return lines.join("\n").trimEnd();
 }
 
-async function safe(fn: () => Promise<unknown>): Promise<void> {
+/** Run a best-effort side effect, swallowing failures. Returns true iff `fn` completed. */
+async function safe(fn: () => Promise<unknown>): Promise<boolean> {
   try {
     await fn();
+    return true;
   } catch {
     // best-effort
+    return false;
   }
 }

@@ -16,7 +16,7 @@ import { makeNightlyStringerHandler } from "./nightly-stringer";
 import { makeOrphanGroomingHandler } from "./orphan-grooming";
 import { JobRunner, type RunnerLogger } from "./runner";
 import { Scheduler } from "./scheduler";
-import { systemClock } from "./queue";
+import { getJob, systemClock } from "./queue";
 
 const log: RunnerLogger = {
   info: (msg, meta) => console.log(`[jobs] ${msg}`, meta ?? ""),
@@ -25,6 +25,7 @@ const log: RunnerLogger = {
 
 let _runner: JobRunner | null = null;
 let _scheduler: Scheduler | null = null;
+let _reconciled = false;
 
 /**
  * Global ceiling on total in-flight jobs across all projects — a safety bound above the per-project
@@ -67,17 +68,43 @@ export function getScheduler(): Scheduler {
   return _scheduler;
 }
 
-/** Idempotent: starts the background runner loop + the cron scheduler. Call once at server boot. */
-export function startRunner(): void {
+/**
+ * Idempotent: reconcile crash-orphaned jobs/runs (anton-nbd), then start the background runner loop
+ * + the cron scheduler. Meant to be called once at server boot, but tolerant of re-entry (dev
+ * hot-reload, tests): reconciliation runs at most once — the first call only — because it expires
+ * every `running` lease, and a second call while this process already has jobs in flight would
+ * reclaim its own live leases and let the next tick dispatch those job ids a second time. `start()`
+ * and the scheduler are themselves idempotent. Reconciliation runs before the loop so a restart
+ * re-dispatches in-flight work on the first tick rather than after a lease window; it's best-effort
+ * and never blocks startup.
+ */
+export async function startRunner(): Promise<void> {
+  if (!_reconciled) {
+    // Set before awaiting so a concurrent second call can't slip past into a second reconcile.
+    _reconciled = true;
+    await getRunner().reconcile();
+  }
   getRunner().start();
   getScheduler().start();
 }
 
-/** Enqueue an execute-epic job for an approved epic. Returns the job id. */
+/**
+ * Enqueue an execute-epic job for an approved epic. Returns the job id — the existing one when an
+ * active (queued|running) run for this epic already exists, so a double approval or retrigger can't
+ * spawn duplicate concurrent runs (anton-761).
+ */
 export function enqueueExecuteEpic(projectId: string, epicBeadId: string): Promise<string> {
-  return getRunner().enqueue({
-    type: "execute-epic",
-    projectId,
-    payload: { projectId, epicBeadId },
-  });
+  return Promise.resolve(getRunner().enqueueExecuteEpic(projectId, epicBeadId));
+}
+
+/**
+ * Un-park a parked/failed job from the UI (anton-ner.4). Scoped to the project so a route can't
+ * resume another project's job by id. Returns true if a resumable job was returned to `queued`
+ * (the runner re-leases it next tick), false if the job doesn't exist, isn't in this project, or
+ * isn't in a resumable state (already queued/running/done → rejected no-op).
+ */
+export async function resumeJob(projectId: string, jobId: string): Promise<boolean> {
+  const job = await getJob(getDb(), jobId);
+  if (!job || job.projectId !== projectId) return false;
+  return getRunner().resume(jobId);
 }

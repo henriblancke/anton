@@ -24,6 +24,12 @@ import type { AntonDb, Clock } from "./queue";
 import { systemClock } from "./queue";
 import type { JobContext, JobHandler } from "./runner";
 
+/**
+ * The assignee an automated run claims its epic + tickets under. Stable (not per-run) so a resume
+ * re-claims to the same value — an idempotent no-op — rather than churning the assignee (anton-ner.1).
+ */
+export const ANTON_ACTOR = "anton";
+
 export interface ExecuteEpicPayload {
   projectId: string;
   epicBeadId: string;
@@ -96,8 +102,8 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       });
       await ctx.heartbeat();
 
-      // 2. Mark the epic implementing (idempotent).
-      await safe(() => beads.setStatus(repo, epicBeadId, "in_progress"));
+      // 2. Claim the epic for anton — in_progress + assignee (idempotent on resume, anton-ner.1).
+      await safe(() => beads.claim(repo, epicBeadId, ANTON_ACTOR));
       await safe(() => beads.tag(repo, epicBeadId, [LABELS.stage("implementing")]));
 
       // 3. Per ticket: claude → tests → commit → close. Skip already-closed (resume).
@@ -168,6 +174,9 @@ async function runTicket(args: {
   settings: ProjectSettings;
 }): Promise<void> {
   const { db, clock, ctx, projectId, repo, runId, worktreePath, ticket, settings } = args;
+  // Claim the ticket for anton — assignee + in_progress — so the board shows who owns it and a
+  // second run/human won't grab it. Idempotent on resume (anton-ner.1).
+  await safe(() => beads.claim(repo, ticket.id, ANTON_ACTOR));
   const agentTag = labelValue(ticket.labels, "agent");
   // Compose the system prompt: locked base contract + agent-tag prompt + operator seed. The base
   // is mandatory (buildExecutionSystemPrompt throws if src/prompts/system-base.md is missing).

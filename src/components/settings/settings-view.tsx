@@ -55,10 +55,11 @@ const AGENTS = [
 
 const DEFAULT_ACTIVE = new Set(["fastapi", "supabase", "pydantic", "nextjs"]);
 
+// Mirrors DEFAULT_SCHEDULES in src/lib/schedules.ts — keep the crons in sync.
 const AUTOMATIONS = [
-  { id: "nightly-stringer", label: "nightly-stringer", meta: "scan → triage · 0 2 * * *", on: true },
-  { id: "review-fix", label: "review-fix watcher", meta: "poll PRs every 5m", on: true },
-  { id: "orphan-grooming", label: "orphan-grooming", meta: "bucket loose tickets", on: false },
+  { id: "nightly-stringer", label: "nightly-stringer", meta: "scan → triage · 0 3 * * *", on: true },
+  { id: "review-fix", label: "review-fix watcher", meta: "poll PRs every 15m", on: true },
+  { id: "orphan-grooming", label: "orphan-grooming", meta: "bucket loose tickets · 0 4 * * 1", on: true },
 ];
 
 export function SettingsView({

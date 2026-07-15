@@ -285,6 +285,16 @@ export const beads = {
   setStatus: (cwd: string, id: string, status: string) =>
     bd(cwd, ["update", id, "--status", status]),
 
+  /**
+   * Claim a bead for an actor: set `in_progress` AND an `--assignee` in one write, so the board
+   * shows who owns in-flight work (not just that it's in progress) and a human or a second run can
+   * see the ticket is taken (anton-ner.1). Use a stable actor (e.g. `anton`) so re-claiming on a
+   * resume is a harmless no-op — `bd update --assignee anton` on an already-claimed bead just
+   * rewrites the same values.
+   */
+  claim: (cwd: string, id: string, actor: string) =>
+    bd(cwd, ["update", id, "--status", "in_progress", "--assignee", actor]),
+
   /** Pure argv builder, exposed for testing and callers that want to inspect the write. */
   buildUpdateArgs,
 

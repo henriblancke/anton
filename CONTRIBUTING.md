@@ -23,16 +23,35 @@ The **job runner and cron scheduler auto-start** with the server (via `src/instr
 ## Quality gates
 
 ```bash
-bun run lint         # eslint
-bun run typecheck    # tsc --noEmit
-bun run test         # vitest (unit + integration; integration suites self-skip
-                     # when bd/gh/stringer/claude aren't installed)
-bun run build        # next build
+bun run lint          # eslint
+bun run typecheck     # tsc --noEmit
+bun run test          # vitest (unit + integration; integration suites self-skip
+                      # when bd/gh/stringer/claude aren't installed)
+bun run test:coverage # same, with a V8 coverage report (report-only, ~5x slower)
+bun run build         # next build
 ```
 
 - **Pre-commit** — a husky hook runs `lint-staged` (`eslint --fix` on staged `.ts`/`.tsx`) then `typecheck`. Installed automatically on `bun install`.
-- **CI** — `.github/workflows/ci.yml` runs lint + typecheck + test + build on every push to `main` and every PR.
+- **CI** — `.github/workflows/ci.yml` runs on every push to `main` and every PR:
+  - `check` (blocking) — lint + typecheck + test + build.
+  - `secrets` (blocking) — [gitleaks](https://github.com/gitleaks/gitleaks-action) secret scan. Free for personal repos; org-owned repos need a `GITLEAKS_LICENSE` secret.
+  - `coverage` (non-blocking) — runs `test:coverage` and uploads the html/lcov report as a run artifact. Kept off the blocking gate because instrumentation slows the suite ~5x; there's no coverage threshold yet.
+- **Dependencies** — [Dependabot](./.github/dependabot.yml) opens weekly PRs for npm/bun deps (minor+patch grouped, majors individual) and GitHub Actions.
 - **Release** — pushing a `v*` tag runs the same gates and cuts a GitHub Release (`.github/workflows/release.yml`).
+
+### Automated code review (Codex)
+
+PRs are reviewed by the **Codex GitHub app** (already installed on this repo). Codex reads
+[`AGENTS.md`](./AGENTS.md) as its project context, so keep that file current — it's what makes the
+review understand anton's conventions.
+
+- **Auto-review on every PR** is enabled in the Codex/ChatGPT *Code review* settings for this repo
+  (an account-level setting, not committed here). If reviews stop appearing, re-check that toggle.
+- **On demand**: comment `@codex review` on any PR to (re-)trigger a full review.
+
+Codex review is advisory — it comments and (when enabled) can score a PR, but it is intentionally
+**not** a required/blocking status check. The deterministic gates above (`check`, `secrets`) are the
+ones that block merge.
 
 ## Database migrations
 

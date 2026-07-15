@@ -9,5 +9,5 @@ export async function register(): Promise<void> {
   if (process.env.NEXT_RUNTIME !== "nodejs") return;
   if (process.env.ANTON_RUNNER === "off") return;
   const { startRunner } = await import("./lib/jobs/service");
-  startRunner();
+  await startRunner();
 }

@@ -3,9 +3,12 @@ import { notFound } from "next/navigation";
 import { SquareTerminalIcon } from "lucide-react";
 
 import { getProjectBySlug } from "@/lib/projects";
-import { listRuns, type RunStatus, type RunSummary } from "@/lib/runs";
+import { countRuns, listRunsPaged, type RunStatus, type RunSummary } from "@/lib/runs";
+import { countJobs } from "@/lib/jobs-view";
 import { cn } from "@/lib/utils";
 import { fmtDuration, isActiveRun } from "@/components/runs/run-view-utils";
+import { SectionTabs } from "@/components/runs/section-tabs";
+import { PAGE_SIZE, Pagination, resolvePage } from "@/components/runs/pagination";
 
 export const dynamic = "force-dynamic";
 
@@ -17,7 +20,7 @@ const STATUS_STYLE: Record<RunStatus, { dot: string; text: string; pulse?: boole
   done: { dot: "bg-stage-done", text: "text-stage-done" },
 };
 
-/** Compact "3m ago" / "2h ago" for the history column. */
+/** Compact "3m ago" / "2h ago" for the activity column. */
 function relativeTime(epoch?: number): string {
   if (!epoch) return "";
   const s = Math.max(0, Math.floor(Date.now() / 1000) - epoch);
@@ -29,17 +32,22 @@ function relativeTime(epoch?: number): string {
 
 export default async function ProjectRunsPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ slug: string }>;
+  searchParams: Promise<{ page?: string }>;
 }) {
   const { slug } = await params;
   const project = await getProjectBySlug(slug);
   if (!project) notFound();
 
-  const runs = await listRuns(project.id);
-  // Split active (queued/running/parked) from history (done/failed) for diagnostics browsing.
-  const active = runs.filter((r) => isActiveRun(r.status));
-  const history = runs.filter((r) => !isActiveRun(r.status));
+  const [total, jobsCount] = await Promise.all([countRuns(project.id), countJobs(project.id)]);
+  const { page } = await searchParams;
+  const current = resolvePage(page, total);
+  const runs = total > 0 ? await listRunsPaged(project.id, {
+    limit: PAGE_SIZE,
+    offset: (current - 1) * PAGE_SIZE,
+  }) : [];
 
   return (
     <div className="flex flex-1 flex-col">
@@ -49,10 +57,11 @@ export default async function ProjectRunsPage({
           <span className="text-subtle">/</span>
           <span className="font-medium text-foreground">Runs</span>
         </div>
-        <span className="ml-1 font-mono text-[11px] text-subtle">{runs.length}</span>
       </header>
 
-      {runs.length === 0 ? (
+      <SectionTabs slug={slug} active="runs" runsCount={total} jobsCount={jobsCount} />
+
+      {total === 0 ? (
         <div className="flex flex-1 flex-col items-center justify-center gap-4 p-8 text-center">
           <span className="flex size-12 items-center justify-center rounded-xl border border-dashed border-border">
             <SquareTerminalIcon className="size-5 text-subtle" aria-hidden="true" />
@@ -70,28 +79,16 @@ export default async function ProjectRunsPage({
           </Link>
         </div>
       ) : (
-        <div className="flex flex-col">
-          {active.length > 0 && <RunGroup label="Active" runs={active} slug={slug} />}
-          {history.length > 0 && <RunGroup label="History" runs={history} slug={slug} />}
+        <div className="flex flex-1 flex-col">
+          <ul className="flex flex-col divide-y divide-border">
+            {runs.map((run) => (
+              <RunRow key={run.id} run={run} slug={slug} />
+            ))}
+          </ul>
+          <Pagination basePath={`/projects/${slug}/runs`} page={current} total={total} />
         </div>
       )}
     </div>
-  );
-}
-
-function RunGroup({ label, runs, slug }: { label: string; runs: RunSummary[]; slug: string }) {
-  return (
-    <section>
-      <div className="flex items-center gap-2 border-b border-border bg-card/30 px-6 py-2">
-        <span className="font-mono text-[10px] tracking-[0.05em] text-subtle uppercase">{label}</span>
-        <span className="font-mono text-[10px] text-subtle">{runs.length}</span>
-      </div>
-      <ul className="flex flex-col divide-y divide-border">
-        {runs.map((run) => (
-          <RunRow key={run.id} run={run} slug={slug} />
-        ))}
-      </ul>
-    </section>
   );
 }
 

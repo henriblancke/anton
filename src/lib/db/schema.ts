@@ -5,7 +5,7 @@
  * See DESIGN.md §3.
  */
 import { sql } from "drizzle-orm";
-import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+import { sqliteTable, text, integer, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 const ts = (name: string) => integer(name, { mode: "timestamp" });
 const now = sql`(unixepoch())`;
@@ -41,21 +41,38 @@ export const runs = sqliteTable("runs", {
 });
 
 /** Durable job queue. Idempotent; resumable via leases + backoff. See DESIGN.md §4. */
-export const jobs = sqliteTable("jobs", {
-  id: text("id").primaryKey(),
-  // execute-epic | review-fix | nightly-stringer | orphan-grooming
-  type: text("type").notNull(),
-  projectId: text("project_id").references(() => projects.id),
-  payloadJson: text("payload_json").notNull().default("{}"),
-  // queued | running | parked | done | failed
-  status: text("status").notNull().default("queued"),
-  runAt: ts("run_at").notNull().default(now),
-  leaseExpiresAt: ts("lease_expires_at"),
-  attempts: integer("attempts").notNull().default(0),
-  lastError: text("last_error"),
-  createdAt: ts("created_at").notNull().default(now),
-  updatedAt: ts("updated_at").notNull().default(now),
-});
+export const jobs = sqliteTable(
+  "jobs",
+  {
+    id: text("id").primaryKey(),
+    // execute-epic | review-fix | nightly-stringer | orphan-grooming
+    type: text("type").notNull(),
+    projectId: text("project_id").references(() => projects.id),
+    payloadJson: text("payload_json").notNull().default("{}"),
+    // queued | running | parked | done | failed
+    status: text("status").notNull().default("queued"),
+    runAt: ts("run_at").notNull().default(now),
+    leaseExpiresAt: ts("lease_expires_at"),
+    attempts: integer("attempts").notNull().default(0),
+    lastError: text("last_error"),
+    createdAt: ts("created_at").notNull().default(now),
+    updatedAt: ts("updated_at").notNull().default(now),
+  },
+  (table) => [
+    // At most one active (queued|running) job per (type, project, epicBeadId). epicBeadId lives in
+    // payload_json, so this is an expression index over json_extract. A DB-level backstop for the
+    // transactional dedupe in enqueueExecuteEpicDeduped (anton-761) — stops a double approval or
+    // retrigger from spawning duplicate concurrent runs of the same epic. Non-epic job types have a
+    // NULL extract, and SQLite treats NULLs as distinct in a unique index, so they never collide.
+    uniqueIndex("jobs_active_epic_unique")
+      .on(
+        table.type,
+        table.projectId,
+        sql`json_extract(${table.payloadJson}, '$.epicBeadId')`,
+      )
+      .where(sql`${table.status} in ('queued', 'running')`),
+  ],
+);
 
 export const schedules = sqliteTable("schedules", {
   id: text("id").primaryKey(),

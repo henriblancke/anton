@@ -18,6 +18,7 @@ import {
   configureBeadsDoltSync,
   ensureBeadsGitignore,
   ensureBetterSqlite3,
+  ensureMigrated,
   nextArgs,
   normalizeGitUrl,
   parseInitArgs,
@@ -285,6 +286,27 @@ describe("applyMigrations (in-process, no drizzle-kit)", () => {
   });
 });
 
+describe("ensureMigrated (bundle mode → in-process apply, before serving)", () => {
+  let dir: string;
+  afterEach(async () => {
+    if (dir) await rm(dir, { recursive: true, force: true });
+  });
+
+  it("applies pending migrations, then is a clean no-op on the next start", async () => {
+    dir = await mkdtemp(join(tmpdir(), "anton-start-mig-"));
+    const dbPath = join(dir, "anton.db");
+
+    // Bundle branch: apply the real committed SQL in-process (no drizzle-kit), like `anton start`.
+    const first = ensureMigrated({ isBundle: true, dbPath, appRoot: REPO_ROOT });
+    expect(first.ran).toBeGreaterThan(0);
+    expect(await exists(dbPath)).toBe(true);
+
+    // Re-running start with nothing pending applies zero migrations.
+    const second = ensureMigrated({ isBundle: true, dbPath, appRoot: REPO_ROOT });
+    expect(second.ran).toBe(0);
+  });
+});
+
 describe("registerProject (anton init → projects board, anton-uez)", () => {
   let dir: string;
   afterEach(async () => {
@@ -319,6 +341,42 @@ describe("registerProject (anton init → projects board, anton-uez)", () => {
       // The three default schedules are seeded once (idempotent per type).
       const schedules = sqlite.prepare("SELECT COUNT(*) AS n FROM schedules").get() as { n: number };
       expect(schedules.n).toBe(3);
+    } finally {
+      sqlite.close();
+    }
+  });
+
+  it("self-heals: re-registering backfills a missing default schedule (anton-mxy)", async () => {
+    dir = await mkdtemp(join(tmpdir(), "anton-reg-heal-"));
+    const dbPath = join(dir, "anton.db");
+    const repoPath = join(dir, "repo");
+    mkdirSync(repoPath, { recursive: true });
+
+    const first = registerProject(repoPath, { appRoot: REPO_ROOT, dbPath });
+    expect(first.created).toBe(true);
+    expect(first.backfilled).toBe(3);
+
+    const require = createRequire(join(REPO_ROOT, "package.json"));
+    const Database = require("better-sqlite3");
+    const sqlite = new Database(dbPath);
+    try {
+      // Simulate a project that predates seeding one of its types (e.g. the anton project).
+      sqlite.prepare("DELETE FROM schedules WHERE type = 'nightly-stringer'").run();
+      expect((sqlite.prepare("SELECT COUNT(*) AS n FROM schedules").get() as { n: number }).n).toBe(2);
+
+      // Re-registering the existing repo backfills only the missing type.
+      const healed = registerProject(repoPath, { appRoot: REPO_ROOT, dbPath });
+      expect(healed.created).toBe(false);
+      expect(healed.backfilled).toBe(1);
+
+      const types = sqlite
+        .prepare("SELECT type FROM schedules ORDER BY type")
+        .all()
+        .map((r: { type: string }) => r.type);
+      expect(types).toEqual(["nightly-stringer", "orphan-grooming", "review-fix"]);
+
+      // A second re-register is now a clean no-op.
+      expect(registerProject(repoPath, { appRoot: REPO_ROOT, dbPath }).backfilled).toBe(0);
     } finally {
       sqlite.close();
     }
