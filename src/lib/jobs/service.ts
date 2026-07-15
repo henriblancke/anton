@@ -17,6 +17,7 @@ import { makeOrphanGroomingHandler } from "./orphan-grooming";
 import { JobRunner, type RunnerLogger } from "./runner";
 import { Scheduler } from "./scheduler";
 import { getJob, systemClock } from "./queue";
+import { startSyncEngine } from "../beads/sync-engine";
 
 const log: RunnerLogger = {
   info: (msg, meta) => console.log(`[jobs] ${msg}`, meta ?? ""),
@@ -70,13 +71,13 @@ export function getScheduler(): Scheduler {
 
 /**
  * Idempotent: reconcile crash-orphaned jobs/runs (anton-nbd), then start the background runner loop
- * + the cron scheduler. Meant to be called once at server boot, but tolerant of re-entry (dev
- * hot-reload, tests): reconciliation runs at most once — the first call only — because it expires
- * every `running` lease, and a second call while this process already has jobs in flight would
- * reclaim its own live leases and let the next tick dispatch those job ids a second time. `start()`
- * and the scheduler are themselves idempotent. Reconciliation runs before the loop so a restart
- * re-dispatches in-flight work on the first tick rather than after a lease window; it's best-effort
- * and never blocks startup.
+ * + the cron scheduler + the beads sync engine. Meant to be called once at server boot, but tolerant
+ * of re-entry (dev hot-reload, tests): reconciliation runs at most once — the first call only —
+ * because it expires every `running` lease, and a second call while this process already has jobs in
+ * flight would reclaim its own live leases and let the next tick dispatch those job ids a second
+ * time. `start()`, the scheduler, and the sync engine are themselves idempotent. Reconciliation runs
+ * before the loop so a restart re-dispatches in-flight work on the first tick rather than after a
+ * lease window; it's best-effort and never blocks startup.
  */
 export async function startRunner(): Promise<void> {
   if (!_reconciled) {
@@ -86,6 +87,7 @@ export async function startRunner(): Promise<void> {
   }
   getRunner().start();
   getScheduler().start();
+  startSyncEngine();
 }
 
 /**

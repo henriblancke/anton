@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { TriangleAlertIcon } from "lucide-react";
 import {
@@ -22,36 +22,64 @@ import { EpicCard } from "@/components/board/epic-card";
 import { BoardColumn } from "@/components/board/board-column";
 import { BoardSkeleton } from "@/components/board/board-skeleton";
 import { STAGE_LABELS, moveEpicBetweenColumns } from "@/components/board/board-utils";
+import { SyncStatusBadge } from "@/components/board/sync-status-badge";
 import { Button } from "@/components/ui/button";
+
+/** Board freshness cadence — matches the sync engine's heartbeat so remote changes surface
+ * within one beat + one poll (anton-live-sync R8). */
+const BOARD_POLL_MS = 10_000;
 
 export function EpicBoard({ slug }: { slug: string }) {
   const [board, setBoard] = useState<Board | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
   const [activeId, setActiveId] = useState<string | null>(null);
+  // Poll guard: a poll result landing mid-drag would clobber the drag interaction; the ref
+  // mirrors activeId so the polling closure sees the live value.
+  const draggingRef = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
 
     async function load() {
       try {
         const res = await fetch(`/api/projects/${slug}/board`);
         if (!res.ok) throw new Error(`Failed to load board (${res.status})`);
         const data = (await res.json()) as { board: Board };
-        if (!cancelled) {
+        if (!cancelled && !draggingRef.current) {
           setBoard(data.board);
           setError(null);
         }
       } catch (err) {
+        // Only the initial load surfaces an error UI; a failed poll keeps the last good board.
         if (!cancelled) {
-          setError(err instanceof Error ? err.message : "Failed to load board");
+          setBoard((prev) => {
+            if (prev === null) {
+              setError(err instanceof Error ? err.message : "Failed to load board");
+            }
+            return prev;
+          });
         }
       }
     }
 
-    void load();
+    async function poll() {
+      // Skip work while the tab is hidden or a card is being dragged; keep the loop alive.
+      if (document.visibilityState === "visible" && !draggingRef.current) await load();
+      if (!cancelled) timer = setTimeout(() => void poll(), BOARD_POLL_MS);
+    }
+
+    void poll();
+    const onVisible = () => {
+      // Coming back to the tab refreshes immediately instead of waiting out the interval.
+      if (document.visibilityState === "visible" && !cancelled) void load();
+    };
+    document.addEventListener("visibilitychange", onVisible);
     return () => {
       cancelled = true;
+      if (timer) clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisible);
     };
   }, [slug, attempt]);
 
@@ -70,6 +98,7 @@ export function EpicBoard({ slug }: { slug: string }) {
   }, [board, activeId]);
 
   function handleDragStart(event: DragStartEvent) {
+    draggingRef.current = true;
     setActiveId(String(event.active.id));
   }
 
@@ -85,6 +114,7 @@ export function EpicBoard({ slug }: { slug: string }) {
   }
 
   async function handleDragEnd(event: DragEndEvent) {
+    draggingRef.current = false;
     setActiveId(null);
     const { active, over } = event;
     if (!board || !over) return;
@@ -140,8 +170,14 @@ export function EpicBoard({ slug }: { slug: string }) {
       modifiers={[restrictToWindowEdges]}
       onDragStart={handleDragStart}
       onDragEnd={handleDragEnd}
-      onDragCancel={() => setActiveId(null)}
+      onDragCancel={() => {
+        draggingRef.current = false;
+        setActiveId(null);
+      }}
     >
+      <div className="flex justify-end pb-2">
+        <SyncStatusBadge sync={board.sync} />
+      </div>
       <div className="grid min-h-0 flex-1 grid-cols-1 gap-3.5 sm:grid-cols-2 xl:grid-cols-4">
         {STAGES.map((stage) => (
           <BoardColumn

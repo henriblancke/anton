@@ -404,9 +404,21 @@ function configureBeadsDoltSync(opts = {}) {
 
   if (!existsSync(join(repoDir, ".beads"))) return { status: "no-workspace" };
 
-  const origin = exec("git", ["remote", "get-url", "origin"]);
-  const url = (origin.stdout ?? "").trim();
-  if ((origin.status ?? 1) !== 0 || !url) return { status: "no-remote" };
+  // Remote choice is dynamic per project: a `sync.remote` declared in .beads/config.yaml (e.g.
+  // an aws:// remote) wins over the git-origin fallback. NOTE `bd config get` exits 0 with
+  // "sync.remote (not set in config.yaml)" when unset — parse the text, never the exit code.
+  const cfg = exec("bd", ["config", "get", "sync.remote"]);
+  const cfgOut = ((cfg.status ?? 1) === 0 ? (cfg.stdout ?? "") : "").trim();
+  const declared = /\(not set/i.test(cfgOut)
+    ? undefined
+    : cfgOut.split(/\s+/).find((t) => /^[a-z+]+:\/\//i.test(t) || t.startsWith("git@"));
+
+  let url = declared;
+  if (!url) {
+    const origin = exec("git", ["remote", "get-url", "origin"]);
+    url = (origin.stdout ?? "").trim();
+    if ((origin.status ?? 1) !== 0 || !url) return { status: "no-remote" };
+  }
 
   // `bd dolt remote list` prints `<name>  <url>` lines ("No remotes configured." when empty).
   const list = exec("bd", ["dolt", "remote", "list"]);

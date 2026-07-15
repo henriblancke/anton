@@ -12,6 +12,7 @@ import { runClaude, type ClaudeEvent } from "../claude/driver";
 import { commitAll, openPullRequest } from "../git/ops";
 import { createWorktree, removeWorktree } from "../git/worktree";
 import { getProjectById, getProjectSettings, type ProjectSettings } from "../projects";
+import { resolveOperator } from "../operator";
 import {
   createRun,
   findOpenRunForEpic,
@@ -23,12 +24,6 @@ import { runShell } from "./shell";
 import type { AntonDb, Clock } from "./queue";
 import { systemClock } from "./queue";
 import type { JobContext, JobHandler } from "./runner";
-
-/**
- * The assignee an automated run claims its epic + tickets under. Stable (not per-run) so a resume
- * re-claims to the same value — an idempotent no-op — rather than churning the assignee (anton-ner.1).
- */
-export const ANTON_ACTOR = "anton";
 
 export interface ExecuteEpicPayload {
   projectId: string;
@@ -102,9 +97,15 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       });
       await ctx.heartbeat();
 
-      // 2. Claim the epic for anton — in_progress + assignee (idempotent on resume, anton-ner.1).
-      await safe(() => beads.claim(repo, epicBeadId, ANTON_ACTOR));
+      // 2. Claim the epic for the human operator (idempotent). The immediate sync nudge makes
+      // the claim visible on teammates' boards within a heartbeat — that's the whole point of
+      // claiming (anton-live-sync R6); fire-and-forget, the end-of-run sync is the backstop.
+      const operator = await resolveOperator();
+      await safe(() => beads.claim(repo, epicBeadId, operator));
       await safe(() => beads.tag(repo, epicBeadId, [LABELS.stage("implementing")]));
+      void beads
+        .sync(repo)
+        .catch((e) => console.error(`[execute-epic] claim sync failed for ${epicBeadId}`, e));
 
       // 3. Per ticket: claude → tests → commit → close. Skip already-closed (resume).
       for (const ticket of orderTickets(tickets, all)) {
@@ -119,6 +120,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           worktreePath: worktree.path,
           ticket,
           settings,
+          operator,
         });
         await ctx.heartbeat();
       }
@@ -172,11 +174,35 @@ async function runTicket(args: {
   worktreePath: string;
   ticket: Bead;
   settings: ProjectSettings;
+  operator?: string;
 }): Promise<void> {
-  const { db, clock, ctx, projectId, repo, runId, worktreePath, ticket, settings } = args;
-  // Claim the ticket for anton — assignee + in_progress — so the board shows who owns it and a
-  // second run/human won't grab it. Idempotent on resume (anton-ner.1).
-  await safe(() => beads.claim(repo, ticket.id, ANTON_ACTOR));
+  const { db, clock, ctx, projectId, repo, runId, worktreePath, ticket, settings, operator } =
+    args;
+
+  // Claim the ticket for the operator as a HARD GATE before doing any work. On a shared board
+  // the claim is the cross-operator coordination primitive (anton-live-sync R6): a failure here
+  // means the ticket was already claimed by another operator (e.g. after a heartbeat pull) or the
+  // local Dolt DB is locked. In either case we must NOT run Claude on a ticket this process does
+  // not own — and must NOT fall through to the failure path below, which would clear the real
+  // owner's claim. Claiming is idempotent for the same actor, so a resume re-claims cleanly. A
+  // conflict aborts the run before any session/worktree work; the job retries and either skips the
+  // now-closed ticket (already-closed check in the caller) or reclaims one whose owner released it.
+  try {
+    await beads.claim(repo, ticket.id, operator);
+  } catch (e) {
+    throw new Error(
+      `refusing to execute ${ticket.id}: could not claim it for ${operator ?? "this operator"} ` +
+        `— already claimed by another operator, or the beads DB is locked ` +
+        `(${e instanceof Error ? e.message : String(e)})`,
+    );
+  }
+  // Announce the stage + nudge a sync so the claim reaches teammates within a heartbeat
+  // (fire-and-forget; the end-of-run sync is the backstop).
+  await safe(() => beads.tag(repo, ticket.id, [LABELS.stage("implementing")]));
+  void beads
+    .sync(repo)
+    .catch((e) => console.error(`[execute-epic] claim sync failed for ${ticket.id}`, e));
+
   const agentTag = labelValue(ticket.labels, "agent");
   // Compose the system prompt: locked base contract + agent-tag prompt + operator seed. The base
   // is mandatory (buildExecutionSystemPrompt throws if src/prompts/system-base.md is missing).
@@ -203,10 +229,7 @@ async function runTicket(args: {
     void appendSessionLog(logPath, line).catch(() => {});
   };
 
-  // Claim the ticket before the session so the board shows it in-flight (idempotent on resume).
-  await safe(() => beads.setStatus(repo, ticket.id, "in_progress"));
-  await safe(() => beads.tag(repo, ticket.id, [LABELS.stage("implementing")]));
-
+  let committed = false;
   try {
     const result = await runClaude({
       cwd: worktreePath,
@@ -230,12 +253,30 @@ async function runTicket(args: {
 
     // Commit whatever claude changed.
     await commitAll(worktreePath, `${ticket.id}: ${ticket.title}`);
+    committed = true;
 
     // Mark the ticket done in beads (stage → done).
     await safe(() => beads.close(repo, ticket.id));
     await endSession(db, clock, sessionId, "done");
   } catch (e) {
     await endSession(db, clock, sessionId, "failed");
+    // Release the claim so the board never shows a dead session's ticket as in-flight
+    // (anton-live-sync R10). A usage-limit park is NOT dead — the run resumes with the claim
+    // intact. When work already landed on the branch, flag for a human instead of silently
+    // re-queueing a ticket whose commits exist. All best-effort: never mask the run's error;
+    // the epic-level finally sync pushes the release to the remote.
+    if (!isUsageLimitError(e)) {
+      if (committed) {
+        await safe(() => beads.setStatus(repo, ticket.id, "blocked"));
+        await safe(() =>
+          beads.note(repo, ticket.id, `anton: run failed after committing work — needs review`),
+        );
+      } else {
+        await safe(() => beads.setStatus(repo, ticket.id, "open"));
+      }
+      await safe(() => beads.unassign(repo, ticket.id));
+      await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
+    }
     throw e;
   }
 }

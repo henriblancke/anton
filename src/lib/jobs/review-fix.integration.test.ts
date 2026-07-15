@@ -76,7 +76,7 @@ suite("review-fix e2e (real handler · real bd/git · fake claude/gh)", () => {
     g(["push", "-q", "-u", "origin", "main"]);
 
     // beads: an in-review epic with a PR ref (as execute-epic would have left it).
-    execFileSync("bd", ["init"], { cwd: repo, stdio: "ignore" });
+    execFileSync("bd", ["init", "--skip-hooks"], { cwd: repo, stdio: "ignore" });
     epicId = await beads.create(repo, {
       title: "Ship feature X",
       type: "epic",

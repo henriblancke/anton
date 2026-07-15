@@ -46,8 +46,13 @@ suite("beads.sync integration (real bd · local bare remote)", () => {
     g(["remote", "add", "origin", bare]);
     g(["push", "-q", "-u", "origin", "main"]); // Dolt push needs an existing branch on the remote
 
-    execFileSync("bd", ["init"], { cwd: repo, stdio: "ignore" });
+    // --skip-hooks: bd's own pre-commit hook (bd export) deadlocks against bd init's exclusive
+    // embedded-Dolt lock in a pristine repo. anton never relies on bd hooks — sync is explicit.
+    execFileSync("bd", ["init", "--skip-hooks"], { cwd: repo, stdio: "ignore" });
     execFileSync("bd", ["dolt", "remote", "add", "origin", bare], { cwd: repo, stdio: "ignore" });
+    // anton-managed config: bd 1.0.2 auto-pushes after each write once a remote named `origin`
+    // exists — anton owns push cadence, so managed projects disable it (see CONFIG_KEYS).
+    execFileSync("bd", ["config", "set", "dolt.auto-push", "false"], { cwd: repo, stdio: "ignore" });
 
     project = {
       id: "x", slug: "tmp", name: "tmp", repoPath: repo,
@@ -64,15 +69,26 @@ suite("beads.sync integration (real bd · local bare remote)", () => {
     return refs.split("\n").find((l) => l.endsWith("refs/dolt/data"));
   };
 
+  it("a pull-only pass never moves the remote ref (heartbeats must not push)", async () => {
+    // `bd dolt remote add` publishes refs/dolt/data once at wiring time; from then on only
+    // write-nudged full passes may move it. A heartbeat pull with local uncommitted-to-remote
+    // writes present must leave the remote untouched.
+    const before = doltDataRef();
+    await beads.create(repo, { title: "Local-only until nudged", type: "task" });
+    await beads.pull(repo);
+    expect(doltDataRef(), "pull-only pass must never push").toBe(before);
+  }, 60_000);
+
   it("a UI ticket edit lands commits on refs/dolt/data of the git remote", async () => {
     const id = await beads.create(repo, { title: "Sync me", type: "task" });
-    expect(doltDataRef(), "no dolt data pushed before the first sync").toBeUndefined();
+    const beforeEdit = doltDataRef();
 
     // The UI PATCH path: updateTicket writes via bd then syncs explicitly.
     await updateTicket(project, id, { title: "Synced title" });
 
     const afterEdit = doltDataRef();
     expect(afterEdit, "refs/dolt/data exists on the remote after a ticket edit").toBeDefined();
+    expect(afterEdit, "the write-nudged sync moved the remote ref").not.toBe(beforeEdit);
 
     // A second write moves the ref — every write reaches the remote, not just the first.
     await updateTicket(project, id, { priority: 1 });
@@ -80,12 +96,15 @@ suite("beads.sync integration (real bd · local bare remote)", () => {
     expect(doltDataRef()).not.toBe(afterEdit);
   }, 60_000);
 
-  it("sync rejects loudly on a real push failure", async () => {
-    // Re-point the Dolt remote at a path that doesn't exist (upsert) — push must fail, not skip.
+  it("sync rejects loudly on a real remote failure (unreachable remote is not swallowed)", async () => {
+    // Re-point the Dolt remote at a path that doesn't exist (upsert). This is NOT the benign
+    // first-publish case (a wired-but-unpushed remote) — the remote is unreachable, so the full
+    // pass must reject loudly rather than tolerate it. bd surfaces it at the pull step (which runs
+    // before push), so the sync fails there; push-failure rejection is covered in bd.test.ts.
     execFileSync("bd", ["dolt", "remote", "add", "origin", join(sandbox, "missing.git")], {
       cwd: repo,
       stdio: "ignore",
     });
-    await expect(beads.sync(repo)).rejects.toThrow(/bd dolt push failed/);
+    await expect(beads.sync(repo)).rejects.toThrow(/bd dolt (pull|push) failed/);
   }, 60_000);
 });

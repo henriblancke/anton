@@ -14,9 +14,10 @@ import { randomUUID } from "node:crypto";
 import { makeTestDb, type TestDb } from "../db/testing";
 import { beads } from "../beads/bd";
 import * as schema from "../db/schema";
-import { getJob, type Clock } from "./queue";
+import { getJob, park, type Clock } from "./queue";
 import { JobRunner } from "./runner";
 import { makeExecuteEpicHandler } from "./execute-epic";
+import { resetOperatorCache } from "../operator";
 
 function has(cmd: string): boolean {
   try {
@@ -84,8 +85,12 @@ suite("execute-epic e2e (real handler · real bd/git · fake claude/gh)", () => 
 
     // beads: epic (approved) + two tickets under it. The git `origin` doubles as the Dolt
     // remote (as `anton setup` wires it), so the run's explicit beads.sync is exercised too.
-    execFileSync("bd", ["init"], { cwd: repo, stdio: "ignore" });
+    // --skip-hooks: bd's own pre-commit hook (bd export) deadlocks against bd init's exclusive
+    // embedded-Dolt lock in a pristine repo. anton never relies on bd hooks — sync is explicit.
+    execFileSync("bd", ["init", "--skip-hooks"], { cwd: repo, stdio: "ignore" });
     execFileSync("bd", ["dolt", "remote", "add", "origin", bare], { cwd: repo, stdio: "ignore" });
+    // anton-managed config: disable bd's own auto-push — anton owns push cadence (see CONFIG_KEYS).
+    execFileSync("bd", ["config", "set", "dolt.auto-push", "false"], { cwd: repo, stdio: "ignore" });
     epicId = await beads.create(repo, {
       title: "Ship feature X",
       type: "epic",
@@ -142,6 +147,8 @@ process.exit(0);`,
     set("ANTON_WORKTREES_ROOT", join(sandbox, "worktrees"));
     set("ANTON_SESSIONS_ROOT", join(sandbox, "sessions"));
     set("ANTON_TEST_CLAUDE_ARGV", join(sandbox, "claude-argv.jsonl"));
+    set("ANTON_OPERATOR", "test-operator"); // claims must land on the human operator
+    resetOperatorCache();
 
     // Test DB + project row.
     tdb = makeTestDb();
@@ -168,6 +175,7 @@ process.exit(0);`,
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
     }
+    resetOperatorCache();
     rmSync(sandbox, { recursive: true, force: true });
   });
 
@@ -214,11 +222,11 @@ process.exit(0);`,
     expect(epic.external_ref).toBe("gh-42");
     expect(epic.labels ?? []).toContain("stage:in-review");
 
-    // The run CLAIMED the epic + each ticket for anton (assignee set, not just in_progress) so the
-    // board shows who owns in-flight work — anton-ner.1.
-    expect(epic.assignee).toBe("anton");
-    expect(bt1?.assignee).toBe("anton");
-    expect(bt2?.assignee).toBe("anton");
+    // The run CLAIMED the epic + each ticket for the human operator (assignee set, not just
+    // in_progress) so the board shows who owns in-flight work — anton-ner.1 / anton-live-sync R6.
+    expect(epic.assignee).toBe("test-operator");
+    expect(bt1?.assignee).toBe("test-operator");
+    expect(bt2?.assignee).toBe("test-operator");
 
     // The branch was actually pushed to origin, and carries per-ticket commits.
     const remoteBranches = execFileSync("git", ["-C", repo, "ls-remote", "--heads", "origin"], {
@@ -332,9 +340,11 @@ process.exit(0);`,
       const run2 = runsForEpic.find((r) => r.epicBeadId === epic2)!;
       expect(run2.status).toBe("parked");
       expect(existsSync(run2.worktreePath!)).toBe(true); // worktree kept for resume
-      // The ticket was claimed before the session ran: visible in-flight state on the board.
+      // The ticket was claimed before the session ran: visible in-flight state on the board,
+      // assigned to the human operator. A usage-limit park keeps the claim (the run resumes).
       const claimed = await beads.show(repo, ticket2);
       expect(claimed.status).toBe("in_progress");
+      expect(claimed.assignee).toBe("test-operator");
       expect(claimed.labels ?? []).toContain("stage:implementing");
 
       // Not due yet.
@@ -356,6 +366,66 @@ process.exit(0);`,
       expect((await beads.show(repo, epic2)).labels ?? []).toContain("stage:in-review");
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
+    }
+  }, 60_000);
+
+  it("releases a dead session's claim: a failed ticket run leaves the ticket unclaimed", async () => {
+    const epic3 = await beads.create(repo, {
+      title: "Feature Z",
+      type: "epic",
+      description: "## Goal\nZ",
+    });
+    await beads.approve(repo, epic3);
+    const ticket3 = (() => {
+      const p = JSON.parse(
+        execFileSync(
+          "bd",
+          ["create", "Doomed ticket", "--type", "task", "--parent", epic3, "--acceptance", "x", "--json"],
+          { cwd: repo, encoding: "utf8" },
+        ),
+      );
+      return (Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string;
+    })();
+
+    // Fake claude that fails outright (non-quota) before committing anything.
+    const failingClaude = writeBin(
+      binDir,
+      "claude-fail",
+      `const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+e({type:'system',subtype:'init',session_id:'sf'});
+e({type:'result',subtype:'error',result:'boom — claude fell over',is_error:true});
+process.exit(0);`,
+    );
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    process.env.ANTON_CLAUDE_BIN = failingClaude;
+    let jobId: string;
+    try {
+      jobId = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: epic3 },
+      });
+      await runner.tickOnce();
+      await runner.whenIdle(); // let the failed run settle (reschedule) before we park it below
+
+      // R10: no bead left looking claimed by a dead session — status back to open, unassigned,
+      // stage label removed. (No work was committed, so it returns to the ready pool.)
+      const released = await beads.show(repo, ticket3);
+      expect(released.status).toBe("open");
+      expect(released.assignee ?? null).toBeNull();
+      expect(released.labels ?? []).not.toContain("stage:implementing");
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      // A failed run reschedules the job with backoff; park it so a later test's clock-advancing
+      // tick can't re-dispatch this doomed epic (the test DB is shared across the describe block).
+      if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
     }
   }, 60_000);
 
@@ -475,6 +545,86 @@ process.exit(0);`,
       expect((await beads.show(repo, epic3)).labels ?? []).toContain("stage:in-review");
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
+    }
+  }, 60_000);
+
+  it("hard-gates on a ticket claimed by another operator: aborts without stealing the claim", async () => {
+    // Shared-backlog safety: on a shared board a ticket may already be claimed by ANOTHER operator
+    // (e.g. picked up after a heartbeat pull). The run must not run Claude on a ticket it doesn't
+    // own, and must not clear the real owner's claim on the failure path. The ticket claim is a hard
+    // gate — a conflict aborts the run (run → failed, no PR) and leaves the foreign claim intact.
+    const epic4 = await beads.create(repo, {
+      title: "Feature W",
+      type: "epic",
+      description: "## Goal\nW",
+    });
+    await beads.approve(repo, epic4);
+    const owned = (() => {
+      const p = JSON.parse(
+        execFileSync(
+          "bd",
+          ["create", "Foreign ticket", "--type", "task", "--parent", epic4, "--acceptance", "x", "--json"],
+          { cwd: repo, encoding: "utf8" },
+        ),
+      );
+      return (Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string;
+    })();
+    // Another operator claims it before our run (bd's --claim fails for a different actor).
+    execFileSync("bd", ["update", owned, "--claim"], {
+      cwd: repo,
+      env: { ...process.env, BEADS_ACTOR: "other-operator" },
+      stdio: "ignore",
+    });
+
+    // A claude that logs every ticket it's invoked for — so we can prove it's NEVER run on `owned`.
+    const invLog = join(sandbox, "gate-inv.jsonl");
+    const loggingClaude = writeBin(
+      binDir,
+      "claude-gate",
+      `const fs=require('fs');const path=require('path');
+const a=process.argv.slice(2);const get=f=>{const i=a.indexOf(f);return i>=0?a[i+1]:undefined;};
+const prompt=get('-p')||'';const m=prompt.match(/Ticket: (\\S+)/);
+fs.appendFileSync(${JSON.stringify(invLog)},(m?m[1]:'unknown')+'\\n');
+fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work\\n');
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+e({type:'result',subtype:'success',result:'done',session_id:'sg',num_turns:1,is_error:false});
+process.exit(0);`,
+    );
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    process.env.ANTON_CLAUDE_BIN = loggingClaude;
+    let jobId: string;
+    try {
+      jobId = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: epic4 },
+      });
+      await runner.tickOnce();
+      await runner.whenIdle();
+
+      // Run failed (no partial PR); the epic never advanced to in-review.
+      const run4 = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === epic4)!;
+      expect(run4.status).toBe("failed");
+      expect((await beads.show(repo, epic4)).labels ?? []).not.toContain("stage:in-review");
+
+      // The foreign operator's claim is intact — we neither ran Claude on it nor cleared it.
+      const t = await beads.show(repo, owned);
+      expect(t.assignee).toBe("other-operator");
+      expect(t.status).toBe("in_progress");
+      const invoked = existsSync(invLog) ? readFileSync(invLog, "utf8") : "";
+      expect(invoked).not.toContain(owned);
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      // A failed run reschedules the job with backoff; park it so a later clock-advancing tick
+      // can't re-dispatch this epic (the test DB is shared across the describe block).
+      if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
     }
   }, 60_000);
 });

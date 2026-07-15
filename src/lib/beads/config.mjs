@@ -151,10 +151,14 @@ export function ensureBdConfig(dir, beadsDir, key, want) {
   return (r.status ?? 1) === 0 ? "set" : "failed";
 }
 
-/** The config.yaml keys anton's team-config enforces (Dolt-first model). */
+/** The config.yaml keys anton's team-config enforces (Dolt-first model). `dolt.auto-push false`
+ * because anton owns push cadence (write-nudged full passes, pull-only heartbeats): bd 1.0.2
+ * auto-pushes after every write once a remote named `origin` exists, which both double-pushes
+ * and re-creates the concurrent-push manifest-corruption risk (beads GH#2466) anton avoids. */
 const CONFIG_KEYS = [
   ["dolt.auto-commit", "on"],
   ["export.git-add", "false"],
+  ["dolt.auto-push", "false"],
 ];
 
 /** True when a Dolt remote named `name` is already configured in `dir`'s workspace. */
@@ -167,9 +171,61 @@ export function doltRemoteConfigured(dir, name = "origin") {
   return out.split("\n").some((l) => l.trim().split(/\s+/)[0] === name);
 }
 
+/**
+ * The URL of the Dolt remote named `name` in `dir`'s workspace, or null when it isn't configured.
+ * `bd dolt remote list` prints `<name>  <url>` lines ("No remotes configured." when empty).
+ *
+ * @param {string} dir
+ * @param {string} [name]
+ */
+export function doltRemoteUrl(dir, name = "origin") {
+  const r = spawnSync("bd", ["dolt", "remote", "list"], { cwd: dir, encoding: "utf8" });
+  if ((r.status ?? 1) !== 0) return null;
+  const out = r.stdout || "";
+  if (/no remotes configured/i.test(out)) return null;
+  for (const line of out.split("\n")) {
+    const [n, url] = line.trim().split(/\s+/);
+    if (n === name && url) return url;
+  }
+  return null;
+}
+
+/**
+ * Normalize a Dolt/git remote URL for equality checks against what `bd dolt remote list` reports.
+ * bd rewrites URLs when storing them — a `git+` scheme prefix, and scp form (`git@host:org/repo`)
+ * becomes `git+ssh://git@host/./org/repo.git` — so a byte compare would re-point on every run.
+ * A declared non-git remote (e.g. `aws://…`) passes through the git-specific steps unchanged.
+ *
+ * @param {string} url
+ */
+export function normalizeRemoteUrl(url) {
+  let s = url.trim().replace(/^git\+/, "").replace(/^file:\/\//, "");
+  const scp = s.match(/^([^@/]+@[^:/]+):(.+)$/);
+  if (scp) s = `ssh://${scp[1]}/${scp[2]}`;
+  return s.replace(/\/\.\//g, "/").replace(/\.git$/, "").replace(/\/+$/, "");
+}
+
 /** Best-effort `{stderr||stdout}` detail from a spawnSync result, for surfacing a failed step. */
 function stepDetail(r) {
   return (r.stderr || r.stdout || "").trim() || `exit ${r.status ?? "?"}`;
+}
+
+/**
+ * The project's declared Dolt remote from beads config (`sync.remote` in .beads/config.yaml) —
+ * e.g. knowledge-layer declares an `aws://` remote there. IMPORTANT: `bd config get` exits 0
+ * with "sync.remote (not set in config.yaml)" when unset (verified on bd 1.0.2), so detection
+ * parses the output text, never the exit code. Returns the URL or null.
+ *
+ * @param {string} dir
+ */
+export function configuredSyncRemote(dir) {
+  const r = spawnSync("bd", ["config", "get", "sync.remote"], { cwd: dir, encoding: "utf8" });
+  if ((r.status ?? 1) !== 0) return null;
+  const out = (r.stdout || "").trim();
+  if (!out || /\(not set/i.test(out)) return null;
+  // Output is "sync.remote = <url>" or a bare value line — take the first URL-shaped token.
+  const token = out.split(/\s+/).find((t) => /^[a-z+]+:\/\//i.test(t) || t.startsWith("git@"));
+  return token ?? null;
 }
 
 /**
@@ -197,12 +253,25 @@ export function configureBeadsDoltSync(opts = {}) {
   const emit = typeof log === "function" ? log : () => {};
 
   if (!existsSync(join(dir, ".beads"))) return { status: "no-workspace" };
-  const url = originRemoteUrl(dir);
+
+  // Remote choice is dynamic per project: a `sync.remote` declared in .beads/config.yaml (e.g.
+  // an aws:// remote) wins over the git-origin fallback — anton drives whatever the project's
+  // beads config declares, it never forces git-origin over a declared remote.
+  const declared = configuredSyncRemote(dir);
+  const url = declared ?? originRemoteUrl(dir);
   if (!url) return { status: "no-remote" };
-  if (doltRemoteConfigured(dir, "origin")) {
+
+  // Only a no-op when the existing Dolt remote already points at THIS url. A repo first wired to
+  // git origin and later given a declared `sync.remote` (e.g. aws://) must be re-pointed, not left
+  // pulling/pushing the stale remote — otherwise the declared shared backlog is silently ignored
+  // (anton-live-sync review). `bd dolt remote add` upserts, so the add below re-points a stale url.
+  const existing = doltRemoteUrl(dir, "origin");
+  if (existing && normalizeRemoteUrl(existing) === normalizeRemoteUrl(url)) {
     emit("Dolt remote 'origin' already configured — no-op.");
     return { status: "already", url };
   }
+  if (existing) emit(`Dolt remote 'origin' points at ${existing} — repointing to ${url}`);
+  else if (declared) emit(`sync.remote declared in beads config — wiring ${declared}`);
 
   const add = spawnSync("bd", ["dolt", "remote", "add", "origin", url], { cwd: dir, encoding: "utf8" });
   if ((add.status ?? 1) !== 0) return { status: "error", detail: stepDetail(add) };

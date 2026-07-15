@@ -64,7 +64,7 @@ suite("nightly-stringer e2e (real handler · real bd · fake stringer/claude)", 
     writeFileSync(join(repo, "README.md"), "# sandbox\n");
     g(["add", "-A"]);
     g(["commit", "-q", "-m", "init"]);
-    execFileSync("bd", ["init"], { cwd: repo, stdio: "ignore" });
+    execFileSync("bd", ["init", "--skip-hooks"], { cwd: repo, stdio: "ignore" });
 
     // Fake stringer: honor `-o <file>`, write a canned scan whose signal count is controlled by
     // FAKE_STRINGER_SIGNALS (0 → an empty scan, exercising the no-op path).

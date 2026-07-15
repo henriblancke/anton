@@ -1,7 +1,7 @@
 /**
  * Assembles the Board from beads. Stage/approval/PR are derived — never stored. See DESIGN.md §2/§3.
  */
-import { beads, type Bead } from "./beads/bd";
+import { beads, getSyncStatus, type Bead } from "./beads/bd";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
 import { STAGES, type Board, type Epic, type Project, type Stage, type Ticket } from "./types";
 
@@ -165,5 +165,8 @@ export async function getBoard(project: Project): Promise<Board> {
   return {
     projectSlug: project.slug,
     columns,
+    // Read from the globalThis-anchored registry, so the API bundle sees passes run by the
+    // instrumentation-started sync engine (see bd.ts).
+    sync: getSyncStatus(project.repoPath),
   };
 }
