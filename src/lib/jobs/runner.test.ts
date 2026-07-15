@@ -6,8 +6,9 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { makeTestDb, type TestDb } from "../db/testing";
+import * as schema from "../db/schema";
 import { PoisonError, UsageLimitError } from "./errors";
-import { getJob, toMs, type Clock } from "./queue";
+import { enqueue, getJob, toMs, type Clock } from "./queue";
 import {
   DEFAULT_CONFIG,
   JobRunner,
@@ -661,6 +662,27 @@ describe("JobRunner (live, in-memory db)", () => {
     await expect(r.abortProject("A")).resolves.toBeUndefined();
     // Settled (done) rows are the caller's to delete, not abortProject's.
     expect((await getJob(tdb.db, id))?.status).toBe("done");
+  });
+
+  it("quiesceProject rejects new enqueue/resume work and never leases the project again", async () => {
+    await seedProjects("A", "B");
+    const r = runner(async () => {});
+    const parked = await r.enqueue({ type: "execute-epic", projectId: "A" });
+    await tdb.db.update(schema.jobs).set({ status: "parked" }).where(eq(schema.jobs.id, parked));
+
+    await r.quiesceProject("A");
+
+    await expect(r.enqueue({ type: "review-fix", projectId: "A" })).rejects.toThrow(
+      /being deleted/,
+    );
+    expect(() => r.enqueueExecuteEpic("A", "epic-race")).toThrow(/being deleted/);
+    await expect(r.resume(parked)).resolves.toBe(false);
+    const bypassed = await enqueue(tdb.db, clock, { type: "review-fix", projectId: "A" });
+    const other = await r.enqueue({ type: "execute-epic", projectId: "B" });
+    expect(await r.tickOnce()).toBe(1);
+    await r.whenIdle();
+    expect((await getJob(tdb.db, bypassed))?.status).toBe("queued");
+    expect((await getJob(tdb.db, other))?.status).toBe("done");
   });
 });
 

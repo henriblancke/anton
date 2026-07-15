@@ -98,6 +98,20 @@ describe("Scheduler.tickOnce", () => {
     expect(jobsFor(tdb, "p1").length).toBe(1);
   });
 
+  it("does not enqueue a due schedule after project teardown raises its barrier", async () => {
+    await createSchedule(tdb.db, clock, {
+      projectId: "p1",
+      type: "nightly-stringer",
+      cron: "0 3 * * *",
+    });
+    const sched = new Scheduler({ db: tdb.db, clock });
+    sched.quiesceProject("p1");
+    clock.set(new Date(2026, 6, 11, 3, 0, 0, 0).getTime());
+
+    expect(await sched.tickOnce()).toBe(0);
+    expect(jobsFor(tdb, "p1")).toHaveLength(0);
+  });
+
   it("coalesces — skips a due slot when a job of the same type+project is already in flight", async () => {
     const id = await createSchedule(tdb.db, clock, {
       projectId: "p1",

@@ -250,8 +250,11 @@ export async function deleteProject(slug: string): Promise<void> {
   //    runner can't re-claim this project's work mid-teardown. Dynamic import — the service
   //    statically imports this module for its policy resolver, so a static import would cycle.
   try {
-    const { getRunner } = await import("./jobs/service");
-    await getRunner().abortProject(project.id);
+    const { getRunner, getScheduler } = await import("./jobs/service");
+    // Raise both enqueue barriers before draining work. A scheduler tick or approval that already
+    // crossed the barrier is caught by quiesceProject's abort sweep; anything later is rejected.
+    getScheduler().quiesceProject(project.id);
+    await getRunner().quiesceProject(project.id);
   } catch (e) {
     throw new Error(`deleteProject(${slug}): aborting in-flight jobs failed: ${errMsg(e)}`);
   }

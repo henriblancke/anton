@@ -163,6 +163,7 @@ export class JobRunner {
   private readonly clock: Clock;
   private readonly config: RunnerConfig;
   private readonly handlers = new Map<JobType, JobHandler>();
+  private readonly quiescedProjects = new Set<string>();
   private readonly log: RunnerLogger;
   private readonly resolvePolicy: JobPolicyResolver | null;
 
@@ -209,6 +210,9 @@ export class JobRunner {
 
   /** Enqueue a job on this runner's DB/clock. */
   enqueue(input: { type: JobType; projectId?: string; payload?: unknown; runAt?: number }) {
+    if (input.projectId && this.quiescedProjects.has(input.projectId)) {
+      return Promise.reject(new Error(`Project is being deleted: ${input.projectId}`));
+    }
     return enqueue(this.db, this.clock, input);
   }
 
@@ -218,6 +222,9 @@ export class JobRunner {
    * Race-safe via a transactional guard + partial unique index (anton-761).
    */
   enqueueExecuteEpic(projectId: string, epicBeadId: string): string {
+    if (this.quiescedProjects.has(projectId)) {
+      throw new Error(`Project is being deleted: ${projectId}`);
+    }
     return enqueueExecuteEpicDeduped(this.db, this.clock, projectId, epicBeadId);
   }
 
@@ -227,7 +234,9 @@ export class JobRunner {
    * error a human has since resolved). Resolves true if a parked job was resumed, false otherwise.
    * The manual-resume UI (anton's separate ticket) drives this; parking is no longer terminal.
    */
-  resume(jobId: string): Promise<boolean> {
+  async resume(jobId: string): Promise<boolean> {
+    const job = await getJob(this.db, jobId);
+    if (job?.projectId && this.quiescedProjects.has(job.projectId)) return false;
     return resumeJob(this.db, this.clock, jobId);
   }
 
@@ -279,7 +288,7 @@ export class JobRunner {
 
     // With a policy resolver, gate execute-epic concurrency per project. Precompute each pending
     // project's cap so leaseDue can decide synchronously; other job types stay ungated (Infinity).
-    let capOf: ((job: JobRow) => number) | undefined;
+    let policyCapOf: ((job: JobRow) => number) | undefined;
     if (this.resolvePolicy) {
       const projectIds = await projectIdsWithPendingJobs(this.db, "execute-epic");
       const concByProject = new Map<string, number>();
@@ -287,11 +296,15 @@ export class JobRunner {
         const policy = await this.policyFor(pid ?? undefined);
         concByProject.set(pid ?? "", policy.concurrency);
       }
-      capOf = (job) =>
+      policyCapOf = (job) =>
         job.type === "execute-epic"
           ? (concByProject.get(job.projectId ?? "") ?? DEFAULT_CONFIG.maxConcurrent)
           : Infinity;
     }
+    const capOf = (job: JobRow) =>
+      job.projectId && this.quiescedProjects.has(job.projectId)
+        ? 0
+        : (policyCapOf?.(job) ?? Infinity);
 
     const jobs = await leaseDue(this.db, this.clock, {
       leaseMs: this.config.leaseMs,
@@ -485,6 +498,16 @@ export class JobRunner {
         `abortProject(${projectId}): active job(s) ${leftover.join(", ")} still present after abort`,
       );
     }
+  }
+
+  /**
+   * Permanently stop this process from accepting or leasing more work for a project, then drain
+   * all work that crossed the barrier before it was raised. Project deletion calls this before
+   * reading worktree state, closing the approval/tick race identified in PR review.
+   */
+  async quiesceProject(projectId: string): Promise<void> {
+    this.quiescedProjects.add(projectId);
+    await this.abortProject(projectId);
   }
 
   /**
