@@ -3,12 +3,14 @@
  * The shareable truth (epics/tickets, approval, stage, PR) lives in beads. See DESIGN.md §3.
  */
 import { existsSync } from "node:fs";
+import { unlink } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { getDb, schema } from "./db";
+import { removeWorktree } from "./git/worktree";
 import { configureBeadsForRepo } from "./beads/config.mjs";
 import type { AntonDb } from "./jobs/queue";
 import type { Project } from "./types";
@@ -203,6 +205,115 @@ function healBeads(repoPath: string): boolean {
   } catch (err) {
     console.warn(`[projects] beads self-heal failed for ${repoPath}: ${String(err)}`);
     return existsSync(join(repoPath, ".beads"));
+  }
+}
+
+async function branchExists(repoPath: string, branch: string): Promise<boolean> {
+  try {
+    await execFileAsync(
+      "git",
+      ["-C", repoPath, "show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
+      { timeout: 10_000 },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function errMsg(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * Full local teardown for a project (anton-adt): abort its live work, remove every anton-created
+ * worktree + branch, delete its session logs, then drop its anton.db rows. Leaves the repo itself
+ * pristine — the only git commands run are `worktree remove/prune` and `branch -D` on anton's own
+ * branches; nothing touches the repo's working tree, tracked files, or `.beads/`.
+ *
+ * Idempotent-by-absence: a second call (or an unknown slug) throws the clear not-found error, with
+ * nothing left to clean. Fails loud mid-way: if a step leaves residue (a worktree/branch that
+ * survived removal), the project's rows are kept and the error names the residue so a retry can
+ * finish the job instead of silently orphaning it.
+ */
+export async function deleteProject(slug: string): Promise<void> {
+  const db = getDb();
+  const rows = await db
+    .select()
+    .from(schema.projects)
+    .where(eq(schema.projects.slug, slug))
+    .limit(1);
+  const project = rows[0];
+  if (!project) throw new Error(`Project not found: ${slug}`);
+
+  // 1. Stop live work first: force-abort in-flight jobs and drop queued/running rows so the
+  //    runner can't re-claim this project's work mid-teardown. Dynamic import — the service
+  //    statically imports this module for its policy resolver, so a static import would cycle.
+  try {
+    const { getRunner } = await import("./jobs/service");
+    await getRunner().abortProject(project.id);
+  } catch (e) {
+    throw new Error(`deleteProject(${slug}): aborting in-flight jobs failed: ${errMsg(e)}`);
+  }
+
+  // 2. Remove every anton-created worktree + branch recorded on this project's runs.
+  const runRows = await db
+    .select({ worktreePath: schema.runs.worktreePath, branch: schema.runs.branch })
+    .from(schema.runs)
+    .where(eq(schema.runs.projectId, project.id));
+  const worktrees = new Map<string, { path: string; branch: string }>();
+  for (const run of runRows) {
+    if (!run.worktreePath) continue;
+    // Paranoia guard: never operate on the repo's own working tree, whatever the row says.
+    if (resolve(run.worktreePath) === resolve(project.repoPath)) continue;
+    worktrees.set(run.worktreePath, { path: run.worktreePath, branch: run.branch ?? "" });
+  }
+  for (const wt of worktrees.values()) {
+    await removeWorktree(
+      { path: wt.path, branch: wt.branch, baseBranch: wt.branch, repoPath: project.repoPath },
+      { deleteBranch: Boolean(wt.branch) },
+    );
+  }
+
+  // Fail loud before touching rows: removeWorktree is best-effort internally, so verify. If a
+  // worktree or branch survived, keep the DB state so a retry can finish the cleanup instead of
+  // deleting the only record of where the residue lives.
+  const residue: string[] = [];
+  for (const wt of worktrees.values()) {
+    if (existsSync(wt.path)) residue.push(`worktree ${wt.path}`);
+    if (wt.branch && (await branchExists(project.repoPath, wt.branch))) {
+      residue.push(`branch ${wt.branch}`);
+    }
+  }
+  if (residue.length > 0) {
+    throw new Error(
+      `deleteProject(${slug}): worktree cleanup left residue (${residue.join(", ")}); ` +
+        `rows kept so a retry can complete the teardown`,
+    );
+  }
+
+  // 3. Session logs are disposable local diagnostics — delete best-effort, never block teardown.
+  const sessionRows = await db
+    .select({ logPath: schema.sessions.logPath })
+    .from(schema.sessions)
+    .where(eq(schema.sessions.projectId, project.id));
+  for (const session of sessionRows) {
+    if (!session.logPath) continue;
+    await unlink(session.logPath).catch(() => {});
+  }
+
+  // 4. Drop the project's anton.db rows atomically, children before parents (no ON DELETE
+  //    CASCADE in the schema): sessions → runs → jobs → schedules → projects.
+  try {
+    db.transaction((tx) => {
+      tx.delete(schema.sessions).where(eq(schema.sessions.projectId, project.id)).run();
+      tx.delete(schema.runs).where(eq(schema.runs.projectId, project.id)).run();
+      tx.delete(schema.jobs).where(eq(schema.jobs.projectId, project.id)).run();
+      tx.delete(schema.schedules).where(eq(schema.schedules.projectId, project.id)).run();
+      tx.delete(schema.projects).where(eq(schema.projects.id, project.id)).run();
+    });
+  } catch (e) {
+    throw new Error(`deleteProject(${slug}): deleting anton.db rows failed: ${errMsg(e)}`);
   }
 }
 

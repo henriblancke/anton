@@ -14,7 +14,9 @@
  */
 import {
   activeExecuteEpicKeys,
+  activeJobIdsForProject,
   complete,
+  deleteActiveJobsForProject,
   enqueue,
   enqueueExecuteEpicDeduped,
   getJob,
@@ -436,6 +438,53 @@ export class JobRunner {
       await new Promise((r) => setTimeout(r, 50));
     }
     this.log.info("job runner stopped");
+  }
+
+  /**
+   * Project teardown (anton-adt): force-abort every in-flight job for `projectId`, then delete its
+   * `queued`/`running` rows so nothing re-claims the project's work mid-teardown. Sweeps until no
+   * active row remains — the polling loop can lease a row between one read and its delete, so a
+   * single pass isn't a guarantee. Row deletion makes an aborted handler's settle a no-op (its
+   * UPDATE hits nothing), and settled rows (done/parked/failed) hold no lease, so they're left for
+   * the caller's full project delete.
+   *
+   * Fails loud rather than half-stopping: throws if an aborted handler doesn't unwind within the
+   * grace window or active rows keep reappearing (a racing enqueue) — the caller must not proceed
+   * to worktree/db teardown while work may still be running.
+   */
+  async abortProject(projectId: string): Promise<void> {
+    const aborted = new Set<string>();
+    for (let sweep = 0; sweep < 5; sweep++) {
+      const activeIds = await activeJobIdsForProject(this.db, projectId);
+      if (activeIds.length === 0) break;
+      for (const id of activeIds) {
+        const controller = this.inFlight.get(id);
+        if (controller) {
+          controller.abort();
+          aborted.add(id);
+        }
+      }
+      await deleteActiveJobsForProject(this.db, projectId);
+    }
+
+    // Give aborted handlers a bounded window to unwind (mirrors stop()) so teardown doesn't race
+    // a live job — e.g. removing a worktree a child process is still writing to.
+    const start = Date.now();
+    while ([...aborted].some((id) => this.inFlight.has(id)) && Date.now() - start < 10_000) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const stuck = [...aborted].filter((id) => this.inFlight.has(id));
+    if (stuck.length > 0) {
+      throw new Error(
+        `abortProject(${projectId}): aborted job(s) ${stuck.join(", ")} did not unwind in time`,
+      );
+    }
+    const leftover = await activeJobIdsForProject(this.db, projectId);
+    if (leftover.length > 0) {
+      throw new Error(
+        `abortProject(${projectId}): active job(s) ${leftover.join(", ")} still present after abort`,
+      );
+    }
   }
 
   /**
