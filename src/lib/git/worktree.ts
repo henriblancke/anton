@@ -9,8 +9,8 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { mkdir, realpath } from "node:fs/promises";
+import { dirname, join, resolve, sep } from "node:path";
+import { mkdir, readFile, realpath, rm } from "node:fs/promises";
 
 const execFileAsync = promisify(execFile);
 
@@ -150,7 +150,21 @@ export async function removeWorktree(
     try {
       await git(wt.repoPath, ["worktree", "remove", "--force", wt.path]);
     } catch {
-      // already gone / not a worktree anymore — fall through to prune.
+      // The main repository may have been moved or partially deleted before anton is asked to
+      // forget it. In that case git cannot remove the worktree, but the checkout is still ours if
+      // its .git file points into this repo's worktree administration directory. Remove only that
+      // narrowly verified orphan; never recursively delete an arbitrary path from a database row.
+      try {
+        const gitFile = await readFile(join(wt.path, ".git"), "utf8");
+        const adminRoot = resolve(wt.repoPath, ".git", "worktrees") + sep;
+        const gitDir = gitFile.match(/^gitdir:\s*(.+)\s*$/m)?.[1];
+        if (gitDir && resolve(gitDir).startsWith(adminRoot)) {
+          await rm(wt.path, { recursive: true, force: true });
+        }
+      } catch {
+        // Missing/unreadable marker means ownership cannot be proven; leave it for residue
+        // verification to report instead of risking user data.
+      }
     }
   }
 

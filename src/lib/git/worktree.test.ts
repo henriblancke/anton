@@ -115,4 +115,34 @@ suite("worktree manager (real git)", () => {
 
     await expect(removeWorktree(wt, { deleteBranch: true })).resolves.toBeUndefined();
   });
+
+  it("removes a verified orphan when the main repository metadata is gone", async () => {
+    const orphanRepo = mkdtempSync(join(tmpdir(), "anton-wt-orphan-repo-"));
+    const orphanPath = mkdtempSync(join(tmpdir(), "anton-wt-orphan-checkout-"));
+    const branch = "anton/orphan";
+    writeFileSync(
+      join(orphanPath, ".git"),
+      `gitdir: ${join(orphanRepo, ".git", "worktrees", "anton-orphan")}\n`,
+    );
+    rmSync(orphanRepo, { recursive: true, force: true });
+
+    await removeWorktree({ path: orphanPath, branch, baseBranch: branch, repoPath: orphanRepo });
+
+    expect(existsSync(orphanPath)).toBe(false);
+  });
+
+  it("leaves an arbitrary directory untouched when orphan ownership cannot be proven", async () => {
+    const arbitraryPath = mkdtempSync(join(tmpdir(), "anton-wt-unverified-"));
+    writeFileSync(join(arbitraryPath, "keep.txt"), "user data\n");
+
+    await removeWorktree({
+      path: arbitraryPath,
+      branch: "anton/unverified",
+      baseBranch: "anton/unverified",
+      repoPath: join(arbitraryPath, "missing-repo"),
+    });
+
+    expect(existsSync(join(arbitraryPath, "keep.txt"))).toBe(true);
+    rmSync(arbitraryPath, { recursive: true, force: true });
+  });
 });
