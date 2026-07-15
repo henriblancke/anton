@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bead } from "./beads/bd";
 import type { Project } from "./types";
 
@@ -16,6 +16,12 @@ vi.mock("./beads/bd", async () => {
 });
 
 const { deriveStage, getBoard } = await import("./board");
+const { resetIssueSnapshots } = await import("./beads/snapshot");
+
+beforeEach(() => {
+  resetIssueSnapshots();
+  listMock.mockReset();
+});
 
 function makeBead(overrides: Partial<Bead> & { id: string; title: string }): Bead {
   return {

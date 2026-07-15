@@ -4,6 +4,7 @@
  * Mirrors board.ts's read + section-parsing patterns — see DESIGN.md §2/§3.
  */
 import { beads, type Bead } from "./beads/bd";
+import { allIssues } from "./beads/issues";
 import { deriveStage } from "./board";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
 import type { Project, TicketFilters, TicketRow } from "./types";
@@ -48,20 +49,7 @@ export function createdMeta(bead: Bead): {
 }
 
 export async function listAllBeads(project: Project): Promise<Bead[]> {
-  try {
-    return await beads.list(project.repoPath, ["--status", "all"]);
-  } catch {
-    const [open, closed] = await Promise.all([
-      beads.list(project.repoPath),
-      beads.list(project.repoPath, ["--status", "closed"]),
-    ]);
-    const seen = new Set<string>();
-    return [...open, ...closed].filter((b) => {
-      if (seen.has(b.id)) return false;
-      seen.add(b.id);
-      return true;
-    });
-  }
+  return allIssues(project.repoPath);
 }
 
 function toTicketRow(bead: Bead, epic: Bead | undefined): TicketRow {

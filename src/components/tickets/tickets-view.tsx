@@ -21,7 +21,15 @@ import {
   type TicketSort,
 } from "@/components/tickets/tickets-utils";
 
-export function TicketsView({ slug }: { slug: string }) {
+export function TicketsView({
+  slug,
+  initialTickets,
+  initialQueryString,
+}: {
+  slug: string;
+  initialTickets: TicketRow[];
+  initialQueryString: string;
+}) {
   const searchParams = useSearchParams();
   const filters = filtersFromSearchParams(searchParams);
   const queryString = ticketsQueryString(filters);
@@ -33,17 +41,22 @@ export function TicketsView({ slug }: { slug: string }) {
     key: string;
     tickets: TicketRow[] | null;
     error: string | null;
-  }>({ key: queryString, tickets: null, error: null });
+  }>({ key: initialQueryString, tickets: initialTickets, error: null });
   const [attempt, setAttempt] = useState(0);
   const [openTicketId, setOpenTicketId] = useState<string | null>(null);
 
   if (state.key !== queryString) {
-    setState({ key: queryString, tickets: null, error: null });
+    setState({
+      key: queryString,
+      tickets: initialQueryString === queryString ? initialTickets : null,
+      error: null,
+    });
   }
   const tickets = state.tickets;
   const error = state.error;
 
   useEffect(() => {
+    if (attempt === 0 && initialQueryString === queryString) return;
     let cancelled = false;
 
     async function load() {
@@ -67,7 +80,7 @@ export function TicketsView({ slug }: { slug: string }) {
     return () => {
       cancelled = true;
     };
-  }, [slug, queryString, attempt]);
+  }, [slug, queryString, attempt, initialQueryString]);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
