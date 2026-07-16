@@ -223,7 +223,10 @@ export async function leaseDue(
     // genuinely occupying its bucket, so it must count toward the cap — otherwise a spare-capacity
     // tick would lease a second job for a project already at its concurrency limit. The two
     // conditions are OR'd in one query so a job that's both leased-and-unexpired and in-flight is
-    // counted once, not twice. Only gated buckets are tracked.
+    // counted once, not twice. Only gated buckets are tracked. Buckets are keyed by (type, project)
+    // so a cap on one job type — execute-epic concurrency, or a disabled schedule's cap-0 — never
+    // counts against a different type sharing the same project (anton-7l7).
+    const bucketKey = (type: string, projectId: string | null) => `${type}\0${projectId ?? ""}`;
     const liveLoad =
       excludeIds.length > 0
         ? or(gt(schema.jobs.leaseExpiresAt, nowDate), inArray(schema.jobs.id, excludeIds))
@@ -235,7 +238,7 @@ export async function leaseDue(
     const usedByBucket = new Map<string, number>();
     for (const row of active) {
       if (capOf(row as JobRow) === Infinity) continue;
-      const key = row.projectId ?? "";
+      const key = bucketKey(row.type, row.projectId);
       usedByBucket.set(key, (usedByBucket.get(key) ?? 0) + 1);
     }
 
@@ -247,7 +250,7 @@ export async function leaseDue(
         picked.push(job);
         continue;
       }
-      const key = job.projectId ?? "";
+      const key = bucketKey(job.type, job.projectId);
       const used = usedByBucket.get(key) ?? 0;
       if (used >= cap) continue; // bucket at capacity — leave queued, try the next candidate
       usedByBucket.set(key, used + 1);
@@ -495,4 +498,25 @@ export async function activeExecuteEpicKeys(db: AntonDb): Promise<Set<string>> {
     if (epicBeadId) keys.add(`${row.projectId ?? ""}::${epicBeadId}`);
   }
   return keys;
+}
+
+/** Key a job's schedule gate by `(type, projectId)` — the grain a `schedules` row is keyed on. */
+export function scheduleGateKey(type: string, projectId: string | null | undefined): string {
+  return `${type}\0${projectId ?? ""}`;
+}
+
+/**
+ * The set of `scheduleGateKey(type, projectId)` for schedules that are currently DISABLED. The
+ * runner uses this to gate at *claim* (anton-7l7): a disabled schedule stops its already-queued or
+ * backoff/quota-rescheduled jobs from being leased, not just new enqueues. Mirrors the autonomy
+ * master-switch, but keyed on the schedule instead of a per-project policy, so it covers every
+ * scheduled job type (review-fix, nightly-stringer, orphan-grooming). Re-enabling clears the key,
+ * so the still-queued job resumes on the next tick.
+ */
+export async function disabledScheduleKeys(db: AntonDb): Promise<Set<string>> {
+  const rows = await db
+    .select({ type: schema.schedules.type, projectId: schema.schedules.projectId })
+    .from(schema.schedules)
+    .where(eq(schema.schedules.enabled, false));
+  return new Set(rows.map((r) => scheduleGateKey(r.type, r.projectId)));
 }

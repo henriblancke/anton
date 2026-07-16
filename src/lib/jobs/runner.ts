@@ -17,6 +17,7 @@ import {
   activeJobIdsForProject,
   complete,
   deleteActiveJobsForProject,
+  disabledScheduleKeys,
   enqueue,
   enqueueExecuteEpicDeduped,
   getJob,
@@ -27,6 +28,7 @@ import {
   renewLease,
   reschedule,
   resumeJob,
+  scheduleGateKey,
   systemClock,
   type AntonDb,
   type Clock,
@@ -294,6 +296,13 @@ export class JobRunner {
     const capacity = this.config.maxConcurrent - this.inFlight.size;
     if (capacity <= 0) return 0;
 
+    // Schedule master-switch (anton-7l7): a DISABLED schedule caps its jobs at 0, so an
+    // already-queued or backoff/quota-rescheduled review-fix (or any scheduled type) is NOT leased
+    // while the toggle is off. Gating at *claim* — not just at the scheduler's enqueue — is what
+    // makes disabling actually stop in-flight-but-queued work; re-enabling clears the key and the
+    // still-queued job resumes on the next tick. Read every tick so a mid-run toggle takes effect.
+    const disabledSchedules = await disabledScheduleKeys(this.db);
+
     // With a policy resolver, gate execute-epic concurrency per project. Precompute each pending
     // project's cap so leaseDue can decide synchronously; other job types stay ungated (Infinity).
     let policyCapOf: ((job: JobRow) => number) | undefined;
@@ -311,10 +320,11 @@ export class JobRunner {
           ? (concByProject.get(job.projectId ?? "") ?? DEFAULT_CONFIG.maxConcurrent)
           : Infinity;
     }
-    const capOf = (job: JobRow) =>
-      job.projectId && this.quiescedProjects.has(job.projectId)
-        ? 0
-        : (policyCapOf?.(job) ?? Infinity);
+    const capOf = (job: JobRow) => {
+      if (job.projectId && this.quiescedProjects.has(job.projectId)) return 0;
+      if (disabledSchedules.has(scheduleGateKey(job.type, job.projectId))) return 0;
+      return policyCapOf?.(job) ?? Infinity;
+    };
 
     const jobs = await leaseDue(this.db, this.clock, {
       leaseMs: this.config.leaseMs,
