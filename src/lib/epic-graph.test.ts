@@ -192,6 +192,37 @@ describe("standaloneBlockers", () => {
     ];
     expect(standaloneBlockers(beads, "S")).toEqual(["B"]);
   });
+
+  it("rolls an epic-child blocker up to its parent epic and gates on the epic", () => {
+    // S blocks-depends on C, a child of epic E. C closes the moment its code commits, but that code
+    // only lands when E's PR merges (E reaches done). While E is in-review the child is done yet the
+    // prerequisite hasn't landed — so S must stay blocked on E, matching computeEpicGraph's rollup.
+    const beads = [
+      standalone("S", { dependencies: [blocks("S", "C")] }),
+      epic("E", { labels: ["stage:in-review"] }),
+      ticket("C", "E", { status: "closed" }),
+    ];
+    expect(standaloneBlockers(beads, "S")).toEqual(["E"]);
+  });
+
+  it("clears the epic-child blocker only once the parent epic itself is done", () => {
+    const beads = [
+      standalone("S", { dependencies: [blocks("S", "C")] }),
+      epic("E", { status: "closed" }),
+      ticket("C", "E", { status: "closed" }),
+    ];
+    expect(standaloneBlockers(beads, "S")).toEqual([]);
+  });
+
+  it("dedupes two epic-child blockers of the same epic to one epic id", () => {
+    const beads = [
+      standalone("S", { dependencies: [blocks("S", "C1"), blocks("S", "C2")] }),
+      epic("E", { labels: ["stage:in-review"] }),
+      ticket("C1", "E", { status: "closed" }),
+      ticket("C2", "E", { status: "closed" }),
+    ];
+    expect(standaloneBlockers(beads, "S")).toEqual(["E"]);
+  });
 });
 
 describe("epicStandaloneBlockers", () => {
