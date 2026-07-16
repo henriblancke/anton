@@ -17,6 +17,8 @@ function makeItem(over: Partial<StandaloneItem> = {}): StandaloneItem {
     assignee: null,
     createdAt: "",
     createdBy: null,
+    blockedBy: [],
+    ready: true,
     unread: false,
     ...over,
   };
@@ -50,6 +52,15 @@ describe("StandaloneChip", () => {
     expect(html).not.toMatch(/Approve &amp; run/);
     // An implementing chip shows the live "working" indicator instead.
     expect(html).toContain("working");
+  });
+
+  it("hides the run affordance and shows a blocked chip while a prerequisite is open", () => {
+    const html = renderToStaticMarkup(
+      <StandaloneChip slug="anton" item={makeItem({ ready: false, blockedBy: ["t-9"] })} />,
+    );
+    // A blocked standalone target can't be approved (the route 409s), so no Approve & run.
+    expect(html).not.toMatch(/Approve/);
+    expect(html).toContain("blocked by t-9");
   });
 
   it("links a PR chip when the standalone item is in review", () => {

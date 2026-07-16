@@ -8,7 +8,7 @@ import type { StandaloneItem } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { CopyButton } from "@/components/ui/copy-button";
-import { MetaChip, PrLink, RiskChip } from "@/components/atoms";
+import { BlockedChip, MetaChip, PrLink, RiskChip } from "@/components/atoms";
 import { TYPE_RAIL, TYPE_TEXT, agentDotClass } from "@/components/board/board-utils";
 import { TypeBadge, TypeIcon } from "@/components/board/type-language";
 
@@ -60,7 +60,9 @@ export function StandaloneChip({
     }
   }
 
-  const showApproveRun = item.stage === "backlog" && !approved;
+  // Gate on readiness, not just stage: the approve route rejects a still-blocked standalone target
+  // with 409, so a chip with open blockers must not offer Approve & run (mirrors the epic card).
+  const showApproveRun = item.stage === "backlog" && !approved && item.ready;
 
   return (
     <div
@@ -115,6 +117,7 @@ export function StandaloneChip({
         </CopyButton>
         {item.agent && <MetaChip dotClass={agentDotClass(item.agent)}>{item.agent}</MetaChip>}
         {item.risk && <RiskChip risk={item.risk} />}
+        {item.stage === "backlog" && <BlockedChip blockedBy={item.blockedBy} />}
         {showApproveRun && (
           <Button
             size="xs"

@@ -291,6 +291,50 @@ describe("getBoard", () => {
     expect(blocker.rank).toBeLessThan(blocked.rank);
   });
 
+  it("marks an epic blocked by an open standalone task not-ready (the rollup drops that edge)", async () => {
+    // A parentless task blocks the epic. computeEpicGraph's rollup can't attribute a standalone
+    // blocker to an epic, so it drops the edge — the board must fold it back in via
+    // epicStandaloneBlockers, matching the readiness the approve route enforces (409 while open).
+    const blockerTask = makeBead({ id: "task-block", title: "Prereq task", issue_type: "task" });
+    const epic = makeBead({
+      id: "epic-x",
+      title: "Depends on a loose task",
+      issue_type: "epic",
+      dependencies: [{ issue_id: "epic-x", depends_on_id: "task-block", type: "blocks" }],
+    });
+
+    listMock.mockResolvedValue([epic, blockerTask]);
+
+    const board = await getBoard(project);
+
+    const built = board.columns.backlog.find((e) => e.id === "epic-x")!;
+    expect(built.ready).toBe(false);
+    expect(built.blockedBy).toEqual(["task-block"]);
+  });
+
+  it("carries ready/blockedBy onto a standalone item so a blocked chip can't be approved", async () => {
+    // Two parentless tasks: task-b blocks task-a. task-a is a standalone run target whose readiness
+    // isn't in the epic rollup, so the board derives it from its own blocks edge (standaloneBlockers).
+    const blocker = makeBead({ id: "task-b", title: "Prereq", issue_type: "task" });
+    const blocked = makeBead({
+      id: "task-a",
+      title: "Blocked standalone",
+      issue_type: "task",
+      dependencies: [{ issue_id: "task-a", depends_on_id: "task-b", type: "blocks" }],
+    });
+
+    listMock.mockResolvedValue([blocked, blocker]);
+
+    const board = await getBoard(project);
+
+    const a = board.standalone.backlog.find((i) => i.id === "task-a")!;
+    const b = board.standalone.backlog.find((i) => i.id === "task-b")!;
+    expect(a.ready).toBe(false);
+    expect(a.blockedBy).toEqual(["task-b"]);
+    expect(b.ready).toBe(true);
+    expect(b.blockedBy).toEqual([]);
+  });
+
   it("falls back to merging open + closed lists when --status all fails", async () => {
     const openEpic = makeBead({ id: "epic-open", title: "Open Epic", issue_type: "epic" });
     const closedEpic = makeBead({

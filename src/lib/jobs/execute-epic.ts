@@ -10,7 +10,7 @@ import { computeEpicGraph, epicStandaloneBlockers, standaloneBlockers } from "..
 import { loadAgentPrompt } from "../claude/agent-prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
 import { runClaude, type ClaudeEvent } from "../claude/driver";
-import { commitAll, openPullRequest } from "../git/ops";
+import { commitAll, openPullRequest, resolveFreshBase } from "../git/ops";
 import { createWorktree, removeWorktree } from "../git/worktree";
 import { getProjectById, getProjectSettings, type ProjectSettings } from "../projects";
 import { resolveOperator } from "../operator";
@@ -122,6 +122,15 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     }
 
     try {
+      // A standalone target that already committed on a prior attempt carries stage:in-review and
+      // is skipped straight to the PR step below — its agent never runs again on this resume. Both
+      // the allowlist gate here and the ticket loop share this "won't run" predicate so neither
+      // acts on a resume marker: gating on a since-disabled agent would park a retry that only has
+      // the (agent-free) PR step left to do.
+      const inReview = LABELS.stage("in-review");
+      const isResumeSkipped = (t: Bead) =>
+        t.status === "closed" || (standaloneRun && (t.labels?.includes(inReview) ?? false));
+
       // 0. Dispatch honors the active-agents allowlist (anton-dm7). PARK, don't skip: running
       // the ticket with the default agent would silently produce work the operator disabled the
       // specialist for, and skipping it would open the epic's single PR incomplete. Parking is
@@ -129,7 +138,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // then resumes; tickets and settings are re-read on every attempt. Checked before any
       // claim/worktree/session work so a run never half-executes into a config problem.
       const inactive = inactiveAgentTickets(
-        tickets.filter((t) => t.status !== "closed"),
+        tickets.filter((t) => !isResumeSkipped(t)),
         settings.agents,
       );
       if (inactive.length > 0) {
@@ -140,11 +149,17 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         );
       }
 
-      // 1. Warm worktree (idempotent — reused on resume).
+      // 1. Warm worktree (idempotent — reused on resume). Branch off the FRESHEST base
+      // (anton-x3o): resolveFreshBase fetches origin/<base> and returns `origin/<base>` so a run
+      // whose local base is stale still starts at the remote tip; it's best-effort and falls back
+      // to the local base offline. On resume this is moot — createWorktree short-circuits to the
+      // existing worktree, so the base is never re-applied mid-run. Note the PR `base` below stays
+      // the plain branch name (gh needs a branch, not a remote-tracking ref).
+      const baseBranch = settings.baseBranch ?? project.defaultBranch;
       const worktree = await createWorktree({
         repoPath: repo,
         branch,
-        baseBranch: settings.baseBranch ?? project.defaultBranch,
+        baseBranch: await resolveFreshBase(repo, baseBranch),
         warm: true,
       });
       await updateRun(db, clock, runId, {
@@ -171,7 +186,6 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //    moves it to stage:in-review instead — that label is both the board's "in review" state
       //    and the persisted resume marker, so a retry after a failed PR step skips straight to
       //    the PR step here rather than re-running claude/tests/commit on already-committed work.
-      const inReview = LABELS.stage("in-review");
       for (const ticket of orderTickets(tickets, all)) {
         if (ticket.status === "closed") continue;
         if (standaloneRun && (ticket.labels?.includes(inReview) ?? false)) {
@@ -210,7 +224,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       const pr = await openPullRequest({
         repoPath: repo,
         branch: worktree.branch,
-        base: settings.baseBranch ?? project.defaultBranch,
+        base: baseBranch,
         title: `${target.title} (${epicBeadId})`,
         body: prBody(target, tickets),
       });

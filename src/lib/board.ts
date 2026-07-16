@@ -4,7 +4,7 @@
 import { compareBacklogEpics } from "@/components/board/board-utils";
 import { beads, getSyncStatus, getSyncStatusToken, type Bead } from "./beads/bd";
 import { allIssues } from "./beads/issues";
-import { computeEpicGraph } from "./epic-graph";
+import { computeEpicGraph, epicStandaloneBlockers, standaloneBlockers } from "./epic-graph";
 import { issueSnapshotVersion } from "./beads/snapshot";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
 import { parseAcceptance, parseGoal, toEpic, toStandaloneItem, toTicket } from "./ticket-view";
@@ -77,12 +77,17 @@ export async function getBoard(project: Project): Promise<Board> {
     const children = childrenByEpic.get(epic.id) ?? [];
     const tickets = children.map(toTicket);
     const node = graphNodes.get(epic.id);
+    // The epic-graph rollup DROPS any blocks edge whose blocker is a parentless standalone task/bug
+    // (epicOf can't attribute it to an epic). Fold those back in — the same set the approve route
+    // gates on — so the board's blockedBy/ready match what approval will actually enforce and the
+    // card doesn't show a not-ready epic as approvable.
+    const blockedBy = [...(node?.blockedBy ?? []), ...epicStandaloneBlockers(allBeads, epic.id)];
     const built = toEpic(epic, {
       goal: parseGoal(epic.description),
       acceptance: parseAcceptance(epic),
       tickets,
-      blockedBy: node?.blockedBy ?? [],
-      ready: node?.ready ?? true,
+      blockedBy,
+      ready: blockedBy.length === 0,
       rank: node?.rank ?? 0,
     });
     columns[built.stage].push(built);
@@ -96,7 +101,10 @@ export async function getBoard(project: Project): Promise<Board> {
   // here so the board never surfaces an item it can't actually run.
   const orphanTasks = taskBeads.filter((t) => !claimedTaskIds.has(t.id) && beads.isRunTarget(t));
   for (const task of orphanTasks) {
-    const item = toStandaloneItem(task);
+    // A standalone target never appears in the epic-graph rollup, so derive its blockers from its
+    // own `blocks` edges — the same set the approve route + runner gate on. Feeds the chip's
+    // ready/blockedBy so it can hide Approve & run and show a blocked chip while a prerequisite is open.
+    const item = toStandaloneItem(task, standaloneBlockers(allBeads, task.id));
     standalone[item.stage].push(item);
   }
 

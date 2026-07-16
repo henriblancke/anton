@@ -91,8 +91,10 @@ export function isUnreadBug(bead: Bead): boolean {
 }
 
 /** Map a parentless task/bug to the shared StandaloneItem view model (a board chip). Carries the
- * bead's real issue_type so the type language can tint it; approval + unread drive the chip UI. */
-export function toStandaloneItem(bead: Bead): StandaloneItem {
+ * bead's real issue_type so the type language can tint it; approval + unread drive the chip UI.
+ * `blockedBy` is the item's open blockers (standaloneBlockers, computed in board.ts) — the chip
+ * gates its Approve & run affordance on `ready` the same way the epic card does. */
+export function toStandaloneItem(bead: Bead, blockedBy: string[] = []): StandaloneItem {
   return {
     id: bead.id,
     title: bead.title,
@@ -105,6 +107,8 @@ export function toStandaloneItem(bead: Bead): StandaloneItem {
     size: labelValue(bead.labels, "size"),
     ...createdMeta(bead),
     prRef: bead.external_ref,
+    blockedBy,
+    ready: blockedBy.length === 0,
     unread: isUnreadBug(bead),
   };
 }

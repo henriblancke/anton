@@ -79,6 +79,11 @@ export interface StandaloneItem {
   createdBy: string | null; // who created the bead
   prRef?: string; // bead external_ref, if any
   prUrl?: string; // browser URL for the PR, resolved from prRef + the repo's origin remote
+  // Open blockers from the standalone target's own `blocks` edges (standaloneBlockers), attached in
+  // board.ts. A standalone item never appears in the epic-graph rollup, so its readiness is derived
+  // directly — mirroring the epic card's blockedBy/ready so the chip can gate approval the same way.
+  blockedBy: string[]; // blocker ids that currently block this item (open blockers); empty when ready
+  ready: boolean; // no open blockers — mirrors what the approve route enforces
   /** A self-filed bug (source:<x> label) still untouched (backlog, unclaimed, not approved) — it
    * wants a human's triage before it runs. Derived each build; there is no stored read-state. */
   unread: boolean;

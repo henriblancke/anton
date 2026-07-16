@@ -3,7 +3,7 @@
 import { useState } from "react";
 import Link from "next/link";
 import { toast } from "sonner";
-import { CircleCheckIcon, GitPullRequestIcon, LockIcon } from "lucide-react";
+import { CircleCheckIcon, GitPullRequestIcon } from "lucide-react";
 
 import type { Epic } from "@/lib/types";
 import { Button } from "@/components/ui/button";
@@ -11,27 +11,13 @@ import { ConfirmDeleteButton } from "@/components/ui/confirm-delete-button";
 import { cn } from "@/lib/utils";
 import { STAGE_INSET_SHADOW, agentDotClass, ticketProgress } from "@/components/board/board-utils";
 import { TypeBadge, TypeIcon } from "@/components/board/type-language";
-import { MetaChip, PrLink, RiskChip } from "@/components/atoms";
+import { BlockedChip, MetaChip, PrLink, RiskChip } from "@/components/atoms";
 import { CopyButton } from "@/components/ui/copy-button";
 
 /** Short PR label from a bead external-ref: `gh-218` / a URL ending in `/218` → `#218`. */
 function prLabel(ref: string): string {
   const m = /(\d+)\s*$/.exec(ref);
   return m ? `#${m[1]}` : ref;
-}
-
-/** "blocked by <id>" chip — marks an epic the runtime's bd-ready won't pick up yet. Shows the
- * first open blocker with a "+N" when there are several; the full list rides in the title. */
-function BlockedChip({ blockedBy }: { blockedBy: string[] }) {
-  if (blockedBy.length === 0) return null;
-  const [first, ...rest] = blockedBy;
-  const label = rest.length > 0 ? `blocked by ${first} +${rest.length}` : `blocked by ${first}`;
-  return (
-    <MetaChip tone="blocked">
-      <LockIcon className="size-2.5" aria-hidden="true" />
-      <span title={`blocked by ${blockedBy.join(", ")}`}>{label}</span>
-    </MetaChip>
-  );
 }
 
 export function EpicCard({
