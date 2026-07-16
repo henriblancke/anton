@@ -6,7 +6,12 @@
  */
 import { describe, expect, it } from "vitest";
 import type { Bead, BeadDep } from "./beads/bd";
-import { computeEpicGraph } from "./epic-graph";
+import { computeEpicGraph, standaloneBlockers } from "./epic-graph";
+
+/** A parentless task/bug run target (epic-of-one) — no parent, so it never rolls up to an epic. */
+function standalone(id: string, extra: Partial<Bead> = {}): Bead {
+  return { id, title: id, status: "open", issue_type: "task", ...extra };
+}
 
 function epic(id: string, extra: Partial<Bead> = {}): Bead {
   return { id, title: id, status: "open", issue_type: "epic", ...extra };
@@ -143,5 +148,48 @@ describe("computeEpicGraph", () => {
     expect(node(g, "E1").rank).toBe(2);
     expect(node(g, "E3").ready).toBe(true);
     expect(node(g, "E2").ready).toBe(false);
+  });
+});
+
+describe("standaloneBlockers", () => {
+  it("returns a standalone target's OPEN blockers from its own blocks edges", () => {
+    // S is a parentless task blocked by another parentless task B — B never appears in the epic
+    // graph, so its readiness must be derived here directly from the blocks edge.
+    const beads = [standalone("S", { dependencies: [blocks("S", "B")] }), standalone("B")];
+    expect(standaloneBlockers(beads, "S")).toEqual(["B"]);
+    // The blocker itself has no blockers.
+    expect(standaloneBlockers(beads, "B")).toEqual([]);
+  });
+
+  it("counts a blocker only while it is not done (closed → ready)", () => {
+    const beads = [
+      standalone("S", { dependencies: [blocks("S", "B")] }),
+      standalone("B", { status: "closed" }),
+    ];
+    expect(standaloneBlockers(beads, "S")).toEqual([]);
+  });
+
+  it("ignores related / discovered-from edges — only blocks gates a standalone", () => {
+    const beads = [
+      standalone("S", {
+        dependencies: [dep("S", "X", "related"), dep("S", "Y", "discovered-from")],
+      }),
+      standalone("X"),
+      standalone("Y"),
+    ];
+    expect(standaloneBlockers(beads, "S")).toEqual([]);
+  });
+
+  it("treats an unknown blocker (absent from the list) as still open — fail safe", () => {
+    const beads = [standalone("S", { dependencies: [blocks("S", "GONE")] })];
+    expect(standaloneBlockers(beads, "S")).toEqual(["GONE"]);
+  });
+
+  it("dedupes multiple edges to the same open blocker", () => {
+    const beads = [
+      standalone("S", { dependencies: [blocks("S", "B"), blocks("S", "B")] }),
+      standalone("B"),
+    ];
+    expect(standaloneBlockers(beads, "S")).toEqual(["B"]);
   });
 });

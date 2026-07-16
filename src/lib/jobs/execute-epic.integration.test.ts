@@ -18,6 +18,7 @@ import * as schema from "../db/schema";
 import { getJob, park, resumeJob, type Clock } from "./queue";
 import { JobRunner } from "./runner";
 import { makeExecuteEpicHandler } from "./execute-epic";
+import { deriveStage } from "../ticket-view";
 import { resetOperatorCache } from "../operator";
 
 function has(cmd: string): boolean {
@@ -332,6 +333,98 @@ process.exit(0);`,
       (s) => s.beadId === bugId,
     );
     expect(sessions).toHaveLength(1);
+  }, 60_000);
+
+  it("keeps a standalone target OPEN (not Done) when the PR step fails after committing", async () => {
+    // anton-cmz review: a standalone's single ticket close is deferred until its PR opens. If
+    // push/`gh pr create` fails after the commit, the bead must NOT be left closed — that would
+    // put it in Done with no PR ref and no visible retry state (a false green). It stays in
+    // implementing (in_progress, not closed) so the failed run is honest and resumable.
+    const bugId = await beads.create(repo, {
+      title: "PR step will fail",
+      type: "bug",
+      acceptance: "work file exists",
+      description: "## Goal\nProve the deferred close.",
+    });
+    await beads.approve(repo, bugId);
+
+    // Fake gh that fails outright — `gh pr create` (and `gh pr view`) exit non-zero, so
+    // openPullRequest throws after the branch is pushed and the ticket work is committed.
+    const failingGh = writeBin(binDir, "gh-fail", `console.error('gh boom');process.exit(1);`);
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = failingGh;
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    process.env.ANTON_CLAUDE_BIN = successClaude;
+    let jobId: string;
+    try {
+      jobId = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: bugId },
+      });
+      await runner.tickOnce();
+      await runner.whenIdle();
+
+      // The run failed at the PR step.
+      const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === bugId)!;
+      expect(run.status).toBe("failed");
+
+      // The bead is NOT closed and carries no PR ref — it did not silently land in Done.
+      const bug = await beads.show(repo, bugId);
+      expect(bug.status).not.toBe("closed");
+      expect(bug.external_ref ?? null).toBeNull();
+      // Its committed work is real, so it stays flagged as in-flight (implementing), not Done.
+      expect(deriveStage(bug)).not.toBe("done");
+      expect(deriveStage(bug)).toBe("implementing");
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      // Failed runs reschedule with backoff; park so a later clock-advancing tick can't re-dispatch.
+      if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  }, 60_000);
+
+  it("parks a standalone target blocked by an open prerequisite (readiness gate at job start)", async () => {
+    // anton-cmz review: a standalone's blockers aren't in the epic-graph rollup, so the runner
+    // derives them from its own `blocks` edges. An open blocker must PARK the run (poison), not
+    // execute — the same gate the approve route enforces, re-checked at lease time.
+    const blocker = await beads.create(repo, { title: "Runner blocker", type: "task" });
+    const dependent = await beads.create(repo, {
+      title: "Runner dependent",
+      type: "bug",
+      acceptance: "x",
+    });
+    await beads.link(repo, dependent, blocker, "blocks");
+    await beads.approve(repo, dependent);
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    process.env.ANTON_CLAUDE_BIN = successClaude;
+    const jobId = await runner.enqueue({
+      type: "execute-epic",
+      projectId,
+      payload: { projectId, epicBeadId: dependent },
+    });
+    await runner.tickOnce();
+    await runner.whenIdle();
+
+    // Poison-parked (blocked target refused), and the bead was never touched (not claimed/closed).
+    expect((await getJob(tdb.db, jobId))?.status).toBe("parked");
+    const bead = await beads.show(repo, dependent);
+    expect(bead.status).not.toBe("closed");
+    expect(bead.assignee ?? null).toBeNull();
   }, 60_000);
 
   it("poison-parks a bead that was found but isn't runnable, with an honest (not 'not found') reason", async () => {

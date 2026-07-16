@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getBoard } from "@/lib/board";
+import { standaloneBlockers } from "@/lib/epic-graph";
 import { refreshAllIssues } from "@/lib/beads/issues";
 import { beads } from "@/lib/beads/bd";
 import { enqueueExecuteEpic } from "@/lib/jobs/service";
@@ -50,8 +51,9 @@ export async function POST(
   const epic = STAGES.map((stage) => board.columns[stage].find((e) => e.id === epicId)).find(
     Boolean,
   );
-  // A standalone task/bug (epic-of-one) lives in `standalone`, not `columns` — it has no blockers,
-  // so it needs no readiness gate, but it must still be found here or a valid run target 404s.
+  // A standalone task/bug (epic-of-one) lives in `standalone`, not `columns`, so it carries no
+  // epic-graph readiness — but it can still hold cross-item `blocks` edges. It must be found here
+  // or a valid run target 404s, and it must be gated on its own open blockers below.
   const standalone = epic
     ? undefined
     : STAGES.map((stage) => board.standalone[stage].find((e) => e.id === epicId)).find(Boolean);
@@ -63,6 +65,19 @@ export async function POST(
       { error: `Epic is blocked by ${epic.blockedBy.join(", ")}` },
       { status: 409 },
     );
+  }
+  // A standalone target's blockers aren't in the epic rollup, so derive them from its own `blocks`
+  // edges off the fresh read above. Approving enqueues immediately, so a still-blocked standalone
+  // must be rejected here — else we'd label + enqueue work `bd ready` would keep blocked, and the
+  // runner's epic-only readiness check (a no-op for standalone) wouldn't catch it either.
+  if (standalone) {
+    const blockers = standaloneBlockers(allBeads, epicId);
+    if (blockers.length > 0) {
+      return NextResponse.json(
+        { error: `${epicId} is blocked by ${blockers.join(", ")}` },
+        { status: 409 },
+      );
+    }
   }
 
   await beads.approve(project.repoPath, epicId);

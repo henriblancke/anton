@@ -6,7 +6,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { beads, LABELS, type Bead } from "../beads/bd";
-import { computeEpicGraph } from "../epic-graph";
+import { computeEpicGraph, standaloneBlockers } from "../epic-graph";
 import { loadAgentPrompt } from "../claude/agent-prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
 import { runClaude, type ClaudeEvent } from "../claude/driver";
@@ -71,17 +71,20 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       throw new PoisonEpic(`target ${epicBeadId} is not approved — refusing to execute`);
     }
 
-    // Re-check the same epic→epic readiness gate the approval route enforces, now at job start.
-    // Approval only guarantees readiness at approval time; between then and this lease a cross-epic
-    // `blocks` edge could have been added or pulled in via Dolt sync (a shared board), leaving this
-    // job queued behind a blocker that's no longer done. Derive readiness from the fresh `all` read
-    // above (same source computeEpicGraph consumes at approval) and PARK if a blocker is open —
-    // starting a still-blocked epic would violate the sequence. Recoverable: once the blocker
-    // completes, resuming the parked job re-reads beads and passes this gate.
-    const epicNode = computeEpicGraph(all).epics.find((n) => n.id === epicBeadId);
-    if (epicNode && !epicNode.ready) {
+    // Re-check the same readiness gate the approval route enforces, now at job start. Approval only
+    // guarantees readiness at approval time; between then and this lease a `blocks` edge could have
+    // been added or pulled in via Dolt sync (a shared board), leaving this job queued behind a
+    // blocker that's no longer done. An epic's blockers come from the epic-graph rollup; a
+    // standalone task/bug (epic-of-one) never appears there, so derive its blockers from its own
+    // `blocks` edges. Either way, derive from the fresh `all` read above and PARK if a blocker is
+    // open — starting still-blocked work would violate the sequence. Recoverable: once the
+    // blocker completes, resuming the parked job re-reads beads and passes this gate.
+    const blockers = beads.isEpic(target)
+      ? (computeEpicGraph(all).epics.find((n) => n.id === epicBeadId)?.blockedBy ?? [])
+      : standaloneBlockers(all, epicBeadId);
+    if (blockers.length > 0) {
       throw new PoisonEpic(
-        `epic ${epicBeadId} is blocked by ${epicNode.blockedBy.join(", ")} — refusing to execute; ` +
+        `${epicBeadId} is blocked by ${blockers.join(", ")} — refusing to execute; ` +
           `resume the run once the blocker(s) complete`,
       );
     }
@@ -89,7 +92,8 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     // An epic runs all its children into one PR; a standalone task/bug IS its own single ticket
     // (an epic-of-one). The rest of the pipeline — worktree, per-ticket claude→tests→commit→close,
     // one PR — is identical either way, so the standalone case is just a one-element ticket list.
-    const tickets = beads.isEpic(target) ? childrenOf(all, epicBeadId) : [target];
+    const standaloneRun = !beads.isEpic(target);
+    const tickets = standaloneRun ? [target] : childrenOf(all, epicBeadId);
     if (tickets.length === 0) throw new PoisonEpic(`epic ${epicBeadId} has no tickets`);
 
     // Branches keep the `prefix/id` slash (git convention); only the worktree *path* segment is
@@ -156,6 +160,11 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         .catch((e) => console.error(`[execute-epic] claim sync failed for ${epicBeadId}`, e));
 
       // 3. Per ticket: claude → tests → commit → close. Skip already-closed (resume).
+      // For a standalone run the single ticket IS the target; DEFER its close until the PR opens
+      // (below). Closing it here would drop the bead into Done before a PR exists, so a failed
+      // push/`gh pr create` would strand it in Done with no PR ref and no visible retry state (a
+      // false green). An epic closes its children now as before — the epic bead itself is never
+      // closed here, so an epic never hits that trap.
       for (const ticket of orderTickets(tickets, all)) {
         if (ticket.status === "closed") continue;
         await runTicket({
@@ -169,6 +178,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           ticket,
           settings,
           operator,
+          closeOnDone: !standaloneRun,
         });
         await ctx.heartbeat();
       }
@@ -186,6 +196,10 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       await safe(() => beads.setExternalRef(repo, epicBeadId, pr.ref));
       await safe(() => beads.tag(repo, epicBeadId, [LABELS.stage("in-review")]));
       await safe(() => beads.untag(repo, epicBeadId, [LABELS.stage("implementing")]));
+      // Standalone (epic-of-one): its single ticket's close was deferred so a failed PR step
+      // couldn't strand it in Done. The PR now exists and its ref is stamped — close it to finish
+      // (same end state as before: closed + PR ref + in-review label).
+      if (standaloneRun) await safe(() => beads.close(repo, epicBeadId));
 
       // 5. Finalize run + clean up the worktree (the branch/PR carry the work now).
       await updateRun(db, clock, runId, { status: "done", endedAt: clock.now(), error: null });
@@ -225,9 +239,14 @@ async function runTicket(args: {
   ticket: Bead;
   settings: ProjectSettings;
   operator?: string;
+  /** Close the bead in beads once its work is committed. False for a standalone (epic-of-one)
+   * target, whose close is deferred to the caller until its PR opens (so a failed PR step can't
+   * strand it in Done). Defaults to true (an epic's children close as their work lands). */
+  closeOnDone?: boolean;
 }): Promise<void> {
   const { db, clock, ctx, projectId, repo, runId, worktreePath, ticket, settings, operator } =
     args;
+  const closeOnDone = args.closeOnDone ?? true;
 
   // Claim the ticket for the operator as a HARD GATE before doing any work. On a shared board
   // the claim is the cross-operator coordination primitive (anton-live-sync R6): a failure here
@@ -305,8 +324,9 @@ async function runTicket(args: {
     await commitAll(worktreePath, `${ticket.id}: ${ticket.title}`);
     committed = true;
 
-    // Mark the ticket done in beads (stage → done).
-    await safe(() => beads.close(repo, ticket.id));
+    // Mark the ticket done in beads (stage → done) — unless the caller defers the close (a
+    // standalone target, closed only after its PR opens). endSession still records the work done.
+    if (closeOnDone) await safe(() => beads.close(repo, ticket.id));
     await endSession(db, clock, sessionId, "done");
   } catch (e) {
     await endSession(db, clock, sessionId, "failed");

@@ -136,6 +136,34 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     expect(beads.isApproved(await beads.show(repo, bug))).toBe(true);
   }, 60_000);
 
+  it("409s a standalone task blocked by an open prerequisite, without approving it", async () => {
+    // A parentless task/bug is a run target, but a `blocks` edge still gates it — its blockers
+    // aren't in the epic-graph rollup, so the route derives them from the target's own edges.
+    // Approval enqueues immediately, so a still-blocked standalone must be rejected before labeling.
+    const blocker = await beads.create(repo, { title: "Standalone blocker", type: "task" });
+    const dependent = await beads.create(repo, { title: "Standalone dependent", type: "task" });
+    await beads.link(repo, dependent, blocker, "blocks");
+
+    const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", dependent));
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toMatch(/blocked by/i);
+    expect(body.error).toContain(blocker);
+    expect(beads.isApproved(await beads.show(repo, dependent))).toBe(false);
+  }, 60_000);
+
+  it("enqueues a standalone task once its blocker closes", async () => {
+    // The same blocks edge stops gating once the prerequisite is done — the standalone becomes ready.
+    const blocker = await beads.create(repo, { title: "Standalone blocker (closes)", type: "task" });
+    const dependent = await beads.create(repo, { title: "Standalone dependent (ready)", type: "task" });
+    await beads.link(repo, dependent, blocker, "blocks");
+    await beads.close(repo, blocker);
+
+    const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", dependent));
+    expect(res.status).toBe(200);
+    expect(beads.isApproved(await beads.show(repo, dependent))).toBe(true);
+  }, 60_000);
+
   it("enqueues a real epic with no blockers and applies the approved label", async () => {
     const epic = await beads.create(repo, { title: "Free epic", type: "epic" });
     const child = await beads.create(repo, { title: "Free epic child", type: "task" });
