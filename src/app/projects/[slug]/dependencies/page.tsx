@@ -22,7 +22,7 @@ export default async function ProjectDependenciesPage({
           <span className="text-subtle">/</span>
           <span className="font-medium text-foreground">Dependencies</span>
         </div>
-        <span className="ml-1 font-mono text-[11px] text-subtle">epics → tickets · dagre</span>
+        <span className="ml-1 font-mono text-[11px] text-subtle">epic sequence · blocks · dagre</span>
       </header>
       <ProjectGraph slug={slug} />
     </div>

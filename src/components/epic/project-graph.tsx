@@ -17,15 +17,16 @@ import {
 import "@xyflow/react/dist/style.css";
 import { Share2Icon, TriangleAlertIcon } from "lucide-react";
 
-import type { Board, Epic, Stage } from "@/lib/types";
+import type { EpicGraphEdge, EpicGraphNode } from "@/lib/epic-graph";
+import type { Stage } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
-import { layoutGraphNodes, type GraphLayoutNode } from "@/components/epic/graph-layout";
-
-const EPIC_W = 220;
-const EPIC_H = 60;
-const TICKET_W = 190;
-const TICKET_H = 52;
+import {
+  buildProjectGraph,
+  EPIC_H,
+  EPIC_W,
+  type ProjectGraphNodeData,
+} from "@/components/epic/project-graph-model";
 
 const STAGE_VAR: Record<Stage, string> = {
   backlog: "var(--stage-backlog)",
@@ -34,19 +35,7 @@ const STAGE_VAR: Record<Stage, string> = {
   done: "var(--stage-done)",
 };
 
-interface EpicData extends Record<string, unknown> {
-  title: string;
-  stage: Stage;
-  slug: string;
-  id: string;
-}
-interface TicketData extends Record<string, unknown> {
-  title: string;
-  id: string;
-  stage: Stage;
-}
-type EpicNode = Node<EpicData, "epic">;
-type TicketNode = Node<TicketData, "ticket">;
+type EpicNode = Node<ProjectGraphNodeData, "epic">;
 
 function EpicNodeView({ data }: NodeProps<EpicNode>) {
   return (
@@ -65,68 +54,47 @@ function EpicNodeView({ data }: NodeProps<EpicNode>) {
   );
 }
 
-function TicketNodeView({ data }: NodeProps<TicketNode>) {
-  return (
-    <div
-      className="flex flex-col justify-center gap-0.5 rounded-lg border border-border bg-card px-3 py-2"
-      style={{ width: TICKET_W, height: TICKET_H, borderLeft: `3px solid ${STAGE_VAR[data.stage]}` }}
-    >
-      <Handle type="target" position={Position.Left} className="!size-2 !border-none !bg-border" />
-      <span className="font-mono text-[9px] text-subtle">{data.id}</span>
-      <span className="truncate text-[11.5px] font-medium" title={data.title}>
-        {data.title}
-      </span>
-      <Handle type="source" position={Position.Right} className="!size-2 !border-none !bg-border" />
-    </div>
-  );
+const nodeTypes = { epic: EpicNodeView };
+
+interface GraphPayload {
+  epics: EpicGraphNode[];
+  edges: EpicGraphEdge[];
 }
 
-const nodeTypes = { epic: EpicNodeView, ticket: TicketNodeView };
+function toFlow(slug: string, payload: GraphPayload): { nodes: Node[]; edges: Edge[] } {
+  const { nodes, edges } = buildProjectGraph(slug, payload.epics, payload.edges);
 
-function buildGraph(slug: string, epics: Epic[]): { nodes: Node[]; edges: Edge[] } {
-  const layoutNodes: GraphLayoutNode[] = [];
-  const layoutEdges: { source: string; target: string }[] = [];
-  const meta: Node[] = [];
-
-  for (const epic of epics) {
-    layoutNodes.push({ id: epic.id, width: EPIC_W, height: EPIC_H });
-    meta.push({
-      id: epic.id,
-      type: "epic",
-      position: { x: 0, y: 0 },
-      data: { title: epic.title, stage: epic.stage, slug, id: epic.id },
-    } satisfies EpicNode);
-    for (const ticket of epic.tickets) {
-      // A ticket that IS the epic (orphan wrapped as single-ticket epic) needn't duplicate.
-      if (ticket.id === epic.id) continue;
-      layoutNodes.push({ id: ticket.id, width: TICKET_W, height: TICKET_H });
-      layoutEdges.push({ source: epic.id, target: ticket.id });
-      meta.push({
-        id: ticket.id,
-        type: "ticket",
-        position: { x: 0, y: 0 },
-        data: { title: ticket.title, id: ticket.id, stage: ticket.stage },
-      } satisfies TicketNode);
-    }
-  }
-
-  const positions = layoutGraphNodes(layoutNodes, layoutEdges, {
-    direction: "LR",
-    nodeSep: 24,
-    rankSep: 90,
-  });
-  const nodes = meta.map((n) => ({ ...n, position: positions.get(n.id) ?? { x: 0, y: 0 } }));
-
-  const edges: Edge[] = layoutEdges.map((e) => ({
-    id: `${e.source}-${e.target}`,
-    source: e.source,
-    target: e.target,
-    type: "smoothstep",
-    style: { stroke: "var(--color-border)", strokeWidth: 1.5, opacity: 0.7 },
-    markerEnd: { type: MarkerType.ArrowClosed, color: "var(--color-border)", width: 12, height: 12 },
+  const flowNodes: Node[] = nodes.map((n) => ({
+    id: n.id,
+    type: "epic",
+    position: n.position,
+    data: n.data,
   }));
 
-  return { nodes, edges };
+  const flowEdges: Edge[] = edges.map((e) => {
+    // Blocks style + direction from dependency-graph.tsx:115 (red, arrow at the blocker).
+    // Cycle edges render distinctly: dashed amber, animated, "cycle" label.
+    const stroke = e.inCycle ? "var(--color-stage-implementing)" : "var(--color-destructive)";
+    return {
+      id: e.id,
+      source: e.source,
+      target: e.target,
+      type: "smoothstep",
+      animated: e.inCycle,
+      label: e.inCycle ? "cycle" : "blocks",
+      style: {
+        stroke,
+        strokeWidth: 1.5,
+        strokeDasharray: e.inCycle ? "6 4" : undefined,
+        opacity: 0.85,
+      },
+      labelStyle: { fill: "var(--color-muted-foreground)", fontSize: 10 },
+      labelBgStyle: { fill: "var(--color-card)", fillOpacity: 0.9 },
+      markerEnd: { type: MarkerType.ArrowClosed, color: stroke, width: 14, height: 14 },
+    };
+  });
+
+  return { nodes: flowNodes, edges: flowEdges };
 }
 
 const CHROME = [
@@ -143,7 +111,7 @@ const CHROME = [
 ].join(" ");
 
 export function ProjectGraph({ slug }: { slug: string }) {
-  const [board, setBoard] = useState<Board | null>(null);
+  const [payload, setPayload] = useState<GraphPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
 
@@ -151,11 +119,11 @@ export function ProjectGraph({ slug }: { slug: string }) {
     let cancelled = false;
     async function load() {
       try {
-        const res = await fetch(`/api/projects/${slug}/board`);
+        const res = await fetch(`/api/projects/${slug}/graph`);
         if (!res.ok) throw new Error(`Failed to load dependencies (${res.status})`);
-        const data = (await res.json()) as { board: Board };
+        const data = (await res.json()) as GraphPayload;
         if (!cancelled) {
-          setBoard(data.board);
+          setPayload(data);
           setError(null);
         }
       } catch (err) {
@@ -168,11 +136,10 @@ export function ProjectGraph({ slug }: { slug: string }) {
     };
   }, [slug, attempt]);
 
-  const epics = useMemo(
-    () => (board ? Object.values(board.columns).flat() : []),
-    [board],
+  const { nodes, edges } = useMemo(
+    () => (payload ? toFlow(slug, payload) : { nodes: [], edges: [] }),
+    [slug, payload],
   );
-  const { nodes, edges } = useMemo(() => buildGraph(slug, epics), [slug, epics]);
 
   if (error) {
     return (
@@ -188,11 +155,11 @@ export function ProjectGraph({ slug }: { slug: string }) {
     );
   }
 
-  if (!board) {
+  if (!payload) {
     return <div className="anton-shimmer m-6 flex-1 rounded-xl" aria-busy="true" />;
   }
 
-  if (epics.length === 0) {
+  if (payload.epics.length === 0) {
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-3 p-8 text-center">
         <span className="flex size-11 items-center justify-center rounded-xl border border-dashed border-border">
@@ -216,7 +183,7 @@ export function ProjectGraph({ slug }: { slug: string }) {
         nodesConnectable={false}
         minZoom={0.2}
         maxZoom={1.5}
-        aria-label="Project dependency graph"
+        aria-label="Project epic dependency graph"
       >
         <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="var(--color-border)" />
         <Controls showInteractive={false} position="bottom-right" />
