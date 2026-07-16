@@ -276,6 +276,105 @@ process.exit(0);`,
     expect(forTicket(t2).append).not.toContain("Specialist guidance (agent)");
   }, 60_000);
 
+  it("runs a parentless bug as an epic-of-one → branch anton/<id> → its own PR → bead closed", async () => {
+    // anton-cmz.1: a standalone (parentless) bug is a run target. It executes as a single-ticket
+    // run — its own branch + PR — and the bead itself is the ticket that gets closed.
+    const bugId = await beads.create(repo, {
+      title: "Fix the flaky import",
+      type: "bug",
+      acceptance: "work file exists",
+      description: "## Goal\nStop the flake.",
+    });
+    await beads.approve(repo, bugId);
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    process.env.ANTON_CLAUDE_BIN = successClaude;
+    const jobId = await runner.enqueue({
+      type: "execute-epic",
+      projectId,
+      payload: { projectId, epicBeadId: bugId },
+    });
+    await runner.tickOnce();
+    await runner.whenIdle();
+
+    // Job + run finalized.
+    expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+    const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === bugId)!;
+    expect(run.status).toBe("done");
+    expect(run.branch).toBe(`anton/${bugId}`);
+    expect(existsSync(run.worktreePath!)).toBe(false); // cleaned up after the run
+
+    // Exactly one PR was opened for the branch, and the bug itself is closed + carries its ref.
+    const bug = await beads.show(repo, bugId);
+    expect(bug.status).toBe("closed");
+    expect(bug.external_ref).toBe("gh-42");
+    expect(bug.labels ?? []).toContain("stage:in-review");
+    expect(bug.assignee).toBe("test-operator");
+
+    // The branch was pushed and carries a commit for the bug.
+    const remoteBranches = execFileSync("git", ["-C", repo, "ls-remote", "--heads", "origin"], {
+      encoding: "utf8",
+    });
+    expect(remoteBranches).toContain(`refs/heads/anton/${bugId}`);
+    const log = execFileSync("git", ["-C", repo, "log", "--oneline", `origin/anton/${bugId}`], {
+      encoding: "utf8",
+    });
+    expect(log).toContain(`${bugId}:`);
+
+    // Exactly one execute session for the single ticket.
+    const sessions = (await tdb.db.select().from(schema.sessions)).filter(
+      (s) => s.beadId === bugId,
+    );
+    expect(sessions).toHaveLength(1);
+  }, 60_000);
+
+  it("poison-parks a bead that was found but isn't runnable, with an honest (not 'not found') reason", async () => {
+    // anton-cmz.1 AC3: a genuinely non-runnable target (here a non-work `chore` type) must poison
+    // with a message that names WHY — the bead WAS found — instead of pretending it doesn't exist.
+    const created = JSON.parse(
+      execFileSync(
+        "bd",
+        ["create", "Not a run target", "--type", "chore", "--acceptance", "x", "--json"],
+        { cwd: repo, encoding: "utf8" },
+      ),
+    );
+    const choreId = (Array.isArray(created) ? created[0] : (created.issue ?? created)).id as string;
+    await beads.approve(repo, choreId);
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    process.env.ANTON_CLAUDE_BIN = successClaude;
+    const jobId = await runner.enqueue({
+      type: "execute-epic",
+      projectId,
+      payload: { projectId, epicBeadId: choreId },
+    });
+    await runner.tickOnce();
+    await runner.whenIdle();
+
+    // Poison → job parked; the reason names the bead and the type, not "not found".
+    const job = await getJob(tdb.db, jobId);
+    expect(job?.status).toBe("parked");
+    expect(job?.lastError).toContain(choreId);
+    expect(job?.lastError).toMatch(/not runnable/i);
+    expect(job?.lastError).not.toMatch(/not found/i);
+    // Pre-flight gate: no run row created.
+    expect(
+      (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === choreId),
+    ).toBeUndefined();
+  }, 60_000);
+
   it("parks on a usage limit, then resumes the SAME run/worktree past the reset window", async () => {
     // A fresh approved epic with one ticket.
     const epic2 = await beads.create(repo, {

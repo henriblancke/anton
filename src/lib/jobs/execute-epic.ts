@@ -52,12 +52,23 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     const repo = project.repoPath;
     const settings = await getProjectSettings(db, projectId);
 
-    // Load the epic + its tickets from beads (the source of truth).
+    // Load the run target + (for an epic) its tickets from beads (the source of truth). A target
+    // is an epic OR a parentless task/bug run as an epic-of-one (isRunTarget). Distinguish the two
+    // non-runnable cases so the poison message is honest: a bead that WAS found but isn't a valid
+    // target must not read "not found" (that sends the operator hunting for a missing bead).
     const all = await beads.list(repo, ["--status", "all"]);
-    const epic = all.find((b) => b.id === epicBeadId);
-    if (!epic || !beads.isEpic(epic)) throw new PoisonEpic(`epic ${epicBeadId} not found`);
-    if (!beads.isApproved(epic)) {
-      throw new PoisonEpic(`epic ${epicBeadId} is not approved — refusing to execute`);
+    const target = all.find((b) => b.id === epicBeadId);
+    if (!target) throw new PoisonEpic(`bead ${epicBeadId} not found on the board`);
+    if (!beads.isRunTarget(target)) {
+      const parent = (target.parent ?? target.parent_id) as string | undefined;
+      throw new PoisonEpic(
+        `bead ${epicBeadId} is not runnable: type "${target.issue_type ?? "unknown"}"` +
+          (parent ? ` with parent ${parent}` : "") +
+          ` — only an epic or a parentless task/bug can be run`,
+      );
+    }
+    if (!beads.isApproved(target)) {
+      throw new PoisonEpic(`target ${epicBeadId} is not approved — refusing to execute`);
     }
 
     // Re-check the same epic→epic readiness gate the approval route enforces, now at job start.
@@ -75,7 +86,10 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       );
     }
 
-    const tickets = childrenOf(all, epicBeadId);
+    // An epic runs all its children into one PR; a standalone task/bug IS its own single ticket
+    // (an epic-of-one). The rest of the pipeline — worktree, per-ticket claude→tests→commit→close,
+    // one PR — is identical either way, so the standalone case is just a one-element ticket list.
+    const tickets = beads.isEpic(target) ? childrenOf(all, epicBeadId) : [target];
     if (tickets.length === 0) throw new PoisonEpic(`epic ${epicBeadId} has no tickets`);
 
     // Branches keep the `prefix/id` slash (git convention); only the worktree *path* segment is
@@ -159,13 +173,15 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         await ctx.heartbeat();
       }
 
-      // 4. All tickets closed → open one PR, move epic to in-review.
+      // 4. All tickets closed → open one PR, move the target to in-review. For a standalone
+      // task/bug the target IS the single ticket runTicket already closed above; opening its PR
+      // and stamping in-review + the PR ref onto the (now closed) bead is the epic-of-one finish.
       const pr = await openPullRequest({
         repoPath: repo,
         branch: worktree.branch,
         base: settings.baseBranch ?? project.defaultBranch,
-        title: `${epic.title} (${epicBeadId})`,
-        body: prBody(epic, tickets),
+        title: `${target.title} (${epicBeadId})`,
+        body: prBody(target, tickets),
       });
       await safe(() => beads.setExternalRef(repo, epicBeadId, pr.ref));
       await safe(() => beads.tag(repo, epicBeadId, [LABELS.stage("in-review")]));
@@ -416,13 +432,13 @@ function ticketPrompt(ticket: Bead): string {
   ].join("\n");
 }
 
-function prBody(epic: Bead, tickets: Bead[]): string {
+function prBody(target: Bead, tickets: Bead[]): string {
+  // Standalone run (epic-of-one): the single ticket IS the target, so listing it again is noise.
+  const standalone = tickets.length === 1 && tickets[0]?.id === target.id;
   const lines = [
-    `Autonomous run for **${epic.id}** — ${epic.title}.`,
+    `Autonomous run for **${target.id}** — ${target.title}.`,
     ``,
-    `Tickets:`,
-    ...tickets.map((t) => `- ${t.id} — ${t.title}`),
-    ``,
+    ...(standalone ? [] : [`Tickets:`, ...tickets.map((t) => `- ${t.id} — ${t.title}`), ``]),
     `🤖 Generated with [anton](https://github.com/) autonomous execution`,
   ];
   return lines.join("\n");
