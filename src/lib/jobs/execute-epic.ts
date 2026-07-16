@@ -174,7 +174,16 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       const inReview = LABELS.stage("in-review");
       for (const ticket of orderTickets(tickets, all)) {
         if (ticket.status === "closed") continue;
-        if (standaloneRun && (ticket.labels?.includes(inReview) ?? false)) continue;
+        if (standaloneRun && (ticket.labels?.includes(inReview) ?? false)) {
+          // Resume after a failed PR step: this ticket already committed and moved to in-review on
+          // a prior attempt. Step 2 above re-tagged the target stage:implementing (it can't tell a
+          // fresh run from a resume), and runTicket — the only standalone path that clears
+          // implementing — is being skipped here. Clear it now so the ticket doesn't carry BOTH
+          // stage labels into merge-finalize, which strips only in-review and would otherwise leave
+          // a stale implementing label (making a reopened bead derive as in-progress).
+          await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
+          continue;
+        }
         await runTicket({
           db,
           clock,

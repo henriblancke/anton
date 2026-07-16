@@ -34,12 +34,17 @@ export function StandaloneChip({
   /** Open this ticket's detail dialog. When omitted the chip is non-interactive (view-only). */
   onOpen?: (ticketId: string) => void;
 }) {
-  const [approved, setApproved] = useState(item.approved);
+  // Optimistic override only — the source of truth is `item.approved`, which a later board poll
+  // refreshes. Deriving from the prop (rather than seeding local state once) keeps the button in
+  // sync when another operator approves the same item between polls; the flag just hides it
+  // immediately on our own click and reverts on failure.
+  const [optimisticApproved, setOptimisticApproved] = useState(false);
   const [running, setRunning] = useState(false);
+  const approved = item.approved || optimisticApproved;
 
   async function handleApproveRun() {
     setRunning(true);
-    setApproved(true);
+    setOptimisticApproved(true);
     try {
       const res = await fetch(`/api/projects/${slug}/epics/${item.id}/approve`, { method: "POST" });
       if (!res.ok) {
@@ -48,7 +53,7 @@ export function StandaloneChip({
       }
       toast.success(`Approved & running "${item.title}"`);
     } catch (err) {
-      setApproved(false);
+      setOptimisticApproved(false);
       toast.error(err instanceof Error ? err.message : "Failed to approve run");
     } finally {
       setRunning(false);
