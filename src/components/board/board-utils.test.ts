@@ -4,6 +4,7 @@ import {
   STAGE_LABELS,
   compareBacklogEpics,
   moveEpicBetweenColumns,
+  sortEpics,
 } from "@/components/board/board-utils";
 import { STAGES, type Epic, type Stage } from "@/lib/types";
 
@@ -61,6 +62,52 @@ describe("compareBacklogEpics", () => {
     const p0 = makeEpic("p0", { priority: 0, createdAt: "2026-01-02" });
     const p2 = makeEpic("p2", { priority: 2, createdAt: "2026-01-01" });
     expect([p2, p0].sort(compareBacklogEpics).map((e) => e.id)).toEqual(["p0", "p2"]);
+  });
+});
+
+describe("sortEpics", () => {
+  it("leaves order untouched for the default sort", () => {
+    const epics = [makeEpic("b"), makeEpic("a"), makeEpic("c")];
+    expect(sortEpics(epics, "default")).toBe(epics);
+  });
+
+  it("orders by risk high→low, unknown/absent last", () => {
+    const high = makeEpic("high", { risk: "high" });
+    const med = makeEpic("med", { risk: "med" });
+    const low = makeEpic("low", { risk: "low" });
+    const none = makeEpic("none");
+    expect(sortEpics([low, none, high, med], "risk").map((e) => e.id)).toEqual([
+      "high",
+      "med",
+      "low",
+      "none",
+    ]);
+  });
+
+  it("orders by size large→small", () => {
+    const l = makeEpic("l", { size: "L" });
+    const m = makeEpic("m", { size: "M" });
+    const s = makeEpic("s", { size: "S" });
+    expect(sortEpics([s, l, m], "size").map((e) => e.id)).toEqual(["l", "m", "s"]);
+  });
+
+  it("always sinks blocked epics to the bottom regardless of criteria", () => {
+    // A blocked high-risk epic must still fall below every ready epic.
+    const blockedHigh = makeEpic("blocked-high", { risk: "high", ready: false, blockedBy: ["x"] });
+    const readyLow = makeEpic("ready-low", { risk: "low", ready: true });
+    const readyMed = makeEpic("ready-med", { risk: "med", ready: true });
+    expect(sortEpics([blockedHigh, readyLow, readyMed], "risk").map((e) => e.id)).toEqual([
+      "ready-med",
+      "ready-low",
+      "blocked-high",
+    ]);
+  });
+
+  it("does not mutate the input array", () => {
+    const epics = [makeEpic("s", { size: "S" }), makeEpic("l", { size: "L" })];
+    const before = epics.map((e) => e.id);
+    sortEpics(epics, "size");
+    expect(epics.map((e) => e.id)).toEqual(before);
   });
 });
 

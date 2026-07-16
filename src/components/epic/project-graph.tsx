@@ -20,6 +20,7 @@ import { Share2Icon, TriangleAlertIcon } from "lucide-react";
 import type { EpicGraphEdge, EpicGraphNode } from "@/lib/epic-graph";
 import type { Stage } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { Toggle } from "@/components/atoms";
 import { Button } from "@/components/ui/button";
 import {
   buildProjectGraph,
@@ -59,6 +60,17 @@ const nodeTypes = { epic: EpicNodeView };
 interface GraphPayload {
   epics: EpicGraphNode[];
   edges: EpicGraphEdge[];
+}
+
+/**
+ * Drop `done` epics and any edge that touches one, so a "Hide completed" view shows only
+ * live sequencing. Edges are filtered by the surviving epic id set (both endpoints must remain).
+ */
+function withoutCompleted(payload: GraphPayload): GraphPayload {
+  const epics = payload.epics.filter((epic) => epic.stage !== "done");
+  const kept = new Set(epics.map((epic) => epic.id));
+  const edges = payload.edges.filter((edge) => kept.has(edge.from) && kept.has(edge.to));
+  return { epics, edges };
 }
 
 function toFlow(slug: string, payload: GraphPayload): { nodes: Node[]; edges: Edge[] } {
@@ -114,6 +126,7 @@ export function ProjectGraph({ slug }: { slug: string }) {
   const [payload, setPayload] = useState<GraphPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
+  const [hideCompleted, setHideCompleted] = useState(true);
 
   useEffect(() => {
     let cancelled = false;
@@ -136,9 +149,14 @@ export function ProjectGraph({ slug }: { slug: string }) {
     };
   }, [slug, attempt]);
 
+  const view = useMemo(() => {
+    if (!payload) return null;
+    return hideCompleted ? withoutCompleted(payload) : payload;
+  }, [payload, hideCompleted]);
+
   const { nodes, edges } = useMemo(
-    () => (payload ? toFlow(slug, payload) : { nodes: [], edges: [] }),
-    [slug, payload],
+    () => (view ? toFlow(slug, view) : { nodes: [], edges: [] }),
+    [slug, view],
   );
 
   if (error) {
@@ -170,24 +188,47 @@ export function ProjectGraph({ slug }: { slug: string }) {
     );
   }
 
+  const emptyAfterFilter = nodes.length === 0;
+
   return (
-    <div className={cn("min-h-0 flex-1", CHROME)}>
-      <ReactFlow
-        nodes={nodes}
-        edges={edges}
-        nodeTypes={nodeTypes}
-        fitView
-        fitViewOptions={{ padding: 0.15 }}
-        proOptions={{ hideAttribution: true }}
-        nodesDraggable={false}
-        nodesConnectable={false}
-        minZoom={0.2}
-        maxZoom={1.5}
-        aria-label="Project epic dependency graph"
-      >
-        <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="var(--color-border)" />
-        <Controls showInteractive={false} position="bottom-right" />
-      </ReactFlow>
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div className="flex shrink-0 items-center justify-end gap-2 border-b border-border px-6 py-2">
+        <span className="flex items-center gap-2 text-[12px] text-muted-foreground">
+          Hide completed
+          <Toggle
+            checked={hideCompleted}
+            onChange={setHideCompleted}
+            label="Hide completed epics"
+          />
+        </span>
+      </div>
+      {emptyAfterFilter ? (
+        <div className="flex flex-1 flex-col items-center justify-center gap-3 p-8 text-center">
+          <span className="flex size-11 items-center justify-center rounded-xl border border-dashed border-border">
+            <Share2Icon className="size-5 text-subtle" aria-hidden="true" />
+          </span>
+          <p className="text-sm text-subtle">All epics are completed</p>
+        </div>
+      ) : (
+        <div className={cn("min-h-0 flex-1", CHROME)}>
+          <ReactFlow
+            nodes={nodes}
+            edges={edges}
+            nodeTypes={nodeTypes}
+            fitView
+            fitViewOptions={{ padding: 0.15 }}
+            proOptions={{ hideAttribution: true }}
+            nodesDraggable={false}
+            nodesConnectable={false}
+            minZoom={0.2}
+            maxZoom={1.5}
+            aria-label="Project epic dependency graph"
+          >
+            <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="var(--color-border)" />
+            <Controls showInteractive={false} position="bottom-right" />
+          </ReactFlow>
+        </div>
+      )}
     </div>
   );
 }

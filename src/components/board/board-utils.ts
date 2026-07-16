@@ -81,6 +81,48 @@ export function compareBacklogEpics(a: Epic, b: Epic): number {
   return a.id < b.id ? -1 : 1;
 }
 
+/** User-selectable board ordering. `default` keeps the server/dependency-aware order. */
+export type BoardSort = "default" | "risk" | "size";
+
+export const BOARD_SORT_LABELS: Record<BoardSort, string> = {
+  default: "Default order",
+  risk: "Risk",
+  size: "Size",
+};
+
+// Highest-impact first (rank 0 sorts to the top). Unknown/absent values sort last within
+// their block. `med`/`medium` and the size aliases are folded so label spelling never matters.
+const RISK_RANK: Record<string, number> = { high: 0, med: 1, medium: 1, low: 2 };
+const SIZE_RANK: Record<string, number> = { xl: 0, l: 1, lg: 1, m: 2, md: 2, s: 3, sm: 3, xs: 4 };
+
+function tierRank(value: string | undefined, table: Record<string, number>): number {
+  const key = value?.toLowerCase();
+  const rank = key ? table[key] : undefined;
+  return rank ?? Number.POSITIVE_INFINITY;
+}
+
+/**
+ * Compare two epics for a chosen board sort. Blocked epics (open blockers, `ready === false`)
+ * always sink to the bottom regardless of the criteria; within each block, epics order by the
+ * selected criteria (risk high→low or size large→small) and fall back to the shared
+ * dependency-aware order so ties stay stable across re-renders.
+ */
+export function compareEpicsBy(sort: Exclude<BoardSort, "default">, a: Epic, b: Epic): number {
+  if (a.ready !== b.ready) return a.ready ? -1 : 1;
+  const table = sort === "risk" ? RISK_RANK : SIZE_RANK;
+  const field = sort === "risk" ? a.risk : a.size;
+  const otherField = sort === "risk" ? b.risk : b.size;
+  const delta = tierRank(field, table) - tierRank(otherField, table);
+  if (delta !== 0) return delta;
+  return compareBacklogEpics(a, b);
+}
+
+/** Returns the epics reordered for the chosen sort. `default` returns the input order unchanged. */
+export function sortEpics(epics: Epic[], sort: BoardSort): Epic[] {
+  if (sort === "default") return epics;
+  return [...epics].sort((a, b) => compareEpicsBy(sort, a, b));
+}
+
 /** Moves an epic (by id) to another stage column, immutably. Used for optimistic
  * drag-and-drop updates before the move API call resolves. No-op if the epic isn't found.
  * A move that lands in the backlog is re-sorted (compareBacklogEpics) so the prepended card
