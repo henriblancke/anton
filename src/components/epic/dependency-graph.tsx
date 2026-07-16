@@ -18,6 +18,7 @@ import "@xyflow/react/dist/style.css";
 import type { DepEdge, DepType, Epic, Stage, Ticket } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { layoutGraphNodes, type GraphLayoutNode } from "@/components/epic/graph-layout";
+import { orientEdge } from "@/components/epic/dependency-graph-model";
 
 const STAGE_VAR: Record<Stage, string> = {
   backlog: "var(--stage-backlog)",
@@ -131,7 +132,7 @@ function buildGraph(
   ];
   const positions = layoutGraphNodes(
     layoutInputs,
-    edges.map((edge) => ({ source: edge.from, target: edge.to })),
+    edges.map(orientEdge),
     { direction: "LR", nodeSep: 24, rankSep: 90 },
   );
 
@@ -157,10 +158,11 @@ function buildGraph(
 
   const flowEdges: Edge[] = edges.map((edge) => {
     const style = DEP_EDGE_STYLE[edge.type];
+    const { source, target } = orientEdge(edge);
     return {
       id: `${edge.from}-${edge.to}-${edge.type}`,
-      source: edge.from,
-      target: edge.to,
+      source,
+      target,
       type: "smoothstep",
       label: style.label,
       style: {
