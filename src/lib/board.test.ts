@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bead } from "./beads/bd";
+import { STAGES } from "./types";
 import type { Project } from "./types";
 
 const listMock = vi.fn();
@@ -203,6 +204,25 @@ describe("getBoard", () => {
     expect(board.columns.backlog.find((e) => e.id === "epic-x")?.tickets.map((t) => t.id)).toEqual([
       "child-1",
     ]);
+  });
+
+  it("does not surface a parentless non-runnable type (learning/chore) as a chip", async () => {
+    // A parentless `learning` is not a run target (beads.isRunTarget → false), so a chip for it
+    // would advertise `Approve & run` yet the approve route + runner reject it — a permanent 422.
+    // It must not appear on the board at all (no fake epic, no standalone chip).
+    const learning = makeBead({ id: "learn-1", title: "A loose learning", issue_type: "learning" });
+    const bug = makeBead({ id: "bug-1", title: "Runnable bug", issue_type: "bug", status: "open" });
+
+    listMock.mockResolvedValue([learning, bug]);
+
+    const board = await getBoard(project);
+
+    const allStandalone = STAGES.flatMap((s) => board.standalone[s]);
+    expect(allStandalone.some((i) => i.id === "learn-1")).toBe(false);
+    const allColumns = STAGES.flatMap((s) => board.columns[s]);
+    expect(allColumns.some((e) => e.id === "learn-1")).toBe(false);
+    // The runnable bug is unaffected.
+    expect(allStandalone.some((i) => i.id === "bug-1")).toBe(true);
   });
 
   it("marks a self-filed, untouched bug unread and sorts unread chips first", async () => {

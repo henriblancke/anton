@@ -6,7 +6,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { beads, LABELS, type Bead } from "../beads/bd";
-import { computeEpicGraph, standaloneBlockers } from "../epic-graph";
+import { computeEpicGraph, epicStandaloneBlockers, standaloneBlockers } from "../epic-graph";
 import { loadAgentPrompt } from "../claude/agent-prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
 import { runClaude, type ClaudeEvent } from "../claude/driver";
@@ -79,8 +79,13 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     // `blocks` edges. Either way, derive from the fresh `all` read above and PARK if a blocker is
     // open — starting still-blocked work would violate the sequence. Recoverable: once the
     // blocker completes, resuming the parked job re-reads beads and passes this gate.
+    // An epic also inherits any open standalone (parentless task/bug) prerequisite that the
+    // epic-graph rollup drops (epicStandaloneBlockers) — the same gap the approve route closes.
     const blockers = beads.isEpic(target)
-      ? (computeEpicGraph(all).epics.find((n) => n.id === epicBeadId)?.blockedBy ?? [])
+      ? [
+          ...(computeEpicGraph(all).epics.find((n) => n.id === epicBeadId)?.blockedBy ?? []),
+          ...epicStandaloneBlockers(all, epicBeadId),
+        ]
       : standaloneBlockers(all, epicBeadId);
     if (blockers.length > 0) {
       throw new PoisonEpic(

@@ -6,7 +6,7 @@
  */
 import { describe, expect, it } from "vitest";
 import type { Bead, BeadDep } from "./beads/bd";
-import { computeEpicGraph, standaloneBlockers } from "./epic-graph";
+import { computeEpicGraph, epicStandaloneBlockers, standaloneBlockers } from "./epic-graph";
 
 /** A parentless task/bug run target (epic-of-one) — no parent, so it never rolls up to an epic. */
 function standalone(id: string, extra: Partial<Bead> = {}): Bead {
@@ -191,5 +191,54 @@ describe("standaloneBlockers", () => {
       standalone("B"),
     ];
     expect(standaloneBlockers(beads, "S")).toEqual(["B"]);
+  });
+});
+
+describe("epicStandaloneBlockers", () => {
+  it("gates an epic on an open standalone blocker the epic-graph rollup drops", () => {
+    // E blocks-depends on a parentless task B. epicOf(B) is undefined, so computeEpicGraph drops
+    // the edge and E reads ready — epicStandaloneBlockers recovers it.
+    const beads = [epic("E", { dependencies: [blocks("E", "B")] }), standalone("B")];
+    expect(node(graphOf(beads), "E").ready).toBe(true); // rollup can't see the standalone blocker
+    expect(epicStandaloneBlockers(beads, "E")).toEqual(["B"]);
+  });
+
+  it("gates an epic on a standalone blocker of one of its CHILDREN", () => {
+    const beads = [
+      epic("E"),
+      ticket("T", "E", { dependencies: [blocks("T", "B")] }),
+      standalone("B"),
+    ];
+    expect(epicStandaloneBlockers(beads, "E")).toEqual(["B"]);
+  });
+
+  it("counts a standalone blocker only while it is not done (closed → ready)", () => {
+    const beads = [
+      epic("E", { dependencies: [blocks("E", "B")] }),
+      standalone("B", { status: "closed" }),
+    ];
+    expect(epicStandaloneBlockers(beads, "E")).toEqual([]);
+  });
+
+  it("ignores epic→epic and cross-epic child blockers (already in the rollup)", () => {
+    const beads = [
+      epic("E", { dependencies: [blocks("E", "E2")] }),
+      epic("E2"),
+      epic("E3"),
+      ticket("T", "E", { dependencies: [blocks("T", "T3")] }),
+      ticket("T3", "E3"),
+    ];
+    expect(epicStandaloneBlockers(beads, "E")).toEqual([]);
+  });
+
+  it("treats an unknown blocker (absent from the list) as still open — fail safe", () => {
+    const beads = [epic("E", { dependencies: [blocks("E", "GONE")] })];
+    expect(epicStandaloneBlockers(beads, "E")).toEqual(["GONE"]);
+  });
+
+  it("returns [] for a non-epic / unknown target", () => {
+    const beads = [standalone("S", { dependencies: [blocks("S", "B")] }), standalone("B")];
+    expect(epicStandaloneBlockers(beads, "S")).toEqual([]);
+    expect(epicStandaloneBlockers(beads, "MISSING")).toEqual([]);
   });
 });

@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { getBoard } from "@/lib/board";
-import { standaloneBlockers } from "@/lib/epic-graph";
+import { epicStandaloneBlockers, standaloneBlockers } from "@/lib/epic-graph";
 import { refreshAllIssues } from "@/lib/beads/issues";
 import { beads } from "@/lib/beads/bd";
 import { enqueueExecuteEpic } from "@/lib/jobs/service";
@@ -60,11 +60,19 @@ export async function POST(
   if (!epic && !standalone) {
     return NextResponse.json({ error: "Run target not found" }, { status: 404 });
   }
-  if (epic && !epic.ready) {
-    return NextResponse.json(
-      { error: `Epic is blocked by ${epic.blockedBy.join(", ")}` },
-      { status: 409 },
-    );
+  if (epic) {
+    // epic.blockedBy is the epic-graph rollup (epic→epic + cross-epic child blocks). That rollup
+    // DROPS any blocks edge whose blocker is a parentless standalone task/bug, so an epic (or a
+    // child of it) that depends on an open standalone item would otherwise read ready here. Gate on
+    // those standalone blockers too — derived off the same fresh read — so the epic can't be
+    // approved/enqueued before its standalone prerequisite is done.
+    const blockers = [...epic.blockedBy, ...epicStandaloneBlockers(allBeads, epicId)];
+    if (blockers.length > 0) {
+      return NextResponse.json(
+        { error: `Epic is blocked by ${blockers.join(", ")}` },
+        { status: 409 },
+      );
+    }
   }
   // A standalone target's blockers aren't in the epic rollup, so derive them from its own `blocks`
   // edges off the fresh read above. Approving enqueues immediately, so a still-blocked standalone

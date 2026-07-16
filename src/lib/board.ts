@@ -89,8 +89,12 @@ export async function getBoard(project: Project): Promise<Board> {
   }
 
   // Parentless tasks/bugs are standalone run targets (epic-of-one), not fake epics: they land as
-  // typed chips at the foot of their stage column, carrying their real issue_type.
-  const orphanTasks = taskBeads.filter((t) => !claimedTaskIds.has(t.id));
+  // typed chips at the foot of their stage column, carrying their real issue_type. Only RUNNABLE
+  // parentless beads become chips (beads.isRunTarget — task/bug only): a parentless `learning`/
+  // `chore`/etc. is not a run target, so a chip for it would advertise `Approve & run` yet the
+  // approve route + runner reject it via the same isRunTarget gate — a permanent 422/park. Gate
+  // here so the board never surfaces an item it can't actually run.
+  const orphanTasks = taskBeads.filter((t) => !claimedTaskIds.has(t.id) && beads.isRunTarget(t));
   for (const task of orphanTasks) {
     const item = toStandaloneItem(task);
     standalone[item.stage].push(item);
