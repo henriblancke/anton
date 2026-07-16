@@ -7,8 +7,15 @@ import { allIssues } from "./beads/issues";
 import { computeEpicGraph } from "./epic-graph";
 import { issueSnapshotVersion } from "./beads/snapshot";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
-import { parseAcceptance, parseGoal, toEpic, toTicket } from "./ticket-view";
-import { STAGES, type Board, type Epic, type Project, type Stage } from "./types";
+import { parseAcceptance, parseGoal, toEpic, toStandaloneItem, toTicket } from "./ticket-view";
+import {
+  STAGES,
+  type Board,
+  type Epic,
+  type Project,
+  type Stage,
+  type StandaloneItem,
+} from "./types";
 
 // deriveStage lives in ticket-view.ts now; re-exported here for existing importers/tests.
 export { deriveStage } from "./ticket-view";
@@ -17,10 +24,12 @@ export function getBoardVersion(repoPath: string): string {
   return `${issueSnapshotVersion(repoPath)}:${getSyncStatusToken(repoPath)}`;
 }
 
-/** A parentless non-epic bead, rendered on the board as a single-ticket pseudo-epic card. The
- * PR link rides on the wrapped ticket, so the epic wrapper itself carries no prRef. */
-function ticketAsEpic(bead: Bead): Epic {
-  return toEpic(bead, { tickets: [toTicket(bead)], prRef: false });
+/** Standalone chips read newest-first within a stage, but a self-filed unread bug jumps ahead of
+ * its read siblings so triage-worthy work surfaces above the "+N more" cap. */
+function compareStandalone(a: StandaloneItem, b: StandaloneItem): number {
+  if (a.unread !== b.unread) return a.unread ? -1 : 1;
+  if (a.createdAt !== b.createdAt) return a.createdAt > b.createdAt ? -1 : 1;
+  return a.id < b.id ? -1 : 1;
 }
 
 export async function getBoard(project: Project): Promise<Board> {
@@ -53,6 +62,12 @@ export async function getBoard(project: Project): Promise<Board> {
     "in-review": [],
     done: [],
   };
+  const standalone: Record<Stage, StandaloneItem[]> = {
+    backlog: [],
+    implementing: [],
+    "in-review": [],
+    done: [],
+  };
 
   // Derive epic→epic dependency rollup once (blockedBy/ready/rank), so the board reflects the
   // readiness the runtime's bd-ready enforces. Degrades to a stable order on a cycle (epic-graph.ts).
@@ -73,19 +88,24 @@ export async function getBoard(project: Project): Promise<Board> {
     columns[built.stage].push(built);
   }
 
+  // Parentless tasks/bugs are standalone run targets (epic-of-one), not fake epics: they land as
+  // typed chips at the foot of their stage column, carrying their real issue_type.
   const orphanTasks = taskBeads.filter((t) => !claimedTaskIds.has(t.id));
   for (const task of orphanTasks) {
-    const wrapped = ticketAsEpic(task);
-    columns[wrapped.stage].push(wrapped);
+    const item = toStandaloneItem(task);
+    standalone[item.stage].push(item);
   }
 
   for (const stage of STAGES) {
     if (!columns[stage]) columns[stage] = [];
+    if (!standalone[stage]) standalone[stage] = [];
   }
 
   // Only the backlog is dependency-aware ordered (ready-first → rank → priority → createdAt); the
   // other columns are stage-based, so deps can't reorder across them — they keep insertion order.
   columns.backlog.sort(compareBacklogEpics);
+  // Chips read the same way in every column (unread-first, then newest), independent of epic order.
+  for (const stage of STAGES) standalone[stage].sort(compareStandalone);
 
   // Resolve PR links from the repo's origin remote (once) so `gh-<n>` refs become clickable.
   const base = await githubBaseUrl(project.repoPath);
@@ -94,12 +114,14 @@ export async function getBoard(project: Project): Promise<Board> {
       attachPrUrl(epic, base);
       for (const ticket of epic.tickets) attachPrUrl(ticket, base);
     }
+    for (const item of standalone[stage]) attachPrUrl(item, base);
   }
 
   return {
     projectSlug: project.slug,
     version: getBoardVersion(project.repoPath),
     columns,
+    standalone,
     // Read from the globalThis-anchored registry, so the API bundle sees passes run by the
     // instrumentation-started sync engine (see bd.ts).
     sync: getSyncStatus(project.repoPath),

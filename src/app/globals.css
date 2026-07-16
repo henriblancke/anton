@@ -58,6 +58,9 @@
   --color-agent-terraform: var(--agent-terraform);
   --color-agent-docker: var(--agent-docker);
   --color-agent-kubernetes: var(--agent-kubernetes);
+  --color-type-epic: var(--type-epic);
+  --color-type-task: var(--type-task);
+  --color-type-bug: var(--type-bug);
 
   --radius-sm: calc(var(--radius) * 0.6);
   --radius-md: calc(var(--radius) * 0.8);
@@ -105,6 +108,10 @@
   --agent-terraform: #c05070;
   --agent-docker: #6a675f;
   --agent-kubernetes: #6a675f;
+  /* Work-type language: epic = the product iris, task = calm blue, bug = warm red. */
+  --type-epic: #6355e0;
+  --type-task: #2f7fd6;
+  --type-bug: #d1483d;
 
   --chart-1: #6355e0;
   --chart-2: #2f7fd6;
@@ -160,6 +167,10 @@
   --agent-terraform: #f26a86;
   --agent-docker: #8b8781;
   --agent-kubernetes: #8b8781;
+  /* Work-type language: epic = the product iris, task = calm blue, bug = warm red. */
+  --type-epic: #8f82ff;
+  --type-task: #57a8f2;
+  --type-bug: #f2685e;
 
   --chart-1: #8f82ff;
   --chart-2: #57a8f2;

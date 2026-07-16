@@ -2,7 +2,7 @@
  * Pure display helpers for the epic board. Kept dependency-free so they're trivially testable
  * (see board-utils.test.ts) and reusable from both the board and card client components.
  */
-import { STAGES, type Epic, type Stage, type Ticket } from "@/lib/types";
+import { STAGES, type Epic, type IssueType, type Stage, type Ticket } from "@/lib/types";
 
 export const STAGE_LABELS: Record<Stage, string> = {
   backlog: "Backlog",
@@ -19,12 +19,38 @@ export const STAGE_ACCENT_DOT: Record<Stage, string> = {
   done: "bg-stage-done",
 };
 
-/** Inset left-border color per stage — mirrors the board card's `box-shadow: inset 2px 0`. */
-export const STAGE_INSET_SHADOW: Record<Stage, string> = {
-  backlog: "shadow-[inset_2px_0_0_var(--stage-backlog)]",
-  implementing: "shadow-[inset_2px_0_0_var(--stage-implementing)]",
-  "in-review": "shadow-[inset_2px_0_0_var(--stage-in-review)]",
-  done: "shadow-[inset_2px_0_0_var(--stage-done)]",
+// ── Work-type language (epic / task / bug) ─────────────────────────────────
+//
+// One shared vocabulary so every board item reads its type at a glance: a human label, a left rail
+// inset, a compact-badge tint, and an icon/text hue — all keyed on the same `--type-*` tokens. The
+// icon components live in type-language.tsx (JSX); these string maps stay pure so board-utils is
+// trivially testable and shareable by server + client.
+
+export const TYPE_LABELS: Record<IssueType, string> = {
+  epic: "Epic",
+  task: "Task",
+  bug: "Bug",
+};
+
+/** Left-rail inset color per work type — mirrors the stage rail's `box-shadow: inset 2px 0`. */
+export const TYPE_RAIL: Record<IssueType, string> = {
+  epic: "shadow-[inset_2px_0_0_var(--type-epic)]",
+  task: "shadow-[inset_2px_0_0_var(--type-task)]",
+  bug: "shadow-[inset_2px_0_0_var(--type-bug)]",
+};
+
+/** Icon/text hue per work type. */
+export const TYPE_TEXT: Record<IssueType, string> = {
+  epic: "text-type-epic",
+  task: "text-type-task",
+  bug: "text-type-bug",
+};
+
+/** Compact type-badge tint (border + fill + text), one per work type. */
+export const TYPE_BADGE: Record<IssueType, string> = {
+  epic: "border-type-epic/30 bg-type-epic/10 text-type-epic",
+  task: "border-type-task/30 bg-type-task/10 text-type-task",
+  bug: "border-type-bug/30 bg-type-bug/10 text-type-bug",
 };
 
 /** Left-border color per stage — used by dependency-graph nodes (`border-l-3`). */

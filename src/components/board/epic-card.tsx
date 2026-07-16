@@ -9,7 +9,8 @@ import type { Epic } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { ConfirmDeleteButton } from "@/components/ui/confirm-delete-button";
 import { cn } from "@/lib/utils";
-import { STAGE_INSET_SHADOW, agentDotClass, ticketProgress } from "@/components/board/board-utils";
+import { TYPE_RAIL, agentDotClass, ticketProgress } from "@/components/board/board-utils";
+import { TypeBadge, TypeIcon } from "@/components/board/type-language";
 import { MetaChip, PrLink, RiskChip } from "@/components/atoms";
 import { CopyButton } from "@/components/ui/copy-button";
 
@@ -88,6 +89,7 @@ export function EpicCard({
     return (
       <CardShell epic={epic} overlay={overlay} slug={slug} muted>
         <div className="flex items-center gap-2">
+          <TypeIcon type="epic" />
           <CopyButton value={epic.id} label="epic id" className="font-mono text-[10px]">
           {epic.id}
         </CopyButton>
@@ -113,6 +115,7 @@ export function EpicCard({
   return (
     <CardShell epic={epic} overlay={overlay} slug={slug}>
       <div className="flex items-center gap-1.5">
+        <TypeIcon type="epic" />
         <CopyButton value={epic.id} label="epic id" className="font-mono text-[10px]">
           {epic.id}
         </CopyButton>
@@ -158,13 +161,12 @@ export function EpicCard({
         </div>
       </div>
 
-      {(epic.agent || epic.risk || epic.size) && (
-        <div className="flex flex-wrap gap-1.5">
-          {epic.agent && <MetaChip dotClass={agentDotClass(epic.agent)}>{epic.agent}</MetaChip>}
-          {epic.risk && <RiskChip risk={epic.risk} />}
-          {epic.size && <MetaChip>size:{epic.size}</MetaChip>}
-        </div>
-      )}
+      <div className="flex flex-wrap gap-1.5">
+        <TypeBadge type="epic" />
+        {epic.agent && <MetaChip dotClass={agentDotClass(epic.agent)}>{epic.agent}</MetaChip>}
+        {epic.risk && <RiskChip risk={epic.risk} />}
+        {epic.size && <MetaChip>size:{epic.size}</MetaChip>}
+      </div>
 
       {epic.stage === "backlog" && !overlay && (
         <div className="mt-0.5 flex items-center gap-2">
@@ -206,10 +208,9 @@ function CardShell({
   muted?: boolean;
   children: React.ReactNode;
 }) {
-  const inset =
-    epic.stage === "implementing" || epic.stage === "in-review"
-      ? STAGE_INSET_SHADOW[epic.stage]
-      : undefined;
+  // The left rail is type-hued (the shared type language), not stage-hued — stage is read from the
+  // column now, so a per-card stage rail would be redundant.
+  const rail = TYPE_RAIL.epic;
 
   // A blocked epic (open blockers) is dimmed in every column so it reads as "the runtime won't
   // pick this up yet", mirroring the "blocked by" chip. Done cards are never blocked in practice.
@@ -223,7 +224,7 @@ function CardShell({
         overlay && "rotate-1 shadow-lg ring-1 ring-ring/30",
         muted && "bg-card/70",
         blocked && "opacity-60",
-        inset,
+        rail,
       )}
     >
       {!overlay && (

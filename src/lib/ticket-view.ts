@@ -8,7 +8,7 @@
  * so those modules can all consume it without reintroducing a board↔tickets import cycle.
  */
 import { beads, type Bead } from "./beads/bd";
-import type { Epic, Stage, Ticket } from "./types";
+import type { Epic, IssueType, Stage, StandaloneItem, Ticket } from "./types";
 
 /** Derived stage for a bead: closed → done; an `in-review` label or PR ref → in-review; an
  * in-progress status or `implementing` label → implementing; otherwise backlog. */
@@ -75,6 +75,37 @@ export function toTicket(bead: Bead): Ticket {
     acceptance: parseAcceptance(bead),
     ...createdMeta(bead),
     prRef: bead.external_ref,
+  };
+}
+
+/**
+ * A "self-filed" bug is one anton's own automation created — it carries a `source:<x>` label (e.g.
+ * `source:stringer` from scan-triage). A self-filed bug that is still untouched — backlog, unclaimed,
+ * not yet approved — is "unread": it wants a human's triage before it runs (auto-run of self-filed
+ * bugs is deliberately out of scope). There is no stored read-state, so this is derived each build.
+ */
+export function isUnreadBug(bead: Bead): boolean {
+  if (bead.issue_type !== "bug") return false;
+  const selfFiled = (bead.labels ?? []).some((l) => l.startsWith("source:"));
+  return selfFiled && deriveStage(bead) === "backlog" && !bead.assignee && !beads.isApproved(bead);
+}
+
+/** Map a parentless task/bug to the shared StandaloneItem view model (a board chip). Carries the
+ * bead's real issue_type so the type language can tint it; approval + unread drive the chip UI. */
+export function toStandaloneItem(bead: Bead): StandaloneItem {
+  return {
+    id: bead.id,
+    title: bead.title,
+    type: (bead.issue_type === "bug" ? "bug" : "task") as Exclude<IssueType, "epic">,
+    status: bead.status,
+    stage: deriveStage(bead),
+    approved: beads.isApproved(bead),
+    agent: labelValue(bead.labels, "agent"),
+    risk: labelValue(bead.labels, "risk"),
+    size: labelValue(bead.labels, "size"),
+    ...createdMeta(bead),
+    prRef: bead.external_ref,
+    unread: isUnreadBug(bead),
   };
 }
 

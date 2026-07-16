@@ -81,7 +81,7 @@ describe("deriveStage", () => {
 });
 
 describe("getBoard", () => {
-  it("groups epics by stage, parses goal, and wraps orphan tasks", async () => {
+  it("groups epics by stage, parses goal, and surfaces orphan tasks as standalone chips", async () => {
     const epic1 = makeBead({
       id: "epic-1",
       title: "Epic One",
@@ -164,14 +164,84 @@ describe("getBoard", () => {
     expect(doneEpic!.goal).toBe("Done deal.");
     expect(doneEpic!.tickets[0]).toMatchObject({ id: "ticket-2", prRef: "gh-42", stage: "done" });
 
-    const orphanEpic = board.columns.backlog.find((e) => e.id === "orphan-1");
-    expect(orphanEpic).toBeDefined();
-    expect(orphanEpic!.tickets).toHaveLength(1);
-    expect(orphanEpic!.tickets[0].id).toBe("orphan-1");
-    expect(orphanEpic!.approved).toBe(true);
+    // The orphan task is NOT wrapped as a fake epic — it surfaces as a standalone chip carrying
+    // its real issue_type, grouped under its derived stage.
+    expect(board.columns.backlog.some((e) => e.id === "orphan-1")).toBe(false);
+    const orphanItem = board.standalone.backlog.find((i) => i.id === "orphan-1");
+    expect(orphanItem).toBeDefined();
+    expect(orphanItem!.type).toBe("task");
+    expect(orphanItem!.approved).toBe(true);
+    expect(orphanItem!.stage).toBe("backlog");
+    expect(orphanItem!.unread).toBe(false); // an approved task is never an unread bug
     // Null-safe: an unclaimed orphan has no assignee/created_by and an empty createdAt.
-    expect(orphanEpic!.tickets[0]).toMatchObject({ assignee: null, createdAt: "", createdBy: null });
-    expect(orphanEpic!).toMatchObject({ assignee: null, createdAt: "", createdBy: null });
+    expect(orphanItem!).toMatchObject({ assignee: null, createdAt: "", createdBy: null });
+  });
+
+  it("carries issue_type through and groups standalone items by derived stage", async () => {
+    const backlogBug = makeBead({ id: "bug-1", title: "Loose bug", issue_type: "bug", status: "open" });
+    const workingTask = makeBead({
+      id: "task-1",
+      title: "Loose task in flight",
+      issue_type: "task",
+      status: "in_progress",
+    });
+    // A task WITH a parent epic is a child, never standalone.
+    const parentEpic = makeBead({ id: "epic-x", title: "Epic X", issue_type: "epic", status: "open" });
+    const child = makeBead({ id: "child-1", title: "Child", issue_type: "task", parent: "epic-x" });
+
+    listMock.mockResolvedValue([backlogBug, workingTask, parentEpic, child]);
+
+    const board = await getBoard(project);
+
+    const bug = board.standalone.backlog.find((i) => i.id === "bug-1");
+    expect(bug?.type).toBe("bug");
+    expect(board.standalone.implementing.map((i) => i.id)).toEqual(["task-1"]);
+    expect(board.standalone.implementing[0].type).toBe("task");
+    // The child ticket rides on its epic, not the standalone group.
+    expect(board.standalone.backlog.some((i) => i.id === "child-1")).toBe(false);
+    expect(board.standalone.implementing.some((i) => i.id === "child-1")).toBe(false);
+    expect(board.columns.backlog.find((e) => e.id === "epic-x")?.tickets.map((t) => t.id)).toEqual([
+      "child-1",
+    ]);
+  });
+
+  it("marks a self-filed, untouched bug unread and sorts unread chips first", async () => {
+    const unread = makeBead({
+      id: "bug-unread",
+      title: "Self-filed bug",
+      issue_type: "bug",
+      status: "open",
+      labels: ["source:stringer"],
+      created_at: "2026-07-10T00:00:00Z",
+    });
+    // Same source, but claimed → engaged → no longer unread.
+    const claimed = makeBead({
+      id: "bug-claimed",
+      title: "Claimed self-filed bug",
+      issue_type: "bug",
+      status: "open",
+      labels: ["source:stringer"],
+      assignee: "alice",
+      created_at: "2026-07-14T00:00:00Z",
+    });
+    // A human-filed bug (no source label) is never "unread".
+    const human = makeBead({
+      id: "bug-human",
+      title: "Human bug",
+      issue_type: "bug",
+      status: "open",
+      created_at: "2026-07-15T00:00:00Z",
+    });
+
+    listMock.mockResolvedValue([human, claimed, unread]);
+
+    const board = await getBoard(project);
+    const ids = board.standalone.backlog.map((i) => i.id);
+    // Unread first, then newest-created.
+    expect(ids).toEqual(["bug-unread", "bug-human", "bug-claimed"]);
+    expect(board.standalone.backlog.find((i) => i.id === "bug-unread")!.unread).toBe(true);
+    expect(board.standalone.backlog.find((i) => i.id === "bug-claimed")!.unread).toBe(false);
+    expect(board.standalone.backlog.find((i) => i.id === "bug-human")!.unread).toBe(false);
   });
 
   it("attaches ready/blockedBy and sorts the backlog so a blocker precedes what it blocks", async () => {

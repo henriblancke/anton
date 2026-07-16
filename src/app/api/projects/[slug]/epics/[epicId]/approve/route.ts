@@ -50,10 +50,15 @@ export async function POST(
   const epic = STAGES.map((stage) => board.columns[stage].find((e) => e.id === epicId)).find(
     Boolean,
   );
-  if (!epic) {
-    return NextResponse.json({ error: "Epic not found" }, { status: 404 });
+  // A standalone task/bug (epic-of-one) lives in `standalone`, not `columns` — it has no blockers,
+  // so it needs no readiness gate, but it must still be found here or a valid run target 404s.
+  const standalone = epic
+    ? undefined
+    : STAGES.map((stage) => board.standalone[stage].find((e) => e.id === epicId)).find(Boolean);
+  if (!epic && !standalone) {
+    return NextResponse.json({ error: "Run target not found" }, { status: 404 });
   }
-  if (!epic.ready) {
+  if (epic && !epic.ready) {
     return NextResponse.json(
       { error: `Epic is blocked by ${epic.blockedBy.join(", ")}` },
       { status: 409 },
@@ -76,14 +81,19 @@ export async function POST(
     console.error(`[approve] failed to enqueue execute-epic for ${epicId}`, err);
   }
 
-  // Re-read so the response reflects the post-approval state.
+  // Re-read so the response reflects the post-approval state. The target is an epic or a standalone
+  // chip; return whichever the board now carries. `epic` is kept for the existing epic-card client.
   const updatedBoard = await getBoard(project);
   for (const stage of STAGES) {
-    const updated = updatedBoard.columns[stage].find((e) => e.id === epicId);
-    if (updated) {
-      return NextResponse.json({ epic: updated, jobId });
+    const updatedEpic = updatedBoard.columns[stage].find((e) => e.id === epicId);
+    if (updatedEpic) {
+      return NextResponse.json({ epic: updatedEpic, item: updatedEpic, jobId });
+    }
+    const updatedItem = updatedBoard.standalone[stage].find((e) => e.id === epicId);
+    if (updatedItem) {
+      return NextResponse.json({ item: updatedItem, jobId });
     }
   }
 
-  return NextResponse.json({ error: "Epic not found" }, { status: 404 });
+  return NextResponse.json({ error: "Run target not found" }, { status: 404 });
 }

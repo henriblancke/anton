@@ -231,6 +231,7 @@ export function EpicBoard({ slug, initialBoard }: { slug: string; initialBoard: 
             key={stage}
             stage={stage}
             epics={sortedColumns?.[stage] ?? []}
+            standalone={board.standalone?.[stage] ?? []}
             slug={slug}
             onEpicDeleted={handleEpicDeleted}
           />
