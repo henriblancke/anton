@@ -84,7 +84,8 @@ function toFlow(slug: string, payload: GraphPayload): { nodes: Node[]; edges: Ed
   }));
 
   const flowEdges: Edge[] = edges.map((e) => {
-    // Blocks style + direction from dependency-graph.tsx:115 (red, arrow at the blocker).
+    // Blocks style matches dependency-graph.tsx (red). Edges arrive already oriented blocker→blocked
+    // from the model, so the arrowhead lands on the blocked node and the edge reads "X blocks Y".
     // Cycle edges render distinctly: dashed amber, animated, "cycle" label.
     const stroke = e.inCycle ? "var(--color-stage-implementing)" : "var(--color-destructive)";
     return {

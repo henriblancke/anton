@@ -39,19 +39,20 @@ describe("buildProjectGraph", () => {
 
     expect(graph.edges).toHaveLength(1);
     const [built] = graph.edges;
-    // Direction mirrors dependency-graph.tsx: source = blocked (from), target = blocker (to).
-    expect(built.source).toBe("b");
-    expect(built.target).toBe("a");
+    // Arrow points blocker→blocked so it reads "a blocks b" (b is blocked by a): source = blocker
+    // (edge.to), target = blocked (edge.from).
+    expect(built.source).toBe("a");
+    expect(built.target).toBe("b");
     expect(built.inCycle).toBe(false);
   });
 
-  it("lays epics left-to-right along the blocks direction (dagre LR)", () => {
+  it("lays prerequisites first, left-to-right (blocker before blocked, dagre LR)", () => {
     const epics = [epic("blocked"), epic("blocker")];
     const graph = buildProjectGraph("proj", epics, [edge("blocked", "blocker")]);
 
     const blocked = graph.nodes.find((n) => n.id === "blocked")!;
     const blocker = graph.nodes.find((n) => n.id === "blocker")!;
-    expect(blocked.position.x).toBeLessThan(blocker.position.x);
+    expect(blocker.position.x).toBeLessThan(blocked.position.x);
   });
 
   it("preserves the inCycle flag so cycle edges can render distinctly", () => {
