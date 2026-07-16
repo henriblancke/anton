@@ -19,6 +19,7 @@ import "@xyflow/react/dist/style.css";
 import type { DepEdge, DepType, Epic, Stage, Ticket } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { layoutGraphNodes, type GraphLayoutNode } from "@/components/epic/graph-layout";
+import { orientEdge } from "@/components/epic/dependency-graph-model";
 
 const STAGE_VAR: Record<Stage, string> = {
   backlog: "var(--stage-backlog)",
@@ -123,19 +124,6 @@ const DEP_EDGE_STYLE: Record<DepType, { label: string; stroke: string; dashed?: 
   related: { label: "related", stroke: "var(--color-muted-foreground)", dashed: true, opacity: 0.5 },
   "discovered-from": { label: "discovered from", stroke: "var(--color-muted-foreground)", dashed: true, opacity: 0.35 },
 };
-
-/**
- * beads stores every edge dependent→blocker (`from` = issue_id = the dependent/blocked side).
- * For `blocks` that means the raw direction is the reverse of how the "blocks" label reads, so
- * flip it to blocker→blocked — the arrow then reads "X blocks Y" and agrees with the board's
- * "blocked by" chip. Other edge types (part of / related / discovered from) already read correctly
- * in the stored direction and are left as-is.
- */
-function orientEdge(edge: DepEdge): { source: string; target: string } {
-  return edge.type === "blocks"
-    ? { source: edge.to, target: edge.from }
-    : { source: edge.from, target: edge.to };
-}
 
 function buildGraph(
   epic: Epic,

@@ -206,8 +206,9 @@ export function EpicBoard({ slug, initialBoard }: { slug: string; initialBoard: 
     <DndContext
       // Stable id → deterministic aria-describedby. dnd-kit's useUniqueId falls back to a
       // module-level counter that drifts between SSR and hydration (DndDescribedBy-0 vs -N);
-      // passing an explicit id short-circuits it and kills the hydration mismatch.
-      id="epic-board"
+      // passing an explicit id short-circuits it and kills the hydration mismatch. Scope by
+      // slug so multiple boards on a page still get distinct, deterministic ids.
+      id={`epic-board-${slug}`}
       sensors={sensors}
       collisionDetection={closestCorners}
       modifiers={[restrictToWindowEdges]}
