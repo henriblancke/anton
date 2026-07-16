@@ -1,0 +1,50 @@
+# Codex review. Asks Codex to review every pull request, including on each new commit pushed to the
+# PR branch. The review focus/instructions come from REVIEW.md in the repo root — edit that file to
+# change what Codex checks.
+#
+# Requires the Codex GitHub app to be connected to this repo (ChatGPT → Codex → GitHub settings).
+# Without that connection the @codex mention posts but nothing reviews. Codex also reads AGENTS.md
+# for general conventions; REVIEW.md is a review-specific layer on top.
+name: codex review
+
+on:
+  pull_request:
+    # opened / reopened / ready_for_review — PR lifecycle; synchronize — new commits pushed to the
+    # PR branch (runs on every commit).
+    types: [opened, reopened, ready_for_review, synchronize]
+
+# The default GITHUB_TOKEN needs write access to post the PR comment.
+permissions:
+  contents: read
+  pull-requests: write
+
+# Collapse superseded requests on the same PR (e.g. rapid pushes) into the latest one.
+concurrency:
+  group: codex-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  request-review:
+    runs-on: ubuntu-latest
+    # Skip drafts. `pull_request` never runs on forks with a writable token, so this is aimed at
+    # same-repo branch PRs.
+    if: github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Post Codex review request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          BODY_FILE="$(mktemp)"
+          {
+            echo "@codex review"
+            echo
+            if [ -f REVIEW.md ]; then
+              cat REVIEW.md
+            else
+              echo "_(No REVIEW.md found in the repo root — reviewing with defaults.)_"
+            fi
+          } > "$BODY_FILE"
+          gh pr comment "$PR_NUMBER" --body-file "$BODY_FILE"
