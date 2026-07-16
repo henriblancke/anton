@@ -95,7 +95,7 @@ export function StandaloneChip({
           {item.title}
         </h4>
         {item.prRef && (
-          <PrLink href={item.prUrl} className="pointer-events-auto">
+          <PrLink href={item.prUrl} className={item.prUrl ? "pointer-events-auto" : undefined}>
             <MetaChip tone={item.stage === "done" ? "done" : "pr"}>
               <GitPullRequestIcon className="size-2.5" aria-hidden="true" />
               {prLabel(item.prRef)}
