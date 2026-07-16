@@ -68,8 +68,15 @@ export async function resolveFreshBase(repoPath: string, base: string): Promise<
     // No origin (e.g. a local-only repo) — nothing to fetch; branch off the local base.
     return base;
   }
+  const trackingRef = `refs/remotes/origin/${base}`;
   try {
-    await fetchOrigin(repoPath, [base]);
+    // Explicit destination refspec: a bare `git fetch origin <base>` honours origin's configured
+    // fetch refspec, so in repos with a custom or missing refspec it can succeed while only
+    // updating FETCH_HEAD — leaving `origin/<base>` stale or absent. Naming the destination forces
+    // the remote-tracking ref to be written; `+` allows a non-fast-forward update.
+    await fetchOrigin(repoPath, [`+refs/heads/${base}:${trackingRef}`]);
+    // Confirm the ref actually resolves before branching a run off it (throws → fall back).
+    await git(repoPath, ["rev-parse", "--verify", "--quiet", trackingRef]);
     return `origin/${base}`;
   } catch (e) {
     console.warn(
