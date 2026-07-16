@@ -91,8 +91,11 @@ suite("execute-epic e2e (real handler · real bd/git · fake claude/gh)", () => 
 
     const g = (args: string[], cwd = repo) => execFileSync("git", args, { cwd, stdio: "ignore" });
 
-    // Bare remote + working repo pushed to it.
-    execFileSync("git", ["init", "--bare", "-q", bare], { stdio: "ignore" });
+    // Bare remote + working repo pushed to it. `-b main` pins the bare HEAD to refs/heads/main
+    // so clones of this remote (e.g. pushFreshBaseCommit) check out main; otherwise hosts whose
+    // default branch is `master` leave the clone on an unborn `master` and `git push origin main`
+    // fails with "src refspec main does not match any".
+    execFileSync("git", ["init", "--bare", "-q", "-b", "main", bare], { stdio: "ignore" });
     g(["init", "-q", "-b", "main"]);
     g(["config", "user.email", "t@example.com"]);
     g(["config", "user.name", "anton-test"]);

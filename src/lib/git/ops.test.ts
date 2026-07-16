@@ -125,7 +125,11 @@ suite("resolveFreshBase (real git)", () => {
     bare = join(sandbox, "remote.git");
     mkdirSync(repo);
 
-    execFileSync("git", ["init", "--bare", "-q", bare], { stdio: "ignore" });
+    // `-b main` on the bare remote so its HEAD points at refs/heads/main. Without it, hosts
+    // whose default branch is `master` leave clones of this remote (see the "other" clone below)
+    // with no `main` checked out, so later commits land on an unborn `master` and
+    // `git push origin main` fails with "src refspec main does not match any".
+    execFileSync("git", ["init", "--bare", "-q", "-b", "main", bare], { stdio: "ignore" });
     execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
     g(repo, ["config", "user.email", "t@example.com"]);
     g(repo, ["config", "user.name", "anton-test"]);
