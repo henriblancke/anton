@@ -47,6 +47,11 @@ export interface Epic {
   createdBy: string | null; // who created the epic bead
   prRef?: string;
   prUrl?: string; // browser URL for the PR, resolved from prRef + the repo's origin remote
+  // Epic→epic dependency rollup from computeEpicGraph (epic-graph.ts), attached in board.ts.
+  blockedBy: string[]; // epic ids that currently block this epic (open blockers); empty when ready
+  ready: boolean; // no open blockers — mirrors what the runtime's bd-ready would actually pick up
+  rank: number; // topological rank (0 = no blockers); drives dependency-aware backlog order
+  priority: number; // bead priority (0=critical … 4=lowest); backlog tiebreak after rank
   tickets: Ticket[];
 }
 

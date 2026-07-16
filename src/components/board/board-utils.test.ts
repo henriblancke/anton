@@ -2,9 +2,29 @@ import { describe, expect, it } from "vitest";
 import {
   STAGE_ACCENT_DOT,
   STAGE_LABELS,
+  compareBacklogEpics,
   moveEpicBetweenColumns,
 } from "@/components/board/board-utils";
 import { STAGES, type Epic, type Stage } from "@/lib/types";
+
+/** A ready, rank-0 backlog epic; override the dependency/sort fields per test. */
+function makeEpic(id: string, over: Partial<Epic> = {}): Epic {
+  return {
+    id,
+    title: id,
+    approved: false,
+    stage: "backlog",
+    assignee: null,
+    createdAt: "",
+    createdBy: null,
+    blockedBy: [],
+    ready: true,
+    rank: 0,
+    priority: 4,
+    tickets: [],
+    ...over,
+  };
+}
 
 describe("STAGE_LABELS", () => {
   it("has a human label for every stage", () => {
@@ -22,21 +42,32 @@ describe("STAGE_ACCENT_DOT", () => {
   });
 });
 
+describe("compareBacklogEpics", () => {
+  it("orders ready-first, then rank, then priority, then createdAt", () => {
+    const ready = makeEpic("ready", { ready: true, rank: 5 });
+    const blocked = makeEpic("blocked", { ready: false, blockedBy: ["x"], rank: 0 });
+    // Ready beats a lower-rank blocked epic.
+    expect([blocked, ready].sort(compareBacklogEpics).map((e) => e.id)).toEqual(["ready", "blocked"]);
+
+    // Among ready epics, a blocker (lower rank) precedes what it blocks (higher rank).
+    const blocker = makeEpic("blocker", { rank: 0 });
+    const dependent = makeEpic("dependent", { rank: 1 });
+    expect([dependent, blocker].sort(compareBacklogEpics).map((e) => e.id)).toEqual([
+      "blocker",
+      "dependent",
+    ]);
+
+    // Same rank → priority (0=critical wins) → createdAt tiebreak.
+    const p0 = makeEpic("p0", { priority: 0, createdAt: "2026-01-02" });
+    const p2 = makeEpic("p2", { priority: 2, createdAt: "2026-01-01" });
+    expect([p2, p0].sort(compareBacklogEpics).map((e) => e.id)).toEqual(["p0", "p2"]);
+  });
+});
+
 describe("moveEpicBetweenColumns", () => {
   function makeColumns(): Record<Stage, Epic[]> {
     return {
-      backlog: [
-        {
-          id: "e1",
-          title: "Epic 1",
-          approved: false,
-          stage: "backlog",
-          assignee: null,
-          createdAt: "",
-          createdBy: null,
-          tickets: [],
-        },
-      ],
+      backlog: [makeEpic("e1", { title: "Epic 1" })],
       implementing: [],
       "in-review": [],
       done: [],
@@ -58,17 +89,22 @@ describe("moveEpicBetweenColumns", () => {
 
   it("prepends the moved epic in the destination column", () => {
     const columns = makeColumns();
-    columns.done.push({
-      id: "e2",
-      title: "Epic 2",
-      approved: true,
-      stage: "done",
-      assignee: null,
-      createdAt: "",
-      createdBy: null,
-      tickets: [],
-    });
+    columns.done.push(makeEpic("e2", { title: "Epic 2", approved: true, stage: "done" }));
     const next = moveEpicBetweenColumns(columns, "e1", "done");
     expect(next.done.map((e) => e.id)).toEqual(["e1", "e2"]);
+  });
+
+  it("re-sorts a move that lands in the backlog into dependency-aware order", () => {
+    // A blocked epic dragged back to the backlog must settle below the ready epics already there,
+    // not jump to the top — the optimistic prepend is reconciled with compareBacklogEpics.
+    const columns: Record<Stage, Epic[]> = {
+      backlog: [makeEpic("ready-a", { rank: 0 }), makeEpic("ready-b", { rank: 1 })],
+      implementing: [makeEpic("blocked", { ready: false, blockedBy: ["ready-a"], rank: 2 })],
+      "in-review": [],
+      done: [],
+    };
+    const next = moveEpicBetweenColumns(columns, "blocked", "backlog");
+    expect(next.backlog.map((e) => e.id)).toEqual(["ready-a", "ready-b", "blocked"]);
+    expect(next.implementing).toEqual([]);
   });
 });

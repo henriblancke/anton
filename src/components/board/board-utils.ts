@@ -68,8 +68,24 @@ export function ticketProgress(epic: { tickets: Ticket[] }): {
   return { done, total, pct };
 }
 
+/**
+ * Dependency-aware backlog order, shared by the server board build (board.ts) and the client
+ * optimistic reconcile so both agree on one order: ready epics first, then topological rank (a
+ * blocker precedes what it blocks), then priority, then created-at, with id as a stable tiebreak.
+ */
+export function compareBacklogEpics(a: Epic, b: Epic): number {
+  if (a.ready !== b.ready) return a.ready ? -1 : 1;
+  if (a.rank !== b.rank) return a.rank - b.rank;
+  if (a.priority !== b.priority) return a.priority - b.priority;
+  if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? -1 : 1;
+  return a.id < b.id ? -1 : 1;
+}
+
 /** Moves an epic (by id) to another stage column, immutably. Used for optimistic
- * drag-and-drop updates before the move API call resolves. No-op if the epic isn't found. */
+ * drag-and-drop updates before the move API call resolves. No-op if the epic isn't found.
+ * A move that lands in the backlog is re-sorted (compareBacklogEpics) so the prepended card
+ * settles into dependency-aware order instead of jumping to the top; other columns keep
+ * insertion order (newest-moved first). */
 export function moveEpicBetweenColumns(
   columns: Record<Stage, Epic[]>,
   epicId: string,
@@ -92,6 +108,7 @@ export function moveEpicBetweenColumns(
   }
 
   if (!moved) return columns;
-  next[toStage] = [{ ...moved, stage: toStage }, ...next[toStage]];
+  const inserted = [{ ...moved, stage: toStage }, ...next[toStage]];
+  next[toStage] = toStage === "backlog" ? inserted.sort(compareBacklogEpics) : inserted;
   return next;
 }

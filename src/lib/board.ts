@@ -1,8 +1,10 @@
 /**
  * Assembles the Board from beads. Stage/approval/PR are derived — never stored. See DESIGN.md §2/§3.
  */
+import { compareBacklogEpics } from "@/components/board/board-utils";
 import { beads, getSyncStatus, getSyncStatusToken, type Bead } from "./beads/bd";
 import { allIssues } from "./beads/issues";
+import { computeEpicGraph } from "./epic-graph";
 import { issueSnapshotVersion } from "./beads/snapshot";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
 import { parseAcceptance, parseGoal, toEpic, toTicket } from "./ticket-view";
@@ -52,13 +54,21 @@ export async function getBoard(project: Project): Promise<Board> {
     done: [],
   };
 
+  // Derive epic→epic dependency rollup once (blockedBy/ready/rank), so the board reflects the
+  // readiness the runtime's bd-ready enforces. Degrades to a stable order on a cycle (epic-graph.ts).
+  const graphNodes = new Map(computeEpicGraph(allBeads).epics.map((n) => [n.id, n]));
+
   for (const epic of epicBeads) {
     const children = childrenByEpic.get(epic.id) ?? [];
     const tickets = children.map(toTicket);
+    const node = graphNodes.get(epic.id);
     const built = toEpic(epic, {
       goal: parseGoal(epic.description),
       acceptance: parseAcceptance(epic),
       tickets,
+      blockedBy: node?.blockedBy ?? [],
+      ready: node?.ready ?? true,
+      rank: node?.rank ?? 0,
     });
     columns[built.stage].push(built);
   }
@@ -72,6 +82,10 @@ export async function getBoard(project: Project): Promise<Board> {
   for (const stage of STAGES) {
     if (!columns[stage]) columns[stage] = [];
   }
+
+  // Only the backlog is dependency-aware ordered (ready-first → rank → priority → createdAt); the
+  // other columns are stage-based, so deps can't reorder across them — they keep insertion order.
+  columns.backlog.sort(compareBacklogEpics);
 
   // Resolve PR links from the repo's origin remote (once) so `gh-<n>` refs become clickable.
   const base = await githubBaseUrl(project.repoPath);

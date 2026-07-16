@@ -3,7 +3,7 @@
 import { useState } from "react";
 import Link from "next/link";
 import { toast } from "sonner";
-import { CircleCheckIcon, GitPullRequestIcon } from "lucide-react";
+import { CircleCheckIcon, GitPullRequestIcon, LockIcon } from "lucide-react";
 
 import type { Epic } from "@/lib/types";
 import { Button } from "@/components/ui/button";
@@ -17,6 +17,20 @@ import { CopyButton } from "@/components/ui/copy-button";
 function prLabel(ref: string): string {
   const m = /(\d+)\s*$/.exec(ref);
   return m ? `#${m[1]}` : ref;
+}
+
+/** "blocked by <id>" chip — marks an epic the runtime's bd-ready won't pick up yet. Shows the
+ * first open blocker with a "+N" when there are several; the full list rides in the title. */
+function BlockedChip({ blockedBy }: { blockedBy: string[] }) {
+  if (blockedBy.length === 0) return null;
+  const [first, ...rest] = blockedBy;
+  const label = rest.length > 0 ? `blocked by ${first} +${rest.length}` : `blocked by ${first}`;
+  return (
+    <MetaChip tone="blocked">
+      <LockIcon className="size-2.5" aria-hidden="true" />
+      <span title={`blocked by ${blockedBy.join(", ")}`}>{label}</span>
+    </MetaChip>
+  );
 }
 
 export function EpicCard({
@@ -194,6 +208,10 @@ function CardShell({
       ? STAGE_INSET_SHADOW[epic.stage]
       : undefined;
 
+  // A blocked epic (open blockers) is dimmed in every column so it reads as "the runtime won't
+  // pick this up yet", mirroring the "blocked by" chip. Done cards are never blocked in practice.
+  const blocked = !epic.ready;
+
   return (
     <div
       className={cn(
@@ -201,6 +219,7 @@ function CardShell({
         !overlay && "hover:border-ring/40",
         overlay && "rotate-1 shadow-lg ring-1 ring-ring/30",
         muted && "bg-card/70",
+        blocked && "opacity-60",
         inset,
       )}
     >
@@ -212,7 +231,10 @@ function CardShell({
           <span className="sr-only">Open epic {epic.title}</span>
         </Link>
       )}
-      <div className="pointer-events-none relative z-[1] flex flex-col gap-2.5">{children}</div>
+      <div className="pointer-events-none relative z-[1] flex flex-col gap-2.5">
+        {blocked && <BlockedChip blockedBy={epic.blockedBy} />}
+        {children}
+      </div>
     </div>
   );
 }
