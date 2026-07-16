@@ -32,6 +32,10 @@ let beads: typeof import("@/lib/beads/bd").beads;
 
 suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd)", () => {
   let blocked = "";
+  // A ready epic used to prove the gate reads fresh beads, not a warm board snapshot.
+  let ready = "";
+  let readyChild = "";
+  let externalBlockerChild = "";
 
   beforeAll(async () => {
     workDir = mkdtempSync(join(tmpdir(), "anton-approve-route-"));
@@ -72,6 +76,15 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     await beads.link(repo, t2, blocker, "parent-child");
     await beads.link(repo, t1, t2, "blocks");
 
+    // A second, initially-ready epic plus a standalone blocker whose child we later wire in via a
+    // raw `bd` call, simulating another process adding a cross-epic edge behind the board snapshot.
+    ready = await beads.create(repo, { title: "Ready epic", type: "epic" });
+    const externalBlocker = await beads.create(repo, { title: "External blocker epic", type: "epic" });
+    readyChild = await beads.create(repo, { title: "Ticket in ready", type: "task" });
+    externalBlockerChild = await beads.create(repo, { title: "Ticket in external blocker", type: "task" });
+    await beads.link(repo, readyChild, ready, "parent-child");
+    await beads.link(repo, externalBlockerChild, externalBlocker, "parent-child");
+
     await getDb().insert(schema.projects).values({
       id: randomUUID(),
       slug: "approvy",
@@ -91,6 +104,26 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
 
     // The gate must reject *before* tagging: the epic stays un-approved.
     const bead = await beads.show(repo, blocked);
+    expect(beads.isApproved(bead)).toBe(false);
+  }, 60_000);
+
+  it("re-reads beads before gating, so a blocker added behind a warm snapshot still 409s", async () => {
+    // Warm the board snapshot while `ready` has no blockers — the cached view sees it as ready.
+    const { allIssues } = await import("@/lib/beads/issues");
+    await allIssues(repo);
+
+    // Add the cross-epic `blocks` edge through the raw CLI (mirrors beads.link's args) so the
+    // wrapper's snapshot invalidation never fires — exactly the stale-snapshot race under review.
+    execFileSync("bd", ["link", readyChild, externalBlockerChild, "--type", "blocks"], {
+      cwd: repo,
+      stdio: "ignore",
+    });
+
+    const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", ready));
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toMatch(/blocked by/i);
+
+    const bead = await beads.show(repo, ready);
     expect(beads.isApproved(bead)).toBe(false);
   }, 60_000);
 
