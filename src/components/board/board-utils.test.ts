@@ -84,6 +84,17 @@ describe("sortEpics", () => {
     ]);
   });
 
+  it("sinks a lone unknown tier last even when its id sorts first", () => {
+    // Exactly one side is unknown → the delta is ±Infinity, not NaN. The unknown epic must
+    // still sink last despite a lexically smaller id winning every compareBacklogEpics tiebreak.
+    const labelled = makeEpic("zeta", { risk: "high" });
+    const unlabelled = makeEpic("aaa");
+    expect(sortEpics([unlabelled, labelled], "risk").map((e) => e.id)).toEqual([
+      "zeta",
+      "aaa",
+    ]);
+  });
+
   it("falls back to dependency-aware order when both epics have unknown risk/size", () => {
     // Both lack a risk label → tierRank returns Infinity on each side and the delta is NaN;
     // the comparator must fall through to compareBacklogEpics (rank order here), not freeze

@@ -112,11 +112,12 @@ export function compareEpicsBy(sort: Exclude<BoardSort, "default">, a: Epic, b: 
   const table = sort === "risk" ? RISK_RANK : SIZE_RANK;
   const field = sort === "risk" ? a.risk : a.size;
   const otherField = sort === "risk" ? b.risk : b.size;
-  // Both tiers unknown → tierRank returns Infinity on each side and the subtraction is NaN;
-  // guard on Number.isFinite so those pairs fall through to the dependency-aware order instead
-  // of returning NaN (which sort treats as equality, freezing the input order).
+  // Subtracting the two tier ranks yields NaN only when BOTH are unknown (Infinity - Infinity);
+  // guard on Number.isNaN so that pair falls through to the dependency-aware order. When exactly
+  // one is unknown the delta is ±Infinity, which correctly sinks the unknown side last (the UI
+  // promise), so we must NOT treat it as a fall-through — only the both-unknown NaN case does.
   const delta = tierRank(field, table) - tierRank(otherField, table);
-  if (Number.isFinite(delta) && delta !== 0) return delta;
+  if (!Number.isNaN(delta) && delta !== 0) return Math.sign(delta);
   return compareBacklogEpics(a, b);
 }
 
