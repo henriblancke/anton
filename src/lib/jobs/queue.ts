@@ -7,7 +7,7 @@
  * clock. Times are stored as unix SECONDS (the schema's timestamp mode); this module works in ms
  * and converts at the boundary.
  */
-import { and, eq, gt, inArray, lte, notInArray, or, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, isNull, lte, not, notInArray, or, sql } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { randomUUID } from "node:crypto";
 import * as schema from "../db/schema";
@@ -187,16 +187,30 @@ export function enqueueExecuteEpicDeduped(
  * lapsed — a missed renewal from laptop sleep or a transient DB failure — would look reclaimable and
  * get leased a second time, running two handlers against the same job/worktree. Excluding it here
  * also avoids burning an attempt and overwriting its live lease.
+ *
+ * `excludeBucketKeys` filters out whole `(type, projectId)` buckets — keyed by `scheduleGateKey` — at
+ * the SQL level, BEFORE the finite scan window. This is the starvation guard for hard-held buckets
+ * (a disabled schedule or an autonomy-off project, both cap 0): `capOf` alone would let their jobs
+ * fill the earliest-by-`runAt` scan window and be skipped, so every tick keeps re-scanning the same
+ * gated prefix and never reaches leasable work for other schedules/projects (anton-7l7). Excluding
+ * them in the query paginates past them instead. `capOf` still enforces the cap as a backstop.
  */
 export async function leaseDue(
   db: AntonDb,
   clock: Clock,
-  opts: { leaseMs: number; limit: number; capOf?: (job: JobRow) => number; exclude?: Iterable<string> },
+  opts: {
+    leaseMs: number;
+    limit: number;
+    capOf?: (job: JobRow) => number;
+    exclude?: Iterable<string>;
+    excludeBucketKeys?: Iterable<string>;
+  },
 ): Promise<JobRow[]> {
   const nowMs = clock.now();
   const nowDate = secDate(nowMs);
   const leaseDate = secDate(nowMs + opts.leaseMs);
   const excludeIds = opts.exclude ? [...opts.exclude] : [];
+  const excludeBuckets = opts.excludeBucketKeys ? [...opts.excludeBucketKeys] : [];
 
   // Without per-bucket caps, the DB `limit` alone bounds the result. With caps we must scan more
   // candidates than `limit` (some get skipped for being at capacity), so widen the fetch.
@@ -205,10 +219,31 @@ export async function leaseDue(
     and(eq(schema.jobs.status, "queued"), lte(schema.jobs.runAt, nowDate)),
     and(eq(schema.jobs.status, "running"), lte(schema.jobs.leaseExpiresAt, nowDate)),
   );
+  // Drop hard-held buckets before the scan window so they can't crowd out leasable work. Each key is
+  // `scheduleGateKey(type, projectId)`; an empty projectId segment means the null-project bucket.
+  const heldBucketFilter =
+    excludeBuckets.length > 0
+      ? not(
+          or(
+            ...excludeBuckets.map((key) => {
+              const [type, projectId] = key.split("\0");
+              return and(
+                eq(schema.jobs.type, type),
+                projectId === "" ? isNull(schema.jobs.projectId) : eq(schema.jobs.projectId, projectId),
+              );
+            }),
+          )!,
+        )
+      : undefined;
+  const where = and(
+    runnable,
+    excludeIds.length > 0 ? notInArray(schema.jobs.id, excludeIds) : undefined,
+    heldBucketFilter,
+  );
   const candidates = await db
     .select()
     .from(schema.jobs)
-    .where(excludeIds.length > 0 ? and(runnable, notInArray(schema.jobs.id, excludeIds)) : runnable)
+    .where(where)
     .orderBy(schema.jobs.runAt)
     .limit(scanLimit);
 

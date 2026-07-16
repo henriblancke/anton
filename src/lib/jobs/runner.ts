@@ -303,6 +303,13 @@ export class JobRunner {
     // still-queued job resumes on the next tick. Read every tick so a mid-run toggle takes effect.
     const disabledSchedules = await disabledScheduleKeys(this.db);
 
+    // Hard-held buckets (cap 0 regardless of load) are excluded from leaseDue's scan window at the
+    // SQL level, not just skipped by capOf — otherwise a large backlog of disabled/autonomy-off jobs
+    // (the earliest by runAt) fills the finite scan window every tick and starves leasable work for
+    // other schedules and projects (anton-7l7). Seed with disabled schedules; autonomy-off projects
+    // are added below. capOf still enforces cap 0 as a backstop for anything not excluded (quiesce).
+    const heldBucketKeys = new Set<string>(disabledSchedules);
+
     // With a policy resolver, gate execute-epic concurrency per project. Precompute each pending
     // project's cap so leaseDue can decide synchronously; other job types stay ungated (Infinity).
     let policyCapOf: ((job: JobRow) => number) | undefined;
@@ -313,7 +320,11 @@ export class JobRunner {
         const policy = await this.policyFor(pid ?? undefined);
         // Autonomy master-switch: off → cap 0, so no execute-epic job for this project is leased
         // (they stay queued and resume when the switch turns back on). See JobPolicy.autonomy.
-        concByProject.set(pid ?? "", policy.autonomy === false ? 0 : policy.concurrency);
+        const cap = policy.autonomy === false ? 0 : policy.concurrency;
+        concByProject.set(pid ?? "", cap);
+        // Cap 0 is a hard hold — exclude the whole bucket from the scan window so its backlog can't
+        // starve other work (same rationale as disabled schedules above).
+        if (cap === 0) heldBucketKeys.add(scheduleGateKey("execute-epic", pid));
       }
       policyCapOf = (job) =>
         job.type === "execute-epic"
@@ -330,6 +341,7 @@ export class JobRunner {
       leaseMs: this.config.leaseMs,
       limit: capacity,
       capOf,
+      excludeBucketKeys: heldBucketKeys,
       // Never re-lease a job already dispatched in this process. Rolling dispatch keeps a running
       // job in `inFlight` while its handler works; if its lease lapses (missed renewal from sleep or
       // a transient DB failure) its row looks reclaimable, and without this a spare-capacity tick

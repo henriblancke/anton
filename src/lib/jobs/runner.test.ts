@@ -598,6 +598,55 @@ describe("JobRunner (live, in-memory db)", () => {
     expect((await getJob(tdb.db, reviewId))?.status).toBe("queued");
   });
 
+  it("a large disabled-schedule backlog doesn't starve leasable work past the scan window (anton-7l7)", async () => {
+    // Regression: disabled jobs sort earliest by runAt, so before the SQL-level bucket exclusion they
+    // filled leaseDue's finite scan window (max(limit*8, 200)) every tick; the cap-0 skip then left a
+    // leasable job sorting AFTER them permanently unreachable — enabled schedules and other projects
+    // stalled until the disabled ones were re-enabled or removed. Excluding held buckets in the query
+    // paginates past the backlog so leasable work is still reached.
+    await seedProjects("A", "B");
+    await seedSchedule("A", "review-fix", { enabled: false });
+
+    // 250 disabled review-fix jobs (> the 200-row scan window) as the earliest-by-runAt prefix.
+    const backlogAt = new Date(clock.now() - 10_000);
+    await tdb.db.insert(schema.jobs).values(
+      Array.from({ length: 250 }, (_, i) => ({
+        id: `held-${i}`,
+        type: "review-fix" as const,
+        projectId: "A",
+        status: "queued" as const,
+        runAt: backlogAt,
+        attempts: 0,
+      })),
+    );
+    // One leasable execute-epic (autonomy on) for another project, sorted AFTER the whole backlog.
+    await tdb.db.insert(schema.jobs).values({
+      id: "leasable",
+      type: "execute-epic",
+      projectId: "B",
+      status: "queued",
+      runAt: new Date(clock.now() - 1_000),
+      attempts: 0,
+    });
+
+    let epicRan = 0;
+    const r = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { ...CONFIG, maxConcurrent: 5 },
+      resolvePolicy: () => policy({ concurrency: 2, autonomy: true }),
+    });
+    r.registerHandler("review-fix", async () => {});
+    r.registerHandler("execute-epic", async () => {
+      epicRan += 1;
+    });
+
+    expect(await r.tickOnce()).toBe(1); // reaches past the 250 held jobs to lease the execute-epic
+    await r.whenIdle();
+    expect(epicRan).toBe(1);
+    expect((await getJob(tdb.db, "leasable"))?.status).toBe("done");
+  });
+
   it("aborts a job that exceeds its per-project timeout and retries it", async () => {
     // Handler blocks until aborted; a 20ms timeout fires, aborts it → retryable 'timed out' error.
     const r = policyRunner(
