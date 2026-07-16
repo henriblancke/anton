@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo } from "react";
+import { useEffect, useMemo } from "react";
 import {
   Background,
   BackgroundVariant,
@@ -9,6 +9,7 @@ import {
   MarkerType,
   Position,
   ReactFlow,
+  useNodesState,
   type Edge,
   type Node,
   type NodeProps,
@@ -39,12 +40,16 @@ const REACT_FLOW_CHROME_CLASS = [
   "[&_.react-flow__controls]:border-border",
   "[&_.react-flow__controls]:bg-card",
   "[&_.react-flow__controls]:shadow-none",
-  "[&_.react-flow__controls-button]:border-b",
-  "[&_.react-flow__controls-button]:border-border",
-  "[&_.react-flow__controls-button]:bg-card",
-  "[&_.react-flow__controls-button]:fill-foreground",
-  "[&_.react-flow__controls-button:hover]:bg-muted",
-  "[&_.react-flow__controls-button:last-child]:border-b-0",
+  // Theme the Controls through ReactFlow's own CSS variables. ReactFlow only applies its dark
+  // palette under `.react-flow.dark` (a class we never set — the app toggles dark on an ancestor),
+  // so its light defaults (white button, grey border) otherwise leak into dark mode. Driving the
+  // vars here follows the app theme in both modes; the button glyph is an <svg fill="currentColor">,
+  // so the button *color* var (not `fill`) is what makes the icon visible.
+  "[--xy-controls-button-background-color:var(--color-card)]",
+  "[--xy-controls-button-background-color-hover:var(--color-muted)]",
+  "[--xy-controls-button-color:var(--color-foreground)]",
+  "[--xy-controls-button-color-hover:var(--color-foreground)]",
+  "[--xy-controls-button-border-color:var(--color-border)]",
 ].join(" ");
 
 interface EpicNodeData extends Record<string, unknown> {
@@ -153,6 +158,8 @@ function buildGraph(
       id: epic.id,
       type: "epic",
       position: positions.get(epic.id) ?? { x: 0, y: 0 },
+      // The epic is the graph's anchor — keep it fixed while its tickets are draggable.
+      draggable: false,
       data: { title: epic.title, goal: epic.goal },
     },
     ...tickets.map(
@@ -160,6 +167,8 @@ function buildGraph(
         id: ticket.id,
         type: "ticket",
         position: positions.get(ticket.id) ?? { x: 0, y: 0 },
+        // Tickets can be dragged to rearrange the layout (positions are view-only, not persisted).
+        draggable: true,
         data: {
           ticket,
           onSelect: onSelectTicket ? () => onSelectTicket(ticket.id) : undefined,
@@ -208,10 +217,14 @@ export function DependencyGraph({
   /** Called with a ticket id when its node is activated; enables the clickable ticket popup. */
   onSelectTicket?: (ticketId: string) => void;
 }) {
-  const { nodes, flowEdges } = useMemo(
+  const { nodes: initialNodes, flowEdges } = useMemo(
     () => buildGraph(epic, tickets, edges, onSelectTicket),
     [epic, tickets, edges, onSelectTicket],
   );
+
+  // Local node state makes ticket drags stick; a fresh layout (epic/tickets/edges change) resets it.
+  const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
+  useEffect(() => setNodes(initialNodes), [initialNodes, setNodes]);
 
   if (tickets.length === 0) {
     return (
@@ -238,11 +251,11 @@ export function DependencyGraph({
       <ReactFlow
         nodes={nodes}
         edges={flowEdges}
+        onNodesChange={onNodesChange}
         nodeTypes={nodeTypes}
         fitView
         fitViewOptions={{ padding: 0.2 }}
         proOptions={{ hideAttribution: true }}
-        nodesDraggable={false}
         nodesConnectable={false}
         nodesFocusable={false}
         minZoom={0.3}

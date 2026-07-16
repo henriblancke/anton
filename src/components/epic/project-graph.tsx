@@ -116,11 +116,16 @@ const CHROME = [
   "[&_.react-flow__controls]:rounded-lg",
   "[&_.react-flow__controls]:border",
   "[&_.react-flow__controls]:border-border",
-  "[&_.react-flow__controls-button]:border-b",
-  "[&_.react-flow__controls-button]:border-border",
-  "[&_.react-flow__controls-button]:bg-card",
-  "[&_.react-flow__controls-button]:fill-foreground",
-  "[&_.react-flow__controls-button:hover]:bg-muted",
+  // Theme the Controls through ReactFlow's own CSS variables. ReactFlow only applies its dark
+  // palette under `.react-flow.dark` (a class we never set — the app toggles dark on an ancestor),
+  // so its light defaults (white button, grey border) otherwise leak into dark mode. Driving the
+  // vars here follows the app theme in both modes; the button glyph is an <svg fill="currentColor">,
+  // so the button *color* var (not `fill`) is what makes the icon visible.
+  "[--xy-controls-button-background-color:var(--color-card)]",
+  "[--xy-controls-button-background-color-hover:var(--color-muted)]",
+  "[--xy-controls-button-color:var(--color-foreground)]",
+  "[--xy-controls-button-color-hover:var(--color-foreground)]",
+  "[--xy-controls-button-border-color:var(--color-border)]",
 ].join(" ");
 
 export function ProjectGraph({ slug }: { slug: string }) {
