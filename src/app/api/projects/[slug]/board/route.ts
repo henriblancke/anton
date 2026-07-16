@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getBoard, getBoardVersion } from "@/lib/board";
-import { getProjectBySlug } from "@/lib/projects";
 import { probeAllIssues, refreshAllIssues } from "@/lib/beads/issues";
+import { resolveProject } from "../resolve-project";
 
 export const dynamic = "force-dynamic";
 
@@ -10,10 +10,8 @@ export async function GET(
   { params }: { params: Promise<{ slug: string }> },
 ) {
   const { slug } = await params;
-  const project = await getProjectBySlug(slug);
-  if (!project) {
-    return NextResponse.json({ error: "Project not found" }, { status: 404 });
-  }
+  const { project, response } = await resolveProject(slug);
+  if (!project) return response;
 
   const knownVersion = new URL(request.url).searchParams.get("version");
   if (knownVersion !== null) {

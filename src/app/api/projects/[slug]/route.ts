@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { deleteProject, getProjectBySlug } from "@/lib/projects";
+import { deleteProject } from "@/lib/projects";
+import { resolveProject } from "./resolve-project";
 
 export const dynamic = "force-dynamic";
 
@@ -8,10 +9,8 @@ export async function DELETE(
   { params }: { params: Promise<{ slug: string }> },
 ) {
   const { slug } = await params;
-  const project = await getProjectBySlug(slug);
-  if (!project) {
-    return NextResponse.json({ error: `Project not found: ${slug}` }, { status: 404 });
-  }
+  const { project, response } = await resolveProject(slug, `Project not found: ${slug}`);
+  if (!project) return response;
 
   try {
     await deleteProject(slug);

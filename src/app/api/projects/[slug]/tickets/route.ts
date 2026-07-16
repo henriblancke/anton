@@ -1,7 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { getTickets } from "@/lib/tickets";
-import { getProjectBySlug } from "@/lib/projects";
 import type { TicketFilters } from "@/lib/types";
+import { resolveProject } from "../resolve-project";
 
 export const dynamic = "force-dynamic";
 
@@ -30,10 +30,8 @@ export async function GET(
   { params }: { params: Promise<{ slug: string }> },
 ) {
   const { slug } = await params;
-  const project = await getProjectBySlug(slug);
-  if (!project) {
-    return NextResponse.json({ error: "Project not found" }, { status: 404 });
-  }
+  const { project, response } = await resolveProject(slug);
+  if (!project) return response;
 
   const tickets = await getTickets(project, parseFilters(request.nextUrl.searchParams));
   return NextResponse.json({ tickets });

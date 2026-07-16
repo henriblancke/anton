@@ -1,7 +1,7 @@
 import { z } from "zod";
 
-import { getProjectBySlug } from "@/lib/projects";
 import { startInteractiveSession } from "@/lib/pty/interactive";
+import { resolveProject } from "../../resolve-project";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -29,10 +29,8 @@ export async function POST(
 ) {
   const { slug } = await params;
 
-  const project = await getProjectBySlug(slug);
-  if (!project) {
-    return Response.json({ error: "Project not found" }, { status: 404 });
-  }
+  const { project, response } = await resolveProject(slug);
+  if (!project) return response;
 
   let body: z.infer<typeof spawnSchema> = {};
   try {
