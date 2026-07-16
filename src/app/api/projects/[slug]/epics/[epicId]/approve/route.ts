@@ -24,7 +24,11 @@ export async function POST(
   // Force a fresh bead read first — this mutating gate must not decide readiness from a warm board
   // snapshot (up to ISSUE_SNAPSHOT_MAX_AGE_MS stale), which could miss a just-added cross-epic
   // `blocks` edge and approve a still-blocked epic.
-  await refreshAllIssues(project.repoPath);
+  // The fresh read returns the loaded beads, so reuse them for the runnability gate below rather than
+  // issuing a second `bd list`. Crucially, `refreshAllIssues` goes through `loadAllIssues`, which
+  // falls back to separate open/closed reads where `--status all` fails; calling `beads.list` directly
+  // here would skip that fallback and 500 the whole approval in exactly the scenario the board handles.
+  const allBeads = await refreshAllIssues(project.repoPath);
 
   // Validate the target is actually runnable *before* touching labels or enqueuing. Approval is the
   // run trigger, so labeling-and-enqueuing a bead that execute-epic will only poison-park is a false
@@ -32,7 +36,6 @@ export async function POST(
   // execute-epic enforces (a shared helper, no duplicated type logic) so the route and the runner
   // agree on what "runnable" means. Read beads fresh (matching execute-epic's `--status all` load) so
   // a missing bead is distinguishable from a found-but-not-runnable one, and the message stays honest.
-  const allBeads = await beads.list(project.repoPath, ["--status", "all"]);
   const target = allBeads.find((b) => b.id === epicId);
   if (!target) {
     return NextResponse.json({ error: `Ticket ${epicId} not found on the board` }, { status: 404 });
