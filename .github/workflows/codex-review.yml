@@ -1,0 +1,56 @@
+# Codex review. Asks Codex to review every pull request, including on each new commit pushed to the
+# PR branch. The review focus/instructions come from REVIEW.md in the repo root — edit that file to
+# change what Codex checks.
+#
+# Requires the Codex GitHub app to be connected to this repo (ChatGPT → Codex → GitHub settings).
+# Without that connection the @codex mention posts but nothing reviews. Codex also reads AGENTS.md
+# for general conventions; REVIEW.md is a review-specific layer on top.
+name: codex review
+
+on:
+  pull_request:
+    # opened / reopened / ready_for_review — PR lifecycle; synchronize — new commits pushed to the
+    # PR branch (runs on every commit).
+    types: [opened, reopened, ready_for_review, synchronize]
+
+# Only needs read here; the comment is posted with a PAT (see CODEX_REVIEW_TOKEN below), not the
+# default GITHUB_TOKEN.
+permissions:
+  contents: read
+
+# Collapse superseded requests on the same PR (e.g. rapid pushes) into the latest one.
+concurrency:
+  group: codex-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  request-review:
+    runs-on: ubuntu-latest
+    # Skip drafts. `pull_request` never runs on forks with a writable token, so this is aimed at
+    # same-repo branch PRs.
+    if: github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Post Codex review request
+        env:
+          # MUST be a PAT belonging to a user with a connected Codex seat — NOT the default
+          # GITHUB_TOKEN. Codex resolves which seat runs the review from the comment's author; the
+          # default token authors comments as github-actions[bot], which has no Codex seat, so Codex
+          # replies "To use Codex here, create a Codex account and connect to github" instead of
+          # reviewing. Store the PAT as the repo/org secret CODEX_REVIEW_TOKEN (fine-grained, Pull
+          # requests: Read and write).
+          GH_TOKEN: ${{ secrets.CODEX_REVIEW_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          BODY_FILE="$(mktemp)"
+          {
+            echo "@codex review"
+            echo
+            if [ -f REVIEW.md ]; then
+              cat REVIEW.md
+            else
+              echo "_(No REVIEW.md found in the repo root — reviewing with defaults.)_"
+            fi
+          } > "$BODY_FILE"
+          gh pr comment "$PR_NUMBER" --body-file "$BODY_FILE"
