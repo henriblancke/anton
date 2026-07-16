@@ -17,6 +17,22 @@ export async function POST(
     return NextResponse.json({ error: "Project not found" }, { status: 404 });
   }
 
+  // Gate approval on readiness: approving enqueues execute-epic immediately, so an epic with open
+  // blockers must not be startable before its blocker completes. Locate it across stages first.
+  const board = await getBoard(project);
+  const epic = STAGES.map((stage) => board.columns[stage].find((e) => e.id === epicId)).find(
+    Boolean,
+  );
+  if (!epic) {
+    return NextResponse.json({ error: "Epic not found" }, { status: 404 });
+  }
+  if (!epic.ready) {
+    return NextResponse.json(
+      { error: `Epic is blocked by ${epic.blockedBy.join(", ")}` },
+      { status: 409 },
+    );
+  }
+
   await beads.approve(project.repoPath, epicId);
   await beads
     .sync(project.repoPath)
@@ -33,11 +49,12 @@ export async function POST(
     console.error(`[approve] failed to enqueue execute-epic for ${epicId}`, err);
   }
 
-  const board = await getBoard(project);
+  // Re-read so the response reflects the post-approval state.
+  const updatedBoard = await getBoard(project);
   for (const stage of STAGES) {
-    const epic = board.columns[stage].find((e) => e.id === epicId);
-    if (epic) {
-      return NextResponse.json({ epic, jobId });
+    const updated = updatedBoard.columns[stage].find((e) => e.id === epicId);
+    if (updated) {
+      return NextResponse.json({ epic: updated, jobId });
     }
   }
 

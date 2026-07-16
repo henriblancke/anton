@@ -77,7 +77,10 @@ export function EpicCard({
     }
   }
 
-  const showApprove = epic.stage === "backlog" && !approved;
+  // Gate approval on readiness, not just stage: approving enqueues execute-epic immediately, so a
+  // blocked epic (open blockers) must not be startable before its blocker completes (mirrors the
+  // approve route, which rejects a not-ready epic).
+  const showApprove = epic.stage === "backlog" && !approved && epic.ready;
   const { done, total, pct } = ticketProgress(epic);
   const isDone = epic.stage === "done";
 
