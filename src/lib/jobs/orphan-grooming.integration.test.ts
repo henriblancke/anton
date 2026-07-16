@@ -31,8 +31,10 @@ class FakeClock implements Clock {
   }
 }
 
-function createTicket(repo: string, title: string, parent?: string): string {
-  const args = ["create", title, "--type", "task", "--acceptance", "x", "--json"];
+// Orphans grooming buckets are the NON-runnable loose types (a parentless task/bug is a runnable
+// standalone target that grooming must leave alone — anton-cmz), so loose tickets default to `chore`.
+function createTicket(repo: string, title: string, parent?: string, type = "chore"): string {
+  const args = ["create", title, "--type", type, "--acceptance", "x", "--json"];
   if (parent) args.push("--parent", parent);
   const raw = execFileSync("bd", args, { cwd: repo, encoding: "utf8" });
   const p = JSON.parse(raw);
