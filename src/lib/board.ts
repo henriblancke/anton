@@ -33,15 +33,20 @@ function compareStandalone(a: StandaloneItem, b: StandaloneItem): number {
 }
 
 export async function getBoard(project: Project): Promise<Board> {
-  let allBeads = await allIssues(project.repoPath);
+  // The raw, unfiltered bead list. Keep it around for blocker readiness below: the standalone-blocker
+  // helpers treat a blocker missing from the list as still-open (fail-safe), so readiness must be
+  // derived against every bead — including intentionally-hidden types — or a `blocks` edge to an
+  // already-closed `molecule` would surface as a phantom open blocker (matches the approve route,
+  // which gates on the same unfiltered `--status all` read).
+  const allBeads = await allIssues(project.repoPath);
 
   // Only work items land on the board. `molecule` (swarm coordination) and similar artifacts
   // are excluded; features/tasks/bugs are tickets.
   const NON_WORK = new Set(["molecule"]);
-  allBeads = allBeads.filter((b) => !NON_WORK.has(b.issue_type ?? ""));
+  const workBeads = allBeads.filter((b) => !NON_WORK.has(b.issue_type ?? ""));
 
-  const epicBeads = allBeads.filter((b) => beads.isEpic(b));
-  const taskBeads = allBeads.filter((b) => !beads.isEpic(b));
+  const epicBeads = workBeads.filter((b) => beads.isEpic(b));
+  const taskBeads = workBeads.filter((b) => !beads.isEpic(b));
 
   // Group tickets under epics from the inline `parent` field — no per-epic bd calls.
   const childrenByEpic = new Map<string, Bead[]>();
@@ -71,7 +76,7 @@ export async function getBoard(project: Project): Promise<Board> {
 
   // Derive epic→epic dependency rollup once (blockedBy/ready/rank), so the board reflects the
   // readiness the runtime's bd-ready enforces. Degrades to a stable order on a cycle (epic-graph.ts).
-  const graphNodes = new Map(computeEpicGraph(allBeads).epics.map((n) => [n.id, n]));
+  const graphNodes = new Map(computeEpicGraph(workBeads).epics.map((n) => [n.id, n]));
 
   for (const epic of epicBeads) {
     const children = childrenByEpic.get(epic.id) ?? [];
@@ -82,6 +87,8 @@ export async function getBoard(project: Project): Promise<Board> {
     // gates on — so the board's blockedBy/ready match what approval will actually enforce and the
     // card doesn't show a not-ready epic as approvable.
     const blockedBy = [...(node?.blockedBy ?? []), ...epicStandaloneBlockers(allBeads, epic.id)];
+    // ^ allBeads (unfiltered) on purpose: a closed `molecule` blocker must resolve to done here,
+    //   not read as a phantom open blocker via the helper's missing-bead fail-safe.
     const built = toEpic(epic, {
       goal: parseGoal(epic.description),
       acceptance: parseAcceptance(epic),

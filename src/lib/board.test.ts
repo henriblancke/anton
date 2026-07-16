@@ -312,6 +312,40 @@ describe("getBoard", () => {
     expect(built.blockedBy).toEqual(["task-block"]);
   });
 
+  it("does not treat a closed non-work (molecule) blocker as still-open", async () => {
+    // `molecule` beads are filtered off the board, but a `blocks` edge to one still lives on the
+    // epic. Blocker readiness must be derived against the UNFILTERED bead list — otherwise the
+    // filtered-out (and here already-closed) molecule reads as a phantom open blocker via the
+    // helper's missing-bead fail-safe, wrongly marking the epic not-ready and 409ing approval.
+    const doneMolecule = makeBead({
+      id: "mol-done",
+      title: "Coordination artifact",
+      issue_type: "molecule",
+      status: "closed",
+    });
+    const epic = makeBead({
+      id: "epic-m",
+      title: "Depends on a done molecule",
+      issue_type: "epic",
+      dependencies: [{ issue_id: "epic-m", depends_on_id: "mol-done", type: "blocks" }],
+    });
+
+    listMock.mockResolvedValue([epic, doneMolecule]);
+
+    const board = await getBoard(project);
+
+    // The molecule itself never lands on the board...
+    const allIds = STAGES.flatMap((s) => [
+      ...board.columns[s].map((e) => e.id),
+      ...board.standalone[s].map((i) => i.id),
+    ]);
+    expect(allIds).not.toContain("mol-done");
+    // ...and its closed edge doesn't block the epic.
+    const built = board.columns.backlog.find((e) => e.id === "epic-m")!;
+    expect(built.blockedBy).toEqual([]);
+    expect(built.ready).toBe(true);
+  });
+
   it("carries ready/blockedBy onto a standalone item so a blocked chip can't be approved", async () => {
     // Two parentless tasks: task-b blocks task-a. task-a is a standalone run target whose readiness
     // isn't in the epic rollup, so the board derives it from its own blocks edge (standaloneBlockers).
