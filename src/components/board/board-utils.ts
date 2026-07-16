@@ -112,8 +112,11 @@ export function compareEpicsBy(sort: Exclude<BoardSort, "default">, a: Epic, b: 
   const table = sort === "risk" ? RISK_RANK : SIZE_RANK;
   const field = sort === "risk" ? a.risk : a.size;
   const otherField = sort === "risk" ? b.risk : b.size;
+  // Both tiers unknown → tierRank returns Infinity on each side and the subtraction is NaN;
+  // guard on Number.isFinite so those pairs fall through to the dependency-aware order instead
+  // of returning NaN (which sort treats as equality, freezing the input order).
   const delta = tierRank(field, table) - tierRank(otherField, table);
-  if (delta !== 0) return delta;
+  if (Number.isFinite(delta) && delta !== 0) return delta;
   return compareBacklogEpics(a, b);
 }
 

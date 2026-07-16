@@ -84,6 +84,18 @@ describe("sortEpics", () => {
     ]);
   });
 
+  it("falls back to dependency-aware order when both epics have unknown risk/size", () => {
+    // Both lack a risk label → tierRank returns Infinity on each side and the delta is NaN;
+    // the comparator must fall through to compareBacklogEpics (rank order here), not freeze
+    // the input order.
+    const blocker = makeEpic("blocker", { rank: 0 });
+    const dependent = makeEpic("dependent", { rank: 1 });
+    expect(sortEpics([dependent, blocker], "risk").map((e) => e.id)).toEqual([
+      "blocker",
+      "dependent",
+    ]);
+  });
+
   it("orders by size large→small", () => {
     const l = makeEpic("l", { size: "L" });
     const m = makeEpic("m", { size: "M" });
