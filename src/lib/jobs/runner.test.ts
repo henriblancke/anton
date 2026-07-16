@@ -462,6 +462,66 @@ describe("JobRunner (live, in-memory db)", () => {
     expect(queuedA).toHaveLength(1); // the over-cap A job was left for a later tick
   });
 
+  it("autonomy off gates claiming: execute-epic stays queued, and re-enabling resumes it (anton-y3l)", async () => {
+    // The autonomy master-switch gates at *claim*: approval-style enqueues still land, but no
+    // tick leases the job while the switch is off; flipping it back on resumes on the next tick.
+    await seedProjects("A");
+    let autonomy = false;
+    let ran = 0;
+    const r = policyRunner(
+      async () => {
+        ran += 1;
+      },
+      () => policy({ autonomy }),
+    );
+    const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
+
+    expect(await r.tickOnce()).toBe(0); // never claimed while the switch is off
+    await r.whenIdle();
+    expect(ran).toBe(0);
+    let job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("queued"); // enqueued but not running — no attempt burned
+    expect(job?.attempts).toBe(0);
+
+    autonomy = true; // operator flips the switch back on
+    expect(await r.tickOnce()).toBe(1);
+    await r.whenIdle();
+    expect(ran).toBe(1);
+    job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("done");
+  });
+
+  it("autonomy off leaves in-flight work untouched and gates only new claims (anton-y3l)", async () => {
+    // A job already leased keeps running to completion after the switch turns off; only the
+    // not-yet-claimed job is held back.
+    await seedProjects("A");
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let autonomy = true;
+    const r = policyRunner(
+      async () => {
+        await gate;
+      },
+      () => policy({ concurrency: 2, autonomy }),
+    );
+    const inFlightId = await r.enqueue({ type: "execute-epic", projectId: "A", payload: { n: 1 } });
+    expect(await r.tickOnce()).toBe(1); // leased + dispatched while autonomy is on
+    expect(r.activeCount).toBe(1);
+
+    autonomy = false; // switch off with the first job mid-run
+    const heldId = await r.enqueue({ type: "execute-epic", projectId: "A", payload: { n: 2 } });
+    expect(await r.tickOnce()).toBe(0); // the new job is not claimed
+    expect((await getJob(tdb.db, heldId))?.status).toBe("queued");
+    expect((await getJob(tdb.db, inFlightId))?.status).toBe("running"); // untouched
+
+    release(); // the in-flight job finishes normally despite the switch being off
+    await r.whenIdle();
+    expect((await getJob(tdb.db, inFlightId))?.status).toBe("done");
+    expect((await getJob(tdb.db, heldId))?.status).toBe("queued"); // still waiting on the switch
+  });
+
   it("aborts a job that exceeds its per-project timeout and retries it", async () => {
     // Handler blocks until aborted; a 20ms timeout fires, aborts it → retryable 'timed out' error.
     const r = policyRunner(

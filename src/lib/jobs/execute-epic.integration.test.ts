@@ -11,10 +11,11 @@ import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
 import { makeTestDb, type TestDb } from "../db/testing";
 import { beads } from "../beads/bd";
 import * as schema from "../db/schema";
-import { getJob, park, type Clock } from "./queue";
+import { getJob, park, resumeJob, type Clock } from "./queue";
 import { JobRunner } from "./runner";
 import { makeExecuteEpicHandler } from "./execute-epic";
 import { resetOperatorCache } from "../operator";
@@ -625,6 +626,106 @@ process.exit(0);`,
       // A failed run reschedules the job with backoff; park it so a later clock-advancing tick
       // can't re-dispatch this epic (the test DB is shared across the describe block).
       if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  }, 60_000);
+
+  it("parks a run whose ticket needs a disabled agent, and completes it once re-enabled (anton-dm7)", async () => {
+    // Dispatch honors the active-agents allowlist: a ticket labeled with a disabled agent must
+    // NOT run with the default agent — the run parks with a clear reason before any claim or
+    // claude work. Parking is recoverable: enabling the agent + resuming completes the epic.
+    const epic5 = await beads.create(repo, {
+      title: "Feature V",
+      type: "epic",
+      description: "## Goal\nV",
+    });
+    await beads.approve(repo, epic5);
+    const gated = (() => {
+      const p = JSON.parse(
+        execFileSync(
+          "bd",
+          ["create", "Gated ticket", "--type", "task", "--parent", epic5, "--labels", "agent:nextjs", "--acceptance", "x", "--json"],
+          { cwd: repo, encoding: "utf8" },
+        ),
+      );
+      return (Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string;
+    })();
+
+    // A claude that logs every ticket it's invoked for — proves it NEVER runs while gated.
+    const invLog = join(sandbox, "allowlist-inv.jsonl");
+    const loggingClaude = writeBin(
+      binDir,
+      "claude-allowlist",
+      `const fs=require('fs');const path=require('path');
+const a=process.argv.slice(2);const get=f=>{const i=a.indexOf(f);return i>=0?a[i+1]:undefined;};
+const prompt=get('-p')||'';const m=prompt.match(/Ticket: (\\S+)/);
+fs.appendFileSync(${JSON.stringify(invLog)},(m?m[1]:'unknown')+'\\n');
+fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work\\n');
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+e({type:'result',subtype:'success',result:'done',session_id:'sa',num_turns:1,is_error:false});
+process.exit(0);`,
+    );
+
+    const [proj] = await tdb.db
+      .select()
+      .from(schema.projects)
+      .where(eq(schema.projects.id, projectId));
+    const baseSettings = JSON.parse(proj.settingsJson) as Record<string, unknown>;
+    const setAgents = (agents: string[] | undefined) =>
+      tdb.db
+        .update(schema.projects)
+        .set({ settingsJson: JSON.stringify({ ...baseSettings, agents }) })
+        .where(eq(schema.projects.id, projectId));
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    process.env.ANTON_CLAUDE_BIN = loggingClaude;
+    try {
+      // Allowlist excludes nextjs → the agent:nextjs ticket is gated.
+      await setAgents(["fastapi"]);
+      const jobId = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: epic5 },
+      });
+      await runner.tickOnce();
+      await runner.whenIdle();
+
+      // Poison → job parked immediately (no retry burn) with a reason naming ticket + agent.
+      const job = await getJob(tdb.db, jobId);
+      expect(job?.status).toBe("parked");
+      expect(job?.lastError).toContain(gated);
+      expect(job?.lastError).toContain("agent:nextjs");
+
+      // Run failed with the same clear reason; claude never invoked; the ticket was never
+      // claimed (the check runs before any claim/worktree work) — still open + unassigned.
+      const run5 = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === epic5)!;
+      expect(run5.status).toBe("failed");
+      expect(run5.error).toContain("agent:nextjs");
+      expect(existsSync(invLog) ? readFileSync(invLog, "utf8") : "").not.toContain(gated);
+      const t = await beads.show(repo, gated);
+      expect(t.status).toBe("open");
+      expect(t.assignee ?? null).toBeNull();
+
+      // Operator enables the agent → resume → the same epic completes normally.
+      await setAgents(["fastapi", "nextjs"]);
+      expect(await resumeJob(tdb.db, clock, jobId)).toBe(true);
+      await runner.tickOnce();
+      await runner.whenIdle();
+      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+      expect((await beads.show(repo, gated)).status).toBe("closed");
+      expect((await beads.show(repo, epic5)).labels ?? []).toContain("stage:in-review");
+      expect(readFileSync(invLog, "utf8")).toContain(gated);
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      await tdb.db
+        .update(schema.projects)
+        .set({ settingsJson: JSON.stringify(baseSettings) })
+        .where(eq(schema.projects.id, projectId));
     }
   }, 60_000);
 });

@@ -119,6 +119,22 @@ export interface ProjectSettings {
    * effective per-task retry budget. Absent → DEFAULT_MAX_RETRIES.
    */
   maxRetries?: number;
+  /**
+   * Active-agents allowlist (anton-46w): which specialist agent prompts dispatch may assign. Each
+   * entry is a discoverable agent id — bundled OR the project's own `.claude/agents` (anton-dvo.1,
+   * discoverAgents in src/lib/agents-discovery.ts). Enforced by dispatch (anton-dm7, execute-epic):
+   * a run whose ticket needs a disabled agent is PARKED with a clear reason — never silently run
+   * with the default agent. Absent (never persisted / cleared) → all agents active; empty `[]` →
+   * no agents active (the operator toggled every agent off), so any labeled ticket is parked. The
+   * UI seeds "all discovered on" when this is absent, so a no-op save stays all-active.
+   */
+  agents?: string[];
+  /**
+   * Autonomy master-switch (anton-46w): whether approved epics execute without asking. Absent →
+   * true (autonomous). Enforced by the runner's claim gate (anton-y3l): off leaves execute-epic
+   * jobs `queued` (approval still enqueues), and turning it back on resumes them.
+   */
+  autonomy?: boolean;
 }
 
 /** Defaults for the per-project job policy when a setting is unset. */

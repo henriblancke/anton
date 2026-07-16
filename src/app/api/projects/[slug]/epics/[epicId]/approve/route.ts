@@ -24,6 +24,8 @@ export async function POST(
 
   // Approval is the trigger: enqueue the autonomous execute-epic run (DESIGN.md §2/§7).
   // Best-effort — approving must still succeed even if the runner enqueue hiccups.
+  // Approval always enqueues; the autonomy master-switch (anton-y3l) gates at *claim* in the
+  // runner instead, so with autonomy off the job waits `queued` and re-enabling resumes it.
   let jobId: string | undefined;
   try {
     jobId = await enqueueExecuteEpic(project.id, epicId);

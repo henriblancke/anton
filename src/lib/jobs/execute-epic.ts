@@ -83,6 +83,24 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     }
 
     try {
+      // 0. Dispatch honors the active-agents allowlist (anton-dm7). PARK, don't skip: running
+      // the ticket with the default agent would silently produce work the operator disabled the
+      // specialist for, and skipping it would open the epic's single PR incomplete. Parking is
+      // recoverable — the operator enables the agent (Settings → Agents) or relabels the ticket,
+      // then resumes; tickets and settings are re-read on every attempt. Checked before any
+      // claim/worktree/session work so a run never half-executes into a config problem.
+      const inactive = inactiveAgentTickets(
+        tickets.filter((t) => t.status !== "closed"),
+        settings.agents,
+      );
+      if (inactive.length > 0) {
+        throw new PoisonEpic(
+          `epic ${epicBeadId} needs agents disabled in this project's settings: ` +
+            inactive.map((x) => `${x.id} → agent:${x.agent}`).join(", ") +
+            ` — enable them in Settings → Agents (or relabel the tickets), then resume the run`,
+        );
+      }
+
       // 1. Warm worktree (idempotent — reused on resume).
       const worktree = await createWorktree({
         repoPath: repo,
@@ -298,6 +316,34 @@ function childrenOf(all: Bead[], epicId: string): Bead[] {
 function labelValue(labels: string[] | undefined, prefix: string): string | undefined {
   const l = labels?.find((x) => x.startsWith(`${prefix}:`));
   return l ? l.slice(prefix.length + 1) : undefined;
+}
+
+/**
+ * Tickets whose `agent:` label names a specialist agent the project has disabled (anton-dm7).
+ * `activeAgents` is settings.agents. Semantics:
+ *   • absent (never persisted / cleared) → all agents active (a project that never touched
+ *     settings must not stall; the API persists a cleared value as `undefined`, never `[]`)
+ *   • EMPTY allowlist `[]` → no agents active: every ticket with an `agent:` label is parked.
+ *     The operator explicitly toggled every agent off, and the API persists `[]` as a real
+ *     value distinct from clearing (settings/route.ts) — honoring it is the whole point.
+ *   • no `agent:` label → runs with the default agent, never blocked
+ *   • the allowlist gates ALL agents — bundled AND the operator's own `.claude/agents` (anton-dvo.1).
+ *     Custom agents are discoverable and toggleable in Settings now, so a ticket needing a disabled
+ *     custom agent is parked just like a bundled one, rather than silently running.
+ */
+export function inactiveAgentTickets(
+  tickets: Bead[],
+  activeAgents: string[] | undefined,
+): { id: string; agent: string }[] {
+  if (activeAgents == null) return [];
+  const active = new Set(activeAgents);
+  const out: { id: string; agent: string }[] = [];
+  for (const t of tickets) {
+    const agent = labelValue(t.labels, "agent");
+    if (!agent) continue;
+    if (!active.has(agent)) out.push({ id: t.id, agent });
+  }
+  return out;
 }
 
 /**

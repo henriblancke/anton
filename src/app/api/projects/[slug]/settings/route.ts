@@ -1,8 +1,10 @@
 import { NextResponse } from "next/server";
+import { discoverAgents } from "@/lib/agents-discovery";
 import {
   CONCURRENCY_RANGE,
   JOB_TIMEOUT_MINUTES_RANGE,
   MAX_RETRIES_RANGE,
+  getProjectBySlug,
   getProjectSettingsBySlug,
   updateProjectSettings,
   type ProjectSettings,
@@ -98,6 +100,39 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
         { status: 400 },
       );
     } else patch.reviewFixPrompt = rf;
+  }
+
+  if ("agents" in body) {
+    const agents = body.agents;
+    // "" / null → clear (fall back to the default active set). Otherwise an array of ids that this
+    // project can actually assign (bundled + its own .claude/agents, anton-dvo.1); [] is a real
+    // value ("no agents"), not a clear.
+    if (agents == null || agents === "") patch.agents = undefined;
+    else if (!Array.isArray(agents) || agents.some((a) => typeof a !== "string")) {
+      return NextResponse.json(
+        { error: "agents must be an array of agent ids" },
+        { status: 400 },
+      );
+    } else if (agents.length > 0) {
+      const project = await getProjectBySlug(slug);
+      const discovered = new Set((await discoverAgents(project?.repoPath)).map((a) => a.id));
+      const unknown = agents.find((a) => !discovered.has(a));
+      if (unknown !== undefined) {
+        return NextResponse.json({ error: `Unknown agent: ${unknown}` }, { status: 400 });
+      }
+      patch.agents = [...new Set<string>(agents)];
+    } else {
+      patch.agents = []; // explicit "no agents active"
+    }
+  }
+
+  if ("autonomy" in body) {
+    const autonomy = body.autonomy;
+    // "" / null → clear (default: autonomous). Otherwise strictly a boolean.
+    if (autonomy == null || autonomy === "") patch.autonomy = undefined;
+    else if (typeof autonomy !== "boolean") {
+      return NextResponse.json({ error: "autonomy must be a boolean" }, { status: 400 });
+    } else patch.autonomy = autonomy;
   }
 
   try {

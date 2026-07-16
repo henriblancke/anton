@@ -18,6 +18,8 @@ interface EditableSettings {
   concurrency?: number;
   jobTimeoutMinutes?: number;
   maxRetries?: number;
+  agents?: string[];
+  autonomy?: boolean;
 }
 
 // Defaults mirror the server (src/lib/projects.ts DEFAULT_*); duplicated so this client module
@@ -43,54 +45,95 @@ const SECTIONS = [
   { id: "automation", label: "Automation" },
 ] as const;
 
-const AGENTS = [
-  "fastapi",
-  "supabase",
-  "pydantic",
-  "nextjs",
-  "alembic",
-  "terraform",
-  "docker",
-  "kubernetes",
-] as const;
-
-const DEFAULT_ACTIVE = new Set(["fastapi", "supabase", "pydantic", "nextjs"]);
-
-// Mirrors DEFAULT_SCHEDULES in src/lib/schedules.ts — keep the crons in sync.
+// Display copy for the scheduled automations. Ids match the schedule row `type`; crons mirror
+// DEFAULT_SCHEDULES in src/lib/schedules.ts — keep in sync. Enabled state comes from `schedules`.
 const AUTOMATIONS = [
-  { id: "nightly-stringer", label: "nightly-stringer", meta: "scan → triage · 0 3 * * *", on: true },
-  { id: "review-fix", label: "review-fix watcher", meta: "poll PRs every 15m", on: true },
-  { id: "orphan-grooming", label: "orphan-grooming", meta: "bucket loose tickets · 0 4 * * 1", on: true },
+  { id: "nightly-stringer", label: "nightly-stringer", meta: "scan → triage · 0 3 * * *" },
+  { id: "review-fix", label: "review-fix watcher", meta: "poll PRs every 15m" },
+  { id: "orphan-grooming", label: "orphan-grooming", meta: "bucket loose tickets · 0 4 * * 1" },
 ];
+
+/** Per-automation schedule state from the server; a missing row means "not scheduled yet". */
+interface AutomationSchedule {
+  type: string;
+  enabled: boolean;
+}
+
+/**
+ * One discoverable agent (anton-dvo.1), mirrored from the server's DiscoveredAgent. Kept local so
+ * this client module never imports the server-only discovery code.
+ */
+interface DiscoveredAgent {
+  id: string;
+  source: "project" | "global" | "bundled";
+  description?: string;
+}
 
 export function SettingsView({
   project,
   settings,
   basePrompt,
+  schedules,
+  agents,
 }: {
   project: Project;
   settings: EditableSettings;
   /** The locked base system prompt, shown read-only so operators see what always applies. */
   basePrompt: string;
+  /** The project's schedule rows (schedules.enabled) backing the Automation toggles. */
+  schedules: AutomationSchedule[];
+  /** Every agent this project can assign — bundled + the operator's own .claude/agents. */
+  agents: DiscoveredAgent[];
 }) {
   const [active, setActive] = useState<(typeof SECTIONS)[number]["id"]>("general");
-  const [agents, setAgents] = useState<Set<string>>(new Set(DEFAULT_ACTIVE));
+  // The enabled allowlist. Absent persisted value → seed "all discovered on", matching the runtime
+  // rule that an absent allowlist means every agent is active (so a no-op save stays all-active).
+  const [activeAgents, setActiveAgents] = useState<Set<string>>(
+    () => new Set(settings.agents ?? agents.map((a) => a.id)),
+  );
   const [concurrency, setConcurrency] = useState(settings.concurrency ?? DEFAULT_CONCURRENCY);
   const [jobTimeoutMinutes, setJobTimeoutMinutes] = useState(
     settings.jobTimeoutMinutes ?? DEFAULT_JOB_TIMEOUT_MINUTES,
   );
   const [maxRetries, setMaxRetries] = useState(settings.maxRetries ?? DEFAULT_MAX_RETRIES);
-  const [autonomy, setAutonomy] = useState(true);
-  const [automations, setAutomations] = useState<Record<string, boolean>>(
-    Object.fromEntries(AUTOMATIONS.map((a) => [a.id, a.on])),
+  const [autonomy, setAutonomy] = useState(settings.autonomy ?? true);
+  // null = no schedule row for this project yet (shown as "not scheduled"; toggling creates it).
+  const [automations, setAutomations] = useState<Record<string, boolean | null>>(() =>
+    Object.fromEntries(
+      AUTOMATIONS.map((a) => [a.id, schedules.find((s) => s.type === a.id)?.enabled ?? null]),
+    ),
   );
   const [model, setModel] = useState(settings.model ?? "");
   const [seedPrompt, setSeedPrompt] = useState(settings.seedPrompt ?? "");
   const [reviewFixPrompt, setReviewFixPrompt] = useState(settings.reviewFixPrompt ?? "");
   const [saving, setSaving] = useState(false);
 
+  /**
+   * Flip one automation's schedules.enabled row immediately (not via Save) — optimistic flip,
+   * reverted with a toast if the PATCH fails. A missing row is created server-side.
+   */
+  async function toggleAutomation(id: string, next: boolean) {
+    const prev = automations[id];
+    setAutomations((p) => ({ ...p, [id]: next }));
+    try {
+      const res = await fetch(`/api/projects/${project.slug}/schedules`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ type: id, enabled: next }),
+      });
+      if (!res.ok) {
+        const { error } = await res.json().catch(() => ({ error: "Update failed" }));
+        throw new Error(error ?? "Update failed");
+      }
+      toast.success(`${id} ${next ? "enabled" : "disabled"}`);
+    } catch (err) {
+      setAutomations((p) => ({ ...p, [id]: prev }));
+      toast.error(err instanceof Error ? err.message : `Failed to update ${id}`);
+    }
+  }
+
   function toggleAgent(agent: string) {
-    setAgents((prev) => {
+    setActiveAgents((prev) => {
       const next = new Set(prev);
       if (next.has(agent)) next.delete(agent);
       else next.add(agent);
@@ -112,6 +155,10 @@ export function SettingsView({
           concurrency,
           jobTimeoutMinutes,
           maxRetries,
+          // The enabled ids, in discovered order. Only ids we actually rendered — a stale id from
+          // a since-deleted agent (still in the seeded set) is pruned rather than re-persisted.
+          agents: agents.filter((a) => activeAgents.has(a.id)).map((a) => a.id),
+          autonomy,
         }),
       });
       if (!res.ok) {
@@ -185,28 +232,48 @@ export function SettingsView({
           <section className="flex flex-col gap-3.5">
             <div className="flex items-baseline gap-2.5">
               <h2 className="text-[15px] font-semibold">Active agents</h2>
-              <span className="text-xs text-subtle">which agent prompts anton may assign</span>
+              <span className="text-xs text-subtle">
+                which agent prompts anton may assign · bundled + your{" "}
+                <span className="font-mono">.claude/agents</span>
+              </span>
             </div>
-            <div className="grid max-w-2xl grid-cols-1 gap-2.5 sm:grid-cols-2">
-              {AGENTS.map((agent) => {
-                const on = agents.has(agent);
-                return (
-                  <div
-                    key={agent}
-                    className={cn(
-                      "flex items-center gap-2.5 rounded-[10px] border border-border bg-card px-3 py-2.5",
-                      !on && "opacity-70",
-                    )}
-                  >
-                    <span className={cn("size-2 rounded-full", agentDotClass(agent))} aria-hidden="true" />
-                    <span className="font-mono text-xs">{agent}</span>
-                    <span className="ml-auto">
-                      <Toggle checked={on} onChange={() => toggleAgent(agent)} label={`agent ${agent}`} />
-                    </span>
-                  </div>
-                );
-              })}
-            </div>
+            {agents.length === 0 ? (
+              <p className="max-w-2xl text-xs text-subtle">No agents discovered for this project.</p>
+            ) : (
+              <div className="grid max-w-2xl grid-cols-1 gap-2.5 sm:grid-cols-2">
+                {agents.map((agent) => {
+                  const on = activeAgents.has(agent.id);
+                  return (
+                    <div
+                      key={agent.id}
+                      className={cn(
+                        "flex items-center gap-2.5 rounded-[10px] border border-border bg-card px-3 py-2.5",
+                        !on && "opacity-70",
+                      )}
+                      title={agent.description}
+                    >
+                      <span
+                        className={cn("size-2 shrink-0 rounded-full", agentDotClass(agent.id))}
+                        aria-hidden="true"
+                      />
+                      <span className="truncate font-mono text-xs">{agent.id}</span>
+                      {agent.source !== "bundled" && (
+                        <span className="shrink-0 rounded-full border border-border px-1.5 py-0.5 text-[9.5px] text-subtle">
+                          {agent.source}
+                        </span>
+                      )}
+                      <span className="ml-auto shrink-0">
+                        <Toggle
+                          checked={on}
+                          onChange={() => toggleAgent(agent.id)}
+                          label={`agent ${agent.id}`}
+                        />
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </section>
 
           <Divider />
@@ -354,7 +421,9 @@ export function SettingsView({
               <h2 className="text-[15px] font-semibold">Automation</h2>
               <div className="flex flex-col gap-2.5">
                 {AUTOMATIONS.map((a) => {
-                  const on = automations[a.id];
+                  const state = automations[a.id];
+                  const on = state === true;
+                  const missing = state === null;
                   return (
                     <div
                       key={a.id}
@@ -369,12 +438,14 @@ export function SettingsView({
                       />
                       <div className="flex flex-col gap-0.5">
                         <span className="text-[12.5px]">{a.label}</span>
-                        <span className="font-mono text-[10.5px] text-subtle">{a.meta}</span>
+                        <span className="font-mono text-[10.5px] text-subtle">
+                          {missing ? `${a.meta} · not scheduled` : a.meta}
+                        </span>
                       </div>
                       <span className="ml-auto">
                         <Toggle
                           checked={on}
-                          onChange={(next) => setAutomations((p) => ({ ...p, [a.id]: next }))}
+                          onChange={(next) => toggleAutomation(a.id, next)}
                           label={a.label}
                         />
                       </span>
