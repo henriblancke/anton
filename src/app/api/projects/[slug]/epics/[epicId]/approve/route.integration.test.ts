@@ -127,6 +127,56 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     expect(beads.isApproved(bead)).toBe(false);
   }, 60_000);
 
+  it("enqueues a standalone bug and applies the approved label", async () => {
+    // A parentless bug is a run target (epic-of-one) — approval must label + enqueue it, not reject.
+    const bug = await beads.create(repo, { title: "Loose bug", type: "bug" });
+    const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", bug));
+    expect(res.status).toBe(200);
+    expect((await res.json()).jobId).toBeTruthy();
+    expect(beads.isApproved(await beads.show(repo, bug))).toBe(true);
+  }, 60_000);
+
+  it("enqueues a real epic with no blockers and applies the approved label", async () => {
+    const epic = await beads.create(repo, { title: "Free epic", type: "epic" });
+    const child = await beads.create(repo, { title: "Free epic child", type: "task" });
+    await beads.link(repo, child, epic, "parent-child");
+    const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", epic));
+    expect(res.status).toBe(200);
+    expect(beads.isApproved(await beads.show(repo, epic))).toBe(true);
+  }, 60_000);
+
+  it("422s a child ticket of an epic, points at its parent, and does not approve it", async () => {
+    // A task WITH a parent runs via its epic's PR, never standalone — approving it must be rejected.
+    const parentEpic = await beads.create(repo, { title: "Parent epic", type: "epic" });
+    const child = await beads.create(repo, { title: "Child ticket", type: "task" });
+    await beads.link(repo, child, parentEpic, "parent-child");
+    const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", child));
+    expect(res.status).toBe(422);
+    const body = await res.json();
+    expect(body.error).toMatch(/child ticket/i);
+    expect(body.error).toContain(parentEpic); // guidance names the epic to approve instead
+    expect(beads.isApproved(await beads.show(repo, child))).toBe(false);
+  }, 60_000);
+
+  it("422s a non-work type (molecule) with an honest error and does not approve it", async () => {
+    // `beads.create` only makes epic/task/bug; a non-work type needs the raw CLI.
+    const out = execFileSync("bd", ["create", "A molecule", "--type", "molecule", "--json"], {
+      cwd: repo,
+      encoding: "utf8",
+    });
+    const molecule = JSON.parse(out).id as string;
+    const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", molecule));
+    expect(res.status).toBe(422);
+    expect((await res.json()).error).toMatch(/not runnable/i);
+    expect(beads.isApproved(await beads.show(repo, molecule))).toBe(false);
+  }, 60_000);
+
+  it("404s an unknown bead id without approving anything", async () => {
+    const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", "approvy-nope"));
+    expect(res.status).toBe(404);
+    expect((await res.json()).error).toMatch(/not found/i);
+  }, 60_000);
+
   it("404s with {error} for an unknown slug", async () => {
     const res = await POST(new Request("http://t/", { method: "POST" }), ctx("nope", blocked));
     expect(res.status).toBe(404);

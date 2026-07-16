@@ -24,6 +24,28 @@ export async function POST(
   // snapshot (up to ISSUE_SNAPSHOT_MAX_AGE_MS stale), which could miss a just-added cross-epic
   // `blocks` edge and approve a still-blocked epic.
   await refreshAllIssues(project.repoPath);
+
+  // Validate the target is actually runnable *before* touching labels or enqueuing. Approval is the
+  // run trigger, so labeling-and-enqueuing a bead that execute-epic will only poison-park is a false
+  // green: the operator sees "approved" but no run ever reaches a PR. Reuse the same isRunTarget gate
+  // execute-epic enforces (a shared helper, no duplicated type logic) so the route and the runner
+  // agree on what "runnable" means. Read beads fresh (matching execute-epic's `--status all` load) so
+  // a missing bead is distinguishable from a found-but-not-runnable one, and the message stays honest.
+  const allBeads = await beads.list(project.repoPath, ["--status", "all"]);
+  const target = allBeads.find((b) => b.id === epicId);
+  if (!target) {
+    return NextResponse.json({ error: `Ticket ${epicId} not found on the board` }, { status: 404 });
+  }
+  if (!beads.isRunTarget(target)) {
+    const parent = (target.parent ?? target.parent_id) as string | undefined;
+    const type = target.issue_type ?? "unknown";
+    const reason =
+      (type === "task" || type === "bug") && parent
+        ? `${epicId} is a child ticket of ${parent} — approve its epic ${parent} instead; a child runs via its epic's PR, not on its own`
+        : `${epicId} is not runnable: type "${type}" — only an epic or a parentless task/bug can be approved to run`;
+    return NextResponse.json({ error: reason }, { status: 422 });
+  }
+
   const board = await getBoard(project);
   const epic = STAGES.map((stage) => board.columns[stage].find((e) => e.id === epicId)).find(
     Boolean,
