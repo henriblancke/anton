@@ -6,7 +6,12 @@
  */
 import { describe, expect, it } from "vitest";
 import type { Bead, BeadDep } from "./beads/bd";
-import { computeEpicGraph } from "./epic-graph";
+import { computeEpicGraph, epicStandaloneBlockers, standaloneBlockers } from "./epic-graph";
+
+/** A parentless task/bug run target (epic-of-one) — no parent, so it never rolls up to an epic. */
+function standalone(id: string, extra: Partial<Bead> = {}): Bead {
+  return { id, title: id, status: "open", issue_type: "task", ...extra };
+}
 
 function epic(id: string, extra: Partial<Bead> = {}): Bead {
   return { id, title: id, status: "open", issue_type: "epic", ...extra };
@@ -143,5 +148,128 @@ describe("computeEpicGraph", () => {
     expect(node(g, "E1").rank).toBe(2);
     expect(node(g, "E3").ready).toBe(true);
     expect(node(g, "E2").ready).toBe(false);
+  });
+});
+
+describe("standaloneBlockers", () => {
+  it("returns a standalone target's OPEN blockers from its own blocks edges", () => {
+    // S is a parentless task blocked by another parentless task B — B never appears in the epic
+    // graph, so its readiness must be derived here directly from the blocks edge.
+    const beads = [standalone("S", { dependencies: [blocks("S", "B")] }), standalone("B")];
+    expect(standaloneBlockers(beads, "S")).toEqual(["B"]);
+    // The blocker itself has no blockers.
+    expect(standaloneBlockers(beads, "B")).toEqual([]);
+  });
+
+  it("counts a blocker only while it is not done (closed → ready)", () => {
+    const beads = [
+      standalone("S", { dependencies: [blocks("S", "B")] }),
+      standalone("B", { status: "closed" }),
+    ];
+    expect(standaloneBlockers(beads, "S")).toEqual([]);
+  });
+
+  it("ignores related / discovered-from edges — only blocks gates a standalone", () => {
+    const beads = [
+      standalone("S", {
+        dependencies: [dep("S", "X", "related"), dep("S", "Y", "discovered-from")],
+      }),
+      standalone("X"),
+      standalone("Y"),
+    ];
+    expect(standaloneBlockers(beads, "S")).toEqual([]);
+  });
+
+  it("treats an unknown blocker (absent from the list) as still open — fail safe", () => {
+    const beads = [standalone("S", { dependencies: [blocks("S", "GONE")] })];
+    expect(standaloneBlockers(beads, "S")).toEqual(["GONE"]);
+  });
+
+  it("dedupes multiple edges to the same open blocker", () => {
+    const beads = [
+      standalone("S", { dependencies: [blocks("S", "B"), blocks("S", "B")] }),
+      standalone("B"),
+    ];
+    expect(standaloneBlockers(beads, "S")).toEqual(["B"]);
+  });
+
+  it("rolls an epic-child blocker up to its parent epic and gates on the epic", () => {
+    // S blocks-depends on C, a child of epic E. C closes the moment its code commits, but that code
+    // only lands when E's PR merges (E reaches done). While E is in-review the child is done yet the
+    // prerequisite hasn't landed — so S must stay blocked on E, matching computeEpicGraph's rollup.
+    const beads = [
+      standalone("S", { dependencies: [blocks("S", "C")] }),
+      epic("E", { labels: ["stage:in-review"] }),
+      ticket("C", "E", { status: "closed" }),
+    ];
+    expect(standaloneBlockers(beads, "S")).toEqual(["E"]);
+  });
+
+  it("clears the epic-child blocker only once the parent epic itself is done", () => {
+    const beads = [
+      standalone("S", { dependencies: [blocks("S", "C")] }),
+      epic("E", { status: "closed" }),
+      ticket("C", "E", { status: "closed" }),
+    ];
+    expect(standaloneBlockers(beads, "S")).toEqual([]);
+  });
+
+  it("dedupes two epic-child blockers of the same epic to one epic id", () => {
+    const beads = [
+      standalone("S", { dependencies: [blocks("S", "C1"), blocks("S", "C2")] }),
+      epic("E", { labels: ["stage:in-review"] }),
+      ticket("C1", "E", { status: "closed" }),
+      ticket("C2", "E", { status: "closed" }),
+    ];
+    expect(standaloneBlockers(beads, "S")).toEqual(["E"]);
+  });
+});
+
+describe("epicStandaloneBlockers", () => {
+  it("gates an epic on an open standalone blocker the epic-graph rollup drops", () => {
+    // E blocks-depends on a parentless task B. epicOf(B) is undefined, so computeEpicGraph drops
+    // the edge and E reads ready — epicStandaloneBlockers recovers it.
+    const beads = [epic("E", { dependencies: [blocks("E", "B")] }), standalone("B")];
+    expect(node(graphOf(beads), "E").ready).toBe(true); // rollup can't see the standalone blocker
+    expect(epicStandaloneBlockers(beads, "E")).toEqual(["B"]);
+  });
+
+  it("gates an epic on a standalone blocker of one of its CHILDREN", () => {
+    const beads = [
+      epic("E"),
+      ticket("T", "E", { dependencies: [blocks("T", "B")] }),
+      standalone("B"),
+    ];
+    expect(epicStandaloneBlockers(beads, "E")).toEqual(["B"]);
+  });
+
+  it("counts a standalone blocker only while it is not done (closed → ready)", () => {
+    const beads = [
+      epic("E", { dependencies: [blocks("E", "B")] }),
+      standalone("B", { status: "closed" }),
+    ];
+    expect(epicStandaloneBlockers(beads, "E")).toEqual([]);
+  });
+
+  it("ignores epic→epic and cross-epic child blockers (already in the rollup)", () => {
+    const beads = [
+      epic("E", { dependencies: [blocks("E", "E2")] }),
+      epic("E2"),
+      epic("E3"),
+      ticket("T", "E", { dependencies: [blocks("T", "T3")] }),
+      ticket("T3", "E3"),
+    ];
+    expect(epicStandaloneBlockers(beads, "E")).toEqual([]);
+  });
+
+  it("treats an unknown blocker (absent from the list) as still open — fail safe", () => {
+    const beads = [epic("E", { dependencies: [blocks("E", "GONE")] })];
+    expect(epicStandaloneBlockers(beads, "E")).toEqual(["GONE"]);
+  });
+
+  it("returns [] for a non-epic / unknown target", () => {
+    const beads = [standalone("S", { dependencies: [blocks("S", "B")] }), standalone("B")];
+    expect(epicStandaloneBlockers(beads, "S")).toEqual([]);
+    expect(epicStandaloneBlockers(beads, "MISSING")).toEqual([]);
   });
 });

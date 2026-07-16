@@ -6,7 +6,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { beads, LABELS, type Bead } from "../beads/bd";
-import { computeEpicGraph } from "../epic-graph";
+import { computeEpicGraph, epicStandaloneBlockers, standaloneBlockers } from "../epic-graph";
 import { loadAgentPrompt } from "../claude/agent-prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
 import { runClaude, type ClaudeEvent } from "../claude/driver";
@@ -52,30 +52,53 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     const repo = project.repoPath;
     const settings = await getProjectSettings(db, projectId);
 
-    // Load the epic + its tickets from beads (the source of truth).
+    // Load the run target + (for an epic) its tickets from beads (the source of truth). A target
+    // is an epic OR a parentless task/bug run as an epic-of-one (isRunTarget). Distinguish the two
+    // non-runnable cases so the poison message is honest: a bead that WAS found but isn't a valid
+    // target must not read "not found" (that sends the operator hunting for a missing bead).
     const all = await beads.list(repo, ["--status", "all"]);
-    const epic = all.find((b) => b.id === epicBeadId);
-    if (!epic || !beads.isEpic(epic)) throw new PoisonEpic(`epic ${epicBeadId} not found`);
-    if (!beads.isApproved(epic)) {
-      throw new PoisonEpic(`epic ${epicBeadId} is not approved — refusing to execute`);
+    const target = all.find((b) => b.id === epicBeadId);
+    if (!target) throw new PoisonEpic(`bead ${epicBeadId} not found on the board`);
+    if (!beads.isRunTarget(target)) {
+      const parent = (target.parent ?? target.parent_id) as string | undefined;
+      throw new PoisonEpic(
+        `bead ${epicBeadId} is not runnable: type "${target.issue_type ?? "unknown"}"` +
+          (parent ? ` with parent ${parent}` : "") +
+          ` — only an epic or a parentless task/bug can be run`,
+      );
+    }
+    if (!beads.isApproved(target)) {
+      throw new PoisonEpic(`target ${epicBeadId} is not approved — refusing to execute`);
     }
 
-    // Re-check the same epic→epic readiness gate the approval route enforces, now at job start.
-    // Approval only guarantees readiness at approval time; between then and this lease a cross-epic
-    // `blocks` edge could have been added or pulled in via Dolt sync (a shared board), leaving this
-    // job queued behind a blocker that's no longer done. Derive readiness from the fresh `all` read
-    // above (same source computeEpicGraph consumes at approval) and PARK if a blocker is open —
-    // starting a still-blocked epic would violate the sequence. Recoverable: once the blocker
-    // completes, resuming the parked job re-reads beads and passes this gate.
-    const epicNode = computeEpicGraph(all).epics.find((n) => n.id === epicBeadId);
-    if (epicNode && !epicNode.ready) {
+    // Re-check the same readiness gate the approval route enforces, now at job start. Approval only
+    // guarantees readiness at approval time; between then and this lease a `blocks` edge could have
+    // been added or pulled in via Dolt sync (a shared board), leaving this job queued behind a
+    // blocker that's no longer done. An epic's blockers come from the epic-graph rollup; a
+    // standalone task/bug (epic-of-one) never appears there, so derive its blockers from its own
+    // `blocks` edges. Either way, derive from the fresh `all` read above and PARK if a blocker is
+    // open — starting still-blocked work would violate the sequence. Recoverable: once the
+    // blocker completes, resuming the parked job re-reads beads and passes this gate.
+    // An epic also inherits any open standalone (parentless task/bug) prerequisite that the
+    // epic-graph rollup drops (epicStandaloneBlockers) — the same gap the approve route closes.
+    const blockers = beads.isEpic(target)
+      ? [
+          ...(computeEpicGraph(all).epics.find((n) => n.id === epicBeadId)?.blockedBy ?? []),
+          ...epicStandaloneBlockers(all, epicBeadId),
+        ]
+      : standaloneBlockers(all, epicBeadId);
+    if (blockers.length > 0) {
       throw new PoisonEpic(
-        `epic ${epicBeadId} is blocked by ${epicNode.blockedBy.join(", ")} — refusing to execute; ` +
+        `${epicBeadId} is blocked by ${blockers.join(", ")} — refusing to execute; ` +
           `resume the run once the blocker(s) complete`,
       );
     }
 
-    const tickets = childrenOf(all, epicBeadId);
+    // An epic runs all its children into one PR; a standalone task/bug IS its own single ticket
+    // (an epic-of-one). The rest of the pipeline — worktree, per-ticket claude→tests→commit→close,
+    // one PR — is identical either way, so the standalone case is just a one-element ticket list.
+    const standaloneRun = !beads.isEpic(target);
+    const tickets = standaloneRun ? [target] : childrenOf(all, epicBeadId);
     if (tickets.length === 0) throw new PoisonEpic(`epic ${epicBeadId} has no tickets`);
 
     // Branches keep the `prefix/id` slash (git convention); only the worktree *path* segment is
@@ -99,6 +122,15 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     }
 
     try {
+      // A standalone target that already committed on a prior attempt carries stage:in-review and
+      // is skipped straight to the PR step below — its agent never runs again on this resume. Both
+      // the allowlist gate here and the ticket loop share this "won't run" predicate so neither
+      // acts on a resume marker: gating on a since-disabled agent would park a retry that only has
+      // the (agent-free) PR step left to do.
+      const inReview = LABELS.stage("in-review");
+      const isResumeSkipped = (t: Bead) =>
+        t.status === "closed" || (standaloneRun && (t.labels?.includes(inReview) ?? false));
+
       // 0. Dispatch honors the active-agents allowlist (anton-dm7). PARK, don't skip: running
       // the ticket with the default agent would silently produce work the operator disabled the
       // specialist for, and skipping it would open the epic's single PR incomplete. Parking is
@@ -106,7 +138,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // then resumes; tickets and settings are re-read on every attempt. Checked before any
       // claim/worktree/session work so a run never half-executes into a config problem.
       const inactive = inactiveAgentTickets(
-        tickets.filter((t) => t.status !== "closed"),
+        tickets.filter((t) => !isResumeSkipped(t)),
         settings.agents,
       );
       if (inactive.length > 0) {
@@ -147,9 +179,25 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         .sync(repo)
         .catch((e) => console.error(`[execute-epic] claim sync failed for ${epicBeadId}`, e));
 
-      // 3. Per ticket: claude → tests → commit → close. Skip already-closed (resume).
+      // 3. Per ticket: claude → tests → commit → (close | in-review). Skip work that already
+      //    landed on a prior attempt. A closed ticket is done — an epic's children close as they
+      //    commit, and any resumed run skips them. A standalone target is NEVER closed here (its
+      //    close is a merge-time concern, below): the moment its single ticket commits, runTicket
+      //    moves it to stage:in-review instead — that label is both the board's "in review" state
+      //    and the persisted resume marker, so a retry after a failed PR step skips straight to
+      //    the PR step here rather than re-running claude/tests/commit on already-committed work.
       for (const ticket of orderTickets(tickets, all)) {
         if (ticket.status === "closed") continue;
+        if (standaloneRun && (ticket.labels?.includes(inReview) ?? false)) {
+          // Resume after a failed PR step: this ticket already committed and moved to in-review on
+          // a prior attempt. Step 2 above re-tagged the target stage:implementing (it can't tell a
+          // fresh run from a resume), and runTicket — the only standalone path that clears
+          // implementing — is being skipped here. Clear it now so the ticket doesn't carry BOTH
+          // stage labels into merge-finalize, which strips only in-review and would otherwise leave
+          // a stale implementing label (making a reopened bead derive as in-progress).
+          await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
+          continue;
+        }
         await runTicket({
           db,
           clock,
@@ -161,21 +209,30 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           ticket,
           settings,
           operator,
+          closeOnDone: !standaloneRun,
         });
         await ctx.heartbeat();
       }
 
-      // 4. All tickets closed → open one PR, move epic to in-review.
+      // 4. All tickets done → open one PR, stamp the PR ref, and (for an epic) move it to
+      //    in-review. A standalone target is NOT closed here: like an epic it stays OPEN, tagged
+      //    stage:in-review (runTicket already applied that on commit), carrying its PR ref until
+      //    the PR actually MERGES — at which point review-fix's merge-finalize path closes it.
+      //    Closing it now would derive it as Done on the board while its PR is still open and drop
+      //    it out of review-fix's in-review sweep (which is what keeps a standalone PR in the
+      //    automated review/finalization path).
       const pr = await openPullRequest({
         repoPath: repo,
         branch: worktree.branch,
         base: baseBranch,
-        title: `${epic.title} (${epicBeadId})`,
-        body: prBody(epic, tickets),
+        title: `${target.title} (${epicBeadId})`,
+        body: prBody(target, tickets),
       });
       await safe(() => beads.setExternalRef(repo, epicBeadId, pr.ref));
-      await safe(() => beads.tag(repo, epicBeadId, [LABELS.stage("in-review")]));
-      await safe(() => beads.untag(repo, epicBeadId, [LABELS.stage("implementing")]));
+      if (!standaloneRun) {
+        await safe(() => beads.tag(repo, epicBeadId, [inReview]));
+        await safe(() => beads.untag(repo, epicBeadId, [LABELS.stage("implementing")]));
+      }
 
       // 5. Finalize run + clean up the worktree (the branch/PR carry the work now).
       await updateRun(db, clock, runId, { status: "done", endedAt: clock.now(), error: null });
@@ -215,9 +272,16 @@ async function runTicket(args: {
   ticket: Bead;
   settings: ProjectSettings;
   operator?: string;
+  /** Close the bead in beads once its work is committed. False for a standalone (epic-of-one)
+   * target, which is never closed by execute-epic: it stays open + stage:in-review + PR ref until
+   * its PR merges (review-fix's merge-finalize path closes it). On commit, a false value instead
+   * moves the bead to stage:in-review — the resume marker + board state. Defaults to true (an
+   * epic's children close as their work lands). */
+  closeOnDone?: boolean;
 }): Promise<void> {
   const { db, clock, ctx, projectId, repo, runId, worktreePath, ticket, settings, operator } =
     args;
+  const closeOnDone = args.closeOnDone ?? true;
 
   // Claim the ticket for the operator as a HARD GATE before doing any work. On a shared board
   // the claim is the cross-operator coordination primitive (anton-live-sync R6): a failure here
@@ -295,8 +359,17 @@ async function runTicket(args: {
     await commitAll(worktreePath, `${ticket.id}: ${ticket.title}`);
     committed = true;
 
-    // Mark the ticket done in beads (stage → done).
-    await safe(() => beads.close(repo, ticket.id));
+    // Persist this ticket's "code done" state the moment it commits. An epic child closes (stage
+    // → done). A standalone target isn't closed until its PR merges, so instead move it to
+    // stage:in-review here (dropping implementing): that is both its board state and the persisted
+    // resume marker, so a retry after a failed PR step skips it rather than re-running claude on
+    // committed work. endSession still records the work done either way.
+    if (closeOnDone) {
+      await safe(() => beads.close(repo, ticket.id));
+    } else {
+      await safe(() => beads.tag(repo, ticket.id, [LABELS.stage("in-review")]));
+      await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
+    }
     await endSession(db, clock, sessionId, "done");
   } catch (e) {
     await endSession(db, clock, sessionId, "failed");
@@ -422,13 +495,13 @@ function ticketPrompt(ticket: Bead): string {
   ].join("\n");
 }
 
-function prBody(epic: Bead, tickets: Bead[]): string {
+function prBody(target: Bead, tickets: Bead[]): string {
+  // Standalone run (epic-of-one): the single ticket IS the target, so listing it again is noise.
+  const standalone = tickets.length === 1 && tickets[0]?.id === target.id;
   const lines = [
-    `Autonomous run for **${epic.id}** — ${epic.title}.`,
+    `Autonomous run for **${target.id}** — ${target.title}.`,
     ``,
-    `Tickets:`,
-    ...tickets.map((t) => `- ${t.id} — ${t.title}`),
-    ``,
+    ...(standalone ? [] : [`Tickets:`, ...tickets.map((t) => `- ${t.id} — ${t.title}`), ``]),
     `🤖 Generated with [anton](https://github.com/) autonomous execution`,
   ];
   return lines.join("\n");

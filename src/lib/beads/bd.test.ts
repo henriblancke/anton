@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  beads,
   buildUpdateArgs,
   createDoltSync,
   getSyncStatus,
@@ -7,7 +8,32 @@ import {
   isBenignSyncOutput,
   isNotWiredOutput,
   runDoltSync,
+  type Bead,
 } from "./bd";
+
+const bead = (b: Partial<Bead>): Bead => ({ id: "x", title: "x", status: "open", ...b }) as Bead;
+
+describe("beads.isRunTarget", () => {
+  it("accepts an epic (the classic run target)", () => {
+    expect(beads.isRunTarget(bead({ issue_type: "epic" }))).toBe(true);
+  });
+
+  it("accepts a parentless task or bug (epic-of-one)", () => {
+    expect(beads.isRunTarget(bead({ issue_type: "task" }))).toBe(true);
+    expect(beads.isRunTarget(bead({ issue_type: "bug" }))).toBe(true);
+  });
+
+  it("rejects a task/bug that has a parent — it's a child ticket, run via its epic", () => {
+    expect(beads.isRunTarget(bead({ issue_type: "task", parent: "bd-1" }))).toBe(false);
+    expect(beads.isRunTarget(bead({ issue_type: "bug", parent_id: "bd-1" }))).toBe(false);
+  });
+
+  it("rejects a non-work type (learning, molecule, …) even when parentless", () => {
+    expect(beads.isRunTarget(bead({ issue_type: "learning" }))).toBe(false);
+    expect(beads.isRunTarget(bead({ issue_type: "molecule" }))).toBe(false);
+    expect(beads.isRunTarget(bead({ issue_type: undefined }))).toBe(false);
+  });
+});
 
 describe("buildUpdateArgs", () => {
   it("builds a title-only update", () => {

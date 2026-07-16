@@ -42,12 +42,23 @@ function parentedIds(all: Bead[]): Set<string> {
   return parented;
 }
 
-/** Open, non-epic beads with no parent — the loose tickets to bucket. Pure, for unit testing. */
+/**
+ * Open, non-epic beads with no parent that anton CAN'T already run standalone — the loose tickets to
+ * bucket. Pure, for unit testing.
+ *
+ * A parentless task/bug is a runnable standalone target (`beads.isRunTarget`): the board renders it
+ * as an "Approve & run" chip and the approve route/runner execute it as an epic-of-one. Grooming
+ * MUST NOT touch those — parenting one under the grooming epic turns it into a child ticket, which
+ * `isRunTarget` then rejects, so its standalone chip disappears and the approve route redirects users
+ * to run the whole grooming epic instead (anton-cmz review). We only bucket orphans that are NOT
+ * independently runnable (learning/chore/… — types that can't be approved on their own).
+ */
 export function findOrphans(all: Bead[]): Bead[] {
   const parented = parentedIds(all);
   return all.filter(
     (b) =>
       !beads.isEpic(b) &&
+      !beads.isRunTarget(b) &&
       b.status !== "closed" &&
       !parented.has(b.id) &&
       !(b.labels?.includes(ORPHAN_EPIC_LABEL) ?? false),

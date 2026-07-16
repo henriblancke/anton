@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { LockIcon } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import type { Stage } from "@/lib/types";
@@ -78,6 +79,21 @@ export function PrLink({
     >
       {children}
     </a>
+  );
+}
+
+/** "blocked by <id>" chip — marks a run target (epic or standalone) the runtime's bd-ready won't
+ * pick up yet. Shows the first open blocker with a "+N" when there are several; the full list rides
+ * in the title. Renders nothing when there are no open blockers. */
+export function BlockedChip({ blockedBy }: { blockedBy: string[] }) {
+  if (blockedBy.length === 0) return null;
+  const [first, ...rest] = blockedBy;
+  const label = rest.length > 0 ? `blocked by ${first} +${rest.length}` : `blocked by ${first}`;
+  return (
+    <MetaChip tone="blocked">
+      <LockIcon className="size-2.5" aria-hidden="true" />
+      <span title={`blocked by ${blockedBy.join(", ")}`}>{label}</span>
+    </MetaChip>
   );
 }
 

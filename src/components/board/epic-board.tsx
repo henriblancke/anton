@@ -30,6 +30,7 @@ import {
 } from "@/components/board/board-utils";
 import { SyncStatusBadge } from "@/components/board/sync-status-badge";
 import { Button } from "@/components/ui/button";
+import { TicketDialog } from "@/components/ticket/ticket-dialog";
 
 const BOARD_SORTS: BoardSort[] = ["default", "risk", "size"];
 
@@ -46,6 +47,9 @@ export function EpicBoard({ slug, initialBoard }: { slug: string; initialBoard: 
   const [attempt, setAttempt] = useState(0);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [sort, setSort] = useState<BoardSort>("default");
+  // The standalone task/bug whose detail dialog is open. Epics still deep-link to their own page;
+  // standalone chips (an epic-of-one) reuse the shared TicketDialog inline.
+  const [openTicketId, setOpenTicketId] = useState<string | null>(null);
   // Poll guard: a poll result landing mid-drag would clobber the drag interaction; the ref
   // mirrors activeId so the polling closure sees the live value.
   const draggingRef = useRef(false);
@@ -92,8 +96,11 @@ export function EpicBoard({ slug, initialBoard }: { slug: string; initialBoard: 
       if (!cancelled) timer = setTimeout(() => void poll(), BOARD_POLL_MS);
     }
 
+    // Kick an immediate load when there's no board yet or a refresh was requested (retry, or a
+    // ticket saved/deleted in the dialog); otherwise the first fetch rides the poll cadence. Poll
+    // is always (re)scheduled so a manual refresh never silently ends live sync.
     if (initialBoard === null || attempt > 0) void load(true);
-    else timer = setTimeout(() => void poll(), BOARD_POLL_MS);
+    timer = setTimeout(() => void poll(), BOARD_POLL_MS);
     const onVisible = () => {
       // Coming back to the tab refreshes immediately instead of waiting out the interval.
       if (document.visibilityState === "visible" && !cancelled) void load();
@@ -197,6 +204,10 @@ export function EpicBoard({ slug, initialBoard }: { slug: string; initialBoard: 
 
   return (
     <DndContext
+      // Stable id → deterministic aria-describedby. dnd-kit's useUniqueId falls back to a
+      // module-level counter that drifts between SSR and hydration (DndDescribedBy-0 vs -N);
+      // passing an explicit id short-circuits it and kills the hydration mismatch. Scope by
+      // slug so multiple boards on a page still get distinct, deterministic ids.
       id={`epic-board-${slug}`}
       sensors={sensors}
       collisionDetection={closestCorners}
@@ -232,12 +243,24 @@ export function EpicBoard({ slug, initialBoard }: { slug: string; initialBoard: 
             key={stage}
             stage={stage}
             epics={sortedColumns?.[stage] ?? []}
+            standalone={board.standalone?.[stage] ?? []}
             slug={slug}
             onEpicDeleted={handleEpicDeleted}
+            onOpenTicket={setOpenTicketId}
           />
         ))}
       </div>
       <DragOverlay>{activeEpic ? <EpicCard slug={slug} epic={activeEpic} overlay /> : null}</DragOverlay>
+      <TicketDialog
+        slug={slug}
+        ticketId={openTicketId}
+        open={openTicketId !== null}
+        onClose={() => setOpenTicketId(null)}
+        // A saved/deleted standalone ticket may change title, stage, or drop off the board — force a
+        // fresh load so the chips reflect it.
+        onSaved={() => setAttempt((n) => n + 1)}
+        onDeleted={() => setAttempt((n) => n + 1)}
+      />
     </DndContext>
   );
 }

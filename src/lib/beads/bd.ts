@@ -464,4 +464,16 @@ export const beads = {
   approve: (cwd: string, epicId: string) => beads.tag(cwd, epicId, [LABELS.approved]),
   isApproved: (b: Bead) => b.labels?.includes(LABELS.approved) ?? false,
   isEpic: (b: Bead) => b.issue_type === "epic",
+
+  /**
+   * A bead anton can execute as a run: an epic (all its children batch into one PR) OR a
+   * parentless task/bug (an "epic-of-one" — runs as a single-ticket run: branch anton/<id>, its
+   * own PR, ticket closed). A task/bug WITH a parent is a child ticket, executed as part of its
+   * epic's run, not a run target on its own; every other type (learning, molecule, …) is never
+   * runnable. Shared by execute-epic (the run gate) and the approve route (validating targets
+   * before enqueue) so both agree on what "runnable" means.
+   */
+  isRunTarget: (b: Bead) =>
+    beads.isEpic(b) ||
+    ((b.issue_type === "task" || b.issue_type === "bug") && !(b.parent ?? b.parent_id)),
 };

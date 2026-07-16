@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getBoard } from "@/lib/board";
+import { epicStandaloneBlockers, standaloneBlockers } from "@/lib/epic-graph";
 import { refreshAllIssues } from "@/lib/beads/issues";
 import { beads } from "@/lib/beads/bd";
 import { enqueueExecuteEpic } from "@/lib/jobs/service";
@@ -23,19 +24,71 @@ export async function POST(
   // Force a fresh bead read first — this mutating gate must not decide readiness from a warm board
   // snapshot (up to ISSUE_SNAPSHOT_MAX_AGE_MS stale), which could miss a just-added cross-epic
   // `blocks` edge and approve a still-blocked epic.
-  await refreshAllIssues(project.repoPath);
+  // The fresh read returns the loaded beads, so reuse them for the runnability gate below rather than
+  // issuing a second `bd list`. Crucially, `refreshAllIssues` goes through `loadAllIssues`, which
+  // falls back to separate open/closed reads where `--status all` fails; calling `beads.list` directly
+  // here would skip that fallback and 500 the whole approval in exactly the scenario the board handles.
+  const allBeads = await refreshAllIssues(project.repoPath);
+
+  // Validate the target is actually runnable *before* touching labels or enqueuing. Approval is the
+  // run trigger, so labeling-and-enqueuing a bead that execute-epic will only poison-park is a false
+  // green: the operator sees "approved" but no run ever reaches a PR. Reuse the same isRunTarget gate
+  // execute-epic enforces (a shared helper, no duplicated type logic) so the route and the runner
+  // agree on what "runnable" means. Read beads fresh (matching execute-epic's `--status all` load) so
+  // a missing bead is distinguishable from a found-but-not-runnable one, and the message stays honest.
+  const target = allBeads.find((b) => b.id === epicId);
+  if (!target) {
+    return NextResponse.json({ error: `Ticket ${epicId} not found on the board` }, { status: 404 });
+  }
+  if (!beads.isRunTarget(target)) {
+    const parent = (target.parent ?? target.parent_id) as string | undefined;
+    const type = target.issue_type ?? "unknown";
+    const reason =
+      (type === "task" || type === "bug") && parent
+        ? `${epicId} is a child ticket of ${parent} — approve its epic ${parent} instead; a child runs via its epic's PR, not on its own`
+        : `${epicId} is not runnable: type "${type}" — only an epic or a parentless task/bug can be approved to run`;
+    return NextResponse.json({ error: reason }, { status: 422 });
+  }
+
   const board = await getBoard(project);
   const epic = STAGES.map((stage) => board.columns[stage].find((e) => e.id === epicId)).find(
     Boolean,
   );
-  if (!epic) {
-    return NextResponse.json({ error: "Epic not found" }, { status: 404 });
+  // A standalone task/bug (epic-of-one) lives in `standalone`, not `columns`, so it carries no
+  // epic-graph readiness — but it can still hold cross-item `blocks` edges. It must be found here
+  // or a valid run target 404s, and it must be gated on its own open blockers below.
+  const standalone = epic
+    ? undefined
+    : STAGES.map((stage) => board.standalone[stage].find((e) => e.id === epicId)).find(Boolean);
+  if (!epic && !standalone) {
+    return NextResponse.json({ error: "Run target not found" }, { status: 404 });
   }
-  if (!epic.ready) {
-    return NextResponse.json(
-      { error: `Epic is blocked by ${epic.blockedBy.join(", ")}` },
-      { status: 409 },
-    );
+  if (epic) {
+    // epic.blockedBy is the epic-graph rollup (epic→epic + cross-epic child blocks). That rollup
+    // DROPS any blocks edge whose blocker is a parentless standalone task/bug, so an epic (or a
+    // child of it) that depends on an open standalone item would otherwise read ready here. Gate on
+    // those standalone blockers too — derived off the same fresh read — so the epic can't be
+    // approved/enqueued before its standalone prerequisite is done.
+    const blockers = [...epic.blockedBy, ...epicStandaloneBlockers(allBeads, epicId)];
+    if (blockers.length > 0) {
+      return NextResponse.json(
+        { error: `Epic is blocked by ${blockers.join(", ")}` },
+        { status: 409 },
+      );
+    }
+  }
+  // A standalone target's blockers aren't in the epic rollup, so derive them from its own `blocks`
+  // edges off the fresh read above. Approving enqueues immediately, so a still-blocked standalone
+  // must be rejected here — else we'd label + enqueue work `bd ready` would keep blocked, and the
+  // runner's epic-only readiness check (a no-op for standalone) wouldn't catch it either.
+  if (standalone) {
+    const blockers = standaloneBlockers(allBeads, epicId);
+    if (blockers.length > 0) {
+      return NextResponse.json(
+        { error: `${epicId} is blocked by ${blockers.join(", ")}` },
+        { status: 409 },
+      );
+    }
   }
 
   await beads.approve(project.repoPath, epicId);
@@ -54,14 +107,19 @@ export async function POST(
     console.error(`[approve] failed to enqueue execute-epic for ${epicId}`, err);
   }
 
-  // Re-read so the response reflects the post-approval state.
+  // Re-read so the response reflects the post-approval state. The target is an epic or a standalone
+  // chip; return whichever the board now carries. `epic` is kept for the existing epic-card client.
   const updatedBoard = await getBoard(project);
   for (const stage of STAGES) {
-    const updated = updatedBoard.columns[stage].find((e) => e.id === epicId);
-    if (updated) {
-      return NextResponse.json({ epic: updated, jobId });
+    const updatedEpic = updatedBoard.columns[stage].find((e) => e.id === epicId);
+    if (updatedEpic) {
+      return NextResponse.json({ epic: updatedEpic, item: updatedEpic, jobId });
+    }
+    const updatedItem = updatedBoard.standalone[stage].find((e) => e.id === epicId);
+    if (updatedItem) {
+      return NextResponse.json({ item: updatedItem, jobId });
     }
   }
 
-  return NextResponse.json({ error: "Epic not found" }, { status: 404 });
+  return NextResponse.json({ error: "Run target not found" }, { status: 404 });
 }

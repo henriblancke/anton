@@ -3,34 +3,21 @@
 import { useState } from "react";
 import Link from "next/link";
 import { toast } from "sonner";
-import { CircleCheckIcon, GitPullRequestIcon, LockIcon } from "lucide-react";
+import { CircleCheckIcon, GitPullRequestIcon } from "lucide-react";
 
 import type { Epic } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { ConfirmDeleteButton } from "@/components/ui/confirm-delete-button";
 import { cn } from "@/lib/utils";
 import { STAGE_INSET_SHADOW, agentDotClass, ticketProgress } from "@/components/board/board-utils";
-import { MetaChip, PrLink, RiskChip } from "@/components/atoms";
+import { TypeBadge, TypeIcon } from "@/components/board/type-language";
+import { BlockedChip, MetaChip, PrLink, RiskChip } from "@/components/atoms";
 import { CopyButton } from "@/components/ui/copy-button";
 
 /** Short PR label from a bead external-ref: `gh-218` / a URL ending in `/218` → `#218`. */
 function prLabel(ref: string): string {
   const m = /(\d+)\s*$/.exec(ref);
   return m ? `#${m[1]}` : ref;
-}
-
-/** "blocked by <id>" chip — marks an epic the runtime's bd-ready won't pick up yet. Shows the
- * first open blocker with a "+N" when there are several; the full list rides in the title. */
-function BlockedChip({ blockedBy }: { blockedBy: string[] }) {
-  if (blockedBy.length === 0) return null;
-  const [first, ...rest] = blockedBy;
-  const label = rest.length > 0 ? `blocked by ${first} +${rest.length}` : `blocked by ${first}`;
-  return (
-    <MetaChip tone="blocked">
-      <LockIcon className="size-2.5" aria-hidden="true" />
-      <span title={`blocked by ${blockedBy.join(", ")}`}>{label}</span>
-    </MetaChip>
-  );
 }
 
 export function EpicCard({
@@ -88,6 +75,7 @@ export function EpicCard({
     return (
       <CardShell epic={epic} overlay={overlay} slug={slug} muted>
         <div className="flex items-center gap-2">
+          <TypeIcon type="epic" />
           <CopyButton value={epic.id} label="epic id" className="font-mono text-[10px]">
           {epic.id}
         </CopyButton>
@@ -113,6 +101,7 @@ export function EpicCard({
   return (
     <CardShell epic={epic} overlay={overlay} slug={slug}>
       <div className="flex items-center gap-1.5">
+        <TypeIcon type="epic" />
         <CopyButton value={epic.id} label="epic id" className="font-mono text-[10px]">
           {epic.id}
         </CopyButton>
@@ -158,13 +147,12 @@ export function EpicCard({
         </div>
       </div>
 
-      {(epic.agent || epic.risk || epic.size) && (
-        <div className="flex flex-wrap gap-1.5">
-          {epic.agent && <MetaChip dotClass={agentDotClass(epic.agent)}>{epic.agent}</MetaChip>}
-          {epic.risk && <RiskChip risk={epic.risk} />}
-          {epic.size && <MetaChip>size:{epic.size}</MetaChip>}
-        </div>
-      )}
+      <div className="flex flex-wrap gap-1.5">
+        <TypeBadge type="epic" />
+        {epic.agent && <MetaChip dotClass={agentDotClass(epic.agent)}>{epic.agent}</MetaChip>}
+        {epic.risk && <RiskChip risk={epic.risk} />}
+        {epic.size && <MetaChip>size:{epic.size}</MetaChip>}
+      </div>
 
       {epic.stage === "backlog" && !overlay && (
         <div className="mt-0.5 flex items-center gap-2">
@@ -206,6 +194,8 @@ function CardShell({
   muted?: boolean;
   children: React.ReactNode;
 }) {
+  // Stage-hued left rail as the active-stage cue: orange for implementing, blue for in-review.
+  // Backlog/done epics stay railless (the purple type rail was intentionally dropped).
   const inset =
     epic.stage === "implementing" || epic.stage === "in-review"
       ? STAGE_INSET_SHADOW[epic.stage]

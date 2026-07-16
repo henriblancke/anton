@@ -84,7 +84,8 @@ function toFlow(slug: string, payload: GraphPayload): { nodes: Node[]; edges: Ed
   }));
 
   const flowEdges: Edge[] = edges.map((e) => {
-    // Blocks style + direction from dependency-graph.tsx:115 (red, arrow at the blocker).
+    // Blocks style matches dependency-graph.tsx (red). Edges arrive already oriented blocker→blocked
+    // from the model, so the arrowhead lands on the blocked node and the edge reads "X blocks Y".
     // Cycle edges render distinctly: dashed amber, animated, "cycle" label.
     const stroke = e.inCycle ? "var(--color-stage-implementing)" : "var(--color-destructive)";
     return {
@@ -115,11 +116,16 @@ const CHROME = [
   "[&_.react-flow__controls]:rounded-lg",
   "[&_.react-flow__controls]:border",
   "[&_.react-flow__controls]:border-border",
-  "[&_.react-flow__controls-button]:border-b",
-  "[&_.react-flow__controls-button]:border-border",
-  "[&_.react-flow__controls-button]:bg-card",
-  "[&_.react-flow__controls-button]:fill-foreground",
-  "[&_.react-flow__controls-button:hover]:bg-muted",
+  // Theme the Controls through ReactFlow's own CSS variables. ReactFlow only applies its dark
+  // palette under `.react-flow.dark` (a class we never set — the app toggles dark on an ancestor),
+  // so its light defaults (white button, grey border) otherwise leak into dark mode. Driving the
+  // vars here follows the app theme in both modes; the button glyph is an <svg fill="currentColor">,
+  // so the button *color* var (not `fill`) is what makes the icon visible.
+  "[--xy-controls-button-background-color:var(--color-card)]",
+  "[--xy-controls-button-background-color-hover:var(--color-muted)]",
+  "[--xy-controls-button-color:var(--color-foreground)]",
+  "[--xy-controls-button-color-hover:var(--color-foreground)]",
+  "[--xy-controls-button-border-color:var(--color-border)]",
 ].join(" ");
 
 export function ProjectGraph({ slug }: { slug: string }) {
