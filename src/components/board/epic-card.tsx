@@ -9,7 +9,7 @@ import type { Epic } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { ConfirmDeleteButton } from "@/components/ui/confirm-delete-button";
 import { cn } from "@/lib/utils";
-import { TYPE_RAIL, agentDotClass, ticketProgress } from "@/components/board/board-utils";
+import { STAGE_INSET_SHADOW, agentDotClass, ticketProgress } from "@/components/board/board-utils";
 import { TypeBadge, TypeIcon } from "@/components/board/type-language";
 import { MetaChip, PrLink, RiskChip } from "@/components/atoms";
 import { CopyButton } from "@/components/ui/copy-button";
@@ -208,9 +208,12 @@ function CardShell({
   muted?: boolean;
   children: React.ReactNode;
 }) {
-  // The left rail is type-hued (the shared type language), not stage-hued — stage is read from the
-  // column now, so a per-card stage rail would be redundant.
-  const rail = TYPE_RAIL.epic;
+  // Stage-hued left rail as the active-stage cue: orange for implementing, blue for in-review.
+  // Backlog/done epics stay railless (the purple type rail was intentionally dropped).
+  const inset =
+    epic.stage === "implementing" || epic.stage === "in-review"
+      ? STAGE_INSET_SHADOW[epic.stage]
+      : undefined;
 
   // A blocked epic (open blockers) is dimmed in every column so it reads as "the runtime won't
   // pick this up yet", mirroring the "blocked by" chip. Done cards are never blocked in practice.
@@ -224,7 +227,7 @@ function CardShell({
         overlay && "rotate-1 shadow-lg ring-1 ring-ring/30",
         muted && "bg-card/70",
         blocked && "opacity-60",
-        rail,
+        inset,
       )}
     >
       {!overlay && (

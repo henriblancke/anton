@@ -13,7 +13,16 @@ const CAP = 3;
  * "standalone · N" divider. Beyond the cap, the overflow collapses behind a "+N more" expander so
  * the board stays epics-first above the fold.
  */
-export function StandaloneGroup({ slug, items }: { slug: string; items: StandaloneItem[] }) {
+export function StandaloneGroup({
+  slug,
+  items,
+  onOpenTicket,
+}: {
+  slug: string;
+  items: StandaloneItem[];
+  /** Open a chip's detail dialog — forwarded from the board. */
+  onOpenTicket?: (ticketId: string) => void;
+}) {
   const [expanded, setExpanded] = useState(false);
   if (items.length === 0) return null;
 
@@ -28,7 +37,7 @@ export function StandaloneGroup({ slug, items }: { slug: string; items: Standalo
         <span className="font-mono text-[10px] text-subtle">{items.length}</span>
       </div>
       {visible.map((item) => (
-        <StandaloneChip key={item.id} slug={slug} item={item} />
+        <StandaloneChip key={item.id} slug={slug} item={item} onOpen={onOpenTicket} />
       ))}
       {overflow > 0 && (
         <button

@@ -61,6 +61,15 @@ export const STAGE_BORDER_LEFT: Record<Stage, string> = {
   done: "border-l-stage-done",
 };
 
+/** Inset left-rail per stage — the active-stage cue on epic cards. Only implementing (orange) and
+ * in-review (blue) carry it; backlog/done cards stay railless. */
+export const STAGE_INSET_SHADOW: Record<Stage, string> = {
+  backlog: "shadow-[inset_2px_0_0_var(--stage-backlog)]",
+  implementing: "shadow-[inset_2px_0_0_var(--stage-implementing)]",
+  "in-review": "shadow-[inset_2px_0_0_var(--stage-in-review)]",
+  done: "shadow-[inset_2px_0_0_var(--stage-done)]",
+};
+
 /** Dot color per agent tag — a stable, warm-matched hue so an agent reads at a glance.
  * Falls back to the neutral subtle color for unknown/absent agents. */
 export function agentDotClass(agent?: string): string {

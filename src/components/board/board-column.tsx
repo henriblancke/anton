@@ -14,12 +14,15 @@ export function BoardColumn({
   standalone,
   slug,
   onEpicDeleted,
+  onOpenTicket,
 }: {
   stage: Stage;
   epics: Epic[];
   standalone: StandaloneItem[];
   slug: string;
   onEpicDeleted?: (epicId: string) => void;
+  /** Open a standalone ticket's detail dialog (hoisted to the board so one dialog serves all). */
+  onOpenTicket?: (ticketId: string) => void;
 }) {
   const { setNodeRef, isOver } = useDroppable({ id: stage });
   const isEmpty = epics.length === 0 && standalone.length === 0;
@@ -60,7 +63,7 @@ export function BoardColumn({
             {epics.map((epic) => (
               <DraggableEpicCard key={epic.id} slug={slug} epic={epic} onDeleted={onEpicDeleted} />
             ))}
-            <StandaloneGroup slug={slug} items={standalone} />
+            <StandaloneGroup slug={slug} items={standalone} onOpenTicket={onOpenTicket} />
           </>
         )}
       </div>
