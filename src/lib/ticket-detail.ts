@@ -4,9 +4,9 @@
  * Mirrors the read/parse patterns in epic-detail.ts and tickets.ts. See DESIGN.md §2/§3.
  */
 import { beads, type BeadPatch } from "./beads/bd";
-import { deriveStage } from "./board";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
-import { createdMeta, labelValue, listAllBeads, parseAcceptance, parseGoal } from "./tickets";
+import { createdMeta, deriveStage, labelValue, parseAcceptance, parseGoal } from "./ticket-view";
+import { listAllBeads } from "./tickets";
 import type { Bead } from "./beads/bd";
 import type { Project, TicketDetail } from "./types";
 

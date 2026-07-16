@@ -3,13 +3,13 @@
  * among {epic + tickets}. Edges come from `bd dep list` on each ticket, filtered to members
  * of the epic's own graph. See DESIGN.md §2/§3.
  */
-import { beads, type Bead } from "./beads/bd";
-import { deriveStage } from "./board";
+import { beads } from "./beads/bd";
 import { getDb } from "./db";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
 import { findOpenRunForEpic } from "./runs";
-import { createdMeta, labelValue, listAllBeads, parseAcceptance, parseGoal } from "./tickets";
-import type { DepEdge, DepType, Epic, EpicDetail, EpicRun, Project, Ticket } from "./types";
+import { parseAcceptance, parseGoal, toEpic, toTicket } from "./ticket-view";
+import { listAllBeads } from "./tickets";
+import type { DepEdge, DepType, EpicDetail, EpicRun, Project } from "./types";
 
 /** The open run backing this epic (if any), for the "View run" / worktree affordances. */
 async function openRunFor(project: Project, epicId: string): Promise<EpicRun | undefined> {
@@ -24,21 +24,6 @@ async function openRunFor(project: Project, epicId: string): Promise<EpicRun | u
 }
 
 const DEP_TYPES = new Set<DepType>(["parent-child", "blocks", "related", "discovered-from"]);
-
-function toTicket(bead: Bead): Ticket {
-  return {
-    id: bead.id,
-    title: bead.title,
-    status: bead.status,
-    stage: deriveStage(bead),
-    agent: labelValue(bead.labels, "agent"),
-    risk: labelValue(bead.labels, "risk"),
-    size: labelValue(bead.labels, "size"),
-    acceptance: parseAcceptance(bead),
-    ...createdMeta(bead),
-    prRef: bead.external_ref,
-  };
-}
 
 export async function getEpicDetail(project: Project, epicId: string): Promise<EpicDetail> {
   const all = await listAllBeads(project); // one call: carries parent + inline dependencies
@@ -56,20 +41,11 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
   // it becomes an epic whose only member is itself, with no children and no epic-graph edges.
   if (!beads.isEpic(lite)) {
     const self = toTicket(lite);
-    const epic: Epic = {
-      id: lite.id,
-      title: lite.title,
+    const epic = toEpic(lite, {
       goal: parseGoal(full.description),
       acceptance: parseAcceptance(full),
-      approved: beads.isApproved(lite),
-      stage: deriveStage(lite),
-      agent: labelValue(lite.labels, "agent"),
-      risk: labelValue(lite.labels, "risk"),
-      size: labelValue(lite.labels, "size"),
-      ...createdMeta(lite),
-      prRef: lite.external_ref,
       tickets: [self],
-    };
+    });
     attachPrUrl(epic, base);
     attachPrUrl(self, base);
     return { epic, description: full.description, tickets: [self], edges: [], run };
@@ -80,17 +56,14 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
   );
   const tickets = childBeads.map(toTicket);
 
-  const epic: Epic = {
-    id: lite.id,
-    title: lite.title,
+  // The epic-detail header historically shows agent/risk/size per-ticket (in the graph), not on
+  // the epic itself — so `chips: false` keeps this view byte-identical. See ticket-view.ts.
+  const epic = toEpic(lite, {
     goal: parseGoal(full.description),
     acceptance: parseAcceptance(full),
-    approved: beads.isApproved(lite),
-    stage: deriveStage(lite),
-    ...createdMeta(lite),
-    prRef: lite.external_ref,
     tickets,
-  };
+    chips: false,
+  });
   attachPrUrl(epic, base);
   for (const t of tickets) attachPrUrl(t, base);
 
