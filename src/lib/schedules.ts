@@ -118,10 +118,6 @@ export async function updateSchedule(
   await db.update(schema.schedules).set(set).where(eq(schema.schedules.id, id));
 }
 
-export async function deleteSchedule(db: AntonDb, id: string): Promise<void> {
-  await db.delete(schema.schedules).where(eq(schema.schedules.id, id));
-}
-
 /** All schedules for a project (UI read path via shared anton.db). */
 export async function listSchedules(projectId: string): Promise<ScheduleSummary[]> {
   const rows = await getDb()
@@ -129,11 +125,6 @@ export async function listSchedules(projectId: string): Promise<ScheduleSummary[
     .from(schema.schedules)
     .where(eq(schema.schedules.projectId, projectId));
   return rows.map(toScheduleSummary);
-}
-
-/** db-injectable list (scheduler loop / tests). */
-export async function listSchedulesDb(db: AntonDb, projectId: string): Promise<ScheduleRow[]> {
-  return db.select().from(schema.schedules).where(eq(schema.schedules.projectId, projectId));
 }
 
 /**

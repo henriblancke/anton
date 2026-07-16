@@ -182,8 +182,3 @@ export async function removeWorktree(
     }
   }
 }
-
-/** `git worktree prune` — drop administrative entries for worktrees whose dir is gone. */
-export async function pruneWorktrees(repoPath: string): Promise<void> {
-  await git(repoPath, ["worktree", "prune"]);
-}

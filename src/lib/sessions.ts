@@ -3,7 +3,7 @@
  * shape / review-fix): rows for history + diagnostics, plus an append-only log file the UI can
  * tail (SSE) or replay. db-injectable so the runner and tests share one connection.
  */
-import { appendFile, mkdir, open, readFile, stat } from "node:fs/promises";
+import { appendFile, mkdir, open, stat } from "node:fs/promises";
 import { watch } from "node:fs";
 import { dirname, join } from "node:path";
 import { desc, eq } from "drizzle-orm";
@@ -122,17 +122,6 @@ export async function getSessionById(id: string): Promise<SessionRow | undefined
     .where(eq(schema.sessions.id, id))
     .limit(1);
   return rows[0];
-}
-
-/** Full current contents of a session log (replay for finished sessions / diagnostics). */
-export async function readSessionLog(logPath: string): Promise<string> {
-  try {
-    return await readFile(logPath, "utf8");
-  } catch (err) {
-    // A session that hasn't emitted anything yet has no file — treat as empty, not an error.
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return "";
-    throw err;
-  }
 }
 
 /** One chunk from {@link tailSessionLog}: appended log bytes, or the terminal `end` marker. */

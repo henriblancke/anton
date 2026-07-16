@@ -19,14 +19,6 @@ export const STAGE_ACCENT_DOT: Record<Stage, string> = {
   done: "bg-stage-done",
 };
 
-/** Text color per stage, for stage-tinted labels/pills. */
-export const STAGE_TEXT: Record<Stage, string> = {
-  backlog: "text-stage-backlog",
-  implementing: "text-stage-implementing",
-  "in-review": "text-stage-in-review",
-  done: "text-stage-done",
-};
-
 /** Inset left-border color per stage — mirrors the board card's `box-shadow: inset 2px 0`. */
 export const STAGE_INSET_SHADOW: Record<Stage, string> = {
   backlog: "shadow-[inset_2px_0_0_var(--stage-backlog)]",
@@ -74,39 +66,6 @@ export function ticketProgress(epic: { tickets: Ticket[] }): {
   const done = epic.tickets.filter((t) => t.stage === "done").length;
   const pct = total === 0 ? 0 : Math.round((done / total) * 100);
   return { done, total, pct };
-}
-
-export interface TicketBadge {
-  key: string;
-  label: string;
-}
-
-/** Small badges for a ticket: agent / risk / size, in that order, skipping unset fields. */
-export function ticketBadges(ticket: Ticket): TicketBadge[] {
-  const badges: TicketBadge[] = [];
-  if (ticket.agent) badges.push({ key: "agent", label: ticket.agent });
-  if (ticket.risk) badges.push({ key: "risk", label: `risk:${ticket.risk}` });
-  if (ticket.size) badges.push({ key: "size", label: `size:${ticket.size}` });
-  return badges;
-}
-
-/** Badge variant for a ticket badge — only `risk:high` gets the destructive (red) tint, per
- * the design brief; everything else stays a quiet neutral chip. */
-export function badgeVariant(badge: TicketBadge): "outline" | "destructive" {
-  return badge.key === "risk" && badge.label === "risk:high" ? "destructive" : "outline";
-}
-
-/** Tooltip text for a ticket's summary dot on a multi-ticket epic card. */
-export function ticketDotTitle(ticket: Ticket): string {
-  const parts = [ticket.title];
-  if (ticket.agent) parts.push(`agent:${ticket.agent}`);
-  if (ticket.risk) parts.push(`risk:${ticket.risk}`);
-  return parts.join(" · ");
-}
-
-/** Whether a PR reference looks like a clickable URL rather than a bare bead external-ref. */
-export function isExternalUrl(value: string): boolean {
-  return /^https?:\/\//.test(value);
 }
 
 /** Moves an epic (by id) to another stage column, immutably. Used for optimistic

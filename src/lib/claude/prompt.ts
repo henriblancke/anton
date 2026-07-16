@@ -21,7 +21,6 @@ export const SKILLS_DIR = "skills";
  * This is the canonical list; the installer and the asset test both read it.
  */
 export const REQUIRED_SKILLS = ["shape", "bd", "scan-triage", "review-fix"] as const;
-export type RequiredSkill = (typeof REQUIRED_SKILLS)[number];
 
 /** Absolute path to a skill's `SKILL.md`, resolved against anton's repo root. */
 export function skillPath(name: string): string {
