@@ -32,6 +32,24 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Build the comment body in a step WITHOUT the PAT in its environment. REVIEW.md comes from
+      # the checked-out PR merge, so it's attacker-controlled: an author could make it a symlink to
+      # /proc/self/environ (or another secrets file) and have `cat` copy an inherited token into the
+      # comment. Keeping the token out of this step means there's nothing sensitive to capture; the
+      # `! -L` guard rejects symlinks as belt-and-suspenders.
+      - name: Build review comment body
+        run: |
+          BODY_FILE="$RUNNER_TEMP/codex-body.md"
+          {
+            echo "@codex review"
+            echo
+            if [ -f REVIEW.md ] && [ ! -L REVIEW.md ]; then
+              cat REVIEW.md
+            else
+              echo "_(No usable REVIEW.md in the repo root — reviewing with defaults.)_"
+            fi
+          } > "$BODY_FILE"
+
       - name: Post Codex review request
         env:
           # MUST be a PAT belonging to a user with a connected Codex seat — NOT the default
@@ -39,18 +57,8 @@ jobs:
           # default token authors comments as github-actions[bot], which has no Codex seat, so Codex
           # replies "To use Codex here, create a Codex account and connect to github" instead of
           # reviewing. Store the PAT as the repo/org secret CODEX_REVIEW_TOKEN (fine-grained, Pull
-          # requests: Read and write).
+          # requests: Read and write). Scoped to this step only, which reads just the body file we
+          # built above — never the untrusted REVIEW.md.
           GH_TOKEN: ${{ secrets.CODEX_REVIEW_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          BODY_FILE="$(mktemp)"
-          {
-            echo "@codex review"
-            echo
-            if [ -f REVIEW.md ]; then
-              cat REVIEW.md
-            else
-              echo "_(No REVIEW.md found in the repo root — reviewing with defaults.)_"
-            fi
-          } > "$BODY_FILE"
-          gh pr comment "$PR_NUMBER" --body-file "$BODY_FILE"
+        run: gh pr comment "$PR_NUMBER" --body-file "$RUNNER_TEMP/codex-body.md"
