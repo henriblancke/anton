@@ -5,83 +5,20 @@ import { beads, getSyncStatus, getSyncStatusToken, type Bead } from "./beads/bd"
 import { allIssues } from "./beads/issues";
 import { issueSnapshotVersion } from "./beads/snapshot";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
-import { STAGES, type Board, type Epic, type Project, type Stage, type Ticket } from "./types";
+import { parseAcceptance, parseGoal, toEpic, toTicket } from "./ticket-view";
+import { STAGES, type Board, type Epic, type Project, type Stage } from "./types";
 
-export function deriveStage(bead: Bead): Stage {
-  if (bead.status === "closed") return "done";
-  const labels = bead.labels ?? [];
-  if (labels.includes("stage:in-review") || bead.external_ref) return "in-review";
-  if (bead.status === "in_progress" || labels.includes("stage:implementing")) {
-    return "implementing";
-  }
-  return "backlog";
-}
+// deriveStage lives in ticket-view.ts now; re-exported here for existing importers/tests.
+export { deriveStage } from "./ticket-view";
 
 export function getBoardVersion(repoPath: string): string {
   return `${issueSnapshotVersion(repoPath)}:${getSyncStatusToken(repoPath)}`;
 }
 
-/** Extract a "## <name>" section from a bead description. `bd list --json` returns the
- * description but not the acceptance/context fields, so the board reads the contract here. */
-function parseSection(description: string | undefined, name: string): string | undefined {
-  if (!description) return undefined;
-  const lines = description.split("\n");
-  const re = new RegExp(`^##\\s*${name}\\b`, "i");
-  const startIdx = lines.findIndex((l) => re.test(l.trim()));
-  if (startIdx === -1) return undefined;
-  const rest = lines.slice(startIdx + 1);
-  const endIdx = rest.findIndex((l) => /^##\s+/.test(l.trim()));
-  const body = endIdx === -1 ? rest : rest.slice(0, endIdx);
-  const text = body.join("\n").trim();
-  return text || undefined;
-}
-const parseGoal = (d: string | undefined) => parseSection(d, "Goal");
-const parseAcceptance = (bead: Bead) =>
-  parseSection(bead.description, "Acceptance") ?? bead.acceptance_criteria ?? bead.acceptance;
-
-function labelValue(labels: string[] | undefined, prefix: string): string | undefined {
-  const label = labels?.find((l) => l.startsWith(`${prefix}:`));
-  return label ? label.slice(prefix.length + 1) : undefined;
-}
-
-/** Claimed-by + created metadata carried straight off the raw bead, null-safe. Kept local to
- * board.ts so this module stays free of a tickets.ts ← board.ts import cycle. */
-function createdMeta(bead: Bead): { assignee: string | null; createdAt: string; createdBy: string | null } {
-  return {
-    assignee: bead.assignee ?? null,
-    createdAt: bead.created_at ?? "",
-    createdBy: bead.created_by ?? null,
-  };
-}
-
-function toTicket(bead: Bead): Ticket {
-  return {
-    id: bead.id,
-    title: bead.title,
-    status: bead.status,
-    stage: deriveStage(bead),
-    agent: labelValue(bead.labels, "agent"),
-    risk: labelValue(bead.labels, "risk"),
-    size: labelValue(bead.labels, "size"),
-    acceptance: parseAcceptance(bead),
-    ...createdMeta(bead),
-    prRef: bead.external_ref,
-  };
-}
-
+/** A parentless non-epic bead, rendered on the board as a single-ticket pseudo-epic card. The
+ * PR link rides on the wrapped ticket, so the epic wrapper itself carries no prRef. */
 function ticketAsEpic(bead: Bead): Epic {
-  const ticket = toTicket(bead);
-  return {
-    id: bead.id,
-    title: bead.title,
-    approved: beads.isApproved(bead),
-    stage: ticket.stage,
-    agent: ticket.agent,
-    risk: ticket.risk,
-    size: ticket.size,
-    ...createdMeta(bead),
-    tickets: [ticket],
-  };
+  return toEpic(bead, { tickets: [toTicket(bead)], prRef: false });
 }
 
 export async function getBoard(project: Project): Promise<Board> {
@@ -118,20 +55,11 @@ export async function getBoard(project: Project): Promise<Board> {
   for (const epic of epicBeads) {
     const children = childrenByEpic.get(epic.id) ?? [];
     const tickets = children.map(toTicket);
-    const built: Epic = {
-      id: epic.id,
-      title: epic.title,
+    const built = toEpic(epic, {
       goal: parseGoal(epic.description),
       acceptance: parseAcceptance(epic),
-      approved: beads.isApproved(epic),
-      stage: deriveStage(epic),
-      agent: labelValue(epic.labels, "agent"),
-      risk: labelValue(epic.labels, "risk"),
-      size: labelValue(epic.labels, "size"),
-      ...createdMeta(epic),
-      prRef: epic.external_ref,
       tickets,
-    };
+    });
     columns[built.stage].push(built);
   }
 

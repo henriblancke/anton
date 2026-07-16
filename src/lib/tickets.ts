@@ -5,48 +5,15 @@
  */
 import { beads, type Bead } from "./beads/bd";
 import { allIssues } from "./beads/issues";
-import { deriveStage } from "./board";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
+import { createdMeta, deriveStage, labelValue, parseAcceptance } from "./ticket-view";
 import type { Project, TicketFilters, TicketRow } from "./types";
 
 const NON_WORK = new Set(["molecule"]);
 
-function parseSection(description: string | undefined, name: string): string | undefined {
-  if (!description) return undefined;
-  const lines = description.split("\n");
-  const re = new RegExp(`^##\\s*${name}\\b`, "i");
-  const startIdx = lines.findIndex((l) => re.test(l.trim()));
-  if (startIdx === -1) return undefined;
-  const rest = lines.slice(startIdx + 1);
-  const endIdx = rest.findIndex((l) => /^##\s+/.test(l.trim()));
-  const body = endIdx === -1 ? rest : rest.slice(0, endIdx);
-  const text = body.join("\n").trim();
-  return text || undefined;
-}
-
-export const parseGoal = (d: string | undefined): string | undefined => parseSection(d, "Goal");
-
-export const parseAcceptance = (bead: Bead): string | undefined =>
-  parseSection(bead.description, "Acceptance") ?? bead.acceptance_criteria ?? bead.acceptance;
-
-export function labelValue(labels: string[] | undefined, prefix: string): string | undefined {
-  const label = labels?.find((l) => l.startsWith(`${prefix}:`));
-  return label ? label.slice(prefix.length + 1) : undefined;
-}
-
-/** The claimed-by + created metadata carried straight off the raw bead, null-safe (an unclaimed
- * ticket has no assignee/created_by). Shared by every bead→view mapper. */
-export function createdMeta(bead: Bead): {
-  assignee: string | null;
-  createdAt: string;
-  createdBy: string | null;
-} {
-  return {
-    assignee: bead.assignee ?? null,
-    createdAt: bead.created_at ?? "",
-    createdBy: bead.created_by ?? null,
-  };
-}
+// Re-exported for callers/tests that read the ticket contract off a bead; the implementations
+// live in ticket-view.ts (the single source of truth).
+export { parseAcceptance, parseGoal } from "./ticket-view";
 
 export async function listAllBeads(project: Project): Promise<Bead[]> {
   return allIssues(project.repoPath);

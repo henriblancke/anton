@@ -9,7 +9,7 @@ import { appendFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { readSessionLog, tailSessionLog, type LogChunk } from "./sessions";
+import { tailSessionLog, type LogChunk } from "./sessions";
 
 let dir: string;
 let logPath: string;
@@ -29,17 +29,6 @@ async function drain(gen: AsyncGenerator<LogChunk>): Promise<LogChunk[]> {
   for await (const c of gen) out.push(c);
   return out;
 }
-
-describe("readSessionLog", () => {
-  it("returns empty string for a session that never wrote a log", async () => {
-    expect(await readSessionLog(logPath)).toBe("");
-  });
-
-  it("returns the full contents once written", async () => {
-    await writeFile(logPath, "[system] init\n[assistant] hi\n");
-    expect(await readSessionLog(logPath)).toBe("[system] init\n[assistant] hi\n");
-  });
-});
 
 describe("tailSessionLog", () => {
   it("replays an existing finished log then emits end", async () => {

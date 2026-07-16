@@ -1,12 +1,13 @@
 /**
- * Unit tests for review-fix's pure helpers: the per-thread outcome report parser (the contract
- * between claude's final message and anton's reply/resolve step). The end-to-end flow is covered
- * by review-fix.integration.test.ts.
+ * The review-fix protocol helpers moved to review-fix-context.ts (anton-l6u); their tests live in
+ * review-fix-context.test.ts. This spec keeps a smoke check that the parser is still re-exported
+ * from ./review-fix so existing importers keep working. The end-to-end flow is covered by
+ * review-fix.integration.test.ts.
  */
 import { describe, expect, it } from "vitest";
 import { parseThreadReport } from "./review-fix";
 
-describe("parseThreadReport", () => {
+describe("parseThreadReport (re-exported from ./review-fix)", () => {
   it("parses the fenced json report block", () => {
     const text = [
       "I renamed foo to bar and left the style nit.",

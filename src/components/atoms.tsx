@@ -3,7 +3,7 @@ import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";
 import type { Stage } from "@/lib/types";
 import { formatExactTime, formatRelativeTime } from "@/lib/time";
-import { STAGE_ACCENT_DOT, STAGE_LABELS, STAGE_TEXT, agentDotClass } from "@/components/board/board-utils";
+import { STAGE_ACCENT_DOT, STAGE_LABELS } from "@/components/board/board-utils";
 
 type ChipTone = "neutral" | "risk-high" | "risk-med" | "blocked" | "pr" | "done";
 
@@ -78,15 +78,6 @@ export function PrLink({
     >
       {children}
     </a>
-  );
-}
-
-/** Agent chip — mono label with the agent's stable hue as a leading dot. */
-export function AgentChip({ agent, className }: { agent: string; className?: string }) {
-  return (
-    <MetaChip dotClass={agentDotClass(agent)} className={className}>
-      {agent}
-    </MetaChip>
   );
 }
 
@@ -174,35 +165,5 @@ export function RelativeTime({ iso, className }: { iso: string | null | undefine
     <time dateTime={iso ?? undefined} title={exact ?? undefined} className={className}>
       {relative}
     </time>
-  );
-}
-
-/** Stage dot + label used in column headers and inline. */
-export function StageDotLabel({
-  stage,
-  count,
-  className,
-}: {
-  stage: Stage;
-  count?: number;
-  className?: string;
-}) {
-  return (
-    <div className={cn("flex items-center gap-2", className)}>
-      <span
-        className={cn(
-          "size-2.5 rounded-full",
-          STAGE_ACCENT_DOT[stage],
-          stage === "implementing" && "anton-pulse",
-        )}
-        aria-hidden="true"
-      />
-      <span className={cn("text-sm font-medium", STAGE_TEXT[stage])}>{STAGE_LABELS[stage]}</span>
-      {count !== undefined && (
-        <span className="ml-auto rounded-full bg-card px-2 py-0.5 font-mono text-[11px] text-subtle">
-          {count}
-        </span>
-      )}
-    </div>
   );
 }
