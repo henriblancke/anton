@@ -277,9 +277,12 @@ process.exit(0);`,
     expect(forTicket(t2).append).not.toContain("Specialist guidance (agent)");
   }, 60_000);
 
-  it("runs a parentless bug as an epic-of-one → branch anton/<id> → its own PR → bead closed", async () => {
-    // anton-cmz.1: a standalone (parentless) bug is a run target. It executes as a single-ticket
-    // run — its own branch + PR — and the bead itself is the ticket that gets closed.
+  it("runs a parentless bug as an epic-of-one → branch anton/<id> → its own PR → in-review (open, not closed)", async () => {
+    // anton-cmz.1 + anton-cmz review: a standalone (parentless) bug is a run target. It executes as
+    // a single-ticket run — its own branch + PR — but, exactly like an epic, the bead is NOT closed
+    // when the PR opens. It stays OPEN + stage:in-review + PR ref until the PR MERGES (review-fix's
+    // merge-finalize path closes it then). Closing it at PR-open would derive it as Done on the
+    // board while the PR is still open and drop it out of review-fix's in-review sweep.
     const bugId = await beads.create(repo, {
       title: "Fix the flaky import",
       type: "bug",
@@ -311,11 +314,15 @@ process.exit(0);`,
     expect(run.branch).toBe(`anton/${bugId}`);
     expect(existsSync(run.worktreePath!)).toBe(false); // cleaned up after the run
 
-    // Exactly one PR was opened for the branch, and the bug itself is closed + carries its ref.
+    // Exactly one PR was opened for the branch. The bug itself is OPEN (not closed) and sits in
+    // review: it carries its PR ref + stage:in-review, has dropped stage:implementing, and is still
+    // claimed by the operator. Closing happens only when the PR merges.
     const bug = await beads.show(repo, bugId);
-    expect(bug.status).toBe("closed");
+    expect(bug.status).not.toBe("closed");
     expect(bug.external_ref).toBe("gh-42");
     expect(bug.labels ?? []).toContain("stage:in-review");
+    expect(bug.labels ?? []).not.toContain("stage:implementing");
+    expect(deriveStage(bug)).toBe("in-review");
     expect(bug.assignee).toBe("test-operator");
 
     // The branch was pushed and carries a commit for the bug.
@@ -335,16 +342,18 @@ process.exit(0);`,
     expect(sessions).toHaveLength(1);
   }, 60_000);
 
-  it("keeps a standalone target OPEN (not Done) when the PR step fails after committing", async () => {
-    // anton-cmz review: a standalone's single ticket close is deferred until its PR opens. If
-    // push/`gh pr create` fails after the commit, the bead must NOT be left closed — that would
-    // put it in Done with no PR ref and no visible retry state (a false green). It stays in
-    // implementing (in_progress, not closed) so the failed run is honest and resumable.
+  it("standalone PR-step failure: stays OPEN + in-review, then resumes at the PR step without re-running claude", async () => {
+    // anton-cmz review (both threads): a standalone is never closed by execute-epic — it stays
+    // OPEN + stage:in-review + PR ref until its PR merges. If push/`gh pr create` fails AFTER the
+    // ticket work is committed, the bead must NOT land in Done (a false green) and the committed
+    // work must NOT be redone on the next attempt. runTicket moves the bead to stage:in-review the
+    // moment it commits, which serves both as the honest board state (in review, not Done) and as
+    // the persisted resume marker: the retry skips the ticket loop and resumes at the PR step.
     const bugId = await beads.create(repo, {
       title: "PR step will fail",
       type: "bug",
       acceptance: "work file exists",
-      description: "## Goal\nProve the deferred close.",
+      description: "## Goal\nProve resume-at-PR.",
     });
     await beads.approve(repo, bugId);
 
@@ -372,21 +381,52 @@ process.exit(0);`,
       await runner.tickOnce();
       await runner.whenIdle();
 
-      // The run failed at the PR step.
-      const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === bugId)!;
-      expect(run.status).toBe("failed");
+      // Attempt 1: the run failed at the PR step.
+      const run1 = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === bugId)!;
+      expect(run1.status).toBe("failed");
 
-      // The bead is NOT closed and carries no PR ref — it did not silently land in Done.
-      const bug = await beads.show(repo, bugId);
-      expect(bug.status).not.toBe("closed");
-      expect(bug.external_ref ?? null).toBeNull();
-      // Its committed work is real, so it stays flagged as in-flight (implementing), not Done.
-      expect(deriveStage(bug)).not.toBe("done");
-      expect(deriveStage(bug)).toBe("implementing");
+      // The bead is NOT closed and carries no PR ref — it did not silently land in Done. Its
+      // committed work moved it to in-review (the resume marker), so it reads as in review, not Done.
+      const bug1 = await beads.show(repo, bugId);
+      expect(bug1.status).not.toBe("closed");
+      expect(bug1.external_ref ?? null).toBeNull();
+      expect(deriveStage(bug1)).toBe("in-review");
+      expect(bug1.labels ?? []).not.toContain("stage:implementing");
+      const sessionsAfter1 = (await tdb.db.select().from(schema.sessions)).filter(
+        (s) => s.beadId === bugId,
+      );
+      expect(sessionsAfter1).toHaveLength(1);
+
+      // Resume with a working gh. The retry must skip the already-committed ticket (resume marker)
+      // and pick up at the PR step — no second claude session, one PR opened.
+      process.env.ANTON_GH_BIN = okGh;
+      await park(tdb.db, clock, jobId, "test: simulate resume");
+      expect(await resumeJob(tdb.db, clock, jobId)).toBe(true);
+      await runner.tickOnce();
+      await runner.whenIdle();
+
+      // Attempt 2: the run finished and the PR opened onto the still-open, in-review bead. The
+      // failed attempt-1 run row remains (findOpenRunForEpic ignores failed runs, so the resume
+      // starts a fresh run), so assert a done run exists rather than picking one arbitrarily.
+      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+      const runsForBug = (await tdb.db.select().from(schema.runs)).filter(
+        (r) => r.epicBeadId === bugId,
+      );
+      expect(runsForBug.some((r) => r.status === "done")).toBe(true);
+      const bug2 = await beads.show(repo, bugId);
+      expect(bug2.status).not.toBe("closed"); // closes only when the PR merges
+      expect(bug2.external_ref).toBe("gh-42");
+      expect(deriveStage(bug2)).toBe("in-review");
+
+      // Claude was NOT re-run: still exactly one execute session for the bug.
+      const sessionsAfter2 = (await tdb.db.select().from(schema.sessions)).filter(
+        (s) => s.beadId === bugId,
+      );
+      expect(sessionsAfter2).toHaveLength(1);
     } finally {
       process.env.ANTON_GH_BIN = okGh;
       process.env.ANTON_CLAUDE_BIN = successClaude;
-      // Failed runs reschedule with backoff; park so a later clock-advancing tick can't re-dispatch.
+      // Park so a later clock-advancing tick in another test can't re-dispatch this job.
       if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
     }
   }, 60_000);

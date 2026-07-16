@@ -5,7 +5,8 @@
  * review-fix.integration.test.ts.
  */
 import { describe, expect, it } from "vitest";
-import { parseThreadReport } from "./review-fix";
+import { inReviewEpics, parseThreadReport } from "./review-fix";
+import { LABELS, type Bead } from "../beads/bd";
 
 describe("parseThreadReport (re-exported from ./review-fix)", () => {
   it("parses the fenced json report block", () => {
@@ -63,5 +64,36 @@ describe("parseThreadReport (re-exported from ./review-fix)", () => {
     expect(parseThreadReport("all done, no threads to report")).toEqual([]);
     expect(parseThreadReport("```json\n{not json\n```")).toEqual([]);
     expect(parseThreadReport('```json\n{"threads":"nope"}\n```')).toEqual([]);
+  });
+});
+
+describe("inReviewEpics", () => {
+  const IN_REVIEW = LABELS.stage("in-review");
+  const bead = (over: Partial<Bead>): Bead => ({
+    id: over.id ?? "b1",
+    title: "t",
+    status: "in_progress",
+    labels: [IN_REVIEW],
+    external_ref: "gh-1",
+    ...over,
+  });
+
+  it("selects in-review run targets: epics AND standalone (parentless) task/bug PR targets", () => {
+    // anton-cmz review: a standalone task/bug runs as an epic-of-one and stays open + in-review +
+    // PR ref until its PR merges. review-fix must sweep it too, else its PR falls out of the
+    // automated review/finalization path and the board derives it Done while the PR is still open.
+    const epic = bead({ id: "epic-1", issue_type: "epic" });
+    const task = bead({ id: "task-1", issue_type: "task" }); // parentless → run target
+    const bug = bead({ id: "bug-1", issue_type: "bug" }); // parentless → run target
+    const selected = inReviewEpics([epic, task, bug]).map((b) => b.id);
+    expect(selected).toEqual(["epic-1", "task-1", "bug-1"]);
+  });
+
+  it("excludes child tickets, closed beads, non-in-review, and PR-ref-less beads", () => {
+    const child = bead({ id: "child-1", issue_type: "task", parent: "epic-1" }); // has a parent
+    const closed = bead({ id: "closed-1", issue_type: "epic", status: "closed" });
+    const noLabel = bead({ id: "nolabel-1", issue_type: "bug", labels: [] });
+    const noRef = bead({ id: "noref-1", issue_type: "epic", external_ref: undefined });
+    expect(inReviewEpics([child, closed, noLabel, noRef])).toEqual([]);
   });
 });

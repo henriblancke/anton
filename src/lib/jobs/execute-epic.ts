@@ -159,14 +159,17 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         .sync(repo)
         .catch((e) => console.error(`[execute-epic] claim sync failed for ${epicBeadId}`, e));
 
-      // 3. Per ticket: claude → tests → commit → close. Skip already-closed (resume).
-      // For a standalone run the single ticket IS the target; DEFER its close until the PR opens
-      // (below). Closing it here would drop the bead into Done before a PR exists, so a failed
-      // push/`gh pr create` would strand it in Done with no PR ref and no visible retry state (a
-      // false green). An epic closes its children now as before — the epic bead itself is never
-      // closed here, so an epic never hits that trap.
+      // 3. Per ticket: claude → tests → commit → (close | in-review). Skip work that already
+      //    landed on a prior attempt. A closed ticket is done — an epic's children close as they
+      //    commit, and any resumed run skips them. A standalone target is NEVER closed here (its
+      //    close is a merge-time concern, below): the moment its single ticket commits, runTicket
+      //    moves it to stage:in-review instead — that label is both the board's "in review" state
+      //    and the persisted resume marker, so a retry after a failed PR step skips straight to
+      //    the PR step here rather than re-running claude/tests/commit on already-committed work.
+      const inReview = LABELS.stage("in-review");
       for (const ticket of orderTickets(tickets, all)) {
         if (ticket.status === "closed") continue;
+        if (standaloneRun && (ticket.labels?.includes(inReview) ?? false)) continue;
         await runTicket({
           db,
           clock,
@@ -183,9 +186,13 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         await ctx.heartbeat();
       }
 
-      // 4. All tickets closed → open one PR, move the target to in-review. For a standalone
-      // task/bug the target IS the single ticket runTicket already closed above; opening its PR
-      // and stamping in-review + the PR ref onto the (now closed) bead is the epic-of-one finish.
+      // 4. All tickets done → open one PR, stamp the PR ref, and (for an epic) move it to
+      //    in-review. A standalone target is NOT closed here: like an epic it stays OPEN, tagged
+      //    stage:in-review (runTicket already applied that on commit), carrying its PR ref until
+      //    the PR actually MERGES — at which point review-fix's merge-finalize path closes it.
+      //    Closing it now would derive it as Done on the board while its PR is still open and drop
+      //    it out of review-fix's in-review sweep (which is what keeps a standalone PR in the
+      //    automated review/finalization path).
       const pr = await openPullRequest({
         repoPath: repo,
         branch: worktree.branch,
@@ -194,12 +201,10 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         body: prBody(target, tickets),
       });
       await safe(() => beads.setExternalRef(repo, epicBeadId, pr.ref));
-      await safe(() => beads.tag(repo, epicBeadId, [LABELS.stage("in-review")]));
-      await safe(() => beads.untag(repo, epicBeadId, [LABELS.stage("implementing")]));
-      // Standalone (epic-of-one): its single ticket's close was deferred so a failed PR step
-      // couldn't strand it in Done. The PR now exists and its ref is stamped — close it to finish
-      // (same end state as before: closed + PR ref + in-review label).
-      if (standaloneRun) await safe(() => beads.close(repo, epicBeadId));
+      if (!standaloneRun) {
+        await safe(() => beads.tag(repo, epicBeadId, [inReview]));
+        await safe(() => beads.untag(repo, epicBeadId, [LABELS.stage("implementing")]));
+      }
 
       // 5. Finalize run + clean up the worktree (the branch/PR carry the work now).
       await updateRun(db, clock, runId, { status: "done", endedAt: clock.now(), error: null });
@@ -240,8 +245,10 @@ async function runTicket(args: {
   settings: ProjectSettings;
   operator?: string;
   /** Close the bead in beads once its work is committed. False for a standalone (epic-of-one)
-   * target, whose close is deferred to the caller until its PR opens (so a failed PR step can't
-   * strand it in Done). Defaults to true (an epic's children close as their work lands). */
+   * target, which is never closed by execute-epic: it stays open + stage:in-review + PR ref until
+   * its PR merges (review-fix's merge-finalize path closes it). On commit, a false value instead
+   * moves the bead to stage:in-review — the resume marker + board state. Defaults to true (an
+   * epic's children close as their work lands). */
   closeOnDone?: boolean;
 }): Promise<void> {
   const { db, clock, ctx, projectId, repo, runId, worktreePath, ticket, settings, operator } =
@@ -324,9 +331,17 @@ async function runTicket(args: {
     await commitAll(worktreePath, `${ticket.id}: ${ticket.title}`);
     committed = true;
 
-    // Mark the ticket done in beads (stage → done) — unless the caller defers the close (a
-    // standalone target, closed only after its PR opens). endSession still records the work done.
-    if (closeOnDone) await safe(() => beads.close(repo, ticket.id));
+    // Persist this ticket's "code done" state the moment it commits. An epic child closes (stage
+    // → done). A standalone target isn't closed until its PR merges, so instead move it to
+    // stage:in-review here (dropping implementing): that is both its board state and the persisted
+    // resume marker, so a retry after a failed PR step skips it rather than re-running claude on
+    // committed work. endSession still records the work done either way.
+    if (closeOnDone) {
+      await safe(() => beads.close(repo, ticket.id));
+    } else {
+      await safe(() => beads.tag(repo, ticket.id, [LABELS.stage("in-review")]));
+      await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
+    }
     await endSession(db, clock, sessionId, "done");
   } catch (e) {
     await endSession(db, clock, sessionId, "failed");

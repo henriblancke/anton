@@ -69,11 +69,18 @@ const consoleLog: RunnerLogger = {
   error: (m, meta) => console.error(`[review-fix] ${m}`, meta ?? ""),
 };
 
-/** In-review epics = open epics tagged stage:in-review that carry a PR external-ref. */
+/**
+ * In-review run targets = open run targets tagged stage:in-review that carry a PR external-ref.
+ * A run target is an epic OR a standalone parentless task/bug (an epic-of-one) — both open a PR
+ * and sit in review until it merges, so both must be swept here. A standalone target has no
+ * children, so `handleEpic`/`finalizeMergedEpic` treat it as an epic with an empty ticket set:
+ * fixing feedback runs against its PR branch as usual, and a merge closes the bead itself.
+ * (Kept named `inReviewEpics` — the exported handle importers/tests already use.)
+ */
 export function inReviewEpics(all: Bead[]): Bead[] {
   return all.filter(
     (b) =>
-      beads.isEpic(b) &&
+      beads.isRunTarget(b) &&
       b.status !== "closed" &&
       (b.labels?.includes(IN_REVIEW) ?? false) &&
       prNumberFromRef(b.external_ref) !== undefined,
