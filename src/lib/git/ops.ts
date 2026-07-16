@@ -57,6 +57,30 @@ export async function fetchOrigin(repoPath: string, refs: string[] = []): Promis
 }
 
 /**
+ * Resolve the freshest usable base ref for a new worktree (anton-l0h). Fetches `origin/<base>` and
+ * returns `"origin/<base>"` so the job layer can branch off the remote tip. Best-effort: if the
+ * repo has no `origin` remote, or the fetch fails (offline, auth, deleted ref), it logs loudly and
+ * falls back to the local `<base>` so a run is never blocked on network access. Only updates the
+ * remote-tracking ref — no local branch is mutated.
+ */
+export async function resolveFreshBase(repoPath: string, base: string): Promise<string> {
+  if (!(await hasRemote(repoPath))) {
+    // No origin (e.g. a local-only repo) — nothing to fetch; branch off the local base.
+    return base;
+  }
+  try {
+    await fetchOrigin(repoPath, [base]);
+    return `origin/${base}`;
+  } catch (e) {
+    console.warn(
+      `[git] fetch of origin/${base} in ${repoPath} failed; falling back to local ${base}`,
+      e,
+    );
+    return base;
+  }
+}
+
+/**
  * Merge `ref` into the branch checked out in `worktreePath`. A conflicted merge is left in
  * progress (markers in the tree, MERGE_HEAD set) and the conflicted paths are returned — the
  * caller has claude resolve the markers and a later `commitAll` concludes the merge. A merge that

@@ -4,12 +4,12 @@
  * on a duplicate and `pr view <branch>` resolving the branch's PR. Proves a resumed execute-epic
  * run that re-reaches the PR step reuses the existing PR instead of erroring on `gh pr create`.
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openPullRequest } from "./ops";
+import { openPullRequest, resolveFreshBase } from "./ops";
 import { GH_BIN_ENV } from "./ops";
 
 function has(cmd: string): boolean {
@@ -108,5 +108,79 @@ process.exit(0);
     expect(second.number).toBe(42);
     expect(second.ref).toBe("gh-42");
     expect(second.url).toBe(first.url);
+  });
+});
+
+suite("resolveFreshBase (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+  let bare: string;
+
+  const g = (cwd: string, args: string[]) =>
+    execFileSync("git", ["-C", cwd, ...args], { stdio: "ignore" });
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-freshbase-"));
+    repo = join(sandbox, "repo");
+    bare = join(sandbox, "remote.git");
+    mkdirSync(repo);
+
+    execFileSync("git", ["init", "--bare", "-q", bare], { stdio: "ignore" });
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(repo, ["config", "user.email", "t@example.com"]);
+    g(repo, ["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(repo, ["add", "-A"]);
+    g(repo, ["commit", "-q", "-m", "init"]);
+    g(repo, ["remote", "add", "origin", bare]);
+    g(repo, ["push", "-q", "-u", "origin", "main"]);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("fetches and returns origin/<base> when origin is ahead", async () => {
+    // Advance origin/main via a second clone so the local repo's remote-tracking ref is stale.
+    const other = join(sandbox, "other");
+    execFileSync("git", ["clone", "-q", bare, other], { stdio: "ignore" });
+    g(other, ["config", "user.email", "t@example.com"]);
+    g(other, ["config", "user.name", "anton-test"]);
+    writeFileSync(join(other, "next.md"), "next\n");
+    g(other, ["add", "-A"]);
+    g(other, ["commit", "-q", "-m", "ahead"]);
+    g(other, ["push", "-q", "origin", "main"]);
+
+    const aheadTip = execFileSync("git", ["-C", bare, "rev-parse", "main"]).toString().trim();
+
+    const ref = await resolveFreshBase(repo, "main");
+    expect(ref).toBe("origin/main");
+    // The fetch updated the remote-tracking ref to origin's new tip.
+    const tracked = execFileSync("git", ["-C", repo, "rev-parse", "origin/main"]).toString().trim();
+    expect(tracked).toBe(aheadTip);
+  });
+
+  it("logs a warning and falls back to local <base> when the fetch fails", async () => {
+    // Break the remote URL so `git fetch origin` fails, but hasRemote() still reports a remote.
+    g(repo, ["remote", "set-url", "origin", join(sandbox, "does-not-exist.git")]);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const ref = await resolveFreshBase(repo, "main");
+
+    expect(ref).toBe("main");
+    expect(warn).toHaveBeenCalledOnce();
+    expect(String(warn.mock.calls[0]?.[0])).toContain("origin/main");
+  });
+
+  it("returns local <base> without fetching when there is no origin remote", async () => {
+    g(repo, ["remote", "remove", "origin"]);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const ref = await resolveFreshBase(repo, "main");
+
+    expect(ref).toBe("main");
+    // No remote → no fetch attempt → no warning.
+    expect(warn).not.toHaveBeenCalled();
   });
 });
