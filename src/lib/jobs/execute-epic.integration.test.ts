@@ -728,4 +728,70 @@ process.exit(0);`,
         .where(eq(schema.projects.id, projectId));
     }
   }, 60_000);
+
+  it("parks a run whose epic became blocked after approval, then completes it once unblocked", async () => {
+    // TOCTOU gate (mirrors the approval route's 409): an epic can be approved + enqueued while
+    // ready, then a cross-epic `blocks` edge appears (added or pulled via Dolt sync on a shared
+    // board) before the queued job is leased. The handler re-checks readiness at job start and
+    // PARKS a still-blocked epic instead of starting it out of sequence. Recoverable: closing the
+    // blocker + resuming re-reads beads, passes the gate, and completes the epic.
+    const dependent = await beads.create(repo, {
+      title: "Dependent epic",
+      type: "epic",
+      description: "## Goal\nD",
+    });
+    await beads.approve(repo, dependent);
+    const blocker = await beads.create(repo, { title: "Blocker epic", type: "epic" });
+    const child = (() => {
+      const p = JSON.parse(
+        execFileSync(
+          "bd",
+          ["create", "Dependent ticket", "--type", "task", "--parent", dependent, "--acceptance", "x", "--json"],
+          { cwd: repo, encoding: "utf8" },
+        ),
+      );
+      return (Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string;
+    })();
+    // Direct epic→epic block: `dependent` is blocked by `blocker` while `blocker` isn't done.
+    await beads.link(repo, dependent, blocker, "blocks");
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    const jobId = await runner.enqueue({
+      type: "execute-epic",
+      projectId,
+      payload: { projectId, epicBeadId: dependent },
+    });
+    await runner.tickOnce();
+    await runner.whenIdle();
+
+    // Poison → job parked immediately (no retry burn) with a reason naming the open blocker.
+    const job = await getJob(tdb.db, jobId);
+    expect(job?.status).toBe("parked");
+    expect(job?.lastError).toContain(blocker);
+    expect(job?.lastError).toMatch(/blocked by/i);
+
+    // The gate is pre-flight — it runs before any run/claim/worktree work (like the not-approved
+    // and no-tickets gates), so no run row is created and the epic's ticket is never claimed.
+    expect(
+      (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === dependent),
+    ).toBeUndefined();
+    const t = await beads.show(repo, child);
+    expect(t.status).toBe("open");
+    expect(t.assignee ?? null).toBeNull();
+
+    // Close the blocker → it rolls up as done → resume → the dependent epic completes normally.
+    await beads.close(repo, blocker);
+    expect(await resumeJob(tdb.db, clock, jobId)).toBe(true);
+    await runner.tickOnce();
+    await runner.whenIdle();
+    expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+    expect((await beads.show(repo, child)).status).toBe("closed");
+    expect((await beads.show(repo, dependent)).labels ?? []).toContain("stage:in-review");
+  }, 60_000);
 });

@@ -17,13 +17,24 @@ import {
 } from "@dnd-kit/core";
 import { restrictToWindowEdges } from "@dnd-kit/modifiers";
 
-import { STAGES, type Board, type MoveRequest, type Stage } from "@/lib/types";
+import { STAGES, type Board, type Epic, type MoveRequest, type Stage } from "@/lib/types";
 import { EpicCard } from "@/components/board/epic-card";
 import { BoardColumn } from "@/components/board/board-column";
 import { BoardSkeleton } from "@/components/board/board-skeleton";
-import { STAGE_LABELS, moveEpicBetweenColumns } from "@/components/board/board-utils";
+import {
+  BOARD_SORT_LABELS,
+  STAGE_LABELS,
+  moveEpicBetweenColumns,
+  sortEpics,
+  type BoardSort,
+} from "@/components/board/board-utils";
 import { SyncStatusBadge } from "@/components/board/sync-status-badge";
 import { Button } from "@/components/ui/button";
+
+const BOARD_SORTS: BoardSort[] = ["default", "risk", "size"];
+
+const sortSelectClassName =
+  "h-8 rounded-lg border border-border bg-card px-2 text-xs text-foreground outline-none transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50";
 
 /** Board freshness cadence — matches the sync engine's heartbeat so remote changes surface
  * within one beat + one poll (anton-live-sync R8). */
@@ -34,6 +45,7 @@ export function EpicBoard({ slug, initialBoard }: { slug: string; initialBoard: 
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
   const [activeId, setActiveId] = useState<string | null>(null);
+  const [sort, setSort] = useState<BoardSort>("default");
   // Poll guard: a poll result landing mid-drag would clobber the drag interaction; the ref
   // mirrors activeId so the polling closure sees the live value.
   const draggingRef = useRef(false);
@@ -107,6 +119,15 @@ export function EpicBoard({ slug, initialBoard }: { slug: string; initialBoard: 
     }
     return null;
   }, [board, activeId]);
+
+  // Derived, sorted view over the raw board columns — drag/drop and polling keep operating on
+  // the source order in `board`, while each column is reordered for display per the chosen sort.
+  const sortedColumns = useMemo(() => {
+    if (!board) return null;
+    return Object.fromEntries(
+      STAGES.map((stage) => [stage, sortEpics(board.columns[stage] ?? [], sort)]),
+    ) as Record<Stage, Epic[]>;
+  }, [board, sort]);
 
   function handleDragStart(event: DragStartEvent) {
     draggingRef.current = true;
@@ -186,7 +207,22 @@ export function EpicBoard({ slug, initialBoard }: { slug: string; initialBoard: 
         setActiveId(null);
       }}
     >
-      <div className="flex justify-end pb-2">
+      <div className="flex items-center justify-end gap-2 pb-2">
+        <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+          <span className="text-subtle">Sort</span>
+          <select
+            aria-label="Sort epics"
+            value={sort}
+            onChange={(e) => setSort(e.target.value as BoardSort)}
+            className={sortSelectClassName}
+          >
+            {BOARD_SORTS.map((option) => (
+              <option key={option} value={option}>
+                {BOARD_SORT_LABELS[option]}
+              </option>
+            ))}
+          </select>
+        </label>
         <SyncStatusBadge sync={board.sync} />
       </div>
       <div className="grid min-h-0 flex-1 grid-cols-1 gap-3.5 sm:grid-cols-2 xl:grid-cols-4">
@@ -194,7 +230,7 @@ export function EpicBoard({ slug, initialBoard }: { slug: string; initialBoard: 
           <BoardColumn
             key={stage}
             stage={stage}
-            epics={board.columns[stage] ?? []}
+            epics={sortedColumns?.[stage] ?? []}
             slug={slug}
             onEpicDeleted={handleEpicDeleted}
           />

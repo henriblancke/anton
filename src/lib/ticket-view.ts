@@ -98,7 +98,16 @@ export interface ToEpicOptions {
    * wrapped ticket already carries its own PR link). Defaults to true.
    */
   prRef?: boolean;
+  /** Epic ids that currently block this epic, from computeEpicGraph. Defaults to none. */
+  blockedBy?: string[];
+  /** No open blockers. Defaults to ready (true) when the caller has no graph (e.g. epic-detail). */
+  ready?: boolean;
+  /** Topological rank from the epic graph (0 = no blockers). Defaults to 0. */
+  rank?: number;
 }
+
+/** Missing bead priority sorts after every explicit priority (bd uses 0=critical … 4=lowest). */
+const DEFAULT_PRIORITY = 4;
 
 /** Map a bead to the shared Epic view model. `approved` and the chips/prRef are derived from the
  * bead; goal/acceptance are passed in because their source (the lite list bead vs. a `bd show`
@@ -122,6 +131,10 @@ export function toEpic(bead: Bead, opts: ToEpicOptions): Epic {
       : {}),
     ...createdMeta(bead),
     ...(withPrRef ? { prRef: bead.external_ref } : {}),
+    blockedBy: opts.blockedBy ?? [],
+    ready: opts.ready ?? true,
+    rank: opts.rank ?? 0,
+    priority: bead.priority ?? DEFAULT_PRIORITY,
     tickets: opts.tickets,
   };
 }

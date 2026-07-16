@@ -174,6 +174,33 @@ describe("getBoard", () => {
     expect(orphanEpic!).toMatchObject({ assignee: null, createdAt: "", createdBy: null });
   });
 
+  it("attaches ready/blockedBy and sorts the backlog so a blocker precedes what it blocks", async () => {
+    // epic-late is blocked by epic-early (a direct epic→epic blocks edge). The runtime's bd-ready
+    // would skip epic-late, so the board must mark it blocked and sink it below its blocker.
+    const early = makeBead({ id: "epic-early", title: "Blocker", issue_type: "epic" });
+    const late = makeBead({
+      id: "epic-late",
+      title: "Blocked",
+      issue_type: "epic",
+      dependencies: [{ issue_id: "epic-late", depends_on_id: "epic-early", type: "blocks" }],
+    });
+
+    listMock.mockResolvedValue([late, early]);
+
+    const board = await getBoard(project);
+
+    const ids = board.columns.backlog.map((e) => e.id);
+    expect(ids).toEqual(["epic-early", "epic-late"]);
+
+    const blocker = board.columns.backlog.find((e) => e.id === "epic-early")!;
+    const blocked = board.columns.backlog.find((e) => e.id === "epic-late")!;
+    expect(blocker.ready).toBe(true);
+    expect(blocker.blockedBy).toEqual([]);
+    expect(blocked.ready).toBe(false);
+    expect(blocked.blockedBy).toEqual(["epic-early"]);
+    expect(blocker.rank).toBeLessThan(blocked.rank);
+  });
+
   it("falls back to merging open + closed lists when --status all fails", async () => {
     const openEpic = makeBead({ id: "epic-open", title: "Open Epic", issue_type: "epic" });
     const closedEpic = makeBead({

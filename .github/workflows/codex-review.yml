@@ -5,18 +5,24 @@
 # Requires the Codex GitHub app to be connected to this repo (ChatGPT → Codex → GitHub settings).
 # Without that connection the @codex mention posts but nothing reviews. Codex also reads AGENTS.md
 # for general conventions; REVIEW.md is a review-specific layer on top.
+#
+# Uses pull_request_target (NOT pull_request) on purpose: this job holds a long-lived PAT
+# (CODEX_REVIEW_TOKEN), and pull_request runs the workflow file *from the PR head* with secrets
+# available on same-repo branches — so a PR could rewrite this YAML to exfiltrate the PAT.
+# pull_request_target runs the workflow + REVIEW.md from the trusted BASE branch instead, and this
+# job never checks out or executes PR-authored code, so there is nothing untrusted to leak into.
 name: codex review
 
 on:
-  pull_request:
+  pull_request_target:
     # opened / reopened / ready_for_review — PR lifecycle; synchronize — new commits pushed to the
     # PR branch (runs on every commit).
     types: [opened, reopened, ready_for_review, synchronize]
 
-# The default GITHUB_TOKEN needs write access to post the PR comment.
+# Only needs read (to check out the base branch for REVIEW.md). The comment is posted with the PAT,
+# not the default GITHUB_TOKEN.
 permissions:
   contents: read
-  pull-requests: write
 
 # Collapse superseded requests on the same PR (e.g. rapid pushes) into the latest one.
 concurrency:
@@ -26,25 +32,39 @@ concurrency:
 jobs:
   request-review:
     runs-on: ubuntu-latest
-    # Skip drafts. `pull_request` never runs on forks with a writable token, so this is aimed at
-    # same-repo branch PRs.
-    if: github.event.pull_request.draft == false
+    # Skip drafts. Restrict to same-repo branch PRs; drop the head-repo clause to also review fork
+    # PRs (still safe here — we never run PR code — but it lets external PRs consume the Codex seat).
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
     steps:
+      # Default checkout under pull_request_target is the BASE branch (trusted) — NOT the PR head.
+      # Do not add `ref:` pointing at the PR; that would reintroduce untrusted code into a job that
+      # holds the PAT.
       - uses: actions/checkout@v7
 
-      - name: Post Codex review request
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+      - name: Build review comment body
         run: |
-          BODY_FILE="$(mktemp)"
+          BODY_FILE="$RUNNER_TEMP/codex-body.md"
           {
             echo "@codex review"
             echo
             if [ -f REVIEW.md ]; then
               cat REVIEW.md
             else
-              echo "_(No REVIEW.md found in the repo root — reviewing with defaults.)_"
+              echo "_(No REVIEW.md in the repo root — reviewing with defaults.)_"
             fi
           } > "$BODY_FILE"
-          gh pr comment "$PR_NUMBER" --body-file "$BODY_FILE"
+
+      - name: Post Codex review request
+        env:
+          # MUST be a PAT belonging to a user with a connected Codex seat — NOT the default
+          # GITHUB_TOKEN. Codex resolves which seat runs the review from the comment's author; the
+          # default token authors comments as github-actions[bot], which has no Codex seat, so Codex
+          # replies "To use Codex here, create a Codex account and connect to github" instead of
+          # reviewing. Store the PAT as the repo/org secret CODEX_REVIEW_TOKEN, minimally scoped
+          # (fine-grained, Pull requests: Read and write, this repo only) so it grants nothing beyond
+          # what a collaborator already has.
+          GH_TOKEN: ${{ secrets.CODEX_REVIEW_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: gh pr comment "$PR_NUMBER" --body-file "$RUNNER_TEMP/codex-body.md"
