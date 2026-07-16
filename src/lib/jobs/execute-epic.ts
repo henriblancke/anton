@@ -6,6 +6,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { beads, LABELS, type Bead } from "../beads/bd";
+import { computeEpicGraph } from "../epic-graph";
 import { loadAgentPrompt } from "../claude/agent-prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
 import { runClaude, type ClaudeEvent } from "../claude/driver";
@@ -57,6 +58,21 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     if (!epic || !beads.isEpic(epic)) throw new PoisonEpic(`epic ${epicBeadId} not found`);
     if (!beads.isApproved(epic)) {
       throw new PoisonEpic(`epic ${epicBeadId} is not approved — refusing to execute`);
+    }
+
+    // Re-check the same epic→epic readiness gate the approval route enforces, now at job start.
+    // Approval only guarantees readiness at approval time; between then and this lease a cross-epic
+    // `blocks` edge could have been added or pulled in via Dolt sync (a shared board), leaving this
+    // job queued behind a blocker that's no longer done. Derive readiness from the fresh `all` read
+    // above (same source computeEpicGraph consumes at approval) and PARK if a blocker is open —
+    // starting a still-blocked epic would violate the sequence. Recoverable: once the blocker
+    // completes, resuming the parked job re-reads beads and passes this gate.
+    const epicNode = computeEpicGraph(all).epics.find((n) => n.id === epicBeadId);
+    if (epicNode && !epicNode.ready) {
+      throw new PoisonEpic(
+        `epic ${epicBeadId} is blocked by ${epicNode.blockedBy.join(", ")} — refusing to execute; ` +
+          `resume the run once the blocker(s) complete`,
+      );
     }
 
     const tickets = childrenOf(all, epicBeadId);
