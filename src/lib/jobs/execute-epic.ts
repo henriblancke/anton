@@ -10,7 +10,7 @@ import { computeEpicGraph } from "../epic-graph";
 import { loadAgentPrompt } from "../claude/agent-prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
 import { runClaude, type ClaudeEvent } from "../claude/driver";
-import { commitAll, openPullRequest } from "../git/ops";
+import { commitAll, openPullRequest, resolveFreshBase } from "../git/ops";
 import { createWorktree, removeWorktree } from "../git/worktree";
 import { getProjectById, getProjectSettings, type ProjectSettings } from "../projects";
 import { resolveOperator } from "../operator";
@@ -117,11 +117,17 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         );
       }
 
-      // 1. Warm worktree (idempotent — reused on resume).
+      // 1. Warm worktree (idempotent — reused on resume). Branch off the FRESHEST base
+      // (anton-x3o): resolveFreshBase fetches origin/<base> and returns `origin/<base>` so a run
+      // whose local base is stale still starts at the remote tip; it's best-effort and falls back
+      // to the local base offline. On resume this is moot — createWorktree short-circuits to the
+      // existing worktree, so the base is never re-applied mid-run. Note the PR `base` below stays
+      // the plain branch name (gh needs a branch, not a remote-tracking ref).
+      const baseBranch = settings.baseBranch ?? project.defaultBranch;
       const worktree = await createWorktree({
         repoPath: repo,
         branch,
-        baseBranch: settings.baseBranch ?? project.defaultBranch,
+        baseBranch: await resolveFreshBase(repo, baseBranch),
         warm: true,
       });
       await updateRun(db, clock, runId, {
@@ -163,7 +169,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       const pr = await openPullRequest({
         repoPath: repo,
         branch: worktree.branch,
-        base: settings.baseBranch ?? project.defaultBranch,
+        base: baseBranch,
         title: `${epic.title} (${epicBeadId})`,
         body: prBody(epic, tickets),
       });

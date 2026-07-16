@@ -47,6 +47,24 @@ function writeBin(dir: string, name: string, body: string): string {
   return p;
 }
 
+/**
+ * Advance `origin/main` ahead of the sandbox repo's LOCAL main by committing to a throwaway clone
+ * of the bare remote and pushing. Leaves the sandbox repo's own main untouched (stale) so a run
+ * that fetches origin/main sees a newer tip. Returns the new commit's sha.
+ */
+function pushFreshBaseCommit(sandbox: string, bare: string, marker: string): string {
+  const clone = mkdtempSync(join(sandbox, "fresh-"));
+  const g = (args: string[]) => execFileSync("git", args, { cwd: clone, stdio: "ignore" });
+  execFileSync("git", ["clone", "-q", bare, clone], { stdio: "ignore" });
+  g(["config", "user.email", "t@example.com"]);
+  g(["config", "user.name", "anton-test"]);
+  writeFileSync(join(clone, `${marker}.md`), `${marker}\n`);
+  g(["add", "-A"]);
+  g(["commit", "-q", "-m", marker]);
+  g(["push", "-q", "origin", "main"]);
+  return execFileSync("git", ["rev-parse", "HEAD"], { cwd: clone, encoding: "utf8" }).trim();
+}
+
 const suite = has("bd") && has("git") ? describe : describe.skip;
 
 suite("execute-epic e2e (real handler · real bd/git · fake claude/gh)", () => {
@@ -793,5 +811,160 @@ process.exit(0);`,
     expect((await getJob(tdb.db, jobId))?.status).toBe("done");
     expect((await beads.show(repo, child)).status).toBe("closed");
     expect((await beads.show(repo, dependent)).labels ?? []).toContain("stage:in-review");
+  }, 60_000);
+
+  it("branches a fresh run off the newer origin/<base> tip (anton-x3o)", async () => {
+    // A run whose LOCAL base is stale must start at the remote tip: resolveFreshBase fetches
+    // origin/main before createWorktree, so the worktree branches off origin/main, not the local
+    // (behind) main. Advance origin/main behind the sandbox repo's back, then run and assert the
+    // fresh commit is an ancestor of the run's pushed branch.
+    const epic6 = await beads.create(repo, {
+      title: "Feature FreshBase",
+      type: "epic",
+      description: "## Goal\nFresh",
+    });
+    await beads.approve(repo, epic6);
+    const t6 = (() => {
+      const p = JSON.parse(
+        execFileSync(
+          "bd",
+          ["create", "Fresh ticket", "--type", "task", "--parent", epic6, "--acceptance", "x", "--json"],
+          { cwd: repo, encoding: "utf8" },
+        ),
+      );
+      return (Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string;
+    })();
+
+    // Push a commit to origin/main WITHOUT updating the sandbox repo's local main.
+    const freshSha = pushFreshBaseCommit(sandbox, bare, "FRESH_BASE");
+    // The sandbox repo's local main does NOT contain it yet (proves "stale local base").
+    expect(
+      execFileSync("git", ["-C", repo, "log", "--oneline", "main"], { encoding: "utf8" }),
+    ).not.toContain("FRESH_BASE");
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    const jobId = await runner.enqueue({
+      type: "execute-epic",
+      projectId,
+      payload: { projectId, epicBeadId: epic6 },
+    });
+    await runner.tickOnce();
+    await runner.whenIdle();
+    expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+    expect((await beads.show(repo, t6)).status).toBe("closed");
+
+    // The run's branch descends from origin's newer commit — the worktree was cut off origin/main.
+    execFileSync("git", ["-C", repo, "fetch", "-q", "origin"], { stdio: "ignore" });
+    const isAncestor = (() => {
+      try {
+        execFileSync(
+          "git",
+          ["-C", repo, "merge-base", "--is-ancestor", freshSha, `origin/anton/${epic6}`],
+          { stdio: "ignore" },
+        );
+        return true;
+      } catch {
+        return false;
+      }
+    })();
+    expect(isAncestor).toBe(true);
+  }, 60_000);
+
+  it("does not rebase an existing worktree onto a newer base on resume (anton-x3o)", async () => {
+    // AC3: resume reuses the existing worktree as-is. Even if origin/main advances between the
+    // park and the resume, createWorktree short-circuits to the existing worktree and its base is
+    // NOT moved mid-run — the run's branch must not pick up the post-park commit.
+    const epic7 = await beads.create(repo, {
+      title: "Feature ResumeStable",
+      type: "epic",
+      description: "## Goal\nStable",
+    });
+    await beads.approve(repo, epic7);
+    const t7 = (() => {
+      const p = JSON.parse(
+        execFileSync(
+          "bd",
+          ["create", "Stable ticket", "--type", "task", "--parent", epic7, "--acceptance", "x", "--json"],
+          { cwd: repo, encoding: "utf8" },
+        ),
+      );
+      return (Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string;
+    })();
+
+    const resetSec = Math.floor(clock.now() / 1000) + 3600;
+    const quotaClaude = writeBin(
+      binDir,
+      "claude-quota-stable",
+      `const fs=require('fs');const path=require('path');
+const sentinel=path.join(process.cwd(),'.quota-hit-stable');
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+if(!fs.existsSync(sentinel)){
+  fs.writeFileSync(sentinel,'1');
+  e({type:'result',subtype:'error',result:'Claude AI usage limit reached|${resetSec}',is_error:true});
+  process.exit(0);
+}
+fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work-stable '+Date.now()+'\\n');
+e({type:'system',subtype:'init',session_id:'ss'});
+e({type:'assistant',message:{content:[{type:'text',text:'done'}]}});
+e({type:'result',subtype:'success',result:'done',session_id:'ss',num_turns:1,is_error:false});
+process.exit(0);`,
+    );
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000, quotaCooloffMs: 60_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    process.env.ANTON_CLAUDE_BIN = quotaClaude;
+    try {
+      const jobId = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: epic7 },
+      });
+
+      // First tick → usage limit → run parked, worktree created off whatever origin/main was.
+      await runner.tickOnce();
+      await runner.whenIdle();
+      const run7 = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === epic7)!;
+      expect(run7.status).toBe("parked");
+      expect(existsSync(run7.worktreePath!)).toBe(true);
+
+      // Origin/main advances AFTER the worktree exists — resume must not fold this into the run.
+      const postParkSha = pushFreshBaseCommit(sandbox, bare, "POST_PARK");
+
+      // Advance past the reset window → resume completes on the SAME worktree.
+      clock.set(resetSec * 1000 + 1);
+      await runner.tickOnce();
+      await runner.whenIdle();
+      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+      expect((await beads.show(repo, t7)).status).toBe("closed");
+
+      // The post-park commit is NOT an ancestor of the run branch — the worktree wasn't rebased.
+      execFileSync("git", ["-C", repo, "fetch", "-q", "origin"], { stdio: "ignore" });
+      const foldedIn = (() => {
+        try {
+          execFileSync(
+            "git",
+            ["-C", repo, "merge-base", "--is-ancestor", postParkSha, `origin/anton/${epic7}`],
+            { stdio: "ignore" },
+          );
+          return true;
+        } catch {
+          return false;
+        }
+      })();
+      expect(foldedIn).toBe(false);
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+    }
   }, 60_000);
 });
