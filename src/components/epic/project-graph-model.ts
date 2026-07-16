@@ -5,8 +5,9 @@
  * Consumes the /api/projects/[slug]/graph payload (epics + rolled-up blocks edges from
  * computeEpicGraph). One node per epic; one edge per epic→epic `blocks` pair. Ticket containment
  * lives on the epic-detail page, so no ticket nodes and no parent-child edges are produced here.
- * Direction mirrors dependency-graph.tsx: source = edge.from (blocked/dependent), target = edge.to
- * (blocker); dagre LR then lays the sequence out left-to-right.
+ * Direction mirrors dependency-graph.tsx: the arrow points blocker→blocked (source = edge.to =
+ * blocker, target = edge.from = blocked) so it reads "X blocks Y" and matches the board's
+ * "blocked by" chip; dagre LR then lays prerequisites out first, left-to-right.
  */
 import type { EpicGraphEdge, EpicGraphNode } from "@/lib/epic-graph";
 import type { Stage } from "@/lib/types";
@@ -46,7 +47,8 @@ export function buildProjectGraph(
     width: EPIC_W,
     height: EPIC_H,
   }));
-  const layoutEdges = edges.map((edge) => ({ source: edge.from, target: edge.to }));
+  // Blocker (edge.to) is the prerequisite, so it's the layout source → dagre LR places it first.
+  const layoutEdges = edges.map((edge) => ({ source: edge.to, target: edge.from }));
 
   const positions = layoutGraphNodes(layoutNodes, layoutEdges, {
     direction: "LR",
@@ -62,8 +64,8 @@ export function buildProjectGraph(
 
   const flowEdges: ProjectGraphEdge[] = edges.map((edge) => ({
     id: `${edge.from}-${edge.to}`,
-    source: edge.from,
-    target: edge.to,
+    source: edge.to,
+    target: edge.from,
     inCycle: edge.inCycle,
   }));
 

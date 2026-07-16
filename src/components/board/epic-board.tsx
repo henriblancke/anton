@@ -197,6 +197,7 @@ export function EpicBoard({ slug, initialBoard }: { slug: string; initialBoard: 
 
   return (
     <DndContext
+      id={`epic-board-${slug}`}
       sensors={sensors}
       collisionDetection={closestCorners}
       modifiers={[restrictToWindowEdges]}
