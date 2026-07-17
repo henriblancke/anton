@@ -67,6 +67,22 @@ async function loadTarget(
   if (!beads.isRunTarget(target)) {
     return { response: NextResponse.json({ error: notRunnableReason(epicId, target) }, { status: 422 }) };
   }
+  // Once approved, the reservation is locked in by the approve flow (soft-lock + steal-on-approve):
+  // the human-claim route must NOT mutate an approved target's assignee. Approval queues a run, and
+  // the runner swallows its own epic claim (`safe(() => beads.claim(...))` in execute-epic), so a
+  // post-approval steal/release here would let a queued run execute under someone else's reservation
+  // while the board shows a different owner. Ownership of an approved target changes only through
+  // Approve (steal-on-approve), never through this route.
+  if (beads.isApproved(target)) {
+    return {
+      response: NextResponse.json(
+        {
+          error: `${epicId} is already approved for a run — its reservation is locked; take it over via Approve (steal-on-approve), not the claim control`,
+        },
+        { status: 409 },
+      ),
+    };
+  }
   return { repoPath: project.repoPath, target };
 }
 

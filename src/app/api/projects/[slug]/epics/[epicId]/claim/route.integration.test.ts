@@ -169,6 +169,28 @@ suite("claim route (temp anton.db + real bd)", () => {
     expect((await beads.show(repo, epic)).assignee).toBe("bob");
   }, 60_000);
 
+  it("409s claim + release once the target is approved — the reservation is locked", async () => {
+    // Approve locks the reservation (approve enforces the claim as a soft-lock). The human-claim
+    // route must not mutate an approved target: the runner swallows its own epic claim, so a
+    // post-approval steal/release would let a queued run execute under someone else's reservation.
+    const approvedEpic = await beads.create(repo, { title: "Approved epic", type: "epic" });
+    await beads.assign(repo, approvedEpic, "bob");
+    await beads.approve(repo, approvedEpic);
+    try {
+      const stealRes = await post("claimy", approvedEpic, { steal: true });
+      expect(stealRes.status).toBe(409);
+      expect((await stealRes.json()).error).toMatch(/approved/i);
+      // The gate rejects before reassigning — bob keeps the claim.
+      expect((await beads.show(repo, approvedEpic)).assignee).toBe("bob");
+
+      const releaseRes = await del("claimy", approvedEpic, { steal: true });
+      expect(releaseRes.status).toBe(409);
+      expect((await beads.show(repo, approvedEpic)).assignee).toBe("bob");
+    } finally {
+      await beads.delete(repo, approvedEpic, { cascade: true });
+    }
+  }, 60_000);
+
   it("422s a child ticket of an epic and points at its parent, without claiming it", async () => {
     const parentEpic = await beads.create(repo, { title: "Parent epic", type: "epic" });
     const child = await beads.create(repo, { title: "Child ticket", type: "task" });

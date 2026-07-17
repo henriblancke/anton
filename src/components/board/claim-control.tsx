@@ -45,12 +45,17 @@ export function ClaimControl({
   const hookOperator = useOperator();
   const operator = operatorProp !== undefined ? operatorProp : hookOperator;
   const [busy, setBusy] = useState(false);
+  // Beads represents a released/never-claimed assignee as "" (`bd assign <id> ""`), not null. Fold an
+  // empty/whitespace owner to null so a just-released target reads as Unclaimed (Claim) rather than a
+  // blank owner with a Steal button. Applied to both the server prop and the write response below.
+  const normalizedServerOwner = serverOwner?.trim() || null;
   // Optimistic override keyed on the server value it was based on. While the server prop still
   // equals `base`, show `value`; once the server moves past `base` (our write landed, or a teammate
   // changed it), discard the override during render and follow the server truth.
   const [override, setOverride] = useState<{ base: string | null; value: string | null } | null>(null);
-  if (override && override.base !== serverOwner) setOverride(null);
-  const owner = override && override.base === serverOwner ? override.value : serverOwner;
+  if (override && override.base !== normalizedServerOwner) setOverride(null);
+  const owner =
+    override && override.base === normalizedServerOwner ? override.value : normalizedServerOwner;
 
   // A known identity is required to claim/release/steal (the route rejects a write it can't attribute
   // to an operator). Until the identity resolves — or when none can be — the owner shows read-only.
@@ -58,7 +63,7 @@ export function ClaimControl({
   const mine = known && owner === operator;
 
   async function act(kind: "claim" | "release" | "steal") {
-    const base = serverOwner;
+    const base = normalizedServerOwner;
     const optimisticValue = kind === "release" ? null : (operator ?? owner);
     setBusy(true);
     setOverride({ base, value: optimisticValue });
@@ -71,7 +76,9 @@ export function ClaimControl({
       });
       const data = (await res.json().catch(() => null)) as { item?: { assignee?: string | null }; error?: string } | null;
       if (!res.ok) throw new Error(data?.error ?? `${LABEL[kind]} failed (${res.status})`);
-      const next = data?.item?.assignee ?? null;
+      // Normalize the same way as the prop: a release response carries assignee "" — fold it to null
+      // so the optimistic value resolves to Unclaimed, not a blank owner.
+      const next = data?.item?.assignee?.trim() || null;
       setOverride({ base, value: next });
       onChanged?.(next);
       toast.success(TOAST[kind]);

@@ -33,6 +33,18 @@ describe("ClaimControl", () => {
     expect(html).not.toMatch(/Release/);
   });
 
+  it("treats an empty-string owner as unclaimed (a released target reads as Claim)", () => {
+    // Beads returns a released assignee as "" (`bd assign <id> ""`), not null. The control must fold
+    // it to unclaimed rather than render a blank owner with a Steal button.
+    const html = renderToStaticMarkup(
+      <ClaimControl slug="anton" itemId="e-1" owner="" operator="alice" />,
+    );
+    expect(html).toContain("Unclaimed");
+    expect(html).toMatch(/Claim/);
+    expect(html).not.toMatch(/Release/);
+    expect(html).not.toMatch(/Steal/);
+  });
+
   it("shows the owner read-only until the operator identity resolves", () => {
     // operator=null (resolved to "nobody") still can't claim someone else's — no Steal/Release,
     // but the owner is always visible.
