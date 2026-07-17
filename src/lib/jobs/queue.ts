@@ -119,30 +119,6 @@ function activeExecuteEpicId(
 }
 
 /**
- * Has this project + epic EVER had an execute-epic job — in any status, including `parked`, `failed`
- * and `done`? Unlike `activeExecuteEpicId` (the `queued`/`running` dedupe), this answers "was a run
- * already triggered for this target", which is what a re-approve needs: approval is the run trigger
- * exactly once, so a re-approve of an already-approved target must not enqueue a second run just
- * because the first one parked or finished. A target that is approved yet has no job at all is the
- * one honest recovery case (the original approval's best-effort enqueue never landed).
- */
-export function hasExecuteEpicJob(db: AntonDb, projectId: string, epicBeadId: string): boolean {
-  const rows = db
-    .select({ id: schema.jobs.id })
-    .from(schema.jobs)
-    .where(
-      and(
-        eq(schema.jobs.type, "execute-epic"),
-        eq(schema.jobs.projectId, projectId),
-        eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
-      ),
-    )
-    .limit(1)
-    .all();
-  return rows.length > 0;
-}
-
-/**
  * Enqueue an execute-epic run, deduped against any already-active job for the same project + epic.
  * Returns the existing job's id (inserting no new row) when a `queued`/`running` execute-epic job
  * exists for that epic; otherwise inserts a fresh `queued` job and returns its id. Prior

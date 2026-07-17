@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { beads, type Bead } from "@/lib/beads/bd";
-import { conflictBody, ownerOf, setAssigneeIfOwner } from "@/lib/beads/claim";
+import { conflictBody, ownerOf, withClaimLock, type SwapResult } from "@/lib/beads/claim";
 import { refreshAllIssues } from "@/lib/beads/issues";
 import { resolveOperator } from "@/lib/operator";
 import { resolveProject } from "../../../resolve-project";
@@ -73,18 +73,40 @@ async function loadTarget(
   // post-approval steal/release here would let a queued run execute under someone else's reservation
   // while the board shows a different owner. Ownership of an approved target changes only through
   // Approve (steal-on-approve), never through this route.
-  if (beads.isApproved(target)) {
-    return {
-      ok: false,
-      response: NextResponse.json(
-        {
-          error: `${epicId} is already approved for a run — its reservation is locked; take it over via Approve (steal-on-approve), not the claim control`,
-        },
-        { status: 409 },
-      ),
-    };
-  }
+  if (beads.isApproved(target)) return { ok: false, response: approvedLockResponse(epicId) };
   return { ok: true, repoPath: project.repoPath, target };
+}
+
+/** The 409 for a claim write refused because approval has locked the target's reservation. */
+function approvedLockResponse(epicId: string): NextResponse {
+  return NextResponse.json(
+    {
+      error: `${epicId} is already approved for a run — its reservation is locked; take it over via Approve (steal-on-approve), not the claim control`,
+    },
+    { status: 409 },
+  );
+}
+
+/**
+ * The approved gate above reads a bead loaded before this route's own gates ran, so an approval
+ * landing in that window would slip past it. Re-check under the claim-write lock — the same lock the
+ * approve route holds across its swap AND its `approved` label — and only then swap. That makes the
+ * two routes strictly ordered on one bead: a claim either wins the lock and writes while the target
+ * is genuinely unapproved (and approve's swap then 409s on the changed owner), or it takes the lock
+ * after the label and is refused here. Without the re-check, a steal could still land on a target
+ * approve had already decided to run, leaving a queued run executing under an owner who never
+ * approved it.
+ */
+async function swapUnlessApproved(
+  repoPath: string,
+  epicId: string,
+  owner: string | undefined,
+  next: string | undefined,
+): Promise<SwapResult | "approved"> {
+  return withClaimLock(repoPath, epicId, async (swap) => {
+    if (beads.isApproved(await beads.show(repoPath, epicId))) return "approved" as const;
+    return swap(owner, next);
+  });
 }
 
 /** Best-effort sync so the claim/release reaches teammates within a heartbeat; never blocks. */
@@ -126,7 +148,8 @@ export async function POST(
   // the earlier claim — both answering 200. Swap only if the assignee is still what we gated on,
   // so the loser gets a 409 naming the winner. A steal is authorized against the owner the caller
   // was shown; if someone else has since taken it, that authorization doesn't carry over.
-  const swap = await setAssigneeIfOwner(repoPath, epicId, owner, operator);
+  const swap = await swapUnlessApproved(repoPath, epicId, owner, operator);
+  if (swap === "approved") return approvedLockResponse(epicId);
   if (!swap.ok) return NextResponse.json(conflictBody(epicId, swap.owner), { status: 409 });
   await nudgeSync(repoPath, epicId, "claiming");
 
@@ -170,8 +193,10 @@ export async function DELETE(
       }
     }
     // Same conditional write as POST: a release is a claim write too, so an unconditional
-    // `unassign` here would clear a reservation that changed hands after the gate above.
-    const swap = await setAssigneeIfOwner(repoPath, epicId, owner, undefined);
+    // `unassign` here would clear a reservation that changed hands — or that approval locked —
+    // after the gates above.
+    const swap = await swapUnlessApproved(repoPath, epicId, owner, undefined);
+    if (swap === "approved") return approvedLockResponse(epicId);
     if (!swap.ok) return NextResponse.json(conflictBody(epicId, swap.owner), { status: 409 });
     await nudgeSync(repoPath, epicId, "releasing");
   }

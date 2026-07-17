@@ -3,8 +3,8 @@ import { getBoard } from "@/lib/board";
 import { epicStandaloneBlockers, standaloneBlockers } from "@/lib/epic-graph";
 import { refreshAllIssues } from "@/lib/beads/issues";
 import { beads } from "@/lib/beads/bd";
-import { conflictBody, ownerOf, setAssigneeIfOwner } from "@/lib/beads/claim";
-import { enqueueExecuteEpic, hasExecuteEpicRun } from "@/lib/jobs/service";
+import { conflictBody, ownerOf, withClaimLock } from "@/lib/beads/claim";
+import { enqueueExecuteEpic } from "@/lib/jobs/service";
 import { resolveOperator } from "@/lib/operator";
 import { getProjectBySlug } from "@/lib/projects";
 import { STAGES } from "@/lib/types";
@@ -146,44 +146,65 @@ export async function POST(
       );
     }
   }
-  // Auto-claim before enqueuing: an unclaimed target (or one being stolen) gets assigned to the
-  // approver so the reservation is set BEFORE the runtime execution-claim, closing the gap where a
-  // teammate could claim between approve and the runner. Skipped when no operator identity resolves
-  // (can't name an assignee).
+  // Auto-claim, then approve, both under the bead's claim-write lock.
   //
-  // Conditional on the assignee still being `owner` — the value the steal gate above decided from.
-  // `bd assign` is an unconditional assignee update, so the re-read alone doesn't close the window:
-  // a teammate claiming between that read and this write would have their fresh reservation
-  // overwritten without `{ steal: true }`, and approval would then enqueue a run under it. Losing
-  // the swap means ownership moved after we checked, so the approval must not proceed on a stale
-  // decision — 409 and let the operator re-decide against the state as it now is. Re-approving one
-  // you already own swaps owner→owner: no write, just a verification that it's still yours.
-  if (operator) {
-    const swap = await setAssigneeIfOwner(project.repoPath, epicId, owner, operator);
-    if (!swap.ok) return NextResponse.json(conflictBody(epicId, swap.owner), { status: 409 });
-  }
+  // The claim: an unclaimed target (or one being stolen) gets assigned to the approver so the
+  // reservation is set BEFORE the runtime execution-claim, closing the gap where a teammate could
+  // claim between approve and the runner. It's conditional on the assignee still being `owner` —
+  // the value the steal gate above decided from. `bd assign` is an unconditional assignee update,
+  // so the re-read alone doesn't close the window: a teammate claiming between that read and this
+  // write would have their fresh reservation overwritten without `{ steal: true }`. Losing the swap
+  // means ownership moved after we checked, so the approval must not proceed on a stale decision —
+  // 409 and let the operator re-decide against the state as it now is. Re-approving one you already
+  // own swaps owner→owner: no write, just a verification that it's still yours.
+  //
+  // The lock has to span the label too, not just the swap. The `approved` label is what locks the
+  // reservation (the claim route refuses to touch an approved target), so between a bare swap and
+  // an unlocked `beads.approve` a teammate's steal would still be legal — it would land on a target
+  // that isn't approved *yet*, and this request would then approve and enqueue a run under their
+  // reservation, which they never approved. Holding the lock through the label leaves no such
+  // window: a concurrent steal either lands first (and this swap 409s) or finds the target approved
+  // and is refused.
+  //
+  // With no operator identity (no ANTON_OPERATOR, no git user.name) there's no one to assign, so
+  // the swap is owner→owner: a verified no-op that still takes the lock and still serializes the
+  // label against concurrent claims.
+  const swap = await withClaimLock(project.repoPath, epicId, async (cas) => {
+    const result = await cas(owner, operator ?? owner);
+    if (result.ok) await beads.approve(project.repoPath, epicId);
+    return result;
+  });
+  if (!swap.ok) return NextResponse.json(conflictBody(epicId, swap.owner), { status: 409 });
 
-  await beads.approve(project.repoPath, epicId);
   await beads
     .sync(project.repoPath)
     .catch((err) => console.error(`[approve] beads dolt sync failed after approving ${epicId}`, err));
 
   // Approval is the trigger: enqueue the autonomous execute-epic run (DESIGN.md §2/§7) — but it
-  // triggers ONCE. A re-approve of an already-approved target is a take-over (the UI's Take over is
-  // steal-on-approve, the only ownership move an approved target allows): it must reassign the bead
-  // and nothing more. `enqueueExecuteEpicDeduped` alone can't carry that guarantee — it only dedupes
-  // `queued`/`running`, so an approved target whose run has since parked/failed/finished would get a
-  // SECOND run from a take-over. Gate on the run's existence in any status instead. The one case a
-  // re-approve should still enqueue: approved with no job at all, i.e. the original approval's
-  // best-effort enqueue never landed — re-approving is then the honest recovery.
+  // triggers ONCE, on the approval that flips the label. A re-approve of an already-approved target
+  // is a take-over (the UI's Take over is steal-on-approve, the only ownership move an approved
+  // target allows): it must reassign the bead and nothing more. `enqueueExecuteEpicDeduped` alone
+  // can't carry that guarantee — it only dedupes `queued`/`running`, so an approved target whose run
+  // has since parked/failed/finished would get a SECOND run from a take-over.
+  //
+  // `wasApproved` is the only sound gate here because it's read from beads, which every operator's
+  // anton shares via dolt. The jobs table can't stand in for it: `anton.db` is machine-local and
+  // disposable (README/DESIGN §"Ephemeral"), so a take-over from a second machine — the whole point
+  // of the multi-operator flow — sees no job row for the run queued on the first machine and would
+  // read "never enqueued", spawning a duplicate concurrent run on the same epic.
+  //
+  // The cost of gating on the label alone: if the best-effort enqueue below fails, the target stays
+  // approved with no run, and re-approving won't retry it (this request can't tell that state from a
+  // run living on another machine). Recovery is to clear the label (`bd label remove`) and approve
+  // again — an explicit operator act, which is the right trade against silently double-running an
+  // epic.
+  //
   // Best-effort — approving must still succeed even if the runner enqueue hiccups.
   // The autonomy master-switch (anton-y3l) gates at *claim* in the runner instead, so with autonomy
   // off the job waits `queued` and re-enabling resumes it.
   let jobId: string | undefined;
   try {
-    if (!wasApproved || !(await hasExecuteEpicRun(project.id, epicId))) {
-      jobId = await enqueueExecuteEpic(project.id, epicId);
-    }
+    if (!wasApproved) jobId = await enqueueExecuteEpic(project.id, epicId);
   } catch (err) {
     console.error(`[approve] failed to enqueue execute-epic for ${epicId}`, err);
   }

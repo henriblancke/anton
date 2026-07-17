@@ -235,20 +235,22 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     expect((await res.json()).jobId).toBeUndefined();
   }, 60_000);
 
-  it("re-approving an approved target that never got a run enqueues one (enqueue-hiccup recovery)", async () => {
-    // The mirror of the case above: approve's enqueue is best-effort, so an approved target can end
-    // up with no job at all. Re-approving is the recovery path — it must still trigger the run.
+  it("re-approving an already-approved target never enqueues, even with no local job row", async () => {
+    // `anton.db` is machine-local: a take-over from a second operator's machine sees no job row for
+    // the run queued on the first machine. So "no job here" must NOT be read as "never enqueued" —
+    // doing so would spawn a duplicate concurrent run on the epic. The approved label (shared via
+    // dolt) is the only sound trigger gate, so this state approves quietly and enqueues nothing.
     actAs("anton-test");
-    const epic = await beads.create(repo, { title: "Approved, never enqueued", type: "epic" });
-    const child = await beads.create(repo, { title: "Approved, never enqueued child", type: "task" });
+    const epic = await beads.create(repo, { title: "Approved elsewhere", type: "epic" });
+    const child = await beads.create(repo, { title: "Approved elsewhere child", type: "task" });
     await beads.link(repo, child, epic, "parent-child");
-    await beads.approve(repo, epic); // label only — no job, as if the enqueue had failed
+    await beads.approve(repo, epic); // labelled, with no job on THIS machine
     expect(await executeEpicJobs(epic)).toHaveLength(0);
 
     const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", epic));
     expect(res.status).toBe(200);
-    expect((await res.json()).jobId).toBeTruthy();
-    expect(await executeEpicJobs(epic)).toHaveLength(1);
+    expect((await res.json()).jobId).toBeUndefined();
+    expect(await executeEpicJobs(epic)).toHaveLength(0);
   }, 60_000);
 
   it("422s a child ticket of an epic, points at its parent, and does not approve it", async () => {

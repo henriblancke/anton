@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { conflictBody, createAssigneeSwap, ownerOf, type AssigneeStore } from "./claim";
+import { conflictBody, createClaimGuard, ownerOf, type AssigneeStore } from "./claim";
 import type { Bead } from "./bd";
+
+/** The guard's one-shot CAS, bound to a fake board — what most of these tests exercise. */
+const createAssigneeSwap = (store: AssigneeStore) => createClaimGuard(store).setAssigneeIfOwner;
 
 /**
  * A fake board keyed by bead id (so beads don't share an assignee the way one bead's claim
@@ -151,6 +154,50 @@ describe("createAssigneeSwap", () => {
 
     store.assign = realAssign;
     await expect(swap("/repo", "bd-1", undefined, "alice")).resolves.toEqual({ ok: true });
+    expect(owner()).toBe("alice");
+  });
+});
+
+describe("withClaimLock", () => {
+  it("holds the lock across work that follows the swap, so a concurrent claim can't interleave", async () => {
+    // The approve-vs-claim window: approve swaps the assignee, then labels the bead `approved`, and
+    // the label is what locks the reservation. A claim landing between the two would be legal (not
+    // approved yet) and would leave the run executing under an owner who never approved it.
+    const { store, owner } = fakeStore(undefined);
+    const guard = createClaimGuard(store);
+    const order: string[] = [];
+
+    const approving = guard.withClaimLock("/repo", "bd-1", async (swap) => {
+      const result = await swap(undefined, "alice");
+      // Stand in for `beads.approve` — slow enough that an unlocked claim would win the race.
+      await new Promise((r) => setTimeout(r, 20));
+      order.push("labelled");
+      return result;
+    });
+    const stealing = guard.setAssigneeIfOwner("/repo", "bd-1", undefined, "bob").then((r) => {
+      order.push("claim");
+      return r;
+    });
+
+    await expect(approving).resolves.toEqual({ ok: true });
+    // bob gated on `undefined`, but alice owns it by the time his swap runs — he loses, not stomps.
+    await expect(stealing).resolves.toEqual({ ok: false, owner: "alice" });
+    expect(order).toEqual(["labelled", "claim"]); // the label completed before the claim ran at all
+    expect(owner()).toBe("alice");
+  });
+
+  it("releases the lock when the body throws, leaving the bead writable", async () => {
+    const { store, owner } = fakeStore(undefined);
+    const guard = createClaimGuard(store);
+    await expect(
+      guard.withClaimLock("/repo", "bd-1", async () => {
+        throw new Error("approve exploded");
+      }),
+    ).rejects.toThrow("approve exploded");
+
+    await expect(guard.setAssigneeIfOwner("/repo", "bd-1", undefined, "alice")).resolves.toEqual({
+      ok: true,
+    });
     expect(owner()).toBe("alice");
   });
 });
