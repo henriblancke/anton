@@ -19,13 +19,17 @@ function fetchOperator(): Promise<string | null> {
   if (cached !== undefined) return Promise.resolve(cached);
   if (!inflight) {
     inflight = fetch("/api/operator")
-      .then((res) => (res.ok ? (res.json() as Promise<{ operator: string | null }>) : { operator: null }))
+      .then((res) => {
+        if (!res.ok) throw new Error(`operator lookup failed: ${res.status}`);
+        return res.json() as Promise<{ operator: string | null }>;
+      })
       .then((data) => {
         cached = data.operator ?? null;
         return cached;
       })
       .catch(() => {
-        cached = null;
+        // Transient failure (network hiccup, dev-server restart, non-2xx). Leave `cached` unset
+        // so the next consumer retries instead of treating the operator as permanently unknown.
         return null;
       })
       .finally(() => {
