@@ -115,9 +115,8 @@ export async function POST(
     return NextResponse.json({ error: `Ticket ${epicId} not found on the board` }, { status: 404 });
   }
   const owner = ownerOf(current);
-  // Whether approval is the RUN TRIGGER on this request, or just settles ownership. Read before the
-  // approve below, which would otherwise make every request look like a re-approve. See the enqueue
-  // gate at the end for why a re-approve must not start a second run.
+  // Read before the approve below, which would otherwise make every request look like a re-approve.
+  // See the enqueue gate at the end for what this distinguishes.
   const wasApproved = beads.isApproved(current);
   const steal = await readSteal(request);
   if (owner && owner !== operator) {
@@ -180,31 +179,29 @@ export async function POST(
     .sync(project.repoPath)
     .catch((err) => console.error(`[approve] beads dolt sync failed after approving ${epicId}`, err));
 
-  // Approval is the trigger: enqueue the autonomous execute-epic run (DESIGN.md §2/§7) — but it
-  // triggers ONCE, on the approval that flips the label. A re-approve of an already-approved target
-  // is a take-over (the UI's Take over is steal-on-approve, the only ownership move an approved
-  // target allows): it must reassign the bead and nothing more. `enqueueExecuteEpicDeduped` alone
-  // can't carry that guarantee — it only dedupes `queued`/`running`, so an approved target whose run
-  // has since parked/failed/finished would get a SECOND run from a take-over.
+  // Approval is the trigger: enqueue the autonomous execute-epic run (DESIGN.md §2/§7). Every
+  // approval enqueues EXCEPT a pure ownership take-over — stealing an already-approved target only
+  // moves the reservation to the new owner, so it must reassign the bead and nothing more.
+  // `enqueueExecuteEpicDeduped` alone can't carry that guarantee: it dedupes `queued`/`running`
+  // only, so a take-over of an epic whose run has since parked/failed/finished would spawn a SECOND
+  // run under the new owner. `wasApproved` is read from beads (shared across operators via dolt)
+  // rather than the jobs table, which is machine-local and disposable (README/DESIGN §"Ephemeral")
+  // and so reads "never enqueued" for a run living on another machine.
   //
-  // `wasApproved` is the only sound gate here because it's read from beads, which every operator's
-  // anton shares via dolt. The jobs table can't stand in for it: `anton.db` is machine-local and
-  // disposable (README/DESIGN §"Ephemeral"), so a take-over from a second machine — the whole point
-  // of the multi-operator flow — sees no job row for the run queued on the first machine and would
-  // read "never enqueued", spawning a duplicate concurrent run on the same epic.
-  //
-  // The cost of gating on the label alone: if the best-effort enqueue below fails, the target stays
-  // approved with no run, and re-approving won't retry it (this request can't tell that state from a
-  // run living on another machine). Recovery is to clear the label (`bd label remove`) and approve
-  // again — an explicit operator act, which is the right trade against silently double-running an
-  // epic.
+  // The gate is deliberately scoped to the steal: a re-approve that ISN'T a take-over is the
+  // operator asking for a run. Both epic-detail run buttons post here with no body (Force run on an
+  // implementing epic, Run epic elsewhere — epic-detail-view.tsx), as does re-approving a target
+  // whose enqueue previously failed. Gating those on `wasApproved` alone would report success with
+  // no `jobId` and leave an approved epic with no way to retry from the UI. The dedupe covers the
+  // double-click case; a cross-machine force-run is not deduped (anton-jz1).
   //
   // Best-effort — approving must still succeed even if the runner enqueue hiccups.
   // The autonomy master-switch (anton-y3l) gates at *claim* in the runner instead, so with autonomy
   // off the job waits `queued` and re-enabling resumes it.
+  const takeOver = wasApproved && steal && !!owner && owner !== operator;
   let jobId: string | undefined;
   try {
-    if (!wasApproved) jobId = await enqueueExecuteEpic(project.id, epicId);
+    if (!takeOver) jobId = await enqueueExecuteEpic(project.id, epicId);
   } catch (err) {
     console.error(`[approve] failed to enqueue execute-epic for ${epicId}`, err);
   }

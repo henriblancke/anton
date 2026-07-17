@@ -12,9 +12,18 @@
  *   1. Writes for one bead are serialized in this process, and the expected owner is re-read
  *      INSIDE that lock — so concurrent requests to this anton server (the case the soft-lock
  *      exists for: two operators clicking Claim) are ordered, and the loser sees the winner.
- *   2. The assignee is re-read after the write and verified. An in-process lock can't order a
- *      write from another bd client (a teammate's CLI, the runner), so the swap confirms what
- *      actually landed rather than reporting a success it never verified.
+ *   2. The assignee is re-read after the write and verified, so a write another bd client had
+ *      already landed is caught rather than reported as our success.
+ *
+ * What this does NOT do: make the swap atomic across processes. Layer 1 only orders writes it
+ * shares a Map with, and layer 2 verifies the assignee as of its own read — so two anton servers
+ * (or a teammate's `bd` CLI) can still interleave read→assign→verify and both return `{ ok: true }`,
+ * with the later write winning. bd exposes no conditional assignee write to close this: `bd assign`
+ * is unconditional, and the one atomic primitive (`bd update --claim`) also flips status to
+ * in_progress, which a human claim must never do. That residual window is why a claim is specified
+ * as ADVISORY, not a hard lock (DESIGN.md §Soft-lock) — it narrows the race that a single anton
+ * server can actually order, and approval (the act with consequences) re-settles ownership under
+ * this same guard before it enqueues. A cross-process hard lock needs a new bd primitive: anton-od4.
  *
  * A bare swap settles ownership only for the instant of its own write, which isn't enough for
  * either route: approve must still own the target through the `approved` label (that label is what
