@@ -7,7 +7,7 @@
  * clock. Times are stored as unix SECONDS (the schema's timestamp mode); this module works in ms
  * and converts at the boundary.
  */
-import { and, eq, gt, inArray, lte, notInArray, or, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, isNull, lte, not, notInArray, or, sql } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { randomUUID } from "node:crypto";
 import * as schema from "../db/schema";
@@ -187,16 +187,30 @@ export function enqueueExecuteEpicDeduped(
  * lapsed — a missed renewal from laptop sleep or a transient DB failure — would look reclaimable and
  * get leased a second time, running two handlers against the same job/worktree. Excluding it here
  * also avoids burning an attempt and overwriting its live lease.
+ *
+ * `excludeBucketKeys` filters out whole `(type, projectId)` buckets — keyed by `scheduleGateKey` — at
+ * the SQL level, BEFORE the finite scan window. This is the starvation guard for hard-held buckets
+ * (a disabled schedule or an autonomy-off project, both cap 0): `capOf` alone would let their jobs
+ * fill the earliest-by-`runAt` scan window and be skipped, so every tick keeps re-scanning the same
+ * gated prefix and never reaches leasable work for other schedules/projects (anton-7l7). Excluding
+ * them in the query paginates past them instead. `capOf` still enforces the cap as a backstop.
  */
 export async function leaseDue(
   db: AntonDb,
   clock: Clock,
-  opts: { leaseMs: number; limit: number; capOf?: (job: JobRow) => number; exclude?: Iterable<string> },
+  opts: {
+    leaseMs: number;
+    limit: number;
+    capOf?: (job: JobRow) => number;
+    exclude?: Iterable<string>;
+    excludeBucketKeys?: Iterable<string>;
+  },
 ): Promise<JobRow[]> {
   const nowMs = clock.now();
   const nowDate = secDate(nowMs);
   const leaseDate = secDate(nowMs + opts.leaseMs);
   const excludeIds = opts.exclude ? [...opts.exclude] : [];
+  const excludeBuckets = opts.excludeBucketKeys ? [...opts.excludeBucketKeys] : [];
 
   // Without per-bucket caps, the DB `limit` alone bounds the result. With caps we must scan more
   // candidates than `limit` (some get skipped for being at capacity), so widen the fetch.
@@ -205,10 +219,31 @@ export async function leaseDue(
     and(eq(schema.jobs.status, "queued"), lte(schema.jobs.runAt, nowDate)),
     and(eq(schema.jobs.status, "running"), lte(schema.jobs.leaseExpiresAt, nowDate)),
   );
+  // Drop hard-held buckets before the scan window so they can't crowd out leasable work. Each key is
+  // `scheduleGateKey(type, projectId)`; an empty projectId segment means the null-project bucket.
+  const heldBucketFilter =
+    excludeBuckets.length > 0
+      ? not(
+          or(
+            ...excludeBuckets.map((key) => {
+              const [type, projectId] = key.split("\0");
+              return and(
+                eq(schema.jobs.type, type),
+                projectId === "" ? isNull(schema.jobs.projectId) : eq(schema.jobs.projectId, projectId),
+              );
+            }),
+          )!,
+        )
+      : undefined;
+  const where = and(
+    runnable,
+    excludeIds.length > 0 ? notInArray(schema.jobs.id, excludeIds) : undefined,
+    heldBucketFilter,
+  );
   const candidates = await db
     .select()
     .from(schema.jobs)
-    .where(excludeIds.length > 0 ? and(runnable, notInArray(schema.jobs.id, excludeIds)) : runnable)
+    .where(where)
     .orderBy(schema.jobs.runAt)
     .limit(scanLimit);
 
@@ -223,7 +258,10 @@ export async function leaseDue(
     // genuinely occupying its bucket, so it must count toward the cap — otherwise a spare-capacity
     // tick would lease a second job for a project already at its concurrency limit. The two
     // conditions are OR'd in one query so a job that's both leased-and-unexpired and in-flight is
-    // counted once, not twice. Only gated buckets are tracked.
+    // counted once, not twice. Only gated buckets are tracked. Buckets are keyed by (type, project)
+    // so a cap on one job type — execute-epic concurrency, or a disabled schedule's cap-0 — never
+    // counts against a different type sharing the same project (anton-7l7).
+    const bucketKey = (type: string, projectId: string | null) => `${type}\0${projectId ?? ""}`;
     const liveLoad =
       excludeIds.length > 0
         ? or(gt(schema.jobs.leaseExpiresAt, nowDate), inArray(schema.jobs.id, excludeIds))
@@ -235,7 +273,7 @@ export async function leaseDue(
     const usedByBucket = new Map<string, number>();
     for (const row of active) {
       if (capOf(row as JobRow) === Infinity) continue;
-      const key = row.projectId ?? "";
+      const key = bucketKey(row.type, row.projectId);
       usedByBucket.set(key, (usedByBucket.get(key) ?? 0) + 1);
     }
 
@@ -247,7 +285,7 @@ export async function leaseDue(
         picked.push(job);
         continue;
       }
-      const key = job.projectId ?? "";
+      const key = bucketKey(job.type, job.projectId);
       const used = usedByBucket.get(key) ?? 0;
       if (used >= cap) continue; // bucket at capacity — leave queued, try the next candidate
       usedByBucket.set(key, used + 1);
@@ -495,4 +533,25 @@ export async function activeExecuteEpicKeys(db: AntonDb): Promise<Set<string>> {
     if (epicBeadId) keys.add(`${row.projectId ?? ""}::${epicBeadId}`);
   }
   return keys;
+}
+
+/** Key a job's schedule gate by `(type, projectId)` — the grain a `schedules` row is keyed on. */
+export function scheduleGateKey(type: string, projectId: string | null | undefined): string {
+  return `${type}\0${projectId ?? ""}`;
+}
+
+/**
+ * The set of `scheduleGateKey(type, projectId)` for schedules that are currently DISABLED. The
+ * runner uses this to gate at *claim* (anton-7l7): a disabled schedule stops its already-queued or
+ * backoff/quota-rescheduled jobs from being leased, not just new enqueues. Mirrors the autonomy
+ * master-switch, but keyed on the schedule instead of a per-project policy, so it covers every
+ * scheduled job type (review-fix, nightly-stringer, orphan-grooming). Re-enabling clears the key,
+ * so the still-queued job resumes on the next tick.
+ */
+export async function disabledScheduleKeys(db: AntonDb): Promise<Set<string>> {
+  const rows = await db
+    .select({ type: schema.schedules.type, projectId: schema.schedules.projectId })
+    .from(schema.schedules)
+    .where(eq(schema.schedules.enabled, false));
+  return new Set(rows.map((r) => scheduleGateKey(r.type, r.projectId)));
 }

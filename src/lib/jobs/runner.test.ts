@@ -522,6 +522,131 @@ describe("JobRunner (live, in-memory db)", () => {
     expect((await getJob(tdb.db, heldId))?.status).toBe("queued"); // still waiting on the switch
   });
 
+  /** Seed a schedule row (defaults to disabled) so its jobs can be gated at claim. */
+  async function seedSchedule(
+    projectId: string,
+    type: string,
+    over: { enabled?: boolean } = {},
+  ) {
+    await tdb.db.insert(schema.schedules).values({
+      id: `sched-${type}-${projectId}`,
+      projectId,
+      type,
+      cron: "*/15 * * * *",
+      enabled: over.enabled ?? false,
+    });
+  }
+
+  it("disabling a schedule gates claiming: a queued review-fix stays queued (anton-7l7)", async () => {
+    // Mirrors the scheduler's "skips disabled schedules" but at the runner/dispatch layer — a job
+    // already sitting in `queued` (or backoff/quota-rescheduled) is NOT leased while its schedule is
+    // off. Uses a plain runner (no policy resolver) to prove the gate is independent of autonomy.
+    await seedProjects("A");
+    await seedSchedule("A", "review-fix", { enabled: false });
+    let ran = 0;
+    const r = new JobRunner({ db: tdb.db, clock, config: CONFIG });
+    r.registerHandler("review-fix", async () => {
+      ran += 1;
+    });
+    const id = await r.enqueue({ type: "review-fix", projectId: "A" });
+
+    expect(await r.tickOnce()).toBe(0); // schedule disabled → never leased
+    await r.whenIdle();
+    expect(ran).toBe(0);
+    let job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("queued"); // still queued — no attempt burned
+    expect(job?.attempts).toBe(0);
+
+    // Re-enable the schedule → the still-queued job resumes on the next tick.
+    await tdb.db
+      .update(schema.schedules)
+      .set({ enabled: true })
+      .where(eq(schema.schedules.id, "sched-review-fix-A"));
+    expect(await r.tickOnce()).toBe(1);
+    await r.whenIdle();
+    expect(ran).toBe(1);
+    job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("done");
+  });
+
+  it("gates every scheduled job type, and a disabled schedule doesn't starve execute-epic (anton-7l7)", async () => {
+    // The gate is keyed on (type, project): a disabled review-fix schedule holds its own job back
+    // but leaves the same project's execute-epic dispatch (autonomy on) untouched.
+    await seedProjects("A");
+    await seedSchedule("A", "review-fix", { enabled: false });
+    let reviewRan = 0;
+    let epicRan = 0;
+    const r = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { ...CONFIG, maxConcurrent: 5 },
+      resolvePolicy: () => policy({ concurrency: 2, autonomy: true }),
+    });
+    r.registerHandler("review-fix", async () => {
+      reviewRan += 1;
+    });
+    r.registerHandler("execute-epic", async () => {
+      epicRan += 1;
+    });
+    const reviewId = await r.enqueue({ type: "review-fix", projectId: "A" });
+    await r.enqueue({ type: "execute-epic", projectId: "A", payload: { n: 1 } });
+
+    expect(await r.tickOnce()).toBe(1); // only the execute-epic job — review-fix is gated off
+    await r.whenIdle();
+    expect(reviewRan).toBe(0);
+    expect(epicRan).toBe(1);
+    expect((await getJob(tdb.db, reviewId))?.status).toBe("queued");
+  });
+
+  it("a large disabled-schedule backlog doesn't starve leasable work past the scan window (anton-7l7)", async () => {
+    // Regression: disabled jobs sort earliest by runAt, so before the SQL-level bucket exclusion they
+    // filled leaseDue's finite scan window (max(limit*8, 200)) every tick; the cap-0 skip then left a
+    // leasable job sorting AFTER them permanently unreachable — enabled schedules and other projects
+    // stalled until the disabled ones were re-enabled or removed. Excluding held buckets in the query
+    // paginates past the backlog so leasable work is still reached.
+    await seedProjects("A", "B");
+    await seedSchedule("A", "review-fix", { enabled: false });
+
+    // 250 disabled review-fix jobs (> the 200-row scan window) as the earliest-by-runAt prefix.
+    const backlogAt = new Date(clock.now() - 10_000);
+    await tdb.db.insert(schema.jobs).values(
+      Array.from({ length: 250 }, (_, i) => ({
+        id: `held-${i}`,
+        type: "review-fix" as const,
+        projectId: "A",
+        status: "queued" as const,
+        runAt: backlogAt,
+        attempts: 0,
+      })),
+    );
+    // One leasable execute-epic (autonomy on) for another project, sorted AFTER the whole backlog.
+    await tdb.db.insert(schema.jobs).values({
+      id: "leasable",
+      type: "execute-epic",
+      projectId: "B",
+      status: "queued",
+      runAt: new Date(clock.now() - 1_000),
+      attempts: 0,
+    });
+
+    let epicRan = 0;
+    const r = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { ...CONFIG, maxConcurrent: 5 },
+      resolvePolicy: () => policy({ concurrency: 2, autonomy: true }),
+    });
+    r.registerHandler("review-fix", async () => {});
+    r.registerHandler("execute-epic", async () => {
+      epicRan += 1;
+    });
+
+    expect(await r.tickOnce()).toBe(1); // reaches past the 250 held jobs to lease the execute-epic
+    await r.whenIdle();
+    expect(epicRan).toBe(1);
+    expect((await getJob(tdb.db, "leasable"))?.status).toBe("done");
+  });
+
   it("aborts a job that exceeds its per-project timeout and retries it", async () => {
     // Handler blocks until aborted; a 20ms timeout fires, aborts it → retryable 'timed out' error.
     const r = policyRunner(

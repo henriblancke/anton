@@ -17,6 +17,7 @@ import {
   activeJobIdsForProject,
   complete,
   deleteActiveJobsForProject,
+  disabledScheduleKeys,
   enqueue,
   enqueueExecuteEpicDeduped,
   getJob,
@@ -27,6 +28,7 @@ import {
   renewLease,
   reschedule,
   resumeJob,
+  scheduleGateKey,
   systemClock,
   type AntonDb,
   type Clock,
@@ -294,6 +296,20 @@ export class JobRunner {
     const capacity = this.config.maxConcurrent - this.inFlight.size;
     if (capacity <= 0) return 0;
 
+    // Schedule master-switch (anton-7l7): a DISABLED schedule caps its jobs at 0, so an
+    // already-queued or backoff/quota-rescheduled review-fix (or any scheduled type) is NOT leased
+    // while the toggle is off. Gating at *claim* — not just at the scheduler's enqueue — is what
+    // makes disabling actually stop in-flight-but-queued work; re-enabling clears the key and the
+    // still-queued job resumes on the next tick. Read every tick so a mid-run toggle takes effect.
+    const disabledSchedules = await disabledScheduleKeys(this.db);
+
+    // Hard-held buckets (cap 0 regardless of load) are excluded from leaseDue's scan window at the
+    // SQL level, not just skipped by capOf — otherwise a large backlog of disabled/autonomy-off jobs
+    // (the earliest by runAt) fills the finite scan window every tick and starves leasable work for
+    // other schedules and projects (anton-7l7). Seed with disabled schedules; autonomy-off projects
+    // are added below. capOf still enforces cap 0 as a backstop for anything not excluded (quiesce).
+    const heldBucketKeys = new Set<string>(disabledSchedules);
+
     // With a policy resolver, gate execute-epic concurrency per project. Precompute each pending
     // project's cap so leaseDue can decide synchronously; other job types stay ungated (Infinity).
     let policyCapOf: ((job: JobRow) => number) | undefined;
@@ -304,22 +320,28 @@ export class JobRunner {
         const policy = await this.policyFor(pid ?? undefined);
         // Autonomy master-switch: off → cap 0, so no execute-epic job for this project is leased
         // (they stay queued and resume when the switch turns back on). See JobPolicy.autonomy.
-        concByProject.set(pid ?? "", policy.autonomy === false ? 0 : policy.concurrency);
+        const cap = policy.autonomy === false ? 0 : policy.concurrency;
+        concByProject.set(pid ?? "", cap);
+        // Cap 0 is a hard hold — exclude the whole bucket from the scan window so its backlog can't
+        // starve other work (same rationale as disabled schedules above).
+        if (cap === 0) heldBucketKeys.add(scheduleGateKey("execute-epic", pid));
       }
       policyCapOf = (job) =>
         job.type === "execute-epic"
           ? (concByProject.get(job.projectId ?? "") ?? DEFAULT_CONFIG.maxConcurrent)
           : Infinity;
     }
-    const capOf = (job: JobRow) =>
-      job.projectId && this.quiescedProjects.has(job.projectId)
-        ? 0
-        : (policyCapOf?.(job) ?? Infinity);
+    const capOf = (job: JobRow) => {
+      if (job.projectId && this.quiescedProjects.has(job.projectId)) return 0;
+      if (disabledSchedules.has(scheduleGateKey(job.type, job.projectId))) return 0;
+      return policyCapOf?.(job) ?? Infinity;
+    };
 
     const jobs = await leaseDue(this.db, this.clock, {
       leaseMs: this.config.leaseMs,
       limit: capacity,
       capOf,
+      excludeBucketKeys: heldBucketKeys,
       // Never re-lease a job already dispatched in this process. Rolling dispatch keeps a running
       // job in `inFlight` while its handler works; if its lease lapses (missed renewal from sleep or
       // a transient DB failure) its row looks reclaimable, and without this a spare-capacity tick
