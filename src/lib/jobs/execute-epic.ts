@@ -206,10 +206,30 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         try {
           await beads.claim(repo, epicBeadId, operator);
         } catch (e) {
-          throw new PoisonEpic(
-            `${epicBeadId} could not be claimed for ${operator} — it was taken over after this run ` +
-              `was queued; refusing to run under another operator's claim. Approve ${epicBeadId} as ` +
-              `its current owner to start a run under them. ` +
+          // A claim failure has two very different causes and only one warrants poisoning. Re-read the
+          // owner to tell them apart: if a DIFFERENT operator now holds the epic, this is a confirmed
+          // take-over — retrying is pointless, so poison (human must re-approve as the current owner).
+          // But `bd update --claim` also throws on transient failures (a Dolt lock, a CLI timeout) with
+          // NO ownership change; poisoning those would park a valid approved epic that a retry would
+          // claim cleanly. Treat that class as a normal retryable error — the same call runTicket's
+          // hard gate makes — so the runner retries instead of parking. A racing steal is still caught:
+          // either this re-read sees it, or the pre-read gate above does on the next attempt. If the
+          // re-read ITSELF fails we can't confirm a take-over, so fall through to the retryable path.
+          const ownerNow = await beads
+            .show(repo, epicBeadId)
+            .then(ownerOf)
+            .catch(() => undefined);
+          if (ownerNow && ownerNow !== operator) {
+            throw new PoisonEpic(
+              `${epicBeadId} is reserved by ${ownerNow}, not ${operator} — it was taken over after this ` +
+                `run was queued; refusing to run under another operator's claim. Approve ${epicBeadId} as ` +
+                `${ownerNow} to start a run under the current owner. ` +
+                `(${e instanceof Error ? e.message : String(e)})`,
+            );
+          }
+          throw new Error(
+            `${epicBeadId} could not be claimed for ${operator} — the beads DB is locked or the claim ` +
+              `command failed transiently; retrying. ` +
               `(${e instanceof Error ? e.message : String(e)})`,
           );
         }
