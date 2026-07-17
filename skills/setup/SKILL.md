@@ -30,12 +30,18 @@ once per repo; it is **idempotent** — it skips anything already present, so re
 
 ## 2. Initialize beads
 
-Check for `.beads/` **at the repo root** (from step 1). If it is absent, run `bd init --skip-agents`
-from the repo root. The `--skip-agents` flag is required: a bare
-`bd init` writes/updates `AGENTS.md` by default, which would edit the repo's agent instructions
-before the consent gate in step 6 — pass `--skip-agents` so anton only touches `AGENTS.md` with
-the user's say-so. Then confirm `bd ready --json` works. If `bd init` errors, **stop and say so** —
-do not leave a half-initialized project. If `.beads/` already exists, skip.
+Check for `.beads/` **at the repo root** (from step 1). If it is absent, run
+`bd init --skip-agents --skip-hooks` from the repo root. Both flags keep `bd init` from mutating
+the repo before the consent gate in step 6:
+
+- `--skip-agents` — a bare `bd init` writes/updates `AGENTS.md` by default, which would edit the
+  repo's agent instructions before the user has agreed (see step 6).
+- `--skip-hooks` — a bare `bd init` installs its own git hooks and overwrites `core.hooksPath`,
+  which would silently disable an existing Husky / lefthook / custom-`hooksPath` setup. Skip them
+  so `/setup` never clobbers the project's hook config uninvited.
+
+Then confirm `bd ready --json` works. If `bd init` errors, **stop and say so** — do not leave a
+half-initialized project. If `.beads/` already exists, skip.
 
 ## 3. Detect the stack
 
