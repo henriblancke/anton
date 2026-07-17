@@ -34,6 +34,7 @@ import {
   type PrReview,
 } from "../git/pr";
 import { createWorktree, findWorktree, removeWorktree, worktreePathFor, type Worktree } from "../git/worktree";
+import { resolveOperator } from "../operator";
 import { getProjectById, getProjectSettings, type ProjectSettings } from "../projects";
 import { runShell } from "./shell";
 import { findOpenRunForEpic, updateRun } from "../runs";
@@ -70,21 +71,50 @@ const consoleLog: RunnerLogger = {
 };
 
 /**
- * In-review run targets = open run targets tagged stage:in-review that carry a PR external-ref.
- * A run target is an epic OR a standalone parentless task/bug (an epic-of-one) — both open a PR
- * and sit in review until it merges, so both must be swept here. A standalone target has no
- * children, so `handleEpic`/`finalizeMergedEpic` treat it as an epic with an empty ticket set:
- * fixing feedback runs against its PR branch as usual, and a merge closes the bead itself.
- * (Kept named `inReviewEpics` — the exported handle importers/tests already use.)
+ * Does the current operator own this epic? On a shared board an operator may only fix/finalize the
+ * in-review PRs it claimed (or unclaimed ones) — never another operator's. `assignee` is the claim
+ * execute-epic stamps (beads.claim → `bd update --claim`, actor = resolveOperator); unclaimed beads
+ * carry null/absent/empty. resolveOperator resolves the same identity — down to bd's $USER fallback
+ * (anton-g3v) — that stamped the claim, so a claim this instance made always matches. `operator`
+ * is undefined only in the degenerate case where even $USER is unset; then nothing but unclaimed
+ * epics match, so an anton that genuinely can't name itself never races a claimed PR.
  */
-export function inReviewEpics(all: Bead[]): Bead[] {
-  return all.filter(
-    (b) =>
-      beads.isRunTarget(b) &&
-      b.status !== "closed" &&
-      (b.labels?.includes(IN_REVIEW) ?? false) &&
-      prNumberFromRef(b.external_ref) !== undefined,
-  );
+function ownedByOperator(b: Bead, operator: string | undefined): boolean {
+  const assignee = (b.assignee ?? undefined)?.trim() || undefined;
+  if (!assignee) return true; // unclaimed — free to take
+  return assignee === operator; // claimed-by-me; a different operator's claim is excluded
+}
+
+/**
+ * In-review run targets = open run targets tagged stage:in-review that carry a PR external-ref,
+ * filtered to the ones this operator may act on. A run target is an epic OR a standalone parentless
+ * task/bug (an epic-of-one) — both open a PR and sit in review until it merges, so both must be
+ * swept here. A standalone target has no children, so `handleEpic`/`finalizeMergedEpic` treat it as
+ * an epic with an empty ticket set: fixing feedback runs against its PR branch as usual, and a merge
+ * closes the bead itself. (Kept named `inReviewEpics` — the exported handle importers/tests use.)
+ *
+ * Ownership (anton-zoh): an epic is selected only when unclaimed OR claimed by `options.operator`;
+ * a DIFFERENT operator's claim is excluded so two antons sharing a board never race the same PR. A
+ * targeted `options.epicBeadId` (an explicit single-epic run) bypasses the ownership filter — an
+ * operator asking for a specific epic gets it regardless of claim.
+ */
+export function inReviewEpics(
+  all: Bead[],
+  options: { operator?: string; epicBeadId?: string } = {},
+): Bead[] {
+  const { operator, epicBeadId } = options;
+  return all.filter((b) => {
+    if (
+      !beads.isRunTarget(b) ||
+      b.status === "closed" ||
+      !(b.labels?.includes(IN_REVIEW) ?? false) ||
+      prNumberFromRef(b.external_ref) === undefined
+    ) {
+      return false;
+    }
+    if (epicBeadId) return b.id === epicBeadId; // targeted run — ownership bypassed
+    return ownedByOperator(b, operator);
+  });
 }
 
 /** Build the runner handler bound to a db/clock. Register it as the "review-fix" handler. */
@@ -101,9 +131,13 @@ export function makeReviewFixHandler(deps: ReviewFixDeps): JobHandler {
     const settings = await getProjectSettings(db, projectId);
 
     const all = await beads.list(repo, ["--status", "all"]);
-    let epics = inReviewEpics(all);
-    if (epicBeadId) epics = epics.filter((e) => e.id === epicBeadId);
-    if (epics.length === 0) return; // nothing in review — done.
+    // Scope the sweep to epics this operator owns (anton-zoh): unclaimed or claimed-by-me, so a
+    // shared board doesn't have two antons racing the same in-review PR. A targeted epicBeadId
+    // (single-epic run) bypasses ownership — the operator explicitly asked for that epic. Identity
+    // comes from the same resolveOperator that execute-epic claims with, so "mine" matches the claim.
+    const operator = await resolveOperator();
+    const epics = inReviewEpics(all, { operator, epicBeadId });
+    if (epics.length === 0) return; // nothing in review for this operator — done.
 
     // Sweep each in-review PR. One epic's failure shouldn't abort the others, but a usage limit
     // must propagate so the runner backs the WHOLE job off (you can't retry an exhausted quota).

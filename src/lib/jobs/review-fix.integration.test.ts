@@ -18,6 +18,7 @@ import { getJob, type Clock } from "./queue";
 import { JobRunner } from "./runner";
 import { makeReviewFixHandler } from "./review-fix";
 import { createWorktree } from "../git/worktree";
+import { resetOperatorCache } from "../operator";
 
 function has(cmd: string): boolean {
   try {
@@ -315,5 +316,100 @@ process.exit(0);`,
     } finally {
       process.env.ANTON_GH_BIN = prev;
     }
+  }, 60_000);
+
+  // ── operator ownership (anton-zoh) ──
+  //
+  // These drive the REAL handler with a resolved operator identity (ANTON_OPERATOR) and a second
+  // epic CLAIMED by a different operator, whose PR is MERGED. The unclaimed epic-1 the sweep also
+  // visits is served an approved+green PR so it's a no-op and can't interfere.
+  //
+  // A gh that reports the given PR number MERGED and every other number approved+green.
+  const mergedGhFor = (mergedNumber: number) =>
+    writeBin(
+      binDir,
+      `gh-merged-${mergedNumber}`,
+      `const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='view'){
+  const n=Number(a[2]);
+  if(n===${mergedNumber}){console.log(JSON.stringify({number:n,state:'MERGED',headRefName:'anton/bob-'+n,url:'u',reviews:[],statusCheckRollup:[]}));process.exit(0);}
+  console.log(JSON.stringify({number:n,state:'OPEN',reviewDecision:'APPROVED',headRefName:process.env.FAKE_BRANCH,url:'u',reviews:[],statusCheckRollup:[{__typename:'CheckRun',name:'build',status:'COMPLETED',conclusion:'SUCCESS'}]}));process.exit(0);
+}
+if(a[0]==='repo'){console.log('acme/repo');process.exit(0);}
+process.exit(0);`,
+    );
+
+  async function withOperator<T>(name: string, fn: () => Promise<T>): Promise<T> {
+    const prevOp = process.env.ANTON_OPERATOR;
+    const prevGh = process.env.ANTON_GH_BIN;
+    process.env.ANTON_OPERATOR = name;
+    resetOperatorCache();
+    try {
+      return await fn();
+    } finally {
+      if (prevOp === undefined) delete process.env.ANTON_OPERATOR;
+      else process.env.ANTON_OPERATOR = prevOp;
+      process.env.ANTON_GH_BIN = prevGh;
+      resetOperatorCache();
+    }
+  }
+
+  it("does NOT finalize a MERGED epic claimed by another operator (ownership gate)", async () => {
+    const bobEpic = await beads.create(repo, {
+      title: "Bob's merged feature",
+      type: "epic",
+      description: "## Goal\nBob's.",
+    });
+    await beads.claim(repo, bobEpic, "bob");
+    await beads.tag(repo, bobEpic, [LABELS.stage("in-review")]);
+    await beads.setExternalRef(repo, bobEpic, "gh-8");
+
+    await withOperator("alice", async () => {
+      process.env.ANTON_GH_BIN = mergedGhFor(8);
+      const runner = new JobRunner({ db: tdb.db, clock, config: { maxConcurrent: 1, leaseMs: 30_000 } });
+      runner.registerHandler("review-fix", makeReviewFixHandler({ db: tdb.db, clock }));
+      const jobId = await runner.enqueue({ type: "review-fix", projectId, payload: { projectId } });
+      expect(await runner.tickOnce()).toBe(1);
+      await runner.whenIdle();
+      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+    });
+
+    // Bob's epic was skipped entirely — finalizeMergedEpic (close + drop stage:in-review) never ran.
+    const now = await beads.list(repo, ["--status", "all"]);
+    const bob = now.find((b) => b.id === bobEpic);
+    expect(bob?.status).not.toBe("closed");
+    expect(bob?.labels?.includes(LABELS.stage("in-review"))).toBe(true);
+  }, 60_000);
+
+  it("a targeted epicBeadId finalizes another operator's MERGED epic (override wins)", async () => {
+    const bobEpic = await beads.create(repo, {
+      title: "Bob's targeted merged feature",
+      type: "epic",
+      description: "## Goal\nBob's targeted.",
+    });
+    await beads.claim(repo, bobEpic, "bob");
+    await beads.tag(repo, bobEpic, [LABELS.stage("in-review")]);
+    await beads.setExternalRef(repo, bobEpic, "gh-9");
+
+    await withOperator("alice", async () => {
+      process.env.ANTON_GH_BIN = mergedGhFor(9);
+      const runner = new JobRunner({ db: tdb.db, clock, config: { maxConcurrent: 1, leaseMs: 30_000 } });
+      runner.registerHandler("review-fix", makeReviewFixHandler({ db: tdb.db, clock }));
+      // Explicit single-epic target bypasses the ownership filter — alice runs bob's epic.
+      const jobId = await runner.enqueue({
+        type: "review-fix",
+        projectId,
+        payload: { projectId, epicBeadId: bobEpic },
+      });
+      expect(await runner.tickOnce()).toBe(1);
+      await runner.whenIdle();
+      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+    });
+
+    // The override reached finalizeMergedEpic: bob's epic is closed and out of review.
+    const now = await beads.list(repo, ["--status", "all"]);
+    const bob = now.find((b) => b.id === bobEpic);
+    expect(bob?.status).toBe("closed");
+    expect(bob?.labels?.includes(LABELS.stage("in-review")) ?? false).toBe(false);
   }, 60_000);
 });
