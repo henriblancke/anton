@@ -7,6 +7,7 @@ import { conflictBody, ownerOf, withClaimLock } from "@/lib/beads/claim";
 import { enqueueExecuteEpic } from "@/lib/jobs/service";
 import { resolveOperator } from "@/lib/operator";
 import { getProjectBySlug } from "@/lib/projects";
+import { deriveStage } from "@/lib/ticket-view";
 import { STAGES } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
@@ -127,6 +128,24 @@ export async function POST(
         {
           error: `${epicId} is claimed by ${owner} — pass { steal: true } to approve and take it over`,
           owner,
+        },
+        { status: 409 },
+      );
+    }
+    // A steal only moves the reservation; it does not stop a run already executing under the current
+    // owner. The `takeOver` gate below suppresses a *second* enqueue but never halts the first, so
+    // reassigning an implementing/in-review target would strand that live run under a new owner —
+    // exactly the takeover the runtime is mid-flight on. Only a backlog target (approved-but-unstarted,
+    // or never started) is safe to take over. This mirrors the UI, which offers Take over solely on
+    // backlog targets (claim-control.tsx `canTakeOver`); enforce that boundary here so a direct request
+    // can't bypass it. Derive from the fresh `current` bead read above.
+    const stage = deriveStage(current);
+    if (stage !== "backlog") {
+      return NextResponse.json(
+        {
+          error: `${epicId} is claimed by ${owner} and is already ${stage} — its run is in progress, so it can't be taken over; wait for it to finish or have ${owner} release it`,
+          owner,
+          stage,
         },
         { status: 409 },
       );

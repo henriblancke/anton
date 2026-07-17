@@ -330,6 +330,35 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     expect(bead.assignee).toBe("anton-test");
   }, 60_000);
 
+  it("409s a steal-on-approve of an implementing target and leaves the reservation with its owner", async () => {
+    // A steal only moves the reservation — it cannot halt a run already executing under the owner.
+    // Taking over an implementing/in-review target would strand that live run under a new owner, so
+    // the route rejects it (the takeOver gate suppresses only a *second* enqueue, never the first).
+    // Mirrors the UI, which offers Take over solely on backlog targets (claim-control `canTakeOver`).
+    const epic = await beads.create(repo, { title: "Running epic", type: "epic" });
+    const child = await beads.create(repo, { title: "Running epic child", type: "task" });
+    await beads.link(repo, child, epic, "parent-child");
+    await beads.assign(repo, epic, "someone-else");
+    await beads.approve(repo, epic);
+    await beads.tag(repo, epic, ["stage:implementing"]);
+
+    const res = await POST(
+      new Request("http://t/", {
+        method: "POST",
+        body: JSON.stringify({ steal: true }),
+        headers: { "content-type": "application/json" },
+      }),
+      ctx("approvy", epic),
+    );
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toContain("someone-else");
+    expect(body.stage).toBe("implementing");
+    // The reservation stays with its owner and no run is enqueued under the would-be stealer.
+    expect((await beads.show(repo, epic)).assignee).toBe("someone-else");
+    expect(await executeEpicJobs(epic)).toHaveLength(0);
+  }, 60_000);
+
   it("auto-claims an unclaimed run target for the approver before enqueuing", async () => {
     // Closing the gap before the runtime execution-claim: approving an unclaimed target sets the
     // approver as assignee, so a teammate can't land a claim between approve and the runner.
