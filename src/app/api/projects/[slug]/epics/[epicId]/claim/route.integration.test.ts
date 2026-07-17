@@ -169,6 +169,28 @@ suite("claim route (temp anton.db + real bd)", () => {
     expect((await beads.show(repo, epic)).assignee).toBe("bob");
   }, 60_000);
 
+  it("409s a stolen release with no operator identity, keeping the owner's claim", async () => {
+    // A steal nobody can be attributed to must not clear a teammate's reservation — POST/approve
+    // already refuse an unattributable steal, and a release is no less consequential.
+    await beads.assign(repo, epic, "bob");
+    delete process.env.ANTON_OPERATOR;
+    resetOperatorCache();
+    // The fallback identity must miss too, or this wouldn't be the case under test. Point git's
+    // global config at an empty file so the host's own user.name can't resolve one for us.
+    const realGlobalConfig = process.env.GIT_CONFIG_GLOBAL;
+    process.env.GIT_CONFIG_GLOBAL = join(workDir, "empty-gitconfig");
+    try {
+      const res = await del("claimy", epic, { steal: true });
+      expect(res.status).toBe(409);
+      expect((await res.json()).error).toMatch(/ANTON_OPERATOR/);
+      expect((await beads.show(repo, epic)).assignee).toBe("bob");
+    } finally {
+      if (realGlobalConfig === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+      else process.env.GIT_CONFIG_GLOBAL = realGlobalConfig;
+      resetOperatorCache();
+    }
+  }, 60_000);
+
   it("409s claim + release once the target is approved — the reservation is locked", async () => {
     // Approve locks the reservation (approve enforces the claim as a soft-lock). The human-claim
     // route must not mutate an approved target: the runner swallows its own epic claim, so a

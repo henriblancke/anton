@@ -29,6 +29,33 @@ let workDir: string;
 let repo: string;
 let POST: typeof import("./route").POST;
 let beads: typeof import("@/lib/beads/bd").beads;
+let resetOperatorCache: typeof import("@/lib/operator").resetOperatorCache;
+
+/** Set the resolved operator identity for the next route call (the identity is memoized). */
+function actAs(name: string): void {
+  process.env.ANTON_OPERATOR = name;
+  resetOperatorCache();
+}
+
+/** Every execute-epic job queued for `epicId`, in any status. */
+async function executeEpicJobs(epicId: string) {
+  const { getDb } = await import("@/lib/db");
+  const schema = await import("@/lib/db/schema");
+  const rows = await getDb().select().from(schema.jobs);
+  return rows.filter(
+    (r) =>
+      r.type === "execute-epic" &&
+      (JSON.parse(r.payloadJson ?? "{}") as { epicBeadId?: string }).epicBeadId === epicId,
+  );
+}
+
+/** Park a job the way an exhausted retry budget would, without running the runner. */
+async function parkJob(id: string): Promise<void> {
+  const { getDb } = await import("@/lib/db");
+  const schema = await import("@/lib/db/schema");
+  const { eq } = await import("drizzle-orm");
+  await getDb().update(schema.jobs).set({ status: "parked" }).where(eq(schema.jobs.id, id));
+}
 
 suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd)", () => {
   let blocked = "";
@@ -61,6 +88,7 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
 
     ({ POST } = await import("./route"));
     ({ beads } = await import("@/lib/beads/bd"));
+    ({ resetOperatorCache } = await import("@/lib/operator"));
     const { getDb } = await import("@/lib/db");
     const schema = await import("@/lib/db/schema");
 
@@ -98,6 +126,8 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
 
   afterAll(() => {
     if (workDir) rmSync(workDir, { recursive: true, force: true });
+    delete process.env.ANTON_OPERATOR;
+    resetOperatorCache?.();
   });
 
   it("409s a blocked epic without approving it", async () => {
@@ -174,6 +204,51 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", epic));
     expect(res.status).toBe(200);
     expect(beads.isApproved(await beads.show(repo, epic))).toBe(true);
+  }, 60_000);
+
+  it("does not enqueue a second run when a take-over re-approves an epic whose run parked", async () => {
+    // Take over is steal-on-approve, so it goes through this route — but it must only move the
+    // reservation. The enqueue dedupe covers `queued`/`running` only, so a parked prior run is
+    // exactly the window where a re-approve could spawn a duplicate run under the new owner.
+    const epic = await beads.create(repo, { title: "Parked-run epic", type: "epic" });
+    const child = await beads.create(repo, { title: "Parked-run epic child", type: "task" });
+    await beads.link(repo, child, epic, "parent-child");
+
+    actAs("bob");
+    expect((await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", epic))).status).toBe(200);
+    const first = await executeEpicJobs(epic);
+    expect(first).toHaveLength(1);
+    await parkJob(first[0].id);
+
+    actAs("alice");
+    const res = await POST(
+      new Request("http://t/", { method: "POST", body: JSON.stringify({ steal: true }) }),
+      ctx("approvy", epic),
+    );
+    expect(res.status).toBe(200);
+    // The reservation moves…
+    expect((await beads.show(repo, epic)).assignee).toBe("alice");
+    // …and nothing else does: still one run, still parked (recoverable via resume, not a fresh run).
+    const after = await executeEpicJobs(epic);
+    expect(after).toHaveLength(1);
+    expect(after[0].status).toBe("parked");
+    expect((await res.json()).jobId).toBeUndefined();
+  }, 60_000);
+
+  it("re-approving an approved target that never got a run enqueues one (enqueue-hiccup recovery)", async () => {
+    // The mirror of the case above: approve's enqueue is best-effort, so an approved target can end
+    // up with no job at all. Re-approving is the recovery path — it must still trigger the run.
+    actAs("anton-test");
+    const epic = await beads.create(repo, { title: "Approved, never enqueued", type: "epic" });
+    const child = await beads.create(repo, { title: "Approved, never enqueued child", type: "task" });
+    await beads.link(repo, child, epic, "parent-child");
+    await beads.approve(repo, epic); // label only — no job, as if the enqueue had failed
+    expect(await executeEpicJobs(epic)).toHaveLength(0);
+
+    const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", epic));
+    expect(res.status).toBe(200);
+    expect((await res.json()).jobId).toBeTruthy();
+    expect(await executeEpicJobs(epic)).toHaveLength(1);
   }, 60_000);
 
   it("422s a child ticket of an epic, points at its parent, and does not approve it", async () => {

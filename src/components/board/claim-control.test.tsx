@@ -59,8 +59,9 @@ describe("ClaimControl", () => {
 
   it("offers Take over on an approved target another operator holds when steal-on-approve is safe", () => {
     // The claim route 409s an approved target, so Steal is gone — but steal-on-approve is still a
-    // valid move for a backlog target (the enqueue dedupes, so no second run). Surface it, or the
-    // documented take-over flow would be unreachable from the UI.
+    // valid move for a backlog target (the approve route skips the enqueue for an already-approved
+    // target that has a run, so no second run). Surface it, or the documented take-over flow would
+    // be unreachable from the UI.
     const html = renderToStaticMarkup(
       <ClaimControl slug="anton" itemId="e-1" owner="bob" operator="alice" readOnly canTakeOver />,
     );
@@ -69,9 +70,9 @@ describe("ClaimControl", () => {
     expect(html).not.toMatch(/Steal/);
   });
 
-  it("keeps an approved target read-only when a take-over would start a second run", () => {
-    // Past backlog the prior job may be done/parked, where re-approving enqueues a NEW run. A
-    // take-over must never do that, so callers leave canTakeOver false and no action is offered.
+  it("keeps an approved target read-only when the caller doesn't allow a take-over", () => {
+    // Past backlog the run is already executing under its owner's reservation; moving it is not a
+    // claim-control affordance, so callers leave canTakeOver false and no action is offered.
     const html = renderToStaticMarkup(
       <ClaimControl slug="anton" itemId="e-1" owner="bob" operator="alice" readOnly />,
     );

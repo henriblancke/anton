@@ -16,7 +16,7 @@ import { makeNightlyStringerHandler } from "./nightly-stringer";
 import { makeOrphanGroomingHandler } from "./orphan-grooming";
 import { JobRunner, type RunnerLogger } from "./runner";
 import { Scheduler } from "./scheduler";
-import { getJob, systemClock } from "./queue";
+import { getJob, hasExecuteEpicJob, systemClock } from "./queue";
 import { startSyncEngine } from "../beads/sync-engine";
 
 const log: RunnerLogger = {
@@ -100,6 +100,15 @@ export async function startRunner(): Promise<void> {
  */
 export function enqueueExecuteEpic(projectId: string, epicBeadId: string): Promise<string> {
   return Promise.resolve(getRunner().enqueueExecuteEpic(projectId, epicBeadId));
+}
+
+/**
+ * Was a run ever triggered for this project + epic (a job row in ANY status)? Lets the approve route
+ * tell a first approval from a re-approve whose run already exists in some non-active state. See
+ * `hasExecuteEpicJob` in queue.ts.
+ */
+export function hasExecuteEpicRun(projectId: string, epicBeadId: string): Promise<boolean> {
+  return Promise.resolve(hasExecuteEpicJob(getDb(), projectId, epicBeadId));
 }
 
 /**

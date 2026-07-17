@@ -3,7 +3,7 @@ import { getBoard } from "@/lib/board";
 import { epicStandaloneBlockers, standaloneBlockers } from "@/lib/epic-graph";
 import { refreshAllIssues } from "@/lib/beads/issues";
 import { beads } from "@/lib/beads/bd";
-import { enqueueExecuteEpic } from "@/lib/jobs/service";
+import { enqueueExecuteEpic, hasExecuteEpicRun } from "@/lib/jobs/service";
 import { resolveOperator } from "@/lib/operator";
 import { getProjectBySlug } from "@/lib/projects";
 import { STAGES } from "@/lib/types";
@@ -114,6 +114,10 @@ export async function POST(
     return NextResponse.json({ error: `Ticket ${epicId} not found on the board` }, { status: 404 });
   }
   const owner = current.assignee?.trim() || undefined;
+  // Whether approval is the RUN TRIGGER on this request, or just settles ownership. Read before the
+  // approve below, which would otherwise make every request look like a re-approve. See the enqueue
+  // gate at the end for why a re-approve must not start a second run.
+  const wasApproved = beads.isApproved(current);
   const steal = await readSteal(request);
   if (owner && owner !== operator) {
     // Claimed by someone else → approving would silently run a teammate's reservation. Require an
@@ -154,13 +158,22 @@ export async function POST(
     .sync(project.repoPath)
     .catch((err) => console.error(`[approve] beads dolt sync failed after approving ${epicId}`, err));
 
-  // Approval is the trigger: enqueue the autonomous execute-epic run (DESIGN.md §2/§7).
+  // Approval is the trigger: enqueue the autonomous execute-epic run (DESIGN.md §2/§7) — but it
+  // triggers ONCE. A re-approve of an already-approved target is a take-over (the UI's Take over is
+  // steal-on-approve, the only ownership move an approved target allows): it must reassign the bead
+  // and nothing more. `enqueueExecuteEpicDeduped` alone can't carry that guarantee — it only dedupes
+  // `queued`/`running`, so an approved target whose run has since parked/failed/finished would get a
+  // SECOND run from a take-over. Gate on the run's existence in any status instead. The one case a
+  // re-approve should still enqueue: approved with no job at all, i.e. the original approval's
+  // best-effort enqueue never landed — re-approving is then the honest recovery.
   // Best-effort — approving must still succeed even if the runner enqueue hiccups.
-  // Approval always enqueues; the autonomy master-switch (anton-y3l) gates at *claim* in the
-  // runner instead, so with autonomy off the job waits `queued` and re-enabling resumes it.
+  // The autonomy master-switch (anton-y3l) gates at *claim* in the runner instead, so with autonomy
+  // off the job waits `queued` and re-enabling resumes it.
   let jobId: string | undefined;
   try {
-    jobId = await enqueueExecuteEpic(project.id, epicId);
+    if (!wasApproved || !(await hasExecuteEpicRun(project.id, epicId))) {
+      jobId = await enqueueExecuteEpic(project.id, epicId);
+    }
   } catch (err) {
     console.error(`[approve] failed to enqueue execute-epic for ${epicId}`, err);
   }

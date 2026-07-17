@@ -51,12 +51,14 @@ export function ClaimControl({
    */
   readOnly?: boolean;
   /**
-   * Whether steal-on-approve is a safe take-over here — only true where the caller knows re-approving
-   * won't start a second run. Set it for a `backlog` target: approval there means a run is queued but
-   * not yet started, and the enqueue is deduped per project+epic, so re-approving with `{ steal: true }`
-   * only reassigns the bead. Past backlog the prior job may be done/parked, where a re-approve would
-   * enqueue a NEW run — a take-over must never do that, so callers leave this false and the owner
-   * stays read-only. Only consulted with `readOnly`; an unapproved target uses the claim-route Steal.
+   * Whether taking over is offered here. Set it for a `backlog` target: the run is approved but hasn't
+   * started, so reassigning it only changes who owns the pending work. Callers leave it false past
+   * backlog — a run that is implementing/in-review is already executing under its owner's reservation,
+   * and moving that out from under it is a separate decision, not a claim-control affordance.
+   *
+   * Take over never starts a second run: approval is the run trigger only on the FIRST approve, and the
+   * approve route skips the enqueue for a target already approved with a run of its own (in any status —
+   * see its enqueue gate). Only consulted with `readOnly`; an unapproved target uses the claim-route Steal.
    */
   canTakeOver?: boolean;
   className?: string;

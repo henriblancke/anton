@@ -145,11 +145,27 @@ export async function DELETE(
     // Releasing another operator's claim is itself a steal — gate it the same way as taking one over
     // so a release can't silently clear a teammate's reservation. An unclaimed target is a no-op.
     const operator = await resolveOperator();
-    if (owner !== operator && !(await readSteal(request))) {
-      return NextResponse.json(
-        { error: `${epicId} is claimed by ${owner} — pass { steal: true } to release someone else's claim`, owner },
-        { status: 409 },
-      );
+    if (owner !== operator) {
+      if (!(await readSteal(request))) {
+        return NextResponse.json(
+          { error: `${epicId} is claimed by ${owner} — pass { steal: true } to release someone else's claim`, owner },
+          { status: 409 },
+        );
+      }
+      // A steal with no resolvable operator identity (no ANTON_OPERATOR, no global git user.name) is
+      // an override nobody can be held to: without an identity we can't even tell whose claim this is
+      // *not*, so `owner !== operator` is vacuously true and the steal gate above is the only thing
+      // standing between a crafted body and a teammate's reservation. POST/approve both refuse a steal
+      // they can't attribute; a release must too — clearing someone's claim is no less consequential.
+      if (!operator) {
+        return NextResponse.json(
+          {
+            error: `${epicId} is claimed by ${owner} — set ANTON_OPERATOR (or git user.name) to identify who is releasing someone else's claim`,
+            owner,
+          },
+          { status: 409 },
+        );
+      }
     }
     await beads.unassign(repoPath, epicId);
     await nudgeSync(repoPath, epicId, "releasing");
