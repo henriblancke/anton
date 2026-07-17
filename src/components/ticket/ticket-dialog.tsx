@@ -212,6 +212,7 @@ function TicketDialogBody({
                 itemId={detail.id}
                 owner={detail.assignee}
                 variant="row"
+                readOnly={detail.approved}
                 onChanged={() => setAttempt((n) => n + 1)}
               />
             )}

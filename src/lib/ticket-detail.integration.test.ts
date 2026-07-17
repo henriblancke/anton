@@ -71,6 +71,7 @@ suite("ticket-detail integration (real bd)", () => {
     expect(detail.size).toBe("M");
     expect(detail.epicId).toBe(epicId);
     expect(detail.epicTitle).toBe("Detail epic");
+    expect(detail.approved).toBe(false);
   }, 30_000);
 
   it("changes the agent label without disturbing the approved label", async () => {
@@ -80,6 +81,7 @@ suite("ticket-detail integration (real bd)", () => {
     const updated = await updateTicket(project, taskId, { labels: { agent: "fastapi" } });
 
     expect(updated.agent).toBe("fastapi");
+    expect(updated.approved).toBe(true);
     const fresh = await beads.show(repo, taskId);
     expect(fresh.labels).toContain("approved");
     expect(fresh.labels).not.toContain("agent:nextjs");

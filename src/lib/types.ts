@@ -137,6 +137,7 @@ export interface TicketDetail extends Ticket {
   epicId?: string; // parent epic id, if any
   epicTitle?: string;
   epicAssignee?: string | null; // the parent epic's human-claim owner, inherited by this child
+  approved: boolean; // has the `approved` label — locks the standalone claim control (see ClaimControl)
 }
 
 // ── Board drag-and-drop ──

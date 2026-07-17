@@ -30,6 +30,7 @@ function toTicketDetail(lite: Bead, full: Bead, epic: Bead | undefined): TicketD
     epicId: epic?.id,
     epicTitle: epic?.title,
     epicAssignee: epic ? (epic.assignee ?? null) : undefined,
+    approved: beads.isApproved(lite),
   };
 }
 
