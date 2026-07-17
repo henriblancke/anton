@@ -4,7 +4,7 @@
  * epic (open cross-epic blocker) must be rejected with 409 *before* any approve/enqueue happens,
  * so a dependent epic can't start before its blocker completes. Skipped when `bd`/`git` are absent.
  */
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -357,6 +357,50 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     // The reservation stays with its owner and no run is enqueued under the would-be stealer.
     expect((await beads.show(repo, epic)).assignee).toBe("someone-else");
     expect(await executeEpicJobs(epic)).toHaveLength(0);
+  }, 60_000);
+
+  it("409s a steal when the owner's run starts between the stage gate and the claim swap", async () => {
+    // The pre-lock stage gate can read backlog, then the owner's runner starts before the CAS:
+    // it moves the bead to stage:implementing but leaves the assignee as the old owner, so a swap
+    // matching on assignee alone would reassign a live run to the approver. The route re-derives the
+    // stage under the claim lock to reject exactly that window. Simulate it by returning the backlog
+    // snapshot for the pre-lock read, then tagging the bead implementing before the under-lock read.
+    const epic = await beads.create(repo, { title: "Racing take-over", type: "epic" });
+    const child = await beads.create(repo, { title: "Racing take-over child", type: "task" });
+    await beads.link(repo, child, epic, "parent-child");
+    await beads.assign(repo, epic, "someone-else");
+    await beads.approve(repo, epic); // approved + backlog, owned by a teammate
+
+    const realShow = beads.show.bind(beads);
+    let raced = false;
+    const spy = vi.spyOn(beads, "show").mockImplementation(async (cwd, id) => {
+      const bead = await realShow(cwd, id);
+      if (id === epic && !raced) {
+        raced = true; // first read (the pre-lock gate) sees backlog; the runner then "starts"
+        await beads.tag(repo, epic, ["stage:implementing"]);
+      }
+      return bead;
+    });
+
+    actAs("anton-test");
+    try {
+      const res = await POST(
+        new Request("http://t/", {
+          method: "POST",
+          body: JSON.stringify({ steal: true }),
+          headers: { "content-type": "application/json" },
+        }),
+        ctx("approvy", epic),
+      );
+      expect(res.status).toBe(409);
+      const body = await res.json();
+      expect(body.stage).toBe("implementing");
+      // The reservation stays with its owner and nothing is enqueued under the would-be stealer.
+      expect((await realShow(repo, epic)).assignee).toBe("someone-else");
+      expect(await executeEpicJobs(epic)).toHaveLength(0);
+    } finally {
+      spy.mockRestore();
+    }
   }, 60_000);
 
   it("takes over an approved backlog target that gained a blocker after approval, without enqueuing", async () => {

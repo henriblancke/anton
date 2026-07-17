@@ -204,10 +204,34 @@ export async function POST(
   // the swap is owner→owner: a verified no-op that still takes the lock and still serializes the
   // label against concurrent claims.
   const swap = await withClaimLock(project.repoPath, epicId, async (cas) => {
+    // Re-derive the stage HERE, under the lock — not only from the pre-lock `current` read above.
+    // On a steal (owner !== operator) the pre-lock stage gate can pass on a backlog snapshot, then
+    // the original owner's runner starts in the window before this CAS: it moves the bead to
+    // in_progress/stage:implementing but leaves the assignee as the old owner, so `cas(owner, …)`
+    // (which matches on assignee alone) would still succeed and reassign a *live* run to the
+    // approver — the exact implementing/in-review takeover the pre-lock gate rejects. Reading the
+    // stage inside the lock makes a run that started in that window lose the swap instead. A
+    // self-owned re-approve (owner === operator, e.g. Force run on an implementing epic) is
+    // deliberately excluded: it's the operator asking to re-run their own target, not a takeover.
+    if (owner && owner !== operator) {
+      const locked = await beads.show(project.repoPath, epicId);
+      const lockedStage = locked ? deriveStage(locked) : undefined;
+      if (lockedStage && lockedStage !== "backlog") return { moved: lockedStage } as const;
+    }
     const result = await cas(owner, operator ?? owner);
     if (result.ok) await beads.approve(project.repoPath, epicId);
     return result;
   });
+  if ("moved" in swap) {
+    return NextResponse.json(
+      {
+        error: `${epicId} is claimed by ${owner} and is already ${swap.moved} — its run started while this approval was in flight, so it can't be taken over; wait for it to finish or have ${owner} release it`,
+        owner,
+        stage: swap.moved,
+      },
+      { status: 409 },
+    );
+  }
   if (!swap.ok) return NextResponse.json(conflictBody(epicId, swap.owner), { status: 409 });
 
   await beads
