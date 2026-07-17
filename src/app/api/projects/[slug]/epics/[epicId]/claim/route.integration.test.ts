@@ -5,8 +5,9 @@
  *
  * Mirrors the approve route test's harness (temp anton.db + real bd repo). Covers the assignee-only
  * primitive (claim leaves the bead `open` / stage `backlog`, release clears the assignee), the
- * steal-required-409 gate naming the current owner, and the non-run-target-422 gate. Skipped when
- * `bd`/`git` are absent.
+ * steal-required-409 gate naming the current owner, the non-run-target-422 gate, and the
+ * backlog-only gate (a target that has left backlog — approved or in_progress — is 409, not
+ * mutated). Skipped when `bd`/`git` are absent.
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
@@ -210,6 +211,30 @@ suite("claim route (temp anton.db + real bd)", () => {
       expect((await beads.show(repo, approvedEpic)).assignee).toBe("bob");
     } finally {
       await beads.delete(repo, approvedEpic, { cascade: true });
+    }
+  }, 60_000);
+
+  it("409s claim + release once an UNAPPROVED target has left backlog (in_progress)", async () => {
+    // A bead claimed outside anton (`bd update --claim`) or by an older/manual run is in_progress
+    // with an assignee but NO `approved` label, so the label-based approved gate would miss it. Its
+    // live assignee is owned by that run's lifecycle — a human claim/release here must not steal or
+    // clear it. Gate on the derived stage (backlog-only), not just the approved label.
+    const runningEpic = await beads.create(repo, { title: "Running epic", type: "epic" });
+    await beads.claim(repo, runningEpic, "bob");
+    try {
+      expect(deriveStage(await beads.show(repo, runningEpic))).toBe("implementing");
+
+      const stealRes = await post("claimy", runningEpic, { steal: true });
+      expect(stealRes.status).toBe(409);
+      expect((await stealRes.json()).error).toMatch(/backlog/i);
+      // The gate rejects before reassigning — bob keeps the claim.
+      expect((await beads.show(repo, runningEpic)).assignee).toBe("bob");
+
+      const releaseRes = await del("claimy", runningEpic, { steal: true });
+      expect(releaseRes.status).toBe(409);
+      expect((await beads.show(repo, runningEpic)).assignee).toBe("bob");
+    } finally {
+      await beads.delete(repo, runningEpic, { cascade: true });
     }
   }, 60_000);
 

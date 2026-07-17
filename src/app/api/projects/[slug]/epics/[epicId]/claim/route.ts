@@ -3,6 +3,8 @@ import { beads, type Bead } from "@/lib/beads/bd";
 import { conflictBody, ownerOf, withClaimLock, type SwapResult } from "@/lib/beads/claim";
 import { refreshAllIssues } from "@/lib/beads/issues";
 import { resolveOperator } from "@/lib/operator";
+import { deriveStage } from "@/lib/ticket-view";
+import type { Stage } from "@/lib/types";
 import { resolveProject } from "../../../resolve-project";
 
 export const dynamic = "force-dynamic";
@@ -74,7 +76,27 @@ async function loadTarget(
   // while the board shows a different owner. Ownership of an approved target changes only through
   // Approve (steal-on-approve), never through this route.
   if (beads.isApproved(target)) return { ok: false, response: approvedLockResponse(epicId) };
+  // A human claim is a *backlog* reservation (see the file docstring): it sets/clears the assignee
+  // while the bead stays `open`. Once a target has left backlog — in_progress (a run's own claim, or
+  // a manual `bd update --claim` outside anton), in-review, or closed — its assignee is owned by that
+  // run's lifecycle, not this control, so a claim/release here would steal or clear a live assignee.
+  // The `approved` gate above is label-based and would miss an unapproved in_progress bead; gate on
+  // the derived stage so every non-backlog state is refused. Mirrors the approve route's take-over
+  // boundary (backlog-only) and the UI's `canTakeOver`.
+  const stage = deriveStage(target);
+  if (stage !== "backlog") return { ok: false, response: notBacklogResponse(epicId, stage) };
   return { ok: true, repoPath: project.repoPath, target };
+}
+
+/** The 409 for a claim write refused because the target has left backlog (a run owns its assignee). */
+function notBacklogResponse(epicId: string, stage: Stage): NextResponse {
+  return NextResponse.json(
+    {
+      error: `${epicId} is already ${stage}, not in backlog — a human claim only reserves a backlog ticket; once a run is underway its assignee is owned by that run, not the claim control`,
+      stage,
+    },
+    { status: 409 },
+  );
 }
 
 /** The 409 for a claim write refused because approval has locked the target's reservation. */
