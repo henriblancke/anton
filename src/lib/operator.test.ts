@@ -1,5 +1,14 @@
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { resetOperatorCache, resolveOperator } from "./operator";
+
+// Isolate the global git-config rung: pointing GIT_CONFIG_GLOBAL at a path that doesn't exist
+// makes `git config --global user.name` read an empty config, so gitGlobalUserName() reliably
+// returns undefined regardless of the host's real git identity. Without this, machines with a
+// global user.name would satisfy resolveOperator() from the git rung and never exercise the
+// $USER / $USERNAME fallbacks these tests are meant to cover.
+const NO_GLOBAL_GITCONFIG = join(tmpdir(), "anton-operator-test-nonexistent-gitconfig");
 
 /**
  * resolveOperator resolution order (anton-g3v): ANTON_OPERATOR > global git user.name > $USER.
@@ -12,11 +21,13 @@ describe("resolveOperator", () => {
     ANTON_OPERATOR: process.env.ANTON_OPERATOR,
     USER: process.env.USER,
     USERNAME: process.env.USERNAME,
+    GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL,
   };
 
   beforeEach(() => {
     resetOperatorCache();
     delete process.env.ANTON_OPERATOR;
+    process.env.GIT_CONFIG_GLOBAL = NO_GLOBAL_GITCONFIG;
   });
 
   afterEach(() => {
@@ -34,20 +45,20 @@ describe("resolveOperator", () => {
   });
 
   it("falls back to $USER when ANTON_OPERATOR and global git user.name are unset", async () => {
-    // Not asserting the git rung directly (env-dependent); with ANTON_OPERATOR unset the resolver
-    // must still yield a non-undefined identity as long as an OS user exists, so its claims are
-    // owned by itself on a later review-fix sweep rather than silently disowned.
+    // GIT_CONFIG_GLOBAL (set in beforeEach) neutralizes the git rung, so this exercises the
+    // $USER fallback specifically: its claims stay owned by itself on a later review-fix sweep
+    // rather than silently disowned. A regression in osUser() would now fail here.
     process.env.USER = "svc-anton";
-    expect(await resolveOperator()).toBeTypeOf("string");
+    delete process.env.USERNAME;
+    expect(await resolveOperator()).toBe("svc-anton");
   });
 
   it("resolves to $USERNAME when $USER is absent (Windows-style)", async () => {
+    // Git rung neutralized via GIT_CONFIG_GLOBAL (beforeEach) and $USER unset, so the resolver
+    // must reach the $USERNAME rung — a regression in that fallback fails this assertion.
     delete process.env.USER;
     process.env.USERNAME = "winuser";
-    // Only decisive when global git user.name is unset; on machines that set it, that rung wins.
-    const op = await resolveOperator();
-    expect(op).toBeTypeOf("string");
-    expect(op).not.toBe("");
+    expect(await resolveOperator()).toBe("winuser");
   });
 
   it("memoizes — a second call returns the cached value without re-resolving", async () => {
