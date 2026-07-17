@@ -27,6 +27,7 @@ export function ClaimControl({
   owner: serverOwner,
   operator: operatorProp,
   variant = "chip",
+  readOnly = false,
   className,
   onChanged,
 }: {
@@ -38,6 +39,12 @@ export function ClaimControl({
   operator?: string | null;
   /** `chip` — compact, for board cards/chips. `row` — inline, for the detail assignee rows. */
   variant?: "chip" | "row";
+  /**
+   * Show the owner without any claim/release/steal control. Set once a target is approved/locked:
+   * the claim route 409s any write to an approved target (ownership then changes only via Approve's
+   * steal-on-approve), so offering an action that can't succeed would be misleading.
+   */
+  readOnly?: boolean;
   className?: string;
   /** Fired with the new owner after a successful write so callers can refetch/update their copy. */
   onChanged?: (owner: string | null) => void;
@@ -107,13 +114,21 @@ export function ClaimControl({
           isRow ? "" : "font-mono text-[10px]",
           owner ? "text-foreground/85" : "text-subtle",
         )}
-        title={owner ? `Claimed by ${owner}` : "Unclaimed"}
+        title={
+          readOnly
+            ? owner
+              ? `Claimed by ${owner} — locked while approved (take over via Approve)`
+              : "Unclaimed — locked while approved"
+            : owner
+              ? `Claimed by ${owner}`
+              : "Unclaimed"
+        }
       >
         <UserIcon className={cn(isRow ? "size-3.5" : "size-3", "shrink-0")} aria-hidden="true" />
         <span className="truncate">{mine ? "You" : label}</span>
       </span>
 
-      {owner === null ? (
+      {readOnly ? null : owner === null ? (
         known ? (
           <Button size="xs" variant="outline" onClick={() => act("claim")} disabled={busy}>
             <UserPlusIcon aria-hidden="true" />

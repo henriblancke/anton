@@ -45,6 +45,18 @@ describe("ClaimControl", () => {
     expect(html).not.toMatch(/Steal/);
   });
 
+  it("shows the owner read-only when locked (approved), even for my own claim", () => {
+    // Once approved the claim route 409s any write, so the control must show the owner without a
+    // Release/Steal/Claim action it can never satisfy — ownership then moves only via Approve.
+    const html = renderToStaticMarkup(
+      <ClaimControl slug="anton" itemId="e-1" owner="alice" operator="alice" readOnly />,
+    );
+    expect(html).toContain("You");
+    expect(html).not.toMatch(/Release/);
+    expect(html).not.toMatch(/Steal/);
+    expect(html).not.toMatch(/>Claim</);
+  });
+
   it("shows the owner read-only until the operator identity resolves", () => {
     // operator=null (resolved to "nobody") still can't claim someone else's — no Steal/Release,
     // but the owner is always visible.

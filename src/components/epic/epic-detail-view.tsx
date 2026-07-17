@@ -281,6 +281,7 @@ export function EpicDetailView({ slug, epicId }: { slug: string; epicId: string 
                   itemId={epic.id}
                   owner={epic.assignee}
                   variant="row"
+                  readOnly={epic.approved}
                   onChanged={() => setAttempt((n) => n + 1)}
                 />
               </dd>

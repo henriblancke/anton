@@ -108,16 +108,32 @@ export async function POST(
   // settled before we label + enqueue.
   const operator = await resolveOperator();
   const owner = target.assignee?.trim() || undefined;
-  // Claimed by someone else → approving would silently run a teammate's reservation. Require an
-  // explicit steal to take it over, mirroring the claim route's 409.
-  if (owner && owner !== operator && !(await readSteal(request))) {
-    return NextResponse.json(
-      {
-        error: `${epicId} is claimed by ${owner} — pass { steal: true } to approve and take it over`,
-        owner,
-      },
-      { status: 409 },
-    );
+  const steal = await readSteal(request);
+  if (owner && owner !== operator) {
+    // Claimed by someone else → approving would silently run a teammate's reservation. Require an
+    // explicit steal to take it over, mirroring the claim route's 409.
+    if (!steal) {
+      return NextResponse.json(
+        {
+          error: `${epicId} is claimed by ${owner} — pass { steal: true } to approve and take it over`,
+          owner,
+        },
+        { status: 409 },
+      );
+    }
+    // Steal requested, but no operator identity resolves (no ANTON_OPERATOR, no global git user.name),
+    // so we can't reassign the target. Approving anyway would enqueue a run under the teammate's
+    // reservation while leaving them as assignee — a half-steal that breaks the soft-lock the response
+    // text and DESIGN.md promise. Reject until an operator identity is set to take ownership.
+    if (!operator) {
+      return NextResponse.json(
+        {
+          error: `${epicId} is claimed by ${owner} — set ANTON_OPERATOR (or git user.name) to identify who is taking it over before approving`,
+          owner,
+        },
+        { status: 409 },
+      );
+    }
   }
   // Auto-claim before enqueuing: an unclaimed target (or one being stolen) gets assigned to the
   // approver so the reservation is set BEFORE the runtime execution-claim, closing the gap where a
