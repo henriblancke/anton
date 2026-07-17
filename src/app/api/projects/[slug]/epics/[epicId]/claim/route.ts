@@ -151,7 +151,10 @@ export async function POST(
   const swap = await swapUnlessApproved(repoPath, epicId, owner, operator);
   if (swap === "approved") return approvedLockResponse(epicId);
   if (!swap.ok) return NextResponse.json(conflictBody(epicId, swap.owner), { status: 409 });
-  await nudgeSync(repoPath, epicId, "claiming");
+  // Fire-and-forget (like the runner's claim sync in execute-epic): the assignee write already
+  // succeeded, so don't make the response wait on a shell-out to `bd dolt pull/commit/push` that a
+  // slow/unreachable remote could stall — the sync engine's heartbeat is the backstop.
+  void nudgeSync(repoPath, epicId, "claiming");
 
   return NextResponse.json({ item: await beads.show(repoPath, epicId) });
 }
@@ -198,7 +201,9 @@ export async function DELETE(
     const swap = await swapUnlessApproved(repoPath, epicId, owner, undefined);
     if (swap === "approved") return approvedLockResponse(epicId);
     if (!swap.ok) return NextResponse.json(conflictBody(epicId, swap.owner), { status: 409 });
-    await nudgeSync(repoPath, epicId, "releasing");
+    // Fire-and-forget for the same reason as POST: the unassign already landed locally, so don't
+    // block the release response on the best-effort remote sync.
+    void nudgeSync(repoPath, epicId, "releasing");
   }
 
   return NextResponse.json({ item: await beads.show(repoPath, epicId) });
