@@ -24,8 +24,11 @@ once per repo; it is **idempotent** — it skips anything already present, so re
 
 ## 2. Initialize beads
 
-If `.beads/` is absent, run `bd init`. Then confirm `bd ready --json` works. If `bd init` errors,
-**stop and say so** — do not leave a half-initialized project. If `.beads/` already exists, skip.
+If `.beads/` is absent, run `bd init --skip-agents`. The `--skip-agents` flag is required: a bare
+`bd init` writes/updates `AGENTS.md` by default, which would edit the repo's agent instructions
+before the consent gate in step 6 — pass `--skip-agents` so anton only touches `AGENTS.md` with
+the user's say-so. Then confirm `bd ready --json` works. If `bd init` errors, **stop and say so** —
+do not leave a half-initialized project. If `.beads/` already exists, skip.
 
 ## 3. Detect the stack
 
@@ -47,9 +50,11 @@ the agent set anywhere here — just report the detected stack and note which ag
 
 ## 4. Generate `.product/`
 
-Copy the shapes from the **`templates/.product/`** directory bundled alongside this skill (it sits
-in this skill's own directory, so it travels with `/setup` into any repo) into the repo's
-`.product/`. **Idempotent — skip any file that already exists; never overwrite.** Create:
+Copy the shapes from the **`${CLAUDE_SKILL_DIR}/templates/.product/`** directory bundled alongside
+this skill into the repo's `.product/`. `${CLAUDE_SKILL_DIR}` is the directory holding this
+`SKILL.md`, so it resolves to the templates whether `/setup` is installed globally
+(`~/.claude/skills/setup/`) or per-project — **not** the current working directory. **Idempotent —
+skip any file that already exists; never overwrite.** Create:
 
 - **`PRODUCT.md`** — from the template, then fill it from the interview in step 5. Set the
   `## Stack` section from the detection in step 3.
