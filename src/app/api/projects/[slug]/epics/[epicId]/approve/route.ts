@@ -3,6 +3,7 @@ import { getBoard } from "@/lib/board";
 import { epicStandaloneBlockers, standaloneBlockers } from "@/lib/epic-graph";
 import { refreshAllIssues } from "@/lib/beads/issues";
 import { beads } from "@/lib/beads/bd";
+import { conflictBody, ownerOf, setAssigneeIfOwner } from "@/lib/beads/claim";
 import { enqueueExecuteEpic, hasExecuteEpicRun } from "@/lib/jobs/service";
 import { resolveOperator } from "@/lib/operator";
 import { getProjectBySlug } from "@/lib/projects";
@@ -113,7 +114,7 @@ export async function POST(
   if (!current) {
     return NextResponse.json({ error: `Ticket ${epicId} not found on the board` }, { status: 404 });
   }
-  const owner = current.assignee?.trim() || undefined;
+  const owner = ownerOf(current);
   // Whether approval is the RUN TRIGGER on this request, or just settles ownership. Read before the
   // approve below, which would otherwise make every request look like a re-approve. See the enqueue
   // gate at the end for why a re-approve must not start a second run.
@@ -147,10 +148,19 @@ export async function POST(
   }
   // Auto-claim before enqueuing: an unclaimed target (or one being stolen) gets assigned to the
   // approver so the reservation is set BEFORE the runtime execution-claim, closing the gap where a
-  // teammate could claim between approve and the runner. Re-approving one you already own is a no-op
-  // here (idempotent). Skipped when no operator identity resolves (can't name an assignee).
-  if (operator && owner !== operator) {
-    await beads.assign(project.repoPath, epicId, operator);
+  // teammate could claim between approve and the runner. Skipped when no operator identity resolves
+  // (can't name an assignee).
+  //
+  // Conditional on the assignee still being `owner` — the value the steal gate above decided from.
+  // `bd assign` is an unconditional assignee update, so the re-read alone doesn't close the window:
+  // a teammate claiming between that read and this write would have their fresh reservation
+  // overwritten without `{ steal: true }`, and approval would then enqueue a run under it. Losing
+  // the swap means ownership moved after we checked, so the approval must not proceed on a stale
+  // decision — 409 and let the operator re-decide against the state as it now is. Re-approving one
+  // you already own swaps owner→owner: no write, just a verification that it's still yours.
+  if (operator) {
+    const swap = await setAssigneeIfOwner(project.repoPath, epicId, owner, operator);
+    if (!swap.ok) return NextResponse.json(conflictBody(epicId, swap.owner), { status: 409 });
   }
 
   await beads.approve(project.repoPath, epicId);

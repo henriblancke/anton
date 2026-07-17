@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { beads, type Bead } from "@/lib/beads/bd";
+import { conflictBody, ownerOf, setAssigneeIfOwner } from "@/lib/beads/claim";
 import { refreshAllIssues } from "@/lib/beads/issues";
 import { resolveOperator } from "@/lib/operator";
 import { resolveProject } from "../../../resolve-project";
@@ -24,11 +25,6 @@ function notRunnableReason(id: string, target: Bead): string {
   return (type === "task" || type === "bug") && parent
     ? `${id} is a child ticket of ${parent} — claim its epic ${parent} instead; a child is reserved via its epic, not on its own`
     : `${id} is not a run target: type "${type}" — only an epic or a parentless task/bug can be claimed`;
-}
-
-/** The current holder of a claim, or undefined when the bead is unclaimed. */
-function currentOwner(target: Bead): string | undefined {
-  return target.assignee?.trim() || undefined;
 }
 
 /** Read the optional `{ steal?: boolean }` body; a missing/invalid body means no steal. */
@@ -115,7 +111,7 @@ export async function POST(
     );
   }
 
-  const owner = currentOwner(target);
+  const owner = ownerOf(target);
   // Already claimed by someone else → stealing must be explicit, so a claim can't silently stomp a
   // teammate's reservation. Re-claiming your own is idempotent and needs no steal.
   if (owner && owner !== operator && !(await readSteal(request))) {
@@ -125,7 +121,13 @@ export async function POST(
     );
   }
 
-  await beads.assign(repoPath, epicId, operator);
+  // Conditional write: `bd assign` is unconditional, so gating on `owner` alone would let two
+  // operators both pass the check above against the same snapshot and have the later write stomp
+  // the earlier claim — both answering 200. Swap only if the assignee is still what we gated on,
+  // so the loser gets a 409 naming the winner. A steal is authorized against the owner the caller
+  // was shown; if someone else has since taken it, that authorization doesn't carry over.
+  const swap = await setAssigneeIfOwner(repoPath, epicId, owner, operator);
+  if (!swap.ok) return NextResponse.json(conflictBody(epicId, swap.owner), { status: 409 });
   await nudgeSync(repoPath, epicId, "claiming");
 
   return NextResponse.json({ item: await beads.show(repoPath, epicId) });
@@ -140,7 +142,7 @@ export async function DELETE(
   if (!loaded.ok) return loaded.response;
   const { repoPath, target } = loaded;
 
-  const owner = currentOwner(target);
+  const owner = ownerOf(target);
   if (owner) {
     // Releasing another operator's claim is itself a steal — gate it the same way as taking one over
     // so a release can't silently clear a teammate's reservation. An unclaimed target is a no-op.
@@ -167,7 +169,10 @@ export async function DELETE(
         );
       }
     }
-    await beads.unassign(repoPath, epicId);
+    // Same conditional write as POST: a release is a claim write too, so an unconditional
+    // `unassign` here would clear a reservation that changed hands after the gate above.
+    const swap = await setAssigneeIfOwner(repoPath, epicId, owner, undefined);
+    if (!swap.ok) return NextResponse.json(conflictBody(epicId, swap.owner), { status: 409 });
     await nudgeSync(repoPath, epicId, "releasing");
   }
 
