@@ -81,6 +81,17 @@ describe("createAssigneeSwap", () => {
     expect(calls.filter((c) => c.startsWith("assign"))).toEqual([]);
   });
 
+  it("is idempotent when a duplicate same-actor claim raced off the same unclaimed snapshot", async () => {
+    // Two requests from one operator (Claim in two tabs, or Claim and Approve together) both gated on
+    // `undefined`. The first swap already set the assignee to alice; the second re-reads alice as the
+    // owner and must report success — the owner it wanted already holds it — not a 409, even though
+    // `before` (alice) no longer matches its `expectedOwner` (undefined).
+    const { store, calls } = fakeStore("alice");
+    const swap = createAssigneeSwap(store);
+    await expect(swap("/repo", "bd-1", undefined, "alice")).resolves.toEqual({ ok: true });
+    expect(calls.filter((c) => c.startsWith("assign"))).toEqual([]); // no redundant write
+  });
+
   it("releases a claim, and refuses to release one that changed hands", async () => {
     const held = fakeStore("alice");
     const releaseSwap = createAssigneeSwap(held.store);

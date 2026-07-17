@@ -97,10 +97,17 @@ export function createClaimGuard(store: AssigneeStore = beads): ClaimGuard {
       // Re-read inside the lock: `expectedOwner` came from a snapshot the caller took before its
       // gates ran, and a claim landing in that window must lose here rather than be overwritten.
       const before = ownerOf(await store.show(repoPath, id));
-      if (before !== expectedOwner) return { ok: false, owner: before };
-      // Already where we want it (re-claiming your own, releasing an unclaimed target) — writing
-      // would be a no-op, so skip bd entirely and stay idempotent.
+      // Already where we want it — the desired owner already holds it (re-claiming your own, a
+      // duplicate same-actor Claim/Approve off one snapshot, releasing an unclaimed target). Writing
+      // would be a no-op, so skip bd and stay idempotent. Checked BEFORE the mismatch guard on
+      // purpose: when two requests from one operator start from the same unclaimed snapshot, the
+      // winner sets the owner to exactly what the loser also wanted, so `before !== expectedOwner`
+      // would otherwise turn the loser into a spurious 409 even though the end state it asked for
+      // already holds.
       if (before === next) return { ok: true };
+      // A different owner landed in the window (a real steal by someone else) — lose here rather
+      // than overwrite it, and name who holds the claim now.
+      if (before !== expectedOwner) return { ok: false, owner: before };
 
       if (next) await store.assign(repoPath, id, next);
       else await store.unassign(repoPath, id);
