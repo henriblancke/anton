@@ -213,6 +213,7 @@ function TicketDialogBody({
                 owner={detail.assignee}
                 variant="row"
                 readOnly={detail.approved}
+                canTakeOver={detail.stage === "backlog"}
                 onChanged={() => setAttempt((n) => n + 1)}
               />
             )}

@@ -282,6 +282,7 @@ export function EpicDetailView({ slug, epicId }: { slug: string; epicId: string 
                   owner={epic.assignee}
                   variant="row"
                   readOnly={epic.approved}
+                  canTakeOver={epic.stage === "backlog"}
                   onChanged={() => setAttempt((n) => n + 1)}
                 />
               </dd>

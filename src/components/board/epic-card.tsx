@@ -157,7 +157,13 @@ export function EpicCard({
 
       {epic.stage === "backlog" && !overlay && (
         <div className="mt-0.5 flex flex-col gap-2">
-          <ClaimControl slug={slug} itemId={epic.id} owner={epic.assignee} readOnly={approved} />
+          <ClaimControl
+            slug={slug}
+            itemId={epic.id}
+            owner={epic.assignee}
+            readOnly={approved}
+            canTakeOver={epic.stage === "backlog"}
+          />
           <div className="flex items-center gap-2">
           {showApprove && (
             <Button

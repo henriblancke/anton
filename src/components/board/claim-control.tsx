@@ -16,6 +16,10 @@ import { useOperator } from "@/lib/use-operator";
  *   - claimed by me    → Release (DELETE /epics/<id>/claim)
  *   - claimed by other → Steal   (POST … { steal: true }), with the owner shown
  *
+ * Once approved the claim route locks the assignee (409), and ownership moves only via
+ * steal-on-approve. `readOnly` + `canTakeOver` surfaces that one path as Take over
+ * (POST /epics/<id>/approve { steal: true }) so the documented flow is reachable from the UI.
+ *
  * Writes are optimistic: the shown owner flips immediately and reverts on failure, and the route's
  * error (which names the current owner + the required action, e.g. a lost steal race) surfaces as a
  * toast. `owner` is the server truth (the bead's assignee); when a later poll/refetch moves it past
@@ -28,6 +32,7 @@ export function ClaimControl({
   operator: operatorProp,
   variant = "chip",
   readOnly = false,
+  canTakeOver = false,
   className,
   onChanged,
 }: {
@@ -40,11 +45,20 @@ export function ClaimControl({
   /** `chip` — compact, for board cards/chips. `row` — inline, for the detail assignee rows. */
   variant?: "chip" | "row";
   /**
-   * Show the owner without any claim/release/steal control. Set once a target is approved/locked:
-   * the claim route 409s any write to an approved target (ownership then changes only via Approve's
+   * Drop the claim/release/steal controls. Set once a target is approved/locked: the claim route
+   * 409s any write to an approved target (ownership then changes only via Approve's
    * steal-on-approve), so offering an action that can't succeed would be misleading.
    */
   readOnly?: boolean;
+  /**
+   * Whether steal-on-approve is a safe take-over here — only true where the caller knows re-approving
+   * won't start a second run. Set it for a `backlog` target: approval there means a run is queued but
+   * not yet started, and the enqueue is deduped per project+epic, so re-approving with `{ steal: true }`
+   * only reassigns the bead. Past backlog the prior job may be done/parked, where a re-approve would
+   * enqueue a NEW run — a take-over must never do that, so callers leave this false and the owner
+   * stays read-only. Only consulted with `readOnly`; an unapproved target uses the claim-route Steal.
+   */
+  canTakeOver?: boolean;
   className?: string;
   /** Fired with the new owner after a successful write so callers can refetch/update their copy. */
   onChanged?: (owner: string | null) => void;
@@ -69,18 +83,24 @@ export function ClaimControl({
   const known = typeof operator === "string" && operator.length > 0;
   const mine = known && owner === operator;
 
-  async function act(kind: "claim" | "release" | "steal") {
+  async function act(kind: Action) {
     const base = normalizedServerOwner;
     const optimisticValue = kind === "release" ? null : (operator ?? owner);
     setBusy(true);
     setOverride({ base, value: optimisticValue });
     try {
-      const res = await fetch(`/api/projects/${slug}/epics/${itemId}/claim`, {
-        method: kind === "release" ? "DELETE" : "POST",
-        ...(kind === "steal"
-          ? { headers: { "content-type": "application/json" }, body: JSON.stringify({ steal: true }) }
-          : {}),
-      });
+      // Take over goes to the approve route (the claim route 409s an approved target); both routes
+      // answer with `{ item: { assignee } }` and an `{ error }` naming the owner, so the response
+      // handling below is shared.
+      const res = await fetch(
+        `/api/projects/${slug}/epics/${itemId}/${kind === "takeover" ? "approve" : "claim"}`,
+        {
+          method: kind === "release" ? "DELETE" : "POST",
+          ...(kind === "steal" || kind === "takeover"
+            ? { headers: { "content-type": "application/json" }, body: JSON.stringify({ steal: true }) }
+            : {}),
+        },
+      );
       const data = (await res.json().catch(() => null)) as { item?: { assignee?: string | null }; error?: string } | null;
       if (!res.ok) throw new Error(data?.error ?? `${LABEL[kind]} failed (${res.status})`);
       // Normalize the same way as the prop: a release response carries assignee "" — fold it to null
@@ -99,6 +119,10 @@ export function ClaimControl({
 
   const isRow = variant === "row";
   const label = owner ?? "Unclaimed";
+  // The one ownership move an approved target allows: steal-on-approve, offered only where the caller
+  // vouched it won't start a second run (`canTakeOver`). Nothing to take over when it's unclaimed or
+  // already ours.
+  const takeOverable = readOnly && canTakeOver && known && owner !== null && !mine;
 
   return (
     <span
@@ -117,7 +141,9 @@ export function ClaimControl({
         title={
           readOnly
             ? owner
-              ? `Claimed by ${owner} — locked while approved (take over via Approve)`
+              ? takeOverable
+                ? `Claimed by ${owner} — approved; take over re-approves it under your name`
+                : `Claimed by ${owner} — locked while approved`
               : "Unclaimed — locked while approved"
             : owner
               ? `Claimed by ${owner}`
@@ -128,7 +154,14 @@ export function ClaimControl({
         <span className="truncate">{mine ? "You" : label}</span>
       </span>
 
-      {readOnly ? null : owner === null ? (
+      {readOnly ? (
+        takeOverable ? (
+          <Button size="xs" variant="outline" onClick={() => act("takeover")} disabled={busy}>
+            <UserPlusIcon aria-hidden="true" />
+            {busy ? "Taking over…" : "Take over"}
+          </Button>
+        ) : null
+      ) : owner === null ? (
         known ? (
           <Button size="xs" variant="outline" onClick={() => act("claim")} disabled={busy}>
             <UserPlusIcon aria-hidden="true" />
@@ -149,16 +182,20 @@ export function ClaimControl({
   );
 }
 
-const LABEL: Record<"claim" | "release" | "steal", string> = {
+type Action = "claim" | "release" | "steal" | "takeover";
+
+const LABEL: Record<Action, string> = {
   claim: "Claim",
   release: "Release",
   steal: "Steal",
+  takeover: "Take over",
 };
 
-const TOAST: Record<"claim" | "release" | "steal", string> = {
+const TOAST: Record<Action, string> = {
   claim: "Claimed",
   release: "Released",
   steal: "Claim stolen",
+  takeover: "Taken over",
 };
 
 /**

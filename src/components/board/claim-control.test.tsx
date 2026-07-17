@@ -57,6 +57,47 @@ describe("ClaimControl", () => {
     expect(html).not.toMatch(/>Claim</);
   });
 
+  it("offers Take over on an approved target another operator holds when steal-on-approve is safe", () => {
+    // The claim route 409s an approved target, so Steal is gone — but steal-on-approve is still a
+    // valid move for a backlog target (the enqueue dedupes, so no second run). Surface it, or the
+    // documented take-over flow would be unreachable from the UI.
+    const html = renderToStaticMarkup(
+      <ClaimControl slug="anton" itemId="e-1" owner="bob" operator="alice" readOnly canTakeOver />,
+    );
+    expect(html).toContain("bob");
+    expect(html).toMatch(/Take over/);
+    expect(html).not.toMatch(/Steal/);
+  });
+
+  it("keeps an approved target read-only when a take-over would start a second run", () => {
+    // Past backlog the prior job may be done/parked, where re-approving enqueues a NEW run. A
+    // take-over must never do that, so callers leave canTakeOver false and no action is offered.
+    const html = renderToStaticMarkup(
+      <ClaimControl slug="anton" itemId="e-1" owner="bob" operator="alice" readOnly />,
+    );
+    expect(html).toContain("bob");
+    expect(html).not.toMatch(/Take over/);
+    expect(html).not.toMatch(/Steal/);
+  });
+
+  it("does not offer Take over without an operator identity to reassign to", () => {
+    // The approve route 409s a steal it can't attribute to an operator, so the button would only
+    // ever fail.
+    const html = renderToStaticMarkup(
+      <ClaimControl slug="anton" itemId="e-1" owner="bob" operator={null} readOnly canTakeOver />,
+    );
+    expect(html).toContain("bob");
+    expect(html).not.toMatch(/Take over/);
+  });
+
+  it("does not offer Take over on a claim that is already mine", () => {
+    const html = renderToStaticMarkup(
+      <ClaimControl slug="anton" itemId="e-1" owner="alice" operator="alice" readOnly canTakeOver />,
+    );
+    expect(html).toContain("You");
+    expect(html).not.toMatch(/Take over/);
+  });
+
   it("shows the owner read-only until the operator identity resolves", () => {
     // operator=null (resolved to "nobody") still can't claim someone else's — no Steal/Release,
     // but the owner is always visible.

@@ -133,7 +133,13 @@ export function StandaloneChip({
 
       {item.stage === "backlog" && (
         <div className={cn("relative z-[1] flex items-center", onOpen && "pointer-events-none")}>
-          <ClaimControl slug={slug} itemId={item.id} owner={item.assignee} readOnly={approved} />
+          <ClaimControl
+            slug={slug}
+            itemId={item.id}
+            owner={item.assignee}
+            readOnly={approved}
+            canTakeOver={item.stage === "backlog"}
+          />
         </div>
       )}
     </div>
