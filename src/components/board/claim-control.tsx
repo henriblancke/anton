@@ -203,13 +203,16 @@ const TOAST: Record<Action, string> = {
  * control of its own (claims live on the run target — the epic — not per child).
  */
 export function InheritedOwner({
-  owner,
+  owner: epicOwner,
   className,
 }: {
   /** The parent epic's assignee; null when the epic is unclaimed. */
   owner: string | null;
   className?: string;
 }) {
+  // A released epic claim arrives as "" (`bd assign <id> ""`), which would otherwise render as a
+  // blank owner under an "unclaimed" title. Fold it to null exactly as ClaimControl does.
+  const owner = epicOwner?.trim() || null;
   return (
     <span
       className={cn("inline-flex items-center gap-1", owner ? "text-foreground/85" : "text-subtle", className)}

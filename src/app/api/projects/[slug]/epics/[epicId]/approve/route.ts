@@ -102,12 +102,18 @@ export async function POST(
     }
   }
 
-  // Enforce the claim as a soft-lock at the run trigger. `target` was read via refreshAllIssues
-  // above (the same fresh path this route already uses), so a teammate's just-landed claim is
-  // visible here — not read from a warm snapshot. Approval is the run trigger, so ownership must be
-  // settled before we label + enqueue.
+  // Enforce the claim as a soft-lock at the run trigger. Re-read the assignee HERE rather than
+  // reusing `target` from the refreshAllIssues above: the board load and blocker gates in between
+  // are several bd/graph reads wide, and a teammate claiming inside that window would otherwise be
+  // invisible — the auto-claim below would silently steal their fresh reservation without
+  // `{ steal: true }` and enqueue a run under it. Approval is the run trigger, so ownership must be
+  // settled from the state as it is at the moment we take it.
   const operator = await resolveOperator();
-  const owner = target.assignee?.trim() || undefined;
+  const current = await beads.show(project.repoPath, epicId);
+  if (!current) {
+    return NextResponse.json({ error: `Ticket ${epicId} not found on the board` }, { status: 404 });
+  }
+  const owner = current.assignee?.trim() || undefined;
   const steal = await readSteal(request);
   if (owner && owner !== operator) {
     // Claimed by someone else → approving would silently run a teammate's reservation. Require an

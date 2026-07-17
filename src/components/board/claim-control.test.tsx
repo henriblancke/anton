@@ -124,4 +124,10 @@ describe("InheritedOwner", () => {
     const html = renderToStaticMarkup(<InheritedOwner owner={null} />);
     expect(html).toContain("Unclaimed");
   });
+
+  it("reads as Unclaimed for a released epic claim, which beads reports as an empty assignee", () => {
+    const html = renderToStaticMarkup(<InheritedOwner owner="" />);
+    expect(html).toContain("Unclaimed");
+    expect(html).toContain("The epic is unclaimed");
+  });
 });
