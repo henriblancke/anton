@@ -177,9 +177,10 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //    the assumption the reservation just moves, but the jobs table is machine-local: this stale
       //    job still sits on the ORIGINAL operator's instance. Running it now would execute under the
       //    new owner's reservation — the exact "run under someone else's claim" state the soft-lock
-      //    forbids (DESIGN.md §Soft-lock) — and the best-effort claim below would swallow the conflict
-      //    and proceed rather than stop. So gate on ownership FIRST, like the ticket-claim hard gate
-      //    in runTicket. Re-read the owner here (not from the job-start snapshot): the worktree warm
+      //    forbids (DESIGN.md §Soft-lock). So gate on ownership FIRST — like the ticket-claim hard gate
+      //    in runTicket — AND make the claim itself hard (below): a steal landing between this read and
+      //    the claim is caught by `bd update --claim` refusing to reassign, not swallowed by `safe`.
+      //    Re-read the owner here (not from the job-start snapshot): the worktree warm
       //    above is several ops wide, so ownership settles against current state, mirroring the approve
       //    route re-reading the assignee at its own run trigger. PARK (not fail) on a mismatch —
       //    recoverable, it stops the stale run without stomping the new owner, and the current owner
@@ -194,7 +195,28 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
             `as ${currentOwner} to start a run under the current owner.`,
         );
       }
-      await safe(() => beads.claim(repo, epicBeadId, operator));
+      if (operator) {
+        // Fold the ownership gate INTO the claim so a take-over that lands in the window between the
+        // read above and this write can't slip through. `bd update --claim` refuses to reassign a
+        // bead a different operator now holds, so it — not the stale pre-read — is the operation that
+        // actually observes a racing steal. That refusal MUST stop the run (like runTicket's ticket
+        // hard gate), never be swallowed by `safe`: swallowing would tag and execute the epic under
+        // the new owner's reservation, the exact state the soft-lock forbids. Idempotent on resume
+        // (re-claiming as the same actor succeeds), so a retry re-claims cleanly.
+        try {
+          await beads.claim(repo, epicBeadId, operator);
+        } catch (e) {
+          throw new PoisonEpic(
+            `${epicBeadId} could not be claimed for ${operator} — it was taken over after this run ` +
+              `was queued; refusing to run under another operator's claim. Approve ${epicBeadId} as ` +
+              `its current owner to start a run under them. ` +
+              `(${e instanceof Error ? e.message : String(e)})`,
+          );
+        }
+      } else {
+        // No operator identity → can't assert ownership; keep the prior best-effort claim.
+        await safe(() => beads.claim(repo, epicBeadId, operator));
+      }
       await safe(() => beads.tag(repo, epicBeadId, [LABELS.stage("implementing")]));
       void beads
         .sync(repo)
