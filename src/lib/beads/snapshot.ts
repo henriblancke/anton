@@ -1,4 +1,4 @@
-import type { Bead } from "./bd";
+import type { Bead } from "./types";
 
 export const ISSUE_SNAPSHOT_MAX_AGE_MS = 30_000;
 

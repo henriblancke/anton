@@ -7,35 +7,13 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { invalidateIssueSnapshot } from "./snapshot";
 
+// Bead/BeadDep live in the leaf ./types module so snapshot.ts can share them without importing
+// bd.ts back (breaking the bd ↔ snapshot cycle, anton-mur). Re-exported here so every existing
+// `from ".../beads/bd"` import keeps working.
+export type { Bead, BeadDep } from "./types";
+import type { Bead } from "./types";
+
 const execFileAsync = promisify(execFile);
-
-export interface Bead {
-  id: string;
-  title: string;
-  status: string; // open | in_progress | blocked | closed | ...
-  issue_type?: string; // epic | task | bug | ...
-  description?: string;
-  acceptance?: string;
-  acceptance_criteria?: string; // the field bd show/dep return
-  context?: string;
-  labels?: string[];
-  external_ref?: string;
-  priority?: number;
-  assignee?: string | null; // who claimed the bead; null/absent when unclaimed
-  created_at?: string; // ISO timestamp
-  created_by?: string | null; // who created the bead
-  parent?: string; // parent epic id (present in `bd list --json` for structured boards)
-  parent_id?: string;
-  dependencies?: BeadDep[]; // edges carried inline by `bd list --json`
-  dependency_type?: string; // set on beads returned by `bd dep list`
-  [k: string]: unknown;
-}
-
-export interface BeadDep {
-  issue_id: string; // the dependent
-  depends_on_id: string; // what it depends on / is a child of
-  type: string; // parent-child | blocks | related | discovered-from
-}
 
 export const LABELS = {
   approved: "approved",
