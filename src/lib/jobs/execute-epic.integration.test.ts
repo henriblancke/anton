@@ -939,6 +939,76 @@ process.exit(0);`,
     expect((await beads.show(repo, ticket5)).status).not.toBe("closed");
   }, 60_000);
 
+  it("parks an owned epic when the runner has no operator identity (anton-i71 review)", async () => {
+    // Same soft-lock as the take-over above, but the runner can't resolve an operator at all
+    // (no ANTON_OPERATOR, no global git user.name) — an older queued job on an unconfigured
+    // instance. The no-operator path used to keep a best-effort `safe` claim, which swallows bd's
+    // refusal to reassign a foreign bead and would run the epic under the new owner's reservation.
+    // With no identity to assert AND an epic now owned by someone, the runner must PARK instead.
+    const epic6 = await beads.create(repo, {
+      title: "Feature W",
+      type: "epic",
+      description: "## Goal\nW",
+    });
+    await beads.approve(repo, epic6);
+    const ticket6 = (() => {
+      const p = JSON.parse(
+        execFileSync(
+          "bd",
+          ["create", "W ticket", "--type", "task", "--parent", epic6, "--acceptance", "x", "--json"],
+          { cwd: repo, encoding: "utf8" },
+        ),
+      );
+      return (Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string;
+    })();
+    // Another operator owns it before the lease, exactly as in the take-over case.
+    await beads.assign(repo, epic6, "thief-operator");
+
+    // Strip this runner of any operator identity: unset ANTON_OPERATOR and point git's global
+    // config at /dev/null so `git config --global user.name` resolves nothing → resolveOperator()
+    // returns undefined. Restored in `finally` so later tests keep the suite's test-operator.
+    const savedOperator = process.env.ANTON_OPERATOR;
+    const savedGitGlobal = process.env.GIT_CONFIG_GLOBAL;
+    delete process.env.ANTON_OPERATOR;
+    process.env.GIT_CONFIG_GLOBAL = "/dev/null";
+    resetOperatorCache();
+    try {
+      const runner = new JobRunner({
+        db: tdb.db,
+        clock,
+        config: { maxConcurrent: 1, leaseMs: 30_000 },
+      });
+      runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      const jobId = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: epic6 },
+      });
+      await runner.tickOnce();
+      await runner.whenIdle();
+
+      // Poison → job parked; the reason names the epic and the operator that now owns it.
+      const job = await getJob(tdb.db, jobId);
+      expect(job?.status).toBe("parked");
+      expect(job?.lastError).toContain(epic6);
+      expect(job?.lastError).toContain("thief-operator");
+
+      // The owner's reservation is intact and nothing ran under it.
+      const epic = await beads.show(repo, epic6);
+      expect(epic.assignee).toBe("thief-operator");
+      expect(epic.labels ?? []).not.toContain("stage:in-review");
+      expect((await beads.show(repo, ticket6)).status).not.toBe("closed");
+    } finally {
+      if (savedOperator === undefined) delete process.env.ANTON_OPERATOR;
+      else process.env.ANTON_OPERATOR = savedOperator;
+      if (savedGitGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+      else process.env.GIT_CONFIG_GLOBAL = savedGitGlobal;
+      resetOperatorCache();
+    }
+  }, 60_000);
+
   it("parks a run whose ticket needs a disabled agent, and completes it once re-enabled (anton-dm7)", async () => {
     // Dispatch honors the active-agents allowlist: a ticket labeled with a disabled agent must
     // NOT run with the default agent — the run parks with a clear reason before any claim or

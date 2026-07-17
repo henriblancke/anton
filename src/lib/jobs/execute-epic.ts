@@ -237,8 +237,24 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
               `(${e instanceof Error ? e.message : String(e)})`,
           );
         }
+      } else if (currentOwner) {
+        // No operator identity, but the epic is owned by someone. We can't assert we ARE that
+        // owner, and a best-effort `safe` claim would swallow bd's refusal to reassign a foreign
+        // bead — tagging and running the epic under the current owner's reservation, the exact
+        // state the soft-lock forbids (DESIGN.md §Soft-lock). So mirror the pre-read gate above
+        // and PARK: this is an older queued approved-but-unassigned job on an instance without
+        // ANTON_OPERATOR/global user.name, and another operator took the epic over before the
+        // lease. Poison (recoverable) — a human must re-approve as the current owner to enqueue a
+        // run under their identity. Retrying is pointless: this runner still can't assert ownership.
+        throw new PoisonEpic(
+          `${epicBeadId} is reserved by ${currentOwner}, but this runner has no operator identity ` +
+            `(set ANTON_OPERATOR or the global git user.name) to assert ownership — refusing to ` +
+            `run under another operator's claim. Approve ${epicBeadId} as ${currentOwner} to start ` +
+            `a run under the current owner.`,
+        );
       } else {
-        // No operator identity → can't assert ownership; keep the prior best-effort claim.
+        // No operator identity AND the epic is unowned → nobody's reservation to stomp, so keep
+        // the prior best-effort claim (bd falls back to its own actor resolution).
         await safe(() => beads.claim(repo, epicBeadId, operator));
       }
       await safe(() => beads.tag(repo, epicBeadId, [LABELS.stage("implementing")]));
