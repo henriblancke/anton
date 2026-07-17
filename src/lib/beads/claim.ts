@@ -137,11 +137,24 @@ export function createClaimGuard(store: AssigneeStore = beads): ClaimGuard {
  * The process-wide claim guard. Claim and approve both go through THIS instance — a per-module
  * guard would let them race each other, which is exactly the approve-vs-claim window the soft-lock
  * has to cover.
+ *
+ * Anchored on globalThis via Symbol.for for the same cross-bundle reason as bd.ts's sync
+ * singletons: the /claim and /approve route handlers can load DIFFERENT compiled instances of this
+ * module, and two guards with separate `chains` maps serialize nothing against each other.
  */
-export const claimGuard = createClaimGuard();
+const CLAIM_GUARD_KEY = Symbol.for("anton.beads.claimGuard");
+export const claimGuard = ((globalThis as unknown as Record<symbol, ClaimGuard>)[
+  CLAIM_GUARD_KEY
+] ??= createClaimGuard());
 
 /** Run `fn` under `id`'s claim-write lock. See {@link ClaimGuard.withClaimLock}. */
-export const withClaimLock = claimGuard.withClaimLock;
+export const withClaimLock: ClaimGuard["withClaimLock"] = (repoPath, id, fn) =>
+  claimGuard.withClaimLock(repoPath, id, fn);
 
 /** Set `id`'s assignee to `next` (undefined releases it) only if it still reads as `expectedOwner`. */
-export const setAssigneeIfOwner = claimGuard.setAssigneeIfOwner;
+export const setAssigneeIfOwner: ClaimGuard["setAssigneeIfOwner"] = (
+  repoPath,
+  id,
+  expectedOwner,
+  next,
+) => claimGuard.setAssigneeIfOwner(repoPath, id, expectedOwner, next);
