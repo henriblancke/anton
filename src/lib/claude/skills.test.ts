@@ -61,4 +61,39 @@ describe("required skill assets", () => {
       expect(readFileSync(skillPath(name), "utf8")).toMatch(/`bd` skill/);
     }
   });
+
+  it("shape and scan-triage warn about missing .product/ and point at /setup", () => {
+    // If .product/ is absent, these skills must not shape/triage against a vacuum — they warn
+    // explicitly and direct the user at the now-bundled /setup (anton-olh).
+    for (const name of ["shape", "scan-triage"] as const) {
+      const raw = readFileSync(skillPath(name), "utf8");
+      expect(raw).toMatch(/`.product\/` is missing/);
+      expect(raw).toMatch(/`\/setup`/);
+    }
+  });
+
+  // `setup` is bundled (so `/setup` resolves in a target repo) but founder-run, not loaded by
+  // anton's runtime for a background job — so it lives outside REQUIRED_SKILLS (anton-olh).
+  describe("bundled setup skill", () => {
+    const raw = readFileSync(skillPath("setup"), "utf8");
+
+    it("is not in the runtime-required set", () => {
+      expect([...REQUIRED_SKILLS]).not.toContain("setup");
+    });
+
+    it("has frontmatter whose name matches its directory + a non-empty body", () => {
+      const fm = frontmatter(raw);
+      expect(fm.name).toBe("setup");
+      expect(fm.description && fm.description.length).toBeGreaterThan(0);
+      expect(stripFrontmatter(raw).trim().length).toBeGreaterThan(0);
+    });
+
+    it("is de-loomed and scaffolds from anton's bundled templates", () => {
+      const body = stripFrontmatter(raw);
+      expect(body).not.toMatch(/loom/i);
+      expect(body).not.toMatch(/foolery/i);
+      expect(body).toMatch(/anton\/templates\/\.product\//);
+      expect(body).toMatch(/bd init/);
+    });
+  });
 });
