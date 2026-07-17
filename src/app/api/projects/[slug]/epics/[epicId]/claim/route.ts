@@ -110,23 +110,31 @@ function approvedLockResponse(epicId: string): NextResponse {
 }
 
 /**
- * The approved gate above reads a bead loaded before this route's own gates ran, so an approval
- * landing in that window would slip past it. Re-check under the claim-write lock — the same lock the
- * approve route holds across its swap AND its `approved` label — and only then swap. That makes the
- * two routes strictly ordered on one bead: a claim either wins the lock and writes while the target
- * is genuinely unapproved (and approve's swap then 409s on the changed owner), or it takes the lock
- * after the label and is refused here. Without the re-check, a steal could still land on a target
- * approve had already decided to run, leaving a queued run executing under an owner who never
- * approved it.
+ * The backlog gates in `loadTarget` (approved-label AND derived-stage) read a bead loaded before
+ * this route's own gates ran, so a state change landing in that window would slip past them. Re-read
+ * under the claim-write lock — the same lock the approve route holds across its swap AND its
+ * `approved` label — and re-run BOTH backlog checks before swapping. That makes the two routes
+ * strictly ordered on one bead: a claim either wins the lock and writes while the target is genuinely
+ * an unapproved backlog ticket (and approve's swap then 409s on the changed owner), or it takes the
+ * lock after the state changed and is refused here.
+ *
+ * Re-checking only `approved` is not enough: `swap` compares the assignee alone, so an unapproved
+ * target that left backlog under the lock window — a run flipping the bead to `in_progress` while
+ * keeping the same assignee (the runner claims under the human's reservation), or a manual
+ * `bd update --claim` — would still let a steal/release overwrite or clear that live execution claim.
+ * Re-deriving the stage here refuses every non-backlog state, mirroring `loadTarget`'s own gate.
  */
-async function swapUnlessApproved(
+async function swapIfBacklog(
   repoPath: string,
   epicId: string,
   owner: string | undefined,
   next: string | undefined,
-): Promise<SwapResult | "approved"> {
+): Promise<SwapResult | "approved" | { leftBacklog: Stage }> {
   return withClaimLock(repoPath, epicId, async (swap) => {
-    if (beads.isApproved(await beads.show(repoPath, epicId))) return "approved" as const;
+    const fresh = await beads.show(repoPath, epicId);
+    if (beads.isApproved(fresh)) return "approved" as const;
+    const stage = deriveStage(fresh);
+    if (stage !== "backlog") return { leftBacklog: stage } as const;
     return swap(owner, next);
   });
 }
@@ -170,8 +178,9 @@ export async function POST(
   // the earlier claim — both answering 200. Swap only if the assignee is still what we gated on,
   // so the loser gets a 409 naming the winner. A steal is authorized against the owner the caller
   // was shown; if someone else has since taken it, that authorization doesn't carry over.
-  const swap = await swapUnlessApproved(repoPath, epicId, owner, operator);
+  const swap = await swapIfBacklog(repoPath, epicId, owner, operator);
   if (swap === "approved") return approvedLockResponse(epicId);
+  if ("leftBacklog" in swap) return notBacklogResponse(epicId, swap.leftBacklog);
   if (!swap.ok) return NextResponse.json(conflictBody(epicId, swap.owner), { status: 409 });
   // Fire-and-forget (like the runner's claim sync in execute-epic): the assignee write already
   // succeeded, so don't make the response wait on a shell-out to `bd dolt pull/commit/push` that a
@@ -220,8 +229,9 @@ export async function DELETE(
     // Same conditional write as POST: a release is a claim write too, so an unconditional
     // `unassign` here would clear a reservation that changed hands — or that approval locked —
     // after the gates above.
-    const swap = await swapUnlessApproved(repoPath, epicId, owner, undefined);
+    const swap = await swapIfBacklog(repoPath, epicId, owner, undefined);
     if (swap === "approved") return approvedLockResponse(epicId);
+    if ("leftBacklog" in swap) return notBacklogResponse(epicId, swap.leftBacklog);
     if (!swap.ok) return NextResponse.json(conflictBody(epicId, swap.owner), { status: 409 });
     // Fire-and-forget for the same reason as POST: the unassign already landed locally, so don't
     // block the release response on the best-effort remote sync.
