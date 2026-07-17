@@ -48,9 +48,9 @@ async function readSteal(request: Request): Promise<boolean> {
 async function loadTarget(
   slug: string,
   epicId: string,
-): Promise<{ repoPath: string; target: Bead; response?: undefined } | { response: NextResponse }> {
+): Promise<{ ok: true; repoPath: string; target: Bead } | { ok: false; response: NextResponse }> {
   const { project, response } = await resolveProject(slug);
-  if (!project) return { response };
+  if (!project) return { ok: false, response };
 
   // Force a fresh read (not a warm board snapshot) so the steal check and run-target gate decide
   // from the true current state — a claim added by a teammate seconds ago must be visible here.
@@ -58,6 +58,7 @@ async function loadTarget(
   const target = allBeads.find((b) => b.id === epicId);
   if (!target) {
     return {
+      ok: false,
       response: NextResponse.json(
         { error: `Ticket ${epicId} not found on the board` },
         { status: 404 },
@@ -65,7 +66,10 @@ async function loadTarget(
     };
   }
   if (!beads.isRunTarget(target)) {
-    return { response: NextResponse.json({ error: notRunnableReason(epicId, target) }, { status: 422 }) };
+    return {
+      ok: false,
+      response: NextResponse.json({ error: notRunnableReason(epicId, target) }, { status: 422 }),
+    };
   }
   // Once approved, the reservation is locked in by the approve flow (soft-lock + steal-on-approve):
   // the human-claim route must NOT mutate an approved target's assignee. Approval queues a run, and
@@ -75,6 +79,7 @@ async function loadTarget(
   // Approve (steal-on-approve), never through this route.
   if (beads.isApproved(target)) {
     return {
+      ok: false,
       response: NextResponse.json(
         {
           error: `${epicId} is already approved for a run — its reservation is locked; take it over via Approve (steal-on-approve), not the claim control`,
@@ -83,7 +88,7 @@ async function loadTarget(
       ),
     };
   }
-  return { repoPath: project.repoPath, target };
+  return { ok: true, repoPath: project.repoPath, target };
 }
 
 /** Best-effort sync so the claim/release reaches teammates within a heartbeat; never blocks. */
@@ -99,7 +104,7 @@ export async function POST(
 ) {
   const { slug, epicId } = await params;
   const loaded = await loadTarget(slug, epicId);
-  if (loaded.response) return loaded.response;
+  if (!loaded.ok) return loaded.response;
   const { repoPath, target } = loaded;
 
   const operator = await resolveOperator();
@@ -132,7 +137,7 @@ export async function DELETE(
 ) {
   const { slug, epicId } = await params;
   const loaded = await loadTarget(slug, epicId);
-  if (loaded.response) return loaded.response;
+  if (!loaded.ok) return loaded.response;
   const { repoPath, target } = loaded;
 
   const owner = currentOwner(target);
