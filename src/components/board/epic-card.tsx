@@ -33,8 +33,13 @@ export function EpicCard({
   /** Fired after this epic is deleted so the board can drop it from its columns. */
   onDeleted?: (epicId: string) => void;
 }) {
-  const [approved, setApproved] = useState(epic.approved);
+  // Optimistic override only — the source of truth is `epic.approved`, which a later board poll
+  // refreshes. Deriving from the prop (rather than seeding local state once) keeps the controls in
+  // sync when another operator approves the same epic between polls; the flag just locks it
+  // immediately on our own click and reverts on failure.
+  const [optimisticApproved, setOptimisticApproved] = useState(false);
   const [approving, setApproving] = useState(false);
+  const approved = epic.approved || optimisticApproved;
 
   async function handleDelete() {
     const res = await fetch(`/api/projects/${slug}/epics/${epic.id}`, { method: "DELETE" });
@@ -49,7 +54,7 @@ export function EpicCard({
 
   async function handleApprove() {
     setApproving(true);
-    setApproved(true);
+    setOptimisticApproved(true);
     try {
       const res = await fetch(`/api/projects/${slug}/epics/${epic.id}/approve`, { method: "POST" });
       if (!res.ok) {
@@ -58,7 +63,7 @@ export function EpicCard({
       }
       toast.success(`Approved "${epic.title}"`);
     } catch (err) {
-      setApproved(false);
+      setOptimisticApproved(false);
       toast.error(err instanceof Error ? err.message : "Failed to approve epic");
     } finally {
       setApproving(false);
