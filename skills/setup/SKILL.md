@@ -31,9 +31,14 @@ once per repo; it is **idempotent** — it skips anything already present, so re
 ## 2. Initialize beads
 
 Check for `.beads/` **at the repo root** (from step 1). If it is absent, run
-`bd init --skip-agents --skip-hooks` from the repo root. Both flags keep `bd init` from mutating
-the repo before the consent gate in step 6:
+`bd init --non-interactive --skip-agents --skip-hooks` from the repo root. All three flags keep
+`bd init` safe for an agent-run scaffold and stop it from mutating the repo before the consent
+gate in step 6:
 
+- `--non-interactive` — a bare `bd init` can drop into interactive setup wizards and prompt for
+  input, which would hang an agent-run `/setup`. This flag skips every prompt and uses sensible
+  defaults (`maintainer` role, auto-export enabled). It's auto-detected under CI/non-TTY, but
+  pass it explicitly so `/setup` is safe regardless of how it's invoked.
 - `--skip-agents` — a bare `bd init` writes/updates `AGENTS.md` by default, which would edit the
   repo's agent instructions before the user has agreed (see step 6).
 - `--skip-hooks` — a bare `bd init` installs its own git hooks and overwrites `core.hooksPath`,
