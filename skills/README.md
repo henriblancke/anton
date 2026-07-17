@@ -24,13 +24,15 @@ assets alone.
 - **anton's runtime** loads the skill bodies directly for its background jobs
   (`scan-triage` → nightly-stringer, `review-fix` → review-fix) via
   `src/lib/claude/prompt.ts` (`loadSkill`).
-- **The setup wizard** (epic `anton-3n5`) treats the four runtime-backed skills — `bd`, `shape`,
-  `scan-triage`, `review-fix` — as anton's **REQUIRED** set: always installed into a target
-  project's `.claude/skills/`, never deselectable, so an interactive `claude` session in that
-  project resolves `/shape`, the `bd` conventions, etc.
-- **`setup` is founder-run, not job-loaded.** It's bundled here so `/setup` resolves in a target
-  repo, but anton's runtime never loads it for a background job (there's nothing to scaffold
-  server-side), so it lives outside `REQUIRED_SKILLS`.
+- **The setup wizard / CLI** (epic `anton-3n5`) installs anton's whole **INSTALLED** set into a
+  target project's `.claude/skills/`, never deselectable — the four runtime-backed skills (`bd`,
+  `shape`, `scan-triage`, `review-fix`) plus `setup` — so an interactive `claude` session in that
+  project resolves `/shape`, `/setup`, the `bd` conventions, etc. A skill is copied as its whole
+  directory, so `setup`'s bundled `.product/` templates (`skills/setup/templates/`) travel with it.
+- **`setup` is founder-run, not job-loaded.** It's installed so `/setup` resolves in a target repo,
+  but anton's runtime never loads it for a background job (there's nothing to scaffold
+  server-side), so it lives in `INSTALLED_SKILLS` but **outside** `REQUIRED_SKILLS`.
 
-The canonical required list lives in `REQUIRED_SKILLS` in `src/lib/claude/prompt.ts`; a test
-asserts each of those assets is present and well-formed.
+Both lists live in `src/lib/claude/prompt.ts`: `REQUIRED_SKILLS` (runtime-loaded) and
+`INSTALLED_SKILLS` (the full installed set, `REQUIRED_SKILLS` + `setup`). A test asserts each
+asset is present and well-formed.

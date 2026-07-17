@@ -47,7 +47,8 @@ the agent set anywhere here — just report the detected stack and note which ag
 
 ## 4. Generate `.product/`
 
-Copy the shapes from anton's bundled templates at **`anton/templates/.product/`** into the repo's
+Copy the shapes from the **`templates/.product/`** directory bundled alongside this skill (it sits
+in this skill's own directory, so it travels with `/setup` into any repo) into the repo's
 `.product/`. **Idempotent — skip any file that already exists; never overwrite.** Create:
 
 - **`PRODUCT.md`** — from the template, then fill it from the interview in step 5. Set the

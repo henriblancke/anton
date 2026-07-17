@@ -5,7 +5,7 @@
  *
  * Sources it reads:
  *   - anton's bundled agents:  <bundledRoot>/src/prompts/agents/<tag>.md   (name/description frontmatter)
- *   - anton's bundled skills:  <bundledRoot>/skills/<name>/SKILL.md        (the always-on REQUIRED_SKILLS)
+ *   - anton's bundled skills:  <bundledRoot>/skills/<name>/SKILL.md        (the always-installed INSTALLED_SKILLS)
  *   - project `.claude/`:      <projectDir>/.claude/agents/<tag>.md, <projectDir>/.claude/skills/<name>/SKILL.md
  *   - global  `.claude/`:      <homeDir>/.claude/agents/<tag>.md,   <homeDir>/.claude/skills/<name>/SKILL.md
  *
@@ -28,7 +28,7 @@ import {
   AGENTS_SRC_DIR,
   CLAUDE_AGENTS_DIR,
   CLAUDE_SKILLS_DIR,
-  REQUIRED_SKILLS,
+  INSTALLED_SKILLS,
   SKILLS_SRC_DIR,
 } from "./installer";
 
@@ -54,7 +54,7 @@ export interface InventoryItem {
   description?: string;
   /** True iff anton ships a bundled source for this item. */
   bundled: boolean;
-  /** True for a {@link REQUIRED_SKILLS} member — always installed, cannot be deselected. */
+  /** True for an {@link INSTALLED_SKILLS} member — always installed, cannot be deselected. */
   required: boolean;
   classification: Classification;
   /** Every scope where a copy already exists (may span both project and global). */
@@ -299,13 +299,13 @@ export async function buildInventory(options: InventoryOptions): Promise<Invento
     bundledAgents.push(await bundledItem("agent", tag, src, false, opts));
   }
 
-  // --- Bundled skills (the always-on required set) ---
-  const skillNameSet = new Set<string>(REQUIRED_SKILLS);
+  // --- Bundled skills (the always-installed set: required runtime skills + founder-run setup) ---
+  const skillNameSet = new Set<string>(INSTALLED_SKILLS);
   const bundledSkills: InventoryItem[] = [];
-  for (const name of REQUIRED_SKILLS) {
+  for (const name of INSTALLED_SKILLS) {
     const src = await readMaybe(join(opts.bundledRoot, SKILLS_SRC_DIR, name, "SKILL.md"));
     if (src === undefined) {
-      throw new Error(`buildInventory: required skill "${name}" missing from bundled ${SKILLS_SRC_DIR}`);
+      throw new Error(`buildInventory: bundled skill "${name}" missing from bundled ${SKILLS_SRC_DIR}`);
     }
     bundledSkills.push(await bundledItem("skill", name, src, true, opts));
   }

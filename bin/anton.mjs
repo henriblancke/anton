@@ -200,10 +200,14 @@ function runLocal(bin, args, env = {}) {
 // the launcher stays pure Node and runs before any build. Install target is the user's GLOBAL
 // ~/.claude, so anton's agents/skills are discoverable from every repo `claude` runs in. No-clobber
 // is the invariant: an existing destination (a prior install OR the user's own file) is never
-// overwritten. Keep REQUIRED_SKILLS in sync with REQUIRED_SKILLS in src/lib/claude/prompt.ts.
+// overwritten. Keep these in sync with REQUIRED_SKILLS / INSTALLED_SKILLS in src/lib/claude/prompt.ts.
 const AGENTS_SRC = join(APP_ROOT, "src", "prompts", "agents");
 const SKILLS_SRC = join(APP_ROOT, "skills");
 const REQUIRED_SKILLS = ["shape", "bd", "scan-triage", "review-fix"];
+// The full set installed into a project (non-deselectable): the runtime-required skills + the
+// founder-run `setup` scaffolder. `setup` isn't runtime-loaded, but must be installed so `/setup`
+// resolves; it ships its `.product/` templates under skills/setup/templates/, copied with it.
+const INSTALLED_SKILLS = [...REQUIRED_SKILLS, "setup"];
 const CLAUDE_ROOT = join(homedir(), ".claude");
 
 /** Bundled specialist agent tags (basenames of src/prompts/agents/*.md), sorted. */
@@ -248,6 +252,28 @@ function installFile(src, dest) {
   if (existsSync(dest)) return "skipped";
   mkdirSync(dirname(dest), { recursive: true });
   copyFileSync(src, dest);
+  return "installed";
+}
+
+/** Recursively list every file under `dir` as paths relative to `dir` (files only). */
+function walkFiles(dir, base = dir) {
+  const out = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const abs = join(dir, entry.name);
+    if (entry.isDirectory()) out.push(...walkFiles(abs, base));
+    else if (entry.isFile()) out.push(abs.slice(base.length + 1));
+  }
+  return out;
+}
+
+/**
+ * Install a whole skill DIRECTORY (SKILL.md + any bundled assets, e.g. setup's templates/) no-clobber.
+ * The SKILL.md is the presence sentinel: if it already exists the skill is left untouched ("skipped");
+ * otherwise every file under the bundled skill dir is copied. Returns "installed" | "skipped".
+ */
+function installSkillDir(srcDir, destDir) {
+  if (existsSync(join(destDir, "SKILL.md"))) return "skipped";
+  for (const rel of walkFiles(srcDir)) installFile(join(srcDir, rel), join(destDir, rel));
   return "installed";
 }
 
@@ -331,12 +357,14 @@ async function provisionAgentsSkills(args, opts = {}) {
   const selected = await resolveAgentSelection(args, agentsSrc);
 
   const jobs = [
-    ...REQUIRED_SKILLS.map((name) => ({
+    ...INSTALLED_SKILLS.map((name) => ({
       kind: "skill",
       name,
       required: true,
-      src: join(skillsSrc, name, "SKILL.md"),
-      dest: join(claudeRoot, "skills", name, "SKILL.md"),
+      src: join(skillsSrc, name), // a skill is a directory (SKILL.md + any bundled assets)
+      dest: join(claudeRoot, "skills", name),
+      // The SKILL.md is the presence sentinel for both the missing-source check and no-clobber.
+      sentinel: join(skillsSrc, name, "SKILL.md"),
     })),
     ...selected.map((tag) => ({
       kind: "agent",
@@ -344,17 +372,19 @@ async function provisionAgentsSkills(args, opts = {}) {
       required: false,
       src: join(agentsSrc, `${tag}.md`),
       dest: join(claudeRoot, "agents", `${tag}.md`),
+      sentinel: join(agentsSrc, `${tag}.md`),
     })),
   ];
 
   let installed = 0;
   let skipped = 0;
   for (const job of jobs) {
-    if (!existsSync(job.src)) {
+    if (!existsSync(job.sentinel)) {
       console.log(`  ${c.yellow("!")} ${job.kind} ${c.bold(job.name)} ${c.yellow("missing from package")} ${c.dim(job.src)}`);
       continue;
     }
-    const outcome = installFile(job.src, job.dest);
+    const outcome =
+      job.kind === "skill" ? installSkillDir(job.src, job.dest) : installFile(job.src, job.dest);
     if (outcome === "installed") installed++;
     else skipped++;
     const tag = outcome === "installed" ? c.green("installed") : c.dim("already present");
@@ -1205,6 +1235,7 @@ export {
   agentsFromArgs,
   provisionAgentsSkills,
   REQUIRED_SKILLS,
+  INSTALLED_SKILLS,
   compareVersions,
   platformLabel,
   applyMigrations,

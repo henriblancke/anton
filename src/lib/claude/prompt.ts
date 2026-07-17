@@ -16,11 +16,23 @@ import { stripFrontmatter } from "./agent-prompt";
 export const SKILLS_DIR = "skills";
 
 /**
- * anton's REQUIRED skills: always shipped, and (per the setup wizard, anton-3n5) always installed
- * into a target project — the founder cannot deselect them, because anton itself depends on them.
- * This is the canonical list; the installer and the asset test both read it.
+ * anton's REQUIRED skills: the ones anton's own runtime loads (`loadSkill`) as the `-p` instruction
+ * for a background job. Always shipped, and always installed into a target project — the founder
+ * cannot deselect them, because anton itself depends on them. This is the canonical runtime list;
+ * the installer and the asset test both read it.
  */
 export const REQUIRED_SKILLS = ["shape", "bd", "scan-triage", "review-fix"] as const;
+
+/**
+ * anton's INSTALLED skills: every skill the setup wizard / CLI installs into a target project's
+ * `.claude/skills/`, non-deselectable. A superset of {@link REQUIRED_SKILLS} that adds `setup` —
+ * the founder-run `/setup` scaffolder. `setup` is NOT in REQUIRED_SKILLS because anton's runtime
+ * never loads it for a background job (there's nothing to scaffold server-side), but it must still
+ * land in the project so `/setup` resolves when `/shape` / `/scan-triage` send a founder there.
+ * `setup` carries its own scaffolding templates under `skills/setup/templates/`, so installing the
+ * skill directory ships them with it (anton-olh).
+ */
+export const INSTALLED_SKILLS = [...REQUIRED_SKILLS, "setup"] as const;
 
 /** Absolute path to a skill's `SKILL.md`, resolved against anton's repo root. */
 export function skillPath(name: string): string {

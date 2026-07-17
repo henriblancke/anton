@@ -3,9 +3,10 @@
  * (`skills/<name>/SKILL.md`) exist and are well-formed, so a `/shape` run — and anton's own jobs —
  * have full operating context from anton's assets alone, with no loom/plugin dependency.
  */
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { REQUIRED_SKILLS, loadSkill, skillPath } from "./prompt";
+import { INSTALLED_SKILLS, REQUIRED_SKILLS, loadSkill, skillPath } from "./prompt";
 import { stripFrontmatter } from "./agent-prompt";
 
 /** Pull `name:` and `description:` out of a SKILL.md frontmatter block. */
@@ -72,13 +73,18 @@ describe("required skill assets", () => {
     }
   });
 
-  // `setup` is bundled (so `/setup` resolves in a target repo) but founder-run, not loaded by
-  // anton's runtime for a background job — so it lives outside REQUIRED_SKILLS (anton-olh).
+  // `setup` is founder-run, not loaded by anton's runtime for a background job — so it lives outside
+  // REQUIRED_SKILLS. But it IS in INSTALLED_SKILLS: the installer must ship it (skill + its bundled
+  // templates) into a target repo, or `/setup` can't resolve where `/shape` sends the founder (anton-olh).
   describe("bundled setup skill", () => {
     const raw = readFileSync(skillPath("setup"), "utf8");
 
     it("is not in the runtime-required set", () => {
       expect([...REQUIRED_SKILLS]).not.toContain("setup");
+    });
+
+    it("is in the always-installed set (so `/setup` resolves in a target repo)", () => {
+      expect([...INSTALLED_SKILLS]).toContain("setup");
     });
 
     it("has frontmatter whose name matches its directory + a non-empty body", () => {
@@ -88,12 +94,28 @@ describe("required skill assets", () => {
       expect(stripFrontmatter(raw).trim().length).toBeGreaterThan(0);
     });
 
-    it("is de-loomed and scaffolds from anton's bundled templates", () => {
+    it("is de-loomed and scaffolds from templates bundled alongside the skill", () => {
       const body = stripFrontmatter(raw);
       expect(body).not.toMatch(/loom/i);
       expect(body).not.toMatch(/foolery/i);
-      expect(body).toMatch(/anton\/templates\/\.product\//);
+      expect(body).toMatch(/templates\/\.product\//);
       expect(body).toMatch(/bd init/);
+    });
+
+    it("ships its `.product/` templates inside the skill directory (they travel with the skill)", () => {
+      // The templates must live under skills/setup/ so installing the skill dir copies them into a
+      // target repo — the fix for a source tree where /setup had no templates to copy (anton-olh).
+      const templates = join(dirname(skillPath("setup")), "templates", ".product");
+      for (const rel of [
+        "PRODUCT.md",
+        "config.yaml",
+        "principles.md",
+        "learnings.md",
+        "decisions/README.md",
+        "entities/README.md",
+      ]) {
+        expect(existsSync(join(templates, rel))).toBe(true);
+      }
     });
   });
 });
