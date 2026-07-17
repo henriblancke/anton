@@ -19,12 +19,18 @@ once per repo; it is **idempotent** — it skips anything already present, so re
 
 - Confirm the cwd is a git repo (`git rev-parse --is-inside-work-tree`). If not, tell the user
   and offer `git init` — do **not** run it unasked.
+- Capture the repo root with `git rev-parse --show-toplevel` and treat it as the anchor for
+  **every** repo-local read and write below (`.beads/`, `.product/`, `AGENTS.md`/`CLAUDE.md`).
+  When `/setup` is invoked from a subdirectory the cwd check still passes, so anchoring here is
+  what keeps beads and `.product/` at the repository root instead of scaffolding them into
+  whatever nested package directory you happen to be in.
 - Confirm `bd` is installed (`bd version`). If missing, tell the user to install beads and stop
   here — nothing downstream works without it.
 
 ## 2. Initialize beads
 
-If `.beads/` is absent, run `bd init --skip-agents`. The `--skip-agents` flag is required: a bare
+Check for `.beads/` **at the repo root** (from step 1). If it is absent, run `bd init --skip-agents`
+from the repo root. The `--skip-agents` flag is required: a bare
 `bd init` writes/updates `AGENTS.md` by default, which would edit the repo's agent instructions
 before the consent gate in step 6 — pass `--skip-agents` so anton only touches `AGENTS.md` with
 the user's say-so. Then confirm `bd ready --json` works. If `bd init` errors, **stop and say so** —
@@ -51,7 +57,8 @@ the agent set anywhere here — just report the detected stack and note which ag
 ## 4. Generate `.product/`
 
 Copy the shapes from the **`${CLAUDE_SKILL_DIR}/templates/.product/`** directory bundled alongside
-this skill into the repo's `.product/`. `${CLAUDE_SKILL_DIR}` is the directory holding this
+this skill into the repo's `.product/` **at the repo root** (from step 1), not `./.product/`
+relative to the cwd. `${CLAUDE_SKILL_DIR}` is the directory holding this
 `SKILL.md`, so it resolves to the templates whether `/setup` is installed globally
 (`~/.claude/skills/setup/`) or per-project — **not** the current working directory. **Idempotent —
 skip any file that already exists; never overwrite.** Create:
