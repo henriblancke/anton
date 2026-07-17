@@ -6,6 +6,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { beads, LABELS, type Bead } from "../beads/bd";
+import { ownerOf } from "../beads/claim";
 import { computeEpicGraph, epicStandaloneBlockers, standaloneBlockers } from "../epic-graph";
 import { loadAgentPrompt } from "../claude/agent-prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
@@ -169,10 +170,30 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       });
       await ctx.heartbeat();
 
-      // 2. Claim the epic for the human operator (idempotent). The immediate sync nudge makes
-      // the claim visible on teammates' boards within a heartbeat — that's the whole point of
-      // claiming (anton-live-sync R6); fire-and-forget, the end-of-run sync is the backstop.
+      // 2. Assert this process still owns the epic, THEN claim it for the human operator (idempotent).
+      //    An approved-but-unstarted (backlog) target can be TAKEN OVER — reassigned to another
+      //    operator via the approve route's steal — after this run was queued but before it leased the
+      //    epic (a queued or autonomy-paused job). The take-over suppresses the new owner's enqueue on
+      //    the assumption the reservation just moves, but the jobs table is machine-local: this stale
+      //    job still sits on the ORIGINAL operator's instance. Running it now would execute under the
+      //    new owner's reservation — the exact "run under someone else's claim" state the soft-lock
+      //    forbids (DESIGN.md §Soft-lock) — and the best-effort claim below would swallow the conflict
+      //    and proceed rather than stop. So gate on ownership FIRST, like the ticket-claim hard gate
+      //    in runTicket. Re-read the owner here (not from the job-start snapshot): the worktree warm
+      //    above is several ops wide, so ownership settles against current state, mirroring the approve
+      //    route re-reading the assignee at its own run trigger. PARK (not fail) on a mismatch —
+      //    recoverable, it stops the stale run without stomping the new owner, and the current owner
+      //    approving afresh enqueues a run under their identity on their instance. A runner with no
+      //    operator identity can't assert ownership, so it falls through to the prior best-effort claim.
       const operator = await resolveOperator();
+      const currentOwner = ownerOf(await beads.show(repo, epicBeadId));
+      if (operator && currentOwner && currentOwner !== operator) {
+        throw new PoisonEpic(
+          `${epicBeadId} is reserved by ${currentOwner}, not ${operator} — it was taken over after ` +
+            `this run was queued; refusing to run under another operator's claim. Approve ${epicBeadId} ` +
+            `as ${currentOwner} to start a run under the current owner.`,
+        );
+      }
       await safe(() => beads.claim(repo, epicBeadId, operator));
       await safe(() => beads.tag(repo, epicBeadId, [LABELS.stage("implementing")]));
       void beads
