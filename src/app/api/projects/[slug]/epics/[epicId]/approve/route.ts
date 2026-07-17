@@ -76,7 +76,38 @@ export async function POST(
   if (!epic && !standalone) {
     return NextResponse.json({ error: "Run target not found" }, { status: 404 });
   }
-  if (epic) {
+  // Settle ownership BEFORE the open-blocker readiness gate below. Approval is the run trigger and
+  // normally enqueues execute-epic immediately, so a target with open blockers must not be approved.
+  // But a pure ownership take-over — stealing an already-approved backlog target — only reassigns the
+  // reservation and enqueues nothing (the take-over gate at the end suppresses the run). It starts no
+  // work, so the blocker gate that guards a fresh approval must NOT reject it: a target that gained a
+  // blocker AFTER its original approval has to stay transferable to a new owner, not sit stranded with
+  // the old one until the blocker closes (the UI offers Take over on exactly these approved backlog
+  // targets — claim-control.tsx `canTakeOver`). So read ownership here and derive the take-over first,
+  // then let the gate skip it.
+  //
+  // Re-read the assignee HERE — a fresh `show` after the board load above — rather than reusing
+  // `target` from the refreshAllIssues at the top: the board load in between is several bd reads wide,
+  // and a teammate claiming inside that window would otherwise be invisible, so the auto-claim below
+  // would silently steal their fresh reservation without `{ steal: true }` and enqueue a run under it.
+  // Ownership must be settled from the state as it is at the moment we take it.
+  const operator = await resolveOperator();
+  const current = await beads.show(project.repoPath, epicId);
+  if (!current) {
+    return NextResponse.json({ error: `Ticket ${epicId} not found on the board` }, { status: 404 });
+  }
+  const owner = ownerOf(current);
+  // Read before the approve below, which would otherwise make every request look like a re-approve.
+  // See the enqueue gate at the end for what this distinguishes.
+  const wasApproved = beads.isApproved(current);
+  const steal = await readSteal(request);
+  // A pure take-over reassigns the reservation and nothing more (the enqueue gate at the end skips its
+  // run), so it bypasses the blocker gate — but never the steal-validity checks below, which still
+  // confine it to a backlog target with a resolvable operator identity. Mirrors the enqueue-suppression
+  // condition computed identically at the end.
+  const takeOver = wasApproved && steal && !!owner && owner !== operator;
+
+  if (!takeOver && epic) {
     // epic.blockedBy is the epic-graph rollup (epic→epic + cross-epic child blocks). That rollup
     // DROPS any blocks edge whose blocker is a parentless standalone task/bug, so an epic (or a
     // child of it) that depends on an open standalone item would otherwise read ready here. Gate on
@@ -94,7 +125,7 @@ export async function POST(
   // edges off the fresh read above. Approving enqueues immediately, so a still-blocked standalone
   // must be rejected here — else we'd label + enqueue work `bd ready` would keep blocked, and the
   // runner's epic-only readiness check (a no-op for standalone) wouldn't catch it either.
-  if (standalone) {
+  if (!takeOver && standalone) {
     const blockers = standaloneBlockers(allBeads, epicId);
     if (blockers.length > 0) {
       return NextResponse.json(
@@ -104,22 +135,7 @@ export async function POST(
     }
   }
 
-  // Enforce the claim as a soft-lock at the run trigger. Re-read the assignee HERE rather than
-  // reusing `target` from the refreshAllIssues above: the board load and blocker gates in between
-  // are several bd/graph reads wide, and a teammate claiming inside that window would otherwise be
-  // invisible — the auto-claim below would silently steal their fresh reservation without
-  // `{ steal: true }` and enqueue a run under it. Approval is the run trigger, so ownership must be
-  // settled from the state as it is at the moment we take it.
-  const operator = await resolveOperator();
-  const current = await beads.show(project.repoPath, epicId);
-  if (!current) {
-    return NextResponse.json({ error: `Ticket ${epicId} not found on the board` }, { status: 404 });
-  }
-  const owner = ownerOf(current);
-  // Read before the approve below, which would otherwise make every request look like a re-approve.
-  // See the enqueue gate at the end for what this distinguishes.
-  const wasApproved = beads.isApproved(current);
-  const steal = await readSteal(request);
+  // Enforce the claim as a soft-lock at the run trigger, from the fresh ownership read above.
   if (owner && owner !== operator) {
     // Claimed by someone else → approving would silently run a teammate's reservation. Require an
     // explicit steal to take it over, mirroring the claim route's 409.
@@ -217,7 +233,7 @@ export async function POST(
   // Best-effort — approving must still succeed even if the runner enqueue hiccups.
   // The autonomy master-switch (anton-y3l) gates at *claim* in the runner instead, so with autonomy
   // off the job waits `queued` and re-enabling resumes it.
-  const takeOver = wasApproved && steal && !!owner && owner !== operator;
+  // `takeOver` was derived above (identical condition) so the blocker gate could skip a pure take-over.
   let jobId: string | undefined;
   try {
     if (!takeOver) jobId = await enqueueExecuteEpic(project.id, epicId);

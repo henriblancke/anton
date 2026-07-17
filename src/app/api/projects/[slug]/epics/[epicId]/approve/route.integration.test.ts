@@ -359,6 +359,38 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     expect(await executeEpicJobs(epic)).toHaveLength(0);
   }, 60_000);
 
+  it("takes over an approved backlog target that gained a blocker after approval, without enqueuing", async () => {
+    // A pure take-over only moves the reservation — it enqueues nothing — so the open-blocker gate
+    // that guards a fresh approval must not reject it. Otherwise a target that gained a blocker AFTER
+    // its original approval would sit stranded with the old owner until the blocker closes, even
+    // though the UI offers Take over on exactly these approved backlog targets (claim-control).
+    const epic = await beads.create(repo, { title: "Approved-then-blocked take-over", type: "epic" });
+    const child = await beads.create(repo, { title: "Approved-then-blocked take-over child", type: "task" });
+    await beads.link(repo, child, epic, "parent-child");
+    await beads.assign(repo, epic, "someone-else");
+    await beads.approve(repo, epic); // approved + backlog, owned by a teammate
+
+    // A blocker lands only now — a normal (non-take-over) approval of this epic would 409 here.
+    const blocker = await beads.create(repo, { title: "Late-arriving blocker", type: "task" });
+    await beads.link(repo, child, blocker, "blocks");
+
+    actAs("anton-test");
+    const res = await POST(
+      new Request("http://t/", {
+        method: "POST",
+        body: JSON.stringify({ steal: true }),
+        headers: { "content-type": "application/json" },
+      }),
+      ctx("approvy", epic),
+    );
+    expect(res.status).toBe(200);
+    // The reservation transfers to the new owner…
+    expect((await beads.show(repo, epic)).assignee).toBe("anton-test");
+    // …and no run is enqueued (a take-over suppresses the run despite the open blocker).
+    expect((await res.json()).jobId).toBeUndefined();
+    expect(await executeEpicJobs(epic)).toHaveLength(0);
+  }, 60_000);
+
   it("auto-claims an unclaimed run target for the approver before enqueuing", async () => {
     // Closing the gap before the runtime execution-claim: approving an unclaimed target sets the
     // approver as assignee, so a teammate can't land a claim between approve and the runner.
