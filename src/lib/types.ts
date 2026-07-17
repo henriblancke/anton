@@ -136,6 +136,7 @@ export interface TicketDetail extends Ticket {
   description?: string; // the full bead description (markdown)
   epicId?: string; // parent epic id, if any
   epicTitle?: string;
+  epicAssignee?: string | null; // the parent epic's human-claim owner, inherited by this child
 }
 
 // ── Board drag-and-drop ──

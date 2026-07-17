@@ -15,8 +15,8 @@ import {
   DialogFooter,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { cn } from "@/lib/utils";
 import { MetaChip, PrLink, RelativeTime, StagePill } from "@/components/atoms";
+import { ClaimControl, InheritedOwner } from "@/components/board/claim-control";
 import {
   AGENT_OPTIONS,
   PRIORITY_LABELS,
@@ -200,12 +200,21 @@ function TicketDialogBody({
           )}
         </div>
         {/* claimed-by + created — mirrors the epic detail + tickets list surfaces */}
-        <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1 text-[11px] text-subtle">
-          <span>
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-subtle">
+          <span className="inline-flex items-center gap-1.5">
             Claimed by{" "}
-            <span className={cn(detail.assignee ? "text-foreground/85" : "text-subtle")}>
-              {detail.assignee ?? "Unclaimed"}
-            </span>
+            {detail.epicId ? (
+              // A child ticket inherits its epic's human claim and has no control of its own.
+              <InheritedOwner owner={detail.epicAssignee ?? null} />
+            ) : (
+              <ClaimControl
+                slug={slug}
+                itemId={detail.id}
+                owner={detail.assignee}
+                variant="row"
+                onChanged={() => setAttempt((n) => n + 1)}
+              />
+            )}
           </span>
           <span>
             Created <RelativeTime iso={detail.createdAt} className="text-foreground/85" />

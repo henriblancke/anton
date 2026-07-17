@@ -12,6 +12,7 @@ import { cn } from "@/lib/utils";
 import { STAGE_INSET_SHADOW, agentDotClass, ticketProgress } from "@/components/board/board-utils";
 import { TypeBadge, TypeIcon } from "@/components/board/type-language";
 import { BlockedChip, MetaChip, PrLink, RiskChip } from "@/components/atoms";
+import { ClaimControl } from "@/components/board/claim-control";
 import { CopyButton } from "@/components/ui/copy-button";
 
 /** Short PR label from a bead external-ref: `gh-218` / a URL ending in `/218` → `#218`. */
@@ -155,7 +156,9 @@ export function EpicCard({
       </div>
 
       {epic.stage === "backlog" && !overlay && (
-        <div className="mt-0.5 flex items-center gap-2">
+        <div className="mt-0.5 flex flex-col gap-2">
+          <ClaimControl slug={slug} itemId={epic.id} owner={epic.assignee} />
+          <div className="flex items-center gap-2">
           {showApprove && (
             <Button
               size="xs"
@@ -175,6 +178,7 @@ export function EpicCard({
             title="Delete epic"
             className={cn("pointer-events-auto shrink-0", !showApprove && "ml-auto")}
           />
+          </div>
         </div>
       )}
     </CardShell>

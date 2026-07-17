@@ -9,6 +9,7 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { CopyButton } from "@/components/ui/copy-button";
 import { BlockedChip, MetaChip, PrLink, RiskChip } from "@/components/atoms";
+import { ClaimControl } from "@/components/board/claim-control";
 import { TYPE_RAIL, TYPE_TEXT, agentDotClass } from "@/components/board/board-utils";
 import { TypeBadge, TypeIcon } from "@/components/board/type-language";
 
@@ -129,6 +130,12 @@ export function StandaloneChip({
           </Button>
         )}
       </div>
+
+      {item.stage === "backlog" && (
+        <div className={cn("relative z-[1] flex items-center", onOpen && "pointer-events-none")}>
+          <ClaimControl slug={slug} itemId={item.id} owner={item.assignee} />
+        </div>
+      )}
     </div>
   );
 }
