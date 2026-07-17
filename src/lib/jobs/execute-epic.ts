@@ -201,8 +201,12 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         // bead a different operator now holds, so it — not the stale pre-read — is the operation that
         // actually observes a racing steal. That refusal MUST stop the run (like runTicket's ticket
         // hard gate), never be swallowed by `safe`: swallowing would tag and execute the epic under
-        // the new owner's reservation, the exact state the soft-lock forbids. Idempotent on resume
-        // (re-claiming as the same actor succeeds), so a retry re-claims cleanly.
+        // the new owner's reservation, the exact state the soft-lock forbids. On the NORMAL path the
+        // approve route already pre-assigned this same operator (approve/route.ts `cas(owner, operator)`),
+        // so this is a same-actor re-claim — and `bd update --claim` is idempotent for the same actor
+        // ("idempotent if already claimed by you" per its own help; verified on bd 1.0.4), so it
+        // succeeds and the run proceeds. Same story on resume, so a retry re-claims cleanly. A claim
+        // only FAILS when a DIFFERENT operator now holds the bead — the take-over handled below.
         try {
           await beads.claim(repo, epicBeadId, operator);
         } catch (e) {
