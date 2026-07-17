@@ -6,6 +6,7 @@ description: >-
   bundled templates (idempotent — skips anything already present), runs a ≤4-question PRODUCT
   interview, and proposes (never forces) an AGENTS.md pointer. Use when a repo has no `.product/`
   yet, or when `/shape` / `/scan-triage` tells you to run `/setup` first.
+disable-model-invocation: true
 ---
 
 # /setup — scaffold an anton project
