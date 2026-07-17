@@ -4,13 +4,24 @@ import { epicStandaloneBlockers, standaloneBlockers } from "@/lib/epic-graph";
 import { refreshAllIssues } from "@/lib/beads/issues";
 import { beads } from "@/lib/beads/bd";
 import { enqueueExecuteEpic } from "@/lib/jobs/service";
+import { resolveOperator } from "@/lib/operator";
 import { getProjectBySlug } from "@/lib/projects";
 import { STAGES } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
+/** Read the optional `{ steal?: boolean }` body; a missing/invalid body means no steal. */
+async function readSteal(request: Request): Promise<boolean> {
+  try {
+    const body = (await request.json()) as { steal?: unknown };
+    return body?.steal === true;
+  } catch {
+    return false;
+  }
+}
+
 export async function POST(
-  _request: Request,
+  request: Request,
   { params }: { params: Promise<{ slug: string; epicId: string }> },
 ) {
   const { slug, epicId } = await params;
@@ -89,6 +100,31 @@ export async function POST(
         { status: 409 },
       );
     }
+  }
+
+  // Enforce the claim as a soft-lock at the run trigger. `target` was read via refreshAllIssues
+  // above (the same fresh path this route already uses), so a teammate's just-landed claim is
+  // visible here — not read from a warm snapshot. Approval is the run trigger, so ownership must be
+  // settled before we label + enqueue.
+  const operator = await resolveOperator();
+  const owner = target.assignee?.trim() || undefined;
+  // Claimed by someone else → approving would silently run a teammate's reservation. Require an
+  // explicit steal to take it over, mirroring the claim route's 409.
+  if (owner && owner !== operator && !(await readSteal(request))) {
+    return NextResponse.json(
+      {
+        error: `${epicId} is claimed by ${owner} — pass { steal: true } to approve and take it over`,
+        owner,
+      },
+      { status: 409 },
+    );
+  }
+  // Auto-claim before enqueuing: an unclaimed target (or one being stolen) gets assigned to the
+  // approver so the reservation is set BEFORE the runtime execution-claim, closing the gap where a
+  // teammate could claim between approve and the runner. Re-approving one you already own is a no-op
+  // here (idempotent). Skipped when no operator identity resolves (can't name an assignee).
+  if (operator && owner !== operator) {
+    await beads.assign(project.repoPath, epicId, operator);
   }
 
   await beads.approve(project.repoPath, epicId);

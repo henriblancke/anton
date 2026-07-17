@@ -40,6 +40,9 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
   beforeAll(async () => {
     workDir = mkdtempSync(join(tmpdir(), "anton-approve-route-"));
     process.env.ANTON_DB = join(workDir, "anton.db");
+    // Pin a deterministic operator identity so the claim soft-lock (owner check + auto-claim) is
+    // assertable without depending on the host's global git user.name.
+    process.env.ANTON_OPERATOR = "anton-test";
 
     // Apply every committed migration before the module-level getDb() singleton is created.
     const setup = new Database(process.env.ANTON_DB);
@@ -197,6 +200,71 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     expect(res.status).toBe(422);
     expect((await res.json()).error).toMatch(/not runnable/i);
     expect(beads.isApproved(await beads.show(repo, molecule))).toBe(false);
+  }, 60_000);
+
+  it("409s a run target claimed by another operator, without approving it", async () => {
+    // A teammate's claim is a soft-lock: approving would silently run their reservation. The route
+    // reads the fresh bead (assignee set by another operator) and refuses without an explicit steal.
+    const epic = await beads.create(repo, { title: "Claimed by teammate", type: "epic" });
+    const child = await beads.create(repo, { title: "Claimed epic child", type: "task" });
+    await beads.link(repo, child, epic, "parent-child");
+    await beads.assign(repo, epic, "someone-else");
+
+    const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", epic));
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toContain("someone-else");
+    expect(body.owner).toBe("someone-else");
+    expect(beads.isApproved(await beads.show(repo, epic))).toBe(false);
+  }, 60_000);
+
+  it("steals a teammate's claim on approve when { steal: true } is passed", async () => {
+    // Stealing is the explicit override: it reassigns the claim to the approver and approves.
+    const epic = await beads.create(repo, { title: "Stolen on approve", type: "epic" });
+    const child = await beads.create(repo, { title: "Stolen epic child", type: "task" });
+    await beads.link(repo, child, epic, "parent-child");
+    await beads.assign(repo, epic, "someone-else");
+
+    const res = await POST(
+      new Request("http://t/", {
+        method: "POST",
+        body: JSON.stringify({ steal: true }),
+        headers: { "content-type": "application/json" },
+      }),
+      ctx("approvy", epic),
+    );
+    expect(res.status).toBe(200);
+    const bead = await beads.show(repo, epic);
+    expect(beads.isApproved(bead)).toBe(true);
+    expect(bead.assignee).toBe("anton-test");
+  }, 60_000);
+
+  it("auto-claims an unclaimed run target for the approver before enqueuing", async () => {
+    // Closing the gap before the runtime execution-claim: approving an unclaimed target sets the
+    // approver as assignee, so a teammate can't land a claim between approve and the runner.
+    const epic = await beads.create(repo, { title: "Unclaimed on approve", type: "epic" });
+    const child = await beads.create(repo, { title: "Unclaimed epic child", type: "task" });
+    await beads.link(repo, child, epic, "parent-child");
+
+    const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", epic));
+    expect(res.status).toBe(200);
+    const bead = await beads.show(repo, epic);
+    expect(beads.isApproved(bead)).toBe(true);
+    expect(bead.assignee).toBe("anton-test");
+  }, 60_000);
+
+  it("approves an item already claimed by the requesting operator unchanged", async () => {
+    // Re-approving your own claim is idempotent — no steal needed, assignee stays yours.
+    const epic = await beads.create(repo, { title: "Self-claimed on approve", type: "epic" });
+    const child = await beads.create(repo, { title: "Self-claimed epic child", type: "task" });
+    await beads.link(repo, child, epic, "parent-child");
+    await beads.assign(repo, epic, "anton-test");
+
+    const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", epic));
+    expect(res.status).toBe(200);
+    const bead = await beads.show(repo, epic);
+    expect(beads.isApproved(bead)).toBe(true);
+    expect(bead.assignee).toBe("anton-test");
   }, 60_000);
 
   it("404s an unknown bead id without approving anything", async () => {
