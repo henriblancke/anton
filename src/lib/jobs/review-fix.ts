@@ -74,8 +74,10 @@ const consoleLog: RunnerLogger = {
  * Does the current operator own this epic? On a shared board an operator may only fix/finalize the
  * in-review PRs it claimed (or unclaimed ones) — never another operator's. `assignee` is the claim
  * execute-epic stamps (beads.claim → `bd update --claim`, actor = resolveOperator); unclaimed beads
- * carry null/absent/empty. When identity is unresolved (`operator === undefined`) nothing but
- * unclaimed epics match, so an anton that can't name itself never races a claimed PR.
+ * carry null/absent/empty. resolveOperator resolves the same identity — down to bd's $USER fallback
+ * (anton-g3v) — that stamped the claim, so a claim this instance made always matches. `operator`
+ * is undefined only in the degenerate case where even $USER is unset; then nothing but unclaimed
+ * epics match, so an anton that genuinely can't name itself never races a claimed PR.
  */
 function ownedByOperator(b: Bead, operator: string | undefined): boolean {
   const assignee = (b.assignee ?? undefined)?.trim() || undefined;
