@@ -39,15 +39,19 @@ export function issueSnapshotVersion(cwd: string): number {
   return entryFor(cwd).version;
 }
 
-/** Mark cached data stale while retaining it so readers never wait behind a Dolt sync/write. */
-export function invalidateIssueSnapshot(cwd: string, drop = false): void {
+/**
+ * Mark cached data stale while retaining it so readers keep serving last-good data and never wait
+ * behind a Dolt sync/write. `localWrite` additionally bumps the version (so clients detect the
+ * change) and clears any in-flight loader, forcing a fresh read that starts AFTER the write — the
+ * pre-write loader is orphaned and the generation guard discards its result. Beads are retained
+ * either way: a local write marks the snapshot stale, it never blanks the board.
+ */
+export function invalidateIssueSnapshot(cwd: string, localWrite = false): void {
   const entry = entryFor(cwd);
   entry.loadedAt = 0;
   entry.generation += 1;
-  if (drop) {
+  if (localWrite) {
     entry.version += 1;
-    entry.beads = null;
-    entry.serialized = null;
     // A post-write read must start after the write, never share a loader that started before it.
     entry.refresh = null;
   }

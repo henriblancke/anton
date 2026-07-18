@@ -87,7 +87,8 @@ async function bd(cwd: string, args: string[], env?: Record<string, string>): Pr
 
 async function bdWrite(cwd: string, args: string[], env?: Record<string, string>): Promise<string> {
   const stdout = await bd(cwd, args, env);
-  // Local callers expect their next read to observe the completed write, so discard old data.
+  // Mark the snapshot stale (keeping last-good data) and force a fresh post-write read, so the
+  // next board read never blocks on a cold `bd list` queued behind the Dolt lock.
   invalidateIssueSnapshot(cwd, true);
   return stdout;
 }
