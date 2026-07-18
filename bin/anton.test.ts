@@ -432,6 +432,7 @@ const FAKE_BD = [
   'const beads = path.join(process.cwd(), ".beads");',
   'const cfg = path.join(beads, "config.yaml");',
   'const marker = path.join(beads, ".fake-dolt-remotes");',
+  'const setlog = path.join(beads, ".fake-config-set-order");',
   // onPath() probes --version/--help.
   'if (a[0] === "--version" || a[0] === "--help") { console.log("bd 0.0.0-fake"); process.exit(0); }',
   // `bd init` creates the workspace; the team-config keys are intentionally left OUT so the
@@ -446,6 +447,9 @@ const FAKE_BD = [
   // `bd config set` patches an existing uncommented `key:` line in place (drift), else appends it.
   'if (a[0] === "config" && a[1] === "set") {',
   "  const key = a[2], val = a[3];",
+  // Record each enforced key in order so tests can assert export.auto is disabled FIRST (anton-1th):
+  // a real `bd config set` write regenerates the JSONL under export.auto=true, so ordering matters.
+  '  try { fs.appendFileSync(setlog, key + "\\n"); } catch {}',
   '  let text = ""; try { text = fs.readFileSync(cfg, "utf8"); } catch {}',
   '  const lines = text.split("\\n");',
   "  let replaced = false;",
@@ -604,6 +608,13 @@ describe("anton init (end-to-end, bd stubbed on PATH)", () => {
     expect(cfg).not.toContain("export.auto: true"); // …patched in place, not duplicated
     expect((cfg.match(/^export\.auto:/gm) ?? []).length).toBe(1); // exactly one export.auto key
     expect(cfg).toContain("export.git-add: false"); // missing key appended
+
+    // export.auto=false is enforced BEFORE any other `bd config set` write (anton-1th): each write is
+    // itself a bd command that regenerates the JSONL while export.auto is still true, so disabling it
+    // first closes that window. dolt.auto-commit here is drifted (off), so it too issues a write.
+    const order = (await readFile(join(dir, ".beads", ".fake-config-set-order"), "utf8")).trim().split("\n");
+    expect(order.indexOf("export.auto")).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf("export.auto")).toBeLessThan(order.indexOf("dolt.auto-commit"));
   });
 });
 

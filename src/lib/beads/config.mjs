@@ -159,10 +159,16 @@ export function ensureBdConfig(dir, beadsDir, key, want) {
  *     the regeneration, so on its own it leaves the churn/latency in place.
  * Team sync never travels through the JSONL — it flows through Dolt over refs/dolt/data (bd dolt
  * commit/push/pull) — so disabling the automatic export costs nothing. Manual `bd export` stays
- * available for explicit recovery or interchange. */
+ * available for explicit recovery or interchange.
+ *
+ * `export.auto false` is enforced FIRST: `bd config set` writes are themselves ordinary bd commands,
+ * so a drifted earlier key (e.g. dolt.auto-commit off on an existing workspace) would, while
+ * export.auto is still at its default (true), regenerate the JSONL snapshot as a side effect of its
+ * own write. Disabling auto-export up front closes that window so the enforcement pass never emits
+ * the very churn it exists to stop. */
 const CONFIG_KEYS = [
-  ["dolt.auto-commit", "on"],
   ["export.auto", "false"],
+  ["dolt.auto-commit", "on"],
   ["export.git-add", "false"],
   ["dolt.auto-push", "false"],
 ];
