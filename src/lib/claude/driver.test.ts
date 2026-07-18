@@ -215,6 +215,47 @@ describe("runClaude", () => {
     expect((caught as Error).message).toContain("monthly spend limit");
   });
 
+  it("throws UsageLimitError for the no-link monthly spend-limit banner (/usage-credits variant)", async () => {
+    // anton-b9l review follow-up (PR #43): Claude Code 2.1.172 (anthropics/claude-code#67579)
+    // surfaces the monthly quota with no claude.ai/settings/usage URL — the banner is
+    // `You've hit your monthly spend limit.` followed on the next line by `/usage-credits …`.
+    // The earlier monthly branch required the settings/usage link on the same line, so this
+    // variant fell through as a plain `claude exited` error, burning attempts and parking. It
+    // must now route to UsageLimitError via the `/usage-credits` remediation pointer.
+    const spendLimitText = "You've hit your monthly spend limit.\n/usage-credits to check your usage and remaining credits";
+    const bin = writeFakeClaude(
+      "spend-limited-nolink-claude",
+      [
+        JSON.stringify({ type: "system", subtype: "init", session_id: "sess-nolink" }),
+        JSON.stringify({
+          type: "assistant",
+          message: { content: [{ type: "text", text: spendLimitText }] },
+        }),
+        JSON.stringify({
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: true,
+          session_id: "sess-nolink",
+          total_cost_usd: 0,
+          result: spendLimitText,
+        }),
+      ],
+      1,
+    );
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    let caught: unknown;
+    try {
+      await runClaude({ cwd: dir, prompt: "do the thing" });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(isUsageLimitError(caught)).toBe(true);
+    expect((caught as { resetAt?: number }).resetAt).toBeUndefined();
+    expect((caught as Error).message).toContain("monthly spend limit");
+  });
+
   it("does NOT misclassify a clean success whose transcript mentions a monthly spend limit", async () => {
     // Success false-positive guard, extended to the spend-limit wording (anton-b9l): a run that
     // exits 0 with is_error false is a success even if its output says "monthly spend limit" (e.g. an
