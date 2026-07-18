@@ -12,6 +12,7 @@ import { cn } from "@/lib/utils";
 import { STAGE_INSET_SHADOW, agentDotClass, ticketProgress } from "@/components/board/board-utils";
 import { TypeBadge, TypeIcon } from "@/components/board/type-language";
 import { BlockedChip, MetaChip, PrLink, RiskChip } from "@/components/atoms";
+import { ClaimControl } from "@/components/board/claim-control";
 import { CopyButton } from "@/components/ui/copy-button";
 
 /** Short PR label from a bead external-ref: `gh-218` / a URL ending in `/218` → `#218`. */
@@ -32,8 +33,13 @@ export function EpicCard({
   /** Fired after this epic is deleted so the board can drop it from its columns. */
   onDeleted?: (epicId: string) => void;
 }) {
-  const [approved, setApproved] = useState(epic.approved);
+  // Optimistic override only — the source of truth is `epic.approved`, which a later board poll
+  // refreshes. Deriving from the prop (rather than seeding local state once) keeps the controls in
+  // sync when another operator approves the same epic between polls; the flag just locks it
+  // immediately on our own click and reverts on failure.
+  const [optimisticApproved, setOptimisticApproved] = useState(false);
   const [approving, setApproving] = useState(false);
+  const approved = epic.approved || optimisticApproved;
 
   async function handleDelete() {
     const res = await fetch(`/api/projects/${slug}/epics/${epic.id}`, { method: "DELETE" });
@@ -48,7 +54,7 @@ export function EpicCard({
 
   async function handleApprove() {
     setApproving(true);
-    setApproved(true);
+    setOptimisticApproved(true);
     try {
       const res = await fetch(`/api/projects/${slug}/epics/${epic.id}/approve`, { method: "POST" });
       if (!res.ok) {
@@ -57,7 +63,7 @@ export function EpicCard({
       }
       toast.success(`Approved "${epic.title}"`);
     } catch (err) {
-      setApproved(false);
+      setOptimisticApproved(false);
       toast.error(err instanceof Error ? err.message : "Failed to approve epic");
     } finally {
       setApproving(false);
@@ -155,13 +161,21 @@ export function EpicCard({
       </div>
 
       {epic.stage === "backlog" && !overlay && (
-        <div className="mt-0.5 flex items-center gap-2">
+        <ClaimControl
+          slug={slug}
+          itemId={epic.id}
+          owner={epic.assignee}
+          variant="stack"
+          readOnly={approved}
+          canTakeOver={epic.stage === "backlog"}
+          className="mt-0.5"
+        >
           {showApprove && (
             <Button
               size="xs"
               onClick={handleApprove}
               disabled={approving}
-              className="pointer-events-auto flex-1"
+              className="pointer-events-auto"
             >
               {approving ? "Approving…" : "Approve"}
             </Button>
@@ -173,9 +187,9 @@ export function EpicCard({
             stopPropagation
             confirmLabel="Delete"
             title="Delete epic"
-            className={cn("pointer-events-auto shrink-0", !showApprove && "ml-auto")}
+            className="pointer-events-auto ml-auto shrink-0"
           />
-        </div>
+        </ClaimControl>
       )}
     </CardShell>
   );

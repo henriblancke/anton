@@ -85,6 +85,23 @@ suite("epic-detail integration (real bd)", () => {
     expect(blocksEdge, "blocks edge from A to B").toBeDefined();
   }, 30_000);
 
+  // Regression for anton-lhw: the epic-detail header must surface the epic's own agent/risk/size
+  // chips (getEpicDetail's real-epic branch used to pass `chips: false`, silently dropping them
+  // even though the board card and single-ticket pseudo-epic show them).
+  it("carries the epic's own agent/risk/size chips onto the detail header", async () => {
+    const epicId = await beads.create(repo, {
+      title: "Labeled epic",
+      type: "epic",
+      description: "## Goal\nShip it.",
+    });
+    await beads.tag(repo, epicId, ["agent:nextjs", "risk:high", "size:M"]);
+
+    const detail = await getEpicDetail(project, epicId);
+    expect(detail.epic.agent).toBe("nextjs");
+    expect(detail.epic.risk).toBe("high");
+    expect(detail.epic.size).toBe("M");
+  }, 30_000);
+
   // Regression for anton-noc: `bd list` defaults to 50 results, so in a repo with >50 issues an
   // epic's tickets were silently truncated (planar showed 3 of 5, 1 of 6). beads.list must pass
   // --limit 0 so ALL children come back regardless of repo size.

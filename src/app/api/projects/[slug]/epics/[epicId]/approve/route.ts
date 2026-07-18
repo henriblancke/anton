@@ -3,14 +3,27 @@ import { getBoard } from "@/lib/board";
 import { epicStandaloneBlockers, standaloneBlockers } from "@/lib/epic-graph";
 import { refreshAllIssues } from "@/lib/beads/issues";
 import { beads } from "@/lib/beads/bd";
-import { enqueueExecuteEpic } from "@/lib/jobs/service";
+import { conflictBody, ownerOf, withClaimLock } from "@/lib/beads/claim";
+import { enqueueExecuteEpic, enqueueExecuteEpicIfAbsent } from "@/lib/jobs/service";
+import { resolveOperator } from "@/lib/operator";
+import { deriveStage } from "@/lib/ticket-view";
 import { STAGES } from "@/lib/types";
 import { resolveProject } from "../../../resolve-project";
 
 export const dynamic = "force-dynamic";
 
+/** Read the optional `{ steal?: boolean }` body; a missing/invalid body means no steal. */
+async function readSteal(request: Request): Promise<boolean> {
+  try {
+    const body = (await request.json()) as { steal?: unknown };
+    return body?.steal === true;
+  } catch {
+    return false;
+  }
+}
+
 export async function POST(
-  _request: Request,
+  request: Request,
   { params }: { params: Promise<{ slug: string; epicId: string }> },
 ) {
   const { slug, epicId } = await params;
@@ -61,46 +74,197 @@ export async function POST(
   if (!epic && !standalone) {
     return NextResponse.json({ error: "Run target not found" }, { status: 404 });
   }
-  if (epic) {
-    // epic.blockedBy is the epic-graph rollup (epic→epic + cross-epic child blocks). That rollup
-    // DROPS any blocks edge whose blocker is a parentless standalone task/bug, so an epic (or a
-    // child of it) that depends on an open standalone item would otherwise read ready here. Gate on
-    // those standalone blockers too — derived off the same fresh read — so the epic can't be
-    // approved/enqueued before its standalone prerequisite is done.
-    const blockers = [...epic.blockedBy, ...epicStandaloneBlockers(allBeads, epicId)];
-    if (blockers.length > 0) {
-      return NextResponse.json(
-        { error: `Epic is blocked by ${blockers.join(", ")}` },
-        { status: 409 },
-      );
-    }
+  // Settle ownership BEFORE the open-blocker readiness gate below. Approval is the run trigger and
+  // normally enqueues execute-epic immediately, so a target with open blockers must not be approved.
+  // But a pure ownership take-over — stealing an already-approved backlog target — only reassigns the
+  // reservation and enqueues nothing (the take-over gate at the end suppresses the run). It starts no
+  // work, so the blocker gate that guards a fresh approval must NOT reject it: a target that gained a
+  // blocker AFTER its original approval has to stay transferable to a new owner, not sit stranded with
+  // the old one until the blocker closes (the UI offers Take over on exactly these approved backlog
+  // targets — claim-control.tsx `canTakeOver`). So read ownership here and derive the take-over first,
+  // then let the gate skip it.
+  //
+  // Re-read the assignee HERE — a fresh `show` after the board load above — rather than reusing
+  // `target` from the refreshAllIssues at the top: the board load in between is several bd reads wide,
+  // and a teammate claiming inside that window would otherwise be invisible, so the auto-claim below
+  // would silently steal their fresh reservation without `{ steal: true }` and enqueue a run under it.
+  // Ownership must be settled from the state as it is at the moment we take it.
+  const operator = await resolveOperator();
+  const current = await beads.show(project.repoPath, epicId);
+  if (!current) {
+    return NextResponse.json({ error: `Ticket ${epicId} not found on the board` }, { status: 404 });
   }
-  // A standalone target's blockers aren't in the epic rollup, so derive them from its own `blocks`
-  // edges off the fresh read above. Approving enqueues immediately, so a still-blocked standalone
-  // must be rejected here — else we'd label + enqueue work `bd ready` would keep blocked, and the
-  // runner's epic-only readiness check (a no-op for standalone) wouldn't catch it either.
-  if (standalone) {
-    const blockers = standaloneBlockers(allBeads, epicId);
-    if (blockers.length > 0) {
-      return NextResponse.json(
-        { error: `${epicId} is blocked by ${blockers.join(", ")}` },
-        { status: 409 },
-      );
-    }
+  const owner = ownerOf(current);
+  // Read before the approve below, which would otherwise make every request look like a re-approve.
+  // See the enqueue gate at the end for what this distinguishes.
+  const wasApproved = beads.isApproved(current);
+  const steal = await readSteal(request);
+  // A pure take-over reassigns the reservation and nothing more (the enqueue gate at the end skips its
+  // run), so it bypasses the blocker gate — but never the steal-validity checks below, which still
+  // confine it to a backlog target with a resolvable operator identity. Mirrors the enqueue-suppression
+  // condition computed identically at the end.
+  const takeOver = wasApproved && steal && !!owner && owner !== operator;
+
+  // Open blockers for the run target, derived off the fresh `allBeads` read above. For an epic that's
+  // the epic-graph rollup (epic→epic + cross-epic child blocks) PLUS any parentless standalone
+  // (task/bug) prerequisite the rollup DROPS (epicStandaloneBlockers) — otherwise an epic that
+  // depends on an open standalone item would read ready. For a standalone target the rollup never
+  // carries it, so derive from its own `blocks` edges. Two consumers below: the readiness gate (a
+  // fresh approval enqueues immediately, so a still-blocked target must be rejected before we
+  // label + enqueue work `bd ready` would keep blocked), and the take-over enqueue at the end (which
+  // only fires when nothing is open).
+  const openBlockers = epic
+    ? [...epic.blockedBy, ...epicStandaloneBlockers(allBeads, epicId)]
+    : standaloneBlockers(allBeads, epicId);
+  // A pure take-over bypasses this gate — it only reassigns the reservation and enqueues no run that
+  // would start blocked work (see the enqueue gate at the end) — so a target that gained a blocker
+  // AFTER its original approval stays transferable to a new owner rather than stranded with the old.
+  if (!takeOver && openBlockers.length > 0) {
+    const message = epic
+      ? `Epic is blocked by ${openBlockers.join(", ")}`
+      : `${epicId} is blocked by ${openBlockers.join(", ")}`;
+    return NextResponse.json({ error: message }, { status: 409 });
   }
 
-  await beads.approve(project.repoPath, epicId);
+  // Enforce the claim as a soft-lock at the run trigger, from the fresh ownership read above.
+  if (owner && owner !== operator) {
+    // Claimed by someone else → approving would silently run a teammate's reservation. Require an
+    // explicit steal to take it over, mirroring the claim route's 409.
+    if (!steal) {
+      return NextResponse.json(
+        {
+          error: `${epicId} is claimed by ${owner} — pass { steal: true } to approve and take it over`,
+          owner,
+        },
+        { status: 409 },
+      );
+    }
+    // A steal only moves the reservation; it does not stop a run already executing under the current
+    // owner. The `takeOver` gate below suppresses a *second* enqueue but never halts the first, so
+    // reassigning an implementing/in-review target would strand that live run under a new owner —
+    // exactly the takeover the runtime is mid-flight on. Only a backlog target (approved-but-unstarted,
+    // or never started) is safe to take over. This mirrors the UI, which offers Take over solely on
+    // backlog targets (claim-control.tsx `canTakeOver`); enforce that boundary here so a direct request
+    // can't bypass it. Derive from the fresh `current` bead read above.
+    const stage = deriveStage(current);
+    if (stage !== "backlog") {
+      return NextResponse.json(
+        {
+          error: `${epicId} is claimed by ${owner} and is already ${stage} — its run is in progress, so it can't be taken over; wait for it to finish or have ${owner} release it`,
+          owner,
+          stage,
+        },
+        { status: 409 },
+      );
+    }
+    // Steal requested, but no operator identity resolves (no ANTON_OPERATOR, no global git user.name),
+    // so we can't reassign the target. Approving anyway would enqueue a run under the teammate's
+    // reservation while leaving them as assignee — a half-steal that breaks the soft-lock the response
+    // text and DESIGN.md promise. Reject until an operator identity is set to take ownership.
+    if (!operator) {
+      return NextResponse.json(
+        {
+          error: `${epicId} is claimed by ${owner} — set ANTON_OPERATOR (or git user.name) to identify who is taking it over before approving`,
+          owner,
+        },
+        { status: 409 },
+      );
+    }
+  }
+  // Auto-claim, then approve, both under the bead's claim-write lock.
+  //
+  // The claim: an unclaimed target (or one being stolen) gets assigned to the approver so the
+  // reservation is set BEFORE the runtime execution-claim, closing the gap where a teammate could
+  // claim between approve and the runner. It's conditional on the assignee still being `owner` —
+  // the value the steal gate above decided from. `bd assign` is an unconditional assignee update,
+  // so the re-read alone doesn't close the window: a teammate claiming between that read and this
+  // write would have their fresh reservation overwritten without `{ steal: true }`. Losing the swap
+  // means ownership moved after we checked, so the approval must not proceed on a stale decision —
+  // 409 and let the operator re-decide against the state as it now is. Re-approving one you already
+  // own swaps owner→owner: no write, just a verification that it's still yours.
+  //
+  // The lock has to span the label too, not just the swap. The `approved` label is what locks the
+  // reservation (the claim route refuses to touch an approved target), so between a bare swap and
+  // an unlocked `beads.approve` a teammate's steal would still be legal — it would land on a target
+  // that isn't approved *yet*, and this request would then approve and enqueue a run under their
+  // reservation, which they never approved. Holding the lock through the label leaves no such
+  // window: a concurrent steal either lands first (and this swap 409s) or finds the target approved
+  // and is refused.
+  //
+  // With no operator identity (no ANTON_OPERATOR, no git user.name) there's no one to assign, so
+  // the swap is owner→owner: a verified no-op that still takes the lock and still serializes the
+  // label against concurrent claims.
+  const swap = await withClaimLock(project.repoPath, epicId, async (cas) => {
+    // Re-derive the stage HERE, under the lock — not only from the pre-lock `current` read above.
+    // On a steal (owner !== operator) the pre-lock stage gate can pass on a backlog snapshot, then
+    // the original owner's runner starts in the window before this CAS: it moves the bead to
+    // in_progress/stage:implementing but leaves the assignee as the old owner, so `cas(owner, …)`
+    // (which matches on assignee alone) would still succeed and reassign a *live* run to the
+    // approver — the exact implementing/in-review takeover the pre-lock gate rejects. Reading the
+    // stage inside the lock makes a run that started in that window lose the swap instead. A
+    // self-owned re-approve (owner === operator, e.g. Force run on an implementing epic) is
+    // deliberately excluded: it's the operator asking to re-run their own target, not a takeover.
+    if (owner && owner !== operator) {
+      const locked = await beads.show(project.repoPath, epicId);
+      const lockedStage = locked ? deriveStage(locked) : undefined;
+      if (lockedStage && lockedStage !== "backlog") return { moved: lockedStage } as const;
+    }
+    const result = await cas(owner, operator ?? owner);
+    if (result.ok) await beads.approve(project.repoPath, epicId);
+    return result;
+  });
+  if ("moved" in swap) {
+    return NextResponse.json(
+      {
+        error: `${epicId} is claimed by ${owner} and is already ${swap.moved} — its run started while this approval was in flight, so it can't be taken over; wait for it to finish or have ${owner} release it`,
+        owner,
+        stage: swap.moved,
+      },
+      { status: 409 },
+    );
+  }
+  if (!swap.ok) return NextResponse.json(conflictBody(epicId, swap.owner), { status: 409 });
+
   await beads
     .sync(project.repoPath)
     .catch((err) => console.error(`[approve] beads dolt sync failed after approving ${epicId}`, err));
 
-  // Approval is the trigger: enqueue the autonomous execute-epic run (DESIGN.md §2/§7).
+  // Approval is the trigger: enqueue the autonomous execute-epic run (DESIGN.md §2/§7). Two paths:
+  //
+  // 1. A normal approval / re-approve (NOT a take-over) enqueues via the active-dedupe. This is the
+  //    operator asking for a run: both epic-detail run buttons post here with no body (Force run on
+  //    an implementing epic, Run epic elsewhere — epic-detail-view.tsx), as does re-approving a
+  //    target whose enqueue previously failed. Gating those on `wasApproved` would report success
+  //    with no `jobId` and leave an approved epic unrunnable from the UI. The dedupe covers the
+  //    double-click case; a cross-machine force-run is not deduped (anton-jz1).
+  //
+  // 2. An owner-changing take-over enqueues ONLY when this instance has no job covering the epic yet
+  //    (enqueueExecuteEpicIfAbsent, active + resumable statuses; a terminal `done` row does NOT
+  //    count, so a machine that previously finished this epic still enqueues afresh). Jobs are
+  //    machine-local (README/DESIGN §"Ephemeral"), so stealing an already-approved target from
+  //    operator A leaves A's queued/paused job on A's instance — and execute-epic's ownership gate
+  //    makes A's job poison itself once it sees the epic reassigned to B. Without a local job the
+  //    approved work would strand under the new owner with nothing runnable (anton-i71 review,
+  //    PR #39). A same-instance take-over instead finds its existing (queued/running/parked/failed)
+  //    job and reuses it (returns no new id), so a parked prior run stays resumable rather than
+  //    shadowed by a duplicate.
+  //
+  //    Skip the take-over enqueue when the target is currently blocked: a take-over bypasses the
+  //    readiness gate above (to stay transferable), but starting blocked work is exactly what that
+  //    gate prevents — the runner would only park it. The operator force-runs it once the blocker
+  //    clears, matching a fresh approval's own blocker rejection.
+  //
   // Best-effort — approving must still succeed even if the runner enqueue hiccups.
-  // Approval always enqueues; the autonomy master-switch (anton-y3l) gates at *claim* in the
-  // runner instead, so with autonomy off the job waits `queued` and re-enabling resumes it.
+  // The autonomy master-switch (anton-y3l) gates at *claim* in the runner instead, so with autonomy
+  // off the job waits `queued` and re-enabling resumes it.
+  // `takeOver` was derived above (identical condition) so the blocker gate could skip a pure take-over.
   let jobId: string | undefined;
   try {
-    jobId = await enqueueExecuteEpic(project.id, epicId);
+    if (!takeOver) {
+      jobId = await enqueueExecuteEpic(project.id, epicId);
+    } else if (openBlockers.length === 0) {
+      jobId = await enqueueExecuteEpicIfAbsent(project.id, epicId);
+    }
   } catch (err) {
     console.error(`[approve] failed to enqueue execute-epic for ${epicId}`, err);
   }
