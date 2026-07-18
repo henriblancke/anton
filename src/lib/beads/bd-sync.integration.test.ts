@@ -137,7 +137,10 @@ suite("two managed repos exchange a change over refs/dolt/data with export.auto 
     repoB = join(sandbox, "b");
 
     // Bare git remote seeded with an initial main branch (Dolt's git backend refuses an empty remote).
-    execFileSync("git", ["init", "--bare", "-q", bare]);
+    // Pin HEAD to main so the clone at repoB checks out the pushed branch — without this the bare repo's
+    // HEAD follows git's default (still `master` on many hosts), and the clone would land on an empty
+    // working tree that never receives .beads/config.yaml, silently defeating the repoB assertions.
+    execFileSync("git", ["init", "--bare", "-q", "-b", "main", bare]);
     execFileSync("git", ["init", "-q", "-b", "main", repoA]);
     gitIn(repoA, ["config", "user.email", "a@example.com"]);
     gitIn(repoA, ["config", "user.name", "anton-a"]);
