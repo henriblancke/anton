@@ -8,8 +8,8 @@
  * CLI and the TypeScript server. See DESIGN.md §3 (beads is the work source of truth).
  *
  * The correct team-config is the Dolt-first model (issues live in Dolt, synced over refs/dolt/data;
- * the JSONL is a passive export): dolt.auto-commit "on", export.git-add false, and a .gitignore that
- * keeps the derived exports + Dolt runtime state out of git.
+ * the JSONL is a passive export): dolt.auto-commit "on", export.auto false, export.git-add false, and
+ * a .gitignore that keeps the derived exports + Dolt runtime state out of git.
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -148,9 +148,21 @@ export function ensureBdConfig(dir, beadsDir, key, want) {
 /** The config.yaml keys anton's team-config enforces (Dolt-first model). `dolt.auto-push false`
  * because anton owns push cadence (write-nudged full passes, pull-only heartbeats): bd 1.0.2
  * auto-pushes after every write once a remote named `origin` exists, which both double-pushes
- * and re-creates the concurrent-push manifest-corruption risk (beads GH#2466) anton avoids. */
+ * and re-creates the concurrent-push manifest-corruption risk (beads GH#2466) anton avoids.
+ *
+ * `export.auto false` and `export.git-add false` are DISTINCT knobs and both are needed (anton-1th):
+ *   - export.auto governs whether bd regenerates the JSONL snapshot at all. Left at its default
+ *     (true), ordinary commands (bd ready/show) periodically rewrite issues.jsonl + export-state.json
+ *     once the export interval elapses — working-tree churn and latency for a file we only keep as a
+ *     passive recovery artifact.
+ *   - export.git-add only governs whether that regenerated snapshot is auto-STAGED. It does not stop
+ *     the regeneration, so on its own it leaves the churn/latency in place.
+ * Team sync never travels through the JSONL — it flows through Dolt over refs/dolt/data (bd dolt
+ * commit/push/pull) — so disabling the automatic export costs nothing. Manual `bd export` stays
+ * available for explicit recovery or interchange. */
 const CONFIG_KEYS = [
   ["dolt.auto-commit", "on"],
+  ["export.auto", "false"],
   ["export.git-add", "false"],
   ["dolt.auto-push", "false"],
 ];

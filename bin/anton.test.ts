@@ -555,6 +555,9 @@ describe("anton init (end-to-end, bd stubbed on PATH)", () => {
     // config.yaml carries the enforced Dolt-first keys…
     const cfg = await readFile(join(dir, ".beads", "config.yaml"), "utf8");
     expect(cfg).toContain("dolt.auto-commit: on");
+    // export.auto AND export.git-add are both disabled — export.auto stops the periodic JSONL
+    // regeneration itself, export.git-add only stops staging it (anton-1th).
+    expect(cfg).toContain("export.auto: false");
     expect(cfg).toContain("export.git-add: false");
     // …and .gitignore untracks the derived exports + Dolt runtime state.
     const gi = await readFile(join(dir, ".beads", ".gitignore"), "utf8");
@@ -585,10 +588,11 @@ describe("anton init (end-to-end, bd stubbed on PATH)", () => {
   it("patches a drifted config.yaml key without clobbering the file (config-drift patch)", async () => {
     const dir = await tmp("anton-init-");
     gitInit(dir, true);
-    // A pre-existing workspace whose config.yaml has a DRIFTED value + a missing key. Because .beads/
-    // is present, init skips `bd init` and only enforces the team-config keys.
+    // A pre-existing workspace whose config.yaml has DRIFTED values + a missing key. Because .beads/
+    // is present, init skips `bd init` and only enforces the team-config keys. export.auto: true is
+    // the inherited bd default anton must flip to false (anton-1th).
     mkdirSync(join(dir, ".beads"), { recursive: true });
-    writeFileSync(join(dir, ".beads", "config.yaml"), "# beads config\ndolt.auto-commit: off\n");
+    writeFileSync(join(dir, ".beads", "config.yaml"), "# beads config\ndolt.auto-commit: off\nexport.auto: true\n");
 
     const r = runInit(dir);
     expect(r.status).toBe(0);
@@ -596,6 +600,9 @@ describe("anton init (end-to-end, bd stubbed on PATH)", () => {
     const cfg = await readFile(join(dir, ".beads", "config.yaml"), "utf8");
     expect(cfg).toContain("dolt.auto-commit: on"); // drift patched in place…
     expect(cfg).not.toContain("dolt.auto-commit: off"); // …not left alongside the stale value
+    expect(cfg).toContain("export.auto: false"); // export.auto=true flipped to false…
+    expect(cfg).not.toContain("export.auto: true"); // …patched in place, not duplicated
+    expect((cfg.match(/^export\.auto:/gm) ?? []).length).toBe(1); // exactly one export.auto key
     expect(cfg).toContain("export.git-add: false"); // missing key appended
   });
 });

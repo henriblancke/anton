@@ -6,10 +6,11 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beads } from "./bd";
+import { configureBeadsForRepo } from "./config.mjs";
 import { updateTicket } from "../ticket-detail";
 import type { Project } from "../types";
 
@@ -50,9 +51,12 @@ suite("beads.sync integration (real bd · local bare remote)", () => {
     // embedded-Dolt lock in a pristine repo. anton never relies on bd hooks — sync is explicit.
     execFileSync("bd", ["init", "--skip-hooks"], { cwd: repo, stdio: "ignore" });
     execFileSync("bd", ["dolt", "remote", "add", "origin", bare], { cwd: repo, stdio: "ignore" });
-    // anton-managed config: bd 1.0.2 auto-pushes after each write once a remote named `origin`
-    // exists — anton owns push cadence, so managed projects disable it (see CONFIG_KEYS).
+    // anton-managed config (see CONFIG_KEYS): bd 1.0.2 auto-pushes after each write once a remote
+    // named `origin` exists — anton owns push cadence, so managed projects disable it. export.auto is
+    // disabled too (anton-1th) so ordinary reads don't regenerate the passive JSONL snapshot; team
+    // sync flows through Dolt over refs/dolt/data, never the JSONL.
     execFileSync("bd", ["config", "set", "dolt.auto-push", "false"], { cwd: repo, stdio: "ignore" });
+    execFileSync("bd", ["config", "set", "export.auto", "false"], { cwd: repo, stdio: "ignore" });
 
     project = {
       id: "x", slug: "tmp", name: "tmp", repoPath: repo,
@@ -107,4 +111,92 @@ suite("beads.sync integration (real bd · local bare remote)", () => {
     });
     await expect(beads.sync(repo)).rejects.toThrow(/bd dolt (pull|push) failed/);
   }, 60_000);
+});
+
+/**
+ * Two anton-managed repositories exchange a beads change over refs/dolt/data with automatic JSONL
+ * export disabled (anton-1th). Repo A goes through anton's real init path (configureBeadsForRepo),
+ * which now enforces export.auto=false alongside export.git-add=false; it publishes a ticket through
+ * Dolt. Repo B is a fresh clone hydrated from the git remote — it never receives issues.jsonl (that
+ * export is gitignored) yet still sees the ticket, proving the collaboration channel is refs/dolt/data
+ * and not the passive JSONL snapshot.
+ */
+suite("two managed repos exchange a change over refs/dolt/data with export.auto disabled (anton-1th)", () => {
+  let sandbox: string;
+  let bare: string;
+  let repoA: string;
+  let repoB: string;
+  let ticketId: string;
+
+  const gitIn = (cwd: string, args: string[]) => execFileSync("git", args, { cwd, stdio: "ignore" });
+
+  beforeAll(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-1th-fixture-"));
+    bare = join(sandbox, "remote.git");
+    repoA = join(sandbox, "a");
+    repoB = join(sandbox, "b");
+
+    // Bare git remote seeded with an initial main branch (Dolt's git backend refuses an empty remote).
+    execFileSync("git", ["init", "--bare", "-q", bare]);
+    execFileSync("git", ["init", "-q", "-b", "main", repoA]);
+    gitIn(repoA, ["config", "user.email", "a@example.com"]);
+    gitIn(repoA, ["config", "user.name", "anton-a"]);
+    writeFileSync(join(repoA, "README.md"), "# a\n");
+    gitIn(repoA, ["add", "-A"]);
+    gitIn(repoA, ["commit", "-q", "-m", "init"]);
+    gitIn(repoA, ["remote", "add", "origin", bare]);
+    gitIn(repoA, ["push", "-q", "-u", "origin", "main"]);
+
+    // Anton's real init path: bd init → team-config (export.auto=false + export.git-add=false + …) →
+    // .beads/.gitignore → Dolt remote wiring (publishes refs/dolt/data). This is the code under test.
+    const cfg = configureBeadsForRepo(repoA, { prefix: "ex", log: () => {} });
+    if (!cfg.configured) throw new Error(`configureBeadsForRepo(A) failed: ${cfg.errors.join("; ")}`);
+
+    // A creates a ticket and publishes it through Dolt (never through the JSONL export).
+    const created = JSON.parse(
+      execFileSync("bd", ["create", "Cross-machine ticket", "--type", "task", "--json"], {
+        cwd: repoA,
+        encoding: "utf8",
+      }),
+    );
+    ticketId = (Array.isArray(created) ? created[0] : created).id;
+    execFileSync("bd", ["dolt", "commit", "-m", "add ticket"], { cwd: repoA, stdio: "ignore" });
+    execFileSync("bd", ["dolt", "push"], { cwd: repoA, stdio: "ignore" });
+
+    // Commit the beads team-config so a clone inherits export.auto=false. config.yaml is tracked; the
+    // JSONL exports and Dolt runtime state stay gitignored (they must NOT travel through git).
+    gitIn(repoA, ["add", "-f", ".beads/config.yaml", ".beads/.gitignore", ".beads/metadata.json"]);
+    gitIn(repoA, ["commit", "-q", "-m", "beads team-config"]);
+    gitIn(repoA, ["push", "-q", "origin", "main"]);
+
+    // Second machine: clone the git repo, then hydrate the Dolt DB from the remote. `bd init` pulls
+    // refs/dolt/data on a clone whose Dolt DB is gitignored (absent); the explicit pull confirms it.
+    execFileSync("git", ["clone", "-q", bare, repoB]);
+    gitIn(repoB, ["config", "user.email", "b@example.com"]);
+    gitIn(repoB, ["config", "user.name", "anton-b"]);
+    execFileSync("bd", ["init", "--skip-hooks"], { cwd: repoB, stdio: "ignore" });
+    execFileSync("bd", ["dolt", "remote", "add", "origin", bare], { cwd: repoB, stdio: "ignore" });
+    execFileSync("bd", ["dolt", "pull"], { cwd: repoB, stdio: "ignore" });
+  }, 120_000);
+
+  afterAll(() => {
+    if (sandbox) rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("both repos commit export.auto=false alongside export.git-add=false", () => {
+    for (const repo of [repoA, repoB]) {
+      const cfg = readFileSync(join(repo, ".beads", "config.yaml"), "utf8");
+      expect(cfg, `${repo} must disable the automatic JSONL export`).toMatch(/^export\.auto:\s*false\s*$/m);
+      expect(cfg, `${repo} must still keep the export unstaged`).toMatch(/^export\.git-add:\s*false\s*$/m);
+    }
+  });
+
+  it("the change travels through refs/dolt/data, not the JSONL export", () => {
+    // The clone never received issues.jsonl (it is gitignored), yet the ticket is present — proof the
+    // board hydrated from Dolt over refs/dolt/data with automatic JSONL export disabled.
+    expect(existsSync(join(repoB, ".beads", "issues.jsonl")), "issues.jsonl must not travel via git").toBe(false);
+    const parsed = JSON.parse(execFileSync("bd", ["list", "--json"], { cwd: repoB, encoding: "utf8" }));
+    const issues: Array<{ id: string }> = Array.isArray(parsed) ? parsed : (parsed.issues ?? []);
+    expect(issues.map((i) => i.id)).toContain(ticketId);
+  });
 });
