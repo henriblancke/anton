@@ -84,6 +84,20 @@ describe("run-lease helpers (anton-jz1)", () => {
     );
   });
 
+  it("ownRunLeaseLabels: returns only leases stamped with this run's id", () => {
+    const mine = LABELS.runLease(now + 60_000, "run-mine");
+    const other = LABELS.runLease(now + 60_000, "run-other");
+    const b = bead({ labels: ["stage:implementing", mine, other, `run-lease:${now}`] });
+    // Only the owner-matched lease is swept; a foreign lease and an owner-less legacy lease are left.
+    expect(beads.ownRunLeaseLabels(b, "run-mine")).toEqual([mine]);
+  });
+
+  it("ownRunLeaseLabels: no owned lease reads empty", () => {
+    const b = bead({ labels: [LABELS.runLease(now + 60_000, "run-other")] });
+    expect(beads.ownRunLeaseLabels(b, "run-mine")).toEqual([]);
+    expect(beads.ownRunLeaseLabels(bead({ labels: [] }), "run-mine")).toEqual([]);
+  });
+
   it("winsRunLeaseRace: uncontested (only our own lease) proceeds", () => {
     const b = bead({ labels: [LABELS.runLease(now + 60_000, "run-mine")] });
     expect(beads.winsRunLeaseRace(b, now, "run-mine")).toBe(true);

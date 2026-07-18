@@ -16,6 +16,7 @@ import { makeTestDb, type TestDb } from "../db/testing";
 import { beads } from "../beads/bd";
 import * as schema from "../db/schema";
 import { getJob, park, resumeJob, type Clock } from "./queue";
+import { createRun } from "../runs";
 import { JobRunner } from "./runner";
 import { makeExecuteEpicHandler } from "./execute-epic";
 import { deriveStage } from "../ticket-view";
@@ -524,6 +525,72 @@ process.exit(0);`,
     }
   }, 60_000);
 
+  it("clears its OWN leftover run-lease on the external-ref short-circuit (crash after PR, before cleanup)", async () => {
+    // anton-jz1 review (thread PRRT_kwDOTWcq8c6SAdZu): a run that crashed AFTER stamping the external
+    // ref but BEFORE its `finally` cleared the run-lease leaves an unexpired `run-lease:…:<runId>` on
+    // the board. On resume, findOpenRunForEpic returns the SAME run row (same runId), so the target
+    // still carries this run's own lease. The idempotent external-ref short-circuit returns before the
+    // general lease-adoption step, so it must sweep that own lease itself — otherwise other machines
+    // keep seeing the epic as live until the 15-minute TTL even though its PR is already open.
+    const bugId = await beads.create(repo, {
+      title: "Crashed after PR",
+      type: "bug",
+      acceptance: "work file exists",
+      description: "## Goal\nProve the own-lease sweep on the idempotent path.",
+    });
+    await beads.approve(repo, bugId);
+
+    // Simulate the crashed prior attempt: a still-"running" run row (so it resumes rather than
+    // starting fresh), the external ref already stamped, and this run's own unexpired lease still on
+    // the board — the exact "died between setExternalRef and finally" state.
+    const runId = randomUUID();
+    await createRun(tdb.db, clock, {
+      id: runId,
+      projectId,
+      epicBeadId: bugId,
+      branch: `anton/${bugId}`,
+      status: "running",
+    });
+    const leaseExp = clock.now() + 15 * 60_000;
+    await beads.publishRunLease(repo, bugId, leaseExp, [], runId);
+    await beads.setExternalRef(repo, bugId, "gh-77");
+    await beads.sync(repo); // land both on the remote so the handler's pull can't clobber them
+    expect(beads.ownRunLeaseLabels(await beads.show(repo, bugId), runId)).toHaveLength(1);
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    // gh points at a failing binary: if the handler wrongly reached the PR step it would throw. The
+    // short-circuit must finish the attempt as done without ever invoking gh.
+    const failingGh = writeBin(binDir, "gh-fail-lease", `console.error('gh boom');process.exit(1);`);
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = failingGh;
+    try {
+      const job = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: bugId },
+      });
+      await runner.tickOnce();
+      await runner.whenIdle();
+      expect((await getJob(tdb.db, job))?.status).toBe("done");
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+    }
+
+    // The resumed run's row settled done, and its own lease was swept — no lingering run-lease keeps
+    // the epic looking live to other machines. External ref untouched (not re-opened).
+    const settled = (await tdb.db.select().from(schema.runs)).find((r) => r.id === runId);
+    expect(settled?.status).toBe("done");
+    const after = await beads.show(repo, bugId);
+    expect(beads.runLeaseLabels(after)).toEqual([]);
+    expect(after.external_ref).toBe("gh-77");
+  }, 60_000);
+
   it("parks a standalone target blocked by an open prerequisite (readiness gate at job start)", async () => {
     // anton-cmz review: a standalone's blockers aren't in the epic-graph rollup, so the runner
     // derives them from its own `blocks` edges. An open blocker must PARK the run (poison), not
@@ -951,6 +1018,133 @@ process.exit(0);`,
       // A failed run reschedules the job with backoff; park it so a later clock-advancing tick
       // can't re-dispatch this epic (the test DB is shared across the describe block).
       if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  }, 60_000);
+
+  it("parks when the epic was taken over by another operator after the run was queued", async () => {
+    // Soft-lock at the execution-claim (anton-i71 review): an approved-but-unstarted (backlog) epic
+    // can be STOLEN — reassigned to another operator via the approve route — after its execute-epic
+    // job was queued but before the runner leased it. The take-over suppresses the new owner's
+    // enqueue on the assumption the reservation just moves, but the jobs table is machine-local, so
+    // this stale job still sits on the ORIGINAL operator's instance. The runner must NOT run under
+    // the new owner's reservation; it parks (poison, recoverable) and leaves the steal intact.
+    const epic5 = await beads.create(repo, {
+      title: "Feature V",
+      type: "epic",
+      description: "## Goal\nV",
+    });
+    await beads.approve(repo, epic5);
+    const ticket5 = (() => {
+      const p = JSON.parse(
+        execFileSync(
+          "bd",
+          ["create", "V ticket", "--type", "task", "--parent", epic5, "--acceptance", "x", "--json"],
+          { cwd: repo, encoding: "utf8" },
+        ),
+      );
+      return (Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string;
+    })();
+    // Another operator takes it over between enqueue and lease: a backlog reservation sets the
+    // assignee without flipping status (bead stays open), exactly what the approve route's steal does.
+    await beads.assign(repo, epic5, "thief-operator");
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    process.env.ANTON_CLAUDE_BIN = successClaude;
+    const jobId = await runner.enqueue({
+      type: "execute-epic",
+      projectId,
+      payload: { projectId, epicBeadId: epic5 },
+    });
+    await runner.tickOnce();
+    await runner.whenIdle();
+
+    // Poison → job parked; the reason names the epic and the operator that now owns it.
+    const job = await getJob(tdb.db, jobId);
+    expect(job?.status).toBe("parked");
+    expect(job?.lastError).toContain(epic5);
+    expect(job?.lastError).toContain("thief-operator");
+
+    // The take-over is intact (not stolen back to us) and nothing ran under it: the epic never
+    // reached in-review and its ticket was never closed under someone else's reservation.
+    const epic = await beads.show(repo, epic5);
+    expect(epic.assignee).toBe("thief-operator");
+    expect(epic.labels ?? []).not.toContain("stage:in-review");
+    expect((await beads.show(repo, ticket5)).status).not.toBe("closed");
+  }, 60_000);
+
+  it("parks an owned epic when the runner has no operator identity (anton-i71 review)", async () => {
+    // Same soft-lock as the take-over above, but the runner can't resolve an operator at all
+    // (no ANTON_OPERATOR, no global git user.name) — an older queued job on an unconfigured
+    // instance. The no-operator path used to keep a best-effort `safe` claim, which swallows bd's
+    // refusal to reassign a foreign bead and would run the epic under the new owner's reservation.
+    // With no identity to assert AND an epic now owned by someone, the runner must PARK instead.
+    const epic6 = await beads.create(repo, {
+      title: "Feature W",
+      type: "epic",
+      description: "## Goal\nW",
+    });
+    await beads.approve(repo, epic6);
+    const ticket6 = (() => {
+      const p = JSON.parse(
+        execFileSync(
+          "bd",
+          ["create", "W ticket", "--type", "task", "--parent", epic6, "--acceptance", "x", "--json"],
+          { cwd: repo, encoding: "utf8" },
+        ),
+      );
+      return (Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string;
+    })();
+    // Another operator owns it before the lease, exactly as in the take-over case.
+    await beads.assign(repo, epic6, "thief-operator");
+
+    // Strip this runner of any operator identity: unset ANTON_OPERATOR and point git's global
+    // config at /dev/null so `git config --global user.name` resolves nothing → resolveOperator()
+    // returns undefined. Restored in `finally` so later tests keep the suite's test-operator.
+    const savedOperator = process.env.ANTON_OPERATOR;
+    const savedGitGlobal = process.env.GIT_CONFIG_GLOBAL;
+    delete process.env.ANTON_OPERATOR;
+    process.env.GIT_CONFIG_GLOBAL = "/dev/null";
+    resetOperatorCache();
+    try {
+      const runner = new JobRunner({
+        db: tdb.db,
+        clock,
+        config: { maxConcurrent: 1, leaseMs: 30_000 },
+      });
+      runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      const jobId = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: epic6 },
+      });
+      await runner.tickOnce();
+      await runner.whenIdle();
+
+      // Poison → job parked; the reason names the epic and the operator that now owns it.
+      const job = await getJob(tdb.db, jobId);
+      expect(job?.status).toBe("parked");
+      expect(job?.lastError).toContain(epic6);
+      expect(job?.lastError).toContain("thief-operator");
+
+      // The owner's reservation is intact and nothing ran under it.
+      const epic = await beads.show(repo, epic6);
+      expect(epic.assignee).toBe("thief-operator");
+      expect(epic.labels ?? []).not.toContain("stage:in-review");
+      expect((await beads.show(repo, ticket6)).status).not.toBe("closed");
+    } finally {
+      if (savedOperator === undefined) delete process.env.ANTON_OPERATOR;
+      else process.env.ANTON_OPERATOR = savedOperator;
+      if (savedGitGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+      else process.env.GIT_CONFIG_GLOBAL = savedGitGlobal;
+      resetOperatorCache();
     }
   }, 60_000);
 

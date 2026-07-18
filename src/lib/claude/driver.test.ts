@@ -12,12 +12,14 @@ import { CLAUDE_BIN_ENV, runClaude, type ClaudeEvent } from "./driver";
 let dir: string;
 let prevBin: string | undefined;
 
-function writeFakeClaude(name: string, ndjsonLines: string[], exitCode = 0): string {
+function writeFakeClaude(name: string, ndjsonLines: string[], exitCode = 0, stderr = ""): string {
   const path = join(dir, name);
   const body = [
     "#!/usr/bin/env node",
     `const lines = ${JSON.stringify(ndjsonLines)};`,
     "for (const l of lines) { process.stdout.write(l + \"\\n\"); }",
+    `const stderr = ${JSON.stringify(stderr)};`,
+    "if (stderr) { process.stderr.write(stderr); }",
     `process.exitCode = ${exitCode};`,
     "",
   ].join("\n");
@@ -170,6 +172,365 @@ describe("runClaude", () => {
 
     expect(isUsageLimitError(caught)).toBe(true);
     expect((caught as { resetAt?: number }).resetAt).toBe(resetSec);
+  });
+
+  it("throws UsageLimitError with no resetAt for the captured monthly spend-limit payload", async () => {
+    // The exact wording captured on 2026-07-15 (run 36efe52b…): Claude Code surfaces a monthly
+    // spend-limit hit as `You've hit your monthly spend limit · raise it at claude.ai/settings/usage`
+    // with a non-zero exit and no reset timestamp. Before anton-b9l this slipped past USAGE_LIMIT_RE
+    // (which only knew usage/5-hour/weekly wording), so the runner surfaced the plain stderr exit
+    // error, burned maxAttempts, and parked. It must now route to UsageLimitError. Because the format
+    // supplies no reset time, resetAt is undefined → the runner falls back to quotaCooloffMs and
+    // refunds the attempt.
+    const spendLimitText = "You've hit your monthly spend limit · raise it at claude.ai/settings/usage";
+    const bin = writeFakeClaude(
+      "spend-limited-claude",
+      [
+        JSON.stringify({ type: "system", subtype: "init", session_id: "sess-spend" }),
+        JSON.stringify({
+          type: "assistant",
+          message: { content: [{ type: "text", text: spendLimitText }] },
+        }),
+        JSON.stringify({
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: true,
+          session_id: "sess-spend",
+          total_cost_usd: 0,
+          result: spendLimitText,
+        }),
+      ],
+      1,
+    );
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    let caught: unknown;
+    try {
+      await runClaude({ cwd: dir, prompt: "do the thing" });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(isUsageLimitError(caught)).toBe(true);
+    // No parseable reset time → runner uses the fallback cool-off (quotaCooloffMs) and refunds.
+    expect((caught as { resetAt?: number }).resetAt).toBeUndefined();
+    expect((caught as Error).message).toContain("monthly spend limit");
+  });
+
+  it("throws UsageLimitError for the no-link monthly spend-limit banner (/usage-credits variant)", async () => {
+    // anton-b9l review follow-up (PR #43): Claude Code 2.1.172 (anthropics/claude-code#67579)
+    // surfaces the monthly quota with no claude.ai/settings/usage URL — the banner is
+    // `You've hit your monthly spend limit.` followed on the next line by `/usage-credits …`.
+    // The earlier monthly branch required the settings/usage link on the same line, so this
+    // variant fell through as a plain `claude exited` error, burning attempts and parking. It
+    // must now route to UsageLimitError via the `/usage-credits` remediation pointer.
+    const spendLimitText = "You've hit your monthly spend limit.\n/usage-credits to check your usage and remaining credits";
+    const bin = writeFakeClaude(
+      "spend-limited-nolink-claude",
+      [
+        JSON.stringify({ type: "system", subtype: "init", session_id: "sess-nolink" }),
+        JSON.stringify({
+          type: "assistant",
+          message: { content: [{ type: "text", text: spendLimitText }] },
+        }),
+        JSON.stringify({
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: true,
+          session_id: "sess-nolink",
+          total_cost_usd: 0,
+          result: spendLimitText,
+        }),
+      ],
+      1,
+    );
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    let caught: unknown;
+    try {
+      await runClaude({ cwd: dir, prompt: "do the thing" });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(isUsageLimitError(caught)).toBe(true);
+    expect((caught as { resetAt?: number }).resetAt).toBeUndefined();
+    expect((caught as Error).message).toContain("monthly spend limit");
+  });
+
+  it("does NOT misclassify a clean success whose transcript mentions a monthly spend limit", async () => {
+    // Success false-positive guard, extended to the spend-limit wording (anton-b9l): a run that
+    // exits 0 with is_error false is a success even if its output says "monthly spend limit" (e.g. an
+    // agent working this very ticket). It must resolve, not throw UsageLimitError.
+    const bin = writeFakeClaude("mentions-spend-limit-claude", [
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [
+            { type: "text", text: 'Made "monthly spend limit" reschedule instead of parking the job.' },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        session_id: "sess-ok2",
+        total_cost_usd: 0.01,
+        result: "Implemented the monthly spend-limit detection and pushed.",
+      }),
+    ]);
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    const result = await runClaude({ cwd: dir, prompt: "work the anton-b9l ticket" });
+
+    expect(result.ok).toBe(true);
+    expect(result.isError).toBe(false);
+    expect(result.text).toBe("Implemented the monthly spend-limit detection and pushed.");
+  });
+
+  it("does NOT misclassify a non-zero exit whose transcript mentions the words 'monthly spend limit'", async () => {
+    // anton-b9l narrowing: the matcher keys on the captured payload wording ("hit your monthly spend
+    // limit"), not any occurrence of the bare words "monthly spend limit". A run that fails for an
+    // unrelated reason (e.g. an agent working this very ticket, whose output describes the monthly
+    // spend limit feature, whose tests or push then fail, exiting non-zero) must NOT be reclassified
+    // as a quota hit — that would refund the attempt and reschedule the real failure forever. It must
+    // surface as a plain error for a human.
+    const bin = writeFakeClaude(
+      "mentions-monthly-spend-limit-claude",
+      [
+        JSON.stringify({
+          type: "assistant",
+          message: {
+            content: [
+              { type: "text", text: "Narrowed the monthly spend limit matcher, but the push failed." },
+            ],
+          },
+        }),
+        JSON.stringify({
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: true,
+          session_id: "sess-bare",
+          total_cost_usd: 0.01,
+          result: "Narrowed the monthly spend limit matcher, but the push failed.",
+        }),
+      ],
+      1,
+    );
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    let caught: unknown;
+    try {
+      await runClaude({ cwd: dir, prompt: "work the anton-b9l ticket" });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(isUsageLimitError(caught)).toBe(false);
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain("claude exited with code 1");
+  });
+
+  it("does NOT misclassify a non-zero exit that quotes the exact spend-limit payload mid-prose", async () => {
+    // anton-b9l review follow-up: the spend-limit payload is an ordinary sentence a model can
+    // reproduce verbatim — e.g. an agent working this very ticket says it "added a test for
+    // 'You've hit your monthly spend limit'" and then its tests/push fail, exiting non-zero. The
+    // phrase is present in both the assistant and result text, but embedded mid-sentence rather than
+    // as Claude Code's own leading notice. Because USAGE_LIMIT_RE anchors to the start of a line, an
+    // embedded quote does NOT match, so the run surfaces as a plain error for a human instead of
+    // being refunded and rescheduled forever.
+    const quoted = "Added a test for the \"You've hit your monthly spend limit\" payload, but the push failed.";
+    const bin = writeFakeClaude(
+      "quotes-spend-limit-payload-claude",
+      [
+        JSON.stringify({
+          type: "assistant",
+          message: { content: [{ type: "text", text: quoted }] },
+        }),
+        JSON.stringify({
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: true,
+          session_id: "sess-quote",
+          total_cost_usd: 0.01,
+          result: quoted,
+        }),
+      ],
+      1,
+    );
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    let caught: unknown;
+    try {
+      await runClaude({ cwd: dir, prompt: "work the anton-b9l ticket" });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(isUsageLimitError(caught)).toBe(false);
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain("claude exited with code 1");
+  });
+
+  it("does NOT misclassify a non-zero exit that opens a line with the spend-limit phrase but no link", async () => {
+    // anton-b9l review follow-up (PR #43): line-anchoring alone is not enough for the monthly-spend
+    // wording — it's a whole English sentence a model can just as easily put at the *start* of a
+    // line (a heading, a leading quote in a fixture) while discussing this very behavior. Here an
+    // assistant block and the result field each begin with "You've hit your monthly spend limit"
+    // but WITHOUT Claude Code's trailing `raise it at claude.ai/settings/usage` link, then the run
+    // fails for an unrelated reason (exit 1). Because the monthly branch additionally requires that
+    // link on the same line, this leading quote does NOT match, so the real failure surfaces as a
+    // plain error for a human instead of being refunded and rescheduled forever.
+    const heading = "You've hit your monthly spend limit — here's the fixture I added, but the tests fail.";
+    const bin = writeFakeClaude(
+      "spend-limit-heading-no-link-claude",
+      [
+        JSON.stringify({
+          type: "assistant",
+          message: { content: [{ type: "text", text: heading }] },
+        }),
+        JSON.stringify({
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: true,
+          session_id: "sess-heading",
+          total_cost_usd: 0.01,
+          result: heading,
+        }),
+      ],
+      1,
+    );
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    let caught: unknown;
+    try {
+      await runClaude({ cwd: dir, prompt: "work the anton-b9l ticket" });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(isUsageLimitError(caught)).toBe(false);
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain("claude exited with code 1");
+  });
+
+  it("does NOT misclassify a non-zero exit that quotes the FULL no-link banner at line start in assistant prose", async () => {
+    // anton-b9l review follow-up (PR #43, thread PRRT_kwDOTWcq...): the earlier guards (line-anchor
+    // + required remediation pointer) still matched an agent that quotes the *whole* no-link banner
+    // — including the `/usage-credits` pointer — at the start of a line while working this very code
+    // path (e.g. adding a fixture), then fails for an unrelated reason. Because the model-authored
+    // assistant transcript is no longer scanned for the monthly-spend wording (only Claude Code's
+    // own result field + stderr are), this verbatim quote in an assistant block does NOT match. The
+    // result field here is a generic failure summary with no banner, so the run surfaces as a plain
+    // error for a human instead of being refunded and rescheduled forever.
+    const quotedBanner =
+      "You've hit your monthly spend limit.\n/usage-credits to check your usage and remaining credits\n\n" +
+      "^ Added the above as a fixture for the no-link variant, but three tests still fail.";
+    const bin = writeFakeClaude(
+      "quotes-full-nolink-banner-claude",
+      [
+        JSON.stringify({
+          type: "assistant",
+          message: { content: [{ type: "text", text: quotedBanner }] },
+        }),
+        JSON.stringify({
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: true,
+          session_id: "sess-fullquote",
+          total_cost_usd: 0.02,
+          result: "3 tests failed in driver.test.ts; the push was rejected.",
+        }),
+      ],
+      1,
+    );
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    let caught: unknown;
+    try {
+      await runClaude({ cwd: dir, prompt: "work the anton-b9l ticket" });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(isUsageLimitError(caught)).toBe(false);
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain("claude exited with code 1");
+  });
+
+  it("does NOT misclassify a non-zero exit whose RESULT field opens with the full no-link banner then adds failure prose", async () => {
+    // anton-b9l review follow-up (PR #43, thread PRRT_kwDOTWcq...): the result field is ALSO
+    // model-authored final text on an ordinary failed run, so excluding only the assistant
+    // transcript was not enough — a leading quote of the full banner in the *result* field would
+    // still match a loose scan. Here an agent working this very ticket makes its final result text
+    // begin with the verbatim no-link banner (including the `/usage-credits` pointer) and then
+    // reports that its own work failed. Because the result field is trusted for the spend-limit
+    // wording ONLY when the banner is the WHOLE result (SPEND_LIMIT_RESULT_RE is end-anchored), the
+    // trailing failure prose defeats the match, so the run surfaces as a plain error for a human
+    // instead of being refunded and rescheduled forever.
+    const resultText =
+      "You've hit your monthly spend limit.\n/usage-credits to check your usage and remaining credits\n\n" +
+      "^ Added the above as a fixture for the no-link variant, but three tests still fail.";
+    const bin = writeFakeClaude(
+      "result-quotes-full-nolink-banner-claude",
+      [
+        JSON.stringify({
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: true,
+          session_id: "sess-resultquote",
+          total_cost_usd: 0.02,
+          result: resultText,
+        }),
+      ],
+      1,
+    );
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    let caught: unknown;
+    try {
+      await runClaude({ cwd: dir, prompt: "work the anton-b9l ticket" });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(isUsageLimitError(caught)).toBe(false);
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain("claude exited with code 1");
+  });
+
+  it("throws UsageLimitError for a genuine monthly spend-limit banner surfaced only on stderr", async () => {
+    // anton-b9l review follow-up (PR #43): stderr is Claude Code's own diagnostic channel (the model
+    // streams to stdout, never the process stderr), so the spend-limit banner there is trusted with
+    // the loose matcher even when the result field is a generic error — a genuine abort that lands
+    // the banner on stderr must still route to UsageLimitError so the runner reschedules.
+    const bin = writeFakeClaude(
+      "spend-limited-stderr-claude",
+      [
+        JSON.stringify({ type: "system", subtype: "init", session_id: "sess-spend-stderr" }),
+        JSON.stringify({
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: true,
+          session_id: "sess-spend-stderr",
+          total_cost_usd: 0,
+        }),
+      ],
+      1,
+      "You've hit your monthly spend limit · raise it at claude.ai/settings/usage\n",
+    );
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    let caught: unknown;
+    try {
+      await runClaude({ cwd: dir, prompt: "do the thing" });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(isUsageLimitError(caught)).toBe(true);
+    expect((caught as Error).message).toContain("monthly spend limit");
   });
 
   it("does NOT misclassify a clean success whose transcript merely mentions a usage limit", async () => {

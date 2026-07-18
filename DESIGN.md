@@ -32,6 +32,28 @@ Mapping to beads: `backlog` = open, no `approved` label · `implementing` = `in_
 active run · `in-review` = open PR linked in `runs` · `done` = closed. **Approval is a label on
 the epic**, set by you in the UI. The execute job only ever touches approved epics.
 
+### Claim vs approve — reserving is not approving
+
+**Claim** and **approve** are separate actions on a run target (an epic or a parentless
+task/bug), and only approve starts automation:
+
+- **Human claim** (`POST/DELETE …/claim`) — reserve a target for a person *without* approving it
+  for automation. It only sets/clears the bead's **assignee** (`beads.assign`/`unassign`); the
+  bead stays `open` and in **backlog**, and no run is ever enqueued. Use it to call dibs while you
+  finish shaping, or to hand a target to a teammate, before anyone hits Approve.
+- **Soft-lock** — a claim is advisory, not a hard lock. Approving a target claimed by someone else
+  is refused (`409`); only the claimer approves it. Taking it over is an **explicit override** —
+  pass `{ steal: true }` — so approval can never silently run a teammate's reservation. Releasing
+  or re-claiming someone else's claim is gated the same way. Approve also **auto-claims**: an
+  unclaimed target (or one being stolen) is assigned to the approver *before* enqueuing, closing
+  the gap where a teammate could claim between approve and the run.
+
+Neither of these is the **runtime execution-claim**. That is the *runner's* `bd` claim: when
+execute-epic actually starts a run it flips the bead to **`in_progress`** (the `implementing`
+stage above) to mark it as executing. The human claim is a `backlog` reservation on `open`;
+the execution-claim is the runner announcing work is underway. Don't conflate the two — a claimed
+epic is still just reserved until you approve it.
+
 ## 3. Data model — two tiers by shareability
 
 Persistence splits by whether state is **shareable/durable** (belongs in git, follows the repo)

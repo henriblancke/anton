@@ -436,7 +436,16 @@ export const beads = {
   claim: (cwd: string, id: string, actor?: string) =>
     bdWrite(cwd, ["update", id, "--claim"], actor ? { BEADS_ACTOR: actor } : undefined),
 
-  /** Clear a bead's assignee (`bd assign <id> ""`) — used when releasing a stale claim. */
+  /**
+   * Set a bead's assignee WITHOUT touching status (`bd assign <id> <actor>`). This is the
+   * human-reservation primitive: unlike `claim`, it never flips the bead to in_progress, so the
+   * bead stays `open` and deriveStage stays `backlog` — a person reserves it without triggering a
+   * run. `actor` is a positional arg (not BEADS_ACTOR) because `bd assign` names the assignee
+   * directly; do NOT route human claims through `claim`, which is the automation-run primitive.
+   */
+  assign: (cwd: string, id: string, actor: string) => bdWrite(cwd, ["assign", id, actor]),
+
+  /** Clear a bead's assignee (`bd assign <id> ""`) — used when releasing a claim. */
   unassign: (cwd: string, id: string) => bdWrite(cwd, ["assign", id, ""]),
 
   /** Pure argv builder, exposed for testing and callers that want to inspect the write. */
@@ -537,6 +546,19 @@ export const beads = {
     }
     return false;
   },
+
+  /**
+   * The bead's run-lease labels OWNED by `ownRunId` (anton-jz1) — the leases this run itself
+   * published, matched by the `:<owner>` suffix. Used to sweep a run's OWN crash leftover on an
+   * idempotent short-circuit that returns BEFORE the general lease-adoption step (the external-ref
+   * early return in execute-epic): clearing these lets a stopped run free the epic immediately
+   * instead of leaving it looking live until the TTL, while a foreign machine's lease is deliberately
+   * left for its own owner/TTL to clear — honoring "finally clears only what we own".
+   */
+  ownRunLeaseLabels: (b: Bead, ownRunId: string): string[] =>
+    (b.labels ?? []).filter(
+      (l) => l.startsWith(RUN_LEASE_PREFIX) && parseRunLease(l).owner === ownRunId,
+    ),
 
   /**
    * Tiebreak for two runs that acquired the lease at the same instant (anton-jz1). The foreign-lease

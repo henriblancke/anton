@@ -8,7 +8,13 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
-import { enqueueExecuteEpicDeduped, getJob, resumeJob, systemClock } from "./queue";
+import {
+  enqueueExecuteEpicDeduped,
+  enqueueExecuteEpicIfAbsent,
+  getJob,
+  resumeJob,
+  systemClock,
+} from "./queue";
 
 let t: TestDb;
 beforeEach(() => {
@@ -82,6 +88,38 @@ describe("enqueueExecuteEpicDeduped", () => {
       insertReviewFix("rf-2");
     }).not.toThrow();
     expect(activeRows()).toHaveLength(2);
+  });
+});
+
+describe("enqueueExecuteEpicIfAbsent (take-over path, anton-i71)", () => {
+  it.each(["queued", "running", "parked", "failed"] as const)(
+    "reuses a %s prior job (covering) and enqueues nothing new",
+    (status) => {
+      const prior = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-1");
+      t.db.update(schema.jobs).set({ status }).where(eq(schema.jobs.id, prior)).run();
+
+      expect(enqueueExecuteEpicIfAbsent(t.db, systemClock, "p1", "epic-1")).toBeUndefined();
+      expect(activeRows()).toHaveLength(1);
+    },
+  );
+
+  it("enqueues a fresh job when only a `done` prior run exists (not resumable)", async () => {
+    // A machine that previously COMPLETED this epic holds a terminal `done` row. `done` is not
+    // resumable, so a re-approved/stolen backlog target must still get a runnable job here — else
+    // the take-over strands with nothing to run.
+    const prior = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-1");
+    t.db.update(schema.jobs).set({ status: "done" }).where(eq(schema.jobs.id, prior)).run();
+
+    const fresh = enqueueExecuteEpicIfAbsent(t.db, systemClock, "p1", "epic-1");
+    expect(fresh).toBeDefined();
+    expect(fresh).not.toBe(prior);
+    expect((await getJob(t.db, fresh!))?.status).toBe("queued");
+  });
+
+  it("enqueues a runnable job when the instance holds no prior job at all", () => {
+    const id = enqueueExecuteEpicIfAbsent(t.db, systemClock, "p1", "epic-solo");
+    expect(id).toBeDefined();
+    expect(activeRows()).toHaveLength(1);
   });
 });
 

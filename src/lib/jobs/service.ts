@@ -135,6 +135,20 @@ export function enqueueExecuteEpic(
 }
 
 /**
+ * Enqueue an execute-epic job for an owner-changing take-over, but only when THIS instance has no
+ * job for the epic yet (any status). Returns the new job id, or `undefined` when a local job already
+ * covers it. Jobs are machine-local, so a take-over that reassigns the reservation from another
+ * operator must give the new owner's instance its own runnable job — otherwise the approved work
+ * strands with the original owner's (now-poisoning) job on a different machine (anton-i71, PR #39).
+ */
+export function enqueueExecuteEpicIfAbsent(
+  projectId: string,
+  epicBeadId: string,
+): Promise<string | undefined> {
+  return Promise.resolve(getRunner().enqueueExecuteEpicIfAbsent(projectId, epicBeadId));
+}
+
+/**
  * Un-park a parked/failed job from the UI (anton-ner.4). Scoped to the project so a route can't
  * resume another project's job by id. Returns true if a resumable job was returned to `queued`
  * (the runner re-leases it next tick), false if the job doesn't exist, isn't in this project, or
