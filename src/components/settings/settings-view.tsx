@@ -15,6 +15,10 @@ interface EditableSettings {
   model?: string;
   seedPrompt?: string;
   reviewFixPrompt?: string;
+  testCommand?: string;
+  lintCommand?: string;
+  typecheckCommand?: string;
+  buildCommand?: string;
   concurrency?: number;
   jobTimeoutMinutes?: number;
   maxRetries?: number;
@@ -110,6 +114,10 @@ export function SettingsView({
   const [model, setModel] = useState(settings.model ?? "");
   const [seedPrompt, setSeedPrompt] = useState(settings.seedPrompt ?? "");
   const [reviewFixPrompt, setReviewFixPrompt] = useState(settings.reviewFixPrompt ?? "");
+  const [testCommand, setTestCommand] = useState(settings.testCommand ?? "");
+  const [lintCommand, setLintCommand] = useState(settings.lintCommand ?? "");
+  const [typecheckCommand, setTypecheckCommand] = useState(settings.typecheckCommand ?? "");
+  const [buildCommand, setBuildCommand] = useState(settings.buildCommand ?? "");
   const [saving, setSaving] = useState(false);
 
   /**
@@ -156,6 +164,11 @@ export function SettingsView({
           model: model || null,
           seedPrompt: seedPrompt.trim() || null,
           reviewFixPrompt: reviewFixPrompt.trim() || null,
+          // "" clears a verify gate → it's skipped (no behavior change).
+          testCommand: testCommand.trim() || null,
+          lintCommand: lintCommand.trim() || null,
+          typecheckCommand: typecheckCommand.trim() || null,
+          buildCommand: buildCommand.trim() || null,
           concurrency,
           jobTimeoutMinutes,
           maxRetries,
@@ -355,6 +368,50 @@ export function SettingsView({
 
           <Divider />
 
+          {/* Verify gates — operator-pinned hard checks run in the worktree before commit */}
+          <section className="flex flex-col gap-3.5">
+            <div className="flex items-baseline gap-2.5">
+              <h2 className="text-[15px] font-semibold">Verify gates</h2>
+              <span className="text-xs text-subtle">
+                deterministic checks anton runs after the agent, before commit · non-zero exit fails
+                the ticket
+              </span>
+            </div>
+            <div className="grid max-w-2xl grid-cols-1 gap-3.5 sm:grid-cols-2">
+              <GateField
+                label="Test command"
+                value={testCommand}
+                onChange={setTestCommand}
+                placeholder="e.g. bun run test"
+              />
+              <GateField
+                label="Lint command"
+                value={lintCommand}
+                onChange={setLintCommand}
+                placeholder="e.g. bun run lint"
+              />
+              <GateField
+                label="Typecheck command"
+                value={typecheckCommand}
+                onChange={setTypecheckCommand}
+                placeholder="e.g. bun run typecheck"
+              />
+              <GateField
+                label="Build command"
+                value={buildCommand}
+                onChange={setBuildCommand}
+                placeholder="e.g. bun run build"
+              />
+            </div>
+            <span className="max-w-2xl text-[11px] text-subtle">
+              Each gate runs in the ticket&apos;s worktree in order (test → lint → typecheck →
+              build). Empty = skipped. These are the operator-pinned backstop; the agent still
+              self-verifies. The same gates run before review-fix pushes.
+            </span>
+          </section>
+
+          <Divider />
+
           {/* Execution + Automation */}
           <div className="grid max-w-3xl grid-cols-1 gap-7 md:grid-cols-2">
             <section className="flex flex-col gap-3.5">
@@ -529,6 +586,36 @@ function Field({
         {chevron && <span className="ml-auto text-subtle">▾</span>}
       </div>
     </div>
+  );
+}
+
+/** Editable verify-gate command (anton-3oh8). Persists to settingsJson.*Command; "" clears it. */
+function GateField({
+  label,
+  value,
+  onChange,
+  placeholder,
+  className,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  placeholder?: string;
+  className?: string;
+}) {
+  return (
+    <label className={cn("flex flex-col gap-1.5", className)}>
+      <span className="text-[11px] text-subtle">{label}</span>
+      <input
+        type="text"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        maxLength={1000}
+        aria-label={label}
+        className="rounded-lg border border-border bg-card px-3 py-2 font-mono text-[12.5px] text-foreground outline-none placeholder:text-subtle focus:border-primary/60"
+      />
+    </label>
   );
 }
 

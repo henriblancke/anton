@@ -65,6 +65,16 @@ describe("loadBaseSystemPrompt (real file)", () => {
     // Anchors on the operating contract the base must encode.
     expect(base.toLowerCase()).toContain("bd remember"); // learnings
     expect(base.toLowerCase()).toMatch(/do not run `bd close`|bd close/i); // beads ownership
+    // The self-verification mandate: the agent runs the project's checks before declaring done.
+    expect(base).toContain("Verify before you finish");
+  });
+});
+
+describe("buildExecutionSystemPrompt self-verification section", () => {
+  it("carries the 'Verify before you finish' section into the composed prompt", async () => {
+    _resetBaseSystemPromptCache();
+    const out = await buildExecutionSystemPrompt({ agentPrompt: "AGENT-X", seedPrompt: "SEED-Y" });
+    expect(out).toContain("Verify before you finish");
   });
 });
 
