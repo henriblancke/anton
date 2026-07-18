@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { resumeJob } from "@/lib/jobs/service";
-import { getProjectBySlug } from "@/lib/projects";
+import { resolveProject } from "../../../resolve-project";
 
 export const dynamic = "force-dynamic";
 
@@ -15,10 +15,8 @@ export async function POST(
   { params }: { params: Promise<{ slug: string; jobId: string }> },
 ) {
   const { slug, jobId } = await params;
-  const project = await getProjectBySlug(slug);
-  if (!project) {
-    return NextResponse.json({ error: "Project not found" }, { status: 404 });
-  }
+  const { project, response } = await resolveProject(slug);
+  if (!project) return response;
 
   const resumed = await resumeJob(project.id, jobId);
   if (!resumed) {

@@ -2,6 +2,8 @@
 
 import { useEffect, useRef, useState } from "react";
 
+import { readSseFrames } from "@/lib/sse-frames";
+
 import "@xterm/xterm/css/xterm.css";
 
 /**
@@ -132,37 +134,14 @@ export function PtyTerminal({
         if (disposed) return;
         setPhase("streaming");
 
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
-
-        // SSE frames are separated by a blank line; each carries `event:` and `data:` lines.
-        while (!disposed) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-
-          let sep: number;
-          while ((sep = buffer.indexOf("\n\n")) !== -1) {
-            const frame = buffer.slice(0, sep);
-            buffer = buffer.slice(sep + 2);
-
-            let event = "message";
-            const dataLines: string[] = [];
-            for (const line of frame.split("\n")) {
-              if (line.startsWith("event: ")) event = line.slice(7);
-              else if (line.startsWith("data: ")) dataLines.push(line.slice(6));
-            }
-            const payload = dataLines.join("\n");
-
-            if (event === "data") {
-              // base64 → bytes; xterm renders the raw terminal stream (ANSI, cursor moves, UTF-8).
-              term.write(base64ToBytes(payload));
-            } else if (event === "exit") {
-              if (!disposed) {
-                onExitRef.current?.(Number(payload) || 0);
-                setPhase("ended");
-              }
+        for await (const { event, data } of readSseFrames(res.body, () => disposed)) {
+          if (event === "data") {
+            // base64 → bytes; xterm renders the raw terminal stream (ANSI, cursor moves, UTF-8).
+            term.write(base64ToBytes(data));
+          } else if (event === "exit") {
+            if (!disposed) {
+              onExitRef.current?.(Number(data) || 0);
+              setPhase("ended");
             }
           }
         }

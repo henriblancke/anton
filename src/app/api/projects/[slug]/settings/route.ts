@@ -4,11 +4,11 @@ import {
   CONCURRENCY_RANGE,
   JOB_TIMEOUT_MINUTES_RANGE,
   MAX_RETRIES_RANGE,
-  getProjectBySlug,
   getProjectSettingsBySlug,
   updateProjectSettings,
   type ProjectSettings,
 } from "@/lib/projects";
+import { resolveProject } from "../resolve-project";
 
 export const dynamic = "force-dynamic";
 
@@ -114,7 +114,9 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
         { status: 400 },
       );
     } else if (agents.length > 0) {
-      const project = await getProjectBySlug(slug);
+      // Resolve for the project's repoPath only — a missing project falls through to
+      // updateProjectSettings' 400 below, so tolerate null here rather than 404 early.
+      const { project } = await resolveProject(slug);
       const discovered = new Set((await discoverAgents(project?.repoPath)).map((a) => a.id));
       const unknown = agents.find((a) => !discovered.has(a));
       if (unknown !== undefined) {

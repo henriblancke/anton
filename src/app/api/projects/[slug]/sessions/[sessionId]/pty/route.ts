@@ -1,8 +1,8 @@
 import { z } from "zod";
 
-import { getProjectBySlug } from "@/lib/projects";
 import { getSessionById } from "@/lib/sessions";
 import { getPtyManager, type PtyEvent } from "@/lib/pty/manager";
+import { resolveProject } from "../../../resolve-project";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -26,9 +26,9 @@ async function resolveSession(
   slug: string,
   sessionId: string,
 ): Promise<{ ok: true } | { ok: false; response: Response }> {
-  const project = await getProjectBySlug(slug);
+  const { project, response } = await resolveProject(slug);
   if (!project) {
-    return { ok: false, response: Response.json({ error: "Project not found" }, { status: 404 }) };
+    return { ok: false, response };
   }
   const session = await getSessionById(sessionId);
   if (!session || session.projectId !== project.id) {

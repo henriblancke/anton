@@ -2,6 +2,8 @@
 
 import { useEffect, useRef, useState } from "react";
 
+import { readSseFrames } from "@/lib/sse-frames";
+
 import "@xterm/xterm/css/xterm.css";
 
 /**
@@ -103,34 +105,11 @@ export function RunTerminal({
         if (disposed) return;
         setState("streaming");
 
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
-
-        // SSE frames are separated by a blank line; each carries an `event:` and `data:` lines.
-        while (!disposed) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-
-          let sep: number;
-          while ((sep = buffer.indexOf("\n\n")) !== -1) {
-            const frame = buffer.slice(0, sep);
-            buffer = buffer.slice(sep + 2);
-
-            let event = "message";
-            const dataLines: string[] = [];
-            for (const line of frame.split("\n")) {
-              if (line.startsWith("event: ")) event = line.slice(7);
-              else if (line.startsWith("data: ")) dataLines.push(line.slice(6));
-            }
-            const data = dataLines.join("\n");
-
-            if (event === "log") {
-              term.write(data.endsWith("\n") ? data : data + "\r\n");
-            } else if (event === "end") {
-              if (!disposed) setState("ended");
-            }
+        for await (const { event, data } of readSseFrames(res.body, () => disposed)) {
+          if (event === "log") {
+            term.write(data.endsWith("\n") ? data : data + "\r\n");
+          } else if (event === "end") {
+            if (!disposed) setState("ended");
           }
         }
         if (!disposed) setState((s) => (s === "streaming" ? "ended" : s));
