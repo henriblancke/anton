@@ -54,13 +54,19 @@ async function resolvePolicy(projectId: string | undefined) {
  * Cross-machine run-liveness source for the runner (anton-jz1). Reads the shared beads board to
  * tell whether an execute-epic run is already live for this epic on ANOTHER machine — the `jobs`
  * table is machine-local, so a Force run on machine B can't otherwise see a run executing on
- * machine A and would double-run it. Fails open (returns false) so a transient beads read never
- * blocks a legitimate run; the local dedupe + `jobs_active_epic_unique` still backstop same-machine.
+ * machine A and would double-run it. Pulls the shared board FIRST: the local Dolt working set can
+ * be a sync heartbeat (~30s) behind, so without a pull a lease machine A published moments ago
+ * reads as absent and this gate lets B enqueue a second concurrent run — the exact race the lease
+ * exists to close. Fails open (returns false) so a transient beads read never blocks a legitimate
+ * run; the local dedupe + `jobs_active_epic_unique` still backstop same-machine.
  */
 async function liveRunCheck(projectId: string, epicBeadId: string): Promise<boolean> {
   try {
     const project = await getProjectById(getDb(), projectId);
     if (!project) return false;
+    // Best-effort: a pull failure (offline, transient) falls back to the local snapshot rather
+    // than blocking the check — the same fail-open posture as the surrounding try/catch.
+    await beads.pull(project.repoPath).catch(() => {});
     const bead = await beads.show(project.repoPath, epicBeadId);
     return beads.isRunLive(bead, Date.now());
   } catch {
