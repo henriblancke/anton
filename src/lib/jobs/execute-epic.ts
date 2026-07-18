@@ -43,6 +43,17 @@ export interface ExecuteEpicPayload {
  */
 const RUN_LEASE_TTL_MS = 15 * 60_000;
 const RUN_LEASE_REFRESH_MS = 5 * 60_000;
+/**
+ * Propagation window the post-publish race arbitration (step 1b) settles for before it trusts an
+ * uncontested read (anton-jz1). Concluding a run "won" from seeing only its OWN lease is a decision
+ * made on the ABSENCE of a foreign lease, and absence is unreliable on an eventually-consistent
+ * board: a machine that force-ran the same epic at the same instant may not have propagated its lease
+ * yet, so a fast publish→read can miss it. Waiting a bounded window (comfortably above sync round-trip
+ * latency, far below the TTL) lets a near-simultaneous foreign lease reach the remote before we
+ * re-read and commit to running. This narrows — like the rest of this protocol, it can't fully close
+ * without a real cross-machine lock — the asymmetric-read window the reviewer flagged.
+ */
+const RUN_LEASE_SETTLE_MS = 2_000;
 
 export interface ExecuteEpicDeps {
   db: AntonDb;
@@ -288,52 +299,68 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //     REQUIRED, not best-effort (anton-jz1): a swallowed pull failure would arbitrate against a
       //     stale local view that can't see the other machine's lease, so both could conclude they
       //     won — the exact double-run this step exists to break. If the pull fails we can't prove we
-      //     won, so we fail closed (park + retry) rather than proceed. This narrows the double-run
-      //     window to the sub-heartbeat gap where a machine re-reads before the other's lease has
-      //     propagated; it can't fully close it without a true cross-machine lock, but it
-      //     deterministically resolves the symmetric collision. Throwing here (before the refresh
-      //     timer is armed) means `finally` (leaseTimer still null) tears down only the lease this run
-      //     published.
-      try {
-        await beads.pull(repo);
-      } catch (e) {
-        throw new RunAlreadyLiveError(
-          `${epicBeadId} could not refresh the shared board to arbitrate the run-lease race (${
-            e instanceof Error ? e.message : String(e)
-          }) — parking so a concurrent run on another machine isn't ignored; this attempt resumes ` +
-            `once the board is reachable`,
-        );
-      }
-      const acquired = await beads.show(repo, epicBeadId).catch(() => null);
-      // Fail closed when this re-read fails (anton-jz1). It's the ONLY check confirming no concurrent
-      // lease won the race; a null here (DB lock, transient CLI error, malformed output) means we
-      // can't prove we won, so park + retry like the pull failure above rather than fall through and
-      // proceed while another machine may hold a live lease.
-      if (!acquired) {
-        throw new RunAlreadyLiveError(
-          `${epicBeadId} could not re-read the target to arbitrate the run-lease race — parking so a ` +
-            `concurrent run on another machine isn't ignored; this attempt resumes once the board is reachable`,
-        );
-      }
-      // If the step-0 pre-check was stale, an already-live incumbent lease could have been invisible
-      // then and only surfaces now. That incumbent won't re-arbitrate, so winsRunLeaseRace's
-      // lowest-owner-wins tiebreak would let us steal the lease and double-run. Park on ANY foreign
-      // live lease instead of arbitrating by owner order (anton-jz1). A trusted (fresh) pre-check
-      // guarantees no incumbent existed, so a foreign lease seen now is a symmetric racer and IS
-      // safely arbitrable below.
-      if (!preCheckTrusted && beads.foreignRunLeaseLive(acquired, clock.now(), runId)) {
-        throw new RunAlreadyLiveError(
-          `${epicBeadId} found a live run-lease from another machine after a stale pre-check — parking ` +
-            `rather than stealing by owner order (that run started earlier and won't yield); this ` +
-            `attempt resumes once it settles and clears its lease`,
-        );
-      }
-      if (!beads.winsRunLeaseRace(acquired, clock.now(), runId)) {
-        throw new RunAlreadyLiveError(
-          `${epicBeadId} lost the run-lease race to a concurrent run on another machine — parking; ` +
-            `this attempt resumes once that run settles and clears its lease`,
-        );
-      }
+      //     won, so we fail closed (park + retry) rather than proceed. Throwing here (before the
+      //     refresh timer is armed) means `finally` (leaseTimer still null) tears down only the lease
+      //     this run published.
+      const arbitrateRunLease = async () => {
+        try {
+          await beads.pull(repo);
+        } catch (e) {
+          throw new RunAlreadyLiveError(
+            `${epicBeadId} could not refresh the shared board to arbitrate the run-lease race (${
+              e instanceof Error ? e.message : String(e)
+            }) — parking so a concurrent run on another machine isn't ignored; this attempt resumes ` +
+              `once the board is reachable`,
+          );
+        }
+        const acquired = await beads.show(repo, epicBeadId).catch(() => null);
+        // Fail closed when this re-read fails (anton-jz1). It's the ONLY check confirming no
+        // concurrent lease won the race; a null here (DB lock, transient CLI error, malformed output)
+        // means we can't prove we won, so park + retry like the pull failure above rather than fall
+        // through and proceed while another machine may hold a live lease.
+        if (!acquired) {
+          throw new RunAlreadyLiveError(
+            `${epicBeadId} could not re-read the target to arbitrate the run-lease race — parking so a ` +
+              `concurrent run on another machine isn't ignored; this attempt resumes once the board is reachable`,
+          );
+        }
+        // If the step-0 pre-check was stale, an already-live incumbent lease could have been invisible
+        // then and only surfaces now. That incumbent won't re-arbitrate, so winsRunLeaseRace's
+        // lowest-owner-wins tiebreak would let us steal the lease and double-run. Park on ANY foreign
+        // live lease instead of arbitrating by owner order (anton-jz1). A trusted (fresh) pre-check
+        // guarantees no incumbent existed, so a foreign lease seen now is a symmetric racer and IS
+        // safely arbitrable below.
+        if (!preCheckTrusted && beads.foreignRunLeaseLive(acquired, clock.now(), runId)) {
+          throw new RunAlreadyLiveError(
+            `${epicBeadId} found a live run-lease from another machine after a stale pre-check — parking ` +
+              `rather than stealing by owner order (that run started earlier and won't yield); this ` +
+              `attempt resumes once it settles and clears its lease`,
+          );
+        }
+        if (!beads.winsRunLeaseRace(acquired, clock.now(), runId)) {
+          throw new RunAlreadyLiveError(
+            `${epicBeadId} lost the run-lease race to a concurrent run on another machine — parking; ` +
+              `this attempt resumes once that run settles and clears its lease`,
+          );
+        }
+      };
+      // Arbitrate, settle, then arbitrate AGAIN before committing to run (anton-jz1). A single
+      // post-publish read can't close the race the reviewer flagged: winsRunLeaseRace returning true
+      // means "no foreign lease that beats us is VISIBLE", but on an eventually-consistent board a
+      // machine that force-ran the same instant may simply not have propagated its lease yet — so a
+      // fast publish→read wins uncontested while the slower racer, re-reading later, sees both leases
+      // and (if it sorts lower) also wins. That's the asymmetric-read double-run. The first call
+      // parks us fast if we've already clearly lost; the settle then gives a near-simultaneous foreign
+      // lease time to reach the remote, and the second call re-reads and re-arbitrates against it — so
+      // an "uncontested" win is only trusted once it has survived a propagation window rather than
+      // being acted on the instant no rival is visible. `clock.sleep` is the real wall-clock wait in
+      // production (systemClock); test clocks omit it, so the settle is a no-op and the second read
+      // runs immediately against the same fake board. This narrows, but (like the rest of this
+      // protocol) can't fully close, the window — a true cross-machine lock/CAS would; beads/Dolt
+      // offers none.
+      await arbitrateRunLease();
+      await clock.sleep?.(RUN_LEASE_SETTLE_MS);
+      await arbitrateRunLease();
 
       leaseTimer = setInterval(() => {
         if (leaseSettled) return; // run is settling — don't publish a fresh lease behind finally's clear
