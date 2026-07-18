@@ -7,6 +7,7 @@ import { cn } from "@/lib/utils";
 import { isNavItemActive, type ShellNavItem } from "@/components/shell/shell-utils";
 import { ThemeToggle } from "@/components/shell/theme-toggle";
 import { AntonWordmark } from "@/components/shell/brand";
+import { UsagePill } from "@/components/usage/usage-pill";
 import {
   BoardIcon,
   DependenciesIcon,
@@ -121,6 +122,9 @@ export function Sidebar({
         </nav>
 
         <div className="mt-4 flex flex-col gap-3">
+          {/* Global Claude usage glance. Renders nothing until live usage resolves and hides again
+              if the API reports absence — no reserved slot, so the footer never shifts. */}
+          <UsagePill />
           <ThemeToggle />
           <div className="flex items-center gap-2.5 px-1">
             <span className="size-6 shrink-0 rounded-full bg-[linear-gradient(135deg,#4fc08a,#57a8f2)]" aria-hidden="true" />

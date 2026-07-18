@@ -164,7 +164,7 @@ export function UsageMeter({ usage }: { usage: UsageSnapshot }) {
         </span>
       </Popover.Trigger>
       <Popover.Portal>
-        <Popover.Positioner side="top" align="end" sideOffset={8} className="z-50">
+        <Popover.Positioner side="top" align="start" sideOffset={8} className="z-50">
           <Popover.Popup
             className={cn(
               "w-64 rounded-xl border border-border bg-popover p-3.5 text-popover-foreground shadow-lg ring-1 ring-foreground/5 outline-none",
