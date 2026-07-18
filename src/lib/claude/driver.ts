@@ -69,15 +69,24 @@ export interface RunClaudeOptions {
  * and the spend-limit payload is an ordinary English sentence a model can reproduce verbatim — an
  * agent working this very ticket might quote `You've hit your monthly spend limit` in its own prose
  * (or an added test fixture) and then fail for an unrelated reason (red tests, a rejected push).
- * Matching that embedded quote would refund the attempt and reschedule the real failure forever.
- * So every branch is anchored to the start of a line (`^\s*…`, multiline `m`): Claude Code emits
- * the notice as the *leading* content of the result field / an assistant block, whereas a quotation
- * is buried mid-sentence. Anchoring keeps the genuine standalone notice matching while letting a
- * failure that merely mentions the wording — and ordinary payment failures (declined card, no
- * payment method) — fall through to a plain error for a human.
+ * Matching that quote would refund the attempt and reschedule the real failure forever. Two guards
+ * keep that out:
+ *   1. Every branch is anchored to the start of a line (`^\s*…`, multiline `m`): Claude Code emits
+ *      the notice as the *leading* content of the result field / an assistant block, whereas a
+ *      quotation buried mid-sentence never starts a line. That alone rejects the common mid-prose
+ *      quote.
+ *   2. The monthly-spend wording is a whole English sentence a model could just as easily put at
+ *      the *start* of a line (a heading, a leading quote), so line-anchoring is not enough on its
+ *      own here — unlike the terse "usage limit reached" / "5-hour limit reached" banners it does
+ *      not read as machine output. So the monthly branch additionally requires the notice's trailing
+ *      `claude.ai/settings/usage` link on the same line: Claude Code always emits the full
+ *      `… monthly spend limit · raise it at claude.ai/settings/usage` banner, whereas prose leading
+ *      with the phrase does not carry the link. This keeps the genuine standalone notice matching
+ *      while letting a failure that merely mentions the wording — and ordinary payment failures
+ *      (declined card, no payment method) — fall through to a plain error for a human.
  */
 const USAGE_LIMIT_RE =
-  /^\s*(?:(?:claude ai\s+)?usage limit reached|(?:5-hour|weekly) limit reached|(?:you['’]ve\s+)?(?:hit|reached) your monthly spend limit)/im;
+  /^\s*(?:(?:claude ai\s+)?usage limit reached|(?:5-hour|weekly) limit reached|(?:you['’]ve\s+)?(?:hit|reached) your monthly spend limit\b.*claude\.ai\/settings\/usage)/im;
 
 /** Best-effort extraction of a reset time (unix seconds) from claude's usage-limit text. */
 function parseResetAt(text: string | undefined): number | undefined {

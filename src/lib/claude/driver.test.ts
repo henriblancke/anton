@@ -330,6 +330,48 @@ describe("runClaude", () => {
     expect((caught as Error).message).toContain("claude exited with code 1");
   });
 
+  it("does NOT misclassify a non-zero exit that opens a line with the spend-limit phrase but no link", async () => {
+    // anton-b9l review follow-up (PR #43): line-anchoring alone is not enough for the monthly-spend
+    // wording — it's a whole English sentence a model can just as easily put at the *start* of a
+    // line (a heading, a leading quote in a fixture) while discussing this very behavior. Here an
+    // assistant block and the result field each begin with "You've hit your monthly spend limit"
+    // but WITHOUT Claude Code's trailing `raise it at claude.ai/settings/usage` link, then the run
+    // fails for an unrelated reason (exit 1). Because the monthly branch additionally requires that
+    // link on the same line, this leading quote does NOT match, so the real failure surfaces as a
+    // plain error for a human instead of being refunded and rescheduled forever.
+    const heading = "You've hit your monthly spend limit — here's the fixture I added, but the tests fail.";
+    const bin = writeFakeClaude(
+      "spend-limit-heading-no-link-claude",
+      [
+        JSON.stringify({
+          type: "assistant",
+          message: { content: [{ type: "text", text: heading }] },
+        }),
+        JSON.stringify({
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: true,
+          session_id: "sess-heading",
+          total_cost_usd: 0.01,
+          result: heading,
+        }),
+      ],
+      1,
+    );
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    let caught: unknown;
+    try {
+      await runClaude({ cwd: dir, prompt: "work the anton-b9l ticket" });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(isUsageLimitError(caught)).toBe(false);
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain("claude exited with code 1");
+  });
+
   it("does NOT misclassify a clean success whose transcript merely mentions a usage limit", async () => {
     // Regression for the anton-ner.2 transcript-scan false positive: a run that exits 0 with
     // is_error false is a success, even if an assistant text block contains "usage limit reached"
