@@ -81,8 +81,8 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     // is an epic OR a parentless task/bug run as an epic-of-one (isRunTarget). Distinguish the two
     // non-runnable cases so the poison message is honest: a bead that WAS found but isn't a valid
     // target must not read "not found" (that sends the operator hunting for a missing bead).
-    const all = await beads.list(repo, ["--status", "all"]);
-    const target = all.find((b) => b.id === epicBeadId);
+    let all = await beads.list(repo, ["--status", "all"]);
+    let target = all.find((b) => b.id === epicBeadId);
     if (!target) throw new PoisonEpic(`bead ${epicBeadId} not found on the board`);
     if (!beads.isRunTarget(target)) {
       const parent = (target.parent ?? target.parent_id) as string | undefined;
@@ -123,7 +123,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     // (an epic-of-one). The rest of the pipeline — worktree, per-ticket claude→tests→commit→close,
     // one PR — is identical either way, so the standalone case is just a one-element ticket list.
     const standaloneRun = !beads.isEpic(target);
-    const tickets = standaloneRun ? [target] : childrenOf(all, epicBeadId);
+    let tickets = standaloneRun ? [target] : childrenOf(all, epicBeadId);
     if (tickets.length === 0) throw new PoisonEpic(`epic ${epicBeadId} has no tickets`);
 
     // Branches keep the `prefix/id` slash (git convention); only the worktree *path* segment is
@@ -223,6 +223,26 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         leaseTarget = await beads.show(repo, epicBeadId);
       } catch {
         preCheckTrusted = false; // fell back to the stale top-of-handler snapshot
+      }
+
+      // Re-derive the ticket list from the freshly-pulled board (anton-jz1). `all`/`target`/`tickets`
+      // up top were read BEFORE the pull above, so on a cross-machine retry a child ticket another
+      // machine closed — then crashed before stamping `external_ref` — still shows OPEN in that stale
+      // snapshot. The ticket loop (step 4) skips only tickets whose status is `closed`, so iterating
+      // the stale list would re-run claude and re-commit work the just-pulled board already reflects as
+      // done. Re-list here so those remotely-closed tickets are skipped. Best-effort like the pull: a
+      // failed re-list keeps the pre-pull snapshot (no worse than before this refresh existed). The
+      // epic/standalone shape can't change across a pull, so `standaloneRun` is derived once above.
+      try {
+        const fresh = await beads.list(repo, ["--status", "all"]);
+        const freshTarget = fresh.find((b) => b.id === epicBeadId);
+        if (freshTarget) {
+          all = fresh;
+          target = freshTarget;
+          tickets = standaloneRun ? [target] : childrenOf(all, epicBeadId);
+        }
+      } catch {
+        // keep the pre-pull snapshot
       }
 
       // 0a. Revalidate the target still needs execution (anton-jz1). A job that parked on a foreign

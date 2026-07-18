@@ -302,6 +302,16 @@ export class JobRunner {
       if (live) return undefined;
     }
 
+    // Re-check quiescence AFTER the await (anton-jz1). `liveRunCheck` yields, and `quiesceProject()`
+    // can run during it: it sets the flag then calls `abortProject`, which saw no active job for us
+    // (our row isn't inserted yet) and proceeded to tear the project down. Enqueuing now would strand
+    // an execute-epic row for a project being deleted, so re-gate exactly like the pre-await check
+    // above before inserting. (`abortProject`'s own post-sweep leftover guard fails loud if a row
+    // still slips in after this, so the two together close the window.)
+    if (this.quiescedProjects.has(projectId)) {
+      throw new Error(`Project is being deleted: ${projectId}`);
+    }
+
     return enqueueExecuteEpicDeduped(this.db, this.clock, projectId, epicBeadId);
   }
 
