@@ -13,7 +13,12 @@ import { buildExecutionSystemPrompt } from "../claude/system-prompt";
 import { runClaude, type ClaudeEvent } from "../claude/driver";
 import { commitAll, openPullRequest, resolveFreshBase } from "../git/ops";
 import { createWorktree, removeWorktree } from "../git/worktree";
-import { getProjectById, getProjectSettings, type ProjectSettings } from "../projects";
+import {
+  getProjectById,
+  getProjectSettings,
+  resolveVerifyGates,
+  type ProjectSettings,
+} from "../projects";
 import { resolveOperator } from "../operator";
 import {
   createRun,
@@ -23,7 +28,7 @@ import {
 import { appendSessionLog, createSession, endSession, sessionLogPath } from "../sessions";
 import { buildPrTitle } from "./pr-title";
 import { isUsageLimitError } from "./errors";
-import { runShell } from "./shell";
+import { runVerifyGates } from "./shell";
 import type { AntonDb, Clock } from "./queue";
 import { systemClock } from "./queue";
 import type { JobContext, JobHandler } from "./runner";
@@ -432,12 +437,15 @@ async function runTicket(args: {
       throw new Error(`claude reported an error for ${ticket.id}: ${result.text ?? "unknown"}`);
     }
 
-    // Tests (optional — configured per project).
-    if (settings.testCommand) {
-      const test = await runShell(settings.testCommand, worktreePath, ctx.signal);
-      await appendSessionLog(logPath, `\n[tests] ${settings.testCommand}\n${test.output}\n`);
-      if (!test.ok) throw new Error(`tests failed for ${ticket.id} (exit ${test.code})`);
-    }
+    // Verify gates (optional — configured per project): tests + operator-pinned lint/typecheck/
+    // build (anton-3oh8). Absent → no gates run. A non-zero exit fails the ticket before commit.
+    await runVerifyGates(
+      resolveVerifyGates(settings),
+      worktreePath,
+      ctx.signal,
+      logPath,
+      (gate, code) => `${gate.label} gate failed for ${ticket.id} (exit ${code})`,
+    );
 
     // Commit whatever claude changed.
     await commitAll(worktreePath, `${ticket.id}: ${ticket.title}`);

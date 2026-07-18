@@ -35,8 +35,13 @@ import {
 } from "../git/pr";
 import { createWorktree, findWorktree, removeWorktree, worktreePathFor, type Worktree } from "../git/worktree";
 import { resolveOperator } from "../operator";
-import { getProjectById, getProjectSettings, type ProjectSettings } from "../projects";
-import { runShell } from "./shell";
+import {
+  getProjectById,
+  getProjectSettings,
+  resolveVerifyGates,
+  type ProjectSettings,
+} from "../projects";
+import { runVerifyGates } from "./shell";
 import { findOpenRunForEpic, updateRun } from "../runs";
 import { appendSessionLog, createSession, endSession, sessionLogPath } from "../sessions";
 import { buildReviewFixPrompt, parseThreadReport, type ThreadOutcome } from "./review-fix-context";
@@ -351,7 +356,10 @@ async function runFixSession(args: {
   }
 }
 
-/** Optional test gate before pushing (same gate as execution). Throws if the tests fail. */
+/**
+ * Optional verify gates before pushing (same mechanism as execution, anton-3oh8): tests +
+ * operator-pinned lint/typecheck/build. Absent → no gates run. Throws on the first non-zero exit.
+ */
 async function runTestGate(
   settings: ProjectSettings,
   cwd: string,
@@ -359,10 +367,13 @@ async function runTestGate(
   logPath: string,
   number: number,
 ): Promise<void> {
-  if (!settings.testCommand) return;
-  const test = await runShell(settings.testCommand, cwd, signal);
-  await appendSessionLog(logPath, `\n[tests] ${settings.testCommand}\n${test.output}\n`);
-  if (!test.ok) throw new Error(`tests failed after review-fix for PR #${number} (exit ${test.code})`);
+  await runVerifyGates(
+    resolveVerifyGates(settings),
+    cwd,
+    signal,
+    logPath,
+    (gate, code) => `${gate.label} gate failed after review-fix for PR #${number} (exit ${code})`,
+  );
 }
 
 /**

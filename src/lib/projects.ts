@@ -89,6 +89,15 @@ export async function getProjectById(db: AntonDb, id: string): Promise<Project |
 export interface ProjectSettings {
   model?: string;
   testCommand?: string;
+  /**
+   * Optional operator-pinned verify gates (anton-3oh8), run in the worktree after the agent and
+   * before commit alongside `testCommand`. Each is a shell command; a non-zero exit fails the
+   * ticket exactly like the test gate. Absent → skipped (no behavior change). These are the
+   * deterministic hard backstop complementing the agent's own self-verification (sibling ticket).
+   */
+  lintCommand?: string;
+  typecheckCommand?: string;
+  buildCommand?: string;
   permissionMode?: "default" | "acceptEdits" | "bypassPermissions" | "plan";
   baseBranch?: string;
   /**
@@ -142,6 +151,28 @@ export interface ProjectSettings {
    * `<title> (<id>)`, so existing projects' PR titles are unchanged until enabled.
    */
   conventionalCommits?: boolean;
+}
+
+/** A resolved verify gate (anton-3oh8): a stable label (for logs/errors) + the shell command. */
+export interface VerifyGate {
+  label: string;
+  command: string;
+}
+
+/**
+ * The ordered verify gates configured for a project (anton-3oh8): tests, then lint, typecheck,
+ * build. Unset commands are skipped, so an empty result means "no gates" → unchanged behavior.
+ * Shared by execute-epic and review-fix so both enforce the same operator backstop identically.
+ */
+export function resolveVerifyGates(settings: ProjectSettings): VerifyGate[] {
+  const gates: VerifyGate[] = [];
+  if (settings.testCommand) gates.push({ label: "tests", command: settings.testCommand });
+  if (settings.lintCommand) gates.push({ label: "lint", command: settings.lintCommand });
+  if (settings.typecheckCommand) {
+    gates.push({ label: "typecheck", command: settings.typecheckCommand });
+  }
+  if (settings.buildCommand) gates.push({ label: "build", command: settings.buildCommand });
+  return gates;
 }
 
 /** Defaults for the per-project job policy when a setting is unset. */
