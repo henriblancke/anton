@@ -96,22 +96,32 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       throw new PoisonEpic(`target ${epicBeadId} is not approved — refusing to execute`);
     }
 
+    // Compute the epic's open blockers from a board snapshot. An epic's blockers come from the
+    // epic-graph rollup; a standalone task/bug (epic-of-one) never appears there, so derive its
+    // blockers from its own `blocks` edges. An epic also inherits any open standalone (parentless
+    // task/bug) prerequisite that the epic-graph rollup drops (epicStandaloneBlockers) — the same
+    // gap the approve route closes. The epic-vs-standalone shape can't change across a pull, so
+    // capture it here (while `target` is narrowed) and reuse it against the freshly-pulled board in
+    // step 0 — `target` is a `let` reassigned there, so reading it inside this closure would widen
+    // back to `Bead | undefined`.
+    const targetIsEpic = beads.isEpic(target);
+    const computeBlockers = (board: Bead[]): string[] =>
+      targetIsEpic
+        ? [
+            ...(computeEpicGraph(board).epics.find((n) => n.id === epicBeadId)?.blockedBy ?? []),
+            ...epicStandaloneBlockers(board, epicBeadId),
+          ]
+        : standaloneBlockers(board, epicBeadId);
+
     // Re-check the same readiness gate the approval route enforces, now at job start. Approval only
     // guarantees readiness at approval time; between then and this lease a `blocks` edge could have
     // been added or pulled in via Dolt sync (a shared board), leaving this job queued behind a
-    // blocker that's no longer done. An epic's blockers come from the epic-graph rollup; a
-    // standalone task/bug (epic-of-one) never appears there, so derive its blockers from its own
-    // `blocks` edges. Either way, derive from the fresh `all` read above and PARK if a blocker is
-    // open — starting still-blocked work would violate the sequence. Recoverable: once the
-    // blocker completes, resuming the parked job re-reads beads and passes this gate.
-    // An epic also inherits any open standalone (parentless task/bug) prerequisite that the
-    // epic-graph rollup drops (epicStandaloneBlockers) — the same gap the approve route closes.
-    const blockers = beads.isEpic(target)
-      ? [
-          ...(computeEpicGraph(all).epics.find((n) => n.id === epicBeadId)?.blockedBy ?? []),
-          ...epicStandaloneBlockers(all, epicBeadId),
-        ]
-      : standaloneBlockers(all, epicBeadId);
+    // blocker that's no longer done. Derive from the fresh `all` read above and PARK if a blocker is
+    // open — starting still-blocked work would violate the sequence. Recoverable: once the blocker
+    // completes, resuming the parked job re-reads beads and passes this gate. Re-checked again in
+    // step 0 after the cross-machine pull refreshes `all` (a blocker another machine pushed since
+    // would be invisible to this pre-pull snapshot).
+    const blockers = computeBlockers(all);
     if (blockers.length > 0) {
       throw new PoisonEpic(
         `${epicBeadId} is blocked by ${blockers.join(", ")} — refusing to execute; ` +
@@ -288,6 +298,23 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         // Closed-without-merging ref → stale. Fall through to recover the epic: the foreign-lease gate
         // and general lease adoption below run as usual (nothing adopted here so `finally` owns only what
         // the recovery path takes), the closed tickets are skipped, and step 5 re-opens the PR.
+      }
+
+      // 0a-bis. Re-run the job-start readiness gate against the freshly-pulled board (anton-jz1).
+      //     The top-of-handler `blockers` check ran on the PRE-pull `all`, so a `blocks` edge
+      //     another machine pushed before this pull is invisible there — and the `fresh` adoption
+      //     above swapped `all`/`tickets` to the pulled board WITHOUT re-checking readiness, which
+      //     would let this path execute a now-blocked epic and bypass the gate. Recompute from the
+      //     adopted board and PARK if a blocker reopened (recoverable, same as the top gate).
+      //     Checked AFTER the completion short-circuit (step 0a) so a genuinely-finished epic still
+      //     takes the idempotent "done" path instead of parking, and BEFORE adopting/publishing any
+      //     lease (below) so a park leaves nothing for `finally` to clear.
+      const freshBlockers = computeBlockers(all);
+      if (freshBlockers.length > 0) {
+        throw new PoisonEpic(
+          `${epicBeadId} is blocked by ${freshBlockers.join(", ")} — refusing to execute; ` +
+            `resume the run once the blocker(s) complete`,
+        );
       }
 
       if (beads.foreignRunLeaseLive(leaseTarget, clock.now(), runId)) {
