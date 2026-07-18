@@ -11,7 +11,7 @@ import { computeEpicGraph, epicStandaloneBlockers, standaloneBlockers } from "..
 import { loadAgentPrompt } from "../claude/agent-prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
 import { runClaude, type ClaudeEvent } from "../claude/driver";
-import { commitAll, openPullRequest, resolveFreshBase } from "../git/ops";
+import { commitAll, openPullRequest, pullRequestState, resolveFreshBase } from "../git/ops";
 import { createWorktree, removeWorktree } from "../git/worktree";
 import { getProjectById, getProjectSettings, type ProjectSettings } from "../projects";
 import { resolveOperator } from "../operator";
@@ -232,26 +232,42 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //     ref, and cleared its lease on settle. Without this gate the loser would proceed, skip the
       //     already-closed tickets, and re-enter the PR step — creating a duplicate/empty PR or parking
       //     on a `gh "a pull request already exists"` failure. The external ref is set ONLY by a
-      //     completed PR step (step 5, setExternalRef), so its presence on the freshest board read is
-      //     the terminal marker that another run already finished this epic. Nothing is left for
-      //     execute-epic to do, so finish this attempt as done (idempotent) and settle this machine's
-      //     run row rather than redoing covered work. Checked BEFORE the foreign-lease gate so a still-
-      //     lingering lease from the finishing run can't re-park an epic that's already complete, and
-      //     BEFORE adopting/publishing any lease so `finally` clears nothing we don't own. A stale read
-      //     (pull/show failed) simply won't show the ref yet and falls through to the lease gate below.
+      //     completed PR step (step 5, setExternalRef), but its mere PRESENCE is NOT proof another run
+      //     finished: review-fix deliberately LEAVES the ref on a bead whose PR was CLOSED without
+      //     merging so a Run/Force run can recover it. So a ref only marks completion when its PR is
+      //     still live — open (review in flight) or merged; a closed-unmerged ref is stale and must
+      //     fall through to the recovery path below (checked via `pullRequestState`). Nothing is left
+      //     for execute-epic to do only in the live/merged case, so there we finish this attempt as
+      //     done (idempotent) and settle this machine's run row rather than redoing covered work.
+      //     Checked BEFORE the foreign-lease gate so a still-lingering lease from the finishing run
+      //     can't re-park an epic that's already complete, and BEFORE adopting/publishing any lease so
+      //     `finally` clears nothing we don't own. A stale board read (pull/show failed) simply won't
+      //     show the ref yet and falls through to the lease gate below.
       if (leaseTarget.external_ref) {
-        // Sweep this run's OWN leftover lease before the idempotent short-circuit (anton-jz1). If this
-        // attempt resumes after a crash that landed the external ref (step 5, setExternalRef) but died
-        // before `finally` cleared its run-lease, `leaseTarget` still carries an unexpired
-        // `run-lease:…:<runId>` this run published. The general lease-adoption step (`leaseLabels =
-        // runLeaseLabels(...)`) runs AFTER this return, so without adopting here `finally` would clear
-        // nothing and other machines would keep seeing the epic as live until the TTL even though its
-        // PR is already open. Adopt only OUR OWN lease (matched by runId) so `finally` clears it; a
-        // foreign machine's lease is left for its own owner/TTL, honoring "finally clears only what we
-        // own" (the same reason this gate precedes the general adoption below).
-        leaseLabels = beads.ownRunLeaseLabels(leaseTarget, runId);
-        await updateRun(db, clock, runId, { status: "done", endedAt: clock.now(), error: null });
-        return;
+        // Distinguish a stale (closed-without-merging) ref from one that proves completion (anton-jz1).
+        // Only an OPEN or MERGED PR means another run carried this epic to the finish; a CLOSED-unmerged
+        // ref is what review-fix leaves for recovery, so DON'T short-circuit on it — fall through and let
+        // this run re-open the PR. An UNKNOWN state (no remote / gh error / unparseable ref) fails CLOSED
+        // to the idempotent skip: falling through with a genuinely merged ref would try `gh pr create` on
+        // a branch with no diff and fail the run, so a state we can't read is treated as "leave it be".
+        const prState = await pullRequestState(repo, leaseTarget.external_ref);
+        if (prState !== "closed") {
+          // Sweep this run's OWN leftover lease before the idempotent short-circuit (anton-jz1). If this
+          // attempt resumes after a crash that landed the external ref (step 5, setExternalRef) but died
+          // before `finally` cleared its run-lease, `leaseTarget` still carries an unexpired
+          // `run-lease:…:<runId>` this run published. The general lease-adoption step (`leaseLabels =
+          // runLeaseLabels(...)`) runs AFTER this return, so without adopting here `finally` would clear
+          // nothing and other machines would keep seeing the epic as live until the TTL even though its
+          // PR is already open. Adopt only OUR OWN lease (matched by runId) so `finally` clears it; a
+          // foreign machine's lease is left for its own owner/TTL, honoring "finally clears only what we
+          // own" (the same reason this gate precedes the general adoption below).
+          leaseLabels = beads.ownRunLeaseLabels(leaseTarget, runId);
+          await updateRun(db, clock, runId, { status: "done", endedAt: clock.now(), error: null });
+          return;
+        }
+        // Closed-without-merging ref → stale. Fall through to recover the epic: the foreign-lease gate
+        // and general lease adoption below run as usual (nothing adopted here so `finally` owns only what
+        // the recovery path takes), the closed tickets are skipped, and step 5 re-opens the PR.
       }
 
       if (beads.foreignRunLeaseLive(leaseTarget, clock.now(), runId)) {

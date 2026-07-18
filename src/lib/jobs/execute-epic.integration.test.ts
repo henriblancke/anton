@@ -591,6 +591,80 @@ process.exit(0);`,
     expect(after.external_ref).toBe("gh-77");
   }, 60_000);
 
+  it("recovers a target whose external-ref PR was CLOSED without merging — re-opens instead of a false-done short-circuit", async () => {
+    // anton-jz1 review (thread PRRT_kwDOTWcq8c6SAsC0): when a PR is closed WITHOUT merging, review-fix
+    // leaves the bead in-review with its external_ref intact so a Run/Force run can recover it. The
+    // external-ref short-circuit must NOT treat that stale ref as proof another run finished: doing so
+    // marks the new run done and returns before the PR step, stranding the bead on the dead PR. The
+    // handler must instead check the PR state and, seeing it CLOSED, fall through and re-open the PR.
+    const bugId = await beads.create(repo, {
+      title: "PR closed without merging",
+      type: "bug",
+      acceptance: "work file exists",
+      description: "## Goal\nProve stale-ref recovery.",
+    });
+    await beads.approve(repo, bugId);
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    // Attempt 1: a normal run carries the bug to in-review (PR opened at gh-42, external ref stamped).
+    process.env.ANTON_CLAUDE_BIN = successClaude;
+    const job1 = await runner.enqueue({
+      type: "execute-epic",
+      projectId,
+      payload: { projectId, epicBeadId: bugId },
+    });
+    await runner.tickOnce();
+    await runner.whenIdle();
+    expect((await getJob(tdb.db, job1))?.status).toBe("done");
+    expect((await beads.show(repo, bugId)).external_ref).toBe("gh-42");
+    const sessionsAfter1 = (await tdb.db.select().from(schema.sessions)).filter(
+      (s) => s.beadId === bugId,
+    );
+    expect(sessionsAfter1).toHaveLength(1);
+
+    // Attempt 2: the operator Force-runs the recovery after the PR was closed unmerged. Point gh at a
+    // fake that reports every PR CLOSED (so `pullRequestState` sees a stale ref and the PR-reuse check
+    // finds nothing to reuse) and opens a fresh PR at gh-99 on `pr create`.
+    const recoverGh = writeBin(
+      binDir,
+      "gh-recover-jz1",
+      `const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='view'){process.stdout.write(JSON.stringify({state:'CLOSED'})+'\\n');process.exit(0);}
+if(a[0]==='pr'&&a[1]==='create'){process.stdout.write('https://github.com/acme/repo/pull/99\\n');process.exit(0);}
+process.exit(0);`,
+    );
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = recoverGh;
+    try {
+      const job2 = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: bugId },
+      });
+      await runner.tickOnce();
+      await runner.whenIdle();
+
+      // The recovery run did NOT short-circuit: it re-opened the PR (external ref advanced to gh-99)
+      // and finished done, rather than reporting a false completion on the dead gh-42.
+      expect((await getJob(tdb.db, job2))?.status).toBe("done");
+      expect((await beads.show(repo, bugId)).external_ref).toBe("gh-99");
+      // The standalone target is stage:in-review from attempt 1, so its ticket is resume-skipped —
+      // claude is not re-run; only the (agent-free) PR step executes on recovery.
+      const sessionsAfter2 = (await tdb.db.select().from(schema.sessions)).filter(
+        (s) => s.beadId === bugId,
+      );
+      expect(sessionsAfter2).toHaveLength(1);
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+    }
+  }, 60_000);
+
   it("parks a standalone target blocked by an open prerequisite (readiness gate at job start)", async () => {
     // anton-cmz review: a standalone's blockers aren't in the epic-graph rollup, so the runner
     // derives them from its own `blocks` edges. An open blocker must PARK the run (poison), not

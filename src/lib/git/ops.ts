@@ -170,6 +170,44 @@ async function findOpenPullRequest(
   }
 }
 
+/** Lifecycle state of a GitHub PR, plus `unknown` when it can't be read (no remote/gh error). */
+export type PullRequestState = "open" | "merged" | "closed" | "unknown";
+
+/**
+ * Report the lifecycle state of the PR named by a beads external ref (`gh-<n>`, a bare number, or
+ * a PR url). Returns `"unknown"` when the state can't be determined — no `gh`, a network/CLI error,
+ * or an unparseable ref — so callers can fail closed rather than mistake a transient failure for a
+ * definitive state.
+ *
+ * Used by execute-epic to tell a STALE ref (a PR that was closed WITHOUT merging — which review-fix
+ * deliberately leaves on the bead so a Run/Force run can recover the epic) apart from a ref that
+ * proves another run already finished the epic (its PR is open or merged) (anton-jz1).
+ */
+export async function pullRequestState(
+  repoPath: string,
+  ref: string,
+): Promise<PullRequestState> {
+  // `gh pr view` accepts a number or url; `gh-<n>` is the beads form, so strip the prefix.
+  const selector = ref.startsWith("gh-") ? ref.slice(3) : ref;
+  if (!selector) return "unknown";
+  const gh = process.env[GH_BIN_ENV] ?? "gh";
+  try {
+    const { stdout } = await execFileAsync(gh, ["pr", "view", selector, "--json", "state"], {
+      cwd: repoPath,
+      timeout: 120_000,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    // gh reports state as OPEN | CLOSED | MERGED (a closed-then-merged PR reports MERGED).
+    const state = (JSON.parse(stdout) as { state?: string }).state?.toUpperCase();
+    if (state === "OPEN") return "open";
+    if (state === "MERGED") return "merged";
+    if (state === "CLOSED") return "closed";
+    return "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
 /**
  * Push the branch and open a PR with `gh`. Requires an `origin` remote. Parses the PR number
  * from the returned URL (…/pull/<n>). Throws a clear Error when there is no remote.
