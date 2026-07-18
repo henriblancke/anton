@@ -22,9 +22,10 @@ export async function GET(
     if (knownVersion === currentVersion) {
       return new NextResponse(null, { status: 304 });
     }
-    // Writes and completed pulls invalidate only after Dolt is done, so this refresh cannot
-    // collide with the synchronization pass that changed the version.
-    await refreshAllIssues(project.repoPath);
+    // The version already advanced, so serve the current snapshot now and refresh in the
+    // background — never await a cold bd list on the poll path (cold precisely after a write).
+    // The client surfaces any newer data on its next poll.
+    void refreshAllIssues(project.repoPath).catch(() => {});
   }
 
   const board = await getBoard(project);
