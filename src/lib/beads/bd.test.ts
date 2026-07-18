@@ -83,6 +83,40 @@ describe("run-lease helpers (anton-jz1)", () => {
       false,
     );
   });
+
+  it("winsRunLeaseRace: uncontested (only our own lease) proceeds", () => {
+    const b = bead({ labels: [LABELS.runLease(now + 60_000, "run-mine")] });
+    expect(beads.winsRunLeaseRace(b, now, "run-mine")).toBe(true);
+  });
+
+  it("winsRunLeaseRace: no lease at all proceeds", () => {
+    expect(beads.winsRunLeaseRace(bead({ labels: ["stage:implementing"] }), now, "run-mine")).toBe(
+      true,
+    );
+  });
+
+  it("winsRunLeaseRace: lower owner wins, higher owner yields (deterministic + symmetric)", () => {
+    // Both runs published concurrently, so each sees BOTH leases in the merged label set. The
+    // lexicographically-lowest owner keeps the lease; every other colliding run parks.
+    const b = bead({
+      labels: [LABELS.runLease(now + 60_000, "run-aaa"), LABELS.runLease(now + 60_000, "run-bbb")],
+    });
+    expect(beads.winsRunLeaseRace(b, now, "run-aaa")).toBe(true);
+    expect(beads.winsRunLeaseRace(b, now, "run-bbb")).toBe(false);
+  });
+
+  it("winsRunLeaseRace: an EXPIRED foreign lease is not a contender", () => {
+    const b = bead({
+      labels: [LABELS.runLease(now + 60_000, "run-mine"), LABELS.runLease(now - 1_000, "run-aaa")],
+    });
+    // run-aaa sorts below run-mine but its lease is dead, so it doesn't cost us the race.
+    expect(beads.winsRunLeaseRace(b, now, "run-mine")).toBe(true);
+  });
+
+  it("winsRunLeaseRace: an owner-less foreign live lease yields (can't arbitrate)", () => {
+    const b = bead({ labels: [`run-lease:${now + 60_000}`, LABELS.runLease(now + 60_000, "run-mine")] });
+    expect(beads.winsRunLeaseRace(b, now, "run-mine")).toBe(false);
+  });
 });
 
 describe("buildUpdateArgs", () => {

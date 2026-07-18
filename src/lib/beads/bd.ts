@@ -539,6 +539,29 @@ export const beads = {
   },
 
   /**
+   * Tiebreak for two runs that acquired the lease at the same instant (anton-jz1). The foreign-lease
+   * gate reads the board BEFORE a run publishes its own lease, so two machines force-running an epic
+   * simultaneously can both clear that gate before either lease is visible remotely. After publishing,
+   * a handler re-pulls and re-reads the target and calls this: it returns true iff `ownRunId` should
+   * KEEP the lease and proceed, i.e. no OTHER live lease on the bead has an owner that sorts
+   * lexicographically at or below `ownRunId`. Because every colliding run applies the same
+   * lowest-owner-wins rule against the same merged label set, exactly one proceeds and the rest park.
+   * An owner-less foreign live lease (legacy / liveness-only publish) can't be arbitrated, so this
+   * yields (returns false): parking is recoverable, a double-run is not. No foreign live lease at all
+   * → true (the run is uncontested).
+   */
+  winsRunLeaseRace: (b: Bead, nowMs: number, ownRunId: string): boolean => {
+    for (const l of b.labels ?? []) {
+      if (!l.startsWith(RUN_LEASE_PREFIX)) continue;
+      const { expiry, owner } = parseRunLease(l);
+      if (expiry === undefined || expiry <= nowMs) continue; // expired: not a live contender
+      if (owner === ownRunId) continue; // our own lease
+      if (owner === undefined || owner <= ownRunId) return false; // a foreign owner sorts first → it wins
+    }
+    return true;
+  },
+
+  /**
    * Publish/refresh the run-lease on the target, atomically replacing any existing lease labels
    * (`stale`, e.g. the prior expiry this process published, or leftovers from a crashed run) in a
    * single `bd update`. Removing a label that isn't present is a bd no-op, so a slightly-stale

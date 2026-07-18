@@ -143,6 +143,12 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     // tell this run's own crash leftover from another machine's live lease.
     let leaseLabels: string[] = [];
     let leaseTimer: ReturnType<typeof setInterval> | null = null;
+    // Set true in `finally` so a refresh tick that hasn't started yet no-ops instead of publishing a
+    // fresh lease after settle; `leaseRefreshInFlight` tracks a tick already mid-publish so `finally`
+    // can await it before clearing the label (otherwise a slow refresh write could re-publish an
+    // unexpired lease after the clear and leave the epic looking live until TTL — anton-jz1).
+    let leaseSettled = false;
+    let leaseRefreshInFlight: Promise<void> = Promise.resolve();
     // Publish/refresh this run's lease. Advances `leaseLabels` ONLY after the write lands (not
     // best-effort like the other bd writes): a swallowed failure that still advanced the tracked
     // label would let `finally` clear a label that isn't on the board while the real prior lease
@@ -226,13 +232,37 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //    lease must not proceed. The timer is unref'd so it never keeps the process alive, is torn
       //    down in `finally`, and its refresh failures are caught + logged rather than fatal.
       await publishLease();
-      leaseTimer = setInterval(
-        () =>
-          void publishLease().catch((e) =>
-            console.error(`[execute-epic] run-lease refresh failed for ${epicBeadId}`, e),
-          ),
-        RUN_LEASE_REFRESH_MS,
-      );
+
+      // 1b. Read-after-write conflict check (anton-jz1). The foreign-lease gate in step 0 read the
+      //     board BEFORE this publish, so it can't serialize two machines that force-run the same
+      //     epic at the same instant: both clear the gate before either lease is visible remotely,
+      //     then both publish. Push our lease and re-pull so a concurrently-published foreign lease
+      //     becomes visible, then re-read and arbitrate: winsRunLeaseRace keeps the lease for the
+      //     lexicographically-lowest owner runId, so of two runs that both published, exactly one
+      //     proceeds and the other parks (RunAlreadyLiveError → reschedules, re-checks once the
+      //     winner settles). Best-effort like the step-0 pull — if the sync/pull/re-read can't
+      //     complete we degrade to the local view and proceed rather than block a legitimate run.
+      //     This narrows the double-run window to the sub-heartbeat gap where a machine re-reads
+      //     before the other's lease has propagated; it can't fully close it without a true
+      //     cross-machine lock, but it deterministically resolves the symmetric collision. Losing
+      //     here throws before the refresh timer is armed, so `finally` (leaseTimer still null)
+      //     tears down only the lease this run published.
+      await safe(() => beads.sync(repo));
+      await safe(() => beads.pull(repo));
+      const acquired = await beads.show(repo, epicBeadId).catch(() => null);
+      if (acquired && !beads.winsRunLeaseRace(acquired, clock.now(), runId)) {
+        throw new RunAlreadyLiveError(
+          `${epicBeadId} lost the run-lease race to a concurrent run on another machine — parking; ` +
+            `this attempt resumes once that run settles and clears its lease`,
+        );
+      }
+
+      leaseTimer = setInterval(() => {
+        if (leaseSettled) return; // run is settling — don't publish a fresh lease behind finally's clear
+        leaseRefreshInFlight = publishLease().catch((e) =>
+          console.error(`[execute-epic] run-lease refresh failed for ${epicBeadId}`, e),
+        );
+      }, RUN_LEASE_REFRESH_MS);
       if (typeof leaseTimer.unref === "function") leaseTimer.unref();
 
       // 2. Warm worktree (idempotent — reused on resume). Branch off the FRESHEST base
@@ -344,7 +374,12 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // re-trigger a stopped run immediately instead of waiting out the lease TTL; a hard crash that
       // skips this still self-heals when the (un-refreshed) lease expires. Best-effort like the
       // other bd writes; the sync below pushes the removal to the remote.
+      leaseSettled = true;
       if (leaseTimer) clearInterval(leaseTimer);
+      // clearInterval only stops FUTURE ticks; a refresh already inside publishLease when we settle
+      // would otherwise write a fresh lease after the clear below. Await it first so leaseLabels
+      // reflects what it actually wrote and the clear removes the right (freshest) label (anton-jz1).
+      await leaseRefreshInFlight;
       await safe(() => beads.clearRunLease(repo, epicBeadId, leaseLabels));
 
       // Every bd write above (claims, closes, stage labels, PR ref, lease clear) must reach the
