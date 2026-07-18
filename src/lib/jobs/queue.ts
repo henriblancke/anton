@@ -80,6 +80,14 @@ export async function enqueue(
 /** The active statuses that must hold at most one execute-epic job per (project, epic). */
 const ACTIVE_STATUSES = ["queued", "running"] as const;
 
+/**
+ * Statuses under which a local execute-epic job "covers" an epic for the take-over path: either
+ * runnable (`queued`/`running`) or settled-but-recoverable (`parked`/`failed`, both un-parkable via
+ * `resumeJob`). `done` is deliberately excluded — a completed run is NOT resumable, so a re-approved
+ * / stolen epic on a machine that previously finished it must still enqueue a fresh job.
+ */
+const COVERING_STATUSES = ["queued", "running", "parked", "failed"] as const;
+
 /** Is `e` a SQLite UNIQUE-constraint violation (the partial-index backstop firing)? */
 function isUniqueViolation(e: unknown): boolean {
   const code = (e as { code?: string })?.code;
@@ -119,12 +127,14 @@ function activeExecuteEpicId(
 }
 
 /**
- * Id of ANY execute-epic job for this project + epic — in any status (queued/running/parked/failed/
- * done) — if the local instance holds one. Unlike `activeExecuteEpicId`, this doesn't filter on
- * status: it answers "does this machine already have a job (runnable or resumable) for this epic?",
- * which is what a cross-instance take-over needs to know before enqueuing a replacement.
+ * Id of a local execute-epic job for this project + epic that still COVERS the epic — i.e. is
+ * runnable (queued/running) or resumable (parked/failed). Unlike `activeExecuteEpicId`, this
+ * includes parked/failed rows, since a cross-instance take-over can resume those. It deliberately
+ * excludes `done`: a completed prior run is terminal and not resumable, so it must NOT be treated
+ * as covering the epic — otherwise a machine that previously finished this epic would never enqueue
+ * a fresh job when it later steals an approved backlog target (anton-i71 review, PR #39).
  */
-function anyExecuteEpicId(
+function coveringExecuteEpicId(
   tx: Pick<AntonDb, "select">,
   projectId: string,
   epicBeadId: string,
@@ -136,6 +146,7 @@ function anyExecuteEpicId(
       and(
         eq(schema.jobs.type, "execute-epic"),
         eq(schema.jobs.projectId, projectId),
+        inArray(schema.jobs.status, [...COVERING_STATUSES]),
         eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
       ),
     )
@@ -145,18 +156,20 @@ function anyExecuteEpicId(
 }
 
 /**
- * Enqueue an execute-epic run ONLY when the local instance has no job for this epic at all (any
- * status). The take-over path (approve/route.ts): stealing an already-approved target from another
+ * Enqueue an execute-epic run ONLY when the local instance has no COVERING job for this epic — i.e.
+ * none that is runnable (queued/running) or resumable (parked/failed); a terminal `done` row does
+ * not count. The take-over path (approve/route.ts): stealing an already-approved target from another
  * operator reassigns the reservation, but jobs are machine-local — the original owner's job lives on
  * THEIR instance and will poison itself once it sees the epic was reassigned (execute-epic's
  * ownership gate). So the new owner's instance must hold its own runnable job, or the approved work
  * strands with nothing to run (anton-i71 review, PR #39).
  *
- * Returns the new job's id, or `undefined` when a job already exists locally — the same-instance
- * take-over case, where the existing (queued/running/parked/failed) job is reusable by the new owner
- * (operator identity is machine-scoped) and a duplicate must not be spawned. Uses `anyExecuteEpicId`
- * (all statuses), not the active-only dedupe, precisely so a same-instance PARKED prior run is
- * recognized and left for `resume` rather than shadowed by a second job.
+ * Returns the new job's id, or `undefined` when a covering job already exists locally — the
+ * same-instance take-over case, where the existing (queued/running/parked/failed) job is reusable
+ * by the new owner (operator identity is machine-scoped) and a duplicate must not be spawned. Uses
+ * `coveringExecuteEpicId` (active + resumable statuses), not the active-only dedupe, precisely so a
+ * same-instance PARKED prior run is recognized and left for `resume` rather than shadowed by a
+ * second job. A terminal `done` row does NOT cover the epic, so a fresh take-over still enqueues.
  *
  * Same transactional guard + partial-unique backstop as `enqueueExecuteEpicDeduped`: a concurrent
  * insert that wins the race raises UNIQUE, which we absorb by returning `undefined` (the other job
@@ -171,7 +184,7 @@ export function enqueueExecuteEpicIfAbsent(
   const nowMs = clock.now();
   try {
     return db.transaction((tx) => {
-      if (anyExecuteEpicId(tx, projectId, epicBeadId)) return undefined;
+      if (coveringExecuteEpicId(tx, projectId, epicBeadId)) return undefined;
 
       const id = randomUUID();
       tx.insert(schema.jobs)

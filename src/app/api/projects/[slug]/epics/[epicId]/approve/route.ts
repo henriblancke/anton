@@ -240,14 +240,16 @@ export async function POST(
   //    with no `jobId` and leave an approved epic unrunnable from the UI. The dedupe covers the
   //    double-click case; a cross-machine force-run is not deduped (anton-jz1).
   //
-  // 2. An owner-changing take-over enqueues ONLY when this instance has no job for the epic yet
-  //    (enqueueExecuteEpicIfAbsent, any status). Jobs are machine-local (README/DESIGN §"Ephemeral"),
-  //    so stealing an already-approved target from operator A leaves A's queued/paused job on A's
-  //    instance — and execute-epic's ownership gate makes A's job poison itself once it sees the
-  //    epic reassigned to B. Without a local job the approved work would strand under the new owner
-  //    with nothing runnable (anton-i71 review, PR #39). A same-instance take-over instead finds its
-  //    existing (queued/running/parked/failed) job and reuses it (returns no new id), so a parked
-  //    prior run stays resumable rather than shadowed by a duplicate.
+  // 2. An owner-changing take-over enqueues ONLY when this instance has no job covering the epic yet
+  //    (enqueueExecuteEpicIfAbsent, active + resumable statuses; a terminal `done` row does NOT
+  //    count, so a machine that previously finished this epic still enqueues afresh). Jobs are
+  //    machine-local (README/DESIGN §"Ephemeral"), so stealing an already-approved target from
+  //    operator A leaves A's queued/paused job on A's instance — and execute-epic's ownership gate
+  //    makes A's job poison itself once it sees the epic reassigned to B. Without a local job the
+  //    approved work would strand under the new owner with nothing runnable (anton-i71 review,
+  //    PR #39). A same-instance take-over instead finds its existing (queued/running/parked/failed)
+  //    job and reuses it (returns no new id), so a parked prior run stays resumable rather than
+  //    shadowed by a duplicate.
   //
   //    Skip the take-over enqueue when the target is currently blocked: a take-over bypasses the
   //    readiness gate above (to stay transferable), but starting blocked work is exactly what that
