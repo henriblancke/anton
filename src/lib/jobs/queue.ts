@@ -119,6 +119,84 @@ function activeExecuteEpicId(
 }
 
 /**
+ * Id of ANY execute-epic job for this project + epic — in any status (queued/running/parked/failed/
+ * done) — if the local instance holds one. Unlike `activeExecuteEpicId`, this doesn't filter on
+ * status: it answers "does this machine already have a job (runnable or resumable) for this epic?",
+ * which is what a cross-instance take-over needs to know before enqueuing a replacement.
+ */
+function anyExecuteEpicId(
+  tx: Pick<AntonDb, "select">,
+  projectId: string,
+  epicBeadId: string,
+): string | undefined {
+  const rows = tx
+    .select({ id: schema.jobs.id })
+    .from(schema.jobs)
+    .where(
+      and(
+        eq(schema.jobs.type, "execute-epic"),
+        eq(schema.jobs.projectId, projectId),
+        eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
+      ),
+    )
+    .limit(1)
+    .all();
+  return rows[0]?.id;
+}
+
+/**
+ * Enqueue an execute-epic run ONLY when the local instance has no job for this epic at all (any
+ * status). The take-over path (approve/route.ts): stealing an already-approved target from another
+ * operator reassigns the reservation, but jobs are machine-local — the original owner's job lives on
+ * THEIR instance and will poison itself once it sees the epic was reassigned (execute-epic's
+ * ownership gate). So the new owner's instance must hold its own runnable job, or the approved work
+ * strands with nothing to run (anton-i71 review, PR #39).
+ *
+ * Returns the new job's id, or `undefined` when a job already exists locally — the same-instance
+ * take-over case, where the existing (queued/running/parked/failed) job is reusable by the new owner
+ * (operator identity is machine-scoped) and a duplicate must not be spawned. Uses `anyExecuteEpicId`
+ * (all statuses), not the active-only dedupe, precisely so a same-instance PARKED prior run is
+ * recognized and left for `resume` rather than shadowed by a second job.
+ *
+ * Same transactional guard + partial-unique backstop as `enqueueExecuteEpicDeduped`: a concurrent
+ * insert that wins the race raises UNIQUE, which we absorb by returning `undefined` (the other job
+ * now satisfies the local instance).
+ */
+export function enqueueExecuteEpicIfAbsent(
+  db: AntonDb,
+  clock: Clock,
+  projectId: string,
+  epicBeadId: string,
+): string | undefined {
+  const nowMs = clock.now();
+  try {
+    return db.transaction((tx) => {
+      if (anyExecuteEpicId(tx, projectId, epicBeadId)) return undefined;
+
+      const id = randomUUID();
+      tx.insert(schema.jobs)
+        .values({
+          id,
+          type: "execute-epic",
+          projectId,
+          payloadJson: JSON.stringify({ projectId, epicBeadId }),
+          status: "queued",
+          runAt: secDate(nowMs),
+          attempts: 0,
+          createdAt: secDate(nowMs),
+          updatedAt: secDate(nowMs),
+        })
+        .run();
+      return id;
+    });
+  } catch (e) {
+    // Backstop: the index rejected a concurrent insert. The winning job now covers the epic locally.
+    if (isUniqueViolation(e)) return undefined;
+    throw e;
+  }
+}
+
+/**
  * Enqueue an execute-epic run, deduped against any already-active job for the same project + epic.
  * Returns the existing job's id (inserting no new row) when a `queued`/`running` execute-epic job
  * exists for that epic; otherwise inserts a fresh `queued` job and returns its id. Prior

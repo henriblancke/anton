@@ -435,6 +435,67 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     expect(await executeEpicJobs(epic)).toHaveLength(0);
   }, 60_000);
 
+  it("enqueues a local run when taking over an approved, ready target with no job on this instance", async () => {
+    // The cross-instance take-over (anton-i71, PR #39): operator A approved on their machine, which
+    // enqueued A's job in A's local anton.db — not this one. Here the target is approved + backlog,
+    // owned by A, ready (no blockers), and this instance holds NO job for it. A take-over reassigns
+    // the reservation to us; without a local enqueue the approved work would strand, because A's job
+    // poisons itself once execute-epic sees the epic reassigned. So the take-over must enqueue a
+    // fresh runnable job HERE, under the new owner.
+    const epic = await beads.create(repo, { title: "Cross-instance take-over", type: "epic" });
+    const child = await beads.create(repo, { title: "Cross-instance take-over child", type: "task" });
+    await beads.link(repo, child, epic, "parent-child");
+    await beads.assign(repo, epic, "someone-else");
+    await beads.approve(repo, epic); // approved + backlog, owned by A, with no job on THIS machine
+    expect(await executeEpicJobs(epic)).toHaveLength(0);
+
+    actAs("anton-test");
+    const res = await POST(
+      new Request("http://t/", {
+        method: "POST",
+        body: JSON.stringify({ steal: true }),
+        headers: { "content-type": "application/json" },
+      }),
+      ctx("approvy", epic),
+    );
+    expect(res.status).toBe(200);
+    // The reservation transfers to the new owner…
+    expect((await beads.show(repo, epic)).assignee).toBe("anton-test");
+    // …and a runnable job is enqueued on this instance under the new owner (not stranded).
+    expect((await res.json()).jobId).toBeTruthy();
+    const jobs = await executeEpicJobs(epic);
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0].status).toBe("queued");
+  }, 60_000);
+
+  it("does not enqueue a second local job when taking over a ready target this instance already runs", async () => {
+    // The same-instance counterpart: this instance already has an active job for the epic (a normal
+    // approval enqueued it here). A take-over must reuse that job — reassigning the reservation, not
+    // spawning a duplicate — since operator identity is machine-scoped and the existing job will run
+    // under whoever holds the epic. `enqueueExecuteEpicIfAbsent` returns no new id when a job exists.
+    const epic = await beads.create(repo, { title: "Same-instance take-over", type: "epic" });
+    const child = await beads.create(repo, { title: "Same-instance take-over child", type: "task" });
+    await beads.link(repo, child, epic, "parent-child");
+
+    actAs("bob");
+    expect((await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", epic))).status).toBe(200);
+    const first = await executeEpicJobs(epic);
+    expect(first).toHaveLength(1);
+
+    actAs("alice");
+    const res = await POST(
+      new Request("http://t/", { method: "POST", body: JSON.stringify({ steal: true }) }),
+      ctx("approvy", epic),
+    );
+    expect(res.status).toBe(200);
+    expect((await beads.show(repo, epic)).assignee).toBe("alice");
+    // The existing job is reused — no new id, still exactly one job for the epic.
+    expect((await res.json()).jobId).toBeUndefined();
+    expect(await executeEpicJobs(epic)).toHaveLength(1);
+    // Restore the default operator the following (actAs-less) tests rely on.
+    actAs("anton-test");
+  }, 60_000);
+
   it("auto-claims an unclaimed run target for the approver before enqueuing", async () => {
     // Closing the gap before the runtime execution-claim: approving an unclaimed target sets the
     // approver as assignee, so a teammate can't land a claim between approve and the runner.

@@ -61,9 +61,10 @@ export function ClaimControl({
    * backlog — a run that is implementing/in-review is already executing under its owner's reservation,
    * and moving that out from under it is a separate decision, not a claim-control affordance.
    *
-   * Take over never starts a second run: approval is the run trigger only on the FIRST approve, and the
-   * approve route skips the enqueue for a target already approved with a run of its own (in any status —
-   * see its enqueue gate). Only consulted with `readOnly`; an unapproved target uses the claim-route Steal.
+   * Take over never spawns a duplicate concurrent run: the approve route only enqueues under the new
+   * owner when this instance has no job for the epic yet (a cross-instance take-over, where the
+   * original owner's job lives on their machine); a same-instance take-over reuses the existing job.
+   * See its enqueue gate. Only consulted with `readOnly`; an unapproved target uses the claim-route Steal.
    */
   canTakeOver?: boolean;
   className?: string;

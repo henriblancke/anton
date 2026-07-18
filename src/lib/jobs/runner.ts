@@ -20,6 +20,7 @@ import {
   disabledScheduleKeys,
   enqueue,
   enqueueExecuteEpicDeduped,
+  enqueueExecuteEpicIfAbsent,
   getJob,
   leaseDue,
   park,
@@ -236,6 +237,19 @@ export class JobRunner {
       throw new Error(`Project is being deleted: ${projectId}`);
     }
     return enqueueExecuteEpicDeduped(this.db, this.clock, projectId, epicBeadId);
+  }
+
+  /**
+   * Enqueue an execute-epic run for an owner-changing take-over: creates a job only when this
+   * instance has no job for the epic (any status), so a cross-instance take-over gets a runnable
+   * local job while a same-instance one reuses the existing (resumable) job. Returns the new job id,
+   * or `undefined` when a local job already covers the epic. See `enqueueExecuteEpicIfAbsent`.
+   */
+  enqueueExecuteEpicIfAbsent(projectId: string, epicBeadId: string): string | undefined {
+    if (this.quiescedProjects.has(projectId)) {
+      throw new Error(`Project is being deleted: ${projectId}`);
+    }
+    return enqueueExecuteEpicIfAbsent(this.db, this.clock, projectId, epicBeadId);
   }
 
   /**

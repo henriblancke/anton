@@ -173,10 +173,10 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // 2. Assert this process still owns the epic, THEN claim it for the human operator (idempotent).
       //    An approved-but-unstarted (backlog) target can be TAKEN OVER — reassigned to another
       //    operator via the approve route's steal — after this run was queued but before it leased the
-      //    epic (a queued or autonomy-paused job). The take-over suppresses the new owner's enqueue on
-      //    the assumption the reservation just moves, but the jobs table is machine-local: this stale
-      //    job still sits on the ORIGINAL operator's instance. Running it now would execute under the
-      //    new owner's reservation — the exact "run under someone else's claim" state the soft-lock
+      //    epic (a queued or autonomy-paused job). The take-over enqueues a fresh run on the NEW
+      //    owner's instance, but the jobs table is machine-local: THIS stale job still sits on the
+      //    ORIGINAL operator's instance. Running it now would execute under the new owner's
+      //    reservation — the exact "run under someone else's claim" state the soft-lock
       //    forbids (DESIGN.md §Soft-lock). So gate on ownership FIRST — like the ticket-claim hard gate
       //    in runTicket — AND make the claim itself hard (below): a steal landing between this read and
       //    the claim is caught by `bd update --claim` refusing to reassign, not swallowed by `safe`.
