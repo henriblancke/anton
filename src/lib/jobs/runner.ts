@@ -37,6 +37,7 @@ import {
 } from "./queue";
 import { reconcileInterruptedRuns } from "../runs";
 import { isPoisonError, isUsageLimitError } from "./errors";
+import { PollingLoop } from "./polling-loop";
 
 export interface RunnerConfig {
   /** How long a lease is held before a job is considered crashed. */
@@ -180,9 +181,7 @@ export class JobRunner {
   private readonly inFlight = new Map<string, AbortController>();
   /** Settlement promises for jobs dispatched but not yet settled — the drain set for whenIdle(). */
   private readonly pending = new Set<Promise<void>>();
-  private timer: ReturnType<typeof setTimeout> | null = null;
-  private running = false;
-  private ticking = false;
+  private readonly loop: PollingLoop;
 
   constructor(deps: {
     db: AntonDb;
@@ -201,6 +200,13 @@ export class JobRunner {
     this.config = { ...DEFAULT_CONFIG, ...deps.config };
     this.log = deps.log ?? noopLog;
     this.resolvePolicy = deps.resolvePolicy ?? null;
+    this.loop = new PollingLoop({
+      tickMs: this.config.tickMs,
+      tick: async () => {
+        await this.tickOnce();
+      },
+      onError: (e) => this.log.error("runner tick failed", e),
+    });
   }
 
   /** The effective policy for a job's project — the injected resolver, or config-derived defaults. */
@@ -448,24 +454,7 @@ export class JobRunner {
 
   /** Start the background polling loop (idempotent). */
   start(): void {
-    if (this.running) return;
-    this.running = true;
-    const loop = async () => {
-      if (!this.running) return;
-      if (!this.ticking) {
-        this.ticking = true;
-        try {
-          await this.tickOnce();
-        } catch (e) {
-          this.log.error("runner tick failed", e);
-        } finally {
-          this.ticking = false;
-        }
-      }
-      if (this.running) this.timer = setTimeout(loop, this.config.tickMs);
-    };
-    this.timer = setTimeout(loop, 0);
-    this.log.info("job runner started");
+    if (this.loop.start()) this.log.info("job runner started");
   }
 
   /**
@@ -473,9 +462,7 @@ export class JobRunner {
    * reclaimed after it expires on the next boot — that is the durability contract.
    */
   async stop(): Promise<void> {
-    this.running = false;
-    if (this.timer) clearTimeout(this.timer);
-    this.timer = null;
+    this.loop.stop();
     for (const controller of this.inFlight.values()) controller.abort();
     // Give aborting handlers a moment to unwind; they settle their own job state.
     const start = Date.now();
