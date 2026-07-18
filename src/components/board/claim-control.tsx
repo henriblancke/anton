@@ -253,3 +253,28 @@ export function InheritedOwner({
     </span>
   );
 }
+
+/**
+ * Read-only owner display for a parentless bead that is NOT a run target (a `learning`/`chore`/etc.
+ * with no epic): the claim route 422s it via `isRunTarget`, so it has no interactive claim control —
+ * we just surface its assignee, mirroring InheritedOwner's shape without the epic-inheritance framing.
+ */
+export function StaticOwner({
+  owner: rawOwner,
+  className,
+}: {
+  /** The bead's assignee; null when unclaimed. */
+  owner: string | null;
+  className?: string;
+}) {
+  const owner = rawOwner?.trim() || null;
+  return (
+    <span
+      className={cn("inline-flex items-center gap-1", owner ? "text-foreground/85" : "text-subtle", className)}
+      title={owner ? `Claimed by ${owner}` : "Unclaimed — not a run target"}
+    >
+      <UserIcon className="size-3.5 shrink-0" aria-hidden="true" />
+      <span className="truncate">{owner ?? "Unclaimed"}</span>
+    </span>
+  );
+}

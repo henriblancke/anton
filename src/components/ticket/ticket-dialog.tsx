@@ -16,7 +16,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { MetaChip, PrLink, RelativeTime, StagePill } from "@/components/atoms";
-import { ClaimControl, InheritedOwner } from "@/components/board/claim-control";
+import { ClaimControl, InheritedOwner, StaticOwner } from "@/components/board/claim-control";
 import {
   AGENT_OPTIONS,
   PRIORITY_LABELS,
@@ -205,8 +205,10 @@ function TicketDialogBody({
   const set = <K extends keyof TicketDraft>(key: K, value: TicketDraft[K]) =>
     setDraft({ ...draft, [key]: value });
 
-  // Only a parentless task/bug is a run target of its own; a child ticket runs via its epic's PR.
-  const isRunTarget = !detail.epicId;
+  // Only a parentless task/bug is a run target of its own (mirrors `beads.isRunTarget`, which the
+  // approve/claim routes gate on): a child ticket runs via its epic's PR, and a parentless
+  // `learning`/`chore`/etc. is never runnable, so its controls would only ever 422.
+  const isRunTarget = !detail.epicId && (detail.type === "task" || detail.type === "bug");
   const approved = detail.approved || optimisticApproved;
 
   return (
@@ -234,10 +236,9 @@ function TicketDialogBody({
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-subtle">
           <span className="inline-flex items-center gap-1.5">
             Claimed by{" "}
-            {detail.epicId ? (
-              // A child ticket inherits its epic's human claim and has no control of its own.
-              <InheritedOwner owner={detail.epicAssignee ?? null} />
-            ) : (
+            {isRunTarget ? (
+              // A parentless task/bug is a run target — claimable on its own (same isRunTarget gate
+              // the claim route enforces).
               <ClaimControl
                 slug={slug}
                 itemId={detail.id}
@@ -247,6 +248,13 @@ function TicketDialogBody({
                 canTakeOver={detail.stage === "backlog"}
                 onChanged={() => setAttempt((n) => n + 1)}
               />
+            ) : detail.epicId ? (
+              // A child ticket inherits its epic's human claim and has no control of its own.
+              <InheritedOwner owner={detail.epicAssignee ?? null} />
+            ) : (
+              // A parentless non-run-target (learning/chore/etc.) can't be claimed — the claim route
+              // 422s it — so its owner shows read-only, matching the hidden Approve & run control.
+              <StaticOwner owner={detail.assignee} />
             )}
           </span>
           <span>
