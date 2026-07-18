@@ -221,6 +221,26 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       } catch {
         preCheckTrusted = false; // fell back to the stale top-of-handler snapshot
       }
+
+      // 0a. Revalidate the target still needs execution (anton-jz1). A job that parked on a foreign
+      //     live lease (foreignRunLeaseLive below) or lost the publish race (step 1b) reschedules and
+      //     re-enters this handler once that lease clears — but the run that HELD the lease may have
+      //     already carried this epic all the way to in-review: opened the PR, stamped the external
+      //     ref, and cleared its lease on settle. Without this gate the loser would proceed, skip the
+      //     already-closed tickets, and re-enter the PR step — creating a duplicate/empty PR or parking
+      //     on a `gh "a pull request already exists"` failure. The external ref is set ONLY by a
+      //     completed PR step (step 5, setExternalRef), so its presence on the freshest board read is
+      //     the terminal marker that another run already finished this epic. Nothing is left for
+      //     execute-epic to do, so finish this attempt as done (idempotent) and settle this machine's
+      //     run row rather than redoing covered work. Checked BEFORE the foreign-lease gate so a still-
+      //     lingering lease from the finishing run can't re-park an epic that's already complete, and
+      //     BEFORE adopting/publishing any lease so `finally` clears nothing we don't own. A stale read
+      //     (pull/show failed) simply won't show the ref yet and falls through to the lease gate below.
+      if (leaseTarget.external_ref) {
+        await updateRun(db, clock, runId, { status: "done", endedAt: clock.now(), error: null });
+        return;
+      }
+
       if (beads.foreignRunLeaseLive(leaseTarget, clock.now(), runId)) {
         throw new RunAlreadyLiveError(
           `${epicBeadId} is already running on another machine (unexpired run-lease) — parking; ` +

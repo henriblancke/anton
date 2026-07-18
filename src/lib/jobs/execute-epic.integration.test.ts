@@ -452,6 +452,78 @@ process.exit(0);`,
     }
   }, 60_000);
 
+  it("a retry after another run already opened the PR completes idempotently — no duplicate/empty PR", async () => {
+    // anton-jz1 review: a losing machine's job parks on the winner's live run-lease (or a lost
+    // publish race) and reschedules; when the winner finishes and clears its lease, the loser
+    // retries. By then the epic is already in-review with its PR opened + external ref stamped, so
+    // re-running would re-enter the PR step and create a duplicate/empty PR (or park on a `gh "a
+    // pull request already exists"` failure). The handler must instead revalidate the target still
+    // needs execution and, seeing the external ref, finish the attempt as done without touching gh.
+    const bugId = await beads.create(repo, {
+      title: "Covered by another run",
+      type: "bug",
+      acceptance: "work file exists",
+      description: "## Goal\nProve idempotent completion.",
+    });
+    await beads.approve(repo, bugId);
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    // Attempt 1: a normal run carries the bug to in-review (PR opened, external ref stamped).
+    process.env.ANTON_CLAUDE_BIN = successClaude;
+    const job1 = await runner.enqueue({
+      type: "execute-epic",
+      projectId,
+      payload: { projectId, epicBeadId: bugId },
+    });
+    await runner.tickOnce();
+    await runner.whenIdle();
+    expect((await getJob(tdb.db, job1))?.status).toBe("done");
+    const covered = await beads.show(repo, bugId);
+    expect(covered.external_ref).toBe("gh-42");
+    const sessionsAfter1 = (await tdb.db.select().from(schema.sessions)).filter(
+      (s) => s.beadId === bugId,
+    );
+    expect(sessionsAfter1).toHaveLength(1);
+
+    // Attempt 2: a SECOND job for the same target (the losing machine's retry after the lease
+    // cleared). Point gh at a binary that fails outright — if the handler wrongly reached the PR
+    // step it would throw and the job would fail; the revalidation must short-circuit before it.
+    const failingGh = writeBin(binDir, "gh-fail-jz1", `console.error('gh boom');process.exit(1);`);
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = failingGh;
+    try {
+      const job2 = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: bugId },
+      });
+      await runner.tickOnce();
+      await runner.whenIdle();
+
+      // The retry completed (not failed/parked) without invoking gh: the external ref is unchanged
+      // and no second claude session ran — the covered work was not redone.
+      expect((await getJob(tdb.db, job2))?.status).toBe("done");
+      const run2 = (await tdb.db.select().from(schema.runs))
+        .filter((r) => r.epicBeadId === bugId)
+        .find((r) => r.id !== undefined && r.status === "done" && r.worktreePath === null);
+      expect(run2).toBeTruthy(); // the retry's run row settled done without ever warming a worktree
+      const after2 = await beads.show(repo, bugId);
+      expect(after2.external_ref).toBe("gh-42"); // not overwritten / re-opened
+      const sessionsAfter2 = (await tdb.db.select().from(schema.sessions)).filter(
+        (s) => s.beadId === bugId,
+      );
+      expect(sessionsAfter2).toHaveLength(1); // claude was NOT re-run
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+    }
+  }, 60_000);
+
   it("parks a standalone target blocked by an open prerequisite (readiness gate at job start)", async () => {
     // anton-cmz review: a standalone's blockers aren't in the epic-graph rollup, so the runner
     // derives them from its own `blocks` edges. An open blocker must PARK the run (poison), not
