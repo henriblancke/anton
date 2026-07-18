@@ -413,6 +413,50 @@ describe("runClaude", () => {
     expect((caught as Error).message).toContain("claude exited with code 1");
   });
 
+  it("does NOT misclassify a non-zero exit that quotes the FULL no-link banner at line start in assistant prose", async () => {
+    // anton-b9l review follow-up (PR #43, thread PRRT_kwDOTWcq...): the earlier guards (line-anchor
+    // + required remediation pointer) still matched an agent that quotes the *whole* no-link banner
+    // — including the `/usage-credits` pointer — at the start of a line while working this very code
+    // path (e.g. adding a fixture), then fails for an unrelated reason. Because the model-authored
+    // assistant transcript is no longer scanned for the monthly-spend wording (only Claude Code's
+    // own result field + stderr are), this verbatim quote in an assistant block does NOT match. The
+    // result field here is a generic failure summary with no banner, so the run surfaces as a plain
+    // error for a human instead of being refunded and rescheduled forever.
+    const quotedBanner =
+      "You've hit your monthly spend limit.\n/usage-credits to check your usage and remaining credits\n\n" +
+      "^ Added the above as a fixture for the no-link variant, but three tests still fail.";
+    const bin = writeFakeClaude(
+      "quotes-full-nolink-banner-claude",
+      [
+        JSON.stringify({
+          type: "assistant",
+          message: { content: [{ type: "text", text: quotedBanner }] },
+        }),
+        JSON.stringify({
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: true,
+          session_id: "sess-fullquote",
+          total_cost_usd: 0.02,
+          result: "3 tests failed in driver.test.ts; the push was rejected.",
+        }),
+      ],
+      1,
+    );
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    let caught: unknown;
+    try {
+      await runClaude({ cwd: dir, prompt: "work the anton-b9l ticket" });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(isUsageLimitError(caught)).toBe(false);
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain("claude exited with code 1");
+  });
+
   it("does NOT misclassify a clean success whose transcript merely mentions a usage limit", async () => {
     // Regression for the anton-ner.2 transcript-scan false positive: a run that exits 0 with
     // is_error false is a success, even if an assistant text block contains "usage limit reached"

@@ -56,41 +56,54 @@ export interface RunClaudeOptions {
 }
 
 /**
- * Case-insensitive usage-limit phrasing claude emits on an exhausted quota, anchored to the
- * start of a line.
+ * Case-insensitive usage-limit phrasing Claude Code emits on an exhausted quota, anchored to the
+ * start of a line (`^\s*…`, multiline `m`): the notice lands as the *leading* content of an
+ * assistant block / the result field, whereas a quotation buried mid-sentence never starts a line.
  *
- * Covers the 5-hour/weekly "usage limit reached" wording *and* the monthly spend-limit wording
- * Claude Code surfaces separately — observed as `You've hit your monthly spend limit · raise it
- * at claude.ai/settings/usage` (anton-b9l). A spend limit is a periodic quota that lifts on its
- * own (a raised cap or the next billing cycle), so it belongs here: the runner reschedules past
+ * This RE covers the terse machine banners only — the 5-hour/weekly "usage limit reached" wording
+ * (and the bare "Claude AI usage limit reached|<epoch>" variant). Those read unmistakably as
+ * machine output, so they are trusted wherever they surface: the scan runs over the *combined*
+ * transcript (assistant text + result + stderr), because Claude Code has emitted them in the result
+ * field, in an assistant text block, or on stderr depending on how the run exited (anton-ner.2).
+ *
+ * The monthly spend-limit wording is deliberately NOT in this RE — see `SPEND_LIMIT_RE`.
+ */
+const USAGE_LIMIT_RE = /^\s*(?:(?:claude ai\s+)?usage limit reached|(?:5-hour|weekly) limit reached)/im;
+
+/**
+ * The monthly spend-limit banner Claude Code surfaces separately — observed as `You've hit your
+ * monthly spend limit · raise it at claude.ai/settings/usage` (anton-b9l), or the no-link variant
+ * `You've hit your monthly spend limit.` then `/usage-credits …` (Claude Code 2.1.172,
+ * anthropics/claude-code#67579). A spend limit is a periodic quota that lifts on its own (a raised
+ * cap or the next billing cycle), so it belongs with the usage limits: the runner reschedules past
  * a cool-off instead of burning attempts and parking.
  *
- * The transcript scan runs over every non-successful run's combined assistant/result/stderr text,
- * and the spend-limit payload is an ordinary English sentence a model can reproduce verbatim — an
- * agent working this very ticket might quote `You've hit your monthly spend limit` in its own prose
- * (or an added test fixture) and then fail for an unrelated reason (red tests, a rejected push).
- * Matching that quote would refund the attempt and reschedule the real failure forever. Two guards
- * keep that out:
- *   1. Every branch is anchored to the start of a line (`^\s*…`, multiline `m`): Claude Code emits
- *      the notice as the *leading* content of the result field / an assistant block, whereas a
- *      quotation buried mid-sentence never starts a line. That alone rejects the common mid-prose
- *      quote.
- *   2. The monthly-spend wording is a whole English sentence a model could just as easily put at
- *      the *start* of a line (a heading, a leading quote), so line-anchoring is not enough on its
- *      own here — unlike the terse "usage limit reached" / "5-hour limit reached" banners it does
- *      not read as machine output. So the monthly branch additionally requires Claude Code's
- *      trailing remediation pointer to follow the phrase — either the `claude.ai/settings/usage`
- *      link (`… monthly spend limit · raise it at claude.ai/settings/usage`, observed 2026-07-15)
- *      or the `/usage-credits` slash-command pointer of the no-link variant
- *      (`You've hit your monthly spend limit.` then `/usage-credits …`, reported in Claude Code
- *      2.1.172 — anthropics/claude-code#67579). The pointer may sit on the next line (the banner
- *      renders across two lines), so the match spans a bounded window rather than a single line.
- *      This keeps the genuine standalone notice matching in both wordings while letting a failure
- *      that merely mentions the phrase — and ordinary payment failures (declined card, no payment
- *      method) — fall through to a plain error for a human.
+ * Unlike the terse banners above, this is an ordinary English sentence a model can reproduce
+ * verbatim — an agent working this very ticket might quote it in its prose or a test fixture and
+ * then fail for an unrelated reason (red tests, a rejected push). Matching that quote would refund
+ * the attempt and reschedule the real failure forever. Two structural guards keep that out:
+ *   1. It is scanned ONLY in Claude Code's own output channels (the result field + stderr), never
+ *      the model-authored assistant transcript. The genuine banner is emitted by the CLI into the
+ *      result field / stderr on the aborting exit (observed 2026-07-15); a model quoting the phrase
+ *      while it works lands in an assistant text block, which this RE never sees. (The terse
+ *      banners still scan the assistant transcript — they can't be confused for prose.) A quote can
+ *      only reach here if the model made the verbatim banner its *final result text*, which a
+ *      genuine failure summary does not do.
+ *   2. Line-anchoring alone is not enough here — the sentence could just as easily open a line as a
+ *      heading or leading quote — so the phrase must be followed by Claude Code's trailing
+ *      remediation pointer: the `claude.ai/settings/usage` link or the `/usage-credits`
+ *      slash-command pointer. The pointer may sit on the next line (the banner renders across two),
+ *      so the match spans a bounded window rather than a single line.
+ *
+ * Together these keep the genuine standalone notice matching in both wordings while letting a
+ * failure that merely mentions the phrase — and ordinary payment failures (declined card, no
+ * payment method) — fall through to a plain error for a human. The trade-off of guard 1: a genuine
+ * spend-limit banner that Claude Code surfaced *only* in an assistant block (not result/stderr)
+ * would be missed and fall back to a plain error (park + burn an attempt) — the safe direction,
+ * far better than infinite-rescheduling a real failure that happened to quote the banner.
  */
-const USAGE_LIMIT_RE =
-  /^\s*(?:(?:claude ai\s+)?usage limit reached|(?:5-hour|weekly) limit reached|(?:you['’]ve\s+)?(?:hit|reached) your monthly spend limit\b[\s\S]{0,80}?(?:claude\.ai\/settings\/usage|\/usage-credits\b))/im;
+const SPEND_LIMIT_RE =
+  /^\s*(?:you['’]ve\s+)?(?:hit|reached) your monthly spend limit\b[\s\S]{0,80}?(?:claude\.ai\/settings\/usage|\/usage-credits\b)/im;
 
 /** Best-effort extraction of a reset time (unix seconds) from claude's usage-limit text. */
 function parseResetAt(text: string | undefined): number | undefined {
@@ -237,11 +250,16 @@ export async function runClaude(opts: RunClaudeOptions): Promise<ClaudeResult> {
       const succeeded = code === 0 && resultRaw !== undefined && !resultRaw.is_error;
 
       if (!succeeded) {
-        // Scan the full transcript (assistant + result text) plus stderr — the result field alone
-        // isn't a reliable place to find the quota signal. See `transcript` above.
+        // Terse machine banners are trusted across the full transcript (assistant + result text +
+        // stderr) — the result field alone isn't a reliable place to find them. See `transcript`.
         const combined = `${transcript}\n${resultText ?? ""}\n${stderrBuf}`;
+        // The monthly spend-limit sentence is trusted ONLY in Claude Code's own output channels
+        // (result field + stderr), never the model-authored assistant transcript — otherwise an
+        // agent quoting the banner verbatim (fixtures, prose) while it works would be misread as a
+        // quota hit and its real failure rescheduled forever. See `SPEND_LIMIT_RE`.
+        const cliOwned = `${resultText ?? ""}\n${stderrBuf}`;
 
-        if (USAGE_LIMIT_RE.test(combined)) {
+        if (USAGE_LIMIT_RE.test(combined) || SPEND_LIMIT_RE.test(cliOwned)) {
           const message = resultText || stderrBuf.trim() || transcript.trim() || "Claude AI usage limit reached";
           reject(new UsageLimitError(message, parseResetAt(combined)));
           return;
