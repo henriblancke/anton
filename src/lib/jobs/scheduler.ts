@@ -14,6 +14,7 @@ import * as schema from "../db/schema";
 import { enqueue, systemClock, type AntonDb, type Clock } from "./queue";
 import { nextRun } from "./cron";
 import type { RunnerLogger } from "./runner";
+import { PollingLoop } from "./polling-loop";
 
 function secDate(ms: number): Date {
   return new Date(Math.floor(ms / 1000) * 1000);
@@ -36,9 +37,7 @@ export class Scheduler {
   private readonly config: SchedulerConfig;
   private readonly log: RunnerLogger;
 
-  private timer: ReturnType<typeof setTimeout> | null = null;
-  private running = false;
-  private ticking = false;
+  private readonly loop: PollingLoop;
   private readonly quiescedProjects = new Set<string>();
 
   constructor(deps: {
@@ -51,6 +50,14 @@ export class Scheduler {
     this.clock = deps.clock ?? systemClock;
     this.config = { ...DEFAULT_SCHEDULER_CONFIG, ...deps.config };
     this.log = deps.log ?? noopLog;
+    this.loop = new PollingLoop({
+      tickMs: this.config.tickMs,
+      tick: async () => {
+        const n = await this.tickOnce();
+        if (n > 0) this.log.info(`scheduler enqueued ${n} scheduled job(s)`);
+      },
+      onError: (e) => this.log.error("scheduler tick failed", e),
+    });
   }
 
   /**
@@ -113,31 +120,11 @@ export class Scheduler {
   }
 
   start(): void {
-    if (this.running) return;
-    this.running = true;
-    const loop = async () => {
-      if (!this.running) return;
-      if (!this.ticking) {
-        this.ticking = true;
-        try {
-          const n = await this.tickOnce();
-          if (n > 0) this.log.info(`scheduler enqueued ${n} scheduled job(s)`);
-        } catch (e) {
-          this.log.error("scheduler tick failed", e);
-        } finally {
-          this.ticking = false;
-        }
-      }
-      if (this.running) this.timer = setTimeout(loop, this.config.tickMs);
-    };
-    this.timer = setTimeout(loop, 0);
-    this.log.info("scheduler started");
+    if (this.loop.start()) this.log.info("scheduler started");
   }
 
   stop(): void {
-    this.running = false;
-    if (this.timer) clearTimeout(this.timer);
-    this.timer = null;
+    this.loop.stop();
     this.log.info("scheduler stopped");
   }
 }

@@ -1,5 +1,5 @@
-import { getProjectBySlug } from "@/lib/projects";
 import { getSessionById, sessionLogPath, tailSessionLog } from "@/lib/sessions";
+import { resolveProject } from "../../../resolve-project";
 
 export const dynamic = "force-dynamic";
 // The tail loop runs for the life of the session; never let the platform buffer/cap it.
@@ -19,10 +19,8 @@ export async function GET(
 ) {
   const { slug, sessionId } = await params;
 
-  const project = await getProjectBySlug(slug);
-  if (!project) {
-    return new Response("Project not found", { status: 404 });
-  }
+  const { project, response } = await resolveProject(slug);
+  if (!project) return response;
 
   const session = await getSessionById(sessionId);
   if (!session || session.projectId !== project.id) {

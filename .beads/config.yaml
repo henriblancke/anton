@@ -7,7 +7,13 @@
 # `bd dolt push` always has data to carry over refs/dolt/*, and the passive JSONL
 # export is never auto-staged into git commits (refs/dolt/data is the sync channel,
 # not the JSONL). The Dolt remote itself is per-machine state applied by `anton setup`.
+#
+# export.auto false (anton-1th): don't auto-regenerate the passive issues.jsonl snapshot on
+# ordinary bd commands. Committed here (not just enforced by configureBeadsForRepo) so existing
+# clones inherit the knob on pull without re-running init/re-add. export.git-add false is a
+# distinct knob — it only stops staging, not the regeneration itself.
 dolt.auto-commit: "on"
+export.auto: false
 export.git-add: false
 
 # Issue prefix for this repository (used by bd init)

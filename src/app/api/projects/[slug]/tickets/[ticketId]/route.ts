@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
-import { getProjectBySlug } from "@/lib/projects";
 import { deleteTicket, getTicketDetail, updateTicket } from "@/lib/ticket-detail";
 import { parseTicketPatch } from "@/lib/ticket-patch";
+import { resolveProject } from "../../resolve-project";
 
 export const dynamic = "force-dynamic";
 
@@ -10,10 +10,8 @@ export async function GET(
   { params }: { params: Promise<{ slug: string; ticketId: string }> },
 ) {
   const { slug, ticketId } = await params;
-  const project = await getProjectBySlug(slug);
-  if (!project) {
-    return NextResponse.json({ error: "Project not found" }, { status: 404 });
-  }
+  const { project, response } = await resolveProject(slug);
+  if (!project) return response;
 
   try {
     const detail = await getTicketDetail(project, ticketId);
@@ -28,10 +26,8 @@ export async function PATCH(
   { params }: { params: Promise<{ slug: string; ticketId: string }> },
 ) {
   const { slug, ticketId } = await params;
-  const project = await getProjectBySlug(slug);
-  if (!project) {
-    return NextResponse.json({ error: "Project not found" }, { status: 404 });
-  }
+  const { project, response } = await resolveProject(slug);
+  if (!project) return response;
 
   let body: unknown;
   try {
@@ -58,10 +54,8 @@ export async function DELETE(
   { params }: { params: Promise<{ slug: string; ticketId: string }> },
 ) {
   const { slug, ticketId } = await params;
-  const project = await getProjectBySlug(slug);
-  if (!project) {
-    return NextResponse.json({ error: "Project not found" }, { status: 404 });
-  }
+  const { project, response } = await resolveProject(slug);
+  if (!project) return response;
 
   try {
     await deleteTicket(project, ticketId);

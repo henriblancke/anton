@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
-import { getProjectBySlug } from "@/lib/projects";
 import { getRunDetail } from "@/lib/runs";
 import { listSessions, toSessionSummary } from "@/lib/sessions";
+import { resolveProject } from "../../resolve-project";
 
 export const dynamic = "force-dynamic";
 
@@ -11,10 +11,8 @@ export async function GET(
   { params }: { params: Promise<{ slug: string; runId: string }> },
 ) {
   const { slug, runId } = await params;
-  const project = await getProjectBySlug(slug);
-  if (!project) {
-    return NextResponse.json({ error: "Project not found" }, { status: 404 });
-  }
+  const { project, response } = await resolveProject(slug);
+  if (!project) return response;
 
   const run = await getRunDetail(project.id, runId);
   if (!run) {

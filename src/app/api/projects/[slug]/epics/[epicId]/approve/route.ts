@@ -6,9 +6,9 @@ import { beads } from "@/lib/beads/bd";
 import { conflictBody, ownerOf, withClaimLock } from "@/lib/beads/claim";
 import { enqueueExecuteEpic, enqueueExecuteEpicIfAbsent } from "@/lib/jobs/service";
 import { resolveOperator } from "@/lib/operator";
-import { getProjectBySlug } from "@/lib/projects";
 import { deriveStage } from "@/lib/ticket-view";
 import { STAGES } from "@/lib/types";
+import { resolveProject } from "../../../resolve-project";
 
 export const dynamic = "force-dynamic";
 
@@ -27,10 +27,8 @@ export async function POST(
   { params }: { params: Promise<{ slug: string; epicId: string }> },
 ) {
   const { slug, epicId } = await params;
-  const project = await getProjectBySlug(slug);
-  if (!project) {
-    return NextResponse.json({ error: "Project not found" }, { status: 404 });
-  }
+  const { project, response } = await resolveProject(slug);
+  if (!project) return response;
 
   // Gate approval on readiness: approving enqueues execute-epic immediately, so an epic with open
   // blockers must not be startable before its blocker completes. Locate it across stages first.
