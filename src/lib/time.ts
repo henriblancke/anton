@@ -25,3 +25,23 @@ export function formatExactTime(iso: string | null | undefined): string | null {
     timeStyle: "short",
   });
 }
+
+/**
+ * Compact forward-looking countdown to a future ISO timestamp — "2h 15m", "45m", "3d 4h" —
+ * for limit reset times in the usage popover. Returns `"now"` once the moment has passed and
+ * `null` when unparseable. Complements {@link formatRelativeTime}, which looks backward.
+ */
+export function formatCountdown(iso: string | null | undefined, now = Date.now()): string | null {
+  if (!iso) return null;
+  const ms = Date.parse(iso);
+  if (Number.isNaN(ms)) return null;
+  const s = Math.floor((ms - now) / 1000);
+  if (s <= 0) return "now";
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (d > 0) return h > 0 ? `${d}d ${h}h` : `${d}d`;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m`;
+  return "<1m";
+}
