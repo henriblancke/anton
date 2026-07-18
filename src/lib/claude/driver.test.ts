@@ -12,12 +12,14 @@ import { CLAUDE_BIN_ENV, runClaude, type ClaudeEvent } from "./driver";
 let dir: string;
 let prevBin: string | undefined;
 
-function writeFakeClaude(name: string, ndjsonLines: string[], exitCode = 0): string {
+function writeFakeClaude(name: string, ndjsonLines: string[], exitCode = 0, stderr = ""): string {
   const path = join(dir, name);
   const body = [
     "#!/usr/bin/env node",
     `const lines = ${JSON.stringify(ndjsonLines)};`,
     "for (const l of lines) { process.stdout.write(l + \"\\n\"); }",
+    `const stderr = ${JSON.stringify(stderr)};`,
+    "if (stderr) { process.stderr.write(stderr); }",
     `process.exitCode = ${exitCode};`,
     "",
   ].join("\n");
@@ -455,6 +457,80 @@ describe("runClaude", () => {
     expect(isUsageLimitError(caught)).toBe(false);
     expect(caught).toBeInstanceOf(Error);
     expect((caught as Error).message).toContain("claude exited with code 1");
+  });
+
+  it("does NOT misclassify a non-zero exit whose RESULT field opens with the full no-link banner then adds failure prose", async () => {
+    // anton-b9l review follow-up (PR #43, thread PRRT_kwDOTWcq...): the result field is ALSO
+    // model-authored final text on an ordinary failed run, so excluding only the assistant
+    // transcript was not enough — a leading quote of the full banner in the *result* field would
+    // still match a loose scan. Here an agent working this very ticket makes its final result text
+    // begin with the verbatim no-link banner (including the `/usage-credits` pointer) and then
+    // reports that its own work failed. Because the result field is trusted for the spend-limit
+    // wording ONLY when the banner is the WHOLE result (SPEND_LIMIT_RESULT_RE is end-anchored), the
+    // trailing failure prose defeats the match, so the run surfaces as a plain error for a human
+    // instead of being refunded and rescheduled forever.
+    const resultText =
+      "You've hit your monthly spend limit.\n/usage-credits to check your usage and remaining credits\n\n" +
+      "^ Added the above as a fixture for the no-link variant, but three tests still fail.";
+    const bin = writeFakeClaude(
+      "result-quotes-full-nolink-banner-claude",
+      [
+        JSON.stringify({
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: true,
+          session_id: "sess-resultquote",
+          total_cost_usd: 0.02,
+          result: resultText,
+        }),
+      ],
+      1,
+    );
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    let caught: unknown;
+    try {
+      await runClaude({ cwd: dir, prompt: "work the anton-b9l ticket" });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(isUsageLimitError(caught)).toBe(false);
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain("claude exited with code 1");
+  });
+
+  it("throws UsageLimitError for a genuine monthly spend-limit banner surfaced only on stderr", async () => {
+    // anton-b9l review follow-up (PR #43): stderr is Claude Code's own diagnostic channel (the model
+    // streams to stdout, never the process stderr), so the spend-limit banner there is trusted with
+    // the loose matcher even when the result field is a generic error — a genuine abort that lands
+    // the banner on stderr must still route to UsageLimitError so the runner reschedules.
+    const bin = writeFakeClaude(
+      "spend-limited-stderr-claude",
+      [
+        JSON.stringify({ type: "system", subtype: "init", session_id: "sess-spend-stderr" }),
+        JSON.stringify({
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: true,
+          session_id: "sess-spend-stderr",
+          total_cost_usd: 0,
+        }),
+      ],
+      1,
+      "You've hit your monthly spend limit · raise it at claude.ai/settings/usage\n",
+    );
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    let caught: unknown;
+    try {
+      await runClaude({ cwd: dir, prompt: "do the thing" });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(isUsageLimitError(caught)).toBe(true);
+    expect((caught as Error).message).toContain("monthly spend limit");
   });
 
   it("does NOT misclassify a clean success whose transcript merely mentions a usage limit", async () => {
