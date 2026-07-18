@@ -207,7 +207,13 @@ function healBeads(repoPath: string): boolean {
       console.log(`[projects] beads configured for ${repoPath}`);
     }
     if (result.doltSync?.status === "configured") {
-      console.log(`[projects] Dolt remote wired for ${repoPath} (refs/dolt/data on origin)`);
+      // Push is non-fatal + reported (anton-8qx): the remote is wired locally even when the publish
+      // push fails (e.g. no push access yet), so only claim refs/dolt/data is on origin when it is.
+      console.log(
+        result.doltSync.pushed === false
+          ? `[projects] Dolt remote wired for ${repoPath} — bd dolt push failed; retry once auth/network is available`
+          : `[projects] Dolt remote wired for ${repoPath} (refs/dolt/data on origin)`,
+      );
     }
     if (result.hooksWarning) {
       // Hooks are optional for anton-driven repos (runner pushes Dolt explicitly); just note the
