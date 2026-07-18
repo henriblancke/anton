@@ -124,4 +124,29 @@ describe("settings route — agents allowlist + autonomy (anton-46w)", () => {
     const res = await PATCH(patchReq({ autonomy: false }), ctx("nope"));
     expect(res.status).toBe(400);
   });
+
+  it("PATCH persists a boolean conventionalCommits, and GET restores it (anton-41d)", async () => {
+    const res = await PATCH(patchReq({ conventionalCommits: true }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.conventionalCommits).toBe(true);
+    expect(persisted().conventionalCommits).toBe(true);
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.conventionalCommits).toBe(true);
+  });
+
+  it("PATCH rejects a non-boolean conventionalCommits (anton-41d)", async () => {
+    for (const bad of ["yes", 1, {}]) {
+      const res = await PATCH(patchReq({ conventionalCommits: bad }), ctx("tmp"));
+      expect(res.status).toBe(400);
+    }
+  });
+
+  it('PATCH "" / null clears conventionalCommits back to OFF (key removed) (anton-41d)', async () => {
+    await PATCH(patchReq({ conventionalCommits: true }), ctx("tmp"));
+    const res = await PATCH(patchReq({ conventionalCommits: null }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.conventionalCommits).toBeUndefined();
+    expect("conventionalCommits" in persisted()).toBe(false);
+  });
 });

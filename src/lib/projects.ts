@@ -135,6 +135,13 @@ export interface ProjectSettings {
    * jobs `queued` (approval still enqueues), and turning it back on resumes them.
    */
   autonomy?: boolean;
+  /**
+   * Conventional-commit PR titles (anton-41d): when true, execute-epic prefixes the epic PR title
+   * with a deterministic `<type>(<scope>): ` derived from the target bead (bug→fix, epic/task→feat;
+   * scope = the `agent:` label when present). Absent → OFF (opt-in): the title stays the historical
+   * `<title> (<id>)`, so existing projects' PR titles are unchanged until enabled.
+   */
+  conventionalCommits?: boolean;
 }
 
 /** Defaults for the per-project job policy when a setting is unset. */

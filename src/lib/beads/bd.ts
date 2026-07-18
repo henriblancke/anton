@@ -40,7 +40,8 @@ export interface BeadPatch {
   labels?: Partial<Record<LabelPrefix, string>>;
 }
 
-function labelValueOf(labels: string[] | undefined, prefix: string): string | undefined {
+/** Read the value of a single-valued `prefix:` label off a bead's labels, or undefined. */
+export function labelValueOf(labels: string[] | undefined, prefix: string): string | undefined {
   const label = labels?.find((l) => l.startsWith(`${prefix}:`));
   return label ? label.slice(prefix.length + 1) : undefined;
 }
