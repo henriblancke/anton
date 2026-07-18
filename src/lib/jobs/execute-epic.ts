@@ -11,6 +11,7 @@ import { computeEpicGraph, epicStandaloneBlockers, standaloneBlockers } from "..
 import { loadAgentPrompt } from "../claude/agent-prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
 import { runClaude, type ClaudeEvent } from "../claude/driver";
+import { formatAntonResult, parseAntonResult } from "../claude/anton-result";
 import { commitAll, openPullRequest, resolveFreshBase } from "../git/ops";
 import { createWorktree, removeWorktree } from "../git/worktree";
 import {
@@ -437,6 +438,13 @@ async function runTicket(args: {
       throw new Error(`claude reported an error for ${ticket.id}: ${result.text ?? "unknown"}`);
     }
 
+    // Parse the agent's machine-readable self-report (anton-j5i8): the last `ANTON-RESULT:` line
+    // from its output — `delivered` or `blocked — <reason>`. Recorded on the session log here; it
+    // CORROBORATES the delivery-evidence gate below, never replaces it. A missing/unparseable line
+    // (selfReport === null) simply falls through to the commit-evidence gate — never a crash.
+    const selfReport = parseAntonResult(result.text);
+    await appendSessionLog(logPath, `[anton-result] ${formatAntonResult(selfReport)}\n`).catch(() => {});
+
     // Verify gates (optional — configured per project): tests + operator-pinned lint/typecheck/
     // build (anton-3oh8). Absent → no gates run. A non-zero exit fails the ticket before commit.
     await runVerifyGates(
@@ -455,13 +463,32 @@ async function runTicket(args: {
     // runner parks the run for a human instead of retrying claude to the same empty result forever.
     const { committed: didCommit } = await commitAll(worktreePath, `${ticket.id}: ${ticket.title}`);
     if (!didCommit) {
+      // Empty tree: the delivery-evidence gate blocks + halts. Cross-check the self-report and
+      // fold it into the reason (anton-j5i8): a `delivered` claim on an empty tree is the exact
+      // false success the gate exists to catch; a `blocked` self-report corroborates the block and
+      // carries the agent's own reason forward. A missing line just reads as the plain gate message.
       throw new NoDeliveryError(
         `${ticket.id} produced no delivery: claude exited cleanly and passed the verify gates but ` +
           `left no changes to commit (zero diff). Blocking the ticket for operator review and ` +
-          `halting the epic — nothing landed, so closing it would be a false success.`,
+          `halting the epic — nothing landed, so closing it would be a false success.` +
+          selfReportSuffix(selfReport),
       );
     }
     committed = true;
+
+    // Commit evidence exists, but the agent SELF-REPORTED blocked (anton-j5i8): it is telling us
+    // the ticket is not actually done. Honor that honest signal — block the ticket for a human
+    // rather than closing it on a partial change. This is NOT a self-report-alone failure (out of
+    // scope): there IS commit evidence; we surface the contradiction (work committed + agent-declared
+    // block) so the partial work isn't lost and a human decides. A `delivered`/missing self-report
+    // with a real commit is the normal path and proceeds to close/in-review below.
+    if (selfReport?.outcome === "blocked") {
+      throw new BlockedByAgentError(
+        `${ticket.id} was self-reported blocked by the agent (${formatAntonResult(selfReport)}) even ` +
+          `though it committed changes. Blocking the ticket for operator review and halting the epic — ` +
+          `the agent declared the work incomplete, so closing it would be a false success.`,
+      );
+    }
 
     // Persist this ticket's "code done" state the moment it commits. An epic child closes (stage
     // → done). A standalone target isn't closed until its PR merges, so instead move it to
@@ -477,11 +504,15 @@ async function runTicket(args: {
     await endSession(db, clock, sessionId, "done");
   } catch (e) {
     await endSession(db, clock, sessionId, "failed");
-    // Record the no-delivery reason in the session log too, so it's visible when tailing/replaying
-    // the session — not just in the run row's error. Best-effort; never mask the run's own error.
+    // Record the no-delivery / agent-blocked reason in the session log too, so it's visible when
+    // tailing/replaying the session — not just in the run row's error. Best-effort; never mask the
+    // run's own error.
     const noDelivery = e instanceof NoDeliveryError;
+    const agentBlocked = e instanceof BlockedByAgentError;
     if (noDelivery) {
       await appendSessionLog(logPath, `[no-delivery] ${e.message}\n`).catch(() => {});
+    } else if (agentBlocked) {
+      await appendSessionLog(logPath, `[agent-blocked] ${e.message}\n`).catch(() => {});
     }
     // Release the claim so the board never shows a dead session's ticket as in-flight
     // (anton-live-sync R10). A usage-limit park is NOT dead — the run resumes with the claim
@@ -491,7 +522,7 @@ async function runTicket(args: {
     // open would silently re-queue it into the ready pool and hide the false-success. All
     // best-effort: never mask the run's error; the epic-level finally sync pushes the release.
     if (!isUsageLimitError(e)) {
-      if (committed || noDelivery) {
+      if (committed || noDelivery || agentBlocked) {
         await safe(() => beads.setStatus(repo, ticket.id, "blocked"));
         await safe(() =>
           beads.note(
@@ -500,7 +531,11 @@ async function runTicket(args: {
             noDelivery
               ? `anton: run made no changes (clean agent exit, zero diff) — nothing was delivered; ` +
                   `needs a human to implement it or fix the ticket, then resume the run`
-              : `anton: run failed after committing work — needs review`,
+              : agentBlocked
+                ? `anton: the agent self-reported ANTON-RESULT: blocked and committed only partial ` +
+                    `work — it declared the ticket incomplete; needs a human to finish or re-scope it, ` +
+                    `then resume the run`
+                : `anton: run failed after committing work — needs review`,
           ),
         );
       } else {
@@ -535,6 +570,28 @@ class NoDeliveryError extends Error {
     super(msg);
     this.name = "PoisonError"; // classified as poison by the runner
   }
+}
+
+/**
+ * The agent committed changes but SELF-REPORTED `ANTON-RESULT: blocked` (anton-j5i8) — it declared
+ * the ticket incomplete despite leaving a diff. Poison-classified (`name = "PoisonError"`) so the
+ * runner parks for a human rather than retrying: the agent has said it can't finish, so re-running
+ * would reproduce the same block. A distinct subclass so runTicket's catch can surface it (block +
+ * agent-specific note) apart from a genuine post-commit failure.
+ */
+class BlockedByAgentError extends Error {
+  constructor(msg: string) {
+    super(msg);
+    this.name = "PoisonError"; // classified as poison by the runner
+  }
+}
+
+/** Fold the parsed self-report into a zero-diff block reason, when one was emitted (anton-j5i8). */
+function selfReportSuffix(selfReport: ReturnType<typeof parseAntonResult>): string {
+  if (!selfReport) return "";
+  return selfReport.outcome === "delivered"
+    ? ` The agent self-reported ANTON-RESULT: delivered — a false success on an unchanged tree.`
+    : ` The agent self-reported ${formatAntonResult(selfReport)}, corroborating the block.`;
 }
 
 function childrenOf(all: Bead[], epicId: string): Bead[] {

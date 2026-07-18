@@ -92,3 +92,27 @@ A pre-existing failure unrelated to your change isn't yours to fix here — but 
 
 Briefly summarize what you changed and why — including which checks you ran and their result.
 anton takes it from there.
+
+## Signal your outcome (required last line)
+
+End your final message with **exactly one** machine-readable status line — nothing after it:
+
+```
+ANTON-RESULT: delivered
+```
+
+when you implemented the ticket and left the checks green, **or**
+
+```
+ANTON-RESULT: blocked — <one-line reason>
+```
+
+when you could not deliver (a blocker from "Fail loud", a contradiction in the acceptance
+criteria, a missing dependency, or a pre-existing failure that isn't yours to fix). State the
+reason in one line so a human knows what to decide.
+
+Rules:
+- Emit it **once**, as the final line. anton reads the last `ANTON-RESULT:` line from your output.
+- **Never report `delivered` on an unchanged tree.** If you made no code changes, you delivered
+  nothing — report `blocked` with the reason. anton cross-checks this line against what actually
+  got committed; a `delivered` claim with an empty diff is a false success and is blocked for a human.

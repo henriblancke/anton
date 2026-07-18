@@ -1283,6 +1283,110 @@ process.exit(0);`,
     }
   }, 60_000);
 
+  it("blocks + surfaces a ticket the agent self-reported ANTON-RESULT: blocked, even with a commit (anton-j5i8)", async () => {
+    // The agent committed partial work but ended with `ANTON-RESULT: blocked — <reason>`: it is
+    // telling us the ticket is not done. The harness must honor that honest signal — block the
+    // ticket for a human (not close it on the partial change), record the parsed outcome on the
+    // session log, and halt the epic — corroborating the delivery-evidence gate rather than
+    // trusting the commit alone.
+    const epicSb = await beads.create(repo, {
+      title: "Self-blocked epic",
+      type: "epic",
+      description: "## Goal\nSB",
+    });
+    await beads.approve(repo, epicSb);
+    const mkSb = (title: string) => {
+      const p = JSON.parse(
+        execFileSync(
+          "bd",
+          ["create", title, "--type", "task", "--parent", epicSb, "--acceptance", "x", "--json"],
+          { cwd: repo, encoding: "utf8" },
+        ),
+      );
+      return (Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string;
+    };
+    const sb1 = mkSb("SB ticket one");
+    const sb2 = mkSb("SB ticket two");
+
+    // A claude that DOES change the tree (so a commit lands + the AGENT_WORK.md test gate passes)
+    // but self-reports `blocked` in its final result — the exact "committed but declared incomplete"
+    // contradiction the cross-check must surface. Logs each ticket so we can prove the epic halts.
+    const invLog = join(sandbox, "selfblocked-inv.jsonl");
+    const blockedClaude = writeBin(
+      binDir,
+      "claude-selfblocked",
+      `const fs=require('fs');const path=require('path');
+const a=process.argv.slice(2);const get=f=>{const i=a.indexOf(f);return i>=0?a[i+1]:undefined;};
+const prompt=get('-p')||'';const m=prompt.match(/Ticket: (\\S+)/);
+fs.appendFileSync(${JSON.stringify(invLog)},(m?m[1]:'unknown')+'\\n');
+fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'partial '+Date.now()+'\\n');
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+e({type:'system',subtype:'init',session_id:'ssb'});
+e({type:'assistant',message:{content:[{type:'text',text:'made partial progress'}]}});
+e({type:'result',subtype:'success',result:'Partial progress only.\\nANTON-RESULT: blocked — acceptance criteria contradict the existing API',session_id:'ssb',num_turns:1,is_error:false});
+process.exit(0);`,
+    );
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    process.env.ANTON_CLAUDE_BIN = blockedClaude;
+    let jobId: string;
+    try {
+      jobId = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: epicSb },
+      });
+      await runner.tickOnce();
+      await runner.whenIdle();
+
+      // Poison → job parked (no retry burn); the reason names the self-reported block and is
+      // recorded on the run row + the parked job's lastError.
+      const job = await getJob(tdb.db, jobId);
+      expect(job?.status).toBe("parked");
+      expect(job?.lastError).toMatch(/self-reported blocked/i);
+      const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === epicSb)!;
+      expect(run.status).toBe("failed");
+      expect(run.error).toMatch(/self-reported blocked/i);
+
+      // Exactly one ticket dispatched — the epic halted on the blocked ticket.
+      const invoked = readFileSync(invLog, "utf8").trim().split("\n").filter(Boolean);
+      expect(invoked).toHaveLength(1);
+      const blockedId = invoked[0];
+      const skippedId = blockedId === sb1 ? sb2 : sb1;
+
+      // Ticket state reflects the block: BLOCKED (not closed), unclaimed, no implementing label,
+      // with an operator note that names the agent's self-report.
+      const blocked = await beads.show(repo, blockedId);
+      expect(blocked.status).toBe("blocked");
+      expect(blocked.assignee ?? null).toBeNull();
+      expect(blocked.labels ?? []).not.toContain("stage:implementing");
+
+      // The parsed outcome was recorded on the session log (surfaced for tailing/replay).
+      const session = (await tdb.db.select().from(schema.sessions)).find(
+        (s) => s.beadId === blockedId,
+      )!;
+      const log = readFileSync(session.logPath!, "utf8");
+      expect(log).toContain("[anton-result] blocked — acceptance criteria contradict");
+      expect(log).toContain("[agent-blocked]");
+
+      // Downstream ticket never dispatched; no PR; epic never advanced to in-review.
+      const skipped = await beads.show(repo, skippedId);
+      expect(skipped.status).toBe("open");
+      const epic = await beads.show(repo, epicSb);
+      expect(epic.external_ref ?? null).toBeNull();
+      expect(epic.labels ?? []).not.toContain("stage:in-review");
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  }, 60_000);
+
   it("branches a fresh run off the newer origin/<base> tip (anton-x3o)", async () => {
     // A run whose LOCAL base is stale must start at the remote tip: resolveFreshBase fetches
     // origin/main before createWorktree, so the worktree branches off origin/main, not the local
