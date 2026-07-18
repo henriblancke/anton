@@ -192,8 +192,24 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //    below as a sweep leftover. Checked before any claim/worktree/session work so a run never
       //    half-executes into a concurrent one. Best-effort pull: a failure degrades to the last
       //    local snapshot rather than blocking a legitimate run.
-      await safe(() => beads.pull(repo));
-      const leaseTarget = await beads.show(repo, epicBeadId).catch(() => target);
+      //    Track whether this pre-check ran against a TRUSTED (fresh) board read. A stale snapshot —
+      //    the pull failed, or the show fell back to the top-of-handler `all` — can hide an
+      //    already-live incumbent lease published by a run that started earlier. That incumbent only
+      //    arbitrates the lease at ITS OWN startup and keeps running regardless of what we decide, so
+      //    the post-publish race arbitration (step 1b) must NOT steal the lease from it by owner order
+      //    when our pre-check couldn't rule it out (anton-jz1).
+      let preCheckTrusted = true;
+      try {
+        await beads.pull(repo);
+      } catch {
+        preCheckTrusted = false; // stale local snapshot — an incumbent lease may be invisible below
+      }
+      let leaseTarget = target;
+      try {
+        leaseTarget = await beads.show(repo, epicBeadId);
+      } catch {
+        preCheckTrusted = false; // fell back to the stale top-of-handler snapshot
+      }
       if (beads.foreignRunLeaseLive(leaseTarget, clock.now(), runId)) {
         throw new RunAlreadyLiveError(
           `${epicBeadId} is already running on another machine (unexpired run-lease) — parking; ` +
@@ -273,7 +289,30 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         );
       }
       const acquired = await beads.show(repo, epicBeadId).catch(() => null);
-      if (acquired && !beads.winsRunLeaseRace(acquired, clock.now(), runId)) {
+      // Fail closed when this re-read fails (anton-jz1). It's the ONLY check confirming no concurrent
+      // lease won the race; a null here (DB lock, transient CLI error, malformed output) means we
+      // can't prove we won, so park + retry like the pull failure above rather than fall through and
+      // proceed while another machine may hold a live lease.
+      if (!acquired) {
+        throw new RunAlreadyLiveError(
+          `${epicBeadId} could not re-read the target to arbitrate the run-lease race — parking so a ` +
+            `concurrent run on another machine isn't ignored; this attempt resumes once the board is reachable`,
+        );
+      }
+      // If the step-0 pre-check was stale, an already-live incumbent lease could have been invisible
+      // then and only surfaces now. That incumbent won't re-arbitrate, so winsRunLeaseRace's
+      // lowest-owner-wins tiebreak would let us steal the lease and double-run. Park on ANY foreign
+      // live lease instead of arbitrating by owner order (anton-jz1). A trusted (fresh) pre-check
+      // guarantees no incumbent existed, so a foreign lease seen now is a symmetric racer and IS
+      // safely arbitrable below.
+      if (!preCheckTrusted && beads.foreignRunLeaseLive(acquired, clock.now(), runId)) {
+        throw new RunAlreadyLiveError(
+          `${epicBeadId} found a live run-lease from another machine after a stale pre-check — parking ` +
+            `rather than stealing by owner order (that run started earlier and won't yield); this ` +
+            `attempt resumes once it settles and clears its lease`,
+        );
+      }
+      if (!beads.winsRunLeaseRace(acquired, clock.now(), runId)) {
         throw new RunAlreadyLiveError(
           `${epicBeadId} lost the run-lease race to a concurrent run on another machine — parking; ` +
             `this attempt resumes once that run settles and clears its lease`,

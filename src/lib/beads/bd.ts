@@ -549,6 +549,14 @@ export const beads = {
    * An owner-less foreign live lease (legacy / liveness-only publish) can't be arbitrated, so this
    * yields (returns false): parking is recoverable, a double-run is not. No foreign live lease at all
    * → true (the run is uncontested).
+   *
+   * The lowest-owner-wins tiebreak is ONLY sound for that SYMMETRIC case — two fresh runs that raced
+   * before either lease was visible. It is NOT safe against an already-live INCUMBENT (a run that
+   * started earlier, only arbitrates at its own startup, and won't yield): from the label set alone
+   * this function can't tell an incumbent from a co-racer, so a latecomer whose owner sorts lower
+   * would wrongly "win" and double-run. The caller must therefore park on any foreign live lease when
+   * its pre-check was stale (couldn't rule out an incumbent) and only reach this arbitration after a
+   * trusted, fresh pre-check — see execute-epic step 1b (`preCheckTrusted`).
    */
   winsRunLeaseRace: (b: Bead, nowMs: number, ownRunId: string): boolean => {
     for (const l of b.labels ?? []) {
