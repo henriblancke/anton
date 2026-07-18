@@ -64,11 +64,13 @@ export interface RunClaudeOptions {
  * lifts on its own (a raised cap or the next billing cycle), so it belongs here: the runner
  * reschedules past a cool-off instead of burning attempts and parking.
  *
- * We match the specific "spend limit" phrasing rather than generic billing text so an ordinary
- * payment failure (declined card, no payment method) is NOT reclassified as a transient quota
- * reset and rescheduled forever — those still fall through to a plain error for a human.
+ * We match the specific "monthly spend limit" phrasing rather than generic billing text — or the
+ * bare "spend limit" phrase — so neither an ordinary payment failure (declined card, no payment
+ * method) nor a non-zero-exit run whose transcript merely mentions the words "spend limit" (e.g. an
+ * agent working this very ticket that then fails tests or a push) is reclassified as a transient
+ * quota reset and rescheduled forever — those still fall through to a plain error for a human.
  */
-const USAGE_LIMIT_RE = /usage limit reached|(?:5-hour|weekly) limit reached|spend limit/i;
+const USAGE_LIMIT_RE = /usage limit reached|(?:5-hour|weekly) limit reached|monthly spend limit/i;
 
 /** Best-effort extraction of a reset time (unix seconds) from claude's usage-limit text. */
 function parseResetAt(text: string | undefined): number | undefined {

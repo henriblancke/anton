@@ -246,6 +246,48 @@ describe("runClaude", () => {
     expect(result.text).toBe("Implemented the monthly spend-limit detection and pushed.");
   });
 
+  it("does NOT misclassify a non-zero exit whose transcript mentions a bare 'spend limit'", async () => {
+    // anton-b9l narrowing: the matcher keys on "monthly spend limit", not the bare "spend limit"
+    // phrase. A run that fails for an unrelated reason (e.g. an agent working this ticket whose tests
+    // or push then fail, exiting non-zero) but whose transcript merely says "spend limit" must NOT be
+    // reclassified as a quota hit — that would refund the attempt and reschedule the real failure
+    // forever. It must surface as a plain error for a human.
+    const bin = writeFakeClaude(
+      "mentions-bare-spend-limit-claude",
+      [
+        JSON.stringify({
+          type: "assistant",
+          message: {
+            content: [
+              { type: "text", text: "Narrowed the spend limit matcher, but the push failed." },
+            ],
+          },
+        }),
+        JSON.stringify({
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: true,
+          session_id: "sess-bare",
+          total_cost_usd: 0.01,
+          result: "Narrowed the spend limit matcher, but the push failed.",
+        }),
+      ],
+      1,
+    );
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    let caught: unknown;
+    try {
+      await runClaude({ cwd: dir, prompt: "work the anton-b9l ticket" });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(isUsageLimitError(caught)).toBe(false);
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain("claude exited with code 1");
+  });
+
   it("does NOT misclassify a clean success whose transcript merely mentions a usage limit", async () => {
     // Regression for the anton-ner.2 transcript-scan false positive: a run that exits 0 with
     // is_error false is a success, even if an assistant text block contains "usage limit reached"
