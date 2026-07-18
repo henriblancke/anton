@@ -35,6 +35,7 @@ export function ClaimControl({
   canTakeOver = false,
   className,
   onChanged,
+  children,
 }: {
   slug: string;
   itemId: string;
@@ -42,8 +43,12 @@ export function ClaimControl({
   owner: string | null;
   /** Override the resolved operator identity (defaults to the shared useOperator hook). */
   operator?: string | null;
-  /** `chip` — compact, for board cards/chips. `row` — inline, for the detail assignee rows. */
-  variant?: "chip" | "row";
+  /**
+   * `chip` — compact inline, for board cards/chips. `row` — inline, for the detail assignee rows.
+   * `stack` — owner name on its own line above the action button, so extra buttons passed as
+   * `children` sit beside the claim button in the row below the name (used on the epic card).
+   */
+  variant?: "chip" | "row" | "stack";
   /**
    * Drop the claim/release/steal controls. Set once a target is approved/locked: the claim route
    * 409s any write to an approved target (ownership then changes only via Approve's
@@ -64,6 +69,8 @@ export function ClaimControl({
   className?: string;
   /** Fired with the new owner after a successful write so callers can refetch/update their copy. */
   onChanged?: (owner: string | null) => void;
+  /** Extra buttons rendered in the action row beside the claim button (only in `stack` variant). */
+  children?: React.ReactNode;
 }) {
   const hookOperator = useOperator();
   const operator = operatorProp !== undefined ? operatorProp : hookOperator;
@@ -120,11 +127,75 @@ export function ClaimControl({
   }
 
   const isRow = variant === "row";
+  const isStack = variant === "stack";
   const label = owner ?? "Unclaimed";
   // The one ownership move an approved target allows: steal-on-approve, offered only where the caller
   // vouched it won't start a second run (`canTakeOver`). Nothing to take over when it's unclaimed or
   // already ours.
   const takeOverable = readOnly && canTakeOver && known && owner !== null && !mine;
+
+  const nameEl = (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1",
+        isRow ? "" : "font-mono text-[10px]",
+        owner ? "text-foreground/85" : "text-subtle",
+      )}
+      title={
+        readOnly
+          ? owner
+            ? takeOverable
+              ? `Claimed by ${owner} — approved; take over re-approves it under your name`
+              : `Claimed by ${owner} — locked while approved`
+            : "Unclaimed — locked while approved"
+          : owner
+            ? `Claimed by ${owner}`
+            : "Unclaimed"
+      }
+    >
+      <UserIcon className={cn(isRow ? "size-3.5" : "size-3", "shrink-0")} aria-hidden="true" />
+      <span className="truncate">{mine ? "You" : label}</span>
+    </span>
+  );
+
+  const actionEl = readOnly ? (
+    takeOverable ? (
+      <Button size="xs" variant="outline" onClick={() => act("takeover")} disabled={busy}>
+        <UserPlusIcon aria-hidden="true" />
+        {busy ? "Taking over…" : "Take over"}
+      </Button>
+    ) : null
+  ) : owner === null ? (
+    known ? (
+      <Button size="xs" variant="outline" onClick={() => act("claim")} disabled={busy}>
+        <UserPlusIcon aria-hidden="true" />
+        {busy ? "Claiming…" : "Claim"}
+      </Button>
+    ) : null
+  ) : mine ? (
+    <Button size="xs" variant="ghost" onClick={() => act("release")} disabled={busy}>
+      <UserMinusIcon aria-hidden="true" />
+      {busy ? "Releasing…" : "Release"}
+    </Button>
+  ) : known ? (
+    <Button size="xs" variant="outline" onClick={() => act("steal")} disabled={busy}>
+      {busy ? "Stealing…" : "Steal"}
+    </Button>
+  ) : null;
+
+  // Stack — owner name on its own line, then a button row where the claim action sits beside any
+  // extra buttons (Approve, delete) the caller passes as children.
+  if (isStack) {
+    return (
+      <div className={cn("pointer-events-auto flex flex-col gap-2", className)}>
+        {nameEl}
+        <div className="flex items-center gap-2">
+          {actionEl}
+          {children}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <span
@@ -134,52 +205,8 @@ export function ClaimControl({
         className,
       )}
     >
-      <span
-        className={cn(
-          "inline-flex items-center gap-1",
-          isRow ? "" : "font-mono text-[10px]",
-          owner ? "text-foreground/85" : "text-subtle",
-        )}
-        title={
-          readOnly
-            ? owner
-              ? takeOverable
-                ? `Claimed by ${owner} — approved; take over re-approves it under your name`
-                : `Claimed by ${owner} — locked while approved`
-              : "Unclaimed — locked while approved"
-            : owner
-              ? `Claimed by ${owner}`
-              : "Unclaimed"
-        }
-      >
-        <UserIcon className={cn(isRow ? "size-3.5" : "size-3", "shrink-0")} aria-hidden="true" />
-        <span className="truncate">{mine ? "You" : label}</span>
-      </span>
-
-      {readOnly ? (
-        takeOverable ? (
-          <Button size="xs" variant="outline" onClick={() => act("takeover")} disabled={busy}>
-            <UserPlusIcon aria-hidden="true" />
-            {busy ? "Taking over…" : "Take over"}
-          </Button>
-        ) : null
-      ) : owner === null ? (
-        known ? (
-          <Button size="xs" variant="outline" onClick={() => act("claim")} disabled={busy}>
-            <UserPlusIcon aria-hidden="true" />
-            {busy ? "Claiming…" : "Claim"}
-          </Button>
-        ) : null
-      ) : mine ? (
-        <Button size="xs" variant="ghost" onClick={() => act("release")} disabled={busy}>
-          <UserMinusIcon aria-hidden="true" />
-          {busy ? "Releasing…" : "Release"}
-        </Button>
-      ) : known ? (
-        <Button size="xs" variant="outline" onClick={() => act("steal")} disabled={busy}>
-          {busy ? "Stealing…" : "Steal"}
-        </Button>
-      ) : null}
+      {nameEl}
+      {actionEl}
     </span>
   );
 }

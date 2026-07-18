@@ -95,6 +95,10 @@ function TicketDialogBody({
   const [attempt, setAttempt] = useState(0);
   const [draft, setDraft] = useState<TicketDraft | null>(null);
   const [saving, setSaving] = useState(false);
+  // Optimistic run/approve state, mirroring the standalone chip: flip the affordance to Force run
+  // immediately on our own click and revert on failure. The board's own poll refreshes the truth.
+  const [running, setRunning] = useState(false);
+  const [optimisticApproved, setOptimisticApproved] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -158,6 +162,29 @@ function TicketDialogBody({
     onClose();
   }
 
+  // A standalone task/bug is its own run target, so approval is its run trigger — the same T2 route
+  // an epic uses (validates the id is a real run target). Re-approving an already-approved target
+  // re-triggers the run (Force run), resuming from where it stopped. A child ticket has no run of
+  // its own (it runs via its epic's PR), so the affordance is hidden for it; the route 422s it too.
+  async function run(wasApproved: boolean) {
+    if (!detail) return;
+    setRunning(true);
+    setOptimisticApproved(true);
+    try {
+      const res = await fetch(`/api/projects/${slug}/epics/${ticketId}/approve`, { method: "POST" });
+      if (!res.ok) {
+        const { error: message } = await res.json().catch(() => ({ error: "Run failed" }));
+        throw new Error(message ?? "Run failed");
+      }
+      toast.success(wasApproved ? `Re-running "${detail.title}"` : `Approved & running "${detail.title}"`);
+    } catch (err) {
+      setOptimisticApproved(false);
+      toast.error(err instanceof Error ? err.message : "Failed to start run");
+    } finally {
+      setRunning(false);
+    }
+  }
+
   if (error) {
     return (
       <div className="flex flex-col items-center justify-center gap-3 py-10 text-center">
@@ -177,6 +204,10 @@ function TicketDialogBody({
   const changed = hasTicketChanges(draftFromDetail(detail), draft);
   const set = <K extends keyof TicketDraft>(key: K, value: TicketDraft[K]) =>
     setDraft({ ...draft, [key]: value });
+
+  // Only a parentless task/bug is a run target of its own; a child ticket runs via its epic's PR.
+  const isRunTarget = !detail.epicId;
+  const approved = detail.approved || optimisticApproved;
 
   return (
     <div className="flex flex-col gap-4">
@@ -314,6 +345,21 @@ function TicketDialogBody({
       <DialogFooter className="sm:justify-between">
         <ConfirmDeleteButton onConfirm={remove} label="Delete ticket" />
         <div className="flex gap-2">
+          {isRunTarget && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => run(approved)}
+              disabled={running}
+              title={
+                approved
+                  ? "Re-trigger the run (resumes from where it stopped)"
+                  : "Approve and start the run"
+              }
+            >
+              {running ? "Starting…" : approved ? "Force run" : "Approve & run"}
+            </Button>
+          )}
           <Button
             variant="ghost"
             size="sm"

@@ -161,21 +161,21 @@ export function EpicCard({
       </div>
 
       {epic.stage === "backlog" && !overlay && (
-        <div className="mt-0.5 flex flex-col gap-2">
-          <ClaimControl
-            slug={slug}
-            itemId={epic.id}
-            owner={epic.assignee}
-            readOnly={approved}
-            canTakeOver={epic.stage === "backlog"}
-          />
-          <div className="flex items-center gap-2">
+        <ClaimControl
+          slug={slug}
+          itemId={epic.id}
+          owner={epic.assignee}
+          variant="stack"
+          readOnly={approved}
+          canTakeOver={epic.stage === "backlog"}
+          className="mt-0.5"
+        >
           {showApprove && (
             <Button
               size="xs"
               onClick={handleApprove}
               disabled={approving}
-              className="pointer-events-auto flex-1"
+              className="pointer-events-auto"
             >
               {approving ? "Approving…" : "Approve"}
             </Button>
@@ -187,10 +187,9 @@ export function EpicCard({
             stopPropagation
             confirmLabel="Delete"
             title="Delete epic"
-            className={cn("pointer-events-auto shrink-0", !showApprove && "ml-auto")}
+            className="pointer-events-auto ml-auto shrink-0"
           />
-          </div>
-        </div>
+        </ClaimControl>
       )}
     </CardShell>
   );
