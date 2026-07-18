@@ -56,13 +56,13 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
   );
   const tickets = childBeads.map(toTicket);
 
-  // The epic-detail header historically shows agent/risk/size per-ticket (in the graph), not on
-  // the epic itself — so `chips: false` keeps this view byte-identical. See ticket-view.ts.
+  // The epic-detail header shows the epic's own agent/risk/size chips (like the board card and the
+  // single-ticket pseudo-epic) so an epic with risk:/size: labels doesn't silently drop them. See
+  // ticket-view.ts; `chips` defaults to true.
   const epic = toEpic(lite, {
     goal: parseGoal(full.description),
     acceptance: parseAcceptance(full),
     tickets,
-    chips: false,
   });
   attachPrUrl(epic, base);
   for (const t of tickets) attachPrUrl(t, base);
