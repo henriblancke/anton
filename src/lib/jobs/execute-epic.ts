@@ -259,7 +259,23 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //    timer is unref'd so it never keeps the process alive, is torn down in `finally`, and its
       //    refresh failures are caught + logged (with `assertLeaseHeld` parking the run if they
       //    persist past the TTL) rather than fatal.
-      await publishLease();
+      //    Fail closed as a PARK, not a hard failure (anton-jz1). A transient board outage (Dolt
+      //    remote/CLI unavailable) at run start leaves us unable to prove we hold the shared lease —
+      //    the same "can't prove liveness" condition steps 1b/assertLeaseHeld already treat as a
+      //    RunAlreadyLiveError (park + retry, refunding the attempt and cooling off until the board is
+      //    reachable). Marking it `failed` instead would burn retry attempts on a temporary outage and
+      //    eventually strand an approved job for a human. Not proceeding is what matters here; parking
+      //    doesn't proceed any more than failing does, and it recovers on its own.
+      try {
+        await publishLease();
+      } catch (e) {
+        throw new RunAlreadyLiveError(
+          `${epicBeadId} could not publish its run-lease to the shared board (${
+            e instanceof Error ? e.message : String(e)
+          }) — parking rather than proceeding without a lease other machines can see; this attempt ` +
+            `resumes once the board is reachable`,
+        );
+      }
 
       // 1b. Read-after-write conflict check (anton-jz1). The foreign-lease gate in step 0 read the
       //     board BEFORE this publish, so it can't serialize two machines that force-run the same
