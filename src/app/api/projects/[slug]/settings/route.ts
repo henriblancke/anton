@@ -29,6 +29,8 @@ export async function GET(_request: Request, { params }: { params: Promise<{ slu
 /** Upper bound on operator-editable prompts — generous for guidance, guards a runaway payload. */
 const MAX_SEED_PROMPT = 8000;
 const MAX_REVIEW_FIX_PROMPT = 8000;
+/** Upper bound on an operator verify-gate command (anton-3oh8) — generous for a chained gate. */
+const MAX_COMMAND = 1000;
 
 export async function PATCH(request: Request, { params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
@@ -64,6 +66,34 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
       );
     }
     patch[key] = n;
+  }
+
+  // Verify-gate commands (anton-3oh8): tests + operator-pinned lint/typecheck/build. "" / null
+  // clears the gate (skipped); otherwise a bounded shell-command string. Shared handling so all
+  // four behave identically.
+  const commandFields: ("testCommand" | "lintCommand" | "typecheckCommand" | "buildCommand")[] = [
+    "testCommand",
+    "lintCommand",
+    "typecheckCommand",
+    "buildCommand",
+  ];
+  for (const key of commandFields) {
+    if (!(key in body)) continue;
+    const raw = (body as Record<string, unknown>)[key];
+    if (raw == null || raw === "") {
+      patch[key] = undefined; // clear → gate skipped
+      continue;
+    }
+    if (typeof raw !== "string") {
+      return NextResponse.json({ error: `${key} must be a string` }, { status: 400 });
+    }
+    if (raw.length > MAX_COMMAND) {
+      return NextResponse.json(
+        { error: `${key} too long (max ${MAX_COMMAND} chars)` },
+        { status: 400 },
+      );
+    }
+    patch[key] = raw;
   }
 
   if ("model" in body) {
