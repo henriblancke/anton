@@ -568,23 +568,61 @@ export function orderTickets(tickets: Bead[], all: Bead[]): Bead[] {
 }
 
 /**
- * The concrete task (`-p`) for one ticket: identity + acceptance only. The operating contract
- * (git/beads ownership, scope, learnings, fail-loud) lives in the locked base system prompt
- * (composeSystemPrompt), so it isn't duplicated here.
+ * Cap on each inlined ticket field. anton worktrees carry a frozen embedded Dolt with no remote,
+ * so `bd show` inside the worktree can fail (issue #46 root cause #3) — the prompt must therefore
+ * carry the spec itself and not be load-bearing on in-worktree DB access. A generous per-field
+ * budget keeps a pathologically large body from bloating the prompt while still delivering the
+ * whole spec for the common case.
  */
-function ticketPrompt(ticket: Bead): string {
-  const acceptance = ticket.acceptance_criteria ?? ticket.acceptance ?? "(see `bd show`)";
-  return [
+const MAX_TICKET_FIELD_CHARS = 4000;
+
+function truncateField(text: string): string {
+  const trimmed = text.trim();
+  if (trimmed.length <= MAX_TICKET_FIELD_CHARS) return trimmed;
+  return `${trimmed.slice(0, MAX_TICKET_FIELD_CHARS)}\n… [truncated — run \`bd show\` for the full text]`;
+}
+
+/**
+ * The concrete task (`-p`) for one ticket. The operating contract (git/beads ownership, scope,
+ * learnings, fail-loud) lives in the locked base system prompt (composeSystemPrompt), so it isn't
+ * duplicated here.
+ *
+ * The ticket's full spec — Goal / Out of scope / Verify (the `description` markdown), Acceptance,
+ * and Context — is inlined so the agent can implement even when the worktree's beads DB is
+ * unreadable (issue #46 root cause #3). `bd show` is offered as a convenience, never as the sole
+ * source: a bead whose spec is genuinely empty AND whose `bd show` fails is a fail-loud/blocked
+ * condition, not a cue to silently produce nothing.
+ */
+export function ticketPrompt(ticket: Bead): string {
+  const description = ticket.description?.trim();
+  const acceptance = (ticket.acceptance_criteria ?? ticket.acceptance)?.trim();
+  // In some boards Context is a separate column; in others it's folded into `description` as a
+  // `## Context` heading. Only inline the standalone field when it isn't already in `description`.
+  const context =
+    ticket.context?.trim() && ticket.context.trim() !== description
+      ? ticket.context.trim()
+      : undefined;
+
+  const lines = [
     `Implement this beads ticket in the current worktree:`,
     ``,
     `Ticket: ${ticket.id} — ${ticket.title}`,
+  ];
+  if (description) {
+    lines.push(``, `## Goal / Out of scope / Verify`, truncateField(description));
+  }
+  lines.push(``, `## Acceptance criteria`, acceptance ? truncateField(acceptance) : "(none stated)");
+  if (context) {
+    lines.push(``, `## Context`, truncateField(context));
+  }
+  lines.push(
     ``,
-    `Acceptance criteria:`,
-    acceptance,
-    ``,
-    `Run \`bd show ${ticket.id}\` for the full Goal / Context, then implement it to satisfy the`,
-    `acceptance criteria. Follow the operating contract in your system prompt.`,
-  ].join("\n");
+    `The full ticket spec is inlined above so you can implement it even if the worktree's beads ` +
+      `DB is unreadable. \`bd show ${ticket.id}\` gives the same content when bd is healthy. If ` +
+      `the spec above is empty AND \`bd show\` fails, stop and report the ticket as blocked — do ` +
+      `not guess or silently bail. Follow the operating contract in your system prompt.`,
+  );
+  return lines.join("\n");
 }
 
 function prBody(target: Bead, tickets: Bead[]): string {

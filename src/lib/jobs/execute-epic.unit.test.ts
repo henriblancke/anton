@@ -5,7 +5,7 @@
  */
 import { describe, expect, it } from "vitest";
 import type { Bead } from "../beads/bd";
-import { inactiveAgentTickets } from "./execute-epic";
+import { inactiveAgentTickets, ticketPrompt } from "./execute-epic";
 
 function ticket(id: string, labels?: string[]): Bead {
   return { id, title: id, status: "open", labels } as Bead;
@@ -65,5 +65,67 @@ describe("inactiveAgentTickets", () => {
       { id: "t-1", agent: "docker" },
       { id: "t-2", agent: "alembic" },
     ]);
+  });
+});
+
+describe("ticketPrompt", () => {
+  it("inlines the full spec (description/acceptance/context) so it survives a dead in-worktree bd", () => {
+    const p = ticketPrompt({
+      id: "t-1",
+      title: "Do the thing",
+      status: "open",
+      description: "## Goal\nMake it work.",
+      acceptance_criteria: "- [ ] it works",
+      context: "touches src/foo.ts",
+    } as Bead);
+    // Spec is carried in the prompt itself, not fetched via bd — the whole point of the ticket.
+    expect(p).toContain("t-1 — Do the thing");
+    expect(p).toContain("Make it work.");
+    expect(p).toContain("- [ ] it works");
+    expect(p).toContain("touches src/foo.ts");
+  });
+
+  it("frames an empty spec + failing bd as fail-loud/blocked, never a silent bailout", () => {
+    const p = ticketPrompt({ id: "t-1", title: "Bare", status: "open" } as Bead);
+    expect(p).toContain("(none stated)");
+    expect(p).toMatch(/report the ticket as blocked/);
+    expect(p).toMatch(/not guess or silently bail/);
+  });
+
+  it("prefers acceptance_criteria but falls back to the legacy acceptance field", () => {
+    const p = ticketPrompt({
+      id: "t-1",
+      title: "T",
+      status: "open",
+      acceptance: "- [ ] legacy criterion",
+    } as Bead);
+    expect(p).toContain("- [ ] legacy criterion");
+  });
+
+  it("does not repeat Context when it is already folded into the description markdown", () => {
+    const body = "## Goal\nG\n\n## Context\ntouches src/foo.ts";
+    const p = ticketPrompt({
+      id: "t-1",
+      title: "T",
+      status: "open",
+      description: body,
+      context: body,
+    } as Bead);
+    // The standalone context block is skipped, so the folded body appears exactly once — not
+    // duplicated once from `description` and again from the separate `context` column.
+    expect(p.match(/touches src\/foo\.ts/g) ?? []).toHaveLength(1);
+  });
+
+  it("truncates an oversized body so it cannot bloat the prompt", () => {
+    const huge = "x".repeat(10_000);
+    const p = ticketPrompt({
+      id: "t-1",
+      title: "T",
+      status: "open",
+      description: huge,
+      acceptance_criteria: "- [ ] ok",
+    } as Bead);
+    expect(p).toContain("[truncated");
+    expect(p).not.toContain(huge);
   });
 });
