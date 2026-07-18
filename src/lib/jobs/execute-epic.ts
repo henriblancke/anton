@@ -156,9 +156,11 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     let leaseLabels: string[] = [];
     let leaseTimer: ReturnType<typeof setInterval> | null = null;
     // Set true in `finally` so a refresh tick that hasn't started yet no-ops instead of publishing a
-    // fresh lease after settle; `leaseRefreshInFlight` tracks a tick already mid-publish so `finally`
-    // can await it before clearing the label (otherwise a slow refresh write could re-publish an
-    // unexpired lease after the clear and leave the epic looking live until TTL — anton-jz1).
+    // fresh lease after settle; `leaseRefreshInFlight` tracks the tail of the serialized refresh
+    // chain (each tick chains onto it rather than overwriting — see the setInterval below) so
+    // `finally` can await every queued/in-flight refresh before clearing the label (otherwise a slow
+    // refresh write could re-publish an unexpired lease after the clear and leave the epic looking
+    // live until TTL — anton-jz1).
     let leaseSettled = false;
     let leaseRefreshInFlight: Promise<void> = Promise.resolve();
     // Expiry (ms) of the last lease this run PUSHED to the shared remote — advanced only after the
@@ -395,12 +397,27 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
 
       leaseTimer = setInterval(() => {
         if (leaseSettled) return; // run is settling — don't publish a fresh lease behind finally's clear
-        // A failed refresh only logs (it must not crash the process from a detached timer), and
+        // Serialize refreshes by CHAINING onto the in-flight promise rather than overwriting it
+        // (anton-jz1). If a `publishLease` runs longer than RUN_LEASE_REFRESH_MS (a `bd sync` queued
+        // behind another sync, a remote stall), the next tick would otherwise start a second publish
+        // concurrently AND replace the only promise `finally` awaits — the first, still-running
+        // refresh could then land an unexpired lease AFTER finally cleared the label, leaving a
+        // done/failed/parked run looking live until TTL. Chaining guarantees at most one publish is
+        // in flight, and `leaseRefreshInFlight` always tracks the tail of the chain so `finally`
+        // awaits every queued refresh. Re-check `leaseSettled` after the prior link resolves so a
+        // refresh queued before settle no-ops instead of re-publishing behind finally's clear. A
+        // failed refresh only logs (it must not crash the process from a detached timer), and
         // publishLease leaves `leaseExpiry` un-advanced on failure — so if these writes keep failing,
         // `assertLeaseHeld` at the next checkpoint parks the run before the shared lease lapses.
-        leaseRefreshInFlight = publishLease().catch((e) =>
-          console.error(`[execute-epic] run-lease refresh failed for ${epicBeadId}`, e),
-        );
+        leaseRefreshInFlight = leaseRefreshInFlight
+          .catch(() => {}) // prior failure already logged below; keep the chain alive
+          .then(() => {
+            if (leaseSettled) return; // settled while the prior refresh was in flight — don't republish
+            return publishLease();
+          })
+          .catch((e) =>
+            console.error(`[execute-epic] run-lease refresh failed for ${epicBeadId}`, e),
+          );
       }, RUN_LEASE_REFRESH_MS);
       if (typeof leaseTimer.unref === "function") leaseTimer.unref();
 
