@@ -6,6 +6,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { beads, LABELS, type Bead } from "../beads/bd";
+import { ownerOf } from "../beads/claim";
 import { computeEpicGraph, epicStandaloneBlockers, standaloneBlockers } from "../epic-graph";
 import { loadAgentPrompt } from "../claude/agent-prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
@@ -170,11 +171,93 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       });
       await ctx.heartbeat();
 
-      // 2. Claim the epic for the human operator (idempotent). The immediate sync nudge makes
-      // the claim visible on teammates' boards within a heartbeat — that's the whole point of
-      // claiming (anton-live-sync R6); fire-and-forget, the end-of-run sync is the backstop.
+      // 2. Assert this process still owns the epic, THEN claim it for the human operator (idempotent).
+      //    An approved-but-unstarted (backlog) target can be TAKEN OVER — reassigned to another
+      //    operator via the approve route's steal — after this run was queued but before it leased the
+      //    epic (a queued or autonomy-paused job). The take-over enqueues a fresh run on the NEW
+      //    owner's instance, but the jobs table is machine-local: THIS stale job still sits on the
+      //    ORIGINAL operator's instance. Running it now would execute under the new owner's
+      //    reservation — the exact "run under someone else's claim" state the soft-lock
+      //    forbids (DESIGN.md §Soft-lock). So gate on ownership FIRST — like the ticket-claim hard gate
+      //    in runTicket — AND make the claim itself hard (below): a steal landing between this read and
+      //    the claim is caught by `bd update --claim` refusing to reassign, not swallowed by `safe`.
+      //    Re-read the owner here (not from the job-start snapshot): the worktree warm
+      //    above is several ops wide, so ownership settles against current state, mirroring the approve
+      //    route re-reading the assignee at its own run trigger. PARK (not fail) on a mismatch —
+      //    recoverable, it stops the stale run without stomping the new owner, and the current owner
+      //    approving afresh enqueues a run under their identity on their instance. A runner with no
+      //    operator identity can't assert ownership, so it falls through to the prior best-effort claim.
       const operator = await resolveOperator();
-      await safe(() => beads.claim(repo, epicBeadId, operator));
+      const currentOwner = ownerOf(await beads.show(repo, epicBeadId));
+      if (operator && currentOwner && currentOwner !== operator) {
+        throw new PoisonEpic(
+          `${epicBeadId} is reserved by ${currentOwner}, not ${operator} — it was taken over after ` +
+            `this run was queued; refusing to run under another operator's claim. Approve ${epicBeadId} ` +
+            `as ${currentOwner} to start a run under the current owner.`,
+        );
+      }
+      if (operator) {
+        // Fold the ownership gate INTO the claim so a take-over that lands in the window between the
+        // read above and this write can't slip through. `bd update --claim` refuses to reassign a
+        // bead a different operator now holds, so it — not the stale pre-read — is the operation that
+        // actually observes a racing steal. That refusal MUST stop the run (like runTicket's ticket
+        // hard gate), never be swallowed by `safe`: swallowing would tag and execute the epic under
+        // the new owner's reservation, the exact state the soft-lock forbids. On the NORMAL path the
+        // approve route already pre-assigned this same operator (approve/route.ts `cas(owner, operator)`),
+        // so this is a same-actor re-claim — and `bd update --claim` is idempotent for the same actor
+        // ("idempotent if already claimed by you" per its own help; verified on bd 1.0.4), so it
+        // succeeds and the run proceeds. Same story on resume, so a retry re-claims cleanly. A claim
+        // only FAILS when a DIFFERENT operator now holds the bead — the take-over handled below.
+        try {
+          await beads.claim(repo, epicBeadId, operator);
+        } catch (e) {
+          // A claim failure has two very different causes and only one warrants poisoning. Re-read the
+          // owner to tell them apart: if a DIFFERENT operator now holds the epic, this is a confirmed
+          // take-over — retrying is pointless, so poison (human must re-approve as the current owner).
+          // But `bd update --claim` also throws on transient failures (a Dolt lock, a CLI timeout) with
+          // NO ownership change; poisoning those would park a valid approved epic that a retry would
+          // claim cleanly. Treat that class as a normal retryable error — the same call runTicket's
+          // hard gate makes — so the runner retries instead of parking. A racing steal is still caught:
+          // either this re-read sees it, or the pre-read gate above does on the next attempt. If the
+          // re-read ITSELF fails we can't confirm a take-over, so fall through to the retryable path.
+          const ownerNow = await beads
+            .show(repo, epicBeadId)
+            .then(ownerOf)
+            .catch(() => undefined);
+          if (ownerNow && ownerNow !== operator) {
+            throw new PoisonEpic(
+              `${epicBeadId} is reserved by ${ownerNow}, not ${operator} — it was taken over after this ` +
+                `run was queued; refusing to run under another operator's claim. Approve ${epicBeadId} as ` +
+                `${ownerNow} to start a run under the current owner. ` +
+                `(${e instanceof Error ? e.message : String(e)})`,
+            );
+          }
+          throw new Error(
+            `${epicBeadId} could not be claimed for ${operator} — the beads DB is locked or the claim ` +
+              `command failed transiently; retrying. ` +
+              `(${e instanceof Error ? e.message : String(e)})`,
+          );
+        }
+      } else if (currentOwner) {
+        // No operator identity, but the epic is owned by someone. We can't assert we ARE that
+        // owner, and a best-effort `safe` claim would swallow bd's refusal to reassign a foreign
+        // bead — tagging and running the epic under the current owner's reservation, the exact
+        // state the soft-lock forbids (DESIGN.md §Soft-lock). So mirror the pre-read gate above
+        // and PARK: this is an older queued approved-but-unassigned job on an instance without
+        // ANTON_OPERATOR/global user.name, and another operator took the epic over before the
+        // lease. Poison (recoverable) — a human must re-approve as the current owner to enqueue a
+        // run under their identity. Retrying is pointless: this runner still can't assert ownership.
+        throw new PoisonEpic(
+          `${epicBeadId} is reserved by ${currentOwner}, but this runner has no operator identity ` +
+            `(set ANTON_OPERATOR or the global git user.name) to assert ownership — refusing to ` +
+            `run under another operator's claim. Approve ${epicBeadId} as ${currentOwner} to start ` +
+            `a run under the current owner.`,
+        );
+      } else {
+        // No operator identity AND the epic is unowned → nobody's reservation to stomp, so keep
+        // the prior best-effort claim (bd falls back to its own actor resolution).
+        await safe(() => beads.claim(repo, epicBeadId, operator));
+      }
       await safe(() => beads.tag(repo, epicBeadId, [LABELS.stage("implementing")]));
       void beads
         .sync(repo)

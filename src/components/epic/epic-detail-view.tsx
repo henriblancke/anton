@@ -13,6 +13,7 @@ import { ConfirmDeleteButton } from "@/components/ui/confirm-delete-button";
 import { CopyButton } from "@/components/ui/copy-button";
 import { agentDotClass, ticketProgress } from "@/components/board/board-utils";
 import { MetaChip, PrLink, RelativeTime, RiskChip, StagePill } from "@/components/atoms";
+import { ClaimControl } from "@/components/board/claim-control";
 import { DependencyGraph } from "@/components/epic/dependency-graph";
 import { TicketDialog } from "@/components/ticket/ticket-dialog";
 
@@ -270,12 +271,20 @@ export function EpicDetailView({ slug, epicId }: { slug: string; epicId: string 
 
           {/* claimed-by + created — mirrors the ticket surfaces */}
           <dl className="flex flex-col gap-2">
-            <div className="flex items-baseline gap-2 text-[12.5px]">
+            <div className="flex items-center gap-2 text-[12.5px]">
               <dt className="w-20 shrink-0">
                 <SectionLabel>Claimed by</SectionLabel>
               </dt>
-              <dd className={cn(epic.assignee ? "text-foreground/85" : "text-subtle")}>
-                {epic.assignee ?? "Unclaimed"}
+              <dd>
+                <ClaimControl
+                  slug={slug}
+                  itemId={epic.id}
+                  owner={epic.assignee}
+                  variant="row"
+                  readOnly={epic.approved}
+                  canTakeOver={epic.stage === "backlog"}
+                  onChanged={() => setAttempt((n) => n + 1)}
+                />
               </dd>
             </div>
             <div className="flex items-baseline gap-2 text-[12.5px]">

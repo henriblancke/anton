@@ -404,7 +404,16 @@ export const beads = {
   claim: (cwd: string, id: string, actor?: string) =>
     bdWrite(cwd, ["update", id, "--claim"], actor ? { BEADS_ACTOR: actor } : undefined),
 
-  /** Clear a bead's assignee (`bd assign <id> ""`) — used when releasing a stale claim. */
+  /**
+   * Set a bead's assignee WITHOUT touching status (`bd assign <id> <actor>`). This is the
+   * human-reservation primitive: unlike `claim`, it never flips the bead to in_progress, so the
+   * bead stays `open` and deriveStage stays `backlog` — a person reserves it without triggering a
+   * run. `actor` is a positional arg (not BEADS_ACTOR) because `bd assign` names the assignee
+   * directly; do NOT route human claims through `claim`, which is the automation-run primitive.
+   */
+  assign: (cwd: string, id: string, actor: string) => bdWrite(cwd, ["assign", id, actor]),
+
+  /** Clear a bead's assignee (`bd assign <id> ""`) — used when releasing a claim. */
   unassign: (cwd: string, id: string) => bdWrite(cwd, ["assign", id, ""]),
 
   /** Pure argv builder, exposed for testing and callers that want to inspect the write. */
