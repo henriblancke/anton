@@ -20,6 +20,7 @@ interface EditableSettings {
   maxRetries?: number;
   agents?: string[];
   autonomy?: boolean;
+  conventionalCommits?: boolean;
 }
 
 // Defaults mirror the server (src/lib/projects.ts DEFAULT_*); duplicated so this client module
@@ -97,6 +98,9 @@ export function SettingsView({
   );
   const [maxRetries, setMaxRetries] = useState(settings.maxRetries ?? DEFAULT_MAX_RETRIES);
   const [autonomy, setAutonomy] = useState(settings.autonomy ?? true);
+  const [conventionalCommits, setConventionalCommits] = useState(
+    settings.conventionalCommits ?? false,
+  );
   // null = no schedule row for this project yet (shown as "not scheduled"; toggling creates it).
   const [automations, setAutomations] = useState<Record<string, boolean | null>>(() =>
     Object.fromEntries(
@@ -159,6 +163,7 @@ export function SettingsView({
           // a since-deleted agent (still in the seeded set) is pruned rather than re-persisted.
           agents: agents.filter((a) => activeAgents.has(a.id)).map((a) => a.id),
           autonomy,
+          conventionalCommits,
         }),
       });
       if (!res.ok) {
@@ -413,6 +418,22 @@ export function SettingsView({
                 </div>
                 <span className="ml-auto">
                   <Toggle checked={autonomy} onChange={setAutonomy} label="Autonomous execution" />
+                </span>
+              </div>
+
+              <div className="flex items-center gap-2.5 rounded-[10px] border border-border bg-card px-3 py-2.5">
+                <div className="flex flex-col gap-0.5">
+                  <span className="text-[12.5px]">Conventional-commit PR titles</span>
+                  <span className="text-[10.5px] text-subtle">
+                    prefix epic PR titles with feat/fix(scope)
+                  </span>
+                </div>
+                <span className="ml-auto">
+                  <Toggle
+                    checked={conventionalCommits}
+                    onChange={setConventionalCommits}
+                    label="Conventional-commit PR titles"
+                  />
                 </span>
               </div>
             </section>

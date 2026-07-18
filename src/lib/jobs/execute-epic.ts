@@ -20,6 +20,7 @@ import {
   updateRun,
 } from "../runs";
 import { appendSessionLog, createSession, endSession, sessionLogPath } from "../sessions";
+import { buildPrTitle } from "./pr-title";
 import { isUsageLimitError } from "./errors";
 import { runShell } from "./shell";
 import type { AntonDb, Clock } from "./queue";
@@ -225,7 +226,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         repoPath: repo,
         branch: worktree.branch,
         base: baseBranch,
-        title: `${target.title} (${epicBeadId})`,
+        title: buildPrTitle(target, epicBeadId, settings.conventionalCommits),
         body: prBody(target, tickets),
       });
       await safe(() => beads.setExternalRef(repo, epicBeadId, pr.ref));

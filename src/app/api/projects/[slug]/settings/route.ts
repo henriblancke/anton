@@ -135,6 +135,19 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
     } else patch.autonomy = autonomy;
   }
 
+  if ("conventionalCommits" in body) {
+    const conventionalCommits = body.conventionalCommits;
+    // "" / null → clear (default: OFF). Otherwise strictly a boolean.
+    if (conventionalCommits == null || conventionalCommits === "") {
+      patch.conventionalCommits = undefined;
+    } else if (typeof conventionalCommits !== "boolean") {
+      return NextResponse.json(
+        { error: "conventionalCommits must be a boolean" },
+        { status: 400 },
+      );
+    } else patch.conventionalCommits = conventionalCommits;
+  }
+
   try {
     const settings = await updateProjectSettings(slug, patch);
     return NextResponse.json({ settings });
