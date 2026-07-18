@@ -55,8 +55,20 @@ export interface RunClaudeOptions {
   onEvent?: (event: ClaudeEvent) => void;
 }
 
-/** Case-insensitive usage-limit phrasing claude emits on an exhausted quota. */
-const USAGE_LIMIT_RE = /usage limit reached|(?:5-hour|weekly) limit reached/i;
+/**
+ * Case-insensitive usage-limit phrasing claude emits on an exhausted quota.
+ *
+ * Covers the 5-hour/weekly "usage limit reached" wording *and* the monthly spend-limit
+ * wording Claude Code surfaces separately — observed as `You've hit your monthly spend limit ·
+ * raise it at claude.ai/settings/usage` (anton-b9l). A spend limit is a periodic quota that
+ * lifts on its own (a raised cap or the next billing cycle), so it belongs here: the runner
+ * reschedules past a cool-off instead of burning attempts and parking.
+ *
+ * We match the specific "spend limit" phrasing rather than generic billing text so an ordinary
+ * payment failure (declined card, no payment method) is NOT reclassified as a transient quota
+ * reset and rescheduled forever — those still fall through to a plain error for a human.
+ */
+const USAGE_LIMIT_RE = /usage limit reached|(?:5-hour|weekly) limit reached|spend limit/i;
 
 /** Best-effort extraction of a reset time (unix seconds) from claude's usage-limit text. */
 function parseResetAt(text: string | undefined): number | undefined {

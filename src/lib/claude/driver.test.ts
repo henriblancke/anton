@@ -172,6 +172,80 @@ describe("runClaude", () => {
     expect((caught as { resetAt?: number }).resetAt).toBe(resetSec);
   });
 
+  it("throws UsageLimitError with no resetAt for the captured monthly spend-limit payload", async () => {
+    // The exact wording captured on 2026-07-15 (run 36efe52b…): Claude Code surfaces a monthly
+    // spend-limit hit as `You've hit your monthly spend limit · raise it at claude.ai/settings/usage`
+    // with a non-zero exit and no reset timestamp. Before anton-b9l this slipped past USAGE_LIMIT_RE
+    // (which only knew usage/5-hour/weekly wording), so the runner surfaced the plain stderr exit
+    // error, burned maxAttempts, and parked. It must now route to UsageLimitError. Because the format
+    // supplies no reset time, resetAt is undefined → the runner falls back to quotaCooloffMs and
+    // refunds the attempt.
+    const spendLimitText = "You've hit your monthly spend limit · raise it at claude.ai/settings/usage";
+    const bin = writeFakeClaude(
+      "spend-limited-claude",
+      [
+        JSON.stringify({ type: "system", subtype: "init", session_id: "sess-spend" }),
+        JSON.stringify({
+          type: "assistant",
+          message: { content: [{ type: "text", text: spendLimitText }] },
+        }),
+        JSON.stringify({
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: true,
+          session_id: "sess-spend",
+          total_cost_usd: 0,
+          result: spendLimitText,
+        }),
+      ],
+      1,
+    );
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    let caught: unknown;
+    try {
+      await runClaude({ cwd: dir, prompt: "do the thing" });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(isUsageLimitError(caught)).toBe(true);
+    // No parseable reset time → runner uses the fallback cool-off (quotaCooloffMs) and refunds.
+    expect((caught as { resetAt?: number }).resetAt).toBeUndefined();
+    expect((caught as Error).message).toContain("monthly spend limit");
+  });
+
+  it("does NOT misclassify a clean success whose transcript mentions a monthly spend limit", async () => {
+    // Success false-positive guard, extended to the spend-limit wording (anton-b9l): a run that
+    // exits 0 with is_error false is a success even if its output says "monthly spend limit" (e.g. an
+    // agent working this very ticket). It must resolve, not throw UsageLimitError.
+    const bin = writeFakeClaude("mentions-spend-limit-claude", [
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [
+            { type: "text", text: 'Made "monthly spend limit" reschedule instead of parking the job.' },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        session_id: "sess-ok2",
+        total_cost_usd: 0.01,
+        result: "Implemented the monthly spend-limit detection and pushed.",
+      }),
+    ]);
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    const result = await runClaude({ cwd: dir, prompt: "work the anton-b9l ticket" });
+
+    expect(result.ok).toBe(true);
+    expect(result.isError).toBe(false);
+    expect(result.text).toBe("Implemented the monthly spend-limit detection and pushed.");
+  });
+
   it("does NOT misclassify a clean success whose transcript merely mentions a usage limit", async () => {
     // Regression for the anton-ner.2 transcript-scan false positive: a run that exits 0 with
     // is_error false is a success, even if an assistant text block contains "usage limit reached"
