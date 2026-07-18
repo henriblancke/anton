@@ -246,20 +246,21 @@ describe("runClaude", () => {
     expect(result.text).toBe("Implemented the monthly spend-limit detection and pushed.");
   });
 
-  it("does NOT misclassify a non-zero exit whose transcript mentions a bare 'spend limit'", async () => {
-    // anton-b9l narrowing: the matcher keys on "monthly spend limit", not the bare "spend limit"
-    // phrase. A run that fails for an unrelated reason (e.g. an agent working this ticket whose tests
-    // or push then fail, exiting non-zero) but whose transcript merely says "spend limit" must NOT be
-    // reclassified as a quota hit — that would refund the attempt and reschedule the real failure
-    // forever. It must surface as a plain error for a human.
+  it("does NOT misclassify a non-zero exit whose transcript mentions the words 'monthly spend limit'", async () => {
+    // anton-b9l narrowing: the matcher keys on the captured payload wording ("hit your monthly spend
+    // limit"), not any occurrence of the bare words "monthly spend limit". A run that fails for an
+    // unrelated reason (e.g. an agent working this very ticket, whose output describes the monthly
+    // spend limit feature, whose tests or push then fail, exiting non-zero) must NOT be reclassified
+    // as a quota hit — that would refund the attempt and reschedule the real failure forever. It must
+    // surface as a plain error for a human.
     const bin = writeFakeClaude(
-      "mentions-bare-spend-limit-claude",
+      "mentions-monthly-spend-limit-claude",
       [
         JSON.stringify({
           type: "assistant",
           message: {
             content: [
-              { type: "text", text: "Narrowed the spend limit matcher, but the push failed." },
+              { type: "text", text: "Narrowed the monthly spend limit matcher, but the push failed." },
             ],
           },
         }),
@@ -269,7 +270,7 @@ describe("runClaude", () => {
           is_error: true,
           session_id: "sess-bare",
           total_cost_usd: 0.01,
-          result: "Narrowed the spend limit matcher, but the push failed.",
+          result: "Narrowed the monthly spend limit matcher, but the push failed.",
         }),
       ],
       1,
