@@ -25,7 +25,7 @@ import {
   platformLabel,
   provisionAgentsSkills,
   registerProject,
-  REQUIRED_SKILLS,
+  INSTALLED_SKILLS,
   resolvePort,
 } from "./anton.mjs";
 
@@ -396,20 +396,24 @@ describe("provisionAgentsSkills (into a temp ~/.claude)", () => {
 
     // Non-interactive selection via flag so no TTY prompt is needed.
     const first = await provisionAgentsSkills(["--agents", "nextjs"], { claudeRoot, appRoot: REPO_ROOT });
-    expect(first.installed).toBe(REQUIRED_SKILLS.length + 1); // 4 skills + 1 agent
-    for (const req of REQUIRED_SKILLS) expect(await exists(skillPath(req))).toBe(true);
+    expect(first.installed).toBe(INSTALLED_SKILLS.length + 1); // 5 skills (incl. setup) + 1 agent
+    for (const req of INSTALLED_SKILLS) expect(await exists(skillPath(req))).toBe(true);
     expect(await exists(join(claudeRoot, "agents", "nextjs.md"))).toBe(true);
+    // setup's bundled templates travel with the skill directory (anton-olh).
+    expect(
+      await exists(join(claudeRoot, "skills", "setup", "templates", ".product", "PRODUCT.md")),
+    ).toBe(true);
 
     // Re-run: everything already present, zero writes.
     const second = await provisionAgentsSkills(["--agents", "nextjs"], { claudeRoot, appRoot: REPO_ROOT });
     expect(second.installed).toBe(0);
-    expect(second.skipped).toBe(REQUIRED_SKILLS.length + 1);
+    expect(second.skipped).toBe(INSTALLED_SKILLS.length + 1);
   });
 
   it("with --no-agents installs only the required skills", async () => {
     claudeRoot = await mkdtemp(join(tmpdir(), "anton-claude-"));
     const r = await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
-    expect(r.installed).toBe(REQUIRED_SKILLS.length);
+    expect(r.installed).toBe(INSTALLED_SKILLS.length);
     expect(r.agents).toEqual([]);
     expect(await exists(join(claudeRoot, "agents"))).toBe(false);
   });

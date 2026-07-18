@@ -27,9 +27,12 @@ These travel with the skill — hold them while shaping:
   git already does it, don't build it.
 - **Fail loud.** On a missing field or a broken state, stop and say so with a pointer to the fix.
 
-Read the project's `.product/PRODUCT.md` + `.product/principles.md` before shaping. If `.product/`
-is missing, say so and run `/setup` — do not shape against a vacuum. All bead writes go through
-the **`bd` skill** (installed alongside this one) — it carries anton's label / edge / lifecycle
+Read the project's `.product/PRODUCT.md` + `.product/principles.md` before shaping. **If
+`.product/` is missing, STOP and WARN the user explicitly:** you'd be shaping against a vacuum —
+no product context, no principles, no non-goals to keep scope honest. Direct them to run the
+bundled **`/setup`** (the `setup` skill installed alongside this one) in their repo first, then
+re-run `/shape`. Do not fabricate product context to proceed. All bead writes go through the
+**`bd` skill** (installed alongside this one) — it carries anton's label / edge / lifecycle
 conventions and the exact `bd` commands.
 
 ## Phase 1 — Validate the problem (forcing questions)

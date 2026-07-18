@@ -1,0 +1,13 @@
+# anton project config.
+#
+# anton reads exactly ONE field from this file: stringer.max_beads_per_scan
+# (see skills/scan-triage). Everything else that used to live in a project config —
+# the merge policy, the strict scorer's model, the hard-floor test/typecheck/lint
+# commands, and the active agents list — anton reads from its settings DB (per-project
+# settings in the web app), NOT from here. Don't add them back; they would be ignored.
+
+stringer:
+  # Cap on how many beads a single stringer scan triage may create. If triage exceeds
+  # it, the highest-severity signals win and the rest resurface next scan. Security
+  # findings are exempt from the cap.
+  max_beads_per_scan: 10
