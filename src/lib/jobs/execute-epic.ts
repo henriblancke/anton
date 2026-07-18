@@ -286,15 +286,20 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         // this run re-open the PR. An UNKNOWN state (no `gh`, a network/CLI error, an unparseable ref) is
         // proof of NOTHING and must not be mistaken for either: treating it as done would strand a
         // genuinely-closed epic that a retry could recover, while falling through with a genuinely-merged
-        // ref would run `gh pr create` on a branch with no diff and fail the run. So park + retry on
-        // unknown (like every other board/remote-unreachable condition in this protocol) and re-check
-        // once `gh` is reachable — only a confirmed open/merged/closed state drives a decision below.
+        // ref would run `gh pr create` on a branch with no diff and fail the run. So retry on unknown with
+        // a COUNTING error (a plain throw, NOT RunAlreadyLiveError): a transient gh/network hiccup
+        // self-heals within the retry budget, but a permanently-unreadable ref (gh missing, broken auth,
+        // malformed ref) exhausts `maxAttempts` and PARKS for a human instead of retrying forever.
+        // RunAlreadyLiveError is reserved for real lease/liveness conflicts, which the runner refunds and
+        // retries indefinitely because a foreign run may legitimately hold the lease for a long time — an
+        // unreadable ref is a local failure to resolve, not that, so it must count against the budget.
         const prState = await pullRequestState(repo, leaseTarget.external_ref);
         if (prState === "unknown") {
-          throw new RunAlreadyLiveError(
+          throw new Error(
             `${epicBeadId} carries a PR ref but its state can't be read (gh unavailable or the ref is ` +
-              `unparseable) — parking rather than treating an unreadable PR as a completed run; this ` +
-              `attempt resumes once gh is reachable`,
+              `unparseable) — retrying rather than treating an unreadable PR as a completed run; a ` +
+              `transient gh outage self-heals within the retry budget, a permanently-unreadable ref ` +
+              `parks for a human`,
           );
         }
         if (prState === "open" || prState === "merged") {

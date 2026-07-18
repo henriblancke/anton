@@ -607,11 +607,14 @@ process.exit(0);`,
     expect(after.external_ref).toBe("gh-77");
   }, 60_000);
 
-  it("parks (does not false-complete) when a target's PR ref state can't be read", async () => {
+  it("retries (does not false-complete) when a target's PR ref state can't be read", async () => {
     // anton-jz1 review (thread PRRT_kwDOTWcq8c6SBg3n): a set external_ref only proves completion when
     // its PR is confirmed OPEN or MERGED. An UNKNOWN state (gh down / unparseable ref) is proof of
     // nothing — treating it as done would strand a genuinely-closed epic that a retry could recover.
-    // The handler must park + retry on unknown rather than mark the run done, leaving the ref intact.
+    // The handler must retry on unknown rather than mark the run done, leaving the ref intact. Unlike a
+    // foreign lease (RunAlreadyLiveError, refunded forever), an unreadable ref is a COUNTING error: a
+    // transient gh outage self-heals within the retry budget, a permanent one exhausts attempts and
+    // parks for a human (PRRT_kwDOTWcq8c6SB5Ja) rather than retrying indefinitely.
     const bugId = await beads.create(repo, {
       title: "Unreadable PR state",
       type: "bug",
@@ -642,13 +645,14 @@ process.exit(0);`,
       });
       await runner.tickOnce();
       await runner.whenIdle();
-      // RunAlreadyLiveError → the job is rescheduled (parked/queued for retry), NOT done.
+      // Counting error → the job is rescheduled for retry (attempt spent), NOT done.
       expect((await getJob(tdb.db, job))?.status).not.toBe("done");
-      // The run row settled as parked (run-live-elsewhere class), and the ref is untouched.
+      // The run row settled as failed (a counting failure, not the parked run-live-elsewhere class),
+      // and the ref is untouched. Repeated unreadable attempts exhaust the budget and park the job.
       const runsForBug = (await tdb.db.select().from(schema.runs)).filter(
         (r) => r.epicBeadId === bugId,
       );
-      expect(runsForBug.some((r) => r.status === "parked")).toBe(true);
+      expect(runsForBug.some((r) => r.status === "failed")).toBe(true);
       expect(runsForBug.some((r) => r.status === "done")).toBe(false);
       expect((await beads.show(repo, bugId)).external_ref).toBe("gh-88");
     } finally {
