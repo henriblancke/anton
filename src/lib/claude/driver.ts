@@ -56,25 +56,28 @@ export interface RunClaudeOptions {
 }
 
 /**
- * Case-insensitive usage-limit phrasing claude emits on an exhausted quota.
+ * Case-insensitive usage-limit phrasing claude emits on an exhausted quota, anchored to the
+ * start of a line.
  *
- * Covers the 5-hour/weekly "usage limit reached" wording *and* the monthly spend-limit
- * wording Claude Code surfaces separately — observed as `You've hit your monthly spend limit ·
- * raise it at claude.ai/settings/usage` (anton-b9l). A spend limit is a periodic quota that
- * lifts on its own (a raised cap or the next billing cycle), so it belongs here: the runner
- * reschedules past a cool-off instead of burning attempts and parking.
+ * Covers the 5-hour/weekly "usage limit reached" wording *and* the monthly spend-limit wording
+ * Claude Code surfaces separately — observed as `You've hit your monthly spend limit · raise it
+ * at claude.ai/settings/usage` (anton-b9l). A spend limit is a periodic quota that lifts on its
+ * own (a raised cap or the next billing cycle), so it belongs here: the runner reschedules past
+ * a cool-off instead of burning attempts and parking.
  *
- * We key on the captured Claude payload phrasing — "(You've) hit your monthly spend limit" — rather
- * than any occurrence of the bare words "monthly spend limit". That distinction matters because the
- * transcript scan runs over every non-successful run's combined assistant/result/stderr text: a run
- * that fails for an unrelated reason (e.g. an agent working this very ticket, whose output describes
- * the "monthly spend limit" feature, then fails tests or a push and exits non-zero) must NOT be
- * reclassified as a transient quota reset and rescheduled forever. Requiring the "hit your monthly
- * spend limit" wording — the actual quota payload — keeps ordinary payment failures (declined card,
- * no payment method) and ticket-work mentions falling through to a plain error for a human.
+ * The transcript scan runs over every non-successful run's combined assistant/result/stderr text,
+ * and the spend-limit payload is an ordinary English sentence a model can reproduce verbatim — an
+ * agent working this very ticket might quote `You've hit your monthly spend limit` in its own prose
+ * (or an added test fixture) and then fail for an unrelated reason (red tests, a rejected push).
+ * Matching that embedded quote would refund the attempt and reschedule the real failure forever.
+ * So every branch is anchored to the start of a line (`^\s*…`, multiline `m`): Claude Code emits
+ * the notice as the *leading* content of the result field / an assistant block, whereas a quotation
+ * is buried mid-sentence. Anchoring keeps the genuine standalone notice matching while letting a
+ * failure that merely mentions the wording — and ordinary payment failures (declined card, no
+ * payment method) — fall through to a plain error for a human.
  */
 const USAGE_LIMIT_RE =
-  /usage limit reached|(?:5-hour|weekly) limit reached|(?:hit|reached) your monthly spend limit/i;
+  /^\s*(?:(?:claude ai\s+)?usage limit reached|(?:5-hour|weekly) limit reached|(?:you['’]ve\s+)?(?:hit|reached) your monthly spend limit)/im;
 
 /** Best-effort extraction of a reset time (unix seconds) from claude's usage-limit text. */
 function parseResetAt(text: string | undefined): number | undefined {

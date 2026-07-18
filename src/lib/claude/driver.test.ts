@@ -289,6 +289,47 @@ describe("runClaude", () => {
     expect((caught as Error).message).toContain("claude exited with code 1");
   });
 
+  it("does NOT misclassify a non-zero exit that quotes the exact spend-limit payload mid-prose", async () => {
+    // anton-b9l review follow-up: the spend-limit payload is an ordinary sentence a model can
+    // reproduce verbatim — e.g. an agent working this very ticket says it "added a test for
+    // 'You've hit your monthly spend limit'" and then its tests/push fail, exiting non-zero. The
+    // phrase is present in both the assistant and result text, but embedded mid-sentence rather than
+    // as Claude Code's own leading notice. Because USAGE_LIMIT_RE anchors to the start of a line, an
+    // embedded quote does NOT match, so the run surfaces as a plain error for a human instead of
+    // being refunded and rescheduled forever.
+    const quoted = "Added a test for the \"You've hit your monthly spend limit\" payload, but the push failed.";
+    const bin = writeFakeClaude(
+      "quotes-spend-limit-payload-claude",
+      [
+        JSON.stringify({
+          type: "assistant",
+          message: { content: [{ type: "text", text: quoted }] },
+        }),
+        JSON.stringify({
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: true,
+          session_id: "sess-quote",
+          total_cost_usd: 0.01,
+          result: quoted,
+        }),
+      ],
+      1,
+    );
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    let caught: unknown;
+    try {
+      await runClaude({ cwd: dir, prompt: "work the anton-b9l ticket" });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(isUsageLimitError(caught)).toBe(false);
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain("claude exited with code 1");
+  });
+
   it("does NOT misclassify a clean success whose transcript merely mentions a usage limit", async () => {
     // Regression for the anton-ner.2 transcript-scan false positive: a run that exits 0 with
     // is_error false is a success, even if an assistant text block contains "usage limit reached"
