@@ -210,6 +210,11 @@ function TicketDialogBody({
   // `learning`/`chore`/etc. is never runnable, so its controls would only ever 422.
   const isRunTarget = !detail.epicId && (detail.type === "task" || detail.type === "bug");
   const approved = detail.approved || optimisticApproved;
+  // The run affordance is narrower than the claim control: a `done` (closed) standalone target has
+  // already finished its run and produced its PR, so re-approving it would only enqueue duplicate/
+  // no-op PR work. Hide the button there while keeping it for a still-runnable target — a fresh
+  // backlog approval or a Force run that resumes an in-flight (implementing/in-review) run.
+  const canRun = isRunTarget && detail.stage !== "done";
 
   return (
     <div className="flex flex-col gap-4">
@@ -353,7 +358,7 @@ function TicketDialogBody({
       <DialogFooter className="sm:justify-between">
         <ConfirmDeleteButton onConfirm={remove} label="Delete ticket" />
         <div className="flex gap-2">
-          {isRunTarget && (
+          {canRun && (
             <Button
               variant="outline"
               size="sm"
