@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { computeEpicGraph } from "@/lib/epic-graph";
-import { getProjectBySlug } from "@/lib/projects";
 import { listAllBeads } from "@/lib/tickets";
+import { resolveProject } from "../resolve-project";
 
 export const dynamic = "force-dynamic";
 
@@ -10,10 +10,8 @@ export async function GET(
   { params }: { params: Promise<{ slug: string }> },
 ) {
   const { slug } = await params;
-  const project = await getProjectBySlug(slug);
-  if (!project) {
-    return NextResponse.json({ error: "Project not found" }, { status: 404 });
-  }
+  const { project, response } = await resolveProject(slug);
+  if (!project) return response;
 
   const { epics, edges } = computeEpicGraph(await listAllBeads(project));
   return NextResponse.json({ epics, edges });

@@ -1,8 +1,8 @@
 import { NextResponse } from "next/server";
 import { moveCard } from "@/lib/board-move";
-import { getProjectBySlug } from "@/lib/projects";
 import { STAGES } from "@/lib/types";
 import type { MoveRequest } from "@/lib/types";
+import { resolveProject } from "../../../resolve-project";
 
 export const dynamic = "force-dynamic";
 
@@ -11,10 +11,8 @@ export async function POST(
   { params }: { params: Promise<{ slug: string; cardId: string }> },
 ) {
   const { slug, cardId } = await params;
-  const project = await getProjectBySlug(slug);
-  if (!project) {
-    return NextResponse.json({ error: "Project not found" }, { status: 404 });
-  }
+  const { project, response } = await resolveProject(slug);
+  if (!project) return response;
 
   const body = (await request.json().catch(() => null)) as MoveRequest | null;
   if (!body || !STAGES.includes(body.toStage)) {
