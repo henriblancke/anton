@@ -178,11 +178,21 @@ function recordStatus(cwd: string, patch: Partial<SyncStatus>): void {
 }
 
 /**
- * Sync pass modes. "full" (write-nudged): pull → commit → push. "pull": pull only — used by the
- * heartbeat, which must NOT push when there are no local changes; every anton instance pushing
- * a shared remote every ~10s is the concurrent-push manifest-corruption pattern (beads GH#2466).
+ * Concrete sync passes runDoltSync executes. "full" (write-nudged): pull → commit → push.
+ * "pull": pull only — the heartbeat's default, which must NOT push when there are no local
+ * changes; every anton instance pushing a shared remote every ~10s is the concurrent-push
+ * manifest-corruption pattern (beads GH#2466).
  */
 export type SyncMode = "full" | "pull";
+
+/**
+ * What the coalescer accepts. "backstop" is the heartbeat's push safety net (anton-sr8f): the
+ * coalescer resolves it to "full" when the repo has unpushed local commits (a prior push failed)
+ * and to "pull" otherwise — so a failed push is retried on the next beat until it lands, while a
+ * repo that is not ahead of its remote stays quiet. Routes through the same per-repo coalescer as
+ * "full"/"pull", so a backstop push can never overlap a write-nudged one (beads GH#2466).
+ */
+export type SyncRequest = SyncMode | "backstop";
 
 export type SyncOutcome = "synced" | "not-wired";
 
@@ -236,11 +246,17 @@ export async function runDoltSync(
  * their writes) — a burst of writes costs one extra push, not one each. A "pull" request
  * piggybacks on any in-flight or queued pass (full ⊃ pull); a "full" request upgrades a queued
  * pull-only trailing pass. Updates the sync status registry on every pass. Exported for testing.
+ *
+ * Also tracks a per-repo `unpushed` flag (anton-sr8f): a full pass that fails to reach "synced"
+ * committed local changes it couldn't push, so the repo is left ahead of its remote. The flag
+ * lets a "backstop" request (the heartbeat) resolve to a push-retry while a not-ahead repo stays
+ * pull-only. A pass that reaches "synced"/"not-wired" clears it (nothing left to push).
  */
-export function createDoltSync(exec: BdExec = bd): (cwd: string, mode?: SyncMode) => Promise<void> {
+export function createDoltSync(exec: BdExec = bd): (cwd: string, mode?: SyncRequest) => Promise<void> {
   const running = new Map<string, Promise<void>>();
   const trailing = new Map<string, { promise: Promise<void>; mode: SyncMode }>();
   const trailingMode = new Map<string, SyncMode>(); // live handle so an upgrade reaches the queued run
+  const unpushed = new Map<string, boolean>(); // repo is ahead of its remote (a push failed)
 
   const start = (cwd: string, mode: SyncMode): Promise<void> => {
     recordStatus(cwd, { state: "syncing" });
@@ -252,12 +268,17 @@ export function createDoltSync(exec: BdExec = bd): (cwd: string, mode?: SyncMode
         invalidateIssueSnapshot(cwd);
         recordStatus(cwd, { state: "synced", lastSyncedAt: Date.now(), lastError: null });
       }
+      // A completed full pass pushed everything (or has no remote to be ahead of): no backstop owed.
+      if (mode === "full") unpushed.set(cwd, false);
     });
     running.set(cwd, p);
     // Bookkeeping only — callers hold `p` and see its rejection; this chain must not re-reject.
     void p
       .catch((e: Error) => {
         recordStatus(cwd, { state: "failing", lastError: e.message });
+        // A full pass committed but never landed its push — mark the repo ahead so the next
+        // heartbeat backstop retries the push instead of leaving it unpushed indefinitely.
+        if (mode === "full") unpushed.set(cwd, true);
       })
       .finally(() => {
         if (running.get(cwd) === p) running.delete(cwd);
@@ -265,7 +286,10 @@ export function createDoltSync(exec: BdExec = bd): (cwd: string, mode?: SyncMode
     return p;
   };
 
-  return function sync(cwd: string, mode: SyncMode = "full"): Promise<void> {
+  return function sync(cwd: string, request: SyncRequest = "full"): Promise<void> {
+    // Resolve the backstop against the current ahead state: push-retry only when a prior push failed.
+    const mode: SyncMode =
+      request === "backstop" ? (unpushed.get(cwd) ? "full" : "pull") : request;
     const queued = trailing.get(cwd);
     if (queued) {
       if (mode === "full") trailingMode.set(cwd, "full");
@@ -448,6 +472,14 @@ export const beads = {
    * see SyncMode. Shares the per-repo coalescing with `sync`, so passes never overlap.
    */
   pull: (cwd: string): Promise<void> => doltSync(cwd, "pull"),
+
+  /**
+   * Heartbeat backstop pass (anton-sr8f): pulls, plus retries a push ONLY when this repo has
+   * unpushed local commits (a prior write-nudged push failed). A repo that is not ahead pulls
+   * only — idle repos stay quiet. Shares the per-repo coalescer with `sync`/`pull`, so a backstop
+   * push can never overlap a write-nudged one (beads GH#2466); a not-wired repo is unaffected.
+   */
+  backstop: (cwd: string): Promise<void> => doltSync(cwd, "backstop"),
 
   // ── convenience: anton's stage/approval semantics, all in beads ──
   approve: (cwd: string, epicId: string) => beads.tag(cwd, epicId, [LABELS.approved]),

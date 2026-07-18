@@ -429,6 +429,71 @@ describe("createDoltSync", () => {
     expect(getSyncStatus(cwd).state).toBe("not-wired");
   });
 
+  it("resolves a backstop to a push-retry when ahead and to pull-only otherwise", async () => {
+    const cwd = `/backstop-resolve-${Math.random()}`;
+    let pushFails = true;
+    const calls: string[][] = [];
+    const sync = createDoltSync(async (_cwd, args) => {
+      calls.push(args);
+      if (args[1] === "push" && pushFails) {
+        throw execError({ stderr: "Error: push failed: connection reset" });
+      }
+      return "";
+    });
+
+    // Not ahead yet: the backstop is pull-only.
+    await sync(cwd, "backstop");
+    expect(calls).toEqual([["dolt", "pull"]]);
+
+    // A write-nudged full pass whose push fails leaves the repo ahead of its remote.
+    await sync(cwd, "full").catch(() => {});
+
+    // Now the backstop retries the push (still failing → still ahead).
+    calls.length = 0;
+    await sync(cwd, "backstop").catch(() => {});
+    expect(calls).toContainEqual(["dolt", "push"]);
+
+    // Once the push lands the repo is no longer ahead: the backstop drops back to pull-only.
+    pushFails = false;
+    await sync(cwd, "backstop"); // this retry lands the push, clearing the ahead flag
+    calls.length = 0;
+    await sync(cwd, "backstop");
+    expect(calls).toEqual([["dolt", "pull"]]);
+  });
+
+  it("a backstop push coalesces behind an in-flight full pass (never a concurrent push)", async () => {
+    const cwd = `/backstop-coalesce-${Math.random()}`;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let firstPushFails = true;
+    let park = false;
+    let parked = false;
+    const sync = createDoltSync(async (_cwd, args) => {
+      if (args[1] === "push" && firstPushFails) {
+        firstPushFails = false;
+        throw execError({ stderr: "Error: push failed: connection reset" });
+      }
+      if (args[1] === "commit" && park && !parked) {
+        parked = true;
+        await gate; // hold the in-flight full pass so a backstop must queue behind it
+      }
+      return "";
+    });
+
+    // Leave the repo ahead: the first full pass commits but its push fails.
+    await sync(cwd, "full").catch(() => {});
+
+    park = true;
+    const running = sync(cwd, "full"); // parks at commit, before its push
+    const backstop = sync(cwd, "backstop"); // ahead → resolves to full → must coalesce, not push now
+    const alsoBackstop = sync(cwd, "backstop");
+    expect(backstop).toBe(alsoBackstop); // the burst shares ONE trailing pass
+    expect(backstop).not.toBe(running); // and does not run concurrently with the in-flight pass
+
+    release();
+    await Promise.all([running, backstop, alsoBackstop]);
+  });
+
   it("getSyncStatus defaults to unknown for a never-synced cwd", () => {
     expect(getSyncStatus(`/never-${Math.random()}`)).toEqual({
       state: "unknown",
