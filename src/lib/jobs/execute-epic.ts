@@ -277,11 +277,21 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         // Distinguish a stale (closed-without-merging) ref from one that proves completion (anton-jz1).
         // Only an OPEN or MERGED PR means another run carried this epic to the finish; a CLOSED-unmerged
         // ref is what review-fix leaves for recovery, so DON'T short-circuit on it — fall through and let
-        // this run re-open the PR. An UNKNOWN state (no remote / gh error / unparseable ref) fails CLOSED
-        // to the idempotent skip: falling through with a genuinely merged ref would try `gh pr create` on
-        // a branch with no diff and fail the run, so a state we can't read is treated as "leave it be".
+        // this run re-open the PR. An UNKNOWN state (no `gh`, a network/CLI error, an unparseable ref) is
+        // proof of NOTHING and must not be mistaken for either: treating it as done would strand a
+        // genuinely-closed epic that a retry could recover, while falling through with a genuinely-merged
+        // ref would run `gh pr create` on a branch with no diff and fail the run. So park + retry on
+        // unknown (like every other board/remote-unreachable condition in this protocol) and re-check
+        // once `gh` is reachable — only a confirmed open/merged/closed state drives a decision below.
         const prState = await pullRequestState(repo, leaseTarget.external_ref);
-        if (prState !== "closed") {
+        if (prState === "unknown") {
+          throw new RunAlreadyLiveError(
+            `${epicBeadId} carries a PR ref but its state can't be read (gh unavailable or the ref is ` +
+              `unparseable) — parking rather than treating an unreadable PR as a completed run; this ` +
+              `attempt resumes once gh is reachable`,
+          );
+        }
+        if (prState === "open" || prState === "merged") {
           // Sweep this run's OWN leftover lease before the idempotent short-circuit (anton-jz1). If this
           // attempt resumes after a crash that landed the external ref (step 5, setExternalRef) but died
           // before `finally` cleared its run-lease, `leaseTarget` still carries an unexpired
@@ -292,6 +302,17 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           // foreign machine's lease is left for its own owner/TTL, honoring "finally clears only what we
           // own" (the same reason this gate precedes the general adoption below).
           leaseLabels = beads.ownRunLeaseLabels(leaseTarget, runId);
+          // Restore the in-review board state before returning (anton-jz1). An epic run that crashed
+          // AFTER setExternalRef (step 5) but before the stage updates at the tail of step 5 leaves the
+          // epic on stage:implementing with no stage:in-review. review-fix sweeps only stage:in-review
+          // targets (see review-fix.ts), so without re-applying it here the run is marked done yet its
+          // PR never enters the automated review/finalization path. Idempotent — a run that already
+          // tagged in-review re-tags harmlessly. Standalone targets get in-review from runTicket on
+          // commit (before the ref is ever set), so only the epic path needs this here.
+          if (!standaloneRun) {
+            await safe(() => beads.tag(repo, epicBeadId, [LABELS.stage("in-review")]));
+            await safe(() => beads.untag(repo, epicBeadId, [LABELS.stage("implementing")]));
+          }
           await updateRun(db, clock, runId, { status: "done", endedAt: clock.now(), error: null });
           return;
         }

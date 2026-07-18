@@ -493,11 +493,19 @@ process.exit(0);`,
     expect(sessionsAfter1).toHaveLength(1);
 
     // Attempt 2: a SECOND job for the same target (the losing machine's retry after the lease
-    // cleared). Point gh at a binary that fails outright — if the handler wrongly reached the PR
-    // step it would throw and the job would fail; the revalidation must short-circuit before it.
-    const failingGh = writeBin(binDir, "gh-fail-jz1", `console.error('gh boom');process.exit(1);`);
+    // cleared). Point gh at a binary that reports the PR OPEN (its real state — attempt 1 opened it)
+    // so the revalidation short-circuits on a confirmed-live ref; `pr create` booms so a wrongful
+    // fall-through to the PR step would throw and fail the job instead of short-circuiting.
+    const openGh = writeBin(
+      binDir,
+      "gh-open-jz1",
+      `const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='view'){process.stdout.write(JSON.stringify({state:'OPEN',url:'https://github.com/acme/repo/pull/42',number:42})+'\\n');process.exit(0);}
+if(a[0]==='pr'&&a[1]==='create'){console.error('gh boom: must not reach PR step');process.exit(1);}
+process.exit(0);`,
+    );
     const okGh = process.env.ANTON_GH_BIN!;
-    process.env.ANTON_GH_BIN = failingGh;
+    process.env.ANTON_GH_BIN = openGh;
     try {
       const job2 = await runner.enqueue({
         type: "execute-epic",
@@ -564,11 +572,19 @@ process.exit(0);`,
     });
     runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
 
-    // gh points at a failing binary: if the handler wrongly reached the PR step it would throw. The
-    // short-circuit must finish the attempt as done without ever invoking gh.
-    const failingGh = writeBin(binDir, "gh-fail-lease", `console.error('gh boom');process.exit(1);`);
+    // gh reports the PR OPEN — the real state after a crash that stamped the ref (the PR was opened
+    // first) — so the short-circuit legitimately proves completion and finishes the attempt as done.
+    // `pr create` booms: if the handler wrongly fell through to the PR step it would throw instead.
+    const openGh = writeBin(
+      binDir,
+      "gh-open-lease",
+      `const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='view'){process.stdout.write(JSON.stringify({state:'OPEN',url:'https://github.com/acme/repo/pull/77',number:77})+'\\n');process.exit(0);}
+if(a[0]==='pr'&&a[1]==='create'){console.error('gh boom: must not reach PR step');process.exit(1);}
+process.exit(0);`,
+    );
     const okGh = process.env.ANTON_GH_BIN!;
-    process.env.ANTON_GH_BIN = failingGh;
+    process.env.ANTON_GH_BIN = openGh;
     try {
       const job = await runner.enqueue({
         type: "execute-epic",
@@ -589,6 +605,136 @@ process.exit(0);`,
     const after = await beads.show(repo, bugId);
     expect(beads.runLeaseLabels(after)).toEqual([]);
     expect(after.external_ref).toBe("gh-77");
+  }, 60_000);
+
+  it("parks (does not false-complete) when a target's PR ref state can't be read", async () => {
+    // anton-jz1 review (thread PRRT_kwDOTWcq8c6SBg3n): a set external_ref only proves completion when
+    // its PR is confirmed OPEN or MERGED. An UNKNOWN state (gh down / unparseable ref) is proof of
+    // nothing — treating it as done would strand a genuinely-closed epic that a retry could recover.
+    // The handler must park + retry on unknown rather than mark the run done, leaving the ref intact.
+    const bugId = await beads.create(repo, {
+      title: "Unreadable PR state",
+      type: "bug",
+      acceptance: "work file exists",
+      description: "## Goal\nProve unknown PR state parks instead of false-completing.",
+    });
+    await beads.approve(repo, bugId);
+    await beads.setExternalRef(repo, bugId, "gh-88");
+    await beads.sync(repo);
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    // gh fails outright → pullRequestState reports "unknown". The run must park, not short-circuit
+    // to done; `pr create` would also boom, so a wrongful fall-through to the PR step can't pass.
+    const failingGh = writeBin(binDir, "gh-unknown-jz1", `console.error('gh boom');process.exit(1);`);
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = failingGh;
+    try {
+      const job = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: bugId },
+      });
+      await runner.tickOnce();
+      await runner.whenIdle();
+      // RunAlreadyLiveError → the job is rescheduled (parked/queued for retry), NOT done.
+      expect((await getJob(tdb.db, job))?.status).not.toBe("done");
+      // The run row settled as parked (run-live-elsewhere class), and the ref is untouched.
+      const runsForBug = (await tdb.db.select().from(schema.runs)).filter(
+        (r) => r.epicBeadId === bugId,
+      );
+      expect(runsForBug.some((r) => r.status === "parked")).toBe(true);
+      expect(runsForBug.some((r) => r.status === "done")).toBe(false);
+      expect((await beads.show(repo, bugId)).external_ref).toBe("gh-88");
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+    }
+  }, 60_000);
+
+  it("restores an epic's stage:in-review on the external-ref short-circuit (crash after ref, before stage update)", async () => {
+    // anton-jz1 review (thread PRRT_kwDOTWcq8c6SBg3m): an epic run that crashed AFTER setExternalRef
+    // (step 5) but BEFORE the stage updates at the tail of step 5 leaves the epic on stage:implementing
+    // with no stage:in-review. review-fix sweeps only stage:in-review targets, so a resume that
+    // short-circuits to done must re-apply in-review (and drop implementing) or the PR is silently
+    // dropped from automated review. Unlike a standalone (which gets in-review from runTicket on
+    // commit), the epic acquires it only after the ref, so this window is epic-specific.
+    const epicId = await beads.create(repo, {
+      title: "Epic crashed before in-review",
+      type: "epic",
+      description: "## Goal\nProve in-review restoration on the epic short-circuit.",
+    });
+    const childRaw = execFileSync(
+      "bd",
+      ["create", "Only child", "--type", "task", "--parent", epicId, "--acceptance", "x", "--json"],
+      { cwd: repo, encoding: "utf8" },
+    );
+    const childId = (() => {
+      const p = JSON.parse(childRaw);
+      const b = Array.isArray(p) ? p[0] : (p.issue ?? p);
+      return b.id as string;
+    })();
+    await beads.approve(repo, epicId);
+
+    // Simulate the crashed prior attempt: the child committed + closed, the PR ref stamped, and the
+    // epic still on stage:implementing (step 2's tag) with in-review NEVER applied — plus a still
+    // "running" run row so this resumes rather than starting fresh.
+    await beads.close(repo, childId);
+    await beads.tag(repo, epicId, ["stage:implementing"]);
+    await beads.setExternalRef(repo, epicId, "gh-55");
+    const runId = randomUUID();
+    await createRun(tdb.db, clock, {
+      id: runId,
+      projectId,
+      epicBeadId: epicId,
+      branch: `anton/${epicId}`,
+      status: "running",
+    });
+    await beads.sync(repo);
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    // gh reports the PR OPEN (its real state after the crash); `pr create` booms so a wrongful
+    // fall-through to the PR step would throw instead of short-circuiting.
+    const openGh = writeBin(
+      binDir,
+      "gh-open-epic-jz1",
+      `const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='view'){process.stdout.write(JSON.stringify({state:'OPEN',url:'https://github.com/acme/repo/pull/55',number:55})+'\\n');process.exit(0);}
+if(a[0]==='pr'&&a[1]==='create'){console.error('gh boom: must not reach PR step');process.exit(1);}
+process.exit(0);`,
+    );
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = openGh;
+    try {
+      const job = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: epicId },
+      });
+      await runner.tickOnce();
+      await runner.whenIdle();
+      expect((await getJob(tdb.db, job))?.status).toBe("done");
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+    }
+
+    // The short-circuit finished done AND repaired the board: the epic now carries stage:in-review,
+    // has dropped stage:implementing, and reads as in-review so review-fix's sweep will pick it up.
+    const epic = await beads.show(repo, epicId);
+    expect(epic.labels ?? []).toContain("stage:in-review");
+    expect(epic.labels ?? []).not.toContain("stage:implementing");
+    expect(deriveStage(epic)).toBe("in-review");
+    expect(epic.external_ref).toBe("gh-55");
   }, 60_000);
 
   it("recovers a target whose external-ref PR was CLOSED without merging — re-opens instead of a false-done short-circuit", async () => {
