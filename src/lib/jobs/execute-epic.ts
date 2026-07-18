@@ -13,7 +13,7 @@ import { buildExecutionSystemPrompt } from "../claude/system-prompt";
 import { runClaude, type ClaudeEvent } from "../claude/driver";
 import { formatAntonResult, parseAntonResult } from "../claude/anton-result";
 import { commitAll, openPullRequest, pullRequestState, resolveFreshBase } from "../git/ops";
-import { createWorktree, removeWorktree } from "../git/worktree";
+import { createWorktree, findWorktree, removeWorktree } from "../git/worktree";
 import {
   getProjectById,
   getProjectSettings,
@@ -256,6 +256,12 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           all = fresh;
           target = freshTarget;
           tickets = standaloneRun ? [target] : childrenOf(all, epicBeadId);
+          // Adopt the fresh bead for the liveness gates too (anton-jz1). When the `show` above failed
+          // but this list succeeds, `leaseTarget` still points at the stale pre-pull snapshot — yet the
+          // completion short-circuit (step 0a, reads `external_ref`) and the foreign-lease gate below
+          // read `leaseTarget`. Leaving it stale would let a run whose completion/lease is visible in
+          // this fresh list fall through into worktree/PR handling instead of finishing idempotently.
+          leaseTarget = freshTarget;
         }
       } catch {
         // keep the pre-pull snapshot
@@ -324,6 +330,16 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
             await safe(() => beads.tag(repo, epicBeadId, [LABELS.stage("in-review")]));
             await safe(() => beads.untag(repo, epicBeadId, [LABELS.stage("implementing")]));
           }
+          // Clean up any worktree a prior attempt left behind before short-circuiting (anton-jz1). A
+          // resume that crashed AFTER the worktree-warm step (step 2 stamps `worktreePath` on the run
+          // row) leaves the git worktree registered/on disk; this idempotent return skips the normal
+          // `removeWorktree` finalization (step 6), so without this the run is marked done yet its
+          // worktree lingers. Locate it by branch and remove it best-effort — a no-op when this resume
+          // never created one.
+          await safe(async () => {
+            const staleWorktree = await findWorktree(repo, branch);
+            if (staleWorktree) await removeWorktree(staleWorktree);
+          });
           await updateRun(db, clock, runId, { status: "done", endedAt: clock.now(), error: null });
           return;
         }
