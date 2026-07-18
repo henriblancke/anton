@@ -15,12 +15,10 @@ import {
   agentsFromArgs,
   applyMigrations,
   compareVersions,
-  configureBeadsDoltSync,
   ensureBeadsGitignore,
   ensureBetterSqlite3,
   ensureMigrated,
   nextArgs,
-  normalizeGitUrl,
   parseInitArgs,
   platformLabel,
   provisionAgentsSkills,
@@ -30,10 +28,12 @@ import {
 } from "./anton.mjs";
 
 import {
-  // config.mjs has its own configureBeadsDoltSync (used by `anton init` via configureBeadsForRepo);
-  // anton.mjs has a distinct one (used by `anton setup`). Alias to keep both under test without collision.
-  configureBeadsDoltSync as configureBeadsDoltSyncForRepo,
+  // The single Dolt-sync path (anton-8qx): one configureBeadsDoltSync shared by `anton setup`
+  // (bin/anton.mjs) and `anton init` (via configureBeadsForRepo). normalizeRemoteUrl is its URL
+  // equality helper.
+  configureBeadsDoltSync,
   detectHooksManager,
+  normalizeRemoteUrl,
 } from "../src/lib/beads/config.mjs";
 
 const CLI = join(dirname(fileURLToPath(import.meta.url)), "anton.mjs");
@@ -212,14 +212,14 @@ describe("configureBeadsDoltSync (anton init — skip branches, anton-43b)", () 
 
   it("returns no-workspace when there is no .beads/", async () => {
     dir = await mkdtemp(join(tmpdir(), "anton-dolt-"));
-    expect(configureBeadsDoltSyncForRepo({ repoDir: dir })).toEqual({ status: "no-workspace" });
+    expect(configureBeadsDoltSync({ repoDir: dir })).toEqual({ status: "no-workspace" });
   });
 
   it("returns no-remote when the repo has no origin remote", async () => {
     dir = await mkdtemp(join(tmpdir(), "anton-dolt-"));
     mkdirSync(join(dir, ".beads"), { recursive: true });
     spawnSync("git", ["-C", dir, "init"], { stdio: "ignore" });
-    expect(configureBeadsDoltSyncForRepo({ repoDir: dir })).toEqual({ status: "no-remote" });
+    expect(configureBeadsDoltSync({ repoDir: dir })).toEqual({ status: "no-remote" });
   });
 });
 
@@ -600,17 +600,17 @@ describe("anton init (end-to-end, bd stubbed on PATH)", () => {
   });
 });
 
-describe("normalizeGitUrl", () => {
+describe("normalizeRemoteUrl", () => {
   it("equates the git-origin form with what bd dolt remote list reports", () => {
     // bd rewrites scp form to git+ssh:// with a literal /./ path segment.
-    expect(normalizeGitUrl("git@github.com:henriblancke/anton.git")).toBe(
-      normalizeGitUrl("git+ssh://git@github.com/./henriblancke/anton.git"),
+    expect(normalizeRemoteUrl("git@github.com:henriblancke/anton.git")).toBe(
+      normalizeRemoteUrl("git+ssh://git@github.com/./henriblancke/anton.git"),
     );
-    expect(normalizeGitUrl("https://github.com/org/repo.git")).toBe(
-      normalizeGitUrl("git+https://github.com/org/repo.git"),
+    expect(normalizeRemoteUrl("https://github.com/org/repo.git")).toBe(
+      normalizeRemoteUrl("git+https://github.com/org/repo.git"),
     );
-    expect(normalizeGitUrl("/tmp/remote.git")).toBe(normalizeGitUrl("git+file:///tmp/remote.git"));
-    expect(normalizeGitUrl("https://github.com/a/b")).not.toBe(normalizeGitUrl("https://github.com/a/c"));
+    expect(normalizeRemoteUrl("/tmp/remote.git")).toBe(normalizeRemoteUrl("git+file:///tmp/remote.git"));
+    expect(normalizeRemoteUrl("https://github.com/a/b")).not.toBe(normalizeRemoteUrl("https://github.com/a/c"));
   });
 });
 
