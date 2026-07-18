@@ -97,7 +97,7 @@ function epicBeadIdOf(payloadJson: string | null): string | undefined {
 }
 
 /** Id of the currently-active execute-epic job for this project + epic, if any. */
-function activeExecuteEpicId(
+export function activeExecuteEpicId(
   tx: Pick<AntonDb, "select">,
   projectId: string,
   epicBeadId: string,

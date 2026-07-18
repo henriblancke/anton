@@ -32,6 +32,18 @@ export interface ExecuteEpicPayload {
   epicBeadId: string;
 }
 
+/**
+ * Cross-machine run-liveness lease (anton-jz1). While a run executes, it publishes a
+ * `run-lease:<expiry>` label on the target (the shared beads board) and refreshes it every
+ * `RUN_LEASE_REFRESH_MS`; a Force run on another machine reads this and won't double-run a live
+ * epic. TTL is comfortably longer than the refresh gap so a slow tick never lapses a live lease,
+ * yet short enough that a crashed/killed machine (which stops refreshing) frees the epic for
+ * re-trigger within the window. The lease is cleared when the run settles (below), so a
+ * parked/failed/finished run is immediately re-triggerable without waiting out the TTL.
+ */
+const RUN_LEASE_TTL_MS = 15 * 60_000;
+const RUN_LEASE_REFRESH_MS = 5 * 60_000;
+
 export interface ExecuteEpicDeps {
   db: AntonDb;
   clock?: Clock;
@@ -122,6 +134,23 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       await updateRun(db, clock, runId, { status: "running", error: null });
     }
 
+    // Cross-machine run-liveness lease (anton-jz1). `leaseLabels` tracks the run-lease labels
+    // currently on the target so a refresh can atomically replace them; it's seeded from the fresh
+    // read so a lease stranded by a crashed prior attempt is swept on the first publish. Declared
+    // out here so the `finally` can tear the refresh timer down and clear the lease on settle.
+    let leaseLabels = beads.runLeaseLabels(target);
+    let leaseTimer: ReturnType<typeof setInterval> | null = null;
+    const publishLease = async () => {
+      const exp = clock.now() + RUN_LEASE_TTL_MS;
+      await safe(() => beads.publishRunLease(repo, epicBeadId, exp, leaseLabels));
+      leaseLabels = [LABELS.runLease(exp)];
+      // Nudge a sync so other machines see the lease within a heartbeat (fire-and-forget; the
+      // end-of-run sync is the backstop).
+      void beads
+        .sync(repo)
+        .catch((e) => console.error(`[execute-epic] run-lease sync failed for ${epicBeadId}`, e));
+    };
+
     try {
       // A standalone target that already committed on a prior attempt carries stage:in-review and
       // is skipped straight to the PR step below — its agent never runs again on this resume. Both
@@ -179,6 +208,13 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       void beads
         .sync(repo)
         .catch((e) => console.error(`[execute-epic] claim sync failed for ${epicBeadId}`, e));
+
+      // 2b. Publish the cross-machine run-liveness lease and keep it fresh while this run executes
+      // (anton-jz1). A Force run on another machine reads it and won't start a second concurrent
+      // run. The timer is unref'd so it never keeps the process alive, and torn down in `finally`.
+      await publishLease();
+      leaseTimer = setInterval(() => void publishLease(), RUN_LEASE_REFRESH_MS);
+      if (typeof leaseTimer.unref === "function") leaseTimer.unref();
 
       // 3. Per ticket: claude → tests → commit → (close | in-review). Skip work that already
       //    landed on a prior attempt. A closed ticket is done — an epic's children close as they
@@ -251,9 +287,17 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       }
       throw e; // let the runner apply job-level durability
     } finally {
-      // Every bd write above (claims, closes, stage labels, PR ref) must reach the remote even
-      // when the run failed mid-way. Logged, not thrown: a push failure must not mask the run's
-      // own error or fail a run whose real work (branch + PR) already landed.
+      // Stop refreshing and drop the run-liveness lease now that this attempt has stopped executing
+      // (anton-jz1). Clearing on EVERY settle path — done, parked, failed — is what lets a Force run
+      // re-trigger a stopped run immediately instead of waiting out the lease TTL; a hard crash that
+      // skips this still self-heals when the (un-refreshed) lease expires. Best-effort like the
+      // other bd writes; the sync below pushes the removal to the remote.
+      if (leaseTimer) clearInterval(leaseTimer);
+      await safe(() => beads.clearRunLease(repo, epicBeadId, leaseLabels));
+
+      // Every bd write above (claims, closes, stage labels, PR ref, lease clear) must reach the
+      // remote even when the run failed mid-way. Logged, not thrown: a push failure must not mask
+      // the run's own error or fail a run whose real work (branch + PR) already landed.
       await beads
         .sync(repo)
         .catch((e) => console.error(`[execute-epic] beads dolt sync failed for ${epicBeadId}`, e));

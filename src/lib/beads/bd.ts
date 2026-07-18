@@ -19,7 +19,22 @@ export const LABELS = {
   approved: "approved",
   stage: (s: "implementing" | "in-review") => `stage:${s}`,
   source: (s: string) => `source:${s}`,
+  /**
+   * Cross-machine run-liveness lease (anton-jz1): `run-lease:<expiresAtEpochMs>` on the run
+   * target. Present + unexpired ⇒ a run is actively executing this epic on SOME machine, so a
+   * Force run started elsewhere must not spawn a second concurrent run. This is the shared
+   * (beads/dolt) mirror of the machine-local jobs lease: the `jobs` table is disposable and
+   * per-machine, so it can't stop machine B double-running an epic already live on machine A.
+   * Heartbeat-refreshed by execute-epic while the run is executing; cleared when the run settles;
+   * an EXPIRED lease is ignored so a crashed/killed machine's run is re-triggerable (a stuck
+   * `stage:implementing` label alone would otherwise wedge Force run — its whole purpose). See
+   * DESIGN.md §3 (state by shareability).
+   */
+  runLease: (expiresAtMs: number) => `run-lease:${expiresAtMs}`,
 } as const;
+
+/** Prefix of the run-lease label (see LABELS.runLease). */
+const RUN_LEASE_PREFIX = "run-lease:";
 
 /** The managed-metadata label prefixes anton edits. Control labels (approved, stage:*,
  * source:*) are NOT in this set and are never touched by a patch. */
@@ -455,4 +470,55 @@ export const beads = {
   isRunTarget: (b: Bead) =>
     beads.isEpic(b) ||
     ((b.issue_type === "task" || b.issue_type === "bug") && !(b.parent ?? b.parent_id)),
+
+  // ── cross-machine run-liveness lease (anton-jz1) ──
+
+  /** The `run-lease:*` labels currently on a bead (normally 0 or 1; a crashed refresh may leave 2). */
+  runLeaseLabels: (b: Bead): string[] =>
+    (b.labels ?? []).filter((l) => l.startsWith(RUN_LEASE_PREFIX)),
+
+  /**
+   * Expiry (ms epoch) of the bead's run-lease, or undefined when absent/malformed. Takes the MAX
+   * across labels so a lingering older lease can't make a fresher one read as expired.
+   */
+  runLeaseExpiry: (b: Bead): number | undefined => {
+    let max: number | undefined;
+    for (const l of b.labels ?? []) {
+      if (!l.startsWith(RUN_LEASE_PREFIX)) continue;
+      const n = Number(l.slice(RUN_LEASE_PREFIX.length));
+      if (Number.isFinite(n) && (max === undefined || n > max)) max = n;
+    }
+    return max;
+  },
+
+  /**
+   * Is a run actively executing this bead on some machine right now? True iff it carries a
+   * run-lease whose expiry is still in the future. An expired lease (crashed/killed machine that
+   * stopped heartbeating, or a settled run) reads false so the epic is re-triggerable (anton-jz1).
+   */
+  isRunLive: (b: Bead, nowMs: number): boolean => {
+    const exp = beads.runLeaseExpiry(b);
+    return exp !== undefined && exp > nowMs;
+  },
+
+  /**
+   * Publish/refresh the run-lease on the target, atomically replacing any existing lease labels
+   * (`stale`, e.g. the prior expiry this process published, or leftovers from a crashed run) in a
+   * single `bd update`. Removing a label that isn't present is a bd no-op, so a slightly-stale
+   * `stale` list is harmless.
+   */
+  publishRunLease: (cwd: string, id: string, expiresAtMs: number, stale: string[] = []) =>
+    bdWrite(cwd, [
+      "update",
+      id,
+      ...stale.flatMap((l) => ["--remove-label", l]),
+      "--add-label",
+      LABELS.runLease(expiresAtMs),
+    ]),
+
+  /** Remove the given run-lease labels from the target (run settled). No-op when there are none. */
+  clearRunLease: (cwd: string, id: string, stale: string[]): Promise<string> =>
+    stale.length === 0
+      ? Promise.resolve("")
+      : bdWrite(cwd, ["update", id, ...stale.flatMap((l) => ["--remove-label", l])]),
 };

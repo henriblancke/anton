@@ -860,7 +860,7 @@ describe("JobRunner (live, in-memory db)", () => {
     await expect(r.enqueue({ type: "review-fix", projectId: "A" })).rejects.toThrow(
       /being deleted/,
     );
-    expect(() => r.enqueueExecuteEpic("A", "epic-race")).toThrow(/being deleted/);
+    await expect(r.enqueueExecuteEpic("A", "epic-race")).rejects.toThrow(/being deleted/);
     await expect(r.resume(parked)).resolves.toBe(false);
     const bypassed = await enqueue(tdb.db, clock, { type: "review-fix", projectId: "A" });
     const other = await r.enqueue({ type: "execute-epic", projectId: "B" });
