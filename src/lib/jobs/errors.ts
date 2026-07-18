@@ -30,10 +30,31 @@ export class PoisonError extends Error {
   }
 }
 
+/**
+ * Another machine already holds a live run-lease for this epic (anton-jz1) — a Force run started
+ * elsewhere is legitimately executing it, and running here too would double-run it. This is NOT a
+ * failure of THIS job, so the runner reschedules it after a cool-off (like a quota park) to retry
+ * once the other run settles and clears its lease, and does NOT count the attempt against
+ * `maxAttempts` (a foreign run may hold the lease for a long time; parking this job for a human
+ * would be wrong).
+ */
+export class RunAlreadyLiveError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RunAlreadyLiveError";
+  }
+}
+
 export function isUsageLimitError(e: unknown): e is UsageLimitError {
   return e instanceof UsageLimitError || (e as { name?: string })?.name === "UsageLimitError";
 }
 
 export function isPoisonError(e: unknown): e is PoisonError {
   return e instanceof PoisonError || (e as { name?: string })?.name === "PoisonError";
+}
+
+export function isRunAlreadyLiveError(e: unknown): e is RunAlreadyLiveError {
+  return (
+    e instanceof RunAlreadyLiveError || (e as { name?: string })?.name === "RunAlreadyLiveError"
+  );
 }

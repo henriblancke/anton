@@ -7,6 +7,7 @@ import {
   getSyncStatusToken,
   isBenignSyncOutput,
   isNotWiredOutput,
+  LABELS,
   runDoltSync,
   type Bead,
 } from "./bd";
@@ -32,6 +33,55 @@ describe("beads.isRunTarget", () => {
     expect(beads.isRunTarget(bead({ issue_type: "learning" }))).toBe(false);
     expect(beads.isRunTarget(bead({ issue_type: "molecule" }))).toBe(false);
     expect(beads.isRunTarget(bead({ issue_type: undefined }))).toBe(false);
+  });
+});
+
+describe("run-lease helpers (anton-jz1)", () => {
+  const now = 1_000_000_000_000;
+
+  it("LABELS.runLease stamps an optional owner into the label", () => {
+    expect(LABELS.runLease(now)).toBe(`run-lease:${now}`);
+    expect(LABELS.runLease(now, "run-abc")).toBe(`run-lease:${now}:run-abc`);
+  });
+
+  it("runLeaseExpiry parses both legacy and owner-stamped labels, taking the max", () => {
+    expect(beads.runLeaseExpiry(bead({ labels: [`run-lease:${now}`] }))).toBe(now);
+    expect(beads.runLeaseExpiry(bead({ labels: [`run-lease:${now}:run-abc`] }))).toBe(now);
+    // A lingering older lease can't make a fresher one read as expired.
+    expect(
+      beads.runLeaseExpiry(
+        bead({ labels: [`run-lease:${now - 5}:run-old`, `run-lease:${now}:run-new`] }),
+      ),
+    ).toBe(now);
+    expect(beads.runLeaseExpiry(bead({ labels: ["run-lease:not-a-number"] }))).toBeUndefined();
+    expect(beads.runLeaseExpiry(bead({ labels: [] }))).toBeUndefined();
+  });
+
+  it("foreignRunLeaseLive: an unexpired lease owned by ANOTHER run reads foreign", () => {
+    const b = bead({ labels: [LABELS.runLease(now + 60_000, "run-other")] });
+    expect(beads.foreignRunLeaseLive(b, now, "run-mine")).toBe(true);
+  });
+
+  it("foreignRunLeaseLive: this run's OWN unexpired lease is not foreign (crash-resume sweep)", () => {
+    const b = bead({ labels: [LABELS.runLease(now + 60_000, "run-mine")] });
+    expect(beads.foreignRunLeaseLive(b, now, "run-mine")).toBe(false);
+  });
+
+  it("foreignRunLeaseLive: an EXPIRED foreign lease reads not-foreign (dead, safe to sweep)", () => {
+    const b = bead({ labels: [LABELS.runLease(now - 1_000, "run-other")] });
+    expect(beads.foreignRunLeaseLive(b, now, "run-mine")).toBe(false);
+  });
+
+  it("foreignRunLeaseLive: an owner-less unexpired lease is conservatively foreign", () => {
+    // Legacy/liveness-only publish that recorded no owner — treat as foreign; parking is recoverable.
+    const b = bead({ labels: [`run-lease:${now + 60_000}`] });
+    expect(beads.foreignRunLeaseLive(b, now, "run-mine")).toBe(true);
+  });
+
+  it("foreignRunLeaseLive: no lease at all reads not-foreign", () => {
+    expect(beads.foreignRunLeaseLive(bead({ labels: ["stage:implementing"] }), now, "run-mine")).toBe(
+      false,
+    );
   });
 });
 

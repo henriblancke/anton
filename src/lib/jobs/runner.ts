@@ -37,7 +37,7 @@ import {
   type JobType,
 } from "./queue";
 import { reconcileInterruptedRuns } from "../runs";
-import { isPoisonError, isUsageLimitError } from "./errors";
+import { isPoisonError, isRunAlreadyLiveError, isUsageLimitError } from "./errors";
 
 export interface RunnerConfig {
   /** How long a lease is held before a job is considered crashed. */
@@ -122,6 +122,7 @@ export type JobHandler = (ctx: JobContext) => Promise<void>;
 export type Outcome =
   | { kind: "success" }
   | { kind: "quota"; resetAt?: number }
+  | { kind: "lease-held"; error: string }
   | { kind: "poison"; error: string }
   | { kind: "error"; error: string };
 
@@ -132,6 +133,7 @@ export type Action =
 
 export function classifyError(e: unknown): Outcome {
   if (isUsageLimitError(e)) return { kind: "quota", resetAt: e.resetAt };
+  if (isRunAlreadyLiveError(e)) return { kind: "lease-held", error: e.message };
   if (isPoisonError(e)) return { kind: "poison", error: e.message };
   return { kind: "error", error: e instanceof Error ? e.message : String(e) };
 }
@@ -153,6 +155,18 @@ export function nextAction(
         runAtMs,
         refundAttempt: true,
         lastError: `usage-limit: resumes at ${new Date(runAtMs).toISOString()}`,
+      };
+    }
+    case "lease-held": {
+      // A run is live on another machine (anton-jz1). Retry after a cool-off, refunding the attempt:
+      // it's not this job's failure and the foreign run may hold its lease for a long time, so it
+      // must never park for a human — it re-checks liveness each time until the lease clears.
+      const runAtMs = nowMs + config.quotaCooloffMs;
+      return {
+        action: "reschedule",
+        runAtMs,
+        refundAttempt: true,
+        lastError: `run live elsewhere: retries at ${new Date(runAtMs).toISOString()}`,
       };
     }
     case "poison":

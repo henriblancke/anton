@@ -21,7 +21,7 @@ import {
 } from "../runs";
 import { appendSessionLog, createSession, endSession, sessionLogPath } from "../sessions";
 import { buildPrTitle } from "./pr-title";
-import { isUsageLimitError } from "./errors";
+import { isUsageLimitError, isRunAlreadyLiveError, RunAlreadyLiveError } from "./errors";
 import { runShell } from "./shell";
 import type { AntonDb, Clock } from "./queue";
 import { systemClock } from "./queue";
@@ -134,16 +134,19 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       await updateRun(db, clock, runId, { status: "running", error: null });
     }
 
-    // Cross-machine run-liveness lease (anton-jz1). `leaseLabels` tracks the run-lease labels
-    // currently on the target so a refresh can atomically replace them; it's seeded from the fresh
-    // read so a lease stranded by a crashed prior attempt is swept on the first publish. Declared
-    // out here so the `finally` can tear the refresh timer down and clear the lease on settle.
-    let leaseLabels = beads.runLeaseLabels(target);
+    // Cross-machine run-liveness lease (anton-jz1). `leaseLabels` tracks the run-lease labels this
+    // run OWNS — its published lease plus any leftover leases it adopted to sweep. Start EMPTY so the
+    // `finally` never clears a lease this run never took ownership of: in particular the foreign-lease
+    // gate at the top of the try (below) parks before adopting anything, so the other machine's live
+    // lease is left intact. Declared out here so the `finally` can tear the refresh timer down and
+    // clear the lease on settle. `runId` stamps the owner onto every publish so a later resume can
+    // tell this run's own crash leftover from another machine's live lease.
+    let leaseLabels: string[] = [];
     let leaseTimer: ReturnType<typeof setInterval> | null = null;
     const publishLease = async () => {
       const exp = clock.now() + RUN_LEASE_TTL_MS;
-      await safe(() => beads.publishRunLease(repo, epicBeadId, exp, leaseLabels));
-      leaseLabels = [LABELS.runLease(exp)];
+      await safe(() => beads.publishRunLease(repo, epicBeadId, exp, leaseLabels, runId));
+      leaseLabels = [LABELS.runLease(exp, runId)];
       // Nudge a sync so other machines see the lease within a heartbeat (fire-and-forget; the
       // end-of-run sync is the backstop).
       void beads
@@ -152,6 +155,27 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     };
 
     try {
+      // 0. Cross-machine double-run guard (anton-jz1). A queued job that reschedules (quota/backoff)
+      //    re-enters this handler WITHOUT the enqueue-time liveRunCheck. If a Force run started on
+      //    ANOTHER machine while this job was parked/backing off, the fresh target now carries that
+      //    machine's unexpired run-lease. Publishing our own lease (step 2b) sweeps `leaseLabels`, so
+      //    overwriting it would let BOTH machines run the epic at once — the exact double-run this
+      //    lease exists to prevent. Treat a foreign live lease as a park/retry: RunAlreadyLiveError
+      //    reschedules this job (refunding the attempt) to re-check once that run settles and clears
+      //    its lease. This run's OWN lease (same runId, e.g. stranded by a crashed prior attempt) is
+      //    not foreign and is adopted just below as a sweep leftover. Checked before any claim/
+      //    worktree/session work so a run never half-executes into a concurrent one.
+      if (beads.foreignRunLeaseLive(target, clock.now(), runId)) {
+        throw new RunAlreadyLiveError(
+          `${epicBeadId} is already running on another machine (unexpired run-lease) — parking; ` +
+            `this attempt resumes once that run settles and clears its lease`,
+        );
+      }
+      // No foreign live lease: adopt any leftover leases on the target (this run's own from a crashed
+      // prior attempt, or an expired dead one from any machine) so the first publish atomically
+      // replaces them. Set here — after the gate — so the `finally` only ever clears leases we own.
+      leaseLabels = beads.runLeaseLabels(target);
+
       // A standalone target that already committed on a prior attempt carries stage:in-review and
       // is skipped straight to the PR step below — its agent never runs again on this resume. Both
       // the allowlist gate here and the ticket loop share this "won't run" predicate so neither
@@ -161,7 +185,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       const isResumeSkipped = (t: Bead) =>
         t.status === "closed" || (standaloneRun && (t.labels?.includes(inReview) ?? false));
 
-      // 0. Dispatch honors the active-agents allowlist (anton-dm7). PARK, don't skip: running
+      // 0b. Dispatch honors the active-agents allowlist (anton-dm7). PARK, don't skip: running
       // the ticket with the default agent would silently produce work the operator disabled the
       // specialist for, and skipping it would open the epic's single PR incomplete. Parking is
       // recoverable — the operator enables the agent (Settings → Agents) or relabels the ticket,
@@ -275,9 +299,12 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       await updateRun(db, clock, runId, { status: "done", endedAt: clock.now(), error: null });
       await safe(() => removeWorktree(worktree));
     } catch (e) {
-      // Quota → park the run (job reschedules); anything else → the run failed (job retries/parks).
+      // Quota or a run already live on another machine (anton-jz1) → park the run (the job
+      // reschedules and re-checks liveness); anything else → the run failed (job retries/parks).
       if (isUsageLimitError(e)) {
         await updateRun(db, clock, runId, { status: "parked", error: "usage-limit" });
+      } else if (isRunAlreadyLiveError(e)) {
+        await updateRun(db, clock, runId, { status: "parked", error: "run-live-elsewhere" });
       } else {
         await updateRun(db, clock, runId, {
           status: "failed",
