@@ -1175,6 +1175,114 @@ process.exit(0);`,
     expect((await beads.show(repo, dependent)).labels ?? []).toContain("stage:in-review");
   }, 60_000);
 
+  it("blocks a zero-diff ticket, halts the epic, and never closes or dispatches downstream (issue #46 root cause #1)", async () => {
+    // A clean agent exit that leaves NO diff delivered nothing — the false-success in issue #46.
+    // The run must NOT close the ticket: it blocks it (with an operator note, not a silent re-queue
+    // to open), records the no-delivery reason, and halts the epic so downstream tickets are never
+    // dispatched. This project has no verify gates so the zero-diff commit path is what's exercised
+    // (a failing test gate is a different, already-covered failure). The "changes → committed →
+    // closed" path stays green via the suite's first test.
+    const noGateProjectId = randomUUID();
+    await tdb.db.insert(schema.projects).values({
+      id: noGateProjectId,
+      slug: "sandbox-nogate",
+      name: "sandbox-nogate",
+      repoPath: repo,
+      defaultBranch: "main",
+      settingsJson: JSON.stringify({}), // no testCommand → no verify gates
+    });
+
+    const epicNd = await beads.create(repo, {
+      title: "No-delivery epic",
+      type: "epic",
+      description: "## Goal\nND",
+    });
+    await beads.approve(repo, epicNd);
+    const mkNd = (title: string) => {
+      const p = JSON.parse(
+        execFileSync(
+          "bd",
+          ["create", title, "--type", "task", "--parent", epicNd, "--acceptance", "x", "--json"],
+          { cwd: repo, encoding: "utf8" },
+        ),
+      );
+      return (Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string;
+    };
+    const nd1 = mkNd("ND ticket one");
+    const nd2 = mkNd("ND ticket two");
+
+    // A claude that exits cleanly (is_error:false) but makes NO change → zero diff → no delivery.
+    // Logs each ticket it's invoked for so we can prove the epic halts before ticket two.
+    const invLog = join(sandbox, "nodelivery-inv.jsonl");
+    const noopClaude = writeBin(
+      binDir,
+      "claude-noop",
+      `const fs=require('fs');
+const a=process.argv.slice(2);const get=f=>{const i=a.indexOf(f);return i>=0?a[i+1]:undefined;};
+const prompt=get('-p')||'';const m=prompt.match(/Ticket: (\\S+)/);
+fs.appendFileSync(${JSON.stringify(invLog)},(m?m[1]:'unknown')+'\\n');
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+e({type:'system',subtype:'init',session_id:'snd'});
+e({type:'assistant',message:{content:[{type:'text',text:'nothing to do'}]}});
+e({type:'result',subtype:'success',result:'done',session_id:'snd',num_turns:1,is_error:false});
+process.exit(0);`,
+    );
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    process.env.ANTON_CLAUDE_BIN = noopClaude;
+    let jobId: string;
+    try {
+      jobId = await runner.enqueue({
+        type: "execute-epic",
+        projectId: noGateProjectId,
+        payload: { projectId: noGateProjectId, epicBeadId: epicNd },
+      });
+      await runner.tickOnce();
+      await runner.whenIdle();
+
+      // Poison → job parked immediately (no retry burn). The reason is recorded on the run row and
+      // on the parked job's lastError — visible in the UI/logs.
+      const job = await getJob(tdb.db, jobId);
+      expect(job?.status).toBe("parked");
+      expect(job?.lastError).toMatch(/no delivery/i);
+      const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === epicNd)!;
+      expect(run.status).toBe("failed");
+      expect(run.error).toMatch(/no delivery/i);
+
+      // Exactly one ticket was dispatched: the run halted on the no-delivery ticket rather than
+      // proceeding to the next one.
+      const invoked = readFileSync(invLog, "utf8").trim().split("\n").filter(Boolean);
+      expect(invoked).toHaveLength(1);
+      const blockedId = invoked[0];
+      const skippedId = blockedId === nd1 ? nd2 : nd1;
+
+      // The dispatched ticket is BLOCKED (not closed, not silently re-queued to open) and unclaimed.
+      const blocked = await beads.show(repo, blockedId);
+      expect(blocked.status).toBe("blocked");
+      expect(blocked.assignee ?? null).toBeNull();
+      expect(blocked.labels ?? []).not.toContain("stage:implementing");
+
+      // The downstream ticket was never dispatched — still open, never claimed or closed.
+      const skipped = await beads.show(repo, skippedId);
+      expect(skipped.status).toBe("open");
+      expect(skipped.assignee ?? null).toBeNull();
+
+      // No PR was opened and the epic never advanced to in-review — nothing landed.
+      const epic = await beads.show(repo, epicNd);
+      expect(epic.external_ref ?? null).toBeNull();
+      expect(epic.labels ?? []).not.toContain("stage:in-review");
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  }, 60_000);
+
   it("branches a fresh run off the newer origin/<base> tip (anton-x3o)", async () => {
     // A run whose LOCAL base is stale must start at the remote tip: resolveFreshBase fetches
     // origin/main before createWorktree, so the worktree branches off origin/main, not the local

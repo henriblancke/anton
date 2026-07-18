@@ -447,8 +447,20 @@ async function runTicket(args: {
       (gate, code) => `${gate.label} gate failed for ${ticket.id} (exit ${code})`,
     );
 
-    // Commit whatever claude changed.
-    await commitAll(worktreePath, `${ticket.id}: ${ticket.title}`);
+    // Commit whatever claude changed — and honor commitAll's { committed } verdict. A clean agent
+    // exit that leaves NO diff delivered nothing: the exact false-success in issue #46 (root cause
+    // #1). Do NOT close/advance the ticket on empty delivery. Throw a NoDeliveryError so the catch
+    // below BLOCKS the ticket for a human (never re-queues it open) and the error propagates out of
+    // the ticket loop, halting dispatch of the rest of the epic. NoDeliveryError is poison, so the
+    // runner parks the run for a human instead of retrying claude to the same empty result forever.
+    const { committed: didCommit } = await commitAll(worktreePath, `${ticket.id}: ${ticket.title}`);
+    if (!didCommit) {
+      throw new NoDeliveryError(
+        `${ticket.id} produced no delivery: claude exited cleanly and passed the verify gates but ` +
+          `left no changes to commit (zero diff). Blocking the ticket for operator review and ` +
+          `halting the epic — nothing landed, so closing it would be a false success.`,
+      );
+    }
     committed = true;
 
     // Persist this ticket's "code done" state the moment it commits. An epic child closes (stage
@@ -465,16 +477,31 @@ async function runTicket(args: {
     await endSession(db, clock, sessionId, "done");
   } catch (e) {
     await endSession(db, clock, sessionId, "failed");
+    // Record the no-delivery reason in the session log too, so it's visible when tailing/replaying
+    // the session — not just in the run row's error. Best-effort; never mask the run's own error.
+    const noDelivery = e instanceof NoDeliveryError;
+    if (noDelivery) {
+      await appendSessionLog(logPath, `[no-delivery] ${e.message}\n`).catch(() => {});
+    }
     // Release the claim so the board never shows a dead session's ticket as in-flight
     // (anton-live-sync R10). A usage-limit park is NOT dead — the run resumes with the claim
-    // intact. When work already landed on the branch, flag for a human instead of silently
-    // re-queueing a ticket whose commits exist. All best-effort: never mask the run's error;
-    // the epic-level finally sync pushes the release to the remote.
+    // intact. Two states must NOT silently re-queue the ticket open: work already landed on the
+    // branch (commits exist), OR the agent delivered nothing at all (zero diff). Both are
+    // human-review states — block with an operator-facing note. Resetting a no-delivery ticket to
+    // open would silently re-queue it into the ready pool and hide the false-success. All
+    // best-effort: never mask the run's error; the epic-level finally sync pushes the release.
     if (!isUsageLimitError(e)) {
-      if (committed) {
+      if (committed || noDelivery) {
         await safe(() => beads.setStatus(repo, ticket.id, "blocked"));
         await safe(() =>
-          beads.note(repo, ticket.id, `anton: run failed after committing work — needs review`),
+          beads.note(
+            repo,
+            ticket.id,
+            noDelivery
+              ? `anton: run made no changes (clean agent exit, zero diff) — nothing was delivered; ` +
+                  `needs a human to implement it or fix the ticket, then resume the run`
+              : `anton: run failed after committing work — needs review`,
+          ),
         );
       } else {
         await safe(() => beads.setStatus(repo, ticket.id, "open"));
@@ -490,6 +517,20 @@ async function runTicket(args: {
 
 /** A permanent, human-needed failure (never retried). */
 class PoisonEpic extends Error {
+  constructor(msg: string) {
+    super(msg);
+    this.name = "PoisonError"; // classified as poison by the runner
+  }
+}
+
+/**
+ * The agent exited clean but delivered no code — a zero-diff commit (issue #46 root cause #1).
+ * Poison-classified (`name = "PoisonError"`), so the runner parks the run for a human rather than
+ * burning retries: re-running the agent on the same unchanged ticket would just reproduce the empty
+ * result. A distinct subclass so runTicket's catch can tell "delivered nothing" apart from other
+ * failures and block (never re-queue open) the ticket accordingly.
+ */
+class NoDeliveryError extends Error {
   constructor(msg: string) {
     super(msg);
     this.name = "PoisonError"; // classified as poison by the runner
