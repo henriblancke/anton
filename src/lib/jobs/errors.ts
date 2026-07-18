@@ -31,12 +31,17 @@ export class PoisonError extends Error {
 }
 
 /**
- * Another machine already holds a live run-lease for this epic (anton-jz1) — a Force run started
- * elsewhere is legitimately executing it, and running here too would double-run it. This is NOT a
- * failure of THIS job, so the runner reschedules it after a cool-off (like a quota park) to retry
- * once the other run settles and clears its lease, and does NOT count the attempt against
- * `maxAttempts` (a foreign run may hold the lease for a long time; parking this job for a human
- * would be wrong).
+ * This run cannot safely proceed because it can't prove it exclusively holds the epic's live
+ * run-lease (anton-jz1). Two triggers, same recovery:
+ *   1. Another machine already holds a live run-lease — a Force run started elsewhere is
+ *      legitimately executing the epic, and running here too would double-run it.
+ *   2. THIS run can't confirm or keep its OWN lease on the shared board — its pre-work publish
+ *      couldn't be pushed/pulled to arbitrate, or its refresh writes lapsed past the TTL — so
+ *      another machine may now see the epic as free.
+ * In every case the safe move is to yield: the runner reschedules the job after a cool-off (like a
+ * quota park) to retry and re-check liveness once the other run settles / the board is reachable,
+ * and does NOT count the attempt against `maxAttempts` (a foreign run may hold the lease for a long
+ * time, and a transient board outage should self-heal rather than park the job for a human).
  */
 export class RunAlreadyLiveError extends Error {
   constructor(message: string) {

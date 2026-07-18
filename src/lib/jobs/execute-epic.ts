@@ -149,6 +149,11 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     // unexpired lease after the clear and leave the epic looking live until TTL — anton-jz1).
     let leaseSettled = false;
     let leaseRefreshInFlight: Promise<void> = Promise.resolve();
+    // Expiry (ms) of the last lease this run PUSHED to the shared remote — advanced only after the
+    // push confirms, so it tracks remote-visible liveness, not just a local write. The cooperative
+    // `assertLeaseHeld` guard reads it to park the run before a lease whose refresh pushes have been
+    // failing silently lapses past its TTL and another machine treats the epic as free (anton-jz1).
+    let leaseExpiry = 0;
     // Publish/refresh this run's lease. Advances `leaseLabels` ONLY after the write lands (not
     // best-effort like the other bd writes): a swallowed failure that still advanced the tracked
     // label would let `finally` clear a label that isn't on the board while the real prior lease
@@ -159,11 +164,16 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       const exp = clock.now() + RUN_LEASE_TTL_MS;
       await beads.publishRunLease(repo, epicBeadId, exp, leaseLabels, runId);
       leaseLabels = [LABELS.runLease(exp, runId)];
-      // Nudge a sync so other machines see the lease within a heartbeat (fire-and-forget; the
-      // end-of-run sync is the backstop).
-      void beads
-        .sync(repo)
-        .catch((e) => console.error(`[execute-epic] run-lease sync failed for ${epicBeadId}`, e));
+      // Pushing the lease to the shared remote is REQUIRED, not a fire-and-forget nudge (anton-jz1):
+      // the cross-machine guard only holds if OTHER machines' liveRunCheck can read this lease off the
+      // Dolt remote, so a lease that lands locally but never pushes is invisible to them and lets them
+      // double-run the epic. Await the push and let it throw on failure — the caller decides what a
+      // failed publish means: the initial publish (step 1) fails the run closed; a refresh tick logs
+      // and, because `leaseExpiry` is advanced only AFTER the push confirms below, leaves it un-bumped
+      // so `assertLeaseHeld` parks the run before the stale lease lapses. `beads.sync` tolerates a
+      // no-remote workspace (resolves without pushing), so a single-machine run advances normally.
+      await beads.sync(repo);
+      leaseExpiry = exp;
     };
 
     try {
@@ -228,27 +238,40 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //    (anton-jz1). Acquiring it up front closes the window where another machine's Force run
       //    (whose local jobs table is empty) sees no lease during our setup and starts a second
       //    concurrent run; the fresh foreign-lease gate above already ruled out an existing one. The
-      //    initial publish fails closed (publishLease throws) — a run that can't hold the shared
-      //    lease must not proceed. The timer is unref'd so it never keeps the process alive, is torn
-      //    down in `finally`, and its refresh failures are caught + logged rather than fatal.
+      //    initial publish fails closed (publishLease throws if the label can't be written OR pushed
+      //    to the shared remote) — a run whose lease no other machine can see must not proceed. The
+      //    timer is unref'd so it never keeps the process alive, is torn down in `finally`, and its
+      //    refresh failures are caught + logged (with `assertLeaseHeld` parking the run if they
+      //    persist past the TTL) rather than fatal.
       await publishLease();
 
       // 1b. Read-after-write conflict check (anton-jz1). The foreign-lease gate in step 0 read the
       //     board BEFORE this publish, so it can't serialize two machines that force-run the same
       //     epic at the same instant: both clear the gate before either lease is visible remotely,
-      //     then both publish. Push our lease and re-pull so a concurrently-published foreign lease
-      //     becomes visible, then re-read and arbitrate: winsRunLeaseRace keeps the lease for the
-      //     lexicographically-lowest owner runId, so of two runs that both published, exactly one
-      //     proceeds and the other parks (RunAlreadyLiveError → reschedules, re-checks once the
-      //     winner settles). Best-effort like the step-0 pull — if the sync/pull/re-read can't
-      //     complete we degrade to the local view and proceed rather than block a legitimate run.
-      //     This narrows the double-run window to the sub-heartbeat gap where a machine re-reads
-      //     before the other's lease has propagated; it can't fully close it without a true
-      //     cross-machine lock, but it deterministically resolves the symmetric collision. Losing
-      //     here throws before the refresh timer is armed, so `finally` (leaseTimer still null)
-      //     tears down only the lease this run published.
-      await safe(() => beads.sync(repo));
-      await safe(() => beads.pull(repo));
+      //     then both publish. Our lease was already pushed to the remote by the required publish in
+      //     step 1; now re-pull so a concurrently-published foreign lease becomes visible, then
+      //     re-read and arbitrate: winsRunLeaseRace keeps the lease for the lexicographically-lowest
+      //     owner runId, so of two runs that both published, exactly one proceeds and the other parks
+      //     (RunAlreadyLiveError → reschedules, re-checks once the winner settles). The pull is
+      //     REQUIRED, not best-effort (anton-jz1): a swallowed pull failure would arbitrate against a
+      //     stale local view that can't see the other machine's lease, so both could conclude they
+      //     won — the exact double-run this step exists to break. If the pull fails we can't prove we
+      //     won, so we fail closed (park + retry) rather than proceed. This narrows the double-run
+      //     window to the sub-heartbeat gap where a machine re-reads before the other's lease has
+      //     propagated; it can't fully close it without a true cross-machine lock, but it
+      //     deterministically resolves the symmetric collision. Throwing here (before the refresh
+      //     timer is armed) means `finally` (leaseTimer still null) tears down only the lease this run
+      //     published.
+      try {
+        await beads.pull(repo);
+      } catch (e) {
+        throw new RunAlreadyLiveError(
+          `${epicBeadId} could not refresh the shared board to arbitrate the run-lease race (${
+            e instanceof Error ? e.message : String(e)
+          }) — parking so a concurrent run on another machine isn't ignored; this attempt resumes ` +
+            `once the board is reachable`,
+        );
+      }
       const acquired = await beads.show(repo, epicBeadId).catch(() => null);
       if (acquired && !beads.winsRunLeaseRace(acquired, clock.now(), runId)) {
         throw new RunAlreadyLiveError(
@@ -259,11 +282,33 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
 
       leaseTimer = setInterval(() => {
         if (leaseSettled) return; // run is settling — don't publish a fresh lease behind finally's clear
+        // A failed refresh only logs (it must not crash the process from a detached timer), and
+        // publishLease leaves `leaseExpiry` un-advanced on failure — so if these writes keep failing,
+        // `assertLeaseHeld` at the next checkpoint parks the run before the shared lease lapses.
         leaseRefreshInFlight = publishLease().catch((e) =>
           console.error(`[execute-epic] run-lease refresh failed for ${epicBeadId}`, e),
         );
       }, RUN_LEASE_REFRESH_MS);
       if (typeof leaseTimer.unref === "function") leaseTimer.unref();
+
+      // Cooperative lease-liveness guard (anton-jz1). The refresh timer only LOGS a failed publish;
+      // if writes to the shared board keep failing, the lease silently lapses past its TTL while this
+      // run is still executing, and another machine's liveRunCheck would then see the epic as free and
+      // start a duplicate. So at each checkpoint below (every ticket boundary, and before the PR) we
+      // re-check the expiry we last successfully PUSHED: once it's in the past we can no longer prove
+      // we hold the shared lease, so we yield (RunAlreadyLiveError → park + retry, re-checking liveness
+      // next attempt) rather than keep running unguarded. A single ticket that itself runs past the TTL
+      // under sustained sync failure can't be interrupted mid-session, so this bounds — not eliminates
+      // — the exposure to roughly one ticket's worth of work.
+      const assertLeaseHeld = () => {
+        if (clock.now() >= leaseExpiry) {
+          throw new RunAlreadyLiveError(
+            `${epicBeadId} run-lease expired mid-run (refresh writes to the shared board have been ` +
+              `failing) — parking so another machine doesn't treat the epic as free and double-run ` +
+              `it; this attempt resumes once the board is reachable`,
+          );
+        }
+      };
 
       // 2. Warm worktree (idempotent — reused on resume). Branch off the FRESHEST base
       // (anton-x3o): resolveFreshBase fetches origin/<base> and returns `origin/<base>` so a run
@@ -303,6 +348,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //    and the persisted resume marker, so a retry after a failed PR step skips straight to
       //    the PR step here rather than re-running claude/tests/commit on already-committed work.
       for (const ticket of orderTickets(tickets, all)) {
+        assertLeaseHeld(); // yield before starting a ticket if the shared lease has lapsed
         if (ticket.status === "closed") continue;
         if (standaloneRun && (ticket.labels?.includes(inReview) ?? false)) {
           // Resume after a failed PR step: this ticket already committed and moved to in-review on
@@ -337,6 +383,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //    Closing it now would derive it as Done on the board while its PR is still open and drop
       //    it out of review-fix's in-review sweep (which is what keeps a standalone PR in the
       //    automated review/finalization path).
+      assertLeaseHeld(); // don't open a PR under a lease that has silently lapsed
       const pr = await openPullRequest({
         repoPath: repo,
         branch: worktree.branch,
