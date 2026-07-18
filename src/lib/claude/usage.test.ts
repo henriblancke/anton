@@ -146,4 +146,26 @@ describe("getClaudeUsageCached", () => {
     expect(await getClaudeUsageCached(fetcher, now)).toBeNull();
     expect(calls).toBe(1);
   });
+
+  it("dedupes concurrent cold-cache callers into a single upstream fetch", async () => {
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const fetcher = async () => {
+      calls += 1;
+      await gate; // hold the fetch open so both callers race the empty cache
+      return snapshot;
+    };
+    const now = () => 1_000;
+
+    const first = getClaudeUsageCached(fetcher, now);
+    const second = getClaudeUsageCached(fetcher, now);
+    release();
+
+    expect(await first).toEqual(snapshot);
+    expect(await second).toEqual(snapshot);
+    expect(calls).toBe(1);
+  });
 });

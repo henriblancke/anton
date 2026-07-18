@@ -180,11 +180,20 @@ interface UsageCacheEntry {
   value: ClaudeUsage | null;
 }
 let usageCache: UsageCacheEntry | null = null;
+/**
+ * The single upstream fetch currently in flight, shared by every concurrent caller until it
+ * settles. Without this, simultaneous page loads that all miss a cold/stale cache would each run
+ * their own keychain read + Anthropic request, defeating the rate-limit protection the cache
+ * exists to provide.
+ */
+let usageInFlight: Promise<ClaudeUsage | null> | null = null;
 
 /**
  * Server-side cached usage read for the route handler. Collapses bursts of page loads into one
  * upstream fetch within {@link USAGE_CACHE_TTL_MS}; `null` results are cached too, so a transient
- * outage doesn't hammer the endpoint. `fetcher`/`now` are injectable for deterministic tests.
+ * outage doesn't hammer the endpoint. Concurrent callers that miss the cache share a single
+ * in-flight fetch (single-flight), so only one upstream request runs per TTL window even under a
+ * burst. `fetcher`/`now` are injectable for deterministic tests.
  */
 export async function getClaudeUsageCached(
   fetcher: () => Promise<ClaudeUsage | null> = fetchClaudeUsage,
@@ -192,12 +201,22 @@ export async function getClaudeUsageCached(
 ): Promise<ClaudeUsage | null> {
   const ts = now();
   if (usageCache && ts - usageCache.at < USAGE_CACHE_TTL_MS) return usageCache.value;
-  const value = await fetcher();
-  usageCache = { at: ts, value };
-  return value;
+  // Join the fetch already running for this TTL window rather than starting a second one.
+  if (usageInFlight) return usageInFlight;
+  usageInFlight = (async () => {
+    try {
+      const value = await fetcher();
+      usageCache = { at: ts, value };
+      return value;
+    } finally {
+      usageInFlight = null;
+    }
+  })();
+  return usageInFlight;
 }
 
 /** Clear the module-level cache. Test-only. */
 export function resetUsageCache(): void {
   usageCache = null;
+  usageInFlight = null;
 }
