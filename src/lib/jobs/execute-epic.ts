@@ -12,7 +12,7 @@ import { ownerOf } from "../beads/claim";
 import { computeEpicGraph, epicStandaloneBlockers, standaloneBlockers } from "../epic-graph";
 import { loadAgentPrompt } from "../claude/agent-prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
-import { runClaude, type ClaudeEvent } from "../claude/driver";
+import { runClaude, type ClaudeEvent, type ClaudeResult } from "../claude/driver";
 import { formatAntonResult, parseAntonResult } from "../claude/anton-result";
 import {
   commitAll,
@@ -34,9 +34,20 @@ import {
   findOpenRunForEpic,
   updateRun,
 } from "../runs";
-import { appendSessionLog, createSession, endSession, sessionLogPath } from "../sessions";
+import {
+  appendSessionLog,
+  createSession,
+  endSession,
+  sessionLogPath,
+  setSessionClaudeId,
+} from "../sessions";
 import { buildPrTitle } from "./pr-title";
-import { isUsageLimitError, isRunAlreadyLiveError, RunAlreadyLiveError } from "./errors";
+import {
+  isRecoverableClaudeError,
+  isUsageLimitError,
+  isRunAlreadyLiveError,
+  RunAlreadyLiveError,
+} from "./errors";
 import { runVerifyGates } from "./shell";
 import type { AntonDb, Clock } from "./queue";
 import { systemClock } from "./queue";
@@ -887,13 +898,16 @@ async function runTicket(args: {
 
   let committed = false;
   try {
-    const result = await runClaude({
-      cwd: worktreePath,
-      prompt: ticketPrompt(ticket),
+    const result = await runClaudeResilient({
+      db,
+      ctx,
+      sessionId,
+      logPath,
+      worktreePath,
+      ticket,
       appendSystemPrompt,
       model: settings.model,
       permissionMode: settings.permissionMode ?? "bypassPermissions",
-      signal: ctx.signal,
       onEvent,
     });
     if (!result.ok) {
@@ -1011,6 +1025,131 @@ async function runTicket(args: {
 }
 
 // ── helpers ──
+
+/** Cap on in-session `claude --resume` retries before escalating to a fresh restart (anton-juar). */
+const MAX_RESUME_ATTEMPTS = 2;
+
+export function claudeResumeDecision(
+  error: { sessionId?: string; signature: string },
+  attempt: number,
+  priorSignature?: string,
+): { resume: true } | { resume: false; reason: string } {
+  if (!error.sessionId) return { resume: false, reason: "no session id" };
+  if (error.signature === priorSignature) {
+    return { resume: false, reason: `repeated ${error.signature}` };
+  }
+  if (attempt >= MAX_RESUME_ATTEMPTS) {
+    return { resume: false, reason: "resume budget spent" };
+  }
+  return { resume: true };
+}
+
+/**
+ * Run claude for one ticket with resilient in-session recovery (anton-juar). A transient mid-stream
+ * death (network drop, truncated stream, exit-without-result) that captured a Claude session id is
+ * retried with `claude --resume <id>` — continuing the same conversation instead of re-running the
+ * whole ticket from scratch — bounded by MAX_RESUME_ATTEMPTS so a flapping connection can't burn the
+ * job's retry budget. A resume that dies the SAME way escalates immediately to a fresh restart. When
+ * no session id was captured, the failure is deterministic (non-recoverable), or the resume budget
+ * is spent, the error propagates so the job-level runner does today's fresh spawn (then parks after
+ * maxAttempts) — resume is best-effort and never a new failure mode.
+ */
+async function runClaudeResilient(args: {
+  db: AntonDb;
+  ctx: JobContext;
+  sessionId: string;
+  logPath: string;
+  worktreePath: string;
+  ticket: Bead;
+  appendSystemPrompt: string;
+  model?: string;
+  permissionMode: "default" | "acceptEdits" | "bypassPermissions" | "plan";
+  onEvent: (e: ClaudeEvent) => void;
+}): Promise<ClaudeResult> {
+  const { db, ctx, sessionId, logPath, worktreePath, ticket } = args;
+  let resumeId: string | undefined;
+  let priorError: string | undefined;
+  let priorSignature: string | undefined;
+
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const result = await runClaude({
+        cwd: worktreePath,
+        prompt: resumeId ? continuationPrompt(ticket, priorError) : ticketPrompt(ticket),
+        resumeSessionId: resumeId,
+        appendSystemPrompt: args.appendSystemPrompt,
+        model: args.model,
+        permissionMode: args.permissionMode,
+        signal: ctx.signal,
+        onEvent: args.onEvent,
+      });
+      // Persist the real Claude session id once the run reports it (diagnostics + future resume).
+      if (result.sessionId) await setSessionClaudeId(db, sessionId, result.sessionId).catch(() => {});
+      return result;
+    } catch (e) {
+      // Only a transient (RecoverableClaudeError) failure is resume-eligible. A deterministic/content
+      // failure (verify-gate, agent error), poison, or quota is NOT — it propagates unchanged so the
+      // runner applies today's fresh-restart/park policy (never a resume that would replay bad state).
+      if (!isRecoverableClaudeError(e)) throw e;
+      // Persist the captured id even on the failure path — a mid-stream death may carry it only via
+      // the system-init event, and it's what a fresh-restart's operator or a future resume relies on.
+      if (e.sessionId) await setSessionClaudeId(db, sessionId, e.sessionId).catch(() => {});
+
+      const decision = claudeResumeDecision(e, attempt, priorSignature);
+      if (!decision.resume) {
+        await appendSessionLog(
+          logPath,
+          `[resume] not resuming (${decision.reason}) — escalating to a fresh restart: ${e.message}\n`,
+        ).catch(() => {});
+        throw e;
+      }
+      resumeId = e.sessionId;
+      priorError = e.message;
+      priorSignature = e.signature;
+      await appendSessionLog(
+        logPath,
+        `[resume] transient failure (${e.signature}); resuming claude session ${e.sessionId} — ` +
+          `attempt ${attempt + 2}/${MAX_RESUME_ATTEMPTS + 1}: ${e.message}\n`,
+      ).catch(() => {});
+    }
+  }
+}
+
+/**
+ * Brief continuation prompt for a resumed session (anton-juar). The full ticket spec already lives in
+ * the resumed conversation, so this only nudges the agent to pick up where it left off. The captured
+ * error is injected ONLY when it may have been caused by the agent's own output (e.g. an oversized
+ * tool result that tripped a limit) — never for pure infra noise the agent can't act on, which would
+ * only distract it.
+ */
+export function continuationPrompt(ticket: Bead, priorError?: string): string {
+  const lines = [
+    `Your previous session for ${ticket.id} was interrupted mid-stream by a transient failure and ` +
+      `has been resumed with full conversation context. Continue from where you left off — do NOT ` +
+      `restart from scratch. Inspect the working tree for partial edits before redoing anything, so ` +
+      `you don't duplicate or conflict with work already in progress.`,
+  ];
+  if (priorError && mayBeAgentCaused(priorError)) {
+    lines.push(
+      ``,
+      `Your previous session ended with: "${truncateField(priorError)}". If that was caused by your ` +
+        `own output (an oversized tool result, too-long input), adjust your approach so it doesn't recur.`,
+    );
+  }
+  lines.push(``, `Follow the operating contract in your system prompt.`);
+  return lines.join("\n");
+}
+
+/**
+ * Could this transient error have been triggered by the AGENT's own output rather than pure infra
+ * noise (anton-juar)? Oversized-input / context-window / too-large-payload errors are the agent-caused
+ * class worth surfacing back into the continuation; a bare network drop is not, so it's left out.
+ */
+function mayBeAgentCaused(message: string): boolean {
+  return /prompt is too long|input (?:is )?too long|too many tokens|maximum context|context (?:length|window)|request (?:entity )?too large|payload too large|too large|\b413\b/i.test(
+    message,
+  );
+}
 
 /** A permanent, human-needed failure (never retried). */
 class PoisonEpic extends Error {

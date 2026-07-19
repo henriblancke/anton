@@ -3,10 +3,10 @@
  * usage-limit detection against fake claude binaries (no network / no real claude needed).
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isUsageLimitError } from "../jobs/errors";
+import { isRecoverableClaudeError, isUsageLimitError } from "../jobs/errors";
 import { CLAUDE_BIN_ENV, runClaude, type ClaudeEvent } from "./driver";
 
 let dir: string;
@@ -588,5 +588,230 @@ describe("runClaude", () => {
 
     expect(result.ok).toBe(true);
     expect(result.text).toBe("ok");
+  });
+
+  it("surfaces a transient mid-stream death as a RecoverableClaudeError carrying the init session id (anton-juar)", async () => {
+    // A run that emits the `system` init event (carrying session_id) and then dies mid-stream —
+    // "Connection closed mid-response" on stderr, exit 1, NO final result event. The session id is
+    // captured from init (not the missing result), and the failure classifies transient/resume-eligible.
+    const bin = writeFakeClaude(
+      "midstream-death-claude",
+      [JSON.stringify({ type: "system", subtype: "init", session_id: "sess-mid" })],
+      1,
+      "API Error: Connection closed mid-response\n",
+    );
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    let caught: unknown;
+    try {
+      await runClaude({ cwd: dir, prompt: "do the thing" });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(isRecoverableClaudeError(caught)).toBe(true);
+    expect((caught as { sessionId?: string }).sessionId).toBe("sess-mid");
+    expect(isUsageLimitError(caught)).toBe(false);
+  });
+
+  it("classifies an is_error result on a clean exit as recoverable when the text is transient (anton-juar)", async () => {
+    // Claude Code can surface a mid-stream drop as an error result that STILL exits 0 — e.g. a final
+    // result with is_error:true and "Connection closed mid-response". The transient classification
+    // must run here too (not only on non-zero exits), else it resolves { ok: false } → fresh restart
+    // instead of an in-place resume.
+    const bin = writeFakeClaude("iserror-exit0-claude", [
+      JSON.stringify({ type: "system", subtype: "init", session_id: "sess-ie0" }),
+      JSON.stringify({
+        type: "result",
+        subtype: "error",
+        is_error: true,
+        session_id: "sess-ie0",
+        result: "API Error: Connection closed mid-response",
+      }),
+    ]);
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    let caught: unknown;
+    try {
+      await runClaude({ cwd: dir, prompt: "do the thing" });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(isRecoverableClaudeError(caught)).toBe(true);
+    expect((caught as { sessionId?: string }).sessionId).toBe("sess-ie0");
+    expect((caught as { signature?: string }).signature).toBe("connection-closed");
+  });
+
+  it("resolves { ok: false } for an is_error result on a clean exit with no transient signal (anton-juar)", async () => {
+    // A deterministic content failure that exits 0 with is_error:true — no network/transient phrasing.
+    // It must stay a plain { ok: false } (runTicket throws → fresh restart), never a resume that would
+    // replay bad state.
+    const bin = writeFakeClaude("iserror-exit0-deterministic-claude", [
+      JSON.stringify({ type: "system", subtype: "init", session_id: "sess-ie0d" }),
+      JSON.stringify({
+        type: "result",
+        subtype: "error",
+        is_error: true,
+        session_id: "sess-ie0d",
+        result: "the agent could not satisfy the acceptance criteria",
+      }),
+    ]);
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    const result = await runClaude({ cwd: dir, prompt: "do the thing" });
+    expect(result.ok).toBe(false);
+    expect(result.isError).toBe(true);
+  });
+
+  it("classifies an exit-without-result (exit 0, no result event) as recoverable (anton-juar)", async () => {
+    // A truncated/interrupted stream that exits cleanly but never emits the final result event is a
+    // transient death — resume-eligible, carrying the init session id.
+    const bin = writeFakeClaude("no-result-claude", [
+      JSON.stringify({ type: "system", subtype: "init", session_id: "sess-noresult" }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "working" }] } }),
+    ]);
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    let caught: unknown;
+    try {
+      await runClaude({ cwd: dir, prompt: "do the thing" });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(isRecoverableClaudeError(caught)).toBe(true);
+    expect((caught as { sessionId?: string }).sessionId).toBe("sess-noresult");
+    expect((caught as { signature?: string }).signature).toBe("exit-without-result");
+  });
+
+  it("does NOT classify a deterministic non-zero exit (real result, no transient signal) as recoverable (anton-juar)", async () => {
+    // The agent genuinely errored: a real result event, exit 1, no network/transient phrasing. This
+    // must stay a plain Error so the runner does a fresh restart / park — resuming would replay bad state.
+    const bin = writeFakeClaude(
+      "deterministic-fail-claude",
+      [
+        JSON.stringify({ type: "system", subtype: "init", session_id: "sess-det" }),
+        JSON.stringify({
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: true,
+          session_id: "sess-det",
+          result: "the tool call failed with a syntax error",
+        }),
+      ],
+      1,
+    );
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    let caught: unknown;
+    try {
+      await runClaude({ cwd: dir, prompt: "do the thing" });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(isRecoverableClaudeError(caught)).toBe(false);
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain("claude exited with code 1");
+  });
+
+  it("does NOT resume when a model-authored result summary merely mentions an upstream status code (anton-juar)", async () => {
+    // The agent's OWN final summary names a bare status code / generic upstream error as the reason a
+    // deterministic task failed. That is model-authored prose, not a Claude Code transient, so the
+    // broad status-code matcher must not fire on the result text — otherwise the real failure is lost
+    // to an "interrupted" resume. It stays a plain Error → fresh restart, and the summary is surfaced.
+    const bin = writeFakeClaude(
+      "model-status-code-claude",
+      [
+        JSON.stringify({ type: "system", subtype: "init", session_id: "sess-mac" }),
+        JSON.stringify({
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: true,
+          session_id: "sess-mac",
+          result: "The local endpoint returned 503 Service Unavailable; the migration could not run.",
+        }),
+      ],
+      1,
+    );
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    let caught: unknown;
+    try {
+      await runClaude({ cwd: dir, prompt: "do the thing" });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(isRecoverableClaudeError(caught)).toBe(false);
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain("503 Service Unavailable");
+  });
+
+  it("still resumes when Claude Code's own stderr carries an upstream status code (anton-juar)", async () => {
+    // The same status-code wording on Claude Code's OWN stderr channel IS a real transient — the broad
+    // matcher stays in force there, so the run is resume-eligible.
+    const bin = writeFakeClaude(
+      "stderr-status-code-claude",
+      [JSON.stringify({ type: "system", subtype: "init", session_id: "sess-ssc" })],
+      1,
+      "API Error: 503 Service Unavailable\n",
+    );
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    let caught: unknown;
+    try {
+      await runClaude({ cwd: dir, prompt: "do the thing" });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(isRecoverableClaudeError(caught)).toBe(true);
+    expect((caught as { sessionId?: string }).sessionId).toBe("sess-ssc");
+    expect((caught as { signature?: string }).signature).toBe("503");
+  });
+
+  it("passes --resume <id> through as an argument when resumeSessionId is set (anton-juar)", async () => {
+    // The fake records its argv so we can assert the resume flag reached claude.
+    const argvPath = join(dir, "resume-argv.json");
+    const path = join(dir, "resume-claude");
+    const body = [
+      "#!/usr/bin/env node",
+      `require('fs').writeFileSync(${JSON.stringify(argvPath)}, JSON.stringify(process.argv.slice(2)));`,
+      `process.stdout.write(JSON.stringify({ type: 'result', is_error: false, session_id: 'sess-r', result: 'ok' }) + "\\n");`,
+      "",
+    ].join("\n");
+    writeFileSync(path, body, "utf8");
+    chmodSync(path, 0o755);
+    process.env[CLAUDE_BIN_ENV] = path;
+
+    const result = await runClaude({ cwd: dir, prompt: "continue", resumeSessionId: "sess-abc" });
+
+    expect(result.ok).toBe(true);
+    const argv: string[] = JSON.parse(readFileSync(argvPath, "utf8"));
+    const i = argv.indexOf("--resume");
+    expect(i).toBeGreaterThanOrEqual(0);
+    expect(argv[i + 1]).toBe("sess-abc");
+  });
+
+  it("falls back to the last assistant text when a success omits the result field (anton-juar)", async () => {
+    // A resumed run can finish is_error:false but omit the final `result` field, leaving the agent's
+    // ANTON-RESULT self-report only in its last assistant message. Without the fallback, `text` would
+    // be undefined and a `blocked` self-report on partial work would be lost — a false success.
+    const bin = writeFakeClaude("resultless-success-claude", [
+      JSON.stringify({ type: "system", subtype: "init", session_id: "sess-rl" }),
+      JSON.stringify({
+        type: "assistant",
+        message: { content: [{ type: "text", text: "Could not finish.\nANTON-RESULT: blocked — schema mismatch" }] },
+      }),
+      JSON.stringify({ type: "result", subtype: "success", is_error: false, session_id: "sess-rl" }),
+    ]);
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    const result = await runClaude({ cwd: dir, prompt: "continue", resumeSessionId: "sess-rl" });
+
+    expect(result.ok).toBe(true);
+    expect(result.text).toContain("ANTON-RESULT: blocked");
   });
 });

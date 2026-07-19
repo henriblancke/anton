@@ -15,6 +15,13 @@
       "when": 1783999392007,
       "tag": "0001_dapper_kid_colt",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1784467878971,
+      "tag": "0002_nice_supernaut",
+      "breakpoints": true
     }
   ]
 }
