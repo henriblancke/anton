@@ -148,8 +148,14 @@ export type SyncState = "unknown" | "not-wired" | "syncing" | "synced" | "failin
 
 export interface SyncStatus {
   state: SyncState;
-  /** ms epoch of the last successful pass; survives later failures for "last synced Xs ago". */
+  /** ms epoch of the last successful pass (pull OR push); survives later failures for "last synced Xs ago". */
   lastSyncedAt: number | null;
+  /** ms epoch of the last successful PUSH. Distinct from lastSyncedAt: a pull-only pass moves
+   * lastSyncedAt but NOT this, so "unpushed for a while" is visible even while pulls keep succeeding. */
+  lastPushedAt: number | null;
+  /** Full (write-nudged/backstop) passes that committed local work but failed to push since the last
+   * successful push. 0 when the repo is caught up with its remote; >0 means work is queued locally. */
+  unpushedCount: number;
   lastError: string | null;
 }
 
@@ -161,16 +167,26 @@ function statusRegistry(): Map<string, SyncStatus> {
 }
 
 export function getSyncStatus(cwd: string): SyncStatus {
-  return statusRegistry().get(cwd) ?? { state: "unknown", lastSyncedAt: null, lastError: null };
+  return (
+    statusRegistry().get(cwd) ?? {
+      state: "unknown",
+      lastSyncedAt: null,
+      lastPushedAt: null,
+      unpushedCount: 0,
+      lastError: null,
+    }
+  );
 }
 
 /**
  * Compact token for board refreshes. Repeated successful heartbeats do not change it, while every
- * user-visible health transition does (including gaining the first successful-sync timestamp).
+ * user-visible health transition does (including gaining the first successful-sync timestamp and any
+ * change to the unpushed-backlog count, which the badge renders).
  */
 export function getSyncStatusToken(cwd: string): string {
   const status = getSyncStatus(cwd);
-  return `${status.state}:${status.lastSyncedAt === null ? "never" : "seen"}:${status.lastError ?? ""}`;
+  const seen = status.lastSyncedAt === null ? "never" : "seen";
+  return `${status.state}:${seen}:${status.unpushedCount}:${status.lastError ?? ""}`;
 }
 
 function recordStatus(cwd: string, patch: Partial<SyncStatus>): void {
@@ -247,16 +263,17 @@ export async function runDoltSync(
  * piggybacks on any in-flight or queued pass (full ⊃ pull); a "full" request upgrades a queued
  * pull-only trailing pass. Updates the sync status registry on every pass. Exported for testing.
  *
- * Also tracks a per-repo `unpushed` flag (anton-sr8f): a full pass that fails to reach "synced"
- * committed local changes it couldn't push, so the repo is left ahead of its remote. The flag
- * lets a "backstop" request (the heartbeat) resolve to a push-retry while a not-ahead repo stays
- * pull-only. A pass that reaches "synced"/"not-wired" clears it (nothing left to push).
+ * Also tracks the per-repo unpushed backlog on the sync-status registry (anton-sr8f, anton-rn88): a
+ * full pass that fails to reach "synced" committed local changes it couldn't push, so the repo is
+ * left ahead of its remote — recorded as `unpushedCount > 0`. That count lets a "backstop" request
+ * (the heartbeat) resolve to a push-retry while a caught-up repo stays pull-only, and it is the
+ * operator-visible "N unpushed" surface. A full pass that reaches "synced"/"not-wired" clears the
+ * count and stamps `lastPushedAt` (nothing left to push).
  */
 export function createDoltSync(exec: BdExec = bd): (cwd: string, mode?: SyncRequest) => Promise<void> {
   const running = new Map<string, Promise<void>>();
   const trailing = new Map<string, { promise: Promise<void>; mode: SyncMode }>();
   const trailingMode = new Map<string, SyncMode>(); // live handle so an upgrade reaches the queued run
-  const unpushed = new Map<string, boolean>(); // repo is ahead of its remote (a push failed)
 
   const start = (cwd: string, mode: SyncMode): Promise<void> => {
     recordStatus(cwd, { state: "syncing" });
@@ -266,19 +283,27 @@ export function createDoltSync(exec: BdExec = bd): (cwd: string, mode?: SyncRequ
       } else {
         // Retain the last valid data while a background read refreshes after the remote pull.
         invalidateIssueSnapshot(cwd);
-        recordStatus(cwd, { state: "synced", lastSyncedAt: Date.now(), lastError: null });
+        const now = Date.now();
+        // A full pass pushed everything — stamp the push and clear the backlog. A pull-only pass
+        // moves lastSyncedAt but leaves lastPushedAt/unpushedCount alone (it never pushes).
+        recordStatus(cwd, {
+          state: "synced",
+          lastSyncedAt: now,
+          lastError: null,
+          ...(mode === "full" ? { lastPushedAt: now, unpushedCount: 0 } : {}),
+        });
       }
-      // A completed full pass pushed everything (or has no remote to be ahead of): no backstop owed.
-      if (mode === "full") unpushed.set(cwd, false);
     });
     running.set(cwd, p);
     // Bookkeeping only — callers hold `p` and see its rejection; this chain must not re-reject.
     void p
       .catch((e: Error) => {
-        recordStatus(cwd, { state: "failing", lastError: e.message });
-        // A full pass committed but never landed its push — mark the repo ahead so the next
-        // heartbeat backstop retries the push instead of leaving it unpushed indefinitely.
-        if (mode === "full") unpushed.set(cwd, true);
+        // A full pass committed but never landed its push — grow the unpushed backlog so the next
+        // heartbeat backstop retries the push, and the operator sees a truthful "N unpushed" count
+        // instead of the failure hiding in server logs. A pull-only failure leaves the count as-is.
+        const patch: Partial<SyncStatus> = { state: "failing", lastError: e.message };
+        if (mode === "full") patch.unpushedCount = getSyncStatus(cwd).unpushedCount + 1;
+        recordStatus(cwd, patch);
       })
       .finally(() => {
         if (running.get(cwd) === p) running.delete(cwd);
@@ -287,9 +312,9 @@ export function createDoltSync(exec: BdExec = bd): (cwd: string, mode?: SyncRequ
   };
 
   return function sync(cwd: string, request: SyncRequest = "full"): Promise<void> {
-    // Resolve the backstop against the current ahead state: push-retry only when a prior push failed.
+    // Resolve the backstop against the recorded backlog: push-retry only when a prior push failed.
     const mode: SyncMode =
-      request === "backstop" ? (unpushed.get(cwd) ? "full" : "pull") : request;
+      request === "backstop" ? (getSyncStatus(cwd).unpushedCount > 0 ? "full" : "pull") : request;
     const queued = trailing.get(cwd);
     if (queued) {
       if (mode === "full") trailingMode.set(cwd, "full");

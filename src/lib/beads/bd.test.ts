@@ -498,7 +498,56 @@ describe("createDoltSync", () => {
     expect(getSyncStatus(`/never-${Math.random()}`)).toEqual({
       state: "unknown",
       lastSyncedAt: null,
+      lastPushedAt: null,
+      unpushedCount: 0,
       lastError: null,
     });
+  });
+
+  it("stamps lastPushedAt and clears the unpushed count when a full pass pushes", async () => {
+    const cwd = `/repo-pushed-${Math.random()}`;
+    const sync = createDoltSync(async () => "");
+    await sync(cwd, "full");
+    const status = getSyncStatus(cwd);
+    expect(status.lastPushedAt).toBeTypeOf("number");
+    expect(status.unpushedCount).toBe(0);
+  });
+
+  it("grows the unpushed count per failed push and clears it once a retry lands", async () => {
+    const cwd = `/repo-unpushed-${Math.random()}`;
+    let pushFails = true;
+    const sync = createDoltSync(async (_cwd, args) => {
+      if (args[1] === "push" && pushFails) throw execError({ stderr: "Error: push failed: reset" });
+      return "";
+    });
+
+    await sync(cwd, "full").catch(() => {});
+    expect(getSyncStatus(cwd).unpushedCount).toBe(1);
+    await sync(cwd, "full").catch(() => {});
+    expect(getSyncStatus(cwd).unpushedCount).toBe(2);
+
+    pushFails = false;
+    await sync(cwd, "full");
+    expect(getSyncStatus(cwd).unpushedCount).toBe(0);
+    expect(getSyncStatus(cwd).lastPushedAt).toBeTypeOf("number");
+  });
+
+  it("a pull-only pass moves lastSyncedAt but not lastPushedAt or the unpushed count", async () => {
+    const cwd = `/repo-pull-only-${Math.random()}`;
+    let pushFails = true;
+    const sync = createDoltSync(async (_cwd, args) => {
+      if (args[1] === "push" && pushFails) throw execError({ stderr: "Error: push failed: reset" });
+      return "";
+    });
+    // Leave the repo ahead of its remote (a full push failed), then run a pull-only pass.
+    await sync(cwd, "full").catch(() => {});
+    expect(getSyncStatus(cwd).unpushedCount).toBe(1);
+    pushFails = false; // a push would now succeed, but pull-only must not attempt one
+    await sync(cwd, "pull");
+    const status = getSyncStatus(cwd);
+    expect(status.state).toBe("synced");
+    expect(status.lastSyncedAt).toBeTypeOf("number");
+    expect(status.lastPushedAt).toBeNull(); // never pushed successfully
+    expect(status.unpushedCount).toBe(1); // still ahead — the backlog survives a pull
   });
 });

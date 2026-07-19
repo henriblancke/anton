@@ -1,6 +1,7 @@
 "use client";
 
-import { CloudOffIcon, LoaderIcon, TriangleAlertIcon } from "lucide-react";
+import { CloudOffIcon, LoaderIcon, TriangleAlertIcon, UploadIcon } from "lucide-react";
+import { deriveSyncBadge } from "@/lib/sync-status";
 import type { SyncStatusView } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -12,14 +13,22 @@ function ago(msEpoch: number): string {
   return `${Math.round(m / 60)}h ago`;
 }
 
+/** "1 unpushed" / "3 unpushed" — the operator-visible backlog count. */
+function unpushedLabel(n: number): string {
+  return `${n} unpushed`;
+}
+
+const base =
+  "inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium";
+
 /**
- * Per-project beads↔Dolt sync health, rendered next to the board. Every state is visible —
- * a project with no shared remote shows "not wired", never a silent local-only mode.
+ * Per-project beads↔Dolt sync health, rendered next to the board. Every state is visible and
+ * truthful: a project with no shared remote shows "not wired"; committed-but-unpushed work shows a
+ * live count that a heartbeat is retrying; and an outright sync failure is prominent, never a subtle
+ * chip — so a stuck push is impossible to miss without reading server logs (anton-rn88).
  */
 export function SyncStatusBadge({ sync }: { sync: SyncStatusView }) {
-  const base =
-    "inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium";
-  switch (sync.state) {
+  switch (deriveSyncBadge(sync)) {
     case "synced":
       return (
         <span className={cn(base, "border-emerald-500/30 text-emerald-600 dark:text-emerald-400")}>
@@ -34,14 +43,32 @@ export function SyncStatusBadge({ sync }: { sync: SyncStatusView }) {
           Syncing…
         </span>
       );
+    case "unpushed-retrying":
+      return (
+        <span
+          className={cn(base, "border-amber-500/40 text-amber-600 dark:text-amber-400")}
+          title={`${unpushedLabel(sync.unpushedCount)} local change${
+            sync.unpushedCount === 1 ? "" : "s"
+          } committed but not yet pushed to the shared remote — retrying on the next heartbeat.${
+            sync.lastPushedAt ? ` Last pushed ${ago(sync.lastPushedAt)}.` : ""
+          }`}
+        >
+          <UploadIcon className="size-3" aria-hidden="true" />⚠ {unpushedLabel(sync.unpushedCount)} · retrying
+        </span>
+      );
     case "failing":
       return (
         <span
-          className={cn(base, "border-destructive/40 text-destructive")}
+          className={cn(
+            base,
+            "border-destructive bg-destructive/10 font-semibold text-destructive",
+          )}
           title={sync.lastError ?? undefined}
         >
-          <TriangleAlertIcon className="size-3" aria-hidden="true" />
-          Sync failing{sync.lastSyncedAt ? ` · last synced ${ago(sync.lastSyncedAt)}` : ""}
+          <TriangleAlertIcon className="size-3.5" aria-hidden="true" />
+          Sync failing
+          {sync.unpushedCount > 0 ? ` · ${unpushedLabel(sync.unpushedCount)}` : ""}
+          {sync.lastPushedAt ? ` · last pushed ${ago(sync.lastPushedAt)}` : ""}
         </span>
       );
     case "not-wired":
