@@ -10,6 +10,7 @@ import type { JobStatus, JobSummary } from "@/lib/jobs-view";
 import { cn } from "@/lib/utils";
 import { fmtDuration } from "@/components/runs/run-view-utils";
 import { ResumeJobButton } from "@/components/runs/resume-job-button";
+import { KillJobButton } from "@/components/runs/kill-job-button";
 
 const STATUS_STYLE: Record<JobStatus, { dot: string; text: string; pulse?: boolean }> = {
   running: { dot: "bg-stage-implementing", text: "text-stage-implementing", pulse: true },
@@ -58,10 +59,15 @@ export function JobList({ jobs, slug }: { jobs: JobSummary[]; slug: string }) {
 
 function JobRow({ job, slug }: { job: JobSummary; slug: string }) {
   const [open, setOpen] = useState(false);
-  const style = STATUS_STYLE[job.status];
-  const finished = !ACTIVE_JOB_STATUSES.has(job.status);
+  // A confirmed kill is terminal, so the row can show `cancelled` immediately rather than waiting
+  // on router.refresh(). Only ever set from a 200 — a failed kill leaves the job's own status.
+  const [killed, setKilled] = useState(false);
+  const status: JobStatus = killed ? "cancelled" : job.status;
+  const style = STATUS_STYLE[status];
+  const active = ACTIVE_JOB_STATUSES.has(status);
+  const finished = !active;
   // Parked/failed jobs are recoverable but not self-healing — offer a manual resume (anton-ner.4).
-  const resumable = job.status === "parked" || job.status === "failed";
+  const resumable = !killed && (job.status === "parked" || job.status === "failed");
 
   return (
     <li className="flex flex-col">
@@ -92,13 +98,19 @@ function JobRow({ job, slug }: { job: JobSummary; slug: string }) {
             </span>
           </div>
         </button>
-        {resumable && (
-          <div className="shrink-0" onClick={(e) => e.stopPropagation()}>
-            <ResumeJobButton slug={slug} jobId={job.id} />
+        {(resumable || active) && (
+          <div
+            className="flex shrink-0 items-center gap-1.5"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {resumable && <ResumeJobButton slug={slug} jobId={job.id} />}
+            {active && (
+              <KillJobButton slug={slug} jobId={job.id} onKilled={() => setKilled(true)} />
+            )}
           </div>
         )}
         <div className="flex shrink-0 flex-col items-end gap-0.5">
-          <span className={cn("font-mono text-[11px]", style.text)}>{job.status}</span>
+          <span className={cn("font-mono text-[11px]", style.text)}>{status}</span>
           <span className="font-mono text-[10px] text-subtle">
             {finished
               ? `${fmtDuration(job.createdAt, job.updatedAt)} · ${relativeTime(job.updatedAt)}`
@@ -107,16 +119,16 @@ function JobRow({ job, slug }: { job: JobSummary; slug: string }) {
         </div>
       </div>
 
-      {open && <JobDetail job={job} />}
+      {open && <JobDetail job={job} status={status} />}
     </li>
   );
 }
 
-function JobDetail({ job }: { job: JobSummary }) {
+function JobDetail({ job, status }: { job: JobSummary; status: JobStatus }) {
   const rows: Array<[string, string]> = [
     ["Job ID", job.id],
     ["Type", job.type],
-    ["Status", job.status],
+    ["Status", status],
     ["Attempts", String(job.attempts)],
     ["Created", absTime(job.createdAt)],
     ["Updated", absTime(job.updatedAt)],
