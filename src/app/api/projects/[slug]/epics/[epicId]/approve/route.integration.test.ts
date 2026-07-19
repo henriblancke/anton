@@ -169,6 +169,25 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     expect(beads.isApproved(await beads.show(repo, bug))).toBe(true);
   }, 60_000);
 
+  it("returns the post-write approved + assignee in the 200 body, not the retained pre-write snapshot", async () => {
+    // Read-after-write: the approve write only marks the board snapshot stale (retaining the
+    // pre-write beads), so building the 200 body straight off the stale-tolerant getBoard would echo
+    // the old unapproved/unclaimed values — and ClaimControl, which consumes `assignee`, would keep
+    // showing no owner until a later poll. The route forces a fresh read before responding, so the
+    // body must carry the just-written approval and the auto-claim.
+    actAs("anton-test");
+    const bug = await beads.create(repo, { title: "Fresh-body bug", type: "bug" });
+    // Warm the snapshot with the pre-write (unapproved, unclaimed) bead, reproducing the stale-read race.
+    const { allIssues } = await import("@/lib/beads/issues");
+    await allIssues(repo);
+
+    const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", bug));
+    expect(res.status).toBe(200);
+    const { item } = await res.json();
+    expect(item.approved).toBe(true);
+    expect(item.assignee).toBe("anton-test");
+  }, 60_000);
+
   it("409s a standalone task blocked by an open prerequisite, without approving it", async () => {
     // A parentless task/bug is a run target, but a `blocks` edge still gates it — its blockers
     // aren't in the epic-graph rollup, so the route derives them from the target's own edges.
