@@ -61,7 +61,7 @@ describe("issue snapshots", () => {
     expect(issueSnapshotVersion("/b")).toBe(bVersion);
   });
 
-  it("serves prior beads immediately after a local write, then refreshes in the background", async () => {
+  it("blocks a full board read on a fresh post-write load instead of serving the stale board", async () => {
     const loader = vi
       .fn<() => Promise<Bead[]>>()
       .mockResolvedValueOnce([bead("old")])
@@ -69,15 +69,26 @@ describe("issue snapshots", () => {
     await getIssueSnapshot("/repo", loader, 0);
     invalidateIssueSnapshot("/repo", true);
 
-    // A local write marks the snapshot stale but keeps last-good data: the read returns the prior
-    // beads at once (no await on the loader) and kicks a background refresh, never a cold load.
+    // A local write bumps the version but retains last-good data. A full board read must NOT hand
+    // back the stale board stamped with the advanced version (a version poll would then treat it as
+    // current) — it blocks on a fresh post-write load so write-then-navigate/server-render is fresh.
+    await expect(getIssueSnapshot("/repo", loader, 1)).resolves.toEqual([bead("new")]);
+    expect(loader).toHaveBeenCalledTimes(2);
+
+    // Once a post-write read has landed, reads serve warm again — no further load.
+    await expect(getIssueSnapshot("/repo", loader, 2)).resolves.toEqual([bead("new")]);
+    expect(loader).toHaveBeenCalledTimes(2);
+  });
+
+  it("falls back to the retained board when the post-write read fails", async () => {
+    await getIssueSnapshot("/repo", async () => [bead("old")], 0);
+    invalidateIssueSnapshot("/repo", true);
+
+    // A transient bd failure on the forced post-write read must serve last-good, never throw the
+    // render — the same fall-back the API forced-reload path relies on.
     await expect(
-      getIssueSnapshot("/repo", loader, ISSUE_SNAPSHOT_MAX_AGE_MS),
+      getIssueSnapshot("/repo", async () => Promise.reject(new Error("boom")), 1),
     ).resolves.toEqual([bead("old")]);
-    await vi.waitFor(() => expect(loader).toHaveBeenCalledTimes(2));
-    await expect(
-      getIssueSnapshot("/repo", loader, ISSUE_SNAPSHOT_MAX_AGE_MS),
-    ).resolves.toEqual([bead("new")]);
   });
 
   it("keeps a pre-write loader from repopulating post-write data", async () => {
@@ -92,22 +103,20 @@ describe("issue snapshots", () => {
 
     invalidateIssueSnapshot("/repo", true);
 
-    // The read serves the prior beads at once (stale-not-drop) and kicks a fresh post-write loader.
+    // The read blocks on a fresh post-write loader that starts after the write.
     const postWriteRead = getIssueSnapshot(
       "/repo",
       async () => [bead("post-write")],
       ISSUE_SNAPSHOT_MAX_AGE_MS,
     );
-    await expect(postWriteRead).resolves.toEqual([bead("initial")]);
+    await expect(postWriteRead).resolves.toEqual([bead("post-write")]);
 
     // The pre-write loader now resolves — its result predates the write and must be discarded.
     resolveOld([bead("pre-write")]);
     await oldRefresh;
 
-    await vi.waitFor(() =>
-      expect(
-        getIssueSnapshot("/repo", async () => [bead("post-write")], ISSUE_SNAPSHOT_MAX_AGE_MS),
-      ).resolves.toEqual([bead("post-write")]),
-    );
+    await expect(
+      getIssueSnapshot("/repo", async () => [bead("post-write")], ISSUE_SNAPSHOT_MAX_AGE_MS),
+    ).resolves.toEqual([bead("post-write")]);
   });
 });

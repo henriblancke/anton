@@ -9,6 +9,9 @@ interface SnapshotEntry {
   generation: number;
   loadedAt: number;
   refresh: Promise<Bead[]> | null;
+  // A local write bumped the version but retained last-good beads. Full board reads must block on a
+  // fresh post-write read (never serve the stale-but-version-stamped board); cleared once one lands.
+  pendingWrite: boolean;
 }
 
 const SNAPSHOTS_KEY = Symbol.for("anton.beads.issueSnapshots");
@@ -29,6 +32,7 @@ function entryFor(cwd: string): SnapshotEntry {
     generation: 0,
     loadedAt: 0,
     refresh: null,
+    pendingWrite: false,
   };
   entries.set(cwd, created);
   return created;
@@ -40,11 +44,13 @@ export function issueSnapshotVersion(cwd: string): number {
 }
 
 /**
- * Mark cached data stale while retaining it so readers keep serving last-good data and never wait
- * behind a Dolt sync/write. `localWrite` additionally bumps the version (so clients detect the
- * change) and clears any in-flight loader, forcing a fresh read that starts AFTER the write — the
- * pre-write loader is orphaned and the generation guard discards its result. Beads are retained
- * either way: a local write marks the snapshot stale, it never blanks the board.
+ * Mark cached data stale while retaining it so a background-refresh reader (the poll path) keeps
+ * serving last-good data and never waits behind a Dolt sync. `localWrite` additionally bumps the
+ * version (so clients detect the change), clears any in-flight loader — forcing a fresh read that
+ * starts AFTER the write; the pre-write loader is orphaned and the generation guard discards its
+ * result — and flags the entry pendingWrite so full board reads (`getIssueSnapshot`) block on that
+ * fresh read rather than hand back the retained board stamped with the already-advanced version.
+ * Beads are retained either way: an invalidation marks the snapshot stale, it never blanks the board.
  */
 export function invalidateIssueSnapshot(cwd: string, localWrite = false): void {
   const entry = entryFor(cwd);
@@ -54,6 +60,7 @@ export function invalidateIssueSnapshot(cwd: string, localWrite = false): void {
     entry.version += 1;
     // A post-write read must start after the write, never share a loader that started before it.
     entry.refresh = null;
+    entry.pendingWrite = true;
   }
 }
 
@@ -80,6 +87,9 @@ export function refreshIssueSnapshot(
       entry.beads = beads;
       entry.serialized = serialized;
       entry.loadedAt = now;
+      // This read started after (and its generation matches) the write, so it reflects it — the
+      // retained board is no longer the only post-write data and reads can serve warm again.
+      entry.pendingWrite = false;
       return beads;
     })
     .finally(() => {
@@ -91,7 +101,11 @@ export function refreshIssueSnapshot(
 
 /**
  * Return the last valid snapshot immediately. Cold loads wait once; stale warm loads trigger a
- * background refresh and keep serving known-good data.
+ * background refresh and keep serving known-good data. A pending local write is the exception: the
+ * retained board predates the write yet the version already advanced, so this read blocks on a
+ * fresh post-write load (falling back to last-good on a transient failure) rather than serve stale
+ * data a version poll would then treat as current — the guarantee the API forced-reload path relies
+ * on, now honored on write-then-navigate/server-render flows too.
  */
 export async function getIssueSnapshot(
   cwd: string,
@@ -99,11 +113,15 @@ export async function getIssueSnapshot(
   now = Date.now(),
 ): Promise<Bead[]> {
   const entry = entryFor(cwd);
-  if (entry.beads) {
+  const retained = entry.beads;
+  if (retained) {
+    if (entry.pendingWrite) {
+      return refreshIssueSnapshot(cwd, loader, now).catch(() => retained);
+    }
     if (now - entry.loadedAt >= ISSUE_SNAPSHOT_MAX_AGE_MS) {
       void refreshIssueSnapshot(cwd, loader, now).catch(() => {});
     }
-    return entry.beads;
+    return retained;
   }
   return refreshIssueSnapshot(cwd, loader, now);
 }
