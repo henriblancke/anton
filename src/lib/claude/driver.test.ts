@@ -614,6 +614,56 @@ describe("runClaude", () => {
     expect(isUsageLimitError(caught)).toBe(false);
   });
 
+  it("classifies an is_error result on a clean exit as recoverable when the text is transient (anton-juar)", async () => {
+    // Claude Code can surface a mid-stream drop as an error result that STILL exits 0 — e.g. a final
+    // result with is_error:true and "Connection closed mid-response". The transient classification
+    // must run here too (not only on non-zero exits), else it resolves { ok: false } → fresh restart
+    // instead of an in-place resume.
+    const bin = writeFakeClaude("iserror-exit0-claude", [
+      JSON.stringify({ type: "system", subtype: "init", session_id: "sess-ie0" }),
+      JSON.stringify({
+        type: "result",
+        subtype: "error",
+        is_error: true,
+        session_id: "sess-ie0",
+        result: "API Error: Connection closed mid-response",
+      }),
+    ]);
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    let caught: unknown;
+    try {
+      await runClaude({ cwd: dir, prompt: "do the thing" });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(isRecoverableClaudeError(caught)).toBe(true);
+    expect((caught as { sessionId?: string }).sessionId).toBe("sess-ie0");
+    expect((caught as { signature?: string }).signature).toBe("connection-closed");
+  });
+
+  it("resolves { ok: false } for an is_error result on a clean exit with no transient signal (anton-juar)", async () => {
+    // A deterministic content failure that exits 0 with is_error:true — no network/transient phrasing.
+    // It must stay a plain { ok: false } (runTicket throws → fresh restart), never a resume that would
+    // replay bad state.
+    const bin = writeFakeClaude("iserror-exit0-deterministic-claude", [
+      JSON.stringify({ type: "system", subtype: "init", session_id: "sess-ie0d" }),
+      JSON.stringify({
+        type: "result",
+        subtype: "error",
+        is_error: true,
+        session_id: "sess-ie0d",
+        result: "the agent could not satisfy the acceptance criteria",
+      }),
+    ]);
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    const result = await runClaude({ cwd: dir, prompt: "do the thing" });
+    expect(result.ok).toBe(false);
+    expect(result.isError).toBe(true);
+  });
+
   it("classifies an exit-without-result (exit 0, no result event) as recoverable (anton-juar)", async () => {
     // A truncated/interrupted stream that exits cleanly but never emits the final result event is a
     // transient death — resume-eligible, carrying the init session id.

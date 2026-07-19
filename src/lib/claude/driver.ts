@@ -364,6 +364,24 @@ export async function runClaude(opts: RunClaudeOptions): Promise<ClaudeResult> {
         return;
       }
 
+      // A run can report failure via `is_error` while still exiting 0 — Claude Code surfaces a
+      // mid-stream drop (e.g. "Connection closed mid-response") as an error result on a clean exit.
+      // Classify it over Claude's own channels (result text + stderr) so a transient death here is
+      // resume-eligible too, matching the non-zero-exit branch — otherwise it would resolve
+      // `{ ok: false }` and force a fresh restart instead of an in-place resume (anton-juar).
+      if (resultRaw.is_error) {
+        const signature = transientSignature(`${resultText ?? ""}\n${stderrBuf}`, true);
+        if (signature) {
+          reject(
+            new RecoverableClaudeError(resultText || "claude reported a transient error result", {
+              sessionId: capturedSessionId,
+              signature,
+            }),
+          );
+          return;
+        }
+      }
+
       resolve({
         ok: !resultRaw.is_error,
         sessionId: typeof resultRaw.session_id === "string" ? resultRaw.session_id : undefined,
