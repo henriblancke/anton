@@ -125,29 +125,48 @@ const SPEND_LIMIT_RESULT_RE =
   /^\s*(?:you['’]ve\s+)?(?:hit|reached) your monthly spend limit\b[\s\S]{0,80}?(?:claude\.ai\/settings\/usage|\/usage-credits\b)[^\n]*\s*$/i;
 
 /**
- * Transient/recoverable failure phrasing Claude Code emits when a run dies mid-stream from network
- * or upstream trouble rather than a deterministic code/content failure (anton-juar). A match makes
- * the failure resume-eligible: the runner retries with `claude --resume <id>` (continue in-session)
- * instead of re-running the ticket from scratch. Precision isn't load-bearing — a resume is bounded
- * and always falls back to a fresh spawn — so this errs toward recognizing recoverable causes.
- * Scanned only over Claude Code's OWN channels (stderr + the final result text), never the
- * model-authored assistant transcript, so an agent that merely writes "connection closed" in its
- * prose doesn't get misread as a transient death.
+ * Broad transient/recoverable phrasing Claude Code emits on its OWN stderr when a run dies mid-stream
+ * from network or upstream trouble (anton-juar). A match makes the failure resume-eligible: the runner
+ * retries with `claude --resume <id>` (continue in-session) instead of re-running the ticket from
+ * scratch. Includes bare HTTP status codes and generic upstream-error prose ("internal server error",
+ * "503") — safe here because stderr is a machine channel, but NOT against the model-authored result
+ * text (see `TRANSIENT_RESULT_RE`). Precision isn't load-bearing — a resume is bounded and always
+ * falls back to a fresh spawn — so this errs toward recognizing recoverable causes.
  */
-const TRANSIENT_RE =
+const TRANSIENT_STDERR_RE =
   /(connection (?:closed|reset|error|aborted)|closed mid-?response|econnreset|epipe|etimedout|socket hang ?up|network (?:error|is unreachable)|premature close|stream (?:closed|error|interrupted|truncat)|unexpected end of|overloaded|\b(?:429|500|502|503|504|529)\b|internal server error|bad gateway|service unavailable|gateway time-?out)/i;
 
 /**
- * Coarsely categorize a transient failure so the runner can refuse to resume twice on the SAME
- * signature (a resume that dies the same way escalates to a fresh restart). Returns null when the
- * text carries no recoverable signal. `hadResult` is false when the process exited without ever
- * emitting the final `result` event — a mid-stream death that is transient on its own.
+ * The subset of transient phrasing safe to match against the MODEL-AUTHORED result text. On an
+ * agent-reported failure the `result` field is the agent's own summary, so bare status codes and
+ * generic upstream-error prose are deliberately excluded: a summary that merely says "the local
+ * endpoint returned 500" must surface as a real failure, not be misread as a transient death and
+ * resumed with an "interrupted" prompt (anton-juar). Only socket/stream-level diagnostics a model
+ * won't casually type in prose remain — enough to still catch Claude Code's own error results like
+ * "Connection closed mid-response".
  */
-function transientSignature(text: string, hadResult: boolean): string | null {
-  const m = text.match(TRANSIENT_RE);
-  if (m) return m[1].toLowerCase().replace(/\s+/g, "-");
+const TRANSIENT_RESULT_RE =
+  /(connection (?:closed|reset|aborted)|closed mid-?response|econnreset|epipe|etimedout|socket hang ?up|premature close|stream (?:closed|error|interrupted|truncat)|unexpected end of)/i;
+
+/**
+ * Coarsely categorize a transient failure so the runner can refuse to resume twice on the SAME
+ * signature (a resume that dies the same way escalates to a fresh restart). stderr (Claude Code's own
+ * channel) is scanned broadly; the model-authored result text only against socket/stream-level
+ * wording. Returns null when neither channel carries a recoverable signal. `hadResult` is false when
+ * the process exited without ever emitting the final `result` event — a mid-stream death that is
+ * transient on its own.
+ */
+function transientSignature(resultText: string, stderrText: string, hadResult: boolean): string | null {
+  const stderrMatch = stderrText.match(TRANSIENT_STDERR_RE);
+  if (stderrMatch) return signatureOf(stderrMatch[1]);
+  const resultMatch = resultText.match(TRANSIENT_RESULT_RE);
+  if (resultMatch) return signatureOf(resultMatch[1]);
   if (!hadResult) return "exit-without-result";
   return null;
+}
+
+function signatureOf(raw: string): string {
+  return raw.toLowerCase().replace(/\s+/g, "-");
 }
 
 /** Best-effort extraction of a reset time (unix seconds) from claude's usage-limit text. */
@@ -337,13 +356,16 @@ export async function runClaude(opts: RunClaudeOptions): Promise<ClaudeResult> {
         initSessionId;
 
       if (code !== 0) {
-        const tail = stderrBuf.trim().slice(-2000) || `claude exited with code ${code}`;
-        const message = `claude exited with code ${code}: ${tail}`;
+        // Prefer the agent's own result summary over stderr for the surfaced message — on a
+        // deterministic failure that's where the real reason lives (anton-juar).
+        const detail = (resultText ?? "").trim() || stderrBuf.trim() || `claude exited with code ${code}`;
+        const message = `claude exited with code ${code}: ${detail.slice(-2000)}`;
         // A non-zero exit is resume-eligible only when it looks transient — a network/upstream drop
-        // in Claude Code's own channels (result text + stderr), or a death before the final result
-        // event. A deterministic non-zero exit (the agent errored, a real content failure) has a
-        // result event and no transient signal, so it stays a plain Error → today's fresh retry.
-        const signature = transientSignature(`${resultText ?? ""}\n${stderrBuf}`, resultRaw !== undefined);
+        // in Claude Code's own channels (broadly in stderr, narrowly in the model-authored result
+        // text), or a death before the final result event. A deterministic non-zero exit (the agent
+        // errored, a real content failure) has a result event and no transient signal, so it stays a
+        // plain Error → today's fresh retry.
+        const signature = transientSignature(resultText ?? "", stderrBuf, resultRaw !== undefined);
         if (signature) {
           reject(new RecoverableClaudeError(message, { sessionId: capturedSessionId, signature }));
           return;
@@ -370,7 +392,7 @@ export async function runClaude(opts: RunClaudeOptions): Promise<ClaudeResult> {
       // resume-eligible too, matching the non-zero-exit branch — otherwise it would resolve
       // `{ ok: false }` and force a fresh restart instead of an in-place resume (anton-juar).
       if (resultRaw.is_error) {
-        const signature = transientSignature(`${resultText ?? ""}\n${stderrBuf}`, true);
+        const signature = transientSignature(resultText ?? "", stderrBuf, true);
         if (signature) {
           reject(
             new RecoverableClaudeError(resultText || "claude reported a transient error result", {

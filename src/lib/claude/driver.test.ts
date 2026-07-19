@@ -716,6 +716,62 @@ describe("runClaude", () => {
     expect((caught as Error).message).toContain("claude exited with code 1");
   });
 
+  it("does NOT resume when a model-authored result summary merely mentions an upstream status code (anton-juar)", async () => {
+    // The agent's OWN final summary names a bare status code / generic upstream error as the reason a
+    // deterministic task failed. That is model-authored prose, not a Claude Code transient, so the
+    // broad status-code matcher must not fire on the result text — otherwise the real failure is lost
+    // to an "interrupted" resume. It stays a plain Error → fresh restart, and the summary is surfaced.
+    const bin = writeFakeClaude(
+      "model-status-code-claude",
+      [
+        JSON.stringify({ type: "system", subtype: "init", session_id: "sess-mac" }),
+        JSON.stringify({
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: true,
+          session_id: "sess-mac",
+          result: "The local endpoint returned 503 Service Unavailable; the migration could not run.",
+        }),
+      ],
+      1,
+    );
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    let caught: unknown;
+    try {
+      await runClaude({ cwd: dir, prompt: "do the thing" });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(isRecoverableClaudeError(caught)).toBe(false);
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain("503 Service Unavailable");
+  });
+
+  it("still resumes when Claude Code's own stderr carries an upstream status code (anton-juar)", async () => {
+    // The same status-code wording on Claude Code's OWN stderr channel IS a real transient — the broad
+    // matcher stays in force there, so the run is resume-eligible.
+    const bin = writeFakeClaude(
+      "stderr-status-code-claude",
+      [JSON.stringify({ type: "system", subtype: "init", session_id: "sess-ssc" })],
+      1,
+      "API Error: 503 Service Unavailable\n",
+    );
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    let caught: unknown;
+    try {
+      await runClaude({ cwd: dir, prompt: "do the thing" });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(isRecoverableClaudeError(caught)).toBe(true);
+    expect((caught as { sessionId?: string }).sessionId).toBe("sess-ssc");
+    expect((caught as { signature?: string }).signature).toBe("503");
+  });
+
   it("passes --resume <id> through as an argument when resumeSessionId is set (anton-juar)", async () => {
     // The fake records its argv so we can assert the resume flag reached claude.
     const argvPath = join(dir, "resume-argv.json");
