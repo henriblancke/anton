@@ -17,6 +17,7 @@ import {
 } from "@/components/ui/dialog";
 import { MetaChip, PrLink, RelativeTime, StagePill } from "@/components/atoms";
 import { ClaimControl, InheritedOwner, StaticOwner } from "@/components/board/claim-control";
+import { PrLinkControl } from "@/components/board/pr-link-control";
 import {
   AGENT_OPTIONS,
   PRIORITY_LABELS,
@@ -150,6 +151,23 @@ function TicketDialogBody({
     }
   }
 
+  // After a PR link the bead's external-ref AND stage labels change (→ in-review). Refetch the
+  // dialog's own detail, then hand the fresh detail to onSaved so the parent surface (e.g.
+  // TicketsView, which has no polling and only refreshes via onSaved/onDeleted) updates the row's
+  // stage indicator too — otherwise it shows a stale stage until the next manual save/refresh.
+  async function reloadAfterLink() {
+    try {
+      const res = await fetch(`/api/projects/${slug}/tickets/${ticketId}`);
+      if (!res.ok) return;
+      const data = (await res.json()) as { detail: TicketDetail };
+      setDetail(data.detail);
+      setDraft(draftFromDetail(data.detail));
+      onSaved?.(data.detail);
+    } catch {
+      // best-effort; the link already succeeded server-side and the board's own reads will catch up.
+    }
+  }
+
   async function remove() {
     const res = await fetch(`/api/projects/${slug}/tickets/${ticketId}`, { method: "DELETE" });
     if (!res.ok) {
@@ -228,13 +246,25 @@ function TicketDialogBody({
             · {detail.type}
           </span>
           <StagePill stage={detail.stage} />
-          {detail.prRef && (
-            <PrLink href={detail.prUrl}>
-              <MetaChip tone="pr">
-                <GitPullRequestIcon className="size-2.5" aria-hidden="true" />
-                {detail.prUrl ? "PR" : detail.prRef}
-              </MetaChip>
-            </PrLink>
+          {isRunTarget ? (
+            // A standalone task/bug carries its own PR — let it be linked/relinked here (same
+            // /epics/<id>/pr route the epic detail uses). Linking flips it to in-review.
+            <PrLinkControl
+              slug={slug}
+              itemId={detail.id}
+              prRef={detail.prRef}
+              prUrl={detail.prUrl}
+              onLinked={reloadAfterLink}
+            />
+          ) : (
+            detail.prRef && (
+              <PrLink href={detail.prUrl}>
+                <MetaChip tone="pr">
+                  <GitPullRequestIcon className="size-2.5" aria-hidden="true" />
+                  {detail.prUrl ? "PR" : detail.prRef}
+                </MetaChip>
+              </PrLink>
+            )
           )}
         </div>
         {/* claimed-by + created — mirrors the epic detail + tickets list surfaces */}

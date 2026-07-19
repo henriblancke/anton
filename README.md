@@ -239,6 +239,7 @@ Environment variables (all optional):
 | `ANTON_CLAUDE_BIN` | `claude` (on `PATH`) | override the `claude` executable anton drives |
 | `ANTON_GH_BIN` | `gh` (on `PATH`) | override the GitHub CLI executable |
 | `ANTON_STRINGER_BIN` | `stringer` (on `PATH`) | override the `stringer` executable |
+| `ANTON_USAGE_PILL` | on | live Claude usage pill (`GET /api/usage`); set falsy (`0`/`false`/`off`) to disable |
 
 ## Troubleshooting
 
