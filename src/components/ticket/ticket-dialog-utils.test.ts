@@ -15,10 +15,13 @@ import type { TicketDetail } from "@/lib/types";
 const asBead = (fields: Partial<Bead>): Bead => ({ id: "x", title: "t", status: "open", ...fields });
 
 /** The claimed-by + created metadata every TicketDetail now carries; incidental to these tests. */
-const meta = { assignee: null, createdAt: "", createdBy: null, approved: false } satisfies Pick<
-  TicketDetail,
-  "assignee" | "createdAt" | "createdBy" | "approved"
->;
+const meta = {
+  assignee: null,
+  createdAt: "",
+  createdBy: null,
+  approved: false,
+  notes: [],
+} satisfies Pick<TicketDetail, "assignee" | "createdAt" | "createdBy" | "approved" | "notes">;
 
 const detail: TicketDetail = {
   id: "bd-1",

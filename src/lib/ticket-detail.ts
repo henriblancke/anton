@@ -5,6 +5,7 @@
  */
 import { beads, type BeadPatch } from "./beads/bd";
 import { refreshAllIssues } from "./beads/issues";
+import { formatHumanNote, parseTicketNotes, type TicketNote } from "./beads/notes";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
 import { createdMeta, deriveStage, labelValue, parseAcceptance, parseGoal } from "./ticket-view";
 import { listAllBeads } from "./tickets";
@@ -32,6 +33,8 @@ function toTicketDetail(lite: Bead, full: Bead, epic: Bead | undefined): TicketD
     epicTitle: epic?.title,
     epicAssignee: epic ? (epic.assignee ?? null) : undefined,
     approved: beads.isApproved(lite),
+    // Only the full bead read carries `notes` reliably; `bd list` omits it for beads with none.
+    notes: parseTicketNotes(full.notes),
   };
 }
 
@@ -87,6 +90,47 @@ export async function updateTicket(
     .sync(project.repoPath)
     .catch((e) => console.error(`[ticket-detail] beads dolt sync failed after updating ${id}`, e));
   return detail;
+}
+
+/**
+ * Cap on one human note. The dispatch prompt inlines notes verbatim, so an unbounded note is an
+ * unbounded prompt; anything longer belongs in the ticket's contract fields, not a steer.
+ */
+export const MAX_NOTE_CHARS = 2000;
+
+/**
+ * Append a human note to a ticket and return the refreshed note history (anton-bfy4). This is the
+ * steering channel: the note lands on the bead's append-only notes blob, which the dispatch prompt
+ * builder reads when the executor picks the ticket up — no new gate, no status change.
+ *
+ * Throws on an unknown id (bd's own error, so the route can 404) or an empty/oversized note.
+ */
+export async function addTicketNote(
+  project: Project,
+  id: string,
+  text: string,
+  author: string,
+): Promise<TicketNote[]> {
+  const trimmed = text.trim();
+  if (!trimmed) throw new Error("Note is empty");
+  if (trimmed.length > MAX_NOTE_CHARS) {
+    throw new Error(`Note is too long (${trimmed.length} > ${MAX_NOTE_CHARS} characters)`);
+  }
+  await beads.show(project.repoPath, id); // 404 guard — bd throws on an unknown id
+  await beads.note(
+    project.repoPath,
+    id,
+    formatHumanNote(trimmed, author, new Date()),
+    author || undefined,
+  );
+  // Read-after-write so the response carries the note just appended, not a stale blob.
+  const fresh = await beads.show(project.repoPath, id);
+  // Fire-and-forget, like every other bd write here: the note already landed locally and the
+  // heartbeat backstop retries a failed push — never block the response on a slow remote.
+  void beads
+    .sync(project.repoPath)
+    .catch((e) => console.error(`[ticket-detail] beads dolt sync failed after noting ${id}`, e));
+  return parseTicketNotes(fresh.notes);
 }
 
 /**

@@ -2,6 +2,9 @@
  * Shared contract for the anton board slice. The API layer and the UI both build to this.
  * Stages/approval/PR are derived from beads (see DESIGN.md §2/§3), not stored in anton.db.
  */
+import type { TicketNote } from "./beads/notes";
+
+export type { TicketNote };
 
 export type Stage = "backlog" | "implementing" | "in-review" | "done";
 export const STAGES: Stage[] = ["backlog", "implementing", "in-review", "done"];
@@ -144,6 +147,7 @@ export interface TicketDetail extends Ticket {
   epicTitle?: string;
   epicAssignee?: string | null; // the parent epic's human-claim owner, inherited by this child
   approved: boolean; // has the `approved` label — locks the standalone claim control (see ClaimControl)
+  notes: TicketNote[]; // append-only note history (human steering + anton's own machine notes)
 }
 
 // ── Board drag-and-drop ──

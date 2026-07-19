@@ -496,7 +496,14 @@ export const beads = {
   setExternalRef: (cwd: string, id: string, ref: string) =>
     bdWrite(cwd, ["update", id, "--external-ref", ref]),
 
-  note: (cwd: string, id: string, text: string) => bdWrite(cwd, ["note", id, text]),
+  /**
+   * Append to a bead's notes blob (`bd note`). `actor` attributes the write in bd's audit trail —
+   * pass it for a human note so the entry isn't stamped with whatever unix user the server runs
+   * as; anton's own job notes leave it unset. The visible authorship a reader sees comes from the
+   * note header itself (see beads/notes.ts), not from bd.
+   */
+  note: (cwd: string, id: string, text: string, actor?: string) =>
+    bdWrite(cwd, ["note", id, text], actor ? { BEADS_ACTOR: actor } : undefined),
   close: (cwd: string, id: string) => bdWrite(cwd, ["close", id]),
 
   /**

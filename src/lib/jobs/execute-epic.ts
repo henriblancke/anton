@@ -9,6 +9,7 @@
 import { randomUUID } from "node:crypto";
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { ownerOf } from "../beads/claim";
+import { humanNotesPromptBlock } from "../beads/notes";
 import { computeEpicGraph, epicStandaloneBlockers, standaloneBlockers } from "../epic-graph";
 import { loadAgentPrompt } from "../claude/agent-prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
@@ -896,6 +897,11 @@ async function runTicket(args: {
     void appendSessionLog(logPath, line).catch(() => {});
   };
 
+  // Human steering (anton-bfy4) can land at any moment — including while this epic's earlier
+  // tickets were running — so the notes that reach the prompt are read HERE, at dispatch, not from
+  // the board snapshot the run started with. Best-effort: an unreadable bead just means no notes.
+  const dispatched = await withDispatchNotes(repo, ticket);
+
   let committed = false;
   try {
     const result = await runClaudeResilient({
@@ -904,7 +910,7 @@ async function runTicket(args: {
       sessionId,
       logPath,
       worktreePath,
-      ticket,
+      ticket: dispatched,
       appendSystemPrompt,
       model: settings.model,
       permissionMode: settings.permissionMode ?? "bypassPermissions",
@@ -1291,6 +1297,9 @@ function truncateField(text: string): string {
  * unreadable (issue #46 root cause #3). `bd show` is offered as a convenience, never as the sole
  * source: a bead whose spec is genuinely empty AND whose `bd show` fails is a fail-loud/blocked
  * condition, not a cue to silently produce nothing.
+ *
+ * Human notes on the bead (anton-bfy4) are appended last — the operator's steer is the freshest
+ * intent, so it reads as a refinement of the contract above it.
  */
 export function ticketPrompt(ticket: Bead): string {
   const description = ticket.description?.trim();
@@ -1314,6 +1323,12 @@ export function ticketPrompt(ticket: Bead): string {
   if (context) {
     lines.push(``, `## Context`, truncateField(context));
   }
+  // The human steering channel (anton-bfy4): notes an operator left on the bead between the gates.
+  // They come last so the freshest human intent is what the agent reads before the closing rules.
+  const humanNotes = humanNotesPromptBlock(ticket.notes);
+  if (humanNotes) {
+    lines.push(``, truncateField(humanNotes));
+  }
   lines.push(
     ``,
     `The full ticket spec is inlined above so you can implement it even if the worktree's beads ` +
@@ -1334,6 +1349,16 @@ function prBody(target: Bead, tickets: Bead[]): string {
     `🤖 Generated with [anton](https://github.com/) autonomous execution`,
   ];
   return lines.join("\n");
+}
+
+/**
+ * The ticket as it should be dispatched: the board-snapshot bead plus its CURRENT notes blob, read
+ * fresh so an operator's steer written after the run started still reaches this ticket's prompt.
+ * `bd show` failing (e.g. a locked DB) must never block the run — the snapshot bead is returned.
+ */
+async function withDispatchNotes(repo: string, ticket: Bead): Promise<Bead> {
+  const fresh = await beads.show(repo, ticket.id).catch(() => null);
+  return fresh?.notes ? { ...ticket, notes: fresh.notes } : ticket;
 }
 
 /** Swallow errors from best-effort bd side effects (already-applied labels, etc.). */

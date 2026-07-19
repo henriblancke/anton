@@ -14,6 +14,7 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { makeTestDb, type TestDb } from "../db/testing";
 import { beads } from "../beads/bd";
+import { formatHumanNote } from "../beads/notes";
 import * as schema from "../db/schema";
 import { getJob, park, resumeJob, type Clock } from "./queue";
 import { createRun } from "../runs";
@@ -66,6 +67,9 @@ function pushFreshBaseCommit(sandbox: string, bare: string, marker: string): str
   g(["push", "-q", "origin", "main"]);
   return execFileSync("git", ["rev-parse", "HEAD"], { cwd: clone, encoding: "utf8" }).trim();
 }
+
+/** The operator's steer on ticket one; asserted to reach that ticket's dispatch prompt. */
+const HUMAN_NOTE = "STEER_MARKER_BFY4 — reuse the existing helper, do not add a new one";
 
 const suite = has("bd") && has("git") ? describe : describe.skip;
 
@@ -140,6 +144,10 @@ suite("execute-epic e2e (real handler · real bd/git · fake claude/gh)", () => 
     };
     t1 = idOf(c1);
     t2 = idOf(c2);
+
+    // A human steer left on t1 between the gates (anton-bfy4) — the run must carry it into that
+    // ticket's dispatch prompt, and only that ticket's.
+    await beads.note(repo, t1, formatHumanNote(HUMAN_NOTE, "Henri Blancke", new Date(0)));
 
     // Fake claude: make a change in the worktree, dump its -p / --append-system-prompt args (so
     // the test can assert the composed system prompt reached it), emit valid stream-json, succeed.
@@ -297,6 +305,13 @@ process.exit(0);`,
     // Agent layer present only where an agent:tag exists.
     expect(forTicket(t1).append).toContain("Specialist guidance (agent)");
     expect(forTicket(t2).append).not.toContain("Specialist guidance (agent)");
+
+    // The human steer left on t1 reached ITS dispatch prompt (attributed, and only there) —
+    // anton-bfy4's whole point: a note the executor reads when it picks the ticket up.
+    expect(forTicket(t1).prompt).toContain("## Human notes on this ticket");
+    expect(forTicket(t1).prompt).toContain(HUMAN_NOTE);
+    expect(forTicket(t1).prompt).toContain("Henri Blancke");
+    expect(forTicket(t2).prompt).not.toContain(HUMAN_NOTE);
   }, 60_000);
 
   it("runs a parentless bug as an epic-of-one → branch anton/<id> → its own PR → in-review (open, not closed)", async () => {

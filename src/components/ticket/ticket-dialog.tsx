@@ -18,6 +18,7 @@ import {
 import { MetaChip, PrLink, RelativeTime, StagePill } from "@/components/atoms";
 import { ClaimControl, InheritedOwner, StaticOwner } from "@/components/board/claim-control";
 import { PrLinkControl } from "@/components/board/pr-link-control";
+import { TicketNotes } from "./ticket-notes";
 import {
   AGENT_OPTIONS,
   PRIORITY_LABELS,
@@ -383,6 +384,15 @@ function TicketDialogBody({
         onChange={(v) => set("body", v)}
         rows={6}
         placeholder="The remaining contract markdown."
+      />
+
+      <TicketNotes
+        slug={slug}
+        ticketId={ticketId}
+        notes={detail.notes}
+        // The note lands on the bead, not in the draft — merge it into the loaded detail so the
+        // history updates without a refetch and without touching the unsaved edit form.
+        onAppended={(notes) => setDetail({ ...detail, notes })}
       />
 
       <DialogFooter className="sm:justify-between">
