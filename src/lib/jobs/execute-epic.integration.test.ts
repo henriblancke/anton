@@ -1165,6 +1165,91 @@ process.exit(0);`,
     }
   }, 60_000);
 
+  it("resumes a transient mid-stream death in-session via claude --resume, completing in one tick (anton-juar)", async () => {
+    // A standalone target whose FIRST claude invocation dies mid-stream transiently (emits the
+    // system-init session id, then "Connection closed mid-response" on stderr, exit 1, NO result
+    // event, NO file change). The driver surfaces a RecoverableClaudeError carrying the init session
+    // id; runTicket resumes IN-SESSION with `claude --resume <id>` (no job reschedule), and the
+    // second invocation succeeds + commits. Proves: the same session id is resumed (argv recorded),
+    // the whole run completes in a single tick, and the session row persisted the Claude session id.
+    const target = await beads.create(repo, {
+      title: "Resilient recovery target",
+      type: "task",
+      description: "## Goal\nProve in-session resume.",
+      acceptance: "work file exists",
+    });
+    await beads.approve(repo, target);
+
+    const argvLog = join(sandbox, "resume-argv.jsonl");
+    // Counting claude: invocation 1 dies transiently (mid-stream, no result); invocation 2+ succeed.
+    // The counter lives in the worktree, shared across both invocations of the same runTicket loop.
+    const resumeClaude = writeBin(
+      binDir,
+      "claude-resume",
+      `const fs=require('fs');const path=require('path');
+const a=process.argv.slice(2);const get=f=>{const i=a.indexOf(f);return i>=0?a[i+1]:undefined;};
+fs.appendFileSync(${JSON.stringify(argvLog)},JSON.stringify({resume:get('--resume')})+'\\n');
+const counter=path.join(process.cwd(),'.resume-count');
+let n=0;try{n=parseInt(fs.readFileSync(counter,'utf8'),10)||0;}catch(e){}
+n+=1;fs.writeFileSync(counter,String(n));
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+e({type:'system',subtype:'init',session_id:'s4'});
+if(n===1){process.stderr.write('API Error: Connection closed mid-response\\n');process.exit(1);}
+fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work '+n+'\\n');
+e({type:'assistant',message:{content:[{type:'text',text:'done'}]}});
+e({type:'result',subtype:'success',result:'done',session_id:'s4',num_turns:1,is_error:false});
+process.exit(0);`,
+    );
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    process.env.ANTON_CLAUDE_BIN = resumeClaude;
+    try {
+      const jobId = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: target },
+      });
+
+      // A single tick completes: the transient death is recovered in-session, not by a job retry.
+      await runner.tickOnce();
+      await runner.whenIdle();
+
+      const job = await getJob(tdb.db, jobId);
+      expect(job?.status).toBe("done");
+      // Leased exactly once (attempts=1) and never rescheduled: the transient death was recovered
+      // in-session, so it consumed NO extra job-level retry (a fresh-restart path would have leased
+      // a second time, attempts=2).
+      expect(job?.attempts).toBe(1);
+
+      // claude was invoked twice for the one ticket: the first died, the second (a resume) succeeded.
+      const argv = readFileSync(argvLog, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+      expect(argv).toHaveLength(2);
+      expect(argv[0].resume).toBeUndefined(); // first spawn is fresh
+      expect(argv[1].resume).toBe("s4"); // retry resumes the SAME captured session id
+
+      // The Claude session id was persisted on the session row (from the init event on failure,
+      // then confirmed by the successful result).
+      const sessions = (await tdb.db.select().from(schema.sessions)).filter(
+        (s) => s.beadId === target,
+      );
+      expect(sessions).toHaveLength(1);
+      expect(sessions[0].claudeSessionId).toBe("s4");
+
+      // The run finished and reached in-review with a PR — a normal successful standalone run.
+      const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === target)!;
+      expect(run.status).toBe("done");
+      expect((await beads.show(repo, target)).labels ?? []).toContain("stage:in-review");
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+    }
+  }, 60_000);
+
   it("hard-gates on a ticket claimed by another operator: aborts without stealing the claim", async () => {
     // Shared-backlog safety: on a shared board a ticket may already be claimed by ANOTHER operator
     // (e.g. picked up after a heartbeat pull). The run must not run Claude on a ticket it doesn't

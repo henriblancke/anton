@@ -5,7 +5,7 @@
  */
 import { describe, expect, it } from "vitest";
 import type { Bead } from "../beads/bd";
-import { inactiveAgentTickets, ticketPrompt } from "./execute-epic";
+import { continuationPrompt, inactiveAgentTickets, ticketPrompt } from "./execute-epic";
 
 function ticket(id: string, labels?: string[]): Bead {
   return { id, title: id, status: "open", labels } as Bead;
@@ -127,5 +127,36 @@ describe("ticketPrompt", () => {
     } as Bead);
     expect(p).toContain("[truncated");
     expect(p).not.toContain(huge);
+  });
+});
+
+describe("continuationPrompt (anton-juar)", () => {
+  it("is a brief continuation that does not re-inline the full ticket spec", () => {
+    const t = {
+      id: "t-1",
+      title: "Do X",
+      description: "## Goal\nThe whole detailed spec body",
+      acceptance_criteria: "- [ ] everything",
+    } as Bead;
+    const p = continuationPrompt(t);
+    expect(p).toContain("t-1");
+    expect(p).toContain("resumed");
+    expect(p).toContain("do NOT");
+    // The resumed session already holds the spec, so it must not be re-inlined.
+    expect(p).not.toContain("The whole detailed spec body");
+  });
+
+  it("injects the prior error ONLY when it may be agent-caused (oversized output/context)", () => {
+    const t = { id: "t-1", title: "Do X", status: "open" } as Bead;
+    const agentCaused = continuationPrompt(t, "API Error: prompt is too long: 250000 tokens > 200000");
+    expect(agentCaused).toContain("prompt is too long");
+    expect(agentCaused).toContain("adjust your approach");
+  });
+
+  it("does NOT inject a pure-infra error the agent can't act on", () => {
+    const t = { id: "t-1", title: "Do X", status: "open" } as Bead;
+    const infra = continuationPrompt(t, "claude exited with code 1: Connection closed mid-response");
+    expect(infra).not.toContain("Connection closed mid-response");
+    expect(infra).not.toContain("adjust your approach");
   });
 });

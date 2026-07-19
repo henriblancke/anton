@@ -3,10 +3,10 @@
  * usage-limit detection against fake claude binaries (no network / no real claude needed).
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isUsageLimitError } from "../jobs/errors";
+import { isRecoverableClaudeError, isUsageLimitError } from "../jobs/errors";
 import { CLAUDE_BIN_ENV, runClaude, type ClaudeEvent } from "./driver";
 
 let dir: string;
@@ -588,5 +588,104 @@ describe("runClaude", () => {
 
     expect(result.ok).toBe(true);
     expect(result.text).toBe("ok");
+  });
+
+  it("surfaces a transient mid-stream death as a RecoverableClaudeError carrying the init session id (anton-juar)", async () => {
+    // A run that emits the `system` init event (carrying session_id) and then dies mid-stream —
+    // "Connection closed mid-response" on stderr, exit 1, NO final result event. The session id is
+    // captured from init (not the missing result), and the failure classifies transient/resume-eligible.
+    const bin = writeFakeClaude(
+      "midstream-death-claude",
+      [JSON.stringify({ type: "system", subtype: "init", session_id: "sess-mid" })],
+      1,
+      "API Error: Connection closed mid-response\n",
+    );
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    let caught: unknown;
+    try {
+      await runClaude({ cwd: dir, prompt: "do the thing" });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(isRecoverableClaudeError(caught)).toBe(true);
+    expect((caught as { sessionId?: string }).sessionId).toBe("sess-mid");
+    expect(isUsageLimitError(caught)).toBe(false);
+  });
+
+  it("classifies an exit-without-result (exit 0, no result event) as recoverable (anton-juar)", async () => {
+    // A truncated/interrupted stream that exits cleanly but never emits the final result event is a
+    // transient death — resume-eligible, carrying the init session id.
+    const bin = writeFakeClaude("no-result-claude", [
+      JSON.stringify({ type: "system", subtype: "init", session_id: "sess-noresult" }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "working" }] } }),
+    ]);
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    let caught: unknown;
+    try {
+      await runClaude({ cwd: dir, prompt: "do the thing" });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(isRecoverableClaudeError(caught)).toBe(true);
+    expect((caught as { sessionId?: string }).sessionId).toBe("sess-noresult");
+    expect((caught as { signature?: string }).signature).toBe("exit-without-result");
+  });
+
+  it("does NOT classify a deterministic non-zero exit (real result, no transient signal) as recoverable (anton-juar)", async () => {
+    // The agent genuinely errored: a real result event, exit 1, no network/transient phrasing. This
+    // must stay a plain Error so the runner does a fresh restart / park — resuming would replay bad state.
+    const bin = writeFakeClaude(
+      "deterministic-fail-claude",
+      [
+        JSON.stringify({ type: "system", subtype: "init", session_id: "sess-det" }),
+        JSON.stringify({
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: true,
+          session_id: "sess-det",
+          result: "the tool call failed with a syntax error",
+        }),
+      ],
+      1,
+    );
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    let caught: unknown;
+    try {
+      await runClaude({ cwd: dir, prompt: "do the thing" });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(isRecoverableClaudeError(caught)).toBe(false);
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain("claude exited with code 1");
+  });
+
+  it("passes --resume <id> through as an argument when resumeSessionId is set (anton-juar)", async () => {
+    // The fake records its argv so we can assert the resume flag reached claude.
+    const argvPath = join(dir, "resume-argv.json");
+    const path = join(dir, "resume-claude");
+    const body = [
+      "#!/usr/bin/env node",
+      `require('fs').writeFileSync(${JSON.stringify(argvPath)}, JSON.stringify(process.argv.slice(2)));`,
+      `process.stdout.write(JSON.stringify({ type: 'result', is_error: false, session_id: 'sess-r', result: 'ok' }) + "\\n");`,
+      "",
+    ].join("\n");
+    writeFileSync(path, body, "utf8");
+    chmodSync(path, 0o755);
+    process.env[CLAUDE_BIN_ENV] = path;
+
+    const result = await runClaude({ cwd: dir, prompt: "continue", resumeSessionId: "sess-abc" });
+
+    expect(result.ok).toBe(true);
+    const argv: string[] = JSON.parse(readFileSync(argvPath, "utf8"));
+    const i = argv.indexOf("--resume");
+    expect(i).toBeGreaterThanOrEqual(0);
+    expect(argv[i + 1]).toBe("sess-abc");
   });
 });

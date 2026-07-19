@@ -9,7 +9,7 @@
  * shared `UsageLimitError` so the runner parks + reschedules (never a plain throw).
  */
 import { spawn } from "node:child_process";
-import { UsageLimitError } from "../jobs/errors";
+import { RecoverableClaudeError, UsageLimitError } from "../jobs/errors";
 
 /** Override the claude binary (tests point this at a fake stream-json emitter). */
 export const CLAUDE_BIN_ENV = "ANTON_CLAUDE_BIN";
@@ -49,6 +49,12 @@ export interface RunClaudeOptions {
   permissionMode?: "default" | "acceptEdits" | "bypassPermissions" | "plan";
   /** Restrict tools (--allowedTools), optional. */
   allowedTools?: string[];
+  /**
+   * Resume an existing Claude session (`--resume <id>`) instead of starting fresh (anton-juar).
+   * Set on a retry after a transient mid-stream death: the run continues with the full in-session
+   * conversation, so `prompt` should be a brief continuation, not the whole ticket spec again.
+   */
+  resumeSessionId?: string;
   /** Abort the child (lease lost / run cancelled). */
   signal?: AbortSignal;
   /** Streamed events (append to session log, push to SSE). */
@@ -117,6 +123,32 @@ const SPEND_LIMIT_RE =
  */
 const SPEND_LIMIT_RESULT_RE =
   /^\s*(?:you['’]ve\s+)?(?:hit|reached) your monthly spend limit\b[\s\S]{0,80}?(?:claude\.ai\/settings\/usage|\/usage-credits\b)[^\n]*\s*$/i;
+
+/**
+ * Transient/recoverable failure phrasing Claude Code emits when a run dies mid-stream from network
+ * or upstream trouble rather than a deterministic code/content failure (anton-juar). A match makes
+ * the failure resume-eligible: the runner retries with `claude --resume <id>` (continue in-session)
+ * instead of re-running the ticket from scratch. Precision isn't load-bearing — a resume is bounded
+ * and always falls back to a fresh spawn — so this errs toward recognizing recoverable causes.
+ * Scanned only over Claude Code's OWN channels (stderr + the final result text), never the
+ * model-authored assistant transcript, so an agent that merely writes "connection closed" in its
+ * prose doesn't get misread as a transient death.
+ */
+const TRANSIENT_RE =
+  /(connection (?:closed|reset|error|aborted)|closed mid-?response|econnreset|epipe|etimedout|socket hang ?up|network (?:error|is unreachable)|premature close|stream (?:closed|error|interrupted|truncat)|unexpected end of|overloaded|\b(?:429|500|502|503|504|529)\b|internal server error|bad gateway|service unavailable|gateway time-?out)/i;
+
+/**
+ * Coarsely categorize a transient failure so the runner can refuse to resume twice on the SAME
+ * signature (a resume that dies the same way escalates to a fresh restart). Returns null when the
+ * text carries no recoverable signal. `hadResult` is false when the process exited without ever
+ * emitting the final `result` event — a mid-stream death that is transient on its own.
+ */
+function transientSignature(text: string, hadResult: boolean): string | null {
+  const m = text.match(TRANSIENT_RE);
+  if (m) return m[1].toLowerCase().replace(/\s+/g, "-");
+  if (!hadResult) return "exit-without-result";
+  return null;
+}
 
 /** Best-effort extraction of a reset time (unix seconds) from claude's usage-limit text. */
 function parseResetAt(text: string | undefined): number | undefined {
@@ -193,6 +225,9 @@ export async function runClaude(opts: RunClaudeOptions): Promise<ClaudeResult> {
   const bin = process.env[CLAUDE_BIN_ENV] ?? "claude";
 
   const args = ["-p", opts.prompt, "--output-format", "stream-json", "--verbose"];
+  // Resume an interrupted session in-place (anton-juar) — continue the same conversation rather than
+  // spawning fresh. Placed first so it reads clearly in the recorded argv; order is otherwise moot.
+  if (opts.resumeSessionId) args.unshift("--resume", opts.resumeSessionId);
   if (opts.appendSystemPrompt) args.push("--append-system-prompt", opts.appendSystemPrompt);
   if (opts.model) args.push("--model", opts.model);
   args.push("--permission-mode", opts.permissionMode ?? "bypassPermissions");
@@ -209,6 +244,10 @@ export async function runClaude(opts: RunClaudeOptions): Promise<ClaudeResult> {
     let stdoutBuf = "";
     let stderrBuf = "";
     let resultRaw: Record<string, unknown> | undefined;
+    // Claude's session id captured from the `system` init event — emitted at session start, BEFORE
+    // any work. Held separately so a mid-stream death that never reaches the final `result` event
+    // still surfaces an id the runner can `claude --resume` (anton-juar).
+    let initSessionId: string | undefined;
     // All human-readable text Claude emitted (assistant + result), so the usage-limit scan sees
     // the quota signal wherever it lands — Claude Code has surfaced "usage limit reached" in the
     // final result field, in an assistant text block, or on stderr depending on how it exited.
@@ -226,6 +265,9 @@ export async function runClaude(opts: RunClaudeOptions): Promise<ClaudeResult> {
         return;
       }
       if (parsed.type === "result") resultRaw = parsed;
+      if (parsed.type === "system" && typeof parsed.session_id === "string") {
+        initSessionId = parsed.session_id;
+      }
       for (const event of toEvents(parsed)) {
         if (event.text) transcript += `${event.text}\n`;
         opts.onEvent?.(event);
@@ -283,14 +325,38 @@ export async function runClaude(opts: RunClaudeOptions): Promise<ClaudeResult> {
         }
       }
 
+      // The session id for `--resume`: the final result carries it on a clean exit, but a mid-stream
+      // death may never emit that event, so fall back to the id captured from the `system` init
+      // event (anton-juar).
+      const capturedSessionId =
+        (resultRaw && typeof resultRaw.session_id === "string" ? resultRaw.session_id : undefined) ??
+        initSessionId;
+
       if (code !== 0) {
         const tail = stderrBuf.trim().slice(-2000) || `claude exited with code ${code}`;
-        reject(new Error(`claude exited with code ${code}: ${tail}`));
+        const message = `claude exited with code ${code}: ${tail}`;
+        // A non-zero exit is resume-eligible only when it looks transient — a network/upstream drop
+        // in Claude Code's own channels (result text + stderr), or a death before the final result
+        // event. A deterministic non-zero exit (the agent errored, a real content failure) has a
+        // result event and no transient signal, so it stays a plain Error → today's fresh retry.
+        const signature = transientSignature(`${resultText ?? ""}\n${stderrBuf}`, resultRaw !== undefined);
+        if (signature) {
+          reject(new RecoverableClaudeError(message, { sessionId: capturedSessionId, signature }));
+          return;
+        }
+        reject(new Error(message));
         return;
       }
 
       if (!resultRaw) {
-        reject(new Error("claude exited without a result event"));
+        // Exited 0 but never emitted the final result event — a truncated/interrupted stream. This is
+        // a transient mid-stream death, so it's resume-eligible (anton-juar).
+        reject(
+          new RecoverableClaudeError("claude exited without a result event", {
+            sessionId: capturedSessionId,
+            signature: "exit-without-result",
+          }),
+        );
         return;
       }
 

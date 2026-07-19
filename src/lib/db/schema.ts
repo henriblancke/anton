@@ -94,6 +94,9 @@ export const sessions = sqliteTable("sessions", {
   beadId: text("bead_id"),
   status: text("status").notNull().default("running"),
   logPath: text("log_path"),
+  // Claude's own session id (from the stream-json result / system-init event), persisted so a
+  // transient mid-stream death can be retried with `claude --resume <id>` (anton-juar).
+  claudeSessionId: text("claude_session_id"),
   startedAt: ts("started_at").notNull().default(now),
   endedAt: ts("ended_at"),
 });
