@@ -2,7 +2,9 @@
  * execute-epic job (anton-dzh.4). For an approved epic: warm a worktree, then per ticket run
  * `claude` (with the ticket's agent prompt) → run tests → commit; when all tickets are done, open
  * ONE PR via `gh` and move the epic to in-review. Idempotent/resumable — a re-run (crash, quota
- * backoff) skips tickets already closed and reuses the existing worktree. See DESIGN.md §4/§7.
+ * backoff) reuses the existing worktree and skips tickets already closed WHOSE COMMIT is on this
+ * branch; a cross-machine resume re-runs a board-closed ticket whose commit never got pushed. See
+ * DESIGN.md §4/§7.
  */
 import { randomUUID } from "node:crypto";
 import { beads, LABELS, type Bead } from "../beads/bd";
@@ -12,8 +14,14 @@ import { loadAgentPrompt } from "../claude/agent-prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
 import { runClaude, type ClaudeEvent } from "../claude/driver";
 import { formatAntonResult, parseAntonResult } from "../claude/anton-result";
-import { commitAll, openPullRequest, resolveFreshBase } from "../git/ops";
-import { createWorktree, removeWorktree } from "../git/worktree";
+import {
+  commitAll,
+  openPullRequest,
+  pullRequestState,
+  resolveFreshBase,
+  worktreeHasCommitFor,
+} from "../git/ops";
+import { createWorktree, findWorktree, removeWorktree } from "../git/worktree";
 import {
   getProjectById,
   getProjectSettings,
@@ -28,7 +36,7 @@ import {
 } from "../runs";
 import { appendSessionLog, createSession, endSession, sessionLogPath } from "../sessions";
 import { buildPrTitle } from "./pr-title";
-import { isUsageLimitError } from "./errors";
+import { isUsageLimitError, isRunAlreadyLiveError, RunAlreadyLiveError } from "./errors";
 import { runVerifyGates } from "./shell";
 import type { AntonDb, Clock } from "./queue";
 import { systemClock } from "./queue";
@@ -38,6 +46,29 @@ export interface ExecuteEpicPayload {
   projectId: string;
   epicBeadId: string;
 }
+
+/**
+ * Cross-machine run-liveness lease (anton-jz1). While a run executes, it publishes a
+ * `run-lease:<expiry>` label on the target (the shared beads board) and refreshes it every
+ * `RUN_LEASE_REFRESH_MS`; a Force run on another machine reads this and won't double-run a live
+ * epic. TTL is comfortably longer than the refresh gap so a slow tick never lapses a live lease,
+ * yet short enough that a crashed/killed machine (which stops refreshing) frees the epic for
+ * re-trigger within the window. The lease is cleared when the run settles (below), so a
+ * parked/failed/finished run is immediately re-triggerable without waiting out the TTL.
+ */
+const RUN_LEASE_TTL_MS = 15 * 60_000;
+const RUN_LEASE_REFRESH_MS = 5 * 60_000;
+/**
+ * Propagation window the post-publish race arbitration (step 1b) settles for before it trusts an
+ * uncontested read (anton-jz1). Concluding a run "won" from seeing only its OWN lease is a decision
+ * made on the ABSENCE of a foreign lease, and absence is unreliable on an eventually-consistent
+ * board: a machine that force-ran the same epic at the same instant may not have propagated its lease
+ * yet, so a fast publish→read can miss it. Waiting a bounded window (comfortably above sync round-trip
+ * latency, far below the TTL) lets a near-simultaneous foreign lease reach the remote before we
+ * re-read and commit to running. This narrows — like the rest of this protocol, it can't fully close
+ * without a real cross-machine lock — the asymmetric-read window the reviewer flagged.
+ */
+const RUN_LEASE_SETTLE_MS = 2_000;
 
 export interface ExecuteEpicDeps {
   db: AntonDb;
@@ -64,8 +95,8 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     // is an epic OR a parentless task/bug run as an epic-of-one (isRunTarget). Distinguish the two
     // non-runnable cases so the poison message is honest: a bead that WAS found but isn't a valid
     // target must not read "not found" (that sends the operator hunting for a missing bead).
-    const all = await beads.list(repo, ["--status", "all"]);
-    const target = all.find((b) => b.id === epicBeadId);
+    let all = await beads.list(repo, ["--status", "all"]);
+    let target = all.find((b) => b.id === epicBeadId);
     if (!target) throw new PoisonEpic(`bead ${epicBeadId} not found on the board`);
     if (!beads.isRunTarget(target)) {
       const parent = (target.parent ?? target.parent_id) as string | undefined;
@@ -79,22 +110,32 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       throw new PoisonEpic(`target ${epicBeadId} is not approved — refusing to execute`);
     }
 
+    // Compute the epic's open blockers from a board snapshot. An epic's blockers come from the
+    // epic-graph rollup; a standalone task/bug (epic-of-one) never appears there, so derive its
+    // blockers from its own `blocks` edges. An epic also inherits any open standalone (parentless
+    // task/bug) prerequisite that the epic-graph rollup drops (epicStandaloneBlockers) — the same
+    // gap the approve route closes. The epic-vs-standalone shape can't change across a pull, so
+    // capture it here (while `target` is narrowed) and reuse it against the freshly-pulled board in
+    // step 0 — `target` is a `let` reassigned there, so reading it inside this closure would widen
+    // back to `Bead | undefined`.
+    const targetIsEpic = beads.isEpic(target);
+    const computeBlockers = (board: Bead[]): string[] =>
+      targetIsEpic
+        ? [
+            ...(computeEpicGraph(board).epics.find((n) => n.id === epicBeadId)?.blockedBy ?? []),
+            ...epicStandaloneBlockers(board, epicBeadId),
+          ]
+        : standaloneBlockers(board, epicBeadId);
+
     // Re-check the same readiness gate the approval route enforces, now at job start. Approval only
     // guarantees readiness at approval time; between then and this lease a `blocks` edge could have
     // been added or pulled in via Dolt sync (a shared board), leaving this job queued behind a
-    // blocker that's no longer done. An epic's blockers come from the epic-graph rollup; a
-    // standalone task/bug (epic-of-one) never appears there, so derive its blockers from its own
-    // `blocks` edges. Either way, derive from the fresh `all` read above and PARK if a blocker is
-    // open — starting still-blocked work would violate the sequence. Recoverable: once the
-    // blocker completes, resuming the parked job re-reads beads and passes this gate.
-    // An epic also inherits any open standalone (parentless task/bug) prerequisite that the
-    // epic-graph rollup drops (epicStandaloneBlockers) — the same gap the approve route closes.
-    const blockers = beads.isEpic(target)
-      ? [
-          ...(computeEpicGraph(all).epics.find((n) => n.id === epicBeadId)?.blockedBy ?? []),
-          ...epicStandaloneBlockers(all, epicBeadId),
-        ]
-      : standaloneBlockers(all, epicBeadId);
+    // blocker that's no longer done. Derive from the fresh `all` read above and PARK if a blocker is
+    // open — starting still-blocked work would violate the sequence. Recoverable: once the blocker
+    // completes, resuming the parked job re-reads beads and passes this gate. Re-checked again in
+    // step 0 after the cross-machine pull refreshes `all` (a blocker another machine pushed since
+    // would be invisible to this pre-pull snapshot).
+    const blockers = computeBlockers(all);
     if (blockers.length > 0) {
       throw new PoisonEpic(
         `${epicBeadId} is blocked by ${blockers.join(", ")} — refusing to execute; ` +
@@ -106,7 +147,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     // (an epic-of-one). The rest of the pipeline — worktree, per-ticket claude→tests→commit→close,
     // one PR — is identical either way, so the standalone case is just a one-element ticket list.
     const standaloneRun = !beads.isEpic(target);
-    const tickets = standaloneRun ? [target] : childrenOf(all, epicBeadId);
+    let tickets = standaloneRun ? [target] : childrenOf(all, epicBeadId);
     if (tickets.length === 0) throw new PoisonEpic(`epic ${epicBeadId} has no tickets`);
 
     // Branches keep the `prefix/id` slash (git convention); only the worktree *path* segment is
@@ -129,17 +170,234 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       await updateRun(db, clock, runId, { status: "running", error: null });
     }
 
+    // Cross-machine run-liveness lease (anton-jz1). `leaseLabels` tracks the run-lease labels this
+    // run OWNS — its published lease plus any leftover leases it adopted to sweep. Start EMPTY so the
+    // `finally` never clears a lease this run never took ownership of: in particular the foreign-lease
+    // gate at the top of the try (below) parks before adopting anything, so the other machine's live
+    // lease is left intact. Declared out here so the `finally` can tear the refresh timer down and
+    // clear the lease on settle. `runId` stamps the owner onto every publish so a later resume can
+    // tell this run's own crash leftover from another machine's live lease.
+    let leaseLabels: string[] = [];
+    let leaseTimer: ReturnType<typeof setInterval> | null = null;
+    // Set true in `finally` so a refresh tick that hasn't started yet no-ops instead of publishing a
+    // fresh lease after settle; `leaseRefreshInFlight` tracks the tail of the serialized refresh
+    // chain (each tick chains onto it rather than overwriting — see the setInterval below) so
+    // `finally` can await every queued/in-flight refresh before clearing the label (otherwise a slow
+    // refresh write could re-publish an unexpired lease after the clear and leave the epic looking
+    // live until TTL — anton-jz1).
+    let leaseSettled = false;
+    let leaseRefreshInFlight: Promise<void> = Promise.resolve();
+    // Expiry (ms) of the last lease this run PUSHED to the shared remote — advanced only after the
+    // push confirms, so it tracks remote-visible liveness, not just a local write. The cooperative
+    // `assertLeaseHeld` guard reads it to park the run before a lease whose refresh pushes have been
+    // failing silently lapses past its TTL and another machine treats the epic as free (anton-jz1).
+    let leaseExpiry = 0;
+    // Publish/refresh this run's lease. Advances `leaseLabels` ONLY after the write lands (not
+    // best-effort like the other bd writes): a swallowed failure that still advanced the tracked
+    // label would let `finally` clear a label that isn't on the board while the real prior lease
+    // lingers until TTL, and would report a shared lease that was never written. So this throws on
+    // failure — the initial publish fails closed (a run holding no shared lease could be double-run
+    // by another machine), while the refresh timer catches + logs instead of crashing the process.
+    const publishLease = async () => {
+      const exp = clock.now() + RUN_LEASE_TTL_MS;
+      await beads.publishRunLease(repo, epicBeadId, exp, leaseLabels, runId);
+      leaseLabels = [LABELS.runLease(exp, runId)];
+      // Pushing the lease to the shared remote is REQUIRED, not a fire-and-forget nudge (anton-jz1):
+      // the cross-machine guard only holds if OTHER machines' liveRunCheck can read this lease off the
+      // Dolt remote, so a lease that lands locally but never pushes is invisible to them and lets them
+      // double-run the epic. Await the push and let it throw on failure — the caller decides what a
+      // failed publish means: the initial publish (step 1) fails the run closed; a refresh tick logs
+      // and, because `leaseExpiry` is advanced only AFTER the push confirms below, leaves it un-bumped
+      // so `assertLeaseHeld` parks the run before the stale lease lapses. `beads.sync` tolerates a
+      // no-remote workspace (resolves without pushing), so a single-machine run advances normally.
+      await beads.sync(repo);
+      leaseExpiry = exp;
+    };
+
     try {
+      // 0. Cross-machine double-run guard (anton-jz1). A queued job that reschedules (quota/backoff)
+      //    re-enters this handler WITHOUT the enqueue-time liveRunCheck. If a Force run started on
+      //    ANOTHER machine while this job was parked/backing off, the target now carries that
+      //    machine's unexpired run-lease. Pull the shared board and re-read the target FRESH before
+      //    deciding: the `all` snapshot up top was taken before any of this setup, so a lease another
+      //    machine published since (the sync heartbeat is periodic) would be invisible to a check
+      //    against that stale bead and this gate would miss the concurrent run. Publishing our own
+      //    lease (below) sweeps `leaseLabels`, so overwriting a foreign one would let BOTH machines
+      //    run the epic at once — the exact double-run this lease exists to prevent. Treat a foreign
+      //    live lease as a park/retry: RunAlreadyLiveError reschedules this job (refunding the
+      //    attempt) to re-check once that run settles and clears its lease. This run's OWN lease
+      //    (same runId, e.g. stranded by a crashed prior attempt) is not foreign and is adopted just
+      //    below as a sweep leftover. Checked before any claim/worktree/session work so a run never
+      //    half-executes into a concurrent one. Best-effort pull: a failure degrades to the last
+      //    local snapshot rather than blocking a legitimate run.
+      //    Track whether this pre-check ran against a TRUSTED (fresh) board read. A stale snapshot —
+      //    the pull failed, or the show fell back to the top-of-handler `all` — can hide an
+      //    already-live incumbent lease published by a run that started earlier. That incumbent only
+      //    arbitrates the lease at ITS OWN startup and keeps running regardless of what we decide, so
+      //    the post-publish race arbitration (step 1b) must NOT steal the lease from it by owner order
+      //    when our pre-check couldn't rule it out (anton-jz1).
+      let preCheckTrusted = true;
+      try {
+        await beads.pull(repo);
+      } catch {
+        preCheckTrusted = false; // stale local snapshot — an incumbent lease may be invisible below
+      }
+      let leaseTarget = target;
+      try {
+        leaseTarget = await beads.show(repo, epicBeadId);
+      } catch {
+        preCheckTrusted = false; // fell back to the stale top-of-handler snapshot
+      }
+
+      // Re-derive the ticket list from the freshly-pulled board (anton-jz1). `all`/`target`/`tickets`
+      // up top were read BEFORE the pull above, so on a cross-machine retry a child ticket another
+      // machine closed — then crashed before stamping `external_ref` — still shows OPEN in that stale
+      // snapshot. The ticket loop (step 4) skips only tickets whose status is `closed`, so iterating
+      // the stale list would re-run claude and re-commit work the just-pulled board already reflects as
+      // done. Re-list here so those remotely-closed tickets are skipped. Best-effort like the pull: a
+      // failed re-list keeps the pre-pull snapshot (no worse than before this refresh existed). The
+      // epic/standalone shape can't change across a pull, so `standaloneRun` is derived once above.
+      try {
+        const fresh = await beads.list(repo, ["--status", "all"]);
+        const freshTarget = fresh.find((b) => b.id === epicBeadId);
+        if (freshTarget) {
+          all = fresh;
+          target = freshTarget;
+          tickets = standaloneRun ? [target] : childrenOf(all, epicBeadId);
+          // Adopt the fresh bead for the liveness gates too (anton-jz1). When the `show` above failed
+          // but this list succeeds, `leaseTarget` still points at the stale pre-pull snapshot — yet the
+          // completion short-circuit (step 0a, reads `external_ref`) and the foreign-lease gate below
+          // read `leaseTarget`. Leaving it stale would let a run whose completion/lease is visible in
+          // this fresh list fall through into worktree/PR handling instead of finishing idempotently.
+          leaseTarget = freshTarget;
+        }
+      } catch {
+        // keep the pre-pull snapshot
+      }
+
+      // 0a. Revalidate the target still needs execution (anton-jz1). A job that parked on a foreign
+      //     live lease (foreignRunLeaseLive below) or lost the publish race (step 1b) reschedules and
+      //     re-enters this handler once that lease clears — but the run that HELD the lease may have
+      //     already carried this epic all the way to in-review: opened the PR, stamped the external
+      //     ref, and cleared its lease on settle. Without this gate the loser would proceed, skip the
+      //     already-closed tickets, and re-enter the PR step — creating a duplicate/empty PR or parking
+      //     on a `gh "a pull request already exists"` failure. The external ref is set ONLY by a
+      //     completed PR step (step 5, setExternalRef), but its mere PRESENCE is NOT proof another run
+      //     finished: review-fix deliberately LEAVES the ref on a bead whose PR was CLOSED without
+      //     merging so a Run/Force run can recover it. So a ref only marks completion when its PR is
+      //     still live — open (review in flight) or merged; a closed-unmerged ref is stale and must
+      //     fall through to the recovery path below (checked via `pullRequestState`). Nothing is left
+      //     for execute-epic to do only in the live/merged case, so there we finish this attempt as
+      //     done (idempotent) and settle this machine's run row rather than redoing covered work.
+      //     Checked BEFORE the foreign-lease gate so a still-lingering lease from the finishing run
+      //     can't re-park an epic that's already complete, and BEFORE adopting/publishing any lease so
+      //     `finally` clears nothing we don't own. A stale board read (pull/show failed) simply won't
+      //     show the ref yet and falls through to the lease gate below.
+      if (leaseTarget.external_ref) {
+        // Distinguish a stale (closed-without-merging) ref from one that proves completion (anton-jz1).
+        // Only an OPEN or MERGED PR means another run carried this epic to the finish; a CLOSED-unmerged
+        // ref is what review-fix leaves for recovery, so DON'T short-circuit on it — fall through and let
+        // this run re-open the PR. An UNKNOWN state (no `gh`, a network/CLI error, an unparseable ref) is
+        // proof of NOTHING and must not be mistaken for either: treating it as done would strand a
+        // genuinely-closed epic that a retry could recover, while falling through with a genuinely-merged
+        // ref would run `gh pr create` on a branch with no diff and fail the run. So retry on unknown with
+        // a COUNTING error (a plain throw, NOT RunAlreadyLiveError): a transient gh/network hiccup
+        // self-heals within the retry budget, but a permanently-unreadable ref (gh missing, broken auth,
+        // malformed ref) exhausts `maxAttempts` and PARKS for a human instead of retrying forever.
+        // RunAlreadyLiveError is reserved for real lease/liveness conflicts, which the runner refunds and
+        // retries indefinitely because a foreign run may legitimately hold the lease for a long time — an
+        // unreadable ref is a local failure to resolve, not that, so it must count against the budget.
+        const prState = await pullRequestState(repo, leaseTarget.external_ref);
+        if (prState === "unknown") {
+          throw new Error(
+            `${epicBeadId} carries a PR ref but its state can't be read (gh unavailable or the ref is ` +
+              `unparseable) — retrying rather than treating an unreadable PR as a completed run; a ` +
+              `transient gh outage self-heals within the retry budget, a permanently-unreadable ref ` +
+              `parks for a human`,
+          );
+        }
+        if (prState === "open" || prState === "merged") {
+          // Sweep this run's OWN leftover lease before the idempotent short-circuit (anton-jz1). If this
+          // attempt resumes after a crash that landed the external ref (step 5, setExternalRef) but died
+          // before `finally` cleared its run-lease, `leaseTarget` still carries an unexpired
+          // `run-lease:…:<runId>` this run published. The general lease-adoption step (`leaseLabels =
+          // runLeaseLabels(...)`) runs AFTER this return, so without adopting here `finally` would clear
+          // nothing and other machines would keep seeing the epic as live until the TTL even though its
+          // PR is already open. Adopt only OUR OWN lease (matched by runId) so `finally` clears it; a
+          // foreign machine's lease is left for its own owner/TTL, honoring "finally clears only what we
+          // own" (the same reason this gate precedes the general adoption below).
+          leaseLabels = beads.ownRunLeaseLabels(leaseTarget, runId);
+          // Restore the in-review board state before returning (anton-jz1). An epic run that crashed
+          // AFTER setExternalRef (step 5) but before the stage updates at the tail of step 5 leaves the
+          // epic on stage:implementing with no stage:in-review. review-fix sweeps only stage:in-review
+          // targets (see review-fix.ts), so without re-applying it here the run is marked done yet its
+          // PR never enters the automated review/finalization path. Idempotent — a run that already
+          // tagged in-review re-tags harmlessly. Standalone targets get in-review from runTicket on
+          // commit (before the ref is ever set), so only the epic path needs this here.
+          if (!standaloneRun) {
+            await safe(() => beads.tag(repo, epicBeadId, [LABELS.stage("in-review")]));
+            await safe(() => beads.untag(repo, epicBeadId, [LABELS.stage("implementing")]));
+          }
+          // Clean up any worktree a prior attempt left behind before short-circuiting (anton-jz1). A
+          // resume that crashed AFTER the worktree-warm step (step 2 stamps `worktreePath` on the run
+          // row) leaves the git worktree registered/on disk; this idempotent return skips the normal
+          // `removeWorktree` finalization (step 6), so without this the run is marked done yet its
+          // worktree lingers. Locate it by branch and remove it best-effort — a no-op when this resume
+          // never created one.
+          await safe(async () => {
+            const staleWorktree = await findWorktree(repo, branch);
+            if (staleWorktree) await removeWorktree(staleWorktree);
+          });
+          await updateRun(db, clock, runId, { status: "done", endedAt: clock.now(), error: null });
+          return;
+        }
+        // Closed-without-merging ref → stale. Fall through to recover the epic: the foreign-lease gate
+        // and general lease adoption below run as usual (nothing adopted here so `finally` owns only what
+        // the recovery path takes), the closed tickets are skipped, and step 5 re-opens the PR.
+      }
+
+      // 0a-bis. Re-run the job-start readiness gate against the freshly-pulled board (anton-jz1).
+      //     The top-of-handler `blockers` check ran on the PRE-pull `all`, so a `blocks` edge
+      //     another machine pushed before this pull is invisible there — and the `fresh` adoption
+      //     above swapped `all`/`tickets` to the pulled board WITHOUT re-checking readiness, which
+      //     would let this path execute a now-blocked epic and bypass the gate. Recompute from the
+      //     adopted board and PARK if a blocker reopened (recoverable, same as the top gate).
+      //     Checked AFTER the completion short-circuit (step 0a) so a genuinely-finished epic still
+      //     takes the idempotent "done" path instead of parking, and BEFORE adopting/publishing any
+      //     lease (below) so a park leaves nothing for `finally` to clear.
+      const freshBlockers = computeBlockers(all);
+      if (freshBlockers.length > 0) {
+        throw new PoisonEpic(
+          `${epicBeadId} is blocked by ${freshBlockers.join(", ")} — refusing to execute; ` +
+            `resume the run once the blocker(s) complete`,
+        );
+      }
+
+      if (beads.foreignRunLeaseLive(leaseTarget, clock.now(), runId)) {
+        throw new RunAlreadyLiveError(
+          `${epicBeadId} is already running on another machine (unexpired run-lease) — parking; ` +
+            `this attempt resumes once that run settles and clears its lease`,
+        );
+      }
+      // No foreign live lease: adopt any leftover leases on the freshly-read target (this run's own
+      // from a crashed prior attempt, or an expired dead one from any machine) so the first publish
+      // atomically replaces them. Set here — after the gate — so the `finally` only ever clears
+      // leases we own.
+      leaseLabels = beads.runLeaseLabels(leaseTarget);
+
       // A standalone target that already committed on a prior attempt carries stage:in-review and
       // is skipped straight to the PR step below — its agent never runs again on this resume. Both
       // the allowlist gate here and the ticket loop share this "won't run" predicate so neither
       // acts on a resume marker: gating on a since-disabled agent would park a retry that only has
-      // the (agent-free) PR step left to do.
+      // the (agent-free) PR step left to do. Caveat: "won't run" holds only when the ticket's commit
+      // is actually on this branch. A done-on-board ticket whose commit is missing (cross-machine
+      // resume) DOES re-run, so the loop re-applies this allowlist gate there — the worktree needed
+      // to prove commit presence doesn't exist yet at this point.
       const inReview = LABELS.stage("in-review");
       const isResumeSkipped = (t: Bead) =>
         t.status === "closed" || (standaloneRun && (t.labels?.includes(inReview) ?? false));
 
-      // 0. Dispatch honors the active-agents allowlist (anton-dm7). PARK, don't skip: running
+      // 0b. Dispatch honors the active-agents allowlist (anton-dm7). PARK, don't skip: running
       // the ticket with the default agent would silently produce work the operator disabled the
       // specialist for, and skipping it would open the epic's single PR incomplete. Parking is
       // recoverable — the operator enables the agent (Settings → Agents) or relabels the ticket,
@@ -157,7 +415,154 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         );
       }
 
-      // 1. Warm worktree (idempotent — reused on resume). Branch off the FRESHEST base
+      // 1. Publish the cross-machine run-liveness lease BEFORE any slow setup — worktree creation,
+      //    operator resolution, the epic claim — and keep it fresh while this run executes
+      //    (anton-jz1). Acquiring it up front closes the window where another machine's Force run
+      //    (whose local jobs table is empty) sees no lease during our setup and starts a second
+      //    concurrent run; the fresh foreign-lease gate above already ruled out an existing one. The
+      //    initial publish fails closed (publishLease throws if the label can't be written OR pushed
+      //    to the shared remote) — a run whose lease no other machine can see must not proceed. The
+      //    timer is unref'd so it never keeps the process alive, is torn down in `finally`, and its
+      //    refresh failures are caught + logged (with `assertLeaseHeld` parking the run if they
+      //    persist past the TTL) rather than fatal.
+      //    Fail closed as a PARK, not a hard failure (anton-jz1). A transient board outage (Dolt
+      //    remote/CLI unavailable) at run start leaves us unable to prove we hold the shared lease —
+      //    the same "can't prove liveness" condition steps 1b/assertLeaseHeld already treat as a
+      //    RunAlreadyLiveError (park + retry, refunding the attempt and cooling off until the board is
+      //    reachable). Marking it `failed` instead would burn retry attempts on a temporary outage and
+      //    eventually strand an approved job for a human. Not proceeding is what matters here; parking
+      //    doesn't proceed any more than failing does, and it recovers on its own.
+      try {
+        await publishLease();
+      } catch (e) {
+        throw new RunAlreadyLiveError(
+          `${epicBeadId} could not publish its run-lease to the shared board (${
+            e instanceof Error ? e.message : String(e)
+          }) — parking rather than proceeding without a lease other machines can see; this attempt ` +
+            `resumes once the board is reachable`,
+        );
+      }
+
+      // 1b. Read-after-write conflict check (anton-jz1). The foreign-lease gate in step 0 read the
+      //     board BEFORE this publish, so it can't serialize two machines that force-run the same
+      //     epic at the same instant: both clear the gate before either lease is visible remotely,
+      //     then both publish. Our lease was already pushed to the remote by the required publish in
+      //     step 1; now re-pull so a concurrently-published foreign lease becomes visible, then
+      //     re-read and arbitrate: winsRunLeaseRace keeps the lease for the lexicographically-lowest
+      //     owner runId, so of two runs that both published, exactly one proceeds and the other parks
+      //     (RunAlreadyLiveError → reschedules, re-checks once the winner settles). The pull is
+      //     REQUIRED, not best-effort (anton-jz1): a swallowed pull failure would arbitrate against a
+      //     stale local view that can't see the other machine's lease, so both could conclude they
+      //     won — the exact double-run this step exists to break. If the pull fails we can't prove we
+      //     won, so we fail closed (park + retry) rather than proceed. Throwing here (before the
+      //     refresh timer is armed) means `finally` (leaseTimer still null) tears down only the lease
+      //     this run published.
+      const arbitrateRunLease = async () => {
+        try {
+          await beads.pull(repo);
+        } catch (e) {
+          throw new RunAlreadyLiveError(
+            `${epicBeadId} could not refresh the shared board to arbitrate the run-lease race (${
+              e instanceof Error ? e.message : String(e)
+            }) — parking so a concurrent run on another machine isn't ignored; this attempt resumes ` +
+              `once the board is reachable`,
+          );
+        }
+        const acquired = await beads.show(repo, epicBeadId).catch(() => null);
+        // Fail closed when this re-read fails (anton-jz1). It's the ONLY check confirming no
+        // concurrent lease won the race; a null here (DB lock, transient CLI error, malformed output)
+        // means we can't prove we won, so park + retry like the pull failure above rather than fall
+        // through and proceed while another machine may hold a live lease.
+        if (!acquired) {
+          throw new RunAlreadyLiveError(
+            `${epicBeadId} could not re-read the target to arbitrate the run-lease race — parking so a ` +
+              `concurrent run on another machine isn't ignored; this attempt resumes once the board is reachable`,
+          );
+        }
+        // If the step-0 pre-check was stale, an already-live incumbent lease could have been invisible
+        // then and only surfaces now. That incumbent won't re-arbitrate, so winsRunLeaseRace's
+        // lowest-owner-wins tiebreak would let us steal the lease and double-run. Park on ANY foreign
+        // live lease instead of arbitrating by owner order (anton-jz1). A trusted (fresh) pre-check
+        // guarantees no incumbent existed, so a foreign lease seen now is a symmetric racer and IS
+        // safely arbitrable below.
+        if (!preCheckTrusted && beads.foreignRunLeaseLive(acquired, clock.now(), runId)) {
+          throw new RunAlreadyLiveError(
+            `${epicBeadId} found a live run-lease from another machine after a stale pre-check — parking ` +
+              `rather than stealing by owner order (that run started earlier and won't yield); this ` +
+              `attempt resumes once it settles and clears its lease`,
+          );
+        }
+        if (!beads.winsRunLeaseRace(acquired, clock.now(), runId)) {
+          throw new RunAlreadyLiveError(
+            `${epicBeadId} lost the run-lease race to a concurrent run on another machine — parking; ` +
+              `this attempt resumes once that run settles and clears its lease`,
+          );
+        }
+      };
+      // Arbitrate, settle, then arbitrate AGAIN before committing to run (anton-jz1). A single
+      // post-publish read can't close the race the reviewer flagged: winsRunLeaseRace returning true
+      // means "no foreign lease that beats us is VISIBLE", but on an eventually-consistent board a
+      // machine that force-ran the same instant may simply not have propagated its lease yet — so a
+      // fast publish→read wins uncontested while the slower racer, re-reading later, sees both leases
+      // and (if it sorts lower) also wins. That's the asymmetric-read double-run. The first call
+      // parks us fast if we've already clearly lost; the settle then gives a near-simultaneous foreign
+      // lease time to reach the remote, and the second call re-reads and re-arbitrates against it — so
+      // an "uncontested" win is only trusted once it has survived a propagation window rather than
+      // being acted on the instant no rival is visible. `clock.sleep` is the real wall-clock wait in
+      // production (systemClock); test clocks omit it, so the settle is a no-op and the second read
+      // runs immediately against the same fake board. This narrows, but (like the rest of this
+      // protocol) can't fully close, the window — a true cross-machine lock/CAS would; beads/Dolt
+      // offers none.
+      await arbitrateRunLease();
+      await clock.sleep?.(RUN_LEASE_SETTLE_MS);
+      await arbitrateRunLease();
+
+      leaseTimer = setInterval(() => {
+        if (leaseSettled) return; // run is settling — don't publish a fresh lease behind finally's clear
+        // Serialize refreshes by CHAINING onto the in-flight promise rather than overwriting it
+        // (anton-jz1). If a `publishLease` runs longer than RUN_LEASE_REFRESH_MS (a `bd sync` queued
+        // behind another sync, a remote stall), the next tick would otherwise start a second publish
+        // concurrently AND replace the only promise `finally` awaits — the first, still-running
+        // refresh could then land an unexpired lease AFTER finally cleared the label, leaving a
+        // done/failed/parked run looking live until TTL. Chaining guarantees at most one publish is
+        // in flight, and `leaseRefreshInFlight` always tracks the tail of the chain so `finally`
+        // awaits every queued refresh. Re-check `leaseSettled` after the prior link resolves so a
+        // refresh queued before settle no-ops instead of re-publishing behind finally's clear. A
+        // failed refresh only logs (it must not crash the process from a detached timer), and
+        // publishLease leaves `leaseExpiry` un-advanced on failure — so if these writes keep failing,
+        // `assertLeaseHeld` at the next checkpoint parks the run before the shared lease lapses.
+        leaseRefreshInFlight = leaseRefreshInFlight
+          .catch(() => {}) // prior failure already logged below; keep the chain alive
+          .then(() => {
+            if (leaseSettled) return; // settled while the prior refresh was in flight — don't republish
+            return publishLease();
+          })
+          .catch((e) =>
+            console.error(`[execute-epic] run-lease refresh failed for ${epicBeadId}`, e),
+          );
+      }, RUN_LEASE_REFRESH_MS);
+      if (typeof leaseTimer.unref === "function") leaseTimer.unref();
+
+      // Cooperative lease-liveness guard (anton-jz1). The refresh timer only LOGS a failed publish;
+      // if writes to the shared board keep failing, the lease silently lapses past its TTL while this
+      // run is still executing, and another machine's liveRunCheck would then see the epic as free and
+      // start a duplicate. So at each checkpoint below (every ticket boundary, and before the PR) we
+      // re-check the expiry we last successfully PUSHED: once it's in the past we can no longer prove
+      // we hold the shared lease, so we yield (RunAlreadyLiveError → park + retry, re-checking liveness
+      // next attempt) rather than keep running unguarded. A single ticket that itself runs past the TTL
+      // under sustained sync failure can't be interrupted mid-session, so this bounds — not eliminates
+      // — the exposure to roughly one ticket's worth of work.
+      const assertLeaseHeld = () => {
+        if (clock.now() >= leaseExpiry) {
+          throw new RunAlreadyLiveError(
+            `${epicBeadId} run-lease expired mid-run (refresh writes to the shared board have been ` +
+              `failing) — parking so another machine doesn't treat the epic as free and double-run ` +
+              `it; this attempt resumes once the board is reachable`,
+          );
+        }
+      };
+
+      // 2. Warm worktree (idempotent — reused on resume). Branch off the FRESHEST base
       // (anton-x3o): resolveFreshBase fetches origin/<base> and returns `origin/<base>` so a run
       // whose local base is stale still starts at the remote tip; it's best-effort and falls back
       // to the local base offline. On resume this is moot — createWorktree short-circuits to the
@@ -177,7 +582,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       });
       await ctx.heartbeat();
 
-      // 2. Assert this process still owns the epic, THEN claim it for the human operator (idempotent).
+      // 3. Assert this process still owns the epic, THEN claim it for the human operator (idempotent).
       //    An approved-but-unstarted (backlog) target can be TAKEN OVER — reassigned to another
       //    operator via the approve route's steal — after this run was queued but before it leased the
       //    epic (a queued or autonomy-paused job). The take-over enqueues a fresh run on the NEW
@@ -193,6 +598,8 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //    recoverable, it stops the stale run without stomping the new owner, and the current owner
       //    approving afresh enqueues a run under their identity on their instance. A runner with no
       //    operator identity can't assert ownership, so it falls through to the prior best-effort claim.
+      //    The claim's own sync nudge (below) still makes it visible on teammates' boards within a
+      //    heartbeat (anton-live-sync R6); fire-and-forget, the end-of-run sync is the backstop.
       const operator = await resolveOperator();
       const currentOwner = ownerOf(await beads.show(repo, epicBeadId));
       if (operator && currentOwner && currentOwner !== operator) {
@@ -269,7 +676,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         .sync(repo)
         .catch((e) => console.error(`[execute-epic] claim sync failed for ${epicBeadId}`, e));
 
-      // 3. Per ticket: claude → tests → commit → (close | in-review). Skip work that already
+      // 4. Per ticket: claude → tests → commit → (close | in-review). Skip work that already
       //    landed on a prior attempt. A closed ticket is done — an epic's children close as they
       //    commit, and any resumed run skips them. A standalone target is NEVER closed here (its
       //    close is a merge-time concern, below): the moment its single ticket commits, runTicket
@@ -277,16 +684,54 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //    and the persisted resume marker, so a retry after a failed PR step skips straight to
       //    the PR step here rather than re-running claude/tests/commit on already-committed work.
       for (const ticket of orderTickets(tickets, all)) {
-        if (ticket.status === "closed") continue;
-        if (standaloneRun && (ticket.labels?.includes(inReview) ?? false)) {
-          // Resume after a failed PR step: this ticket already committed and moved to in-review on
-          // a prior attempt. Step 2 above re-tagged the target stage:implementing (it can't tell a
-          // fresh run from a resume), and runTicket — the only standalone path that clears
-          // implementing — is being skipped here. Clear it now so the ticket doesn't carry BOTH
-          // stage labels into merge-finalize, which strips only in-review and would otherwise leave
-          // a stale implementing label (making a reopened bead derive as in-progress).
-          await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
+        assertLeaseHeld(); // yield before starting a ticket if the shared lease has lapsed
+        // A ticket marked done on the board — a closed epic child, or a standalone target moved to
+        // stage:in-review — is only safe to SKIP if its commit is actually present on THIS
+        // worktree's branch (anton-jz1). Board state propagates cross-machine via `bd sync`, but the
+        // branch is pushed only at the PR step: a ticket another machine closed then parked/crashed
+        // on (before openPullRequest) has its commit solely in that machine's local, never-pushed
+        // worktree. This machine's fresh worktree branches off origin/<base> and lacks it, so
+        // skipping on board state alone would open the epic's single PR missing that work while the
+        // board still marks it done. Re-run it here so its commit lands on this branch. On a
+        // same-machine resume the worktree is reused and the commit is present, so this skips as
+        // before — no redundant re-run.
+        const doneOnBoard =
+          ticket.status === "closed" ||
+          (standaloneRun && (ticket.labels?.includes(inReview) ?? false));
+        if (doneOnBoard && (await worktreeHasCommitFor(worktree.path, ticket.id))) {
+          if (standaloneRun) {
+            // Resume after a failed PR step: this standalone ticket committed and moved to in-review
+            // on a prior attempt. Step 2 above re-tagged the target stage:implementing (it can't
+            // tell a fresh run from a resume), and runTicket — the only standalone path that clears
+            // implementing — is being skipped here. Clear it now so the ticket doesn't carry BOTH
+            // stage labels into merge-finalize, which strips only in-review and would otherwise
+            // leave a stale implementing label (making a reopened bead derive as in-progress).
+            await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
+          }
           continue;
+        }
+        // Done on the board but the commit is missing from this branch (cross-machine resume): the
+        // work must be regenerated here, which re-runs the ticket's agent. Step 0b's allowlist gate
+        // SKIPPED this ticket — isResumeSkipped treats any done-on-board bead as "won't run", which
+        // is only true when its commit is present. Now that we know it WILL re-run, re-gate it here
+        // (anton-jz1): a ticket whose `agent:` label was disabled since it first closed must
+        // poison-park, exactly as step 0b does, rather than silently regenerate under the default
+        // agent. Checked before the reopen/runTicket so the re-run never starts.
+        if (doneOnBoard) {
+          const disabled = inactiveAgentTickets([ticket], settings.agents);
+          if (disabled.length > 0) {
+            throw new PoisonEpic(
+              `epic ${epicBeadId} needs agents disabled in this project's settings: ` +
+                disabled.map((x) => `${x.id} → agent:${x.agent}`).join(", ") +
+                ` — enable them in Settings → Agents (or relabel the tickets), then resume the run`,
+            );
+          }
+        }
+        // Done on the board but the commit is missing from this branch (cross-machine resume): the
+        // work must be regenerated here. Reopen a closed child first so runTicket's claim + close
+        // operate on a live bead (a standalone target is never closed, so it needs no reopen).
+        if (doneOnBoard && ticket.status === "closed") {
+          await safe(() => beads.reopen(repo, ticket.id));
         }
         await runTicket({
           db,
@@ -304,13 +749,14 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         await ctx.heartbeat();
       }
 
-      // 4. All tickets done → open one PR, stamp the PR ref, and (for an epic) move it to
+      // 5. All tickets done → open one PR, stamp the PR ref, and (for an epic) move it to
       //    in-review. A standalone target is NOT closed here: like an epic it stays OPEN, tagged
       //    stage:in-review (runTicket already applied that on commit), carrying its PR ref until
       //    the PR actually MERGES — at which point review-fix's merge-finalize path closes it.
       //    Closing it now would derive it as Done on the board while its PR is still open and drop
       //    it out of review-fix's in-review sweep (which is what keeps a standalone PR in the
       //    automated review/finalization path).
+      assertLeaseHeld(); // don't open a PR under a lease that has silently lapsed
       const pr = await openPullRequest({
         repoPath: repo,
         branch: worktree.branch,
@@ -324,13 +770,16 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         await safe(() => beads.untag(repo, epicBeadId, [LABELS.stage("implementing")]));
       }
 
-      // 5. Finalize run + clean up the worktree (the branch/PR carry the work now).
+      // 6. Finalize run + clean up the worktree (the branch/PR carry the work now).
       await updateRun(db, clock, runId, { status: "done", endedAt: clock.now(), error: null });
       await safe(() => removeWorktree(worktree));
     } catch (e) {
-      // Quota → park the run (job reschedules); anything else → the run failed (job retries/parks).
+      // Quota or a run already live on another machine (anton-jz1) → park the run (the job
+      // reschedules and re-checks liveness); anything else → the run failed (job retries/parks).
       if (isUsageLimitError(e)) {
         await updateRun(db, clock, runId, { status: "parked", error: "usage-limit" });
+      } else if (isRunAlreadyLiveError(e)) {
+        await updateRun(db, clock, runId, { status: "parked", error: "run-live-elsewhere" });
       } else {
         await updateRun(db, clock, runId, {
           status: "failed",
@@ -340,9 +789,22 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       }
       throw e; // let the runner apply job-level durability
     } finally {
-      // Every bd write above (claims, closes, stage labels, PR ref) must reach the remote even
-      // when the run failed mid-way. Logged, not thrown: a push failure must not mask the run's
-      // own error or fail a run whose real work (branch + PR) already landed.
+      // Stop refreshing and drop the run-liveness lease now that this attempt has stopped executing
+      // (anton-jz1). Clearing on EVERY settle path — done, parked, failed — is what lets a Force run
+      // re-trigger a stopped run immediately instead of waiting out the lease TTL; a hard crash that
+      // skips this still self-heals when the (un-refreshed) lease expires. Best-effort like the
+      // other bd writes; the sync below pushes the removal to the remote.
+      leaseSettled = true;
+      if (leaseTimer) clearInterval(leaseTimer);
+      // clearInterval only stops FUTURE ticks; a refresh already inside publishLease when we settle
+      // would otherwise write a fresh lease after the clear below. Await it first so leaseLabels
+      // reflects what it actually wrote and the clear removes the right (freshest) label (anton-jz1).
+      await leaseRefreshInFlight;
+      await safe(() => beads.clearRunLease(repo, epicBeadId, leaseLabels));
+
+      // Every bd write above (claims, closes, stage labels, PR ref, lease clear) must reach the
+      // remote even when the run failed mid-way. Logged, not thrown: a push failure must not mask
+      // the run's own error or fail a run whose real work (branch + PR) already landed.
       await beads
         .sync(repo)
         .catch((e) => console.error(`[execute-epic] beads dolt sync failed for ${epicBeadId}`, e));

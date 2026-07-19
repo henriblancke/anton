@@ -36,8 +36,18 @@ export type JobRow = typeof schema.jobs.$inferSelect;
 export interface Clock {
   /** Milliseconds since epoch. */
   now(): number;
+  /**
+   * Wait `ms` before resolving. Optional so the many ad-hoc test clocks (which only need `now`)
+   * stay valid; where absent, a caller's `await clock.sleep?.(ms)` no-ops (resolves immediately),
+   * which is exactly what deterministic tests want. The real `systemClock` provides the wall-clock
+   * delay used by the run-lease settle (execute-epic step 1b).
+   */
+  sleep?(ms: number): Promise<void>;
 }
-export const systemClock: Clock = { now: () => Date.now() };
+export const systemClock: Clock = {
+  now: () => Date.now(),
+  sleep: (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+};
 
 /** timestamp mode stores seconds as a Date; normalize either to ms. */
 export function toMs(value: unknown): number | undefined {
@@ -105,7 +115,7 @@ function epicBeadIdOf(payloadJson: string | null): string | undefined {
 }
 
 /** Id of the currently-active execute-epic job for this project + epic, if any. */
-function activeExecuteEpicId(
+export function activeExecuteEpicId(
   tx: Pick<AntonDb, "select">,
   projectId: string,
   epicBeadId: string,

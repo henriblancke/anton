@@ -9,7 +9,7 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openPullRequest, resolveFreshBase } from "./ops";
+import { openPullRequest, pullRequestState, resolveFreshBase, worktreeHasCommitFor } from "./ops";
 import { GH_BIN_ENV } from "./ops";
 
 function has(cmd: string): boolean {
@@ -108,6 +108,106 @@ process.exit(0);
     expect(second.number).toBe(42);
     expect(second.ref).toBe("gh-42");
     expect(second.url).toBe(first.url);
+  });
+});
+
+describe("pullRequestState (fake gh)", () => {
+  let sandbox: string;
+  let binDir: string;
+  let prevGh: string | undefined;
+
+  // Fake gh whose `pr view <selector> --json state` echoes the state passed in via ANTON_TEST_PR_STATE,
+  // or exits non-zero (as the real gh does for an unknown PR) when it's set to "__error__".
+  function installFakeGh(): void {
+    const fakeGh = join(binDir, "gh");
+    writeFileSync(
+      fakeGh,
+      `#!/usr/bin/env node
+const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='view'){
+  const st=process.env.ANTON_TEST_PR_STATE;
+  if(!st||st==='__error__'){process.stderr.write('no pull requests found\\n');process.exit(1);}
+  process.stdout.write(JSON.stringify({state:st})+'\\n');process.exit(0);
+}
+process.exit(0);
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+  }
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-prstate-"));
+    binDir = join(sandbox, "bin");
+    mkdirSync(binDir);
+    installFakeGh();
+    prevGh = process.env[GH_BIN_ENV];
+    process.env[GH_BIN_ENV] = join(binDir, "gh");
+  });
+
+  afterEach(() => {
+    if (prevGh === undefined) delete process.env[GH_BIN_ENV];
+    else process.env[GH_BIN_ENV] = prevGh;
+    delete process.env.ANTON_TEST_PR_STATE;
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("maps gh states to open / merged / closed, strips the gh- ref prefix", async () => {
+    process.env.ANTON_TEST_PR_STATE = "OPEN";
+    expect(await pullRequestState(sandbox, "gh-42")).toBe("open");
+    process.env.ANTON_TEST_PR_STATE = "MERGED";
+    expect(await pullRequestState(sandbox, "gh-42")).toBe("merged");
+    process.env.ANTON_TEST_PR_STATE = "CLOSED";
+    expect(await pullRequestState(sandbox, "gh-42")).toBe("closed");
+  });
+
+  it("returns 'unknown' when gh errors, and for an empty/unparseable ref", async () => {
+    process.env.ANTON_TEST_PR_STATE = "__error__";
+    expect(await pullRequestState(sandbox, "gh-42")).toBe("unknown");
+    // Empty ref (nothing to look up) short-circuits to unknown without invoking gh.
+    expect(await pullRequestState(sandbox, "")).toBe("unknown");
+    // An unexpected state string also degrades to unknown rather than a bogus value.
+    process.env.ANTON_TEST_PR_STATE = "DRAFT_WEIRD";
+    expect(await pullRequestState(sandbox, "gh-42")).toBe("unknown");
+  });
+});
+
+suite("worktreeHasCommitFor (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-hascommit-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("detects a ticket's commit by its `<id>: …` subject, ignoring other commits", async () => {
+    writeFileSync(join(repo, "work.md"), "work\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "anton-jz1.2: implement the thing"]);
+
+    // The committed ticket is present; a sibling ticket that never committed here is absent — the
+    // exact cross-machine-resume signal execute-epic skips/re-runs on.
+    expect(await worktreeHasCommitFor(repo, "anton-jz1.2")).toBe(true);
+    expect(await worktreeHasCommitFor(repo, "anton-jz1.3")).toBe(false);
+    // A prefix collision must NOT false-positive: `anton-jz1.2` is not a commit for `anton-jz1`.
+    expect(await worktreeHasCommitFor(repo, "anton-jz1")).toBe(false);
+  });
+
+  it("returns false in a repo with no matching commit (fresh cross-machine worktree)", async () => {
+    expect(await worktreeHasCommitFor(repo, "anton-jz1.2")).toBe(false);
   });
 });
 

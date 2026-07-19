@@ -7,9 +7,10 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
-import { PoisonError, UsageLimitError } from "./errors";
+import { PoisonError, RunAlreadyLiveError, UsageLimitError } from "./errors";
 import { enqueue, getJob, toMs, type Clock } from "./queue";
 import {
+  classifyError,
   DEFAULT_CONFIG,
   JobRunner,
   nextAction,
@@ -70,6 +71,23 @@ describe("nextAction (pure durability policy)", () => {
   it("parks immediately on a poison error", () => {
     const a = nextAction(CONFIG, { attempts: 1 }, { kind: "poison", error: "boom" }, now);
     expect(a.action).toBe("park");
+  });
+
+  it("reschedules a run-live-elsewhere hit after a cool-off and refunds the attempt (anton-jz1)", () => {
+    // A foreign live lease is not this job's failure and the other run may hold it a long time, so
+    // the attempt is refunded — it re-checks liveness each cool-off and must never poison-park.
+    const a = nextAction(CONFIG, { attempts: 3 }, { kind: "lease-held", error: "live on B" }, now);
+    expect(a.action).toBe("reschedule");
+    if (a.action !== "reschedule") throw new Error("unreachable");
+    expect(a.runAtMs).toBe(now + CONFIG.quotaCooloffMs);
+    expect(a.refundAttempt).toBe(true);
+  });
+
+  it("classifies RunAlreadyLiveError as a lease-held outcome (anton-jz1)", () => {
+    expect(classifyError(new RunAlreadyLiveError("live on B"))).toEqual({
+      kind: "lease-held",
+      error: "live on B",
+    });
   });
 
   it("retries with exponential backoff below the attempt cap", () => {
@@ -860,7 +878,7 @@ describe("JobRunner (live, in-memory db)", () => {
     await expect(r.enqueue({ type: "review-fix", projectId: "A" })).rejects.toThrow(
       /being deleted/,
     );
-    expect(() => r.enqueueExecuteEpic("A", "epic-race")).toThrow(/being deleted/);
+    await expect(r.enqueueExecuteEpic("A", "epic-race")).rejects.toThrow(/being deleted/);
     await expect(r.resume(parked)).resolves.toBe(false);
     const bypassed = await enqueue(tdb.db, clock, { type: "review-fix", projectId: "A" });
     const other = await r.enqueue({ type: "execute-epic", projectId: "B" });

@@ -16,6 +16,7 @@ import { makeTestDb, type TestDb } from "../db/testing";
 import { beads } from "../beads/bd";
 import * as schema from "../db/schema";
 import { getJob, park, resumeJob, type Clock } from "./queue";
+import { createRun } from "../runs";
 import { JobRunner } from "./runner";
 import { makeExecuteEpicHandler } from "./execute-epic";
 import { deriveStage } from "../ticket-view";
@@ -449,6 +450,368 @@ process.exit(0);`,
       process.env.ANTON_CLAUDE_BIN = successClaude;
       // Park so a later clock-advancing tick in another test can't re-dispatch this job.
       if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  }, 60_000);
+
+  it("a retry after another run already opened the PR completes idempotently — no duplicate/empty PR", async () => {
+    // anton-jz1 review: a losing machine's job parks on the winner's live run-lease (or a lost
+    // publish race) and reschedules; when the winner finishes and clears its lease, the loser
+    // retries. By then the epic is already in-review with its PR opened + external ref stamped, so
+    // re-running would re-enter the PR step and create a duplicate/empty PR (or park on a `gh "a
+    // pull request already exists"` failure). The handler must instead revalidate the target still
+    // needs execution and, seeing the external ref, finish the attempt as done without touching gh.
+    const bugId = await beads.create(repo, {
+      title: "Covered by another run",
+      type: "bug",
+      acceptance: "work file exists",
+      description: "## Goal\nProve idempotent completion.",
+    });
+    await beads.approve(repo, bugId);
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    // Attempt 1: a normal run carries the bug to in-review (PR opened, external ref stamped).
+    process.env.ANTON_CLAUDE_BIN = successClaude;
+    const job1 = await runner.enqueue({
+      type: "execute-epic",
+      projectId,
+      payload: { projectId, epicBeadId: bugId },
+    });
+    await runner.tickOnce();
+    await runner.whenIdle();
+    expect((await getJob(tdb.db, job1))?.status).toBe("done");
+    const covered = await beads.show(repo, bugId);
+    expect(covered.external_ref).toBe("gh-42");
+    const sessionsAfter1 = (await tdb.db.select().from(schema.sessions)).filter(
+      (s) => s.beadId === bugId,
+    );
+    expect(sessionsAfter1).toHaveLength(1);
+
+    // Attempt 2: a SECOND job for the same target (the losing machine's retry after the lease
+    // cleared). Point gh at a binary that reports the PR OPEN (its real state — attempt 1 opened it)
+    // so the revalidation short-circuits on a confirmed-live ref; `pr create` booms so a wrongful
+    // fall-through to the PR step would throw and fail the job instead of short-circuiting.
+    const openGh = writeBin(
+      binDir,
+      "gh-open-jz1",
+      `const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='view'){process.stdout.write(JSON.stringify({state:'OPEN',url:'https://github.com/acme/repo/pull/42',number:42})+'\\n');process.exit(0);}
+if(a[0]==='pr'&&a[1]==='create'){console.error('gh boom: must not reach PR step');process.exit(1);}
+process.exit(0);`,
+    );
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = openGh;
+    try {
+      const job2 = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: bugId },
+      });
+      await runner.tickOnce();
+      await runner.whenIdle();
+
+      // The retry completed (not failed/parked) without invoking gh: the external ref is unchanged
+      // and no second claude session ran — the covered work was not redone.
+      expect((await getJob(tdb.db, job2))?.status).toBe("done");
+      const run2 = (await tdb.db.select().from(schema.runs))
+        .filter((r) => r.epicBeadId === bugId)
+        .find((r) => r.id !== undefined && r.status === "done" && r.worktreePath === null);
+      expect(run2).toBeTruthy(); // the retry's run row settled done without ever warming a worktree
+      const after2 = await beads.show(repo, bugId);
+      expect(after2.external_ref).toBe("gh-42"); // not overwritten / re-opened
+      const sessionsAfter2 = (await tdb.db.select().from(schema.sessions)).filter(
+        (s) => s.beadId === bugId,
+      );
+      expect(sessionsAfter2).toHaveLength(1); // claude was NOT re-run
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+    }
+  }, 60_000);
+
+  it("clears its OWN leftover run-lease on the external-ref short-circuit (crash after PR, before cleanup)", async () => {
+    // anton-jz1 review (thread PRRT_kwDOTWcq8c6SAdZu): a run that crashed AFTER stamping the external
+    // ref but BEFORE its `finally` cleared the run-lease leaves an unexpired `run-lease:…:<runId>` on
+    // the board. On resume, findOpenRunForEpic returns the SAME run row (same runId), so the target
+    // still carries this run's own lease. The idempotent external-ref short-circuit returns before the
+    // general lease-adoption step, so it must sweep that own lease itself — otherwise other machines
+    // keep seeing the epic as live until the 15-minute TTL even though its PR is already open.
+    const bugId = await beads.create(repo, {
+      title: "Crashed after PR",
+      type: "bug",
+      acceptance: "work file exists",
+      description: "## Goal\nProve the own-lease sweep on the idempotent path.",
+    });
+    await beads.approve(repo, bugId);
+
+    // Simulate the crashed prior attempt: a still-"running" run row (so it resumes rather than
+    // starting fresh), the external ref already stamped, and this run's own unexpired lease still on
+    // the board — the exact "died between setExternalRef and finally" state.
+    const runId = randomUUID();
+    await createRun(tdb.db, clock, {
+      id: runId,
+      projectId,
+      epicBeadId: bugId,
+      branch: `anton/${bugId}`,
+      status: "running",
+    });
+    const leaseExp = clock.now() + 15 * 60_000;
+    await beads.publishRunLease(repo, bugId, leaseExp, [], runId);
+    await beads.setExternalRef(repo, bugId, "gh-77");
+    await beads.sync(repo); // land both on the remote so the handler's pull can't clobber them
+    expect(beads.ownRunLeaseLabels(await beads.show(repo, bugId), runId)).toHaveLength(1);
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    // gh reports the PR OPEN — the real state after a crash that stamped the ref (the PR was opened
+    // first) — so the short-circuit legitimately proves completion and finishes the attempt as done.
+    // `pr create` booms: if the handler wrongly fell through to the PR step it would throw instead.
+    const openGh = writeBin(
+      binDir,
+      "gh-open-lease",
+      `const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='view'){process.stdout.write(JSON.stringify({state:'OPEN',url:'https://github.com/acme/repo/pull/77',number:77})+'\\n');process.exit(0);}
+if(a[0]==='pr'&&a[1]==='create'){console.error('gh boom: must not reach PR step');process.exit(1);}
+process.exit(0);`,
+    );
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = openGh;
+    try {
+      const job = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: bugId },
+      });
+      await runner.tickOnce();
+      await runner.whenIdle();
+      expect((await getJob(tdb.db, job))?.status).toBe("done");
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+    }
+
+    // The resumed run's row settled done, and its own lease was swept — no lingering run-lease keeps
+    // the epic looking live to other machines. External ref untouched (not re-opened).
+    const settled = (await tdb.db.select().from(schema.runs)).find((r) => r.id === runId);
+    expect(settled?.status).toBe("done");
+    const after = await beads.show(repo, bugId);
+    expect(beads.runLeaseLabels(after)).toEqual([]);
+    expect(after.external_ref).toBe("gh-77");
+  }, 60_000);
+
+  it("retries (does not false-complete) when a target's PR ref state can't be read", async () => {
+    // anton-jz1 review (thread PRRT_kwDOTWcq8c6SBg3n): a set external_ref only proves completion when
+    // its PR is confirmed OPEN or MERGED. An UNKNOWN state (gh down / unparseable ref) is proof of
+    // nothing — treating it as done would strand a genuinely-closed epic that a retry could recover.
+    // The handler must retry on unknown rather than mark the run done, leaving the ref intact. Unlike a
+    // foreign lease (RunAlreadyLiveError, refunded forever), an unreadable ref is a COUNTING error: a
+    // transient gh outage self-heals within the retry budget, a permanent one exhausts attempts and
+    // parks for a human (PRRT_kwDOTWcq8c6SB5Ja) rather than retrying indefinitely.
+    const bugId = await beads.create(repo, {
+      title: "Unreadable PR state",
+      type: "bug",
+      acceptance: "work file exists",
+      description: "## Goal\nProve unknown PR state parks instead of false-completing.",
+    });
+    await beads.approve(repo, bugId);
+    await beads.setExternalRef(repo, bugId, "gh-88");
+    await beads.sync(repo);
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    // gh fails outright → pullRequestState reports "unknown". The run must park, not short-circuit
+    // to done; `pr create` would also boom, so a wrongful fall-through to the PR step can't pass.
+    const failingGh = writeBin(binDir, "gh-unknown-jz1", `console.error('gh boom');process.exit(1);`);
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = failingGh;
+    try {
+      const job = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: bugId },
+      });
+      await runner.tickOnce();
+      await runner.whenIdle();
+      // Counting error → the job is rescheduled for retry (attempt spent), NOT done.
+      expect((await getJob(tdb.db, job))?.status).not.toBe("done");
+      // The run row settled as failed (a counting failure, not the parked run-live-elsewhere class),
+      // and the ref is untouched. Repeated unreadable attempts exhaust the budget and park the job.
+      const runsForBug = (await tdb.db.select().from(schema.runs)).filter(
+        (r) => r.epicBeadId === bugId,
+      );
+      expect(runsForBug.some((r) => r.status === "failed")).toBe(true);
+      expect(runsForBug.some((r) => r.status === "done")).toBe(false);
+      expect((await beads.show(repo, bugId)).external_ref).toBe("gh-88");
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+    }
+  }, 60_000);
+
+  it("restores an epic's stage:in-review on the external-ref short-circuit (crash after ref, before stage update)", async () => {
+    // anton-jz1 review (thread PRRT_kwDOTWcq8c6SBg3m): an epic run that crashed AFTER setExternalRef
+    // (step 5) but BEFORE the stage updates at the tail of step 5 leaves the epic on stage:implementing
+    // with no stage:in-review. review-fix sweeps only stage:in-review targets, so a resume that
+    // short-circuits to done must re-apply in-review (and drop implementing) or the PR is silently
+    // dropped from automated review. Unlike a standalone (which gets in-review from runTicket on
+    // commit), the epic acquires it only after the ref, so this window is epic-specific.
+    const epicId = await beads.create(repo, {
+      title: "Epic crashed before in-review",
+      type: "epic",
+      description: "## Goal\nProve in-review restoration on the epic short-circuit.",
+    });
+    const childRaw = execFileSync(
+      "bd",
+      ["create", "Only child", "--type", "task", "--parent", epicId, "--acceptance", "x", "--json"],
+      { cwd: repo, encoding: "utf8" },
+    );
+    const childId = (() => {
+      const p = JSON.parse(childRaw);
+      const b = Array.isArray(p) ? p[0] : (p.issue ?? p);
+      return b.id as string;
+    })();
+    await beads.approve(repo, epicId);
+
+    // Simulate the crashed prior attempt: the child committed + closed, the PR ref stamped, and the
+    // epic still on stage:implementing (step 2's tag) with in-review NEVER applied — plus a still
+    // "running" run row so this resumes rather than starting fresh.
+    await beads.close(repo, childId);
+    await beads.tag(repo, epicId, ["stage:implementing"]);
+    await beads.setExternalRef(repo, epicId, "gh-55");
+    const runId = randomUUID();
+    await createRun(tdb.db, clock, {
+      id: runId,
+      projectId,
+      epicBeadId: epicId,
+      branch: `anton/${epicId}`,
+      status: "running",
+    });
+    await beads.sync(repo);
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    // gh reports the PR OPEN (its real state after the crash); `pr create` booms so a wrongful
+    // fall-through to the PR step would throw instead of short-circuiting.
+    const openGh = writeBin(
+      binDir,
+      "gh-open-epic-jz1",
+      `const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='view'){process.stdout.write(JSON.stringify({state:'OPEN',url:'https://github.com/acme/repo/pull/55',number:55})+'\\n');process.exit(0);}
+if(a[0]==='pr'&&a[1]==='create'){console.error('gh boom: must not reach PR step');process.exit(1);}
+process.exit(0);`,
+    );
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = openGh;
+    try {
+      const job = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: epicId },
+      });
+      await runner.tickOnce();
+      await runner.whenIdle();
+      expect((await getJob(tdb.db, job))?.status).toBe("done");
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+    }
+
+    // The short-circuit finished done AND repaired the board: the epic now carries stage:in-review,
+    // has dropped stage:implementing, and reads as in-review so review-fix's sweep will pick it up.
+    const epic = await beads.show(repo, epicId);
+    expect(epic.labels ?? []).toContain("stage:in-review");
+    expect(epic.labels ?? []).not.toContain("stage:implementing");
+    expect(deriveStage(epic)).toBe("in-review");
+    expect(epic.external_ref).toBe("gh-55");
+  }, 60_000);
+
+  it("recovers a target whose external-ref PR was CLOSED without merging — re-opens instead of a false-done short-circuit", async () => {
+    // anton-jz1 review (thread PRRT_kwDOTWcq8c6SAsC0): when a PR is closed WITHOUT merging, review-fix
+    // leaves the bead in-review with its external_ref intact so a Run/Force run can recover it. The
+    // external-ref short-circuit must NOT treat that stale ref as proof another run finished: doing so
+    // marks the new run done and returns before the PR step, stranding the bead on the dead PR. The
+    // handler must instead check the PR state and, seeing it CLOSED, fall through and re-open the PR.
+    const bugId = await beads.create(repo, {
+      title: "PR closed without merging",
+      type: "bug",
+      acceptance: "work file exists",
+      description: "## Goal\nProve stale-ref recovery.",
+    });
+    await beads.approve(repo, bugId);
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    // Attempt 1: a normal run carries the bug to in-review (PR opened at gh-42, external ref stamped).
+    process.env.ANTON_CLAUDE_BIN = successClaude;
+    const job1 = await runner.enqueue({
+      type: "execute-epic",
+      projectId,
+      payload: { projectId, epicBeadId: bugId },
+    });
+    await runner.tickOnce();
+    await runner.whenIdle();
+    expect((await getJob(tdb.db, job1))?.status).toBe("done");
+    expect((await beads.show(repo, bugId)).external_ref).toBe("gh-42");
+    const sessionsAfter1 = (await tdb.db.select().from(schema.sessions)).filter(
+      (s) => s.beadId === bugId,
+    );
+    expect(sessionsAfter1).toHaveLength(1);
+
+    // Attempt 2: the operator Force-runs the recovery after the PR was closed unmerged. Point gh at a
+    // fake that reports every PR CLOSED (so `pullRequestState` sees a stale ref and the PR-reuse check
+    // finds nothing to reuse) and opens a fresh PR at gh-99 on `pr create`.
+    const recoverGh = writeBin(
+      binDir,
+      "gh-recover-jz1",
+      `const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='view'){process.stdout.write(JSON.stringify({state:'CLOSED'})+'\\n');process.exit(0);}
+if(a[0]==='pr'&&a[1]==='create'){process.stdout.write('https://github.com/acme/repo/pull/99\\n');process.exit(0);}
+process.exit(0);`,
+    );
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = recoverGh;
+    try {
+      const job2 = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: bugId },
+      });
+      await runner.tickOnce();
+      await runner.whenIdle();
+
+      // The recovery run did NOT short-circuit: it re-opened the PR (external ref advanced to gh-99)
+      // and finished done, rather than reporting a false completion on the dead gh-42.
+      expect((await getJob(tdb.db, job2))?.status).toBe("done");
+      expect((await beads.show(repo, bugId)).external_ref).toBe("gh-99");
+      // The standalone target is stage:in-review from attempt 1, so its ticket is resume-skipped —
+      // claude is not re-run; only the (agent-free) PR step executes on recovery.
+      const sessionsAfter2 = (await tdb.db.select().from(schema.sessions)).filter(
+        (s) => s.beadId === bugId,
+      );
+      expect(sessionsAfter2).toHaveLength(1);
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
     }
   }, 60_000);
 

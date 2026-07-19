@@ -19,7 +19,39 @@ export const LABELS = {
   approved: "approved",
   stage: (s: "implementing" | "in-review") => `stage:${s}`,
   source: (s: string) => `source:${s}`,
+  /**
+   * Cross-machine run-liveness lease (anton-jz1): `run-lease:<expiresAtEpochMs>[:<ownerRunId>]` on
+   * the run target. Present + unexpired ⇒ a run is actively executing this epic on SOME machine, so
+   * a Force run started elsewhere must not spawn a second concurrent run. This is the shared
+   * (beads/dolt) mirror of the machine-local jobs lease: the `jobs` table is disposable and
+   * per-machine, so it can't stop machine B double-running an epic already live on machine A.
+   * Heartbeat-refreshed by execute-epic while the run is executing; cleared when the run settles;
+   * an EXPIRED lease is ignored so a crashed/killed machine's run is re-triggerable (a stuck
+   * `stage:implementing` label alone would otherwise wedge Force run — its whole purpose). The
+   * optional `:<ownerRunId>` suffix identifies the publishing run so a resuming handler can tell its
+   * OWN crash leftover (safe to sweep) from another machine's live lease (a park condition). See
+   * DESIGN.md §3 (state by shareability).
+   */
+  runLease: (expiresAtMs: number, owner?: string) =>
+    owner ? `run-lease:${expiresAtMs}:${owner}` : `run-lease:${expiresAtMs}`,
 } as const;
+
+/** Prefix of the run-lease label (see LABELS.runLease). */
+const RUN_LEASE_PREFIX = "run-lease:";
+
+/**
+ * Parse a `run-lease:<expiry>[:<owner>]` label into its expiry (ms epoch) and optional owner (the
+ * publishing run's id, anton-jz1). `expiry` is undefined for a malformed/non-numeric value. A label
+ * with no `:<owner>` suffix (legacy format, or a liveness-only publish) parses `owner: undefined`.
+ */
+function parseRunLease(label: string): { expiry: number | undefined; owner: string | undefined } {
+  const rest = label.slice(RUN_LEASE_PREFIX.length);
+  const sep = rest.indexOf(":");
+  const expStr = sep === -1 ? rest : rest.slice(0, sep);
+  const owner = sep === -1 ? undefined : rest.slice(sep + 1) || undefined;
+  const n = Number(expStr);
+  return { expiry: Number.isFinite(n) ? n : undefined, owner };
+}
 
 /** The managed-metadata label prefixes anton edits. Control labels (approved, stage:*,
  * source:*) are NOT in this set and are never touched by a patch. */
@@ -464,4 +496,126 @@ export const beads = {
   isRunTarget: (b: Bead) =>
     beads.isEpic(b) ||
     ((b.issue_type === "task" || b.issue_type === "bug") && !(b.parent ?? b.parent_id)),
+
+  // ── cross-machine run-liveness lease (anton-jz1) ──
+
+  /** The `run-lease:*` labels currently on a bead (normally 0 or 1; a crashed refresh may leave 2). */
+  runLeaseLabels: (b: Bead): string[] =>
+    (b.labels ?? []).filter((l) => l.startsWith(RUN_LEASE_PREFIX)),
+
+  /**
+   * Expiry (ms epoch) of the bead's run-lease, or undefined when absent/malformed. Takes the MAX
+   * across labels so a lingering older lease can't make a fresher one read as expired.
+   */
+  runLeaseExpiry: (b: Bead): number | undefined => {
+    let max: number | undefined;
+    for (const l of b.labels ?? []) {
+      if (!l.startsWith(RUN_LEASE_PREFIX)) continue;
+      const { expiry } = parseRunLease(l);
+      if (expiry !== undefined && (max === undefined || expiry > max)) max = expiry;
+    }
+    return max;
+  },
+
+  /**
+   * Is a run actively executing this bead on some machine right now? True iff it carries a
+   * run-lease whose expiry is still in the future. An expired lease (crashed/killed machine that
+   * stopped heartbeating, or a settled run) reads false so the epic is re-triggerable (anton-jz1).
+   */
+  isRunLive: (b: Bead, nowMs: number): boolean => {
+    const exp = beads.runLeaseExpiry(b);
+    return exp !== undefined && exp > nowMs;
+  },
+
+  /**
+   * Does the bead carry an UNEXPIRED run-lease owned by a run OTHER than `ownRunId` (anton-jz1)? A
+   * queued execute-epic job that reschedules (quota/backoff) re-enters its handler WITHOUT the
+   * enqueue-time liveRunCheck, so if a Force run started on another machine while this job was
+   * parked, the fresh target now carries that machine's live lease. The handler treats this as a
+   * park/retry condition rather than overwriting the lease — replacing it would let both machines
+   * run the epic at once. This run's OWN lease (same owner, e.g. a crash leftover) and any expired
+   * lease read false, so a resume sweeps and re-publishes its own lease normally. An owner-less lease
+   * (legacy format, or a liveness-only publish that recorded no owner) is conservatively treated as
+   * foreign when unexpired: parking is recoverable, a double-run is not.
+   */
+  foreignRunLeaseLive: (b: Bead, nowMs: number, ownRunId: string): boolean => {
+    for (const l of b.labels ?? []) {
+      if (!l.startsWith(RUN_LEASE_PREFIX)) continue;
+      const { expiry, owner } = parseRunLease(l);
+      if (expiry !== undefined && expiry > nowMs && owner !== ownRunId) return true;
+    }
+    return false;
+  },
+
+  /**
+   * The bead's run-lease labels OWNED by `ownRunId` (anton-jz1) — the leases this run itself
+   * published, matched by the `:<owner>` suffix. Used to sweep a run's OWN crash leftover on an
+   * idempotent short-circuit that returns BEFORE the general lease-adoption step (the external-ref
+   * early return in execute-epic): clearing these lets a stopped run free the epic immediately
+   * instead of leaving it looking live until the TTL, while a foreign machine's lease is deliberately
+   * left for its own owner/TTL to clear — honoring "finally clears only what we own".
+   */
+  ownRunLeaseLabels: (b: Bead, ownRunId: string): string[] =>
+    (b.labels ?? []).filter(
+      (l) => l.startsWith(RUN_LEASE_PREFIX) && parseRunLease(l).owner === ownRunId,
+    ),
+
+  /**
+   * Tiebreak for two runs that acquired the lease at the same instant (anton-jz1). The foreign-lease
+   * gate reads the board BEFORE a run publishes its own lease, so two machines force-running an epic
+   * simultaneously can both clear that gate before either lease is visible remotely. After publishing,
+   * a handler re-pulls and re-reads the target and calls this: it returns true iff `ownRunId` should
+   * KEEP the lease and proceed, i.e. no OTHER live lease on the bead has an owner that sorts
+   * lexicographically at or below `ownRunId`. Because every colliding run applies the same
+   * lowest-owner-wins rule against the same merged label set, exactly one proceeds and the rest park.
+   * An owner-less foreign live lease (legacy / liveness-only publish) can't be arbitrated, so this
+   * yields (returns false): parking is recoverable, a double-run is not. No foreign live lease at all
+   * → true (the run is uncontested).
+   *
+   * The lowest-owner-wins tiebreak is ONLY sound for that SYMMETRIC case — two fresh runs that raced
+   * before either lease was visible. It is NOT safe against an already-live INCUMBENT (a run that
+   * started earlier, only arbitrates at its own startup, and won't yield): from the label set alone
+   * this function can't tell an incumbent from a co-racer, so a latecomer whose owner sorts lower
+   * would wrongly "win" and double-run. The caller must therefore park on any foreign live lease when
+   * its pre-check was stale (couldn't rule out an incumbent) and only reach this arbitration after a
+   * trusted, fresh pre-check — see execute-epic step 1b (`preCheckTrusted`).
+   */
+  winsRunLeaseRace: (b: Bead, nowMs: number, ownRunId: string): boolean => {
+    for (const l of b.labels ?? []) {
+      if (!l.startsWith(RUN_LEASE_PREFIX)) continue;
+      const { expiry, owner } = parseRunLease(l);
+      if (expiry === undefined || expiry <= nowMs) continue; // expired: not a live contender
+      if (owner === ownRunId) continue; // our own lease
+      if (owner === undefined || owner <= ownRunId) return false; // a foreign owner sorts first → it wins
+    }
+    return true;
+  },
+
+  /**
+   * Publish/refresh the run-lease on the target, atomically replacing any existing lease labels
+   * (`stale`, e.g. the prior expiry this process published, or leftovers from a crashed run) in a
+   * single `bd update`. Removing a label that isn't present is a bd no-op, so a slightly-stale
+   * `stale` list is harmless. `owner` stamps the publishing run's id onto the lease so a resuming
+   * handler can distinguish its own lease from another machine's (see foreignRunLeaseLive).
+   */
+  publishRunLease: (
+    cwd: string,
+    id: string,
+    expiresAtMs: number,
+    stale: string[] = [],
+    owner?: string,
+  ) =>
+    bdWrite(cwd, [
+      "update",
+      id,
+      ...stale.flatMap((l) => ["--remove-label", l]),
+      "--add-label",
+      LABELS.runLease(expiresAtMs, owner),
+    ]),
+
+  /** Remove the given run-lease labels from the target (run settled). No-op when there are none. */
+  clearRunLease: (cwd: string, id: string, stale: string[]): Promise<string> =>
+    stale.length === 0
+      ? Promise.resolve("")
+      : bdWrite(cwd, ["update", id, ...stale.flatMap((l) => ["--remove-label", l])]),
 };

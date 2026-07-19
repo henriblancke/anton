@@ -13,6 +13,7 @@
  * See DESIGN.md §4.
  */
 import {
+  activeExecuteEpicId,
   activeExecuteEpicKeys,
   activeJobIdsForProject,
   complete,
@@ -37,7 +38,7 @@ import {
   type JobType,
 } from "./queue";
 import { reconcileInterruptedRuns } from "../runs";
-import { isPoisonError, isUsageLimitError } from "./errors";
+import { isPoisonError, isRunAlreadyLiveError, isUsageLimitError } from "./errors";
 import { PollingLoop } from "./polling-loop";
 
 export interface RunnerConfig {
@@ -94,6 +95,18 @@ export type JobPolicyResolver = (
   projectId: string | undefined,
 ) => Promise<JobPolicy> | JobPolicy;
 
+/**
+ * Is an execute-epic run already live for this project + epic on ANOTHER machine? (anton-jz1)
+ * Reads run-liveness from the shared board (beads/dolt) — the `jobs` table is machine-local and
+ * disposable, so it can't see a run executing on a different operator's machine. Used to gate a
+ * Force run so it can't double-run an epic already in flight elsewhere. Best-effort: returns false
+ * (fail open) on any error so a transient beads hiccup never blocks a legitimate run.
+ */
+export type LiveRunCheck = (
+  projectId: string,
+  epicBeadId: string,
+) => Promise<boolean> | boolean;
+
 export interface JobContext {
   jobId: string;
   type: JobType;
@@ -111,6 +124,7 @@ export type JobHandler = (ctx: JobContext) => Promise<void>;
 export type Outcome =
   | { kind: "success" }
   | { kind: "quota"; resetAt?: number }
+  | { kind: "lease-held"; error: string }
   | { kind: "poison"; error: string }
   | { kind: "error"; error: string };
 
@@ -121,6 +135,7 @@ export type Action =
 
 export function classifyError(e: unknown): Outcome {
   if (isUsageLimitError(e)) return { kind: "quota", resetAt: e.resetAt };
+  if (isRunAlreadyLiveError(e)) return { kind: "lease-held", error: e.message };
   if (isPoisonError(e)) return { kind: "poison", error: e.message };
   return { kind: "error", error: e instanceof Error ? e.message : String(e) };
 }
@@ -142,6 +157,18 @@ export function nextAction(
         runAtMs,
         refundAttempt: true,
         lastError: `usage-limit: resumes at ${new Date(runAtMs).toISOString()}`,
+      };
+    }
+    case "lease-held": {
+      // A run is live on another machine (anton-jz1). Retry after a cool-off, refunding the attempt:
+      // it's not this job's failure and the foreign run may hold its lease for a long time, so it
+      // must never park for a human — it re-checks liveness each time until the lease clears.
+      const runAtMs = nowMs + config.quotaCooloffMs;
+      return {
+        action: "reschedule",
+        runAtMs,
+        refundAttempt: true,
+        lastError: `run live elsewhere: retries at ${new Date(runAtMs).toISOString()}`,
       };
     }
     case "poison":
@@ -178,6 +205,7 @@ export class JobRunner {
   private readonly quiescedProjects = new Set<string>();
   private readonly log: RunnerLogger;
   private readonly resolvePolicy: JobPolicyResolver | null;
+  private readonly liveRunCheck: LiveRunCheck | null;
 
   private readonly inFlight = new Map<string, AbortController>();
   /** Settlement promises for jobs dispatched but not yet settled — the drain set for whenIdle(). */
@@ -195,12 +223,20 @@ export class JobRunner {
      * runner falls back to its config (global maxConcurrent / maxAttempts, no timeout).
      */
     resolvePolicy?: JobPolicyResolver;
+    /**
+     * Cross-machine run-liveness source (anton-jz1). When set, a fresh execute-epic enqueue that
+     * has no active job in THIS machine's store is gated on it: if a run is already live for the
+     * epic on another machine (read from the shared beads board), no second run is started. Omit
+     * to keep the pre-jz1 behavior (machine-local dedupe only).
+     */
+    liveRunCheck?: LiveRunCheck;
   }) {
     this.db = deps.db;
     this.clock = deps.clock ?? systemClock;
     this.config = { ...DEFAULT_CONFIG, ...deps.config };
     this.log = deps.log ?? noopLog;
     this.resolvePolicy = deps.resolvePolicy ?? null;
+    this.liveRunCheck = deps.liveRunCheck ?? null;
     this.loop = new PollingLoop({
       tickMs: this.config.tickMs,
       tick: async () => {
@@ -234,14 +270,48 @@ export class JobRunner {
   }
 
   /**
-   * Enqueue an execute-epic run, deduped against any active (queued|running) job for the same
-   * project + epic. Returns the existing job's id when one is active; else creates a fresh job.
-   * Race-safe via a transactional guard + partial unique index (anton-761).
+   * Enqueue an execute-epic run, deduped against any active run for the same project + epic —
+   * both this machine's `jobs` table (anton-761) AND, when a `liveRunCheck` is wired, the shared
+   * beads board (anton-jz1). Returns the active job's id when one already exists in THIS store;
+   * `undefined` when a run is live on ANOTHER machine (nothing enqueued here — the other run
+   * covers it); otherwise the id of a freshly-created `queued` job. Race-safe locally via a
+   * transactional guard + partial unique index.
    */
-  enqueueExecuteEpic(projectId: string, epicBeadId: string): string {
+  async enqueueExecuteEpic(
+    projectId: string,
+    epicBeadId: string,
+  ): Promise<string | undefined> {
     if (this.quiescedProjects.has(projectId)) {
       throw new Error(`Project is being deleted: ${projectId}`);
     }
+    // A job already active in this store (queued|running) short-circuits every other check: it IS
+    // this machine's live/pending run for the epic, so return it (the existing dedupe contract).
+    const localActive = activeExecuteEpicId(this.db, projectId, epicBeadId);
+    if (localActive) return localActive;
+
+    // No local job. Before starting a fresh run, consult the shared board: if a run is live on
+    // another machine, don't double-run — the `jobs` table can't see it because it's machine-local
+    // and disposable (anton-jz1). Fail open so a beads hiccup never blocks a legitimate run.
+    if (this.liveRunCheck) {
+      let live = false;
+      try {
+        live = await this.liveRunCheck(projectId, epicBeadId);
+      } catch (e) {
+        this.log.error(`liveRunCheck failed for ${projectId}/${epicBeadId}; enqueuing anyway`, e);
+      }
+      if (live) return undefined;
+    }
+
+    // Re-check quiescence AFTER the await (anton-jz1). `liveRunCheck` yields, and `quiesceProject()`
+    // can run during it: it sets the flag then calls `abortProject`, which saw no active job for us
+    // (our row isn't inserted yet) and proceeded to tear the project down. Enqueuing now would strand
+    // an execute-epic row for a project being deleted, so re-gate exactly like the pre-await check
+    // above before inserting. (`abortProject`'s own post-sweep leftover guard fails loud if a row
+    // still slips in after this, so the two together close the window.)
+    if (this.quiescedProjects.has(projectId)) {
+      throw new Error(`Project is being deleted: ${projectId}`);
+    }
+
     return enqueueExecuteEpicDeduped(this.db, this.clock, projectId, epicBeadId);
   }
 
