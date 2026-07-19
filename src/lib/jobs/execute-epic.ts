@@ -389,7 +389,10 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // is skipped straight to the PR step below — its agent never runs again on this resume. Both
       // the allowlist gate here and the ticket loop share this "won't run" predicate so neither
       // acts on a resume marker: gating on a since-disabled agent would park a retry that only has
-      // the (agent-free) PR step left to do.
+      // the (agent-free) PR step left to do. Caveat: "won't run" holds only when the ticket's commit
+      // is actually on this branch. A done-on-board ticket whose commit is missing (cross-machine
+      // resume) DOES re-run, so the loop re-applies this allowlist gate there — the worktree needed
+      // to prove commit presence doesn't exist yet at this point.
       const inReview = LABELS.stage("in-review");
       const isResumeSkipped = (t: Bead) =>
         t.status === "closed" || (standaloneRun && (t.labels?.includes(inReview) ?? false));
@@ -706,6 +709,23 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
             await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
           }
           continue;
+        }
+        // Done on the board but the commit is missing from this branch (cross-machine resume): the
+        // work must be regenerated here, which re-runs the ticket's agent. Step 0b's allowlist gate
+        // SKIPPED this ticket — isResumeSkipped treats any done-on-board bead as "won't run", which
+        // is only true when its commit is present. Now that we know it WILL re-run, re-gate it here
+        // (anton-jz1): a ticket whose `agent:` label was disabled since it first closed must
+        // poison-park, exactly as step 0b does, rather than silently regenerate under the default
+        // agent. Checked before the reopen/runTicket so the re-run never starts.
+        if (doneOnBoard) {
+          const disabled = inactiveAgentTickets([ticket], settings.agents);
+          if (disabled.length > 0) {
+            throw new PoisonEpic(
+              `epic ${epicBeadId} needs agents disabled in this project's settings: ` +
+                disabled.map((x) => `${x.id} → agent:${x.agent}`).join(", ") +
+                ` — enable them in Settings → Agents (or relabel the tickets), then resume the run`,
+            );
+          }
         }
         // Done on the board but the commit is missing from this branch (cross-machine resume): the
         // work must be regenerated here. Reopen a closed child first so runTicket's claim + close
