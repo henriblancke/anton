@@ -964,13 +964,18 @@ process.exit(0);`,
     // Another operator owns it before the lease, exactly as in the take-over case.
     await beads.assign(repo, epic6, "thief-operator");
 
-    // Strip this runner of any operator identity: unset ANTON_OPERATOR and point git's global
-    // config at /dev/null so `git config --global user.name` resolves nothing → resolveOperator()
-    // returns undefined. Restored in `finally` so later tests keep the suite's test-operator.
+    // Strip this runner of any operator identity: unset ANTON_OPERATOR, point git's global config
+    // at /dev/null so `git config --global user.name` resolves nothing, AND unset $USER/$USERNAME
+    // so resolveOperator's final osUser() rung misses too → resolveOperator() returns undefined.
+    // Restored in `finally` so later tests keep the suite's test-operator.
     const savedOperator = process.env.ANTON_OPERATOR;
     const savedGitGlobal = process.env.GIT_CONFIG_GLOBAL;
+    const savedUser = process.env.USER;
+    const savedUsername = process.env.USERNAME;
     delete process.env.ANTON_OPERATOR;
     process.env.GIT_CONFIG_GLOBAL = "/dev/null";
+    delete process.env.USER;
+    delete process.env.USERNAME;
     resetOperatorCache();
     try {
       const runner = new JobRunner({
@@ -1005,6 +1010,10 @@ process.exit(0);`,
       else process.env.ANTON_OPERATOR = savedOperator;
       if (savedGitGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL;
       else process.env.GIT_CONFIG_GLOBAL = savedGitGlobal;
+      if (savedUser === undefined) delete process.env.USER;
+      else process.env.USER = savedUser;
+      if (savedUsername === undefined) delete process.env.USERNAME;
+      else process.env.USERNAME = savedUsername;
       resetOperatorCache();
     }
   }, 60_000);

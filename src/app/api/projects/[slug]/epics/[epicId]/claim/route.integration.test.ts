@@ -176,10 +176,15 @@ suite("claim route (temp anton.db + real bd)", () => {
     await beads.assign(repo, epic, "bob");
     delete process.env.ANTON_OPERATOR;
     resetOperatorCache();
-    // The fallback identity must miss too, or this wouldn't be the case under test. Point git's
-    // global config at an empty file so the host's own user.name can't resolve one for us.
+    // Every fallback rung must miss too, or this wouldn't be the case under test: point git's
+    // global config at an empty file so the host's user.name can't resolve one, AND strip
+    // $USER/$USERNAME so resolveOperator's final osUser() rung can't either (mirrors operator.test).
     const realGlobalConfig = process.env.GIT_CONFIG_GLOBAL;
+    const realUser = process.env.USER;
+    const realUsername = process.env.USERNAME;
     process.env.GIT_CONFIG_GLOBAL = join(workDir, "empty-gitconfig");
+    delete process.env.USER;
+    delete process.env.USERNAME;
     try {
       const res = await del("claimy", epic, { steal: true });
       expect(res.status).toBe(409);
@@ -188,6 +193,10 @@ suite("claim route (temp anton.db + real bd)", () => {
     } finally {
       if (realGlobalConfig === undefined) delete process.env.GIT_CONFIG_GLOBAL;
       else process.env.GIT_CONFIG_GLOBAL = realGlobalConfig;
+      if (realUser === undefined) delete process.env.USER;
+      else process.env.USER = realUser;
+      if (realUsername === undefined) delete process.env.USERNAME;
+      else process.env.USERNAME = realUsername;
       resetOperatorCache();
     }
   }, 60_000);

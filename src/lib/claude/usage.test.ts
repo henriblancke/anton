@@ -32,17 +32,20 @@ describe("usageEnabled", () => {
     delete process.env[USAGE_FLAG_ENV];
   });
 
-  it("is off by default (flag unset) so the pill ships dark", () => {
+  it("is on by default (flag unset) so the pill ships live", () => {
     delete process.env[USAGE_FLAG_ENV];
-    expect(usageEnabled()).toBe(false);
-  });
-
-  it.each(["1", "true", "TRUE", "on", "yes", " true "])("treats %o as enabled", (value) => {
-    process.env[USAGE_FLAG_ENV] = value;
     expect(usageEnabled()).toBe(true);
   });
 
-  it.each(["", "0", "false", "off", "no"])("treats %o as disabled", (value) => {
+  it.each(["1", "true", "TRUE", "on", "yes", " true ", "", "anything"])(
+    "treats %o as enabled",
+    (value) => {
+      process.env[USAGE_FLAG_ENV] = value;
+      expect(usageEnabled()).toBe(true);
+    },
+  );
+
+  it.each(["0", "false", "FALSE", "off", "no", " off "])("treats %o as disabled", (value) => {
     process.env[USAGE_FLAG_ENV] = value;
     expect(usageEnabled()).toBe(false);
   });

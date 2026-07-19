@@ -13,7 +13,7 @@
  *     the token stays fresh — the pill just reads whatever is current and hides when it can't.
  *   • Cache server-side (short TTL) so many page loads collapse to one upstream fetch. The
  *     endpoint is cheap but undocumented; never hit it per request.
- *   • Dark until `ANTON_USAGE_PILL` is enabled — the whole epic ships behind this flag.
+ *   • On by default — set `ANTON_USAGE_PILL` to a falsy value (`0`/`false`/`off`/`no`) to opt out.
  */
 import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
@@ -23,7 +23,7 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
-/** Feature flag: usage fetching is dark (returns null) until this env var is truthy. */
+/** Kill switch: usage fetching is on by default; set this env var falsy to turn the pill dark. */
 export const USAGE_FLAG_ENV = "ANTON_USAGE_PILL";
 
 /** Endpoint the Claude Code CLI's own `fetchUtilization()` calls. Undocumented; OAuth-gated. */
@@ -49,12 +49,16 @@ export interface ClaudeUsage {
   plan: string | null;
 }
 
-/** True when the usage pill is switched on for this deployment. */
+/**
+ * True when the usage pill is switched on for this deployment. On by default; only an explicit
+ * falsy value (`0` / `false` / `off` / `no`) turns it off. Anything else — including unset —
+ * leaves it enabled.
+ */
 export function usageEnabled(): boolean {
   const raw = process.env[USAGE_FLAG_ENV];
-  if (!raw) return false;
+  if (raw === undefined) return true;
   const v = raw.trim().toLowerCase();
-  return v === "1" || v === "true" || v === "on" || v === "yes";
+  return !(v === "0" || v === "false" || v === "off" || v === "no");
 }
 
 interface OAuthCreds {
