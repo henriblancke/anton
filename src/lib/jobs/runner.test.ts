@@ -8,7 +8,7 @@ import { eq } from "drizzle-orm";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
 import { PoisonError, RunAlreadyLiveError, UsageLimitError } from "./errors";
-import { enqueue, getJob, toMs, type Clock } from "./queue";
+import { complete, enqueue, getJob, park, reschedule, toMs, type Clock } from "./queue";
 import {
   classifyError,
   DEFAULT_CONFIG,
@@ -413,6 +413,27 @@ describe("JobRunner (live, in-memory db)", () => {
     expect(await r.cancel(q)).toBe(true);
     expect(await r.cancel(q)).toBe(false);
     expect(await r.cancel("does-not-exist")).toBe(false);
+  });
+
+  it("cancel() wins when a stale settlement tries to transition the job afterward", async () => {
+    const transitions = [
+      (id: string) => complete(tdb.db, clock, id),
+      (id: string) => reschedule(tdb.db, clock, id, clock.now() + 1_000),
+      (id: string) => park(tdb.db, clock, id, "stale failure"),
+    ];
+
+    for (const transition of transitions) {
+      const r = runner(async () => {});
+      const id = await r.enqueue({ type: "execute-epic" });
+      await tdb.db
+        .update(schema.jobs)
+        .set({ status: "running", leaseExpiresAt: new Date(clock.now() + CONFIG.leaseMs) })
+        .where(eq(schema.jobs.id, id));
+
+      expect(await r.cancel(id)).toBe(true);
+      await transition(id);
+      expect((await getJob(tdb.db, id))?.status).toBe("cancelled");
+    }
   });
 
   it("reconcile() reclaims orphaned running jobs and fails only truly-orphaned runs (anton-nbd)", async () => {

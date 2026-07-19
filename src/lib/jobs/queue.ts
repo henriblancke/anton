@@ -407,7 +407,7 @@ export async function leaseDue(
   if (due.length === 0) return [];
 
   const ids = due.map((j) => j.id);
-  await db
+  const leased = await db
     .update(schema.jobs)
     .set({
       status: "running",
@@ -415,10 +415,12 @@ export async function leaseDue(
       attempts: sql`${schema.jobs.attempts} + 1`,
       updatedAt: nowDate,
     })
-    .where(inArray(schema.jobs.id, ids));
+    // Candidates can be cancelled after the SELECT above. Re-assert runnable state here so a
+    // successful cancel is terminal, and return only rows this UPDATE actually leased.
+    .where(and(inArray(schema.jobs.id, ids), runnable))
+    .returning();
 
-  // Return the leased rows re-read so callers see the incremented attempts + new lease.
-  return db.select().from(schema.jobs).where(inArray(schema.jobs.id, ids));
+  return leased;
 }
 
 /**
@@ -456,7 +458,7 @@ export async function complete(db: AntonDb, clock: Clock, jobId: string): Promis
   await db
     .update(schema.jobs)
     .set({ status: "done", leaseExpiresAt: null, lastError: null, updatedAt: secDate(nowMs) })
-    .where(eq(schema.jobs.id, jobId));
+    .where(and(eq(schema.jobs.id, jobId), eq(schema.jobs.status, "running")));
 }
 
 /**
@@ -484,7 +486,7 @@ export async function reschedule(
         : schema.jobs.attempts,
       updatedAt: secDate(nowMs),
     })
-    .where(eq(schema.jobs.id, jobId));
+    .where(and(eq(schema.jobs.id, jobId), eq(schema.jobs.status, "running")));
 }
 
 /**
@@ -502,7 +504,7 @@ export async function park(
   await db
     .update(schema.jobs)
     .set({ status: "parked", leaseExpiresAt: null, lastError, updatedAt: secDate(nowMs) })
-    .where(eq(schema.jobs.id, jobId));
+    .where(and(eq(schema.jobs.id, jobId), eq(schema.jobs.status, "running")));
 }
 
 /**

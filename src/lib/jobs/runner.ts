@@ -533,11 +533,9 @@ export class JobRunner {
   private async settle(job: JobRow, outcome: Outcome, policy: JobPolicy): Promise<void> {
     // Re-read attempts (a heartbeat/lease may have advanced updatedAt, not attempts, but be safe).
     const fresh = (await getJob(this.db, job.id)) ?? job;
-    // A concurrent cancel (anton-a4jj) terminalized this row while the handler ran — its abort is what
-    // made the handler throw. `cancelled` is terminal, and cancel completes its DB write + abort before
-    // the handler's rejection propagates here, so this read always observes it. Settling now would
-    // resurrect the job (an aborted handler classifies as a retryable `error` → reschedule to `queued`),
-    // so treat settle as a no-op, mirroring abortProject's deleted-row no-op.
+    // Fast-path a cancel already visible at this read. The queue transition below also compares from
+    // `running`, which closes the remaining race where cancel lands after this check but before the
+    // settle write.
     if (fresh.status === "cancelled") return;
     // The project's retry budget governs when we park; backoff/quota stay from the runner config.
     const config = { ...this.config, maxAttempts: policy.maxAttempts };
