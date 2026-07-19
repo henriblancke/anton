@@ -74,6 +74,11 @@ export async function updateTicket(
 ): Promise<TicketDetail> {
   const current = await beads.show(project.repoPath, id);
   await beads.update(project.repoPath, id, patch, current.labels ?? []);
+  // Read-after-write: return the post-write detail, not the stale snapshot the board serves. This
+  // MUST complete before the sync below: a succeeding sync calls invalidateIssueSnapshot, bumping
+  // the snapshot generation, which makes refreshIssueSnapshot discard this fresh loader's result and
+  // serve the retained pre-edit beads — the exact form reset this fresh read exists to prevent.
+  const detail = await getTicketDetail(project, id, true);
   // Fire-and-forget (like the claim route's nudgeSync): the update already landed locally, so don't
   // block the save response on a `bd dolt pull/commit/push` a slow/unreachable remote could stall. A
   // failed push is recorded as "failing"/unpushed in the sync-status registry inside beads.sync and
@@ -81,8 +86,7 @@ export async function updateTicket(
   void beads
     .sync(project.repoPath)
     .catch((e) => console.error(`[ticket-detail] beads dolt sync failed after updating ${id}`, e));
-  // Read-after-write: return the post-write detail, not the stale snapshot the board serves.
-  return getTicketDetail(project, id, true);
+  return detail;
 }
 
 /**

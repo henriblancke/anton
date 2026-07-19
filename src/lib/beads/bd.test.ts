@@ -431,7 +431,7 @@ describe("createDoltSync", () => {
 
   it("resolves a backstop to a push-retry when ahead and to pull-only otherwise", async () => {
     const cwd = `/backstop-resolve-${Math.random()}`;
-    let pushFails = true;
+    let pushFails = false;
     const calls: string[][] = [];
     const sync = createDoltSync(async (_cwd, args) => {
       calls.push(args);
@@ -441,11 +441,17 @@ describe("createDoltSync", () => {
       return "";
     });
 
-    // Not ahead yet: the backstop is pull-only.
+    // The first backstop reconciles the repo with a full pass (its push lands), so it is caught up.
+    await sync(cwd, "backstop");
+    expect(calls).toContainEqual(["dolt", "push"]);
+
+    // Caught up and reconciled: the backstop drops to pull-only.
+    calls.length = 0;
     await sync(cwd, "backstop");
     expect(calls).toEqual([["dolt", "pull"]]);
 
     // A write-nudged full pass whose push fails leaves the repo ahead of its remote.
+    pushFails = true;
     await sync(cwd, "full").catch(() => {});
 
     // Now the backstop retries the push (still failing → still ahead).
@@ -456,6 +462,38 @@ describe("createDoltSync", () => {
     // Once the push lands the repo is no longer ahead: the backstop drops back to pull-only.
     pushFails = false;
     await sync(cwd, "backstop"); // this retry lands the push, clearing the ahead flag
+    calls.length = 0;
+    await sync(cwd, "backstop");
+    expect(calls).toEqual([["dolt", "pull"]]);
+  });
+
+  it("a cold-start backstop reconciles stranded commits even when the in-memory count is 0", async () => {
+    // Simulates a restart: a fresh coalescer (empty in-memory backlog) whose local Dolt has commits
+    // a crashed process committed but never pushed. The count reads 0, yet the first backstop must
+    // still run a full pass so those commits ship — never pull forever without pushing them.
+    const cwd = `/backstop-coldstart-${Math.random()}`;
+    let pushFails = true;
+    const calls: string[][] = [];
+    const sync = createDoltSync(async (_cwd, args) => {
+      calls.push(args);
+      if (args[1] === "push" && pushFails) throw execError({ stderr: "Error: push failed: reset" });
+      return "";
+    });
+
+    // Count is 0 (nothing recorded this process), yet the very first backstop attempts a push.
+    expect(getSyncStatus(cwd).unpushedCount).toBe(0);
+    await sync(cwd, "backstop").catch(() => {});
+    expect(calls).toContainEqual(["dolt", "push"]);
+
+    // The push still fails, so the repo stays unreconciled: the next backstop keeps trying a full
+    // pass rather than lapsing to pull-only and stranding the commits.
+    calls.length = 0;
+    await sync(cwd, "backstop").catch(() => {});
+    expect(calls).toContainEqual(["dolt", "push"]);
+
+    // Once the push lands, the repo is reconciled and the backstop goes quiet (pull-only).
+    pushFails = false;
+    await sync(cwd, "backstop");
     calls.length = 0;
     await sync(cwd, "backstop");
     expect(calls).toEqual([["dolt", "pull"]]);

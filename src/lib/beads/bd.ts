@@ -206,9 +206,10 @@ export type SyncMode = "full" | "pull";
 
 /**
  * What the coalescer accepts. "backstop" is the heartbeat's push safety net (anton-sr8f): the
- * coalescer resolves it to "full" when the repo has unpushed local commits (a prior push failed)
- * and to "pull" otherwise — so a failed push is retried on the next beat until it lands, while a
- * repo that is not ahead of its remote stays quiet. Routes through the same per-repo coalescer as
+ * coalescer resolves it to "full" when the repo has unpushed local commits (a prior push failed) OR
+ * has not yet been reconciled by this process (a cold start after a crash can't trust the in-memory
+ * backlog count), and to "pull" otherwise — so stranded commits are always retried until they land,
+ * while a caught-up, reconciled repo stays quiet. Routes through the same per-repo coalescer as
  * "full"/"pull", so a backstop push can never overlap a write-nudged one (beads GH#2466).
  */
 export type SyncRequest = SyncMode | "backstop";
@@ -281,6 +282,12 @@ export function createDoltSync(exec: BdExec = bd): (cwd: string, mode?: SyncRequ
   const trailingMode = new Map<string, SyncMode>(); // live handle so an upgrade reaches the queued run
   const trailingNewWork = new Map<string, boolean>(); // did any queued request carry new local work?
 
+  // Repos whose backlog this process has reconciled against the remote — a full pass has pushed
+  // (or resolved not-wired) at least once. `unpushedCount` lives only in memory, so after a restart
+  // a repo left ahead by a crashed process reads count 0; until reconciled, a backstop must run a
+  // full pass rather than trust that 0 to mean "caught up" and pull forever (anton-z908 review).
+  const reconciled = new Set<string>();
+
   // `newWork` is true only for a write-nudged full pass, which may carry a genuinely new local
   // commit. A backstop retry (newWork=false) re-attempts already-counted work and commits nothing
   // new, so it must never grow the backlog — otherwise a flaky remote turns one stranded change into
@@ -290,6 +297,7 @@ export function createDoltSync(exec: BdExec = bd): (cwd: string, mode?: SyncRequ
     const p = runDoltSync(cwd, exec, mode).then((outcome) => {
       if (outcome === "not-wired") {
         recordStatus(cwd, { state: "not-wired", lastError: null });
+        reconciled.add(cwd); // no remote to reconcile against — stop forcing full backstop passes
       } else {
         // Retain the last valid data while a background read refreshes after the remote pull.
         invalidateIssueSnapshot(cwd);
@@ -302,6 +310,7 @@ export function createDoltSync(exec: BdExec = bd): (cwd: string, mode?: SyncRequ
           lastError: null,
           ...(mode === "full" ? { lastPushedAt: now, unpushedCount: 0 } : {}),
         });
+        if (mode === "full") reconciled.add(cwd); // a full pass pushed — the backlog is reconciled
       }
     });
     running.set(cwd, p);
@@ -323,9 +332,16 @@ export function createDoltSync(exec: BdExec = bd): (cwd: string, mode?: SyncRequ
   };
 
   return function sync(cwd: string, request: SyncRequest = "full"): Promise<void> {
-    // Resolve the backstop against the recorded backlog: push-retry only when a prior push failed.
+    // Resolve the backstop to a push-retry when a prior push failed (recorded backlog) OR when this
+    // process has not yet reconciled the repo — the backlog is in-memory only, so a cold start after
+    // a crash that stranded local commits reads count 0 and must NOT pull forever without shipping
+    // them (anton-z908 review). A caught-up, already-reconciled repo stays pull-only and quiet.
     const mode: SyncMode =
-      request === "backstop" ? (getSyncStatus(cwd).unpushedCount > 0 ? "full" : "pull") : request;
+      request === "backstop"
+        ? getSyncStatus(cwd).unpushedCount > 0 || !reconciled.has(cwd)
+          ? "full"
+          : "pull"
+        : request;
     // Only a write-nudge introduces new local work; a backstop is a retry of already-counted commits.
     const newWork = request === "full";
     const queued = trailing.get(cwd);
@@ -516,10 +532,13 @@ export const beads = {
   pull: (cwd: string): Promise<void> => doltSync(cwd, "pull"),
 
   /**
-   * Heartbeat backstop pass (anton-sr8f): pulls, plus retries a push ONLY when this repo has
-   * unpushed local commits (a prior write-nudged push failed). A repo that is not ahead pulls
-   * only — idle repos stay quiet. Shares the per-repo coalescer with `sync`/`pull`, so a backstop
-   * push can never overlap a write-nudged one (beads GH#2466); a not-wired repo is unaffected.
+   * Heartbeat backstop pass (anton-sr8f): pulls, plus retries a push when this repo has unpushed
+   * local commits (a prior write-nudged push failed) OR has not yet been reconciled by this process
+   * — the first backstop after a (re)start runs one reconciling full pass so commits stranded by a
+   * crash before their push still ship, since the in-memory backlog count can't survive a restart
+   * (anton-z908). A caught-up, reconciled repo pulls only — idle repos stay quiet. Shares the
+   * per-repo coalescer with `sync`/`pull`, so a backstop push can never overlap a write-nudged one
+   * (beads GH#2466); a not-wired repo is unaffected.
    */
   backstop: (cwd: string): Promise<void> => doltSync(cwd, "backstop"),
 

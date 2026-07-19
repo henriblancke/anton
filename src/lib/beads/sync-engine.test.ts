@@ -177,7 +177,7 @@ describe("createSyncEngine", () => {
     expect(pushes).toHaveLength(3);
   });
 
-  it("backstop does not push on the beat for a repo that is not ahead (idle stays quiet)", async () => {
+  it("backstop reconciles once on the cold-start beat, then stays quiet for a repo that is not ahead", async () => {
     const cwd = `/engine-idle-${Math.random()}`;
     const pushes: string[] = [];
     const sync = createDoltSync(async (c, args) => {
@@ -188,11 +188,14 @@ describe("createSyncEngine", () => {
       listProjects: () => projects(cwd),
       sync: (c) => sync(c, "backstop" as SyncRequest),
     });
-    await engine.tick();
+    await engine.tick(); // cold start: one reconciling full pass (its push lands) — count can't survive a restart
+    expect(pushes).toEqual([cwd]);
+    clock.advance(10_000);
+    await engine.tick(); // reconciled + not ahead → pull-only
     clock.advance(10_000);
     await engine.tick();
-    expect(pushes).toEqual([]); // never ahead → never pushes
-    expect(getSyncStatus(cwd).state).toBe("synced"); // pull-only pass still succeeds
+    expect(pushes).toEqual([cwd]); // no further pushes — idle stays quiet after the reconcile
+    expect(getSyncStatus(cwd).state).toBe("synced");
   });
 
   it("start() is idempotent and stop() halts the loop", async () => {

@@ -2,9 +2,11 @@
  * Per-project heartbeat that keeps every managed project's local beads DB fresh against its
  * configured Dolt remote (anton-live-sync). Each beat runs one BACKSTOP pass through the shared
  * coalescer in bd.ts: always a pull, plus a push when the repo is ahead of its remote — i.e. a
- * prior write-nudged push failed and left work committed-but-unpushed (anton-sr8f). A repo that is
- * not ahead pulls only, so idle anton instances never hammer a shared remote (see SyncRequest in
- * bd.ts). Started once at server boot alongside the job runner; status lands in the globalThis
+ * prior write-nudged push failed and left work committed-but-unpushed (anton-sr8f), plus one
+ * reconciling full pass on the first beat after a (re)start so commits stranded by a crash still
+ * ship (the in-memory backlog count can't survive a restart). A caught-up, reconciled repo pulls
+ * only, so idle anton instances never hammer a shared remote (see SyncRequest in bd.ts). Started
+ * once at server boot alongside the job runner; status lands in the globalThis
  * sync-status registry that API routes read.
  */
 import { beads, getSyncStatus } from "./bd";
