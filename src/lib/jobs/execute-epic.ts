@@ -2,7 +2,9 @@
  * execute-epic job (anton-dzh.4). For an approved epic: warm a worktree, then per ticket run
  * `claude` (with the ticket's agent prompt) → run tests → commit; when all tickets are done, open
  * ONE PR via `gh` and move the epic to in-review. Idempotent/resumable — a re-run (crash, quota
- * backoff) skips tickets already closed and reuses the existing worktree. See DESIGN.md §4/§7.
+ * backoff) reuses the existing worktree and skips tickets already closed WHOSE COMMIT is on this
+ * branch; a cross-machine resume re-runs a board-closed ticket whose commit never got pushed. See
+ * DESIGN.md §4/§7.
  */
 import { randomUUID } from "node:crypto";
 import { beads, LABELS, type Bead } from "../beads/bd";
@@ -12,7 +14,13 @@ import { loadAgentPrompt } from "../claude/agent-prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
 import { runClaude, type ClaudeEvent } from "../claude/driver";
 import { formatAntonResult, parseAntonResult } from "../claude/anton-result";
-import { commitAll, openPullRequest, pullRequestState, resolveFreshBase } from "../git/ops";
+import {
+  commitAll,
+  openPullRequest,
+  pullRequestState,
+  resolveFreshBase,
+  worktreeHasCommitFor,
+} from "../git/ops";
 import { createWorktree, findWorktree, removeWorktree } from "../git/worktree";
 import {
   getProjectById,
@@ -674,16 +682,36 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //    the PR step here rather than re-running claude/tests/commit on already-committed work.
       for (const ticket of orderTickets(tickets, all)) {
         assertLeaseHeld(); // yield before starting a ticket if the shared lease has lapsed
-        if (ticket.status === "closed") continue;
-        if (standaloneRun && (ticket.labels?.includes(inReview) ?? false)) {
-          // Resume after a failed PR step: this ticket already committed and moved to in-review on
-          // a prior attempt. Step 2 above re-tagged the target stage:implementing (it can't tell a
-          // fresh run from a resume), and runTicket — the only standalone path that clears
-          // implementing — is being skipped here. Clear it now so the ticket doesn't carry BOTH
-          // stage labels into merge-finalize, which strips only in-review and would otherwise leave
-          // a stale implementing label (making a reopened bead derive as in-progress).
-          await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
+        // A ticket marked done on the board — a closed epic child, or a standalone target moved to
+        // stage:in-review — is only safe to SKIP if its commit is actually present on THIS
+        // worktree's branch (anton-jz1). Board state propagates cross-machine via `bd sync`, but the
+        // branch is pushed only at the PR step: a ticket another machine closed then parked/crashed
+        // on (before openPullRequest) has its commit solely in that machine's local, never-pushed
+        // worktree. This machine's fresh worktree branches off origin/<base> and lacks it, so
+        // skipping on board state alone would open the epic's single PR missing that work while the
+        // board still marks it done. Re-run it here so its commit lands on this branch. On a
+        // same-machine resume the worktree is reused and the commit is present, so this skips as
+        // before — no redundant re-run.
+        const doneOnBoard =
+          ticket.status === "closed" ||
+          (standaloneRun && (ticket.labels?.includes(inReview) ?? false));
+        if (doneOnBoard && (await worktreeHasCommitFor(worktree.path, ticket.id))) {
+          if (standaloneRun) {
+            // Resume after a failed PR step: this standalone ticket committed and moved to in-review
+            // on a prior attempt. Step 2 above re-tagged the target stage:implementing (it can't
+            // tell a fresh run from a resume), and runTicket — the only standalone path that clears
+            // implementing — is being skipped here. Clear it now so the ticket doesn't carry BOTH
+            // stage labels into merge-finalize, which strips only in-review and would otherwise
+            // leave a stale implementing label (making a reopened bead derive as in-progress).
+            await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
+          }
           continue;
+        }
+        // Done on the board but the commit is missing from this branch (cross-machine resume): the
+        // work must be regenerated here. Reopen a closed child first so runTicket's claim + close
+        // operate on a live bead (a standalone target is never closed, so it needs no reopen).
+        if (doneOnBoard && ticket.status === "closed") {
+          await safe(() => beads.reopen(repo, ticket.id));
         }
         await runTicket({
           db,

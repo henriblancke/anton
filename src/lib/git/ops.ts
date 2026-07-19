@@ -131,6 +131,27 @@ export async function branchAheadOfRemote(
   }
 }
 
+/**
+ * True when the branch checked out in `worktreePath` already contains the commit for `ticketId` —
+ * a commit whose subject starts with `<ticketId>:` (the shape execute-epic's `commitAll` writes).
+ *
+ * execute-epic's ticket loop uses this to tell a ticket that is done AND whose work lives on THIS
+ * branch apart from one merely marked done on the shared board (anton-jz1). Board state propagates
+ * cross-machine via `bd sync`, but the branch is pushed only at PR time — so a ticket another
+ * machine closed then crashed on (before opening the PR) has its commit solely in that machine's
+ * local, never-pushed worktree. Skipping such a ticket on board state alone would open the epic's PR
+ * missing that work. A run's own ticket commits are always at the branch tip, so bounding the scan
+ * is safe. Fails closed to `false` (git error → treat as absent → re-run) rather than risk a skip.
+ */
+export async function worktreeHasCommitFor(
+  worktreePath: string,
+  ticketId: string,
+): Promise<boolean> {
+  const subjects = await git(worktreePath, ["log", "--format=%s", "-n", "1000"]).catch(() => "");
+  const prefix = `${ticketId}:`;
+  return subjects.split("\n").some((s) => s.startsWith(prefix));
+}
+
 export interface PullRequest {
   url: string;
   /** beads external-ref form: `gh-<number>` when the number is parseable, else the url. */

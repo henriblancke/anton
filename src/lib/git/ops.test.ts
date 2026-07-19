@@ -9,7 +9,7 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openPullRequest, pullRequestState, resolveFreshBase } from "./ops";
+import { openPullRequest, pullRequestState, resolveFreshBase, worktreeHasCommitFor } from "./ops";
 import { GH_BIN_ENV } from "./ops";
 
 function has(cmd: string): boolean {
@@ -168,6 +168,46 @@ process.exit(0);
     // An unexpected state string also degrades to unknown rather than a bogus value.
     process.env.ANTON_TEST_PR_STATE = "DRAFT_WEIRD";
     expect(await pullRequestState(sandbox, "gh-42")).toBe("unknown");
+  });
+});
+
+suite("worktreeHasCommitFor (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-hascommit-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("detects a ticket's commit by its `<id>: …` subject, ignoring other commits", async () => {
+    writeFileSync(join(repo, "work.md"), "work\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "anton-jz1.2: implement the thing"]);
+
+    // The committed ticket is present; a sibling ticket that never committed here is absent — the
+    // exact cross-machine-resume signal execute-epic skips/re-runs on.
+    expect(await worktreeHasCommitFor(repo, "anton-jz1.2")).toBe(true);
+    expect(await worktreeHasCommitFor(repo, "anton-jz1.3")).toBe(false);
+    // A prefix collision must NOT false-positive: `anton-jz1.2` is not a commit for `anton-jz1`.
+    expect(await worktreeHasCommitFor(repo, "anton-jz1")).toBe(false);
+  });
+
+  it("returns false in a repo with no matching commit (fresh cross-machine worktree)", async () => {
+    expect(await worktreeHasCommitFor(repo, "anton-jz1.2")).toBe(false);
   });
 });
 
