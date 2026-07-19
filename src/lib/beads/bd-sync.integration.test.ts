@@ -73,6 +73,20 @@ suite("beads.sync integration (real bd · local bare remote)", () => {
     return refs.split("\n").find((l) => l.endsWith("refs/dolt/data"));
   };
 
+  // updateTicket fires its Dolt push fire-and-forget (off the save response path), so the remote ref
+  // moves shortly AFTER updateTicket resolves, not synchronously. Poll until it settles.
+  const waitForRef = async (
+    predicate: (ref: string | undefined) => boolean,
+    label: string,
+  ): Promise<string | undefined> => {
+    for (let i = 0; i < 100; i++) {
+      const ref = doltDataRef();
+      if (predicate(ref)) return ref;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    throw new Error(`timed out waiting for refs/dolt/data: ${label}`);
+  };
+
   it("a pull-only pass never moves the remote ref (heartbeats must not push)", async () => {
     // `bd dolt remote add` publishes refs/dolt/data once at wiring time; from then on only
     // write-nudged full passes may move it. A heartbeat pull with local uncommitted-to-remote
@@ -87,17 +101,24 @@ suite("beads.sync integration (real bd · local bare remote)", () => {
     const id = await beads.create(repo, { title: "Sync me", type: "task" });
     const beforeEdit = doltDataRef();
 
-    // The UI PATCH path: updateTicket writes via bd then syncs explicitly.
+    // The UI PATCH path: updateTicket writes via bd then fires the sync off the response path.
     await updateTicket(project, id, { title: "Synced title" });
 
-    const afterEdit = doltDataRef();
+    const afterEdit = await waitForRef(
+      (ref) => ref !== undefined && ref !== beforeEdit,
+      "moved after the first edit",
+    );
     expect(afterEdit, "refs/dolt/data exists on the remote after a ticket edit").toBeDefined();
     expect(afterEdit, "the write-nudged sync moved the remote ref").not.toBe(beforeEdit);
 
     // A second write moves the ref — every write reaches the remote, not just the first.
     await updateTicket(project, id, { priority: 1 });
-    expect(doltDataRef()).toBeDefined();
-    expect(doltDataRef()).not.toBe(afterEdit);
+    const afterSecond = await waitForRef(
+      (ref) => ref !== undefined && ref !== afterEdit,
+      "moved after the second edit",
+    );
+    expect(afterSecond).toBeDefined();
+    expect(afterSecond).not.toBe(afterEdit);
   }, 60_000);
 
   it("sync rejects loudly on a real remote failure (unreachable remote is not swallowed)", async () => {

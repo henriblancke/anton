@@ -225,10 +225,6 @@ export async function POST(
   }
   if (!swap.ok) return NextResponse.json(conflictBody(epicId, swap.owner), { status: 409 });
 
-  await beads
-    .sync(project.repoPath)
-    .catch((err) => console.error(`[approve] beads dolt sync failed after approving ${epicId}`, err));
-
   // Approval is the trigger: enqueue the autonomous execute-epic run (DESIGN.md §2/§7). Two paths:
   //
   // 1. A normal approval / re-approve (NOT a take-over) enqueues via the active-dedupe. This is the
@@ -269,9 +265,28 @@ export async function POST(
     console.error(`[approve] failed to enqueue execute-epic for ${epicId}`, err);
   }
 
+  // Read-after-write: force a fresh bead read so the response reflects the just-written approval and
+  // assignee. `getBoard` reads through the stale-tolerant snapshot, which the approve write only
+  // marked stale (retaining the pre-write beads) — so without this the 200 body could echo the old
+  // `approved`/`assignee` and ClaimControl would keep showing the previous owner until a later poll.
+  // This MUST land before the sync below: a succeeding sync invalidates the snapshot, and a sync
+  // completing mid-read would discard this fresh loader's result and serve the retained pre-write
+  // beads — the exact read-after-write ordering updateTicket enforces.
+  await refreshAllIssues(project.repoPath);
   // Re-read so the response reflects the post-approval state. The target is an epic or a standalone
   // chip; return whichever the board now carries. `epic` is kept for the existing epic-card client.
   const updatedBoard = await getBoard(project);
+
+  // Fire-and-forget (like the claim route's nudgeSync): the approve write already landed locally and
+  // the run enqueues off that local state, so don't block the response on a `bd dolt pull/commit/push`
+  // a slow/unreachable remote could stall. A failed push is recorded as "failing"/unpushed in the
+  // sync-status registry inside beads.sync and retried by the E1 heartbeat backstop — this catch only
+  // keeps the rejection from floating. Fired AFTER the fresh read above so its snapshot invalidation
+  // can't discard that read.
+  void beads
+    .sync(project.repoPath)
+    .catch((err) => console.error(`[approve] beads dolt sync failed after approving ${epicId}`, err));
+
   for (const stage of STAGES) {
     const updatedEpic = updatedBoard.columns[stage].find((e) => e.id === epicId);
     if (updatedEpic) {

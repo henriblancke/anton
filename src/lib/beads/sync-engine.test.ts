@@ -1,11 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
-import { createDoltSync, getSyncStatus, type SyncMode } from "./bd";
+import { createDoltSync, getSyncStatus, type SyncRequest } from "./bd";
 import { createSyncEngine, type SyncEngineDeps } from "./sync-engine";
 
 const silentLog = { info: () => {}, error: () => {} };
 
-/** Engine with manual time + injected pull; tests drive tick() directly (start() only loops it). */
-function engineWith(overrides: Partial<SyncEngineDeps> & { pull: SyncEngineDeps["pull"] }) {
+/** A promisified-execFile-shaped failure: message + captured stdout/stderr. */
+const execError = (out: { stdout?: string; stderr?: string }) =>
+  Object.assign(new Error("Command failed: bd"), out);
+
+/** Engine with manual time + injected sync; tests drive tick() directly (start() only loops it). */
+function engineWith(overrides: Partial<SyncEngineDeps> & { sync: SyncEngineDeps["sync"] }) {
   let now = 0;
   const clock = { now: () => now, advance: (ms: number) => (now += ms) };
   const engine = createSyncEngine({
@@ -27,7 +31,7 @@ describe("createSyncEngine", () => {
     const pulled: string[] = [];
     const { engine } = engineWith({
       listProjects: () => projects("/a", "/b"),
-      pull: async (cwd) => {
+      sync: async (cwd) => {
         pulled.push(cwd);
       },
     });
@@ -43,7 +47,7 @@ describe("createSyncEngine", () => {
           { repoPath: "/beads", hasBeads: true },
           { repoPath: "/plain", hasBeads: false },
         ]),
-      pull: async (cwd) => {
+      sync: async (cwd) => {
         pulled.push(cwd);
       },
     });
@@ -55,7 +59,7 @@ describe("createSyncEngine", () => {
     const pulled: string[] = [];
     const { engine, clock } = engineWith({
       listProjects: () => projects("/a"),
-      pull: async (cwd) => {
+      sync: async (cwd) => {
         pulled.push(cwd);
       },
     });
@@ -80,9 +84,9 @@ describe("createSyncEngine", () => {
     const pulled: number[] = [];
     const { engine, clock } = engineWith({
       listProjects: () => projects(cwd),
-      pull: (c) => {
+      sync: (c) => {
         pulled.push(clock.now());
-        return sync(c, "pull" as SyncMode);
+        return sync(c, "backstop" as SyncRequest);
       },
     });
 
@@ -108,7 +112,7 @@ describe("createSyncEngine", () => {
     const pulled: number[] = [];
     const { engine, clock } = engineWith({
       listProjects: () => projects("/flaky"),
-      pull: async () => {
+      sync: async () => {
         pulled.push(clock.now());
         throw new Error("connection reset");
       },
@@ -129,13 +133,69 @@ describe("createSyncEngine", () => {
     const pulled: string[] = [];
     const { engine } = engineWith({
       listProjects: () => projects("/bad", "/good"),
-      pull: async (cwd) => {
+      sync: async (cwd) => {
         pulled.push(cwd);
         if (cwd === "/bad") throw new Error("boom");
       },
     });
     await engine.tick();
     expect(pulled.sort()).toEqual(["/bad", "/good"]);
+  });
+
+  it("backstop pushes on the beat when the repo is ahead, and retries until the push lands", async () => {
+    // Real coalescer so the ahead-of-remote flag drives the backstop through injected exec.
+    const cwd = `/engine-ahead-${Math.random()}`;
+    let pushFails = true;
+    const pushes: number[] = [];
+    const sync = createDoltSync(async (_c, args) => {
+      if (args[1] === "push") {
+        pushes.push(1);
+        if (pushFails) throw execError({ stderr: "Error: push failed: connection reset" });
+      }
+      return "";
+    });
+    // A write-nudged full pass whose push fails leaves the repo committed-but-unpushed (ahead).
+    await sync(cwd, "full").catch(() => {});
+    expect(pushes).toHaveLength(1);
+
+    const { engine, clock } = engineWith({
+      listProjects: () => projects(cwd),
+      sync: (c) => sync(c, "backstop" as SyncRequest),
+    });
+
+    await engine.tick(); // ahead → backstop retries the push (still failing → beat backs off)
+    expect(pushes).toHaveLength(2);
+
+    pushFails = false;
+    clock.advance(20_000); // clear the failure backoff so the beat is due again
+    await engine.tick(); // still ahead → retries → lands this time
+    expect(pushes).toHaveLength(3);
+    expect(getSyncStatus(cwd).state).toBe("synced");
+
+    clock.advance(10_000);
+    await engine.tick(); // no longer ahead → pull-only, no further pushes
+    expect(pushes).toHaveLength(3);
+  });
+
+  it("backstop reconciles once on the cold-start beat, then stays quiet for a repo that is not ahead", async () => {
+    const cwd = `/engine-idle-${Math.random()}`;
+    const pushes: string[] = [];
+    const sync = createDoltSync(async (c, args) => {
+      if (args[1] === "push") pushes.push(c);
+      return "";
+    });
+    const { engine, clock } = engineWith({
+      listProjects: () => projects(cwd),
+      sync: (c) => sync(c, "backstop" as SyncRequest),
+    });
+    await engine.tick(); // cold start: one reconciling full pass (its push lands) — count can't survive a restart
+    expect(pushes).toEqual([cwd]);
+    clock.advance(10_000);
+    await engine.tick(); // reconciled + not ahead → pull-only
+    clock.advance(10_000);
+    await engine.tick();
+    expect(pushes).toEqual([cwd]); // no further pushes — idle stays quiet after the reconcile
+    expect(getSyncStatus(cwd).state).toBe("synced");
   });
 
   it("start() is idempotent and stop() halts the loop", async () => {
@@ -146,7 +206,7 @@ describe("createSyncEngine", () => {
         ticks += 1;
         return projects();
       },
-      pull: async () => {},
+      sync: async () => {},
     });
     engine.start();
     engine.start(); // no double loop

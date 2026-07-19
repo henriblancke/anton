@@ -527,11 +527,180 @@ describe("createDoltSync", () => {
     expect(getSyncStatus(cwd).state).toBe("not-wired");
   });
 
+  it("resolves a backstop to a push-retry when ahead and to pull-only otherwise", async () => {
+    const cwd = `/backstop-resolve-${Math.random()}`;
+    let pushFails = false;
+    const calls: string[][] = [];
+    const sync = createDoltSync(async (_cwd, args) => {
+      calls.push(args);
+      if (args[1] === "push" && pushFails) {
+        throw execError({ stderr: "Error: push failed: connection reset" });
+      }
+      return "";
+    });
+
+    // The first backstop reconciles the repo with a full pass (its push lands), so it is caught up.
+    await sync(cwd, "backstop");
+    expect(calls).toContainEqual(["dolt", "push"]);
+
+    // Caught up and reconciled: the backstop drops to pull-only.
+    calls.length = 0;
+    await sync(cwd, "backstop");
+    expect(calls).toEqual([["dolt", "pull"]]);
+
+    // A write-nudged full pass whose push fails leaves the repo ahead of its remote.
+    pushFails = true;
+    await sync(cwd, "full").catch(() => {});
+
+    // Now the backstop retries the push (still failing → still ahead).
+    calls.length = 0;
+    await sync(cwd, "backstop").catch(() => {});
+    expect(calls).toContainEqual(["dolt", "push"]);
+
+    // Once the push lands the repo is no longer ahead: the backstop drops back to pull-only.
+    pushFails = false;
+    await sync(cwd, "backstop"); // this retry lands the push, clearing the ahead flag
+    calls.length = 0;
+    await sync(cwd, "backstop");
+    expect(calls).toEqual([["dolt", "pull"]]);
+  });
+
+  it("a cold-start backstop reconciles stranded commits even when the in-memory count is 0", async () => {
+    // Simulates a restart: a fresh coalescer (empty in-memory backlog) whose local Dolt has commits
+    // a crashed process committed but never pushed. The count reads 0, yet the first backstop must
+    // still run a full pass so those commits ship — never pull forever without pushing them.
+    const cwd = `/backstop-coldstart-${Math.random()}`;
+    let pushFails = true;
+    const calls: string[][] = [];
+    const sync = createDoltSync(async (_cwd, args) => {
+      calls.push(args);
+      if (args[1] === "push" && pushFails) throw execError({ stderr: "Error: push failed: reset" });
+      return "";
+    });
+
+    // Count is 0 (nothing recorded this process), yet the very first backstop attempts a push.
+    expect(getSyncStatus(cwd).unpushedCount).toBe(0);
+    await sync(cwd, "backstop").catch(() => {});
+    expect(calls).toContainEqual(["dolt", "push"]);
+
+    // The push still fails, so the repo stays unreconciled: the next backstop keeps trying a full
+    // pass rather than lapsing to pull-only and stranding the commits.
+    calls.length = 0;
+    await sync(cwd, "backstop").catch(() => {});
+    expect(calls).toContainEqual(["dolt", "push"]);
+
+    // Once the push lands, the repo is reconciled and the backstop goes quiet (pull-only).
+    pushFails = false;
+    await sync(cwd, "backstop");
+    calls.length = 0;
+    await sync(cwd, "backstop");
+    expect(calls).toEqual([["dolt", "pull"]]);
+  });
+
+  it("a backstop push coalesces behind an in-flight full pass (never a concurrent push)", async () => {
+    const cwd = `/backstop-coalesce-${Math.random()}`;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let firstPushFails = true;
+    let park = false;
+    let parked = false;
+    const sync = createDoltSync(async (_cwd, args) => {
+      if (args[1] === "push" && firstPushFails) {
+        firstPushFails = false;
+        throw execError({ stderr: "Error: push failed: connection reset" });
+      }
+      if (args[1] === "commit" && park && !parked) {
+        parked = true;
+        await gate; // hold the in-flight full pass so a backstop must queue behind it
+      }
+      return "";
+    });
+
+    // Leave the repo ahead: the first full pass commits but its push fails.
+    await sync(cwd, "full").catch(() => {});
+
+    park = true;
+    const running = sync(cwd, "full"); // parks at commit, before its push
+    const backstop = sync(cwd, "backstop"); // ahead → resolves to full → must coalesce, not push now
+    const alsoBackstop = sync(cwd, "backstop");
+    expect(backstop).toBe(alsoBackstop); // the burst shares ONE trailing pass
+    expect(backstop).not.toBe(running); // and does not run concurrently with the in-flight pass
+
+    release();
+    await Promise.all([running, backstop, alsoBackstop]);
+  });
+
   it("getSyncStatus defaults to unknown for a never-synced cwd", () => {
     expect(getSyncStatus(`/never-${Math.random()}`)).toEqual({
       state: "unknown",
       lastSyncedAt: null,
+      lastPushedAt: null,
+      unpushedCount: 0,
       lastError: null,
     });
+  });
+
+  it("stamps lastPushedAt and clears the unpushed count when a full pass pushes", async () => {
+    const cwd = `/repo-pushed-${Math.random()}`;
+    const sync = createDoltSync(async () => "");
+    await sync(cwd, "full");
+    const status = getSyncStatus(cwd);
+    expect(status.lastPushedAt).toBeTypeOf("number");
+    expect(status.unpushedCount).toBe(0);
+  });
+
+  it("grows the unpushed count per failed push and clears it once a retry lands", async () => {
+    const cwd = `/repo-unpushed-${Math.random()}`;
+    let pushFails = true;
+    const sync = createDoltSync(async (_cwd, args) => {
+      if (args[1] === "push" && pushFails) throw execError({ stderr: "Error: push failed: reset" });
+      return "";
+    });
+
+    await sync(cwd, "full").catch(() => {});
+    expect(getSyncStatus(cwd).unpushedCount).toBe(1);
+    await sync(cwd, "full").catch(() => {});
+    expect(getSyncStatus(cwd).unpushedCount).toBe(2);
+
+    pushFails = false;
+    await sync(cwd, "full");
+    expect(getSyncStatus(cwd).unpushedCount).toBe(0);
+    expect(getSyncStatus(cwd).lastPushedAt).toBeTypeOf("number");
+  });
+
+  it("failed backstop retries do not inflate the unpushed count (one stranded change stays 1)", async () => {
+    const cwd = `/repo-backstop-noinflate-${Math.random()}`;
+    const sync = createDoltSync(async (_cwd, args) => {
+      if (args[1] === "push") throw execError({ stderr: "Error: push failed: reset" });
+      return "";
+    });
+
+    // One write-nudged full pass strands a single change locally.
+    await sync(cwd, "full").catch(() => {});
+    expect(getSyncStatus(cwd).unpushedCount).toBe(1);
+
+    // Every heartbeat backstop resolves to a full push-retry (repo is ahead) and fails, but retries
+    // re-attempt the same commit and must never grow the count — a flaky remote can't fake a backlog.
+    for (let i = 0; i < 4; i++) await sync(cwd, "backstop").catch(() => {});
+    expect(getSyncStatus(cwd).unpushedCount).toBe(1);
+  });
+
+  it("a pull-only pass moves lastSyncedAt but not lastPushedAt or the unpushed count", async () => {
+    const cwd = `/repo-pull-only-${Math.random()}`;
+    let pushFails = true;
+    const sync = createDoltSync(async (_cwd, args) => {
+      if (args[1] === "push" && pushFails) throw execError({ stderr: "Error: push failed: reset" });
+      return "";
+    });
+    // Leave the repo ahead of its remote (a full push failed), then run a pull-only pass.
+    await sync(cwd, "full").catch(() => {});
+    expect(getSyncStatus(cwd).unpushedCount).toBe(1);
+    pushFails = false; // a push would now succeed, but pull-only must not attempt one
+    await sync(cwd, "pull");
+    const status = getSyncStatus(cwd);
+    expect(status.state).toBe("synced");
+    expect(status.lastSyncedAt).toBeTypeOf("number");
+    expect(status.lastPushedAt).toBeNull(); // never pushed successfully
+    expect(status.unpushedCount).toBe(1); // still ahead — the backlog survives a pull
   });
 });
