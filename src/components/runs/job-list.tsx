@@ -16,6 +16,7 @@ const STATUS_STYLE: Record<JobStatus, { dot: string; text: string; pulse?: boole
   queued: { dot: "bg-stage-backlog", text: "text-muted-foreground" },
   parked: { dot: "bg-risk-med", text: "text-risk-med" },
   failed: { dot: "bg-risk-high", text: "text-risk-high" },
+  cancelled: { dot: "bg-muted-foreground", text: "text-muted-foreground" },
   done: { dot: "bg-stage-done", text: "text-stage-done" },
 };
 

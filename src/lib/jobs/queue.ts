@@ -28,8 +28,10 @@ export type JobType =
  *             transient failure that ran out of retries is recoverable, not a dead end (anton-ner.2).
  * `done`    — completed successfully.
  * `failed`  — terminal, non-retryable (reserved).
+ * `cancelled` — terminally killed by an operator (anton-a4jj). Unlike `parked`, no durability path
+ *             revives it: never re-leased, never reclaimed, and `resumeJob` refuses it.
  */
-export type JobStatus = "queued" | "running" | "parked" | "done" | "failed";
+export type JobStatus = "queued" | "running" | "parked" | "done" | "failed" | "cancelled";
 
 export type JobRow = typeof schema.jobs.$inferSelect;
 
@@ -89,6 +91,13 @@ export async function enqueue(
 
 /** The active statuses that must hold at most one execute-epic job per (project, epic). */
 const ACTIVE_STATUSES = ["queued", "running"] as const;
+
+/**
+ * Statuses a job can be cancelled from (anton-a4jj): anything still live — runnable (`queued`),
+ * in flight (`running`), or paused-but-recoverable (`parked`). The terminal statuses (`done`,
+ * `failed`, `cancelled`) are excluded, so a cancel of an already-terminal job is a no-op.
+ */
+const CANCELLABLE_STATUSES = ["queued", "running", "parked"] as const;
 
 /**
  * Statuses under which a local execute-epic job "covers" an epic for the take-over path: either
@@ -545,6 +554,27 @@ export async function resumeJob(db: AntonDb, clock: Clock, jobId: string): Promi
     throw e;
   }
   return true;
+}
+
+/**
+ * Terminalize a job as `cancelled` — the durable half of a force-kill (anton-a4jj). Flips a still-
+ * live job (`queued`/`running`/`parked`) to the terminal `cancelled` status and clears its lease so
+ * NO durability path revives it: the runner never re-leases it (it's not queued-due nor a reclaimable
+ * running lease), boot reclaim skips it (only `running` rows reclaim), and `resumeJob` refuses it
+ * (not `parked`/`failed`). The status guard lives in the UPDATE's WHERE, so this is race-safe against
+ * a concurrent settle and idempotent: a second cancel — or a cancel of an already-terminal
+ * (`done`/`failed`/`cancelled`) row — updates zero rows and returns false. Returns whether it acted.
+ * Aborting the in-flight child is the runner's job (`JobRunner.cancel`); this only writes state, so
+ * it also terminalizes a `running` row whose controller lives on a since-restarted process.
+ */
+export async function cancelJob(db: AntonDb, clock: Clock, jobId: string): Promise<boolean> {
+  const nowMs = clock.now();
+  const updated = await db
+    .update(schema.jobs)
+    .set({ status: "cancelled", leaseExpiresAt: null, lastError: "cancelled by operator", updatedAt: secDate(nowMs) })
+    .where(and(eq(schema.jobs.id, jobId), inArray(schema.jobs.status, [...CANCELLABLE_STATUSES])))
+    .returning({ id: schema.jobs.id });
+  return updated.length > 0;
 }
 
 /**

@@ -337,6 +337,84 @@ describe("JobRunner (live, in-memory db)", () => {
     expect(job?.attempts).toBe(0);
   });
 
+  it("cancel() aborts the in-flight job, terminalizes it, and no durability path revives it (anton-a4jj)", async () => {
+    // The core force-kill: abort the child AND mark the row terminal so the aborted handler's settle
+    // (an AbortError classifies as a retryable `error`) can't reschedule it back to `queued`.
+    let sawAbort = false;
+    const r = runner(async (ctx) => {
+      await new Promise<void>((resolveWait) => {
+        ctx.signal.addEventListener("abort", () => {
+          sawAbort = true;
+          resolveWait();
+        });
+      });
+    });
+    const id = await r.enqueue({ type: "execute-epic" });
+    expect(await r.tickOnce()).toBe(1);
+    await waitUntil(() => r.activeCount === 1);
+
+    expect(await r.cancel(id)).toBe(true);
+    await r.whenIdle();
+
+    expect(sawAbort).toBe(true);
+    const job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("cancelled"); // NOT rescheduled by the aborted handler's settle
+    expect(job?.leaseExpiresAt).toBeNull();
+
+    // No re-lease even past the lease window, and resume refuses it.
+    clock.advance(CONFIG.leaseMs * 2);
+    expect(await r.tickOnce()).toBe(0);
+    expect((await getJob(tdb.db, id))?.status).toBe("cancelled");
+    expect(await r.resume(id)).toBe(false);
+  });
+
+  it("cancel() terminalizes a queued job so it is never leased (anton-a4jj)", async () => {
+    const r = runner(async () => {});
+    const id = await r.enqueue({ type: "execute-epic" });
+    expect(await r.cancel(id)).toBe(true);
+    expect((await getJob(tdb.db, id))?.status).toBe("cancelled");
+    expect(await r.tickOnce()).toBe(0); // never dispatched
+  });
+
+  it("cancel() terminalizes a running row with no local controller so reclaim can't re-run it (anton-a4jj)", async () => {
+    // A `running` row leased by a since-restarted process: the lease is still held and THIS runner
+    // holds no in-flight controller. Cancel must still write the row terminal.
+    const schema = await import("../db/schema");
+    const r = runner(async () => {});
+    await tdb.db.insert(schema.jobs).values({
+      id: "leased-elsewhere",
+      type: "execute-epic",
+      status: "running",
+      runAt: new Date(clock.now() - 1_000),
+      leaseExpiresAt: new Date(clock.now() + CONFIG.leaseMs),
+      attempts: 1,
+    });
+
+    expect(await r.cancel("leased-elsewhere")).toBe(true);
+    expect((await getJob(tdb.db, "leased-elsewhere"))?.status).toBe("cancelled");
+
+    // Past the original lease, lease-expiry reclaim never re-dispatches it.
+    clock.advance(CONFIG.leaseMs * 2);
+    expect(await r.tickOnce()).toBe(0);
+    expect((await getJob(tdb.db, "leased-elsewhere"))?.status).toBe("cancelled");
+  });
+
+  it("cancel() is a safe no-op on an already-terminal job and reports whether it acted (anton-a4jj)", async () => {
+    const r = runner(async () => {});
+    const done = await r.enqueue({ type: "execute-epic" });
+    await r.tickOnce();
+    await r.whenIdle();
+    expect((await getJob(tdb.db, done))?.status).toBe("done");
+    expect(await r.cancel(done)).toBe(false); // already terminal — untouched
+    expect((await getJob(tdb.db, done))?.status).toBe("done");
+
+    // A second cancel of an already-cancelled job is a no-op; an unknown id too.
+    const q = await r.enqueue({ type: "execute-epic" });
+    expect(await r.cancel(q)).toBe(true);
+    expect(await r.cancel(q)).toBe(false);
+    expect(await r.cancel("does-not-exist")).toBe(false);
+  });
+
   it("reconcile() reclaims orphaned running jobs and fails only truly-orphaned runs (anton-nbd)", async () => {
     const schema = await import("../db/schema");
     await seedProjects("A", "B");
