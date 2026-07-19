@@ -10,27 +10,46 @@ import { beads, type Bead } from "./beads/bd";
 import { planMove, type MoveOp } from "./board-move";
 import type { Project } from "./types";
 
+/** Success (a ready-to-store external-ref) or a human-readable rejection reason. */
+export type PrRefResult = { ok: true; ref: string } | { ok: false; error: string };
+
+/** Parse `owner/repo` + number from a GitHub PR url (trailing `/files` etc. tolerated), else null. */
+export function parseGitHubPrUrl(input: string): { slug: string; number: string } | null {
+  const m = input.trim().match(/^https?:\/\/[^/]+\/([^/]+\/[^/]+)\/pull\/(\d+)/i);
+  return m ? { slug: m[1], number: m[2] } : null;
+}
+
 /**
  * Normalize a user-entered PR reference to a beads external-ref. Accepts a bare number (`44`),
  * `#44`, an already-normalized `gh-44`, or a full GitHub PR URL
- * (`https://github.com/owner/repo/pull/44`, trailing `/files` etc. tolerated). Returns null when no
- * PR number can be extracted, so the caller answers 400 rather than storing junk.
+ * (`https://github.com/owner/repo/pull/44`, trailing `/files` etc. tolerated).
  *
- * A full URL is stored VERBATIM, not collapsed to `gh-<n>`: collapsing loses the repo, so the chip
- * goes inert when `origin` can't be resolved to a web base, and a pasted fork/other-repo URL would
- * be silently re-expanded against the CURRENT repo and point at the wrong PR. Keeping the URL is
- * strictly safer and fully supported downstream — `prNumberFromRef` (git/pr.ts) reads the number
- * out of `/pull/<n>` for the review-fix sweep, and `prUrlFromRef` returns an http(s) ref as-is.
- * Only a bare number / #44 / gh-44 collapses to the canonical `gh-<n>`.
+ * A full URL is validated against the project's `originSlug` (`owner/repo`, resolved by the caller
+ * from `origin`): an OFF-REPO url is REJECTED, because storing it would let review-fix's
+ * `getPrReview(repo, number)` run `gh pr view <n>` against the CURRENT repo — inspecting/finalizing
+ * the wrong same-numbered PR, or failing to sweep the linked one. A same-repo url collapses to the
+ * canonical `gh-<n>` (origin matched, so `prUrlFromRef` re-expands it correctly). When origin can't
+ * be resolved (no web base) the url is kept verbatim — we can't validate it, but there's also no gh
+ * remote for the sweep to mis-target, and the chip stays clickable. Bare number / #44 / gh-44 →
+ * `gh-<n>` regardless of origin.
  */
-export function normalizePrRef(input: string): string | null {
+export function normalizePrRef(input: string, originSlug?: string): PrRefResult {
   const s = input.trim();
-  if (!s) return null;
-  if (/^https?:\/\/\S+\/pull\/\d+/i.test(s)) return s; // full PR url — preserve verbatim
-  const m =
-    s.match(/^gh-(\d+)$/i) ?? // already normalized
-    s.match(/^#?(\d+)$/); // 44 or #44
-  return m ? `gh-${m[1]}` : null;
+  if (!s) return { ok: false, error: "empty PR reference" };
+  const url = parseGitHubPrUrl(s);
+  if (url) {
+    if (originSlug && url.slug.toLowerCase() !== originSlug.toLowerCase()) {
+      return {
+        ok: false,
+        error: `that PR url is for ${url.slug}, not this repo (${originSlug}) — link a PR from this repository`,
+      };
+    }
+    return { ok: true, ref: originSlug ? `gh-${url.number}` : s };
+  }
+  const m = s.match(/^gh-(\d+)$/i) ?? s.match(/^#?(\d+)$/);
+  return m
+    ? { ok: true, ref: `gh-${m[1]}` }
+    : { ok: false, error: `could not read a PR number from "${s}" — pass 44, #44, gh-44, or a PR url in this repo` };
 }
 
 export interface PrLinkPlan {

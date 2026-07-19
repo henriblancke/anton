@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { beads, type Bead } from "@/lib/beads/bd";
+import { githubBaseUrl } from "@/lib/git/remote";
 import { linkPr, normalizePrRef } from "@/lib/pr-link";
 import { resolveProject } from "../../../resolve-project";
 
@@ -13,7 +14,8 @@ export const dynamic = "force-dynamic";
  *
  * Gated on isRunTarget (422 otherwise), mirroring the approve/claim routes: only an epic or a
  * parentless task/bug carries its own PR — a child ticket runs via its epic's PR, so linking a PR
- * to it is meaningless. `ref` accepts 44 / #44 / gh-44 / a full PR url; an unparseable ref 400s.
+ * to it is meaningless. `ref` accepts 44 / #44 / gh-44 / a full PR url; an unparseable ref, or a
+ * full url for a different repo than this project's origin, 400s.
  */
 
 /** Build the 422 reason for a non-run-target, mirroring the approve/claim routes' wording. */
@@ -43,13 +45,16 @@ export async function POST(
   if (typeof rawRef !== "string") {
     return NextResponse.json({ error: "ref must be a string" }, { status: 400 });
   }
-  const ref = normalizePrRef(rawRef);
-  if (!ref) {
-    return NextResponse.json(
-      { error: `Could not read a PR number from "${rawRef}" — pass 44, #44, gh-44, or a PR url` },
-      { status: 400 },
-    );
+  // Resolve the project's origin `owner/repo` so a pasted full PR url is validated against it — an
+  // off-repo url is rejected (else review-fix's getPrReview would run `gh pr view <n>` in THIS repo
+  // and hit the wrong same-numbered PR). Undefined when there's no resolvable web base.
+  const base = await githubBaseUrl(project.repoPath);
+  const originSlug = base?.replace(/^https?:\/\/[^/]+\//, "").replace(/\/+$/, "") || undefined;
+  const parsed = normalizePrRef(rawRef, originSlug);
+  if (!parsed.ok) {
+    return NextResponse.json({ error: parsed.error }, { status: 400 });
   }
+  const ref = parsed.ref;
 
   // Fresh read: the run-target gate and the in-review flip must decide from the true current state.
   let target: Bead;

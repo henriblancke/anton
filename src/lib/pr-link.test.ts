@@ -18,37 +18,51 @@ function makeBead(overrides: Partial<Bead> & { id: string }): Bead {
 
 describe("normalizePrRef", () => {
   it("accepts a bare number", () => {
-    expect(normalizePrRef("44")).toBe("gh-44");
+    expect(normalizePrRef("44")).toEqual({ ok: true, ref: "gh-44" });
   });
 
   it("accepts a #-prefixed number", () => {
-    expect(normalizePrRef("#44")).toBe("gh-44");
+    expect(normalizePrRef("#44")).toEqual({ ok: true, ref: "gh-44" });
   });
 
   it("accepts an already-normalized gh-<n> ref (case-insensitive)", () => {
-    expect(normalizePrRef("gh-44")).toBe("gh-44");
-    expect(normalizePrRef("GH-44")).toBe("gh-44");
+    expect(normalizePrRef("gh-44")).toEqual({ ok: true, ref: "gh-44" });
+    expect(normalizePrRef("GH-44")).toEqual({ ok: true, ref: "gh-44" });
   });
 
-  it("preserves a full GitHub PR url verbatim (keeps the repo; downstream reads the number out)", () => {
-    expect(normalizePrRef("https://github.com/owner/repo/pull/44")).toBe(
-      "https://github.com/owner/repo/pull/44",
-    );
-    expect(normalizePrRef("https://github.com/owner/repo/pull/44/files")).toBe(
-      "https://github.com/owner/repo/pull/44/files",
-    );
+  it("collapses a same-repo PR url to gh-<n> when origin matches", () => {
+    expect(normalizePrRef("https://github.com/owner/repo/pull/44", "owner/repo")).toEqual({
+      ok: true,
+      ref: "gh-44",
+    });
+    // trailing path segments (…/files) and host/owner casing tolerated
+    expect(normalizePrRef("https://github.com/Owner/Repo/pull/44/files", "owner/repo")).toEqual({
+      ok: true,
+      ref: "gh-44",
+    });
+  });
+
+  it("REJECTS an off-repo PR url (would mis-target review-fix's sweep in this repo)", () => {
+    const r = normalizePrRef("https://github.com/other/project/pull/44", "owner/repo");
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/other\/project/);
+  });
+
+  it("keeps a full url verbatim when origin can't be resolved (no web base to validate against)", () => {
+    expect(normalizePrRef("https://github.com/owner/repo/pull/44", undefined)).toEqual({
+      ok: true,
+      ref: "https://github.com/owner/repo/pull/44",
+    });
   });
 
   it("trims surrounding whitespace", () => {
-    expect(normalizePrRef("  44  ")).toBe("gh-44");
+    expect(normalizePrRef("  44  ")).toEqual({ ok: true, ref: "gh-44" });
   });
 
   it("rejects empty / non-numeric / unparseable input", () => {
-    expect(normalizePrRef("")).toBeNull();
-    expect(normalizePrRef("   ")).toBeNull();
-    expect(normalizePrRef("abc")).toBeNull();
-    expect(normalizePrRef("pr-44")).toBeNull();
-    expect(normalizePrRef("https://example.com/foo")).toBeNull();
+    for (const bad of ["", "   ", "abc", "pr-44", "https://example.com/foo"]) {
+      expect(normalizePrRef(bad).ok).toBe(false);
+    }
   });
 });
 
