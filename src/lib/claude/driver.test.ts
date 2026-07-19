@@ -688,4 +688,24 @@ describe("runClaude", () => {
     expect(i).toBeGreaterThanOrEqual(0);
     expect(argv[i + 1]).toBe("sess-abc");
   });
+
+  it("falls back to the last assistant text when a success omits the result field (anton-juar)", async () => {
+    // A resumed run can finish is_error:false but omit the final `result` field, leaving the agent's
+    // ANTON-RESULT self-report only in its last assistant message. Without the fallback, `text` would
+    // be undefined and a `blocked` self-report on partial work would be lost — a false success.
+    const bin = writeFakeClaude("resultless-success-claude", [
+      JSON.stringify({ type: "system", subtype: "init", session_id: "sess-rl" }),
+      JSON.stringify({
+        type: "assistant",
+        message: { content: [{ type: "text", text: "Could not finish.\nANTON-RESULT: blocked — schema mismatch" }] },
+      }),
+      JSON.stringify({ type: "result", subtype: "success", is_error: false, session_id: "sess-rl" }),
+    ]);
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    const result = await runClaude({ cwd: dir, prompt: "continue", resumeSessionId: "sess-rl" });
+
+    expect(result.ok).toBe(true);
+    expect(result.text).toContain("ANTON-RESULT: blocked");
+  });
 });

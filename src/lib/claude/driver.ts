@@ -30,7 +30,7 @@ export interface ClaudeResult {
   sessionId?: string;
   numTurns?: number;
   costUsd?: number;
-  /** Final assistant/result text. */
+  /** Final assistant/result text — the `result` field when present, else the last assistant text block. */
   text?: string;
   /** True if claude reported an error result subtype. */
   isError?: boolean;
@@ -254,6 +254,9 @@ export async function runClaude(opts: RunClaudeOptions): Promise<ClaudeResult> {
     // Scanning only the result field risked misclassifying a real quota hit as a plain error,
     // which burns maxAttempts and parks instead of rescheduling (anton-ner.2).
     let transcript = "";
+    // The last assistant text block — the `text` fallback for a success that omits the final
+    // `result` field (see the resolve below, anton-juar).
+    let lastAssistantText: string | undefined;
 
     const handleLine = (line: string) => {
       const trimmed = line.trim();
@@ -270,6 +273,7 @@ export async function runClaude(opts: RunClaudeOptions): Promise<ClaudeResult> {
       }
       for (const event of toEvents(parsed)) {
         if (event.text) transcript += `${event.text}\n`;
+        if (event.type === "assistant" && event.text) lastAssistantText = event.text;
         opts.onEvent?.(event);
       }
     };
@@ -365,7 +369,10 @@ export async function runClaude(opts: RunClaudeOptions): Promise<ClaudeResult> {
         sessionId: typeof resultRaw.session_id === "string" ? resultRaw.session_id : undefined,
         numTurns: typeof resultRaw.num_turns === "number" ? resultRaw.num_turns : undefined,
         costUsd: typeof resultRaw.total_cost_usd === "number" ? resultRaw.total_cost_usd : undefined,
-        text: resultText,
+        // Fall back to the last assistant message when the result field is absent (a result-less
+        // success, observed on `claude --resume`) so the agent's final text — and its ANTON-RESULT
+        // self-report — isn't lost, which would let partial work close as a false success (anton-juar).
+        text: resultText ?? lastAssistantText,
         isError: !!resultRaw.is_error,
       });
     });
