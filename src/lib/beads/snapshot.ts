@@ -24,6 +24,13 @@ export interface SnapshotReadOptions {
   blockOnPendingWrite?: boolean;
 }
 
+export interface SnapshotRead {
+  beads: Bead[];
+  /** The snapshot version these exact beads carry — captured in the same tick they were read, so a
+   * concurrent background refresh can never advance the version past the data a caller returns. */
+  version: number;
+}
+
 const SNAPSHOTS_KEY = Symbol.for("anton.beads.issueSnapshots");
 
 function snapshots(): Map<string, SnapshotEntry> {
@@ -123,21 +130,39 @@ export async function getIssueSnapshot(
   cwd: string,
   loader: () => Promise<Bead[]>,
   now = Date.now(),
-  { blockOnPendingWrite = true }: SnapshotReadOptions = {},
+  opts: SnapshotReadOptions = {},
 ): Promise<Bead[]> {
+  return (await readIssueSnapshot(cwd, loader, now, opts)).beads;
+}
+
+/**
+ * Like {@link getIssueSnapshot} but returns the snapshot version alongside the beads, read in the
+ * same synchronous tick. Callers that STAMP a response with the version (the board's freshness token)
+ * must use this: reading beads and version separately lets an in-flight refresh land between them and
+ * advance the version past the data being served, which a version poll would then treat as current
+ * and 304 forever — pinning the client to the pre-refresh board until the next invalidation.
+ */
+export async function readIssueSnapshot(
+  cwd: string,
+  loader: () => Promise<Bead[]>,
+  now = Date.now(),
+  { blockOnPendingWrite = true }: SnapshotReadOptions = {},
+): Promise<SnapshotRead> {
   const entry = entryFor(cwd);
   const retained = entry.beads;
   if (retained) {
     if (entry.pendingWrite && blockOnPendingWrite) {
-      return refreshIssueSnapshot(cwd, loader, now).catch(() => retained);
+      await refreshIssueSnapshot(cwd, loader, now).catch(() => {});
+      return { beads: entry.beads ?? retained, version: entry.version };
     }
     // Serve retained now, but a pending write or a stale TTL still needs a fresh read behind it.
     if (entry.pendingWrite || now - entry.loadedAt >= ISSUE_SNAPSHOT_MAX_AGE_MS) {
       void refreshIssueSnapshot(cwd, loader, now).catch(() => {});
     }
-    return retained;
+    return { beads: retained, version: entry.version };
   }
-  return refreshIssueSnapshot(cwd, loader, now);
+  await refreshIssueSnapshot(cwd, loader, now);
+  return { beads: entry.beads ?? [], version: entry.version };
 }
 
 /** Start a freshness probe without making the caller wait for embedded Dolt. */
