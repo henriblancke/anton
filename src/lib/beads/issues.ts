@@ -1,5 +1,10 @@
 import { beads, type Bead } from "./bd";
-import { getIssueSnapshot, probeIssueSnapshot, refreshIssueSnapshot } from "./snapshot";
+import {
+  getIssueSnapshot,
+  probeIssueSnapshot,
+  refreshIssueSnapshot,
+  type SnapshotReadOptions,
+} from "./snapshot";
 
 export async function loadAllIssues(cwd: string): Promise<Bead[]> {
   try {
@@ -18,8 +23,8 @@ export async function loadAllIssues(cwd: string): Promise<Bead[]> {
   }
 }
 
-export function allIssues(cwd: string): Promise<Bead[]> {
-  return getIssueSnapshot(cwd, () => loadAllIssues(cwd));
+export function allIssues(cwd: string, opts?: SnapshotReadOptions): Promise<Bead[]> {
+  return getIssueSnapshot(cwd, () => loadAllIssues(cwd), undefined, opts);
 }
 
 export function refreshAllIssues(cwd: string): Promise<Bead[]> {

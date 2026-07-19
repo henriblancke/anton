@@ -14,6 +14,9 @@ export async function GET(
   if (!project) return response;
 
   const knownVersion = new URL(request.url).searchParams.get("version");
+  // The poll path stays non-blocking end to end: getBoard must serve the retained snapshot instead
+  // of awaiting the post-write load that a pending local write would otherwise force downstream.
+  let blockOnPendingWrite = true;
   if (knownVersion !== null) {
     // A stale TTL or completed sync starts one background comparison. Unchanged data keeps the
     // same version and therefore never causes a full board download.
@@ -26,6 +29,7 @@ export async function GET(
     // background — never await a cold bd list on the poll path (cold precisely after a write).
     // The client surfaces any newer data on its next poll.
     void refreshAllIssues(project.repoPath).catch(() => {});
+    blockOnPendingWrite = false;
   } else {
     // A forced reload carries no version token — it follows a local mutation (TicketDialog
     // onSaved/onDeleted) or a manual retry. A local write RETAINS the pre-write snapshot
@@ -36,6 +40,6 @@ export async function GET(
     await refreshAllIssues(project.repoPath).catch(() => {});
   }
 
-  const board = await getBoard(project);
+  const board = await getBoard(project, { blockOnPendingWrite });
   return NextResponse.json({ board });
 }

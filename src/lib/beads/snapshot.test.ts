@@ -80,6 +80,30 @@ describe("issue snapshots", () => {
     expect(loader).toHaveBeenCalledTimes(2);
   });
 
+  it("serves the retained board without blocking on a pending write when blockOnPendingWrite is false", async () => {
+    let resolvePostWrite!: (value: Bead[]) => void;
+    const loader = vi
+      .fn<() => Promise<Bead[]>>()
+      .mockResolvedValueOnce([bead("old")])
+      .mockImplementationOnce(() => new Promise<Bead[]>((done) => (resolvePostWrite = done)));
+    await getIssueSnapshot("/repo", loader, 0);
+    invalidateIssueSnapshot("/repo", true);
+
+    // The non-blocking poll path serves last-good immediately even while a write is pending, kicking
+    // the post-write load in the background rather than awaiting the cold bd read.
+    await expect(
+      getIssueSnapshot("/repo", loader, 1, { blockOnPendingWrite: false }),
+    ).resolves.toEqual([bead("old")]);
+    await vi.waitFor(() => expect(loader).toHaveBeenCalledTimes(2));
+
+    // Once the background post-write read lands, the pending write clears and reads serve it.
+    resolvePostWrite([bead("new")]);
+    await vi.waitFor(async () =>
+      expect(await getIssueSnapshot("/repo", loader, 2)).toEqual([bead("new")]),
+    );
+    expect(loader).toHaveBeenCalledTimes(2);
+  });
+
   it("falls back to the retained board when the post-write read fails", async () => {
     await getIssueSnapshot("/repo", async () => [bead("old")], 0);
     invalidateIssueSnapshot("/repo", true);

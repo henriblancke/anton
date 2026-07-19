@@ -14,6 +14,16 @@ interface SnapshotEntry {
   pendingWrite: boolean;
 }
 
+export interface SnapshotReadOptions {
+  /**
+   * Whether a pending local write blocks the read on a fresh post-write load. Default `true` for
+   * write-then-navigate/forced-reload paths that must reflect the write. The versioned poll path
+   * passes `false`: it is contractually non-blocking, so it serves the retained board now and lets
+   * a background refresh (and the client's next poll) surface the post-write data.
+   */
+  blockOnPendingWrite?: boolean;
+}
+
 const SNAPSHOTS_KEY = Symbol.for("anton.beads.issueSnapshots");
 
 function snapshots(): Map<string, SnapshotEntry> {
@@ -101,24 +111,28 @@ export function refreshIssueSnapshot(
 
 /**
  * Return the last valid snapshot immediately. Cold loads wait once; stale warm loads trigger a
- * background refresh and keep serving known-good data. A pending local write is the exception: the
- * retained board predates the write yet the version already advanced, so this read blocks on a
- * fresh post-write load (falling back to last-good on a transient failure) rather than serve stale
- * data a version poll would then treat as current — the guarantee the API forced-reload path relies
- * on, now honored on write-then-navigate/server-render flows too.
+ * background refresh and keep serving known-good data. A pending local write is the exception when
+ * `blockOnPendingWrite` (the default): the retained board predates the write yet the version already
+ * advanced, so this read blocks on a fresh post-write load (falling back to last-good on a transient
+ * failure) rather than serve stale data a version poll would then treat as current — the guarantee
+ * the API forced-reload path relies on, honored on write-then-navigate/server-render flows too. The
+ * versioned poll path opts out (`blockOnPendingWrite: false`) to stay non-blocking: it serves the
+ * retained board now and kicks the post-write load in the background for the client's next poll.
  */
 export async function getIssueSnapshot(
   cwd: string,
   loader: () => Promise<Bead[]>,
   now = Date.now(),
+  { blockOnPendingWrite = true }: SnapshotReadOptions = {},
 ): Promise<Bead[]> {
   const entry = entryFor(cwd);
   const retained = entry.beads;
   if (retained) {
-    if (entry.pendingWrite) {
+    if (entry.pendingWrite && blockOnPendingWrite) {
       return refreshIssueSnapshot(cwd, loader, now).catch(() => retained);
     }
-    if (now - entry.loadedAt >= ISSUE_SNAPSHOT_MAX_AGE_MS) {
+    // Serve retained now, but a pending write or a stale TTL still needs a fresh read behind it.
+    if (entry.pendingWrite || now - entry.loadedAt >= ISSUE_SNAPSHOT_MAX_AGE_MS) {
       void refreshIssueSnapshot(cwd, loader, now).catch(() => {});
     }
     return retained;
