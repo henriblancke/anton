@@ -31,21 +31,31 @@ describe("normalizePrRef", () => {
   });
 
   it("collapses a same-repo PR url to gh-<n> when origin matches", () => {
-    expect(normalizePrRef("https://github.com/owner/repo/pull/44", "owner/repo")).toEqual({
-      ok: true,
-      ref: "gh-44",
-    });
-    // trailing path segments (…/files) and host/owner casing tolerated
-    expect(normalizePrRef("https://github.com/Owner/Repo/pull/44/files", "owner/repo")).toEqual({
-      ok: true,
-      ref: "gh-44",
-    });
+    expect(
+      normalizePrRef("https://github.com/owner/repo/pull/44", "https://github.com/owner/repo"),
+    ).toEqual({ ok: true, ref: "gh-44" });
+    // trailing path segments (…/files), host/owner casing, and a trailing base slash tolerated
+    expect(
+      normalizePrRef("https://github.com/Owner/Repo/pull/44/files", "https://github.com/owner/repo/"),
+    ).toEqual({ ok: true, ref: "gh-44" });
   });
 
   it("REJECTS an off-repo PR url (would mis-target review-fix's sweep in this repo)", () => {
-    const r = normalizePrRef("https://github.com/other/project/pull/44", "owner/repo");
+    const r = normalizePrRef(
+      "https://github.com/other/project/pull/44",
+      "https://github.com/owner/repo",
+    );
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toMatch(/other\/project/);
+  });
+
+  it("REJECTS a same-slug PR url on a DIFFERENT host (GHE/mirror — gh in this repo can't reach it)", () => {
+    const r = normalizePrRef(
+      "https://ghe.corp.example/owner/repo/pull/44",
+      "https://github.com/owner/repo",
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/ghe\.corp\.example/);
   });
 
   it("keeps a full url verbatim when origin can't be resolved (no web base to validate against)", () => {

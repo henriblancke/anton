@@ -45,12 +45,12 @@ export async function POST(
   if (typeof rawRef !== "string") {
     return NextResponse.json({ error: "ref must be a string" }, { status: 400 });
   }
-  // Resolve the project's origin `owner/repo` so a pasted full PR url is validated against it — an
-  // off-repo url is rejected (else review-fix's getPrReview would run `gh pr view <n>` in THIS repo
-  // and hit the wrong same-numbered PR). Undefined when there's no resolvable web base.
+  // Resolve the project's origin web base (`https://host/owner/repo`) so a pasted full PR url is
+  // validated against it — an off-repo url (different host OR owner/repo) is rejected, else
+  // review-fix's getPrReview would run `gh pr view <n>` in THIS repo and hit the wrong same-numbered
+  // PR. Undefined when there's no resolvable web base.
   const base = await githubBaseUrl(project.repoPath);
-  const originSlug = base?.replace(/^https?:\/\/[^/]+\//, "").replace(/\/+$/, "") || undefined;
-  const parsed = normalizePrRef(rawRef, originSlug);
+  const parsed = normalizePrRef(rawRef, base);
   if (!parsed.ok) {
     return NextResponse.json({ error: parsed.error }, { status: 400 });
   }

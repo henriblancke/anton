@@ -13,10 +13,16 @@ import type { Project } from "./types";
 /** Success (a ready-to-store external-ref) or a human-readable rejection reason. */
 export type PrRefResult = { ok: true; ref: string } | { ok: false; error: string };
 
-/** Parse `owner/repo` + number from a GitHub PR url (trailing `/files` etc. tolerated), else null. */
-export function parseGitHubPrUrl(input: string): { slug: string; number: string } | null {
-  const m = input.trim().match(/^https?:\/\/[^/]+\/([^/]+\/[^/]+)\/pull\/(\d+)/i);
-  return m ? { slug: m[1], number: m[2] } : null;
+/** Parse host + `owner/repo` + number from a GitHub PR url (trailing `/files` etc. tolerated), else null. */
+export function parseGitHubPrUrl(input: string): { host: string; slug: string; number: string } | null {
+  const m = input.trim().match(/^https?:\/\/([^/]+)\/([^/]+\/[^/]+)\/pull\/(\d+)/i);
+  return m ? { host: m[1], slug: m[2], number: m[3] } : null;
+}
+
+/** Split a git web base (`https://host/owner/repo`, resolved from `origin`) into host + slug, else null. */
+function parseOriginBase(base: string): { host: string; slug: string } | null {
+  const m = base.trim().match(/^https?:\/\/([^/]+)\/(.+?)\/?$/i);
+  return m ? { host: m[1], slug: m[2] } : null;
 }
 
 /**
@@ -24,27 +30,34 @@ export function parseGitHubPrUrl(input: string): { slug: string; number: string 
  * `#44`, an already-normalized `gh-44`, or a full GitHub PR URL
  * (`https://github.com/owner/repo/pull/44`, trailing `/files` etc. tolerated).
  *
- * A full URL is validated against the project's `originSlug` (`owner/repo`, resolved by the caller
- * from `origin`): an OFF-REPO url is REJECTED, because storing it would let review-fix's
- * `getPrReview(repo, number)` run `gh pr view <n>` against the CURRENT repo — inspecting/finalizing
- * the wrong same-numbered PR, or failing to sweep the linked one. A same-repo url collapses to the
- * canonical `gh-<n>` (origin matched, so `prUrlFromRef` re-expands it correctly). When origin can't
- * be resolved (no web base) the url is kept verbatim — we can't validate it, but there's also no gh
- * remote for the sweep to mis-target, and the chip stays clickable. Bare number / #44 / gh-44 →
- * `gh-<n>` regardless of origin.
+ * A full URL is validated against the project's `originBase` (the `https://host/owner/repo` web base
+ * resolved by the caller from `origin`): its HOST and `owner/repo` must both match, else it is
+ * REJECTED. Storing an off-repo url would let review-fix's `getPrReview(repo, number)` run
+ * `gh pr view <n>` against the CURRENT repo — inspecting/finalizing the wrong same-numbered PR, or
+ * failing to sweep the linked one. The host check matters because a same-slug url on a DIFFERENT
+ * host (e.g. a GHE/mirror) points at a different PR that `gh` in this repo would never reach. A
+ * matching url collapses to the canonical `gh-<n>` (so `prUrlFromRef` re-expands it correctly). When
+ * origin can't be resolved (no web base) the url is kept verbatim — we can't validate it, but
+ * there's also no gh remote for the sweep to mis-target, and the chip stays clickable. Bare number /
+ * #44 / gh-44 → `gh-<n>` regardless of origin.
  */
-export function normalizePrRef(input: string, originSlug?: string): PrRefResult {
+export function normalizePrRef(input: string, originBase?: string): PrRefResult {
   const s = input.trim();
   if (!s) return { ok: false, error: "empty PR reference" };
   const url = parseGitHubPrUrl(s);
   if (url) {
-    if (originSlug && url.slug.toLowerCase() !== originSlug.toLowerCase()) {
+    const origin = originBase ? parseOriginBase(originBase) : null;
+    if (
+      origin &&
+      (url.host.toLowerCase() !== origin.host.toLowerCase() ||
+        url.slug.toLowerCase() !== origin.slug.toLowerCase())
+    ) {
       return {
         ok: false,
-        error: `that PR url is for ${url.slug}, not this repo (${originSlug}) — link a PR from this repository`,
+        error: `that PR url is for ${url.host}/${url.slug}, not this repo (${origin.host}/${origin.slug}) — link a PR from this repository`,
       };
     }
-    return { ok: true, ref: originSlug ? `gh-${url.number}` : s };
+    return { ok: true, ref: origin ? `gh-${url.number}` : s };
   }
   const m = s.match(/^gh-(\d+)$/i) ?? s.match(/^#?(\d+)$/);
   return m
