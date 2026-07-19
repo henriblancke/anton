@@ -1029,6 +1029,21 @@ async function runTicket(args: {
 /** Cap on in-session `claude --resume` retries before escalating to a fresh restart (anton-juar). */
 const MAX_RESUME_ATTEMPTS = 2;
 
+export function claudeResumeDecision(
+  error: { sessionId?: string; signature: string },
+  attempt: number,
+  priorSignature?: string,
+): { resume: true } | { resume: false; reason: string } {
+  if (!error.sessionId) return { resume: false, reason: "no session id" };
+  if (error.signature === priorSignature) {
+    return { resume: false, reason: `repeated ${error.signature}` };
+  }
+  if (attempt >= MAX_RESUME_ATTEMPTS) {
+    return { resume: false, reason: "resume budget spent" };
+  }
+  return { resume: true };
+}
+
 /**
  * Run claude for one ticket with resilient in-session recovery (anton-juar). A transient mid-stream
  * death (network drop, truncated stream, exit-without-result) that captured a Claude session id is
@@ -1080,17 +1095,11 @@ async function runClaudeResilient(args: {
       // the system-init event, and it's what a fresh-restart's operator or a future resume relies on.
       if (e.sessionId) await setSessionClaudeId(db, sessionId, e.sessionId).catch(() => {});
 
-      const sameSignature = e.signature === priorSignature;
-      const canResume = !!e.sessionId && attempt < MAX_RESUME_ATTEMPTS && !sameSignature;
-      if (!canResume) {
-        const why = !e.sessionId
-          ? "no session id"
-          : sameSignature
-            ? `repeated ${e.signature}`
-            : "resume budget spent";
+      const decision = claudeResumeDecision(e, attempt, priorSignature);
+      if (!decision.resume) {
         await appendSessionLog(
           logPath,
-          `[resume] not resuming (${why}) — escalating to a fresh restart: ${e.message}\n`,
+          `[resume] not resuming (${decision.reason}) — escalating to a fresh restart: ${e.message}\n`,
         ).catch(() => {});
         throw e;
       }

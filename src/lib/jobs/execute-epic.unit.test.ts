@@ -5,7 +5,12 @@
  */
 import { describe, expect, it } from "vitest";
 import type { Bead } from "../beads/bd";
-import { continuationPrompt, inactiveAgentTickets, ticketPrompt } from "./execute-epic";
+import {
+  claudeResumeDecision,
+  continuationPrompt,
+  inactiveAgentTickets,
+  ticketPrompt,
+} from "./execute-epic";
 
 function ticket(id: string, labels?: string[]): Bead {
   return { id, title: id, status: "open", labels } as Bead;
@@ -158,5 +163,37 @@ describe("continuationPrompt (anton-juar)", () => {
     const infra = continuationPrompt(t, "claude exited with code 1: Connection closed mid-response");
     expect(infra).not.toContain("Connection closed mid-response");
     expect(infra).not.toContain("adjust your approach");
+  });
+});
+
+describe("claudeResumeDecision (anton-juar)", () => {
+  it("escalates immediately when a resumed session repeats the same failure signature", () => {
+    expect(
+      claudeResumeDecision(
+        { sessionId: "sess-1", signature: "connection-closed" },
+        1,
+        "connection-closed",
+      ),
+    ).toEqual({ resume: false, reason: "repeated connection-closed" });
+  });
+
+  it("allows two distinct resume attempts, then escalates when the budget is exhausted", () => {
+    expect(
+      claudeResumeDecision({ sessionId: "sess-1", signature: "connection-closed" }, 0),
+    ).toEqual({ resume: true });
+    expect(
+      claudeResumeDecision(
+        { sessionId: "sess-1", signature: "service-unavailable" },
+        1,
+        "connection-closed",
+      ),
+    ).toEqual({ resume: true });
+    expect(
+      claudeResumeDecision(
+        { sessionId: "sess-1", signature: "gateway-time-out" },
+        2,
+        "service-unavailable",
+      ),
+    ).toEqual({ resume: false, reason: "resume budget spent" });
   });
 });
