@@ -2,7 +2,9 @@
  * GET /board polling contract (anton-qgt4): the poll path never blocks on a cold bd list.
  * A stale ?version serves the current snapshot immediately and kicks a background refresh
  * (never awaited), so a slow loader can't stall the response; an unchanged ?version still
- * short-circuits to 304 without building the board.
+ * short-circuits to 304 without building the board. A forced reload (no ?version — a
+ * post-mutation onSaved/onDeleted or retry) instead AWAITS a fresh read so it can't serve the
+ * retained pre-write snapshot, falling back to last-good only on a bd failure.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -65,12 +67,37 @@ describe("GET /board — non-blocking poll refresh (anton-qgt4)", () => {
     expect(probeAllIssues).toHaveBeenCalledWith(project.repoPath);
   });
 
-  it("builds the board on a first load with no version token", async () => {
+  it("awaits a fresh read before building the board on a forced reload (no version token)", async () => {
+    // A forced reload follows a local mutation, whose write RETAINS the pre-write snapshot. The
+    // route must refresh BEFORE building the board, so the response reflects the write rather than
+    // handing back the stale chip/title. Prove it by holding the refresh open: getBoard must not
+    // run until the fresh read resolves.
+    let release!: () => void;
+    refreshAllIssues.mockImplementationOnce(
+      () => new Promise<[]>((resolve) => (release = () => resolve([]))),
+    );
+
+    const pending = GET(req(), ctx("tmp"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(refreshAllIssues).toHaveBeenCalledWith(project.repoPath);
+    expect(getBoard).not.toHaveBeenCalled();
+    expect(probeAllIssues).not.toHaveBeenCalled();
+
+    release();
+    const res = await pending;
+
+    expect(res.status).toBe(200);
+    expect(getBoard).toHaveBeenCalledOnce();
+  });
+
+  it("still serves the last-good board when the forced fresh read fails", async () => {
+    // A transient bd failure on the forced path must not 500 the reload — fall back to the snapshot
+    // getBoard already serves.
+    refreshAllIssues.mockRejectedValueOnce(new Error("bd list failed"));
+
     const res = await GET(req(), ctx("tmp"));
 
     expect(res.status).toBe(200);
     expect(getBoard).toHaveBeenCalledOnce();
-    expect(probeAllIssues).not.toHaveBeenCalled();
-    expect(refreshAllIssues).not.toHaveBeenCalled();
   });
 });

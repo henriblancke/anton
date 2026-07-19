@@ -26,6 +26,14 @@ export async function GET(
     // background — never await a cold bd list on the poll path (cold precisely after a write).
     // The client surfaces any newer data on its next poll.
     void refreshAllIssues(project.repoPath).catch(() => {});
+  } else {
+    // A forced reload carries no version token — it follows a local mutation (TicketDialog
+    // onSaved/onDeleted) or a manual retry. A local write RETAINS the pre-write snapshot
+    // (invalidateIssueSnapshot only marks it stale), so building the board off it here would hand
+    // back the old chip/title stamped with the already-advanced version, and the client would only
+    // self-correct a poll later. Await a fresh read so this response reflects the write — but fall
+    // back to the last-good snapshot on a transient bd failure rather than 500 the reload.
+    await refreshAllIssues(project.repoPath).catch(() => {});
   }
 
   const board = await getBoard(project);
