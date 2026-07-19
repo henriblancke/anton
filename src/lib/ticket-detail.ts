@@ -4,6 +4,7 @@
  * Mirrors the read/parse patterns in epic-detail.ts and tickets.ts. See DESIGN.md §2/§3.
  */
 import { beads, type BeadPatch } from "./beads/bd";
+import { refreshAllIssues } from "./beads/issues";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
 import { createdMeta, deriveStage, labelValue, parseAcceptance, parseGoal } from "./ticket-view";
 import { listAllBeads } from "./tickets";
@@ -34,8 +35,19 @@ function toTicketDetail(lite: Bead, full: Bead, epic: Bead | undefined): TicketD
   };
 }
 
-export async function getTicketDetail(project: Project, id: string): Promise<TicketDetail> {
-  const all = await listAllBeads(project); // one call: carries parent + inline dependencies
+/**
+ * Read a ticket's full detail. `fresh` forces a post-write board read for read-after-write callers
+ * (updateTicket): the snapshot serves stale-but-retained data by default so the board never blocks,
+ * but a mutation's own response must reflect the write it just made, or the edit form resets back to
+ * pre-write title/labels/approval. A plain GET keeps the non-blocking stale read.
+ */
+export async function getTicketDetail(
+  project: Project,
+  id: string,
+  fresh = false,
+): Promise<TicketDetail> {
+  // one call: carries parent + inline dependencies
+  const all = fresh ? await refreshAllIssues(project.repoPath) : await listAllBeads(project);
   const lite = all.find((b) => b.id === id);
   if (!lite) {
     throw new Error(`Ticket not found: ${id}`);
@@ -69,7 +81,8 @@ export async function updateTicket(
   void beads
     .sync(project.repoPath)
     .catch((e) => console.error(`[ticket-detail] beads dolt sync failed after updating ${id}`, e));
-  return getTicketDetail(project, id);
+  // Read-after-write: return the post-write detail, not the stale snapshot the board serves.
+  return getTicketDetail(project, id, true);
 }
 
 /**

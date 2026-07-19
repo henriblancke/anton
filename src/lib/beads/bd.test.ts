@@ -532,6 +532,23 @@ describe("createDoltSync", () => {
     expect(getSyncStatus(cwd).lastPushedAt).toBeTypeOf("number");
   });
 
+  it("failed backstop retries do not inflate the unpushed count (one stranded change stays 1)", async () => {
+    const cwd = `/repo-backstop-noinflate-${Math.random()}`;
+    const sync = createDoltSync(async (_cwd, args) => {
+      if (args[1] === "push") throw execError({ stderr: "Error: push failed: reset" });
+      return "";
+    });
+
+    // One write-nudged full pass strands a single change locally.
+    await sync(cwd, "full").catch(() => {});
+    expect(getSyncStatus(cwd).unpushedCount).toBe(1);
+
+    // Every heartbeat backstop resolves to a full push-retry (repo is ahead) and fails, but retries
+    // re-attempt the same commit and must never grow the count — a flaky remote can't fake a backlog.
+    for (let i = 0; i < 4; i++) await sync(cwd, "backstop").catch(() => {});
+    expect(getSyncStatus(cwd).unpushedCount).toBe(1);
+  });
+
   it("a pull-only pass moves lastSyncedAt but not lastPushedAt or the unpushed count", async () => {
     const cwd = `/repo-pull-only-${Math.random()}`;
     let pushFails = true;

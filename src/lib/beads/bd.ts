@@ -153,8 +153,11 @@ export interface SyncStatus {
   /** ms epoch of the last successful PUSH. Distinct from lastSyncedAt: a pull-only pass moves
    * lastSyncedAt but NOT this, so "unpushed for a while" is visible even while pulls keep succeeding. */
   lastPushedAt: number | null;
-  /** Full (write-nudged/backstop) passes that committed local work but failed to push since the last
-   * successful push. 0 when the repo is caught up with its remote; >0 means work is queued locally. */
+  /** Write-nudged full passes that committed new local work but failed to push, since the last
+   * successful push — the count of local changes queued for the backstop to retry. 0 when the repo
+   * is caught up with its remote; >0 means work is queued locally. Backstop retries never grow it:
+   * they re-attempt already-counted commits, so a flaky remote can't inflate one stranded change
+   * into "N unpushed". */
   unpushedCount: number;
   lastError: string | null;
 }
@@ -264,9 +267,11 @@ export async function runDoltSync(
  * pull-only trailing pass. Updates the sync status registry on every pass. Exported for testing.
  *
  * Also tracks the per-repo unpushed backlog on the sync-status registry (anton-sr8f, anton-rn88): a
- * full pass that fails to reach "synced" committed local changes it couldn't push, so the repo is
- * left ahead of its remote — recorded as `unpushedCount > 0`. That count lets a "backstop" request
- * (the heartbeat) resolve to a push-retry while a caught-up repo stays pull-only, and it is the
+ * write-nudged full pass that fails to reach "synced" committed new local work it couldn't push, so
+ * the repo is left ahead of its remote — recorded as `unpushedCount > 0`. A backstop retry that also
+ * fails does NOT grow the count: it re-attempts the same stranded commits and adds no new work, so a
+ * flaky remote can't inflate one change into "N unpushed". That count lets a "backstop" request (the
+ * heartbeat) resolve to a push-retry while a caught-up repo stays pull-only, and it is the
  * operator-visible "N unpushed" surface. A full pass that reaches "synced"/"not-wired" clears the
  * count and stamps `lastPushedAt` (nothing left to push).
  */
@@ -274,8 +279,13 @@ export function createDoltSync(exec: BdExec = bd): (cwd: string, mode?: SyncRequ
   const running = new Map<string, Promise<void>>();
   const trailing = new Map<string, { promise: Promise<void>; mode: SyncMode }>();
   const trailingMode = new Map<string, SyncMode>(); // live handle so an upgrade reaches the queued run
+  const trailingNewWork = new Map<string, boolean>(); // did any queued request carry new local work?
 
-  const start = (cwd: string, mode: SyncMode): Promise<void> => {
+  // `newWork` is true only for a write-nudged full pass, which may carry a genuinely new local
+  // commit. A backstop retry (newWork=false) re-attempts already-counted work and commits nothing
+  // new, so it must never grow the backlog — otherwise a flaky remote turns one stranded change into
+  // "N unpushed" after N failed retries (anton-rn88 review).
+  const start = (cwd: string, mode: SyncMode, newWork: boolean): Promise<void> => {
     recordStatus(cwd, { state: "syncing" });
     const p = runDoltSync(cwd, exec, mode).then((outcome) => {
       if (outcome === "not-wired") {
@@ -298,11 +308,12 @@ export function createDoltSync(exec: BdExec = bd): (cwd: string, mode?: SyncRequ
     // Bookkeeping only — callers hold `p` and see its rejection; this chain must not re-reject.
     void p
       .catch((e: Error) => {
-        // A full pass committed but never landed its push — grow the unpushed backlog so the next
-        // heartbeat backstop retries the push, and the operator sees a truthful "N unpushed" count
-        // instead of the failure hiding in server logs. A pull-only failure leaves the count as-is.
+        // A write-nudged full pass committed new work but never landed its push — grow the unpushed
+        // backlog so the next heartbeat backstop retries, and the operator sees a truthful "N
+        // unpushed" count instead of the failure hiding in server logs. A backstop retry (newWork
+        // false) or a pull-only failure leaves the count as-is: the stranded work is already counted.
         const patch: Partial<SyncStatus> = { state: "failing", lastError: e.message };
-        if (mode === "full") patch.unpushedCount = getSyncStatus(cwd).unpushedCount + 1;
+        if (mode === "full" && newWork) patch.unpushedCount = getSyncStatus(cwd).unpushedCount + 1;
         recordStatus(cwd, patch);
       })
       .finally(() => {
@@ -315,21 +326,27 @@ export function createDoltSync(exec: BdExec = bd): (cwd: string, mode?: SyncRequ
     // Resolve the backstop against the recorded backlog: push-retry only when a prior push failed.
     const mode: SyncMode =
       request === "backstop" ? (getSyncStatus(cwd).unpushedCount > 0 ? "full" : "pull") : request;
+    // Only a write-nudge introduces new local work; a backstop is a retry of already-counted commits.
+    const newWork = request === "full";
     const queued = trailing.get(cwd);
     if (queued) {
       if (mode === "full") trailingMode.set(cwd, "full");
+      if (newWork) trailingNewWork.set(cwd, true); // a coalesced write carries new work into the pass
       return queued.promise;
     }
     const current = running.get(cwd);
-    if (!current) return start(cwd, mode);
+    if (!current) return start(cwd, mode, newWork);
     trailingMode.set(cwd, mode);
+    trailingNewWork.set(cwd, newWork);
     const next = current
       .catch(() => {}) // the current run's failure belongs to its own callers
       .then(() => {
         trailing.delete(cwd);
         const m = trailingMode.get(cwd) ?? "full";
+        const nw = trailingNewWork.get(cwd) ?? false;
         trailingMode.delete(cwd);
-        return start(cwd, m);
+        trailingNewWork.delete(cwd);
+        return start(cwd, m, nw);
       });
     trailing.set(cwd, { promise: next, mode });
     return next;

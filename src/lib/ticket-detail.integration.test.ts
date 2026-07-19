@@ -109,6 +109,22 @@ suite("ticket-detail integration (real bd)", () => {
     expect(updated.goal).toMatch(/keep me/i);
   }, 30_000);
 
+  it("returns post-write detail even when the board snapshot is warm (read-after-write)", async () => {
+    const taskId = await beads.create(repo, { title: "Warm cache", type: "task" });
+    await beads.tag(repo, taskId, ["agent:nextjs"]);
+    // Warm the board snapshot so the read-after-write would otherwise serve stale, pre-write beads.
+    await getTicketDetail(project, taskId);
+
+    const updated = await updateTicket(project, taskId, {
+      title: "Renamed",
+      labels: { agent: "fastapi" },
+    });
+
+    // The mutation's own response must reflect the write, or the edit form resets to stale values.
+    expect(updated.title).toBe("Renamed");
+    expect(updated.agent).toBe("fastapi");
+  }, 30_000);
+
   it("throws for a genuinely missing id", async () => {
     await expect(getTicketDetail(project, "does-not-exist-999")).rejects.toThrow(/not found/i);
   }, 30_000);
