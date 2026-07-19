@@ -16,6 +16,7 @@ import {
   activeExecuteEpicId,
   activeExecuteEpicKeys,
   activeJobIdsForProject,
+  cancelJob,
   complete,
   deleteActiveJobsForProject,
   disabledScheduleKeys,
@@ -341,6 +342,21 @@ export class JobRunner {
   }
 
   /**
+   * Force-kill a single job (anton-a4jj): terminalize it as `cancelled` so no durability path revives
+   * it, then abort its in-flight child if this process holds one. Order matters — terminalize FIRST,
+   * so the aborted handler's settle (which classifies an AbortError as a retryable `error`) lands as a
+   * no-op against the now-terminal row instead of rescheduling it back to `queued`. The DB write runs
+   * regardless of `inFlight` membership, so a `running` row leased by a since-restarted process (no
+   * local controller) is still terminalized and lease-expiry reclaim can't re-run it. Returns whether
+   * it acted (false = the job was already terminal or unknown).
+   */
+  async cancel(jobId: string): Promise<boolean> {
+    const acted = await cancelJob(this.db, this.clock, jobId);
+    this.inFlight.get(jobId)?.abort();
+    return acted;
+  }
+
+  /**
    * Crash/restart reconciliation (anton-nbd). Call ONCE at boot, before `start()`, while nothing is
    * in flight. Two steps make the durable state consistent again:
    *
@@ -517,6 +533,10 @@ export class JobRunner {
   private async settle(job: JobRow, outcome: Outcome, policy: JobPolicy): Promise<void> {
     // Re-read attempts (a heartbeat/lease may have advanced updatedAt, not attempts, but be safe).
     const fresh = (await getJob(this.db, job.id)) ?? job;
+    // Fast-path a cancel already visible at this read. The queue transition below also compares from
+    // `running`, which closes the remaining race where cancel lands after this check but before the
+    // settle write.
+    if (fresh.status === "cancelled") return;
     // The project's retry budget governs when we park; backoff/quota stay from the runner config.
     const config = { ...this.config, maxAttempts: policy.maxAttempts };
     const action = nextAction(config, fresh, outcome, this.clock.now());

@@ -49,7 +49,7 @@ export const jobs = sqliteTable(
     type: text("type").notNull(),
     projectId: text("project_id").references(() => projects.id),
     payloadJson: text("payload_json").notNull().default("{}"),
-    // queued | running | parked | done | failed
+    // queued | running | parked | done | failed | cancelled
     status: text("status").notNull().default("queued"),
     runAt: ts("run_at").notNull().default(now),
     leaseExpiresAt: ts("lease_expires_at"),

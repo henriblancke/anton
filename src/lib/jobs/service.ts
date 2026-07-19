@@ -159,3 +159,25 @@ export async function resumeJob(projectId: string, jobId: string): Promise<boole
   if (!job || job.projectId !== projectId) return false;
   return getRunner().resume(jobId);
 }
+
+/**
+ * Outcome of a project-scoped cancel, so the route can pick the right HTTP status:
+ *   • `ok`              — the job was terminalized (200).
+ *   • `not-found`       — no such job, or it belongs to a different project (404). Project-scoping is
+ *                         enforced here so a route can't kill another project's job by id.
+ *   • `not-cancellable` — the job exists in this project but is already terminal (409).
+ */
+export type CancelResult = { ok: true } | { ok: false; reason: "not-found" | "not-cancellable" };
+
+/**
+ * Force-kill a job from the UI (anton-a4jj). Aborts its in-flight child (when this process holds one)
+ * and durably marks it `cancelled` so no durability path revives it. Scoped to the project so a route
+ * can't cancel another project's job by id — a cross-project (or missing) job is `not-found`, an
+ * already-terminal one is `not-cancellable`.
+ */
+export async function cancelJob(projectId: string, jobId: string): Promise<CancelResult> {
+  const job = await getJob(getDb(), jobId);
+  if (!job || job.projectId !== projectId) return { ok: false, reason: "not-found" };
+  const acted = await getRunner().cancel(jobId);
+  return acted ? { ok: true } : { ok: false, reason: "not-cancellable" };
+}
