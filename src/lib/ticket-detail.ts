@@ -62,7 +62,11 @@ export async function updateTicket(
 ): Promise<TicketDetail> {
   const current = await beads.show(project.repoPath, id);
   await beads.update(project.repoPath, id, patch, current.labels ?? []);
-  await beads
+  // Fire-and-forget (like the claim route's nudgeSync): the update already landed locally, so don't
+  // block the save response on a `bd dolt pull/commit/push` a slow/unreachable remote could stall. A
+  // failed push is recorded as "failing"/unpushed in the sync-status registry inside beads.sync and
+  // retried by the E1 heartbeat backstop — this catch only keeps the rejection from floating.
+  void beads
     .sync(project.repoPath)
     .catch((e) => console.error(`[ticket-detail] beads dolt sync failed after updating ${id}`, e));
   return getTicketDetail(project, id);
@@ -76,7 +80,11 @@ export async function updateTicket(
 export async function deleteTicket(project: Project, id: string): Promise<void> {
   await beads.show(project.repoPath, id); // 404 guard — bd throws on an unknown id
   await beads.delete(project.repoPath, id);
-  await beads
+  // Fire-and-forget (like the claim route's nudgeSync): the delete already landed locally, so don't
+  // block the response on a `bd dolt pull/commit/push` a slow/unreachable remote could stall. A
+  // failed push is recorded as "failing"/unpushed in the sync-status registry inside beads.sync and
+  // retried by the E1 heartbeat backstop — this catch only keeps the rejection from floating.
+  void beads
     .sync(project.repoPath)
     .catch((e) => console.error(`[ticket-detail] beads dolt sync failed after deleting ${id}`, e));
 }

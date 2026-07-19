@@ -535,4 +535,39 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     expect(res.status).toBe(404);
     expect((await res.json()).error).toMatch(/not found/i);
   });
+
+  // anton-u8wu (A2): approval enqueues the run off the local approve write, so it must not block on
+  // the remote push. Hold the sync pending, prove POST responds 200 before it settles (off the
+  // critical path), then reject it and prove the failure is logged and swallowed — never awaited,
+  // never an unhandled rejection. The sync-status "failing"/unpushed recording lives in beads.sync
+  // and is covered in bd.test.ts.
+  it("fires the remote push off the response path and catches a rejected sync", async () => {
+    actAs("anton-test");
+    const epic = await beads.create(repo, { title: "Approve then fail", type: "epic" });
+    const child = await beads.create(repo, { title: "Approve then fail child", type: "task" });
+    await beads.link(repo, child, epic, "parent-child");
+
+    let failSync!: () => void;
+    const pendingSync = new Promise<void>((_resolve, reject) => {
+      failSync = () => reject(new Error("remote unreachable"));
+    });
+    const syncSpy = vi.spyOn(beads, "sync").mockReturnValue(pendingSync);
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // Responds while the push is still in flight — proof it isn't awaited (an awaited sync would
+    // hang the response until this test times out).
+    const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", epic));
+    expect(res.status).toBe(200);
+    expect(syncSpy).toHaveBeenCalledTimes(1);
+
+    failSync();
+    await new Promise((r) => setImmediate(r)); // let the fire-and-forget `.catch` run
+    expect(errSpy).toHaveBeenCalled(); // the failed push was logged, not silently swallowed
+
+    syncSpy.mockRestore();
+    errSpy.mockRestore();
+
+    // The approve write landed locally regardless of the failed push.
+    expect(beads.isApproved(await beads.show(repo, epic))).toBe(true);
+  }, 60_000);
 });

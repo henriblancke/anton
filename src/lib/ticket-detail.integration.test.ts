@@ -4,13 +4,14 @@
  * hit only the intended fields — an agent change preserves the `approved` label. Mirrors
  * epic-detail.integration.test.ts. Skipped when `bd`/`git` aren't installed.
  */
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beads } from "./beads/bd";
-import { getTicketDetail, updateTicket } from "./ticket-detail";
+import { resetIssueSnapshots } from "./beads/snapshot";
+import { deleteTicket, getTicketDetail, updateTicket } from "./ticket-detail";
 import type { Project } from "./types";
 
 function has(cmd: string): boolean {
@@ -48,6 +49,13 @@ suite("ticket-detail integration (real bd)", () => {
   afterAll(() => {
     if (repo) rmSync(repo, { recursive: true, force: true });
   });
+
+  // These cases share one repo, so a warm cross-test snapshot would leak between them. Since A1
+  // (anton-hp2b) the snapshot serves last-good data on a local write instead of dropping it — a
+  // read-after-write returns stale beads, refreshed client-side by A3's version-bump poll. Clearing
+  // the cache before each case forces the cold, fresh read a new client's next poll would make, so a
+  // just-written bead is observed rather than a prior test's snapshot.
+  beforeEach(() => resetIssueSnapshots());
 
   it("reads a task's goal/acceptance/labels and parent epic", async () => {
     const epicId = await beads.create(repo, { title: "Detail epic", type: "epic" });
@@ -103,5 +111,58 @@ suite("ticket-detail integration (real bd)", () => {
 
   it("throws for a genuinely missing id", async () => {
     await expect(getTicketDetail(project, "does-not-exist-999")).rejects.toThrow(/not found/i);
+  }, 30_000);
+
+  // anton-u8wu (A2): a ticket save must not block on the remote push. Hold the sync pending, prove
+  // updateTicket resolves (with the saved detail) before it settles, then reject it and prove the
+  // failure is logged and swallowed — never awaited, never an unhandled rejection. The sync-status
+  // "failing"/unpushed recording lives in beads.sync and is covered in bd.test.ts.
+  it("updateTicket fires the remote push off the response path and catches a rejected sync", async () => {
+    const taskId = await beads.create(repo, { title: "Save me", type: "task" });
+
+    let failSync!: () => void;
+    const pendingSync = new Promise<void>((_resolve, reject) => {
+      failSync = () => reject(new Error("remote unreachable"));
+    });
+    const syncSpy = vi.spyOn(beads, "sync").mockReturnValue(pendingSync);
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // Resolves with the saved detail while the push is still in flight — proof it isn't awaited.
+    const updated = await updateTicket(project, taskId, { title: "Saved" });
+    expect(updated.title).toBe("Saved");
+    expect(syncSpy).toHaveBeenCalledTimes(1);
+
+    failSync();
+    await new Promise((r) => setImmediate(r));
+    expect(errSpy).toHaveBeenCalled();
+
+    syncSpy.mockRestore();
+    errSpy.mockRestore();
+
+    // The local update landed regardless of the failed push.
+    expect((await beads.show(repo, taskId)).title).toBe("Saved");
+  }, 30_000);
+
+  it("deleteTicket fires the remote push off the response path and catches a rejected sync", async () => {
+    const taskId = await beads.create(repo, { title: "Delete me", type: "task" });
+
+    let failSync!: () => void;
+    const pendingSync = new Promise<void>((_resolve, reject) => {
+      failSync = () => reject(new Error("remote unreachable"));
+    });
+    const syncSpy = vi.spyOn(beads, "sync").mockReturnValue(pendingSync);
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await deleteTicket(project, taskId);
+    expect(syncSpy).toHaveBeenCalledTimes(1);
+
+    failSync();
+    await new Promise((r) => setImmediate(r));
+    expect(errSpy).toHaveBeenCalled();
+
+    syncSpy.mockRestore();
+    errSpy.mockRestore();
+
+    await expect(beads.show(repo, taskId)).rejects.toThrow();
   }, 30_000);
 });

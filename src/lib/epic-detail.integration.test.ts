@@ -3,13 +3,14 @@
  * getEpicDetail returns the tickets plus that edge. Mirrors board.integration.test.ts. Skipped
  * when `bd`/`git` aren't installed.
  */
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beads } from "./beads/bd";
-import { getEpicDetail } from "./epic-detail";
+import { resetIssueSnapshots } from "./beads/snapshot";
+import { deleteEpic, getEpicDetail } from "./epic-detail";
 import type { Project } from "./types";
 
 function has(cmd: string): boolean {
@@ -47,6 +48,13 @@ suite("epic-detail integration (real bd)", () => {
   afterAll(() => {
     if (repo) rmSync(repo, { recursive: true, force: true });
   });
+
+  // These cases share one repo, so a warm cross-test snapshot would leak between them. Since A1
+  // (anton-hp2b) the snapshot serves last-good data on a local write instead of dropping it — a
+  // read-after-write returns stale beads, refreshed client-side by A3's version-bump poll. Clearing
+  // the cache before each case forces the cold, fresh read a new client's next poll would make, so a
+  // just-written bead is observed rather than a prior test's snapshot.
+  beforeEach(() => resetIssueSnapshots());
 
   it("returns the epic's tickets and their blocks edge", async () => {
     const epicId = await beads.create(repo, {
@@ -129,7 +137,9 @@ suite("epic-detail integration (real bd)", () => {
       expect(got.has(id), `child ${id} present`).toBe(true);
     }
     expect(detail.tickets.length).toBe(childIds.length);
-  }, 60_000);
+    // Real bd shells out per create; 68 beads plus the cold fresh read run past the default 60s on a
+    // loaded machine (the per-test snapshot reset means the final read is a true fresh `bd list`).
+  }, 120_000);
 
   // Regression for anton-noc (secondary): an orphan (parentless) non-epic bead is shown on the
   // board as a single-ticket card; opening it must return a single-ticket detail, not 404/throw.
@@ -148,5 +158,35 @@ suite("epic-detail integration (real bd)", () => {
 
   it("still throws for a genuinely missing id", async () => {
     await expect(getEpicDetail(project, "does-not-exist-999")).rejects.toThrow(/not found/i);
+  }, 30_000);
+
+  // anton-u8wu (A2): the delete must not block on the remote push. Hold the sync pending, prove the
+  // delete resolves before it settles (off the critical path), then reject it and prove the failure
+  // is logged and swallowed — never awaited, never an unhandled rejection. The sync-status
+  // "failing"/unpushed recording lives in beads.sync and is covered in bd.test.ts.
+  it("deleteEpic fires the remote push off the response path and catches a rejected sync", async () => {
+    const epicId = await beads.create(repo, { title: "Doomed epic", type: "epic" });
+
+    let failSync!: () => void;
+    const pendingSync = new Promise<void>((_resolve, reject) => {
+      failSync = () => reject(new Error("remote unreachable"));
+    });
+    const syncSpy = vi.spyOn(beads, "sync").mockReturnValue(pendingSync);
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // Resolves while the push is still in flight — proof it isn't awaited (an awaited sync would
+    // hang here until the test times out).
+    await deleteEpic(project, epicId);
+    expect(syncSpy).toHaveBeenCalledTimes(1);
+
+    failSync();
+    await new Promise((r) => setImmediate(r)); // let the fire-and-forget `.catch` run
+    expect(errSpy).toHaveBeenCalled(); // the failed push was logged, not silently swallowed
+
+    syncSpy.mockRestore();
+    errSpy.mockRestore();
+
+    // The local cascade delete landed regardless of the failed push.
+    await expect(beads.show(repo, epicId)).rejects.toThrow();
   }, 30_000);
 });

@@ -225,7 +225,12 @@ export async function POST(
   }
   if (!swap.ok) return NextResponse.json(conflictBody(epicId, swap.owner), { status: 409 });
 
-  await beads
+  // Fire-and-forget (like the claim route's nudgeSync): the approve write already landed locally and
+  // the run enqueues off that local state, so don't block the response on a `bd dolt pull/commit/push`
+  // a slow/unreachable remote could stall. A failed push is recorded as "failing"/unpushed in the
+  // sync-status registry inside beads.sync and retried by the E1 heartbeat backstop — this catch only
+  // keeps the rejection from floating.
+  void beads
     .sync(project.repoPath)
     .catch((err) => console.error(`[approve] beads dolt sync failed after approving ${epicId}`, err));
 
