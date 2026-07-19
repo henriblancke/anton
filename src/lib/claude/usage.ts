@@ -90,7 +90,11 @@ async function readOAuth(): Promise<OAuthCreds | null> {
     const { stdout } = await execFileAsync(
       "security",
       ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
-      { encoding: "utf8" },
+      // Bound the call: a locked keychain (or an interactive access prompt) makes `security` block
+      // indefinitely, and `execFile` has no default deadline — without a timeout the fail-soft
+      // filesystem fallback below is never reached and the /api/usage fetch hangs. Short timeout so
+      // a blocked keychain degrades to the fs path fast; maxBuffer mirrors the other CLI wrappers.
+      { encoding: "utf8", timeout: 5_000, maxBuffer: 1024 * 1024 },
     );
     const creds = readOAuthCreds(JSON.parse(stdout));
     if (creds) return creds;

@@ -11,17 +11,23 @@ import { planMove, type MoveOp } from "./board-move";
 import type { Project } from "./types";
 
 /**
- * Normalize a user-entered PR reference to the beads external-ref form `gh-<n>`. Accepts a bare
- * number (`44`), `#44`, an already-normalized `gh-44`, or a full GitHub PR URL
+ * Normalize a user-entered PR reference to a beads external-ref. Accepts a bare number (`44`),
+ * `#44`, an already-normalized `gh-44`, or a full GitHub PR URL
  * (`https://github.com/owner/repo/pull/44`, trailing `/files` etc. tolerated). Returns null when no
- * PR number can be extracted, so the caller answers 400 rather than storing junk. `gh-<n>` matches
- * the primary form `prNumberFromRef` (git/pr.ts) parses back out for the review-fix sweep.
+ * PR number can be extracted, so the caller answers 400 rather than storing junk.
+ *
+ * A full URL is stored VERBATIM, not collapsed to `gh-<n>`: collapsing loses the repo, so the chip
+ * goes inert when `origin` can't be resolved to a web base, and a pasted fork/other-repo URL would
+ * be silently re-expanded against the CURRENT repo and point at the wrong PR. Keeping the URL is
+ * strictly safer and fully supported downstream — `prNumberFromRef` (git/pr.ts) reads the number
+ * out of `/pull/<n>` for the review-fix sweep, and `prUrlFromRef` returns an http(s) ref as-is.
+ * Only a bare number / #44 / gh-44 collapses to the canonical `gh-<n>`.
  */
 export function normalizePrRef(input: string): string | null {
   const s = input.trim();
   if (!s) return null;
+  if (/^https?:\/\/\S+\/pull\/\d+/i.test(s)) return s; // full PR url — preserve verbatim
   const m =
-    s.match(/\/pull\/(\d+)/) ?? // full PR url (…/pull/44, …/pull/44/files)
     s.match(/^gh-(\d+)$/i) ?? // already normalized
     s.match(/^#?(\d+)$/); // 44 or #44
   return m ? `gh-${m[1]}` : null;

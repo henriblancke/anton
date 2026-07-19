@@ -58,7 +58,9 @@ describe("UsageRow", () => {
     const html = renderToStaticMarkup(<UsageRow label="Weekly" pct={10} resetAt={resetAt} />);
     expect(html).toMatch(/resets in 2h \d+m/); // relative countdown
     expect(html).toContain("·"); // separates relative from the absolute stamp
-    expect(html).toContain("2026"); // absolute reset stamp
+    // Derive the year from resetAt (local, matching the component's formatting) so the assertion
+    // isn't pinned to 2026 — a hard-coded year breaks once the clock passes it or near a boundary.
+    expect(html).toContain(String(new Date(resetAt).getFullYear())); // absolute reset stamp
   });
 });
 

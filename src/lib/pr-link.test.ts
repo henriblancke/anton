@@ -30,9 +30,13 @@ describe("normalizePrRef", () => {
     expect(normalizePrRef("GH-44")).toBe("gh-44");
   });
 
-  it("extracts the number from a full GitHub PR url", () => {
-    expect(normalizePrRef("https://github.com/owner/repo/pull/44")).toBe("gh-44");
-    expect(normalizePrRef("https://github.com/owner/repo/pull/44/files")).toBe("gh-44");
+  it("preserves a full GitHub PR url verbatim (keeps the repo; downstream reads the number out)", () => {
+    expect(normalizePrRef("https://github.com/owner/repo/pull/44")).toBe(
+      "https://github.com/owner/repo/pull/44",
+    );
+    expect(normalizePrRef("https://github.com/owner/repo/pull/44/files")).toBe(
+      "https://github.com/owner/repo/pull/44/files",
+    );
   });
 
   it("trims surrounding whitespace", () => {
