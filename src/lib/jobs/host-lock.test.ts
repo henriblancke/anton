@@ -4,9 +4,10 @@
  * owner died. Lock names are unique per test because the lock root is a real shared /tmp directory.
  */
 import { describe, expect, it } from "vitest";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { randomUUID } from "node:crypto";
 import { withHostLock } from "./host-lock";
 
 const LOCK_ROOT = join(tmpdir(), "anton-host-locks");
@@ -95,7 +96,7 @@ describe("withHostLock", () => {
     // PID 2^22 is above the max on Linux and macOS, so it can never be a live process.
     await writeFile(
       join(dir, "owner.json"),
-      JSON.stringify({ pid: 4194304, heartbeatAt: Date.now(), label: "dead" }),
+      JSON.stringify({ token: randomUUID(), pid: 4194304, heartbeatAt: Date.now(), label: "dead" }),
       "utf8",
     );
 
@@ -106,6 +107,28 @@ describe("withHostLock", () => {
     }, { maxWaitMs: 200 });
 
     expect(ran).toBe(true);
+  });
+
+  it("does not let a second stale reclaimer remove the live path", async () => {
+    const name = `test-reclaim-race-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+    const oldToken = randomUUID();
+    // The existing tombstone means another waiter already reclaimed this acquisition. Model the
+    // race window by putting a successor at the live path while this delayed waiter still holds the
+    // old metadata it read. Its token-specific rename must fail rather than moving the successor.
+    await mkdir(`${dir}.retired-${oldToken}`, { recursive: true });
+    await writeFile(join(`${dir}.retired-${oldToken}`, "owner.json"), "old", "utf8");
+    await mkdir(dir, { recursive: true });
+    await writeFile(
+      join(dir, "owner.json"),
+      JSON.stringify({ token: oldToken, pid: 4194304, heartbeatAt: Date.now(), label: "stale read" }),
+      "utf8",
+    );
+
+    await withHostLock(name, async () => {}, { maxWaitMs: 25 });
+
+    const stillLive = JSON.parse(await readFile(join(dir, "owner.json"), "utf8")) as { token: string };
+    expect(stillLive.token).toBe(oldToken);
   });
 
   it("reports the holder to onWait only when contended", async () => {

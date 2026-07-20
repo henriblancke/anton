@@ -43,6 +43,37 @@ function writeFakeHangingClaude(name: string, ndjsonLines: string[]): string {
   return path;
 }
 
+/** A wedged Claude stand-in with a child process, proving the watchdog kills the whole tree. */
+function writeFakeHangingClaudeWithChild(name: string, childPidPath: string): string {
+  const path = join(dir, name);
+  const body = [
+    "#!/usr/bin/env node",
+    "const { spawn } = require('node:child_process');",
+    "const { writeFileSync } = require('node:fs');",
+    "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1 << 30)']);",
+    `writeFileSync(${JSON.stringify(childPidPath)}, String(child.pid));`,
+    "process.stdout.write(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sess-tree' }) + '\\n');",
+    "setInterval(() => {}, 1 << 30);",
+    "",
+  ].join("\n");
+  writeFileSync(path, body, "utf8");
+  chmodSync(path, 0o755);
+  return path;
+}
+
+async function waitForProcessExit(pid: number, timeoutMs = 2_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return false;
+}
+
 /** A fake that emits each line `gapMs` apart — slow but demonstrably alive. */
 function writeFakeDripClaude(name: string, gapMs: number, ndjsonLines: string[]): string {
   const path = join(dir, name);
@@ -872,6 +903,19 @@ describe("runClaude", () => {
     expect(err.signature).toBe("stalled");
     // The id from the `system` init event survives even though no result event ever arrived.
     expect(err.sessionId).toBe("sess-stall");
+  });
+
+  it.runIf(process.platform !== "win32")("kills descendants when a session stalls", async () => {
+    const childPidPath = join(dir, "stalled-child.pid");
+    const bin = writeFakeHangingClaudeWithChild("stalled-tree-claude", childPidPath);
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    await expect(runClaude({ cwd: dir, prompt: "wedge tree", stallTimeoutMs: 1_500 })).rejects.toMatchObject({
+      signature: "stalled",
+    });
+
+    const childPid = Number(readFileSync(childPidPath, "utf8"));
+    expect(await waitForProcessExit(childPid)).toBe(true);
   });
 
   it("does not kill a slow session that keeps emitting output", async () => {

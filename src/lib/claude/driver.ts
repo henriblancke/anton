@@ -276,7 +276,27 @@ export async function runClaude(opts: RunClaudeOptions): Promise<ClaudeResult> {
     const child = spawn(bin, args, {
       cwd: opts.cwd,
       signal: opts.signal,
+      // On POSIX, make Claude the leader of a new process group. The stall watchdog must terminate
+      // the shell commands/tests Claude spawned too; killing only Claude leaves the actual hung
+      // wait-loop orphaned and lets every retry add another copy.
+      detached: process.platform !== "win32",
     });
+    const killTree = (signal: NodeJS.Signals) => {
+      if (process.platform !== "win32" && child.pid) {
+        try {
+          process.kill(-child.pid, signal);
+          return;
+        } catch {
+          // The group may not have formed if spawn failed; fall back to the direct child handle.
+        }
+      }
+      child.kill(signal);
+    };
+    // Node's built-in AbortSignal handling targets only the direct child. Since Claude is now a
+    // process-group leader, mirror cancellation to the group so ordinary job cancellation does not
+    // orphan descendants either.
+    const onAbort = () => killTree("SIGTERM");
+    opts.signal?.addEventListener("abort", onAbort, { once: true });
 
     let stdoutBuf = "";
     let stderrBuf = "";
@@ -330,7 +350,7 @@ export async function runClaude(opts: RunClaudeOptions): Promise<ClaudeResult> {
       if (!Number.isFinite(stallMs) || stallMs <= 0) return; // 0/Infinity disables the watchdog
       stallTimer = setTimeout(() => {
         stalled = true;
-        child.kill("SIGKILL");
+        killTree("SIGKILL");
       }, stallMs);
       stallTimer.unref?.();
     };
@@ -351,11 +371,13 @@ export async function runClaude(opts: RunClaudeOptions): Promise<ClaudeResult> {
 
     child.on("error", (err) => {
       clearStall();
+      opts.signal?.removeEventListener("abort", onAbort);
       reject(err);
     });
 
     child.on("close", (code) => {
       clearStall();
+      opts.signal?.removeEventListener("abort", onAbort);
       if (stdoutBuf.trim()) {
         handleLine(stdoutBuf);
         stdoutBuf = "";

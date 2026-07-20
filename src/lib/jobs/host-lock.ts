@@ -9,9 +9,10 @@
  * best-effort by design: a caller that cannot acquire within its budget runs anyway rather than
  * failing the epic, because a slow check is better than a stuck queue.
  */
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { randomUUID } from "node:crypto";
 
 /** Lock directory root. One subdirectory per lock name; `mkdir` is the atomic acquire. */
 const LOCK_ROOT = join(tmpdir(), "anton-host-locks");
@@ -26,10 +27,32 @@ const STALE_AFTER_MS = 60_000;
 const POLL_MS = 2_000;
 
 interface LockFile {
+  /** Unique acquisition identity, used to make reclaim and release ownership-safe. */
+  token: string;
   pid: number;
   /** Refreshed while held, so a peer can tell "slow" from "dead" without trusting pid reuse. */
   heartbeatAt: number;
   label: string;
+}
+
+/**
+ * Move an acquisition out of the live lock path without ever deleting whatever currently lives
+ * there. Reclaim and release use the same token-specific destination. Once either wins, that
+ * non-empty tombstone remains as a guard: a delayed actor for the old acquisition cannot rename a
+ * successor over it. The tiny files live under the OS temp directory and are cleared on reboot.
+ */
+async function retire(dir: string, token: string): Promise<boolean> {
+  // Holder metadata is in a host-writable temp directory. Accept only tokens this module creates so
+  // a forged owner file cannot turn the rename destination into a path traversal.
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(token)) {
+    return false;
+  }
+  try {
+    await rename(dir, `${dir}.retired-${token}`);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export interface HostLockOptions {
@@ -87,6 +110,7 @@ export async function withHostLock<T>(
   const dir = join(LOCK_ROOT, name);
   const metaPath = join(dir, "owner.json");
   const deadline = Date.now() + maxWaitMs;
+  const token = randomUUID();
 
   await mkdir(LOCK_ROOT, { recursive: true });
 
@@ -107,11 +131,14 @@ export async function withHostLock<T>(
         notifiedWait = true;
       }
       if (isAbandoned(holder, dirCreatedAt, Date.now())) {
-        // Reclaim: drop the corpse and retry immediately. Two peers may race here; the loser's
-        // mkdir simply fails and it keeps waiting, so at most one winner proceeds.
-        await rm(dir, { recursive: true, force: true });
-        dirCreatedAt = Date.now();
-        continue;
+        // Only metadata with an acquisition token can be reclaimed safely. `retire`'s stable,
+        // token-specific destination prevents a delayed reclaimer from moving a successor's lock.
+        if (holder?.token && (await retire(dir, holder.token))) {
+          dirCreatedAt = Date.now();
+          continue;
+        }
+        // A failed retirement usually means another waiter already reclaimed this acquisition.
+        // Fall through to the normal deadline/poll path; spinning here would defeat maxWaitMs.
       }
       const remaining = deadline - Date.now();
       if (opts.signal?.aborted || remaining <= 0) break; // advisory: run unlocked
@@ -124,7 +151,11 @@ export async function withHostLock<T>(
   if (!held) return fn();
 
   const write = () =>
-    writeFile(metaPath, JSON.stringify({ pid: process.pid, heartbeatAt: Date.now(), label: opts.label ?? "" }), "utf8");
+    writeFile(
+      metaPath,
+      JSON.stringify({ token, pid: process.pid, heartbeatAt: Date.now(), label: opts.label ?? "" }),
+      "utf8",
+    );
   await write();
   // Keep the heartbeat fresh so a long-but-healthy hold is never mistaken for a crash. Unref'd so a
   // pending tick can't hold the process open.
@@ -135,7 +166,9 @@ export async function withHostLock<T>(
     return await fn();
   } finally {
     clearInterval(beat);
-    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    // The token-specific tombstone also makes release safe if this acquisition was reclaimed: its
+    // tombstone already exists, so a late release cannot move or delete the successor at `dir`.
+    await retire(dir, token);
   }
 }
 
