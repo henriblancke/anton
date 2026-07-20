@@ -4,6 +4,7 @@
  */
 import { spawn } from "node:child_process";
 import { appendSessionLog } from "../sessions";
+import { VERIFY_GATE_LOCK, withHostLock } from "./host-lock";
 import type { VerifyGate } from "../projects";
 
 export interface ShellResult {
@@ -28,6 +29,10 @@ export function runShell(cmd: string, cwd: string, signal?: AbortSignal): Promis
  * on the first non-zero exit — the same fail path as the historical single test gate. `onFail`
  * builds the caller-specific error message (execute-epic names the ticket; review-fix names the
  * PR). An empty gate list is a no-op, preserving unchanged behavior when nothing is configured.
+ *
+ * The whole sequence runs under a host-wide lock (anton-0oi): concurrent runs each starting a full
+ * suite starve each other into timeout failures that belong to neither change. The lock is advisory
+ * — if a peer holds it too long we run anyway, because a slow gate beats a wedged queue.
  */
 export async function runVerifyGates(
   gates: VerifyGate[],
@@ -36,9 +41,26 @@ export async function runVerifyGates(
   logPath: string,
   onFail: (gate: VerifyGate, code: number | null) => string,
 ): Promise<void> {
-  for (const gate of gates) {
-    const res = await runShell(gate.command, cwd, signal);
-    await appendSessionLog(logPath, `\n[${gate.label}] ${gate.command}\n${res.output}\n`);
-    if (!res.ok) throw new Error(onFail(gate, res.code));
-  }
+  if (gates.length === 0) return; // no gates: never take the lock
+
+  await withHostLock(
+    VERIFY_GATE_LOCK,
+    async () => {
+      for (const gate of gates) {
+        const res = await runShell(gate.command, cwd, signal);
+        await appendSessionLog(logPath, `\n[${gate.label}] ${gate.command}\n${res.output}\n`);
+        if (!res.ok) throw new Error(onFail(gate, res.code));
+      }
+    },
+    {
+      signal,
+      label: cwd,
+      onWait: (holder) => {
+        void appendSessionLog(
+          logPath,
+          `\n[verify] waiting for host verify-gate lock (held by pid ${holder?.pid ?? "?"}${holder?.label ? ` — ${holder.label}` : ""})\n`,
+        );
+      },
+    },
+  );
 }

@@ -59,7 +59,25 @@ export interface RunClaudeOptions {
   signal?: AbortSignal;
   /** Streamed events (append to session log, push to SSE). */
   onEvent?: (event: ClaudeEvent) => void;
+  /**
+   * Kill the session after this long with NO output at all (anton-0oi). A headless agent that
+   * blocks forever — e.g. on a shell wait-loop whose condition can never go false — emits nothing
+   * and otherwise burns the run's entire budget looking alive. Silence is the only signal
+   * available: a blocked tool call produces no stream-json events.
+   *
+   * Default {@link DEFAULT_STALL_TIMEOUT_MS} is deliberately generous, because *legitimate*
+   * silence can be long: a full test suite runs for minutes, and under the host verify-gate lock a
+   * gate can also wait its turn first. Set below that only when the work is known to be chatty.
+   */
+  stallTimeoutMs?: number;
 }
+
+/**
+ * 60 minutes. Must exceed the longest legitimate silent stretch — a full suite (~13 min here) that
+ * first waited out the host verify-gate lock (up to 30 min) is ~45 min of justified quiet. This is
+ * a backstop against a hang that would otherwise run until the job lease expires, not a latency SLO.
+ */
+export const DEFAULT_STALL_TIMEOUT_MS = 60 * 60_000;
 
 /**
  * Case-insensitive usage-limit phrasing Claude Code emits on an exhausted quota, anchored to the
@@ -258,7 +276,27 @@ export async function runClaude(opts: RunClaudeOptions): Promise<ClaudeResult> {
     const child = spawn(bin, args, {
       cwd: opts.cwd,
       signal: opts.signal,
+      // On POSIX, make Claude the leader of a new process group. The stall watchdog must terminate
+      // the shell commands/tests Claude spawned too; killing only Claude leaves the actual hung
+      // wait-loop orphaned and lets every retry add another copy.
+      detached: process.platform !== "win32",
     });
+    const killTree = (signal: NodeJS.Signals) => {
+      if (process.platform !== "win32" && child.pid) {
+        try {
+          process.kill(-child.pid, signal);
+          return;
+        } catch {
+          // The group may not have formed if spawn failed; fall back to the direct child handle.
+        }
+      }
+      child.kill(signal);
+    };
+    // Node's built-in AbortSignal handling targets only the direct child. Since Claude is now a
+    // process-group leader, mirror cancellation to the group so ordinary job cancellation does not
+    // orphan descendants either.
+    const onAbort = () => killTree("SIGTERM");
+    opts.signal?.addEventListener("abort", onAbort, { once: true });
 
     let stdoutBuf = "";
     let stderrBuf = "";
@@ -297,7 +335,29 @@ export async function runClaude(opts: RunClaudeOptions): Promise<ClaudeResult> {
       }
     };
 
+    // Stall watchdog (anton-0oi): any byte on either stream counts as liveness and rearms the
+    // timer. On expiry the child is killed, which reaches `close` below — but `stalled` is latched
+    // first so that handler reports the hang instead of a bare "exited with code null".
+    const stallMs = opts.stallTimeoutMs ?? DEFAULT_STALL_TIMEOUT_MS;
+    let stalled = false;
+    let stallTimer: NodeJS.Timeout | undefined;
+    const clearStall = () => {
+      if (stallTimer) clearTimeout(stallTimer);
+      stallTimer = undefined;
+    };
+    const armStall = () => {
+      clearStall();
+      if (!Number.isFinite(stallMs) || stallMs <= 0) return; // 0/Infinity disables the watchdog
+      stallTimer = setTimeout(() => {
+        stalled = true;
+        killTree("SIGKILL");
+      }, stallMs);
+      stallTimer.unref?.();
+    };
+    armStall();
+
     child.stdout?.on("data", (chunk: Buffer) => {
+      armStall();
       stdoutBuf += chunk.toString("utf8");
       const lines = stdoutBuf.split("\n");
       stdoutBuf = lines.pop() ?? "";
@@ -305,17 +365,36 @@ export async function runClaude(opts: RunClaudeOptions): Promise<ClaudeResult> {
     });
 
     child.stderr?.on("data", (chunk: Buffer) => {
+      armStall();
       stderrBuf += chunk.toString("utf8");
     });
 
     child.on("error", (err) => {
+      clearStall();
+      opts.signal?.removeEventListener("abort", onAbort);
       reject(err);
     });
 
     child.on("close", (code) => {
+      clearStall();
+      opts.signal?.removeEventListener("abort", onAbort);
       if (stdoutBuf.trim()) {
         handleLine(stdoutBuf);
         stdoutBuf = "";
+      }
+
+      if (stalled) {
+        // Resume-eligible: the session may have real work banked before it wedged, and the caller
+        // refuses to resume twice on the same signature, so a re-stall escalates to a fresh run
+        // rather than looping. `initSessionId` is captured at session start, so it is available
+        // even though no result event ever arrived.
+        reject(
+          new RecoverableClaudeError(
+            `claude produced no output for ${Math.round(stallMs / 60_000)}m — killed as stalled`,
+            { sessionId: initSessionId, signature: "stalled" },
+          ),
+        );
+        return;
       }
 
       const resultText = resultRaw && typeof resultRaw.result === "string" ? resultRaw.result : undefined;

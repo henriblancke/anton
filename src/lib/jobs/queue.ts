@@ -493,18 +493,29 @@ export async function reschedule(
  * Park the job: it exhausted its retry budget or hit a permanent error, so pause it for a human.
  * NOT terminal — `resumeJob` is the un-park path. Quota hits reschedule (see `reschedule`) and
  * must never reach here; only plain-error exhaustion and `PoisonError` park (anton-ner.2).
+ *
+ * Parks any ACTIVE job — `running` **or** `queued`. A job awaiting a retry (requeued with a future
+ * `runAt`) is a legitimate park target: it is exactly what a human parks to stop the next attempt,
+ * and what a caller parks to stop a job being re-dispatched. Restricting this to `running` made
+ * both cases a silent no-op (anton-0oi).
+ *
+ * Returns whether it actually parked. Callers that depend on the job being parked afterwards MUST
+ * check — a `done`/`failed`/already-`parked` job is left alone and reports `false` rather than
+ * pretending to have parked it.
  */
 export async function park(
   db: AntonDb,
   clock: Clock,
   jobId: string,
   lastError: string,
-): Promise<void> {
+): Promise<boolean> {
   const nowMs = clock.now();
-  await db
+  const rows = await db
     .update(schema.jobs)
     .set({ status: "parked", leaseExpiresAt: null, lastError, updatedAt: secDate(nowMs) })
-    .where(and(eq(schema.jobs.id, jobId), eq(schema.jobs.status, "running")));
+    .where(and(eq(schema.jobs.id, jobId), inArray(schema.jobs.status, [...ACTIVE_STATUSES])))
+    .returning({ id: schema.jobs.id });
+  return rows.length > 0;
 }
 
 /**
