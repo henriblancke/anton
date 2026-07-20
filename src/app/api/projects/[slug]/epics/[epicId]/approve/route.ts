@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { getBoard } from "@/lib/board";
 import { epicStandaloneBlockers, standaloneBlockers } from "@/lib/epic-graph";
 import { refreshAllIssues } from "@/lib/beads/issues";
-import { beads } from "@/lib/beads/bd";
+import { beads, type Bead } from "@/lib/beads/bd";
 import { conflictBody, ownerOf, withClaimLock } from "@/lib/beads/claim";
 import { enqueueExecuteEpic, enqueueExecuteEpicIfAbsent } from "@/lib/jobs/service";
 import { resolveOperator } from "@/lib/operator";
@@ -61,6 +61,8 @@ export async function POST(
     return NextResponse.json({ error: reason }, { status: 422 });
   }
 
+  // Builds off the snapshot the refresh above just populated — a board rebuild, not a bd read. The
+  // route needs it for the epic-graph blocker rollup and for the item shape it answers with.
   const board = await getBoard(project);
   const epic = STAGES.map((stage) => board.columns[stage].find((e) => e.id === epicId)).find(
     Boolean,
@@ -84,20 +86,16 @@ export async function POST(
   // targets — claim-control.tsx `canTakeOver`). So read ownership here and derive the take-over first,
   // then let the gate skip it.
   //
-  // Re-read the assignee HERE — a fresh `show` after the board load above — rather than reusing
-  // `target` from the refreshAllIssues at the top: the board load in between is several bd reads wide,
-  // and a teammate claiming inside that window would otherwise be invisible, so the auto-claim below
-  // would silently steal their fresh reservation without `{ steal: true }` and enqueue a run under it.
-  // Ownership must be settled from the state as it is at the moment we take it.
+  // Ownership comes off `target` — the bead the forced fresh read above already loaded — rather than
+  // a second `bd show`: the board build in between reuses that same snapshot, so nothing bd-visible
+  // happens between the two and the extra spawn would re-read identical state. A teammate claiming
+  // after this read is caught where it matters anyway: the CAS below re-reads under the claim lock
+  // and loses to them (409) instead of overwriting their reservation.
   const operator = await resolveOperator();
-  const current = await beads.show(project.repoPath, epicId);
-  if (!current) {
-    return NextResponse.json({ error: `Ticket ${epicId} not found on the board` }, { status: 404 });
-  }
-  const owner = ownerOf(current);
+  const owner = ownerOf(target);
   // Read before the approve below, which would otherwise make every request look like a re-approve.
   // See the enqueue gate at the end for what this distinguishes.
-  const wasApproved = beads.isApproved(current);
+  const wasApproved = beads.isApproved(target);
   const steal = await readSteal(request);
   // A pure take-over reassigns the reservation and nothing more (the enqueue gate at the end skips its
   // run), so it bypasses the blocker gate — but never the steal-validity checks below, which still
@@ -145,8 +143,8 @@ export async function POST(
     // exactly the takeover the runtime is mid-flight on. Only a backlog target (approved-but-unstarted,
     // or never started) is safe to take over. This mirrors the UI, which offers Take over solely on
     // backlog targets (claim-control.tsx `canTakeOver`); enforce that boundary here so a direct request
-    // can't bypass it. Derive from the fresh `current` bead read above.
-    const stage = deriveStage(current);
+    // can't bypass it. Derive from the fresh `target` read above.
+    const stage = deriveStage(target);
     if (stage !== "backlog") {
       return NextResponse.json(
         {
@@ -195,7 +193,7 @@ export async function POST(
   // the swap is owner→owner: a verified no-op that still takes the lock and still serializes the
   // label against concurrent claims.
   const swap = await withClaimLock(project.repoPath, epicId, async (cas) => {
-    // Re-derive the stage HERE, under the lock — not only from the pre-lock `current` read above.
+    // Re-derive the stage HERE, under the lock — not only from the pre-lock `target` read above.
     // On a steal (owner !== operator) the pre-lock stage gate can pass on a backlog snapshot, then
     // the original owner's runner starts in the window before this CAS: it moves the bead to
     // in_progress/stage:implementing but leaves the assignee as the old owner, so `cas(owner, …)`
@@ -204,12 +202,15 @@ export async function POST(
     // stage inside the lock makes a run that started in that window lose the swap instead. A
     // self-owned re-approve (owner === operator, e.g. Force run on an implementing epic) is
     // deliberately excluded: it's the operator asking to re-run their own target, not a takeover.
+    let locked: Bead | undefined;
     if (owner && owner !== operator) {
-      const locked = await beads.show(project.repoPath, epicId);
+      locked = await beads.show(project.repoPath, epicId);
       const lockedStage = locked ? deriveStage(locked) : undefined;
       if (lockedStage && lockedStage !== "backlog") return { moved: lockedStage } as const;
     }
-    const result = await cas(owner, operator ?? owner);
+    // Hand the stage gate's read to the CAS: it needs the assignee as of this lock, which is exactly
+    // what `locked` holds — re-reading it would be a second `bd show` of a bead nothing can move.
+    const result = await cas(owner, operator ?? owner, locked);
     if (result.ok) await beads.approve(project.repoPath, epicId);
     return result;
   });
@@ -265,38 +266,30 @@ export async function POST(
     console.error(`[approve] failed to enqueue execute-epic for ${epicId}`, err);
   }
 
-  // Read-after-write: force a fresh bead read so the response reflects the just-written approval and
-  // assignee. `getBoard` reads through the stale-tolerant snapshot, which the approve write only
-  // marked stale (retaining the pre-write beads) — so without this the 200 body could echo the old
-  // `approved`/`assignee` and ClaimControl would keep showing the previous owner until a later poll.
-  // This MUST land before the sync below: a succeeding sync invalidates the snapshot, and a sync
-  // completing mid-read would discard this fresh loader's result and serve the retained pre-write
-  // beads — the exact read-after-write ordering updateTicket enforces.
-  await refreshAllIssues(project.repoPath);
-  // Re-read so the response reflects the post-approval state. The target is an epic or a standalone
-  // chip; return whichever the board now carries. `epic` is kept for the existing epic-card client.
-  const updatedBoard = await getBoard(project);
-
   // Fire-and-forget (like the claim route's nudgeSync): the approve write already landed locally and
   // the run enqueues off that local state, so don't block the response on a `bd dolt pull/commit/push`
   // a slow/unreachable remote could stall. A failed push is recorded as "failing"/unpushed in the
   // sync-status registry inside beads.sync and retried by the E1 heartbeat backstop — this catch only
-  // keeps the rejection from floating. Fired AFTER the fresh read above so its snapshot invalidation
-  // can't discard that read.
+  // keeps the rejection from floating.
   void beads
     .sync(project.repoPath)
     .catch((err) => console.error(`[approve] beads dolt sync failed after approving ${epicId}`, err));
 
-  for (const stage of STAGES) {
-    const updatedEpic = updatedBoard.columns[stage].find((e) => e.id === epicId);
-    if (updatedEpic) {
-      return NextResponse.json({ epic: updatedEpic, item: updatedEpic, jobId });
-    }
-    const updatedItem = updatedBoard.standalone[stage].find((e) => e.id === epicId);
-    if (updatedItem) {
-      return NextResponse.json({ item: updatedItem, jobId });
-    }
+  // Read-after-write, without the read: the approval changed exactly two fields on the target — the
+  // `approved` label this route just wrote, and the assignee the CAS verified with its own post-write
+  // read — so patch those onto the board item instead of paying a forced cold `bd list` plus a second
+  // board rebuild to read back state we already hold. Answering off the stale-tolerant board alone
+  // would echo the pre-write values (ClaimControl would keep showing the previous owner), which is
+  // what the patch supplies. Everything else on the board is unchanged by an approve, and the write
+  // flagged the snapshot pendingWrite, so the client's next poll blocks on a fresh read regardless.
+  // `epic` is kept alongside `item` for the existing epic-card client.
+  const written = { approved: true, assignee: swap.bead.assignee ?? null };
+  if (epic) {
+    const updatedEpic = { ...epic, ...written };
+    return NextResponse.json({ epic: updatedEpic, item: updatedEpic, jobId });
   }
-
+  if (standalone) {
+    return NextResponse.json({ item: { ...standalone, ...written }, jobId });
+  }
   return NextResponse.json({ error: "Run target not found" }, { status: 404 });
 }
