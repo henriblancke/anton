@@ -18,6 +18,9 @@ export async function POST(request: Request) {
     const project = await addProject({
       name: typeof body.name === "string" ? body.name : undefined,
       repoPath: body.repoPath,
+      // Prefix seeds `bd init` for a repo with no board yet (anton-ivtj); blank → bd's default.
+      prefix:
+        typeof body.prefix === "string" && body.prefix.trim() ? body.prefix.trim() : undefined,
     });
     return NextResponse.json({ project }, { status: 201 });
   } catch (err) {
