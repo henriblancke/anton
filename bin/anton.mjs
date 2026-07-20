@@ -1242,6 +1242,7 @@ export {
   INSTALLED_SKILLS,
   compareVersions,
   platformLabel,
+  fetchLatestRelease,
   applyMigrations,
   ensureMigrated,
   ensureBetterSqlite3,

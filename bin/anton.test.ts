@@ -18,6 +18,7 @@ import {
   ensureBeadsGitignore,
   ensureBetterSqlite3,
   ensureMigrated,
+  fetchLatestRelease,
   nextArgs,
   parseInitArgs,
   platformLabel,
@@ -859,5 +860,102 @@ describe("configureBeadsDoltSync (bd/git stubbed — CI has no bd)", () => {
     const r = configureBeadsDoltSync({ repoDir, exec });
     expect(r).toMatchObject({ status: "error" });
     expect((r as { detail: string }).detail).toContain("dolt server unreachable");
+  });
+});
+
+describe("fetchLatestRelease", () => {
+  const TOKEN_VARS = ["ANTON_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"] as const;
+  let realFetch: typeof globalThis.fetch;
+  let savedTokens: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    realFetch = globalThis.fetch;
+    // Clear token env so header assertions aren't polluted by a token CI itself sets.
+    savedTokens = {};
+    for (const name of TOKEN_VARS) {
+      savedTokens[name] = process.env[name];
+      delete process.env[name];
+    }
+  });
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    for (const name of TOKEN_VARS) {
+      if (savedTokens[name] === undefined) delete process.env[name];
+      else process.env[name] = savedTokens[name];
+    }
+  });
+
+  /** Minimal Response-shaped stub with a case-insensitive header lookup. */
+  function fakeResponse({
+    ok,
+    status,
+    headers = {},
+    body,
+  }: {
+    ok: boolean;
+    status: number;
+    headers?: Record<string, string>;
+    body?: unknown;
+  }) {
+    const lower = new Map(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), v]));
+    // Only the fields fetchLatestRelease reads; cast past the full Response shape.
+    return {
+      ok,
+      status,
+      headers: { get: (name: string) => lower.get(name.toLowerCase()) ?? null },
+      json: async () => body,
+    } as unknown as Response;
+  }
+
+  it("returns the release on a 200", async () => {
+    const release = { tag_name: "v1.2.3", assets: [] };
+    globalThis.fetch = (async () => fakeResponse({ ok: true, status: 200, body: release })) as typeof fetch;
+    const result = await fetchLatestRelease();
+    expect(result).toEqual({ release });
+  });
+
+  it("maps 403 + x-ratelimit-remaining:0 to a rate_limit error carrying the reset time", async () => {
+    globalThis.fetch = (async () =>
+      fakeResponse({
+        ok: false,
+        status: 403,
+        headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": "1700000000" },
+      })) as typeof fetch;
+    const result = await fetchLatestRelease();
+    expect(result).toEqual({ error: { kind: "rate_limit", reset: 1700000000 } });
+  });
+
+  it("maps a timeout/AbortError to a timeout error", async () => {
+    globalThis.fetch = (async () => {
+      const err = new Error("The operation timed out.");
+      err.name = "TimeoutError";
+      throw err;
+    }) as typeof fetch;
+    const result = await fetchLatestRelease();
+    expect(result).toEqual({ error: { kind: "timeout" } });
+  });
+
+  it("maps a 404 to a not_found error", async () => {
+    globalThis.fetch = (async () => fakeResponse({ ok: false, status: 404 })) as typeof fetch;
+    const result = await fetchLatestRelease();
+    expect(result).toEqual({ error: { kind: "not_found" } });
+  });
+
+  it("sends an Authorization header when a token env var is set, and none when unset", async () => {
+    let capturedHeaders: Record<string, string> = {};
+    globalThis.fetch = (async (_url: string, init: RequestInit) => {
+      capturedHeaders = (init.headers ?? {}) as Record<string, string>;
+      return fakeResponse({ ok: true, status: 200, body: { tag_name: "v1.0.0" } });
+    }) as typeof fetch;
+
+    // No token set (cleared in beforeEach) → no Authorization header.
+    await fetchLatestRelease();
+    expect(capturedHeaders.Authorization).toBeUndefined();
+
+    // Token set → Bearer header present.
+    process.env.ANTON_GITHUB_TOKEN = "secret-token";
+    await fetchLatestRelease();
+    expect(capturedHeaders.Authorization).toBe("Bearer secret-token");
   });
 });
