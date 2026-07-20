@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   composeDescription,
+  detailsSummary,
   diffTicketPatch,
   draftFromDetail,
   hasTicketChanges,
+  resolutionOf,
   stripContractSections,
   type TicketDraft,
 } from "@/components/ticket/ticket-dialog-utils";
@@ -209,5 +211,40 @@ describe("contract editing", () => {
     expect(composeDescription({ ...original, goal: "", acceptance: "", body: "just body" })).toBe(
       "just body",
     );
+  });
+});
+
+describe("resolutionOf", () => {
+  it("reads abandoned first — it wins over deferred and stage", () => {
+    expect(resolutionOf({ abandoned: true, deferred: true, stage: "done" })).toBe("abandoned");
+    expect(resolutionOf({ abandoned: true, deferred: false, stage: "implementing" })).toBe("abandoned");
+  });
+
+  it("reads a snoozed (deferred) ticket next", () => {
+    expect(resolutionOf({ abandoned: false, deferred: true, stage: "backlog" })).toBe("snoozed");
+  });
+
+  it("treats a plain closed/done bead as shipped, not active", () => {
+    expect(resolutionOf({ abandoned: false, deferred: false, stage: "done" })).toBe("done");
+  });
+
+  it("is active for open work that is neither snoozed, abandoned, nor done", () => {
+    expect(resolutionOf({ abandoned: false, deferred: false, stage: "implementing" })).toBe("active");
+    expect(resolutionOf({ abandoned: false, deferred: false, stage: "backlog" })).toBe("active");
+  });
+});
+
+describe("detailsSummary", () => {
+  it("joins the folded label/scalar fields, omitting absent ones", () => {
+    expect(detailsSummary(base, false)).toBe("Open · P2 · nextjs · risk:low · size:M");
+  });
+
+  it("drops empty labels and undefined priority", () => {
+    const bare: TicketDraft = { ...base, priority: undefined, agent: "", risk: "", size: "" };
+    expect(detailsSummary(bare, false)).toBe("Open");
+  });
+
+  it("shows Snoozed as the status when deferred, regardless of the draft's raw status", () => {
+    expect(detailsSummary(base, true)).toBe("Snoozed · P2 · nextjs · risk:low · size:M");
   });
 });
