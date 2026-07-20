@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bead } from "./bd";
 import {
   ISSUE_SNAPSHOT_MAX_AGE_MS,
+  getBeadDescription,
   getIssueSnapshot,
   invalidateIssueSnapshot,
   issueSnapshotVersion,
@@ -25,7 +26,9 @@ describe("issue snapshots", () => {
     resolve([bead("one")]);
     await expect(first).resolves.toEqual([bead("one")]);
     await expect(concurrent).resolves.toEqual([bead("one")]);
-    await expect(getIssueSnapshot("/repo", loader, 101)).resolves.toEqual([bead("one")]);
+    await expect(getIssueSnapshot("/repo", loader, 101)).resolves.toEqual([
+      bead("one"),
+    ]);
     expect(loader).toHaveBeenCalledTimes(1);
   });
 
@@ -40,14 +43,21 @@ describe("issue snapshots", () => {
       getIssueSnapshot("/repo", loader, 100 + ISSUE_SNAPSHOT_MAX_AGE_MS),
     ).resolves.toEqual([bead("old")]);
     await vi.waitFor(() => expect(loader).toHaveBeenCalledTimes(2));
-    await expect(getIssueSnapshot("/repo", loader, 200)).resolves.toEqual([bead("new")]);
+    await expect(getIssueSnapshot("/repo", loader, 200)).resolves.toEqual([
+      bead("new"),
+    ]);
   });
 
   it("preserves the last valid data when a background refresh fails", async () => {
     await refreshIssueSnapshot("/repo", async () => [bead("safe")], 100);
-    await expect(refreshIssueSnapshot("/repo", async () => Promise.reject(new Error("boom"))))
-      .rejects.toThrow("boom");
-    await expect(getIssueSnapshot("/repo", async () => [])).resolves.toEqual([bead("safe")]);
+    await expect(
+      refreshIssueSnapshot("/repo", async () =>
+        Promise.reject(new Error("boom")),
+      ),
+    ).rejects.toThrow("boom");
+    await expect(getIssueSnapshot("/repo", async () => [])).resolves.toEqual([
+      bead("safe"),
+    ]);
   });
 
   it("isolates repositories and increments versions only for local invalidation", async () => {
@@ -72,11 +82,15 @@ describe("issue snapshots", () => {
     // A local write bumps the version but retains last-good data. A full board read must NOT hand
     // back the stale board stamped with the advanced version (a version poll would then treat it as
     // current) — it blocks on a fresh post-write load so write-then-navigate/server-render is fresh.
-    await expect(getIssueSnapshot("/repo", loader, 1)).resolves.toEqual([bead("new")]);
+    await expect(getIssueSnapshot("/repo", loader, 1)).resolves.toEqual([
+      bead("new"),
+    ]);
     expect(loader).toHaveBeenCalledTimes(2);
 
     // Once a post-write read has landed, reads serve warm again — no further load.
-    await expect(getIssueSnapshot("/repo", loader, 2)).resolves.toEqual([bead("new")]);
+    await expect(getIssueSnapshot("/repo", loader, 2)).resolves.toEqual([
+      bead("new"),
+    ]);
     expect(loader).toHaveBeenCalledTimes(2);
   });
 
@@ -85,7 +99,9 @@ describe("issue snapshots", () => {
     const loader = vi
       .fn<() => Promise<Bead[]>>()
       .mockResolvedValueOnce([bead("old")])
-      .mockImplementationOnce(() => new Promise<Bead[]>((done) => (resolvePostWrite = done)));
+      .mockImplementationOnce(
+        () => new Promise<Bead[]>((done) => (resolvePostWrite = done)),
+      );
     await getIssueSnapshot("/repo", loader, 0);
     invalidateIssueSnapshot("/repo", true);
 
@@ -111,7 +127,11 @@ describe("issue snapshots", () => {
     // A transient bd failure on the forced post-write read must serve last-good, never throw the
     // render — the same fall-back the API forced-reload path relies on.
     await expect(
-      getIssueSnapshot("/repo", async () => Promise.reject(new Error("boom")), 1),
+      getIssueSnapshot(
+        "/repo",
+        async () => Promise.reject(new Error("boom")),
+        1,
+      ),
     ).resolves.toEqual([bead("old")]);
   });
 
@@ -140,7 +160,51 @@ describe("issue snapshots", () => {
     await oldRefresh;
 
     await expect(
-      getIssueSnapshot("/repo", async () => [bead("post-write")], ISSUE_SNAPSHOT_MAX_AGE_MS),
+      getIssueSnapshot(
+        "/repo",
+        async () => [bead("post-write")],
+        ISSUE_SNAPSHOT_MAX_AGE_MS,
+      ),
     ).resolves.toEqual([bead("post-write")]);
+  });
+});
+
+describe("bead description cache", () => {
+  it("does not cache a failed description load", async () => {
+    const loader = vi
+      .fn<() => Promise<string | undefined>>()
+      .mockRejectedValueOnce(new Error("bd show failed"))
+      .mockResolvedValueOnce("retry succeeded");
+
+    await expect(getBeadDescription("/repo", "one", loader)).rejects.toThrow(
+      "bd show failed",
+    );
+    await expect(getBeadDescription("/repo", "one", loader)).resolves.toBe(
+      "retry succeeded",
+    );
+    expect(loader).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not let an in-flight pre-invalidation load repopulate stale data", async () => {
+    let resolveOld!: (value: string) => void;
+    const oldLoad = getBeadDescription(
+      "/repo",
+      "one",
+      () => new Promise<string>((resolve) => (resolveOld = resolve)),
+    );
+
+    invalidateIssueSnapshot("/repo", true);
+    await expect(
+      getBeadDescription("/repo", "one", async () => "post-write"),
+    ).resolves.toBe("post-write");
+
+    resolveOld("pre-write");
+    await expect(oldLoad).resolves.toBe("pre-write");
+
+    const loader = vi.fn(async () => "unexpected reload");
+    await expect(getBeadDescription("/repo", "one", loader)).resolves.toBe(
+      "post-write",
+    );
+    expect(loader).not.toHaveBeenCalled();
   });
 });

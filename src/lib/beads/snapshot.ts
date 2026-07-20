@@ -35,7 +35,10 @@ const SNAPSHOTS_KEY = Symbol.for("anton.beads.issueSnapshots");
 const DESCRIPTIONS_KEY = Symbol.for("anton.beads.beadDescriptions");
 
 function snapshots(): Map<string, SnapshotEntry> {
-  const global = globalThis as unknown as Record<symbol, Map<string, SnapshotEntry> | undefined>;
+  const global = globalThis as unknown as Record<
+    symbol,
+    Map<string, SnapshotEntry> | undefined
+  >;
   return (global[SNAPSHOTS_KEY] ??= new Map());
 }
 
@@ -61,13 +64,16 @@ export async function getBeadDescription(
   id: string,
   loader: () => Promise<string | undefined>,
 ): Promise<string> {
+  const generation = entryFor(cwd).generation;
   const caches = descriptionCaches();
   const cache = caches.get(cwd) ?? new Map<string, string>();
   if (!caches.has(cwd)) caches.set(cwd, cache);
   const cached = cache.get(id);
   if (cached !== undefined) return cached;
   const description = (await loader()) ?? "";
-  cache.set(id, description);
+  // A write or remote pull invalidated this load while it was in flight. Return the value to its
+  // original caller, but never let pre-invalidation data repopulate the post-invalidation cache.
+  if (entryFor(cwd).generation === generation) cache.set(id, description);
   return description;
 }
 
@@ -192,7 +198,10 @@ export async function readIssueSnapshot(
       return { beads: entry.beads ?? retained, version: entry.version };
     }
     // Serve retained now, but a pending write or a stale TTL still needs a fresh read behind it.
-    if (entry.pendingWrite || now - entry.loadedAt >= ISSUE_SNAPSHOT_MAX_AGE_MS) {
+    if (
+      entry.pendingWrite ||
+      now - entry.loadedAt >= ISSUE_SNAPSHOT_MAX_AGE_MS
+    ) {
       void refreshIssueSnapshot(cwd, loader, now).catch(() => {});
     }
     return { beads: retained, version: entry.version };
@@ -202,9 +211,15 @@ export async function readIssueSnapshot(
 }
 
 /** Start a freshness probe without making the caller wait for embedded Dolt. */
-export function probeIssueSnapshot(cwd: string, loader: () => Promise<Bead[]>): void {
+export function probeIssueSnapshot(
+  cwd: string,
+  loader: () => Promise<Bead[]>,
+): void {
   const entry = entryFor(cwd);
-  if (!entry.beads || Date.now() - entry.loadedAt >= ISSUE_SNAPSHOT_MAX_AGE_MS) {
+  if (
+    !entry.beads ||
+    Date.now() - entry.loadedAt >= ISSUE_SNAPSHOT_MAX_AGE_MS
+  ) {
     void refreshIssueSnapshot(cwd, loader).catch(() => {});
   }
 }

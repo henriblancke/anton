@@ -26,13 +26,19 @@ export async function loadAllIssues(cwd: string): Promise<Bead[]> {
   }
 }
 
-export function allIssues(cwd: string, opts?: SnapshotReadOptions): Promise<Bead[]> {
+export function allIssues(
+  cwd: string,
+  opts?: SnapshotReadOptions,
+): Promise<Bead[]> {
   return getIssueSnapshot(cwd, () => loadAllIssues(cwd), undefined, opts);
 }
 
 /** Beads plus the snapshot version they carry, read atomically — for callers that stamp a response
  * with the version (the board freshness token) and must not desync data from version. */
-export function readAllIssues(cwd: string, opts?: SnapshotReadOptions): Promise<SnapshotRead> {
+export function readAllIssues(
+  cwd: string,
+  opts?: SnapshotReadOptions,
+): Promise<SnapshotRead> {
   return readIssueSnapshot(cwd, () => loadAllIssues(cwd), undefined, opts);
 }
 
@@ -51,10 +57,15 @@ export function probeAllIssues(cwd: string): void {
  * (the one field it can drop), the description is fetched once via `bd show` and memoized (see
  * getBeadDescription), so repeat opens of the same bead stay warm.
  */
-export async function ensureDescription(cwd: string, lite: Bead): Promise<Bead> {
+export async function ensureDescription(
+  cwd: string,
+  lite: Bead,
+): Promise<Bead> {
   if (lite.description !== undefined) return lite;
   const description = await getBeadDescription(cwd, lite.id, async () => {
-    const full = await beads.show(cwd, lite.id).catch(() => undefined);
+    // Let transient bd failures reject: getBeadDescription must not turn a failed read into a
+    // successfully cached empty contract. A later detail open can then retry the read.
+    const full = await beads.show(cwd, lite.id);
     return full?.description;
   });
   return { ...lite, description };
