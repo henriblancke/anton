@@ -53,11 +53,12 @@ jobs:
     # Real bd/Dolt work shells out per issue and is slow; cap it so a hang can't run for hours.
     timeout-minutes: 45
     env:
-      # PINNED deliberately. beads' install.sh always takes the LATEST release, which made this job
-      # non-deterministic: it silently jumped to bd 1.1.0 and went red on a config-format change
-      # unrelated to any PR. CI must run the version developers run — upgrade this on purpose, not
-      # by surprise (anton-0oi). See anton-qhoz for the 1.1.0 compatibility work.
-      BD_VERSION: "1.0.4"
+      # PINNED deliberately (beads' install.sh always takes the LATEST release, which once made this
+      # job non-deterministic). Moved to 1.1.0 with anton-qhoz: bd 1.1.0 nests `export.*`/`dolt.*` in
+      # config.yaml, and configYamlHas + the bd-sync suites now parse both encodings, so pinning here
+      # keeps CI validating the newer format that motivated the fix. Upgrade on purpose, not by
+      # surprise (anton-0oi).
+      BD_VERSION: "1.1.0"
     steps:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2

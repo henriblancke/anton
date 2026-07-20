@@ -6,11 +6,11 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beads } from "./bd";
-import { configureBeadsForRepo } from "./config.mjs";
+import { configureBeadsForRepo, configYamlHas } from "./config.mjs";
 import { updateTicket } from "../ticket-detail";
 import type { Project } from "../types";
 
@@ -208,10 +208,16 @@ suite("two managed repos exchange a change over refs/dolt/data with export.auto 
   });
 
   it("both repos commit export.auto=false alongside export.git-add=false", () => {
+    // Assert semantically (via configYamlHas), not on the raw text: bd 1.1.0 writes these keys as a
+    // nested `export:` map rather than the flat `export.auto: false` line 1.0.4 emits (anton-qhoz).
     for (const repo of [repoA, repoB]) {
-      const cfg = readFileSync(join(repo, ".beads", "config.yaml"), "utf8");
-      expect(cfg, `${repo} must disable the automatic JSONL export`).toMatch(/^export\.auto:\s*false\s*$/m);
-      expect(cfg, `${repo} must still keep the export unstaged`).toMatch(/^export\.git-add:\s*false\s*$/m);
+      const beadsDir = join(repo, ".beads");
+      expect(configYamlHas(beadsDir, "export.auto", "false"), `${repo} must disable the automatic JSONL export`).toBe(
+        true,
+      );
+      expect(configYamlHas(beadsDir, "export.git-add", "false"), `${repo} must still keep the export unstaged`).toBe(
+        true,
+      );
     }
   });
 
