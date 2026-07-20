@@ -54,6 +54,25 @@ function writeBin(dir: string, name: string, body: string): string {
 }
 
 /**
+ * Wrap a fake-claude body so it reads the task prompt from stdin and the composed system prompt from
+ * the file named by `--append-system-prompt-file` — matching the driver, which keeps both off argv so
+ * no bead/contract text is visible in `ps` (anton-14tj). Inside `inner`, `fs`/`path` are required and
+ * `prompt` (stdin), `append` (system-prompt file contents), `a` (argv), and `get(flag)` are in scope.
+ */
+function fakeClaudeReadingStdin(inner: string): string {
+  return `const fs=require('fs');const path=require('path');
+const a=process.argv.slice(2);const get=f=>{const i=a.indexOf(f);return i>=0?a[i+1]:undefined;};
+const sysFile=get('--append-system-prompt-file');
+const append=sysFile?fs.readFileSync(sysFile,'utf8'):undefined;
+let prompt='';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data',c=>{prompt+=c;});
+process.stdin.on('end',()=>{
+${inner}
+});`;
+}
+
+/**
  * Advance `origin/main` ahead of the sandbox repo's LOCAL main by committing to a throwaway clone
  * of the bare remote and pushing. Leaves the sandbox repo's own main untouched (stale) so a run
  * that fetches origin/main sees a newer tip. Returns the new commit's sha.
@@ -152,21 +171,20 @@ suite("execute-epic e2e (real handler · real bd/git · fake claude/gh)", () => 
     // ticket's dispatch prompt, and only that ticket's.
     await beads.note(repo, t1, formatHumanNote(HUMAN_NOTE, "Henri Blancke", new Date(0)));
 
-    // Fake claude: make a change in the worktree, dump its -p / --append-system-prompt args (so
-    // the test can assert the composed system prompt reached it), emit valid stream-json, succeed.
+    // Fake claude: make a change in the worktree, dump its stdin prompt / append-system-prompt-file
+    // contents (so the test can assert the composed system prompt reached it AND that neither is on
+    // argv), emit valid stream-json, succeed.
     const fakeClaude = writeBin(
       binDir,
       "claude",
-      `const fs=require('fs');const path=require('path');
-fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work '+Date.now()+' '+Math.random()+'\\n');
-const a=process.argv.slice(2);const get=f=>{const i=a.indexOf(f);return i>=0?a[i+1]:undefined;};
+      fakeClaudeReadingStdin(`fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work '+Date.now()+' '+Math.random()+'\\n');
 const dump=process.env.ANTON_TEST_CLAUDE_ARGV;
-if(dump){fs.appendFileSync(dump,JSON.stringify({prompt:get('-p'),append:get('--append-system-prompt')})+'\\n');}
+if(dump){fs.appendFileSync(dump,JSON.stringify({prompt,append,argv:a})+'\\n');}
 const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
 e({type:'system',subtype:'init',session_id:'s'});
 e({type:'assistant',message:{content:[{type:'text',text:'implemented the ticket'}]}});
 e({type:'result',subtype:'success',result:'done',session_id:'s',num_turns:1,total_cost_usd:0.01,is_error:false});
-process.exit(0);`,
+process.exit(0);`),
     );
     successClaude = fakeClaude;
     // Fake gh: echo a PR url.
@@ -307,14 +325,23 @@ process.exit(0);`,
     const invocations = readFileSync(argvDump, "utf8")
       .trim()
       .split("\n")
-      .map((l) => JSON.parse(l) as { prompt?: string; append?: string });
+      .map((l) => JSON.parse(l) as { prompt?: string; append?: string; argv?: string[] });
     const forTicket = (id: string) => invocations.find((v) => v.prompt?.includes(id))!;
 
     for (const id of [t1, t2]) {
       const inv = forTicket(id);
+      // The task prompt arrived on stdin, the system prompt via --append-system-prompt-file.
       expect(inv.append).toContain("operating contract"); // locked base
       expect(inv.append).toContain("bd remember"); // learnings requirement
       expect(inv.append).toContain("SEED_MARKER_QZX"); // operator seed layered in
+      // Neither the ticket prompt nor the composed system prompt is on argv — the whole point of
+      // anton-14tj is that `ps` reveals no bead/contract text. The system prompt reaches claude by
+      // file path, not inline (`--append-system-prompt` is never used).
+      const joinedArgv = (inv.argv ?? []).join(" ");
+      expect(joinedArgv).not.toContain(id); // no ticket id / prompt body on the command line
+      expect(joinedArgv).not.toContain("operating contract"); // no system-prompt body on argv
+      expect(inv.argv ?? []).not.toContain("--append-system-prompt");
+      expect(inv.argv ?? []).toContain("--append-system-prompt-file");
     }
     // Agent layer present only where an agent:tag exists.
     expect(forTicket(t1).append).toContain("Specialist guidance (agent)");
@@ -1110,9 +1137,7 @@ process.exit(0);`,
     const countingClaude = writeBin(
       binDir,
       "claude-count",
-      `const fs=require('fs');const path=require('path');
-const a=process.argv.slice(2);const get=f=>{const i=a.indexOf(f);return i>=0?a[i+1]:undefined;};
-const prompt=get('-p')||'';const m=prompt.match(/Ticket: (\\S+)/);const ticket=m?m[1]:'unknown';
+      fakeClaudeReadingStdin(`const m=prompt.match(/Ticket: (\\S+)/);const ticket=m?m[1]:'unknown';
 const log=${JSON.stringify(invLog)};fs.appendFileSync(log,ticket+'\\n');
 const counter=path.join(process.cwd(),'.inv-count');
 let n=0;try{n=parseInt(fs.readFileSync(counter,'utf8'),10)||0;}catch(e){}
@@ -1123,7 +1148,7 @@ fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work '+ticket+' '+n+
 e({type:'system',subtype:'init',session_id:'s3'});
 e({type:'assistant',message:{content:[{type:'text',text:'done'}]}});
 e({type:'result',subtype:'success',result:'done',session_id:'s3',num_turns:1,is_error:false});
-process.exit(0);`,
+process.exit(0);`),
     );
 
     const runner = new JobRunner({
@@ -1317,14 +1342,12 @@ process.exit(0);`,
     const loggingClaude = writeBin(
       binDir,
       "claude-gate",
-      `const fs=require('fs');const path=require('path');
-const a=process.argv.slice(2);const get=f=>{const i=a.indexOf(f);return i>=0?a[i+1]:undefined;};
-const prompt=get('-p')||'';const m=prompt.match(/Ticket: (\\S+)/);
+      fakeClaudeReadingStdin(`const m=prompt.match(/Ticket: (\\S+)/);
 fs.appendFileSync(${JSON.stringify(invLog)},(m?m[1]:'unknown')+'\\n');
 fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work\\n');
 const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
 e({type:'result',subtype:'success',result:'done',session_id:'sg',num_turns:1,is_error:false});
-process.exit(0);`,
+process.exit(0);`),
     );
 
     const runner = new JobRunner({
@@ -1526,14 +1549,12 @@ process.exit(0);`,
     const loggingClaude = writeBin(
       binDir,
       "claude-allowlist",
-      `const fs=require('fs');const path=require('path');
-const a=process.argv.slice(2);const get=f=>{const i=a.indexOf(f);return i>=0?a[i+1]:undefined;};
-const prompt=get('-p')||'';const m=prompt.match(/Ticket: (\\S+)/);
+      fakeClaudeReadingStdin(`const m=prompt.match(/Ticket: (\\S+)/);
 fs.appendFileSync(${JSON.stringify(invLog)},(m?m[1]:'unknown')+'\\n');
 fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work\\n');
 const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
 e({type:'result',subtype:'success',result:'done',session_id:'sa',num_turns:1,is_error:false});
-process.exit(0);`,
+process.exit(0);`),
     );
 
     const [proj] = await tdb.db
@@ -1708,15 +1729,13 @@ process.exit(0);`,
     const noopClaude = writeBin(
       binDir,
       "claude-noop",
-      `const fs=require('fs');
-const a=process.argv.slice(2);const get=f=>{const i=a.indexOf(f);return i>=0?a[i+1]:undefined;};
-const prompt=get('-p')||'';const m=prompt.match(/Ticket: (\\S+)/);
+      fakeClaudeReadingStdin(`const m=prompt.match(/Ticket: (\\S+)/);
 fs.appendFileSync(${JSON.stringify(invLog)},(m?m[1]:'unknown')+'\\n');
 const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
 e({type:'system',subtype:'init',session_id:'snd'});
 e({type:'assistant',message:{content:[{type:'text',text:'nothing to do'}]}});
 e({type:'result',subtype:'success',result:'done',session_id:'snd',num_turns:1,is_error:false});
-process.exit(0);`,
+process.exit(0);`),
     );
 
     const runner = new JobRunner({
@@ -1806,16 +1825,14 @@ process.exit(0);`,
     const blockedClaude = writeBin(
       binDir,
       "claude-selfblocked",
-      `const fs=require('fs');const path=require('path');
-const a=process.argv.slice(2);const get=f=>{const i=a.indexOf(f);return i>=0?a[i+1]:undefined;};
-const prompt=get('-p')||'';const m=prompt.match(/Ticket: (\\S+)/);
+      fakeClaudeReadingStdin(`const m=prompt.match(/Ticket: (\\S+)/);
 fs.appendFileSync(${JSON.stringify(invLog)},(m?m[1]:'unknown')+'\\n');
 fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'partial '+Date.now()+'\\n');
 const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
 e({type:'system',subtype:'init',session_id:'ssb'});
 e({type:'assistant',message:{content:[{type:'text',text:'made partial progress'}]}});
 e({type:'result',subtype:'success',result:'Partial progress only.\\nANTON-RESULT: blocked — acceptance criteria contradict the existing API',session_id:'ssb',num_turns:1,is_error:false});
-process.exit(0);`,
+process.exit(0);`),
     );
 
     const runner = new JobRunner({

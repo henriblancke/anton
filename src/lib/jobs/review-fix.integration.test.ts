@@ -103,12 +103,18 @@ suite("review-fix e2e (real handler · real bd/git · fake claude/gh)", () => {
       `const fs=require('fs');const path=require('path');
 fs.writeFileSync(path.join(process.cwd(),'FIX.md'),'fixed '+Date.now());
 const a=process.argv.slice(2);const get=f=>{const i=a.indexOf(f);return i>=0?a[i+1]:undefined;};
-if(process.env.ANTON_TEST_CLAUDE_ARGV) fs.appendFileSync(process.env.ANTON_TEST_CLAUDE_ARGV,JSON.stringify({prompt:get('-p'),append:get('--append-system-prompt')})+'\\n');
+// Prompt arrives on stdin, system prompt via --append-system-prompt-file — never on argv (anton-14tj).
+const sysFile=get('--append-system-prompt-file');const append=sysFile?fs.readFileSync(sysFile,'utf8'):undefined;
 const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
-e({type:'system',subtype:'init',session_id:'s'});
-e({type:'assistant',message:{content:[{type:'text',text:'resolved feedback'}]}});
-e({type:'result',subtype:'success',result:'done\\n\\n\`\`\`json\\n${report}\\n\`\`\`',session_id:'s',is_error:false});
-process.exit(0);`,
+let stdin='';process.stdin.setEncoding('utf8');
+process.stdin.on('data',c=>{stdin+=c;});
+process.stdin.on('end',()=>{
+  if(process.env.ANTON_TEST_CLAUDE_ARGV) fs.appendFileSync(process.env.ANTON_TEST_CLAUDE_ARGV,JSON.stringify({prompt:stdin,append})+'\\n');
+  e({type:'system',subtype:'init',session_id:'s'});
+  e({type:'assistant',message:{content:[{type:'text',text:'resolved feedback'}]}});
+  e({type:'result',subtype:'success',result:'done\\n\\n\`\`\`json\\n${report}\\n\`\`\`',session_id:'s',is_error:false});
+  process.exit(0);
+});`,
     );
 
     // Fake gh: pr view (CHANGES_REQUESTED + failing build), repo view, graphql review threads +
