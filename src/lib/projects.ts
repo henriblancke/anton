@@ -89,6 +89,15 @@ export async function getProjectById(db: AntonDb, id: string): Promise<Project |
 export interface ProjectSettings {
   model?: string;
   testCommand?: string;
+  /**
+   * Optional operator-pinned verify gates (anton-3oh8), run in the worktree after the agent and
+   * before commit alongside `testCommand`. Each is a shell command; a non-zero exit fails the
+   * ticket exactly like the test gate. Absent → skipped (no behavior change). These are the
+   * deterministic hard backstop complementing the agent's own self-verification (sibling ticket).
+   */
+  lintCommand?: string;
+  typecheckCommand?: string;
+  buildCommand?: string;
   permissionMode?: "default" | "acceptEdits" | "bypassPermissions" | "plan";
   baseBranch?: string;
   /**
@@ -135,6 +144,35 @@ export interface ProjectSettings {
    * jobs `queued` (approval still enqueues), and turning it back on resumes them.
    */
   autonomy?: boolean;
+  /**
+   * Conventional-commit PR titles (anton-41d): when true, execute-epic prefixes the epic PR title
+   * with a deterministic `<type>(<scope>): ` derived from the target bead (bug→fix, epic/task→feat;
+   * scope = the `agent:` label when present). Absent → OFF (opt-in): the title stays the historical
+   * `<title> (<id>)`, so existing projects' PR titles are unchanged until enabled.
+   */
+  conventionalCommits?: boolean;
+}
+
+/** A resolved verify gate (anton-3oh8): a stable label (for logs/errors) + the shell command. */
+export interface VerifyGate {
+  label: string;
+  command: string;
+}
+
+/**
+ * The ordered verify gates configured for a project (anton-3oh8): tests, then lint, typecheck,
+ * build. Unset commands are skipped, so an empty result means "no gates" → unchanged behavior.
+ * Shared by execute-epic and review-fix so both enforce the same operator backstop identically.
+ */
+export function resolveVerifyGates(settings: ProjectSettings): VerifyGate[] {
+  const gates: VerifyGate[] = [];
+  if (settings.testCommand) gates.push({ label: "tests", command: settings.testCommand });
+  if (settings.lintCommand) gates.push({ label: "lint", command: settings.lintCommand });
+  if (settings.typecheckCommand) {
+    gates.push({ label: "typecheck", command: settings.typecheckCommand });
+  }
+  if (settings.buildCommand) gates.push({ label: "build", command: settings.buildCommand });
+  return gates;
 }
 
 /** Defaults for the per-project job policy when a setting is unset. */
@@ -207,7 +245,13 @@ function healBeads(repoPath: string): boolean {
       console.log(`[projects] beads configured for ${repoPath}`);
     }
     if (result.doltSync?.status === "configured") {
-      console.log(`[projects] Dolt remote wired for ${repoPath} (refs/dolt/data on origin)`);
+      // Push is non-fatal + reported (anton-8qx): the remote is wired locally even when the publish
+      // push fails (e.g. no push access yet), so only claim refs/dolt/data is on origin when it is.
+      console.log(
+        result.doltSync.pushed === false
+          ? `[projects] Dolt remote wired for ${repoPath} — bd dolt push failed; retry once auth/network is available`
+          : `[projects] Dolt remote wired for ${repoPath} (refs/dolt/data on origin)`,
+      );
     }
     if (result.hooksWarning) {
       // Hooks are optional for anton-driven repos (runner pushes Dolt explicitly); just note the

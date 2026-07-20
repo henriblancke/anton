@@ -11,7 +11,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   CLAUDE_AGENTS_DIR,
   CLAUDE_SKILLS_DIR,
-  REQUIRED_SKILLS,
+  INSTALLED_SKILLS,
 } from "./installer";
 import { type Inventory, buildInventory } from "./inventory";
 
@@ -79,8 +79,8 @@ describe("buildInventory", () => {
       expect(a.present).toEqual([]);
     }
 
-    // Required skills are all present, flagged required, and available on an empty install.
-    expect(inv.skills.map((s) => s.name).sort()).toEqual([...REQUIRED_SKILLS].sort());
+    // Installed skills are all present, flagged required, and available on an empty install.
+    expect(inv.skills.map((s) => s.name).sort()).toEqual([...INSTALLED_SKILLS].sort());
     for (const s of inv.skills) {
       expect(s.required).toBe(true);
       expect(s.classification).toBe("available");

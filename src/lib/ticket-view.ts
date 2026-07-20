@@ -121,11 +121,9 @@ export interface ToEpicOptions {
   /** Parsed "## Acceptance" text, if available. */
   acceptance?: string;
   /**
-   * Carry the epic's own agent/risk/size chips off its labels. The board card and the board's
-   * single-ticket pseudo-epic show them; the epic-detail header historically does NOT (it renders
-   * agent/risk/size per-ticket in the dependency graph instead). Defaults to true; epic-detail's
-   * full-epic path passes false to keep its rendered output byte-identical. Filed as a follow-up
-   * inconsistency in anton-sb5's notes.
+   * Carry the epic's own agent/risk/size chips off its labels. The board card, the board's
+   * single-ticket pseudo-epic, and the epic-detail header all show them. Defaults to true; kept as
+   * an opt-out for any surface that renders agent/risk/size elsewhere (e.g. per-ticket in a graph).
    */
   chips?: boolean;
   /**

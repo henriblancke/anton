@@ -37,6 +37,7 @@ import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import {
   beadsPrereqs,
+  configureBeadsDoltSync,
   configureBeadsForRepo,
   ensureBeadsGitignore,
 } from "../src/lib/beads/config.mjs";
@@ -200,10 +201,14 @@ function runLocal(bin, args, env = {}) {
 // the launcher stays pure Node and runs before any build. Install target is the user's GLOBAL
 // ~/.claude, so anton's agents/skills are discoverable from every repo `claude` runs in. No-clobber
 // is the invariant: an existing destination (a prior install OR the user's own file) is never
-// overwritten. Keep REQUIRED_SKILLS in sync with REQUIRED_SKILLS in src/lib/claude/prompt.ts.
+// overwritten. Keep these in sync with REQUIRED_SKILLS / INSTALLED_SKILLS in src/lib/claude/prompt.ts.
 const AGENTS_SRC = join(APP_ROOT, "src", "prompts", "agents");
 const SKILLS_SRC = join(APP_ROOT, "skills");
 const REQUIRED_SKILLS = ["shape", "bd", "scan-triage", "review-fix"];
+// The full set installed into a project (non-deselectable): the runtime-required skills + the
+// founder-run `setup` scaffolder. `setup` isn't runtime-loaded, but must be installed so `/setup`
+// resolves; it ships its `.product/` templates under skills/setup/templates/, copied with it.
+const INSTALLED_SKILLS = [...REQUIRED_SKILLS, "setup"];
 const CLAUDE_ROOT = join(homedir(), ".claude");
 
 /** Bundled specialist agent tags (basenames of src/prompts/agents/*.md), sorted. */
@@ -248,6 +253,28 @@ function installFile(src, dest) {
   if (existsSync(dest)) return "skipped";
   mkdirSync(dirname(dest), { recursive: true });
   copyFileSync(src, dest);
+  return "installed";
+}
+
+/** Recursively list every file under `dir` as paths relative to `dir` (files only). */
+function walkFiles(dir, base = dir) {
+  const out = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const abs = join(dir, entry.name);
+    if (entry.isDirectory()) out.push(...walkFiles(abs, base));
+    else if (entry.isFile()) out.push(abs.slice(base.length + 1));
+  }
+  return out;
+}
+
+/**
+ * Install a whole skill DIRECTORY (SKILL.md + any bundled assets, e.g. setup's templates/) no-clobber.
+ * The SKILL.md is the presence sentinel: if it already exists the skill is left untouched ("skipped");
+ * otherwise every file under the bundled skill dir is copied. Returns "installed" | "skipped".
+ */
+function installSkillDir(srcDir, destDir) {
+  if (existsSync(join(destDir, "SKILL.md"))) return "skipped";
+  for (const rel of walkFiles(srcDir)) installFile(join(srcDir, rel), join(destDir, rel));
   return "installed";
 }
 
@@ -331,12 +358,14 @@ async function provisionAgentsSkills(args, opts = {}) {
   const selected = await resolveAgentSelection(args, agentsSrc);
 
   const jobs = [
-    ...REQUIRED_SKILLS.map((name) => ({
+    ...INSTALLED_SKILLS.map((name) => ({
       kind: "skill",
       name,
       required: true,
-      src: join(skillsSrc, name, "SKILL.md"),
-      dest: join(claudeRoot, "skills", name, "SKILL.md"),
+      src: join(skillsSrc, name), // a skill is a directory (SKILL.md + any bundled assets)
+      dest: join(claudeRoot, "skills", name),
+      // The SKILL.md is the presence sentinel for both the missing-source check and no-clobber.
+      sentinel: join(skillsSrc, name, "SKILL.md"),
     })),
     ...selected.map((tag) => ({
       kind: "agent",
@@ -344,17 +373,19 @@ async function provisionAgentsSkills(args, opts = {}) {
       required: false,
       src: join(agentsSrc, `${tag}.md`),
       dest: join(claudeRoot, "agents", `${tag}.md`),
+      sentinel: join(agentsSrc, `${tag}.md`),
     })),
   ];
 
   let installed = 0;
   let skipped = 0;
   for (const job of jobs) {
-    if (!existsSync(job.src)) {
+    if (!existsSync(job.sentinel)) {
       console.log(`  ${c.yellow("!")} ${job.kind} ${c.bold(job.name)} ${c.yellow("missing from package")} ${c.dim(job.src)}`);
       continue;
     }
-    const outcome = installFile(job.src, job.dest);
+    const outcome =
+      job.kind === "skill" ? installSkillDir(job.src, job.dest) : installFile(job.src, job.dest);
     if (outcome === "installed") installed++;
     else skipped++;
     const tag = outcome === "installed" ? c.green("installed") : c.dim("already present");
@@ -367,86 +398,9 @@ async function provisionAgentsSkills(args, opts = {}) {
   return { installed, skipped, agents: selected };
 }
 
-// ── Beads Dolt sync provisioning (anton-pns) ─────────────────────────────────────────────────
-
-/**
- * Normalize a git remote URL for equality checks against what `bd dolt remote list` reports.
- * bd rewrites URLs when storing them — `git+` scheme prefix, scp form (`git@host:org/repo`)
- * becomes `git+ssh://git@host/./org/repo.git` — so a byte compare would re-add on every setup.
- */
-function normalizeGitUrl(url) {
-  let s = url.trim().replace(/^git\+/, "").replace(/^file:\/\//, "");
-  const scp = s.match(/^([^@/]+@[^:/]+):(.+)$/);
-  if (scp) s = `ssh://${scp[1]}/${scp[2]}`;
-  return s.replace(/\/\.\//g, "/").replace(/\.git$/, "").replace(/\/+$/, "");
-}
-
-/**
- * Point beads' Dolt sync at the repo's git `origin` remote (anton-pns). The Dolt-level remote
- * lives in per-machine, gitignored state (.beads/embeddeddolt), so a clone can't carry it —
- * setup must (re)apply it on every machine. Team defaults (dolt.auto-commit, export.git-add)
- * are committed in .beads/config.yaml, not set here. After configuring, pulls once — the JSONL
- * exports are gitignored (anton-hg9), so a fresh clone's board is empty until refs/dolt/data is
- * hydrated — then pushes so refs/dolt/data exists on the git remote. A pull failure is expected
- * on the very first setup (no refs/dolt/data on the remote yet) and reported, not fatal.
- * Returns a status object the caller renders:
- *   { status: "no-workspace" }                — no .beads/ at the root (installed bundle): skip
- *   { status: "no-remote" }                   — .beads/ exists but git has no origin: fail loud
- *   { status: "already", url }                — Dolt remote already matches origin: no-op
- *   { status: "configured", url, pulled, pushed, pushOutput } — remote added/re-pointed,
- *     hydration pull + push attempted
- *   { status: "error", detail }               — `bd dolt remote add` itself failed
- */
-function configureBeadsDoltSync(opts = {}) {
-  const repoDir = opts.repoDir ?? APP_ROOT;
-  const exec =
-    opts.exec ?? ((cmd, args) => spawnSync(cmd, args, { cwd: repoDir, encoding: "utf8" }));
-
-  if (!existsSync(join(repoDir, ".beads"))) return { status: "no-workspace" };
-
-  // Remote choice is dynamic per project: a `sync.remote` declared in .beads/config.yaml (e.g.
-  // an aws:// remote) wins over the git-origin fallback. NOTE `bd config get` exits 0 with
-  // "sync.remote (not set in config.yaml)" when unset — parse the text, never the exit code.
-  const cfg = exec("bd", ["config", "get", "sync.remote"]);
-  const cfgOut = ((cfg.status ?? 1) === 0 ? (cfg.stdout ?? "") : "").trim();
-  const declared = /\(not set/i.test(cfgOut)
-    ? undefined
-    : cfgOut.split(/\s+/).find((t) => /^[a-z+]+:\/\//i.test(t) || t.startsWith("git@"));
-
-  let url = declared;
-  if (!url) {
-    const origin = exec("git", ["remote", "get-url", "origin"]);
-    url = (origin.stdout ?? "").trim();
-    if ((origin.status ?? 1) !== 0 || !url) return { status: "no-remote" };
-  }
-
-  // `bd dolt remote list` prints `<name>  <url>` lines ("No remotes configured." when empty).
-  const list = exec("bd", ["dolt", "remote", "list"]);
-  const existing = ((list.stdout ?? "").match(/^origin\s+(\S+)$/m) ?? [])[1];
-  if (existing && normalizeGitUrl(existing) === normalizeGitUrl(url)) {
-    return { status: "already", url };
-  }
-
-  // Add-or-update: `bd dolt remote add` upserts, so a stale URL is simply re-pointed at origin.
-  const add = exec("bd", ["dolt", "remote", "add", "origin", url]);
-  if ((add.status ?? 1) !== 0) {
-    return { status: "error", detail: `${add.stdout ?? ""}${add.stderr ?? ""}`.trim() };
-  }
-
-  // Hydrate before publishing: with the JSONL exports untracked (anton-hg9), a fresh clone's
-  // board comes from refs/dolt/data, not from files in the clone. Fails benignly when the
-  // remote has no refs/dolt/data yet (first setup ever) — the push below then publishes it.
-  const pull = exec("bd", ["dolt", "pull"]);
-
-  const push = exec("bd", ["dolt", "push"]);
-  return {
-    status: "configured",
-    url,
-    pulled: (pull.status ?? 1) === 0,
-    pushed: (push.status ?? 1) === 0,
-    pushOutput: `${push.stdout ?? ""}${push.stderr ?? ""}`.trim(),
-  };
-}
+// The Beads Dolt sync provisioning (anton-pns) lives in ../src/lib/beads/config.mjs as the single
+// `configureBeadsDoltSync`, shared by `anton setup` (cmdSetup) and `anton init` (configureBeadsForRepo)
+// so both wire the remote identically (anton-8qx). renderDoltSyncOutcome below renders its result.
 
 // ── Bundle-mode migrations + daemon lifecycle (anton-1xp) ───────────────────────────────────
 
@@ -837,6 +791,49 @@ function cmdDoctor() {
   return ok ? 0 : 1;
 }
 
+/**
+ * Render the Dolt remote wiring outcome from the shared configureBeadsDoltSync (anton-8qx) for
+ * `anton setup`. Consumes the unified result shape `{ status, url, pulled, pushed, pushOutput }`.
+ * Returns `true` when setup may proceed, `false` when it must abort (no origin / failed remote add);
+ * a failed push is NON-fatal — reported here, not aborted (first-time setup without push access
+ * still wires the remote locally).
+ */
+function renderDoltSyncOutcome(dolt) {
+  switch (dolt.status) {
+    case "no-workspace":
+      console.log(c.dim("  no .beads workspace at the package root — skipping."));
+      return true;
+    case "no-remote":
+      console.log(c.red("  ✗ .beads exists but git has no `origin` remote — Dolt sync has nowhere to push."));
+      console.log(c.dim("    Add one (git remote add origin <url>), then re-run `anton setup`."));
+      return false;
+    case "error":
+      console.log(c.red(`  ✗ bd dolt remote add failed: ${dolt.detail}`));
+      return false;
+    case "already":
+      console.log(`  · Dolt remote ${c.bold("origin")} already → ${dolt.url} ${c.dim("(unchanged)")}`);
+      return true;
+    case "configured":
+      console.log(`  ${c.green("✓")} Dolt remote ${c.bold("origin")} → ${dolt.url}`);
+      if (dolt.pulled) {
+        console.log(`  ${c.green("✓")} bd dolt pull — board hydrated from refs/dolt/data`);
+      } else {
+        console.log(c.dim("  · bd dolt pull found nothing to hydrate (fine on a first-ever setup)"));
+      }
+      if (dolt.pushed) {
+        console.log(`  ${c.green("✓")} bd dolt push — refs/dolt/data is on origin`);
+      } else {
+        console.log(c.yellow("  ! bd dolt push failed — once auth/network is available, run:"));
+        console.log(c.dim("      bd dolt pull && bd dolt push"));
+        const lastLine = (dolt.pushOutput ?? "").split("\n").filter(Boolean).at(-1);
+        if (lastLine) console.log(c.dim(`    (${lastLine})`));
+      }
+      return true;
+    default:
+      return true;
+  }
+}
+
 async function cmdSetup(args = []) {
   console.log(c.bold("anton setup"));
   const ok = checkPrereqs();
@@ -880,38 +877,10 @@ async function cmdSetup(args = []) {
   // Beads Dolt sync (anton-pns): the Dolt remote is per-machine (gitignored) state, so every
   // machine re-applies it here; the first push publishes refs/dolt/data to the git remote.
   console.log(c.bold("\nConfiguring beads Dolt sync (git origin ↔ refs/dolt):"));
-  const dolt = configureBeadsDoltSync();
-  switch (dolt.status) {
-    case "no-workspace":
-      console.log(c.dim("  no .beads workspace at the package root — skipping."));
-      break;
-    case "no-remote":
-      console.log(c.red("  ✗ .beads exists but git has no `origin` remote — Dolt sync has nowhere to push."));
-      console.log(c.dim("    Add one (git remote add origin <url>), then re-run `anton setup`."));
-      return 1;
-    case "error":
-      console.log(c.red(`  ✗ bd dolt remote add failed: ${dolt.detail}`));
-      return 1;
-    case "already":
-      console.log(`  · Dolt remote ${c.bold("origin")} already → ${dolt.url} ${c.dim("(unchanged)")}`);
-      break;
-    case "configured":
-      console.log(`  ${c.green("✓")} Dolt remote ${c.bold("origin")} → ${dolt.url}`);
-      if (dolt.pulled) {
-        console.log(`  ${c.green("✓")} bd dolt pull — board hydrated from refs/dolt/data`);
-      } else {
-        console.log(c.dim("  · bd dolt pull found nothing to hydrate (fine on a first-ever setup)"));
-      }
-      if (dolt.pushed) {
-        console.log(`  ${c.green("✓")} bd dolt push — refs/dolt/data is on origin`);
-      } else {
-        console.log(c.yellow("  ! bd dolt push failed — once auth/network is available, run:"));
-        console.log(c.dim("      bd dolt pull && bd dolt push"));
-        const lastLine = dolt.pushOutput.split("\n").filter(Boolean).at(-1);
-        if (lastLine) console.log(c.dim(`    (${lastLine})`));
-      }
-      break;
-  }
+  const dolt = configureBeadsDoltSync({ repoDir: APP_ROOT });
+  // A push failure is non-fatal + reported (anton-8qx); only a missing origin or a failed remote
+  // add is fatal for `anton setup` (there's nothing to push to / the remote isn't wired).
+  if (!renderDoltSyncOutcome(dolt)) return 1;
 
   console.log(c.green("\n✓ Setup complete.") + " Next: " + c.bold("anton start") + c.dim(" (or `anton dev`)\n"));
   return 0;
@@ -1056,7 +1025,15 @@ function renderDoltSync(sync) {
   if (!sync) return;
   switch (sync.status) {
     case "configured":
-      console.log(c.green("✓ Dolt remote wired") + c.dim(` — refs/dolt/data published to origin (${sync.url})`));
+      if (sync.pushed === false) {
+        // Push is non-fatal + reported (anton-8qx): the remote is wired locally, just not published.
+        console.log(c.green("✓ Dolt remote wired") + c.dim(` — origin (${sync.url})`));
+        console.log(c.yellow("! bd dolt push failed — run `bd dolt pull && bd dolt push` once auth/network is available."));
+        const lastLine = (sync.pushOutput ?? "").split("\n").filter(Boolean).at(-1);
+        if (lastLine) console.log(c.dim(`  (${lastLine})`));
+      } else {
+        console.log(c.green("✓ Dolt remote wired") + c.dim(` — refs/dolt/data published to origin (${sync.url})`));
+      }
       break;
     case "already":
       console.log(c.dim("• Dolt remote already configured — nothing to do."));
@@ -1075,21 +1052,26 @@ function renderDoltSync(sync) {
 }
 
 /**
- * Warn when a git-hooks manager (husky/lefthook) or a custom core.hooksPath owns the repo's hooks:
- * bd's post-merge/post-checkout Dolt HYDRATION won't fire under it. Print manual chaining steps —
- * anton never rewrites the user's hooks. Hooks are OPTIONAL for anton-driven repos because the
- * runner pushes Dolt explicitly on every write, so this is informational, not a failure (anton-43b).
+ * Note when a git-hooks manager (husky/lefthook) or a custom core.hooksPath owns the repo's hooks:
+ * bd's post-merge/post-checkout Dolt HYDRATION won't fire under it. For an anton-driven repo that
+ * is the DESIRABLE outcome, so this is reassurance, not a warning (anton-43b, anton-vqgw).
+ *
+ * anton used to print steps for chaining `bd hooks run post-merge` back in. That advice was wrong:
+ * hydration is redundant here (the runner pushes Dolt explicitly on every write) and it is
+ * destructive — an inbound import replaces local rows from an older snapshot, so a bead closed
+ * after that snapshot silently reverts to open. Repos that followed the old advice saw closed
+ * epics flip back to open across merges. Never recommend chaining the hydration hooks.
  */
 function renderHooksWarning(warning) {
   if (!warning) return;
   console.log(
-    c.yellow(`\n! git hooks are managed by ${warning.manager}`) +
+    c.green(`\n✓ git hooks are managed by ${warning.manager}`) +
       c.dim(` (${warning.path}) — bd's hydration hooks won't run under it.`),
   );
-  console.log(c.dim("  anton won't rewrite your hooks. Hooks are OPTIONAL here — the runner pushes Dolt"));
-  console.log(c.dim("  explicitly on every write. To also keep hydration on pull/checkout, chain bd in:"));
-  console.log(c.dim(`    add to ${warning.manager === "lefthook" ? "your lefthook post-merge/post-checkout commands" : ".husky/post-merge and .husky/post-checkout"}:`));
-  console.log(c.dim('      bd hooks run post-merge "$@"      # (and post-checkout, respectively)'));
+  console.log(c.dim("  That's what you want. anton pushes Dolt explicitly on every write, so inbound"));
+  console.log(c.dim("  hydration is redundant — and it can revert beads you already closed by replaying"));
+  console.log(c.dim("  an older snapshot over them. Do NOT chain `bd hooks run post-merge/post-checkout`."));
+  console.log(c.dim("  Export/push hooks (pre-commit, pre-push) are safe to chain if you want them."));
 }
 
 async function cmdInit(args = []) {
@@ -1118,8 +1100,8 @@ async function cmdInit(args = []) {
   renderDoltSync(beads.doltSync);
 
   // Hooks are optional for anton-driven repos (runDoltSync() pushes Dolt explicitly on every write).
-  // Under a husky/lefthook hooksPath, only post-merge/post-checkout hydration is lost — warn, don't
-  // auto-rewrite the user's hooks.
+  // Under a husky/lefthook hooksPath only post-merge/post-checkout HYDRATION is lost, which is a
+  // good thing here — hydration can replay an older snapshot over beads closed since (anton-vqgw).
   renderHooksWarning(beads.hooksWarning);
 
   // Register with anton so the repo shows on the projects board — in the same command (anton-uez).
@@ -1257,11 +1239,10 @@ export {
   agentsFromArgs,
   provisionAgentsSkills,
   REQUIRED_SKILLS,
+  INSTALLED_SKILLS,
   compareVersions,
   platformLabel,
   applyMigrations,
   ensureMigrated,
   ensureBetterSqlite3,
-  configureBeadsDoltSync,
-  normalizeGitUrl,
 };

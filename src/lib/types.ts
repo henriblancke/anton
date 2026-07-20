@@ -89,11 +89,17 @@ export interface StandaloneItem {
   unread: boolean;
 }
 
-/** Per-project beads↔Dolt sync health, read from the sync-status registry (bd.ts). */
+/** Per-project beads↔Dolt sync health, read from the sync-status registry (bd.ts). Mirrors
+ * SyncStatus there — kept as a separate declaration so client components import types without the
+ * server-only bd module. */
 export interface SyncStatusView {
   state: "unknown" | "not-wired" | "syncing" | "synced" | "failing";
-  /** ms epoch of the last successful pass; null when never synced. */
+  /** ms epoch of the last successful pass (pull or push); null when never synced. */
   lastSyncedAt: number | null;
+  /** ms epoch of the last successful push; null when nothing has been pushed yet. */
+  lastPushedAt: number | null;
+  /** Local commits committed but not yet pushed to the remote; 0 when caught up. */
+  unpushedCount: number;
   lastError: string | null;
 }
 
@@ -136,6 +142,8 @@ export interface TicketDetail extends Ticket {
   description?: string; // the full bead description (markdown)
   epicId?: string; // parent epic id, if any
   epicTitle?: string;
+  epicAssignee?: string | null; // the parent epic's human-claim owner, inherited by this child
+  approved: boolean; // has the `approved` label — locks the standalone claim control (see ClaimControl)
 }
 
 // ── Board drag-and-drop ──

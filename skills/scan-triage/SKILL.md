@@ -14,9 +14,13 @@ stringer will happily emit hundreds of signals. Dumping them as raw beads floods
 the executor ships noise faster. **The board is the product** — your job is to convert signals
 into the *few* beads worth doing, shaped to the contract, and drop the rest.
 
-Read `.product/principles.md` and `.product/PRODUCT.md` first. All bead writes go through the
-**`bd` skill** (installed alongside this one) — it carries anton's label / edge / lifecycle
-conventions and the bead contract. Input: a stringer scan file (JSON) passed as the argument.
+Read `.product/principles.md` and `.product/PRODUCT.md` first. **If `.product/` is missing, STOP
+and WARN the user explicitly:** without principles and product context you'd triage signals into
+beads against a vacuum — no scope, no risk conventions, no non-goals. Direct them to run the
+bundled **`/setup`** (the `setup` skill installed alongside this one) in their repo first, then
+re-run `/scan-triage`. All bead writes go through the **`bd` skill** (installed alongside this
+one) — it carries anton's label / edge / lifecycle conventions and the bead contract. Input: a
+stringer scan file (JSON) passed as the argument.
 
 ## 1. Read signals + existing board
 

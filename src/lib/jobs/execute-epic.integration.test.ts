@@ -4,7 +4,7 @@
  * and git against a temp repo with a bare `origin`, using fake `claude` / `gh` binaries so the
  * pipeline is exercised deterministically without spending API quota. Skipped without bd + git.
  */
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { mkdirSync } from "node:fs";
@@ -16,6 +16,7 @@ import { makeTestDb, type TestDb } from "../db/testing";
 import { beads } from "../beads/bd";
 import * as schema from "../db/schema";
 import { getJob, park, resumeJob, type Clock } from "./queue";
+import { createRun } from "../runs";
 import { JobRunner } from "./runner";
 import { makeExecuteEpicHandler } from "./execute-epic";
 import { deriveStage } from "../ticket-view";
@@ -29,6 +30,9 @@ function has(cmd: string): boolean {
     return false;
   }
 }
+
+/** Fixed start-of-test wall clock. Reset before each case — see the `beforeEach` below. */
+const BASE_TIME_MS = 1_700_000_000_000;
 
 class FakeClock implements Clock {
   constructor(private t: number) {}
@@ -175,7 +179,7 @@ process.exit(0);`,
 
     // Test DB + project row.
     tdb = makeTestDb();
-    clock = new FakeClock(1_700_000_000_000);
+    clock = new FakeClock(BASE_TIME_MS);
     projectId = randomUUID();
     await tdb.db.insert(schema.projects).values({
       id: projectId,
@@ -200,6 +204,17 @@ process.exit(0);`,
     }
     resetOperatorCache();
     rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  // These cases share one DB and one clock (the sandbox + bd repo are expensive to build per test),
+  // so without a reset they leak into each other (anton-0oi). Two concrete leaks this closes:
+  // a case that jumps the clock past a usage-limit reset leaves it there, which retroactively makes
+  // every earlier retry-pending job *due*; and with `maxConcurrent: 1` the next `tickOnce()` then
+  // leases one of those leftovers instead of the job the case just enqueued, so its own job sits at
+  // `queued` and the assertions read the wrong state.
+  beforeEach(async () => {
+    clock.set(BASE_TIME_MS);
+    await tdb.db.delete(schema.jobs);
   });
 
   it("runs an approved epic autonomously → worktree → per-ticket commits → PR → in-review", async () => {
@@ -421,7 +436,10 @@ process.exit(0);`,
       // Resume with a working gh. The retry must skip the already-committed ticket (resume marker)
       // and pick up at the PR step — no second claude session, one PR opened.
       process.env.ANTON_GH_BIN = okGh;
-      await park(tdb.db, clock, jobId, "test: simulate resume");
+      // The failed attempt was requeued for retry (queued, future runAt), not left running — so this
+      // park must be asserted, not fire-and-forget. It silently no-oped before anton-0oi, which made
+      // the resumeJob below return false and wedged every later case in this file.
+      expect(await park(tdb.db, clock, jobId, "test: simulate resume")).toBe(true);
       expect(await resumeJob(tdb.db, clock, jobId)).toBe(true);
       await runner.tickOnce();
       await runner.whenIdle();
@@ -449,6 +467,368 @@ process.exit(0);`,
       process.env.ANTON_CLAUDE_BIN = successClaude;
       // Park so a later clock-advancing tick in another test can't re-dispatch this job.
       if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  }, 60_000);
+
+  it("a retry after another run already opened the PR completes idempotently — no duplicate/empty PR", async () => {
+    // anton-jz1 review: a losing machine's job parks on the winner's live run-lease (or a lost
+    // publish race) and reschedules; when the winner finishes and clears its lease, the loser
+    // retries. By then the epic is already in-review with its PR opened + external ref stamped, so
+    // re-running would re-enter the PR step and create a duplicate/empty PR (or park on a `gh "a
+    // pull request already exists"` failure). The handler must instead revalidate the target still
+    // needs execution and, seeing the external ref, finish the attempt as done without touching gh.
+    const bugId = await beads.create(repo, {
+      title: "Covered by another run",
+      type: "bug",
+      acceptance: "work file exists",
+      description: "## Goal\nProve idempotent completion.",
+    });
+    await beads.approve(repo, bugId);
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    // Attempt 1: a normal run carries the bug to in-review (PR opened, external ref stamped).
+    process.env.ANTON_CLAUDE_BIN = successClaude;
+    const job1 = await runner.enqueue({
+      type: "execute-epic",
+      projectId,
+      payload: { projectId, epicBeadId: bugId },
+    });
+    await runner.tickOnce();
+    await runner.whenIdle();
+    expect((await getJob(tdb.db, job1))?.status).toBe("done");
+    const covered = await beads.show(repo, bugId);
+    expect(covered.external_ref).toBe("gh-42");
+    const sessionsAfter1 = (await tdb.db.select().from(schema.sessions)).filter(
+      (s) => s.beadId === bugId,
+    );
+    expect(sessionsAfter1).toHaveLength(1);
+
+    // Attempt 2: a SECOND job for the same target (the losing machine's retry after the lease
+    // cleared). Point gh at a binary that reports the PR OPEN (its real state — attempt 1 opened it)
+    // so the revalidation short-circuits on a confirmed-live ref; `pr create` booms so a wrongful
+    // fall-through to the PR step would throw and fail the job instead of short-circuiting.
+    const openGh = writeBin(
+      binDir,
+      "gh-open-jz1",
+      `const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='view'){process.stdout.write(JSON.stringify({state:'OPEN',url:'https://github.com/acme/repo/pull/42',number:42})+'\\n');process.exit(0);}
+if(a[0]==='pr'&&a[1]==='create'){console.error('gh boom: must not reach PR step');process.exit(1);}
+process.exit(0);`,
+    );
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = openGh;
+    try {
+      const job2 = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: bugId },
+      });
+      await runner.tickOnce();
+      await runner.whenIdle();
+
+      // The retry completed (not failed/parked) without invoking gh: the external ref is unchanged
+      // and no second claude session ran — the covered work was not redone.
+      expect((await getJob(tdb.db, job2))?.status).toBe("done");
+      const run2 = (await tdb.db.select().from(schema.runs))
+        .filter((r) => r.epicBeadId === bugId)
+        .find((r) => r.id !== undefined && r.status === "done" && r.worktreePath === null);
+      expect(run2).toBeTruthy(); // the retry's run row settled done without ever warming a worktree
+      const after2 = await beads.show(repo, bugId);
+      expect(after2.external_ref).toBe("gh-42"); // not overwritten / re-opened
+      const sessionsAfter2 = (await tdb.db.select().from(schema.sessions)).filter(
+        (s) => s.beadId === bugId,
+      );
+      expect(sessionsAfter2).toHaveLength(1); // claude was NOT re-run
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+    }
+  }, 60_000);
+
+  it("clears its OWN leftover run-lease on the external-ref short-circuit (crash after PR, before cleanup)", async () => {
+    // anton-jz1 review (thread PRRT_kwDOTWcq8c6SAdZu): a run that crashed AFTER stamping the external
+    // ref but BEFORE its `finally` cleared the run-lease leaves an unexpired `run-lease:…:<runId>` on
+    // the board. On resume, findOpenRunForEpic returns the SAME run row (same runId), so the target
+    // still carries this run's own lease. The idempotent external-ref short-circuit returns before the
+    // general lease-adoption step, so it must sweep that own lease itself — otherwise other machines
+    // keep seeing the epic as live until the 15-minute TTL even though its PR is already open.
+    const bugId = await beads.create(repo, {
+      title: "Crashed after PR",
+      type: "bug",
+      acceptance: "work file exists",
+      description: "## Goal\nProve the own-lease sweep on the idempotent path.",
+    });
+    await beads.approve(repo, bugId);
+
+    // Simulate the crashed prior attempt: a still-"running" run row (so it resumes rather than
+    // starting fresh), the external ref already stamped, and this run's own unexpired lease still on
+    // the board — the exact "died between setExternalRef and finally" state.
+    const runId = randomUUID();
+    await createRun(tdb.db, clock, {
+      id: runId,
+      projectId,
+      epicBeadId: bugId,
+      branch: `anton/${bugId}`,
+      status: "running",
+    });
+    const leaseExp = clock.now() + 15 * 60_000;
+    await beads.publishRunLease(repo, bugId, leaseExp, [], runId);
+    await beads.setExternalRef(repo, bugId, "gh-77");
+    await beads.sync(repo); // land both on the remote so the handler's pull can't clobber them
+    expect(beads.ownRunLeaseLabels(await beads.show(repo, bugId), runId)).toHaveLength(1);
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    // gh reports the PR OPEN — the real state after a crash that stamped the ref (the PR was opened
+    // first) — so the short-circuit legitimately proves completion and finishes the attempt as done.
+    // `pr create` booms: if the handler wrongly fell through to the PR step it would throw instead.
+    const openGh = writeBin(
+      binDir,
+      "gh-open-lease",
+      `const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='view'){process.stdout.write(JSON.stringify({state:'OPEN',url:'https://github.com/acme/repo/pull/77',number:77})+'\\n');process.exit(0);}
+if(a[0]==='pr'&&a[1]==='create'){console.error('gh boom: must not reach PR step');process.exit(1);}
+process.exit(0);`,
+    );
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = openGh;
+    try {
+      const job = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: bugId },
+      });
+      await runner.tickOnce();
+      await runner.whenIdle();
+      expect((await getJob(tdb.db, job))?.status).toBe("done");
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+    }
+
+    // The resumed run's row settled done, and its own lease was swept — no lingering run-lease keeps
+    // the epic looking live to other machines. External ref untouched (not re-opened).
+    const settled = (await tdb.db.select().from(schema.runs)).find((r) => r.id === runId);
+    expect(settled?.status).toBe("done");
+    const after = await beads.show(repo, bugId);
+    expect(beads.runLeaseLabels(after)).toEqual([]);
+    expect(after.external_ref).toBe("gh-77");
+  }, 60_000);
+
+  it("retries (does not false-complete) when a target's PR ref state can't be read", async () => {
+    // anton-jz1 review (thread PRRT_kwDOTWcq8c6SBg3n): a set external_ref only proves completion when
+    // its PR is confirmed OPEN or MERGED. An UNKNOWN state (gh down / unparseable ref) is proof of
+    // nothing — treating it as done would strand a genuinely-closed epic that a retry could recover.
+    // The handler must retry on unknown rather than mark the run done, leaving the ref intact. Unlike a
+    // foreign lease (RunAlreadyLiveError, refunded forever), an unreadable ref is a COUNTING error: a
+    // transient gh outage self-heals within the retry budget, a permanent one exhausts attempts and
+    // parks for a human (PRRT_kwDOTWcq8c6SB5Ja) rather than retrying indefinitely.
+    const bugId = await beads.create(repo, {
+      title: "Unreadable PR state",
+      type: "bug",
+      acceptance: "work file exists",
+      description: "## Goal\nProve unknown PR state parks instead of false-completing.",
+    });
+    await beads.approve(repo, bugId);
+    await beads.setExternalRef(repo, bugId, "gh-88");
+    await beads.sync(repo);
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    // gh fails outright → pullRequestState reports "unknown". The run must park, not short-circuit
+    // to done; `pr create` would also boom, so a wrongful fall-through to the PR step can't pass.
+    const failingGh = writeBin(binDir, "gh-unknown-jz1", `console.error('gh boom');process.exit(1);`);
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = failingGh;
+    try {
+      const job = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: bugId },
+      });
+      await runner.tickOnce();
+      await runner.whenIdle();
+      // Counting error → the job is rescheduled for retry (attempt spent), NOT done.
+      expect((await getJob(tdb.db, job))?.status).not.toBe("done");
+      // The run row settled as failed (a counting failure, not the parked run-live-elsewhere class),
+      // and the ref is untouched. Repeated unreadable attempts exhaust the budget and park the job.
+      const runsForBug = (await tdb.db.select().from(schema.runs)).filter(
+        (r) => r.epicBeadId === bugId,
+      );
+      expect(runsForBug.some((r) => r.status === "failed")).toBe(true);
+      expect(runsForBug.some((r) => r.status === "done")).toBe(false);
+      expect((await beads.show(repo, bugId)).external_ref).toBe("gh-88");
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+    }
+  }, 60_000);
+
+  it("restores an epic's stage:in-review on the external-ref short-circuit (crash after ref, before stage update)", async () => {
+    // anton-jz1 review (thread PRRT_kwDOTWcq8c6SBg3m): an epic run that crashed AFTER setExternalRef
+    // (step 5) but BEFORE the stage updates at the tail of step 5 leaves the epic on stage:implementing
+    // with no stage:in-review. review-fix sweeps only stage:in-review targets, so a resume that
+    // short-circuits to done must re-apply in-review (and drop implementing) or the PR is silently
+    // dropped from automated review. Unlike a standalone (which gets in-review from runTicket on
+    // commit), the epic acquires it only after the ref, so this window is epic-specific.
+    const epicId = await beads.create(repo, {
+      title: "Epic crashed before in-review",
+      type: "epic",
+      description: "## Goal\nProve in-review restoration on the epic short-circuit.",
+    });
+    const childRaw = execFileSync(
+      "bd",
+      ["create", "Only child", "--type", "task", "--parent", epicId, "--acceptance", "x", "--json"],
+      { cwd: repo, encoding: "utf8" },
+    );
+    const childId = (() => {
+      const p = JSON.parse(childRaw);
+      const b = Array.isArray(p) ? p[0] : (p.issue ?? p);
+      return b.id as string;
+    })();
+    await beads.approve(repo, epicId);
+
+    // Simulate the crashed prior attempt: the child committed + closed, the PR ref stamped, and the
+    // epic still on stage:implementing (step 2's tag) with in-review NEVER applied — plus a still
+    // "running" run row so this resumes rather than starting fresh.
+    await beads.close(repo, childId);
+    await beads.tag(repo, epicId, ["stage:implementing"]);
+    await beads.setExternalRef(repo, epicId, "gh-55");
+    const runId = randomUUID();
+    await createRun(tdb.db, clock, {
+      id: runId,
+      projectId,
+      epicBeadId: epicId,
+      branch: `anton/${epicId}`,
+      status: "running",
+    });
+    await beads.sync(repo);
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    // gh reports the PR OPEN (its real state after the crash); `pr create` booms so a wrongful
+    // fall-through to the PR step would throw instead of short-circuiting.
+    const openGh = writeBin(
+      binDir,
+      "gh-open-epic-jz1",
+      `const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='view'){process.stdout.write(JSON.stringify({state:'OPEN',url:'https://github.com/acme/repo/pull/55',number:55})+'\\n');process.exit(0);}
+if(a[0]==='pr'&&a[1]==='create'){console.error('gh boom: must not reach PR step');process.exit(1);}
+process.exit(0);`,
+    );
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = openGh;
+    try {
+      const job = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: epicId },
+      });
+      await runner.tickOnce();
+      await runner.whenIdle();
+      expect((await getJob(tdb.db, job))?.status).toBe("done");
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+    }
+
+    // The short-circuit finished done AND repaired the board: the epic now carries stage:in-review,
+    // has dropped stage:implementing, and reads as in-review so review-fix's sweep will pick it up.
+    const epic = await beads.show(repo, epicId);
+    expect(epic.labels ?? []).toContain("stage:in-review");
+    expect(epic.labels ?? []).not.toContain("stage:implementing");
+    expect(deriveStage(epic)).toBe("in-review");
+    expect(epic.external_ref).toBe("gh-55");
+  }, 60_000);
+
+  it("recovers a target whose external-ref PR was CLOSED without merging — re-opens instead of a false-done short-circuit", async () => {
+    // anton-jz1 review (thread PRRT_kwDOTWcq8c6SAsC0): when a PR is closed WITHOUT merging, review-fix
+    // leaves the bead in-review with its external_ref intact so a Run/Force run can recover it. The
+    // external-ref short-circuit must NOT treat that stale ref as proof another run finished: doing so
+    // marks the new run done and returns before the PR step, stranding the bead on the dead PR. The
+    // handler must instead check the PR state and, seeing it CLOSED, fall through and re-open the PR.
+    const bugId = await beads.create(repo, {
+      title: "PR closed without merging",
+      type: "bug",
+      acceptance: "work file exists",
+      description: "## Goal\nProve stale-ref recovery.",
+    });
+    await beads.approve(repo, bugId);
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    // Attempt 1: a normal run carries the bug to in-review (PR opened at gh-42, external ref stamped).
+    process.env.ANTON_CLAUDE_BIN = successClaude;
+    const job1 = await runner.enqueue({
+      type: "execute-epic",
+      projectId,
+      payload: { projectId, epicBeadId: bugId },
+    });
+    await runner.tickOnce();
+    await runner.whenIdle();
+    expect((await getJob(tdb.db, job1))?.status).toBe("done");
+    expect((await beads.show(repo, bugId)).external_ref).toBe("gh-42");
+    const sessionsAfter1 = (await tdb.db.select().from(schema.sessions)).filter(
+      (s) => s.beadId === bugId,
+    );
+    expect(sessionsAfter1).toHaveLength(1);
+
+    // Attempt 2: the operator Force-runs the recovery after the PR was closed unmerged. Point gh at a
+    // fake that reports every PR CLOSED (so `pullRequestState` sees a stale ref and the PR-reuse check
+    // finds nothing to reuse) and opens a fresh PR at gh-99 on `pr create`.
+    const recoverGh = writeBin(
+      binDir,
+      "gh-recover-jz1",
+      `const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='view'){process.stdout.write(JSON.stringify({state:'CLOSED'})+'\\n');process.exit(0);}
+if(a[0]==='pr'&&a[1]==='create'){process.stdout.write('https://github.com/acme/repo/pull/99\\n');process.exit(0);}
+process.exit(0);`,
+    );
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = recoverGh;
+    try {
+      const job2 = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: bugId },
+      });
+      await runner.tickOnce();
+      await runner.whenIdle();
+
+      // The recovery run did NOT short-circuit: it re-opened the PR (external ref advanced to gh-99)
+      // and finished done, rather than reporting a false completion on the dead gh-42.
+      expect((await getJob(tdb.db, job2))?.status).toBe("done");
+      expect((await beads.show(repo, bugId)).external_ref).toBe("gh-99");
+      // The standalone target is stage:in-review from attempt 1, so its ticket is resume-skipped —
+      // claude is not re-run; only the (agent-free) PR step executes on recovery.
+      const sessionsAfter2 = (await tdb.db.select().from(schema.sessions)).filter(
+        (s) => s.beadId === bugId,
+      );
+      expect(sessionsAfter2).toHaveLength(1);
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
     }
   }, 60_000);
 
@@ -800,6 +1180,93 @@ process.exit(0);`,
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
     }
+  // Three full run phases (run → park → clock jump → resume → run) of real bd/git work; its
+  // honest cost is ~60-90s, above the 60s the rest of this file uses (anton-0oi).
+  }, 150_000);
+
+  it("resumes a transient mid-stream death in-session via claude --resume, completing in one tick (anton-juar)", async () => {
+    // A standalone target whose FIRST claude invocation dies mid-stream transiently (emits the
+    // system-init session id, then "Connection closed mid-response" on stderr, exit 1, NO result
+    // event, NO file change). The driver surfaces a RecoverableClaudeError carrying the init session
+    // id; runTicket resumes IN-SESSION with `claude --resume <id>` (no job reschedule), and the
+    // second invocation succeeds + commits. Proves: the same session id is resumed (argv recorded),
+    // the whole run completes in a single tick, and the session row persisted the Claude session id.
+    const target = await beads.create(repo, {
+      title: "Resilient recovery target",
+      type: "task",
+      description: "## Goal\nProve in-session resume.",
+      acceptance: "work file exists",
+    });
+    await beads.approve(repo, target);
+
+    const argvLog = join(sandbox, "resume-argv.jsonl");
+    // Counting claude: invocation 1 dies transiently (mid-stream, no result); invocation 2+ succeed.
+    // The counter lives in the worktree, shared across both invocations of the same runTicket loop.
+    const resumeClaude = writeBin(
+      binDir,
+      "claude-resume",
+      `const fs=require('fs');const path=require('path');
+const a=process.argv.slice(2);const get=f=>{const i=a.indexOf(f);return i>=0?a[i+1]:undefined;};
+fs.appendFileSync(${JSON.stringify(argvLog)},JSON.stringify({resume:get('--resume')})+'\\n');
+const counter=path.join(process.cwd(),'.resume-count');
+let n=0;try{n=parseInt(fs.readFileSync(counter,'utf8'),10)||0;}catch(e){}
+n+=1;fs.writeFileSync(counter,String(n));
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+e({type:'system',subtype:'init',session_id:'s4'});
+if(n===1){process.stderr.write('API Error: Connection closed mid-response\\n');process.exit(1);}
+fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work '+n+'\\n');
+e({type:'assistant',message:{content:[{type:'text',text:'done'}]}});
+e({type:'result',subtype:'success',result:'done',session_id:'s4',num_turns:1,is_error:false});
+process.exit(0);`,
+    );
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    process.env.ANTON_CLAUDE_BIN = resumeClaude;
+    try {
+      const jobId = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: target },
+      });
+
+      // A single tick completes: the transient death is recovered in-session, not by a job retry.
+      await runner.tickOnce();
+      await runner.whenIdle();
+
+      const job = await getJob(tdb.db, jobId);
+      expect(job?.status).toBe("done");
+      // Leased exactly once (attempts=1) and never rescheduled: the transient death was recovered
+      // in-session, so it consumed NO extra job-level retry (a fresh-restart path would have leased
+      // a second time, attempts=2).
+      expect(job?.attempts).toBe(1);
+
+      // claude was invoked twice for the one ticket: the first died, the second (a resume) succeeded.
+      const argv = readFileSync(argvLog, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+      expect(argv).toHaveLength(2);
+      expect(argv[0].resume).toBeUndefined(); // first spawn is fresh
+      expect(argv[1].resume).toBe("s4"); // retry resumes the SAME captured session id
+
+      // The Claude session id was persisted on the session row (from the init event on failure,
+      // then confirmed by the successful result).
+      const sessions = (await tdb.db.select().from(schema.sessions)).filter(
+        (s) => s.beadId === target,
+      );
+      expect(sessions).toHaveLength(1);
+      expect(sessions[0].claudeSessionId).toBe("s4");
+
+      // The run finished and reached in-review with a PR — a normal successful standalone run.
+      const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === target)!;
+      expect(run.status).toBe("done");
+      expect((await beads.show(repo, target)).labels ?? []).toContain("stage:in-review");
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+    }
   }, 60_000);
 
   it("hard-gates on a ticket claimed by another operator: aborts without stealing the claim", async () => {
@@ -879,6 +1346,142 @@ process.exit(0);`,
       // A failed run reschedules the job with backoff; park it so a later clock-advancing tick
       // can't re-dispatch this epic (the test DB is shared across the describe block).
       if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  }, 60_000);
+
+  it("parks when the epic was taken over by another operator after the run was queued", async () => {
+    // Soft-lock at the execution-claim (anton-i71 review): an approved-but-unstarted (backlog) epic
+    // can be STOLEN — reassigned to another operator via the approve route — after its execute-epic
+    // job was queued but before the runner leased it. The take-over suppresses the new owner's
+    // enqueue on the assumption the reservation just moves, but the jobs table is machine-local, so
+    // this stale job still sits on the ORIGINAL operator's instance. The runner must NOT run under
+    // the new owner's reservation; it parks (poison, recoverable) and leaves the steal intact.
+    const epic5 = await beads.create(repo, {
+      title: "Feature V",
+      type: "epic",
+      description: "## Goal\nV",
+    });
+    await beads.approve(repo, epic5);
+    const ticket5 = (() => {
+      const p = JSON.parse(
+        execFileSync(
+          "bd",
+          ["create", "V ticket", "--type", "task", "--parent", epic5, "--acceptance", "x", "--json"],
+          { cwd: repo, encoding: "utf8" },
+        ),
+      );
+      return (Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string;
+    })();
+    // Another operator takes it over between enqueue and lease: a backlog reservation sets the
+    // assignee without flipping status (bead stays open), exactly what the approve route's steal does.
+    await beads.assign(repo, epic5, "thief-operator");
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    process.env.ANTON_CLAUDE_BIN = successClaude;
+    const jobId = await runner.enqueue({
+      type: "execute-epic",
+      projectId,
+      payload: { projectId, epicBeadId: epic5 },
+    });
+    await runner.tickOnce();
+    await runner.whenIdle();
+
+    // Poison → job parked; the reason names the epic and the operator that now owns it.
+    const job = await getJob(tdb.db, jobId);
+    expect(job?.status).toBe("parked");
+    expect(job?.lastError).toContain(epic5);
+    expect(job?.lastError).toContain("thief-operator");
+
+    // The take-over is intact (not stolen back to us) and nothing ran under it: the epic never
+    // reached in-review and its ticket was never closed under someone else's reservation.
+    const epic = await beads.show(repo, epic5);
+    expect(epic.assignee).toBe("thief-operator");
+    expect(epic.labels ?? []).not.toContain("stage:in-review");
+    expect((await beads.show(repo, ticket5)).status).not.toBe("closed");
+  }, 60_000);
+
+  it("parks an owned epic when the runner has no operator identity (anton-i71 review)", async () => {
+    // Same soft-lock as the take-over above, but the runner can't resolve an operator at all
+    // (no ANTON_OPERATOR, no global git user.name) — an older queued job on an unconfigured
+    // instance. The no-operator path used to keep a best-effort `safe` claim, which swallows bd's
+    // refusal to reassign a foreign bead and would run the epic under the new owner's reservation.
+    // With no identity to assert AND an epic now owned by someone, the runner must PARK instead.
+    const epic6 = await beads.create(repo, {
+      title: "Feature W",
+      type: "epic",
+      description: "## Goal\nW",
+    });
+    await beads.approve(repo, epic6);
+    const ticket6 = (() => {
+      const p = JSON.parse(
+        execFileSync(
+          "bd",
+          ["create", "W ticket", "--type", "task", "--parent", epic6, "--acceptance", "x", "--json"],
+          { cwd: repo, encoding: "utf8" },
+        ),
+      );
+      return (Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string;
+    })();
+    // Another operator owns it before the lease, exactly as in the take-over case.
+    await beads.assign(repo, epic6, "thief-operator");
+
+    // Strip this runner of any operator identity: unset ANTON_OPERATOR, point git's global config
+    // at /dev/null so `git config --global user.name` resolves nothing, AND unset $USER/$USERNAME
+    // so resolveOperator's final osUser() rung misses too → resolveOperator() returns undefined.
+    // Restored in `finally` so later tests keep the suite's test-operator.
+    const savedOperator = process.env.ANTON_OPERATOR;
+    const savedGitGlobal = process.env.GIT_CONFIG_GLOBAL;
+    const savedUser = process.env.USER;
+    const savedUsername = process.env.USERNAME;
+    delete process.env.ANTON_OPERATOR;
+    process.env.GIT_CONFIG_GLOBAL = "/dev/null";
+    delete process.env.USER;
+    delete process.env.USERNAME;
+    resetOperatorCache();
+    try {
+      const runner = new JobRunner({
+        db: tdb.db,
+        clock,
+        config: { maxConcurrent: 1, leaseMs: 30_000 },
+      });
+      runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      const jobId = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: epic6 },
+      });
+      await runner.tickOnce();
+      await runner.whenIdle();
+
+      // Poison → job parked; the reason names the epic and the operator that now owns it.
+      const job = await getJob(tdb.db, jobId);
+      expect(job?.status).toBe("parked");
+      expect(job?.lastError).toContain(epic6);
+      expect(job?.lastError).toContain("thief-operator");
+
+      // The owner's reservation is intact and nothing ran under it.
+      const epic = await beads.show(repo, epic6);
+      expect(epic.assignee).toBe("thief-operator");
+      expect(epic.labels ?? []).not.toContain("stage:in-review");
+      expect((await beads.show(repo, ticket6)).status).not.toBe("closed");
+    } finally {
+      if (savedOperator === undefined) delete process.env.ANTON_OPERATOR;
+      else process.env.ANTON_OPERATOR = savedOperator;
+      if (savedGitGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+      else process.env.GIT_CONFIG_GLOBAL = savedGitGlobal;
+      if (savedUser === undefined) delete process.env.USER;
+      else process.env.USER = savedUser;
+      if (savedUsername === undefined) delete process.env.USERNAME;
+      else process.env.USERNAME = savedUsername;
+      resetOperatorCache();
     }
   }, 60_000);
 
@@ -1048,6 +1651,218 @@ process.exit(0);`,
     expect((await beads.show(repo, dependent)).labels ?? []).toContain("stage:in-review");
   }, 60_000);
 
+  it("blocks a zero-diff ticket, halts the epic, and never closes or dispatches downstream (issue #46 root cause #1)", async () => {
+    // A clean agent exit that leaves NO diff delivered nothing — the false-success in issue #46.
+    // The run must NOT close the ticket: it blocks it (with an operator note, not a silent re-queue
+    // to open), records the no-delivery reason, and halts the epic so downstream tickets are never
+    // dispatched. This project has no verify gates so the zero-diff commit path is what's exercised
+    // (a failing test gate is a different, already-covered failure). The "changes → committed →
+    // closed" path stays green via the suite's first test.
+    const noGateProjectId = randomUUID();
+    await tdb.db.insert(schema.projects).values({
+      id: noGateProjectId,
+      slug: "sandbox-nogate",
+      name: "sandbox-nogate",
+      repoPath: repo,
+      defaultBranch: "main",
+      settingsJson: JSON.stringify({}), // no testCommand → no verify gates
+    });
+
+    const epicNd = await beads.create(repo, {
+      title: "No-delivery epic",
+      type: "epic",
+      description: "## Goal\nND",
+    });
+    await beads.approve(repo, epicNd);
+    const mkNd = (title: string) => {
+      const p = JSON.parse(
+        execFileSync(
+          "bd",
+          ["create", title, "--type", "task", "--parent", epicNd, "--acceptance", "x", "--json"],
+          { cwd: repo, encoding: "utf8" },
+        ),
+      );
+      return (Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string;
+    };
+    const nd1 = mkNd("ND ticket one");
+    const nd2 = mkNd("ND ticket two");
+
+    // A claude that exits cleanly (is_error:false) but makes NO change → zero diff → no delivery.
+    // Logs each ticket it's invoked for so we can prove the epic halts before ticket two.
+    const invLog = join(sandbox, "nodelivery-inv.jsonl");
+    const noopClaude = writeBin(
+      binDir,
+      "claude-noop",
+      `const fs=require('fs');
+const a=process.argv.slice(2);const get=f=>{const i=a.indexOf(f);return i>=0?a[i+1]:undefined;};
+const prompt=get('-p')||'';const m=prompt.match(/Ticket: (\\S+)/);
+fs.appendFileSync(${JSON.stringify(invLog)},(m?m[1]:'unknown')+'\\n');
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+e({type:'system',subtype:'init',session_id:'snd'});
+e({type:'assistant',message:{content:[{type:'text',text:'nothing to do'}]}});
+e({type:'result',subtype:'success',result:'done',session_id:'snd',num_turns:1,is_error:false});
+process.exit(0);`,
+    );
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    process.env.ANTON_CLAUDE_BIN = noopClaude;
+    let jobId: string;
+    try {
+      jobId = await runner.enqueue({
+        type: "execute-epic",
+        projectId: noGateProjectId,
+        payload: { projectId: noGateProjectId, epicBeadId: epicNd },
+      });
+      await runner.tickOnce();
+      await runner.whenIdle();
+
+      // Poison → job parked immediately (no retry burn). The reason is recorded on the run row and
+      // on the parked job's lastError — visible in the UI/logs.
+      const job = await getJob(tdb.db, jobId);
+      expect(job?.status).toBe("parked");
+      expect(job?.lastError).toMatch(/no delivery/i);
+      const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === epicNd)!;
+      expect(run.status).toBe("failed");
+      expect(run.error).toMatch(/no delivery/i);
+
+      // Exactly one ticket was dispatched: the run halted on the no-delivery ticket rather than
+      // proceeding to the next one.
+      const invoked = readFileSync(invLog, "utf8").trim().split("\n").filter(Boolean);
+      expect(invoked).toHaveLength(1);
+      const blockedId = invoked[0];
+      const skippedId = blockedId === nd1 ? nd2 : nd1;
+
+      // The dispatched ticket is BLOCKED (not closed, not silently re-queued to open) and unclaimed.
+      const blocked = await beads.show(repo, blockedId);
+      expect(blocked.status).toBe("blocked");
+      expect(blocked.assignee ?? null).toBeNull();
+      expect(blocked.labels ?? []).not.toContain("stage:implementing");
+
+      // The downstream ticket was never dispatched — still open, never claimed or closed.
+      const skipped = await beads.show(repo, skippedId);
+      expect(skipped.status).toBe("open");
+      expect(skipped.assignee ?? null).toBeNull();
+
+      // No PR was opened and the epic never advanced to in-review — nothing landed.
+      const epic = await beads.show(repo, epicNd);
+      expect(epic.external_ref ?? null).toBeNull();
+      expect(epic.labels ?? []).not.toContain("stage:in-review");
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  }, 60_000);
+
+  it("blocks + surfaces a ticket the agent self-reported ANTON-RESULT: blocked, even with a commit (anton-j5i8)", async () => {
+    // The agent committed partial work but ended with `ANTON-RESULT: blocked — <reason>`: it is
+    // telling us the ticket is not done. The harness must honor that honest signal — block the
+    // ticket for a human (not close it on the partial change), record the parsed outcome on the
+    // session log, and halt the epic — corroborating the delivery-evidence gate rather than
+    // trusting the commit alone.
+    const epicSb = await beads.create(repo, {
+      title: "Self-blocked epic",
+      type: "epic",
+      description: "## Goal\nSB",
+    });
+    await beads.approve(repo, epicSb);
+    const mkSb = (title: string) => {
+      const p = JSON.parse(
+        execFileSync(
+          "bd",
+          ["create", title, "--type", "task", "--parent", epicSb, "--acceptance", "x", "--json"],
+          { cwd: repo, encoding: "utf8" },
+        ),
+      );
+      return (Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string;
+    };
+    const sb1 = mkSb("SB ticket one");
+    const sb2 = mkSb("SB ticket two");
+
+    // A claude that DOES change the tree (so a commit lands + the AGENT_WORK.md test gate passes)
+    // but self-reports `blocked` in its final result — the exact "committed but declared incomplete"
+    // contradiction the cross-check must surface. Logs each ticket so we can prove the epic halts.
+    const invLog = join(sandbox, "selfblocked-inv.jsonl");
+    const blockedClaude = writeBin(
+      binDir,
+      "claude-selfblocked",
+      `const fs=require('fs');const path=require('path');
+const a=process.argv.slice(2);const get=f=>{const i=a.indexOf(f);return i>=0?a[i+1]:undefined;};
+const prompt=get('-p')||'';const m=prompt.match(/Ticket: (\\S+)/);
+fs.appendFileSync(${JSON.stringify(invLog)},(m?m[1]:'unknown')+'\\n');
+fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'partial '+Date.now()+'\\n');
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+e({type:'system',subtype:'init',session_id:'ssb'});
+e({type:'assistant',message:{content:[{type:'text',text:'made partial progress'}]}});
+e({type:'result',subtype:'success',result:'Partial progress only.\\nANTON-RESULT: blocked — acceptance criteria contradict the existing API',session_id:'ssb',num_turns:1,is_error:false});
+process.exit(0);`,
+    );
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    process.env.ANTON_CLAUDE_BIN = blockedClaude;
+    let jobId: string;
+    try {
+      jobId = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: epicSb },
+      });
+      await runner.tickOnce();
+      await runner.whenIdle();
+
+      // Poison → job parked (no retry burn); the reason names the self-reported block and is
+      // recorded on the run row + the parked job's lastError.
+      const job = await getJob(tdb.db, jobId);
+      expect(job?.status).toBe("parked");
+      expect(job?.lastError).toMatch(/self-reported blocked/i);
+      const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === epicSb)!;
+      expect(run.status).toBe("failed");
+      expect(run.error).toMatch(/self-reported blocked/i);
+
+      // Exactly one ticket dispatched — the epic halted on the blocked ticket.
+      const invoked = readFileSync(invLog, "utf8").trim().split("\n").filter(Boolean);
+      expect(invoked).toHaveLength(1);
+      const blockedId = invoked[0];
+      const skippedId = blockedId === sb1 ? sb2 : sb1;
+
+      // Ticket state reflects the block: BLOCKED (not closed), unclaimed, no implementing label,
+      // with an operator note that names the agent's self-report.
+      const blocked = await beads.show(repo, blockedId);
+      expect(blocked.status).toBe("blocked");
+      expect(blocked.assignee ?? null).toBeNull();
+      expect(blocked.labels ?? []).not.toContain("stage:implementing");
+
+      // The parsed outcome was recorded on the session log (surfaced for tailing/replay).
+      const session = (await tdb.db.select().from(schema.sessions)).find(
+        (s) => s.beadId === blockedId,
+      )!;
+      const log = readFileSync(session.logPath!, "utf8");
+      expect(log).toContain("[anton-result] blocked — acceptance criteria contradict");
+      expect(log).toContain("[agent-blocked]");
+
+      // Downstream ticket never dispatched; no PR; epic never advanced to in-review.
+      const skipped = await beads.show(repo, skippedId);
+      expect(skipped.status).toBe("open");
+      const epic = await beads.show(repo, epicSb);
+      expect(epic.external_ref ?? null).toBeNull();
+      expect(epic.labels ?? []).not.toContain("stage:in-review");
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  }, 60_000);
+
   it("branches a fresh run off the newer origin/<base> tip (anton-x3o)", async () => {
     // A run whose LOCAL base is stale must start at the remote tip: resolveFreshBase fetches
     // origin/main before createWorktree, so the worktree branches off origin/main, not the local
@@ -1201,5 +2016,7 @@ process.exit(0);`,
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
     }
-  }, 60_000);
+  // Three full run phases (run → park → clock jump → resume → run) of real bd/git work; its
+  // honest cost is ~60-90s, above the 60s the rest of this file uses (anton-0oi).
+  }, 150_000);
 });

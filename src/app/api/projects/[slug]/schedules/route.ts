@@ -1,5 +1,4 @@
 import { NextResponse } from "next/server";
-import { getProjectBySlug } from "@/lib/projects";
 import { getDb } from "@/lib/db";
 import { systemClock } from "@/lib/jobs/queue";
 import {
@@ -9,16 +8,15 @@ import {
   updateSchedule,
   type ScheduledJobType,
 } from "@/lib/schedules";
+import { resolveProject } from "../resolve-project";
 
 export const dynamic = "force-dynamic";
 
 /** List a project's schedules so the settings UI shows each automation's real enabled state. */
 export async function GET(_request: Request, { params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
-  const project = await getProjectBySlug(slug);
-  if (!project) {
-    return NextResponse.json({ error: "Project not found" }, { status: 404 });
-  }
+  const { project, response } = await resolveProject(slug);
+  if (!project) return response;
   const schedules = await listSchedules(project.id);
   return NextResponse.json({ schedules });
 }
@@ -31,10 +29,8 @@ export async function GET(_request: Request, { params }: { params: Promise<{ slu
  */
 export async function PATCH(request: Request, { params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
-  const project = await getProjectBySlug(slug);
-  if (!project) {
-    return NextResponse.json({ error: "Project not found" }, { status: 404 });
-  }
+  const { project, response } = await resolveProject(slug);
+  if (!project) return response;
 
   const body = await request.json().catch(() => null);
   if (!body || typeof body !== "object") {

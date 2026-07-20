@@ -70,6 +70,23 @@ export async function endSession(
     .where(eq(schema.sessions.id, id));
 }
 
+/**
+ * Persist Claude's own session id on the session row (anton-juar). Recorded as soon as it's known —
+ * from the stream-json result on success, or from the `system` init event when a run dies mid-stream
+ * — so a transient failure can be retried with `claude --resume <id>`. Best-effort by the caller;
+ * a resume is bounded and falls back to a fresh spawn, so a missed write is never fatal.
+ */
+export async function setSessionClaudeId(
+  db: AntonDb,
+  id: string,
+  claudeSessionId: string,
+): Promise<void> {
+  await db
+    .update(schema.sessions)
+    .set({ claudeSessionId })
+    .where(eq(schema.sessions.id, id));
+}
+
 /** Append a chunk to a session log, creating the parent dir on first write. */
 export async function appendSessionLog(logPath: string, chunk: string): Promise<void> {
   await mkdir(dirname(logPath), { recursive: true });

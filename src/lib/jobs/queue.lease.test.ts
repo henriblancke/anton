@@ -7,7 +7,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
-import { leaseDue, systemClock } from "./queue";
+import { cancelJob, leaseDue, systemClock } from "./queue";
 
 let t: TestDb;
 beforeEach(() => {
@@ -32,6 +32,40 @@ function seedReclaimable(id: string) {
 }
 
 describe("leaseDue exclude", () => {
+  it("does not lease a queued row that was cancelled before the lease transition", async () => {
+    const due = new Date(systemClock.now() - 1_000);
+    t.db
+      .insert(schema.jobs)
+      .values({ id: "cancelled", type: "execute-epic", status: "queued", runAt: due })
+      .run();
+    expect(await cancelJob(t.db, systemClock, "cancelled")).toBe(true);
+
+    expect(await leaseDue(t.db, systemClock, { leaseMs: 30_000, limit: 5 })).toEqual([]);
+    expect(t.db.select().from(schema.jobs).all()[0].status).toBe("cancelled");
+  });
+
+  it("returns no job when cancellation wins after candidate selection", async () => {
+    const due = new Date(systemClock.now() - 1_000);
+    t.db
+      .insert(schema.jobs)
+      .values({ id: "raced", type: "execute-epic", status: "queued", runAt: due })
+      .run();
+    // Simulate cancellation in the exact window between leaseDue's candidate SELECT and guarded
+    // UPDATE. The trigger makes the competing transition win and skips the stale lease write.
+    t.sqlite.exec(`
+      CREATE TRIGGER cancel_before_lease
+      BEFORE UPDATE OF status ON jobs
+      WHEN OLD.id = 'raced' AND NEW.status = 'running'
+      BEGIN
+        UPDATE jobs SET status = 'cancelled' WHERE id = OLD.id;
+        SELECT RAISE(IGNORE);
+      END;
+    `);
+
+    expect(await leaseDue(t.db, systemClock, { leaseMs: 30_000, limit: 5 })).toEqual([]);
+    expect(t.db.select().from(schema.jobs).all()[0].status).toBe("cancelled");
+  });
+
   it("reclaims a lease-expired running job by default", async () => {
     seedReclaimable("j1");
     const leased = await leaseDue(t.db, systemClock, { leaseMs: 30_000, limit: 5 });

@@ -8,8 +8,8 @@
  * CLI and the TypeScript server. See DESIGN.md §3 (beads is the work source of truth).
  *
  * The correct team-config is the Dolt-first model (issues live in Dolt, synced over refs/dolt/data;
- * the JSONL is a passive export): dolt.auto-commit "on", export.git-add false, and a .gitignore that
- * keeps the derived exports + Dolt runtime state out of git.
+ * the JSONL is a passive export): dolt.auto-commit "on", export.auto false, export.git-add false, and
+ * a .gitignore that keeps the derived exports + Dolt runtime state out of git.
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -35,12 +35,6 @@ export function isGitWorkTree(dir) {
 export function hasOriginRemote(dir) {
   const r = spawnSync("git", ["-C", dir, "remote", "get-url", "origin"], { stdio: "ignore" });
   return r.status === 0;
-}
-
-/** The `origin` remote's URL, or "" when there is none. */
-export function originRemoteUrl(dir) {
-  const r = spawnSync("git", ["-C", dir, "remote", "get-url", "origin"], { encoding: "utf8" });
-  return (r.status ?? 1) === 0 ? (r.stdout || "").trim() : "";
 }
 
 /** Read a single git config value for `dir`, or "" when unset. */
@@ -118,6 +112,31 @@ export function ensureBeadsGitignore(beadsDir, entries = BEADS_GITIGNORE_ENTRIES
 }
 
 /**
+ * Untrack beads exports that are ALREADY in git (anton-vqgw). `.gitignore` only suppresses
+ * *untracked* files, so a repo that committed `issues.jsonl` before the ignore was added keeps
+ * carrying it — and then every clone/branch ships a frozen snapshot of the board that inbound
+ * tooling can replay over live state. Idempotent: a no-op when nothing is tracked.
+ *
+ * Stages the removal (`git rm --cached`) rather than committing — the caller's next commit picks it
+ * up, and anton never commits on the user's behalf. Returns { untracked: string[] }.
+ */
+export function untrackBeadsExports(dir, entries = BEADS_GITIGNORE_ENTRIES) {
+  const paths = entries.map((e) => `.beads/${e}`);
+  const ls = spawnSync("git", ["ls-files", "--", ...paths], { cwd: dir, encoding: "utf8" });
+  if ((ls.status ?? 1) !== 0) return { untracked: [] };
+  const tracked = (ls.stdout || "")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (tracked.length === 0) return { untracked: [] };
+
+  // -r so a tracked directory form (dolt/, embeddeddolt/) is removed too.
+  const rm = spawnSync("git", ["rm", "--cached", "-r", "-q", "--", ...tracked], { cwd: dir, encoding: "utf8" });
+  if ((rm.status ?? 1) !== 0) return { untracked: [], error: (rm.stderr || "").trim() };
+  return { untracked: tracked };
+}
+
+/**
  * True when `.beads/config.yaml` carries an *uncommented* `key: value` matching `want` (surrounding
  * quotes tolerated, e.g. `dolt.auto-commit: "on"`). We check the FILE — not `bd config get` — because
  * the team-config must be committed to config.yaml to travel to every clone; `bd config get` also
@@ -154,41 +173,30 @@ export function ensureBdConfig(dir, beadsDir, key, want) {
 /** The config.yaml keys anton's team-config enforces (Dolt-first model). `dolt.auto-push false`
  * because anton owns push cadence (write-nudged full passes, pull-only heartbeats): bd 1.0.2
  * auto-pushes after every write once a remote named `origin` exists, which both double-pushes
- * and re-creates the concurrent-push manifest-corruption risk (beads GH#2466) anton avoids. */
+ * and re-creates the concurrent-push manifest-corruption risk (beads GH#2466) anton avoids.
+ *
+ * `export.auto false` and `export.git-add false` are DISTINCT knobs and both are needed (anton-1th):
+ *   - export.auto governs whether bd regenerates the JSONL snapshot at all. Left at its default
+ *     (true), ordinary commands (bd ready/show) periodically rewrite issues.jsonl + export-state.json
+ *     once the export interval elapses — working-tree churn and latency for a file we only keep as a
+ *     passive recovery artifact.
+ *   - export.git-add only governs whether that regenerated snapshot is auto-STAGED. It does not stop
+ *     the regeneration, so on its own it leaves the churn/latency in place.
+ * Team sync never travels through the JSONL — it flows through Dolt over refs/dolt/data (bd dolt
+ * commit/push/pull) — so disabling the automatic export costs nothing. Manual `bd export` stays
+ * available for explicit recovery or interchange.
+ *
+ * `export.auto false` is enforced FIRST: `bd config set` writes are themselves ordinary bd commands,
+ * so a drifted earlier key (e.g. dolt.auto-commit off on an existing workspace) would, while
+ * export.auto is still at its default (true), regenerate the JSONL snapshot as a side effect of its
+ * own write. Disabling auto-export up front closes that window so the enforcement pass never emits
+ * the very churn it exists to stop. */
 const CONFIG_KEYS = [
+  ["export.auto", "false"],
   ["dolt.auto-commit", "on"],
   ["export.git-add", "false"],
   ["dolt.auto-push", "false"],
 ];
-
-/** True when a Dolt remote named `name` is already configured in `dir`'s workspace. */
-export function doltRemoteConfigured(dir, name = "origin") {
-  const r = spawnSync("bd", ["dolt", "remote", "list"], { cwd: dir, encoding: "utf8" });
-  if ((r.status ?? 1) !== 0) return false;
-  const out = r.stdout || "";
-  if (/no remotes configured/i.test(out)) return false;
-  // Lines look like: "origin               git+file:///…" — first whitespace token is the remote name.
-  return out.split("\n").some((l) => l.trim().split(/\s+/)[0] === name);
-}
-
-/**
- * The URL of the Dolt remote named `name` in `dir`'s workspace, or null when it isn't configured.
- * `bd dolt remote list` prints `<name>  <url>` lines ("No remotes configured." when empty).
- *
- * @param {string} dir
- * @param {string} [name]
- */
-export function doltRemoteUrl(dir, name = "origin") {
-  const r = spawnSync("bd", ["dolt", "remote", "list"], { cwd: dir, encoding: "utf8" });
-  if ((r.status ?? 1) !== 0) return null;
-  const out = r.stdout || "";
-  if (/no remotes configured/i.test(out)) return null;
-  for (const line of out.split("\n")) {
-    const [n, url] = line.trim().split(/\s+/);
-    if (n === name && url) return url;
-  }
-  return null;
-}
 
 /**
  * Normalize a Dolt/git remote URL for equality checks against what `bd dolt remote list` reports.
@@ -205,67 +213,65 @@ export function normalizeRemoteUrl(url) {
   return s.replace(/\/\.\//g, "/").replace(/\.git$/, "").replace(/\/+$/, "");
 }
 
-/** Best-effort `{stderr||stdout}` detail from a spawnSync result, for surfacing a failed step. */
-function stepDetail(r) {
-  return (r.stderr || r.stdout || "").trim() || `exit ${r.status ?? "?"}`;
-}
-
-/**
- * The project's declared Dolt remote from beads config (`sync.remote` in .beads/config.yaml) —
- * e.g. knowledge-layer declares an `aws://` remote there. IMPORTANT: `bd config get` exits 0
- * with "sync.remote (not set in config.yaml)" when unset (verified on bd 1.0.2), so detection
- * parses the output text, never the exit code. Returns the URL or null.
- *
- * @param {string} dir
- */
-export function configuredSyncRemote(dir) {
-  const r = spawnSync("bd", ["config", "get", "sync.remote"], { cwd: dir, encoding: "utf8" });
-  if ((r.status ?? 1) !== 0) return null;
-  const out = (r.stdout || "").trim();
-  if (!out || /\(not set/i.test(out)) return null;
-  // Output is "sync.remote = <url>" or a bare value line — take the first URL-shaped token.
-  const token = out.split(/\s+/).find((t) => /^[a-z+]+:\/\//i.test(t) || t.startsWith("git@"));
-  return token ?? null;
-}
-
 /**
  * Wire the git-backed Dolt remote for `repoDir`, reusing bd's own `dolt` subcommands — no new sync
  * code. beads stores issues in Dolt and syncs them over the git remote as `refs/dolt/data`; adding
  * the remote points `bd dolt push/pull` at the repo's `origin` URL (bd records it as `git+<url>`).
  *
+ * The single Dolt-sync path shared by `anton setup` (bin/anton.mjs) and `anton init`/`addProject`
+ * (via configureBeadsForRepo) so both wire the remote with IDENTICAL behavior + result shape
+ * (anton-8qx). All external calls go through an injectable `exec` seam so tests can stub bd/git
+ * (CI has neither); the default binds `repoDir` as cwd.
+ *
  * Steps (idempotent): remote add → hydrate pull → publish push. The pull is best-effort — a fresh
  * origin has no `refs/dolt/data` yet, so it exits non-zero ("no branches found"); that's expected on
- * the first machine, not an error. The push publishes local Dolt commits so `refs/dolt/data` exists
- * on origin for the next machine to hydrate from. Dolt remotes live in `.beads/dolt/` (gitignored),
- * so this must run once per machine — a clone doesn't inherit the remote config.
+ * the first machine, not an error. The push is likewise NON-fatal and only REPORTED: first-time
+ * setup against a remote without push access still completes the local wiring, and the failure is
+ * surfaced (fail loud in output, not by aborting) so it can be retried once auth/network is up. Dolt
+ * remotes live in `.beads/dolt/` (gitignored), so this must run once per machine — a clone doesn't
+ * inherit the remote config.
  *
- * Returns `{ status, ... }` where status is one of, matching cmdSetup's rendering:
- *   - "no-workspace" — no `.beads/` (nothing to wire)
- *   - "no-remote"    — repo has no `origin` remote
- *   - "already"      — the Dolt `origin` remote is already configured (no-op)
- *   - "configured"   — remote added + published (`{ url }`)
- *   - "error"        — a step failed (`{ detail }`)
+ * Returns `{ status, ... }`:
+ *   - { status: "no-workspace" }                                — no `.beads/` (nothing to wire)
+ *   - { status: "no-remote" }                                   — no declared/origin remote to use
+ *   - { status: "already", url }                                — Dolt `origin` already points here
+ *   - { status: "configured", url, pulled, pushed, pushOutput } — remote (re)pointed; pull + push
+ *       attempted. `pushed:false` + `pushOutput` reports a benign push failure (non-fatal).
+ *   - { status: "error", detail }                               — `bd dolt remote add` itself failed
  *
- * @param {{ repoDir: string, log?: (msg: string) => void }} opts
+ * @param {{ repoDir: string, log?: (msg: string) => void, exec?: (cmd: string, args: string[]) => { status: number|null, stdout?: string, stderr?: string } }} opts
  */
 export function configureBeadsDoltSync(opts = {}) {
   const { repoDir: dir, log } = opts;
   const emit = typeof log === "function" ? log : () => {};
+  const exec = opts.exec ?? ((cmd, args) => spawnSync(cmd, args, { cwd: dir, encoding: "utf8" }));
 
   if (!existsSync(join(dir, ".beads"))) return { status: "no-workspace" };
 
-  // Remote choice is dynamic per project: a `sync.remote` declared in .beads/config.yaml (e.g.
-  // an aws:// remote) wins over the git-origin fallback — anton drives whatever the project's
-  // beads config declares, it never forces git-origin over a declared remote.
-  const declared = configuredSyncRemote(dir);
-  const url = declared ?? originRemoteUrl(dir);
-  if (!url) return { status: "no-remote" };
+  // Remote choice is dynamic per project: a `sync.remote` declared in .beads/config.yaml (e.g. an
+  // aws:// remote) wins over the git-origin fallback — anton drives whatever the project's beads
+  // config declares, it never forces git-origin over a declared remote. NOTE `bd config get` exits 0
+  // with "sync.remote (not set in config.yaml)" when unset — parse the text, never the exit code.
+  const cfg = exec("bd", ["config", "get", "sync.remote"]);
+  const cfgOut = ((cfg.status ?? 1) === 0 ? (cfg.stdout ?? "") : "").trim();
+  const declared = /\(not set/i.test(cfgOut)
+    ? undefined
+    : cfgOut.split(/\s+/).find((t) => /^[a-z+]+:\/\//i.test(t) || t.startsWith("git@"));
+
+  let url = declared;
+  if (!url) {
+    const origin = exec("git", ["remote", "get-url", "origin"]);
+    url = (origin.stdout ?? "").trim();
+    if ((origin.status ?? 1) !== 0 || !url) return { status: "no-remote" };
+  }
 
   // Only a no-op when the existing Dolt remote already points at THIS url. A repo first wired to
   // git origin and later given a declared `sync.remote` (e.g. aws://) must be re-pointed, not left
   // pulling/pushing the stale remote — otherwise the declared shared backlog is silently ignored
-  // (anton-live-sync review). `bd dolt remote add` upserts, so the add below re-points a stale url.
-  const existing = doltRemoteUrl(dir, "origin");
+  // (anton-live-sync review). `bd dolt remote list` prints `<name>  <url>` lines; `bd dolt remote
+  // add` upserts, so the add below re-points a stale url.
+  const list = exec("bd", ["dolt", "remote", "list"]);
+  const existing = ((list.stdout ?? "").match(/^origin\s+(\S+)$/m) ?? [])[1];
   if (existing && normalizeRemoteUrl(existing) === normalizeRemoteUrl(url)) {
     emit("Dolt remote 'origin' already configured — no-op.");
     return { status: "already", url };
@@ -273,20 +279,31 @@ export function configureBeadsDoltSync(opts = {}) {
   if (existing) emit(`Dolt remote 'origin' points at ${existing} — repointing to ${url}`);
   else if (declared) emit(`sync.remote declared in beads config — wiring ${declared}`);
 
-  const add = spawnSync("bd", ["dolt", "remote", "add", "origin", url], { cwd: dir, encoding: "utf8" });
-  if ((add.status ?? 1) !== 0) return { status: "error", detail: stepDetail(add) };
+  const add = exec("bd", ["dolt", "remote", "add", "origin", url]);
+  if ((add.status ?? 1) !== 0) {
+    return { status: "error", detail: `${add.stdout ?? ""}${add.stderr ?? ""}`.trim() || `exit ${add.status ?? "?"}` };
+  }
   emit(`bd dolt remote add origin ${url}`);
 
-  // Hydrate: pull any existing refs/dolt/data (best-effort — a fresh remote has none yet).
-  const pull = spawnSync("bd", ["dolt", "pull"], { cwd: dir, encoding: "utf8" });
-  emit((pull.status ?? 1) === 0 ? "bd dolt pull — hydrated from origin" : "bd dolt pull — nothing to hydrate yet");
+  // Hydrate before publishing: with the JSONL exports untracked (anton-hg9), a fresh clone's board
+  // comes from refs/dolt/data, not from files in the clone. Fails benignly when the remote has no
+  // refs/dolt/data yet (first setup ever) — the push below then publishes it.
+  const pull = exec("bd", ["dolt", "pull"]);
+  const pulled = (pull.status ?? 1) === 0;
+  emit(pulled ? "bd dolt pull — hydrated from origin" : "bd dolt pull — nothing to hydrate yet");
 
-  // Publish: push local Dolt commits so refs/dolt/data lands on origin for the next machine.
-  const push = spawnSync("bd", ["dolt", "push"], { cwd: dir, encoding: "utf8" });
-  if ((push.status ?? 1) !== 0) return { status: "error", detail: stepDetail(push) };
-  emit("bd dolt push — published refs/dolt/data to origin");
+  // Publish: push local Dolt commits so refs/dolt/data lands on origin for the next machine. A push
+  // failure is NON-fatal (anton-8qx) — the local wiring is done; report it so it can be retried.
+  const push = exec("bd", ["dolt", "push"]);
+  const pushed = (push.status ?? 1) === 0;
+  const pushOutput = `${push.stdout ?? ""}${push.stderr ?? ""}`.trim();
+  emit(
+    pushed
+      ? "bd dolt push — published refs/dolt/data to origin"
+      : "bd dolt push — failed (non-fatal); retry with `bd dolt pull && bd dolt push`",
+  );
 
-  return { status: "configured", url };
+  return { status: "configured", url, pulled, pushed, pushOutput };
 }
 
 /** Config files that mark a third-party git-hooks manager owning core.hooksPath. */
@@ -405,6 +422,19 @@ export function configureBeadsForRepo(dir, opts = {}) {
   } else {
     emit(".beads/.gitignore already untracks exports + Dolt state");
     steps.push({ name: ".beads/.gitignore", status: "already" });
+  }
+
+  // 3b. .gitignore only suppresses UNTRACKED files — a repo that committed an export before the
+  // ignore existed keeps shipping it. Untrack them for real (anton-vqgw).
+  const ut = untrackBeadsExports(dir);
+  if (ut.error) {
+    errors.push(`could not untrack committed beads exports: ${ut.error}`);
+    steps.push({ name: "untrack exports", status: "failed", detail: ut.error });
+  } else if (ut.untracked.length) {
+    emit(`untracked (staged for removal): ${ut.untracked.join(", ")}`);
+    steps.push({ name: "untrack exports", status: "set", detail: ut.untracked.join(", ") });
+  } else {
+    steps.push({ name: "untrack exports", status: "already" });
   }
 
   // 4. Wire the git-backed Dolt remote (remote add → hydrate pull → publish push). Shared here so

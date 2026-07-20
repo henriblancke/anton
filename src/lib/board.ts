@@ -3,9 +3,9 @@
  */
 import { compareBacklogEpics } from "@/components/board/board-utils";
 import { beads, getSyncStatus, getSyncStatusToken, type Bead } from "./beads/bd";
-import { allIssues } from "./beads/issues";
+import { readAllIssues } from "./beads/issues";
 import { computeEpicGraph, epicStandaloneBlockers, standaloneBlockers } from "./epic-graph";
-import { issueSnapshotVersion } from "./beads/snapshot";
+import { issueSnapshotVersion, type SnapshotReadOptions } from "./beads/snapshot";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
 import { parseAcceptance, parseGoal, toEpic, toStandaloneItem, toTicket } from "./ticket-view";
 import {
@@ -32,13 +32,16 @@ function compareStandalone(a: StandaloneItem, b: StandaloneItem): number {
   return a.id < b.id ? -1 : 1;
 }
 
-export async function getBoard(project: Project): Promise<Board> {
+export async function getBoard(project: Project, opts?: SnapshotReadOptions): Promise<Board> {
   // The raw, unfiltered bead list. Keep it around for blocker readiness below: the standalone-blocker
   // helpers treat a blocker missing from the list as still-open (fail-safe), so readiness must be
   // derived against every bead — including intentionally-hidden types — or a `blocks` edge to an
   // already-closed `molecule` would surface as a phantom open blocker (matches the approve route,
   // which gates on the same unfiltered `--status all` read).
-  const allBeads = await allIssues(project.repoPath);
+  // Read beads and their snapshot version together: a background refresh can land mid-build, so
+  // stamping the response with a separately-read version would let it advance past the data served
+  // here — the client would then poll that version, 304, and never see this board's data refreshed.
+  const { beads: allBeads, version: snapshotVersion } = await readAllIssues(project.repoPath, opts);
 
   // Only work items land on the board. `molecule` (swarm coordination) and similar artifacts
   // are excluded; features/tasks/bugs are tickets.
@@ -138,7 +141,9 @@ export async function getBoard(project: Project): Promise<Board> {
 
   return {
     projectSlug: project.slug,
-    version: getBoardVersion(project.repoPath),
+    // Pin the freshness token to the snapshot version the served beads carry (not a re-read of the
+    // live version), so a poll on this token only 304s while this exact data is still current.
+    version: `${snapshotVersion}:${getSyncStatusToken(project.repoPath)}`,
     columns,
     standalone,
     // Read from the globalThis-anchored registry, so the API bundle sees passes run by the

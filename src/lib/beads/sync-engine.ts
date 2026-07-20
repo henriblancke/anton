@@ -1,9 +1,13 @@
 /**
  * Per-project heartbeat that keeps every managed project's local beads DB fresh against its
- * configured Dolt remote (anton-live-sync). Each beat runs a PULL-ONLY pass through the shared
- * coalescer in bd.ts — pushes belong to write-nudged passes only, so idle anton instances never
- * hammer a shared remote (see SyncMode in bd.ts). Started once at server boot alongside the job
- * runner; status lands in the globalThis sync-status registry that API routes read.
+ * configured Dolt remote (anton-live-sync). Each beat runs one BACKSTOP pass through the shared
+ * coalescer in bd.ts: always a pull, plus a push when the repo is ahead of its remote — i.e. a
+ * prior write-nudged push failed and left work committed-but-unpushed (anton-sr8f), plus one
+ * reconciling full pass on the first beat after a (re)start so commits stranded by a crash still
+ * ship (the in-memory backlog count can't survive a restart). A caught-up, reconciled repo pulls
+ * only, so idle anton instances never hammer a shared remote (see SyncRequest in bd.ts). Started
+ * once at server boot alongside the job runner; status lands in the globalThis
+ * sync-status registry that API routes read.
  */
 import { beads, getSyncStatus } from "./bd";
 import { listProjects } from "../projects";
@@ -11,8 +15,9 @@ import { listProjects } from "../projects";
 export interface SyncEngineDeps {
   /** Projects to heartbeat; only those with a .beads workspace are synced. */
   listProjects: () => Promise<Array<{ repoPath: string; hasBeads: boolean }>>;
-  /** Pull-only sync for one project (defaults to beads.pull through the shared coalescer). */
-  pull: (cwd: string) => Promise<void>;
+  /** One heartbeat pass for a project: pull + backstop push if it's ahead of its remote (defaults
+   * to beads.backstop through the shared coalescer). */
+  sync: (cwd: string) => Promise<void>;
   heartbeatMs: number;
   /** Recheck cadence for not-wired projects — no full-rate churn against nothing. */
   notWiredRecheckMs: number;
@@ -24,7 +29,7 @@ export interface SyncEngineDeps {
 
 const defaultDeps = (): SyncEngineDeps => ({
   listProjects,
-  pull: (cwd) => beads.pull(cwd),
+  sync: (cwd) => beads.backstop(cwd),
   heartbeatMs: Number(process.env.ANTON_SYNC_HEARTBEAT_MS) || 30_000,
   notWiredRecheckMs: Number(process.env.ANTON_SYNC_NOT_WIRED_RECHECK_MS) || 60_000,
   maxBackoffMs: 60_000,
@@ -44,7 +49,7 @@ interface ProjectBeat {
 export interface SyncEngine {
   start(): void;
   stop(): void;
-  /** One scheduler pass: pulls every due project. Exposed for tests; start() loops it. */
+  /** One scheduler pass: syncs every due project. Exposed for tests; start() loops it. */
   tick(): Promise<void>;
 }
 
@@ -61,7 +66,7 @@ export function createSyncEngine(overrides: Partial<SyncEngineDeps> = {}): SyncE
       lastLoggedError: null,
     };
     try {
-      await deps.pull(repoPath);
+      await deps.sync(repoPath);
       const state = getSyncStatus(repoPath).state;
       beat.backoffMs = deps.heartbeatMs;
       beat.lastLoggedError = null;
@@ -72,7 +77,7 @@ export function createSyncEngine(overrides: Partial<SyncEngineDeps> = {}): SyncE
       // retries (doubling backoff, capped) and keep the log to one line per distinct error.
       const msg = e instanceof Error ? e.message : String(e);
       if (msg !== beat.lastLoggedError) {
-        deps.log.error(`pull failed for ${repoPath}: ${msg}`);
+        deps.log.error(`sync failed for ${repoPath}: ${msg}`);
         beat.lastLoggedError = msg;
       }
       beat.backoffMs = Math.min(beat.backoffMs * 2, deps.maxBackoffMs);

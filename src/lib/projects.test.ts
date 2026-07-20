@@ -9,6 +9,7 @@ let dbFile: string;
 let addProject: typeof import("./projects").addProject;
 let listProjects: typeof import("./projects").listProjects;
 let getProjectBySlug: typeof import("./projects").getProjectBySlug;
+let resolveVerifyGates: typeof import("./projects").resolveVerifyGates;
 
 beforeAll(async () => {
   workDir = mkdtempSync(join(tmpdir(), "anton-projects-test-"));
@@ -27,6 +28,7 @@ beforeAll(async () => {
   addProject = mod.addProject;
   listProjects = mod.listProjects;
   getProjectBySlug = mod.getProjectBySlug;
+  resolveVerifyGates = mod.resolveVerifyGates;
 });
 
 afterAll(() => {
@@ -113,5 +115,33 @@ describe("addProject", () => {
 
     const matches = (await listProjects()).filter((p) => p.repoPath === repoPath);
     expect(matches).toHaveLength(1);
+  });
+});
+
+describe("resolveVerifyGates (anton-3oh8)", () => {
+  it("returns no gates when nothing is configured (unchanged behavior)", () => {
+    expect(resolveVerifyGates({})).toEqual([]);
+  });
+
+  it("maps each configured command to a labeled gate, in test→lint→typecheck→build order", () => {
+    const gates = resolveVerifyGates({
+      buildCommand: "b",
+      testCommand: "t",
+      typecheckCommand: "tc",
+      lintCommand: "l",
+    });
+    expect(gates).toEqual([
+      { label: "tests", command: "t" },
+      { label: "lint", command: "l" },
+      { label: "typecheck", command: "tc" },
+      { label: "build", command: "b" },
+    ]);
+  });
+
+  it("skips unset commands so partial config only runs what's pinned", () => {
+    expect(resolveVerifyGates({ testCommand: "t", buildCommand: "b" })).toEqual([
+      { label: "tests", command: "t" },
+      { label: "build", command: "b" },
+    ]);
   });
 });

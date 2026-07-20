@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
-import { CheckIcon, GitPullRequestIcon, TriangleAlertIcon } from "lucide-react";
+import { CheckIcon, TriangleAlertIcon } from "lucide-react";
 
 import type { EpicDetail, Ticket } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -12,7 +12,9 @@ import { Button, buttonVariants } from "@/components/ui/button";
 import { ConfirmDeleteButton } from "@/components/ui/confirm-delete-button";
 import { CopyButton } from "@/components/ui/copy-button";
 import { agentDotClass, ticketProgress } from "@/components/board/board-utils";
-import { MetaChip, PrLink, RelativeTime, RiskChip, StagePill } from "@/components/atoms";
+import { MetaChip, RelativeTime, RiskChip, StagePill } from "@/components/atoms";
+import { ClaimControl } from "@/components/board/claim-control";
+import { PrLinkControl } from "@/components/board/pr-link-control";
 import { DependencyGraph } from "@/components/epic/dependency-graph";
 import { TicketDialog } from "@/components/ticket/ticket-dialog";
 
@@ -230,21 +232,20 @@ export function EpicDetailView({ slug, epicId }: { slug: string; epicId: string 
             <h1 className="font-display text-[22px] leading-tight font-bold tracking-[-0.01em]" title={epic.title}>
               {epic.title}
             </h1>
-            {(epic.agent || epic.risk || epic.size || epic.prRef) && (
+            {(epic.agent || epic.risk || epic.size) && (
               <div className="flex flex-wrap gap-1.5">
                 {epic.agent && <MetaChip dotClass={agentDotClass(epic.agent)}>{epic.agent}</MetaChip>}
                 {epic.risk && <RiskChip risk={epic.risk} />}
                 {epic.size && <MetaChip>size:{epic.size}</MetaChip>}
-                {epic.prRef && (
-                  <PrLink href={epic.prUrl}>
-                    <MetaChip tone="pr">
-                      <GitPullRequestIcon className="size-2.5" aria-hidden="true" />
-                      {epic.prUrl ? "PR" : epic.prRef}
-                    </MetaChip>
-                  </PrLink>
-                )}
               </div>
             )}
+            <PrLinkControl
+              slug={slug}
+              itemId={epic.id}
+              prRef={epic.prRef}
+              prUrl={epic.prUrl}
+              onLinked={() => setAttempt((n) => n + 1)}
+            />
           </div>
 
           {/* completion module */}
@@ -270,12 +271,20 @@ export function EpicDetailView({ slug, epicId }: { slug: string; epicId: string 
 
           {/* claimed-by + created — mirrors the ticket surfaces */}
           <dl className="flex flex-col gap-2">
-            <div className="flex items-baseline gap-2 text-[12.5px]">
+            <div className="flex items-center gap-2 text-[12.5px]">
               <dt className="w-20 shrink-0">
                 <SectionLabel>Claimed by</SectionLabel>
               </dt>
-              <dd className={cn(epic.assignee ? "text-foreground/85" : "text-subtle")}>
-                {epic.assignee ?? "Unclaimed"}
+              <dd>
+                <ClaimControl
+                  slug={slug}
+                  itemId={epic.id}
+                  owner={epic.assignee}
+                  variant="row"
+                  readOnly={epic.approved}
+                  canTakeOver={epic.stage === "backlog"}
+                  onChanged={() => setAttempt((n) => n + 1)}
+                />
               </dd>
             </div>
             <div className="flex items-baseline gap-2 text-[12.5px]">

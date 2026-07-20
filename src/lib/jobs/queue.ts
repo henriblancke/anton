@@ -28,16 +28,28 @@ export type JobType =
  *             transient failure that ran out of retries is recoverable, not a dead end (anton-ner.2).
  * `done`    — completed successfully.
  * `failed`  — terminal, non-retryable (reserved).
+ * `cancelled` — terminally killed by an operator (anton-a4jj). Unlike `parked`, no durability path
+ *             revives it: never re-leased, never reclaimed, and `resumeJob` refuses it.
  */
-export type JobStatus = "queued" | "running" | "parked" | "done" | "failed";
+export type JobStatus = "queued" | "running" | "parked" | "done" | "failed" | "cancelled";
 
 export type JobRow = typeof schema.jobs.$inferSelect;
 
 export interface Clock {
   /** Milliseconds since epoch. */
   now(): number;
+  /**
+   * Wait `ms` before resolving. Optional so the many ad-hoc test clocks (which only need `now`)
+   * stay valid; where absent, a caller's `await clock.sleep?.(ms)` no-ops (resolves immediately),
+   * which is exactly what deterministic tests want. The real `systemClock` provides the wall-clock
+   * delay used by the run-lease settle (execute-epic step 1b).
+   */
+  sleep?(ms: number): Promise<void>;
 }
-export const systemClock: Clock = { now: () => Date.now() };
+export const systemClock: Clock = {
+  now: () => Date.now(),
+  sleep: (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+};
 
 /** timestamp mode stores seconds as a Date; normalize either to ms. */
 export function toMs(value: unknown): number | undefined {
@@ -80,6 +92,21 @@ export async function enqueue(
 /** The active statuses that must hold at most one execute-epic job per (project, epic). */
 const ACTIVE_STATUSES = ["queued", "running"] as const;
 
+/**
+ * Statuses a job can be cancelled from (anton-a4jj): anything still live — runnable (`queued`),
+ * in flight (`running`), or paused-but-recoverable (`parked`). The terminal statuses (`done`,
+ * `failed`, `cancelled`) are excluded, so a cancel of an already-terminal job is a no-op.
+ */
+const CANCELLABLE_STATUSES = ["queued", "running", "parked"] as const;
+
+/**
+ * Statuses under which a local execute-epic job "covers" an epic for the take-over path: either
+ * runnable (`queued`/`running`) or settled-but-recoverable (`parked`/`failed`, both un-parkable via
+ * `resumeJob`). `done` is deliberately excluded — a completed run is NOT resumable, so a re-approved
+ * / stolen epic on a machine that previously finished it must still enqueue a fresh job.
+ */
+const COVERING_STATUSES = ["queued", "running", "parked", "failed"] as const;
+
 /** Is `e` a SQLite UNIQUE-constraint violation (the partial-index backstop firing)? */
 function isUniqueViolation(e: unknown): boolean {
   const code = (e as { code?: string })?.code;
@@ -97,7 +124,7 @@ function epicBeadIdOf(payloadJson: string | null): string | undefined {
 }
 
 /** Id of the currently-active execute-epic job for this project + epic, if any. */
-function activeExecuteEpicId(
+export function activeExecuteEpicId(
   tx: Pick<AntonDb, "select">,
   projectId: string,
   epicBeadId: string,
@@ -116,6 +143,89 @@ function activeExecuteEpicId(
     .limit(1)
     .all();
   return rows[0]?.id;
+}
+
+/**
+ * Id of a local execute-epic job for this project + epic that still COVERS the epic — i.e. is
+ * runnable (queued/running) or resumable (parked/failed). Unlike `activeExecuteEpicId`, this
+ * includes parked/failed rows, since a cross-instance take-over can resume those. It deliberately
+ * excludes `done`: a completed prior run is terminal and not resumable, so it must NOT be treated
+ * as covering the epic — otherwise a machine that previously finished this epic would never enqueue
+ * a fresh job when it later steals an approved backlog target (anton-i71 review, PR #39).
+ */
+function coveringExecuteEpicId(
+  tx: Pick<AntonDb, "select">,
+  projectId: string,
+  epicBeadId: string,
+): string | undefined {
+  const rows = tx
+    .select({ id: schema.jobs.id })
+    .from(schema.jobs)
+    .where(
+      and(
+        eq(schema.jobs.type, "execute-epic"),
+        eq(schema.jobs.projectId, projectId),
+        inArray(schema.jobs.status, [...COVERING_STATUSES]),
+        eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
+      ),
+    )
+    .limit(1)
+    .all();
+  return rows[0]?.id;
+}
+
+/**
+ * Enqueue an execute-epic run ONLY when the local instance has no COVERING job for this epic — i.e.
+ * none that is runnable (queued/running) or resumable (parked/failed); a terminal `done` row does
+ * not count. The take-over path (approve/route.ts): stealing an already-approved target from another
+ * operator reassigns the reservation, but jobs are machine-local — the original owner's job lives on
+ * THEIR instance and will poison itself once it sees the epic was reassigned (execute-epic's
+ * ownership gate). So the new owner's instance must hold its own runnable job, or the approved work
+ * strands with nothing to run (anton-i71 review, PR #39).
+ *
+ * Returns the new job's id, or `undefined` when a covering job already exists locally — the
+ * same-instance take-over case, where the existing (queued/running/parked/failed) job is reusable
+ * by the new owner (operator identity is machine-scoped) and a duplicate must not be spawned. Uses
+ * `coveringExecuteEpicId` (active + resumable statuses), not the active-only dedupe, precisely so a
+ * same-instance PARKED prior run is recognized and left for `resume` rather than shadowed by a
+ * second job. A terminal `done` row does NOT cover the epic, so a fresh take-over still enqueues.
+ *
+ * Same transactional guard + partial-unique backstop as `enqueueExecuteEpicDeduped`: a concurrent
+ * insert that wins the race raises UNIQUE, which we absorb by returning `undefined` (the other job
+ * now satisfies the local instance).
+ */
+export function enqueueExecuteEpicIfAbsent(
+  db: AntonDb,
+  clock: Clock,
+  projectId: string,
+  epicBeadId: string,
+): string | undefined {
+  const nowMs = clock.now();
+  try {
+    return db.transaction((tx) => {
+      if (coveringExecuteEpicId(tx, projectId, epicBeadId)) return undefined;
+
+      const id = randomUUID();
+      tx.insert(schema.jobs)
+        .values({
+          id,
+          type: "execute-epic",
+          projectId,
+          payloadJson: JSON.stringify({ projectId, epicBeadId }),
+          status: "queued",
+          runAt: secDate(nowMs),
+          attempts: 0,
+          createdAt: secDate(nowMs),
+          updatedAt: secDate(nowMs),
+        })
+        .run();
+      return id;
+    });
+  } catch (e) {
+    // Backstop: the index rejected a concurrent insert. The winning job now covers the epic locally.
+    if (isUniqueViolation(e)) return undefined;
+    throw e;
+  }
 }
 
 /**
@@ -297,7 +407,7 @@ export async function leaseDue(
   if (due.length === 0) return [];
 
   const ids = due.map((j) => j.id);
-  await db
+  const leased = await db
     .update(schema.jobs)
     .set({
       status: "running",
@@ -305,10 +415,12 @@ export async function leaseDue(
       attempts: sql`${schema.jobs.attempts} + 1`,
       updatedAt: nowDate,
     })
-    .where(inArray(schema.jobs.id, ids));
+    // Candidates can be cancelled after the SELECT above. Re-assert runnable state here so a
+    // successful cancel is terminal, and return only rows this UPDATE actually leased.
+    .where(and(inArray(schema.jobs.id, ids), runnable))
+    .returning();
 
-  // Return the leased rows re-read so callers see the incremented attempts + new lease.
-  return db.select().from(schema.jobs).where(inArray(schema.jobs.id, ids));
+  return leased;
 }
 
 /**
@@ -346,7 +458,7 @@ export async function complete(db: AntonDb, clock: Clock, jobId: string): Promis
   await db
     .update(schema.jobs)
     .set({ status: "done", leaseExpiresAt: null, lastError: null, updatedAt: secDate(nowMs) })
-    .where(eq(schema.jobs.id, jobId));
+    .where(and(eq(schema.jobs.id, jobId), eq(schema.jobs.status, "running")));
 }
 
 /**
@@ -374,25 +486,36 @@ export async function reschedule(
         : schema.jobs.attempts,
       updatedAt: secDate(nowMs),
     })
-    .where(eq(schema.jobs.id, jobId));
+    .where(and(eq(schema.jobs.id, jobId), eq(schema.jobs.status, "running")));
 }
 
 /**
  * Park the job: it exhausted its retry budget or hit a permanent error, so pause it for a human.
  * NOT terminal — `resumeJob` is the un-park path. Quota hits reschedule (see `reschedule`) and
  * must never reach here; only plain-error exhaustion and `PoisonError` park (anton-ner.2).
+ *
+ * Parks any ACTIVE job — `running` **or** `queued`. A job awaiting a retry (requeued with a future
+ * `runAt`) is a legitimate park target: it is exactly what a human parks to stop the next attempt,
+ * and what a caller parks to stop a job being re-dispatched. Restricting this to `running` made
+ * both cases a silent no-op (anton-0oi).
+ *
+ * Returns whether it actually parked. Callers that depend on the job being parked afterwards MUST
+ * check — a `done`/`failed`/already-`parked` job is left alone and reports `false` rather than
+ * pretending to have parked it.
  */
 export async function park(
   db: AntonDb,
   clock: Clock,
   jobId: string,
   lastError: string,
-): Promise<void> {
+): Promise<boolean> {
   const nowMs = clock.now();
-  await db
+  const rows = await db
     .update(schema.jobs)
     .set({ status: "parked", leaseExpiresAt: null, lastError, updatedAt: secDate(nowMs) })
-    .where(eq(schema.jobs.id, jobId));
+    .where(and(eq(schema.jobs.id, jobId), inArray(schema.jobs.status, [...ACTIVE_STATUSES])))
+    .returning({ id: schema.jobs.id });
+  return rows.length > 0;
 }
 
 /**
@@ -444,6 +567,27 @@ export async function resumeJob(db: AntonDb, clock: Clock, jobId: string): Promi
     throw e;
   }
   return true;
+}
+
+/**
+ * Terminalize a job as `cancelled` — the durable half of a force-kill (anton-a4jj). Flips a still-
+ * live job (`queued`/`running`/`parked`) to the terminal `cancelled` status and clears its lease so
+ * NO durability path revives it: the runner never re-leases it (it's not queued-due nor a reclaimable
+ * running lease), boot reclaim skips it (only `running` rows reclaim), and `resumeJob` refuses it
+ * (not `parked`/`failed`). The status guard lives in the UPDATE's WHERE, so this is race-safe against
+ * a concurrent settle and idempotent: a second cancel — or a cancel of an already-terminal
+ * (`done`/`failed`/`cancelled`) row — updates zero rows and returns false. Returns whether it acted.
+ * Aborting the in-flight child is the runner's job (`JobRunner.cancel`); this only writes state, so
+ * it also terminalizes a `running` row whose controller lives on a since-restarted process.
+ */
+export async function cancelJob(db: AntonDb, clock: Clock, jobId: string): Promise<boolean> {
+  const nowMs = clock.now();
+  const updated = await db
+    .update(schema.jobs)
+    .set({ status: "cancelled", leaseExpiresAt: null, lastError: "cancelled by operator", updatedAt: secDate(nowMs) })
+    .where(and(eq(schema.jobs.id, jobId), inArray(schema.jobs.status, [...CANCELLABLE_STATUSES])))
+    .returning({ id: schema.jobs.id });
+  return updated.length > 0;
 }
 
 /**

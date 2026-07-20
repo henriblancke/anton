@@ -8,8 +8,10 @@ import {
   DEFAULT_CONCURRENCY,
   DEFAULT_JOB_TIMEOUT_MINUTES,
   DEFAULT_MAX_RETRIES,
+  getProjectById,
   getProjectSettings,
 } from "../projects";
+import { beads } from "../beads/bd";
 import { makeExecuteEpicHandler } from "./execute-epic";
 import { makeReviewFixHandler } from "./review-fix";
 import { makeNightlyStringerHandler } from "./nightly-stringer";
@@ -48,6 +50,30 @@ async function resolvePolicy(projectId: string | undefined) {
   };
 }
 
+/**
+ * Cross-machine run-liveness source for the runner (anton-jz1). Reads the shared beads board to
+ * tell whether an execute-epic run is already live for this epic on ANOTHER machine — the `jobs`
+ * table is machine-local, so a Force run on machine B can't otherwise see a run executing on
+ * machine A and would double-run it. Pulls the shared board FIRST: the local Dolt working set can
+ * be a sync heartbeat (~30s) behind, so without a pull a lease machine A published moments ago
+ * reads as absent and this gate lets B enqueue a second concurrent run — the exact race the lease
+ * exists to close. Fails open (returns false) so a transient beads read never blocks a legitimate
+ * run; the local dedupe + `jobs_active_epic_unique` still backstop same-machine.
+ */
+async function liveRunCheck(projectId: string, epicBeadId: string): Promise<boolean> {
+  try {
+    const project = await getProjectById(getDb(), projectId);
+    if (!project) return false;
+    // Best-effort: a pull failure (offline, transient) falls back to the local snapshot rather
+    // than blocking the check — the same fail-open posture as the surrounding try/catch.
+    await beads.pull(project.repoPath).catch(() => {});
+    const bead = await beads.show(project.repoPath, epicBeadId);
+    return beads.isRunLive(bead, Date.now());
+  } catch {
+    return false;
+  }
+}
+
 export function getRunner(): JobRunner {
   if (_runner) return _runner;
   const db = getDb();
@@ -57,6 +83,7 @@ export function getRunner(): JobRunner {
     log,
     config: { maxConcurrent: GLOBAL_MAX_CONCURRENT },
     resolvePolicy,
+    liveRunCheck,
   });
   runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db }));
   runner.registerHandler("review-fix", makeReviewFixHandler({ db }));
@@ -95,11 +122,30 @@ export async function startRunner(): Promise<void> {
 
 /**
  * Enqueue an execute-epic job for an approved epic. Returns the job id — the existing one when an
- * active (queued|running) run for this epic already exists, so a double approval or retrigger can't
- * spawn duplicate concurrent runs (anton-761).
+ * active (queued|running) run for this epic already exists in this store, so a double approval or
+ * retrigger can't spawn duplicate concurrent runs (anton-761). Returns `undefined` when a run is
+ * already live for the epic on ANOTHER machine (read from the shared beads board): nothing is
+ * enqueued here because that run already covers the work (anton-jz1).
  */
-export function enqueueExecuteEpic(projectId: string, epicBeadId: string): Promise<string> {
-  return Promise.resolve(getRunner().enqueueExecuteEpic(projectId, epicBeadId));
+export function enqueueExecuteEpic(
+  projectId: string,
+  epicBeadId: string,
+): Promise<string | undefined> {
+  return getRunner().enqueueExecuteEpic(projectId, epicBeadId);
+}
+
+/**
+ * Enqueue an execute-epic job for an owner-changing take-over, but only when THIS instance has no
+ * job for the epic yet (any status). Returns the new job id, or `undefined` when a local job already
+ * covers it. Jobs are machine-local, so a take-over that reassigns the reservation from another
+ * operator must give the new owner's instance its own runnable job — otherwise the approved work
+ * strands with the original owner's (now-poisoning) job on a different machine (anton-i71, PR #39).
+ */
+export function enqueueExecuteEpicIfAbsent(
+  projectId: string,
+  epicBeadId: string,
+): Promise<string | undefined> {
+  return Promise.resolve(getRunner().enqueueExecuteEpicIfAbsent(projectId, epicBeadId));
 }
 
 /**
@@ -112,4 +158,26 @@ export async function resumeJob(projectId: string, jobId: string): Promise<boole
   const job = await getJob(getDb(), jobId);
   if (!job || job.projectId !== projectId) return false;
   return getRunner().resume(jobId);
+}
+
+/**
+ * Outcome of a project-scoped cancel, so the route can pick the right HTTP status:
+ *   • `ok`              — the job was terminalized (200).
+ *   • `not-found`       — no such job, or it belongs to a different project (404). Project-scoping is
+ *                         enforced here so a route can't kill another project's job by id.
+ *   • `not-cancellable` — the job exists in this project but is already terminal (409).
+ */
+export type CancelResult = { ok: true } | { ok: false; reason: "not-found" | "not-cancellable" };
+
+/**
+ * Force-kill a job from the UI (anton-a4jj). Aborts its in-flight child (when this process holds one)
+ * and durably marks it `cancelled` so no durability path revives it. Scoped to the project so a route
+ * can't cancel another project's job by id — a cross-project (or missing) job is `not-found`, an
+ * already-terminal one is `not-cancellable`.
+ */
+export async function cancelJob(projectId: string, jobId: string): Promise<CancelResult> {
+  const job = await getJob(getDb(), jobId);
+  if (!job || job.projectId !== projectId) return { ok: false, reason: "not-found" };
+  const acted = await getRunner().cancel(jobId);
+  return acted ? { ok: true } : { ok: false, reason: "not-cancellable" };
 }

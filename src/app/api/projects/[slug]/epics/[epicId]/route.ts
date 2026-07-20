@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { deleteEpic, getEpicDetail } from "@/lib/epic-detail";
-import { getProjectBySlug } from "@/lib/projects";
+import { resolveProject } from "../../resolve-project";
 
 export const dynamic = "force-dynamic";
 
@@ -9,10 +9,8 @@ export async function GET(
   { params }: { params: Promise<{ slug: string; epicId: string }> },
 ) {
   const { slug, epicId } = await params;
-  const project = await getProjectBySlug(slug);
-  if (!project) {
-    return NextResponse.json({ error: "Project not found" }, { status: 404 });
-  }
+  const { project, response } = await resolveProject(slug);
+  if (!project) return response;
 
   try {
     const detail = await getEpicDetail(project, epicId);
@@ -27,10 +25,8 @@ export async function DELETE(
   { params }: { params: Promise<{ slug: string; epicId: string }> },
 ) {
   const { slug, epicId } = await params;
-  const project = await getProjectBySlug(slug);
-  if (!project) {
-    return NextResponse.json({ error: "Project not found" }, { status: 404 });
-  }
+  const { project, response } = await resolveProject(slug);
+  if (!project) return response;
 
   try {
     await deleteEpic(project, epicId);

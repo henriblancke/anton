@@ -96,4 +96,41 @@ describe("inReviewEpics", () => {
     const noRef = bead({ id: "noref-1", issue_type: "epic", external_ref: undefined });
     expect(inReviewEpics([child, closed, noLabel, noRef])).toEqual([]);
   });
+
+  // Ownership matrix (anton-zoh): on a shared board an operator may only act on epics it claimed
+  // or unclaimed ones. `assignee` is the claim execute-epic stamps; a DIFFERENT operator's claim
+  // is excluded, and an unresolved identity (operator undefined) sees ONLY unclaimed epics.
+  describe("operator ownership filter", () => {
+    const unclaimed = bead({ id: "unclaimed", issue_type: "epic", assignee: null });
+    const mine = bead({ id: "mine", issue_type: "epic", assignee: "alice" });
+    const theirs = bead({ id: "theirs", issue_type: "epic", assignee: "bob" });
+    const board = [unclaimed, mine, theirs];
+
+    it("selects unclaimed AND claimed-by-me, excludes claimed-by-another", () => {
+      expect(inReviewEpics(board, { operator: "alice" }).map((b) => b.id)).toEqual([
+        "unclaimed",
+        "mine",
+      ]);
+    });
+
+    it("selects ONLY unclaimed when the operator is unresolved (undefined)", () => {
+      expect(inReviewEpics(board, { operator: undefined }).map((b) => b.id)).toEqual(["unclaimed"]);
+    });
+
+    it("treats an empty-string / whitespace assignee as unclaimed", () => {
+      const blank = bead({ id: "blank", issue_type: "epic", assignee: "  " });
+      expect(inReviewEpics([blank], { operator: "alice" }).map((b) => b.id)).toEqual(["blank"]);
+    });
+
+    it("a targeted epicBeadId BYPASSES ownership — another operator's epic still selected", () => {
+      expect(
+        inReviewEpics(board, { operator: "alice", epicBeadId: "theirs" }).map((b) => b.id),
+      ).toEqual(["theirs"]);
+    });
+
+    it("a targeted epicBeadId still respects the in-review/run-target/PR-ref gates", () => {
+      const closedTheirs = bead({ id: "theirs", issue_type: "epic", assignee: "bob", status: "closed" });
+      expect(inReviewEpics([closedTheirs], { epicBeadId: "theirs" })).toEqual([]);
+    });
+  });
 });

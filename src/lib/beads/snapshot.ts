@@ -9,6 +9,26 @@ interface SnapshotEntry {
   generation: number;
   loadedAt: number;
   refresh: Promise<Bead[]> | null;
+  // A local write bumped the version but retained last-good beads. Full board reads must block on a
+  // fresh post-write read (never serve the stale-but-version-stamped board); cleared once one lands.
+  pendingWrite: boolean;
+}
+
+export interface SnapshotReadOptions {
+  /**
+   * Whether a pending local write blocks the read on a fresh post-write load. Default `true` for
+   * write-then-navigate/forced-reload paths that must reflect the write. The versioned poll path
+   * passes `false`: it is contractually non-blocking, so it serves the retained board now and lets
+   * a background refresh (and the client's next poll) surface the post-write data.
+   */
+  blockOnPendingWrite?: boolean;
+}
+
+export interface SnapshotRead {
+  beads: Bead[];
+  /** The snapshot version these exact beads carry — captured in the same tick they were read, so a
+   * concurrent background refresh can never advance the version past the data a caller returns. */
+  version: number;
 }
 
 const SNAPSHOTS_KEY = Symbol.for("anton.beads.issueSnapshots");
@@ -29,6 +49,7 @@ function entryFor(cwd: string): SnapshotEntry {
     generation: 0,
     loadedAt: 0,
     refresh: null,
+    pendingWrite: false,
   };
   entries.set(cwd, created);
   return created;
@@ -39,17 +60,24 @@ export function issueSnapshotVersion(cwd: string): number {
   return entryFor(cwd).version;
 }
 
-/** Mark cached data stale while retaining it so readers never wait behind a Dolt sync/write. */
-export function invalidateIssueSnapshot(cwd: string, drop = false): void {
+/**
+ * Mark cached data stale while retaining it so a background-refresh reader (the poll path) keeps
+ * serving last-good data and never waits behind a Dolt sync. `localWrite` additionally bumps the
+ * version (so clients detect the change), clears any in-flight loader — forcing a fresh read that
+ * starts AFTER the write; the pre-write loader is orphaned and the generation guard discards its
+ * result — and flags the entry pendingWrite so full board reads (`getIssueSnapshot`) block on that
+ * fresh read rather than hand back the retained board stamped with the already-advanced version.
+ * Beads are retained either way: an invalidation marks the snapshot stale, it never blanks the board.
+ */
+export function invalidateIssueSnapshot(cwd: string, localWrite = false): void {
   const entry = entryFor(cwd);
   entry.loadedAt = 0;
   entry.generation += 1;
-  if (drop) {
+  if (localWrite) {
     entry.version += 1;
-    entry.beads = null;
-    entry.serialized = null;
     // A post-write read must start after the write, never share a loader that started before it.
     entry.refresh = null;
+    entry.pendingWrite = true;
   }
 }
 
@@ -76,6 +104,9 @@ export function refreshIssueSnapshot(
       entry.beads = beads;
       entry.serialized = serialized;
       entry.loadedAt = now;
+      // This read started after (and its generation matches) the write, so it reflects it — the
+      // retained board is no longer the only post-write data and reads can serve warm again.
+      entry.pendingWrite = false;
       return beads;
     })
     .finally(() => {
@@ -87,21 +118,51 @@ export function refreshIssueSnapshot(
 
 /**
  * Return the last valid snapshot immediately. Cold loads wait once; stale warm loads trigger a
- * background refresh and keep serving known-good data.
+ * background refresh and keep serving known-good data. A pending local write is the exception when
+ * `blockOnPendingWrite` (the default): the retained board predates the write yet the version already
+ * advanced, so this read blocks on a fresh post-write load (falling back to last-good on a transient
+ * failure) rather than serve stale data a version poll would then treat as current — the guarantee
+ * the API forced-reload path relies on, honored on write-then-navigate/server-render flows too. The
+ * versioned poll path opts out (`blockOnPendingWrite: false`) to stay non-blocking: it serves the
+ * retained board now and kicks the post-write load in the background for the client's next poll.
  */
 export async function getIssueSnapshot(
   cwd: string,
   loader: () => Promise<Bead[]>,
   now = Date.now(),
+  opts: SnapshotReadOptions = {},
 ): Promise<Bead[]> {
+  return (await readIssueSnapshot(cwd, loader, now, opts)).beads;
+}
+
+/**
+ * Like {@link getIssueSnapshot} but returns the snapshot version alongside the beads, read in the
+ * same synchronous tick. Callers that STAMP a response with the version (the board's freshness token)
+ * must use this: reading beads and version separately lets an in-flight refresh land between them and
+ * advance the version past the data being served, which a version poll would then treat as current
+ * and 304 forever — pinning the client to the pre-refresh board until the next invalidation.
+ */
+export async function readIssueSnapshot(
+  cwd: string,
+  loader: () => Promise<Bead[]>,
+  now = Date.now(),
+  { blockOnPendingWrite = true }: SnapshotReadOptions = {},
+): Promise<SnapshotRead> {
   const entry = entryFor(cwd);
-  if (entry.beads) {
-    if (now - entry.loadedAt >= ISSUE_SNAPSHOT_MAX_AGE_MS) {
+  const retained = entry.beads;
+  if (retained) {
+    if (entry.pendingWrite && blockOnPendingWrite) {
+      await refreshIssueSnapshot(cwd, loader, now).catch(() => {});
+      return { beads: entry.beads ?? retained, version: entry.version };
+    }
+    // Serve retained now, but a pending write or a stale TTL still needs a fresh read behind it.
+    if (entry.pendingWrite || now - entry.loadedAt >= ISSUE_SNAPSHOT_MAX_AGE_MS) {
       void refreshIssueSnapshot(cwd, loader, now).catch(() => {});
     }
-    return entry.beads;
+    return { beads: retained, version: entry.version };
   }
-  return refreshIssueSnapshot(cwd, loader, now);
+  await refreshIssueSnapshot(cwd, loader, now);
+  return { beads: entry.beads ?? [], version: entry.version };
 }
 
 /** Start a freshness probe without making the caller wait for embedded Dolt. */

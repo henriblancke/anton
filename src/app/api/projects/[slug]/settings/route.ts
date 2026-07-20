@@ -4,11 +4,11 @@ import {
   CONCURRENCY_RANGE,
   JOB_TIMEOUT_MINUTES_RANGE,
   MAX_RETRIES_RANGE,
-  getProjectBySlug,
   getProjectSettingsBySlug,
   updateProjectSettings,
   type ProjectSettings,
 } from "@/lib/projects";
+import { resolveProject } from "../resolve-project";
 
 export const dynamic = "force-dynamic";
 
@@ -29,6 +29,8 @@ export async function GET(_request: Request, { params }: { params: Promise<{ slu
 /** Upper bound on operator-editable prompts — generous for guidance, guards a runaway payload. */
 const MAX_SEED_PROMPT = 8000;
 const MAX_REVIEW_FIX_PROMPT = 8000;
+/** Upper bound on an operator verify-gate command (anton-3oh8) — generous for a chained gate. */
+const MAX_COMMAND = 1000;
 
 export async function PATCH(request: Request, { params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
@@ -64,6 +66,34 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
       );
     }
     patch[key] = n;
+  }
+
+  // Verify-gate commands (anton-3oh8): tests + operator-pinned lint/typecheck/build. "" / null
+  // clears the gate (skipped); otherwise a bounded shell-command string. Shared handling so all
+  // four behave identically.
+  const commandFields: ("testCommand" | "lintCommand" | "typecheckCommand" | "buildCommand")[] = [
+    "testCommand",
+    "lintCommand",
+    "typecheckCommand",
+    "buildCommand",
+  ];
+  for (const key of commandFields) {
+    if (!(key in body)) continue;
+    const raw = (body as Record<string, unknown>)[key];
+    if (raw == null || raw === "") {
+      patch[key] = undefined; // clear → gate skipped
+      continue;
+    }
+    if (typeof raw !== "string") {
+      return NextResponse.json({ error: `${key} must be a string` }, { status: 400 });
+    }
+    if (raw.length > MAX_COMMAND) {
+      return NextResponse.json(
+        { error: `${key} too long (max ${MAX_COMMAND} chars)` },
+        { status: 400 },
+      );
+    }
+    patch[key] = raw;
   }
 
   if ("model" in body) {
@@ -114,7 +144,9 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
         { status: 400 },
       );
     } else if (agents.length > 0) {
-      const project = await getProjectBySlug(slug);
+      // Resolve for the project's repoPath only — a missing project falls through to
+      // updateProjectSettings' 400 below, so tolerate null here rather than 404 early.
+      const { project } = await resolveProject(slug);
       const discovered = new Set((await discoverAgents(project?.repoPath)).map((a) => a.id));
       const unknown = agents.find((a) => !discovered.has(a));
       if (unknown !== undefined) {
@@ -133,6 +165,19 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
     else if (typeof autonomy !== "boolean") {
       return NextResponse.json({ error: "autonomy must be a boolean" }, { status: 400 });
     } else patch.autonomy = autonomy;
+  }
+
+  if ("conventionalCommits" in body) {
+    const conventionalCommits = body.conventionalCommits;
+    // "" / null → clear (default: OFF). Otherwise strictly a boolean.
+    if (conventionalCommits == null || conventionalCommits === "") {
+      patch.conventionalCommits = undefined;
+    } else if (typeof conventionalCommits !== "boolean") {
+      return NextResponse.json(
+        { error: "conventionalCommits must be a boolean" },
+        { status: 400 },
+      );
+    } else patch.conventionalCommits = conventionalCommits;
   }
 
   try {

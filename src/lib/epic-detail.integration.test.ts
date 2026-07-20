@@ -3,13 +3,14 @@
  * getEpicDetail returns the tickets plus that edge. Mirrors board.integration.test.ts. Skipped
  * when `bd`/`git` aren't installed.
  */
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beads } from "./beads/bd";
-import { getEpicDetail } from "./epic-detail";
+import { resetIssueSnapshots } from "./beads/snapshot";
+import { deleteEpic, getEpicDetail } from "./epic-detail";
 import type { Project } from "./types";
 
 function has(cmd: string): boolean {
@@ -22,6 +23,23 @@ function has(cmd: string): boolean {
 }
 
 const suite = has("bd") && has("git") ? describe : describe.skip;
+
+type SeedNode = { key: string; title: string; type: "epic" | "task" | "bug" };
+type SeedEdge = { from_key: string; to_key: string; type: string };
+
+/**
+ * Seed many beads in ONE `bd create --graph` call, returning the key → real-id map. Seeding via
+ * `beads.create` shells out (and takes the Dolt lock) per bead, which costs seconds per bead under
+ * full-suite CPU contention; the batch path is a single process for the whole graph.
+ */
+function seedGraph(cwd: string, nodes: SeedNode[], edges: SeedEdge[] = []): Record<string, string> {
+  const plan = join(cwd, "seed-plan.json");
+  writeFileSync(plan, JSON.stringify({ nodes, edges }));
+  const out = execFileSync("bd", ["create", "--graph", plan, "--json"], { cwd, encoding: "utf8" });
+  const { ids, error } = JSON.parse(out) as { ids?: Record<string, string>; error?: string };
+  if (!ids) throw new Error(`bd create --graph failed: ${error ?? out}`);
+  return ids;
+}
 
 suite("epic-detail integration (real bd)", () => {
   let repo: string;
@@ -47,6 +65,13 @@ suite("epic-detail integration (real bd)", () => {
   afterAll(() => {
     if (repo) rmSync(repo, { recursive: true, force: true });
   });
+
+  // These cases share one repo, so a warm cross-test snapshot would leak between them. Since A1
+  // (anton-hp2b) the snapshot serves last-good data on a local write instead of dropping it — a
+  // read-after-write returns stale beads, refreshed client-side by A3's version-bump poll. Clearing
+  // the cache before each case forces the cold, fresh read a new client's next poll would make, so a
+  // just-written bead is observed rather than a prior test's snapshot.
+  beforeEach(() => resetIssueSnapshots());
 
   it("returns the epic's tickets and their blocks edge", async () => {
     const epicId = await beads.create(repo, {
@@ -85,26 +110,50 @@ suite("epic-detail integration (real bd)", () => {
     expect(blocksEdge, "blocks edge from A to B").toBeDefined();
   }, 30_000);
 
+  // Regression for anton-lhw: the epic-detail header must surface the epic's own agent/risk/size
+  // chips (getEpicDetail's real-epic branch used to pass `chips: false`, silently dropping them
+  // even though the board card and single-ticket pseudo-epic show them).
+  it("carries the epic's own agent/risk/size chips onto the detail header", async () => {
+    const epicId = await beads.create(repo, {
+      title: "Labeled epic",
+      type: "epic",
+      description: "## Goal\nShip it.",
+    });
+    await beads.tag(repo, epicId, ["agent:nextjs", "risk:high", "size:M"]);
+
+    const detail = await getEpicDetail(project, epicId);
+    expect(detail.epic.agent).toBe("nextjs");
+    expect(detail.epic.risk).toBe("high");
+    expect(detail.epic.size).toBe("M");
+  }, 30_000);
+
   // Regression for anton-noc: `bd list` defaults to 50 results, so in a repo with >50 issues an
   // epic's tickets were silently truncated (planar showed 3 of 5, 1 of 6). beads.list must pass
   // --limit 0 so ALL children come back regardless of repo size.
   it("returns ALL of an epic's tickets even when the repo has >50 issues", async () => {
-    const epicId = await beads.create(repo, {
-      title: "Big epic",
-      type: "epic",
-      description: "## Goal\nMany tickets.",
-    });
-    // Create 8 real children under the epic…
-    const childIds: string[] = [];
-    for (let i = 0; i < 8; i++) {
-      const id = await beads.create(repo, { title: `Child ${i}`, type: "task" });
-      await beads.link(repo, id, epicId, "parent-child");
-      childIds.push(id);
-    }
-    // …and enough unrelated beads to push the total well past bd's default 50-result cap.
-    for (let i = 0; i < 60; i++) {
-      await beads.create(repo, { title: `Filler ${i}`, type: "task" });
-    }
+    // 8 real children under the epic, plus enough unrelated beads to push the repo well past bd's
+    // default 50-result cap — all seeded in one batch (anton-0oi: per-bead creates timed out here).
+    const nodes: SeedNode[] = [
+      { key: "epic", title: "Big epic", type: "epic" },
+      ...Array.from({ length: 8 }, (_, i) => ({
+        key: `c${i}`,
+        title: `Child ${i}`,
+        type: "task" as const,
+      })),
+      ...Array.from({ length: 60 }, (_, i) => ({
+        key: `f${i}`,
+        title: `Filler ${i}`,
+        type: "task" as const,
+      })),
+    ];
+    const edges: SeedEdge[] = Array.from({ length: 8 }, (_, i) => ({
+      from_key: `c${i}`,
+      to_key: "epic",
+      type: "parent-child",
+    }));
+    const ids = seedGraph(repo, nodes, edges);
+    const epicId = ids.epic;
+    const childIds = Array.from({ length: 8 }, (_, i) => ids[`c${i}`]);
 
     const detail = await getEpicDetail(project, epicId);
     const got = new Set(detail.tickets.map((t) => t.id));
@@ -131,5 +180,35 @@ suite("epic-detail integration (real bd)", () => {
 
   it("still throws for a genuinely missing id", async () => {
     await expect(getEpicDetail(project, "does-not-exist-999")).rejects.toThrow(/not found/i);
+  }, 30_000);
+
+  // anton-u8wu (A2): the delete must not block on the remote push. Hold the sync pending, prove the
+  // delete resolves before it settles (off the critical path), then reject it and prove the failure
+  // is logged and swallowed — never awaited, never an unhandled rejection. The sync-status
+  // "failing"/unpushed recording lives in beads.sync and is covered in bd.test.ts.
+  it("deleteEpic fires the remote push off the response path and catches a rejected sync", async () => {
+    const epicId = await beads.create(repo, { title: "Doomed epic", type: "epic" });
+
+    let failSync!: () => void;
+    const pendingSync = new Promise<void>((_resolve, reject) => {
+      failSync = () => reject(new Error("remote unreachable"));
+    });
+    const syncSpy = vi.spyOn(beads, "sync").mockReturnValue(pendingSync);
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // Resolves while the push is still in flight — proof it isn't awaited (an awaited sync would
+    // hang here until the test times out).
+    await deleteEpic(project, epicId);
+    expect(syncSpy).toHaveBeenCalledTimes(1);
+
+    failSync();
+    await new Promise((r) => setImmediate(r)); // let the fire-and-forget `.catch` run
+    expect(errSpy).toHaveBeenCalled(); // the failed push was logged, not silently swallowed
+
+    syncSpy.mockRestore();
+    errSpy.mockRestore();
+
+    // The local cascade delete landed regardless of the failed push.
+    await expect(beads.show(repo, epicId)).rejects.toThrow();
   }, 30_000);
 });

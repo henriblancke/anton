@@ -7,6 +7,7 @@ import {
   getSyncStatusToken,
   isBenignSyncOutput,
   isNotWiredOutput,
+  LABELS,
   runDoltSync,
   type Bead,
 } from "./bd";
@@ -32,6 +33,103 @@ describe("beads.isRunTarget", () => {
     expect(beads.isRunTarget(bead({ issue_type: "learning" }))).toBe(false);
     expect(beads.isRunTarget(bead({ issue_type: "molecule" }))).toBe(false);
     expect(beads.isRunTarget(bead({ issue_type: undefined }))).toBe(false);
+  });
+});
+
+describe("run-lease helpers (anton-jz1)", () => {
+  const now = 1_000_000_000_000;
+
+  it("LABELS.runLease stamps an optional owner into the label", () => {
+    expect(LABELS.runLease(now)).toBe(`run-lease:${now}`);
+    expect(LABELS.runLease(now, "run-abc")).toBe(`run-lease:${now}:run-abc`);
+  });
+
+  it("runLeaseExpiry parses both legacy and owner-stamped labels, taking the max", () => {
+    expect(beads.runLeaseExpiry(bead({ labels: [`run-lease:${now}`] }))).toBe(now);
+    expect(beads.runLeaseExpiry(bead({ labels: [`run-lease:${now}:run-abc`] }))).toBe(now);
+    // A lingering older lease can't make a fresher one read as expired.
+    expect(
+      beads.runLeaseExpiry(
+        bead({ labels: [`run-lease:${now - 5}:run-old`, `run-lease:${now}:run-new`] }),
+      ),
+    ).toBe(now);
+    expect(beads.runLeaseExpiry(bead({ labels: ["run-lease:not-a-number"] }))).toBeUndefined();
+    expect(beads.runLeaseExpiry(bead({ labels: [] }))).toBeUndefined();
+  });
+
+  it("foreignRunLeaseLive: an unexpired lease owned by ANOTHER run reads foreign", () => {
+    const b = bead({ labels: [LABELS.runLease(now + 60_000, "run-other")] });
+    expect(beads.foreignRunLeaseLive(b, now, "run-mine")).toBe(true);
+  });
+
+  it("foreignRunLeaseLive: this run's OWN unexpired lease is not foreign (crash-resume sweep)", () => {
+    const b = bead({ labels: [LABELS.runLease(now + 60_000, "run-mine")] });
+    expect(beads.foreignRunLeaseLive(b, now, "run-mine")).toBe(false);
+  });
+
+  it("foreignRunLeaseLive: an EXPIRED foreign lease reads not-foreign (dead, safe to sweep)", () => {
+    const b = bead({ labels: [LABELS.runLease(now - 1_000, "run-other")] });
+    expect(beads.foreignRunLeaseLive(b, now, "run-mine")).toBe(false);
+  });
+
+  it("foreignRunLeaseLive: an owner-less unexpired lease is conservatively foreign", () => {
+    // Legacy/liveness-only publish that recorded no owner — treat as foreign; parking is recoverable.
+    const b = bead({ labels: [`run-lease:${now + 60_000}`] });
+    expect(beads.foreignRunLeaseLive(b, now, "run-mine")).toBe(true);
+  });
+
+  it("foreignRunLeaseLive: no lease at all reads not-foreign", () => {
+    expect(beads.foreignRunLeaseLive(bead({ labels: ["stage:implementing"] }), now, "run-mine")).toBe(
+      false,
+    );
+  });
+
+  it("ownRunLeaseLabels: returns only leases stamped with this run's id", () => {
+    const mine = LABELS.runLease(now + 60_000, "run-mine");
+    const other = LABELS.runLease(now + 60_000, "run-other");
+    const b = bead({ labels: ["stage:implementing", mine, other, `run-lease:${now}`] });
+    // Only the owner-matched lease is swept; a foreign lease and an owner-less legacy lease are left.
+    expect(beads.ownRunLeaseLabels(b, "run-mine")).toEqual([mine]);
+  });
+
+  it("ownRunLeaseLabels: no owned lease reads empty", () => {
+    const b = bead({ labels: [LABELS.runLease(now + 60_000, "run-other")] });
+    expect(beads.ownRunLeaseLabels(b, "run-mine")).toEqual([]);
+    expect(beads.ownRunLeaseLabels(bead({ labels: [] }), "run-mine")).toEqual([]);
+  });
+
+  it("winsRunLeaseRace: uncontested (only our own lease) proceeds", () => {
+    const b = bead({ labels: [LABELS.runLease(now + 60_000, "run-mine")] });
+    expect(beads.winsRunLeaseRace(b, now, "run-mine")).toBe(true);
+  });
+
+  it("winsRunLeaseRace: no lease at all proceeds", () => {
+    expect(beads.winsRunLeaseRace(bead({ labels: ["stage:implementing"] }), now, "run-mine")).toBe(
+      true,
+    );
+  });
+
+  it("winsRunLeaseRace: lower owner wins, higher owner yields (deterministic + symmetric)", () => {
+    // Both runs published concurrently, so each sees BOTH leases in the merged label set. The
+    // lexicographically-lowest owner keeps the lease; every other colliding run parks.
+    const b = bead({
+      labels: [LABELS.runLease(now + 60_000, "run-aaa"), LABELS.runLease(now + 60_000, "run-bbb")],
+    });
+    expect(beads.winsRunLeaseRace(b, now, "run-aaa")).toBe(true);
+    expect(beads.winsRunLeaseRace(b, now, "run-bbb")).toBe(false);
+  });
+
+  it("winsRunLeaseRace: an EXPIRED foreign lease is not a contender", () => {
+    const b = bead({
+      labels: [LABELS.runLease(now + 60_000, "run-mine"), LABELS.runLease(now - 1_000, "run-aaa")],
+    });
+    // run-aaa sorts below run-mine but its lease is dead, so it doesn't cost us the race.
+    expect(beads.winsRunLeaseRace(b, now, "run-mine")).toBe(true);
+  });
+
+  it("winsRunLeaseRace: an owner-less foreign live lease yields (can't arbitrate)", () => {
+    const b = bead({ labels: [`run-lease:${now + 60_000}`, LABELS.runLease(now + 60_000, "run-mine")] });
+    expect(beads.winsRunLeaseRace(b, now, "run-mine")).toBe(false);
   });
 });
 
@@ -429,11 +527,180 @@ describe("createDoltSync", () => {
     expect(getSyncStatus(cwd).state).toBe("not-wired");
   });
 
+  it("resolves a backstop to a push-retry when ahead and to pull-only otherwise", async () => {
+    const cwd = `/backstop-resolve-${Math.random()}`;
+    let pushFails = false;
+    const calls: string[][] = [];
+    const sync = createDoltSync(async (_cwd, args) => {
+      calls.push(args);
+      if (args[1] === "push" && pushFails) {
+        throw execError({ stderr: "Error: push failed: connection reset" });
+      }
+      return "";
+    });
+
+    // The first backstop reconciles the repo with a full pass (its push lands), so it is caught up.
+    await sync(cwd, "backstop");
+    expect(calls).toContainEqual(["dolt", "push"]);
+
+    // Caught up and reconciled: the backstop drops to pull-only.
+    calls.length = 0;
+    await sync(cwd, "backstop");
+    expect(calls).toEqual([["dolt", "pull"]]);
+
+    // A write-nudged full pass whose push fails leaves the repo ahead of its remote.
+    pushFails = true;
+    await sync(cwd, "full").catch(() => {});
+
+    // Now the backstop retries the push (still failing → still ahead).
+    calls.length = 0;
+    await sync(cwd, "backstop").catch(() => {});
+    expect(calls).toContainEqual(["dolt", "push"]);
+
+    // Once the push lands the repo is no longer ahead: the backstop drops back to pull-only.
+    pushFails = false;
+    await sync(cwd, "backstop"); // this retry lands the push, clearing the ahead flag
+    calls.length = 0;
+    await sync(cwd, "backstop");
+    expect(calls).toEqual([["dolt", "pull"]]);
+  });
+
+  it("a cold-start backstop reconciles stranded commits even when the in-memory count is 0", async () => {
+    // Simulates a restart: a fresh coalescer (empty in-memory backlog) whose local Dolt has commits
+    // a crashed process committed but never pushed. The count reads 0, yet the first backstop must
+    // still run a full pass so those commits ship — never pull forever without pushing them.
+    const cwd = `/backstop-coldstart-${Math.random()}`;
+    let pushFails = true;
+    const calls: string[][] = [];
+    const sync = createDoltSync(async (_cwd, args) => {
+      calls.push(args);
+      if (args[1] === "push" && pushFails) throw execError({ stderr: "Error: push failed: reset" });
+      return "";
+    });
+
+    // Count is 0 (nothing recorded this process), yet the very first backstop attempts a push.
+    expect(getSyncStatus(cwd).unpushedCount).toBe(0);
+    await sync(cwd, "backstop").catch(() => {});
+    expect(calls).toContainEqual(["dolt", "push"]);
+
+    // The push still fails, so the repo stays unreconciled: the next backstop keeps trying a full
+    // pass rather than lapsing to pull-only and stranding the commits.
+    calls.length = 0;
+    await sync(cwd, "backstop").catch(() => {});
+    expect(calls).toContainEqual(["dolt", "push"]);
+
+    // Once the push lands, the repo is reconciled and the backstop goes quiet (pull-only).
+    pushFails = false;
+    await sync(cwd, "backstop");
+    calls.length = 0;
+    await sync(cwd, "backstop");
+    expect(calls).toEqual([["dolt", "pull"]]);
+  });
+
+  it("a backstop push coalesces behind an in-flight full pass (never a concurrent push)", async () => {
+    const cwd = `/backstop-coalesce-${Math.random()}`;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let firstPushFails = true;
+    let park = false;
+    let parked = false;
+    const sync = createDoltSync(async (_cwd, args) => {
+      if (args[1] === "push" && firstPushFails) {
+        firstPushFails = false;
+        throw execError({ stderr: "Error: push failed: connection reset" });
+      }
+      if (args[1] === "commit" && park && !parked) {
+        parked = true;
+        await gate; // hold the in-flight full pass so a backstop must queue behind it
+      }
+      return "";
+    });
+
+    // Leave the repo ahead: the first full pass commits but its push fails.
+    await sync(cwd, "full").catch(() => {});
+
+    park = true;
+    const running = sync(cwd, "full"); // parks at commit, before its push
+    const backstop = sync(cwd, "backstop"); // ahead → resolves to full → must coalesce, not push now
+    const alsoBackstop = sync(cwd, "backstop");
+    expect(backstop).toBe(alsoBackstop); // the burst shares ONE trailing pass
+    expect(backstop).not.toBe(running); // and does not run concurrently with the in-flight pass
+
+    release();
+    await Promise.all([running, backstop, alsoBackstop]);
+  });
+
   it("getSyncStatus defaults to unknown for a never-synced cwd", () => {
     expect(getSyncStatus(`/never-${Math.random()}`)).toEqual({
       state: "unknown",
       lastSyncedAt: null,
+      lastPushedAt: null,
+      unpushedCount: 0,
       lastError: null,
     });
+  });
+
+  it("stamps lastPushedAt and clears the unpushed count when a full pass pushes", async () => {
+    const cwd = `/repo-pushed-${Math.random()}`;
+    const sync = createDoltSync(async () => "");
+    await sync(cwd, "full");
+    const status = getSyncStatus(cwd);
+    expect(status.lastPushedAt).toBeTypeOf("number");
+    expect(status.unpushedCount).toBe(0);
+  });
+
+  it("grows the unpushed count per failed push and clears it once a retry lands", async () => {
+    const cwd = `/repo-unpushed-${Math.random()}`;
+    let pushFails = true;
+    const sync = createDoltSync(async (_cwd, args) => {
+      if (args[1] === "push" && pushFails) throw execError({ stderr: "Error: push failed: reset" });
+      return "";
+    });
+
+    await sync(cwd, "full").catch(() => {});
+    expect(getSyncStatus(cwd).unpushedCount).toBe(1);
+    await sync(cwd, "full").catch(() => {});
+    expect(getSyncStatus(cwd).unpushedCount).toBe(2);
+
+    pushFails = false;
+    await sync(cwd, "full");
+    expect(getSyncStatus(cwd).unpushedCount).toBe(0);
+    expect(getSyncStatus(cwd).lastPushedAt).toBeTypeOf("number");
+  });
+
+  it("failed backstop retries do not inflate the unpushed count (one stranded change stays 1)", async () => {
+    const cwd = `/repo-backstop-noinflate-${Math.random()}`;
+    const sync = createDoltSync(async (_cwd, args) => {
+      if (args[1] === "push") throw execError({ stderr: "Error: push failed: reset" });
+      return "";
+    });
+
+    // One write-nudged full pass strands a single change locally.
+    await sync(cwd, "full").catch(() => {});
+    expect(getSyncStatus(cwd).unpushedCount).toBe(1);
+
+    // Every heartbeat backstop resolves to a full push-retry (repo is ahead) and fails, but retries
+    // re-attempt the same commit and must never grow the count — a flaky remote can't fake a backlog.
+    for (let i = 0; i < 4; i++) await sync(cwd, "backstop").catch(() => {});
+    expect(getSyncStatus(cwd).unpushedCount).toBe(1);
+  });
+
+  it("a pull-only pass moves lastSyncedAt but not lastPushedAt or the unpushed count", async () => {
+    const cwd = `/repo-pull-only-${Math.random()}`;
+    let pushFails = true;
+    const sync = createDoltSync(async (_cwd, args) => {
+      if (args[1] === "push" && pushFails) throw execError({ stderr: "Error: push failed: reset" });
+      return "";
+    });
+    // Leave the repo ahead of its remote (a full push failed), then run a pull-only pass.
+    await sync(cwd, "full").catch(() => {});
+    expect(getSyncStatus(cwd).unpushedCount).toBe(1);
+    pushFails = false; // a push would now succeed, but pull-only must not attempt one
+    await sync(cwd, "pull");
+    const status = getSyncStatus(cwd);
+    expect(status.state).toBe("synced");
+    expect(status.lastSyncedAt).toBeTypeOf("number");
+    expect(status.lastPushedAt).toBeNull(); // never pushed successfully
+    expect(status.unpushedCount).toBe(1); // still ahead — the backlog survives a pull
   });
 });

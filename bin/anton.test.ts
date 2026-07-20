@@ -15,25 +15,26 @@ import {
   agentsFromArgs,
   applyMigrations,
   compareVersions,
-  configureBeadsDoltSync,
   ensureBeadsGitignore,
   ensureBetterSqlite3,
   ensureMigrated,
   nextArgs,
-  normalizeGitUrl,
   parseInitArgs,
   platformLabel,
   provisionAgentsSkills,
   registerProject,
-  REQUIRED_SKILLS,
+  INSTALLED_SKILLS,
   resolvePort,
 } from "./anton.mjs";
 
 import {
-  // config.mjs has its own configureBeadsDoltSync (used by `anton init` via configureBeadsForRepo);
-  // anton.mjs has a distinct one (used by `anton setup`). Alias to keep both under test without collision.
-  configureBeadsDoltSync as configureBeadsDoltSyncForRepo,
+  // The single Dolt-sync path (anton-8qx): one configureBeadsDoltSync shared by `anton setup`
+  // (bin/anton.mjs) and `anton init` (via configureBeadsForRepo). normalizeRemoteUrl is its URL
+  // equality helper.
+  configureBeadsDoltSync,
   detectHooksManager,
+  normalizeRemoteUrl,
+  untrackBeadsExports,
 } from "../src/lib/beads/config.mjs";
 
 const CLI = join(dirname(fileURLToPath(import.meta.url)), "anton.mjs");
@@ -173,6 +174,67 @@ describe("ensureBeadsGitignore (anton init)", () => {
   });
 });
 
+// anton-vqgw: .gitignore only suppresses UNTRACKED files. A repo that committed issues.jsonl before
+// the ignore existed keeps shipping a frozen board snapshot to every clone and branch, which inbound
+// tooling can replay over live state — so anton init has to untrack it, not just ignore it.
+describe("untrackBeadsExports (anton init)", () => {
+  let dir: string;
+
+  function gitRepoWith(files: Record<string, string>): void {
+    spawnSync("git", ["init", "-q"], { cwd: dir });
+    spawnSync("git", ["config", "user.email", "t@example.com"], { cwd: dir });
+    spawnSync("git", ["config", "user.name", "anton-test"], { cwd: dir });
+    mkdirSync(join(dir, ".beads"), { recursive: true });
+    for (const [rel, body] of Object.entries(files)) writeFileSync(join(dir, rel), body);
+    spawnSync("git", ["add", "-A"], { cwd: dir });
+    spawnSync("git", ["commit", "-qm", "seed"], { cwd: dir });
+  }
+
+  const tracked = (): string[] =>
+    (spawnSync("git", ["ls-files", "--", ".beads/"], { cwd: dir, encoding: "utf8" }).stdout || "")
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean);
+
+  afterEach(async () => {
+    if (dir) await rm(dir, { recursive: true, force: true });
+  });
+
+  it("untracks a committed issues.jsonl while leaving real config files tracked", async () => {
+    dir = await mkdtemp(join(tmpdir(), "anton-untrack-"));
+    gitRepoWith({
+      ".beads/issues.jsonl": '{"id":"x-1","status":"open"}\n',
+      ".beads/config.yaml": "issue-prefix: x\n",
+    });
+    expect(tracked()).toContain(".beads/issues.jsonl");
+
+    const r = untrackBeadsExports(dir);
+
+    expect(r.untracked).toEqual([".beads/issues.jsonl"]);
+    expect(tracked()).not.toContain(".beads/issues.jsonl");
+    // config.yaml is team-config and must stay in git.
+    expect(tracked()).toContain(".beads/config.yaml");
+    // Untracked, not deleted — the export is still on disk for bd to use.
+    await expect(stat(join(dir, ".beads/issues.jsonl"))).resolves.toBeDefined();
+  });
+
+  it("is a no-op when nothing is tracked", async () => {
+    dir = await mkdtemp(join(tmpdir(), "anton-untrack-"));
+    gitRepoWith({ ".beads/config.yaml": "issue-prefix: x\n" });
+
+    const r = untrackBeadsExports(dir);
+
+    expect(r.untracked).toEqual([]);
+    expect(tracked()).toEqual([".beads/config.yaml"]);
+  });
+
+  it("does not throw outside a git repo", async () => {
+    dir = await mkdtemp(join(tmpdir(), "anton-untrack-"));
+    mkdirSync(join(dir, ".beads"), { recursive: true });
+    expect(untrackBeadsExports(dir).untracked).toEqual([]);
+  });
+});
+
 describe("detectHooksManager (anton init — hooks warning, anton-43b)", () => {
   let dir: string;
   afterEach(async () => {
@@ -212,14 +274,14 @@ describe("configureBeadsDoltSync (anton init — skip branches, anton-43b)", () 
 
   it("returns no-workspace when there is no .beads/", async () => {
     dir = await mkdtemp(join(tmpdir(), "anton-dolt-"));
-    expect(configureBeadsDoltSyncForRepo({ repoDir: dir })).toEqual({ status: "no-workspace" });
+    expect(configureBeadsDoltSync({ repoDir: dir })).toEqual({ status: "no-workspace" });
   });
 
   it("returns no-remote when the repo has no origin remote", async () => {
     dir = await mkdtemp(join(tmpdir(), "anton-dolt-"));
     mkdirSync(join(dir, ".beads"), { recursive: true });
     spawnSync("git", ["-C", dir, "init"], { stdio: "ignore" });
-    expect(configureBeadsDoltSyncForRepo({ repoDir: dir })).toEqual({ status: "no-remote" });
+    expect(configureBeadsDoltSync({ repoDir: dir })).toEqual({ status: "no-remote" });
   });
 });
 
@@ -396,20 +458,24 @@ describe("provisionAgentsSkills (into a temp ~/.claude)", () => {
 
     // Non-interactive selection via flag so no TTY prompt is needed.
     const first = await provisionAgentsSkills(["--agents", "nextjs"], { claudeRoot, appRoot: REPO_ROOT });
-    expect(first.installed).toBe(REQUIRED_SKILLS.length + 1); // 4 skills + 1 agent
-    for (const req of REQUIRED_SKILLS) expect(await exists(skillPath(req))).toBe(true);
+    expect(first.installed).toBe(INSTALLED_SKILLS.length + 1); // 5 skills (incl. setup) + 1 agent
+    for (const req of INSTALLED_SKILLS) expect(await exists(skillPath(req))).toBe(true);
     expect(await exists(join(claudeRoot, "agents", "nextjs.md"))).toBe(true);
+    // setup's bundled templates travel with the skill directory (anton-olh).
+    expect(
+      await exists(join(claudeRoot, "skills", "setup", "templates", ".product", "PRODUCT.md")),
+    ).toBe(true);
 
     // Re-run: everything already present, zero writes.
     const second = await provisionAgentsSkills(["--agents", "nextjs"], { claudeRoot, appRoot: REPO_ROOT });
     expect(second.installed).toBe(0);
-    expect(second.skipped).toBe(REQUIRED_SKILLS.length + 1);
+    expect(second.skipped).toBe(INSTALLED_SKILLS.length + 1);
   });
 
   it("with --no-agents installs only the required skills", async () => {
     claudeRoot = await mkdtemp(join(tmpdir(), "anton-claude-"));
     const r = await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
-    expect(r.installed).toBe(REQUIRED_SKILLS.length);
+    expect(r.installed).toBe(INSTALLED_SKILLS.length);
     expect(r.agents).toEqual([]);
     expect(await exists(join(claudeRoot, "agents"))).toBe(false);
   });
@@ -428,6 +494,7 @@ const FAKE_BD = [
   'const beads = path.join(process.cwd(), ".beads");',
   'const cfg = path.join(beads, "config.yaml");',
   'const marker = path.join(beads, ".fake-dolt-remotes");',
+  'const setlog = path.join(beads, ".fake-config-set-order");',
   // onPath() probes --version/--help.
   'if (a[0] === "--version" || a[0] === "--help") { console.log("bd 0.0.0-fake"); process.exit(0); }',
   // `bd init` creates the workspace; the team-config keys are intentionally left OUT so the
@@ -442,6 +509,9 @@ const FAKE_BD = [
   // `bd config set` patches an existing uncommented `key:` line in place (drift), else appends it.
   'if (a[0] === "config" && a[1] === "set") {',
   "  const key = a[2], val = a[3];",
+  // Record each enforced key in order so tests can assert export.auto is disabled FIRST (anton-1th):
+  // a real `bd config set` write regenerates the JSONL under export.auto=true, so ordering matters.
+  '  try { fs.appendFileSync(setlog, key + "\\n"); } catch {}',
   '  let text = ""; try { text = fs.readFileSync(cfg, "utf8"); } catch {}',
   '  const lines = text.split("\\n");',
   "  let replaced = false;",
@@ -551,6 +621,9 @@ describe("anton init (end-to-end, bd stubbed on PATH)", () => {
     // config.yaml carries the enforced Dolt-first keys…
     const cfg = await readFile(join(dir, ".beads", "config.yaml"), "utf8");
     expect(cfg).toContain("dolt.auto-commit: on");
+    // export.auto AND export.git-add are both disabled — export.auto stops the periodic JSONL
+    // regeneration itself, export.git-add only stops staging it (anton-1th).
+    expect(cfg).toContain("export.auto: false");
     expect(cfg).toContain("export.git-add: false");
     // …and .gitignore untracks the derived exports + Dolt runtime state.
     const gi = await readFile(join(dir, ".beads", ".gitignore"), "utf8");
@@ -581,10 +654,11 @@ describe("anton init (end-to-end, bd stubbed on PATH)", () => {
   it("patches a drifted config.yaml key without clobbering the file (config-drift patch)", async () => {
     const dir = await tmp("anton-init-");
     gitInit(dir, true);
-    // A pre-existing workspace whose config.yaml has a DRIFTED value + a missing key. Because .beads/
-    // is present, init skips `bd init` and only enforces the team-config keys.
+    // A pre-existing workspace whose config.yaml has DRIFTED values + a missing key. Because .beads/
+    // is present, init skips `bd init` and only enforces the team-config keys. export.auto: true is
+    // the inherited bd default anton must flip to false (anton-1th).
     mkdirSync(join(dir, ".beads"), { recursive: true });
-    writeFileSync(join(dir, ".beads", "config.yaml"), "# beads config\ndolt.auto-commit: off\n");
+    writeFileSync(join(dir, ".beads", "config.yaml"), "# beads config\ndolt.auto-commit: off\nexport.auto: true\n");
 
     const r = runInit(dir);
     expect(r.status).toBe(0);
@@ -592,21 +666,31 @@ describe("anton init (end-to-end, bd stubbed on PATH)", () => {
     const cfg = await readFile(join(dir, ".beads", "config.yaml"), "utf8");
     expect(cfg).toContain("dolt.auto-commit: on"); // drift patched in place…
     expect(cfg).not.toContain("dolt.auto-commit: off"); // …not left alongside the stale value
+    expect(cfg).toContain("export.auto: false"); // export.auto=true flipped to false…
+    expect(cfg).not.toContain("export.auto: true"); // …patched in place, not duplicated
+    expect((cfg.match(/^export\.auto:/gm) ?? []).length).toBe(1); // exactly one export.auto key
     expect(cfg).toContain("export.git-add: false"); // missing key appended
+
+    // export.auto=false is enforced BEFORE any other `bd config set` write (anton-1th): each write is
+    // itself a bd command that regenerates the JSONL while export.auto is still true, so disabling it
+    // first closes that window. dolt.auto-commit here is drifted (off), so it too issues a write.
+    const order = (await readFile(join(dir, ".beads", ".fake-config-set-order"), "utf8")).trim().split("\n");
+    expect(order.indexOf("export.auto")).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf("export.auto")).toBeLessThan(order.indexOf("dolt.auto-commit"));
   });
 });
 
-describe("normalizeGitUrl", () => {
+describe("normalizeRemoteUrl", () => {
   it("equates the git-origin form with what bd dolt remote list reports", () => {
     // bd rewrites scp form to git+ssh:// with a literal /./ path segment.
-    expect(normalizeGitUrl("git@github.com:henriblancke/anton.git")).toBe(
-      normalizeGitUrl("git+ssh://git@github.com/./henriblancke/anton.git"),
+    expect(normalizeRemoteUrl("git@github.com:henriblancke/anton.git")).toBe(
+      normalizeRemoteUrl("git+ssh://git@github.com/./henriblancke/anton.git"),
     );
-    expect(normalizeGitUrl("https://github.com/org/repo.git")).toBe(
-      normalizeGitUrl("git+https://github.com/org/repo.git"),
+    expect(normalizeRemoteUrl("https://github.com/org/repo.git")).toBe(
+      normalizeRemoteUrl("git+https://github.com/org/repo.git"),
     );
-    expect(normalizeGitUrl("/tmp/remote.git")).toBe(normalizeGitUrl("git+file:///tmp/remote.git"));
-    expect(normalizeGitUrl("https://github.com/a/b")).not.toBe(normalizeGitUrl("https://github.com/a/c"));
+    expect(normalizeRemoteUrl("/tmp/remote.git")).toBe(normalizeRemoteUrl("git+file:///tmp/remote.git"));
+    expect(normalizeRemoteUrl("https://github.com/a/b")).not.toBe(normalizeRemoteUrl("https://github.com/a/c"));
   });
 });
 

@@ -15,8 +15,9 @@ import {
   DialogFooter,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { cn } from "@/lib/utils";
 import { MetaChip, PrLink, RelativeTime, StagePill } from "@/components/atoms";
+import { ClaimControl, InheritedOwner, StaticOwner } from "@/components/board/claim-control";
+import { PrLinkControl } from "@/components/board/pr-link-control";
 import {
   AGENT_OPTIONS,
   PRIORITY_LABELS,
@@ -95,6 +96,10 @@ function TicketDialogBody({
   const [attempt, setAttempt] = useState(0);
   const [draft, setDraft] = useState<TicketDraft | null>(null);
   const [saving, setSaving] = useState(false);
+  // Optimistic run/approve state, mirroring the standalone chip: flip the affordance to Force run
+  // immediately on our own click and revert on failure. The board's own poll refreshes the truth.
+  const [running, setRunning] = useState(false);
+  const [optimisticApproved, setOptimisticApproved] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -146,6 +151,23 @@ function TicketDialogBody({
     }
   }
 
+  // After a PR link the bead's external-ref AND stage labels change (→ in-review). Refetch the
+  // dialog's own detail, then hand the fresh detail to onSaved so the parent surface (e.g.
+  // TicketsView, which has no polling and only refreshes via onSaved/onDeleted) updates the row's
+  // stage indicator too — otherwise it shows a stale stage until the next manual save/refresh.
+  async function reloadAfterLink() {
+    try {
+      const res = await fetch(`/api/projects/${slug}/tickets/${ticketId}`);
+      if (!res.ok) return;
+      const data = (await res.json()) as { detail: TicketDetail };
+      setDetail(data.detail);
+      setDraft(draftFromDetail(data.detail));
+      onSaved?.(data.detail);
+    } catch {
+      // best-effort; the link already succeeded server-side and the board's own reads will catch up.
+    }
+  }
+
   async function remove() {
     const res = await fetch(`/api/projects/${slug}/tickets/${ticketId}`, { method: "DELETE" });
     if (!res.ok) {
@@ -156,6 +178,29 @@ function TicketDialogBody({
     toast.success("Ticket deleted");
     onDeleted?.(ticketId);
     onClose();
+  }
+
+  // A standalone task/bug is its own run target, so approval is its run trigger — the same T2 route
+  // an epic uses (validates the id is a real run target). Re-approving an already-approved target
+  // re-triggers the run (Force run), resuming from where it stopped. A child ticket has no run of
+  // its own (it runs via its epic's PR), so the affordance is hidden for it; the route 422s it too.
+  async function run(wasApproved: boolean) {
+    if (!detail) return;
+    setRunning(true);
+    setOptimisticApproved(true);
+    try {
+      const res = await fetch(`/api/projects/${slug}/epics/${ticketId}/approve`, { method: "POST" });
+      if (!res.ok) {
+        const { error: message } = await res.json().catch(() => ({ error: "Run failed" }));
+        throw new Error(message ?? "Run failed");
+      }
+      toast.success(wasApproved ? `Re-running "${detail.title}"` : `Approved & running "${detail.title}"`);
+    } catch (err) {
+      setOptimisticApproved(false);
+      toast.error(err instanceof Error ? err.message : "Failed to start run");
+    } finally {
+      setRunning(false);
+    }
   }
 
   if (error) {
@@ -178,6 +223,17 @@ function TicketDialogBody({
   const set = <K extends keyof TicketDraft>(key: K, value: TicketDraft[K]) =>
     setDraft({ ...draft, [key]: value });
 
+  // Only a parentless task/bug is a run target of its own (mirrors `beads.isRunTarget`, which the
+  // approve/claim routes gate on): a child ticket runs via its epic's PR, and a parentless
+  // `learning`/`chore`/etc. is never runnable, so its controls would only ever 422.
+  const isRunTarget = !detail.epicId && (detail.type === "task" || detail.type === "bug");
+  const approved = detail.approved || optimisticApproved;
+  // The run affordance is narrower than the claim control: a `done` (closed) standalone target has
+  // already finished its run and produced its PR, so re-approving it would only enqueue duplicate/
+  // no-op PR work. Hide the button there while keeping it for a still-runnable target — a fresh
+  // backlog approval or a Force run that resumes an in-flight (implementing/in-review) run.
+  const canRun = isRunTarget && detail.stage !== "done";
+
   return (
     <div className="flex flex-col gap-4">
       {/* header — read-only identity */}
@@ -190,22 +246,51 @@ function TicketDialogBody({
             · {detail.type}
           </span>
           <StagePill stage={detail.stage} />
-          {detail.prRef && (
-            <PrLink href={detail.prUrl}>
-              <MetaChip tone="pr">
-                <GitPullRequestIcon className="size-2.5" aria-hidden="true" />
-                {detail.prUrl ? "PR" : detail.prRef}
-              </MetaChip>
-            </PrLink>
+          {isRunTarget ? (
+            // A standalone task/bug carries its own PR — let it be linked/relinked here (same
+            // /epics/<id>/pr route the epic detail uses). Linking flips it to in-review.
+            <PrLinkControl
+              slug={slug}
+              itemId={detail.id}
+              prRef={detail.prRef}
+              prUrl={detail.prUrl}
+              onLinked={reloadAfterLink}
+            />
+          ) : (
+            detail.prRef && (
+              <PrLink href={detail.prUrl}>
+                <MetaChip tone="pr">
+                  <GitPullRequestIcon className="size-2.5" aria-hidden="true" />
+                  {detail.prUrl ? "PR" : detail.prRef}
+                </MetaChip>
+              </PrLink>
+            )
           )}
         </div>
         {/* claimed-by + created — mirrors the epic detail + tickets list surfaces */}
-        <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1 text-[11px] text-subtle">
-          <span>
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-subtle">
+          <span className="inline-flex items-center gap-1.5">
             Claimed by{" "}
-            <span className={cn(detail.assignee ? "text-foreground/85" : "text-subtle")}>
-              {detail.assignee ?? "Unclaimed"}
-            </span>
+            {isRunTarget ? (
+              // A parentless task/bug is a run target — claimable on its own (same isRunTarget gate
+              // the claim route enforces).
+              <ClaimControl
+                slug={slug}
+                itemId={detail.id}
+                owner={detail.assignee}
+                variant="row"
+                readOnly={approved}
+                canTakeOver={detail.stage === "backlog"}
+                onChanged={() => setAttempt((n) => n + 1)}
+              />
+            ) : detail.epicId ? (
+              // A child ticket inherits its epic's human claim and has no control of its own.
+              <InheritedOwner owner={detail.epicAssignee ?? null} />
+            ) : (
+              // A parentless non-run-target (learning/chore/etc.) can't be claimed — the claim route
+              // 422s it — so its owner shows read-only, matching the hidden Approve & run control.
+              <StaticOwner owner={detail.assignee} />
+            )}
           </span>
           <span>
             Created <RelativeTime iso={detail.createdAt} className="text-foreground/85" />
@@ -303,6 +388,21 @@ function TicketDialogBody({
       <DialogFooter className="sm:justify-between">
         <ConfirmDeleteButton onConfirm={remove} label="Delete ticket" />
         <div className="flex gap-2">
+          {canRun && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => run(approved)}
+              disabled={running}
+              title={
+                approved
+                  ? "Re-trigger the run (resumes from where it stopped)"
+                  : "Approve and start the run"
+              }
+            >
+              {running ? "Starting…" : approved ? "Force run" : "Approve & run"}
+            </Button>
+          )}
           <Button
             variant="ghost"
             size="sm"

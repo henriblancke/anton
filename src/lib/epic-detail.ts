@@ -56,13 +56,13 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
   );
   const tickets = childBeads.map(toTicket);
 
-  // The epic-detail header historically shows agent/risk/size per-ticket (in the graph), not on
-  // the epic itself — so `chips: false` keeps this view byte-identical. See ticket-view.ts.
+  // The epic-detail header shows the epic's own agent/risk/size chips (like the board card and the
+  // single-ticket pseudo-epic) so an epic with risk:/size: labels doesn't silently drop them. See
+  // ticket-view.ts; `chips` defaults to true.
   const epic = toEpic(lite, {
     goal: parseGoal(full.description),
     acceptance: parseAcceptance(full),
     tickets,
-    chips: false,
   });
   attachPrUrl(epic, base);
   for (const t of tickets) attachPrUrl(t, base);
@@ -90,7 +90,11 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
 export async function deleteEpic(project: Project, epicId: string): Promise<void> {
   await beads.show(project.repoPath, epicId); // 404 guard — bd throws on an unknown id
   await beads.delete(project.repoPath, epicId, { cascade: true });
-  await beads
+  // Fire-and-forget (like the claim route's nudgeSync): the delete already landed locally, so don't
+  // block the response on a `bd dolt pull/commit/push` a slow/unreachable remote could stall. A
+  // failed push is recorded as "failing"/unpushed in the sync-status registry inside beads.sync and
+  // retried by the E1 heartbeat backstop — this catch only keeps the rejection from floating.
+  void beads
     .sync(project.repoPath)
     .catch((e) =>
       console.error(`[epic-detail] beads dolt sync failed after deleting ${epicId}`, e),
