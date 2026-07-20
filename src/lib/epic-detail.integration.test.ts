@@ -5,7 +5,7 @@
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beads } from "./beads/bd";
@@ -23,6 +23,23 @@ function has(cmd: string): boolean {
 }
 
 const suite = has("bd") && has("git") ? describe : describe.skip;
+
+type SeedNode = { key: string; title: string; type: "epic" | "task" | "bug" };
+type SeedEdge = { from_key: string; to_key: string; type: string };
+
+/**
+ * Seed many beads in ONE `bd create --graph` call, returning the key → real-id map. Seeding via
+ * `beads.create` shells out (and takes the Dolt lock) per bead, which costs seconds per bead under
+ * full-suite CPU contention; the batch path is a single process for the whole graph.
+ */
+function seedGraph(cwd: string, nodes: SeedNode[], edges: SeedEdge[] = []): Record<string, string> {
+  const plan = join(cwd, "seed-plan.json");
+  writeFileSync(plan, JSON.stringify({ nodes, edges }));
+  const out = execFileSync("bd", ["create", "--graph", plan, "--json"], { cwd, encoding: "utf8" });
+  const { ids, error } = JSON.parse(out) as { ids?: Record<string, string>; error?: string };
+  if (!ids) throw new Error(`bd create --graph failed: ${error ?? out}`);
+  return ids;
+}
 
 suite("epic-detail integration (real bd)", () => {
   let repo: string;
@@ -114,22 +131,29 @@ suite("epic-detail integration (real bd)", () => {
   // epic's tickets were silently truncated (planar showed 3 of 5, 1 of 6). beads.list must pass
   // --limit 0 so ALL children come back regardless of repo size.
   it("returns ALL of an epic's tickets even when the repo has >50 issues", async () => {
-    const epicId = await beads.create(repo, {
-      title: "Big epic",
-      type: "epic",
-      description: "## Goal\nMany tickets.",
-    });
-    // Create 8 real children under the epic…
-    const childIds: string[] = [];
-    for (let i = 0; i < 8; i++) {
-      const id = await beads.create(repo, { title: `Child ${i}`, type: "task" });
-      await beads.link(repo, id, epicId, "parent-child");
-      childIds.push(id);
-    }
-    // …and enough unrelated beads to push the total well past bd's default 50-result cap.
-    for (let i = 0; i < 60; i++) {
-      await beads.create(repo, { title: `Filler ${i}`, type: "task" });
-    }
+    // 8 real children under the epic, plus enough unrelated beads to push the repo well past bd's
+    // default 50-result cap — all seeded in one batch (anton-0oi: per-bead creates timed out here).
+    const nodes: SeedNode[] = [
+      { key: "epic", title: "Big epic", type: "epic" },
+      ...Array.from({ length: 8 }, (_, i) => ({
+        key: `c${i}`,
+        title: `Child ${i}`,
+        type: "task" as const,
+      })),
+      ...Array.from({ length: 60 }, (_, i) => ({
+        key: `f${i}`,
+        title: `Filler ${i}`,
+        type: "task" as const,
+      })),
+    ];
+    const edges: SeedEdge[] = Array.from({ length: 8 }, (_, i) => ({
+      from_key: `c${i}`,
+      to_key: "epic",
+      type: "parent-child",
+    }));
+    const ids = seedGraph(repo, nodes, edges);
+    const epicId = ids.epic;
+    const childIds = Array.from({ length: 8 }, (_, i) => ids[`c${i}`]);
 
     const detail = await getEpicDetail(project, epicId);
     const got = new Set(detail.tickets.map((t) => t.id));
@@ -137,9 +161,7 @@ suite("epic-detail integration (real bd)", () => {
       expect(got.has(id), `child ${id} present`).toBe(true);
     }
     expect(detail.tickets.length).toBe(childIds.length);
-    // Real bd shells out per create; 68 beads plus the cold fresh read run past the default 60s on a
-    // loaded machine (the per-test snapshot reset means the final read is a true fresh `bd list`).
-  }, 120_000);
+  }, 60_000);
 
   // Regression for anton-noc (secondary): an orphan (parentless) non-epic bead is shown on the
   // board as a single-ticket card; opening it must return a single-ticket detail, not 404/throw.
