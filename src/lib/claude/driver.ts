@@ -1,14 +1,18 @@
 /**
- * Headless claude driver (anton-dzh.3). Spawns `claude -p` for autonomous work: injects the
- * ticket's agent-tag prompt via --append-system-prompt, --model from settings, cwd = worktree;
- * streams stream-json events out (for the session log + UI SSE) and detects usage-limit signals
- * so the runner can back off. See DESIGN.md §5.
+ * Headless claude driver (anton-dzh.3). Spawns `claude -p` for autonomous work: delivers the task
+ * prompt on the child's stdin and the composed system prompt via --append-system-prompt-file, so no
+ * bead or contract text ever lands on the process command line (anton-14tj) — `ps` during a run
+ * shows neither. --model from settings, cwd = worktree; streams stream-json events out (for the
+ * session log + UI SSE) and detects usage-limit signals so the runner can back off. See DESIGN.md §5.
  *
  * ── CONTRACT (locked — implement the bodies, keep these signatures) ──
  * The execute-epic job depends on exactly these exports. Usage limits MUST surface as the
  * shared `UsageLimitError` so the runner parks + reschedules (never a plain throw).
  */
 import { spawn } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { RecoverableClaudeError, UsageLimitError } from "../jobs/errors";
 
 /** Override the claude binary (tests point this at a fake stream-json emitter). */
@@ -39,9 +43,9 @@ export interface ClaudeResult {
 export interface RunClaudeOptions {
   /** Working directory — the run's worktree. */
   cwd: string;
-  /** The task prompt (the `-p` value). */
+  /** The task prompt — delivered on the child's stdin, never on argv (anton-14tj). */
   prompt: string;
-  /** Injected via --append-system-prompt (the resolved agent prompt). */
+  /** The composed system prompt — written to a temp file and passed via --append-system-prompt-file. */
   appendSystemPrompt?: string;
   /** --model; falls back to claude's default when omitted. */
   model?: string;
@@ -271,18 +275,41 @@ export async function runClaude(opts: RunClaudeOptions): Promise<ClaudeResult> {
   }
   const bin = binOverride ?? "claude";
 
-  const args = ["-p", opts.prompt, "--output-format", "stream-json", "--verbose"];
+  // Keep the prompt AND the system prompt off argv so no bead/contract text is visible in `ps`
+  // during an autonomous run (anton-14tj): the task prompt goes on stdin, and the composed system
+  // prompt is written to a temp file passed via --append-system-prompt-file. The temp dir is removed
+  // in `finally` below, so it survives neither a throw nor an abort.
+  let systemPromptDir: string | undefined;
+  let systemPromptFile: string | undefined;
+  if (opts.appendSystemPrompt) {
+    systemPromptDir = mkdtempSync(join(tmpdir(), "anton-claude-sys-"));
+    systemPromptFile = join(systemPromptDir, "system-prompt.txt");
+    writeFileSync(systemPromptFile, opts.appendSystemPrompt, "utf8");
+  }
+  const cleanupSystemPrompt = () => {
+    if (!systemPromptDir) return;
+    try {
+      rmSync(systemPromptDir, { recursive: true, force: true });
+    } catch {
+      // Best-effort: a leaked temp file is harmless next to losing the real result/error.
+    }
+    systemPromptDir = undefined;
+  };
+
+  // `-p` is now the bare print-mode flag (no positional prompt) — the prompt arrives on stdin.
+  const args = ["-p", "--output-format", "stream-json", "--verbose"];
   // Resume an interrupted session in-place (anton-juar) — continue the same conversation rather than
   // spawning fresh. Placed first so it reads clearly in the recorded argv; order is otherwise moot.
+  // The continuation prompt is delivered on stdin exactly like a fresh run.
   if (opts.resumeSessionId) args.unshift("--resume", opts.resumeSessionId);
-  if (opts.appendSystemPrompt) args.push("--append-system-prompt", opts.appendSystemPrompt);
+  if (systemPromptFile) args.push("--append-system-prompt-file", systemPromptFile);
   if (opts.model) args.push("--model", opts.model);
   args.push("--permission-mode", opts.permissionMode ?? "bypassPermissions");
   if (opts.allowedTools && opts.allowedTools.length > 0) {
     args.push("--allowedTools", opts.allowedTools.join(","));
   }
 
-  return new Promise<ClaudeResult>((resolve, reject) => {
+  const runPromise = new Promise<ClaudeResult>((resolve, reject) => {
     const child = spawn(bin, args, {
       cwd: opts.cwd,
       signal: opts.signal,
@@ -307,6 +334,15 @@ export async function runClaude(opts: RunClaudeOptions): Promise<ClaudeResult> {
     // orphan descendants either.
     const onAbort = () => killTree("SIGTERM");
     opts.signal?.addEventListener("abort", onAbort, { once: true });
+
+    // Deliver the task prompt on stdin, then close it. The 'error' listener swallows EPIPE for the
+    // case the child exits before the prompt is fully written (a large prompt outlives a child that
+    // died early / never read stdin) — without it that write would surface as an unhandled error and
+    // fail an otherwise-classified run (anton-14tj).
+    if (child.stdin) {
+      child.stdin.on("error", () => {});
+      child.stdin.end(opts.prompt);
+    }
 
     let stdoutBuf = "";
     let stderrBuf = "";
@@ -506,4 +542,8 @@ export async function runClaude(opts: RunClaudeOptions): Promise<ClaudeResult> {
       });
     });
   });
+
+  // Remove the system-prompt temp file on every path — success, throw, or abort — while passing the
+  // original result/error through unchanged.
+  return runPromise.finally(cleanupSystemPrompt);
 }

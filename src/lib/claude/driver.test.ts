@@ -669,6 +669,59 @@ describe("runClaude", () => {
     expect(result.text).toBe("ok");
   });
 
+  it("delivers the task prompt on stdin and the system prompt via --append-system-prompt-file, with neither on argv (anton-14tj)", async () => {
+    // The whole point of anton-14tj: no bead/contract text may land on the child's command line, so
+    // `ps` during an autonomous run reveals neither. A fake that echoes its stdin and the contents of
+    // the file named by --append-system-prompt-file proves both arrived by those channels, and that
+    // argv carries neither the prompt body nor the system-prompt body (and never --append-system-prompt).
+    const dumpPath = join(dir, "stdin-echo-dump.json");
+    const path = join(dir, "stdin-echo-claude");
+    const body = [
+      "#!/usr/bin/env node",
+      "const fs = require('node:fs');",
+      "const a = process.argv.slice(2);",
+      "const get = (f) => { const i = a.indexOf(f); return i >= 0 ? a[i + 1] : undefined; };",
+      "const sysFile = get('--append-system-prompt-file');",
+      "const append = sysFile ? fs.readFileSync(sysFile, 'utf8') : undefined;",
+      "let stdin = '';",
+      "process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data', (c) => { stdin += c; });",
+      "process.stdin.on('end', () => {",
+      `  fs.writeFileSync(${JSON.stringify(dumpPath)}, JSON.stringify({ stdin, append, argv: a }));`,
+      "  process.stdout.write(JSON.stringify({ type: 'result', is_error: false, session_id: 'sess-stdin', result: 'ok' }) + '\\n');",
+      "  process.exit(0);",
+      "});",
+      "",
+    ].join("\n");
+    writeFileSync(path, body, "utf8");
+    chmodSync(path, 0o755);
+    process.env[CLAUDE_BIN_ENV] = path;
+
+    const promptBody = "PROMPT_MARKER_QZX implement ticket anton-14tj";
+    const systemBody = "SYSTEM_MARKER_QZX operating contract for the run";
+    const result = await runClaude({
+      cwd: dir,
+      prompt: promptBody,
+      appendSystemPrompt: systemBody,
+    });
+
+    expect(result.ok).toBe(true);
+    const dump = JSON.parse(readFileSync(dumpPath, "utf8")) as {
+      stdin: string;
+      append?: string;
+      argv: string[];
+    };
+    // Both prompts arrived by their off-argv channel.
+    expect(dump.stdin).toBe(promptBody);
+    expect(dump.append).toBe(systemBody);
+    // Neither body is visible on the command line, and the inline flag is never used.
+    const joinedArgv = dump.argv.join(" ");
+    expect(joinedArgv).not.toContain("PROMPT_MARKER_QZX");
+    expect(joinedArgv).not.toContain("SYSTEM_MARKER_QZX");
+    expect(dump.argv).not.toContain("--append-system-prompt");
+    expect(dump.argv).toContain("--append-system-prompt-file");
+  });
+
   it("surfaces a transient mid-stream death as a RecoverableClaudeError carrying the init session id (anton-juar)", async () => {
     // A run that emits the `system` init event (carrying session_id) and then dies mid-stream —
     // "Connection closed mid-response" on stderr, exit 1, NO final result event. The session id is
