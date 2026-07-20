@@ -4,7 +4,7 @@
  * Mirrors the read/parse patterns in epic-detail.ts and tickets.ts. See DESIGN.md §2/§3.
  */
 import { beads, type BeadPatch } from "./beads/bd";
-import { allIssues } from "./beads/issues";
+import { allIssues, ensureDescription } from "./beads/issues";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
 import { createdMeta, deriveStage, labelValue, parseAcceptance, parseGoal } from "./ticket-view";
 import { listAllBeads } from "./tickets";
@@ -57,8 +57,8 @@ export async function getTicketDetail(project: Project, id: string): Promise<Tic
   if (!lite) {
     throw new Error(`Ticket not found: ${id}`);
   }
-  // `bd list` omits the description, so fetch the bead once for its goal/acceptance markdown.
-  const full = await beads.show(project.repoPath, id).catch(() => lite);
+  // Serve the contract off the snapshot bead; only a description the list dropped costs a `bd show`.
+  const full = await ensureDescription(project.repoPath, lite);
 
   const parentId = parentOf(lite);
   const epic = parentId ? all.find((b) => b.id === parentId) : undefined;

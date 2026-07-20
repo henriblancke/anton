@@ -1,5 +1,6 @@
 import { beads, type Bead } from "./bd";
 import {
+  getBeadDescription,
   getIssueSnapshot,
   probeIssueSnapshot,
   readIssueSnapshot,
@@ -41,4 +42,20 @@ export function refreshAllIssues(cwd: string): Promise<Bead[]> {
 
 export function probeAllIssues(cwd: string): void {
   probeIssueSnapshot(cwd, () => loadAllIssues(cwd));
+}
+
+/**
+ * Return a snapshot bead guaranteed to carry its description, so detail views can be served off the
+ * already-loaded list without a fresh `bd show`. `bd list --json` carries the description on
+ * structured boards, so a snapshot bead is returned as-is — zero bd spawns. When the list omits it
+ * (the one field it can drop), the description is fetched once via `bd show` and memoized (see
+ * getBeadDescription), so repeat opens of the same bead stay warm.
+ */
+export async function ensureDescription(cwd: string, lite: Bead): Promise<Bead> {
+  if (lite.description !== undefined) return lite;
+  const description = await getBeadDescription(cwd, lite.id, async () => {
+    const full = await beads.show(cwd, lite.id).catch(() => undefined);
+    return full?.description;
+  });
+  return { ...lite, description };
 }

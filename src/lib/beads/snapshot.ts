@@ -32,10 +32,43 @@ export interface SnapshotRead {
 }
 
 const SNAPSHOTS_KEY = Symbol.for("anton.beads.issueSnapshots");
+const DESCRIPTIONS_KEY = Symbol.for("anton.beads.beadDescriptions");
 
 function snapshots(): Map<string, SnapshotEntry> {
   const global = globalThis as unknown as Record<symbol, Map<string, SnapshotEntry> | undefined>;
   return (global[SNAPSHOTS_KEY] ??= new Map());
+}
+
+/** Per-repo memo of the one field `bd list` can drop — a bead's description — keyed by bead id. */
+function descriptionCaches(): Map<string, Map<string, string>> {
+  const global = globalThis as unknown as Record<
+    symbol,
+    Map<string, Map<string, string>> | undefined
+  >;
+  return (global[DESCRIPTIONS_KEY] ??= new Map());
+}
+
+/**
+ * Serve a bead's description from the per-repo memo, loading it once (via `bd show`) on a miss. The
+ * list snapshot carries most fields but can omit the description; this memoizes that single lazy
+ * fetch so repeat detail opens of the same bead don't re-spawn bd. A loader that yields no
+ * description is memoized as empty, so a genuinely description-less bead still costs at most one
+ * spawn. The memo is cleared whenever the snapshot is invalidated (a local write or a remote pull
+ * may have changed the description), so a stale description can never outlive the write that changed it.
+ */
+export async function getBeadDescription(
+  cwd: string,
+  id: string,
+  loader: () => Promise<string | undefined>,
+): Promise<string> {
+  const caches = descriptionCaches();
+  const cache = caches.get(cwd) ?? new Map<string, string>();
+  if (!caches.has(cwd)) caches.set(cwd, cache);
+  const cached = cache.get(id);
+  if (cached !== undefined) return cached;
+  const description = (await loader()) ?? "";
+  cache.set(id, description);
+  return description;
 }
 
 function entryFor(cwd: string): SnapshotEntry {
@@ -73,6 +106,9 @@ export function invalidateIssueSnapshot(cwd: string, localWrite = false): void {
   const entry = entryFor(cwd);
   entry.loadedAt = 0;
   entry.generation += 1;
+  // A lazily-fetched description may now be stale (a write or a remote pull can change it), so drop
+  // the memo alongside the snapshot rather than serve a description that predates the change.
+  descriptionCaches().get(cwd)?.clear();
   if (localWrite) {
     entry.version += 1;
     // A post-write read must start after the write, never share a loader that started before it.
@@ -176,4 +212,5 @@ export function probeIssueSnapshot(cwd: string, loader: () => Promise<Bead[]>): 
 /** Test-only reset; repository runtime code should invalidate instead. */
 export function resetIssueSnapshots(): void {
   snapshots().clear();
+  descriptionCaches().clear();
 }

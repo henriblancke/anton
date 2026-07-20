@@ -8,6 +8,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { beads } from "./beads/bd";
 import { invalidateIssueSnapshot, resetIssueSnapshots } from "./beads/snapshot";
+import { allIssues } from "./beads/issues";
 import { getTicketDetail, updateTicket } from "./ticket-detail";
 import type { Bead } from "./beads/bd";
 import type { Project } from "./types";
@@ -45,6 +46,41 @@ function fakeBd(board: Bead[]) {
   vi.spyOn(beads, "sync").mockResolvedValue(undefined);
   return { list, show, update };
 }
+
+describe("getTicketDetail read economy", () => {
+  beforeEach(() => resetIssueSnapshots());
+  afterEach(() => vi.restoreAllMocks());
+
+  it("opens off the warm snapshot with zero bd spawns when the list carries the description", async () => {
+    const bd = fakeBd([
+      bead({ id: "t-1", title: "T", description: "## Goal\nShip it\n", labels: ["agent:nextjs"] }),
+    ]);
+    await allIssues(project.repoPath); // warm the board, as a real client already has
+    bd.list.mockClear();
+    bd.show.mockClear();
+
+    const detail = await getTicketDetail(project, "t-1");
+
+    expect(detail.goal).toBe("Ship it");
+    expect(detail.agent).toBe("nextjs");
+    expect(bd.list).not.toHaveBeenCalled(); // served off the warm snapshot
+    expect(bd.show).not.toHaveBeenCalled(); // description already in the snapshot — no cold spawn
+  });
+
+  it("fetches an absent description once, then reuses the memo", async () => {
+    const bd = fakeBd([bead({ id: "t-1", title: "T" })]); // no description on the list bead
+    await allIssues(project.repoPath);
+    bd.list.mockClear();
+    bd.show.mockClear();
+
+    await getTicketDetail(project, "t-1");
+    expect(bd.show).toHaveBeenCalledTimes(1); // the one genuinely-absent field triggers a lazy show
+
+    await getTicketDetail(project, "t-1");
+    expect(bd.show).toHaveBeenCalledTimes(1); // second open is served from the memo — still one spawn
+    expect(bd.list).not.toHaveBeenCalled();
+  });
+});
 
 describe("updateTicket read economy", () => {
   beforeEach(() => resetIssueSnapshots());
