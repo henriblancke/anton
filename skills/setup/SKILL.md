@@ -30,23 +30,33 @@ once per repo; it is **idempotent** — it skips anything already present, so re
 
 ## 2. Initialize beads
 
-Check for `.beads/` **at the repo root** (from step 1). If it is absent, run
-`bd init --non-interactive --skip-agents --skip-hooks` from the repo root. All three flags keep
-`bd init` safe for an agent-run scaffold and stop it from mutating the repo before the consent
-gate in step 6:
+Check for `.beads/` **at the repo root** (from step 1). This is the ONE reconciled `bd init` flag
+set anton uses everywhere (it matches `configureBeadsForRepo` in `src/lib/beads/config.mjs`, exported
+as `BD_INIT_FLAGS` — keep the two in sync). Cases:
 
-- `--non-interactive` — a bare `bd init` can drop into interactive setup wizards and prompt for
-  input, which would hang an agent-run `/setup`. This flag skips every prompt and uses sensible
-  defaults (`maintainer` role, auto-export enabled). It's auto-detected under CI/non-TTY, but
-  pass it explicitly so `/setup` is safe regardless of how it's invoked.
-- `--skip-agents` — a bare `bd init` writes/updates `AGENTS.md` by default, which would edit the
-  repo's agent instructions before the user has agreed (see step 6).
-- `--skip-hooks` — a bare `bd init` installs its own git hooks and overwrites `core.hooksPath`,
-  which would silently disable an existing Husky / lefthook / custom-`hooksPath` setup. Skip them
-  so `/setup` never clobbers the project's hook config uninvited.
+- **`.beads/` absent** → run `bd init --non-interactive --skip-hooks --skip-agents --dolt-auto-commit on`
+  from the repo root. The flags keep `bd init` safe for an agent-run scaffold and stop it from
+  mutating the repo before the consent gate in step 6:
+  - `--non-interactive` — a bare `bd init` can drop into interactive setup wizards and prompt for
+    input, which would hang an agent-run `/setup`. This flag skips every prompt and uses sensible
+    defaults (`maintainer` role). It's auto-detected under CI/non-TTY, but pass it explicitly so
+    `/setup` is safe regardless of how it's invoked.
+  - `--skip-hooks` — a bare `bd init` installs its own git hooks and overwrites `core.hooksPath`,
+    which would silently disable an existing Husky / lefthook / custom-`hooksPath` setup. Skip them
+    so `/setup` never clobbers the project's hook config uninvited (anton pushes Dolt explicitly on
+    every write, so bd's hydration hooks are redundant here anyway).
+  - `--skip-agents` — a bare `bd init` writes/updates `AGENTS.md` by default, which would edit the
+    repo's agent instructions before the user has agreed (see step 6).
+  - `--dolt-auto-commit on` — commit-after-each-write from the very first write, so nothing is left
+    uncommitted in the Dolt working set.
+- **`.beads/` present but no local Dolt DB** (a fresh clone — `.beads/config.yaml` is committed but
+  the Dolt runtime under `.beads/dolt/` is gitignored and never travels with the clone) → run
+  `bd bootstrap --non-interactive` from the repo root. Bootstrap hydrates the DB and wires the Dolt
+  remote from origin's `refs/dolt/data` — the recommended path for a fresh clone or a new machine.
+- **`.beads/` present with a local Dolt DB** → an already-initialized workspace; skip.
 
-Then confirm `bd ready --json` works. If `bd init` errors, **stop and say so** — do not leave a
-half-initialized project. If `.beads/` already exists, skip.
+Then confirm `bd ready --json` works. If `bd init`/`bd bootstrap` errors, **stop and say so** — do
+not leave a half-initialized project.
 
 ## 3. Detect the stack
 

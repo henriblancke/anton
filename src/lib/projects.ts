@@ -233,10 +233,14 @@ export async function updateProjectSettings(
  * through the UI/API converges to the same end state as one configured via `anton init`. Never
  * throws: a plain directory with no git/origin is skipped, and a beads-config failure is surfaced
  * (logged) but leaves the projects row intact. Returns whether `.beads/` exists afterwards.
+ *
+ * `prefix` (anton-ivtj) is threaded to `bd init` for a fresh repo with no `.beads/` yet, so the
+ * board's ticket-ID prefix is the operator's choice rather than bd's silent dir-name default. It is
+ * ignored once a workspace exists (enforcement-only re-run), so passing it on every add is safe.
  */
-function healBeads(repoPath: string): boolean {
+function healBeads(repoPath: string, prefix?: string): boolean {
   try {
-    const result = configureBeadsForRepo(repoPath);
+    const result = configureBeadsForRepo(repoPath, { prefix });
     if (result.errors.length) {
       console.warn(
         `[projects] beads config partial for ${repoPath}: ${result.errors.join("; ")}`,
@@ -247,11 +251,22 @@ function healBeads(repoPath: string): boolean {
     if (result.doltSync?.status === "configured") {
       // Push is non-fatal + reported (anton-8qx): the remote is wired locally even when the publish
       // push fails (e.g. no push access yet), so only claim refs/dolt/data is on origin when it is.
-      console.log(
-        result.doltSync.pushed === false
-          ? `[projects] Dolt remote wired for ${repoPath} — bd dolt push failed; retry once auth/network is available`
-          : `[projects] Dolt remote wired for ${repoPath} (refs/dolt/data on origin)`,
-      );
+      // A failed FIRST publish leaves the remote EMPTY (nothing for the next clone to bootstrap
+      // from) — warn LOUD on that case rather than logging it as a routine retry note.
+      if (result.doltSync.pushed !== false) {
+        console.log(`[projects] Dolt remote wired for ${repoPath} (refs/dolt/data on origin)`);
+      } else if (result.doltSync.firstPublish) {
+        console.warn(
+          `[projects] Dolt remote wired for ${repoPath} but the FIRST publish failed after ` +
+            `${result.doltSync.pushAttempts} attempts — origin has no refs/dolt/data yet (empty remote); ` +
+            `retry \`bd dolt pull && bd dolt push\` once auth/network is available`,
+        );
+      } else {
+        console.warn(
+          `[projects] Dolt remote wired for ${repoPath} — bd dolt push failed after ` +
+            `${result.doltSync.pushAttempts} attempts; retry once auth/network is available`,
+        );
+      }
     }
     if (result.hooksWarning) {
       // Hooks are optional for anton-driven repos (runner pushes Dolt explicitly); just note the
@@ -380,7 +395,12 @@ export async function deleteProject(slug: string): Promise<void> {
   }
 }
 
-export async function addProject(input: { name?: string; repoPath: string }): Promise<Project> {
+export async function addProject(input: {
+  name?: string;
+  repoPath: string;
+  /** Ticket-ID prefix for a fresh `bd init` (anton-ivtj). Ignored when the repo already has a board. */
+  prefix?: string;
+}): Promise<Project> {
   const repoPath = resolve(input.repoPath);
   if (!existsSync(repoPath)) {
     throw new Error(`repoPath does not exist: ${repoPath}`);
@@ -397,7 +417,7 @@ export async function addProject(input: { name?: string; repoPath: string }): Pr
     .where(eq(schema.projects.repoPath, repoPath))
     .limit(1);
   if (existing[0]) {
-    healBeads(repoPath);
+    healBeads(repoPath, input.prefix);
     return toProject(existing[0]);
   }
 
@@ -427,8 +447,9 @@ export async function addProject(input: { name?: string; repoPath: string }): Pr
   }
 
   // Self-heal beads so a UI/API-added repo converges to the same end state as `anton init`
-  // (anton-uez). Best-effort; `hasBeads` reflects the post-heal reality.
-  const hasBeads = healBeads(repoPath);
+  // (anton-uez). Best-effort; `hasBeads` reflects the post-heal reality. The chosen prefix
+  // (anton-ivtj) is threaded to `bd init` so a fresh board gets the operator's ticket-ID prefix.
+  const hasBeads = healBeads(repoPath, input.prefix);
 
   const createdAt = Math.floor(Date.now() / 1000);
 

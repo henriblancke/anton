@@ -5,6 +5,7 @@
  */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { resolveBdBin } from "./bd-bin";
 import { invalidateIssueSnapshot } from "./snapshot";
 
 // Bead/BeadDep live in the leaf ./types module so snapshot.ts can share them without importing
@@ -115,7 +116,9 @@ export function buildUpdateArgs(
 }
 
 async function bd(cwd: string, args: string[], env?: Record<string, string>): Promise<string> {
-  const { stdout } = await execFileAsync("bd", args, {
+  // Spawn bd by its resolved absolute path (anton-346): a background-launched server's PATH may not
+  // reach bd's install dir, so a bare `execFile("bd", …)` fails with `spawn bd ENOENT`.
+  const { stdout } = await execFileAsync(resolveBdBin(), args, {
     cwd,
     maxBuffer: 32 * 1024 * 1024,
     timeout: 60_000,

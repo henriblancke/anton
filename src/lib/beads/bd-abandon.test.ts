@@ -4,7 +4,13 @@
  * cancelled status, so that pair IS the outcome. `node:child_process` is mocked so no bd is spawned.
  * Mirrors bd-defer.test.ts.
  */
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { BD_BIN_ENV, resetBdBinCache } from "./bd-bin";
+
+// bd.ts spawns bd's RESOLVED absolute path (anton-346), not the bare name. Pin it to this test
+// runner's own executable so resolveBdBin() resolves hermetically — with no bd on the box, it would
+// otherwise fail loud. These are argv-level assertions (which bd subcommand), not about bd's path.
+const BD = process.execPath;
 
 const { calls } = vi.hoisted(() => ({ calls: [] as string[][] }));
 
@@ -25,14 +31,20 @@ const { beads } = await import("./bd");
 describe("beads.abandon", () => {
   beforeEach(() => {
     calls.length = 0;
+    process.env[BD_BIN_ENV] = BD;
+    resetBdBinCache();
+  });
+  afterEach(() => {
+    delete process.env[BD_BIN_ENV];
+    resetBdBinCache();
   });
 
   it("closes with the reason, then tags the bead abandoned and clears its stage", async () => {
     await beads.abandon("/repo", "bd-1", "superseded by bd-9");
     expect(calls).toEqual([
-      ["bd", "close", "bd-1", "--reason", "abandoned: superseded by bd-9"],
+      [BD, "close", "bd-1", "--reason", "abandoned: superseded by bd-9"],
       [
-        "bd",
+        BD,
         "update",
         "bd-1",
         "--add-label",

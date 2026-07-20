@@ -23,6 +23,21 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+
+/** Slugify a folder name into a bd-safe ticket-ID prefix (lowercase, alnum, dash-separated). */
+function toPrefix(input: string): string {
+  return input
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function baseName(path: string): string {
+  return path.split("/").filter(Boolean).pop() ?? "";
+}
 
 interface DirEntry {
   name: string;
@@ -44,6 +59,23 @@ export function AddProjectDialog() {
   const [browsing, setBrowsing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [name, setName] = useState("");
+  const [prefix, setPrefix] = useState("");
+  // The folder the editable fields were last seeded from — re-seed when the browsed folder changes.
+  const [seededPath, setSeededPath] = useState<string | null>(null);
+
+  // Prefill name + prefix from the selected folder, but keep them user-editable. Adjusting state
+  // during render (React's recommended reset-on-change pattern) converges: once seededPath matches
+  // the browsed path, the branch stops firing.
+  if (dir && dir.path !== seededPath) {
+    const base = baseName(dir.path);
+    setSeededPath(dir.path);
+    setName(base);
+    setPrefix(toPrefix(base));
+  }
+
+  const needsInit = Boolean(dir) && !dir?.hasBeads;
+  const canAdd = Boolean(dir) && !submitting && (!needsInit || prefix.trim().length > 0);
 
   const browse = useCallback(async (path?: string) => {
     setBrowsing(true);
@@ -63,14 +95,19 @@ export function AddProjectDialog() {
   }, []);
 
   async function handleAdd() {
-    if (!dir?.hasBeads) return;
+    if (!dir || !canAdd) return;
     setSubmitting(true);
     setError(null);
     try {
       const res = await fetch("/api/projects", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ repoPath: dir.path }),
+        body: JSON.stringify({
+          repoPath: dir.path,
+          name: name.trim() || undefined,
+          // Only a fresh repo needs a prefix; an existing board ignores it server-side.
+          prefix: needsInit ? prefix.trim() || undefined : undefined,
+        }),
       });
       const data = (await res.json()) as { project: Project } | { error: string };
       if (!res.ok || !("project" in data)) {
@@ -96,6 +133,9 @@ export function AddProjectDialog() {
         } else {
           setError(null);
           setDir(null);
+          setSeededPath(null);
+          setName("");
+          setPrefix("");
         }
       }}
     >
@@ -110,8 +150,9 @@ export function AddProjectDialog() {
             Add project
           </DialogTitle>
           <DialogDescription>
-            Browse to a local repo. Only folders that contain a{" "}
-            <span className="font-mono text-muted-foreground">.beads/</span> directory can be added.
+            Browse to a local repo. A folder with a{" "}
+            <span className="font-mono text-muted-foreground">.beads/</span> board is added as-is;
+            one without gets a fresh board initialized under the prefix you choose.
           </DialogDescription>
         </DialogHeader>
 
@@ -182,11 +223,45 @@ export function AddProjectDialog() {
               <span className="font-mono">.beads/</span> found in this folder · ready to add
             </span>
           </div>
-        ) : (
+        ) : dir ? (
           <p className="text-xs text-subtle">
-            Open a folder that contains a{" "}
-            <span className="font-mono text-muted-foreground">.beads/</span> directory to add it.
+            No <span className="font-mono text-muted-foreground">.beads/</span> board here yet — anton
+            will initialize one with <span className="font-mono">bd init</span>.
           </p>
+        ) : (
+          <p className="text-xs text-subtle">Open a folder to add it.</p>
+        )}
+
+        {/* project name + (fresh-repo only) board prefix */}
+        {dir && (
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div className="grid gap-1.5">
+              <Label htmlFor="add-project-name">Name</Label>
+              <Input
+                id="add-project-name"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder={baseName(dir.path)}
+                autoComplete="off"
+                spellCheck={false}
+              />
+            </div>
+            {needsInit && (
+              <div className="grid gap-1.5">
+                <Label htmlFor="add-project-prefix">Board prefix</Label>
+                <Input
+                  id="add-project-prefix"
+                  value={prefix}
+                  onChange={(e) => setPrefix(toPrefix(e.target.value))}
+                  placeholder="e.g. anton"
+                  aria-invalid={prefix.trim().length === 0}
+                  autoComplete="off"
+                  spellCheck={false}
+                  className="font-mono"
+                />
+              </div>
+            )}
+          </div>
         )}
 
         {error && (
@@ -196,12 +271,8 @@ export function AddProjectDialog() {
         )}
 
         <DialogFooter>
-          <Button
-            type="button"
-            onClick={handleAdd}
-            disabled={!dir?.hasBeads || submitting}
-          >
-            {submitting ? "Adding…" : "Add this project"}
+          <Button type="button" onClick={handleAdd} disabled={!canAdd}>
+            {submitting ? "Adding…" : needsInit ? "Initialize & add" : "Add this project"}
           </Button>
         </DialogFooter>
       </DialogContent>
