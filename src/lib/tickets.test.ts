@@ -92,6 +92,13 @@ describe("applyFilters", () => {
     expect(applyFilters(rows, { q: "EXPORT" }).map((r) => r.id)).toEqual(["t-1"]);
   });
 
+  it("keeps abandoned rows by default, and hides or isolates them on the outcome filter", () => {
+    const withDropped = [...rows, makeRow({ id: "t-4", title: "Dropped idea", abandoned: true })];
+    expect(applyFilters(withDropped, {}).map((r) => r.id)).toContain("t-4");
+    expect(applyFilters(withDropped, { outcome: "active" }).map((r) => r.id)).not.toContain("t-4");
+    expect(applyFilters(withDropped, { outcome: "abandoned" }).map((r) => r.id)).toEqual(["t-4"]);
+  });
+
   it("combines multiple filters (AND semantics)", () => {
     expect(applyFilters(rows, { domain: "eng", risk: "high" }).map((r) => r.id)).toEqual(["t-2"]);
   });

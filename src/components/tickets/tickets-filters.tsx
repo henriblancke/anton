@@ -17,15 +17,18 @@ import {
   uniqueEpicOptions,
   uniqueFieldOptions,
   type EpicOption,
+  type TicketFilterField,
 } from "@/components/tickets/tickets-utils";
 
 type SelectOption = { value: string; label: string };
 
 function optionsForField(
-  key: keyof TicketFilters,
+  field: TicketFilterField,
   tickets: TicketRow[],
   epicOptions: EpicOption[],
 ): SelectOption[] {
+  if (field.options) return field.options;
+  const key = field.key;
   if (key === "epic") {
     return epicOptions.map((epic) => ({ value: epic.id, label: epic.title }));
   }
@@ -118,7 +121,7 @@ export function TicketsFilters({ tickets }: { tickets: TicketRow[] }) {
           field={field.key}
           label={field.label}
           value={filters[field.key] ?? ""}
-          options={optionsForField(field.key, tickets, epicOptions)}
+          options={optionsForField(field, tickets, epicOptions)}
           onChange={(value) => handleFieldChange(field.key, value)}
         />
       ))}

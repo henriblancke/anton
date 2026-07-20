@@ -15,9 +15,17 @@ import {
   DialogFooter,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { MetaChip, PrLink, RelativeTime, SnoozedChip, StagePill } from "@/components/atoms";
+import {
+  AbandonedChip,
+  MetaChip,
+  PrLink,
+  RelativeTime,
+  SnoozedChip,
+  StagePill,
+} from "@/components/atoms";
 import { ClaimControl, InheritedOwner, StaticOwner } from "@/components/board/claim-control";
 import { PrLinkControl } from "@/components/board/pr-link-control";
+import { AbandonButton } from "./abandon-button";
 import { SnoozeButton } from "./snooze-button";
 import { TicketNotes } from "./ticket-notes";
 import {
@@ -237,6 +245,9 @@ function TicketDialogBody({
   // A snoozed target hides it too: the whole point of the snooze is "don't pick this up yet", so
   // offering the one control that would start it immediately contradicts the state it's in.
   const canRun = isRunTarget && detail.stage !== "done" && !detail.deferred;
+  // Abandon settles work that hasn't settled yet — the route 409s an already-closed bead, so the
+  // action is offered exactly where it can succeed.
+  const canAbandon = detail.stage !== "done" && !detail.abandoned;
 
   return (
     <div className="flex flex-col gap-4">
@@ -249,7 +260,9 @@ function TicketDialogBody({
             </CopyButton>
             · {detail.type}
           </span>
-          <StagePill stage={detail.stage} />
+          {/* An abandoned bead is closed, so its derived stage is `done` — showing the Done pill
+              would read as shipped. The chip replaces it outright. */}
+          {detail.abandoned ? <AbandonedChip /> : <StagePill stage={detail.stage} />}
           {detail.deferred && <SnoozedChip />}
           {isRunTarget ? (
             // A standalone task/bug carries its own PR — let it be linked/relinked here (same
@@ -403,7 +416,28 @@ function TicketDialogBody({
       />
 
       <DialogFooter className="sm:justify-between">
-        <ConfirmDeleteButton onConfirm={remove} label="Delete ticket" />
+        {/* Exit actions sit together on the left: delete erases the ticket, abandon keeps it and
+            records why it won't be done. */}
+        <div className="flex flex-wrap items-center gap-2">
+          <ConfirmDeleteButton onConfirm={remove} label="Delete ticket" />
+          {canAbandon && (
+            <AbandonButton
+              slug={slug}
+              targetId={ticketId}
+              kind="ticket"
+              onAbandoned={(result) => {
+                if (result.kind !== "ticket") return;
+                setDetail(result.detail);
+                // Abandoning only settles the bead's status/labels — keep the operator's unsaved
+                // edits and sync just that field, mirroring the snooze toggle.
+                setDraft((d) =>
+                  d ? { ...d, status: result.detail.status } : draftFromDetail(result.detail),
+                );
+                onSaved?.(result.detail);
+              }}
+            />
+          )}
+        </div>
         <div className="flex gap-2">
           {/* A finished ticket has nothing to park — snooze is about work still ahead. */}
           {(detail.stage !== "done" || detail.deferred) && (

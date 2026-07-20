@@ -3,13 +3,21 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { ArrowDownIcon, ArrowUpIcon, CheckIcon, ListTodoIcon, PlusIcon, TriangleAlertIcon } from "lucide-react";
+import {
+  ArrowDownIcon,
+  ArrowUpIcon,
+  CheckIcon,
+  CircleSlashIcon,
+  ListTodoIcon,
+  PlusIcon,
+  TriangleAlertIcon,
+} from "lucide-react";
 
 import type { Stage, TicketRow } from "@/lib/types";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { agentDotClass } from "@/components/board/board-utils";
-import { RelativeTime } from "@/components/atoms";
+import { AbandonedChip, RelativeTime } from "@/components/atoms";
 import { TicketDialog } from "@/components/ticket/ticket-dialog";
 import { CopyButton } from "@/components/ui/copy-button";
 import { TicketsFilters } from "@/components/tickets/tickets-filters";
@@ -209,37 +217,44 @@ function TicketsTable({
           const isDone = ticket.stage === "done";
           const isEpic = ticket.type === "epic";
           const titleClass = cn(
-            "truncate text-left text-[13px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
-            isDone
-              ? "text-muted-foreground line-through decoration-border"
-              : isEpic
-                ? "font-semibold text-foreground"
-                : "text-foreground",
+            "min-w-0 truncate text-left text-[13px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
+            ticket.abandoned
+              ? "text-subtle line-through decoration-border"
+              : isDone
+                ? "text-muted-foreground line-through decoration-border"
+                : isEpic
+                  ? "font-semibold text-foreground"
+                  : "text-foreground",
           );
           return (
             <li
               key={ticket.id}
               className={cn(GRID, "px-5 py-2.5 sm:px-6", i % 2 === 1 && "bg-card/40")}
             >
-              <StatusCircle stage={ticket.stage} epic={isEpic} />
-              {isEpic ? (
-                <Link
-                  href={`/projects/${slug}/epics/${ticket.id}`}
-                  className={titleClass}
-                  title={ticket.title}
-                >
-                  {ticket.title}
-                </Link>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => onOpenTicket(ticket.id)}
-                  className={cn(titleClass, "hover:underline hover:decoration-border")}
-                  title={ticket.title}
-                >
-                  {ticket.title}
-                </button>
-              )}
+              <StatusCircle stage={ticket.stage} epic={isEpic} abandoned={ticket.abandoned} />
+              {/* The chip rides beside the title: this row has no status column, and a struck-out
+                  title alone reads the same as a shipped one. */}
+              <span className="flex min-w-0 items-center gap-2">
+                {isEpic ? (
+                  <Link
+                    href={`/projects/${slug}/epics/${ticket.id}`}
+                    className={titleClass}
+                    title={ticket.title}
+                  >
+                    {ticket.title}
+                  </Link>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => onOpenTicket(ticket.id)}
+                    className={cn(titleClass, "hover:underline hover:decoration-border")}
+                    title={ticket.title}
+                  >
+                    {ticket.title}
+                  </button>
+                )}
+                {ticket.abandoned && <AbandonedChip className="shrink-0" />}
+              </span>
               <CopyButton value={ticket.id} label="ticket id" className="font-mono text-[11px]">
                 {ticket.id}
               </CopyButton>
@@ -298,7 +313,20 @@ const STAGE_MARK: Record<Stage, string> = {
   done: "border-stage-done",
 };
 
-function StatusCircle({ stage, epic = false }: { stage: Stage; epic?: boolean }) {
+function StatusCircle({
+  stage,
+  epic = false,
+  abandoned = false,
+}: {
+  stage: Stage;
+  epic?: boolean;
+  abandoned?: boolean;
+}) {
+  // Checked first: an abandoned bead is closed, so its stage is `done` and it would otherwise wear
+  // the shipped tick (or the filled done square).
+  if (abandoned) {
+    return <CircleSlashIcon className="size-[15px] text-subtle" aria-label="abandoned" />;
+  }
   // Epics read as a rounded square (a container of tickets) tinted by their stage.
   if (epic) {
     return (

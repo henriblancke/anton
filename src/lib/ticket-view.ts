@@ -172,6 +172,7 @@ export function toEpic(bead: Bead, opts: ToEpicOptions): Epic {
     ready: opts.ready ?? true,
     rank: opts.rank ?? 0,
     priority: bead.priority ?? DEFAULT_PRIORITY,
+    abandoned: beads.isAbandoned(bead),
     tickets: opts.tickets,
   };
 }

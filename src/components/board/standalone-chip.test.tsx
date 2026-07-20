@@ -79,6 +79,27 @@ describe("StandaloneChip", () => {
     expect(snoozed).not.toMatch(/Approve/);
   });
 
+  it("marks an abandoned item with its own chip and never with the shipped/done tint", () => {
+    const shipped = renderToStaticMarkup(
+      <StandaloneChip
+        slug="anton"
+        item={makeItem({ stage: "done", status: "closed", prRef: "gh-42" })}
+      />,
+    );
+    expect(shipped).not.toContain("abandoned");
+    expect(shipped).toContain("text-stage-done");
+
+    const dropped = renderToStaticMarkup(
+      <StandaloneChip
+        slug="anton"
+        item={makeItem({ stage: "done", status: "closed", prRef: "gh-42", abandoned: true })}
+      />,
+    );
+    expect(dropped).toContain("abandoned");
+    // Closed, but nothing shipped — the done tint belongs to delivered work only.
+    expect(dropped).not.toContain("text-stage-done");
+  });
+
   it("links a PR chip when the standalone item is in review", () => {
     const html = renderToStaticMarkup(
       <StandaloneChip

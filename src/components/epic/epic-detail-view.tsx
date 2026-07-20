@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
-import { CheckIcon, TriangleAlertIcon } from "lucide-react";
+import { CheckIcon, CircleSlashIcon, TriangleAlertIcon } from "lucide-react";
 
 import type { EpicDetail, Ticket } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -12,10 +12,11 @@ import { Button, buttonVariants } from "@/components/ui/button";
 import { ConfirmDeleteButton } from "@/components/ui/confirm-delete-button";
 import { CopyButton } from "@/components/ui/copy-button";
 import { agentDotClass, ticketProgress } from "@/components/board/board-utils";
-import { MetaChip, RelativeTime, RiskChip, StagePill } from "@/components/atoms";
+import { AbandonedChip, MetaChip, RelativeTime, RiskChip, StagePill } from "@/components/atoms";
 import { ClaimControl } from "@/components/board/claim-control";
 import { PrLinkControl } from "@/components/board/pr-link-control";
 import { DependencyGraph } from "@/components/epic/dependency-graph";
+import { AbandonButton } from "@/components/ticket/abandon-button";
 import { TicketDialog } from "@/components/ticket/ticket-dialog";
 
 type AcceptanceItem = { text: string; checked: boolean };
@@ -34,6 +35,13 @@ function parseAcceptance(acceptance: string): AcceptanceItem[] {
 }
 
 function StatusCircle({ ticket }: { ticket: Ticket }) {
+  // Checked BEFORE done: an abandoned ticket is closed, so its stage says done — the slash is what
+  // keeps a dropped ticket from wearing the shipped tick.
+  if (ticket.abandoned) {
+    return (
+      <CircleSlashIcon className="size-3.5 shrink-0 text-subtle" aria-label="abandoned" />
+    );
+  }
   if (ticket.stage === "done") {
     return (
       <span className="flex size-3.5 shrink-0 items-center justify-center rounded-full bg-stage-done">
@@ -151,6 +159,7 @@ export function EpicDetailView({ slug, epicId }: { slug: string; epicId: string 
   const inProgress = tickets.filter((t) => t.stage === "implementing").length;
   const inProgressPct = total === 0 ? 0 : Math.round((inProgress / total) * 100);
   const todo = Math.max(0, total - done - inProgress);
+  const abandoned = tickets.filter((t) => t.abandoned).length;
   const acceptance = epic.acceptance ? parseAcceptance(epic.acceptance) : [];
 
   return (
@@ -169,9 +178,15 @@ export function EpicDetailView({ slug, epicId }: { slug: string; epicId: string 
             {epic.title}
           </span>
         </div>
-        <StagePill stage={epic.stage} className="ml-1" />
+        {/* An abandoned epic is closed, so its derived stage is `done` — the chip replaces the Done
+            pill outright rather than sitting beside it. */}
+        {epic.abandoned ? (
+          <AbandonedChip className="ml-1" />
+        ) : (
+          <StagePill stage={epic.stage} className="ml-1" />
+        )}
         <div className="ml-auto flex shrink-0 items-center gap-2">
-          {epic.stage === "implementing" ? (
+          {epic.abandoned ? null : epic.stage === "implementing" ? (
             <>
               {run && (
                 <Link
@@ -210,6 +225,16 @@ export function EpicDetailView({ slug, epicId }: { slug: string; epicId: string 
           >
             Open worktree
           </Button>
+          {/* Abandon settles the epic and cascades to its open children; the route 409s an
+              already-closed epic, so the action only shows while there is something to settle. */}
+          {epic.stage !== "done" && !epic.abandoned && (
+            <AbandonButton
+              slug={slug}
+              targetId={epicId}
+              kind="epic"
+              onAbandoned={() => setAttempt((n) => n + 1)}
+            />
+          )}
           <ConfirmDeleteButton
             onConfirm={() => handleDelete(epic.title)}
             iconOnly
@@ -266,6 +291,11 @@ export function EpicDetailView({ slug, epicId }: { slug: string; epicId: string 
               <LegendItem className="bg-stage-done" label={`${done} done`} />
               <LegendItem className="bg-stage-implementing" label={`${inProgress} in progress`} />
               <LegendItem className="bg-subtle" label={`${todo} to do`} />
+              {/* Abandoned tickets are out of the progress count — say so rather than let them
+                  silently vanish from the epic's arithmetic. */}
+              {abandoned > 0 && (
+                <LegendItem className="bg-border" label={`${abandoned} abandoned`} />
+              )}
             </div>
           </div>
 
@@ -348,7 +378,11 @@ export function EpicDetailView({ slug, epicId }: { slug: string; epicId: string 
                       <span
                         className={cn(
                           "min-w-0 flex-1 truncate text-[12.5px]",
-                          ticket.stage === "done" ? "text-muted-foreground" : "text-foreground",
+                          ticket.abandoned
+                            ? "text-subtle line-through decoration-border"
+                            : ticket.stage === "done"
+                              ? "text-muted-foreground"
+                              : "text-foreground",
                         )}
                       >
                         {ticket.title}

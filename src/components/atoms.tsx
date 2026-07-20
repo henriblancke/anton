@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { LockIcon, MoonIcon } from "lucide-react";
+import { CircleSlashIcon, LockIcon, MoonIcon } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import type { Stage } from "@/lib/types";
@@ -104,6 +104,18 @@ export function SnoozedChip({ className }: { className?: string }) {
     <MetaChip className={className}>
       <MoonIcon className="size-2.5" aria-hidden="true" />
       <span title="Snoozed — kept out of the ready queue until un-snoozed">snoozed</span>
+    </MetaChip>
+  );
+}
+
+/** "abandoned" chip — a won't-do outcome (anton-6xj0). Deliberately grey and never `done`-tinted:
+ * an abandoned bead is closed, so every stage derivation reads it as done — this chip is the only
+ * thing standing between a dropped decision and a shipped one. */
+export function AbandonedChip({ className }: { className?: string }) {
+  return (
+    <MetaChip className={className}>
+      <CircleSlashIcon className="size-2.5" aria-hidden="true" />
+      <span title="Abandoned — closed as won't-do, not delivered">abandoned</span>
     </MetaChip>
   );
 }

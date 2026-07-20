@@ -50,6 +50,10 @@ export function applyFilters(rows: TicketRow[], filters: TicketFilters): TicketR
     if (filters.status && row.status !== filters.status) return false;
     if (filters.type && row.type !== filters.type) return false;
     if (filters.epic && row.epicId !== filters.epic) return false;
+    // Abandoned work stays in the list by default — the outcome is part of the record — but it is
+    // one select away from being hidden, or isolated for a review of what was dropped.
+    if (filters.outcome === "active" && row.abandoned) return false;
+    if (filters.outcome === "abandoned" && !row.abandoned) return false;
     if (q && !row.title.toLowerCase().includes(q)) return false;
     return true;
   });

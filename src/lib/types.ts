@@ -9,6 +9,14 @@ export type { TicketNote };
 export type Stage = "backlog" | "implementing" | "in-review" | "done";
 export const STAGES: Stage[] = ["backlog", "implementing", "in-review", "done"];
 
+/**
+ * Cap on an abandon reason (anton-6xj0). It is a sentence explaining a decision, not a document —
+ * anything longer belongs in a note on the bead. Lives here, not in lib/abandon.ts, so the client
+ * form can bound the input without pulling the server-only abandon module into the browser bundle;
+ * the server still enforces it.
+ */
+export const MAX_ABANDON_REASON_CHARS = 500;
+
 /** The board's shared type language. An epic renders as a card; a standalone task/bug as a chip.
  * Every other bead issue_type is not board work. */
 export type IssueType = "epic" | "task" | "bug";
@@ -63,6 +71,8 @@ export interface Epic {
   ready: boolean; // no open blockers — mirrors what the runtime's bd-ready would actually pick up
   rank: number; // topological rank (0 = no blockers); drives dependency-aware backlog order
   priority: number; // bead priority (0=critical … 4=lowest); backlog tiebreak after rank
+  /** Abandoned (closed + `abandoned` label, anton-6xj0) — a won't-do outcome, never a delivery. */
+  abandoned: boolean;
   tickets: Ticket[];
 }
 
@@ -141,6 +151,8 @@ export interface TicketFilters {
   status?: string;
   type?: string;
   epic?: string;
+  /** Abandoned work: "active" hides it, "abandoned" shows only it; unset shows everything. */
+  outcome?: string;
   q?: string; // free-text over title
 }
 

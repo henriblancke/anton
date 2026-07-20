@@ -8,7 +8,7 @@ import type { StandaloneItem } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { CopyButton } from "@/components/ui/copy-button";
-import { BlockedChip, MetaChip, PrLink, RiskChip, SnoozedChip } from "@/components/atoms";
+import { AbandonedChip, BlockedChip, MetaChip, PrLink, RiskChip, SnoozedChip } from "@/components/atoms";
 import { SnoozeButton } from "@/components/ticket/snooze-button";
 import { ClaimControl } from "@/components/board/claim-control";
 import { TYPE_RAIL, TYPE_TEXT, agentDotClass } from "@/components/board/board-utils";
@@ -83,7 +83,7 @@ export function StandaloneChip({
         "relative flex flex-col gap-2 rounded-[10px] border border-border bg-card/70 p-2.5 text-card-foreground transition-colors hover:border-ring/40",
         TYPE_RAIL[item.type],
         // Dimmed like a blocked card: the runtime won't pick this up as it stands.
-        deferred && "opacity-60",
+        (deferred || item.abandoned) && "opacity-60",
       )}
     >
       {/* Full-bleed trigger — opens the shared TicketDialog. Interactive controls below sit above it
@@ -111,7 +111,8 @@ export function StandaloneChip({
         </h4>
         {item.prRef && (
           <PrLink href={item.prUrl} className={item.prUrl ? "pointer-events-auto" : undefined}>
-            <MetaChip tone={item.stage === "done" ? "done" : "pr"}>
+            {/* An abandoned item is closed (stage `done`) but nothing merged — never green-tint its PR. */}
+            <MetaChip tone={item.stage === "done" && !item.abandoned ? "done" : "pr"}>
               <GitPullRequestIcon className="size-2.5" aria-hidden="true" />
               {prLabel(item.prRef)}
             </MetaChip>
@@ -133,6 +134,7 @@ export function StandaloneChip({
         {item.agent && <MetaChip dotClass={agentDotClass(item.agent)}>{item.agent}</MetaChip>}
         {item.risk && <RiskChip risk={item.risk} />}
         {item.stage === "backlog" && <BlockedChip blockedBy={item.blockedBy} />}
+        {item.abandoned && <AbandonedChip />}
         {deferred && <SnoozedChip />}
         {showApproveRun && (
           <Button

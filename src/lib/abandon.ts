@@ -8,13 +8,12 @@ import { beads } from "./beads/bd";
 import { cancelRunForTarget } from "./jobs/service";
 import { getTicketDetail } from "./ticket-detail";
 import type { Bead } from "./beads/bd";
+import { MAX_ABANDON_REASON_CHARS } from "./types";
 import type { Project, TicketDetail } from "./types";
 
-/**
- * Cap on an abandon reason. It is a sentence explaining a decision, not a document — anything
- * longer belongs in a note on the bead.
- */
-export const MAX_ABANDON_REASON_CHARS = 500;
+// Re-exported so server callers keep importing the cap from the module that enforces it; the
+// declaration lives in types.ts because the client abandon form needs it too.
+export { MAX_ABANDON_REASON_CHARS };
 
 /** Thrown when the target exists but isn't in a state that can be abandoned (route → 409). */
 export class NotAbandonableError extends Error {
