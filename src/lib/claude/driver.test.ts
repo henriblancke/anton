@@ -6,7 +6,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isRecoverableClaudeError, isUsageLimitError } from "../jobs/errors";
+import { isRecoverableClaudeError, isUsageLimitError, type RecoverableClaudeError } from "../jobs/errors";
 import { CLAUDE_BIN_ENV, runClaude, type ClaudeEvent } from "./driver";
 
 let dir: string;
@@ -21,6 +21,40 @@ function writeFakeClaude(name: string, ndjsonLines: string[], exitCode = 0, stde
     `const stderr = ${JSON.stringify(stderr)};`,
     "if (stderr) { process.stderr.write(stderr); }",
     `process.exitCode = ${exitCode};`,
+    "",
+  ].join("\n");
+  writeFileSync(path, body, "utf8");
+  chmodSync(path, 0o755);
+  return path;
+}
+
+/** A fake that emits `ndjsonLines`, then hangs forever without exiting — the wedged-session case. */
+function writeFakeHangingClaude(name: string, ndjsonLines: string[]): string {
+  const path = join(dir, name);
+  const body = [
+    "#!/usr/bin/env node",
+    `const lines = ${JSON.stringify(ndjsonLines)};`,
+    "for (const l of lines) { process.stdout.write(l + \"\\n\"); }",
+    "setInterval(() => {}, 1 << 30);", // never exits, never writes again
+    "",
+  ].join("\n");
+  writeFileSync(path, body, "utf8");
+  chmodSync(path, 0o755);
+  return path;
+}
+
+/** A fake that emits each line `gapMs` apart — slow but demonstrably alive. */
+function writeFakeDripClaude(name: string, gapMs: number, ndjsonLines: string[]): string {
+  const path = join(dir, name);
+  const body = [
+    "#!/usr/bin/env node",
+    `const lines = ${JSON.stringify(ndjsonLines)};`,
+    `const gap = ${gapMs};`,
+    "let i = 0;",
+    "const t = setInterval(() => {",
+    "  if (i >= lines.length) { clearInterval(t); return; }",
+    "  process.stdout.write(lines[i++] + \"\\n\");",
+    "}, gap);",
     "",
   ].join("\n");
   writeFileSync(path, body, "utf8");
@@ -813,5 +847,50 @@ describe("runClaude", () => {
 
     expect(result.ok).toBe(true);
     expect(result.text).toContain("ANTON-RESULT: blocked");
+  });
+
+  // anton-0oi: a session that wedges on a shell wait-loop emits nothing and looks alive until the
+  // lease expires. Silence is the only available signal, so the watchdog kills on it — and resumes,
+  // since work may already be banked and the caller escalates a repeated signature to a fresh run.
+  it("kills a session that goes silent past stallTimeoutMs and reports it as resume-eligible", async () => {
+    const bin = writeFakeHangingClaude("stalled-claude", [
+      JSON.stringify({ type: "system", subtype: "init", session_id: "sess-stall" }),
+    ]);
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    let caught: unknown;
+    try {
+      // Comfortably longer than node's spawn time: the fake must get its init event out before the
+      // watchdog fires, or this would assert on a session id that never arrived.
+      await runClaude({ cwd: dir, prompt: "wedge", stallTimeoutMs: 1_500 });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(isRecoverableClaudeError(caught)).toBe(true);
+    const err = caught as RecoverableClaudeError;
+    expect(err.signature).toBe("stalled");
+    // The id from the `system` init event survives even though no result event ever arrived.
+    expect(err.sessionId).toBe("sess-stall");
+  });
+
+  it("does not kill a slow session that keeps emitting output", async () => {
+    // Liveness is any byte, not a completed turn. The budget must exceed node's spawn time plus one
+    // gap — not the whole run — so keep the gap well under it and let the total (3 gaps) exceed it:
+    // that is what proves the timer is REARMED per chunk rather than bounding the session.
+    const bin = writeFakeDripClaude("drip-claude", 600, [
+      JSON.stringify({ type: "system", subtype: "init", session_id: "sess-drip" }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "working" }] } }),
+      JSON.stringify({ type: "result", subtype: "success", is_error: false, session_id: "sess-drip", result: "done" }),
+    ]);
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    // 3 gaps of 600ms = 1.8s of runtime under a 1.5s budget — the session outlives the timeout while
+    // no single silence does. That gap is the whole point: a session-length timer kills this, a
+    // per-chunk rearm lets it finish.
+    const result = await runClaude({ cwd: dir, prompt: "slow but alive", stallTimeoutMs: 1_500 });
+
+    expect(result.ok).toBe(true);
+    expect(result.text).toBe("done");
   });
 });

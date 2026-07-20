@@ -33,12 +33,43 @@ jobs:
         run: bun run typecheck
 
       - name: Test
-        # Integration suites that shell out to bd/gh/stringer/claude self-skip when those CLIs are
-        # absent (see the `has(...)` guards); the unit + DB-backed suites always run.
+        # NOTE: this gate does NOT cover the bd-backed integration suites. `bd`/`gh`/`stringer`/
+        # `claude` are absent here, so their `has(...)` guards turn those `describe`s into
+        # `describe.skip` and they report as passing without ever executing. A green `check` means
+        # "unit + DB-backed suites pass" — nothing more. The `integration` job below installs `bd`
+        # and is the only place the bd suites actually run (anton-0oi).
         run: bun run test
 
       - name: Build
         run: bun run build
+
+  # Integration (anton-0oi). Installs `bd` so the beads-backed integration suites actually execute
+  # instead of self-skipping in `check`. Report-only for now — `execute-epic.integration.test.ts` is
+  # currently red on an idle machine, so blocking on this would wedge every PR; the job exists to
+  # make that failure *visible* rather than hidden behind a green `check`. Flip `continue-on-error`
+  # off once that suite is healthy — that is the point of the job.
+  integration:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    # Real bd/Dolt work shells out per issue and is slow; cap it so a hang can't run for hours.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14" # match package.json `packageManager`
+      - name: Install bd
+        run: |
+          curl -sSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Verify bd is on PATH
+        # Fail loud: if bd didn't install, the suites would silently self-skip again and this job
+        # would report green — exactly the false signal it exists to remove.
+        run: bd version
+      - name: Install
+        run: bun install --frozen-lockfile
+      - name: Test (integration included)
+        run: bun run test
 
   # Coverage (anton-7jy). Report-only — a separate, non-blocking job. V8 instrumentation adds ~5x
   # runtime, so it's kept OFF the blocking `check` gate to avoid slowing/flaking it; the html+lcov

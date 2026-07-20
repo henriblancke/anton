@@ -84,6 +84,16 @@ project's own checks — in whatever language(s) the repo uses — and leaving t
    right way (per the quality floor above) — never by weakening the check.
 4. **If the project has no such checks, say so explicitly** in your summary ("no test/lint/build
    tooling found") rather than silently skipping — so the gap is visible, not assumed-passed.
+5. **Wait on the artifact, not on a process.** When a check runs long enough that you background it,
+   poll for its *output* — `until [ -s run.json ]; do sleep 10; done` — or use your harness's own
+   completion signal. Never gate on process absence. `pgrep -f "<pattern>"` matches every command
+   line *containing* that text, which includes the polling shell's own `zsh -c` argv and this
+   session's `claude` process — your ticket spec is on that command line, so a spec quoting
+   `vitest run` makes `pgrep -f "vitest run"` match forever. The loop then never exits and the run
+   burns its whole budget waiting on a check that already finished.
+6. **Never run the full suite concurrently with another run.** anton executes tickets in parallel
+   worktrees on one machine. Two suites at once starve each other and produce timeout failures that
+   belong to neither change — do not "fix" a timeout you have not first reproduced on an idle box.
 
 A pre-existing failure unrelated to your change isn't yours to fix here — but it is yours to
 **report** (see "Fail loud"), not to quietly leave behind an apparent green.
