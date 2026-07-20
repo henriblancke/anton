@@ -52,7 +52,28 @@ export const STATUS_LABELS: Record<string, string> = {
   in_progress: "In progress",
   blocked: "Blocked",
   closed: "Closed",
+  // Set by the snooze toggle (`bd defer`), never picked from the Status select — the state bar owns it.
+  deferred: "Snoozed",
 };
+
+/**
+ * A ticket's resolution — the human-decision axis the state bar surfaces, distinct from its derived
+ * lifecycle stage. Kept a pure function here so the segment↔state mapping is unit-tested in the node
+ * env alongside the draft/diff helpers. `abandoned` wins over `deferred` (an abandoned bead is closed
+ * and can't also be snoozed); a plain closed/`done` bead that was neither is a shipped "done".
+ */
+export type Resolution = "active" | "snoozed" | "abandoned" | "done";
+
+export function resolutionOf(detail: {
+  deferred: boolean;
+  abandoned: boolean;
+  stage: string;
+}): Resolution {
+  if (detail.abandoned) return "abandoned";
+  if (detail.deferred) return "snoozed";
+  if (detail.stage === "done") return "done";
+  return "active";
+}
 
 /** Human labels for priorities (0 = critical … 4 = backlog), matching bd conventions. */
 export const PRIORITY_LABELS: Record<number, string> = {
@@ -169,6 +190,20 @@ export function diffTicketPatch(original: TicketDraft, draft: TicketDraft): Tick
   }
 
   return patch;
+}
+
+/**
+ * The one-line summary shown on the collapsed "Details" disclosure (anton-q02q) — the label/scalar
+ * fields folded away so the contract + notes lead. Snooze renders as its own status; absent labels
+ * are omitted. Pure so it's unit-tested alongside the other draft helpers.
+ */
+export function detailsSummary(draft: TicketDraft, deferred: boolean): string {
+  const parts: string[] = [deferred ? STATUS_LABELS.deferred : (STATUS_LABELS[draft.status] ?? draft.status)];
+  if (draft.priority !== undefined) parts.push(`P${draft.priority}`);
+  if (draft.agent) parts.push(draft.agent);
+  if (draft.risk) parts.push(`risk:${draft.risk}`);
+  if (draft.size) parts.push(`size:${draft.size}`);
+  return parts.join(" · ");
 }
 
 /** Whether a draft has any field the dialog would PATCH (drives the Save-disabled state). */

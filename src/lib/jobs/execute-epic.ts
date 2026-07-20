@@ -9,6 +9,7 @@
 import { randomUUID } from "node:crypto";
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { ownerOf } from "../beads/claim";
+import { humanNotesPromptBlock } from "../beads/notes";
 import { computeEpicGraph, epicStandaloneBlockers, standaloneBlockers } from "../epic-graph";
 import { loadAgentPrompt } from "../claude/agent-prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
@@ -120,6 +121,12 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     if (!beads.isApproved(target)) {
       throw new PoisonEpic(`target ${epicBeadId} is not approved — refusing to execute`);
     }
+    // An abandoned target has nothing left to execute (anton-6xj0): a human declared the work
+    // won't be done. Return cleanly instead of poisoning — a park would put an operator's own
+    // decision back in front of them as a job needing attention, and there is no run row yet, so
+    // nothing can be mistaken for a delivery. Reached by a job that was already queued (or is being
+    // resumed) when the abandon landed; a job that was RUNNING is cancelled by the abandon itself.
+    if (beads.isAbandoned(target)) return;
 
     // Compute the epic's open blockers from a board snapshot. An epic's blockers come from the
     // epic-graph rollup; a standalone task/bug (epic-of-one) never appears there, so derive its
@@ -694,7 +701,21 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //    moves it to stage:in-review instead — that label is both the board's "in review" state
       //    and the persisted resume marker, so a retry after a failed PR step skips straight to
       //    the PR step here rather than re-running claude/tests/commit on already-committed work.
-      for (const ticket of orderTickets(tickets, all)) {
+      // Abandoned tickets are dropped from the run entirely (anton-6xj0). Filtered out HERE, ahead
+      // of the done-on-board logic below: an abandoned bead IS closed, but its work was never
+      // committed, so that logic would read "closed with no commit on this branch" as a
+      // cross-machine resume, reopen it, and re-run the agent on work a human explicitly killed.
+      const live = orderTickets(tickets, all).filter((t) => !beads.isAbandoned(t));
+      if (live.length === 0) {
+        // Every ticket abandoned but the epic left open — a contradiction only a human can settle
+        // (abandon the epic too, or add work to it). Park rather than open an empty PR or mark the
+        // run done, either of which would read as a delivery that never happened.
+        throw new PoisonEpic(
+          `every ticket under ${epicBeadId} has been abandoned — nothing left to run; abandon the ` +
+            `epic itself or give it work, then resume the run`,
+        );
+      }
+      for (const ticket of live) {
         assertLeaseHeld(); // yield before starting a ticket if the shared lease has lapsed
         // A ticket marked done on the board — a closed epic child, or a standalone target moved to
         // stage:in-review — is only safe to SKIP if its commit is actually present on THIS
@@ -773,7 +794,9 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         branch: worktree.branch,
         base: baseBranch,
         title: buildPrTitle(target, epicBeadId, settings.conventionalCommits),
-        body: prBody(target, tickets),
+        // `live`, not `tickets`: an abandoned ticket contributed no commit, so listing it would
+        // advertise work this PR doesn't contain (anton-6xj0).
+        body: prBody(target, live),
       });
       await safe(() => beads.setExternalRef(repo, epicBeadId, pr.ref));
       if (!standaloneRun) {
@@ -896,6 +919,11 @@ async function runTicket(args: {
     void appendSessionLog(logPath, line).catch(() => {});
   };
 
+  // Human steering (anton-bfy4) can land at any moment — including while this epic's earlier
+  // tickets were running — so the notes that reach the prompt are read HERE, at dispatch, not from
+  // the board snapshot the run started with. Best-effort: an unreadable bead just means no notes.
+  const dispatched = await withDispatchNotes(repo, ticket);
+
   let committed = false;
   try {
     const result = await runClaudeResilient({
@@ -904,7 +932,7 @@ async function runTicket(args: {
       sessionId,
       logPath,
       worktreePath,
-      ticket,
+      ticket: dispatched,
       appendSystemPrompt,
       model: settings.model,
       permissionMode: settings.permissionMode ?? "bypassPermissions",
@@ -989,6 +1017,28 @@ async function runTicket(args: {
       await appendSessionLog(logPath, `[no-delivery] ${e.message}\n`).catch(() => {});
     } else if (agentBlocked) {
       await appendSessionLog(logPath, `[agent-blocked] ${e.message}\n`).catch(() => {});
+    }
+    // An ABORTED ticket writes nothing to the board (anton-6xj0). The abort's author decides this
+    // ticket's fate, not this unwinding handler: an abandon settles it (closed + `abandoned`, the
+    // stage label cleared — beads.abandon does all three), a force-kill or a lost lease leaves it
+    // claimed for the resume that follows. Writing here would race the abandon's own writes — the
+    // handler unwinds in milliseconds while `bd close` takes far longer, so whichever landed last
+    // would win — and reopening a ticket a human just killed re-queues it into the ready pool,
+    // while blocking it would file the operator's own decision as a failure needing attention.
+    // The error still propagates: the run stops, and the cancelled job means no park.
+    // The same holds for a ticket abandoned WITHOUT this job being killed — an abandon on another
+    // machine, arriving by sync, while this ticket happened to fail here. Its outcome is settled;
+    // don't rewrite it. Checked second because it costs a bd read, and only on the failure path.
+    const settledElsewhere =
+      !ctx.signal.aborted &&
+      (await beads
+        .show(repo, ticket.id)
+        .then((b) => beads.isAbandoned(b))
+        .catch(() => false));
+    if (ctx.signal.aborted || settledElsewhere) {
+      const why = ctx.signal.aborted ? "aborted" : "abandoned";
+      await appendSessionLog(logPath, `[${why}] ${ticket.id} was ${why} mid-run\n`).catch(() => {});
+      throw e;
     }
     // Release the claim so the board never shows a dead session's ticket as in-flight
     // (anton-live-sync R10). A usage-limit park is NOT dead — the run resumes with the claim
@@ -1091,6 +1141,11 @@ async function runClaudeResilient(args: {
       // failure (verify-gate, agent error), poison, or quota is NOT — it propagates unchanged so the
       // runner applies today's fresh-restart/park policy (never a resume that would replay bad state).
       if (!isRecoverableClaudeError(e)) throw e;
+      // A killed job (force-kill, or an abandon that cancelled the run — anton-6xj0) aborts the
+      // child mid-stream, which looks exactly like a transient death. Never resume through it: the
+      // operator asked for this agent to stop, and the retry would spawn against an already-aborted
+      // signal anyway. Checked before the resume decision so the abort propagates immediately.
+      if (ctx.signal.aborted) throw e;
       // Persist the captured id even on the failure path — a mid-stream death may carry it only via
       // the system-init event, and it's what a fresh-restart's operator or a future resume relies on.
       if (e.sessionId) await setSessionClaudeId(db, sessionId, e.sessionId).catch(() => {});
@@ -1291,6 +1346,9 @@ function truncateField(text: string): string {
  * unreadable (issue #46 root cause #3). `bd show` is offered as a convenience, never as the sole
  * source: a bead whose spec is genuinely empty AND whose `bd show` fails is a fail-loud/blocked
  * condition, not a cue to silently produce nothing.
+ *
+ * Human notes on the bead (anton-bfy4) are appended last — the operator's steer is the freshest
+ * intent, so it reads as a refinement of the contract above it.
  */
 export function ticketPrompt(ticket: Bead): string {
   const description = ticket.description?.trim();
@@ -1314,6 +1372,12 @@ export function ticketPrompt(ticket: Bead): string {
   if (context) {
     lines.push(``, `## Context`, truncateField(context));
   }
+  // The human steering channel (anton-bfy4): notes an operator left on the bead between the gates.
+  // They come last so the freshest human intent is what the agent reads before the closing rules.
+  const humanNotes = humanNotesPromptBlock(ticket.notes);
+  if (humanNotes) {
+    lines.push(``, truncateField(humanNotes));
+  }
   lines.push(
     ``,
     `The full ticket spec is inlined above so you can implement it even if the worktree's beads ` +
@@ -1334,6 +1398,16 @@ function prBody(target: Bead, tickets: Bead[]): string {
     `🤖 Generated with [anton](https://github.com/) autonomous execution`,
   ];
   return lines.join("\n");
+}
+
+/**
+ * The ticket as it should be dispatched: the board-snapshot bead plus its CURRENT notes blob, read
+ * fresh so an operator's steer written after the run started still reaches this ticket's prompt.
+ * `bd show` failing (e.g. a locked DB) must never block the run — the snapshot bead is returned.
+ */
+async function withDispatchNotes(repo: string, ticket: Bead): Promise<Bead> {
+  const fresh = await beads.show(repo, ticket.id).catch(() => null);
+  return fresh?.notes ? { ...ticket, notes: fresh.notes } : ticket;
 }
 
 /** Swallow errors from best-effort bd side effects (already-applied labels, etc.). */

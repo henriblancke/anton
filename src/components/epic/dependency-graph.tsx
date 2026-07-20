@@ -86,6 +86,9 @@ function EpicGraphNode({ data }: NodeProps<EpicFlowNode>) {
 
 function TicketGraphNode({ data }: NodeProps<TicketFlowNode>) {
   const { ticket, onSelect } = data;
+  // An abandoned ticket is closed, so its stage reads `done` — greyed and relabelled here so the
+  // graph never shows dropped work in the shipped tint.
+  const tint = ticket.abandoned ? "var(--color-subtle)" : STAGE_VAR[ticket.stage];
   return (
     <div
       className="relative"
@@ -104,10 +107,10 @@ function TicketGraphNode({ data }: NodeProps<TicketFlowNode>) {
           "flex size-full flex-col justify-center gap-0.5 rounded-[9px] border border-border bg-card px-3 py-2 text-left text-card-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
           onSelect && "cursor-pointer hover:border-primary/40",
         )}
-        style={{ borderLeft: `3px solid ${STAGE_VAR[ticket.stage]}` }}
+        style={{ borderLeft: `3px solid ${tint}` }}
       >
-        <span className="truncate font-mono text-[9px]" style={{ color: STAGE_VAR[ticket.stage] }}>
-          {ticket.id} · {ticket.stage}
+        <span className="truncate font-mono text-[9px]" style={{ color: tint }}>
+          {ticket.id} · {ticket.abandoned ? "abandoned" : ticket.stage}
         </span>
         <span className="truncate text-[11.5px] font-medium leading-snug">{ticket.title}</span>
       </button>

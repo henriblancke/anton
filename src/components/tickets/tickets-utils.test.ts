@@ -21,6 +21,8 @@ const base: TicketRow = {
   assignee: null,
   createdAt: "",
   createdBy: null,
+  deferred: false,
+  abandoned: false,
 };
 
 describe("filtersFromSearchParams", () => {
@@ -141,7 +143,7 @@ describe("sortTicketsByCreated", () => {
 describe("TICKET_FILTER_FIELDS", () => {
   it("covers every select-driven filter field", () => {
     expect(TICKET_FILTER_FIELDS.map((f) => f.key).sort()).toEqual(
-      ["agent", "domain", "epic", "risk", "size", "status", "type"].sort(),
+      ["agent", "domain", "epic", "outcome", "risk", "size", "status", "type"].sort(),
     );
   });
 });

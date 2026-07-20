@@ -5,8 +5,24 @@ import {
   compareBacklogEpics,
   moveEpicBetweenColumns,
   sortEpics,
+  ticketProgress,
 } from "@/components/board/board-utils";
-import { STAGES, type Epic, type Stage } from "@/lib/types";
+import { STAGES, type Epic, type Stage, type Ticket } from "@/lib/types";
+
+function makeTicket(id: string, over: Partial<Ticket> = {}): Ticket {
+  return {
+    id,
+    title: id,
+    status: "open",
+    stage: "backlog",
+    assignee: null,
+    createdAt: "",
+    createdBy: null,
+    deferred: false,
+    abandoned: false,
+    ...over,
+  };
+}
 
 /** A ready, rank-0 backlog epic; override the dependency/sort fields per test. */
 function makeEpic(id: string, over: Partial<Epic> = {}): Epic {
@@ -22,10 +38,27 @@ function makeEpic(id: string, over: Partial<Epic> = {}): Epic {
     ready: true,
     rank: 0,
     priority: 4,
+    abandoned: false,
     tickets: [],
     ...over,
   };
 }
+
+describe("ticketProgress", () => {
+  it("counts done tickets against the total", () => {
+    const tickets = [makeTicket("a", { stage: "done" }), makeTicket("b")];
+    expect(ticketProgress({ tickets })).toEqual({ done: 1, total: 2, pct: 50 });
+  });
+
+  it("drops abandoned tickets from both sides — won't-do work is out of scope, not shipped", () => {
+    const tickets = [
+      makeTicket("a", { stage: "done" }),
+      makeTicket("b", { stage: "done", status: "closed", abandoned: true }),
+    ];
+    // The abandoned ticket neither inflates `done` nor holds the epic below 100%.
+    expect(ticketProgress({ tickets })).toEqual({ done: 1, total: 1, pct: 100 });
+  });
+});
 
 describe("STAGE_LABELS", () => {
   it("has a human label for every stage", () => {

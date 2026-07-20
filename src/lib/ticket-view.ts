@@ -75,6 +75,8 @@ export function toTicket(bead: Bead): Ticket {
     acceptance: parseAcceptance(bead),
     ...createdMeta(bead),
     prRef: bead.external_ref,
+    deferred: beads.isDeferred(bead),
+    abandoned: beads.isAbandoned(bead),
   };
 }
 
@@ -110,6 +112,8 @@ export function toStandaloneItem(bead: Bead, blockedBy: string[] = []): Standalo
     blockedBy,
     ready: blockedBy.length === 0,
     unread: isUnreadBug(bead),
+    deferred: beads.isDeferred(bead),
+    abandoned: beads.isAbandoned(bead),
   };
 }
 
@@ -168,6 +172,7 @@ export function toEpic(bead: Bead, opts: ToEpicOptions): Epic {
     ready: opts.ready ?? true,
     rank: opts.rank ?? 0,
     priority: bead.priority ?? DEFAULT_PRIORITY,
+    abandoned: beads.isAbandoned(bead),
     tickets: opts.tickets,
   };
 }

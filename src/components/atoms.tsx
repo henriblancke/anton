@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { LockIcon } from "lucide-react";
+import { CircleSlashIcon, LockIcon, MoonIcon } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import type { Stage } from "@/lib/types";
@@ -93,6 +93,29 @@ export function BlockedChip({ blockedBy }: { blockedBy: string[] }) {
     <MetaChip tone="blocked">
       <LockIcon className="size-2.5" aria-hidden="true" />
       <span title={`blocked by ${blockedBy.join(", ")}`}>{label}</span>
+    </MetaChip>
+  );
+}
+
+/** "snoozed" chip — a ticket deliberately deferred out of the ready queue (anton-ywi8). Reads as
+ * paused rather than blocked: nothing is waiting on a dependency, a human parked it. */
+export function SnoozedChip({ className }: { className?: string }) {
+  return (
+    <MetaChip className={className}>
+      <MoonIcon className="size-2.5" aria-hidden="true" />
+      <span title="Snoozed — kept out of the ready queue until un-snoozed">snoozed</span>
+    </MetaChip>
+  );
+}
+
+/** "abandoned" chip — a won't-do outcome (anton-6xj0). Deliberately grey and never `done`-tinted:
+ * an abandoned bead is closed, so every stage derivation reads it as done — this chip is the only
+ * thing standing between a dropped decision and a shipped one. */
+export function AbandonedChip({ className }: { className?: string }) {
+  return (
+    <MetaChip className={className}>
+      <CircleSlashIcon className="size-2.5" aria-hidden="true" />
+      <span title="Abandoned — closed as won't-do, not delivered">abandoned</span>
     </MetaChip>
   );
 }
