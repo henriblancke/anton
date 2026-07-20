@@ -135,7 +135,9 @@ async function swapIfBacklog(
     if (beads.isApproved(fresh)) return "approved" as const;
     const stage = deriveStage(fresh);
     if (stage !== "backlog") return { leftBacklog: stage } as const;
-    return swap(owner, next);
+    // Hand the gates' read to the CAS: it needs the assignee as of this lock, which is exactly what
+    // `fresh` holds — re-reading it would be a second `bd show` of a bead nothing can move.
+    return swap(owner, next, fresh);
   });
 }
 
@@ -187,7 +189,9 @@ export async function POST(
   // slow/unreachable remote could stall — the sync engine's heartbeat is the backstop.
   void nudgeSync(repoPath, epicId, "claiming");
 
-  return NextResponse.json({ item: await beads.show(repoPath, epicId) });
+  // The swap already verified the write with its own read — answer with that bead rather than
+  // spawning a third `bd show` for the same state.
+  return NextResponse.json({ item: swap.bead });
 }
 
 export async function DELETE(
@@ -236,7 +240,11 @@ export async function DELETE(
     // Fire-and-forget for the same reason as POST: the unassign already landed locally, so don't
     // block the release response on the best-effort remote sync.
     void nudgeSync(repoPath, epicId, "releasing");
+    // Post-write state, already verified by the swap's own read.
+    return NextResponse.json({ item: swap.bead });
   }
 
-  return NextResponse.json({ item: await beads.show(repoPath, epicId) });
+  // Nothing was written (the target was unclaimed), so `target` — read fresh by loadTarget — is
+  // still the current state.
+  return NextResponse.json({ item: target });
 }

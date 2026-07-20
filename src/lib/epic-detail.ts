@@ -4,6 +4,7 @@
  * of the epic's own graph. See DESIGN.md §2/§3.
  */
 import { beads } from "./beads/bd";
+import { ensureDescription } from "./beads/issues";
 import { getDb } from "./db";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
 import { findOpenRunForEpic } from "./runs";
@@ -31,8 +32,8 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
   if (!lite) {
     throw new Error(`Epic not found: ${epicId}`);
   }
-  // `bd list` omits the description, so fetch the bead once for its goal/acceptance.
-  const full = await beads.show(project.repoPath, epicId).catch(() => lite);
+  // Serve the contract off the snapshot bead; only a description the list dropped costs a `bd show`.
+  const full = await ensureDescription(project.repoPath, lite);
   const run = await openRunFor(project, epicId);
   const base = await githubBaseUrl(project.repoPath);
 

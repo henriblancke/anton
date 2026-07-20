@@ -382,8 +382,9 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     // The pre-lock stage gate can read backlog, then the owner's runner starts before the CAS:
     // it moves the bead to stage:implementing but leaves the assignee as the old owner, so a swap
     // matching on assignee alone would reassign a live run to the approver. The route re-derives the
-    // stage under the claim lock to reject exactly that window. Simulate it by returning the backlog
-    // snapshot for the pre-lock read, then tagging the bead implementing before the under-lock read.
+    // stage under the claim lock to reject exactly that window. The pre-lock gate reads the bead off
+    // the `bd list` the route forces up front (still backlog here), so simulate the runner starting
+    // in the window after it by tagging the bead implementing just before the under-lock read lands.
     const epic = await beads.create(repo, { title: "Racing take-over", type: "epic" });
     const child = await beads.create(repo, { title: "Racing take-over child", type: "task" });
     await beads.link(repo, child, epic, "parent-child");
@@ -393,12 +394,11 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     const realShow = beads.show.bind(beads);
     let raced = false;
     const spy = vi.spyOn(beads, "show").mockImplementation(async (cwd, id) => {
-      const bead = await realShow(cwd, id);
       if (id === epic && !raced) {
-        raced = true; // first read (the pre-lock gate) sees backlog; the runner then "starts"
+        raced = true; // the owner's runner "starts" between the pre-lock gate and this read
         await beads.tag(repo, epic, ["stage:implementing"]);
       }
-      return bead;
+      return realShow(cwd, id);
     });
 
     actAs("anton-test");
@@ -554,6 +554,74 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     expect(res.status).toBe(404);
     expect((await res.json()).error).toMatch(/not found/i);
   });
+
+  // anton-hwkx: read economy. Approve used to spend up to four `bd list`/`bd show` reads of its own
+  // around the single write — a forced list + board build before it, an ownership `show`, then a
+  // second forced list + board build after it — with every one of them queued behind the Dolt lock on
+  // the operator's critical path. The trimmed path reads once and answers off state it already holds.
+  it("spends at most two bd reads on a normal approve", async () => {
+    // A target the operator already owns (the UI's Force run / re-approve): the CAS finds the
+    // assignee already where it wants it, so the whole request is one forced `bd list` for the
+    // readiness gate plus the CAS's one under-lock re-read — no board refresh, no ownership `show`.
+    actAs("anton-test");
+    const epic = await beads.create(repo, { title: "Read-economy epic", type: "epic" });
+    const child = await beads.create(repo, { title: "Read-economy epic child", type: "task" });
+    await beads.link(repo, child, epic, "parent-child");
+    await beads.assign(repo, epic, "anton-test");
+
+    // The remote push is fire-and-forget off the response path; stub it so its spawns aren't counted.
+    const syncSpy = vi.spyOn(beads, "sync").mockResolvedValue(undefined);
+    const listSpy = vi.spyOn(beads, "list");
+    const showSpy = vi.spyOn(beads, "show");
+    // Count reads as of the approve write — the last step of the approve chain. What follows is the
+    // enqueue's own cross-machine liveness gate (liveRunCheck, anton-jz1), a separate concern.
+    let readsAtWrite = -1;
+    const realTag = beads.tag.bind(beads);
+    const tagSpy = vi.spyOn(beads, "tag").mockImplementation(async (cwd, id, labels) => {
+      if (id === epic) readsAtWrite = listSpy.mock.calls.length + showSpy.mock.calls.length;
+      return realTag(cwd, id, labels);
+    });
+    try {
+      const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", epic));
+      expect(res.status).toBe(200);
+      expect(readsAtWrite).toBeLessThanOrEqual(2);
+      expect(listSpy).toHaveBeenCalledTimes(1); // the readiness gate; the board build reuses it
+    } finally {
+      tagSpy.mockRestore();
+      listSpy.mockRestore();
+      showSpy.mockRestore();
+      syncSpy.mockRestore();
+    }
+    // Behaviour is unchanged by the trim: the label landed and the reservation stands.
+    const bead = await beads.show(repo, epic);
+    expect(beads.isApproved(bead)).toBe(true);
+    expect(bead.assignee).toBe("anton-test");
+  }, 60_000);
+
+  it("reads once for the gate and never re-reads the board after the write", async () => {
+    // An unclaimed target additionally pays the CAS write chain (assign + its post-write verify
+    // read), which is the claim guard and stays. What must NOT come back is a second forced `bd list`
+    // for the response: the write flags the snapshot pendingWrite, so the client's next poll blocks
+    // on a fresh read anyway — and the 200 body still carries the just-written approval + assignee.
+    actAs("anton-test");
+    const epic = await beads.create(repo, { title: "Read-economy unclaimed", type: "epic" });
+    const child = await beads.create(repo, { title: "Read-economy unclaimed child", type: "task" });
+    await beads.link(repo, child, epic, "parent-child");
+
+    const syncSpy = vi.spyOn(beads, "sync").mockResolvedValue(undefined);
+    const listSpy = vi.spyOn(beads, "list");
+    try {
+      const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", epic));
+      expect(res.status).toBe(200);
+      const { item } = await res.json();
+      expect(item.approved).toBe(true);
+      expect(item.assignee).toBe("anton-test");
+      expect(listSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      listSpy.mockRestore();
+      syncSpy.mockRestore();
+    }
+  }, 60_000);
 
   // anton-u8wu (A2): approval enqueues the run off the local approve write, so it must not block on
   // the remote push. Hold the sync pending, prove POST responds 200 before it settles (off the

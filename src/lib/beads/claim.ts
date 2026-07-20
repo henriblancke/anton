@@ -34,8 +34,12 @@
  */
 import { beads, type Bead } from "./bd";
 
-/** The outcome of a swap: `ok` when the assignee is now `next`, else the owner that beat us. */
-export type SwapResult = { ok: true } | { ok: false; owner: string | undefined };
+/**
+ * The outcome of a swap: `ok` when the assignee is now `next`, else the owner that beat us. A
+ * successful swap carries the bead it verified — the post-write read on a real write, the read it
+ * short-circuited on a no-op — so callers can answer with it instead of spawning `bd show` again.
+ */
+export type SwapResult = { ok: true; bead: Bead } | { ok: false; owner: string | undefined };
 
 /** The bd surface a swap needs, injectable so tests can drive it without a real board. */
 export interface AssigneeStore {
@@ -57,10 +61,16 @@ export function conflictBody(id: string, owner: string | undefined): { error: st
     : { error: `${id}'s claim changed while this request was in flight — reload and retry` };
 }
 
-/** The CAS handed to a `withClaimLock` body: the swap, minus the lock the body already holds. */
+/**
+ * The CAS handed to a `withClaimLock` body: the swap, minus the lock the body already holds.
+ * `current` lets a body that already read the bead UNDER THIS LOCK (the claim route re-derives the
+ * backlog gates from a fresh read there) hand that read in rather than pay for an identical one —
+ * the lock is what makes them identical. Omit it and the swap reads the bead itself.
+ */
 export type LockedSwap = (
   expectedOwner: string | undefined,
   next: string | undefined,
+  current?: Bead,
 ) => Promise<SwapResult>;
 
 /** A claim guard bound to one bd surface: the per-bead lock, plus the one-shot swap built on it. */
@@ -93,10 +103,12 @@ export function createClaimGuard(store: AssigneeStore = beads): ClaimGuard {
 
   const swapUnlocked =
     (repoPath: string, id: string): LockedSwap =>
-    async (expectedOwner, next) => {
+    async (expectedOwner, next, current) => {
       // Re-read inside the lock: `expectedOwner` came from a snapshot the caller took before its
       // gates ran, and a claim landing in that window must lose here rather than be overwritten.
-      const before = ownerOf(await store.show(repoPath, id));
+      // A `current` handed in was itself read under this lock, so it IS that re-read.
+      const bead = current ?? (await store.show(repoPath, id));
+      const before = ownerOf(bead);
       // Already where we want it — the desired owner already holds it (re-claiming your own, a
       // duplicate same-actor Claim/Approve off one snapshot, releasing an unclaimed target). Writing
       // would be a no-op, so skip bd and stay idempotent. Checked BEFORE the mismatch guard on
@@ -104,7 +116,7 @@ export function createClaimGuard(store: AssigneeStore = beads): ClaimGuard {
       // winner sets the owner to exactly what the loser also wanted, so `before !== expectedOwner`
       // would otherwise turn the loser into a spurious 409 even though the end state it asked for
       // already holds.
-      if (before === next) return { ok: true };
+      if (before === next) return { ok: true, bead };
       // A different owner landed in the window (a real steal by someone else) — lose here rather
       // than overwrite it, and name who holds the claim now.
       if (before !== expectedOwner) return { ok: false, owner: before };
@@ -112,8 +124,9 @@ export function createClaimGuard(store: AssigneeStore = beads): ClaimGuard {
       if (next) await store.assign(repoPath, id, next);
       else await store.unassign(repoPath, id);
 
-      const after = ownerOf(await store.show(repoPath, id));
-      return after === next ? { ok: true } : { ok: false, owner: after };
+      const written = await store.show(repoPath, id);
+      const after = ownerOf(written);
+      return after === next ? { ok: true, bead: written } : { ok: false, owner: after };
     };
 
   function withClaimLock<T>(
