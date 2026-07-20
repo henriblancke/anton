@@ -44,15 +44,20 @@ jobs:
         run: bun run build
 
   # Integration (anton-0oi). Installs `bd` so the beads-backed integration suites actually execute
-  # instead of self-skipping in `check`. Report-only for now — `execute-epic.integration.test.ts` is
-  # currently red on an idle machine, so blocking on this would wedge every PR; the job exists to
-  # make that failure *visible* rather than hidden behind a green `check`. Flip `continue-on-error`
-  # off once that suite is healthy — that is the point of the job.
+  # instead of self-skipping in `check`. Report-only for now — flip `continue-on-error` off once the
+  # suite is reliably green here; the job exists to make failures *visible* rather than hidden behind
+  # a green `check`.
   integration:
     runs-on: ubuntu-latest
     continue-on-error: true
     # Real bd/Dolt work shells out per issue and is slow; cap it so a hang can't run for hours.
     timeout-minutes: 45
+    env:
+      # PINNED deliberately. beads' install.sh always takes the LATEST release, which made this job
+      # non-deterministic: it silently jumped to bd 1.1.0 and went red on a config-format change
+      # unrelated to any PR. CI must run the version developers run — upgrade this on purpose, not
+      # by surprise (anton-0oi). See anton-qhoz for the 1.1.0 compatibility work.
+      BD_VERSION: "1.0.4"
     steps:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
@@ -60,12 +65,19 @@ jobs:
           bun-version: "1.3.14" # match package.json `packageManager`
       - name: Install bd
         run: |
-          curl -sSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      - name: Verify bd is on PATH
-        # Fail loud: if bd didn't install, the suites would silently self-skip again and this job
-        # would report green — exactly the false signal it exists to remove.
-        run: bd version
+          set -euo pipefail
+          curl -fsSL -o /tmp/bd.tar.gz \
+            "https://github.com/gastownhall/beads/releases/download/v${BD_VERSION}/beads_${BD_VERSION}_linux_amd64.tar.gz"
+          sudo tar -xzf /tmp/bd.tar.gz -C /usr/local/bin bd
+      - name: Verify bd is on PATH at the pinned version
+        # Fail loud twice over: if bd didn't install, the suites would silently self-skip and this job
+        # would report green — the exact false signal it exists to remove. And if the resolved version
+        # drifts from BD_VERSION, fail rather than test something other than what developers run.
+        run: |
+          set -euo pipefail
+          bd version
+          bd version | grep -q "bd version ${BD_VERSION}" || {
+            echo "::error::bd version mismatch — expected ${BD_VERSION}, got: $(bd version)"; exit 1; }
       - name: Install
         run: bun install --frozen-lockfile
       - name: Test (integration included)
