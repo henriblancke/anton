@@ -34,6 +34,7 @@ import {
   configureBeadsDoltSync,
   detectHooksManager,
   normalizeRemoteUrl,
+  untrackBeadsExports,
 } from "../src/lib/beads/config.mjs";
 
 const CLI = join(dirname(fileURLToPath(import.meta.url)), "anton.mjs");
@@ -170,6 +171,67 @@ describe("ensureBeadsGitignore (anton init)", () => {
     for (const e of ["issues.jsonl", "interactions.jsonl", "dolt/", "embeddeddolt/"]) {
       expect(text).toContain(e);
     }
+  });
+});
+
+// anton-vqgw: .gitignore only suppresses UNTRACKED files. A repo that committed issues.jsonl before
+// the ignore existed keeps shipping a frozen board snapshot to every clone and branch, which inbound
+// tooling can replay over live state — so anton init has to untrack it, not just ignore it.
+describe("untrackBeadsExports (anton init)", () => {
+  let dir: string;
+
+  function gitRepoWith(files: Record<string, string>): void {
+    spawnSync("git", ["init", "-q"], { cwd: dir });
+    spawnSync("git", ["config", "user.email", "t@example.com"], { cwd: dir });
+    spawnSync("git", ["config", "user.name", "anton-test"], { cwd: dir });
+    mkdirSync(join(dir, ".beads"), { recursive: true });
+    for (const [rel, body] of Object.entries(files)) writeFileSync(join(dir, rel), body);
+    spawnSync("git", ["add", "-A"], { cwd: dir });
+    spawnSync("git", ["commit", "-qm", "seed"], { cwd: dir });
+  }
+
+  const tracked = (): string[] =>
+    (spawnSync("git", ["ls-files", "--", ".beads/"], { cwd: dir, encoding: "utf8" }).stdout || "")
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean);
+
+  afterEach(async () => {
+    if (dir) await rm(dir, { recursive: true, force: true });
+  });
+
+  it("untracks a committed issues.jsonl while leaving real config files tracked", async () => {
+    dir = await mkdtemp(join(tmpdir(), "anton-untrack-"));
+    gitRepoWith({
+      ".beads/issues.jsonl": '{"id":"x-1","status":"open"}\n',
+      ".beads/config.yaml": "issue-prefix: x\n",
+    });
+    expect(tracked()).toContain(".beads/issues.jsonl");
+
+    const r = untrackBeadsExports(dir);
+
+    expect(r.untracked).toEqual([".beads/issues.jsonl"]);
+    expect(tracked()).not.toContain(".beads/issues.jsonl");
+    // config.yaml is team-config and must stay in git.
+    expect(tracked()).toContain(".beads/config.yaml");
+    // Untracked, not deleted — the export is still on disk for bd to use.
+    await expect(stat(join(dir, ".beads/issues.jsonl"))).resolves.toBeDefined();
+  });
+
+  it("is a no-op when nothing is tracked", async () => {
+    dir = await mkdtemp(join(tmpdir(), "anton-untrack-"));
+    gitRepoWith({ ".beads/config.yaml": "issue-prefix: x\n" });
+
+    const r = untrackBeadsExports(dir);
+
+    expect(r.untracked).toEqual([]);
+    expect(tracked()).toEqual([".beads/config.yaml"]);
+  });
+
+  it("does not throw outside a git repo", async () => {
+    dir = await mkdtemp(join(tmpdir(), "anton-untrack-"));
+    mkdirSync(join(dir, ".beads"), { recursive: true });
+    expect(untrackBeadsExports(dir).untracked).toEqual([]);
   });
 });
 
