@@ -1,5 +1,7 @@
-# Beads/Dolt sync (anton-q3o): keep Dolt in sync on branch switches. Chains the
-# bd-managed shim (guarded by `command -v bd`, so contributors without bd are unaffected).
-if [ -f .beads/hooks/post-checkout ]; then
-  sh .beads/hooks/post-checkout "$@"
-fi
+# Beads/Dolt: intentionally NO hydration here (anton-vqgw).
+#
+# Same reasoning as .husky/post-merge: the bd post-checkout shim re-imports Dolt on branch switches,
+# which is redundant for an anton-driven repo and can overwrite newer local rows with an older
+# snapshot. anton creates a worktree per ticket, so this fired constantly.
+#
+# Export/push stays chained in .husky/pre-commit and .husky/pre-push.
