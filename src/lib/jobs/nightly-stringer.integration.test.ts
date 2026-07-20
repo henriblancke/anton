@@ -85,18 +85,21 @@ process.exit(0);`,
       binDir,
       "claude",
       `const fs=require('fs');const cp=require('child_process');
-const a=process.argv.slice(2);const get=f=>{const i=a.indexOf(f);return i>=0?a[i+1]:undefined;};
-const prompt=get('-p')||'';
-if(process.env.ANTON_TEST_CLAUDE_ARGV)fs.appendFileSync(process.env.ANTON_TEST_CLAUDE_ARGV,JSON.stringify({prompt})+'\\n');
-const m=prompt.match(/scan file to triage is: (\\S+)/);
-if(m){const scan=JSON.parse(fs.readFileSync(m[1],'utf8'));
-  for(const s of (scan.signals||[])){
-    cp.execFileSync('bd',['create','Triaged: '+s.Title,'--type','task','--acceptance','fix it','--json'],{cwd:process.cwd()});
+// Prompt arrives on stdin, never on argv (anton-14tj).
+let prompt='';process.stdin.setEncoding('utf8');
+process.stdin.on('data',c=>{prompt+=c;});
+process.stdin.on('end',()=>{
+  if(process.env.ANTON_TEST_CLAUDE_ARGV)fs.appendFileSync(process.env.ANTON_TEST_CLAUDE_ARGV,JSON.stringify({prompt})+'\\n');
+  const m=prompt.match(/scan file to triage is: (\\S+)/);
+  if(m){const scan=JSON.parse(fs.readFileSync(m[1],'utf8'));
+    for(const s of (scan.signals||[])){
+      cp.execFileSync('bd',['create','Triaged: '+s.Title,'--type','task','--acceptance','fix it','--json'],{cwd:process.cwd()});
+    }
   }
-}
-const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
-e({type:'result',subtype:'success',result:'created beads',is_error:false});
-process.exit(0);`,
+  const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+  e({type:'result',subtype:'success',result:'created beads',is_error:false});
+  process.exit(0);
+});`,
     );
 
     const set = (k: string, v: string) => {
