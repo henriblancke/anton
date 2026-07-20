@@ -4,7 +4,7 @@
  * Mirrors the read/parse patterns in epic-detail.ts and tickets.ts. See DESIGN.md §2/§3.
  */
 import { beads, type BeadPatch } from "./beads/bd";
-import { refreshAllIssues } from "./beads/issues";
+import { allIssues, ensureDescription } from "./beads/issues";
 import { formatHumanNote, parseTicketNotes, type TicketNote } from "./beads/notes";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
 import { createdMeta, deriveStage, labelValue, parseAcceptance, parseGoal } from "./ticket-view";
@@ -40,31 +40,56 @@ function toTicketDetail(lite: Bead, full: Bead, epic: Bead | undefined): TicketD
   };
 }
 
-/**
- * Read a ticket's full detail. `fresh` forces a post-write board read for read-after-write callers
- * (updateTicket): the snapshot serves stale-but-retained data by default so the board never blocks,
- * but a mutation's own response must reflect the write it just made, or the edit form resets back to
- * pre-write title/labels/approval. A plain GET keeps the non-blocking stale read.
- */
-export async function getTicketDetail(
+const parentOf = (bead: Bead): string | undefined =>
+  (bead.parent ?? bead.parent_id) as string | undefined;
+
+/** Finish a detail: the PR link needs the repo's GitHub base, cached per repo in git/remote. */
+async function withPrUrl(
   project: Project,
-  id: string,
-  fresh = false,
+  lite: Bead,
+  full: Bead,
+  epic: Bead | undefined,
 ): Promise<TicketDetail> {
+  const base = await githubBaseUrl(project.repoPath);
+  return attachPrUrl(toTicketDetail(lite, full, epic), base);
+}
+
+/** Read a ticket's full detail off the board snapshot (stale-but-retained, so a GET never blocks). */
+export async function getTicketDetail(project: Project, id: string): Promise<TicketDetail> {
   // one call: carries parent + inline dependencies
-  const all = fresh ? await refreshAllIssues(project.repoPath) : await listAllBeads(project);
+  const all = await listAllBeads(project);
   const lite = all.find((b) => b.id === id);
   if (!lite) {
     throw new Error(`Ticket not found: ${id}`);
   }
-  // `bd list` omits the description, so fetch the bead once for its goal/acceptance markdown.
-  const full = await beads.show(project.repoPath, id).catch(() => lite);
+  // Serve the contract off the snapshot bead; only a description the list dropped costs a `bd show`.
+  const full = await ensureDescription(project.repoPath, lite);
 
-  const parentId = (lite.parent ?? lite.parent_id) as string | undefined;
+  const parentId = parentOf(lite);
   const epic = parentId ? all.find((b) => b.id === parentId) : undefined;
+  return withPrUrl(project, lite, full, epic);
+}
 
-  const base = await githubBaseUrl(project.repoPath);
-  return attachPrUrl(toTicketDetail(lite, full, epic), base);
+/**
+ * Detail built from a bead just read by `bd show` — the read-after-write half of updateTicket. That
+ * bead is authoritative for the ticket itself (`bd show` carries everything `bd list` does, plus the
+ * description), so the board is consulted only for the parent epic's title/assignee, and only when
+ * the ticket has a parent.
+ *
+ * That board read must NOT force a cold `bd list`: the write already bumped the snapshot version, so
+ * the client's next poll reloads the board regardless, and blocking here would put a `bd list` —
+ * queued behind the Dolt lock — on the save request's critical path for two header fields that the
+ * write cannot have changed. `blockOnPendingWrite: false` serves the retained board and kicks the
+ * post-write refresh in the background, which is the very load that next poll then shares.
+ */
+export async function freshDetail(project: Project, bead: Bead): Promise<TicketDetail> {
+  const parentId = parentOf(bead);
+  const epic = parentId
+    ? (await allIssues(project.repoPath, { blockOnPendingWrite: false })).find(
+        (b) => b.id === parentId,
+      )
+    : undefined;
+  return withPrUrl(project, bead, bead, epic);
 }
 
 /**
@@ -79,11 +104,11 @@ export async function updateTicket(
 ): Promise<TicketDetail> {
   const current = await beads.show(project.repoPath, id);
   await beads.update(project.repoPath, id, patch, current.labels ?? []);
-  // Read-after-write: return the post-write detail, not the stale snapshot the board serves. This
-  // MUST complete before the sync below: a succeeding sync calls invalidateIssueSnapshot, bumping
-  // the snapshot generation, which makes refreshIssueSnapshot discard this fresh loader's result and
-  // serve the retained pre-edit beads — the exact form reset this fresh read exists to prevent.
-  const detail = await getTicketDetail(project, id, true);
+  // Read-after-write: the response must reflect the write, not the stale board the snapshot serves,
+  // or the edit form resets to pre-write title/labels/approval. One `bd show` is the whole read —
+  // it goes straight to bd, so unlike a snapshot refresh it can't be discarded by the sync below
+  // bumping the snapshot generation.
+  const detail = await freshDetail(project, await beads.show(project.repoPath, id));
   // Fire-and-forget (like the claim route's nudgeSync): the update already landed locally, so don't
   // block the save response on a `bd dolt pull/commit/push` a slow/unreachable remote could stall. A
   // failed push is recorded as "failing"/unpushed in the sync-status registry inside beads.sync and
@@ -150,9 +175,9 @@ export async function setTicketDeferred(
   await beads.show(project.repoPath, id); // 404 guard — bd throws on an unknown id
   if (deferred) await beads.defer(project.repoPath, id);
   else await beads.undefer(project.repoPath, id);
-  // Read-after-write, like updateTicket: the response must show the snoozed state it just set, not
-  // the board's stale snapshot. Must complete before the sync below invalidates the snapshot.
-  const detail = await getTicketDetail(project, id, true);
+  // Read-after-write, like updateTicket: the `bd show` bead is authoritative for the snoozed state
+  // it just set, so the response never reflects the board's stale snapshot.
+  const detail = await freshDetail(project, await beads.show(project.repoPath, id));
   // Fire-and-forget, like every other bd write here: the write already landed locally and the
   // heartbeat backstop retries a failed push — never block the response on a slow remote.
   void beads

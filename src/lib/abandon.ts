@@ -6,7 +6,7 @@
  */
 import { beads } from "./beads/bd";
 import { cancelRunForTarget } from "./jobs/service";
-import { getTicketDetail } from "./ticket-detail";
+import { freshDetail } from "./ticket-detail";
 import type { Bead } from "./beads/bd";
 import { MAX_ABANDON_REASON_CHARS } from "./types";
 import type { Project, TicketDetail } from "./types";
@@ -77,9 +77,9 @@ export async function abandonTicket(
   await cancelRunForTarget(project.id, runTarget);
 
   await beads.abandon(project.repoPath, id, why);
-  // Read-after-write, like setTicketDeferred: the response must show the abandoned state it just
-  // wrote, not the board's stale snapshot. Must complete before the sync invalidates the snapshot.
-  const detail = await getTicketDetail(project, id, true);
+  // Read-after-write, like setTicketDeferred: the `bd show` bead is authoritative for the abandoned
+  // state it just wrote, so the response never reflects the board's stale snapshot.
+  const detail = await freshDetail(project, await beads.show(project.repoPath, id));
   nudgeSync(project, id);
   return detail;
 }

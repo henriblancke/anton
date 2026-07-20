@@ -589,18 +589,65 @@ function cmdStatus(args) {
   return 0;
 }
 
-/** Fetch the latest GitHub release metadata for owner/repo (best-effort; returns null on failure). */
+/** First non-empty GitHub token from the env (anton-specific wins, then the standard names). */
+function githubToken() {
+  for (const name of ["ANTON_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]) {
+    const v = process.env[name];
+    if (v && v.trim()) return v.trim();
+  }
+  return null;
+}
+
+/** Auth header for GitHub requests when a token is set (never logged). */
+function githubAuthHeader() {
+  const token = githubToken();
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+/**
+ * Fetch the latest GitHub release metadata for owner/repo.
+ * Returns a discriminated result: `{ release }` on success, or `{ error }` describing the cause
+ * (`rate_limit` with reset epoch seconds, `timeout`, `not_found`, `http` with status, `network`).
+ */
 async function fetchLatestRelease() {
   const url = `https://api.github.com/repos/${RELEASE_OWNER}/${RELEASE_REPO}/releases/latest`;
   try {
     const res = await fetch(url, {
-      headers: { "User-Agent": "anton-cli", Accept: "application/vnd.github+json" },
+      headers: { "User-Agent": "anton-cli", Accept: "application/vnd.github+json", ...githubAuthHeader() },
       signal: AbortSignal.timeout(10000),
     });
-    if (!res.ok) return null;
-    return await res.json();
-  } catch {
-    return null;
+    if (!res.ok) {
+      // GitHub signals rate-limit exhaustion with 403/429 + x-ratelimit-remaining: 0.
+      if ((res.status === 403 || res.status === 429) && res.headers.get("x-ratelimit-remaining") === "0") {
+        const reset = Number(res.headers.get("x-ratelimit-reset"));
+        return { error: { kind: "rate_limit", reset: Number.isFinite(reset) ? reset : null } };
+      }
+      if (res.status === 404) return { error: { kind: "not_found" } };
+      return { error: { kind: "http", status: res.status } };
+    }
+    return { release: await res.json() };
+  } catch (e) {
+    if (e?.name === "TimeoutError") return { error: { kind: "timeout" } };
+    return { error: { kind: "network", message: e?.message ?? String(e) } };
+  }
+}
+
+/** Render a fetchLatestRelease `error` object as a user-facing line. */
+function describeReleaseError(error) {
+  switch (error.kind) {
+    case "rate_limit": {
+      const when = error.reset ? new Date(error.reset * 1000).toLocaleString() : "later";
+      const hint = githubToken() ? "" : " Set ANTON_GITHUB_TOKEN (or GH_TOKEN/GITHUB_TOKEN) to raise the limit.";
+      return `GitHub API rate limit exceeded — resets at ${when}.${hint}`;
+    }
+    case "timeout":
+      return "request to GitHub timed out — try again later.";
+    case "not_found":
+      return `no releases found for ${RELEASE_OWNER}/${RELEASE_REPO}.`;
+    case "http":
+      return `GitHub returned HTTP ${error.status}.`;
+    default:
+      return `could not reach GitHub releases — ${error.message ?? "try again later."}`;
   }
 }
 
@@ -612,7 +659,12 @@ async function cmdUpdate() {
   }
   const current = bundleVersion();
   console.log(c.dim(`current version: ${current}. Checking ${RELEASE_OWNER}/${RELEASE_REPO}…`));
-  const rel = await fetchLatestRelease();
+  const result = await fetchLatestRelease();
+  if (result.error) {
+    console.log(c.red(describeReleaseError(result.error)));
+    return 1;
+  }
+  const rel = result.release;
   if (!rel || !rel.tag_name) {
     console.log(c.red("could not reach GitHub releases — try again later."));
     return 1;
@@ -635,7 +687,7 @@ async function cmdUpdate() {
   const tarball = join(tmp, asset.name);
   try {
     const res = await fetch(asset.browser_download_url, {
-      headers: { "User-Agent": "anton-cli" },
+      headers: { "User-Agent": "anton-cli", ...githubAuthHeader() },
       signal: AbortSignal.timeout(120000),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -1190,6 +1242,7 @@ export {
   INSTALLED_SKILLS,
   compareVersions,
   platformLabel,
+  fetchLatestRelease,
   applyMigrations,
   ensureMigrated,
   ensureBetterSqlite3,

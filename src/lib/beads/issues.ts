@@ -1,5 +1,6 @@
 import { beads, type Bead } from "./bd";
 import {
+  getBeadDescription,
   getIssueSnapshot,
   probeIssueSnapshot,
   readIssueSnapshot,
@@ -25,13 +26,19 @@ export async function loadAllIssues(cwd: string): Promise<Bead[]> {
   }
 }
 
-export function allIssues(cwd: string, opts?: SnapshotReadOptions): Promise<Bead[]> {
+export function allIssues(
+  cwd: string,
+  opts?: SnapshotReadOptions,
+): Promise<Bead[]> {
   return getIssueSnapshot(cwd, () => loadAllIssues(cwd), undefined, opts);
 }
 
 /** Beads plus the snapshot version they carry, read atomically — for callers that stamp a response
  * with the version (the board freshness token) and must not desync data from version. */
-export function readAllIssues(cwd: string, opts?: SnapshotReadOptions): Promise<SnapshotRead> {
+export function readAllIssues(
+  cwd: string,
+  opts?: SnapshotReadOptions,
+): Promise<SnapshotRead> {
   return readIssueSnapshot(cwd, () => loadAllIssues(cwd), undefined, opts);
 }
 
@@ -41,4 +48,25 @@ export function refreshAllIssues(cwd: string): Promise<Bead[]> {
 
 export function probeAllIssues(cwd: string): void {
   probeIssueSnapshot(cwd, () => loadAllIssues(cwd));
+}
+
+/**
+ * Return a snapshot bead guaranteed to carry its description, so detail views can be served off the
+ * already-loaded list without a fresh `bd show`. `bd list --json` carries the description on
+ * structured boards, so a snapshot bead is returned as-is — zero bd spawns. When the list omits it
+ * (the one field it can drop), the description is fetched once via `bd show` and memoized (see
+ * getBeadDescription), so repeat opens of the same bead stay warm.
+ */
+export async function ensureDescription(
+  cwd: string,
+  lite: Bead,
+): Promise<Bead> {
+  if (lite.description !== undefined) return lite;
+  const description = await getBeadDescription(cwd, lite.id, async () => {
+    // Let transient bd failures reject: getBeadDescription must not turn a failed read into a
+    // successfully cached empty contract. A later detail open can then retry the read.
+    const full = await beads.show(cwd, lite.id);
+    return full?.description;
+  });
+  return { ...lite, description };
 }

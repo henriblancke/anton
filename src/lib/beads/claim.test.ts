@@ -43,7 +43,7 @@ describe("createAssigneeSwap", () => {
   it("claims an unclaimed target", async () => {
     const { store, owner } = fakeStore(undefined);
     const swap = createAssigneeSwap(store);
-    await expect(swap("/repo", "bd-1", undefined, "alice")).resolves.toEqual({ ok: true });
+    await expect(swap("/repo", "bd-1", undefined, "alice")).resolves.toMatchObject({ ok: true });
     expect(owner()).toBe("alice");
   });
 
@@ -70,14 +70,14 @@ describe("createAssigneeSwap", () => {
   it("completes a steal authorized against the owner who still holds the claim", async () => {
     const { store, owner } = fakeStore("bob");
     const swap = createAssigneeSwap(store);
-    await expect(swap("/repo", "bd-1", "bob", "alice")).resolves.toEqual({ ok: true });
+    await expect(swap("/repo", "bd-1", "bob", "alice")).resolves.toMatchObject({ ok: true });
     expect(owner()).toBe("alice");
   });
 
   it("re-claiming your own target is a verified no-op — no bd write", async () => {
     const { store, calls } = fakeStore("alice");
     const swap = createAssigneeSwap(store);
-    await expect(swap("/repo", "bd-1", "alice", "alice")).resolves.toEqual({ ok: true });
+    await expect(swap("/repo", "bd-1", "alice", "alice")).resolves.toMatchObject({ ok: true });
     expect(calls.filter((c) => c.startsWith("assign"))).toEqual([]);
   });
 
@@ -88,14 +88,14 @@ describe("createAssigneeSwap", () => {
     // `before` (alice) no longer matches its `expectedOwner` (undefined).
     const { store, calls } = fakeStore("alice");
     const swap = createAssigneeSwap(store);
-    await expect(swap("/repo", "bd-1", undefined, "alice")).resolves.toEqual({ ok: true });
+    await expect(swap("/repo", "bd-1", undefined, "alice")).resolves.toMatchObject({ ok: true });
     expect(calls.filter((c) => c.startsWith("assign"))).toEqual([]); // no redundant write
   });
 
   it("releases a claim, and refuses to release one that changed hands", async () => {
     const held = fakeStore("alice");
     const releaseSwap = createAssigneeSwap(held.store);
-    await expect(releaseSwap("/repo", "bd-1", "alice", undefined)).resolves.toEqual({ ok: true });
+    await expect(releaseSwap("/repo", "bd-1", "alice", undefined)).resolves.toMatchObject({ ok: true });
     expect(held.owner()).toBeUndefined();
 
     const moved = fakeStore("bob");
@@ -132,7 +132,7 @@ describe("createAssigneeSwap", () => {
       swapOne("/repo", "bd-1", undefined, "alice"),
       swapOne("/repo", "bd-2", undefined, "bob"),
     ]);
-    expect([a, b]).toEqual([{ ok: true }, { ok: true }]);
+    expect([a.ok, b.ok]).toEqual([true, true]);
   });
 
   it("reports a conflict when another bd client overwrites the assignee after our write", async () => {
@@ -164,8 +164,48 @@ describe("createAssigneeSwap", () => {
     await expect(swap("/repo", "bd-1", undefined, "alice")).rejects.toThrow("bd exploded");
 
     store.assign = realAssign;
-    await expect(swap("/repo", "bd-1", undefined, "alice")).resolves.toEqual({ ok: true });
+    await expect(swap("/repo", "bd-1", undefined, "alice")).resolves.toMatchObject({ ok: true });
     expect(owner()).toBe("alice");
+  });
+});
+
+describe("swap read economy", () => {
+  it("returns the bead it verified, so the caller needn't read the bead again", async () => {
+    const { store, calls } = fakeStore(undefined);
+    const swap = createAssigneeSwap(store);
+
+    const result = await swap("/repo", "bd-1", undefined, "alice");
+
+    expect(result).toEqual({ ok: true, bead: { id: "bd-1", assignee: "alice" } });
+    // Exactly the two reads the CAS needs: the pre-write re-read and the post-write verification.
+    expect(calls).toEqual(["show bd-1", "assign bd-1 alice", "show bd-1"]);
+  });
+
+  it("reuses a bead the lock holder already read instead of re-reading it", async () => {
+    // The claim route's shape: it re-derives its backlog gates from a fresh read under the lock,
+    // then swaps. Handing that read in drops the CAS's own pre-write `bd show`.
+    const { store, calls } = fakeStore(undefined);
+    const guard = createClaimGuard(store);
+
+    const result = await guard.withClaimLock("/repo", "bd-1", async (swap) => {
+      const fresh = await store.show("/repo", "bd-1");
+      return swap(ownerOf(fresh), "alice", fresh);
+    });
+
+    expect(result).toMatchObject({ ok: true });
+    expect(calls).toEqual(["show bd-1", "assign bd-1 alice", "show bd-1"]);
+    expect(calls.filter((c) => c.startsWith("show"))).toHaveLength(2); // not 3
+  });
+
+  it("a no-op swap answers from the read it already has — no second read, no write", async () => {
+    const { store, calls } = fakeStore("alice");
+    const swap = createAssigneeSwap(store);
+
+    await expect(swap("/repo", "bd-1", "alice", "alice")).resolves.toEqual({
+      ok: true,
+      bead: { id: "bd-1", assignee: "alice" },
+    });
+    expect(calls).toEqual(["show bd-1"]);
   });
 });
 
@@ -190,7 +230,7 @@ describe("withClaimLock", () => {
       return r;
     });
 
-    await expect(approving).resolves.toEqual({ ok: true });
+    await expect(approving).resolves.toMatchObject({ ok: true });
     // bob gated on `undefined`, but alice owns it by the time his swap runs — he loses, not stomps.
     await expect(stealing).resolves.toEqual({ ok: false, owner: "alice" });
     expect(order).toEqual(["labelled", "claim"]); // the label completed before the claim ran at all
@@ -206,9 +246,9 @@ describe("withClaimLock", () => {
       }),
     ).rejects.toThrow("approve exploded");
 
-    await expect(guard.setAssigneeIfOwner("/repo", "bd-1", undefined, "alice")).resolves.toEqual({
-      ok: true,
-    });
+    await expect(
+      guard.setAssigneeIfOwner("/repo", "bd-1", undefined, "alice"),
+    ).resolves.toMatchObject({ ok: true });
     expect(owner()).toBe("alice");
   });
 });
