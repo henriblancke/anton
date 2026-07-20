@@ -52,6 +52,8 @@ export const STATUS_LABELS: Record<string, string> = {
   in_progress: "In progress",
   blocked: "Blocked",
   closed: "Closed",
+  // Set by the snooze toggle (`bd defer`), never picked from the Status select — see TicketDialog.
+  deferred: "Snoozed",
 };
 
 /** Human labels for priorities (0 = critical … 4 = backlog), matching bd conventions. */

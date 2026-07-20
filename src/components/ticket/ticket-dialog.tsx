@@ -15,9 +15,10 @@ import {
   DialogFooter,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { MetaChip, PrLink, RelativeTime, StagePill } from "@/components/atoms";
+import { MetaChip, PrLink, RelativeTime, SnoozedChip, StagePill } from "@/components/atoms";
 import { ClaimControl, InheritedOwner, StaticOwner } from "@/components/board/claim-control";
 import { PrLinkControl } from "@/components/board/pr-link-control";
+import { SnoozeButton } from "./snooze-button";
 import { TicketNotes } from "./ticket-notes";
 import {
   AGENT_OPTIONS,
@@ -233,7 +234,9 @@ function TicketDialogBody({
   // already finished its run and produced its PR, so re-approving it would only enqueue duplicate/
   // no-op PR work. Hide the button there while keeping it for a still-runnable target — a fresh
   // backlog approval or a Force run that resumes an in-flight (implementing/in-review) run.
-  const canRun = isRunTarget && detail.stage !== "done";
+  // A snoozed target hides it too: the whole point of the snooze is "don't pick this up yet", so
+  // offering the one control that would start it immediately contradicts the state it's in.
+  const canRun = isRunTarget && detail.stage !== "done" && !detail.deferred;
 
   return (
     <div className="flex flex-col gap-4">
@@ -247,6 +250,7 @@ function TicketDialogBody({
             · {detail.type}
           </span>
           <StagePill stage={detail.stage} />
+          {detail.deferred && <SnoozedChip />}
           {isRunTarget ? (
             // A standalone task/bug carries its own PR — let it be linked/relinked here (same
             // /epics/<id>/pr route the epic detail uses). Linking flips it to in-review.
@@ -313,6 +317,9 @@ function TicketDialogBody({
 
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <Select label="Status" value={draft.status} onChange={(v) => set("status", v)}>
+          {/* `deferred` is set by the snooze toggle, not chosen here — but it must still render as
+              the current value, or a snoozed ticket shows an empty Status. */}
+          {draft.status === "deferred" && <option value="deferred">{STATUS_LABELS.deferred}</option>}
           {STATUS_OPTIONS.map((s) => (
             <option key={s} value={s}>
               {STATUS_LABELS[s] ?? s}
@@ -398,6 +405,21 @@ function TicketDialogBody({
       <DialogFooter className="sm:justify-between">
         <ConfirmDeleteButton onConfirm={remove} label="Delete ticket" />
         <div className="flex gap-2">
+          {/* A finished ticket has nothing to park — snooze is about work still ahead. */}
+          {(detail.stage !== "done" || detail.deferred) && (
+            <SnoozeButton
+              slug={slug}
+              ticketId={ticketId}
+              deferred={detail.deferred}
+              onChanged={(next) => {
+                setDetail(next);
+                // Snoozing only moves the bead's status — keep the operator's unsaved edits and
+                // sync just that field, so the Status select doesn't offer to patch it back.
+                setDraft((d) => (d ? { ...d, status: next.status } : draftFromDetail(next)));
+                onSaved?.(next);
+              }}
+            />
+          )}
           {canRun && (
             <Button
               variant="outline"

@@ -20,8 +20,12 @@ const meta = {
   createdAt: "",
   createdBy: null,
   approved: false,
+  deferred: false,
   notes: [],
-} satisfies Pick<TicketDetail, "assignee" | "createdAt" | "createdBy" | "approved" | "notes">;
+} satisfies Pick<
+  TicketDetail,
+  "assignee" | "createdAt" | "createdBy" | "approved" | "deferred" | "notes"
+>;
 
 const detail: TicketDetail = {
   id: "bd-1",

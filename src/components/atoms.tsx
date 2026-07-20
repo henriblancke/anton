@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { LockIcon } from "lucide-react";
+import { LockIcon, MoonIcon } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import type { Stage } from "@/lib/types";
@@ -93,6 +93,17 @@ export function BlockedChip({ blockedBy }: { blockedBy: string[] }) {
     <MetaChip tone="blocked">
       <LockIcon className="size-2.5" aria-hidden="true" />
       <span title={`blocked by ${blockedBy.join(", ")}`}>{label}</span>
+    </MetaChip>
+  );
+}
+
+/** "snoozed" chip — a ticket deliberately deferred out of the ready queue (anton-ywi8). Reads as
+ * paused rather than blocked: nothing is waiting on a dependency, a human parked it. */
+export function SnoozedChip({ className }: { className?: string }) {
+  return (
+    <MetaChip className={className}>
+      <MoonIcon className="size-2.5" aria-hidden="true" />
+      <span title="Snoozed — kept out of the ready queue until un-snoozed">snoozed</span>
     </MetaChip>
   );
 }

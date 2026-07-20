@@ -37,6 +37,8 @@ export interface Ticket {
   createdBy: string | null; // who created the bead
   prRef?: string; // bead external_ref, if any
   prUrl?: string; // browser URL for the PR, resolved from prRef + the repo's origin remote
+  /** Snoozed (`bd defer`) — kept off the ready queue until a human restores it. */
+  deferred: boolean;
 }
 
 export interface Epic {
@@ -90,6 +92,8 @@ export interface StandaloneItem {
   /** A self-filed bug (source:<x> label) still untouched (backlog, unclaimed, not approved) — it
    * wants a human's triage before it runs. Derived each build; there is no stored read-state. */
   unread: boolean;
+  /** Snoozed (`bd defer`) — kept off the ready queue until a human restores it. */
+  deferred: boolean;
 }
 
 /** Per-project beads↔Dolt sync health, read from the sync-status registry (bd.ts). Mirrors

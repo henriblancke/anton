@@ -75,6 +75,7 @@ export function toTicket(bead: Bead): Ticket {
     acceptance: parseAcceptance(bead),
     ...createdMeta(bead),
     prRef: bead.external_ref,
+    deferred: beads.isDeferred(bead),
   };
 }
 
@@ -110,6 +111,7 @@ export function toStandaloneItem(bead: Bead, blockedBy: string[] = []): Standalo
     blockedBy,
     ready: blockedBy.length === 0,
     unread: isUnreadBug(bead),
+    deferred: beads.isDeferred(bead),
   };
 }
 

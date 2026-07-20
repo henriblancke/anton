@@ -25,6 +25,7 @@ function toTicketDetail(lite: Bead, full: Bead, epic: Bead | undefined): TicketD
     acceptance: parseAcceptance(full),
     ...createdMeta(lite),
     prRef: lite.external_ref,
+    deferred: beads.isDeferred(lite),
     type: lite.issue_type ?? "task",
     priority: lite.priority,
     goal: parseGoal(full.description),
@@ -131,6 +132,32 @@ export async function addTicketNote(
     .sync(project.repoPath)
     .catch((e) => console.error(`[ticket-detail] beads dolt sync failed after noting ${id}`, e));
   return parseTicketNotes(fresh.notes);
+}
+
+/**
+ * Snooze a ticket out of the ready queue, or restore it (anton-ywi8). Deferring is the "not now,
+ * but not dead" move: the bead keeps its contract and history, but `bd ready` skips it so the
+ * runtime never dispatches it until a human un-snoozes. Nothing else about the ticket changes.
+ *
+ * Throws on an unknown id (bd's own error, so the route can 404).
+ */
+export async function setTicketDeferred(
+  project: Project,
+  id: string,
+  deferred: boolean,
+): Promise<TicketDetail> {
+  await beads.show(project.repoPath, id); // 404 guard — bd throws on an unknown id
+  if (deferred) await beads.defer(project.repoPath, id);
+  else await beads.undefer(project.repoPath, id);
+  // Read-after-write, like updateTicket: the response must show the snoozed state it just set, not
+  // the board's stale snapshot. Must complete before the sync below invalidates the snapshot.
+  const detail = await getTicketDetail(project, id, true);
+  // Fire-and-forget, like every other bd write here: the write already landed locally and the
+  // heartbeat backstop retries a failed push — never block the response on a slow remote.
+  void beads
+    .sync(project.repoPath)
+    .catch((e) => console.error(`[ticket-detail] beads dolt sync failed after deferring ${id}`, e));
+  return detail;
 }
 
 /**

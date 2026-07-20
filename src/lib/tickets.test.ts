@@ -10,6 +10,7 @@ function makeRow(overrides: Partial<TicketRow> & { id: string; title: string }):
     assignee: null,
     createdAt: "",
     createdBy: null,
+    deferred: false,
     ...overrides,
   };
 }

@@ -514,6 +514,20 @@ export const beads = {
   delete: (cwd: string, id: string, opts: { cascade?: boolean } = {}) =>
     bdWrite(cwd, ["delete", id, "--force", ...(opts.cascade ? ["--cascade"] : [])]),
   reopen: (cwd: string, id: string) => bdWrite(cwd, ["reopen", id]),
+
+  /**
+   * Snooze a bead (`bd defer`) / restore it (`bd undefer`) — the "not now, but not dead" state
+   * (anton-ywi8). A deferred bead keeps its contract, notes, and edges but drops out of `bd ready`,
+   * so the runtime never picks it up; undefer returns it to `open`. Deliberately distinct from
+   * close (finished) and from blocked (waiting on a specific dependency). Manual only — bd's
+   * `--until <date>` scheduling is out of scope.
+   */
+  defer: (cwd: string, id: string) => bdWrite(cwd, ["defer", id]),
+  undefer: (cwd: string, id: string) => bdWrite(cwd, ["undefer", id]),
+
+  /** A bead snoozed out of the ready queue (`bd defer`). */
+  isDeferred: (b: Bead) => b.status === "deferred",
+
   setStatus: (cwd: string, id: string, status: string) =>
     bdWrite(cwd, ["update", id, "--status", status]),
 

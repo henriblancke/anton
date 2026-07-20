@@ -21,6 +21,7 @@ const base: TicketRow = {
   assignee: null,
   createdAt: "",
   createdBy: null,
+  deferred: false,
 };
 
 describe("filtersFromSearchParams", () => {
