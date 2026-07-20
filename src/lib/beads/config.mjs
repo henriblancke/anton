@@ -137,10 +137,46 @@ export function untrackBeadsExports(dir, entries = BEADS_GITIGNORE_ENTRIES) {
 }
 
 /**
- * True when `.beads/config.yaml` carries an *uncommented* `key: value` matching `want` (surrounding
- * quotes tolerated, e.g. `dolt.auto-commit: "on"`). We check the FILE — not `bd config get` — because
- * the team-config must be committed to config.yaml to travel to every clone; `bd config get` also
- * reflects the Dolt DB (where `bd init --dolt-auto-commit on` lands it), which is not portable.
+ * Parse `.beads/config.yaml` into a flat `dotted.path → value` map (surrounding quotes stripped),
+ * accepting BOTH encodings bd has shipped. bd 1.0.4 appends flat dotted lines (`export.auto: false`);
+ * bd 1.1.0 writes `export.*` and `dolt.*` as nested maps (`export:` / `    auto: false`) while keeping
+ * `sync.remote` flat. Both must resolve to the same dotted path so team-config enforcement doesn't
+ * keep re-setting keys it already set (anton-qhoz). Nesting is tracked purely by indentation; blank
+ * and comment lines are ignored. A later line for the same path wins (bd appends, so this reflects the
+ * effective value).
+ */
+function parseConfigYaml(text) {
+  const map = {};
+  const stack = []; // parent map headers currently in scope, outermost first: { indent, key }
+  for (const raw of text.split("\n")) {
+    const line = raw.replace(/\r$/, "");
+    if (line.trim() === "" || line.trimStart().startsWith("#")) continue;
+    const m = line.match(/^(\s*)([^:#]+):\s*(.*)$/);
+    if (!m) continue;
+    const indent = m[1].length;
+    const key = m[2].trim();
+    const value = m[3].trim();
+    // Unwind to the parent whose children sit at a deeper indent than this line.
+    while (stack.length && stack[stack.length - 1].indent >= indent) stack.pop();
+    const path = [...stack.map((s) => s.key), key].join(".");
+    if (value === "") {
+      // A bare `key:` opens a nested map (bd 1.1.0's `export:`/`dolt:`) — remember it as a parent.
+      stack.push({ indent, key });
+    } else {
+      map[path] = value.replace(/^["']|["']$/g, "");
+    }
+  }
+  return map;
+}
+
+/**
+ * True when `.beads/config.yaml` carries an *uncommented* setting for `key` (given as a dotted path,
+ * e.g. `export.auto`) whose value equals `want` (surrounding quotes tolerated, e.g.
+ * `dolt.auto-commit: "on"`). Matches the flat (`export.auto: false`) AND nested (`export:` /
+ * `  auto: false`) encodings — bd switched `export.*`/`dolt.*` to nested at 1.1.0 (anton-qhoz). We
+ * check the FILE — not `bd config get` — because the team-config must be committed to config.yaml to
+ * travel to every clone; `bd config get` also reflects the Dolt DB (where `bd init --dolt-auto-commit
+ * on` lands it), which is not portable.
  */
 export function configYamlHas(beadsDir, key, want) {
   let text = "";
@@ -149,14 +185,7 @@ export function configYamlHas(beadsDir, key, want) {
   } catch {
     return false;
   }
-  const esc = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const re = new RegExp(`^\\s*${esc}:\\s*(.+?)\\s*$`);
-  for (const line of text.split("\n")) {
-    if (line.trimStart().startsWith("#")) continue;
-    const m = line.match(re);
-    if (m) return m[1].replace(/^["']|["']$/g, "") === want;
-  }
-  return false;
+  return parseConfigYaml(text)[key] === want;
 }
 
 /**
