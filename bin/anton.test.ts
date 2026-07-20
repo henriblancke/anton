@@ -834,6 +834,19 @@ describe("configureBeadsDoltSync (bd/git stubbed — CI has no bd)", () => {
     expect(r).toMatchObject({ status: "configured", pulled: false, pushed: true, firstPublish: true });
   });
 
+  it("stops before push when pull fails for a reason other than a missing first-publish ref", async () => {
+    repoDir = await beadsRepo();
+    const { exec, calls } = fakeExec({
+      "git remote get-url origin": { status: 0, stdout: "git@github.com:org/repo.git\n" },
+      "bd dolt remote list": { status: 0, stdout: "No remotes configured.\n" },
+      "bd dolt remote add origin": { status: 0 },
+      "bd dolt pull": { status: 1, stderr: "authentication required" },
+    });
+    const r = configureBeadsDoltSync({ repoDir, exec });
+    expect(r).toMatchObject({ status: "error", detail: expect.stringContaining("authentication required") });
+    expect(calls.some((line) => line === "bd dolt push")).toBe(false);
+  });
+
   it("is idempotent: skips add+push when origin already matches (bd's rewritten form)", async () => {
     repoDir = await beadsRepo();
     const { exec, calls } = fakeExec({
@@ -945,6 +958,21 @@ describe("configureBeadsDoltSync (bd/git stubbed — CI has no bd)", () => {
     // Verification fails ⇒ not treated as published; retried up to the cap.
     expect(r).toMatchObject({ status: "configured", pushed: false, pushAttempts: 3 });
     expect(calls.filter((l) => l === "bd dolt push").length).toBe(3);
+  });
+
+  it("retries and reports failure when remote verification itself fails", async () => {
+    repoDir = await beadsRepo();
+    const { exec, calls } = fakeExec({
+      "git remote get-url origin": { status: 0, stdout: "git@github.com:org/repo.git\n" },
+      "bd dolt remote list": { status: 0, stdout: "No remotes configured.\n" },
+      "bd dolt remote add origin": { status: 0 },
+      "bd dolt pull": { status: 0 },
+      "bd dolt push": { status: 0 },
+      "git ls-remote origin refs/dolt/data": { status: 128, stderr: "authentication required" },
+    });
+    const r = configureBeadsDoltSync({ repoDir, exec });
+    expect(r).toMatchObject({ status: "configured", pushed: false, pushAttempts: 3 });
+    expect(calls.filter((line) => line === "bd dolt push").length).toBe(3);
   });
 
   it("surfaces a bd dolt remote add failure as an error", async () => {

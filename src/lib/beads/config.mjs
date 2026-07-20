@@ -243,6 +243,18 @@ export function normalizeRemoteUrl(url) {
   return s.replace(/\/\.\//g, "/").replace(/\.git$/, "").replace(/\/+$/, "");
 }
 
+/** The only benign `bd dolt pull` failure: the remote has never published refs/dolt/data. */
+const FIRST_PUBLISH_PULL_OUTPUT = [
+  /no branches found in remote/i,
+  /(?:could ?n['’]t|could not) find remote ref/i,
+  /remote ref .*does not exist/i,
+  /remote ref .*not found/i,
+];
+
+export function isFirstPublishPullOutput(output) {
+  return FIRST_PUBLISH_PULL_OUTPUT.some((re) => re.test(output));
+}
+
 /**
  * Wire the git-backed Dolt remote for `repoDir`, reusing bd's own `dolt` subcommands — no new sync
  * code. beads stores issues in Dolt and syncs them over the git remote as `refs/dolt/data`; adding
@@ -322,6 +334,13 @@ export function configureBeadsDoltSync(opts = {}) {
   // refs/dolt/data yet (first setup ever) — the push below then publishes it.
   const pull = exec("bd", ["dolt", "pull"]);
   const pulled = (pull.status ?? 1) === 0;
+  const pullOutput = `${pull.stdout ?? ""}${pull.stderr ?? ""}`.trim();
+  const firstPublish = !pulled && isFirstPublishPullOutput(pullOutput);
+  if (!pulled && !firstPublish) {
+    const detail = pullOutput || `exit ${pull.status ?? "?"}`;
+    emit(`bd dolt pull — failed: ${detail}`);
+    return { status: "error", detail: `bd dolt pull failed: ${detail}` };
+  }
   emit(pulled ? "bd dolt pull — hydrated from origin" : "bd dolt pull — nothing to hydrate yet");
 
   // Publish: push local Dolt commits so refs/dolt/data lands on origin for the next machine. A
@@ -331,7 +350,6 @@ export function configureBeadsDoltSync(opts = {}) {
   // reconciling with a pull between attempts. A push that still can't land stays NON-fatal (the local
   // wiring is done, anton-8qx) but is surfaced LOUD via `firstPublish` so it's retried once auth/
   // network is up rather than silently leaving the remote empty.
-  const firstPublish = !pulled; // nothing hydrated ⇒ origin had no refs/dolt/data yet
   // Only the git-origin path is verifiable with `git ls-remote origin refs/dolt/data`: a declared
   // non-git `sync.remote` (e.g. aws://) pushes Dolt data somewhere git can't inspect, so there we
   // trust bd's exit code rather than falsely flagging an empty remote.
@@ -350,7 +368,9 @@ export function configureBeadsDoltSync(opts = {}) {
         pushed = true;
       } else {
         const ls = exec("git", ["ls-remote", "origin", "refs/dolt/data"]);
-        pushed = (ls.status ?? 1) === 0 ? /\S/.test((ls.stdout ?? "").trim()) : true;
+        // Verification must fail closed: an unreachable/auth-failing remote cannot prove the ref
+        // landed, even when `bd dolt push` itself returned zero.
+        pushed = (ls.status ?? 1) === 0 && /\S/.test((ls.stdout ?? "").trim());
       }
       if (pushed) break;
     }
