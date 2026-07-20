@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { createRequire } from "node:module";
-import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import {
   agentsFromArgs,
   applyMigrations,
@@ -498,13 +498,23 @@ const FAKE_BD = [
   'const setlog = path.join(beads, ".fake-config-set-order");',
   // onPath() probes --version/--help.
   'if (a[0] === "--version" || a[0] === "--help") { console.log("bd 0.0.0-fake"); process.exit(0); }',
-  // `bd init` creates the workspace; the team-config keys are intentionally left OUT so the
-  // subsequent `bd config set` calls (config.yaml enforcement) are exercised.
+  // `bd init` creates the workspace + the (gitignored) local Dolt DB dir — its presence is how the
+  // real config path tells an existing workspace from a fresh clone. The team-config keys are
+  // intentionally left OUT so the subsequent `bd config set` calls (config.yaml enforcement) run.
   'if (a[0] === "init") {',
   "  fs.mkdirSync(beads, { recursive: true });",
+  '  fs.mkdirSync(path.join(beads, "dolt"), { recursive: true });',
   '  const pi = a.indexOf("--prefix");',
   '  const prefix = pi >= 0 ? a[pi + 1] : "bd";',
   '  if (!fs.existsSync(cfg)) fs.writeFileSync(cfg, "# beads config (fake)\\nprefix: " + prefix + "\\n");',
+  "  process.exit(0);",
+  "}",
+  // `bd bootstrap` hydrates a fresh clone: it creates the local Dolt DB (which the clone lacked) and
+  // records that it ran so the fresh-clone test can assert bootstrap — not init — was the entry point.
+  'if (a[0] === "bootstrap") {',
+  "  fs.mkdirSync(beads, { recursive: true });",
+  '  fs.mkdirSync(path.join(beads, "dolt"), { recursive: true });',
+  '  fs.writeFileSync(path.join(beads, ".fake-bootstrapped"), "1");',
   "  process.exit(0);",
   "}",
   // `bd config set` patches an existing uncommented `key:` line in place (drift), else appends it.
@@ -631,8 +641,32 @@ describe("anton init (end-to-end, bd stubbed on PATH)", () => {
     for (const e of ["issues.jsonl", "interactions.jsonl", "dolt/", "embeddeddolt/"]) {
       expect(gi).toContain(e);
     }
+    // The .product/ layer is scaffolded so /shape + /scan-triage aren't left in a vacuum.
+    expect(r.stdout).toContain("scaffolded .product/");
+    expect(existsSync(join(dir, ".product", "PRODUCT.md"))).toBe(true);
+    expect(existsSync(join(dir, ".product", "principles.md"))).toBe(true);
     // The repo is registered exactly once in the (temp) anton.db.
     expect(projectCount(resolve(dir))).toBe(1);
+  });
+
+  it("hydrates a fresh clone via bd bootstrap, then enforces team-config (fresh-clone)", async () => {
+    const dir = await tmp("anton-init-");
+    gitInit(dir, true);
+    // A fresh clone: .beads/config.yaml arrived via git, but the gitignored local Dolt DB
+    // (.beads/dolt/) never travels with the clone — the signal that init must bootstrap, not re-init.
+    mkdirSync(join(dir, ".beads"), { recursive: true });
+    writeFileSync(join(dir, ".beads", "config.yaml"), "# beads config (cloned)\nprefix: ex\n");
+
+    const r = runInit(dir);
+    expect(r.status).toBe(0);
+    // bd bootstrap ran (not bd init) — its marker + the hydrated local Dolt DB are present.
+    expect(existsSync(join(dir, ".beads", ".fake-bootstrapped"))).toBe(true);
+    expect(existsSync(join(dir, ".beads", "dolt"))).toBe(true);
+    expect(r.stdout).toContain("bd bootstrap");
+    // Team-config is still enforced on top of the hydrated workspace.
+    const cfg = await readFile(join(dir, ".beads", "config.yaml"), "utf8");
+    expect(cfg).toContain("dolt.auto-commit: on");
+    expect(cfg).toContain("export.auto: false");
   });
 
   it("is a no-op on re-run — no clobber, no duplicate registration (idempotent)", async () => {
@@ -656,9 +690,9 @@ describe("anton init (end-to-end, bd stubbed on PATH)", () => {
     const dir = await tmp("anton-init-");
     gitInit(dir, true);
     // A pre-existing workspace whose config.yaml has DRIFTED values + a missing key. Because .beads/
-    // is present, init skips `bd init` and only enforces the team-config keys. export.auto: true is
-    // the inherited bd default anton must flip to false (anton-1th).
-    mkdirSync(join(dir, ".beads"), { recursive: true });
+    // is present WITH a local Dolt DB, init skips `bd init`/`bd bootstrap` and only enforces the
+    // team-config keys. export.auto: true is the inherited bd default anton must flip to false (anton-1th).
+    mkdirSync(join(dir, ".beads", "dolt"), { recursive: true });
     writeFileSync(join(dir, ".beads", "config.yaml"), "# beads config\ndolt.auto-commit: off\nexport.auto: true\n");
 
     const r = runInit(dir);
@@ -748,6 +782,7 @@ describe("configureBeadsDoltSync (bd/git stubbed — CI has no bd)", () => {
       "bd dolt remote add origin": { status: 0, stdout: 'Added remote "origin"' },
       "bd dolt pull": { status: 0, stdout: "Everything up-to-date." },
       "bd dolt push": { status: 0, stdout: "Push complete." },
+      "git ls-remote origin refs/dolt/data": { status: 0, stdout: "abc123\trefs/dolt/data\n" },
     });
     const r = configureBeadsDoltSync({ repoDir, exec });
     expect(r).toMatchObject({
@@ -770,9 +805,11 @@ describe("configureBeadsDoltSync (bd/git stubbed — CI has no bd)", () => {
       "bd dolt remote add origin": { status: 0 },
       "bd dolt pull": { status: 1, stderr: "remote ref refs/dolt/data not found" },
       "bd dolt push": { status: 0 },
+      "git ls-remote origin refs/dolt/data": { status: 0, stdout: "abc123\trefs/dolt/data\n" },
     });
     const r = configureBeadsDoltSync({ repoDir, exec });
-    expect(r).toMatchObject({ status: "configured", pulled: false, pushed: true });
+    // First publish: nothing hydrated, but the push landed refs/dolt/data on origin.
+    expect(r).toMatchObject({ status: "configured", pulled: false, pushed: true, firstPublish: true });
   });
 
   it("is idempotent: skips add+push when origin already matches (bd's rewritten form)", async () => {
@@ -799,12 +836,15 @@ describe("configureBeadsDoltSync (bd/git stubbed — CI has no bd)", () => {
       "bd dolt remote add origin": { status: 0 },
       "bd dolt pull": { status: 0 },
       "bd dolt push": { status: 0 },
+      // A declared non-git remote isn't verifiable via `git ls-remote origin` — no ls-remote call.
     });
     const r = configureBeadsDoltSync({ repoDir, exec });
     expect(r).toMatchObject({ status: "configured", url: declared });
     expect(calls).toContain(`bd dolt remote add origin ${declared}`);
-    // git origin is never consulted when the beads config declares the remote.
+    // git origin is never consulted when the beads config declares the remote — neither to read the
+    // URL nor to verify the push (a non-git remote isn't inspectable via `git ls-remote origin`).
     expect(calls.some((l) => l.startsWith("git remote get-url"))).toBe(false);
+    expect(calls.some((l) => l.startsWith("git ls-remote"))).toBe(false);
   });
 
   it("treats bd's '(not set in config.yaml)' prose as absent — exit code is 0 either way", async () => {
@@ -816,6 +856,7 @@ describe("configureBeadsDoltSync (bd/git stubbed — CI has no bd)", () => {
       "bd dolt remote add origin": { status: 0 },
       "bd dolt pull": { status: 0 },
       "bd dolt push": { status: 0 },
+      "git ls-remote origin refs/dolt/data": { status: 0, stdout: "abc123\trefs/dolt/data\n" },
     });
     const r = configureBeadsDoltSync({ repoDir, exec });
     expect(r).toMatchObject({ status: "configured", url: "git@github.com:org/repo.git" });
@@ -830,6 +871,7 @@ describe("configureBeadsDoltSync (bd/git stubbed — CI has no bd)", () => {
       "bd dolt remote add origin": { status: 0 },
       "bd dolt pull": { status: 0 },
       "bd dolt push": { status: 0 },
+      "git ls-remote origin refs/dolt/data": { status: 0, stdout: "abc123\trefs/dolt/data\n" },
     });
     const r = configureBeadsDoltSync({ repoDir, exec });
     expect(r).toMatchObject({ status: "configured", url: "git@github.com:org/new.git" });
@@ -838,7 +880,7 @@ describe("configureBeadsDoltSync (bd/git stubbed — CI has no bd)", () => {
 
   it("reports a failed push (pushed: false) without hiding the remote configuration", async () => {
     repoDir = await beadsRepo();
-    const { exec } = fakeExec({
+    const { exec, calls } = fakeExec({
       "git remote get-url origin": { status: 0, stdout: "git@github.com:org/repo.git\n" },
       "bd dolt remote list": { status: 0, stdout: "No remotes configured.\n" },
       "bd dolt remote add origin": { status: 0 },
@@ -846,8 +888,41 @@ describe("configureBeadsDoltSync (bd/git stubbed — CI has no bd)", () => {
       "bd dolt push": { status: 1, stderr: "Error: push to origin/main: auth required" },
     });
     const r = configureBeadsDoltSync({ repoDir, exec });
-    expect(r).toMatchObject({ status: "configured", pushed: false });
+    // The push is retried a bounded number of times before giving up (non-fatal).
+    expect(r).toMatchObject({ status: "configured", pushed: false, pushAttempts: 3 });
     expect((r as { pushOutput: string }).pushOutput).toContain("auth required");
+    expect(calls.filter((l) => l === "bd dolt push").length).toBe(3);
+  });
+
+  it("flags a failed FIRST publish loud (firstPublish) — an empty remote must not pass silently", async () => {
+    repoDir = await beadsRepo();
+    const { exec } = fakeExec({
+      "git remote get-url origin": { status: 0, stdout: "git@github.com:org/repo.git\n" },
+      "bd dolt remote list": { status: 0, stdout: "No remotes configured.\n" },
+      "bd dolt remote add origin": { status: 0 },
+      // Fresh origin: nothing to hydrate, so this is the first publish…
+      "bd dolt pull": { status: 1, stderr: "remote ref refs/dolt/data not found" },
+      // …and it never lands (no push access) — the remote stays empty.
+      "bd dolt push": { status: 1, stderr: "auth required" },
+    });
+    const r = configureBeadsDoltSync({ repoDir, exec });
+    expect(r).toMatchObject({ status: "configured", pulled: false, pushed: false, firstPublish: true });
+  });
+
+  it("retries when a push exits 0 but the ref never lands (verify beats a no-op push)", async () => {
+    repoDir = await beadsRepo();
+    const { exec, calls } = fakeExec({
+      "git remote get-url origin": { status: 0, stdout: "git@github.com:org/repo.git\n" },
+      "bd dolt remote list": { status: 0, stdout: "No remotes configured.\n" },
+      "bd dolt remote add origin": { status: 0 },
+      "bd dolt pull": { status: 0 },
+      "bd dolt push": { status: 0 }, // exits 0…
+      "git ls-remote origin refs/dolt/data": { status: 0, stdout: "" }, // …but nothing on origin
+    });
+    const r = configureBeadsDoltSync({ repoDir, exec });
+    // Verification fails ⇒ not treated as published; retried up to the cap.
+    expect(r).toMatchObject({ status: "configured", pushed: false, pushAttempts: 3 });
+    expect(calls.filter((l) => l === "bd dolt push").length).toBe(3);
   });
 
   it("surfaces a bd dolt remote add failure as an error", async () => {

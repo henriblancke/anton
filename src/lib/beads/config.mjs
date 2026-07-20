@@ -199,6 +199,36 @@ const CONFIG_KEYS = [
 ];
 
 /**
+ * The ONE reconciled `bd init` flag set shared by every anton init path — `configureBeadsForRepo`
+ * (anton init / addProject) and the `/setup` skill (skills/setup/SKILL.md keeps its prose in sync).
+ * There used to be two divergent sets; converging them avoids the surprise where a repo initialized
+ * from the CLI differs from one scaffolded by `/setup`.
+ *
+ *   --non-interactive     never drop into a setup wizard (auto-detected under CI/non-TTY, passed
+ *                         explicitly so init is safe however it's invoked).
+ *   --skip-hooks          bd's native hooks install repoints core.hooksPath at .beads/hooks, which
+ *                         silently CLOBBERS an existing husky/lefthook/custom-hooksPath setup. Skip
+ *                         it — anton pushes Dolt explicitly on every write, so the hydration hooks
+ *                         are redundant here anyway (see detectHooksManager).
+ *   --skip-agents         a bare `bd init` writes/overwrites AGENTS.md; never edit the repo's agent
+ *                         instructions uninvited (the /setup skill proposes a pointer under consent).
+ *   --dolt-auto-commit on commit-after-each-write from the very first write, matching the portable
+ *                         dolt.auto-commit=on later enforced in .beads/config.yaml (CONFIG_KEYS).
+ */
+export const BD_INIT_FLAGS = ["--non-interactive", "--skip-hooks", "--skip-agents", "--dolt-auto-commit", "on"];
+
+/**
+ * True when `.beads/` carries a LOCAL Dolt database (the workspace's runtime state), not just the
+ * committed config. The Dolt runtime lives in `.beads/dolt/` (or `.beads/embeddeddolt/`) and is
+ * gitignored, so a FRESH CLONE arrives with a committed `.beads/config.yaml` but no DB — that
+ * absence is the signal that the clone needs `bd bootstrap` to hydrate from origin's refs/dolt/data
+ * before any other bd command (config set, dolt remote add) can run against it.
+ */
+export function hasLocalDoltDb(beadsDir) {
+  return existsSync(join(beadsDir, "dolt")) || existsSync(join(beadsDir, "embeddeddolt"));
+}
+
+/**
  * Normalize a Dolt/git remote URL for equality checks against what `bd dolt remote list` reports.
  * bd rewrites URLs when storing them — a `git+` scheme prefix, and scp form (`git@host:org/repo`)
  * becomes `git+ssh://git@host/./org/repo.git` — so a byte compare would re-point on every run.
@@ -225,19 +255,21 @@ export function normalizeRemoteUrl(url) {
  *
  * Steps (idempotent): remote add → hydrate pull → publish push. The pull is best-effort — a fresh
  * origin has no `refs/dolt/data` yet, so it exits non-zero ("no branches found"); that's expected on
- * the first machine, not an error. The push is likewise NON-fatal and only REPORTED: first-time
- * setup against a remote without push access still completes the local wiring, and the failure is
- * surfaced (fail loud in output, not by aborting) so it can be retried once auth/network is up. Dolt
- * remotes live in `.beads/dolt/` (gitignored), so this must run once per machine — a clone doesn't
- * inherit the remote config.
+ * the first machine, not an error. The push is VERIFIED (the ref must actually land on origin) and
+ * RETRIED a bounded number of times; it stays NON-fatal so first-time setup without push access still
+ * completes the local wiring, but a failed FIRST publish (`firstPublish:true`) is surfaced LOUD so an
+ * empty remote never passes silently. Dolt remotes live in `.beads/dolt/` (gitignored), so this must
+ * run once per machine — a clone doesn't inherit the remote config.
  *
  * Returns `{ status, ... }`:
- *   - { status: "no-workspace" }                                — no `.beads/` (nothing to wire)
- *   - { status: "no-remote" }                                   — no declared/origin remote to use
- *   - { status: "already", url }                                — Dolt `origin` already points here
- *   - { status: "configured", url, pulled, pushed, pushOutput } — remote (re)pointed; pull + push
- *       attempted. `pushed:false` + `pushOutput` reports a benign push failure (non-fatal).
- *   - { status: "error", detail }                               — `bd dolt remote add` itself failed
+ *   - { status: "no-workspace" }                — no `.beads/` (nothing to wire)
+ *   - { status: "no-remote" }                   — no declared/origin remote to use
+ *   - { status: "already", url }                — Dolt `origin` already points here
+ *   - { status: "configured", url, pulled, pushed, pushAttempts, firstPublish, pushOutput } — remote
+ *       (re)pointed; pull + verified/retried push attempted. `pushed:false` reports a push that could
+ *       not land after `pushAttempts` tries (non-fatal); `firstPublish:true` means the remote is still
+ *       empty and the failure must be surfaced loud.
+ *   - { status: "error", detail }               — `bd dolt remote add` itself failed
  *
  * @param {{ repoDir: string, log?: (msg: string) => void, exec?: (cmd: string, args: string[]) => { status: number|null, stdout?: string, stderr?: string } }} opts
  */
@@ -292,18 +324,49 @@ export function configureBeadsDoltSync(opts = {}) {
   const pulled = (pull.status ?? 1) === 0;
   emit(pulled ? "bd dolt pull — hydrated from origin" : "bd dolt pull — nothing to hydrate yet");
 
-  // Publish: push local Dolt commits so refs/dolt/data lands on origin for the next machine. A push
-  // failure is NON-fatal (anton-8qx) — the local wiring is done; report it so it can be retried.
-  const push = exec("bd", ["dolt", "push"]);
-  const pushed = (push.status ?? 1) === 0;
+  // Publish: push local Dolt commits so refs/dolt/data lands on origin for the next machine. A
+  // FAILED FIRST publish (the remote had no refs/dolt/data to hydrate from) is the dangerous case —
+  // it leaves an EMPTY remote, so the next clone/machine finds nothing to bootstrap from. So the
+  // push is VERIFIED (the ref must actually appear on origin) and RETRIED a bounded number of times,
+  // reconciling with a pull between attempts. A push that still can't land stays NON-fatal (the local
+  // wiring is done, anton-8qx) but is surfaced LOUD via `firstPublish` so it's retried once auth/
+  // network is up rather than silently leaving the remote empty.
+  const firstPublish = !pulled; // nothing hydrated ⇒ origin had no refs/dolt/data yet
+  // Only the git-origin path is verifiable with `git ls-remote origin refs/dolt/data`: a declared
+  // non-git `sync.remote` (e.g. aws://) pushes Dolt data somewhere git can't inspect, so there we
+  // trust bd's exit code rather than falsely flagging an empty remote.
+  const verifyViaGitOrigin = !declared;
+  const MAX_PUSH_ATTEMPTS = 3;
+  let push;
+  let pushed = false;
+  let pushAttempts = 0;
+  while (pushAttempts < MAX_PUSH_ATTEMPTS) {
+    pushAttempts++;
+    push = exec("bd", ["dolt", "push"]);
+    if ((push.status ?? 1) === 0) {
+      // Confirm the ref really landed — `bd dolt push` can exit 0 as a no-op. If the check can't run
+      // (offline / local test remote), trust bd's exit code rather than falsely flagging failure.
+      if (!verifyViaGitOrigin) {
+        pushed = true;
+      } else {
+        const ls = exec("git", ["ls-remote", "origin", "refs/dolt/data"]);
+        pushed = (ls.status ?? 1) === 0 ? /\S/.test((ls.stdout ?? "").trim()) : true;
+      }
+      if (pushed) break;
+    }
+    // Reconcile before retrying — a concurrent writer may have advanced refs/dolt/data.
+    if (pushAttempts < MAX_PUSH_ATTEMPTS) exec("bd", ["dolt", "pull"]);
+  }
   const pushOutput = `${push.stdout ?? ""}${push.stderr ?? ""}`.trim();
   emit(
     pushed
-      ? "bd dolt push — published refs/dolt/data to origin"
-      : "bd dolt push — failed (non-fatal); retry with `bd dolt pull && bd dolt push`",
+      ? `bd dolt push — published refs/dolt/data to origin${pushAttempts > 1 ? ` (after ${pushAttempts} attempts)` : ""}`
+      : firstPublish
+        ? `bd dolt push — FIRST publish failed after ${pushAttempts} attempts; origin has no refs/dolt/data yet — retry with \`bd dolt pull && bd dolt push\``
+        : `bd dolt push — failed after ${pushAttempts} attempts (non-fatal); retry with \`bd dolt pull && bd dolt push\``,
   );
 
-  return { status: "configured", url, pulled, pushed, pushOutput };
+  return { status: "configured", url, pulled, pushed, pushAttempts, firstPublish, pushOutput };
 }
 
 /** Config files that mark a third-party git-hooks manager owning core.hooksPath. */
@@ -340,13 +403,15 @@ export function detectHooksManager(dir, priorHooksPath = null) {
 }
 
 /**
- * Run the full beads team-config path for `dir`, idempotently. Steps: `bd init` (only when `.beads/`
- * is absent) → config.yaml enforcement → `.beads/.gitignore`. Every step is best-effort and its
- * outcome is collected in `steps`/`errors` rather than thrown — the caller decides how loud to be
- * (the CLI prints each step; addProject logs a summary) and a step failure never aborts the caller.
+ * Run the full beads team-config path for `dir`, idempotently. Steps: workspace creation
+ * (`bd init` when `.beads/` is absent, `bd bootstrap` for a fresh clone with no local Dolt DB, else
+ * no-op) → config.yaml enforcement → `.beads/.gitignore` → Dolt remote wiring. Every step is
+ * best-effort and its outcome is collected in `steps`/`errors` rather than thrown — the caller
+ * decides how loud to be (the CLI prints each step; addProject logs a summary) and a step failure
+ * never aborts the caller.
  *
  * Returns:
- *   { configured, skipped, reason?, ranInit, steps: [{name,status,detail?}], errors: [], hasBeads }
+ *   { configured, skipped, reason?, ranInit, ranBootstrap, steps: [{name,status,detail?}], errors, hasBeads }
  *
  * When prereqs aren't met (no bd / not a git repo / no origin) it returns early with
  * `{ configured:false, skipped:true, reason, hasBeads }` and does nothing — so calling it on a plain
@@ -379,27 +444,44 @@ export function configureBeadsForRepo(dir, opts = {}) {
   // husky/lefthook (or bare custom) override is only observable here (anton-43b).
   const priorHooksPath = gitConfigGet(dir, "core.hooksPath") || null;
 
-  // 1. bd init — only when .beads/ is absent (prefix from caller, else bd auto-detects from dir name).
+  // 1. Bring a Dolt workspace into being, choosing the right entry point for the repo's state:
+  //    - no .beads/ at all              → `bd init` (reconciled BD_INIT_FLAGS)
+  //    - .beads/ committed but no DB    → FRESH CLONE: `bd bootstrap` hydrates the DB + wires the
+  //                                       Dolt remote from origin's refs/dolt/data (the gitignored
+  //                                       .beads/dolt/ never travels with the clone).
+  //    - .beads/ with a local Dolt DB   → existing workspace: enforce team-config only, no re-init.
+  //    A failure in either creation path is fatal for this run (nothing downstream can apply without
+  //    a workspace) but collected, not thrown. NOTE: bd's global `-C` mis-resolves for init/bootstrap
+  //    ("no beads project found"); run with the target as cwd instead — equivalent, and it works. (bd 1.0.4)
   let ranInit = false;
-  if (existsSync(beadsDir)) {
-    emit(".beads/ present — enforcing team-config only (no re-init).");
-    steps.push({ name: "bd init", status: "already" });
-  } else {
-    const initArgs = ["init", "--non-interactive", "--dolt-auto-commit", "on"];
+  let ranBootstrap = false;
+  if (!existsSync(beadsDir)) {
+    const initArgs = ["init", ...BD_INIT_FLAGS];
     if (prefix) initArgs.push("--prefix", prefix);
     emit(`bd ${initArgs.join(" ")}`);
-    // NOTE: bd's global `-C` flag mis-resolves for `init` ("no beads project found"); run with the
-    // target as cwd instead — equivalent, and it's what actually works. (bd 1.0.4)
     const r = spawnSync("bd", initArgs, { cwd: dir, encoding: "utf8" });
     if ((r.status ?? 1) !== 0) {
       const detail = (r.stderr || r.stdout || "").trim() || `exit ${r.status ?? "?"}`;
       steps.push({ name: "bd init", status: "failed", detail });
       errors.push(`bd init failed: ${detail}`);
-      // Without a workspace the remaining steps can't apply — stop here but don't throw.
       return { configured: false, skipped: false, ranInit: false, steps, errors, hasBeads: existsSync(beadsDir) };
     }
     ranInit = true;
     steps.push({ name: "bd init", status: "ok" });
+  } else if (!hasLocalDoltDb(beadsDir)) {
+    emit("bd bootstrap --non-interactive (fresh clone — hydrating the Dolt DB from origin)");
+    const r = spawnSync("bd", ["bootstrap", "--non-interactive"], { cwd: dir, encoding: "utf8" });
+    if ((r.status ?? 1) !== 0) {
+      const detail = (r.stderr || r.stdout || "").trim() || `exit ${r.status ?? "?"}`;
+      steps.push({ name: "bd bootstrap", status: "failed", detail });
+      errors.push(`bd bootstrap failed: ${detail}`);
+      return { configured: false, skipped: false, ranInit: false, steps, errors, hasBeads: existsSync(beadsDir) };
+    }
+    ranBootstrap = true;
+    steps.push({ name: "bd bootstrap", status: "ok" });
+  } else {
+    emit(".beads/ present with a local Dolt DB — enforcing team-config only (no re-init).");
+    steps.push({ name: "bd init", status: "already" });
   }
 
   // 2. Patch config.yaml idempotently (never clobber).
@@ -458,6 +540,7 @@ export function configureBeadsForRepo(dir, opts = {}) {
     configured: true,
     skipped: false,
     ranInit,
+    ranBootstrap,
     steps,
     errors,
     hasBeads: existsSync(beadsDir),

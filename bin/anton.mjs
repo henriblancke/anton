@@ -822,8 +822,16 @@ function renderDoltSyncOutcome(dolt) {
       }
       if (dolt.pushed) {
         console.log(`  ${c.green("✓")} bd dolt push — refs/dolt/data is on origin`);
+      } else if (dolt.firstPublish) {
+        // Loud: a failed FIRST publish leaves the remote EMPTY — the next clone has nothing to
+        // bootstrap from. Non-fatal (local wiring is done) but never silent.
+        console.log(c.red(`  ✗ bd dolt push failed after ${dolt.pushAttempts} attempts — origin has NO refs/dolt/data yet (empty remote).`));
+        console.log(c.dim("    Nothing can bootstrap from this remote until you publish. Once auth/network is up, run:"));
+        console.log(c.dim("      bd dolt pull && bd dolt push"));
+        const lastLine = (dolt.pushOutput ?? "").split("\n").filter(Boolean).at(-1);
+        if (lastLine) console.log(c.dim(`    (${lastLine})`));
       } else {
-        console.log(c.yellow("  ! bd dolt push failed — once auth/network is available, run:"));
+        console.log(c.yellow(`  ! bd dolt push failed after ${dolt.pushAttempts} attempts — once auth/network is available, run:`));
         console.log(c.dim("      bd dolt pull && bd dolt push"));
         const lastLine = (dolt.pushOutput ?? "").split("\n").filter(Boolean).at(-1);
         if (lastLine) console.log(c.dim(`    (${lastLine})`));
@@ -1027,8 +1035,16 @@ function renderDoltSync(sync) {
     case "configured":
       if (sync.pushed === false) {
         // Push is non-fatal + reported (anton-8qx): the remote is wired locally, just not published.
+        // A failed FIRST publish leaves the remote EMPTY (nothing for the next clone to bootstrap
+        // from), so surface that case LOUD (red) rather than as a routine retry note.
         console.log(c.green("✓ Dolt remote wired") + c.dim(` — origin (${sync.url})`));
-        console.log(c.yellow("! bd dolt push failed — run `bd dolt pull && bd dolt push` once auth/network is available."));
+        if (sync.firstPublish) {
+          console.log(c.red(`✗ bd dolt push failed after ${sync.pushAttempts} attempts — origin has NO refs/dolt/data yet (empty remote).`));
+          console.log(c.dim("  Nothing can bootstrap from this remote until you publish. Once auth/network is up, run:"));
+          console.log(c.dim("    bd dolt pull && bd dolt push"));
+        } else {
+          console.log(c.yellow(`! bd dolt push failed after ${sync.pushAttempts} attempts — run \`bd dolt pull && bd dolt push\` once auth/network is available.`));
+        }
         const lastLine = (sync.pushOutput ?? "").split("\n").filter(Boolean).at(-1);
         if (lastLine) console.log(c.dim(`  (${lastLine})`));
       } else {
@@ -1074,6 +1090,28 @@ function renderHooksWarning(warning) {
   console.log(c.dim("  Export/push hooks (pre-commit, pre-push) are safe to chain if you want them."));
 }
 
+/** The bundled `.product/` templates `/setup` scaffolds — they travel with the `setup` skill dir. */
+const PRODUCT_TEMPLATES_SRC = join(SKILLS_SRC, "setup", "templates", ".product");
+
+/**
+ * Scaffold `.product/` into `dir` from the bundled templates so `/shape` and `/scan-triage` — which
+ * read a project-local `.product/` layer before doing anything — aren't left in a vacuum after
+ * `anton init`. No-clobber and idempotent (skips any file that already exists), mirroring how the
+ * `/setup` skill generates the same layer; a re-run or a repo that already ran `/setup` is a no-op.
+ * Returns `{ created: string[], skipped: string[], missing: boolean }` (missing → templates absent).
+ */
+function scaffoldProductDir(dir) {
+  if (!existsSync(PRODUCT_TEMPLATES_SRC)) return { created: [], skipped: [], missing: true };
+  const destRoot = join(dir, ".product");
+  const created = [];
+  const skipped = [];
+  for (const rel of walkFiles(PRODUCT_TEMPLATES_SRC)) {
+    const status = installFile(join(PRODUCT_TEMPLATES_SRC, rel), join(destRoot, rel));
+    (status === "installed" ? created : skipped).push(rel);
+  }
+  return { created, skipped, missing: false };
+}
+
 async function cmdInit(args = []) {
   const { path: rawPath, prefix } = parseInitArgs(args);
   const dir = resolve(rawPath ?? process.cwd());
@@ -1103,6 +1141,17 @@ async function cmdInit(args = []) {
   // Under a husky/lefthook hooksPath only post-merge/post-checkout HYDRATION is lost, which is a
   // good thing here — hydration can replay an older snapshot over beads closed since (anton-vqgw).
   renderHooksWarning(beads.hooksWarning);
+
+  // Scaffold the project-local .product/ layer so /shape and /scan-triage have the contract they
+  // read — same layer /setup generates, no-clobber so an existing one (or a prior /setup) is kept.
+  const product = scaffoldProductDir(dir);
+  if (product.missing) {
+    console.log(c.yellow("! .product/ templates not found — run /setup to scaffold the project layer."));
+  } else if (product.created.length) {
+    console.log(c.green("✓ scaffolded .product/") + c.dim(` — ${product.created.length} file${product.created.length === 1 ? "" : "s"} (run /setup to fill PRODUCT.md)`));
+  } else {
+    console.log(c.dim("• .product/ already present — left untouched."));
+  }
 
   // Register with anton so the repo shows on the projects board — in the same command (anton-uez).
   const reg = registerProject(dir);
