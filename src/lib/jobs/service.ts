@@ -12,6 +12,7 @@ import {
   getProjectSettings,
 } from "../projects";
 import { beads } from "../beads/bd";
+import { preflightBd } from "../beads/bd-bin";
 import { makeExecuteEpicHandler } from "./execute-epic";
 import { makeReviewFixHandler } from "./review-fix";
 import { makeNightlyStringerHandler } from "./nightly-stringer";
@@ -110,6 +111,10 @@ export function getScheduler(): Scheduler {
  * lease window; it's best-effort and never blocks startup.
  */
 export async function startRunner(): Promise<void> {
+  // Preflight (anton-346): resolve bd before any job can spawn it. A server launched with a PATH
+  // that can't reach bd fails loud HERE with actionable guidance, instead of booting and then
+  // parking execute-epic/review-fix jobs mid-run with `spawn bd ENOENT`.
+  preflightBd();
   if (!_reconciled) {
     // Set before awaiting so a concurrent second call can't slip past into a second reconcile.
     _reconciled = true;
