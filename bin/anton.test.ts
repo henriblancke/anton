@@ -25,6 +25,7 @@ import {
   provisionAgentsSkills,
   registerProject,
   INSTALLED_SKILLS,
+  REQUIRED_SKILLS,
   resolvePort,
 } from "./anton.mjs";
 
@@ -647,6 +648,27 @@ describe("anton init (end-to-end, bd stubbed on PATH)", () => {
     expect(existsSync(join(dir, ".product", "principles.md"))).toBe(true);
     // The repo is registered exactly once in the (temp) anton.db.
     expect(projectCount(resolve(dir))).toBe(1);
+  });
+
+  it("installs the required skills into the repo's own .claude/, no-clobber on re-run (skills-install)", async () => {
+    const dir = await tmp("anton-init-");
+    gitInit(dir, true);
+
+    const first = runInit(dir);
+    expect(first.status).toBe(0);
+    // The required runtime skills land in the PROJECT .claude/ — not just the global ~/.claude that
+    // `anton setup` provisions (anton-jvsd).
+    for (const name of REQUIRED_SKILLS) {
+      expect(existsSync(join(dir, ".claude", "skills", name, "SKILL.md"))).toBe(true);
+    }
+
+    // Re-run is a no-op: a pre-existing (user-modified) skill file is never overwritten.
+    const marker = join(dir, ".claude", "skills", "bd", "SKILL.md");
+    const edited = (await readFile(marker, "utf8")) + "\n<!-- user edit -->\n";
+    writeFileSync(marker, edited);
+    const second = runInit(dir);
+    expect(second.status).toBe(0);
+    expect(await readFile(marker, "utf8")).toBe(edited);
   });
 
   it("hydrates a fresh clone via bd bootstrap, then enforces team-config (fresh-clone)", async () => {

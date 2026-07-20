@@ -196,12 +196,14 @@ function runLocal(bin, args, env = {}) {
   return r.status ?? 1;
 }
 
-// ── Agents & skills provisioning (anton setup) ──────────────────────────────────────────────
-// Mirrors src/lib/setup/installer.ts (which the in-app UI uses), reimplemented dependency-free so
-// the launcher stays pure Node and runs before any build. Install target is the user's GLOBAL
-// ~/.claude, so anton's agents/skills are discoverable from every repo `claude` runs in. No-clobber
-// is the invariant: an existing destination (a prior install OR the user's own file) is never
-// overwritten. Keep these in sync with REQUIRED_SKILLS / INSTALLED_SKILLS in src/lib/claude/prompt.ts.
+// ── Agents & skills provisioning (anton setup + anton init) ─────────────────────────────────
+// The authoritative installer (anton-jvsd), dependency-free so the launcher stays pure Node and
+// runs before any build. Two install targets, chosen by the caller's `claudeRoot`: `anton setup`
+// provisions the GLOBAL ~/.claude (discoverable from every repo), while `anton init` provisions a
+// project's own <repo>/.claude/ (project scope wins when `claude` runs there). No-clobber is the
+// invariant: an existing destination — a prior install OR the user's own (possibly modified) file —
+// is never overwritten, so a re-run writes nothing. Keep REQUIRED_SKILLS / INSTALLED_SKILLS in sync
+// with src/lib/claude/prompt.ts.
 const AGENTS_SRC = join(APP_ROOT, "src", "prompts", "agents");
 const SKILLS_SRC = join(APP_ROOT, "skills");
 const REQUIRED_SKILLS = ["shape", "bd", "scan-triage", "review-fix"];
@@ -1151,6 +1153,18 @@ async function cmdInit(args = []) {
     console.log(c.green("✓ scaffolded .product/") + c.dim(` — ${product.created.length} file${product.created.length === 1 ? "" : "s"} (run /setup to fill PRODUCT.md)`));
   } else {
     console.log(c.dim("• .product/ already present — left untouched."));
+  }
+
+  // Install anton's required skills (+ any --agents selection) into the repo's OWN .claude/ so
+  // `claude` resolves them at project scope when it runs here — not just the global ~/.claude that
+  // `anton setup` provisions (anton-jvsd). Best-effort + no-clobber: a missing bundled asset or a
+  // pre-existing (user-modified) file is left untouched, and a skills-install hiccup never fails an
+  // otherwise-good beads init.
+  try {
+    await provisionAgentsSkills(args, { claudeRoot: join(dir, ".claude") });
+  } catch (e) {
+    console.log(c.yellow(`\n! could not install skills into ${join(dir, ".claude")}: ${String(e?.message ?? e)}`));
+    console.log(c.dim("  beads is configured; run `anton setup` to install anton's skills globally."));
   }
 
   // Register with anton so the repo shows on the projects board — in the same command (anton-uez).
