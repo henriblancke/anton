@@ -63,8 +63,10 @@ export function TicketDialog({ slug, ticketId, open, onClose, onSaved, onDeleted
       }}
     >
       {/* Widen as the viewport allows — the contract textareas + notes get room, and the Details grid
-          breathes — while the mobile cap (max-w-[calc(100%-2rem)]) still keeps it inset on small screens. */}
-      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-xl md:max-w-2xl xl:max-w-3xl">
+          breathes — while the mobile cap (max-w-[calc(100%-2rem)]) still keeps it inset on small screens.
+          `pb-0` drops the scroll container's bottom padding so the sticky footer can pin truly flush to
+          the modal's bottom edge (no padding gap, no negative-margin compensation). */}
+      <DialogContent className="max-h-[85vh] overflow-y-auto pb-0 sm:max-w-xl md:max-w-2xl xl:max-w-3xl">
         <DialogTitle className="sr-only">{ticketId ? `Ticket ${ticketId}` : "Ticket"}</DialogTitle>
         <DialogDescription className="sr-only">
           View and edit this ticket&apos;s fields.
@@ -448,10 +450,12 @@ function TicketDialogBody({
         />
       </div>
 
-      {/* Pinned to the modal's bottom edge: `sticky bottom-0` + the footer's own `-mb-4` full-bleed
-          margin lands it flush against the bottom while the body scrolls under it. `bg-muted` (opaque,
-          over the base bg-muted/50) hides the scrolling content; z-10 keeps it above. */}
-      <DialogFooter className="sticky bottom-0 z-10 bg-muted sm:justify-between">
+      {/* Pinned to the modal's bottom edge while the body scrolls under it: `sticky bottom-0` against
+          the DialogContent scrollport (whose bottom padding is removed above, so bottom-0 sits flush).
+          `mb-0` cancels the base `-mb-4` — that negative margin + sticky was the source of the earlier
+          mis-render; `-mx-4` (base) keeps the bar full-bleed. `bg-muted` (opaque, over base bg-muted/50)
+          hides the scrolling content; z-10 keeps it above. */}
+      <DialogFooter className="sticky bottom-0 z-10 mb-0 bg-muted sm:justify-between">
         {/* Snooze + abandon now live in the state bar above; delete is the rare, destructive exit, so
             it's demoted to an icon on the far left, out of the edit/run flow (anton-q02q). */}
         <div className="flex flex-wrap items-center gap-2">
