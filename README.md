@@ -6,6 +6,24 @@
 
 <p align="center"><strong>Shape an idea into an epic, approve it, and let it ship itself.</strong></p>
 
+## Get started
+
+Install with the **one-line installer**. It fetches a small (~15 MB) prebuilt bundle for your platform and drops the `anton` launcher on your `PATH` — no toolchain, no build step:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/henriblancke/anton/main/scripts/install.sh | bash
+```
+
+Then set it up and start the server:
+
+```bash
+anton setup                    # check prereqs, migrate the DB, install skills & agents
+anton start                    # start the server → http://localhost:3000
+open http://localhost:3000     # add a repo, shape an epic, approve, watch it run
+```
+
+anton drives your local `claude`, `git`, `gh`, and `bd` — install those first ([Prerequisites](#prerequisites)). For how the bundle works and how to manage it see [Install](#install); to hack on anton itself, run it [from source](#from-source-contributors).
+
 ## What is anton
 
 anton is a local app that takes an idea — or a finding from scanning your code — and turns it into work that gets done while you watch. You describe what you want; anton **shapes** it into an epic with concrete tickets and sets it aside for your OK. Once you **approve**, it runs each ticket **autonomously**: it spins up an isolated git worktree, drives `claude` to write the code, runs your tests, and opens a **pull request**. Then it keeps working the PR for you — when a reviewer asks for changes or CI goes red, it **auto review-fixes** until the PR is clean.
@@ -19,17 +37,6 @@ shape → approve → autonomous run → PR → auto review-fix
 You stay in control at exactly two points — approving the epic and merging the PR. Everything in between runs on its own.
 
 > **Local, not deployed.** anton runs as a Next.js server on your machine and drives your local `claude`, `git`, `gh`, `bd`, and `stringer`. It is not a hosted service — there's nothing to sign up for and nothing leaves your machine. See [`DESIGN.md`](./DESIGN.md) for the full architecture.
-
-## Quick start
-
-```bash
-bun install                       # or: npm install
-anton setup                       # check prereqs, migrate the DB, build native deps
-anton start                       # build if needed, then start the server
-open http://localhost:3000        # add a repo, shape an epic, approve, watch it run
-```
-
-New here? See [Install](#install) and [Run locally](#run-locally) for prerequisites and detail.
 
 ## What it does
 
@@ -56,7 +63,7 @@ Plus two scheduled background jobs, per project:
 
 ![The epics board — four stage columns derived live from beads](docs/images/board.png)
 
-A project's home is a four-column board — **backlog → implementing → in-review → done** — with a live count on each column. Every stage is derived from beads at read time (an epic's tickets and its PR state decide where it sits), so the board is never a cache to reconcile: approve an epic in backlog and it moves right on its own as its runs land. In-review cards carry their PR number, and backlog cards expose the **Approve** gate directly.
+A project's home is a four-column board — **backlog → implementing → in-review → done** — with a live count on each column and a **live-synced** pill that shows the board is following beads in real time. Every stage is derived from beads at read time (an epic's tickets and its PR state decide where it sits), so the board is never a cache to reconcile: approve an epic in backlog and it moves right on its own as its runs land. In-review cards carry their PR number, and backlog cards expose the controls directly — **Approve** to start automation, or **Claim** to reserve an epic for yourself without approving it yet (**Release** to drop the claim). Loose bugs and tasks with no parent epic surface in their own **Standalone** lane so they're just as approvable as epics.
 
 ### Epic detail
 
@@ -69,6 +76,16 @@ Opening an epic shows its full contract — Goal, Acceptance, and child tickets 
 ![The filterable tickets list across all epics](docs/images/tickets.png)
 
 The tickets view is the flat, cross-epic index — every epic and ticket in the project with its id, parent epic, agent, risk, and size, filterable by any of those plus title, status, and type. It's the granular counterpart to the board: where the board tracks epics through stages, this is where you scan, filter, and drill into individual work items.
+
+### More views
+
+Three more views round out a project, in the left nav:
+
+- **Dependencies** — the project-wide dependency graph across every epic and ticket, so you can see the whole DAG at once rather than one epic at a time.
+- **Runs** — every run anton has executed, each with its epic · ticket · agent, status (done / failed), and duration. Runs are the per-ticket unit of work: a worktree, a `claude` session, tests, a commit.
+- **Jobs** — the background job queue behind those runs — `execute-epic`, `review-fix`, and the scheduled jobs — showing what's running, queued, done, or parked, with attempts and timing. A stuck job can be **force-killed** here.
+
+A global **usage pill** in the sidebar tracks your live Claude session and weekly limits at a glance (toggle with `ANTON_USAGE_PILL`).
 
 ## Prerequisites
 
@@ -104,7 +121,7 @@ Run `anton doctor` at any time to check what's present.
 
 ## Install
 
-The quickest path is the **one-line installer**. It downloads a small (~15 MB) prebuilt, per-platform bundle — the built app plus its native modules — and drops the `anton` launcher on your `PATH`. No toolchain, no build step:
+[Get started](#get-started) above shows the **one-line installer** — the quickest path. Here's what it actually does. It downloads a small (~15 MB) prebuilt, per-platform bundle — the built app plus its native modules — and drops the `anton` launcher on your `PATH`. No toolchain, no build step:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/henriblancke/anton/main/scripts/install.sh | bash
@@ -208,10 +225,13 @@ Each project has its own settings (under **Settings** for that project). Nothing
 | **Model** | Which model the headless `claude` driver uses for runs (Opus / Sonnet / Haiku / Fable, or **Default** to use `claude`'s own configured model). |
 | **Seed prompt** | Extra operator guidance layered onto the locked base contract for every run — conventions, things to avoid, where key files live. It customizes *how* epics are approached; it can't override the base contract. Empty = base + agent prompt only. |
 | **Review-fix prompt** | Overrides the default review-fix reasoning prompt (`skills/review-fix/SKILL.md`). anton appends the concrete PR context beneath it. Empty = the shipped default. |
-| **Test command** | The command anton runs in a worktree to verify a ticket before committing. |
+| **Verify gates** | The commands anton runs in a worktree to verify a ticket before committing — **test**, plus optional **lint**, **typecheck**, and **build**. Each is a shell command; a non-zero exit fails the ticket. Unset gates are skipped. |
+| **Active agents** | Which specialist agent prompts dispatch may assign. A run whose ticket needs a disabled agent is **parked** rather than silently run with the default. Empty (never set) = all discovered agents active. |
 | **Base branch** | The branch runs target and open their PRs against (defaults to the repo's detected default branch). |
+| **Conventional-commit PR titles** | When on, prefixes the epic PR title with a derived `<type>(<scope>): ` (bug→`fix`, epic/task→`feat`; scope = the `agent:` label). Off by default — the title stays `<title> (<id>)`. |
 | **Max concurrent runs** | How many worktrees run in parallel (1–6). |
-| **Autonomous execution** | Whether approved epics run without further prompting. |
+| **Job timeout / max retries** | Wall-clock limit for a single job attempt, and how many attempts before a job is parked for a human. |
+| **Autonomous execution** | Whether approved epics run without further prompting. When off, approval still enqueues the run but it waits until you turn autonomy back on. |
 
 The three background jobs (**review-fix**, **nightly-stringer**, **orphan-grooming**) can each be toggled on/off per project under **Automation**.
 
