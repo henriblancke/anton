@@ -4,7 +4,7 @@
  * and git against a temp repo with a bare `origin`, using fake `claude` / `gh` binaries so the
  * pipeline is exercised deterministically without spending API quota. Skipped without bd + git.
  */
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { mkdirSync } from "node:fs";
@@ -30,6 +30,9 @@ function has(cmd: string): boolean {
     return false;
   }
 }
+
+/** Fixed start-of-test wall clock. Reset before each case — see the `beforeEach` below. */
+const BASE_TIME_MS = 1_700_000_000_000;
 
 class FakeClock implements Clock {
   constructor(private t: number) {}
@@ -176,7 +179,7 @@ process.exit(0);`,
 
     // Test DB + project row.
     tdb = makeTestDb();
-    clock = new FakeClock(1_700_000_000_000);
+    clock = new FakeClock(BASE_TIME_MS);
     projectId = randomUUID();
     await tdb.db.insert(schema.projects).values({
       id: projectId,
@@ -201,6 +204,17 @@ process.exit(0);`,
     }
     resetOperatorCache();
     rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  // These cases share one DB and one clock (the sandbox + bd repo are expensive to build per test),
+  // so without a reset they leak into each other (anton-0oi). Two concrete leaks this closes:
+  // a case that jumps the clock past a usage-limit reset leaves it there, which retroactively makes
+  // every earlier retry-pending job *due*; and with `maxConcurrent: 1` the next `tickOnce()` then
+  // leases one of those leftovers instead of the job the case just enqueued, so its own job sits at
+  // `queued` and the assertions read the wrong state.
+  beforeEach(async () => {
+    clock.set(BASE_TIME_MS);
+    await tdb.db.delete(schema.jobs);
   });
 
   it("runs an approved epic autonomously → worktree → per-ticket commits → PR → in-review", async () => {
@@ -422,7 +436,10 @@ process.exit(0);`,
       // Resume with a working gh. The retry must skip the already-committed ticket (resume marker)
       // and pick up at the PR step — no second claude session, one PR opened.
       process.env.ANTON_GH_BIN = okGh;
-      await park(tdb.db, clock, jobId, "test: simulate resume");
+      // The failed attempt was requeued for retry (queued, future runAt), not left running — so this
+      // park must be asserted, not fire-and-forget. It silently no-oped before anton-0oi, which made
+      // the resumeJob below return false and wedged every later case in this file.
+      expect(await park(tdb.db, clock, jobId, "test: simulate resume")).toBe(true);
       expect(await resumeJob(tdb.db, clock, jobId)).toBe(true);
       await runner.tickOnce();
       await runner.whenIdle();
@@ -1163,7 +1180,9 @@ process.exit(0);`,
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
     }
-  }, 60_000);
+  // Three full run phases (run → park → clock jump → resume → run) of real bd/git work; its
+  // honest cost is ~60-90s, above the 60s the rest of this file uses (anton-0oi).
+  }, 150_000);
 
   it("resumes a transient mid-stream death in-session via claude --resume, completing in one tick (anton-juar)", async () => {
     // A standalone target whose FIRST claude invocation dies mid-stream transiently (emits the
@@ -1997,5 +2016,7 @@ process.exit(0);`,
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
     }
-  }, 60_000);
+  // Three full run phases (run → park → clock jump → resume → run) of real bd/git work; its
+  // honest cost is ~60-90s, above the 60s the rest of this file uses (anton-0oi).
+  }, 150_000);
 });
