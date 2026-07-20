@@ -21,10 +21,11 @@ const meta = {
   createdBy: null,
   approved: false,
   deferred: false,
+  abandoned: false,
   notes: [],
 } satisfies Pick<
   TicketDetail,
-  "assignee" | "createdAt" | "createdBy" | "approved" | "deferred" | "notes"
+  "assignee" | "createdAt" | "createdBy" | "approved" | "deferred" | "abandoned" | "notes"
 >;
 
 const detail: TicketDetail = {

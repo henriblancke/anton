@@ -76,6 +76,7 @@ export function toTicket(bead: Bead): Ticket {
     ...createdMeta(bead),
     prRef: bead.external_ref,
     deferred: beads.isDeferred(bead),
+    abandoned: beads.isAbandoned(bead),
   };
 }
 
@@ -112,6 +113,7 @@ export function toStandaloneItem(bead: Bead, blockedBy: string[] = []): Standalo
     ready: blockedBy.length === 0,
     unread: isUnreadBug(bead),
     deferred: beads.isDeferred(bead),
+    abandoned: beads.isAbandoned(bead),
   };
 }
 

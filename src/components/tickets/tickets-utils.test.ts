@@ -22,6 +22,7 @@ const base: TicketRow = {
   createdAt: "",
   createdBy: null,
   deferred: false,
+  abandoned: false,
 };
 
 describe("filtersFromSearchParams", () => {

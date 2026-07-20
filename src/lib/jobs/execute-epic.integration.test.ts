@@ -2013,4 +2013,169 @@ process.exit(0);`,
       process.env.ANTON_CLAUDE_BIN = successClaude;
     }
   }, 60_000);
+  it("skips an abandoned ticket instead of reopening it, and ships the rest of the epic (anton-6xj0)", async () => {
+    // An abandoned bead is CLOSED with no commit on the branch — the exact shape the cross-machine
+    // resume path reads as "closed elsewhere, regenerate it here". Without the abandon check the run
+    // would reopen it and re-run the agent on work a human explicitly killed. It must be dropped
+    // from the run entirely: never dispatched, never reopened, and absent from the PR body.
+    const epicAb = await beads.create(repo, {
+      title: "Epic with an abandoned ticket",
+      type: "epic",
+      description: "## Goal\nAB",
+    });
+    await beads.approve(repo, epicAb);
+    const mk = (title: string) => {
+      const p = JSON.parse(
+        execFileSync(
+          "bd",
+          ["create", title, "--type", "task", "--parent", epicAb, "--acceptance", "x", "--json"],
+          { cwd: repo, encoding: "utf8" },
+        ),
+      );
+      return (Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string;
+    };
+    const keep = mk("Ticket that ships");
+    const drop = mk("Ticket the operator killed");
+    await beads.abandon(repo, drop, "not worth building");
+
+    // Capture the PR body `gh pr create` is invoked with, to prove the abandoned ticket isn't listed.
+    const bodyDump = join(sandbox, "abandon-pr-body.txt");
+    const bodyGh = writeBin(
+      binDir,
+      "gh-body",
+      `const fs=require('fs');const a=process.argv.slice(2);
+const i=a.indexOf('--body');if(i>=0){fs.writeFileSync(${JSON.stringify(bodyDump)},a[i+1]);}
+console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
+    );
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = bodyGh;
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    process.env.ANTON_CLAUDE_BIN = successClaude;
+    let jobId: string;
+    try {
+      jobId = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: epicAb },
+      });
+      await runner.tickOnce();
+      await runner.whenIdle();
+
+      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+
+      // The abandoned ticket is untouched: still closed, still labelled, never claimed or dispatched.
+      const dropped = await beads.show(repo, drop);
+      expect(dropped.status).toBe("closed");
+      expect(beads.isAbandoned(dropped)).toBe(true);
+      const droppedSessions = (await tdb.db.select().from(schema.sessions)).filter(
+        (s) => s.beadId === drop,
+      );
+      expect(droppedSessions).toHaveLength(0);
+
+      // The live ticket shipped, and only its commit is on the branch.
+      expect((await beads.show(repo, keep)).status).toBe("closed");
+      const log = execFileSync(
+        "git",
+        ["-C", repo, "log", "--oneline", `origin/anton/${epicAb}`],
+        { encoding: "utf8" },
+      );
+      expect(log).toContain(`${keep}:`);
+      expect(log).not.toContain(`${drop}:`);
+
+      // The PR advertises only the work it actually contains.
+      const body = readFileSync(bodyDump, "utf8");
+      expect(body).toContain(keep);
+      expect(body).not.toContain(drop);
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+      if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  }, 60_000);
+
+  it("a mid-run abandon kills the job and exits with no delivery — not a park, not a false success (anton-6xj0)", async () => {
+    // The operator abandons a ticket while its agent is running: cancel the job first (stopping the
+    // agent), then record the outcome — the order abandonTicket uses. The run must end with the
+    // ticket closed + abandoned (never reopened into the ready pool, never blocked with a
+    // "nothing was delivered" note), nothing shipped, and the job terminal as `cancelled` — the
+    // runner's park/retry path must not fire on an operator's own decision.
+    const epicKill = await beads.create(repo, {
+      title: "Epic abandoned mid-flight",
+      type: "epic",
+      description: "## Goal\nKILL",
+    });
+    await beads.approve(repo, epicKill);
+    const p = JSON.parse(
+      execFileSync(
+        "bd",
+        ["create", "Long-running ticket", "--type", "task", "--parent", epicKill, "--acceptance", "x", "--json"],
+        { cwd: repo, encoding: "utf8" },
+      ),
+    );
+    const tk = ((Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string);
+
+    // A claude that announces it started, then hangs until it is killed.
+    const startedMarker = join(sandbox, "abandon-started");
+    const slowClaude = writeBin(
+      binDir,
+      "claude-slow",
+      `const fs=require('fs');
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+e({type:'system',subtype:'init',session_id:'skill'});
+fs.writeFileSync(${JSON.stringify(startedMarker)},'1');
+setTimeout(()=>process.exit(0),60000);`,
+    );
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 60_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    process.env.ANTON_CLAUDE_BIN = slowClaude;
+    try {
+      const jobId = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: epicKill },
+      });
+      void runner.tickOnce();
+      // Wait for the agent to actually be in flight — abandoning before dispatch would prove nothing.
+      const deadline = Date.now() + 40_000;
+      while (!existsSync(startedMarker) && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      expect(existsSync(startedMarker)).toBe(true);
+
+      expect(await runner.cancel(jobId)).toBe(true);
+      await beads.abandon(repo, tk, "changed our minds mid-flight");
+      await runner.whenIdle();
+
+      // Terminal as cancelled — NOT parked, NOT done: an abandon is neither a failure needing a
+      // human nor a delivery.
+      const job = await getJob(tdb.db, jobId);
+      expect(job?.status).toBe("cancelled");
+
+      // The ticket keeps the outcome the operator gave it.
+      const bead = await beads.show(repo, tk);
+      expect(bead.status).toBe("closed");
+      expect(beads.isAbandoned(bead)).toBe(true);
+      expect(bead.labels ?? []).not.toContain("stage:implementing");
+      expect(bead.notes ?? "").not.toMatch(/nothing was delivered/i);
+
+      // Nothing shipped: no PR ref, and the epic never advanced to in-review.
+      const epic = await beads.show(repo, epicKill);
+      expect(epic.external_ref ?? null).toBeNull();
+      expect(epic.labels ?? []).not.toContain("stage:in-review");
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+    }
+  }, 90_000);
 });

@@ -26,6 +26,7 @@ function toTicketDetail(lite: Bead, full: Bead, epic: Bead | undefined): TicketD
     ...createdMeta(lite),
     prRef: lite.external_ref,
     deferred: beads.isDeferred(lite),
+    abandoned: beads.isAbandoned(lite),
     type: lite.issue_type ?? "task",
     priority: lite.priority,
     goal: parseGoal(full.description),

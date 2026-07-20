@@ -21,6 +21,7 @@ function makeItem(over: Partial<StandaloneItem> = {}): StandaloneItem {
     ready: true,
     unread: false,
     deferred: false,
+    abandoned: false,
     ...over,
   };
 }

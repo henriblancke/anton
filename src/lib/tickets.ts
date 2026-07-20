@@ -33,6 +33,7 @@ function toTicketRow(bead: Bead, epic: Bead | undefined): TicketRow {
     ...createdMeta(bead),
     prRef: bead.external_ref,
     deferred: beads.isDeferred(bead),
+    abandoned: beads.isAbandoned(bead),
     type: bead.issue_type ?? "task",
     epicId: epic?.id,
     epicTitle: epic?.title,

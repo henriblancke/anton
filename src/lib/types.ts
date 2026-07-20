@@ -39,6 +39,8 @@ export interface Ticket {
   prUrl?: string; // browser URL for the PR, resolved from prRef + the repo's origin remote
   /** Snoozed (`bd defer`) — kept off the ready queue until a human restores it. */
   deferred: boolean;
+  /** Abandoned (closed + `abandoned` label, anton-6xj0) — a won't-do outcome, never a delivery. */
+  abandoned: boolean;
 }
 
 export interface Epic {
@@ -94,6 +96,8 @@ export interface StandaloneItem {
   unread: boolean;
   /** Snoozed (`bd defer`) — kept off the ready queue until a human restores it. */
   deferred: boolean;
+  /** Abandoned (closed + `abandoned` label, anton-6xj0) — a won't-do outcome, never a delivery. */
+  abandoned: boolean;
 }
 
 /** Per-project beads↔Dolt sync health, read from the sync-status registry (bd.ts). Mirrors
