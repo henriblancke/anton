@@ -19,7 +19,7 @@ import { makeNightlyStringerHandler } from "./nightly-stringer";
 import { makeOrphanGroomingHandler } from "./orphan-grooming";
 import { JobRunner, type RunnerLogger } from "./runner";
 import { Scheduler } from "./scheduler";
-import { getJob, systemClock } from "./queue";
+import { activeExecuteEpicId, getJob, systemClock } from "./queue";
 import { startSyncEngine } from "../beads/sync-engine";
 
 const log: RunnerLogger = {
@@ -185,4 +185,20 @@ export async function cancelJob(projectId: string, jobId: string): Promise<Cance
   if (!job || job.projectId !== projectId) return { ok: false, reason: "not-found" };
   const acted = await getRunner().cancel(jobId);
   return acted ? { ok: true } : { ok: false, reason: "not-cancellable" };
+}
+
+/**
+ * Force-kill the active execute-epic job for a run target, if one is live here (anton-6xj0).
+ * Abandoning work whose run is still executing must stop the agent — otherwise it keeps burning
+ * tokens on a ticket a human just killed and races the board writes that record the decision. Runs
+ * BEFORE the beads writes so the job row is already terminal (`cancelled`) when the aborted handler
+ * settles: the runner then skips its park/retry path entirely, which is what keeps an abandon from
+ * being recorded as a park. Returns whether a job was killed; jobs are machine-local, so `false`
+ * just means nothing was running on this instance (a run on another machine stops at its next
+ * lease/ticket boundary, where the abandoned bead is skipped).
+ */
+export async function cancelRunForTarget(projectId: string, epicBeadId: string): Promise<boolean> {
+  const jobId = activeExecuteEpicId(getDb(), projectId, epicBeadId);
+  if (!jobId) return false;
+  return getRunner().cancel(jobId);
 }

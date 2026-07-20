@@ -91,14 +91,20 @@ export function agentDotClass(agent?: string): string {
   }
 }
 
-/** Ticket completion for an epic: how many of its tickets are `done`, and the total. */
+/**
+ * Ticket completion for an epic: how many of its tickets are `done`, and the total. Abandoned
+ * tickets leave the count entirely (anton-a5vc) — they are closed, so counting them would inflate
+ * `done` with work that shipped nothing; leaving them in the denominator would instead pin the epic
+ * below 100% forever. A won't-do ticket is out of scope, not outstanding.
+ */
 export function ticketProgress(epic: { tickets: Ticket[] }): {
   done: number;
   total: number;
   pct: number;
 } {
-  const total = epic.tickets.length;
-  const done = epic.tickets.filter((t) => t.stage === "done").length;
+  const counted = epic.tickets.filter((t) => !t.abandoned);
+  const total = counted.length;
+  const done = counted.filter((t) => t.stage === "done").length;
   const pct = total === 0 ? 0 : Math.round((done / total) * 100);
   return { done, total, pct };
 }

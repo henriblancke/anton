@@ -5,6 +5,7 @@ import { toast } from "sonner";
 import { GitPullRequestIcon, TriangleAlertIcon } from "lucide-react";
 
 import type { TicketDetail } from "@/lib/types";
+import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { ConfirmDeleteButton } from "@/components/ui/confirm-delete-button";
 import { CopyButton } from "@/components/ui/copy-button";
@@ -15,9 +16,11 @@ import {
   DialogFooter,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { MetaChip, PrLink, RelativeTime, StagePill } from "@/components/atoms";
+import { MetaChip, PrLink, RelativeTime } from "@/components/atoms";
 import { ClaimControl, InheritedOwner, StaticOwner } from "@/components/board/claim-control";
 import { PrLinkControl } from "@/components/board/pr-link-control";
+import { TicketNotes } from "./ticket-notes";
+import { TicketStateBar } from "./ticket-state-bar";
 import {
   AGENT_OPTIONS,
   PRIORITY_LABELS,
@@ -26,6 +29,7 @@ import {
   SIZE_OPTIONS,
   STATUS_LABELS,
   STATUS_OPTIONS,
+  detailsSummary,
   diffTicketPatch,
   draftFromDetail,
   hasTicketChanges,
@@ -58,7 +62,11 @@ export function TicketDialog({ slug, ticketId, open, onClose, onSaved, onDeleted
         if (!next) onClose();
       }}
     >
-      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-lg">
+      {/* Widen as the viewport allows — the contract textareas + notes get room, and the Details grid
+          breathes — while the mobile cap (max-w-[calc(100%-2rem)]) still keeps it inset on small screens.
+          `pb-0` drops the scroll container's bottom padding so the sticky footer can pin truly flush to
+          the modal's bottom edge (no padding gap, no negative-margin compensation). */}
+      <DialogContent className="max-h-[85vh] overflow-y-auto pb-0 sm:max-w-xl md:max-w-2xl xl:max-w-3xl">
         <DialogTitle className="sr-only">{ticketId ? `Ticket ${ticketId}` : "Ticket"}</DialogTitle>
         <DialogDescription className="sr-only">
           View and edit this ticket&apos;s fields.
@@ -232,7 +240,9 @@ function TicketDialogBody({
   // already finished its run and produced its PR, so re-approving it would only enqueue duplicate/
   // no-op PR work. Hide the button there while keeping it for a still-runnable target — a fresh
   // backlog approval or a Force run that resumes an in-flight (implementing/in-review) run.
-  const canRun = isRunTarget && detail.stage !== "done";
+  // A snoozed target hides it too: the whole point of the snooze is "don't pick this up yet", so
+  // offering the one control that would start it immediately contradicts the state it's in.
+  const canRun = isRunTarget && detail.stage !== "done" && !detail.deferred;
 
   return (
     <div className="flex flex-col gap-4">
@@ -245,7 +255,8 @@ function TicketDialogBody({
             </CopyButton>
             · {detail.type}
           </span>
-          <StagePill stage={detail.stage} />
+          {/* Stage + resolution (abandoned / snoozed / done) now live in the state bar below, not as
+              header chips — one home for state instead of three. */}
           {isRunTarget ? (
             // A standalone task/bug carries its own PR — let it be linked/relinked here (same
             // /epics/<id>/pr route the epic detail uses). Linking flips it to in-review.
@@ -299,6 +310,21 @@ function TicketDialogBody({
         </div>
       </div>
 
+      {/* state — stage track + Active/Snoozed/Abandoned resolution, replacing the header chips,
+          the Status `deferred` special-case, and the footer Snooze/Abandon buttons */}
+      <TicketStateBar
+        slug={slug}
+        ticketId={ticketId}
+        detail={detail}
+        onChanged={(next) => {
+          setDetail(next);
+          // Snooze/abandon only move the bead's status — keep the operator's unsaved edits and sync
+          // just that field so the Status select doesn't offer to patch it back.
+          setDraft((d) => (d ? { ...d, status: next.status } : draftFromDetail(next)));
+          onSaved?.(next);
+        }}
+      />
+
       {/* editable form */}
       <label className="flex flex-col gap-1.5">
         <span className="text-[11px] text-subtle">Title</span>
@@ -310,55 +336,81 @@ function TicketDialogBody({
         />
       </label>
 
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-        <Select label="Status" value={draft.status} onChange={(v) => set("status", v)}>
-          {STATUS_OPTIONS.map((s) => (
-            <option key={s} value={s}>
-              {STATUS_LABELS[s] ?? s}
-            </option>
-          ))}
-        </Select>
+      {/* Details — the label/scalar selects fold away by default so the contract + notes lead
+          (anton-q02q). Collapsed shows a live summary; open reveals the grid. Native <details> so the
+          toggle needs no JS and stays keyboard-accessible. */}
+      <details className="group overflow-hidden rounded-xl border border-border bg-card/40 [&_summary::-webkit-details-marker]:hidden">
+        <summary className="flex cursor-pointer list-none items-center justify-between gap-2 px-3.5 py-2.5 text-[12.5px] font-medium text-foreground select-none">
+          <span>
+            Details{" "}
+            <span className="font-normal text-subtle">· {detailsSummary(draft, detail.deferred)}</span>
+          </span>
+          <span
+            className="text-subtle transition-transform group-open:rotate-90"
+            aria-hidden="true"
+          >
+            ▸
+          </span>
+        </summary>
+        <div className="grid grid-cols-1 gap-3 border-t border-border px-3.5 py-3.5 sm:grid-cols-2">
+          {detail.deferred ? (
+            // Snooze IS the raw bead status `deferred`, and it's owned by the state bar's segment, not
+            // picked here. Show it read-only so a snoozed ticket reads coherently; un-snooze (→ open)
+            // to change status.
+            <Select label="Status" value="deferred" onChange={() => {}} disabled>
+              <option value="deferred">{STATUS_LABELS.deferred}</option>
+            </Select>
+          ) : (
+            <Select label="Status" value={draft.status} onChange={(v) => set("status", v)}>
+              {STATUS_OPTIONS.map((s) => (
+                <option key={s} value={s}>
+                  {STATUS_LABELS[s] ?? s}
+                </option>
+              ))}
+            </Select>
+          )}
 
-        <Select
-          label="Priority"
-          value={draft.priority === undefined ? "" : String(draft.priority)}
-          onChange={(v) => set("priority", v === "" ? undefined : Number(v))}
-        >
-          {draft.priority === undefined && <option value="">—</option>}
-          {PRIORITY_OPTIONS.map((p) => (
-            <option key={p} value={String(p)}>
-              {PRIORITY_LABELS[p]}
-            </option>
-          ))}
-        </Select>
+          <Select
+            label="Priority"
+            value={draft.priority === undefined ? "" : String(draft.priority)}
+            onChange={(v) => set("priority", v === "" ? undefined : Number(v))}
+          >
+            {draft.priority === undefined && <option value="">—</option>}
+            {PRIORITY_OPTIONS.map((p) => (
+              <option key={p} value={String(p)}>
+                {PRIORITY_LABELS[p]}
+              </option>
+            ))}
+          </Select>
 
-        <Select label="Agent" value={draft.agent} onChange={(v) => set("agent", v)}>
-          {draft.agent === "" && <option value="">none</option>}
-          {AGENT_OPTIONS.map((a) => (
-            <option key={a} value={a}>
-              {a}
-            </option>
-          ))}
-        </Select>
+          <Select label="Agent" value={draft.agent} onChange={(v) => set("agent", v)}>
+            {draft.agent === "" && <option value="">none</option>}
+            {AGENT_OPTIONS.map((a) => (
+              <option key={a} value={a}>
+                {a}
+              </option>
+            ))}
+          </Select>
 
-        <Select label="Risk" value={draft.risk} onChange={(v) => set("risk", v)}>
-          {draft.risk === "" && <option value="">none</option>}
-          {RISK_OPTIONS.map((r) => (
-            <option key={r} value={r}>
-              risk:{r}
-            </option>
-          ))}
-        </Select>
+          <Select label="Risk" value={draft.risk} onChange={(v) => set("risk", v)}>
+            {draft.risk === "" && <option value="">none</option>}
+            {RISK_OPTIONS.map((r) => (
+              <option key={r} value={r}>
+                risk:{r}
+              </option>
+            ))}
+          </Select>
 
-        <Select label="Size" value={draft.size} onChange={(v) => set("size", v)}>
-          {draft.size === "" && <option value="">none</option>}
-          {SIZE_OPTIONS.map((s) => (
-            <option key={s} value={s}>
-              size:{s}
-            </option>
-          ))}
-        </Select>
-      </div>
+          <Select label="Size" value={draft.size} onChange={(v) => set("size", v)}>
+            {draft.size === "" && <option value="">none</option>}
+            {SIZE_OPTIONS.map((s) => (
+              <option key={s} value={s}>
+                size:{s}
+              </option>
+            ))}
+          </Select>
+        </div>
+      </details>
 
       <ContractField
         label="Goal"
@@ -385,8 +437,30 @@ function TicketDialogBody({
         placeholder="The remaining contract markdown."
       />
 
-      <DialogFooter className="sm:justify-between">
-        <ConfirmDeleteButton onConfirm={remove} label="Delete ticket" />
+      {/* Notes stay first-class and open beside the contract — the steering the executor reads at
+          dispatch. A left accent rail marks it as its own channel, not just another field (anton-q02q). */}
+      <div className="rounded-xl border border-border bg-raised/30 p-3.5 shadow-[inset_2px_0_0_var(--primary)]">
+        <TicketNotes
+          slug={slug}
+          ticketId={ticketId}
+          notes={detail.notes}
+          // The note lands on the bead, not in the draft — merge it into the loaded detail so the
+          // history updates without a refetch and without touching the unsaved edit form.
+          onAppended={(notes) => setDetail({ ...detail, notes })}
+        />
+      </div>
+
+      {/* Pinned to the modal's bottom edge while the body scrolls under it: `sticky bottom-0` against
+          the DialogContent scrollport (whose bottom padding is removed above, so bottom-0 sits flush).
+          `mb-0` cancels the base `-mb-4` — that negative margin + sticky was the source of the earlier
+          mis-render; `-mx-4` (base) keeps the bar full-bleed. `bg-muted` (opaque, over base bg-muted/50)
+          hides the scrolling content; z-10 keeps it above. */}
+      <DialogFooter className="sticky bottom-0 z-10 mb-0 bg-muted sm:justify-between">
+        {/* Snooze + abandon now live in the state bar above; delete is the rare, destructive exit, so
+            it's demoted to an icon on the far left, out of the edit/run flow (anton-q02q). */}
+        <div className="flex flex-wrap items-center gap-2">
+          <ConfirmDeleteButton onConfirm={remove} iconOnly title="Delete ticket" />
+        </div>
         <div className="flex gap-2">
           {canRun && (
             <Button
@@ -424,22 +498,30 @@ function Select({
   label,
   value,
   onChange,
+  disabled = false,
   children,
 }: {
   label: string;
   value: string;
   onChange: (value: string) => void;
+  disabled?: boolean;
   children: React.ReactNode;
 }) {
   return (
     <label className="flex flex-col gap-1.5">
       <span className="text-[11px] text-subtle">{label}</span>
-      <div className="relative flex items-center rounded-lg border border-border bg-card text-[12.5px] focus-within:border-primary/60">
+      <div
+        className={cn(
+          "relative flex items-center rounded-lg border border-border bg-card text-[12.5px] focus-within:border-primary/60",
+          disabled && "opacity-60",
+        )}
+      >
         <select
           value={value}
           onChange={(e) => onChange(e.target.value)}
+          disabled={disabled}
           aria-label={label}
-          className="w-full appearance-none rounded-lg bg-transparent px-3 py-2 pr-8 font-mono text-foreground outline-none"
+          className="w-full appearance-none rounded-lg bg-transparent px-3 py-2 pr-8 font-mono text-foreground outline-none disabled:cursor-not-allowed"
         >
           {children}
         </select>

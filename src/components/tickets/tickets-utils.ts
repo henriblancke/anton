@@ -13,13 +13,23 @@ export const TICKET_FILTER_KEYS: (keyof TicketFilters)[] = [
   "status",
   "type",
   "epic",
+  "outcome",
   "q",
 ];
 
 export interface TicketFilterField {
   key: keyof TicketFilters;
   label: string;
+  /** Fixed choices, for a field whose values aren't derived from the current rows. */
+  options?: { value: string; label: string }[];
 }
+
+/** Outcome is a fixed pair, not a value read off the rows: the useful states are "hide the work we
+ * decided against" and "show me only what we dropped". */
+export const OUTCOME_OPTIONS = [
+  { value: "active", label: "Hide abandoned" },
+  { value: "abandoned", label: "Abandoned only" },
+];
 
 /** Select-driven filter fields, in display order. `q` (free text) is handled separately. */
 export const TICKET_FILTER_FIELDS: TicketFilterField[] = [
@@ -30,6 +40,7 @@ export const TICKET_FILTER_FIELDS: TicketFilterField[] = [
   { key: "status", label: "Status" },
   { key: "type", label: "Type" },
   { key: "epic", label: "Epic" },
+  { key: "outcome", label: "Outcome", options: OUTCOME_OPTIONS },
 ];
 
 /** Reads ticket filters out of a URLSearchParams instance (e.g. from useSearchParams). */

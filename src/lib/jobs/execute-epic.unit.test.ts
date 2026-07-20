@@ -5,6 +5,7 @@
  */
 import { describe, expect, it } from "vitest";
 import type { Bead } from "../beads/bd";
+import { formatHumanNote } from "../beads/notes";
 import {
   claudeResumeDecision,
   continuationPrompt,
@@ -132,6 +133,31 @@ describe("ticketPrompt", () => {
     } as Bead);
     expect(p).toContain("[truncated");
     expect(p).not.toContain(huge);
+  });
+
+  it("carries the operator's human notes as binding steering, after the contract (anton-bfy4)", () => {
+    const p = ticketPrompt({
+      id: "t-1",
+      title: "T",
+      status: "open",
+      acceptance_criteria: "- [ ] it works",
+      notes: [
+        "anton: run failed after committing work — needs review",
+        formatHumanNote("reuse the existing helper", "Henri Blancke", new Date(0)),
+      ].join("\n"),
+    } as Bead);
+    expect(p).toContain("## Human notes on this ticket");
+    expect(p).toContain("reuse the existing helper");
+    expect(p).toContain("Henri Blancke");
+    // The steer must land after the acceptance criteria it refines, and anton's own machine notes
+    // stay out — they narrate past failures, not the human's intent.
+    expect(p.indexOf("Human notes")).toBeGreaterThan(p.indexOf("- [ ] it works"));
+    expect(p).not.toContain("run failed after committing work");
+  });
+
+  it("adds no notes section when the bead has none", () => {
+    const p = ticketPrompt({ id: "t-1", title: "T", status: "open" } as Bead);
+    expect(p).not.toContain("Human notes");
   });
 });
 

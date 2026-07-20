@@ -8,7 +8,8 @@ import type { StandaloneItem } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { CopyButton } from "@/components/ui/copy-button";
-import { BlockedChip, MetaChip, PrLink, RiskChip } from "@/components/atoms";
+import { AbandonedChip, BlockedChip, MetaChip, PrLink, RiskChip, SnoozedChip } from "@/components/atoms";
+import { SnoozeButton } from "@/components/ticket/snooze-button";
 import { ClaimControl } from "@/components/board/claim-control";
 import { TYPE_RAIL, TYPE_TEXT, agentDotClass } from "@/components/board/board-utils";
 import { TypeBadge, TypeIcon } from "@/components/board/type-language";
@@ -43,6 +44,16 @@ export function StandaloneChip({
   const [running, setRunning] = useState(false);
   const approved = item.approved || optimisticApproved;
 
+  // Snooze is two-way, so an optimistic override can't be a one-way flag like `approved`: hold the
+  // clicked value until the board's own poll reports it, then drop back to the server truth (which
+  // keeps another operator's un-snooze from being masked by our stale override). Reconciled during
+  // render — the props-changed reset pattern, not an effect.
+  const [optimisticDeferred, setOptimisticDeferred] = useState<boolean | null>(null);
+  if (optimisticDeferred !== null && optimisticDeferred === item.deferred) {
+    setOptimisticDeferred(null);
+  }
+  const deferred = optimisticDeferred ?? item.deferred;
+
   async function handleApproveRun() {
     setRunning(true);
     setOptimisticApproved(true);
@@ -63,13 +74,16 @@ export function StandaloneChip({
 
   // Gate on readiness, not just stage: the approve route rejects a still-blocked standalone target
   // with 409, so a chip with open blockers must not offer Approve & run (mirrors the epic card).
-  const showApproveRun = item.stage === "backlog" && !approved && item.ready;
+  // A snoozed item hides it too — the snooze exists to keep this off the runtime's plate.
+  const showApproveRun = item.stage === "backlog" && !approved && item.ready && !deferred;
 
   return (
     <div
       className={cn(
         "relative flex flex-col gap-2 rounded-[10px] border border-border bg-card/70 p-2.5 text-card-foreground transition-colors hover:border-ring/40",
         TYPE_RAIL[item.type],
+        // Dimmed like a blocked card: the runtime won't pick this up as it stands.
+        (deferred || item.abandoned) && "opacity-60",
       )}
     >
       {/* Full-bleed trigger — opens the shared TicketDialog. Interactive controls below sit above it
@@ -97,7 +111,8 @@ export function StandaloneChip({
         </h4>
         {item.prRef && (
           <PrLink href={item.prUrl} className={item.prUrl ? "pointer-events-auto" : undefined}>
-            <MetaChip tone={item.stage === "done" ? "done" : "pr"}>
+            {/* An abandoned item is closed (stage `done`) but nothing merged — never green-tint its PR. */}
+            <MetaChip tone={item.stage === "done" && !item.abandoned ? "done" : "pr"}>
               <GitPullRequestIcon className="size-2.5" aria-hidden="true" />
               {prLabel(item.prRef)}
             </MetaChip>
@@ -119,6 +134,8 @@ export function StandaloneChip({
         {item.agent && <MetaChip dotClass={agentDotClass(item.agent)}>{item.agent}</MetaChip>}
         {item.risk && <RiskChip risk={item.risk} />}
         {item.stage === "backlog" && <BlockedChip blockedBy={item.blockedBy} />}
+        {item.abandoned && <AbandonedChip />}
+        {deferred && <SnoozedChip />}
         {showApproveRun && (
           <Button
             size="xs"
@@ -139,6 +156,15 @@ export function StandaloneChip({
             owner={item.assignee}
             readOnly={approved}
             canTakeOver={item.stage === "backlog"}
+          />
+          <SnoozeButton
+            slug={slug}
+            ticketId={item.id}
+            deferred={deferred}
+            size="icon-xs"
+            iconOnly
+            className="pointer-events-auto ml-auto shrink-0"
+            onChanged={(detail) => setOptimisticDeferred(detail.deferred)}
           />
         </div>
       )}

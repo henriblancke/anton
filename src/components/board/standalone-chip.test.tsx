@@ -20,6 +20,8 @@ function makeItem(over: Partial<StandaloneItem> = {}): StandaloneItem {
     blockedBy: [],
     ready: true,
     unread: false,
+    deferred: false,
+    abandoned: false,
     ...over,
   };
 }
@@ -61,6 +63,41 @@ describe("StandaloneChip", () => {
     // A blocked standalone target can't be approved (the route 409s), so no Approve & run.
     expect(html).not.toMatch(/Approve/);
     expect(html).toContain("blocked by t-9");
+  });
+
+  it("offers a snooze toggle in the backlog and marks a snoozed item, hiding its run affordance", () => {
+    const awake = renderToStaticMarkup(<StandaloneChip slug="anton" item={makeItem()} />);
+    expect(awake).toContain('aria-label="Snooze"');
+    expect(awake).not.toContain("snoozed");
+
+    const snoozed = renderToStaticMarkup(
+      <StandaloneChip slug="anton" item={makeItem({ deferred: true })} />,
+    );
+    expect(snoozed).toContain("snoozed");
+    // The toggle flips to restore, and the one control that would start a run is gone.
+    expect(snoozed).toContain('aria-label="Un-snooze"');
+    expect(snoozed).not.toMatch(/Approve/);
+  });
+
+  it("marks an abandoned item with its own chip and never with the shipped/done tint", () => {
+    const shipped = renderToStaticMarkup(
+      <StandaloneChip
+        slug="anton"
+        item={makeItem({ stage: "done", status: "closed", prRef: "gh-42" })}
+      />,
+    );
+    expect(shipped).not.toContain("abandoned");
+    expect(shipped).toContain("text-stage-done");
+
+    const dropped = renderToStaticMarkup(
+      <StandaloneChip
+        slug="anton"
+        item={makeItem({ stage: "done", status: "closed", prRef: "gh-42", abandoned: true })}
+      />,
+    );
+    expect(dropped).toContain("abandoned");
+    // Closed, but nothing shipped — the done tint belongs to delivered work only.
+    expect(dropped).not.toContain("text-stage-done");
   });
 
   it("links a PR chip when the standalone item is in review", () => {

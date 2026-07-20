@@ -2,9 +2,20 @@
  * Shared contract for the anton board slice. The API layer and the UI both build to this.
  * Stages/approval/PR are derived from beads (see DESIGN.md §2/§3), not stored in anton.db.
  */
+import type { TicketNote } from "./beads/notes";
+
+export type { TicketNote };
 
 export type Stage = "backlog" | "implementing" | "in-review" | "done";
 export const STAGES: Stage[] = ["backlog", "implementing", "in-review", "done"];
+
+/**
+ * Cap on an abandon reason (anton-6xj0). It is a sentence explaining a decision, not a document —
+ * anything longer belongs in a note on the bead. Lives here, not in lib/abandon.ts, so the client
+ * form can bound the input without pulling the server-only abandon module into the browser bundle;
+ * the server still enforces it.
+ */
+export const MAX_ABANDON_REASON_CHARS = 500;
 
 /** The board's shared type language. An epic renders as a card; a standalone task/bug as a chip.
  * Every other bead issue_type is not board work. */
@@ -34,6 +45,10 @@ export interface Ticket {
   createdBy: string | null; // who created the bead
   prRef?: string; // bead external_ref, if any
   prUrl?: string; // browser URL for the PR, resolved from prRef + the repo's origin remote
+  /** Snoozed (`bd defer`) — kept off the ready queue until a human restores it. */
+  deferred: boolean;
+  /** Abandoned (closed + `abandoned` label, anton-6xj0) — a won't-do outcome, never a delivery. */
+  abandoned: boolean;
 }
 
 export interface Epic {
@@ -56,6 +71,8 @@ export interface Epic {
   ready: boolean; // no open blockers — mirrors what the runtime's bd-ready would actually pick up
   rank: number; // topological rank (0 = no blockers); drives dependency-aware backlog order
   priority: number; // bead priority (0=critical … 4=lowest); backlog tiebreak after rank
+  /** Abandoned (closed + `abandoned` label, anton-6xj0) — a won't-do outcome, never a delivery. */
+  abandoned: boolean;
   tickets: Ticket[];
 }
 
@@ -87,6 +104,10 @@ export interface StandaloneItem {
   /** A self-filed bug (source:<x> label) still untouched (backlog, unclaimed, not approved) — it
    * wants a human's triage before it runs. Derived each build; there is no stored read-state. */
   unread: boolean;
+  /** Snoozed (`bd defer`) — kept off the ready queue until a human restores it. */
+  deferred: boolean;
+  /** Abandoned (closed + `abandoned` label, anton-6xj0) — a won't-do outcome, never a delivery. */
+  abandoned: boolean;
 }
 
 /** Per-project beads↔Dolt sync health, read from the sync-status registry (bd.ts). Mirrors
@@ -130,6 +151,8 @@ export interface TicketFilters {
   status?: string;
   type?: string;
   epic?: string;
+  /** Abandoned work: "active" hides it, "abandoned" shows only it; unset shows everything. */
+  outcome?: string;
   q?: string; // free-text over title
 }
 
@@ -144,6 +167,7 @@ export interface TicketDetail extends Ticket {
   epicTitle?: string;
   epicAssignee?: string | null; // the parent epic's human-claim owner, inherited by this child
   approved: boolean; // has the `approved` label — locks the standalone claim control (see ClaimControl)
+  notes: TicketNote[]; // append-only note history (human steering + anton's own machine notes)
 }
 
 // ── Board drag-and-drop ──

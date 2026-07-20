@@ -21,6 +21,13 @@ export const LABELS = {
   stage: (s: "implementing" | "in-review") => `stage:${s}`,
   source: (s: string) => `source:${s}`,
   /**
+   * Won't-do outcome (anton-6xj0). beads has no `cancelled` status, so an abandoned bead is
+   * `closed` + this label: the history/contract survives (unlike delete) while the label keeps it
+   * from reading as shipped (unlike a plain close). Every "was this delivered?" check must consult
+   * it — see beads.isAbandoned.
+   */
+  abandoned: "abandoned",
+  /**
    * Cross-machine run-liveness lease (anton-jz1): `run-lease:<expiresAtEpochMs>[:<ownerRunId>]` on
    * the run target. Present + unexpired ⇒ a run is actively executing this epic on SOME machine, so
    * a Force run started elsewhere must not spawn a second concurrent run. This is the shared
@@ -499,7 +506,14 @@ export const beads = {
   setExternalRef: (cwd: string, id: string, ref: string) =>
     bdWrite(cwd, ["update", id, "--external-ref", ref]),
 
-  note: (cwd: string, id: string, text: string) => bdWrite(cwd, ["note", id, text]),
+  /**
+   * Append to a bead's notes blob (`bd note`). `actor` attributes the write in bd's audit trail —
+   * pass it for a human note so the entry isn't stamped with whatever unix user the server runs
+   * as; anton's own job notes leave it unset. The visible authorship a reader sees comes from the
+   * note header itself (see beads/notes.ts), not from bd.
+   */
+  note: (cwd: string, id: string, text: string, actor?: string) =>
+    bdWrite(cwd, ["note", id, text], actor ? { BEADS_ACTOR: actor } : undefined),
   close: (cwd: string, id: string) => bdWrite(cwd, ["close", id]),
 
   /**
@@ -510,6 +524,51 @@ export const beads = {
   delete: (cwd: string, id: string, opts: { cascade?: boolean } = {}) =>
     bdWrite(cwd, ["delete", id, "--force", ...(opts.cascade ? ["--cascade"] : [])]),
   reopen: (cwd: string, id: string) => bdWrite(cwd, ["reopen", id]),
+
+  /**
+   * Snooze a bead (`bd defer`) / restore it (`bd undefer`) — the "not now, but not dead" state
+   * (anton-ywi8). A deferred bead keeps its contract, notes, and edges but drops out of `bd ready`,
+   * so the runtime never picks it up; undefer returns it to `open`. Deliberately distinct from
+   * close (finished) and from blocked (waiting on a specific dependency). Manual only — bd's
+   * `--until <date>` scheduling is out of scope.
+   */
+  defer: (cwd: string, id: string) => bdWrite(cwd, ["defer", id]),
+  undefer: (cwd: string, id: string) => bdWrite(cwd, ["undefer", id]),
+
+  /** A bead snoozed out of the ready queue (`bd defer`). */
+  isDeferred: (b: Bead) => b.status === "deferred",
+
+  /**
+   * Abandon a bead — the won't-do outcome (anton-6xj0). Two writes, in this order: `bd close
+   * --reason "abandoned: <why>"` (the reason is the durable record of the decision, so it is
+   * REQUIRED here rather than optional) then the `abandoned` label. Closing first means a crash
+   * between the two leaves the bead closed-without-the-label — visible as done, which understates
+   * the decision but never re-queues work a human killed; the label write is retried by re-running
+   * abandon. Deliberately NOT a delete (that destroys the history a won't-do decision is made of)
+   * and NOT a plain close (that reads as shipped).
+   */
+  abandon: async (cwd: string, id: string, reason: string): Promise<void> => {
+    const why = reason.trim();
+    if (!why) throw new Error("abandon requires a reason");
+    await bdWrite(cwd, ["close", id, "--reason", `abandoned: ${why}`]);
+    // One update: tag it abandoned and drop any stage label. The stage is a claim on in-flight work
+    // — an abandoned bead has none, and leaving `stage:implementing` behind (the run that was
+    // killed to make room for this abandon set it) would keep it reading as in-flight work.
+    await bdWrite(cwd, [
+      "update",
+      id,
+      "--add-label",
+      LABELS.abandoned,
+      "--remove-label",
+      LABELS.stage("implementing"),
+      "--remove-label",
+      LABELS.stage("in-review"),
+    ]);
+  },
+
+  /** A bead a human abandoned (closed + `abandoned`) — closed, but explicitly NOT delivered. */
+  isAbandoned: (b: Bead) => b.labels?.includes(LABELS.abandoned) ?? false,
+
   setStatus: (cwd: string, id: string, status: string) =>
     bdWrite(cwd, ["update", id, "--status", status]),
 

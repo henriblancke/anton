@@ -3,7 +3,7 @@
 import { useState } from "react";
 import Link from "next/link";
 import { toast } from "sonner";
-import { CircleCheckIcon, GitPullRequestIcon } from "lucide-react";
+import { CircleCheckIcon, CircleSlashIcon, GitPullRequestIcon } from "lucide-react";
 
 import type { Epic } from "@/lib/types";
 import { Button } from "@/components/ui/button";
@@ -11,7 +11,7 @@ import { ConfirmDeleteButton } from "@/components/ui/confirm-delete-button";
 import { cn } from "@/lib/utils";
 import { STAGE_INSET_SHADOW, agentDotClass, ticketProgress } from "@/components/board/board-utils";
 import { TypeBadge, TypeIcon } from "@/components/board/type-language";
-import { BlockedChip, MetaChip, PrLink, RiskChip } from "@/components/atoms";
+import { AbandonedChip, BlockedChip, MetaChip, PrLink, RiskChip } from "@/components/atoms";
 import { ClaimControl } from "@/components/board/claim-control";
 import { CopyButton } from "@/components/ui/copy-button";
 
@@ -85,19 +85,38 @@ export function EpicCard({
           <CopyButton value={epic.id} label="epic id" className="font-mono text-[10px]">
           {epic.id}
         </CopyButton>
-          {epic.prRef && (
+          {epic.prRef && !epic.abandoned && (
             <PrLink href={epic.prUrl} className="ml-auto">
               <MetaChip tone="done">merged {prLabel(epic.prRef)}</MetaChip>
             </PrLink>
           )}
+          {epic.abandoned && <AbandonedChip className="ml-auto" />}
         </div>
-        <h4 className="text-[13px] leading-snug font-semibold" title={epic.title}>
+        <h4
+          className={cn(
+            "text-[13px] leading-snug font-semibold",
+            epic.abandoned && "text-subtle line-through decoration-border",
+          )}
+          title={epic.title}
+        >
           {epic.title}
         </h4>
+        {/* An abandoned epic is closed like a shipped one — the done column would otherwise read it
+            as delivered. Slash, not tick; "won't be done", not "complete". */}
         <div className="flex items-center gap-1.5">
-          <CircleCheckIcon className="size-3 text-stage-done" aria-hidden="true" />
+          {epic.abandoned ? (
+            <CircleSlashIcon className="size-3 text-subtle" aria-hidden="true" />
+          ) : (
+            <CircleCheckIcon className="size-3 text-stage-done" aria-hidden="true" />
+          )}
           <span className="font-mono text-[10px] text-subtle">
-            {total > 0 ? `${done} / ${total} tickets` : "complete"}
+            {epic.abandoned
+              ? total > 0
+                ? `abandoned · ${done} / ${total} tickets`
+                : "abandoned"
+              : total > 0
+                ? `${done} / ${total} tickets`
+                : "complete"}
           </span>
         </div>
       </CardShell>
