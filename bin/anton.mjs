@@ -1000,21 +1000,26 @@ function renderDoltSync(sync) {
 }
 
 /**
- * Warn when a git-hooks manager (husky/lefthook) or a custom core.hooksPath owns the repo's hooks:
- * bd's post-merge/post-checkout Dolt HYDRATION won't fire under it. Print manual chaining steps —
- * anton never rewrites the user's hooks. Hooks are OPTIONAL for anton-driven repos because the
- * runner pushes Dolt explicitly on every write, so this is informational, not a failure (anton-43b).
+ * Note when a git-hooks manager (husky/lefthook) or a custom core.hooksPath owns the repo's hooks:
+ * bd's post-merge/post-checkout Dolt HYDRATION won't fire under it. For an anton-driven repo that
+ * is the DESIRABLE outcome, so this is reassurance, not a warning (anton-43b, anton-vqgw).
+ *
+ * anton used to print steps for chaining `bd hooks run post-merge` back in. That advice was wrong:
+ * hydration is redundant here (the runner pushes Dolt explicitly on every write) and it is
+ * destructive — an inbound import replaces local rows from an older snapshot, so a bead closed
+ * after that snapshot silently reverts to open. Repos that followed the old advice saw closed
+ * epics flip back to open across merges. Never recommend chaining the hydration hooks.
  */
 function renderHooksWarning(warning) {
   if (!warning) return;
   console.log(
-    c.yellow(`\n! git hooks are managed by ${warning.manager}`) +
+    c.green(`\n✓ git hooks are managed by ${warning.manager}`) +
       c.dim(` (${warning.path}) — bd's hydration hooks won't run under it.`),
   );
-  console.log(c.dim("  anton won't rewrite your hooks. Hooks are OPTIONAL here — the runner pushes Dolt"));
-  console.log(c.dim("  explicitly on every write. To also keep hydration on pull/checkout, chain bd in:"));
-  console.log(c.dim(`    add to ${warning.manager === "lefthook" ? "your lefthook post-merge/post-checkout commands" : ".husky/post-merge and .husky/post-checkout"}:`));
-  console.log(c.dim('      bd hooks run post-merge "$@"      # (and post-checkout, respectively)'));
+  console.log(c.dim("  That's what you want. anton pushes Dolt explicitly on every write, so inbound"));
+  console.log(c.dim("  hydration is redundant — and it can revert beads you already closed by replaying"));
+  console.log(c.dim("  an older snapshot over them. Do NOT chain `bd hooks run post-merge/post-checkout`."));
+  console.log(c.dim("  Export/push hooks (pre-commit, pre-push) are safe to chain if you want them."));
 }
 
 async function cmdInit(args = []) {
@@ -1043,8 +1048,8 @@ async function cmdInit(args = []) {
   renderDoltSync(beads.doltSync);
 
   // Hooks are optional for anton-driven repos (runDoltSync() pushes Dolt explicitly on every write).
-  // Under a husky/lefthook hooksPath, only post-merge/post-checkout hydration is lost — warn, don't
-  // auto-rewrite the user's hooks.
+  // Under a husky/lefthook hooksPath only post-merge/post-checkout HYDRATION is lost, which is a
+  // good thing here — hydration can replay an older snapshot over beads closed since (anton-vqgw).
   renderHooksWarning(beads.hooksWarning);
 
   // Register with anton so the repo shows on the projects board — in the same command (anton-uez).
