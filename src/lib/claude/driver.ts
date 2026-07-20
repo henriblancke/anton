@@ -259,7 +259,17 @@ function toEvents(raw: Record<string, unknown>): ClaudeEvent[] {
  * Throws a plain Error on spawn failure / non-zero exit that isn't a usage limit.
  */
 export async function runClaude(opts: RunClaudeOptions): Promise<ClaudeResult> {
-  const bin = process.env[CLAUDE_BIN_ENV] ?? "claude";
+  const binOverride = process.env[CLAUDE_BIN_ENV];
+  // Refuse to spawn the real, billable `claude` under vitest. Tests must point `ANTON_CLAUDE_BIN`
+  // at a fake emitter; without it we'd otherwise launch a real bypassPermissions session against a
+  // temp worktree (anton-lixu). Enforce this structurally so a stub isn't left to each test to remember.
+  if (!binOverride && process.env.VITEST) {
+    throw new Error(
+      `runClaude refused to spawn the real 'claude' binary under vitest: set ${CLAUDE_BIN_ENV} to a fake stream-json emitter. ` +
+        "This guard prevents a real, billable bypassPermissions session from launching in tests.",
+    );
+  }
+  const bin = binOverride ?? "claude";
 
   const args = ["-p", opts.prompt, "--output-format", "stream-json", "--verbose"];
   // Resume an interrupted session in-place (anton-juar) — continue the same conversation rather than

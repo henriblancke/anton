@@ -143,6 +143,20 @@ describe("runClaude", () => {
     expect(events.some((e) => e.type === "system")).toBe(true);
   });
 
+  it("refuses to spawn the real binary under vitest when ANTON_CLAUDE_BIN is unset", async () => {
+    // A missing override under vitest must fail loud — never fall through to spawning the real,
+    // billable `claude` against a temp worktree (anton-lixu). The guard runs before spawn(), so a
+    // rejection here proves no process was launched; the error must name the env var to fix.
+    const saved = process.env[CLAUDE_BIN_ENV];
+    delete process.env[CLAUDE_BIN_ENV];
+    try {
+      await expect(runClaude({ cwd: dir, prompt: "do the thing" })).rejects.toThrow(CLAUDE_BIN_ENV);
+    } finally {
+      if (saved === undefined) delete process.env[CLAUDE_BIN_ENV];
+      else process.env[CLAUDE_BIN_ENV] = saved;
+    }
+  });
+
   it("rejects with UsageLimitError (and a parsed resetAt) when claude reports an exhausted quota", async () => {
     const bin = writeFakeClaude(
       "limited-claude",
