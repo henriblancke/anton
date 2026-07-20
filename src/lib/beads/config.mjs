@@ -112,6 +112,31 @@ export function ensureBeadsGitignore(beadsDir, entries = BEADS_GITIGNORE_ENTRIES
 }
 
 /**
+ * Untrack beads exports that are ALREADY in git (anton-vqgw). `.gitignore` only suppresses
+ * *untracked* files, so a repo that committed `issues.jsonl` before the ignore was added keeps
+ * carrying it — and then every clone/branch ships a frozen snapshot of the board that inbound
+ * tooling can replay over live state. Idempotent: a no-op when nothing is tracked.
+ *
+ * Stages the removal (`git rm --cached`) rather than committing — the caller's next commit picks it
+ * up, and anton never commits on the user's behalf. Returns { untracked: string[] }.
+ */
+export function untrackBeadsExports(dir, entries = BEADS_GITIGNORE_ENTRIES) {
+  const paths = entries.map((e) => `.beads/${e}`);
+  const ls = spawnSync("git", ["ls-files", "--", ...paths], { cwd: dir, encoding: "utf8" });
+  if ((ls.status ?? 1) !== 0) return { untracked: [] };
+  const tracked = (ls.stdout || "")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (tracked.length === 0) return { untracked: [] };
+
+  // -r so a tracked directory form (dolt/, embeddeddolt/) is removed too.
+  const rm = spawnSync("git", ["rm", "--cached", "-r", "-q", "--", ...tracked], { cwd: dir, encoding: "utf8" });
+  if ((rm.status ?? 1) !== 0) return { untracked: [], error: (rm.stderr || "").trim() };
+  return { untracked: tracked };
+}
+
+/**
  * True when `.beads/config.yaml` carries an *uncommented* `key: value` matching `want` (surrounding
  * quotes tolerated, e.g. `dolt.auto-commit: "on"`). We check the FILE — not `bd config get` — because
  * the team-config must be committed to config.yaml to travel to every clone; `bd config get` also
@@ -397,6 +422,19 @@ export function configureBeadsForRepo(dir, opts = {}) {
   } else {
     emit(".beads/.gitignore already untracks exports + Dolt state");
     steps.push({ name: ".beads/.gitignore", status: "already" });
+  }
+
+  // 3b. .gitignore only suppresses UNTRACKED files — a repo that committed an export before the
+  // ignore existed keeps shipping it. Untrack them for real (anton-vqgw).
+  const ut = untrackBeadsExports(dir);
+  if (ut.error) {
+    errors.push(`could not untrack committed beads exports: ${ut.error}`);
+    steps.push({ name: "untrack exports", status: "failed", detail: ut.error });
+  } else if (ut.untracked.length) {
+    emit(`untracked (staged for removal): ${ut.untracked.join(", ")}`);
+    steps.push({ name: "untrack exports", status: "set", detail: ut.untracked.join(", ") });
+  } else {
+    steps.push({ name: "untrack exports", status: "already" });
   }
 
   // 4. Wire the git-backed Dolt remote (remote add → hydrate pull → publish push). Shared here so

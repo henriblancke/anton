@@ -1,5 +1,10 @@
-# Beads/Dolt sync (anton-q3o): re-import Dolt data after `git pull`/merge. Chains the
-# bd-managed shim (guarded by `command -v bd`, so contributors without bd are unaffected).
-if [ -f .beads/hooks/post-merge ]; then
-  sh .beads/hooks/post-merge "$@"
-fi
+# Beads/Dolt: intentionally NO hydration here (anton-vqgw).
+#
+# This used to chain `.beads/hooks/post-merge`, which re-imports Dolt data after `git pull`/merge.
+# That import is redundant for an anton-driven repo — the runner pushes Dolt explicitly on every
+# write — and it is not harmless: hydration replaces local rows from an older synced snapshot, so a
+# bead closed after that snapshot was taken silently reverts to open. Closed epics were observed
+# flipping back to open across merges (bd history showed four closed->open flips in one day).
+#
+# Export/push stays chained in .husky/pre-commit and .husky/pre-push — those publish local state and
+# are safe. Only the inbound hydration (post-merge, post-checkout) is dropped.
