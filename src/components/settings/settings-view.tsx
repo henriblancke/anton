@@ -673,6 +673,7 @@ function PctField({
       <div className="relative flex items-center rounded-[10px] border border-border bg-card focus-within:border-primary/60">
         <input
           type="number"
+          step={1}
           min={0}
           max={100}
           value={value}

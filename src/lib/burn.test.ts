@@ -1,6 +1,6 @@
 /**
- * Per-job burn sampler (anton-w8ny): the pure delta, the rolling per-type average with its static
- * tier-seed fallback, and the fail-soft sampler, all against a real in-memory anton.db.
+ * Per-job burn sampler (anton-w8ny): the pure delta, the rolling per-type average with its
+ * seed-blended ramp-up, and the fail-soft sampler, all against a real in-memory anton.db.
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { makeTestDb, type TestDb } from "./db/testing";
@@ -58,17 +58,30 @@ describe("getBurnAverage", () => {
   });
   afterEach(() => t.close());
 
-  it("returns the static tier seed until N real samples accrue", async () => {
+  it("returns the pure tier seed when no real samples exist", async () => {
     const seed = TIER_SEEDS[JOB_TYPE_TIER["execute-epic"]]; // L
-    for (let i = 0; i < BURN_SAMPLE_WINDOW - 1; i++) {
-      const avg = await getBurnAverage(t.db, "execute-epic");
-      expect(avg.seeded).toBe(true);
-      expect(avg.sessionAvg).toBe(seed.sessionPct);
-      expect(avg.weeklyAvg).toBe(seed.weeklyPct);
-      expect(avg.sampleCount).toBe(i);
-      expect(avg.tier).toBe("L");
+    const avg = await getBurnAverage(t.db, "execute-epic");
+    expect(avg.seeded).toBe(true);
+    expect(avg.sampleCount).toBe(0);
+    expect(avg.sessionAvg).toBe(seed.sessionPct);
+    expect(avg.weeklyAvg).toBe(seed.weeklyPct);
+    expect(avg.tier).toBe("L");
+  });
+
+  it("blends real samples with the seed during ramp-up, staying seeded", async () => {
+    // L seed is 20/3; each real sample burns 30/4. The average should move off the seed toward the
+    // real data by rows.length/window — not stay pinned to the seed until the window fills.
+    const seed = TIER_SEEDS[JOB_TYPE_TIER["execute-epic"]]; // { sessionPct: 20, weeklyPct: 3 }
+    for (let i = 1; i < BURN_SAMPLE_WINDOW; i++) {
       await recordBurnSample(t.db, clock, "execute-epic", { sessionDelta: 30, weeklyDelta: 4 });
       clock.advance(1_000);
+      const avg = await getBurnAverage(t.db, "execute-epic");
+      const pad = BURN_SAMPLE_WINDOW - i;
+      expect(avg.seeded).toBe(true);
+      expect(avg.sampleCount).toBe(i);
+      expect(avg.sessionAvg).toBeCloseTo((i * 30 + pad * seed.sessionPct) / BURN_SAMPLE_WINDOW, 5);
+      expect(avg.weeklyAvg).toBeCloseTo((i * 4 + pad * seed.weeklyPct) / BURN_SAMPLE_WINDOW, 5);
+      expect(avg.sessionAvg).toBeGreaterThan(seed.sessionPct); // real burn pulls it up
     }
   });
 

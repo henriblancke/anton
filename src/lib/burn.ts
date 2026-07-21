@@ -8,7 +8,8 @@
  * cost. Reads are fail-soft — a missing/reset meter records NO sample and never touches the job.
  *
  * `getBurnAverage` returns a rolling average over the most recent {@link BURN_SAMPLE_WINDOW} samples
- * for a type; until that many real samples accrue it falls back to a static per-tier seed. Everything
+ * for a type; until that many real samples accrue it blends the samples it has with a static per-tier
+ * seed (padding the empty slots with the seed), so real measurements count from the first one. Everything
  * is db-injectable (like schedules.ts) so the runner and tests share one connection.
  *
  * Scope: no per-request/token accounting, no cross-machine aggregation — each machine keeps its own
@@ -85,21 +86,22 @@ export async function recordBurnSample(
 
 export interface BurnAverage {
   jobType: JobType;
-  /** Rolling mean session%-delta over the window, or the tier seed while under-sampled. */
+  /** Rolling mean session%-delta over the window; while under-sampled, real samples blended with the tier seed. */
   sessionAvg: number;
-  /** Rolling mean weekly%-delta over the window, or the tier seed while under-sampled. */
+  /** Rolling mean weekly%-delta over the window; while under-sampled, real samples blended with the tier seed. */
   weeklyAvg: number;
   /** Real samples counted (capped at the window). */
   sampleCount: number;
-  /** True when the answer is the static tier seed, not yet backed by enough real samples. */
+  /** True while under-sampled, so the average still leans on the tier seed rather than being fully measured. */
   seeded: boolean;
   tier: BurnTier;
 }
 
 /**
- * Rolling per-type burn average over the most recent `window` samples. Returns the static tier seed
- * until at least `window` real samples exist, so callers always get a usable number. Read path via
- * the shared anton.db by default; the runner/tests inject their own connection.
+ * Rolling per-type burn average over the most recent `window` samples. Under-sampled types blend the
+ * real samples they have with the tier seed (empty slots padded with the seed), so callers always get
+ * a usable number that tracks real burn from the first sample. Read path via the shared anton.db by
+ * default; the runner/tests inject their own connection.
  */
 export async function getBurnAverage(
   db: AntonDb,
@@ -118,15 +120,15 @@ export async function getBurnAverage(
     .limit(window);
 
   if (rows.length < window) {
+    // Ramp-up: pad the missing slots with the tier seed rather than discarding the real samples we
+    // do have. Each real measurement pulls the average toward reality (weighted by rows.length/window)
+    // so an execute-epic that actually burns 40% isn't stuck reporting the 20% seed until sample #5.
+    // With zero rows this collapses to the pure seed.
     const seed = TIER_SEEDS[tier];
-    return {
-      jobType,
-      sessionAvg: seed.sessionPct,
-      weeklyAvg: seed.weeklyPct,
-      sampleCount: rows.length,
-      seeded: true,
-      tier,
-    };
+    const pad = window - rows.length;
+    const sessionAvg = (rows.reduce((s, r) => s + r.sessionDelta, 0) + pad * seed.sessionPct) / window;
+    const weeklyAvg = (rows.reduce((s, r) => s + r.weeklyDelta, 0) + pad * seed.weeklyPct) / window;
+    return { jobType, sessionAvg, weeklyAvg, sampleCount: rows.length, seeded: true, tier };
   }
 
   const sessionAvg = rows.reduce((s, r) => s + r.sessionDelta, 0) / rows.length;
