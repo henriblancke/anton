@@ -10,6 +10,7 @@ import {
   admitJob,
   budgetGate,
   DEFAULT_BUDGET_POLICY,
+  isBehindPace,
   jobValueScore,
   type BudgetPolicy,
 } from "./budget";
@@ -306,5 +307,21 @@ describe("admitJob / admissibleJobs (pace-modulated prioritization)", () => {
     expect(admitJob(day, POLICY, NOON, heavyCleanup).admit).toBe(false);
     expect(admitJob(usage, POLICY, NIGHT, heavyCleanup).admit).toBe(true);
     expect(admitJob(usage, POLICY, NIGHT, lightCleanup).admit).toBe(false);
+  });
+});
+
+describe("isBehindPace (shaping-nudge input)", () => {
+  it("is true when weekly usage trails the pace-line beyond the slack band", () => {
+    // Half the week elapsed (target ~50%) but only 30% burned → behind, room in the plan.
+    expect(isBehindPace(usageAt(NOON, { elapsed: 0.5, weeklyPct: 30, sessionPct: 10 }), POLICY, NOON)).toBe(true);
+  });
+
+  it("is false on-pace and when ahead of the plan", () => {
+    expect(isBehindPace(usageAt(NOON, { elapsed: 0.5, weeklyPct: 50, sessionPct: 10 }), POLICY, NOON)).toBe(false);
+    expect(isBehindPace(usageAt(NOON, { elapsed: 0.5, weeklyPct: 80, sessionPct: 10 }), POLICY, NOON)).toBe(false);
+  });
+
+  it("is false on a null read — never nags when the pace is unknown", () => {
+    expect(isBehindPace(null, POLICY, NOON)).toBe(false);
   });
 });

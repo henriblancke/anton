@@ -8,6 +8,7 @@ import { isNavItemActive, type ShellNavItem } from "@/components/shell/shell-uti
 import { ThemeToggle } from "@/components/shell/theme-toggle";
 import { AntonWordmark } from "@/components/shell/brand";
 import { UsagePill } from "@/components/usage/usage-pill";
+import { ShapingNudgePill } from "@/components/usage/shaping-nudge";
 import {
   BoardIcon,
   DependenciesIcon,
@@ -122,6 +123,9 @@ export function Sidebar({
         </nav>
 
         <div className="mt-4 flex flex-col gap-3">
+          {/* Backlog-starvation nudge: prompts the operator to shape more when quota is idle but
+              the ready queue is thin. Hidden unless all three conditions hold — see anton-eklj. */}
+          <ShapingNudgePill />
           {/* Global Claude usage glance. Renders nothing until live usage resolves and hides again
               if the API reports absence — no reserved slot, so the footer never shifts. */}
           <UsagePill />

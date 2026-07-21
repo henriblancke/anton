@@ -2,10 +2,13 @@ import { describe, expect, it } from "vitest";
 
 import {
   clampPct,
+  shouldNudgeShaping,
   tightestLimit,
   usageTone,
+  BACKLOG_THIN_AT,
   USAGE_CRIT_AT,
   USAGE_WARN_AT,
+  type ShapingSignal,
   type UsageSnapshot,
 } from "@/lib/usage";
 
@@ -67,5 +70,38 @@ describe("tightestLimit", () => {
       snapshot({ sessionPct: 10, weeklyPct: 70, weeklyResetAt: "2026-07-25T00:00:00Z" }),
     );
     expect(t.resetAt).toBe("2026-07-25T00:00:00Z");
+  });
+});
+
+describe("shouldNudgeShaping", () => {
+  function signal(over: Partial<ShapingSignal> = {}): ShapingSignal {
+    return {
+      behindPace: true,
+      headroomAvailable: true,
+      readyCount: BACKLOG_THIN_AT - 1,
+      weeklyRemainingPct: 60,
+      ...over,
+    };
+  }
+
+  it("nudges only when behind pace, quota headroom, and a thin backlog all hold", () => {
+    expect(shouldNudgeShaping(signal())).toBe(true);
+  });
+
+  it("stays quiet when on/ahead of pace — the plan has no idle room", () => {
+    expect(shouldNudgeShaping(signal({ behindPace: false }))).toBe(false);
+  });
+
+  it("stays quiet when there's no quota headroom to burn", () => {
+    expect(shouldNudgeShaping(signal({ headroomAvailable: false }))).toBe(false);
+  });
+
+  it("stays quiet once the ready backlog reaches the threshold", () => {
+    expect(shouldNudgeShaping(signal({ readyCount: BACKLOG_THIN_AT }))).toBe(false);
+    expect(shouldNudgeShaping(signal({ readyCount: BACKLOG_THIN_AT - 1 }))).toBe(true);
+  });
+
+  it("stays quiet when the ready count is unknown — never nags on a guess", () => {
+    expect(shouldNudgeShaping(signal({ readyCount: null }))).toBe(false);
   });
 });

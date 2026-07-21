@@ -172,6 +172,17 @@ function computePace(usage: ClaudeUsage, policy: BudgetPolicy, now: number): Pac
   };
 }
 
+/**
+ * Whether weekly usage is *behind* the pace-line at `now` — the plan still has room this week.
+ * Exposed for the shaping nudge (anton-eklj), which only prompts the operator to shape more when
+ * quota is genuinely idle. A null usage read means the pace is unknown, so it returns false: we
+ * never nag on a guess.
+ */
+export function isBehindPace(usage: ClaudeUsage | null, policy: BudgetPolicy, now: number): boolean {
+  if (!usage) return false;
+  return computePace(usage, policy, now).behindPace;
+}
+
 /** True when `now` falls outside the policy's day window — the preferred window for heavy work. */
 function isNight(now: number, policy: BudgetPolicy): boolean {
   const hour = localHour(now, policy.utcOffsetMinutes);
