@@ -7,7 +7,7 @@
  * clock. Times are stored as unix SECONDS (the schema's timestamp mode); this module works in ms
  * and converts at the boundary.
  */
-import { and, eq, gt, inArray, isNull, lte, not, notInArray, or, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, isNull, lt, lte, not, notInArray, or, sql } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { randomUUID } from "node:crypto";
 import * as schema from "../db/schema";
@@ -487,6 +487,44 @@ export async function reschedule(
       updatedAt: secDate(nowMs),
     })
     .where(and(eq(schema.jobs.id, jobId), eq(schema.jobs.status, "running")));
+}
+
+/**
+ * Budget-defer (anton-szld): push the `queued` jobs of `types` for a project out to `retryAtMs`, so
+ * the proactive budget governor backs autonomous work off past the reset/night boundary instead of
+ * only catching a `UsageLimitError` after hitting the wall. Mirrors a quota backoff's reschedule but
+ * for a *proactive* hold: it touches only `queued` rows (a `running` job is in flight and settles on
+ * its own), never burns an attempt, and only ever moves a job *later* — a job already scheduled past
+ * `retryAtMs` (e.g. a longer quota backoff) is left where it is. Returns how many rows it deferred.
+ */
+export async function deferQueuedJobs(
+  db: AntonDb,
+  clock: Clock,
+  opts: {
+    types: readonly JobType[];
+    projectId: string | null | undefined;
+    retryAtMs: number;
+    lastError?: string;
+  },
+): Promise<number> {
+  if (opts.types.length === 0) return 0;
+  const nowMs = clock.now();
+  const retryDate = secDate(opts.retryAtMs);
+  const rows = await db
+    .update(schema.jobs)
+    .set({ runAt: retryDate, lastError: opts.lastError ?? null, updatedAt: secDate(nowMs) })
+    .where(
+      and(
+        eq(schema.jobs.status, "queued"),
+        inArray(schema.jobs.type, [...opts.types]),
+        opts.projectId == null
+          ? isNull(schema.jobs.projectId)
+          : eq(schema.jobs.projectId, opts.projectId),
+        lt(schema.jobs.runAt, retryDate),
+      ),
+    )
+    .returning({ id: schema.jobs.id });
+  return rows.length;
 }
 
 /**

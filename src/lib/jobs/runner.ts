@@ -18,6 +18,7 @@ import {
   activeJobIdsForProject,
   cancelJob,
   complete,
+  deferQueuedJobs,
   deleteActiveJobsForProject,
   disabledScheduleKeys,
   enqueue,
@@ -43,6 +44,7 @@ import { isPoisonError, isRunAlreadyLiveError, isUsageLimitError } from "./error
 import { PollingLoop } from "./polling-loop";
 import { sampleJobBurn } from "../burn";
 import { getClaudeUsageCached, type ClaudeUsage } from "../claude/usage";
+import { budgetGate, type BudgetPolicy } from "./budget";
 
 export interface RunnerConfig {
   /** How long a lease is held before a job is considered crashed. */
@@ -97,6 +99,26 @@ export interface JobPolicy {
 export type JobPolicyResolver = (
   projectId: string | undefined,
 ) => Promise<JobPolicy> | JobPolicy;
+
+/** Resolve a project's budget policy for the governor (anton-szld). May be async (reads settings). */
+export type BudgetPolicyResolver = (
+  projectId: string | undefined,
+) => Promise<BudgetPolicy> | BudgetPolicy;
+
+/**
+ * Job types the budget governor may proactively defer (anton-szld). An allowlist by design: only
+ * anton's *autonomous* background work — the scheduled sweeps and autonomous epic execution — is
+ * held when the governor says the budget is scarce. A human-approved epic still *enqueues* the
+ * moment it's approved; the governor only delays when the runner *leases* it, exactly like the
+ * schedule master-switch. Truly interactive work (the app's own `claude -p` calls) isn't a job in
+ * this queue and so is never governed; any future interactive job type is unaffected until listed here.
+ */
+export const GOVERNED_JOB_TYPES: readonly JobType[] = [
+  "execute-epic",
+  "review-fix",
+  "nightly-stringer",
+  "orphan-grooming",
+];
 
 /**
  * Is an execute-epic run already live for this project + epic on ANOTHER machine? (anton-jz1)
@@ -208,6 +230,7 @@ export class JobRunner {
   private readonly quiescedProjects = new Set<string>();
   private readonly log: RunnerLogger;
   private readonly resolvePolicy: JobPolicyResolver | null;
+  private readonly resolveBudgetPolicy: BudgetPolicyResolver | null;
   private readonly liveRunCheck: LiveRunCheck | null;
   private readonly readUsage: () => Promise<ClaudeUsage | null>;
 
@@ -228,6 +251,14 @@ export class JobRunner {
      */
     resolvePolicy?: JobPolicyResolver;
     /**
+     * Per-project budget-policy source for the proactive governor (anton-szld). When set, each tick
+     * consults `budgetGate(usage, policy, now)` per project with pending autonomous jobs and, on a
+     * DEFER verdict, holds that project's governed buckets and pushes their queued runAt out to the
+     * governor's retryAt. Omit to disable the proactive gate (the reactive UsageLimitError backstop
+     * is unaffected either way).
+     */
+    resolveBudgetPolicy?: BudgetPolicyResolver;
+    /**
      * Cross-machine run-liveness source (anton-jz1). When set, a fresh execute-epic enqueue that
      * has no active job in THIS machine's store is gated on it: if a run is already live for the
      * epic on another machine (read from the shared beads board), no second run is started. Omit
@@ -245,6 +276,7 @@ export class JobRunner {
     this.config = { ...DEFAULT_CONFIG, ...deps.config };
     this.log = deps.log ?? noopLog;
     this.resolvePolicy = deps.resolvePolicy ?? null;
+    this.resolveBudgetPolicy = deps.resolveBudgetPolicy ?? null;
     this.liveRunCheck = deps.liveRunCheck ?? null;
     this.readUsage = deps.readUsage ?? getClaudeUsageCached;
     this.loop = new PollingLoop({
@@ -425,6 +457,13 @@ export class JobRunner {
     // are added below. capOf still enforces cap 0 as a backstop for anything not excluded (quiesce).
     const heldBucketKeys = new Set<string>(disabledSchedules);
 
+    // Budget governor (anton-szld): before leasing, ask the pace-line whether autonomous work may
+    // run *now*. A DEFER verdict adds the project's governed buckets here (same hold as the
+    // master-switch) and pushes their queued runAt out to retryAt. Proactive back-off past the
+    // reset/night boundary — the reactive UsageLimitError path below still backstops a wall we hit
+    // anyway. Fails OPEN on a null usage read, so a broken meter never halts anton.
+    await this.applyBudgetGovernor(heldBucketKeys);
+
     // With a policy resolver, gate execute-epic concurrency per project. Precompute each pending
     // project's cap so leaseDue can decide synchronously; other job types stay ungated (Infinity).
     let policyCapOf: ((job: JobRow) => number) | undefined;
@@ -473,6 +512,44 @@ export class JobRunner {
       void p.finally(() => this.pending.delete(p));
     }
     return jobs.length;
+  }
+
+  /**
+   * Proactive budget gate (anton-szld). For each project with pending governed jobs, ask
+   * `budgetGate` whether autonomous work may run now; on a DEFER verdict, hold that project's
+   * governed buckets for this tick and push their queued jobs' runAt out to the governor's retryAt.
+   * Only runs when a budget-policy resolver is injected. Fails OPEN: a null usage read defers nothing
+   * (a missing meter must never starve the queue), mirroring `budgetGate`'s own contract.
+   */
+  private async applyBudgetGovernor(heldBucketKeys: Set<string>): Promise<void> {
+    if (!this.resolveBudgetPolicy) return;
+    const usage = await this.readUsageSafe();
+    if (!usage) return; // fail open — a broken/absent meter never holds work
+
+    // The gate decides per project (day window / reserve are per-project knobs), so gather every
+    // project — including the null-project bucket — that has a pending job of a governed type.
+    const projectIds = new Set<string | null>();
+    for (const type of GOVERNED_JOB_TYPES) {
+      for (const pid of await projectIdsWithPendingJobs(this.db, type)) projectIds.add(pid);
+    }
+    if (projectIds.size === 0) return;
+
+    const now = this.clock.now();
+    for (const pid of projectIds) {
+      const policy = await this.resolveBudgetPolicy(pid ?? undefined);
+      const decision = budgetGate(usage, policy, now);
+      if (decision.admit) continue;
+      const retryAtMs = decision.retryAt.getTime();
+      // Hold this tick (same mechanism as the schedule master-switch)…
+      for (const type of GOVERNED_JOB_TYPES) heldBucketKeys.add(scheduleGateKey(type, pid));
+      // …and push the queued rows out so they aren't re-evaluated until the boundary.
+      await deferQueuedJobs(this.db, this.clock, {
+        types: GOVERNED_JOB_TYPES,
+        projectId: pid,
+        retryAtMs,
+        lastError: `budget: ${decision.reason} — resumes at ${new Date(retryAtMs).toISOString()}`,
+      });
+    }
   }
 
   private async processJob(job: JobRow): Promise<void> {

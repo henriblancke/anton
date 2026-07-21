@@ -11,11 +11,13 @@ import { getBurnAverage } from "../burn";
 import type { ClaudeUsage } from "../claude/usage";
 import { PoisonError, RunAlreadyLiveError, UsageLimitError } from "./errors";
 import { complete, enqueue, getJob, park, reschedule, toMs, type Clock } from "./queue";
+import { DEFAULT_BUDGET_POLICY, type BudgetPolicy } from "./budget";
 import {
   classifyError,
   DEFAULT_CONFIG,
   JobRunner,
   nextAction,
+  type BudgetPolicyResolver,
   type JobHandler,
   type JobPolicy,
   type JobPolicyResolver,
@@ -1057,6 +1059,148 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     expect((await getJob(tdb.db, id))?.status).toBe("done");
     const rows = await tdb.db.select().from(schema.burnSamples);
     expect(rows).toHaveLength(0);
+  });
+});
+
+describe("JobRunner budget governor admission gate (anton-szld)", () => {
+  let tdb: TestDb;
+  let clock: FakeClock;
+  beforeEach(() => {
+    tdb = makeTestDb();
+    clock = new FakeClock(1_700_000_000_000);
+  });
+  afterEach(() => tdb.close());
+
+  async function seedProjects(...ids: string[]) {
+    const s = await import("../db/schema");
+    for (const id of ids) {
+      await tdb.db
+        .insert(s.projects)
+        .values({ id, slug: id.toLowerCase(), name: id, repoPath: `/tmp/${id}` });
+    }
+  }
+
+  const usage = (over: Partial<ClaudeUsage> = {}): ClaudeUsage => ({
+    sessionPct: 10,
+    weeklyPct: 0,
+    sessionResetAt: null,
+    weeklyResetAt: null,
+    plan: "max",
+    ...over,
+  });
+
+  /** A runner wired with the budget governor: a fixed usage read + a fixed policy for every project. */
+  function budgetRunner(
+    handler: JobHandler,
+    opts: {
+      readUsage: () => Promise<ClaudeUsage | null>;
+      policy?: BudgetPolicy;
+      resolveBudgetPolicy?: BudgetPolicyResolver;
+    },
+  ) {
+    const r = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { ...CONFIG, maxConcurrent: 5 },
+      readUsage: opts.readUsage,
+      resolveBudgetPolicy: opts.resolveBudgetPolicy ?? (() => opts.policy ?? DEFAULT_BUDGET_POLICY),
+    });
+    for (const type of ["execute-epic", "review-fix"] as const) r.registerHandler(type, handler);
+    return r;
+  }
+
+  it("defers a tick past the reset boundary: leases nothing and reschedules queued work to retryAt", async () => {
+    // Session nearly exhausted (99% ≥ 100 − minSessionHeadroom 5) → session-headroom defer. No known
+    // session reset, so retryAt is now + the 5h session window.
+    await seedProjects("A");
+    let ran = 0;
+    const r = budgetRunner(
+      async () => {
+        ran += 1;
+      },
+      { readUsage: async () => usage({ sessionPct: 99 }) },
+    );
+    const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
+
+    expect(await r.tickOnce()).toBe(0); // held — nothing leased
+    await r.whenIdle();
+    expect(ran).toBe(0);
+    const job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("queued");
+    expect(job?.attempts).toBe(0); // a proactive hold never burns an attempt
+    const expectedRetry = Math.floor((clock.now() + DEFAULT_BUDGET_POLICY.sessionWindowMs) / 1000) * 1000;
+    expect(toMs(job?.runAt)).toBe(expectedRetry);
+    expect(job?.lastError).toMatch(/budget: session-headroom/);
+  });
+
+  it("governs a scheduled job type too (review-fix), not just execute-epic", async () => {
+    await seedProjects("A");
+    const r = budgetRunner(async () => {}, { readUsage: async () => usage({ sessionPct: 99 }) });
+    const id = await r.enqueue({ type: "review-fix", projectId: "A" });
+
+    expect(await r.tickOnce()).toBe(0);
+    const job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("queued");
+    expect(job?.lastError).toMatch(/budget:/);
+  });
+
+  it("admits a tick when the governor says work may run", async () => {
+    await seedProjects("A");
+    let ran = 0;
+    const r = budgetRunner(
+      async () => {
+        ran += 1;
+      },
+      { readUsage: async () => usage({ sessionPct: 10 }) },
+    );
+    const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
+
+    expect(await r.tickOnce()).toBe(1);
+    await r.whenIdle();
+    expect(ran).toBe(1);
+    expect((await getJob(tdb.db, id))?.status).toBe("done");
+  });
+
+  it("fails OPEN on a null usage read: no deferral, work leases normally", async () => {
+    await seedProjects("A");
+    let ran = 0;
+    const r = budgetRunner(
+      async () => {
+        ran += 1;
+      },
+      { readUsage: async () => null },
+    );
+    const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
+    const runAtBefore = toMs((await getJob(tdb.db, id))?.runAt);
+
+    expect(await r.tickOnce()).toBe(1); // null usage → governor admits
+    await r.whenIdle();
+    expect(ran).toBe(1);
+    const job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("done");
+    expect(runAtBefore).toBeLessThanOrEqual(clock.now()); // was due; governor never pushed it out
+  });
+
+  it("keeps the reactive UsageLimitError backstop working with the governor wired", async () => {
+    // Governor admits (session fresh), but the handler still hits the wall mid-run: the reactive
+    // path must reschedule to the reset and refund the attempt, exactly as without the governor.
+    await seedProjects("A");
+    const resetAt = Math.floor(clock.now() / 1000) + 3600; // seconds
+    const r = budgetRunner(
+      async () => {
+        throw new UsageLimitError("hit the wall", resetAt);
+      },
+      { readUsage: async () => usage({ sessionPct: 10 }) },
+    );
+    const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
+
+    expect(await r.tickOnce()).toBe(1); // governor admitted; the job ran and hit the limit
+    await r.whenIdle();
+    const job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("queued"); // rescheduled, not parked
+    expect(toMs(job?.runAt)).toBe(resetAt * 1000);
+    expect(job?.attempts).toBe(0); // attempt refunded — quota isn't the job's fault
+    expect(job?.lastError).toMatch(/usage-limit/);
   });
 });
 

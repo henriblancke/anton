@@ -10,6 +10,7 @@ import {
   DEFAULT_MAX_RETRIES,
   getProjectById,
   getProjectSettings,
+  resolveBudgetPolicy as resolveBudgetPolicyFromSettings,
 } from "../projects";
 import { beads } from "../beads/bd";
 import { preflightBd } from "../beads/bd-bin";
@@ -52,6 +53,18 @@ async function resolvePolicy(projectId: string | undefined) {
 }
 
 /**
+ * Per-project budget policy for the proactive governor (anton-szld). Reads the same project
+ * settings as `resolvePolicy` and projects the operator's knobs onto the governor's full
+ * {@link BudgetPolicy} (`resolveBudgetPolicy` in ../projects); a project-less job gets the shipped
+ * defaults. This is what the runner consults each tick to defer autonomous work past the
+ * reset/night boundary.
+ */
+async function resolveBudgetPolicy(projectId: string | undefined) {
+  const settings = projectId ? await getProjectSettings(getDb(), projectId) : {};
+  return resolveBudgetPolicyFromSettings(settings);
+}
+
+/**
  * Cross-machine run-liveness source for the runner (anton-jz1). Reads the shared beads board to
  * tell whether an execute-epic run is already live for this epic on ANOTHER machine — the `jobs`
  * table is machine-local, so a Force run on machine B can't otherwise see a run executing on
@@ -84,6 +97,7 @@ export function getRunner(): JobRunner {
     log,
     config: { maxConcurrent: GLOBAL_MAX_CONCURRENT },
     resolvePolicy,
+    resolveBudgetPolicy,
     liveRunCheck,
   });
   runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db }));
