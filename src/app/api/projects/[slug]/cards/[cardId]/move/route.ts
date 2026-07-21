@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
+import { getBoard } from "@/lib/board";
 import { moveCard } from "@/lib/board-move";
+import { refreshAllIssues } from "@/lib/beads/issues";
 import { STAGES } from "@/lib/types";
 import type { MoveRequest } from "@/lib/types";
 import { resolveProject } from "../../../resolve-project";
@@ -26,5 +28,16 @@ export async function POST(
     return NextResponse.json({ error: message }, { status: 404 });
   }
 
-  return NextResponse.json({ ok: true });
+  // Answer with the post-move board, not a bare `{ ok: true }` — the write bumped the snapshot
+  // version and RETAINED the pre-move beads (invalidateIssueSnapshot only marks them stale). If the
+  // client can't advance its version token off this response, its next poll sends the stale version,
+  // the non-blocking poll path (blockOnPendingWrite:false) serves the retained pre-move snapshot
+  // stamped with the already-advanced version, and the client wholesale-reverts the just-moved card
+  // until a background refresh lands ~30s later (anton-4g35). So mirror the GET forced-reload path:
+  // await a fresh read so the board reflects the move (falling back to last-good on a transient bd
+  // failure rather than 500 the move), build it blocking on the pending write, and return it. The
+  // client advances versionRef off `board.version` and its next poll 304s instead of reverting.
+  await refreshAllIssues(project.repoPath).catch(() => {});
+  const board = await getBoard(project);
+  return NextResponse.json({ ok: true, board });
 }
