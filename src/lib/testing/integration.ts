@@ -132,6 +132,10 @@ export interface FileDb {
 export function makeFileDb(): FileDb {
   const dir = mkdtempSync(join(tmpdir(), "anton-it-db-"));
   const path = join(dir, "anton.db");
+  // Capture ANTON_DB BEFORE overwriting it so cleanup can restore the prior value — the same
+  // save/restore contract `saveEnv` gives every other env var this harness touches. Keeps
+  // `makeFileDb` composable: a second call in the same process won't silently strand the first.
+  const prevDb = process.env.ANTON_DB;
   process.env.ANTON_DB = path;
 
   const sqlite = new Database(path);
@@ -140,7 +144,11 @@ export function makeFileDb(): FileDb {
 
   return {
     path,
-    cleanup: () => rmSync(dir, { recursive: true, force: true }),
+    cleanup: () => {
+      rmSync(dir, { recursive: true, force: true });
+      if (prevDb === undefined) delete process.env.ANTON_DB;
+      else process.env.ANTON_DB = prevDb;
+    },
   };
 }
 

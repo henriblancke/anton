@@ -22,6 +22,10 @@ export function ctx(slug: string, epicId: string): { params: Promise<{ slug: str
 /** Set the resolved operator identity for the next route call (the identity is memoized). */
 export function actAs(name: string): void {
   process.env.ANTON_OPERATOR = name;
+  // `resetOperatorCacheRef` is assigned by `setupApproveSuite`; the explicit annotation hides its
+  // uninitialized state from tsc, so guard against a pre-setup call (e.g. `actAs` at `describe`
+  // scope) with a clear error instead of a cryptic "resetOperatorCacheRef is not a function".
+  if (!resetOperatorCacheRef) throw new Error("actAs() called before setupApproveSuite()");
   resetOperatorCacheRef();
 }
 
