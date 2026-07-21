@@ -25,6 +25,11 @@ interface EditableSettings {
   agents?: string[];
   autonomy?: boolean;
   conventionalCommits?: boolean;
+  /** Operator budget policy (anton-egrg); only the two exposed knobs round-trip through this form. */
+  budgetPolicy?: {
+    daytimeReservePct?: number;
+    weeklyTargetPct?: number;
+  };
 }
 
 // Defaults mirror the server (src/lib/projects.ts DEFAULT_*); duplicated so this client module
@@ -32,6 +37,9 @@ interface EditableSettings {
 const DEFAULT_CONCURRENCY = 3;
 const DEFAULT_JOB_TIMEOUT_MINUTES = 120; // 2h
 const DEFAULT_MAX_RETRIES = 3;
+// Mirror DEFAULT_PROJECT_BUDGET_POLICY (src/lib/projects.ts) for the two operator-facing knobs.
+const DEFAULT_DAYTIME_RESERVE_PCT = 15;
+const DEFAULT_WEEKLY_TARGET_PCT = 90;
 
 /** Default model options for the headless claude driver. Empty value = the CLI's own default. */
 const MODELS: { value: string; label: string; hint?: string }[] = [
@@ -105,6 +113,12 @@ export function SettingsView({
   const [conventionalCommits, setConventionalCommits] = useState(
     settings.conventionalCommits ?? false,
   );
+  const [daytimeReservePct, setDaytimeReservePct] = useState(
+    settings.budgetPolicy?.daytimeReservePct ?? DEFAULT_DAYTIME_RESERVE_PCT,
+  );
+  const [weeklyTargetPct, setWeeklyTargetPct] = useState(
+    settings.budgetPolicy?.weeklyTargetPct ?? DEFAULT_WEEKLY_TARGET_PCT,
+  );
   // null = no schedule row for this project yet (shown as "not scheduled"; toggling creates it).
   const [automations, setAutomations] = useState<Record<string, boolean | null>>(() =>
     Object.fromEntries(
@@ -177,6 +191,7 @@ export function SettingsView({
           agents: agents.filter((a) => activeAgents.has(a.id)).map((a) => a.id),
           autonomy,
           conventionalCommits,
+          budgetPolicy: { daytimeReservePct, weeklyTargetPct },
         }),
       });
       if (!res.ok) {
@@ -493,6 +508,27 @@ export function SettingsView({
                   />
                 </span>
               </div>
+
+              <div className="flex flex-col gap-2 rounded-[10px] border border-border bg-card px-3 py-3">
+                <span className="text-[12.5px]">Budget policy</span>
+                <span className="text-[10.5px] text-subtle">
+                  paces autonomous spend against your Claude plan
+                </span>
+                <div className="grid grid-cols-2 gap-3">
+                  <PctField
+                    label="Daytime reserve"
+                    value={daytimeReservePct}
+                    onChange={setDaytimeReservePct}
+                    hint="held back for interactive use"
+                  />
+                  <PctField
+                    label="Weekly target"
+                    value={weeklyTargetPct}
+                    onChange={setWeeklyTargetPct}
+                    hint="utilization the pace-line aims for"
+                  />
+                </div>
+              </div>
             </section>
 
             <section className="flex flex-col gap-3.5">
@@ -615,6 +651,41 @@ function GateField({
         aria-label={label}
         className="rounded-lg border border-border bg-card px-3 py-2 font-mono text-[12.5px] text-foreground outline-none placeholder:text-subtle focus:border-primary/60"
       />
+    </label>
+  );
+}
+
+/** A 0–100 integer percentage knob for the budget policy (anton-egrg). Clamps on change. */
+function PctField({
+  label,
+  value,
+  onChange,
+  hint,
+}: {
+  label: string;
+  value: number;
+  onChange: (value: number) => void;
+  hint?: string;
+}) {
+  return (
+    <label className="flex flex-col gap-1.5">
+      <span className="text-[11px] text-subtle">{label}</span>
+      <div className="relative flex items-center rounded-[10px] border border-border bg-card focus-within:border-primary/60">
+        <input
+          type="number"
+          min={0}
+          max={100}
+          value={value}
+          onChange={(e) => {
+            const n = Number(e.target.value);
+            onChange(Number.isFinite(n) ? Math.min(100, Math.max(0, Math.round(n))) : 0);
+          }}
+          aria-label={label}
+          className="w-full rounded-[10px] bg-transparent px-3 py-2 pr-8 font-mono text-[12.5px] text-foreground outline-none"
+        />
+        <span className="pointer-events-none absolute right-3 text-[11px] text-subtle">%</span>
+      </div>
+      {hint && <span className="text-[11px] text-subtle">{hint}</span>}
     </label>
   );
 }

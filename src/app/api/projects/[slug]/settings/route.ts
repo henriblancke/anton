@@ -4,6 +4,7 @@ import {
   CONCURRENCY_RANGE,
   JOB_TIMEOUT_MINUTES_RANGE,
   MAX_RETRIES_RANGE,
+  budgetPolicySchema,
   getProjectSettingsBySlug,
   updateProjectSettings,
   type ProjectSettings,
@@ -178,6 +179,22 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
         { status: 400 },
       );
     } else patch.conventionalCommits = conventionalCommits;
+  }
+
+  if ("budgetPolicy" in body) {
+    const raw = (body as Record<string, unknown>).budgetPolicy;
+    // "" / null → clear (fall back to DEFAULT_PROJECT_BUDGET_POLICY). Otherwise validate strictly:
+    // out-of-range / unknown keys 400 (fail loud) rather than persisting a bad policy.
+    if (raw == null || raw === "") {
+      patch.budgetPolicy = undefined;
+    } else {
+      const parsed = budgetPolicySchema.safeParse(raw);
+      if (!parsed.success) {
+        const detail = parsed.error.issues[0]?.message ?? "out of range";
+        return NextResponse.json({ error: `Invalid budgetPolicy: ${detail}` }, { status: 400 });
+      }
+      patch.budgetPolicy = parsed.data;
+    }
   }
 
   try {

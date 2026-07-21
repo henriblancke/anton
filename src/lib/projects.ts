@@ -8,10 +8,12 @@ import { basename, join, resolve } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
+import { z } from "zod";
 import { eq } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import { removeWorktree } from "./git/worktree";
 import { configureBeadsForRepo } from "./beads/config.mjs";
+import { DEFAULT_BUDGET_POLICY, type BudgetPolicy } from "./jobs/budget";
 import type { AntonDb } from "./jobs/queue";
 import type { Project } from "./types";
 
@@ -151,6 +153,13 @@ export interface ProjectSettings {
    * `<title> (<id>)`, so existing projects' PR titles are unchanged until enabled.
    */
   conventionalCommits?: boolean;
+  /**
+   * Operator-tunable budget policy (anton-egrg): the subset of the governor's full
+   * {@link BudgetPolicy} the operator controls per project. Absent → DEFAULT_PROJECT_BUDGET_POLICY;
+   * a stored value need only carry the fields the operator touched (the rest fall back to default
+   * on resolve). Validated with {@link budgetPolicySchema} at the API boundary.
+   */
+  budgetPolicy?: ProjectBudgetPolicy;
 }
 
 /** A resolved verify gate (anton-3oh8): a stable label (for logs/errors) + the shell command. */
@@ -184,6 +193,70 @@ export const DEFAULT_MAX_RETRIES = 3;
 export const CONCURRENCY_RANGE = { min: 1, max: 6 } as const;
 export const JOB_TIMEOUT_MINUTES_RANGE = { min: 5, max: 720 } as const; // 5 min … 12 h
 export const MAX_RETRIES_RANGE = { min: 1, max: 10 } as const;
+
+/** A 0–100 integer percentage — the same scale the governor's {@link BudgetPolicy} uses. */
+const pctSchema = z.number().int().min(0).max(100);
+
+/**
+ * Operator-facing budget policy (anton-egrg): the tunable subset of the governor's full
+ * {@link BudgetPolicy}. Every field optional so a patch can carry just the knobs the operator
+ * touched; each is strictly range-checked (fail loud on out-of-range), and unknown keys are
+ * rejected. `dayWindow` is a local `[startHour, endHour)` pair with `start < end`.
+ */
+export const budgetPolicySchema = z
+  .object({
+    dayWindow: z
+      .tuple([z.number().int().min(0).max(23), z.number().int().min(0).max(23)])
+      .refine(([start, end]) => start < end, {
+        message: "dayWindow start hour must be before end hour",
+      }),
+    daytimeReservePct: pctSchema,
+    weeklyTargetPct: pctSchema,
+    minSessionHeadroomPct: pctSchema,
+    preferNightForHeavy: z.boolean(),
+  })
+  .partial()
+  .strict();
+
+export type ProjectBudgetPolicy = z.infer<typeof budgetPolicySchema>;
+
+/**
+ * Safe defaults applied when a policy (or one of its fields) is absent. The daytime reserve is the
+ * configurable knob the founder asked for; the weekly target drives the governor's pace-line.
+ */
+export const DEFAULT_PROJECT_BUDGET_POLICY: Required<ProjectBudgetPolicy> = {
+  dayWindow: [9, 18],
+  daytimeReservePct: 15,
+  weeklyTargetPct: 90,
+  minSessionHeadroomPct: 5,
+  preferNightForHeavy: true,
+};
+
+/** Overlay the stored (possibly partial) operator policy onto the defaults — never a partial out. */
+export function resolveProjectBudgetPolicy(
+  settings: ProjectSettings,
+): Required<ProjectBudgetPolicy> {
+  return { ...DEFAULT_PROJECT_BUDGET_POLICY, ...(settings.budgetPolicy ?? {}) };
+}
+
+/**
+ * Project a project's settings onto the governor's full {@link BudgetPolicy}: the operator's knobs
+ * ride on top of {@link DEFAULT_BUDGET_POLICY}, so fields the operator can't set keep the governor's
+ * shipped defaults. `preferNightForHeavy` off zeroes the night value discount, so heavy jobs are no
+ * longer preferentially deferred to night. This is the hook the admission gate (anton-szld) consumes.
+ */
+export function resolveBudgetPolicy(settings: ProjectSettings): BudgetPolicy {
+  const p = resolveProjectBudgetPolicy(settings);
+  return {
+    ...DEFAULT_BUDGET_POLICY,
+    minSessionHeadroomPct: p.minSessionHeadroomPct,
+    daytimeReservePct: p.daytimeReservePct,
+    dayStartHour: p.dayWindow[0],
+    dayEndHour: p.dayWindow[1],
+    weeklyTargetPct: p.weeklyTargetPct,
+    nightValueDiscount: p.preferNightForHeavy ? DEFAULT_BUDGET_POLICY.nightValueDiscount : 0,
+  };
+}
 
 export async function getProjectSettings(db: AntonDb, id: string): Promise<ProjectSettings> {
   const rows = await db
