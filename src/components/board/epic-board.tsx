@@ -179,6 +179,17 @@ export function EpicBoard({ slug, initialBoard }: { slug: string; initialBoard: 
         const body = (await res.json().catch(() => null)) as { error?: string } | null;
         throw new Error(body?.error ?? `Move failed (${res.status})`);
       }
+      // The move bumped the snapshot version; adopt the authoritative post-move board the route
+      // returns so versionRef advances past the write. Without this the next poll sends the stale
+      // version and the non-blocking poll path serves the retained pre-move snapshot stamped with the
+      // new version — reverting the just-moved card (anton-4g35). Guard on draggingRef exactly like
+      // the poll: if another drag started while this POST was in flight, keep that live optimistic
+      // board and let its own move settle the version rather than clobber it here.
+      const data = (await res.json().catch(() => null)) as { board?: Board } | null;
+      if (data?.board && !draggingRef.current) {
+        versionRef.current = data.board.version;
+        setBoard(data.board);
+      }
       toast.success(`Moved "${epic.title}" to ${STAGE_LABELS[toStage]}`);
     } catch (err) {
       setBoard(previous);
