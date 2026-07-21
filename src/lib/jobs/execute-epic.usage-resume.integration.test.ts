@@ -22,6 +22,7 @@ import { resetOperatorCache } from "../operator";
 import { describeBd } from "@/lib/testing/integration";
 import {
   BASE_TIME_MS,
+  resetPerCaseState,
   FakeClock,
   writeBin,
   createExecuteEpicSandbox,
@@ -51,7 +52,7 @@ describeBd("execute-epic e2e â€” usage-limit & in-session resume (real handler Â
 
   beforeEach(async () => {
     clock.set(BASE_TIME_MS);
-    await tdb.db.delete(schema.jobs);
+    await resetPerCaseState(tdb);
   });
 
   it("parks on a usage limit, then resumes the SAME run/worktree past the reset window", async () => {

@@ -22,6 +22,7 @@ import { resetOperatorCache } from "../operator";
 import { describeBd } from "@/lib/testing/integration";
 import {
   BASE_TIME_MS,
+  resetPerCaseState,
   FakeClock,
   writeBin,
   fakeClaudeReadingStdin,
@@ -52,7 +53,7 @@ describeBd("execute-epic e2e — recovery & readiness (real handler · real bd/g
 
   beforeEach(async () => {
     clock.set(BASE_TIME_MS);
-    await tdb.db.delete(schema.jobs);
+    await resetPerCaseState(tdb);
   });
 
   it("recovers a target whose external-ref PR was CLOSED without merging — re-opens instead of a false-done short-circuit", async () => {

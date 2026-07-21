@@ -24,6 +24,7 @@ import { resetOperatorCache } from "../operator";
 import { describeBd } from "@/lib/testing/integration";
 import {
   BASE_TIME_MS,
+  resetPerCaseState,
   HUMAN_NOTE,
   FakeClock,
   writeBin,
@@ -63,7 +64,7 @@ describeBd("execute-epic e2e — lifecycle (real handler · real bd/git · fake 
   // `queued` and the assertions read the wrong state.
   beforeEach(async () => {
     clock.set(BASE_TIME_MS);
-    await tdb.db.delete(schema.jobs);
+    await resetPerCaseState(tdb);
   });
 
   it("runs an approved epic autonomously → worktree → per-ticket commits → PR → in-review", async () => {

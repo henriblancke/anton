@@ -23,6 +23,7 @@ import { resetOperatorCache } from "../operator";
 import { describeBd } from "@/lib/testing/integration";
 import {
   BASE_TIME_MS,
+  resetPerCaseState,
   FakeClock,
   writeBin,
   fakeClaudeReadingStdin,
@@ -55,7 +56,7 @@ describeBd("execute-epic e2e — base tip & abandon (real handler · real bd/git
 
   beforeEach(async () => {
     clock.set(BASE_TIME_MS);
-    await tdb.db.delete(schema.jobs);
+    await resetPerCaseState(tdb);
   });
 
   it("blocks + surfaces a ticket the agent self-reported ANTON-RESULT: blocked, even with a commit (anton-j5i8)", async () => {

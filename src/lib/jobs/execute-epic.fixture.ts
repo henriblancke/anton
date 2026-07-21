@@ -24,6 +24,21 @@ import { makeBdRepo, saveEnv } from "@/lib/testing/integration";
 /** Fixed start-of-test wall clock. Reset before each case — see each suite's `beforeEach`. */
 export const BASE_TIME_MS = 1_700_000_000_000;
 
+/**
+ * Reset ALL per-run DB state between cases — not just `jobs`. Every split suite shares one sandbox +
+ * anton.db (they're expensive to build, so `beforeAll` builds them once), which means leaked `runs`/
+ * `sessions` rows bleed across cases: an unfiltered `expect(runs).toHaveLength(1)` turns
+ * order-dependent, and a lookup-by-epic-id can pick up a prior case's row. Delete children
+ * (`sessions`) before parents (`runs`) to stay FK-safe. Every suite's `beforeEach` must call this
+ * (alongside `clock.set(BASE_TIME_MS)`) — keeping it here means a future split can't silently drop
+ * the reset the way clearing only `jobs` inline once did (anton-fj7c).
+ */
+export async function resetPerCaseState(tdb: TestDb): Promise<void> {
+  await tdb.db.delete(schema.sessions);
+  await tdb.db.delete(schema.runs);
+  await tdb.db.delete(schema.jobs);
+}
+
 /** The operator's steer on ticket one; asserted to reach that ticket's dispatch prompt. */
 export const HUMAN_NOTE = "STEER_MARKER_BFY4 — reuse the existing helper, do not add a new one";
 
