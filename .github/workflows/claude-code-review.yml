@@ -23,6 +23,7 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
+      id-token: write
 
     # Edit these defaults (or set repo variables) to tune the review.
     env:
