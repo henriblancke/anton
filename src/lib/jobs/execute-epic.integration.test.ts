@@ -240,6 +240,14 @@ process.exit(0);`),
   // `queued` and the assertions read the wrong state.
   beforeEach(async () => {
     clock.set(BASE_TIME_MS);
+    // Reset ALL per-run DB state between cases, not just jobs. These cases share one DB (the sandbox
+    // + bd repo are expensive to build per test), so leaked `runs`/`sessions` rows leak across cases:
+    // an unfiltered `expect(runs).toHaveLength(1)` becomes order-dependent, and a case that finds a
+    // run by epic id can pick up a prior case's row. Clearing children (sessions) before parents
+    // (runs) keeps it FK-safe. Combined with realistic per-case timeouts (a timed-out case's rolling
+    // handler otherwise runs on into the next case and writes these very tables), this isolates cases.
+    await tdb.db.delete(schema.sessions);
+    await tdb.db.delete(schema.runs);
     await tdb.db.delete(schema.jobs);
   });
 
@@ -1893,7 +1901,11 @@ process.exit(0);`),
       process.env.ANTON_CLAUDE_BIN = successClaude;
       if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
     }
-  }, 60_000);
+    // A full run (two real bd/git ticket phases + the self-block cross-check) honestly costs
+    // ~60s; the old 60_000 cap made it flaky under any load, and a timed-out case leaves its
+    // rolling-dispatched handler running into the NEXT case — corrupting it via the shared env/db/
+    // repo (anton-fj7c). Give the heavy cases the same 150_000 the file's other heavy cases use.
+  }, 150_000);
 
   it("branches a fresh run off the newer origin/<base> tip (anton-x3o)", async () => {
     // A run whose LOCAL base is stale must start at the remote tip: resolveFreshBase fetches
@@ -1956,7 +1968,9 @@ process.exit(0);`),
       }
     })();
     expect(isAncestor).toBe(true);
-  }, 60_000);
+    // Fresh-base fetch + full run + push honestly runs ~60s; the old 60_000 cap timed it out under
+    // load, and the orphaned handler then bled into the next case (anton-fj7c). 150_000 as elsewhere.
+  }, 150_000);
 
   it("does not rebase an existing worktree onto a newer base on resume (anton-x3o)", async () => {
     // AC3: resume reuses the existing worktree as-is. Even if origin/main advances between the
@@ -2135,7 +2149,9 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
       process.env.ANTON_GH_BIN = okGh;
       if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
     }
-  }, 60_000);
+    // Abandon-and-ship runs the full epic (multiple real ticket phases + PR); honestly ~60s. The old
+    // 60_000 cap timed it out under load, orphaning its handler into the next case (anton-fj7c). 150s.
+  }, 150_000);
 
   it("a mid-run abandon kills the job and exits with no delivery — not a park, not a false success (anton-6xj0)", async () => {
     // The operator abandons a ticket while its agent is running: cancel the job first (stopping the
