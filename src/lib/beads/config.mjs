@@ -31,6 +31,9 @@ export function onPath(cmd) {
  * recompute, and `bd bootstrap` for fresh clones — and, critically, guards the remote-backed schema
  * migration (a bare `bd migrate` refuses without BD_ALLOW_REMOTE_MIGRATE=1). Running anton against an
  * older bd is unsupported; every preflight fails loud rather than limping on.
+ *
+ * Kept in sync by hand with bd-bin.ts MIN_BD_VERSION/MIN_BD (`.mjs` and `.ts` can't share a const):
+ * the server-startup preflight and the CLI preflight must agree, so bump both together.
  */
 export const MIN_BD_VERSION = "1.1.0";
 const MIN_BD = { major: 1, minor: 1, patch: 0 };

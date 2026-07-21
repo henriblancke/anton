@@ -30,9 +30,7 @@ export function nudgeSync(project: NudgeTarget, label = "sync"): void {
 
   // Durable backstop: one deduped push job per repo drives the change to the remote or parks.
   try {
-    void Promise.resolve(enqueueSyncPushDeduped(getDb(), systemClock, project.id)).catch((e) =>
-      console.error(`[${label}] enqueue sync-push failed for ${project.id}`, e),
-    );
+    enqueueSyncPushDeduped(getDb(), systemClock, project.id);
   } catch (e) {
     console.error(`[${label}] enqueue sync-push failed for ${project.id}`, e);
   }

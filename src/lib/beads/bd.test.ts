@@ -685,6 +685,90 @@ describe("createDoltSync", () => {
     expect(getSyncStatus(cwd).unpushedCount).toBe(1);
   });
 
+  it("a durable push always runs a full push, even caught up where a backstop drops to pull-only", async () => {
+    // The durable sync-push job (anton-nowq) must retry the write's push unconditionally — a backstop
+    // here would read count 0 on a reconciled repo and pull only, so a failed push would go unretried.
+    const cwd = `/repo-push-forces-full-${Math.random()}`;
+    const calls: string[][] = [];
+    const sync = createDoltSync(async (_cwd, args) => {
+      calls.push(args);
+      return "";
+    });
+
+    // Reconcile with a clean full pass: repo is now caught up (count 0, reconciled).
+    await sync(cwd, "full");
+    expect(getSyncStatus(cwd).unpushedCount).toBe(0);
+
+    calls.length = 0;
+    await sync(cwd, "backstop");
+    expect(calls).toEqual([["dolt", "pull"]]); // backstop drops to pull-only here…
+
+    calls.length = 0;
+    await sync(cwd, "push");
+    expect(calls).toContainEqual(["dolt", "push"]); // …but a durable push still pushes.
+  });
+
+  it("a durable push coalescing behind a failing in-flight write pass still retries the push (anton-nowq)", async () => {
+    // The race the durable job must survive: it coalesces behind a write full pass and snapshots
+    // count 0 BEFORE that push fails. A backstop would have resolved to pull-only and left the failed
+    // push unretried; a "push" request resolves to full and lands the retry.
+    const cwd = `/repo-push-race-${Math.random()}`;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let arm = false; // hold only the raced write pass, not the reconcile
+    let held = false;
+    let writePushFails = true;
+    const sync = createDoltSync(async (_cwd, args) => {
+      if (args[1] === "commit" && arm && !held) {
+        held = true;
+        await gate; // hold the in-flight write full pass at commit, before its push
+      }
+      if (args[1] === "push" && writePushFails && held) {
+        writePushFails = false; // only the in-flight write push fails; the coalesced retry lands
+        throw execError({ stderr: "Error: push failed: connection reset" });
+      }
+      return "";
+    });
+
+    // Reconcile so the repo reads "caught up" (count 0, reconciled) — where a backstop would pull-only.
+    await sync(cwd, "full");
+    // Let the coalescer's bookkeeping clear the settled pass from `running` (a trailing .finally), so
+    // the next full pass starts fresh rather than coalescing behind the reconcile.
+    await new Promise<void>((r) => setTimeout(r, 0));
+    expect(getSyncStatus(cwd).unpushedCount).toBe(0);
+
+    arm = true;
+    const writePass = sync(cwd, "full"); // held at commit; its push will fail
+    const durablePush = sync(cwd, "push"); // coalesces as a trailing pass; must resolve to full
+    expect(durablePush).not.toBe(writePass);
+
+    release();
+    await writePass.catch(() => {}); // its push failed → repo left ahead (count 1)
+    await durablePush; // the trailing durable pass retries the push and lands it
+
+    const status = getSyncStatus(cwd);
+    expect(status.unpushedCount).toBe(0); // cleared by the retry — not a pull-only no-op
+    expect(status.state).toBe("synced");
+    expect(status.lastPushedAt).toBeTypeOf("number");
+  });
+
+  it("failed durable push retries do not inflate the unpushed count (anton-rn88)", async () => {
+    const cwd = `/repo-push-noinflate-${Math.random()}`;
+    const sync = createDoltSync(async (_cwd, args) => {
+      if (args[1] === "push") throw execError({ stderr: "Error: push failed: reset" });
+      return "";
+    });
+
+    // One write-nudged full pass strands a single change locally.
+    await sync(cwd, "full").catch(() => {});
+    expect(getSyncStatus(cwd).unpushedCount).toBe(1);
+
+    // The durable job retries via "push"; like a backstop, it re-attempts already-counted work and
+    // must never grow the count — a flaky remote can't inflate one change into "N unpushed".
+    for (let i = 0; i < 4; i++) await sync(cwd, "push").catch(() => {});
+    expect(getSyncStatus(cwd).unpushedCount).toBe(1);
+  });
+
   it("a pull-only pass moves lastSyncedAt but not lastPushedAt or the unpushed count", async () => {
     const cwd = `/repo-pull-only-${Math.random()}`;
     let pushFails = true;

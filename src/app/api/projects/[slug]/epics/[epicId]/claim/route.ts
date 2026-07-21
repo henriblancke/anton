@@ -235,7 +235,7 @@ export async function DELETE(
     if (!swap.ok) return NextResponse.json(conflictBody(epicId, swap.owner), { status: 409 });
     // Fire-and-forget for the same reason as POST: the unassign already landed locally, so don't
     // block the release response on the best-effort remote sync.
-    nudgeSync({ id: projectId, repoPath }, "claim");
+    nudgeSync({ id: projectId, repoPath }, "release");
     // Post-write state, already verified by the swap's own read.
     return NextResponse.json({ item: swap.bead });
   }
