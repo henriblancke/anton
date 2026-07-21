@@ -6,23 +6,11 @@
  * right run target; the runner's own kill semantics are covered by anton-a4jj's tests. Skipped when
  * `bd`/`git` aren't installed. Mirrors the defer route integration test.
  */
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { beads } from "@/lib/beads/bd";
 import { resetIssueSnapshots } from "@/lib/beads/snapshot";
+import { describeBd, jsonRequest, makeBdRepo, paramsCtx, type BdRepo } from "@/lib/testing/integration";
 import type { Project, TicketDetail } from "@/lib/types";
-
-function has(cmd: string): boolean {
-  try {
-    execFileSync(cmd, ["--version"], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 let project: Project | null = null;
 const cancelled: Array<[string, string]> = [];
@@ -40,13 +28,11 @@ vi.mock("@/lib/jobs/service", () => ({
 
 const { POST } = await import("./route");
 
-const ctx = (slug: string, ticketId: string) => ({ params: Promise.resolve({ slug, ticketId }) });
-const post = (body: unknown) =>
-  new Request("http://t/", { method: "POST", body: JSON.stringify(body) });
+const ctx = (slug: string, ticketId: string) => paramsCtx({ slug, ticketId });
+const post = (body: unknown) => jsonRequest("POST", body);
 
-const suite = has("bd") && has("git") ? describe : describe.skip;
-
-suite("ticket abandon route (real bd)", () => {
+describeBd("ticket abandon route (real bd)", () => {
+  let bdRepo: BdRepo;
   let repo: string;
   let epicId: string;
   let childId: string;
@@ -55,11 +41,8 @@ suite("ticket abandon route (real bd)", () => {
   const readyIds = async () => (await beads.ready(repo)).map((b) => b.id);
 
   beforeAll(async () => {
-    repo = mkdtempSync(join(tmpdir(), "anton-bd-abandon-"));
-    execFileSync("git", ["init", "-q"], { cwd: repo });
-    execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: repo });
-    execFileSync("git", ["config", "user.name", "anton-test"], { cwd: repo });
-    execFileSync("bd", ["init", "--skip-hooks"], { cwd: repo, stdio: "ignore" });
+    bdRepo = makeBdRepo();
+    repo = bdRepo.repo;
     project = {
       id: "proj-1",
       slug: "tmp",
@@ -76,10 +59,10 @@ suite("ticket abandon route (real bd)", () => {
       deps: [`parent-child:${epicId}`],
     });
     looseId = await beads.create(repo, { title: "A loose task", type: "task" });
-  }, 30_000);
+  });
 
   afterAll(() => {
-    if (repo) rmSync(repo, { recursive: true, force: true });
+    bdRepo.cleanup();
   });
 
   // The cases share one repo, so a warm snapshot would leak a pre-write bead list between them.
@@ -101,13 +84,13 @@ suite("ticket abandon route (real bd)", () => {
     const bead = await beads.show(repo, childId);
     expect(beads.isAbandoned(bead)).toBe(true);
     expect(await readyIds()).not.toContain(childId);
-  }, 30_000);
+  });
 
   it("kills the ticket's own run when it is a parentless (epic-of-one) target", async () => {
     const res = await POST(post({ reason: "not worth doing" }), ctx("tmp", looseId));
     expect(res.status).toBe(200);
     expect(cancelled).toEqual([["proj-1", looseId]]);
-  }, 30_000);
+  });
 
   it("refuses without a reason, and leaves the ticket alone", async () => {
     const open = await beads.create(repo, { title: "Still open", type: "task" });
@@ -123,15 +106,15 @@ suite("ticket abandon route (real bd)", () => {
 
     expect((await beads.show(repo, open)).status).not.toBe("closed");
     expect(cancelled).toEqual([]);
-  }, 30_000);
+  });
 
   it("409s a ticket whose outcome already settled", async () => {
     const res = await POST(post({ reason: "again" }), ctx("tmp", childId));
     expect(res.status).toBe(409);
-  }, 30_000);
+  });
 
   it("404s an unknown ticket or project", async () => {
     expect((await POST(post({ reason: "x" }), ctx("tmp", "bd-nope"))).status).toBe(404);
     expect((await POST(post({ reason: "x" }), ctx("nope", childId))).status).toBe(404);
-  }, 30_000);
+  });
 });

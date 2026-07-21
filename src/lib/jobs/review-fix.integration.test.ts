@@ -4,13 +4,13 @@
  * bd/git against a temp repo with a bare origin, using fake `claude`/`gh` so the flow is
  * deterministic without spending API quota or hitting GitHub. Skipped without bd + git.
  */
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
+import { describeBd, makeBdRepo, saveEnv, withOperator, type BdRepo } from "@/lib/testing/integration";
 import { makeTestDb, type TestDb } from "../db/testing";
 import { beads, LABELS } from "../beads/bd";
 import * as schema from "../db/schema";
@@ -19,15 +19,6 @@ import { JobRunner } from "./runner";
 import { makeReviewFixHandler } from "./review-fix";
 import { createWorktree } from "../git/worktree";
 import { resetOperatorCache } from "../operator";
-
-function has(cmd: string): boolean {
-  try {
-    execFileSync(cmd, ["--version"], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 class FakeClock implements Clock {
   constructor(private t: number) {}
@@ -43,41 +34,28 @@ function writeBin(dir: string, name: string, body: string): string {
   return p;
 }
 
-const suite = has("bd") && has("git") ? describe : describe.skip;
-
-suite("review-fix e2e (real handler · real bd/git · fake claude/gh)", () => {
+describeBd("review-fix e2e (real handler · real bd/git · fake claude/gh)", () => {
+  let bdRepo: BdRepo;
   let sandbox: string;
   let repo: string;
-  let bare: string;
   let binDir: string;
   let tdb: TestDb;
   let clock: FakeClock;
   let projectId: string;
   let epicId: string;
   let branch: string;
-  const prevEnv: Record<string, string | undefined> = {};
+  let restoreEnv: () => void;
 
   beforeAll(async () => {
-    sandbox = mkdtempSync(join(tmpdir(), "anton-rf-"));
-    repo = join(sandbox, "repo");
-    bare = join(sandbox, "remote.git");
+    bdRepo = makeBdRepo({ bare: true, initialCommit: true });
+    sandbox = bdRepo.dir;
+    repo = bdRepo.repo;
     binDir = join(sandbox, "bin");
-    mkdirSync(repo);
     mkdirSync(binDir);
 
     const g = (args: string[], cwd = repo) => execFileSync("git", args, { cwd, stdio: "ignore" });
-    execFileSync("git", ["init", "--bare", "-q", bare], { stdio: "ignore" });
-    g(["init", "-q", "-b", "main"]);
-    g(["config", "user.email", "t@example.com"]);
-    g(["config", "user.name", "anton-test"]);
-    writeFileSync(join(repo, "README.md"), "# sandbox\n");
-    g(["add", "-A"]);
-    g(["commit", "-q", "-m", "init"]);
-    g(["remote", "add", "origin", bare]);
-    g(["push", "-q", "-u", "origin", "main"]);
 
     // beads: an in-review epic with a PR ref (as execute-epic would have left it).
-    execFileSync("bd", ["init", "--skip-hooks"], { cwd: repo, stdio: "ignore" });
     epicId = await beads.create(repo, {
       title: "Ship feature X",
       type: "epic",
@@ -146,17 +124,22 @@ if(a[0]==='api'&&a.includes('--method')){log('rerequest');process.exit(0);}
 process.exit(0);`,
     );
 
-    const set = (k: string, v: string) => {
-      prevEnv[k] = process.env[k];
-      process.env[k] = v;
-    };
-    set("ANTON_CLAUDE_BIN", fakeClaude);
-    set("ANTON_GH_BIN", fakeGh);
-    set("ANTON_WORKTREES_ROOT", join(sandbox, "worktrees"));
-    set("ANTON_SESSIONS_ROOT", join(sandbox, "sessions"));
-    set("ANTON_TEST_CLAUDE_ARGV", join(sandbox, "claude-argv.jsonl"));
-    set("FAKE_BRANCH", branch);
-    set("FAKE_GH_LOG", join(sandbox, "gh.log"));
+    restoreEnv = saveEnv([
+      "ANTON_CLAUDE_BIN",
+      "ANTON_GH_BIN",
+      "ANTON_WORKTREES_ROOT",
+      "ANTON_SESSIONS_ROOT",
+      "ANTON_TEST_CLAUDE_ARGV",
+      "FAKE_BRANCH",
+      "FAKE_GH_LOG",
+    ]);
+    process.env.ANTON_CLAUDE_BIN = fakeClaude;
+    process.env.ANTON_GH_BIN = fakeGh;
+    process.env.ANTON_WORKTREES_ROOT = join(sandbox, "worktrees");
+    process.env.ANTON_SESSIONS_ROOT = join(sandbox, "sessions");
+    process.env.ANTON_TEST_CLAUDE_ARGV = join(sandbox, "claude-argv.jsonl");
+    process.env.FAKE_BRANCH = branch;
+    process.env.FAKE_GH_LOG = join(sandbox, "gh.log");
 
     tdb = makeTestDb();
     clock = new FakeClock(1_700_000_000_000);
@@ -168,15 +151,12 @@ process.exit(0);`,
       repoPath: repo,
       defaultBranch: "main",
     });
-  }, 60_000);
+  });
 
   afterAll(() => {
     tdb?.close();
-    for (const [k, v] of Object.entries(prevEnv)) {
-      if (v === undefined) delete process.env[k];
-      else process.env[k] = v;
-    }
-    rmSync(sandbox, { recursive: true, force: true });
+    restoreEnv();
+    bdRepo.cleanup();
   });
 
   it("resolves an actionable PR: claude fix → commit → push → thread reply/resolve + comment + re-request", async () => {
@@ -227,7 +207,7 @@ process.exit(0);`,
     expect(sessions[0].kind).toBe("review-fix");
     expect(sessions[0].status).toBe("done");
     expect(sessions[0].beadId).toBe(epicId);
-  }, 60_000);
+  });
 
   it("uses the per-project reviewFixPrompt override when set (else the default file)", async () => {
     const marker = "RF_OVERRIDE_MARKER_QZX9";
@@ -256,7 +236,7 @@ process.exit(0);`,
         .set({ settingsJson: "{}" })
         .where(eq(schema.projects.id, projectId));
     }
-  }, 60_000);
+  });
 
   it("pushes an unpushed prior fix even when the new claude run produces no diff", async () => {
     // Simulate a crashed/failed-push retry: a commit exists locally on the branch but was never
@@ -294,7 +274,7 @@ process.exit(0);`,
     } finally {
       process.env.ANTON_CLAUDE_BIN = prev;
     }
-  }, 60_000);
+  });
 
   it("is a no-op when the PR has nothing actionable (approved, checks green)", async () => {
     // Point gh at an 'approved & green' PR for this run.
@@ -322,7 +302,7 @@ process.exit(0);`,
     } finally {
       process.env.ANTON_GH_BIN = prev;
     }
-  }, 60_000);
+  });
 
   // ── operator ownership (anton-zoh) ──
   //
@@ -345,17 +325,13 @@ if(a[0]==='repo'){console.log('acme/repo');process.exit(0);}
 process.exit(0);`,
     );
 
-  async function withOperator<T>(name: string, fn: () => Promise<T>): Promise<T> {
-    const prevOp = process.env.ANTON_OPERATOR;
-    const prevGh = process.env.ANTON_GH_BIN;
-    process.env.ANTON_OPERATOR = name;
-    resetOperatorCache();
+  async function actAs<T>(name: string, fn: () => Promise<T>): Promise<T> {
+    const restore = saveEnv(["ANTON_OPERATOR", "ANTON_GH_BIN"]);
+    await withOperator(name);
     try {
       return await fn();
     } finally {
-      if (prevOp === undefined) delete process.env.ANTON_OPERATOR;
-      else process.env.ANTON_OPERATOR = prevOp;
-      process.env.ANTON_GH_BIN = prevGh;
+      restore();
       resetOperatorCache();
     }
   }
@@ -370,7 +346,7 @@ process.exit(0);`,
     await beads.tag(repo, bobEpic, [LABELS.stage("in-review")]);
     await beads.setExternalRef(repo, bobEpic, "gh-8");
 
-    await withOperator("alice", async () => {
+    await actAs("alice", async () => {
       process.env.ANTON_GH_BIN = mergedGhFor(8);
       const runner = new JobRunner({ db: tdb.db, clock, config: { maxConcurrent: 1, leaseMs: 30_000 } });
       runner.registerHandler("review-fix", makeReviewFixHandler({ db: tdb.db, clock }));
@@ -385,7 +361,7 @@ process.exit(0);`,
     const bob = now.find((b) => b.id === bobEpic);
     expect(bob?.status).not.toBe("closed");
     expect(bob?.labels?.includes(LABELS.stage("in-review"))).toBe(true);
-  }, 60_000);
+  });
 
   it("a targeted epicBeadId finalizes another operator's MERGED epic (override wins)", async () => {
     const bobEpic = await beads.create(repo, {
@@ -397,7 +373,7 @@ process.exit(0);`,
     await beads.tag(repo, bobEpic, [LABELS.stage("in-review")]);
     await beads.setExternalRef(repo, bobEpic, "gh-9");
 
-    await withOperator("alice", async () => {
+    await actAs("alice", async () => {
       process.env.ANTON_GH_BIN = mergedGhFor(9);
       const runner = new JobRunner({ db: tdb.db, clock, config: { maxConcurrent: 1, leaseMs: 30_000 } });
       runner.registerHandler("review-fix", makeReviewFixHandler({ db: tdb.db, clock }));
@@ -417,5 +393,5 @@ process.exit(0);`,
     const bob = now.find((b) => b.id === bobEpic);
     expect(bob?.status).toBe("closed");
     expect(bob?.labels?.includes(LABELS.stage("in-review")) ?? false).toBe(false);
-  }, 60_000);
+  });
 });

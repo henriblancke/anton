@@ -33,11 +33,10 @@ jobs:
         run: bun run typecheck
 
       - name: Test
-        # NOTE: this gate does NOT cover the bd-backed integration suites. `bd`/`gh`/`stringer`/
-        # `claude` are absent here, so their `has(...)` guards turn those `describe`s into
-        # `describe.skip` and they report as passing without ever executing. A green `check` means
-        # "unit + DB-backed suites pass" — nothing more. The `integration` job below installs `bd`
-        # and is the only place the bd suites actually run (anton-0oi).
+        # Unit + DB-backed suites only. The bd-backed `*.integration.test.ts` suites are EXCLUDED
+        # from this config (they run in the `integration` job below via `test:integration`, which
+        # caps fork concurrency for Dolt). Previously they were collected here but self-skipped with
+        # `bd` absent; excluding them keeps this gate fast and its scope explicit (anton-0oi).
         run: bun run test
 
       - name: Build
@@ -81,8 +80,10 @@ jobs:
             echo "::error::bd version mismatch — expected ${BD_VERSION}, got: $(bd version)"; exit 1; }
       - name: Install
         run: bun install --frozen-lockfile
-      - name: Test (integration included)
-        run: bun run test
+      - name: Test (integration suites)
+        # Dedicated config: `*.integration.test.ts` only, with a capped fork pool so the per-repo
+        # Dolt sql-servers don't race and deadlock `bd dolt pull` under full parallelism (anton-0oi).
+        run: bun run test:integration
 
   # Coverage (anton-7jy). Report-only — a separate, non-blocking job. V8 instrumentation adds ~5x
   # runtime, so it's kept OFF the blocking `check` gate to avoid slowing/flaking it; the html+lcov

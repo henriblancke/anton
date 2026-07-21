@@ -6,36 +6,20 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  readdirSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
-import Database from "better-sqlite3";
+import { hasGit, makeFileDb, saveEnv, type FileDb } from "@/lib/testing/integration";
 
-function has(cmd: string): boolean {
-  try {
-    execFileSync(cmd, ["--version"], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-const suite = has("git") ? describe : describe.skip;
+const suite = hasGit() ? describe : describe.skip;
 
 let workDir: string;
 let repo: string;
 let worktreesRoot: string;
-let prevRoot: string | undefined;
+let fileDb: FileDb;
+let restoreWorktreesRoot: () => void;
 let deleteProject: typeof import("./projects").deleteProject;
 let getDb: typeof import("./db").getDb;
 let schema: typeof import("./db/schema");
@@ -48,27 +32,14 @@ function gitIn(cwd: string, args: string[]): string {
 beforeAll(async () => {
   workDir = mkdtempSync(join(tmpdir(), "anton-delete-project-"));
   worktreesRoot = mkdtempSync(join(tmpdir(), "anton-delete-wt-root-"));
-  process.env.ANTON_DB = join(workDir, "anton.db");
   const wtMod = await import("./git/worktree");
-  prevRoot = process.env[wtMod.WORKTREES_ROOT_ENV];
+  restoreWorktreesRoot = saveEnv([wtMod.WORKTREES_ROOT_ENV]);
   process.env[wtMod.WORKTREES_ROOT_ENV] = worktreesRoot;
   createWorktree = wtMod.createWorktree;
 
-  // Apply every committed migration to the temp anton.db (same approach as db/testing.ts, but
-  // against the ANTON_DB file so the module-level getDb() singleton picks it up).
-  const setup = new Database(process.env.ANTON_DB);
-  const migrationsDir = join(process.cwd(), "drizzle");
-  for (const file of readdirSync(migrationsDir).filter((f) => f.endsWith(".sql")).sort()) {
-    const raw = readFileSync(join(migrationsDir, file), "utf8");
-    setup.exec(
-      raw
-        .split("--> statement-breakpoint")
-        .map((s) => s.trim())
-        .filter(Boolean)
-        .join(";\n"),
-    );
-  }
-  setup.close();
+  // Applies every committed migration to a temp anton.db and points ANTON_DB at it, so the
+  // module-level getDb() singleton picks it up.
+  fileDb = makeFileDb();
 
   // A real repo with a commit and a fake .beads/ export, to prove teardown leaves both untouched.
   repo = join(workDir, "repo");
@@ -89,10 +60,9 @@ beforeAll(async () => {
   schema = await import("./db/schema");
 });
 
-afterAll(async () => {
-  const { WORKTREES_ROOT_ENV } = await import("./git/worktree");
-  if (prevRoot === undefined) delete process.env[WORKTREES_ROOT_ENV];
-  else process.env[WORKTREES_ROOT_ENV] = prevRoot;
+afterAll(() => {
+  restoreWorktreesRoot();
+  fileDb.cleanup();
   rmSync(workDir, { recursive: true, force: true });
   rmSync(worktreesRoot, { recursive: true, force: true });
 });

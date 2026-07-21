@@ -7,29 +7,15 @@
  * shared bead board (one real bd repo), asserting a single live run. Skipped when `bd`/`git` are
  * absent.
  */
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { afterAll, afterEach, beforeAll, expect, it } from "vitest";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
 import { JobRunner } from "./runner";
 import { systemClock } from "./queue";
 import { beads } from "../beads/bd";
+import { describeBd, makeBdRepo } from "@/lib/testing/integration";
 
-function has(cmd: string): boolean {
-  try {
-    execFileSync(cmd, ["--version"], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-const suite = has("bd") && has("git") ? describe : describe.skip;
-
-let workDir: string;
+let bdRepo: ReturnType<typeof makeBdRepo>;
 let repo: string;
 let epic: string;
 
@@ -48,22 +34,18 @@ function executeEpicJobs(store: TestDb) {
   return store.db.select().from(schema.jobs).all().filter((j) => j.type === "execute-epic");
 }
 
-suite("cross-machine execute-epic dedupe over a shared board (anton-jz1)", () => {
+describeBd("cross-machine execute-epic dedupe over a shared board (anton-jz1)", () => {
   let A: TestDb;
   let B: TestDb;
 
   beforeAll(async () => {
-    workDir = mkdtempSync(join(tmpdir(), "anton-xmachine-"));
-    repo = join(workDir, "repo");
-    execFileSync("git", ["init", "-q", repo]);
-    execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: repo });
-    execFileSync("git", ["config", "user.name", "anton-test"], { cwd: repo });
-    execFileSync("bd", ["init", "--skip-hooks"], { cwd: repo, stdio: "ignore" });
+    bdRepo = makeBdRepo();
+    repo = bdRepo.repo;
 
     epic = await beads.create(repo, { title: "Shared epic", type: "epic" });
     const child = await beads.create(repo, { title: "Child", type: "task" });
     await beads.link(repo, child, epic, "parent-child");
-  }, 60_000);
+  });
 
   afterEach(async () => {
     A?.close();
@@ -73,7 +55,7 @@ suite("cross-machine execute-epic dedupe over a shared board (anton-jz1)", () =>
   });
 
   afterAll(() => {
-    if (workDir) rmSync(workDir, { recursive: true, force: true });
+    bdRepo?.cleanup();
   });
 
   it("machine B does not start a second run while a run is live on machine A", async () => {
@@ -95,7 +77,7 @@ suite("cross-machine execute-epic dedupe over a shared board (anton-jz1)", () =>
     expect(executeEpicJobs(B)).toHaveLength(0);
     // A still owns its single live run.
     expect(executeEpicJobs(A)).toHaveLength(1);
-  }, 60_000);
+  });
 
   it("machine A's own force run dedupes to its existing job despite the shared lease", async () => {
     A = makeTestDb();
@@ -109,7 +91,7 @@ suite("cross-machine execute-epic dedupe over a shared board (anton-jz1)", () =>
     const again = await rA.enqueueExecuteEpic("p1", epic);
     expect(again).toBe(jobA);
     expect(executeEpicJobs(A)).toHaveLength(1);
-  }, 60_000);
+  });
 
   it("re-triggers once the prior run settles (lease cleared) — parked/failed/finished", async () => {
     B = makeTestDb();
@@ -123,7 +105,7 @@ suite("cross-machine execute-epic dedupe over a shared board (anton-jz1)", () =>
     const jobB = await rB.enqueueExecuteEpic("p1", epic);
     expect(jobB).toBeTruthy();
     expect(executeEpicJobs(B)).toHaveLength(1);
-  }, 60_000);
+  });
 
   it("re-triggers when the lease has gone stale (a crashed machine stops refreshing)", async () => {
     B = makeTestDb();
@@ -140,5 +122,5 @@ suite("cross-machine execute-epic dedupe over a shared board (anton-jz1)", () =>
 
     // Cleanup the stale lease so it doesn't leak into other assertions on the shared board.
     await beads.clearRunLease(repo, epic, beads.runLeaseLabels(await beads.show(repo, epic)));
-  }, 60_000);
+  });
 });

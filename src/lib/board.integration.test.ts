@@ -3,36 +3,20 @@
  * `bd list` shape (no acceptance/external_ref fields; acceptance parsed from description) and
  * parent-child grouping. Skipped when `bd`/`git` aren't installed.
  */
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { afterAll, beforeAll, expect, it } from "vitest";
+import { describeBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
 import { beads } from "./beads/bd";
 import { getBoard } from "./board";
 import type { Epic, Project } from "./types";
 
-function has(cmd: string): boolean {
-  try {
-    execFileSync(cmd, ["--version"], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-const suite = has("bd") && has("git") ? describe : describe.skip;
-
-suite("board integration (real bd)", () => {
+describeBd("board integration (real bd)", () => {
+  let bdRepo: BdRepo;
   let repo: string;
   let project: Project;
 
   beforeAll(() => {
-    repo = mkdtempSync(join(tmpdir(), "anton-bd-"));
-    execFileSync("git", ["init", "-q"], { cwd: repo });
-    execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: repo });
-    execFileSync("git", ["config", "user.name", "anton-test"], { cwd: repo });
-    execFileSync("bd", ["init", "--skip-hooks"], { cwd: repo, stdio: "ignore" });
+    bdRepo = makeBdRepo();
+    repo = bdRepo.repo;
     project = {
       id: "x", slug: "tmp", name: "tmp", repoPath: repo,
       defaultBranch: "main", hasBeads: true, createdAt: 0,
@@ -40,7 +24,7 @@ suite("board integration (real bd)", () => {
   });
 
   afterAll(() => {
-    if (repo) rmSync(repo, { recursive: true, force: true });
+    bdRepo.cleanup();
   });
 
   const find = (epics: Record<string, Epic[]>, id: string) =>
@@ -77,5 +61,5 @@ suite("board integration (real bd)", () => {
     await beads.approve(repo, epicId);
     board = await getBoard(project);
     expect(find(board.columns, epicId)!.approved, "approve flips the label").toBe(true);
-  }, 30_000);
+  });
 });
