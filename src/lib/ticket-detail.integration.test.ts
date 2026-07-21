@@ -4,37 +4,21 @@
  * hit only the intended fields — an agent change preserves the `approved` label. Mirrors
  * epic-detail.integration.test.ts. Skipped when `bd`/`git` aren't installed.
  */
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
+import { describeBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
 import { beads } from "./beads/bd";
 import { resetIssueSnapshots } from "./beads/snapshot";
 import { deleteTicket, getTicketDetail, updateTicket } from "./ticket-detail";
 import type { Project } from "./types";
 
-function has(cmd: string): boolean {
-  try {
-    execFileSync(cmd, ["--version"], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-const suite = has("bd") && has("git") ? describe : describe.skip;
-
-suite("ticket-detail integration (real bd)", () => {
+describeBd("ticket-detail integration (real bd)", () => {
+  let bdRepo: BdRepo;
   let repo: string;
   let project: Project;
 
   beforeAll(() => {
-    repo = mkdtempSync(join(tmpdir(), "anton-bd-ticket-"));
-    execFileSync("git", ["init", "-q"], { cwd: repo });
-    execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: repo });
-    execFileSync("git", ["config", "user.name", "anton-test"], { cwd: repo });
-    execFileSync("bd", ["init", "--skip-hooks"], { cwd: repo, stdio: "ignore" });
+    bdRepo = makeBdRepo();
+    repo = bdRepo.repo;
     project = {
       id: "x",
       slug: "tmp",
@@ -47,7 +31,7 @@ suite("ticket-detail integration (real bd)", () => {
   });
 
   afterAll(() => {
-    if (repo) rmSync(repo, { recursive: true, force: true });
+    bdRepo.cleanup();
   });
 
   // These cases share one repo, so a warm cross-test snapshot would leak between them. Since A1
@@ -80,7 +64,7 @@ suite("ticket-detail integration (real bd)", () => {
     expect(detail.epicId).toBe(epicId);
     expect(detail.epicTitle).toBe("Detail epic");
     expect(detail.approved).toBe(false);
-  }, 30_000);
+  });
 
   it("changes the agent label without disturbing the approved label", async () => {
     const taskId = await beads.create(repo, { title: "Swap agent", type: "task" });
@@ -94,7 +78,7 @@ suite("ticket-detail integration (real bd)", () => {
     expect(fresh.labels).toContain("approved");
     expect(fresh.labels).not.toContain("agent:nextjs");
     expect(fresh.labels).toContain("agent:fastapi");
-  }, 30_000);
+  });
 
   it("updates the title and leaves other fields alone", async () => {
     const taskId = await beads.create(repo, {
@@ -107,7 +91,7 @@ suite("ticket-detail integration (real bd)", () => {
 
     expect(updated.title).toBe("New title");
     expect(updated.goal).toMatch(/keep me/i);
-  }, 30_000);
+  });
 
   it("returns post-write detail even when the board snapshot is warm (read-after-write)", async () => {
     const taskId = await beads.create(repo, { title: "Warm cache", type: "task" });
@@ -123,11 +107,11 @@ suite("ticket-detail integration (real bd)", () => {
     // The mutation's own response must reflect the write, or the edit form resets to stale values.
     expect(updated.title).toBe("Renamed");
     expect(updated.agent).toBe("fastapi");
-  }, 30_000);
+  });
 
   it("throws for a genuinely missing id", async () => {
     await expect(getTicketDetail(project, "does-not-exist-999")).rejects.toThrow(/not found/i);
-  }, 30_000);
+  });
 
   // anton-u8wu (A2): a ticket save must not block on the remote push. Hold the sync pending, prove
   // updateTicket resolves (with the saved detail) before it settles, then reject it and prove the
@@ -157,7 +141,7 @@ suite("ticket-detail integration (real bd)", () => {
 
     // The local update landed regardless of the failed push.
     expect((await beads.show(repo, taskId)).title).toBe("Saved");
-  }, 30_000);
+  });
 
   it("deleteTicket fires the remote push off the response path and catches a rejected sync", async () => {
     const taskId = await beads.create(repo, { title: "Delete me", type: "task" });
@@ -180,5 +164,5 @@ suite("ticket-detail integration (real bd)", () => {
     errSpy.mockRestore();
 
     await expect(beads.show(repo, taskId)).rejects.toThrow();
-  }, 30_000);
+  });
 });

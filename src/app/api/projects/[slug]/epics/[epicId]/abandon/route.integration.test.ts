@@ -4,24 +4,12 @@
  * keeping the beads (unlike DELETE, which destroys them) and leaving already-settled children
  * untouched. The job runner is mocked; skipped when `bd`/`git` aren't installed.
  */
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { beads } from "@/lib/beads/bd";
 import { resetIssueSnapshots } from "@/lib/beads/snapshot";
+import { type BdRepo, describeBd, jsonRequest, makeBdRepo, paramsCtx } from "@/lib/testing/integration";
 import type { EpicAbandonResult } from "@/lib/abandon";
 import type { Project } from "@/lib/types";
-
-function has(cmd: string): boolean {
-  try {
-    execFileSync(cmd, ["--version"], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 let project: Project | null = null;
 const cancelled: Array<[string, string]> = [];
@@ -39,24 +27,18 @@ vi.mock("@/lib/jobs/service", () => ({
 
 const { POST } = await import("./route");
 
-const ctx = (slug: string, epicId: string) => ({ params: Promise.resolve({ slug, epicId }) });
-const post = (body: unknown) =>
-  new Request("http://t/", { method: "POST", body: JSON.stringify(body) });
+const post = (body: unknown) => jsonRequest("POST", body);
 
-const suite = has("bd") && has("git") ? describe : describe.skip;
-
-suite("epic abandon route (real bd)", () => {
+describeBd("epic abandon route (real bd)", () => {
+  let bdRepo: BdRepo;
   let repo: string;
   let epicId: string;
   let openChild: string;
   let doneChild: string;
 
   beforeAll(async () => {
-    repo = mkdtempSync(join(tmpdir(), "anton-bd-abandon-epic-"));
-    execFileSync("git", ["init", "-q"], { cwd: repo });
-    execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: repo });
-    execFileSync("git", ["config", "user.name", "anton-test"], { cwd: repo });
-    execFileSync("bd", ["init", "--skip-hooks"], { cwd: repo, stdio: "ignore" });
+    bdRepo = makeBdRepo();
+    repo = bdRepo.repo;
     project = {
       id: "proj-1",
       slug: "tmp",
@@ -78,10 +60,10 @@ suite("epic abandon route (real bd)", () => {
       deps: [`parent-child:${epicId}`],
     });
     await beads.close(repo, doneChild);
-  }, 30_000);
+  });
 
   afterAll(() => {
-    if (repo) rmSync(repo, { recursive: true, force: true });
+    bdRepo?.cleanup();
   });
 
   beforeEach(() => {
@@ -90,19 +72,21 @@ suite("epic abandon route (real bd)", () => {
   });
 
   it("refuses without a reason, and writes nothing", async () => {
-    expect((await POST(post({}), ctx("tmp", epicId))).status).toBe(400);
-    expect((await POST(post({ reason: " " }), ctx("tmp", epicId))).status).toBe(400);
+    expect((await POST(post({}), paramsCtx({ slug: "tmp", epicId }))).status).toBe(400);
+    expect((await POST(post({ reason: " " }), paramsCtx({ slug: "tmp", epicId }))).status).toBe(400);
     expect((await beads.show(repo, epicId)).status).not.toBe("closed");
     expect(cancelled).toEqual([]);
-  }, 30_000);
+  });
 
   it("404s an unknown epic or project", async () => {
-    expect((await POST(post({ reason: "x" }), ctx("tmp", "bd-nope"))).status).toBe(404);
-    expect((await POST(post({ reason: "x" }), ctx("nope", epicId))).status).toBe(404);
-  }, 30_000);
+    expect(
+      (await POST(post({ reason: "x" }), paramsCtx({ slug: "tmp", epicId: "bd-nope" }))).status,
+    ).toBe(404);
+    expect((await POST(post({ reason: "x" }), paramsCtx({ slug: "nope", epicId }))).status).toBe(404);
+  });
 
   it("abandons the epic and cascades to its open children only", async () => {
-    const res = await POST(post({ reason: "the market moved" }), ctx("tmp", epicId));
+    const res = await POST(post({ reason: "the market moved" }), paramsCtx({ slug: "tmp", epicId }));
     expect(res.status).toBe(200);
     const { abandoned } = (await res.json()) as { abandoned: EpicAbandonResult };
     expect(abandoned).toEqual({ epicId, children: [openChild] });
@@ -121,10 +105,10 @@ suite("epic abandon route (real bd)", () => {
     const shipped = await beads.show(repo, doneChild);
     expect(shipped.status).toBe("closed");
     expect(beads.isAbandoned(shipped)).toBe(false);
-  }, 30_000);
+  });
 
   it("409s an epic whose outcome already settled", async () => {
-    const res = await POST(post({ reason: "again" }), ctx("tmp", epicId));
+    const res = await POST(post({ reason: "again" }), paramsCtx({ slug: "tmp", epicId }));
     expect(res.status).toBe(409);
-  }, 30_000);
+  });
 });
