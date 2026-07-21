@@ -268,6 +268,12 @@ export type SyncOutcome = "synced" | "not-wired";
  * yet — the push that follows publishes it); a real commit/push failure (auth, network, remote
  * conflict) rejects with the bd output attached — callers surface it, never swallow it.
  * `exec` is injectable for tests.
+ *
+ * No explicit `bd recompute-blocked` here: bd 1.1.0 recomputes the denormalized `is_blocked` flag
+ * automatically on every pull, scoped to what the merge changed, so `bd ready` never reads a stale
+ * flag on the hot sync path. The unconditional repair (`bd recompute-blocked`) is reserved for the
+ * places that gap can't reach — a freshly bootstrapped clone that never ran a local merge (see
+ * configureBeadsForRepo in config.mjs) — rather than paid on every heartbeat pull.
  */
 export async function runDoltSync(
   cwd: string,
@@ -449,6 +455,10 @@ export const beads = {
     bd(cwd, ["list", "--json", "--limit", "0", ...extra]).then(asArray<Bead>),
 
   show: async (cwd: string, id: string): Promise<Bead> => {
+    // Count-only `bd show --json` (bd 1.1.0): deliberately WITHOUT --include-comments /
+    // --include-dependents, so it returns the bead's fields + dependency counts without streaming
+    // full comment/dependent bodies (slow on hub beads). anton's callers only need the bead itself
+    // and its counts here; opt into hydration explicitly at the (rare) call site that needs it.
     // `bd show --json` returns an array (one or more issues), not an object.
     const parsed = JSON.parse(await bd(cwd, ["show", id, "--json"]));
     if (Array.isArray(parsed)) return parsed[0];

@@ -10,7 +10,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beads } from "./bd";
-import { configureBeadsForRepo, configYamlHas } from "./config.mjs";
+import { configureBeadsForRepo, configYamlHas, hasLocalDoltDb } from "./config.mjs";
 import { updateTicket } from "../ticket-detail";
 import type { Project } from "../types";
 
@@ -225,6 +225,86 @@ suite("two managed repos exchange a change over refs/dolt/data with export.auto 
     // The clone never received issues.jsonl (it is gitignored), yet the ticket is present — proof the
     // board hydrated from Dolt over refs/dolt/data with automatic JSONL export disabled.
     expect(existsSync(join(repoB, ".beads", "issues.jsonl")), "issues.jsonl must not travel via git").toBe(false);
+    const parsed = JSON.parse(execFileSync("bd", ["list", "--json"], { cwd: repoB, encoding: "utf8" }));
+    const issues: Array<{ id: string }> = Array.isArray(parsed) ? parsed : (parsed.issues ?? []);
+    expect(issues.map((i) => i.id)).toContain(ticketId);
+  });
+});
+
+/**
+ * Fresh-clone smoke test for anton's bootstrap path (anton-qwsq). A git clone arrives with the
+ * committed `.beads/config.yaml` but NO local Dolt DB (`.beads/dolt/` is gitignored) — the signal
+ * that anton must `bd bootstrap` (hydrate the DB from origin's refs/dolt/data) rather than re-init.
+ * Unlike the anton-1th suite (which hydrates repoB by hand), this drives the real
+ * configureBeadsForRepo bootstrap branch end-to-end against real bd 1.1.0.
+ */
+suite("fresh clone hydrates via configureBeadsForRepo → bd bootstrap (anton-qwsq)", () => {
+  let sandbox: string;
+  let bare: string;
+  let repoA: string;
+  let repoB: string;
+  let ticketId: string;
+  let result: ReturnType<typeof configureBeadsForRepo>;
+
+  const gitIn = (cwd: string, args: string[]) => execFileSync("git", args, { cwd, stdio: "ignore" });
+
+  beforeAll(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-qwsq-bootstrap-"));
+    bare = join(sandbox, "remote.git");
+    repoA = join(sandbox, "a");
+    repoB = join(sandbox, "b");
+
+    execFileSync("git", ["init", "--bare", "-q", "-b", "main", bare]);
+    execFileSync("git", ["init", "-q", "-b", "main", repoA]);
+    gitIn(repoA, ["config", "user.email", "a@example.com"]);
+    gitIn(repoA, ["config", "user.name", "anton-a"]);
+    writeFileSync(join(repoA, "README.md"), "# a\n");
+    gitIn(repoA, ["add", "-A"]);
+    gitIn(repoA, ["commit", "-q", "-m", "init"]);
+    gitIn(repoA, ["remote", "add", "origin", bare]);
+    gitIn(repoA, ["push", "-q", "-u", "origin", "main"]);
+
+    // A goes through anton's real init path (bd init → team-config → Dolt remote wiring → publish).
+    const cfgA = configureBeadsForRepo(repoA, { prefix: "bs", log: () => {} });
+    if (!cfgA.configured) throw new Error(`configureBeadsForRepo(A) failed: ${cfgA.errors.join("; ")}`);
+
+    const created = JSON.parse(
+      execFileSync("bd", ["create", "Bootstrap me", "--type", "task", "--json"], { cwd: repoA, encoding: "utf8" }),
+    );
+    ticketId = (Array.isArray(created) ? created[0] : created).id;
+    execFileSync("bd", ["dolt", "commit", "-m", "add ticket"], { cwd: repoA, stdio: "ignore" });
+    execFileSync("bd", ["dolt", "push"], { cwd: repoA, stdio: "ignore" });
+
+    // Commit the team-config so the clone inherits it; the JSONL/Dolt runtime stay gitignored.
+    gitIn(repoA, ["add", "-f", ".beads/config.yaml", ".beads/.gitignore", ".beads/metadata.json"]);
+    gitIn(repoA, ["commit", "-q", "-m", "beads team-config"]);
+    gitIn(repoA, ["push", "-q", "origin", "main"]);
+
+    // Fresh clone: config.yaml travels, the gitignored local Dolt DB does not — so anton must bootstrap.
+    execFileSync("git", ["clone", "-q", bare, repoB]);
+    gitIn(repoB, ["config", "user.email", "b@example.com"]);
+    gitIn(repoB, ["config", "user.name", "anton-b"]);
+    if (hasLocalDoltDb(join(repoB, ".beads"))) throw new Error("precondition: fresh clone must have no local Dolt DB");
+
+    // The code under test: anton hydrates the clone through the bootstrap branch (NOT bd init).
+    result = configureBeadsForRepo(repoB, { log: () => {} });
+  }, 120_000);
+
+  afterAll(() => {
+    if (sandbox) rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("chose bd bootstrap (not bd init) and hydrated the local Dolt DB", () => {
+    expect(result.configured, `configure failed: ${result.errors.join("; ")}`).toBe(true);
+    expect(result.ranBootstrap).toBe(true);
+    expect(result.ranInit).toBe(false);
+    expect(hasLocalDoltDb(join(repoB, ".beads"))).toBe(true);
+    // The post-bootstrap is_blocked repair ran (best-effort, but should succeed on a healthy clone).
+    expect(result.steps.find((s) => s.name === "bd bootstrap")?.status).toBe("ok");
+    expect(result.steps.find((s) => s.name === "bd recompute-blocked")?.status).toBe("ok");
+  });
+
+  it("the bootstrapped board carries the ticket published by the other clone", () => {
     const parsed = JSON.parse(execFileSync("bd", ["list", "--json"], { cwd: repoB, encoding: "utf8" }));
     const issues: Array<{ id: string }> = Array.isArray(parsed) ? parsed : (parsed.issues ?? []);
     expect(issues.map((i) => i.id)).toContain(ticketId);

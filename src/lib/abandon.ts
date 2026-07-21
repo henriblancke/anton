@@ -106,7 +106,9 @@ export async function abandonEpic(
 
   await cancelRunForTarget(project.id, epicId);
 
-  const all = await beads.list(repo, ["--status", "all"]);
+  // --skip-labels (bd 1.1.0): this full-board read only inspects parent + status to find the epic's
+  // open children — it never reads labels — so skipping label hydration keeps it lean.
+  const all = await beads.list(repo, ["--status", "all", "--skip-labels"]);
   const open = all.filter(
     (b) => ((b.parent ?? b.parent_id) as string | undefined) === epicId && b.status !== "closed",
   );

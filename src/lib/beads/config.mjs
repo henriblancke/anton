@@ -25,6 +25,38 @@ export function onPath(cmd) {
   return r.status === 0;
 }
 
+/**
+ * The floor bd version anton requires (anton-qwsq / epic anton-x7la). 1.1.0 ships the correctness
+ * and perf features anton now depends on — `--skip-labels` reads, automatic post-pull is_blocked
+ * recompute, and `bd bootstrap` for fresh clones — and, critically, guards the remote-backed schema
+ * migration (a bare `bd migrate` refuses without BD_ALLOW_REMOTE_MIGRATE=1). Running anton against an
+ * older bd is unsupported; every preflight fails loud rather than limping on.
+ */
+export const MIN_BD_VERSION = "1.1.0";
+const MIN_BD = { major: 1, minor: 1, patch: 0 };
+
+/**
+ * Parse a `bd --version` line (`bd version 1.1.0 (hash)`) into `{ major, minor, patch, raw }`, or
+ * null when no dotted version is present. `run` is injectable for tests; the default spawns bd.
+ *
+ * @param {() => { status?: number|null, stdout?: string, stderr?: string, error?: unknown }} [run]
+ */
+export function bdVersion(run = () => spawnSync("bd", ["--version"], { encoding: "utf8" })) {
+  const r = run();
+  if (!r || r.error || (r.status ?? 1) !== 0) return null;
+  const m = `${r.stdout ?? ""}${r.stderr ?? ""}`.match(/(\d+)\.(\d+)\.(\d+)/);
+  if (!m) return null;
+  return { major: +m[1], minor: +m[2], patch: +m[3], raw: `${m[1]}.${m[2]}.${m[3]}` };
+}
+
+/** True when parsed version `v` is >= `min` (semver-ish major/minor/patch compare). null → false. */
+export function bdVersionAtLeast(v, min = MIN_BD) {
+  if (!v) return false;
+  if (v.major !== min.major) return v.major > min.major;
+  if (v.minor !== min.minor) return v.minor > min.minor;
+  return v.patch >= min.patch;
+}
+
 /** True when `dir` is inside a git work tree. */
 export function isGitWorkTree(dir) {
   const r = spawnSync("git", ["-C", dir, "rev-parse", "--is-inside-work-tree"], { stdio: "ignore" });
@@ -60,7 +92,19 @@ export function beadsPrereqs(dir) {
       ok: false,
       error: {
         message: "bd not found on PATH — beads is anton's work source of truth.",
-        fix: "Install it, then re-run: https://github.com/gastownhall/beads",
+        fix: `Install bd >= ${MIN_BD_VERSION}, then re-run: https://github.com/gastownhall/beads`,
+      },
+    };
+  }
+  const v = bdVersion();
+  if (!bdVersionAtLeast(v)) {
+    return {
+      ok: false,
+      error: {
+        message: v
+          ? `bd ${v.raw} is too old — anton requires bd >= ${MIN_BD_VERSION}.`
+          : `could not read the bd version — anton requires bd >= ${MIN_BD_VERSION}.`,
+        fix: "Upgrade bd (https://github.com/gastownhall/beads). For a remote-backed board, follow docs/runbooks/bd-1.0.4-to-1.1.0-migration.md — one clone migrates, the rest `bd bootstrap`.",
       },
     };
   }
@@ -528,6 +572,13 @@ export function configureBeadsForRepo(dir, opts = {}) {
     }
     ranBootstrap = true;
     steps.push({ name: "bd bootstrap", status: "ok" });
+    // A freshly hydrated clone never ran the local writes / post-pull scoped recompute that
+    // maintain the denormalized `is_blocked` flag, so it can arrive stale — and `bd ready` trusts
+    // that flag, silently hiding ready work or surfacing blocked work (bd 1.1.0). Repair it once,
+    // right after bootstrap. Best-effort: idempotent on a consistent DB, and a failure here must
+    // never abort an otherwise-good clone setup.
+    const rc = spawnSync("bd", ["recompute-blocked"], { cwd: dir, encoding: "utf8" });
+    steps.push({ name: "bd recompute-blocked", status: (rc.status ?? 1) === 0 ? "ok" : "skipped" });
   } else {
     emit(".beads/ present with a local Dolt DB — enforcing team-config only (no re-init).");
     steps.push({ name: "bd init", status: "already" });
