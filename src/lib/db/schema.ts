@@ -45,7 +45,7 @@ export const jobs = sqliteTable(
   "jobs",
   {
     id: text("id").primaryKey(),
-    // execute-epic | review-fix | nightly-stringer | orphan-grooming
+    // execute-epic | review-fix | nightly-stringer | orphan-grooming | sync-push
     type: text("type").notNull(),
     projectId: text("project_id").references(() => projects.id),
     payloadJson: text("payload_json").notNull().default("{}"),
@@ -71,6 +71,13 @@ export const jobs = sqliteTable(
         sql`json_extract(${table.payloadJson}, '$.epicBeadId')`,
       )
       .where(sql`${table.status} in ('queued', 'running')`),
+    // At most one active (queued|running) sync-push job per project (anton-nowq). A repo's writes
+    // all target the same Dolt remote, so a burst of writes coalesces onto one durable push job
+    // rather than one per write. Partial on type='sync-push' so it never touches other job types;
+    // the transactional guard in enqueueSyncPushDeduped is the fast path, this index the backstop.
+    uniqueIndex("jobs_active_sync_push_unique")
+      .on(table.projectId)
+      .where(sql`${table.type} = 'sync-push' and ${table.status} in ('queued', 'running')`),
   ],
 );
 

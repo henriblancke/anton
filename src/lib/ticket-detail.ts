@@ -5,6 +5,7 @@
  */
 import { beads, type BeadPatch } from "./beads/bd";
 import { allIssues, ensureDescription } from "./beads/issues";
+import { nudgeSync } from "./beads/sync-nudge";
 import { formatHumanNote, parseTicketNotes, type TicketNote } from "./beads/notes";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
 import { createdMeta, deriveStage, labelValue, parseAcceptance, parseGoal } from "./ticket-view";
@@ -109,13 +110,9 @@ export async function updateTicket(
   // it goes straight to bd, so unlike a snapshot refresh it can't be discarded by the sync below
   // bumping the snapshot generation.
   const detail = await freshDetail(project, await beads.show(project.repoPath, id));
-  // Fire-and-forget (like the claim route's nudgeSync): the update already landed locally, so don't
-  // block the save response on a `bd dolt pull/commit/push` a slow/unreachable remote could stall. A
-  // failed push is recorded as "failing"/unpushed in the sync-status registry inside beads.sync and
-  // retried by the E1 heartbeat backstop — this catch only keeps the rejection from floating.
-  void beads
-    .sync(project.repoPath)
-    .catch((e) => console.error(`[ticket-detail] beads dolt sync failed after updating ${id}`, e));
+  // The update landed locally; propagate via the immediate push + durable sync-push job (anton-nowq)
+  // without blocking the save response on a slow/unreachable remote.
+  nudgeSync(project, "ticket-detail");
   return detail;
 }
 
@@ -152,11 +149,8 @@ export async function addTicketNote(
   );
   // Read-after-write so the response carries the note just appended, not a stale blob.
   const fresh = await beads.show(project.repoPath, id);
-  // Fire-and-forget, like every other bd write here: the note already landed locally and the
-  // heartbeat backstop retries a failed push — never block the response on a slow remote.
-  void beads
-    .sync(project.repoPath)
-    .catch((e) => console.error(`[ticket-detail] beads dolt sync failed after noting ${id}`, e));
+  // The note landed locally; propagate via the immediate push + durable sync-push job (anton-nowq).
+  nudgeSync(project, "ticket-detail");
   return parseTicketNotes(fresh.notes);
 }
 
@@ -178,11 +172,8 @@ export async function setTicketDeferred(
   // Read-after-write, like updateTicket: the `bd show` bead is authoritative for the snoozed state
   // it just set, so the response never reflects the board's stale snapshot.
   const detail = await freshDetail(project, await beads.show(project.repoPath, id));
-  // Fire-and-forget, like every other bd write here: the write already landed locally and the
-  // heartbeat backstop retries a failed push — never block the response on a slow remote.
-  void beads
-    .sync(project.repoPath)
-    .catch((e) => console.error(`[ticket-detail] beads dolt sync failed after deferring ${id}`, e));
+  // The deferral landed locally; propagate via the immediate push + durable sync-push job (anton-nowq).
+  nudgeSync(project, "ticket-detail");
   return detail;
 }
 
@@ -194,11 +185,6 @@ export async function setTicketDeferred(
 export async function deleteTicket(project: Project, id: string): Promise<void> {
   await beads.show(project.repoPath, id); // 404 guard — bd throws on an unknown id
   await beads.delete(project.repoPath, id);
-  // Fire-and-forget (like the claim route's nudgeSync): the delete already landed locally, so don't
-  // block the response on a `bd dolt pull/commit/push` a slow/unreachable remote could stall. A
-  // failed push is recorded as "failing"/unpushed in the sync-status registry inside beads.sync and
-  // retried by the E1 heartbeat backstop — this catch only keeps the rejection from floating.
-  void beads
-    .sync(project.repoPath)
-    .catch((e) => console.error(`[ticket-detail] beads dolt sync failed after deleting ${id}`, e));
+  // The delete landed locally; propagate via the immediate push + durable sync-push job (anton-nowq).
+  nudgeSync(project, "ticket-detail");
 }

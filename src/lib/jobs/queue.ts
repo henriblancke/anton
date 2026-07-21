@@ -18,7 +18,8 @@ export type JobType =
   | "execute-epic"
   | "review-fix"
   | "nightly-stringer"
-  | "orphan-grooming";
+  | "orphan-grooming"
+  | "sync-push";
 
 /**
  * `queued`  — eligible when runAt ≤ now (also how a backoff/quota reschedule is represented).
@@ -272,6 +273,78 @@ export function enqueueExecuteEpicDeduped(
     // Backstop: the index rejected a concurrent insert. Return the job that won the race.
     if (isUniqueViolation(e)) {
       const winner = activeExecuteEpicId(db, projectId, epicBeadId);
+      if (winner) return winner;
+    }
+    throw e;
+  }
+}
+
+/** Id of the currently-active (`queued`|`running`) sync-push job for this project, if any. */
+export function activeSyncPushId(
+  tx: Pick<AntonDb, "select">,
+  projectId: string,
+): string | undefined {
+  const rows = tx
+    .select({ id: schema.jobs.id })
+    .from(schema.jobs)
+    .where(
+      and(
+        eq(schema.jobs.type, "sync-push"),
+        eq(schema.jobs.projectId, projectId),
+        inArray(schema.jobs.status, [...ACTIVE_STATUSES]),
+      ),
+    )
+    .limit(1)
+    .all();
+  return rows[0]?.id;
+}
+
+/**
+ * Enqueue a durable sync-push job for a project's repo, deduped per repo (anton-nowq). Every local
+ * write can call this; the dedupe collapses a burst of writes onto ONE active push job (all of a
+ * repo's writes push the same Dolt remote), so the queue never fills with redundant pushes.
+ *
+ * Returns the existing job's id (inserting no new row) when a `queued`/`running` sync-push job
+ * already covers this project; otherwise inserts a fresh `queued` job and returns its id. Prior
+ * done/parked/failed jobs don't block a new one — a settled push must not stop the next write from
+ * scheduling its own durable push.
+ *
+ * Same shape as `enqueueExecuteEpicDeduped`: the select-existing + insert run in one synchronous
+ * better-sqlite3 transaction (so concurrent enqueues serialize to one active job), and the partial
+ * unique index `jobs_active_sync_push_unique` is the DB-level backstop — a race that slips past the
+ * guard raises UNIQUE, which we absorb by returning the row that won.
+ */
+export function enqueueSyncPushDeduped(
+  db: AntonDb,
+  clock: Clock,
+  projectId: string,
+): string {
+  const nowMs = clock.now();
+  try {
+    return db.transaction((tx) => {
+      const existing = activeSyncPushId(tx, projectId);
+      if (existing) return existing;
+
+      const id = randomUUID();
+      tx.insert(schema.jobs)
+        .values({
+          id,
+          type: "sync-push",
+          projectId,
+          payloadJson: JSON.stringify({ projectId }),
+          status: "queued",
+          runAt: secDate(nowMs),
+          attempts: 0,
+          createdAt: secDate(nowMs),
+          updatedAt: secDate(nowMs),
+        })
+        .run();
+      return id;
+    });
+  } catch (e) {
+    // Backstop: the index rejected a concurrent insert. Return the job that won the race.
+    if (isUniqueViolation(e)) {
+      const winner = activeSyncPushId(db, projectId);
       if (winner) return winner;
     }
     throw e;
