@@ -179,7 +179,7 @@ describeBd("two managed repos exchange a change over refs/dolt/data with export.
     execFileSync("bd", ["init", "--skip-hooks"], { cwd: repoB, stdio: "ignore" });
     execFileSync("bd", ["dolt", "remote", "add", "origin", bare], { cwd: repoB, stdio: "ignore" });
     execFileSync("bd", ["dolt", "pull"], { cwd: repoB, stdio: "ignore" });
-  }, 120_000);
+  });
 
   afterAll(() => {
     if (sandbox) rmSync(sandbox, { recursive: true, force: true });

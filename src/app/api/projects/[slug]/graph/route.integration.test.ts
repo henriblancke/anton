@@ -54,7 +54,7 @@ describeBd("GET /api/projects/[slug]/graph (temp anton.db + real bd)", () => {
       name: "graphy",
       repoPath: repo,
     });
-  }, 60_000);
+  });
 
   afterAll(() => {
     bdRepo?.cleanup();

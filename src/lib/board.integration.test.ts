@@ -61,5 +61,5 @@ describeBd("board integration (real bd)", () => {
     await beads.approve(repo, epicId);
     board = await getBoard(project);
     expect(find(board.columns, epicId)!.approved, "approve flips the label").toBe(true);
-  }, 30_000);
+  });
 });

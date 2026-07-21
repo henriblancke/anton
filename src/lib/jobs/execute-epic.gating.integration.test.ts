@@ -133,7 +133,7 @@ process.exit(0);`),
       // can't re-dispatch this epic (the test DB is shared across the describe block).
       if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
     }
-  }, 60_000);
+  });
 
   it("parks when the epic was taken over by another operator after the run was queued", async () => {
     // Soft-lock at the execution-claim (anton-i71 review): an approved-but-unstarted (backlog) epic
@@ -190,7 +190,7 @@ process.exit(0);`),
     expect(epic.assignee).toBe("thief-operator");
     expect(epic.labels ?? []).not.toContain("stage:in-review");
     expect((await beads.show(repo, ticket5)).status).not.toBe("closed");
-  }, 60_000);
+  });
 
   it("parks an owned epic when the runner has no operator identity (anton-i71 review)", async () => {
     // Same soft-lock as the take-over above, but the runner can't resolve an operator at all
@@ -269,7 +269,7 @@ process.exit(0);`),
       else process.env.USERNAME = savedUsername;
       resetOperatorCache();
     }
-  }, 60_000);
+  });
 
   it("parks a run whose ticket needs a disabled agent, and completes it once re-enabled (anton-dm7)", async () => {
     // Dispatch honors the active-agents allowlist: a ticket labeled with a disabled agent must
@@ -367,7 +367,7 @@ process.exit(0);`),
         .set({ settingsJson: JSON.stringify(baseSettings) })
         .where(eq(schema.projects.id, projectId));
     }
-  }, 60_000);
+  });
 
   it("parks a run whose epic became blocked after approval, then completes it once unblocked", async () => {
     // TOCTOU gate (mirrors the approval route's 409): an epic can be approved + enqueued while
@@ -433,7 +433,7 @@ process.exit(0);`),
     expect((await getJob(tdb.db, jobId))?.status).toBe("done");
     expect((await beads.show(repo, child)).status).toBe("closed");
     expect((await beads.show(repo, dependent)).labels ?? []).toContain("stage:in-review");
-  }, 60_000);
+  });
 
   it("blocks a zero-diff ticket, halts the epic, and never closes or dispatches downstream (issue #46 root cause #1)", async () => {
     // A clean agent exit that leaves NO diff delivered nothing — the false-success in issue #46.
@@ -539,5 +539,5 @@ process.exit(0);`),
       process.env.ANTON_CLAUDE_BIN = successClaude;
       if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
     }
-  }, 60_000);
+  });
 });

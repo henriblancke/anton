@@ -42,7 +42,7 @@ describeBd("ticket notes route (real bd)", () => {
       createdAt: 0,
     };
     taskId = await beads.create(repo, { title: "Steerable ticket", type: "task" });
-  }, 30_000);
+  });
 
   afterAll(() => {
     bdRepo.cleanup();
@@ -56,7 +56,7 @@ describeBd("ticket notes route (real bd)", () => {
     expect(notes[0]!.source).toBe("human");
     expect(notes[0]!.text).toBe("prefer the existing helper");
     expect(notes[0]!.at).toBeTruthy();
-  }, 30_000);
+  });
 
   it("appends rather than replacing, and keeps an anton machine note as its own entry", async () => {
     await beads.note(repo, taskId, "anton: run failed after committing work — needs review");
@@ -64,24 +64,24 @@ describeBd("ticket notes route (real bd)", () => {
     const { notes } = (await res.json()) as { notes: TicketNote[] };
     expect(notes.map((n) => n.source)).toEqual(["human", "system", "human"]);
     expect(notes[2]!.text).toBe("ignore the flaky test\nfix the real bug");
-  }, 30_000);
+  });
 
   it("surfaces the history on the ticket detail GET", async () => {
     const res = await GET(new Request("http://t/"), ctx("tmp", taskId));
     const body = await res.json();
     expect(body.detail.notes.filter((n: TicketNote) => n.source === "human")).toHaveLength(2);
-  }, 30_000);
+  });
 
   it("400s an empty note and 404s an unknown ticket or project", async () => {
     expect((await post("tmp", taskId, { text: "   " })).status).toBe(400);
     expect((await post("tmp", taskId, {})).status).toBe(400);
     expect((await post("tmp", "bd-nope", { text: "hi" })).status).toBe(404);
     expect((await post("nope", taskId, { text: "hi" })).status).toBe(404);
-  }, 30_000);
+  });
 
   it("400s a note past the length cap rather than bloating the dispatch prompt", async () => {
     const res = await post("tmp", taskId, { text: "x".repeat(5_000) });
     expect(res.status).toBe(400);
     expect((await res.json()).error).toMatch(/too long/i);
-  }, 30_000);
+  });
 });

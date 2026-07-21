@@ -158,7 +158,7 @@ process.exit(0);`),
       process.env.ANTON_CLAUDE_BIN = successClaude;
       if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
     }
-  }, 60_000);
+  });
 
   it("branches a fresh run off the newer origin/<base> tip (anton-x3o)", async () => {
     // A run whose LOCAL base is stale must start at the remote tip: resolveFreshBase fetches
@@ -221,7 +221,7 @@ process.exit(0);`),
       }
     })();
     expect(isAncestor).toBe(true);
-  }, 60_000);
+  });
 
   it("does not rebase an existing worktree onto a newer base on resume (anton-x3o)", async () => {
     // AC3: resume reuses the existing worktree as-is. Even if origin/main advances between the
@@ -315,7 +315,7 @@ process.exit(0);`,
     }
   // Three full run phases (run → park → clock jump → resume → run) of real bd/git work; its
   // honest cost is ~60-90s, above the 60s the rest of this file uses (anton-0oi).
-  }, 150_000);
+  });
 
   it("skips an abandoned ticket instead of reopening it, and ships the rest of the epic (anton-6xj0)", async () => {
     // An abandoned bead is CLOSED with no commit on the branch — the exact shape the cross-machine
@@ -401,7 +401,7 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
       process.env.ANTON_GH_BIN = okGh;
       if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
     }
-  }, 60_000);
+  });
 
   it("a mid-run abandon kills the job and exits with no delivery — not a park, not a false success (anton-6xj0)", async () => {
     // The operator abandons a ticket while its agent is running: cancel the job first (stopping the
@@ -481,5 +481,5 @@ setTimeout(()=>process.exit(0),60000);`,
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
     }
-  }, 90_000);
+  });
 });

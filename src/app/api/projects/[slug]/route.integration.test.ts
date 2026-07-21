@@ -87,5 +87,5 @@ describe("DELETE /api/projects/[slug] (temp anton.db)", () => {
     expect(res.status).toBe(500);
     expect((await res.json()).error).toMatch(/residue/i);
     expect(await projectCount(projectId)).toBe(1);
-  }, 30_000);
+  });
 });

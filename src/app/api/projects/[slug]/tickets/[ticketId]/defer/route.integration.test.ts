@@ -41,7 +41,7 @@ describeBd("ticket defer route (real bd)", () => {
       createdAt: 0,
     };
     taskId = await beads.create(repo, { title: "Not now, not dead", type: "task" });
-  }, 30_000);
+  });
 
   afterAll(() => {
     bdRepo.cleanup();
@@ -60,7 +60,7 @@ describeBd("ticket defer route (real bd)", () => {
     expect(detail.status).toBe("deferred");
 
     expect(await readyIds()).not.toContain(taskId);
-  }, 30_000);
+  });
 
   it("DELETE un-snoozes it back into the ready queue", async () => {
     const res = await DELETE(req, ctx("tmp", taskId));
@@ -69,11 +69,11 @@ describeBd("ticket defer route (real bd)", () => {
     expect(detail.deferred).toBe(false);
 
     expect(await readyIds()).toContain(taskId);
-  }, 30_000);
+  });
 
   it("404s an unknown ticket or project", async () => {
     expect((await POST(req, ctx("tmp", "bd-nope"))).status).toBe(404);
     expect((await DELETE(req, ctx("tmp", "bd-nope"))).status).toBe(404);
     expect((await POST(req, ctx("nope", taskId))).status).toBe(404);
-  }, 30_000);
+  });
 });

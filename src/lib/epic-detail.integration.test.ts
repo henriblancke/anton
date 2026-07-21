@@ -95,7 +95,7 @@ describeBd("epic-detail integration (real bd)", () => {
       (e) => e.from === ticketA && e.to === ticketB && e.type === "blocks",
     );
     expect(blocksEdge, "blocks edge from A to B").toBeDefined();
-  }, 30_000);
+  });
 
   // Regression for anton-lhw: the epic-detail header must surface the epic's own agent/risk/size
   // chips (getEpicDetail's real-epic branch used to pass `chips: false`, silently dropping them
@@ -112,7 +112,7 @@ describeBd("epic-detail integration (real bd)", () => {
     expect(detail.epic.agent).toBe("nextjs");
     expect(detail.epic.risk).toBe("high");
     expect(detail.epic.size).toBe("M");
-  }, 30_000);
+  });
 
   // Regression for anton-noc: `bd list` defaults to 50 results, so in a repo with >50 issues an
   // epic's tickets were silently truncated (planar showed 3 of 5, 1 of 6). beads.list must pass
@@ -163,11 +163,11 @@ describeBd("epic-detail integration (real bd)", () => {
     expect(detail.epic.id).toBe(bugId);
     expect(detail.tickets.map((t) => t.id)).toEqual([bugId]);
     expect(detail.edges).toEqual([]);
-  }, 30_000);
+  });
 
   it("still throws for a genuinely missing id", async () => {
     await expect(getEpicDetail(project, "does-not-exist-999")).rejects.toThrow(/not found/i);
-  }, 30_000);
+  });
 
   // anton-u8wu (A2): the delete must not block on the remote push. Hold the sync pending, prove the
   // delete resolves before it settles (off the critical path), then reject it and prove the failure
@@ -197,5 +197,5 @@ describeBd("epic-detail integration (real bd)", () => {
 
     // The local cascade delete landed regardless of the failed push.
     await expect(beads.show(repo, epicId)).rejects.toThrow();
-  }, 30_000);
+  });
 });

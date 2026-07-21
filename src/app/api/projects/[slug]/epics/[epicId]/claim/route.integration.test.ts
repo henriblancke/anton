@@ -63,7 +63,7 @@ describeBd("claim route (temp anton.db + real bd)", () => {
       name: "claimy",
       repoPath: repo,
     });
-  }, 60_000);
+  });
 
   afterAll(() => {
     bdRepo?.cleanup();

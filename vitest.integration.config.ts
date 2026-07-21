@@ -13,12 +13,13 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["src/**/*.integration.test.ts"],
-    // Generous headroom: each case shells out to bd/Dolt/git many times, so under load (or a busy
-    // CI runner) a normally-15s e2e case can spike past a tight limit. A genuine deadlock hangs
-    // indefinitely, so this still surfaces it — it just stops transient contention from failing an
-    // otherwise-passing case.
-    testTimeout: 120_000,
-    hookTimeout: 120_000,
+    // Generous, UNIFORM headroom: each case shells out to bd/Dolt/git many times, so under load (or
+    // a busy CI runner) a normally-15s e2e case can spike well past a tight limit. Integration tests
+    // rely on this single ceiling rather than scattered per-`it` literals — a per-test timeout would
+    // OVERRIDE this and silently reintroduce the tight caps we're widening. 150s covers the longest
+    // legitimate case; a genuine deadlock hangs indefinitely, so it still surfaces here.
+    testTimeout: 150_000,
+    hookTimeout: 150_000,
     // Reliability knob, not just a speed one: above ~4 concurrent workers the Dolt-server race
     // above reappears. `maxWorkers` caps how many test FILES run at once (vitest 4 replaced
     // `poolOptions.forks.maxForks` with this top-level option). Tune up only alongside evidence the

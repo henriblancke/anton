@@ -176,7 +176,7 @@ describeBd("execute-epic e2e — lifecycle (real handler · real bd/git · fake 
     expect(forTicket(t1).prompt).toContain(HUMAN_NOTE);
     expect(forTicket(t1).prompt).toContain("Henri Blancke");
     expect(forTicket(t2).prompt).not.toContain(HUMAN_NOTE);
-  }, 60_000);
+  });
 
   it("runs a parentless bug as an epic-of-one → branch anton/<id> → its own PR → in-review (open, not closed)", async () => {
     // anton-cmz.1 + anton-cmz review: a standalone (parentless) bug is a run target. It executes as
@@ -241,7 +241,7 @@ describeBd("execute-epic e2e — lifecycle (real handler · real bd/git · fake 
       (s) => s.beadId === bugId,
     );
     expect(sessions).toHaveLength(1);
-  }, 60_000);
+  });
 
   it("standalone PR-step failure: stays OPEN + in-review, then resumes at the PR step without re-running claude", async () => {
     // anton-cmz review (both threads): a standalone is never closed by execute-epic — it stays
@@ -333,7 +333,7 @@ describeBd("execute-epic e2e — lifecycle (real handler · real bd/git · fake 
       // Park so a later clock-advancing tick in another test can't re-dispatch this job.
       if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
     }
-  }, 60_000);
+  });
 
   it("a retry after another run already opened the PR completes idempotently — no duplicate/empty PR", async () => {
     // anton-jz1 review: a losing machine's job parks on the winner's live run-lease (or a lost
@@ -413,7 +413,7 @@ process.exit(0);`,
     } finally {
       process.env.ANTON_GH_BIN = okGh;
     }
-  }, 60_000);
+  });
 
   it("clears its OWN leftover run-lease on the external-ref short-circuit (crash after PR, before cleanup)", async () => {
     // anton-jz1 review (thread PRRT_kwDOTWcq8c6SAdZu): a run that crashed AFTER stamping the external
@@ -487,7 +487,7 @@ process.exit(0);`,
     const after = await beads.show(repo, bugId);
     expect(beads.runLeaseLabels(after)).toEqual([]);
     expect(after.external_ref).toBe("gh-77");
-  }, 60_000);
+  });
 
   it("retries (does not false-complete) when a target's PR ref state can't be read", async () => {
     // anton-jz1 review (thread PRRT_kwDOTWcq8c6SBg3n): a set external_ref only proves completion when
@@ -540,7 +540,7 @@ process.exit(0);`,
     } finally {
       process.env.ANTON_GH_BIN = okGh;
     }
-  }, 60_000);
+  });
 
   it("restores an epic's stage:in-review on the external-ref short-circuit (crash after ref, before stage update)", async () => {
     // anton-jz1 review (thread PRRT_kwDOTWcq8c6SBg3m): an epic run that crashed AFTER setExternalRef
@@ -621,5 +621,5 @@ process.exit(0);`,
     expect(epic.labels ?? []).not.toContain("stage:implementing");
     expect(deriveStage(epic)).toBe("in-review");
     expect(epic.external_ref).toBe("gh-55");
-  }, 60_000);
+  });
 });

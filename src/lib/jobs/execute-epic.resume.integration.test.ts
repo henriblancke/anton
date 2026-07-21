@@ -127,7 +127,7 @@ process.exit(0);`,
     } finally {
       process.env.ANTON_GH_BIN = okGh;
     }
-  }, 60_000);
+  });
 
   it("parks a standalone target blocked by an open prerequisite (readiness gate at job start)", async () => {
     // anton-cmz review: a standalone's blockers aren't in the epic-graph rollup, so the runner
@@ -163,7 +163,7 @@ process.exit(0);`,
     const bead = await beads.show(repo, dependent);
     expect(bead.status).not.toBe("closed");
     expect(bead.assignee ?? null).toBeNull();
-  }, 60_000);
+  });
 
   it("poison-parks a bead that was found but isn't runnable, with an honest (not 'not found') reason", async () => {
     // anton-cmz.1 AC3: a genuinely non-runnable target (here a non-work `chore` type) must poison
@@ -204,7 +204,7 @@ process.exit(0);`,
     expect(
       (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === choreId),
     ).toBeUndefined();
-  }, 60_000);
+  });
 
   it("parks on a usage limit, then resumes the SAME run/worktree past the reset window", async () => {
     // A fresh approved epic with one ticket.
@@ -298,7 +298,7 @@ process.exit(0);`,
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
     }
-  }, 60_000);
+  });
 
   it("releases a dead session's claim: a failed ticket run leaves the ticket unclaimed", async () => {
     const epic3 = await beads.create(repo, {
@@ -358,7 +358,7 @@ process.exit(0);`,
       // tick can't re-dispatch this doomed epic (the test DB is shared across the describe block).
       if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
     }
-  }, 60_000);
+  });
 
   it("resumes past a usage limit skipping already-closed tickets and reusing the worktree", async () => {
     // anton-ner.2 AC5: a two-ticket epic where the first ticket closes, then the second hits the
@@ -477,7 +477,7 @@ process.exit(0);`),
     }
   // Three full run phases (run → park → clock jump → resume → run) of real bd/git work; its
   // honest cost is ~60-90s, above the 60s the rest of this file uses (anton-0oi).
-  }, 150_000);
+  });
 
   it("resumes a transient mid-stream death in-session via claude --resume, completing in one tick (anton-juar)", async () => {
     // A standalone target whose FIRST claude invocation dies mid-stream transiently (emits the
@@ -562,5 +562,5 @@ process.exit(0);`,
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
     }
-  }, 60_000);
+  });
 });

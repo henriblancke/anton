@@ -43,7 +43,7 @@ describeBd("ticket route (real bd)", () => {
       description: "## Goal\nedit me",
     });
     await beads.tag(repo, taskId, ["agent:nextjs", "risk:low", "approved"]);
-  }, 30_000);
+  });
 
   afterAll(() => {
     bdRepo.cleanup();
@@ -56,7 +56,7 @@ describeBd("ticket route (real bd)", () => {
     expect(body.detail.id).toBe(taskId);
     expect(body.detail.risk).toBe("low");
     expect(body.detail.goal).toMatch(/edit me/i);
-  }, 30_000);
+  });
 
   it("GET 404s for an unknown project", async () => {
     const res = await GET(new Request("http://t/"), ctx("nope", taskId));
@@ -66,7 +66,7 @@ describeBd("ticket route (real bd)", () => {
   it("GET 404s for an unknown ticket", async () => {
     const res = await GET(new Request("http://t/"), ctx("tmp", "does-not-exist-999"));
     expect(res.status).toBe(404);
-  }, 30_000);
+  });
 
   it("PATCH { risk: 'high' } updates risk and preserves the approved label", async () => {
     const res = await PATCH(jsonRequest("PATCH", { risk: "high" }), ctx("tmp", taskId));
@@ -78,7 +78,7 @@ describeBd("ticket route (real bd)", () => {
     expect(fresh.labels).toContain("approved");
     expect(fresh.labels).toContain("risk:high");
     expect(fresh.labels).not.toContain("risk:low");
-  }, 30_000);
+  });
 
   it("PATCH with an unknown field 400s", async () => {
     const res = await PATCH(jsonRequest("PATCH", { bogus: true }), ctx("tmp", taskId));
@@ -102,7 +102,7 @@ describeBd("ticket route (real bd)", () => {
     expect(missing.status).toBe(404);
     const again = await DELETE(new Request("http://t/"), ctx("tmp", doomed));
     expect(again.status).toBe(404);
-  }, 30_000);
+  });
 
   it("DELETE 404s for an unknown project", async () => {
     const res = await DELETE(new Request("http://t/"), ctx("nope", taskId));

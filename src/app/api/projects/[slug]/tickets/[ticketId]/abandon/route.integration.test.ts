@@ -59,7 +59,7 @@ describeBd("ticket abandon route (real bd)", () => {
       deps: [`parent-child:${epicId}`],
     });
     looseId = await beads.create(repo, { title: "A loose task", type: "task" });
-  }, 30_000);
+  });
 
   afterAll(() => {
     bdRepo.cleanup();
@@ -84,13 +84,13 @@ describeBd("ticket abandon route (real bd)", () => {
     const bead = await beads.show(repo, childId);
     expect(beads.isAbandoned(bead)).toBe(true);
     expect(await readyIds()).not.toContain(childId);
-  }, 30_000);
+  });
 
   it("kills the ticket's own run when it is a parentless (epic-of-one) target", async () => {
     const res = await POST(post({ reason: "not worth doing" }), ctx("tmp", looseId));
     expect(res.status).toBe(200);
     expect(cancelled).toEqual([["proj-1", looseId]]);
-  }, 30_000);
+  });
 
   it("refuses without a reason, and leaves the ticket alone", async () => {
     const open = await beads.create(repo, { title: "Still open", type: "task" });
@@ -106,15 +106,15 @@ describeBd("ticket abandon route (real bd)", () => {
 
     expect((await beads.show(repo, open)).status).not.toBe("closed");
     expect(cancelled).toEqual([]);
-  }, 30_000);
+  });
 
   it("409s a ticket whose outcome already settled", async () => {
     const res = await POST(post({ reason: "again" }), ctx("tmp", childId));
     expect(res.status).toBe(409);
-  }, 30_000);
+  });
 
   it("404s an unknown ticket or project", async () => {
     expect((await POST(post({ reason: "x" }), ctx("tmp", "bd-nope"))).status).toBe(404);
     expect((await POST(post({ reason: "x" }), ctx("nope", childId))).status).toBe(404);
-  }, 30_000);
+  });
 });

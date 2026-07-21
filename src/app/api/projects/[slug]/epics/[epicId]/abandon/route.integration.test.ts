@@ -60,7 +60,7 @@ describeBd("epic abandon route (real bd)", () => {
       deps: [`parent-child:${epicId}`],
     });
     await beads.close(repo, doneChild);
-  }, 30_000);
+  });
 
   afterAll(() => {
     bdRepo?.cleanup();
@@ -76,14 +76,14 @@ describeBd("epic abandon route (real bd)", () => {
     expect((await POST(post({ reason: " " }), paramsCtx({ slug: "tmp", epicId }))).status).toBe(400);
     expect((await beads.show(repo, epicId)).status).not.toBe("closed");
     expect(cancelled).toEqual([]);
-  }, 30_000);
+  });
 
   it("404s an unknown epic or project", async () => {
     expect(
       (await POST(post({ reason: "x" }), paramsCtx({ slug: "tmp", epicId: "bd-nope" }))).status,
     ).toBe(404);
     expect((await POST(post({ reason: "x" }), paramsCtx({ slug: "nope", epicId }))).status).toBe(404);
-  }, 30_000);
+  });
 
   it("abandons the epic and cascades to its open children only", async () => {
     const res = await POST(post({ reason: "the market moved" }), paramsCtx({ slug: "tmp", epicId }));
@@ -105,10 +105,10 @@ describeBd("epic abandon route (real bd)", () => {
     const shipped = await beads.show(repo, doneChild);
     expect(shipped.status).toBe("closed");
     expect(beads.isAbandoned(shipped)).toBe(false);
-  }, 30_000);
+  });
 
   it("409s an epic whose outcome already settled", async () => {
     const res = await POST(post({ reason: "again" }), paramsCtx({ slug: "tmp", epicId }));
     expect(res.status).toBe(409);
-  }, 30_000);
+  });
 });

@@ -39,7 +39,7 @@ describeBd("board-move integration (real bd)", () => {
     await moveCard(project, id, "implementing");
 
     expect(deriveStage(await beads.show(repo, id))).toBe("implementing");
-  }, 30_000);
+  });
 
   // anton-u8wu (A2): the drag must not block on the remote push. Hold the sync pending, prove
   // moveCard resolves before it settles (off the critical path), then reject it and prove the
@@ -68,5 +68,5 @@ describeBd("board-move integration (real bd)", () => {
 
     // The local move landed regardless of the failed push.
     expect(deriveStage(await beads.show(repo, id))).toBe("implementing");
-  }, 30_000);
+  });
 });

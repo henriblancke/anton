@@ -64,7 +64,7 @@ describeBd("ticket-detail integration (real bd)", () => {
     expect(detail.epicId).toBe(epicId);
     expect(detail.epicTitle).toBe("Detail epic");
     expect(detail.approved).toBe(false);
-  }, 30_000);
+  });
 
   it("changes the agent label without disturbing the approved label", async () => {
     const taskId = await beads.create(repo, { title: "Swap agent", type: "task" });
@@ -78,7 +78,7 @@ describeBd("ticket-detail integration (real bd)", () => {
     expect(fresh.labels).toContain("approved");
     expect(fresh.labels).not.toContain("agent:nextjs");
     expect(fresh.labels).toContain("agent:fastapi");
-  }, 30_000);
+  });
 
   it("updates the title and leaves other fields alone", async () => {
     const taskId = await beads.create(repo, {
@@ -91,7 +91,7 @@ describeBd("ticket-detail integration (real bd)", () => {
 
     expect(updated.title).toBe("New title");
     expect(updated.goal).toMatch(/keep me/i);
-  }, 30_000);
+  });
 
   it("returns post-write detail even when the board snapshot is warm (read-after-write)", async () => {
     const taskId = await beads.create(repo, { title: "Warm cache", type: "task" });
@@ -107,11 +107,11 @@ describeBd("ticket-detail integration (real bd)", () => {
     // The mutation's own response must reflect the write, or the edit form resets to stale values.
     expect(updated.title).toBe("Renamed");
     expect(updated.agent).toBe("fastapi");
-  }, 30_000);
+  });
 
   it("throws for a genuinely missing id", async () => {
     await expect(getTicketDetail(project, "does-not-exist-999")).rejects.toThrow(/not found/i);
-  }, 30_000);
+  });
 
   // anton-u8wu (A2): a ticket save must not block on the remote push. Hold the sync pending, prove
   // updateTicket resolves (with the saved detail) before it settles, then reject it and prove the
@@ -141,7 +141,7 @@ describeBd("ticket-detail integration (real bd)", () => {
 
     // The local update landed regardless of the failed push.
     expect((await beads.show(repo, taskId)).title).toBe("Saved");
-  }, 30_000);
+  });
 
   it("deleteTicket fires the remote push off the response path and catches a rejected sync", async () => {
     const taskId = await beads.create(repo, { title: "Delete me", type: "task" });
@@ -164,5 +164,5 @@ describeBd("ticket-detail integration (real bd)", () => {
     errSpy.mockRestore();
 
     await expect(beads.show(repo, taskId)).rejects.toThrow();
-  }, 30_000);
+  });
 });
