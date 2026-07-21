@@ -4,28 +4,15 @@
  * epic (open cross-epic blocker) must be rejected with 409 *before* any approve/enqueue happens,
  * so a dependent epic can't start before its blocker completes. Skipped when `bd`/`git` are absent.
  */
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import Database from "better-sqlite3";
+import { describeBd, makeBdRepo, makeFileDb, paramsCtx, jsonRequest } from "@/lib/testing/integration";
 
-function has(cmd: string): boolean {
-  try {
-    execFileSync(cmd, ["--version"], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-}
+const ctx = (slug: string, epicId: string) => paramsCtx({ slug, epicId });
 
-const suite = has("bd") && has("git") ? describe : describe.skip;
-
-const ctx = (slug: string, epicId: string) => ({ params: Promise.resolve({ slug, epicId }) });
-
-let workDir: string;
+let fileDb: ReturnType<typeof makeFileDb>;
+let bdRepo: ReturnType<typeof makeBdRepo>;
 let repo: string;
 let POST: typeof import("./route").POST;
 let beads: typeof import("@/lib/beads/bd").beads;
@@ -57,7 +44,7 @@ async function parkJob(id: string): Promise<void> {
   await getDb().update(schema.jobs).set({ status: "parked" }).where(eq(schema.jobs.id, id));
 }
 
-suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd)", () => {
+describeBd("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd)", () => {
   let blocked = "";
   // A ready epic used to prove the gate reads fresh beads, not a warm board snapshot.
   let ready = "";
@@ -65,26 +52,10 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
   let externalBlockerChild = "";
 
   beforeAll(async () => {
-    workDir = mkdtempSync(join(tmpdir(), "anton-approve-route-"));
-    process.env.ANTON_DB = join(workDir, "anton.db");
+    fileDb = makeFileDb();
     // Pin a deterministic operator identity so the claim soft-lock (owner check + auto-claim) is
     // assertable without depending on the host's global git user.name.
     process.env.ANTON_OPERATOR = "anton-test";
-
-    // Apply every committed migration before the module-level getDb() singleton is created.
-    const setup = new Database(process.env.ANTON_DB);
-    const migrationsDir = join(process.cwd(), "drizzle");
-    for (const file of readdirSync(migrationsDir).filter((f) => f.endsWith(".sql")).sort()) {
-      const raw = readFileSync(join(migrationsDir, file), "utf8");
-      setup.exec(
-        raw
-          .split("--> statement-breakpoint")
-          .map((s) => s.trim())
-          .filter(Boolean)
-          .join(";\n"),
-      );
-    }
-    setup.close();
 
     ({ POST } = await import("./route"));
     ({ beads } = await import("@/lib/beads/bd"));
@@ -92,11 +63,8 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     const { getDb } = await import("@/lib/db");
     const schema = await import("@/lib/db/schema");
 
-    repo = join(workDir, "repo");
-    execFileSync("git", ["init", "-q", repo]);
-    execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: repo });
-    execFileSync("git", ["config", "user.name", "anton-test"], { cwd: repo });
-    execFileSync("bd", ["init", "--skip-hooks"], { cwd: repo, stdio: "ignore" });
+    bdRepo = makeBdRepo();
+    repo = bdRepo.repo;
 
     // blocked epic's child is blocked by blocker epic's child → inferred blocked→blocker edge.
     blocked = await beads.create(repo, { title: "Blocked epic", type: "epic" });
@@ -122,23 +90,24 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
       name: "approvy",
       repoPath: repo,
     });
-  }, 60_000);
+  });
 
   afterAll(() => {
-    if (workDir) rmSync(workDir, { recursive: true, force: true });
+    fileDb?.cleanup();
+    bdRepo?.cleanup();
     delete process.env.ANTON_OPERATOR;
     resetOperatorCache?.();
   });
 
   it("409s a blocked epic without approving it", async () => {
-    const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", blocked));
+    const res = await POST(jsonRequest("POST"), ctx("approvy", blocked));
     expect(res.status).toBe(409);
     expect((await res.json()).error).toMatch(/blocked by/i);
 
     // The gate must reject *before* tagging: the epic stays un-approved.
     const bead = await beads.show(repo, blocked);
     expect(beads.isApproved(bead)).toBe(false);
-  }, 60_000);
+  });
 
   it("re-reads beads before gating, so a blocker added behind a warm snapshot still 409s", async () => {
     // Warm the board snapshot while `ready` has no blockers — the cached view sees it as ready.
@@ -152,22 +121,22 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
       stdio: "ignore",
     });
 
-    const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", ready));
+    const res = await POST(jsonRequest("POST"), ctx("approvy", ready));
     expect(res.status).toBe(409);
     expect((await res.json()).error).toMatch(/blocked by/i);
 
     const bead = await beads.show(repo, ready);
     expect(beads.isApproved(bead)).toBe(false);
-  }, 60_000);
+  });
 
   it("enqueues a standalone bug and applies the approved label", async () => {
     // A parentless bug is a run target (epic-of-one) — approval must label + enqueue it, not reject.
     const bug = await beads.create(repo, { title: "Loose bug", type: "bug" });
-    const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", bug));
+    const res = await POST(jsonRequest("POST"), ctx("approvy", bug));
     expect(res.status).toBe(200);
     expect((await res.json()).jobId).toBeTruthy();
     expect(beads.isApproved(await beads.show(repo, bug))).toBe(true);
-  }, 60_000);
+  });
 
   it("returns the post-write approved + assignee in the 200 body, not the retained pre-write snapshot", async () => {
     // Read-after-write: the approve write only marks the board snapshot stale (retaining the
@@ -181,12 +150,12 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     const { allIssues } = await import("@/lib/beads/issues");
     await allIssues(repo);
 
-    const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", bug));
+    const res = await POST(jsonRequest("POST"), ctx("approvy", bug));
     expect(res.status).toBe(200);
     const { item } = await res.json();
     expect(item.approved).toBe(true);
     expect(item.assignee).toBe("anton-test");
-  }, 60_000);
+  });
 
   it("409s a standalone task blocked by an open prerequisite, without approving it", async () => {
     // A parentless task/bug is a run target, but a `blocks` edge still gates it — its blockers
@@ -196,13 +165,13 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     const dependent = await beads.create(repo, { title: "Standalone dependent", type: "task" });
     await beads.link(repo, dependent, blocker, "blocks");
 
-    const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", dependent));
+    const res = await POST(jsonRequest("POST"), ctx("approvy", dependent));
     expect(res.status).toBe(409);
     const body = await res.json();
     expect(body.error).toMatch(/blocked by/i);
     expect(body.error).toContain(blocker);
     expect(beads.isApproved(await beads.show(repo, dependent))).toBe(false);
-  }, 60_000);
+  });
 
   it("enqueues a standalone task once its blocker closes", async () => {
     // The same blocks edge stops gating once the prerequisite is done — the standalone becomes ready.
@@ -211,19 +180,19 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     await beads.link(repo, dependent, blocker, "blocks");
     await beads.close(repo, blocker);
 
-    const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", dependent));
+    const res = await POST(jsonRequest("POST"), ctx("approvy", dependent));
     expect(res.status).toBe(200);
     expect(beads.isApproved(await beads.show(repo, dependent))).toBe(true);
-  }, 60_000);
+  });
 
   it("enqueues a real epic with no blockers and applies the approved label", async () => {
     const epic = await beads.create(repo, { title: "Free epic", type: "epic" });
     const child = await beads.create(repo, { title: "Free epic child", type: "task" });
     await beads.link(repo, child, epic, "parent-child");
-    const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", epic));
+    const res = await POST(jsonRequest("POST"), ctx("approvy", epic));
     expect(res.status).toBe(200);
     expect(beads.isApproved(await beads.show(repo, epic))).toBe(true);
-  }, 60_000);
+  });
 
   it("does not enqueue a second run when a take-over re-approves an epic whose run parked", async () => {
     // Take over is steal-on-approve, so it goes through this route — but it must only move the
@@ -234,14 +203,14 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     await beads.link(repo, child, epic, "parent-child");
 
     actAs("bob");
-    expect((await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", epic))).status).toBe(200);
+    expect((await POST(jsonRequest("POST"), ctx("approvy", epic))).status).toBe(200);
     const first = await executeEpicJobs(epic);
     expect(first).toHaveLength(1);
     await parkJob(first[0].id);
 
     actAs("alice");
     const res = await POST(
-      new Request("http://t/", { method: "POST", body: JSON.stringify({ steal: true }) }),
+      jsonRequest("POST", { steal: true }),
       ctx("approvy", epic),
     );
     expect(res.status).toBe(200);
@@ -252,7 +221,7 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     expect(after).toHaveLength(1);
     expect(after[0].status).toBe("parked");
     expect((await res.json()).jobId).toBeUndefined();
-  }, 60_000);
+  });
 
   it("re-approving an already-approved target you own enqueues a run (the UI's Force run)", async () => {
     // Force run / Run epic post here with no body, so a re-approve that isn't a steal is the
@@ -265,11 +234,11 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     await beads.approve(repo, epic); // labelled, with no job on THIS machine
     expect(await executeEpicJobs(epic)).toHaveLength(0);
 
-    const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", epic));
+    const res = await POST(jsonRequest("POST"), ctx("approvy", epic));
     expect(res.status).toBe(200);
     expect((await res.json()).jobId).toBeTruthy();
     expect(await executeEpicJobs(epic)).toHaveLength(1);
-  }, 60_000);
+  });
 
   it("force-running twice reuses the live job rather than starting a second run", async () => {
     // The steal-scoped gate leans on the enqueue dedupe for the double-click case, so hold that
@@ -279,25 +248,25 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     const child = await beads.create(repo, { title: "Double force child", type: "task" });
     await beads.link(repo, child, epic, "parent-child");
 
-    const first = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", epic));
-    const second = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", epic));
+    const first = await POST(jsonRequest("POST"), ctx("approvy", epic));
+    const second = await POST(jsonRequest("POST"), ctx("approvy", epic));
     expect(second.status).toBe(200);
     expect((await second.json()).jobId).toBe((await first.json()).jobId);
     expect(await executeEpicJobs(epic)).toHaveLength(1);
-  }, 60_000);
+  });
 
   it("422s a child ticket of an epic, points at its parent, and does not approve it", async () => {
     // A task WITH a parent runs via its epic's PR, never standalone — approving it must be rejected.
     const parentEpic = await beads.create(repo, { title: "Parent epic", type: "epic" });
     const child = await beads.create(repo, { title: "Child ticket", type: "task" });
     await beads.link(repo, child, parentEpic, "parent-child");
-    const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", child));
+    const res = await POST(jsonRequest("POST"), ctx("approvy", child));
     expect(res.status).toBe(422);
     const body = await res.json();
     expect(body.error).toMatch(/child ticket/i);
     expect(body.error).toContain(parentEpic); // guidance names the epic to approve instead
     expect(beads.isApproved(await beads.show(repo, child))).toBe(false);
-  }, 60_000);
+  });
 
   it("422s a non-work type (molecule) with an honest error and does not approve it", async () => {
     // `beads.create` only makes epic/task/bug; a non-work type needs the raw CLI.
@@ -306,11 +275,11 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
       encoding: "utf8",
     });
     const molecule = JSON.parse(out).id as string;
-    const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", molecule));
+    const res = await POST(jsonRequest("POST"), ctx("approvy", molecule));
     expect(res.status).toBe(422);
     expect((await res.json()).error).toMatch(/not runnable/i);
     expect(beads.isApproved(await beads.show(repo, molecule))).toBe(false);
-  }, 60_000);
+  });
 
   it("409s a run target claimed by another operator, without approving it", async () => {
     // A teammate's claim is a soft-lock: approving would silently run their reservation. The route
@@ -320,13 +289,13 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     await beads.link(repo, child, epic, "parent-child");
     await beads.assign(repo, epic, "someone-else");
 
-    const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", epic));
+    const res = await POST(jsonRequest("POST"), ctx("approvy", epic));
     expect(res.status).toBe(409);
     const body = await res.json();
     expect(body.error).toContain("someone-else");
     expect(body.owner).toBe("someone-else");
     expect(beads.isApproved(await beads.show(repo, epic))).toBe(false);
-  }, 60_000);
+  });
 
   it("steals a teammate's claim on approve when { steal: true } is passed", async () => {
     // Stealing is the explicit override: it reassigns the claim to the approver and approves.
@@ -336,18 +305,14 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     await beads.assign(repo, epic, "someone-else");
 
     const res = await POST(
-      new Request("http://t/", {
-        method: "POST",
-        body: JSON.stringify({ steal: true }),
-        headers: { "content-type": "application/json" },
-      }),
+      jsonRequest("POST", { steal: true }),
       ctx("approvy", epic),
     );
     expect(res.status).toBe(200);
     const bead = await beads.show(repo, epic);
     expect(beads.isApproved(bead)).toBe(true);
     expect(bead.assignee).toBe("anton-test");
-  }, 60_000);
+  });
 
   it("409s a steal-on-approve of an implementing target and leaves the reservation with its owner", async () => {
     // A steal only moves the reservation — it cannot halt a run already executing under the owner.
@@ -362,11 +327,7 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     await beads.tag(repo, epic, ["stage:implementing"]);
 
     const res = await POST(
-      new Request("http://t/", {
-        method: "POST",
-        body: JSON.stringify({ steal: true }),
-        headers: { "content-type": "application/json" },
-      }),
+      jsonRequest("POST", { steal: true }),
       ctx("approvy", epic),
     );
     expect(res.status).toBe(409);
@@ -376,7 +337,7 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     // The reservation stays with its owner and no run is enqueued under the would-be stealer.
     expect((await beads.show(repo, epic)).assignee).toBe("someone-else");
     expect(await executeEpicJobs(epic)).toHaveLength(0);
-  }, 60_000);
+  });
 
   it("409s a steal when the owner's run starts between the stage gate and the claim swap", async () => {
     // The pre-lock stage gate can read backlog, then the owner's runner starts before the CAS:
@@ -404,11 +365,7 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     actAs("anton-test");
     try {
       const res = await POST(
-        new Request("http://t/", {
-          method: "POST",
-          body: JSON.stringify({ steal: true }),
-          headers: { "content-type": "application/json" },
-        }),
+        jsonRequest("POST", { steal: true }),
         ctx("approvy", epic),
       );
       expect(res.status).toBe(409);
@@ -420,7 +377,7 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     } finally {
       spy.mockRestore();
     }
-  }, 60_000);
+  });
 
   it("takes over an approved backlog target that gained a blocker after approval, without enqueuing", async () => {
     // A pure take-over only moves the reservation — it enqueues nothing — so the open-blocker gate
@@ -439,11 +396,7 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
 
     actAs("anton-test");
     const res = await POST(
-      new Request("http://t/", {
-        method: "POST",
-        body: JSON.stringify({ steal: true }),
-        headers: { "content-type": "application/json" },
-      }),
+      jsonRequest("POST", { steal: true }),
       ctx("approvy", epic),
     );
     expect(res.status).toBe(200);
@@ -452,7 +405,7 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     // …and no run is enqueued (a take-over suppresses the run despite the open blocker).
     expect((await res.json()).jobId).toBeUndefined();
     expect(await executeEpicJobs(epic)).toHaveLength(0);
-  }, 60_000);
+  });
 
   it("enqueues a local run when taking over an approved, ready target with no job on this instance", async () => {
     // The cross-instance take-over (anton-i71, PR #39): operator A approved on their machine, which
@@ -470,11 +423,7 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
 
     actAs("anton-test");
     const res = await POST(
-      new Request("http://t/", {
-        method: "POST",
-        body: JSON.stringify({ steal: true }),
-        headers: { "content-type": "application/json" },
-      }),
+      jsonRequest("POST", { steal: true }),
       ctx("approvy", epic),
     );
     expect(res.status).toBe(200);
@@ -485,7 +434,7 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     const jobs = await executeEpicJobs(epic);
     expect(jobs).toHaveLength(1);
     expect(jobs[0].status).toBe("queued");
-  }, 60_000);
+  });
 
   it("does not enqueue a second local job when taking over a ready target this instance already runs", async () => {
     // The same-instance counterpart: this instance already has an active job for the epic (a normal
@@ -497,13 +446,13 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     await beads.link(repo, child, epic, "parent-child");
 
     actAs("bob");
-    expect((await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", epic))).status).toBe(200);
+    expect((await POST(jsonRequest("POST"), ctx("approvy", epic))).status).toBe(200);
     const first = await executeEpicJobs(epic);
     expect(first).toHaveLength(1);
 
     actAs("alice");
     const res = await POST(
-      new Request("http://t/", { method: "POST", body: JSON.stringify({ steal: true }) }),
+      jsonRequest("POST", { steal: true }),
       ctx("approvy", epic),
     );
     expect(res.status).toBe(200);
@@ -513,7 +462,7 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     expect(await executeEpicJobs(epic)).toHaveLength(1);
     // Restore the default operator the following (actAs-less) tests rely on.
     actAs("anton-test");
-  }, 60_000);
+  });
 
   it("auto-claims an unclaimed run target for the approver before enqueuing", async () => {
     // Closing the gap before the runtime execution-claim: approving an unclaimed target sets the
@@ -522,12 +471,12 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     const child = await beads.create(repo, { title: "Unclaimed epic child", type: "task" });
     await beads.link(repo, child, epic, "parent-child");
 
-    const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", epic));
+    const res = await POST(jsonRequest("POST"), ctx("approvy", epic));
     expect(res.status).toBe(200);
     const bead = await beads.show(repo, epic);
     expect(beads.isApproved(bead)).toBe(true);
     expect(bead.assignee).toBe("anton-test");
-  }, 60_000);
+  });
 
   it("approves an item already claimed by the requesting operator unchanged", async () => {
     // Re-approving your own claim is idempotent — no steal needed, assignee stays yours.
@@ -536,21 +485,21 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     await beads.link(repo, child, epic, "parent-child");
     await beads.assign(repo, epic, "anton-test");
 
-    const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", epic));
+    const res = await POST(jsonRequest("POST"), ctx("approvy", epic));
     expect(res.status).toBe(200);
     const bead = await beads.show(repo, epic);
     expect(beads.isApproved(bead)).toBe(true);
     expect(bead.assignee).toBe("anton-test");
-  }, 60_000);
+  });
 
   it("404s an unknown bead id without approving anything", async () => {
-    const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", "approvy-nope"));
+    const res = await POST(jsonRequest("POST"), ctx("approvy", "approvy-nope"));
     expect(res.status).toBe(404);
     expect((await res.json()).error).toMatch(/not found/i);
-  }, 60_000);
+  });
 
   it("404s with {error} for an unknown slug", async () => {
-    const res = await POST(new Request("http://t/", { method: "POST" }), ctx("nope", blocked));
+    const res = await POST(jsonRequest("POST"), ctx("nope", blocked));
     expect(res.status).toBe(404);
     expect((await res.json()).error).toMatch(/not found/i);
   });
@@ -582,7 +531,7 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
       return realTag(cwd, id, labels);
     });
     try {
-      const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", epic));
+      const res = await POST(jsonRequest("POST"), ctx("approvy", epic));
       expect(res.status).toBe(200);
       expect(readsAtWrite).toBeLessThanOrEqual(2);
       expect(listSpy).toHaveBeenCalledTimes(1); // the readiness gate; the board build reuses it
@@ -596,7 +545,7 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     const bead = await beads.show(repo, epic);
     expect(beads.isApproved(bead)).toBe(true);
     expect(bead.assignee).toBe("anton-test");
-  }, 60_000);
+  });
 
   it("reads once for the gate and never re-reads the board after the write", async () => {
     // An unclaimed target additionally pays the CAS write chain (assign + its post-write verify
@@ -611,7 +560,7 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
     const syncSpy = vi.spyOn(beads, "sync").mockResolvedValue(undefined);
     const listSpy = vi.spyOn(beads, "list");
     try {
-      const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", epic));
+      const res = await POST(jsonRequest("POST"), ctx("approvy", epic));
       expect(res.status).toBe(200);
       const { item } = await res.json();
       expect(item.approved).toBe(true);
@@ -621,7 +570,7 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
       listSpy.mockRestore();
       syncSpy.mockRestore();
     }
-  }, 60_000);
+  });
 
   // anton-u8wu (A2): approval enqueues the run off the local approve write, so it must not block on
   // the remote push. Hold the sync pending, prove POST responds 200 before it settles (off the
@@ -643,7 +592,7 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
 
     // Responds while the push is still in flight — proof it isn't awaited (an awaited sync would
     // hang the response until this test times out).
-    const res = await POST(new Request("http://t/", { method: "POST" }), ctx("approvy", epic));
+    const res = await POST(jsonRequest("POST"), ctx("approvy", epic));
     expect(res.status).toBe(200);
     expect(syncSpy).toHaveBeenCalledTimes(1);
 
@@ -656,5 +605,5 @@ suite("POST /api/projects/[slug]/epics/[epicId]/approve (temp anton.db + real bd
 
     // The approve write landed locally regardless of the failed push.
     expect(beads.isApproved(await beads.show(repo, epic))).toBe(true);
-  }, 60_000);
+  });
 });

@@ -5,22 +5,10 @@
  * unknown ticket/project 404s. Skipped when `bd`/`git` aren't installed. Mirrors the
  * ticket-detail integration test.
  */
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { afterAll, beforeAll, expect, it, vi } from "vitest";
 import { beads } from "@/lib/beads/bd";
+import { describeBd, jsonRequest, makeBdRepo, paramsCtx, type BdRepo } from "@/lib/testing/integration";
 import type { Project } from "@/lib/types";
-
-function has(cmd: string): boolean {
-  try {
-    execFileSync(cmd, ["--version"], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 let project: Project | null = null;
 
@@ -30,20 +18,16 @@ vi.mock("@/lib/projects", () => ({
 
 const { GET, PATCH, DELETE } = await import("./route");
 
-const ctx = (slug: string, ticketId: string) => ({ params: Promise.resolve({ slug, ticketId }) });
+const ctx = (slug: string, ticketId: string) => paramsCtx({ slug, ticketId });
 
-const suite = has("bd") && has("git") ? describe : describe.skip;
-
-suite("ticket route (real bd)", () => {
+describeBd("ticket route (real bd)", () => {
+  let bdRepo: BdRepo;
   let repo: string;
   let taskId: string;
 
   beforeAll(async () => {
-    repo = mkdtempSync(join(tmpdir(), "anton-bd-route-"));
-    execFileSync("git", ["init", "-q"], { cwd: repo });
-    execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: repo });
-    execFileSync("git", ["config", "user.name", "anton-test"], { cwd: repo });
-    execFileSync("bd", ["init", "--skip-hooks"], { cwd: repo, stdio: "ignore" });
+    bdRepo = makeBdRepo();
+    repo = bdRepo.repo;
     project = {
       id: "x",
       slug: "tmp",
@@ -62,7 +46,7 @@ suite("ticket route (real bd)", () => {
   }, 30_000);
 
   afterAll(() => {
-    if (repo) rmSync(repo, { recursive: true, force: true });
+    bdRepo.cleanup();
   });
 
   it("GET returns the ticket detail", async () => {
@@ -85,8 +69,7 @@ suite("ticket route (real bd)", () => {
   }, 30_000);
 
   it("PATCH { risk: 'high' } updates risk and preserves the approved label", async () => {
-    const req = new Request("http://t/", { method: "PATCH", body: JSON.stringify({ risk: "high" }) });
-    const res = await PATCH(req, ctx("tmp", taskId));
+    const res = await PATCH(jsonRequest("PATCH", { risk: "high" }), ctx("tmp", taskId));
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.detail.risk).toBe("high");
@@ -98,20 +81,12 @@ suite("ticket route (real bd)", () => {
   }, 30_000);
 
   it("PATCH with an unknown field 400s", async () => {
-    const req = new Request("http://t/", {
-      method: "PATCH",
-      body: JSON.stringify({ bogus: true }),
-    });
-    const res = await PATCH(req, ctx("tmp", taskId));
+    const res = await PATCH(jsonRequest("PATCH", { bogus: true }), ctx("tmp", taskId));
     expect(res.status).toBe(400);
   });
 
   it("PATCH with an invalid value 400s", async () => {
-    const req = new Request("http://t/", {
-      method: "PATCH",
-      body: JSON.stringify({ status: "done" }),
-    });
-    const res = await PATCH(req, ctx("tmp", taskId));
+    const res = await PATCH(jsonRequest("PATCH", { status: "done" }), ctx("tmp", taskId));
     expect(res.status).toBe(400);
   });
 

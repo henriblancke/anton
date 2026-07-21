@@ -4,27 +4,17 @@
  * repo, using a fake `stringer` (writes a canned scan) and fake `claude` (creates a bead via bd,
  * as /scan-triage would). Skipped without bd + git.
  */
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { afterAll, beforeAll, expect, it } from "vitest";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { describeBd, makeBdRepo, saveEnv, type BdRepo } from "@/lib/testing/integration";
 import { makeTestDb, type TestDb } from "../db/testing";
 import { beads } from "../beads/bd";
 import * as schema from "../db/schema";
 import { getJob, type Clock } from "./queue";
 import { JobRunner } from "./runner";
 import { makeNightlyStringerHandler } from "./nightly-stringer";
-
-function has(cmd: string): boolean {
-  try {
-    execFileSync(cmd, ["--version"], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 class FakeClock implements Clock {
   constructor(private t: number) {}
@@ -40,31 +30,22 @@ function writeBin(dir: string, name: string, body: string): string {
   return p;
 }
 
-const suite = has("bd") && has("git") ? describe : describe.skip;
-
-suite("nightly-stringer e2e (real handler · real bd · fake stringer/claude)", () => {
+describeBd("nightly-stringer e2e (real handler · real bd · fake stringer/claude)", () => {
+  let bdRepo: BdRepo;
   let sandbox: string;
   let repo: string;
   let binDir: string;
   let tdb: TestDb;
   let clock: FakeClock;
   let projectId: string;
-  const prevEnv: Record<string, string | undefined> = {};
+  let restoreEnv: () => void;
 
   beforeAll(async () => {
-    sandbox = mkdtempSync(join(tmpdir(), "anton-ns-"));
-    repo = join(sandbox, "repo");
+    bdRepo = makeBdRepo({ initialCommit: true });
+    sandbox = bdRepo.dir;
+    repo = bdRepo.repo;
     binDir = join(sandbox, "bin");
-    mkdirSync(repo);
     mkdirSync(binDir);
-    const g = (args: string[]) => execFileSync("git", args, { cwd: repo, stdio: "ignore" });
-    g(["init", "-q", "-b", "main"]);
-    g(["config", "user.email", "t@example.com"]);
-    g(["config", "user.name", "anton-test"]);
-    writeFileSync(join(repo, "README.md"), "# sandbox\n");
-    g(["add", "-A"]);
-    g(["commit", "-q", "-m", "init"]);
-    execFileSync("bd", ["init", "--skip-hooks"], { cwd: repo, stdio: "ignore" });
 
     // Fake stringer: honor `-o <file>`, write a canned scan whose signal count is controlled by
     // FAKE_STRINGER_SIGNALS (0 → an empty scan, exercising the no-op path).
@@ -102,15 +83,18 @@ process.stdin.on('end',()=>{
 });`,
     );
 
-    const set = (k: string, v: string) => {
-      prevEnv[k] = process.env[k];
-      process.env[k] = v;
-    };
-    set("ANTON_STRINGER_BIN", fakeStringer);
-    set("ANTON_CLAUDE_BIN", fakeClaude);
-    set("ANTON_SESSIONS_ROOT", join(sandbox, "sessions"));
-    set("ANTON_SCANS_ROOT", join(sandbox, "scans"));
-    set("ANTON_TEST_CLAUDE_ARGV", join(sandbox, "claude-argv.jsonl"));
+    restoreEnv = saveEnv([
+      "ANTON_STRINGER_BIN",
+      "ANTON_CLAUDE_BIN",
+      "ANTON_SESSIONS_ROOT",
+      "ANTON_SCANS_ROOT",
+      "ANTON_TEST_CLAUDE_ARGV",
+    ]);
+    process.env.ANTON_STRINGER_BIN = fakeStringer;
+    process.env.ANTON_CLAUDE_BIN = fakeClaude;
+    process.env.ANTON_SESSIONS_ROOT = join(sandbox, "sessions");
+    process.env.ANTON_SCANS_ROOT = join(sandbox, "scans");
+    process.env.ANTON_TEST_CLAUDE_ARGV = join(sandbox, "claude-argv.jsonl");
 
     tdb = makeTestDb();
     clock = new FakeClock(1_700_000_000_000);
@@ -122,15 +106,12 @@ process.stdin.on('end',()=>{
       repoPath: repo,
       defaultBranch: "main",
     });
-  }, 60_000);
+  });
 
   afterAll(() => {
     tdb?.close();
-    for (const [k, v] of Object.entries(prevEnv)) {
-      if (v === undefined) delete process.env[k];
-      else process.env[k] = v;
-    }
-    rmSync(sandbox, { recursive: true, force: true });
+    restoreEnv();
+    bdRepo.cleanup();
   });
 
   it("scans, triages signals into beads, records a session", async () => {
@@ -159,7 +140,7 @@ process.stdin.on('end',()=>{
     // Session recorded + done.
     const sessions = await tdb.db.select().from(schema.sessions);
     expect(sessions.some((s) => s.kind === "nightly-stringer" && s.status === "done")).toBe(true);
-  }, 60_000);
+  });
 
   it("is a no-op when the scan has no new signals (claude not invoked)", async () => {
     process.env.FAKE_STRINGER_SIGNALS = "0";
@@ -176,5 +157,5 @@ process.stdin.on('end',()=>{
     // No beads created, claude never ran (no argv file written).
     expect((await beads.list(repo, ["--status", "all"])).length).toBe(beadsBefore);
     expect(existsSync(join(sandbox, "claude-argv.jsonl"))).toBe(false);
-  }, 60_000);
+  });
 });

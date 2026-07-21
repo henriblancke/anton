@@ -4,23 +4,11 @@
  * `bd ready`, detail reads `deferred`), DELETE restores it to both. Skipped when `bd`/`git` aren't
  * installed. Mirrors the notes route integration test.
  */
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { beads } from "@/lib/beads/bd";
 import { resetIssueSnapshots } from "@/lib/beads/snapshot";
+import { describeBd, makeBdRepo, paramsCtx, type BdRepo } from "@/lib/testing/integration";
 import type { Project, TicketDetail } from "@/lib/types";
-
-function has(cmd: string): boolean {
-  try {
-    execFileSync(cmd, ["--version"], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 let project: Project | null = null;
 
@@ -30,23 +18,19 @@ vi.mock("@/lib/projects", () => ({
 
 const { POST, DELETE } = await import("./route");
 
-const ctx = (slug: string, ticketId: string) => ({ params: Promise.resolve({ slug, ticketId }) });
+const ctx = (slug: string, ticketId: string) => paramsCtx({ slug, ticketId });
 const req = new Request("http://t/");
 
-const suite = has("bd") && has("git") ? describe : describe.skip;
-
-suite("ticket defer route (real bd)", () => {
+describeBd("ticket defer route (real bd)", () => {
+  let bdRepo: BdRepo;
   let repo: string;
   let taskId: string;
 
   const readyIds = async () => (await beads.ready(repo)).map((b) => b.id);
 
   beforeAll(async () => {
-    repo = mkdtempSync(join(tmpdir(), "anton-bd-defer-"));
-    execFileSync("git", ["init", "-q"], { cwd: repo });
-    execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: repo });
-    execFileSync("git", ["config", "user.name", "anton-test"], { cwd: repo });
-    execFileSync("bd", ["init", "--skip-hooks"], { cwd: repo, stdio: "ignore" });
+    bdRepo = makeBdRepo();
+    repo = bdRepo.repo;
     project = {
       id: "x",
       slug: "tmp",
@@ -60,7 +44,7 @@ suite("ticket defer route (real bd)", () => {
   }, 30_000);
 
   afterAll(() => {
-    if (repo) rmSync(repo, { recursive: true, force: true });
+    bdRepo.cleanup();
   });
 
   // The cases share one repo, so a warm snapshot would leak a pre-write bead list between them.

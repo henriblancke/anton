@@ -6,23 +6,11 @@
  * right run target; the runner's own kill semantics are covered by anton-a4jj's tests. Skipped when
  * `bd`/`git` aren't installed. Mirrors the defer route integration test.
  */
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { beads } from "@/lib/beads/bd";
 import { resetIssueSnapshots } from "@/lib/beads/snapshot";
+import { describeBd, jsonRequest, makeBdRepo, paramsCtx, type BdRepo } from "@/lib/testing/integration";
 import type { Project, TicketDetail } from "@/lib/types";
-
-function has(cmd: string): boolean {
-  try {
-    execFileSync(cmd, ["--version"], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 let project: Project | null = null;
 const cancelled: Array<[string, string]> = [];
@@ -40,13 +28,11 @@ vi.mock("@/lib/jobs/service", () => ({
 
 const { POST } = await import("./route");
 
-const ctx = (slug: string, ticketId: string) => ({ params: Promise.resolve({ slug, ticketId }) });
-const post = (body: unknown) =>
-  new Request("http://t/", { method: "POST", body: JSON.stringify(body) });
+const ctx = (slug: string, ticketId: string) => paramsCtx({ slug, ticketId });
+const post = (body: unknown) => jsonRequest("POST", body);
 
-const suite = has("bd") && has("git") ? describe : describe.skip;
-
-suite("ticket abandon route (real bd)", () => {
+describeBd("ticket abandon route (real bd)", () => {
+  let bdRepo: BdRepo;
   let repo: string;
   let epicId: string;
   let childId: string;
@@ -55,11 +41,8 @@ suite("ticket abandon route (real bd)", () => {
   const readyIds = async () => (await beads.ready(repo)).map((b) => b.id);
 
   beforeAll(async () => {
-    repo = mkdtempSync(join(tmpdir(), "anton-bd-abandon-"));
-    execFileSync("git", ["init", "-q"], { cwd: repo });
-    execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: repo });
-    execFileSync("git", ["config", "user.name", "anton-test"], { cwd: repo });
-    execFileSync("bd", ["init", "--skip-hooks"], { cwd: repo, stdio: "ignore" });
+    bdRepo = makeBdRepo();
+    repo = bdRepo.repo;
     project = {
       id: "proj-1",
       slug: "tmp",
@@ -79,7 +62,7 @@ suite("ticket abandon route (real bd)", () => {
   }, 30_000);
 
   afterAll(() => {
-    if (repo) rmSync(repo, { recursive: true, force: true });
+    bdRepo.cleanup();
   });
 
   // The cases share one repo, so a warm snapshot would leak a pre-write bead list between them.

@@ -3,37 +3,21 @@
  * then nudges the remote sync off the response path (anton-u8wu, A2). Mirrors the other
  * *.integration.test.ts harnesses. Skipped when `bd`/`git` aren't installed.
  */
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { afterAll, beforeAll, expect, it, vi } from "vitest";
+import { describeBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
 import { beads } from "./beads/bd";
 import { moveCard } from "./board-move";
 import { deriveStage } from "./ticket-view";
 import type { Project } from "./types";
 
-function has(cmd: string): boolean {
-  try {
-    execFileSync(cmd, ["--version"], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-const suite = has("bd") && has("git") ? describe : describe.skip;
-
-suite("board-move integration (real bd)", () => {
+describeBd("board-move integration (real bd)", () => {
+  let bdRepo: BdRepo;
   let repo: string;
   let project: Project;
 
   beforeAll(() => {
-    repo = mkdtempSync(join(tmpdir(), "anton-bd-move-"));
-    execFileSync("git", ["init", "-q"], { cwd: repo });
-    execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: repo });
-    execFileSync("git", ["config", "user.name", "anton-test"], { cwd: repo });
-    execFileSync("bd", ["init", "--skip-hooks"], { cwd: repo, stdio: "ignore" });
+    bdRepo = makeBdRepo();
+    repo = bdRepo.repo;
     project = {
       id: "x",
       slug: "tmp",
@@ -46,7 +30,7 @@ suite("board-move integration (real bd)", () => {
   });
 
   afterAll(() => {
-    if (repo) rmSync(repo, { recursive: true, force: true });
+    bdRepo.cleanup();
   });
 
   it("applies the stage ops to the real bead", async () => {

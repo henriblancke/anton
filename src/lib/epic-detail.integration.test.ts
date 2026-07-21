@@ -3,26 +3,15 @@
  * getEpicDetail returns the tickets plus that edge. Mirrors board.integration.test.ts. Skipped
  * when `bd`/`git` aren't installed.
  */
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { describeBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
 import { beads } from "./beads/bd";
 import { resetIssueSnapshots } from "./beads/snapshot";
 import { deleteEpic, getEpicDetail } from "./epic-detail";
 import type { Project } from "./types";
-
-function has(cmd: string): boolean {
-  try {
-    execFileSync(cmd, ["--version"], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-const suite = has("bd") && has("git") ? describe : describe.skip;
 
 type SeedNode = { key: string; title: string; type: "epic" | "task" | "bug" };
 type SeedEdge = { from_key: string; to_key: string; type: string };
@@ -41,16 +30,14 @@ function seedGraph(cwd: string, nodes: SeedNode[], edges: SeedEdge[] = []): Reco
   return ids;
 }
 
-suite("epic-detail integration (real bd)", () => {
+describeBd("epic-detail integration (real bd)", () => {
+  let bdRepo: BdRepo;
   let repo: string;
   let project: Project;
 
   beforeAll(() => {
-    repo = mkdtempSync(join(tmpdir(), "anton-bd-epic-"));
-    execFileSync("git", ["init", "-q"], { cwd: repo });
-    execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: repo });
-    execFileSync("git", ["config", "user.name", "anton-test"], { cwd: repo });
-    execFileSync("bd", ["init", "--skip-hooks"], { cwd: repo, stdio: "ignore" });
+    bdRepo = makeBdRepo();
+    repo = bdRepo.repo;
     project = {
       id: "x",
       slug: "tmp",
@@ -63,7 +50,7 @@ suite("epic-detail integration (real bd)", () => {
   });
 
   afterAll(() => {
-    if (repo) rmSync(repo, { recursive: true, force: true });
+    bdRepo.cleanup();
   });
 
   // These cases share one repo, so a warm cross-test snapshot would leak between them. Since A1
@@ -161,7 +148,7 @@ suite("epic-detail integration (real bd)", () => {
       expect(got.has(id), `child ${id} present`).toBe(true);
     }
     expect(detail.tickets.length).toBe(childIds.length);
-  }, 60_000);
+  });
 
   // Regression for anton-noc (secondary): an orphan (parentless) non-epic bead is shown on the
   // board as a single-ticket card; opening it must return a single-ticket detail, not 404/throw.

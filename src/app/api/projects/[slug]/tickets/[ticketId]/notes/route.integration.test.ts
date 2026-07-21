@@ -5,22 +5,10 @@
  * note written straight to the blob stays a separate entry; empty/unknown inputs are refused.
  * Skipped when `bd`/`git` aren't installed. Mirrors the ticket route integration test.
  */
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { afterAll, beforeAll, expect, it, vi } from "vitest";
 import { beads } from "@/lib/beads/bd";
+import { describeBd, jsonRequest, makeBdRepo, paramsCtx, type BdRepo } from "@/lib/testing/integration";
 import type { Project, TicketNote } from "@/lib/types";
-
-function has(cmd: string): boolean {
-  try {
-    execFileSync(cmd, ["--version"], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 let project: Project | null = null;
 
@@ -31,23 +19,19 @@ vi.mock("@/lib/projects", () => ({
 const { POST } = await import("./route");
 const { GET } = await import("../route");
 
-const ctx = (slug: string, ticketId: string) => ({ params: Promise.resolve({ slug, ticketId }) });
+const ctx = (slug: string, ticketId: string) => paramsCtx({ slug, ticketId });
 
 const post = (slug: string, ticketId: string, body: unknown) =>
-  POST(new Request("http://t/", { method: "POST", body: JSON.stringify(body) }), ctx(slug, ticketId));
+  POST(jsonRequest("POST", body), ctx(slug, ticketId));
 
-const suite = has("bd") && has("git") ? describe : describe.skip;
-
-suite("ticket notes route (real bd)", () => {
+describeBd("ticket notes route (real bd)", () => {
+  let bdRepo: BdRepo;
   let repo: string;
   let taskId: string;
 
   beforeAll(async () => {
-    repo = mkdtempSync(join(tmpdir(), "anton-bd-notes-"));
-    execFileSync("git", ["init", "-q"], { cwd: repo });
-    execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: repo });
-    execFileSync("git", ["config", "user.name", "anton-test"], { cwd: repo });
-    execFileSync("bd", ["init", "--skip-hooks"], { cwd: repo, stdio: "ignore" });
+    bdRepo = makeBdRepo();
+    repo = bdRepo.repo;
     project = {
       id: "x",
       slug: "tmp",
@@ -61,7 +45,7 @@ suite("ticket notes route (real bd)", () => {
   }, 30_000);
 
   afterAll(() => {
-    if (repo) rmSync(repo, { recursive: true, force: true });
+    bdRepo.cleanup();
   });
 
   it("appends a human note and returns the updated history", async () => {
