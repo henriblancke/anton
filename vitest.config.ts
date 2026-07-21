@@ -1,12 +1,16 @@
 import { defineConfig, configDefaults } from "vitest/config";
 import tsconfigPaths from "vite-tsconfig-paths";
 
-// Default (unit) project. The bd/git-backed `*.integration.test.ts` suites are deliberately
-// EXCLUDED here and run via their own config (`vitest.integration.config.ts`, `bun run
-// test:integration`): they drive real Dolt sql-servers that race under full fork parallelism, so
-// they need a capped-concurrency pool the fast unit run must not pay for. `bun run test` stays the
-// quick, fully-parallel gate (it never actually ran the integration suites anyway — without `bd`
-// on PATH they self-skipped).
+// Default (unit) project. The `*.integration.test.ts` suites are deliberately EXCLUDED here and run
+// via their own config (`vitest.integration.config.ts`, `bun run test:integration`): they drive
+// real Dolt sql-servers that race under full fork parallelism, so they need a capped-concurrency
+// pool the fast unit run must not pay for. Excluding them costs this gate no coverage — every
+// `*.integration.test.ts` self-skips without its required binary (bd/git for the Dolt suites,
+// node-pty's native addon for the pty suite), so they never actually executed here anyway.
+// IMPORTANT: parallel-safe route/DB tests that must gate PRs (in-memory or temp-sqlite, no Dolt)
+// stay named plain `*.test.ts` so they run in THIS blocking gate — do NOT give them the
+// `.integration` infix, or the exclude below silently drops them into the report-only integration
+// job. `bun run test` stays the quick, fully-parallel gate.
 export default defineConfig({
   plugins: [tsconfigPaths()],
   test: {

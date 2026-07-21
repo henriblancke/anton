@@ -1,6 +1,6 @@
 /**
  * Real-db route test for DELETE /api/projects/[slug]. Boots a temp anton.db (same approach as
- * src/lib/projects.delete.integration.test.ts), seeds project rows directly, then drives the
+ * src/lib/projects.delete.test.ts), seeds project rows directly, then drives the
  * actual route handler: DELETE a known slug → 200 and the project is gone; unknown slug → 404
  * with {error}; a teardown that leaves residue → 500 with the service's message and the rows
  * kept. Mirrors the ticket-detail integration test.
