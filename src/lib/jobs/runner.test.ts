@@ -7,6 +7,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
+import { getBurnAverage } from "../burn";
+import type { ClaudeUsage } from "../claude/usage";
 import { PoisonError, RunAlreadyLiveError, UsageLimitError } from "./errors";
 import { complete, enqueue, getJob, park, reschedule, toMs, type Clock } from "./queue";
 import {
@@ -985,6 +987,76 @@ describe("JobRunner (live, in-memory db)", () => {
     await r.whenIdle();
     expect((await getJob(tdb.db, bypassed))?.status).toBe("queued");
     expect((await getJob(tdb.db, other))?.status).toBe("done");
+  });
+});
+
+describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
+  let tdb: TestDb;
+  let clock: FakeClock;
+  beforeEach(() => {
+    tdb = makeTestDb();
+    clock = new FakeClock(1_700_000_000_000);
+  });
+  afterEach(() => tdb.close());
+
+  const usage = (sessionPct: number, weeklyPct: number): ClaudeUsage => ({
+    sessionPct,
+    weeklyPct,
+    sessionResetAt: null,
+    weeklyResetAt: null,
+    plan: "max",
+  });
+
+  it("persists the session%/weekly% delta across a job, attributed to its type", async () => {
+    // readUsage is called before dispatch, then again after settle: 10%→30% session, 5%→8% weekly.
+    const reads = [usage(10, 5), usage(30, 8)];
+    let i = 0;
+    const r = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: CONFIG,
+      readUsage: async () => reads[i++] ?? null,
+    });
+    r.registerHandler("execute-epic", async () => {});
+    await r.enqueue({ type: "execute-epic" });
+    await r.tickOnce();
+    await r.whenIdle();
+
+    const avg = await getBurnAverage(tdb.db, "execute-epic", 1);
+    expect(avg.seeded).toBe(false);
+    expect(avg.sessionAvg).toBe(20);
+    expect(avg.weeklyAvg).toBe(3);
+  });
+
+  it("records NO sample on a null usage read and still completes the job", async () => {
+    const r = new JobRunner({ db: tdb.db, clock, config: CONFIG, readUsage: async () => null });
+    r.registerHandler("execute-epic", async () => {});
+    const id = await r.enqueue({ type: "execute-epic" });
+    await r.tickOnce();
+    await r.whenIdle();
+
+    expect((await getJob(tdb.db, id))?.status).toBe("done");
+    const rows = await tdb.db.select().from(schema.burnSamples);
+    expect(rows).toHaveLength(0);
+  });
+
+  it("never fails a job when the usage read throws", async () => {
+    const r = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: CONFIG,
+      readUsage: async () => {
+        throw new Error("usage endpoint down");
+      },
+    });
+    r.registerHandler("execute-epic", async () => {});
+    const id = await r.enqueue({ type: "execute-epic" });
+    await r.tickOnce();
+    await r.whenIdle();
+
+    expect((await getJob(tdb.db, id))?.status).toBe("done");
+    const rows = await tdb.db.select().from(schema.burnSamples);
+    expect(rows).toHaveLength(0);
   });
 });
 

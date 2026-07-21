@@ -41,6 +41,8 @@ import {
 import { reconcileInterruptedRuns } from "../runs";
 import { isPoisonError, isRunAlreadyLiveError, isUsageLimitError } from "./errors";
 import { PollingLoop } from "./polling-loop";
+import { sampleJobBurn } from "../burn";
+import { getClaudeUsageCached, type ClaudeUsage } from "../claude/usage";
 
 export interface RunnerConfig {
   /** How long a lease is held before a job is considered crashed. */
@@ -207,6 +209,7 @@ export class JobRunner {
   private readonly log: RunnerLogger;
   private readonly resolvePolicy: JobPolicyResolver | null;
   private readonly liveRunCheck: LiveRunCheck | null;
+  private readonly readUsage: () => Promise<ClaudeUsage | null>;
 
   private readonly inFlight = new Map<string, AbortController>();
   /** Settlement promises for jobs dispatched but not yet settled — the drain set for whenIdle(). */
@@ -231,6 +234,11 @@ export class JobRunner {
      * to keep the pre-jz1 behavior (machine-local dedupe only).
      */
     liveRunCheck?: LiveRunCheck;
+    /**
+     * Live Claude-usage reader for the per-job burn sampler (anton-w8ny). Defaults to the shared,
+     * cached read so bursts collapse to one upstream fetch. Injectable for deterministic tests.
+     */
+    readUsage?: () => Promise<ClaudeUsage | null>;
   }) {
     this.db = deps.db;
     this.clock = deps.clock ?? systemClock;
@@ -238,6 +246,7 @@ export class JobRunner {
     this.log = deps.log ?? noopLog;
     this.resolvePolicy = deps.resolvePolicy ?? null;
     this.liveRunCheck = deps.liveRunCheck ?? null;
+    this.readUsage = deps.readUsage ?? getClaudeUsageCached;
     this.loop = new PollingLoop({
       tickMs: this.config.tickMs,
       tick: async () => {
@@ -473,6 +482,11 @@ export class JobRunner {
     // durably settled — that's what keeps global/per-project capacity from oversubscribing.
     this.inFlight.set(job.id, controller);
 
+    // Burn sampler (anton-w8ny): snapshot Claude usage before the job so we can attribute the
+    // session%/weekly% that moves across it to this job's TYPE. maxConcurrent=1 makes that clean.
+    // Fail-soft — a null read just means no sample; it never gates dispatch.
+    const burnBefore = await this.readUsageSafe();
+
     try {
       const policy = await this.policyFor(job.projectId ?? undefined);
 
@@ -526,7 +540,22 @@ export class JobRunner {
       // expires and the job is reclaimed on a later tick.
       this.log.error(`job ${job.id} (${job.type}) did not settle`, e);
     } finally {
+      // Close the burn window: a fresh read minus the pre-job snapshot is this type's cost. Runs
+      // for every outcome (even a failed attempt burned quota) and is fully fail-soft — sampleJobBurn
+      // records nothing on a null read or a mid-job meter reset and swallows its own errors.
+      await sampleJobBurn(this.db, this.clock, job.type as JobType, burnBefore, () =>
+        this.readUsageSafe(),
+      );
       this.inFlight.delete(job.id);
+    }
+  }
+
+  /** Read live Claude usage for the burn sampler, fail-soft to `null` (never throws into dispatch). */
+  private async readUsageSafe(): Promise<ClaudeUsage | null> {
+    try {
+      return await this.readUsage();
+    } catch {
+      return null;
     }
   }
 
