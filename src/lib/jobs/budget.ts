@@ -49,6 +49,28 @@ export interface BudgetPolicy {
   weekMs: number;
   /** Fallback session-reset horizon when `sessionResetAt` is unknown (Claude's window is 5h). */
   sessionWindowMs: number;
+
+  // ── Pace-modulated prioritization (anton-k05r) ──
+  // A second, finer gate layered on {@link budgetGate}: once work MAY run, which jobs are worth
+  // admitting *now*. Pace-state (plus session headroom) sets a minimum value threshold; a job's
+  // value comes from its bead labels. Scarce budget → only high-value; abundant → down to cleanup.
+
+  /** Age window backing {@link jobValueScore}'s tie-break: a job this old scores the full age band. */
+  valueAgeWindowMs: number;
+  /** Session headroom% at/below which budget is "scarce" (high-value only), even absent an ahead-of-pace read. */
+  scarceHeadroomPct: number;
+  /** Session headroom% at/above which budget is "abundant" (admit down to cleanup), absent a behind-pace read. */
+  abundantHeadroomPct: number;
+  /** Value threshold when scarce/ahead-of-pace — matches the risk:high band, so only high-value admits. */
+  valueThresholdScarce: number;
+  /** Value threshold on-pace — matches the blocking-PR band, so cleanup waits but urgent work runs. */
+  valueThresholdNormal: number;
+  /** Value threshold when abundant/behind-pace — admit everything, including low-value cleanup. */
+  valueThresholdAbundant: number;
+  /** Max threshold reduction at night, scaled by job cost — night lowers the bar for heavy/long jobs. */
+  nightValueDiscount: number;
+  /** Session%-cost at/above which a night job earns the full {@link nightValueDiscount} (heavy = long). */
+  nightHeavyCostPct: number;
 }
 
 /**
@@ -72,6 +94,14 @@ export const DEFAULT_BUDGET_POLICY: BudgetPolicy = {
   paceSlackPct: 5,
   weekMs: 7 * DAY_MS,
   sessionWindowMs: 5 * HOUR_MS,
+  valueAgeWindowMs: 7 * DAY_MS,
+  scarceHeadroomPct: 20,
+  abundantHeadroomPct: 60,
+  valueThresholdScarce: 0.8,
+  valueThresholdNormal: 0.5,
+  valueThresholdAbundant: 0,
+  nightValueDiscount: 0.3,
+  nightHeavyCostPct: 15,
 };
 
 /** Local hour-of-day (fractional, [0,24)) under the policy's fixed offset. */
@@ -113,6 +143,42 @@ function paceCatchUp(
 }
 
 /**
+ * Where the weekly pace-line sits relative to current usage. `weeklyResetMs` is carried (NaN when
+ * unknown) so callers that defer on ahead-of-pace can compute the catch-up time without re-parsing.
+ */
+interface Pace {
+  behindPace: boolean;
+  aheadPace: boolean;
+  havePace: boolean;
+  weeklyResetMs: number;
+}
+
+/**
+ * Behind/ahead of the weekly pace-line at `now`. Only computable when the weekly reset is known;
+ * without it we run without pace (behind/ahead both false), so the daytime reserve holds
+ * conservatively and there's no ahead-of-pace defer. Shared by {@link budgetGate} (coarse: work at
+ * all?) and {@link admitJob} (fine: which jobs are worth admitting now?).
+ */
+function computePace(usage: ClaudeUsage, policy: BudgetPolicy, now: number): Pace {
+  const weeklyResetMs = usage.weeklyResetAt ? Date.parse(usage.weeklyResetAt) : NaN;
+  const havePace = !Number.isNaN(weeklyResetMs) && policy.weeklyTargetPct > 0;
+  if (!havePace) return { behindPace: false, aheadPace: false, havePace: false, weeklyResetMs };
+  const expectedPct = policy.weeklyTargetPct * elapsedWeekFraction(now, weeklyResetMs, policy.weekMs);
+  return {
+    behindPace: usage.weeklyPct < expectedPct - policy.paceSlackPct,
+    aheadPace: usage.weeklyPct > expectedPct + policy.paceSlackPct,
+    havePace: true,
+    weeklyResetMs,
+  };
+}
+
+/** True when `now` falls outside the policy's day window — the preferred window for heavy work. */
+function isNight(now: number, policy: BudgetPolicy): boolean {
+  const hour = localHour(now, policy.utcOffsetMinutes);
+  return !(hour >= policy.dayStartHour && hour < policy.dayEndHour);
+}
+
+/**
  * Decide whether autonomous work may start now. See the module header for the reason ordering.
  * `now` is epoch-ms (injected for tests). A null `usage` fails OPEN — a broken read never halts.
  */
@@ -133,19 +199,7 @@ export function budgetGate(
     return { admit: false, retryAt, reason: "session-headroom" };
   }
 
-  // Pace-line: where should weekly usage be by now, and are we behind/ahead of it? Only computable
-  // when the weekly reset is known; without it we run without pace (behind/ahead both false), so
-  // the daytime reserve holds conservatively and there's no ahead-of-pace defer.
-  const weeklyResetMs = usage.weeklyResetAt ? Date.parse(usage.weeklyResetAt) : NaN;
-  const havePace = !Number.isNaN(weeklyResetMs) && policy.weeklyTargetPct > 0;
-  let behindPace = false;
-  let aheadPace = false;
-  if (havePace) {
-    const expectedPct =
-      policy.weeklyTargetPct * elapsedWeekFraction(now, weeklyResetMs, policy.weekMs);
-    behindPace = usage.weeklyPct < expectedPct - policy.paceSlackPct;
-    aheadPace = usage.weeklyPct > expectedPct + policy.paceSlackPct;
-  }
+  const { behindPace, aheadPace, weeklyResetMs } = computePace(usage, policy, now);
 
   // 2. Ahead of the weekly plan (a front-loaded burst): ease off until the pace-line catches up.
   //    Applies day and night — it's about the weekly budget, not the daily reserve.
@@ -171,4 +225,131 @@ export function budgetGate(
   }
 
   return { admit: true };
+}
+
+// ── Pace-modulated prioritization (anton-k05r) ──────────────────────────────────────────────────
+// Once budgetGate says work MAY run, this finer gate decides which jobs are worth admitting *now*.
+// A job's value comes from its bead labels; pace-state (plus session headroom) sets a minimum value
+// threshold. Scarce budget → high-value only; abundant → drain low-value cleanup; night lowers the
+// bar for heavy jobs. This governs anton's own admission order only — it never forks beads' board.
+
+/** Bead label marking the highest-value work — a risky change that must land before it rots. */
+export const VALUE_LABEL_RISK_HIGH = "risk:high";
+/** Bead label marking work that unblocks an open PR — high value, below risk:high. */
+export const VALUE_LABEL_BLOCKING_PR = "blocking-PR";
+
+/** The inputs to {@link jobValueScore}: a bead's labels and how long the work has waited. */
+export interface JobValueInput {
+  /** The bead's labels (e.g. `risk:high`, `blocking-PR`, `size:M`). */
+  labels: readonly string[];
+  /** How long the job has been waiting, in ms. Older work scores higher within its band. */
+  ageMs?: number;
+}
+
+/**
+ * Score a job's value in [0,1] from its bead labels, with age as a within-band tie-break. The bands
+ * are disjoint so the ordering `risk:high > blocking-PR > age` is total: any risk:high job outranks
+ * any blocking-PR job, which outranks any unlabeled job however old. Age only breaks ties among
+ * peers — a week-old cleanup job never overtakes a fresh blocking-PR one.
+ *
+ *   • risk:high    → [0.8, 1.0]
+ *   • blocking-PR  → [0.5, 0.7]
+ *   • otherwise    → [0.0, 0.4]  (pure age; this is the "low-value cleanup" band)
+ */
+export function jobValueScore(input: JobValueInput, policy: BudgetPolicy): number {
+  const ageFrac =
+    policy.valueAgeWindowMs > 0
+      ? Math.min(1, Math.max(0, (input.ageMs ?? 0) / policy.valueAgeWindowMs))
+      : 0;
+  if (input.labels.includes(VALUE_LABEL_RISK_HIGH)) return 0.8 + 0.2 * ageFrac;
+  if (input.labels.includes(VALUE_LABEL_BLOCKING_PR)) return 0.5 + 0.2 * ageFrac;
+  return 0.4 * ageFrac;
+}
+
+/** A job as the admission gate sees it: its value score and its projected session%-cost to run. */
+export interface GovernedJob {
+  /** Value in [0,1] from {@link jobValueScore}. */
+  value: number;
+  /** Projected session%-cost of running this job now — the sampler's per-type burn average. */
+  sessionCost: number;
+}
+
+/** Why {@link admitJob} held a job, or that it admitted. */
+export type AdmitReason = "admitted" | "value-below-threshold" | "cost-exceeds-headroom";
+
+/** The value gate's verdict, carrying the threshold that was applied for observability. */
+export interface AdmitDecision {
+  admit: boolean;
+  /** The minimum value threshold in effect for this decision. */
+  threshold: number;
+  reason: AdmitReason;
+}
+
+/**
+ * Decide whether a single job clears the current value bar. `budgetGate` decides *whether* to work;
+ * this decides *what* to spend the budget on. Fail-open on a null usage read (mirrors budgetGate) —
+ * a broken meter must never starve the queue.
+ *
+ * The threshold moves with the budget's scarcity:
+ *   • scarce   (ahead-of-pace OR session headroom ≤ scarceHeadroomPct)   → high-value only
+ *   • abundant (behind-pace OR session headroom ≥ abundantHeadroomPct)   → admit down to cleanup
+ *   • on-pace  (neither)                                                 → the normal bar
+ * Scarce wins ties: being ahead of plan holds the line even if the session looks fresh.
+ *
+ * Night lowers the bar for heavy/long jobs — the preferred window, so a big burner that would wait
+ * behind higher-value work by day can run at night. And when budget is scarce, a job whose cost
+ * overruns what's left of the session is held regardless of value: it can't fit, so admitting it
+ * would just exhaust the session mid-run.
+ */
+export function admitJob(
+  usage: ClaudeUsage | null,
+  policy: BudgetPolicy,
+  now: number,
+  job: GovernedJob,
+): AdmitDecision {
+  if (!usage) return { admit: true, threshold: 0, reason: "admitted" };
+
+  const { behindPace, aheadPace } = computePace(usage, policy, now);
+  const headroomPct = 100 - usage.sessionPct;
+  const scarce = aheadPace || headroomPct <= policy.scarceHeadroomPct;
+  const abundant = !scarce && (behindPace || headroomPct >= policy.abundantHeadroomPct);
+
+  let threshold = scarce
+    ? policy.valueThresholdScarce
+    : abundant
+      ? policy.valueThresholdAbundant
+      : policy.valueThresholdNormal;
+
+  // Night discount, scaled by cost: heavy jobs (cost ≥ nightHeavyCostPct) get the full discount.
+  if (isNight(now, policy)) {
+    const heaviness =
+      policy.nightHeavyCostPct > 0 ? Math.min(1, job.sessionCost / policy.nightHeavyCostPct) : 1;
+    threshold = Math.max(0, threshold - policy.nightValueDiscount * heaviness);
+  }
+
+  // When budget is scarce, refuse a job that can't fit the remaining session — no value clears a
+  // guaranteed mid-run exhaustion (anton-k05r acceptance #3).
+  if (scarce && job.sessionCost > headroomPct) {
+    return { admit: false, threshold, reason: "cost-exceeds-headroom" };
+  }
+  if (job.value < threshold) {
+    return { admit: false, threshold, reason: "value-below-threshold" };
+  }
+  return { admit: true, threshold, reason: "admitted" };
+}
+
+/**
+ * Filter a ready queue to the jobs admissible now, ordered by value (highest first) — anton's own
+ * admission order among ready work. This reorders nothing on the beads board; it only decides which
+ * of the already-ready jobs anton spends the current budget on, and in what order.
+ */
+export function admissibleJobs<T extends GovernedJob>(
+  usage: ClaudeUsage | null,
+  policy: BudgetPolicy,
+  now: number,
+  jobs: readonly T[],
+): T[] {
+  return jobs
+    .filter((job) => admitJob(usage, policy, now, job).admit)
+    .sort((a, b) => b.value - a.value);
 }

@@ -5,7 +5,14 @@
  */
 import { describe, expect, it } from "vitest";
 import type { ClaudeUsage } from "../claude/usage";
-import { budgetGate, DEFAULT_BUDGET_POLICY, type BudgetPolicy } from "./budget";
+import {
+  admissibleJobs,
+  admitJob,
+  budgetGate,
+  DEFAULT_BUDGET_POLICY,
+  jobValueScore,
+  type BudgetPolicy,
+} from "./budget";
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
@@ -208,5 +215,96 @@ describe("budgetGate", () => {
       // Same usage at night: no pace, no daytime window → admit.
       expect(budgetGate(makeUsage({ ...day }), POLICY, NIGHT)).toEqual({ admit: true });
     });
+  });
+});
+
+const DAY_MS = 24 * HOUR_MS;
+
+/** Usage whose weekly pace-line sits at `elapsed` of the week relative to `now` (deterministic pace). */
+function usageAt(
+  now: number,
+  o: { elapsed: number; weeklyPct: number; sessionPct: number },
+): ClaudeUsage {
+  return {
+    sessionPct: o.sessionPct,
+    weeklyPct: o.weeklyPct,
+    sessionResetAt: new Date(now + 3 * HOUR_MS).toISOString(),
+    weeklyResetAt: resetForElapsed(now, o.elapsed),
+    plan: "max",
+  };
+}
+
+// Mixed-value queue: one job per band. `value` here is what jobValueScore would produce.
+const RISK_HIGH = { value: 0.9, sessionCost: 2 };
+const BLOCKING_PR = { value: 0.6, sessionCost: 2 };
+const CLEANUP = { value: 0.2, sessionCost: 2 };
+const MIXED_QUEUE = [CLEANUP, RISK_HIGH, BLOCKING_PR];
+
+describe("jobValueScore", () => {
+  it("bands labels risk:high > blocking-PR > age, disjointly", () => {
+    const high = jobValueScore({ labels: ["risk:high", "size:L"] }, POLICY);
+    const pr = jobValueScore({ labels: ["blocking-PR"] }, POLICY);
+    const cleanup = jobValueScore({ labels: ["size:S"], ageMs: DAY_MS }, POLICY);
+    expect(high).toBeGreaterThanOrEqual(0.8);
+    expect(pr).toBeGreaterThanOrEqual(0.5);
+    expect(pr).toBeLessThan(0.7 + 1e-9);
+    expect(cleanup).toBeLessThan(0.4);
+    // Total order holds: a fresh cleanup job never outranks a PR job, etc.
+    expect(pr).toBeGreaterThan(cleanup);
+    expect(high).toBeGreaterThan(pr);
+  });
+
+  it("uses age only as a within-band tie-break", () => {
+    const fresh = jobValueScore({ labels: ["blocking-PR"], ageMs: 0 }, POLICY);
+    const old = jobValueScore({ labels: ["blocking-PR"], ageMs: 7 * DAY_MS }, POLICY);
+    expect(old).toBeGreaterThan(fresh);
+    // Even a week-old cleanup job stays below the freshest blocking-PR job.
+    const oldCleanup = jobValueScore({ labels: [], ageMs: 30 * DAY_MS }, POLICY);
+    expect(oldCleanup).toBeLessThan(fresh);
+  });
+});
+
+describe("admitJob / admissibleJobs (pace-modulated prioritization)", () => {
+  it("fails open on a null usage read", () => {
+    expect(admitJob(null, POLICY, NOON, CLEANUP).admit).toBe(true);
+  });
+
+  it("ahead of pace admits only high-value work", () => {
+    // Weekly burst (70% at half-week vs 50% expected) → ahead of pace → scarce, even with a fresh
+    // session (abundant headroom). Daytime, so no night discount muddies the threshold.
+    const usage = usageAt(NOON, { elapsed: 0.5, weeklyPct: 70, sessionPct: 10 });
+    const admitted = admissibleJobs(usage, POLICY, NOON, MIXED_QUEUE);
+    expect(admitted).toEqual([RISK_HIGH]);
+    expect(admitJob(usage, POLICY, NOON, BLOCKING_PR).reason).toBe("value-below-threshold");
+  });
+
+  it("behind pace admits down to low-value cleanup", () => {
+    // Under-spent week (10% at half-week) → behind pace → abundant → threshold 0, everything runs.
+    const usage = usageAt(NOON, { elapsed: 0.5, weeklyPct: 10, sessionPct: 30 });
+    const admitted = admissibleJobs(usage, POLICY, NOON, MIXED_QUEUE);
+    // All three admitted, ordered by value (anton's admission order, not the board's).
+    expect(admitted).toEqual([RISK_HIGH, BLOCKING_PR, CLEANUP]);
+  });
+
+  it("holds a job whose cost exceeds remaining headroom when ahead of pace", () => {
+    // Ahead of pace via the weekly line; session headroom 30 is NOT scarce on its own (> 20), so
+    // ahead-of-pace is the sole scarce driver — isolating acceptance #3.
+    const usage = usageAt(NOON, { elapsed: 0.5, weeklyPct: 70, sessionPct: 70 });
+    const heavyHighValue = { value: 0.95, sessionCost: 40 }; // 40 > 30 headroom
+    const cheapHighValue = { value: 0.95, sessionCost: 5 };
+    expect(admitJob(usage, POLICY, NOON, heavyHighValue).reason).toBe("cost-exceeds-headroom");
+    expect(admitJob(usage, POLICY, NOON, cheapHighValue).admit).toBe(true);
+  });
+
+  it("night lowers the bar for heavy jobs but not light ones", () => {
+    // On-pace (50% at half-week), mid headroom → normal threshold 0.5. A cleanup job (value 0.3)
+    // is held by day but a HEAVY one clears at night; a light cleanup job stays held.
+    const usage = usageAt(NIGHT, { elapsed: 0.5, weeklyPct: 50, sessionPct: 50 });
+    const day = usageAt(NOON, { elapsed: 0.5, weeklyPct: 50, sessionPct: 50 });
+    const heavyCleanup = { value: 0.3, sessionCost: 15 }; // full night discount → threshold 0.2
+    const lightCleanup = { value: 0.3, sessionCost: 3 }; // small discount → threshold ~0.44
+    expect(admitJob(day, POLICY, NOON, heavyCleanup).admit).toBe(false);
+    expect(admitJob(usage, POLICY, NIGHT, heavyCleanup).admit).toBe(true);
+    expect(admitJob(usage, POLICY, NIGHT, lightCleanup).admit).toBe(false);
   });
 });
