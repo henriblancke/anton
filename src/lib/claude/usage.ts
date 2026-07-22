@@ -334,6 +334,9 @@ export async function getClaudeUsageFresh(
     // Wait it out (never double the upstream request), then take our own post-job read. Any fetch
     // found in flight after the settle necessarily started after this call, so joining it is safe.
     await stale.catch(() => {});
+    // The stale flight itself may have just earned a 429 and armed the backoff — re-check before
+    // launching a fresh read, or we'd re-hammer an endpoint that just told us to stop.
+    if (now() < backoffUntil) return null;
     if (usageInFlight) return usageInFlight;
   }
   usageInFlight = (async () => {

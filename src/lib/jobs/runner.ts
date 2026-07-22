@@ -530,17 +530,30 @@ export class JobRunner {
     // `valueHeldJobIds` collects individual queued jobs the per-job value/cost gate (anton-k05r)
     // holds this tick when the coarse gate ADMITS a budget-aware project: scarce budget admits only
     // high-value work. Fed into leaseDue's `exclude` below so the held rows aren't leased.
+    // `valueHeldReclaimIds` collects the gate's holds on RECLAIMABLE rows — `running` with an
+    // expired lease after a crash/missed heartbeat, which leaseDue treats as runnable. They can't
+    // ride `exclude`: an excluded running row counts toward capOf's live load, so a dead held row
+    // would occupy its project's concurrency slot and block admitted high-value work. capOf caps
+    // them at 0 instead (same trick as pacedExecuteEpicHolds), which skips the lease without the
+    // live-load side effect.
     const pacedExecuteEpicHolds = new Set<string>();
     const valueHeldJobIds = new Set<string>();
-    await this.applyBudgetGovernor(heldBucketKeys, pacedExecuteEpicHolds, valueHeldJobIds);
-    const holdLogKey = [...valueHeldJobIds].sort().join(",");
+    const valueHeldReclaimIds = new Set<string>();
+    await this.applyBudgetGovernor(
+      heldBucketKeys,
+      pacedExecuteEpicHolds,
+      valueHeldJobIds,
+      valueHeldReclaimIds,
+    );
+    const holdLogKey = [...valueHeldJobIds, ...valueHeldReclaimIds].sort().join(",");
     if (holdLogKey !== this.valueHoldLogKey) {
       this.valueHoldLogKey = holdLogKey;
-      if (valueHeldJobIds.size > 0) {
-        this.log.info(
-          `budget value gate holding ${valueHeldJobIds.size} queued job(s)`,
-          [...valueHeldJobIds],
-        );
+      const heldCount = valueHeldJobIds.size + valueHeldReclaimIds.size;
+      if (heldCount > 0) {
+        this.log.info(`budget value gate holding ${heldCount} job(s)`, [
+          ...valueHeldJobIds,
+          ...valueHeldReclaimIds,
+        ]);
       }
     }
 
@@ -568,6 +581,10 @@ export class JobRunner {
     const capOf = (job: JobRow) => {
       if (job.projectId && this.quiescedProjects.has(job.projectId)) return 0;
       if (disabledSchedules.has(scheduleGateKey(job.type, job.projectId))) return 0;
+      // Value-gate hold on a reclaimable (crashed, lease-expired) row: unleasable this tick, but
+      // NOT via `exclude` — see valueHeldReclaimIds above. Its expired lease keeps it out of the
+      // live-load count, so it doesn't occupy a slot admitted work could use.
+      if (valueHeldReclaimIds.has(job.id)) return 0;
       // Paced project: keep non-bypass execute-epic rows (the "Queue for optimal usage" ones)
       // unleasable so a crash/lease-expiry reclaim can't restart one ahead of the pace boundary.
       // Bypass ("Approve") rows fall through to their normal per-project cap.
@@ -612,8 +629,9 @@ export class JobRunner {
    * `pacedExecuteEpicHolds` instead of held outright, so capOf can block reclaim of crashed paced
    * rows without stopping bypass ("Approve") rows.
    * When the coarse gate ADMITS a project, the per-job value/cost gate (anton-k05r) still runs over
-   * its queued governed jobs and collects the ones not worth the remaining budget into
-   * `valueHeldJobIds` — see {@link applyValueGate}.
+   * its queued + reclaimable governed jobs and collects the ones not worth the remaining budget
+   * into `valueHeldJobIds` (queued → exclude) / `valueHeldReclaimIds` (lease-expired running →
+   * capOf 0) — see {@link applyValueGate}.
    * Only runs when a budget-policy resolver is injected. Fails OPEN: a null usage read defers
    * nothing AND resumes any deferrals a prior governed tick wrote (a missing meter must never
    * starve the queue — not even via a stale pace boundary), mirroring `budgetGate`'s own contract.
@@ -622,6 +640,7 @@ export class JobRunner {
     heldBucketKeys: Set<string>,
     pacedExecuteEpicHolds: Set<string>,
     valueHeldJobIds: Set<string>,
+    valueHeldReclaimIds: Set<string>,
   ): Promise<void> {
     if (!this.resolveBudgetPolicy) return;
 
@@ -687,7 +706,7 @@ export class JobRunner {
         // But "work may run" is not "any work may run": the fine-grained gate (anton-k05r) still
         // decides which queued jobs are worth the budget that's left — e.g. scarce session headroom
         // at night admits high-value work only.
-        await this.applyValueGate(usage, policy, pid, now, valueHeldJobIds);
+        await this.applyValueGate(usage, policy, pid, now, valueHeldJobIds, valueHeldReclaimIds);
         continue;
       }
       const retryAtMs = decision.retryAt.getTime();
@@ -750,8 +769,15 @@ export class JobRunner {
    * says aren't worth the remaining budget — scarce headroom admits only high-value work
    * (risk:high / blocking-PR), abundant budget drains down to cleanup, and a job whose per-type
    * burn average can't fit the remaining session is held regardless of value. Holds are per-tick
-   * only (the set feeds leaseDue's `exclude`): nothing is deferred or written, so the next tick
-   * re-evaluates against fresh usage/pace state and the hold lifts the moment the budget does.
+   * only (queued holds feed leaseDue's `exclude`; reclaim holds feed capOf — see tickOnce):
+   * nothing is deferred or written, so the next tick re-evaluates against fresh usage/pace state
+   * and the hold lifts the moment the budget does.
+   *
+   * Candidates include RECLAIMABLE rows — `running` with an expired lease after a crash or missed
+   * heartbeat, which leaseDue treats as runnable. Without them a low-value expired retry would
+   * bypass the admission check its queued twin gets and spend the protected quota. Rows still
+   * dispatched in this process are skipped: they're genuinely running (leaseDue excludes them via
+   * `inFlight`), so scoring them would only pollute the hold set.
    *
    * Value comes from the target bead's labels via the injected `readBeadLabels` (execute-epic
    * only — orphan-grooming carries no bead and scores as label-less cleanup by definition), age
@@ -766,14 +792,17 @@ export class JobRunner {
     pid: string | null,
     nowMs: number,
     valueHeldJobIds: Set<string>,
+    valueHeldReclaimIds: Set<string>,
   ): Promise<void> {
     const candidates = await queuedDueJobs(this.db, this.clock, {
       types: GOVERNED_JOB_TYPES,
       projectId: pid,
+      includeReclaimable: true,
     });
     // One burn-average read per type per tick — the cost side of every candidate of that type.
     const costByType = new Map<string, number>();
     for (const job of candidates) {
+      if (job.status === "running" && this.inFlight.has(job.id)) continue; // genuinely running here
       const payload = parsePayload(job.payloadJson) as
         | { bypassBudget?: unknown; epicBeadId?: unknown }
         | null;
@@ -803,7 +832,7 @@ export class JobRunner {
         policy,
       );
       if (!admitJob(usage, policy, nowMs, { value, sessionCost }).admit) {
-        valueHeldJobIds.add(job.id);
+        (job.status === "running" ? valueHeldReclaimIds : valueHeldJobIds).add(job.id);
       }
     }
   }

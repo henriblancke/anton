@@ -327,6 +327,32 @@ describe("429 backoff (shared across all readers)", () => {
     expect(calls).toBe(2);
   });
 
+  it("re-checks the backoff after waiting out a stale in-flight that earned the 429", async () => {
+    // The sampler passes its entry backoff check while another read is still in flight; that stale
+    // read then hits a 429 and arms the backoff as it settles. The fresh path must re-check after
+    // the drain — not fall through and re-hammer the endpoint that just said stop.
+    const now = () => 1_000;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const preJob = getClaudeUsageCached(async () => {
+      await gate;
+      armBackoffForTest(61_000); // what fetchClaudeUsage does on a 429
+      return null;
+    }, now);
+    let freshCalls = 0;
+    const postJob = getClaudeUsageFresh(async () => {
+      freshCalls += 1;
+      return snapshot;
+    }, now);
+    release();
+
+    expect(await preJob).toBeNull();
+    expect(await postJob).toBeNull(); // backoff honored — skip the sample
+    expect(freshCalls).toBe(0); // no second upstream request
+  });
+
   it("pauses the cached (pill/governor) path too, serving the last cached value", async () => {
     let clock = 1_000;
     const now = () => clock;

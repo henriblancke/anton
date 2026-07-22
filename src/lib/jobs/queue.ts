@@ -495,25 +495,38 @@ export async function projectIdsWithPendingJobs(
  * The `queued` jobs of `types` for one project that are due now — the candidates the runner's
  * per-job value gate (anton-k05r) evaluates before leasing. Read-only (holds are per-tick, applied
  * via leaseDue's `exclude`); ordered by runAt to match leaseDue's own scan order.
+ *
+ * `includeReclaimable` also returns `running` rows whose lease has expired — the same condition
+ * `leaseDue` treats as runnable. Without them the value gate can't see a crashed job's retry, and
+ * a low-value reclaim would bypass the admission check that holds its queued twin.
  */
 export async function queuedDueJobs(
   db: AntonDb,
   clock: Clock,
-  opts: { types: readonly JobType[]; projectId: string | null | undefined },
+  opts: {
+    types: readonly JobType[];
+    projectId: string | null | undefined;
+    includeReclaimable?: boolean;
+  },
 ): Promise<JobRow[]> {
   if (opts.types.length === 0) return [];
   const nowDate = secDate(clock.now());
+  const dueQueued = and(eq(schema.jobs.status, "queued"), lte(schema.jobs.runAt, nowDate));
   return db
     .select()
     .from(schema.jobs)
     .where(
       and(
-        eq(schema.jobs.status, "queued"),
+        opts.includeReclaimable
+          ? or(
+              dueQueued,
+              and(eq(schema.jobs.status, "running"), lte(schema.jobs.leaseExpiresAt, nowDate)),
+            )
+          : dueQueued,
         inArray(schema.jobs.type, [...opts.types]),
         opts.projectId == null
           ? isNull(schema.jobs.projectId)
           : eq(schema.jobs.projectId, opts.projectId),
-        lte(schema.jobs.runAt, nowDate),
       ),
     )
     .orderBy(schema.jobs.runAt);

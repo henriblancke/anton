@@ -1726,6 +1726,57 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     await r.whenIdle();
     expect((await getJob(tdb.db, id))?.status).toBe("done");
   });
+
+  it("value gate: holds a reclaimable (lease-expired) low-value retry like its queued twin", async () => {
+    // A crashed low-value job is `running` with an expired lease — leaseDue treats that as
+    // runnable, so without gating it the reclaim would bypass the admission check and spend the
+    // scarce quota. It must be held un-reclaimed — while an admitted high-value QUEUED job in the
+    // same project still leases (the hold must not occupy a concurrency slot).
+    await seedProjects("A");
+    await seedBurn(2);
+    let sessionPct = 85; // scarce → high-value only
+    let ran = 0;
+    const r = budgetRunner(
+      async () => {
+        ran += 1;
+      },
+      {
+        readUsage: async () => usage({ sessionPct }),
+        readBeadLabels: labelsReader({ "A-high": ["risk:high"] }),
+      },
+    );
+    // Crashed mid-run: lease expired, nothing in this process's inFlight.
+    await tdb.db.insert(schema.jobs).values({
+      id: "stuck-low",
+      type: "execute-epic",
+      projectId: "A",
+      payloadJson: JSON.stringify({ projectId: "A", epicBeadId: "A-low" }),
+      status: "running",
+      runAt: new Date(clock.now() - 100_000),
+      leaseExpiresAt: new Date(clock.now() - 50_000),
+      attempts: 1,
+    });
+    const high = await r.enqueue({
+      type: "execute-epic",
+      projectId: "A",
+      payload: { projectId: "A", epicBeadId: "A-high" },
+    });
+
+    expect(await r.tickOnce()).toBe(1); // the high-value queued job — NOT the crashed low-value row
+    await r.whenIdle();
+    expect(ran).toBe(1);
+    expect((await getJob(tdb.db, high))?.status).toBe("done");
+    // The reclaimable row is untouched — still running/expired, no attempt burned (per-tick hold).
+    const held = await getJob(tdb.db, "stuck-low");
+    expect(held?.status).toBe("running");
+    expect(held?.attempts).toBe(1);
+
+    sessionPct = 10; // budget loosens → the hold lifts and the row is reclaimed next tick
+    expect(await r.tickOnce()).toBe(1);
+    await r.whenIdle();
+    expect(ran).toBe(2);
+    expect((await getJob(tdb.db, "stuck-low"))?.status).toBe("done");
+  });
 });
 
 /** Poll `pred` on real timers until it holds (used with in-flight jobs the FakeClock can't drive). */
