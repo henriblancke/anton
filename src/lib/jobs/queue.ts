@@ -555,8 +555,14 @@ export async function complete(db: AntonDb, clock: Clock, jobId: string): Promis
  * single queued slot. Requeuing this job would be a second queued row → UNIQUE. The follow-up runs a
  * full push that supersedes this job's retry (it carries the same unpushed commits, plus the newer
  * write), so we discharge this job as `done` rather than let the exception leave it a zombie `running`
- * row that never backs off and is re-leased on every reclaim tick. Retry/backoff/park continuity is
- * preserved: the queued follow-up is now the sole carrier of the durable push for this repo.
+ * row that never backs off and is re-leased on every reclaim tick. The follow-up becomes the sole
+ * carrier of the durable push for this repo. Note this resets the attempt budget: under a remote
+ * outage WITH continuous board writes, each running push is discharged before its attempts reach
+ * `maxAttempts`, so parking is DEFERRED (not lost) until writes quiesce — the outage stays operator-
+ * visible throughout via the write-nudge's `unpushedCount` / `state:"failing"` surface, which is
+ * independent of the job. The discharge is gated on `type === 'sync-push'`: only its queued-only
+ * index can raise UNIQUE on a running→queued move, so a violation from any other job type re-throws
+ * loudly rather than being silently swallowed as `done`.
  */
 export async function reschedule(
   db: AntonDb,
@@ -581,9 +587,11 @@ export async function reschedule(
       })
       .where(and(eq(schema.jobs.id, jobId), eq(schema.jobs.status, "running")));
   } catch (e) {
-    if (isUniqueViolation(e)) {
-      // A queued sync-push follow-up already holds this project's queued slot — it supersedes this
-      // retry. Discharge this job cleanly instead of surfacing the violation on the settle path.
+    // Only sync-push's queued-only index can raise UNIQUE on a running→queued move (a queued
+    // follow-up already holds the project's slot); it supersedes this retry, so discharge this job
+    // cleanly instead of surfacing the violation on the settle path. Any other type's violation is
+    // unexpected — re-throw it rather than mask a real problem as a silent `done`.
+    if (isUniqueViolation(e) && (await getJob(db, jobId))?.type === "sync-push") {
       await db
         .update(schema.jobs)
         .set({
