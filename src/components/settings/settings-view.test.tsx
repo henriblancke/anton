@@ -65,6 +65,8 @@ describe("SettingsView budget policy (anton-egrg)", () => {
     const fetchMock = stubFetch();
     renderView({});
 
+    // The knobs are gated behind the budget-aware toggle (off by default) — enable it first.
+    fireEvent.click(screen.getByRole("switch", { name: "Budget-aware execution" }));
     fireEvent.change(screen.getByLabelText("Daytime reserve"), { target: { value: "30" } });
     fireEvent.change(screen.getByLabelText("Weekly target"), { target: { value: "70" } });
     fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
@@ -74,13 +76,38 @@ describe("SettingsView budget policy (anton-egrg)", () => {
       expect.objectContaining({ method: "PATCH" }),
     );
     const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.budgetAware).toBe(true);
     expect(body.budgetPolicy).toEqual({ daytimeReservePct: 30, weeklyTargetPct: 70 });
   });
 
   it("clamps an out-of-range knob to [0,100]", () => {
     renderView({});
+    fireEvent.click(screen.getByRole("switch", { name: "Budget-aware execution" }));
     const reserve = screen.getByLabelText("Daytime reserve") as HTMLInputElement;
     fireEvent.change(reserve, { target: { value: "150" } });
     expect(reserve.value).toBe("100");
+  });
+});
+
+describe("SettingsView budget-aware master-switch (anton-7mpv.1)", () => {
+  it("is off by default and disables the knobs", () => {
+    renderView({});
+    expect(screen.getByRole("switch", { name: "Budget-aware execution" }).getAttribute("aria-checked")).toBe("false");
+    expect((screen.getByLabelText("Daytime reserve") as HTMLInputElement).disabled).toBe(true);
+    expect((screen.getByLabelText("Weekly target") as HTMLInputElement).disabled).toBe(true);
+  });
+
+  it("seeds ON from persisted settings and enables the knobs (round-trip in)", () => {
+    renderView({ budgetAware: true });
+    expect(screen.getByRole("switch", { name: "Budget-aware execution" }).getAttribute("aria-checked")).toBe("true");
+    expect((screen.getByLabelText("Daytime reserve") as HTMLInputElement).disabled).toBe(false);
+  });
+
+  it("PATCHes budgetAware:false when left off (round-trip out)", () => {
+    const fetchMock = stubFetch();
+    renderView({});
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.budgetAware).toBe(false);
   });
 });

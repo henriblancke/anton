@@ -1,9 +1,9 @@
 import { NextResponse } from "next/server";
 
-import { getClaudeUsageCached } from "@/lib/claude/usage";
+import { getDisplayUsage } from "@/lib/claude/usage";
 import { getReadyCountCached } from "@/lib/claude/ready-count";
 import { budgetGate, isBehindPace, DEFAULT_BUDGET_POLICY } from "@/lib/jobs/budget";
-import { DEFAULT_PROJECT_BUDGET_POLICY } from "@/lib/projects";
+import { DEFAULT_PROJECT_BUDGET_POLICY, isBudgetAwareEnabledAnywhere } from "@/lib/projects";
 import { clampPct, type ShapingSignal } from "@/lib/usage";
 
 export const dynamic = "force-dynamic";
@@ -18,9 +18,15 @@ export const dynamic = "force-dynamic";
  *
  * The ready-queue sweep only runs when the cheap pace/headroom conditions already hold — otherwise
  * the nudge can't fire, so there's no reason to spawn `bd` on every poll.
+ *
+ * Gated on budget-aware execution being enabled for at least one project (anton-7mpv.1): the nudge is
+ * built on the same budget signals the governor uses, so with the feature off everywhere it answers
+ * `204` and stays hidden — and the cheap enablement check runs first, before any usage read.
  */
 export async function GET() {
-  const usage = await getClaudeUsageCached();
+  if (!(await isBudgetAwareEnabledAnywhere())) return new NextResponse(null, { status: 204 });
+
+  const usage = await getDisplayUsage();
   if (!usage) return new NextResponse(null, { status: 204 });
 
   const now = Date.now();

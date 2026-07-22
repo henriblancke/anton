@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   getClaudeUsageCached,
+  getDisplayUsage,
+  LAST_GOOD_TTL_MS,
   parseUsage,
   resetUsageCache,
   usageEnabled,
@@ -170,5 +172,46 @@ describe("getClaudeUsageCached", () => {
     expect(await first).toEqual(snapshot);
     expect(await second).toEqual(snapshot);
     expect(calls).toBe(1);
+  });
+});
+
+describe("getDisplayUsage (last-good fallback, anton-7mpv.1)", () => {
+  afterEach(() => {
+    resetUsageCache();
+  });
+
+  const snapshot: ClaudeUsage = {
+    sessionPct: 42,
+    weeklyPct: 12,
+    sessionResetAt: null,
+    weeklyResetAt: null,
+    plan: "max",
+  };
+
+  it("returns the fresh read when the fetch succeeds", async () => {
+    const now = () => 1_000;
+    expect(await getDisplayUsage(async () => snapshot, now)).toEqual(snapshot);
+  });
+
+  it("falls back to the last-good value when a later read fails (pill stays lit)", async () => {
+    let clock = 1_000;
+    const now = () => clock;
+    // Prime a good value, then let the live read start failing (null).
+    expect(await getDisplayUsage(async () => snapshot, now)).toEqual(snapshot);
+    clock += USAGE_CACHE_TTL_MS; // force a re-fetch that now returns null
+    expect(await getDisplayUsage(async () => null, now)).toEqual(snapshot); // still lit via last-good
+  });
+
+  it("stops backing the display once the last-good value ages past its window", async () => {
+    let clock = 1_000;
+    const now = () => clock;
+    expect(await getDisplayUsage(async () => snapshot, now)).toEqual(snapshot);
+    clock += LAST_GOOD_TTL_MS; // last-good is now too stale to trust
+    expect(await getDisplayUsage(async () => null, now)).toBeNull(); // → route answers 204, pill hides
+  });
+
+  it("returns null when there was never a successful read", async () => {
+    const now = () => 1_000;
+    expect(await getDisplayUsage(async () => null, now)).toBeNull();
   });
 });

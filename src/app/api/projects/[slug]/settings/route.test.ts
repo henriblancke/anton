@@ -150,6 +150,31 @@ describe("settings route — agents allowlist + autonomy (anton-46w)", () => {
     expect("conventionalCommits" in persisted()).toBe(false);
   });
 
+  it("PATCH persists a boolean budgetAware, and GET restores it (anton-7mpv.1)", async () => {
+    const res = await PATCH(patchReq({ budgetAware: true }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.budgetAware).toBe(true);
+    expect(persisted().budgetAware).toBe(true);
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.budgetAware).toBe(true);
+  });
+
+  it("PATCH rejects a non-boolean budgetAware (anton-7mpv.1)", async () => {
+    for (const bad of ["yes", 1, {}]) {
+      const res = await PATCH(patchReq({ budgetAware: bad }), ctx("tmp"));
+      expect(res.status).toBe(400);
+    }
+  });
+
+  it('PATCH "" / null clears budgetAware back to OFF (key removed) (anton-7mpv.1)', async () => {
+    await PATCH(patchReq({ budgetAware: true }), ctx("tmp"));
+    const res = await PATCH(patchReq({ budgetAware: null }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.budgetAware).toBeUndefined();
+    expect("budgetAware" in persisted()).toBe(false);
+  });
+
   it("PATCH persists a budgetPolicy, and GET restores it (anton-egrg)", async () => {
     const budgetPolicy = { daytimeReservePct: 25, weeklyTargetPct: 80 };
     const res = await PATCH(patchReq({ budgetPolicy }), ctx("tmp"));

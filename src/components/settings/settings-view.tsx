@@ -25,6 +25,8 @@ interface EditableSettings {
   agents?: string[];
   autonomy?: boolean;
   conventionalCommits?: boolean;
+  /** Budget-aware execution master-switch (anton-7mpv.1); off by default. Gates the knobs below. */
+  budgetAware?: boolean;
   /** Operator budget policy (anton-egrg); only the two exposed knobs round-trip through this form. */
   budgetPolicy?: {
     daytimeReservePct?: number;
@@ -113,6 +115,7 @@ export function SettingsView({
   const [conventionalCommits, setConventionalCommits] = useState(
     settings.conventionalCommits ?? false,
   );
+  const [budgetAware, setBudgetAware] = useState(settings.budgetAware ?? false);
   const [daytimeReservePct, setDaytimeReservePct] = useState(
     settings.budgetPolicy?.daytimeReservePct ?? DEFAULT_DAYTIME_RESERVE_PCT,
   );
@@ -191,6 +194,7 @@ export function SettingsView({
           agents: agents.filter((a) => activeAgents.has(a.id)).map((a) => a.id),
           autonomy,
           conventionalCommits,
+          budgetAware,
           budgetPolicy: { daytimeReservePct, weeklyTargetPct },
         }),
       });
@@ -509,23 +513,42 @@ export function SettingsView({
                 </span>
               </div>
 
-              <div className="flex flex-col gap-2 rounded-[10px] border border-border bg-card px-3 py-3">
-                <span className="text-[12.5px]">Budget policy</span>
-                <span className="text-[10.5px] text-subtle">
-                  paces autonomous spend against your Claude plan
-                </span>
-                <div className="grid grid-cols-2 gap-3">
+              <div className="flex flex-col gap-2.5 rounded-[10px] border border-border bg-card px-3 py-3">
+                <div className="flex items-center gap-2.5">
+                  <div className="flex flex-col gap-0.5">
+                    <span className="text-[12.5px]">Budget-aware execution</span>
+                    <span className="text-[10.5px] text-subtle">
+                      pace autonomous spend against your Claude plan · off by default
+                    </span>
+                  </div>
+                  <span className="ml-auto">
+                    <Toggle
+                      checked={budgetAware}
+                      onChange={setBudgetAware}
+                      label="Budget-aware execution"
+                    />
+                  </span>
+                </div>
+                <div
+                  className={cn(
+                    "grid grid-cols-2 gap-3 transition-opacity",
+                    !budgetAware && "pointer-events-none opacity-50",
+                  )}
+                  aria-hidden={!budgetAware}
+                >
                   <PctField
                     label="Daytime reserve"
                     value={daytimeReservePct}
                     onChange={setDaytimeReservePct}
                     hint="held back for interactive use"
+                    disabled={!budgetAware}
                   />
                   <PctField
                     label="Weekly target"
                     value={weeklyTargetPct}
                     onChange={setWeeklyTargetPct}
                     hint="utilization the pace-line aims for"
+                    disabled={!budgetAware}
                   />
                 </div>
               </div>
@@ -661,11 +684,13 @@ function PctField({
   value,
   onChange,
   hint,
+  disabled = false,
 }: {
   label: string;
   value: number;
   onChange: (value: number) => void;
   hint?: string;
+  disabled?: boolean;
 }) {
   return (
     <label className="flex flex-col gap-1.5">
@@ -677,12 +702,13 @@ function PctField({
           min={0}
           max={100}
           value={value}
+          disabled={disabled}
           onChange={(e) => {
             const n = Number(e.target.value);
             onChange(Number.isFinite(n) ? Math.min(100, Math.max(0, Math.round(n))) : 0);
           }}
           aria-label={label}
-          className="w-full rounded-[10px] bg-transparent px-3 py-2 pr-8 font-mono text-[12.5px] text-foreground outline-none"
+          className="w-full rounded-[10px] bg-transparent px-3 py-2 pr-8 font-mono text-[12.5px] text-foreground outline-none disabled:cursor-not-allowed"
         />
         <span className="pointer-events-none absolute right-3 text-[11px] text-subtle">%</span>
       </div>

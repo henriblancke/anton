@@ -100,10 +100,15 @@ export type JobPolicyResolver = (
   projectId: string | undefined,
 ) => Promise<JobPolicy> | JobPolicy;
 
-/** Resolve a project's budget policy for the governor (anton-szld). May be async (reads settings). */
+/**
+ * Resolve a project's budget policy for the governor (anton-szld). May be async (reads settings).
+ * Returns `null` when the project has budget-aware execution turned off (anton-7mpv.1) — the runner
+ * treats that project as ungoverned and, when NO project is budget-aware, skips the usage read
+ * entirely so the governor never touches the pill's shared usage cache.
+ */
 export type BudgetPolicyResolver = (
   projectId: string | undefined,
-) => Promise<BudgetPolicy> | BudgetPolicy;
+) => Promise<BudgetPolicy | null> | BudgetPolicy | null;
 
 /**
  * Job types the budget governor may proactively defer (anton-szld). An allowlist by design: only
@@ -523,8 +528,6 @@ export class JobRunner {
    */
   private async applyBudgetGovernor(heldBucketKeys: Set<string>): Promise<void> {
     if (!this.resolveBudgetPolicy) return;
-    const usage = await this.readUsageSafe();
-    if (!usage) return; // fail open — a broken/absent meter never holds work
 
     // The gate decides per project (day window / reserve are per-project knobs), so gather every
     // project — including the null-project bucket — that has a pending job of a governed type.
@@ -534,9 +537,23 @@ export class JobRunner {
     }
     if (projectIds.size === 0) return;
 
-    const now = this.clock.now();
+    // Resolve each project's budget policy FIRST. A null policy means budget-aware execution is off
+    // for that project (anton-7mpv.1) — the default — so it isn't governed. Reading usage only AFTER
+    // finding a governed project is deliberate: when no project has opted in (the default state), the
+    // governor never calls the usage endpoint, so it can't cache a transient null into the shared
+    // cache the nav pill reads (which is what darkened the pill on this branch) or hammer the keychain.
+    const governed: Array<{ pid: string | null; policy: BudgetPolicy }> = [];
     for (const pid of projectIds) {
       const policy = await this.resolveBudgetPolicy(pid ?? undefined);
+      if (policy) governed.push({ pid, policy });
+    }
+    if (governed.length === 0) return; // no project is budget-aware → never read usage
+
+    const usage = await this.readUsageSafe();
+    if (!usage) return; // fail open — a broken/absent meter never holds work
+
+    const now = this.clock.now();
+    for (const { pid, policy } of governed) {
       const decision = budgetGate(usage, policy, now);
       if (decision.admit) continue;
       const retryAtMs = decision.retryAt.getTime();

@@ -188,6 +188,19 @@ interface UsageCacheEntry {
   value: ClaudeUsage | null;
 }
 let usageCache: UsageCacheEntry | null = null;
+
+/**
+ * The most recent *successful* (non-null) read, retained separately from {@link usageCache} so a
+ * transient failure can't blank the nav display (anton-7mpv.1). The cache holds `null` on failure by
+ * design — the governor reads it and fails OPEN — but the pill/nudge must not go dark on a single
+ * blip. Background readers (the runner's burn sampler / governor) share this module's cache and refetch
+ * it far more often than the pill, so any one of their fail-soft nulls used to darken the pill for a
+ * whole TTL; {@link getDisplayUsage} falls back to this last-good value instead.
+ */
+let lastGoodUsage: { at: number; value: ClaudeUsage } | null = null;
+
+/** How long a last-good usage snapshot may back the display after the live read starts failing. */
+export const LAST_GOOD_TTL_MS = 5 * 60_000;
 /**
  * The single upstream fetch currently in flight, shared by every concurrent caller until it
  * settles. Without this, simultaneous page loads that all miss a cold/stale cache would each run
@@ -215,6 +228,7 @@ export async function getClaudeUsageCached(
     try {
       const value = await fetcher();
       usageCache = { at: ts, value };
+      if (value) lastGoodUsage = { at: ts, value }; // remember the last successful read
       return value;
     } finally {
       usageInFlight = null;
@@ -223,8 +237,28 @@ export async function getClaudeUsageCached(
   return usageInFlight;
 }
 
-/** Clear the module-level cache. Test-only. */
+/**
+ * Usage for the nav *display* (the pill + shaping nudge). Prefers the fresh cached read; on a
+ * transient failure (a `null` result) it falls back to the last-known-good snapshot while that's
+ * still recent ({@link LAST_GOOD_TTL_MS}), so a background reader's blip never darkens the pill.
+ *
+ * This is intentionally separate from {@link getClaudeUsageCached}: the governor keeps reading the
+ * strict cached value (null → fail OPEN / admit), while only the display tolerates a little staleness.
+ * `fetcher`/`now` are injectable for deterministic tests.
+ */
+export async function getDisplayUsage(
+  fetcher: () => Promise<ClaudeUsage | null> = fetchClaudeUsage,
+  now: () => number = Date.now,
+): Promise<ClaudeUsage | null> {
+  const fresh = await getClaudeUsageCached(fetcher, now);
+  if (fresh) return fresh;
+  if (lastGoodUsage && now() - lastGoodUsage.at < LAST_GOOD_TTL_MS) return lastGoodUsage.value;
+  return null;
+}
+
+/** Clear the module-level cache (and last-good snapshot). Test-only. */
 export function resetUsageCache(): void {
   usageCache = null;
   usageInFlight = null;
+  lastGoodUsage = null;
 }

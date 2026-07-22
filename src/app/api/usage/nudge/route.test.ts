@@ -4,14 +4,21 @@
  * The ready-queue sweep only runs when the cheap pace/headroom conditions already hold — otherwise
  * the nudge can't fire, so there's no reason to spawn `bd`.
  */
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClaudeUsage } from "@/lib/claude/usage";
 import type { ShapingSignal } from "@/lib/usage";
 
-const getClaudeUsageCached = vi.fn<() => Promise<ClaudeUsage | null>>();
+const getDisplayUsage = vi.fn<() => Promise<ClaudeUsage | null>>();
 const getReadyCountCached = vi.fn<() => Promise<number | null>>();
-vi.mock("@/lib/claude/usage", () => ({ getClaudeUsageCached }));
+const isBudgetAwareEnabledAnywhere = vi.fn<() => Promise<boolean>>();
+vi.mock("@/lib/claude/usage", () => ({ getDisplayUsage }));
 vi.mock("@/lib/claude/ready-count", () => ({ getReadyCountCached }));
+// Only isBudgetAwareEnabledAnywhere is exercised here; the default policy constant the route also
+// imports from projects is a plain value, re-exported so the module resolves under the mock.
+vi.mock("@/lib/projects", () => ({
+  isBudgetAwareEnabledAnywhere,
+  DEFAULT_PROJECT_BUDGET_POLICY: { weeklyTargetPct: 90 },
+}));
 
 const { GET } = await import("./route");
 
@@ -29,13 +36,30 @@ function usage(o: Partial<ClaudeUsage> = {}): ClaudeUsage {
   };
 }
 
+beforeEach(() => {
+  // Budget-aware execution is the gate for the nudge (anton-7mpv.1); default it ON so the existing
+  // signal cases exercise the usage path. The disabled case overrides it below.
+  isBudgetAwareEnabledAnywhere.mockResolvedValue(true);
+});
+
 afterEach(() => {
   vi.clearAllMocks();
 });
 
 describe("GET /api/usage/nudge", () => {
+  it("answers 204 without reading usage when budget-aware execution is off everywhere (anton-7mpv.1)", async () => {
+    isBudgetAwareEnabledAnywhere.mockResolvedValue(false);
+
+    const res = await GET();
+
+    expect(res.status).toBe(204);
+    expect(await res.text()).toBe("");
+    expect(getDisplayUsage).not.toHaveBeenCalled();
+    expect(getReadyCountCached).not.toHaveBeenCalled();
+  });
+
   it("answers 204 with no body when usage is unavailable", async () => {
-    getClaudeUsageCached.mockResolvedValueOnce(null);
+    getDisplayUsage.mockResolvedValueOnce(null);
 
     const res = await GET();
 
@@ -45,7 +69,7 @@ describe("GET /api/usage/nudge", () => {
   });
 
   it("reads the ready count and reports the signal when behind pace with headroom", async () => {
-    getClaudeUsageCached.mockResolvedValueOnce(usage());
+    getDisplayUsage.mockResolvedValueOnce(usage());
     getReadyCountCached.mockResolvedValueOnce(1);
 
     const res = await GET();
@@ -62,7 +86,7 @@ describe("GET /api/usage/nudge", () => {
 
   it("skips the ready-queue sweep when not behind pace", async () => {
     // On pace (weekly matches the elapsed half-week) → the nudge can't fire, so don't spawn bd.
-    getClaudeUsageCached.mockResolvedValueOnce(usage({ weeklyPct: 50 }));
+    getDisplayUsage.mockResolvedValueOnce(usage({ weeklyPct: 50 }));
 
     const res = await GET();
     const signal = (await res.json()) as ShapingSignal;

@@ -154,10 +154,20 @@ export interface ProjectSettings {
    */
   conventionalCommits?: boolean;
   /**
+   * Budget-aware execution master-switch (anton-7mpv.1). OFF by default: only when a project turns
+   * this on does the runner's budget governor pace/defer that project's autonomous work against the
+   * Claude plan (see `resolveBudgetPolicy` in ./jobs/service and the governor in ./jobs/budget).
+   * Kept deliberately separate from `budgetPolicy` (the knobs): the knobs may be pre-set while the
+   * feature stays off. Default off is also what keeps the runner from reading Claude usage at all —
+   * so the nav usage pill isn't starved of the shared cache — until an operator opts in.
+   */
+  budgetAware?: boolean;
+  /**
    * Operator-tunable budget policy (anton-egrg): the subset of the governor's full
    * {@link BudgetPolicy} the operator controls per project. Absent → DEFAULT_PROJECT_BUDGET_POLICY;
    * a stored value need only carry the fields the operator touched (the rest fall back to default
-   * on resolve). Validated with {@link budgetPolicySchema} at the API boundary.
+   * on resolve). Validated with {@link budgetPolicySchema} at the API boundary. Only consulted when
+   * {@link budgetAware} is on.
    */
   budgetPolicy?: ProjectBudgetPolicy;
 }
@@ -276,6 +286,23 @@ export async function getProjectSettingsBySlug(slug: string): Promise<ProjectSet
   const p = await getProjectBySlug(slug);
   if (!p) return {};
   return getProjectSettings(getDb(), p.id);
+}
+
+/**
+ * Whether ANY project has budget-aware execution turned on (anton-7mpv.1). The shaping nudge is a
+ * workspace-wide glance, so it's gated on the feature being enabled *somewhere* rather than for a
+ * single project. Fail-soft: a project with unparseable settingsJson is treated as off, and the
+ * default (no project opted in) returns false — the nudge stays hidden.
+ */
+export async function isBudgetAwareEnabledAnywhere(): Promise<boolean> {
+  const rows = await getDb().select({ settingsJson: schema.projects.settingsJson }).from(schema.projects);
+  return rows.some((row) => {
+    try {
+      return (JSON.parse(row.settingsJson) as ProjectSettings).budgetAware === true;
+    } catch {
+      return false;
+    }
+  });
 }
 
 /** Merge a settings patch into the project's settingsJson. Returns the merged settings. */

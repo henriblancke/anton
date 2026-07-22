@@ -14,6 +14,8 @@ let budgetPolicySchema: typeof import("./projects").budgetPolicySchema;
 let resolveProjectBudgetPolicy: typeof import("./projects").resolveProjectBudgetPolicy;
 let resolveBudgetPolicy: typeof import("./projects").resolveBudgetPolicy;
 let DEFAULT_PROJECT_BUDGET_POLICY: typeof import("./projects").DEFAULT_PROJECT_BUDGET_POLICY;
+let updateProjectSettings: typeof import("./projects").updateProjectSettings;
+let isBudgetAwareEnabledAnywhere: typeof import("./projects").isBudgetAwareEnabledAnywhere;
 
 beforeAll(async () => {
   workDir = mkdtempSync(join(tmpdir(), "anton-projects-test-"));
@@ -37,6 +39,8 @@ beforeAll(async () => {
   resolveProjectBudgetPolicy = mod.resolveProjectBudgetPolicy;
   resolveBudgetPolicy = mod.resolveBudgetPolicy;
   DEFAULT_PROJECT_BUDGET_POLICY = mod.DEFAULT_PROJECT_BUDGET_POLICY;
+  updateProjectSettings = mod.updateProjectSettings;
+  isBudgetAwareEnabledAnywhere = mod.isBudgetAwareEnabledAnywhere;
 });
 
 afterAll(() => {
@@ -222,5 +226,20 @@ describe("budget policy (anton-egrg)", () => {
 
   it("rejects unknown keys so a typo can't silently persist", () => {
     expect(budgetPolicySchema.safeParse({ daytimeReserve: 15 }).success).toBe(false);
+  });
+});
+
+describe("isBudgetAwareEnabledAnywhere (anton-7mpv.1)", () => {
+  it("is false when no project has budget-aware execution on (the default)", async () => {
+    const created = await addProject({ name: "Budget Off", repoPath: makeRepoDir("budget-off") });
+    // A project with an unrelated setting is still 'off'.
+    await updateProjectSettings(created.slug, { model: "claude-sonnet-5" });
+    expect(await isBudgetAwareEnabledAnywhere()).toBe(false);
+  });
+
+  it("is true once any project turns it on", async () => {
+    const created = await addProject({ name: "Budget On", repoPath: makeRepoDir("budget-on") });
+    await updateProjectSettings(created.slug, { budgetAware: true });
+    expect(await isBudgetAwareEnabledAnywhere()).toBe(true);
   });
 });

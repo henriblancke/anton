@@ -53,14 +53,16 @@ async function resolvePolicy(projectId: string | undefined) {
 }
 
 /**
- * Per-project budget policy for the proactive governor (anton-szld). Reads the same project
- * settings as `resolvePolicy` and projects the operator's knobs onto the governor's full
- * {@link BudgetPolicy} (`resolveBudgetPolicy` in ../projects); a project-less job gets the shipped
- * defaults. This is what the runner consults each tick to defer autonomous work past the
- * reset/night boundary.
+ * Per-project budget policy for the proactive governor (anton-szld), gated by the budget-aware
+ * master-switch (anton-7mpv.1). Returns `null` unless the project has `budgetAware` turned ON — off is
+ * the default — which the runner reads as "not governed": it never defers that project's work AND
+ * never reads Claude usage on its behalf, so the nav usage pill isn't starved of the shared cache.
+ * When on, it projects the operator's knobs onto the governor's full {@link BudgetPolicy}. A
+ * project-less job is never budget-aware (empty settings → off).
  */
 async function resolveBudgetPolicy(projectId: string | undefined) {
   const settings = projectId ? await getProjectSettings(getDb(), projectId) : {};
+  if (!settings.budgetAware) return null;
   return resolveBudgetPolicyFromSettings(settings);
 }
 

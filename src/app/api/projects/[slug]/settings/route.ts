@@ -181,6 +181,15 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
     } else patch.conventionalCommits = conventionalCommits;
   }
 
+  if ("budgetAware" in body) {
+    const budgetAware = body.budgetAware;
+    // "" / null → clear (default: OFF). Otherwise strictly a boolean.
+    if (budgetAware == null || budgetAware === "") patch.budgetAware = undefined;
+    else if (typeof budgetAware !== "boolean") {
+      return NextResponse.json({ error: "budgetAware must be a boolean" }, { status: 400 });
+    } else patch.budgetAware = budgetAware;
+  }
+
   if ("budgetPolicy" in body) {
     const raw = (body as Record<string, unknown>).budgetPolicy;
     // "" / null → clear (fall back to DEFAULT_PROJECT_BUDGET_POLICY). Otherwise validate strictly:
