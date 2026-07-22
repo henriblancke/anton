@@ -215,7 +215,27 @@ export function enqueueExecuteEpicIfAbsent(
   const nowMs = clock.now();
   try {
     return db.transaction((tx) => {
-      if (coveringExecuteEpicId(tx, projectId, epicBeadId)) return undefined;
+      const covering = coveringExecuteEpicId(tx, projectId, epicBeadId);
+      if (covering) {
+        // A take-over with "run now" intent (`bypassBudget`) onto a covering QUEUED job — e.g. a
+        // paced "Queue for optimal usage" row, possibly budget-deferred to a future runAt — must
+        // promote it, mirroring `enqueueExecuteEpicDeduped`: set the bypass flag and pull it due
+        // now, or the governor keeps holding the reused job to the pace boundary and the "run now"
+        // intent is silently dropped. Guarded to `queued`: a running job is already executing, and
+        // a parked/failed one is left for its own resume path.
+        if (opts?.bypassBudget) {
+          tx.update(schema.jobs)
+            .set({
+              payloadJson: JSON.stringify(executeEpicPayload(projectId, epicBeadId, true)),
+              runAt: secDate(nowMs),
+              lastError: null,
+              updatedAt: secDate(nowMs),
+            })
+            .where(and(eq(schema.jobs.id, covering), eq(schema.jobs.status, "queued")))
+            .run();
+        }
+        return undefined;
+      }
 
       const id = randomUUID();
       tx.insert(schema.jobs)

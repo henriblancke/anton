@@ -197,6 +197,53 @@ describe("enqueueExecuteEpicIfAbsent (take-over path, anton-i71)", () => {
     expect(id).toBeDefined();
     expect(activeRows()).toHaveLength(1);
   });
+
+  it("promotes a covering queued paced job when taking over with bypassBudget (run-now intent)", async () => {
+    // Operator A queued the epic for optimal usage; the governor deferred it to the pace boundary.
+    const paced = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-1");
+    const future = new Date(systemClock.now() + 60 * 60_000);
+    t.db
+      .update(schema.jobs)
+      .set({ runAt: future, lastError: "budget: weekly-on-track — resumes at …" })
+      .where(eq(schema.jobs.id, paced))
+      .run();
+
+    // Operator B takes it over with "Approve & run" (immediate → bypassBudget). No new job, but the
+    // covering row must be promoted — flag set, due now — or the "run now" intent is silently dropped.
+    expect(
+      enqueueExecuteEpicIfAbsent(t.db, systemClock, "p1", "epic-1", { bypassBudget: true }),
+    ).toBeUndefined();
+    const job = await getJob(t.db, paced);
+    expect((JSON.parse(job!.payloadJson) as Record<string, unknown>).bypassBudget).toBe(true);
+    expect(toMs(job!.runAt)).toBeLessThanOrEqual(systemClock.now());
+    expect(job!.lastError).toBeNull();
+  });
+
+  it.each(["running", "parked", "failed"] as const)(
+    "does not promote a covering %s job on a bypassBudget take-over",
+    async (status) => {
+      const prior = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-1");
+      const before = await getJob(t.db, prior);
+      t.db.update(schema.jobs).set({ status }).where(eq(schema.jobs.id, prior)).run();
+
+      expect(
+        enqueueExecuteEpicIfAbsent(t.db, systemClock, "p1", "epic-1", { bypassBudget: true }),
+      ).toBeUndefined();
+      const after = await getJob(t.db, prior);
+      // Non-queued covering rows are left for their own lifecycle (running settles; parked resumes).
+      expect(after!.payloadJson).toBe(before!.payloadJson);
+      expect(toMs(after!.runAt)).toBe(toMs(before!.runAt));
+    },
+  );
+
+  it("leaves a covering queued paced job untouched on a paced (non-bypass) take-over", async () => {
+    const paced = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-1");
+    const before = await getJob(t.db, paced);
+
+    expect(enqueueExecuteEpicIfAbsent(t.db, systemClock, "p1", "epic-1")).toBeUndefined();
+    const after = await getJob(t.db, paced);
+    expect(after!.payloadJson).toBe(before!.payloadJson);
+  });
 });
 
 describe("jobs_active_epic_unique (DB backstop)", () => {

@@ -319,6 +319,28 @@ export async function isBudgetAwareEnabledAnywhere(): Promise<boolean> {
   });
 }
 
+/**
+ * The resolved governor policies of every budget-aware project (anton-7mpv.1). The shaping nudge
+ * evaluates pace/headroom against these — the SAME knobs (`resolveBudgetPolicy`) the per-project
+ * governor applies — rather than a hard-coded default, so an operator who tunes `weeklyTargetPct`
+ * or `daytimeReservePct` sees the nudge agree with what the runner actually admits. Empty when no
+ * project has opted in (the nudge's hide gate); a project with unparseable settingsJson is treated
+ * as off, mirroring {@link isBudgetAwareEnabledAnywhere}.
+ */
+export async function budgetAwareProjectPolicies(): Promise<BudgetPolicy[]> {
+  const rows = await getDb().select({ settingsJson: schema.projects.settingsJson }).from(schema.projects);
+  const policies: BudgetPolicy[] = [];
+  for (const row of rows) {
+    try {
+      const settings = JSON.parse(row.settingsJson) as ProjectSettings;
+      if (settings.budgetAware === true) policies.push(resolveBudgetPolicy(settings));
+    } catch {
+      // unparseable settings → not budget-aware; skip
+    }
+  }
+  return policies;
+}
+
 /** Merge a settings patch into the project's settingsJson. Returns the merged settings. */
 export async function updateProjectSettings(
   slug: string,
