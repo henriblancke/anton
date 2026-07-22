@@ -11,7 +11,7 @@
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import { jsonRequest } from "@/lib/testing/integration";
-import { actAs, ctx, setupApproveSuite, type ApproveSuiteCtx } from "../approve.fixture";
+import { actAs, ctx, executeEpicJobs, setupApproveSuite, type ApproveSuiteCtx } from "../approve.fixture";
 import { describeBd } from "@/lib/testing/integration";
 
 let fileDb: ApproveSuiteCtx["fileDb"];
@@ -78,6 +78,26 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     expect(res.status).toBe(200);
     expect((await res.json()).jobId).toBeTruthy();
     expect(beads.isApproved(await beads.show(repo, bug))).toBe(true);
+  });
+
+  it("defaults a bodyless approval to an immediate run; pacing is opt-in via immediate:false", async () => {
+    // Bodyless callers (the ticket dialog's "Approve & run"/"Force run") predate the run-directly
+    // flag (anton-d8i4) and promise an immediate run — a missing body must not silently become a
+    // paced queue request on a budget-aware project. Only an explicit `immediate: false` opts in.
+    const bodyless = await beads.create(repo, { title: "Bodyless-immediate bug", type: "bug" });
+    const paced = await beads.create(repo, { title: "Opt-in paced bug", type: "bug" });
+
+    expect((await POST(jsonRequest("POST"), ctx("approvy", bodyless))).status).toBe(200);
+    expect((await POST(jsonRequest("POST", { immediate: false }), ctx("approvy", paced))).status).toBe(200);
+
+    const payloadOf = async (id: string) => {
+      const jobs = await executeEpicJobs(id);
+      expect(jobs).toHaveLength(1);
+      return JSON.parse(jobs[0].payloadJson ?? "{}") as { bypassBudget?: boolean };
+    };
+    expect((await payloadOf(bodyless)).bypassBudget).toBe(true);
+    // `bypassBudget` is written only when true, so a paced enqueue carries no flag at all.
+    expect((await payloadOf(paced)).bypassBudget).toBeUndefined();
   });
 
   it("returns the post-write approved + assignee in the 200 body, not the retained pre-write snapshot", async () => {

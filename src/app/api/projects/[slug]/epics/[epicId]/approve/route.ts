@@ -14,17 +14,20 @@ export const dynamic = "force-dynamic";
 
 /**
  * Read the optional approval body. `steal` takes over a teammate's reservation (unchanged); `immediate`
- * is the run-directly choice (anton-d8i4): true → bypass the budget governor's weekly/daytime pacing
- * (the session-headroom floor still applies), false/absent → queue for optimal usage (paced). A
- * missing/invalid body means neither — no steal, and paced (the governed default). Only meaningful on
- * a project with `budgetAware` on; on others the governor never runs, so both choices execute now.
+ * is the run-directly choice (anton-d8i4): only an explicit `immediate: false` queues for optimal usage
+ * (paced by the budget governor) — anything else, including a missing/invalid body, runs now (bypass
+ * the governor's weekly/daytime pacing; the session-headroom floor still applies). Immediate is the
+ * default because approval predates the flag as the run trigger: bodyless callers (e.g. the ticket
+ * dialog's "Approve & run"/"Force run") promise an immediate run, so pacing is strictly opt-in. Only
+ * meaningful on a project with `budgetAware` on; on others the governor never runs, so both choices
+ * execute now.
  */
 async function readApprovalBody(request: Request): Promise<{ steal: boolean; immediate: boolean }> {
   try {
     const body = (await request.json()) as { steal?: unknown; immediate?: unknown };
-    return { steal: body?.steal === true, immediate: body?.immediate === true };
+    return { steal: body?.steal === true, immediate: body?.immediate !== false };
   } catch {
-    return { steal: false, immediate: false };
+    return { steal: false, immediate: true };
   }
 }
 
