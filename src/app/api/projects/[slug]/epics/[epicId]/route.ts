@@ -44,8 +44,14 @@ export async function PATCH(
   try {
     const detail = await updateEpic(project, epicId, parsed.patch);
     return NextResponse.json({ detail });
-  } catch {
-    return NextResponse.json({ error: "Epic not found" }, { status: 404 });
+  } catch (e) {
+    // updateEpic's 404 guard is beads.show, which throws bd's raw "no issue found matching …"; a
+    // genuinely missing epic must stay a 404, while a non-lookup failure (disk/write) surfaces as 500.
+    const msg = e instanceof Error ? e.message : "";
+    if (/not found|no issues? found/i.test(msg)) {
+      return NextResponse.json({ error: "Epic not found" }, { status: 404 });
+    }
+    return NextResponse.json({ error: "Failed to update epic" }, { status: 500 });
   }
 }
 

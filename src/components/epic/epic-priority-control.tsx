@@ -27,10 +27,20 @@ export function EpicPriorityControl({
   /** Fired after a successful save so the caller can refetch/re-sort. */
   onChanged?: () => void;
 }) {
+  // Shadow the prop so the select reflects the pick immediately; a re-render mid-save would
+  // otherwise reset a purely prop-controlled select to the old priority. Re-sync during render
+  // (not an effect) when the prop actually changes — React's "adjust state when a prop changes".
+  const [localPriority, setLocalPriority] = useState(priority);
+  const [syncedPriority, setSyncedPriority] = useState(priority);
+  if (priority !== syncedPriority) {
+    setSyncedPriority(priority);
+    setLocalPriority(priority);
+  }
   const [saving, setSaving] = useState(false);
 
   async function save(next: number) {
     if (next === priority || saving) return;
+    setLocalPriority(next);
     setSaving(true);
     try {
       const res = await fetch(`/api/projects/${slug}/epics/${epicId}`, {
@@ -47,6 +57,7 @@ export function EpicPriorityControl({
       toast.success(`Priority set to ${PRIORITY_LABELS[next]}`);
       onChanged?.();
     } catch (err) {
+      setLocalPriority(priority);
       toast.error(err instanceof Error ? err.message : "Save failed");
     } finally {
       setSaving(false);
@@ -63,7 +74,7 @@ export function EpicPriorityControl({
         )}
       >
         <select
-          value={String(priority)}
+          value={String(localPriority)}
           onChange={(e) => save(Number(e.target.value))}
           disabled={disabled || saving}
           aria-label="Priority"
