@@ -15,7 +15,8 @@ export const dynamic = "force-dynamic";
  * nudge hides. This is a workspace-wide glance, so the pace-line uses the global default policy —
  * with every operator-facing knob overridden from `DEFAULT_PROJECT_BUDGET_POLICY`, so the nudge
  * admits/defers at the same thresholds (pace target, daytime reserve, day window, session floor)
- * the per-project governor (`resolveBudgetPolicy`) actually applies. Without that the nudge would
+ * — and against the same local clock (`utcOffsetMinutes`) — that the per-project governor
+ * (`resolveBudgetPolicy`) actually applies. Without that the nudge would
  * suppress itself (40% reserve, 08–22 day window) exactly when the 15%-reserve governor is
  * admitting work — "quota idle but backlog thin" failing to fire when it matters most.
  *
@@ -40,6 +41,9 @@ export async function GET() {
     dayStartHour: DEFAULT_PROJECT_BUDGET_POLICY.dayWindow[0],
     dayEndHour: DEFAULT_PROJECT_BUDGET_POLICY.dayWindow[1],
     minSessionHeadroomPct: DEFAULT_PROJECT_BUDGET_POLICY.minSessionHeadroomPct,
+    // dayWindow is LOCAL hours — same negation resolveBudgetPolicy applies, so the nudge reads the
+    // day window on the operator's clock, not UTC (the global default's 0 offset).
+    utcOffsetMinutes: -new Date().getTimezoneOffset(),
   };
   const behindPace = isBehindPace(usage, policy, now);
   const headroomAvailable = budgetGate(usage, policy, now).admit;

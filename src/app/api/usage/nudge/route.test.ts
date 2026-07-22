@@ -104,6 +104,25 @@ describe("GET /api/usage/nudge", () => {
     expect(signal.headroomAvailable).toBe(true);
   });
 
+  it("evaluates the day window on the operator's local clock, not UTC", async () => {
+    // UTC noon = 20:00 local at UTC+8 (getTimezoneOffset −480): night for the governor's local
+    // dayWindow [9,18), but mid-day in UTC. sessionPct 90 trips the 15% daytime reserve, so a
+    // UTC-evaluated nudge would report no headroom while the governor is admitting night work.
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-01-07T12:00:00Z"));
+    const tzSpy = vi.spyOn(Date.prototype, "getTimezoneOffset").mockReturnValue(-480);
+    try {
+      getDisplayUsage.mockResolvedValueOnce(usage({ sessionPct: 90, weeklyPct: 45 }));
+
+      const res = await GET();
+      const signal = (await res.json()) as ShapingSignal;
+
+      expect(signal.headroomAvailable).toBe(true);
+    } finally {
+      nowSpy.mockRestore();
+      tzSpy.mockRestore();
+    }
+  });
+
   it("skips the ready-queue sweep when not behind pace", async () => {
     // On pace (weekly matches the elapsed half-week) → the nudge can't fire, so don't spawn bd.
     getDisplayUsage.mockResolvedValueOnce(usage({ weeklyPct: 50 }));

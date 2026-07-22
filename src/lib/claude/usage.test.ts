@@ -206,7 +206,26 @@ describe("getClaudeUsageFresh (TTL-bypassing read for the burn sampler)", () => 
     expect(await getClaudeUsageCached(async () => snapshot(99), now)).toEqual(snapshot(30));
   });
 
-  it("joins an in-flight fetch rather than doubling the upstream request", async () => {
+  it("never serves a fetch that was already in flight when called (stale pre-job read)", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    // The pill's cached read starts mid-job and is still in flight when the job closes…
+    const preJob = getClaudeUsageCached(async () => {
+      await gate;
+      return snapshot(10);
+    }, () => 1_000);
+    // …so the sampler's post-job read must NOT join it: that snapshot predates the job's burn and
+    // would record a zero/undercounted delta.
+    const postJob = getClaudeUsageFresh(async () => snapshot(50), () => 1_001);
+    release();
+
+    expect(await preJob).toEqual(snapshot(10));
+    expect(await postJob).toEqual(snapshot(50)); // its own upstream read, not the stale join
+  });
+
+  it("waits out an in-flight fetch (no parallel upstream request) before taking its own read", async () => {
     let calls = 0;
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
@@ -214,18 +233,19 @@ describe("getClaudeUsageFresh (TTL-bypassing read for the burn sampler)", () => 
     });
     const fetcher = async () => {
       calls += 1;
-      await gate;
-      return snapshot(20);
+      if (calls === 1) await gate; // hold only the first fetch open
+      return snapshot(calls * 20);
     };
     const now = () => 1_000;
 
     const first = getClaudeUsageFresh(fetcher, now);
     const second = getClaudeUsageFresh(fetcher, now);
+    expect(calls).toBe(1); // the second caller is waiting on the first, not racing it upstream
     release();
 
     expect(await first).toEqual(snapshot(20));
-    expect(await second).toEqual(snapshot(20));
-    expect(calls).toBe(1);
+    expect(await second).toEqual(snapshot(40)); // re-fetched after the first settled
+    expect(calls).toBe(2);
   });
 });
 
