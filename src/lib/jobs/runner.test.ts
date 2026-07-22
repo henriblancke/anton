@@ -1470,6 +1470,34 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     expect(runAtBefore).toBeLessThanOrEqual(clock.now()); // was due; governor never pushed it out
   });
 
+  it("resumes prior budget deferrals on a null usage read — fail-open admits already-deferred work", async () => {
+    // A governed tick defers the queued job past the session horizon; then the meter goes dark
+    // (429 backoff, credentials hiccup, usage outage). leaseDue only scans due rows, so returning
+    // on the null read without resuming the governor's own deferrals would strand the job until
+    // the stale pace boundary — fail-open must pull it back to due-now and lease it.
+    await seedProjects("A");
+    let meterUp = true;
+    let ran = 0;
+    const r = budgetRunner(
+      async () => {
+        ran += 1;
+      },
+      { readUsage: async () => (meterUp ? usage({ sessionPct: 99 }) : null) },
+    );
+    const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
+
+    expect(await r.tickOnce()).toBe(0); // governed → deferred to the session horizon
+    const deferred = await getJob(tdb.db, id);
+    expect(toMs(deferred?.runAt)).toBeGreaterThan(clock.now());
+    expect(deferred?.lastError).toMatch(/budget: session-headroom/);
+
+    meterUp = false; // meter goes dark
+    expect(await r.tickOnce()).toBe(1); // stale deferral resumed → leases this tick
+    await r.whenIdle();
+    expect(ran).toBe(1);
+    expect((await getJob(tdb.db, id))?.status).toBe("done");
+  });
+
   it("keeps the reactive UsageLimitError backstop working with the governor wired", async () => {
     // Governor admits (session fresh), but the handler still hits the wall mid-run: the reactive
     // path must reschedule to the reset and refund the attempt, exactly as without the governor.

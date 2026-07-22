@@ -603,8 +603,9 @@ export class JobRunner {
    * When the coarse gate ADMITS a project, the per-job value/cost gate (anton-k05r) still runs over
    * its queued governed jobs and collects the ones not worth the remaining budget into
    * `valueHeldJobIds` — see {@link applyValueGate}.
-   * Only runs when a budget-policy resolver is injected. Fails OPEN: a null usage read defers nothing
-   * (a missing meter must never starve the queue), mirroring `budgetGate`'s own contract.
+   * Only runs when a budget-policy resolver is injected. Fails OPEN: a null usage read defers
+   * nothing AND resumes any deferrals a prior governed tick wrote (a missing meter must never
+   * starve the queue — not even via a stale pace boundary), mirroring `budgetGate`'s own contract.
    */
   private async applyBudgetGovernor(
     heldBucketKeys: Set<string>,
@@ -644,7 +645,20 @@ export class JobRunner {
     if (governed.length === 0) return; // no project is budget-aware → never read usage
 
     const usage = await this.readUsageSafe();
-    if (!usage) return; // fail open — a broken/absent meter never holds work
+    if (!usage) {
+      // Fail open — a broken/absent meter never holds work. That must include work a PRIOR
+      // governed tick already pushed to a future runAt: leaseDue only scans due rows, so without
+      // pulling those deferrals back a 429 backoff / credentials hiccup / meter outage would
+      // strand governed jobs until the stale pace boundary — possibly hours or the weekly reset.
+      // Same marker-scoped resume as the pacing-off path above.
+      for (const { pid } of governed) {
+        await resumeBudgetDeferredJobs(this.db, this.clock, {
+          types: GOVERNED_JOB_TYPES,
+          projectId: pid,
+        });
+      }
+      return;
+    }
 
     const now = this.clock.now();
     for (const { pid, policy } of governed) {
