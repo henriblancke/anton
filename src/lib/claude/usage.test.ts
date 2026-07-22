@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  armBackoffForTest,
   getClaudeUsageCached,
   getClaudeUsageFresh,
   getDisplayUsage,
   LAST_GOOD_TTL_MS,
+  parseRetryAfterMs,
   parseUsage,
   resetUsageCache,
   usageEnabled,
@@ -246,6 +248,78 @@ describe("getClaudeUsageFresh (TTL-bypassing read for the burn sampler)", () => 
     expect(await first).toEqual(snapshot(20));
     expect(await second).toEqual(snapshot(40)); // re-fetched after the first settled
     expect(calls).toBe(2);
+  });
+});
+
+describe("parseRetryAfterMs", () => {
+  it("reads delta-seconds", () => {
+    expect(parseRetryAfterMs("30")).toBe(30_000);
+    expect(parseRetryAfterMs("0")).toBe(0);
+  });
+
+  it("reads an HTTP-date relative to now", () => {
+    const now = () => Date.parse("2026-07-22T00:00:00Z");
+    expect(parseRetryAfterMs("Wed, 22 Jul 2026 00:00:45 GMT", now)).toBe(45_000);
+  });
+
+  it("returns null for a missing or unparseable header (caller uses its default)", () => {
+    expect(parseRetryAfterMs(null)).toBeNull();
+    expect(parseRetryAfterMs("not-a-date")).toBeNull();
+  });
+});
+
+describe("429 backoff (shared across all readers)", () => {
+  afterEach(() => {
+    resetUsageCache();
+  });
+
+  const snapshot: ClaudeUsage = {
+    sessionPct: 20,
+    weeklyPct: 8,
+    sessionResetAt: null,
+    weeklyResetAt: null,
+    plan: "max",
+  };
+
+  it("pauses the fresh (sampler) path after a 429 until the window elapses", async () => {
+    let clock = 1_000;
+    const now = () => clock;
+    let calls = 0;
+    const live = async () => {
+      calls += 1;
+      return snapshot;
+    };
+
+    // Prime a good value, then simulate a 429 arming a 60s backoff (as fetchClaudeUsage does).
+    await getClaudeUsageFresh(live, now);
+    expect(calls).toBe(1);
+    armBackoffForTest(clock + 60_000);
+
+    // A solo job completing 5s later must NOT go upstream — it serves the cached value instead.
+    clock += 5_000;
+    expect(await getClaudeUsageFresh(live, now)).toEqual(snapshot);
+    expect(calls).toBe(1); // no new upstream request during backoff
+
+    // Once the window passes, the sampler reads live again.
+    clock += 60_000;
+    await getClaudeUsageFresh(live, now);
+    expect(calls).toBe(2);
+  });
+
+  it("pauses the cached (pill/governor) path too, serving the last cached value", async () => {
+    let clock = 1_000;
+    const now = () => clock;
+    let calls = 0;
+    const live = async () => {
+      calls += 1;
+      return snapshot;
+    };
+
+    await getClaudeUsageCached(live, now); // warm the cache
+    armBackoffForTest(clock + 5 * USAGE_CACHE_TTL_MS);
+    clock += USAGE_CACHE_TTL_MS + 1; // TTL elapsed, but backoff still active
+    expect(await getClaudeUsageCached(live, now)).toEqual(snapshot); // cached value, no new fetch
+    expect(calls).toBe(1);
   });
 });
 

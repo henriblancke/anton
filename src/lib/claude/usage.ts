@@ -35,6 +35,32 @@ const FETCH_TIMEOUT_MS = 5_000;
 /** Short server-side cache TTL: collapse many page loads into one upstream fetch. */
 export const USAGE_CACHE_TTL_MS = 60_000;
 
+/** Cool-off applied on a 429 that arrives without a usable `Retry-After` header. */
+export const DEFAULT_BACKOFF_MS = 60_000;
+
+/**
+ * Epoch-ms instant before which upstream must not be touched, armed when Anthropic returns 429 and
+ * honored by *every* reader — the pill, the nudge, the governor, and the TTL-bypassing burn sampler
+ * alike. The sampler ({@link getClaudeUsageFresh}) deliberately skips the cache, so without a shared
+ * throttle a burst of quick solo jobs re-hits a rate-limited endpoint on every completion and earns
+ * a fresh 429 each time. One 429 now quiets all paths until the window Anthropic asked for elapses;
+ * the last cached/last-good value backs the display meanwhile. Reset by {@link resetUsageCache}.
+ */
+let backoffUntil = 0;
+
+/**
+ * Parse a `Retry-After` header into milliseconds. The spec allows either delta-seconds or an
+ * HTTP-date; honor both, and fall back to `null` (caller applies {@link DEFAULT_BACKOFF_MS}) for a
+ * missing or unusable value.
+ */
+export function parseRetryAfterMs(header: string | null, now: () => number = Date.now): number | null {
+  if (!header) return null;
+  const secs = Number(header);
+  if (Number.isFinite(secs)) return Math.max(0, secs * 1000);
+  const at = Date.parse(header);
+  return Number.isNaN(at) ? null : Math.max(0, at - now());
+}
+
 /** Normalized usage snapshot the pill consumes. `null` when a limit is absent for the tier. */
 export interface ClaudeUsage {
   /** Current 5-hour session utilization, 0–100 percent. */
@@ -186,9 +212,16 @@ export async function fetchClaudeUsage(): Promise<ClaudeUsage | null> {
       console.warn("[usage] upstream 204 (no content) — token scope/account, not a transient blip");
       return null;
     }
+    if (res.status === 429) {
+      // Being throttled — arm the shared backoff so every reader (including the sampler) stops
+      // hitting the endpoint until the window Anthropic asked for elapses. Honors Retry-After.
+      const waitMs = parseRetryAfterMs(res.headers.get("retry-after")) ?? DEFAULT_BACKOFF_MS;
+      backoffUntil = Date.now() + waitMs;
+      console.warn(`[usage] upstream 429 — backing off ${Math.round(waitMs / 1000)}s (all readers paused)`);
+      return null;
+    }
     if (!res.ok) {
-      // 401 → expired token (the CLI owns rotation; we intentionally don't refresh). 429 → we're
-      // being throttled, which points at the burn sampler's TTL-bypassing reads.
+      // 401 → expired token (the CLI owns rotation; we intentionally don't refresh).
       console.warn(`[usage] upstream ${res.status} — hiding pill (fail soft, no token refresh)`);
       return null;
     }
@@ -238,6 +271,8 @@ export async function getClaudeUsageCached(
   now: () => number = Date.now,
 ): Promise<ClaudeUsage | null> {
   const ts = now();
+  // Throttled by a recent 429 — serve whatever we last had rather than hit a rate-limited endpoint.
+  if (ts < backoffUntil) return usageCache?.value ?? null;
   if (usageCache && ts - usageCache.at < USAGE_CACHE_TTL_MS) return usageCache.value;
   // Join the fetch already running for this TTL window rather than starting a second one.
   if (usageInFlight) return usageInFlight;
@@ -270,6 +305,9 @@ export async function getClaudeUsageFresh(
   fetcher: () => Promise<ClaudeUsage | null> = fetchClaudeUsage,
   now: () => number = Date.now,
 ): Promise<ClaudeUsage | null> {
+  // Honor the shared 429 backoff even here: the sampler bypasses the TTL, so if it kept firing while
+  // throttled it would re-earn a 429 on every solo job. Serve the last cached value; skip a sample.
+  if (now() < backoffUntil) return usageCache?.value ?? null;
   const stale = usageInFlight;
   if (stale) {
     // Wait it out (never double the upstream request), then take our own post-job read. Any fetch
@@ -315,4 +353,10 @@ export function resetUsageCache(): void {
   usageCache = null;
   usageInFlight = null;
   lastGoodUsage = null;
+  backoffUntil = 0;
+}
+
+/** Arm the shared 429 backoff to expire at `until` (epoch ms on the caller's clock). Test-only. */
+export function armBackoffForTest(until: number): void {
+  backoffUntil = until;
 }
