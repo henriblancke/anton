@@ -1009,6 +1009,10 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     plan: "max",
   });
 
+  // Burn sampling is gated behind the budget-aware opt-in (anton-7mpv.1) — these tests wire a
+  // resolver that opts every project in; the feature-off tests below omit it.
+  const budgetAware: BudgetPolicyResolver = () => DEFAULT_BUDGET_POLICY;
+
   it("persists the session%/weekly% delta across a job, attributed to its type", async () => {
     // Pre-job snapshot via the cached read, post-job via the FRESH (TTL-bypassing) read:
     // 10%→30% session, 5%→8% weekly.
@@ -1016,6 +1020,7 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
       db: tdb.db,
       clock,
       config: CONFIG,
+      resolveBudgetPolicy: budgetAware,
       readUsage: async () => usage(10, 5),
       readUsageFresh: async () => usage(30, 8),
     });
@@ -1038,6 +1043,7 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
       db: tdb.db,
       clock,
       config: CONFIG,
+      resolveBudgetPolicy: budgetAware,
       readUsage: async () => usage(10, 5), // the stale cache entry, before AND after
       readUsageFresh: async () => {
         freshCalls += 1;
@@ -1059,6 +1065,7 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
       db: tdb.db,
       clock,
       config: CONFIG,
+      resolveBudgetPolicy: budgetAware,
       readUsage: async () => null,
       readUsageFresh: async () => null,
     });
@@ -1080,6 +1087,7 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
       db: tdb.db,
       clock,
       config: CONFIG,
+      resolveBudgetPolicy: budgetAware,
       readUsage: boom,
       readUsageFresh: boom,
     });
@@ -1101,6 +1109,7 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
       db: tdb.db,
       clock,
       config: { ...CONFIG, maxConcurrent: 2 },
+      resolveBudgetPolicy: budgetAware,
       readUsage: async () => usage(10, 5),
       readUsageFresh: async () => {
         reads += 1;
@@ -1122,6 +1131,61 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     await r.tickOnce();
     await r.whenIdle();
     expect(await tdb.db.select().from(schema.burnSamples)).toHaveLength(1);
+  });
+
+  it("never reads usage when the project is not budget-aware (null policy — the feature-off default)", async () => {
+    // The opt-in gate (anton-7mpv.1): a resolver that returns null means budget-aware execution is
+    // off for the project, so a solo job must not open a burn window — neither the pre-job cached
+    // read nor the post-job fresh read may fire (each shells out to credentials and can cache a
+    // transient null into the shared cache the nav pill reads).
+    let cachedReads = 0;
+    let freshReads = 0;
+    const r = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: CONFIG,
+      resolveBudgetPolicy: () => null,
+      readUsage: async () => {
+        cachedReads += 1;
+        return usage(10, 5);
+      },
+      readUsageFresh: async () => {
+        freshReads += 1;
+        return usage(30, 8);
+      },
+    });
+    r.registerHandler("execute-epic", async () => {});
+    const id = await r.enqueue({ type: "execute-epic" });
+    await r.tickOnce();
+    await r.whenIdle();
+
+    expect((await getJob(tdb.db, id))?.status).toBe("done");
+    expect(cachedReads).toBe(0);
+    expect(freshReads).toBe(0);
+    expect(await tdb.db.select().from(schema.burnSamples)).toHaveLength(0);
+  });
+
+  it("never reads usage when no budget resolver is wired at all", async () => {
+    // Without a resolveBudgetPolicy dep nothing can be budget-aware, so the sampler stays fully off.
+    let reads = 0;
+    const count = async () => {
+      reads += 1;
+      return usage(10, 5);
+    };
+    const r = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: CONFIG,
+      readUsage: count,
+      readUsageFresh: count,
+    });
+    r.registerHandler("execute-epic", async () => {});
+    await r.enqueue({ type: "execute-epic" });
+    await r.tickOnce();
+    await r.whenIdle();
+
+    expect(reads).toBe(0);
+    expect(await tdb.db.select().from(schema.burnSamples)).toHaveLength(0);
   });
 });
 

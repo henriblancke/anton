@@ -9,7 +9,9 @@
  * every recorded delta is unambiguously one job's cost. The closing read bypasses the usage cache
  * (see getClaudeUsageFresh): a cached read would subtract a cache entry from itself for any job
  * finishing inside the TTL and record a bogus zero. Reads are fail-soft — a missing/reset meter
- * records NO sample and never touches the job.
+ * records NO sample and never touches the job. Sampling is gated behind the project's budget-aware
+ * opt-in (anton-7mpv.1): burn data only feeds budget pacing, so in the default feature-off state the
+ * runner takes no usage reads on the sampler's behalf.
  *
  * `getBurnAverage` returns a rolling average over the most recent {@link BURN_SAMPLE_WINDOW} samples
  * for a type; until that many real samples accrue it blends the samples it has with a static per-tier

@@ -638,8 +638,17 @@ export class JobRunner {
     // double-count across types — so only open a window when nothing else is in flight; a sibling
     // dispatched mid-window is caught at close via `dispatchSeq`. Fail-soft — a null read just
     // means no sample; it never gates dispatch.
+    //
+    // Gated behind the project's budget-aware opt-in (anton-7mpv.1), like the governor: burn data
+    // only feeds budget pacing, so in the default feature-off state the sampler must not shell out
+    // to credentials / hit the usage endpoint before every solo job — nor cache a transient null
+    // into the shared cache the nav pill reads. A closed gate leaves `burnBefore` null, which also
+    // suppresses the post-job fresh read.
     const seqAtStart = ++this.dispatchSeq;
-    const burnBefore = this.inFlight.size === 1 ? await this.readUsageSafe() : null;
+    const burnBefore =
+      this.inFlight.size === 1 && (await this.budgetAwareFor(job.projectId ?? undefined))
+        ? await this.readUsageSafe()
+        : null;
 
     try {
       const policy = await this.policyFor(job.projectId ?? undefined);
@@ -706,6 +715,20 @@ export class JobRunner {
         );
       }
       this.inFlight.delete(job.id);
+    }
+  }
+
+  /**
+   * Has this job's project opted into budget-aware execution (anton-7mpv.1)? The same non-null-policy
+   * signal the governor keys on — a cheap settings read, never the usage endpoint. Fail-soft: no
+   * resolver wired, or a resolver error, reads as "not budget-aware" (skip the burn sample).
+   */
+  private async budgetAwareFor(projectId: string | undefined): Promise<boolean> {
+    if (!this.resolveBudgetPolicy) return false;
+    try {
+      return (await this.resolveBudgetPolicy(projectId)) !== null;
+    } catch {
+      return false;
     }
   }
 
