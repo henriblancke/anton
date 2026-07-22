@@ -591,7 +591,18 @@ export async function reschedule(
     // follow-up already holds the project's slot); it supersedes this retry, so discharge this job
     // cleanly instead of surfacing the violation on the settle path. Any other type's violation is
     // unexpected — re-throw it rather than mask a real problem as a silent `done`.
-    if (isUniqueViolation(e) && (await getJob(db, jobId))?.type === "sync-push") {
+    // Guard the type lookup: if it throws (transient DB error), fall through to re-throw the
+    // original violation rather than escaping with the lookup error and leaving the job `running`
+    // until lease expiry (which would skip a backoff step via the reclaimer's re-increment).
+    let jobType: string | undefined;
+    if (isUniqueViolation(e)) {
+      try {
+        jobType = (await getJob(db, jobId))?.type;
+      } catch {
+        /* db error — fall through to throw e */
+      }
+    }
+    if (jobType === "sync-push") {
       await db
         .update(schema.jobs)
         .set({

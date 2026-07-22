@@ -73,8 +73,10 @@ export type InspectRun = (
   cwd: string,
 ) => { status: number | null; stdout?: string; stderr?: string; error?: unknown };
 
+// timeout: a hung inspect (e.g. a Dolt DB lock) must not block boot — the kill surfaces as
+// r.error/non-zero status, which the caller already treats as fail-open (anton-x7la review).
 const defaultInspectRun: InspectRun = (bin, cwd) =>
-  spawnSync(bin, ["migrate", "--inspect"], { cwd, encoding: "utf8" });
+  spawnSync(bin, ["migrate", "--inspect"], { cwd, encoding: "utf8", timeout: 10_000 });
 
 /**
  * Parse the DB schema version from `bd migrate --inspect` output — the `Schema Version: X.Y.Z` line.
