@@ -221,7 +221,13 @@ export const budgetPolicySchema = z
         message: "dayWindow start hour must be before end hour",
       }),
     daytimeReservePct: pctSchema,
-    weeklyTargetPct: pctSchema,
+    // Zero is rejected for the weekly target specifically: `computePace` treats a target <= 0 as
+    // "no pace data", so 0 would silently DISABLE weekly pacing rather than target zero usage.
+    weeklyTargetPct: z
+      .number()
+      .int()
+      .min(1, { message: "weeklyTargetPct must be at least 1 (0 would disable pacing, not stop work)" })
+      .max(100),
     minSessionHeadroomPct: pctSchema,
     preferNightForHeavy: z.boolean(),
   })
@@ -318,6 +324,10 @@ export async function updateProjectSettings(
   const next: ProjectSettings = { ...current };
   for (const [k, v] of Object.entries(patch)) {
     if (v === undefined || v === "") delete (next as Record<string, unknown>)[k];
+    // budgetPolicy is a partial-by-design nested object: merge the patched knobs into the stored
+    // policy so an update carrying only e.g. `weeklyTargetPct` can't silently wipe `dayWindow` or
+    // any other knob the UI/API didn't send. Clearing the whole policy stays `undefined` above.
+    else if (k === "budgetPolicy") next.budgetPolicy = { ...current.budgetPolicy, ...(v as object) };
     else (next as Record<string, unknown>)[k] = v;
   }
   await db

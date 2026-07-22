@@ -1010,14 +1010,14 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
   });
 
   it("persists the session%/weekly% delta across a job, attributed to its type", async () => {
-    // readUsage is called before dispatch, then again after settle: 10%→30% session, 5%→8% weekly.
-    const reads = [usage(10, 5), usage(30, 8)];
-    let i = 0;
+    // Pre-job snapshot via the cached read, post-job via the FRESH (TTL-bypassing) read:
+    // 10%→30% session, 5%→8% weekly.
     const r = new JobRunner({
       db: tdb.db,
       clock,
       config: CONFIG,
-      readUsage: async () => reads[i++] ?? null,
+      readUsage: async () => usage(10, 5),
+      readUsageFresh: async () => usage(30, 8),
     });
     r.registerHandler("execute-epic", async () => {});
     await r.enqueue({ type: "execute-epic" });
@@ -1030,8 +1030,38 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     expect(avg.weeklyAvg).toBe(3);
   });
 
+  it("closes the window with the fresh read, never the cached one (anti zero-delta)", async () => {
+    // A cached after-read inside the TTL returns the same snapshot as the before-read → a bogus
+    // 0% delta. The sampler must go through the fresh reader for the closing measurement.
+    let freshCalls = 0;
+    const r = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: CONFIG,
+      readUsage: async () => usage(10, 5), // the stale cache entry, before AND after
+      readUsageFresh: async () => {
+        freshCalls += 1;
+        return usage(25, 7);
+      },
+    });
+    r.registerHandler("execute-epic", async () => {});
+    await r.enqueue({ type: "execute-epic" });
+    await r.tickOnce();
+    await r.whenIdle();
+
+    expect(freshCalls).toBe(1);
+    const avg = await getBurnAverage(tdb.db, "execute-epic", 1);
+    expect(avg.sessionAvg).toBe(15); // 25 − 10, not the cached self-subtraction's 0
+  });
+
   it("records NO sample on a null usage read and still completes the job", async () => {
-    const r = new JobRunner({ db: tdb.db, clock, config: CONFIG, readUsage: async () => null });
+    const r = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: CONFIG,
+      readUsage: async () => null,
+      readUsageFresh: async () => null,
+    });
     r.registerHandler("execute-epic", async () => {});
     const id = await r.enqueue({ type: "execute-epic" });
     await r.tickOnce();
@@ -1043,13 +1073,15 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
   });
 
   it("never fails a job when the usage read throws", async () => {
+    const boom = async (): Promise<ClaudeUsage | null> => {
+      throw new Error("usage endpoint down");
+    };
     const r = new JobRunner({
       db: tdb.db,
       clock,
       config: CONFIG,
-      readUsage: async () => {
-        throw new Error("usage endpoint down");
-      },
+      readUsage: boom,
+      readUsageFresh: boom,
     });
     r.registerHandler("execute-epic", async () => {});
     const id = await r.enqueue({ type: "execute-epic" });
@@ -1059,6 +1091,37 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     expect((await getJob(tdb.db, id))?.status).toBe("done");
     const rows = await tdb.db.select().from(schema.burnSamples);
     expect(rows).toHaveLength(0);
+  });
+
+  it("records NO samples for jobs whose windows overlap (attribution needs a solo window)", async () => {
+    // Two jobs in flight at once: each window would include the sibling's burn, double-counting
+    // across types. Neither may record a sample; a later solo job samples normally again.
+    let reads = 0;
+    const r = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { ...CONFIG, maxConcurrent: 2 },
+      readUsage: async () => usage(10, 5),
+      readUsageFresh: async () => {
+        reads += 1;
+        return usage(30, 8);
+      },
+    });
+    r.registerHandler("execute-epic", async () => {});
+    r.registerHandler("review-fix", async () => {});
+    await r.enqueue({ type: "execute-epic" });
+    await r.enqueue({ type: "review-fix" });
+    expect(await r.tickOnce()).toBe(2); // both leased into the same tick → overlapping windows
+    await r.whenIdle();
+
+    expect(reads).toBe(0); // contaminated windows never even take the closing read
+    expect(await tdb.db.select().from(schema.burnSamples)).toHaveLength(0);
+
+    // Solo follow-up job still samples.
+    await r.enqueue({ type: "execute-epic" });
+    await r.tickOnce();
+    await r.whenIdle();
+    expect(await tdb.db.select().from(schema.burnSamples)).toHaveLength(1);
   });
 });
 
@@ -1103,6 +1166,8 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
       clock,
       config: { ...CONFIG, maxConcurrent: 5 },
       readUsage: opts.readUsage,
+      // Keep the burn sampler off the real endpoint — these tests exercise the governor only.
+      readUsageFresh: async () => null,
       resolveBudgetPolicy: opts.resolveBudgetPolicy ?? (() => opts.policy ?? DEFAULT_BUDGET_POLICY),
     });
     for (const type of ["execute-epic", "review-fix", "nightly-stringer", "orphan-grooming"] as const) {

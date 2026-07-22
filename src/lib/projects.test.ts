@@ -218,6 +218,14 @@ describe("budget policy (anton-egrg)", () => {
     expect(budgetPolicySchema.safeParse({ minSessionHeadroomPct: 3.5 }).success).toBe(false);
   });
 
+  it("rejects a zero weekly target — 0 would disable pacing, not target zero usage", () => {
+    expect(budgetPolicySchema.safeParse({ weeklyTargetPct: 0 }).success).toBe(false);
+    expect(budgetPolicySchema.safeParse({ weeklyTargetPct: 1 }).success).toBe(true);
+    // Zero stays valid where it means "no reserve/floor", which IS a coherent setting.
+    expect(budgetPolicySchema.safeParse({ daytimeReservePct: 0 }).success).toBe(true);
+    expect(budgetPolicySchema.safeParse({ minSessionHeadroomPct: 0 }).success).toBe(true);
+  });
+
   it("rejects a day window whose start is not before its end", () => {
     expect(budgetPolicySchema.safeParse({ dayWindow: [18, 9] }).success).toBe(false);
     expect(budgetPolicySchema.safeParse({ dayWindow: [12, 12] }).success).toBe(false);
@@ -226,6 +234,33 @@ describe("budget policy (anton-egrg)", () => {
 
   it("rejects unknown keys so a typo can't silently persist", () => {
     expect(budgetPolicySchema.safeParse({ daytimeReserve: 15 }).success).toBe(false);
+  });
+});
+
+describe("updateProjectSettings budgetPolicy deep-merge", () => {
+  it("merges a partial patch into the stored policy instead of replacing it wholesale", async () => {
+    const created = await addProject({ name: "Budget Merge", repoPath: makeRepoDir("budget-merge") });
+    await updateProjectSettings(created.slug, {
+      budgetPolicy: { dayWindow: [7, 20], minSessionHeadroomPct: 10, preferNightForHeavy: false },
+    });
+    // A save exposing only the two UI knobs must not wipe the API-set knobs above.
+    const settings = await updateProjectSettings(created.slug, {
+      budgetPolicy: { daytimeReservePct: 25, weeklyTargetPct: 80 },
+    });
+    expect(settings.budgetPolicy).toEqual({
+      dayWindow: [7, 20],
+      minSessionHeadroomPct: 10,
+      preferNightForHeavy: false,
+      daytimeReservePct: 25,
+      weeklyTargetPct: 80,
+    });
+  });
+
+  it("still clears the whole policy on an explicit undefined (back to defaults)", async () => {
+    const created = await addProject({ name: "Budget Clear", repoPath: makeRepoDir("budget-clear") });
+    await updateProjectSettings(created.slug, { budgetPolicy: { daytimeReservePct: 25 } });
+    const settings = await updateProjectSettings(created.slug, { budgetPolicy: undefined });
+    expect(settings.budgetPolicy).toBeUndefined();
   });
 });
 

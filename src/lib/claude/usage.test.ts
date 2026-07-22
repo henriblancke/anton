@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   getClaudeUsageCached,
+  getClaudeUsageFresh,
   getDisplayUsage,
   LAST_GOOD_TTL_MS,
   parseUsage,
@@ -171,6 +172,59 @@ describe("getClaudeUsageCached", () => {
 
     expect(await first).toEqual(snapshot);
     expect(await second).toEqual(snapshot);
+    expect(calls).toBe(1);
+  });
+});
+
+describe("getClaudeUsageFresh (TTL-bypassing read for the burn sampler)", () => {
+  afterEach(() => {
+    resetUsageCache();
+  });
+
+  const snapshot = (sessionPct: number): ClaudeUsage => ({
+    sessionPct,
+    weeklyPct: 5,
+    sessionResetAt: null,
+    weeklyResetAt: null,
+    plan: "max",
+  });
+
+  it("goes upstream even when a cache entry is still inside the TTL", async () => {
+    const now = () => 1_000;
+    // Warm the cache, then verify a fresh read does NOT serve the entry back (the zero-delta trap).
+    expect(await getClaudeUsageCached(async () => snapshot(10), now)).toEqual(snapshot(10));
+    expect(await getClaudeUsageFresh(async () => snapshot(30), now)).toEqual(snapshot(30));
+  });
+
+  it("refreshes the shared cache so subsequent cached readers see the fresh value", async () => {
+    let clock = 1_000;
+    const now = () => clock;
+    await getClaudeUsageCached(async () => snapshot(10), now);
+    clock += 1;
+    await getClaudeUsageFresh(async () => snapshot(30), now);
+    // Still inside the TTL — the cached read now serves the sampler's fresher value.
+    expect(await getClaudeUsageCached(async () => snapshot(99), now)).toEqual(snapshot(30));
+  });
+
+  it("joins an in-flight fetch rather than doubling the upstream request", async () => {
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const fetcher = async () => {
+      calls += 1;
+      await gate;
+      return snapshot(20);
+    };
+    const now = () => 1_000;
+
+    const first = getClaudeUsageFresh(fetcher, now);
+    const second = getClaudeUsageFresh(fetcher, now);
+    release();
+
+    expect(await first).toEqual(snapshot(20));
+    expect(await second).toEqual(snapshot(20));
     expect(calls).toBe(1);
   });
 });

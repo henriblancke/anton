@@ -238,6 +238,33 @@ export async function getClaudeUsageCached(
 }
 
 /**
+ * TTL-bypassing usage read for the burn sampler's post-job measurement (anton-w8ny). The cached
+ * read is wrong there: a job that finishes inside {@link USAGE_CACHE_TTL_MS} would subtract a
+ * cache entry from itself and record a zero delta, biasing the rolling burn averages toward zero.
+ * This always goes upstream — but still shares the single-flight (a concurrent caller joins the
+ * live fetch rather than doubling it) and refreshes the cache + last-good snapshot, so the pill
+ * and the governor benefit from every sample the runner takes. `fetcher`/`now` are injectable for
+ * deterministic tests.
+ */
+export async function getClaudeUsageFresh(
+  fetcher: () => Promise<ClaudeUsage | null> = fetchClaudeUsage,
+  now: () => number = Date.now,
+): Promise<ClaudeUsage | null> {
+  if (usageInFlight) return usageInFlight;
+  usageInFlight = (async () => {
+    try {
+      const value = await fetcher();
+      usageCache = { at: now(), value };
+      if (value) lastGoodUsage = { at: now(), value };
+      return value;
+    } finally {
+      usageInFlight = null;
+    }
+  })();
+  return usageInFlight;
+}
+
+/**
  * Usage for the nav *display* (the pill + shaping nudge). Prefers the fresh cached read; on a
  * transient failure (a `null` result) it falls back to the last-known-good snapshot while that's
  * still recent ({@link LAST_GOOD_TTL_MS}), so a background reader's blip never darkens the pill.

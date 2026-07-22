@@ -193,7 +193,9 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
   if ("budgetPolicy" in body) {
     const raw = (body as Record<string, unknown>).budgetPolicy;
     // "" / null → clear (fall back to DEFAULT_PROJECT_BUDGET_POLICY). Otherwise validate strictly:
-    // out-of-range / unknown keys 400 (fail loud) rather than persisting a bad policy.
+    // out-of-range / unknown keys 400 (fail loud) rather than persisting a bad policy. The parsed
+    // partial is deep-merged into the stored policy by updateProjectSettings, so a patch carrying
+    // only the knobs a client exposes never wipes the ones it doesn't.
     if (raw == null || raw === "") {
       patch.budgetPolicy = undefined;
     } else {

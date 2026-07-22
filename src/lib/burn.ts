@@ -2,10 +2,14 @@
  * Per-job Claude burn sampler (anton-w8ny). Records how much subscription quota each job TYPE
  * actually burns, so pacing and prioritization can reason about cost.
  *
- * The runner samples live usage (via getClaudeUsageCached) immediately before and after each job
- * and persists the session%/weekly% delta attributed to the job's type. maxConcurrent=1 per machine
- * makes that attribution clean: nothing else ran across the window, so the whole delta is this job's
- * cost. Reads are fail-soft — a missing/reset meter records NO sample and never touches the job.
+ * The runner samples live usage immediately before and after each job and persists the
+ * session%/weekly% delta attributed to the job's type. The runner only opens a window when the job
+ * runs alone (nothing else in flight, and nothing dispatched across the window), so under
+ * concurrency > 1 overlapping jobs record NO sample rather than double-counting each other's burn —
+ * every recorded delta is unambiguously one job's cost. The closing read bypasses the usage cache
+ * (see getClaudeUsageFresh): a cached read would subtract a cache entry from itself for any job
+ * finishing inside the TTL and record a bogus zero. Reads are fail-soft — a missing/reset meter
+ * records NO sample and never touches the job.
  *
  * `getBurnAverage` returns a rolling average over the most recent {@link BURN_SAMPLE_WINDOW} samples
  * for a type; until that many real samples accrue it blends the samples it has with a static per-tier
@@ -142,7 +146,8 @@ export async function getBurnAverage(
  * nothing, and any error (a failed usage read, a DB hiccup) is swallowed so burn accounting can
  * NEVER fail a job. Returns the recorded sample, or `null` when none was.
  *
- * `read` is injected (the runner passes `getClaudeUsageCached`) so tests drive it deterministically.
+ * `read` is injected (the runner passes its TTL-bypassing fresh read) so tests drive it
+ * deterministically.
  */
 export async function sampleJobBurn(
   db: AntonDb,

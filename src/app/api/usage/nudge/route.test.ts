@@ -14,10 +14,17 @@ const isBudgetAwareEnabledAnywhere = vi.fn<() => Promise<boolean>>();
 vi.mock("@/lib/claude/usage", () => ({ getDisplayUsage }));
 vi.mock("@/lib/claude/ready-count", () => ({ getReadyCountCached }));
 // Only isBudgetAwareEnabledAnywhere is exercised here; the default policy constant the route also
-// imports from projects is a plain value, re-exported so the module resolves under the mock.
+// imports from projects is a plain value, mirrored here (matches DEFAULT_PROJECT_BUDGET_POLICY —
+// keep in sync) so the module resolves under the mock.
 vi.mock("@/lib/projects", () => ({
   isBudgetAwareEnabledAnywhere,
-  DEFAULT_PROJECT_BUDGET_POLICY: { weeklyTargetPct: 90 },
+  DEFAULT_PROJECT_BUDGET_POLICY: {
+    dayWindow: [9, 18],
+    daytimeReservePct: 15,
+    weeklyTargetPct: 90,
+    minSessionHeadroomPct: 5,
+    preferNightForHeavy: true,
+  },
 }));
 
 const { GET } = await import("./route");
@@ -82,6 +89,19 @@ describe("GET /api/usage/nudge", () => {
     expect(signal.readyCount).toBe(1);
     expect(signal.weeklyRemainingPct).toBe(80);
     expect(getReadyCountCached).toHaveBeenCalledOnce();
+  });
+
+  it("uses the governor's 15% daytime reserve, not the stricter global 40% default", async () => {
+    // On pace (weekly 45% ≈ the elapsed half-week's 90%-target line), so the daytime-reserve
+    // branch is what decides. sessionPct 70 clears the per-project reserve (100 − 15 = 85) at any
+    // hour, but would have been deferred by the global default's 40% reserve (threshold 60) during
+    // its 08–22 day window — the regime where the nudge went dark while the governor admitted work.
+    getDisplayUsage.mockResolvedValueOnce(usage({ sessionPct: 70, weeklyPct: 45 }));
+
+    const res = await GET();
+    const signal = (await res.json()) as ShapingSignal;
+
+    expect(signal.headroomAvailable).toBe(true);
   });
 
   it("skips the ready-queue sweep when not behind pace", async () => {

@@ -129,7 +129,9 @@ function elapsedWeekFraction(nowMs: number, weeklyResetAtMs: number, weekMs: num
 
 /**
  * When (epoch-ms) the pace-line rises to meet current usage, i.e. the earliest time we're no
- * longer ahead of plan. Clamped to (now, weeklyResetAt]; at the reset the week refreshes anyway.
+ * longer ahead of plan. Capped at `weeklyResetAt` — at the reset the week refreshes anyway. No
+ * lower bound is needed: the only caller runs on `aheadPace`, which guarantees the catch-up time
+ * is in the future.
  */
 function paceCatchUp(
   weeklyPct: number,

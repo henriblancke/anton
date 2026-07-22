@@ -195,6 +195,8 @@ export function SettingsView({
           autonomy,
           conventionalCommits,
           budgetAware,
+          // Only the two exposed knobs; the server deep-merges into the stored policy, so knobs
+          // set via the API (dayWindow, minSessionHeadroomPct, …) survive a save from this form.
           budgetPolicy: { daytimeReservePct, weeklyTargetPct },
         }),
       });
@@ -549,6 +551,8 @@ export function SettingsView({
                     onChange={setWeeklyTargetPct}
                     hint="utilization the pace-line aims for"
                     disabled={!budgetAware}
+                    // 0 would disable weekly pacing (no pace data), not target zero — server rejects it.
+                    min={1}
                   />
                 </div>
               </div>
@@ -678,19 +682,21 @@ function GateField({
   );
 }
 
-/** A 0–100 integer percentage knob for the budget policy (anton-egrg). Clamps on change. */
+/** A min–100 integer percentage knob for the budget policy (anton-egrg). Clamps on change. */
 function PctField({
   label,
   value,
   onChange,
   hint,
   disabled = false,
+  min = 0,
 }: {
   label: string;
   value: number;
   onChange: (value: number) => void;
   hint?: string;
   disabled?: boolean;
+  min?: number;
 }) {
   return (
     <label className="flex flex-col gap-1.5">
@@ -699,13 +705,13 @@ function PctField({
         <input
           type="number"
           step={1}
-          min={0}
+          min={min}
           max={100}
           value={value}
           disabled={disabled}
           onChange={(e) => {
             const n = Number(e.target.value);
-            onChange(Number.isFinite(n) ? Math.min(100, Math.max(0, Math.round(n))) : 0);
+            onChange(Number.isFinite(n) ? Math.min(100, Math.max(min, Math.round(n))) : min);
           }}
           aria-label={label}
           className="w-full rounded-[10px] bg-transparent px-3 py-2 pr-8 font-mono text-[12.5px] text-foreground outline-none disabled:cursor-not-allowed"
