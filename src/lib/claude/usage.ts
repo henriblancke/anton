@@ -176,10 +176,27 @@ export async function fetchClaudeUsage(): Promise<ClaudeUsage | null> {
       },
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
-    if (!res.ok) return null; // includes 401/expiry — fail soft, do not refresh
+    // Distinguish the failure modes so a persistent dark pill / 204 route is diagnosable. All still
+    // fail soft to null (never throw into a render); the log just names *why*. Volume is bounded —
+    // this runs at most once per cache TTL plus once per solo job (burn sampler), never per request.
+    if (res.status === 204) {
+      // 204 is 2xx, so res.ok is true — catch it here before res.json() throws on the empty body.
+      // Anthropic answering "no content" usually means the OAuth token lacks the usage scope or the
+      // account has nothing to report; more caching won't change it.
+      console.warn("[usage] upstream 204 (no content) — token scope/account, not a transient blip");
+      return null;
+    }
+    if (!res.ok) {
+      // 401 → expired token (the CLI owns rotation; we intentionally don't refresh). 429 → we're
+      // being throttled, which points at the burn sampler's TTL-bypassing reads.
+      console.warn(`[usage] upstream ${res.status} — hiding pill (fail soft, no token refresh)`);
+      return null;
+    }
     return parseUsage(await res.json(), oauth.subscriptionType ?? null);
-  } catch {
-    return null; // network error, timeout, or malformed JSON
+  } catch (e) {
+    // Network error, timeout (AbortSignal), or a malformed/empty body that slipped past the checks.
+    console.warn(`[usage] upstream fetch failed: ${e instanceof Error ? e.message : String(e)}`);
+    return null;
   }
 }
 
