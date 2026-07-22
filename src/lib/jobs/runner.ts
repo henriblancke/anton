@@ -32,6 +32,7 @@ import {
   reclaimRunningJobs,
   renewLease,
   reschedule,
+  resumeBudgetDeferredJobs,
   resumeJob,
   scheduleGateKey,
   systemClock,
@@ -628,7 +629,17 @@ export class JobRunner {
     const governed: Array<{ pid: string | null; policy: BudgetPolicy }> = [];
     for (const pid of projectIds) {
       const policy = await this.resolveBudgetPolicy(pid ?? undefined);
-      if (policy) governed.push({ pid, policy });
+      if (policy) {
+        governed.push({ pid, policy });
+        continue;
+      }
+      // Pacing turned OFF for this project: pull back any rows a prior governed tick pushed to a
+      // future runAt, or they'd sit parked until that stale pace boundary (leaseDue only scans due
+      // rows). Scoped to the governor's own deferrals via the `budget: ` lastError marker.
+      await resumeBudgetDeferredJobs(this.db, this.clock, {
+        types: GOVERNED_JOB_TYPES,
+        projectId: pid,
+      });
     }
     if (governed.length === 0) return; // no project is budget-aware → never read usage
 

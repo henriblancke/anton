@@ -351,10 +351,12 @@ export interface AdmitDecision {
  * a broken meter must never starve the queue.
  *
  * The threshold moves with the budget's scarcity:
- *   • scarce   (ahead-of-pace OR session headroom ≤ scarceHeadroomPct)   → high-value only
- *   • abundant (behind-pace OR session headroom ≥ abundantHeadroomPct)   → admit down to cleanup
- *   • on-pace  (neither)                                                 → the normal bar
- * Scarce wins ties: being ahead of plan holds the line even if the session looks fresh.
+ *   • scarce   (ahead-of-pace in the throttle band OR headroom ≤ scarceHeadroomPct) → high-value only
+ *   • abundant (behind-pace OR session headroom ≥ abundantHeadroomPct)             → admit down to cleanup
+ *   • on-pace  (neither)                                                           → the normal bar
+ * Scarce wins ties: being ahead of plan holds the line even if the session looks fresh. Ahead-of-pace
+ * only reads as scarce inside the throttle band — below it `budgetGate` runs freely (idle-fill,
+ * anton-ld7j), and the value bar must not quietly tighten where the coarse gate admits everything.
  *
  * Night lowers the bar for heavy/long jobs — the preferred window, so a big burner that would wait
  * behind higher-value work by day can run at night. And when budget is scarce, a job whose cost
@@ -371,7 +373,10 @@ export function admitJob(
 
   const { behindPace, aheadPace } = computePace(usage, policy, now);
   const headroomPct = 100 - usage.sessionPct;
-  const scarce = aheadPace || headroomPct <= policy.scarceHeadroomPct;
+  // Mirror budgetGate's idle-fill zoning: ahead-of-pace tightens the bar only inside the throttle
+  // band. (aheadPace already implies havePace, so no separate pace-known check is needed.)
+  const inThrottleBand = usage.weeklyPct >= policy.weeklyTargetPct - policy.throttleBandPct;
+  const scarce = (aheadPace && inThrottleBand) || headroomPct <= policy.scarceHeadroomPct;
   const abundant = !scarce && (behindPace || headroomPct >= policy.abundantHeadroomPct);
 
   let threshold = scarce

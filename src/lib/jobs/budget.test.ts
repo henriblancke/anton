@@ -329,13 +329,23 @@ describe("admitJob / admissibleJobs (pace-modulated prioritization)", () => {
     expect(admitJob(null, POLICY, NOON, CLEANUP).admit).toBe(true);
   });
 
-  it("ahead of pace admits only high-value work", () => {
-    // Weekly burst (70% at half-week vs 50% expected) → ahead of pace → scarce, even with a fresh
-    // session (abundant headroom). Daytime, so no night discount muddies the threshold.
-    const usage = usageAt(NOON, { elapsed: 0.5, weeklyPct: 70, sessionPct: 10 });
+  it("ahead of pace in the throttle band admits only high-value work", () => {
+    // Weekly burst into the throttle band (85% ≥ floor 80, vs 50% expected at half-week) → ahead of
+    // pace where pacing engages → scarce, even with a fresh session (abundant headroom). Daytime, so
+    // no night discount muddies the threshold.
+    const usage = usageAt(NOON, { elapsed: 0.5, weeklyPct: 85, sessionPct: 10 });
     const admitted = admissibleJobs(usage, POLICY, NOON, MIXED_QUEUE);
     expect(admitted).toEqual([RISK_HIGH]);
     expect(admitJob(usage, POLICY, NOON, BLOCKING_PR).reason).toBe("value-below-threshold");
+  });
+
+  it("ahead of pace BELOW the throttle band is idle-fill — the value bar does not tighten", () => {
+    // Early-week burst (70% at half-week vs 50% expected) that stays below the throttle floor (80):
+    // budgetGate admits freely here (idle-fill, anton-ld7j), so admitJob must not read ahead-of-pace
+    // as scarce. Fresh session (headroom 70 ≥ abundant 60) → abundant → everything runs.
+    const usage = usageAt(NOON, { elapsed: 0.5, weeklyPct: 70, sessionPct: 30 });
+    const admitted = admissibleJobs(usage, POLICY, NOON, MIXED_QUEUE);
+    expect(admitted).toEqual([RISK_HIGH, BLOCKING_PR, CLEANUP]);
   });
 
   it("behind pace admits down to low-value cleanup", () => {
@@ -347,9 +357,9 @@ describe("admitJob / admissibleJobs (pace-modulated prioritization)", () => {
   });
 
   it("holds a job whose cost exceeds remaining headroom when ahead of pace", () => {
-    // Ahead of pace via the weekly line; session headroom 30 is NOT scarce on its own (> 20), so
-    // ahead-of-pace is the sole scarce driver — isolating acceptance #3.
-    const usage = usageAt(NOON, { elapsed: 0.5, weeklyPct: 70, sessionPct: 70 });
+    // Ahead of pace inside the throttle band (85 ≥ floor 80); session headroom 30 is NOT scarce on
+    // its own (> 20), so ahead-of-pace is the sole scarce driver — isolating acceptance #3.
+    const usage = usageAt(NOON, { elapsed: 0.5, weeklyPct: 85, sessionPct: 70 });
     const heavyHighValue = { value: 0.95, sessionCost: 40 }; // 40 > 30 headroom
     const cheapHighValue = { value: 0.95, sessionCost: 5 };
     expect(admitJob(usage, POLICY, NOON, heavyHighValue).reason).toBe("cost-exceeds-headroom");

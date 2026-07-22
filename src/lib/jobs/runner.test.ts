@@ -1267,6 +1267,39 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     expect(job?.lastError).toMatch(/budget: session-headroom/);
   });
 
+  it("clears stale budget deferrals when a project's budget-aware pacing turns off", async () => {
+    // A governed tick pushes the queued job past the session horizon; then the operator flips
+    // budgetAware off (resolver → null). leaseDue only scans due rows, so without clearing the
+    // governor's own deferrals the job would stay parked until the stale pace boundary — the next
+    // tick must pull it back to due-now and lease it.
+    await seedProjects("A");
+    let budgetAwareOn = true;
+    let ran = 0;
+    const r = budgetRunner(
+      async () => {
+        ran += 1;
+      },
+      {
+        readUsage: async () => usage({ sessionPct: 99 }),
+        resolveBudgetPolicy: () => (budgetAwareOn ? DEFAULT_BUDGET_POLICY : null),
+      },
+    );
+    const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
+
+    expect(await r.tickOnce()).toBe(0); // governed → deferred to the session horizon
+    const deferred = await getJob(tdb.db, id);
+    expect(toMs(deferred?.runAt)).toBeGreaterThan(clock.now());
+    expect(deferred?.lastError).toMatch(/budget: session-headroom/);
+
+    budgetAwareOn = false; // operator turns pacing off
+    expect(await r.tickOnce()).toBe(1); // stale deferral cleared → leases this tick
+    await r.whenIdle();
+    expect(ran).toBe(1);
+    const job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("done");
+    expect(job?.lastError).toBeNull();
+  });
+
   it("governs the orphan-grooming cleanup sweep, not just execute-epic", async () => {
     await seedProjects("A");
     const r = budgetRunner(async () => {}, { readUsage: async () => usage({ sessionPct: 99 }) });

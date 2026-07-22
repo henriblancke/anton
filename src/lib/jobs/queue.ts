@@ -7,7 +7,7 @@
  * clock. Times are stored as unix SECONDS (the schema's timestamp mode); this module works in ms
  * and converts at the boundary.
  */
-import { and, eq, gt, inArray, isNull, lt, lte, not, notInArray, or, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, isNull, like, lt, lte, not, notInArray, or, sql } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { randomUUID } from "node:crypto";
 import * as schema from "../db/schema";
@@ -616,6 +616,39 @@ export async function deferQueuedJobs(
           : eq(schema.jobs.projectId, opts.projectId),
         lt(schema.jobs.runAt, retryDate),
         bypassFilter,
+      ),
+    )
+    .returning({ id: schema.jobs.id });
+  return rows.length;
+}
+
+/**
+ * Undo stale budget deferrals: when a project's budget-aware pacing turns OFF, rows the governor
+ * pushed to a future `runAt` would otherwise stay parked until that stale boundary — `leaseDue`
+ * only scans due rows, so disabling pacing wouldn't actually resume them. Pull the governor's own
+ * deferrals back to due-now. Scoped by the `budget: ` lastError marker `deferQueuedJobs` writes:
+ * quota backoffs and retry reschedules carry different lastError text and are left where they are.
+ * Returns how many rows it resumed.
+ */
+export async function resumeBudgetDeferredJobs(
+  db: AntonDb,
+  clock: Clock,
+  opts: { types: readonly JobType[]; projectId: string | null | undefined },
+): Promise<number> {
+  if (opts.types.length === 0) return 0;
+  const nowDate = secDate(clock.now());
+  const rows = await db
+    .update(schema.jobs)
+    .set({ runAt: nowDate, lastError: null, updatedAt: nowDate })
+    .where(
+      and(
+        eq(schema.jobs.status, "queued"),
+        inArray(schema.jobs.type, [...opts.types]),
+        opts.projectId == null
+          ? isNull(schema.jobs.projectId)
+          : eq(schema.jobs.projectId, opts.projectId),
+        gt(schema.jobs.runAt, nowDate),
+        like(schema.jobs.lastError, "budget: %"),
       ),
     )
     .returning({ id: schema.jobs.id });
