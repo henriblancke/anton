@@ -23,6 +23,14 @@ const BD_SPEC: BinSpec = {
 export const MIN_BD_VERSION = "1.1.0";
 const MIN_BD = { major: 1, minor: 1, patch: 0 };
 
+/**
+ * Absolute URL to the one-clone migration runbook. Must be a URL, not a repo-relative path: the
+ * version gate fires for npm/bundle installs too, where `docs/` isn't shipped (package.json `files`
+ * and build-bundle.mjs omit it), so a relative path would dangle exactly when a user needs it.
+ */
+export const BD_MIGRATION_RUNBOOK =
+  "https://github.com/henriblancke/anton/blob/main/docs/runbooks/bd-1.0.4-to-1.1.0-migration.md";
+
 /** A `bd --version` runner, injectable for tests. */
 export type VersionRun = (bin: string) => { status: number | null; stdout?: string; stderr?: string; error?: unknown };
 
@@ -42,7 +50,7 @@ export function assertBdVersion(
   bin: string,
   run: VersionRun = (b) => spawnSync(b, ["--version"], { encoding: "utf8" }),
 ): void {
-  const guidance = `Upgrade bd (${BD_SPEC.install}); for a remote-backed board follow docs/runbooks/bd-1.0.4-to-1.1.0-migration.md.`;
+  const guidance = `Upgrade bd (${BD_SPEC.install}); for a remote-backed board follow ${BD_MIGRATION_RUNBOOK}.`;
   let r: ReturnType<VersionRun>;
   try {
     r = run(bin);
@@ -106,7 +114,7 @@ export function assertRepoSchemaCurrent(bin: string, cwd: string, run: InspectRu
     throw new Error(
       `beads DB at ${cwd} is on schema ${v.major}.${v.minor}.${v.patch}, behind the required bd ${MIN_BD_VERSION} — ` +
         `bd ${MIN_BD_VERSION} gates pending migrations on open and refuses dolt push/pull. Do NOT auto-migrate: ` +
-        `follow docs/runbooks/bd-1.0.4-to-1.1.0-migration.md (one clone migrates, the rest \`bd bootstrap\`).`,
+        `follow ${BD_MIGRATION_RUNBOOK} (one clone migrates, the rest \`bd bootstrap\`).`,
     );
   }
 }

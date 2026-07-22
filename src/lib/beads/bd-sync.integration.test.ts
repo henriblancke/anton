@@ -216,7 +216,7 @@ describeBd("two managed repos exchange a change over refs/dolt/data with export.
  * Unlike the anton-1th suite (which hydrates repoB by hand), this drives the real
  * configureBeadsForRepo bootstrap branch end-to-end against real bd 1.1.0.
  */
-suite("fresh clone hydrates via configureBeadsForRepo → bd bootstrap (anton-qwsq)", () => {
+describeBd("fresh clone hydrates via configureBeadsForRepo → bd bootstrap (anton-qwsq)", () => {
   let sandbox: string;
   let bare: string;
   let repoA: string;

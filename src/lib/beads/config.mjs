@@ -39,6 +39,13 @@ export const MIN_BD_VERSION = "1.1.0";
 const MIN_BD = { major: 1, minor: 1, patch: 0 };
 
 /**
+ * Absolute URL to the one-clone migration runbook — a URL, not a repo-relative path, so it resolves
+ * for npm/bundle installs where `docs/` isn't shipped. Keep in sync with bd-bin.ts BD_MIGRATION_RUNBOOK.
+ */
+export const BD_MIGRATION_RUNBOOK =
+  "https://github.com/henriblancke/anton/blob/main/docs/runbooks/bd-1.0.4-to-1.1.0-migration.md";
+
+/**
  * Parse a `bd --version` line (`bd version 1.1.0 (hash)`) into `{ major, minor, patch, raw }`, or
  * null when no dotted version is present. `run` is injectable for tests; the default spawns bd.
  *
@@ -107,7 +114,7 @@ export function beadsPrereqs(dir) {
         message: v
           ? `bd ${v.raw} is too old — anton requires bd >= ${MIN_BD_VERSION}.`
           : `could not read the bd version — anton requires bd >= ${MIN_BD_VERSION}.`,
-        fix: "Upgrade bd (https://github.com/gastownhall/beads). For a remote-backed board, follow docs/runbooks/bd-1.0.4-to-1.1.0-migration.md — one clone migrates, the rest `bd bootstrap`.",
+        fix: `Upgrade bd (https://github.com/gastownhall/beads). For a remote-backed board, follow ${BD_MIGRATION_RUNBOOK} — one clone migrates, the rest \`bd bootstrap\`.`,
       },
     };
   }
