@@ -9,7 +9,7 @@ vi.mock("next/navigation", () => ({
 
 import ProjectLoading from "./loading";
 
-describe("projects/[slug]/loading", () => {
+describe("projects/[slug]/(board)/loading", () => {
   it("renders the board skeleton inside the board frame with the topbar for the target project", () => {
     const html = renderToStaticMarkup(<ProjectLoading />);
     // Route-level fallback: the skeleton shows immediately while getBoard() resolves.

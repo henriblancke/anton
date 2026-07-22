@@ -289,4 +289,10 @@
   .anton-shimmer {
     animation: none;
   }
+  /* The fade-in animation carries the indicator to visible (fill-mode: forwards);
+     with animation suppressed it would stay at opacity: 0 forever — show it at once. */
+  .anton-nav-pending-in {
+    opacity: 1;
+    animation: none;
+  }
 }

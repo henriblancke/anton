@@ -10,8 +10,10 @@ import { extractProjectSlug } from "@/components/shell/shell-utils";
  * Instant fallback while the project RSC resolves getBoard() — a cold `bd list` spawn can
  * take seconds, and without this boundary the previous screen stays frozen. Mirrors the
  * board page's exact frame (Topbar + p-[18px] board grid) so the real board swaps in with
- * no layout shift. Client component: loading.tsx gets no params, so the slug for the
- * breadcrumb comes from the already-committed pathname.
+ * no layout shift. Lives in the (board) route group so this fallback scopes to the board
+ * page only — at the [slug] level it would also wrap /tickets, /runs, etc. and flash the
+ * board skeleton on their navigations. Client component: loading.tsx gets no params, so
+ * the slug for the breadcrumb comes from the already-committed pathname.
  */
 export default function ProjectLoading() {
   const pathname = usePathname();
