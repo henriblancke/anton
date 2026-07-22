@@ -1,6 +1,6 @@
 import { Suspense } from "react";
 
-import { TicketsView } from "@/components/tickets/tickets-view";
+import { TicketsSkeleton, TicketsView } from "@/components/tickets/tickets-view";
 import { ticketsQueryString } from "@/components/tickets/tickets-utils";
 import { getProjectBySlug } from "@/lib/projects";
 import { getTickets } from "@/lib/tickets";
@@ -26,13 +26,37 @@ export default async function ProjectTicketsPage({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <Suspense fallback={<div className="flex min-h-0 flex-1 flex-col gap-4" aria-busy="true" />}>
+      <Suspense fallback={<TicketsPageFallback slug={slug} />}>
         <TicketsView
           slug={slug}
           initialTickets={tickets}
           initialQueryString={initialQueryString}
         />
       </Suspense>
+    </div>
+  );
+}
+
+/** Mirrors the TicketsView frame (h-14 header, filter bar, table rows) so the real view
+ * swaps in without layout shift. */
+function TicketsPageFallback({ slug }: { slug: string }) {
+  return (
+    <div className="flex min-h-0 flex-1 flex-col" aria-busy="true">
+      <header className="flex h-14 shrink-0 items-center gap-2.5 border-b border-border px-5 sm:px-6">
+        <div className="flex items-center gap-2 text-[13px]">
+          <span className="text-muted-foreground">{slug}</span>
+          <span className="text-subtle">/</span>
+          <span className="font-medium text-foreground">Tickets</span>
+        </div>
+      </header>
+      <div className="flex shrink-0 flex-wrap items-center gap-2.5 border-b border-border px-5 py-3 sm:px-6">
+        <span className="anton-shimmer h-8 w-52 rounded-lg" />
+        <span className="h-5 w-px bg-border" aria-hidden="true" />
+        {Array.from({ length: 4 }).map((_, i) => (
+          <span key={i} className="anton-shimmer h-8 w-24 rounded-lg" />
+        ))}
+      </div>
+      <TicketsSkeleton />
     </div>
   );
 }

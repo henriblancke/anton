@@ -364,7 +364,9 @@ function StatusCircle({
   return <span className="size-[15px] rounded-full border-[1.5px] border-subtle" aria-label="todo" />;
 }
 
-function TicketsSkeleton() {
+/** Shimmer rows matching the tickets table grid — shared with the tickets page's Suspense
+ * fallback so the route-level and in-view loading states are the same shape. */
+export function TicketsSkeleton() {
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-y-auto" aria-busy="true" aria-label="Loading tickets">
       {Array.from({ length: 8 }).map((_, i) => (

@@ -254,6 +254,11 @@
     opacity: 0;
   }
 }
+@keyframes antonFadeIn {
+  to {
+    opacity: 1;
+  }
+}
 
 .anton-pulse {
   animation: antonPulse 1.6s ease-in-out infinite;
@@ -270,6 +275,12 @@
   );
   background-size: 420px 100%;
   animation: antonShimmer 1.4s infinite linear;
+}
+/* Pending-nav hint: invisible for the first ~120ms so prefetched (instant) navigations
+   never flash a spinner; only slow transitions surface it. */
+.anton-nav-pending-in {
+  opacity: 0;
+  animation: antonFadeIn 150ms ease 120ms forwards;
 }
 
 @media (prefers-reduced-motion: reduce) {
