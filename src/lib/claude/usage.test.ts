@@ -314,9 +314,11 @@ describe("429 backoff (shared across all readers)", () => {
     expect(calls).toBe(1);
     armBackoffForTest(clock + 60_000);
 
-    // A solo job completing 5s later must NOT go upstream — it serves the cached value instead.
+    // A solo job completing 5s later must NOT go upstream — and must NOT get the cached value
+    // either: that cache entry may be the sampler's own pre-job reading, and a non-null pair would
+    // record a bogus 0% burn sample. Null makes the sampler skip the sample instead.
     clock += 5_000;
-    expect(await getClaudeUsageFresh(live, now)).toEqual(snapshot);
+    expect(await getClaudeUsageFresh(live, now)).toBeNull();
     expect(calls).toBe(1); // no new upstream request during backoff
 
     // Once the window passes, the sampler reads live again.

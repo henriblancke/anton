@@ -675,9 +675,18 @@ export class JobRunner {
     for (const { pid, policy } of governed) {
       const decision = budgetGate(usage, policy, now);
       if (decision.admit) {
-        // Budget healthy → nothing paced this tick. But "work may run" is not "any work may run":
-        // the fine-grained gate (anton-k05r) still decides which queued jobs are worth the budget
-        // that's left — e.g. scarce session headroom at night admits high-value work only.
+        // Budget healthy → nothing paced this tick. First pull back any rows a PRIOR governed tick
+        // pushed to a future runAt: the gate can start admitting before that stale boundary (the
+        // operator raised weeklyTargetPct, lowered a reserve, usage dropped), and leaseDue only
+        // scans due rows — without this resume those jobs stay parked until the old boundary even
+        // though the governor now admits them. Marker-scoped, same as the pacing-off/fail-open paths.
+        await resumeBudgetDeferredJobs(this.db, this.clock, {
+          types: GOVERNED_JOB_TYPES,
+          projectId: pid,
+        });
+        // But "work may run" is not "any work may run": the fine-grained gate (anton-k05r) still
+        // decides which queued jobs are worth the budget that's left — e.g. scarce session headroom
+        // at night admits high-value work only.
         await this.applyValueGate(usage, policy, pid, now, valueHeldJobIds);
         continue;
       }

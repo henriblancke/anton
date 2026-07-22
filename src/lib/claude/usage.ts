@@ -325,8 +325,10 @@ export async function getClaudeUsageFresh(
   now: () => number = Date.now,
 ): Promise<ClaudeUsage | null> {
   // Honor the shared 429 backoff even here: the sampler bypasses the TTL, so if it kept firing while
-  // throttled it would re-earn a 429 on every solo job. Serve the last cached value; skip a sample.
-  if (now() < backoffUntil) return usageCache?.value ?? null;
+  // throttled it would re-earn a 429 on every solo job. Return null — NOT the cached value: the
+  // cache may hold the sampler's own pre-job reading, and a non-null pair records a bogus 0% burn
+  // sample (`sampleJobBurn` treats any before/after pair as real). A null read skips the sample.
+  if (now() < backoffUntil) return null;
   const stale = usageInFlight;
   if (stale) {
     // Wait it out (never double the upstream request), then take our own post-job read. Any fetch
