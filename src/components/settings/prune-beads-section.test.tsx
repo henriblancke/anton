@@ -76,6 +76,27 @@ describe("PruneBeadsSection", () => {
     expect(screen.queryByRole("button", { name: /Prune 2 beads/ })).toBeNull();
   });
 
+  it("a preview resolving after an age change is discarded (late response can't gate a wider delete)", async () => {
+    let resolvePreview!: (r: Response) => void;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockReturnValue(new Promise<Response>((resolve) => (resolvePreview = resolve))),
+    );
+
+    render(<PruneBeadsSection project={project} />);
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    // User widens the scope while the 30d preview is still in flight…
+    fireEvent.change(screen.getByRole("combobox", { name: "Prune age" }), {
+      target: { value: "all" },
+    });
+    // …then the stale 30d response lands. It must not repopulate the delete affordance.
+    resolvePreview(jsonResponse({ count: 3, pruned: false }));
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Preview" })).toBeDefined());
+    expect(screen.queryByRole("button", { name: /Prune / })).toBeNull();
+    expect(screen.queryByText(/would be permanently deleted/)).toBeNull();
+  });
+
   it("renders a not-connected notice instead of controls when beads is missing", () => {
     render(<PruneBeadsSection project={{ ...project, hasBeads: false } as Project} />);
     expect(screen.queryByRole("button", { name: "Preview" })).toBeNull();

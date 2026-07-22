@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 
@@ -29,8 +29,11 @@ export function PruneBeadsSection({ project }: { project: Project }) {
   // null = no preview yet (or invalidated by an age change) — the delete affordance is hidden.
   const [preview, setPreview] = useState<number | null>(null);
   const [previewing, setPreviewing] = useState(false);
+  // Latest selected age, readable at response time — lets an in-flight preview detect that the
+  // user switched scope and discard its now-stale count.
+  const ageRef = useRef(age);
 
-  async function runPrune(force: boolean): Promise<number> {
+  async function runPrune(age: PruneAge, force: boolean): Promise<number> {
     const res = await fetch(`/api/projects/${project.slug}/prune`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -42,9 +45,13 @@ export function PruneBeadsSection({ project }: { project: Project }) {
   }
 
   async function handlePreview() {
+    const requested = age;
     setPreviewing(true);
     try {
-      setPreview(await runPrune(false));
+      const count = await runPrune(requested, false);
+      // Drop responses for a scope the user has since left — a stale count must never
+      // repopulate the delete affordance and gate a wider prune.
+      if (ageRef.current === requested) setPreview(count);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Preview failed");
     } finally {
@@ -54,7 +61,7 @@ export function PruneBeadsSection({ project }: { project: Project }) {
 
   async function handleConfirm() {
     try {
-      const count = await runPrune(true);
+      const count = await runPrune(age, true);
       toast.success(`Pruned ${count} closed bead${count === 1 ? "" : "s"}`);
       setPreview(null);
       // Board/backlog counts are server-rendered off the beads snapshot — refresh so they reflect
@@ -78,7 +85,9 @@ export function PruneBeadsSection({ project }: { project: Project }) {
           <select
             value={age}
             onChange={(e) => {
-              setAge(e.target.value as PruneAge);
+              const next = e.target.value as PruneAge;
+              ageRef.current = next;
+              setAge(next);
               // A preview counts one scope only — a stale count must never gate a wider delete.
               setPreview(null);
             }}
