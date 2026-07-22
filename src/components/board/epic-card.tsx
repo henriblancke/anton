@@ -25,11 +25,17 @@ export function EpicCard({
   slug,
   epic,
   overlay = false,
+  budgetAware = false,
   onDeleted,
 }: {
   slug: string;
   epic: Epic;
   overlay?: boolean;
+  /**
+   * Project budget-aware flag (anton-y2ue): on → the backlog approval splits into "Approve"
+   * (immediate) and "Queue" (paced for optimal usage); off → a single "Approve" button.
+   */
+  budgetAware?: boolean;
   /** Fired after this epic is deleted so the board can drop it from its columns. */
   onDeleted?: (epicId: string) => void;
 }) {
@@ -52,16 +58,24 @@ export function EpicCard({
     onDeleted?.(epic.id);
   }
 
-  async function handleApprove() {
+  async function handleApprove(immediate = true) {
+    // `immediate` is the run-directly choice (anton-y2ue): true → run now (bypass budget pacing),
+    // false → queue for optimal usage. Defaults true so the single (non-budget-aware) button runs now.
     setApproving(true);
     setOptimisticApproved(true);
     try {
-      const res = await fetch(`/api/projects/${slug}/epics/${epic.id}/approve`, { method: "POST" });
+      const res = await fetch(`/api/projects/${slug}/epics/${epic.id}/approve`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ immediate }),
+      });
       if (!res.ok) {
         const body = (await res.json().catch(() => null)) as { error?: string } | null;
         throw new Error(body?.error ?? `Approve failed (${res.status})`);
       }
-      toast.success(`Approved "${epic.title}"`);
+      toast.success(
+        immediate ? `Approved & running "${epic.title}"` : `Queued "${epic.title}" for optimal usage`,
+      );
     } catch (err) {
       setOptimisticApproved(false);
       toast.error(err instanceof Error ? err.message : "Failed to approve epic");
@@ -189,16 +203,38 @@ export function EpicCard({
           canTakeOver={epic.stage === "backlog"}
           className="mt-0.5"
         >
-          {showApprove && (
-            <Button
-              size="xs"
-              onClick={handleApprove}
-              disabled={approving}
-              className="pointer-events-auto"
-            >
-              {approving ? "Approving…" : "Approve"}
-            </Button>
-          )}
+          {showApprove &&
+            (budgetAware ? (
+              // Budget-aware: let the operator run now or hand the run to the governor's pace-line.
+              <span className="pointer-events-auto flex items-center gap-1">
+                <Button
+                  size="xs"
+                  variant="outline"
+                  onClick={() => handleApprove(false)}
+                  disabled={approving}
+                  title="Queue this run for the budget governor to pace against the weekly plan"
+                >
+                  Queue
+                </Button>
+                <Button
+                  size="xs"
+                  onClick={() => handleApprove(true)}
+                  disabled={approving}
+                  title="Approve and run now, bypassing budget pacing (the session limit still applies)"
+                >
+                  {approving ? "…" : "Approve"}
+                </Button>
+              </span>
+            ) : (
+              <Button
+                size="xs"
+                onClick={() => handleApprove()}
+                disabled={approving}
+                className="pointer-events-auto"
+              >
+                {approving ? "Approving…" : "Approve"}
+              </Button>
+            ))}
           <ConfirmDeleteButton
             onConfirm={handleDelete}
             iconOnly
