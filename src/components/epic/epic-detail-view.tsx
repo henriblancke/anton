@@ -16,6 +16,7 @@ import { AbandonedChip, MetaChip, RelativeTime, RiskChip, StagePill } from "@/co
 import { ClaimControl } from "@/components/board/claim-control";
 import { PrLinkControl } from "@/components/board/pr-link-control";
 import { DependencyGraph } from "@/components/epic/dependency-graph";
+import { EpicPriorityControl } from "@/components/epic/epic-priority-control";
 import { AbandonButton } from "@/components/ticket/abandon-button";
 import { TicketDialog } from "@/components/ticket/ticket-dialog";
 
@@ -186,6 +187,16 @@ export function EpicDetailView({ slug, epicId }: { slug: string; epicId: string 
           <StagePill stage={epic.stage} className="ml-1" />
         )}
         <div className="ml-auto flex shrink-0 items-center gap-2">
+          {/* Priority drives the board/backlog ordering; let it be set here (P0–P4) unless the epic
+              is abandoned, which strips the rest of the action set too. */}
+          {!epic.abandoned && (
+            <EpicPriorityControl
+              slug={slug}
+              epicId={epic.id}
+              priority={epic.priority}
+              onChanged={() => setAttempt((n) => n + 1)}
+            />
+          )}
           {epic.abandoned ? null : epic.stage === "implementing" ? (
             <>
               {run && (

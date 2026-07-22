@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { describeBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
 import { beads } from "./beads/bd";
 import { resetIssueSnapshots } from "./beads/snapshot";
-import { deleteEpic, getEpicDetail } from "./epic-detail";
+import { deleteEpic, getEpicDetail, updateEpic } from "./epic-detail";
 import type { Project } from "./types";
 
 type SeedNode = { key: string; title: string; type: "epic" | "task" | "bug" };
@@ -167,6 +167,47 @@ describeBd("epic-detail integration (real bd)", () => {
 
   it("still throws for a genuinely missing id", async () => {
     await expect(getEpicDetail(project, "does-not-exist-999")).rejects.toThrow(/not found/i);
+  });
+
+  // The epic priority editor's write path (anton-etvw): a PATCH to priority must land on the bead so
+  // `bd show` reflects it, and the returned detail must carry the new value (read-after-write).
+  it("updateEpic sets the epic's priority and reflects it in bd show + the returned detail", async () => {
+    const epicId = await beads.create(repo, {
+      title: "Prioritizable epic",
+      type: "epic",
+      description: "## Goal\nRank me.",
+    });
+
+    const detail = await updateEpic(project, epicId, { priority: 1 });
+    expect(detail.epic.priority).toBe(1);
+
+    const fresh = await beads.show(repo, epicId);
+    expect(fresh.priority).toBe(1);
+  });
+
+  // Fires the remote push off the response path and swallows a rejected sync — same fire-and-forget
+  // contract as deleteEpic (the "failing"/unpushed recording lives in beads.sync, covered in bd.test.ts).
+  it("updateEpic fires the remote push off the response path and catches a rejected sync", async () => {
+    const epicId = await beads.create(repo, { title: "Sync-tested epic", type: "epic" });
+
+    let failSync!: () => void;
+    const pendingSync = new Promise<void>((_resolve, reject) => {
+      failSync = () => reject(new Error("remote unreachable"));
+    });
+    const syncSpy = vi.spyOn(beads, "sync").mockReturnValue(pendingSync);
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // Resolves while the push is still in flight — proof it isn't awaited.
+    const detail = await updateEpic(project, epicId, { priority: 2 });
+    expect(detail.epic.priority).toBe(2);
+    expect(syncSpy).toHaveBeenCalledTimes(1);
+
+    failSync();
+    await new Promise((r) => setImmediate(r)); // let the fire-and-forget `.catch` run
+    expect(errSpy).toHaveBeenCalled(); // the failed push was logged, not silently swallowed
+
+    syncSpy.mockRestore();
+    errSpy.mockRestore();
   });
 
   // anton-u8wu (A2): the delete must not block on the remote push. Hold the sync pending, prove the

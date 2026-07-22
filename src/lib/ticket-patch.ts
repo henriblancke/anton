@@ -15,7 +15,7 @@ const DOMAINS = ["eng", "marketing", "bizdev", "research", "ops"] as const;
 export type ParsedPatch = { patch: BeadPatch } | { error: string };
 
 // A field parser validates one raw value and returns the value to store or a rejection reason.
-type FieldResult = { value: string | number } | { error: string };
+export type FieldResult = { value: string | number } | { error: string };
 type FieldParser = (v: unknown) => FieldResult;
 
 const oneOf = (allowed: readonly string[], v: unknown): v is string =>
@@ -34,7 +34,9 @@ const enumValue =
   (v) =>
     oneOf(allowed, v) ? { value: v } : { error: `Invalid ${field}: ${String(v)}` };
 
-const priority: FieldParser = (v) =>
+// Exported so the epic patch (priority-only, see epic-patch.ts) reuses the exact same validation +
+// error message rather than duplicating the 0-4 range check.
+export const parsePriority: FieldParser = (v) =>
   typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 4
     ? { value: v }
     : { error: `Invalid priority: ${String(v)} (expected integer 0-4)` };
@@ -50,7 +52,7 @@ type FieldSpec =
 const FIELD_SPECS: Record<string, FieldSpec> = {
   title: { parse: nonEmptyString("title"), target: "patch", key: "title" },
   status: { parse: enumValue("status", STATUSES), target: "patch", key: "status" },
-  priority: { parse: priority, target: "patch", key: "priority" },
+  priority: { parse: parsePriority, target: "patch", key: "priority" },
   description: { parse: nonEmptyString("description"), target: "patch", key: "description" },
   acceptance: { parse: nonEmptyString("acceptance"), target: "patch", key: "acceptance" },
   agent: { parse: nonEmptyString("agent"), target: "labels", key: "agent" },
