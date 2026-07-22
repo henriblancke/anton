@@ -29,9 +29,11 @@ export function PruneBeadsSection({ project }: { project: Project }) {
   // null = no preview yet (or invalidated by an age change) — the delete affordance is hidden.
   const [preview, setPreview] = useState<number | null>(null);
   const [previewing, setPreviewing] = useState(false);
-  // Latest selected age, readable at response time — lets an in-flight preview detect that the
-  // user switched scope and discard its now-stale count.
-  const ageRef = useRef(age);
+  const [confirming, setConfirming] = useState(false);
+  // Bumped whenever an in-flight preview's count would be stale (age change, or a force-delete
+  // starting) — responses carrying an older token are dropped, so a stale count can never
+  // repopulate the delete affordance.
+  const previewTokenRef = useRef(0);
 
   async function runPrune(age: PruneAge, force: boolean): Promise<number> {
     const res = await fetch(`/api/projects/${project.slug}/prune`, {
@@ -45,13 +47,11 @@ export function PruneBeadsSection({ project }: { project: Project }) {
   }
 
   async function handlePreview() {
-    const requested = age;
+    const token = previewTokenRef.current;
     setPreviewing(true);
     try {
-      const count = await runPrune(requested, false);
-      // Drop responses for a scope the user has since left — a stale count must never
-      // repopulate the delete affordance and gate a wider prune.
-      if (ageRef.current === requested) setPreview(count);
+      const count = await runPrune(age, false);
+      if (previewTokenRef.current === token) setPreview(count);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Preview failed");
     } finally {
@@ -60,6 +60,9 @@ export function PruneBeadsSection({ project }: { project: Project }) {
   }
 
   async function handleConfirm() {
+    // The delete invalidates any preview count measured before it — even one still in flight.
+    previewTokenRef.current++;
+    setConfirming(true);
     try {
       const count = await runPrune(age, true);
       toast.success(`Pruned ${count} closed bead${count === 1 ? "" : "s"}`);
@@ -69,6 +72,8 @@ export function PruneBeadsSection({ project }: { project: Project }) {
       router.refresh();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Prune failed");
+    } finally {
+      setConfirming(false);
     }
   }
 
@@ -85,10 +90,9 @@ export function PruneBeadsSection({ project }: { project: Project }) {
           <select
             value={age}
             onChange={(e) => {
-              const next = e.target.value as PruneAge;
-              ageRef.current = next;
-              setAge(next);
+              setAge(e.target.value as PruneAge);
               // A preview counts one scope only — a stale count must never gate a wider delete.
+              previewTokenRef.current++;
               setPreview(null);
             }}
             aria-label="Prune age"
@@ -107,7 +111,7 @@ export function PruneBeadsSection({ project }: { project: Project }) {
           variant="outline"
           size="sm"
           onClick={handlePreview}
-          disabled={previewing}
+          disabled={previewing || confirming}
         >
           {previewing ? "Previewing…" : "Preview"}
         </Button>

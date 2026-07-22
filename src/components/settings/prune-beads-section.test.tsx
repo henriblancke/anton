@@ -97,6 +97,56 @@ describe("PruneBeadsSection", () => {
     expect(screen.queryByText(/would be permanently deleted/)).toBeNull();
   });
 
+  it("a preview resolving after a confirm is discarded (stale count can't resurrect the delete affordance)", async () => {
+    let resolveLatePreview!: (r: Response) => void;
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ count: 2, pruned: false }))
+      .mockReturnValueOnce(new Promise<Response>((resolve) => (resolveLatePreview = resolve)))
+      .mockResolvedValueOnce(jsonResponse({ count: 2, pruned: true }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<PruneBeadsSection project={project} />);
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    const armButton = await screen.findByRole("button", { name: /Prune 2 beads/ });
+
+    // Second preview still in flight when the user confirms the delete…
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(armButton);
+    fireEvent.click(screen.getByRole("button", { name: /Confirm — delete 2/ }));
+    await waitFor(() => expect(refresh).toHaveBeenCalled());
+
+    // …then the pre-delete count lands. The beads are gone — it must stay discarded.
+    resolveLatePreview(jsonResponse({ count: 2, pruned: false }));
+    await waitFor(() =>
+      expect(
+        (screen.getByRole("button", { name: "Preview" }) as HTMLButtonElement).disabled,
+      ).toBe(false),
+    );
+    expect(screen.queryByRole("button", { name: /Prune 2 beads/ })).toBeNull();
+    expect(screen.queryByText(/would be permanently deleted/)).toBeNull();
+  });
+
+  it("Preview is disabled while a confirm is in flight", async () => {
+    let resolveConfirm!: (r: Response) => void;
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ count: 1, pruned: false }))
+      .mockReturnValueOnce(new Promise<Response>((resolve) => (resolveConfirm = resolve)));
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<PruneBeadsSection project={project} />);
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(await screen.findByRole("button", { name: /Prune 1 bead/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Confirm — delete 1/ }));
+
+    const previewButton = screen.getByRole("button", { name: "Preview" }) as HTMLButtonElement;
+    await waitFor(() => expect(previewButton.disabled).toBe(true));
+
+    resolveConfirm(jsonResponse({ count: 1, pruned: true }));
+    await waitFor(() => expect(previewButton.disabled).toBe(false));
+  });
+
   it("renders a not-connected notice instead of controls when beads is missing", () => {
     render(<PruneBeadsSection project={{ ...project, hasBeads: false } as Project} />);
     expect(screen.queryByRole("button", { name: "Preview" })).toBeNull();
