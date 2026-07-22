@@ -91,6 +91,18 @@ describeBd("bd prune (real bd · dry-run vs --force via the route)", () => {
     expect(ids).toContain(inProgressId);
   });
 
+  it("force with 0 matches returns count 0 without error", async () => {
+    // After the force-delete test has run, the closed bead is gone; force on an empty set must 200.
+    const res = await POST(
+      jsonRequest("POST", { age: "all", force: true }),
+      paramsCtx({ slug: SLUG }),
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.count).toBe(0);
+    expect(body.pruned).toBe(true);
+  });
+
   it("400s on an unknown age and 404s on an unknown project", async () => {
     const bad = await POST(jsonRequest("POST", { age: "7d" }), paramsCtx({ slug: SLUG }));
     expect(bad.status).toBe(400);

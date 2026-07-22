@@ -556,7 +556,12 @@ export const beads = {
     const args = buildPruneArgs(age, opts);
     const out = opts.force ? await bdWrite(cwd, args) : await bd(cwd, args);
     const parsed = JSON.parse(out || "{}") as { prune_count?: number; pruned_count?: number };
-    return parsed.pruned_count ?? parsed.prune_count ?? 0;
+    const count = parsed.pruned_count ?? parsed.prune_count;
+    if (count === undefined) {
+      // Neither field present — likely a bd output-format change; surface it instead of a silent 0.
+      console.warn("[beads.prune] unexpected bd output — no prune_count/pruned_count:", out.slice(0, 200));
+    }
+    return count ?? 0;
   },
   reopen: (cwd: string, id: string) => bdWrite(cwd, ["reopen", id]),
 
