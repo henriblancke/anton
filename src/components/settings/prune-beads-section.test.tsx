@@ -97,34 +97,26 @@ describe("PruneBeadsSection", () => {
     expect(screen.queryByText(/would be permanently deleted/)).toBeNull();
   });
 
-  it("a preview resolving after a confirm is discarded (stale count can't resurrect the delete affordance)", async () => {
-    let resolveLatePreview!: (r: Response) => void;
+  it("re-running Preview clears the stale count — no delete affordance until the refresh resolves", async () => {
+    let resolveRefresh!: (r: Response) => void;
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(jsonResponse({ count: 2, pruned: false }))
-      .mockReturnValueOnce(new Promise<Response>((resolve) => (resolveLatePreview = resolve)))
-      .mockResolvedValueOnce(jsonResponse({ count: 2, pruned: true }));
+      .mockReturnValueOnce(new Promise<Response>((resolve) => (resolveRefresh = resolve)));
     vi.stubGlobal("fetch", fetchMock);
 
     render(<PruneBeadsSection project={project} />);
     fireEvent.click(screen.getByRole("button", { name: "Preview" }));
-    const armButton = await screen.findByRole("button", { name: /Prune 2 beads/ });
+    await screen.findByRole("button", { name: /Prune 2 beads/ });
 
-    // Second preview still in flight when the user confirms the delete…
+    // Refresh preview in flight — the pre-refresh count must not gate a delete in the interim.
     fireEvent.click(screen.getByRole("button", { name: "Preview" }));
-    fireEvent.click(armButton);
-    fireEvent.click(screen.getByRole("button", { name: /Confirm — delete 2/ }));
-    await waitFor(() => expect(refresh).toHaveBeenCalled());
-
-    // …then the pre-delete count lands. The beads are gone — it must stay discarded.
-    resolveLatePreview(jsonResponse({ count: 2, pruned: false }));
-    await waitFor(() =>
-      expect(
-        (screen.getByRole("button", { name: "Preview" }) as HTMLButtonElement).disabled,
-      ).toBe(false),
-    );
     expect(screen.queryByRole("button", { name: /Prune 2 beads/ })).toBeNull();
     expect(screen.queryByText(/would be permanently deleted/)).toBeNull();
+
+    // The refreshed count repopulates the affordance once it lands.
+    resolveRefresh(jsonResponse({ count: 5, pruned: false }));
+    await screen.findByRole("button", { name: /Prune 5 beads/ });
   });
 
   it("Preview is disabled while a confirm is in flight", async () => {

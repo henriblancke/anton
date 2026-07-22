@@ -49,6 +49,9 @@ export function PruneBeadsSection({ project }: { project: Project }) {
   async function handlePreview() {
     const token = previewTokenRef.current;
     setPreviewing(true);
+    // A refresh invalidates the previous count — hide the confirm affordance so the operator
+    // can't delete against a stale preview while the new dry-run is in flight.
+    setPreview(null);
     try {
       const count = await runPrune(age, false);
       if (previewTokenRef.current === token) setPreview(count);
