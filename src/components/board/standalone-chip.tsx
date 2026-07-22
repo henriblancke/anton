@@ -150,42 +150,11 @@ export function StandaloneChip({
         {item.stage === "backlog" && <BlockedChip blockedBy={item.blockedBy} />}
         {item.abandoned && <AbandonedChip />}
         {deferred && <SnoozedChip />}
-        {showApproveRun &&
-          (budgetAware ? (
-            // Budget-aware: run now or hand the run to the governor's pace-line.
-            <span className="ml-auto flex items-center gap-1 pointer-events-auto">
-              <Button
-                size="xs"
-                variant="outline"
-                onClick={() => handleApproveRun(false)}
-                disabled={running}
-                title="Queue this run for the budget governor to pace against the weekly plan"
-              >
-                Queue
-              </Button>
-              <Button
-                size="xs"
-                onClick={() => handleApproveRun(true)}
-                disabled={running}
-                title="Approve and run now, bypassing budget pacing (the session limit still applies)"
-              >
-                {running ? "…" : "Approve"}
-              </Button>
-            </span>
-          ) : (
-            <Button
-              size="xs"
-              onClick={() => handleApproveRun()}
-              disabled={running}
-              className="ml-auto pointer-events-auto"
-            >
-              {running ? "Starting…" : "Approve & run"}
-            </Button>
-          ))}
       </div>
 
       {item.stage === "backlog" && (
-        <div className={cn("relative z-[1] flex items-center", onOpen && "pointer-events-none")}>
+        <div className={cn("relative z-[1] flex flex-col gap-2", onOpen && "pointer-events-none")}>
+          {/* Claim sits on its own line, above the action row. */}
           <ClaimControl
             slug={slug}
             itemId={item.id}
@@ -193,15 +162,50 @@ export function StandaloneChip({
             readOnly={approved}
             canTakeOver={item.stage === "backlog"}
           />
-          <SnoozeButton
-            slug={slug}
-            ticketId={item.id}
-            deferred={deferred}
-            size="icon-xs"
-            iconOnly
-            className="pointer-events-auto ml-auto shrink-0"
-            onChanged={(detail) => setOptimisticDeferred(detail.deferred)}
-          />
+          {/* Queue · Approve · Snooze share one line (anton-tc6y); snooze is pushed to the right. */}
+          <div className="flex items-center gap-1">
+            {showApproveRun &&
+              (budgetAware ? (
+                // Budget-aware: run now or hand the run to the governor's pace-line.
+                <span className="pointer-events-auto flex items-center gap-1">
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    onClick={() => handleApproveRun(false)}
+                    disabled={running}
+                    title="Queue this run for the budget governor to pace against the weekly plan"
+                  >
+                    Queue
+                  </Button>
+                  <Button
+                    size="xs"
+                    onClick={() => handleApproveRun(true)}
+                    disabled={running}
+                    title="Approve and run now, bypassing budget pacing (the session limit still applies)"
+                  >
+                    {running ? "…" : "Approve"}
+                  </Button>
+                </span>
+              ) : (
+                <Button
+                  size="xs"
+                  onClick={() => handleApproveRun()}
+                  disabled={running}
+                  className="pointer-events-auto"
+                >
+                  {running ? "Starting…" : "Approve & run"}
+                </Button>
+              ))}
+            <SnoozeButton
+              slug={slug}
+              ticketId={item.id}
+              deferred={deferred}
+              size="icon-xs"
+              iconOnly
+              className="pointer-events-auto ml-auto shrink-0"
+              onChanged={(detail) => setOptimisticDeferred(detail.deferred)}
+            />
+          </div>
         </div>
       )}
     </div>
