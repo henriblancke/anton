@@ -440,6 +440,14 @@ export class JobRunner {
     const capOf = (job: JobRow) => {
       if (job.projectId && this.quiescedProjects.has(job.projectId)) return 0;
       if (disabledSchedules.has(scheduleGateKey(job.type, job.projectId))) return 0;
+      // At most one sync-push may RUN per project at a time (anton-x7la). The queued-only dedup index
+      // permits a queued follow-up alongside a running push (so a write during an in-flight push gets
+      // a durable slot), but the per-repo coalescer already serializes their pushes — a second
+      // concurrent lease buys nothing and, under a slow remote + write burst, would pile sync-push
+      // handlers into the global concurrency pool and starve execute-epic work. Capping the running
+      // count at 1 keeps the follow-up queued until the running push settles: the real 1-running +
+      // 1-queued bound the queued-only index promises.
+      if (job.type === "sync-push") return 1;
       return policyCapOf?.(job) ?? Infinity;
     };
 

@@ -166,7 +166,7 @@ describe("no double-push against the E1 backstop (anton-nowq)", () => {
 
     const handler = makeSyncPushHandler({
       db: t.db,
-      push: (cwd) => coalescer(cwd, "full"), // the durable job forces a push
+      push: (cwd) => coalescer(cwd, "push"), // the durable job forces a push
     });
 
     // Fire the job's push and the E1 heartbeat backstop concurrently at the same repo.

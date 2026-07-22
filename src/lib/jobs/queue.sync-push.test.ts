@@ -11,7 +11,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
-import { enqueueSyncPushDeduped, getJob, resumeJob, systemClock } from "./queue";
+import { enqueueSyncPushDeduped, getJob, reschedule, resumeJob, systemClock } from "./queue";
 
 let t: TestDb;
 beforeEach(() => {
@@ -139,6 +139,39 @@ describe("jobs_active_sync_push_unique (DB backstop)", () => {
     t.db.update(schema.jobs).set({ status: "running" }).where(eq(schema.jobs.id, a)).run();
     expect(() => rawInsert("followup", "queued")).not.toThrow();
     expect(activeRows()).toHaveLength(2); // 1 running + 1 queued
+  });
+});
+
+describe("reschedule vs the queued follow-up (anton-x7la)", () => {
+  it("discharges a failing running push as done when a queued follow-up already covers the repo", async () => {
+    // A is running and about to be rescheduled after a failed push; a write during its run enqueued a
+    // queued follow-up B into the project's single queued slot. Requeuing A (running → queued) would
+    // collide with B on the queued-only unique index — reschedule must absorb that and discharge A
+    // rather than throw on the settle path or leave A a zombie running row.
+    const a = enqueueSyncPushDeduped(t.db, systemClock, "p1");
+    t.db.update(schema.jobs).set({ status: "running" }).where(eq(schema.jobs.id, a)).run();
+    const b = enqueueSyncPushDeduped(t.db, systemClock, "p1"); // queued follow-up
+    expect(b).not.toBe(a);
+
+    await expect(
+      reschedule(t.db, systemClock, a, systemClock.now() + 2_000, { lastError: "remote down" }),
+    ).resolves.toBeUndefined();
+
+    expect((await getJob(t.db, a))?.status).toBe("done"); // superseded, discharged cleanly
+    expect((await getJob(t.db, b))?.status).toBe("queued"); // the sole retry carrier, untouched
+    expect(activeRows()).toHaveLength(1);
+    expect(activeRows()[0]?.id).toBe(b);
+  });
+
+  it("still requeues a running push normally when no follow-up is queued", async () => {
+    const a = enqueueSyncPushDeduped(t.db, systemClock, "p1");
+    t.db.update(schema.jobs).set({ status: "running" }).where(eq(schema.jobs.id, a)).run();
+
+    await reschedule(t.db, systemClock, a, systemClock.now() + 2_000, { lastError: "remote down" });
+
+    const job = await getJob(t.db, a);
+    expect(job?.status).toBe("queued"); // back on the retry path
+    expect(job?.lastError).toBe("remote down");
   });
 });
 

@@ -579,6 +579,40 @@ describe("JobRunner (live, in-memory db)", () => {
     expect(queuedA).toHaveLength(1); // the over-cap A job was left for a later tick
   });
 
+  it("runs at most one sync-push per project at a time (anton-x7la)", async () => {
+    // The queued-only dedup index lets a queued follow-up sit alongside a running push. The runner
+    // must still cap the RUNNING count at 1 per project: the per-repo coalescer serializes their
+    // pushes, so a second concurrent lease buys nothing and would pile handlers into the global pool
+    // under a slow remote. Bound: 1 running + 1 queued.
+    await seedProjects("A");
+    let concurrent = 0;
+    let peak = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((res) => (release = res));
+    const r = new JobRunner({ db: tdb.db, clock, config: { ...CONFIG, maxConcurrent: 5 } });
+    r.registerHandler("sync-push", async () => {
+      concurrent += 1;
+      peak = Math.max(peak, concurrent);
+      await gate;
+      concurrent -= 1;
+    });
+
+    await r.enqueue({ type: "sync-push", projectId: "A" }); // A → queued
+    expect(await r.tickOnce()).toBe(1); // A leased → running, handler blocks on the gate
+
+    // A durable follow-up lands while A runs (permitted by the queued-only index).
+    const bId = await r.enqueue({ type: "sync-push", projectId: "A" });
+    expect(await r.tickOnce()).toBe(0); // capped at 1 running per project — B stays queued
+    expect((await getJob(tdb.db, bId))?.status).toBe("queued");
+
+    release();
+    await r.whenIdle();
+    expect(await r.tickOnce()).toBe(1); // A settled → the queued follow-up is now leasable
+    await r.whenIdle();
+
+    expect(peak).toBe(1); // the two pushes never ran concurrently for project A
+  });
+
   it("autonomy off gates claiming: execute-epic stays queued, and re-enabling resumes it (anton-y3l)", async () => {
     // The autonomy master-switch gates at *claim*: approval-style enqueues still land, but no
     // tick leases the job while the switch is off; flipping it back on resumes on the next tick.

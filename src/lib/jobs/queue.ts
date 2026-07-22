@@ -549,6 +549,14 @@ export async function complete(db: AntonDb, clock: Clock, jobId: string): Promis
  * Reschedule a job to run again at `runAtMs` (used for both quota backoff and retry). Returns it
  * to `queued` and clears the lease so it is picked up when due. Optionally rewinds `attempts`
  * (quota isn't the job's fault, so it shouldn't burn the poison budget).
+ *
+ * One collision is possible for sync-push (anton-x7la): its dedup index is queued-only, so while
+ * this job was `running` a board write may have enqueued a fresh queued follow-up into the project's
+ * single queued slot. Requeuing this job would be a second queued row → UNIQUE. The follow-up runs a
+ * full push that supersedes this job's retry (it carries the same unpushed commits, plus the newer
+ * write), so we discharge this job as `done` rather than let the exception leave it a zombie `running`
+ * row that never backs off and is re-leased on every reclaim tick. Retry/backoff/park continuity is
+ * preserved: the queued follow-up is now the sole carrier of the durable push for this repo.
  */
 export async function reschedule(
   db: AntonDb,
@@ -558,19 +566,37 @@ export async function reschedule(
   opts?: { lastError?: string; refundAttempt?: boolean },
 ): Promise<void> {
   const nowMs = clock.now();
-  await db
-    .update(schema.jobs)
-    .set({
-      status: "queued",
-      runAt: secDate(runAtMs),
-      leaseExpiresAt: null,
-      lastError: opts?.lastError ?? null,
-      attempts: opts?.refundAttempt
-        ? sql`MAX(${schema.jobs.attempts} - 1, 0)`
-        : schema.jobs.attempts,
-      updatedAt: secDate(nowMs),
-    })
-    .where(and(eq(schema.jobs.id, jobId), eq(schema.jobs.status, "running")));
+  try {
+    await db
+      .update(schema.jobs)
+      .set({
+        status: "queued",
+        runAt: secDate(runAtMs),
+        leaseExpiresAt: null,
+        lastError: opts?.lastError ?? null,
+        attempts: opts?.refundAttempt
+          ? sql`MAX(${schema.jobs.attempts} - 1, 0)`
+          : schema.jobs.attempts,
+        updatedAt: secDate(nowMs),
+      })
+      .where(and(eq(schema.jobs.id, jobId), eq(schema.jobs.status, "running")));
+  } catch (e) {
+    if (isUniqueViolation(e)) {
+      // A queued sync-push follow-up already holds this project's queued slot — it supersedes this
+      // retry. Discharge this job cleanly instead of surfacing the violation on the settle path.
+      await db
+        .update(schema.jobs)
+        .set({
+          status: "done",
+          leaseExpiresAt: null,
+          lastError: "superseded by a queued sync-push follow-up",
+          updatedAt: secDate(nowMs),
+        })
+        .where(and(eq(schema.jobs.id, jobId), eq(schema.jobs.status, "running")));
+      return;
+    }
+    throw e;
+  }
 }
 
 /**
