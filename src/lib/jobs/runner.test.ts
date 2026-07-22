@@ -1166,6 +1166,48 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     expect(await tdb.db.select().from(schema.burnSamples)).toHaveLength(0);
   });
 
+  it("throttles the sampler: no fresh read for a second solo job inside the interval", async () => {
+    // The fresh read bypasses the usage cache; with maxConcurrent: 1 every solo completion would
+    // hit the endpoint. burnSampleMinIntervalMs caps that — a second job finishing inside the
+    // window records no sample and takes no fresh read; once the interval elapses, sampling resumes.
+    let freshReads = 0;
+    const r = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { ...CONFIG, burnSampleMinIntervalMs: 60_000 },
+      resolveBudgetPolicy: budgetAware,
+      readUsage: async () => usage(10, 5),
+      readUsageFresh: async () => {
+        freshReads += 1;
+        return usage(30, 8);
+      },
+    });
+    r.registerHandler("execute-epic", async () => {});
+
+    // First solo job samples.
+    await r.enqueue({ type: "execute-epic" });
+    await r.tickOnce();
+    await r.whenIdle();
+    expect(freshReads).toBe(1);
+    expect(await tdb.db.select().from(schema.burnSamples)).toHaveLength(1);
+
+    // Second job 30s later — inside the 60s window — must NOT hit the endpoint.
+    clock.advance(30_000);
+    await r.enqueue({ type: "execute-epic" });
+    await r.tickOnce();
+    await r.whenIdle();
+    expect(freshReads).toBe(1); // unchanged — throttled
+    expect(await tdb.db.select().from(schema.burnSamples)).toHaveLength(1);
+
+    // Past the window — sampling resumes.
+    clock.advance(31_000);
+    await r.enqueue({ type: "execute-epic" });
+    await r.tickOnce();
+    await r.whenIdle();
+    expect(freshReads).toBe(2);
+    expect(await tdb.db.select().from(schema.burnSamples)).toHaveLength(2);
+  });
+
   it("never reads usage when no budget resolver is wired at all", async () => {
     // Without a resolveBudgetPolicy dep nothing can be budget-aware, so the sampler stays fully off.
     let reads = 0;

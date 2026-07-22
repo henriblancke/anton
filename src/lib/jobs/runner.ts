@@ -64,6 +64,14 @@ export interface RunnerConfig {
   maxConcurrent: number;
   /** Poll interval for the background loop. */
   tickMs: number;
+  /**
+   * Minimum spacing between burn-sampler windows (anton-w8ny). Each window's post-job read goes
+   * *fresh* to the usage endpoint (bypassing the shared cache), so with `maxConcurrent: 1` every
+   * solo job completion would otherwise hit it — a fast churn of jobs hammers `/api/oauth/usage`
+   * and earns a 429. Opening a window at most once per this interval caps the sampler's upstream
+   * rate; the tradeoff is fewer (still-accurate) samples feeding the rolling burn averages.
+   */
+  burnSampleMinIntervalMs: number;
 }
 
 export const DEFAULT_CONFIG: RunnerConfig = {
@@ -74,6 +82,7 @@ export const DEFAULT_CONFIG: RunnerConfig = {
   quotaCooloffMs: 30 * 60_000,
   maxConcurrent: 1,
   tickMs: 2_000,
+  burnSampleMinIntervalMs: 60_000,
 };
 
 /**
@@ -259,6 +268,8 @@ export class JobRunner {
 
   /** Monotonic dispatch counter — lets a burn window detect that another job started inside it. */
   private dispatchSeq = 0;
+  /** Clock time of the last burn-sampler fresh read — throttles fresh usage reads (see config). */
+  private lastBurnSampleAt = 0;
   private readonly inFlight = new Map<string, AbortController>();
   /** Settlement promises for jobs dispatched but not yet settled — the drain set for whenIdle(). */
   private readonly pending = new Set<Promise<void>>();
@@ -808,8 +819,16 @@ export class JobRunner {
     // into the shared cache the nav pill reads. A closed gate leaves `burnBefore` null, which also
     // suppresses the post-job fresh read.
     const seqAtStart = ++this.dispatchSeq;
+    // Throttle the sampler: its post-job read bypasses the usage cache, so with maxConcurrent: 1
+    // every solo completion would hit the endpoint. Only open a window once per burnSampleMinIntervalMs
+    // — measured from the last window that actually took its closing read (stamped at close), so a
+    // contaminated window that bails doesn't spend the budget. Closing the gate leaves burnBefore
+    // null, which also suppresses the fresh post-job read below.
+    const burnDue = this.clock.now() - this.lastBurnSampleAt >= this.config.burnSampleMinIntervalMs;
     const burnBefore =
-      this.inFlight.size === 1 && (await this.budgetAwareFor(job.projectId ?? undefined))
+      burnDue &&
+      this.inFlight.size === 1 &&
+      (await this.budgetAwareFor(job.projectId ?? undefined))
         ? await this.readUsageSafe()
         : null;
 
@@ -873,6 +892,9 @@ export class JobRunner {
       // it — `dispatchSeq` unchanged), and is fully fail-soft — sampleJobBurn records nothing on a
       // null read or a mid-job meter reset and swallows its own errors.
       if (burnBefore && this.dispatchSeq === seqAtStart) {
+        // Stamp the throttle here, not at window open: only a window that actually takes its fresh
+        // upstream read spends the interval budget — a contaminated window that bailed doesn't.
+        this.lastBurnSampleAt = this.clock.now();
         await sampleJobBurn(this.db, this.clock, job.type as JobType, burnBefore, () =>
           this.readUsageFreshSafe(),
         );
