@@ -254,8 +254,9 @@ export async function getClaudeUsageFresh(
   usageInFlight = (async () => {
     try {
       const value = await fetcher();
-      usageCache = { at: now(), value };
-      if (value) lastGoodUsage = { at: now(), value };
+      const ts = now();
+      usageCache = { at: ts, value };
+      if (value) lastGoodUsage = { at: ts, value };
       return value;
     } finally {
       usageInFlight = null;

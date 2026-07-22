@@ -488,7 +488,11 @@ export class JobRunner {
     // master-switch) and pushes their queued runAt out to retryAt. Proactive back-off past the
     // reset/night boundary — the reactive UsageLimitError path below still backstops a wall we hit
     // anyway. Fails OPEN on a null usage read, so a broken meter never halts anton.
-    await this.applyBudgetGovernor(heldBucketKeys);
+    // `pacedExecuteEpicHolds` collects projects where only pacing defers (immediate work admits):
+    // their non-bypass execute-epic rows are capped at 0 in capOf below, so a crashed/lease-expired
+    // paced row isn't reclaimed ahead of the pace boundary while bypass rows still lease.
+    const pacedExecuteEpicHolds = new Set<string>();
+    await this.applyBudgetGovernor(heldBucketKeys, pacedExecuteEpicHolds);
 
     // With a policy resolver, gate execute-epic concurrency per project. Precompute each pending
     // project's cap so leaseDue can decide synchronously; other job types stay ungated (Infinity).
@@ -514,6 +518,15 @@ export class JobRunner {
     const capOf = (job: JobRow) => {
       if (job.projectId && this.quiescedProjects.has(job.projectId)) return 0;
       if (disabledSchedules.has(scheduleGateKey(job.type, job.projectId))) return 0;
+      // Paced project: keep non-bypass execute-epic rows (the "Queue for optimal usage" ones)
+      // unleasable so a crash/lease-expiry reclaim can't restart one ahead of the pace boundary.
+      // Bypass ("Approve") rows fall through to their normal per-project cap.
+      if (
+        pacedExecuteEpicHolds.has(scheduleGateKey(job.type, job.projectId)) &&
+        (parsePayload(job.payloadJson) as { bypassBudget?: unknown } | null)?.bypassBudget !== true
+      ) {
+        return 0;
+      }
       return policyCapOf?.(job) ?? Infinity;
     };
 
@@ -544,10 +557,16 @@ export class JobRunner {
    * Proactive budget gate (anton-szld). For each project with pending governed jobs, ask
    * `budgetGate` whether autonomous work may run now; on a DEFER verdict, hold that project's
    * governed buckets for this tick and push their queued jobs' runAt out to the governor's retryAt.
+   * When only pacing defers (immediate work still admits), the execute-epic bucket is added to
+   * `pacedExecuteEpicHolds` instead of held outright, so capOf can block reclaim of crashed paced
+   * rows without stopping bypass ("Approve") rows.
    * Only runs when a budget-policy resolver is injected. Fails OPEN: a null usage read defers nothing
    * (a missing meter must never starve the queue), mirroring `budgetGate`'s own contract.
    */
-  private async applyBudgetGovernor(heldBucketKeys: Set<string>): Promise<void> {
+  private async applyBudgetGovernor(
+    heldBucketKeys: Set<string>,
+    pacedExecuteEpicHolds: Set<string>,
+  ): Promise<void> {
     if (!this.resolveBudgetPolicy) return;
 
     // The gate decides per project (day window / reserve are per-project knobs), so gather every
@@ -618,10 +637,16 @@ export class JobRunner {
         // Every execute-epic row for the project is now deferred (paced + immediate), so hold the
         // whole bucket as the starvation guard, matching the schedule master-switch.
         heldBucketKeys.add(scheduleGateKey("execute-epic", pid));
+      } else {
+        // Immediate rows run this tick — do NOT hold the execute-epic bucket. The paced *queued*
+        // rows were just pushed to a future runAt, so they're not runnable and can't crowd the
+        // finite scan window (the reason the bucket is normally held). But a paced row that
+        // crashed or lost its lease is still `running` with an expired lease — deferQueuedJobs
+        // (queued-only) can't move it, and without a hold leaseDue would reclaim and restart it
+        // now, bypassing "Queue for optimal usage" exactly after a crash. Mark the bucket paced
+        // so capOf caps its non-bypass rows at 0; bypass rows still lease as usual.
+        pacedExecuteEpicHolds.add(scheduleGateKey("execute-epic", pid));
       }
-      // else: immediate rows run this tick — do NOT hold the execute-epic bucket. The paced rows were
-      // just pushed to a future runAt, so they're not runnable and can't crowd the finite scan window
-      // (the reason the bucket is normally held); the immediate rows stay due and lease as usual.
     }
   }
 

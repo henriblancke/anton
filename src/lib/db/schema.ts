@@ -86,8 +86,10 @@ export const schedules = sqliteTable("schedules", {
 
 /**
  * Per-job Claude burn samples (anton-w8ny). One row per completed job attempt: the session%/weekly%
- * that moved across the job, attributed to its TYPE. maxConcurrent=1 per machine makes attribution
- * clean — nothing else ran in the window, so the whole delta is this job's. A rolling per-type
+ * that moved across the job, attributed to its TYPE. Attribution is clean only for solo windows:
+ * the runner opens a burn window only when this job runs alone (nothing else in flight), and
+ * discards the window if a sibling is dispatched before it closes — so every recorded delta is
+ * unambiguously one job's cost. A rolling per-type
  * average over the most recent samples feeds pacing/prioritization; a static tier seed answers until
  * enough real samples accrue. Machine-local by design (no cross-machine aggregation).
  */

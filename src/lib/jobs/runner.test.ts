@@ -1329,6 +1329,47 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     expect(pacedJob?.lastError).toMatch(/budget: weekly-on-track/);
   });
 
+  it("does NOT reclaim a crashed (lease-expired) paced execute-epic during a paced deferral, while a crashed bypass row reclaims (anton-d8i4)", async () => {
+    // Weekly-on-track pacing defers non-bypass work while immediate work admits. deferQueuedJobs
+    // only moves `queued` rows, so a paced job that was leased and then crashed sits `running`
+    // with an expired lease — it must NOT be reclaimed and restarted ahead of the pace boundary,
+    // while a bypass ("Approve") row in the same crashed state reclaims normally.
+    await seedProjects("A");
+    const s = await import("../db/schema");
+    const seedCrashed = async (id: string, payload: object) => {
+      await tdb.db.insert(s.jobs).values({
+        id,
+        type: "execute-epic",
+        projectId: "A",
+        payloadJson: JSON.stringify(payload),
+        status: "running",
+        runAt: new Date(clock.now() - 100_000),
+        leaseExpiresAt: new Date(clock.now() - 50_000), // already expired — looks reclaimable
+        attempts: 1,
+      });
+    };
+    await seedCrashed("crashed-paced", { projectId: "A", epicBeadId: "A-1" });
+    await seedCrashed("crashed-bypass", { projectId: "A", epicBeadId: "A-2", bypassBudget: true });
+
+    const weeklyResetAt = new Date(clock.now() + 3.5 * 24 * 60 * 60 * 1000).toISOString();
+    let ran = 0;
+    const r = budgetRunner(
+      async () => {
+        ran += 1;
+      },
+      { readUsage: async () => usage({ sessionPct: 10, weeklyPct: 80, weeklyResetAt }) },
+    );
+
+    expect(await r.tickOnce()).toBe(1); // only the bypass row reclaims
+    await r.whenIdle();
+    expect(ran).toBe(1);
+    expect((await getJob(tdb.db, "crashed-bypass"))?.status).toBe("done");
+    // The paced row stays un-reclaimed this tick; it resumes when pacing admits again.
+    const paced = await getJob(tdb.db, "crashed-paced");
+    expect(paced?.status).toBe("running");
+    expect(paced?.attempts).toBe(1); // no reclaim → no new attempt burned
+  });
+
   it("still holds an immediate-approved execute-epic at the session-headroom floor (anton-d8i4)", async () => {
     // The session floor is the one hold "Approve" (immediate) does NOT bypass — it protects the tail
     // of the 5h session, so an immediate run can't blow the cap it would only hit mid-run.
