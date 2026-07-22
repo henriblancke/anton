@@ -1,9 +1,11 @@
 /**
- * Dedupe + resume tests for the durable sync-push job (anton-nowq): the transactional guard
- * (`enqueueSyncPushDeduped`) plus the partial unique index `jobs_active_sync_push_unique` that backs
- * it. A repo's writes all push the same Dolt remote, so a burst of writes must collapse onto ONE
- * active push job — never a queue full of redundant pushes — while a settled push doesn't block the
- * next write from scheduling its own.
+ * Dedupe + resume tests for the durable sync-push job (anton-nowq, anton-x7la): the transactional
+ * guard (`enqueueSyncPushDeduped`) plus the partial unique index `jobs_active_sync_push_unique` that
+ * backs it. A repo's writes all push the same Dolt remote, so a burst collapses onto at most one
+ * QUEUED push job — never a queue full of redundant pushes. Dedupe is queued-only, NOT running: a
+ * write that lands while a push is in flight schedules exactly one durable follow-up (bounded at
+ * 1 running + 1 queued), so its work can't rest solely on a fire-and-forget pass; a settled push
+ * never blocks the next write from scheduling its own.
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
@@ -31,7 +33,7 @@ function activeRows() {
 }
 
 describe("enqueueSyncPushDeduped", () => {
-  it("returns the existing job id and inserts no new row when an active push job exists", () => {
+  it("returns the existing job id and inserts no new row when a queued push job exists", () => {
     const a = enqueueSyncPushDeduped(t.db, systemClock, "p1");
     const b = enqueueSyncPushDeduped(t.db, systemClock, "p1");
     expect(b).toBe(a);
@@ -40,12 +42,23 @@ describe("enqueueSyncPushDeduped", () => {
     expect(JSON.parse(allRows()[0]!.payloadJson)).toEqual({ projectId: "p1" });
   });
 
-  it("dedupes against a running job, not just a queued one", () => {
+  it("enqueues a durable follow-up against a running job — does NOT dedupe onto it (anton-x7la)", () => {
+    // A write that lands while a push is `running` must schedule a fresh queued follow-up: the running
+    // job's push may have snapshotted before this write committed, so folding onto it would leave the
+    // write's durability resting only on the fire-and-forget trailing pass. Bounded at 1 running + 1
+    // queued — a second write while both exist dedupes onto the queued follow-up.
     const a = enqueueSyncPushDeduped(t.db, systemClock, "p1");
     t.db.update(schema.jobs).set({ status: "running" }).where(eq(schema.jobs.id, a)).run();
+
     const b = enqueueSyncPushDeduped(t.db, systemClock, "p1");
-    expect(b).toBe(a);
-    expect(allRows()).toHaveLength(1);
+    expect(b).not.toBe(a); // fresh follow-up, not the running job
+    expect(allRows()).toHaveLength(2);
+    expect(activeRows()).toHaveLength(2); // 1 running + 1 queued
+
+    // A further write while the running + queued pair exists coalesces onto the queued follow-up.
+    const c = enqueueSyncPushDeduped(t.db, systemClock, "p1");
+    expect(c).toBe(b);
+    expect(allRows()).toHaveLength(2);
   });
 
   it("keeps repos (projects) independent", () => {
@@ -95,26 +108,37 @@ describe("enqueueSyncPushDeduped", () => {
 });
 
 describe("jobs_active_sync_push_unique (DB backstop)", () => {
-  it("rejects a second active sync-push row for the same project", () => {
-    enqueueSyncPushDeduped(t.db, systemClock, "p1");
-    const nowSec = new Date(Math.floor(systemClock.now() / 1000) * 1000);
-    // Bypass the transactional guard and force a raw duplicate active insert — the index rejects it.
-    expect(() =>
-      t.db
-        .insert(schema.jobs)
-        .values({
-          id: "dup",
-          type: "sync-push",
-          projectId: "p1",
-          payloadJson: JSON.stringify({ projectId: "p1" }),
-          status: "queued",
-          runAt: nowSec,
-          createdAt: nowSec,
-          updatedAt: nowSec,
-        })
-        .run(),
-    ).toThrow(/UNIQUE/i);
+  const nowSec = () => new Date(Math.floor(systemClock.now() / 1000) * 1000);
+  const rawInsert = (id: string, status: string) =>
+    t.db
+      .insert(schema.jobs)
+      .values({
+        id,
+        type: "sync-push",
+        projectId: "p1",
+        payloadJson: JSON.stringify({ projectId: "p1" }),
+        status,
+        runAt: nowSec(),
+        createdAt: nowSec(),
+        updatedAt: nowSec(),
+      })
+      .run();
+
+  it("rejects a second QUEUED sync-push row for the same project", () => {
+    enqueueSyncPushDeduped(t.db, systemClock, "p1"); // one queued row
+    // Bypass the transactional guard and force a raw duplicate queued insert — the index rejects it.
+    expect(() => rawInsert("dup", "queued")).toThrow(/UNIQUE/i);
     expect(activeRows()).toHaveLength(1);
+  });
+
+  it("allows a queued follow-up alongside a running job (anton-x7la)", () => {
+    // The index is queued-only: a running push + one queued follow-up is the intended bounded state,
+    // so the follow-up insert must NOT be rejected. Overlap on the remote is prevented by the
+    // per-repo coalescer, not this index.
+    const a = enqueueSyncPushDeduped(t.db, systemClock, "p1");
+    t.db.update(schema.jobs).set({ status: "running" }).where(eq(schema.jobs.id, a)).run();
+    expect(() => rawInsert("followup", "queued")).not.toThrow();
+    expect(activeRows()).toHaveLength(2); // 1 running + 1 queued
   });
 });
 

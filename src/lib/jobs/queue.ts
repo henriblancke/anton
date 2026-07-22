@@ -279,8 +279,14 @@ export function enqueueExecuteEpicDeduped(
   }
 }
 
-/** Id of the currently-active (`queued`|`running`) sync-push job for this project, if any. */
-export function activeSyncPushId(
+/**
+ * Id of the `queued` (not-yet-running) sync-push job for this project, if any — the dedupe target
+ * for `enqueueSyncPushDeduped`. Deliberately excludes `running`: a write that arrives while a push
+ * is in flight must be able to schedule a fresh queued follow-up rather than fold onto a running
+ * job whose push may already be past its snapshot (anton-x7la). The `jobs_active_sync_push_unique`
+ * index — now queued-only — guarantees at most one such follow-up per project.
+ */
+function queuedSyncPushId(
   tx: Pick<AntonDb, "select">,
   projectId: string,
 ): string | undefined {
@@ -291,7 +297,7 @@ export function activeSyncPushId(
       and(
         eq(schema.jobs.type, "sync-push"),
         eq(schema.jobs.projectId, projectId),
-        inArray(schema.jobs.status, [...ACTIVE_STATUSES]),
+        eq(schema.jobs.status, "queued"),
       ),
     )
     .limit(1)
@@ -300,17 +306,21 @@ export function activeSyncPushId(
 }
 
 /**
- * Enqueue a durable sync-push job for a project's repo, deduped per repo (anton-nowq). Every local
- * write can call this; the dedupe collapses a burst of writes onto ONE active push job (all of a
- * repo's writes push the same Dolt remote), so the queue never fills with redundant pushes.
+ * Enqueue a durable sync-push job for a project's repo, deduped per repo (anton-nowq, anton-x7la).
+ * Every local write can call this; the dedupe collapses a burst of writes onto at most one QUEUED
+ * push job (all of a repo's writes push the same Dolt remote), so the queue never fills with
+ * redundant pushes.
  *
- * Returns the existing job's id (inserting no new row) when a `queued`/`running` sync-push job
- * already covers this project; otherwise inserts a fresh `queued` job and returns its id. Prior
- * done/parked/failed jobs don't block a new one — a settled push must not stop the next write from
- * scheduling its own durable push.
+ * Dedupe is on the `queued` job only — NOT a `running` one. Returns the existing queued job's id
+ * (inserting no new row) when one already covers this project; otherwise inserts a fresh `queued`
+ * job and returns its id. A write that lands while an earlier push is still `running` therefore
+ * schedules a durable follow-up (the running job may have snapshotted before this write committed),
+ * closing the E2 gap where such a write's durability rested only on a fire-and-forget trailing pass.
+ * The result is bounded at 1 running + 1 queued per project; the per-repo coalescer keeps the two
+ * from ever overlapping on the remote. Prior done/parked/failed jobs don't block a new one.
  *
  * Same shape as `enqueueExecuteEpicDeduped`: the select-existing + insert run in one synchronous
- * better-sqlite3 transaction (so concurrent enqueues serialize to one active job), and the partial
+ * better-sqlite3 transaction (so concurrent enqueues serialize to one queued job), and the partial
  * unique index `jobs_active_sync_push_unique` is the DB-level backstop — a race that slips past the
  * guard raises UNIQUE, which we absorb by returning the row that won.
  */
@@ -322,7 +332,7 @@ export function enqueueSyncPushDeduped(
   const nowMs = clock.now();
   try {
     return db.transaction((tx) => {
-      const existing = activeSyncPushId(tx, projectId);
+      const existing = queuedSyncPushId(tx, projectId);
       if (existing) return existing;
 
       const id = randomUUID();
@@ -342,9 +352,10 @@ export function enqueueSyncPushDeduped(
       return id;
     });
   } catch (e) {
-    // Backstop: the index rejected a concurrent insert. Return the job that won the race.
+    // Backstop: the index rejected a concurrent insert of the queued follow-up. Return the queued
+    // job that won the race (the index is now queued-only, so the conflict is on that row).
     if (isUniqueViolation(e)) {
-      const winner = activeSyncPushId(db, projectId);
+      const winner = queuedSyncPushId(db, projectId);
       if (winner) return winner;
     }
     throw e;

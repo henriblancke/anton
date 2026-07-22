@@ -71,13 +71,20 @@ export const jobs = sqliteTable(
         sql`json_extract(${table.payloadJson}, '$.epicBeadId')`,
       )
       .where(sql`${table.status} in ('queued', 'running')`),
-    // At most one active (queued|running) sync-push job per project (anton-nowq). A repo's writes
-    // all target the same Dolt remote, so a burst of writes coalesces onto one durable push job
-    // rather than one per write. Partial on type='sync-push' so it never touches other job types;
-    // the transactional guard in enqueueSyncPushDeduped is the fast path, this index the backstop.
+    // At most one QUEUED sync-push job per project (anton-nowq, tightened anton-x7la). Only queued
+    // rows are constrained — NOT running. A write that lands while a push is already `running` dedups
+    // onto that job's earlier push, but that push may have snapshotted before the write committed; the
+    // write must therefore be able to enqueue exactly ONE durable follow-up (a fresh queued job) that
+    // will push the new work and retry/park on failure. Constraining running too (the old predicate)
+    // suppressed that follow-up and left the write's durability resting only on the fire-and-forget
+    // trailing coalescer pass — the E2 gap this closes. A burst still coalesces: every write during an
+    // in-flight push collapses onto the single queued follow-up (1 running + 1 queued max). Overlapping
+    // pushes are prevented by the per-repo COALESCER, not this index (beads GH#2466), so two active
+    // sync-push jobs can never double-push. Partial on type='sync-push' so it never touches other job
+    // types; the transactional guard in enqueueSyncPushDeduped is the fast path, this index the backstop.
     uniqueIndex("jobs_active_sync_push_unique")
       .on(table.projectId)
-      .where(sql`${table.type} = 'sync-push' and ${table.status} in ('queued', 'running')`),
+      .where(sql`${table.type} = 'sync-push' and ${table.status} = 'queued'`),
   ],
 );
 

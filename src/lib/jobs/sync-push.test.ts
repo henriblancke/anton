@@ -123,17 +123,20 @@ describe("sync-push durability (runner + real coalescer)", () => {
     expect(job?.attempts).toBe(0);
   });
 
-  it("completes when the coalescer resolves the backstop to a pull-only no-op", async () => {
-    // A caught-up, reconciled repo pushes nothing on a backstop; the job still completes cleanly.
+  it("completes when the push pass is a no-op on a caught-up repo", async () => {
+    // Mirror production: the handler forces a full "push" pass unconditionally. On a caught-up,
+    // reconciled repo that push lands nothing (bd dolt push is a clean exit 0) — the job still
+    // completes done, idempotently. (The handler uses "push", NOT "backstop", precisely so a
+    // still-in-flight write can't snapshot count 0 and drop it to pull-only.)
     const clock = new FakeClock(1_700_000_000_000);
     const coalescer = createDoltSync(async () => ""); // every bd step is a clean no-op
-    // Reconcile the repo once (a full pass) so a later backstop drops to pull-only.
+    // Reconcile the repo once (a full pass) so the state registry is caught up before the job runs.
     await coalescer("/tmp/p1", "full");
 
     const runner = new JobRunner({ db: t.db, clock, config: CONFIG });
     runner.registerHandler(
       "sync-push",
-      makeSyncPushHandler({ db: t.db, push: (cwd) => coalescer(cwd, "backstop") }),
+      makeSyncPushHandler({ db: t.db, push: (cwd) => coalescer(cwd, "push") }),
     );
     const id = enqueueSyncPushDeduped(t.db, clock, "p1");
     await runner.tickOnce();
