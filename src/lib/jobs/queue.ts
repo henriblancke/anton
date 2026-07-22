@@ -491,6 +491,34 @@ export async function projectIdsWithPendingJobs(
   return rows.map((r) => r.projectId);
 }
 
+/**
+ * The `queued` jobs of `types` for one project that are due now — the candidates the runner's
+ * per-job value gate (anton-k05r) evaluates before leasing. Read-only (holds are per-tick, applied
+ * via leaseDue's `exclude`); ordered by runAt to match leaseDue's own scan order.
+ */
+export async function queuedDueJobs(
+  db: AntonDb,
+  clock: Clock,
+  opts: { types: readonly JobType[]; projectId: string | null | undefined },
+): Promise<JobRow[]> {
+  if (opts.types.length === 0) return [];
+  const nowDate = secDate(clock.now());
+  return db
+    .select()
+    .from(schema.jobs)
+    .where(
+      and(
+        eq(schema.jobs.status, "queued"),
+        inArray(schema.jobs.type, [...opts.types]),
+        opts.projectId == null
+          ? isNull(schema.jobs.projectId)
+          : eq(schema.jobs.projectId, opts.projectId),
+        lte(schema.jobs.runAt, nowDate),
+      ),
+    )
+    .orderBy(schema.jobs.runAt);
+}
+
 /** Heartbeat: extend the lease on a running job while its handler works. */
 export async function renewLease(
   db: AntonDb,

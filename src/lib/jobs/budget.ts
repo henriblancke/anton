@@ -1,20 +1,28 @@
 /**
- * Budget governor + pace-line (anton-7tcc). The keystone arbiter: from live Claude usage, a
- * policy, and the clock it decides whether autonomous work may start *now* or must defer (with a
- * `retryAt`). It reconciles two pulls — "spend the whole weekly plan" vs "keep a daytime reserve /
- * prefer nights" — along a single pace-line.
+ * Budget governor (anton-7tcc). The keystone arbiter: from live Claude usage, a policy, and the
+ * clock it decides whether autonomous work may start *now* or must defer (with a `retryAt`).
+ *
+ * The model is **idle-fill** (anton-ld7j): the whole point is to soak up otherwise-idle weekly
+ * quota — capacity that resets unused each week and is simply wasted if not spent — so spare weekly
+ * budget is used freely, and only the real limits push back. The weekly plan is a *ceiling*, not an
+ * even-pace rail: run below it, throttle only the last stretch so it lasts to the reset, stop at it.
+ * A productive early-week burst is NOT benched just for being ahead of an even line. A daytime
+ * reserve still holds the tail of the *session* for interactive use, so anton doesn't eat the last
+ * of your 5-hour window out from under you during the day.
  *
  * Pure + injected clock (mirrors `nextAction` in ./runner): no timers, no I/O, `now` is a plain
  * epoch-ms argument, so every branch is unit-testable deterministically.
  *
- * The three defer reasons, in priority order:
+ * The defer reasons, in priority order:
  *   • session-headroom — the 5-hour session is nearly exhausted; a hard floor that outranks the
  *     weekly plan (never burn the last sliver of a session). Defers to the session reset.
- *   • weekly-on-track  — usage is *ahead* of where the pace-line says it should be for this point
- *     in the week (a front-loaded burst). Ease off until the pace-line catches up, day OR night.
+ *   • weekly-cap       — weekly usage has hit the cap (the operator's weekly budget). Stop until the
+ *     weekly window resets, protecting the reserve (100 − cap) and Claude's own hard limit.
+ *   • weekly-on-track  — inside the throttle band just below the cap AND *ahead* of the even
+ *     pace-line: ease off until the line catches up, so the last stretch of budget lasts to reset.
  *   • daytime-reserve  — inside the day window with the session running low: hold the remaining
  *     session for interactive daytime use and defer to tonight — UNLESS we're *behind* pace, in
- *     which case work spills into the day to hit the weekly plan.
+ *     which case work spills into the day.
  *
  * Fail-open is the master rule: a null usage read (missing creds, offline, a broken fetch) admits,
  * so a degraded read never halts anton.
@@ -22,7 +30,7 @@
 import type { ClaudeUsage } from "../claude/usage";
 
 /** Why work was deferred. The runner/admission-gate surfaces this to the operator. */
-export type DeferReason = "session-headroom" | "daytime-reserve" | "weekly-on-track";
+export type DeferReason = "session-headroom" | "weekly-cap" | "weekly-on-track" | "daytime-reserve";
 
 /**
  * Operator-tunable pace policy. Percentages are 0–100 (same scale as {@link ClaudeUsage}). The
@@ -41,8 +49,18 @@ export interface BudgetPolicy {
   dayEndHour: number;
   /** Offset applied to the clock to derive local hour/boundaries (e.g. -420 for PDT). */
   utcOffsetMinutes: number;
-  /** Target weekly utilization by the week's reset — the "spend the whole plan" line. */
+  /**
+   * Weekly cap: the ceiling on weekly utilization anton will spend on autonomous work (idle-fill,
+   * anton-ld7j). At/above it work stops until the weekly resets, protecting the reserve (100 − this)
+   * and Claude's own hard limit. Below the {@link throttleBandPct} band it's spent freely.
+   */
   weeklyTargetPct: number;
+  /**
+   * Throttle band (percentage points below the cap) where pacing engages (anton-ld7j). In
+   * `[cap − this, cap)` anton paces against the even line so the last stretch lasts to the reset;
+   * below `cap − this` it's pure idle-fill (run freely). Internal — not an operator knob.
+   */
+  throttleBandPct: number;
   /** Dead-band around the pace-line, applied to both sides (behind and ahead). */
   paceSlackPct: number;
   /** Length of the weekly window backing the pace math (Claude's is 7 days). */
@@ -91,6 +109,7 @@ export const DEFAULT_BUDGET_POLICY: BudgetPolicy = {
   dayEndHour: 22,
   utcOffsetMinutes: 0,
   weeklyTargetPct: 100,
+  throttleBandPct: 20,
   paceSlackPct: 5,
   weekMs: 7 * DAY_MS,
   sessionWindowMs: 5 * HOUR_MS,
@@ -196,7 +215,7 @@ function isNight(now: number, policy: BudgetPolicy): boolean {
  * `now` is epoch-ms (injected for tests). A null `usage` fails OPEN — a broken read never halts.
  *
  * `opts.skipPacing` is the "run directly" bypass (anton-d8i4): an epic the operator approved for
- * immediate execution skips the weekly-on-track and daytime-reserve *pacing* holds but NOT the
+ * immediate execution skips the weekly (cap/throttle) and daytime-reserve *pacing* holds but NOT the
  * session-headroom floor — that hard limit still protects the tail of a 5-hour session, so an
  * immediate run can't blow past the cap it would only hit mid-run. With it set, the gate admits as
  * soon as the session floor clears.

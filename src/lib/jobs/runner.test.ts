@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
-import { getBurnAverage } from "../burn";
+import { getBurnAverage, recordBurnSample } from "../burn";
 import type { ClaudeUsage } from "../claude/usage";
 import { PoisonError, RunAlreadyLiveError, UsageLimitError } from "./errors";
 import { complete, enqueue, getJob, park, reschedule, toMs, type Clock } from "./queue";
@@ -17,6 +17,7 @@ import {
   DEFAULT_CONFIG,
   JobRunner,
   nextAction,
+  type BeadLabelsReader,
   type BudgetPolicyResolver,
   type JobHandler,
   type JobPolicy,
@@ -1223,6 +1224,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
       readUsage: () => Promise<ClaudeUsage | null>;
       policy?: BudgetPolicy;
       resolveBudgetPolicy?: BudgetPolicyResolver;
+      readBeadLabels?: BeadLabelsReader;
     },
   ) {
     const r = new JobRunner({
@@ -1233,6 +1235,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
       // Keep the burn sampler off the real endpoint — these tests exercise the governor only.
       readUsageFresh: async () => null,
       resolveBudgetPolicy: opts.resolveBudgetPolicy ?? (() => opts.policy ?? DEFAULT_BUDGET_POLICY),
+      readBeadLabels: opts.readBeadLabels,
     });
     for (const type of ["execute-epic", "review-fix", "nightly-stringer", "orphan-grooming"] as const) {
       r.registerHandler(type, handler);
@@ -1454,6 +1457,143 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     expect(toMs(job?.runAt)).toBe(resetAt * 1000);
     expect(job?.attempts).toBe(0); // attempt refunded — quota isn't the job's fault
     expect(job?.lastError).toMatch(/usage-limit/);
+  });
+
+  // ── Per-job value/cost gate (anton-k05r) ──
+  // The clock (1_700_000_000_000 ≈ 22:13 UTC) is NIGHT under the default policy (day 8–22), so the
+  // daytime reserve never holds these ticks: the coarse gate admits and the fine gate decides.
+  // sessionPct 85 → 15% headroom ≤ scarceHeadroomPct 20 → scarce (high-value only).
+
+  /** Labels by bead id for the gate's reader; anything not listed reads as label-less cleanup. */
+  const labelsReader =
+    (byBead: Record<string, string[]>): BeadLabelsReader =>
+    async (_pid, beadId) =>
+      byBead[beadId] ?? [];
+
+  /** Seed enough real burn samples that execute-epic's rolling average is `sessionDelta` (not the L-tier seed). */
+  async function seedBurn(sessionDelta: number) {
+    for (let i = 0; i < 5; i++) {
+      await recordBurnSample(tdb.db, clock, "execute-epic", { sessionDelta, weeklyDelta: 0.1 });
+    }
+  }
+
+  it("value gate: scarce session admits only high-value work, holding cleanup un-deferred (anton-k05r)", async () => {
+    await seedProjects("A");
+    await seedBurn(2); // measured cost 2% — fits the 15% headroom
+    let ran = 0;
+    const r = budgetRunner(
+      async () => {
+        ran += 1;
+      },
+      {
+        readUsage: async () => usage({ sessionPct: 85 }),
+        readBeadLabels: labelsReader({ "A-high": ["risk:high"] }),
+      },
+    );
+    const high = await r.enqueue({
+      type: "execute-epic",
+      projectId: "A",
+      payload: { projectId: "A", epicBeadId: "A-high" },
+    });
+    const low = await r.enqueue({
+      type: "execute-epic",
+      projectId: "A",
+      payload: { projectId: "A", epicBeadId: "A-low" },
+    });
+
+    expect(await r.tickOnce()).toBe(1); // only the risk:high job clears the scarce threshold
+    await r.whenIdle();
+    expect(ran).toBe(1);
+    expect((await getJob(tdb.db, high))?.status).toBe("done");
+    // The held job is untouched — still queued and due (a per-tick hold, not a deferral), no
+    // attempt burned. It re-evaluates next tick and leases the moment budget loosens.
+    const held = await getJob(tdb.db, low);
+    expect(held?.status).toBe("queued");
+    expect(held?.attempts).toBe(0);
+    expect(toMs(held?.runAt)).toBeLessThanOrEqual(clock.now());
+  });
+
+  it("value gate: a job whose cost cannot fit the remaining session is held even at high value", async () => {
+    await seedProjects("A");
+    // No burn samples → execute-epic costs the L-tier seed (20%), over the 15% headroom.
+    const r = budgetRunner(async () => {}, {
+      readUsage: async () => usage({ sessionPct: 85 }),
+      readBeadLabels: labelsReader({ "A-1": ["risk:high"] }),
+    });
+    await r.enqueue({
+      type: "execute-epic",
+      projectId: "A",
+      payload: { projectId: "A", epicBeadId: "A-1" },
+    });
+
+    expect(await r.tickOnce()).toBe(0); // cost-exceeds-headroom — admitting guarantees mid-run exhaustion
+  });
+
+  it("value gate: abundant budget admits low-value cleanup", async () => {
+    await seedProjects("A");
+    const r = budgetRunner(async () => {}, {
+      readUsage: async () => usage({ sessionPct: 10 }), // 90% headroom ≥ abundant 60 → threshold 0
+      readBeadLabels: labelsReader({}),
+    });
+    const id = await r.enqueue({
+      type: "execute-epic",
+      projectId: "A",
+      payload: { projectId: "A", epicBeadId: "A-1" },
+    });
+
+    expect(await r.tickOnce()).toBe(1);
+    await r.whenIdle();
+    expect((await getJob(tdb.db, id))?.status).toBe("done");
+  });
+
+  it("value gate: holds the orphan-grooming cleanup sweep when the session is scarce", async () => {
+    // Grooming carries no bead — it IS the low-value cleanup band — so scarce budget holds it
+    // without any label read, and it drains later when budget is abundant/behind pace.
+    await seedProjects("A");
+    const r = budgetRunner(async () => {}, {
+      readUsage: async () => usage({ sessionPct: 85 }),
+    });
+    const id = await r.enqueue({ type: "orphan-grooming", projectId: "A" });
+
+    expect(await r.tickOnce()).toBe(0);
+    expect((await getJob(tdb.db, id))?.status).toBe("queued");
+  });
+
+  it("value gate: fails open when the bead's labels cannot be read", async () => {
+    await seedProjects("A");
+    await seedBurn(2);
+    const r = budgetRunner(async () => {}, {
+      readUsage: async () => usage({ sessionPct: 85 }),
+      readBeadLabels: async () => null, // bead unresolved → must admit, never starve on a guess
+    });
+    const id = await r.enqueue({
+      type: "execute-epic",
+      projectId: "A",
+      payload: { projectId: "A", epicBeadId: "A-1" },
+    });
+
+    expect(await r.tickOnce()).toBe(1);
+    await r.whenIdle();
+    expect((await getJob(tdb.db, id))?.status).toBe("done");
+  });
+
+  it("value gate: an immediate-approved (bypassBudget) job skips the value gate", async () => {
+    // The operator asked for "now" — only the session floor may hold it, not the value threshold.
+    await seedProjects("A");
+    await seedBurn(2);
+    const r = budgetRunner(async () => {}, {
+      readUsage: async () => usage({ sessionPct: 85 }),
+      readBeadLabels: labelsReader({}), // would score as cleanup and be held if gated
+    });
+    const id = await r.enqueue({
+      type: "execute-epic",
+      projectId: "A",
+      payload: { projectId: "A", epicBeadId: "A-1", bypassBudget: true },
+    });
+
+    expect(await r.tickOnce()).toBe(1);
+    await r.whenIdle();
+    expect((await getJob(tdb.db, id))?.status).toBe("done");
   });
 });
 

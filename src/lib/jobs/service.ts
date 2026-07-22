@@ -13,6 +13,7 @@ import {
   resolveBudgetPolicy as resolveBudgetPolicyFromSettings,
 } from "../projects";
 import { beads } from "../beads/bd";
+import { allIssues } from "../beads/issues";
 import { preflightBd } from "../beads/bd-bin";
 import { makeExecuteEpicHandler } from "./execute-epic";
 import { makeReviewFixHandler } from "./review-fix";
@@ -90,6 +91,23 @@ async function liveRunCheck(projectId: string, epicBeadId: string): Promise<bool
   }
 }
 
+/**
+ * Bead-label source for the runner's per-job value gate (anton-k05r): the labels of a queued
+ * execute-epic job's target bead, so `jobValueScore` can rank governed work at lease time. Serves
+ * off the shared issue snapshot (warm within its max-age) rather than `bd show`, so the 2s runner
+ * tick never spawns bd per queued job. Returns `null` on any miss — the gate fails open on null.
+ */
+async function readBeadLabels(projectId: string, beadId: string): Promise<readonly string[] | null> {
+  try {
+    const project = await getProjectById(getDb(), projectId);
+    if (!project) return null;
+    const bead = (await allIssues(project.repoPath)).find((b) => b.id === beadId);
+    return bead?.labels ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export function getRunner(): JobRunner {
   if (_runner) return _runner;
   const db = getDb();
@@ -101,6 +119,7 @@ export function getRunner(): JobRunner {
     resolvePolicy,
     resolveBudgetPolicy,
     liveRunCheck,
+    readBeadLabels,
   });
   runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db }));
   runner.registerHandler("review-fix", makeReviewFixHandler({ db }));

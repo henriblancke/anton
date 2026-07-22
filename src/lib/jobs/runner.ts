@@ -28,12 +28,14 @@ import {
   leaseDue,
   park,
   projectIdsWithPendingJobs,
+  queuedDueJobs,
   reclaimRunningJobs,
   renewLease,
   reschedule,
   resumeJob,
   scheduleGateKey,
   systemClock,
+  toMs,
   type AntonDb,
   type Clock,
   type JobRow,
@@ -42,9 +44,9 @@ import {
 import { reconcileInterruptedRuns } from "../runs";
 import { isPoisonError, isRunAlreadyLiveError, isUsageLimitError } from "./errors";
 import { PollingLoop } from "./polling-loop";
-import { sampleJobBurn } from "../burn";
+import { getBurnAverage, sampleJobBurn } from "../burn";
 import { getClaudeUsageCached, getClaudeUsageFresh, type ClaudeUsage } from "../claude/usage";
-import { budgetGate, type BudgetPolicy } from "./budget";
+import { admitJob, budgetGate, jobValueScore, type BudgetPolicy } from "./budget";
 
 export interface RunnerConfig {
   /** How long a lease is held before a job is considered crashed. */
@@ -136,6 +138,17 @@ export type LiveRunCheck = (
   projectId: string,
   epicBeadId: string,
 ) => Promise<boolean> | boolean;
+
+/**
+ * Bead-label source for the per-job value gate (anton-k05r): the labels of a job's target bead
+ * (e.g. `risk:high`, `blocking-PR`), read at lease time so `jobValueScore` can rank governed work.
+ * Returns `null` when the bead can't be resolved — the gate fails open on null (admits the job)
+ * rather than starving work on a guess.
+ */
+export type BeadLabelsReader = (
+  projectId: string,
+  beadId: string,
+) => Promise<readonly string[] | null>;
 
 export interface JobContext {
   jobId: string;
@@ -237,8 +250,11 @@ export class JobRunner {
   private readonly resolvePolicy: JobPolicyResolver | null;
   private readonly resolveBudgetPolicy: BudgetPolicyResolver | null;
   private readonly liveRunCheck: LiveRunCheck | null;
+  private readonly readBeadLabels: BeadLabelsReader | null;
   private readonly readUsage: () => Promise<ClaudeUsage | null>;
   private readonly readUsageFresh: () => Promise<ClaudeUsage | null>;
+  /** Last logged value-gate hold set (sorted ids) — logs only on change, not every 2s tick. */
+  private valueHoldLogKey = "";
 
   /** Monotonic dispatch counter — lets a burn window detect that another job started inside it. */
   private dispatchSeq = 0;
@@ -274,6 +290,13 @@ export class JobRunner {
      */
     liveRunCheck?: LiveRunCheck;
     /**
+     * Bead-label source for the per-job value gate (anton-k05r). When set alongside
+     * `resolveBudgetPolicy`, a budget-aware project's queued governed jobs are individually gated
+     * on value/cost (`admitJob`) before leasing whenever the coarse `budgetGate` admits. Omit to
+     * skip the fine gate (execute-epic value can't be scored without labels — fail open).
+     */
+    readBeadLabels?: BeadLabelsReader;
+    /**
      * Cached Claude-usage reader for the budget governor and the burn sampler's *pre-job* snapshot
      * (anton-w8ny). Defaults to the shared, cached read so per-tick bursts collapse to one upstream
      * fetch. Injectable for deterministic tests.
@@ -294,6 +317,7 @@ export class JobRunner {
     this.resolvePolicy = deps.resolvePolicy ?? null;
     this.resolveBudgetPolicy = deps.resolveBudgetPolicy ?? null;
     this.liveRunCheck = deps.liveRunCheck ?? null;
+    this.readBeadLabels = deps.readBeadLabels ?? null;
     this.readUsage = deps.readUsage ?? getClaudeUsageCached;
     this.readUsageFresh = deps.readUsageFresh ?? getClaudeUsageFresh;
     this.loop = new PollingLoop({
@@ -491,8 +515,22 @@ export class JobRunner {
     // `pacedExecuteEpicHolds` collects projects where only pacing defers (immediate work admits):
     // their non-bypass execute-epic rows are capped at 0 in capOf below, so a crashed/lease-expired
     // paced row isn't reclaimed ahead of the pace boundary while bypass rows still lease.
+    // `valueHeldJobIds` collects individual queued jobs the per-job value/cost gate (anton-k05r)
+    // holds this tick when the coarse gate ADMITS a budget-aware project: scarce budget admits only
+    // high-value work. Fed into leaseDue's `exclude` below so the held rows aren't leased.
     const pacedExecuteEpicHolds = new Set<string>();
-    await this.applyBudgetGovernor(heldBucketKeys, pacedExecuteEpicHolds);
+    const valueHeldJobIds = new Set<string>();
+    await this.applyBudgetGovernor(heldBucketKeys, pacedExecuteEpicHolds, valueHeldJobIds);
+    const holdLogKey = [...valueHeldJobIds].sort().join(",");
+    if (holdLogKey !== this.valueHoldLogKey) {
+      this.valueHoldLogKey = holdLogKey;
+      if (valueHeldJobIds.size > 0) {
+        this.log.info(
+          `budget value gate holding ${valueHeldJobIds.size} queued job(s)`,
+          [...valueHeldJobIds],
+        );
+      }
+    }
 
     // With a policy resolver, gate execute-epic concurrency per project. Precompute each pending
     // project's cap so leaseDue can decide synchronously; other job types stay ungated (Infinity).
@@ -538,8 +576,9 @@ export class JobRunner {
       // Never re-lease a job already dispatched in this process. Rolling dispatch keeps a running
       // job in `inFlight` while its handler works; if its lease lapses (missed renewal from sleep or
       // a transient DB failure) its row looks reclaimable, and without this a spare-capacity tick
-      // would dispatch it twice against the same worktree.
-      exclude: this.inFlight.keys(),
+      // would dispatch it twice against the same worktree. Value-gate holds ride along: a queued job
+      // the fine gate held this tick is excluded from the scan, re-evaluated fresh next tick.
+      exclude: [...this.inFlight.keys(), ...valueHeldJobIds],
     });
     if (jobs.length === 0) return 0;
 
@@ -560,12 +599,16 @@ export class JobRunner {
    * When only pacing defers (immediate work still admits), the execute-epic bucket is added to
    * `pacedExecuteEpicHolds` instead of held outright, so capOf can block reclaim of crashed paced
    * rows without stopping bypass ("Approve") rows.
+   * When the coarse gate ADMITS a project, the per-job value/cost gate (anton-k05r) still runs over
+   * its queued governed jobs and collects the ones not worth the remaining budget into
+   * `valueHeldJobIds` — see {@link applyValueGate}.
    * Only runs when a budget-policy resolver is injected. Fails OPEN: a null usage read defers nothing
    * (a missing meter must never starve the queue), mirroring `budgetGate`'s own contract.
    */
   private async applyBudgetGovernor(
     heldBucketKeys: Set<string>,
     pacedExecuteEpicHolds: Set<string>,
+    valueHeldJobIds: Set<string>,
   ): Promise<void> {
     if (!this.resolveBudgetPolicy) return;
 
@@ -595,7 +638,13 @@ export class JobRunner {
     const now = this.clock.now();
     for (const { pid, policy } of governed) {
       const decision = budgetGate(usage, policy, now);
-      if (decision.admit) continue; // budget healthy → nothing paced this tick, immediate or not
+      if (decision.admit) {
+        // Budget healthy → nothing paced this tick. But "work may run" is not "any work may run":
+        // the fine-grained gate (anton-k05r) still decides which queued jobs are worth the budget
+        // that's left — e.g. scarce session headroom at night admits high-value work only.
+        await this.applyValueGate(usage, policy, pid, now, valueHeldJobIds);
+        continue;
+      }
       const retryAtMs = decision.retryAt.getTime();
       const pacedError = `budget: ${decision.reason} — resumes at ${new Date(retryAtMs).toISOString()}`;
 
@@ -646,6 +695,70 @@ export class JobRunner {
         // now, bypassing "Queue for optimal usage" exactly after a crash. Mark the bucket paced
         // so capOf caps its non-bypass rows at 0; bypass rows still lease as usual.
         pacedExecuteEpicHolds.add(scheduleGateKey("execute-epic", pid));
+      }
+    }
+  }
+
+  /**
+   * Per-job value/cost admission gate (anton-k05r), run when the coarse `budgetGate` ADMITS a
+   * budget-aware project: of that project's due queued governed jobs, hold the ones `admitJob`
+   * says aren't worth the remaining budget — scarce headroom admits only high-value work
+   * (risk:high / blocking-PR), abundant budget drains down to cleanup, and a job whose per-type
+   * burn average can't fit the remaining session is held regardless of value. Holds are per-tick
+   * only (the set feeds leaseDue's `exclude`): nothing is deferred or written, so the next tick
+   * re-evaluates against fresh usage/pace state and the hold lifts the moment the budget does.
+   *
+   * Value comes from the target bead's labels via the injected `readBeadLabels` (execute-epic
+   * only — orphan-grooming carries no bead and scores as label-less cleanup by definition), age
+   * from the job row, and cost from the per-type burn average (anton-w8ny). Fail-open throughout,
+   * mirroring the governor: a missing reader, an unresolvable bead, or a malformed payload admits
+   * the job rather than starving it on a guess. An operator's immediate "Approve" (`bypassBudget`)
+   * skips the gate entirely — they asked for now, and only the session floor may hold that.
+   */
+  private async applyValueGate(
+    usage: ClaudeUsage,
+    policy: BudgetPolicy,
+    pid: string | null,
+    nowMs: number,
+    valueHeldJobIds: Set<string>,
+  ): Promise<void> {
+    const candidates = await queuedDueJobs(this.db, this.clock, {
+      types: GOVERNED_JOB_TYPES,
+      projectId: pid,
+    });
+    // One burn-average read per type per tick — the cost side of every candidate of that type.
+    const costByType = new Map<string, number>();
+    for (const job of candidates) {
+      const payload = parsePayload(job.payloadJson) as
+        | { bypassBudget?: unknown; epicBeadId?: unknown }
+        | null;
+      if (payload?.bypassBudget === true) continue;
+
+      let labels: readonly string[] = [];
+      if (job.type === "execute-epic") {
+        if (!this.readBeadLabels || !job.projectId || typeof payload?.epicBeadId !== "string") {
+          continue; // can't score it → fail open
+        }
+        try {
+          const read = await this.readBeadLabels(job.projectId, payload.epicBeadId);
+          if (!read) continue; // bead unresolved → fail open
+          labels = read;
+        } catch {
+          continue; // reader error → fail open
+        }
+      }
+
+      let sessionCost = costByType.get(job.type);
+      if (sessionCost === undefined) {
+        sessionCost = (await getBurnAverage(this.db, job.type as JobType)).sessionAvg;
+        costByType.set(job.type, sessionCost);
+      }
+      const value = jobValueScore(
+        { labels, ageMs: Math.max(0, nowMs - (toMs(job.createdAt) ?? nowMs)) },
+        policy,
+      );
+      if (!admitJob(usage, policy, nowMs, { value, sessionCost }).admit) {
+        valueHeldJobIds.add(job.id);
       }
     }
   }

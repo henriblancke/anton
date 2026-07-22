@@ -21,13 +21,25 @@ export const dynamic = "force-dynamic";
  * dialog's "Approve & run"/"Force run") promise an immediate run, so pacing is strictly opt-in. Only
  * meaningful on a project with `budgetAware` on; on others the governor never runs, so both choices
  * execute now.
+ *
+ * `immediateExplicit` is true only when the body ASKS for an immediate run (`immediate: true`), not
+ * when the field is merely absent. The take-over enqueue keys off it instead of `immediate`: the UI's
+ * Take over button posts `{ steal: true }` with no `immediate` field, and a pure ownership transfer
+ * must not promote a teammate's paced ("Queue for optimal usage") job to an immediate `bypassBudget`
+ * run the operator never requested.
  */
-async function readApprovalBody(request: Request): Promise<{ steal: boolean; immediate: boolean }> {
+async function readApprovalBody(
+  request: Request,
+): Promise<{ steal: boolean; immediate: boolean; immediateExplicit: boolean }> {
   try {
     const body = (await request.json()) as { steal?: unknown; immediate?: unknown };
-    return { steal: body?.steal === true, immediate: body?.immediate !== false };
+    return {
+      steal: body?.steal === true,
+      immediate: body?.immediate !== false,
+      immediateExplicit: body?.immediate === true,
+    };
   } catch {
-    return { steal: false, immediate: true };
+    return { steal: false, immediate: true, immediateExplicit: false };
   }
 }
 
@@ -105,7 +117,7 @@ export async function POST(
   // Read before the approve below, which would otherwise make every request look like a re-approve.
   // See the enqueue gate at the end for what this distinguishes.
   const wasApproved = beads.isApproved(target);
-  const { steal, immediate } = await readApprovalBody(request);
+  const { steal, immediate, immediateExplicit } = await readApprovalBody(request);
   // A pure take-over reassigns the reservation and nothing more (the enqueue gate at the end skips its
   // run), so it bypasses the blocker gate — but never the steal-validity checks below, which still
   // confine it to a backlog target with a resolvable operator identity. Mirrors the enqueue-suppression
@@ -267,12 +279,16 @@ export async function POST(
   // Run-directly (anton-d8i4): the operator's "Approve" (immediate) vs "Queue" choice rides into the
   // enqueue as `bypassBudget`, so the governor paces a Queue but not an Approve. Inert on a project
   // without budget-aware execution — the governor never runs there.
+  // The take-over branch keys off `immediateExplicit`, not the immediate DEFAULT: Take over posts
+  // `{ steal: true }` with no `immediate` field, and a pure ownership transfer must preserve the
+  // existing pacing choice — a defaulted `bypassBudget: true` would promote a covering paced job
+  // (or enqueue a fresh bypass one) and silently override the operator's Queue decision.
   let jobId: string | undefined;
   try {
     if (!takeOver) {
       jobId = await enqueueExecuteEpic(project.id, epicId, { bypassBudget: immediate });
     } else if (openBlockers.length === 0) {
-      jobId = await enqueueExecuteEpicIfAbsent(project.id, epicId, { bypassBudget: immediate });
+      jobId = await enqueueExecuteEpicIfAbsent(project.id, epicId, { bypassBudget: immediateExplicit });
     }
   } catch (err) {
     console.error(`[approve] failed to enqueue execute-epic for ${epicId}`, err);
