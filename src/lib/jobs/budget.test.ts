@@ -161,16 +161,46 @@ describe("budgetGate", () => {
     });
   });
 
-  describe("front-loaded burst", () => {
-    it("defers weekly-on-track and retries when the pace-line catches up", () => {
-      const reset = resetForElapsed(NOON, 0.1); // only 10% of the week elapsed
-      const usage = makeUsage({ sessionPct: 5, weeklyPct: 40, weeklyResetAt: reset });
-      const d = budgetGate(usage, POLICY, NOON);
+  describe("idle-fill below the throttle band (anton-ld7j)", () => {
+    it("runs a front-loaded early-week burst instead of benching it (uses idle capacity)", () => {
+      // 40% weekly at 10% into the week: far ahead of the even line, but well below the throttle
+      // band (cap 100 − band 20 = 80). Idle-fill runs it — the whole point of the feature.
+      const usage = makeUsage({ sessionPct: 5, weeklyPct: 40, weeklyResetAt: resetForElapsed(NOON, 0.1) });
+      expect(budgetGate(usage, POLICY, NOON)).toEqual({ admit: true });
+    });
+
+    it("runs day or night while below the band with a fresh session", () => {
+      const usage = makeUsage({ sessionPct: 20, weeklyPct: 70, weeklyResetAt: resetForElapsed(NIGHT, 0.2) });
+      expect(budgetGate(usage, POLICY, NIGHT)).toEqual({ admit: true });
+    });
+  });
+
+  describe("weekly ceiling + throttle band (anton-ld7j)", () => {
+    it("stops at the cap until the weekly resets (weekly-cap)", () => {
+      const reset = resetForElapsed(NOON, 0.5);
+      const usage = makeUsage({ sessionPct: 10, weeklyPct: 100, weeklyResetAt: reset });
+      const d = budgetGate(usage, POLICY, NIGHT);
+      if (d.admit) throw new Error("expected defer");
+      expect(d.reason).toBe("weekly-cap");
+      expect(d.retryAt.getTime()).toBe(Date.parse(reset));
+    });
+
+    it("paces inside the band when ahead of the even line, retrying at catch-up", () => {
+      // 90% weekly (band [80,100)) at 30% into the week → ahead of the 30% line → throttle.
+      const reset = resetForElapsed(NIGHT, 0.3);
+      const usage = makeUsage({ sessionPct: 10, weeklyPct: 90, weeklyResetAt: reset });
+      const d = budgetGate(usage, POLICY, NIGHT);
       if (d.admit) throw new Error("expected defer");
       expect(d.reason).toBe("weekly-on-track");
       const weekStart = Date.parse(reset) - WEEK_MS;
-      const expected = weekStart + ((40 - POLICY.paceSlackPct) / POLICY.weeklyTargetPct) * WEEK_MS;
+      const expected = weekStart + ((90 - POLICY.paceSlackPct) / POLICY.weeklyTargetPct) * WEEK_MS;
       expect(d.retryAt.getTime()).toBe(expected);
+    });
+
+    it("runs inside the band when on/behind the even line (not ahead)", () => {
+      // 85% weekly at 90% into the week: the even line sits at 90 > 85, so we're behind → run.
+      const usage = makeUsage({ sessionPct: 10, weeklyPct: 85, weeklyResetAt: resetForElapsed(NIGHT, 0.9) });
+      expect(budgetGate(usage, POLICY, NIGHT)).toEqual({ admit: true });
     });
   });
 
@@ -223,15 +253,15 @@ describe("budgetGate", () => {
       expect(budgetGate(usage, POLICY, NOON)).toEqual({ admit: true });
     });
 
-    it("caps a weekly-on-track retry at the weekly reset", () => {
-      // A reserve plan (target 50) the burst has already blown past — the pace-line would only meet
-      // usage after the reset, so clamp the retry to the reset itself.
+    it("stops at a low reserve cap the burst blew past (weekly-cap to the reset)", () => {
+      // A reserve plan (cap 50) already fully spent (99%): above the cap → stop until the weekly
+      // resets, so the retry is the reset itself.
       const reservePolicy: BudgetPolicy = { ...POLICY, weeklyTargetPct: 50 };
       const reset = resetForElapsed(NIGHT, 0.9);
       const usage = makeUsage({ sessionPct: 5, weeklyPct: 99, weeklyResetAt: reset });
       const d = budgetGate(usage, reservePolicy, NIGHT);
       if (d.admit) throw new Error("expected defer");
-      expect(d.reason).toBe("weekly-on-track");
+      expect(d.reason).toBe("weekly-cap");
       expect(d.retryAt.getTime()).toBe(Date.parse(reset));
     });
   });

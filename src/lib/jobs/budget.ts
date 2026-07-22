@@ -242,16 +242,33 @@ export function budgetGate(
   // is deliberately skipped, so an operator who asked for "now" gets it the moment the session allows.
   if (opts?.skipPacing) return { admit: true };
 
-  const { behindPace, aheadPace, weeklyResetMs } = computePace(usage, policy, now);
+  // `behindPace` (from the same even pace-line) still feeds the daytime-reserve waiver below.
+  const { behindPace, weeklyResetMs } = computePace(usage, policy, now);
+  const cap = policy.weeklyTargetPct;
 
-  // 2. Ahead of the weekly plan (a front-loaded burst): ease off until the pace-line catches up.
-  //    Applies day and night — it's about the weekly budget, not the daily reserve.
-  if (aheadPace) {
-    return {
-      admit: false,
-      retryAt: new Date(paceCatchUp(usage.weeklyPct, weeklyResetMs, policy)),
-      reason: "weekly-on-track",
-    };
+  // 2. Weekly ceiling (idle-fill, anton-ld7j). Spare weekly budget is spent freely — only the top of
+  //    the plan is paced. Skipped entirely without a weekly signal (unknown reset or cap ≤ 0), which
+  //    leaves pure idle-fill up to the session/daytime gates.
+  if (!Number.isNaN(weeklyResetMs) && cap > 0) {
+    // 2a. At/above the cap: the weekly budget is spent — stop until the window resets so the reserve
+    //     (100 − cap) and Claude's own hard limit are protected.
+    if (usage.weeklyPct >= cap) {
+      return { admit: false, retryAt: new Date(weeklyResetMs), reason: "weekly-cap" };
+    }
+    // 2b. Inside the throttle band just below the cap: pace what's left so it lasts to the reset —
+    //     defer only when ahead of the even line, retrying when the line catches up. BELOW the band
+    //     it's idle-fill: run freely, day or night, so a productive early-week burst isn't benched.
+    const throttleFloor = cap - policy.throttleBandPct;
+    if (usage.weeklyPct >= throttleFloor) {
+      const expectedPct = cap * elapsedWeekFraction(now, weeklyResetMs, policy.weekMs);
+      if (usage.weeklyPct > expectedPct + policy.paceSlackPct) {
+        return {
+          admit: false,
+          retryAt: new Date(paceCatchUp(usage.weeklyPct, weeklyResetMs, policy)),
+          reason: "weekly-on-track",
+        };
+      }
+    }
   }
 
   // 3. Daytime reserve: inside the day window with the session running low, hold what's left for

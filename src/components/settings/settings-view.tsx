@@ -520,7 +520,7 @@ export function SettingsView({
                   <div className="flex flex-col gap-0.5">
                     <span className="text-[12.5px]">Budget-aware execution</span>
                     <span className="text-[10.5px] text-subtle">
-                      pace autonomous spend against your Claude plan · off by default
+                      use idle Claude capacity up to a weekly cap · off by default
                     </span>
                   </div>
                   <span className="ml-auto">
@@ -542,16 +542,16 @@ export function SettingsView({
                     label="Daytime reserve"
                     value={daytimeReservePct}
                     onChange={setDaytimeReservePct}
-                    hint="held back for interactive use"
+                    hint="session held back for interactive daytime use"
                     disabled={!budgetAware}
                   />
                   <PctField
-                    label="Weekly target"
+                    label="Weekly cap"
                     value={weeklyTargetPct}
                     onChange={setWeeklyTargetPct}
-                    hint="utilization the pace-line aims for"
+                    hint="run freely below this, then stop until reset"
                     disabled={!budgetAware}
-                    // 0 would disable weekly pacing (no pace data), not target zero — server rejects it.
+                    // 0 would disable the weekly cap (no pace data), not cap at zero — server rejects it.
                     min={1}
                   />
                 </div>

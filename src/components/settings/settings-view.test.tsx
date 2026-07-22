@@ -52,13 +52,13 @@ describe("SettingsView budget policy (anton-egrg)", () => {
   it("seeds the two knobs from a persisted policy (round-trip in)", () => {
     renderView({ budgetPolicy: { daytimeReservePct: 25, weeklyTargetPct: 80 } });
     expect((screen.getByLabelText("Daytime reserve") as HTMLInputElement).value).toBe("25");
-    expect((screen.getByLabelText("Weekly target") as HTMLInputElement).value).toBe("80");
+    expect((screen.getByLabelText("Weekly cap") as HTMLInputElement).value).toBe("80");
   });
 
   it("falls back to defaults when no policy is persisted", () => {
     renderView({});
     expect((screen.getByLabelText("Daytime reserve") as HTMLInputElement).value).toBe("15");
-    expect((screen.getByLabelText("Weekly target") as HTMLInputElement).value).toBe("90");
+    expect((screen.getByLabelText("Weekly cap") as HTMLInputElement).value).toBe("90");
   });
 
   it("PATCHes the edited knobs on Save (round-trip out)", async () => {
@@ -68,7 +68,7 @@ describe("SettingsView budget policy (anton-egrg)", () => {
     // The knobs are gated behind the budget-aware toggle (off by default) — enable it first.
     fireEvent.click(screen.getByRole("switch", { name: "Budget-aware execution" }));
     fireEvent.change(screen.getByLabelText("Daytime reserve"), { target: { value: "30" } });
-    fireEvent.change(screen.getByLabelText("Weekly target"), { target: { value: "70" } });
+    fireEvent.change(screen.getByLabelText("Weekly cap"), { target: { value: "70" } });
     fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
 
     expect(fetchMock).toHaveBeenCalledWith(
@@ -94,7 +94,7 @@ describe("SettingsView budget-aware master-switch (anton-7mpv.1)", () => {
     renderView({});
     expect(screen.getByRole("switch", { name: "Budget-aware execution" }).getAttribute("aria-checked")).toBe("false");
     expect((screen.getByLabelText("Daytime reserve") as HTMLInputElement).disabled).toBe(true);
-    expect((screen.getByLabelText("Weekly target") as HTMLInputElement).disabled).toBe(true);
+    expect((screen.getByLabelText("Weekly cap") as HTMLInputElement).disabled).toBe(true);
   });
 
   it("seeds ON from persisted settings and enables the knobs (round-trip in)", () => {
