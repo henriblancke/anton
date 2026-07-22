@@ -115,6 +115,23 @@ export function buildUpdateArgs(
   return args.length > 2 ? args : null;
 }
 
+/** Age scope for `beads.prune`: a relative window bd accepts, or "all" (every closed bead). */
+export type PruneAge = "30d" | "90d" | "all";
+
+/**
+ * Pure argv builder for `bd prune`, exposed for testing (like buildUpdateArgs). bd requires
+ * `--older-than` OR `--pattern` as a safety gate; "all" maps to `--pattern '*'` (sweep every
+ * closed bead). Preview is `--dry-run`; only `force` actually deletes.
+ */
+export function buildPruneArgs(age: PruneAge, opts: { force?: boolean } = {}): string[] {
+  return [
+    "prune",
+    ...(age === "all" ? ["--pattern", "*"] : ["--older-than", age]),
+    opts.force ? "--force" : "--dry-run",
+    "--json",
+  ];
+}
+
 async function bd(cwd: string, args: string[], env?: Record<string, string>): Promise<string> {
   // Spawn bd by its resolved absolute path (anton-346): a background-launched server's PATH may not
   // reach bd's install dir, so a bare `execFile("bd", …)` fails with `spawn bd ENOENT`.
@@ -523,6 +540,24 @@ export const beads = {
    */
   delete: (cwd: string, id: string, opts: { cascade?: boolean } = {}) =>
     bdWrite(cwd, ["delete", id, "--force", ...(opts.cascade ? ["--cascade"] : [])]),
+
+  /** Pure argv builder for prune, exposed for testing (see buildUpdateArgs). */
+  buildPruneArgs,
+
+  /**
+   * Prune piled-up closed beads (`bd prune`, anton-uobe) — permanent deletion of closed,
+   * non-ephemeral, non-pinned beads only; open/in_progress beads are never touched (bd itself
+   * guarantees this — never weaken it here). Default is a dry-run preview; `force` deletes (a
+   * write, so the board snapshot invalidates and counts refresh). Returns the affected count:
+   * bd emits `prune_count` on a dry-run and `pruned_count` on a force AND on the
+   * nothing-to-prune message — read both.
+   */
+  prune: async (cwd: string, age: PruneAge, opts: { force?: boolean } = {}): Promise<number> => {
+    const args = buildPruneArgs(age, opts);
+    const out = opts.force ? await bdWrite(cwd, args) : await bd(cwd, args);
+    const parsed = JSON.parse(out || "{}") as { prune_count?: number; pruned_count?: number };
+    return parsed.pruned_count ?? parsed.prune_count ?? 0;
+  },
   reopen: (cwd: string, id: string) => bdWrite(cwd, ["reopen", id]),
 
   /**
