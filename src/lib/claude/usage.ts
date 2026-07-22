@@ -39,6 +39,14 @@ export const USAGE_CACHE_TTL_MS = 60_000;
 export const DEFAULT_BACKOFF_MS = 60_000;
 
 /**
+ * Absolute floor on the 429 cool-off. This endpoint answers a rate limit with `Retry-After: 0`
+ * (and an empty header parses to 0 too), which would make the backoff a no-op and let the storm
+ * continue — every reader would re-hit and re-earn a 429 on the next tick. The floor guarantees one
+ * 429 buys real quiet.
+ */
+export const MIN_BACKOFF_MS = 10_000;
+
+/**
  * Epoch-ms instant before which upstream must not be touched, armed when Anthropic returns 429 and
  * honored by *every* reader — the pill, the nudge, the governor, and the TTL-bypassing burn sampler
  * alike. The sampler ({@link getClaudeUsageFresh}) deliberately skips the cache, so without a shared
@@ -59,6 +67,16 @@ export function parseRetryAfterMs(header: string | null, now: () => number = Dat
   if (Number.isFinite(secs)) return Math.max(0, secs * 1000);
   const at = Date.parse(header);
   return Number.isNaN(at) ? null : Math.max(0, at - now());
+}
+
+/**
+ * How long to back off after a 429, given the raw `Retry-After` header. Honors a *positive* hint,
+ * ignores a non-positive or absent one (→ {@link DEFAULT_BACKOFF_MS}), and always clamps up to
+ * {@link MIN_BACKOFF_MS} so a `Retry-After: 0` can't leave the backoff a no-op.
+ */
+export function backoffMsFor(retryAfter: string | null, now: () => number = Date.now): number {
+  const hint = parseRetryAfterMs(retryAfter, now);
+  return Math.max(MIN_BACKOFF_MS, hint && hint > 0 ? hint : DEFAULT_BACKOFF_MS);
 }
 
 /** Normalized usage snapshot the pill consumes. `null` when a limit is absent for the tier. */
@@ -214,8 +232,9 @@ export async function fetchClaudeUsage(): Promise<ClaudeUsage | null> {
     }
     if (res.status === 429) {
       // Being throttled — arm the shared backoff so every reader (including the sampler) stops
-      // hitting the endpoint until the window Anthropic asked for elapses. Honors Retry-After.
-      const waitMs = parseRetryAfterMs(res.headers.get("retry-after")) ?? DEFAULT_BACKOFF_MS;
+      // hitting the endpoint. Honors a positive Retry-After but floors it (this endpoint sends
+      // Retry-After: 0, which would otherwise make the backoff a no-op).
+      const waitMs = backoffMsFor(res.headers.get("retry-after"));
       backoffUntil = Date.now() + waitMs;
       console.warn(`[usage] upstream 429 — backing off ${Math.round(waitMs / 1000)}s (all readers paused)`);
       return null;

@@ -2,10 +2,13 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   armBackoffForTest,
+  backoffMsFor,
+  DEFAULT_BACKOFF_MS,
   getClaudeUsageCached,
   getClaudeUsageFresh,
   getDisplayUsage,
   LAST_GOOD_TTL_MS,
+  MIN_BACKOFF_MS,
   parseRetryAfterMs,
   parseUsage,
   resetUsageCache,
@@ -265,6 +268,22 @@ describe("parseRetryAfterMs", () => {
   it("returns null for a missing or unparseable header (caller uses its default)", () => {
     expect(parseRetryAfterMs(null)).toBeNull();
     expect(parseRetryAfterMs("not-a-date")).toBeNull();
+  });
+});
+
+describe("backoffMsFor", () => {
+  it("floors a Retry-After: 0 to the minimum (the no-op storm bug)", () => {
+    expect(backoffMsFor("0")).toBe(DEFAULT_BACKOFF_MS); // 0 is non-positive → default, then floored
+    expect(backoffMsFor("")).toBe(DEFAULT_BACKOFF_MS); // Number("") === 0 too
+  });
+
+  it("uses the default for a missing header", () => {
+    expect(backoffMsFor(null)).toBe(DEFAULT_BACKOFF_MS);
+  });
+
+  it("honors a positive Retry-After but never below the floor", () => {
+    expect(backoffMsFor("120")).toBe(120_000); // above the floor → honored
+    expect(backoffMsFor("3")).toBe(MIN_BACKOFF_MS); // below the floor → clamped up
   });
 });
 
