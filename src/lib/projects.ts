@@ -260,6 +260,11 @@ export function resolveProjectBudgetPolicy(
  * ride on top of {@link DEFAULT_BUDGET_POLICY}, so fields the operator can't set keep the governor's
  * shipped defaults. `preferNightForHeavy` off zeroes the night value discount, so heavy jobs are no
  * longer preferentially deferred to night. This is the hook the admission gate (anton-szld) consumes.
+ *
+ * `dayWindow` is documented as LOCAL hours, so the governor's fixed UTC offset comes from this
+ * machine's timezone (anton runs on the operator's box — machine-local IS operator-local). Resolved
+ * per call rather than baked into a constant so a DST shift is picked up at the next gate check
+ * while `budgetGate` itself stays pure on a fixed offset.
  */
 export function resolveBudgetPolicy(settings: ProjectSettings): BudgetPolicy {
   const p = resolveProjectBudgetPolicy(settings);
@@ -269,6 +274,9 @@ export function resolveBudgetPolicy(settings: ProjectSettings): BudgetPolicy {
     daytimeReservePct: p.daytimeReservePct,
     dayStartHour: p.dayWindow[0],
     dayEndHour: p.dayWindow[1],
+    // getTimezoneOffset() is minutes to ADD to local to reach UTC (e.g. 420 for PDT) — the
+    // governor's offset is the inverse (local = UTC + offset), hence the negation.
+    utcOffsetMinutes: -new Date().getTimezoneOffset(),
     weeklyTargetPct: p.weeklyTargetPct,
     nightValueDiscount: p.preferNightForHeavy ? DEFAULT_BUDGET_POLICY.nightValueDiscount : 0,
   };

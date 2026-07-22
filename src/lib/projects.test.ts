@@ -196,6 +196,14 @@ describe("budget policy (anton-egrg)", () => {
     expect(policy.nightValueDiscount).toBeGreaterThan(0);
   });
 
+  it("applies this machine's UTC offset so the local dayWindow is evaluated in local time", () => {
+    // dayWindow is documented as local hours; the governor compares against a fixed-offset clock,
+    // so resolving must carry the machine's offset (PR #68 review) — a 0 offset would evaluate a
+    // Pacific-afternoon 13:00 as 20:00 UTC and skip the daytime reserve during the local day.
+    const policy = resolveBudgetPolicy({});
+    expect(policy.utcOffsetMinutes).toBe(-new Date().getTimezoneOffset());
+  });
+
   it("zeroes the night discount when preferNightForHeavy is off", () => {
     expect(resolveBudgetPolicy({ budgetPolicy: { preferNightForHeavy: false } }).nightValueDiscount).toBe(0);
     expect(resolveBudgetPolicy({ budgetPolicy: { preferNightForHeavy: true } }).nightValueDiscount).toBeGreaterThan(0);
