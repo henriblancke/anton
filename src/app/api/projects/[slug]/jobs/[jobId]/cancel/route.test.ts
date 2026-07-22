@@ -9,6 +9,7 @@ import { eq } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 import { makeTestDb, type TestDb } from "@/lib/db/testing";
 import * as schema from "@/lib/db/schema";
+import { jsonRequest, paramsCtx } from "@/lib/testing/integration";
 
 // One db for the whole file: the jobs service caches a runner singleton bound to getDb() on first
 // use, so every test must share the same connection.
@@ -20,8 +21,8 @@ vi.mock("@/lib/beads/sync-engine", () => ({ startSyncEngine: () => {} }));
 
 const { POST } = await import("./route");
 
-const ctx = (slug: string, jobId: string) => ({ params: Promise.resolve({ slug, jobId }) });
-const req = () => new Request("http://t/", { method: "POST" });
+const ctx = (slug: string, jobId: string) => paramsCtx({ slug, jobId });
+const req = () => jsonRequest("POST");
 
 /** Seed a job row directly, returning its id. */
 async function seedJob(projectId: string, status: string): Promise<string> {

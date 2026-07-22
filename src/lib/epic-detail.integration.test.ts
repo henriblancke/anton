@@ -3,26 +3,15 @@
  * getEpicDetail returns the tickets plus that edge. Mirrors board.integration.test.ts. Skipped
  * when `bd`/`git` aren't installed.
  */
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { describeBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
 import { beads } from "./beads/bd";
 import { resetIssueSnapshots } from "./beads/snapshot";
-import { deleteEpic, getEpicDetail } from "./epic-detail";
+import { deleteEpic, getEpicDetail, updateEpic } from "./epic-detail";
 import type { Project } from "./types";
-
-function has(cmd: string): boolean {
-  try {
-    execFileSync(cmd, ["--version"], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-const suite = has("bd") && has("git") ? describe : describe.skip;
 
 type SeedNode = { key: string; title: string; type: "epic" | "task" | "bug" };
 type SeedEdge = { from_key: string; to_key: string; type: string };
@@ -41,16 +30,14 @@ function seedGraph(cwd: string, nodes: SeedNode[], edges: SeedEdge[] = []): Reco
   return ids;
 }
 
-suite("epic-detail integration (real bd)", () => {
+describeBd("epic-detail integration (real bd)", () => {
+  let bdRepo: BdRepo;
   let repo: string;
   let project: Project;
 
   beforeAll(() => {
-    repo = mkdtempSync(join(tmpdir(), "anton-bd-epic-"));
-    execFileSync("git", ["init", "-q"], { cwd: repo });
-    execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: repo });
-    execFileSync("git", ["config", "user.name", "anton-test"], { cwd: repo });
-    execFileSync("bd", ["init", "--skip-hooks"], { cwd: repo, stdio: "ignore" });
+    bdRepo = makeBdRepo();
+    repo = bdRepo.repo;
     project = {
       id: "x",
       slug: "tmp",
@@ -63,7 +50,7 @@ suite("epic-detail integration (real bd)", () => {
   });
 
   afterAll(() => {
-    if (repo) rmSync(repo, { recursive: true, force: true });
+    bdRepo.cleanup();
   });
 
   // These cases share one repo, so a warm cross-test snapshot would leak between them. Since A1
@@ -108,7 +95,7 @@ suite("epic-detail integration (real bd)", () => {
       (e) => e.from === ticketA && e.to === ticketB && e.type === "blocks",
     );
     expect(blocksEdge, "blocks edge from A to B").toBeDefined();
-  }, 30_000);
+  });
 
   // Regression for anton-lhw: the epic-detail header must surface the epic's own agent/risk/size
   // chips (getEpicDetail's real-epic branch used to pass `chips: false`, silently dropping them
@@ -125,7 +112,7 @@ suite("epic-detail integration (real bd)", () => {
     expect(detail.epic.agent).toBe("nextjs");
     expect(detail.epic.risk).toBe("high");
     expect(detail.epic.size).toBe("M");
-  }, 30_000);
+  });
 
   // Regression for anton-noc: `bd list` defaults to 50 results, so in a repo with >50 issues an
   // epic's tickets were silently truncated (planar showed 3 of 5, 1 of 6). beads.list must pass
@@ -161,7 +148,7 @@ suite("epic-detail integration (real bd)", () => {
       expect(got.has(id), `child ${id} present`).toBe(true);
     }
     expect(detail.tickets.length).toBe(childIds.length);
-  }, 60_000);
+  });
 
   // Regression for anton-noc (secondary): an orphan (parentless) non-epic bead is shown on the
   // board as a single-ticket card; opening it must return a single-ticket detail, not 404/throw.
@@ -176,11 +163,52 @@ suite("epic-detail integration (real bd)", () => {
     expect(detail.epic.id).toBe(bugId);
     expect(detail.tickets.map((t) => t.id)).toEqual([bugId]);
     expect(detail.edges).toEqual([]);
-  }, 30_000);
+  });
 
   it("still throws for a genuinely missing id", async () => {
     await expect(getEpicDetail(project, "does-not-exist-999")).rejects.toThrow(/not found/i);
-  }, 30_000);
+  });
+
+  // The epic priority editor's write path (anton-etvw): a PATCH to priority must land on the bead so
+  // `bd show` reflects it, and the returned detail must carry the new value (read-after-write).
+  it("updateEpic sets the epic's priority and reflects it in bd show + the returned detail", async () => {
+    const epicId = await beads.create(repo, {
+      title: "Prioritizable epic",
+      type: "epic",
+      description: "## Goal\nRank me.",
+    });
+
+    const detail = await updateEpic(project, epicId, { priority: 1 });
+    expect(detail.epic.priority).toBe(1);
+
+    const fresh = await beads.show(repo, epicId);
+    expect(fresh.priority).toBe(1);
+  });
+
+  // Fires the remote push off the response path and swallows a rejected sync — same fire-and-forget
+  // contract as deleteEpic (the "failing"/unpushed recording lives in beads.sync, covered in bd.test.ts).
+  it("updateEpic fires the remote push off the response path and catches a rejected sync", async () => {
+    const epicId = await beads.create(repo, { title: "Sync-tested epic", type: "epic" });
+
+    let failSync!: () => void;
+    const pendingSync = new Promise<void>((_resolve, reject) => {
+      failSync = () => reject(new Error("remote unreachable"));
+    });
+    const syncSpy = vi.spyOn(beads, "sync").mockReturnValue(pendingSync);
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // Resolves while the push is still in flight — proof it isn't awaited.
+    const detail = await updateEpic(project, epicId, { priority: 2 });
+    expect(detail.epic.priority).toBe(2);
+    expect(syncSpy).toHaveBeenCalledTimes(1);
+
+    failSync();
+    await new Promise((r) => setImmediate(r)); // let the fire-and-forget `.catch` run
+    expect(errSpy).toHaveBeenCalled(); // the failed push was logged, not silently swallowed
+
+    syncSpy.mockRestore();
+    errSpy.mockRestore();
+  });
 
   // anton-u8wu (A2): the delete must not block on the remote push. Hold the sync pending, prove the
   // delete resolves before it settles (off the critical path), then reject it and prove the failure
@@ -210,5 +238,5 @@ suite("epic-detail integration (real bd)", () => {
 
     // The local cascade delete landed regardless of the failed push.
     await expect(beads.show(repo, epicId)).rejects.toThrow();
-  }, 30_000);
+  });
 });

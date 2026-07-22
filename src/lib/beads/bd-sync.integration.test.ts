@@ -4,68 +4,42 @@
  * remote seeded with an initial branch (Dolt's git backend refuses an empty remote). Skipped
  * when `bd`/`git` aren't installed.
  */
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { describeBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
 import { beads } from "./bd";
 import { configureBeadsForRepo, configYamlHas, hasLocalDoltDb } from "./config.mjs";
 import { updateTicket } from "../ticket-detail";
 import type { Project } from "../types";
 
-function has(cmd: string): boolean {
-  try {
-    execFileSync(cmd, ["--version"], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-const suite = has("bd") && has("git") ? describe : describe.skip;
-
-suite("beads.sync integration (real bd · local bare remote)", () => {
-  let sandbox: string;
+describeBd("beads.sync integration (real bd · local bare remote)", () => {
+  let bdRepo: BdRepo;
   let repo: string;
   let bare: string;
   let project: Project;
 
   beforeAll(() => {
-    sandbox = mkdtempSync(join(tmpdir(), "anton-dolt-sync-"));
-    repo = join(sandbox, "repo");
-    bare = join(sandbox, "remote.git");
+    bdRepo = makeBdRepo({ bare: true, initialCommit: true });
+    repo = bdRepo.repo;
+    bare = bdRepo.bare!;
 
-    execFileSync("git", ["init", "--bare", "-q", bare]);
-    execFileSync("git", ["init", "-q", "-b", "main", repo]);
-    const g = (args: string[]) => execFileSync("git", args, { cwd: repo, stdio: "ignore" });
-    g(["config", "user.email", "t@example.com"]);
-    g(["config", "user.name", "anton-test"]);
-    writeFileSync(join(repo, "README.md"), "# sandbox\n");
-    g(["add", "-A"]);
-    g(["commit", "-q", "-m", "init"]);
-    g(["remote", "add", "origin", bare]);
-    g(["push", "-q", "-u", "origin", "main"]); // Dolt push needs an existing branch on the remote
-
-    // --skip-hooks: bd's own pre-commit hook (bd export) deadlocks against bd init's exclusive
-    // embedded-Dolt lock in a pristine repo. anton never relies on bd hooks — sync is explicit.
-    execFileSync("bd", ["init", "--skip-hooks"], { cwd: repo, stdio: "ignore" });
-    execFileSync("bd", ["dolt", "remote", "add", "origin", bare], { cwd: repo, stdio: "ignore" });
-    // anton-managed config (see CONFIG_KEYS): bd 1.0.2 auto-pushes after each write once a remote
-    // named `origin` exists — anton owns push cadence, so managed projects disable it. export.auto is
-    // disabled too (anton-1th) so ordinary reads don't regenerate the passive JSONL snapshot; team
-    // sync flows through Dolt over refs/dolt/data, never the JSONL.
-    execFileSync("bd", ["config", "set", "dolt.auto-push", "false"], { cwd: repo, stdio: "ignore" });
+    // anton-managed config (see CONFIG_KEYS): export.auto is disabled too (anton-1th) so ordinary
+    // reads don't regenerate the passive JSONL snapshot; team sync flows through Dolt over
+    // refs/dolt/data, never the JSONL. Not part of makeBdRepo's standard bare-remote wiring, so
+    // it's set explicitly here.
     execFileSync("bd", ["config", "set", "export.auto", "false"], { cwd: repo, stdio: "ignore" });
 
     project = {
       id: "x", slug: "tmp", name: "tmp", repoPath: repo,
       defaultBranch: "main", hasBeads: true, createdAt: 0,
     };
-  }, 60_000);
+  });
 
   afterAll(() => {
-    if (sandbox) rmSync(sandbox, { recursive: true, force: true });
+    bdRepo.cleanup();
   });
 
   const doltDataRef = () => {
@@ -95,7 +69,7 @@ suite("beads.sync integration (real bd · local bare remote)", () => {
     await beads.create(repo, { title: "Local-only until nudged", type: "task" });
     await beads.pull(repo);
     expect(doltDataRef(), "pull-only pass must never push").toBe(before);
-  }, 60_000);
+  });
 
   it("a UI ticket edit lands commits on refs/dolt/data of the git remote", async () => {
     const id = await beads.create(repo, { title: "Sync me", type: "task" });
@@ -119,19 +93,19 @@ suite("beads.sync integration (real bd · local bare remote)", () => {
     );
     expect(afterSecond).toBeDefined();
     expect(afterSecond).not.toBe(afterEdit);
-  }, 60_000);
+  });
 
   it("sync rejects loudly on a real remote failure (unreachable remote is not swallowed)", async () => {
     // Re-point the Dolt remote at a path that doesn't exist (upsert). This is NOT the benign
     // first-publish case (a wired-but-unpushed remote) — the remote is unreachable, so the full
     // pass must reject loudly rather than tolerate it. bd surfaces it at the pull step (which runs
     // before push), so the sync fails there; push-failure rejection is covered in bd.test.ts.
-    execFileSync("bd", ["dolt", "remote", "add", "origin", join(sandbox, "missing.git")], {
+    execFileSync("bd", ["dolt", "remote", "add", "origin", join(bdRepo.dir, "missing.git")], {
       cwd: repo,
       stdio: "ignore",
     });
     await expect(beads.sync(repo)).rejects.toThrow(/bd dolt (pull|push) failed/);
-  }, 60_000);
+  });
 });
 
 /**
@@ -141,8 +115,12 @@ suite("beads.sync integration (real bd · local bare remote)", () => {
  * Dolt. Repo B is a fresh clone hydrated from the git remote — it never receives issues.jsonl (that
  * export is gitignored) yet still sees the ticket, proving the collaboration channel is refs/dolt/data
  * and not the passive JSONL snapshot.
+ *
+ * Both repos here are bootstrapped by hand rather than via `makeBdRepo`: repo A's `bd init` must run
+ * through `configureBeadsForRepo` (the code under test, not a raw `bd init`), and repo B is a clone of
+ * repo A's remote rather than a fresh repo — neither shape fits the shared helper.
  */
-suite("two managed repos exchange a change over refs/dolt/data with export.auto disabled (anton-1th)", () => {
+describeBd("two managed repos exchange a change over refs/dolt/data with export.auto disabled (anton-1th)", () => {
   let sandbox: string;
   let bare: string;
   let repoA: string;
@@ -201,7 +179,7 @@ suite("two managed repos exchange a change over refs/dolt/data with export.auto 
     execFileSync("bd", ["init", "--skip-hooks"], { cwd: repoB, stdio: "ignore" });
     execFileSync("bd", ["dolt", "remote", "add", "origin", bare], { cwd: repoB, stdio: "ignore" });
     execFileSync("bd", ["dolt", "pull"], { cwd: repoB, stdio: "ignore" });
-  }, 120_000);
+  });
 
   afterAll(() => {
     if (sandbox) rmSync(sandbox, { recursive: true, force: true });

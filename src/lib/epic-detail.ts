@@ -3,7 +3,7 @@
  * among {epic + tickets}. Edges come from `bd dep list` on each ticket, filtered to members
  * of the epic's own graph. See DESIGN.md §2/§3.
  */
-import { beads } from "./beads/bd";
+import { beads, type BeadPatch } from "./beads/bd";
 import { ensureDescription } from "./beads/issues";
 import { nudgeSync } from "./beads/sync-nudge";
 import { getDb } from "./db";
@@ -82,6 +82,34 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
   }
 
   return { epic, description: full.description, tickets, edges, run };
+}
+
+/**
+ * Apply a field patch to an epic bead and return the refreshed detail. Mirrors ticket-detail's
+ * updateTicket: the bead is read first so label edits diff against its current labels, and the
+ * post-write read reflects the write (getEpicDetail blocks on the pending write by default, so it
+ * never serves the stale snapshot). Today the only field is priority (see epic-patch.ts); an empty
+ * patch writes nothing. Throws on an unknown id, so the API can answer 404.
+ */
+export async function updateEpic(
+  project: Project,
+  epicId: string,
+  patch: BeadPatch,
+): Promise<EpicDetail> {
+  const current = await beads.show(project.repoPath, epicId); // 404 guard + current labels
+  await beads.update(project.repoPath, epicId, patch, current.labels ?? []);
+  // Read-after-write: getEpicDetail reads the board snapshot, which blocks on the pending local write
+  // (blockOnPendingWrite defaults true), so the response carries the new priority — not the stale
+  // pre-write board. The board/backlog then re-sort on it (priority is already a sort key).
+  const detail = await getEpicDetail(project, epicId);
+  // Fire-and-forget, exactly like deleteEpic: the update already landed locally, so don't block the
+  // response on a `bd dolt pull/commit/push` a slow/unreachable remote could stall. A failed push is
+  // recorded as failing/unpushed in the sync-status registry and retried by the E1 heartbeat backstop
+  // — this catch only keeps the rejection from floating.
+  void beads
+    .sync(project.repoPath)
+    .catch((e) => console.error(`[epic-detail] beads dolt sync failed after updating ${epicId}`, e));
+  return detail;
 }
 
 /**

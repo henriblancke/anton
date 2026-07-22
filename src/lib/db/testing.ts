@@ -9,8 +9,12 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import * as schema from "./schema";
 
-/** Apply every committed drizzle migration to a raw sqlite connection. */
-function applyMigrations(sqlite: Database.Database): void {
+/**
+ * Apply every committed drizzle migration to a raw sqlite connection (in-memory or file-backed).
+ * Shared by `makeTestDb` (in-memory) and `src/lib/testing/integration.ts`'s `makeFileDb` (temp
+ * file) so both apply the exact same schema the exact same way — no duplicated SQL parsing.
+ */
+export function applyMigrationsTo(sqlite: Database.Database): void {
   const dir = join(process.cwd(), "drizzle");
   const files = readdirSync(dir)
     .filter((f) => f.endsWith(".sql"))
@@ -37,7 +41,7 @@ export interface TestDb {
 export function makeTestDb(): TestDb {
   const sqlite = new Database(":memory:");
   sqlite.pragma("foreign_keys = ON");
-  applyMigrations(sqlite);
+  applyMigrationsTo(sqlite);
   const db = drizzle(sqlite, { schema });
   return { db, sqlite, close: () => sqlite.close() };
 }

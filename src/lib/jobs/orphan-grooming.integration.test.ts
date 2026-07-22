@@ -2,27 +2,16 @@
  * End-to-end proof of anton-3t2.4's acceptance: "Orphan tickets are periodically grouped under an
  * epic." Drives the REAL orphan-grooming handler + REAL bd against a temp repo. Skipped without bd.
  */
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { describeBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
 import { makeTestDb, type TestDb } from "../db/testing";
 import { beads } from "../beads/bd";
 import * as schema from "../db/schema";
 import { type Clock } from "./queue";
 import { JobRunner } from "./runner";
 import { makeOrphanGroomingHandler, ORPHAN_EPIC_LABEL } from "./orphan-grooming";
-
-function has(cmd: string): boolean {
-  try {
-    execFileSync(cmd, ["--version"], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 class FakeClock implements Clock {
   constructor(private t: number) {}
@@ -41,10 +30,8 @@ function createTicket(repo: string, title: string, parent?: string, type = "chor
   return (Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string;
 }
 
-const suite = has("bd") ? describe : describe.skip;
-
-suite("orphan-grooming e2e (real handler · real bd)", () => {
-  let sandbox: string;
+describeBd("orphan-grooming e2e (real handler · real bd)", () => {
+  let bdRepo: BdRepo;
   let repo: string;
   let tdb: TestDb;
   let clock: FakeClock;
@@ -55,18 +42,9 @@ suite("orphan-grooming e2e (real handler · real bd)", () => {
   let realEpic: string;
 
   beforeAll(async () => {
-    sandbox = mkdtempSync(join(tmpdir(), "anton-og-"));
-    repo = join(sandbox, "repo");
-    mkdirSync(repo);
-    const g = (args: string[]) => execFileSync("git", args, { cwd: repo, stdio: "ignore" });
-    g(["init", "-q", "-b", "main"]);
-    g(["config", "user.email", "t@example.com"]);
-    g(["config", "user.name", "anton-test"]);
-    writeFileSync(join(repo, "README.md"), "# sandbox\n");
-    g(["add", "-A"]);
-    g(["commit", "-q", "-m", "init"]);
+    bdRepo = makeBdRepo({ initialCommit: true });
+    repo = bdRepo.repo;
 
-    execFileSync("bd", ["init", "--skip-hooks"], { cwd: repo, stdio: "ignore" });
     // A real epic with a child (NOT an orphan) + two loose tickets (orphans).
     realEpic = await beads.create(repo, { title: "Real epic", type: "epic", description: "## Goal\nx" });
     childTicket = createTicket(repo, "Child of real epic", realEpic);
@@ -83,11 +61,11 @@ suite("orphan-grooming e2e (real handler · real bd)", () => {
       repoPath: repo,
       defaultBranch: "main",
     });
-  }, 60_000);
+  });
 
   afterAll(() => {
     tdb?.close();
-    rmSync(sandbox, { recursive: true, force: true });
+    bdRepo.cleanup();
   });
 
   it("buckets loose tickets under a grooming epic; leaves parented ones alone", async () => {
@@ -120,7 +98,7 @@ suite("orphan-grooming e2e (real handler · real bd)", () => {
 
     // The already-parented ticket kept its original epic.
     expect(parentOf(childTicket)).toBe(realEpic);
-  }, 60_000);
+  });
 
   it("is idempotent — a second run with no new orphans reuses the epic and adds nothing", async () => {
     const before = await beads.list(repo, ["--status", "all"]);
@@ -151,5 +129,5 @@ suite("orphan-grooming e2e (real handler · real bd)", () => {
       ((c?.parent ?? c?.parent_id) as string | undefined) ??
       beads.edgesOf(final).find((e) => e.type === "parent-child" && e.from === orphanC)?.to;
     expect(cParent).toBe(groomingEpic.id);
-  }, 60_000);
+  });
 });
