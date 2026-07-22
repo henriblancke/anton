@@ -4,6 +4,7 @@ import Link from "next/link";
 import { ChevronDownIcon, XIcon } from "lucide-react";
 
 import { cn } from "@/lib/utils";
+import { LinkPendingIndicator } from "@/components/ui/link-pending-indicator";
 import { isNavItemActive, type ShellNavItem } from "@/components/shell/shell-utils";
 import { ThemeToggle } from "@/components/shell/theme-toggle";
 import { AntonWordmark } from "@/components/shell/brand";
@@ -96,13 +97,16 @@ export function Sidebar({
           <Link
             href="/"
             title={`${label} — switch project`}
-            className="mb-4 flex items-center gap-2.5 rounded-[10px] border border-border bg-card px-2.5 py-2 transition-colors hover:border-ring/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+            className="mb-4 flex items-center gap-2.5 rounded-[10px] border border-border bg-card px-2.5 py-2 transition-colors hover:border-ring/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 has-[[data-pending]]:opacity-60"
           >
             <span className="flex size-5 items-center justify-center rounded-md border border-border bg-muted font-mono text-[10px] font-medium text-primary">
               {label?.[0]?.toLowerCase() ?? "a"}
             </span>
             <span className="min-w-0 flex-1 truncate text-[13px] font-medium">{label}</span>
-            <ChevronDownIcon className="size-3 shrink-0 text-muted-foreground" aria-hidden="true" />
+            <LinkPendingIndicator
+              className="size-3 text-muted-foreground"
+              idle={<ChevronDownIcon className="size-3" aria-hidden="true" />}
+            />
           </Link>
         )}
 
@@ -163,7 +167,7 @@ function NavLink({ item, pathname }: { item: NavEntry; pathname: string | null }
         href={item.href}
         aria-current={active ? "page" : undefined}
         className={cn(
-          "group flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-[13px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
+          "group flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-[13px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 has-[[data-pending]]:opacity-60",
           active
             ? "bg-sidebar-accent font-medium text-sidebar-accent-foreground"
             : "text-muted-foreground hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground",
@@ -171,6 +175,7 @@ function NavLink({ item, pathname }: { item: NavEntry; pathname: string | null }
       >
         <Icon className={cn("size-4 shrink-0", active ? "text-primary" : "text-subtle")} />
         {item.label}
+        <LinkPendingIndicator className="ml-auto text-subtle" />
       </Link>
     </li>
   );
