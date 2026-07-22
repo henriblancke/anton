@@ -59,6 +59,58 @@ export function assertBdVersion(
   }
 }
 
+/** A `bd migrate --inspect` runner, injectable for tests. Runs read-only in the repo's cwd. */
+export type InspectRun = (
+  bin: string,
+  cwd: string,
+) => { status: number | null; stdout?: string; stderr?: string; error?: unknown };
+
+const defaultInspectRun: InspectRun = (bin, cwd) =>
+  spawnSync(bin, ["migrate", "--inspect"], { cwd, encoding: "utf8" });
+
+/**
+ * Parse the DB schema version from `bd migrate --inspect` output — the `Schema Version: X.Y.Z` line.
+ * Returns null when it's absent or blank (e.g. the post-bootstrap display artifact the migration
+ * runbook documents), which callers treat as "can't tell → don't block".
+ */
+export function parseSchemaVersion(output: string): { major: number; minor: number; patch: number } | null {
+  const m = output.match(/Schema Version:\s*(\d+)\.(\d+)\.(\d+)/i);
+  return m ? { major: +m[1], minor: +m[2], patch: +m[3] } : null;
+}
+
+/**
+ * Fail loud when a repo's remote-backed beads DB still carries a pre-1.1 schema that the 1.1.0 binary
+ * gates on open (anton-x7la review). bd 1.1.0 applies its pending migrations only via the one-clone
+ * runbook and, until then, refuses `bd dolt push`/`pull` and blocks on open — so without this gate the
+ * server boots and background/route bd calls fail or park mid-run instead of stopping at preflight
+ * with the migration/adopt guidance. Called per configured repo from startRunner().
+ *
+ * Conservative by design — it only fires on an UNAMBIGUOUS behind-schema signal (a parsed DB schema
+ * version older than MIN_BD_VERSION) and fails OPEN on anything it can't read cleanly: a non-zero
+ * `bd migrate --inspect`, a blank/absent `Schema Version:` (the post-bootstrap display artifact the
+ * runbook documents), or a spawn error. A healthy repo is never blocked from booting. `run` is
+ * injectable for tests.
+ */
+export function assertRepoSchemaCurrent(bin: string, cwd: string, run: InspectRun = defaultInspectRun): void {
+  let r: ReturnType<InspectRun>;
+  try {
+    r = run(bin, cwd);
+  } catch {
+    return; // can't even spawn the inspect → don't block boot
+  }
+  if (r.error || (r.status ?? 1) !== 0) return; // inspect failed → don't block
+  const v = parseSchemaVersion(`${r.stdout ?? ""}${r.stderr ?? ""}`);
+  if (!v) return; // no readable schema version (e.g. the bootstrap display artifact) → don't block
+  const current = v.major !== MIN_BD.major ? v.major > MIN_BD.major : v.minor !== MIN_BD.minor ? v.minor > MIN_BD.minor : v.patch >= MIN_BD.patch;
+  if (!current) {
+    throw new Error(
+      `beads DB at ${cwd} is on schema ${v.major}.${v.minor}.${v.patch}, behind the required bd ${MIN_BD_VERSION} — ` +
+        `bd ${MIN_BD_VERSION} gates pending migrations on open and refuses dolt push/pull. Do NOT auto-migrate: ` +
+        `follow docs/runbooks/bd-1.0.4-to-1.1.0-migration.md (one clone migrates, the rest \`bd bootstrap\`).`,
+    );
+  }
+}
+
 let cached: string | undefined;
 
 /**

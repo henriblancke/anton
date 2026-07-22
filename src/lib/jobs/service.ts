@@ -4,15 +4,18 @@
  * from `src/instrumentation.ts` on server boot; API routes enqueue through the runner. See DESIGN §4.
  */
 import { getDb } from "../db";
+import { join } from "node:path";
 import {
   DEFAULT_CONCURRENCY,
   DEFAULT_JOB_TIMEOUT_MINUTES,
   DEFAULT_MAX_RETRIES,
   getProjectById,
   getProjectSettings,
+  listProjects,
 } from "../projects";
 import { beads } from "../beads/bd";
-import { preflightBd } from "../beads/bd-bin";
+import { assertRepoSchemaCurrent, preflightBd } from "../beads/bd-bin";
+import { hasLocalDoltDb } from "../beads/config.mjs";
 import { makeExecuteEpicHandler } from "./execute-epic";
 import { makeReviewFixHandler } from "./review-fix";
 import { makeNightlyStringerHandler } from "./nightly-stringer";
@@ -116,7 +119,18 @@ export async function startRunner(): Promise<void> {
   // Preflight (anton-346): resolve bd before any job can spawn it. A server launched with a PATH
   // that can't reach bd fails loud HERE with actionable guidance, instead of booting and then
   // parking execute-epic/review-fix jobs mid-run with `spawn bd ENOENT`.
-  preflightBd();
+  const bin = preflightBd();
+
+  // Schema preflight (anton-x7la review): the binary is new enough (above), but a configured repo's
+  // remote-backed DB may still be on a pre-1.1 schema that bd 1.1.0 gates on open — it refuses dolt
+  // push/pull until the one-clone migration runbook runs. Catch that HERE per repo so we fail loud
+  // with the runbook instead of booting and parking every bd call against that repo. Repos with no
+  // local Dolt DB are the bootstrap path (hydrated on first configure), not a migration target, so
+  // they're skipped; assertRepoSchemaCurrent itself fails open on any signal it can't read cleanly.
+  for (const project of await listProjects()) {
+    if (!hasLocalDoltDb(join(project.repoPath, ".beads"))) continue;
+    assertRepoSchemaCurrent(bin, project.repoPath);
+  }
   if (!_reconciled) {
     // Set before awaiting so a concurrent second call can't slip past into a second reconcile.
     _reconciled = true;
