@@ -174,6 +174,35 @@ describe("budgetGate", () => {
     });
   });
 
+  describe("skipPacing (run-directly / immediate approval, anton-d8i4)", () => {
+    it("bypasses a weekly-on-track hold when ahead of pace", () => {
+      const usage = makeUsage({
+        sessionPct: 10,
+        weeklyPct: 80, // ahead of the pace-line → would defer weekly-on-track…
+        weeklyResetAt: resetForElapsed(NIGHT, 0.5),
+      });
+      expect(budgetGate(usage, POLICY, NIGHT)).not.toEqual({ admit: true }); // paced: defers
+      expect(budgetGate(usage, POLICY, NIGHT, { skipPacing: true })).toEqual({ admit: true });
+    });
+
+    it("bypasses the daytime reserve", () => {
+      const usage = makeUsage({
+        sessionPct: 70, // past the daytime reserve during the day → would defer daytime-reserve…
+        weeklyPct: 50,
+        weeklyResetAt: resetForElapsed(NOON, 0.5),
+      });
+      expect(budgetGate(usage, POLICY, NOON)).not.toEqual({ admit: true });
+      expect(budgetGate(usage, POLICY, NOON, { skipPacing: true })).toEqual({ admit: true });
+    });
+
+    it("still honors the session-headroom floor (the one hold it does NOT bypass)", () => {
+      const usage = makeUsage({ sessionPct: 99, weeklyPct: 0 }); // above the 5% floor
+      const d = budgetGate(usage, POLICY, NIGHT, { skipPacing: true });
+      if (d.admit) throw new Error("expected the session floor to still defer");
+      expect(d.reason).toBe("session-headroom");
+    });
+  });
+
   describe("reset boundary", () => {
     it("clamps elapsed to 1 at the reset and lets low usage spill (behind pace)", () => {
       const usage = makeUsage({

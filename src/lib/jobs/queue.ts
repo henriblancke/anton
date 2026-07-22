@@ -113,6 +113,17 @@ function isUniqueViolation(e: unknown): boolean {
   return code === "SQLITE_CONSTRAINT_UNIQUE" || code === "SQLITE_CONSTRAINT";
 }
 
+/**
+ * Build an execute-epic job payload. `bypassBudget` is written only when true (anton-d8i4) so the
+ * paced/default case keeps the historical `{ projectId, epicBeadId }` shape — an absent flag is the
+ * governed default, and the governor's `deferQueuedJobs({ bypass })` filter reads its absence as such.
+ */
+function executeEpicPayload(projectId: string, epicBeadId: string, bypassBudget?: boolean) {
+  return bypassBudget
+    ? { projectId, epicBeadId, bypassBudget: true }
+    : { projectId, epicBeadId };
+}
+
 /** The `epicBeadId` carried in a job's payload, or undefined if absent/malformed. */
 function epicBeadIdOf(payloadJson: string | null): string | undefined {
   try {
@@ -199,6 +210,7 @@ export function enqueueExecuteEpicIfAbsent(
   clock: Clock,
   projectId: string,
   epicBeadId: string,
+  opts?: { bypassBudget?: boolean },
 ): string | undefined {
   const nowMs = clock.now();
   try {
@@ -211,7 +223,7 @@ export function enqueueExecuteEpicIfAbsent(
           id,
           type: "execute-epic",
           projectId,
-          payloadJson: JSON.stringify({ projectId, epicBeadId }),
+          payloadJson: JSON.stringify(executeEpicPayload(projectId, epicBeadId, opts?.bypassBudget)),
           status: "queued",
           runAt: secDate(nowMs),
           attempts: 0,
@@ -245,12 +257,32 @@ export function enqueueExecuteEpicDeduped(
   clock: Clock,
   projectId: string,
   epicBeadId: string,
+  opts?: { bypassBudget?: boolean },
 ): string {
   const nowMs = clock.now();
+  const bypassBudget = opts?.bypassBudget === true;
   try {
     return db.transaction((tx) => {
       const existing = activeExecuteEpicId(tx, projectId, epicBeadId);
-      if (existing) return existing;
+      if (existing) {
+        // "Approve" (immediate) on an epic that already has a queued run: promote it so the budget
+        // governor stops pacing it — set the bypass flag AND pull it due now, clearing any budget
+        // defer that had pushed its runAt into the future. Guarded to `queued` (a `running` job is
+        // already executing, and its payload is re-read only on the next attempt). A queue-mode
+        // (non-bypass) re-approve leaves the existing job exactly as it is (anton-d8i4).
+        if (bypassBudget) {
+          tx.update(schema.jobs)
+            .set({
+              payloadJson: JSON.stringify(executeEpicPayload(projectId, epicBeadId, true)),
+              runAt: secDate(nowMs),
+              lastError: null,
+              updatedAt: secDate(nowMs),
+            })
+            .where(and(eq(schema.jobs.id, existing), eq(schema.jobs.status, "queued")))
+            .run();
+        }
+        return existing;
+      }
 
       const id = randomUUID();
       tx.insert(schema.jobs)
@@ -258,7 +290,7 @@ export function enqueueExecuteEpicDeduped(
           id,
           type: "execute-epic",
           projectId,
-          payloadJson: JSON.stringify({ projectId, epicBeadId }),
+          payloadJson: JSON.stringify(executeEpicPayload(projectId, epicBeadId, bypassBudget)),
           status: "queued",
           runAt: secDate(nowMs),
           attempts: 0,
@@ -496,6 +528,12 @@ export async function reschedule(
  * for a *proactive* hold: it touches only `queued` rows (a `running` job is in flight and settles on
  * its own), never burns an attempt, and only ever moves a job *later* — a job already scheduled past
  * `retryAtMs` (e.g. a longer quota backoff) is left where it is. Returns how many rows it deferred.
+ *
+ * `bypass` filters execute-epic rows by the `bypassBudget` payload flag (anton-d8i4), so the governor
+ * can hold the paced ("Queue") jobs and the immediate-approved ("Approve"/run-directly) ones on
+ * different boundaries: `"exclude"` matches only the paced rows (flag unset), `"only"` matches only
+ * the immediate ones (flag set). Absent → no payload filter (defer every matching row). SQLite maps
+ * a JSON `true` to the integer 1 via `json_extract`, so an absent/`false` flag is `IS NOT 1`.
  */
 export async function deferQueuedJobs(
   db: AntonDb,
@@ -505,11 +543,19 @@ export async function deferQueuedJobs(
     projectId: string | null | undefined;
     retryAtMs: number;
     lastError?: string;
+    bypass?: "only" | "exclude";
   },
 ): Promise<number> {
   if (opts.types.length === 0) return 0;
   const nowMs = clock.now();
   const retryDate = secDate(opts.retryAtMs);
+  const bypassExtract = sql`json_extract(${schema.jobs.payloadJson}, '$.bypassBudget')`;
+  const bypassFilter =
+    opts.bypass === "only"
+      ? sql`${bypassExtract} = 1`
+      : opts.bypass === "exclude"
+        ? sql`${bypassExtract} is not 1`
+        : undefined;
   const rows = await db
     .update(schema.jobs)
     .set({ runAt: retryDate, lastError: opts.lastError ?? null, updatedAt: secDate(nowMs) })
@@ -521,6 +567,7 @@ export async function deferQueuedJobs(
           ? isNull(schema.jobs.projectId)
           : eq(schema.jobs.projectId, opts.projectId),
         lt(schema.jobs.runAt, retryDate),
+        bypassFilter,
       ),
     )
     .returning({ id: schema.jobs.id });

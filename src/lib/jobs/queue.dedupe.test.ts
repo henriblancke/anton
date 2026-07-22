@@ -9,11 +9,13 @@ import { eq } from "drizzle-orm";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
 import {
+  deferQueuedJobs,
   enqueueExecuteEpicDeduped,
   enqueueExecuteEpicIfAbsent,
   getJob,
   resumeJob,
   systemClock,
+  toMs,
 } from "./queue";
 
 let t: TestDb;
@@ -88,6 +90,80 @@ describe("enqueueExecuteEpicDeduped", () => {
       insertReviewFix("rf-2");
     }).not.toThrow();
     expect(activeRows()).toHaveLength(2);
+  });
+});
+
+describe("bypassBudget payload flag (run-directly, anton-d8i4)", () => {
+  function jobPayload(id: string): Record<string, unknown> {
+    const row = t.db.select().from(schema.jobs).where(eq(schema.jobs.id, id)).get();
+    return JSON.parse(row?.payloadJson ?? "{}") as Record<string, unknown>;
+  }
+
+  it("omits the flag by default (paced) and sets it only when immediate", () => {
+    const paced = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-paced");
+    const now = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-now", { bypassBudget: true });
+    expect(jobPayload(paced).bypassBudget).toBeUndefined();
+    expect(jobPayload(now).bypassBudget).toBe(true);
+  });
+
+  it("promotes an already-queued paced job to immediate: sets the flag, pulls it due now, clears the budget defer", () => {
+    const id = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-1");
+    // Simulate the governor having deferred it: pushed runAt out with a budget lastError.
+    const future = new Date(systemClock.now() + 60 * 60_000);
+    t.db
+      .update(schema.jobs)
+      .set({ runAt: future, lastError: "budget: weekly-on-track — resumes at …" })
+      .where(eq(schema.jobs.id, id))
+      .run();
+
+    const again = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-1", { bypassBudget: true });
+    expect(again).toBe(id); // same job, promoted in place
+    const job = t.db.select().from(schema.jobs).where(eq(schema.jobs.id, id)).get();
+    expect((JSON.parse(job!.payloadJson) as Record<string, unknown>).bypassBudget).toBe(true);
+    expect(toMs(job!.runAt)).toBeLessThanOrEqual(systemClock.now()); // due now, no longer deferred
+    expect(job!.lastError).toBeNull();
+  });
+
+  it("does not promote a paced re-approve (leaves the existing job untouched)", () => {
+    const id = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-1", { bypassBudget: true });
+    const before = t.db.select().from(schema.jobs).where(eq(schema.jobs.id, id)).get();
+    const again = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-1"); // paced re-approve
+    expect(again).toBe(id);
+    const after = t.db.select().from(schema.jobs).where(eq(schema.jobs.id, id)).get();
+    // A paced re-approve must not strip a prior immediate flag nor rewrite runAt.
+    expect(after!.payloadJson).toBe(before!.payloadJson);
+  });
+});
+
+describe("deferQueuedJobs bypass filter (anton-d8i4)", () => {
+  async function deferMs(id: string) {
+    return toMs((await getJob(t.db, id))?.runAt);
+  }
+  const RETRY = () => systemClock.now() + 2 * 60 * 60_000;
+
+  it("bypass:'exclude' defers only paced rows; bypass:'only' defers only immediate rows", async () => {
+    const paced = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-paced");
+    const now = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-now", { bypassBudget: true });
+    const retry = RETRY();
+
+    const excluded = await deferQueuedJobs(t.db, systemClock, {
+      types: ["execute-epic"],
+      projectId: "p1",
+      retryAtMs: retry,
+      bypass: "exclude",
+    });
+    expect(excluded).toBe(1); // only the paced row moved
+    expect(await deferMs(paced)).toBe(Math.floor(retry / 1000) * 1000);
+    expect(await deferMs(now)).toBeLessThanOrEqual(systemClock.now()); // immediate row untouched
+
+    const onlyImmediate = await deferQueuedJobs(t.db, systemClock, {
+      types: ["execute-epic"],
+      projectId: "p1",
+      retryAtMs: retry,
+      bypass: "only",
+    });
+    expect(onlyImmediate).toBe(1); // now the immediate row moves
+    expect(await deferMs(now)).toBe(Math.floor(retry / 1000) * 1000);
   });
 });
 

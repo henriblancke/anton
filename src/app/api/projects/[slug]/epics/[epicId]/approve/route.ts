@@ -12,13 +12,19 @@ import { resolveProject } from "../../../resolve-project";
 
 export const dynamic = "force-dynamic";
 
-/** Read the optional `{ steal?: boolean }` body; a missing/invalid body means no steal. */
-async function readSteal(request: Request): Promise<boolean> {
+/**
+ * Read the optional approval body. `steal` takes over a teammate's reservation (unchanged); `immediate`
+ * is the run-directly choice (anton-d8i4): true → bypass the budget governor's weekly/daytime pacing
+ * (the session-headroom floor still applies), false/absent → queue for optimal usage (paced). A
+ * missing/invalid body means neither — no steal, and paced (the governed default). Only meaningful on
+ * a project with `budgetAware` on; on others the governor never runs, so both choices execute now.
+ */
+async function readApprovalBody(request: Request): Promise<{ steal: boolean; immediate: boolean }> {
   try {
-    const body = (await request.json()) as { steal?: unknown };
-    return body?.steal === true;
+    const body = (await request.json()) as { steal?: unknown; immediate?: unknown };
+    return { steal: body?.steal === true, immediate: body?.immediate === true };
   } catch {
-    return false;
+    return { steal: false, immediate: false };
   }
 }
 
@@ -96,7 +102,7 @@ export async function POST(
   // Read before the approve below, which would otherwise make every request look like a re-approve.
   // See the enqueue gate at the end for what this distinguishes.
   const wasApproved = beads.isApproved(target);
-  const steal = await readSteal(request);
+  const { steal, immediate } = await readApprovalBody(request);
   // A pure take-over reassigns the reservation and nothing more (the enqueue gate at the end skips its
   // run), so it bypasses the blocker gate — but never the steal-validity checks below, which still
   // confine it to a backlog target with a resolvable operator identity. Mirrors the enqueue-suppression
@@ -255,12 +261,15 @@ export async function POST(
   // The autonomy master-switch (anton-y3l) gates at *claim* in the runner instead, so with autonomy
   // off the job waits `queued` and re-enabling resumes it.
   // `takeOver` was derived above (identical condition) so the blocker gate could skip a pure take-over.
+  // Run-directly (anton-d8i4): the operator's "Approve" (immediate) vs "Queue" choice rides into the
+  // enqueue as `bypassBudget`, so the governor paces a Queue but not an Approve. Inert on a project
+  // without budget-aware execution — the governor never runs there.
   let jobId: string | undefined;
   try {
     if (!takeOver) {
-      jobId = await enqueueExecuteEpic(project.id, epicId);
+      jobId = await enqueueExecuteEpic(project.id, epicId, { bypassBudget: immediate });
     } else if (openBlockers.length === 0) {
-      jobId = await enqueueExecuteEpicIfAbsent(project.id, epicId);
+      jobId = await enqueueExecuteEpicIfAbsent(project.id, epicId, { bypassBudget: immediate });
     }
   } catch (err) {
     console.error(`[approve] failed to enqueue execute-epic for ${epicId}`, err);

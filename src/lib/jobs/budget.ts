@@ -192,11 +192,18 @@ function isNight(now: number, policy: BudgetPolicy): boolean {
 /**
  * Decide whether autonomous work may start now. See the module header for the reason ordering.
  * `now` is epoch-ms (injected for tests). A null `usage` fails OPEN — a broken read never halts.
+ *
+ * `opts.skipPacing` is the "run directly" bypass (anton-d8i4): an epic the operator approved for
+ * immediate execution skips the weekly-on-track and daytime-reserve *pacing* holds but NOT the
+ * session-headroom floor — that hard limit still protects the tail of a 5-hour session, so an
+ * immediate run can't blow past the cap it would only hit mid-run. With it set, the gate admits as
+ * soon as the session floor clears.
  */
 export function budgetGate(
   usage: ClaudeUsage | null,
   policy: BudgetPolicy,
   now: number,
+  opts?: { skipPacing?: boolean },
 ): BudgetDecision {
   if (!usage) return { admit: true };
 
@@ -209,6 +216,10 @@ export function budgetGate(
     const retryAt = Number.isNaN(resetMs) ? new Date(now + policy.sessionWindowMs) : new Date(resetMs);
     return { admit: false, retryAt, reason: "session-headroom" };
   }
+
+  // Run-directly (immediate approval): only the session floor above holds it — weekly/daytime pacing
+  // is deliberately skipped, so an operator who asked for "now" gets it the moment the session allows.
+  if (opts?.skipPacing) return { admit: true };
 
   const { behindPace, aheadPace, weeklyResetMs } = computePace(usage, policy, now);
 

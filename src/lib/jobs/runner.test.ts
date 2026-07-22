@@ -1105,7 +1105,9 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
       readUsage: opts.readUsage,
       resolveBudgetPolicy: opts.resolveBudgetPolicy ?? (() => opts.policy ?? DEFAULT_BUDGET_POLICY),
     });
-    for (const type of ["execute-epic", "review-fix"] as const) r.registerHandler(type, handler);
+    for (const type of ["execute-epic", "review-fix", "nightly-stringer", "orphan-grooming"] as const) {
+      r.registerHandler(type, handler);
+    }
     return r;
   }
 
@@ -1133,15 +1135,96 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     expect(job?.lastError).toMatch(/budget: session-headroom/);
   });
 
-  it("governs a scheduled job type too (review-fix), not just execute-epic", async () => {
+  it("governs the orphan-grooming cleanup sweep, not just execute-epic", async () => {
     await seedProjects("A");
     const r = budgetRunner(async () => {}, { readUsage: async () => usage({ sessionPct: 99 }) });
-    const id = await r.enqueue({ type: "review-fix", projectId: "A" });
+    const id = await r.enqueue({ type: "orphan-grooming", projectId: "A" });
 
     expect(await r.tickOnce()).toBe(0);
     const job = await getJob(tdb.db, id);
     expect(job?.status).toBe("queued");
     expect(job?.lastError).toMatch(/budget:/);
+  });
+
+  it("does NOT govern review-fix or nightly-stringer — they lease immediately even when budget is scarce (anton-d8i4)", async () => {
+    // Session 99% ≥ the floor would defer any governed type, but review-fix / nightly-stringer are
+    // off the allowlist: a human's PR-review fix and the fixed nightly scan must not be paced.
+    await seedProjects("A");
+    let ran = 0;
+    const r = budgetRunner(
+      async () => {
+        ran += 1;
+      },
+      { readUsage: async () => usage({ sessionPct: 99 }) },
+    );
+    const rf = await r.enqueue({ type: "review-fix", projectId: "A" });
+    const ns = await r.enqueue({ type: "nightly-stringer", projectId: "A" });
+
+    expect(await r.tickOnce()).toBe(2); // both leased despite the scarce budget
+    await r.whenIdle();
+    expect(ran).toBe(2);
+    expect((await getJob(tdb.db, rf))?.status).toBe("done");
+    expect((await getJob(tdb.db, ns))?.status).toBe("done");
+  });
+
+  it("runs an immediate-approved (bypassBudget) execute-epic while pacing a queued one (anton-d8i4)", async () => {
+    // Ahead of the weekly pace-line (weekly-on-track), session fresh: a paced job defers, but an
+    // immediate-approved one skips pacing and runs now.
+    await seedProjects("A");
+    const weeklyResetAt = new Date(clock.now() + 3.5 * 24 * 60 * 60 * 1000).toISOString(); // half-week left
+    let ran = 0;
+    const r = budgetRunner(
+      async () => {
+        ran += 1;
+      },
+      { readUsage: async () => usage({ sessionPct: 10, weeklyPct: 80, weeklyResetAt }) },
+    );
+    const paced = await r.enqueue({
+      type: "execute-epic",
+      projectId: "A",
+      payload: { projectId: "A", epicBeadId: "A-1" },
+    });
+    const immediate = await r.enqueue({
+      type: "execute-epic",
+      projectId: "A",
+      payload: { projectId: "A", epicBeadId: "A-2", bypassBudget: true },
+    });
+
+    expect(await r.tickOnce()).toBe(1); // only the immediate job leases
+    await r.whenIdle();
+    expect(ran).toBe(1);
+    expect((await getJob(tdb.db, immediate))?.status).toBe("done");
+    const pacedJob = await getJob(tdb.db, paced);
+    expect(pacedJob?.status).toBe("queued");
+    expect(toMs(pacedJob?.runAt)).toBeGreaterThan(clock.now()); // pushed out to the pace boundary
+    expect(pacedJob?.lastError).toMatch(/budget: weekly-on-track/);
+  });
+
+  it("still holds an immediate-approved execute-epic at the session-headroom floor (anton-d8i4)", async () => {
+    // The session floor is the one hold "Approve" (immediate) does NOT bypass — it protects the tail
+    // of the 5h session, so an immediate run can't blow the cap it would only hit mid-run.
+    await seedProjects("A");
+    let ran = 0;
+    const r = budgetRunner(
+      async () => {
+        ran += 1;
+      },
+      { readUsage: async () => usage({ sessionPct: 99 }) },
+    );
+    const id = await r.enqueue({
+      type: "execute-epic",
+      projectId: "A",
+      payload: { projectId: "A", epicBeadId: "A-1", bypassBudget: true },
+    });
+
+    expect(await r.tickOnce()).toBe(0); // held by the session floor
+    await r.whenIdle();
+    expect(ran).toBe(0);
+    const job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("queued");
+    const expectedRetry = Math.floor((clock.now() + DEFAULT_BUDGET_POLICY.sessionWindowMs) / 1000) * 1000;
+    expect(toMs(job?.runAt)).toBe(expectedRetry);
+    expect(job?.lastError).toMatch(/budget: session-headroom/);
   });
 
   it("admits a tick when the governor says work may run", async () => {

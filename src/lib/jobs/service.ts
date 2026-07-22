@@ -151,8 +151,9 @@ export async function startRunner(): Promise<void> {
 export function enqueueExecuteEpic(
   projectId: string,
   epicBeadId: string,
+  opts?: { bypassBudget?: boolean },
 ): Promise<string | undefined> {
-  return getRunner().enqueueExecuteEpic(projectId, epicBeadId);
+  return getRunner().enqueueExecuteEpic(projectId, epicBeadId, opts);
 }
 
 /**
@@ -165,8 +166,9 @@ export function enqueueExecuteEpic(
 export function enqueueExecuteEpicIfAbsent(
   projectId: string,
   epicBeadId: string,
+  opts?: { bypassBudget?: boolean },
 ): Promise<string | undefined> {
-  return Promise.resolve(getRunner().enqueueExecuteEpicIfAbsent(projectId, epicBeadId));
+  return Promise.resolve(getRunner().enqueueExecuteEpicIfAbsent(projectId, epicBeadId, opts));
 }
 
 /**

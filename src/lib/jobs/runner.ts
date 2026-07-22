@@ -112,18 +112,18 @@ export type BudgetPolicyResolver = (
 
 /**
  * Job types the budget governor may proactively defer (anton-szld). An allowlist by design: only
- * anton's *autonomous* background work — the scheduled sweeps and autonomous epic execution — is
- * held when the governor says the budget is scarce. A human-approved epic still *enqueues* the
- * moment it's approved; the governor only delays when the runner *leases* it, exactly like the
- * schedule master-switch. Truly interactive work (the app's own `claude -p` calls) isn't a job in
- * this queue and so is never governed; any future interactive job type is unaffected until listed here.
+ * anton's *autonomous* background work is held when the governor says the budget is scarce, and the
+ * governor only delays when the runner *leases* a job — a human-approved epic still *enqueues* the
+ * moment it's approved, exactly like the schedule master-switch.
+ *
+ * `review-fix` and `nightly-stringer` are deliberately NOT governed (anton-d8i4): review-fix responds
+ * to a human's PR review / failing CI and must land promptly, and the nightly scan is a fixed, cheap,
+ * off-peak sweep — pacing either just adds latency without meaningfully shaping the weekly burn. So
+ * only autonomous *epic execution* and the `orphan-grooming` cleanup sweep are paced; and even an
+ * execute-epic job the operator approved for immediate run (the `bypassBudget` payload flag) skips
+ * the pacing holds, keeping only the session-headroom floor (see `applyBudgetGovernor`).
  */
-export const GOVERNED_JOB_TYPES: readonly JobType[] = [
-  "execute-epic",
-  "review-fix",
-  "nightly-stringer",
-  "orphan-grooming",
-];
+export const GOVERNED_JOB_TYPES: readonly JobType[] = ["execute-epic", "orphan-grooming"];
 
 /**
  * Is an execute-epic run already live for this project + epic on ANOTHER machine? (anton-jz1)
@@ -327,14 +327,19 @@ export class JobRunner {
   async enqueueExecuteEpic(
     projectId: string,
     epicBeadId: string,
+    opts?: { bypassBudget?: boolean },
   ): Promise<string | undefined> {
     if (this.quiescedProjects.has(projectId)) {
       throw new Error(`Project is being deleted: ${projectId}`);
     }
-    // A job already active in this store (queued|running) short-circuits every other check: it IS
-    // this machine's live/pending run for the epic, so return it (the existing dedupe contract).
+    // A job already active in this store (queued|running) short-circuits the cross-machine check: it
+    // IS this machine's live/pending run for the epic. Re-run the dedupe path anyway (not a bare
+    // return) so an immediate "Approve" (bypassBudget) can promote an already-queued paced job —
+    // pull it due now + set the bypass flag — instead of leaving it stuck behind the pace-line.
     const localActive = activeExecuteEpicId(this.db, projectId, epicBeadId);
-    if (localActive) return localActive;
+    if (localActive) {
+      return enqueueExecuteEpicDeduped(this.db, this.clock, projectId, epicBeadId, opts);
+    }
 
     // No local job. Before starting a fresh run, consult the shared board: if a run is live on
     // another machine, don't double-run — the `jobs` table can't see it because it's machine-local
@@ -359,7 +364,7 @@ export class JobRunner {
       throw new Error(`Project is being deleted: ${projectId}`);
     }
 
-    return enqueueExecuteEpicDeduped(this.db, this.clock, projectId, epicBeadId);
+    return enqueueExecuteEpicDeduped(this.db, this.clock, projectId, epicBeadId, opts);
   }
 
   /**
@@ -368,11 +373,15 @@ export class JobRunner {
    * local job while a same-instance one reuses the existing (resumable) job. Returns the new job id,
    * or `undefined` when a local job already covers the epic. See `enqueueExecuteEpicIfAbsent`.
    */
-  enqueueExecuteEpicIfAbsent(projectId: string, epicBeadId: string): string | undefined {
+  enqueueExecuteEpicIfAbsent(
+    projectId: string,
+    epicBeadId: string,
+    opts?: { bypassBudget?: boolean },
+  ): string | undefined {
     if (this.quiescedProjects.has(projectId)) {
       throw new Error(`Project is being deleted: ${projectId}`);
     }
-    return enqueueExecuteEpicIfAbsent(this.db, this.clock, projectId, epicBeadId);
+    return enqueueExecuteEpicIfAbsent(this.db, this.clock, projectId, epicBeadId, opts);
   }
 
   /**
@@ -555,17 +564,52 @@ export class JobRunner {
     const now = this.clock.now();
     for (const { pid, policy } of governed) {
       const decision = budgetGate(usage, policy, now);
-      if (decision.admit) continue;
+      if (decision.admit) continue; // budget healthy → nothing paced this tick, immediate or not
       const retryAtMs = decision.retryAt.getTime();
-      // Hold this tick (same mechanism as the schedule master-switch)…
-      for (const type of GOVERNED_JOB_TYPES) heldBucketKeys.add(scheduleGateKey(type, pid));
-      // …and push the queued rows out so they aren't re-evaluated until the boundary.
+      const pacedError = `budget: ${decision.reason} — resumes at ${new Date(retryAtMs).toISOString()}`;
+
+      // Fully-governed types (everything except execute-epic) — held + deferred wholesale to the
+      // pace boundary. There's no per-job bypass for these; the whole bucket is paced.
+      const otherTypes = GOVERNED_JOB_TYPES.filter((t) => t !== "execute-epic");
+      for (const type of otherTypes) heldBucketKeys.add(scheduleGateKey(type, pid));
+      if (otherTypes.length > 0) {
+        await deferQueuedJobs(this.db, this.clock, {
+          types: otherTypes,
+          projectId: pid,
+          retryAtMs,
+          lastError: pacedError,
+        });
+      }
+
+      // execute-epic splits on the per-job `bypassBudget` flag (anton-d8i4):
+      //  • paced ("Queue for optimal usage") rows are deferred to the pace boundary like before.
       await deferQueuedJobs(this.db, this.clock, {
-        types: GOVERNED_JOB_TYPES,
+        types: ["execute-epic"],
         projectId: pid,
         retryAtMs,
-        lastError: `budget: ${decision.reason} — resumes at ${new Date(retryAtMs).toISOString()}`,
+        lastError: pacedError,
+        bypass: "exclude",
       });
+
+      //  • immediate ("Approve" / run-directly) rows skip weekly/daytime pacing but still honor the
+      //    session-headroom floor: defer them ONLY when the session itself is nearly exhausted.
+      const immediate = budgetGate(usage, policy, now, { skipPacing: true });
+      if (!immediate.admit) {
+        const immRetryMs = immediate.retryAt.getTime();
+        await deferQueuedJobs(this.db, this.clock, {
+          types: ["execute-epic"],
+          projectId: pid,
+          retryAtMs: immRetryMs,
+          lastError: `budget: ${immediate.reason} — resumes at ${new Date(immRetryMs).toISOString()}`,
+          bypass: "only",
+        });
+        // Every execute-epic row for the project is now deferred (paced + immediate), so hold the
+        // whole bucket as the starvation guard, matching the schedule master-switch.
+        heldBucketKeys.add(scheduleGateKey("execute-epic", pid));
+      }
+      // else: immediate rows run this tick — do NOT hold the execute-epic bucket. The paced rows were
+      // just pushed to a future runAt, so they're not runnable and can't crowd the finite scan window
+      // (the reason the bucket is normally held); the immediate rows stay due and lease as usual.
     }
   }
 
