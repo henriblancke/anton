@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import { LayersIcon } from "lucide-react";
 
 import { getProjectBySlug } from "@/lib/projects";
+import { getRunningJobInfo } from "@/lib/jobs/service";
 import { countJobs, listJobsPaged } from "@/lib/jobs-view";
 import { countRuns } from "@/lib/runs";
 import { SectionTabs } from "@/components/runs/section-tabs";
@@ -29,6 +30,19 @@ export default async function ProjectJobsPage({
     limit: PAGE_SIZE,
     offset: (current - 1) * PAGE_SIZE,
   }) : [];
+
+  // Live cwd per running job (anton-gjhu), read from the runner's in-memory handle. Only jobs
+  // running on THIS instance with a reported cwd get an Investigate action — a queued/settled or
+  // other-machine job has no live directory to drop into.
+  const investigateCwds: Record<string, string> = Object.fromEntries(
+    (
+      await Promise.all(
+        jobs
+          .filter((job) => job.status === "running")
+          .map(async (job) => [job.id, (await getRunningJobInfo(project.id, job.id))?.cwd] as const),
+      )
+    ).filter((entry): entry is [string, string] => Boolean(entry[1])),
+  );
 
   return (
     <div className="flex flex-1 flex-col">
@@ -60,7 +74,7 @@ export default async function ProjectJobsPage({
         </div>
       ) : (
         <div className="flex flex-1 flex-col">
-          <JobList jobs={jobs} slug={slug} />
+          <JobList jobs={jobs} slug={slug} investigateCwds={investigateCwds} />
           <Pagination basePath={`/projects/${slug}/jobs`} page={current} total={total} />
         </div>
       )}

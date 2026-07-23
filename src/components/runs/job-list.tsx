@@ -11,6 +11,10 @@ import { cn } from "@/lib/utils";
 import { fmtDuration } from "@/components/runs/run-view-utils";
 import { ResumeJobButton } from "@/components/runs/resume-job-button";
 import { KillJobButton } from "@/components/runs/kill-job-button";
+import {
+  InvestigateJobButton,
+  InvestigateTerminal,
+} from "@/components/runs/investigate-job";
 
 const STATUS_STYLE: Record<JobStatus, { dot: string; text: string; pulse?: boolean }> = {
   running: { dot: "bg-stage-implementing", text: "text-stage-implementing", pulse: true },
@@ -47,27 +51,49 @@ function absTime(epoch?: number): string {
  * metadata, so a failed scan is diagnosable without touching the DB. Rendered on its own paginated
  * Jobs page, so no section chrome here — just the row list.
  */
-export function JobList({ jobs, slug }: { jobs: JobSummary[]; slug: string }) {
+export function JobList({
+  jobs,
+  slug,
+  investigateCwds,
+}: {
+  jobs: JobSummary[];
+  slug: string;
+  /** jobId → live cwd for jobs running on this instance (anton-gjhu) — gates the Investigate action. */
+  investigateCwds?: Record<string, string>;
+}) {
   return (
     <ul className="flex flex-col divide-y divide-border">
       {jobs.map((job) => (
-        <JobRow key={job.id} job={job} slug={slug} />
+        <JobRow key={job.id} job={job} slug={slug} investigateCwd={investigateCwds?.[job.id]} />
       ))}
     </ul>
   );
 }
 
-function JobRow({ job, slug }: { job: JobSummary; slug: string }) {
+function JobRow({
+  job,
+  slug,
+  investigateCwd,
+}: {
+  job: JobSummary;
+  slug: string;
+  investigateCwd?: string;
+}) {
   const [open, setOpen] = useState(false);
   // A confirmed kill is terminal, so the row can show `cancelled` immediately rather than waiting
   // on router.refresh(). Only ever set from a 200 — a failed kill leaves the job's own status.
   const [killed, setKilled] = useState(false);
+  // Live investigate pty under this row (anton-gjhu). Set only from a 201 spawn, cleared on close.
+  const [investigateSession, setInvestigateSession] = useState<string | null>(null);
   const status: JobStatus = killed ? "cancelled" : job.status;
   const style = STATUS_STYLE[status];
   const active = ACTIVE_JOB_STATUSES.has(status);
   const finished = !active;
   // Parked/failed jobs are recoverable but not self-healing — offer a manual resume (anton-ner.4).
   const resumable = !killed && (job.status === "parked" || job.status === "failed");
+  // Investigate needs a job that's still running here with a reported cwd — the map only carries
+  // those, and a local kill drops the action immediately.
+  const investigable = !killed && job.status === "running" && Boolean(investigateCwd);
 
   return (
     <li className="flex flex-col">
@@ -104,6 +130,9 @@ function JobRow({ job, slug }: { job: JobSummary; slug: string }) {
             onClick={(e) => e.stopPropagation()}
           >
             {resumable && <ResumeJobButton slug={slug} jobId={job.id} />}
+            {investigable && !investigateSession && (
+              <InvestigateJobButton slug={slug} jobId={job.id} onSession={setInvestigateSession} />
+            )}
             {active && (
               <KillJobButton slug={slug} jobId={job.id} onKilled={() => setKilled(true)} />
             )}
@@ -120,6 +149,15 @@ function JobRow({ job, slug }: { job: JobSummary; slug: string }) {
       </div>
 
       {open && <JobDetail job={job} status={status} />}
+
+      {investigateSession && investigateCwd && (
+        <InvestigateTerminal
+          slug={slug}
+          sessionId={investigateSession}
+          cwd={investigateCwd}
+          onClose={() => setInvestigateSession(null)}
+        />
+      )}
     </li>
   );
 }

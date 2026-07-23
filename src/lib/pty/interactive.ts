@@ -14,6 +14,13 @@ export interface StartInteractiveInput {
   rows?: number;
   beadId?: string;
   runId?: string;
+  /**
+   * Working directory for the pty; defaults to the project's repoPath. The investigate flow
+   * (anton-gjhu) passes a running job's reported cwd so the operator lands in the exact directory
+   * the job is working in (e.g. its worktree). Callers must resolve this server-side — never from
+   * client input directly.
+   */
+  cwd?: string;
 }
 
 /**
@@ -45,7 +52,7 @@ export async function startInteractiveSession(
       sessionId,
       file: bin,
       args: input.args ?? [],
-      cwd: project.repoPath,
+      cwd: input.cwd ?? project.repoPath,
       env: { ...process.env, TERM: "xterm-256color" },
       cols: input.cols ?? 80,
       rows: input.rows ?? 24,
