@@ -298,6 +298,9 @@ async function runFixSession(args: {
     beadId: epic.id,
     logPath,
   });
+  // Live handle (anton-susu): review-fix writes no run row, so this is how observe finds the
+  // in-flight session + worktree.
+  ctx.report({ sessionId, cwd: worktree.path });
   const onEvent = (e: ClaudeEvent) => {
     const line = e.text ? `[${e.type}] ${e.text}\n` : `[${e.type}]\n`;
     void appendSessionLog(logPath, line).catch(() => {});

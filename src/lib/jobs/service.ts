@@ -17,7 +17,7 @@ import { makeExecuteEpicHandler } from "./execute-epic";
 import { makeReviewFixHandler } from "./review-fix";
 import { makeNightlyStringerHandler } from "./nightly-stringer";
 import { makeOrphanGroomingHandler } from "./orphan-grooming";
-import { JobRunner, type RunnerLogger } from "./runner";
+import { JobRunner, type RunnerLogger, type RunningJobInfo } from "./runner";
 import { Scheduler } from "./scheduler";
 import { activeExecuteEpicId, getJob, systemClock } from "./queue";
 import { startSyncEngine } from "../beads/sync-engine";
@@ -163,6 +163,21 @@ export async function resumeJob(projectId: string, jobId: string): Promise<boole
   const job = await getJob(getDb(), jobId);
   if (!job || job.projectId !== projectId) return false;
   return getRunner().resume(jobId);
+}
+
+/**
+ * Live info for a running job (anton-susu): the session id + cwd its handler reported via
+ * ctx.report, plus the job type. Scoped to the project so a route can't introspect another
+ * project's job by id. Undefined when the job doesn't exist, belongs to another project, or is
+ * not in flight on this instance (jobs are machine-local; the info clears when the job settles).
+ */
+export async function getRunningJobInfo(
+  projectId: string,
+  jobId: string,
+): Promise<RunningJobInfo | undefined> {
+  const job = await getJob(getDb(), jobId);
+  if (!job || job.projectId !== projectId) return undefined;
+  return getRunner().runningJobInfo(jobId);
 }
 
 /**

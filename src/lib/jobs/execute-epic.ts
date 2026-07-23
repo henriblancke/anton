@@ -913,6 +913,9 @@ async function runTicket(args: {
     logPath,
   });
   await updateRun(db, clock, runId, { ticketBeadId: ticket.id, agentTag: agentTag ?? null });
+  // Live handle (anton-susu): expose this ticket's session + worktree while it runs; each ticket's
+  // dispatch overwrites the last, so the handle always names the job's CURRENT session.
+  ctx.report({ sessionId, cwd: worktreePath });
 
   const onEvent = (e: ClaudeEvent) => {
     const line = e.text ? `[${e.type}] ${e.text}\n` : `[${e.type}]\n`;

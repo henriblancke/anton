@@ -986,6 +986,81 @@ describe("JobRunner (live, in-memory db)", () => {
     expect((await getJob(tdb.db, bypassed))?.status).toBe("queued");
     expect((await getJob(tdb.db, other))?.status).toBe("done");
   });
+
+  it("runningJobInfo returns what the handler reported while in flight, undefined after settle (anton-susu)", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let reported = false;
+    const r = runner(async (ctx) => {
+      ctx.report({ sessionId: "sess-1", cwd: "/tmp/wt-1" });
+      reported = true;
+      await gate;
+    });
+    const id = await r.enqueue({ type: "execute-epic" });
+    expect(await r.tickOnce()).toBe(1);
+    await waitUntil(() => reported);
+
+    expect(r.runningJobInfo(id)).toEqual({
+      sessionId: "sess-1",
+      cwd: "/tmp/wt-1",
+      type: "execute-epic",
+    });
+    expect(r.runningJobInfo("does-not-exist")).toBeUndefined();
+
+    // Settled → the live handle is cleared with the in-flight entry; a done job reports nothing.
+    release();
+    await r.whenIdle();
+    expect(r.runningJobInfo(id)).toBeUndefined();
+    expect((await getJob(tdb.db, id))?.status).toBe("done");
+  });
+
+  it("runningJobInfo merges partial reports and a re-report overwrites (anton-susu)", async () => {
+    // execute-epic re-reports per ticket: the handle must always name the CURRENT session.
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let ctxRef: Parameters<JobHandler>[0] | undefined;
+    const r = runner(async (ctx) => {
+      ctxRef = ctx;
+      await gate;
+    });
+    const id = await r.enqueue({ type: "execute-epic" });
+    await r.tickOnce();
+    await waitUntil(() => ctxRef !== undefined);
+
+    // In flight but nothing reported yet — the job is introspectable, its fields just empty.
+    expect(r.runningJobInfo(id)).toEqual({ type: "execute-epic" });
+
+    ctxRef!.report({ cwd: "/tmp/wt-1" });
+    expect(r.runningJobInfo(id)).toEqual({ cwd: "/tmp/wt-1", type: "execute-epic" });
+    ctxRef!.report({ sessionId: "sess-1" });
+    expect(r.runningJobInfo(id)).toEqual({
+      sessionId: "sess-1",
+      cwd: "/tmp/wt-1",
+      type: "execute-epic",
+    });
+    ctxRef!.report({ sessionId: "sess-2" }); // next ticket's session replaces the last
+    expect(r.runningJobInfo(id)).toEqual({
+      sessionId: "sess-2",
+      cwd: "/tmp/wt-1",
+      type: "execute-epic",
+    });
+
+    release();
+    await r.whenIdle();
+    expect(r.runningJobInfo(id)).toBeUndefined();
+  });
+
+  it("runningJobInfo clears even when the handler fails (settle → park/retry) (anton-susu)", async () => {
+    const r = runner(async (ctx) => {
+      ctx.report({ sessionId: "sess-fail", cwd: "/tmp/wt-f" });
+      throw new Error("boom");
+    });
+    const id = await r.enqueue({ type: "execute-epic" });
+    await r.tickOnce();
+    await r.whenIdle();
+    expect(r.runningJobInfo(id)).toBeUndefined();
+    expect((await getJob(tdb.db, id))?.status).toBe("queued"); // rescheduled for retry
+  });
 });
 
 /** Poll `pred` on real timers until it holds (used with in-flight jobs the FakeClock can't drive). */
