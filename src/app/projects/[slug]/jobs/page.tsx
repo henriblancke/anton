@@ -31,17 +31,21 @@ export default async function ProjectJobsPage({
     offset: (current - 1) * PAGE_SIZE,
   }) : [];
 
-  // Live cwd per running job (anton-gjhu), read from the runner's in-memory handle. Only jobs
-  // running on THIS instance with a reported cwd get an Investigate action — a queued/settled or
-  // other-machine job has no live directory to drop into.
-  const investigateCwds: Record<string, string> = Object.fromEntries(
+  // Live handle per running job, read from the runner's in-memory state. Only jobs running on
+  // THIS instance carry one — a reported cwd gates the Investigate action (anton-gjhu), a reported
+  // sessionId gates View live output (anton-x10l); a queued/settled or other-machine job has
+  // neither. Only the two UI-relevant fields cross the RSC boundary.
+  const liveJobs: Record<string, { sessionId?: string; cwd?: string }> = Object.fromEntries(
     (
       await Promise.all(
         jobs
           .filter((job) => job.status === "running")
-          .map(async (job) => [job.id, (await getRunningJobInfo(project.id, job.id))?.cwd] as const),
+          .map(async (job) => {
+            const info = await getRunningJobInfo(project.id, job.id);
+            return [job.id, { sessionId: info?.sessionId, cwd: info?.cwd }] as const;
+          }),
       )
-    ).filter((entry): entry is [string, string] => Boolean(entry[1])),
+    ).filter(([, live]) => Boolean(live.sessionId || live.cwd)),
   );
 
   return (
@@ -74,7 +78,7 @@ export default async function ProjectJobsPage({
         </div>
       ) : (
         <div className="flex flex-1 flex-col">
-          <JobList jobs={jobs} slug={slug} investigateCwds={investigateCwds} />
+          <JobList jobs={jobs} slug={slug} liveJobs={liveJobs} />
           <Pagination basePath={`/projects/${slug}/jobs`} page={current} total={total} />
         </div>
       )}

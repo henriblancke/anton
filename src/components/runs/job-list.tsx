@@ -1,13 +1,17 @@
 "use client";
 
 import { useState } from "react";
-import { ChevronRightIcon } from "lucide-react";
+import { ChevronRightIcon, ScrollTextIcon } from "lucide-react";
 
 // Type-only import: pulling the runtime `isActiveJob`/`listJobs` from jobs-view would drag its
 // better-sqlite3 (server-only) dependency into this client bundle. Types are erased at build, so
 // this is safe; the active-status check is inlined below.
 import type { JobStatus, JobSummary } from "@/lib/jobs-view";
+// Type-only for the same reason: runner.ts is server-only, but its LiveJobInfo shape is exactly
+// what the page resolves per running job.
+import type { LiveJobInfo } from "@/lib/jobs/runner";
 import { cn } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
 import { fmtDuration } from "@/components/runs/run-view-utils";
 import { ResumeJobButton } from "@/components/runs/resume-job-button";
 import { KillJobButton } from "@/components/runs/kill-job-button";
@@ -15,6 +19,7 @@ import {
   InvestigateJobButton,
   InvestigateTerminal,
 } from "@/components/runs/investigate-job";
+import { JobOutputPanel } from "@/components/runs/view-job-output";
 
 const STATUS_STYLE: Record<JobStatus, { dot: string; text: string; pulse?: boolean }> = {
   running: { dot: "bg-stage-implementing", text: "text-stage-implementing", pulse: true },
@@ -54,17 +59,20 @@ function absTime(epoch?: number): string {
 export function JobList({
   jobs,
   slug,
-  investigateCwds,
+  liveJobs,
 }: {
   jobs: JobSummary[];
   slug: string;
-  /** jobId → live cwd for jobs running on this instance (anton-gjhu) — gates the Investigate action. */
-  investigateCwds?: Record<string, string>;
+  /**
+   * jobId → live handle for jobs running on this instance: cwd gates the Investigate action
+   * (anton-gjhu), sessionId gates View live output (anton-x10l).
+   */
+  liveJobs?: Record<string, LiveJobInfo>;
 }) {
   return (
     <ul className="flex flex-col divide-y divide-border">
       {jobs.map((job) => (
-        <JobRow key={job.id} job={job} slug={slug} investigateCwd={investigateCwds?.[job.id]} />
+        <JobRow key={job.id} job={job} slug={slug} live={liveJobs?.[job.id]} />
       ))}
     </ul>
   );
@@ -73,11 +81,11 @@ export function JobList({
 function JobRow({
   job,
   slug,
-  investigateCwd,
+  live,
 }: {
   job: JobSummary;
   slug: string;
-  investigateCwd?: string;
+  live?: LiveJobInfo;
 }) {
   const [open, setOpen] = useState(false);
   // A confirmed kill is terminal, so the row can show `cancelled` immediately rather than waiting
@@ -85,6 +93,8 @@ function JobRow({
   const [killed, setKilled] = useState(false);
   // Live investigate pty under this row (anton-gjhu). Set only from a 201 spawn, cleared on close.
   const [investigateSession, setInvestigateSession] = useState<string | null>(null);
+  // Live output viewer under this row (anton-x10l) — read-only tail of the job's session log.
+  const [outputOpen, setOutputOpen] = useState(false);
   const status: JobStatus = killed ? "cancelled" : job.status;
   const style = STATUS_STYLE[status];
   const active = ACTIVE_JOB_STATUSES.has(status);
@@ -93,7 +103,9 @@ function JobRow({
   const resumable = !killed && (job.status === "parked" || job.status === "failed");
   // Investigate needs a job that's still running here with a reported cwd — the map only carries
   // those, and a local kill drops the action immediately.
-  const investigable = !killed && job.status === "running" && Boolean(investigateCwd);
+  const investigable = !killed && job.status === "running" && Boolean(live?.cwd);
+  // View live output needs a running job whose handler reported a session — same locality rules.
+  const observable = !killed && job.status === "running" && Boolean(live?.sessionId);
 
   return (
     <li className="flex flex-col">
@@ -130,6 +142,12 @@ function JobRow({
             onClick={(e) => e.stopPropagation()}
           >
             {resumable && <ResumeJobButton slug={slug} jobId={job.id} />}
+            {observable && !outputOpen && (
+              <Button size="xs" variant="outline" onClick={() => setOutputOpen(true)}>
+                <ScrollTextIcon aria-hidden="true" />
+                View live output
+              </Button>
+            )}
             {investigable && !investigateSession && (
               <InvestigateJobButton slug={slug} jobId={job.id} onSession={setInvestigateSession} />
             )}
@@ -150,11 +168,19 @@ function JobRow({
 
       {open && <JobDetail job={job} status={status} />}
 
-      {investigateSession && investigateCwd && (
+      {outputOpen && live?.sessionId && (
+        <JobOutputPanel
+          slug={slug}
+          sessionId={live.sessionId}
+          onClose={() => setOutputOpen(false)}
+        />
+      )}
+
+      {investigateSession && live?.cwd && (
         <InvestigateTerminal
           slug={slug}
           sessionId={investigateSession}
-          cwd={investigateCwd}
+          cwd={live.cwd}
           onClose={() => setInvestigateSession(null)}
         />
       )}

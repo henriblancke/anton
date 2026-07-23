@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 /**
  * anton-gjhu: the Investigate affordance. Present only on a running job whose live cwd resolved
- * (the server passes investigateCwds for those alone); absent everywhere else. The button spawns
+ * (the server passes liveJobs for those alone); absent everywhere else. The button spawns
  * via the project-scoped interactive route with the jobId — never a client-picked directory.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -36,7 +36,7 @@ describe("JobList investigate affordance", () => {
       <JobList
         jobs={[job("running")]}
         slug="anton"
-        investigateCwds={{ "job-running": "/worktrees/wt1" }}
+        liveJobs={{ "job-running": { cwd: "/worktrees/wt1" } }}
       />,
     );
     expect(screen.getByRole("button", { name: /investigate/i })).toBeDefined();
@@ -54,7 +54,7 @@ describe("JobList investigate affordance", () => {
         <JobList
           jobs={[job(status)]}
           slug="anton"
-          investigateCwds={{ [`job-${status}`]: "/worktrees/wt1" }}
+          liveJobs={{ [`job-${status}`]: { cwd: "/worktrees/wt1" } }}
         />,
       );
       expect(screen.queryByRole("button", { name: /investigate/i })).toBeNull();
