@@ -16,7 +16,7 @@ vi.mock("@/lib/db", () => ({ getDb: () => tdb.db, schema }));
 // service.ts imports the sync engine only to start it in startRunner(); these tests never do.
 vi.mock("@/lib/beads/sync-engine", () => ({ startSyncEngine: () => {} }));
 
-const { getRunner, getRunningJobInfo } = await import("./service");
+const { getRunner, getRunningJobInfo, getRunningJobInfos } = await import("./service");
 
 describe("getRunningJobInfo (service, project-scoped)", () => {
   beforeAll(() => {
@@ -63,6 +63,34 @@ describe("getRunningJobInfo (service, project-scoped)", () => {
     await runner.whenIdle();
     // Settled → the live handle is gone; a done job reports nothing.
     expect(await getRunningJobInfo("p-alpha", id)).toBeUndefined();
+  });
+
+  it("getRunningJobInfos batch-reads in-flight handles synchronously (no per-job DB lookup)", async () => {
+    const runner = getRunner();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let reported!: () => void;
+    const reportedGate = new Promise<void>((resolve) => (reported = resolve));
+    runner.registerHandler("execute-epic", async (ctx) => {
+      ctx.report({ sessionId: "sess-batch", cwd: "/tmp/alpha/wt" });
+      reported();
+      await gate;
+    });
+
+    const id = await runner.enqueue({ type: "execute-epic", projectId: "p-alpha" });
+    await runner.tickOnce();
+    await reportedGate;
+
+    // Ids come pre-verified from a project-scoped list query — the read is a pure in-memory map
+    // over the runner's live handles: in-flight ids surface their report, unknown ids are absent.
+    expect(getRunningJobInfos([id, randomUUID()])).toEqual({
+      [id]: { sessionId: "sess-batch", cwd: "/tmp/alpha/wt", type: "execute-epic" },
+    });
+
+    release();
+    await runner.whenIdle();
+    // Settled → the live handle is gone; the batch read no longer carries the id.
+    expect(getRunningJobInfos([id])).toEqual({});
   });
 
   it("is undefined for a job that exists but is not in flight on this instance", async () => {

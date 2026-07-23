@@ -3,7 +3,9 @@ import { notFound } from "next/navigation";
 import { LayersIcon } from "lucide-react";
 
 import { getProjectBySlug } from "@/lib/projects";
-import { getRunningJobInfo } from "@/lib/jobs/service";
+import { getRunningJobInfos } from "@/lib/jobs/service";
+// Type-only: runner.ts is server-only, but the type is erased at build time.
+import type { LiveJobInfo } from "@/lib/jobs/runner";
 import { countJobs, listJobsPaged } from "@/lib/jobs-view";
 import { countRuns } from "@/lib/runs";
 import { SectionTabs } from "@/components/runs/section-tabs";
@@ -34,18 +36,14 @@ export default async function ProjectJobsPage({
   // Live handle per running job, read from the runner's in-memory state. Only jobs running on
   // THIS instance carry one — a reported cwd gates the Investigate action (anton-gjhu), a reported
   // sessionId gates View live output (anton-x10l); a queued/settled or other-machine job has
-  // neither. Only the two UI-relevant fields cross the RSC boundary.
-  const liveJobs: Record<string, { sessionId?: string; cwd?: string }> = Object.fromEntries(
-    (
-      await Promise.all(
-        jobs
-          .filter((job) => job.status === "running")
-          .map(async (job) => {
-            const info = await getRunningJobInfo(project.id, job.id);
-            return [job.id, { sessionId: info?.sessionId, cwd: info?.cwd }] as const;
-          }),
-      )
-    ).filter(([, live]) => Boolean(live.sessionId || live.cwd)),
+  // neither. The batch read trusts listJobsPaged's project scoping (no per-job DB re-check), and
+  // only the two UI-relevant fields cross the RSC boundary.
+  const liveJobs: Record<string, LiveJobInfo> = Object.fromEntries(
+    Object.entries(
+      getRunningJobInfos(jobs.filter((job) => job.status === "running").map((job) => job.id)),
+    )
+      .map(([id, info]) => [id, { sessionId: info.sessionId, cwd: info.cwd }] as const)
+      .filter(([, live]) => Boolean(live.sessionId || live.cwd)),
   );
 
   return (

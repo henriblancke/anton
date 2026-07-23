@@ -181,6 +181,23 @@ export async function getRunningJobInfo(
 }
 
 /**
+ * Batch live-info read for job ids ALREADY verified to belong to the caller's project — e.g. rows
+ * from a project-scoped list query. Skips getRunningJobInfo's per-job ownership lookup (one
+ * redundant DB query per running job otherwise); routes resolving an untrusted client-supplied id
+ * must keep using getRunningJobInfo. Purely an in-memory runner read: ids not in flight on this
+ * instance are simply absent from the result.
+ */
+export function getRunningJobInfos(jobIds: string[]): Record<string, RunningJobInfo> {
+  const runner = getRunner();
+  const infos: Record<string, RunningJobInfo> = {};
+  for (const id of jobIds) {
+    const info = runner.runningJobInfo(id);
+    if (info) infos[id] = info;
+  }
+  return infos;
+}
+
+/**
  * Outcome of a project-scoped cancel, so the route can pick the right HTTP status:
  *   • `ok`              — the job was terminalized (200).
  *   • `not-found`       — no such job, or it belongs to a different project (404). Project-scoping is
