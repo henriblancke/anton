@@ -81,6 +81,36 @@ describe("JobList view-live-output affordance", () => {
     },
   );
 
+  it("does not auto-reopen the viewer when the job settles and later resumes with a new session", () => {
+    const { rerender } = render(
+      <JobList
+        jobs={[job("running")]}
+        slug="anton"
+        liveJobs={{ "job-running": { sessionId: "sess-42" } }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /view live output/i }));
+    expect(screen.getByTestId("run-terminal")).toBeDefined();
+
+    // RSC refresh after the job settled: the live handle is gone → the viewer closes.
+    rerender(<JobList jobs={[job("running")]} slug="anton" />);
+    expect(screen.queryByTestId("run-terminal")).toBeNull();
+
+    // The job resumes on this instance with a fresh session. The stale open flag must not
+    // silently reopen the viewer — it takes a new click, and the click wires the new session.
+    rerender(
+      <JobList
+        jobs={[job("running")]}
+        slug="anton"
+        liveJobs={{ "job-running": { sessionId: "sess-43" } }}
+      />,
+    );
+    expect(screen.queryByTestId("run-terminal")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /view live output/i }));
+    expect(screen.getByTestId("run-terminal").getAttribute("data-session-id")).toBe("sess-43");
+  });
+
   it("Close collapses the viewer and restores the action", () => {
     render(
       <JobList

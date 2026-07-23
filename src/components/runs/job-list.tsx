@@ -101,6 +101,9 @@ function JobRow({
   // confirmed kill) → drop the session during render (React's "adjusting state when props change"
   // pattern) so the teardown effect below fires and a later resume can't resurrect a dead session.
   if (investigateSession && !liveCwd) setInvestigateSession(null);
+  // Same for the output panel: without this, a settled job leaves outputOpen=true and a later
+  // resume with a fresh sessionId would silently reopen the panel without a user click.
+  if (outputOpen && !live?.sessionId) setOutputOpen(false);
 
   // The row owns the investigate pty's lifetime: dropping the session — Close, the job settling
   // out from under the terminal, or this row unmounting — must kill the pty, because unmounting
