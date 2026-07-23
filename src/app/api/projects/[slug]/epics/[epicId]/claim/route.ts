@@ -4,8 +4,8 @@ import { conflictBody, ownerOf, withClaimLock, type SwapResult } from "@/lib/bea
 import { refreshAllIssues } from "@/lib/beads/issues";
 import { resolveOperator } from "@/lib/operator";
 import { deriveStage } from "@/lib/ticket-view";
-import type { Stage } from "@/lib/types";
-import { resolveProject } from "../../../resolve-project";
+import type { Project, Stage } from "@/lib/types";
+import { notFoundResponse, withProject } from "../../../resolve-project";
 
 export const dynamic = "force-dynamic";
 
@@ -40,16 +40,13 @@ async function readSteal(request: Request): Promise<boolean> {
 }
 
 /**
- * Resolve project + run target off a FRESH bead read, returning either the loaded target or a
+ * Load the run target off a FRESH bead read, returning either the loaded target or a
  * ready-to-return error response. Shared by POST/DELETE so both gate identically to approve.
  */
 async function loadTarget(
-  slug: string,
+  project: Project,
   epicId: string,
 ): Promise<{ ok: true; repoPath: string; target: Bead } | { ok: false; response: NextResponse }> {
-  const { project, response } = await resolveProject(slug);
-  if (!project) return { ok: false, response };
-
   // Force a fresh read (not a warm board snapshot) so the steal check and run-target gate decide
   // from the true current state — a claim added by a teammate seconds ago must be visible here.
   const allBeads = await refreshAllIssues(project.repoPath);
@@ -57,10 +54,7 @@ async function loadTarget(
   if (!target) {
     return {
       ok: false,
-      response: NextResponse.json(
-        { error: `Ticket ${epicId} not found on the board` },
-        { status: 404 },
-      ),
+      response: notFoundResponse(`Ticket ${epicId} not found on the board`),
     };
   }
   if (!beads.isRunTarget(target)) {
@@ -148,12 +142,9 @@ function nudgeSync(repoPath: string, epicId: string, verb: string): Promise<void
     .catch((err) => console.error(`[claim] beads dolt sync failed after ${verb} ${epicId}`, err));
 }
 
-export async function POST(
-  request: Request,
-  { params }: { params: Promise<{ slug: string; epicId: string }> },
-) {
-  const { slug, epicId } = await params;
-  const loaded = await loadTarget(slug, epicId);
+export const POST = withProject<{ slug: string; epicId: string }>(async (request, { project, params }) => {
+  const { epicId } = params;
+  const loaded = await loadTarget(project, epicId);
   if (!loaded.ok) return loaded.response;
   const { repoPath, target } = loaded;
 
@@ -192,14 +183,11 @@ export async function POST(
   // The swap already verified the write with its own read — answer with that bead rather than
   // spawning a third `bd show` for the same state.
   return NextResponse.json({ item: swap.bead });
-}
+});
 
-export async function DELETE(
-  request: Request,
-  { params }: { params: Promise<{ slug: string; epicId: string }> },
-) {
-  const { slug, epicId } = await params;
-  const loaded = await loadTarget(slug, epicId);
+export const DELETE = withProject<{ slug: string; epicId: string }>(async (request, { project, params }) => {
+  const { epicId } = params;
+  const loaded = await loadTarget(project, epicId);
   if (!loaded.ok) return loaded.response;
   const { repoPath, target } = loaded;
 
@@ -247,4 +235,4 @@ export async function DELETE(
   // Nothing was written (the target was unclaimed), so `target` — read fresh by loadTarget — is
   // still the current state.
   return NextResponse.json({ item: target });
-}
+});

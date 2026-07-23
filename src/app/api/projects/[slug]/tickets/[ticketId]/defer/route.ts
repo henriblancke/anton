@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { setTicketDeferred } from "@/lib/ticket-detail";
-import { resolveProject } from "../../../resolve-project";
+import type { Project } from "@/lib/types";
+import { notFoundResponse, withProject } from "../../../resolve-project";
 
 export const dynamic = "force-dynamic";
 
@@ -11,33 +12,22 @@ export const dynamic = "force-dynamic";
  * Both return the refreshed detail so the dialog and board card can re-render without a refetch.
  */
 async function setDeferred(
-  slug: string,
+  project: Project,
   ticketId: string,
   deferred: boolean,
 ): Promise<NextResponse> {
-  const { project, response } = await resolveProject(slug);
-  if (!project) return response;
-
   try {
     const detail = await setTicketDeferred(project, ticketId, deferred);
     return NextResponse.json({ detail });
   } catch {
-    return NextResponse.json({ error: "Ticket not found" }, { status: 404 });
+    return notFoundResponse("Ticket not found");
   }
 }
 
-export async function POST(
-  _request: Request,
-  { params }: { params: Promise<{ slug: string; ticketId: string }> },
-) {
-  const { slug, ticketId } = await params;
-  return setDeferred(slug, ticketId, true);
-}
+export const POST = withProject<{ slug: string; ticketId: string }>(
+  (_request, { project, params }) => setDeferred(project, params.ticketId, true),
+);
 
-export async function DELETE(
-  _request: Request,
-  { params }: { params: Promise<{ slug: string; ticketId: string }> },
-) {
-  const { slug, ticketId } = await params;
-  return setDeferred(slug, ticketId, false);
-}
+export const DELETE = withProject<{ slug: string; ticketId: string }>(
+  (_request, { project, params }) => setDeferred(project, params.ticketId, false),
+);

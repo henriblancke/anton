@@ -1,5 +1,5 @@
 import { getSessionById, sessionLogPath, tailSessionLog } from "@/lib/sessions";
-import { resolveProject } from "../../../resolve-project";
+import { withProject } from "../../../resolve-project";
 
 export const dynamic = "force-dynamic";
 // The tail loop runs for the life of the session; never let the platform buffer/cap it.
@@ -13,14 +13,8 @@ export const maxDuration = 3600;
  * A finished session simply replays its whole log then ends immediately — the same endpoint backs
  * both the live terminal and history/diagnostics replay.
  */
-export async function GET(
-  request: Request,
-  { params }: { params: Promise<{ slug: string; sessionId: string }> },
-) {
-  const { slug, sessionId } = await params;
-
-  const { project, response } = await resolveProject(slug);
-  if (!project) return response;
+export const GET = withProject<{ slug: string; sessionId: string }>(async (request, { project, params }) => {
+  const { sessionId } = params;
 
   const session = await getSessionById(sessionId);
   if (!session || session.projectId !== project.id) {
@@ -75,4 +69,4 @@ export async function GET(
       "X-Accel-Buffering": "no",
     },
   });
-}
+});
