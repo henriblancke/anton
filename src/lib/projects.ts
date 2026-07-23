@@ -131,13 +131,19 @@ export interface ProjectSettings {
    */
   maxRetries?: number;
   /**
-   * Active-agents allowlist (anton-46w): which specialist agent prompts dispatch may assign. Each
-   * entry is a discoverable agent id — bundled OR the project's own `.claude/agents` (anton-dvo.1,
-   * discoverAgents in src/lib/agents-discovery.ts). Enforced by dispatch (anton-dm7, execute-epic):
-   * a run whose ticket needs a disabled agent is PARKED with a clear reason — never silently run
-   * with the default agent. Absent (never persisted / cleared) → all agents active; empty `[]` →
-   * no agents active (the operator toggled every agent off), so any labeled ticket is parked. The
-   * UI seeds "all discovered on" when this is absent, so a no-op save stays all-active.
+   * Active-agents allowlist (anton-46w): which of anton's BUNDLED specialist prompts dispatch may
+   * assign. Each entry is a bundled agent id (discoverAgents in src/lib/agents-discovery.ts).
+   * Enforced by dispatch (anton-dm7, execute-epic): a run whose ticket needs a disabled bundled
+   * agent is PARKED with a clear reason — never silently run with the default agent. Absent (never
+   * persisted / cleared) → all bundled agents active; empty `[]` → no bundled agent active (the
+   * operator toggled every one off), so a ticket needing a bundled agent is parked. The UI seeds
+   * "all bundled on" when this is absent, so a no-op save stays all-active.
+   *
+   * The project's OWN `.claude/agents` (project + global sources) are NOT part of this allowlist:
+   * they always run, never parked (the anton-dvo.1 reversal — the operator brought them and labels
+   * tickets with them deliberately). A stored value may still contain a stale user-agent id from
+   * before the reversal; dispatch ignores it (user agents aren't gated) and the UI prunes it on the
+   * next save.
    */
   agents?: string[];
   /**

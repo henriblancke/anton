@@ -78,6 +78,31 @@ export async function discoverAgents(
 }
 
 /**
+ * The ids of anton's BUNDLED specialist agents (`src/prompts/agents/*.md`), ignoring any user
+ * override of the same name. The active-agents allowlist governs exactly this namespace: an
+ * `agent:<id>` label whose id names a bundled agent is gated by the allowlist (whatever prompt file
+ * actually resolves — a user's `.claude/agents/<id>.md` override still runs under anton's slot),
+ * while an id OUTSIDE this set is the project's own agent and is never gated (execute-epic). Read
+ * directly from the bundled dir rather than derived from discoverAgents, whose project/global >
+ * bundled dedup hides a bundled id the moment the operator overrides it — on a machine that mirrors
+ * every bundled name into `~/.claude/agents`, source alone can't tell "anton's slot" from "mine".
+ * Missing bundled dir → empty. Sorted.
+ */
+export async function bundledAgentIds(bundledRoot?: string): Promise<string[]> {
+  const dir = join(bundledRoot ?? process.cwd(), AGENT_PROMPTS_DIR);
+  try {
+    return (await readdir(dir))
+      .filter((e) => e.endsWith(".md"))
+      .map((e) => e.slice(0, -3))
+      .sort();
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT" || code === "ENOTDIR") return [];
+    throw err;
+  }
+}
+
+/**
  * Extract the `name` / `description` scalars from a markdown file's leading YAML frontmatter. A
  * deliberately tiny parser — it only needs the two display fields anton's agent prompts carry, and
  * handles the plain (`key: value`), quoted, and folded/block (`>-`, `|`) forms those files use. Not

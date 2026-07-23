@@ -1,7 +1,7 @@
 import { notFound } from "next/navigation";
 
 import { getProjectBySlug, getProjectSettingsBySlug } from "@/lib/projects";
-import { discoverAgents } from "@/lib/agents-discovery";
+import { bundledAgentIds, discoverAgents } from "@/lib/agents-discovery";
 import { listSchedules } from "@/lib/schedules";
 import { loadBaseSystemPrompt } from "@/lib/claude/system-prompt";
 import { SettingsView } from "@/components/settings/settings-view";
@@ -25,9 +25,15 @@ export default async function ProjectSettingsPage({
     type: s.type,
     enabled: s.enabled,
   }));
-  // Every agent this project can assign — bundled + the operator's own .claude/agents (anton-dvo.1),
-  // so Settings → Agents toggles the real set, not just the hardcoded bundled ids.
-  const agents = await discoverAgents(project.repoPath).catch(() => []);
+  // Every agent this project can assign, plus which ids belong to anton's bundled namespace. The
+  // Agents tab splits them: bundled ids are toggleable in the allowlist; the project's own
+  // .claude/agents (ids anton doesn't ship) are shown as always-active, never gated (anton-dvo.1
+  // reversal). We partition by bundled-id membership, not by DiscoveredAgent.source — a user
+  // override of a bundled name reports source "global"/"project" but still lives in anton's slot.
+  const [agents, bundledIds] = await Promise.all([
+    discoverAgents(project.repoPath).catch(() => []),
+    bundledAgentIds().catch(() => []),
+  ]);
 
   return (
     <SettingsView
@@ -36,6 +42,7 @@ export default async function ProjectSettingsPage({
       basePrompt={basePrompt}
       schedules={schedules}
       agents={agents}
+      bundledIds={bundledIds}
     />
   );
 }

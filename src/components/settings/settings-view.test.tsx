@@ -30,6 +30,7 @@ function renderView(settings: Parameters<typeof SettingsView>[0]["settings"] = {
       basePrompt="base"
       schedules={[]}
       agents={[]}
+      bundledIds={[]}
     />,
   );
 }
