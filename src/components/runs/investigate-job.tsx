@@ -80,9 +80,10 @@ export function InvestigateJobButton({
 }
 
 /**
- * The live investigate terminal, expanded under the job row. Closing kills the pty explicitly —
- * unmounting PtyTerminal only aborts the SSE stream, so the claude process behind it would
- * otherwise outlive the panel (same teardown as shape-view).
+ * The live investigate terminal, expanded under the job row. Purely presentational: Close only
+ * clears the owner's session state. The owning row kills the pty whenever the session is dropped
+ * (Close, the job settling, or the row unmounting) — unmounting PtyTerminal alone only aborts the
+ * SSE stream, so the claude process behind it would otherwise outlive the panel.
  */
 export function InvestigateTerminal({
   slug,
@@ -94,18 +95,9 @@ export function InvestigateTerminal({
   sessionId: string;
   /** The job's reported working directory, shown so the operator knows where they landed. */
   cwd: string;
+  /** Must drop the session in the owner, whose teardown kills the pty (DELETE `…/pty`). */
   onClose: () => void;
 }) {
-  function close() {
-    void fetch(`/api/projects/${slug}/sessions/${sessionId}/pty`, {
-      method: "DELETE",
-      keepalive: true,
-    }).catch(() => {
-      /* best-effort teardown — the pty exits on its own if this never lands */
-    });
-    onClose();
-  }
-
   return (
     <div className="flex flex-col border-t border-border">
       <div className="flex items-center gap-2 bg-card/40 px-6 py-1.5">
@@ -113,7 +105,7 @@ export function InvestigateTerminal({
         <span className="truncate font-mono text-[11px] text-muted-foreground" title={cwd}>
           {cwd}
         </span>
-        <Button size="xs" variant="ghost" className="ml-auto shrink-0" onClick={close}>
+        <Button size="xs" variant="ghost" className="ml-auto shrink-0" onClick={onClose}>
           <XIcon aria-hidden="true" />
           Close
         </Button>

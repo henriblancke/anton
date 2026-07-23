@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ChevronRightIcon, ScrollTextIcon } from "lucide-react";
 
 // Type-only import: pulling the runtime `isActiveJob`/`listJobs` from jobs-view would drag its
@@ -95,6 +95,30 @@ function JobRow({
   const [investigateSession, setInvestigateSession] = useState<string | null>(null);
   // Live output viewer under this row (anton-x10l) — read-only tail of the job's session log.
   const [outputOpen, setOutputOpen] = useState(false);
+  const liveCwd = live?.cwd;
+
+  // Job settled while the terminal was open (an RSC refresh dropped the live handle, e.g. after a
+  // confirmed kill) → drop the session during render (React's "adjusting state when props change"
+  // pattern) so the teardown effect below fires and a later resume can't resurrect a dead session.
+  if (investigateSession && !liveCwd) setInvestigateSession(null);
+
+  // The row owns the investigate pty's lifetime: dropping the session — Close, the job settling
+  // out from under the terminal, or this row unmounting — must kill the pty, because unmounting
+  // PtyTerminal only aborts the SSE stream and the claude process would outlive the panel until
+  // the server-side timeout. Keyed on the session (not a cleanup inside InvestigateTerminal) so
+  // dev StrictMode's double-mount of the panel can't kill a live session: at row mount the
+  // session is null and the double-invoked effect is a no-op.
+  useEffect(() => {
+    if (!investigateSession) return;
+    return () => {
+      void fetch(`/api/projects/${slug}/sessions/${investigateSession}/pty`, {
+        method: "DELETE",
+        keepalive: true,
+      }).catch(() => {
+        /* best-effort teardown — the pty exits on its own if this never lands */
+      });
+    };
+  }, [slug, investigateSession]);
   const status: JobStatus = killed ? "cancelled" : job.status;
   const style = STATUS_STYLE[status];
   const active = ACTIVE_JOB_STATUSES.has(status);
@@ -176,11 +200,11 @@ function JobRow({
         />
       )}
 
-      {investigateSession && live?.cwd && (
+      {investigateSession && liveCwd && (
         <InvestigateTerminal
           slug={slug}
           sessionId={investigateSession}
-          cwd={live.cwd}
+          cwd={liveCwd}
           onClose={() => setInvestigateSession(null)}
         />
       )}

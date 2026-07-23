@@ -12,6 +12,10 @@ import { InvestigateJobButton } from "@/components/runs/investigate-job";
 import type { JobStatus, JobSummary } from "@/lib/jobs-view";
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn() }) }));
+// xterm touches window APIs jsdom lacks; the pty lifecycle under test lives in JobRow, not here.
+vi.mock("@/components/pty/pty-terminal", () => ({
+  PtyTerminal: () => <div data-testid="pty-terminal" />,
+}));
 
 function job(status: JobStatus): JobSummary {
   return {
@@ -100,5 +104,64 @@ describe("InvestigateJobButton", () => {
     await waitFor(() => expect(screen.getByRole("alert")).toBeDefined());
     expect(screen.getByRole("alert").textContent).toContain("not running");
     expect(onSession).not.toHaveBeenCalled();
+  });
+});
+
+describe("investigate pty lifecycle", () => {
+  /** 201 with a sessionId for the spawn POST; bare 200 for the teardown DELETE. */
+  function lifecycleFetch() {
+    return vi.fn().mockImplementation((_url: string, init?: RequestInit) =>
+      Promise.resolve(
+        init?.method === "POST"
+          ? new Response(JSON.stringify({ sessionId: "s-live" }), { status: 201 })
+          : new Response(null, { status: 200 }),
+      ),
+    );
+  }
+
+  async function openTerminal(fetchMock: ReturnType<typeof lifecycleFetch>) {
+    vi.stubGlobal("fetch", fetchMock);
+    const view = render(
+      <JobList
+        jobs={[job("running")]}
+        slug="anton"
+        liveJobs={{ "job-running": { cwd: "/worktrees/wt1" } }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /investigate/i }));
+    await waitFor(() => expect(screen.getByTestId("pty-terminal")).toBeDefined());
+    return view;
+  }
+
+  it("kills the pty when the job settles while the terminal is open", async () => {
+    const fetchMock = lifecycleFetch();
+    const { rerender } = await openTerminal(fetchMock);
+
+    // RSC refresh after the job settled (e.g. a confirmed kill): the live handle is gone. The
+    // render guard unmounts the panel — the pty must still be torn down, not leaked (PR #75).
+    rerender(<JobList jobs={[job("running")]} slug="anton" />);
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/projects/anton/sessions/s-live/pty",
+        expect.objectContaining({ method: "DELETE", keepalive: true }),
+      ),
+    );
+    expect(screen.queryByTestId("pty-terminal")).toBeNull();
+  });
+
+  it("kills the pty when the operator closes the terminal", async () => {
+    const fetchMock = lifecycleFetch();
+    await openTerminal(fetchMock);
+
+    fireEvent.click(screen.getByRole("button", { name: /close/i }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/projects/anton/sessions/s-live/pty",
+        expect.objectContaining({ method: "DELETE", keepalive: true }),
+      ),
+    );
+    expect(screen.queryByTestId("pty-terminal")).toBeNull();
   });
 });
