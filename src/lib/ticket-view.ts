@@ -11,11 +11,12 @@ import { beads, type Bead } from "./beads/bd";
 import type { Epic, IssueType, Stage, StandaloneItem, Ticket } from "./types";
 
 /** Derived stage for a bead: closed → done; an `in-review` label or PR ref → in-review; an
- * in-progress status or `implementing` label → implementing; otherwise backlog. */
+ * in-progress status or `implementing` label → implementing; otherwise backlog. The PR pointer is
+ * read through the seam (metadata.pr), so a tracker URL in external_ref never reads as in-review. */
 export function deriveStage(bead: Bead): Stage {
   if (bead.status === "closed") return "done";
   const labels = bead.labels ?? [];
-  if (labels.includes("stage:in-review") || bead.external_ref) return "in-review";
+  if (labels.includes("stage:in-review") || beads.getPrRef(bead)) return "in-review";
   if (bead.status === "in_progress" || labels.includes("stage:implementing")) {
     return "implementing";
   }
@@ -74,7 +75,7 @@ export function toTicket(bead: Bead): Ticket {
     size: labelValue(bead.labels, "size"),
     acceptance: parseAcceptance(bead),
     ...createdMeta(bead),
-    prRef: bead.external_ref,
+    prRef: beads.getPrRef(bead),
     deferred: beads.isDeferred(bead),
     abandoned: beads.isAbandoned(bead),
   };
@@ -108,7 +109,7 @@ export function toStandaloneItem(bead: Bead, blockedBy: string[] = []): Standalo
     risk: labelValue(bead.labels, "risk"),
     size: labelValue(bead.labels, "size"),
     ...createdMeta(bead),
-    prRef: bead.external_ref,
+    prRef: beads.getPrRef(bead),
     blockedBy,
     ready: blockedBy.length === 0,
     unread: isUnreadBug(bead),
@@ -131,7 +132,7 @@ export interface ToEpicOptions {
    */
   chips?: boolean;
   /**
-   * Carry the PR ref off `external_ref`. board.ts's single-ticket pseudo-epic omits it (the
+   * Carry the PR ref off the seam (metadata.pr). board.ts's single-ticket pseudo-epic omits it (the
    * wrapped ticket already carries its own PR link). Defaults to true.
    */
   prRef?: boolean;
@@ -167,7 +168,7 @@ export function toEpic(bead: Bead, opts: ToEpicOptions): Epic {
         }
       : {}),
     ...createdMeta(bead),
-    ...(withPrRef ? { prRef: bead.external_ref } : {}),
+    ...(withPrRef ? { prRef: beads.getPrRef(bead) } : {}),
     blockedBy: opts.blockedBy ?? [],
     ready: opts.ready ?? true,
     rank: opts.rank ?? 0,

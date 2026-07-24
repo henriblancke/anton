@@ -56,10 +56,29 @@ describe("deriveStage", () => {
     ).toBe("in-review");
   });
 
-  it("returns in-review when external_ref is set", () => {
+  it("returns in-review when metadata.pr is set (the PR seam)", () => {
     expect(
-      deriveStage(makeBead({ id: "b-3", title: "t", status: "open", external_ref: "gh-1" })),
+      deriveStage(makeBead({ id: "b-3", title: "t", status: "open", metadata: { pr: "gh-1" } })),
     ).toBe("in-review");
+  });
+
+  it("returns in-review for a legacy gh-* external_ref (pre-migration fallback)", () => {
+    expect(
+      deriveStage(makeBead({ id: "b-3b", title: "t", status: "open", external_ref: "gh-1" })),
+    ).toBe("in-review");
+  });
+
+  it("does NOT read a non-gh external_ref (a tracker URL) as in-review", () => {
+    expect(
+      deriveStage(
+        makeBead({
+          id: "b-3c",
+          title: "t",
+          status: "open",
+          external_ref: "https://tracker.example/ISSUE-7",
+        }),
+      ),
+    ).toBe("backlog");
   });
 
   it("returns implementing when status is in_progress", () => {
@@ -118,7 +137,7 @@ describe("getBoard", () => {
       title: "Ticket Two",
       status: "closed",
       parent: "epic-2",
-      external_ref: "gh-42",
+      metadata: { pr: "gh-42" },
     });
     const orphan = makeBead({
       id: "orphan-1",

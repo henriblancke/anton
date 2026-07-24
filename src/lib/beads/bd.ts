@@ -524,6 +524,27 @@ export const beads = {
     bdWrite(cwd, ["update", id, "--external-ref", ref]),
 
   /**
+   * Write the PR pointer to `metadata.pr` — the single seam anton uses for the PR link (anton-is7x).
+   * Keeping it out of `external_ref` frees that field for tracker integrations; every read goes
+   * through getPrRef, every write through here, so no call site touches `external_ref` for PRs.
+   */
+  setPrRef: (cwd: string, id: string, ref: string) =>
+    bdWrite(cwd, ["update", id, "--set-metadata", `pr=${ref}`]),
+
+  /**
+   * Read a bead's PR pointer through the seam (anton-is7x). `metadata.pr` is authoritative; until the
+   * one-time migration (anton-ftar) moves legacy pointers over, a `gh-*` `external_ref` is honored as
+   * a fallback. A NON-`gh-` `external_ref` (e.g. a tracker URL) is deliberately ignored — external_ref
+   * is no longer the PR channel, so a tracker link there must never read as a PR / in-review.
+   */
+  getPrRef: (b: Bead): string | undefined => {
+    const pr = b.metadata?.pr;
+    if (typeof pr === "string" && pr) return pr;
+    const ref = b.external_ref;
+    return ref && /^gh-\d+$/i.test(ref) ? ref : undefined;
+  },
+
+  /**
    * Append to a bead's notes blob (`bd note`). `actor` attributes the write in bd's audit trail —
    * pass it for a human note so the entry isn't stamped with whatever unix user the server runs
    * as; anton's own job notes leave it unset. The visible authorship a reader sees comes from the

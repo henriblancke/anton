@@ -15,6 +15,12 @@ export interface Bead {
   context?: string;
   labels?: string[];
   external_ref?: string;
+  /**
+   * bd custom metadata (`bd update --set-metadata k=v`, read back as an object). anton's PR pointer
+   * lives at `metadata.pr` so `external_ref` is freed for tracker integrations — always read/write it
+   * through beads.getPrRef/setPrRef, never `metadata.pr` directly.
+   */
+  metadata?: { pr?: string; [k: string]: unknown };
   priority?: number;
   assignee?: string | null; // who claimed the bead; null/absent when unclaimed
   created_at?: string; // ISO timestamp
