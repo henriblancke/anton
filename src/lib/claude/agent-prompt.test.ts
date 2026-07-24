@@ -8,7 +8,13 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { USER_AGENTS_DIR, loadAgentPrompt, stripFrontmatter } from "./agent-prompt";
+import {
+  PLUGINS_DIR,
+  USER_AGENTS_DIR,
+  loadAgentPrompt,
+  pluginAgentDirs,
+  stripFrontmatter,
+} from "./agent-prompt";
 
 describe("stripFrontmatter", () => {
   it("removes a --- delimited frontmatter block and leaves the body", () => {
@@ -91,5 +97,55 @@ describe("loadAgentPrompt precedence", () => {
   it("none-found: returns undefined when no source has the tag", async () => {
     const prompt = await loadAgentPrompt("nextjs", { projectDir, homeDir, bundledRoot });
     expect(prompt).toBeUndefined();
+  });
+
+  /** Write a plugin registry under `homeDir` mapping each key to an installPath, and drop a
+   *  `<tag>.md` into each plugin's `agents/` dir. Mirrors ~/.claude/plugins/installed_plugins.json. */
+  async function writePlugins(specs: { key: string; tag: string; body: string }[]) {
+    const registry: { plugins: Record<string, { installPath: string }[]> } = { plugins: {} };
+    for (const { key, tag, body } of specs) {
+      const installPath = join(homeDir, "plugins-cache", key);
+      await writeAgent(installPath, "agents", tag, body);
+      (registry.plugins[key] ||= []).push({ installPath });
+    }
+    const dir = join(homeDir, PLUGINS_DIR);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "installed_plugins.json"), JSON.stringify(registry), "utf8");
+  }
+
+  it("plugin fallback: an installed plugin's agent resolves when no .claude/agents or bundled has it", async () => {
+    await writePlugins([{ key: "develop@market", tag: "prompt-engineer", body: "---\nname: pe\n---\nplugin body" }]);
+    const prompt = await loadAgentPrompt("prompt-engineer", { projectDir, homeDir, bundledRoot });
+    expect(prompt).toBe("plugin body");
+  });
+
+  it("bundled wins over plugin: anton's shipped prompt keeps its name", async () => {
+    await writeAgent(bundledRoot, "src/prompts/agents", "nextjs", "bundled body");
+    await writePlugins([{ key: "develop@market", tag: "nextjs", body: "plugin body" }]);
+    const prompt = await loadAgentPrompt("nextjs", { projectDir, homeDir, bundledRoot });
+    expect(prompt).toBe("bundled body");
+  });
+
+  it("plugin collision resolves deterministically by sorted plugin key (first wins)", async () => {
+    await writePlugins([
+      { key: "zeta@market", tag: "prompt-engineer", body: "zeta body" },
+      { key: "develop@market", tag: "prompt-engineer", body: "develop body" },
+    ]);
+    const prompt = await loadAgentPrompt("prompt-engineer", { projectDir, homeDir, bundledRoot });
+    expect(prompt).toBe("develop body"); // "develop@market" < "zeta@market"
+  });
+});
+
+describe("pluginAgentDirs", () => {
+  it("returns [] when the registry is absent or malformed", async () => {
+    const home = await mkdtemp(join(tmpdir(), "anton-noplugins-"));
+    try {
+      expect(await pluginAgentDirs(home)).toEqual([]);
+      await mkdir(join(home, PLUGINS_DIR), { recursive: true });
+      await writeFile(join(home, PLUGINS_DIR, "installed_plugins.json"), "{ not json", "utf8");
+      expect(await pluginAgentDirs(home)).toEqual([]);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
   });
 });

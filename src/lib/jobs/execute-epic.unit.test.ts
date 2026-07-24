@@ -38,28 +38,43 @@ describe("inactiveAgentTickets", () => {
     expect(inactiveAgentTickets([ticket("t-1", ["agent:kubernetes"])], undefined)).toEqual([]);
   });
 
-  it("treats an EMPTY allowlist as no agents active — parks every labeled ticket", () => {
-    // The operator toggled every agent off; the API persists [] as a real "no agents" value
-    // distinct from clearing (undefined), so dispatch must honor it rather than run anyway.
-    // Both bundled and custom agents are parked; only unlabeled (default agent) tickets pass.
+  it("treats an EMPTY allowlist as no BUNDLED agent active — parks bundled, not user agents", () => {
+    // The operator toggled every bundled agent off; the API persists [] as a real "no agents"
+    // value distinct from clearing (undefined), so dispatch must honor it for bundled agents. A
+    // user agent (`my-custom` in userAgentIds) still runs; only unlabeled tickets otherwise pass.
     expect(
       inactiveAgentTickets(
         [ticket("t-1", ["agent:kubernetes"]), ticket("t-2", ["agent:my-custom"]), ticket("t-3")],
         [],
+        ["my-custom"],
       ),
-    ).toEqual([
-      { id: "t-1", agent: "kubernetes" },
-      { id: "t-2", agent: "my-custom" },
-    ]);
+    ).toEqual([{ id: "t-1", agent: "kubernetes" }]);
   });
 
-  it("gates user-provided custom agents like bundled ones (anton-dvo.1)", () => {
-    // Custom `.claude/agents` are discoverable and toggleable now, so a disabled custom agent
-    // parks; an enabled one passes.
-    expect(inactiveAgentTickets([ticket("t-1", ["agent:my-custom"])], ["fastapi"])).toEqual([
-      { id: "t-1", agent: "my-custom" },
+  it("never gates the project's own user agents, whatever the allowlist (anton-dvo.1 reversal)", () => {
+    // `my-custom` is a `.claude/agents` agent (in userAgentIds) — it always runs, even when the
+    // allowlist omits it and only lists a bundled agent.
+    expect(
+      inactiveAgentTickets([ticket("t-1", ["agent:my-custom"])], ["fastapi"], ["my-custom"]),
+    ).toEqual([]);
+    expect(
+      inactiveAgentTickets([ticket("t-1", ["agent:my-custom"])], [], ["my-custom"]),
+    ).toEqual([]);
+  });
+
+  it("still parks a disabled bundled agent or an unknown tag not among the user agents", () => {
+    // The safety net stands: an `agent:` tag that is neither active nor a known user agent — a
+    // disabled bundled specialist, or a typo resolving nowhere — is parked.
+    expect(
+      inactiveAgentTickets(
+        [ticket("t-1", ["agent:terraform"]), ticket("t-2", ["agent:typoo"])],
+        ["fastapi"],
+        ["my-custom"],
+      ),
+    ).toEqual([
+      { id: "t-1", agent: "terraform" },
+      { id: "t-2", agent: "typoo" },
     ]);
-    expect(inactiveAgentTickets([ticket("t-1", ["agent:my-custom"])], ["my-custom"])).toEqual([]);
   });
 
   it("reports every offending ticket, not just the first", () => {

@@ -5,7 +5,7 @@
  * See DESIGN.md §3.
  */
 import { sql } from "drizzle-orm";
-import { sqliteTable, text, integer, uniqueIndex } from "drizzle-orm/sqlite-core";
+import { sqliteTable, text, integer, real, index, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 const ts = (name: string) => integer(name, { mode: "timestamp" });
 const now = sql`(unixepoch())`;
@@ -83,6 +83,30 @@ export const schedules = sqliteTable("schedules", {
   lastRunAt: ts("last_run_at"),
   nextRunAt: ts("next_run_at"),
 });
+
+/**
+ * Per-job Claude burn samples (anton-w8ny). One row per completed job attempt: the session%/weekly%
+ * that moved across the job, attributed to its TYPE. Attribution is clean only for solo windows:
+ * the runner opens a burn window only when this job runs alone (nothing else in flight), and
+ * discards the window if a sibling is dispatched before it closes — so every recorded delta is
+ * unambiguously one job's cost. A rolling per-type
+ * average over the most recent samples feeds pacing/prioritization; a static tier seed answers until
+ * enough real samples accrue. Machine-local by design (no cross-machine aggregation).
+ */
+export const burnSamples = sqliteTable(
+  "burn_samples",
+  {
+    id: text("id").primaryKey(),
+    // execute-epic | review-fix | nightly-stringer | orphan-grooming
+    jobType: text("job_type").notNull(),
+    // session/weekly utilization delta (0–100 percentage points) burned across the job.
+    sessionDelta: real("session_delta").notNull(),
+    weeklyDelta: real("weekly_delta").notNull(),
+    createdAt: ts("created_at").notNull().default(now),
+  },
+  // Serve the "most recent N samples for this type" query without a full scan.
+  (table) => [index("burn_samples_type_created_idx").on(table.jobType, table.createdAt)],
+);
 
 /** Claude sessions — for history, diagnostics, and xterm attach. */
 export const sessions = sqliteTable("sessions", {

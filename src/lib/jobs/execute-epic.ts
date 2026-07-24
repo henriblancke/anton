@@ -23,6 +23,7 @@ import {
   worktreeHasCommitFor,
 } from "../git/ops";
 import { createWorktree, findWorktree, removeWorktree } from "../git/worktree";
+import { bundledAgentIds, discoverAgents } from "../agents-discovery";
 import {
   getProjectById,
   getProjectSettings,
@@ -101,6 +102,21 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
 
     const repo = project.repoPath;
     const settings = await getProjectSettings(db, projectId);
+
+    // The project's OWN agents — a discoverable `agent:<id>` whose id anton does NOT ship as a
+    // bundled specialist — are NEVER gated by the active-agents allowlist (anton-dvo.1 reversed):
+    // the operator brought them and labels tickets with them deliberately, so a second opt-in in
+    // Settings is pure friction. The allowlist governs anton's bundled NAMESPACE only; a bundled id
+    // stays gated even when the operator has a `.claude/agents/<id>.md` override of it (else a
+    // machine that mirrors every bundled name into ~/.claude/agents would slip the whole allowlist).
+    // An id that resolves nowhere (a typo) is not in `discovered`, so it isn't exempted — it parks.
+    // Fails safe to "no user agents" on a discovery error rather than crashing the run here.
+    const userAgentIds = await Promise.all([discoverAgents(repo), bundledAgentIds()])
+      .then(([discovered, bundled]) => {
+        const bundledSet = new Set(bundled);
+        return discovered.filter((a) => !bundledSet.has(a.id)).map((a) => a.id);
+      })
+      .catch(() => [] as string[]);
 
     // Load the run target + (for an epic) its tickets from beads (the source of truth). A target
     // is an epic OR a parentless task/bug run as an epic-of-one (isRunTarget). Distinguish the two
@@ -414,19 +430,21 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       const isResumeSkipped = (t: Bead) =>
         t.status === "closed" || (standaloneRun && (t.labels?.includes(inReview) ?? false));
 
-      // 0b. Dispatch honors the active-agents allowlist (anton-dm7). PARK, don't skip: running
-      // the ticket with the default agent would silently produce work the operator disabled the
-      // specialist for, and skipping it would open the epic's single PR incomplete. Parking is
+      // 0b. Dispatch honors the active-agents allowlist for anton's BUNDLED specialists (anton-dm7);
+      // the project's own `.claude/agents` (userAgentIds) are always allowed. PARK, don't skip:
+      // running the ticket with the default agent would silently produce work the operator disabled
+      // the specialist for, and skipping it would open the epic's single PR incomplete. Parking is
       // recoverable — the operator enables the agent (Settings → Agents) or relabels the ticket,
       // then resumes; tickets and settings are re-read on every attempt. Checked before any
       // claim/worktree/session work so a run never half-executes into a config problem.
       const inactive = inactiveAgentTickets(
         tickets.filter((t) => !isResumeSkipped(t)),
         settings.agents,
+        userAgentIds,
       );
       if (inactive.length > 0) {
         throw new PoisonEpic(
-          `epic ${epicBeadId} needs agents disabled in this project's settings: ` +
+          `epic ${epicBeadId} needs agents enabled in this project's settings: ` +
             inactive.map((x) => `${x.id} → agent:${x.agent}`).join(", ") +
             ` — enable them in Settings → Agents (or relabel the tickets), then resume the run`,
         );
@@ -749,10 +767,10 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         // poison-park, exactly as step 0b does, rather than silently regenerate under the default
         // agent. Checked before the reopen/runTicket so the re-run never starts.
         if (doneOnBoard) {
-          const disabled = inactiveAgentTickets([ticket], settings.agents);
+          const disabled = inactiveAgentTickets([ticket], settings.agents, userAgentIds);
           if (disabled.length > 0) {
             throw new PoisonEpic(
-              `epic ${epicBeadId} needs agents disabled in this project's settings: ` +
+              `epic ${epicBeadId} needs agents enabled in this project's settings: ` +
                 disabled.map((x) => `${x.id} → agent:${x.agent}`).join(", ") +
                 ` — enable them in Settings → Agents (or relabel the tickets), then resume the run`,
             );
@@ -1254,28 +1272,38 @@ function labelValue(labels: string[] | undefined, prefix: string): string | unde
 
 /**
  * Tickets whose `agent:` label names a specialist agent the project has disabled (anton-dm7).
- * `activeAgents` is settings.agents. Semantics:
- *   • absent (never persisted / cleared) → all agents active (a project that never touched
+ * `activeAgents` is settings.agents; `userAgentIds` are the project's own agents — discoverable
+ * `agent:<id>` ids that anton does NOT ship as bundled specialists (see the caller). Semantics:
+ *   • absent allowlist (never persisted / cleared) → all agents active (a project that never touched
  *     settings must not stall; the API persists a cleared value as `undefined`, never `[]`)
- *   • EMPTY allowlist `[]` → no agents active: every ticket with an `agent:` label is parked.
- *     The operator explicitly toggled every agent off, and the API persists `[]` as a real
+ *   • EMPTY allowlist `[]` → no BUNDLED agent active: a ticket needing a bundled specialist is parked.
+ *     The operator explicitly toggled every bundled agent off, and the API persists `[]` as a real
  *     value distinct from clearing (settings/route.ts) — honoring it is the whole point.
  *   • no `agent:` label → runs with the default agent, never blocked
- *   • the allowlist gates ALL agents — bundled AND the operator's own `.claude/agents` (anton-dvo.1).
- *     Custom agents are discoverable and toggleable in Settings now, so a ticket needing a disabled
- *     custom agent is parked just like a bundled one, rather than silently running.
+ *   • a USER agent (id in `userAgentIds`) is NEVER gated — the operator brought it and labeled the
+ *     ticket with it deliberately, so it runs regardless of the allowlist. This is the reversal of
+ *     anton-dvo.1: the allowlist gates anton's bundled specialists only, not the project's own
+ *     `.claude/agents`. An `agent:` label that is neither active nor a known user agent (a disabled
+ *     bundled agent, or a typo that resolves nowhere) is still parked — the safety net stands.
+ * `userAgentIds` defaults to none, so a caller that doesn't pass it gets the pre-reversal behavior
+ * (every non-allowlisted labeled ticket parked) — used by callers/tests that only reason about the
+ * allowlist itself.
  */
 export function inactiveAgentTickets(
   tickets: Bead[],
   activeAgents: string[] | undefined,
+  userAgentIds?: Iterable<string>,
 ): { id: string; agent: string }[] {
   if (activeAgents == null) return [];
   const active = new Set(activeAgents);
+  const userAgents = userAgentIds ? new Set(userAgentIds) : null;
   const out: { id: string; agent: string }[] = [];
   for (const t of tickets) {
     const agent = labelValue(t.labels, "agent");
     if (!agent) continue;
-    if (!active.has(agent)) out.push({ id: t.id, agent });
+    if (active.has(agent)) continue;
+    if (userAgents?.has(agent)) continue; // the project's own agent — never gated by the allowlist
+    out.push({ id: t.id, agent });
   }
   return out;
 }

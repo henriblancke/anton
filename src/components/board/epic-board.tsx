@@ -41,7 +41,16 @@ const sortSelectClassName =
  * within one beat + one poll (anton-live-sync R8). */
 const BOARD_POLL_MS = 30_000;
 
-export function EpicBoard({ slug, initialBoard }: { slug: string; initialBoard: Board | null }) {
+export function EpicBoard({
+  slug,
+  initialBoard,
+  budgetAware = false,
+}: {
+  slug: string;
+  initialBoard: Board | null;
+  /** Project budget-aware flag (anton-y2ue): when on, cards offer Approve (immediate) vs Queue (paced). */
+  budgetAware?: boolean;
+}) {
   const [board, setBoard] = useState<Board | null>(initialBoard);
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
@@ -256,6 +265,7 @@ export function EpicBoard({ slug, initialBoard }: { slug: string; initialBoard: 
             epics={sortedColumns?.[stage] ?? []}
             standalone={board.standalone?.[stage] ?? []}
             slug={slug}
+            budgetAware={budgetAware}
             onEpicDeleted={handleEpicDeleted}
             onOpenTicket={setOpenTicketId}
           />

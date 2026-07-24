@@ -13,6 +13,7 @@ export function BoardColumn({
   epics,
   standalone,
   slug,
+  budgetAware = false,
   onEpicDeleted,
   onOpenTicket,
 }: {
@@ -20,6 +21,8 @@ export function BoardColumn({
   epics: Epic[];
   standalone: StandaloneItem[];
   slug: string;
+  /** Project budget-aware flag (anton-y2ue): forwarded to cards to gate the Approve/Queue split. */
+  budgetAware?: boolean;
   onEpicDeleted?: (epicId: string) => void;
   /** Open a standalone ticket's detail dialog (hoisted to the board so one dialog serves all). */
   onOpenTicket?: (ticketId: string) => void;
@@ -61,9 +64,20 @@ export function BoardColumn({
         ) : (
           <>
             {epics.map((epic) => (
-              <DraggableEpicCard key={epic.id} slug={slug} epic={epic} onDeleted={onEpicDeleted} />
+              <DraggableEpicCard
+                key={epic.id}
+                slug={slug}
+                epic={epic}
+                budgetAware={budgetAware}
+                onDeleted={onEpicDeleted}
+              />
             ))}
-            <StandaloneGroup slug={slug} items={standalone} onOpenTicket={onOpenTicket} />
+            <StandaloneGroup
+              slug={slug}
+              items={standalone}
+              budgetAware={budgetAware}
+              onOpenTicket={onOpenTicket}
+            />
           </>
         )}
       </div>

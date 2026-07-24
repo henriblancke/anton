@@ -37,7 +37,18 @@ export async function POST(
   // await a fresh read so the board reflects the move (falling back to last-good on a transient bd
   // failure rather than 500 the move), build it blocking on the pending write, and return it. The
   // client advances versionRef off `board.version` and its next poll 304s instead of reverting.
+  //
+  // Both post-write reads are fail-soft: the move already persisted, so a refresh/build failure
+  // (cold route with no retained snapshot, `bd list` timeout) must not 500 — the client would roll
+  // back a card whose move landed. Fall back to a boardless `{ ok: true }`; the client keeps its
+  // optimistic board (it guards on `data?.board`) and reconciles on a later refresh — the anton-4g35
+  // transient revert is the lesser evil vs. a hard rollback of a persisted move.
   await refreshAllIssues(project.repoPath).catch(() => {});
-  const board = await getBoard(project);
-  return NextResponse.json({ ok: true, board });
+  try {
+    const board = await getBoard(project);
+    return NextResponse.json({ ok: true, board });
+  } catch (err) {
+    console.error(`[move] board rebuild failed after moving ${cardId}`, err);
+    return NextResponse.json({ ok: true });
+  }
 }

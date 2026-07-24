@@ -35,6 +35,50 @@ const FETCH_TIMEOUT_MS = 5_000;
 /** Short server-side cache TTL: collapse many page loads into one upstream fetch. */
 export const USAGE_CACHE_TTL_MS = 60_000;
 
+/** Cool-off applied on a 429 that arrives without a usable `Retry-After` header. */
+export const DEFAULT_BACKOFF_MS = 60_000;
+
+/**
+ * Absolute floor on the 429 cool-off. This endpoint answers a rate limit with `Retry-After: 0`
+ * (and an empty header parses to 0 too), which would make the backoff a no-op and let the storm
+ * continue — every reader would re-hit and re-earn a 429 on the next tick. The floor guarantees one
+ * 429 buys real quiet.
+ */
+export const MIN_BACKOFF_MS = 10_000;
+
+/**
+ * Epoch-ms instant before which upstream must not be touched, armed when Anthropic returns 429 and
+ * honored by *every* reader — the pill, the nudge, the governor, and the TTL-bypassing burn sampler
+ * alike. The sampler ({@link getClaudeUsageFresh}) deliberately skips the cache, so without a shared
+ * throttle a burst of quick solo jobs re-hits a rate-limited endpoint on every completion and earns
+ * a fresh 429 each time. One 429 now quiets all paths until the window Anthropic asked for elapses;
+ * the last cached/last-good value backs the display meanwhile. Reset by {@link resetUsageCache}.
+ */
+let backoffUntil = 0;
+
+/**
+ * Parse a `Retry-After` header into milliseconds. The spec allows either delta-seconds or an
+ * HTTP-date; honor both, and fall back to `null` (caller applies {@link DEFAULT_BACKOFF_MS}) for a
+ * missing or unusable value.
+ */
+export function parseRetryAfterMs(header: string | null, now: () => number = Date.now): number | null {
+  if (!header) return null;
+  const secs = Number(header);
+  if (Number.isFinite(secs)) return Math.max(0, secs * 1000);
+  const at = Date.parse(header);
+  return Number.isNaN(at) ? null : Math.max(0, at - now());
+}
+
+/**
+ * How long to back off after a 429, given the raw `Retry-After` header. Honors a *positive* hint,
+ * ignores a non-positive or absent one (→ {@link DEFAULT_BACKOFF_MS}), and always clamps up to
+ * {@link MIN_BACKOFF_MS} so a `Retry-After: 0` can't leave the backoff a no-op.
+ */
+export function backoffMsFor(retryAfter: string | null, now: () => number = Date.now): number {
+  const hint = parseRetryAfterMs(retryAfter, now);
+  return Math.max(MIN_BACKOFF_MS, hint && hint > 0 ? hint : DEFAULT_BACKOFF_MS);
+}
+
 /** Normalized usage snapshot the pill consumes. `null` when a limit is absent for the tier. */
 export interface ClaudeUsage {
   /** Current 5-hour session utilization, 0–100 percent. */
@@ -176,10 +220,35 @@ export async function fetchClaudeUsage(): Promise<ClaudeUsage | null> {
       },
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
-    if (!res.ok) return null; // includes 401/expiry — fail soft, do not refresh
+    // Distinguish the failure modes so a persistent dark pill / 204 route is diagnosable. All still
+    // fail soft to null (never throw into a render); the log just names *why*. Volume is bounded —
+    // this runs at most once per cache TTL plus once per solo job (burn sampler), never per request.
+    if (res.status === 204) {
+      // 204 is 2xx, so res.ok is true — catch it here before res.json() throws on the empty body.
+      // Anthropic answering "no content" usually means the OAuth token lacks the usage scope or the
+      // account has nothing to report; more caching won't change it.
+      console.warn("[usage] upstream 204 (no content) — token scope/account, not a transient blip");
+      return null;
+    }
+    if (res.status === 429) {
+      // Being throttled — arm the shared backoff so every reader (including the sampler) stops
+      // hitting the endpoint. Honors a positive Retry-After but floors it (this endpoint sends
+      // Retry-After: 0, which would otherwise make the backoff a no-op).
+      const waitMs = backoffMsFor(res.headers.get("retry-after"));
+      backoffUntil = Date.now() + waitMs;
+      console.warn(`[usage] upstream 429 — backing off ${Math.round(waitMs / 1000)}s (all readers paused)`);
+      return null;
+    }
+    if (!res.ok) {
+      // 401 → expired token (the CLI owns rotation; we intentionally don't refresh).
+      console.warn(`[usage] upstream ${res.status} — hiding pill (fail soft, no token refresh)`);
+      return null;
+    }
     return parseUsage(await res.json(), oauth.subscriptionType ?? null);
-  } catch {
-    return null; // network error, timeout, or malformed JSON
+  } catch (e) {
+    // Network error, timeout (AbortSignal), or a malformed/empty body that slipped past the checks.
+    console.warn(`[usage] upstream fetch failed: ${e instanceof Error ? e.message : String(e)}`);
+    return null;
   }
 }
 
@@ -188,6 +257,19 @@ interface UsageCacheEntry {
   value: ClaudeUsage | null;
 }
 let usageCache: UsageCacheEntry | null = null;
+
+/**
+ * The most recent *successful* (non-null) read, retained separately from {@link usageCache} so a
+ * transient failure can't blank the nav display (anton-7mpv.1). The cache holds `null` on failure by
+ * design — the governor reads it and fails OPEN — but the pill/nudge must not go dark on a single
+ * blip. Background readers (the runner's burn sampler / governor) share this module's cache and refetch
+ * it far more often than the pill, so any one of their fail-soft nulls used to darken the pill for a
+ * whole TTL; {@link getDisplayUsage} falls back to this last-good value instead.
+ */
+let lastGoodUsage: { at: number; value: ClaudeUsage } | null = null;
+
+/** How long a last-good usage snapshot may back the display after the live read starts failing. */
+export const LAST_GOOD_TTL_MS = 5 * 60_000;
 /**
  * The single upstream fetch currently in flight, shared by every concurrent caller until it
  * settles. Without this, simultaneous page loads that all miss a cold/stale cache would each run
@@ -208,6 +290,8 @@ export async function getClaudeUsageCached(
   now: () => number = Date.now,
 ): Promise<ClaudeUsage | null> {
   const ts = now();
+  // Throttled by a recent 429 — serve whatever we last had rather than hit a rate-limited endpoint.
+  if (ts < backoffUntil) return usageCache?.value ?? null;
   if (usageCache && ts - usageCache.at < USAGE_CACHE_TTL_MS) return usageCache.value;
   // Join the fetch already running for this TTL window rather than starting a second one.
   if (usageInFlight) return usageInFlight;
@@ -215,6 +299,7 @@ export async function getClaudeUsageCached(
     try {
       const value = await fetcher();
       usageCache = { at: ts, value };
+      if (value) lastGoodUsage = { at: ts, value }; // remember the last successful read
       return value;
     } finally {
       usageInFlight = null;
@@ -223,8 +308,79 @@ export async function getClaudeUsageCached(
   return usageInFlight;
 }
 
-/** Clear the module-level cache. Test-only. */
+/**
+ * TTL-bypassing usage read for the burn sampler's post-job measurement (anton-w8ny). The cached
+ * read is wrong there: a job that finishes inside {@link USAGE_CACHE_TTL_MS} would subtract a
+ * cache entry from itself and record a zero delta, biasing the rolling burn averages toward zero.
+ * This always returns a snapshot from a fetch started *at or after* the call — it never joins a
+ * fetch that was already in flight (the pill or governor may have started one mid-job), because
+ * that read can predate the job's burn and would zero/undercount the recorded delta. The single
+ * upstream flight is still respected: a stale in-flight read is awaited to settlement rather than
+ * raced, and the post-job fetch is published for concurrent callers to join. Refreshes the cache +
+ * last-good snapshot, so the pill and the governor benefit from every sample the runner takes.
+ * `fetcher`/`now` are injectable for deterministic tests.
+ */
+export async function getClaudeUsageFresh(
+  fetcher: () => Promise<ClaudeUsage | null> = fetchClaudeUsage,
+  now: () => number = Date.now,
+): Promise<ClaudeUsage | null> {
+  // Honor the shared 429 backoff even here: the sampler bypasses the TTL, so if it kept firing while
+  // throttled it would re-earn a 429 on every solo job. Return null — NOT the cached value: the
+  // cache may hold the sampler's own pre-job reading, and a non-null pair records a bogus 0% burn
+  // sample (`sampleJobBurn` treats any before/after pair as real). A null read skips the sample.
+  if (now() < backoffUntil) return null;
+  const stale = usageInFlight;
+  if (stale) {
+    // Wait it out (never double the upstream request), then take our own post-job read. Any fetch
+    // found in flight after the settle necessarily started after this call, so joining it is safe.
+    await stale.catch(() => {});
+    // The stale flight itself may have just earned a 429 and armed the backoff — re-check before
+    // launching a fresh read, or we'd re-hammer an endpoint that just told us to stop.
+    if (now() < backoffUntil) return null;
+    if (usageInFlight) return usageInFlight;
+  }
+  usageInFlight = (async () => {
+    try {
+      const value = await fetcher();
+      const ts = now();
+      usageCache = { at: ts, value };
+      if (value) lastGoodUsage = { at: ts, value };
+      return value;
+    } finally {
+      usageInFlight = null;
+    }
+  })();
+  return usageInFlight;
+}
+
+/**
+ * Usage for the nav *display* (the pill + shaping nudge). Prefers the fresh cached read; on a
+ * transient failure (a `null` result) it falls back to the last-known-good snapshot while that's
+ * still recent ({@link LAST_GOOD_TTL_MS}), so a background reader's blip never darkens the pill.
+ *
+ * This is intentionally separate from {@link getClaudeUsageCached}: the governor keeps reading the
+ * strict cached value (null → fail OPEN / admit), while only the display tolerates a little staleness.
+ * `fetcher`/`now` are injectable for deterministic tests.
+ */
+export async function getDisplayUsage(
+  fetcher: () => Promise<ClaudeUsage | null> = fetchClaudeUsage,
+  now: () => number = Date.now,
+): Promise<ClaudeUsage | null> {
+  const fresh = await getClaudeUsageCached(fetcher, now);
+  if (fresh) return fresh;
+  if (lastGoodUsage && now() - lastGoodUsage.at < LAST_GOOD_TTL_MS) return lastGoodUsage.value;
+  return null;
+}
+
+/** Clear the module-level cache (and last-good snapshot). Test-only. */
 export function resetUsageCache(): void {
   usageCache = null;
   usageInFlight = null;
+  lastGoodUsage = null;
+  backoffUntil = 0;
+}
+
+/** Arm the shared 429 backoff to expire at `until` (epoch ms on the caller's clock). Test-only. */
+export function armBackoffForTest(until: number): void {
+  backoffUntil = until;
 }

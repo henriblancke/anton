@@ -16,10 +16,13 @@ const CAP = 3;
 export function StandaloneGroup({
   slug,
   items,
+  budgetAware = false,
   onOpenTicket,
 }: {
   slug: string;
   items: StandaloneItem[];
+  /** Project budget-aware flag (anton-y2ue): forwarded to chips for the Approve/Queue split. */
+  budgetAware?: boolean;
   /** Open a chip's detail dialog — forwarded from the board. */
   onOpenTicket?: (ticketId: string) => void;
 }) {
@@ -37,7 +40,13 @@ export function StandaloneGroup({
         <span className="font-mono text-[10px] text-subtle">{items.length}</span>
       </div>
       {visible.map((item) => (
-        <StandaloneChip key={item.id} slug={slug} item={item} onOpen={onOpenTicket} />
+        <StandaloneChip
+          key={item.id}
+          slug={slug}
+          item={item}
+          budgetAware={budgetAware}
+          onOpen={onOpenTicket}
+        />
       ))}
       {overflow > 0 && (
         <button

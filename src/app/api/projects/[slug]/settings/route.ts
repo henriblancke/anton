@@ -4,6 +4,7 @@ import {
   CONCURRENCY_RANGE,
   JOB_TIMEOUT_MINUTES_RANGE,
   MAX_RETRIES_RANGE,
+  budgetPolicySchema,
   getProjectSettingsBySlug,
   updateProjectSettings,
   type ProjectSettings,
@@ -178,6 +179,33 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
         { status: 400 },
       );
     } else patch.conventionalCommits = conventionalCommits;
+  }
+
+  if ("budgetAware" in body) {
+    const budgetAware = body.budgetAware;
+    // "" / null → clear (default: OFF). Otherwise strictly a boolean.
+    if (budgetAware == null || budgetAware === "") patch.budgetAware = undefined;
+    else if (typeof budgetAware !== "boolean") {
+      return NextResponse.json({ error: "budgetAware must be a boolean" }, { status: 400 });
+    } else patch.budgetAware = budgetAware;
+  }
+
+  if ("budgetPolicy" in body) {
+    const raw = (body as Record<string, unknown>).budgetPolicy;
+    // "" / null → clear (fall back to DEFAULT_PROJECT_BUDGET_POLICY). Otherwise validate strictly:
+    // out-of-range / unknown keys 400 (fail loud) rather than persisting a bad policy. The parsed
+    // partial is deep-merged into the stored policy by updateProjectSettings, so a patch carrying
+    // only the knobs a client exposes never wipes the ones it doesn't.
+    if (raw == null || raw === "") {
+      patch.budgetPolicy = undefined;
+    } else {
+      const parsed = budgetPolicySchema.safeParse(raw);
+      if (!parsed.success) {
+        const detail = parsed.error.issues[0]?.message ?? "out of range";
+        return NextResponse.json({ error: `Invalid budgetPolicy: ${detail}` }, { status: 400 });
+      }
+      patch.budgetPolicy = parsed.data;
+    }
   }
 
   try {
