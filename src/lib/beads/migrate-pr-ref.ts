@@ -35,7 +35,7 @@ export function planPrRefMigration(list: Bead[]): PrRefMove[] {
  * default `list` hides everything but open, so the cutover must sweep them all or it would strand
  * pointers on non-open beads.
  */
-const ALL_STATUSES = "open,in_progress,blocked,closed,deferred";
+export const ALL_STATUSES = "open,in_progress,blocked,closed,deferred";
 
 /**
  * Run the backfill over one board (`cwd`). Reads every bead, plans the gh- moves, and applies each

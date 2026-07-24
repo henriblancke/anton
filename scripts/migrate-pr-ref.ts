@@ -12,7 +12,7 @@
  * override that. Dry-run by default (like `bd prune`); pass --apply to write.
  */
 import { getDb, schema } from "@/lib/db";
-import { migratePrRefs, planPrRefMigration } from "@/lib/beads/migrate-pr-ref";
+import { migratePrRefs, planPrRefMigration, ALL_STATUSES } from "@/lib/beads/migrate-pr-ref";
 import { beads } from "@/lib/beads/bd";
 
 function repoPathsFromArgs(paths: string[]): string[] {
@@ -36,7 +36,7 @@ async function main() {
     // In dry-run we plan without writing; --apply performs the same plan and executes it.
     const plan = apply
       ? await migratePrRefs(cwd)
-      : planPrRefMigration(await beads.list(cwd, ["--status", "open,in_progress,blocked,closed,deferred"]));
+      : planPrRefMigration(await beads.list(cwd, ["--status", ALL_STATUSES]));
     console.log(`${cwd}: ${plan.length} bead(s)${apply ? " migrated" : " to migrate"}`);
     for (const { id, ref } of plan) console.log(`  ${id}  ${ref} → metadata.pr`);
   }
