@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Toggle } from "@/components/atoms";
 import { agentDotClass } from "@/components/board/board-utils";
 import { DeleteProjectDialog } from "@/components/settings/delete-project-dialog";
+import { PruneBeadsSection } from "@/components/settings/prune-beads-section";
 
 /** Settings the UI can edit today. Kept local so this client module never imports server code. */
 interface EditableSettings {
@@ -550,6 +551,17 @@ export function SettingsView({
               <span className="ml-auto">
                 <DeleteProjectDialog project={project} />
               </span>
+            </div>
+            {/* Prune closed beads (anton-uobe): permanent deletion, gated behind preview + confirm */}
+            <div className="flex flex-col gap-3 rounded-xl border border-risk-high/25 bg-risk-high/5 p-4">
+              <div className="flex flex-col gap-1">
+                <span className="text-[13px] font-semibold text-risk-high">Prune closed beads</span>
+                <span className="text-xs text-muted-foreground">
+                  Permanently deletes piled-up closed beads (they bloat the export and slow
+                  queries). Open and in-progress beads are never touched.
+                </span>
+              </div>
+              <PruneBeadsSection project={project} />
             </div>
           </section>
         </div>

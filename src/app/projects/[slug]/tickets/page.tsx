@@ -1,6 +1,6 @@
 import { Suspense } from "react";
 
-import { TicketsView } from "@/components/tickets/tickets-view";
+import { TicketsPageFallback, TicketsView } from "@/components/tickets/tickets-view";
 import { ticketsQueryString } from "@/components/tickets/tickets-utils";
 import { getProjectBySlug } from "@/lib/projects";
 import { getTickets } from "@/lib/tickets";
@@ -26,7 +26,7 @@ export default async function ProjectTicketsPage({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <Suspense fallback={<div className="flex min-h-0 flex-1 flex-col gap-4" aria-busy="true" />}>
+      <Suspense fallback={<TicketsPageFallback slug={slug} />}>
         <TicketsView
           slug={slug}
           initialTickets={tickets}

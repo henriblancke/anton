@@ -6,6 +6,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { PlusIcon, SearchIcon } from "lucide-react";
 
 import { buttonVariants } from "@/components/ui/button";
+import { LinkPendingIndicator } from "@/components/ui/link-pending-indicator";
 import { pageLabelFromPath } from "@/components/shell/shell-utils";
 
 /**
@@ -40,10 +41,11 @@ export function Topbar({
       <nav aria-label="Breadcrumb" className="flex min-w-0 items-center gap-2 text-[13px]">
         <Link
           href={projectSlug ? `/projects/${projectSlug}` : "/"}
-          className="shrink-0 truncate text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+          className="flex shrink-0 items-center gap-1.5 truncate text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 has-[[data-pending]]:opacity-60"
           title={projectName ?? projectSlug ?? "Projects"}
         >
           {projectName ?? projectSlug ?? "Projects"}
+          <LinkPendingIndicator className="size-3" />
         </Link>
         {pageLabel && (
           <>

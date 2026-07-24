@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   beads,
+  buildPruneArgs,
   buildUpdateArgs,
   createDoltSync,
   getSyncStatus,
@@ -234,6 +235,50 @@ describe("buildUpdateArgs", () => {
     expect(buildUpdateArgs("bd-1", { title: "", status: undefined })).toBeNull();
     expect(buildUpdateArgs("bd-1", { labels: { agent: "", risk: undefined } }, ["agent:nextjs"]))
       .toBeNull();
+  });
+});
+
+describe("buildPruneArgs (anton-uobe)", () => {
+  it("previews an age window via --older-than + --dry-run by default", () => {
+    expect(buildPruneArgs("30d")).toEqual(["prune", "--older-than", "30d", "--dry-run", "--json"]);
+    expect(buildPruneArgs("90d")).toEqual(["prune", "--older-than", "90d", "--dry-run", "--json"]);
+  });
+
+  it("deletes an age window via --older-than + --force", () => {
+    expect(buildPruneArgs("30d", { force: true })).toEqual([
+      "prune",
+      "--older-than",
+      "30d",
+      "--force",
+      "--json",
+    ]);
+    expect(buildPruneArgs("90d", { force: true })).toEqual([
+      "prune",
+      "--older-than",
+      "90d",
+      "--force",
+      "--json",
+    ]);
+  });
+
+  it("maps 'all closed' to --pattern '*' (bd's everything-closed sweep)", () => {
+    expect(buildPruneArgs("all")).toEqual(["prune", "--pattern", "*", "--dry-run", "--json"]);
+    expect(buildPruneArgs("all", { force: true })).toEqual([
+      "prune",
+      "--pattern",
+      "*",
+      "--force",
+      "--json",
+    ]);
+  });
+
+  it("always scopes: every argv carries --older-than or --pattern (bd's safety gate)", () => {
+    for (const age of ["30d", "90d", "all"] as const) {
+      for (const force of [false, true]) {
+        const args = buildPruneArgs(age, { force });
+        expect(args.some((a) => a === "--older-than" || a === "--pattern")).toBe(true);
+      }
+    }
   });
 });
 

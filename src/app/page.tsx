@@ -4,6 +4,7 @@ import { CircleAlertIcon } from "lucide-react";
 import { listProjects } from "@/lib/projects";
 import { AddProjectDialog } from "@/components/projects/add-project-dialog";
 import { AntonMark } from "@/components/shell/brand";
+import { LinkPendingIndicator } from "@/components/ui/link-pending-indicator";
 
 // Reads the local anton.db at request time — never prerender.
 export const dynamic = "force-dynamic";
@@ -42,7 +43,7 @@ export default async function Home() {
             <Link
               key={project.id}
               href={`/projects/${project.slug}`}
-              className="group flex items-center gap-4 rounded-xl border border-border bg-card p-[18px] transition-colors hover:border-ring/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+              className="group flex items-center gap-4 rounded-xl border border-border bg-card p-[18px] transition-colors hover:border-ring/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 has-[[data-pending]]:opacity-60"
             >
               <span className="flex size-10 shrink-0 items-center justify-center rounded-[10px] border border-border bg-secondary font-mono text-[15px] font-medium text-primary">
                 {project.name[0]?.toLowerCase() ?? "a"}
@@ -67,6 +68,7 @@ export default async function Home() {
                     no .beads/
                   </span>
                 )}
+                <LinkPendingIndicator className="text-muted-foreground" />
               </div>
             </Link>
           ))}

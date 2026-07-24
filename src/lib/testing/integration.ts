@@ -110,7 +110,11 @@ export function makeBdRepo(opts: { bare?: boolean; initialCommit?: boolean } = {
     dir,
     repo,
     bare,
-    cleanup: () => rmSync(dir, { recursive: true, force: true }),
+    // maxRetries: routes fire off-response-path `bd dolt` syncs (fire-and-forget), so a background
+    // subprocess can still be writing inside the repo when afterAll runs — a bare rmSync races it
+    // and dies ENOTEMPTY. Node retries ENOTEMPTY/EBUSY with linear backoff when maxRetries is set,
+    // which outlives the short-lived subprocess.
+    cleanup: () => rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }),
   };
 }
 
