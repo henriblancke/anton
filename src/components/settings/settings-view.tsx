@@ -80,7 +80,7 @@ interface AutomationSchedule {
  */
 interface DiscoveredAgent {
   id: string;
-  source: "project" | "global" | "bundled";
+  source: "project" | "global" | "bundled" | "plugin";
   description?: string;
 }
 
@@ -324,9 +324,8 @@ export function SettingsView({
             {userAgents.length > 0 && (
               <div className="flex flex-col gap-2.5">
                 <span className="text-xs text-subtle">
-                  always active · your{" "}
-                  <span className="font-mono">.claude/agents</span> — never gated; remove the file to
-                  stop one
+                  always active · your own agents (<span className="font-mono">.claude/agents</span>{" "}
+                  and installed plugins) — never gated by the allowlist
                 </span>
                 <div className="grid max-w-2xl grid-cols-1 gap-2.5 sm:grid-cols-2">
                   {userAgents.map((agent) => (
