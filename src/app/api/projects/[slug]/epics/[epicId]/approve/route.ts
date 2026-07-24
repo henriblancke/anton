@@ -8,7 +8,7 @@ import { enqueueExecuteEpic, enqueueExecuteEpicIfAbsent } from "@/lib/jobs/servi
 import { resolveOperator } from "@/lib/operator";
 import { deriveStage } from "@/lib/ticket-view";
 import { STAGES } from "@/lib/types";
-import { resolveProject } from "../../../resolve-project";
+import { notFoundResponse, withProject } from "../../../resolve-project";
 
 export const dynamic = "force-dynamic";
 
@@ -43,13 +43,8 @@ async function readApprovalBody(
   }
 }
 
-export async function POST(
-  request: Request,
-  { params }: { params: Promise<{ slug: string; epicId: string }> },
-) {
-  const { slug, epicId } = await params;
-  const { project, response } = await resolveProject(slug);
-  if (!project) return response;
+export const POST = withProject<{ slug: string; epicId: string }>(async (request, { project, params }) => {
+  const { epicId } = params;
 
   // Gate approval on readiness: approving enqueues execute-epic immediately, so an epic with open
   // blockers must not be startable before its blocker completes. Locate it across stages first.
@@ -70,7 +65,7 @@ export async function POST(
   // a missing bead is distinguishable from a found-but-not-runnable one, and the message stays honest.
   const target = allBeads.find((b) => b.id === epicId);
   if (!target) {
-    return NextResponse.json({ error: `Ticket ${epicId} not found on the board` }, { status: 404 });
+    return notFoundResponse(`Ticket ${epicId} not found on the board`);
   }
   if (!beads.isRunTarget(target)) {
     const parent = (target.parent ?? target.parent_id) as string | undefined;
@@ -95,7 +90,7 @@ export async function POST(
     ? undefined
     : STAGES.map((stage) => board.standalone[stage].find((e) => e.id === epicId)).find(Boolean);
   if (!epic && !standalone) {
-    return NextResponse.json({ error: "Run target not found" }, { status: 404 });
+    return notFoundResponse("Run target not found");
   }
   // Settle ownership BEFORE the open-blocker readiness gate below. Approval is the run trigger and
   // normally enqueues execute-epic immediately, so a target with open blockers must not be approved.
@@ -319,5 +314,5 @@ export async function POST(
   if (standalone) {
     return NextResponse.json({ item: { ...standalone, ...written }, jobId });
   }
-  return NextResponse.json({ error: "Run target not found" }, { status: 404 });
-}
+  return notFoundResponse("Run target not found");
+});
