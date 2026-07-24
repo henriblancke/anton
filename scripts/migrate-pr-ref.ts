@@ -10,6 +10,10 @@
  *
  * Defaults to the projects registered in anton.db (ANTON_DB or ./anton.db); explicit repo paths
  * override that. Dry-run by default (like `bd prune`); pass --apply to write.
+ *
+ * This is only the CLI shell: arg parsing, board resolution, and reporting. The actual migration
+ * logic (planning + applying, unit-tested) lives in `@/lib/beads/migrate-pr-ref` and is imported
+ * here — so the runtime cutover in that module and this operator entry point stay in lockstep.
  */
 import { getDb, schema } from "@/lib/db";
 import { migratePrRefs, planPrRefMigration, ALL_STATUSES } from "@/lib/beads/migrate-pr-ref";
