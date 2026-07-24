@@ -355,7 +355,14 @@ export function enqueueSyncPushDeduped(
     // Backstop: the index rejected a concurrent insert of the queued follow-up. Return the queued
     // job that won the race (the index is now queued-only, so the conflict is on that row).
     if (isUniqueViolation(e)) {
-      const winner = queuedSyncPushId(db, projectId);
+      // Guard the lookup: if it throws (transient DB error), fall through to re-throw the original
+      // violation rather than escaping with the read error.
+      let winner: string | undefined;
+      try {
+        winner = queuedSyncPushId(db, projectId);
+      } catch {
+        /* db error — fall through to throw e */
+      }
       if (winner) return winner;
     }
     throw e;
