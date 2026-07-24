@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { beads, type Bead } from "@/lib/beads/bd";
+import { nudgeSync } from "@/lib/beads/sync-nudge";
 import { conflictBody, ownerOf, withClaimLock, type SwapResult } from "@/lib/beads/claim";
 import { refreshAllIssues } from "@/lib/beads/issues";
 import { resolveOperator } from "@/lib/operator";
@@ -46,7 +47,9 @@ async function readSteal(request: Request): Promise<boolean> {
 async function loadTarget(
   project: Project,
   epicId: string,
-): Promise<{ ok: true; repoPath: string; target: Bead } | { ok: false; response: NextResponse }> {
+): Promise<
+  { ok: true; projectId: string; repoPath: string; target: Bead } | { ok: false; response: NextResponse }
+> {
   // Force a fresh read (not a warm board snapshot) so the steal check and run-target gate decide
   // from the true current state — a claim added by a teammate seconds ago must be visible here.
   const allBeads = await refreshAllIssues(project.repoPath);
@@ -79,7 +82,7 @@ async function loadTarget(
   // boundary (backlog-only) and the UI's `canTakeOver`.
   const stage = deriveStage(target);
   if (stage !== "backlog") return { ok: false, response: notBacklogResponse(epicId, stage) };
-  return { ok: true, repoPath: project.repoPath, target };
+  return { ok: true, projectId: project.id, repoPath: project.repoPath, target };
 }
 
 /** The 409 for a claim write refused because the target has left backlog (a run owns its assignee). */
@@ -135,18 +138,11 @@ async function swapIfBacklog(
   });
 }
 
-/** Best-effort sync so the claim/release reaches teammates within a heartbeat; never blocks. */
-function nudgeSync(repoPath: string, epicId: string, verb: string): Promise<void> {
-  return beads
-    .sync(repoPath)
-    .catch((err) => console.error(`[claim] beads dolt sync failed after ${verb} ${epicId}`, err));
-}
-
 export const POST = withProject<{ slug: string; epicId: string }>(async (request, { project, params }) => {
   const { epicId } = params;
   const loaded = await loadTarget(project, epicId);
   if (!loaded.ok) return loaded.response;
-  const { repoPath, target } = loaded;
+  const { projectId, repoPath, target } = loaded;
 
   const operator = await resolveOperator();
   if (!operator) {
@@ -175,10 +171,10 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   if (swap === "approved") return approvedLockResponse(epicId);
   if ("leftBacklog" in swap) return notBacklogResponse(epicId, swap.leftBacklog);
   if (!swap.ok) return NextResponse.json(conflictBody(epicId, swap.owner), { status: 409 });
-  // Fire-and-forget (like the runner's claim sync in execute-epic): the assignee write already
-  // succeeded, so don't make the response wait on a shell-out to `bd dolt pull/commit/push` that a
-  // slow/unreachable remote could stall — the sync engine's heartbeat is the backstop.
-  void nudgeSync(repoPath, epicId, "claiming");
+  // Fire-and-forget: the assignee write already succeeded, so don't make the response wait on a
+  // shell-out to `bd dolt pull/commit/push` a slow/unreachable remote could stall. nudgeSync fires
+  // the immediate push AND enqueues the durable sync-push backstop (anton-nowq).
+  nudgeSync({ id: projectId, repoPath }, "claim");
 
   // The swap already verified the write with its own read — answer with that bead rather than
   // spawning a third `bd show` for the same state.
@@ -189,7 +185,7 @@ export const DELETE = withProject<{ slug: string; epicId: string }>(async (reque
   const { epicId } = params;
   const loaded = await loadTarget(project, epicId);
   if (!loaded.ok) return loaded.response;
-  const { repoPath, target } = loaded;
+  const { projectId, repoPath, target } = loaded;
 
   const owner = ownerOf(target);
   if (owner) {
@@ -227,7 +223,7 @@ export const DELETE = withProject<{ slug: string; epicId: string }>(async (reque
     if (!swap.ok) return NextResponse.json(conflictBody(epicId, swap.owner), { status: 409 });
     // Fire-and-forget for the same reason as POST: the unassign already landed locally, so don't
     // block the release response on the best-effort remote sync.
-    void nudgeSync(repoPath, epicId, "releasing");
+    nudgeSync({ id: projectId, repoPath }, "release");
     // Post-write state, already verified by the swap's own read.
     return NextResponse.json({ item: swap.bead });
   }

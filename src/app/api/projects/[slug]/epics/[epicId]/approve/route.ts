@@ -3,6 +3,7 @@ import { getBoard } from "@/lib/board";
 import { epicStandaloneBlockers, standaloneBlockers } from "@/lib/epic-graph";
 import { refreshAllIssues } from "@/lib/beads/issues";
 import { beads, type Bead } from "@/lib/beads/bd";
+import { nudgeSync } from "@/lib/beads/sync-nudge";
 import { conflictBody, ownerOf, withClaimLock } from "@/lib/beads/claim";
 import { enqueueExecuteEpic, enqueueExecuteEpicIfAbsent } from "@/lib/jobs/service";
 import { resolveOperator } from "@/lib/operator";
@@ -289,14 +290,11 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
     console.error(`[approve] failed to enqueue execute-epic for ${epicId}`, err);
   }
 
-  // Fire-and-forget (like the claim route's nudgeSync): the approve write already landed locally and
-  // the run enqueues off that local state, so don't block the response on a `bd dolt pull/commit/push`
-  // a slow/unreachable remote could stall. A failed push is recorded as "failing"/unpushed in the
-  // sync-status registry inside beads.sync and retried by the E1 heartbeat backstop — this catch only
-  // keeps the rejection from floating.
-  void beads
-    .sync(project.repoPath)
-    .catch((err) => console.error(`[approve] beads dolt sync failed after approving ${epicId}`, err));
+  // Fire-and-forget: the approve write already landed locally and the run enqueues off that local
+  // state, so don't block the response on a `bd dolt pull/commit/push` a slow/unreachable remote
+  // could stall. nudgeSync fires the immediate push AND enqueues the durable sync-push backstop
+  // (anton-nowq), so a stuck remote becomes a visible parked job rather than a silently-lost approve.
+  nudgeSync({ id: project.id, repoPath: project.repoPath }, "approve");
 
   // Read-after-write, without the read: the approval changed exactly two fields on the target — the
   // `approved` label this route just wrote, and the assignee the CAS verified with its own post-write

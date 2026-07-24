@@ -44,12 +44,16 @@ export const TIER_SEEDS: Record<BurnTier, { sessionPct: number; weeklyPct: numbe
   L: { sessionPct: 20, weeklyPct: 3 },
 };
 
-/** Static tier per job type (ticket: stringer=S, review-fix=M, execute-epic=L; grooming is cheap). */
+/**
+ * Static tier per job type (ticket: stringer=S, review-fix=M, execute-epic=L; grooming is cheap).
+ * sync-push is a deterministic `git push` of dolt refs — it invokes no Claude, so it burns nothing (S).
+ */
 export const JOB_TYPE_TIER: Record<JobType, BurnTier> = {
   "nightly-stringer": "S",
   "review-fix": "M",
   "execute-epic": "L",
   "orphan-grooming": "S",
+  "sync-push": "S",
 };
 
 export interface BurnSample {

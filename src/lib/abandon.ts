@@ -5,6 +5,7 @@
  * about the exit reads as a delivery. See DESIGN.md §3 — beads owns status, anton.db gains no column.
  */
 import { beads } from "./beads/bd";
+import { nudgeSync } from "./beads/sync-nudge";
 import { cancelRunForTarget } from "./jobs/service";
 import { freshDetail } from "./ticket-detail";
 import type { Bead } from "./beads/bd";
@@ -45,13 +46,6 @@ function assertOpen(bead: Bead, what: string): void {
   }
 }
 
-/** Push the abandon to teammates without blocking the response — the heartbeat backstop retries. */
-function nudgeSync(project: Project, id: string): void {
-  void beads
-    .sync(project.repoPath)
-    .catch((e) => console.error(`[abandon] beads dolt sync failed after abandoning ${id}`, e));
-}
-
 /**
  * Abandon one ticket. The live run is killed FIRST (see cancelRunForTarget): a ticket is executed
  * as part of its parent epic's run — or, parentless, as its own epic-of-one — so the run target to
@@ -80,7 +74,7 @@ export async function abandonTicket(
   // Read-after-write, like setTicketDeferred: the `bd show` bead is authoritative for the abandoned
   // state it just wrote, so the response never reflects the board's stale snapshot.
   const detail = await freshDetail(project, await beads.show(project.repoPath, id));
-  nudgeSync(project, id);
+  nudgeSync(project, "abandon");
   return detail;
 }
 
@@ -112,7 +106,9 @@ export async function abandonEpic(
 
   await cancelRunForTarget(project.id, epicId);
 
-  const all = await beads.list(repo, ["--status", "all"]);
+  // --skip-labels (bd 1.1.0): this full-board read only inspects parent + status to find the epic's
+  // open children — it never reads labels — so skipping label hydration keeps it lean.
+  const all = await beads.list(repo, ["--status", "all", "--skip-labels"]);
   const open = all.filter(
     (b) => ((b.parent ?? b.parent_id) as string | undefined) === epicId && b.status !== "closed",
   );
@@ -126,6 +122,6 @@ export async function abandonEpic(
   // which re-running abandon finishes — the reverse order would leave orphaned open children under
   // an epic that already reads as settled.
   await beads.abandon(repo, epicId, why);
-  nudgeSync(project, epicId);
+  nudgeSync(project, "abandon");
   return { epicId, children };
 }

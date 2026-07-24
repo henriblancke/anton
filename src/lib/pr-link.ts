@@ -7,6 +7,7 @@
  * (mirrors board-move.ts).
  */
 import { beads, type Bead } from "./beads/bd";
+import { nudgeSync } from "./beads/sync-nudge";
 import { planMove, type MoveOp } from "./board-move";
 import type { Project } from "./types";
 
@@ -96,7 +97,6 @@ export async function linkPr(project: Project, target: Bead, ref: string): Promi
     if (op.kind === "tag") await beads.tag(project.repoPath, target.id, op.labels);
     else if (op.kind === "untag") await beads.untag(project.repoPath, target.id, op.labels);
   }
-  await beads
-    .sync(project.repoPath)
-    .catch((e) => console.error(`[pr-link] beads dolt sync failed after linking PR on ${target.id}`, e));
+  // The ref + stage ops landed locally; propagate via the immediate push + durable sync-push job.
+  nudgeSync(project, "pr-link");
 }

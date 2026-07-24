@@ -5,6 +5,7 @@
  */
 import { beads, type BeadPatch } from "./beads/bd";
 import { ensureDescription } from "./beads/issues";
+import { nudgeSync } from "./beads/sync-nudge";
 import { getDb } from "./db";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
 import { findOpenRunForEpic } from "./runs";
@@ -101,13 +102,9 @@ export async function updateEpic(
   // (blockOnPendingWrite defaults true), so the response carries the new priority — not the stale
   // pre-write board. The board/backlog then re-sort on it (priority is already a sort key).
   const detail = await getEpicDetail(project, epicId);
-  // Fire-and-forget, exactly like deleteEpic: the update already landed locally, so don't block the
-  // response on a `bd dolt pull/commit/push` a slow/unreachable remote could stall. A failed push is
-  // recorded as failing/unpushed in the sync-status registry and retried by the E1 heartbeat backstop
-  // — this catch only keeps the rejection from floating.
-  void beads
-    .sync(project.repoPath)
-    .catch((e) => console.error(`[epic-detail] beads dolt sync failed after updating ${epicId}`, e));
+  // The update already landed locally; propagate without blocking the response. nudgeSync fires the
+  // immediate push AND enqueues the durable sync-push backstop (anton-nowq), like deleteEpic.
+  nudgeSync(project, "epic-detail");
   return detail;
 }
 
@@ -119,13 +116,7 @@ export async function updateEpic(
 export async function deleteEpic(project: Project, epicId: string): Promise<void> {
   await beads.show(project.repoPath, epicId); // 404 guard — bd throws on an unknown id
   await beads.delete(project.repoPath, epicId, { cascade: true });
-  // Fire-and-forget (like the claim route's nudgeSync): the delete already landed locally, so don't
-  // block the response on a `bd dolt pull/commit/push` a slow/unreachable remote could stall. A
-  // failed push is recorded as "failing"/unpushed in the sync-status registry inside beads.sync and
-  // retried by the E1 heartbeat backstop — this catch only keeps the rejection from floating.
-  void beads
-    .sync(project.repoPath)
-    .catch((e) =>
-      console.error(`[epic-detail] beads dolt sync failed after deleting ${epicId}`, e),
-    );
+  // The delete already landed locally; propagate without blocking the response. nudgeSync fires the
+  // immediate push AND enqueues the durable sync-push backstop (anton-nowq).
+  nudgeSync(project, "epic-detail");
 }

@@ -18,7 +18,8 @@ export type JobType =
   | "execute-epic"
   | "review-fix"
   | "nightly-stringer"
-  | "orphan-grooming";
+  | "orphan-grooming"
+  | "sync-push";
 
 /**
  * `queued`  — eligible when runAt ≤ now (also how a backoff/quota reschedule is represented).
@@ -331,6 +332,96 @@ export function enqueueExecuteEpicDeduped(
 }
 
 /**
+ * Id of the `queued` (not-yet-running) sync-push job for this project, if any — the dedupe target
+ * for `enqueueSyncPushDeduped`. Deliberately excludes `running`: a write that arrives while a push
+ * is in flight must be able to schedule a fresh queued follow-up rather than fold onto a running
+ * job whose push may already be past its snapshot (anton-x7la). The `jobs_active_sync_push_unique`
+ * index — now queued-only — guarantees at most one such follow-up per project.
+ */
+function queuedSyncPushId(
+  tx: Pick<AntonDb, "select">,
+  projectId: string,
+): string | undefined {
+  const rows = tx
+    .select({ id: schema.jobs.id })
+    .from(schema.jobs)
+    .where(
+      and(
+        eq(schema.jobs.type, "sync-push"),
+        eq(schema.jobs.projectId, projectId),
+        eq(schema.jobs.status, "queued"),
+      ),
+    )
+    .limit(1)
+    .all();
+  return rows[0]?.id;
+}
+
+/**
+ * Enqueue a durable sync-push job for a project's repo, deduped per repo (anton-nowq, anton-x7la).
+ * Every local write can call this; the dedupe collapses a burst of writes onto at most one QUEUED
+ * push job (all of a repo's writes push the same Dolt remote), so the queue never fills with
+ * redundant pushes.
+ *
+ * Dedupe is on the `queued` job only — NOT a `running` one. Returns the existing queued job's id
+ * (inserting no new row) when one already covers this project; otherwise inserts a fresh `queued`
+ * job and returns its id. A write that lands while an earlier push is still `running` therefore
+ * schedules a durable follow-up (the running job may have snapshotted before this write committed),
+ * closing the E2 gap where such a write's durability rested only on a fire-and-forget trailing pass.
+ * The result is bounded at 1 running + 1 queued per project; the per-repo coalescer keeps the two
+ * from ever overlapping on the remote. Prior done/parked/failed jobs don't block a new one.
+ *
+ * Same shape as `enqueueExecuteEpicDeduped`: the select-existing + insert run in one synchronous
+ * better-sqlite3 transaction (so concurrent enqueues serialize to one queued job), and the partial
+ * unique index `jobs_active_sync_push_unique` is the DB-level backstop — a race that slips past the
+ * guard raises UNIQUE, which we absorb by returning the row that won.
+ */
+export function enqueueSyncPushDeduped(
+  db: AntonDb,
+  clock: Clock,
+  projectId: string,
+): string {
+  const nowMs = clock.now();
+  try {
+    return db.transaction((tx) => {
+      const existing = queuedSyncPushId(tx, projectId);
+      if (existing) return existing;
+
+      const id = randomUUID();
+      tx.insert(schema.jobs)
+        .values({
+          id,
+          type: "sync-push",
+          projectId,
+          payloadJson: JSON.stringify({ projectId }),
+          status: "queued",
+          runAt: secDate(nowMs),
+          attempts: 0,
+          createdAt: secDate(nowMs),
+          updatedAt: secDate(nowMs),
+        })
+        .run();
+      return id;
+    });
+  } catch (e) {
+    // Backstop: the index rejected a concurrent insert of the queued follow-up. Return the queued
+    // job that won the race (the index is now queued-only, so the conflict is on that row).
+    if (isUniqueViolation(e)) {
+      // Guard the lookup: if it throws (transient DB error), fall through to re-throw the original
+      // violation rather than escaping with the read error.
+      let winner: string | undefined;
+      try {
+        winner = queuedSyncPushId(db, projectId);
+      } catch {
+        /* db error — fall through to throw e */
+      }
+      if (winner) return winner;
+    }
+    throw e;
+  }
+}
+
+/**
  * Atomically lease up to `limit` runnable jobs and return them. Runnable =
  *   • `queued` and due (runAt ≤ now), OR
  *   • `running` but the lease expired (crashed worker → reclaim).
@@ -558,6 +649,20 @@ export async function complete(db: AntonDb, clock: Clock, jobId: string): Promis
  * Reschedule a job to run again at `runAtMs` (used for both quota backoff and retry). Returns it
  * to `queued` and clears the lease so it is picked up when due. Optionally rewinds `attempts`
  * (quota isn't the job's fault, so it shouldn't burn the poison budget).
+ *
+ * One collision is possible for sync-push (anton-x7la): its dedup index is queued-only, so while
+ * this job was `running` a board write may have enqueued a fresh queued follow-up into the project's
+ * single queued slot. Requeuing this job would be a second queued row → UNIQUE. The follow-up runs a
+ * full push that supersedes this job's retry (it carries the same unpushed commits, plus the newer
+ * write), so we discharge this job as `done` rather than let the exception leave it a zombie `running`
+ * row that never backs off and is re-leased on every reclaim tick. The follow-up becomes the sole
+ * carrier of the durable push for this repo. Note this resets the attempt budget: under a remote
+ * outage WITH continuous board writes, each running push is discharged before its attempts reach
+ * `maxAttempts`, so parking is DEFERRED (not lost) until writes quiesce — the outage stays operator-
+ * visible throughout via the write-nudge's `unpushedCount` / `state:"failing"` surface, which is
+ * independent of the job. The discharge is gated on `type === 'sync-push'`: only its queued-only
+ * index can raise UNIQUE on a running→queued move, so a violation from any other job type re-throws
+ * loudly rather than being silently swallowed as `done`.
  */
 export async function reschedule(
   db: AntonDb,
@@ -567,19 +672,50 @@ export async function reschedule(
   opts?: { lastError?: string; refundAttempt?: boolean },
 ): Promise<void> {
   const nowMs = clock.now();
-  await db
-    .update(schema.jobs)
-    .set({
-      status: "queued",
-      runAt: secDate(runAtMs),
-      leaseExpiresAt: null,
-      lastError: opts?.lastError ?? null,
-      attempts: opts?.refundAttempt
-        ? sql`MAX(${schema.jobs.attempts} - 1, 0)`
-        : schema.jobs.attempts,
-      updatedAt: secDate(nowMs),
-    })
-    .where(and(eq(schema.jobs.id, jobId), eq(schema.jobs.status, "running")));
+  try {
+    await db
+      .update(schema.jobs)
+      .set({
+        status: "queued",
+        runAt: secDate(runAtMs),
+        leaseExpiresAt: null,
+        lastError: opts?.lastError ?? null,
+        attempts: opts?.refundAttempt
+          ? sql`MAX(${schema.jobs.attempts} - 1, 0)`
+          : schema.jobs.attempts,
+        updatedAt: secDate(nowMs),
+      })
+      .where(and(eq(schema.jobs.id, jobId), eq(schema.jobs.status, "running")));
+  } catch (e) {
+    // Only sync-push's queued-only index can raise UNIQUE on a running→queued move (a queued
+    // follow-up already holds the project's slot); it supersedes this retry, so discharge this job
+    // cleanly instead of surfacing the violation on the settle path. Any other type's violation is
+    // unexpected — re-throw it rather than mask a real problem as a silent `done`.
+    // Guard the type lookup: if it throws (transient DB error), fall through to re-throw the
+    // original violation rather than escaping with the lookup error and leaving the job `running`
+    // until lease expiry (which would skip a backoff step via the reclaimer's re-increment).
+    let jobType: string | undefined;
+    if (isUniqueViolation(e)) {
+      try {
+        jobType = (await getJob(db, jobId))?.type;
+      } catch {
+        /* db error — fall through to throw e */
+      }
+    }
+    if (jobType === "sync-push") {
+      await db
+        .update(schema.jobs)
+        .set({
+          status: "done",
+          leaseExpiresAt: null,
+          lastError: "superseded by a queued sync-push follow-up",
+          updatedAt: secDate(nowMs),
+        })
+        .where(and(eq(schema.jobs.id, jobId), eq(schema.jobs.status, "running")));
+      return;
+    }
+    throw e;
+  }
 }
 
 /**

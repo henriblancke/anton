@@ -4,6 +4,7 @@
  * the `beads` wrapper. See DESIGN.md §2/§3.
  */
 import { beads, LABELS, type Bead } from "./beads/bd";
+import { nudgeSync } from "./beads/sync-nudge";
 import type { Project, Stage } from "./types";
 
 export type MoveOp =
@@ -63,13 +64,8 @@ export async function moveCard(project: Project, cardId: string, toStage: Stage)
   }
 
   if (ops.length > 0) {
-    // Fire-and-forget (like the claim route's nudgeSync): the label/status ops already landed
-    // locally, so don't block the drag response on a `bd dolt pull/commit/push` a slow/unreachable
-    // remote could stall. A failed push is recorded as "failing"/unpushed in the sync-status
-    // registry inside beads.sync and retried by the E1 heartbeat backstop — this catch only keeps
-    // the rejection from floating.
-    void beads
-      .sync(project.repoPath)
-      .catch((e) => console.error(`[board-move] beads dolt sync failed after moving ${cardId}`, e));
+    // The label/status ops already landed locally; propagate without blocking the drag response.
+    // nudgeSync fires the immediate push AND enqueues the durable sync-push backstop (anton-nowq).
+    nudgeSync(project, "board-move");
   }
 }

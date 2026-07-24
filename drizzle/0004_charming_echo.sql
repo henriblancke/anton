@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX `jobs_active_sync_push_unique` ON `jobs` (`project_id`) WHERE "jobs"."type" = 'sync-push' and "jobs"."status" = 'queued';

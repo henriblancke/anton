@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { configYamlHas } from "./config.mjs";
+import { bdVersion, bdVersionAtLeast, configYamlHas, MIN_BD_VERSION } from "./config.mjs";
 
 // bd 1.0.4: settings appended as flat dotted lines after a comment header.
 const FLAT = `# Beads Configuration File
@@ -89,5 +89,30 @@ describe("configYamlHas", () => {
     // 255`; those must never count as a live setting.
     const beadsDir = withConfig("# export:\n#     auto: false\n");
     expect(configYamlHas(beadsDir, "export.auto", "false")).toBe(false);
+  });
+});
+
+describe("bd version gate (anton-qwsq)", () => {
+  const run = (out: string, status = 0, error?: unknown) => () => ({ status, stdout: out, error });
+
+  it("parses the `bd version X.Y.Z (hash)` line", () => {
+    expect(bdVersion(run("bd version 1.1.0 (8e4e59d39)"))).toEqual({ major: 1, minor: 1, patch: 0, raw: "1.1.0" });
+    expect(bdVersion(run("bd version 1.0.4 (ce242a879)"))).toEqual({ major: 1, minor: 0, patch: 4, raw: "1.0.4" });
+  });
+
+  it("returns null when bd errors, exits non-zero, or prints no version", () => {
+    expect(bdVersion(run("", 127))).toBeNull();
+    expect(bdVersion(run("bd version 1.1.0", 0, new Error("x")))).toBeNull();
+    expect(bdVersion(run("no version here"))).toBeNull();
+  });
+
+  it("gates at the minimum version — accepts >= 1.1.0, rejects older and unreadable", () => {
+    expect(MIN_BD_VERSION).toBe("1.1.0");
+    expect(bdVersionAtLeast({ major: 1, minor: 1, patch: 0 })).toBe(true);
+    expect(bdVersionAtLeast({ major: 1, minor: 2, patch: 0 })).toBe(true);
+    expect(bdVersionAtLeast({ major: 2, minor: 0, patch: 0 })).toBe(true);
+    expect(bdVersionAtLeast({ major: 1, minor: 0, patch: 4 })).toBe(false);
+    expect(bdVersionAtLeast({ major: 0, minor: 63, patch: 3 })).toBe(false);
+    expect(bdVersionAtLeast(null)).toBe(false);
   });
 });
