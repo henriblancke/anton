@@ -3,10 +3,12 @@
  * shape / review-fix): rows for history + diagnostics, plus an append-only log file the UI can
  * tail (SSE) or replay. db-injectable so the runner and tests share one connection.
  */
+import { randomUUID } from "node:crypto";
 import { appendFile, mkdir, open, stat } from "node:fs/promises";
 import { watch } from "node:fs";
 import { dirname, join } from "node:path";
 import { desc, eq } from "drizzle-orm";
+import type { ClaudeEvent } from "./claude/driver";
 import { getDb, schema } from "./db";
 import type { AntonDb, Clock } from "./jobs/queue";
 
@@ -91,6 +93,40 @@ export async function setSessionClaudeId(
 export async function appendSessionLog(logPath: string, chunk: string): Promise<void> {
   await mkdir(dirname(logPath), { recursive: true });
   await appendFile(logPath, chunk);
+}
+
+export interface StartJobSessionInput {
+  projectId: string;
+  kind: SessionKind;
+  runId?: string;
+  beadId?: string;
+}
+
+export interface JobSession {
+  sessionId: string;
+  logPath: string;
+  /** Streams claude events to the session log as `[type] text` lines; fail-soft on write errors. */
+  onEvent: (e: ClaudeEvent) => void;
+}
+
+/**
+ * One-call session bootstrap for the run jobs (execute-epic / review-fix / nightly-stringer):
+ * mint the session id + log path, persist the row, and return the shared `[type] text` log
+ * appender — so the jobs don't each hand-roll the same closure and drift apart.
+ */
+export async function startJobSession(
+  db: AntonDb,
+  clock: Clock,
+  input: StartJobSessionInput,
+): Promise<JobSession> {
+  const sessionId = randomUUID();
+  const logPath = sessionLogPath(sessionId);
+  await createSession(db, clock, { id: sessionId, logPath, ...input });
+  const onEvent = (e: ClaudeEvent) => {
+    const line = e.text ? `[${e.type}] ${e.text}\n` : `[${e.type}]\n`;
+    void appendSessionLog(logPath, line).catch(() => {});
+  };
+  return { sessionId, logPath, onEvent };
 }
 
 /** JSON-friendly session shape for the run-detail API / timeline (epoch seconds, no Date). */

@@ -23,9 +23,35 @@ export async function resolveProject(
 ): Promise<ResolveProjectResult> {
   const project = await getProjectBySlug(slug);
   if (!project) {
-    return {
-      response: NextResponse.json({ error: notFoundMessage }, { status: 404 }),
-    };
+    return { response: notFoundResponse(notFoundMessage) };
   }
   return { project };
+}
+
+/** The standard `{ error }` 404 body shared by the `[slug]` routes' not-found paths. */
+export function notFoundResponse(message: string): NextResponse {
+  return NextResponse.json({ error: message }, { status: 404 });
+}
+
+/**
+ * Wrap a `[slug]`-scoped route handler with the shared prelude: await `params`, resolve the
+ * project, and short-circuit with resolveProject's 404 when the slug matches nothing. The handler
+ * gets the resolved project alongside the awaited params:
+ *
+ *   export const GET = withProject<{ slug: string; epicId: string }>(
+ *     async (_request, { project, params }) => { ... },
+ *   );
+ */
+export function withProject<P extends { slug: string }>(
+  handler: (
+    request: Request,
+    ctx: { project: Project; params: P },
+  ) => Response | Promise<Response>,
+): (request: Request, context: { params: Promise<P> }) => Promise<Response> {
+  return async (request, context) => {
+    const params = await context.params;
+    const { project, response } = await resolveProject(params.slug);
+    if (!project) return response;
+    return handler(request, { project, params });
+  };
 }

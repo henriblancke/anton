@@ -37,10 +37,9 @@ import {
 } from "../runs";
 import {
   appendSessionLog,
-  createSession,
   endSession,
-  sessionLogPath,
   setSessionClaudeId,
+  startJobSession,
 } from "../sessions";
 import { buildPrTitle } from "./pr-title";
 import {
@@ -902,25 +901,16 @@ async function runTicket(args: {
     seedPrompt: settings.seedPrompt,
   });
 
-  const sessionId = randomUUID();
-  const logPath = sessionLogPath(sessionId);
-  await createSession(db, clock, {
-    id: sessionId,
+  const { sessionId, logPath, onEvent } = await startJobSession(db, clock, {
     projectId,
     runId,
     kind: "execute",
     beadId: ticket.id,
-    logPath,
   });
   await updateRun(db, clock, runId, { ticketBeadId: ticket.id, agentTag: agentTag ?? null });
   // Live handle (anton-susu): expose this ticket's session + worktree while it runs; each ticket's
   // dispatch overwrites the last, so the handle always names the job's CURRENT session.
   ctx.report({ sessionId, cwd: worktreePath });
-
-  const onEvent = (e: ClaudeEvent) => {
-    const line = e.text ? `[${e.type}] ${e.text}\n` : `[${e.type}]\n`;
-    void appendSessionLog(logPath, line).catch(() => {});
-  };
 
   // Human steering (anton-bfy4) can land at any moment — including while this epic's earlier
   // tickets were running — so the notes that reach the prompt are read HERE, at dispatch, not from
