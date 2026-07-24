@@ -534,7 +534,7 @@ process.exit(0);`),
 
       // No PR was opened and the epic never advanced to in-review — nothing landed.
       const epic = await beads.show(repo, epicNd);
-      expect(epic.external_ref ?? null).toBeNull();
+      expect(beads.getPrRef(epic) ?? null).toBeNull();
       expect(epic.labels ?? []).not.toContain("stage:in-review");
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;

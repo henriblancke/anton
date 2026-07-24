@@ -112,7 +112,7 @@ export function inReviewEpics(
       !beads.isRunTarget(b) ||
       b.status === "closed" ||
       !(b.labels?.includes(IN_REVIEW) ?? false) ||
-      prNumberFromRef(b.external_ref) === undefined
+      prNumberFromRef(beads.getPrRef(b)) === undefined
     ) {
       return false;
     }
@@ -194,7 +194,7 @@ async function handleEpic(args: {
   all: Bead[];
 }): Promise<void> {
   const { db, clock, ctx, repo, projectId, epic, settings, branchPrefix, baseBranch, all } = args;
-  const number = prNumberFromRef(epic.external_ref);
+  const number = prNumberFromRef(beads.getPrRef(epic));
   if (number === undefined) return;
 
   const pr = await getPrReview(repo, number, ctx.signal);

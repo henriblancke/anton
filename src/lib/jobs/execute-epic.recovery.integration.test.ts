@@ -77,7 +77,7 @@ describeBd("execute-epic e2e — recovery & readiness (real handler · real bd/g
     });
     runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
 
-    // Attempt 1: a normal run carries the bug to in-review (PR opened at gh-42, external ref stamped).
+    // Attempt 1: a normal run carries the bug to in-review (PR opened at gh-42, PR ref stamped to metadata.pr).
     process.env.ANTON_CLAUDE_BIN = successClaude;
     const job1 = await runner.enqueue({
       type: "execute-epic",
@@ -87,7 +87,7 @@ describeBd("execute-epic e2e — recovery & readiness (real handler · real bd/g
     await runner.tickOnce();
     await runner.whenIdle();
     expect((await getJob(tdb.db, job1))?.status).toBe("done");
-    expect((await beads.show(repo, bugId)).external_ref).toBe("gh-42");
+    expect(beads.getPrRef(await beads.show(repo, bugId))).toBe("gh-42");
     const sessionsAfter1 = (await tdb.db.select().from(schema.sessions)).filter(
       (s) => s.beadId === bugId,
     );
@@ -115,10 +115,10 @@ process.exit(0);`,
       await runner.tickOnce();
       await runner.whenIdle();
 
-      // The recovery run did NOT short-circuit: it re-opened the PR (external ref advanced to gh-99)
+      // The recovery run did NOT short-circuit: it re-opened the PR (PR ref advanced to gh-99)
       // and finished done, rather than reporting a false completion on the dead gh-42.
       expect((await getJob(tdb.db, job2))?.status).toBe("done");
-      expect((await beads.show(repo, bugId)).external_ref).toBe("gh-99");
+      expect(beads.getPrRef(await beads.show(repo, bugId))).toBe("gh-99");
       // The standalone target is stage:in-review from attempt 1, so its ticket is resume-skipped —
       // claude is not re-run; only the (agent-free) PR step executes on recovery.
       const sessionsAfter2 = (await tdb.db.select().from(schema.sessions)).filter(

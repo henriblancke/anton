@@ -74,7 +74,7 @@ describe("inReviewEpics", () => {
     title: "t",
     status: "in_progress",
     labels: [IN_REVIEW],
-    external_ref: "gh-1",
+    metadata: { pr: "gh-1" }, // the PR pointer lives at metadata.pr (anton-76ej), read via getPrRef
     ...over,
   });
 
@@ -93,8 +93,26 @@ describe("inReviewEpics", () => {
     const child = bead({ id: "child-1", issue_type: "task", parent: "epic-1" }); // has a parent
     const closed = bead({ id: "closed-1", issue_type: "epic", status: "closed" });
     const noLabel = bead({ id: "nolabel-1", issue_type: "bug", labels: [] });
-    const noRef = bead({ id: "noref-1", issue_type: "epic", external_ref: undefined });
+    const noRef = bead({ id: "noref-1", issue_type: "epic", metadata: undefined });
     expect(inReviewEpics([child, closed, noLabel, noRef])).toEqual([]);
+  });
+
+  it("a tracker URL in external_ref (no metadata.pr) is NOT swept — external_ref is not the PR channel", () => {
+    // anton-76ej: enabling a tracker integration (e.g. Linear) parks its URL in external_ref. The
+    // sweep reads the PR pointer through getPrRef, which honors only metadata.pr or a legacy gh-* ref
+    // — a tracker URL there must never read as an open PR, or Linear would silently trip the sweep.
+    const linear = bead({
+      id: "linear-1",
+      issue_type: "epic",
+      metadata: undefined,
+      external_ref: "https://linear.app/acme/issue/ACME-42",
+    });
+    expect(inReviewEpics([linear])).toEqual([]);
+  });
+
+  it("honors a legacy gh-* external_ref as a PR pointer until the metadata.pr backfill (anton-76ej)", () => {
+    const legacy = bead({ id: "legacy-1", issue_type: "epic", metadata: undefined, external_ref: "gh-9" });
+    expect(inReviewEpics([legacy]).map((b) => b.id)).toEqual(["legacy-1"]);
   });
 
   // Ownership matrix (anton-zoh): on a shared board an operator may only act on epics it claimed
