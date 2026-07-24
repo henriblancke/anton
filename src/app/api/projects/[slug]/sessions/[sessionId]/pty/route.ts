@@ -2,7 +2,8 @@ import { z } from "zod";
 
 import { getSessionById } from "@/lib/sessions";
 import { getPtyManager, type PtyEvent } from "@/lib/pty/manager";
-import { resolveProject } from "../../../resolve-project";
+import type { Project } from "@/lib/types";
+import { notFoundResponse, withProject } from "../../../resolve-project";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -21,28 +22,21 @@ export const maxDuration = 3600;
  * The session is scoped to its project: a session whose row belongs to another project 404s.
  */
 
-/** Verify the session exists and belongs to `slug`. Returns the project id, or a Response to send. */
+/** Verify the session exists and belongs to the project. Returns a 404 Response to send if not. */
 async function resolveSession(
-  slug: string,
+  project: Project,
   sessionId: string,
 ): Promise<{ ok: true } | { ok: false; response: Response }> {
-  const { project, response } = await resolveProject(slug);
-  if (!project) {
-    return { ok: false, response };
-  }
   const session = await getSessionById(sessionId);
   if (!session || session.projectId !== project.id) {
-    return { ok: false, response: Response.json({ error: "Session not found" }, { status: 404 }) };
+    return { ok: false, response: notFoundResponse("Session not found") };
   }
   return { ok: true };
 }
 
-export async function GET(
-  request: Request,
-  { params }: { params: Promise<{ slug: string; sessionId: string }> },
-) {
-  const { slug, sessionId } = await params;
-  const resolved = await resolveSession(slug, sessionId);
+export const GET = withProject<{ slug: string; sessionId: string }>(async (request, { project, params }) => {
+  const { sessionId } = params;
+  const resolved = await resolveSession(project, sessionId);
   if (!resolved.ok) return resolved.response;
 
   const manager = getPtyManager();
@@ -118,7 +112,7 @@ export async function GET(
       "X-Accel-Buffering": "no",
     },
   });
-}
+});
 
 const inputSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("input"), data: z.string() }),
@@ -129,12 +123,9 @@ const inputSchema = z.discriminatedUnion("type", [
   }),
 ]);
 
-export async function POST(
-  request: Request,
-  { params }: { params: Promise<{ slug: string; sessionId: string }> },
-) {
-  const { slug, sessionId } = await params;
-  const resolved = await resolveSession(slug, sessionId);
+export const POST = withProject<{ slug: string; sessionId: string }>(async (request, { project, params }) => {
+  const { sessionId } = params;
+  const resolved = await resolveSession(project, sessionId);
   if (!resolved.ok) return resolved.response;
 
   let body: z.infer<typeof inputSchema>;
@@ -158,16 +149,13 @@ export async function POST(
     return Response.json({ error: "Session not live" }, { status: 409 });
   }
   return new Response(null, { status: 204 });
-}
+});
 
-export async function DELETE(
-  _request: Request,
-  { params }: { params: Promise<{ slug: string; sessionId: string }> },
-) {
-  const { slug, sessionId } = await params;
-  const resolved = await resolveSession(slug, sessionId);
+export const DELETE = withProject<{ slug: string; sessionId: string }>(async (_request, { project, params }) => {
+  const { sessionId } = params;
+  const resolved = await resolveSession(project, sessionId);
   if (!resolved.ok) return resolved.response;
 
   getPtyManager().kill(sessionId);
   return new Response(null, { status: 204 });
-}
+});
