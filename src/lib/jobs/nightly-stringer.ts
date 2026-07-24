@@ -7,14 +7,13 @@
  * Idempotent: `--delta` means a re-run (crash / quota backoff) doesn't re-triage signals already
  * seen; the worst case is claude re-reading a scan and deduping against the board it already wrote.
  */
-import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { beads } from "../beads/bd";
 import { getProjectById, getProjectSettings } from "../projects";
 import { loadSkill } from "../claude/prompt";
-import { runClaude, type ClaudeEvent } from "../claude/driver";
+import { runClaude } from "../claude/driver";
 import { scan } from "../stringer";
-import { appendSessionLog, createSession, endSession, sessionLogPath } from "../sessions";
+import { appendSessionLog, endSession, startJobSession } from "../sessions";
 import { PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
 import { systemClock } from "./queue";
@@ -47,18 +46,10 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
     if (!project) throw new PoisonError(`project ${projectId} not found`);
     const settings = await getProjectSettings(db, projectId);
 
-    const sessionId = randomUUID();
-    const logPath = sessionLogPath(sessionId);
-    await createSession(db, clock, {
-      id: sessionId,
+    const { sessionId, logPath, onEvent } = await startJobSession(db, clock, {
       projectId,
       kind: "nightly-stringer",
-      logPath,
     });
-    const onEvent = (e: ClaudeEvent) => {
-      const line = e.text ? `[${e.type}] ${e.text}\n` : `[${e.type}]\n`;
-      void appendSessionLog(logPath, line).catch(() => {});
-    };
 
     try {
       // 1. Scan the repo for new signals.

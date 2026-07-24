@@ -15,9 +15,8 @@
  * existing branch (a re-run just pushes whatever is left), and finalizing a merge clears
  * `stage:in-review` so a later sweep no longer treats the epic as in-review (never finalized twice).
  */
-import { randomUUID } from "node:crypto";
 import { beads, LABELS, type Bead } from "../beads/bd";
-import { runClaude, type ClaudeEvent } from "../claude/driver";
+import { runClaude } from "../claude/driver";
 import { branchAheadOfRemote, commitAll, fetchOrigin, mergeIntoCurrent, pushBranch } from "../git/ops";
 import {
   ANTON_MARK,
@@ -43,7 +42,7 @@ import {
 } from "../projects";
 import { runVerifyGates } from "./shell";
 import { findOpenRunForEpic, updateRun } from "../runs";
-import { appendSessionLog, createSession, endSession, sessionLogPath } from "../sessions";
+import { appendSessionLog, endSession, startJobSession } from "../sessions";
 import { buildReviewFixPrompt, parseThreadReport, type ThreadOutcome } from "./review-fix-context";
 import { isUsageLimitError, PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
@@ -286,22 +285,14 @@ async function runFixSession(args: {
 }): Promise<void> {
   const { db, clock, ctx, repo, projectId, epic, settings, worktree, pr, verdict, conflicts, branch, number } = args;
 
-  const sessionId = randomUUID();
-  const logPath = sessionLogPath(sessionId);
   // Resume the epic's open run if present (for UI linkage); review-fix doesn't create runs itself.
   const run = await findOpenRunForEpic(db, projectId, epic.id);
-  await createSession(db, clock, {
-    id: sessionId,
+  const { sessionId, logPath, onEvent } = await startJobSession(db, clock, {
     projectId,
     runId: run?.id,
     kind: "review-fix",
     beadId: epic.id,
-    logPath,
   });
-  const onEvent = (e: ClaudeEvent) => {
-    const line = e.text ? `[${e.type}] ${e.text}\n` : `[${e.type}]\n`;
-    void appendSessionLog(logPath, line).catch(() => {});
-  };
 
   try {
     await appendSessionLog(logPath, `[review-fix] PR #${number}: ${verdict.reasons.join("; ")}\n`);
