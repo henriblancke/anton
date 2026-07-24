@@ -29,10 +29,16 @@ function prLabel(ref: string): string {
 export function StandaloneChip({
   slug,
   item,
+  budgetAware = false,
   onOpen,
 }: {
   slug: string;
   item: StandaloneItem;
+  /**
+   * Project budget-aware flag (anton-y2ue): on → the backlog action splits into "Approve" (immediate)
+   * and "Queue" (paced for optimal usage); off → a single "Approve & run" button.
+   */
+  budgetAware?: boolean;
   /** Open this ticket's detail dialog. When omitted the chip is non-interactive (view-only). */
   onOpen?: (ticketId: string) => void;
 }) {
@@ -54,16 +60,24 @@ export function StandaloneChip({
   }
   const deferred = optimisticDeferred ?? item.deferred;
 
-  async function handleApproveRun() {
+  async function handleApproveRun(immediate = true) {
+    // `immediate` is the run-directly choice (anton-y2ue): true → run now (bypass budget pacing),
+    // false → queue for optimal usage. Defaults true so the single (non-budget-aware) button runs now.
     setRunning(true);
     setOptimisticApproved(true);
     try {
-      const res = await fetch(`/api/projects/${slug}/epics/${item.id}/approve`, { method: "POST" });
+      const res = await fetch(`/api/projects/${slug}/epics/${item.id}/approve`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ immediate }),
+      });
       if (!res.ok) {
         const body = (await res.json().catch(() => null)) as { error?: string } | null;
         throw new Error(body?.error ?? `Approve failed (${res.status})`);
       }
-      toast.success(`Approved & running "${item.title}"`);
+      toast.success(
+        immediate ? `Approved & running "${item.title}"` : `Queued "${item.title}" for optimal usage`,
+      );
     } catch (err) {
       setOptimisticApproved(false);
       toast.error(err instanceof Error ? err.message : "Failed to approve run");
@@ -136,20 +150,11 @@ export function StandaloneChip({
         {item.stage === "backlog" && <BlockedChip blockedBy={item.blockedBy} />}
         {item.abandoned && <AbandonedChip />}
         {deferred && <SnoozedChip />}
-        {showApproveRun && (
-          <Button
-            size="xs"
-            onClick={handleApproveRun}
-            disabled={running}
-            className="ml-auto pointer-events-auto"
-          >
-            {running ? "Starting…" : "Approve & run"}
-          </Button>
-        )}
       </div>
 
       {item.stage === "backlog" && (
-        <div className={cn("relative z-[1] flex items-center", onOpen && "pointer-events-none")}>
+        <div className={cn("relative z-[1] flex flex-col gap-2", onOpen && "pointer-events-none")}>
+          {/* Claim sits on its own line, above the action row. */}
           <ClaimControl
             slug={slug}
             itemId={item.id}
@@ -157,15 +162,50 @@ export function StandaloneChip({
             readOnly={approved}
             canTakeOver={item.stage === "backlog"}
           />
-          <SnoozeButton
-            slug={slug}
-            ticketId={item.id}
-            deferred={deferred}
-            size="icon-xs"
-            iconOnly
-            className="pointer-events-auto ml-auto shrink-0"
-            onChanged={(detail) => setOptimisticDeferred(detail.deferred)}
-          />
+          {/* Queue · Approve · Snooze share one line (anton-tc6y); snooze is pushed to the right. */}
+          <div className="flex items-center gap-1">
+            {showApproveRun &&
+              (budgetAware ? (
+                // Budget-aware: run now or hand the run to the governor's pace-line.
+                <span className="pointer-events-auto flex items-center gap-1">
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    onClick={() => handleApproveRun(false)}
+                    disabled={running}
+                    title="Queue this run for the budget governor to pace against the weekly plan"
+                  >
+                    Queue
+                  </Button>
+                  <Button
+                    size="xs"
+                    onClick={() => handleApproveRun(true)}
+                    disabled={running}
+                    title="Approve and run now, bypassing budget pacing (the session limit still applies)"
+                  >
+                    {running ? "…" : "Approve"}
+                  </Button>
+                </span>
+              ) : (
+                <Button
+                  size="xs"
+                  onClick={() => handleApproveRun()}
+                  disabled={running}
+                  className="pointer-events-auto"
+                >
+                  {running ? "Starting…" : "Approve & run"}
+                </Button>
+              ))}
+            <SnoozeButton
+              slug={slug}
+              ticketId={item.id}
+              deferred={deferred}
+              size="icon-xs"
+              iconOnly
+              className="pointer-events-auto ml-auto shrink-0"
+              onChanged={(detail) => setOptimisticDeferred(detail.deferred)}
+            />
+          </div>
         </div>
       )}
     </div>

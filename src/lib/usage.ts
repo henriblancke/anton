@@ -65,3 +65,41 @@ export function tightestLimit(usage: UsageSnapshot): TightestLimit {
   };
   return weekly.pct > session.pct ? weekly : session;
 }
+
+/**
+ * Ready-queue size (strictly) below which the backlog counts as "thin" for the shaping nudge.
+ * anton can't invent high-value work — shaping is the founder's job — so when quota is idle and
+ * fewer than this many beads are ready to burn, we prompt the operator to feed the queue.
+ */
+export const BACKLOG_THIN_AT = 3;
+
+/**
+ * The inputs behind the shaping nudge, resolved server-side (see `/api/usage/nudge`). The pill
+ * ships these to a pure component so the three-condition visibility gate is unit-testable on its
+ * own. `readyCount` is null when the ready queue couldn't be read (fail-soft) — which suppresses
+ * the nudge rather than nagging on a guess.
+ */
+export interface ShapingSignal {
+  /** Weekly usage is behind the pace-line — the plan has room this week. */
+  behindPace: boolean;
+  /** The budget gate would admit work now — there's quota to burn, not just weekly slack. */
+  headroomAvailable: boolean;
+  /** Ready beads across projects, or null when the queue read failed. */
+  readyCount: number | null;
+  /** Weekly quota remaining, 0–100 percent — the "~X% weekly left" figure in the message. */
+  weeklyRemainingPct: number;
+}
+
+/**
+ * Whether to surface the backlog-starvation nudge: quota is idle (behind pace AND headroom to
+ * burn) yet the ready backlog is thin. All three must hold; a null `readyCount` (unknown) never
+ * triggers it. Informational only — it prompts shaping, it never generates work.
+ */
+export function shouldNudgeShaping(signal: ShapingSignal): boolean {
+  return (
+    signal.behindPace &&
+    signal.headroomAvailable &&
+    signal.readyCount !== null &&
+    signal.readyCount < BACKLOG_THIN_AT
+  );
+}

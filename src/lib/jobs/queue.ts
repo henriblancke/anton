@@ -7,7 +7,7 @@
  * clock. Times are stored as unix SECONDS (the schema's timestamp mode); this module works in ms
  * and converts at the boundary.
  */
-import { and, eq, gt, inArray, isNull, lte, not, notInArray, or, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, isNull, like, lt, lte, not, notInArray, or, sql } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { randomUUID } from "node:crypto";
 import * as schema from "../db/schema";
@@ -114,6 +114,17 @@ function isUniqueViolation(e: unknown): boolean {
   return code === "SQLITE_CONSTRAINT_UNIQUE" || code === "SQLITE_CONSTRAINT";
 }
 
+/**
+ * Build an execute-epic job payload. `bypassBudget` is written only when true (anton-d8i4) so the
+ * paced/default case keeps the historical `{ projectId, epicBeadId }` shape — an absent flag is the
+ * governed default, and the governor's `deferQueuedJobs({ bypass })` filter reads its absence as such.
+ */
+function executeEpicPayload(projectId: string, epicBeadId: string, bypassBudget?: boolean) {
+  return bypassBudget
+    ? { projectId, epicBeadId, bypassBudget: true }
+    : { projectId, epicBeadId };
+}
+
 /** The `epicBeadId` carried in a job's payload, or undefined if absent/malformed. */
 function epicBeadIdOf(payloadJson: string | null): string | undefined {
   try {
@@ -200,11 +211,32 @@ export function enqueueExecuteEpicIfAbsent(
   clock: Clock,
   projectId: string,
   epicBeadId: string,
+  opts?: { bypassBudget?: boolean },
 ): string | undefined {
   const nowMs = clock.now();
   try {
     return db.transaction((tx) => {
-      if (coveringExecuteEpicId(tx, projectId, epicBeadId)) return undefined;
+      const covering = coveringExecuteEpicId(tx, projectId, epicBeadId);
+      if (covering) {
+        // A take-over with "run now" intent (`bypassBudget`) onto a covering QUEUED job — e.g. a
+        // paced "Queue for optimal usage" row, possibly budget-deferred to a future runAt — must
+        // promote it, mirroring `enqueueExecuteEpicDeduped`: set the bypass flag and pull it due
+        // now, or the governor keeps holding the reused job to the pace boundary and the "run now"
+        // intent is silently dropped. Guarded to `queued`: a running job is already executing, and
+        // a parked/failed one is left for its own resume path.
+        if (opts?.bypassBudget) {
+          tx.update(schema.jobs)
+            .set({
+              payloadJson: JSON.stringify(executeEpicPayload(projectId, epicBeadId, true)),
+              runAt: secDate(nowMs),
+              lastError: null,
+              updatedAt: secDate(nowMs),
+            })
+            .where(and(eq(schema.jobs.id, covering), eq(schema.jobs.status, "queued")))
+            .run();
+        }
+        return undefined;
+      }
 
       const id = randomUUID();
       tx.insert(schema.jobs)
@@ -212,7 +244,7 @@ export function enqueueExecuteEpicIfAbsent(
           id,
           type: "execute-epic",
           projectId,
-          payloadJson: JSON.stringify({ projectId, epicBeadId }),
+          payloadJson: JSON.stringify(executeEpicPayload(projectId, epicBeadId, opts?.bypassBudget)),
           status: "queued",
           runAt: secDate(nowMs),
           attempts: 0,
@@ -246,12 +278,32 @@ export function enqueueExecuteEpicDeduped(
   clock: Clock,
   projectId: string,
   epicBeadId: string,
+  opts?: { bypassBudget?: boolean },
 ): string {
   const nowMs = clock.now();
+  const bypassBudget = opts?.bypassBudget === true;
   try {
     return db.transaction((tx) => {
       const existing = activeExecuteEpicId(tx, projectId, epicBeadId);
-      if (existing) return existing;
+      if (existing) {
+        // "Approve" (immediate) on an epic that already has a queued run: promote it so the budget
+        // governor stops pacing it — set the bypass flag AND pull it due now, clearing any budget
+        // defer that had pushed its runAt into the future. Guarded to `queued` (a `running` job is
+        // already executing, and its payload is re-read only on the next attempt). A queue-mode
+        // (non-bypass) re-approve leaves the existing job exactly as it is (anton-d8i4).
+        if (bypassBudget) {
+          tx.update(schema.jobs)
+            .set({
+              payloadJson: JSON.stringify(executeEpicPayload(projectId, epicBeadId, true)),
+              runAt: secDate(nowMs),
+              lastError: null,
+              updatedAt: secDate(nowMs),
+            })
+            .where(and(eq(schema.jobs.id, existing), eq(schema.jobs.status, "queued")))
+            .run();
+        }
+        return existing;
+      }
 
       const id = randomUUID();
       tx.insert(schema.jobs)
@@ -259,7 +311,7 @@ export function enqueueExecuteEpicDeduped(
           id,
           type: "execute-epic",
           projectId,
-          payloadJson: JSON.stringify({ projectId, epicBeadId }),
+          payloadJson: JSON.stringify(executeEpicPayload(projectId, epicBeadId, bypassBudget)),
           status: "queued",
           runAt: secDate(nowMs),
           attempts: 0,
@@ -530,6 +582,47 @@ export async function projectIdsWithPendingJobs(
   return rows.map((r) => r.projectId);
 }
 
+/**
+ * The `queued` jobs of `types` for one project that are due now — the candidates the runner's
+ * per-job value gate (anton-k05r) evaluates before leasing. Read-only (holds are per-tick, applied
+ * via leaseDue's `exclude`); ordered by runAt to match leaseDue's own scan order.
+ *
+ * `includeReclaimable` also returns `running` rows whose lease has expired — the same condition
+ * `leaseDue` treats as runnable. Without them the value gate can't see a crashed job's retry, and
+ * a low-value reclaim would bypass the admission check that holds its queued twin.
+ */
+export async function queuedDueJobs(
+  db: AntonDb,
+  clock: Clock,
+  opts: {
+    types: readonly JobType[];
+    projectId: string | null | undefined;
+    includeReclaimable?: boolean;
+  },
+): Promise<JobRow[]> {
+  if (opts.types.length === 0) return [];
+  const nowDate = secDate(clock.now());
+  const dueQueued = and(eq(schema.jobs.status, "queued"), lte(schema.jobs.runAt, nowDate));
+  return db
+    .select()
+    .from(schema.jobs)
+    .where(
+      and(
+        opts.includeReclaimable
+          ? or(
+              dueQueued,
+              and(eq(schema.jobs.status, "running"), lte(schema.jobs.leaseExpiresAt, nowDate)),
+            )
+          : dueQueued,
+        inArray(schema.jobs.type, [...opts.types]),
+        opts.projectId == null
+          ? isNull(schema.jobs.projectId)
+          : eq(schema.jobs.projectId, opts.projectId),
+      ),
+    )
+    .orderBy(schema.jobs.runAt);
+}
+
 /** Heartbeat: extend the lease on a running job while its handler works. */
 export async function renewLease(
   db: AntonDb,
@@ -623,6 +716,92 @@ export async function reschedule(
     }
     throw e;
   }
+}
+
+/**
+ * Budget-defer (anton-szld): push the `queued` jobs of `types` for a project out to `retryAtMs`, so
+ * the proactive budget governor backs autonomous work off past the reset/night boundary instead of
+ * only catching a `UsageLimitError` after hitting the wall. Mirrors a quota backoff's reschedule but
+ * for a *proactive* hold: it touches only `queued` rows (a `running` job is in flight and settles on
+ * its own), never burns an attempt, and only ever moves a job *later* — a job already scheduled past
+ * `retryAtMs` (e.g. a longer quota backoff) is left where it is. Returns how many rows it deferred.
+ *
+ * `bypass` filters execute-epic rows by the `bypassBudget` payload flag (anton-d8i4), so the governor
+ * can hold the paced ("Queue") jobs and the immediate-approved ("Approve"/run-directly) ones on
+ * different boundaries: `"exclude"` matches only the paced rows (flag unset), `"only"` matches only
+ * the immediate ones (flag set). Absent → no payload filter (defer every matching row). SQLite maps
+ * a JSON `true` to the integer 1 via `json_extract`, so an absent/`false` flag is `IS NOT 1`.
+ */
+export async function deferQueuedJobs(
+  db: AntonDb,
+  clock: Clock,
+  opts: {
+    types: readonly JobType[];
+    projectId: string | null | undefined;
+    retryAtMs: number;
+    lastError?: string;
+    bypass?: "only" | "exclude";
+  },
+): Promise<number> {
+  if (opts.types.length === 0) return 0;
+  const nowMs = clock.now();
+  const retryDate = secDate(opts.retryAtMs);
+  const bypassExtract = sql`json_extract(${schema.jobs.payloadJson}, '$.bypassBudget')`;
+  const bypassFilter =
+    opts.bypass === "only"
+      ? sql`${bypassExtract} = 1`
+      : opts.bypass === "exclude"
+        ? sql`${bypassExtract} is not 1`
+        : undefined;
+  const rows = await db
+    .update(schema.jobs)
+    .set({ runAt: retryDate, lastError: opts.lastError ?? null, updatedAt: secDate(nowMs) })
+    .where(
+      and(
+        eq(schema.jobs.status, "queued"),
+        inArray(schema.jobs.type, [...opts.types]),
+        opts.projectId == null
+          ? isNull(schema.jobs.projectId)
+          : eq(schema.jobs.projectId, opts.projectId),
+        lt(schema.jobs.runAt, retryDate),
+        bypassFilter,
+      ),
+    )
+    .returning({ id: schema.jobs.id });
+  return rows.length;
+}
+
+/**
+ * Undo stale budget deferrals: when a project's budget-aware pacing turns OFF, rows the governor
+ * pushed to a future `runAt` would otherwise stay parked until that stale boundary — `leaseDue`
+ * only scans due rows, so disabling pacing wouldn't actually resume them. Pull the governor's own
+ * deferrals back to due-now. Scoped by the `budget: ` lastError marker `deferQueuedJobs` writes:
+ * quota backoffs and retry reschedules carry different lastError text and are left where they are.
+ * Returns how many rows it resumed.
+ */
+export async function resumeBudgetDeferredJobs(
+  db: AntonDb,
+  clock: Clock,
+  opts: { types: readonly JobType[]; projectId: string | null | undefined },
+): Promise<number> {
+  if (opts.types.length === 0) return 0;
+  const nowDate = secDate(clock.now());
+  const rows = await db
+    .update(schema.jobs)
+    .set({ runAt: nowDate, lastError: null, updatedAt: nowDate })
+    .where(
+      and(
+        eq(schema.jobs.status, "queued"),
+        inArray(schema.jobs.type, [...opts.types]),
+        opts.projectId == null
+          ? isNull(schema.jobs.projectId)
+          : eq(schema.jobs.projectId, opts.projectId),
+        gt(schema.jobs.runAt, nowDate),
+        like(schema.jobs.lastError, "budget: %"),
+      ),
+    )
+    .returning({ id: schema.jobs.id });
+  return rows.length;
 }
 
 /**

@@ -1,9 +1,64 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "67e36df3-f731-4801-8625-40514e7262fe",
+  "id": "2e74a323-dfaf-4f11-8bee-a19603e5bc56",
   "prevId": "8b38369d-1cb7-43f8-a310-03279453b34b",
   "tables": {
+    "burn_samples": {
+      "name": "burn_samples",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "job_type": {
+          "name": "job_type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "session_delta": {
+          "name": "session_delta",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "weekly_delta": {
+          "name": "weekly_delta",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(unixepoch())"
+        }
+      },
+      "indexes": {
+        "burn_samples_type_created_idx": {
+          "name": "burn_samples_type_created_idx",
+          "columns": [
+            "job_type",
+            "created_at"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
     "jobs": {
       "name": "jobs",
       "columns": {
@@ -101,14 +156,6 @@
           ],
           "isUnique": true,
           "where": "\"jobs\".\"status\" in ('queued', 'running')"
-        },
-        "jobs_active_sync_push_unique": {
-          "name": "jobs_active_sync_push_unique",
-          "columns": [
-            "project_id"
-          ],
-          "isUnique": true,
-          "where": "\"jobs\".\"type\" = 'sync-push' and \"jobs\".\"status\" in ('queued', 'running')"
         }
       },
       "foreignKeys": {

@@ -73,7 +73,20 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
   );
 }
 
-export function EpicDetailView({ slug, epicId }: { slug: string; epicId: string }) {
+export function EpicDetailView({
+  slug,
+  epicId,
+  budgetAware = false,
+}: {
+  slug: string;
+  epicId: string;
+  /**
+   * Whether this project's budget governor paces autonomous work (anton-d8i4). On → the run action
+   * splits into "Approve" (immediate execution) and "Queue" (paced for optimal usage). Off → a single
+   * run button (the governor never runs, so there's nothing to queue for).
+   */
+  budgetAware?: boolean;
+}) {
   const router = useRouter();
   const [detail, setDetail] = useState<EpicDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -116,15 +129,32 @@ export function EpicDetailView({ slug, epicId }: { slug: string; epicId: string 
     );
   }
 
-  async function handleRun(title: string, opts: { force?: boolean } = {}) {
+  async function handleRun(
+    title: string,
+    opts: { force?: boolean; immediate?: boolean } = {},
+  ) {
+    // `immediate` carries the run-directly choice (anton-d8i4): true → execute now (bypass pacing),
+    // false → queue for optimal usage. Defaults to immediate so the single run/force-run button (and
+    // any non-budget-aware project) behaves as it always has — run now.
+    const immediate = opts.immediate ?? true;
     setRunning(true);
     try {
-      const res = await fetch(`/api/projects/${slug}/epics/${epicId}/approve`, { method: "POST" });
+      const res = await fetch(`/api/projects/${slug}/epics/${epicId}/approve`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ immediate }),
+      });
       if (!res.ok) {
         const body = (await res.json().catch(() => null)) as { error?: string } | null;
         throw new Error(body?.error ?? `Run failed (${res.status})`);
       }
-      toast.success(opts.force ? `Re-running "${title}"` : `Run started for "${title}"`);
+      toast.success(
+        opts.force
+          ? `Re-running "${title}"`
+          : immediate
+            ? `Run started for "${title}"`
+            : `Queued "${title}" for optimal usage`,
+      );
       setAttempt((n) => n + 1);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to start run");
@@ -215,6 +245,29 @@ export function EpicDetailView({ slug, epicId }: { slug: string; epicId: string 
                 title="Re-trigger the execute-epic job (resumes from where it stopped)"
               >
                 {running ? "Starting…" : "Force run"}
+              </Button>
+            </>
+          ) : budgetAware ? (
+            // Budget-aware project: let the operator choose immediate execution vs pacing for optimal
+            // usage (anton-d8i4). "Approve" runs now (bypasses weekly/daytime pacing, keeps the
+            // session floor); "Queue" hands the run to the governor's pace-line.
+            <>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => handleRun(epic.title, { immediate: false })}
+                disabled={running}
+                title="Queue this run for the budget governor to pace against the weekly plan"
+              >
+                {running ? "…" : "Queue"}
+              </Button>
+              <Button
+                size="sm"
+                onClick={() => handleRun(epic.title, { immediate: true })}
+                disabled={running}
+                title="Approve and run now, bypassing budget pacing (the session limit still applies)"
+              >
+                {running ? "Starting…" : "Approve"}
               </Button>
             </>
           ) : (

@@ -252,6 +252,32 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
     const jobs = await executeEpicJobs(epic);
     expect(jobs).toHaveLength(1);
     expect(jobs[0].status).toBe("queued");
+    // A pure take-over is an ownership change, not a run-now request: `{ steal: true }` carries no
+    // `immediate` field, so the enqueued job must NOT get the bypassBudget promotion — otherwise a
+    // paced ("Queue for optimal usage") choice would be silently overridden on transfer.
+    const payload = JSON.parse(jobs[0].payloadJson ?? "{}") as { bypassBudget?: unknown };
+    expect(payload.bypassBudget).toBeUndefined();
+  });
+
+  it("take-over with an explicit immediate: true enqueues a run-now (bypassBudget) job", async () => {
+    // The counterpart: when the caller explicitly asks the take-over to also run now, the intent
+    // rides into the enqueue as bypassBudget — only the defaulted (absent) immediate is suppressed.
+    const epic = await beads.create(repo, { title: "Immediate take-over", type: "epic" });
+    const child = await beads.create(repo, { title: "Immediate take-over child", type: "task" });
+    await beads.link(repo, child, epic, "parent-child");
+    await beads.assign(repo, epic, "someone-else");
+    await beads.approve(repo, epic);
+
+    actAs("anton-test");
+    const res = await POST(
+      jsonRequest("POST", { steal: true, immediate: true }),
+      ctx("approvy", epic),
+    );
+    expect(res.status).toBe(200);
+    const jobs = await executeEpicJobs(epic);
+    expect(jobs).toHaveLength(1);
+    const payload = JSON.parse(jobs[0].payloadJson ?? "{}") as { bypassBudget?: unknown };
+    expect(payload.bypassBudget).toBe(true);
   });
 
   it("does not enqueue a second local job when taking over a ready target this instance already runs", async () => {

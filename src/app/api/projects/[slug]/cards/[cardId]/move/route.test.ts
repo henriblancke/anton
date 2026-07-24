@@ -6,7 +6,9 @@
  * (the non-blocking poll path), and revert the just-moved card. The route therefore mirrors the GET
  * forced-reload path: it AWAITS a fresh read before building the board (so the board reflects the
  * move, never the retained pre-move snapshot) and returns it, falling back to last-good on a bd
- * failure rather than 500-ing the move.
+ * failure rather than 500-ing the move. Both post-write reads are fail-soft: once `moveCard`
+ * persisted, a refresh/build failure answers a boardless `{ ok: true }` instead of a 500 that would
+ * make the client roll back a move that landed (PR #68 review).
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -85,6 +87,21 @@ describe("POST /cards/[cardId]/move — returns the post-move board (anton-4g35)
     expect(res.status).toBe(200);
     expect((await res.json()).board.version).toBe("3:sync");
     expect(getBoard).toHaveBeenCalledOnce();
+  });
+
+  it("answers a boardless { ok: true } when the post-move board rebuild fails (no 500)", async () => {
+    // The move already persisted — a getBoard failure (cold route with no retained snapshot, bd
+    // timeout) must not 500 and make the client roll back a landed move. The client guards on
+    // `data?.board`, so a boardless ok keeps its optimistic state until a later refresh reconciles.
+    getBoard.mockRejectedValueOnce(new Error("no snapshot"));
+
+    const res = await POST(moveReq("done"), ctx("tmp", "anton-6"));
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; board?: unknown };
+    expect(body.ok).toBe(true);
+    expect(body.board).toBeUndefined();
+    expect(moveCard).toHaveBeenCalledOnce();
   });
 
   it("rejects an invalid toStage without moving or reading the board", async () => {

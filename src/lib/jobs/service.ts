@@ -12,8 +12,10 @@ import {
   getProjectById,
   getProjectSettings,
   listProjects,
+  resolveBudgetPolicy as resolveBudgetPolicyFromSettings,
 } from "../projects";
 import { beads } from "../beads/bd";
+import { allIssues } from "../beads/issues";
 import { assertRepoSchemaCurrent, preflightBd } from "../beads/bd-bin";
 import { hasLocalDoltDb } from "../beads/config.mjs";
 import { makeExecuteEpicHandler } from "./execute-epic";
@@ -56,6 +58,20 @@ async function resolvePolicy(projectId: string | undefined) {
 }
 
 /**
+ * Per-project budget policy for the proactive governor (anton-szld), gated by the budget-aware
+ * master-switch (anton-7mpv.1). Returns `null` unless the project has `budgetAware` turned ON — off is
+ * the default — which the runner reads as "not governed": it never defers that project's work AND
+ * never reads Claude usage on its behalf, so the nav usage pill isn't starved of the shared cache.
+ * When on, it projects the operator's knobs onto the governor's full {@link BudgetPolicy}. A
+ * project-less job is never budget-aware (empty settings → off).
+ */
+async function resolveBudgetPolicy(projectId: string | undefined) {
+  const settings = projectId ? await getProjectSettings(getDb(), projectId) : {};
+  if (!settings.budgetAware) return null;
+  return resolveBudgetPolicyFromSettings(settings);
+}
+
+/**
  * Cross-machine run-liveness source for the runner (anton-jz1). Reads the shared beads board to
  * tell whether an execute-epic run is already live for this epic on ANOTHER machine — the `jobs`
  * table is machine-local, so a Force run on machine B can't otherwise see a run executing on
@@ -79,6 +95,23 @@ async function liveRunCheck(projectId: string, epicBeadId: string): Promise<bool
   }
 }
 
+/**
+ * Bead-label source for the runner's per-job value gate (anton-k05r): the labels of a queued
+ * execute-epic job's target bead, so `jobValueScore` can rank governed work at lease time. Serves
+ * off the shared issue snapshot (warm within its max-age) rather than `bd show`, so the 2s runner
+ * tick never spawns bd per queued job. Returns `null` on any miss — the gate fails open on null.
+ */
+async function readBeadLabels(projectId: string, beadId: string): Promise<readonly string[] | null> {
+  try {
+    const project = await getProjectById(getDb(), projectId);
+    if (!project) return null;
+    const bead = (await allIssues(project.repoPath)).find((b) => b.id === beadId);
+    return bead?.labels ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export function getRunner(): JobRunner {
   if (_runner) return _runner;
   const db = getDb();
@@ -88,7 +121,9 @@ export function getRunner(): JobRunner {
     log,
     config: { maxConcurrent: GLOBAL_MAX_CONCURRENT },
     resolvePolicy,
+    resolveBudgetPolicy,
     liveRunCheck,
+    readBeadLabels,
   });
   runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db }));
   runner.registerHandler("review-fix", makeReviewFixHandler({ db }));
@@ -151,8 +186,9 @@ export async function startRunner(): Promise<void> {
 export function enqueueExecuteEpic(
   projectId: string,
   epicBeadId: string,
+  opts?: { bypassBudget?: boolean },
 ): Promise<string | undefined> {
-  return getRunner().enqueueExecuteEpic(projectId, epicBeadId);
+  return getRunner().enqueueExecuteEpic(projectId, epicBeadId, opts);
 }
 
 /**
@@ -165,8 +201,9 @@ export function enqueueExecuteEpic(
 export function enqueueExecuteEpicIfAbsent(
   projectId: string,
   epicBeadId: string,
+  opts?: { bypassBudget?: boolean },
 ): Promise<string | undefined> {
-  return Promise.resolve(getRunner().enqueueExecuteEpicIfAbsent(projectId, epicBeadId));
+  return Promise.resolve(getRunner().enqueueExecuteEpicIfAbsent(projectId, epicBeadId, opts));
 }
 
 /**

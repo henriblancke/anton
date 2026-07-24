@@ -11,10 +11,13 @@ import { EpicCard } from "@/components/board/epic-card";
 export function DraggableEpicCard({
   slug,
   epic,
+  budgetAware = false,
   onDeleted,
 }: {
   slug: string;
   epic: Epic;
+  /** Project budget-aware flag (anton-y2ue): forwarded to the card for the Approve/Queue split. */
+  budgetAware?: boolean;
   onDeleted?: (epicId: string) => void;
 }) {
   const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, isDragging } =
@@ -38,7 +41,7 @@ export function DraggableEpicCard({
       >
         <GripVerticalIcon className="size-3.5" aria-hidden="true" />
       </button>
-      <EpicCard slug={slug} epic={epic} onDeleted={onDeleted} />
+      <EpicCard slug={slug} epic={epic} budgetAware={budgetAware} onDeleted={onDeleted} />
     </div>
   );
 }

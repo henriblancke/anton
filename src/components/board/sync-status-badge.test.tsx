@@ -19,7 +19,9 @@ describe("SyncStatusBadge", () => {
   it("shows a live 'synced' chip when caught up", () => {
     const html = renderToStaticMarkup(<SyncStatusBadge sync={makeSync()} />);
     expect(html).toContain("Live");
-    expect(html).toContain("synced");
+    // The relative "· synced Xs ago" suffix is client-only (it depends on the current time, so
+    // rendering it during SSR caused a hydration mismatch) — it is intentionally absent here.
+    expect(html).not.toContain("ago");
   });
 
   it("shows a syncing spinner while a pass is in flight", () => {

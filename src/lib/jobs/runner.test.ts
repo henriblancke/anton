@@ -7,13 +7,18 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
+import { getBurnAverage, recordBurnSample } from "../burn";
+import type { ClaudeUsage } from "../claude/usage";
 import { PoisonError, RunAlreadyLiveError, UsageLimitError } from "./errors";
 import { complete, enqueue, getJob, park, reschedule, toMs, type Clock } from "./queue";
+import { DEFAULT_BUDGET_POLICY, type BudgetPolicy } from "./budget";
 import {
   classifyError,
   DEFAULT_CONFIG,
   JobRunner,
   nextAction,
+  type BeadLabelsReader,
+  type BudgetPolicyResolver,
   type JobHandler,
   type JobPolicy,
   type JobPolicyResolver,
@@ -1019,6 +1024,792 @@ describe("JobRunner (live, in-memory db)", () => {
     await r.whenIdle();
     expect((await getJob(tdb.db, bypassed))?.status).toBe("queued");
     expect((await getJob(tdb.db, other))?.status).toBe("done");
+  });
+});
+
+describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
+  let tdb: TestDb;
+  let clock: FakeClock;
+  beforeEach(() => {
+    tdb = makeTestDb();
+    clock = new FakeClock(1_700_000_000_000);
+  });
+  afterEach(() => tdb.close());
+
+  const usage = (sessionPct: number, weeklyPct: number): ClaudeUsage => ({
+    sessionPct,
+    weeklyPct,
+    sessionResetAt: null,
+    weeklyResetAt: null,
+    plan: "max",
+  });
+
+  // Burn sampling is gated behind the budget-aware opt-in (anton-7mpv.1) — these tests wire a
+  // resolver that opts every project in; the feature-off tests below omit it.
+  const budgetAware: BudgetPolicyResolver = () => DEFAULT_BUDGET_POLICY;
+
+  it("persists the session%/weekly% delta across a job, attributed to its type", async () => {
+    // Pre-job snapshot via the cached read, post-job via the FRESH (TTL-bypassing) read:
+    // 10%→30% session, 5%→8% weekly.
+    const r = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: CONFIG,
+      resolveBudgetPolicy: budgetAware,
+      readUsage: async () => usage(10, 5),
+      readUsageFresh: async () => usage(30, 8),
+    });
+    r.registerHandler("execute-epic", async () => {});
+    await r.enqueue({ type: "execute-epic" });
+    await r.tickOnce();
+    await r.whenIdle();
+
+    const avg = await getBurnAverage(tdb.db, "execute-epic", 1);
+    expect(avg.seeded).toBe(false);
+    expect(avg.sessionAvg).toBe(20);
+    expect(avg.weeklyAvg).toBe(3);
+  });
+
+  it("closes the window with the fresh read, never the cached one (anti zero-delta)", async () => {
+    // A cached after-read inside the TTL returns the same snapshot as the before-read → a bogus
+    // 0% delta. The sampler must go through the fresh reader for the closing measurement.
+    let freshCalls = 0;
+    const r = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: CONFIG,
+      resolveBudgetPolicy: budgetAware,
+      readUsage: async () => usage(10, 5), // the stale cache entry, before AND after
+      readUsageFresh: async () => {
+        freshCalls += 1;
+        return usage(25, 7);
+      },
+    });
+    r.registerHandler("execute-epic", async () => {});
+    await r.enqueue({ type: "execute-epic" });
+    await r.tickOnce();
+    await r.whenIdle();
+
+    expect(freshCalls).toBe(1);
+    const avg = await getBurnAverage(tdb.db, "execute-epic", 1);
+    expect(avg.sessionAvg).toBe(15); // 25 − 10, not the cached self-subtraction's 0
+  });
+
+  it("records NO sample on a null usage read and still completes the job", async () => {
+    const r = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: CONFIG,
+      resolveBudgetPolicy: budgetAware,
+      readUsage: async () => null,
+      readUsageFresh: async () => null,
+    });
+    r.registerHandler("execute-epic", async () => {});
+    const id = await r.enqueue({ type: "execute-epic" });
+    await r.tickOnce();
+    await r.whenIdle();
+
+    expect((await getJob(tdb.db, id))?.status).toBe("done");
+    const rows = await tdb.db.select().from(schema.burnSamples);
+    expect(rows).toHaveLength(0);
+  });
+
+  it("never fails a job when the usage read throws", async () => {
+    const boom = async (): Promise<ClaudeUsage | null> => {
+      throw new Error("usage endpoint down");
+    };
+    const r = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: CONFIG,
+      resolveBudgetPolicy: budgetAware,
+      readUsage: boom,
+      readUsageFresh: boom,
+    });
+    r.registerHandler("execute-epic", async () => {});
+    const id = await r.enqueue({ type: "execute-epic" });
+    await r.tickOnce();
+    await r.whenIdle();
+
+    expect((await getJob(tdb.db, id))?.status).toBe("done");
+    const rows = await tdb.db.select().from(schema.burnSamples);
+    expect(rows).toHaveLength(0);
+  });
+
+  it("records NO samples for jobs whose windows overlap (attribution needs a solo window)", async () => {
+    // Two jobs in flight at once: each window would include the sibling's burn, double-counting
+    // across types. Neither may record a sample; a later solo job samples normally again.
+    let reads = 0;
+    const r = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { ...CONFIG, maxConcurrent: 2 },
+      resolveBudgetPolicy: budgetAware,
+      readUsage: async () => usage(10, 5),
+      readUsageFresh: async () => {
+        reads += 1;
+        return usage(30, 8);
+      },
+    });
+    r.registerHandler("execute-epic", async () => {});
+    r.registerHandler("review-fix", async () => {});
+    await r.enqueue({ type: "execute-epic" });
+    await r.enqueue({ type: "review-fix" });
+    expect(await r.tickOnce()).toBe(2); // both leased into the same tick → overlapping windows
+    await r.whenIdle();
+
+    expect(reads).toBe(0); // contaminated windows never even take the closing read
+    expect(await tdb.db.select().from(schema.burnSamples)).toHaveLength(0);
+
+    // Solo follow-up job still samples.
+    await r.enqueue({ type: "execute-epic" });
+    await r.tickOnce();
+    await r.whenIdle();
+    expect(await tdb.db.select().from(schema.burnSamples)).toHaveLength(1);
+  });
+
+  it("never reads usage when the project is not budget-aware (null policy — the feature-off default)", async () => {
+    // The opt-in gate (anton-7mpv.1): a resolver that returns null means budget-aware execution is
+    // off for the project, so a solo job must not open a burn window — neither the pre-job cached
+    // read nor the post-job fresh read may fire (each shells out to credentials and can cache a
+    // transient null into the shared cache the nav pill reads).
+    let cachedReads = 0;
+    let freshReads = 0;
+    const r = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: CONFIG,
+      resolveBudgetPolicy: () => null,
+      readUsage: async () => {
+        cachedReads += 1;
+        return usage(10, 5);
+      },
+      readUsageFresh: async () => {
+        freshReads += 1;
+        return usage(30, 8);
+      },
+    });
+    r.registerHandler("execute-epic", async () => {});
+    const id = await r.enqueue({ type: "execute-epic" });
+    await r.tickOnce();
+    await r.whenIdle();
+
+    expect((await getJob(tdb.db, id))?.status).toBe("done");
+    expect(cachedReads).toBe(0);
+    expect(freshReads).toBe(0);
+    expect(await tdb.db.select().from(schema.burnSamples)).toHaveLength(0);
+  });
+
+  it("throttles the sampler: no fresh read for a second solo job inside the interval", async () => {
+    // The fresh read bypasses the usage cache; with maxConcurrent: 1 every solo completion would
+    // hit the endpoint. burnSampleMinIntervalMs caps that — a second job finishing inside the
+    // window records no sample and takes no fresh read; once the interval elapses, sampling resumes.
+    let freshReads = 0;
+    const r = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { ...CONFIG, burnSampleMinIntervalMs: 60_000 },
+      resolveBudgetPolicy: budgetAware,
+      readUsage: async () => usage(10, 5),
+      readUsageFresh: async () => {
+        freshReads += 1;
+        return usage(30, 8);
+      },
+    });
+    r.registerHandler("execute-epic", async () => {});
+
+    // First solo job samples.
+    await r.enqueue({ type: "execute-epic" });
+    await r.tickOnce();
+    await r.whenIdle();
+    expect(freshReads).toBe(1);
+    expect(await tdb.db.select().from(schema.burnSamples)).toHaveLength(1);
+
+    // Second job 30s later — inside the 60s window — must NOT hit the endpoint.
+    clock.advance(30_000);
+    await r.enqueue({ type: "execute-epic" });
+    await r.tickOnce();
+    await r.whenIdle();
+    expect(freshReads).toBe(1); // unchanged — throttled
+    expect(await tdb.db.select().from(schema.burnSamples)).toHaveLength(1);
+
+    // Past the window — sampling resumes.
+    clock.advance(31_000);
+    await r.enqueue({ type: "execute-epic" });
+    await r.tickOnce();
+    await r.whenIdle();
+    expect(freshReads).toBe(2);
+    expect(await tdb.db.select().from(schema.burnSamples)).toHaveLength(2);
+  });
+
+  it("never reads usage when no budget resolver is wired at all", async () => {
+    // Without a resolveBudgetPolicy dep nothing can be budget-aware, so the sampler stays fully off.
+    let reads = 0;
+    const count = async () => {
+      reads += 1;
+      return usage(10, 5);
+    };
+    const r = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: CONFIG,
+      readUsage: count,
+      readUsageFresh: count,
+    });
+    r.registerHandler("execute-epic", async () => {});
+    await r.enqueue({ type: "execute-epic" });
+    await r.tickOnce();
+    await r.whenIdle();
+
+    expect(reads).toBe(0);
+    expect(await tdb.db.select().from(schema.burnSamples)).toHaveLength(0);
+  });
+});
+
+describe("JobRunner budget governor admission gate (anton-szld)", () => {
+  let tdb: TestDb;
+  let clock: FakeClock;
+  beforeEach(() => {
+    tdb = makeTestDb();
+    clock = new FakeClock(1_700_000_000_000);
+  });
+  afterEach(() => tdb.close());
+
+  async function seedProjects(...ids: string[]) {
+    const s = await import("../db/schema");
+    for (const id of ids) {
+      await tdb.db
+        .insert(s.projects)
+        .values({ id, slug: id.toLowerCase(), name: id, repoPath: `/tmp/${id}` });
+    }
+  }
+
+  const usage = (over: Partial<ClaudeUsage> = {}): ClaudeUsage => ({
+    sessionPct: 10,
+    weeklyPct: 0,
+    sessionResetAt: null,
+    weeklyResetAt: null,
+    plan: "max",
+    ...over,
+  });
+
+  /** A runner wired with the budget governor: a fixed usage read + a fixed policy for every project. */
+  function budgetRunner(
+    handler: JobHandler,
+    opts: {
+      readUsage: () => Promise<ClaudeUsage | null>;
+      policy?: BudgetPolicy;
+      resolveBudgetPolicy?: BudgetPolicyResolver;
+      readBeadLabels?: BeadLabelsReader;
+    },
+  ) {
+    const r = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { ...CONFIG, maxConcurrent: 5 },
+      readUsage: opts.readUsage,
+      // Keep the burn sampler off the real endpoint — these tests exercise the governor only.
+      readUsageFresh: async () => null,
+      resolveBudgetPolicy: opts.resolveBudgetPolicy ?? (() => opts.policy ?? DEFAULT_BUDGET_POLICY),
+      readBeadLabels: opts.readBeadLabels,
+    });
+    for (const type of ["execute-epic", "review-fix", "nightly-stringer", "orphan-grooming"] as const) {
+      r.registerHandler(type, handler);
+    }
+    return r;
+  }
+
+  it("defers a tick past the reset boundary: leases nothing and reschedules queued work to retryAt", async () => {
+    // Session nearly exhausted (99% ≥ 100 − minSessionHeadroom 5) → session-headroom defer. No known
+    // session reset, so retryAt is now + the 5h session window.
+    await seedProjects("A");
+    let ran = 0;
+    const r = budgetRunner(
+      async () => {
+        ran += 1;
+      },
+      { readUsage: async () => usage({ sessionPct: 99 }) },
+    );
+    const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
+
+    expect(await r.tickOnce()).toBe(0); // held — nothing leased
+    await r.whenIdle();
+    expect(ran).toBe(0);
+    const job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("queued");
+    expect(job?.attempts).toBe(0); // a proactive hold never burns an attempt
+    const expectedRetry = Math.floor((clock.now() + DEFAULT_BUDGET_POLICY.sessionWindowMs) / 1000) * 1000;
+    expect(toMs(job?.runAt)).toBe(expectedRetry);
+    expect(job?.lastError).toMatch(/budget: session-headroom/);
+  });
+
+  it("clears stale budget deferrals when a project's budget-aware pacing turns off", async () => {
+    // A governed tick pushes the queued job past the session horizon; then the operator flips
+    // budgetAware off (resolver → null). leaseDue only scans due rows, so without clearing the
+    // governor's own deferrals the job would stay parked until the stale pace boundary — the next
+    // tick must pull it back to due-now and lease it.
+    await seedProjects("A");
+    let budgetAwareOn = true;
+    let ran = 0;
+    const r = budgetRunner(
+      async () => {
+        ran += 1;
+      },
+      {
+        readUsage: async () => usage({ sessionPct: 99 }),
+        resolveBudgetPolicy: () => (budgetAwareOn ? DEFAULT_BUDGET_POLICY : null),
+      },
+    );
+    const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
+
+    expect(await r.tickOnce()).toBe(0); // governed → deferred to the session horizon
+    const deferred = await getJob(tdb.db, id);
+    expect(toMs(deferred?.runAt)).toBeGreaterThan(clock.now());
+    expect(deferred?.lastError).toMatch(/budget: session-headroom/);
+
+    budgetAwareOn = false; // operator turns pacing off
+    expect(await r.tickOnce()).toBe(1); // stale deferral cleared → leases this tick
+    await r.whenIdle();
+    expect(ran).toBe(1);
+    const job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("done");
+    expect(job?.lastError).toBeNull();
+  });
+
+  it("governs the orphan-grooming cleanup sweep, not just execute-epic", async () => {
+    await seedProjects("A");
+    const r = budgetRunner(async () => {}, { readUsage: async () => usage({ sessionPct: 99 }) });
+    const id = await r.enqueue({ type: "orphan-grooming", projectId: "A" });
+
+    expect(await r.tickOnce()).toBe(0);
+    const job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("queued");
+    expect(job?.lastError).toMatch(/budget:/);
+  });
+
+  it("does NOT govern review-fix or nightly-stringer — they lease immediately even when budget is scarce (anton-d8i4)", async () => {
+    // Session 99% ≥ the floor would defer any governed type, but review-fix / nightly-stringer are
+    // off the allowlist: a human's PR-review fix and the fixed nightly scan must not be paced.
+    await seedProjects("A");
+    let ran = 0;
+    const r = budgetRunner(
+      async () => {
+        ran += 1;
+      },
+      { readUsage: async () => usage({ sessionPct: 99 }) },
+    );
+    const rf = await r.enqueue({ type: "review-fix", projectId: "A" });
+    const ns = await r.enqueue({ type: "nightly-stringer", projectId: "A" });
+
+    expect(await r.tickOnce()).toBe(2); // both leased despite the scarce budget
+    await r.whenIdle();
+    expect(ran).toBe(2);
+    expect((await getJob(tdb.db, rf))?.status).toBe("done");
+    expect((await getJob(tdb.db, ns))?.status).toBe("done");
+  });
+
+  it("runs an immediate-approved (bypassBudget) execute-epic while pacing a queued one (anton-d8i4)", async () => {
+    // Ahead of the weekly pace-line (weekly-on-track), session fresh: a paced job defers, but an
+    // immediate-approved one skips pacing and runs now.
+    await seedProjects("A");
+    const weeklyResetAt = new Date(clock.now() + 3.5 * 24 * 60 * 60 * 1000).toISOString(); // half-week left
+    let ran = 0;
+    const r = budgetRunner(
+      async () => {
+        ran += 1;
+      },
+      { readUsage: async () => usage({ sessionPct: 10, weeklyPct: 80, weeklyResetAt }) },
+    );
+    const paced = await r.enqueue({
+      type: "execute-epic",
+      projectId: "A",
+      payload: { projectId: "A", epicBeadId: "A-1" },
+    });
+    const immediate = await r.enqueue({
+      type: "execute-epic",
+      projectId: "A",
+      payload: { projectId: "A", epicBeadId: "A-2", bypassBudget: true },
+    });
+
+    expect(await r.tickOnce()).toBe(1); // only the immediate job leases
+    await r.whenIdle();
+    expect(ran).toBe(1);
+    expect((await getJob(tdb.db, immediate))?.status).toBe("done");
+    const pacedJob = await getJob(tdb.db, paced);
+    expect(pacedJob?.status).toBe("queued");
+    expect(toMs(pacedJob?.runAt)).toBeGreaterThan(clock.now()); // pushed out to the pace boundary
+    expect(pacedJob?.lastError).toMatch(/budget: weekly-on-track/);
+  });
+
+  it("does NOT reclaim a crashed (lease-expired) paced execute-epic during a paced deferral, while a crashed bypass row reclaims (anton-d8i4)", async () => {
+    // Weekly-on-track pacing defers non-bypass work while immediate work admits. deferQueuedJobs
+    // only moves `queued` rows, so a paced job that was leased and then crashed sits `running`
+    // with an expired lease — it must NOT be reclaimed and restarted ahead of the pace boundary,
+    // while a bypass ("Approve") row in the same crashed state reclaims normally.
+    await seedProjects("A");
+    const s = await import("../db/schema");
+    const seedCrashed = async (id: string, payload: object) => {
+      await tdb.db.insert(s.jobs).values({
+        id,
+        type: "execute-epic",
+        projectId: "A",
+        payloadJson: JSON.stringify(payload),
+        status: "running",
+        runAt: new Date(clock.now() - 100_000),
+        leaseExpiresAt: new Date(clock.now() - 50_000), // already expired — looks reclaimable
+        attempts: 1,
+      });
+    };
+    await seedCrashed("crashed-paced", { projectId: "A", epicBeadId: "A-1" });
+    await seedCrashed("crashed-bypass", { projectId: "A", epicBeadId: "A-2", bypassBudget: true });
+
+    const weeklyResetAt = new Date(clock.now() + 3.5 * 24 * 60 * 60 * 1000).toISOString();
+    let ran = 0;
+    const r = budgetRunner(
+      async () => {
+        ran += 1;
+      },
+      { readUsage: async () => usage({ sessionPct: 10, weeklyPct: 80, weeklyResetAt }) },
+    );
+
+    expect(await r.tickOnce()).toBe(1); // only the bypass row reclaims
+    await r.whenIdle();
+    expect(ran).toBe(1);
+    expect((await getJob(tdb.db, "crashed-bypass"))?.status).toBe("done");
+    // The paced row stays un-reclaimed this tick; it resumes when pacing admits again.
+    const paced = await getJob(tdb.db, "crashed-paced");
+    expect(paced?.status).toBe("running");
+    expect(paced?.attempts).toBe(1); // no reclaim → no new attempt burned
+  });
+
+  it("still holds an immediate-approved execute-epic at the session-headroom floor (anton-d8i4)", async () => {
+    // The session floor is the one hold "Approve" (immediate) does NOT bypass — it protects the tail
+    // of the 5h session, so an immediate run can't blow the cap it would only hit mid-run.
+    await seedProjects("A");
+    let ran = 0;
+    const r = budgetRunner(
+      async () => {
+        ran += 1;
+      },
+      { readUsage: async () => usage({ sessionPct: 99 }) },
+    );
+    const id = await r.enqueue({
+      type: "execute-epic",
+      projectId: "A",
+      payload: { projectId: "A", epicBeadId: "A-1", bypassBudget: true },
+    });
+
+    expect(await r.tickOnce()).toBe(0); // held by the session floor
+    await r.whenIdle();
+    expect(ran).toBe(0);
+    const job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("queued");
+    const expectedRetry = Math.floor((clock.now() + DEFAULT_BUDGET_POLICY.sessionWindowMs) / 1000) * 1000;
+    expect(toMs(job?.runAt)).toBe(expectedRetry);
+    expect(job?.lastError).toMatch(/budget: session-headroom/);
+  });
+
+  it("admits a tick when the governor says work may run", async () => {
+    await seedProjects("A");
+    let ran = 0;
+    const r = budgetRunner(
+      async () => {
+        ran += 1;
+      },
+      { readUsage: async () => usage({ sessionPct: 10 }) },
+    );
+    const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
+
+    expect(await r.tickOnce()).toBe(1);
+    await r.whenIdle();
+    expect(ran).toBe(1);
+    expect((await getJob(tdb.db, id))?.status).toBe("done");
+  });
+
+  it("fails OPEN on a null usage read: no deferral, work leases normally", async () => {
+    await seedProjects("A");
+    let ran = 0;
+    const r = budgetRunner(
+      async () => {
+        ran += 1;
+      },
+      { readUsage: async () => null },
+    );
+    const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
+    const runAtBefore = toMs((await getJob(tdb.db, id))?.runAt);
+
+    expect(await r.tickOnce()).toBe(1); // null usage → governor admits
+    await r.whenIdle();
+    expect(ran).toBe(1);
+    const job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("done");
+    expect(runAtBefore).toBeLessThanOrEqual(clock.now()); // was due; governor never pushed it out
+  });
+
+  it("resumes prior budget deferrals on a null usage read — fail-open admits already-deferred work", async () => {
+    // A governed tick defers the queued job past the session horizon; then the meter goes dark
+    // (429 backoff, credentials hiccup, usage outage). leaseDue only scans due rows, so returning
+    // on the null read without resuming the governor's own deferrals would strand the job until
+    // the stale pace boundary — fail-open must pull it back to due-now and lease it.
+    await seedProjects("A");
+    let meterUp = true;
+    let ran = 0;
+    const r = budgetRunner(
+      async () => {
+        ran += 1;
+      },
+      { readUsage: async () => (meterUp ? usage({ sessionPct: 99 }) : null) },
+    );
+    const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
+
+    expect(await r.tickOnce()).toBe(0); // governed → deferred to the session horizon
+    const deferred = await getJob(tdb.db, id);
+    expect(toMs(deferred?.runAt)).toBeGreaterThan(clock.now());
+    expect(deferred?.lastError).toMatch(/budget: session-headroom/);
+
+    meterUp = false; // meter goes dark
+    expect(await r.tickOnce()).toBe(1); // stale deferral resumed → leases this tick
+    await r.whenIdle();
+    expect(ran).toBe(1);
+    expect((await getJob(tdb.db, id))?.status).toBe("done");
+  });
+
+  it("resumes prior budget deferrals when the gate starts admitting before the old boundary", async () => {
+    // A governed tick defers the queued job to a future runAt; then the budget recovers (usage
+    // drops, or the operator loosens the policy) BEFORE that boundary. leaseDue only scans due
+    // rows, so without resuming the governor's own deferrals on the admit path the job would stay
+    // parked until the stale boundary even though the gate now admits it.
+    await seedProjects("A");
+    let sessionPct = 99; // session exhausted → defer
+    let ran = 0;
+    const r = budgetRunner(
+      async () => {
+        ran += 1;
+      },
+      { readUsage: async () => usage({ sessionPct }) },
+    );
+    const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
+
+    expect(await r.tickOnce()).toBe(0); // governed → deferred to the session horizon
+    const deferred = await getJob(tdb.db, id);
+    expect(toMs(deferred?.runAt)).toBeGreaterThan(clock.now());
+    expect(deferred?.lastError).toMatch(/budget: session-headroom/);
+
+    sessionPct = 10; // budget recovered well before the deferred runAt
+    expect(await r.tickOnce()).toBe(1); // stale deferral resumed → leases this tick
+    await r.whenIdle();
+    expect(ran).toBe(1);
+    expect((await getJob(tdb.db, id))?.status).toBe("done");
+  });
+
+  it("keeps the reactive UsageLimitError backstop working with the governor wired", async () => {
+    // Governor admits (session fresh), but the handler still hits the wall mid-run: the reactive
+    // path must reschedule to the reset and refund the attempt, exactly as without the governor.
+    await seedProjects("A");
+    const resetAt = Math.floor(clock.now() / 1000) + 3600; // seconds
+    const r = budgetRunner(
+      async () => {
+        throw new UsageLimitError("hit the wall", resetAt);
+      },
+      { readUsage: async () => usage({ sessionPct: 10 }) },
+    );
+    const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
+
+    expect(await r.tickOnce()).toBe(1); // governor admitted; the job ran and hit the limit
+    await r.whenIdle();
+    const job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("queued"); // rescheduled, not parked
+    expect(toMs(job?.runAt)).toBe(resetAt * 1000);
+    expect(job?.attempts).toBe(0); // attempt refunded — quota isn't the job's fault
+    expect(job?.lastError).toMatch(/usage-limit/);
+  });
+
+  // ── Per-job value/cost gate (anton-k05r) ──
+  // The clock (1_700_000_000_000 ≈ 22:13 UTC) is NIGHT under the default policy (day 8–22), so the
+  // daytime reserve never holds these ticks: the coarse gate admits and the fine gate decides.
+  // sessionPct 85 → 15% headroom ≤ scarceHeadroomPct 20 → scarce (high-value only).
+
+  /** Labels by bead id for the gate's reader; anything not listed reads as label-less cleanup. */
+  const labelsReader =
+    (byBead: Record<string, string[]>): BeadLabelsReader =>
+    async (_pid, beadId) =>
+      byBead[beadId] ?? [];
+
+  /** Seed enough real burn samples that execute-epic's rolling average is `sessionDelta` (not the L-tier seed). */
+  async function seedBurn(sessionDelta: number) {
+    for (let i = 0; i < 5; i++) {
+      await recordBurnSample(tdb.db, clock, "execute-epic", { sessionDelta, weeklyDelta: 0.1 });
+    }
+  }
+
+  it("value gate: scarce session admits only high-value work, holding cleanup un-deferred (anton-k05r)", async () => {
+    await seedProjects("A");
+    await seedBurn(2); // measured cost 2% — fits the 15% headroom
+    let ran = 0;
+    const r = budgetRunner(
+      async () => {
+        ran += 1;
+      },
+      {
+        readUsage: async () => usage({ sessionPct: 85 }),
+        readBeadLabels: labelsReader({ "A-high": ["risk:high"] }),
+      },
+    );
+    const high = await r.enqueue({
+      type: "execute-epic",
+      projectId: "A",
+      payload: { projectId: "A", epicBeadId: "A-high" },
+    });
+    const low = await r.enqueue({
+      type: "execute-epic",
+      projectId: "A",
+      payload: { projectId: "A", epicBeadId: "A-low" },
+    });
+
+    expect(await r.tickOnce()).toBe(1); // only the risk:high job clears the scarce threshold
+    await r.whenIdle();
+    expect(ran).toBe(1);
+    expect((await getJob(tdb.db, high))?.status).toBe("done");
+    // The held job is untouched — still queued and due (a per-tick hold, not a deferral), no
+    // attempt burned. It re-evaluates next tick and leases the moment budget loosens.
+    const held = await getJob(tdb.db, low);
+    expect(held?.status).toBe("queued");
+    expect(held?.attempts).toBe(0);
+    expect(toMs(held?.runAt)).toBeLessThanOrEqual(clock.now());
+  });
+
+  it("value gate: a job whose cost cannot fit the remaining session is held even at high value", async () => {
+    await seedProjects("A");
+    // No burn samples → execute-epic costs the L-tier seed (20%), over the 15% headroom.
+    const r = budgetRunner(async () => {}, {
+      readUsage: async () => usage({ sessionPct: 85 }),
+      readBeadLabels: labelsReader({ "A-1": ["risk:high"] }),
+    });
+    await r.enqueue({
+      type: "execute-epic",
+      projectId: "A",
+      payload: { projectId: "A", epicBeadId: "A-1" },
+    });
+
+    expect(await r.tickOnce()).toBe(0); // cost-exceeds-headroom — admitting guarantees mid-run exhaustion
+  });
+
+  it("value gate: abundant budget admits low-value cleanup", async () => {
+    await seedProjects("A");
+    const r = budgetRunner(async () => {}, {
+      readUsage: async () => usage({ sessionPct: 10 }), // 90% headroom ≥ abundant 60 → threshold 0
+      readBeadLabels: labelsReader({}),
+    });
+    const id = await r.enqueue({
+      type: "execute-epic",
+      projectId: "A",
+      payload: { projectId: "A", epicBeadId: "A-1" },
+    });
+
+    expect(await r.tickOnce()).toBe(1);
+    await r.whenIdle();
+    expect((await getJob(tdb.db, id))?.status).toBe("done");
+  });
+
+  it("value gate: holds the orphan-grooming cleanup sweep when the session is scarce", async () => {
+    // Grooming carries no bead — it IS the low-value cleanup band — so scarce budget holds it
+    // without any label read, and it drains later when budget is abundant/behind pace.
+    await seedProjects("A");
+    const r = budgetRunner(async () => {}, {
+      readUsage: async () => usage({ sessionPct: 85 }),
+    });
+    const id = await r.enqueue({ type: "orphan-grooming", projectId: "A" });
+
+    expect(await r.tickOnce()).toBe(0);
+    expect((await getJob(tdb.db, id))?.status).toBe("queued");
+  });
+
+  it("value gate: fails open when the bead's labels cannot be read", async () => {
+    await seedProjects("A");
+    await seedBurn(2);
+    const r = budgetRunner(async () => {}, {
+      readUsage: async () => usage({ sessionPct: 85 }),
+      readBeadLabels: async () => null, // bead unresolved → must admit, never starve on a guess
+    });
+    const id = await r.enqueue({
+      type: "execute-epic",
+      projectId: "A",
+      payload: { projectId: "A", epicBeadId: "A-1" },
+    });
+
+    expect(await r.tickOnce()).toBe(1);
+    await r.whenIdle();
+    expect((await getJob(tdb.db, id))?.status).toBe("done");
+  });
+
+  it("value gate: an immediate-approved (bypassBudget) job skips the value gate", async () => {
+    // The operator asked for "now" — only the session floor may hold it, not the value threshold.
+    await seedProjects("A");
+    await seedBurn(2);
+    const r = budgetRunner(async () => {}, {
+      readUsage: async () => usage({ sessionPct: 85 }),
+      readBeadLabels: labelsReader({}), // would score as cleanup and be held if gated
+    });
+    const id = await r.enqueue({
+      type: "execute-epic",
+      projectId: "A",
+      payload: { projectId: "A", epicBeadId: "A-1", bypassBudget: true },
+    });
+
+    expect(await r.tickOnce()).toBe(1);
+    await r.whenIdle();
+    expect((await getJob(tdb.db, id))?.status).toBe("done");
+  });
+
+  it("value gate: holds a reclaimable (lease-expired) low-value retry like its queued twin", async () => {
+    // A crashed low-value job is `running` with an expired lease — leaseDue treats that as
+    // runnable, so without gating it the reclaim would bypass the admission check and spend the
+    // scarce quota. It must be held un-reclaimed — while an admitted high-value QUEUED job in the
+    // same project still leases (the hold must not occupy a concurrency slot).
+    await seedProjects("A");
+    await seedBurn(2);
+    let sessionPct = 85; // scarce → high-value only
+    let ran = 0;
+    const r = budgetRunner(
+      async () => {
+        ran += 1;
+      },
+      {
+        readUsage: async () => usage({ sessionPct }),
+        readBeadLabels: labelsReader({ "A-high": ["risk:high"] }),
+      },
+    );
+    // Crashed mid-run: lease expired, nothing in this process's inFlight.
+    await tdb.db.insert(schema.jobs).values({
+      id: "stuck-low",
+      type: "execute-epic",
+      projectId: "A",
+      payloadJson: JSON.stringify({ projectId: "A", epicBeadId: "A-low" }),
+      status: "running",
+      runAt: new Date(clock.now() - 100_000),
+      leaseExpiresAt: new Date(clock.now() - 50_000),
+      attempts: 1,
+    });
+    const high = await r.enqueue({
+      type: "execute-epic",
+      projectId: "A",
+      payload: { projectId: "A", epicBeadId: "A-high" },
+    });
+
+    expect(await r.tickOnce()).toBe(1); // the high-value queued job — NOT the crashed low-value row
+    await r.whenIdle();
+    expect(ran).toBe(1);
+    expect((await getJob(tdb.db, high))?.status).toBe("done");
+    // The reclaimable row is untouched — still running/expired, no attempt burned (per-tick hold).
+    const held = await getJob(tdb.db, "stuck-low");
+    expect(held?.status).toBe("running");
+    expect(held?.attempts).toBe(1);
+
+    sessionPct = 10; // budget loosens → the hold lifts and the row is reclaimed next tick
+    expect(await r.tickOnce()).toBe(1);
+    await r.whenIdle();
+    expect(ran).toBe(2);
+    expect((await getJob(tdb.db, "stuck-low"))?.status).toBe("done");
   });
 });
 
