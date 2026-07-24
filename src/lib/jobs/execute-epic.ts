@@ -284,7 +284,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
 
       // Re-derive the ticket list from the freshly-pulled board (anton-jz1). `all`/`target`/`tickets`
       // up top were read BEFORE the pull above, so on a cross-machine retry a child ticket another
-      // machine closed — then crashed before stamping `external_ref` — still shows OPEN in that stale
+      // machine closed — then crashed before stamping the PR ref — still shows OPEN in that stale
       // snapshot. The ticket loop (step 4) skips only tickets whose status is `closed`, so iterating
       // the stale list would re-run claude and re-commit work the just-pulled board already reflects as
       // done. Re-list here so those remotely-closed tickets are skipped. Best-effort like the pull: a
@@ -299,7 +299,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           tickets = standaloneRun ? [target] : childrenOf(all, epicBeadId);
           // Adopt the fresh bead for the liveness gates too (anton-jz1). When the `show` above failed
           // but this list succeeds, `leaseTarget` still points at the stale pre-pull snapshot — yet the
-          // completion short-circuit (step 0a, reads `external_ref`) and the foreign-lease gate below
+          // completion short-circuit (step 0a, reads the PR ref via getPrRef) and the foreign-lease gate below
           // read `leaseTarget`. Leaving it stale would let a run whose completion/lease is visible in
           // this fresh list fall through into worktree/PR handling instead of finishing idempotently.
           leaseTarget = freshTarget;
@@ -314,8 +314,8 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //     already carried this epic all the way to in-review: opened the PR, stamped the external
       //     ref, and cleared its lease on settle. Without this gate the loser would proceed, skip the
       //     already-closed tickets, and re-enter the PR step — creating a duplicate/empty PR or parking
-      //     on a `gh "a pull request already exists"` failure. The external ref is set ONLY by a
-      //     completed PR step (step 5, setExternalRef), but its mere PRESENCE is NOT proof another run
+      //     on a `gh "a pull request already exists"` failure. The PR ref is set ONLY by a
+      //     completed PR step (step 5, setPrRef), but its mere PRESENCE is NOT proof another run
       //     finished: review-fix deliberately LEAVES the ref on a bead whose PR was CLOSED without
       //     merging so a Run/Force run can recover it. So a ref only marks completion when its PR is
       //     still live — open (review in flight) or merged; a closed-unmerged ref is stale and must
@@ -326,7 +326,11 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //     can't re-park an epic that's already complete, and BEFORE adopting/publishing any lease so
       //     `finally` clears nothing we don't own. A stale board read (pull/show failed) simply won't
       //     show the ref yet and falls through to the lease gate below.
-      if (leaseTarget.external_ref) {
+      // Read the PR pointer through the seam (anton-76ej): `metadata.pr`, or a legacy `gh-*`
+      // external_ref as a fallback. A tracker URL parked in external_ref (e.g. Linear) is NOT a PR
+      // pointer, so getPrRef ignores it — enabling a tracker integration can never trip this guard.
+      const prRef = beads.getPrRef(leaseTarget);
+      if (prRef) {
         // Distinguish a stale (closed-without-merging) ref from one that proves completion (anton-jz1).
         // Only an OPEN or MERGED PR means another run carried this epic to the finish; a CLOSED-unmerged
         // ref is what review-fix leaves for recovery, so DON'T short-circuit on it — fall through and let
@@ -340,7 +344,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         // RunAlreadyLiveError is reserved for real lease/liveness conflicts, which the runner refunds and
         // retries indefinitely because a foreign run may legitimately hold the lease for a long time — an
         // unreadable ref is a local failure to resolve, not that, so it must count against the budget.
-        const prState = await pullRequestState(repo, leaseTarget.external_ref);
+        const prState = await pullRequestState(repo, prRef);
         if (prState === "unknown") {
           throw new Error(
             `${epicBeadId} carries a PR ref but its state can't be read (gh unavailable or the ref is ` +
@@ -351,7 +355,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         }
         if (prState === "open" || prState === "merged") {
           // Sweep this run's OWN leftover lease before the idempotent short-circuit (anton-jz1). If this
-          // attempt resumes after a crash that landed the external ref (step 5, setExternalRef) but died
+          // attempt resumes after a crash that landed the PR ref (step 5, setPrRef) but died
           // before `finally` cleared its run-lease, `leaseTarget` still carries an unexpired
           // `run-lease:…:<runId>` this run published. The general lease-adoption step (`leaseLabels =
           // runLeaseLabels(...)`) runs AFTER this return, so without adopting here `finally` would clear
@@ -361,7 +365,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           // own" (the same reason this gate precedes the general adoption below).
           leaseLabels = beads.ownRunLeaseLabels(leaseTarget, runId);
           // Restore the in-review board state before returning (anton-jz1). An epic run that crashed
-          // AFTER setExternalRef (step 5) but before the stage updates at the tail of step 5 leaves the
+          // AFTER setPrRef (step 5) but before the stage updates at the tail of step 5 leaves the
           // epic on stage:implementing with no stage:in-review. review-fix sweeps only stage:in-review
           // targets (see review-fix.ts), so without re-applying it here the run is marked done yet its
           // PR never enters the automated review/finalization path. Idempotent — a run that already
@@ -815,7 +819,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         // advertise work this PR doesn't contain (anton-6xj0).
         body: prBody(target, live),
       });
-      await safe(() => beads.setExternalRef(repo, epicBeadId, pr.ref));
+      await safe(() => beads.setPrRef(repo, epicBeadId, pr.ref));
       if (!standaloneRun) {
         await safe(() => beads.tag(repo, epicBeadId, [inReview]));
         await safe(() => beads.untag(repo, epicBeadId, [LABELS.stage("implementing")]));

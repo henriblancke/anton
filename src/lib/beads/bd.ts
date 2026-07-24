@@ -48,6 +48,13 @@ export const LABELS = {
 const RUN_LEASE_PREFIX = "run-lease:";
 
 /**
+ * Shape of a GitHub PR pointer (`gh-<number>`). The ONLY `external_ref` value anton treats as a PR:
+ * the getPrRef fallback honors it until the one-time migration (anton-ftar) moves it to metadata.pr,
+ * and that migration clears external_ref ONLY for refs matching this — a tracker URL is left alone.
+ */
+export const GH_PR_REF = /^gh-\d+$/i;
+
+/**
  * Parse a `run-lease:<expiry>[:<owner>]` label into its expiry (ms epoch) and optional owner (the
  * publishing run's id, anton-jz1). `expiry` is undefined for a malformed/non-numeric value. A label
  * with no `:<owner>` suffix (legacy format, or a liveness-only publish) parses `owner: undefined`.
@@ -522,6 +529,36 @@ export const beads = {
   /** Attach the PR to the bead as its external reference (git-shareable). */
   setExternalRef: (cwd: string, id: string, ref: string) =>
     bdWrite(cwd, ["update", id, "--external-ref", ref]),
+
+  /**
+   * Write the PR pointer to `metadata.pr` — the single seam anton uses for the PR link (anton-is7x).
+   * Keeping it out of `external_ref` frees that field for tracker integrations; every read goes
+   * through getPrRef, every write through here, so no call site touches `external_ref` for PRs.
+   */
+  setPrRef: (cwd: string, id: string, ref: string) =>
+    bdWrite(cwd, ["update", id, "--set-metadata", `pr=${ref}`]),
+
+  /**
+   * Read a bead's PR pointer through the seam (anton-is7x). `metadata.pr` is authoritative; until the
+   * one-time migration (anton-ftar) moves legacy pointers over, a `gh-*` `external_ref` is honored as
+   * a fallback. A NON-`gh-` `external_ref` (e.g. a tracker URL) is deliberately ignored — external_ref
+   * is no longer the PR channel, so a tracker link there must never read as a PR / in-review.
+   */
+  getPrRef: (b: Bead): string | undefined => {
+    const pr = b.metadata?.pr;
+    if (typeof pr === "string" && pr) return pr;
+    const ref = b.external_ref;
+    return ref && GH_PR_REF.test(ref) ? ref : undefined;
+  },
+
+  /**
+   * One-time cutover primitive (anton-ftar): move a legacy `gh-*` external_ref onto `metadata.pr`
+   * and clear external_ref in a SINGLE atomic `bd update` — no partial state to recover from. Only
+   * ever called for gh- shaped refs (see planPrRefMigration), so a tracker URL in external_ref is
+   * never touched. `--external-ref ""` is bd's clear-the-field form (like `--defer ""`).
+   */
+  migratePrRef: (cwd: string, id: string, ref: string) =>
+    bdWrite(cwd, ["update", id, "--set-metadata", `pr=${ref}`, "--external-ref", ""]),
 
   /**
    * Append to a bead's notes blob (`bd note`). `actor` attributes the write in bd's audit trail —
