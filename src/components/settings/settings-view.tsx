@@ -26,6 +26,13 @@ interface EditableSettings {
   agents?: string[];
   autonomy?: boolean;
   conventionalCommits?: boolean;
+  /** Budget-aware execution master-switch (anton-7mpv.1); off by default. Gates the knobs below. */
+  budgetAware?: boolean;
+  /** Operator budget policy (anton-egrg); only the two exposed knobs round-trip through this form. */
+  budgetPolicy?: {
+    daytimeReservePct?: number;
+    weeklyTargetPct?: number;
+  };
 }
 
 // Defaults mirror the server (src/lib/projects.ts DEFAULT_*); duplicated so this client module
@@ -33,6 +40,9 @@ interface EditableSettings {
 const DEFAULT_CONCURRENCY = 3;
 const DEFAULT_JOB_TIMEOUT_MINUTES = 120; // 2h
 const DEFAULT_MAX_RETRIES = 3;
+// Mirror DEFAULT_PROJECT_BUDGET_POLICY (src/lib/projects.ts) for the two operator-facing knobs.
+const DEFAULT_DAYTIME_RESERVE_PCT = 15;
+const DEFAULT_WEEKLY_TARGET_PCT = 90;
 
 /** Default model options for the headless claude driver. Empty value = the CLI's own default. */
 const MODELS: { value: string; label: string; hint?: string }[] = [
@@ -71,7 +81,7 @@ interface AutomationSchedule {
  */
 interface DiscoveredAgent {
   id: string;
-  source: "project" | "global" | "bundled";
+  source: "project" | "global" | "bundled" | "plugin";
   description?: string;
 }
 
@@ -81,6 +91,7 @@ export function SettingsView({
   basePrompt,
   schedules,
   agents,
+  bundledIds,
 }: {
   project: Project;
   settings: EditableSettings;
@@ -90,12 +101,24 @@ export function SettingsView({
   schedules: AutomationSchedule[];
   /** Every agent this project can assign — bundled + the operator's own .claude/agents. */
   agents: DiscoveredAgent[];
+  /** Ids anton ships as bundled specialists — the only agents the allowlist gates. */
+  bundledIds: string[];
 }) {
   const [active, setActive] = useState<(typeof SECTIONS)[number]["id"]>("general");
-  // The enabled allowlist. Absent persisted value → seed "all discovered on", matching the runtime
-  // rule that an absent allowlist means every agent is active (so a no-op save stays all-active).
+  // The allowlist gates anton's BUNDLED agents only; the project's own `.claude/agents` (an id anton
+  // doesn't ship) always run and are shown separately as "always active", not toggled here
+  // (anton-dvo.1 reversal — see inactiveAgentTickets / ProjectSettings.agents). Partition by
+  // bundled-id membership, NOT by DiscoveredAgent.source: a user override of a bundled name reports
+  // source "global"/"project" but still lives in anton's gated slot.
+  const bundled = new Set(bundledIds);
+  const bundledAgents = agents.filter((a) => bundled.has(a.id));
+  const userAgents = agents.filter((a) => !bundled.has(a.id));
+  // The enabled bundled allowlist. Absent persisted value → seed "all bundled on", matching the
+  // runtime rule that an absent allowlist means every bundled agent is active (so a no-op save
+  // stays all-active). A stored value may carry stale user-agent ids from before the reversal; they
+  // never match a bundled toggle and are pruned by the bundled-only filter on save.
   const [activeAgents, setActiveAgents] = useState<Set<string>>(
-    () => new Set(settings.agents ?? agents.map((a) => a.id)),
+    () => new Set(settings.agents ?? bundledAgents.map((a) => a.id)),
   );
   const [concurrency, setConcurrency] = useState(settings.concurrency ?? DEFAULT_CONCURRENCY);
   const [jobTimeoutMinutes, setJobTimeoutMinutes] = useState(
@@ -105,6 +128,13 @@ export function SettingsView({
   const [autonomy, setAutonomy] = useState(settings.autonomy ?? true);
   const [conventionalCommits, setConventionalCommits] = useState(
     settings.conventionalCommits ?? false,
+  );
+  const [budgetAware, setBudgetAware] = useState(settings.budgetAware ?? false);
+  const [daytimeReservePct, setDaytimeReservePct] = useState(
+    settings.budgetPolicy?.daytimeReservePct ?? DEFAULT_DAYTIME_RESERVE_PCT,
+  );
+  const [weeklyTargetPct, setWeeklyTargetPct] = useState(
+    settings.budgetPolicy?.weeklyTargetPct ?? DEFAULT_WEEKLY_TARGET_PCT,
   );
   // null = no schedule row for this project yet (shown as "not scheduled"; toggling creates it).
   const [automations, setAutomations] = useState<Record<string, boolean | null>>(() =>
@@ -173,11 +203,16 @@ export function SettingsView({
           concurrency,
           jobTimeoutMinutes,
           maxRetries,
-          // The enabled ids, in discovered order. Only ids we actually rendered — a stale id from
-          // a since-deleted agent (still in the seeded set) is pruned rather than re-persisted.
-          agents: agents.filter((a) => activeAgents.has(a.id)).map((a) => a.id),
+          // The enabled BUNDLED ids, in discovered order. Only bundled ids we actually rendered — a
+          // stale id from a since-deleted or user agent (still in the seeded set) is pruned rather
+          // than re-persisted, so user agents never leak into the bundled allowlist.
+          agents: bundledAgents.filter((a) => activeAgents.has(a.id)).map((a) => a.id),
           autonomy,
           conventionalCommits,
+          budgetAware,
+          // Only the two exposed knobs; the server deep-merges into the stored policy, so knobs
+          // set via the API (dayWindow, minSessionHeadroomPct, …) survive a save from this form.
+          budgetPolicy: { daytimeReservePct, weeklyTargetPct },
         }),
       });
       if (!res.ok) {
@@ -247,20 +282,18 @@ export function SettingsView({
 
           <Divider />
 
-          {/* Agents */}
+          {/* Agents — the allowlist gates anton's bundled specialists; your own .claude/agents
+              always run and are listed below as always-active (anton-dvo.1 reversal). */}
           <section className="flex flex-col gap-3.5">
             <div className="flex items-baseline gap-2.5">
               <h2 className="text-[15px] font-semibold">Active agents</h2>
-              <span className="text-xs text-subtle">
-                which agent prompts anton may assign · bundled + your{" "}
-                <span className="font-mono">.claude/agents</span>
-              </span>
+              <span className="text-xs text-subtle">which of anton&apos;s bundled agents dispatch may assign</span>
             </div>
-            {agents.length === 0 ? (
-              <p className="max-w-2xl text-xs text-subtle">No agents discovered for this project.</p>
+            {bundledAgents.length === 0 ? (
+              <p className="max-w-2xl text-xs text-subtle">No bundled agents available.</p>
             ) : (
               <div className="grid max-w-2xl grid-cols-1 gap-2.5 sm:grid-cols-2">
-                {agents.map((agent) => {
+                {bundledAgents.map((agent) => {
                   const on = activeAgents.has(agent.id);
                   return (
                     <div
@@ -276,11 +309,6 @@ export function SettingsView({
                         aria-hidden="true"
                       />
                       <span className="truncate font-mono text-xs">{agent.id}</span>
-                      {agent.source !== "bundled" && (
-                        <span className="shrink-0 rounded-full border border-border px-1.5 py-0.5 text-[9.5px] text-subtle">
-                          {agent.source}
-                        </span>
-                      )}
                       <span className="ml-auto shrink-0">
                         <Toggle
                           checked={on}
@@ -291,6 +319,33 @@ export function SettingsView({
                     </div>
                   );
                 })}
+              </div>
+            )}
+
+            {userAgents.length > 0 && (
+              <div className="flex flex-col gap-2.5">
+                <span className="text-xs text-subtle">
+                  always active · your own agents (<span className="font-mono">.claude/agents</span>{" "}
+                  and installed plugins) — never gated by the allowlist
+                </span>
+                <div className="grid max-w-2xl grid-cols-1 gap-2.5 sm:grid-cols-2">
+                  {userAgents.map((agent) => (
+                    <div
+                      key={agent.id}
+                      className="flex items-center gap-2.5 rounded-[10px] border border-border bg-card px-3 py-2.5"
+                      title={agent.description}
+                    >
+                      <span
+                        className={cn("size-2 shrink-0 rounded-full", agentDotClass(agent.id))}
+                        aria-hidden="true"
+                      />
+                      <span className="truncate font-mono text-xs">{agent.id}</span>
+                      <span className="shrink-0 rounded-full border border-border px-1.5 py-0.5 text-[9.5px] text-subtle">
+                        {agent.source}
+                      </span>
+                    </div>
+                  ))}
+                </div>
               </div>
             )}
           </section>
@@ -494,6 +549,48 @@ export function SettingsView({
                   />
                 </span>
               </div>
+
+              <div className="flex flex-col gap-2.5 rounded-[10px] border border-border bg-card px-3 py-3">
+                <div className="flex items-center gap-2.5">
+                  <div className="flex flex-col gap-0.5">
+                    <span className="text-[12.5px]">Budget-aware execution</span>
+                    <span className="text-[10.5px] text-subtle">
+                      use idle Claude capacity up to a weekly cap · off by default
+                    </span>
+                  </div>
+                  <span className="ml-auto">
+                    <Toggle
+                      checked={budgetAware}
+                      onChange={setBudgetAware}
+                      label="Budget-aware execution"
+                    />
+                  </span>
+                </div>
+                <div
+                  className={cn(
+                    "grid grid-cols-2 gap-3 transition-opacity",
+                    !budgetAware && "pointer-events-none opacity-50",
+                  )}
+                  aria-hidden={!budgetAware}
+                >
+                  <PctField
+                    label="Daytime reserve"
+                    value={daytimeReservePct}
+                    onChange={setDaytimeReservePct}
+                    hint="session held back for interactive daytime use"
+                    disabled={!budgetAware}
+                  />
+                  <PctField
+                    label="Weekly cap"
+                    value={weeklyTargetPct}
+                    onChange={setWeeklyTargetPct}
+                    hint="run freely below this, then stop until reset"
+                    disabled={!budgetAware}
+                    // 0 would disable the weekly cap (no pace data), not cap at zero — server rejects it.
+                    min={1}
+                  />
+                </div>
+              </div>
             </section>
 
             <section className="flex flex-col gap-3.5">
@@ -627,6 +724,47 @@ function GateField({
         aria-label={label}
         className="rounded-lg border border-border bg-card px-3 py-2 font-mono text-[12.5px] text-foreground outline-none placeholder:text-subtle focus:border-primary/60"
       />
+    </label>
+  );
+}
+
+/** A min–100 integer percentage knob for the budget policy (anton-egrg). Clamps on change. */
+function PctField({
+  label,
+  value,
+  onChange,
+  hint,
+  disabled = false,
+  min = 0,
+}: {
+  label: string;
+  value: number;
+  onChange: (value: number) => void;
+  hint?: string;
+  disabled?: boolean;
+  min?: number;
+}) {
+  return (
+    <label className="flex flex-col gap-1.5">
+      <span className="text-[11px] text-subtle">{label}</span>
+      <div className="relative flex items-center rounded-[10px] border border-border bg-card focus-within:border-primary/60">
+        <input
+          type="number"
+          step={1}
+          min={min}
+          max={100}
+          value={value}
+          disabled={disabled}
+          onChange={(e) => {
+            const n = Number(e.target.value);
+            onChange(Number.isFinite(n) ? Math.min(100, Math.max(min, Math.round(n))) : min);
+          }}
+          aria-label={label}
+          className="w-full rounded-[10px] bg-transparent px-3 py-2 pr-8 font-mono text-[12.5px] text-foreground outline-none disabled:cursor-not-allowed"
+        />
+        <span className="pointer-events-none absolute right-3 text-[11px] text-subtle">%</span>
+      </div>
+      {hint && <span className="text-[11px] text-subtle">{hint}</span>}
     </label>
   );
 }

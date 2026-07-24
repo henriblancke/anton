@@ -9,11 +9,13 @@ import { eq } from "drizzle-orm";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
 import {
+  deferQueuedJobs,
   enqueueExecuteEpicDeduped,
   enqueueExecuteEpicIfAbsent,
   getJob,
   resumeJob,
   systemClock,
+  toMs,
 } from "./queue";
 
 let t: TestDb;
@@ -91,6 +93,80 @@ describe("enqueueExecuteEpicDeduped", () => {
   });
 });
 
+describe("bypassBudget payload flag (run-directly, anton-d8i4)", () => {
+  function jobPayload(id: string): Record<string, unknown> {
+    const row = t.db.select().from(schema.jobs).where(eq(schema.jobs.id, id)).get();
+    return JSON.parse(row?.payloadJson ?? "{}") as Record<string, unknown>;
+  }
+
+  it("omits the flag by default (paced) and sets it only when immediate", () => {
+    const paced = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-paced");
+    const now = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-now", { bypassBudget: true });
+    expect(jobPayload(paced).bypassBudget).toBeUndefined();
+    expect(jobPayload(now).bypassBudget).toBe(true);
+  });
+
+  it("promotes an already-queued paced job to immediate: sets the flag, pulls it due now, clears the budget defer", () => {
+    const id = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-1");
+    // Simulate the governor having deferred it: pushed runAt out with a budget lastError.
+    const future = new Date(systemClock.now() + 60 * 60_000);
+    t.db
+      .update(schema.jobs)
+      .set({ runAt: future, lastError: "budget: weekly-on-track — resumes at …" })
+      .where(eq(schema.jobs.id, id))
+      .run();
+
+    const again = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-1", { bypassBudget: true });
+    expect(again).toBe(id); // same job, promoted in place
+    const job = t.db.select().from(schema.jobs).where(eq(schema.jobs.id, id)).get();
+    expect((JSON.parse(job!.payloadJson) as Record<string, unknown>).bypassBudget).toBe(true);
+    expect(toMs(job!.runAt)).toBeLessThanOrEqual(systemClock.now()); // due now, no longer deferred
+    expect(job!.lastError).toBeNull();
+  });
+
+  it("does not promote a paced re-approve (leaves the existing job untouched)", () => {
+    const id = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-1", { bypassBudget: true });
+    const before = t.db.select().from(schema.jobs).where(eq(schema.jobs.id, id)).get();
+    const again = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-1"); // paced re-approve
+    expect(again).toBe(id);
+    const after = t.db.select().from(schema.jobs).where(eq(schema.jobs.id, id)).get();
+    // A paced re-approve must not strip a prior immediate flag nor rewrite runAt.
+    expect(after!.payloadJson).toBe(before!.payloadJson);
+  });
+});
+
+describe("deferQueuedJobs bypass filter (anton-d8i4)", () => {
+  async function deferMs(id: string) {
+    return toMs((await getJob(t.db, id))?.runAt);
+  }
+  const RETRY = () => systemClock.now() + 2 * 60 * 60_000;
+
+  it("bypass:'exclude' defers only paced rows; bypass:'only' defers only immediate rows", async () => {
+    const paced = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-paced");
+    const now = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-now", { bypassBudget: true });
+    const retry = RETRY();
+
+    const excluded = await deferQueuedJobs(t.db, systemClock, {
+      types: ["execute-epic"],
+      projectId: "p1",
+      retryAtMs: retry,
+      bypass: "exclude",
+    });
+    expect(excluded).toBe(1); // only the paced row moved
+    expect(await deferMs(paced)).toBe(Math.floor(retry / 1000) * 1000);
+    expect(await deferMs(now)).toBeLessThanOrEqual(systemClock.now()); // immediate row untouched
+
+    const onlyImmediate = await deferQueuedJobs(t.db, systemClock, {
+      types: ["execute-epic"],
+      projectId: "p1",
+      retryAtMs: retry,
+      bypass: "only",
+    });
+    expect(onlyImmediate).toBe(1); // now the immediate row moves
+    expect(await deferMs(now)).toBe(Math.floor(retry / 1000) * 1000);
+  });
+});
+
 describe("enqueueExecuteEpicIfAbsent (take-over path, anton-i71)", () => {
   it.each(["queued", "running", "parked", "failed"] as const)(
     "reuses a %s prior job (covering) and enqueues nothing new",
@@ -120,6 +196,53 @@ describe("enqueueExecuteEpicIfAbsent (take-over path, anton-i71)", () => {
     const id = enqueueExecuteEpicIfAbsent(t.db, systemClock, "p1", "epic-solo");
     expect(id).toBeDefined();
     expect(activeRows()).toHaveLength(1);
+  });
+
+  it("promotes a covering queued paced job when taking over with bypassBudget (run-now intent)", async () => {
+    // Operator A queued the epic for optimal usage; the governor deferred it to the pace boundary.
+    const paced = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-1");
+    const future = new Date(systemClock.now() + 60 * 60_000);
+    t.db
+      .update(schema.jobs)
+      .set({ runAt: future, lastError: "budget: weekly-on-track — resumes at …" })
+      .where(eq(schema.jobs.id, paced))
+      .run();
+
+    // Operator B takes it over with "Approve & run" (immediate → bypassBudget). No new job, but the
+    // covering row must be promoted — flag set, due now — or the "run now" intent is silently dropped.
+    expect(
+      enqueueExecuteEpicIfAbsent(t.db, systemClock, "p1", "epic-1", { bypassBudget: true }),
+    ).toBeUndefined();
+    const job = await getJob(t.db, paced);
+    expect((JSON.parse(job!.payloadJson) as Record<string, unknown>).bypassBudget).toBe(true);
+    expect(toMs(job!.runAt)).toBeLessThanOrEqual(systemClock.now());
+    expect(job!.lastError).toBeNull();
+  });
+
+  it.each(["running", "parked", "failed"] as const)(
+    "does not promote a covering %s job on a bypassBudget take-over",
+    async (status) => {
+      const prior = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-1");
+      const before = await getJob(t.db, prior);
+      t.db.update(schema.jobs).set({ status }).where(eq(schema.jobs.id, prior)).run();
+
+      expect(
+        enqueueExecuteEpicIfAbsent(t.db, systemClock, "p1", "epic-1", { bypassBudget: true }),
+      ).toBeUndefined();
+      const after = await getJob(t.db, prior);
+      // Non-queued covering rows are left for their own lifecycle (running settles; parked resumes).
+      expect(after!.payloadJson).toBe(before!.payloadJson);
+      expect(toMs(after!.runAt)).toBe(toMs(before!.runAt));
+    },
+  );
+
+  it("leaves a covering queued paced job untouched on a paced (non-bypass) take-over", async () => {
+    const paced = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-1");
+    const before = await getJob(t.db, paced);
+
+    expect(enqueueExecuteEpicIfAbsent(t.db, systemClock, "p1", "epic-1")).toBeUndefined();
+    const after = await getJob(t.db, paced);
+    expect(after!.payloadJson).toBe(before!.payloadJson);
   });
 });
 

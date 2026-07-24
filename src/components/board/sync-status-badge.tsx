@@ -1,16 +1,53 @@
 "use client";
 
 import { CloudOffIcon, LoaderIcon, TriangleAlertIcon, UploadIcon } from "lucide-react";
+import { useSyncExternalStore } from "react";
 import { deriveSyncBadge } from "@/lib/sync-status";
 import type { SyncStatusView } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
-function ago(msEpoch: number): string {
-  const s = Math.max(0, Math.round((Date.now() - msEpoch) / 1000));
+function ago(msEpoch: number, now: number): string {
+  const s = Math.max(0, Math.round((now - msEpoch) / 1000));
   if (s < 60) return `${s}s ago`;
   const m = Math.round(s / 60);
   if (m < 60) return `${m}m ago`;
   return `${Math.round(m / 60)}h ago`;
+}
+
+// A shared 1-second wall-clock exposed through useSyncExternalStore. The server snapshot is `null`,
+// so SSR and the first client render agree (no relative text) — computing a relative label during
+// render otherwise made them disagree by ~1s → a hydration mismatch (anton). After hydration the
+// client reads the live time and re-renders each tick. getSnapshot returns the cached tick value
+// (not a fresh Date.now()) so it stays stable between ticks, as useSyncExternalStore requires.
+let clockValue: number | null = null;
+const clockListeners = new Set<() => void>();
+let clockTimer: ReturnType<typeof setInterval> | null = null;
+
+function subscribeClock(onChange: () => void): () => void {
+  clockListeners.add(onChange);
+  if (clockTimer === null) {
+    clockValue = Date.now();
+    clockTimer = setInterval(() => {
+      clockValue = Date.now();
+      for (const l of clockListeners) l();
+    }, 1_000);
+  }
+  return () => {
+    clockListeners.delete(onChange);
+    if (clockListeners.size === 0 && clockTimer !== null) {
+      clearInterval(clockTimer);
+      clockTimer = null;
+    }
+  };
+}
+
+/** Live wall-clock: `null` until mount (SSR-safe), then the current epoch-ms, ticking each second. */
+function useLiveNow(): number | null {
+  return useSyncExternalStore(
+    subscribeClock,
+    () => clockValue,
+    () => null,
+  );
 }
 
 /** "1 unpushed" / "3 unpushed" — the operator-visible backlog count. */
@@ -28,12 +65,13 @@ const base =
  * chip — so a stuck push is impossible to miss without reading server logs (anton-rn88).
  */
 export function SyncStatusBadge({ sync }: { sync: SyncStatusView }) {
+  const now = useLiveNow();
   switch (deriveSyncBadge(sync)) {
     case "synced":
       return (
         <span className={cn(base, "border-emerald-500/30 text-emerald-600 dark:text-emerald-400")}>
           <span className="size-1.5 rounded-full bg-emerald-500" aria-hidden="true" />
-          Live{sync.lastSyncedAt ? ` · synced ${ago(sync.lastSyncedAt)}` : ""}
+          Live{sync.lastSyncedAt && now !== null ? ` · synced ${ago(sync.lastSyncedAt, now)}` : ""}
         </span>
       );
     case "syncing":
@@ -50,7 +88,7 @@ export function SyncStatusBadge({ sync }: { sync: SyncStatusView }) {
           title={`${unpushedLabel(sync.unpushedCount)} local change${
             sync.unpushedCount === 1 ? "" : "s"
           } committed but not yet pushed to the shared remote — retrying on the next heartbeat.${
-            sync.lastPushedAt ? ` Last pushed ${ago(sync.lastPushedAt)}.` : ""
+            sync.lastPushedAt && now !== null ? ` Last pushed ${ago(sync.lastPushedAt, now)}.` : ""
           }`}
         >
           <UploadIcon className="size-3" aria-hidden="true" />⚠ {unpushedLabel(sync.unpushedCount)} · retrying
@@ -68,7 +106,7 @@ export function SyncStatusBadge({ sync }: { sync: SyncStatusView }) {
           <TriangleAlertIcon className="size-3.5" aria-hidden="true" />
           Sync failing
           {sync.unpushedCount > 0 ? ` · ${unpushedLabel(sync.unpushedCount)}` : ""}
-          {sync.lastPushedAt ? ` · last pushed ${ago(sync.lastPushedAt)}` : ""}
+          {sync.lastPushedAt && now !== null ? ` · last pushed ${ago(sync.lastPushedAt, now)}` : ""}
         </span>
       );
     case "not-wired":

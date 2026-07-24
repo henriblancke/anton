@@ -6,8 +6,8 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ClaudeUsage } from "@/lib/claude/usage";
 
-const getClaudeUsageCached = vi.fn<() => Promise<ClaudeUsage | null>>();
-vi.mock("@/lib/claude/usage", () => ({ getClaudeUsageCached }));
+const getDisplayUsage = vi.fn<() => Promise<ClaudeUsage | null>>();
+vi.mock("@/lib/claude/usage", () => ({ getDisplayUsage }));
 
 const { GET } = await import("./route");
 
@@ -20,7 +20,7 @@ describe("GET /api/usage", () => {
       weeklyResetAt: "2026-07-19T00:00:00+00:00",
       plan: "max",
     };
-    getClaudeUsageCached.mockResolvedValueOnce(usage);
+    getDisplayUsage.mockResolvedValueOnce(usage);
 
     const res = await GET();
 
@@ -29,8 +29,8 @@ describe("GET /api/usage", () => {
     expect(await res.json()).toEqual(usage);
   });
 
-  it("answers 204 with no body when usage is unavailable", async () => {
-    getClaudeUsageCached.mockResolvedValueOnce(null);
+  it("answers 204 with no body when usage is unavailable (last-good exhausted too)", async () => {
+    getDisplayUsage.mockResolvedValueOnce(null);
 
     const res = await GET();
 

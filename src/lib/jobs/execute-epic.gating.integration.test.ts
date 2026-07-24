@@ -11,7 +11,7 @@
  */
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
@@ -363,6 +363,76 @@ process.exit(0);`),
       expect(readFileSync(invLog, "utf8")).toContain(gated);
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
+      await tdb.db
+        .update(schema.projects)
+        .set({ settingsJson: JSON.stringify(baseSettings) })
+        .where(eq(schema.projects.id, projectId));
+    }
+  });
+
+  it("never gates the project's own .claude/agents — a user agent runs despite the allowlist (anton-dvo.1 reversal)", async () => {
+    // The allowlist gates anton's bundled specialists only. A ticket labeled with a user agent
+    // (a `.claude/agents/<id>.md` in the project checkout) must run even when the allowlist omits
+    // it — the operator brought that agent deliberately. This proves execute-epic resolves the
+    // user-agent set from discoverAgents(repo) and exempts it from the gate.
+    mkdirSync(join(repo, ".claude", "agents"), { recursive: true });
+    writeFileSync(
+      join(repo, ".claude", "agents", "prompt-engineer.md"),
+      "---\nname: prompt-engineer\ndescription: user agent\n---\nBe a great prompt engineer.\n",
+    );
+
+    const epicU = await beads.create(repo, {
+      title: "Feature U",
+      type: "epic",
+      description: "## Goal\nU",
+    });
+    await beads.approve(repo, epicU);
+    const userTicket = (() => {
+      const p = JSON.parse(
+        execFileSync(
+          "bd",
+          ["create", "User-agent ticket", "--type", "task", "--parent", epicU, "--labels", "agent:prompt-engineer", "--acceptance", "x", "--json"],
+          { cwd: repo, encoding: "utf8" },
+        ),
+      );
+      return (Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string;
+    })();
+
+    const [proj] = await tdb.db
+      .select()
+      .from(schema.projects)
+      .where(eq(schema.projects.id, projectId));
+    const baseSettings = JSON.parse(proj.settingsJson) as Record<string, unknown>;
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    try {
+      // Allowlist lists only a bundled agent → prompt-engineer is NOT in it, but it's a user agent,
+      // so the gate must let it through rather than park.
+      await tdb.db
+        .update(schema.projects)
+        .set({ settingsJson: JSON.stringify({ ...baseSettings, agents: ["fastapi"] }) })
+        .where(eq(schema.projects.id, projectId));
+
+      const jobId = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: epicU },
+      });
+      await runner.tickOnce();
+      await runner.whenIdle();
+
+      // Not parked — the epic completed: job done, ticket closed, epic moved to in-review.
+      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+      expect((await beads.show(repo, userTicket)).status).toBe("closed");
+      expect((await beads.show(repo, epicU)).labels ?? []).toContain("stage:in-review");
+    } finally {
+      rmSync(join(repo, ".claude", "agents", "prompt-engineer.md"), { force: true });
       await tdb.db
         .update(schema.projects)
         .set({ settingsJson: JSON.stringify(baseSettings) })

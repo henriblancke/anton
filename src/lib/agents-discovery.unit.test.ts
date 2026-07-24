@@ -86,3 +86,51 @@ describe("discoverAgents", () => {
     expect(agents.find((a) => a.id === "nextjs")?.source).toBe("bundled");
   });
 });
+
+describe("discoverAgents — installed Claude Code plugins", () => {
+  let root: string;
+  let bundledRoot: string;
+  let homeDir: string;
+
+  beforeAll(async () => {
+    root = await mkdtemp(join(tmpdir(), "anton-plugin-agents-"));
+    bundledRoot = join(root, "bundled");
+    homeDir = join(root, "home");
+    await mkdir(join(bundledRoot, AGENT_PROMPTS_DIR), { recursive: true });
+    // A bundled agent that a plugin also defines → bundled must win the name (stays gateable).
+    await writeFile(join(bundledRoot, AGENT_PROMPTS_DIR, "nextjs.md"), "bundled body");
+
+    // Two plugins: one carries a plugin-only agent (prompt-engineer) + a nextjs that must lose to
+    // bundled; both define prompt-engineer to prove deterministic sorted-key resolution.
+    const registry: { plugins: Record<string, { installPath: string }[]> } = { plugins: {} };
+    for (const [key, ids] of [
+      ["develop@market", ["prompt-engineer", "nextjs"]],
+      ["zeta@market", ["prompt-engineer"]],
+    ] as const) {
+      const installPath = join(root, "plugins", key);
+      await mkdir(join(installPath, "agents"), { recursive: true });
+      for (const id of ids) {
+        await writeFile(join(installPath, "agents", `${id}.md`), `---\ndescription: ${key}/${id}\n---\nb`);
+      }
+      registry.plugins[key] = [{ installPath }];
+    }
+    await mkdir(join(homeDir, ".claude/plugins"), { recursive: true });
+    await writeFile(join(homeDir, ".claude/plugins/installed_plugins.json"), JSON.stringify(registry));
+  });
+
+  afterAll(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it("discovers plugin-only agents as source 'plugin', with bundled winning shared names", async () => {
+    const agents = await discoverAgents(undefined, { homeDir, bundledRoot });
+    expect(agents.map((a) => a.id)).toEqual(["nextjs", "prompt-engineer"]);
+    // nextjs is bundled + plugin → bundled wins (stays in anton's gated namespace).
+    expect(agents.find((a) => a.id === "nextjs")?.source).toBe("bundled");
+    // prompt-engineer is plugin-only → source 'plugin', from the first plugin in sorted key order.
+    expect(agents.find((a) => a.id === "prompt-engineer")).toMatchObject({
+      source: "plugin",
+      description: "develop@market/prompt-engineer",
+    });
+  });
+});

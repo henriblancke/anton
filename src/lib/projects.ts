@@ -8,10 +8,12 @@ import { basename, join, resolve } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
+import { z } from "zod";
 import { eq } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import { removeWorktree } from "./git/worktree";
 import { configureBeadsForRepo } from "./beads/config.mjs";
+import { DEFAULT_BUDGET_POLICY, type BudgetPolicy } from "./jobs/budget";
 import type { AntonDb } from "./jobs/queue";
 import type { Project } from "./types";
 
@@ -129,13 +131,19 @@ export interface ProjectSettings {
    */
   maxRetries?: number;
   /**
-   * Active-agents allowlist (anton-46w): which specialist agent prompts dispatch may assign. Each
-   * entry is a discoverable agent id — bundled OR the project's own `.claude/agents` (anton-dvo.1,
-   * discoverAgents in src/lib/agents-discovery.ts). Enforced by dispatch (anton-dm7, execute-epic):
-   * a run whose ticket needs a disabled agent is PARKED with a clear reason — never silently run
-   * with the default agent. Absent (never persisted / cleared) → all agents active; empty `[]` →
-   * no agents active (the operator toggled every agent off), so any labeled ticket is parked. The
-   * UI seeds "all discovered on" when this is absent, so a no-op save stays all-active.
+   * Active-agents allowlist (anton-46w): which of anton's BUNDLED specialist prompts dispatch may
+   * assign. Each entry is a bundled agent id (discoverAgents in src/lib/agents-discovery.ts).
+   * Enforced by dispatch (anton-dm7, execute-epic): a run whose ticket needs a disabled bundled
+   * agent is PARKED with a clear reason — never silently run with the default agent. Absent (never
+   * persisted / cleared) → all bundled agents active; empty `[]` → no bundled agent active (the
+   * operator toggled every one off), so a ticket needing a bundled agent is parked. The UI seeds
+   * "all bundled on" when this is absent, so a no-op save stays all-active.
+   *
+   * The project's OWN `.claude/agents` (project + global sources) are NOT part of this allowlist:
+   * they always run, never parked (the anton-dvo.1 reversal — the operator brought them and labels
+   * tickets with them deliberately). A stored value may still contain a stale user-agent id from
+   * before the reversal; dispatch ignores it (user agents aren't gated) and the UI prunes it on the
+   * next save.
    */
   agents?: string[];
   /**
@@ -151,6 +159,23 @@ export interface ProjectSettings {
    * `<title> (<id>)`, so existing projects' PR titles are unchanged until enabled.
    */
   conventionalCommits?: boolean;
+  /**
+   * Budget-aware execution master-switch (anton-7mpv.1). OFF by default: only when a project turns
+   * this on does the runner's budget governor pace/defer that project's autonomous work against the
+   * Claude plan (see `resolveBudgetPolicy` in ./jobs/service and the governor in ./jobs/budget).
+   * Kept deliberately separate from `budgetPolicy` (the knobs): the knobs may be pre-set while the
+   * feature stays off. Default off is also what keeps the runner from reading Claude usage at all —
+   * so the nav usage pill isn't starved of the shared cache — until an operator opts in.
+   */
+  budgetAware?: boolean;
+  /**
+   * Operator-tunable budget policy (anton-egrg): the subset of the governor's full
+   * {@link BudgetPolicy} the operator controls per project. Absent → DEFAULT_PROJECT_BUDGET_POLICY;
+   * a stored value need only carry the fields the operator touched (the rest fall back to default
+   * on resolve). Validated with {@link budgetPolicySchema} at the API boundary. Only consulted when
+   * {@link budgetAware} is on.
+   */
+  budgetPolicy?: ProjectBudgetPolicy;
 }
 
 /** A resolved verify gate (anton-3oh8): a stable label (for logs/errors) + the shell command. */
@@ -185,6 +210,84 @@ export const CONCURRENCY_RANGE = { min: 1, max: 6 } as const;
 export const JOB_TIMEOUT_MINUTES_RANGE = { min: 5, max: 720 } as const; // 5 min … 12 h
 export const MAX_RETRIES_RANGE = { min: 1, max: 10 } as const;
 
+/** A 0–100 integer percentage — the same scale the governor's {@link BudgetPolicy} uses. */
+const pctSchema = z.number().int().min(0).max(100);
+
+/**
+ * Operator-facing budget policy (anton-egrg): the tunable subset of the governor's full
+ * {@link BudgetPolicy}. Every field optional so a patch can carry just the knobs the operator
+ * touched; each is strictly range-checked (fail loud on out-of-range), and unknown keys are
+ * rejected. `dayWindow` is a local `[startHour, endHour)` pair with `start < end`.
+ */
+export const budgetPolicySchema = z
+  .object({
+    dayWindow: z
+      .tuple([z.number().int().min(0).max(23), z.number().int().min(0).max(23)])
+      .refine(([start, end]) => start < end, {
+        message: "dayWindow start hour must be before end hour",
+      }),
+    daytimeReservePct: pctSchema,
+    // Zero is rejected for the weekly target specifically: `computePace` treats a target <= 0 as
+    // "no pace data", so 0 would silently DISABLE weekly pacing rather than target zero usage.
+    weeklyTargetPct: z
+      .number()
+      .int()
+      .min(1, { message: "weeklyTargetPct must be at least 1 (0 would disable pacing, not stop work)" })
+      .max(100),
+    minSessionHeadroomPct: pctSchema,
+    preferNightForHeavy: z.boolean(),
+  })
+  .partial()
+  .strict();
+
+export type ProjectBudgetPolicy = z.infer<typeof budgetPolicySchema>;
+
+/**
+ * Safe defaults applied when a policy (or one of its fields) is absent. The daytime reserve is the
+ * configurable knob the founder asked for; the weekly target drives the governor's pace-line.
+ */
+export const DEFAULT_PROJECT_BUDGET_POLICY: Required<ProjectBudgetPolicy> = {
+  dayWindow: [9, 18],
+  daytimeReservePct: 15,
+  weeklyTargetPct: 90,
+  minSessionHeadroomPct: 5,
+  preferNightForHeavy: true,
+};
+
+/** Overlay the stored (possibly partial) operator policy onto the defaults — never a partial out. */
+export function resolveProjectBudgetPolicy(
+  settings: ProjectSettings,
+): Required<ProjectBudgetPolicy> {
+  return { ...DEFAULT_PROJECT_BUDGET_POLICY, ...(settings.budgetPolicy ?? {}) };
+}
+
+/**
+ * Project a project's settings onto the governor's full {@link BudgetPolicy}: the operator's knobs
+ * ride on top of {@link DEFAULT_BUDGET_POLICY}, so fields the operator can't set keep the governor's
+ * shipped defaults. `preferNightForHeavy` off zeroes the night value discount, so heavy jobs are no
+ * longer preferentially deferred to night. This is the hook the admission gate (anton-szld) consumes.
+ *
+ * `dayWindow` is documented as LOCAL hours, so the governor's fixed UTC offset comes from this
+ * machine's timezone (anton runs on the operator's box — machine-local IS operator-local). Resolved
+ * per call rather than baked into a constant so a DST shift is picked up at the next gate check
+ * while `budgetGate` itself stays pure on a fixed offset.
+ */
+export function resolveBudgetPolicy(settings: ProjectSettings): BudgetPolicy {
+  const p = resolveProjectBudgetPolicy(settings);
+  return {
+    ...DEFAULT_BUDGET_POLICY,
+    minSessionHeadroomPct: p.minSessionHeadroomPct,
+    daytimeReservePct: p.daytimeReservePct,
+    dayStartHour: p.dayWindow[0],
+    dayEndHour: p.dayWindow[1],
+    // getTimezoneOffset() is minutes to ADD to local to reach UTC (e.g. 420 for PDT) — the
+    // governor's offset is the inverse (local = UTC + offset), hence the negation.
+    utcOffsetMinutes: -new Date().getTimezoneOffset(),
+    weeklyTargetPct: p.weeklyTargetPct,
+    nightValueDiscount: p.preferNightForHeavy ? DEFAULT_BUDGET_POLICY.nightValueDiscount : 0,
+  };
+}
+
 export async function getProjectSettings(db: AntonDb, id: string): Promise<ProjectSettings> {
   const rows = await db
     .select({ settingsJson: schema.projects.settingsJson })
@@ -205,6 +308,45 @@ export async function getProjectSettingsBySlug(slug: string): Promise<ProjectSet
   return getProjectSettings(getDb(), p.id);
 }
 
+/**
+ * Whether ANY project has budget-aware execution turned on (anton-7mpv.1). The shaping nudge is a
+ * workspace-wide glance, so it's gated on the feature being enabled *somewhere* rather than for a
+ * single project. Fail-soft: a project with unparseable settingsJson is treated as off, and the
+ * default (no project opted in) returns false — the nudge stays hidden.
+ */
+export async function isBudgetAwareEnabledAnywhere(): Promise<boolean> {
+  const rows = await getDb().select({ settingsJson: schema.projects.settingsJson }).from(schema.projects);
+  return rows.some((row) => {
+    try {
+      return (JSON.parse(row.settingsJson) as ProjectSettings).budgetAware === true;
+    } catch {
+      return false;
+    }
+  });
+}
+
+/**
+ * The resolved governor policies of every budget-aware project (anton-7mpv.1). The shaping nudge
+ * evaluates pace/headroom against these — the SAME knobs (`resolveBudgetPolicy`) the per-project
+ * governor applies — rather than a hard-coded default, so an operator who tunes `weeklyTargetPct`
+ * or `daytimeReservePct` sees the nudge agree with what the runner actually admits. Empty when no
+ * project has opted in (the nudge's hide gate); a project with unparseable settingsJson is treated
+ * as off, mirroring {@link isBudgetAwareEnabledAnywhere}.
+ */
+export async function budgetAwareProjectPolicies(): Promise<BudgetPolicy[]> {
+  const rows = await getDb().select({ settingsJson: schema.projects.settingsJson }).from(schema.projects);
+  const policies: BudgetPolicy[] = [];
+  for (const row of rows) {
+    try {
+      const settings = JSON.parse(row.settingsJson) as ProjectSettings;
+      if (settings.budgetAware === true) policies.push(resolveBudgetPolicy(settings));
+    } catch {
+      // unparseable settings → not budget-aware; skip
+    }
+  }
+  return policies;
+}
+
 /** Merge a settings patch into the project's settingsJson. Returns the merged settings. */
 export async function updateProjectSettings(
   slug: string,
@@ -218,6 +360,10 @@ export async function updateProjectSettings(
   const next: ProjectSettings = { ...current };
   for (const [k, v] of Object.entries(patch)) {
     if (v === undefined || v === "") delete (next as Record<string, unknown>)[k];
+    // budgetPolicy is a partial-by-design nested object: merge the patched knobs into the stored
+    // policy so an update carrying only e.g. `weeklyTargetPct` can't silently wipe `dayWindow` or
+    // any other knob the UI/API didn't send. Clearing the whole policy stays `undefined` above.
+    else if (k === "budgetPolicy") next.budgetPolicy = { ...current.budgetPolicy, ...(v as object) };
     else (next as Record<string, unknown>)[k] = v;
   }
   await db
