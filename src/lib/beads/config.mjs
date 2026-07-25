@@ -586,8 +586,9 @@ export function configureBeadsForRepo(dir, opts = {}) {
     // maintain the denormalized `is_blocked` flag, so it can arrive stale — and `bd ready` trusts
     // that flag, silently hiding ready work or surfacing blocked work (bd 1.1.0). Repair it once,
     // right after bootstrap. Best-effort: idempotent on a consistent DB, and a failure here must
-    // never abort an otherwise-good clone setup.
-    const rc = spawnSync("bd", ["recompute-blocked"], { cwd: dir, encoding: "utf8" });
+    // never abort an otherwise-good clone setup. timeout: a hung recompute (e.g. a Dolt DB lock)
+    // must not stall the configure flow — the kill surfaces as rc.error/non-zero, i.e. "skipped".
+    const rc = spawnSync("bd", ["recompute-blocked"], { cwd: dir, encoding: "utf8", timeout: 10_000 });
     steps.push({ name: "bd recompute-blocked", status: (rc.status ?? 1) === 0 ? "ok" : "skipped" });
   } else {
     emit(".beads/ present with a local Dolt DB — enforcing team-config only (no re-init).");
