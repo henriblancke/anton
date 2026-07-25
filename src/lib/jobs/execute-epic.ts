@@ -926,6 +926,9 @@ async function runTicket(args: {
     beadId: ticket.id,
   });
   await updateRun(db, clock, runId, { ticketBeadId: ticket.id, agentTag: agentTag ?? null });
+  // Live handle (anton-susu): expose this ticket's session + worktree while it runs; each ticket's
+  // dispatch overwrites the last, so the handle always names the job's CURRENT session.
+  ctx.report({ sessionId, cwd: worktreePath });
 
   // Human steering (anton-bfy4) can land at any moment — including while this epic's earlier
   // tickets were running — so the notes that reach the prompt are read HERE, at dispatch, not from

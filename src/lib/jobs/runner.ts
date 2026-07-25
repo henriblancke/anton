@@ -150,6 +150,21 @@ export type LiveRunCheck = (
 ) => Promise<boolean> | boolean;
 
 /**
+ * What a running job's handler has reported about its live work (anton-susu). The jobs table links
+ * neither a session nor a working directory (review-fix/nightly-stringer write no run row), so this
+ * in-memory handle is the only place a live job's session id + cwd are introspectable.
+ */
+export interface LiveJobInfo {
+  sessionId?: string;
+  cwd?: string;
+}
+
+/** The synchronous live read for an in-flight job: what it reported, plus its type. */
+export interface RunningJobInfo extends LiveJobInfo {
+  type: JobType;
+}
+
+/**
  * Bead-label source for the per-job value gate (anton-k05r): the labels of a job's target bead
  * (e.g. `risk:high`, `blocking-PR`), read at lease time so `jobValueScore` can rank governed work.
  * Returns `null` when the bead can't be resolved — the gate fails open on null (admits the job)
@@ -170,6 +185,12 @@ export interface JobContext {
   heartbeat: () => Promise<void>;
   /** Aborted when the runner stops or the lease is lost — pass to child processes. */
   signal: AbortSignal;
+  /**
+   * Report the live session id / cwd for this job (anton-susu) so observe/investigate can find the
+   * running work. Merges partial updates; a re-report (e.g. execute-epic's next ticket) overwrites.
+   * Cleared automatically when the job settles — a settled job reports nothing.
+   */
+  report: (info: LiveJobInfo) => void;
 }
 
 export type JobHandler = (ctx: JobContext) => Promise<void>;
@@ -244,6 +265,14 @@ export function nextAction(
   }
 }
 
+/** An in-flight job's registry entry: the abort handle plus the mutable live-report handle. */
+interface InFlightEntry {
+  controller: AbortController;
+  type: JobType;
+  /** Filled by the handler via ctx.report; deleted with the entry when the job settles. */
+  live: LiveJobInfo;
+}
+
 export interface RunnerLogger {
   info: (msg: string, meta?: unknown) => void;
   error: (msg: string, meta?: unknown) => void;
@@ -270,7 +299,7 @@ export class JobRunner {
   private dispatchSeq = 0;
   /** Clock time of the last burn-sampler fresh read — throttles fresh usage reads (see config). */
   private lastBurnSampleAt = 0;
-  private readonly inFlight = new Map<string, AbortController>();
+  private readonly inFlight = new Map<string, InFlightEntry>();
   /** Settlement promises for jobs dispatched but not yet settled — the drain set for whenIdle(). */
   private readonly pending = new Set<Promise<void>>();
   private readonly loop: PollingLoop;
@@ -455,7 +484,7 @@ export class JobRunner {
    */
   async cancel(jobId: string): Promise<boolean> {
     const acted = await cancelJob(this.db, this.clock, jobId);
-    this.inFlight.get(jobId)?.abort();
+    this.inFlight.get(jobId)?.controller.abort();
     return acted;
   }
 
@@ -841,8 +870,11 @@ export class JobRunner {
     const handler = this.handlers.get(job.type as JobType);
     const controller = new AbortController();
     // Held for the whole lifetime (handler + settle) so the slot isn't freed until the job is
-    // durably settled — that's what keeps global/per-project capacity from oversubscribing.
-    this.inFlight.set(job.id, controller);
+    // durably settled — that's what keeps global/per-project capacity from oversubscribing. The
+    // entry's `live` handle is what ctx.report fills (anton-susu); deleting the entry in the
+    // finally below is what makes a settled job report nothing.
+    const entry: InFlightEntry = { controller, type: job.type as JobType, live: {} };
+    this.inFlight.set(job.id, entry);
 
     // Burn sampler (anton-w8ny): snapshot Claude usage before the job so we can attribute the
     // session%/weekly% that moves across it to this job's TYPE. Attribution needs a solo window —
@@ -903,6 +935,7 @@ export class JobRunner {
           attempt: job.attempts,
           heartbeat: () => renewLease(this.db, this.clock, job.id, this.config.leaseMs),
           signal: controller.signal,
+          report: (info) => Object.assign(entry.live, info),
         };
         await handler(ctx);
         outcome = { kind: "success" };
@@ -1010,7 +1043,7 @@ export class JobRunner {
    */
   async stop(): Promise<void> {
     this.loop.stop();
-    for (const controller of this.inFlight.values()) controller.abort();
+    for (const { controller } of this.inFlight.values()) controller.abort();
     // Give aborting handlers a moment to unwind; they settle their own job state.
     const start = Date.now();
     while (this.inFlight.size > 0 && Date.now() - start < 5_000) {
@@ -1037,9 +1070,9 @@ export class JobRunner {
       const activeIds = await activeJobIdsForProject(this.db, projectId);
       if (activeIds.length === 0) break;
       for (const id of activeIds) {
-        const controller = this.inFlight.get(id);
-        if (controller) {
-          controller.abort();
+        const entry = this.inFlight.get(id);
+        if (entry) {
+          entry.controller.abort();
           aborted.add(id);
         }
       }
@@ -1085,6 +1118,17 @@ export class JobRunner {
     while (this.pending.size > 0) {
       await Promise.allSettled([...this.pending]);
     }
+  }
+
+  /**
+   * Synchronous live read for an in-flight job (anton-susu): the session id + cwd its handler
+   * reported via ctx.report, plus the job's type. Undefined for anything not currently in flight
+   * in THIS process — jobs are machine-local, and a settled job's entry is cleared on settle.
+   */
+  runningJobInfo(jobId: string): RunningJobInfo | undefined {
+    const entry = this.inFlight.get(jobId);
+    if (!entry) return undefined;
+    return { ...entry.live, type: entry.type };
   }
 
   get activeCount(): number {
