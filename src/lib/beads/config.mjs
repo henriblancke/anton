@@ -51,7 +51,7 @@ export const BD_MIGRATION_RUNBOOK =
  *
  * @param {() => { status?: number|null, stdout?: string, stderr?: string, error?: unknown }} [run]
  */
-export function bdVersion(run = () => spawnSync("bd", ["--version"], { encoding: "utf8" })) {
+export function bdVersion(run = () => spawnSync("bd", ["--version"], { encoding: "utf8", timeout: 10_000 })) {
   const r = run();
   if (!r || r.error || (r.status ?? 1) !== 0) return null;
   const m = `${r.stdout ?? ""}${r.stderr ?? ""}`.match(/(\d+)\.(\d+)\.(\d+)/);

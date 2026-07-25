@@ -48,7 +48,9 @@ export function parseBdVersion(output: string): { major: number; minor: number; 
  */
 export function assertBdVersion(
   bin: string,
-  run: VersionRun = (b) => spawnSync(b, ["--version"], { encoding: "utf8" }),
+  // timeout: a hung `bd --version` must not block boot — the kill surfaces as r.error, which is
+  // already treated as an unreadable version and fails loud (anton-x7la review).
+  run: VersionRun = (b) => spawnSync(b, ["--version"], { encoding: "utf8", timeout: 10_000 }),
 ): void {
   const guidance = `Upgrade bd (${BD_SPEC.install}); for a remote-backed board follow ${BD_MIGRATION_RUNBOOK}.`;
   let r: ReturnType<VersionRun>;
