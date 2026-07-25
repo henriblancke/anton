@@ -50,6 +50,9 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
       projectId,
       kind: "nightly-stringer",
     });
+    // Live handle (anton-susu): nightly-stringer writes no run row, so this is how observe finds
+    // the in-flight session. It runs claude directly in the project repo — no worktree.
+    ctx.report({ sessionId, cwd: project.repoPath });
 
     try {
       // 1. Scan the repo for new signals.

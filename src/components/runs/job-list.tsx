@@ -1,16 +1,25 @@
 "use client";
 
-import { useState } from "react";
-import { ChevronRightIcon } from "lucide-react";
+import { useEffect, useState } from "react";
+import { ChevronRightIcon, ScrollTextIcon } from "lucide-react";
 
 // Type-only import: pulling the runtime `isActiveJob`/`listJobs` from jobs-view would drag its
 // better-sqlite3 (server-only) dependency into this client bundle. Types are erased at build, so
 // this is safe; the active-status check is inlined below.
 import type { JobStatus, JobSummary } from "@/lib/jobs-view";
+// Type-only for the same reason: runner.ts is server-only, but its LiveJobInfo shape is exactly
+// what the page resolves per running job.
+import type { LiveJobInfo } from "@/lib/jobs/runner";
 import { cn } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
 import { fmtDuration } from "@/components/runs/run-view-utils";
 import { ResumeJobButton } from "@/components/runs/resume-job-button";
 import { KillJobButton } from "@/components/runs/kill-job-button";
+import {
+  InvestigateJobButton,
+  InvestigateTerminal,
+} from "@/components/runs/investigate-job";
+import { JobOutputPanel } from "@/components/runs/view-job-output";
 
 const STATUS_STYLE: Record<JobStatus, { dot: string; text: string; pulse?: boolean }> = {
   running: { dot: "bg-stage-implementing", text: "text-stage-implementing", pulse: true },
@@ -47,27 +56,83 @@ function absTime(epoch?: number): string {
  * metadata, so a failed scan is diagnosable without touching the DB. Rendered on its own paginated
  * Jobs page, so no section chrome here — just the row list.
  */
-export function JobList({ jobs, slug }: { jobs: JobSummary[]; slug: string }) {
+export function JobList({
+  jobs,
+  slug,
+  liveJobs,
+}: {
+  jobs: JobSummary[];
+  slug: string;
+  /**
+   * jobId → live handle for jobs running on this instance: cwd gates the Investigate action
+   * (anton-gjhu), sessionId gates View live output (anton-x10l).
+   */
+  liveJobs?: Record<string, LiveJobInfo>;
+}) {
   return (
     <ul className="flex flex-col divide-y divide-border">
       {jobs.map((job) => (
-        <JobRow key={job.id} job={job} slug={slug} />
+        <JobRow key={job.id} job={job} slug={slug} live={liveJobs?.[job.id]} />
       ))}
     </ul>
   );
 }
 
-function JobRow({ job, slug }: { job: JobSummary; slug: string }) {
+function JobRow({
+  job,
+  slug,
+  live,
+}: {
+  job: JobSummary;
+  slug: string;
+  live?: LiveJobInfo;
+}) {
   const [open, setOpen] = useState(false);
   // A confirmed kill is terminal, so the row can show `cancelled` immediately rather than waiting
   // on router.refresh(). Only ever set from a 200 — a failed kill leaves the job's own status.
   const [killed, setKilled] = useState(false);
+  // Live investigate pty under this row (anton-gjhu). Set only from a 201 spawn, cleared on close.
+  const [investigateSession, setInvestigateSession] = useState<string | null>(null);
+  // Live output viewer under this row (anton-x10l) — read-only tail of the job's session log.
+  const [outputOpen, setOutputOpen] = useState(false);
+  const liveCwd = live?.cwd;
+
+  // Job settled while the terminal was open (an RSC refresh dropped the live handle, e.g. after a
+  // confirmed kill) → drop the session during render (React's "adjusting state when props change"
+  // pattern) so the teardown effect below fires and a later resume can't resurrect a dead session.
+  if (investigateSession && !liveCwd) setInvestigateSession(null);
+  // Same for the output panel: without this, a settled job leaves outputOpen=true and a later
+  // resume with a fresh sessionId would silently reopen the panel without a user click.
+  if (outputOpen && !live?.sessionId) setOutputOpen(false);
+
+  // The row owns the investigate pty's lifetime: dropping the session — Close, the job settling
+  // out from under the terminal, or this row unmounting — must kill the pty, because unmounting
+  // PtyTerminal only aborts the SSE stream and the claude process would outlive the panel until
+  // the server-side timeout. Keyed on the session (not a cleanup inside InvestigateTerminal) so
+  // dev StrictMode's double-mount of the panel can't kill a live session: at row mount the
+  // session is null and the double-invoked effect is a no-op.
+  useEffect(() => {
+    if (!investigateSession) return;
+    return () => {
+      void fetch(`/api/projects/${slug}/sessions/${investigateSession}/pty`, {
+        method: "DELETE",
+        keepalive: true,
+      }).catch(() => {
+        /* best-effort teardown — the pty exits on its own if this never lands */
+      });
+    };
+  }, [slug, investigateSession]);
   const status: JobStatus = killed ? "cancelled" : job.status;
   const style = STATUS_STYLE[status];
   const active = ACTIVE_JOB_STATUSES.has(status);
   const finished = !active;
   // Parked/failed jobs are recoverable but not self-healing — offer a manual resume (anton-ner.4).
   const resumable = !killed && (job.status === "parked" || job.status === "failed");
+  // Investigate needs a job that's still running here with a reported cwd — the map only carries
+  // those, and a local kill drops the action immediately.
+  const investigable = !killed && job.status === "running" && Boolean(live?.cwd);
+  // View live output needs a running job whose handler reported a session — same locality rules.
+  const observable = !killed && job.status === "running" && Boolean(live?.sessionId);
 
   return (
     <li className="flex flex-col">
@@ -104,6 +169,15 @@ function JobRow({ job, slug }: { job: JobSummary; slug: string }) {
             onClick={(e) => e.stopPropagation()}
           >
             {resumable && <ResumeJobButton slug={slug} jobId={job.id} />}
+            {observable && !outputOpen && (
+              <Button size="xs" variant="outline" onClick={() => setOutputOpen(true)}>
+                <ScrollTextIcon aria-hidden="true" />
+                View live output
+              </Button>
+            )}
+            {investigable && !investigateSession && (
+              <InvestigateJobButton slug={slug} jobId={job.id} onSession={setInvestigateSession} />
+            )}
             {active && (
               <KillJobButton slug={slug} jobId={job.id} onKilled={() => setKilled(true)} />
             )}
@@ -120,6 +194,23 @@ function JobRow({ job, slug }: { job: JobSummary; slug: string }) {
       </div>
 
       {open && <JobDetail job={job} status={status} />}
+
+      {outputOpen && live?.sessionId && (
+        <JobOutputPanel
+          slug={slug}
+          sessionId={live.sessionId}
+          onClose={() => setOutputOpen(false)}
+        />
+      )}
+
+      {investigateSession && liveCwd && (
+        <InvestigateTerminal
+          slug={slug}
+          sessionId={investigateSession}
+          cwd={liveCwd}
+          onClose={() => setInvestigateSession(null)}
+        />
+      )}
     </li>
   );
 }

@@ -7,6 +7,9 @@
  */
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createRequire } from "node:module";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Project } from "@/lib/types";
 
 const require = createRequire(import.meta.url);
@@ -50,6 +53,17 @@ vi.mock("@/lib/sessions", () => ({
   createSession: async () => {},
   endSession: async () => {},
   getSessionById: async (id: string) => ({ id, projectId: project.id, kind: "interactive" }),
+}));
+
+// The runner's live job handle (anton-gjhu): one running review-fix job whose reported cwd is a
+// temp "worktree" created in beforeAll. Mocking the whole service module also keeps the runner's
+// heavy import chain (beads, scheduler) out of this transport-focused suite.
+let jobWorktree = "";
+vi.mock("@/lib/jobs/service", () => ({
+  getRunningJobInfo: async (projectId: string, jobId: string) =>
+    projectId === project.id && jobId === "job-review-fix" && jobWorktree
+      ? { type: "review-fix", sessionId: "job-own-session", cwd: jobWorktree }
+      : undefined,
 }));
 
 const { POST: SPAWN } = await import("../../interactive/route");
@@ -107,11 +121,14 @@ suite("interactive pty routes (real node-pty)", () => {
   beforeAll(() => {
     process.env.ANTON_CLAUDE_BIN = "bash";
     process.env.ANTON_PTY_NO_EXIT_HANDLER = "1"; // don't stack a process 'exit' handler per test run
+    // realpath so macOS's /tmp → /private/tmp symlink can't make `pwd` output miss the assert.
+    jobWorktree = realpathSync(mkdtempSync(join(tmpdir(), "anton-gjhu-worktree-")));
   });
 
   afterAll(async () => {
     // Tear down anything still live so no bash pty is orphaned.
     for (const id of created) await DELETE(new Request("http://t/"), ptyCtx("tmp", id));
+    rmSync(jobWorktree, { recursive: true, force: true });
     if (prevBin === undefined) delete process.env.ANTON_CLAUDE_BIN;
     else process.env.ANTON_CLAUDE_BIN = prevBin;
     if (prevNoHandler === undefined) delete process.env.ANTON_PTY_NO_EXIT_HANDLER;
@@ -192,5 +209,48 @@ suite("interactive pty routes (real node-pty)", () => {
   it("404s a session that does not belong to the project", async () => {
     const res = await GET(new Request("http://t/"), ptyCtx("nope", "whatever"));
     expect(res.status).toBe(404);
+  });
+
+  // anton-gjhu: investigate a running job — a separate pty rooted at the job's reported cwd.
+  it("spawns an investigate session rooted at the running job's cwd", async () => {
+    const req = new Request("http://t/", {
+      method: "POST",
+      body: JSON.stringify({
+        jobId: "job-review-fix",
+        args: ["--noprofile", "--norc", "-i"],
+      }),
+    });
+    const res = await SPAWN(req, spawnCtx("tmp"));
+    expect(res.status).toBe(201);
+    const { sessionId } = await res.json();
+    created.push(sessionId);
+    // A fresh session of its own — never the job's headless session.
+    expect(sessionId).not.toBe("job-own-session");
+
+    // The shell must actually be IN the worktree, not the project repoPath.
+    await POST(
+      new Request("http://t/", {
+        method: "POST",
+        body: JSON.stringify({ type: "input", data: "pwd\r" }),
+      }),
+      ptyCtx("tmp", sessionId),
+    );
+    const stream = await GET(new Request("http://t/"), ptyCtx("tmp", sessionId));
+    const { text, abort } = await readUntil(stream, (t) => t.includes(jobWorktree));
+    abort();
+    expect(text).toContain(jobWorktree);
+  });
+
+  it("409s an investigate spawn for a job with no live handle", async () => {
+    const res = await SPAWN(
+      new Request("http://t/", {
+        method: "POST",
+        body: JSON.stringify({ jobId: "job-not-running" }),
+      }),
+      spawnCtx("tmp"),
+    );
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toMatch(/not running/i);
   });
 });

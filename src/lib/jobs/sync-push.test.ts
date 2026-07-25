@@ -31,6 +31,7 @@ function fakeCtx(over: Partial<JobContext> & { payload: unknown }): JobContext {
     projectId: "p1",
     attempt: 1,
     heartbeat: async () => {},
+    report: () => {},
     signal: new AbortController().signal,
     ...over,
   };
