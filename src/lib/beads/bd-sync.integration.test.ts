@@ -6,10 +6,10 @@
  */
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describeBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
+import { describeBd, makeBdRepo, removeTempRepo, type BdRepo } from "@/lib/testing/integration";
 import { beads } from "./bd";
 import { configureBeadsForRepo, configYamlHas, hasLocalDoltDb } from "./config.mjs";
 import { updateTicket } from "../ticket-detail";
@@ -182,7 +182,7 @@ describeBd("two managed repos exchange a change over refs/dolt/data with export.
   });
 
   afterAll(() => {
-    if (sandbox) rmSync(sandbox, { recursive: true, force: true });
+    if (sandbox) removeTempRepo(sandbox);
   });
 
   it("both repos commit export.auto=false alongside export.git-add=false", () => {
@@ -269,7 +269,7 @@ describeBd("fresh clone hydrates via configureBeadsForRepo → bd bootstrap (ant
   }, 120_000);
 
   afterAll(() => {
-    if (sandbox) rmSync(sandbox, { recursive: true, force: true });
+    if (sandbox) removeTempRepo(sandbox);
   });
 
   it("chose bd bootstrap (not bd init) and hydrated the local Dolt DB", () => {
