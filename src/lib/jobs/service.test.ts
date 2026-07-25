@@ -105,4 +105,41 @@ describe("getRunningJobInfo (service, project-scoped)", () => {
     });
     expect(await getRunningJobInfo("p-alpha", id)).toBeUndefined();
   });
+
+  it("hands a re-imported copy of the module the SAME runner (globalThis-anchored singleton)", async () => {
+    // Next compiles instrumentation.ts and the app layer into separate module registries, so
+    // service.ts is evaluated more than once per process. A module-scope `let` gave each copy its
+    // own runner: the instrumentation one ran every job while pages/routes read an empty inFlight
+    // map, so live job handles resolved to nothing and cancel()'s abort never reached the child.
+    // Re-importing after resetModules reproduces that second evaluation — it must resolve to the
+    // one runner that actually holds the jobs.
+    vi.resetModules();
+    const fresh = await import("./service");
+    expect(fresh.getRunner()).toBe(getRunner());
+
+    // And the live read follows: a handle reported through one copy is visible through the other.
+    const runner = getRunner();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let reported!: () => void;
+    const reportedGate = new Promise<void>((resolve) => (reported = resolve));
+    runner.registerHandler("execute-epic", async (ctx) => {
+      ctx.report({ sessionId: "sess-cross", cwd: "/tmp/alpha/wt" });
+      reported();
+      await gate;
+    });
+
+    const id = await runner.enqueue({ type: "execute-epic", projectId: "p-alpha" });
+    await runner.tickOnce();
+    await reportedGate;
+
+    expect(await fresh.getRunningJobInfo("p-alpha", id)).toEqual({
+      sessionId: "sess-cross",
+      cwd: "/tmp/alpha/wt",
+      type: "execute-epic",
+    });
+
+    release();
+    await runner.whenIdle();
+  });
 });

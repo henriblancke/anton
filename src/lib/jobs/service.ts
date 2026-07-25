@@ -29,9 +29,29 @@ const log: RunnerLogger = {
   error: (msg, meta) => console.error(`[jobs] ${msg}`, meta ?? ""),
 };
 
-let _runner: JobRunner | null = null;
-let _scheduler: Scheduler | null = null;
-let _reconciled = false;
+/**
+ * The runner/scheduler singletons live on globalThis, not in module scope, because Next compiles
+ * `instrumentation.ts` and the app layer (RSC pages, route handlers) into SEPARATE module
+ * registries: a module-level `let` yields one runner PER registry. The instrumentation copy is the
+ * only one that ever runs jobs, so every in-memory read from a page or route would hit a second,
+ * never-started runner with an empty `inFlight` map — live job handles (observe/investigate,
+ * anton-susu) resolve to nothing, and `cancel()`'s abort never reaches the running child. Only the
+ * DB-backed paths survive that split, which is why it stayed invisible until the first feature
+ * needed live state. Symbol.for keyed, matching the convention for process-wide state here.
+ */
+const STATE_KEY = Symbol.for("anton.jobs.serviceState");
+
+interface ServiceState {
+  runner: JobRunner | null;
+  scheduler: Scheduler | null;
+  /** Reconcile-once guard — process-wide for the same reason (see startRunner). */
+  reconciled: boolean;
+}
+
+function state(): ServiceState {
+  const global = globalThis as unknown as Record<symbol, ServiceState | undefined>;
+  return (global[STATE_KEY] ??= { runner: null, scheduler: null, reconciled: false });
+}
 
 /**
  * Global ceiling on total in-flight jobs across all projects — a safety bound above the per-project
@@ -109,7 +129,8 @@ async function readBeadLabels(projectId: string, beadId: string): Promise<readon
 }
 
 export function getRunner(): JobRunner {
-  if (_runner) return _runner;
+  const s = state();
+  if (s.runner) return s.runner;
   const db = getDb();
   const runner = new JobRunner({
     db,
@@ -125,14 +146,15 @@ export function getRunner(): JobRunner {
   runner.registerHandler("review-fix", makeReviewFixHandler({ db }));
   runner.registerHandler("nightly-stringer", makeNightlyStringerHandler({ db }));
   runner.registerHandler("orphan-grooming", makeOrphanGroomingHandler({ db }));
-  _runner = runner;
+  s.runner = runner;
   return runner;
 }
 
 export function getScheduler(): Scheduler {
-  if (_scheduler) return _scheduler;
-  _scheduler = new Scheduler({ db: getDb(), clock: systemClock, log });
-  return _scheduler;
+  const s = state();
+  if (s.scheduler) return s.scheduler;
+  s.scheduler = new Scheduler({ db: getDb(), clock: systemClock, log });
+  return s.scheduler;
 }
 
 /**
@@ -150,9 +172,10 @@ export async function startRunner(): Promise<void> {
   // that can't reach bd fails loud HERE with actionable guidance, instead of booting and then
   // parking execute-epic/review-fix jobs mid-run with `spawn bd ENOENT`.
   preflightBd();
-  if (!_reconciled) {
+  const s = state();
+  if (!s.reconciled) {
     // Set before awaiting so a concurrent second call can't slip past into a second reconcile.
-    _reconciled = true;
+    s.reconciled = true;
     await getRunner().reconcile();
   }
   getRunner().start();
