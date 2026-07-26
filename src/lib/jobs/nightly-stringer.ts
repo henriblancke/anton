@@ -12,7 +12,7 @@ import { beads } from "../beads/bd";
 import { getProjectById, getProjectSettings } from "../projects";
 import { loadSkill } from "../claude/prompt";
 import { runClaude } from "../claude/driver";
-import { scan } from "../stringer";
+import { describeCollectorFailure, scan } from "../stringer";
 import { appendSessionLog, endSession, startJobSession } from "../sessions";
 import { PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
@@ -60,6 +60,14 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
       await appendSessionLog(logPath, `[stringer] scan --delta ${project.repoPath}\n`);
       const result = await scan({ repoPath: project.repoPath, scanFile, signal: ctx.signal });
       await ctx.heartbeat();
+
+      // 1b. A dead collector still exits 0 (anton-uspu) — say so on the session, before the
+      // no-signals early return, so a scan that lost gitlog doesn't read as a clean nothing-to-do.
+      for (const failure of result.collectorFailures) {
+        const detail = describeCollectorFailure(failure);
+        await appendSessionLog(logPath, `[stringer] WARNING: ${detail}\n`);
+        console.warn(`[nightly-stringer] ${project.slug}: ${detail}`);
+      }
 
       // 2. No new signals → nothing to triage. That's a success, not an error.
       if (result.signalCount === 0) {

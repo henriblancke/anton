@@ -48,7 +48,8 @@ describeBd("nightly-stringer e2e (real handler · real bd · fake stringer/claud
     mkdirSync(binDir);
 
     // Fake stringer: honor `-o <file>`, write a canned scan whose signal count is controlled by
-    // FAKE_STRINGER_SIGNALS (0 → an empty scan, exercising the no-op path).
+    // FAKE_STRINGER_SIGNALS (0 → an empty scan, exercising the no-op path). FAKE_STRINGER_STDERR
+    // replays real stringer stderr, e.g. a collector that died while the scan still exits 0.
     const fakeStringer = writeBin(
       binDir,
       "stringer",
@@ -57,6 +58,7 @@ const oi=a.indexOf('-o');const out=oi>=0?a[oi+1]:null;
 const n=Number(process.env.FAKE_STRINGER_SIGNALS||'0');
 const signals=Array.from({length:n},(_,i)=>({Source:'todo',Kind:'todo',FilePath:'x.ts',Line:i+1,Title:'TODO '+i}));
 if(out)fs.writeFileSync(out,JSON.stringify({signals,metadata:{}}));
+if(process.env.FAKE_STRINGER_STDERR)process.stderr.write(process.env.FAKE_STRINGER_STDERR+'\\n');
 process.exit(0);`,
     );
 
@@ -157,5 +159,29 @@ process.stdin.on('end',()=>{
     // No beads created, claude never ran (no argv file written).
     expect((await beads.list(repo, ["--status", "all"])).length).toBe(beadsBefore);
     expect(existsSync(join(sandbox, "claude-argv.jsonl"))).toBe(false);
+  });
+
+  it("warns on the session when a collector died, even with no signals to triage (anton-uspu)", async () => {
+    process.env.FAKE_STRINGER_SIGNALS = "0";
+    process.env.FAKE_STRINGER_STDERR =
+      `time=2026-07-26T19:26:45Z level=ERROR msg="collector failed" name=gitlog ` +
+      `error="opening repo: core.repositoryformatversion does not support extension: worktreeconfig" duration=4ms`;
+    const before = new Set((await tdb.db.select().from(schema.sessions)).map((s) => s.id));
+
+    const runner = new JobRunner({ db: tdb.db, clock, config: { maxConcurrent: 1, leaseMs: 30_000 } });
+    runner.registerHandler("nightly-stringer", makeNightlyStringerHandler({ db: tdb.db, clock }));
+    const jobId = await runner.enqueue({ type: "nightly-stringer", projectId, payload: { projectId } });
+    expect(await runner.tickOnce()).toBe(1);
+    await runner.whenIdle();
+    delete process.env.FAKE_STRINGER_STDERR;
+
+    // The scan itself is still a success — only the loss is surfaced.
+    expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+    const sessions = await tdb.db.select().from(schema.sessions);
+    const session = sessions.find((s) => !before.has(s.id))!;
+    expect(session.status).toBe("done");
+    const log = readFileSync(session.logPath!, "utf8");
+    expect(log).toContain(`WARNING: collector "gitlog" failed`);
+    expect(log).toContain("extensions.worktreeConfig");
   });
 });

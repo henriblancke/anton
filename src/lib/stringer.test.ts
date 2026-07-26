@@ -7,13 +7,22 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_SCAN_EXCLUDES, STRINGER_BIN_ENV, scan } from "./stringer";
+import {
+  DEFAULT_SCAN_EXCLUDES,
+  STRINGER_BIN_ENV,
+  describeCollectorFailure,
+  parseCollectorFailures,
+  scan,
+} from "./stringer";
 
 let dir: string;
 let prevBin: string | undefined;
 
-/** Fake stringer: records argv (minus node/script) to argvDump, writes canned signals to the -o path. */
-function writeFakeStringer(argvDump: string, signals: unknown[]): string {
+/**
+ * Fake stringer: records argv (minus node/script) to argvDump, writes canned signals to the -o path,
+ * and optionally echoes canned slog lines to stderr (how a dead collector announces itself).
+ */
+function writeFakeStringer(argvDump: string, signals: unknown[], stderr = ""): string {
   const path = join(dir, "fake-stringer");
   const body = [
     "#!/usr/bin/env node",
@@ -21,6 +30,7 @@ function writeFakeStringer(argvDump: string, signals: unknown[]): string {
     `fs.writeFileSync(${JSON.stringify(argvDump)}, JSON.stringify(process.argv.slice(2)));`,
     "const i = process.argv.indexOf('-o');",
     `if (i !== -1) fs.writeFileSync(process.argv[i + 1], JSON.stringify(${JSON.stringify(signals)}));`,
+    `process.stderr.write(${JSON.stringify(stderr)});`,
     "process.exit(0);",
     "",
   ].join("\n");
@@ -28,6 +38,15 @@ function writeFakeStringer(argvDump: string, signals: unknown[]): string {
   chmodSync(path, 0o755);
   return path;
 }
+
+/** Real stringer 1.8.3 stderr for a repo with extensions.worktreeConfig set (scan still exits 0). */
+const WORKTREECONFIG_STDERR = [
+  `time=2026-07-26T19:26:45.418-04:00 level=INFO msg=scanning collectors=15`,
+  `time=2026-07-26T19:26:45.424-04:00 level=INFO msg="collector \\"gitlog\\" returned error: opening repo: core.repositoryformatversion does not support extension: worktreeconfig"`,
+  `time=2026-07-26T19:26:45.452-04:00 level=ERROR msg="collector failed" name=gitlog error="opening repo: core.repositoryformatversion does not support extension: worktreeconfig" duration=4.748875ms`,
+  `time=2026-07-26T19:26:45.452-04:00 level=INFO msg="collector complete" name=todos signals=1 duration=15.00125ms`,
+  ``,
+].join("\n");
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "anton-stringer-"));
@@ -63,7 +82,9 @@ describe("scan", () => {
     expect(argv).toContain("--collector-timeout");
     expect(argv[argv.indexOf("--collector-timeout") + 1]).toMatch(/^\d+[a-z]+$/);
     expect(argv).toContain("--delta"); // delta on by default
+    expect(argv).toContain("--no-color"); // keeps stderr parseable for collector failures
     expect(result.signalCount).toBe(2);
+    expect(result.collectorFailures).toEqual([]);
   });
 
   it("appends caller-supplied excludes after the defaults", async () => {
@@ -95,5 +116,71 @@ describe("scan", () => {
 
     const result = await scan({ repoPath: "/repo", scanFile: join(dir, "missing.json") });
     expect(result.signalCount).toBe(0);
+  });
+
+  it("reports a collector that died even though the scan exited 0 (anton-uspu)", async () => {
+    const argvDump = join(dir, "argv.json");
+    process.env[STRINGER_BIN_ENV] = writeFakeStringer(argvDump, [{ id: 1 }], WORKTREECONFIG_STDERR);
+
+    const result = await scan({ repoPath: "/repo", scanFile: join(dir, "scan.json") });
+
+    // The scan still succeeded with the surviving collectors' signals — the loss is reported, not thrown.
+    expect(result.signalCount).toBe(1);
+    expect(result.collectorFailures).toEqual([
+      {
+        name: "gitlog",
+        error: "opening repo: core.repositoryformatversion does not support extension: worktreeconfig",
+      },
+    ]);
+  });
+});
+
+describe("parseCollectorFailures", () => {
+  it("reports each dead collector once, from either the ERROR or the INFO line", () => {
+    expect(parseCollectorFailures(WORKTREECONFIG_STDERR)).toHaveLength(1);
+
+    // INFO-only stderr (older/quieter builds) still yields the failure.
+    const infoOnly = WORKTREECONFIG_STDERR.split("\n")
+      .filter((l) => !l.includes("level=ERROR"))
+      .join("\n");
+    expect(parseCollectorFailures(infoOnly)).toEqual([
+      {
+        name: "gitlog",
+        error: "opening repo: core.repositoryformatversion does not support extension: worktreeconfig",
+      },
+    ]);
+  });
+
+  it("picks up timed-out collectors and unquoted values, and ignores healthy scans", () => {
+    const stderr = [
+      `time=2026-07-26T19:26:45Z level=ERROR msg="collector failed" name=deadcode error="context deadline exceeded" duration=60.0s`,
+      `time=2026-07-26T19:26:45Z level=ERROR msg="collector failed" name=vuln error=timeout duration=60.0s`,
+    ].join("\n");
+    expect(parseCollectorFailures(stderr)).toEqual([
+      { name: "deadcode", error: "context deadline exceeded" },
+      { name: "vuln", error: "timeout" },
+    ]);
+
+    expect(parseCollectorFailures("")).toEqual([]);
+    expect(
+      parseCollectorFailures(
+        `time=2026-07-26T19:26:45Z level=INFO msg="collector complete" name=todos signals=1 duration=15ms`,
+      ),
+    ).toEqual([]);
+  });
+});
+
+describe("describeCollectorFailure", () => {
+  it("names what the scan lost, and points at worktreeConfig when that's the cause", () => {
+    const [failure] = parseCollectorFailures(WORKTREECONFIG_STDERR);
+    const line = describeCollectorFailure(failure);
+    expect(line).toContain(`collector "gitlog" failed`);
+    expect(line).toContain("missing from this scan");
+    expect(line).toContain("extensions.worktreeConfig");
+
+    // Unrelated failures get the plain line — no misleading git-config advice.
+    const plain = describeCollectorFailure({ name: "vuln", error: "context deadline exceeded" });
+    expect(plain).toContain("context deadline exceeded");
+    expect(plain).not.toContain("worktreeConfig");
   });
 });
