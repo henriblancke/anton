@@ -24,7 +24,7 @@ function toTicketDetail(lite: Bead, full: Bead, epic: Bead | undefined): TicketD
     domain: labelValue(lite.labels, "domain"),
     acceptance: parseAcceptance(full),
     ...createdMeta(lite),
-    prRef: lite.external_ref,
+    prRef: beads.getPrRef(lite),
     deferred: beads.isDeferred(lite),
     abandoned: beads.isAbandoned(lite),
     type: lite.issue_type ?? "task",

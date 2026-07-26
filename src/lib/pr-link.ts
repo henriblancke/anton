@@ -10,7 +10,7 @@ import { beads, type Bead } from "./beads/bd";
 import { planMove, type MoveOp } from "./board-move";
 import type { Project } from "./types";
 
-/** Success (a ready-to-store external-ref) or a human-readable rejection reason. */
+/** Success (a ready-to-store PR ref, e.g. `gh-44`) or a human-readable rejection reason. */
 export type PrRefResult = { ok: true; ref: string } | { ok: false; error: string };
 
 /** Parse host + `owner/repo` + number from a GitHub PR url (trailing `/files` etc. tolerated), else null. */
@@ -72,7 +72,7 @@ export interface PrLinkPlan {
 }
 
 /**
- * The writes for linking `ref` to `target`: always set the external-ref, and additionally move a
+ * The writes for linking `ref` to `target`: always set the PR ref (via the seam), and additionally move a
  * still-open RUN TARGET to in-review (tag in-review / untag implementing, via the canonical
  * planMove) so review-fix sweeps it. A child ticket (not a run target) or a closed target gets only
  * the ref — a child runs via its epic's PR, and a closed/merged target must not be dragged back
@@ -84,14 +84,14 @@ export function planPrLink(target: Bead, ref: string): PrLinkPlan {
 }
 
 /**
- * Execute a PR link: set the external-ref, apply any stage ops from planPrLink, then best-effort
- * sync so teammates + the review-fix sweep see it within a heartbeat (mirrors board-move/claim —
- * a sync hiccup never fails the write that already landed locally). The in-review plan only ever
- * yields tag/untag ops; a defensive default ignores anything else.
+ * Execute a PR link: write the PR pointer through the seam (metadata.pr), apply any stage ops from
+ * planPrLink, then best-effort sync so teammates + the review-fix sweep see it within a heartbeat
+ * (mirrors board-move/claim — a sync hiccup never fails the write that already landed locally). The
+ * in-review plan only ever yields tag/untag ops; a defensive default ignores anything else.
  */
 export async function linkPr(project: Project, target: Bead, ref: string): Promise<void> {
   const { stageOps } = planPrLink(target, ref);
-  await beads.setExternalRef(project.repoPath, target.id, ref);
+  await beads.setPrRef(project.repoPath, target.id, ref);
   for (const op of stageOps) {
     if (op.kind === "tag") await beads.tag(project.repoPath, target.id, op.labels);
     else if (op.kind === "untag") await beads.untag(project.repoPath, target.id, op.labels);

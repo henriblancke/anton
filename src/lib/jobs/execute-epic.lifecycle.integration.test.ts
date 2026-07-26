@@ -107,7 +107,7 @@ describeBd("execute-epic e2e — lifecycle (real handler · real bd/git · fake 
 
     // Epic → in-review: PR ref + stage label.
     const epic = await beads.show(repo, epicId);
-    expect(epic.external_ref).toBe("gh-42");
+    expect(beads.getPrRef(epic)).toBe("gh-42");
     expect(epic.labels ?? []).toContain("stage:in-review");
 
     // The run CLAIMED the epic + each ticket for the human operator (assignee set, not just
@@ -221,7 +221,7 @@ describeBd("execute-epic e2e — lifecycle (real handler · real bd/git · fake 
     // claimed by the operator. Closing happens only when the PR merges.
     const bug = await beads.show(repo, bugId);
     expect(bug.status).not.toBe("closed");
-    expect(bug.external_ref).toBe("gh-42");
+    expect(beads.getPrRef(bug)).toBe("gh-42");
     expect(bug.labels ?? []).toContain("stage:in-review");
     expect(bug.labels ?? []).not.toContain("stage:implementing");
     expect(deriveStage(bug)).toBe("in-review");
@@ -291,7 +291,7 @@ describeBd("execute-epic e2e — lifecycle (real handler · real bd/git · fake 
       // committed work moved it to in-review (the resume marker), so it reads as in review, not Done.
       const bug1 = await beads.show(repo, bugId);
       expect(bug1.status).not.toBe("closed");
-      expect(bug1.external_ref ?? null).toBeNull();
+      expect(beads.getPrRef(bug1) ?? null).toBeNull();
       expect(deriveStage(bug1)).toBe("in-review");
       expect(bug1.labels ?? []).not.toContain("stage:implementing");
       const sessionsAfter1 = (await tdb.db.select().from(schema.sessions)).filter(
@@ -320,7 +320,7 @@ describeBd("execute-epic e2e — lifecycle (real handler · real bd/git · fake 
       expect(runsForBug.some((r) => r.status === "done")).toBe(true);
       const bug2 = await beads.show(repo, bugId);
       expect(bug2.status).not.toBe("closed"); // closes only when the PR merges
-      expect(bug2.external_ref).toBe("gh-42");
+      expect(beads.getPrRef(bug2)).toBe("gh-42");
       expect(deriveStage(bug2)).toBe("in-review");
 
       // Claude was NOT re-run: still exactly one execute session for the bug.
@@ -339,10 +339,10 @@ describeBd("execute-epic e2e — lifecycle (real handler · real bd/git · fake 
   it("a retry after another run already opened the PR completes idempotently — no duplicate/empty PR", async () => {
     // anton-jz1 review: a losing machine's job parks on the winner's live run-lease (or a lost
     // publish race) and reschedules; when the winner finishes and clears its lease, the loser
-    // retries. By then the epic is already in-review with its PR opened + external ref stamped, so
+    // retries. By then the epic is already in-review with its PR opened + PR ref stamped, so
     // re-running would re-enter the PR step and create a duplicate/empty PR (or park on a `gh "a
     // pull request already exists"` failure). The handler must instead revalidate the target still
-    // needs execution and, seeing the external ref, finish the attempt as done without touching gh.
+    // needs execution and, seeing the PR ref, finish the attempt as done without touching gh.
     const bugId = await beads.create(repo, {
       title: "Covered by another run",
       type: "bug",
@@ -358,7 +358,7 @@ describeBd("execute-epic e2e — lifecycle (real handler · real bd/git · fake 
     });
     runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
 
-    // Attempt 1: a normal run carries the bug to in-review (PR opened, external ref stamped).
+    // Attempt 1: a normal run carries the bug to in-review (PR opened, PR ref stamped).
     process.env.ANTON_CLAUDE_BIN = successClaude;
     const job1 = await runner.enqueue({
       type: "execute-epic",
@@ -369,7 +369,7 @@ describeBd("execute-epic e2e — lifecycle (real handler · real bd/git · fake 
     await runner.whenIdle();
     expect((await getJob(tdb.db, job1))?.status).toBe("done");
     const covered = await beads.show(repo, bugId);
-    expect(covered.external_ref).toBe("gh-42");
+    expect(beads.getPrRef(covered)).toBe("gh-42");
     const sessionsAfter1 = (await tdb.db.select().from(schema.sessions)).filter(
       (s) => s.beadId === bugId,
     );
@@ -398,7 +398,7 @@ process.exit(0);`,
       await runner.tickOnce();
       await runner.whenIdle();
 
-      // The retry completed (not failed/parked) without invoking gh: the external ref is unchanged
+      // The retry completed (not failed/parked) without invoking gh: the PR ref is unchanged
       // and no second claude session ran — the covered work was not redone.
       expect((await getJob(tdb.db, job2))?.status).toBe("done");
       const run2 = (await tdb.db.select().from(schema.runs))
@@ -406,7 +406,7 @@ process.exit(0);`,
         .find((r) => r.id !== undefined && r.status === "done" && r.worktreePath === null);
       expect(run2).toBeTruthy(); // the retry's run row settled done without ever warming a worktree
       const after2 = await beads.show(repo, bugId);
-      expect(after2.external_ref).toBe("gh-42"); // not overwritten / re-opened
+      expect(beads.getPrRef(after2)).toBe("gh-42"); // not overwritten / re-opened
       const sessionsAfter2 = (await tdb.db.select().from(schema.sessions)).filter(
         (s) => s.beadId === bugId,
       );
@@ -416,11 +416,11 @@ process.exit(0);`,
     }
   });
 
-  it("clears its OWN leftover run-lease on the external-ref short-circuit (crash after PR, before cleanup)", async () => {
-    // anton-jz1 review (thread PRRT_kwDOTWcq8c6SAdZu): a run that crashed AFTER stamping the external
-    // ref but BEFORE its `finally` cleared the run-lease leaves an unexpired `run-lease:…:<runId>` on
+  it("clears its OWN leftover run-lease on the PR-ref short-circuit (crash after PR, before cleanup)", async () => {
+    // anton-jz1 review (thread PRRT_kwDOTWcq8c6SAdZu): a run that crashed AFTER stamping the PR ref
+    // but BEFORE its `finally` cleared the run-lease leaves an unexpired `run-lease:…:<runId>` on
     // the board. On resume, findOpenRunForEpic returns the SAME run row (same runId), so the target
-    // still carries this run's own lease. The idempotent external-ref short-circuit returns before the
+    // still carries this run's own lease. The idempotent PR-ref short-circuit returns before the
     // general lease-adoption step, so it must sweep that own lease itself — otherwise other machines
     // keep seeing the epic as live until the 15-minute TTL even though its PR is already open.
     const bugId = await beads.create(repo, {
@@ -432,8 +432,8 @@ process.exit(0);`,
     await beads.approve(repo, bugId);
 
     // Simulate the crashed prior attempt: a still-"running" run row (so it resumes rather than
-    // starting fresh), the external ref already stamped, and this run's own unexpired lease still on
-    // the board — the exact "died between setExternalRef and finally" state.
+    // starting fresh), the PR ref already stamped to metadata.pr, and this run's own unexpired lease
+    // still on the board — the exact "died between setPrRef and finally" state.
     const runId = randomUUID();
     await createRun(tdb.db, clock, {
       id: runId,
@@ -444,7 +444,7 @@ process.exit(0);`,
     });
     const leaseExp = clock.now() + 15 * 60_000;
     await beads.publishRunLease(repo, bugId, leaseExp, [], runId);
-    await beads.setExternalRef(repo, bugId, "gh-77");
+    await beads.setPrRef(repo, bugId, "gh-77");
     await beads.sync(repo); // land both on the remote so the handler's pull can't clobber them
     expect(beads.ownRunLeaseLabels(await beads.show(repo, bugId), runId)).toHaveLength(1);
 
@@ -482,16 +482,16 @@ process.exit(0);`,
     }
 
     // The resumed run's row settled done, and its own lease was swept — no lingering run-lease keeps
-    // the epic looking live to other machines. External ref untouched (not re-opened).
+    // the epic looking live to other machines. PR ref untouched (not re-opened).
     const settled = (await tdb.db.select().from(schema.runs)).find((r) => r.id === runId);
     expect(settled?.status).toBe("done");
     const after = await beads.show(repo, bugId);
     expect(beads.runLeaseLabels(after)).toEqual([]);
-    expect(after.external_ref).toBe("gh-77");
+    expect(beads.getPrRef(after)).toBe("gh-77");
   });
 
   it("retries (does not false-complete) when a target's PR ref state can't be read", async () => {
-    // anton-jz1 review (thread PRRT_kwDOTWcq8c6SBg3n): a set external_ref only proves completion when
+    // anton-jz1 review (thread PRRT_kwDOTWcq8c6SBg3n): a set PR ref only proves completion when
     // its PR is confirmed OPEN or MERGED. An UNKNOWN state (gh down / unparseable ref) is proof of
     // nothing — treating it as done would strand a genuinely-closed epic that a retry could recover.
     // The handler must retry on unknown rather than mark the run done, leaving the ref intact. Unlike a
@@ -505,7 +505,7 @@ process.exit(0);`,
       description: "## Goal\nProve unknown PR state parks instead of false-completing.",
     });
     await beads.approve(repo, bugId);
-    await beads.setExternalRef(repo, bugId, "gh-88");
+    await beads.setPrRef(repo, bugId, "gh-88");
     await beads.sync(repo);
 
     const runner = new JobRunner({
@@ -537,14 +537,14 @@ process.exit(0);`,
       );
       expect(runsForBug.some((r) => r.status === "failed")).toBe(true);
       expect(runsForBug.some((r) => r.status === "done")).toBe(false);
-      expect((await beads.show(repo, bugId)).external_ref).toBe("gh-88");
+      expect(beads.getPrRef(await beads.show(repo, bugId))).toBe("gh-88");
     } finally {
       process.env.ANTON_GH_BIN = okGh;
     }
   });
 
-  it("restores an epic's stage:in-review on the external-ref short-circuit (crash after ref, before stage update)", async () => {
-    // anton-jz1 review (thread PRRT_kwDOTWcq8c6SBg3m): an epic run that crashed AFTER setExternalRef
+  it("restores an epic's stage:in-review on the PR-ref short-circuit (crash after ref, before stage update)", async () => {
+    // anton-jz1 review (thread PRRT_kwDOTWcq8c6SBg3m): an epic run that crashed AFTER setPrRef
     // (step 5) but BEFORE the stage updates at the tail of step 5 leaves the epic on stage:implementing
     // with no stage:in-review. review-fix sweeps only stage:in-review targets, so a resume that
     // short-circuits to done must re-apply in-review (and drop implementing) or the PR is silently
@@ -572,7 +572,7 @@ process.exit(0);`,
     // "running" run row so this resumes rather than starting fresh.
     await beads.close(repo, childId);
     await beads.tag(repo, epicId, ["stage:implementing"]);
-    await beads.setExternalRef(repo, epicId, "gh-55");
+    await beads.setPrRef(repo, epicId, "gh-55");
     const runId = randomUUID();
     await createRun(tdb.db, clock, {
       id: runId,
@@ -621,6 +621,6 @@ process.exit(0);`,
     expect(epic.labels ?? []).toContain("stage:in-review");
     expect(epic.labels ?? []).not.toContain("stage:implementing");
     expect(deriveStage(epic)).toBe("in-review");
-    expect(epic.external_ref).toBe("gh-55");
+    expect(beads.getPrRef(epic)).toBe("gh-55");
   });
 });
