@@ -1,0 +1,1272 @@
+<title>anton — epic tier + Linear sync UX</title>
+
+<style>
+  /* ─────────────────────────────────────────────────────────────
+     Tokens lifted verbatim from anton's Atelier system
+     (src/app/globals.css). Light = warm paper, dark = warm graphite.
+     Nothing here invents a palette; the only NEW tokens are the
+     three area hues, flagged in the notes.
+     ───────────────────────────────────────────────────────────── */
+  :root {
+    --canvas: #f6f4ef;
+    --fg: #1b1a16;
+    --card: #ffffff;
+    --raised: #efece5;
+    --muted-fg: #6a675f;
+    --subtle: #9a968d;
+    --border: #e6e2da;
+    --primary: #6355e0;
+    --primary-fg: #ffffff;
+
+    --stage-backlog: #8a8680;
+    --stage-implementing: #b7801f;
+    --stage-in-review: #2f7fd6;
+    --stage-done: #2c9d68;
+
+    --type-epic: #6355e0;
+    --type-task: #2f7fd6;
+    --type-bug: #d1483d;
+
+    --ok: #2c9d68;
+    --warn: #b7801f;
+    --crit: #d1483d;
+
+    /* NEW — engine/area hues. Drawn from chart-2/3/5 so they stay in family. */
+    --area-ontology: #6355e0;
+    --area-knowledge: #2c9d68;
+    --area-ingest: #c05070;
+
+    --shadow: 0 1px 2px rgb(27 26 22 / 0.06), 0 1px 1px rgb(27 26 22 / 0.04);
+    --radius: 0.625rem;
+    --radius-sm: 0.375rem;
+
+    --font-display: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+    --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --canvas: #131210;
+      --fg: #f3f0ea;
+      --card: #1c1a17;
+      --raised: #24221e;
+      --muted-fg: #a5a199;
+      --subtle: #726e66;
+      --border: #2e2b27;
+      --primary: #8f82ff;
+      --primary-fg: #0b0a09;
+
+      --stage-backlog: #8b8781;
+      --stage-implementing: #e6a94b;
+      --stage-in-review: #57a8f2;
+      --stage-done: #4fc08a;
+
+      --type-epic: #8f82ff;
+      --type-task: #57a8f2;
+      --type-bug: #f2685e;
+
+      --ok: #4fc08a;
+      --warn: #e6a94b;
+      --crit: #f2685e;
+
+      --area-ontology: #8f82ff;
+      --area-knowledge: #4fc08a;
+      --area-ingest: #f26a86;
+
+      --shadow: 0 1px 2px rgb(0 0 0 / 0.4), 0 1px 1px rgb(0 0 0 / 0.3);
+    }
+  }
+
+  /* The viewer's toggle must beat the media query in both directions. */
+  :root[data-theme="dark"] {
+    --canvas: #131210; --fg: #f3f0ea; --card: #1c1a17; --raised: #24221e;
+    --muted-fg: #a5a199; --subtle: #726e66; --border: #2e2b27;
+    --primary: #8f82ff; --primary-fg: #0b0a09;
+    --stage-backlog: #8b8781; --stage-implementing: #e6a94b;
+    --stage-in-review: #57a8f2; --stage-done: #4fc08a;
+    --type-epic: #8f82ff; --type-task: #57a8f2; --type-bug: #f2685e;
+    --ok: #4fc08a; --warn: #e6a94b; --crit: #f2685e;
+    --area-ontology: #8f82ff; --area-knowledge: #4fc08a; --area-ingest: #f26a86;
+    --shadow: 0 1px 2px rgb(0 0 0 / 0.4), 0 1px 1px rgb(0 0 0 / 0.3);
+  }
+  :root[data-theme="light"] {
+    --canvas: #f6f4ef; --fg: #1b1a16; --card: #ffffff; --raised: #efece5;
+    --muted-fg: #6a675f; --subtle: #9a968d; --border: #e6e2da;
+    --primary: #6355e0; --primary-fg: #ffffff;
+    --stage-backlog: #8a8680; --stage-implementing: #b7801f;
+    --stage-in-review: #2f7fd6; --stage-done: #2c9d68;
+    --type-epic: #6355e0; --type-task: #2f7fd6; --type-bug: #d1483d;
+    --ok: #2c9d68; --warn: #b7801f; --crit: #d1483d;
+    --area-ontology: #6355e0; --area-knowledge: #2c9d68; --area-ingest: #c05070;
+    --shadow: 0 1px 2px rgb(27 26 22 / 0.06), 0 1px 1px rgb(27 26 22 / 0.04);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--canvas);
+    color: var(--fg);
+    font-family: var(--font-sans);
+    font-size: 15px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .page {
+    max-width: 1240px;
+    margin: 0 auto;
+    padding: 3rem 1.5rem 6rem;
+    display: flex;
+    flex-direction: column;
+    gap: 3.5rem;
+  }
+
+  /* ── Masthead ─────────────────────────────────────────────── */
+  .masthead { display: flex; flex-direction: column; gap: 1rem; }
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--subtle);
+  }
+  h1 {
+    font-family: var(--font-display);
+    font-size: clamp(1.9rem, 4vw, 2.6rem);
+    line-height: 1.1;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    margin: 0;
+    text-wrap: balance;
+  }
+  .standfirst {
+    max-width: 62ch;
+    color: var(--muted-fg);
+    font-size: 1.05rem;
+    margin: 0;
+  }
+
+  /* ── Section scaffolding ──────────────────────────────────── */
+  section { display: flex; flex-direction: column; gap: 1.25rem; }
+  .sec-head {
+    display: flex;
+    align-items: baseline;
+    gap: 0.85rem;
+    padding-bottom: 0.6rem;
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+  .sec-head h2 {
+    font-family: var(--font-display);
+    font-size: 1.3rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    margin: 0;
+  }
+  .sec-head .hint { color: var(--muted-fg); font-size: 0.9rem; }
+
+  /* Spec layout: the mock, and a quiet rail of decisions beside it. */
+  .spec { display: grid; grid-template-columns: 1fr; gap: 1.5rem; align-items: start; }
+  @media (min-width: 1080px) {
+    .spec { grid-template-columns: minmax(0, 1fr) 250px; gap: 2rem; }
+  }
+  .rail { display: flex; flex-direction: column; gap: 1.1rem; }
+  .note { display: flex; flex-direction: column; gap: 0.3rem; }
+  .note-label {
+    font-family: var(--font-mono);
+    font-size: 0.66rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--primary);
+  }
+  .note-label[data-kind="risk"] { color: var(--crit); }
+  .note-label[data-kind="open"] { color: var(--warn); }
+  .note p { margin: 0; font-size: 0.83rem; color: var(--muted-fg); line-height: 1.5; }
+  .note code { font-size: 0.78rem; }
+
+  code {
+    font-family: var(--font-mono);
+    font-size: 0.85em;
+    background: var(--raised);
+    padding: 0.1em 0.35em;
+    border-radius: 4px;
+  }
+
+  /* ── App chrome — signals "this is inside anton" ──────────── */
+  .app {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+  .app-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.65rem 0.9rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--raised);
+    flex-wrap: wrap;
+  }
+  .mark {
+    width: 20px; height: 20px; border-radius: 28%;
+    background: linear-gradient(135deg, #8f82ff, #6355e0);
+    flex: none;
+  }
+  .app-title { font-weight: 600; font-size: 0.9rem; }
+  .app-bar .spacer { flex: 1 1 auto; }
+
+  .filterbar {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.7rem 0.9rem;
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+  .filter {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.8rem;
+    padding: 0.3rem 0.55rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--card);
+    color: var(--fg);
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .filter .k { color: var(--subtle); }
+  .filter .caret { color: var(--subtle); font-size: 0.65rem; }
+
+  .segmented {
+    display: inline-flex;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+  }
+  .segmented button {
+    font: inherit;
+    font-size: 0.8rem;
+    padding: 0.3rem 0.7rem;
+    border: 0;
+    background: var(--card);
+    color: var(--muted-fg);
+    cursor: pointer;
+  }
+  .segmented button + button { border-left: 1px solid var(--border); }
+  .segmented button[aria-pressed="true"] {
+    background: color-mix(in srgb, var(--primary) 14%, transparent);
+    color: var(--fg);
+    font-weight: 600;
+  }
+  .segmented button:focus-visible,
+  .filter:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+
+  /* ── Board ────────────────────────────────────────────────── */
+  .board {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(210px, 1fr));
+    gap: 0;
+    overflow-x: auto;
+  }
+  .col { border-right: 1px solid var(--border); min-width: 210px; }
+  .col:last-child { border-right: 0; }
+  .col-head {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    padding: 0.7rem 0.75rem 0.55rem;
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted-fg);
+    position: sticky;
+    top: 0;
+    background: var(--card);
+  }
+  .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+  .col-head .count { margin-left: auto; color: var(--subtle); }
+  .col-body { display: flex; flex-direction: column; gap: 0.55rem; padding: 0 0.6rem 0.9rem; }
+
+  /* Feature card — the run target. The card IS the feature, so it
+     needs no type chip; colour is spent on the epic badge instead. */
+  .fcard {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 0.6rem 0.65rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+    box-shadow: var(--shadow);
+  }
+  .epic-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    font-size: 0.68rem;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    padding: 0.12rem 0.4rem;
+    border-radius: 4px;
+    align-self: flex-start;
+    max-width: 100%;
+    background: color-mix(in srgb, var(--tier) 14%, transparent);
+    color: var(--tier);
+    border: 1px solid color-mix(in srgb, var(--tier) 30%, transparent);
+    cursor: pointer;
+  }
+  .epic-badge .glyph { font-size: 0.7em; }
+  .epic-badge .txt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  [data-area="ontology"] { --tier: var(--area-ontology); }
+  [data-area="knowledge"] { --tier: var(--area-knowledge); }
+  [data-area="ingest"] { --tier: var(--area-ingest); }
+  [data-area="none"] { --tier: var(--subtle); }
+
+  .fcard h3 {
+    margin: 0;
+    font-size: 0.9rem;
+    font-weight: 600;
+    line-height: 1.3;
+    text-wrap: balance;
+  }
+  .idline {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--subtle);
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+  }
+  .chips { display: flex; flex-wrap: wrap; gap: 0.25rem; }
+  .chip {
+    font-family: var(--font-mono);
+    font-size: 0.65rem;
+    padding: 0.08rem 0.32rem;
+    border-radius: 4px;
+    background: var(--raised);
+    color: var(--muted-fg);
+  }
+  .chip[data-tone="high"] { color: var(--crit); background: color-mix(in srgb, var(--crit) 12%, transparent); }
+  .chip[data-tone="pr"] { color: var(--stage-in-review); background: color-mix(in srgb, var(--stage-in-review) 12%, transparent); }
+
+  /* Ticket progress — encodes state in form, not just number. */
+  .prog { display: flex; align-items: center; gap: 0.45rem; }
+  .track {
+    flex: 1 1 auto;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--raised);
+    overflow: hidden;
+  }
+  .track > i { display: block; height: 100%; background: var(--stage-done); }
+  .prog .n {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    color: var(--muted-fg);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .btn {
+    font: inherit;
+    font-size: 0.75rem;
+    font-weight: 600;
+    padding: 0.28rem 0.6rem;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--primary);
+    background: var(--primary);
+    color: var(--primary-fg);
+    cursor: pointer;
+    align-self: flex-start;
+  }
+  .btn.ghost { background: transparent; color: var(--fg); border-color: var(--border); }
+  .btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+
+  /* Standalone chip — parentless task/bug, unchanged from today. */
+  .schip {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.35rem 0.5rem;
+    border: 1px dashed var(--border);
+    border-radius: var(--radius-sm);
+    font-size: 0.78rem;
+  }
+  .schip .tick { width: 3px; align-self: stretch; border-radius: 2px; background: var(--type-bug); }
+  .schip.task .tick { background: var(--type-task); }
+  .schip .sid { font-family: var(--font-mono); font-size: 0.68rem; color: var(--subtle); margin-left: auto; }
+
+  /* ── Swimlane variant ─────────────────────────────────────── */
+  .lane { border-bottom: 1px solid var(--border); }
+  .lane:last-child { border-bottom: 0; }
+  .lane-head {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    padding: 0.6rem 0.9rem;
+    background: color-mix(in srgb, var(--tier) 7%, transparent);
+    border-left: 3px solid var(--tier);
+    flex-wrap: wrap;
+  }
+  .lane-head .name { font-weight: 600; font-size: 0.88rem; }
+  .lane-head .meta {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--muted-fg);
+    font-variant-numeric: tabular-nums;
+  }
+  .lane-head .spacer { flex: 1 1 auto; }
+  .lane .board { border-top: 1px solid var(--border); }
+  .lane .col-head { display: none; }
+  .lane .col-body { padding-top: 0.6rem; }
+
+  /* ── Roadmap table ────────────────────────────────────────── */
+  .tablewrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.85rem; min-width: 620px; }
+  th {
+    text-align: left;
+    font-family: var(--font-mono);
+    font-size: 0.66rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--subtle);
+    font-weight: 500;
+    padding: 0.55rem 0.75rem;
+    border-bottom: 1px solid var(--border);
+  }
+  td { padding: 0.6rem 0.75rem; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  tr:last-child td { border-bottom: 0; }
+  td.num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; color: var(--muted-fg); }
+  .linear-link {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--primary);
+    text-decoration: none;
+    border-bottom: 1px dotted color-mix(in srgb, var(--primary) 50%, transparent);
+  }
+  .unsynced { font-family: var(--font-mono); font-size: 0.72rem; color: var(--subtle); }
+
+  /* ── Settings panel ───────────────────────────────────────── */
+  .panel { padding: 1.1rem; display: flex; flex-direction: column; gap: 1.35rem; }
+  .field { display: flex; flex-direction: column; gap: 0.4rem; }
+  .field > label, .field > .lab {
+    font-size: 0.8rem;
+    font-weight: 600;
+  }
+  .field .help { font-size: 0.78rem; color: var(--muted-fg); margin: 0; max-width: 62ch; }
+
+  .row { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+  .row.between { justify-content: space-between; }
+
+  .switch {
+    position: relative;
+    width: 38px; height: 21px;
+    border-radius: 11px;
+    border: 1px solid var(--border);
+    background: var(--raised);
+    cursor: pointer;
+    flex: none;
+    padding: 0;
+    transition: background 0.15s ease, border-color 0.15s ease;
+  }
+  .switch::after {
+    content: "";
+    position: absolute;
+    inset: 2px auto 2px 2px;
+    width: 15px;
+    border-radius: 50%;
+    background: var(--card);
+    box-shadow: var(--shadow);
+    transition: transform 0.15s ease;
+  }
+  .switch[aria-checked="true"] { background: var(--primary); border-color: var(--primary); }
+  .switch[aria-checked="true"]::after { transform: translateX(17px); }
+  .switch:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+
+  .typechips { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+  .tchip {
+    font-family: var(--font-mono);
+    font-size: 0.76rem;
+    padding: 0.25rem 0.55rem;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: var(--card);
+    color: var(--muted-fg);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+  }
+  .tchip .mk { opacity: 0; font-size: 0.7em; }
+  .tchip[aria-pressed="true"] {
+    border-color: color-mix(in srgb, var(--primary) 45%, transparent);
+    background: color-mix(in srgb, var(--primary) 12%, transparent);
+    color: var(--fg);
+    font-weight: 600;
+  }
+  .tchip[aria-pressed="true"] .mk { opacity: 1; color: var(--primary); }
+  .tchip:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+
+  input[type="text"] {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    padding: 0.4rem 0.55rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--card);
+    color: var(--fg);
+    width: 100%;
+  }
+  input[type="text"]:focus-visible { outline: 2px solid var(--primary); outline-offset: -1px; }
+
+  .status {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.78rem;
+    color: var(--muted-fg);
+  }
+  .status .dot { width: 7px; height: 7px; }
+
+  .preview {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--raised);
+    padding: 0.7rem 0.8rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+  }
+  .preview .cmd {
+    font-family: var(--font-mono);
+    font-size: 0.76rem;
+    color: var(--fg);
+    word-break: break-all;
+    line-height: 1.6;
+  }
+  .preview .cmd .flag { color: var(--primary); }
+  .preview .out { font-size: 0.8rem; color: var(--muted-fg); margin: 0; }
+  .preview .out strong { color: var(--fg); font-variant-numeric: tabular-nums; }
+
+  .divider { height: 1px; background: var(--border); border: 0; margin: 0; }
+
+  .maptable td:first-child, .maptable th:first-child { width: 42%; }
+
+  /* ── Tier legend ──────────────────────────────────────────── */
+  .tiers { display: flex; flex-direction: column; gap: 0.5rem; }
+  .tier {
+    display: flex;
+    gap: 0.75rem;
+    align-items: flex-start;
+    padding: 0.7rem 0.85rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--card);
+  }
+  .tier:nth-child(2) { margin-left: 1.25rem; }
+  .tier:nth-child(3) { margin-left: 2.5rem; }
+  .tier .rule { width: 3px; align-self: stretch; border-radius: 2px; background: var(--tier); flex: none; }
+  .tier .body { display: flex; flex-direction: column; gap: 0.15rem; }
+  .tier .name {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--tier);
+  }
+  .tier .what { font-size: 0.85rem; }
+  .tier .who { font-size: 0.78rem; color: var(--muted-fg); }
+  .tier[data-tier="epic"] { --tier: var(--type-epic); }
+  .tier[data-tier="feature"] { --tier: var(--stage-implementing); }
+  .tier[data-tier="task"] { --tier: var(--type-task); }
+
+  .runrule {
+    border-left: 3px solid var(--primary);
+    padding: 0.6rem 0 0.6rem 0.85rem;
+    font-size: 0.9rem;
+    max-width: 68ch;
+  }
+  .runrule strong { font-weight: 600; }
+
+  .breadcrumb {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.82rem;
+    color: var(--muted-fg);
+    padding: 0.75rem 0.9rem;
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+  .breadcrumb .sep { color: var(--subtle); }
+  .breadcrumb .cur { color: var(--fg); font-weight: 600; }
+
+  .ticketlist { display: flex; flex-direction: column; }
+  .trow {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.5rem 0.9rem;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.85rem;
+  }
+  .trow:last-child { border-bottom: 0; }
+  .trow .tick { width: 3px; height: 15px; border-radius: 2px; flex: none; }
+  .trow .tid { font-family: var(--font-mono); font-size: 0.72rem; color: var(--subtle); margin-left: auto; }
+  .trow .st { font-size: 0.72rem; font-family: var(--font-mono); color: var(--muted-fg); }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; animation: none !important; }
+  }
+</style>
+
+<div class="page">
+
+  <header class="masthead">
+    <div class="eyebrow">anton · interface spec · draft</div>
+    <h1>The epic tier, and a Linear sync you can actually configure</h1>
+    <p class="standfirst">
+      Two changes, one page. Features become the thing anton runs; product epics become the
+      tier above them that stakeholders read. Then a sync panel that publishes exactly the tiers
+      you choose — because the tier you execute is rarely the tier anyone else wants to see.
+    </p>
+  </header>
+
+  <!-- ── 1. Tier model ────────────────────────────────────── -->
+  <section>
+    <div class="sec-head">
+      <h2>The three tiers</h2>
+      <span class="hint">what each one is for, and who reads it</span>
+    </div>
+    <div class="spec">
+      <div class="tiers">
+        <div class="tier" data-tier="epic">
+          <span class="rule"></span>
+          <span class="body">
+            <span class="name">epic</span>
+            <span class="what">A product outcome. Spans several features, carries one <code>area:</code> label.</span>
+            <span class="who">Read by people who don't read code. Lives in Linear as a top-level issue.</span>
+          </span>
+        </div>
+        <div class="tier" data-tier="feature">
+          <span class="rule"></span>
+          <span class="body">
+            <span class="name">feature</span>
+            <span class="what">One shippable delivery unit — one worktree, one PR. <strong>This is what anton runs.</strong></span>
+            <span class="who">Approved, claimed, run-leased, shipped. What today's beads epic already is.</span>
+          </span>
+        </div>
+        <div class="tier" data-tier="task">
+          <span class="rule"></span>
+          <span class="body">
+            <span class="name">task · bug · chore</span>
+            <span class="what">The working layer. Executed as part of their feature's run.</span>
+            <span class="who">Engineering only. Never leaves the board.</span>
+          </span>
+        </div>
+      </div>
+      <div class="rail">
+        <div class="note">
+          <span class="note-label">Migration-free rule</span>
+          <p>A bead is runnable if it's a <code>feature</code>, or a parentless <code>task</code>/<code>bug</code>,
+             or an <code>epic</code> with no feature children. Today's boards keep running untouched;
+             an epic becomes a container the moment a feature lands under it.</p>
+        </div>
+        <div class="note">
+          <span class="note-label" data-kind="open">Open</span>
+          <p>An epic with both feature children <em>and</em> loose task children is legal in bd but
+             ambiguous here. Proposal: those tasks render, aren't independently runnable, and get a lint nudge.</p>
+        </div>
+      </div>
+    </div>
+    <p class="runrule">
+      <strong>Approval stays per feature.</strong> Approving an epic does nothing — approval is a
+      per-PR gate, and one button that launches six PRs is not a gate. Bulk-approve can come later
+      as a convenience, clearly labelled as such.
+    </p>
+  </section>
+
+  <!-- ── 2. Board ─────────────────────────────────────────── -->
+  <section>
+    <div class="sec-head">
+      <h2>Board</h2>
+      <span class="hint">cards are features · the epic rides along as a badge</span>
+    </div>
+    <div class="spec">
+      <div>
+        <div class="app">
+          <div class="app-bar">
+            <span class="mark" aria-hidden="true"></span>
+            <span class="app-title">librarian</span>
+            <span class="spacer"></span>
+            <span class="status"><span class="dot" style="background: var(--ok)"></span> synced 12s ago</span>
+          </div>
+
+          <div class="filterbar">
+            <div class="segmented" role="group" aria-label="Board grouping">
+              <button type="button" aria-pressed="true" data-group="stage">Stage</button>
+              <button type="button" aria-pressed="false" data-group="epic">Epic</button>
+            </div>
+            <button class="filter" type="button"><span class="k">Epic</span> All <span class="caret">▾</span></button>
+            <button class="filter" type="button"><span class="k">Area</span> All <span class="caret">▾</span></button>
+            <button class="filter" type="button"><span class="k">Agent</span> All <span class="caret">▾</span></button>
+          </div>
+
+          <!-- Default: stage columns, epic as badge -->
+          <div class="board" data-view="stage">
+            <div class="col">
+              <div class="col-head"><span class="dot" style="background: var(--stage-backlog)"></span> Backlog <span class="count">3</span></div>
+              <div class="col-body">
+                <article class="fcard">
+                  <button class="epic-badge" data-area="ontology" type="button">
+                    <span class="glyph" aria-hidden="true">◆</span><span class="txt">Ontology editing for curators</span>
+                  </button>
+                  <h3>Term merge with a reversible audit trail</h3>
+                  <div class="idline"><span>anton-8kq</span></div>
+                  <div class="chips">
+                    <span class="chip">agent:nextjs</span><span class="chip" data-tone="high">risk:high</span><span class="chip">size:m</span>
+                  </div>
+                  <div class="prog"><span class="track"><i style="width: 0%"></i></span><span class="n">0/5</span></div>
+                  <button class="btn" type="button">Approve &amp; run</button>
+                </article>
+
+                <article class="fcard">
+                  <button class="epic-badge" data-area="knowledge" type="button">
+                    <span class="glyph" aria-hidden="true">◆</span><span class="txt">Trustworthy retrieval</span>
+                  </button>
+                  <h3>Citation provenance panel</h3>
+                  <div class="idline"><span>anton-9rd</span></div>
+                  <div class="chips"><span class="chip">agent:nextjs</span><span class="chip">size:s</span></div>
+                  <div class="prog"><span class="track"><i style="width: 0%"></i></span><span class="n">0/3</span></div>
+                  <button class="btn" type="button">Approve &amp; run</button>
+                </article>
+
+                <div class="schip">
+                  <span class="tick"></span>
+                  <span>Board drag snaps back on drop</span>
+                  <span class="sid">anton-t3x</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="col">
+              <div class="col-head"><span class="dot" style="background: var(--stage-implementing)"></span> Implementing <span class="count">2</span></div>
+              <div class="col-body">
+                <article class="fcard">
+                  <button class="epic-badge" data-area="ontology" type="button">
+                    <span class="glyph" aria-hidden="true">◆</span><span class="txt">Ontology editing for curators</span>
+                  </button>
+                  <h3>Ship the ontology editor</h3>
+                  <div class="idline"><span>anton-ftj</span><span>· henri</span></div>
+                  <div class="chips"><span class="chip">agent:nextjs</span><span class="chip">size:l</span></div>
+                  <div class="prog"><span class="track"><i style="width: 67%"></i></span><span class="n">4/6</span></div>
+                </article>
+
+                <article class="fcard">
+                  <button class="epic-badge" data-area="ingest" type="button">
+                    <span class="glyph" aria-hidden="true">◆</span><span class="txt">Zero-touch ingestion</span>
+                  </button>
+                  <h3>Resumable crawl checkpoints</h3>
+                  <div class="idline"><span>anton-lz4</span><span>· henri</span></div>
+                  <div class="chips"><span class="chip">agent:fastapi</span><span class="chip" data-tone="high">risk:high</span></div>
+                  <div class="prog"><span class="track"><i style="width: 40%"></i></span><span class="n">2/5</span></div>
+                </article>
+              </div>
+            </div>
+
+            <div class="col">
+              <div class="col-head"><span class="dot" style="background: var(--stage-in-review)"></span> In review <span class="count">2</span></div>
+              <div class="col-body">
+                <article class="fcard">
+                  <button class="epic-badge" data-area="knowledge" type="button">
+                    <span class="glyph" aria-hidden="true">◆</span><span class="txt">Trustworthy retrieval</span>
+                  </button>
+                  <h3>Hybrid search ranking</h3>
+                  <div class="idline"><span>anton-2vc</span></div>
+                  <div class="chips"><span class="chip" data-tone="pr">PR #214</span><span class="chip">size:l</span></div>
+                  <div class="prog"><span class="track"><i style="width: 100%"></i></span><span class="n">7/7</span></div>
+                </article>
+
+                <!-- Transition state: a legacy epic with no feature children still runs. -->
+                <article class="fcard">
+                  <button class="epic-badge" data-area="none" type="button">
+                    <span class="glyph" aria-hidden="true">◇</span><span class="txt">No epic — legacy run target</span>
+                  </button>
+                  <h3>Prune closed beads from project Settings</h3>
+                  <div class="idline"><span>anton-uobe</span></div>
+                  <div class="chips"><span class="chip" data-tone="pr">PR #74</span><span class="chip">size:m</span></div>
+                  <div class="prog"><span class="track"><i style="width: 100%"></i></span><span class="n">3/3</span></div>
+                </article>
+              </div>
+            </div>
+
+            <div class="col">
+              <div class="col-head"><span class="dot" style="background: var(--stage-done)"></span> Done <span class="count">1</span></div>
+              <div class="col-body">
+                <article class="fcard">
+                  <button class="epic-badge" data-area="ingest" type="button">
+                    <span class="glyph" aria-hidden="true">◆</span><span class="txt">Zero-touch ingestion</span>
+                  </button>
+                  <h3>PDF table extraction</h3>
+                  <div class="idline"><span>anton-6mw</span></div>
+                  <div class="chips"><span class="chip" data-tone="pr">PR #201</span></div>
+                  <div class="prog"><span class="track"><i style="width: 100%"></i></span><span class="n">4/4</span></div>
+                </article>
+              </div>
+            </div>
+          </div>
+
+          <!-- Opt-in: same cards, grouped into epic swimlanes -->
+          <div data-view="epic" hidden>
+            <div class="lane" data-area="ontology">
+              <div class="lane-head">
+                <span class="epic-badge" data-area="ontology"><span class="glyph" aria-hidden="true">◆</span><span class="txt">Ontology editing for curators</span></span>
+                <span class="name">anton-scj</span>
+                <span class="spacer"></span>
+                <span class="meta">1 of 2 features shipping · LIB-118</span>
+              </div>
+              <div class="board">
+                <div class="col"><div class="col-body">
+                  <article class="fcard">
+                    <h3>Term merge with a reversible audit trail</h3>
+                    <div class="idline"><span>anton-8kq</span></div>
+                    <div class="prog"><span class="track"><i style="width: 0%"></i></span><span class="n">0/5</span></div>
+                    <button class="btn" type="button">Approve &amp; run</button>
+                  </article>
+                </div></div>
+                <div class="col"><div class="col-body">
+                  <article class="fcard">
+                    <h3>Ship the ontology editor</h3>
+                    <div class="idline"><span>anton-ftj</span><span>· henri</span></div>
+                    <div class="prog"><span class="track"><i style="width: 67%"></i></span><span class="n">4/6</span></div>
+                  </article>
+                </div></div>
+                <div class="col"><div class="col-body"></div></div>
+                <div class="col"><div class="col-body"></div></div>
+              </div>
+            </div>
+
+            <div class="lane" data-area="knowledge">
+              <div class="lane-head">
+                <span class="epic-badge" data-area="knowledge"><span class="glyph" aria-hidden="true">◆</span><span class="txt">Trustworthy retrieval</span></span>
+                <span class="name">anton-p2d</span>
+                <span class="spacer"></span>
+                <span class="meta">1 of 2 features shipping · LIB-121</span>
+              </div>
+              <div class="board">
+                <div class="col"><div class="col-body">
+                  <article class="fcard">
+                    <h3>Citation provenance panel</h3>
+                    <div class="idline"><span>anton-9rd</span></div>
+                    <div class="prog"><span class="track"><i style="width: 0%"></i></span><span class="n">0/3</span></div>
+                    <button class="btn" type="button">Approve &amp; run</button>
+                  </article>
+                </div></div>
+                <div class="col"><div class="col-body"></div></div>
+                <div class="col"><div class="col-body">
+                  <article class="fcard">
+                    <h3>Hybrid search ranking</h3>
+                    <div class="idline"><span>anton-2vc</span></div>
+                    <div class="chips"><span class="chip" data-tone="pr">PR #214</span></div>
+                    <div class="prog"><span class="track"><i style="width: 100%"></i></span><span class="n">7/7</span></div>
+                  </article>
+                </div></div>
+                <div class="col"><div class="col-body"></div></div>
+              </div>
+            </div>
+
+            <div class="lane" data-area="none">
+              <div class="lane-head">
+                <span class="epic-badge" data-area="none"><span class="glyph" aria-hidden="true">◇</span><span class="txt">No epic</span></span>
+                <span class="spacer"></span>
+                <span class="meta">2 loose run targets</span>
+              </div>
+              <div class="board">
+                <div class="col"><div class="col-body">
+                  <div class="schip"><span class="tick"></span><span>Board drag snaps back on drop</span><span class="sid">anton-t3x</span></div>
+                </div></div>
+                <div class="col"><div class="col-body"></div></div>
+                <div class="col"><div class="col-body">
+                  <article class="fcard">
+                    <h3>Prune closed beads from project Settings</h3>
+                    <div class="idline"><span>anton-uobe</span></div>
+                    <div class="prog"><span class="track"><i style="width: 100%"></i></span><span class="n">3/3</span></div>
+                  </article>
+                </div></div>
+                <div class="col"><div class="col-body"></div></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="rail">
+        <div class="note">
+          <span class="note-label">Default view</span>
+          <p>Stage columns, epic as a badge. The board's job is execution; the epic is context, not
+             structure. Clicking a badge filters the board to that epic.</p>
+        </div>
+        <div class="note">
+          <span class="note-label">Group by epic</span>
+          <p>The swimlane view is opt-in and non-destructive — same cards, regrouped. It's where the
+             roadmap tier earns a visual home without taxing the daily view. Try the toggle.</p>
+        </div>
+        <div class="note">
+          <span class="note-label">Transition</span>
+          <p>The hollow <span aria-hidden="true">◇</span> badge marks a legacy epic with no feature
+             children — still a run target under the rule above, and visibly unmigrated without
+             being scolded about it.</p>
+        </div>
+        <div class="note">
+          <span class="note-label" data-kind="risk">Fixes a live bug</span>
+          <p>Keying children off run targets instead of epic ids also kills the grandchild-drop:
+             today a task under a non-epic parent vanishes from the board entirely.</p>
+        </div>
+        <div class="note">
+          <span class="note-label" data-kind="open">Colour conflict</span>
+          <p>The three <code>area:</code> hues collide with existing <code>agent:</code> label colours.
+             Either de-saturate the area badge or resolve <code>area:</code> against the
+             existing <code>domain:</code> prefix first — they're the same axis.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── 3. Feature detail ────────────────────────────────── -->
+  <section>
+    <div class="sec-head">
+      <h2>Feature detail</h2>
+      <span class="hint">one breadcrumb hop is the whole change</span>
+    </div>
+    <div class="spec">
+      <div class="app">
+        <div class="breadcrumb">
+          <span class="epic-badge" data-area="ontology"><span class="glyph" aria-hidden="true">◆</span><span class="txt">Ontology editing for curators</span></span>
+          <span class="sep">/</span>
+          <span class="cur">Ship the ontology editor</span>
+          <span class="sep">·</span>
+          <span>anton-ftj</span>
+        </div>
+        <div class="ticketlist">
+          <div class="trow"><span class="tick" style="background: var(--type-task)"></span><span>Add the editor route and shell</span><span class="st">done</span><span class="tid">anton-1c6</span></div>
+          <div class="trow"><span class="tick" style="background: var(--type-task)"></span><span>Term picker with keyboard nav</span><span class="st">done</span><span class="tid">anton-4pv</span></div>
+          <div class="trow"><span class="tick" style="background: var(--type-task)"></span><span>Optimistic save + conflict toast</span><span class="st">done</span><span class="tid">anton-7dz</span></div>
+          <div class="trow"><span class="tick" style="background: var(--type-bug)"></span><span>Editor loses focus after autosave</span><span class="st">done</span><span class="tid">anton-b2k</span></div>
+          <div class="trow"><span class="tick" style="background: var(--type-task)"></span><span>Bulk relation editing</span><span class="st">in progress</span><span class="tid">anton-9xf</span></div>
+          <div class="trow"><span class="tick" style="background: var(--type-task)"></span><span>Empty + error states</span><span class="st">open</span><span class="tid">anton-3jw</span></div>
+        </div>
+      </div>
+      <div class="rail">
+        <div class="note">
+          <span class="note-label">Unchanged</span>
+          <p>Approve, claim, run-lease, PR pointer and notes all stay exactly where they are — they
+             just live on a bead typed <code>feature</code> instead of <code>epic</code>.</p>
+        </div>
+        <div class="note">
+          <span class="note-label" data-kind="open">Naming debt</span>
+          <p>Internals still say <code>execute-epic</code> / <code>epicBeadId</code>. They keep working;
+             renaming costs a DB migration and route churn for zero behaviour. Worth a follow-up bead
+             so it doesn't rot.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── 4. Roadmap ───────────────────────────────────────── -->
+  <section>
+    <div class="sec-head">
+      <h2>Roadmap</h2>
+      <span class="hint">the epic tier's own page — and the mirror of what Linear shows</span>
+    </div>
+    <div class="spec">
+      <div class="app">
+        <div class="tablewrap">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Epic</th>
+                <th scope="col">Area</th>
+                <th scope="col">Features</th>
+                <th scope="col">Shipped</th>
+                <th scope="col">Linear</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Ontology editing for curators</td>
+                <td><span class="epic-badge" data-area="ontology"><span class="txt">area:ontology</span></span></td>
+                <td class="num">2</td>
+                <td class="num">0 / 2</td>
+                <td><a class="linear-link" href="#roadmap">LIB-118</a></td>
+              </tr>
+              <tr>
+                <td>Trustworthy retrieval</td>
+                <td><span class="epic-badge" data-area="knowledge"><span class="txt">area:knowledge</span></span></td>
+                <td class="num">2</td>
+                <td class="num">0 / 2</td>
+                <td><a class="linear-link" href="#roadmap">LIB-121</a></td>
+              </tr>
+              <tr>
+                <td>Zero-touch ingestion</td>
+                <td><span class="epic-badge" data-area="ingest"><span class="txt">area:ingest</span></span></td>
+                <td class="num">2</td>
+                <td class="num">1 / 2</td>
+                <td><a class="linear-link" href="#roadmap">LIB-124</a></td>
+              </tr>
+              <tr>
+                <td>Operator ergonomics</td>
+                <td><span class="epic-badge" data-area="none"><span class="txt">no area</span></span></td>
+                <td class="num">1</td>
+                <td class="num">1 / 1</td>
+                <td><span class="unsynced">not synced — needs area:</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div class="rail">
+        <div class="note">
+          <span class="note-label">Why a table</span>
+          <p>The roadmap is read, not operated. A table answers "what's in flight and where does it
+             live in Linear" in one scan; a second board would only duplicate the first.</p>
+        </div>
+        <div class="note">
+          <span class="note-label">Sync legibility</span>
+          <p>An epic with no <code>area:</code> can't be routed to a Linear project, so it says so
+             here rather than failing silently at push time.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── 5. Linear sync ───────────────────────────────────── -->
+  <section>
+    <div class="sec-head">
+      <h2>Linear sync</h2>
+      <span class="hint">Settings › Automation — you pick the tiers, anton builds the command</span>
+    </div>
+    <div class="spec">
+      <div class="app">
+        <div class="app-bar">
+          <span class="app-title">Sync to Linear</span>
+          <span class="spacer"></span>
+          <button class="switch" type="button" role="switch" aria-checked="true" aria-label="Enable Linear sync"></button>
+        </div>
+
+        <div class="panel">
+          <div class="field">
+            <span class="lab">When it runs</span>
+            <div class="row">
+              <div class="segmented" role="group" aria-label="Sync trigger">
+                <button type="button" aria-pressed="true">After each beads push</button>
+                <button type="button" aria-pressed="true">On a schedule</button>
+              </div>
+              <input type="text" value="0 */4 * * *" aria-label="Schedule" style="width: 8.5rem" />
+            </div>
+            <p class="help">
+              Push-triggered syncs are debounced to one every 5 minutes — a single run writes to a bead
+              dozens of times, and each write nudges a push. The schedule is the backstop for when a
+              push-triggered sync fails.
+            </p>
+          </div>
+
+          <hr class="divider" />
+
+          <div class="field">
+            <span class="lab">Direction</span>
+            <div class="segmented" role="group" aria-label="Sync direction">
+              <button type="button" aria-pressed="true">Push to Linear</button>
+              <button type="button" aria-pressed="false">Pull from Linear</button>
+              <button type="button" aria-pressed="false">Both</button>
+            </div>
+            <p class="help">Push keeps beads authoritative. Both enables editing in Linear, and needs a conflict rule.</p>
+          </div>
+
+          <div class="field">
+            <span class="lab" id="types-lab">Which tiers sync</span>
+            <div class="typechips" role="group" aria-labelledby="types-lab">
+              <button class="tchip" type="button" aria-pressed="true" data-type="epic" data-count="3"><span class="mk" aria-hidden="true">✓</span>epic</button>
+              <button class="tchip" type="button" aria-pressed="true" data-type="feature" data-count="6"><span class="mk" aria-hidden="true">✓</span>feature</button>
+              <button class="tchip" type="button" aria-pressed="false" data-type="task" data-count="41"><span class="mk" aria-hidden="true">✓</span>task</button>
+              <button class="tchip" type="button" aria-pressed="false" data-type="bug" data-count="2"><span class="mk" aria-hidden="true">✓</span>bug</button>
+              <button class="tchip" type="button" aria-pressed="false" data-type="chore" data-count="5"><span class="mk" aria-hidden="true">✓</span>chore</button>
+            </div>
+            <p class="help">Epics land as top-level issues; features as sub-issues of their epic. Anything you leave off stays local.</p>
+          </div>
+
+          <div class="field">
+            <span class="lab">Also include</span>
+            <div class="row">
+              <div class="segmented" role="group" aria-label="Issue state">
+                <button type="button" aria-pressed="false">Open only</button>
+                <button type="button" aria-pressed="true">Open and closed</button>
+              </div>
+            </div>
+            <p class="help">Closed beads carry the completion back to Linear. Open-only leaves shipped work showing as in-flight.</p>
+          </div>
+
+          <hr class="divider" />
+
+          <div class="field">
+            <span class="lab">Team and projects</span>
+            <div class="row">
+              <span class="status">Team</span>
+              <input type="text" value="The Librarian (LIB)" aria-label="Linear team" style="width: 14rem" />
+            </div>
+            <div class="tablewrap">
+              <table class="maptable">
+                <thead>
+                  <tr><th scope="col">Bead label</th><th scope="col">Linear project</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td><span class="epic-badge" data-area="ontology"><span class="txt">area:ontology</span></span></td><td>Ontology</td></tr>
+                  <tr><td><span class="epic-badge" data-area="knowledge"><span class="txt">area:knowledge</span></span></td><td>Knowledge</td></tr>
+                  <tr><td><span class="epic-badge" data-area="ingest"><span class="txt">area:ingest</span></span></td><td>Ingest Engine</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="help">
+              bd holds one project id at a time, so anton runs one pass per area and restores the
+              setting afterwards. Unmapped areas are skipped and reported, never guessed.
+            </p>
+          </div>
+
+          <div class="field">
+            <label for="extra-args">Extra arguments</label>
+            <input id="extra-args" type="text" value="--create-only" />
+            <p class="help">Passed through to <code>bd linear sync</code> verbatim. Anything the panel doesn't cover, you can still reach.</p>
+          </div>
+
+          <hr class="divider" />
+
+          <div class="field">
+            <span class="lab">Preview</span>
+            <div class="preview">
+              <div class="cmd" id="cmd">bd linear sync <span class="flag">--push</span> <span class="flag">--type</span> epic,feature <span class="flag">--state</span> all <span class="flag">--create-only</span></div>
+              <p class="out" id="dry">Would push <strong>3 epics</strong> and <strong>6 features</strong> across 3 projects. <strong>48</strong> beads excluded by the tier filter.</p>
+            </div>
+            <div class="row between">
+              <div class="row">
+                <button class="btn ghost" type="button">Preview changes</button>
+                <button class="btn" type="button">Sync now</button>
+              </div>
+              <span class="status"><span class="dot" style="background: var(--ok)"></span> Last sync 2 min ago · pushed 4 · no conflicts</span>
+            </div>
+          </div>
+
+          <div class="row">
+            <span class="status"><span class="dot" style="background: var(--ok)"></span> <code>LINEAR_API_KEY</code> found in the environment</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="rail">
+        <div class="note">
+          <span class="note-label">The one real control</span>
+          <p>Everything above is a thin skin over <code>bd linear sync</code> flags. Showing the command
+             as you build it means the panel never becomes a lossy abstraction over the CLI.</p>
+        </div>
+        <div class="note">
+          <span class="note-label">Preview before push</span>
+          <p>Every setting is reversible except a bad first push, which creates issues in someone
+             else's Linear. Dry-run is one click and reports counts, not a spinner.</p>
+        </div>
+        <div class="note">
+          <span class="note-label" data-kind="risk">Before the first push</span>
+          <p>bd writes the Linear ref into <code>external_ref</code>. Any board still carrying legacy
+             <code>gh-&lt;n&gt;</code> PR pointers there loses them. The job must refuse to push until
+             the pr-ref migration has run.</p>
+        </div>
+        <div class="note">
+          <span class="note-label" data-kind="risk">Label churn</span>
+          <p>The run-lease is a label rewritten every 5 minutes on the run target — now a synced
+             feature. Either move it to metadata or confirm push ignores labels, or Linear gets an
+             activity feed of nothing.</p>
+        </div>
+        <div class="note">
+          <span class="note-label">Credentials</span>
+          <p>Read from the environment, never stored in <code>anton.db</code> — same posture as
+             <code>gh</code>. The panel reports what it found and stops there.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</div>
+
+<script>
+  // Board grouping toggle — the one interaction worth wiring, since the
+  // stage/epic tradeoff is the actual decision this page is asking for.
+  document.querySelectorAll('[data-group]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var target = btn.dataset.group;
+      document.querySelectorAll('[data-group]').forEach(function (b) {
+        b.setAttribute('aria-pressed', String(b.dataset.group === target));
+      });
+      document.querySelectorAll('[data-view]').forEach(function (v) {
+        v.hidden = v.dataset.view !== target;
+      });
+    });
+  });
+
+  // Tier chips drive the command + dry-run counts, so "which tiers sync"
+  // is something you can feel rather than read.
+  var chips = Array.prototype.slice.call(document.querySelectorAll('.tchip'));
+  var cmdEl = document.getElementById('cmd');
+  var dryEl = document.getElementById('dry');
+  var plural = function (n, word) { return n + ' ' + word + (n === 1 ? '' : 's'); };
+
+  function refresh() {
+    var on = chips.filter(function (c) { return c.getAttribute('aria-pressed') === 'true'; });
+    var off = chips.filter(function (c) { return c.getAttribute('aria-pressed') !== 'true'; });
+    var types = on.map(function (c) { return c.dataset.type; });
+
+    cmdEl.innerHTML = types.length
+      ? 'bd linear sync <span class="flag">--push</span> <span class="flag">--type</span> ' +
+        types.join(',') + ' <span class="flag">--state</span> all <span class="flag">--create-only</span>'
+      : 'bd linear sync <span class="flag">--push</span> — no tiers selected';
+
+    if (!types.length) {
+      dryEl.innerHTML = 'Nothing would sync. Pick at least one tier.';
+      return;
+    }
+    var parts = on.map(function (c) { return '<strong>' + plural(Number(c.dataset.count), c.dataset.type) + '</strong>'; });
+    var excluded = off.reduce(function (sum, c) { return sum + Number(c.dataset.count); }, 0);
+    var list = parts.length > 1
+      ? parts.slice(0, -1).join(', ') + ' and ' + parts[parts.length - 1]
+      : parts[0];
+    dryEl.innerHTML = 'Would push ' + list + ' across 3 projects.' +
+      (excluded ? ' <strong>' + excluded + '</strong> beads excluded by the tier filter.' : '');
+  }
+
+  chips.forEach(function (chip) {
+    chip.addEventListener('click', function () {
+      chip.setAttribute('aria-pressed', chip.getAttribute('aria-pressed') === 'true' ? 'false' : 'true');
+      refresh();
+    });
+  });
+  refresh();
+
+  // Segmented groups in the settings panel are illustrative; keep them
+  // clickable so the mock doesn't feel dead under the cursor.
+  document.querySelectorAll('.panel .segmented').forEach(function (group) {
+    var multi = group.getAttribute('aria-label') === 'Sync trigger';
+    group.querySelectorAll('button').forEach(function (b) {
+      b.addEventListener('click', function () {
+        if (multi) {
+          b.setAttribute('aria-pressed', b.getAttribute('aria-pressed') === 'true' ? 'false' : 'true');
+        } else {
+          group.querySelectorAll('button').forEach(function (o) {
+            o.setAttribute('aria-pressed', String(o === b));
+          });
+        }
+      });
+    });
+  });
+</script>
