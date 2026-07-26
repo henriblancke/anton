@@ -11,6 +11,15 @@ import { DEFAULT_SCAN_EXCLUDES, STRINGER_BIN_ENV, scan } from "./stringer";
 
 let dir: string;
 let prevBin: string | undefined;
+let prevTimeout: string | undefined;
+
+/** Fake stringer with a scripted body (executable node script), for the failure-path tests. */
+function writeScript(name: string, body: string[]): string {
+  const path = join(dir, name);
+  writeFileSync(path, ["#!/usr/bin/env node", ...body, ""].join("\n"), "utf8");
+  chmodSync(path, 0o755);
+  return path;
+}
 
 /** Fake stringer: records argv (minus node/script) to argvDump, writes canned signals to the -o path. */
 function writeFakeStringer(argvDump: string, signals: unknown[]): string {
@@ -32,11 +41,14 @@ function writeFakeStringer(argvDump: string, signals: unknown[]): string {
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "anton-stringer-"));
   prevBin = process.env[STRINGER_BIN_ENV];
+  prevTimeout = process.env.ANTON_STRINGER_TIMEOUT_MS;
 });
 
 afterEach(() => {
   if (prevBin === undefined) delete process.env[STRINGER_BIN_ENV];
   else process.env[STRINGER_BIN_ENV] = prevBin;
+  if (prevTimeout === undefined) delete process.env.ANTON_STRINGER_TIMEOUT_MS;
+  else process.env.ANTON_STRINGER_TIMEOUT_MS = prevTimeout;
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -95,5 +107,46 @@ describe("scan", () => {
 
     const result = await scan({ repoPath: "/repo", scanFile: join(dir, "missing.json") });
     expect(result.signalCount).toBe(0);
+  });
+
+  // anton-be1s: a killed scan's stderr is startup noise (stringer buffers collector logs to the
+  // end), so it must never be what the parked job reports.
+  it("reports a timeout kill as a timeout, not the misleading partial stderr", async () => {
+    process.env[STRINGER_BIN_ENV] = writeScript("slow-stringer", [
+      "process.stderr.write('collector gitlog: go-git: reference not found\\n');",
+      "setTimeout(() => {}, 60000);", // outlive the deadline → SIGTERMed with no output written
+    ]);
+    process.env.ANTON_STRINGER_TIMEOUT_MS = "250";
+
+    await expect(scan({ repoPath: "/repo", scanFile: join(dir, "s.json") })).rejects.toThrow(
+      /stringer timed out after 250ms \(killed with SIG/,
+    );
+    await expect(scan({ repoPath: "/repo", scanFile: join(dir, "s.json") })).rejects.not.toThrow(
+      /gitlog/,
+    );
+  });
+
+  it("surfaces stderr for a genuine non-zero exit", async () => {
+    process.env[STRINGER_BIN_ENV] = writeScript("failing-stringer", [
+      "process.stderr.write('scan aborted: unreadable config at .stringer.toml\\n');",
+      "process.exit(2);",
+    ]);
+
+    await expect(scan({ repoPath: "/repo", scanFile: join(dir, "s.json") })).rejects.toThrow(
+      /unreadable config at \.stringer\.toml/,
+    );
+    await expect(scan({ repoPath: "/repo", scanFile: join(dir, "s.json") })).rejects.not.toThrow(
+      /timed out/,
+    );
+  });
+
+  it("keeps a caller abort an AbortError rather than reporting a timeout", async () => {
+    process.env[STRINGER_BIN_ENV] = writeScript("slow-stringer", ["setTimeout(() => {}, 60000);"]);
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 50);
+
+    await expect(
+      scan({ repoPath: "/repo", scanFile: join(dir, "s.json"), signal: ac.signal }),
+    ).rejects.toMatchObject({ name: "AbortError" });
   });
 });
