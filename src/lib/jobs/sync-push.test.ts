@@ -7,8 +7,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
-import { createDoltSync } from "../beads/bd";
-import { PoisonError } from "./errors";
+import { createDoltSync, type SyncOutcome } from "../beads/bd";
+import { PoisonError, SyncNotWiredError } from "./errors";
 import { enqueueSyncPushDeduped, getJob, type Clock } from "./queue";
 import { JobRunner, type JobContext, type RunnerConfig } from "./runner";
 import { DEFAULT_CONFIG } from "./runner";
@@ -49,10 +49,20 @@ afterEach(() => t.close());
 
 describe("makeSyncPushHandler", () => {
   it("pushes the project's repo through the injected push and completes", async () => {
-    const push = vi.fn(async () => {});
+    const push = vi.fn(async (): Promise<SyncOutcome> => "synced");
     const handler = makeSyncPushHandler({ db: t.db, push });
     await handler(fakeCtx({ payload: { projectId: "p1" } }));
     expect(push).toHaveBeenCalledWith("/tmp/p1");
+  });
+
+  it("signals not-wired instead of completing a push that delivered nothing", async () => {
+    // A repo with no Dolt remote RESOLVES the push (it isn't an error), but the write never left
+    // this machine — completing here would settle the job done on undelivered work.
+    const push = vi.fn(async (): Promise<SyncOutcome> => "not-wired");
+    const handler = makeSyncPushHandler({ db: t.db, push });
+    await expect(handler(fakeCtx({ payload: { projectId: "p1" } }))).rejects.toBeInstanceOf(
+      SyncNotWiredError,
+    );
   });
 
   it("propagates a push failure so the runner can retry/park", async () => {
@@ -64,7 +74,7 @@ describe("makeSyncPushHandler", () => {
   });
 
   it("poisons a vanished project so it parks at once instead of burning retries", async () => {
-    const push = vi.fn(async () => {});
+    const push = vi.fn(async (): Promise<SyncOutcome> => "synced");
     const handler = makeSyncPushHandler({ db: t.db, push });
     await expect(
       handler(fakeCtx({ payload: { projectId: "gone" }, projectId: "gone" })),
@@ -122,6 +132,51 @@ describe("sync-push durability (runner + real coalescer)", () => {
     job = await getJob(t.db, id);
     expect(job?.status).toBe("queued");
     expect(job?.attempts).toBe(0);
+  });
+
+  it("keeps a not-wired project's job pending (no attempt burn) and delivers once a remote is wired", async () => {
+    const clock = new FakeClock(1_700_000_000_000);
+    let wired = false;
+    const pushes: string[] = [];
+    const coalescer = createDoltSync(async (cwd, args) => {
+      if (!wired) {
+        throw Object.assign(new Error("bd"), { stderr: "No remote is configured — skipping.\n" });
+      }
+      if (args[1] === "push") pushes.push(cwd);
+      return "";
+    });
+
+    const runner = new JobRunner({ db: t.db, clock, config: CONFIG });
+    runner.registerHandler(
+      "sync-push",
+      makeSyncPushHandler({ db: t.db, push: (cwd) => coalescer(cwd, "push") }),
+    );
+    const id = enqueueSyncPushDeduped(t.db, clock, "p1");
+
+    // No remote: nothing was published, so the job must NOT settle done — it stays queued for a
+    // recheck, and the attempt is refunded so a local-only project never parks a queue for a human.
+    await runner.tickOnce();
+    await runner.whenIdle();
+    let job = await getJob(t.db, id);
+    expect(job?.status).toBe("queued");
+    expect(job?.attempts).toBe(0);
+    expect(job?.lastError).toMatch(/not wired/i);
+    expect(pushes).toEqual([]);
+
+    // Rechecks stay on the slow cadence rather than spinning at the retry backoff.
+    clock.advance(CONFIG.backoffMaxMs);
+    await runner.tickOnce();
+    await runner.whenIdle();
+    expect((await getJob(t.db, id))?.status).toBe("queued");
+
+    // A human wires the remote (`anton init`): the very next recheck delivers and completes.
+    wired = true;
+    clock.advance(CONFIG.notWiredRetryMs);
+    await runner.tickOnce();
+    await runner.whenIdle();
+    job = await getJob(t.db, id);
+    expect(job?.status).toBe("done");
+    expect(pushes).toEqual(["/tmp/p1"]);
   });
 
   it("completes when the push pass is a no-op on a caught-up repo", async () => {

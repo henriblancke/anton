@@ -503,7 +503,19 @@ describe("createDoltSync", () => {
     const second = sync("/repo");
     release();
     await expect(first).rejects.toThrow(/connection reset/);
-    await expect(second).resolves.toBeUndefined();
+    await expect(second).resolves.toBe("synced");
+  });
+
+  it("resolves the pass's outcome so callers can tell delivery from a not-wired repo", async () => {
+    // The durable sync-push job settles on this value: "not-wired" published nothing, so a caller
+    // that only saw the promise resolve would mark undelivered work done (anton-x7la review).
+    const wired = createDoltSync(async () => "");
+    await expect(wired("/repo-wired", "push")).resolves.toBe("synced");
+
+    const bare = createDoltSync(async () => {
+      throw execError({ stderr: "No remote is configured — skipping.\n" });
+    });
+    await expect(bare("/repo-bare", "push")).resolves.toBe("not-wired");
   });
 
   it("runs again after a completed sync (no stale in-flight state)", async () => {

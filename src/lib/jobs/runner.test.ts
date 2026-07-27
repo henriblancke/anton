@@ -9,7 +9,7 @@ import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
 import { getBurnAverage, recordBurnSample } from "../burn";
 import type { ClaudeUsage } from "../claude/usage";
-import { PoisonError, RunAlreadyLiveError, UsageLimitError } from "./errors";
+import { PoisonError, RunAlreadyLiveError, SyncNotWiredError, UsageLimitError } from "./errors";
 import { complete, enqueue, getJob, park, reschedule, toMs, type Clock } from "./queue";
 import { DEFAULT_BUDGET_POLICY, type BudgetPolicy } from "./budget";
 import {
@@ -92,6 +92,24 @@ describe("nextAction (pure durability policy)", () => {
     expect(classifyError(new RunAlreadyLiveError("live on B"))).toEqual({
       kind: "lease-held",
       error: "live on B",
+    });
+  });
+
+  it("rechecks a not-wired project on a slow cadence and refunds the attempt (anton-x7la)", () => {
+    // Nothing was delivered, so the job must not complete — but only a human wiring a remote can
+    // unblock it, so it never burns attempts toward a park either, even past maxAttempts.
+    const a = nextAction(CONFIG, { attempts: 3 }, { kind: "not-wired", error: "no remote" }, now);
+    expect(a.action).toBe("reschedule");
+    if (a.action !== "reschedule") throw new Error("unreachable");
+    expect(a.runAtMs).toBe(now + CONFIG.notWiredRetryMs);
+    expect(a.refundAttempt).toBe(true);
+    expect(a.lastError).toMatch(/not wired/i);
+  });
+
+  it("classifies SyncNotWiredError as a not-wired outcome (anton-x7la)", () => {
+    expect(classifyError(new SyncNotWiredError("no remote"))).toEqual({
+      kind: "not-wired",
+      error: "no remote",
     });
   });
 

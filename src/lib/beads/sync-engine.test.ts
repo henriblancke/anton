@@ -84,9 +84,9 @@ describe("createSyncEngine", () => {
     const pulled: number[] = [];
     const { engine, clock } = engineWith({
       listProjects: () => projects(cwd),
-      sync: (c) => {
+      sync: async (c) => {
         pulled.push(clock.now());
-        return sync(c, "backstop" as SyncRequest);
+        await sync(c, "backstop" as SyncRequest);
       },
     });
 
@@ -160,7 +160,9 @@ describe("createSyncEngine", () => {
 
     const { engine, clock } = engineWith({
       listProjects: () => projects(cwd),
-      sync: (c) => sync(c, "backstop" as SyncRequest),
+      sync: async (c) => {
+        await sync(c, "backstop" as SyncRequest);
+      },
     });
 
     await engine.tick(); // ahead → backstop retries the push (still failing → beat backs off)
@@ -186,7 +188,9 @@ describe("createSyncEngine", () => {
     });
     const { engine, clock } = engineWith({
       listProjects: () => projects(cwd),
-      sync: (c) => sync(c, "backstop" as SyncRequest),
+      sync: async (c) => {
+        await sync(c, "backstop" as SyncRequest);
+      },
     });
     await engine.tick(); // cold start: one reconciling full pass (its push lands) — count can't survive a restart
     expect(pushes).toEqual([cwd]);
