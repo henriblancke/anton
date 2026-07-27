@@ -246,6 +246,19 @@ describe("Bulk kill bar", () => {
     expect(screen.queryByText("cancelled")).toBeNull();
   });
 
+  it("reports a failure when a 200 carries no readable buckets, rather than claiming a kill", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("<html>", { status: 200 })));
+
+    render(<JobList jobs={[job("j-a", "running")]} slug="anton" />);
+    fireEvent.click(selectAll());
+    bulkKill();
+
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("Unexpected"));
+    expect(screen.queryByText("cancelled")).toBeNull();
+    expect(screen.getByText("running")).toBeDefined();
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
   it("clears stale refusals when the operator re-arms for another attempt", async () => {
     vi.stubGlobal(
       "fetch",

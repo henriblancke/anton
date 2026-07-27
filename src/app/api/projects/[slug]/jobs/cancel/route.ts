@@ -1,8 +1,8 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 
-import { PAGE_SIZE } from "@/components/runs/pagination";
 import { cancelJob } from "@/lib/jobs/service";
+import { PAGE_SIZE } from "@/lib/pagination";
 import { withProject } from "../../resolve-project";
 import { CANCEL_FAILURE_MESSAGES, type CancelFailureReason } from "../cancel-outcome";
 

@@ -27,7 +27,12 @@ export async function requestKill<T>(url: string, body?: unknown): Promise<KillO
     if (!res.ok) {
       return { ok: false, error: parsed?.error ?? `Kill failed (${res.status})` };
     }
-    return { ok: true, data: parsed as T };
+    // Both cancel routes always answer 200 with a JSON body, so an unparseable one is a broken
+    // response — never a phantom success the batch caller would then read buckets off of.
+    if (parsed === null) {
+      return { ok: false, error: "Unexpected response from server" };
+    }
+    return { ok: true, data: parsed };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : "Failed to kill job" };
   }

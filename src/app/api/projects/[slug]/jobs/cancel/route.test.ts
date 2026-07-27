@@ -10,7 +10,7 @@ import { randomUUID } from "node:crypto";
 import { makeTestDb, type TestDb } from "@/lib/db/testing";
 import * as schema from "@/lib/db/schema";
 import { jsonRequest, paramsCtx } from "@/lib/testing/integration";
-import { PAGE_SIZE } from "@/components/runs/pagination";
+import { PAGE_SIZE } from "@/lib/pagination";
 
 // One db for the whole file: the jobs service caches a runner singleton bound to getDb() on first
 // use, so every test must share the same connection.
