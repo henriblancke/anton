@@ -175,8 +175,12 @@ export interface RoadmapRow {
 export interface TicketRow extends Ticket {
   type: string; // bead issue_type
   domain?: string;
+  /** Nearest `epic` ancestor — the product outcome this row rolls up to. */
   epicId?: string;
   epicTitle?: string;
+  /** Nearest `feature` ancestor — the run target whose worktree/PR this row ships in. */
+  featureId?: string;
+  featureTitle?: string;
 }
 export interface TicketFilters {
   agent?: string;
@@ -188,8 +192,29 @@ export interface TicketFilters {
   epic?: string;
   /** Abandoned work: "active" hides it, "abandoned" shows only it; unset shows everything. */
   outcome?: string;
+  /** Tier placement: "unassigned" shows only work detached from the tier above it (see
+   * `isUnassigned`), "assigned" only work that is attached; unset shows everything. */
+  assigned?: string;
   q?: string; // free-text over title
 }
+
+/**
+ * Every ticket filter, in one place. The tickets page, its API route, and the filter toolbar all
+ * read this list — they used to each keep their own copy, and `outcome` was silently dropped by two
+ * of the three, leaving the Outcome select wired to nothing.
+ */
+export const TICKET_FILTER_KEYS: (keyof TicketFilters)[] = [
+  "agent",
+  "risk",
+  "size",
+  "domain",
+  "status",
+  "type",
+  "epic",
+  "outcome",
+  "assigned",
+  "q",
+];
 
 // ── Ticket detail popup ──
 export interface TicketDetail extends Ticket {

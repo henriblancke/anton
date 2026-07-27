@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyFilters, buildTicketRows } from "./tickets";
+import { applyFilters, buildTicketRows, isUnassigned } from "./tickets";
 import type { Bead } from "./beads/bd";
 import type { TicketRow } from "./types";
 
@@ -141,5 +141,83 @@ describe("buildTicketRows (three-tier grouping)", () => {
     const b = bead("c-2", { parent: "c-1" });
     const rows = buildTicketRows([epic, feature, a, b]);
     expect(rows.map((r) => r.id).sort()).toEqual(["c-1", "c-2", "e-1", "f-1"]);
+  });
+
+  it("carries the nearest FEATURE ancestor, resolved through arbitrary depth", () => {
+    const subtask = bead("s-1", { title: "Nested step", parent: "t-1" });
+    const rows = buildTicketRows([epic, feature, task, subtask]);
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    expect(byId.get("f-1")?.featureId).toBeUndefined(); // a feature is not its own feature
+    expect(byId.get("t-1")?.featureId).toBe("f-1");
+    expect(byId.get("t-1")?.featureTitle).toBe("Inline editor");
+    // Two hops up: the subtask ships in the same worktree and PR as the task above it.
+    expect(byId.get("s-1")?.featureId).toBe("f-1");
+  });
+
+  it("finds the feature above a ticket even when NO epic holds that feature", () => {
+    // The row-ordering descent starts at epics, so a parentless feature's subtree never enters it.
+    const loose = bead("f-2", { title: "Orphan feature", issue_type: "feature" });
+    const child = bead("t-9", { parent: "f-2" });
+    const rows = buildTicketRows([loose, child]);
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    expect(byId.get("t-9")?.featureId).toBe("f-2");
+    expect(byId.get("t-9")?.epicId).toBeUndefined();
+  });
+});
+
+describe("isUnassigned", () => {
+  it("never treats an epic as unassigned — it is the top tier", () => {
+    expect(isUnassigned(makeRow({ id: "e-1", title: "Outcome", type: "epic" }))).toBe(false);
+  });
+
+  it("treats a feature with no epic above it as unassigned", () => {
+    expect(isUnassigned(makeRow({ id: "f-1", title: "F", type: "feature" }))).toBe(true);
+    expect(
+      isUnassigned(makeRow({ id: "f-2", title: "F", type: "feature", epicId: "e-1" })),
+    ).toBe(false);
+  });
+
+  it("treats a working-layer bead with no feature above it as unassigned", () => {
+    expect(isUnassigned(makeRow({ id: "t-1", title: "T" }))).toBe(true);
+    expect(isUnassigned(makeRow({ id: "t-2", title: "T", featureId: "f-1" }))).toBe(false);
+  });
+
+  it("flags a ticket parented straight to a container epic — it rides no card and ships in no PR", () => {
+    // Has an epic but no feature: the exact shape the tier model calls a dead bead.
+    expect(isUnassigned(makeRow({ id: "t-3", title: "T", epicId: "e-1" }))).toBe(true);
+  });
+});
+
+describe("applyFilters: assigned", () => {
+  const rows = [
+    makeRow({ id: "e-1", title: "Outcome", type: "epic" }),
+    makeRow({ id: "f-1", title: "Held feature", type: "feature", epicId: "e-1" }),
+    makeRow({ id: "f-2", title: "Loose feature", type: "feature" }),
+    makeRow({ id: "t-1", title: "Held task", featureId: "f-1", epicId: "e-1" }),
+    makeRow({ id: "t-2", title: "Loose task" }),
+    makeRow({ id: "t-3", title: "Task under a container epic", epicId: "e-1" }),
+  ];
+
+  it("shows only work no epic or feature holds", () => {
+    expect(applyFilters(rows, { assigned: "unassigned" }).map((r) => r.id)).toEqual([
+      "f-2",
+      "t-2",
+      "t-3",
+    ]);
+  });
+
+  it("shows only work that is held, epics included", () => {
+    expect(applyFilters(rows, { assigned: "assigned" }).map((r) => r.id)).toEqual([
+      "e-1",
+      "f-1",
+      "t-1",
+    ]);
+  });
+
+  it("shows everything when unset, and composes with the other filters", () => {
+    expect(applyFilters(rows, {})).toHaveLength(6);
+    expect(
+      applyFilters(rows, { assigned: "unassigned", type: "feature" }).map((r) => r.id),
+    ).toEqual(["f-2"]);
   });
 });
