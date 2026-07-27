@@ -138,6 +138,26 @@ export interface Board {
   sync: SyncStatusView;
 }
 
+// ── Roadmap page ──
+/**
+ * One product epic on the roadmap — the epic tier's own view, built server-side by buildRoadmap
+ * (lib/roadmap.ts). Deliberately thin: the roadmap is read, not operated, so a row carries only
+ * what its five columns show (docs/design/2026-07-26-tier-and-linear-ux.md).
+ */
+export interface RoadmapRow {
+  id: string;
+  title: string;
+  /** The epic's `area:` designator — what Linear project routing keys on. Absent means the epic
+   * can't be routed, which the row says out loud rather than failing silently at push time. */
+  area?: string;
+  /** `feature` children, excluding abandoned ones. */
+  features: number;
+  /** How many of those features shipped. */
+  shipped: number;
+  /** The tracker ref bd's Linear sync wrote to `external_ref` — displayed, never fetched. */
+  linearRef?: string;
+}
+
 // ── Tickets page ──
 export interface TicketRow extends Ticket {
   type: string; // bead issue_type

@@ -23,6 +23,17 @@ export function TicketsIcon({ className }: { className?: string }) {
   );
 }
 
+/** Staggered bars — the epic tier read as a plan over time, not as board columns. */
+export function RoadmapIcon({ className }: { className?: string }) {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" className={className} fill="currentColor" aria-hidden="true">
+      <rect x="2" y="3" width="7" height="2.4" rx="1.2" />
+      <rect x="5" y="6.8" width="9" height="2.4" rx="1.2" />
+      <rect x="3.5" y="10.6" width="6" height="2.4" rx="1.2" />
+    </svg>
+  );
+}
+
 export function DependenciesIcon({ className }: { className?: string }) {
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" className={className} fill="none" stroke="currentColor" strokeWidth={1.3} aria-hidden="true">
