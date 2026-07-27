@@ -38,10 +38,14 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
   const base = await githubBaseUrl(project.repoPath);
   const parentEpic = parentEpicOf(lite, all);
 
-  // The board renders orphan (parentless) non-epic beads as single-ticket pseudo-epic cards
-  // (board.ts ticketAsEpic). Mirror that here so opening one shows its detail instead of 404ing —
-  // it becomes an epic whose only member is itself, with no children and no epic-graph edges.
-  if (!beads.isEpic(lite)) {
+  const childBeads = all.filter((b) => beads.parentOf(b) === epicId);
+
+  // A LEAF target — a parentless task/bug chip, or a feature shaped as one unit of work — is its
+  // own single ticket, so it renders as an epic whose only member is itself, with no children and
+  // no epic-graph edges. Mirrors what the run does (beads.groupsChildren, shared with execute-epic):
+  // a feature WITH shaped tickets under it is a grouping target, and must show those tickets and
+  // their dependency graph — reporting the feature itself would hide the work the run acts on.
+  if (!beads.groupsChildren(lite, childBeads)) {
     const self = toTicket(lite);
     const epic = toEpic(lite, {
       goal: parseGoal(full.description),
@@ -53,9 +57,6 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
     return { epic, description: full.description, tickets: [self], edges: [], run, parentEpic };
   }
 
-  const childBeads = all.filter(
-    (b) => ((b.parent ?? b.parent_id) as string | undefined) === epicId,
-  );
   const tickets = childBeads.map(toTicket);
 
   // The epic-detail header shows the epic's own agent/risk/size chips (like the board card and the

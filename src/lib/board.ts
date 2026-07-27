@@ -126,7 +126,9 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   // `chore`/etc. is not a run target, so a chip for it would advertise `Approve & run` yet the
   // approve route + runner reject it via the same isRunTarget gate — a permanent 422/park. Gate
   // here so the board never surfaces an item it can't actually run.
-  const orphanTasks = workingBeads.filter((t) => !claimedTaskIds.has(t.id) && beads.isRunTarget(t));
+  const orphanTasks = workingBeads.filter(
+    (t) => !claimedTaskIds.has(t.id) && beads.isRunTarget(t, workBeads),
+  );
   for (const task of orphanTasks) {
     // A standalone target never appears in the epic-graph rollup, so derive its blockers from its
     // own `blocks` edges — the same set the approve route + runner gate on. Feeds the chip's

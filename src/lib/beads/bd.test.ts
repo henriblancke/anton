@@ -22,25 +22,29 @@ describe("beads.isRunTarget", () => {
   const taskChild = bead({ id: "t-1", issue_type: "task", parent: "e-1" });
 
   it("accepts a feature — the tier that owns a worktree and a PR", () => {
-    expect(beads.isRunTarget(bead({ issue_type: "feature" }))).toBe(true);
+    const loose = bead({ id: "f-2", issue_type: "feature" });
+    expect(beads.isRunTarget(loose, [loose])).toBe(true);
     // Under its epic it is STILL the run target: the epic above it is the container, not the run.
     expect(beads.isRunTarget(featureChild, [epic, featureChild])).toBe(true);
   });
 
   it("accepts a parentless task or bug (epic-of-one)", () => {
-    expect(beads.isRunTarget(bead({ issue_type: "task" }))).toBe(true);
-    expect(beads.isRunTarget(bead({ issue_type: "bug" }))).toBe(true);
+    const task = bead({ issue_type: "task" });
+    const bug = bead({ issue_type: "bug" });
+    expect(beads.isRunTarget(task, [task])).toBe(true);
+    expect(beads.isRunTarget(bug, [bug])).toBe(true);
   });
 
   it("rejects a task/bug that has a parent — it's a child ticket, run via its run target", () => {
-    expect(beads.isRunTarget(bead({ issue_type: "task", parent: "bd-1" }))).toBe(false);
-    expect(beads.isRunTarget(bead({ issue_type: "bug", parent_id: "bd-1" }))).toBe(false);
+    const task = bead({ issue_type: "task", parent: "bd-1" });
+    const bug = bead({ issue_type: "bug", parent_id: "bd-1" });
+    expect(beads.isRunTarget(task, [task])).toBe(false);
+    expect(beads.isRunTarget(bug, [bug])).toBe(false);
   });
 
   it("accepts an epic with no feature children — the legacy run target, byte-identical", () => {
     expect(beads.isRunTarget(epic, [epic, taskChild])).toBe(true);
-    // No board passed at all (a single `bd show`) answers the same pre-tier way.
-    expect(beads.isRunTarget(epic)).toBe(true);
+    expect(beads.isRunTarget(epic, [epic])).toBe(true);
   });
 
   it("rejects an epic that HAS feature children — it is a container, not a run", () => {
@@ -50,10 +54,10 @@ describe("beads.isRunTarget", () => {
   });
 
   it("rejects a non-work type (chore, learning, molecule, …) even when parentless", () => {
-    expect(beads.isRunTarget(bead({ issue_type: "chore" }))).toBe(false);
-    expect(beads.isRunTarget(bead({ issue_type: "learning" }))).toBe(false);
-    expect(beads.isRunTarget(bead({ issue_type: "molecule" }))).toBe(false);
-    expect(beads.isRunTarget(bead({ issue_type: undefined }))).toBe(false);
+    for (const type of ["chore", "learning", "molecule", undefined]) {
+      const b = bead({ issue_type: type });
+      expect(beads.isRunTarget(b, [b])).toBe(false);
+    }
   });
 });
 
@@ -86,6 +90,32 @@ describe("beads.isContainer", () => {
   it("does not count a feature parented elsewhere", () => {
     const other = bead({ id: "f-1", issue_type: "feature", parent: "e-2" });
     expect(beads.isContainer(epic, [epic, other])).toBe(false);
+  });
+});
+
+describe("beads.groupsChildren", () => {
+  // The rule execute-epic (which tickets a run works through) and epic-detail (which tickets its
+  // page shows) share, so a run and its detail page can't disagree about the target's contents.
+  const child = bead({ id: "t-1", issue_type: "task", parent: "f-1" });
+
+  it("an epic always groups — even a childless one (it poisons as a run, exactly as before)", () => {
+    const epic = bead({ id: "e-1", issue_type: "epic" });
+    expect(beads.groupsChildren(epic, [])).toBe(true);
+    expect(beads.groupsChildren(epic, [child])).toBe(true);
+  });
+
+  it("a feature groups once tickets are shaped under it", () => {
+    const feature = bead({ id: "f-1", issue_type: "feature" });
+    expect(beads.groupsChildren(feature, [child])).toBe(true);
+  });
+
+  it("a feature with no children IS its own ticket — a leaf, not an empty group", () => {
+    expect(beads.groupsChildren(bead({ id: "f-1", issue_type: "feature" }), [])).toBe(false);
+  });
+
+  it("a task/bug is always a leaf", () => {
+    expect(beads.groupsChildren(bead({ id: "t-9", issue_type: "task" }), [child])).toBe(false);
+    expect(beads.groupsChildren(bead({ id: "b-9", issue_type: "bug" }), [])).toBe(false);
   });
 });
 

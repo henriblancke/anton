@@ -91,11 +91,9 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   );
   // A standalone task/bug (epic-of-one) lives in `standalone`, not `columns`, so it carries no
   // epic-graph readiness — but it can still hold cross-item `blocks` edges. It must be found here
-  // or a valid run target 404s, and it must be gated on its own open blockers below.
-  // NOTE: a feature NESTED under an epic passes the runnability gate above but is still rendered as
-  // a child ticket by getBoard, so it lands in neither map and 404s here. It is also unreachable in
-  // the UI for the same reason; both close together when the board is re-keyed off run targets
-  // (anton-aul8, which depends on this predicate). A parentless feature already resolves as a chip.
+  // or a valid run target 404s, and it must be gated on its own open blockers below. Every feature
+  // — nested or parentless — is a board CARD since anton-aul8 re-keyed getBoard off run targets, so
+  // it resolves in `columns` above and carries the epic-graph rollup's readiness.
   const standalone = epic
     ? undefined
     : STAGES.map((stage) => board.standalone[stage].find((e) => e.id === epicId)).find(Boolean);

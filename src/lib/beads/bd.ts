@@ -742,15 +742,27 @@ export const beads = {
    * execute-epic (the run gate) and the approve route (validating targets before enqueue) so both
    * agree on what "runnable" means.
    *
-   * `board` is the bead list the container check reads. It defaults to empty — which answers the
-   * pre-tier question, where every epic is runnable — so a caller holding a single bead (a
-   * `bd show`) keeps today's behaviour. Pass the full list anywhere a container epic must be
-   * refused rather than silently run.
+   * `board` — the bead list the container check reads — is REQUIRED, deliberately: a permissive
+   * default would answer the pre-tier question (every epic is runnable) at every boundary that
+   * holds only a single `bd show` bead, letting a container epic be claimed, PR-linked and moved
+   * to review, after which review-fix would run it and close its feature children on merge. Every
+   * classification site loads the full list already; pass it.
    */
-  isRunTarget: (b: Bead, board: Bead[] = []): boolean =>
+  isRunTarget: (b: Bead, board: Bead[]): boolean =>
     b.issue_type === "feature" ||
     (beads.isEpic(b) && !beads.isContainer(b, board)) ||
     ((b.issue_type === "task" || b.issue_type === "bug") && !beads.parentOf(b)),
+
+  /**
+   * Does this run target execute its CHILDREN as its tickets, rather than being its own single
+   * ticket? An epic always groups (a childless one is a poison run, exactly as before the tier
+   * split); a feature groups only once tickets are shaped under it — a feature shaped as one unit
+   * of work IS its own ticket. Everything else is a leaf. Shared by execute-epic (which tickets a
+   * run works through) and epic-detail (which tickets its page shows) so the run and its detail
+   * page never disagree about what the target contains.
+   */
+  groupsChildren: (b: Bead, children: Bead[]): boolean =>
+    beads.isEpic(b) || (b.issue_type === "feature" && children.length > 0),
 
   // ── cross-machine run-liveness lease (anton-jz1) ──
 

@@ -97,6 +97,20 @@ describe("inReviewEpics", () => {
     expect(inReviewEpics([child, closed, noLabel, noRef])).toEqual([]);
   });
 
+  it("selects a feature — the tier that owns the worktree and the PR", () => {
+    const epic = bead({ id: "epic-1", issue_type: "epic" });
+    const feature = bead({ id: "feat-1", issue_type: "feature", parent: "epic-1" });
+    expect(inReviewEpics([epic, feature]).map((b) => b.id)).toEqual(["feat-1"]);
+  });
+
+  it("excludes a container epic — its features carry their own PRs, and a merge would close them", () => {
+    // A container epic can be PR-linked by hand. Classifying it against the full list keeps it out
+    // of the sweep: finalizeMergedEpic would otherwise close its feature children (anton-9pkk review).
+    const epic = bead({ id: "epic-1", issue_type: "epic" });
+    const feature = bead({ id: "feat-1", issue_type: "feature", parent: "epic-1", labels: [] });
+    expect(inReviewEpics([epic, feature]).map((b) => b.id)).toEqual([]);
+  });
+
   it("a tracker URL in external_ref (no metadata.pr) is NOT swept — external_ref is not the PR channel", () => {
     // anton-76ej: enabling a tracker integration (e.g. Linear) parks its URL in external_ref. The
     // sweep reads the PR pointer through getPrRef, which honors only metadata.pr or a legacy gh-* ref

@@ -506,6 +506,61 @@ process.exit(0);`),
     expect((await beads.show(repo, dependent)).labels ?? []).toContain("stage:in-review");
   });
 
+  it("parks a FEATURE target blocked by an inferred cross-feature edge (not just its own edges)", async () => {
+    // A feature is a graph UNIT (epic-graph isUnit), so its blockers come from the epic-graph
+    // rollup — including edges inferred from ticket-level `blocks` between two features. Deriving
+    // them from the feature's OWN edges instead (standaloneBlockers) sees nothing here, so a
+    // blocked feature would start out of sequence while the approve route would have refused it.
+    // Only the park is asserted: the unblock→resume half is covered by the epic case above.
+    const mkChild = (title: string, parent: string) => {
+      const p = JSON.parse(
+        execFileSync(
+          "bd",
+          ["create", title, "--type", "task", "--parent", parent, "--acceptance", "x", "--json"],
+          { cwd: repo, encoding: "utf8" },
+        ),
+      );
+      return (Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string;
+    };
+    const blockedFeature = await beads.create(repo, {
+      title: "Blocked feature",
+      type: "feature",
+      description: "## Goal\nBF",
+    });
+    await beads.approve(repo, blockedFeature);
+    const blockerFeature = await beads.create(repo, { title: "Blocker feature", type: "feature" });
+    const blockedTicket = mkChild("Blocked ticket", blockedFeature);
+    const blockerTicket = mkChild("Blocker ticket", blockerFeature);
+    // Ticket-level edge: rolls up to blockedFeature → blockerFeature. Neither feature carries the
+    // raw edge, so it is invisible to a target's own-edge lookup.
+    await beads.link(repo, blockedTicket, blockerTicket, "blocks");
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    const jobId = await runner.enqueue({
+      type: "execute-epic",
+      projectId,
+      payload: { projectId, epicBeadId: blockedFeature },
+    });
+    await runner.tickOnce();
+    await runner.whenIdle();
+
+    const job = await getJob(tdb.db, jobId);
+    expect(job?.status).toBe("parked");
+    expect(job?.lastError).toMatch(/blocked by/i);
+    expect(job?.lastError).toContain(blockerFeature); // the UNIT that ships the blocking work
+    // Pre-flight: no run row, and the feature's ticket is untouched.
+    expect(
+      (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === blockedFeature),
+    ).toBeUndefined();
+    expect((await beads.show(repo, blockedTicket)).status).toBe("open");
+  });
+
   it("blocks a zero-diff ticket, halts the epic, and never closes or dispatches downstream (issue #46 root cause #1)", async () => {
     // A clean agent exit that leaves NO diff delivered nothing — the false-success in issue #46.
     // The run must NOT close the ticket: it blocks it (with an operator note, not a silent re-queue

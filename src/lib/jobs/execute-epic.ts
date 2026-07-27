@@ -10,7 +10,7 @@ import { randomUUID } from "node:crypto";
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { ownerOf } from "../beads/claim";
 import { humanNotesPromptBlock } from "../beads/notes";
-import { computeEpicGraph, epicStandaloneBlockers, standaloneBlockers } from "../epic-graph";
+import { computeEpicGraph, epicStandaloneBlockers, isUnit, standaloneBlockers } from "../epic-graph";
 import { loadAgentPrompt } from "../claude/agent-prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
 import { runClaude, type ClaudeEvent, type ClaudeResult } from "../claude/driver";
@@ -150,17 +150,20 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     // resumed) when the abandon landed; a job that was RUNNING is cancelled by the abandon itself.
     if (beads.isAbandoned(target)) return;
 
-    // Compute the epic's open blockers from a board snapshot. An epic's blockers come from the
-    // epic-graph rollup; a standalone task/bug (epic-of-one) never appears there, so derive its
-    // blockers from its own `blocks` edges. An epic also inherits any open standalone (parentless
-    // task/bug) prerequisite that the epic-graph rollup drops (epicStandaloneBlockers) — the same
-    // gap the approve route closes. The epic-vs-standalone shape can't change across a pull, so
-    // capture it here (while `target` is narrowed) and reuse it against the freshly-pulled board in
-    // step 0 — `target` is a `let` reassigned there, so reading it inside this closure would widen
-    // back to `Bead | undefined`.
-    const targetIsEpic = beads.isEpic(target);
+    // Compute the target's open blockers from a board snapshot. A GRAPH UNIT — every feature and
+    // every epic (epic-graph's isUnit) — takes its blockers from the epic-graph rollup, which is
+    // where cross-unit edges inferred from ticket-level `blocks` land; keying on isEpic alone would
+    // send a feature down the standalone path and miss every inferred blocker the approve route
+    // gates on. A standalone task/bug (epic-of-one) never appears in the rollup, so derive its
+    // blockers from its own `blocks` edges. A unit also inherits any open standalone (parentless
+    // task/bug) prerequisite that the rollup drops (epicStandaloneBlockers) — the same gap the
+    // approve route closes. The unit-vs-standalone shape can't change across a pull, so capture it
+    // here (while `target` is narrowed) and reuse it against the freshly-pulled board in step 0 —
+    // `target` is a `let` reassigned there, so reading it inside this closure would widen back to
+    // `Bead | undefined`.
+    const targetIsUnit = isUnit(target);
     const computeBlockers = (board: Bead[]): string[] =>
-      targetIsEpic
+      targetIsUnit
         ? [
             ...(computeEpicGraph(board).epics.find((n) => n.id === epicBeadId)?.blockedBy ?? []),
             ...epicStandaloneBlockers(board, epicBeadId),
@@ -189,11 +192,10 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     // An epic always groups (a childless one poisons below, exactly as before the tier split); a
     // feature groups only once tickets have been shaped under it — a feature shaped as one unit of
     // work is its own ticket, so it must not poison for having no children. A parentless task/bug
-    // is always a leaf, unchanged.
+    // is always a leaf, unchanged. The rule is shared with epic-detail (beads.groupsChildren) so a
+    // run and its detail page never disagree about which tickets the target contains.
     const children = childrenOf(all, epicBeadId);
-    const groupsChildren =
-      beads.isEpic(target) || (target.issue_type === "feature" && children.length > 0);
-    const standaloneRun = !groupsChildren;
+    const standaloneRun = !beads.groupsChildren(target, children);
     let tickets = standaloneRun ? [target] : children;
     if (tickets.length === 0) throw new PoisonEpic(`epic ${epicBeadId} has no tickets`);
 

@@ -91,9 +91,12 @@ function ownedByOperator(b: Bead, operator: string | undefined): boolean {
 
 /**
  * In-review run targets = open run targets tagged stage:in-review that carry a PR external-ref,
- * filtered to the ones this operator may act on. A run target is an epic OR a standalone parentless
- * task/bug (an epic-of-one) — both open a PR and sit in review until it merges, so both must be
- * swept here. A standalone target has no children, so `handleEpic`/`finalizeMergedEpic` treat it as
+ * filtered to the ones this operator may act on. A run target is a feature, a legacy epic with no
+ * feature children, OR a standalone parentless task/bug (an epic-of-one) — each opens a PR and sits
+ * in review until it merges, so each must be swept here. Classification reads the full list (`all`)
+ * so a container epic someone PR-linked by hand is NOT swept: it has no PR of its own, and
+ * `finalizeMergedEpic` would close its feature children on merge.
+ * A standalone target has no children, so `handleEpic`/`finalizeMergedEpic` treat it as
  * an epic with an empty ticket set: fixing feedback runs against its PR branch as usual, and a merge
  * closes the bead itself. (Kept named `inReviewEpics` — the exported handle importers/tests use.)
  *
@@ -109,7 +112,7 @@ export function inReviewEpics(
   const { operator, epicBeadId } = options;
   return all.filter((b) => {
     if (
-      !beads.isRunTarget(b) ||
+      !beads.isRunTarget(b, all) ||
       b.status === "closed" ||
       !(b.labels?.includes(IN_REVIEW) ?? false) ||
       prNumberFromRef(beads.getPrRef(b)) === undefined
