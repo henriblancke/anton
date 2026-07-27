@@ -11,12 +11,22 @@ import {
   DEFAULT_SCAN_EXCLUDES,
   STRINGER_BIN_ENV,
   describeCollectorFailure,
+  formatTimeout,
   parseCollectorFailures,
   scan,
 } from "./stringer";
 
 let dir: string;
 let prevBin: string | undefined;
+let prevTimeout: string | undefined;
+
+/** Fake stringer with a scripted body (executable node script), for the failure-path tests. */
+function writeScript(name: string, body: string[]): string {
+  const path = join(dir, name);
+  writeFileSync(path, ["#!/usr/bin/env node", ...body, ""].join("\n"), "utf8");
+  chmodSync(path, 0o755);
+  return path;
+}
 
 /**
  * Fake stringer: records argv (minus node/script) to argvDump, writes canned signals to the -o path,
@@ -51,11 +61,14 @@ const WORKTREECONFIG_STDERR = [
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "anton-stringer-"));
   prevBin = process.env[STRINGER_BIN_ENV];
+  prevTimeout = process.env.ANTON_STRINGER_TIMEOUT_MS;
 });
 
 afterEach(() => {
   if (prevBin === undefined) delete process.env[STRINGER_BIN_ENV];
   else process.env[STRINGER_BIN_ENV] = prevBin;
+  if (prevTimeout === undefined) delete process.env.ANTON_STRINGER_TIMEOUT_MS;
+  else process.env.ANTON_STRINGER_TIMEOUT_MS = prevTimeout;
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -132,6 +145,60 @@ describe("scan", () => {
         error: "opening repo: core.repositoryformatversion does not support extension: worktreeconfig",
       },
     ]);
+  });
+
+  // anton-be1s: a killed scan's stderr is startup noise (stringer buffers collector logs to the
+  // end), so it must never be what the parked job reports.
+  it("reports a timeout kill as a timeout, not the misleading partial stderr", async () => {
+    process.env[STRINGER_BIN_ENV] = writeScript("slow-stringer", [
+      "process.stderr.write('collector gitlog: go-git: reference not found\\n');",
+      "setTimeout(() => {}, 60000);", // outlive the deadline → SIGTERMed with no output written
+    ]);
+    process.env.ANTON_STRINGER_TIMEOUT_MS = "250";
+
+    await expect(scan({ repoPath: "/repo", scanFile: join(dir, "s.json") })).rejects.toThrow(
+      /stringer timed out after 250ms \(killed with SIG/,
+    );
+    await expect(scan({ repoPath: "/repo", scanFile: join(dir, "s.json") })).rejects.not.toThrow(
+      /gitlog/,
+    );
+  });
+
+  it("surfaces stderr for a genuine non-zero exit", async () => {
+    process.env[STRINGER_BIN_ENV] = writeScript("failing-stringer", [
+      "process.stderr.write('scan aborted: unreadable config at .stringer.toml\\n');",
+      "process.exit(2);",
+    ]);
+
+    await expect(scan({ repoPath: "/repo", scanFile: join(dir, "s.json") })).rejects.toThrow(
+      /unreadable config at \.stringer\.toml/,
+    );
+    await expect(scan({ repoPath: "/repo", scanFile: join(dir, "s.json") })).rejects.not.toThrow(
+      /timed out/,
+    );
+  });
+
+  it("keeps a caller abort an AbortError rather than reporting a timeout", async () => {
+    process.env[STRINGER_BIN_ENV] = writeScript("slow-stringer", ["setTimeout(() => {}, 60000);"]);
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 50);
+
+    await expect(
+      scan({ repoPath: "/repo", scanFile: join(dir, "s.json"), signal: ac.signal }),
+    ).rejects.toMatchObject({ name: "AbortError" });
+  });
+});
+
+// The reported deadline is what an operator will go looking for in the config, so it must round-trip
+// to the configured ANTON_STRINGER_TIMEOUT_MS rather than being rounded to a nearby minute.
+describe("formatTimeout", () => {
+  it("reports the configured deadline without rounding it away", () => {
+    expect(formatTimeout(250)).toBe("250ms");
+    expect(formatTimeout(59_999)).toBe("59999ms");
+    expect(formatTimeout(60_000)).toBe("1m");
+    expect(formatTimeout(600_000)).toBe("10m");
+    expect(formatTimeout(90_000)).toBe("90s");
+    expect(formatTimeout(61_234)).toBe("61.234s");
   });
 });
 
