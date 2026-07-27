@@ -163,6 +163,32 @@ describe("reschedule vs the queued follow-up (anton-x7la)", () => {
     expect(activeRows()[0]?.id).toBe(b);
   });
 
+  it("re-throws the original UNIQUE violation when the discharge write itself fails", async () => {
+    // A transient DB error on the discharge must not replace the violation the caller settles on:
+    // either way the job stays `running` until lease expiry, but the settle path should log the
+    // real cause ("did not settle" on a UNIQUE collision), not a misleading write error.
+    const a = enqueueSyncPushDeduped(t.db, systemClock, "p1");
+    t.db.update(schema.jobs).set({ status: "running" }).where(eq(schema.jobs.id, a)).run();
+    enqueueSyncPushDeduped(t.db, systemClock, "p1"); // queued follow-up → requeue collides
+
+    let updates = 0;
+    const db = new Proxy(t.db, {
+      get(target, prop) {
+        const value = Reflect.get(target, prop);
+        if (prop !== "update") return typeof value === "function" ? value.bind(target) : value;
+        return (...args: unknown[]) => {
+          if (++updates > 1) throw new Error("database is locked"); // fail only the discharge
+          return (value as (...a: unknown[]) => unknown).apply(target, args);
+        };
+      },
+    });
+
+    await expect(
+      reschedule(db, systemClock, a, systemClock.now() + 2_000, { lastError: "remote down" }),
+    ).rejects.toMatchObject({ code: expect.stringContaining("SQLITE_CONSTRAINT") });
+    expect((await getJob(t.db, a))?.status).toBe("running"); // left for the reclaimer
+  });
+
   it("still requeues a running push normally when no follow-up is queued", async () => {
     const a = enqueueSyncPushDeduped(t.db, systemClock, "p1");
     t.db.update(schema.jobs).set({ status: "running" }).where(eq(schema.jobs.id, a)).run();

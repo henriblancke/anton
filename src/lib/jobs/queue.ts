@@ -691,9 +691,10 @@ export async function reschedule(
     // follow-up already holds the project's slot); it supersedes this retry, so discharge this job
     // cleanly instead of surfacing the violation on the settle path. Any other type's violation is
     // unexpected — re-throw it rather than mask a real problem as a silent `done`.
-    // Guard the type lookup: if it throws (transient DB error), fall through to re-throw the
-    // original violation rather than escaping with the lookup error and leaving the job `running`
-    // until lease expiry (which would skip a backoff step via the reclaimer's re-increment).
+    // Guard both the type lookup and the discharge write: if either throws (transient DB error),
+    // fall through to re-throw the original violation rather than escaping with that error and
+    // leaving the job `running` until lease expiry (which would skip a backoff step via the
+    // reclaimer's re-increment) — the settle path should log the real cause either way.
     let jobType: string | undefined;
     if (isUniqueViolation(e)) {
       try {
@@ -703,16 +704,20 @@ export async function reschedule(
       }
     }
     if (jobType === "sync-push") {
-      await db
-        .update(schema.jobs)
-        .set({
-          status: "done",
-          leaseExpiresAt: null,
-          lastError: "superseded by a queued sync-push follow-up",
-          updatedAt: secDate(nowMs),
-        })
-        .where(and(eq(schema.jobs.id, jobId), eq(schema.jobs.status, "running")));
-      return;
+      try {
+        await db
+          .update(schema.jobs)
+          .set({
+            status: "done",
+            leaseExpiresAt: null,
+            lastError: "superseded by a queued sync-push follow-up",
+            updatedAt: secDate(nowMs),
+          })
+          .where(and(eq(schema.jobs.id, jobId), eq(schema.jobs.status, "running")));
+        return;
+      } catch {
+        /* discharge failed — fall through to throw the original violation, not this error */
+      }
     }
     throw e;
   }
