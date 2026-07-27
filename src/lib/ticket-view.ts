@@ -8,7 +8,7 @@
  * so those modules can all consume it without reintroducing a board↔tickets import cycle.
  */
 import { beads, type Bead } from "./beads/bd";
-import type { Epic, IssueType, Stage, StandaloneItem, Ticket } from "./types";
+import type { Epic, EpicCrumb, IssueType, Stage, StandaloneItem, Ticket } from "./types";
 
 /** Derived stage for a bead: closed → done; an `in-review` label or PR ref → in-review; an
  * in-progress status or `implementing` label → implementing; otherwise backlog. The PR pointer is
@@ -118,6 +118,20 @@ export function toStandaloneItem(bead: Bead, blockedBy: string[] = []): Standalo
   };
 }
 
+/**
+ * The product epic directly above this bead. One hop, and only to an `epic`: a run target's parent
+ * is its product outcome, while a working-layer bead's parent is another run target — which is
+ * orientation an epic badge would misrepresent. Undefined when there is no such parent, so callers
+ * render no crumb (and the board collects the card in its "No epic" lane) rather than an empty one.
+ */
+export function parentEpicOf(bead: Bead, all: Bead[]): EpicCrumb | undefined {
+  const parentId = beads.parentOf(bead);
+  if (!parentId) return undefined;
+  const parent = all.find((b) => b.id === parentId);
+  if (!parent || !beads.isEpic(parent)) return undefined;
+  return { id: parent.id, title: parent.title };
+}
+
 export interface ToEpicOptions {
   /** The epic's tickets, already mapped (an orphan/pseudo-epic passes `[toTicket(bead)]`). */
   tickets: Ticket[];
@@ -142,6 +156,8 @@ export interface ToEpicOptions {
   ready?: boolean;
   /** Topological rank from the epic graph (0 = no blockers). Defaults to 0. */
   rank?: number;
+  /** The product epic above this run target (parentEpicOf), for the swimlane grouping. */
+  epic?: EpicCrumb;
 }
 
 /** Missing bead priority sorts after every explicit priority (bd uses 0=critical … 4=lowest). */
@@ -174,6 +190,7 @@ export function toEpic(bead: Bead, opts: ToEpicOptions): Epic {
     rank: opts.rank ?? 0,
     priority: bead.priority ?? DEFAULT_PRIORITY,
     abandoned: beads.isAbandoned(bead),
+    ...(opts.epic ? { epic: opts.epic } : {}),
     tickets: opts.tickets,
   };
 }

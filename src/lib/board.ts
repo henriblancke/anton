@@ -7,7 +7,14 @@ import { readAllIssues } from "./beads/issues";
 import { computeEpicGraph, epicStandaloneBlockers, standaloneBlockers } from "./epic-graph";
 import { issueSnapshotVersion, type SnapshotReadOptions } from "./beads/snapshot";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
-import { parseAcceptance, parseGoal, toEpic, toStandaloneItem, toTicket } from "./ticket-view";
+import {
+  parentEpicOf,
+  parseAcceptance,
+  parseGoal,
+  toEpic,
+  toStandaloneItem,
+  toTicket,
+} from "./ticket-view";
 import {
   STAGES,
   type Board,
@@ -99,6 +106,8 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
       blockedBy,
       ready: blockedBy.length === 0,
       rank: node?.rank ?? 0,
+      // The product epic above this card — the key the board's epic swimlanes group on.
+      epic: parentEpicOf(epic, workBeads),
     });
     columns[built.stage].push(built);
   }

@@ -75,6 +75,12 @@ export interface Epic {
   priority: number; // bead priority (0=critical … 4=lowest); backlog tiebreak after rank
   /** Abandoned (closed + `abandoned` label, anton-6xj0) — a won't-do outcome, never a delivery. */
   abandoned: boolean;
+  /**
+   * The product epic this card sits under, when its parent is an `epic` bead — the grouping key for
+   * the board's epic swimlanes (docs/design/2026-07-26-tier-and-linear-ux.md). Absent for a
+   * top-level run target, which collects in the "No epic" lane.
+   */
+  epic?: EpicCrumb;
   tickets: Ticket[];
 }
 

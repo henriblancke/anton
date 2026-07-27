@@ -3,6 +3,7 @@ import {
   STAGE_ACCENT_DOT,
   STAGE_LABELS,
   compareBacklogEpics,
+  groupBoardByEpic,
   moveEpicBetweenColumns,
   sortEpics,
   ticketProgress,
@@ -209,5 +210,87 @@ describe("moveEpicBetweenColumns", () => {
     const next = moveEpicBetweenColumns(columns, "blocked", "backlog");
     expect(next.backlog.map((e) => e.id)).toEqual(["ready-a", "ready-b", "blocked"]);
     expect(next.implementing).toEqual([]);
+  });
+});
+
+describe("groupBoardByEpic", () => {
+  const ONTOLOGY = { id: "anton-b", title: "Ontology editing" };
+  const RETRIEVAL = { id: "anton-a", title: "Trustworthy retrieval" };
+
+  function makeColumns(over: Partial<Record<Stage, Epic[]>> = {}): Record<Stage, Epic[]> {
+    return { backlog: [], implementing: [], "in-review": [], done: [], ...over };
+  }
+
+  it("sorts epic lanes by title and always sinks the No epic lane last", () => {
+    const lanes = groupBoardByEpic(
+      makeColumns({
+        backlog: [
+          makeEpic("loose", {}),
+          makeEpic("o1", { epic: ONTOLOGY }),
+          makeEpic("r1", { epic: RETRIEVAL }),
+        ],
+      }),
+    );
+    // Alphabetical by title (not id, and not board order) so a lane keeps its place as cards move.
+    expect(lanes.map((l) => l.epic?.id ?? "none")).toEqual([ONTOLOGY.id, RETRIEVAL.id, "none"]);
+  });
+
+  it("keeps each card in its own stage column and preserves the order it was given", () => {
+    const lanes = groupBoardByEpic(
+      makeColumns({
+        backlog: [makeEpic("first", { epic: ONTOLOGY }), makeEpic("second", { epic: ONTOLOGY })],
+        done: [makeEpic("shipped", { epic: ONTOLOGY, stage: "done" })],
+      }),
+    );
+    expect(lanes[0].columns.backlog.map((e) => e.id)).toEqual(["first", "second"]);
+    expect(lanes[0].columns.done.map((e) => e.id)).toEqual(["shipped"]);
+    expect(lanes[0].columns.implementing).toEqual([]);
+  });
+
+  it("rolls a lane up as shipped-of-total, with abandoned cards out of both sides", () => {
+    const lanes = groupBoardByEpic(
+      makeColumns({
+        backlog: [makeEpic("open", { epic: ONTOLOGY })],
+        done: [
+          makeEpic("shipped", { epic: ONTOLOGY, stage: "done" }),
+          makeEpic("wontdo", { epic: ONTOLOGY, stage: "done", abandoned: true }),
+        ],
+      }),
+    );
+    // The won't-do card neither inflates `shipped` nor pins the lane below 100% forever.
+    expect(lanes[0]).toMatchObject({ features: 2, shipped: 1 });
+    // It still renders — the lane shows the work, the rollup counts the deliveries.
+    expect(lanes[0].columns.done.map((e) => e.id)).toEqual(["shipped", "wontdo"]);
+  });
+
+  it("collects standalone chips in the No epic lane — they are parentless by definition", () => {
+    const chip = {
+      id: "anton-t3x",
+      title: "chip",
+      type: "bug" as const,
+      status: "open",
+      stage: "backlog" as Stage,
+      approved: false,
+      assignee: null,
+      createdAt: "",
+      createdBy: null,
+      blockedBy: [],
+      ready: true,
+      unread: false,
+      deferred: false,
+      abandoned: false,
+    };
+    const lanes = groupBoardByEpic(
+      makeColumns({ backlog: [makeEpic("o1", { epic: ONTOLOGY })] }),
+      { backlog: [chip], implementing: [], "in-review": [], done: [] },
+    );
+    const noEpic = lanes[lanes.length - 1];
+    expect(noEpic.epic).toBeUndefined();
+    expect(noEpic.standalone.backlog.map((i) => i.id)).toEqual(["anton-t3x"]);
+    expect(noEpic.loose).toBe(1);
+  });
+
+  it("returns no lanes for an empty board rather than an empty No epic lane", () => {
+    expect(groupBoardByEpic(makeColumns())).toEqual([]);
   });
 });

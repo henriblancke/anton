@@ -24,10 +24,14 @@ import { BoardSkeleton } from "@/components/board/board-skeleton";
 import {
   BOARD_SORT_LABELS,
   STAGE_LABELS,
+  groupBoardByEpic,
   moveEpicBetweenColumns,
   sortEpics,
   type BoardSort,
 } from "@/components/board/board-utils";
+import { BoardGroupingToggle } from "@/components/board/board-grouping-toggle";
+import { EpicLaneView, LaneStageStrip } from "@/components/board/epic-lane";
+import { useBoardGrouping } from "@/lib/use-board-grouping";
 import { SyncStatusBadge } from "@/components/board/sync-status-badge";
 import { Button } from "@/components/ui/button";
 import { TicketDialog } from "@/components/ticket/ticket-dialog";
@@ -56,6 +60,8 @@ export function EpicBoard({
   const [attempt, setAttempt] = useState(0);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [sort, setSort] = useState<BoardSort>("default");
+  // Stage columns or epic swimlanes — the same cards either way, remembered per project.
+  const [grouping, setGrouping] = useBoardGrouping(slug);
   // The standalone task/bug whose detail dialog is open. Epics still deep-link to their own page;
   // standalone chips (an epic-of-one) reuse the shared TicketDialog inline.
   const [openTicketId, setOpenTicketId] = useState<string | null>(null);
@@ -144,6 +150,16 @@ export function EpicBoard({
       STAGES.map((stage) => [stage, sortEpics(board.columns[stage] ?? [], sort)]),
     ) as Record<Stage, Epic[]>;
   }, [board, sort]);
+
+  // The swimlanes are a regrouping of the very cards above — the sorted columns feed both views, so
+  // a lane's cards carry the chosen sort and there is no second board to keep in step.
+  const lanes = useMemo(
+    () =>
+      grouping === "epic" && sortedColumns && board
+        ? groupBoardByEpic(sortedColumns, board.standalone)
+        : null,
+    [grouping, sortedColumns, board],
+  );
 
   function handleDragStart(event: DragStartEvent) {
     draggingRef.current = true;
@@ -240,6 +256,8 @@ export function EpicBoard({
       }}
     >
       <div className="flex items-center justify-end gap-2 pb-2">
+        <BoardGroupingToggle value={grouping} onChange={setGrouping} />
+        <span className="flex-1" />
         <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
           <span className="text-subtle">Sort</span>
           <select
@@ -257,20 +275,46 @@ export function EpicBoard({
         </label>
         <SyncStatusBadge sync={board.sync} />
       </div>
-      <div className="grid min-h-0 flex-1 grid-cols-1 gap-3.5 sm:grid-cols-2 xl:grid-cols-4">
-        {STAGES.map((stage) => (
-          <BoardColumn
-            key={stage}
-            stage={stage}
-            epics={sortedColumns?.[stage] ?? []}
-            standalone={board.standalone?.[stage] ?? []}
-            slug={slug}
-            budgetAware={budgetAware}
-            onEpicDeleted={handleEpicDeleted}
-            onOpenTicket={setOpenTicketId}
-          />
-        ))}
-      </div>
+      {lanes ? (
+        // The lanes share one horizontal scroller so every lane's stage columns line up under the
+        // single stage strip, at any width.
+        <div className="flex min-h-0 flex-1 flex-col overflow-auto">
+          <LaneStageStrip />
+          {lanes.length === 0 ? (
+            <p className="rounded-xl border border-dashed border-border px-3 py-10 text-center text-xs text-subtle">
+              No cards to group yet
+            </p>
+          ) : (
+            <div className="flex flex-col divide-y divide-border">
+              {lanes.map((lane) => (
+                <EpicLaneView
+                  key={lane.epic?.id ?? "no-epic"}
+                  slug={slug}
+                  lane={lane}
+                  budgetAware={budgetAware}
+                  onEpicDeleted={handleEpicDeleted}
+                  onOpenTicket={setOpenTicketId}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className="grid min-h-0 flex-1 grid-cols-1 gap-3.5 sm:grid-cols-2 xl:grid-cols-4">
+          {STAGES.map((stage) => (
+            <BoardColumn
+              key={stage}
+              stage={stage}
+              epics={sortedColumns?.[stage] ?? []}
+              standalone={board.standalone?.[stage] ?? []}
+              slug={slug}
+              budgetAware={budgetAware}
+              onEpicDeleted={handleEpicDeleted}
+              onOpenTicket={setOpenTicketId}
+            />
+          ))}
+        </div>
+      )}
       <DragOverlay>{activeEpic ? <EpicCard slug={slug} epic={activeEpic} overlay /> : null}</DragOverlay>
       <TicketDialog
         slug={slug}

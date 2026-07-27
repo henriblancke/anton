@@ -2,7 +2,15 @@
  * Pure display helpers for the epic board. Kept dependency-free so they're trivially testable
  * (see board-utils.test.ts) and reusable from both the board and card client components.
  */
-import { STAGES, type Epic, type IssueType, type Stage, type Ticket } from "@/lib/types";
+import {
+  STAGES,
+  type Epic,
+  type EpicCrumb,
+  type IssueType,
+  type Stage,
+  type StandaloneItem,
+  type Ticket,
+} from "@/lib/types";
 
 export const STAGE_LABELS: Record<Stage, string> = {
   backlog: "Backlog",
@@ -183,6 +191,104 @@ export function compareEpicsBy(sort: Exclude<BoardSort, "default">, a: Epic, b: 
 export function sortEpics(epics: Epic[], sort: BoardSort): Epic[] {
   if (sort === "default") return epics;
   return [...epics].sort((a, b) => compareEpicsBy(sort, a, b));
+}
+
+// ── Grouping: stage columns (default) vs epic swimlanes ───────────────────
+
+/**
+ * How the board arranges the same cards. `stage` is the daily execution view and stays the default;
+ * `epic` regroups those cards into product swimlanes — opt-in and non-destructive
+ * (docs/design/2026-07-26-tier-and-linear-ux.md).
+ */
+export type BoardGrouping = "stage" | "epic";
+
+export const BOARD_GROUPINGS: BoardGrouping[] = ["stage", "epic"];
+
+export const BOARD_GROUPING_LABELS: Record<BoardGrouping, string> = {
+  stage: "Stage",
+  epic: "Epic",
+};
+
+export function isBoardGrouping(value: unknown): value is BoardGrouping {
+  return value === "stage" || value === "epic";
+}
+
+/** One epic swimlane: the same stage columns, narrowed to the run targets under one product epic. */
+export interface EpicLane {
+  /** The lane's product epic; absent on the final "No epic" lane. */
+  epic?: EpicCrumb;
+  columns: Record<Stage, Epic[]>;
+  /** Standalone chips — parentless by definition, so only ever on the "No epic" lane. */
+  standalone: Record<Stage, StandaloneItem[]>;
+  /** Non-abandoned run targets in the lane — the rollup denominator. */
+  features: number;
+  /** How many of those shipped. */
+  shipped: number;
+  /** Non-abandoned standalone chips in the lane. */
+  loose: number;
+}
+
+function emptyStageMap<T>(): Record<Stage, T[]> {
+  return Object.fromEntries(STAGES.map((stage) => [stage, [] as T[]])) as Record<Stage, T[]>;
+}
+
+/**
+ * Regroup the board's cards by their product epic, preserving each card's stage column and the
+ * column order it was given. Lanes read alphabetically (stable as cards move between stages), and
+ * every run target with no epic — including the standalone chips, which are parentless by
+ * definition — collects in a final "No epic" lane.
+ *
+ * An abandoned card leaves both sides of the rollup for the same reason it leaves ticketProgress:
+ * it is a won't-do outcome, so counting it would either inflate `shipped` or pin the lane below
+ * 100% forever. It still renders — the lane shows the work, the rollup counts the deliveries.
+ */
+export function groupBoardByEpic(
+  columns: Record<Stage, Epic[]>,
+  standalone?: Record<Stage, StandaloneItem[]>,
+): EpicLane[] {
+  const NO_EPIC = "";
+  const lanes = new Map<string, EpicLane>();
+
+  const laneFor = (epic?: EpicCrumb): EpicLane => {
+    const key = epic?.id ?? NO_EPIC;
+    let lane = lanes.get(key);
+    if (!lane) {
+      lane = {
+        epic,
+        columns: emptyStageMap<Epic>(),
+        standalone: emptyStageMap<StandaloneItem>(),
+        features: 0,
+        shipped: 0,
+        loose: 0,
+      };
+      lanes.set(key, lane);
+    }
+    return lane;
+  };
+
+  for (const stage of STAGES) {
+    for (const card of columns[stage] ?? []) {
+      const lane = laneFor(card.epic);
+      lane.columns[stage].push(card);
+      if (card.abandoned) continue;
+      lane.features += 1;
+      if (card.stage === "done") lane.shipped += 1;
+    }
+    for (const item of standalone?.[stage] ?? []) {
+      const lane = laneFor(undefined);
+      lane.standalone[stage].push(item);
+      if (!item.abandoned) lane.loose += 1;
+    }
+  }
+
+  const noEpic = lanes.get(NO_EPIC);
+  const sorted = [...lanes.values()]
+    .filter((lane) => lane.epic)
+    .sort((a, b) => {
+      const byTitle = a.epic!.title.localeCompare(b.epic!.title);
+      return byTitle !== 0 ? byTitle : a.epic!.id.localeCompare(b.epic!.id);
+    });
+  return noEpic ? [...sorted, noEpic] : sorted;
 }
 
 /** Moves an epic (by id) to another stage column, immutably. Used for optimistic

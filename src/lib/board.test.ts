@@ -225,6 +225,33 @@ describe("getBoard", () => {
     ]);
   });
 
+  it("attaches the parent epic to a card — the swimlane grouping key", async () => {
+    const outcome = makeBead({
+      id: "epic-o",
+      title: "Ontology editing",
+      issue_type: "epic",
+      status: "open",
+    });
+    const under = makeBead({
+      id: "epic-u",
+      title: "Term merge",
+      issue_type: "epic",
+      parent: "epic-o",
+      status: "open",
+    });
+
+    listMock.mockResolvedValue([outcome, under]);
+
+    const board = await getBoard(project);
+
+    expect(board.columns.backlog.find((e) => e.id === "epic-u")?.epic).toEqual({
+      id: "epic-o",
+      title: "Ontology editing",
+    });
+    // A top-level card has no epic above it, so the board collects it in the "No epic" lane.
+    expect(board.columns.backlog.find((e) => e.id === "epic-o")?.epic).toBeUndefined();
+  });
+
   it("does not surface a parentless non-runnable type (learning/chore) as a chip", async () => {
     // A parentless `learning` is not a run target (beads.isRunTarget → false), so a chip for it
     // would advertise `Approve & run` yet the approve route + runner reject it — a permanent 422.
