@@ -63,11 +63,14 @@ under it. No re-typing, no flag day.
   working and is **deliberately not renamed** — a rename costs a DB migration and route churn for
   zero behaviour change. Track it as separate follow-up debt.
 
-### Open question
+### Resolved: the designator prefix and the badge colour
 
-`area:` and the existing `domain:` prefix are the same axis, and the three area hues collide with
-existing `agent:` label colours. Resolve the prefix question before building the badge; either
-de-saturate the area badge or fold `area:` into `domain:`.
+Settled in [`.product/decisions/2026-07-26-engine-designator-prefix.md`](../../.product/decisions/2026-07-26-engine-designator-prefix.md)
+(anton-9pkk.2). In short: `area:` stays its own prefix — it is a different axis from `domain:`
+(product surface vs. company function), and `domain:` is too saturated by the shaping default to
+carry it. The colour clash is resolved by dropping the per-area hue: every epic badge uses the one
+iris `--type-epic` token and the value is carried by text, because iris is the only hue in the
+palette no `agent:` token uses. Read the decision before building the badge.
 
 ---
 

@@ -31,11 +31,6 @@
     --warn: #b7801f;
     --crit: #d1483d;
 
-    /* NEW — engine/area hues. Drawn from chart-2/3/5 so they stay in family. */
-    --area-ontology: #6355e0;
-    --area-knowledge: #2c9d68;
-    --area-ingest: #c05070;
-
     --shadow: 0 1px 2px rgb(27 26 22 / 0.06), 0 1px 1px rgb(27 26 22 / 0.04);
     --radius: 0.625rem;
     --radius-sm: 0.375rem;
@@ -70,10 +65,6 @@
       --warn: #e6a94b;
       --crit: #f2685e;
 
-      --area-ontology: #8f82ff;
-      --area-knowledge: #4fc08a;
-      --area-ingest: #f26a86;
-
       --shadow: 0 1px 2px rgb(0 0 0 / 0.4), 0 1px 1px rgb(0 0 0 / 0.3);
     }
   }
@@ -87,7 +78,6 @@
     --stage-in-review: #57a8f2; --stage-done: #4fc08a;
     --type-epic: #8f82ff; --type-task: #57a8f2; --type-bug: #f2685e;
     --ok: #4fc08a; --warn: #e6a94b; --crit: #f2685e;
-    --area-ontology: #8f82ff; --area-knowledge: #4fc08a; --area-ingest: #f26a86;
     --shadow: 0 1px 2px rgb(0 0 0 / 0.4), 0 1px 1px rgb(0 0 0 / 0.3);
   }
   :root[data-theme="light"] {
@@ -98,7 +88,6 @@
     --stage-in-review: #2f7fd6; --stage-done: #2c9d68;
     --type-epic: #6355e0; --type-task: #2f7fd6; --type-bug: #d1483d;
     --ok: #2c9d68; --warn: #b7801f; --crit: #d1483d;
-    --area-ontology: #6355e0; --area-knowledge: #2c9d68; --area-ingest: #c05070;
     --shadow: 0 1px 2px rgb(27 26 22 / 0.06), 0 1px 1px rgb(27 26 22 / 0.04);
   }
 
@@ -324,9 +313,10 @@
   }
   .epic-badge .glyph { font-size: 0.7em; }
   .epic-badge .txt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  [data-area="ontology"] { --tier: var(--area-ontology); }
-  [data-area="knowledge"] { --tier: var(--area-knowledge); }
-  [data-area="ingest"] { --tier: var(--area-ingest); }
+  /* One hue for the whole tier, not one per area — see
+     .product/decisions/2026-07-26-engine-designator-prefix.md. Iris is the only palette hue no
+     agent: token uses, and it already means "epic". */
+  [data-area] { --tier: var(--type-epic); }
   [data-area="none"] { --tier: var(--subtle); }
 
   .fcard h3 {
@@ -929,10 +919,12 @@
              today a task under a non-epic parent vanishes from the board entirely.</p>
         </div>
         <div class="note">
-          <span class="note-label" data-kind="open">Colour conflict</span>
-          <p>The three <code>area:</code> hues collide with existing <code>agent:</code> label colours.
-             Either de-saturate the area badge or resolve <code>area:</code> against the
-             existing <code>domain:</code> prefix first — they're the same axis.</p>
+          <span class="note-label">Colour conflict — resolved</span>
+          <p>The three proposed area hues were existing <code>agent:</code> / <code>type:</code>
+             tokens copied verbatim, and no free hue is left in the palette. Every epic badge now
+             uses the one iris <code>--type-epic</code> token and the value is carried by text;
+             <code>area:</code> stays its own prefix, separate from <code>domain:</code>. See
+             <code>.product/decisions/2026-07-26-engine-designator-prefix.md</code>.</p>
         </div>
       </div>
     </div>
