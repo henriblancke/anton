@@ -59,19 +59,57 @@ function nudgeSync(project: Project, id: string): void {
  * abandoning a feature would cancel its product epic (which never runs) and leave the feature's own
  * agent executing on toward a PR the board already calls won't-do.
  */
-async function runTargetOf(project: Project, bead: Bead): Promise<string> {
-  const board = await beads.list(project.repoPath, ["--status", "all"]);
+function runTargetOf(bead: Bead, board: Bead[]): string {
   if (beads.isRunTarget(bead, board)) return bead.id;
   return beads.parentOf(bead) ?? bead.id;
 }
 
 /**
- * Abandon one ticket. The live run is killed FIRST (see cancelRunForTarget), against the run target
- * this bead's work actually executes under (runTargetOf). Only then is the outcome recorded, so the
- * agent is already stopped when the board says the work won't be done. For a child ticket that kill
- * stops the WHOLE run, not just this ticket — there is no finer-grained kill, and a run that kept
- * going would have to be told mid-flight that one of its tickets vanished. The remaining tickets are
- * picked up by running the target again, which now skips the abandoned one.
+ * Abandon every still-open descendant of `target`, killing the run of each descendant that owns one
+ * before recording anything. Shared by the ticket and epic paths: a bead that groups other work must
+ * take that work with it however the abandon was reached, or the descendants sit in `bd ready` as
+ * claimable tickets whose run target is already settled — no run path left to reach them. Settled
+ * descendants are left exactly as they are; their history is not rewritten. Returns the ids it
+ * abandoned, in cascade order.
+ */
+async function cascadeToDescendants(
+  project: Project,
+  target: Bead,
+  board: Bead[],
+  why: string,
+): Promise<string[]> {
+  const descendants = openDescendants(board, target.id);
+
+  for (const descendant of descendants) {
+    if (beads.isRunTarget(descendant, board)) {
+      await cancelRunForTarget(project.id, descendant.id);
+    }
+  }
+
+  const children: string[] = [];
+  for (const descendant of descendants) {
+    await beads.abandon(
+      project.repoPath,
+      descendant.id,
+      `${why} (parent ${target.issue_type ?? "ticket"} ${target.id} abandoned)`,
+    );
+    children.push(descendant.id);
+  }
+  return children;
+}
+
+/**
+ * Abandon one ticket, cascading to everything still open beneath it. The live runs are killed FIRST
+ * (see cancelRunForTarget) — this bead's own, against the run target its work actually executes
+ * under (runTargetOf), plus each descendant that owns one. Only then is the outcome recorded, so no
+ * agent is still driving toward a PR for work the board now calls won't-do. For a child ticket that
+ * kill stops the WHOLE run, not just this ticket — there is no finer-grained kill, and a run that
+ * kept going would have to be told mid-flight that one of its tickets vanished. The remaining
+ * tickets are picked up by running the target again, which now skips the abandoned one.
+ *
+ * The cascade matters most for a feature reached through this path (a direct API call — the UI
+ * deep-links features to the epic route): abandoning it alone would strand its tasks open under a
+ * settled run target. A leaf ticket has no descendants, so it costs one board read and nothing else.
  *
  * Throws on an unknown id (bd's own error → 404), an empty/oversized reason (→ 400), or an
  * already-closed ticket (NotAbandonableError → 409).
@@ -85,8 +123,12 @@ export async function abandonTicket(
   const bead = await beads.show(project.repoPath, id); // 404 guard — bd throws on an unknown id
   assertOpen(bead, "Ticket");
 
-  await cancelRunForTarget(project.id, await runTargetOf(project, bead));
+  const board = await beads.list(project.repoPath, ["--status", "all"]);
+  await cancelRunForTarget(project.id, runTargetOf(bead, board));
+  await cascadeToDescendants(project, bead, board, why);
 
+  // The ticket closes LAST, like the epic cascade: a crash mid-cascade leaves it open with a
+  // partially-abandoned child set that re-running abandon finishes.
   await beads.abandon(project.repoPath, id, why);
   // Read-after-write, like setTicketDeferred: the `bd show` bead is authoritative for the abandoned
   // state it just wrote, so the response never reflects the board's stale snapshot.
@@ -157,25 +199,16 @@ export async function abandonEpic(
   assertOpen(epic, "Epic");
 
   const all = await beads.list(repo, ["--status", "all"]);
-  const descendants = openDescendants(all, epicId);
 
   // Kill every live run this abandon settles, BEFORE recording it. A container epic never runs
-  // itself — the active job is keyed by the FEATURE below it — so cancelling only `epicId` would
-  // mark the feature and its tickets abandoned while its agent kept running from the bead snapshot
-  // it loaded at start, and still committed and opened a PR for work the board now calls won't-do.
-  // The epic's own id is cancelled too: a legacy (non-container) epic is its own run target.
+  // itself — the active job is keyed by the FEATURE below it, which cascadeToDescendants cancels —
+  // so cancelling only `epicId` would mark the feature and its tickets abandoned while its agent
+  // kept running from the bead snapshot it loaded at start, and still committed and opened a PR for
+  // work the board now calls won't-do. The epic's own id is cancelled too: a legacy (non-container)
+  // epic is its own run target.
   await cancelRunForTarget(project.id, epicId);
-  for (const descendant of descendants) {
-    if (beads.isRunTarget(descendant, all)) {
-      await cancelRunForTarget(project.id, descendant.id);
-    }
-  }
+  const children = await cascadeToDescendants(project, epic, all, why);
 
-  const children: string[] = [];
-  for (const descendant of descendants) {
-    await beads.abandon(repo, descendant.id, `${why} (parent epic ${epicId} abandoned)`);
-    children.push(descendant.id);
-  }
   // The epic closes LAST: a crash mid-cascade leaves it open with a partially-abandoned child set,
   // which re-running abandon finishes — the reverse order would leave orphaned open children under
   // an epic that already reads as settled.

@@ -106,6 +106,42 @@ describeBd("ticket abandon route (real bd)", () => {
     expect(cancelled).toEqual([["proj-1", featureId]]);
   });
 
+  it("cascades to the open tasks under a feature abandoned through this route", async () => {
+    // The UI deep-links features to the epic route, but a direct API call lands here. Without the
+    // cascade the tasks stay open in `bd ready` — claimable work whose run target is already
+    // settled, so nothing can ever execute them.
+    const featureId = await beads.create(repo, {
+      title: "A feature with tickets",
+      type: "feature",
+      deps: [`parent-child:${epicId}`],
+    });
+    const taskIds: string[] = [];
+    for (const title of ["First task", "Second task"]) {
+      taskIds.push(
+        await beads.create(repo, { title, type: "task", deps: [`parent-child:${featureId}`] }),
+      );
+    }
+    const settled = await beads.create(repo, {
+      title: "Already shipped",
+      type: "task",
+      deps: [`parent-child:${featureId}`],
+    });
+    await beads.close(repo, settled);
+    resetIssueSnapshots(); // a warm snapshot predates these creates
+
+    const res = await POST(post({ reason: "cut from the release" }), ctx("tmp", featureId));
+    expect(res.status).toBe(200);
+    expect(cancelled).toEqual([["proj-1", featureId]]); // one run for the whole subtree
+
+    for (const taskId of taskIds) {
+      expect(beads.isAbandoned(await beads.show(repo, taskId))).toBe(true);
+    }
+    expect(await readyIds()).not.toContain(taskIds[0]);
+    expect(await readyIds()).not.toContain(taskIds[1]);
+    // A settled child keeps its own outcome — the cascade never rewrites history.
+    expect(beads.isAbandoned(await beads.show(repo, settled))).toBe(false);
+  });
+
   it("refuses without a reason, and leaves the ticket alone", async () => {
     const open = await beads.create(repo, { title: "Still open", type: "task" });
     for (const body of [{}, { reason: "   " }, { reason: 5 }]) {
