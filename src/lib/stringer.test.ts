@@ -162,6 +162,19 @@ describe("parseCollectorFailures", () => {
     ]);
 
     expect(parseCollectorFailures("")).toEqual([]);
+
+    // A quoted value JSON can't parse (a Go \x escape, or a line truncated mid-string) still yields
+    // usable error text — the failure is never dropped just because its quoting is malformed.
+    expect(
+      parseCollectorFailures(
+        `time=2026-07-26T19:26:45Z level=ERROR msg="collector failed" name=todos error="bad\\x00byte"`,
+      ),
+    ).toEqual([{ name: "todos", error: "bad\\x00byte" }]);
+    expect(
+      parseCollectorFailures(
+        `time=2026-07-26T19:26:45Z level=ERROR msg="collector failed" name=churn error="unterminated`,
+      ),
+    ).toEqual([{ name: "churn", error: "unterminated" }]);
     expect(
       parseCollectorFailures(
         `time=2026-07-26T19:26:45Z level=INFO msg="collector complete" name=todos signals=1 duration=15ms`,

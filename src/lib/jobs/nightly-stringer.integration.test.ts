@@ -171,9 +171,13 @@ process.stdin.on('end',()=>{
     const runner = new JobRunner({ db: tdb.db, clock, config: { maxConcurrent: 1, leaseMs: 30_000 } });
     runner.registerHandler("nightly-stringer", makeNightlyStringerHandler({ db: tdb.db, clock }));
     const jobId = await runner.enqueue({ type: "nightly-stringer", projectId, payload: { projectId } });
-    expect(await runner.tickOnce()).toBe(1);
-    await runner.whenIdle();
-    delete process.env.FAKE_STRINGER_STDERR;
+    // finally: a leaked FAKE_STRINGER_STDERR would fake a collector failure in every later test.
+    try {
+      expect(await runner.tickOnce()).toBe(1);
+      await runner.whenIdle();
+    } finally {
+      delete process.env.FAKE_STRINGER_STDERR;
+    }
 
     // The scan itself is still a success — only the loss is surfaced.
     expect((await getJob(tdb.db, jobId))?.status).toBe("done");

@@ -105,7 +105,10 @@ function unquote(value: string): string {
   try {
     return JSON.parse(value) as string;
   } catch {
-    return value.slice(1, -1).replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+    // Malformed for JSON (a truncated line, or a Go escape like \x00 that JSON rejects): salvage the
+    // text by hand rather than dropping the field. Only strip a closing quote that's actually there.
+    const body = value.endsWith('"') && value.length > 1 ? value.slice(1, -1) : value.slice(1);
+    return body.replace(/\\"/g, '"').replace(/\\\\/g, "\\");
   }
 }
 
