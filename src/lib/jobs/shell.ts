@@ -13,14 +13,106 @@ export interface ShellResult {
   output: string;
 }
 
+/**
+ * Override the SIGTERM→SIGKILL grace (tests shrink it). Read per call so a change lands without a
+ * module reload.
+ */
+export const KILL_GRACE_ENV = "ANTON_SHELL_KILL_GRACE_MS";
+
+/** Default window a cancelled gate gets to tear down its own workers before it is killed outright. */
+const DEFAULT_KILL_GRACE_MS = 5_000;
+
+/**
+ * How long to keep draining stdio after the command exits. `close` is the only event that
+ * guarantees the pipes drained, but a descendant that inherited stdout holds them open long after
+ * the gate itself is gone — waiting on it would wedge the job run. So `exit` starts a bounded drain
+ * and the promise settles either way (anton-jfjw.6).
+ */
+const DRAIN_AFTER_EXIT_MS = 2_000;
+
+function killGraceMs(): number {
+  const raw = Number(process.env[KILL_GRACE_ENV]);
+  return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_KILL_GRACE_MS;
+}
+
+/**
+ * Shaped like Node's own AbortError (name + code), which is what `spawn({ signal })` used to raise
+ * here — callers that discriminate cancellation from failure keep working now that runShell owns
+ * cancellation itself.
+ */
+function abortError(): Error {
+  const err: Error & { code?: string } = new Error("The operation was aborted");
+  err.name = "AbortError";
+  err.code = "ABORT_ERR";
+  return err;
+}
+
 export function runShell(cmd: string, cwd: string, signal?: AbortSignal): Promise<ShellResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn("sh", ["-c", cmd], { cwd, signal });
+    // `sh -c` immediately execs or forks the real gate command, so a test runner and its workers are
+    // only reachable as a group. Leading its own process group is what lets cancellation kill them
+    // instead of just the wrapper (anton-jfjw.6 — the same defect the claude driver already fixed).
+    const child = spawn("sh", ["-c", cmd], { cwd, detached: process.platform !== "win32" });
+
     let out = "";
+    let exited = false;
+    let settled = false;
+    let drainTimer: NodeJS.Timeout | undefined;
+    let escalateTimer: NodeJS.Timeout | undefined;
+
+    const killGroup = (sig: NodeJS.Signals) => {
+      if (process.platform !== "win32" && child.pid) {
+        try {
+          process.kill(-child.pid, sig);
+          return;
+        } catch {
+          // The group may never have formed (spawn failed); fall back to the direct child handle.
+        }
+      }
+      child.kill(sig);
+    };
+
+    const settle = (emit: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", onAbort);
+      if (drainTimer) clearTimeout(drainTimer);
+      emit();
+    };
+
+    // Node's built-in `signal` support only ever SIGTERMs the direct child, once. Cancellation is
+    // owned here instead: signal the whole group, then escalate for a command that traps SIGTERM.
+    // The escalation deliberately outlives the promise — the run unwinds immediately, while the
+    // group still gets killed — and is cleared as soon as the child actually exits.
+    const onAbort = () => {
+      if (!exited) {
+        killGroup("SIGTERM");
+        escalateTimer = setTimeout(() => killGroup("SIGKILL"), killGraceMs());
+      }
+      settle(() => reject(abortError()));
+    };
+
     child.stdout?.on("data", (c: Buffer) => (out += c.toString("utf8")));
     child.stderr?.on("data", (c: Buffer) => (out += c.toString("utf8")));
-    child.on("error", reject);
-    child.on("close", (code) => resolve({ ok: code === 0, code, output: out }));
+    child.on("error", (err) => settle(() => reject(err)));
+    child.on("close", (code) => settle(() => resolve({ ok: code === 0, code, output: out })));
+    child.on("exit", (code) => {
+      exited = true;
+      if (escalateTimer) clearTimeout(escalateTimer);
+      if (settled) return;
+      drainTimer = setTimeout(() => {
+        settle(() => {
+          // Drop the pipes a leaked descendant is still holding — nothing will read them again.
+          child.stdout?.destroy();
+          child.stderr?.destroy();
+          resolve({ ok: code === 0, code, output: out });
+        });
+      }, DRAIN_AFTER_EXIT_MS);
+    });
+
+    // A signal already aborted before spawn never fires 'abort', so cancel explicitly.
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 
