@@ -9,6 +9,7 @@ import type { ClaudeUsage } from "./claude/usage";
 import {
   BURN_SAMPLE_WINDOW,
   burnDelta,
+  burnsClaudeQuota,
   getBurnAverage,
   JOB_TYPE_TIER,
   recordBurnSample,
@@ -49,6 +50,20 @@ describe("burnDelta", () => {
   });
 });
 
+describe("burnsClaudeQuota", () => {
+  it("excludes handlers that never invoke Claude", () => {
+    // sync-push is a deterministic `git push` of dolt refs — no Claude, so nothing to sample.
+    expect(burnsClaudeQuota("sync-push")).toBe(false);
+    expect(JOB_TYPE_TIER["sync-push"]).toBe("none");
+  });
+
+  it("includes every Claude-driven type", () => {
+    for (const t of ["execute-epic", "review-fix", "nightly-stringer", "orphan-grooming"] as const) {
+      expect(burnsClaudeQuota(t)).toBe(true);
+    }
+  });
+});
+
 describe("getBurnAverage", () => {
   let t: TestDb;
   let clock: FakeClock;
@@ -66,6 +81,13 @@ describe("getBurnAverage", () => {
     expect(avg.sessionAvg).toBe(seed.sessionPct);
     expect(avg.weeklyAvg).toBe(seed.weeklyPct);
     expect(avg.tier).toBe("L");
+  });
+
+  it("costs the pacer nothing for a type that never invokes Claude", async () => {
+    const avg = await getBurnAverage(t.db, "sync-push");
+    expect(avg.tier).toBe("none");
+    expect(avg.sessionAvg).toBe(0);
+    expect(avg.weeklyAvg).toBe(0);
   });
 
   it("blends real samples with the seed during ramp-up, staying seeded", async () => {

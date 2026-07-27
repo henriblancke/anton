@@ -1317,6 +1317,46 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     expect(await tdb.db.select().from(schema.burnSamples)).toHaveLength(2);
   });
 
+  it("opens no window for a type that never invokes Claude, leaving the throttle for a real job", async () => {
+    // sync-push is a deterministic `git push` — a window around it would blame unrelated Claude
+    // usage on it AND spend burnSampleMinIntervalMs, starving the execute-epic that follows.
+    let cachedReads = 0;
+    let freshReads = 0;
+    const r = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { ...CONFIG, maxConcurrent: 1, burnSampleMinIntervalMs: 60_000 },
+      resolveBudgetPolicy: budgetAware,
+      readUsage: async () => {
+        cachedReads += 1;
+        return usage(10, 5);
+      },
+      readUsageFresh: async () => {
+        freshReads += 1;
+        return usage(30, 8);
+      },
+    });
+    r.registerHandler("sync-push", async () => {});
+    r.registerHandler("execute-epic", async () => {});
+
+    const id = await r.enqueue({ type: "sync-push" });
+    await r.tickOnce();
+    await r.whenIdle();
+    expect((await getJob(tdb.db, id))?.status).toBe("done");
+    expect(cachedReads).toBe(0);
+    expect(freshReads).toBe(0);
+    expect(await tdb.db.select().from(schema.burnSamples)).toHaveLength(0);
+
+    // Immediately after (well inside the throttle interval) a Claude job still samples.
+    await r.enqueue({ type: "execute-epic" });
+    await r.tickOnce();
+    await r.whenIdle();
+    expect(freshReads).toBe(1);
+    const rows = await tdb.db.select().from(schema.burnSamples);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.jobType).toBe("execute-epic");
+  });
+
   it("never reads usage when no budget resolver is wired at all", async () => {
     // Without a resolveBudgetPolicy dep nothing can be budget-aware, so the sampler stays fully off.
     let reads = 0;

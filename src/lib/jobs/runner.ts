@@ -45,7 +45,7 @@ import {
 import { reconcileInterruptedRuns } from "../runs";
 import { isPoisonError, isRunAlreadyLiveError, isUsageLimitError } from "./errors";
 import { PollingLoop } from "./polling-loop";
-import { getBurnAverage, sampleJobBurn } from "../burn";
+import { burnsClaudeQuota, getBurnAverage, sampleJobBurn } from "../burn";
 import { getClaudeUsageCached, getClaudeUsageFresh, type ClaudeUsage } from "../claude/usage";
 import { admitJob, budgetGate, jobValueScore, type BudgetPolicy } from "./budget";
 
@@ -888,8 +888,10 @@ export class JobRunner {
     // session%/weekly% that moves across it to this job's TYPE. Attribution needs a solo window —
     // with jobs overlapping (maxConcurrent > 1), each delta would include the siblings' burn and
     // double-count across types — so only open a window when nothing else is in flight; a sibling
-    // dispatched mid-window is caught at close via `dispatchSeq`. Fail-soft — a null read just
-    // means no sample; it never gates dispatch.
+    // dispatched mid-window is caught at close via `dispatchSeq`. Types that never invoke Claude
+    // (`burnsClaudeQuota`) are skipped outright — sampling them would blame an operator's own
+    // Claude usage on a `git push` and spend the throttle a real job needs. Fail-soft — a null read
+    // just means no sample; it never gates dispatch.
     //
     // Gated behind the project's budget-aware opt-in (anton-7mpv.1), like the governor: burn data
     // only feeds budget pacing, so in the default feature-off state the sampler must not shell out
@@ -905,6 +907,7 @@ export class JobRunner {
     const burnDue = this.clock.now() - this.lastBurnSampleAt >= this.config.burnSampleMinIntervalMs;
     const burnBefore =
       burnDue &&
+      burnsClaudeQuota(job.type as JobType) &&
       this.inFlight.size === 1 &&
       (await this.budgetAwareFor(job.projectId ?? undefined))
         ? await this.readUsageSafe()
