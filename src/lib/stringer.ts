@@ -79,8 +79,15 @@ function scanTimeoutMs(): number {
   return Number.isFinite(raw) && raw > 0 ? raw : 10 * 60_000;
 }
 
-function formatTimeout(ms: number): string {
-  return ms >= 60_000 ? `${Math.round(ms / 60_000)}m` : `${ms}ms`;
+/**
+ * Render a deadline an operator can act on: the number must be traceable back to the configured
+ * ANTON_STRINGER_TIMEOUT_MS, so only exact whole minutes collapse to "m" -- rounding 90_000ms to
+ * "2m" would send someone looking for a timeout that isn't set anywhere. Exported for tests.
+ */
+export function formatTimeout(ms: number): string {
+  if (ms < 60_000) return `${ms}ms`;
+  if (ms % 60_000 === 0) return `${ms / 60_000}m`;
+  return `${Number((ms / 1000).toFixed(3))}s`;
 }
 
 /**
@@ -91,11 +98,12 @@ function formatTimeout(ms: number): string {
  * real cause was the deadline. So a kill is reported as a kill; every other failure keeps its
  * stderr, which for a genuine non-zero exit is the real diagnosis.
  */
-function toScanError(err: unknown, opts: { timeoutMs: number; aborted: boolean }): unknown {
+function toScanError(err: unknown, opts: { timeoutMs: number }): unknown {
   const e = err as { name?: string; code?: unknown; killed?: boolean; signal?: string } | null;
   // A caller abort is cancellation, not a deadline -- keep the AbortError so the job runner
-  // classifies it as such.
-  if (opts.aborted || e?.name === "AbortError" || e?.code === "ABORT_ERR") return err;
+  // classifies it as such. Discriminate on the error Node raised, not on the signal's state now:
+  // a signal aborted after a deadline kill would otherwise mask the timeout as cancellation.
+  if (e?.name === "AbortError" || e?.code === "ABORT_ERR") return err;
   if (!e?.killed) return err;
   return new Error(
     `stringer timed out after ${formatTimeout(opts.timeoutMs)} (killed with ${e.signal ?? "SIGTERM"}, no output written). ` +
@@ -155,7 +163,7 @@ export async function scan(opts: {
       signal: opts.signal,
     });
   } catch (err) {
-    throw toScanError(err, { timeoutMs, aborted: opts.signal?.aborted ?? false });
+    throw toScanError(err, { timeoutMs });
   }
 
   let signalCount = 0;

@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_SCAN_EXCLUDES, STRINGER_BIN_ENV, scan } from "./stringer";
+import { DEFAULT_SCAN_EXCLUDES, STRINGER_BIN_ENV, formatTimeout, scan } from "./stringer";
 
 let dir: string;
 let prevBin: string | undefined;
@@ -148,5 +148,18 @@ describe("scan", () => {
     await expect(
       scan({ repoPath: "/repo", scanFile: join(dir, "s.json"), signal: ac.signal }),
     ).rejects.toMatchObject({ name: "AbortError" });
+  });
+});
+
+// The reported deadline is what an operator will go looking for in the config, so it must round-trip
+// to the configured ANTON_STRINGER_TIMEOUT_MS rather than being rounded to a nearby minute.
+describe("formatTimeout", () => {
+  it("reports the configured deadline without rounding it away", () => {
+    expect(formatTimeout(250)).toBe("250ms");
+    expect(formatTimeout(59_999)).toBe("59999ms");
+    expect(formatTimeout(60_000)).toBe("1m");
+    expect(formatTimeout(600_000)).toBe("10m");
+    expect(formatTimeout(90_000)).toBe("90s");
+    expect(formatTimeout(61_234)).toBe("61.234s");
   });
 });
