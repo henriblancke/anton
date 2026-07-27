@@ -42,6 +42,7 @@ import {
 } from "../projects";
 import { runVerifyGates } from "./shell";
 import { findOpenRunForEpic, updateRun } from "../runs";
+import { runTickets } from "../ticket-view";
 import { appendSessionLog, endSession, startJobSession } from "../sessions";
 import { buildReviewFixPrompt, parseThreadReport, type ThreadOutcome } from "./review-fix-context";
 import { isUsageLimitError, PoisonError } from "./errors";
@@ -213,7 +214,7 @@ async function handleEpic(args: {
       repo,
       projectId,
       epic,
-      children: childrenOf(all, epic.id),
+      children: runTickets(all, epic.id),
       branch,
     });
     return;
@@ -445,11 +446,6 @@ async function notifyReReview(args: {
 
 // ── merge finalization (anton-ner.5) ──
 
-/** Children of an epic — beads whose parent (inline on `bd list --json`) is the epic. */
-function childrenOf(all: Bead[], epicId: string): Bead[] {
-  return all.filter((b) => ((b.parent ?? b.parent_id) as string | undefined) === epicId);
-}
-
 /**
  * Finalize an epic whose PR merged: close the epic + any still-open child tickets, drop the
  * `stage:in-review` label, remove the merged branch + its worktree, and finalize the run row.
@@ -469,7 +465,7 @@ export async function finalizeMergedEpic(args: {
   repo: string;
   projectId: string;
   epic: Bead;
-  /** The epic's child tickets (open ones are closed alongside the epic). */
+  /** The run target's whole ticket subtree (runTickets); open ones close alongside the epic. */
   children: Bead[];
   /** The merged PR's head branch — the local branch + worktree to clean up. */
   branch: string;

@@ -56,6 +56,13 @@ export interface Ticket {
 export interface Epic {
   id: string;
   title: string;
+  /**
+   * The card's real work type — `feature` for the tier anton now runs, `epic` for a legacy run
+   * target or a product epic, `task`/`bug` for a leaf target rendered as an epic-of-one. The card
+   * and the detail header read their icon, badge and wording off this, so a feature is never
+   * presented as an epic (docs/design/2026-07-26-tier-and-linear-ux.md).
+   */
+  type: IssueType;
   goal?: string; // parsed from the bead description "## Goal" section
   acceptance?: string;
   approved: boolean; // has the `approved` label

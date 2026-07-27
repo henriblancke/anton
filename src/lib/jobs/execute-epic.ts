@@ -11,6 +11,7 @@ import { beads, LABELS, type Bead } from "../beads/bd";
 import { ownerOf } from "../beads/claim";
 import { humanNotesPromptBlock } from "../beads/notes";
 import { computeEpicGraph, epicStandaloneBlockers, isUnit, standaloneBlockers } from "../epic-graph";
+import { runTickets } from "../ticket-view";
 import { loadAgentPrompt } from "../claude/agent-prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
 import { runClaude, type ClaudeEvent, type ClaudeResult } from "../claude/driver";
@@ -194,7 +195,10 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     // work is its own ticket, so it must not poison for having no children. A parentless task/bug
     // is always a leaf, unchanged. The rule is shared with epic-detail (beads.groupsChildren) so a
     // run and its detail page never disagree about which tickets the target contains.
-    const children = childrenOf(all, epicBeadId);
+    // The ticket set is the target's whole working-layer SUBTREE (runTickets), the same set the
+    // board card displays and counts — a direct-children run would merge the PR while leaving a
+    // deeper subtask open under a finished run target.
+    const children = runTickets(all, epicBeadId);
     let standaloneRun = !beads.groupsChildren(target, children);
     let tickets = standaloneRun ? [target] : children;
     if (tickets.length === 0) throw new PoisonEpic(`epic ${epicBeadId} has no tickets`);
@@ -313,7 +317,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         if (freshTarget) {
           all = fresh;
           target = freshTarget;
-          tickets = standaloneRun ? [target] : childrenOf(all, epicBeadId);
+          tickets = standaloneRun ? [target] : runTickets(all, epicBeadId);
           // Adopt the fresh bead for the liveness gates too (anton-jz1). When the `show` above failed
           // but this list succeeds, `leaseTarget` still points at the stale pre-pull snapshot — yet the
           // completion short-circuit (step 0a, reads the PR ref via getPrRef) and the foreign-lease gate below
@@ -447,7 +451,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
               ` — refusing to execute`,
         );
       }
-      const freshChildren = childrenOf(all, epicBeadId);
+      const freshChildren = runTickets(all, epicBeadId);
       standaloneRun = !beads.groupsChildren(target, freshChildren);
       tickets = standaloneRun ? [target] : freshChildren;
       if (tickets.length === 0) throw new PoisonEpic(`epic ${epicBeadId} has no tickets`);
@@ -1305,10 +1309,6 @@ function selfReportSuffix(selfReport: ReturnType<typeof parseAntonResult>): stri
   return selfReport.outcome === "delivered"
     ? ` The agent self-reported ANTON-RESULT: delivered — a false success on an unchanged tree.`
     : ` The agent self-reported ${formatAntonResult(selfReport)}, corroborating the block.`;
-}
-
-function childrenOf(all: Bead[], epicId: string): Bead[] {
-  return all.filter((b) => ((b.parent ?? b.parent_id) as string | undefined) === epicId);
 }
 
 function labelValue(labels: string[] | undefined, prefix: string): string | undefined {

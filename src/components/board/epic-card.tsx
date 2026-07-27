@@ -9,7 +9,12 @@ import type { Epic, EpicCrumb } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { ConfirmDeleteButton } from "@/components/ui/confirm-delete-button";
 import { cn } from "@/lib/utils";
-import { STAGE_INSET_SHADOW, agentDotClass, ticketProgress } from "@/components/board/board-utils";
+import {
+  STAGE_INSET_SHADOW,
+  TYPE_LABELS,
+  agentDotClass,
+  ticketProgress,
+} from "@/components/board/board-utils";
 import { TypeBadge, TypeIcon } from "@/components/board/type-language";
 import { EpicBadge, NoEpicBadge } from "@/components/board/epic-badge";
 import { AbandonedChip, BlockedChip, MetaChip, PrLink, RiskChip } from "@/components/atoms";
@@ -21,6 +26,10 @@ function prLabel(ref: string): string {
   const m = /(\d+)\s*$/.exec(ref);
   return m ? `#${m[1]}` : ref;
 }
+
+/** The card's work type in sentence case — "feature", "epic", "task" — for ids, titles and
+ * confirmations. A feature is the tier anton runs, so a card must never call itself an epic. */
+const typeWord = (epic: Epic): string => TYPE_LABELS[epic.type].toLowerCase();
 
 export function EpicCard({
   slug,
@@ -47,6 +56,7 @@ export function EpicCard({
   const [optimisticApproved, setOptimisticApproved] = useState(false);
   const [approving, setApproving] = useState(false);
   const approved = epic.approved || optimisticApproved;
+  const word = typeWord(epic);
 
   async function handleDelete() {
     const res = await fetch(`/api/projects/${slug}/epics/${epic.id}`, { method: "DELETE" });
@@ -79,7 +89,7 @@ export function EpicCard({
       );
     } catch (err) {
       setOptimisticApproved(false);
-      toast.error(err instanceof Error ? err.message : "Failed to approve epic");
+      toast.error(err instanceof Error ? err.message : `Failed to approve ${word}`);
     } finally {
       setApproving(false);
     }
@@ -97,10 +107,10 @@ export function EpicCard({
       <CardShell epic={epic} overlay={overlay} slug={slug} muted>
         <EpicSlot slug={slug} crumb={epic.epic} />
         <div className="flex items-center gap-2">
-          <TypeIcon type="epic" />
-          <CopyButton value={epic.id} label="epic id" className="font-mono text-[10px]">
-          {epic.id}
-        </CopyButton>
+          <TypeIcon type={epic.type} />
+          <CopyButton value={epic.id} label={`${word} id`} className="font-mono text-[10px]">
+            {epic.id}
+          </CopyButton>
           {epic.prRef && !epic.abandoned && (
             <PrLink href={epic.prUrl} className="ml-auto">
               <MetaChip tone="done">merged {prLabel(epic.prRef)}</MetaChip>
@@ -143,8 +153,8 @@ export function EpicCard({
     <CardShell epic={epic} overlay={overlay} slug={slug}>
       <EpicSlot slug={slug} crumb={epic.epic} />
       <div className="flex items-center gap-1.5">
-        <TypeIcon type="epic" />
-        <CopyButton value={epic.id} label="epic id" className="font-mono text-[10px]">
+        <TypeIcon type={epic.type} />
+        <CopyButton value={epic.id} label={`${word} id`} className="font-mono text-[10px]">
           {epic.id}
         </CopyButton>
         <span className="ml-auto flex items-center gap-1.5">
@@ -190,7 +200,7 @@ export function EpicCard({
       </div>
 
       <div className="flex flex-wrap gap-1.5">
-        <TypeBadge type="epic" />
+        <TypeBadge type={epic.type} />
         {epic.agent && <MetaChip dotClass={agentDotClass(epic.agent)}>{epic.agent}</MetaChip>}
         {epic.risk && <RiskChip risk={epic.risk} />}
         {epic.size && <MetaChip>size:{epic.size}</MetaChip>}
@@ -244,7 +254,7 @@ export function EpicCard({
             size="xs"
             stopPropagation
             confirmLabel="Delete"
-            title="Delete epic"
+            title={`Delete ${word}`}
             className="pointer-events-auto ml-auto shrink-0"
           />
         </ClaimControl>
@@ -310,7 +320,9 @@ function CardShell({
           href={`/projects/${slug}/epics/${epic.id}`}
           className="absolute inset-0 z-0 rounded-[12px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
         >
-          <span className="sr-only">Open epic {epic.title}</span>
+          <span className="sr-only">
+            Open {typeWord(epic)} {epic.title}
+          </span>
         </Link>
       )}
       <div className="pointer-events-none relative z-[1] flex flex-col gap-2.5">

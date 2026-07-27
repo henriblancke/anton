@@ -9,6 +9,7 @@ import { issueSnapshotVersion, type SnapshotReadOptions } from "./beads/snapshot
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
 import {
   boardCards,
+  isRunTicket,
   parentEpicOf,
   parseAcceptance,
   parseGoal,
@@ -63,8 +64,9 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   const cards = boardCards(workBeads);
   const cardBeads = workBeads.filter((b) => cards.ids.has(b.id));
   // The working layer: everything that is neither a card nor a container epic (a container groups
-  // cards — it is never a ticket riding on one).
-  const workingBeads = workBeads.filter((b) => !cards.ids.has(b.id) && !beads.isEpic(b));
+  // cards — it is never a ticket riding on one). Same predicate the run uses (see runTickets), so a
+  // card never displays a ticket its run wouldn't execute.
+  const workingBeads = workBeads.filter((b) => isRunTicket(b, cards));
 
   // Attribute each working-layer bead to its NEAREST card ancestor, from the inline `parent` field
   // — no per-card bd calls. Walking the chain (rather than joining on a single parent hop) is the

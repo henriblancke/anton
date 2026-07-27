@@ -179,6 +179,31 @@ export function boardCards(all: Bead[]): BoardCards {
   };
 }
 
+/**
+ * A working-layer bead: neither a card (it owns its own run) nor a container epic (it groups cards
+ * rather than riding on one). These are the beads that ride on a run target as its tickets.
+ */
+export function isRunTicket(bead: Bead, cards: BoardCards): boolean {
+  return !cards.ids.has(bead.id) && !beads.isEpic(bead);
+}
+
+/**
+ * The tickets a run target actually contains: every working-layer DESCENDANT whose nearest card
+ * ancestor is this target (boardCards.cardOf), in board order — not just its direct children.
+ * Depth matters because bd nesting is arbitrary-depth: under `feature → task → subtask` the subtask
+ * ships in the same worktree and the same PR as the task above it, so the board card, the detail
+ * page and the run must all count it. A direct-children-only run would open and merge the feature's
+ * PR while leaving the subtask open under a completed run target — stranded, with no run path left
+ * to reach it. Descent stops at a nested card (it owns its own subtree and its own PR).
+ *
+ * Pure over a bead list, so every consumer — board, epic detail, execute-epic, merge finalization —
+ * derives the same set from one read.
+ */
+export function runTickets(all: Bead[], targetId: string): Bead[] {
+  const cards = boardCards(all);
+  return all.filter((b) => isRunTicket(b, cards) && cards.cardOf(b) === targetId);
+}
+
 export interface ToEpicOptions {
   /** The epic's tickets, already mapped (an orphan/pseudo-epic passes `[toTicket(bead)]`). */
   tickets: Ticket[];
@@ -210,6 +235,15 @@ export interface ToEpicOptions {
 /** Missing bead priority sorts after every explicit priority (bd uses 0=critical … 4=lowest). */
 const DEFAULT_PRIORITY = 4;
 
+const ISSUE_TYPES = new Set<string>(["epic", "feature", "task", "bug", "chore"]);
+
+/** The bead's work type, narrowed to the types the UI has language for. A bead with a missing or
+ * unknown type falls back to `epic` — the pre-tier default every card was rendered as. */
+export function issueTypeOf(bead: Bead): IssueType {
+  const type = bead.issue_type ?? "";
+  return ISSUE_TYPES.has(type) ? (type as IssueType) : "epic";
+}
+
 /** Map a bead to the shared Epic view model. `approved` and the chips/prRef are derived from the
  * bead; goal/acceptance are passed in because their source (the lite list bead vs. a `bd show`
  * fetch) differs per caller. */
@@ -219,6 +253,7 @@ export function toEpic(bead: Bead, opts: ToEpicOptions): Epic {
   return {
     id: bead.id,
     title: bead.title,
+    type: issueTypeOf(bead),
     goal: opts.goal,
     acceptance: opts.acceptance,
     approved: beads.isApproved(bead),

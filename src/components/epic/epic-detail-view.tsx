@@ -11,7 +11,7 @@ import { cn } from "@/lib/utils";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { ConfirmDeleteButton } from "@/components/ui/confirm-delete-button";
 import { CopyButton } from "@/components/ui/copy-button";
-import { agentDotClass, ticketProgress } from "@/components/board/board-utils";
+import { TYPE_LABELS, agentDotClass, ticketProgress } from "@/components/board/board-utils";
 import { AbandonedChip, MetaChip, RelativeTime, RiskChip, StagePill } from "@/components/atoms";
 import { ClaimControl } from "@/components/board/claim-control";
 import { EpicBadge } from "@/components/board/epic-badge";
@@ -233,6 +233,9 @@ export function EpicDetailView({
   const todo = Math.max(0, total - done - inProgress);
   const abandoned = tickets.filter((t) => t.abandoned).length;
   const acceptance = epic.acceptance ? parseAcceptance(epic.acceptance) : [];
+  // The page serves every run target, and a feature is the tier anton runs — so the id line and the
+  // actions name the bead's real type instead of calling everything an epic.
+  const word = TYPE_LABELS[epic.type].toLowerCase();
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -307,7 +310,7 @@ export function EpicDetailView({
               onClick={() => handleRun(epic.title)}
               disabled={running}
             >
-              {running ? "Starting…" : "Run epic"}
+              {running ? "Starting…" : `Run ${word}`}
             </Button>
           )}
           <Button
@@ -332,7 +335,7 @@ export function EpicDetailView({
           <ConfirmDeleteButton
             onConfirm={() => handleDelete(epic.title)}
             iconOnly
-            title="Delete epic and all its tickets"
+            title={`Delete ${word} and all its tickets`}
           />
         </div>
       </header>
@@ -343,10 +346,10 @@ export function EpicDetailView({
         <div className="flex flex-col gap-5 overflow-y-auto border-border p-5 sm:p-6 lg:border-r">
           <div className="flex flex-col gap-2">
             <span className="flex items-center gap-1.5 font-mono text-[11px] text-subtle">
-              <CopyButton value={epic.id} label="epic id">
+              <CopyButton value={epic.id} label={`${word} id`}>
                 {epic.id}
               </CopyButton>
-              · epic
+              · {word}
             </span>
             <h1 className="font-display text-[22px] leading-tight font-bold tracking-[-0.01em]" title={epic.title}>
               {epic.title}

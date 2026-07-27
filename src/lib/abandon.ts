@@ -156,12 +156,23 @@ export async function abandonEpic(
   const epic = await beads.show(repo, epicId); // 404 guard — bd throws on an unknown id
   assertOpen(epic, "Epic");
 
-  await cancelRunForTarget(project.id, epicId);
-
   const all = await beads.list(repo, ["--status", "all"]);
+  const descendants = openDescendants(all, epicId);
+
+  // Kill every live run this abandon settles, BEFORE recording it. A container epic never runs
+  // itself — the active job is keyed by the FEATURE below it — so cancelling only `epicId` would
+  // mark the feature and its tickets abandoned while its agent kept running from the bead snapshot
+  // it loaded at start, and still committed and opened a PR for work the board now calls won't-do.
+  // The epic's own id is cancelled too: a legacy (non-container) epic is its own run target.
+  await cancelRunForTarget(project.id, epicId);
+  for (const descendant of descendants) {
+    if (beads.isRunTarget(descendant, all)) {
+      await cancelRunForTarget(project.id, descendant.id);
+    }
+  }
 
   const children: string[] = [];
-  for (const descendant of openDescendants(all, epicId)) {
+  for (const descendant of descendants) {
     await beads.abandon(repo, descendant.id, `${why} (parent epic ${epicId} abandoned)`);
     children.push(descendant.id);
   }

@@ -73,6 +73,7 @@ function epic(id: string, stage: Stage): Epic {
   return {
     id,
     title: id,
+    type: "feature",
     approved: false,
     stage,
     assignee: null,

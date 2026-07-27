@@ -8,7 +8,7 @@ import { ensureDescription } from "./beads/issues";
 import { getDb } from "./db";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
 import { findOpenRunForEpic } from "./runs";
-import { parentEpicOf, parseAcceptance, parseGoal, toEpic, toTicket } from "./ticket-view";
+import { parentEpicOf, parseAcceptance, parseGoal, runTickets, toEpic, toTicket } from "./ticket-view";
 import { listAllBeads } from "./tickets";
 import type { DepEdge, DepType, EpicDetail, EpicRun, Project } from "./types";
 
@@ -38,7 +38,13 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
   const base = await githubBaseUrl(project.repoPath);
   const parentEpic = parentEpicOf(lite, all);
 
-  const childBeads = all.filter((b) => beads.parentOf(b) === epicId);
+  // A RUN TARGET reports the whole working-layer subtree it ships (runTickets) rather than one
+  // parent hop — the same set the board card counts and the run executes, so the page never shows
+  // fewer tickets than the PR will contain. A container epic owns no run: its members are the
+  // feature cards directly beneath it, each shipping its own PR, so it still reads one hop down.
+  const childBeads = beads.isRunTarget(lite, all)
+    ? runTickets(all, epicId)
+    : all.filter((b) => beads.parentOf(b) === epicId);
 
   // A LEAF target — a parentless task/bug chip, or a feature shaped as one unit of work — is its
   // own single ticket, so it renders as an epic whose only member is itself, with no children and

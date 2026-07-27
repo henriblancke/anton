@@ -87,6 +87,7 @@ function epic(id: string, over: Partial<Epic> = {}): Epic {
   return {
     id,
     title: id,
+    type: "feature",
     approved: false,
     stage: "backlog",
     assignee: null,
