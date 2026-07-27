@@ -73,6 +73,62 @@ describe("required skill assets", () => {
     }
   });
 
+  // The producer must emit the taxonomy the runtime executes (anton-9pkk.7). These assert on the
+  // load-bearing copy only — the tier names, the nesting rule, the run-target rule, and the
+  // never-orphan-a-feature escalation — not on prose that is free to be rewritten.
+  describe("three-tier taxonomy", () => {
+    const bd = readFileSync(skillPath("bd"), "utf8");
+    const shape = readFileSync(skillPath("shape"), "utf8");
+
+    it("bd documents all three tiers and the nesting rule", () => {
+      expect(bd).toMatch(/`epic`/);
+      expect(bd).toMatch(/`feature`/);
+      expect(bd).toMatch(/`task` \/ `bug` \/ `chore`/);
+      expect(bd).toMatch(/epic → feature → task \| bug \| chore/);
+    });
+
+    it("bd records that `epic` was redefined, and that no bead is re-typed to migrate", () => {
+      expect(bd).toMatch(/`epic` has been redefined/);
+      expect(bd).toMatch(/never re-type an existing bead/i);
+    });
+
+    it("bd states the run-target rule the executor implements", () => {
+      // Must stay in step with beads.isRunTarget / isContainer (src/lib/beads/bd.ts).
+      expect(bd).toMatch(
+        /run target if it is a `feature`, \*\*or\*\* a parentless `task`\/`bug`, \*\*or\*\* an `epic`[\s>]+with no `feature` children/,
+      );
+    });
+
+    it("bd scopes `area:` to the epic tier", () => {
+      expect(bd).toMatch(/`area:`/);
+      expect(bd).toMatch(/epic tier only/i);
+    });
+
+    it("shape emits a feature scoped to one PR, not an epic", () => {
+      expect(shape).toMatch(/anton runs \*\*features\*\*, not epics/);
+      expect(shape).toMatch(/\*\*`feature`\*\* scoped to \*\*one reviewable PR\*\*/);
+    });
+
+    it("shape looks for an existing epic before creating one", () => {
+      expect(shape).toMatch(/bd list --type epic --json/);
+      expect(shape).toMatch(/Match on `area:` first/);
+      expect(shape).toMatch(/Nothing fits → create the epic/);
+    });
+
+    it("warns that a ticket parented to an epic never runs", () => {
+      // A live /shape run hung a task straight off the epic — neither a run target (it has a
+      // parent) nor covered by any feature's run. Both producers must name that trap.
+      expect(bd).toMatch(/hang off \*\*a feature\*\*, never off an epic/);
+      expect(shape).toMatch(/parented straight to the epic never runs/);
+    });
+
+    it("shape escalates an unattachable feature instead of orphaning it", () => {
+      expect(shape).toMatch(/ask the user/i);
+      expect(shape).toMatch(/Never leave a feature parentless/);
+      expect(shape).toMatch(/never mint a one-feature epic/);
+    });
+  });
+
   // `setup` is founder-run, not loaded by anton's runtime for a background job — so it lives outside
   // REQUIRED_SKILLS. But it IS in INSTALLED_SKILLS: the installer must ship it (skill + its bundled
   // templates) into a target repo, or `/setup` can't resolve where `/shape` sends the founder (anton-olh).
