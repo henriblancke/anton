@@ -1,6 +1,35 @@
-import { describe, expect, it } from "vitest";
-import { openDescendants } from "./abandon";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bead } from "./beads/bd";
+import type { Project } from "./types";
+
+const showMock = vi.fn();
+const listMock = vi.fn();
+const abandonMock = vi.fn();
+const cancelRunMock = vi.fn();
+
+vi.mock("./beads/bd", async () => {
+  const actual = await vi.importActual<typeof import("./beads/bd")>("./beads/bd");
+  return {
+    ...actual,
+    beads: {
+      ...actual.beads,
+      show: (...args: unknown[]) => showMock(...args),
+      list: (...args: unknown[]) => listMock(...args),
+      abandon: (...args: unknown[]) => abandonMock(...args),
+      sync: vi.fn().mockResolvedValue(undefined),
+    },
+  };
+});
+
+vi.mock("./jobs/service", () => ({
+  cancelRunForTarget: (...args: unknown[]) => cancelRunMock(...args),
+}));
+
+vi.mock("./ticket-detail", () => ({
+  freshDetail: vi.fn().mockResolvedValue({ id: "detail" }),
+}));
+
+const { abandonTicket, openDescendants } = await import("./abandon");
 
 function makeBead(overrides: Partial<Bead> & { id: string }): Bead {
   return {
@@ -69,5 +98,69 @@ describe("openDescendants (epic abandon cascade)", () => {
 
   it("returns nothing for an epic with no children", () => {
     expect(openDescendants([makeBead({ id: "epic", issue_type: "epic" })], "epic")).toEqual([]);
+  });
+});
+
+describe("abandonTicket cascade", () => {
+  const project: Project = {
+    id: "p1",
+    slug: "anton",
+    name: "anton",
+    repoPath: "/tmp/anton",
+    defaultBranch: "main",
+    hasBeads: true,
+    createdAt: 0,
+  };
+
+  beforeEach(() => {
+    showMock.mockReset();
+    listMock.mockReset();
+    abandonMock.mockReset().mockResolvedValue(undefined);
+    cancelRunMock.mockReset().mockResolvedValue(false);
+  });
+
+  /** The route hit by a direct API call on a feature id — the path the UI's epic deep-link skips. */
+  it("takes a feature's open tasks with it, so none are left claimable under a settled target", async () => {
+    const feature = makeBead({ id: "feature", issue_type: "feature", parent: "epic" });
+    const board = [
+      makeBead({ id: "epic", issue_type: "epic" }),
+      feature,
+      makeBead({ id: "t1", parent: "feature" }),
+      makeBead({ id: "t2", parent: "feature", status: "closed" }),
+      makeBead({ id: "t3", parent: "feature" }),
+    ];
+    showMock.mockResolvedValue(feature);
+    listMock.mockResolvedValue(board);
+
+    await abandonTicket(project, "feature", "not worth building");
+
+    // The feature is its own run target, so its run — not the container epic's — is the one killed.
+    expect(cancelRunMock).toHaveBeenCalledWith("p1", "feature");
+    const abandoned = abandonMock.mock.calls.map((c) => c[1]);
+    expect(abandoned).toEqual(["t1", "t3", "feature"]); // settled t2 untouched, feature closes last
+  });
+
+  it("leaves the run of a still-live sibling alone when a leaf ticket is abandoned", async () => {
+    const ticket = makeBead({ id: "t1", parent: "feature" });
+    showMock.mockResolvedValue(ticket);
+    listMock.mockResolvedValue([
+      makeBead({ id: "feature", issue_type: "feature", parent: "epic" }),
+      ticket,
+      makeBead({ id: "t2", parent: "feature" }),
+    ]);
+
+    await abandonTicket(project, "t1", "obsolete");
+
+    // A child ticket executes under its feature's run, and has nothing beneath it to cascade to.
+    expect(cancelRunMock.mock.calls).toEqual([["p1", "feature"]]);
+    expect(abandonMock.mock.calls.map((c) => c[1])).toEqual(["t1"]);
+  });
+
+  it("refuses a ticket that already settled rather than rewriting its outcome", async () => {
+    showMock.mockResolvedValue(makeBead({ id: "t1", status: "closed" }));
+
+    await expect(abandonTicket(project, "t1", "too late")).rejects.toThrow(/already closed/);
+    expect(abandonMock).not.toHaveBeenCalled();
+    expect(cancelRunMock).not.toHaveBeenCalled();
   });
 });
