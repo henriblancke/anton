@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { cancelJob } from "@/lib/jobs/service";
 import { withProject } from "../../../resolve-project";
+import { CANCEL_FAILURE_MESSAGES } from "../../cancel-outcome";
 
 export const dynamic = "force-dynamic";
 
@@ -13,12 +14,10 @@ export const POST = withProject<{ slug: string; jobId: string }>(
   async (_request, { project, params }) => {
     const result = await cancelJob(project.id, params.jobId);
     if (!result.ok) {
-      return result.reason === "not-found"
-        ? NextResponse.json({ error: "Job not found", cancelled: false }, { status: 404 })
-        : NextResponse.json(
-            { error: "Job is not cancellable (already terminal)", cancelled: false },
-            { status: 409 },
-          );
+      return NextResponse.json(
+        { error: CANCEL_FAILURE_MESSAGES[result.reason], cancelled: false },
+        { status: result.reason === "not-found" ? 404 : 409 },
+      );
     }
     return NextResponse.json({ cancelled: true });
   },
