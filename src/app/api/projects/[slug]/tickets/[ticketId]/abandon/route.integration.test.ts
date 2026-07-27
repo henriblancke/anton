@@ -92,6 +92,20 @@ describeBd("ticket abandon route (real bd)", () => {
     expect(cancelled).toEqual([["proj-1", looseId]]);
   });
 
+  it("kills a feature's OWN run, not its product epic's", async () => {
+    // A feature is a run target — one worktree, one PR. Killing its parent epic (which never runs)
+    // would leave the feature's own agent executing toward a PR the board already calls won't-do.
+    const featureId = await beads.create(repo, {
+      title: "A feature under the epic",
+      type: "feature",
+      deps: [`parent-child:${epicId}`],
+    });
+    resetIssueSnapshots(); // a warm snapshot predates this create — freshDetail would miss its epic
+    const res = await POST(post({ reason: "cut from the release" }), ctx("tmp", featureId));
+    expect(res.status).toBe(200);
+    expect(cancelled).toEqual([["proj-1", featureId]]);
+  });
+
   it("refuses without a reason, and leaves the ticket alone", async () => {
     const open = await beads.create(repo, { title: "Still open", type: "task" });
     for (const body of [{}, { reason: "   " }, { reason: 5 }]) {

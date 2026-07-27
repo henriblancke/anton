@@ -53,13 +53,25 @@ function nudgeSync(project: Project, id: string): void {
 }
 
 /**
- * Abandon one ticket. The live run is killed FIRST (see cancelRunForTarget): a ticket is executed
- * as part of its parent epic's run — or, parentless, as its own epic-of-one — so the run target to
- * kill is the parent when there is one. Only then is the outcome recorded, so the agent is already
- * stopped when the board says the work won't be done. Killing the parent's run stops the WHOLE epic,
- * not just this ticket — there is no finer-grained kill, and a run that kept going would have to be
- * told mid-flight that one of its tickets vanished. The remaining tickets are picked up by running
- * the epic again, which now skips the abandoned one.
+ * The run this bead's work executes under: the bead ITSELF when it is a run target (a feature, or a
+ * parentless task/bug run as an epic-of-one), otherwise its parent — a child ticket runs as part of
+ * its target's run. Reading the parent for a bead that owns a run would kill the wrong thing:
+ * abandoning a feature would cancel its product epic (which never runs) and leave the feature's own
+ * agent executing on toward a PR the board already calls won't-do.
+ */
+async function runTargetOf(project: Project, bead: Bead): Promise<string> {
+  const board = await beads.list(project.repoPath, ["--status", "all"]);
+  if (beads.isRunTarget(bead, board)) return bead.id;
+  return beads.parentOf(bead) ?? bead.id;
+}
+
+/**
+ * Abandon one ticket. The live run is killed FIRST (see cancelRunForTarget), against the run target
+ * this bead's work actually executes under (runTargetOf). Only then is the outcome recorded, so the
+ * agent is already stopped when the board says the work won't be done. For a child ticket that kill
+ * stops the WHOLE run, not just this ticket — there is no finer-grained kill, and a run that kept
+ * going would have to be told mid-flight that one of its tickets vanished. The remaining tickets are
+ * picked up by running the target again, which now skips the abandoned one.
  *
  * Throws on an unknown id (bd's own error → 404), an empty/oversized reason (→ 400), or an
  * already-closed ticket (NotAbandonableError → 409).
@@ -73,8 +85,7 @@ export async function abandonTicket(
   const bead = await beads.show(project.repoPath, id); // 404 guard — bd throws on an unknown id
   assertOpen(bead, "Ticket");
 
-  const runTarget = ((bead.parent ?? bead.parent_id) as string | undefined) ?? id;
-  await cancelRunForTarget(project.id, runTarget);
+  await cancelRunForTarget(project.id, await runTargetOf(project, bead));
 
   await beads.abandon(project.repoPath, id, why);
   // Read-after-write, like setTicketDeferred: the `bd show` bead is authoritative for the abandoned

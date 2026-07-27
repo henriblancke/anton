@@ -1,6 +1,7 @@
 /**
- * The Tickets page: a flat, filterable view over every work bead — epics included (each epic
- * row is followed by its child tickets), excluding only `molecule` coordination artifacts.
+ * The Tickets page: a flat, filterable view over every work bead — epics included (each epic row is
+ * followed by its subtree, features and their tickets), excluding only `molecule` coordination
+ * artifacts.
  * Mirrors board.ts's read + section-parsing patterns — see DESIGN.md §2/§3.
  */
 import { beads, type Bead } from "./beads/bd";
@@ -59,42 +60,53 @@ export function applyFilters(rows: TicketRow[], filters: TicketFilters): TicketR
   });
 }
 
-export async function getTickets(project: Project, filters: TicketFilters): Promise<TicketRow[]> {
-  const allBeads = (await listAllBeads(project)).filter((b) => !NON_WORK.has(b.issue_type ?? ""));
-
+/**
+ * The Tickets page's rows, in reading order: each epic, followed by its whole subtree depth-first
+ * (a feature, then the tickets shaped under it), with beads that have no epic ancestor trailing
+ * after. Every row carries its NEAREST epic ancestor, not its immediate parent — under the
+ * three-tier shape (epic → feature → task) a ticket's parent is its feature, so a single hop would
+ * emit it as an orphan: no Epic value and invisible to the Epic filter. Pure over a bead list, so
+ * it costs no bd call and is testable from a fixture board.
+ */
+export function buildTicketRows(allBeads: Bead[]): TicketRow[] {
   const epicBeads = allBeads.filter((b) => beads.isEpic(b));
   const workBeads = allBeads.filter((b) => !beads.isEpic(b));
 
-  // Resolve each ticket's epic from its inline `parent` field — no per-epic bd calls.
-  const epicById = new Map(epicBeads.map((e) => [e.id, e]));
-  const epicByTicketId = new Map<string, Bead>();
+  // Children keyed by parent, over the work beads only — so a descent from an epic stops at a
+  // nested epic, which gets its own row and its own subtree.
+  const childrenByParent = new Map<string, Bead[]>();
   for (const t of workBeads) {
-    const parent = (t.parent ?? t.parent_id) as string | undefined;
-    const epic = parent ? epicById.get(parent) : undefined;
-    if (epic) epicByTicketId.set(t.id, epic);
-  }
-
-  // Group each epic row with its children; orphan tickets trail after. Epics themselves are
-  // rows too (type "epic", no parent epic of their own).
-  const childrenByEpic = new Map<string, Bead[]>();
-  for (const t of workBeads) {
-    const epic = epicByTicketId.get(t.id);
-    if (!epic) continue;
-    const list = childrenByEpic.get(epic.id) ?? [];
-    list.push(t);
-    childrenByEpic.set(epic.id, list);
+    const parent = beads.parentOf(t);
+    if (!parent) continue;
+    const siblings = childrenByParent.get(parent);
+    if (siblings) siblings.push(t);
+    else childrenByParent.set(parent, [t]);
   }
 
   const rows: TicketRow[] = [];
+  const grouped = new Set<string>();
   for (const epic of epicBeads) {
     rows.push(toTicketRow(epic, undefined));
-    for (const child of childrenByEpic.get(epic.id) ?? []) {
-      rows.push(toTicketRow(child, epic));
+    // Depth-first from the epic; `grouped` doubles as the cycle guard on a malformed parent chain.
+    const stack = [...(childrenByParent.get(epic.id) ?? [])].reverse();
+    while (stack.length > 0) {
+      const bead = stack.pop()!;
+      if (grouped.has(bead.id)) continue;
+      grouped.add(bead.id);
+      rows.push(toTicketRow(bead, epic));
+      const children = childrenByParent.get(bead.id) ?? [];
+      for (let i = children.length - 1; i >= 0; i--) stack.push(children[i]);
     }
   }
   for (const t of workBeads) {
-    if (!epicByTicketId.has(t.id)) rows.push(toTicketRow(t, undefined));
+    if (!grouped.has(t.id)) rows.push(toTicketRow(t, undefined));
   }
+  return rows;
+}
+
+export async function getTickets(project: Project, filters: TicketFilters): Promise<TicketRow[]> {
+  const allBeads = (await listAllBeads(project)).filter((b) => !NON_WORK.has(b.issue_type ?? ""));
+  const rows = buildTicketRows(allBeads);
 
   const base = await githubBaseUrl(project.repoPath);
   for (const row of rows) attachPrUrl(row, base);

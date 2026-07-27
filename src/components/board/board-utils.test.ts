@@ -345,6 +345,15 @@ describe("board filters (anton-9pkk.3)", () => {
     expect(narrowed.done.map((e) => e.id)).toEqual(["o2"]);
   });
 
+  it("narrows to a legacy epic by the card's own id — its roadmap row must not open an empty board", () => {
+    // A legacy epic (no feature children) IS the board card, so it carries no parent epic crumb.
+    // The roadmap links every row as `?epic=<row.id>`; keying only on the crumb would hide the card.
+    const legacy = makeEpic(UNDESIGNATED.id, { title: UNDESIGNATED.title });
+    const board = makeColumns({ backlog: [...columns.backlog, legacy] });
+    const { columns: narrowed } = filterBoard(board, undefined, { epic: UNDESIGNATED.id });
+    expect(narrowed.backlog.map((e) => e.id)).toEqual([UNDESIGNATED.id]);
+  });
+
   it("narrows by area — one filter, every epic on that product surface", () => {
     const { columns: narrowed } = filterBoard(columns, undefined, { area: "knowledge" });
     expect(narrowed.backlog.map((e) => e.id)).toEqual(["r1"]);

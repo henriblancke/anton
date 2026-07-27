@@ -124,7 +124,10 @@ export function boardFiltersQueryString(filters: BoardFilters, currentQuery = ""
 }
 
 function matchesBoardFilters(epic: Epic, filters: BoardFilters): boolean {
-  if (filters.epic && epic.epic?.id !== filters.epic) return false;
+  // Match a card by its OWN id too: a legacy epic (no feature children) is itself the board card and
+  // carries no parent epic crumb, so keying only on the crumb would open an empty board on the very
+  // card the roadmap row links to (`?epic=<row.id>`).
+  if (filters.epic && epic.epic?.id !== filters.epic && epic.id !== filters.epic) return false;
   if (filters.area && epic.epic?.area !== filters.area) return false;
   return true;
 }
