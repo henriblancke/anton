@@ -95,18 +95,53 @@ export async function abandonTicket(
   return detail;
 }
 
-/** What an epic-level abandon settled: the epic plus every open child it cascaded to. */
+/** What an epic-level abandon settled: the epic plus every open descendant it cascaded to. */
 export interface EpicAbandonResult {
   epicId: string;
-  /** Ids abandoned by the cascade — the epic's open children, in board order. */
+  /** Ids abandoned by the cascade — the epic's open descendants, depth-first in board order. */
   children: string[];
 }
 
 /**
- * Abandon an epic and cascade to its still-open children. Cascade (not delete's `--cascade`, which
- * would erase them) is what keeps the epic's outcome coherent: leaving children open would strand
- * them in the ready queue with no epic to run them under. Children that already settled — closed,
- * shipped, or abandoned earlier — are left exactly as they are; their history is not rewritten.
+ * Every still-open descendant of the epic, depth-first in board order (like buildTicketRows). The
+ * walk goes the WHOLE way down, not one level: under the three-tier shape (epic → feature → task) a
+ * ticket's parent is its feature, so a direct-children cascade would abandon the feature and strand
+ * its tickets open in the ready queue with no run path left to reach them. Settled beads are
+ * descended THROUGH but never collected — their own history stays as it is, while an open ticket
+ * beneath one is still orphaned by the epic's exit and belongs in the cascade.
+ *
+ * Pure over a bead list, so the cascade costs one bd read and is testable from a fixture board.
+ */
+export function openDescendants(board: Bead[], epicId: string): Bead[] {
+  const childrenByParent = new Map<string, Bead[]>();
+  for (const bead of board) {
+    const parent = beads.parentOf(bead);
+    if (!parent) continue;
+    const siblings = childrenByParent.get(parent);
+    if (siblings) siblings.push(bead);
+    else childrenByParent.set(parent, [bead]);
+  }
+
+  const open: Bead[] = [];
+  const seen = new Set<string>([epicId]); // also the cycle guard on a malformed parent chain
+  const stack = [...(childrenByParent.get(epicId) ?? [])].reverse();
+  while (stack.length > 0) {
+    const bead = stack.pop()!;
+    if (seen.has(bead.id)) continue;
+    seen.add(bead.id);
+    if (bead.status !== "closed") open.push(bead);
+    const children = childrenByParent.get(bead.id) ?? [];
+    for (let i = children.length - 1; i >= 0; i--) stack.push(children[i]);
+  }
+  return open;
+}
+
+/**
+ * Abandon an epic and cascade to its still-open descendants (the whole subtree — see
+ * openDescendants). Cascade (not delete's `--cascade`, which would erase them) is what keeps the
+ * epic's outcome coherent: leaving them open would strand them in the ready queue with no epic to
+ * run them under. Beads that already settled — closed, shipped, or abandoned earlier — are left
+ * exactly as they are; their history is not rewritten.
  *
  * Throws on an unknown id (→ 404), an empty/oversized reason (→ 400), or an already-closed epic
  * (NotAbandonableError → 409).
@@ -124,14 +159,11 @@ export async function abandonEpic(
   await cancelRunForTarget(project.id, epicId);
 
   const all = await beads.list(repo, ["--status", "all"]);
-  const open = all.filter(
-    (b) => ((b.parent ?? b.parent_id) as string | undefined) === epicId && b.status !== "closed",
-  );
 
   const children: string[] = [];
-  for (const child of open) {
-    await beads.abandon(repo, child.id, `${why} (parent epic ${epicId} abandoned)`);
-    children.push(child.id);
+  for (const descendant of openDescendants(all, epicId)) {
+    await beads.abandon(repo, descendant.id, `${why} (parent epic ${epicId} abandoned)`);
+    children.push(descendant.id);
   }
   // The epic closes LAST: a crash mid-cascade leaves it open with a partially-abandoned child set,
   // which re-running abandon finishes — the reverse order would leave orphaned open children under
