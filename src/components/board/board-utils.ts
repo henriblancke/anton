@@ -78,6 +78,101 @@ export function boardEpicFilterHref(slug: string, epicId: string): string {
   return `/projects/${slug}?epic=${encodeURIComponent(epicId)}`;
 }
 
+// ── Filtering: the board narrowed to one product epic or one area ─────────
+
+/**
+ * What the board is narrowed to, mirrored in the URL so an epic badge is a plain link and the
+ * narrowed board is shareable. Both facets are absent by default — the board's job is execution,
+ * so it shows everything until asked otherwise.
+ */
+export interface BoardFilters {
+  /** A single product epic id (`?epic=`) — where every epic badge points. */
+  epic?: string;
+  /** A single `area:` designator (`?area=`), matched against each card's epic. */
+  area?: string;
+}
+
+export const BOARD_FILTER_KEYS: (keyof BoardFilters)[] = ["epic", "area"];
+
+/** Reads the board filters out of a URLSearchParams (e.g. from useSearchParams). */
+export function boardFiltersFromSearchParams(searchParams: URLSearchParams): BoardFilters {
+  const filters: BoardFilters = {};
+  for (const key of BOARD_FILTER_KEYS) {
+    const value = searchParams.get(key)?.trim();
+    if (value) filters[key] = value;
+  }
+  return filters;
+}
+
+export function hasBoardFilters(filters: BoardFilters): boolean {
+  return BOARD_FILTER_KEYS.some((key) => Boolean(filters[key]?.trim()));
+}
+
+/**
+ * `?epic=x&area=y`, preserving any unrelated params already on the URL (sort, dialog state) so a
+ * filter change never silently drops another surface's state. Empty facets are removed, not blanked.
+ */
+export function boardFiltersQueryString(filters: BoardFilters, currentQuery = ""): string {
+  const params = new URLSearchParams(currentQuery);
+  for (const key of BOARD_FILTER_KEYS) {
+    const value = filters[key]?.trim();
+    if (value) params.set(key, value);
+    else params.delete(key);
+  }
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+
+function matchesBoardFilters(epic: Epic, filters: BoardFilters): boolean {
+  if (filters.epic && epic.epic?.id !== filters.epic) return false;
+  if (filters.area && epic.epic?.area !== filters.area) return false;
+  return true;
+}
+
+/**
+ * The board narrowed to the active filters. Standalone chips are parentless by definition — they
+ * carry no epic and so no area — so any active filter drops them entirely rather than leaving a
+ * column of chips that don't belong to the epic being read.
+ */
+export function filterBoard(
+  columns: Record<Stage, Epic[]>,
+  standalone: Record<Stage, StandaloneItem[]> | undefined,
+  filters: BoardFilters,
+): { columns: Record<Stage, Epic[]>; standalone: Record<Stage, StandaloneItem[]> } {
+  const active = hasBoardFilters(filters);
+  const next = emptyStageMap<Epic>();
+  const chips = emptyStageMap<StandaloneItem>();
+  for (const stage of STAGES) {
+    next[stage] = (columns[stage] ?? []).filter((epic) => matchesBoardFilters(epic, filters));
+    chips[stage] = active ? [] : (standalone?.[stage] ?? []);
+  }
+  return { columns: next, standalone: chips };
+}
+
+/** The product epics present on the board, sorted by title — the Epic filter's options. */
+export function boardEpicOptions(columns: Record<Stage, Epic[]>): EpicCrumb[] {
+  const byId = new Map<string, EpicCrumb>();
+  for (const stage of STAGES) {
+    for (const epic of columns[stage] ?? []) {
+      if (epic.epic) byId.set(epic.epic.id, epic.epic);
+    }
+  }
+  return [...byId.values()].sort(
+    (a, b) => a.title.localeCompare(b.title) || a.id.localeCompare(b.id),
+  );
+}
+
+/** The `area:` designators present on the board, sorted — the Area filter's options. */
+export function boardAreaOptions(columns: Record<Stage, Epic[]>): string[] {
+  const areas = new Set<string>();
+  for (const stage of STAGES) {
+    for (const epic of columns[stage] ?? []) {
+      if (epic.epic?.area) areas.add(epic.epic.area);
+    }
+  }
+  return [...areas].sort((a, b) => a.localeCompare(b));
+}
+
 /** Left-border color per stage — used by dependency-graph nodes (`border-l-3`). */
 export const STAGE_BORDER_LEFT: Record<Stage, string> = {
   backlog: "border-l-stage-backlog",

@@ -129,7 +129,7 @@ export function parentEpicOf(bead: Bead, all: Bead[]): EpicCrumb | undefined {
   if (!parentId) return undefined;
   const parent = all.find((b) => b.id === parentId);
   if (!parent || !beads.isEpic(parent)) return undefined;
-  return { id: parent.id, title: parent.title };
+  return { id: parent.id, title: parent.title, area: labelValue(parent.labels, "area") };
 }
 
 export interface ToEpicOptions {

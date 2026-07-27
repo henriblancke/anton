@@ -2,13 +2,19 @@ import { describe, expect, it } from "vitest";
 import {
   STAGE_ACCENT_DOT,
   STAGE_LABELS,
+  boardAreaOptions,
+  boardEpicFilterHref,
+  boardEpicOptions,
+  boardFiltersFromSearchParams,
+  boardFiltersQueryString,
   compareBacklogEpics,
+  filterBoard,
   groupBoardByEpic,
   moveEpicBetweenColumns,
   sortEpics,
   ticketProgress,
 } from "@/components/board/board-utils";
-import { STAGES, type Epic, type Stage, type Ticket } from "@/lib/types";
+import { STAGES, type Epic, type Stage, type StandaloneItem, type Ticket } from "@/lib/types";
 
 function makeTicket(id: string, over: Partial<Ticket> = {}): Ticket {
   return {
@@ -292,5 +298,106 @@ describe("groupBoardByEpic", () => {
 
   it("returns no lanes for an empty board rather than an empty No epic lane", () => {
     expect(groupBoardByEpic(makeColumns())).toEqual([]);
+  });
+});
+
+describe("board filters (anton-9pkk.3)", () => {
+  const ONTOLOGY = { id: "anton-b", title: "Ontology editing", area: "ontology" };
+  const RETRIEVAL = { id: "anton-a", title: "Trustworthy retrieval", area: "knowledge" };
+  /** A designated-nothing epic — today's board, before anyone tags an `area:`. */
+  const UNDESIGNATED = { id: "anton-c", title: "Prune the board" };
+
+  function makeColumns(over: Partial<Record<Stage, Epic[]>> = {}): Record<Stage, Epic[]> {
+    return { backlog: [], implementing: [], "in-review": [], done: [], ...over };
+  }
+
+  function makeChip(id: string): StandaloneItem {
+    return {
+      id,
+      title: id,
+      type: "bug",
+      status: "open",
+      stage: "backlog",
+      approved: false,
+      assignee: null,
+      createdAt: "",
+      createdBy: null,
+      blockedBy: [],
+      ready: true,
+      unread: false,
+      deferred: false,
+      abandoned: false,
+    };
+  }
+
+  const columns = makeColumns({
+    backlog: [
+      makeEpic("o1", { epic: ONTOLOGY }),
+      makeEpic("r1", { epic: RETRIEVAL }),
+      makeEpic("loose"),
+    ],
+    done: [makeEpic("o2", { epic: ONTOLOGY, stage: "done" })],
+  });
+
+  it("narrows the board to one product epic, across every stage column", () => {
+    const { columns: narrowed } = filterBoard(columns, undefined, { epic: ONTOLOGY.id });
+    expect(narrowed.backlog.map((e) => e.id)).toEqual(["o1"]);
+    expect(narrowed.done.map((e) => e.id)).toEqual(["o2"]);
+  });
+
+  it("narrows by area — one filter, every epic on that product surface", () => {
+    const { columns: narrowed } = filterBoard(columns, undefined, { area: "knowledge" });
+    expect(narrowed.backlog.map((e) => e.id)).toEqual(["r1"]);
+    expect(narrowed.done).toEqual([]);
+  });
+
+  it("drops standalone chips while any filter is active — they carry no epic to match", () => {
+    const chips = { backlog: [makeChip("anton-t3x")], implementing: [], "in-review": [], done: [] };
+    expect(filterBoard(columns, chips, {}).standalone.backlog.map((i) => i.id)).toEqual([
+      "anton-t3x",
+    ]);
+    expect(filterBoard(columns, chips, { epic: ONTOLOGY.id }).standalone.backlog).toEqual([]);
+  });
+
+  it("returns the board untouched when nothing is filtered", () => {
+    const { columns: narrowed } = filterBoard(columns, undefined, {});
+    expect(narrowed.backlog.map((e) => e.id)).toEqual(["o1", "r1", "loose"]);
+  });
+
+  it("offers every epic and area on the board as options, sorted for scanning", () => {
+    const withUndesignated = makeColumns({
+      backlog: [...columns.backlog, makeEpic("u1", { epic: UNDESIGNATED })],
+      done: columns.done,
+    });
+    // Sorted by title, deduped across stages — "Ontology editing" appears on two cards.
+    expect(boardEpicOptions(withUndesignated).map((e) => e.title)).toEqual([
+      "Ontology editing",
+      "Prune the board",
+      "Trustworthy retrieval",
+    ]);
+    // An epic with no `area:` contributes no facet value rather than an empty one.
+    expect(boardAreaOptions(withUndesignated)).toEqual(["knowledge", "ontology"]);
+  });
+
+  it("round-trips through the URL, preserving params the filter bar does not own", () => {
+    expect(boardFiltersQueryString({ epic: ONTOLOGY.id, area: "ontology" })).toBe(
+      `?epic=${ONTOLOGY.id}&area=ontology`,
+    );
+    // Clearing a facet removes the key instead of blanking it, and leaves `sort` alone.
+    expect(boardFiltersQueryString({ area: "ontology" }, "sort=risk&epic=anton-b")).toBe(
+      "?sort=risk&area=ontology",
+    );
+    expect(boardFiltersQueryString({}, "epic=anton-b")).toBe("");
+    expect(
+      boardFiltersFromSearchParams(new URLSearchParams("epic=anton-b&area=ontology&sort=risk")),
+    ).toEqual({ epic: "anton-b", area: "ontology" });
+  });
+
+  it("points every epic badge at the same filtered-board URL the facets write", () => {
+    const href = boardEpicFilterHref("tmp", ONTOLOGY.id);
+    expect(href).toBe(`/projects/tmp?epic=${ONTOLOGY.id}`);
+    expect(boardFiltersFromSearchParams(new URLSearchParams(href.split("?")[1]))).toEqual({
+      epic: ONTOLOGY.id,
+    });
   });
 });

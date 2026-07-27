@@ -69,8 +69,10 @@ function parseRunLease(label: string): { expiry: number | undefined; owner: stri
 }
 
 /** The managed-metadata label prefixes anton edits. Control labels (approved, stage:*,
- * source:*) are NOT in this set and are never touched by a patch. */
-export const LABEL_PREFIXES = ["agent", "risk", "size", "domain"] as const;
+ * source:*) are NOT in this set and are never touched by a patch.
+ * `area` is the epic tier's product-surface designator — its own axis, deliberately not folded into
+ * `domain:` (.product/decisions/2026-07-26-engine-designator-prefix.md). */
+export const LABEL_PREFIXES = ["agent", "risk", "size", "domain", "area"] as const;
 export type LabelPrefix = (typeof LABEL_PREFIXES)[number];
 
 /**

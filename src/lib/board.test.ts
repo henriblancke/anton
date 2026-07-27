@@ -231,6 +231,7 @@ describe("getBoard", () => {
       title: "Ontology editing",
       issue_type: "epic",
       status: "open",
+      labels: ["area:ontology"],
     });
     const under = makeBead({
       id: "epic-u",
@@ -244,9 +245,11 @@ describe("getBoard", () => {
 
     const board = await getBoard(project);
 
+    // The crumb carries the epic's `area:` too — the board's Area facet reads it off the card.
     expect(board.columns.backlog.find((e) => e.id === "epic-u")?.epic).toEqual({
       id: "epic-o",
       title: "Ontology editing",
+      area: "ontology",
     });
     // A top-level card has no epic above it, so the board collects it in the "No epic" lane.
     expect(board.columns.backlog.find((e) => e.id === "epic-o")?.epic).toBeUndefined();

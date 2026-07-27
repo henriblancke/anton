@@ -285,6 +285,26 @@ describe("buildUpdateArgs", () => {
     ]);
   });
 
+  it("manages `area:` as its own prefix, leaving `domain:` untouched", () => {
+    // The two answer different questions — company function vs product surface — so a bead may
+    // carry both (.product/decisions/2026-07-26-engine-designator-prefix.md).
+    expect(buildUpdateArgs("bd-1", { labels: { area: "ingest" } }, ["domain:eng"])).toEqual([
+      "update",
+      "bd-1",
+      "--add-label",
+      "area:ingest",
+    ]);
+    // Single-valued like every other managed prefix: a new value replaces the old one.
+    expect(buildUpdateArgs("bd-1", { labels: { area: "ingest" } }, ["area:ontology"])).toEqual([
+      "update",
+      "bd-1",
+      "--remove-label",
+      "area:ontology",
+      "--add-label",
+      "area:ingest",
+    ]);
+  });
+
   it("is a no-op when the label value is unchanged", () => {
     expect(buildUpdateArgs("bd-1", { labels: { agent: "nextjs" } }, ["agent:nextjs"])).toBeNull();
   });

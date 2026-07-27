@@ -5,12 +5,13 @@ import Link from "next/link";
 import { toast } from "sonner";
 import { CircleCheckIcon, CircleSlashIcon, GitPullRequestIcon } from "lucide-react";
 
-import type { Epic } from "@/lib/types";
+import type { Epic, EpicCrumb } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { ConfirmDeleteButton } from "@/components/ui/confirm-delete-button";
 import { cn } from "@/lib/utils";
 import { STAGE_INSET_SHADOW, agentDotClass, ticketProgress } from "@/components/board/board-utils";
 import { TypeBadge, TypeIcon } from "@/components/board/type-language";
+import { EpicBadge, NoEpicBadge } from "@/components/board/epic-badge";
 import { AbandonedChip, BlockedChip, MetaChip, PrLink, RiskChip } from "@/components/atoms";
 import { ClaimControl } from "@/components/board/claim-control";
 import { CopyButton } from "@/components/ui/copy-button";
@@ -94,6 +95,7 @@ export function EpicCard({
   if (isDone) {
     return (
       <CardShell epic={epic} overlay={overlay} slug={slug} muted>
+        <EpicSlot slug={slug} crumb={epic.epic} />
         <div className="flex items-center gap-2">
           <TypeIcon type="epic" />
           <CopyButton value={epic.id} label="epic id" className="font-mono text-[10px]">
@@ -139,6 +141,7 @@ export function EpicCard({
 
   return (
     <CardShell epic={epic} overlay={overlay} slug={slug}>
+      <EpicSlot slug={slug} crumb={epic.epic} />
       <div className="flex items-center gap-1.5">
         <TypeIcon type="epic" />
         <CopyButton value={epic.id} label="epic id" className="font-mono text-[10px]">
@@ -247,6 +250,23 @@ export function EpicCard({
         </ClaimControl>
       )}
     </CardShell>
+  );
+}
+
+/**
+ * The card's product-epic line: the epic as a clickable badge, or the hollow legacy state when the
+ * run target has none. Context, not structure — the board still groups by stage
+ * (docs/design/2026-07-26-tier-and-linear-ux.md).
+ */
+function EpicSlot({ slug, crumb }: { slug: string; crumb?: EpicCrumb }) {
+  return (
+    <div className="flex min-w-0">
+      {crumb ? (
+        <EpicBadge slug={slug} epic={crumb} className="pointer-events-auto" />
+      ) : (
+        <NoEpicBadge />
+      )}
+    </div>
   );
 }
 

@@ -12,6 +12,14 @@ import { STAGES, type Board, type Epic, type StandaloneItem, type Stage } from "
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 
+// The board reads its Epic/Area narrowing from the URL; grouping is orthogonal to it, so this
+// suite runs on an unfiltered URL. The filter behaviour itself is covered in epic-filter.test.tsx.
+vi.mock("next/navigation", () => ({
+  useSearchParams: () => new URLSearchParams(),
+  usePathname: () => "/projects/tmp",
+  useRouter: () => ({ push: vi.fn(), replace: vi.fn() }),
+}));
+
 // dnd-kit can't resolve droppables under jsdom's zero-size rects; the board's drag behaviour is
 // covered in epic-board.test.tsx, so here the whole surface is inert.
 vi.mock("@dnd-kit/core", () => ({

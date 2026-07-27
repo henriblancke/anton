@@ -228,6 +228,9 @@ export interface EpicDetail {
 export interface EpicCrumb {
   id: string;
   title: string;
+  /** The epic's `area:` designator — the board's Area filter groups badges by it. Absent on an epic
+   * that hasn't been designated yet (.product/decisions/2026-07-26-engine-designator-prefix.md). */
+  area?: string;
 }
 
 /** The open (queued/running/parked) run backing an epic, surfaced on the epic detail. */

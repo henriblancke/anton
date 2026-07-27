@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import { toast } from "sonner";
 import { TriangleAlertIcon } from "lucide-react";
 import {
@@ -24,11 +25,14 @@ import { BoardSkeleton } from "@/components/board/board-skeleton";
 import {
   BOARD_SORT_LABELS,
   STAGE_LABELS,
+  boardFiltersFromSearchParams,
+  filterBoard,
   groupBoardByEpic,
   moveEpicBetweenColumns,
   sortEpics,
   type BoardSort,
 } from "@/components/board/board-utils";
+import { BoardFilters } from "@/components/board/board-filters";
 import { BoardGroupingToggle } from "@/components/board/board-grouping-toggle";
 import { EpicLaneView, LaneStageStrip } from "@/components/board/epic-lane";
 import { useBoardGrouping } from "@/lib/use-board-grouping";
@@ -55,6 +59,12 @@ export function EpicBoard({
   /** Project budget-aware flag (anton-y2ue): when on, cards offer Approve (immediate) vs Queue (paced). */
   budgetAware?: boolean;
 }) {
+  // Epic/Area narrowing lives in the URL, so an epic badge is a plain link and a narrowed board is
+  // shareable. Keyed on the serialized query so the derived board only recomputes on a real change.
+  const searchParams = useSearchParams();
+  const query = searchParams.toString();
+  const filters = useMemo(() => boardFiltersFromSearchParams(new URLSearchParams(query)), [query]);
+
   const [board, setBoard] = useState<Board | null>(initialBoard);
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
@@ -142,23 +152,30 @@ export function EpicBoard({
     return null;
   }, [board, activeId]);
 
-  // Derived, sorted view over the raw board columns — drag/drop and polling keep operating on
-  // the source order in `board`, while each column is reordered for display per the chosen sort.
+  // The board narrowed to the URL's Epic/Area facets — where every epic badge points. Derived, so
+  // drag/drop and polling keep operating on the unfiltered source in `board`.
+  const narrowed = useMemo(
+    () => (board ? filterBoard(board.columns, board.standalone, filters) : null),
+    [board, filters],
+  );
+
+  // Derived, sorted view over the narrowed columns — each column is reordered for display per the
+  // chosen sort, on top of whatever the filters left.
   const sortedColumns = useMemo(() => {
-    if (!board) return null;
+    if (!narrowed) return null;
     return Object.fromEntries(
-      STAGES.map((stage) => [stage, sortEpics(board.columns[stage] ?? [], sort)]),
+      STAGES.map((stage) => [stage, sortEpics(narrowed.columns[stage] ?? [], sort)]),
     ) as Record<Stage, Epic[]>;
-  }, [board, sort]);
+  }, [narrowed, sort]);
 
   // The swimlanes are a regrouping of the very cards above — the sorted columns feed both views, so
   // a lane's cards carry the chosen sort and there is no second board to keep in step.
   const lanes = useMemo(
     () =>
-      grouping === "epic" && sortedColumns && board
-        ? groupBoardByEpic(sortedColumns, board.standalone)
+      grouping === "epic" && sortedColumns && narrowed
+        ? groupBoardByEpic(sortedColumns, narrowed.standalone)
         : null,
-    [grouping, sortedColumns, board],
+    [grouping, sortedColumns, narrowed],
   );
 
   function handleDragStart(event: DragStartEvent) {
@@ -255,8 +272,9 @@ export function EpicBoard({
         setActiveId(null);
       }}
     >
-      <div className="flex items-center justify-end gap-2 pb-2">
+      <div className="flex flex-wrap items-center justify-end gap-2 pb-2">
         <BoardGroupingToggle value={grouping} onChange={setGrouping} />
+        <BoardFilters columns={board.columns} filters={filters} query={query} />
         <span className="flex-1" />
         <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
           <span className="text-subtle">Sort</span>
@@ -306,7 +324,7 @@ export function EpicBoard({
               key={stage}
               stage={stage}
               epics={sortedColumns?.[stage] ?? []}
-              standalone={board.standalone?.[stage] ?? []}
+              standalone={narrowed?.standalone[stage] ?? []}
               slug={slug}
               budgetAware={budgetAware}
               onEpicDeleted={handleEpicDeleted}
