@@ -54,13 +54,29 @@ function nudgeSync(project: Project, id: string): void {
 
 /**
  * The run this bead's work executes under: the bead ITSELF when it is a run target (a feature, or a
- * parentless task/bug run as an epic-of-one), otherwise its parent — a child ticket runs as part of
- * its target's run. Reading the parent for a bead that owns a run would kill the wrong thing:
- * abandoning a feature would cancel its product epic (which never runs) and leave the feature's own
- * agent executing on toward a PR the board already calls won't-do.
+ * parentless task/bug run as an epic-of-one), otherwise its nearest run-target ANCESTOR — a child
+ * ticket runs as part of its target's run. Reading the parent for a bead that owns a run would kill
+ * the wrong thing: abandoning a feature would cancel its product epic (which never runs) and leave
+ * the feature's own agent executing on toward a PR the board already calls won't-do.
+ *
+ * The walk goes the whole way up, like openDescendants goes the whole way down: runs are keyed by
+ * run target, so for a subtask (feature → task → subtask) a single hop cancelled the intermediate
+ * task — an id no job is keyed by — and the feature's agent ran on through the abandoned ticket.
+ * Guards against a malformed parent cycle; falls back to the immediate parent when the chain reaches
+ * no run target at all (a cancel that matches no job, rather than a wrong one).
  */
 function runTargetOf(bead: Bead, board: Bead[]): string {
   if (beads.isRunTarget(bead, board)) return bead.id;
+  const byId = new Map(board.map((b) => [b.id, b]));
+  const seen = new Set<string>([bead.id]);
+  let parentId = beads.parentOf(bead);
+  while (parentId && !seen.has(parentId)) {
+    seen.add(parentId);
+    const parent = byId.get(parentId);
+    if (!parent) break;
+    if (beads.isRunTarget(parent, board)) return parent.id;
+    parentId = beads.parentOf(parent);
+  }
   return beads.parentOf(bead) ?? bead.id;
 }
 

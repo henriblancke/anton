@@ -156,6 +156,36 @@ describe("abandonTicket cascade", () => {
     expect(abandonMock.mock.calls.map((c) => c[1])).toEqual(["t1"]);
   });
 
+  it("kills the FEATURE's run when a subtask two levels below it is abandoned", async () => {
+    // feature → task → subtask. Runs are keyed by run target, so cancelling the intermediate task
+    // matches no job and the feature's agent runs on past the ticket the board now calls won't-do.
+    const subtask = makeBead({ id: "s1", parent: "t1" });
+    showMock.mockResolvedValue(subtask);
+    listMock.mockResolvedValue([
+      makeBead({ id: "epic", issue_type: "epic" }),
+      makeBead({ id: "feature", issue_type: "feature", parent: "epic" }),
+      makeBead({ id: "t1", parent: "feature" }),
+      subtask,
+    ]);
+
+    await abandonTicket(project, "s1", "covered by another ticket");
+
+    expect(cancelRunMock.mock.calls).toEqual([["p1", "feature"]]);
+    expect(abandonMock.mock.calls.map((c) => c[1])).toEqual(["s1"]);
+  });
+
+  it("terminates on a malformed parent cycle above the abandoned ticket", async () => {
+    const ticket = makeBead({ id: "t1", parent: "t2" });
+    showMock.mockResolvedValue(ticket);
+    listMock.mockResolvedValue([ticket, makeBead({ id: "t2", parent: "t1" })]);
+
+    await abandonTicket(project, "t1", "obsolete");
+
+    // No run target anywhere on the chain — falls back to the immediate parent, which no job is
+    // keyed by, so the cancel is a no-op rather than killing the wrong run.
+    expect(cancelRunMock.mock.calls).toEqual([["p1", "t2"]]);
+  });
+
   it("refuses a ticket that already settled rather than rewriting its outcome", async () => {
     showMock.mockResolvedValue(makeBead({ id: "t1", status: "closed" }));
 
