@@ -67,13 +67,19 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   if (!target) {
     return notFoundResponse(`Ticket ${epicId} not found on the board`);
   }
-  if (!beads.isRunTarget(target)) {
-    const parent = (target.parent ?? target.parent_id) as string | undefined;
+  if (!beads.isRunTarget(target, allBeads)) {
+    const parent = beads.parentOf(target);
     const type = target.issue_type ?? "unknown";
-    const reason =
-      (type === "task" || type === "bug") && parent
-        ? `${epicId} is a child ticket of ${parent} — approve its epic ${parent} instead; a child runs via its epic's PR, not on its own`
-        : `${epicId} is not runnable: type "${type}" — only an epic or a parentless task/bug can be approved to run`;
+    let reason: string;
+    if (beads.isContainer(target, allBeads)) {
+      // Approval is a per-PR gate, so it must never be offered on a bead whose approval would
+      // launch one PR per feature under it (design 2026-07-26: "Approval stays per feature").
+      reason = `${epicId} is a container epic, not a run target — approve one of its features instead; each feature is its own run and its own PR`;
+    } else if ((type === "task" || type === "bug") && parent) {
+      reason = `${epicId} is a child ticket of ${parent} — approve its epic ${parent} instead; a child runs via its epic's PR, not on its own`;
+    } else {
+      reason = `${epicId} is not runnable: type "${type}" — only a feature, a parentless task/bug, or an epic with no feature children can be approved to run`;
+    }
     return NextResponse.json({ error: reason }, { status: 422 });
   }
 
@@ -86,6 +92,10 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // A standalone task/bug (epic-of-one) lives in `standalone`, not `columns`, so it carries no
   // epic-graph readiness — but it can still hold cross-item `blocks` edges. It must be found here
   // or a valid run target 404s, and it must be gated on its own open blockers below.
+  // NOTE: a feature NESTED under an epic passes the runnability gate above but is still rendered as
+  // a child ticket by getBoard, so it lands in neither map and 404s here. It is also unreachable in
+  // the UI for the same reason; both close together when the board is re-keyed off run targets
+  // (anton-aul8, which depends on this predicate). A parentless feature already resolves as a chip.
   const standalone = epic
     ? undefined
     : STAGES.map((stage) => board.standalone[stage].find((e) => e.id === epicId)).find(Boolean);

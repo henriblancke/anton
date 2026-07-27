@@ -118,19 +118,26 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       })
       .catch(() => [] as string[]);
 
-    // Load the run target + (for an epic) its tickets from beads (the source of truth). A target
-    // is an epic OR a parentless task/bug run as an epic-of-one (isRunTarget). Distinguish the two
-    // non-runnable cases so the poison message is honest: a bead that WAS found but isn't a valid
-    // target must not read "not found" (that sends the operator hunting for a missing bead).
+    // Load the run target + (for a grouping target) its tickets from beads (the source of truth).
+    // A target is a feature, a parentless task/bug run as an epic-of-one, or a legacy epic with no
+    // feature children (isRunTarget). Distinguish the non-runnable cases so the poison message is
+    // honest: a bead that WAS found but isn't a valid target must not read "not found" (that sends
+    // the operator hunting for a missing bead), and a container epic must be told it is one.
     let all = await beads.list(repo, ["--status", "all"]);
     let target = all.find((b) => b.id === epicBeadId);
     if (!target) throw new PoisonEpic(`bead ${epicBeadId} not found on the board`);
-    if (!beads.isRunTarget(target)) {
-      const parent = (target.parent ?? target.parent_id) as string | undefined;
+    if (!beads.isRunTarget(target, all)) {
+      if (beads.isContainer(target, all)) {
+        throw new PoisonEpic(
+          `epic ${epicBeadId} is a container, not a run target — it has feature children, and each ` +
+            `feature runs on its own (own worktree, own PR); run one of its features instead`,
+        );
+      }
+      const parent = beads.parentOf(target);
       throw new PoisonEpic(
         `bead ${epicBeadId} is not runnable: type "${target.issue_type ?? "unknown"}"` +
           (parent ? ` with parent ${parent}` : "") +
-          ` — only an epic or a parentless task/bug can be run`,
+          ` — only a feature, a parentless task/bug, or an epic with no feature children can be run`,
       );
     }
     if (!beads.isApproved(target)) {
@@ -176,11 +183,18 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       );
     }
 
-    // An epic runs all its children into one PR; a standalone task/bug IS its own single ticket
+    // A grouping target runs all its children into one PR; a leaf target IS its own single ticket
     // (an epic-of-one). The rest of the pipeline — worktree, per-ticket claude→tests→commit→close,
-    // one PR — is identical either way, so the standalone case is just a one-element ticket list.
-    const standaloneRun = !beads.isEpic(target);
-    let tickets = standaloneRun ? [target] : childrenOf(all, epicBeadId);
+    // one PR — is identical either way, so the leaf case is just a one-element ticket list.
+    // An epic always groups (a childless one poisons below, exactly as before the tier split); a
+    // feature groups only once tickets have been shaped under it — a feature shaped as one unit of
+    // work is its own ticket, so it must not poison for having no children. A parentless task/bug
+    // is always a leaf, unchanged.
+    const children = childrenOf(all, epicBeadId);
+    const groupsChildren =
+      beads.isEpic(target) || (target.issue_type === "feature" && children.length > 0);
+    const standaloneRun = !groupsChildren;
+    let tickets = standaloneRun ? [target] : children;
     if (tickets.length === 0) throw new PoisonEpic(`epic ${epicBeadId} has no tickets`);
 
     // Branches keep the `prefix/id` slash (git convention); only the worktree *path* segment is

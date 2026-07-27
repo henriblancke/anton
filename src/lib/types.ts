@@ -17,9 +17,11 @@ export const STAGES: Stage[] = ["backlog", "implementing", "in-review", "done"];
  */
 export const MAX_ABANDON_REASON_CHARS = 500;
 
-/** The board's shared type language. An epic renders as a card; a standalone task/bug as a chip.
- * Every other bead issue_type is not board work. */
-export type IssueType = "epic" | "task" | "bug";
+/** The board's shared type language — the three tiers of
+ * docs/design/2026-07-26-tier-and-linear-ux.md: an `epic` is a product outcome spanning features,
+ * a `feature` is the shippable delivery unit anton runs, and `task`/`bug`/`chore` are the working
+ * layer executed as part of their run target's run. Every other bead issue_type is not board work. */
+export type IssueType = "epic" | "feature" | "task" | "bug" | "chore";
 
 export interface Project {
   id: string;

@@ -497,7 +497,7 @@ export const beads = {
     cwd: string,
     opts: {
       title: string;
-      type: "epic" | "task" | "bug";
+      type: "epic" | "feature" | "task" | "bug" | "chore";
       acceptance?: string;
       context?: string;
       description?: string; // Goal / Out of scope / Verify (markdown)
@@ -718,17 +718,37 @@ export const beads = {
   isApproved: (b: Bead) => b.labels?.includes(LABELS.approved) ?? false,
   isEpic: (b: Bead) => b.issue_type === "epic",
 
+  /** The bead's parent id, from whichever field the bd read populated (`list` vs `show`). */
+  parentOf: (b: Bead): string | undefined => (b.parent ?? b.parent_id) as string | undefined,
+
   /**
-   * A bead anton can execute as a run: an epic (all its children batch into one PR) OR a
-   * parentless task/bug (an "epic-of-one" — runs as a single-ticket run: branch anton/<id>, its
-   * own PR, ticket closed). A task/bug WITH a parent is a child ticket, executed as part of its
-   * epic's run, not a run target on its own; every other type (learning, molecule, …) is never
-   * runnable. Shared by execute-epic (the run gate) and the approve route (validating targets
-   * before enqueue) so both agree on what "runnable" means.
+   * A bead that GROUPS run targets rather than being one: an epic with at least one `feature`
+   * child. Each feature is its own run (own worktree, own PR), so executing or approving the epic
+   * above them would be one button launching N PRs — not a gate. The rule is structural, not
+   * type-only, so no existing bead needs re-typing: an epic becomes a container the moment a
+   * feature lands under it (docs/design/2026-07-26-tier-and-linear-ux.md).
    */
-  isRunTarget: (b: Bead) =>
-    beads.isEpic(b) ||
-    ((b.issue_type === "task" || b.issue_type === "bug") && !(b.parent ?? b.parent_id)),
+  isContainer: (b: Bead, board: Bead[]): boolean =>
+    beads.isEpic(b) && board.some((c) => c.issue_type === "feature" && beads.parentOf(c) === b.id),
+
+  /**
+   * A bead anton can execute as a run: a `feature` (the shippable delivery unit — one worktree,
+   * one PR), a parentless task/bug (an "epic-of-one" — a single-ticket run), or a legacy `epic`
+   * with no feature children (its own children batch into one PR, exactly as before the tier
+   * split). A task/bug WITH a parent is a child ticket, executed as part of its run target's run;
+   * every other type (chore, learning, molecule, …) is never runnable on its own. Shared by
+   * execute-epic (the run gate) and the approve route (validating targets before enqueue) so both
+   * agree on what "runnable" means.
+   *
+   * `board` is the bead list the container check reads. It defaults to empty — which answers the
+   * pre-tier question, where every epic is runnable — so a caller holding a single bead (a
+   * `bd show`) keeps today's behaviour. Pass the full list anywhere a container epic must be
+   * refused rather than silently run.
+   */
+  isRunTarget: (b: Bead, board: Bead[] = []): boolean =>
+    b.issue_type === "feature" ||
+    (beads.isEpic(b) && !beads.isContainer(b, board)) ||
+    ((b.issue_type === "task" || b.issue_type === "bug") && !beads.parentOf(b)),
 
   // ── cross-machine run-liveness lease (anton-jz1) ──
 

@@ -16,8 +16,15 @@ import {
 const bead = (b: Partial<Bead>): Bead => ({ id: "x", title: "x", status: "open", ...b }) as Bead;
 
 describe("beads.isRunTarget", () => {
-  it("accepts an epic (the classic run target)", () => {
-    expect(beads.isRunTarget(bead({ issue_type: "epic" }))).toBe(true);
+  // The five shapes of the runnable rule (docs/design/2026-07-26-tier-and-linear-ux.md).
+  const epic = bead({ id: "e-1", issue_type: "epic" });
+  const featureChild = bead({ id: "f-1", issue_type: "feature", parent: "e-1" });
+  const taskChild = bead({ id: "t-1", issue_type: "task", parent: "e-1" });
+
+  it("accepts a feature — the tier that owns a worktree and a PR", () => {
+    expect(beads.isRunTarget(bead({ issue_type: "feature" }))).toBe(true);
+    // Under its epic it is STILL the run target: the epic above it is the container, not the run.
+    expect(beads.isRunTarget(featureChild, [epic, featureChild])).toBe(true);
   });
 
   it("accepts a parentless task or bug (epic-of-one)", () => {
@@ -25,15 +32,60 @@ describe("beads.isRunTarget", () => {
     expect(beads.isRunTarget(bead({ issue_type: "bug" }))).toBe(true);
   });
 
-  it("rejects a task/bug that has a parent — it's a child ticket, run via its epic", () => {
+  it("rejects a task/bug that has a parent — it's a child ticket, run via its run target", () => {
     expect(beads.isRunTarget(bead({ issue_type: "task", parent: "bd-1" }))).toBe(false);
     expect(beads.isRunTarget(bead({ issue_type: "bug", parent_id: "bd-1" }))).toBe(false);
   });
 
-  it("rejects a non-work type (learning, molecule, …) even when parentless", () => {
+  it("accepts an epic with no feature children — the legacy run target, byte-identical", () => {
+    expect(beads.isRunTarget(epic, [epic, taskChild])).toBe(true);
+    // No board passed at all (a single `bd show`) answers the same pre-tier way.
+    expect(beads.isRunTarget(epic)).toBe(true);
+  });
+
+  it("rejects an epic that HAS feature children — it is a container, not a run", () => {
+    expect(beads.isRunTarget(epic, [epic, featureChild, taskChild])).toBe(false);
+    // A closed feature still makes it a container: the tier is structural, not lifecycle-bound.
+    expect(beads.isRunTarget(epic, [epic, { ...featureChild, status: "closed" }])).toBe(false);
+  });
+
+  it("rejects a non-work type (chore, learning, molecule, …) even when parentless", () => {
+    expect(beads.isRunTarget(bead({ issue_type: "chore" }))).toBe(false);
     expect(beads.isRunTarget(bead({ issue_type: "learning" }))).toBe(false);
     expect(beads.isRunTarget(bead({ issue_type: "molecule" }))).toBe(false);
     expect(beads.isRunTarget(bead({ issue_type: undefined }))).toBe(false);
+  });
+});
+
+describe("beads.isContainer", () => {
+  const epic = bead({ id: "e-1", issue_type: "epic" });
+
+  it("is true for an epic with a feature child — the bead that groups run targets", () => {
+    const feature = bead({ id: "f-1", issue_type: "feature", parent: "e-1" });
+    expect(beads.isContainer(epic, [epic, feature])).toBe(true);
+    // parent_id is the field `bd show` populates; both must count.
+    const viaParentId = bead({ id: "f-2", issue_type: "feature", parent_id: "e-1" });
+    expect(beads.isContainer(epic, [epic, viaParentId])).toBe(true);
+  });
+
+  it("is false for an epic whose children are only tasks/bugs", () => {
+    const task = bead({ id: "t-1", issue_type: "task", parent: "e-1" });
+    const bug = bead({ id: "b-1", issue_type: "bug", parent: "e-1" });
+    expect(beads.isContainer(epic, [epic, task, bug])).toBe(false);
+    expect(beads.isContainer(epic, [epic])).toBe(false);
+  });
+
+  it("is false for a feature that has children — a feature runs its children, it doesn't group runs", () => {
+    const feature = bead({ id: "f-1", issue_type: "feature" });
+    const task = bead({ id: "t-1", issue_type: "task", parent: "f-1" });
+    const nested = bead({ id: "f-2", issue_type: "feature", parent: "f-1" });
+    expect(beads.isContainer(feature, [feature, task])).toBe(false);
+    expect(beads.isContainer(feature, [feature, nested])).toBe(false);
+  });
+
+  it("does not count a feature parented elsewhere", () => {
+    const other = bead({ id: "f-1", issue_type: "feature", parent: "e-2" });
+    expect(beads.isContainer(epic, [epic, other])).toBe(false);
   });
 });
 

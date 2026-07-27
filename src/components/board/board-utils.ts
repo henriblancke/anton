@@ -19,7 +19,7 @@ export const STAGE_ACCENT_DOT: Record<Stage, string> = {
   done: "bg-stage-done",
 };
 
-// ── Work-type language (epic / task / bug) ─────────────────────────────────
+// ── Work-type language (epic / feature / task / bug / chore) ───────────────
 //
 // One shared vocabulary so every board item reads its type at a glance: a human label, a left rail
 // inset, a compact-badge tint, and an icon/text hue — all keyed on the same `--type-*` tokens. The
@@ -28,29 +28,37 @@ export const STAGE_ACCENT_DOT: Record<Stage, string> = {
 
 export const TYPE_LABELS: Record<IssueType, string> = {
   epic: "Epic",
+  feature: "Feature",
   task: "Task",
   bug: "Bug",
+  chore: "Chore",
 };
 
 /** Left-rail inset color per work type — mirrors the stage rail's `box-shadow: inset 2px 0`. */
 export const TYPE_RAIL: Record<IssueType, string> = {
   epic: "shadow-[inset_2px_0_0_var(--type-epic)]",
+  feature: "shadow-[inset_2px_0_0_var(--type-feature)]",
   task: "shadow-[inset_2px_0_0_var(--type-task)]",
   bug: "shadow-[inset_2px_0_0_var(--type-bug)]",
+  chore: "shadow-[inset_2px_0_0_var(--type-chore)]",
 };
 
 /** Icon/text hue per work type. */
 export const TYPE_TEXT: Record<IssueType, string> = {
   epic: "text-type-epic",
+  feature: "text-type-feature",
   task: "text-type-task",
   bug: "text-type-bug",
+  chore: "text-type-chore",
 };
 
 /** Compact type-badge tint (border + fill + text), one per work type. */
 export const TYPE_BADGE: Record<IssueType, string> = {
   epic: "border-type-epic/30 bg-type-epic/10 text-type-epic",
+  feature: "border-type-feature/30 bg-type-feature/10 text-type-feature",
   task: "border-type-task/30 bg-type-task/10 text-type-task",
   bug: "border-type-bug/30 bg-type-bug/10 text-type-bug",
+  chore: "border-type-chore/30 bg-type-chore/10 text-type-chore",
 };
 
 /** Left-border color per stage — used by dependency-graph nodes (`border-l-3`). */

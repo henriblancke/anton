@@ -207,6 +207,150 @@ process.exit(0);`,
     ).toBeUndefined();
   });
 
+  it("poison-parks a CONTAINER epic — one with feature children — naming why, and never starts a run", async () => {
+    // anton-s67y: an epic stops being a run target the moment a feature lands under it. Running it
+    // would mean one job opening a PR per feature, which is exactly what the per-feature run/approval
+    // gate exists to prevent. The poison must name the container, not read as a generic type error.
+    const containerId = await beads.create(repo, {
+      title: "Product outcome spanning features",
+      type: "epic",
+      description: "## Goal\nGroup features.",
+    });
+    const featureId = await beads.create(repo, {
+      title: "A shippable feature",
+      type: "feature",
+      acceptance: "work file exists",
+      description: "## Goal\nShip it.",
+    });
+    await beads.link(repo, featureId, containerId, "parent-child");
+    await beads.approve(repo, containerId);
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    process.env.ANTON_CLAUDE_BIN = successClaude;
+    const jobId = await runner.enqueue({
+      type: "execute-epic",
+      projectId,
+      payload: { projectId, epicBeadId: containerId },
+    });
+    await runner.tickOnce();
+    await runner.whenIdle();
+
+    const job = await getJob(tdb.db, jobId);
+    expect(job?.status).toBe("parked");
+    expect(job?.lastError).toContain(containerId);
+    expect(job?.lastError).toMatch(/container/i);
+    expect(job?.lastError).toMatch(/feature/i);
+    expect(job?.lastError).not.toMatch(/not found/i);
+    // Pre-flight gate: no run row, and neither bead was touched.
+    expect(
+      (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === containerId),
+    ).toBeUndefined();
+    expect((await beads.show(repo, featureId)).status).not.toBe("closed");
+  });
+
+  it("accepts a feature target under a container epic and runs it to its own PR", async () => {
+    // The other half of the rule: the feature IS the run target. It runs like an epic-of-one —
+    // branch anton/<id>, its own PR, left OPEN + in-review until that PR merges.
+    const containerId = await beads.create(repo, {
+      title: "Outcome with one runnable feature",
+      type: "epic",
+      description: "## Goal\nGroup features.",
+    });
+    const featureId = await beads.create(repo, {
+      title: "Runnable feature",
+      type: "feature",
+      acceptance: "work file exists",
+      description: "## Goal\nShip the feature.",
+    });
+    await beads.link(repo, featureId, containerId, "parent-child");
+    await beads.approve(repo, featureId);
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    process.env.ANTON_CLAUDE_BIN = successClaude;
+    const jobId = await runner.enqueue({
+      type: "execute-epic",
+      projectId,
+      payload: { projectId, epicBeadId: featureId },
+    });
+    await runner.tickOnce();
+    await runner.whenIdle();
+
+    expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+    const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === featureId)!;
+    expect(run.status).toBe("done");
+    expect(run.branch).toBe(`anton/${featureId}`);
+
+    const feature = await beads.show(repo, featureId);
+    expect(feature.status).not.toBe("closed");
+    expect(beads.getPrRef(feature)).toBe("gh-42");
+    expect(feature.labels ?? []).toContain("stage:in-review");
+    // The container above it was never dragged into the run.
+    expect((await beads.show(repo, containerId)).labels ?? []).not.toContain("stage:in-review");
+  });
+
+  it("runs a feature's child tickets as ONE PR, not the feature bead itself", async () => {
+    // A feature is one delivery unit: its task/bug children are the working layer executed inside
+    // its run (design 2026-07-26). Dispatching the feature bead as a single ticket would silently
+    // drop that shaped work, so a feature WITH children batches them exactly as an epic does.
+    const featureId = await beads.create(repo, {
+      title: "Feature with shaped tickets",
+      type: "feature",
+      description: "## Goal\nBatch the children.",
+    });
+    const childIds: string[] = [];
+    for (const title of ["Child one", "Child two"]) {
+      const id = await beads.create(repo, { title, type: "task", acceptance: "work file exists" });
+      await beads.link(repo, id, featureId, "parent-child");
+      childIds.push(id);
+    }
+    await beads.approve(repo, featureId);
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    process.env.ANTON_CLAUDE_BIN = successClaude;
+    const jobId = await runner.enqueue({
+      type: "execute-epic",
+      projectId,
+      payload: { projectId, epicBeadId: featureId },
+    });
+    await runner.tickOnce();
+    await runner.whenIdle();
+
+    expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+    // Both children were dispatched and closed; the feature itself is in-review on one PR.
+    const board = await beads.list(repo, ["--status", "all"]);
+    for (const id of childIds) {
+      expect(board.find((b) => b.id === id)?.status).toBe("closed");
+    }
+    const sessions = (await tdb.db.select().from(schema.sessions)).filter((s) =>
+      childIds.includes(s.beadId!),
+    );
+    expect(sessions).toHaveLength(2);
+    expect(
+      (await tdb.db.select().from(schema.sessions)).some((s) => s.beadId === featureId),
+    ).toBe(false);
+    const feature = await beads.show(repo, featureId);
+    expect(feature.status).not.toBe("closed");
+    expect(feature.labels ?? []).toContain("stage:in-review");
+  });
+
   it("resumes past a usage limit skipping already-closed tickets and reusing the worktree", async () => {
     // anton-ner.2 AC5: a two-ticket epic where the first ticket closes, then the second hits the
     // usage limit. After the reset window the run resumes on the SAME worktree, skips the closed
