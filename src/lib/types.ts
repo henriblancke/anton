@@ -190,6 +190,18 @@ export interface EpicDetail {
   tickets: Ticket[];
   edges: DepEdge[]; // among the epic + its tickets
   run?: EpicRun; // the currently-open run for this epic, if any (for "View run" / worktree)
+  /**
+   * The product epic this run target sits under — the breadcrumb's one hop of orientation
+   * (docs/design/2026-07-26-tier-and-linear-ux.md). Absent for a parentless run target, which
+   * renders no crumb at all rather than an empty one.
+   */
+  parentEpic?: EpicCrumb;
+}
+
+/** Just enough of the parent epic to render (and link) its badge. */
+export interface EpicCrumb {
+  id: string;
+  title: string;
 }
 
 /** The open (queued/running/parked) run backing an epic, surfaced on the epic detail. */

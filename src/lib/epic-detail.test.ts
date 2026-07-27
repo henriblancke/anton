@@ -80,3 +80,43 @@ describe("getEpicDetail read economy", () => {
     expect(bd.list).not.toHaveBeenCalled();
   });
 });
+
+describe("getEpicDetail parent epic (the detail breadcrumb)", () => {
+  beforeEach(() => {
+    resetIssueSnapshots();
+    vi.spyOn(db, "getDb").mockReturnValue({} as never);
+    vi.spyOn(runs, "findOpenRunForEpic").mockResolvedValue(undefined as never);
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it("carries the product epic a feature hangs under", async () => {
+    fakeBd([
+      bead({ id: "e-1", title: "Ontology editing", issue_type: "epic" }),
+      bead({ id: "f-1", title: "Ship the editor", issue_type: "feature", parent: "e-1" }),
+      bead({ id: "t-1", title: "Child", parent: "f-1" }),
+    ]);
+
+    const detail = await getEpicDetail(project, "f-1");
+
+    expect(detail.parentEpic).toEqual({ id: "e-1", title: "Ontology editing" });
+  });
+
+  it("leaves it undefined for a parentless run target", async () => {
+    fakeBd([bead({ id: "e-1", title: "Legacy epic", issue_type: "epic" })]);
+
+    const detail = await getEpicDetail(project, "e-1");
+
+    expect(detail.parentEpic).toBeUndefined();
+  });
+
+  it("leaves it undefined when the parent is not an epic", async () => {
+    fakeBd([
+      bead({ id: "f-1", title: "Ship the editor", issue_type: "feature" }),
+      bead({ id: "t-1", title: "Child", parent: "f-1" }),
+    ]);
+
+    const detail = await getEpicDetail(project, "t-1");
+
+    expect(detail.parentEpic).toBeUndefined();
+  });
+});

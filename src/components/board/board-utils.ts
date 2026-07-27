@@ -61,6 +61,15 @@ export const TYPE_BADGE: Record<IssueType, string> = {
   chore: "border-type-chore/30 bg-type-chore/10 text-type-chore",
 };
 
+/**
+ * The board, narrowed to one product epic. Every epic badge points here, so "click the badge to see
+ * this epic's work" has a single URL shape across the detail breadcrumb and the feature cards
+ * (docs/design/2026-07-26-tier-and-linear-ux.md).
+ */
+export function boardEpicFilterHref(slug: string, epicId: string): string {
+  return `/projects/${slug}?epic=${encodeURIComponent(epicId)}`;
+}
+
 /** Left-border color per stage — used by dependency-graph nodes (`border-l-3`). */
 export const STAGE_BORDER_LEFT: Record<Stage, string> = {
   backlog: "border-l-stage-backlog",

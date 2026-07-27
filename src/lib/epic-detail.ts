@@ -10,7 +10,8 @@ import { attachPrUrl, githubBaseUrl } from "./git/remote";
 import { findOpenRunForEpic } from "./runs";
 import { parseAcceptance, parseGoal, toEpic, toTicket } from "./ticket-view";
 import { listAllBeads } from "./tickets";
-import type { DepEdge, DepType, EpicDetail, EpicRun, Project } from "./types";
+import type { Bead } from "./beads/bd";
+import type { DepEdge, DepType, EpicCrumb, EpicDetail, EpicRun, Project } from "./types";
 
 /** The open run backing this epic (if any), for the "View run" / worktree affordances. */
 async function openRunFor(project: Project, epicId: string): Promise<EpicRun | undefined> {
@@ -26,6 +27,20 @@ async function openRunFor(project: Project, epicId: string): Promise<EpicRun | u
 
 const DEP_TYPES = new Set<DepType>(["parent-child", "blocks", "related", "discovered-from"]);
 
+/**
+ * The product epic directly above this bead, for the detail breadcrumb. One hop, and only to an
+ * `epic`: a feature's parent is its product outcome, while a working-layer bead's parent is another
+ * run target — which is orientation the crumb's epic badge would misrepresent. Undefined when there
+ * is no such parent, so the header renders no crumb rather than an empty one.
+ */
+function parentEpicOf(bead: Bead, all: Bead[]): EpicCrumb | undefined {
+  const parentId = beads.parentOf(bead);
+  if (!parentId) return undefined;
+  const parent = all.find((b) => b.id === parentId);
+  if (!parent || !beads.isEpic(parent)) return undefined;
+  return { id: parent.id, title: parent.title };
+}
+
 export async function getEpicDetail(project: Project, epicId: string): Promise<EpicDetail> {
   const all = await listAllBeads(project); // one call: carries parent + inline dependencies
   const lite = all.find((b) => b.id === epicId);
@@ -36,6 +51,7 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
   const full = await ensureDescription(project.repoPath, lite);
   const run = await openRunFor(project, epicId);
   const base = await githubBaseUrl(project.repoPath);
+  const parentEpic = parentEpicOf(lite, all);
 
   // The board renders orphan (parentless) non-epic beads as single-ticket pseudo-epic cards
   // (board.ts ticketAsEpic). Mirror that here so opening one shows its detail instead of 404ing —
@@ -49,7 +65,7 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
     });
     attachPrUrl(epic, base);
     attachPrUrl(self, base);
-    return { epic, description: full.description, tickets: [self], edges: [], run };
+    return { epic, description: full.description, tickets: [self], edges: [], run, parentEpic };
   }
 
   const childBeads = all.filter(
@@ -80,7 +96,7 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
     edges.push({ from: e.from, to: e.to, type: e.type as DepType });
   }
 
-  return { epic, description: full.description, tickets, edges, run };
+  return { epic, description: full.description, tickets, edges, run, parentEpic };
 }
 
 /**
