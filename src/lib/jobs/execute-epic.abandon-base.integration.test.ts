@@ -153,7 +153,7 @@ process.exit(0);`),
       const skipped = await beads.show(repo, skippedId);
       expect(skipped.status).toBe("open");
       const epic = await beads.show(repo, epicSb);
-      expect(epic.external_ref ?? null).toBeNull();
+      expect(beads.getPrRef(epic) ?? null).toBeNull();
       expect(epic.labels ?? []).not.toContain("stage:in-review");
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
@@ -477,7 +477,7 @@ setTimeout(()=>process.exit(0),60000);`,
 
       // Nothing shipped: no PR ref, and the epic never advanced to in-review.
       const epic = await beads.show(repo, epicKill);
-      expect(epic.external_ref ?? null).toBeNull();
+      expect(beads.getPrRef(epic) ?? null).toBeNull();
       expect(epic.labels ?? []).not.toContain("stage:in-review");
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;

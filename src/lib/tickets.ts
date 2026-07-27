@@ -31,7 +31,7 @@ function toTicketRow(bead: Bead, epic: Bead | undefined): TicketRow {
     domain: labelValue(bead.labels, "domain"),
     acceptance: parseAcceptance(bead),
     ...createdMeta(bead),
-    prRef: bead.external_ref,
+    prRef: beads.getPrRef(bead),
     deferred: beads.isDeferred(bead),
     abandoned: beads.isAbandoned(bead),
     type: bead.issue_type ?? "task",

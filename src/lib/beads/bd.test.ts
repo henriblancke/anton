@@ -37,6 +37,31 @@ describe("beads.isRunTarget", () => {
   });
 });
 
+describe("beads.getPrRef (PR seam, anton-is7x)", () => {
+  it("reads the PR pointer from metadata.pr", () => {
+    expect(beads.getPrRef(bead({ metadata: { pr: "gh-44" } }))).toBe("gh-44");
+  });
+
+  it("prefers metadata.pr over a legacy external_ref", () => {
+    expect(beads.getPrRef(bead({ metadata: { pr: "gh-44" }, external_ref: "gh-9" }))).toBe("gh-44");
+  });
+
+  it("falls back to a legacy gh-* external_ref until migration (anton-ftar)", () => {
+    expect(beads.getPrRef(bead({ external_ref: "gh-9" }))).toBe("gh-9");
+    expect(beads.getPrRef(bead({ external_ref: "GH-9" }))).toBe("GH-9");
+  });
+
+  it("ignores a non-gh external_ref (a tracker URL is not a PR)", () => {
+    expect(beads.getPrRef(bead({ external_ref: "https://tracker.example/ISSUE-7" }))).toBeUndefined();
+    expect(beads.getPrRef(bead({ external_ref: "PROJ-42" }))).toBeUndefined();
+  });
+
+  it("returns undefined when there is no pointer at all", () => {
+    expect(beads.getPrRef(bead({}))).toBeUndefined();
+    expect(beads.getPrRef(bead({ metadata: { pr: "" } }))).toBeUndefined();
+  });
+});
+
 describe("run-lease helpers (anton-jz1)", () => {
   const now = 1_000_000_000_000;
 

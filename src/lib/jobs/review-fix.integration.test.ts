@@ -70,7 +70,7 @@ describeBd("review-fix e2e (real handler · real bd/git · fake claude/gh)", () 
     g(["push", "-q", "-u", "origin", branch]);
     g(["checkout", "-q", "main"]);
     await beads.tag(repo, epicId, [LABELS.stage("in-review")]);
-    await beads.setExternalRef(repo, epicId, "gh-7");
+    await beads.setPrRef(repo, epicId, "gh-7");
 
     // Fake claude: apply a fix in the worktree + dump its args so we can assert the prompt. Ends
     // with the per-thread json report anton parses to reply/resolve threads.
@@ -344,7 +344,7 @@ process.exit(0);`,
     });
     await beads.claim(repo, bobEpic, "bob");
     await beads.tag(repo, bobEpic, [LABELS.stage("in-review")]);
-    await beads.setExternalRef(repo, bobEpic, "gh-8");
+    await beads.setPrRef(repo, bobEpic, "gh-8");
 
     await actAs("alice", async () => {
       process.env.ANTON_GH_BIN = mergedGhFor(8);
@@ -371,7 +371,7 @@ process.exit(0);`,
     });
     await beads.claim(repo, bobEpic, "bob");
     await beads.tag(repo, bobEpic, [LABELS.stage("in-review")]);
-    await beads.setExternalRef(repo, bobEpic, "gh-9");
+    await beads.setPrRef(repo, bobEpic, "gh-9");
 
     await actAs("alice", async () => {
       process.env.ANTON_GH_BIN = mergedGhFor(9);

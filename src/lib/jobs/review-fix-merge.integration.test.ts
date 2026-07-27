@@ -97,7 +97,7 @@ describeBd("review-fix merge finalization (real handler · real bd/git · fake g
     g(["checkout", "-q", "main"]);
     await beads.setStatus(repo, epicId, "in_progress");
     await beads.tag(repo, epicId, [LABELS.stage("in-review")]);
-    await beads.setExternalRef(repo, epicId, "gh-7");
+    await beads.setPrRef(repo, epicId, "gh-7");
 
     restoreEnv = saveEnv(["ANTON_WORKTREES_ROOT", "ANTON_SESSIONS_ROOT", "FAKE_BRANCH"]);
     process.env.ANTON_WORKTREES_ROOT = join(sandbox, "worktrees");
