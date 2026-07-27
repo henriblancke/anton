@@ -274,6 +274,106 @@ describe("getBoard", () => {
     expect(allStandalone.some((i) => i.id === "bug-1")).toBe(true);
   });
 
+  it("keys cards off run targets: a 3-level tree drops nothing and each bead lands under its parent", async () => {
+    // epic → feature → task → subtask. The feature is the run target (the card); the epic above it
+    // is a container (badge/swimlane key only, since approving it 422s); the working layer rides the
+    // feature's card, however deep. Before this keying the task and subtask matched neither the
+    // epic-child join nor the parentless-chip rule and disappeared from the board entirely.
+    const epic = makeBead({ id: "epic-p", title: "Product outcome", issue_type: "epic" });
+    const feature = makeBead({
+      id: "feat-1",
+      title: "Resumable crawl checkpoints",
+      issue_type: "feature",
+      parent: "epic-p",
+      description: "## Goal\nCheckpoint the crawl.",
+    });
+    const task = makeBead({ id: "task-1", title: "Write the checkpoint", parent: "feat-1" });
+    const subtask = makeBead({ id: "sub-1", title: "Serialise the cursor", parent: "task-1" });
+    const chip = makeBead({ id: "loose-1", title: "Loose task", issue_type: "task" });
+
+    listMock.mockResolvedValue([epic, feature, task, subtask, chip]);
+
+    const board = await getBoard(project);
+
+    const cards = STAGES.flatMap((s) => board.columns[s]);
+    const chips = STAGES.flatMap((s) => board.standalone[s]);
+    // The feature is the card, and it carries its whole working layer — including the grandchild.
+    expect(cards.map((c) => c.id)).toEqual(["feat-1"]);
+    const featureCard = cards.find((c) => c.id === "feat-1")!;
+    expect(featureCard.goal).toBe("Checkpoint the crawl.");
+    expect(featureCard.tickets.map((t) => t.id)).toEqual(["task-1", "sub-1"]);
+    // The container epic is not a card — it reaches the card as the badge/swimlane crumb instead.
+    expect(featureCard.epic).toEqual({ id: "epic-p", title: "Product outcome", area: undefined });
+    // ...and no working-layer bead leaked into the chip group (they belong to the feature's run).
+    expect(chips.map((c) => c.id)).toEqual(["loose-1"]);
+
+    // Nothing is dropped: every bead is a card, a card's ticket, a chip, or the container epic that
+    // groups them.
+    const rendered = new Set([
+      ...cards.map((c) => c.id),
+      ...cards.flatMap((c) => c.tickets.map((t) => t.id)),
+      ...chips.map((c) => c.id),
+      ...cards.flatMap((c) => (c.epic ? [c.epic.id] : [])),
+    ]);
+    expect([...rendered].sort()).toEqual(["epic-p", "feat-1", "loose-1", "sub-1", "task-1"]);
+  });
+
+  it("keeps a legacy epic with no feature children as a card carrying its tasks", async () => {
+    // The migration-free half of the runnable rule: an epic only steps back to a container once a
+    // feature lands under it. A legacy epic keeps running (and rendering) exactly as it did.
+    const legacy = makeBead({
+      id: "epic-legacy",
+      title: "Legacy epic",
+      issue_type: "epic",
+      description: "## Goal\nStill runs.",
+    });
+    const legacyTask = makeBead({ id: "legacy-task", title: "Its ticket", parent: "epic-legacy" });
+    // A migrated epic in the same board must not change how the legacy one reads.
+    const migrated = makeBead({ id: "epic-new", title: "Migrated epic", issue_type: "epic" });
+    const feature = makeBead({
+      id: "feat-new",
+      title: "Its feature",
+      issue_type: "feature",
+      parent: "epic-new",
+    });
+
+    listMock.mockResolvedValue([legacy, legacyTask, migrated, feature]);
+
+    const board = await getBoard(project);
+
+    const cards = STAGES.flatMap((s) => board.columns[s]);
+    expect(cards.map((c) => c.id).sort()).toEqual(["epic-legacy", "feat-new"]);
+    const legacyCard = cards.find((c) => c.id === "epic-legacy")!;
+    expect(legacyCard.goal).toBe("Still runs.");
+    expect(legacyCard.tickets.map((t) => t.id)).toEqual(["legacy-task"]);
+    // A legacy epic has no epic above it — the board collects it in the "No epic" lane.
+    expect(legacyCard.epic).toBeUndefined();
+    // Its ticket stays a ticket, never a chip.
+    expect(STAGES.flatMap((s) => board.standalone[s])).toHaveLength(0);
+  });
+
+  it("does not surface a container epic itself, as a card or a chip", async () => {
+    // An epic with a feature child can't be approved or run (the approve/claim routes 422 it via
+    // isRunTarget), so a card for it would advertise a run that never happens. It reaches the board
+    // only as the badge/swimlane key on its features.
+    const container = makeBead({ id: "epic-c", title: "Container", issue_type: "epic" });
+    const feature = makeBead({
+      id: "feat-c",
+      title: "Feature",
+      issue_type: "feature",
+      parent: "epic-c",
+      status: "in_progress",
+    });
+
+    listMock.mockResolvedValue([container, feature]);
+
+    const board = await getBoard(project);
+
+    expect(STAGES.flatMap((s) => board.columns[s]).map((c) => c.id)).toEqual(["feat-c"]);
+    expect(STAGES.flatMap((s) => board.standalone[s])).toHaveLength(0);
+    expect(board.columns.implementing.map((c) => c.id)).toEqual(["feat-c"]);
+  });
+
   it("marks a self-filed, untouched bug unread and sorts unread chips first", async () => {
     const unread = makeBead({
       id: "bug-unread",

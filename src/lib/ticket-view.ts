@@ -132,6 +132,53 @@ export function parentEpicOf(bead: Bead, all: Bead[]): EpicCrumb | undefined {
   return { id: parent.id, title: parent.title, area: labelValue(parent.labels, "area") };
 }
 
+/**
+ * A board CARD — a bead that owns a run and therefore gets its own column card: a `feature` (one
+ * worktree, one PR) or a legacy `epic` with no feature children. A container epic is deliberately
+ * NOT a card: it can't be approved or run (the approve/claim routes 422 it via the same
+ * `isRunTarget` gate), so a card for it would advertise a run that never happens — it surfaces as
+ * the epic badge/swimlane key instead. A parentless task/bug is a run target too, but the board
+ * renders it as a standalone chip rather than a card.
+ */
+export function isBoardCard(bead: Bead, all: Bead[]): boolean {
+  return (beads.isEpic(bead) || bead.issue_type === "feature") && beads.isRunTarget(bead, all);
+}
+
+export interface BoardCards {
+  /** Every bead id that renders as a card. */
+  ids: Set<string>;
+  /** The card a working-layer bead rides on, or undefined when no ancestor is a card. */
+  cardOf: (bead: Bead) => string | undefined;
+}
+
+/**
+ * The board's card index, built once per board build: which beads are cards, and which card each
+ * working-layer bead belongs to. `cardOf` walks the WHOLE parent chain to the nearest card
+ * ancestor, so in a three-level tree (epic → feature → task) the task lands under its FEATURE —
+ * the single hop it used to take attributed it to nothing and dropped it off the board entirely.
+ * Returns undefined when no ancestor is a card (a task directly under a container epic — work no
+ * run ships; it stays visible on the epic detail page and the Tickets list). Guards against a
+ * malformed parent cycle.
+ */
+export function boardCards(all: Bead[]): BoardCards {
+  const byId = new Map(all.map((b) => [b.id, b]));
+  const ids = new Set(all.filter((b) => isBoardCard(b, all)).map((b) => b.id));
+  return {
+    ids,
+    cardOf: (bead: Bead) => {
+      const seen = new Set<string>([bead.id]);
+      let parentId = beads.parentOf(bead);
+      while (parentId && !seen.has(parentId)) {
+        if (ids.has(parentId)) return parentId;
+        seen.add(parentId);
+        const parent = byId.get(parentId);
+        parentId = parent ? beads.parentOf(parent) : undefined;
+      }
+      return undefined;
+    },
+  };
+}
+
 export interface ToEpicOptions {
   /** The epic's tickets, already mapped (an orphan/pseudo-epic passes `[toTicket(bead)]`). */
   tickets: Ticket[];
