@@ -14,6 +14,20 @@ export function resolvePage(raw: string | undefined, total: number, pageSize = P
 }
 
 /**
+ * Page link for `basePath`, which may already carry a query (the Jobs filters). Every other param
+ * rides along untouched, so paging never silently drops the filter the counts were computed from.
+ * Page 1 omits `page` entirely to keep the canonical URL clean.
+ */
+export function pageHref(basePath: string, page: number): string {
+  const [path, query] = basePath.split("?");
+  const params = new URLSearchParams(query);
+  if (page <= 1) params.delete("page");
+  else params.set("page", String(page));
+  const next = params.toString();
+  return next ? `${path}?${next}` : path;
+}
+
+/**
  * Prev/next pager driven by a `?page` query param on `basePath`. Server-rendered links (no client
  * JS) — each page route paginates independently. Hidden when everything fits on one page.
  */
@@ -33,7 +47,7 @@ export function Pagination({
 
   const from = total === 0 ? 0 : (page - 1) * pageSize + 1;
   const to = Math.min(page * pageSize, total);
-  const href = (p: number) => (p <= 1 ? basePath : `${basePath}?page=${p}`);
+  const href = (p: number) => pageHref(basePath, p);
 
   return (
     <div className="flex items-center justify-between gap-2 border-t border-border px-6 py-3">
