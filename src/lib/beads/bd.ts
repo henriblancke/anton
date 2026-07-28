@@ -279,8 +279,15 @@ export type SyncMode = "full" | "pull";
  * backlog count), and to "pull" otherwise — so stranded commits are always retried until they land,
  * while a caught-up, reconciled repo stays quiet. Routes through the same per-repo coalescer as
  * "full"/"pull", so a backstop push can never overlap a write-nudged one (beads GH#2466).
+ *
+ * "push" is the durable sync-push job's request (anton-nowq): it ALWAYS runs a full push pass to
+ * retry the write's commit, but — unlike "full" — never grows the unpushed backlog (its work is
+ * already counted by the write-nudged pass). "backstop" is wrong for the job: it snapshots
+ * `unpushedCount` at call time and, if it coalesces behind a still-in-flight write push, reads 0 and
+ * drops to pull-only — so a push that then fails goes unretried by the very job meant to retry/park
+ * it. "push" forces the retry unconditionally without the count-inflation "full" would cause.
  */
-export type SyncRequest = SyncMode | "backstop";
+export type SyncRequest = SyncMode | "backstop" | "push";
 
 export type SyncOutcome = "synced" | "not-wired";
 
@@ -294,6 +301,12 @@ export type SyncOutcome = "synced" | "not-wired";
  * yet — the push that follows publishes it); a real commit/push failure (auth, network, remote
  * conflict) rejects with the bd output attached — callers surface it, never swallow it.
  * `exec` is injectable for tests.
+ *
+ * No explicit `bd recompute-blocked` here: bd 1.1.0 recomputes the denormalized `is_blocked` flag
+ * automatically on every pull, scoped to what the merge changed, so `bd ready` never reads a stale
+ * flag on the hot sync path. The unconditional repair (`bd recompute-blocked`) is reserved for the
+ * places that gap can't reach — a freshly bootstrapped clone that never ran a local merge (see
+ * configureBeadsForRepo in config.mjs) — rather than paid on every heartbeat pull.
  */
 export async function runDoltSync(
   cwd: string,
@@ -343,10 +356,18 @@ export async function runDoltSync(
  * heartbeat) resolve to a push-retry while a caught-up repo stays pull-only, and it is the
  * operator-visible "N unpushed" surface. A full pass that reaches "synced"/"not-wired" clears the
  * count and stamps `lastPushedAt` (nothing left to push).
+ *
+ * Resolves with the pass's `SyncOutcome` so callers can tell delivery from non-delivery: a
+ * "not-wired" repo has no remote to publish to, so the write is still only local. The durable
+ * sync-push job depends on that distinction — resolving void would let it settle `done` on work it
+ * never delivered (anton-x7la review). Coalesced callers share the outcome of the pass that covers
+ * them, which is the pass their own request ran in.
  */
-export function createDoltSync(exec: BdExec = bd): (cwd: string, mode?: SyncRequest) => Promise<void> {
-  const running = new Map<string, Promise<void>>();
-  const trailing = new Map<string, { promise: Promise<void>; mode: SyncMode }>();
+export function createDoltSync(
+  exec: BdExec = bd,
+): (cwd: string, mode?: SyncRequest) => Promise<SyncOutcome> {
+  const running = new Map<string, Promise<SyncOutcome>>();
+  const trailing = new Map<string, { promise: Promise<SyncOutcome>; mode: SyncMode }>();
   const trailingMode = new Map<string, SyncMode>(); // live handle so an upgrade reaches the queued run
   const trailingNewWork = new Map<string, boolean>(); // did any queued request carry new local work?
 
@@ -360,7 +381,7 @@ export function createDoltSync(exec: BdExec = bd): (cwd: string, mode?: SyncRequ
   // commit. A backstop retry (newWork=false) re-attempts already-counted work and commits nothing
   // new, so it must never grow the backlog — otherwise a flaky remote turns one stranded change into
   // "N unpushed" after N failed retries (anton-rn88 review).
-  const start = (cwd: string, mode: SyncMode, newWork: boolean): Promise<void> => {
+  const start = (cwd: string, mode: SyncMode, newWork: boolean): Promise<SyncOutcome> => {
     recordStatus(cwd, { state: "syncing" });
     const p = runDoltSync(cwd, exec, mode).then((outcome) => {
       if (outcome === "not-wired") {
@@ -380,6 +401,7 @@ export function createDoltSync(exec: BdExec = bd): (cwd: string, mode?: SyncRequ
         });
         if (mode === "full") reconciled.add(cwd); // a full pass pushed — the backlog is reconciled
       }
+      return outcome;
     });
     running.set(cwd, p);
     // Bookkeeping only — callers hold `p` and see its rejection; this chain must not re-reject.
@@ -399,7 +421,7 @@ export function createDoltSync(exec: BdExec = bd): (cwd: string, mode?: SyncRequ
     return p;
   };
 
-  return function sync(cwd: string, request: SyncRequest = "full"): Promise<void> {
+  return function sync(cwd: string, request: SyncRequest = "full"): Promise<SyncOutcome> {
     // Resolve the backstop to a push-retry when a prior push failed (recorded backlog) OR when this
     // process has not yet reconciled the repo — the backlog is in-memory only, so a cold start after
     // a crash that stranded local commits reads count 0 and must NOT pull forever without shipping
@@ -409,8 +431,11 @@ export function createDoltSync(exec: BdExec = bd): (cwd: string, mode?: SyncRequ
         ? getSyncStatus(cwd).unpushedCount > 0 || !reconciled.has(cwd)
           ? "full"
           : "pull"
-        : request;
-    // Only a write-nudge introduces new local work; a backstop is a retry of already-counted commits.
+        : request === "push"
+          ? "full" // durable job: always retry the push, regardless of the (possibly stale) count
+          : request;
+    // Only a write-nudge introduces new local work; a backstop or durable "push" retry re-attempts
+    // already-counted commits and must never inflate the backlog (anton-rn88).
     const newWork = request === "full";
     const queued = trailing.get(cwd);
     if (queued) {
@@ -475,6 +500,10 @@ export const beads = {
     bd(cwd, ["list", "--json", "--limit", "0", ...extra]).then(asArray<Bead>),
 
   show: async (cwd: string, id: string): Promise<Bead> => {
+    // Count-only `bd show --json` (bd 1.1.0): deliberately WITHOUT --include-comments /
+    // --include-dependents, so it returns the bead's fields + dependency counts without streaming
+    // full comment/dependent bodies (slow on hub beads). anton's callers only need the bead itself
+    // and its counts here; opt into hydration explicitly at the (rare) call site that needs it.
     // `bd show --json` returns an array (one or more issues), not an object.
     const parsed = JSON.parse(await bd(cwd, ["show", id, "--json"]));
     if (Array.isArray(parsed)) return parsed[0];
@@ -694,15 +723,21 @@ export const beads = {
   /**
    * Full sync with the Dolt remote (pull, commit if needed, then push), coalescing concurrent
    * calls per repo. Tolerant of a clean working set and of a workspace with no remote; REJECTS
-   * on a real push failure — call sites must log or rethrow, never ignore the promise.
+   * on a real push failure — call sites must log or rethrow, never ignore the promise. Fire-and-
+   * forget callers read delivery from the sync-status registry, not the resolution — only the
+   * durable job needs the outcome, so only `push` surfaces it.
    */
-  sync: (cwd: string): Promise<void> => doltSync(cwd, "full"),
+  sync: async (cwd: string): Promise<void> => {
+    await doltSync(cwd, "full");
+  },
 
   /**
    * Pull-only sync (heartbeat): remote changes land locally without pushing. Never pushes —
    * see SyncMode. Shares the per-repo coalescing with `sync`, so passes never overlap.
    */
-  pull: (cwd: string): Promise<void> => doltSync(cwd, "pull"),
+  pull: async (cwd: string): Promise<void> => {
+    await doltSync(cwd, "pull");
+  },
 
   /**
    * Heartbeat backstop pass (anton-sr8f): pulls, plus retries a push when this repo has unpushed
@@ -713,7 +748,21 @@ export const beads = {
    * per-repo coalescer with `sync`/`pull`, so a backstop push can never overlap a write-nudged one
    * (beads GH#2466); a not-wired repo is unaffected.
    */
-  backstop: (cwd: string): Promise<void> => doltSync(cwd, "backstop"),
+  backstop: async (cwd: string): Promise<void> => {
+    await doltSync(cwd, "backstop");
+  },
+
+  /**
+   * Durable sync-push job pass (anton-nowq): always runs a full push to retry a write's commit,
+   * unlike `backstop` which snapshots the (possibly stale) unpushed count and can drop to pull-only
+   * when it coalesces behind a still-in-flight write push — leaving a push that then fails unretried
+   * by the very job meant to retry/park it. Never inflates the backlog (the work is already counted).
+   * Shares the per-repo coalescer with `sync`/`pull`/`backstop`, so it can never overlap another push
+   * (beads GH#2466). REJECTS on a real push failure so the runner applies its retry/backoff/park
+   * policy, and resolves "not-wired" when the repo has no remote — nothing was delivered, so the
+   * caller must not treat that as a completed push (see makeSyncPushHandler).
+   */
+  push: (cwd: string): Promise<SyncOutcome> => doltSync(cwd, "push"),
 
   // ── convenience: anton's stage/approval semantics, all in beads ──
   approve: (cwd: string, epicId: string) => beads.tag(cwd, epicId, [LABELS.approved]),

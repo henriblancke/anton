@@ -110,12 +110,36 @@ export function makeBdRepo(opts: { bare?: boolean; initialCommit?: boolean } = {
     dir,
     repo,
     bare,
-    // maxRetries: routes fire off-response-path `bd dolt` syncs (fire-and-forget), so a background
-    // subprocess can still be writing inside the repo when afterAll runs — a bare rmSync races it
-    // and dies ENOTEMPTY. Node retries ENOTEMPTY/EBUSY with linear backoff when maxRetries is set,
-    // which outlives the short-lived subprocess.
-    cleanup: () => rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }),
+    cleanup: () => removeTempRepo(dir),
   };
+}
+
+/** Errnos a still-running `bd` subprocess produces when rm walks the dir underneath it. */
+const BUSY_ERRNOS = new Set(["ENOTEMPTY", "EBUSY", "EPERM"]);
+
+/**
+ * Remove a temp dir holding a bd repo, tolerating the fire-and-forget sync race.
+ *
+ * Write routes push to the remote OFF the response path, so a `bd dolt pull/commit/push` subprocess
+ * can still be writing under `.beads/embeddeddolt` when a suite's afterAll walks the dir — a bare
+ * rmSync then dies ENOTEMPTY with every assertion already green. Node's linear-backoff retries
+ * (~31s here) outlive a bd pass even on a loaded CI runner, where one shell-out takes seconds; the
+ * previous ~5s budget did not, and reddened a fully-passing run (bd-prune on CI).
+ *
+ * If the dir is STILL busy after that, the leftover is a temp dir under `os.tmpdir()` — warn loudly
+ * and continue rather than failing a suite on housekeeping. Any other error (bad path, permissions
+ * bug) still throws: only the race is tolerated. `rm` is injectable for tests.
+ */
+export function removeTempRepo(dir: string, rm: typeof rmSync = rmSync): void {
+  try {
+    rm(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (!code || !BUSY_ERRNOS.has(code)) throw e;
+    console.warn(
+      `[integration] leaked temp dir ${dir} (${code}): a bd subprocess outlived the suite`,
+    );
+  }
 }
 
 // ── temp file-backed anton.db ──

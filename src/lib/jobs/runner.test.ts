@@ -9,7 +9,7 @@ import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
 import { getBurnAverage, recordBurnSample } from "../burn";
 import type { ClaudeUsage } from "../claude/usage";
-import { PoisonError, RunAlreadyLiveError, UsageLimitError } from "./errors";
+import { PoisonError, RunAlreadyLiveError, SyncNotWiredError, UsageLimitError } from "./errors";
 import { complete, enqueue, getJob, park, reschedule, toMs, type Clock } from "./queue";
 import { DEFAULT_BUDGET_POLICY, type BudgetPolicy } from "./budget";
 import {
@@ -92,6 +92,24 @@ describe("nextAction (pure durability policy)", () => {
     expect(classifyError(new RunAlreadyLiveError("live on B"))).toEqual({
       kind: "lease-held",
       error: "live on B",
+    });
+  });
+
+  it("rechecks a not-wired project on a slow cadence and refunds the attempt (anton-x7la)", () => {
+    // Nothing was delivered, so the job must not complete — but only a human wiring a remote can
+    // unblock it, so it never burns attempts toward a park either, even past maxAttempts.
+    const a = nextAction(CONFIG, { attempts: 3 }, { kind: "not-wired", error: "no remote" }, now);
+    expect(a.action).toBe("reschedule");
+    if (a.action !== "reschedule") throw new Error("unreachable");
+    expect(a.runAtMs).toBe(now + CONFIG.notWiredRetryMs);
+    expect(a.refundAttempt).toBe(true);
+    expect(a.lastError).toMatch(/not wired/i);
+  });
+
+  it("classifies SyncNotWiredError as a not-wired outcome (anton-x7la)", () => {
+    expect(classifyError(new SyncNotWiredError("no remote"))).toEqual({
+      kind: "not-wired",
+      error: "no remote",
     });
   });
 
@@ -582,6 +600,40 @@ describe("JobRunner (live, in-memory db)", () => {
       (j) => j.projectId === "A" && j.status === "queued",
     );
     expect(queuedA).toHaveLength(1); // the over-cap A job was left for a later tick
+  });
+
+  it("runs at most one sync-push per project at a time (anton-x7la)", async () => {
+    // The queued-only dedup index lets a queued follow-up sit alongside a running push. The runner
+    // must still cap the RUNNING count at 1 per project: the per-repo coalescer serializes their
+    // pushes, so a second concurrent lease buys nothing and would pile handlers into the global pool
+    // under a slow remote. Bound: 1 running + 1 queued.
+    await seedProjects("A");
+    let concurrent = 0;
+    let peak = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((res) => (release = res));
+    const r = new JobRunner({ db: tdb.db, clock, config: { ...CONFIG, maxConcurrent: 5 } });
+    r.registerHandler("sync-push", async () => {
+      concurrent += 1;
+      peak = Math.max(peak, concurrent);
+      await gate;
+      concurrent -= 1;
+    });
+
+    await r.enqueue({ type: "sync-push", projectId: "A" }); // A → queued
+    expect(await r.tickOnce()).toBe(1); // A leased → running, handler blocks on the gate
+
+    // A durable follow-up lands while A runs (permitted by the queued-only index).
+    const bId = await r.enqueue({ type: "sync-push", projectId: "A" });
+    expect(await r.tickOnce()).toBe(0); // capped at 1 running per project — B stays queued
+    expect((await getJob(tdb.db, bId))?.status).toBe("queued");
+
+    release();
+    await r.whenIdle();
+    expect(await r.tickOnce()).toBe(1); // A settled → the queued follow-up is now leasable
+    await r.whenIdle();
+
+    expect(peak).toBe(1); // the two pushes never ran concurrently for project A
   });
 
   it("autonomy off gates claiming: execute-epic stays queued, and re-enabling resumes it (anton-y3l)", async () => {
@@ -1281,6 +1333,46 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     await r.whenIdle();
     expect(freshReads).toBe(2);
     expect(await tdb.db.select().from(schema.burnSamples)).toHaveLength(2);
+  });
+
+  it("opens no window for a type that never invokes Claude, leaving the throttle for a real job", async () => {
+    // sync-push is a deterministic `git push` — a window around it would blame unrelated Claude
+    // usage on it AND spend burnSampleMinIntervalMs, starving the execute-epic that follows.
+    let cachedReads = 0;
+    let freshReads = 0;
+    const r = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { ...CONFIG, maxConcurrent: 1, burnSampleMinIntervalMs: 60_000 },
+      resolveBudgetPolicy: budgetAware,
+      readUsage: async () => {
+        cachedReads += 1;
+        return usage(10, 5);
+      },
+      readUsageFresh: async () => {
+        freshReads += 1;
+        return usage(30, 8);
+      },
+    });
+    r.registerHandler("sync-push", async () => {});
+    r.registerHandler("execute-epic", async () => {});
+
+    const id = await r.enqueue({ type: "sync-push" });
+    await r.tickOnce();
+    await r.whenIdle();
+    expect((await getJob(tdb.db, id))?.status).toBe("done");
+    expect(cachedReads).toBe(0);
+    expect(freshReads).toBe(0);
+    expect(await tdb.db.select().from(schema.burnSamples)).toHaveLength(0);
+
+    // Immediately after (well inside the throttle interval) a Claude job still samples.
+    await r.enqueue({ type: "execute-epic" });
+    await r.tickOnce();
+    await r.whenIdle();
+    expect(freshReads).toBe(1);
+    const rows = await tdb.db.select().from(schema.burnSamples);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.jobType).toBe("execute-epic");
   });
 
   it("never reads usage when no budget resolver is wired at all", async () => {

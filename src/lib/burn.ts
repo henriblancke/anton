@@ -30,8 +30,11 @@ import type { ClaudeUsage } from "./claude/usage";
 /** How many real samples a type needs before its rolling average replaces the tier seed. */
 export const BURN_SAMPLE_WINDOW = 5;
 
-/** Cost tiers — a rough size for a job type's burn until real data replaces the guess. */
-export type BurnTier = "S" | "M" | "L";
+/**
+ * Cost tiers — a rough size for a job type's burn until real data replaces the guess. `none` is not a
+ * size but a kind: a handler that never invokes Claude (see {@link JOB_TYPE_TIER}).
+ */
+export type BurnTier = "none" | "S" | "M" | "L";
 
 /**
  * Seed burn per tier (session%/weekly% points) used until a type has {@link BURN_SAMPLE_WINDOW} real
@@ -39,18 +42,34 @@ export type BurnTier = "S" | "M" | "L";
  * far smaller than session — the 7-day window dilutes a single job far more than the 5-hour one.
  */
 export const TIER_SEEDS: Record<BurnTier, { sessionPct: number; weeklyPct: number }> = {
+  none: { sessionPct: 0, weeklyPct: 0 },
   S: { sessionPct: 2, weeklyPct: 0.3 },
   M: { sessionPct: 8, weeklyPct: 1.2 },
   L: { sessionPct: 20, weeklyPct: 3 },
 };
 
-/** Static tier per job type (ticket: stringer=S, review-fix=M, execute-epic=L; grooming is cheap). */
+/**
+ * Static tier per job type (ticket: stringer=S, review-fix=M, execute-epic=L; grooming is cheap).
+ * sync-push is a deterministic `git push` of dolt refs — it invokes no Claude at all, so it's `none`:
+ * zero cost to the pacer and never worth sampling (see {@link burnsClaudeQuota}).
+ */
 export const JOB_TYPE_TIER: Record<JobType, BurnTier> = {
   "nightly-stringer": "S",
   "review-fix": "M",
   "execute-epic": "L",
   "orphan-grooming": "S",
+  "sync-push": "none",
 };
+
+/**
+ * Can this job type move the Claude meters at all? Sampling a handler that never invokes Claude is
+ * worse than useless: the window would attribute whatever unrelated Claude usage happened to move
+ * (an operator's own session) to that type, and it spends the sampler's throttle budget — leaving a
+ * real Claude job that starts inside the interval unsampled.
+ */
+export function burnsClaudeQuota(jobType: JobType): boolean {
+  return JOB_TYPE_TIER[jobType] !== "none";
+}
 
 export interface BurnSample {
   sessionDelta: number;

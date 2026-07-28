@@ -126,6 +126,7 @@ describe("option lists", () => {
       "review-fix",
       "nightly-stringer",
       "orphan-grooming",
+      "sync-push",
     ]);
     expect(JOB_TYPE_FILTER_OPTIONS.map((o) => o.value)).toEqual(["", ...JOB_TYPES]);
   });

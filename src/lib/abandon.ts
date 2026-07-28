@@ -5,6 +5,7 @@
  * about the exit reads as a delivery. See DESIGN.md §3 — beads owns status, anton.db gains no column.
  */
 import { beads } from "./beads/bd";
+import { nudgeSync } from "./beads/sync-nudge";
 import { cancelRunForTarget } from "./jobs/service";
 import { freshDetail } from "./ticket-detail";
 import type { Bead } from "./beads/bd";
@@ -43,13 +44,6 @@ function assertOpen(bead: Bead, what: string): void {
         : `${what} is already closed — abandon applies to work that hasn't settled`,
     );
   }
-}
-
-/** Push the abandon to teammates without blocking the response — the heartbeat backstop retries. */
-function nudgeSync(project: Project, id: string): void {
-  void beads
-    .sync(project.repoPath)
-    .catch((e) => console.error(`[abandon] beads dolt sync failed after abandoning ${id}`, e));
 }
 
 /**
@@ -149,7 +143,7 @@ export async function abandonTicket(
   // Read-after-write, like setTicketDeferred: the `bd show` bead is authoritative for the abandoned
   // state it just wrote, so the response never reflects the board's stale snapshot.
   const detail = await freshDetail(project, await beads.show(project.repoPath, id));
-  nudgeSync(project, id);
+  nudgeSync(project, "abandon");
   return detail;
 }
 
@@ -214,7 +208,10 @@ export async function abandonEpic(
   const epic = await beads.show(repo, epicId); // 404 guard — bd throws on an unknown id
   assertOpen(epic, "Epic");
 
-  const all = await beads.list(repo, ["--status", "all"]);
+  // --skip-labels (bd 1.1.0): the cascade only inspects parent, status and type — openDescendants
+  // walks the subtree, isRunTarget classifies it — so skipping label hydration keeps this
+  // full-board read lean.
+  const all = await beads.list(repo, ["--status", "all", "--skip-labels"]);
 
   // Kill every live run this abandon settles, BEFORE recording it. A container epic never runs
   // itself — the active job is keyed by the FEATURE below it, which cascadeToDescendants cancels —
@@ -229,6 +226,6 @@ export async function abandonEpic(
   // which re-running abandon finishes — the reverse order would leave orphaned open children under
   // an epic that already reads as settled.
   await beads.abandon(repo, epicId, why);
-  nudgeSync(project, epicId);
+  nudgeSync(project, "abandon");
   return { epicId, children };
 }

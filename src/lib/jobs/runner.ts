@@ -8,6 +8,8 @@
  *   • Poison-pill            — a job that errors `maxAttempts` times (or throws `PoisonError`) is
  *                              parked for a human. Parking is recoverable, not terminal: `resume()`
  *                              (queue.resumeJob) un-parks a job back to `queued` with a fresh budget.
+ *   • Undeliverable-yet      — `SyncNotWiredError` → recheck on a slow cadence, attempt refunded:
+ *                              the work isn't done, but only a human wiring a remote can unblock it.
  *
  * The decision logic (`nextAction`) is a pure function so it can be unit-tested without timers.
  * See DESIGN.md §4.
@@ -43,9 +45,14 @@ import {
   type JobType,
 } from "./queue";
 import { reconcileInterruptedRuns } from "../runs";
-import { isPoisonError, isRunAlreadyLiveError, isUsageLimitError } from "./errors";
+import {
+  isPoisonError,
+  isRunAlreadyLiveError,
+  isSyncNotWiredError,
+  isUsageLimitError,
+} from "./errors";
 import { PollingLoop } from "./polling-loop";
-import { getBurnAverage, sampleJobBurn } from "../burn";
+import { burnsClaudeQuota, getBurnAverage, sampleJobBurn } from "../burn";
 import { getClaudeUsageCached, getClaudeUsageFresh, type ClaudeUsage } from "../claude/usage";
 import { admitJob, budgetGate, jobValueScore, type BudgetPolicy } from "./budget";
 
@@ -60,6 +67,8 @@ export interface RunnerConfig {
   backoffMaxMs: number;
   /** Fallback park duration for a quota hit with no known reset time. */
   quotaCooloffMs: number;
+  /** Recheck cadence for a job blocked on a project with no Dolt remote (see `SyncNotWiredError`). */
+  notWiredRetryMs: number;
   /** Max jobs in flight at once. */
   maxConcurrent: number;
   /** Poll interval for the background loop. */
@@ -80,6 +89,7 @@ export const DEFAULT_CONFIG: RunnerConfig = {
   backoffBaseMs: 5_000,
   backoffMaxMs: 5 * 60_000,
   quotaCooloffMs: 30 * 60_000,
+  notWiredRetryMs: 5 * 60_000,
   maxConcurrent: 1,
   tickMs: 2_000,
   burnSampleMinIntervalMs: 60_000,
@@ -199,6 +209,7 @@ export type Outcome =
   | { kind: "success" }
   | { kind: "quota"; resetAt?: number }
   | { kind: "lease-held"; error: string }
+  | { kind: "not-wired"; error: string }
   | { kind: "poison"; error: string }
   | { kind: "error"; error: string };
 
@@ -210,6 +221,7 @@ export type Action =
 export function classifyError(e: unknown): Outcome {
   if (isUsageLimitError(e)) return { kind: "quota", resetAt: e.resetAt };
   if (isRunAlreadyLiveError(e)) return { kind: "lease-held", error: e.message };
+  if (isSyncNotWiredError(e)) return { kind: "not-wired", error: e.message };
   if (isPoisonError(e)) return { kind: "poison", error: e.message };
   return { kind: "error", error: e instanceof Error ? e.message : String(e) };
 }
@@ -243,6 +255,20 @@ export function nextAction(
         runAtMs,
         refundAttempt: true,
         lastError: `run live elsewhere: retries at ${new Date(runAtMs).toISOString()}`,
+      };
+    }
+    case "not-wired": {
+      // The project has no Dolt remote (anton-x7la), so the job's work is committed locally and
+      // published nowhere — never `complete`, which would claim a delivery that didn't happen. But
+      // it isn't the job's failure either: it self-heals the moment a human wires a remote, so it
+      // rechecks on a slow cadence with the attempt refunded rather than parking every local-only
+      // write for an operator to resume by hand.
+      const runAtMs = nowMs + config.notWiredRetryMs;
+      return {
+        action: "reschedule",
+        runAtMs,
+        refundAttempt: true,
+        lastError: `not wired to a remote: rechecks at ${new Date(runAtMs).toISOString()}`,
       };
     }
     case "poison":
@@ -623,6 +649,14 @@ export class JobRunner {
       ) {
         return 0;
       }
+      // At most one sync-push may RUN per project at a time (anton-x7la). The queued-only dedup index
+      // permits a queued follow-up alongside a running push (so a write during an in-flight push gets
+      // a durable slot), but the per-repo coalescer already serializes their pushes — a second
+      // concurrent lease buys nothing and, under a slow remote + write burst, would pile sync-push
+      // handlers into the global concurrency pool and starve execute-epic work. Capping the running
+      // count at 1 keeps the follow-up queued until the running push settles: the real 1-running +
+      // 1-queued bound the queued-only index promises.
+      if (job.type === "sync-push") return 1;
       return policyCapOf?.(job) ?? Infinity;
     };
 
@@ -880,8 +914,10 @@ export class JobRunner {
     // session%/weekly% that moves across it to this job's TYPE. Attribution needs a solo window —
     // with jobs overlapping (maxConcurrent > 1), each delta would include the siblings' burn and
     // double-count across types — so only open a window when nothing else is in flight; a sibling
-    // dispatched mid-window is caught at close via `dispatchSeq`. Fail-soft — a null read just
-    // means no sample; it never gates dispatch.
+    // dispatched mid-window is caught at close via `dispatchSeq`. Types that never invoke Claude
+    // (`burnsClaudeQuota`) are skipped outright — sampling them would blame an operator's own
+    // Claude usage on a `git push` and spend the throttle a real job needs. Fail-soft — a null read
+    // just means no sample; it never gates dispatch.
     //
     // Gated behind the project's budget-aware opt-in (anton-7mpv.1), like the governor: burn data
     // only feeds budget pacing, so in the default feature-off state the sampler must not shell out
@@ -897,6 +933,7 @@ export class JobRunner {
     const burnDue = this.clock.now() - this.lastBurnSampleAt >= this.config.burnSampleMinIntervalMs;
     const burnBefore =
       burnDue &&
+      burnsClaudeQuota(job.type as JobType) &&
       this.inFlight.size === 1 &&
       (await this.budgetAwareFor(job.projectId ?? undefined))
         ? await this.readUsageSafe()

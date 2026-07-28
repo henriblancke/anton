@@ -37,9 +37,12 @@ import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import {
   beadsPrereqs,
+  bdVersion,
+  bdVersionAtLeast,
   configureBeadsDoltSync,
   configureBeadsForRepo,
   ensureBeadsGitignore,
+  MIN_BD_VERSION,
 } from "../src/lib/beads/config.mjs";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
@@ -751,13 +754,19 @@ function checkPrereqs() {
   let ok = true;
   for (const p of PREREQS) {
     const present = onPath(p.cmd);
-    const tag = present
-      ? c.green("found")
-      : p.required
+    // bd is version-gated: anton requires >= 1.1.0 (anton-qwsq). A present-but-too-old bd fails the
+    // required check just like a missing one, with the version and the upgrade guidance.
+    const v = present && p.cmd === "bd" ? bdVersion() : null;
+    const bdTooOld = present && p.cmd === "bd" && !bdVersionAtLeast(v);
+    const tag = !present
+      ? p.required
         ? c.red("MISSING")
-        : c.yellow("missing");
-    console.log(`  ${present ? "✓" : "✗"} ${p.cmd.padEnd(9)} ${tag}  ${c.dim(p.why)}`);
-    if (!present && p.required) ok = false;
+        : c.yellow("missing")
+      : bdTooOld
+        ? c.red(`${v ? v.raw : "unknown"} — need >= ${MIN_BD_VERSION}`)
+        : c.green(p.cmd === "bd" && v ? `found ${v.raw}` : "found");
+    console.log(`  ${present && !bdTooOld ? "✓" : "✗"} ${p.cmd.padEnd(9)} ${tag}  ${c.dim(p.why)}`);
+    if ((!present || bdTooOld) && p.required) ok = false;
   }
   const node = process.versions.node.split(".").map(Number);
   const nodeOk = node[0] >= 20;

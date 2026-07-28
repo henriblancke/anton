@@ -41,6 +41,7 @@ const JOB_TYPE_LABELS: Record<JobType, string> = {
   "review-fix": "Review fix",
   "nightly-stringer": "Nightly stringer",
   "orphan-grooming": "Orphan grooming",
+  "sync-push": "Sync push",
 };
 
 export const JOB_STATUSES = Object.keys(JOB_STATUS_LABELS) as JobStatus[];

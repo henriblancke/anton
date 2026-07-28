@@ -497,8 +497,9 @@ const FAKE_BD = [
   'const cfg = path.join(beads, "config.yaml");',
   'const marker = path.join(beads, ".fake-dolt-remotes");',
   'const setlog = path.join(beads, ".fake-config-set-order");',
-  // onPath() probes --version/--help.
-  'if (a[0] === "--version" || a[0] === "--help") { console.log("bd 0.0.0-fake"); process.exit(0); }',
+  // onPath() probes --version/--help; beadsPrereqs parses the version and gates on >= 1.1.0
+  // (anton-qwsq), so the stub must report a supported version to reach the init path under test.
+  'if (a[0] === "--version" || a[0] === "--help") { console.log("bd version 1.1.0 (fake)"); process.exit(0); }',
   // `bd init` creates the workspace + the (gitignored) local Dolt DB dir — its presence is how the
   // real config path tells an existing workspace from a fresh clone. The team-config keys are
   // intentionally left OUT so the subsequent `bd config set` calls (config.yaml enforcement) run.
@@ -619,6 +620,37 @@ describe("anton init (end-to-end, bd stubbed on PATH)", () => {
     const r = runInit(dir);
     expect(r.status).toBe(1);
     expect(r.stdout).toContain('no "origin" remote');
+  });
+
+  it("fails loud when bd is present but older than 1.1.0 (bd-too-old, anton-qwsq)", async () => {
+    // Swap the on-PATH stub for one that reports an unsupported version. The version gate runs
+    // before the git/origin checks, so a fully-wired repo still fails here with upgrade guidance.
+    writeFileSync(
+      join(fakeBin, "bd"),
+      '#!/usr/bin/env node\nconst a = process.argv.slice(2);\nif (a[0] === "--version" || a[0] === "--help") { console.log("bd version 1.0.4 (old)"); process.exit(0); }\nprocess.exit(0);\n',
+    );
+    chmodSync(join(fakeBin, "bd"), 0o755);
+    const dir = await tmp("anton-init-");
+    gitInit(dir, true);
+    const r = runInit(dir);
+    expect(r.status).toBe(1);
+    expect(r.stdout).toContain("bd 1.0.4 is too old");
+    expect(r.stdout).toContain("1.1.0");
+    expect(r.stdout).toContain("migration.md");
+  });
+
+  it("doctor's prereq check flags a too-old bd (anton-qwsq)", () => {
+    writeFileSync(
+      join(fakeBin, "bd"),
+      '#!/usr/bin/env node\nconst a = process.argv.slice(2);\nif (a[0] === "--version" || a[0] === "--help") { console.log("bd version 1.0.4 (old)"); process.exit(0); }\nprocess.exit(0);\n',
+    );
+    chmodSync(join(fakeBin, "bd"), 0o755);
+    const r = spawnSync(process.execPath, [CLI, "doctor"], {
+      encoding: "utf8",
+      env: { ...process.env, PATH: `${fakeBin}${delimiter}${process.env.PATH ?? ""}`, ANTON_DB: dbPath },
+    });
+    expect(r.status).toBe(1);
+    expect(r.stdout).toContain("need >= 1.1.0");
   });
 
   it("configures beads team-config + registers the repo on a fresh repo (fresh-init)", async () => {

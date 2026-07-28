@@ -79,6 +79,21 @@ export class RecoverableClaudeError extends Error {
   }
 }
 
+/**
+ * The job's work cannot be delivered because the project's beads workspace has no Dolt remote
+ * (anton-x7la). The write is committed locally but published nowhere, so the job is NOT done — yet
+ * it isn't a failure either: wiring a remote is a human action (`anton init`), already surfaced by
+ * the board's "not wired" badge. The runner therefore RESCHEDULES the job at a slow recheck cadence
+ * and refunds the attempt, so it neither parks a queue full of local-only writes for a human nor
+ * declares delivery that never happened — and it publishes by itself the moment a remote appears.
+ */
+export class SyncNotWiredError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SyncNotWiredError";
+  }
+}
+
 export function isUsageLimitError(e: unknown): e is UsageLimitError {
   return e instanceof UsageLimitError || (e as { name?: string })?.name === "UsageLimitError";
 }
@@ -98,4 +113,8 @@ export function isRunAlreadyLiveError(e: unknown): e is RunAlreadyLiveError {
   return (
     e instanceof RunAlreadyLiveError || (e as { name?: string })?.name === "RunAlreadyLiveError"
   );
+}
+
+export function isSyncNotWiredError(e: unknown): e is SyncNotWiredError {
+  return e instanceof SyncNotWiredError || (e as { name?: string })?.name === "SyncNotWiredError";
 }

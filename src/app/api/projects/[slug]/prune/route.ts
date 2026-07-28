@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { beads, type PruneAge } from "@/lib/beads/bd";
+import { nudgeSync } from "@/lib/beads/sync-nudge";
 import { resolveProject } from "../resolve-project";
 
 export const dynamic = "force-dynamic";
@@ -29,13 +30,11 @@ export async function POST(request: Request, { params }: { params: Promise<{ slu
   try {
     const count = await beads.prune(project.repoPath, age as PruneAge, { force });
     if (force) {
-      // Fire-and-forget, exactly like deleteEpic: the prune already landed locally, so don't block
-      // the response on a `bd dolt pull/commit/push` a slow/unreachable remote could stall. A failed
-      // push is recorded as failing/unpushed in the sync-status registry and retried by the E1
-      // heartbeat backstop — this catch only keeps the rejection from floating.
-      void beads
-        .sync(project.repoPath)
-        .catch((e) => console.error(`[prune] beads dolt sync failed after pruning ${slug}`, e));
+      // A destructive prune already landed locally, so don't block the response on a `bd dolt
+      // pull/commit/push` a slow/unreachable remote could stall. nudgeSync fires the immediate push
+      // AND enqueues the durable sync-push backstop (anton-nowq) so the deletion can't be stranded
+      // locally — it either reaches the remote or parks for a human. Previews write nothing.
+      nudgeSync({ id: project.id, repoPath: project.repoPath }, "prune");
     }
     return NextResponse.json({ count, pruned: force });
   } catch (err) {
