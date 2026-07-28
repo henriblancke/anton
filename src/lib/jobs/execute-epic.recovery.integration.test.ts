@@ -9,7 +9,7 @@
  * skipping — split out so it runs in parallel with its sibling `execute-epic.*.integration.test.ts`
  * files (anton-0oi).
  */
-import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -205,6 +205,270 @@ process.exit(0);`,
     expect(
       (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === choreId),
     ).toBeUndefined();
+  });
+
+  it("poison-parks a CONTAINER epic — one with feature children — naming why, and never starts a run", async () => {
+    // anton-s67y: an epic stops being a run target the moment a feature lands under it. Running it
+    // would mean one job opening a PR per feature, which is exactly what the per-feature run/approval
+    // gate exists to prevent. The poison must name the container, not read as a generic type error.
+    const containerId = await beads.create(repo, {
+      title: "Product outcome spanning features",
+      type: "epic",
+      description: "## Goal\nGroup features.",
+    });
+    const featureId = await beads.create(repo, {
+      title: "A shippable feature",
+      type: "feature",
+      acceptance: "work file exists",
+      description: "## Goal\nShip it.",
+    });
+    await beads.link(repo, featureId, containerId, "parent-child");
+    await beads.approve(repo, containerId);
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    process.env.ANTON_CLAUDE_BIN = successClaude;
+    const jobId = await runner.enqueue({
+      type: "execute-epic",
+      projectId,
+      payload: { projectId, epicBeadId: containerId },
+    });
+    await runner.tickOnce();
+    await runner.whenIdle();
+
+    const job = await getJob(tdb.db, jobId);
+    expect(job?.status).toBe("parked");
+    expect(job?.lastError).toContain(containerId);
+    expect(job?.lastError).toMatch(/container/i);
+    expect(job?.lastError).toMatch(/feature/i);
+    expect(job?.lastError).not.toMatch(/not found/i);
+    // Pre-flight gate: no run row, and neither bead was touched.
+    expect(
+      (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === containerId),
+    ).toBeUndefined();
+    expect((await beads.show(repo, featureId)).status).not.toBe("closed");
+  });
+
+  it("accepts a feature target under a container epic and runs it to its own PR", async () => {
+    // The other half of the rule: the feature IS the run target. It runs like an epic-of-one —
+    // branch anton/<id>, its own PR, left OPEN + in-review until that PR merges.
+    const containerId = await beads.create(repo, {
+      title: "Outcome with one runnable feature",
+      type: "epic",
+      description: "## Goal\nGroup features.",
+    });
+    const featureId = await beads.create(repo, {
+      title: "Runnable feature",
+      type: "feature",
+      acceptance: "work file exists",
+      description: "## Goal\nShip the feature.",
+    });
+    await beads.link(repo, featureId, containerId, "parent-child");
+    await beads.approve(repo, featureId);
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    process.env.ANTON_CLAUDE_BIN = successClaude;
+    const jobId = await runner.enqueue({
+      type: "execute-epic",
+      projectId,
+      payload: { projectId, epicBeadId: featureId },
+    });
+    await runner.tickOnce();
+    await runner.whenIdle();
+
+    expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+    const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === featureId)!;
+    expect(run.status).toBe("done");
+    expect(run.branch).toBe(`anton/${featureId}`);
+
+    const feature = await beads.show(repo, featureId);
+    expect(feature.status).not.toBe("closed");
+    expect(beads.getPrRef(feature)).toBe("gh-42");
+    expect(feature.labels ?? []).toContain("stage:in-review");
+    // The container above it was never dragged into the run.
+    expect((await beads.show(repo, containerId)).labels ?? []).not.toContain("stage:in-review");
+  });
+
+  it("runs a feature's child tickets as ONE PR, not the feature bead itself", async () => {
+    // A feature is one delivery unit: its task/bug children are the working layer executed inside
+    // its run (design 2026-07-26). Dispatching the feature bead as a single ticket would silently
+    // drop that shaped work, so a feature WITH children batches them exactly as an epic does.
+    const featureId = await beads.create(repo, {
+      title: "Feature with shaped tickets",
+      type: "feature",
+      description: "## Goal\nBatch the children.",
+    });
+    const childIds: string[] = [];
+    for (const title of ["Child one", "Child two"]) {
+      const id = await beads.create(repo, { title, type: "task", acceptance: "work file exists" });
+      await beads.link(repo, id, featureId, "parent-child");
+      childIds.push(id);
+    }
+    await beads.approve(repo, featureId);
+
+    const runner = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { maxConcurrent: 1, leaseMs: 30_000 },
+    });
+    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+    process.env.ANTON_CLAUDE_BIN = successClaude;
+    const jobId = await runner.enqueue({
+      type: "execute-epic",
+      projectId,
+      payload: { projectId, epicBeadId: featureId },
+    });
+    await runner.tickOnce();
+    await runner.whenIdle();
+
+    expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+    // Both children were dispatched and closed; the feature itself is in-review on one PR.
+    const board = await beads.list(repo, ["--status", "all"]);
+    for (const id of childIds) {
+      expect(board.find((b) => b.id === id)?.status).toBe("closed");
+    }
+    const sessions = (await tdb.db.select().from(schema.sessions)).filter((s) =>
+      childIds.includes(s.beadId!),
+    );
+    expect(sessions).toHaveLength(2);
+    expect(
+      (await tdb.db.select().from(schema.sessions)).some((s) => s.beadId === featureId),
+    ).toBe(false);
+    const feature = await beads.show(repo, featureId);
+    expect(feature.status).not.toBe("closed");
+    expect(feature.labels ?? []).toContain("stage:in-review");
+  });
+
+  it("poison-parks a legacy epic that BECAME a container between the first board read and the pull", async () => {
+    // PR #85 review: the target's shape is read twice — once at handler start, once after step 0's
+    // shared-board pull. On a shared board another machine can attach a feature in between, turning
+    // a legacy epic into a container. Carrying the pre-pull shape forward would run that epic and
+    // execute + CLOSE the freshly-arrived feature as one of its own tickets, shipping a run target
+    // nobody approved. The post-pull revalidation must poison instead.
+    const epicId = await beads.create(repo, {
+      title: "Legacy epic that gains a feature mid-flight",
+      type: "epic",
+      description: "## Goal\nGroup work.",
+    });
+    const taskId = await beads.create(repo, {
+      title: "Legacy child task",
+      type: "task",
+      acceptance: "work file exists",
+    });
+    await beads.link(repo, taskId, epicId, "parent-child");
+    await beads.approve(repo, epicId);
+
+    // The other machine's push lands exactly when this run pulls the shared board.
+    let lateFeatureId = "";
+    const pullSpy = vi.spyOn(beads, "pull").mockImplementation(async () => {
+      if (lateFeatureId) return;
+      lateFeatureId = await beads.create(repo, {
+        title: "Feature pushed by another machine",
+        type: "feature",
+        acceptance: "work file exists",
+      });
+      await beads.link(repo, lateFeatureId, epicId, "parent-child");
+    });
+
+    try {
+      const runner = new JobRunner({
+        db: tdb.db,
+        clock,
+        config: { maxConcurrent: 1, leaseMs: 30_000 },
+      });
+      runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      const jobId = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: epicId },
+      });
+      await runner.tickOnce();
+      await runner.whenIdle();
+
+      const job = await getJob(tdb.db, jobId);
+      expect(job?.status).toBe("parked");
+      expect(job?.lastError).toContain(epicId);
+      expect(job?.lastError).toMatch(/container/i);
+      // Nothing was executed: the late feature is untouched and no PR was opened.
+      const board = await beads.list(repo, ["--status", "all"]);
+      expect(board.find((b) => b.id === lateFeatureId)?.status).not.toBe("closed");
+      expect(board.find((b) => b.id === taskId)?.status).not.toBe("closed");
+      expect(beads.getPrRef(await beads.show(repo, epicId))).toBeUndefined();
+      expect(
+        (await tdb.db.select().from(schema.sessions)).some((s) => s.beadId === lateFeatureId),
+      ).toBe(false);
+    } finally {
+      pullSpy.mockRestore();
+    }
+  });
+
+  it("runs the tickets a feature gained during the pull, instead of implementing itself", async () => {
+    // The mirror case: a feature with no children is its own single ticket, but one that gains its
+    // first ticket across the pull is a grouping target. Reusing the pre-pull shape would dispatch
+    // the feature bead and silently ignore the work just shaped under it.
+    const featureId = await beads.create(repo, {
+      title: "Feature that gains a ticket mid-flight",
+      type: "feature",
+      acceptance: "work file exists",
+      description: "## Goal\nShip it.",
+    });
+    await beads.approve(repo, featureId);
+
+    let lateTaskId = "";
+    const pullSpy = vi.spyOn(beads, "pull").mockImplementation(async () => {
+      if (lateTaskId) return;
+      lateTaskId = await beads.create(repo, {
+        title: "Ticket shaped by another machine",
+        type: "task",
+        acceptance: "work file exists",
+      });
+      await beads.link(repo, lateTaskId, featureId, "parent-child");
+    });
+
+    try {
+      const runner = new JobRunner({
+        db: tdb.db,
+        clock,
+        config: { maxConcurrent: 1, leaseMs: 30_000 },
+      });
+      runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      const jobId = await runner.enqueue({
+        type: "execute-epic",
+        projectId,
+        payload: { projectId, epicBeadId: featureId },
+      });
+      await runner.tickOnce();
+      await runner.whenIdle();
+
+      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+      // The late ticket was the unit of work — dispatched and closed; the feature stayed the
+      // delivery unit, left open and in-review on its one PR.
+      expect((await beads.show(repo, lateTaskId)).status).toBe("closed");
+      const sessions = await tdb.db.select().from(schema.sessions);
+      expect(sessions.some((s) => s.beadId === lateTaskId)).toBe(true);
+      expect(sessions.some((s) => s.beadId === featureId)).toBe(false);
+      const feature = await beads.show(repo, featureId);
+      expect(feature.status).not.toBe("closed");
+      expect(feature.labels ?? []).toContain("stage:in-review");
+    } finally {
+      pullSpy.mockRestore();
+    }
   });
 
   it("resumes past a usage limit skipping already-closed tickets and reusing the worktree", async () => {

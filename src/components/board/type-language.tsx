@@ -1,15 +1,18 @@
-import { BugIcon, LayersIcon, SquareCheckIcon } from "lucide-react";
+import { BugIcon, LayersIcon, PackageIcon, SquareCheckIcon, WrenchIcon } from "lucide-react";
 
 import type { IssueType } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { TYPE_BADGE, TYPE_LABELS, TYPE_TEXT } from "@/components/board/board-utils";
 
-/** The one icon per work type — an epic stacks tickets (Layers), a task is a checkable unit
- * (SquareCheck), a bug is a bug (Bug). Shared by epic cards and standalone chips. */
+/** The one icon per work type — an epic stacks features (Layers), a feature is the shippable unit
+ * (Package), a task is a checkable unit (SquareCheck), a bug is a bug (Bug), a chore is upkeep
+ * (Wrench). Shared by epic cards and standalone chips. */
 const TYPE_ICON: Record<IssueType, typeof BugIcon> = {
   epic: LayersIcon,
+  feature: PackageIcon,
   task: SquareCheckIcon,
   bug: BugIcon,
+  chore: WrenchIcon,
 };
 
 /** The type-hued icon, used as the leading glyph on cards and chips. */

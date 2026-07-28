@@ -8,7 +8,7 @@
  * so those modules can all consume it without reintroducing a board↔tickets import cycle.
  */
 import { beads, type Bead } from "./beads/bd";
-import type { Epic, IssueType, Stage, StandaloneItem, Ticket } from "./types";
+import type { Epic, EpicCrumb, IssueType, Stage, StandaloneItem, Ticket } from "./types";
 
 /** Derived stage for a bead: closed → done; an `in-review` label or PR ref → in-review; an
  * in-progress status or `implementing` label → implementing; otherwise backlog. The PR pointer is
@@ -118,6 +118,92 @@ export function toStandaloneItem(bead: Bead, blockedBy: string[] = []): Standalo
   };
 }
 
+/**
+ * The product epic directly above this bead. One hop, and only to an `epic`: a run target's parent
+ * is its product outcome, while a working-layer bead's parent is another run target — which is
+ * orientation an epic badge would misrepresent. Undefined when there is no such parent, so callers
+ * render no crumb (and the board collects the card in its "No epic" lane) rather than an empty one.
+ */
+export function parentEpicOf(bead: Bead, all: Bead[]): EpicCrumb | undefined {
+  const parentId = beads.parentOf(bead);
+  if (!parentId) return undefined;
+  const parent = all.find((b) => b.id === parentId);
+  if (!parent || !beads.isEpic(parent)) return undefined;
+  return { id: parent.id, title: parent.title, area: labelValue(parent.labels, "area") };
+}
+
+/**
+ * A board CARD — a bead that owns a run and therefore gets its own column card: a `feature` (one
+ * worktree, one PR) or a legacy `epic` with no feature children. A container epic is deliberately
+ * NOT a card: it can't be approved or run (the approve/claim routes 422 it via the same
+ * `isRunTarget` gate), so a card for it would advertise a run that never happens — it surfaces as
+ * the epic badge/swimlane key instead. A parentless task/bug is a run target too, but the board
+ * renders it as a standalone chip rather than a card.
+ */
+export function isBoardCard(bead: Bead, all: Bead[]): boolean {
+  return (beads.isEpic(bead) || bead.issue_type === "feature") && beads.isRunTarget(bead, all);
+}
+
+export interface BoardCards {
+  /** Every bead id that renders as a card. */
+  ids: Set<string>;
+  /** The card a working-layer bead rides on, or undefined when no ancestor is a card. */
+  cardOf: (bead: Bead) => string | undefined;
+}
+
+/**
+ * The board's card index, built once per board build: which beads are cards, and which card each
+ * working-layer bead belongs to. `cardOf` walks the WHOLE parent chain to the nearest card
+ * ancestor, so in a three-level tree (epic → feature → task) the task lands under its FEATURE —
+ * the single hop it used to take attributed it to nothing and dropped it off the board entirely.
+ * Returns undefined when no ancestor is a card (a task directly under a container epic — work no
+ * run ships; it stays visible on the epic detail page and the Tickets list). Guards against a
+ * malformed parent cycle.
+ */
+export function boardCards(all: Bead[]): BoardCards {
+  const byId = new Map(all.map((b) => [b.id, b]));
+  const ids = new Set(all.filter((b) => isBoardCard(b, all)).map((b) => b.id));
+  return {
+    ids,
+    cardOf: (bead: Bead) => {
+      const seen = new Set<string>([bead.id]);
+      let parentId = beads.parentOf(bead);
+      while (parentId && !seen.has(parentId)) {
+        if (ids.has(parentId)) return parentId;
+        seen.add(parentId);
+        const parent = byId.get(parentId);
+        parentId = parent ? beads.parentOf(parent) : undefined;
+      }
+      return undefined;
+    },
+  };
+}
+
+/**
+ * A working-layer bead: neither a card (it owns its own run) nor a container epic (it groups cards
+ * rather than riding on one). These are the beads that ride on a run target as its tickets.
+ */
+export function isRunTicket(bead: Bead, cards: BoardCards): boolean {
+  return !cards.ids.has(bead.id) && !beads.isEpic(bead);
+}
+
+/**
+ * The tickets a run target actually contains: every working-layer DESCENDANT whose nearest card
+ * ancestor is this target (boardCards.cardOf), in board order — not just its direct children.
+ * Depth matters because bd nesting is arbitrary-depth: under `feature → task → subtask` the subtask
+ * ships in the same worktree and the same PR as the task above it, so the board card, the detail
+ * page and the run must all count it. A direct-children-only run would open and merge the feature's
+ * PR while leaving the subtask open under a completed run target — stranded, with no run path left
+ * to reach it. Descent stops at a nested card (it owns its own subtree and its own PR).
+ *
+ * Pure over a bead list, so every consumer — board, epic detail, execute-epic, merge finalization —
+ * derives the same set from one read.
+ */
+export function runTickets(all: Bead[], targetId: string): Bead[] {
+  const cards = boardCards(all);
+  return all.filter((b) => isRunTicket(b, cards) && cards.cardOf(b) === targetId);
+}
+
 export interface ToEpicOptions {
   /** The epic's tickets, already mapped (an orphan/pseudo-epic passes `[toTicket(bead)]`). */
   tickets: Ticket[];
@@ -142,10 +228,21 @@ export interface ToEpicOptions {
   ready?: boolean;
   /** Topological rank from the epic graph (0 = no blockers). Defaults to 0. */
   rank?: number;
+  /** The product epic above this run target (parentEpicOf), for the swimlane grouping. */
+  epic?: EpicCrumb;
 }
 
 /** Missing bead priority sorts after every explicit priority (bd uses 0=critical … 4=lowest). */
 const DEFAULT_PRIORITY = 4;
+
+const ISSUE_TYPES = new Set<string>(["epic", "feature", "task", "bug", "chore"]);
+
+/** The bead's work type, narrowed to the types the UI has language for. A bead with a missing or
+ * unknown type falls back to `epic` — the pre-tier default every card was rendered as. */
+export function issueTypeOf(bead: Bead): IssueType {
+  const type = bead.issue_type ?? "";
+  return ISSUE_TYPES.has(type) ? (type as IssueType) : "epic";
+}
 
 /** Map a bead to the shared Epic view model. `approved` and the chips/prRef are derived from the
  * bead; goal/acceptance are passed in because their source (the lite list bead vs. a `bd show`
@@ -156,6 +253,7 @@ export function toEpic(bead: Bead, opts: ToEpicOptions): Epic {
   return {
     id: bead.id,
     title: bead.title,
+    type: issueTypeOf(bead),
     goal: opts.goal,
     acceptance: opts.acceptance,
     approved: beads.isApproved(bead),
@@ -174,6 +272,7 @@ export function toEpic(bead: Bead, opts: ToEpicOptions): Epic {
     rank: opts.rank ?? 0,
     priority: bead.priority ?? DEFAULT_PRIORITY,
     abandoned: beads.isAbandoned(bead),
+    ...(opts.epic ? { epic: opts.epic } : {}),
     tickets: opts.tickets,
   };
 }

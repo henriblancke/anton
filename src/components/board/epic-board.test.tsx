@@ -24,6 +24,14 @@ const LABEL_TO_STAGE = Object.fromEntries(
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 
+// The board reads its Epic/Area narrowing from the URL; a drag-move is orthogonal to it, so this
+// suite runs on an unfiltered URL. The filter behaviour itself is covered in epic-filter.test.tsx.
+vi.mock("next/navigation", () => ({
+  useSearchParams: () => new URLSearchParams(),
+  usePathname: () => "/projects/tmp",
+  useRouter: () => ({ push: vi.fn(), replace: vi.fn() }),
+}));
+
 // Capture the board's onDragEnd so a test can fire a synthetic drop; stub the rest of the dnd-kit
 // surface the board subtree touches (droppable/draggable hooks, sensors, overlay) as inert.
 let dragEndHandler: ((e: DragEndEvent) => void) | undefined;
@@ -65,6 +73,7 @@ function epic(id: string, stage: Stage): Epic {
   return {
     id,
     title: id,
+    type: "feature",
     approved: false,
     stage,
     assignee: null,

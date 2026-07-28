@@ -17,13 +17,47 @@ This skill is the standalone home for anton's beads conventions — the label / 
 model below travels with it, so a `/shape` or `/scan-triage` run has the full contract from
 anton's assets alone (no external plugin or session-start injection required).
 
-## Issue types
+## Issue types — the three tiers
 
-- `epic` — a coherent, shippable increment. Parent of tickets.
-- `task` — a unit of work; a child of an epic, or an orphan.
-- `bug` — a defect (often from `/scan-triage`); reproduced before a fix.
-- `learning` — a captured correction/insight (usually prefer `.product/learnings.md`; a bead
-  only when it needs a dependency edge).
+Work nests in three tiers, linked with `parent-child`. The middle tier is the one anton runs.
+
+| Tier | What it is | Who reads it |
+|------|------------|--------------|
+| `epic` | A **product outcome** that several features add up to. A container — never run or approved on its own. Carries exactly one `area:` label. | Non-technical stakeholders; the roadmap. |
+| `feature` | One **shippable delivery unit — one worktree, one PR**. **This is what anton runs**, approves, claims, and ships. | The board. |
+| `task` / `bug` / `chore` | The **working layer** — the steps of one feature, executed inside its run. | Engineering only; never leaves the board. |
+
+Also `learning` — a captured correction/insight (usually prefer `.product/learnings.md`; a bead
+only when it needs a dependency edge).
+
+### `epic` has been redefined
+
+`epic` used to mean "a coherent, shippable increment, scoped to one PR". **That meaning is now
+`feature`.** An epic is the tier *above* it: the outcome a handful of features deliver together.
+Approval and execution stay per feature — approving an epic would be one button launching N PRs,
+which is not a gate.
+
+### The nesting rule
+
+`epic → feature → task | bug | chore`. One parent per bead.
+
+- Every `feature` hangs off an `epic`. A feature with no plausible epic is a **question for the
+  user**, never a silent orphan (see the `shape` skill).
+- `task` / `bug` / `chore` hang off **a feature**, never off an epic. A ticket parented straight to
+  an epic is a dead bead: it isn't a run target (it has a parent), and no feature's run covers it.
+  Work that no feature holds — the security page, the ops step — is its own `feature`, or a
+  parentless ticket; it is never a loose child of the epic.
+- A genuine one-off that no epic would honestly hold is a **parentless `task`/`bug`** — a run of
+  one. Don't invent a single-feature epic to avoid it, and never nest a feature under a feature.
+
+### The run-target rule (what anton will actually run)
+
+> A bead is a run target if it is a `feature`, **or** a parentless `task`/`bug`, **or** an `epic`
+> with no `feature` children.
+
+That last clause is the whole migration story: boards shaped before the tiers — epics with task
+children — keep running byte-identically. An epic becomes a container the moment a feature lands
+under it. **Never re-type an existing bead to "migrate" it.**
 
 ## Labels
 
@@ -32,6 +66,7 @@ anton's assets alone (no external plugin or session-start injection required).
 | Label     | Values                                                     | Meaning |
 |-----------|------------------------------------------------------------|---------|
 | `domain:` | `eng`, `marketing`, `bizdev`, `research`, `ops`            | cross-domain classification |
+| `area:`   | project-local product surfaces (`ingest`, `billing`, …); open vocabulary | **epic tier only**, exactly one; the roadmap's Area column and Linear project routing key on it. A different axis from `domain:` — which company function owns the work vs. which product surface it advances |
 | `risk:`   | `low`, `high`                                              | `high` = security / schema / auth / payments / migrations / infra |
 | `agent:`  | `nextjs`, `supabase`, `fastapi`, `pydantic`, `alembic`, … or omitted | which specialist fits |
 | `size:`   | `S`, `M`, `L`                                              | sanity check; `L` on a ticket is a smell — split it |
@@ -43,7 +78,7 @@ anton's assets alone (no external plugin or session-start injection required).
 
 beads gives four; use them deliberately:
 
-- `parent-child` — epic → its tickets.
+- `parent-child` — the tier link: epic → feature → ticket.
 - `blocks` — hard ordering. A blocked ticket never appears in `bd ready`.
 - `related` — soft context link; no ordering effect.
 - `discovered-from` — provenance for work found mid-task.
@@ -62,14 +97,18 @@ execution drives:   ready → in-progress → review → done   (and park/unpark
 
 ## The bead contract
 
-A ticket is not `shaped` until its description contains `## Goal`, `## Acceptance` (checkable
-boxes), `## Context`, `## Out of scope`, `## Verify`. Without these the executor has no spec.
-`/shape` and `/scan-triage` enforce it; `bd lint` checks the Acceptance/Success sections.
+A feature or ticket is not `shaped` until its description contains `## Goal`, `## Acceptance`
+(checkable boxes), `## Context`, `## Out of scope`, `## Verify`. Without these the executor has no
+spec. `/shape` and `/scan-triage` enforce it; `bd lint` checks the Acceptance/Success sections.
 
-## Create a shaped ticket
+An epic is read, not executed, so it carries less: a one-line outcome, Success Criteria its
+features add up to, and its `area:` label.
+
+## Create a shaped feature or ticket
 
 Map the bead contract to native fields; put `Goal`, `Out of scope`, and `Verify` in the
-description (markdown), Acceptance and Context in their own fields:
+description (markdown), Acceptance and Context in their own fields. Same shape at both tiers —
+`--type feature` for the run target, `--type task` (or `bug`/`chore`) for its children:
 
 ```bash
 bd create "Add CSV export button" \
@@ -88,22 +127,46 @@ Let users export the reports view to CSV so they can share numbers. Requested by
 EOF
 ```
 
-Then label and link (below). Run `bd lint <id>` — it enforces Acceptance (task) / Success
-Criteria (epic); `/shape` and `/scan-triage` enforce the rest of the contract.
+Then label and link (below). Run `bd lint <id>` — it enforces Acceptance Criteria (`task`, `bug`,
+`feature`) / Success Criteria (`epic`); `/shape` and `/scan-triage` enforce the rest of the
+contract.
 
-## Epic + children
+## Epic → feature → tickets
+
+Create the parent first, then link each child to it — the child is `bd link`'s first argument:
 
 ```bash
-bd create "CSV export" --type epic --acceptance $'- [ ] users can export every report view'
+# The outcome. Several features add up to it; it is never run itself.
+bd create "Reports are shareable outside the app" --type epic \
+  --acceptance $'- [ ] every report view leaves the app in a format a customer can open'
 # → EPIC_ID
-bd create "Add export button" --type task ...           # → T1
-bd link "$T1" "$EPIC_ID" --type parent-child             # T1 is child of EPIC
+bd tag "$EPIC_ID" area:reports                           # exactly one area: on an epic
+
+# The run target: one worktree, one PR.
+bd create "CSV export" --type feature --acceptance ...   # → FEAT_ID
+bd link "$FEAT_ID" "$EPIC_ID" --type parent-child        # feature is child of epic
+
+# The working layer, executed inside the feature's run.
+bd create "Add export button" --type task ...            # → T1
+bd link "$T1" "$FEAT_ID" --type parent-child             # T1 is child of the feature
+```
+
+Find the epic a feature belongs to before creating a new one:
+
+```bash
+bd list --type epic --json                 # open epics; add --all to include closed
+bd list --label area:reports --json        # everything already on that surface
+bd children <epic-id>                      # the full tree under an epic
 ```
 
 ## Labels
 
+`bd tag` takes **one** label per call, so set the set at create time and use `bd update` to patch:
+
 ```bash
-bd tag <id> domain:eng risk:low agent:nextjs size:S
+bd create ... --labels domain:eng,risk:low,agent:nextjs,size:S
+bd update <id> --add-label risk:high --add-label agent:supabase   # repeatable
+bd tag <epic-id> area:reports           # one label; epic tier only, exactly one value
 # /scan-triage also tags: source:stringer  stringer:<collector>:<hash>  (dedup fingerprint)
 ```
 
@@ -141,3 +204,7 @@ contract. But their **entities** (a customer, competitor, content calendar) live
 - Don't store business entities (customers, deals, content) as beads — those are markdown in
   `.product/entities/`.
 - Don't invent statuses; use `bd statuses` to see valid ones.
+- Don't scope an `epic` to one PR — that's a `feature` now. And don't re-type beads already on the
+  board to fit the tiers; the run-target rule keeps them running as they are.
+- Don't leave a `feature` parentless to avoid picking an epic, and don't mint a one-feature epic to
+  avoid asking. Ask the user.

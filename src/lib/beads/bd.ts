@@ -69,8 +69,10 @@ function parseRunLease(label: string): { expiry: number | undefined; owner: stri
 }
 
 /** The managed-metadata label prefixes anton edits. Control labels (approved, stage:*,
- * source:*) are NOT in this set and are never touched by a patch. */
-export const LABEL_PREFIXES = ["agent", "risk", "size", "domain"] as const;
+ * source:*) are NOT in this set and are never touched by a patch.
+ * `area` is the epic tier's product-surface designator — its own axis, deliberately not folded into
+ * `domain:` (.product/decisions/2026-07-26-engine-designator-prefix.md). */
+export const LABEL_PREFIXES = ["agent", "risk", "size", "domain", "area"] as const;
 export type LabelPrefix = (typeof LABEL_PREFIXES)[number];
 
 /**
@@ -497,7 +499,7 @@ export const beads = {
     cwd: string,
     opts: {
       title: string;
-      type: "epic" | "task" | "bug";
+      type: "epic" | "feature" | "task" | "bug" | "chore";
       acceptance?: string;
       context?: string;
       description?: string; // Goal / Out of scope / Verify (markdown)
@@ -718,17 +720,49 @@ export const beads = {
   isApproved: (b: Bead) => b.labels?.includes(LABELS.approved) ?? false,
   isEpic: (b: Bead) => b.issue_type === "epic",
 
+  /** The bead's parent id, from whichever field the bd read populated (`list` vs `show`). */
+  parentOf: (b: Bead): string | undefined => (b.parent ?? b.parent_id) as string | undefined,
+
   /**
-   * A bead anton can execute as a run: an epic (all its children batch into one PR) OR a
-   * parentless task/bug (an "epic-of-one" — runs as a single-ticket run: branch anton/<id>, its
-   * own PR, ticket closed). A task/bug WITH a parent is a child ticket, executed as part of its
-   * epic's run, not a run target on its own; every other type (learning, molecule, …) is never
-   * runnable. Shared by execute-epic (the run gate) and the approve route (validating targets
-   * before enqueue) so both agree on what "runnable" means.
+   * A bead that GROUPS run targets rather than being one: an epic with at least one `feature`
+   * child. Each feature is its own run (own worktree, own PR), so executing or approving the epic
+   * above them would be one button launching N PRs — not a gate. The rule is structural, not
+   * type-only, so no existing bead needs re-typing: an epic becomes a container the moment a
+   * feature lands under it (docs/design/2026-07-26-tier-and-linear-ux.md).
    */
-  isRunTarget: (b: Bead) =>
-    beads.isEpic(b) ||
-    ((b.issue_type === "task" || b.issue_type === "bug") && !(b.parent ?? b.parent_id)),
+  isContainer: (b: Bead, board: Bead[]): boolean =>
+    beads.isEpic(b) && board.some((c) => c.issue_type === "feature" && beads.parentOf(c) === b.id),
+
+  /**
+   * A bead anton can execute as a run: a `feature` (the shippable delivery unit — one worktree,
+   * one PR), a parentless task/bug (an "epic-of-one" — a single-ticket run), or a legacy `epic`
+   * with no feature children (its own children batch into one PR, exactly as before the tier
+   * split). A task/bug WITH a parent is a child ticket, executed as part of its run target's run;
+   * every other type (chore, learning, molecule, …) is never runnable on its own. Shared by
+   * execute-epic (the run gate) and the approve route (validating targets before enqueue) so both
+   * agree on what "runnable" means.
+   *
+   * `board` — the bead list the container check reads — is REQUIRED, deliberately: a permissive
+   * default would answer the pre-tier question (every epic is runnable) at every boundary that
+   * holds only a single `bd show` bead, letting a container epic be claimed, PR-linked and moved
+   * to review, after which review-fix would run it and close its feature children on merge. Every
+   * classification site loads the full list already; pass it.
+   */
+  isRunTarget: (b: Bead, board: Bead[]): boolean =>
+    b.issue_type === "feature" ||
+    (beads.isEpic(b) && !beads.isContainer(b, board)) ||
+    ((b.issue_type === "task" || b.issue_type === "bug") && !beads.parentOf(b)),
+
+  /**
+   * Does this run target execute its CHILDREN as its tickets, rather than being its own single
+   * ticket? An epic always groups (a childless one is a poison run, exactly as before the tier
+   * split); a feature groups only once tickets are shaped under it — a feature shaped as one unit
+   * of work IS its own ticket. Everything else is a leaf. Shared by execute-epic (which tickets a
+   * run works through) and epic-detail (which tickets its page shows) so the run and its detail
+   * page never disagree about what the target contains.
+   */
+  groupsChildren: (b: Bead, children: Bead[]): boolean =>
+    beads.isEpic(b) || (b.issue_type === "feature" && children.length > 0),
 
   // ── cross-machine run-liveness lease (anton-jz1) ──
 

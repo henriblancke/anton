@@ -1,24 +1,13 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { getTickets } from "@/lib/tickets";
-import type { TicketFilters } from "@/lib/types";
+import { TICKET_FILTER_KEYS, type TicketFilters } from "@/lib/types";
 import { resolveProject } from "../resolve-project";
 
 export const dynamic = "force-dynamic";
 
-const FILTER_KEYS: (keyof TicketFilters)[] = [
-  "agent",
-  "risk",
-  "size",
-  "domain",
-  "status",
-  "type",
-  "epic",
-  "q",
-];
-
 function parseFilters(searchParams: URLSearchParams): TicketFilters {
   const filters: TicketFilters = {};
-  for (const key of FILTER_KEYS) {
+  for (const key of TICKET_FILTER_KEYS) {
     const value = searchParams.get(key);
     if (value) filters[key] = value;
   }

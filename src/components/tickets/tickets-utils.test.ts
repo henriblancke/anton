@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { TicketFilters, TicketRow } from "@/lib/types";
 import {
   TICKET_FILTER_FIELDS,
+  TICKET_FILTER_KEYS,
   filtersFromSearchParams,
   hasActiveFilters,
   searchParamsFromFilters,
@@ -143,7 +144,23 @@ describe("sortTicketsByCreated", () => {
 describe("TICKET_FILTER_FIELDS", () => {
   it("covers every select-driven filter field", () => {
     expect(TICKET_FILTER_FIELDS.map((f) => f.key).sort()).toEqual(
-      ["agent", "domain", "epic", "outcome", "risk", "size", "status", "type"].sort(),
+      ["agent", "assigned", "domain", "epic", "outcome", "risk", "size", "status", "type"].sort(),
     );
+  });
+
+  // Every select-driven field must also be a serialized key, or the toolbar would render a control
+  // whose value is dropped from the URL and never reaches getTickets — the bug that left `outcome`
+  // wired to nothing in the page and the API route.
+  it("only offers fields that round-trip through the query string", () => {
+    for (const field of TICKET_FILTER_FIELDS) {
+      expect(TICKET_FILTER_KEYS).toContain(field.key);
+    }
+  });
+
+  it("serializes and reads back the unassigned filter", () => {
+    expect(ticketsQueryString({ assigned: "unassigned" })).toBe("?assigned=unassigned");
+    expect(
+      filtersFromSearchParams(new URLSearchParams("assigned=unassigned")).assigned,
+    ).toBe("unassigned");
   });
 });

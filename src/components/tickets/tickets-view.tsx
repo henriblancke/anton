@@ -216,6 +216,10 @@ function TicketsTable({
         {rows.map((ticket, i) => {
           const isDone = ticket.stage === "done";
           const isEpic = ticket.type === "epic";
+          // A feature is a run target of its own — one worktree, one PR — so it deep-links to its
+          // detail page like an epic instead of opening the ticket dialog, whose claim/PR/abandon
+          // controls all speak for a CHILD ticket (they'd act on the parent epic's run).
+          const hasOwnPage = isEpic || ticket.type === "feature";
           const titleClass = cn(
             "min-w-0 truncate text-left text-[13px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
             ticket.abandoned
@@ -235,7 +239,7 @@ function TicketsTable({
               {/* The chip rides beside the title: this row has no status column, and a struck-out
                   title alone reads the same as a shipped one. */}
               <span className="flex min-w-0 items-center gap-2">
-                {isEpic ? (
+                {hasOwnPage ? (
                   <Link
                     href={`/projects/${slug}/epics/${ticket.id}`}
                     className={titleClass}

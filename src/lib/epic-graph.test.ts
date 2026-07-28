@@ -19,6 +19,10 @@ function epic(id: string, extra: Partial<Bead> = {}): Bead {
 function ticket(id: string, parent: string, extra: Partial<Bead> = {}): Bead {
   return { id, title: id, status: "open", issue_type: "task", parent, ...extra };
 }
+/** A feature — the run target under the tier split, so the rollup stops here, not at the epic. */
+function feature(id: string, parent?: string, extra: Partial<Bead> = {}): Bead {
+  return { id, title: id, status: "open", issue_type: "feature", parent, ...extra };
+}
 /** A blocks edge — attach the returned dep to any bead's `dependencies`. `from` is blocked by `to`. */
 function blocks(from: string, to: string, type = "blocks"): BeadDep {
   return { issue_id: from, depends_on_id: to, type };
@@ -63,6 +67,66 @@ describe("computeEpicGraph", () => {
     expect(g.edges[0]).toMatchObject({ from: "E1", to: "E2", direct: false, inferred: true });
     expect(node(g, "E1").blockedBy).toEqual(["E2"]);
     expect(node(g, "E1").ready).toBe(false);
+  });
+
+  it("rolls a task-level block up to its FEATURE in a three-level tree, not to the epic", () => {
+    // epic → feature → task. Both tasks share one epic, so a single-hop rollup collapsed them to a
+    // self-edge and dropped the dependency entirely; the feature is the run target, so the edge
+    // belongs between the two features.
+    const g = graphOf([
+      epic("E"),
+      feature("F1", "E"),
+      feature("F2", "E"),
+      ticket("T1", "F1", { dependencies: [blocks("T1", "T2")] }),
+      ticket("T2", "F2"),
+    ]);
+
+    expect(g.edges).toHaveLength(1);
+    expect(g.edges[0]).toMatchObject({ from: "F1", to: "F2", direct: false, inferred: true });
+    expect(node(g, "F1").blockedBy).toEqual(["F2"]);
+    expect(node(g, "F1").ready).toBe(false);
+    expect(node(g, "F2").ready).toBe(true);
+    expect(node(g, "F2").rank).toBe(0);
+    expect(node(g, "F1").rank).toBe(1);
+    // The epic above them ships nothing itself, so it inherits neither the edge nor the block.
+    expect(node(g, "E").blockedBy).toEqual([]);
+    expect(node(g, "E").ready).toBe(true);
+  });
+
+  it("rolls a task under a feature under DIFFERENT epics up to the features", () => {
+    const g = graphOf([
+      epic("E1"),
+      epic("E2"),
+      feature("F1", "E1"),
+      feature("F2", "E2"),
+      ticket("T1", "F1", { dependencies: [blocks("T1", "T2")] }),
+      ticket("T2", "F2"),
+    ]);
+
+    expect(g.edges).toHaveLength(1);
+    expect(g.edges[0]).toMatchObject({ from: "F1", to: "F2" });
+    expect(node(g, "E1").ready).toBe(true);
+  });
+
+  it("keeps a direct feature→feature block direct, and an epic→epic block on container epics", () => {
+    const g = graphOf([
+      epic("E1"),
+      epic("E2", { dependencies: [blocks("E2", "E1")] }),
+      feature("F1", "E1"),
+      feature("F2", "E2", { dependencies: [blocks("F2", "F1")] }),
+    ]);
+
+    expect(g.edges).toHaveLength(2);
+    expect(g.edges).toContainEqual(
+      expect.objectContaining({ from: "F2", to: "F1", direct: true, inferred: false }),
+    );
+    // A container epic isn't runnable, but its own sequencing still stands — dropping it would
+    // under-report blockers, which is exactly what the rollup exists to prevent.
+    expect(g.edges).toContainEqual(
+      expect.objectContaining({ from: "E2", to: "E1", direct: true, inferred: false }),
+    );
+    expect(node(g, "F2").blockedBy).toEqual(["F1"]);
+    expect(node(g, "E2").blockedBy).toEqual(["E1"]);
   });
 
   it("drops self-edges (both tickets under the same epic) and dedupes parallel rollups", () => {
@@ -214,6 +278,26 @@ describe("standaloneBlockers", () => {
     expect(standaloneBlockers(beads, "S")).toEqual([]);
   });
 
+  it("gates on the FEATURE that ships a blocker, not the epic above it", () => {
+    // C closes at commit, but its code lands only when F's PR merges — F is the run target, so the
+    // gate is F. A single-hop rollup found no epic parent and gated on C itself, releasing S early.
+    const beads = [
+      standalone("S", { dependencies: [blocks("S", "C")] }),
+      epic("E"),
+      feature("F", "E", { labels: ["stage:in-review"] }),
+      ticket("C", "F", { status: "closed" }),
+    ];
+    expect(standaloneBlockers(beads, "S")).toEqual(["F"]);
+
+    const shipped = [
+      standalone("S", { dependencies: [blocks("S", "C")] }),
+      epic("E"),
+      feature("F", "E", { status: "closed" }),
+      ticket("C", "F", { status: "closed" }),
+    ];
+    expect(standaloneBlockers(shipped, "S")).toEqual([]);
+  });
+
   it("dedupes two epic-child blockers of the same epic to one epic id", () => {
     const beads = [
       standalone("S", { dependencies: [blocks("S", "C1"), blocks("S", "C2")] }),
@@ -265,6 +349,24 @@ describe("epicStandaloneBlockers", () => {
   it("treats an unknown blocker (absent from the list) as still open — fail safe", () => {
     const beads = [epic("E", { dependencies: [blocks("E", "GONE")] })];
     expect(epicStandaloneBlockers(beads, "E")).toEqual(["GONE"]);
+  });
+
+  it("recovers a FEATURE's dropped standalone blocker, including one from its own subtree", () => {
+    const beads = [
+      epic("E"),
+      feature("F", "E"),
+      ticket("T", "F", { dependencies: [blocks("T", "B")] }),
+      standalone("B"),
+    ];
+    expect(epicStandaloneBlockers(beads, "F")).toEqual(["B"]);
+    // The blocker belongs to the feature that ships T, so the epic above must not double-count it.
+    expect(epicStandaloneBlockers(beads, "E")).toEqual([]);
+  });
+
+  it("ignores a feature blocker — the rollup already carries it (no double-count)", () => {
+    const beads = [epic("E", { dependencies: [blocks("E", "F")] }), feature("F")];
+    expect(node(graphOf(beads), "E").blockedBy).toEqual(["F"]);
+    expect(epicStandaloneBlockers(beads, "E")).toEqual([]);
   });
 
   it("returns [] for a non-epic / unknown target", () => {

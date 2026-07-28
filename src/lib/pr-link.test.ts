@@ -80,36 +80,49 @@ describe("planPrLink", () => {
   const IN_REVIEW = LABELS.stage("in-review");
   const IMPLEMENTING = LABELS.stage("implementing");
 
+  const IN_REVIEW_OPS = [
+    { kind: "tag", labels: [IN_REVIEW] },
+    { kind: "untag", labels: [IMPLEMENTING] },
+  ];
+
   it("flips an open epic to in-review (tag in-review, untag implementing)", () => {
     const epic = makeBead({ id: "e-1", issue_type: "epic", labels: [IMPLEMENTING] });
-    const plan = planPrLink(epic, "gh-44");
+    const plan = planPrLink(epic, "gh-44", [epic]);
     expect(plan.ref).toBe("gh-44");
-    expect(plan.stageOps).toEqual([
-      { kind: "tag", labels: [IN_REVIEW] },
-      { kind: "untag", labels: [IMPLEMENTING] },
-    ]);
+    expect(plan.stageOps).toEqual(IN_REVIEW_OPS);
   });
 
   it("flips an open standalone task/bug (an epic-of-one) to in-review", () => {
     const task = makeBead({ id: "t-1", issue_type: "task" });
-    expect(planPrLink(task, "gh-7").stageOps).toEqual([
-      { kind: "tag", labels: [IN_REVIEW] },
-      { kind: "untag", labels: [IMPLEMENTING] },
-    ]);
+    expect(planPrLink(task, "gh-7", [task]).stageOps).toEqual(IN_REVIEW_OPS);
+  });
+
+  it("flips a feature — the tier that owns the worktree and the PR", () => {
+    const epic = makeBead({ id: "e-1", issue_type: "epic" });
+    const feature = makeBead({ id: "f-1", issue_type: "feature", parent_id: "e-1" });
+    expect(planPrLink(feature, "gh-8", [epic, feature]).stageOps).toEqual(IN_REVIEW_OPS);
+  });
+
+  it("does NOT flip a container epic — its features each carry their own PR (ref only)", () => {
+    // Without the board the container reads as a plain epic and would be swept by review-fix,
+    // whose merge finalization then closes its feature children (anton-9pkk review).
+    const epic = makeBead({ id: "e-1", issue_type: "epic" });
+    const feature = makeBead({ id: "f-1", issue_type: "feature", parent_id: "e-1" });
+    expect(planPrLink(epic, "gh-5", [epic, feature]).stageOps).toEqual([]);
   });
 
   it("does NOT flip a child ticket — it runs via its epic's PR (ref only)", () => {
     const child = makeBead({ id: "t-2", issue_type: "task", parent_id: "e-1" });
-    expect(planPrLink(child, "gh-9").stageOps).toEqual([]);
+    expect(planPrLink(child, "gh-9", [child]).stageOps).toEqual([]);
   });
 
   it("does NOT flip a closed/merged run target back into review (ref only)", () => {
     const closed = makeBead({ id: "e-2", issue_type: "epic", status: "closed" });
-    expect(planPrLink(closed, "gh-3").stageOps).toEqual([]);
+    expect(planPrLink(closed, "gh-3", [closed]).stageOps).toEqual([]);
   });
 
   it("does NOT flip a non-runnable parentless type (learning/chore/etc.)", () => {
     const learning = makeBead({ id: "l-1", issue_type: "learning" });
-    expect(planPrLink(learning, "gh-1").stageOps).toEqual([]);
+    expect(planPrLink(learning, "gh-1", [learning]).stageOps).toEqual([]);
   });
 });
