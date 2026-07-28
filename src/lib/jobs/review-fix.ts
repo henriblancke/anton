@@ -42,6 +42,7 @@ import {
 } from "../projects";
 import { runVerifyGates } from "./shell";
 import { findOpenRunForEpic, updateRun } from "../runs";
+import { runTickets } from "../ticket-view";
 import { appendSessionLog, endSession, startJobSession } from "../sessions";
 import { buildReviewFixPrompt, parseThreadReport, type ThreadOutcome } from "./review-fix-context";
 import { isUsageLimitError, PoisonError } from "./errors";
@@ -91,9 +92,12 @@ function ownedByOperator(b: Bead, operator: string | undefined): boolean {
 
 /**
  * In-review run targets = open run targets tagged stage:in-review that carry a PR external-ref,
- * filtered to the ones this operator may act on. A run target is an epic OR a standalone parentless
- * task/bug (an epic-of-one) — both open a PR and sit in review until it merges, so both must be
- * swept here. A standalone target has no children, so `handleEpic`/`finalizeMergedEpic` treat it as
+ * filtered to the ones this operator may act on. A run target is a feature, a legacy epic with no
+ * feature children, OR a standalone parentless task/bug (an epic-of-one) — each opens a PR and sits
+ * in review until it merges, so each must be swept here. Classification reads the full list (`all`)
+ * so a container epic someone PR-linked by hand is NOT swept: it has no PR of its own, and
+ * `finalizeMergedEpic` would close its feature children on merge.
+ * A standalone target has no children, so `handleEpic`/`finalizeMergedEpic` treat it as
  * an epic with an empty ticket set: fixing feedback runs against its PR branch as usual, and a merge
  * closes the bead itself. (Kept named `inReviewEpics` — the exported handle importers/tests use.)
  *
@@ -109,7 +113,7 @@ export function inReviewEpics(
   const { operator, epicBeadId } = options;
   return all.filter((b) => {
     if (
-      !beads.isRunTarget(b) ||
+      !beads.isRunTarget(b, all) ||
       b.status === "closed" ||
       !(b.labels?.includes(IN_REVIEW) ?? false) ||
       prNumberFromRef(beads.getPrRef(b)) === undefined
@@ -210,7 +214,7 @@ async function handleEpic(args: {
       repo,
       projectId,
       epic,
-      children: childrenOf(all, epic.id),
+      children: runTickets(all, epic.id),
       branch,
     });
     return;
@@ -442,11 +446,6 @@ async function notifyReReview(args: {
 
 // ── merge finalization (anton-ner.5) ──
 
-/** Children of an epic — beads whose parent (inline on `bd list --json`) is the epic. */
-function childrenOf(all: Bead[], epicId: string): Bead[] {
-  return all.filter((b) => ((b.parent ?? b.parent_id) as string | undefined) === epicId);
-}
-
 /**
  * Finalize an epic whose PR merged: close the epic + any still-open child tickets, drop the
  * `stage:in-review` label, remove the merged branch + its worktree, and finalize the run row.
@@ -466,7 +465,7 @@ export async function finalizeMergedEpic(args: {
   repo: string;
   projectId: string;
   epic: Bead;
-  /** The epic's child tickets (open ones are closed alongside the epic). */
+  /** The run target's whole ticket subtree (runTickets); open ones close alongside the epic. */
   children: Bead[];
   /** The merged PR's head branch — the local branch + worktree to clean up. */
   branch: string;

@@ -17,9 +17,11 @@ export const STAGES: Stage[] = ["backlog", "implementing", "in-review", "done"];
  */
 export const MAX_ABANDON_REASON_CHARS = 500;
 
-/** The board's shared type language. An epic renders as a card; a standalone task/bug as a chip.
- * Every other bead issue_type is not board work. */
-export type IssueType = "epic" | "task" | "bug";
+/** The board's shared type language — the three tiers of
+ * docs/design/2026-07-26-tier-and-linear-ux.md: an `epic` is a product outcome spanning features,
+ * a `feature` is the shippable delivery unit anton runs, and `task`/`bug`/`chore` are the working
+ * layer executed as part of their run target's run. Every other bead issue_type is not board work. */
+export type IssueType = "epic" | "feature" | "task" | "bug" | "chore";
 
 export interface Project {
   id: string;
@@ -54,6 +56,13 @@ export interface Ticket {
 export interface Epic {
   id: string;
   title: string;
+  /**
+   * The card's real work type — `feature` for the tier anton now runs, `epic` for a legacy run
+   * target or a product epic, `task`/`bug` for a leaf target rendered as an epic-of-one. The card
+   * and the detail header read their icon, badge and wording off this, so a feature is never
+   * presented as an epic (docs/design/2026-07-26-tier-and-linear-ux.md).
+   */
+  type: IssueType;
   goal?: string; // parsed from the bead description "## Goal" section
   acceptance?: string;
   approved: boolean; // has the `approved` label
@@ -73,6 +82,12 @@ export interface Epic {
   priority: number; // bead priority (0=critical … 4=lowest); backlog tiebreak after rank
   /** Abandoned (closed + `abandoned` label, anton-6xj0) — a won't-do outcome, never a delivery. */
   abandoned: boolean;
+  /**
+   * The product epic this card sits under, when its parent is an `epic` bead — the grouping key for
+   * the board's epic swimlanes (docs/design/2026-07-26-tier-and-linear-ux.md). Absent for a
+   * top-level run target, which collects in the "No epic" lane.
+   */
+  epic?: EpicCrumb;
   tickets: Ticket[];
 }
 
@@ -138,12 +153,39 @@ export interface Board {
   sync: SyncStatusView;
 }
 
+// ── Roadmap page ──
+/**
+ * One product epic on the roadmap — the epic tier's own view, built server-side by buildRoadmap
+ * (lib/roadmap.ts). Deliberately thin: the roadmap is read, not operated, so a row carries only
+ * what its five columns show (docs/design/2026-07-26-tier-and-linear-ux.md).
+ */
+export interface RoadmapRow {
+  id: string;
+  title: string;
+  /** The epic's `area:` designator — what Linear project routing keys on. Absent means the epic
+   * can't be routed, which the row says out loud rather than failing silently at push time. */
+  area?: string;
+  /** bd priority, 0=critical … 4=backlog. Defaulted, never undefined, so the column and the sort
+   * agree — an epic with no explicit priority reads (and orders) as P4. */
+  priority: number;
+  /** `feature` children, excluding abandoned ones. */
+  features: number;
+  /** How many of those features shipped. */
+  shipped: number;
+  /** The tracker ref bd's Linear sync wrote to `external_ref` — displayed, never fetched. */
+  linearRef?: string;
+}
+
 // ── Tickets page ──
 export interface TicketRow extends Ticket {
   type: string; // bead issue_type
   domain?: string;
+  /** Nearest `epic` ancestor — the product outcome this row rolls up to. */
   epicId?: string;
   epicTitle?: string;
+  /** Nearest `feature` ancestor — the run target whose worktree/PR this row ships in. */
+  featureId?: string;
+  featureTitle?: string;
 }
 export interface TicketFilters {
   agent?: string;
@@ -155,8 +197,29 @@ export interface TicketFilters {
   epic?: string;
   /** Abandoned work: "active" hides it, "abandoned" shows only it; unset shows everything. */
   outcome?: string;
+  /** Tier placement: "unassigned" shows only work detached from the tier above it (see
+   * `isUnassigned`), "assigned" only work that is attached; unset shows everything. */
+  assigned?: string;
   q?: string; // free-text over title
 }
+
+/**
+ * Every ticket filter, in one place. The tickets page, its API route, and the filter toolbar all
+ * read this list — they used to each keep their own copy, and `outcome` was silently dropped by two
+ * of the three, leaving the Outcome select wired to nothing.
+ */
+export const TICKET_FILTER_KEYS: (keyof TicketFilters)[] = [
+  "agent",
+  "risk",
+  "size",
+  "domain",
+  "status",
+  "type",
+  "epic",
+  "outcome",
+  "assigned",
+  "q",
+];
 
 // ── Ticket detail popup ──
 export interface TicketDetail extends Ticket {
@@ -190,6 +253,21 @@ export interface EpicDetail {
   tickets: Ticket[];
   edges: DepEdge[]; // among the epic + its tickets
   run?: EpicRun; // the currently-open run for this epic, if any (for "View run" / worktree)
+  /**
+   * The product epic this run target sits under — the breadcrumb's one hop of orientation
+   * (docs/design/2026-07-26-tier-and-linear-ux.md). Absent for a parentless run target, which
+   * renders no crumb at all rather than an empty one.
+   */
+  parentEpic?: EpicCrumb;
+}
+
+/** Just enough of the parent epic to render (and link) its badge. */
+export interface EpicCrumb {
+  id: string;
+  title: string;
+  /** The epic's `area:` designator — the board's Area filter groups badges by it. Absent on an epic
+   * that hasn't been designated yet (.product/decisions/2026-07-26-engine-designator-prefix.md). */
+  area?: string;
 }
 
 /** The open (queued/running/parked) run backing an epic, surfaced on the epic detail. */

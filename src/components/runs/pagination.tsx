@@ -1,17 +1,7 @@
 import Link from "next/link";
 import { ChevronLeftIcon, ChevronRightIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
-
-/** Rows per page for the runs/jobs lists. */
-export const PAGE_SIZE = 25;
-
-/** Clamp a raw `?page` value to a valid 1-based page for `total` rows. */
-export function resolvePage(raw: string | undefined, total: number, pageSize = PAGE_SIZE): number {
-  const totalPages = Math.max(1, Math.ceil(total / pageSize));
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n < 1) return 1;
-  return Math.min(Math.floor(n), totalPages);
-}
+import { PAGE_SIZE, pageHref } from "@/lib/pagination";
 
 /**
  * Prev/next pager driven by a `?page` query param on `basePath`. Server-rendered links (no client
@@ -33,7 +23,7 @@ export function Pagination({
 
   const from = total === 0 ? 0 : (page - 1) * pageSize + 1;
   const to = Math.min(page * pageSize, total);
-  const href = (p: number) => (p <= 1 ? basePath : `${basePath}?page=${p}`);
+  const href = (p: number) => pageHref(basePath, p);
 
   return (
     <div className="flex items-center justify-between gap-2 border-t border-border px-6 py-3">

@@ -169,6 +169,40 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     expect(beads.isApproved(await beads.show(repo, child))).toBe(false);
   });
 
+  it("enqueues a feature and applies the approved label", async () => {
+    // anton-s67y: a feature is THE run target — one worktree, one PR. Approval must label + enqueue.
+    const feature = await beads.create(repo, { title: "Shippable feature", type: "feature" });
+    const res = await POST(jsonRequest("POST"), ctx("approvy", feature));
+    expect(res.status).toBe(200);
+    expect((await res.json()).jobId).toBeTruthy();
+    expect(beads.isApproved(await beads.show(repo, feature))).toBe(true);
+  });
+
+  it("422s a container epic — one with feature children — and points at its features", async () => {
+    // Approval is a per-PR gate. An epic that groups features would approve N PRs with one click,
+    // so it stops being approvable the moment a feature lands under it. The error must say so.
+    const container = await beads.create(repo, { title: "Outcome epic", type: "epic" });
+    const feature = await beads.create(repo, { title: "Feature under it", type: "feature" });
+    await beads.link(repo, feature, container, "parent-child");
+
+    const res = await POST(jsonRequest("POST"), ctx("approvy", container));
+    expect(res.status).toBe(422);
+    const body = await res.json();
+    expect(body.error).toMatch(/container/i);
+    expect(body.error).toMatch(/feature/i);
+    expect(beads.isApproved(await beads.show(repo, container))).toBe(false);
+  });
+
+  it("still approves a legacy epic whose only children are tasks — the migration-free clause", async () => {
+    const legacy = await beads.create(repo, { title: "Legacy epic", type: "epic" });
+    const child = await beads.create(repo, { title: "Legacy child", type: "task" });
+    await beads.link(repo, child, legacy, "parent-child");
+
+    const res = await POST(jsonRequest("POST"), ctx("approvy", legacy));
+    expect(res.status).toBe(200);
+    expect(beads.isApproved(await beads.show(repo, legacy))).toBe(true);
+  });
+
   it("422s a non-work type (molecule) with an honest error and does not approve it", async () => {
     // `beads.create` only makes epic/task/bug; a non-work type needs the raw CLI.
     const out = execFileSync("bd", ["create", "A molecule", "--type", "molecule", "--json"], {

@@ -186,9 +186,10 @@ describe("a probe that blows its budget", () => {
     const { result, ms } = elapsed(() => configureBeadsDoltSync({ repoDir: repo }));
 
     // No remote could be resolved (both probes were killed) — a negative result, not a wiring claim.
-    expect(result.status).toBe("no-remote");
+    expect(result).toMatchObject({ status: "error", detail: expect.stringMatching(/timed out/) });
     expect(ms).toBeLessThan(NO_HANG_MS);
   });
+
 });
 
 describe("the injectable exec seam", () => {
@@ -210,5 +211,26 @@ describe("the injectable exec seam", () => {
 
     expect(result).toMatchObject({ status: "already" });
     expect(calls).toContainEqual(["bd", "dolt", "remote", "list"]);
+  });
+
+  // A killed `bd config get sync.remote` flushes nothing, which parses identically to "not set" —
+  // and falling through from there silently swaps a declared aws:// remote for the git origin. The
+  // timeout has to be its own verdict, so the wiring stops dead (PR #89 review).
+  it("stops on a killed `bd config get sync.remote` instead of falling back to the git origin", () => {
+    mkdirSync(join(repo, ".beads"), { recursive: true });
+    const calls: string[][] = [];
+    const exec = (cmd: string, args: string[]) => {
+      calls.push([cmd, ...args]);
+      if (cmd === "bd" && args[0] === "config") {
+        return { status: null, error: { code: "ETIMEDOUT" }, stdout: "", stderr: "" };
+      }
+      // A perfectly healthy origin — the fallback the timeout must NOT reach for.
+      return { status: 0, stdout: "git@example.com:org/repo.git" };
+    };
+
+    const result = configureBeadsDoltSync({ repoDir: repo, exec });
+
+    expect(result).toMatchObject({ status: "error", detail: expect.stringMatching(/timed out/) });
+    expect(calls).toEqual([["bd", "config", "get", "sync.remote"]]);
   });
 });

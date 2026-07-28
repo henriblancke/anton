@@ -34,6 +34,8 @@ export function pageLabelFromPath(pathname: string | null | undefined): string |
   if (rest === "" || rest === undefined) return "Board";
   const seg = rest.replace(/^\//, "").split("/")[0];
   switch (seg) {
+    case "roadmap":
+      return "Roadmap";
     case "tickets":
       return "Tickets";
     case "epics":

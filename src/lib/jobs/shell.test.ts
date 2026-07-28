@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { KILL_GRACE_ENV, runShell, runVerifyGates } from "./shell";
+import { KILL_GRACE_ENV, MAX_OUTPUT_ENV, runShell, runVerifyGates } from "./shell";
 import type { VerifyGate } from "../projects";
 
 // runVerifyGates is the shared backstop (anton-3oh8) that both execute-epic and review-fix run
@@ -167,6 +167,56 @@ describe("runShell cancellation (anton-jfjw.6)", () => {
     expect(res.ok).toBe(true);
     expect(res.code).toBe(0);
     expect(res.output).toContain("parent-done");
+  });
+});
+
+// A verify gate is an arbitrary operator-configured command, so its output is untrusted in size:
+// a runaway test runner must be killed, not buffered until the server OOMs (PR #89 review).
+describe("runShell output ceiling", () => {
+  let dir: string;
+  const strays: number[] = [];
+
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), "anton-shell-cap-"));
+  });
+
+  afterEach(() => {
+    delete process.env[MAX_OUTPUT_ENV];
+    while (strays.length) {
+      const pid = strays.pop()!;
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // already gone — the point of the test
+      }
+    }
+  });
+
+  afterAll(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("kills the group and rejects once a flooding gate blows the ceiling", async () => {
+    process.env[MAX_OUTPUT_ENV] = "65536";
+    const kidPidFile = join(dir, "flood-kid.pid");
+    // The backgrounded node inherits sh's stdout, so nothing but a group kill ends the flood.
+    const cmd =
+      `${process.execPath} -e 'setInterval(() => {}, 1 << 30)' & echo $! > ${kidPidFile}; ` +
+      `while :; do echo flood-flood-flood-flood-flood-flood; done`;
+
+    const promise = runShell(cmd, dir);
+    await expect(promise).rejects.toMatchObject({ code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" });
+
+    const kidPid = await readPid(kidPidFile);
+    strays.push(kidPid);
+    expect(await waitForDeath(kidPid)).toBe(true);
+  });
+
+  it("leaves a gate under the ceiling untouched", async () => {
+    process.env[MAX_OUTPUT_ENV] = "65536";
+    const res = await runShell("echo under-the-cap", dir);
+    expect(res.ok).toBe(true);
+    expect(res.output).toContain("under-the-cap");
   });
 });
 

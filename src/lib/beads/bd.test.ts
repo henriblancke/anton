@@ -17,24 +17,106 @@ import {
 const bead = (b: Partial<Bead>): Bead => ({ id: "x", title: "x", status: "open", ...b }) as Bead;
 
 describe("beads.isRunTarget", () => {
-  it("accepts an epic (the classic run target)", () => {
-    expect(beads.isRunTarget(bead({ issue_type: "epic" }))).toBe(true);
+  // The five shapes of the runnable rule (docs/design/2026-07-26-tier-and-linear-ux.md).
+  const epic = bead({ id: "e-1", issue_type: "epic" });
+  const featureChild = bead({ id: "f-1", issue_type: "feature", parent: "e-1" });
+  const taskChild = bead({ id: "t-1", issue_type: "task", parent: "e-1" });
+
+  it("accepts a feature — the tier that owns a worktree and a PR", () => {
+    const loose = bead({ id: "f-2", issue_type: "feature" });
+    expect(beads.isRunTarget(loose, [loose])).toBe(true);
+    // Under its epic it is STILL the run target: the epic above it is the container, not the run.
+    expect(beads.isRunTarget(featureChild, [epic, featureChild])).toBe(true);
   });
 
   it("accepts a parentless task or bug (epic-of-one)", () => {
-    expect(beads.isRunTarget(bead({ issue_type: "task" }))).toBe(true);
-    expect(beads.isRunTarget(bead({ issue_type: "bug" }))).toBe(true);
+    const task = bead({ issue_type: "task" });
+    const bug = bead({ issue_type: "bug" });
+    expect(beads.isRunTarget(task, [task])).toBe(true);
+    expect(beads.isRunTarget(bug, [bug])).toBe(true);
   });
 
-  it("rejects a task/bug that has a parent — it's a child ticket, run via its epic", () => {
-    expect(beads.isRunTarget(bead({ issue_type: "task", parent: "bd-1" }))).toBe(false);
-    expect(beads.isRunTarget(bead({ issue_type: "bug", parent_id: "bd-1" }))).toBe(false);
+  it("rejects a task/bug that has a parent — it's a child ticket, run via its run target", () => {
+    const task = bead({ issue_type: "task", parent: "bd-1" });
+    const bug = bead({ issue_type: "bug", parent_id: "bd-1" });
+    expect(beads.isRunTarget(task, [task])).toBe(false);
+    expect(beads.isRunTarget(bug, [bug])).toBe(false);
   });
 
-  it("rejects a non-work type (learning, molecule, …) even when parentless", () => {
-    expect(beads.isRunTarget(bead({ issue_type: "learning" }))).toBe(false);
-    expect(beads.isRunTarget(bead({ issue_type: "molecule" }))).toBe(false);
-    expect(beads.isRunTarget(bead({ issue_type: undefined }))).toBe(false);
+  it("accepts an epic with no feature children — the legacy run target, byte-identical", () => {
+    expect(beads.isRunTarget(epic, [epic, taskChild])).toBe(true);
+    expect(beads.isRunTarget(epic, [epic])).toBe(true);
+  });
+
+  it("rejects an epic that HAS feature children — it is a container, not a run", () => {
+    expect(beads.isRunTarget(epic, [epic, featureChild, taskChild])).toBe(false);
+    // A closed feature still makes it a container: the tier is structural, not lifecycle-bound.
+    expect(beads.isRunTarget(epic, [epic, { ...featureChild, status: "closed" }])).toBe(false);
+  });
+
+  it("rejects a non-work type (chore, learning, molecule, …) even when parentless", () => {
+    for (const type of ["chore", "learning", "molecule", undefined]) {
+      const b = bead({ issue_type: type });
+      expect(beads.isRunTarget(b, [b])).toBe(false);
+    }
+  });
+});
+
+describe("beads.isContainer", () => {
+  const epic = bead({ id: "e-1", issue_type: "epic" });
+
+  it("is true for an epic with a feature child — the bead that groups run targets", () => {
+    const feature = bead({ id: "f-1", issue_type: "feature", parent: "e-1" });
+    expect(beads.isContainer(epic, [epic, feature])).toBe(true);
+    // parent_id is the field `bd show` populates; both must count.
+    const viaParentId = bead({ id: "f-2", issue_type: "feature", parent_id: "e-1" });
+    expect(beads.isContainer(epic, [epic, viaParentId])).toBe(true);
+  });
+
+  it("is false for an epic whose children are only tasks/bugs", () => {
+    const task = bead({ id: "t-1", issue_type: "task", parent: "e-1" });
+    const bug = bead({ id: "b-1", issue_type: "bug", parent: "e-1" });
+    expect(beads.isContainer(epic, [epic, task, bug])).toBe(false);
+    expect(beads.isContainer(epic, [epic])).toBe(false);
+  });
+
+  it("is false for a feature that has children — a feature runs its children, it doesn't group runs", () => {
+    const feature = bead({ id: "f-1", issue_type: "feature" });
+    const task = bead({ id: "t-1", issue_type: "task", parent: "f-1" });
+    const nested = bead({ id: "f-2", issue_type: "feature", parent: "f-1" });
+    expect(beads.isContainer(feature, [feature, task])).toBe(false);
+    expect(beads.isContainer(feature, [feature, nested])).toBe(false);
+  });
+
+  it("does not count a feature parented elsewhere", () => {
+    const other = bead({ id: "f-1", issue_type: "feature", parent: "e-2" });
+    expect(beads.isContainer(epic, [epic, other])).toBe(false);
+  });
+});
+
+describe("beads.groupsChildren", () => {
+  // The rule execute-epic (which tickets a run works through) and epic-detail (which tickets its
+  // page shows) share, so a run and its detail page can't disagree about the target's contents.
+  const child = bead({ id: "t-1", issue_type: "task", parent: "f-1" });
+
+  it("an epic always groups — even a childless one (it poisons as a run, exactly as before)", () => {
+    const epic = bead({ id: "e-1", issue_type: "epic" });
+    expect(beads.groupsChildren(epic, [])).toBe(true);
+    expect(beads.groupsChildren(epic, [child])).toBe(true);
+  });
+
+  it("a feature groups once tickets are shaped under it", () => {
+    const feature = bead({ id: "f-1", issue_type: "feature" });
+    expect(beads.groupsChildren(feature, [child])).toBe(true);
+  });
+
+  it("a feature with no children IS its own ticket — a leaf, not an empty group", () => {
+    expect(beads.groupsChildren(bead({ id: "f-1", issue_type: "feature" }), [])).toBe(false);
+  });
+
+  it("a task/bug is always a leaf", () => {
+    expect(beads.groupsChildren(bead({ id: "t-9", issue_type: "task" }), [child])).toBe(false);
+    expect(beads.groupsChildren(bead({ id: "b-9", issue_type: "bug" }), [])).toBe(false);
   });
 });
 
@@ -231,6 +313,26 @@ describe("buildUpdateArgs", () => {
       "bd-1",
       "--add-label",
       "domain:eng",
+    ]);
+  });
+
+  it("manages `area:` as its own prefix, leaving `domain:` untouched", () => {
+    // The two answer different questions — company function vs product surface — so a bead may
+    // carry both (.product/decisions/2026-07-26-engine-designator-prefix.md).
+    expect(buildUpdateArgs("bd-1", { labels: { area: "ingest" } }, ["domain:eng"])).toEqual([
+      "update",
+      "bd-1",
+      "--add-label",
+      "area:ingest",
+    ]);
+    // Single-valued like every other managed prefix: a new value replaces the old one.
+    expect(buildUpdateArgs("bd-1", { labels: { area: "ingest" } }, ["area:ontology"])).toEqual([
+      "update",
+      "bd-1",
+      "--remove-label",
+      "area:ontology",
+      "--add-label",
+      "area:ingest",
     ]);
   });
 

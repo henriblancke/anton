@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { beads, type Bead } from "@/lib/beads/bd";
+import { refreshAllIssues } from "@/lib/beads/issues";
 import { githubBaseUrl } from "@/lib/git/remote";
 import { linkPr, normalizePrRef } from "@/lib/pr-link";
 import { resolveProject } from "../../../resolve-project";
@@ -12,19 +13,23 @@ export const dynamic = "force-dynamic";
  * implemented by hand. POST { ref } sets the bead's external-ref and, for a still-open run target,
  * moves it to stage:in-review so the review-fix sweep picks it up (see lib/pr-link.ts).
  *
- * Gated on isRunTarget (422 otherwise), mirroring the approve/claim routes: only an epic or a
- * parentless task/bug carries its own PR — a child ticket runs via its epic's PR, so linking a PR
- * to it is meaningless. `ref` accepts 44 / #44 / gh-44 / a full PR url; an unparseable ref, or a
+ * Gated on isRunTarget (422 otherwise), mirroring the approve/claim routes: only a feature, an epic
+ * with no feature children, or a parentless task/bug carries its own PR — a child ticket runs via
+ * its run target's PR, and a container epic's features each carry their own, so linking a PR to
+ * either is meaningless. `ref` accepts 44 / #44 / gh-44 / a full PR url; an unparseable ref, or a
  * full url for a different repo than this project's origin, 400s.
  */
 
 /** Build the 422 reason for a non-run-target, mirroring the approve/claim routes' wording. */
-function notRunnableReason(id: string, target: Bead): string {
+function notRunnableReason(id: string, target: Bead, board: Bead[]): string {
   const parent = (target.parent ?? target.parent_id) as string | undefined;
   const type = target.issue_type ?? "unknown";
+  if (beads.isContainer(target, board)) {
+    return `${id} is a container epic, not a run target — link the PR to one of its features instead; each feature is its own run and its own PR`;
+  }
   return (type === "task" || type === "bug") && parent
     ? `${id} is a child ticket of ${parent} — link the PR to its epic ${parent} instead; a child runs via its epic's PR, not its own`
-    : `${id} is not a run target: type "${type}" — only an epic or a parentless task/bug carries a PR`;
+    : `${id} is not a run target: type "${type}" — only a feature, an epic with no feature children, or a parentless task/bug carries a PR`;
 }
 
 export async function POST(
@@ -57,16 +62,20 @@ export async function POST(
   const ref = parsed.ref;
 
   // Fresh read: the run-target gate and the in-review flip must decide from the true current state.
-  let target: Bead;
-  try {
-    target = await beads.show(project.repoPath, epicId);
-  } catch {
+  // The whole list rather than a single `bd show` — classifying a container epic needs its children
+  // in hand, and linkPr's in-review flip gates on the same predicate.
+  const allBeads = await refreshAllIssues(project.repoPath);
+  const target = allBeads.find((b) => b.id === epicId);
+  if (!target) {
     return NextResponse.json({ error: `Ticket ${epicId} not found on the board` }, { status: 404 });
   }
-  if (!beads.isRunTarget(target)) {
-    return NextResponse.json({ error: notRunnableReason(epicId, target) }, { status: 422 });
+  if (!beads.isRunTarget(target, allBeads)) {
+    return NextResponse.json(
+      { error: notRunnableReason(epicId, target, allBeads) },
+      { status: 422 },
+    );
   }
 
-  await linkPr(project, target, ref);
+  await linkPr(project, target, ref, allBeads);
   return NextResponse.json({ item: await beads.show(project.repoPath, epicId) });
 }

@@ -80,3 +80,85 @@ describe("getEpicDetail read economy", () => {
     expect(bd.list).not.toHaveBeenCalled();
   });
 });
+
+describe("getEpicDetail parent epic (the detail breadcrumb)", () => {
+  beforeEach(() => {
+    resetIssueSnapshots();
+    vi.spyOn(db, "getDb").mockReturnValue({} as never);
+    vi.spyOn(runs, "findOpenRunForEpic").mockResolvedValue(undefined as never);
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it("carries the product epic a feature hangs under", async () => {
+    fakeBd([
+      bead({ id: "e-1", title: "Ontology editing", issue_type: "epic" }),
+      bead({ id: "f-1", title: "Ship the editor", issue_type: "feature", parent: "e-1" }),
+      bead({ id: "t-1", title: "Child", parent: "f-1" }),
+    ]);
+
+    const detail = await getEpicDetail(project, "f-1");
+
+    expect(detail.parentEpic).toEqual({ id: "e-1", title: "Ontology editing" });
+  });
+
+  it("leaves it undefined for a parentless run target", async () => {
+    fakeBd([bead({ id: "e-1", title: "Legacy epic", issue_type: "epic" })]);
+
+    const detail = await getEpicDetail(project, "e-1");
+
+    expect(detail.parentEpic).toBeUndefined();
+  });
+
+  it("leaves it undefined when the parent is not an epic", async () => {
+    fakeBd([
+      bead({ id: "f-1", title: "Ship the editor", issue_type: "feature" }),
+      bead({ id: "t-1", title: "Child", parent: "f-1" }),
+    ]);
+
+    const detail = await getEpicDetail(project, "t-1");
+
+    expect(detail.parentEpic).toBeUndefined();
+  });
+});
+
+/**
+ * A feature is a run target, and once tickets are shaped under it the run works through THOSE
+ * tickets. Its detail page must show the same set (anton-9pkk review): reporting the feature as its
+ * own sole ticket hid the real work, mis-stated progress, and dropped the dependency graph.
+ */
+describe("getEpicDetail feature targets", () => {
+  beforeEach(() => {
+    resetIssueSnapshots();
+    vi.spyOn(db, "getDb").mockReturnValue({} as never);
+    vi.spyOn(runs, "findOpenRunForEpic").mockResolvedValue(undefined as never);
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it("shows a feature's child tickets and the blocks edges among them", async () => {
+    fakeBd([
+      bead({ id: "e-1", title: "Ontology editing", issue_type: "epic" }),
+      bead({ id: "f-1", title: "Ship the editor", issue_type: "feature", parent: "e-1" }),
+      bead({ id: "t-1", title: "Schema", parent: "f-1" }),
+      bead({
+        id: "t-2",
+        title: "UI",
+        parent: "f-1",
+        dependencies: [{ issue_id: "t-2", depends_on_id: "t-1", type: "blocks" }],
+      }),
+    ]);
+
+    const detail = await getEpicDetail(project, "f-1");
+
+    expect(detail.tickets.map((t) => t.id)).toEqual(["t-1", "t-2"]);
+    expect(detail.edges).toContainEqual({ from: "t-2", to: "t-1", type: "blocks" });
+  });
+
+  it("a childless feature stays its own single ticket (a leaf run, like a standalone task)", async () => {
+    fakeBd([bead({ id: "f-1", title: "Ship the editor", issue_type: "feature" })]);
+
+    const detail = await getEpicDetail(project, "f-1");
+
+    expect(detail.tickets.map((t) => t.id)).toEqual(["f-1"]);
+    expect(detail.edges).toEqual([]);
+  });
+});

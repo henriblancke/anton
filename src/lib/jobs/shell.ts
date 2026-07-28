@@ -19,8 +19,19 @@ export interface ShellResult {
  */
 export const KILL_GRACE_ENV = "ANTON_SHELL_KILL_GRACE_MS";
 
+/** Override the captured-output ceiling (tests shrink it). Read per call, like the kill grace. */
+export const MAX_OUTPUT_ENV = "ANTON_SHELL_MAX_OUTPUT";
+
 /** Default window a cancelled gate gets to tear down its own workers before it is killed outright. */
 const DEFAULT_KILL_GRACE_MS = 5_000;
+
+/**
+ * Ceiling on a gate's captured output, matching bd.ts's `BD_MAX_BUFFER`. Gates are arbitrary
+ * operator-configured commands, so a test runner looping on a stack trace can emit output until the
+ * server OOMs; past this the group is killed and the gate fails loud instead of growing without
+ * bound. A full test-suite log is comfortably under it.
+ */
+const DEFAULT_MAX_OUTPUT = 32 * 1024 * 1024;
 
 /**
  * How long to keep draining stdio after the command exits. `close` is the only event that
@@ -33,6 +44,11 @@ const DRAIN_AFTER_EXIT_MS = 2_000;
 function killGraceMs(): number {
   const raw = Number(process.env[KILL_GRACE_ENV]);
   return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_KILL_GRACE_MS;
+}
+
+function maxOutput(): number {
+  const raw = Number(process.env[MAX_OUTPUT_ENV]);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_MAX_OUTPUT;
 }
 
 /**
@@ -92,8 +108,29 @@ export function runShell(cmd: string, cwd: string, signal?: AbortSignal): Promis
       settle(() => reject(abortError()));
     };
 
-    child.stdout?.on("data", (c: Buffer) => (out += c.toString("utf8")));
-    child.stderr?.on("data", (c: Buffer) => (out += c.toString("utf8")));
+    /** maxBuffer parity with bd.ts: kill the group and reject rather than buffer without bound. */
+    const limit = maxOutput();
+    const overflow = () => {
+      killGroup("SIGKILL");
+      settle(() => {
+        // Drop the pipes a leaked descendant is still holding — nothing will read them again.
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        reject(
+          Object.assign(new Error(`gate output exceeded ${limit} bytes: ${cmd}`), {
+            code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+            killed: true,
+          }),
+        );
+      });
+    };
+
+    const capture = (c: Buffer) => {
+      out += c.toString("utf8");
+      if (out.length > limit) overflow();
+    };
+    child.stdout?.on("data", capture);
+    child.stderr?.on("data", capture);
     child.on("error", (err) => settle(() => reject(err)));
     child.on("close", (code) => settle(() => resolve({ ok: code === 0, code, output: out })));
     child.on("exit", (code) => {

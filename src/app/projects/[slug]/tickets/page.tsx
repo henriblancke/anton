@@ -4,7 +4,7 @@ import { TicketsPageFallback, TicketsView } from "@/components/tickets/tickets-v
 import { ticketsQueryString } from "@/components/tickets/tickets-utils";
 import { getProjectBySlug } from "@/lib/projects";
 import { getTickets } from "@/lib/tickets";
-import type { TicketFilters } from "@/lib/types";
+import { TICKET_FILTER_KEYS, type TicketFilters } from "@/lib/types";
 
 export default async function ProjectTicketsPage({
   params,
@@ -16,7 +16,7 @@ export default async function ProjectTicketsPage({
   const { slug } = await params;
   const rawFilters = await searchParams;
   const filters: TicketFilters = {};
-  for (const key of ["agent", "risk", "size", "domain", "status", "type", "epic", "q"] as const) {
+  for (const key of TICKET_FILTER_KEYS) {
     const value = rawFilters[key];
     if (typeof value === "string" && value.trim()) filters[key] = value.trim();
   }

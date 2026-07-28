@@ -3,19 +3,11 @@
  * from the current result set. Kept dependency-free so they're trivially testable (see
  * tickets-utils.test.ts) and reusable from both the filters toolbar and the tickets view.
  */
-import type { TicketFilters, TicketRow } from "@/lib/types";
+import { TICKET_FILTER_KEYS, type TicketFilters, type TicketRow } from "@/lib/types";
 
-export const TICKET_FILTER_KEYS: (keyof TicketFilters)[] = [
-  "agent",
-  "risk",
-  "size",
-  "domain",
-  "status",
-  "type",
-  "epic",
-  "outcome",
-  "q",
-];
+// The canonical list lives beside `TicketFilters` in lib/types, so the page, the API route and this
+// toolbar cannot drift apart. Re-exported for existing importers.
+export { TICKET_FILTER_KEYS };
 
 export interface TicketFilterField {
   key: keyof TicketFilters;
@@ -31,6 +23,13 @@ export const OUTCOME_OPTIONS = [
   { value: "abandoned", label: "Abandoned only" },
 ];
 
+/** Tier placement is a fixed pair, not a value read off the rows: "Unassigned" is the triage view —
+ * work no epic or feature holds, which is work the roadmap doesn't account for and no run ships. */
+export const ASSIGNED_OPTIONS = [
+  { value: "unassigned", label: "Unassigned" },
+  { value: "assigned", label: "Assigned" },
+];
+
 /** Select-driven filter fields, in display order. `q` (free text) is handled separately. */
 export const TICKET_FILTER_FIELDS: TicketFilterField[] = [
   { key: "agent", label: "Agent" },
@@ -40,6 +39,7 @@ export const TICKET_FILTER_FIELDS: TicketFilterField[] = [
   { key: "status", label: "Status" },
   { key: "type", label: "Type" },
   { key: "epic", label: "Epic" },
+  { key: "assigned", label: "Epic/feature", options: ASSIGNED_OPTIONS },
   { key: "outcome", label: "Outcome", options: OUTCOME_OPTIONS },
 ];
 

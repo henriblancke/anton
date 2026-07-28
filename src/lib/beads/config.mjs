@@ -407,7 +407,8 @@ export function isFirstPublishPullOutput(output) {
  *       (re)pointed; pull + verified/retried push attempted. `pushed:false` reports a push that could
  *       not land after `pushAttempts` tries (non-fatal); `firstPublish:true` means the remote is still
  *       empty and the failure must be surfaced loud.
- *   - { status: "error", detail }               — `bd dolt remote add` itself failed
+ *   - { status: "error", detail }               — reading `sync.remote`, or `bd dolt remote add`
+ *       itself, failed (a budget kill included — never a silent fallback to git origin)
  *
  * @param {{ repoDir: string, log?: (msg: string) => void, exec?: (cmd: string, args: string[], timeoutMs?: number) => { status: number|null, stdout?: string, stderr?: string } }} opts
  */
@@ -435,6 +436,9 @@ export function configureBeadsDoltSync(opts = {}) {
   // config declares, it never forces git-origin over a declared remote. NOTE `bd config get` exits 0
   // with "sync.remote (not set in config.yaml)" when unset — parse the text, never the exit code.
   const cfg = exec("bd", ["config", "get", "sync.remote"], localMs);
+  // A killed probe flushes no output, which would read exactly like "not set" and silently wire the
+  // git origin over a deliberately declared remote. Fail loud instead — the budget kill is the news.
+  if (timedOut(cfg)) return { status: "error", detail: failureDetail(cfg, localMs, "") };
   const cfgOut = ((cfg.status ?? 1) === 0 ? (cfg.stdout ?? "") : "").trim();
   const declared = /\(not set/i.test(cfgOut)
     ? undefined

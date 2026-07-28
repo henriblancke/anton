@@ -10,7 +10,8 @@ import { randomUUID } from "node:crypto";
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { ownerOf } from "../beads/claim";
 import { humanNotesPromptBlock } from "../beads/notes";
-import { computeEpicGraph, epicStandaloneBlockers, standaloneBlockers } from "../epic-graph";
+import { computeEpicGraph, epicStandaloneBlockers, isUnit, standaloneBlockers } from "../epic-graph";
+import { runTickets } from "../ticket-view";
 import { loadAgentPrompt } from "../claude/agent-prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
 import { runClaude, type ClaudeEvent, type ClaudeResult } from "../claude/driver";
@@ -118,19 +119,26 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       })
       .catch(() => [] as string[]);
 
-    // Load the run target + (for an epic) its tickets from beads (the source of truth). A target
-    // is an epic OR a parentless task/bug run as an epic-of-one (isRunTarget). Distinguish the two
-    // non-runnable cases so the poison message is honest: a bead that WAS found but isn't a valid
-    // target must not read "not found" (that sends the operator hunting for a missing bead).
+    // Load the run target + (for a grouping target) its tickets from beads (the source of truth).
+    // A target is a feature, a parentless task/bug run as an epic-of-one, or a legacy epic with no
+    // feature children (isRunTarget). Distinguish the non-runnable cases so the poison message is
+    // honest: a bead that WAS found but isn't a valid target must not read "not found" (that sends
+    // the operator hunting for a missing bead), and a container epic must be told it is one.
     let all = await beads.list(repo, ["--status", "all"]);
     let target = all.find((b) => b.id === epicBeadId);
     if (!target) throw new PoisonEpic(`bead ${epicBeadId} not found on the board`);
-    if (!beads.isRunTarget(target)) {
-      const parent = (target.parent ?? target.parent_id) as string | undefined;
+    if (!beads.isRunTarget(target, all)) {
+      if (beads.isContainer(target, all)) {
+        throw new PoisonEpic(
+          `epic ${epicBeadId} is a container, not a run target — it has feature children, and each ` +
+            `feature runs on its own (own worktree, own PR); run one of its features instead`,
+        );
+      }
+      const parent = beads.parentOf(target);
       throw new PoisonEpic(
         `bead ${epicBeadId} is not runnable: type "${target.issue_type ?? "unknown"}"` +
           (parent ? ` with parent ${parent}` : "") +
-          ` — only an epic or a parentless task/bug can be run`,
+          ` — only a feature, a parentless task/bug, or an epic with no feature children can be run`,
       );
     }
     if (!beads.isApproved(target)) {
@@ -143,17 +151,20 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     // resumed) when the abandon landed; a job that was RUNNING is cancelled by the abandon itself.
     if (beads.isAbandoned(target)) return;
 
-    // Compute the epic's open blockers from a board snapshot. An epic's blockers come from the
-    // epic-graph rollup; a standalone task/bug (epic-of-one) never appears there, so derive its
-    // blockers from its own `blocks` edges. An epic also inherits any open standalone (parentless
-    // task/bug) prerequisite that the epic-graph rollup drops (epicStandaloneBlockers) — the same
-    // gap the approve route closes. The epic-vs-standalone shape can't change across a pull, so
-    // capture it here (while `target` is narrowed) and reuse it against the freshly-pulled board in
-    // step 0 — `target` is a `let` reassigned there, so reading it inside this closure would widen
-    // back to `Bead | undefined`.
-    const targetIsEpic = beads.isEpic(target);
+    // Compute the target's open blockers from a board snapshot. A GRAPH UNIT — every feature and
+    // every epic (epic-graph's isUnit) — takes its blockers from the epic-graph rollup, which is
+    // where cross-unit edges inferred from ticket-level `blocks` land; keying on isEpic alone would
+    // send a feature down the standalone path and miss every inferred blocker the approve route
+    // gates on. A standalone task/bug (epic-of-one) never appears in the rollup, so derive its
+    // blockers from its own `blocks` edges. A unit also inherits any open standalone (parentless
+    // task/bug) prerequisite that the rollup drops (epicStandaloneBlockers) — the same gap the
+    // approve route closes. Unit-ness is type-only (isUnit reads `issue_type`), so unlike the
+    // grouping shape it genuinely can't change across a pull — capture it here, while `target` is
+    // narrowed, and reuse it against the freshly-pulled board in step 0; `target` is a `let`
+    // reassigned there, so reading it inside this closure would widen back to `Bead | undefined`.
+    const targetIsUnit = isUnit(target);
     const computeBlockers = (board: Bead[]): string[] =>
-      targetIsEpic
+      targetIsUnit
         ? [
             ...(computeEpicGraph(board).epics.find((n) => n.id === epicBeadId)?.blockedBy ?? []),
             ...epicStandaloneBlockers(board, epicBeadId),
@@ -176,11 +187,20 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       );
     }
 
-    // An epic runs all its children into one PR; a standalone task/bug IS its own single ticket
+    // A grouping target runs all its children into one PR; a leaf target IS its own single ticket
     // (an epic-of-one). The rest of the pipeline — worktree, per-ticket claude→tests→commit→close,
-    // one PR — is identical either way, so the standalone case is just a one-element ticket list.
-    const standaloneRun = !beads.isEpic(target);
-    let tickets = standaloneRun ? [target] : childrenOf(all, epicBeadId);
+    // one PR — is identical either way, so the leaf case is just a one-element ticket list.
+    // An epic always groups (a childless one poisons below, exactly as before the tier split); a
+    // feature groups only once tickets have been shaped under it — a feature shaped as one unit of
+    // work is its own ticket, so it must not poison for having no children. A parentless task/bug
+    // is always a leaf, unchanged. The rule is shared with epic-detail (beads.groupsChildren) so a
+    // run and its detail page never disagree about which tickets the target contains.
+    // The ticket set is the target's whole working-layer SUBTREE (runTickets), the same set the
+    // board card displays and counts — a direct-children run would merge the PR while leaving a
+    // deeper subtask open under a finished run target.
+    const children = runTickets(all, epicBeadId);
+    let standaloneRun = !beads.groupsChildren(target, children);
+    let tickets = standaloneRun ? [target] : children;
     if (tickets.length === 0) throw new PoisonEpic(`epic ${epicBeadId} has no tickets`);
 
     // Branches keep the `prefix/id` slash (git convention); only the worktree *path* segment is
@@ -289,14 +309,15 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // the stale list would re-run claude and re-commit work the just-pulled board already reflects as
       // done. Re-list here so those remotely-closed tickets are skipped. Best-effort like the pull: a
       // failed re-list keeps the pre-pull snapshot (no worse than before this refresh existed). The
-      // epic/standalone shape can't change across a pull, so `standaloneRun` is derived once above.
+      // target's SHAPE is re-derived from the adopted board too, but in 0a-ter below — after the
+      // completion short-circuit, alongside the other gates that must not fire on a finished run.
       try {
         const fresh = await beads.list(repo, ["--status", "all"]);
         const freshTarget = fresh.find((b) => b.id === epicBeadId);
         if (freshTarget) {
           all = fresh;
           target = freshTarget;
-          tickets = standaloneRun ? [target] : childrenOf(all, epicBeadId);
+          tickets = standaloneRun ? [target] : runTickets(all, epicBeadId);
           // Adopt the fresh bead for the liveness gates too (anton-jz1). When the `show` above failed
           // but this list succeeds, `leaseTarget` still points at the stale pre-pull snapshot — yet the
           // completion short-circuit (step 0a, reads the PR ref via getPrRef) and the foreign-lease gate below
@@ -409,6 +430,31 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
             `resume the run once the blocker(s) complete`,
         );
       }
+
+      // 0a-ter. Re-derive the target's SHAPE against the freshly-pulled board. Runnability and
+      //     grouping are properties of the whole BOARD, not of the bead: another machine can add or
+      //     remove a feature's first child between the top-of-handler list and the pull above. A
+      //     legacy epic that just gained a feature is now a container — carrying the pre-pull shape
+      //     forward would execute (and CLOSE) that unapproved feature as one of its own tickets —
+      //     and a feature that just gained its first ticket must run that ticket instead of
+      //     implementing itself. Recomputed from `all` unconditionally: when the re-list failed,
+      //     `all` is still the pre-pull snapshot and this reproduces the top-of-handler result.
+      //     Placed with 0a-bis for the same reason — AFTER the completion short-circuit, so an epic
+      //     whose PR is already live still settles idempotently instead of parking on a shape change
+      //     that no longer has any work to gate, and BEFORE any lease is adopted or published.
+      if (!beads.isRunTarget(target, all)) {
+        throw new PoisonEpic(
+          beads.isContainer(target, all)
+            ? `epic ${epicBeadId} gained a feature child while this run was queued — it is now a ` +
+              `container, not a run target; run one of its features instead`
+            : `bead ${epicBeadId} is no longer a run target (type "${target.issue_type ?? "unknown"}")` +
+              ` — refusing to execute`,
+        );
+      }
+      const freshChildren = runTickets(all, epicBeadId);
+      standaloneRun = !beads.groupsChildren(target, freshChildren);
+      tickets = standaloneRun ? [target] : freshChildren;
+      if (tickets.length === 0) throw new PoisonEpic(`epic ${epicBeadId} has no tickets`);
 
       if (beads.foreignRunLeaseLive(leaseTarget, clock.now(), runId)) {
         throw new RunAlreadyLiveError(
@@ -1263,10 +1309,6 @@ function selfReportSuffix(selfReport: ReturnType<typeof parseAntonResult>): stri
   return selfReport.outcome === "delivered"
     ? ` The agent self-reported ANTON-RESULT: delivered — a false success on an unchanged tree.`
     : ` The agent self-reported ${formatAntonResult(selfReport)}, corroborating the block.`;
-}
-
-function childrenOf(all: Bead[], epicId: string): Bead[] {
-  return all.filter((b) => ((b.parent ?? b.parent_id) as string | undefined) === epicId);
 }
 
 function labelValue(labels: string[] | undefined, prefix: string): string | undefined {

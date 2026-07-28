@@ -74,12 +74,15 @@ export interface PrLinkPlan {
 /**
  * The writes for linking `ref` to `target`: always set the PR ref (via the seam), and additionally move a
  * still-open RUN TARGET to in-review (tag in-review / untag implementing, via the canonical
- * planMove) so review-fix sweeps it. A child ticket (not a run target) or a closed target gets only
- * the ref — a child runs via its epic's PR, and a closed/merged target must not be dragged back
- * into review just because someone pasted a PR number. Pure so the transition is unit-testable.
+ * planMove) so review-fix sweeps it. A non-run-target (a child ticket, a container epic) or a closed
+ * target gets only the ref — a child runs via its run target's PR, a container's features each carry
+ * their own, and a closed/merged target must not be dragged back into review just because someone
+ * pasted a PR number. `board` is what the run-target classification reads, so a container epic can't
+ * be flipped into a sweep that would close its feature children on merge. Pure so the transition is
+ * unit-testable.
  */
-export function planPrLink(target: Bead, ref: string): PrLinkPlan {
-  const flipToReview = beads.isRunTarget(target) && target.status !== "closed";
+export function planPrLink(target: Bead, ref: string, board: Bead[]): PrLinkPlan {
+  const flipToReview = beads.isRunTarget(target, board) && target.status !== "closed";
   return { ref, stageOps: flipToReview ? planMove(target, "in-review") : [] };
 }
 
@@ -89,8 +92,13 @@ export function planPrLink(target: Bead, ref: string): PrLinkPlan {
  * (mirrors board-move/claim — a sync hiccup never fails the write that already landed locally). The
  * in-review plan only ever yields tag/untag ops; a defensive default ignores anything else.
  */
-export async function linkPr(project: Project, target: Bead, ref: string): Promise<void> {
-  const { stageOps } = planPrLink(target, ref);
+export async function linkPr(
+  project: Project,
+  target: Bead,
+  ref: string,
+  board: Bead[],
+): Promise<void> {
+  const { stageOps } = planPrLink(target, ref, board);
   await beads.setPrRef(project.repoPath, target.id, ref);
   for (const op of stageOps) {
     if (op.kind === "tag") await beads.tag(project.repoPath, target.id, op.labels);

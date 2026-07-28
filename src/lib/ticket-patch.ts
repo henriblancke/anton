@@ -16,13 +16,14 @@ export type ParsedPatch = { patch: BeadPatch } | { error: string };
 
 // A field parser validates one raw value and returns the value to store or a rejection reason.
 export type FieldResult = { value: string | number } | { error: string };
-type FieldParser = (v: unknown) => FieldResult;
+export type FieldParser = (v: unknown) => FieldResult;
 
 const oneOf = (allowed: readonly string[], v: unknown): v is string =>
   typeof v === "string" && allowed.includes(v);
 
 // Reusable parsers, one per shape. Each owns exactly its own validation + error message.
-const nonEmptyString =
+// Exported so the epic patch (epic-patch.ts) validates its shared fields identically.
+export const nonEmptyString =
   (field: string): FieldParser =>
   (v) =>
     typeof v === "string" && v.trim() !== ""
@@ -42,9 +43,44 @@ export const parsePriority: FieldParser = (v) =>
     : { error: `Invalid priority: ${String(v)} (expected integer 0-4)` };
 
 // Where a parsed value lands: a BeadPatch field, or a managed label prefix.
-type FieldSpec =
+export type FieldSpec =
   | { parse: FieldParser; target: "patch"; key: keyof BeadPatch }
   | { parse: FieldParser; target: "labels"; key: LabelPrefix };
+
+/**
+ * Validate a flat field patch against a spec table and fold it into a BeadPatch. Shared by the
+ * ticket dialog and the epic dialog so both enforce the same two rules from one place: an unknown
+ * field is rejected BEFORE any value is validated (so a stray key always wins over a bad value),
+ * and a field absent from the body is left untouched rather than cleared.
+ */
+export function parseFieldSpecs(body: unknown, specs: Record<string, FieldSpec>): ParsedPatch {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    return { error: "Body must be a JSON object" };
+  }
+  const input = body as Record<string, unknown>;
+
+  for (const key of Object.keys(input)) {
+    if (!Object.hasOwn(specs, key)) return { error: `Unknown field: ${key}` };
+  }
+
+  const patch: BeadPatch = {};
+  const labels: Partial<Record<LabelPrefix, string>> = {};
+
+  for (const [key, spec] of Object.entries(specs)) {
+    if (!(key in input)) continue;
+    const result = spec.parse(input[key]);
+    if ("error" in result) return result;
+    if (spec.target === "labels") {
+      labels[spec.key] = result.value as string;
+    } else {
+      patch[spec.key] = result.value as never;
+    }
+  }
+
+  if (Object.keys(labels).length > 0) patch.labels = labels;
+
+  return { patch };
+}
 
 // The flat fields the ticket dialog is allowed to send. Anything else is rejected.
 // `description`/`acceptance` are the contract markdown the dialog composes; both pass straight through.
@@ -62,31 +98,5 @@ const FIELD_SPECS: Record<string, FieldSpec> = {
 };
 
 export function parseTicketPatch(body: unknown): ParsedPatch {
-  if (typeof body !== "object" || body === null || Array.isArray(body)) {
-    return { error: "Body must be a JSON object" };
-  }
-  const input = body as Record<string, unknown>;
-
-  // Reject any unknown field before validating, so an unknown key always wins over a bad value.
-  for (const key of Object.keys(input)) {
-    if (!Object.hasOwn(FIELD_SPECS, key)) return { error: `Unknown field: ${key}` };
-  }
-
-  const patch: BeadPatch = {};
-  const labels: Partial<Record<LabelPrefix, string>> = {};
-
-  for (const [key, spec] of Object.entries(FIELD_SPECS)) {
-    if (!(key in input)) continue;
-    const result = spec.parse(input[key]);
-    if ("error" in result) return result;
-    if (spec.target === "labels") {
-      labels[spec.key] = result.value as string;
-    } else {
-      patch[spec.key] = result.value as never;
-    }
-  }
-
-  if (Object.keys(labels).length > 0) patch.labels = labels;
-
-  return { patch };
+  return parseFieldSpecs(body, FIELD_SPECS);
 }

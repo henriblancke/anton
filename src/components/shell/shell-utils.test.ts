@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { extractProjectSlug, isNavItemActive } from "@/components/shell/shell-utils";
+import {
+  extractProjectSlug,
+  isNavItemActive,
+  pageLabelFromPath,
+} from "@/components/shell/shell-utils";
 
 describe("extractProjectSlug", () => {
   it("extracts the slug from a project root path", () => {
@@ -41,5 +45,17 @@ describe("isNavItemActive", () => {
 
   it("returns false for nullish pathnames", () => {
     expect(isNavItemActive(null, board)).toBe(false);
+  });
+
+  it("matches the roadmap section without claiming a sibling section's route", () => {
+    const roadmap = { label: "Roadmap", href: "/projects/acme/roadmap" };
+    expect(isNavItemActive("/projects/acme/roadmap", roadmap)).toBe(true);
+    expect(isNavItemActive("/projects/acme/tickets", roadmap)).toBe(false);
+  });
+});
+
+describe("pageLabelFromPath", () => {
+  it("labels the roadmap route rather than falling back to Board", () => {
+    expect(pageLabelFromPath("/projects/acme/roadmap")).toBe("Roadmap");
   });
 });

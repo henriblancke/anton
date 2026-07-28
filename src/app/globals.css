@@ -59,8 +59,10 @@
   --color-agent-docker: var(--agent-docker);
   --color-agent-kubernetes: var(--agent-kubernetes);
   --color-type-epic: var(--type-epic);
+  --color-type-feature: var(--type-feature);
   --color-type-task: var(--type-task);
   --color-type-bug: var(--type-bug);
+  --color-type-chore: var(--type-chore);
 
   /* Usage meter ramp — semantic ok/warn/crit, deliberately NOT the indigo accent. */
   --color-usage-ok: var(--usage-ok);
@@ -113,10 +115,13 @@
   --agent-terraform: #c05070;
   --agent-docker: #6a675f;
   --agent-kubernetes: #6a675f;
-  /* Work-type language: epic = the product iris, task = calm blue, bug = warm red. */
+  /* Work-type language: epic = the product iris, feature = shipping green, task = calm blue,
+     bug = warm red, chore = the quiet neutral. */
   --type-epic: #6355e0;
+  --type-feature: #2c9d68;
   --type-task: #2f7fd6;
   --type-bug: #d1483d;
+  --type-chore: #6a675f;
 
   /* Usage meter — green (headroom) → amber (tightening) → red (near limit). */
   --usage-ok: #2c9d68;
@@ -177,10 +182,13 @@
   --agent-terraform: #f26a86;
   --agent-docker: #8b8781;
   --agent-kubernetes: #8b8781;
-  /* Work-type language: epic = the product iris, task = calm blue, bug = warm red. */
+  /* Work-type language: epic = the product iris, feature = shipping green, task = calm blue,
+     bug = warm red, chore = the quiet neutral. */
   --type-epic: #8f82ff;
+  --type-feature: #4fc08a;
   --type-task: #57a8f2;
   --type-bug: #f2685e;
+  --type-chore: #8b8781;
 
   /* Usage meter — green (headroom) → amber (tightening) → red (near limit). */
   --usage-ok: #4fc08a;

@@ -6,14 +6,15 @@ import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import { CheckIcon, CircleSlashIcon, TriangleAlertIcon } from "lucide-react";
 
-import type { EpicDetail, Ticket } from "@/lib/types";
+import type { EpicCrumb, EpicDetail, Ticket } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { ConfirmDeleteButton } from "@/components/ui/confirm-delete-button";
 import { CopyButton } from "@/components/ui/copy-button";
-import { agentDotClass, ticketProgress } from "@/components/board/board-utils";
+import { TYPE_LABELS, agentDotClass, ticketProgress } from "@/components/board/board-utils";
 import { AbandonedChip, MetaChip, RelativeTime, RiskChip, StagePill } from "@/components/atoms";
 import { ClaimControl } from "@/components/board/claim-control";
+import { EpicBadge } from "@/components/board/epic-badge";
 import { PrLinkControl } from "@/components/board/pr-link-control";
 import { DependencyGraph } from "@/components/epic/dependency-graph";
 import { EpicPriorityControl } from "@/components/epic/epic-priority-control";
@@ -65,6 +66,46 @@ function StatusCircle({ ticket }: { ticket: Ticket }) {
     );
   }
   return <span className="size-3.5 shrink-0 rounded-full border-[1.5px] border-subtle" />;
+}
+
+/**
+ * Where this run target sits: Board / [product epic] / this bead. The epic hop is what a `feature`
+ * gains over the old two-tier board (docs/design/2026-07-26-tier-and-linear-ux.md); a run target
+ * with no parent epic — a legacy epic, a standalone task — simply drops that hop.
+ */
+export function DetailBreadcrumb({
+  slug,
+  id,
+  title,
+  parentEpic,
+}: {
+  slug: string;
+  id: string;
+  title: string;
+  parentEpic?: EpicCrumb;
+}) {
+  return (
+    <nav aria-label="Breadcrumb" className="flex min-w-0 items-center gap-2 text-[13px]">
+      <Link
+        href={`/projects/${slug}`}
+        className="shrink-0 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+      >
+        Board
+      </Link>
+      <span className="text-subtle">/</span>
+      {parentEpic && (
+        <>
+          <EpicBadge slug={slug} epic={parentEpic} />
+          <span className="text-subtle">/</span>
+        </>
+      )}
+      <span className="truncate font-medium text-foreground" title={title}>
+        {title}
+      </span>
+      <span className="shrink-0 text-subtle">·</span>
+      <span className="shrink-0 font-mono text-[11px] text-subtle">{id}</span>
+    </nav>
+  );
 }
 
 function SectionLabel({ children }: { children: React.ReactNode }) {
@@ -185,30 +226,22 @@ export function EpicDetailView({
 
   if (!detail) return <EpicDetailSkeleton />;
 
-  const { epic, tickets, edges, run } = detail;
+  const { epic, tickets, edges, run, parentEpic } = detail;
   const { done, total, pct } = ticketProgress({ tickets });
   const inProgress = tickets.filter((t) => t.stage === "implementing").length;
   const inProgressPct = total === 0 ? 0 : Math.round((inProgress / total) * 100);
   const todo = Math.max(0, total - done - inProgress);
   const abandoned = tickets.filter((t) => t.abandoned).length;
   const acceptance = epic.acceptance ? parseAcceptance(epic.acceptance) : [];
+  // The page serves every run target, and a feature is the tier anton runs — so the id line and the
+  // actions name the bead's real type instead of calling everything an epic.
+  const word = TYPE_LABELS[epic.type].toLowerCase();
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       {/* header */}
       <header className="flex h-14 shrink-0 items-center gap-2.5 border-b border-border px-5 sm:px-6">
-        <div className="flex min-w-0 items-center gap-2 text-[13px]">
-          <Link
-            href={`/projects/${slug}`}
-            className="shrink-0 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
-          >
-            Board
-          </Link>
-          <span className="text-subtle">/</span>
-          <span className="truncate font-medium text-foreground" title={epic.title}>
-            {epic.title}
-          </span>
-        </div>
+        <DetailBreadcrumb slug={slug} id={epic.id} title={epic.title} parentEpic={parentEpic} />
         {/* An abandoned epic is closed, so its derived stage is `done` — the chip replaces the Done
             pill outright rather than sitting beside it. */}
         {epic.abandoned ? (
@@ -277,7 +310,7 @@ export function EpicDetailView({
               onClick={() => handleRun(epic.title)}
               disabled={running}
             >
-              {running ? "Starting…" : "Run epic"}
+              {running ? "Starting…" : `Run ${word}`}
             </Button>
           )}
           <Button
@@ -302,7 +335,7 @@ export function EpicDetailView({
           <ConfirmDeleteButton
             onConfirm={() => handleDelete(epic.title)}
             iconOnly
-            title="Delete epic and all its tickets"
+            title={`Delete ${word} and all its tickets`}
           />
         </div>
       </header>
@@ -313,10 +346,10 @@ export function EpicDetailView({
         <div className="flex flex-col gap-5 overflow-y-auto border-border p-5 sm:p-6 lg:border-r">
           <div className="flex flex-col gap-2">
             <span className="flex items-center gap-1.5 font-mono text-[11px] text-subtle">
-              <CopyButton value={epic.id} label="epic id">
+              <CopyButton value={epic.id} label={`${word} id`}>
                 {epic.id}
               </CopyButton>
-              · epic
+              · {word}
             </span>
             <h1 className="font-display text-[22px] leading-tight font-bold tracking-[-0.01em]" title={epic.title}>
               {epic.title}
