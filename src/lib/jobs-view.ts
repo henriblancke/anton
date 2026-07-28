@@ -7,11 +7,14 @@
  * Mirrors runs.ts: uses the shared `getDb()` connection and exposes a pure row→summary mapper so
  * the field extraction (JSON payload parse, timestamp normalization) is unit-testable.
  */
-import { count, desc, eq } from "drizzle-orm";
+import { and, count, desc, eq, inArray } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import type { JobStatus, JobType } from "./jobs/queue";
+import { isJobType, resolveStatusFilter, type JobFilters } from "./jobs-filters";
 
 export type { JobStatus, JobType } from "./jobs/queue";
+export { isActiveJob } from "./jobs-filters";
+export type { JobFilters } from "./jobs-filters";
 
 export interface JobSummary {
   id: string;
@@ -28,13 +31,6 @@ export interface JobSummary {
   createdAt: number;
   /** Epoch seconds. Last transition; for terminal jobs (done/parked/failed) this is the end. */
   updatedAt: number;
-}
-
-/** Statuses that are still in flight — active vs. terminal (kept for audit) grouping. */
-const ACTIVE_JOB_STATUSES: JobStatus[] = ["queued", "running", "parked"];
-
-export function isActiveJob(status: JobStatus): boolean {
-  return ACTIVE_JOB_STATUSES.includes(status);
 }
 
 function toEpoch(value: unknown): number {
@@ -82,24 +78,47 @@ export async function listJobs(projectId: string): Promise<JobSummary[]> {
   return rows.map(toJobSummary);
 }
 
-/** Total job rows for a project — for pagination. */
-export async function countJobs(projectId: string): Promise<number> {
+/**
+ * Project scope plus the optional status/type filter, as one WHERE. Shared by `countJobs` and
+ * `listJobsPaged` so the total and the page can never disagree about what's being shown — a
+ * client-side filter would leave the pager and the "N of M" footer lying about a filtered list.
+ *
+ * Filters are normalized here, not trusted: an unrecognized value falls back to the default
+ * (active-only) view rather than reaching the query.
+ *
+ * Omitting `filters` entirely is distinct from passing `{}`: no argument means an unfiltered
+ * listing (every status, every type), while a filter object opts into the default view — so a
+ * caller that reads filters off the URL gets active-by-default without special-casing "no params".
+ */
+function jobsWhere(projectId: string, filters?: JobFilters) {
+  const conditions = [eq(schema.jobs.projectId, projectId)];
+  if (filters) {
+    const statuses = resolveStatusFilter(filters.status);
+    if (statuses) conditions.push(inArray(schema.jobs.status, statuses));
+    const type = filters.type;
+    if (isJobType(type)) conditions.push(eq(schema.jobs.type, type));
+  }
+  return and(...conditions);
+}
+
+/** Job rows for a project matching the filter — for pagination. */
+export async function countJobs(projectId: string, filters?: JobFilters): Promise<number> {
   const rows = await getDb()
     .select({ n: count() })
     .from(schema.jobs)
-    .where(eq(schema.jobs.projectId, projectId));
+    .where(jobsWhere(projectId, filters));
   return rows[0]?.n ?? 0;
 }
 
-/** One page of jobs, newest activity first, across every type and status. */
+/** One page of filtered jobs, newest activity first. */
 export async function listJobsPaged(
   projectId: string,
-  opts: { limit: number; offset: number },
+  opts: { limit: number; offset: number; filters?: JobFilters },
 ): Promise<JobSummary[]> {
   const rows = await getDb()
     .select()
     .from(schema.jobs)
-    .where(eq(schema.jobs.projectId, projectId))
+    .where(jobsWhere(projectId, opts.filters))
     .orderBy(desc(schema.jobs.updatedAt))
     .limit(opts.limit)
     .offset(opts.offset);

@@ -6,9 +6,10 @@ import { getProjectBySlug } from "@/lib/projects";
 import { countRuns, listRunsPaged, type RunStatus, type RunSummary } from "@/lib/runs";
 import { countJobs } from "@/lib/jobs-view";
 import { cn } from "@/lib/utils";
+import { PAGE_SIZE, resolvePage } from "@/lib/pagination";
 import { fmtDuration, isActiveRun } from "@/components/runs/run-view-utils";
 import { SectionTabs } from "@/components/runs/section-tabs";
-import { PAGE_SIZE, Pagination, resolvePage } from "@/components/runs/pagination";
+import { Pagination } from "@/components/runs/pagination";
 
 export const dynamic = "force-dynamic";
 

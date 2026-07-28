@@ -1,16 +1,18 @@
-import Link from "next/link";
 import { notFound } from "next/navigation";
-import { LayersIcon } from "lucide-react";
 
 import { getProjectBySlug } from "@/lib/projects";
 import { getRunningJobInfos } from "@/lib/jobs/service";
 // Type-only: runner.ts is server-only, but the type is erased at build time.
 import type { LiveJobInfo } from "@/lib/jobs/runner";
+import { jobsQueryString, normalizeJobFilters } from "@/lib/jobs-filters";
 import { countJobs, listJobsPaged } from "@/lib/jobs-view";
 import { countRuns } from "@/lib/runs";
+import { PAGE_SIZE, resolvePage } from "@/lib/pagination";
 import { SectionTabs } from "@/components/runs/section-tabs";
-import { PAGE_SIZE, Pagination, resolvePage } from "@/components/runs/pagination";
+import { Pagination } from "@/components/runs/pagination";
 import { JobList } from "@/components/runs/job-list";
+import { JobsFilters } from "@/components/runs/jobs-filters";
+import { JobsEmptyState } from "@/components/runs/jobs-empty-state";
 
 export const dynamic = "force-dynamic";
 
@@ -19,18 +21,26 @@ export default async function ProjectJobsPage({
   searchParams,
 }: {
   params: Promise<{ slug: string }>;
-  searchParams: Promise<{ page?: string }>;
+  searchParams: Promise<{ page?: string; status?: string; type?: string }>;
 }) {
-  const { slug } = await params;
+  const [{ slug }, query] = await Promise.all([params, searchParams]);
   const project = await getProjectBySlug(slug);
   if (!project) notFound();
 
-  const [total, runsCount] = await Promise.all([countJobs(project.id), countRuns(project.id)]);
-  const { page } = await searchParams;
-  const current = resolvePage(page, total);
-  const jobs = total > 0 ? await listJobsPaged(project.id, {
+  const filters = normalizeJobFilters(query);
+  // Two counts, two jobs: `total` answers "has this project ever queued anything" (the onboarding
+  // gate, and the Jobs tab badge shared with the Runs page); `matching` drives the list, the pager
+  // and the filtered-empty state.
+  const [total, matching, runsCount] = await Promise.all([
+    countJobs(project.id),
+    countJobs(project.id, filters),
+    countRuns(project.id),
+  ]);
+  const current = resolvePage(query.page, matching);
+  const jobs = matching > 0 ? await listJobsPaged(project.id, {
     limit: PAGE_SIZE,
     offset: (current - 1) * PAGE_SIZE,
+    filters,
   }) : [];
 
   // Live handle per running job, read from the runner's in-memory state. Only jobs running on
@@ -59,25 +69,22 @@ export default async function ProjectJobsPage({
       <SectionTabs slug={slug} active="jobs" runsCount={runsCount} jobsCount={total} />
 
       {total === 0 ? (
-        <div className="flex flex-1 flex-col items-center justify-center gap-4 p-8 text-center">
-          <span className="flex size-12 items-center justify-center rounded-xl border border-dashed border-border">
-            <LayersIcon className="size-5 text-subtle" aria-hidden="true" />
-          </span>
-          <div className="flex flex-col gap-1">
-            <p className="text-sm font-semibold">No jobs yet</p>
-            <p className="max-w-sm text-xs leading-relaxed text-subtle">
-              The durable job queue — epic runs, review-fix polls, nightly stringer scans, and orphan
-              grooming — surfaces here once work is approved or a schedule fires.
-            </p>
-          </div>
-          <Link href={`/projects/${slug}/runs`} className="font-mono text-xs text-primary hover:underline">
-            → View runs
-          </Link>
-        </div>
+        <JobsEmptyState slug={slug} filtered={false} />
       ) : (
         <div className="flex flex-1 flex-col">
-          <JobList jobs={jobs} slug={slug} liveJobs={liveJobs} />
-          <Pagination basePath={`/projects/${slug}/jobs`} page={current} total={total} />
+          <JobsFilters />
+          {matching === 0 ? (
+            <JobsEmptyState slug={slug} filtered />
+          ) : (
+            <>
+              <JobList jobs={jobs} slug={slug} liveJobs={liveJobs} />
+              <Pagination
+                basePath={`/projects/${slug}/jobs${jobsQueryString(filters)}`}
+                page={current}
+                total={matching}
+              />
+            </>
+          )}
         </div>
       )}
     </div>
