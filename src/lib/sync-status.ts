@@ -5,6 +5,7 @@
  * The registry (bd.ts) records raw facts — pass lifecycle, the unpushed-commit backlog, timestamps.
  * This collapses them into the one badge kind the operator sees, so a stuck push is never silent:
  *   - failing            a sync pass errored outright — the loud, prominent state
+ *   - stalled            a pass never finished and never errored — wedged past the staleness window
  *   - unpushed-retrying  inbound is current but local commits are queued and being retried
  *   - synced             caught up with the remote
  */
@@ -14,6 +15,7 @@ export type SyncBadgeKind =
   | "unknown"
   | "not-wired"
   | "syncing"
+  | "stalled"
   | "synced"
   | "unpushed-retrying"
   | "failing";
@@ -22,6 +24,9 @@ export function deriveSyncBadge(status: SyncStatusView): SyncBadgeKind {
   switch (status.state) {
     case "syncing":
       return "syncing";
+    case "stalled":
+      // Aged out of `syncing` by the registry: no completion, no error, no spinner to trust.
+      return "stalled";
     case "not-wired":
       return "not-wired";
     case "unknown":

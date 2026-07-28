@@ -11,6 +11,7 @@ function makeSync(over: Partial<SyncStatusView> = {}): SyncStatusView {
     lastPushedAt: Date.now(),
     unpushedCount: 0,
     lastError: null,
+    stalledForMs: null,
     ...over,
   };
 }
@@ -28,6 +29,19 @@ describe("SyncStatusBadge", () => {
     const html = renderToStaticMarkup(<SyncStatusBadge sync={makeSync({ state: "syncing" })} />);
     expect(html).toContain("Syncing");
     expect(html).toContain("animate-spin");
+  });
+
+  it("renders a stalled pass distinctly from a healthy syncing one, with the elapsed time", () => {
+    const html = renderToStaticMarkup(
+      <SyncStatusBadge sync={makeSync({ state: "stalled", stalledForMs: 4 * 3_600_000 })} />,
+    );
+    expect(html).toContain("Sync stalled");
+    // "How long" is the whole signal — a wedge reads as hours stuck, a slow pull never gets here.
+    expect(html).toContain("stuck 4h");
+    // Not the healthy spinner, and not confusable with an outright failure.
+    expect(html).not.toContain("animate-spin");
+    expect(html).not.toContain("Sync failing");
+    expect(html).toContain("border-destructive");
   });
 
   it("surfaces the unpushed count with a retrying label when synced-but-behind", () => {

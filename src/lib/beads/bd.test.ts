@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   beads,
   buildPruneArgs,
@@ -10,6 +10,7 @@ import {
   isNotWiredOutput,
   LABELS,
   runDoltSync,
+  SYNC_STALL_MS,
   type Bead,
 } from "./bd";
 
@@ -821,6 +822,7 @@ describe("createDoltSync", () => {
       lastPushedAt: null,
       unpushedCount: 0,
       lastError: null,
+      stalledForMs: null,
     });
   });
 
@@ -970,5 +972,69 @@ describe("createDoltSync", () => {
     expect(status.lastSyncedAt).toBeTypeOf("number");
     expect(status.lastPushedAt).toBeNull(); // never pushed successfully
     expect(status.unpushedCount).toBe(1); // still ahead — the backlog survives a pull
+  });
+});
+
+describe("sync stall detection (anton-jfjw.3)", () => {
+  /** A bd invocation that never settles — a wedged `bd dolt pull`, the exact failure mode that
+   * leaves the registry pinned at `syncing`: it neither resolves nor rejects, so nothing else runs. */
+  const wedged = () => new Promise<string>(() => {});
+
+  /** Start a pass that hangs forever, and report when its `syncing` stamp was written. */
+  function wedgedPass(): { cwd: string; startedAt: number } {
+    const cwd = `/repo-stalled-${Math.random()}`;
+    const startedAt = Date.now();
+    void createDoltSync(wedged)(cwd); // never settles, by design
+    return { cwd, startedAt };
+  }
+
+  it("ages a pass pinned at 'syncing' past the window into stalled, carrying how long it's been stuck", () => {
+    const { cwd, startedAt } = wedgedPass();
+    const now = startedAt + SYNC_STALL_MS + 60_000;
+    const status = getSyncStatus(cwd, now);
+    expect(status.state).toBe("stalled");
+    expect(status.stalledForMs).toBeGreaterThanOrEqual(SYNC_STALL_MS);
+  });
+
+  it("leaves a slow-but-live pass under the window reading as syncing — no false alarms", () => {
+    const { cwd, startedAt } = wedgedPass();
+    const status = getSyncStatus(cwd, startedAt + SYNC_STALL_MS - 60_000);
+    expect(status.state).toBe("syncing");
+    expect(status.stalledForMs).toBeNull();
+  });
+
+  it("logs the stall once per occurrence, not once per read", () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { cwd, startedAt } = wedgedPass();
+      const now = startedAt + SYNC_STALL_MS + 60_000;
+      for (let i = 0; i < 5; i++) getSyncStatus(cwd, now);
+      const mine = spy.mock.calls.filter((c) => String(c[0]).includes(cwd));
+      expect(mine).toHaveLength(1);
+      expect(String(mine[0][0])).toMatch(/stuck in 'syncing'/);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("surfaces the stall through the board refresh token, and advances it while stuck", () => {
+    const { cwd, startedAt } = wedgedPass();
+    const healthy = getSyncStatusToken(cwd, startedAt);
+    const stalled = getSyncStatusToken(cwd, startedAt + SYNC_STALL_MS + 60_000);
+    expect(healthy).toContain("syncing");
+    expect(stalled).toContain("stalled");
+    // The badge renders a server-computed "stuck Xm" — the token must keep moving or it freezes.
+    expect(getSyncStatusToken(cwd, startedAt + SYNC_STALL_MS + 120_000)).not.toBe(stalled);
+  });
+
+  it("clears the stall clock when a pass completes, so a later slow pass isn't born stalled", async () => {
+    const cwd = `/repo-stall-clear-${Math.random()}`;
+    const sync = createDoltSync(async () => "");
+    const startedAt = Date.now();
+    await sync(cwd);
+    // Long past the window, but the pass finished — a synced repo can never read as stalled.
+    const status = getSyncStatus(cwd, startedAt + SYNC_STALL_MS * 10);
+    expect(status.state).toBe("synced");
+    expect(status.stalledForMs).toBeNull();
   });
 });

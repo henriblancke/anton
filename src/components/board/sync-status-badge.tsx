@@ -6,12 +6,17 @@ import { deriveSyncBadge } from "@/lib/sync-status";
 import type { SyncStatusView } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
-function ago(msEpoch: number, now: number): string {
-  const s = Math.max(0, Math.round((now - msEpoch) / 1000));
-  if (s < 60) return `${s}s ago`;
+/** Coarse, human duration: "42s" / "7m" / "3h". */
+function duration(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
   const m = Math.round(s / 60);
-  if (m < 60) return `${m}m ago`;
-  return `${Math.round(m / 60)}h ago`;
+  if (m < 60) return `${m}m`;
+  return `${Math.round(m / 60)}h`;
+}
+
+function ago(msEpoch: number, now: number): string {
+  return `${duration(now - msEpoch)} ago`;
 }
 
 // A shared 1-second wall-clock exposed through useSyncExternalStore. The server snapshot is `null`,
@@ -61,8 +66,10 @@ const base =
 /**
  * Per-project beads↔Dolt sync health, rendered next to the board. Every state is visible and
  * truthful: a project with no shared remote shows "not wired"; committed-but-unpushed work shows a
- * live count that a heartbeat is retrying; and an outright sync failure is prominent, never a subtle
- * chip — so a stuck push is impossible to miss without reading server logs (anton-rn88).
+ * live count that a heartbeat is retrying; an outright sync failure is prominent, never a subtle
+ * chip; and a pass wedged past the staleness window reads as stalled rather than spinning
+ * indefinitely — so a stuck sync is impossible to miss without reading server logs (anton-rn88,
+ * anton-jfjw.3).
  */
 export function SyncStatusBadge({ sync }: { sync: SyncStatusView }) {
   const now = useLiveNow();
@@ -79,6 +86,22 @@ export function SyncStatusBadge({ sync }: { sync: SyncStatusView }) {
         <span className={cn(base, "border-muted-foreground/30 text-muted-foreground")}>
           <LoaderIcon className="size-3 animate-spin" aria-hidden="true" />
           Syncing…
+        </span>
+      );
+    case "stalled":
+      // A wedged pass never errors, so it would otherwise spin forever. Show it as the failure it
+      // is, with the elapsed time — the whole point is that "how long" is what tells the operator
+      // this is a wedge and not a slow pull (anton-jfjw.3).
+      return (
+        <span
+          className={cn(base, "border-destructive bg-destructive/10 font-semibold text-destructive")}
+          title={`A sync pass started ${
+            sync.stalledForMs === null ? "a while" : duration(sync.stalledForMs)
+          } ago and has neither finished nor failed — the sync process is wedged. Restart anton if it doesn't clear.`}
+        >
+          <TriangleAlertIcon className="size-3.5" aria-hidden="true" />
+          Sync stalled{sync.stalledForMs === null ? "" : ` · stuck ${duration(sync.stalledForMs)}`}
+          {sync.lastSyncedAt && now !== null ? ` · last synced ${ago(sync.lastSyncedAt, now)}` : ""}
         </span>
       );
     case "unpushed-retrying":

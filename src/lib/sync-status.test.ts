@@ -10,6 +10,7 @@ function status(over: Partial<SyncStatusView> = {}): SyncStatusView {
     lastPushedAt: 1000,
     unpushedCount: 0,
     lastError: null,
+    stalledForMs: null,
     ...over,
   };
 }
@@ -19,6 +20,7 @@ describe("deriveSyncBadge", () => {
     expect(deriveSyncBadge(status({ state: "unknown" }))).toBe("unknown");
     expect(deriveSyncBadge(status({ state: "not-wired" }))).toBe("not-wired");
     expect(deriveSyncBadge(status({ state: "syncing" }))).toBe("syncing");
+    expect(deriveSyncBadge(status({ state: "stalled", stalledForMs: 900_000 }))).toBe("stalled");
     expect(deriveSyncBadge(status({ state: "synced" }))).toBe("synced");
     expect(deriveSyncBadge(status({ state: "failing", lastError: "boom" }))).toBe("failing");
   });

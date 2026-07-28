@@ -1,6 +1,6 @@
-import { describe, expect, it, vi } from "vitest";
-import { createDoltSync, getSyncStatus, type SyncRequest } from "./bd";
-import { createSyncEngine, type SyncEngineDeps } from "./sync-engine";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { BD_STEP_TIMEOUT_MS, createDoltSync, getSyncStatus, type SyncRequest } from "./bd";
+import { beatDeadlineMs, createSyncEngine, type SyncEngineDeps } from "./sync-engine";
 
 const silentLog = { info: () => {}, error: () => {} };
 
@@ -16,6 +16,7 @@ function engineWith(overrides: Partial<SyncEngineDeps> & { sync: SyncEngineDeps[
     heartbeatMs: 10_000,
     notWiredRecheckMs: 60_000,
     maxBackoffMs: 60_000,
+    beatTimeoutMs: 30_000,
     log: silentLog,
     now: clock.now,
     ...overrides,
@@ -23,8 +24,16 @@ function engineWith(overrides: Partial<SyncEngineDeps> & { sync: SyncEngineDeps[
   return { engine, clock };
 }
 
+/** A sync that never settles — the wedged `bd dolt pull` this engine has to survive. */
+const wedged = () => new Promise<void>(() => {});
+
 const projects = (...paths: string[]) =>
   Promise.resolve(paths.map((repoPath) => ({ repoPath, hasBeads: true })));
+
+afterEach(() => {
+  vi.useRealTimers();
+  vi.unstubAllEnvs();
+});
 
 describe("createSyncEngine", () => {
   it("pulls every registered beads project on a tick", async () => {
@@ -202,6 +211,99 @@ describe("createSyncEngine", () => {
     expect(getSyncStatus(cwd).state).toBe("synced");
   });
 
+  // ── containment: one wedged repo must not freeze the heartbeat for the rest (anton-jfjw.2) ──
+
+  it("a repo whose sync never settles leaves every other project on its normal cadence", async () => {
+    vi.useFakeTimers();
+    const healthy: number[] = [];
+    const { engine, clock } = engineWith({
+      listProjects: () => projects("/wedged", "/healthy"),
+      sync: (cwd) => {
+        if (cwd === "/wedged") return wedged();
+        healthy.push(clock.now());
+        return Promise.resolve();
+      },
+    });
+
+    const first = engine.tick();
+    await vi.advanceTimersByTimeAsync(30_000); // the wedged beat's deadline
+    await expect(first).resolves.toBeUndefined(); // tick() settles despite the wedge
+    expect(healthy).toEqual([0]);
+
+    clock.advance(10_000);
+    await engine.tick();
+    expect(healthy).toEqual([0, 10_000]); // healthy repo still beating on cadence
+  });
+
+  it("loop() keeps rescheduling while a repo is wedged", async () => {
+    vi.useFakeTimers();
+    let ticks = 0;
+    const { engine } = engineWith({
+      listProjects: () => {
+        ticks += 1;
+        return projects("/wedged");
+      },
+      sync: () => wedged(),
+    });
+    engine.start();
+    await vi.advanceTimersByTimeAsync(120_000);
+    engine.stop();
+    // Pre-fix this stopped at 1 forever: tick() never settled, so .finally(loop) never fired.
+    expect(ticks).toBeGreaterThan(3);
+  });
+
+  it("a beat that misses its deadline fails, logs once, and retries on the doubling backoff", async () => {
+    vi.useFakeTimers();
+    const errors: string[] = [];
+    const starts: number[] = [];
+    let release: (() => void) | undefined;
+    const { engine, clock } = engineWith({
+      listProjects: () => projects("/wedged"),
+      sync: () =>
+        new Promise<void>((resolve) => {
+          starts.push(clock.now());
+          release = resolve;
+        }),
+      log: { info: () => {}, error: (msg) => errors.push(msg) },
+    });
+
+    await Promise.all([engine.tick(), vi.advanceTimersByTimeAsync(30_000)]);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain("beat deadline");
+
+    release?.(); // the pass finally completes — its slot frees, the backoff still governs retries
+    await vi.advanceTimersByTimeAsync(0);
+
+    clock.advance(10_000);
+    await engine.tick(); // t=10s — inside the 20s backoff
+    expect(starts).toHaveLength(1);
+
+    clock.advance(10_000);
+    await Promise.all([engine.tick(), vi.advanceTimersByTimeAsync(30_000)]); // t=20s — due again
+    expect(starts).toEqual([0, 20_000]);
+    expect(errors).toHaveLength(1); // same message — one line per distinct error, not per beat
+  });
+
+  it("a repo that keeps timing out accumulates no in-flight beats", async () => {
+    vi.useFakeTimers();
+    let starts = 0;
+    const { engine, clock } = engineWith({
+      listProjects: () => projects("/wedged"),
+      sync: () => {
+        starts += 1;
+        return wedged();
+      },
+    });
+    await Promise.all([engine.tick(), vi.advanceTimersByTimeAsync(30_000)]);
+    expect(starts).toBe(1);
+
+    for (let i = 0; i < 5; i += 1) {
+      clock.advance(60_000); // well past any backoff
+      await engine.tick();
+    }
+    expect(starts).toBe(1); // the wedged pass still holds the only slot — nothing piles up behind it
+  });
+
   it("start() is idempotent and stop() halts the loop", async () => {
     vi.useFakeTimers();
     let ticks = 0;
@@ -219,5 +321,24 @@ describe("createSyncEngine", () => {
     engine.stop();
     expect(ticks).toBe(1);
     vi.useRealTimers();
+  });
+});
+
+describe("beatDeadlineMs", () => {
+  it("floors at the widest legitimate pass — pull + commit + push, each with the full step budget", () => {
+    vi.stubEnv("ANTON_SYNC_BEAT_TIMEOUT_MS", "");
+    // A fast heartbeat must not shrink the deadline below one honest full pass, or a slow-but-
+    // progressing repo gets reported as wedged.
+    expect(beatDeadlineMs(1_000)).toBe(3 * BD_STEP_TIMEOUT_MS);
+  });
+
+  it("scales with the heartbeat once six beats exceed that floor", () => {
+    vi.stubEnv("ANTON_SYNC_BEAT_TIMEOUT_MS", "");
+    expect(beatDeadlineMs(60_000)).toBe(360_000);
+  });
+
+  it("honors an explicit override", () => {
+    vi.stubEnv("ANTON_SYNC_BEAT_TIMEOUT_MS", "5000");
+    expect(beatDeadlineMs(30_000)).toBe(5_000);
   });
 });

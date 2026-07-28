@@ -15,13 +15,77 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 
+/**
+ * Wall-clock budgets for the synchronous probes below (anton-jfjw.4). `spawnSync` BLOCKS the calling
+ * thread, so an unbounded probe — `git ls-files` or `git remote get-url` against a repo whose git
+ * wedges on a dead peer — freezes the caller outright, with no timer that could ever fire. Every
+ * call site here passes one of these budgets plus SPAWN_KILL_SIGNAL.
+ *
+ * Proportionate to the work: `command -v` / `git rev-parse` / `git config --get` are local,
+ * millisecond probes; a `bd` command against the local Dolt workspace is slower; `bd init` /
+ * `bd bootstrap` and the Dolt pull/push talk to the remote and legitimately take minutes on a large
+ * board — a budget short enough to cut those off would break setup, not protect it.
+ *
+ * NOTE `timeout` only signals the DIRECT child (spawnSync has no detached/process-group option).
+ * That's the accepted trade here: these are short-lived local probes and the goal is bounding the
+ * calling thread, not reaping descendants — see bd() (bd.ts) and runShell (src/lib/jobs/shell.ts)
+ * for the async paths that do need process-group cleanup.
+ */
+export const SPAWN_BUDGETS_MS = {
+  /** Local, no network: command -v, git rev-parse/config/ls-files/rm. */
+  probe: 15_000,
+  /** A bd command against the local Dolt workspace (config get/set, dolt remote add/list). */
+  bd: 60_000,
+  /** Talks to the remote: bd init/bootstrap, bd dolt pull/push, git ls-remote. */
+  network: 300_000,
+};
+
+/**
+ * SIGKILL, not spawnSync's SIGTERM default: a budget only bounds the calling thread if the child
+ * cannot ignore the kill. These probes hold no state worth a graceful shutdown.
+ */
+export const SPAWN_KILL_SIGNAL = "SIGKILL";
+
+/**
+ * Resolve a budget, capped by ANTON_BEADS_SPAWN_TIMEOUT_MS when set (tests use a few hundred ms; also
+ * an ops escape hatch). A cap rather than an override so production keeps the proportions above.
+ * Read per call so a change lands without a module reload.
+ */
+function budgetMs(kind) {
+  const raw = Number(process.env.ANTON_BEADS_SPAWN_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? Math.min(SPAWN_BUDGETS_MS[kind], raw) : SPAWN_BUDGETS_MS[kind];
+}
+
+/** True when spawnSync killed this child at its budget — status is null and no output was flushed. */
+function timedOut(r) {
+  return r?.error?.code === "ETIMEDOUT";
+}
+
+/**
+ * Why a spawn failed, in a form an operator can act on. A budget kill leaves status null and empty
+ * output, which would otherwise surface as an opaque `exit ?` and send the reader hunting a cause
+ * that isn't there (the anton-be1s misreport). `output` is the caller's own stdout/stderr pick.
+ */
+function failureDetail(r, timeoutMs, output) {
+  if (timedOut(r)) return `timed out after ${timeoutMs}ms (killed with ${r.signal ?? SPAWN_KILL_SIGNAL})`;
+  return output.trim() || `exit ${r.status ?? "?"}`;
+}
+
 /** True when `cmd` answers on PATH (probes --version/--help, then `command -v`). */
 export function onPath(cmd) {
   for (const probe of [["--version"], ["--help"]]) {
-    const r = spawnSync(cmd, probe, { stdio: "ignore" });
+    const r = spawnSync(cmd, probe, {
+      stdio: "ignore",
+      timeout: budgetMs("probe"),
+      killSignal: SPAWN_KILL_SIGNAL,
+    });
     if (!r.error && (r.status === 0 || r.status === 1)) return true;
   }
-  const r = spawnSync("sh", ["-c", `command -v ${cmd}`], { stdio: "ignore" });
+  const r = spawnSync("sh", ["-c", `command -v ${cmd}`], {
+    stdio: "ignore",
+    timeout: budgetMs("probe"),
+    killSignal: SPAWN_KILL_SIGNAL,
+  });
   return r.status === 0;
 }
 
@@ -69,19 +133,36 @@ export function bdVersionAtLeast(v, min = MIN_BD) {
 
 /** True when `dir` is inside a git work tree. */
 export function isGitWorkTree(dir) {
-  const r = spawnSync("git", ["-C", dir, "rev-parse", "--is-inside-work-tree"], { stdio: "ignore" });
+  const r = spawnSync("git", ["-C", dir, "rev-parse", "--is-inside-work-tree"], {
+    stdio: "ignore",
+    timeout: budgetMs("probe"),
+    killSignal: SPAWN_KILL_SIGNAL,
+  });
   return r.status === 0;
 }
 
 /** True when `dir`'s repo has an `origin` remote configured. */
 export function hasOriginRemote(dir) {
-  const r = spawnSync("git", ["-C", dir, "remote", "get-url", "origin"], { stdio: "ignore" });
+  const r = spawnSync("git", ["-C", dir, "remote", "get-url", "origin"], {
+    stdio: "ignore",
+    timeout: budgetMs("probe"),
+    killSignal: SPAWN_KILL_SIGNAL,
+  });
   return r.status === 0;
 }
 
-/** Read a single git config value for `dir`, or "" when unset. */
+/**
+ * Read a single git config value for `dir`: "" when the key is unset, `null` when the read could not
+ * be completed (budget kill). An UNREADABLE config is not an unset one — collapsing the two would let
+ * a wedged `git config` report a confident "no core.hooksPath" and hide a real override (PR #89).
+ */
 function gitConfigGet(dir, key) {
-  const r = spawnSync("git", ["-C", dir, "config", "--get", key], { encoding: "utf8" });
+  const r = spawnSync("git", ["-C", dir, "config", "--get", key], {
+    encoding: "utf8",
+    timeout: budgetMs("probe"),
+    killSignal: SPAWN_KILL_SIGNAL,
+  });
+  if (timedOut(r)) return null;
   return (r.status ?? 1) === 0 ? (r.stdout || "").trim() : "";
 }
 
@@ -176,7 +257,16 @@ export function ensureBeadsGitignore(beadsDir, entries = BEADS_GITIGNORE_ENTRIES
  */
 export function untrackBeadsExports(dir, entries = BEADS_GITIGNORE_ENTRIES) {
   const paths = entries.map((e) => `.beads/${e}`);
-  const ls = spawnSync("git", ["ls-files", "--", ...paths], { cwd: dir, encoding: "utf8" });
+  const probeMs = budgetMs("probe");
+  const ls = spawnSync("git", ["ls-files", "--", ...paths], {
+    cwd: dir,
+    encoding: "utf8",
+    timeout: probeMs,
+    killSignal: SPAWN_KILL_SIGNAL,
+  });
+  // A killed probe proves nothing about what's tracked, so it must NOT read as the empty "nothing to
+  // untrack" result the caller records as a clean step — report it as the failure it is.
+  if (timedOut(ls)) return { untracked: [], error: failureDetail(ls, probeMs, "") };
   if ((ls.status ?? 1) !== 0) return { untracked: [] };
   const tracked = (ls.stdout || "")
     .split("\n")
@@ -185,8 +275,15 @@ export function untrackBeadsExports(dir, entries = BEADS_GITIGNORE_ENTRIES) {
   if (tracked.length === 0) return { untracked: [] };
 
   // -r so a tracked directory form (dolt/, embeddeddolt/) is removed too.
-  const rm = spawnSync("git", ["rm", "--cached", "-r", "-q", "--", ...tracked], { cwd: dir, encoding: "utf8" });
-  if ((rm.status ?? 1) !== 0) return { untracked: [], error: (rm.stderr || "").trim() };
+  const rm = spawnSync("git", ["rm", "--cached", "-r", "-q", "--", ...tracked], {
+    cwd: dir,
+    encoding: "utf8",
+    timeout: probeMs,
+    killSignal: SPAWN_KILL_SIGNAL,
+  });
+  // The detail must never be empty — the caller keys "did this fail?" off its truthiness, so a
+  // killed `git rm` (status null, no stderr) would otherwise be recorded as a clean no-op.
+  if ((rm.status ?? 1) !== 0) return { untracked: [], error: failureDetail(rm, probeMs, rm.stderr || "") };
   return { untracked: tracked };
 }
 
@@ -249,7 +346,12 @@ export function configYamlHas(beadsDir, key, want) {
  */
 export function ensureBdConfig(dir, beadsDir, key, want) {
   if (configYamlHas(beadsDir, key, want)) return "already";
-  const r = spawnSync("bd", ["config", "set", key, want], { cwd: dir, stdio: "ignore" });
+  const r = spawnSync("bd", ["config", "set", key, want], {
+    cwd: dir,
+    stdio: "ignore",
+    timeout: budgetMs("bd"),
+    killSignal: SPAWN_KILL_SIGNAL,
+  });
   return (r.status ?? 1) === 0 ? "set" : "failed";
 }
 
@@ -364,14 +466,27 @@ export function isFirstPublishPullOutput(output) {
  *       (re)pointed; pull + verified/retried push attempted. `pushed:false` reports a push that could
  *       not land after `pushAttempts` tries (non-fatal); `firstPublish:true` means the remote is still
  *       empty and the failure must be surfaced loud.
- *   - { status: "error", detail }               — `bd dolt remote add` itself failed
+ *   - { status: "error", detail }               — reading `sync.remote`, or `bd dolt remote add`
+ *       itself, failed (a budget kill included — never a silent fallback to git origin)
  *
- * @param {{ repoDir: string, log?: (msg: string) => void, exec?: (cmd: string, args: string[]) => { status: number|null, stdout?: string, stderr?: string } }} opts
+ * @param {{ repoDir: string, log?: (msg: string) => void, exec?: (cmd: string, args: string[], timeoutMs?: number) => { status: number|null, stdout?: string, stderr?: string } }} opts
  */
 export function configureBeadsDoltSync(opts = {}) {
   const { repoDir: dir, log } = opts;
   const emit = typeof log === "function" ? log : () => {};
-  const exec = opts.exec ?? ((cmd, args) => spawnSync(cmd, args, { cwd: dir, encoding: "utf8" }));
+  // Budgets are per call (a local `bd config get` is not a network `bd dolt push`); an injected test
+  // exec simply ignores the third argument, so the seam is unchanged for callers that stub it.
+  const localMs = budgetMs("bd");
+  const netMs = budgetMs("network");
+  const exec =
+    opts.exec ??
+    ((cmd, args, timeoutMs = netMs) =>
+      spawnSync(cmd, args, {
+        cwd: dir,
+        encoding: "utf8",
+        timeout: timeoutMs,
+        killSignal: SPAWN_KILL_SIGNAL,
+      }));
 
   if (!existsSync(join(dir, ".beads"))) return { status: "no-workspace" };
 
@@ -379,7 +494,10 @@ export function configureBeadsDoltSync(opts = {}) {
   // aws:// remote) wins over the git-origin fallback — anton drives whatever the project's beads
   // config declares, it never forces git-origin over a declared remote. NOTE `bd config get` exits 0
   // with "sync.remote (not set in config.yaml)" when unset — parse the text, never the exit code.
-  const cfg = exec("bd", ["config", "get", "sync.remote"]);
+  const cfg = exec("bd", ["config", "get", "sync.remote"], localMs);
+  // A killed probe flushes no output, which would read exactly like "not set" and silently wire the
+  // git origin over a deliberately declared remote. Fail loud instead — the budget kill is the news.
+  if (timedOut(cfg)) return { status: "error", detail: failureDetail(cfg, localMs, "") };
   const cfgOut = ((cfg.status ?? 1) === 0 ? (cfg.stdout ?? "") : "").trim();
   const declared = /\(not set/i.test(cfgOut)
     ? undefined
@@ -387,7 +505,7 @@ export function configureBeadsDoltSync(opts = {}) {
 
   let url = declared;
   if (!url) {
-    const origin = exec("git", ["remote", "get-url", "origin"]);
+    const origin = exec("git", ["remote", "get-url", "origin"], budgetMs("probe"));
     url = (origin.stdout ?? "").trim();
     if ((origin.status ?? 1) !== 0 || !url) return { status: "no-remote" };
   }
@@ -397,7 +515,7 @@ export function configureBeadsDoltSync(opts = {}) {
   // pulling/pushing the stale remote — otherwise the declared shared backlog is silently ignored
   // (anton-live-sync review). `bd dolt remote list` prints `<name>  <url>` lines; `bd dolt remote
   // add` upserts, so the add below re-points a stale url.
-  const list = exec("bd", ["dolt", "remote", "list"]);
+  const list = exec("bd", ["dolt", "remote", "list"], localMs);
   const existing = ((list.stdout ?? "").match(/^origin\s+(\S+)$/m) ?? [])[1];
   if (existing && normalizeRemoteUrl(existing) === normalizeRemoteUrl(url)) {
     emit("Dolt remote 'origin' already configured — no-op.");
@@ -406,21 +524,21 @@ export function configureBeadsDoltSync(opts = {}) {
   if (existing) emit(`Dolt remote 'origin' points at ${existing} — repointing to ${url}`);
   else if (declared) emit(`sync.remote declared in beads config — wiring ${declared}`);
 
-  const add = exec("bd", ["dolt", "remote", "add", "origin", url]);
+  const add = exec("bd", ["dolt", "remote", "add", "origin", url], localMs);
   if ((add.status ?? 1) !== 0) {
-    return { status: "error", detail: `${add.stdout ?? ""}${add.stderr ?? ""}`.trim() || `exit ${add.status ?? "?"}` };
+    return { status: "error", detail: failureDetail(add, localMs, `${add.stdout ?? ""}${add.stderr ?? ""}`) };
   }
   emit(`bd dolt remote add origin ${url}`);
 
   // Hydrate before publishing: with the JSONL exports untracked (anton-hg9), a fresh clone's board
   // comes from refs/dolt/data, not from files in the clone. Fails benignly when the remote has no
   // refs/dolt/data yet (first setup ever) — the push below then publishes it.
-  const pull = exec("bd", ["dolt", "pull"]);
+  const pull = exec("bd", ["dolt", "pull"], netMs);
   const pulled = (pull.status ?? 1) === 0;
   const pullOutput = `${pull.stdout ?? ""}${pull.stderr ?? ""}`.trim();
   const firstPublish = !pulled && isFirstPublishPullOutput(pullOutput);
   if (!pulled && !firstPublish) {
-    const detail = pullOutput || `exit ${pull.status ?? "?"}`;
+    const detail = failureDetail(pull, netMs, pullOutput);
     emit(`bd dolt pull — failed: ${detail}`);
     return { status: "error", detail: `bd dolt pull failed: ${detail}` };
   }
@@ -443,14 +561,14 @@ export function configureBeadsDoltSync(opts = {}) {
   let pushAttempts = 0;
   while (pushAttempts < MAX_PUSH_ATTEMPTS) {
     pushAttempts++;
-    push = exec("bd", ["dolt", "push"]);
+    push = exec("bd", ["dolt", "push"], netMs);
     if ((push.status ?? 1) === 0) {
       // Confirm the ref really landed — `bd dolt push` can exit 0 as a no-op. If the check can't run
       // (offline / local test remote), trust bd's exit code rather than falsely flagging failure.
       if (!verifyViaGitOrigin) {
         pushed = true;
       } else {
-        const ls = exec("git", ["ls-remote", "origin", "refs/dolt/data"]);
+        const ls = exec("git", ["ls-remote", "origin", "refs/dolt/data"], netMs);
         // Verification must fail closed: an unreachable/auth-failing remote cannot prove the ref
         // landed, even when `bd dolt push` itself returned zero.
         pushed = (ls.status ?? 1) === 0 && /\S/.test((ls.stdout ?? "").trim());
@@ -458,7 +576,7 @@ export function configureBeadsDoltSync(opts = {}) {
       if (pushed) break;
     }
     // Reconcile before retrying — a concurrent writer may have advanced refs/dolt/data.
-    if (pushAttempts < MAX_PUSH_ATTEMPTS) exec("bd", ["dolt", "pull"]);
+    if (pushAttempts < MAX_PUSH_ATTEMPTS) exec("bd", ["dolt", "pull"], netMs);
   }
   const pushOutput = `${push.stdout ?? ""}${push.stderr ?? ""}`.trim();
   emit(
@@ -544,8 +662,14 @@ export function configureBeadsForRepo(dir, opts = {}) {
   }
 
   // Capture core.hooksPath BEFORE bd init — bd's hooks install overwrites it with .beads/hooks, so a
-  // husky/lefthook (or bare custom) override is only observable here (anton-43b).
-  const priorHooksPath = gitConfigGet(dir, "core.hooksPath") || null;
+  // husky/lefthook (or bare custom) override is only observable here (anton-43b). A read we couldn't
+  // complete is said out loud: the manager-artifact scan below still runs, but a bare custom override
+  // would go unseen, and silence would read as "checked, nothing there".
+  const priorHooksPath = gitConfigGet(dir, "core.hooksPath");
+  if (priorHooksPath === null) {
+    emit("could not read core.hooksPath (git config timed out) — a custom hooks override may go undetected.");
+    steps.push({ name: "core.hooksPath", status: "unknown", detail: "git config --get timed out" });
+  }
 
   // 1. Bring a Dolt workspace into being, choosing the right entry point for the repo's state:
   //    - no .beads/ at all              → `bd init` (reconciled BD_INIT_FLAGS)
@@ -562,9 +686,16 @@ export function configureBeadsForRepo(dir, opts = {}) {
     const initArgs = ["init", ...BD_INIT_FLAGS];
     if (prefix) initArgs.push("--prefix", prefix);
     emit(`bd ${initArgs.join(" ")}`);
-    const r = spawnSync("bd", initArgs, { cwd: dir, encoding: "utf8" });
+    // The long budget: init creates the Dolt workspace and can reach the remote.
+    const initMs = budgetMs("network");
+    const r = spawnSync("bd", initArgs, {
+      cwd: dir,
+      encoding: "utf8",
+      timeout: initMs,
+      killSignal: SPAWN_KILL_SIGNAL,
+    });
     if ((r.status ?? 1) !== 0) {
-      const detail = (r.stderr || r.stdout || "").trim() || `exit ${r.status ?? "?"}`;
+      const detail = failureDetail(r, initMs, r.stderr || r.stdout || "");
       steps.push({ name: "bd init", status: "failed", detail });
       errors.push(`bd init failed: ${detail}`);
       return { configured: false, skipped: false, ranInit: false, steps, errors, hasBeads: existsSync(beadsDir) };
@@ -573,9 +704,16 @@ export function configureBeadsForRepo(dir, opts = {}) {
     steps.push({ name: "bd init", status: "ok" });
   } else if (!hasLocalDoltDb(beadsDir)) {
     emit("bd bootstrap --non-interactive (fresh clone — hydrating the Dolt DB from origin)");
-    const r = spawnSync("bd", ["bootstrap", "--non-interactive"], { cwd: dir, encoding: "utf8" });
+    // Hydrating a fresh clone pulls the whole board over refs/dolt/data — the long budget.
+    const bootstrapMs = budgetMs("network");
+    const r = spawnSync("bd", ["bootstrap", "--non-interactive"], {
+      cwd: dir,
+      encoding: "utf8",
+      timeout: bootstrapMs,
+      killSignal: SPAWN_KILL_SIGNAL,
+    });
     if ((r.status ?? 1) !== 0) {
-      const detail = (r.stderr || r.stdout || "").trim() || `exit ${r.status ?? "?"}`;
+      const detail = failureDetail(r, bootstrapMs, r.stderr || r.stdout || "");
       steps.push({ name: "bd bootstrap", status: "failed", detail });
       errors.push(`bd bootstrap failed: ${detail}`);
       return { configured: false, skipped: false, ranInit: false, steps, errors, hasBeads: existsSync(beadsDir) };

@@ -1,7 +1,7 @@
 /**
  * Argv-level unit test for the won't-do primitive (anton-6xj0): `beads.abandon` must issue bd's own
  * `close --reason` (the decision's durable record) followed by the `abandoned` label — beads has no
- * cancelled status, so that pair IS the outcome. `node:child_process` is mocked so no bd is spawned.
+ * cancelled status, so that pair IS the outcome. `spawn` is faked so no bd is launched.
  * Mirrors bd-defer.test.ts.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -12,25 +12,22 @@ import { BD_BIN_ENV, resetBdBinCache } from "./bd-bin";
 // otherwise fail loud. These are argv-level assertions (which bd subcommand), not about bd's path.
 const BD = process.execPath;
 
-const { calls } = vi.hoisted(() => ({ calls: [] as string[][] }));
+const { spawned } = vi.hoisted(() => ({
+  spawned: [] as Array<{ file: string; args: string[]; options: Record<string, unknown> | undefined }>,
+}));
 
-vi.mock("node:child_process", () => {
-  const promisified = async (file: string, args: string[]) => {
-    calls.push([file, ...args]);
-    return { stdout: "", stderr: "" };
-  };
-  // bd.ts wraps execFile with util.promisify — the custom symbol is what promisify picks up.
-  const execFile = Object.assign(() => undefined, {
-    [Symbol.for("nodejs.util.promisify.custom")]: promisified,
-  });
-  return { execFile };
+vi.mock("node:child_process", async () => {
+  const { makeFakeSpawn } = await import("../testing/spawn");
+  return { spawn: makeFakeSpawn(spawned) };
 });
 
 const { beads } = await import("./bd");
 
+const calls = () => spawned.map((c) => [c.file, ...c.args]);
+
 describe("beads.abandon", () => {
   beforeEach(() => {
-    calls.length = 0;
+    spawned.length = 0;
     process.env[BD_BIN_ENV] = BD;
     resetBdBinCache();
   });
@@ -41,7 +38,7 @@ describe("beads.abandon", () => {
 
   it("closes with the reason, then tags the bead abandoned and clears its stage", async () => {
     await beads.abandon("/repo", "bd-1", "superseded by bd-9");
-    expect(calls).toEqual([
+    expect(calls()).toEqual([
       [BD, "close", "bd-1", "--reason", "abandoned: superseded by bd-9"],
       [
         BD,
@@ -59,12 +56,12 @@ describe("beads.abandon", () => {
 
   it("trims the reason", async () => {
     await beads.abandon("/repo", "bd-1", "  no longer needed \n");
-    expect(calls[0]).toContain("abandoned: no longer needed");
+    expect(calls()[0]).toContain("abandoned: no longer needed");
   });
 
   it("refuses a blank reason — and writes nothing", async () => {
     await expect(beads.abandon("/repo", "bd-1", "   ")).rejects.toThrow(/reason/i);
-    expect(calls).toEqual([]);
+    expect(calls()).toEqual([]);
   });
 });
 

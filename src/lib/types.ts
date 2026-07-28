@@ -129,7 +129,7 @@ export interface StandaloneItem {
  * SyncStatus there — kept as a separate declaration so client components import types without the
  * server-only bd module. */
 export interface SyncStatusView {
-  state: "unknown" | "not-wired" | "syncing" | "synced" | "failing";
+  state: "unknown" | "not-wired" | "syncing" | "stalled" | "synced" | "failing";
   /** ms epoch of the last successful pass (pull or push); null when never synced. */
   lastSyncedAt: number | null;
   /** ms epoch of the last successful push; null when nothing has been pushed yet. */
@@ -137,6 +137,8 @@ export interface SyncStatusView {
   /** Local commits committed but not yet pushed to the remote; 0 when caught up. */
   unpushedCount: number;
   lastError: string | null;
+  /** How long a pass has been pinned at `syncing` past the staleness window; null unless stalled. */
+  stalledForMs: number | null;
 }
 
 export interface Board {
