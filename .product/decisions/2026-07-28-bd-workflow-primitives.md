@@ -119,12 +119,13 @@ onto.
 
 | Command | Failure | anton uses instead |
 | --- | --- | --- |
-| `bd mol ready --gated` | `Error: unknown flag: --gated` — contradicts its own usage line (`Usage: bd mol ready --gated [flags]`) and both its examples | `bd ready --gated` **or** bare `bd mol ready` — both work and print identical output |
+| `bd mol ready --gated` | `Error: unknown flag: --gated` — contradicts its own usage line (`Usage: bd mol ready --gated [flags]`) and both its examples | `bd ready --gated` — the only gate-scoped form. Bare `bd mol ready` runs, but lists **every** ready molecule step, so it is not a substitute on a populated board |
 | `bd sql <query>` | `Error: 'bd sql' is not yet supported in embedded mode` — and anton runs embedded | `bd export` + parse the JSONL, or `bd list --json` |
 | `bd sling <agent> --mol <id>` | `unknown command "sling" for "bd"` — yet `bd gate list` prints it as the suggested next step | nothing; ignore that hint |
 
-Broken identically on 1.1.0 and 1.1.2. Note the failure mode of the first one: bare `bd mol ready`
-*works*, so only the documented invocation is broken.
+Broken identically on 1.1.0 and 1.1.2. Note the failure mode of the first one: only the *documented*
+invocation errors — the bare form runs, which is what makes it a tempting and wrong substitute for
+the gate-scoped query.
 
 ### 5. `bd gate check` resolves GitHub gates against the **process cwd**, not the gate's repo — always spawn with `cwd` = project repo
 
