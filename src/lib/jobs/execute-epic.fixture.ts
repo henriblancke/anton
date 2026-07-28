@@ -18,8 +18,11 @@ import { beads } from "../beads/bd";
 import { formatHumanNote } from "../beads/notes";
 import * as schema from "../db/schema";
 import { type Clock } from "./queue";
+import { type JobRunner, type RunnerConfig } from "./runner";
+import { makeExecuteEpicHandler } from "./execute-epic";
 import { resetOperatorCache } from "../operator";
 import { makeBdRepo, saveEnv } from "@/lib/testing/integration";
+import { makeJobRunner } from "@/lib/testing/jobs";
 
 /** Fixed start-of-test wall clock. Reset before each case — see each suite's `beforeEach`. */
 export const BASE_TIME_MS = 1_700_000_000_000;
@@ -50,6 +53,79 @@ export class FakeClock implements Clock {
   set(t: number) {
     this.t = t;
   }
+}
+
+/**
+ * Create a bead under a run target and return its id. Every suite needs `--parent` (and sometimes
+ * `--labels`), which `beads.create` does not expose, so they shell out to `bd create --json` — once,
+ * here, instead of re-deriving the id out of bd's array-or-object payload at each site.
+ */
+export function createTicket(
+  repo: string,
+  opts: {
+    title: string;
+    /** Omit for a standalone (parentless) target. */
+    parent?: string;
+    type?: "task" | "bug" | "chore" | "epic" | "feature";
+    labels?: string[];
+    /** Defaults to the throwaway `"x"` every gate-focused case uses. */
+    acceptance?: string;
+  },
+): string {
+  const args = ["create", opts.title, "--type", opts.type ?? "task"];
+  if (opts.parent) args.push("--parent", opts.parent);
+  if (opts.labels?.length) args.push("--labels", opts.labels.join(","));
+  args.push("--acceptance", opts.acceptance ?? "x", "--json");
+  const parsed = JSON.parse(execFileSync("bd", args, { cwd: repo, encoding: "utf8" }));
+  return ((Array.isArray(parsed) ? parsed[0] : (parsed.issue ?? parsed)).id as string);
+}
+
+/**
+ * Build the runner every case drives: the REAL execute-epic handler on the sandbox's db + clock,
+ * one job in flight. `config` overrides the shared defaults — the only knobs that actually vary are
+ * `leaseMs` (a case that holds a hung agent open) and `quotaCooloffMs` (the usage-limit cases).
+ */
+export function makeEpicRunner(
+  ctx: Pick<ExecuteEpicSandbox, "tdb" | "clock">,
+  config: Partial<RunnerConfig> = {},
+): JobRunner {
+  const { tdb, clock } = ctx;
+  return makeJobRunner({
+    db: tdb.db,
+    clock,
+    type: "execute-epic",
+    handler: makeExecuteEpicHandler,
+    // These suites pin a shorter lease than the runner default; a case may still override it.
+    config: { leaseMs: 30_000, ...config },
+  });
+}
+
+/** The job payload every execute-epic case enqueues — the run target plus its project. */
+export interface EpicJobPayload {
+  projectId: string;
+  epicBeadId: string;
+}
+
+/** Enqueue one execute-epic job without driving it. Returns the job id. */
+export function enqueueEpicJob(runner: JobRunner, payload: EpicJobPayload): Promise<string> {
+  return runner.enqueue({ type: "execute-epic", projectId: payload.projectId, payload });
+}
+
+/**
+ * Run one tick and wait for the work it leased to settle. Returns how many jobs the tick leased —
+ * cases that resume across a clock jump assert on that count (`0` = not due yet).
+ */
+export async function tickToIdle(runner: JobRunner): Promise<number> {
+  const processed = await runner.tickOnce();
+  await runner.whenIdle();
+  return processed;
+}
+
+/** Enqueue one execute-epic job and drive it to settle. Returns the job id. */
+export async function driveEpicRun(runner: JobRunner, payload: EpicJobPayload): Promise<string> {
+  const jobId = await enqueueEpicJob(runner, payload);
+  await tickToIdle(runner);
+  return jobId;
 }
 
 /** Write an executable node script and return its path. */
@@ -147,23 +223,17 @@ export async function createExecuteEpicSandbox(): Promise<ExecuteEpicSandbox> {
   await beads.approve(repo, epicId);
 
   // Two tickets under the epic; t1 carries an agent tag to exercise agent-prompt loading.
-  const c1 = execFileSync(
-    "bd",
-    ["create", "Ticket one", "--type", "task", "--parent", epicId, "--labels", "agent:nextjs", "--acceptance", "work file exists", "--json"],
-    { cwd: repo, encoding: "utf8" },
-  );
-  const c2 = execFileSync(
-    "bd",
-    ["create", "Ticket two", "--type", "task", "--parent", epicId, "--acceptance", "work file exists", "--json"],
-    { cwd: repo, encoding: "utf8" },
-  );
-  const idOf = (raw: string): string => {
-    const p = JSON.parse(raw);
-    const b = Array.isArray(p) ? p[0] : (p.issue ?? p);
-    return b.id as string;
-  };
-  const t1 = idOf(c1);
-  const t2 = idOf(c2);
+  const t1 = createTicket(repo, {
+    title: "Ticket one",
+    parent: epicId,
+    labels: ["agent:nextjs"],
+    acceptance: "work file exists",
+  });
+  const t2 = createTicket(repo, {
+    title: "Ticket two",
+    parent: epicId,
+    acceptance: "work file exists",
+  });
 
   // A human steer left on t1 between the gates (anton-bfy4) — the run must carry it into that
   // ticket's dispatch prompt, and only that ticket's.

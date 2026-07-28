@@ -17,8 +17,6 @@ import { beads } from "../beads/bd";
 import * as schema from "../db/schema";
 import { getJob, park, resumeJob } from "./queue";
 import { createRun } from "../runs";
-import { JobRunner } from "./runner";
-import { makeExecuteEpicHandler } from "./execute-epic";
 import { deriveStage } from "../ticket-view";
 import { resetOperatorCache } from "../operator";
 import { describeBd } from "@/lib/testing/integration";
@@ -29,6 +27,11 @@ import {
   FakeClock,
   writeBin,
   createExecuteEpicSandbox,
+  createTicket,
+  makeEpicRunner,
+  enqueueEpicJob,
+  tickToIdle,
+  driveEpicRun,
   type ExecuteEpicSandbox,
 } from "./execute-epic.fixture";
 
@@ -68,22 +71,9 @@ describeBd("execute-epic e2e — lifecycle (real handler · real bd/git · fake 
   });
 
   it("runs an approved epic autonomously → worktree → per-ticket commits → PR → in-review", async () => {
-    const runner = new JobRunner({
-      db: tdb.db,
-      clock,
-      config: { maxConcurrent: 1, leaseMs: 30_000 },
-    });
-    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
-
-    const jobId = await runner.enqueue({
-      type: "execute-epic",
-      projectId,
-      payload: { projectId, epicBeadId: epicId },
-    });
-
-    const processed = await runner.tickOnce();
-    await runner.whenIdle();
-    expect(processed).toBe(1);
+    const runner = makeEpicRunner(ctx);
+    const jobId = await enqueueEpicJob(runner, { projectId, epicBeadId: epicId });
+    expect(await tickToIdle(runner)).toBe(1);
 
     // Job succeeded.
     const job = await getJob(tdb.db, jobId);
@@ -193,21 +183,10 @@ describeBd("execute-epic e2e — lifecycle (real handler · real bd/git · fake 
     });
     await beads.approve(repo, bugId);
 
-    const runner = new JobRunner({
-      db: tdb.db,
-      clock,
-      config: { maxConcurrent: 1, leaseMs: 30_000 },
-    });
-    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+    const runner = makeEpicRunner(ctx);
 
     process.env.ANTON_CLAUDE_BIN = successClaude;
-    const jobId = await runner.enqueue({
-      type: "execute-epic",
-      projectId,
-      payload: { projectId, epicBeadId: bugId },
-    });
-    await runner.tickOnce();
-    await runner.whenIdle();
+    const jobId = await driveEpicRun(runner, { projectId, epicBeadId: bugId });
 
     // Job + run finalized.
     expect((await getJob(tdb.db, jobId))?.status).toBe("done");
@@ -265,23 +244,12 @@ describeBd("execute-epic e2e — lifecycle (real handler · real bd/git · fake 
     const okGh = process.env.ANTON_GH_BIN!;
     process.env.ANTON_GH_BIN = failingGh;
 
-    const runner = new JobRunner({
-      db: tdb.db,
-      clock,
-      config: { maxConcurrent: 1, leaseMs: 30_000 },
-    });
-    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+    const runner = makeEpicRunner(ctx);
 
     process.env.ANTON_CLAUDE_BIN = successClaude;
     let jobId: string;
     try {
-      jobId = await runner.enqueue({
-        type: "execute-epic",
-        projectId,
-        payload: { projectId, epicBeadId: bugId },
-      });
-      await runner.tickOnce();
-      await runner.whenIdle();
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: bugId });
 
       // Attempt 1: the run failed at the PR step.
       const run1 = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === bugId)!;
@@ -307,8 +275,7 @@ describeBd("execute-epic e2e — lifecycle (real handler · real bd/git · fake 
       // the resumeJob below return false and wedged every later case in this file.
       expect(await park(tdb.db, clock, jobId, "test: simulate resume")).toBe(true);
       expect(await resumeJob(tdb.db, clock, jobId)).toBe(true);
-      await runner.tickOnce();
-      await runner.whenIdle();
+      await tickToIdle(runner);
 
       // Attempt 2: the run finished and the PR opened onto the still-open, in-review bead. The
       // failed attempt-1 run row remains (findOpenRunForEpic ignores failed runs, so the resume
@@ -351,22 +318,11 @@ describeBd("execute-epic e2e — lifecycle (real handler · real bd/git · fake 
     });
     await beads.approve(repo, bugId);
 
-    const runner = new JobRunner({
-      db: tdb.db,
-      clock,
-      config: { maxConcurrent: 1, leaseMs: 30_000 },
-    });
-    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+    const runner = makeEpicRunner(ctx);
 
     // Attempt 1: a normal run carries the bug to in-review (PR opened, PR ref stamped).
     process.env.ANTON_CLAUDE_BIN = successClaude;
-    const job1 = await runner.enqueue({
-      type: "execute-epic",
-      projectId,
-      payload: { projectId, epicBeadId: bugId },
-    });
-    await runner.tickOnce();
-    await runner.whenIdle();
+    const job1 = await driveEpicRun(runner, { projectId, epicBeadId: bugId });
     expect((await getJob(tdb.db, job1))?.status).toBe("done");
     const covered = await beads.show(repo, bugId);
     expect(beads.getPrRef(covered)).toBe("gh-42");
@@ -390,13 +346,7 @@ process.exit(0);`,
     const okGh = process.env.ANTON_GH_BIN!;
     process.env.ANTON_GH_BIN = openGh;
     try {
-      const job2 = await runner.enqueue({
-        type: "execute-epic",
-        projectId,
-        payload: { projectId, epicBeadId: bugId },
-      });
-      await runner.tickOnce();
-      await runner.whenIdle();
+      const job2 = await driveEpicRun(runner, { projectId, epicBeadId: bugId });
 
       // The retry completed (not failed/parked) without invoking gh: the PR ref is unchanged
       // and no second claude session ran — the covered work was not redone.
@@ -448,12 +398,7 @@ process.exit(0);`,
     await beads.sync(repo); // land both on the remote so the handler's pull can't clobber them
     expect(beads.ownRunLeaseLabels(await beads.show(repo, bugId), runId)).toHaveLength(1);
 
-    const runner = new JobRunner({
-      db: tdb.db,
-      clock,
-      config: { maxConcurrent: 1, leaseMs: 30_000 },
-    });
-    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+    const runner = makeEpicRunner(ctx);
 
     // gh reports the PR OPEN — the real state after a crash that stamped the ref (the PR was opened
     // first) — so the short-circuit legitimately proves completion and finishes the attempt as done.
@@ -469,13 +414,7 @@ process.exit(0);`,
     const okGh = process.env.ANTON_GH_BIN!;
     process.env.ANTON_GH_BIN = openGh;
     try {
-      const job = await runner.enqueue({
-        type: "execute-epic",
-        projectId,
-        payload: { projectId, epicBeadId: bugId },
-      });
-      await runner.tickOnce();
-      await runner.whenIdle();
+      const job = await driveEpicRun(runner, { projectId, epicBeadId: bugId });
       expect((await getJob(tdb.db, job))?.status).toBe("done");
     } finally {
       process.env.ANTON_GH_BIN = okGh;
@@ -508,12 +447,7 @@ process.exit(0);`,
     await beads.setPrRef(repo, bugId, "gh-88");
     await beads.sync(repo);
 
-    const runner = new JobRunner({
-      db: tdb.db,
-      clock,
-      config: { maxConcurrent: 1, leaseMs: 30_000 },
-    });
-    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+    const runner = makeEpicRunner(ctx);
 
     // gh fails outright → pullRequestState reports "unknown". The run must park, not short-circuit
     // to done; `pr create` would also boom, so a wrongful fall-through to the PR step can't pass.
@@ -521,13 +455,7 @@ process.exit(0);`,
     const okGh = process.env.ANTON_GH_BIN!;
     process.env.ANTON_GH_BIN = failingGh;
     try {
-      const job = await runner.enqueue({
-        type: "execute-epic",
-        projectId,
-        payload: { projectId, epicBeadId: bugId },
-      });
-      await runner.tickOnce();
-      await runner.whenIdle();
+      const job = await driveEpicRun(runner, { projectId, epicBeadId: bugId });
       // Counting error → the job is rescheduled for retry (attempt spent), NOT done.
       expect((await getJob(tdb.db, job))?.status).not.toBe("done");
       // The run row settled as failed (a counting failure, not the parked run-live-elsewhere class),
@@ -555,16 +483,7 @@ process.exit(0);`,
       type: "epic",
       description: "## Goal\nProve in-review restoration on the epic short-circuit.",
     });
-    const childRaw = execFileSync(
-      "bd",
-      ["create", "Only child", "--type", "task", "--parent", epicId, "--acceptance", "x", "--json"],
-      { cwd: repo, encoding: "utf8" },
-    );
-    const childId = (() => {
-      const p = JSON.parse(childRaw);
-      const b = Array.isArray(p) ? p[0] : (p.issue ?? p);
-      return b.id as string;
-    })();
+    const childId = createTicket(repo, { title: "Only child", parent: epicId });
     await beads.approve(repo, epicId);
 
     // Simulate the crashed prior attempt: the child committed + closed, the PR ref stamped, and the
@@ -583,12 +502,7 @@ process.exit(0);`,
     });
     await beads.sync(repo);
 
-    const runner = new JobRunner({
-      db: tdb.db,
-      clock,
-      config: { maxConcurrent: 1, leaseMs: 30_000 },
-    });
-    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+    const runner = makeEpicRunner(ctx);
 
     // gh reports the PR OPEN (its real state after the crash); `pr create` booms so a wrongful
     // fall-through to the PR step would throw instead of short-circuiting.
@@ -603,13 +517,7 @@ process.exit(0);`,
     const okGh = process.env.ANTON_GH_BIN!;
     process.env.ANTON_GH_BIN = openGh;
     try {
-      const job = await runner.enqueue({
-        type: "execute-epic",
-        projectId,
-        payload: { projectId, epicBeadId: epicId },
-      });
-      await runner.tickOnce();
-      await runner.whenIdle();
+      const job = await driveEpicRun(runner, { projectId, epicBeadId: epicId });
       expect((await getJob(tdb.db, job))?.status).toBe("done");
     } finally {
       process.env.ANTON_GH_BIN = okGh;

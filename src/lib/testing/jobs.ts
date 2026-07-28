@@ -28,6 +28,21 @@ export interface DriveJobOptions {
 }
 
 /**
+ * Build a one-handler runner without driving it — for suites that must hold the runner across
+ * several ticks (a clock jump, a park-then-resume) and so cannot use `driveJob`'s single-tick
+ * shape. `driveJob` is this plus enqueue/tick/settle.
+ */
+export function makeJobRunner(
+  opts: Pick<DriveJobOptions, "db" | "clock" | "type" | "handler" | "config">,
+): JobRunner {
+  const { db, clock, type, handler, config } = opts;
+
+  const runner = new JobRunner({ db, clock, config: { maxConcurrent: 1, ...config } });
+  runner.registerHandler(type, handler({ db, clock }));
+  return runner;
+}
+
+/**
  * Enqueue one job, run exactly one tick, and wait for it to settle. Returns the job id so the
  * caller can assert on the persisted row (`getJob`).
  *
@@ -35,10 +50,9 @@ export interface DriveJobOptions {
  * what the caller's assertions are actually measuring.
  */
 export async function driveJob(opts: DriveJobOptions): Promise<string> {
-  const { db, clock, type, handler, projectId, payload, config } = opts;
+  const { type, projectId, payload } = opts;
 
-  const runner = new JobRunner({ db, clock, config: { maxConcurrent: 1, ...config } });
-  runner.registerHandler(type, handler({ db, clock }));
+  const runner = makeJobRunner(opts);
 
   const jobId = await runner.enqueue({ type, projectId, payload: payload ?? { projectId } });
   expect(await runner.tickOnce()).toBe(1);
