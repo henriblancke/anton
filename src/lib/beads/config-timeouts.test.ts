@@ -13,6 +13,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  MIN_BD_VERSION,
   SPAWN_BUDGETS_MS,
   beadsPrereqs,
   configureBeadsDoltSync,
@@ -46,11 +47,15 @@ function stub(name: string, body: string[]): void {
 /** A stub that never exits — the wedged-probe the budget has to cut off. */
 const HANGS = ["setTimeout(() => {}, 60000);"];
 
+/**
+ * Every bd stub answers `--version` with the floor anton requires: beadsPrereqs gates on the version
+ * before it ever probes git, so a stub reporting anything older short-circuits there and the timeout
+ * behaviour under test never runs. Derived from MIN_BD_VERSION so a bumped floor can't re-strand it.
+ */
+const ANSWERS_VERSION = `if (process.argv[2] === "--version") { console.log("bd version ${MIN_BD_VERSION} (stub)"); process.exit(0); }`;
+
 /** A stub that answers `--version` instantly and hangs on everything else. */
-const ANSWERS_VERSION_THEN_HANGS = [
-  'if (process.argv[2] === "--version") { console.log("0.0.0-stub"); process.exit(0); }',
-  ...HANGS,
-];
+const ANSWERS_VERSION_THEN_HANGS = [ANSWERS_VERSION, ...HANGS];
 
 function elapsed<T>(fn: () => T): { result: T; ms: number } {
   const t0 = Date.now();
@@ -202,6 +207,7 @@ describe("a probe that blows its budget", () => {
       "else process.exit(0); // rev-parse, ls-files",
     ]);
     stub("bd", [
+      ANSWERS_VERSION,
       'const a = process.argv.slice(2);',
       'if (a[0] === "init") { require("node:fs").mkdirSync(".beads", { recursive: true }); }',
       'if (a[0] === "dolt" && a[1] === "remote") console.log("origin\\tgit+ssh://git@example.com/./org/repo");',

@@ -189,12 +189,17 @@ grep -o '"type":"[a-z-]*"' /tmp/x.jsonl | sort | uniq -c | sort -rn
 
 ```sh
 bd mol ready --gated   # Error: unknown flag: --gated
-bd mol ready           # WORKS — identical output to `bd ready --gated`
+bd mol ready           # WORKS — output identical to `bd ready --gated` *in this one-molecule board*
 bd ready --gated       # WORKS
 ```
 
 `bd mol ready --help` prints `Usage: bd mol ready --gated [flags]` and two `--gated` examples, while
 its `Flags:` block lists only `-h`. Only the *documented* invocation is broken; the bare form works.
+
+The two are not substitutes, though: bare `bd mol ready` lists **every** ready molecule step, while
+`bd ready --gated` is scoped to gate-resumable molecules. They coincided here only because the test
+board held a single molecule, in gate-resume state — on a populated board they diverge. `anton-uk95`
+wants the gated scope, so it must use `bd ready --gated` (PR #90 review).
 
 ```sh
 bd sql "SELECT 1"      # Error: 'bd sql' is not yet supported in embedded mode
