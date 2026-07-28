@@ -23,10 +23,13 @@ grep -n MIN_BD_VERSION src/lib/beads/config.mjs src/lib/beads/bd-bin.ts
 grep -n 'BD_VERSION:' .github/workflows/ci.yml   # BD_VERSION: "1.1.0"
 ```
 
-CI is the tiebreaker and agrees: the integration job installs bd **1.1.0 exactly** and fails the
-build if the resolved version drifts from it. So 1.1.0 is not merely a documented floor — it is the
-only version anton's suites are ever exercised against, which is precisely why the checks below were
-re-run on it rather than on the 1.1.2 that happens to be on this machine.
+CI agrees on the version, with one caveat worth stating precisely: the `integration` job installs bd
+**1.1.0 exactly** and its version-assert step exits 1 on drift, but the entire job carries
+`continue-on-error: true` (`.github/workflows/ci.yml:51`, report-only by design). Drift is therefore
+**reported, not blocking** — do not read the 1.1.0 integration coverage as a merge-blocking
+guarantee until that `continue-on-error` is flipped off. 1.1.0 is still the only version anton's
+suites are ever exercised against, which is why the checks below were re-run on it rather than on
+the 1.1.2 that happens to be on this machine.
 
 **The version contradiction in the ticket is gone — it was a stale snapshot.** All three of its
 premises are now false, verified:
@@ -168,9 +171,13 @@ green CI run in `henriblancke/anton`. Running the same experiment against a *fai
 (`30381985639`) produces the mirror image — `would escalate - workflow 'ci' failed` — so the hazard
 fabricates both verdicts, not just the optimistic one. Reproduced identically on 1.1.0 and 1.1.2.
 
-`bd gate discover` has the same defect: from `repoA` it reports `Found 5 recent workflow run(s) on
-branch 'main'` and offers to write one of **anton's** run IDs into a `cli/cli` gate, where the
-correct cwd finds none.
+`bd gate discover` reads from the same wrong repo: run from `repoA` it reports `Found 5 recent
+workflow run(s) on branch 'main'` — those are **anton's** runs — where the correct cwd finds none.
+What is demonstrated is that discovery's *candidate set* is drawn from the process cwd's repo; the
+harness then printed `Would update 0 gate(s)`, because its only gate already had `--await-id`
+pinned and nothing matched. So the cwd rule below applies to `discover` too, but an actually
+mis-written gate was not observed here — proving that would need a gate left open for discovery to
+fill.
 
 Note that bd *knows* the right answer and does not use it — `bd config list | grep sync.remote`
 returns `git+ssh://git@github.com/cli/cli.git` for the very database whose gate just resolved
