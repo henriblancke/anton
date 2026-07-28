@@ -109,13 +109,18 @@ export function hasOriginRemote(dir) {
   return r.status === 0;
 }
 
-/** Read a single git config value for `dir`, or "" when unset. */
+/**
+ * Read a single git config value for `dir`: "" when the key is unset, `null` when the read could not
+ * be completed (budget kill). An UNREADABLE config is not an unset one — collapsing the two would let
+ * a wedged `git config` report a confident "no core.hooksPath" and hide a real override (PR #89).
+ */
 function gitConfigGet(dir, key) {
   const r = spawnSync("git", ["-C", dir, "config", "--get", key], {
     encoding: "utf8",
     timeout: budgetMs("probe"),
     killSignal: SPAWN_KILL_SIGNAL,
   });
+  if (timedOut(r)) return null;
   return (r.status ?? 1) === 0 ? (r.stdout || "").trim() : "";
 }
 
@@ -603,8 +608,14 @@ export function configureBeadsForRepo(dir, opts = {}) {
   }
 
   // Capture core.hooksPath BEFORE bd init — bd's hooks install overwrites it with .beads/hooks, so a
-  // husky/lefthook (or bare custom) override is only observable here (anton-43b).
-  const priorHooksPath = gitConfigGet(dir, "core.hooksPath") || null;
+  // husky/lefthook (or bare custom) override is only observable here (anton-43b). A read we couldn't
+  // complete is said out loud: the manager-artifact scan below still runs, but a bare custom override
+  // would go unseen, and silence would read as "checked, nothing there".
+  const priorHooksPath = gitConfigGet(dir, "core.hooksPath");
+  if (priorHooksPath === null) {
+    emit("could not read core.hooksPath (git config timed out) — a custom hooks override may go undetected.");
+    steps.push({ name: "core.hooksPath", status: "unknown", detail: "git config --get timed out" });
+  }
 
   // 1. Bring a Dolt workspace into being, choosing the right entry point for the repo's state:
   //    - no .beads/ at all              → `bd init` (reconciled BD_INIT_FLAGS)

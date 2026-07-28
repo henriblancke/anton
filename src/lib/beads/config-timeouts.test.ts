@@ -190,6 +190,36 @@ describe("a probe that blows its budget", () => {
     expect(ms).toBeLessThan(NO_HANG_MS);
   });
 
+  // A killed `git config --get core.hooksPath` returns nothing, which parses identically to "key not
+  // set" — and silence there reads as "checked, no custom hooksPath". Say the read failed instead
+  // (PR #89 review).
+  it("says core.hooksPath is UNKNOWN when the read is killed, never silently 'not set'", () => {
+    stub("git", [
+      "const a = process.argv.slice(2);",
+      'if (a[0] === "-C") a.splice(0, 2);',
+      'if (a[0] === "config") { setTimeout(() => {}, 60000); } // the wedged read under test',
+      'else if (a[0] === "remote") { console.log("git@example.com:org/repo.git"); process.exit(0); }',
+      "else process.exit(0); // rev-parse, ls-files",
+    ]);
+    stub("bd", [
+      'const a = process.argv.slice(2);',
+      'if (a[0] === "init") { require("node:fs").mkdirSync(".beads", { recursive: true }); }',
+      'if (a[0] === "dolt" && a[1] === "remote") console.log("origin\\tgit+ssh://git@example.com/./org/repo");',
+      "process.exit(0);",
+    ]);
+    const logs: string[] = [];
+
+    const { result, ms } = elapsed(() => configureBeadsForRepo(repo, { log: (m: string) => logs.push(m) }));
+
+    expect(result.configured).toBe(true);
+    expect(result.steps).toContainEqual({
+      name: "core.hooksPath",
+      status: "unknown",
+      detail: expect.stringContaining("timed out"),
+    });
+    expect(logs.join("\n")).toMatch(/could not read core\.hooksPath/);
+    expect(ms).toBeLessThan(NO_HANG_MS);
+  });
 });
 
 describe("the injectable exec seam", () => {
