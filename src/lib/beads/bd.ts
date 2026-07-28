@@ -210,7 +210,7 @@ export function isFirstPublishPullOutput(output: string): boolean {
 // route handlers can load DIFFERENT compiled instances of this module (separate bundles), so a
 // plain module-level Map would leave routes reading an empty registry forever.
 
-export type SyncState = "unknown" | "not-wired" | "syncing" | "synced" | "failing";
+export type SyncState = "unknown" | "not-wired" | "syncing" | "stalled" | "synced" | "failing";
 
 export interface SyncStatus {
   state: SyncState;
@@ -226,16 +226,50 @@ export interface SyncStatus {
    * into "N unpushed". */
   unpushedCount: number;
   lastError: string | null;
+  /** How long the pass has been pinned at `syncing`, once past the staleness window. Non-null only
+   * for state `stalled` — it is what lets the badge say "stuck 4h" instead of spinning forever. */
+  stalledForMs: number | null;
+}
+
+/** What the registry actually stores. `stalled` is never written — it is derived on read from
+ * `syncingSince`, so a wedged process (which by definition runs no more code) still ages out. */
+interface SyncRecord extends Omit<SyncStatus, "stalledForMs"> {
+  /** ms epoch this pass stamped `syncing`; null in every terminal state. The stall clock. */
+  syncingSince: number | null;
+}
+
+/**
+ * How long a pass may sit in `syncing` before the registry reads it as `stalled`. A hang is not a
+ * rejection: nothing throws, so the `.catch` that records `failing` never runs and the repo would
+ * otherwise stay pinned at `syncing` forever — the anton-jfjw.3 defect, where two boards were
+ * un-syncable for days with nothing anywhere saying so. Ten missed heartbeats (30s each): long
+ * enough that a genuinely slow pull over a big board is not flagged, short enough that an operator
+ * sees the stall in minutes rather than days. `ANTON_SYNC_STALL_MS` overrides it (read per call so
+ * a change lands without a module reload).
+ */
+export const SYNC_STALL_MS = 300_000;
+
+function stallWindowMs(): number {
+  const raw = Number(process.env.ANTON_SYNC_STALL_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : SYNC_STALL_MS;
 }
 
 const SYNC_STATUS_KEY = Symbol.for("anton.beads.syncStatus");
+const SYNC_STALL_LOGGED_KEY = Symbol.for("anton.beads.syncStallLogged");
 
-function statusRegistry(): Map<string, SyncStatus> {
-  const g = globalThis as unknown as Record<symbol, Map<string, SyncStatus> | undefined>;
+function statusRegistry(): Map<string, SyncRecord> {
+  const g = globalThis as unknown as Record<symbol, Map<string, SyncRecord> | undefined>;
   return (g[SYNC_STATUS_KEY] ??= new Map());
 }
 
-export function getSyncStatus(cwd: string): SyncStatus {
+/** cwd → the `syncingSince` of the stall already logged, so a stall is announced once per
+ * occurrence rather than once per read (the board polls getSyncStatus every few seconds). */
+function stallLogRegistry(): Map<string, number> {
+  const g = globalThis as unknown as Record<symbol, Map<string, number> | undefined>;
+  return (g[SYNC_STALL_LOGGED_KEY] ??= new Map());
+}
+
+function rawStatus(cwd: string): SyncRecord {
   return (
     statusRegistry().get(cwd) ?? {
       state: "unknown",
@@ -243,23 +277,67 @@ export function getSyncStatus(cwd: string): SyncStatus {
       lastPushedAt: null,
       unpushedCount: 0,
       lastError: null,
+      syncingSince: null,
     }
+  );
+}
+
+/**
+ * The repo's sync health, with a wedged pass aged out of `syncing` into `stalled`. Every consumer
+ * of the registry reads through here, so the backstop needs no timer and no cooperation from the
+ * hung pass itself — which is the point: the process that would have reported the failure is the
+ * one that is stuck. `now` is injectable for tests.
+ */
+export function getSyncStatus(cwd: string, now: number = Date.now()): SyncStatus {
+  const { syncingSince, ...view } = rawStatus(cwd);
+  if (view.state !== "syncing" || syncingSince === null) return { ...view, stalledForMs: null };
+  const stuckForMs = now - syncingSince;
+  if (stuckForMs < stallWindowMs()) return { ...view, stalledForMs: null };
+  logStallOnce(cwd, syncingSince, stuckForMs, view.lastSyncedAt);
+  return { ...view, state: "stalled", stalledForMs: stuckForMs };
+}
+
+/** One line per distinct stall, matching sync-engine's log-on-change discipline — an operator
+ * tailing the console sees the wedge without running `ps`, and a polling board doesn't flood it. */
+function logStallOnce(
+  cwd: string,
+  syncingSince: number,
+  stuckForMs: number,
+  lastSyncedAt: number | null,
+): void {
+  const logged = stallLogRegistry();
+  if (logged.get(cwd) === syncingSince) return;
+  logged.set(cwd, syncingSince);
+  const mins = Math.round(stuckForMs / 60_000);
+  const lastSynced =
+    lastSyncedAt === null ? "never synced" : `last synced ${new Date(lastSyncedAt).toISOString()}`;
+  console.error(
+    `[beads.sync] ${cwd} has been stuck in 'syncing' for ${mins}m with no completion and no ` +
+      `error — the sync pass is wedged (${lastSynced}).`,
   );
 }
 
 /**
  * Compact token for board refreshes. Repeated successful heartbeats do not change it, while every
  * user-visible health transition does (including gaining the first successful-sync timestamp and any
- * change to the unpushed-backlog count, which the badge renders).
+ * change to the unpushed-backlog count, which the badge renders). While stalled it also advances
+ * once a minute: the badge renders a server-computed "stuck Xm", which would otherwise freeze at
+ * the value captured when the stall was first detected — exactly the frozen-truth failure this
+ * state exists to fix.
  */
-export function getSyncStatusToken(cwd: string): string {
-  const status = getSyncStatus(cwd);
+export function getSyncStatusToken(cwd: string, now: number = Date.now()): string {
+  const status = getSyncStatus(cwd, now);
   const seen = status.lastSyncedAt === null ? "never" : "seen";
-  return `${status.state}:${seen}:${status.unpushedCount}:${status.lastError ?? ""}`;
+  const stuck = status.stalledForMs === null ? "" : `:${Math.floor(status.stalledForMs / 60_000)}`;
+  return `${status.state}:${seen}:${status.unpushedCount}:${status.lastError ?? ""}${stuck}`;
 }
 
-function recordStatus(cwd: string, patch: Partial<SyncStatus>): void {
-  statusRegistry().set(cwd, { ...getSyncStatus(cwd), ...patch });
+function recordStatus(cwd: string, patch: Partial<SyncRecord>): void {
+  const next = { ...rawStatus(cwd), ...patch };
+  // Single owner of the stall clock: it starts the moment a pass stamps `syncing` and is cleared by
+  // any terminal state, so `syncingSince` always means "the pass currently in flight began here".
+  if (patch.state !== undefined) next.syncingSince = patch.state === "syncing" ? Date.now() : null;
+  statusRegistry().set(cwd, next);
 }
 
 /**
@@ -387,7 +465,7 @@ export function createDoltSync(exec: BdExec = bd): (cwd: string, mode?: SyncRequ
         // backlog so the next heartbeat backstop retries, and the operator sees a truthful "N
         // unpushed" count instead of the failure hiding in server logs. A backstop retry (newWork
         // false) or a pull-only failure leaves the count as-is: the stranded work is already counted.
-        const patch: Partial<SyncStatus> = { state: "failing", lastError: e.message };
+        const patch: Partial<SyncRecord> = { state: "failing", lastError: e.message };
         if (mode === "full" && newWork) patch.unpushedCount = getSyncStatus(cwd).unpushedCount + 1;
         recordStatus(cwd, patch);
       })

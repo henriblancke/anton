@@ -91,7 +91,14 @@ function board(version: string, cardStage: Stage): Board {
     version,
     columns,
     standalone,
-    sync: { state: "synced", lastSyncedAt: 1, lastPushedAt: 1, unpushedCount: 0, lastError: null },
+    sync: {
+      state: "synced",
+      lastSyncedAt: 1,
+      lastPushedAt: 1,
+      unpushedCount: 0,
+      lastError: null,
+      stalledForMs: null,
+    },
   };
 }
 
