@@ -28,8 +28,8 @@ import { spawnSync } from "node:child_process";
  *
  * NOTE `timeout` only signals the DIRECT child (spawnSync has no detached/process-group option).
  * That's the accepted trade here: these are short-lived local probes and the goal is bounding the
- * calling thread, not reaping descendants — see runShell (src/lib/jobs/shell.ts) for the paths that
- * do need process-group cleanup.
+ * calling thread, not reaping descendants — see bd() (bd.ts) and runShell (src/lib/jobs/shell.ts)
+ * for the async paths that do need process-group cleanup.
  */
 export const SPAWN_BUDGETS_MS = {
   /** Local, no network: command -v, git rev-parse/config/ls-files/rm. */

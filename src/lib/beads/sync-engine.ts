@@ -40,11 +40,12 @@ const FULL_PASS_STEPS = 3;
 const BEAT_DEADLINE_HEARTBEATS = 6;
 
 /**
- * Wall-clock budget for one beat, past which the scheduler abandons it (anton-jfjw.2). A hung
- * `bd dolt pull` is NOT self-limiting: `bd`'s own per-step timeout only kills the `bd` child, so a
- * grandchild (a `git fetch` in uninterruptible wait) keeps the pipes open and the pass pending
- * forever. Without this bound, one wedged repo froze the heartbeat for EVERY project — tick() never
- * settled, so loop() never rescheduled.
+ * Wall-clock budget for one beat, past which the scheduler abandons it (anton-jfjw.2). The per-step
+ * budget in bd.ts now reaps bd's whole process group and settles on exit (anton-jfjw.1), so a wedged
+ * step no longer pends forever — but this bound stays load-bearing: it covers a pass that legitimately
+ * spans several steps, and anything that outlives even that reap (a descendant in uninterruptible
+ * kernel wait survives SIGKILL). Without it, one wedged repo froze the heartbeat for EVERY project —
+ * tick() never settled, so loop() never rescheduled.
  *
  * Scaled to the heartbeat so the bound stays meaningful when the cadence is tuned, with a floor at
  * the widest legitimate pass: pull+commit+push each get the full per-step budget, so relying on that
