@@ -175,9 +175,18 @@ const DRAIN_AFTER_EXIT_MS = 2_000;
  * comfortably under it. */
 const BD_MAX_BUFFER = 32 * 1024 * 1024;
 
+/** Override the per-stream output ceiling (tests shrink it so the overflow path is exercisable
+ * without producing 32 MB). Read per call, like the budget and the kill grace. */
+export const BD_MAX_BUFFER_ENV = "ANTON_BD_MAX_BUFFER";
+
 function stepTimeoutMs(): number {
   const raw = Number(process.env[BD_STEP_TIMEOUT_ENV]);
   return Number.isFinite(raw) && raw > 0 ? raw : BD_STEP_TIMEOUT_MS;
+}
+
+function maxBuffer(): number {
+  const raw = Number(process.env[BD_MAX_BUFFER_ENV]);
+  return Number.isFinite(raw) && raw > 0 ? raw : BD_MAX_BUFFER;
 }
 
 function killGraceMs(): number {
@@ -209,6 +218,7 @@ async function bd(cwd: string, args: string[], env?: Record<string, string>): Pr
   // reach bd's install dir, so a bare `spawn("bd", …)` fails with `spawn bd ENOENT`.
   const bin = resolveBdBin();
   const budgetMs = stepTimeoutMs();
+  const bufferLimit = maxBuffer();
   const startedAt = Date.now();
 
   return new Promise<string>((resolve, reject) => {
@@ -309,7 +319,10 @@ async function bd(cwd: string, args: string[], env?: Record<string, string>): Pr
         dropPipes();
         reject(
           Object.assign(
-            new Error(`bd ${args.join(" ")} in ${cwd}: ${stream} maxBuffer length exceeded`),
+            new Error(
+              `bd ${args.join(" ")} in ${cwd}: ${stream} exceeded ${bufferLimit} bytes ` +
+                `(maxBuffer length exceeded)`,
+            ),
             { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER", killed: true, stdout, stderr },
           ),
         );
@@ -318,11 +331,11 @@ async function bd(cwd: string, args: string[], env?: Record<string, string>): Pr
 
     child.stdout?.on("data", (c: Buffer) => {
       stdout += outDecoder.write(c);
-      if (stdout.length > BD_MAX_BUFFER) overflow("stdout");
+      if (stdout.length > bufferLimit) overflow("stdout");
     });
     child.stderr?.on("data", (c: Buffer) => {
       stderr += errDecoder.write(c);
-      if (stderr.length > BD_MAX_BUFFER) overflow("stderr");
+      if (stderr.length > bufferLimit) overflow("stderr");
     });
 
     // `spawn bd ENOENT` and friends — bd never ran, so there is no group to reap.

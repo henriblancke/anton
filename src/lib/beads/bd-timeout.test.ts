@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   BD_KILL_GRACE_ENV,
+  BD_MAX_BUFFER_ENV,
   BD_STEP_TIMEOUT_ENV,
   runBdForTest as runBd,
   runDoltSync,
@@ -87,6 +88,7 @@ beforeEach(() => {
 afterEach(() => {
   delete process.env[BD_STEP_TIMEOUT_ENV];
   delete process.env[BD_KILL_GRACE_ENV];
+  delete process.env[BD_MAX_BUFFER_ENV];
   delete process.env[BD_BIN_ENV];
   resetBdBinCache();
   while (strays.length) {
@@ -176,6 +178,60 @@ describe("bd timeout reaps the whole process group (anton-jfjw.1)", () => {
       "sleep 30",
     ]);
     await expect(runDoltSync(dir)).rejects.toThrow(/bd dolt pull failed[\s\S]*exceeded its \d+ms budget/);
+  });
+});
+
+describe("bd caps captured output per stream (anton-jfjw.1)", () => {
+  // The ceiling replaced execFile's native `maxBuffer`, so it is hand-rolled code with a process
+  // kill in it. ANTON_BD_MAX_BUFFER shrinks it to 64 KB (as ANTON_SHELL_MAX_OUTPUT does for gates)
+  // so the path is provable in milliseconds instead of needing 32 MB of output.
+  const CAP = 65_536;
+
+  it("kills the group and rejects once a flooding bd blows the stdout ceiling", async () => {
+    process.env[BD_STEP_TIMEOUT_ENV] = String(30_000); // the overflow, not the budget, must reject
+    process.env[BD_MAX_BUFFER_ENV] = String(CAP);
+    const kidPidFile = join(dir, "flood-kid.pid");
+    // The backgrounded node inherits bd's stdout, so nothing but a group kill ends it.
+    fakeBd("bd-floods-stdout", [
+      "#!/bin/sh",
+      `${process.execPath} -e 'setInterval(() => {}, 1 << 30)' & echo $! > ${kidPidFile}`,
+      "while :; do echo flood-flood-flood-flood-flood-flood; done",
+    ]);
+
+    const err = (await runBd(dir, ["list", "--json"]).then(
+      () => {
+        throw new Error("expected an overflow rejection");
+      },
+      (e: Error) => e,
+    )) as Error & { code?: string; killed?: boolean };
+    expect(err.code).toBe("ERR_CHILD_PROCESS_STDIO_MAXBUFFER");
+    expect(err.killed).toBe(true);
+    expect(err.message).toContain("stdout");
+    expect(err.message).toContain(String(CAP)); // the ceiling actually in force, not the default
+
+    const kidPid = await readPid(kidPidFile);
+    strays.push(kidPid);
+    expect(await waitForDeath(kidPid), "the leaked grandchild must be reaped too").toBe(true);
+  });
+
+  it("applies the ceiling to stderr as well", async () => {
+    process.env[BD_STEP_TIMEOUT_ENV] = String(30_000);
+    process.env[BD_MAX_BUFFER_ENV] = String(CAP);
+    fakeBd("bd-floods-stderr", [
+      "#!/bin/sh",
+      "while :; do echo flood-flood-flood-flood-flood-flood >&2; done",
+    ]);
+
+    await expect(runBd(dir, ["dolt", "pull"])).rejects.toMatchObject({
+      code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+      message: expect.stringContaining("stderr"),
+    });
+  });
+
+  it("leaves a call under the ceiling untouched", async () => {
+    process.env[BD_MAX_BUFFER_ENV] = String(CAP);
+    fakeBd("bd-under-cap", ["#!/bin/sh", 'printf "%s" "[]"']);
+    await expect(runBd(dir, ["list", "--json"])).resolves.toBe("[]");
   });
 });
 
