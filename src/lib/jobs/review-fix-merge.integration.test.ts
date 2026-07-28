@@ -11,11 +11,11 @@ import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { describeBd, makeBdRepo, saveEnv, type BdRepo } from "@/lib/testing/integration";
+import { driveJob } from "@/lib/testing/jobs";
 import { makeTestDb, type TestDb } from "../db/testing";
 import { beads, LABELS } from "../beads/bd";
 import * as schema from "../db/schema";
 import { getJob, type Clock } from "./queue";
-import { JobRunner } from "./runner";
 import { makeReviewFixHandler } from "./review-fix";
 import { createRun, getRunById } from "../runs";
 
@@ -60,14 +60,15 @@ describeBd("review-fix merge finalization (real handler · real bd/git · fake g
   let runId: string;
   let restoreEnv: () => void;
 
-  const runSweep = async () => {
-    const runner = new JobRunner({ db: tdb.db, clock, config: { maxConcurrent: 1, leaseMs: 30_000 } });
-    runner.registerHandler("review-fix", makeReviewFixHandler({ db: tdb.db, clock }));
-    const jobId = await runner.enqueue({ type: "review-fix", projectId, payload: { projectId } });
-    expect(await runner.tickOnce()).toBe(1);
-    await runner.whenIdle();
-    return jobId;
-  };
+  const runSweep = () =>
+    driveJob({
+      db: tdb.db,
+      clock,
+      type: "review-fix",
+      handler: makeReviewFixHandler,
+      projectId,
+      config: { leaseMs: 30_000 },
+    });
 
   const branchExists = (b: string) => {
     const out = execFileSync("git", ["-C", repo, "branch", "--list", b], { encoding: "utf8" });

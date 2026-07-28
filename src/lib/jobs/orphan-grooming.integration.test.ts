@@ -6,11 +6,11 @@ import { afterAll, beforeAll, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { describeBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
+import { driveJob } from "@/lib/testing/jobs";
 import { makeTestDb, type TestDb } from "../db/testing";
 import { beads } from "../beads/bd";
 import * as schema from "../db/schema";
 import { type Clock } from "./queue";
-import { JobRunner } from "./runner";
 import { makeOrphanGroomingHandler, ORPHAN_EPIC_LABEL } from "./orphan-grooming";
 
 class FakeClock implements Clock {
@@ -41,6 +41,16 @@ describeBd("orphan-grooming e2e (real handler · real bd)", () => {
   let childTicket: string;
   let realEpic: string;
 
+  /** One orphan-grooming sweep, driven to settlement against the suite's db/repo. */
+  const runGrooming = () =>
+    driveJob({
+      db: tdb.db,
+      clock,
+      type: "orphan-grooming",
+      handler: makeOrphanGroomingHandler,
+      projectId,
+    });
+
   beforeAll(async () => {
     bdRepo = makeBdRepo({ initialCommit: true });
     repo = bdRepo.repo;
@@ -69,11 +79,7 @@ describeBd("orphan-grooming e2e (real handler · real bd)", () => {
   });
 
   it("buckets loose tickets under a grooming epic; leaves parented ones alone", async () => {
-    const runner = new JobRunner({ db: tdb.db, clock, config: { maxConcurrent: 1 } });
-    runner.registerHandler("orphan-grooming", makeOrphanGroomingHandler({ db: tdb.db, clock }));
-    await runner.enqueue({ type: "orphan-grooming", projectId, payload: { projectId } });
-    expect(await runner.tickOnce()).toBe(1);
-    await runner.whenIdle();
+    await runGrooming();
 
     const board = await beads.list(repo, ["--status", "all"]);
 
@@ -104,11 +110,7 @@ describeBd("orphan-grooming e2e (real handler · real bd)", () => {
     const before = await beads.list(repo, ["--status", "all"]);
     const epicCountBefore = before.filter((b) => beads.isEpic(b)).length;
 
-    const runner = new JobRunner({ db: tdb.db, clock, config: { maxConcurrent: 1 } });
-    runner.registerHandler("orphan-grooming", makeOrphanGroomingHandler({ db: tdb.db, clock }));
-    await runner.enqueue({ type: "orphan-grooming", projectId, payload: { projectId } });
-    await runner.tickOnce();
-    await runner.whenIdle();
+    await runGrooming();
 
     const after = await beads.list(repo, ["--status", "all"]);
     const epicCountAfter = after.filter((b) => beads.isEpic(b)).length;
@@ -116,9 +118,7 @@ describeBd("orphan-grooming e2e (real handler · real bd)", () => {
 
     // A freshly-added orphan gets bucketed under the SAME grooming epic on the next run.
     const orphanC = createTicket(repo, "Loose ticket C");
-    await runner.enqueue({ type: "orphan-grooming", projectId, payload: { projectId } });
-    await runner.tickOnce();
-    await runner.whenIdle();
+    await runGrooming();
     const final = await beads.list(repo, ["--status", "all"]);
     expect(final.filter((b) => beads.isEpic(b)).length).toBe(epicCountBefore); // still one grooming epic
     const groomingEpic = final.find(
