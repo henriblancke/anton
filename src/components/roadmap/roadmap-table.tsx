@@ -4,29 +4,36 @@ import { MapIcon } from "lucide-react";
 import type { RoadmapRow } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { boardEpicFilterHref, TYPE_BADGE } from "@/components/board/board-utils";
+import { EpicRowActions } from "@/components/roadmap/epic-row-actions";
+import { PRIORITY_LABELS } from "@/components/ticket/ticket-dialog-utils";
 
 /**
- * The roadmap table — the epic tier's own page. Read, not operated: no control on this surface
- * mutates an epic, and the Linear ref is whatever the last sync wrote, never a live lookup
- * (docs/design/2026-07-26-tier-and-linear-ux.md). Every row links through to the board narrowed to
- * that epic, which is where the work is actually operated.
+ * The roadmap table — the epic tier's own page. Still a reading surface: the rollup counts and the
+ * Linear ref are derived or last-written, never live lookups, and the work itself is operated on
+ * the board (docs/design/2026-07-26-tier-and-linear-ux.md). The one exception is the per-row edit
+ * button, which opens a dialog over the three fields this table displays and the roadmap owns —
+ * title, priority, area. Everything else about an epic is still shaped, not typed here.
  */
 export function RoadmapTable({ slug, rows }: { slug: string; rows: RoadmapRow[] }) {
   if (rows.length === 0) return <RoadmapEmpty slug={slug} />;
 
   return (
     <div className="min-h-0 flex-1 overflow-auto">
-      <table className="w-full min-w-[620px] border-collapse text-[13px]">
+      <table className="w-full min-w-[700px] border-collapse text-[13px]">
         <caption className="sr-only">
-          Product epics: area, feature rollup, and Linear reference
+          Product epics: priority, area, feature rollup, and Linear reference
         </caption>
         <thead>
           <tr>
             <ColumnHead>Epic</ColumnHead>
+            <ColumnHead>Priority</ColumnHead>
             <ColumnHead>Area</ColumnHead>
             <ColumnHead>Features</ColumnHead>
             <ColumnHead>Shipped</ColumnHead>
             <ColumnHead>Linear</ColumnHead>
+            <ColumnHead>
+              <span className="sr-only">Actions</span>
+            </ColumnHead>
           </tr>
         </thead>
         <tbody>
@@ -43,6 +50,9 @@ export function RoadmapTable({ slug, rows }: { slug: string; rows: RoadmapRow[] 
                 <span className="font-mono text-[10px] text-subtle">{row.id}</span>
               </td>
               <td className="px-3 py-2.5 align-middle">
+                <PriorityChip priority={row.priority} />
+              </td>
+              <td className="px-3 py-2.5 align-middle">
                 <AreaChip area={row.area} />
               </td>
               <td className={cn(NUM_CELL, row.features === 0 && "text-subtle")}>{row.features}</td>
@@ -57,6 +67,9 @@ export function RoadmapTable({ slug, rows }: { slug: string; rows: RoadmapRow[] 
               </td>
               <td className="px-3 py-2.5 align-middle">
                 <LinearCell row={row} />
+              </td>
+              <td className="px-3 py-2.5 text-right align-middle">
+                <EpicRowActions slug={slug} row={row} />
               </td>
             </tr>
           ))}
@@ -76,6 +89,32 @@ function ColumnHead({ children }: { children: React.ReactNode }) {
     >
       {children}
     </th>
+  );
+}
+
+/**
+ * Where the epic sits in the queue. P0/P1 borrow the risk hues — the roadmap is scanned for what is
+ * urgent, and a flat monospace column makes that a reading exercise. P4 (bd's default for an epic
+ * nobody prioritised) stays subtle so an explicit low priority and an unset one look alike, which
+ * they are.
+ */
+function PriorityChip({ priority }: { priority: number }) {
+  return (
+    <span
+      className={cn(
+        "font-mono text-[11px] tabular-nums",
+        priority === 0
+          ? "font-medium text-risk-high"
+          : priority === 1
+            ? "text-risk-med"
+            : priority >= 4
+              ? "text-subtle"
+              : "text-muted-foreground",
+      )}
+      title={PRIORITY_LABELS[priority]}
+    >
+      {`P${priority}`}
+    </span>
   );
 }
 
@@ -148,10 +187,12 @@ export function RoadmapPageFallback({ slug }: { slug?: string }) {
         {Array.from({ length: 6 }).map((_, i) => (
           <div key={i} className="flex items-center gap-4 border-b border-border px-3 py-3">
             <span className="anton-shimmer h-3 w-2/5 rounded" />
+            <span className="anton-shimmer h-2.5 w-6 rounded" />
             <span className="anton-shimmer h-3 w-20 rounded" />
             <span className="anton-shimmer ml-auto h-2.5 w-8 rounded" />
             <span className="anton-shimmer h-2.5 w-12 rounded" />
             <span className="anton-shimmer h-2.5 w-16 rounded" />
+            <span className="anton-shimmer size-7 rounded-md" />
           </div>
         ))}
       </div>

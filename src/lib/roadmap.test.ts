@@ -65,10 +65,25 @@ describe("buildRoadmap", () => {
         id: "e-1",
         title: "Operator ergonomics",
         area: undefined,
+        priority: 4,
         features: 1,
         shipped: 1,
         linearRef: undefined,
       },
+    ]);
+  });
+
+  it("carries each epic's priority, defaulting to P4 exactly as the sort does", () => {
+    const rows = buildRoadmap([
+      epic({ id: "e-p0", priority: 0 }),
+      epic({ id: "e-none" }), // no explicit priority
+    ]);
+
+    // The column and compareEpics must read the same value, or the table would show P4 on a row
+    // the sort had already treated as something else.
+    expect(rows.map((r) => [r.id, r.priority])).toEqual([
+      ["e-p0", 0],
+      ["e-none", 4],
     ]);
   });
 

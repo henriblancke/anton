@@ -163,6 +163,9 @@ export interface RoadmapRow {
   /** The epic's `area:` designator — what Linear project routing keys on. Absent means the epic
    * can't be routed, which the row says out loud rather than failing silently at push time. */
   area?: string;
+  /** bd priority, 0=critical … 4=backlog. Defaulted, never undefined, so the column and the sort
+   * agree — an epic with no explicit priority reads (and orders) as P4. */
+  priority: number;
   /** `feature` children, excluding abandoned ones. */
   features: number;
   /** How many of those features shipped. */

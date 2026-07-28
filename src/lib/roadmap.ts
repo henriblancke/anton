@@ -69,6 +69,8 @@ export function buildRoadmap(all: Bead[]): RoadmapRow[] {
         id: epic.id,
         title: epic.title,
         area: labelValueOf(epic.labels, "area"),
+        // Same fallback compareEpics sorts on, so the column can never disagree with the order.
+        priority: epic.priority ?? DEFAULT_PRIORITY,
         features: features.length,
         shipped: features.filter((f) => deriveStage(f) === "done").length,
         linearRef: linearRefOf(epic),

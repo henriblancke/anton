@@ -1,14 +1,21 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 
 import type { RoadmapRow } from "@/lib/types";
 import { RoadmapTable } from "@/components/roadmap/roadmap-table";
+
+// The table is a Server Component, but its per-row edit button is a client island that calls
+// useRouter — which throws "expected app router to be mounted" outside a real App Router tree.
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({ refresh: vi.fn(), push: vi.fn() }),
+}));
 
 function makeRow(over: Partial<RoadmapRow> = {}): RoadmapRow {
   return {
     id: "e-1",
     title: "Zero-touch ingestion",
     area: "ingest",
+    priority: 2,
     features: 2,
     shipped: 1,
     linearRef: "LIB-124",
@@ -70,6 +77,42 @@ describe("RoadmapTable", () => {
 
     expect(html).not.toContain("0 / 0");
     expect(html).toContain("—");
+  });
+
+  it("shows each epic's priority in its own column", () => {
+    const html = renderToStaticMarkup(
+      <RoadmapTable slug="acme" rows={[makeRow({ priority: 0 })]} />,
+    );
+
+    expect(html).toContain("Priority");
+    expect(html).toContain("P0");
+    expect(html).toContain("P0 · critical"); // the title attribute spells the level out
+  });
+
+  it("renders an unprioritised epic as P4 rather than a blank cell", () => {
+    // buildRoadmap defaults a missing bead priority to 4, so the column always has a value.
+    const html = renderToStaticMarkup(
+      <RoadmapTable slug="acme" rows={[makeRow({ priority: 4 })]} />,
+    );
+
+    expect(html).toContain("P4");
+  });
+
+  it("gives every row an edit control labelled with its epic", () => {
+    const html = renderToStaticMarkup(
+      <RoadmapTable slug="acme" rows={[makeRow({ title: "Zero-touch ingestion" })]} />,
+    );
+
+    expect(html).toContain('aria-label="Edit Zero-touch ingestion"');
+  });
+
+  it("keeps the title link pointing at the board, not the edit dialog", () => {
+    // The row has two distinct affordances: the title navigates, the pencil edits. Collapsing them
+    // would nest a button inside a link and cost the board-filter shortcut.
+    const html = renderToStaticMarkup(<RoadmapTable slug="acme" rows={[makeRow()]} />);
+
+    expect(html).toContain('href="/projects/acme?epic=e-1"');
+    expect(html).toContain("aria-label=\"Edit Zero-touch ingestion\"");
   });
 
   it("renders an actionable empty state instead of a headless table for an empty board", () => {
