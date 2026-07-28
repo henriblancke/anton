@@ -139,13 +139,22 @@ export function buildPruneArgs(age: PruneAge, opts: { force?: boolean } = {}): s
   ];
 }
 
+/**
+ * Wall-clock budget for ONE `bd` invocation. Note what it does NOT bound: it is a per-step budget,
+ * so a full sync pass (pull → commit → push) may legitimately spend 3× it, and Node's kill only
+ * reaches the `bd` child — a grandchild wedged in uninterruptible wait keeps the pipes open and the
+ * promise pending past it. Callers that need a bounded PASS must add their own deadline on top
+ * (see beatDeadlineMs in sync-engine.ts).
+ */
+export const BD_STEP_TIMEOUT_MS = 60_000;
+
 async function bd(cwd: string, args: string[], env?: Record<string, string>): Promise<string> {
   // Spawn bd by its resolved absolute path (anton-346): a background-launched server's PATH may not
   // reach bd's install dir, so a bare `execFile("bd", …)` fails with `spawn bd ENOENT`.
   const { stdout } = await execFileAsync(resolveBdBin(), args, {
     cwd,
     maxBuffer: 32 * 1024 * 1024,
-    timeout: 60_000,
+    timeout: BD_STEP_TIMEOUT_MS,
     ...(env ? { env: { ...process.env, ...env } } : {}),
   });
   return stdout;

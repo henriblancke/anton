@@ -8,8 +8,12 @@
  * only, so idle anton instances never hammer a shared remote (see SyncRequest in bd.ts). Started
  * once at server boot alongside the job runner; status lands in the globalThis
  * sync-status registry that API routes read.
+ *
+ * Beats are contained per repo (anton-jfjw.2): each one is deadline-bounded and, past its deadline,
+ * abandoned rather than awaited, so a repo whose sync never settles degrades to "that one board is
+ * stale" instead of stopping the scheduler for every project.
  */
-import { beads, getSyncStatus } from "./bd";
+import { BD_STEP_TIMEOUT_MS, beads, getSyncStatus } from "./bd";
 import { listProjects } from "../projects";
 
 export interface SyncEngineDeps {
@@ -23,22 +27,67 @@ export interface SyncEngineDeps {
   notWiredRecheckMs: number;
   /** Ceiling for the doubling failure backoff. */
   maxBackoffMs: number;
+  /** Wall-clock deadline for ONE beat; past it the beat is a failure (see beatDeadlineMs). */
+  beatTimeoutMs: number;
   log: { info: (msg: string) => void; error: (msg: string) => void };
   now: () => number;
 }
 
-const defaultDeps = (): SyncEngineDeps => ({
-  listProjects,
-  sync: (cwd) => beads.backstop(cwd),
-  heartbeatMs: Number(process.env.ANTON_SYNC_HEARTBEAT_MS) || 30_000,
-  notWiredRecheckMs: Number(process.env.ANTON_SYNC_NOT_WIRED_RECHECK_MS) || 60_000,
-  maxBackoffMs: 60_000,
-  log: {
-    info: (msg) => console.log(`[sync-engine] ${msg}`),
-    error: (msg) => console.error(`[sync-engine] ${msg}`),
-  },
-  now: () => Date.now(),
-});
+/** Steps in the widest pass a beat can run — `bd dolt` pull → commit → push (runDoltSync). */
+const FULL_PASS_STEPS = 3;
+
+/** Beat deadline in heartbeats: six missed beats is unambiguously wedged, not merely slow. */
+const BEAT_DEADLINE_HEARTBEATS = 6;
+
+/**
+ * Wall-clock budget for one beat, past which the scheduler abandons it (anton-jfjw.2). A hung
+ * `bd dolt pull` is NOT self-limiting: `bd`'s own per-step timeout only kills the `bd` child, so a
+ * grandchild (a `git fetch` in uninterruptible wait) keeps the pipes open and the pass pending
+ * forever. Without this bound, one wedged repo froze the heartbeat for EVERY project — tick() never
+ * settled, so loop() never rescheduled.
+ *
+ * Scaled to the heartbeat so the bound stays meaningful when the cadence is tuned, with a floor at
+ * the widest legitimate pass: pull+commit+push each get the full per-step budget, so relying on that
+ * budget alone would let one honest pass run 3× it. The floor keeps a genuinely slow — but
+ * progressing — repo from being reported as wedged.
+ */
+export function beatDeadlineMs(heartbeatMs: number): number {
+  const configured = Number(process.env.ANTON_SYNC_BEAT_TIMEOUT_MS);
+  if (Number.isFinite(configured) && configured > 0) return configured;
+  return Math.max(heartbeatMs * BEAT_DEADLINE_HEARTBEATS, FULL_PASS_STEPS * BD_STEP_TIMEOUT_MS);
+}
+
+const defaultDeps = (): SyncEngineDeps => {
+  const heartbeatMs = Number(process.env.ANTON_SYNC_HEARTBEAT_MS) || 30_000;
+  return {
+    listProjects,
+    sync: (cwd) => beads.backstop(cwd),
+    heartbeatMs,
+    notWiredRecheckMs: Number(process.env.ANTON_SYNC_NOT_WIRED_RECHECK_MS) || 60_000,
+    maxBackoffMs: 60_000,
+    beatTimeoutMs: beatDeadlineMs(heartbeatMs),
+    log: {
+      info: (msg) => console.log(`[sync-engine] ${msg}`),
+      error: (msg) => console.error(`[sync-engine] ${msg}`),
+    },
+    now: () => Date.now(),
+  };
+};
+
+/**
+ * Reject with `onTimeout()` if `p` hasn't settled within `ms`. `p` keeps running — a wedged pass
+ * can't be cancelled from here (that's the spawn reap's job); this only stops the SCHEDULER from
+ * waiting on it. The timer is unref'd and always cleared, so an idle engine never holds the process
+ * open and a fast pass leaves nothing pending.
+ */
+function withDeadline<T>(p: Promise<T>, ms: number, onTimeout: () => Error): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(onTimeout()), ms);
+    timer.unref?.();
+  });
+  return Promise.race([p, deadline]).finally(() => clearTimeout(timer));
+}
 
 interface ProjectBeat {
   nextDueAt: number;
@@ -54,8 +103,15 @@ export interface SyncEngine {
 }
 
 export function createSyncEngine(overrides: Partial<SyncEngineDeps> = {}): SyncEngine {
-  const deps = { ...defaultDeps(), ...overrides };
+  const deps: SyncEngineDeps = { ...defaultDeps(), ...overrides };
+  // Derive the deadline from the EFFECTIVE heartbeat — an overridden cadence must carry its own
+  // bound rather than the one the env-configured default happened to produce.
+  if (overrides.beatTimeoutMs === undefined) deps.beatTimeoutMs = beatDeadlineMs(deps.heartbeatMs);
   const beats = new Map<string, ProjectBeat>();
+  // Repos whose pass is still running. A beat abandoned at its deadline stays here until the
+  // underlying pass actually settles, so a permanently wedged repo holds exactly ONE in-flight beat
+  // instead of accumulating a new one every heartbeat.
+  const inFlight = new Set<string>();
   let timer: ReturnType<typeof setTimeout> | null = null;
   let stopped = true;
 
@@ -66,7 +122,15 @@ export function createSyncEngine(overrides: Partial<SyncEngineDeps> = {}): SyncE
       lastLoggedError: null,
     };
     try {
-      await deps.sync(repoPath);
+      const pass = deps.sync(repoPath);
+      inFlight.add(repoPath);
+      // Release on the PASS, not on the deadline race: the pass outlives an abandoned beat.
+      void pass.catch(() => {}).finally(() => inFlight.delete(repoPath));
+      await withDeadline(
+        pass,
+        deps.beatTimeoutMs,
+        () => new Error(`sync exceeded its ${deps.beatTimeoutMs}ms beat deadline`),
+      );
       const state = getSyncStatus(repoPath).state;
       beat.backoffMs = deps.heartbeatMs;
       beat.lastLoggedError = null;
@@ -74,7 +138,10 @@ export function createSyncEngine(overrides: Partial<SyncEngineDeps> = {}): SyncE
         deps.now() + (state === "not-wired" ? deps.notWiredRecheckMs : deps.heartbeatMs);
     } catch (e) {
       // Failure is already recorded in the status registry by the coalescer; here we only pace
-      // retries (doubling backoff, capped) and keep the log to one line per distinct error.
+      // retries (doubling backoff, capped) and keep the log to one line per distinct error. A
+      // deadline miss takes this same path deliberately — including the registry silence, since a
+      // pass that never rejected is still `syncing` there and ages into `stalled` on its own
+      // (anton-jfjw.3), which is a truer report of a wedge than a synthetic `failing`.
       const msg = e instanceof Error ? e.message : String(e);
       if (msg !== beat.lastLoggedError) {
         deps.log.error(`sync failed for ${repoPath}: ${msg}`);
@@ -95,9 +162,13 @@ export function createSyncEngine(overrides: Partial<SyncEngineDeps> = {}): SyncE
       return;
     }
     const due = projects.filter(
-      (p) => p.hasBeads && (beats.get(p.repoPath)?.nextDueAt ?? 0) <= deps.now(),
+      (p) =>
+        p.hasBeads &&
+        (beats.get(p.repoPath)?.nextDueAt ?? 0) <= deps.now() &&
+        !inFlight.has(p.repoPath),
     );
-    // One project's failure must not starve the others — settle all beats independently.
+    // One project's failure must not starve the others — settle all beats independently. Every beat
+    // is deadline-bounded, so a wedged repo can't hold this open and stop loop() rescheduling.
     await Promise.allSettled(due.map((p) => beatProject(p.repoPath)));
   }
 
