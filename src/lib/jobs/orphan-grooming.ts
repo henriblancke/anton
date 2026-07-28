@@ -58,7 +58,7 @@ export function findOrphans(all: Bead[]): Bead[] {
   return all.filter(
     (b) =>
       !beads.isEpic(b) &&
-      !beads.isRunTarget(b) &&
+      !beads.isRunTarget(b, all) &&
       b.status !== "closed" &&
       !parented.has(b.id) &&
       !(b.labels?.includes(ORPHAN_EPIC_LABEL) ?? false),

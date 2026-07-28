@@ -15,6 +15,7 @@ import {
   DependenciesIcon,
   JobsIcon,
   ProjectsIcon,
+  RoadmapIcon,
   RunsIcon,
   SettingsIcon,
   TicketsIcon,
@@ -26,6 +27,7 @@ type NavEntry = ShellNavItem & { icon: NavIcon; exact?: boolean };
 function projectNav(slug: string): NavEntry[] {
   return [
     { label: "Board", href: `/projects/${slug}`, icon: BoardIcon, exact: true },
+    { label: "Roadmap", href: `/projects/${slug}/roadmap`, icon: RoadmapIcon },
     { label: "Tickets", href: `/projects/${slug}/tickets`, icon: TicketsIcon },
     { label: "Dependencies", href: `/projects/${slug}/dependencies`, icon: DependenciesIcon },
   ];

@@ -112,3 +112,68 @@ describeBd("epic abandon route (real bd)", () => {
     expect(res.status).toBe(409);
   });
 });
+
+describeBd("container epic abandon cancels its features' runs (real bd)", () => {
+  let bdRepo: BdRepo;
+  let repo: string;
+  let containerId: string;
+  let featureId: string;
+  let taskId: string;
+
+  beforeAll(async () => {
+    bdRepo = makeBdRepo();
+    repo = bdRepo.repo;
+    project = {
+      id: "proj-2",
+      slug: "tmp",
+      name: "tmp",
+      repoPath: repo,
+      defaultBranch: "main",
+      hasBeads: true,
+      createdAt: 0,
+    };
+    containerId = await beads.create(repo, { title: "Product outcome", type: "epic" });
+    featureId = await beads.create(repo, {
+      title: "The shippable unit",
+      type: "feature",
+      deps: [`parent-child:${containerId}`],
+    });
+    taskId = await beads.create(repo, {
+      title: "Its ticket",
+      type: "task",
+      deps: [`parent-child:${featureId}`],
+    });
+  });
+
+  afterAll(() => {
+    bdRepo?.cleanup();
+  });
+
+  beforeEach(() => {
+    resetIssueSnapshots();
+    cancelled.length = 0;
+  });
+
+  it("kills the feature's run too — the container never owned one", async () => {
+    // The live job is keyed by the FEATURE, so cancelling only the container would leave its agent
+    // running (and committing, and opening a PR) against work the board now calls won't-do.
+    const res = await POST(
+      post({ reason: "the market moved" }),
+      paramsCtx({ slug: "tmp", epicId: containerId }),
+    );
+    expect(res.status).toBe(200);
+    const { abandoned } = (await res.json()) as { abandoned: EpicAbandonResult };
+    expect(abandoned).toEqual({ epicId: containerId, children: [featureId, taskId] });
+
+    // The container's own id is still cancelled (a legacy epic runs itself); the task is not a run
+    // target, so it carries no job of its own.
+    expect(cancelled).toEqual([
+      ["proj-2", containerId],
+      ["proj-2", featureId],
+    ]);
+
+    for (const id of [containerId, featureId, taskId]) {
+      expect(beads.isAbandoned(await beads.show(repo, id))).toBe(true);
+    }
+  });
+});

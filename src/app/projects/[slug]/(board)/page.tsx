@@ -1,5 +1,8 @@
+import { Suspense } from "react";
+
 import { getProjectBySlug, getProjectSettingsBySlug } from "@/lib/projects";
 import { EpicBoard } from "@/components/board/epic-board";
+import { BoardSkeleton } from "@/components/board/board-skeleton";
 import { Topbar } from "@/components/shell/topbar";
 import { getBoard } from "@/lib/board";
 
@@ -21,7 +24,11 @@ export default async function ProjectBoardPage({
     <div className="flex min-h-0 flex-1 flex-col">
       <Topbar projectSlug={slug} projectName={project?.name} />
       <div className="flex min-h-0 flex-1 flex-col p-[18px]">
-        <EpicBoard slug={slug} initialBoard={board} budgetAware={settings.budgetAware === true} />
+        {/* The board reads its Epic/Area narrowing from the URL (useSearchParams), which needs a
+            Suspense boundary so the shell above it isn't dragged into client-side rendering. */}
+        <Suspense fallback={<BoardSkeleton />}>
+          <EpicBoard slug={slug} initialBoard={board} budgetAware={settings.budgetAware === true} />
+        </Suspense>
       </div>
     </div>
   );

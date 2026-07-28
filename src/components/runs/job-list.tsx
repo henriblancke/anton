@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { ChevronRightIcon, ScrollTextIcon } from "lucide-react";
 
 // Type-only import: pulling the runtime `isActiveJob`/`listJobs` from jobs-view would drag its
@@ -15,6 +15,7 @@ import { Button } from "@/components/ui/button";
 import { fmtDuration } from "@/components/runs/run-view-utils";
 import { ResumeJobButton } from "@/components/runs/resume-job-button";
 import { KillJobButton } from "@/components/runs/kill-job-button";
+import { BulkKillJobsBar } from "@/components/runs/bulk-kill-jobs-bar";
 import {
   InvestigateJobButton,
   InvestigateTerminal,
@@ -69,12 +70,127 @@ export function JobList({
    */
   liveJobs?: Record<string, LiveJobInfo>;
 }) {
+  // Confirmed kills, held here rather than per row so the bulk bar and the per-row button write to
+  // the same place. Only ever grown from a 200 — a refused kill leaves the job's own status.
+  const [killedIds, setKilledIds] = useState<ReadonlySet<string>>(EMPTY_IDS);
+  const [selectedIds, setSelectedIds] = useState<ReadonlySet<string>>(EMPTY_IDS);
+
+  // Selection may only ever cover rows on screen, so it is keyed to exactly the rows rendered.
+  const rowsKey = useMemo(() => jobs.map((job) => job.id).join("|"), [jobs]);
+  const [renderedRowsKey, setRenderedRowsKey] = useState(rowsKey);
+  if (renderedRowsKey !== rowsKey) {
+    // A different result set is on screen (filter or page changed) — drop the selection during
+    // render so a stale one can never be killed against rows the founder is no longer looking at.
+    // Local kill state goes with it: the freshly loaded rows carry the server's own status.
+    setRenderedRowsKey(rowsKey);
+    setSelectedIds(EMPTY_IDS);
+    setKilledIds(EMPTY_IDS);
+  }
+
+  // Selectable === killable: exactly the rows that render a per-row Force kill.
+  const selectableIds = jobs
+    .filter((job) => ACTIVE_JOB_STATUSES.has(job.status) && !killedIds.has(job.id))
+    .map((job) => job.id);
+  const selected = selectableIds.filter((id) => selectedIds.has(id));
+  const allSelected = selectableIds.length > 0 && selected.length === selectableIds.length;
+
+  function toggle(jobId: string, checked: boolean) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(jobId);
+      else next.delete(jobId);
+      return next;
+    });
+  }
+
+  function markKilled(ids: string[]) {
+    setKilledIds((prev) => new Set([...prev, ...ids]));
+    setSelectedIds((prev) => new Set([...prev].filter((id) => !ids.includes(id))));
+  }
+
   return (
-    <ul className="flex flex-col divide-y divide-border">
-      {jobs.map((job) => (
-        <JobRow key={job.id} job={job} slug={slug} live={liveJobs?.[job.id]} />
-      ))}
-    </ul>
+    <div className="flex flex-col">
+      {selectableIds.length > 0 && (
+        <div className="flex items-center gap-3 border-b border-border px-6 py-2.5">
+          <SelectCheckbox
+            id={SELECT_ALL_ID}
+            checked={allSelected}
+            indeterminate={selected.length > 0 && !allSelected}
+            onChange={(checked) =>
+              setSelectedIds(checked ? new Set(selectableIds) : EMPTY_IDS)
+            }
+            label={`Select all ${selectableIds.length} cancellable ${
+              selectableIds.length === 1 ? "job" : "jobs"
+            } on this page`}
+          />
+          <label htmlFor={SELECT_ALL_ID} className="cursor-pointer font-mono text-[11px] text-subtle">
+            Select all
+          </label>
+          {selected.length > 0 && (
+            <BulkKillJobsBar
+              slug={slug}
+              jobIds={selected}
+              onKilled={markKilled}
+              onClear={() => setSelectedIds(EMPTY_IDS)}
+            />
+          )}
+        </div>
+      )}
+      <ul className="flex flex-col divide-y divide-border">
+        {jobs.map((job) => (
+          <JobRow
+            key={job.id}
+            job={job}
+            slug={slug}
+            live={liveJobs?.[job.id]}
+            killed={killedIds.has(job.id)}
+            onKilled={() => markKilled([job.id])}
+            selectable={selectableIds.includes(job.id)}
+            selected={selectedIds.has(job.id)}
+            onSelectedChange={(checked) => toggle(job.id, checked)}
+            selectionColumn={selectableIds.length > 0}
+          />
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/** Stable empty selection, so a reset can't churn identity on every render. */
+const EMPTY_IDS: ReadonlySet<string> = new Set();
+
+/** One list per page, so a constant id is enough to bind the visible "Select all" text to it. */
+const SELECT_ALL_ID = "jobs-select-all";
+
+/**
+ * Native checkbox — keyboard-reachable and indeterminate-capable for free, which is the whole
+ * requirement here. `indeterminate` is DOM-only state, so it is written through a ref.
+ */
+function SelectCheckbox({
+  id,
+  checked,
+  indeterminate = false,
+  onChange,
+  label,
+}: {
+  id?: string;
+  checked: boolean;
+  indeterminate?: boolean;
+  onChange: (checked: boolean) => void;
+  label: string;
+}) {
+  return (
+    <input
+      type="checkbox"
+      id={id}
+      aria-label={label}
+      checked={checked}
+      ref={(el) => {
+        if (el) el.indeterminate = indeterminate;
+      }}
+      onChange={(event) => onChange(event.target.checked)}
+      className="size-3.5 shrink-0 cursor-pointer accent-destructive outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+    />
   );
 }
 
@@ -82,15 +198,26 @@ function JobRow({
   job,
   slug,
   live,
+  killed,
+  onKilled,
+  selectable,
+  selected,
+  onSelectedChange,
+  selectionColumn,
 }: {
   job: JobSummary;
   slug: string;
   live?: LiveJobInfo;
+  /** Confirmed cancelled by the server (per-row or bulk) — the row shows `cancelled` at once. */
+  killed: boolean;
+  onKilled: () => void;
+  selectable: boolean;
+  selected: boolean;
+  onSelectedChange: (checked: boolean) => void;
+  /** The page has a selection column — settled rows still reserve its width so labels stay aligned. */
+  selectionColumn: boolean;
 }) {
   const [open, setOpen] = useState(false);
-  // A confirmed kill is terminal, so the row can show `cancelled` immediately rather than waiting
-  // on router.refresh(). Only ever set from a 200 — a failed kill leaves the job's own status.
-  const [killed, setKilled] = useState(false);
   // Live investigate pty under this row (anton-gjhu). Set only from a 201 spawn, cleared on close.
   const [investigateSession, setInvestigateSession] = useState<string | null>(null);
   // Live output viewer under this row (anton-x10l) — read-only tail of the job's session log.
@@ -136,7 +263,16 @@ function JobRow({
 
   return (
     <li className="flex flex-col">
-      <div className="flex items-center gap-4 px-6 py-3.5">
+      <div className="flex items-center gap-3 px-6 py-3.5">
+        {selectable ? (
+          <SelectCheckbox
+            checked={selected}
+            onChange={onSelectedChange}
+            label={`Select ${job.type} job ${job.id} for bulk kill`}
+          />
+        ) : (
+          selectionColumn && <span className="size-3.5 shrink-0" aria-hidden="true" />
+        )}
         <button
           type="button"
           onClick={() => setOpen((v) => !v)}
@@ -178,9 +314,7 @@ function JobRow({
             {investigable && !investigateSession && (
               <InvestigateJobButton slug={slug} jobId={job.id} onSession={setInvestigateSession} />
             )}
-            {active && (
-              <KillJobButton slug={slug} jobId={job.id} onKilled={() => setKilled(true)} />
-            )}
+            {active && <KillJobButton slug={slug} jobId={job.id} onKilled={onKilled} />}
           </div>
         )}
         <div className="flex shrink-0 flex-col items-end gap-0.5">

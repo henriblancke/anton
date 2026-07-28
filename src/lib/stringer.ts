@@ -70,11 +70,120 @@ export const DEFAULT_SCAN_EXCLUDES = [
   ".beads/**",
 ];
 
+/**
+ * Outer wall-clock deadline for one scan. Override with ANTON_STRINGER_TIMEOUT_MS (tests use a few
+ * hundred ms). Read per call so an override lands without a module reload.
+ */
+function scanTimeoutMs(): number {
+  const raw = Number(process.env.ANTON_STRINGER_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 10 * 60_000;
+}
+
+/**
+ * Render a deadline an operator can act on: the number must be traceable back to the configured
+ * ANTON_STRINGER_TIMEOUT_MS, so only exact whole minutes collapse to "m" -- rounding 90_000ms to
+ * "2m" would send someone looking for a timeout that isn't set anywhere. Exported for tests.
+ */
+export function formatTimeout(ms: number): string {
+  if (ms < 60_000) return `${ms}ms`;
+  if (ms % 60_000 === 0) return `${ms / 60_000}m`;
+  return `${Number((ms / 1000).toFixed(3))}s`;
+}
+
+/**
+ * Translate an execFile rejection into what actually went wrong (anton-be1s). On a timeout Node
+ * SIGTERMs the child and reports `Command failed: <argv>\n<stderr-so-far>` -- but stringer buffers
+ * every collector's log until the whole scan finishes, so a killed scan's stderr holds only startup
+ * noise. One job parked for three ~1000s attempts pointing at a harmless `gitlog` line while the
+ * real cause was the deadline. So a kill is reported as a kill; every other failure keeps its
+ * stderr, which for a genuine non-zero exit is the real diagnosis.
+ */
+function toScanError(err: unknown, opts: { timeoutMs: number }): unknown {
+  const e = err as { name?: string; code?: unknown; killed?: boolean; signal?: string } | null;
+  // A caller abort is cancellation, not a deadline -- keep the AbortError so the job runner
+  // classifies it as such. Discriminate on the error Node raised, not on the signal's state now:
+  // a signal aborted after a deadline kill would otherwise mask the timeout as cancellation.
+  if (e?.name === "AbortError" || e?.code === "ABORT_ERR") return err;
+  if (!e?.killed) return err;
+  return new Error(
+    `stringer timed out after ${formatTimeout(opts.timeoutMs)} (killed with ${e.signal ?? "SIGTERM"}, no output written). ` +
+      `stringer buffers collector logs until every collector finishes, so its partial stderr is startup noise, not the cause.`,
+    { cause: err },
+  );
+}
+
 export interface ScanResult {
   /** Absolute path to the JSON scan file written by stringer. */
   scanFile: string;
   /** Number of signals in the scan (0 means nothing to triage). */
   signalCount: number;
+  /** Collectors that died during the scan — their signals are silently absent from the JSON. */
+  collectorFailures: CollectorFailure[];
+}
+
+/** A collector stringer ran but that returned an error (or timed out) — a silent hole in the scan. */
+export interface CollectorFailure {
+  /** Collector name as stringer reports it, e.g. "gitlog". */
+  name: string;
+  /** stringer's error text, e.g. "opening repo: core.repositoryformatversion ...". */
+  error: string;
+}
+
+/**
+ * A dead collector doesn't fail the scan: stringer exits 0 and just omits that collector's signals,
+ * so the loss is invisible in the JSON (anton-uspu — `gitlog` dies on every repo with
+ * `extensions.worktreeConfig` set, taking churn/hotspots/reverts/lottery-risk with it, and nothing
+ * said so). The only evidence is stderr, where stringer's slog emits one
+ * `level=ERROR msg="collector failed" name=<c> error=<e>` line per casualty. Parse those out so the
+ * caller can surface the hole; also covers collectors killed by COLLECTOR_TIMEOUT.
+ */
+const SLOG_FIELD_RE = /(\w+)=("(?:[^"\\]|\\.)*"|\S*)/g;
+/** Older/quiet builds only emit the INFO form — matched as a fallback so a version bump can't re-silence us. */
+const RETURNED_ERROR_RE = /^collector "([^"]+)" returned error: (.*)$/;
+
+/** Unwrap a Go-quoted slog value (`"a \"b\""` → `a "b"`); plain values pass through. */
+function unquote(value: string): string {
+  if (!value.startsWith('"')) return value;
+  try {
+    return JSON.parse(value) as string;
+  } catch {
+    // Malformed for JSON (a truncated line, or a Go escape like \x00 that JSON rejects): salvage the
+    // text by hand rather than dropping the field. Only strip a closing quote that's actually there.
+    const body = value.endsWith('"') && value.length > 1 ? value.slice(1, -1) : value.slice(1);
+    return body.replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+  }
+}
+
+/** Extract per-collector failures from stringer's stderr; one entry per collector (both forms agree). */
+export function parseCollectorFailures(stderr: string): CollectorFailure[] {
+  const byName = new Map<string, CollectorFailure>();
+  for (const line of stderr.split("\n")) {
+    const fields: Record<string, string> = {};
+    for (const [, key, value] of line.matchAll(SLOG_FIELD_RE)) fields[key] = unquote(value);
+
+    if (fields.msg === "collector failed") {
+      const name = fields.name || "unknown";
+      if (!byName.has(name)) byName.set(name, { name, error: fields.error || "unknown error" });
+      continue;
+    }
+    const fallback = RETURNED_ERROR_RE.exec(fields.msg ?? "");
+    if (fallback && !byName.has(fallback[1])) {
+      byName.set(fallback[1], { name: fallback[1], error: fallback[2].trim() || "unknown error" });
+    }
+  }
+  return [...byName.values()];
+}
+
+/**
+ * One human-readable line per dead collector, naming what the scan lost. The worktreeConfig hint is
+ * called out because it's the one cause an operator can act on — and anton won't touch a repo's git
+ * config itself.
+ */
+export function describeCollectorFailure(failure: CollectorFailure): string {
+  const base = `collector "${failure.name}" failed — ${failure.error}; its signals are missing from this scan`;
+  return /worktreeconfig/i.test(failure.error)
+    ? `${base}. Cause: this repo sets extensions.worktreeConfig (conductor and \`git config --worktree\` do this) and stringer's git library refuses it. Unsetting it is the operator's call — only safe if no .git/worktrees/*/config.worktree depends on it`
+    : base;
 }
 
 /** stringer JSON is either a top-level array or an object carrying `signals`/`issues`. */
@@ -91,8 +200,10 @@ function countSignals(parsed: unknown): number {
 
 /**
  * Run `stringer scan <repo> --delta --format json -o <scanFile>` and report how many signals it
- * produced. `delta` (default true) restricts to new signals since the last scan. Throws on a
- * stringer failure (fail loud), so the job then retries/parks per the runner's policy.
+ * produced, plus any collector that died mid-scan (stringer exits 0 either way — see
+ * `parseCollectorFailures`). `delta` (default true) restricts to new signals since the last scan.
+ * Throws on a stringer failure (fail loud), so the job then retries/parks per the runner's policy --
+ * a deadline kill throws a distinct "timed out" error rather than stringer's misleading partial stderr.
  */
 export async function scan(opts: {
   repoPath: string;
@@ -111,12 +222,20 @@ export async function scan(opts: {
   // time out), and cap each collector so a runaway one can't hang the whole scan past the timeout.
   args.push("--exclude", [...DEFAULT_SCAN_EXCLUDES, ...(opts.exclude ?? [])].join(","));
   args.push("--collector-timeout", COLLECTOR_TIMEOUT);
+  // Keep stderr free of ANSI escapes so the collector-failure parse stays reliable when a TTY leaks in.
+  args.push("--no-color");
 
-  await execFileAsync(bin, args, {
-    timeout: 10 * 60_000,
-    maxBuffer: 64 * 1024 * 1024,
-    signal: opts.signal,
-  });
+  const timeoutMs = scanTimeoutMs();
+  let stderr = "";
+  try {
+    ({ stderr } = await execFileAsync(bin, args, {
+      timeout: timeoutMs,
+      maxBuffer: 64 * 1024 * 1024,
+      signal: opts.signal,
+    }));
+  } catch (err) {
+    throw toScanError(err, { timeoutMs });
+  }
 
   let signalCount = 0;
   try {
@@ -126,5 +245,9 @@ export async function scan(opts: {
     // No file / unparseable output means zero signals (nothing to triage).
     signalCount = 0;
   }
-  return { scanFile: opts.scanFile, signalCount };
+  return {
+    scanFile: opts.scanFile,
+    signalCount,
+    collectorFailures: parseCollectorFailures(stderr),
+  };
 }

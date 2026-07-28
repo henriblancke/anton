@@ -22,12 +22,15 @@ export const dynamic = "force-dynamic";
  */
 
 /** Build the 422 reason for a non-run-target, mirroring the approve route's wording. */
-function notRunnableReason(id: string, target: Bead): string {
+function notRunnableReason(id: string, target: Bead, board: Bead[]): string {
   const parent = (target.parent ?? target.parent_id) as string | undefined;
   const type = target.issue_type ?? "unknown";
+  if (beads.isContainer(target, board)) {
+    return `${id} is a container epic, not a run target — claim one of its features instead; each feature is its own run and is reserved on its own`;
+  }
   return (type === "task" || type === "bug") && parent
     ? `${id} is a child ticket of ${parent} — claim its epic ${parent} instead; a child is reserved via its epic, not on its own`
-    : `${id} is not a run target: type "${type}" — only an epic or a parentless task/bug can be claimed`;
+    : `${id} is not a run target: type "${type}" — only a feature, an epic with no feature children, or a parentless task/bug can be claimed`;
 }
 
 /** Read the optional `{ steal?: boolean }` body; a missing/invalid body means no steal. */
@@ -60,10 +63,13 @@ async function loadTarget(
       response: notFoundResponse(`Ticket ${epicId} not found on the board`),
     };
   }
-  if (!beads.isRunTarget(target)) {
+  if (!beads.isRunTarget(target, allBeads)) {
     return {
       ok: false,
-      response: NextResponse.json({ error: notRunnableReason(epicId, target) }, { status: 422 }),
+      response: NextResponse.json(
+        { error: notRunnableReason(epicId, target, allBeads) },
+        { status: 422 },
+      ),
     };
   }
   // Once approved, the reservation is locked in by the approve flow (soft-lock + steal-on-approve):

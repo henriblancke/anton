@@ -9,7 +9,7 @@ import { nudgeSync } from "./beads/sync-nudge";
 import { getDb } from "./db";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
 import { findOpenRunForEpic } from "./runs";
-import { parseAcceptance, parseGoal, toEpic, toTicket } from "./ticket-view";
+import { parentEpicOf, parseAcceptance, parseGoal, runTickets, toEpic, toTicket } from "./ticket-view";
 import { listAllBeads } from "./tickets";
 import type { DepEdge, DepType, EpicDetail, EpicRun, Project } from "./types";
 
@@ -37,11 +37,22 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
   const full = await ensureDescription(project.repoPath, lite);
   const run = await openRunFor(project, epicId);
   const base = await githubBaseUrl(project.repoPath);
+  const parentEpic = parentEpicOf(lite, all);
 
-  // The board renders orphan (parentless) non-epic beads as single-ticket pseudo-epic cards
-  // (board.ts ticketAsEpic). Mirror that here so opening one shows its detail instead of 404ing —
-  // it becomes an epic whose only member is itself, with no children and no epic-graph edges.
-  if (!beads.isEpic(lite)) {
+  // A RUN TARGET reports the whole working-layer subtree it ships (runTickets) rather than one
+  // parent hop — the same set the board card counts and the run executes, so the page never shows
+  // fewer tickets than the PR will contain. A container epic owns no run: its members are the
+  // feature cards directly beneath it, each shipping its own PR, so it still reads one hop down.
+  const childBeads = beads.isRunTarget(lite, all)
+    ? runTickets(all, epicId)
+    : all.filter((b) => beads.parentOf(b) === epicId);
+
+  // A LEAF target — a parentless task/bug chip, or a feature shaped as one unit of work — is its
+  // own single ticket, so it renders as an epic whose only member is itself, with no children and
+  // no epic-graph edges. Mirrors what the run does (beads.groupsChildren, shared with execute-epic):
+  // a feature WITH shaped tickets under it is a grouping target, and must show those tickets and
+  // their dependency graph — reporting the feature itself would hide the work the run acts on.
+  if (!beads.groupsChildren(lite, childBeads)) {
     const self = toTicket(lite);
     const epic = toEpic(lite, {
       goal: parseGoal(full.description),
@@ -50,12 +61,9 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
     });
     attachPrUrl(epic, base);
     attachPrUrl(self, base);
-    return { epic, description: full.description, tickets: [self], edges: [], run };
+    return { epic, description: full.description, tickets: [self], edges: [], run, parentEpic };
   }
 
-  const childBeads = all.filter(
-    (b) => ((b.parent ?? b.parent_id) as string | undefined) === epicId,
-  );
   const tickets = childBeads.map(toTicket);
 
   // The epic-detail header shows the epic's own agent/risk/size chips (like the board card and the
@@ -81,7 +89,7 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
     edges.push({ from: e.from, to: e.to, type: e.type as DepType });
   }
 
-  return { epic, description: full.description, tickets, edges, run };
+  return { epic, description: full.description, tickets, edges, run, parentEpic };
 }
 
 /**
