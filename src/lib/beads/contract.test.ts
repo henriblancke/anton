@@ -211,6 +211,24 @@ describe("validateBeadContract — headings inside fenced code", () => {
     expect(validateBeadContract(quoting)).toEqual([]);
   });
 
+  it("treats a section holding only an empty fenced block as unwritten", () => {
+    // The delimiters are punctuation, not content — counting them as text let a ticket whose
+    // Acceptance was an empty ``` block approve and run with no definition of done.
+    const empty = ticket({
+      acceptance_criteria: undefined,
+      description: [DESCRIPTION, "", "## Acceptance", "```", "```"].join("\n"),
+    });
+    expect(summarize(empty)).toEqual([["Acceptance", "blocking"]]);
+  });
+
+  it("still counts fenced CONTENT as authored — only the delimiters are skipped", () => {
+    const fenced = ticket({
+      acceptance_criteria: undefined,
+      description: [DESCRIPTION, "", "## Acceptance", "```", "- [ ] it works", "```"].join("\n"),
+    });
+    expect(validateBeadContract(fenced)).toEqual([]);
+  });
+
   it("reads an epic's outcome past a fenced sample rather than out of it", () => {
     // The preamble scan stops at the first REAL heading, so a fence opened in the outcome text must
     // not hide the `## Success Criteria` that follows it.

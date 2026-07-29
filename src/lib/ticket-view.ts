@@ -111,7 +111,10 @@ export function toStandaloneItem(bead: Bead, blockedBy: string[] = []): Standalo
     prRef: beads.getPrRef(bead),
     blockedBy,
     ready: blockedBy.length === 0,
-    contract: contractStatusOf(bead),
+    // Judged over the RUN, not the bead alone (runContractStatus, same as toEpic): a standalone
+    // already in review dispatches no agent, so a legacy one missing Acceptance carries no gap —
+    // the chip keeps offering the closed-PR Force run the approve gate permits on exactly it.
+    contract: runContractStatus(bead, []),
     unread: isUnreadBug(bead),
     deferred: beads.isDeferred(bead),
     abandoned: beads.isAbandoned(bead),

@@ -98,18 +98,26 @@ const slug = (heading: string) => heading.toLowerCase().replace(/[^a-z0-9]+/g, "
  * character, is at least as long, and carries nothing but whitespace after it; a backtick fence's
  * info string may not contain a backtick; an unclosed fence runs to the end of the text (so the
  * contract fails closed — the same way the description renders).
+ *
+ * The delimiter lines themselves are flagged: they are punctuation, not content, so a judge of
+ * "does this section say anything" ({@link stateOf}) must skip them — an empty ``` block otherwise
+ * reads as two lines of authored text.
  */
-function scanLines(description: string): { text: string; fenced: boolean }[] {
-  const out: { text: string; fenced: boolean }[] = [];
+function scanLines(description: string): { text: string; fenced: boolean; delimiter?: boolean }[] {
+  const out: { text: string; fenced: boolean; delimiter?: boolean }[] = [];
   let open: { char: string; len: number } | undefined;
   for (const text of description.split(/\r?\n/)) {
     const fence = FENCE.exec(text);
     if (fence) {
       const [char, len] = [fence[1][0], fence[1].length];
       if (!open) {
-        if (char !== "`" || !fence[2].includes("`")) open = { char, len };
+        if (char !== "`" || !fence[2].includes("`")) {
+          open = { char, len };
+          out.push({ text, fenced: true, delimiter: true });
+          continue;
+        }
       } else if (char === open.char && len >= open.len && fence[2].trim() === "") {
-        out.push({ text, fenced: true });
+        out.push({ text, fenced: true, delimiter: true });
         open = undefined;
         continue;
       }
@@ -193,14 +201,17 @@ type SectionState = "written" | "prompt" | "absent";
  * one TODO left beside them is authored, and calling it unwritten would ask for what is already there.
  *
  * Subheadings a section carries (see {@link sectionsOf}) are scaffolding, not spec: `### API` over
- * nothing but TODO boxes is as unwritten as the boxes alone.
+ * nothing but TODO boxes is as unwritten as the boxes alone. So are fence delimiters: a section
+ * holding only an empty ``` block says nothing, and counting the delimiters as text read it as
+ * authored — approval and execution proceeded with no definition of done. Fenced CONTENT still
+ * counts; only the punctuation is skipped.
  */
 function stateOf(bodies: string[]): SectionState {
   let state: SectionState = "absent";
   for (const raw of bodies) {
-    const lines = raw
-      .split(/\r?\n/)
-      .map((l) => l.trim())
+    const lines = scanLines(raw)
+      .filter((l) => !l.delimiter)
+      .map((l) => l.text.trim())
       .filter((l) => l && !HEADING.test(l));
     if (lines.length === 0) continue;
     if (!lines.every((l) => PROMPT_LINE.test(l))) return "written";

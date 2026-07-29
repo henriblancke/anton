@@ -6,6 +6,7 @@ import {
   resumeSkipped,
   runContractStatus,
   runTickets,
+  toStandaloneItem,
 } from "./ticket-view";
 import type { Bead } from "./beads/bd";
 
@@ -92,6 +93,30 @@ describe("resumeSkipped (the beads a run won't dispatch an agent for)", () => {
 
   it("keeps an open, unlabeled bead — its agent still runs", () => {
     expect(resumeSkipped(makeBead({ id: "task-open" }), true)).toBe(false);
+  });
+});
+
+describe("toStandaloneItem (the chip's contract matches the approve gate)", () => {
+  it("carries no gaps for an in-review standalone missing Acceptance — its run dispatches no agent", () => {
+    // A legacy standalone undergoing closed-PR recovery: the approve route Force-runs it
+    // (resumeSkipped → contractGatedBeads → []), so the chip must not render "needs Acceptance"
+    // against exactly the action the gate permits.
+    const bead = makeBead({
+      id: "task-legacy",
+      labels: ["stage:in-review"],
+      description: "written before the contract — no sections",
+      created_at: "2026-07-28T00:00:00Z",
+    });
+    expect(toStandaloneItem(bead).contract).toEqual({ blocking: [], advisory: [] });
+  });
+
+  it("still reports the gaps on a backlog standalone — its run would dispatch an agent", () => {
+    const bead = makeBead({
+      id: "task-unshaped",
+      description: "no sections",
+      created_at: "2026-07-28T00:00:00Z",
+    });
+    expect(toStandaloneItem(bead).contract?.blocking.map((v) => v.section)).toEqual(["Acceptance"]);
   });
 });
 
