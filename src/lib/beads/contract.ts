@@ -78,7 +78,7 @@ function tierOf(bead: Bead): ContractTier {
   }
 }
 
-const HEADING = /^ {0,3}#{1,6}[ \t]+(.*?)[ \t]*#*[ \t]*$/;
+const HEADING = /^ {0,3}(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$/;
 
 /** An opening or closing code fence: up to 3 leading spaces, then 3+ backticks or tildes. */
 const FENCE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
@@ -119,10 +119,22 @@ function scanLines(description: string): { text: string; fenced: boolean }[] {
   return out;
 }
 
-/** Section bodies of a description, keyed by slugged heading. A repeated heading concatenates. */
+/**
+ * Section bodies of a description, keyed by slugged heading. A repeated heading concatenates.
+ *
+ * A section runs until a heading that starts ANOTHER section: one of the contract's own headings at
+ * any depth, or any heading at the current section's level or shallower. A DEEPER heading that names
+ * no contract section is the section's own content — criteria grouped under `## Acceptance` by
+ * `### API` / `### UI` are still that bead's definition of done, and ending the section there read a
+ * fully authored ticket as having none, which blocks approval and execution outright.
+ *
+ * Depth alone can't decide it: descriptions that open with a `# Title` put every `## Goal` below it,
+ * and folding those in would lose the contract entirely. A contract heading always opens its section.
+ */
 function sectionsOf(description: string): Map<string, string> {
   const out = new Map<string, string>();
   let key: string | undefined;
+  let level = 0;
   let body: string[] = [];
   const flush = () => {
     if (!key) return;
@@ -132,10 +144,15 @@ function sectionsOf(description: string): Map<string, string> {
   for (const { text, fenced } of scanLines(description)) {
     const heading = fenced ? null : HEADING.exec(text);
     if (heading) {
-      flush();
-      key = slug(heading[1]);
-      body = [];
-      continue;
+      const depth = heading[1].length;
+      const slugged = slug(heading[2]);
+      if (!key || depth <= level || CONTRACT_KEYS.has(slugged)) {
+        flush();
+        key = slugged;
+        level = depth;
+        body = [];
+        continue;
+      }
     }
     if (key) body.push(text);
   }
@@ -174,6 +191,9 @@ type SectionState = "written" | "prompt" | "absent";
  * author who filled the description section has written it, whatever bd's field still holds), and a
  * body counts as a prompt only when EVERY line of it is one — a section where boxes were filled and
  * one TODO left beside them is authored, and calling it unwritten would ask for what is already there.
+ *
+ * Subheadings a section carries (see {@link sectionsOf}) are scaffolding, not spec: `### API` over
+ * nothing but TODO boxes is as unwritten as the boxes alone.
  */
 function stateOf(bodies: string[]): SectionState {
   let state: SectionState = "absent";
@@ -181,7 +201,7 @@ function stateOf(bodies: string[]): SectionState {
     const lines = raw
       .split(/\r?\n/)
       .map((l) => l.trim())
-      .filter(Boolean);
+      .filter((l) => l && !HEADING.test(l));
     if (lines.length === 0) continue;
     if (!lines.every((l) => PROMPT_LINE.test(l))) return "written";
     state = "prompt";
@@ -242,6 +262,14 @@ export const SUCCESS_KEYS = ["successcriteria", "success", ...ACCEPTANCE_KEYS];
 /** The headings that hold an epic's outcome: what the formula pours (`## Goal`), plus the name the
  * violation itself uses. Text before any heading counts too — see {@link preambleOf}. */
 const OUTCOME_KEYS = ["goal", "outcome"];
+
+/** Every heading the contract reads, at any tier — the set {@link sectionsOf} lets open a section
+ * however deeply it is nested. Derived from the rules so a new section can't be added to one alone. */
+const CONTRACT_KEYS = new Set([
+  ...TICKET_RULES.flatMap((r) => r.keys),
+  ...SUCCESS_KEYS,
+  ...OUTCOME_KEYS,
+]);
 
 /**
  * Which headings carry this bead's definition of done, by tier — the reader's half of the choice

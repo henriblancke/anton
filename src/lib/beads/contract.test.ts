@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { Bead } from "./types";
 import {
+  ACCEPTANCE_KEYS,
   contractGaps,
   formatContractGaps,
   isContractJudged,
   isContractReadable,
+  sectionBody,
   validateBeadContract,
   type ContractSection,
   type ContractSeverity,
@@ -226,6 +228,92 @@ describe("validateBeadContract — headings inside fenced code", () => {
       ].join("\n"),
     });
     expect(validateBeadContract(quoting)).toEqual([]);
+  });
+});
+
+// A section that groups its criteria under subheadings is still that section. Ending it at the
+// first `###` left a fully authored Acceptance reading as empty — a blocking gap that refuses both
+// approval and execution, and a board card that renders nothing.
+describe("validateBeadContract — subheadings inside a section", () => {
+  const grouped = [
+    withoutSection(DESCRIPTION, "Verify"),
+    "",
+    "## Acceptance",
+    "### API",
+    "- [ ] the endpoint returns 422 on a contract gap",
+    "### UI",
+    "- [ ] the board marks the offending bead",
+    "",
+    "## Verify",
+    "- bun test",
+  ].join("\n");
+
+  it("keeps criteria grouped under `###` inside the section they belong to", () => {
+    expect(validateBeadContract(ticket({ acceptance_criteria: undefined, description: grouped }))).toEqual(
+      [],
+    );
+  });
+
+  it("renders the nested content too — the view parses headings the way the gate does", () => {
+    const body = sectionBody(grouped, ACCEPTANCE_KEYS);
+    expect(body).toContain("### API");
+    expect(body).toContain("- [ ] the board marks the offending bead");
+    // The section still ENDS at the next contract heading — Verify is not swept into it.
+    expect(body).not.toContain("bun test");
+  });
+
+  it("still ends the section at a sibling heading that names no contract section", () => {
+    const withNotes = [
+      DESCRIPTION,
+      "",
+      "## Acceptance",
+      "- [ ] it works",
+      "",
+      "## Notes",
+      "- unrelated prose",
+    ].join("\n");
+    expect(sectionBody(withNotes, ACCEPTANCE_KEYS)).toBe("- [ ] it works");
+  });
+
+  it("lets a contract heading open its own section however deeply it is nested", () => {
+    // A description that opens with a `# Title` puts every contract heading below it; folding those
+    // into the title would lose the whole contract.
+    const titled = ["# anton-1 — ship the thing", DESCRIPTION, "## Acceptance", "- [ ] it works"].join(
+      "\n",
+    );
+    expect(validateBeadContract(ticket({ acceptance_criteria: undefined, description: titled }))).toEqual(
+      [],
+    );
+  });
+
+  it("reads a subheading over nothing but prompts as the unwritten section it is", () => {
+    const cooked = ticket({
+      acceptance_criteria: undefined,
+      description: [
+        DESCRIPTION,
+        "",
+        "## Acceptance",
+        "### API",
+        "- [ ] TODO — a concrete, checkable statement of done",
+      ].join("\n"),
+    });
+    const [violation] = validateBeadContract(cooked);
+    expect(violation).toMatchObject({ section: "Acceptance", severity: "blocking" });
+    expect(violation.message).toContain("still the formula's TODO prompt");
+  });
+
+  it("keeps an epic's Success Criteria whole across its subheadings", () => {
+    const nested = epic({
+      acceptance_criteria: undefined,
+      description: [
+        "Reports are shareable outside the app.",
+        "",
+        "## Success Criteria",
+        "### Export",
+        "- [ ] every report leaves the app in a customer-openable format",
+      ].join("\n"),
+    });
+    expect(validateBeadContract(nested)).toEqual([]);
   });
 });
 
