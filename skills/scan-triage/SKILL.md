@@ -62,6 +62,11 @@ Every bead created must satisfy the bead contract (see the `bd` skill):
 ## Verify      the check that proves it (test, re-scan clean, lockfile diff)
 ```
 
+Pour that shape from the project's bead formula rather than retyping it —
+`bd cook anton-bead --mode=runtime --var goal='…' …`, then `bd create --description` from the cooked
+`ticket` step (see the `bd` skill). Fill every var: an unfilled `TODO —` default is not a triaged
+bead, and a fabricated Acceptance box is worse than none.
+
 Labels: `domain:eng`, `source:stringer`, `risk:<class>`, `agent:<stack match>`, `size:`, and a
 fingerprint (`stringer:<collector>:<hash>`) for future dedup. Link child tickets to their epic
 (`parent-child`).

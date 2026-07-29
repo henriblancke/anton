@@ -5,10 +5,18 @@
  * init` would read the nested form as unset and re-set every key on every run (anton-qhoz).
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { bdVersion, bdVersionAtLeast, configYamlHas, MIN_BD_VERSION } from "./config.mjs";
+import {
+  bdVersion,
+  bdVersionAtLeast,
+  BEAD_FORMULA_FILENAME,
+  bundledBeadFormulaPath,
+  configYamlHas,
+  ensureBeadFormula,
+  MIN_BD_VERSION,
+} from "./config.mjs";
 
 // bd 1.0.4: settings appended as flat dotted lines after a comment header.
 const FLAT = `# Beads Configuration File
@@ -114,5 +122,50 @@ describe("bd version gate (anton-qwsq)", () => {
     expect(bdVersionAtLeast({ major: 1, minor: 0, patch: 4 })).toBe(false);
     expect(bdVersionAtLeast({ major: 0, minor: 63, patch: 3 })).toBe(false);
     expect(bdVersionAtLeast(null)).toBe(false);
+  });
+});
+
+/**
+ * The setup half of anton-8mnr: the bead formula must LAND in a fresh `.beads/`, and must never
+ * overwrite a project-local copy — a team that tuned its own bead skeleton keeps it across every
+ * `anton setup` / `anton init` / addProject re-run.
+ */
+describe("ensureBeadFormula (anton-8mnr)", () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  const beadsDir = () => {
+    const dir = mkdtempSync(join(tmpdir(), "anton-formula-cfg-"));
+    dirs.push(dir);
+    return join(dir, ".beads");
+  };
+
+  const dest = (dir: string) => join(dir, "formulas", BEAD_FORMULA_FILENAME);
+
+  it("installs the bundled formula into .beads/formulas/, creating the dir", () => {
+    const dir = beadsDir();
+    expect(ensureBeadFormula(dir)).toBe("installed");
+    expect(JSON.parse(readFileSync(dest(dir), "utf8")).formula).toBe("anton-bead");
+  });
+
+  it("never clobbers an existing project-local copy", () => {
+    const dir = beadsDir();
+    ensureBeadFormula(dir);
+    writeFileSync(dest(dir), '{"formula":"anton-bead","mine":true}');
+
+    expect(ensureBeadFormula(dir)).toBe("already");
+    expect(JSON.parse(readFileSync(dest(dir), "utf8")).mine).toBe(true);
+  });
+
+  it("reports a missing asset instead of throwing", () => {
+    expect(ensureBeadFormula(beadsDir(), join(tmpdir(), "no-such-formula.json"))).toBe(
+      "missing-asset",
+    );
+  });
+
+  it("resolves the bundled asset from the package, not the cwd", () => {
+    expect(existsSync(bundledBeadFormulaPath())).toBe(true);
   });
 });

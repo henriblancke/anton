@@ -111,6 +111,11 @@ For every feature and ticket, the description MUST contain, or it is not `shaped
 ## Verify        the tests that prove it; what to add
 ```
 
+Don't retype that shape from memory — **pour it from the project's bead formula**
+(`bd cook anton-bead --mode=runtime --var …`, see the `bd` skill). The formula holds one step per
+tier and the sections come with it, so your job is filling them, not remembering them. Its `{{var}}`
+defaults are prompts: a bead that ships with a `TODO —` line in it is not shaped.
+
 Set labels (`domain:`, `risk:`, `agent:`, `size:`) per the `bd` skill's conventions, plus one
 `area:` on the epic. Set dependency edges: `parent-child` from ticket to feature and from feature
 to epic, `blocks` for hard ordering. `risk:high` for schema/auth/payments/migrations/infra. A
@@ -123,7 +128,8 @@ executor plans in its own session. Over-specification goes stale before it gets 
 ## Phase 5 — Create the beads and confirm
 
 Use `bd` (following the `bd` skill's conventions) to create the feature, its tickets, and — when
-none fitted — its epic, with their fields, labels, and edges. Then show the user the tree
+none fitted — its epic, cooking each one from the `anton-bead` formula so the contract sections are
+structural rather than retyped, then filling every var and setting labels and edges. Then show the user the tree
 (`bd children <epic-id>`) with the feature's one-line PR scope, name the epic it attached to and
 whether you created it, and confirm before finishing. The user approves what gets built — you
 don't merge scope silently.

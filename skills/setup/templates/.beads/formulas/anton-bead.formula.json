@@ -1,0 +1,62 @@
+{
+  "formula": "anton-bead",
+  "description": "anton's bead skeleton: the contract sections every bead carries, one step per tier (epic / feature / ticket). COOK it and materialise with `bd create --description` — never POUR it: a poured molecule root is issue_type=molecule, which is not one of anton's tiers and falls out of the board's parent walk. Every variable default below is a PROMPT, not content: an author fills it. Shipping a fabricated Acceptance box is worse than an absent one, because the self-review gate scores the diff against it (docs/runbooks/bead-contract-conformance.md). NOTE placeholders are scanned everywhere in this file, so prose here must not contain one.",
+  "version": 1,
+  "type": "workflow",
+  "vars": {
+    "title": {
+      "description": "The bead's title — an outcome for an epic, one PR's worth of change for a feature, one step for a ticket",
+      "default": "TODO — name the work"
+    },
+    "outcome": {
+      "description": "Epic only: the result its features add up to, in one line a stakeholder would recognise",
+      "default": "TODO — the outcome these features add up to, in language a stakeholder would recognise"
+    },
+    "success_criteria": {
+      "description": "Epic only: how we know the outcome is reached — what several features add up to, not one PR's checklist",
+      "default": "- [ ] TODO — the observable state that means this outcome is reached"
+    },
+    "goal": {
+      "description": "One sentence: the outcome this delivers and why it matters",
+      "default": "TODO — one sentence: what this delivers, and why it matters"
+    },
+    "acceptance": {
+      "description": "Concrete, checkable boxes — the run's definition of done and the rubric self-review scores the diff against",
+      "default": "- [ ] TODO — a concrete, checkable statement of done"
+    },
+    "context": {
+      "description": "Which files/areas this touches and which pattern to follow, so the agent doesn't rediscover them",
+      "default": "TODO — touches: <files/areas>; follow the pattern in <file>"
+    },
+    "out_of_scope": {
+      "description": "The explicit non-goals that bound the change",
+      "default": "- TODO — what this deliberately does not change"
+    },
+    "verify": {
+      "description": "The tests that prove it landed, and which to add",
+      "default": "TODO — the tests that prove this landed, and which to add"
+    }
+  },
+  "steps": [
+    {
+      "id": "epic",
+      "type": "epic",
+      "title": "{{title}}",
+      "description": "## Goal\n\n{{outcome}}\n\n## Success Criteria\n\n{{success_criteria}}"
+    },
+    {
+      "id": "feature",
+      "type": "feature",
+      "needs": ["epic"],
+      "title": "{{title}}",
+      "description": "## Goal\n\n{{goal}}\n\n## Acceptance\n\n{{acceptance}}\n\n## Context\n\n{{context}}\n\n## Out of scope\n\n{{out_of_scope}}\n\n## Verify\n\n{{verify}}"
+    },
+    {
+      "id": "ticket",
+      "type": "task",
+      "needs": ["feature"],
+      "title": "{{title}}",
+      "description": "## Goal\n\n{{goal}}\n\n## Acceptance\n\n{{acceptance}}\n\n## Context\n\n{{context}}\n\n## Out of scope\n\n{{out_of_scope}}\n\n## Verify\n\n{{verify}}"
+    }
+  ]
+}

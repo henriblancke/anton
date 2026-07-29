@@ -41,7 +41,9 @@ import {
   bdVersionAtLeast,
   configureBeadsDoltSync,
   configureBeadsForRepo,
+  ensureBeadFormula,
   ensureBeadsGitignore,
+  BEAD_FORMULA_FILENAME,
   MIN_BD_VERSION,
 } from "../src/lib/beads/config.mjs";
 import { createInterface } from "node:readline/promises";
@@ -892,6 +894,19 @@ async function cmdSetup(args = []) {
   }
 
   await provisionAgentsSkills(args);
+
+  // The bead formula (anton-8mnr): the skeleton every bead anton creates is poured from. It lives in
+  // the repo's `.beads/`, so a project-local copy always wins and a re-run never clobbers it.
+  const formula = ensureBeadFormula(join(APP_ROOT, ".beads"));
+  if (formula === "missing-asset") {
+    console.log(c.yellow(`\n! bead formula missing from this install — skipping ${BEAD_FORMULA_FILENAME}.`));
+  } else {
+    console.log(
+      c.bold("\nBead formula:") +
+        ` .beads/formulas/${BEAD_FORMULA_FILENAME} ` +
+        (formula === "installed" ? c.green("installed") : c.dim("already present")),
+    );
+  }
 
   // Beads Dolt sync (anton-pns): the Dolt remote is per-machine (gitignored) state, so every
   // machine re-applies it here; the first push publishes refs/dolt/data to the git remote.

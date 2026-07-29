@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 
 import { createDraftEpic } from "@/lib/backlog";
+import { AREA_SHAPE } from "@/lib/epic-patch";
 import { resolveProject } from "../resolve-project";
 
 export const runtime = "nodejs";
@@ -10,11 +11,18 @@ export const dynamic = "force-dynamic";
 /**
  * Accept a shaping draft and create the open (unapproved) epic bead in backlog (anton-bm4.2). This
  * is the "Send to backlog" action of the Add-work screen: the interactive `/shape` pty forms the
- * draft, and this commit turns the founder's accepted title + goal into a real bead via `bd`.
+ * draft, and this commit turns the founder's accepted draft into a real bead via `bd`.
+ *
+ * Every field of the epic contract is REQUIRED here (anton-8mnr): the bead is rendered from the
+ * project's bead formula, so what lands passes `validateBeadContract` by construction rather than
+ * arriving unshaped for the board to flag. `area:` uses the epic dialog's own label-shape check so
+ * both write paths accept exactly the same vocabulary.
  */
 const draftSchema = z.object({
   title: z.string().trim().min(1).max(200),
-  goal: z.string().trim().max(8000).optional(),
+  goal: z.string().trim().min(1).max(8000),
+  successCriteria: z.string().trim().min(1).max(8000),
+  area: z.string().trim().regex(AREA_SHAPE, "expected a label-safe value — letters, digits, . _ -"),
 });
 
 export async function POST(

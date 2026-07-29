@@ -58,6 +58,18 @@ as `BD_INIT_FLAGS` — keep the two in sync). Cases:
 Then confirm `bd ready --json` works. If `bd init`/`bd bootstrap` errors, **stop and say so** — do
 not leave a half-initialized project.
 
+### 2b. Install the bead formula
+
+Copy `${CLAUDE_SKILL_DIR}/templates/.beads/formulas/anton-bead.formula.json` to
+`<repo-root>/.beads/formulas/anton-bead.formula.json`. **No-clobber — if the file already exists,
+leave it alone and report it as skipped**: a project that has tuned its own bead skeleton keeps it.
+
+This is the skeleton `/shape` and anton's Add-work UI pour every bead from (one step per tier, the
+contract sections pre-stubbed), so the conformant shape is structural instead of a prompt
+remembering five headings. It belongs under `.beads/` because git tracks that directory — only the
+JSONL exports and the Dolt runtime are ignored — so the project's bead shape reaches every clone and
+teammate. Confirm with `bd formula list` (it should list `anton-bead`).
+
 ## 3. Detect the stack
 
 Inspect the repo and infer what applies. This drives the PRODUCT `## Stack` line and which agents

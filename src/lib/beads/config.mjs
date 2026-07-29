@@ -2,7 +2,8 @@
  * Reusable beads team-config for a target repo (anton-uez). The single config path shared by the
  * `anton init` CLI (bin/anton.mjs) and `addProject` (src/lib/projects.ts) so a repo configured from
  * the terminal and one added through the UI/API converge to the SAME end state: bd init (when
- * absent) → config.yaml enforcement → .beads/.gitignore → [Dolt remote wiring — anton-43b].
+ * absent) → config.yaml enforcement → .beads/.gitignore → bead formula (anton-8mnr) → [Dolt remote
+ * wiring — anton-43b].
  *
  * Plain JS, node built-ins only (fs + child_process), so it imports cleanly from both the pure-node
  * CLI and the TypeScript server. See DESIGN.md §3 (beads is the work source of truth).
@@ -11,8 +12,9 @@
  * the JSONL is a passive export): dolt.auto-commit "on", export.auto false, export.git-add false, and
  * a .gitignore that keeps the derived exports + Dolt runtime state out of git.
  */
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
 /**
@@ -285,6 +287,49 @@ export function untrackBeadsExports(dir, entries = BEADS_GITIGNORE_ENTRIES) {
   // killed `git rm` (status null, no stderr) would otherwise be recorded as a clean no-op.
   if ((rm.status ?? 1) !== 0) return { untracked: [], error: failureDetail(rm, probeMs, rm.stderr || "") };
   return { untracked: tracked };
+}
+
+/** The bead-formula asset's filename — how it lands in `.beads/formulas/` and how bd addresses it. */
+export const BEAD_FORMULA_FILENAME = "anton-bead.formula.json";
+
+/**
+ * Path segments of the bundled bead formula, relative to anton's package root (anton-8mnr). It rides
+ * along in the `setup` skill's template tree so `/setup`, `anton setup`, and `anton init` all install
+ * the SAME file, and `src/lib/beads/formula.ts` resolves the same segments against the server's cwd.
+ */
+export const BEAD_FORMULA_RELPATH = [
+  "skills",
+  "setup",
+  "templates",
+  ".beads",
+  "formulas",
+  BEAD_FORMULA_FILENAME,
+];
+
+/** anton's package root, resolved from this module rather than cwd (the CLI runs from anywhere). */
+const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+
+/** Absolute path to the bundled bead formula shipped with this anton install. */
+export function bundledBeadFormulaPath(appRoot = PACKAGE_ROOT) {
+  return join(appRoot, ...BEAD_FORMULA_RELPATH);
+}
+
+/**
+ * Install the bead formula into `<repo>/.beads/formulas/`, NO-CLOBBER (anton-8mnr). A project-local
+ * copy always wins: once a team has tuned its own bead shape, re-running setup must never overwrite
+ * it. Living under `.beads/` (which git tracks — only the JSONL exports and the Dolt runtime are
+ * ignored) is what carries the shape to every clone and teammate.
+ *
+ * Returns "installed" | "already" | "missing-asset" (the bundled file isn't in this install — a
+ * warning, never fatal: anton's own renderer falls back to its packaged copy).
+ */
+export function ensureBeadFormula(beadsDir, src = bundledBeadFormulaPath()) {
+  const dest = join(beadsDir, "formulas", BEAD_FORMULA_FILENAME);
+  if (existsSync(dest)) return "already";
+  if (!existsSync(src)) return "missing-asset";
+  mkdirSync(dirname(dest), { recursive: true });
+  copyFileSync(src, dest);
+  return "installed";
 }
 
 /**
@@ -626,7 +671,7 @@ export function detectHooksManager(dir, priorHooksPath = null) {
 /**
  * Run the full beads team-config path for `dir`, idempotently. Steps: workspace creation
  * (`bd init` when `.beads/` is absent, `bd bootstrap` for a fresh clone with no local Dolt DB, else
- * no-op) → config.yaml enforcement → `.beads/.gitignore` → Dolt remote wiring. Every step is
+ * no-op) → config.yaml enforcement → `.beads/.gitignore` → bead formula → Dolt remote wiring. Every step is
  * best-effort and its outcome is collected in `steps`/`errors` rather than thrown — the caller
  * decides how loud to be (the CLI prints each step; addProject logs a summary) and a step failure
  * never aborts the caller.
@@ -766,6 +811,16 @@ export function configureBeadsForRepo(dir, opts = {}) {
     steps.push({ name: "untrack exports", status: "set", detail: ut.untracked.join(", ") });
   } else {
     steps.push({ name: "untrack exports", status: "already" });
+  }
+
+  // 3c. Install the bead formula so every bead this project creates starts contract-shaped
+  //     (anton-8mnr). No-clobber — a project that tuned its own skeleton keeps it.
+  const formula = ensureBeadFormula(beadsDir);
+  steps.push({ name: "bead formula", status: formula });
+  if (formula === "missing-asset") {
+    emit(`bead formula asset missing from this install (${bundledBeadFormulaPath()}) — skipping.`);
+  } else {
+    emit(`.beads/formulas/${BEAD_FORMULA_FILENAME} (${formula})`);
   }
 
   // 4. Wire the git-backed Dolt remote (remote add → hydrate pull → publish push). Shared here so

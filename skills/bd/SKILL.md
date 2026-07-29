@@ -104,6 +104,32 @@ spec. `/shape` and `/scan-triage` enforce it; `bd lint` checks the Acceptance/Su
 An epic is read, not executed, so it carries less: a one-line outcome, Success Criteria its
 features add up to, and its `area:` label.
 
+## The bead formula — pour the skeleton, don't retype it
+
+The contract's shape is **structural**, not something you re-derive from these headings each time.
+The project ships it as a beads formula at `.beads/formulas/anton-bead.formula.json` (installed by
+`anton setup` / `anton init`; a project-local copy always wins, and because it lives in `.beads/` it
+travels to every clone). It has one step per tier — `epic`, `feature`, `ticket` — with the contract
+sections pre-stubbed:
+
+```bash
+bd formula show anton-bead                      # what it templates
+bd cook anton-bead --mode=runtime \
+  --var goal='…' --var acceptance='- [ ] …' \
+  --var context='touches: …' --var out_of_scope='- …' --var verify='…'
+# → JSON; take .steps[] | select(.id=="ticket") | .description as the bead description
+```
+
+Then materialise with the ordinary `bd create` below (`--description` from the cooked step,
+`--acceptance` mirroring the same text into bd's own field).
+
+**Cook it; never pour it.** `bd mol pour` materialises a molecule whose ROOT is
+`issue_type=molecule` — not one of the three tiers — so anton's board walks straight past it.
+
+The `{{var}}` defaults are **prompts, not content**. Fill every one. A fabricated Acceptance box is
+worse than an absent one: the self-review gate scores the diff against it, so a stub rubric scores
+the run against the wrong thing.
+
 ## Create a shaped feature or ticket
 
 Map the bead contract to native fields; put `Goal`, `Out of scope`, and `Verify` in the

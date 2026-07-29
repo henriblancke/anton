@@ -131,7 +131,10 @@ conventions they hold travel embedded in the `bd` and `shape` skills.
 - **Epics board** (per project, the primary surface) — four columns (backlog/implementing/in-
   review/done); an epic card shows Goal + Acceptance + its tickets; **Approve** on the epic.
 - **Run / xterm** — live terminal for the active session; runs list + history + diagnostics.
-- **Add work** — opens an interactive `/shape` session in the xterm; result lands in backlog.
+- **Add work** — opens an interactive `/shape` session in the xterm; the founder commits the epic's
+  contract (outcome, Success Criteria, one `area:`) and it lands in backlog. The bead is rendered
+  from the project's bead formula (`.beads/formulas/anton-bead.formula.json`, installed by setup,
+  project-local copy wins), so it is contract-shaped by construction rather than flagged unshaped.
 
 ## 7. The vertical slice (Phase 1 — build this first)
 
