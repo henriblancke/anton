@@ -78,6 +78,17 @@ function tierOf(bead: Bead): ContractTier {
   }
 }
 
+/**
+ * Is this bead's type the working layer's own — one the ticket contract judges? The dispatch
+ * predicate (`isRunTicket`, src/lib/ticket-view.ts) asks THIS, so the set of beads a run hands an
+ * agent and the set the contract gates are one taxonomy that cannot drift: an exempt type
+ * (`learning`, `molecule`, a custom type, or one the read didn't carry) that still dispatched would
+ * run an agent against a spec no gate ever judged — the exact hole the run gate exists to close.
+ */
+export function isTicketTier(bead: Bead): boolean {
+  return tierOf(bead) === "ticket";
+}
+
 const HEADING = /^ {0,3}(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$/;
 
 /** An opening or closing code fence: up to 3 leading spaces, then 3+ backticks or tildes. */

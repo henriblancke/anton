@@ -8,7 +8,13 @@
  * so those modules can all consume it without reintroducing a board↔tickets import cycle.
  */
 import { LABELS, beads, type Bead } from "./beads/bd";
-import { acceptanceBody, contractStatusOf, goalBody, type ContractStatus } from "./beads/contract";
+import {
+  acceptanceBody,
+  contractStatusOf,
+  goalBody,
+  isTicketTier,
+  type ContractStatus,
+} from "./beads/contract";
 import type { Epic, EpicCrumb, IssueType, Stage, StandaloneItem, Ticket } from "./types";
 
 /** Derived stage for a bead: closed → done; an `in-review` label or PR ref → in-review; an
@@ -183,11 +189,16 @@ export function boardCards(all: Bead[]): BoardCards {
 }
 
 /**
- * A working-layer bead: neither a card (it owns its own run) nor a container epic (it groups cards
- * rather than riding on one). These are the beads that ride on a run target as its tickets.
+ * A working-layer bead: a ticket-tier type (task/bug/chore/feature — the contract's own
+ * `isTicketTier`) that is not itself a card. These are the beads that ride on a run target as its
+ * tickets, and the tier gate is what keeps dispatch and contract one taxonomy: an exempt-type
+ * descendant (`learning`, `molecule`, a custom type) rides on NO run — dispatching it would hand an
+ * agent a bead whose spec `contractGaps` never judges, and closing it on merge would retire an
+ * artifact that was never work. A container epic falls out the same way (`epic` is not ticket
+ * tier); a non-container epic and every feature are already cards.
  */
 export function isRunTicket(bead: Bead, cards: BoardCards): boolean {
-  return !cards.ids.has(bead.id) && !beads.isEpic(bead);
+  return !cards.ids.has(bead.id) && isTicketTier(bead);
 }
 
 /**

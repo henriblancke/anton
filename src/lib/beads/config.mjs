@@ -117,7 +117,14 @@ export const BD_MIGRATION_RUNBOOK =
  *
  * @param {() => { status?: number|null, stdout?: string, stderr?: string, error?: unknown }} [run]
  */
-export function bdVersion(run = () => spawnSync("bd", ["--version"], { encoding: "utf8", timeout: 10_000 })) {
+export function bdVersion(
+  run = () =>
+    spawnSync("bd", ["--version"], {
+      encoding: "utf8",
+      timeout: budgetMs("probe"),
+      killSignal: SPAWN_KILL_SIGNAL,
+    }),
+) {
   const r = run();
   if (!r || r.error || (r.status ?? 1) !== 0) return null;
   const m = `${r.stdout ?? ""}${r.stderr ?? ""}`.match(/(\d+)\.(\d+)\.(\d+)/);
@@ -786,7 +793,12 @@ export function configureBeadsForRepo(dir, opts = {}) {
     // right after bootstrap. Best-effort: idempotent on a consistent DB, and a failure here must
     // never abort an otherwise-good clone setup. timeout: a hung recompute (e.g. a Dolt DB lock)
     // must not stall the configure flow — the kill surfaces as rc.error/non-zero, i.e. "skipped".
-    const rc = spawnSync("bd", ["recompute-blocked"], { cwd: dir, encoding: "utf8", timeout: 10_000 });
+    const rc = spawnSync("bd", ["recompute-blocked"], {
+      cwd: dir,
+      encoding: "utf8",
+      timeout: budgetMs("bd"),
+      killSignal: SPAWN_KILL_SIGNAL,
+    });
     steps.push({ name: "bd recompute-blocked", status: (rc.status ?? 1) === 0 ? "ok" : "skipped" });
   } else {
     emit(".beads/ present with a local Dolt DB — enforcing team-config only (no re-init).");

@@ -64,6 +64,20 @@ describe("runTickets (the tickets a run target contains)", () => {
     expect(runTickets(board, "epic-p")).toEqual([]);
   });
 
+  it("excludes an exempt-type descendant — a run dispatches only beads the contract judges", () => {
+    // A `learning`/`molecule` (or custom-type) child is exempt from the contract (tierOf →
+    // "exempt"), so dispatching it would run an agent against a spec no gate ever judged. It rides
+    // on no run; a chore is ticket tier and stays in.
+    const board = [
+      makeBead({ id: "feat-1", issue_type: "feature" }),
+      makeBead({ id: "task-1", parent: "feat-1" }),
+      makeBead({ id: "chore-1", issue_type: "chore", parent: "feat-1" }),
+      makeBead({ id: "learn-1", issue_type: "learning", parent: "feat-1" }),
+      makeBead({ id: "mol-1", issue_type: "molecule", parent: "feat-1" }),
+    ];
+    expect(runTickets(board, "feat-1").map((b) => b.id)).toEqual(["task-1", "chore-1"]);
+  });
+
   it("closes over a malformed parent cycle rather than hanging", () => {
     const board = [
       makeBead({ id: "feat-1", issue_type: "feature" }),
