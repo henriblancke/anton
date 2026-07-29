@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseAcceptance, parseGoal, runContractStatus, runTickets } from "./ticket-view";
+import { parseAcceptance, parseGoal, resumeSkipped, runContractStatus, runTickets } from "./ticket-view";
 import type { Bead } from "./beads/bd";
 
 function makeBead(overrides: Partial<Bead> & { id: string }): Bead {
@@ -66,6 +66,28 @@ describe("runTickets (the tickets a run target contains)", () => {
   });
 });
 
+describe("resumeSkipped (the beads a run won't dispatch an agent for)", () => {
+  const inReview = makeBead({ id: "task-1", labels: ["stage:in-review"] });
+
+  it("skips a closed bead on either run shape", () => {
+    const closed = makeBead({ id: "task-done", status: "closed" });
+    expect(resumeSkipped(closed, true)).toBe(true);
+    expect(resumeSkipped(closed, false)).toBe(true);
+  });
+
+  it("skips a standalone target already in review — only the agent-free PR step is left", () => {
+    expect(resumeSkipped(inReview, true)).toBe(true);
+  });
+
+  it("keeps an in-review bead inside a grouped run — the label belongs to the epic, not the ticket", () => {
+    expect(resumeSkipped(inReview, false)).toBe(false);
+  });
+
+  it("keeps an open, unlabeled bead — its agent still runs", () => {
+    expect(resumeSkipped(makeBead({ id: "task-open" }), true)).toBe(false);
+  });
+});
+
 describe("runContractStatus (a card's contract covers the whole run)", () => {
   const SHAPED = "## Goal\nG\n\n## Context\nC\n\n## Out of scope\nO\n\n## Verify\nV";
   /** A bead a bd read produced, so the contract is judged rather than skipped. */
@@ -129,6 +151,14 @@ describe("runContractStatus (a card's contract covers the whole run)", () => {
       blocking: [],
       advisory: [],
     });
+  });
+
+  it("clears a standalone target already in review, however thin its spec", () => {
+    // Force-run recovery of a failed/closed PR on a legacy bead: the commit exists and only the PR
+    // step is left, so a card that surfaced a gap here would withhold the one action that recovers it.
+    const legacy = readBead({ id: "task-legacy", labels: ["stage:in-review"] });
+
+    expect(runContractStatus(legacy, [])).toEqual({ blocking: [], advisory: [] });
   });
 
   it("stays undefined when nothing in the set was judged", () => {

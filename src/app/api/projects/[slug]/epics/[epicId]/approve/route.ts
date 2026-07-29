@@ -8,7 +8,7 @@ import { nudgeSync } from "@/lib/beads/sync-nudge";
 import { conflictBody, ownerOf, withClaimLock } from "@/lib/beads/claim";
 import { enqueueExecuteEpic, enqueueExecuteEpicIfAbsent } from "@/lib/jobs/service";
 import { resolveOperator } from "@/lib/operator";
-import { deriveStage, runTickets } from "@/lib/ticket-view";
+import { deriveStage, resumeSkipped, runTickets } from "@/lib/ticket-view";
 import { STAGES } from "@/lib/types";
 import { notFoundResponse, withProject } from "../../../resolve-project";
 
@@ -90,18 +90,19 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // would otherwise be labeled `approved` and answered "running" here, then poison-parked by the
   // runner before it does any work: exactly the false green this gate exists to prevent. The ticket
   // set comes from the shared `runTickets`/`groupsChildren` pair the runner uses, so route and
-  // runner never disagree about what the target contains. Closed tickets are dropped — the runner
-  // resume-skips them, so their spec can't strand a run. `status !== "closed"` is a deliberate
-  // approximation of the runner's own `isResumeSkipped` (which additionally skips a ticket already
-  // carrying stage:in-review on a standalone run): the runner closes a bead as it merges, so the
-  // only divergence is the slim window between PR merge and bead close, where this gate is the
-  // stricter of the two. Judged off the same forced fresh read as the gate above, so a bead
-  // repaired a moment ago approves. The refusal itself is deferred until we know this request will
-  // start work — see the gate below.
+  // runner never disagree about what the target contains. Resume-skipped beads are dropped through
+  // the runner's own predicate (`resumeSkipped`, shared) rather than an approximation of it: a
+  // closed ticket, and — on a standalone run — a target already carrying stage:in-review, whose
+  // commit exists so only the agent-free PR step is left. Gating that one would 422 exactly the
+  // Force-run recovery of a failed/closed PR the runner allows, forcing the operator to invent
+  // criteria for work that is already written. Judged off the same forced fresh read as the gate
+  // above, so a bead repaired a moment ago approves. The refusal itself is deferred until we know
+  // this request will start work — see the gate below.
   const children = runTickets(allBeads, epicId);
-  const contractGated = beads.groupsChildren(target, children)
-    ? [target, ...children.filter((t) => t.status !== "closed")]
-    : [target];
+  const standaloneRun = !beads.groupsChildren(target, children);
+  const contractGated = standaloneRun
+    ? [target].filter((t) => !resumeSkipped(t, true))
+    : [target, ...children.filter((t) => !resumeSkipped(t, false))];
 
   // Builds off the snapshot the refresh above just populated — a board rebuild, not a bd read. The
   // route needs it for the epic-graph blocker rollup and for the item shape it answers with.

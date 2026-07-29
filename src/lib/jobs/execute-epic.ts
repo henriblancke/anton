@@ -12,7 +12,7 @@ import { ownerOf } from "../beads/claim";
 import { contractGaps, formatContractGaps } from "../beads/contract";
 import { humanNotesPromptBlock } from "../beads/notes";
 import { computeEpicGraph, epicStandaloneBlockers, isUnit, standaloneBlockers } from "../epic-graph";
-import { runTickets } from "../ticket-view";
+import { resumeSkipped, runTickets } from "../ticket-view";
 import { loadAgentPrompt } from "../claude/agent-prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
 import { runClaude, type ClaudeEvent, type ClaudeResult } from "../claude/driver";
@@ -470,16 +470,15 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       leaseLabels = beads.runLeaseLabels(leaseTarget);
 
       // A standalone target that already committed on a prior attempt carries stage:in-review and
-      // is skipped straight to the PR step below — its agent never runs again on this resume. Both
-      // the allowlist gate here and the ticket loop share this "won't run" predicate so neither
-      // acts on a resume marker: gating on a since-disabled agent would park a retry that only has
-      // the (agent-free) PR step left to do. Caveat: "won't run" holds only when the ticket's commit
-      // is actually on this branch. A done-on-board ticket whose commit is missing (cross-machine
-      // resume) DOES re-run, so the loop re-applies this allowlist gate there — the worktree needed
-      // to prove commit presence doesn't exist yet at this point.
-      const inReview = LABELS.stage("in-review");
-      const isResumeSkipped = (t: Bead) =>
-        t.status === "closed" || (standaloneRun && (t.labels?.includes(inReview) ?? false));
+      // is skipped straight to the PR step below — its agent never runs again on this resume. The
+      // allowlist gate here, the ticket loop and the approve route share ONE "won't run" predicate
+      // (ticket-view `resumeSkipped`) so none of them acts on a resume marker: gating on a
+      // since-disabled agent would park a retry that only has the (agent-free) PR step left to do.
+      // Caveat: "won't run" holds only when the ticket's commit is actually on this branch. A
+      // done-on-board ticket whose commit is missing (cross-machine resume) DOES re-run, so the loop
+      // re-applies this allowlist gate there — the worktree needed to prove commit presence doesn't
+      // exist yet at this point.
+      const isResumeSkipped = (t: Bead) => resumeSkipped(t, standaloneRun);
 
       // 0b. Dispatch honors the active-agents allowlist for anton's BUNDLED specialists (anton-dm7);
       // the project's own `.claude/agents` (userAgentIds) are always allowed. PARK, don't skip:
@@ -830,9 +829,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         // board still marks it done. Re-run it here so its commit lands on this branch. On a
         // same-machine resume the worktree is reused and the commit is present, so this skips as
         // before — no redundant re-run.
-        const doneOnBoard =
-          ticket.status === "closed" ||
-          (standaloneRun && (ticket.labels?.includes(inReview) ?? false));
+        const doneOnBoard = resumeSkipped(ticket, standaloneRun);
         if (doneOnBoard && (await worktreeHasCommitFor(worktree.path, ticket.id))) {
           if (standaloneRun) {
             // Resume after a failed PR step: this standalone ticket committed and moved to in-review
@@ -914,7 +911,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       });
       await safe(() => beads.setPrRef(repo, epicBeadId, pr.ref));
       if (!standaloneRun) {
-        await safe(() => beads.tag(repo, epicBeadId, [inReview]));
+        await safe(() => beads.tag(repo, epicBeadId, [LABELS.stage("in-review")]));
         await safe(() => beads.untag(repo, epicBeadId, [LABELS.stage("implementing")]));
       }
 

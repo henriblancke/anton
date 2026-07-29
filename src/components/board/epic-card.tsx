@@ -18,6 +18,7 @@ import {
   ticketProgress,
 } from "@/components/board/board-utils";
 import { TypeBadge, TypeIcon } from "@/components/board/type-language";
+import { toastContractAdvisory } from "@/components/board/contract-advisory";
 import { ApproveBlocked, ContractChip } from "@/components/board/contract-mark";
 import { EpicBadge, NoEpicBadge } from "@/components/board/epic-badge";
 import { AbandonedChip, BlockedChip, MetaChip, PrLink, RiskChip } from "@/components/atoms";
@@ -90,6 +91,8 @@ export function EpicCard({
       toast.success(
         immediate ? `Approved & running "${epic.title}"` : `Queued "${epic.title}" for optimal usage`,
       );
+      // The run starts with whatever thin sections it has; say so once, here.
+      await toastContractAdvisory(res);
     } catch (err) {
       setOptimisticApproved(false);
       toast.error(err instanceof Error ? err.message : `Failed to approve ${word}`);

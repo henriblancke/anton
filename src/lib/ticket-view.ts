@@ -7,7 +7,7 @@
  * This module deliberately imports nothing from board.ts/tickets.ts/epic-detail.ts/ticket-detail.ts,
  * so those modules can all consume it without reintroducing a board↔tickets import cycle.
  */
-import { beads, type Bead } from "./beads/bd";
+import { LABELS, beads, type Bead } from "./beads/bd";
 import {
   GOAL_KEYS,
   acceptanceKeysOf,
@@ -210,6 +210,25 @@ export function runTickets(all: Bead[], targetId: string): Bead[] {
   return all.filter((b) => isRunTicket(b, cards) && cards.cardOf(b) === targetId);
 }
 
+/**
+ * Whether a run SKIPS this bead instead of dispatching an agent for it: it is closed (its work is
+ * done), or — on a standalone run — it already carries `stage:in-review`, meaning its commit exists
+ * and only the agent-free PR step is left. Nothing re-reads a skipped bead's spec, so no contract
+ * gate may refuse on it: this is what keeps Force-run recovery of a closed/failed PR reachable on a
+ * legacy standalone written before the contract. execute-epic, the approve route and the board card
+ * all ask this one predicate so they can't disagree about what a run will actually dispatch.
+ *
+ * Optimistic on purpose. "Won't re-run" holds only while the commit is on THIS branch, which no
+ * caller here can prove; the runner re-applies the gate in its ticket loop for the cross-machine
+ * case where the commit is missing and the ticket really does run again.
+ */
+export function resumeSkipped(bead: Bead, standaloneRun: boolean): boolean {
+  return (
+    bead.status === "closed" ||
+    (standaloneRun && (bead.labels?.includes(LABELS.stage("in-review")) ?? false))
+  );
+}
+
 /** A child's gaps, named with its id — the card's own bead isn't the one missing the section. */
 const attributeTo = (id: string, status: ContractStatus): ContractStatus => {
   const name = (v: ContractStatus["blocking"][number]) => ({ ...v, message: `${id} → ${v.message}` });
@@ -222,14 +241,17 @@ const attributeTo = (id: string, status: ContractStatus): ContractStatus => {
  * (approve/route.ts, execute-epic.ts). Judging the target alone let a feature with Acceptance and
  * one unshaped open child render no marker and keep Approve enabled, then 422 on click.
  *
- * Closed tickets are dropped for the same reason the gates drop them: the runner resume-skips them,
- * so their spec can't strand a run. Undefined only when NOTHING in the set was judged (no bd read
- * behind any of it) — "not judged" is not conformance.
+ * Resume-skipped beads are dropped for the same reason the gates drop them ({@link resumeSkipped}):
+ * nothing re-reads their spec, so it can't strand a run. That includes the whole judgement for a
+ * standalone target already in review — its commit is on the branch and only the PR step is left, so
+ * a card that withheld Force run there would strand exactly the closed-PR recovery the gates allow.
+ * Undefined only when NOTHING in the set was judged (no bd read behind any of it) — "not judged" is
+ * not conformance.
  */
 export function runContractStatus(target: Bead, children: Bead[]): ContractStatus | undefined {
-  const open = beads.groupsChildren(target, children)
-    ? children.filter((t) => t.status !== "closed")
-    : [];
+  const groups = beads.groupsChildren(target, children);
+  if (!groups && resumeSkipped(target, true)) return { blocking: [], advisory: [] };
+  const open = groups ? children.filter((t) => !resumeSkipped(t, false)) : [];
   const statuses: ContractStatus[] = [];
   const own = contractStatusOf(target);
   if (own) statuses.push(own);

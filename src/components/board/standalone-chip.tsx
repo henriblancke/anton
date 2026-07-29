@@ -15,6 +15,7 @@ import { SnoozeButton } from "@/components/ticket/snooze-button";
 import { ClaimControl } from "@/components/board/claim-control";
 import { TYPE_RAIL, TYPE_TEXT, agentDotClass } from "@/components/board/board-utils";
 import { TypeBadge, TypeIcon } from "@/components/board/type-language";
+import { toastContractAdvisory } from "@/components/board/contract-advisory";
 import { ApproveBlocked, ContractChip } from "@/components/board/contract-mark";
 
 /** Short PR label from a bead external-ref: `gh-218` / a URL ending in `/218` → `#218`. */
@@ -81,6 +82,8 @@ export function StandaloneChip({
       toast.success(
         immediate ? `Approved & running "${item.title}"` : `Queued "${item.title}" for optimal usage`,
       );
+      // The run starts with whatever thin sections it has; say so once, here.
+      await toastContractAdvisory(res);
     } catch (err) {
       setOptimisticApproved(false);
       toast.error(err instanceof Error ? err.message : "Failed to approve run");
