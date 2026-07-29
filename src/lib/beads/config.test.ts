@@ -154,7 +154,7 @@ describe("ensureBeadFormula (anton-8mnr)", () => {
 
   it("installs the bundled formula into .beads/formulas/, creating the dir", () => {
     const dir = beadsDir();
-    expect(ensureBeadFormula(dir)).toBe("installed");
+    expect(ensureBeadFormula(dir).status).toBe("installed");
     expect(JSON.parse(readFileSync(dest(dir), "utf8")).formula).toBe("anton-bead");
   });
 
@@ -163,12 +163,12 @@ describe("ensureBeadFormula (anton-8mnr)", () => {
     ensureBeadFormula(dir);
     writeFileSync(dest(dir), '{"formula":"anton-bead","mine":true}');
 
-    expect(ensureBeadFormula(dir)).toBe("already");
+    expect(ensureBeadFormula(dir).status).toBe("already");
     expect(JSON.parse(readFileSync(dest(dir), "utf8")).mine).toBe(true);
   });
 
   it("reports a missing asset instead of throwing", () => {
-    expect(ensureBeadFormula(beadsDir(), join(tmpdir(), "no-such-formula.json"))).toBe(
+    expect(ensureBeadFormula(beadsDir(), join(tmpdir(), "no-such-formula.json")).status).toBe(
       "missing-asset",
     );
   });
@@ -178,8 +178,21 @@ describe("ensureBeadFormula (anton-8mnr)", () => {
     // there would make every "is this a beads repo?" probe answer yes — configureBeadsDoltSync
     // reads exactly that, then fails `anton setup` for having no git origin in an extracted runtime.
     const dir = absentBeadsDir();
-    expect(ensureBeadFormula(dir)).toBe("no-workspace");
+    expect(ensureBeadFormula(dir).status).toBe("no-workspace");
     expect(existsSync(dir)).toBe(false);
+  });
+
+  it("reports a write failure instead of aborting the setup around it", () => {
+    // An unwritable `.beads/` (read-only checkout, no permission, a `formulas` path that isn't a
+    // directory) must not take down project registration — the formula is one best-effort step
+    // among a dozen and anton's renderer falls back to its packaged copy. A throw here aborted
+    // `anton setup` / addProject outright.
+    const dir = beadsDir();
+    writeFileSync(join(dir, "formulas"), "not a directory");
+
+    const result = ensureBeadFormula(dir);
+    expect(result.status).toBe("failed");
+    expect(result.detail).toBeTruthy();
   });
 
   it("resolves the bundled asset from the package, not the cwd", () => {

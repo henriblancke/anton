@@ -30,7 +30,7 @@ function toTicketDetail(lite: Bead, full: Bead, epic: Bead | undefined): TicketD
     abandoned: beads.isAbandoned(lite),
     type: lite.issue_type ?? "task",
     priority: lite.priority,
-    goal: parseGoal(full.description),
+    goal: parseGoal(full),
     description: full.description,
     epicId: epic?.id,
     epicTitle: epic?.title,

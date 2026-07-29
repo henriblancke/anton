@@ -51,7 +51,7 @@ describeBd("bead formula (real bd · cook + create)", () => {
     bdRepo = makeBdRepo();
     repo = bdRepo.repo;
     // The install step `anton init` / addProject runs — proving bd itself discovers what we ship.
-    expect(ensureBeadFormula(`${repo}/.beads`)).toBe("installed");
+    expect(ensureBeadFormula(`${repo}/.beads`).status).toBe("installed");
   });
 
   afterAll(() => bdRepo.cleanup());

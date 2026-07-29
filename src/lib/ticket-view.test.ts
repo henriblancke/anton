@@ -240,8 +240,21 @@ describe("parseGoal / parseAcceptance (the validator's own parser)", () => {
   it("reads the heading levels the contract validator accepts, not `##` alone", () => {
     // The two used to disagree: a `# Goal` bead passed the gate and rendered blank everywhere.
     const description = "# Goal\nShip it.\n\n### Acceptance\n- [ ] it works";
-    expect(parseGoal(description)).toBe("Ship it.");
+    expect(parseGoal(makeBead({ id: "t-1", description }))).toBe("Ship it.");
     expect(parseAcceptance(makeBead({ id: "t-1", description }))).toBe("- [ ] it works");
+  });
+
+  it("reads an epic's outcome from `## Outcome` — the alias its tier is judged on", () => {
+    // The validator accepts either heading for an epic's outcome, so a reader that knew only
+    // `## Goal` rendered a goal-less card for an epic the gate had just called conformant.
+    const bead = makeBead({
+      id: "epic-1",
+      issue_type: "epic",
+      description: "## Outcome\nReports leave the app.\n\n## Success Criteria\n- [ ] every view exports",
+    });
+    expect(parseGoal(bead)).toBe("Reports leave the app.");
+    // A ticket is judged on `## Goal` alone, so the alias must not render one the gate faults.
+    expect(parseGoal({ ...bead, issue_type: "task" })).toBeUndefined();
   });
 
   it("matches the validator's heading spelling too — `## Acceptance Criteria` is Acceptance", () => {
@@ -265,7 +278,7 @@ describe("parseGoal / parseAcceptance (the validator's own parser)", () => {
   it("falls back to bd's own field when the description carries no section", () => {
     const bead = makeBead({ id: "t-1", acceptance_criteria: "- [ ] field only" });
     expect(parseAcceptance(bead)).toBe("- [ ] field only");
-    expect(parseGoal(bead.description)).toBeUndefined();
+    expect(parseGoal(bead)).toBeUndefined();
   });
 
   it("prefers the authored field over a section still holding the formula's TODO prompt", () => {

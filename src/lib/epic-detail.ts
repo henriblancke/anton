@@ -57,7 +57,7 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
     // `full`, not `lite`: the contract is judged off the description, and the list bead may have
     // dropped it — judging the projection would fault a bead for sections nothing read.
     const epic = toEpic(full, {
-      goal: parseGoal(full.description),
+      goal: parseGoal(full),
       acceptance: parseAcceptance(full),
       tickets: [self],
     });
@@ -74,7 +74,7 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
   // `children` carries the raw beads so the header's contract status covers the whole run — the
   // same target-plus-open-tickets set the approve route this page's actions post to gates on.
   const epic = toEpic(full, {
-    goal: parseGoal(full.description),
+    goal: parseGoal(full),
     acceptance: parseAcceptance(full),
     tickets,
     children: childBeads,

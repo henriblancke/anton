@@ -903,13 +903,17 @@ async function cmdSetup(args = []) {
   // origin). Registered projects get their formula from configureBeadsForRepo (`anton init` /
   // addProject), which is the path shaping actually reads.
   const formula = ensureBeadFormula(join(APP_ROOT, ".beads"));
-  if (formula === "missing-asset") {
+  if (formula.status === "missing-asset") {
     console.log(c.yellow(`\n! bead formula missing from this install — skipping ${BEAD_FORMULA_FILENAME}.`));
-  } else if (formula !== "no-workspace") {
+  } else if (formula.status === "failed") {
+    // Best-effort, like the missing asset above: setup carries on and anton's renderer falls back
+    // to its packaged copy, so an unwritable `.beads/formulas/` is a warning, not a failed setup.
+    console.log(c.yellow(`\n! could not install the bead formula: ${formula.detail}`));
+  } else if (formula.status !== "no-workspace") {
     console.log(
       c.bold("\nBead formula:") +
         ` .beads/formulas/${BEAD_FORMULA_FILENAME} ` +
-        (formula === "installed" ? c.green("installed") : c.dim("already present")),
+        (formula.status === "installed" ? c.green("installed") : c.dim("already present")),
     );
   }
 

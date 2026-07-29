@@ -261,7 +261,7 @@ export const SUCCESS_KEYS = ["successcriteria", "success", ...ACCEPTANCE_KEYS];
 
 /** The headings that hold an epic's outcome: what the formula pours (`## Goal`), plus the name the
  * violation itself uses. Text before any heading counts too — see {@link preambleOf}. */
-const OUTCOME_KEYS = ["goal", "outcome"];
+export const OUTCOME_KEYS = ["goal", "outcome"];
 
 /** Every heading the contract reads, at any tier — the set {@link sectionsOf} lets open a section
  * however deeply it is nested. Derived from the rules so a new section can't be added to one alone. */
@@ -279,6 +279,18 @@ const CONTRACT_KEYS = new Set([
  */
 export function acceptanceKeysOf(bead: Bead): string[] {
   return tierOf(bead) === "epic" ? SUCCESS_KEYS : ACCEPTANCE_KEYS;
+}
+
+/**
+ * Which headings carry this bead's purpose, by tier — the same split {@link validateBeadContract}
+ * judges on: a ticket states a `## Goal`, an epic may state either that or `## Outcome`.
+ *
+ * The alias is why this is tier-aware rather than one flat list: an epic authored as `## Outcome`
+ * satisfies the gate, so a viewer reading `## Goal` alone showed a conformant-but-goal-less card,
+ * while a TICKET spelled `## Outcome` must keep rendering blank beside the gap the gate reports.
+ */
+export function goalKeysOf(bead: Bead): string[] {
+  return tierOf(bead) === "epic" ? OUTCOME_KEYS : GOAL_KEYS;
 }
 
 /**
@@ -335,6 +347,15 @@ export function acceptanceBody(bead: Bead): string | undefined {
     bead.acceptance,
   ].filter((b): b is string => typeof b === "string" && b.trim() !== "");
   return bodies.find((b) => stateOf([b]) === "written") ?? bodies[0];
+}
+
+/**
+ * The goal/outcome text a view RENDERS, read on the headings this bead's tier is judged against —
+ * the reader half of {@link goalKeysOf}, mirroring {@link acceptanceBody} for the other section.
+ */
+export function goalBody(bead: Bead): string | undefined {
+  const description = typeof bead.description === "string" ? bead.description : undefined;
+  return sectionBody(description, goalKeysOf(bead));
 }
 
 /**

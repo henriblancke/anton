@@ -8,13 +8,7 @@
  * so those modules can all consume it without reintroducing a board↔tickets import cycle.
  */
 import { LABELS, beads, type Bead } from "./beads/bd";
-import {
-  GOAL_KEYS,
-  acceptanceBody,
-  contractStatusOf,
-  sectionBody,
-  type ContractStatus,
-} from "./beads/contract";
+import { acceptanceBody, contractStatusOf, goalBody, type ContractStatus } from "./beads/contract";
 import type { Epic, EpicCrumb, IssueType, Stage, StandaloneItem, Ticket } from "./types";
 
 /** Derived stage for a bead: closed → done; an `in-review` label or PR ref → in-review; an
@@ -51,15 +45,17 @@ export function createdMeta(bead: Bead): {
 }
 
 /**
- * The contract sections a view RENDERS, read with the validator's own parser (contract.ts's
- * `sectionBody`) rather than a view-local regex. `bd list --json` returns the description but not
- * the acceptance/context fields, so views read the contract out of the description here.
+ * The contract sections a view RENDERS, read with the validator's own reader (contract.ts's
+ * `goalBody`/`acceptanceBody`) rather than a view-local regex. `bd list --json` returns the
+ * description but not the acceptance/context fields, so views read the contract out of the
+ * description here.
  *
- * The shared parser is the point: a view-local one that only accepted `##` left a `# Goal` bead
+ * The shared reader is the point: a view-local one that only accepted `##` left a `# Goal` bead
  * judged conformant by the gate and rendered blank on every card and detail view — the gate said
- * "fine" and the board showed nothing.
+ * "fine" and the board showed nothing. Reading the whole BEAD, not just its description, is what
+ * keeps that true per tier: an epic may state its outcome as `## Outcome`, which the gate accepts.
  */
-export const parseGoal = (d: string | undefined): string | undefined => sectionBody(d, GOAL_KEYS);
+export const parseGoal = (bead: Bead): string | undefined => goalBody(bead);
 
 /** Read through the validator's own reader (`acceptanceBody`), so an epic that states its rubric as
  * `## Success Criteria` renders it, and an authored `--acceptance` field wins over a description

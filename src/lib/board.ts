@@ -110,7 +110,7 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
     // ^ allBeads (unfiltered) on purpose: a closed `molecule` blocker must resolve to done here,
     //   not read as a phantom open blocker via the helper's missing-bead fail-safe.
     const built = toEpic(card, {
-      goal: parseGoal(card.description),
+      goal: parseGoal(card),
       acceptance: parseAcceptance(card),
       tickets,
       // The raw children too: the card's contract marker covers the whole run (target + open

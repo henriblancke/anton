@@ -325,17 +325,26 @@ export function bundledBeadFormulaPath(appRoot = PACKAGE_ROOT) {
  * repo" (configureBeadsDoltSync does exactly that, then aborts `anton setup` for having no git
  * origin). So an absent `.beads/` is a skip, not a mkdir.
  *
- * Returns "installed" | "already" | "missing-asset" (the bundled file isn't in this install — a
- * warning, never fatal: anton's own renderer falls back to its packaged copy) | "no-workspace".
+ * Returns { status, detail? } — "installed" | "already" | "missing-asset" (the bundled file isn't in
+ * this install — a warning, never fatal: anton's own renderer falls back to its packaged copy) |
+ * "no-workspace" | "failed".
+ *
+ * A filesystem error (read-only checkout, no write permission, transient I/O) is REPORTED as
+ * "failed", never thrown: this is one best-effort step among a dozen in setup/registration, and an
+ * unwritable `.beads/formulas/` must not abort the whole run over a skeleton anton can fall back to.
  */
 export function ensureBeadFormula(beadsDir, src = bundledBeadFormulaPath()) {
   const dest = join(beadsDir, "formulas", BEAD_FORMULA_FILENAME);
-  if (existsSync(dest)) return "already";
-  if (!existsSync(beadsDir)) return "no-workspace";
-  if (!existsSync(src)) return "missing-asset";
-  mkdirSync(dirname(dest), { recursive: true });
-  copyFileSync(src, dest);
-  return "installed";
+  if (existsSync(dest)) return { status: "already" };
+  if (!existsSync(beadsDir)) return { status: "no-workspace" };
+  if (!existsSync(src)) return { status: "missing-asset" };
+  try {
+    mkdirSync(dirname(dest), { recursive: true });
+    copyFileSync(src, dest);
+  } catch (err) {
+    return { status: "failed", detail: err?.message || String(err) };
+  }
+  return { status: "installed" };
 }
 
 /**
@@ -822,14 +831,17 @@ export function configureBeadsForRepo(dir, opts = {}) {
   // 3c. Install the bead formula so every bead this project creates starts contract-shaped
   //     (anton-8mnr). No-clobber — a project that tuned its own skeleton keeps it.
   const formula = ensureBeadFormula(beadsDir);
-  steps.push({ name: "bead formula", status: formula });
-  if (formula === "missing-asset") {
+  steps.push({ name: "bead formula", status: formula.status, detail: formula.detail });
+  if (formula.status === "missing-asset") {
     emit(`bead formula asset missing from this install (${bundledBeadFormulaPath()}) — skipping.`);
-  } else if (formula === "no-workspace") {
+  } else if (formula.status === "no-workspace") {
     // Only reachable if the init/bootstrap above reported success without producing `.beads/`.
     emit("no .beads workspace to install the bead formula into — skipping.");
+  } else if (formula.status === "failed") {
+    emit(`could not install the bead formula: ${formula.detail}`);
+    errors.push(`could not install the bead formula: ${formula.detail}`);
   } else {
-    emit(`.beads/formulas/${BEAD_FORMULA_FILENAME} (${formula})`);
+    emit(`.beads/formulas/${BEAD_FORMULA_FILENAME} (${formula.status})`);
   }
 
   // 4. Wire the git-backed Dolt remote (remote add → hydrate pull → publish push). Shared here so
