@@ -141,16 +141,21 @@ function scanLines(description: string): { text: string; fenced: boolean; delimi
 /**
  * Section bodies of a description, keyed by slugged heading. A repeated heading concatenates.
  *
- * A section runs until a heading that starts ANOTHER section: one of the contract's own headings at
- * any depth, or any heading at the current section's level or shallower. A DEEPER heading that names
- * no contract section is the section's own content — criteria grouped under `## Acceptance` by
- * `### API` / `### UI` are still that bead's definition of done, and ending the section there read a
- * fully authored ticket as having none, which blocks approval and execution outright.
+ * A section runs until a heading that starts ANOTHER section: one of `keys` at any depth, or any
+ * heading at the current section's level or shallower. A DEEPER heading that names no contract
+ * section is the section's own content — criteria grouped under `## Acceptance` by `### API` /
+ * `### UI` are still that bead's definition of done, and ending the section there read a fully
+ * authored ticket as having none, which blocks approval and execution outright.
+ *
+ * `keys` is the TIER's heading set ({@link contractKeysOf}), not every tier's merged: `success`
+ * satisfies only an epic, so on a ticket a `### Success` grouping criteria inside `## Acceptance`
+ * is that section's own content — the merged set ended Acceptance there and rejected the authored
+ * ticket outright.
  *
  * Depth alone can't decide it: descriptions that open with a `# Title` put every `## Goal` below it,
  * and folding those in would lose the contract entirely. A contract heading always opens its section.
  */
-function sectionsOf(description: string): Map<string, string> {
+function sectionsOf(description: string, keys: ReadonlySet<string>): Map<string, string> {
   const out = new Map<string, string>();
   let key: string | undefined;
   let level = 0;
@@ -165,7 +170,7 @@ function sectionsOf(description: string): Map<string, string> {
     if (heading) {
       const depth = heading[1].length;
       const slugged = slug(heading[2]);
-      if (!key || depth <= level || CONTRACT_KEYS.has(slugged)) {
+      if (!key || depth <= level || keys.has(slugged)) {
         flush();
         key = slugged;
         level = depth;
@@ -326,13 +331,26 @@ export const SUCCESS_KEYS = ["successcriteria", "success", ...ACCEPTANCE_KEYS];
  * violation itself uses. Text before any heading counts too — see {@link preambleOf}. */
 export const OUTCOME_KEYS = ["goal", "outcome"];
 
-/** Every heading the contract reads, at any tier — the set {@link sectionsOf} lets open a section
- * however deeply it is nested. Derived from the rules so a new section can't be added to one alone. */
-const CONTRACT_KEYS = new Set([
+/** Every heading a TICKET's contract reads — the set {@link sectionsOf} lets open a section however
+ * deeply it is nested, for that tier. Derived from the rules so a new section can't be added to one
+ * alone. */
+const TICKET_KEYS: ReadonlySet<string> = new Set([
   ...TICKET_RULES.flatMap((r) => r.keys),
-  ...SUCCESS_KEYS,
-  ...OUTCOME_KEYS,
+  ...ACCEPTANCE_KEYS,
 ]);
+
+/** The same, for an EPIC: its outcome aliases plus every spelling of its rubric. */
+const EPIC_KEYS: ReadonlySet<string> = new Set([...OUTCOME_KEYS, ...SUCCESS_KEYS]);
+
+/** Every tier's headings merged — only for a reader handed bare text ({@link sectionBody}), which
+ * has no tier to narrow by. Tier-aware judging and reading must pass {@link contractKeysOf}: only
+ * headings applicable to the bead's tier may terminate a deeper section (see {@link sectionsOf}). */
+const CONTRACT_KEYS: ReadonlySet<string> = new Set([...TICKET_KEYS, ...EPIC_KEYS]);
+
+/** The heading set {@link sectionsOf} sections a bead of this tier by. Exempt reads as ticket — the
+ * same non-epic default {@link acceptanceKeysOf} and {@link goalKeysOf} apply. */
+const contractKeysOf = (tier: ContractTier): ReadonlySet<string> =>
+  tier === "epic" ? EPIC_KEYS : TICKET_KEYS;
 
 /**
  * Which headings carry this bead's definition of done, by tier — the reader's half of the choice
@@ -368,7 +386,7 @@ export function goalKeysOf(bead: Bead): string[] {
  */
 export function sectionBody(description: string | undefined, keys: string[]): string | undefined {
   if (!description) return undefined;
-  const sections = sectionsOf(description);
+  const sections = sectionsOf(description, CONTRACT_KEYS);
   for (const key of keys) {
     const text = sections.get(key);
     if (text) return text;
@@ -403,7 +421,8 @@ const acceptanceBodies = (bead: Bead, sections: Map<string, string>, keys: strin
  * no rubric yet, and the blocking marker beside it says so.
  */
 export function acceptanceBody(bead: Bead): string | undefined {
-  const sections = sectionsOf(typeof bead.description === "string" ? bead.description : "");
+  const description = typeof bead.description === "string" ? bead.description : "";
+  const sections = sectionsOf(description, contractKeysOf(tierOf(bead)));
   const bodies = [
     ...acceptanceKeysOf(bead).map((k) => sections.get(k)),
     bead.acceptance_criteria,
@@ -427,7 +446,7 @@ export function acceptanceBody(bead: Bead): string | undefined {
  */
 export function goalBody(bead: Bead): string | undefined {
   const description = typeof bead.description === "string" ? bead.description : "";
-  const sections = sectionsOf(description);
+  const sections = sectionsOf(description, contractKeysOf(tierOf(bead)));
   const bodies = [
     ...goalKeysOf(bead).map((k) => sections.get(k)),
     ...(tierOf(bead) === "epic" ? [preambleOf(description)] : []),
@@ -537,7 +556,7 @@ export function validateBeadContract(bead: Bead): ContractViolation[] {
   if (tier === "exempt" || !isContractReadable(bead)) return [];
 
   const description = typeof bead.description === "string" ? bead.description : "";
-  const sections = sectionsOf(description);
+  const sections = sectionsOf(description, contractKeysOf(tier));
   // A heading whose body is empty — or still the formula's TODO prompt — carries no spec, so it is
   // as absent as no heading at all.
   const sectionState = (keys: string[]) => stateOf(keys.map((k) => sections.get(k) ?? ""));

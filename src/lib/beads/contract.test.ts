@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Bead } from "./types";
 import {
   ACCEPTANCE_KEYS,
+  acceptanceBody,
   contractGaps,
   formatContractGaps,
   isContractJudged,
@@ -355,6 +356,44 @@ describe("validateBeadContract — subheadings inside a section", () => {
     const [violation] = validateBeadContract(cooked);
     expect(violation).toMatchObject({ section: "Acceptance", severity: "blocking" });
     expect(violation.message).toContain("still the formula's TODO prompt");
+  });
+
+  it("keeps another TIER's alias inside a ticket's section — `### Success` is content, not a boundary", () => {
+    // `success` satisfies only an epic's rubric, so on a ticket a deeper `### Success` grouping the
+    // criteria is Acceptance's own content. The merged all-tier key set ended the section there,
+    // rejecting (and rendering blank) a fully authored ticket.
+    const grouped = ticket({
+      acceptance_criteria: undefined,
+      description: [
+        withoutSection(DESCRIPTION, "Verify"),
+        "",
+        "## Acceptance",
+        "### Success",
+        "- [ ] the endpoint returns 422 on a contract gap",
+        "",
+        "## Verify",
+        "- bun test",
+      ].join("\n"),
+    });
+    expect(validateBeadContract(grouped)).toEqual([]);
+    const body = acceptanceBody(grouped);
+    expect(body).toContain("- [ ] the endpoint returns 422 on a contract gap");
+    // A ticket-tier heading at the section's own level still ends it.
+    expect(body).not.toContain("bun test");
+  });
+
+  it("keeps a ticket-only heading inside an epic's Success Criteria the same way", () => {
+    const nested = epic({
+      acceptance_criteria: undefined,
+      description: [
+        "Reports are shareable outside the app.",
+        "",
+        "## Success Criteria",
+        "### Verify",
+        "- [ ] every report leaves the app in a customer-openable format",
+      ].join("\n"),
+    });
+    expect(validateBeadContract(nested)).toEqual([]);
   });
 
   it("keeps an epic's Success Criteria whole across its subheadings", () => {
