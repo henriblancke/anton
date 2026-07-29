@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Bead } from "./types";
 import {
+  isContractJudged,
   isContractReadable,
   validateBeadContract,
   type ContractSection,
@@ -208,5 +209,22 @@ describe("shallow reads", () => {
     expect(isContractReadable({ ...shallow, description: "" })).toBe(true);
     expect(isContractReadable({ ...shallow, acceptance_criteria: "- [ ] x" })).toBe(true);
     expect(isContractReadable({ ...shallow, ...STAMPS })).toBe(true);
+  });
+});
+
+describe("isContractJudged", () => {
+  // An empty violation list means "conformant" OR "never judged"; anything reporting a rate has to
+  // tell those apart or it divides by the wrong denominator.
+  it("separates a judged bead from an exempt or unread one", () => {
+    expect(isContractJudged(ticket())).toBe(true);
+    expect(isContractJudged(epic())).toBe(true);
+    expect(isContractJudged(ticket({ issue_type: "chore" }))).toBe(false);
+    expect(isContractJudged({ id: "anton-5", title: "projection", status: "open", issue_type: "task" })).toBe(false);
+  });
+
+  it("judges a bead that is readable but non-conformant", () => {
+    const gap = ticket({ acceptance_criteria: undefined, description: "" });
+    expect(isContractJudged(gap)).toBe(true);
+    expect(validateBeadContract(gap).length).toBeGreaterThan(0);
   });
 });

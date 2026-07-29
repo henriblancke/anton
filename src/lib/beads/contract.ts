@@ -162,6 +162,15 @@ export function isContractReadable(bead: Bead): boolean {
 }
 
 /**
+ * Does the contract apply to this bead at all? False for an exempt tier and for a bead no bd read
+ * produced. An empty {@link validateBeadContract} means two different things — "conformant" and
+ * "never judged" — so anything reporting a conformance RATE must divide by this, not by the board.
+ */
+export function isContractJudged(bead: Bead): boolean {
+  return tierOf(bead) !== "exempt" && isContractReadable(bead);
+}
+
+/**
  * Every way this bead falls short of the contract for its tier — empty when it is complete, exempt,
  * or not readable. Pure: no bd calls, no IO.
  */
