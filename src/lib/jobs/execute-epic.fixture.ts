@@ -9,6 +9,7 @@
  *
  * Test-only. Skipped suites (no bd/git) never call this.
  */
+import { expect } from "vitest";
 import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -121,10 +122,17 @@ export async function tickToIdle(runner: JobRunner): Promise<number> {
   return processed;
 }
 
-/** Enqueue one execute-epic job and drive it to settle. Returns the job id. */
+/**
+ * Enqueue one execute-epic job and drive it to settle. Returns the job id.
+ *
+ * Asserts the tick leased exactly one job — driving a second, leftover job would silently change
+ * what the caller's assertions are actually measuring (same invariant as `driveJob`). A case that
+ * needs a 0-or-N tick result (a clock jump, a quota cooloff) calls `enqueueEpicJob` + `tickToIdle`
+ * directly instead.
+ */
 export async function driveEpicRun(runner: JobRunner, payload: EpicJobPayload): Promise<string> {
   const jobId = await enqueueEpicJob(runner, payload);
-  await tickToIdle(runner);
+  expect(await tickToIdle(runner)).toBe(1);
   return jobId;
 }
 
