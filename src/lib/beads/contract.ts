@@ -195,23 +195,64 @@ const PROMPT_LINE = /^(?:[-*+]\s+)?(?:\[[ xX]?\][ \t]*)?TODO\s*[—–:-]/;
 type SectionState = "written" | "prompt" | "absent";
 
 /**
+ * A body's lines as the rendered description shows them: fence delimiters dropped, HTML comments
+ * (`<!-- … -->`, single- or multi-line) stripped. Both are invisible in the render, so a judge of
+ * "does this section say anything" must not count them — a template placeholder like
+ * `## Acceptance\n<!-- add criteria here -->` is as empty as the heading alone. Comments inside
+ * fenced code are literal content and are kept; an unclosed comment runs to the end of the body, so
+ * the judgement fails closed — the same way the description renders.
+ */
+function renderedLines(raw: string): string[] {
+  const out: string[] = [];
+  let inComment = false;
+  for (const line of scanLines(raw)) {
+    if (line.delimiter) continue;
+    if (line.fenced) {
+      if (!inComment) out.push(line.text);
+      continue;
+    }
+    let rest = line.text;
+    let kept = "";
+    while (rest !== "") {
+      if (inComment) {
+        const close = rest.indexOf("-->");
+        if (close === -1) break;
+        inComment = false;
+        rest = rest.slice(close + 3);
+      } else {
+        const open = rest.indexOf("<!--");
+        if (open === -1) {
+          kept += rest;
+          break;
+        }
+        kept += rest.slice(0, open);
+        inComment = true;
+        rest = rest.slice(open + 4);
+      }
+    }
+    out.push(kept);
+  }
+  return out;
+}
+
+/**
  * The state of a section given every place its text can live. `written` wins over `prompt` (an
  * author who filled the description section has written it, whatever bd's field still holds), and a
  * body counts as a prompt only when EVERY line of it is one — a section where boxes were filled and
  * one TODO left beside them is authored, and calling it unwritten would ask for what is already there.
  *
  * Subheadings a section carries (see {@link sectionsOf}) are scaffolding, not spec: `### API` over
- * nothing but TODO boxes is as unwritten as the boxes alone. So are fence delimiters: a section
- * holding only an empty ``` block says nothing, and counting the delimiters as text read it as
- * authored — approval and execution proceeded with no definition of done. Fenced CONTENT still
- * counts; only the punctuation is skipped.
+ * nothing but TODO boxes is as unwritten as the boxes alone. So is anything the render hides —
+ * fence delimiters and HTML comments ({@link renderedLines}): a section holding only an empty
+ * ``` block or a `<!-- template placeholder -->` says nothing, and counting either as text read it
+ * as authored — approval and execution proceeded with no definition of done. Fenced CONTENT still
+ * counts; only the invisible punctuation is skipped.
  */
 function stateOf(bodies: string[]): SectionState {
   let state: SectionState = "absent";
   for (const raw of bodies) {
-    const lines = scanLines(raw)
-      .filter((l) => !l.delimiter)
-      .map((l) => l.text.trim())
+    const lines = renderedLines(raw)
+      .map((l) => l.trim())
       .filter((l) => l && !HEADING.test(l));
     if (lines.length === 0) continue;
     if (!lines.every((l) => PROMPT_LINE.test(l))) return "written";

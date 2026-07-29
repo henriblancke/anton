@@ -229,6 +229,43 @@ describe("validateBeadContract — headings inside fenced code", () => {
     expect(validateBeadContract(fenced)).toEqual([]);
   });
 
+  it("treats a section holding only an HTML comment as unwritten", () => {
+    // A template placeholder (`<!-- add criteria here -->`) renders as nothing — counting it as
+    // text let a ticket approve and run against an Acceptance section that displays empty.
+    const placeholder = ticket({
+      acceptance_criteria: undefined,
+      description: [DESCRIPTION, "", "## Acceptance", "<!-- add criteria here -->"].join("\n"),
+    });
+    expect(summarize(placeholder)).toEqual([["Acceptance", "blocking"]]);
+  });
+
+  it("strips a multiline HTML comment, and an unclosed one to the end of the body", () => {
+    const multiline = ticket({
+      acceptance_criteria: undefined,
+      description: [DESCRIPTION, "", "## Acceptance", "<!--", "add criteria here", "-->"].join("\n"),
+    });
+    expect(summarize(multiline)).toEqual([["Acceptance", "blocking"]]);
+    const unclosed = ticket({
+      acceptance_criteria: undefined,
+      description: [DESCRIPTION, "", "## Acceptance", "<!--", "never closed"].join("\n"),
+    });
+    expect(summarize(unclosed)).toEqual([["Acceptance", "blocking"]]);
+  });
+
+  it("keeps the authored text around a comment, and a comment inside fenced code", () => {
+    // Text beside a comment is authored; a `<!-- … -->` inside a fence is literal code, not markup.
+    const beside = ticket({
+      acceptance_criteria: undefined,
+      description: [DESCRIPTION, "", "## Acceptance", "- [ ] it works <!-- verified -->"].join("\n"),
+    });
+    expect(validateBeadContract(beside)).toEqual([]);
+    const fenced = ticket({
+      acceptance_criteria: undefined,
+      description: [DESCRIPTION, "", "## Acceptance", "```", "<!-- literal -->", "```"].join("\n"),
+    });
+    expect(validateBeadContract(fenced)).toEqual([]);
+  });
+
   it("reads an epic's outcome past a fenced sample rather than out of it", () => {
     // The preamble scan stops at the first REAL heading, so a fence opened in the outcome text must
     // not hide the `## Success Criteria` that follows it.
