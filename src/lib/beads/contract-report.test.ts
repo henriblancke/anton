@@ -1,10 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Bead } from "./types";
-import {
-  buildContractReport,
-  formatContractReport,
-  OPEN_WORK_STATUSES,
-} from "./contract-report";
+import { buildContractReport, formatContractReport } from "./contract-report";
 
 const STAMPS = { created_at: "2026-07-28T00:00:00Z", updated_at: "2026-07-28T00:00:00Z" };
 
@@ -52,11 +48,18 @@ describe("buildContractReport", () => {
   });
 
   // The denominator is the whole point: an exempt or unread bead is "not judged", NOT "conformant".
+  // Both ride on a feature's run here, so it is the tier check dropping them, not the run gate.
   it("excludes exempt tiers and unread beads from the denominator", () => {
     const report = buildContractReport([
-      ticket(),
-      ticket({ id: "anton-l", issue_type: "learning", description: "", acceptance_criteria: "" }),
-      { id: "anton-p", title: "A graph projection", status: "open", issue_type: "task" },
+      ticket({ id: "anton-f", issue_type: "feature" }),
+      ticket({
+        id: "anton-l",
+        issue_type: "learning",
+        parent: "anton-f",
+        description: "",
+        acceptance_criteria: "",
+      }),
+      { id: "anton-p", title: "A graph projection", status: "open", issue_type: "task", parent: "anton-f" },
     ]);
     expect(report.judged).toBe(1);
     expect(report.conformant).toBe(1);
@@ -106,7 +109,9 @@ describe("buildContractReport", () => {
     expect(row.violations.map((v) => v.section)).toEqual(["Acceptance"]);
   });
 
-  it("counts an epic's missing Success Criteria as blocking", () => {
+  // A legacy epic runs its own children, so its rubric is the one that run's self-review scores
+  // against — its gap strands work and must count.
+  it("counts a runnable epic's missing Success Criteria as blocking", () => {
     const report = buildContractReport([
       {
         id: "anton-e",
@@ -117,15 +122,62 @@ describe("buildContractReport", () => {
         labels: ["area:reports"],
         ...STAMPS,
       },
+      ticket({ id: "anton-t", parent: "anton-e" }),
     ]);
-    expect(report).toMatchObject({ judged: 1, blocked: 1, blocking: 1, advisory: 0 });
+    expect(report).toMatchObject({ judged: 2, blocked: 1, blocking: 1, advisory: 0 });
+    expect(report.rows.map((r) => r.id)).toEqual(["anton-e"]);
+  });
+
+  // The exit code means "switching the hard gate on would strand work", so only beads a gate reads
+  // may count. A container epic can't be approved or run, and no feature's gate reads its parent.
+  it("ignores a container epic's own gaps and judges its features instead", () => {
+    const report = buildContractReport([
+      { id: "anton-c", title: "A container", status: "open", issue_type: "epic", ...STAMPS },
+      ticket({ id: "anton-f", issue_type: "feature", parent: "anton-c" }),
+    ]);
+    expect(report).toMatchObject({ judged: 1, conformant: 1, blocking: 0, advisory: 0 });
+    expect(report.rows).toEqual([]);
+  });
+
+  // Same reason, the other shape of unreachable work: a chore is never a run target on its own, so
+  // no gate ever reads a parentless one — but the run of the feature it rides on does.
+  it("judges a chore only when it rides on a run", () => {
+    const loose = buildContractReport([
+      ticket({ id: "anton-ch", issue_type: "chore", acceptance_criteria: undefined }),
+    ]);
+    expect(loose).toMatchObject({ judged: 0, blocking: 0 });
+    expect(loose.rows).toEqual([]);
+
+    const riding = buildContractReport([
+      ticket({ id: "anton-f", issue_type: "feature" }),
+      ticket({
+        id: "anton-ch",
+        issue_type: "chore",
+        parent: "anton-f",
+        acceptance_criteria: undefined,
+      }),
+    ]);
+    expect(riding).toMatchObject({ judged: 2, blocked: 1, blocking: 1 });
+    expect(riding.rows.map((r) => r.id)).toEqual(["anton-ch"]);
+  });
+
+  // A closed bead's spec can no longer strand a run — nothing re-reads it. A deferred one wakes up
+  // and hits the gate on that day, so it stays in the denominator.
+  it("drops closed beads but keeps deferred ones", () => {
+    const report = buildContractReport([
+      ticket({ id: "anton-f", issue_type: "feature" }),
+      ticket({ id: "anton-done", parent: "anton-f", status: "closed", acceptance_criteria: undefined }),
+      ticket({ id: "anton-later", parent: "anton-f", status: "deferred", acceptance_criteria: undefined }),
+    ]);
+    expect(report).toMatchObject({ judged: 2, blocked: 1, blocking: 1 });
+    expect(report.rows.map((r) => r.id)).toEqual(["anton-later"]);
   });
 });
 
 describe("formatContractReport", () => {
   it("states the switch-on is safe when the board is clean", () => {
     const text = formatContractReport(buildContractReport([ticket()]));
-    expect(text).toContain("1/1 open work beads conformant (100%)");
+    expect(text).toContain("1/1 run-gated beads conformant (100%)");
     expect(text).toContain("BLOCKING 0");
     expect(text).toContain("No violations.");
   });
@@ -137,7 +189,7 @@ describe("formatContractReport", () => {
         ticket({ id: "anton-b", description: without(SHAPED, "Context") }),
       ]),
     );
-    expect(text).toContain("0/2 open work beads conformant (0%)");
+    expect(text).toContain("0/2 run-gated beads conformant (0%)");
     expect(text).toContain("BLOCKING 1 across 1 bead(s) — Acceptance 1");
     expect(text).toContain("advisory 1 — Context 1");
     expect(text).toContain("anton-a  [task/open]  Needs a rubric");
@@ -149,12 +201,5 @@ describe("formatContractReport", () => {
     expect(formatContractReport(buildContractReport([ticket()]), "/repos/anton")).toContain(
       "/repos/anton: 1/1",
     );
-  });
-});
-
-describe("OPEN_WORK_STATUSES", () => {
-  // A closed bead can no longer strand a run; a deferred one wakes up and hits the gate.
-  it("covers every non-closed status", () => {
-    expect(OPEN_WORK_STATUSES.split(",")).toEqual(["open", "in_progress", "blocked", "deferred"]);
   });
 });

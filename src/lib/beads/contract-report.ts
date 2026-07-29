@@ -6,18 +6,18 @@
  * turns a bead list into exactly that, and is the same judgement the gate will apply — it calls
  * {@link validateBeadContract}, it does not re-implement it.
  *
+ * Judged over the beads the RUN GATE evaluates ({@link contractGatedBoard}), not every bead the
+ * contract has an opinion about. The exit code means "turning the gate on would strand work", so
+ * work no gate can reach must not count: a container epic can't be approved, and no feature's gate
+ * reads its parent, so counting its missing Success Criteria as blocking would fail the command over
+ * a run that was never going to be refused.
+ *
  * Pure (no bd calls, no IO) so the shape of the report is unit-tested; `scripts/contract-report.ts`
  * is the shell that reads the boards and prints it.
  */
+import { contractGatedBoard } from "../ticket-view";
 import { isContractJudged, validateBeadContract, type ContractViolation } from "./contract";
 import type { Bead } from "./types";
-
-/**
- * The statuses that count as open work. Closed is excluded — a closed bead's spec can no longer
- * strand a run. `deferred` is INCLUDED: a snoozed bead is work that comes back, and it would hit the
- * gate on the day it wakes, so leaving it out would make the report read better than the board is.
- */
-export const OPEN_WORK_STATUSES = "open,in_progress,blocked,deferred";
 
 export interface ContractReportRow {
   id: string;
@@ -35,7 +35,7 @@ export interface ContractSectionCount {
 }
 
 export interface ContractReport {
-  /** Beads the contract applies to — the only honest denominator for a conformance rate. */
+  /** Run-gated beads the contract applies to — the only honest denominator for a conformance rate. */
   judged: number;
   conformant: number;
   /** Beads carrying at least one BLOCKING violation: exactly what the hard gate would refuse. */
@@ -52,15 +52,20 @@ function severityRank(row: ContractReportRow): number {
   return row.violations.some((v) => v.severity === "blocking") ? 0 : 1;
 }
 
-/** Every way the given beads fall short of the contract, tallied and ordered for reading. */
-export function buildContractReport(beads: Bead[]): ContractReport {
+/**
+ * Every way this board's run-gated beads fall short of the contract, tallied and ordered for reading.
+ *
+ * Takes the WHOLE board, closed beads included — {@link contractGatedBoard} needs the parent graph to
+ * tell a container epic from a run target, and drops the closed and resume-skipped beads itself.
+ */
+export function buildContractReport(all: Bead[]): ContractReport {
   const rows: ContractReportRow[] = [];
   const counts = new Map<string, ContractSectionCount>();
   let judged = 0;
   let blocking = 0;
   let advisory = 0;
 
-  for (const bead of beads) {
+  for (const bead of contractGatedBoard(all)) {
     if (!isContractJudged(bead)) continue;
     judged++;
     const violations = validateBeadContract(bead);
@@ -121,7 +126,7 @@ const tally = (counts: ContractSectionCount[], severity: string) =>
 export function formatContractReport(report: ContractReport, label = ""): string {
   const head = label ? `${label}: ` : "";
   const lines = [
-    `${head}${report.conformant}/${report.judged} open work beads conformant (${pct(report.conformant, report.judged)}%)`,
+    `${head}${report.conformant}/${report.judged} run-gated beads conformant (${pct(report.conformant, report.judged)}%)`,
     `  BLOCKING ${report.blocking} across ${report.blocked} bead(s)${report.blocking ? ` — ${tally(report.bySection, "blocking")}` : ""}`,
     `  advisory ${report.advisory}${report.advisory ? ` — ${tally(report.bySection, "advisory")}` : ""}`,
   ];

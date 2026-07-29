@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { parseAcceptance, parseGoal, resumeSkipped, runContractStatus, runTickets } from "./ticket-view";
+import {
+  contractGatedBoard,
+  parseAcceptance,
+  parseGoal,
+  resumeSkipped,
+  runContractStatus,
+  runTickets,
+} from "./ticket-view";
 import type { Bead } from "./beads/bd";
 
 function makeBead(overrides: Partial<Bead> & { id: string }): Bead {
@@ -85,6 +92,44 @@ describe("resumeSkipped (the beads a run won't dispatch an agent for)", () => {
 
   it("keeps an open, unlabeled bead — its agent still runs", () => {
     expect(resumeSkipped(makeBead({ id: "task-open" }), true)).toBe(false);
+  });
+});
+
+describe("contractGatedBoard (every spec a run on this board reads)", () => {
+  it("seeds from run targets only — a container epic's spec strands nothing", () => {
+    const board = [
+      makeBead({ id: "epic-p", issue_type: "epic" }),
+      makeBead({ id: "feat-1", issue_type: "feature", parent: "epic-p" }),
+      makeBead({ id: "task-1", parent: "feat-1" }),
+      // Judged by the contract, reachable by no run: a chore is never a target, and a task parked
+      // under the container rides on no card.
+      makeBead({ id: "chore-1", issue_type: "chore" }),
+      makeBead({ id: "loose-1", parent: "epic-p" }),
+    ];
+    expect(contractGatedBoard(board).map((b) => b.id)).toEqual(["feat-1", "task-1"]);
+  });
+
+  it("rolls a target's whole ticket subtree in, and drops what its run skips", () => {
+    const board = [
+      makeBead({ id: "feat-1", issue_type: "feature" }),
+      makeBead({ id: "task-1", parent: "feat-1" }),
+      makeBead({ id: "sub-1", parent: "task-1" }),
+      makeBead({ id: "task-done", parent: "feat-1", status: "closed" }),
+      // A closed standalone target: its run dispatches nothing, so nothing re-reads its spec.
+      makeBead({ id: "task-solo", status: "closed" }),
+    ];
+    expect(contractGatedBoard(board).map((b) => b.id)).toEqual(["feat-1", "task-1", "sub-1"]);
+  });
+
+  it("lists each bead once when two targets' gated sets overlap", () => {
+    const board = [
+      makeBead({ id: "feat-1", issue_type: "feature" }),
+      makeBead({ id: "task-1", parent: "feat-1" }),
+      makeBead({ id: "feat-2", issue_type: "feature", parent: "feat-1" }),
+    ];
+    const gated = contractGatedBoard(board).map((b) => b.id);
+    expect(new Set(gated).size).toBe(gated.length);
+    expect(gated.sort()).toEqual(["feat-1", "feat-2", "task-1"]);
   });
 });
 

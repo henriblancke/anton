@@ -251,6 +251,41 @@ export function contractGatedBeads(target: Bead, children: Bead[]): Bead[] {
   return open.length === 0 ? [] : [target, ...open];
 }
 
+/**
+ * Every bead on a board the contract is actually gated on: {@link contractGatedBeads} rolled up over
+ * every run target, deduped. The board-wide answer to "which specs can strand a run", for the
+ * conformance report (`src/lib/beads/contract-report.ts`).
+ *
+ * Only run TARGETS seed the roll-up, which is the whole point. A container epic can't be approved or
+ * run (`beads.isRunTarget` refuses it) and no feature's gate reads its parent, so faulting its
+ * missing Success Criteria would report stranded work where the gate strands none — and the same for
+ * every other judged-but-unreachable bead, such as a parentless chore. Beads a run skips (closed, or
+ * a standalone already in review) drop out through `contractGatedBeads` for the same reason.
+ *
+ * Needs the WHOLE board, closed beads included: container-ness and the ticket roll-up are read off
+ * the parent graph, and an epic whose only feature child is closed is still a container.
+ */
+export function contractGatedBoard(all: Bead[]): Bead[] {
+  const cards = boardCards(all);
+  const ticketsOf = new Map<string, Bead[]>();
+  for (const bead of all) {
+    const card = isRunTicket(bead, cards) ? cards.cardOf(bead) : undefined;
+    if (!card) continue;
+    const tickets = ticketsOf.get(card);
+    if (tickets) tickets.push(bead);
+    else ticketsOf.set(card, [bead]);
+  }
+
+  const gated = new Map<string, Bead>();
+  for (const target of all) {
+    if (!beads.isRunTarget(target, all)) continue;
+    for (const bead of contractGatedBeads(target, ticketsOf.get(target.id) ?? [])) {
+      gated.set(bead.id, bead);
+    }
+  }
+  return [...gated.values()];
+}
+
 /** A child's gaps, named with its id — the card's own bead isn't the one missing the section. */
 const attributeTo = (id: string, status: ContractStatus): ContractStatus => {
   const name = (v: ContractStatus["blocking"][number]) => ({ ...v, message: `${id} → ${v.message}` });
