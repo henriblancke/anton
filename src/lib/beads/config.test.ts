@@ -5,7 +5,7 @@
  * init` would read the nested form as unset and re-set every key on every run (anton-qhoz).
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -136,7 +136,15 @@ describe("ensureBeadFormula (anton-8mnr)", () => {
     for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
   });
 
+  /** A real (bd-initialised) workspace root — the only place a formula may land. */
   const beadsDir = () => {
+    const dir = absentBeadsDir();
+    mkdirSync(dir, { recursive: true });
+    return dir;
+  };
+
+  /** A repo with NO `.beads/` — a release-bundle install, where nothing may be created. */
+  const absentBeadsDir = () => {
     const dir = mkdtempSync(join(tmpdir(), "anton-formula-cfg-"));
     dirs.push(dir);
     return join(dir, ".beads");
@@ -163,6 +171,15 @@ describe("ensureBeadFormula (anton-8mnr)", () => {
     expect(ensureBeadFormula(beadsDir(), join(tmpdir(), "no-such-formula.json"))).toBe(
       "missing-asset",
     );
+  });
+
+  it("refuses to fabricate a .beads workspace where none exists", () => {
+    // A release-bundle install has no workspace at the package root. Creating `.beads/formulas/`
+    // there would make every "is this a beads repo?" probe answer yes — configureBeadsDoltSync
+    // reads exactly that, then fails `anton setup` for having no git origin in an extracted runtime.
+    const dir = absentBeadsDir();
+    expect(ensureBeadFormula(dir)).toBe("no-workspace");
+    expect(existsSync(dir)).toBe(false);
   });
 
   it("resolves the bundled asset from the package, not the cwd", () => {

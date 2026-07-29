@@ -897,10 +897,15 @@ async function cmdSetup(args = []) {
 
   // The bead formula (anton-8mnr): the skeleton every bead anton creates is poured from. It lives in
   // the repo's `.beads/`, so a project-local copy always wins and a re-run never clobbers it.
+  // Only lands when the package root already IS a beads workspace (anton's own dev checkout) — a
+  // release bundle has none, and ensureBeadFormula refuses to fabricate one there (the Dolt-sync
+  // step below reads a bare `.beads/` as a workspace and would abort setup for having no git
+  // origin). Registered projects get their formula from configureBeadsForRepo (`anton init` /
+  // addProject), which is the path shaping actually reads.
   const formula = ensureBeadFormula(join(APP_ROOT, ".beads"));
   if (formula === "missing-asset") {
     console.log(c.yellow(`\n! bead formula missing from this install — skipping ${BEAD_FORMULA_FILENAME}.`));
-  } else {
+  } else if (formula !== "no-workspace") {
     console.log(
       c.bold("\nBead formula:") +
         ` .beads/formulas/${BEAD_FORMULA_FILENAME} ` +

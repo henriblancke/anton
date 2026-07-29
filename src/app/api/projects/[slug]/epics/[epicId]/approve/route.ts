@@ -8,7 +8,7 @@ import { nudgeSync } from "@/lib/beads/sync-nudge";
 import { conflictBody, ownerOf, withClaimLock } from "@/lib/beads/claim";
 import { enqueueExecuteEpic, enqueueExecuteEpicIfAbsent } from "@/lib/jobs/service";
 import { resolveOperator } from "@/lib/operator";
-import { deriveStage } from "@/lib/ticket-view";
+import { deriveStage, runTickets } from "@/lib/ticket-view";
 import { STAGES } from "@/lib/types";
 import { notFoundResponse, withProject } from "../../../resolve-project";
 
@@ -93,7 +93,19 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // the work is unrunnable. Advisory gaps ride along in the 200 body below — they degrade a run
   // without stopping it, and blocking approval on them would gate the board on prose. Judged off the
   // same forced fresh read as the gate above, so a bead repaired a moment ago approves.
-  const blocking = contractGaps([target], "blocking");
+  //
+  // Judged over the SAME set execute-epic gates on — the target plus every ticket the run will
+  // dispatch — not the target alone. A conformant epic with one unshaped child would otherwise be
+  // labeled `approved` and answered "running" here, then poison-parked by the runner before it does
+  // any work: exactly the false green this gate exists to prevent. The ticket set comes from the
+  // shared `runTickets`/`groupsChildren` pair the runner uses, so route and runner never disagree
+  // about what the target contains. Closed tickets are dropped — the runner resume-skips them, so
+  // their spec can't strand a run.
+  const children = runTickets(allBeads, epicId);
+  const contractGated = beads.groupsChildren(target, children)
+    ? [target, ...children.filter((t) => t.status !== "closed")]
+    : [target];
+  const blocking = contractGaps(contractGated, "blocking");
   if (blocking.length > 0) {
     return NextResponse.json(
       {
@@ -103,10 +115,11 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
       { status: 422 },
     );
   }
-  // Reported, never enforced — see above. Computed here, off the target the gate just judged.
-  const advisory = contractGaps([target], "advisory").flatMap((g) =>
-    g.violations.map((v) => v.message),
-  );
+  // Reported, never enforced — see above. Computed over the same dispatch set the gate just judged,
+  // so a thin child is heard here too rather than only in the runner's log. One line PER BEAD,
+  // each naming its own id: across a whole ticket set, bare messages leave the operator no way to
+  // tell which bead is thin.
+  const advisory = contractGaps(contractGated, "advisory").map((gap) => formatContractGaps([gap]));
 
   // Builds off the snapshot the refresh above just populated — a board rebuild, not a bd read. The
   // route needs it for the epic-graph blocker rollup and for the item shape it answers with.

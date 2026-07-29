@@ -320,12 +320,18 @@ export function bundledBeadFormulaPath(appRoot = PACKAGE_ROOT) {
  * it. Living under `.beads/` (which git tracks — only the JSONL exports and the Dolt runtime are
  * ignored) is what carries the shape to every clone and teammate.
  *
+ * Never CREATES the workspace: a formula under a `.beads/` that no `bd init` made is a half-
+ * workspace, and every downstream probe reads the directory's mere existence as "this is a beads
+ * repo" (configureBeadsDoltSync does exactly that, then aborts `anton setup` for having no git
+ * origin). So an absent `.beads/` is a skip, not a mkdir.
+ *
  * Returns "installed" | "already" | "missing-asset" (the bundled file isn't in this install — a
- * warning, never fatal: anton's own renderer falls back to its packaged copy).
+ * warning, never fatal: anton's own renderer falls back to its packaged copy) | "no-workspace".
  */
 export function ensureBeadFormula(beadsDir, src = bundledBeadFormulaPath()) {
   const dest = join(beadsDir, "formulas", BEAD_FORMULA_FILENAME);
   if (existsSync(dest)) return "already";
+  if (!existsSync(beadsDir)) return "no-workspace";
   if (!existsSync(src)) return "missing-asset";
   mkdirSync(dirname(dest), { recursive: true });
   copyFileSync(src, dest);
@@ -819,6 +825,9 @@ export function configureBeadsForRepo(dir, opts = {}) {
   steps.push({ name: "bead formula", status: formula });
   if (formula === "missing-asset") {
     emit(`bead formula asset missing from this install (${bundledBeadFormulaPath()}) — skipping.`);
+  } else if (formula === "no-workspace") {
+    // Only reachable if the init/bootstrap above reported success without producing `.beads/`.
+    emit("no .beads workspace to install the bead formula into — skipping.");
   } else {
     emit(`.beads/formulas/${BEAD_FORMULA_FILENAME} (${formula})`);
   }

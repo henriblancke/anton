@@ -198,6 +198,62 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     expect(beads.isApproved(await beads.show(repo, thin))).toBe(true);
   });
 
+  it("422s a conformant epic whose open child ticket has no Acceptance, and names the child", async () => {
+    // The gate must judge the whole dispatch set, not just the target: execute-epic checks
+    // `[target, ...tickets]` and poison-parks on the child, so approving here would write the
+    // `approved` label and answer "running" for a run that never reaches a PR — the false green.
+    const epic = await beads.create(repo, { title: "Conformant epic", type: "epic", acceptance: "- [ ] it works" });
+    const unshaped = await beads.create(repo, { title: "Unshaped child" , type: "task" });
+    await beads.link(repo, unshaped, epic, "parent-child");
+
+    const res = await POST(jsonRequest("POST"), ctx("approvy", epic));
+    expect(res.status).toBe(422);
+    const body = await res.json();
+    expect(body.error).toContain(unshaped); // the operator is told WHICH bead to repair
+    expect(body.sections).toEqual(["Acceptance"]);
+    expect(beads.isApproved(await beads.show(repo, epic))).toBe(false);
+    expect(await executeEpicJobs(epic)).toHaveLength(0);
+  });
+
+  it("approves an epic whose only non-conformant child is closed — the runner skips it", async () => {
+    // A closed ticket is resume-skipped by execute-epic: its agent never runs again, so its missing
+    // spec can't strand the run. Gating on it would strand approval on already-delivered work.
+    const epic = await beads.create(repo, { title: "Epic with delivered child", type: "epic", acceptance: "- [ ] it works" });
+    const done = await beads.create(repo, { title: "Delivered child", type: "task" });
+    const open = await beads.create(repo, { title: "Remaining child", type: "task", acceptance: "- [ ] it works" });
+    await beads.link(repo, done, epic, "parent-child");
+    await beads.link(repo, open, epic, "parent-child");
+    await beads.close(repo, done);
+
+    const res = await POST(jsonRequest("POST"), ctx("approvy", epic));
+    expect(res.status).toBe(200);
+    expect(beads.isApproved(await beads.show(repo, epic))).toBe(true);
+  });
+
+  it("reports a child's advisory gaps in the 200 body without refusing the approval", async () => {
+    // Advisory gaps degrade a run, they don't stop it — but they're the operator's to hear, and a
+    // thin CHILD is exactly what the target-only check used to swallow.
+    const epic = await beads.create(repo, {
+      title: "Well-shaped epic",
+      type: "epic",
+      acceptance: "- [ ] every child ships",
+      description: "Reports leave the app in a format a customer can open.",
+      labels: ["area:reports"], // an epic owes exactly one — otherwise it carries its own advisory
+    });
+    const thin = await beads.create(repo, { title: "Thin child", type: "task", acceptance: "- [ ] it works" });
+    await beads.link(repo, thin, epic, "parent-child");
+
+    const res = await POST(jsonRequest("POST"), ctx("approvy", epic));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    // One line per offending bead, each naming its id — across a ticket set, bare messages leave
+    // the operator no way to tell WHICH bead is thin.
+    expect(body.advisory).toHaveLength(1);
+    expect(body.advisory[0]).toContain(thin);
+    expect(body.advisory[0]).toMatch(/Goal[\s\S]*Context[\s\S]*Out of scope[\s\S]*Verify/);
+    expect(beads.isApproved(await beads.show(repo, epic))).toBe(true);
+  });
+
   it("approves a bead repaired since the board last read it — the gate reads fresh", async () => {
     // The contract gate rides the same forced fresh read as the blocker gate: a bead whose
     // Acceptance was written after the board snapshot warmed must approve, not 422 on stale text.
