@@ -80,8 +80,44 @@ function tierOf(bead: Bead): ContractTier {
 
 const HEADING = /^ {0,3}#{1,6}[ \t]+(.*?)[ \t]*#*[ \t]*$/;
 
+/** An opening or closing code fence: up to 3 leading spaces, then 3+ backticks or tildes. */
+const FENCE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+
 /** Heading text → comparison key, case- and punctuation-insensitive: `## Out-of-Scope:` → `outofscope`. */
 const slug = (heading: string) => heading.toLowerCase().replace(/[^a-z0-9]+/g, "");
+
+/**
+ * The description's lines, each flagged with whether it sits inside a fenced code block.
+ *
+ * Fences matter because the contract is judged on HEADINGS: a bead whose description quotes the
+ * formula (or any markdown sample) in a ``` block carries the literal line `## Acceptance` with
+ * example boxes under it, and a scanner blind to fences reads that sample as the real section —
+ * passing the blocking gate on a ticket that states no definition of done at all.
+ *
+ * CommonMark rules, kept to what a description can hit: a closing fence matches the opening
+ * character, is at least as long, and carries nothing but whitespace after it; a backtick fence's
+ * info string may not contain a backtick; an unclosed fence runs to the end of the text (so the
+ * contract fails closed — the same way the description renders).
+ */
+function scanLines(description: string): { text: string; fenced: boolean }[] {
+  const out: { text: string; fenced: boolean }[] = [];
+  let open: { char: string; len: number } | undefined;
+  for (const text of description.split(/\r?\n/)) {
+    const fence = FENCE.exec(text);
+    if (fence) {
+      const [char, len] = [fence[1][0], fence[1].length];
+      if (!open) {
+        if (char !== "`" || !fence[2].includes("`")) open = { char, len };
+      } else if (char === open.char && len >= open.len && fence[2].trim() === "") {
+        out.push({ text, fenced: true });
+        open = undefined;
+        continue;
+      }
+    }
+    out.push({ text, fenced: !!open });
+  }
+  return out;
+}
 
 /** Section bodies of a description, keyed by slugged heading. A repeated heading concatenates. */
 function sectionsOf(description: string): Map<string, string> {
@@ -93,15 +129,15 @@ function sectionsOf(description: string): Map<string, string> {
     const text = [out.get(key), body.join("\n").trim()].filter(Boolean).join("\n");
     out.set(key, text);
   };
-  for (const line of description.split(/\r?\n/)) {
-    const heading = HEADING.exec(line);
+  for (const { text, fenced } of scanLines(description)) {
+    const heading = fenced ? null : HEADING.exec(text);
     if (heading) {
       flush();
       key = slug(heading[1]);
       body = [];
       continue;
     }
-    if (key) body.push(line);
+    if (key) body.push(text);
   }
   flush();
   return out;
@@ -111,9 +147,9 @@ function sectionsOf(description: string): Map<string, string> {
  * line rather than under `## Goal` still states one, and must not be faulted for it. */
 function preambleOf(description: string): string {
   const lines: string[] = [];
-  for (const line of description.split(/\r?\n/)) {
-    if (HEADING.test(line)) break;
-    lines.push(line);
+  for (const { text, fenced } of scanLines(description)) {
+    if (!fenced && HEADING.test(text)) break;
+    lines.push(text);
   }
   return lines.join("\n").trim();
 }

@@ -8,7 +8,7 @@ import { nudgeSync } from "@/lib/beads/sync-nudge";
 import { conflictBody, ownerOf, withClaimLock } from "@/lib/beads/claim";
 import { enqueueExecuteEpic, enqueueExecuteEpicIfAbsent } from "@/lib/jobs/service";
 import { resolveOperator } from "@/lib/operator";
-import { deriveStage, resumeSkipped, runTickets } from "@/lib/ticket-view";
+import { contractGatedBeads, deriveStage, runTickets } from "@/lib/ticket-view";
 import { STAGES } from "@/lib/types";
 import { notFoundResponse, withProject } from "../../../resolve-project";
 
@@ -91,18 +91,16 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // runner before it does any work: exactly the false green this gate exists to prevent. The ticket
   // set comes from the shared `runTickets`/`groupsChildren` pair the runner uses, so route and
   // runner never disagree about what the target contains. Resume-skipped beads are dropped through
-  // the runner's own predicate (`resumeSkipped`, shared) rather than an approximation of it: a
-  // closed ticket, and — on a standalone run — a target already carrying stage:in-review, whose
-  // commit exists so only the agent-free PR step is left. Gating that one would 422 exactly the
-  // Force-run recovery of a failed/closed PR the runner allows, forcing the operator to invent
+  // the runner's own predicate (`contractGatedBeads`, shared) rather than an approximation of it,
+  // which is also what leaves Force-run recovery of a failed/closed PR reachable on a legacy target
+  // written before the contract: that run re-opens the PR and dispatches no agent, in either shape
+  // — a standalone target already carrying stage:in-review, or a grouped one whose children are all
+  // closed — so gating it would 422 the one action that recovers it, forcing the operator to invent
   // criteria for work that is already written. Judged off the same forced fresh read as the gate
   // above, so a bead repaired a moment ago approves. The refusal itself is deferred until we know
   // this request will start work — see the gate below.
   const children = runTickets(allBeads, epicId);
-  const standaloneRun = !beads.groupsChildren(target, children);
-  const contractGated = standaloneRun
-    ? [target].filter((t) => !resumeSkipped(t, true))
-    : [target, ...children.filter((t) => !resumeSkipped(t, false))];
+  const contractGated = contractGatedBeads(target, children);
 
   // Builds off the snapshot the refresh above just populated — a board rebuild, not a bd read. The
   // route needs it for the epic-graph blocker rollup and for the item shape it answers with.

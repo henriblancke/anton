@@ -161,6 +161,29 @@ describe("runContractStatus (a card's contract covers the whole run)", () => {
     expect(runContractStatus(legacy, [])).toEqual({ blocking: [], advisory: [] });
   });
 
+  it("clears a grouped target whose children are all closed — the same recovery, grouped", () => {
+    // Every child done and the PR closed without merging: the run re-opens the PR and dispatches no
+    // agent. Faulting the (legacy, pre-contract) parent here would strand the grouped half of the
+    // closed-PR recovery that execute-epic supports and the standalone shape is already exempt for.
+    const legacy = readBead({ id: "feat-legacy", issue_type: "feature" });
+    const done = readBead({ id: "task-done", parent: "feat-legacy", status: "closed" });
+
+    expect(runContractStatus(legacy, [done])).toEqual({ blocking: [], advisory: [] });
+  });
+
+  it("still faults a grouped target when one child is left to run", () => {
+    // The exemption is "this run reads no spec", not "some children are closed" — with work left,
+    // the target's own criteria are the rubric that work is judged against.
+    const legacy = readBead({ id: "feat-legacy", issue_type: "feature" });
+    const done = readBead({ id: "task-done", parent: "feat-legacy", status: "closed" });
+    const open = readBead({ id: "task-open", parent: "feat-legacy", description: `${SHAPED}\n\n## Acceptance\n- [ ] it works` });
+
+    const status = runContractStatus(legacy, [done, open])!;
+
+    expect(status.blocking.map((v) => v.section)).toEqual(["Acceptance"]);
+    expect(status.blocking[0].message).not.toContain("task-open");
+  });
+
   it("stays undefined when nothing in the set was judged", () => {
     // A projection carrying no bd stamps was never read — "not judged" must not render as a gap.
     const bare = makeBead({ id: "feat-bare", issue_type: "feature" });

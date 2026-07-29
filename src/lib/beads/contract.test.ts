@@ -145,6 +145,90 @@ describe("validateBeadContract — ticket tier (task / bug / chore / feature)", 
   });
 });
 
+// A description that QUOTES markdown — the bead formula, a docs sample, a template an operator
+// pasted — carries contract headings that are code, not sections. Reading them as real would let a
+// ticket with no definition of done pass the blocking gate against an example's boxes.
+describe("validateBeadContract — headings inside fenced code", () => {
+  it("does not let a fenced `## Acceptance` sample satisfy the blocking gate", () => {
+    const quoting = ticket({
+      acceptance_criteria: undefined,
+      description: [
+        DESCRIPTION,
+        "",
+        "```markdown",
+        "## Acceptance",
+        "- [ ] the example's box",
+        "```",
+      ].join("\n"),
+    });
+    expect(summarize(quoting)).toEqual([["Acceptance", "blocking"]]);
+  });
+
+  it("reads a tilde fence, and a longer closing run, the same way", () => {
+    const quoting = ticket({
+      acceptance_criteria: undefined,
+      description: [DESCRIPTION, "", "~~~", "## Acceptance", "- [ ] sample", "~~~~"].join("\n"),
+    });
+    expect(summarize(quoting)).toEqual([["Acceptance", "blocking"]]);
+  });
+
+  it("keeps a fenced sample inside the section that encloses it", () => {
+    // The real Acceptance is authored; a `## Verify` quoted underneath it is that section's content,
+    // so the bead is faulted for the Verify it genuinely lacks rather than credited with the sample.
+    const quoting = ticket({
+      acceptance_criteria: undefined,
+      description: [
+        withoutSection(DESCRIPTION, "Verify"),
+        "",
+        "## Acceptance",
+        "- [ ] it works, e.g.",
+        "```",
+        "## Verify",
+        "- bun test",
+        "```",
+      ].join("\n"),
+    });
+    expect(summarize(quoting)).toEqual([["Verify", "advisory"]]);
+  });
+
+  it("still reads real headings after the fence closes", () => {
+    const quoting = ticket({
+      acceptance_criteria: undefined,
+      description: [
+        DESCRIPTION,
+        "",
+        "```md",
+        "## Acceptance",
+        "- [ ] the example's box",
+        "```",
+        "",
+        "## Acceptance",
+        "- [ ] the real one",
+      ].join("\n"),
+    });
+    expect(validateBeadContract(quoting)).toEqual([]);
+  });
+
+  it("reads an epic's outcome past a fenced sample rather than out of it", () => {
+    // The preamble scan stops at the first REAL heading, so a fence opened in the outcome text must
+    // not hide the `## Success Criteria` that follows it.
+    const quoting = epic({
+      acceptance_criteria: undefined,
+      description: [
+        "Reports are shareable outside the app.",
+        "```",
+        "## Success Criteria",
+        "- [ ] the example's box",
+        "```",
+        "",
+        "## Success Criteria",
+        "- [ ] every report leaves the app",
+      ].join("\n"),
+    });
+    expect(validateBeadContract(quoting)).toEqual([]);
+  });
+});
+
 // anton-8mnr ships the bead formula's defaults as PROMPTS, not content. A bead cooked from it and
 // never authored carries every heading and no spec — so the validator has to read the prompt as the
 // unwritten section it is, or the gate waves through a run whose rubric is a TODO.

@@ -12,7 +12,7 @@ import { ownerOf } from "../beads/claim";
 import { contractGaps, formatContractGaps } from "../beads/contract";
 import { humanNotesPromptBlock } from "../beads/notes";
 import { computeEpicGraph, epicStandaloneBlockers, isUnit, standaloneBlockers } from "../epic-graph";
-import { resumeSkipped, runTickets } from "../ticket-view";
+import { contractGatedBeads, resumeSkipped, runTickets } from "../ticket-view";
 import { loadAgentPrompt } from "../claude/agent-prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
 import { runClaude, type ClaudeEvent, type ClaudeResult } from "../claude/driver";
@@ -511,12 +511,14 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // rather than parking on the enqueue-time snapshot. Resume-skipped beads are excluded exactly
       // as above — a ticket whose work is already committed won't run its agent again, so its spec
       // can't strand this attempt; if it turns out it WILL re-run (the cross-machine
-      // commit-missing case), the ticket loop re-applies this gate there.
-      // The standalone branch names no `target` because it already holds it: `tickets` is `[target]`
-      // for a run that doesn't group children (set above), so listing it again would gate it twice.
-      const contractGated = standaloneRun
-        ? tickets.filter((t) => !isResumeSkipped(t))
-        : [target, ...tickets.filter((t) => !isResumeSkipped(t))];
+      // commit-missing case), the ticket loop re-applies this gate there. When the whole set is
+      // resume-skipped this run dispatches no agent at all — the closed-PR recovery that falls
+      // through step 0a with only the (agent-free) PR step left — so it is gated on nothing, in the
+      // grouped shape as well as the standalone one.
+      // The set comes from the same helper the approve route and the board card use
+      // (`contractGatedBeads`), so a target this parks on is one the board already marked and
+      // approval already refused, rather than a surprise at dispatch.
+      const contractGated = contractGatedBeads(target, freshChildren);
       const contractBlocking = contractGaps(contractGated, "blocking");
       if (contractBlocking.length > 0) {
         throw new PoisonEpic(

@@ -229,6 +229,30 @@ export function resumeSkipped(bead: Bead, standaloneRun: boolean): boolean {
   );
 }
 
+/**
+ * The beads a run's contract is judged on: the target plus every ticket the run will actually
+ * dispatch an agent for. The one set the approve route refuses on, the runner parks on, and the
+ * card renders (approve/route.ts, execute-epic.ts, {@link runContractStatus}) — shared so the
+ * three can't disagree about what a run reads.
+ *
+ * EMPTY when the run dispatches nothing, and that is the whole point. Force run on a target whose
+ * PR was closed without merging recovers it by re-opening the PR (execute-epic step 5) and running
+ * no agent — the standalone shape reaches that through `resumeSkipped(target, true)`, and a grouped
+ * one reaches it here when every child is already closed. Gating either on a spec no agent will
+ * read would strand exactly the recovery the runner supports, on precisely the legacy targets
+ * (written before the contract) that need it.
+ *
+ * The grouped branch keeps the target alongside its open tickets: its criteria are the rubric the
+ * run's self-review scores that work against, so a thin target degrades a run that IS dispatching.
+ */
+export function contractGatedBeads(target: Bead, children: Bead[]): Bead[] {
+  if (!beads.groupsChildren(target, children)) {
+    return resumeSkipped(target, true) ? [] : [target];
+  }
+  const open = children.filter((t) => !resumeSkipped(t, false));
+  return open.length === 0 ? [] : [target, ...open];
+}
+
 /** A child's gaps, named with its id — the card's own bead isn't the one missing the section. */
 const attributeTo = (id: string, status: ContractStatus): ContractStatus => {
   const name = (v: ContractStatus["blocking"][number]) => ({ ...v, message: `${id} → ${v.message}` });
@@ -241,23 +265,22 @@ const attributeTo = (id: string, status: ContractStatus): ContractStatus => {
  * (approve/route.ts, execute-epic.ts). Judging the target alone let a feature with Acceptance and
  * one unshaped open child render no marker and keep Approve enabled, then 422 on click.
  *
- * Resume-skipped beads are dropped for the same reason the gates drop them ({@link resumeSkipped}):
- * nothing re-reads their spec, so it can't strand a run. That includes the whole judgement for a
- * standalone target already in review — its commit is on the branch and only the PR step is left, so
- * a card that withheld Force run there would strand exactly the closed-PR recovery the gates allow.
+ * The set comes from {@link contractGatedBeads}, so the card can't advertise (or withhold) an
+ * action the gates behind it would decide differently. A run that dispatches nothing — a standalone
+ * target already in review, a grouped one whose children are all closed — carries no gaps at all:
+ * its commit is on the branch and only the PR step is left, so a card that surfaced a gap there
+ * would withhold exactly the closed-PR recovery the gates allow.
  * Undefined only when NOTHING in the set was judged (no bd read behind any of it) — "not judged" is
  * not conformance.
  */
 export function runContractStatus(target: Bead, children: Bead[]): ContractStatus | undefined {
-  const groups = beads.groupsChildren(target, children);
-  if (!groups && resumeSkipped(target, true)) return { blocking: [], advisory: [] };
-  const open = groups ? children.filter((t) => !resumeSkipped(t, false)) : [];
+  const gated = contractGatedBeads(target, children);
+  if (gated.length === 0) return { blocking: [], advisory: [] };
   const statuses: ContractStatus[] = [];
-  const own = contractStatusOf(target);
-  if (own) statuses.push(own);
-  for (const child of open) {
-    const status = contractStatusOf(child);
-    if (status) statuses.push(attributeTo(child.id, status));
+  for (const bead of gated) {
+    const status = contractStatusOf(bead);
+    if (!status) continue;
+    statuses.push(bead.id === target.id ? status : attributeTo(bead.id, status));
   }
   if (statuses.length === 0) return undefined;
   return {
