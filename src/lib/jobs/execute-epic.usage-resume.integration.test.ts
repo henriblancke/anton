@@ -60,6 +60,7 @@ describeBd("execute-epic e2e â€” usage-limit & in-session resume (real handler Â
     const epic2 = await beads.create(repo, {
       title: "Feature Y",
       type: "epic",
+      acceptance: "work file exists",
       description: "## Goal\nY",
     });
     await beads.approve(repo, epic2);
@@ -153,6 +154,7 @@ process.exit(0);`,
     const epic3 = await beads.create(repo, {
       title: "Feature Z",
       type: "epic",
+      acceptance: "work file exists",
       description: "## Goal\nZ",
     });
     await beads.approve(repo, epic3);

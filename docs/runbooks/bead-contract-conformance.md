@@ -11,9 +11,9 @@ epic: anton-6u6y
 
 ## Summary
 
-`anton-j9zs` switches the bead contract from advice to a **hard gate**: approve refuses and a run
-parks when the bead has no Acceptance criteria. Flipping that switch on a board that still has
-unshaped beads strands real work. This report is how you know before you flip it.
+`anton-j9zs` switched the bead contract from advice to a **hard gate**: approve refuses (422) and a
+run parks when the bead has no Acceptance criteria. A board carrying unshaped beads therefore has
+stranded work on it. This report is how you find it — before the switch, and ever since.
 
 ```bash
 bun scripts/contract-report.ts                 # every board registered in anton.db

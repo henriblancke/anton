@@ -3,7 +3,8 @@
  *
  * "Is this bead runnable" is judged at three sites — the approve route, execute-epic, and the
  * board — so the judgement lives here as one pure function rather than three copies that drift.
- * This module only REPORTS; gating is the caller's (anton-j9zs).
+ * This module only REPORTS — it judges, names, and formats the gaps; the refusal itself belongs to
+ * the caller (the approve route and execute-epic gate on {@link contractGaps}, anton-j9zs).
  *
  * Severity is the whole point of the split. Only Acceptance BLOCKS: it is the run's definition of
  * done and the rubric self-review scores the diff against, so without it the work is unrunnable.
@@ -202,6 +203,36 @@ export function contractStatusOf(bead: Bead): ContractStatus | undefined {
     blocking: violations.filter((v) => v.severity === "blocking"),
     advisory: violations.filter((v) => v.severity === "advisory"),
   };
+}
+
+/** One bead's gaps at a single severity — the unit both gates name an offender with. */
+export interface ContractGap {
+  id: string;
+  violations: ContractViolation[];
+}
+
+/**
+ * Every bead here that falls short at `severity`, in the order given. The two gates' shared input
+ * (anton-j9zs): each asks for `blocking` to refuse the run, then for `advisory` to report and
+ * proceed. A bead no bd read produced is never faulted (see {@link isContractReadable}), so a
+ * projection that never carried the contract fields can't strand a run.
+ */
+export function contractGaps(beads: Bead[], severity: ContractSeverity): ContractGap[] {
+  const gaps: ContractGap[] = [];
+  for (const bead of beads) {
+    const violations = validateBeadContract(bead).filter((v) => v.severity === severity);
+    if (violations.length > 0) gaps.push({ id: bead.id, violations });
+  }
+  return gaps;
+}
+
+/**
+ * Gaps as one line naming every offending bead and what it is missing — the body of a 422 or of a
+ * park note. Each violation message already opens with its section ("no Acceptance criteria — …")
+ * and carries the bd command that fixes it, so the operator reads the gap and the remedy together.
+ */
+export function formatContractGaps(gaps: ContractGap[]): string {
+  return gaps.map((g) => `${g.id} → ${g.violations.map((v) => v.message).join(", ")}`).join("; ");
 }
 
 /**

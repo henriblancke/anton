@@ -3,6 +3,7 @@ import { getBoard } from "@/lib/board";
 import { epicStandaloneBlockers, standaloneBlockers } from "@/lib/epic-graph";
 import { refreshAllIssues } from "@/lib/beads/issues";
 import { beads, type Bead } from "@/lib/beads/bd";
+import { contractGaps, formatContractGaps } from "@/lib/beads/contract";
 import { nudgeSync } from "@/lib/beads/sync-nudge";
 import { conflictBody, ownerOf, withClaimLock } from "@/lib/beads/claim";
 import { enqueueExecuteEpic, enqueueExecuteEpicIfAbsent } from "@/lib/jobs/service";
@@ -83,6 +84,29 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
     }
     return NextResponse.json({ error: reason }, { status: 422 });
   }
+
+  // The bead contract, enforced where every run target passes (anton-j9zs). Approve is the run
+  // trigger AND already a validation site, so a target the runner would only poison-park is refused
+  // here instead — the operator gets the missing section named while they're still looking at the
+  // bead, not a parked job later. Only BLOCKING gaps refuse: a ticket with no Acceptance (or an epic
+  // with no Success Criteria) gives the agent no definition of done and self-review no rubric, so
+  // the work is unrunnable. Advisory gaps ride along in the 200 body below — they degrade a run
+  // without stopping it, and blocking approval on them would gate the board on prose. Judged off the
+  // same forced fresh read as the gate above, so a bead repaired a moment ago approves.
+  const blocking = contractGaps([target], "blocking");
+  if (blocking.length > 0) {
+    return NextResponse.json(
+      {
+        error: `${epicId} does not meet the bead contract: ${formatContractGaps(blocking)}`,
+        sections: blocking.flatMap((g) => g.violations.map((v) => v.section)),
+      },
+      { status: 422 },
+    );
+  }
+  // Reported, never enforced — see above. Computed here, off the target the gate just judged.
+  const advisory = contractGaps([target], "advisory").flatMap((g) =>
+    g.violations.map((v) => v.message),
+  );
 
   // Builds off the snapshot the refresh above just populated — a board rebuild, not a bd read. The
   // route needs it for the epic-graph blocker rollup and for the item shape it answers with.
@@ -312,13 +336,15 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // what the patch supplies. Everything else on the board is unchanged by an approve, and the write
   // flagged the snapshot pendingWrite, so the client's next poll blocks on a fresh read regardless.
   // `epic` is kept alongside `item` for the existing epic-card client.
+  // `advisory` carries the contract gaps that did NOT refuse the approval — the run is starting
+  // despite them, so the operator hears about them once, here, rather than never.
   const written = { approved: true, assignee: swap.bead.assignee ?? null };
   if (epic) {
     const updatedEpic = { ...epic, ...written };
-    return NextResponse.json({ epic: updatedEpic, item: updatedEpic, jobId });
+    return NextResponse.json({ epic: updatedEpic, item: updatedEpic, jobId, advisory });
   }
   if (standalone) {
-    return NextResponse.json({ item: { ...standalone, ...written }, jobId });
+    return NextResponse.json({ item: { ...standalone, ...written }, jobId, advisory });
   }
   return notFoundResponse("Run target not found");
 });

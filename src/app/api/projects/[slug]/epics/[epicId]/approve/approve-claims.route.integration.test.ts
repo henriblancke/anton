@@ -42,8 +42,8 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
     // Take over is steal-on-approve, so it goes through this route — but it must only move the
     // reservation. The enqueue dedupe covers `queued`/`running` only, so a parked prior run is
     // exactly the window where a re-approve could spawn a duplicate run under the new owner.
-    const epic = await beads.create(repo, { title: "Parked-run epic", type: "epic" });
-    const child = await beads.create(repo, { title: "Parked-run epic child", type: "task" });
+    const epic = await beads.create(repo, { title: "Parked-run epic", type: "epic", acceptance: "- [ ] it works" });
+    const child = await beads.create(repo, { title: "Parked-run epic child", type: "task", acceptance: "- [ ] it works" });
     await beads.link(repo, child, epic, "parent-child");
 
     actAs("bob");
@@ -72,8 +72,8 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
     // operator asking for a run — it must enqueue. Gating every re-approve on the `approved` label
     // would 200 with no jobId and leave an approved epic unrunnable from the UI.
     actAs("anton-test");
-    const epic = await beads.create(repo, { title: "Approved already", type: "epic" });
-    const child = await beads.create(repo, { title: "Approved already child", type: "task" });
+    const epic = await beads.create(repo, { title: "Approved already", type: "epic", acceptance: "- [ ] it works" });
+    const child = await beads.create(repo, { title: "Approved already child", type: "task", acceptance: "- [ ] it works" });
     await beads.link(repo, child, epic, "parent-child");
     await beads.approve(repo, epic); // labelled, with no job on THIS machine
     expect(await executeEpicJobs(epic)).toHaveLength(0);
@@ -88,8 +88,8 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
     // The steal-scoped gate leans on the enqueue dedupe for the double-click case, so hold that
     // line here: a second Force run while the first is still queued must return the same job.
     actAs("anton-test");
-    const epic = await beads.create(repo, { title: "Double force", type: "epic" });
-    const child = await beads.create(repo, { title: "Double force child", type: "task" });
+    const epic = await beads.create(repo, { title: "Double force", type: "epic", acceptance: "- [ ] it works" });
+    const child = await beads.create(repo, { title: "Double force child", type: "task", acceptance: "- [ ] it works" });
     await beads.link(repo, child, epic, "parent-child");
 
     const first = await POST(jsonRequest("POST"), ctx("approvy", epic));
@@ -102,8 +102,8 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
   it("409s a run target claimed by another operator, without approving it", async () => {
     // A teammate's claim is a soft-lock: approving would silently run their reservation. The route
     // reads the fresh bead (assignee set by another operator) and refuses without an explicit steal.
-    const epic = await beads.create(repo, { title: "Claimed by teammate", type: "epic" });
-    const child = await beads.create(repo, { title: "Claimed epic child", type: "task" });
+    const epic = await beads.create(repo, { title: "Claimed by teammate", type: "epic", acceptance: "- [ ] it works" });
+    const child = await beads.create(repo, { title: "Claimed epic child", type: "task", acceptance: "- [ ] it works" });
     await beads.link(repo, child, epic, "parent-child");
     await beads.assign(repo, epic, "someone-else");
 
@@ -117,8 +117,8 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
 
   it("steals a teammate's claim on approve when { steal: true } is passed", async () => {
     // Stealing is the explicit override: it reassigns the claim to the approver and approves.
-    const epic = await beads.create(repo, { title: "Stolen on approve", type: "epic" });
-    const child = await beads.create(repo, { title: "Stolen epic child", type: "task" });
+    const epic = await beads.create(repo, { title: "Stolen on approve", type: "epic", acceptance: "- [ ] it works" });
+    const child = await beads.create(repo, { title: "Stolen epic child", type: "task", acceptance: "- [ ] it works" });
     await beads.link(repo, child, epic, "parent-child");
     await beads.assign(repo, epic, "someone-else");
 
@@ -137,8 +137,8 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
     // Taking over an implementing/in-review target would strand that live run under a new owner, so
     // the route rejects it (the takeOver gate suppresses only a *second* enqueue, never the first).
     // Mirrors the UI, which offers Take over solely on backlog targets (claim-control `canTakeOver`).
-    const epic = await beads.create(repo, { title: "Running epic", type: "epic" });
-    const child = await beads.create(repo, { title: "Running epic child", type: "task" });
+    const epic = await beads.create(repo, { title: "Running epic", type: "epic", acceptance: "- [ ] it works" });
+    const child = await beads.create(repo, { title: "Running epic child", type: "task", acceptance: "- [ ] it works" });
     await beads.link(repo, child, epic, "parent-child");
     await beads.assign(repo, epic, "someone-else");
     await beads.approve(repo, epic);
@@ -164,8 +164,8 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
     // stage under the claim lock to reject exactly that window. The pre-lock gate reads the bead off
     // the `bd list` the route forces up front (still backlog here), so simulate the runner starting
     // in the window after it by tagging the bead implementing just before the under-lock read lands.
-    const epic = await beads.create(repo, { title: "Racing take-over", type: "epic" });
-    const child = await beads.create(repo, { title: "Racing take-over child", type: "task" });
+    const epic = await beads.create(repo, { title: "Racing take-over", type: "epic", acceptance: "- [ ] it works" });
+    const child = await beads.create(repo, { title: "Racing take-over child", type: "task", acceptance: "- [ ] it works" });
     await beads.link(repo, child, epic, "parent-child");
     await beads.assign(repo, epic, "someone-else");
     await beads.approve(repo, epic); // approved + backlog, owned by a teammate
@@ -202,14 +202,14 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
     // that guards a fresh approval must not reject it. Otherwise a target that gained a blocker AFTER
     // its original approval would sit stranded with the old owner until the blocker closes, even
     // though the UI offers Take over on exactly these approved backlog targets (claim-control).
-    const epic = await beads.create(repo, { title: "Approved-then-blocked take-over", type: "epic" });
-    const child = await beads.create(repo, { title: "Approved-then-blocked take-over child", type: "task" });
+    const epic = await beads.create(repo, { title: "Approved-then-blocked take-over", type: "epic", acceptance: "- [ ] it works" });
+    const child = await beads.create(repo, { title: "Approved-then-blocked take-over child", type: "task", acceptance: "- [ ] it works" });
     await beads.link(repo, child, epic, "parent-child");
     await beads.assign(repo, epic, "someone-else");
     await beads.approve(repo, epic); // approved + backlog, owned by a teammate
 
     // A blocker lands only now — a normal (non-take-over) approval of this epic would 409 here.
-    const blocker = await beads.create(repo, { title: "Late-arriving blocker", type: "task" });
+    const blocker = await beads.create(repo, { title: "Late-arriving blocker", type: "task", acceptance: "- [ ] it works" });
     await beads.link(repo, child, blocker, "blocks");
 
     actAs("anton-test");
@@ -232,8 +232,8 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
     // the reservation to us; without a local enqueue the approved work would strand, because A's job
     // poisons itself once execute-epic sees the epic reassigned. So the take-over must enqueue a
     // fresh runnable job HERE, under the new owner.
-    const epic = await beads.create(repo, { title: "Cross-instance take-over", type: "epic" });
-    const child = await beads.create(repo, { title: "Cross-instance take-over child", type: "task" });
+    const epic = await beads.create(repo, { title: "Cross-instance take-over", type: "epic", acceptance: "- [ ] it works" });
+    const child = await beads.create(repo, { title: "Cross-instance take-over child", type: "task", acceptance: "- [ ] it works" });
     await beads.link(repo, child, epic, "parent-child");
     await beads.assign(repo, epic, "someone-else");
     await beads.approve(repo, epic); // approved + backlog, owned by A, with no job on THIS machine
@@ -262,8 +262,8 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
   it("take-over with an explicit immediate: true enqueues a run-now (bypassBudget) job", async () => {
     // The counterpart: when the caller explicitly asks the take-over to also run now, the intent
     // rides into the enqueue as bypassBudget — only the defaulted (absent) immediate is suppressed.
-    const epic = await beads.create(repo, { title: "Immediate take-over", type: "epic" });
-    const child = await beads.create(repo, { title: "Immediate take-over child", type: "task" });
+    const epic = await beads.create(repo, { title: "Immediate take-over", type: "epic", acceptance: "- [ ] it works" });
+    const child = await beads.create(repo, { title: "Immediate take-over child", type: "task", acceptance: "- [ ] it works" });
     await beads.link(repo, child, epic, "parent-child");
     await beads.assign(repo, epic, "someone-else");
     await beads.approve(repo, epic);
@@ -285,8 +285,8 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
     // approval enqueued it here). A take-over must reuse that job — reassigning the reservation, not
     // spawning a duplicate — since operator identity is machine-scoped and the existing job will run
     // under whoever holds the epic. `enqueueExecuteEpicIfAbsent` returns no new id when a job exists.
-    const epic = await beads.create(repo, { title: "Same-instance take-over", type: "epic" });
-    const child = await beads.create(repo, { title: "Same-instance take-over child", type: "task" });
+    const epic = await beads.create(repo, { title: "Same-instance take-over", type: "epic", acceptance: "- [ ] it works" });
+    const child = await beads.create(repo, { title: "Same-instance take-over child", type: "task", acceptance: "- [ ] it works" });
     await beads.link(repo, child, epic, "parent-child");
 
     actAs("bob");
@@ -311,8 +311,8 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
   it("auto-claims an unclaimed run target for the approver before enqueuing", async () => {
     // Closing the gap before the runtime execution-claim: approving an unclaimed target sets the
     // approver as assignee, so a teammate can't land a claim between approve and the runner.
-    const epic = await beads.create(repo, { title: "Unclaimed on approve", type: "epic" });
-    const child = await beads.create(repo, { title: "Unclaimed epic child", type: "task" });
+    const epic = await beads.create(repo, { title: "Unclaimed on approve", type: "epic", acceptance: "- [ ] it works" });
+    const child = await beads.create(repo, { title: "Unclaimed epic child", type: "task", acceptance: "- [ ] it works" });
     await beads.link(repo, child, epic, "parent-child");
 
     const res = await POST(jsonRequest("POST"), ctx("approvy", epic));
@@ -324,8 +324,8 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
 
   it("approves an item already claimed by the requesting operator unchanged", async () => {
     // Re-approving your own claim is idempotent — no steal needed, assignee stays yours.
-    const epic = await beads.create(repo, { title: "Self-claimed on approve", type: "epic" });
-    const child = await beads.create(repo, { title: "Self-claimed epic child", type: "task" });
+    const epic = await beads.create(repo, { title: "Self-claimed on approve", type: "epic", acceptance: "- [ ] it works" });
+    const child = await beads.create(repo, { title: "Self-claimed epic child", type: "task", acceptance: "- [ ] it works" });
     await beads.link(repo, child, epic, "parent-child");
     await beads.assign(repo, epic, "anton-test");
 
@@ -343,8 +343,8 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
   // and is covered in bd.test.ts.
   it("fires the remote push off the response path and catches a rejected sync", async () => {
     actAs("anton-test");
-    const epic = await beads.create(repo, { title: "Approve then fail", type: "epic" });
-    const child = await beads.create(repo, { title: "Approve then fail child", type: "task" });
+    const epic = await beads.create(repo, { title: "Approve then fail", type: "epic", acceptance: "- [ ] it works" });
+    const child = await beads.create(repo, { title: "Approve then fail child", type: "task", acceptance: "- [ ] it works" });
     await beads.link(repo, child, epic, "parent-child");
 
     let failSync!: () => void;

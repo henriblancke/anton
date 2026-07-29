@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { Bead } from "./types";
 import {
+  contractGaps,
+  formatContractGaps,
   isContractJudged,
   isContractReadable,
   validateBeadContract,
@@ -226,5 +228,43 @@ describe("isContractJudged", () => {
     const gap = ticket({ acceptance_criteria: undefined, description: "" });
     expect(isContractJudged(gap)).toBe(true);
     expect(validateBeadContract(gap).length).toBeGreaterThan(0);
+  });
+});
+
+describe("contractGaps + formatContractGaps (the gates' shared input, anton-j9zs)", () => {
+  const noAcceptance = ticket({ id: "anton-a", acceptance_criteria: undefined });
+  const noGoal = ticket({ id: "anton-b", description: withoutSection(DESCRIPTION, "Goal") });
+
+  it("collects only the requested severity, keeping input order", () => {
+    const blocking = contractGaps([ticket(), noAcceptance, noGoal], "blocking");
+    expect(blocking.map((g) => g.id)).toEqual(["anton-a"]);
+    expect(blocking[0].violations.map((v) => v.section)).toEqual(["Acceptance"]);
+
+    const advisory = contractGaps([noAcceptance, noGoal], "advisory");
+    expect(advisory.map((g) => g.id)).toEqual(["anton-b"]);
+    expect(advisory[0].violations.map((v) => v.section)).toEqual(["Goal"]);
+  });
+
+  it("reports nothing for a conformant, exempt, or never-read bead — none of those can gate a run", () => {
+    const shallow: Bead = { id: "anton-p", title: "projection", status: "open", issue_type: "task" };
+    expect(contractGaps([ticket(), epic(), ticket({ issue_type: "chore" }), shallow], "blocking")).toEqual([]);
+  });
+
+  it("faults an epic on Success Criteria, not Acceptance — the tiers gate on different sections", () => {
+    const gaps = contractGaps([epic({ id: "anton-e2", acceptance_criteria: undefined })], "blocking");
+    expect(gaps.map((g) => g.id)).toEqual(["anton-e2"]);
+    expect(gaps[0].violations.map((v) => v.section)).toEqual(["Success Criteria"]);
+  });
+
+  it("formats one line naming every offender, its section, and the fix", () => {
+    const line = formatContractGaps(contractGaps([noAcceptance, epic({ id: "anton-e3", acceptance_criteria: undefined })], "blocking"));
+    expect(line).toContain("anton-a → no Acceptance criteria");
+    expect(line).toContain("anton-e3 → no Success Criteria");
+    expect(line).toContain("bd update --acceptance"); // the remedy travels with the gap
+    expect(line.split("\n")).toHaveLength(1); // one line: it lands in a 422 body and a park note
+  });
+
+  it("formats empty gaps as an empty string", () => {
+    expect(formatContractGaps([])).toBe("");
   });
 });

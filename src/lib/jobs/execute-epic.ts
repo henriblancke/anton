@@ -9,6 +9,7 @@
 import { randomUUID } from "node:crypto";
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { ownerOf } from "../beads/claim";
+import { contractGaps, formatContractGaps } from "../beads/contract";
 import { humanNotesPromptBlock } from "../beads/notes";
 import { computeEpicGraph, epicStandaloneBlockers, isUnit, standaloneBlockers } from "../epic-graph";
 import { runTickets } from "../ticket-view";
@@ -500,6 +501,39 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         );
       }
 
+      // 0c. Dispatch honors the bead contract (anton-j9zs) — the target plus every ticket this run
+      // will actually dispatch. A BLOCKING gap (no Acceptance on a ticket, no Success Criteria on
+      // an epic) leaves the agent with no definition of done and self-review with no rubric, so the
+      // run would produce work nothing can judge. PARK, don't skip, for the same reason as the
+      // allowlist gate above: skipping the ticket opens the epic's single PR incomplete. Recoverable
+      // — the operator writes the missing section (`bd update --acceptance`) and resumes.
+      // Judged against the FRESHLY-PULLED board: `target`/`tickets` were re-read in step 0 (and
+      // re-derived in 0a-ter), so a bead repaired between approve and dispatch passes this gate
+      // rather than parking on the enqueue-time snapshot. Resume-skipped beads are excluded exactly
+      // as above — a ticket whose work is already committed won't run its agent again, so its spec
+      // can't strand this attempt; if it turns out it WILL re-run (the cross-machine
+      // commit-missing case), the ticket loop re-applies this gate there.
+      const contractGated = standaloneRun
+        ? tickets.filter((t) => !isResumeSkipped(t))
+        : [target, ...tickets.filter((t) => !isResumeSkipped(t))];
+      const contractBlocking = contractGaps(contractGated, "blocking");
+      if (contractBlocking.length > 0) {
+        throw new PoisonEpic(
+          `epic ${epicBeadId} has beads that don't meet the bead contract: ` +
+            formatContractGaps(contractBlocking) +
+            ` — write the missing section(s), then resume the run`,
+        );
+      }
+      // Advisory gaps NEVER gate — they cost quality, not runnability. Logged so a degraded run is
+      // visible rather than silent, then the run proceeds.
+      const contractAdvisory = contractGaps(contractGated, "advisory");
+      if (contractAdvisory.length > 0) {
+        console.warn(
+          `[execute-epic] ${epicBeadId} runs with advisory contract gaps: ` +
+            formatContractGaps(contractAdvisory),
+        );
+      }
+
       // 1. Publish the cross-machine run-liveness lease BEFORE any slow setup — worktree creation,
       //    operator resolution, the epic claim — and keep it fresh while this run executes
       //    (anton-jz1). Acquiring it up front closes the window where another machine's Force run
@@ -823,6 +857,17 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
               `epic ${epicBeadId} needs agents enabled in this project's settings: ` +
                 disabled.map((x) => `${x.id} → agent:${x.agent}`).join(", ") +
                 ` — enable them in Settings → Agents (or relabel the tickets), then resume the run`,
+            );
+          }
+          // Same re-gate for the bead contract (anton-j9zs): step 0c skipped this ticket as
+          // resume-skipped, which only holds while it isn't re-run. Regenerating its work under a
+          // spec with no definition of done is the state that gate exists to refuse.
+          const regressed = contractGaps([ticket], "blocking");
+          if (regressed.length > 0) {
+            throw new PoisonEpic(
+              `epic ${epicBeadId} has beads that don't meet the bead contract: ` +
+                formatContractGaps(regressed) +
+                ` — write the missing section(s), then resume the run`,
             );
           }
         }

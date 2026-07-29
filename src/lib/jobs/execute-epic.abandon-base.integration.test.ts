@@ -68,6 +68,7 @@ describeBd("execute-epic e2e — base tip & abandon (real handler · real bd/git
     const epicSb = await beads.create(repo, {
       title: "Self-blocked epic",
       type: "epic",
+      acceptance: "work file exists",
       description: "## Goal\nSB",
     });
     await beads.approve(repo, epicSb);
@@ -169,6 +170,7 @@ process.exit(0);`),
     const epic6 = await beads.create(repo, {
       title: "Feature FreshBase",
       type: "epic",
+      acceptance: "work file exists",
       description: "## Goal\nFresh",
     });
     await beads.approve(repo, epic6);
@@ -231,6 +233,7 @@ process.exit(0);`),
     const epic7 = await beads.create(repo, {
       title: "Feature ResumeStable",
       type: "epic",
+      acceptance: "work file exists",
       description: "## Goal\nStable",
     });
     await beads.approve(repo, epic7);
@@ -326,6 +329,7 @@ process.exit(0);`,
     const epicAb = await beads.create(repo, {
       title: "Epic with an abandoned ticket",
       type: "epic",
+      acceptance: "work file exists",
       description: "## Goal\nAB",
     });
     await beads.approve(repo, epicAb);
@@ -413,6 +417,7 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
     const epicKill = await beads.create(repo, {
       title: "Epic abandoned mid-flight",
       type: "epic",
+      acceptance: "work file exists",
       description: "## Goal\nKILL",
     });
     await beads.approve(repo, epicKill);
