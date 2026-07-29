@@ -120,11 +120,12 @@ describe("the shipped bead formula", () => {
     expect(validateBeadContract(beadFrom(skeleton, ["area:reports"]))).toEqual([]);
   });
 
-  it("faults an unauthored epic on its area: label AND its unfilled Success Criteria", async () => {
-    // The area: label is the one thing the formula cannot supply; the criteria are the one thing
-    // only an author can write.
+  it("faults an unauthored epic on its outcome, its Success Criteria AND its area: label", async () => {
+    // The area: label is the one thing the formula cannot supply; the outcome and the criteria are
+    // the two only an author can write — and the skeleton's `## Goal` prompt is not an outcome.
     const skeleton = renderBeadSkeleton(await load(), "epic");
     expect(validateBeadContract(beadFrom(skeleton)).map((v) => v.section).sort()).toEqual([
+      "Outcome",
       "Success Criteria",
       "area:",
     ]);

@@ -254,6 +254,31 @@ describe("validateBeadContract — epic tier", () => {
     expect(summarize(epic({ description: undefined }))).toEqual([["Outcome", "advisory"]]);
   });
 
+  it("reports an epic whose outcome is still the formula's prompt", () => {
+    // The epic step pours `## Goal` holding a prompt beside `## Success Criteria`. Authoring only
+    // the criteria leaves a non-empty description with no outcome in it.
+    const cooked = epic({
+      acceptance_criteria: undefined,
+      description: [
+        "## Goal",
+        "TODO — the outcome these features add up to, in language a stakeholder would recognise",
+        "",
+        "## Success Criteria",
+        "- [ ] every report leaves the app in a customer-openable format",
+      ].join("\n"),
+    });
+    expect(summarize(cooked)).toEqual([["Outcome", "advisory"]]);
+    expect(validateBeadContract(cooked)[0].message).toContain("still the formula's TODO prompt");
+  });
+
+  it("reports an epic whose description is only its Success Criteria", () => {
+    const criteriaOnly = epic({
+      acceptance_criteria: undefined,
+      description: "## Success Criteria\n- [ ] shipped",
+    });
+    expect(summarize(criteriaOnly)).toEqual([["Outcome", "advisory"]]);
+  });
+
   it.each([
     ["no", undefined],
     ["no", ["domain:eng"]],

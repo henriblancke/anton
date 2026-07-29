@@ -9,8 +9,8 @@
  */
 import { beads, type Bead } from "./beads/bd";
 import {
-  ACCEPTANCE_KEYS,
   GOAL_KEYS,
+  acceptanceKeysOf,
   contractStatusOf,
   sectionBody,
   type ContractStatus,
@@ -61,8 +61,12 @@ export function createdMeta(bead: Bead): {
  */
 export const parseGoal = (d: string | undefined): string | undefined => sectionBody(d, GOAL_KEYS);
 
+/** Read against the keys the bead's TIER is judged on (`acceptanceKeysOf`), so an epic that states
+ * its rubric as `## Success Criteria` — which approval accepts — renders it instead of nothing. */
 export const parseAcceptance = (bead: Bead): string | undefined =>
-  sectionBody(bead.description, ACCEPTANCE_KEYS) ?? bead.acceptance_criteria ?? bead.acceptance;
+  sectionBody(bead.description, acceptanceKeysOf(bead)) ??
+  bead.acceptance_criteria ??
+  bead.acceptance;
 
 /** Map a bead to the shared Ticket view model (board cards, epic-detail children, etc.). */
 export function toTicket(bead: Bead): Ticket {

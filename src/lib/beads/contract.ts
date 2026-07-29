@@ -107,6 +107,17 @@ function sectionsOf(description: string): Map<string, string> {
   return out;
 }
 
+/** The description text ahead of the first heading — an epic whose outcome is written as a bare
+ * line rather than under `## Goal` still states one, and must not be faulted for it. */
+function preambleOf(description: string): string {
+  const lines: string[] = [];
+  for (const line of description.split(/\r?\n/)) {
+    if (HEADING.test(line)) break;
+    lines.push(line);
+  }
+  return lines.join("\n").trim();
+}
+
 /**
  * Every variable default in `anton-bead.formula.json` is a PROMPT, not content — "- [ ] TODO — a
  * concrete, checkable statement of done". A bead cooked from the formula and never authored
@@ -190,7 +201,21 @@ const TICKET_RULES: SectionRule[] = [
 ];
 
 export const ACCEPTANCE_KEYS = ["acceptance", "acceptancecriteria"];
-const SUCCESS_KEYS = ["successcriteria", "success", ...ACCEPTANCE_KEYS];
+export const SUCCESS_KEYS = ["successcriteria", "success", ...ACCEPTANCE_KEYS];
+
+/** The headings that hold an epic's outcome: what the formula pours (`## Goal`), plus the name the
+ * violation itself uses. Text before any heading counts too — see {@link preambleOf}. */
+const OUTCOME_KEYS = ["goal", "outcome"];
+
+/**
+ * Which headings carry this bead's definition of done, by tier — the reader's half of the choice
+ * {@link validateBeadContract} makes below. A view that assumed `## Acceptance` for every tier
+ * rendered nothing for the epic whose rubric is `## Success Criteria`, the very section approval
+ * had just accepted it on.
+ */
+export function acceptanceKeysOf(bead: Bead): string[] {
+  return tierOf(bead) === "epic" ? SUCCESS_KEYS : ACCEPTANCE_KEYS;
+}
 
 /**
  * The body of the first section whose heading matches one of `keys`, or undefined when none carries
@@ -334,11 +359,19 @@ export function validateBeadContract(bead: Bead): ContractViolation[] {
   // An epic is read, not executed: a one-line outcome, the Success Criteria its features add up to,
   // and the one `area:` label the roadmap groups by (skills/bd/SKILL.md).
   if (tier === "epic") {
-    if (description.trim() === "") {
+    // The outcome is judged like every other section, not by "is there any description text":
+    // an epic cooked from the formula carries `## Goal` holding the prompt and `## Success Criteria`
+    // holding real boxes, and a non-empty description read as an authored outcome let exactly that
+    // bead report fully conformant.
+    const outcome = stateOf([preambleOf(description), ...OUTCOME_KEYS.map((k) => sections.get(k) ?? "")]);
+    if (outcome !== "written") {
       violations.push({
         section: "Outcome",
         severity: "advisory",
-        message: "no outcome — an epic's description is the result its features add up to",
+        message:
+          outcome === "prompt"
+            ? "the outcome is still the formula's TODO prompt — nothing states the result these features add up to"
+            : "no outcome — an epic's description is the result its features add up to",
       });
     }
     const success = stateOf(acceptanceBodies(bead, sections, SUCCESS_KEYS));

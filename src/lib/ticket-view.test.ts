@@ -151,6 +151,19 @@ describe("parseGoal / parseAcceptance (the validator's own parser)", () => {
     expect(parseAcceptance(makeBead({ id: "t-1", description }))).toBe("- [ ] it works");
   });
 
+  it("reads an epic's rubric from `## Success Criteria` — the keys its tier is judged on", () => {
+    // The validator accepts an epic whose rubric is `## Success Criteria`; a reader that knew only
+    // `## Acceptance` let approval pass and the detail page omit the criteria the run is judged on.
+    const bead = makeBead({
+      id: "epic-1",
+      issue_type: "epic",
+      description: "Reports are shareable.\n\n## Success Criteria\n- [ ] every report leaves the app",
+    });
+    expect(parseAcceptance(bead)).toBe("- [ ] every report leaves the app");
+    // A ticket is judged on Acceptance, so the same heading is not its rubric.
+    expect(parseAcceptance({ ...bead, issue_type: "task" })).toBeUndefined();
+  });
+
   it("falls back to bd's own field when the description carries no section", () => {
     const bead = makeBead({ id: "t-1", acceptance_criteria: "- [ ] field only" });
     expect(parseAcceptance(bead)).toBe("- [ ] field only");
