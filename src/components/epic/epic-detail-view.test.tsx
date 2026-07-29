@@ -2,13 +2,24 @@
 /**
  * The detail breadcrumb's two states (anton-9pkk.6): a feature under a product epic gets the epic
  * badge hop, a run target without one gets no hop at all — an empty crumb would be worse than none.
+ * Plus the header's run actions, which answer to the same contract gate the approve route enforces.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 
-import { DetailBreadcrumb } from "@/components/epic/epic-detail-view";
+import { contractStatusOf } from "@/lib/beads/contract";
+import type { EpicDetail } from "@/lib/types";
+import { DetailBreadcrumb, EpicDetailView } from "@/components/epic/epic-detail-view";
 
-afterEach(cleanup);
+// The graph is ReactFlow — measured, canvas-ish, and irrelevant to the header actions under test.
+vi.mock("@/components/epic/dependency-graph", () => ({ DependencyGraph: () => null }));
+vi.mock("next/navigation", () => ({ useRouter: () => ({ push: vi.fn() }) }));
+vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 describe("DetailBreadcrumb", () => {
   it("shows the epic badge, then the feature title and id", () => {
@@ -51,5 +62,82 @@ describe("DetailBreadcrumb", () => {
       "/projects/anton",
     );
     expect(crumb.textContent).toMatch(/^Board\s*\/\s*Legacy run target\s*·\s*anton-ftj$/);
+  });
+});
+
+describe("EpicDetailView run actions", () => {
+  const SHAPED = "## Goal\nG\n\n## Context\nC\n\n## Out of scope\nO\n\n## Verify\nV";
+
+  /** The contract as the shared validator judges it, so the page is tested against approve's wording. */
+  const contractOf = (description: string) =>
+    contractStatusOf({
+      id: "anton-1",
+      title: "Resumable crawl checkpoints",
+      status: "open",
+      issue_type: "feature",
+      created_at: "2026-07-20T00:00:00.000Z",
+      description,
+    });
+
+  function renderDetail(description: string, over: Partial<EpicDetail["epic"]> = {}) {
+    const detail: EpicDetail = {
+      epic: {
+        id: "anton-1",
+        title: "Resumable crawl checkpoints",
+        type: "feature",
+        approved: false,
+        stage: "backlog",
+        assignee: null,
+        createdAt: "2026-07-20T00:00:00.000Z",
+        createdBy: null,
+        blockedBy: [],
+        ready: true,
+        rank: 0,
+        priority: 2,
+        abandoned: false,
+        contract: contractOf(description),
+        tickets: [],
+        ...over,
+      },
+      description,
+      tickets: [],
+      edges: [],
+    };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ detail }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    render(<EpicDetailView slug="anton" epicId="anton-1" />);
+    return fetchMock;
+  }
+
+  it("renders the run action inert and names the missing section when the contract blocks", async () => {
+    // The board card already refuses to advertise this run; the detail page posts to the same route,
+    // so an enabled button here is a guaranteed 422 the operator learns nothing from.
+    const fetchMock = renderDetail(SHAPED); // shaped prose, no Acceptance anywhere
+
+    const action = await screen.findByRole("button", { name: /Run feature/ });
+    expect(action.hasAttribute("disabled")).toBe(true);
+    expect(action.getAttribute("aria-label")).toContain("no Acceptance criteria");
+    // Reads only — no approve POST is reachable from the inert control.
+    const posts = fetchMock.mock.calls.filter(
+      ([, init]) => (init as RequestInit | undefined)?.method === "POST",
+    );
+    expect(posts).toEqual([]);
+  });
+
+  it("keeps Force run inert on a blocked target that is already implementing", async () => {
+    renderDetail(SHAPED, { stage: "implementing" });
+
+    const action = await screen.findByRole("button", { name: /Force run/ });
+    expect(action.hasAttribute("disabled")).toBe(true);
+  });
+
+  it("leaves the run action live when only advisory gaps remain", async () => {
+    // Advisory gaps cost quality, not runnability — nothing may withhold the run over them.
+    renderDetail("## Acceptance\n- [ ] it works");
+
+    const action = await screen.findByRole("button", { name: "Run feature" });
+    expect(action.hasAttribute("disabled")).toBe(false);
   });
 });

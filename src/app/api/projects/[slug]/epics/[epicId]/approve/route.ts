@@ -91,18 +91,17 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // runner before it does any work: exactly the false green this gate exists to prevent. The ticket
   // set comes from the shared `runTickets`/`groupsChildren` pair the runner uses, so route and
   // runner never disagree about what the target contains. Closed tickets are dropped — the runner
-  // resume-skips them, so their spec can't strand a run. Judged off the same forced fresh read as
-  // the gate above, so a bead repaired a moment ago approves. The refusal itself is deferred until
-  // we know this request will start work — see the gate below.
+  // resume-skips them, so their spec can't strand a run. `status !== "closed"` is a deliberate
+  // approximation of the runner's own `isResumeSkipped` (which additionally skips a ticket already
+  // carrying stage:in-review on a standalone run): the runner closes a bead as it merges, so the
+  // only divergence is the slim window between PR merge and bead close, where this gate is the
+  // stricter of the two. Judged off the same forced fresh read as the gate above, so a bead
+  // repaired a moment ago approves. The refusal itself is deferred until we know this request will
+  // start work — see the gate below.
   const children = runTickets(allBeads, epicId);
   const contractGated = beads.groupsChildren(target, children)
     ? [target, ...children.filter((t) => t.status !== "closed")]
     : [target];
-  // Reported, never enforced. Computed over the same dispatch set the gate below judges, so a thin
-  // child is heard here too rather than only in the runner's log. One line PER BEAD, each naming
-  // its own id: across a whole ticket set, bare messages leave the operator no way to tell which
-  // bead is thin.
-  const advisory = contractGaps(contractGated, "advisory").map((gap) => formatContractGaps([gap]));
 
   // Builds off the snapshot the refresh above just populated — a board rebuild, not a bd read. The
   // route needs it for the epic-graph blocker rollup and for the item shape it answers with.
@@ -195,6 +194,15 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
       { status: 422 },
     );
   }
+  // Reported, never enforced. Computed over the same dispatch set the gate above judges, so a thin
+  // child is heard here too rather than only in the runner's log. One line PER BEAD, each naming
+  // its own id: across a whole ticket set, bare messages leave the operator no way to tell which
+  // bead is thin. Gated on `willEnqueue` for the same reason the refusal is: a pure take-over of a
+  // blocked target starts no run, so warnings about the spec no run is about to read would tell the
+  // operator a run is degraded when none began.
+  const advisory = willEnqueue
+    ? contractGaps(contractGated, "advisory").map((gap) => formatContractGaps([gap]))
+    : [];
 
   // Enforce the claim as a soft-lock at the run trigger, from the fresh ownership read above.
   if (owner && owner !== operator) {
@@ -360,7 +368,8 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // flagged the snapshot pendingWrite, so the client's next poll blocks on a fresh read regardless.
   // `epic` is kept alongside `item` for the existing epic-card client.
   // `advisory` carries the contract gaps that did NOT refuse the approval — the run is starting
-  // despite them, so the operator hears about them once, here, rather than never.
+  // despite them, so the operator hears about them once, here, rather than never. Empty when this
+  // request enqueued nothing (a pure take-over of a blocked target): no run, nothing degraded.
   const written = { approved: true, assignee: swap.bead.assignee ?? null };
   if (epic) {
     const updatedEpic = { ...epic, ...written };

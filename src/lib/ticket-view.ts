@@ -8,7 +8,13 @@
  * so those modules can all consume it without reintroducing a board↔tickets import cycle.
  */
 import { beads, type Bead } from "./beads/bd";
-import { contractStatusOf } from "./beads/contract";
+import {
+  ACCEPTANCE_KEYS,
+  GOAL_KEYS,
+  contractStatusOf,
+  sectionBody,
+  type ContractStatus,
+} from "./beads/contract";
 import type { Epic, EpicCrumb, IssueType, Stage, StandaloneItem, Ticket } from "./types";
 
 /** Derived stage for a bead: closed → done; an `in-review` label or PR ref → in-review; an
@@ -44,25 +50,19 @@ export function createdMeta(bead: Bead): {
   };
 }
 
-/** Extract a "## <name>" section from a bead description. `bd list --json` returns the
- * description but not the acceptance/context fields, so views read the contract here. */
-function parseSection(description: string | undefined, name: string): string | undefined {
-  if (!description) return undefined;
-  const lines = description.split("\n");
-  const re = new RegExp(`^##\\s*${name}\\b`, "i");
-  const startIdx = lines.findIndex((l) => re.test(l.trim()));
-  if (startIdx === -1) return undefined;
-  const rest = lines.slice(startIdx + 1);
-  const endIdx = rest.findIndex((l) => /^##\s+/.test(l.trim()));
-  const body = endIdx === -1 ? rest : rest.slice(0, endIdx);
-  const text = body.join("\n").trim();
-  return text || undefined;
-}
-
-export const parseGoal = (d: string | undefined): string | undefined => parseSection(d, "Goal");
+/**
+ * The contract sections a view RENDERS, read with the validator's own parser (contract.ts's
+ * `sectionBody`) rather than a view-local regex. `bd list --json` returns the description but not
+ * the acceptance/context fields, so views read the contract out of the description here.
+ *
+ * The shared parser is the point: a view-local one that only accepted `##` left a `# Goal` bead
+ * judged conformant by the gate and rendered blank on every card and detail view — the gate said
+ * "fine" and the board showed nothing.
+ */
+export const parseGoal = (d: string | undefined): string | undefined => sectionBody(d, GOAL_KEYS);
 
 export const parseAcceptance = (bead: Bead): string | undefined =>
-  parseSection(bead.description, "Acceptance") ?? bead.acceptance_criteria ?? bead.acceptance;
+  sectionBody(bead.description, ACCEPTANCE_KEYS) ?? bead.acceptance_criteria ?? bead.acceptance;
 
 /** Map a bead to the shared Ticket view model (board cards, epic-detail children, etc.). */
 export function toTicket(bead: Bead): Ticket {
@@ -206,9 +206,49 @@ export function runTickets(all: Bead[], targetId: string): Bead[] {
   return all.filter((b) => isRunTicket(b, cards) && cards.cardOf(b) === targetId);
 }
 
+/** A child's gaps, named with its id — the card's own bead isn't the one missing the section. */
+const attributeTo = (id: string, status: ContractStatus): ContractStatus => {
+  const name = (v: ContractStatus["blocking"][number]) => ({ ...v, message: `${id} → ${v.message}` });
+  return { blocking: status.blocking.map(name), advisory: status.advisory.map(name) };
+};
+
+/**
+ * The contract status a RUN TARGET carries: its own gaps plus those of every open ticket its run
+ * would dispatch — the SAME set the approve route refuses on and the runner parks on
+ * (approve/route.ts, execute-epic.ts). Judging the target alone let a feature with Acceptance and
+ * one unshaped open child render no marker and keep Approve enabled, then 422 on click.
+ *
+ * Closed tickets are dropped for the same reason the gates drop them: the runner resume-skips them,
+ * so their spec can't strand a run. Undefined only when NOTHING in the set was judged (no bd read
+ * behind any of it) — "not judged" is not conformance.
+ */
+export function runContractStatus(target: Bead, children: Bead[]): ContractStatus | undefined {
+  const open = beads.groupsChildren(target, children)
+    ? children.filter((t) => t.status !== "closed")
+    : [];
+  const statuses: ContractStatus[] = [];
+  const own = contractStatusOf(target);
+  if (own) statuses.push(own);
+  for (const child of open) {
+    const status = contractStatusOf(child);
+    if (status) statuses.push(attributeTo(child.id, status));
+  }
+  if (statuses.length === 0) return undefined;
+  return {
+    blocking: statuses.flatMap((s) => s.blocking),
+    advisory: statuses.flatMap((s) => s.advisory),
+  };
+}
+
 export interface ToEpicOptions {
   /** The epic's tickets, already mapped (an orphan/pseudo-epic passes `[toTicket(bead)]`). */
   tickets: Ticket[];
+  /**
+   * The raw child beads behind `tickets`, so the card's contract status covers the whole run (see
+   * {@link runContractStatus}). Omitted by callers that hold only the target — the status then
+   * reports the target's own gaps, as it did before.
+   */
+  children?: Bead[];
   /** Parsed "## Goal" text, if the caller has the bead's description. */
   goal?: string;
   /** Parsed "## Acceptance" text, if available. */
@@ -271,9 +311,10 @@ export function toEpic(bead: Bead, opts: ToEpicOptions): Epic {
     ...(withPrRef ? { prRef: beads.getPrRef(bead) } : {}),
     blockedBy: opts.blockedBy ?? [],
     ready: opts.ready ?? true,
-    // Derived here, not passed in: contract conformance is a pure read of the bead, so every surface
-    // that maps a bead gets the same judgement the approve route and the runner apply.
-    contract: contractStatusOf(bead),
+    // Derived here, not passed in: contract conformance is a pure read of the beads, so every
+    // surface that maps a run target gets the same judgement the approve route and the runner apply
+    // — over the same set, target plus open tickets, not the target alone.
+    contract: runContractStatus(bead, opts.children ?? []),
     rank: opts.rank ?? 0,
     priority: bead.priority ?? DEFAULT_PRIORITY,
     abandoned: beads.isAbandoned(bead),

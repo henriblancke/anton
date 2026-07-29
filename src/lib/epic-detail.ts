@@ -54,7 +54,9 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
   // their dependency graph — reporting the feature itself would hide the work the run acts on.
   if (!beads.groupsChildren(lite, childBeads)) {
     const self = toTicket(lite);
-    const epic = toEpic(lite, {
+    // `full`, not `lite`: the contract is judged off the description, and the list bead may have
+    // dropped it — judging the projection would fault a bead for sections nothing read.
+    const epic = toEpic(full, {
       goal: parseGoal(full.description),
       acceptance: parseAcceptance(full),
       tickets: [self],
@@ -69,10 +71,13 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
   // The epic-detail header shows the epic's own agent/risk/size chips (like the board card and the
   // single-ticket pseudo-epic) so an epic with risk:/size: labels doesn't silently drop them. See
   // ticket-view.ts; `chips` defaults to true.
-  const epic = toEpic(lite, {
+  // `children` carries the raw beads so the header's contract status covers the whole run — the
+  // same target-plus-open-tickets set the approve route this page's actions post to gates on.
+  const epic = toEpic(full, {
     goal: parseGoal(full.description),
     acceptance: parseAcceptance(full),
     tickets,
+    children: childBeads,
   });
   attachPrUrl(epic, base);
   for (const t of tickets) attachPrUrl(t, base);

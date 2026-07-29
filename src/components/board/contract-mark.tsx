@@ -21,6 +21,12 @@ function reasonOf(violations: ContractViolation[]): string {
   return violations.map((v) => v.message).join("; ");
 }
 
+/** The missing pieces, deduped: a target and two of its tickets can all lack Acceptance, and
+ * "needs Acceptance + Acceptance" names the same fix twice. The reason sentence still lists each. */
+function sectionsOf(violations: ContractViolation[]): string {
+  return [...new Set(violations.map((v) => v.section))].join(" + ");
+}
+
 /**
  * The contract marks for a card or chip: what blocks the run (red, named) and what merely thins it
  * (grey, counted). Both render when both apply — the founder fixes the blocker to run at all and the
@@ -42,7 +48,7 @@ export function ContractChip({
         <MetaChip tone="risk-high" className={className}>
           <CircleAlertIcon className="size-2.5" aria-hidden="true" />
           <span title={`Can't run as shaped — ${reasonOf(blocking)}`}>
-            needs {blocking.map((v) => v.section).join(" + ")}
+            needs {sectionsOf(blocking)}
           </span>
         </MetaChip>
       )}
@@ -66,18 +72,21 @@ export function ContractChip({
 export function ApproveBlocked({
   violations,
   label = "Approve",
+  size = "xs",
   className,
 }: {
   violations: ContractViolation[];
-  /** The wording the enabled button would have used ("Approve", "Approve & run"). */
+  /** The wording the enabled button would have used ("Approve", "Approve & run", "Run feature"). */
   label?: string;
+  /** Match the surface's own button scale — `xs` on a board card, `sm` in a detail header. */
+  size?: "xs" | "sm";
   className?: string;
 }) {
   if (violations.length === 0) return null;
   const reason = `Can't approve — ${reasonOf(violations)}`;
   return (
     <span className={cn("pointer-events-auto inline-flex", className)} title={reason}>
-      <Button size="xs" variant="outline" disabled aria-label={`${label}: ${reason}`}>
+      <Button size={size} variant="outline" disabled aria-label={`${label}: ${reason}`}>
         <CircleAlertIcon className="text-risk-high" aria-hidden="true" />
         {label}
       </Button>

@@ -630,6 +630,62 @@ describe("getBoard contract marking", () => {
     expect(item.contract!.blocking.map((v) => v.section)).toEqual(["Acceptance"]);
   });
 
+  it("marks a conformant card whose open ticket is unshaped — the gate judges the whole run", async () => {
+    // Approval refuses `[target, ...open tickets]`, so a card that reported only its own status
+    // rendered no marker, kept Approve enabled, and 422'd on click. The child's id rides in the
+    // message: the section is missing on the ticket, not on the card's own bead.
+    const card = makeBead({
+      id: "feat-parent",
+      title: "Shaped target, unshaped ticket",
+      issue_type: "feature",
+      created_at: "2026-07-20T00:00:00.000Z",
+      description: `${SHAPED}\n\n## Acceptance\n- [ ] it works`,
+    });
+    const child = makeBead({
+      id: "task-thin",
+      title: "No definition of done",
+      parent: "feat-parent",
+      created_at: "2026-07-20T00:00:00.000Z",
+      description: SHAPED,
+    });
+
+    listMock.mockResolvedValue([card, child]);
+
+    const board = await getBoard(project);
+
+    const built = board.columns.backlog.find((e) => e.id === "feat-parent")!;
+    expect(contractBlocks(built.contract)).toBe(true);
+    expect(built.contract!.blocking.map((v) => v.section)).toEqual(["Acceptance"]);
+    expect(built.contract!.blocking[0].message).toContain("task-thin");
+  });
+
+  it("leaves a card whose only unshaped ticket is closed approvable", async () => {
+    // The runner resume-skips a closed ticket, and so does the approve gate — a delivered ticket's
+    // missing spec must not withhold the run the board is advertising.
+    const card = makeBead({
+      id: "feat-delivered",
+      title: "Shaped target, delivered ticket",
+      issue_type: "feature",
+      created_at: "2026-07-20T00:00:00.000Z",
+      description: `${SHAPED}\n\n## Acceptance\n- [ ] it works`,
+    });
+    const done = makeBead({
+      id: "task-done",
+      title: "Already delivered",
+      parent: "feat-delivered",
+      status: "closed",
+      created_at: "2026-07-20T00:00:00.000Z",
+      description: SHAPED,
+    });
+
+    listMock.mockResolvedValue([card, done]);
+
+    const board = await getBoard(project);
+
+    const built = board.columns.backlog.find((e) => e.id === "feat-delivered")!;
+    expect(contractBlocks(built.contract)).toBe(false);
+  });
+
   it("leaves a conformant target unmarked and a never-judged one unjudged", async () => {
     const conformant = makeBead({
       id: "feat-clean",

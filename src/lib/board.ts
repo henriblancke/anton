@@ -113,6 +113,9 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
       goal: parseGoal(card.description),
       acceptance: parseAcceptance(card),
       tickets,
+      // The raw children too: the card's contract marker covers the whole run (target + open
+      // tickets), so it can't advertise Approve on a target one unshaped child would 422.
+      children,
       blockedBy,
       ready: blockedBy.length === 0,
       rank: node?.rank ?? 0,

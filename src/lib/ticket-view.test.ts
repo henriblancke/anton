@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { runTickets } from "./ticket-view";
+import { parseAcceptance, parseGoal, runContractStatus, runTickets } from "./ticket-view";
 import type { Bead } from "./beads/bd";
 
 function makeBead(overrides: Partial<Bead> & { id: string }): Bead {
@@ -63,5 +63,97 @@ describe("runTickets (the tickets a run target contains)", () => {
       makeBead({ id: "b", parent: "a" }),
     ];
     expect(runTickets(board, "feat-1")).toEqual([]);
+  });
+});
+
+describe("runContractStatus (a card's contract covers the whole run)", () => {
+  const SHAPED = "## Goal\nG\n\n## Context\nC\n\n## Out of scope\nO\n\n## Verify\nV";
+  /** A bead a bd read produced, so the contract is judged rather than skipped. */
+  const readBead = (over: Partial<Bead> & { id: string }) =>
+    makeBead({ created_at: "2026-07-20T00:00:00.000Z", ...over });
+
+  const target = readBead({
+    id: "feat-1",
+    issue_type: "feature",
+    description: `${SHAPED}\n\n## Acceptance\n- [ ] it works`,
+  });
+
+  it("reports an open child's blocking gap on the target, named with the child's id", () => {
+    // The approve route gates on `[target, ...open tickets]`, so a card showing only the target's
+    // own status advertised Approve on a request that 422s.
+    const child = readBead({ id: "task-1", parent: "feat-1", description: SHAPED });
+
+    const status = runContractStatus(target, [child])!;
+
+    expect(status.blocking.map((v) => v.section)).toEqual(["Acceptance"]);
+    expect(status.blocking[0].message).toContain("task-1");
+  });
+
+  it("carries an open child's advisory gaps too, without inventing a blocker", () => {
+    const child = readBead({
+      id: "task-1",
+      parent: "feat-1",
+      acceptance_criteria: "- [ ] it works",
+    });
+
+    const status = runContractStatus(target, [child])!;
+
+    expect(status.blocking).toEqual([]);
+    expect(status.advisory.map((v) => v.section)).toEqual([
+      "Goal",
+      "Context",
+      "Out of scope",
+      "Verify",
+    ]);
+    expect(status.advisory.every((v) => v.message.startsWith("task-1 → "))).toBe(true);
+  });
+
+  it("drops a closed child — the runner resume-skips it, so its spec strands nothing", () => {
+    const done = readBead({
+      id: "task-done",
+      parent: "feat-1",
+      status: "closed",
+      description: SHAPED,
+    });
+
+    expect(runContractStatus(target, [done])).toEqual({ blocking: [], advisory: [] });
+  });
+
+  it("ignores children of a leaf target — it runs as its own single ticket", () => {
+    // A feature with no shaped tickets under it doesn't group children, so a sibling projection
+    // handed in here must not fault it (beads.groupsChildren, shared with the runner).
+    const stranger = readBead({ id: "task-x", description: SHAPED });
+
+    expect(runContractStatus(target, [])).toEqual({ blocking: [], advisory: [] });
+    expect(runContractStatus({ ...target, issue_type: "task" }, [stranger])).toEqual({
+      blocking: [],
+      advisory: [],
+    });
+  });
+
+  it("stays undefined when nothing in the set was judged", () => {
+    // A projection carrying no bd stamps was never read — "not judged" must not render as a gap.
+    const bare = makeBead({ id: "feat-bare", issue_type: "feature" });
+    expect(runContractStatus(bare, [makeBead({ id: "task-bare", parent: "feat-bare" })])).toBeUndefined();
+  });
+});
+
+describe("parseGoal / parseAcceptance (the validator's own parser)", () => {
+  it("reads the heading levels the contract validator accepts, not `##` alone", () => {
+    // The two used to disagree: a `# Goal` bead passed the gate and rendered blank everywhere.
+    const description = "# Goal\nShip it.\n\n### Acceptance\n- [ ] it works";
+    expect(parseGoal(description)).toBe("Ship it.");
+    expect(parseAcceptance(makeBead({ id: "t-1", description }))).toBe("- [ ] it works");
+  });
+
+  it("matches the validator's heading spelling too — `## Acceptance Criteria` is Acceptance", () => {
+    const description = "## Acceptance Criteria\n- [ ] it works";
+    expect(parseAcceptance(makeBead({ id: "t-1", description }))).toBe("- [ ] it works");
+  });
+
+  it("falls back to bd's own field when the description carries no section", () => {
+    const bead = makeBead({ id: "t-1", acceptance_criteria: "- [ ] field only" });
+    expect(parseAcceptance(bead)).toBe("- [ ] field only");
+    expect(parseGoal(bead.description)).toBeUndefined();
   });
 });

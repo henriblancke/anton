@@ -152,12 +152,14 @@ interface SectionRule {
   promptMessage: string;
 }
 
+export const GOAL_KEYS = ["goal"];
+
 /** The four advisory sections every task/bug/chore/feature carries, in the order they read best. */
 const TICKET_RULES: SectionRule[] = [
   {
     section: "Goal",
     severity: "advisory",
-    keys: ["goal"],
+    keys: GOAL_KEYS,
     message: "no `## Goal` section — nothing states what the work is for",
     promptMessage: "`## Goal` is still the formula's TODO prompt — nothing states what the work is for",
   },
@@ -187,8 +189,28 @@ const TICKET_RULES: SectionRule[] = [
   },
 ];
 
-const ACCEPTANCE_KEYS = ["acceptance", "acceptancecriteria"];
+export const ACCEPTANCE_KEYS = ["acceptance", "acceptancecriteria"];
 const SUCCESS_KEYS = ["successcriteria", "success", ...ACCEPTANCE_KEYS];
+
+/**
+ * The body of the first section whose heading matches one of `keys`, or undefined when none carries
+ * text — the reader half of this module, for surfaces that RENDER a contract section rather than
+ * judge it (board cards, detail views).
+ *
+ * It exists so those surfaces parse headings the way {@link validateBeadContract} does. A second
+ * parser drifts silently and in the worst direction: one that only accepted `##` left a `# Goal`
+ * bead judged conformant here and rendered blank everywhere, so the gate said "fine" and the board
+ * showed nothing.
+ */
+export function sectionBody(description: string | undefined, keys: string[]): string | undefined {
+  if (!description) return undefined;
+  const sections = sectionsOf(description);
+  for (const key of keys) {
+    const text = sections.get(key);
+    if (text) return text;
+  }
+  return undefined;
+}
 
 /**
  * Every home the tier's acceptance text can occupy: bd's own field (under either name a read

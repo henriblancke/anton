@@ -296,7 +296,10 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
     expect(res.status).toBe(200);
     expect((await beads.show(repo, unshaped)).assignee).toBe("anton-test");
     // Nothing enqueued, so the thin spec never reaches an agent — the gate lost no ground.
-    expect((await res.json()).jobId).toBeUndefined();
+    const body = await res.json();
+    expect(body.jobId).toBeUndefined();
+    // …and no spec-gap warnings either: they describe a run that is degraded, and no run started.
+    expect(body.advisory).toEqual([]);
     expect(await executeEpicJobs(unshaped)).toHaveLength(0);
   });
 
