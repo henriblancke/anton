@@ -296,6 +296,45 @@ describe("parseGoal / parseAcceptance (the validator's own parser)", () => {
     expect(parseGoal({ ...bead, issue_type: "task" })).toBeUndefined();
   });
 
+  it("reads an epic's outcome from the description preamble — a home the validator accepts", () => {
+    // The gate accepts an outcome written as bare text ahead of the first heading (preambleOf), so
+    // a reader blind to that home cleared the contract warning while rendering no outcome at all.
+    const bead = makeBead({
+      id: "epic-1",
+      issue_type: "epic",
+      description: "Reports are shareable outside the app.\n\n## Success Criteria\n- [ ] every view exports",
+    });
+    expect(parseGoal(bead)).toBe("Reports are shareable outside the app.");
+    // A ticket is judged on `## Goal` alone — bare preamble text is not one.
+    expect(parseGoal({ ...bead, issue_type: "task" })).toBeUndefined();
+  });
+
+  it("prefers a written outcome over a `## Goal` still holding the formula's TODO prompt", () => {
+    // The cooked prompt stays behind when the author writes `## Outcome` (or a bare preamble): a
+    // first-key read showed the stale TODO over the outcome the gate had just accepted.
+    const outcome = makeBead({
+      id: "epic-1",
+      issue_type: "epic",
+      description: "## Goal\nTODO — the outcome these features add up to\n\n## Outcome\nReports leave the app.",
+    });
+    expect(parseGoal(outcome)).toBe("Reports leave the app.");
+    const preamble = makeBead({
+      id: "epic-2",
+      issue_type: "epic",
+      description: "Reports leave the app.\n\n## Goal\nTODO — the outcome these features add up to",
+    });
+    expect(parseGoal(preamble)).toBe("Reports leave the app.");
+  });
+
+  it("still renders the goal prompt when no home is authored — the bead really has no goal yet", () => {
+    const bead = makeBead({
+      id: "epic-1",
+      issue_type: "epic",
+      description: "## Goal\nTODO — the outcome these features add up to",
+    });
+    expect(parseGoal(bead)).toBe("TODO — the outcome these features add up to");
+  });
+
   it("matches the validator's heading spelling too — `## Acceptance Criteria` is Acceptance", () => {
     const description = "## Acceptance Criteria\n- [ ] it works";
     expect(parseAcceptance(makeBead({ id: "t-1", description }))).toBe("- [ ] it works");

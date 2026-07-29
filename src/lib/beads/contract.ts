@@ -413,12 +413,26 @@ export function acceptanceBody(bead: Bead): string | undefined {
 }
 
 /**
- * The goal/outcome text a view RENDERS, read on the headings this bead's tier is judged against —
+ * The goal/outcome text a view RENDERS, read on every home {@link validateBeadContract} judges —
  * the reader half of {@link goalKeysOf}, mirroring {@link acceptanceBody} for the other section.
+ *
+ * For an epic that includes the description PREAMBLE: the validator accepts an outcome written as
+ * bare text ahead of the first heading ({@link preambleOf}), and a reader blind to that home
+ * cleared the contract warning while rendering no outcome at all. A WRITTEN body also wins over
+ * one still holding the formula's TODO prompt, whichever home each sits in — an epic whose cooked
+ * `## Goal` prompt remains beside an authored `## Outcome` is conformant, and a first-key read
+ * showed the stale TODO over the outcome the gate had just accepted. When nothing anywhere is
+ * written the first body is returned — the bead genuinely has no goal yet, and the advisory
+ * marker beside it says so.
  */
 export function goalBody(bead: Bead): string | undefined {
-  const description = typeof bead.description === "string" ? bead.description : undefined;
-  return sectionBody(description, goalKeysOf(bead));
+  const description = typeof bead.description === "string" ? bead.description : "";
+  const sections = sectionsOf(description);
+  const bodies = [
+    ...goalKeysOf(bead).map((k) => sections.get(k)),
+    ...(tierOf(bead) === "epic" ? [preambleOf(description)] : []),
+  ].filter((b): b is string => typeof b === "string" && b.trim() !== "");
+  return bodies.find((b) => stateOf([b]) === "written") ?? bodies[0];
 }
 
 /**
