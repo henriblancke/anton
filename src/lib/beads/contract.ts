@@ -313,6 +313,31 @@ const acceptanceBodies = (bead: Bead, sections: Map<string, string>, keys: strin
 ];
 
 /**
+ * The acceptance text a view RENDERS, across every home it can occupy — the reader half of the
+ * choice {@link validateBeadContract} makes when it judges the same bead.
+ *
+ * A WRITTEN body wins over one still holding the formula's TODO prompt, whichever home each sits
+ * in. That is the whole point: the repair the blocking gap prescribes (`bd update --acceptance`)
+ * writes bd's field and leaves the cooked `## Success Criteria` prompt in the description, so a
+ * description-first read showed the operator the TODO they had just answered — approval succeeded
+ * while every card and detail view still displayed the placeholder.
+ *
+ * Among written bodies the DESCRIPTION section still wins, because that is the home the ticket
+ * dialog edits; falling back to bd's field first would render a stale value the author had already
+ * replaced. When nothing anywhere is written the prompt itself is returned — the bead genuinely has
+ * no rubric yet, and the blocking marker beside it says so.
+ */
+export function acceptanceBody(bead: Bead): string | undefined {
+  const sections = sectionsOf(typeof bead.description === "string" ? bead.description : "");
+  const bodies = [
+    ...acceptanceKeysOf(bead).map((k) => sections.get(k)),
+    bead.acceptance_criteria,
+    bead.acceptance,
+  ].filter((b): b is string => typeof b === "string" && b.trim() !== "");
+  return bodies.find((b) => stateOf([b]) === "written") ?? bodies[0];
+}
+
+/**
  * Did this bead come from a bd read — one that WOULD have carried the contract fields had the bead
  * had them? `bd list` / `show` / `ready` / `dep list` all return the full issue record: bd's own
  * created/updated stamps, and description/acceptance whenever they are non-empty. A bead assembled

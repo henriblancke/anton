@@ -1,3 +1,5 @@
+"use client";
+
 /**
  * The advisory half of the contract, where the operator actually is when it matters (anton-j9zs).
  *

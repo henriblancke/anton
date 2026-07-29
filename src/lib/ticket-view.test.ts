@@ -222,4 +222,24 @@ describe("parseGoal / parseAcceptance (the validator's own parser)", () => {
     expect(parseAcceptance(bead)).toBe("- [ ] field only");
     expect(parseGoal(bead.description)).toBeUndefined();
   });
+
+  it("prefers the authored field over a section still holding the formula's TODO prompt", () => {
+    // The repair the blocking gap prescribes (`bd update --acceptance`) writes bd's field and leaves
+    // the cooked prompt in the description — a description-first read then showed the operator the
+    // TODO they had just answered, on a bead approval now accepts.
+    const epic = makeBead({
+      id: "epic-1",
+      issue_type: "epic",
+      description: "Reports are shareable.\n\n## Success Criteria\n- [ ] TODO — how you know it landed",
+      acceptance_criteria: "- [ ] every report leaves the app",
+    });
+    expect(parseAcceptance(epic)).toBe("- [ ] every report leaves the app");
+    expect(parseAcceptance({ ...epic, issue_type: "task", description: "## Acceptance\n- [ ] TODO — done?" }))
+      .toBe("- [ ] every report leaves the app");
+  });
+
+  it("still renders the prompt when no home is authored — the bead really has no rubric yet", () => {
+    const bead = makeBead({ id: "t-1", description: "## Acceptance\n- [ ] TODO — a checkable statement" });
+    expect(parseAcceptance(bead)).toBe("- [ ] TODO — a checkable statement");
+  });
 });
