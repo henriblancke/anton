@@ -171,6 +171,40 @@ export function isContractJudged(bead: Bead): boolean {
 }
 
 /**
+ * A bead's contract gaps split by what they cost, for the surfaces that render the two differently
+ * (the board marks a blocking gap as an error the Approve affordance refuses, an advisory one as a
+ * nudge). `undefined` from {@link contractStatusOf} is neither — it means "never judged".
+ */
+export interface ContractStatus {
+  /** Gaps that make the bead unrunnable — approval refuses it. */
+  blocking: ContractViolation[];
+  /** Gaps that degrade the run without stopping it. */
+  advisory: ContractViolation[];
+}
+
+/**
+ * Does the contract withhold this target's run? The one predicate every surface asks — the board
+ * before it advertises Approve, and the gate behind it. An absent status means the bead was never
+ * judged (no bd read behind it), which is not a violation.
+ */
+export function contractBlocks(contract: ContractStatus | undefined): boolean {
+  return (contract?.blocking.length ?? 0) > 0;
+}
+
+/**
+ * {@link validateBeadContract} split by severity, for a view model. Undefined when the bead is
+ * exempt or came from no bd read — "not judged", which a caller must not render as conformant.
+ */
+export function contractStatusOf(bead: Bead): ContractStatus | undefined {
+  if (!isContractJudged(bead)) return undefined;
+  const violations = validateBeadContract(bead);
+  return {
+    blocking: violations.filter((v) => v.severity === "blocking"),
+    advisory: violations.filter((v) => v.severity === "advisory"),
+  };
+}
+
+/**
  * Every way this bead falls short of the contract for its tier — empty when it is complete, exempt,
  * or not readable. Pure: no bd calls, no IO.
  */

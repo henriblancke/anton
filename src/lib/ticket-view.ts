@@ -8,6 +8,7 @@
  * so those modules can all consume it without reintroducing a board↔tickets import cycle.
  */
 import { beads, type Bead } from "./beads/bd";
+import { contractStatusOf } from "./beads/contract";
 import type { Epic, EpicCrumb, IssueType, Stage, StandaloneItem, Ticket } from "./types";
 
 /** Derived stage for a bead: closed → done; an `in-review` label or PR ref → in-review; an
@@ -112,6 +113,7 @@ export function toStandaloneItem(bead: Bead, blockedBy: string[] = []): Standalo
     prRef: beads.getPrRef(bead),
     blockedBy,
     ready: blockedBy.length === 0,
+    contract: contractStatusOf(bead),
     unread: isUnreadBug(bead),
     deferred: beads.isDeferred(bead),
     abandoned: beads.isAbandoned(bead),
@@ -269,6 +271,9 @@ export function toEpic(bead: Bead, opts: ToEpicOptions): Epic {
     ...(withPrRef ? { prRef: beads.getPrRef(bead) } : {}),
     blockedBy: opts.blockedBy ?? [],
     ready: opts.ready ?? true,
+    // Derived here, not passed in: contract conformance is a pure read of the bead, so every surface
+    // that maps a bead gets the same judgement the approve route and the runner apply.
+    contract: contractStatusOf(bead),
     rank: opts.rank ?? 0,
     priority: bead.priority ?? DEFAULT_PRIORITY,
     abandoned: beads.isAbandoned(bead),

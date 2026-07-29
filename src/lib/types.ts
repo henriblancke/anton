@@ -2,9 +2,14 @@
  * Shared contract for the anton board slice. The API layer and the UI both build to this.
  * Stages/approval/PR are derived from beads (see DESIGN.md §2/§3), not stored in anton.db.
  */
+import type { ContractStatus } from "./beads/contract";
 import type { TicketNote } from "./beads/notes";
 
 export type { TicketNote };
+
+// The bead contract, re-exported so client surfaces read its shape without importing the validator
+// module itself. Type-only, so nothing of lib/beads reaches the browser bundle.
+export type { ContractSeverity, ContractStatus, ContractViolation } from "./beads/contract";
 
 export type Stage = "backlog" | "implementing" | "in-review" | "done";
 export const STAGES: Stage[] = ["backlog", "implementing", "in-review", "done"];
@@ -78,6 +83,13 @@ export interface Epic {
   // Epic→epic dependency rollup from computeEpicGraph (epic-graph.ts), attached in board.ts.
   blockedBy: string[]; // epic ids that currently block this epic (open blockers); empty when ready
   ready: boolean; // no open blockers — mirrors what the runtime's bd-ready would actually pick up
+  /**
+   * How this card's bead measures against the bead contract, from the SAME validator approve and the
+   * runner judge with (lib/beads/contract.ts) — so the board can never advertise as approvable a bead
+   * approval will refuse. Absent means "never judged" (an item built from no bd read), which a
+   * surface must not render as conformant.
+   */
+  contract?: ContractStatus;
   rank: number; // topological rank (0 = no blockers); drives dependency-aware backlog order
   priority: number; // bead priority (0=critical … 4=lowest); backlog tiebreak after rank
   /** Abandoned (closed + `abandoned` label, anton-6xj0) — a won't-do outcome, never a delivery. */
@@ -116,6 +128,8 @@ export interface StandaloneItem {
   // directly — mirroring the epic card's blockedBy/ready so the chip can gate approval the same way.
   blockedBy: string[]; // blocker ids that currently block this item (open blockers); empty when ready
   ready: boolean; // no open blockers — mirrors what the approve route enforces
+  /** Contract conformance from the shared validator, exactly as on an epic card (see Epic.contract). */
+  contract?: ContractStatus;
   /** A self-filed bug (source:<x> label) still untouched (backlog, unclaimed, not approved) — it
    * wants a human's triage before it runs. Derived each build; there is no stored read-state. */
   unread: boolean;

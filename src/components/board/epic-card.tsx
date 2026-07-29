@@ -6,6 +6,8 @@ import { toast } from "sonner";
 import { CircleCheckIcon, CircleSlashIcon, GitPullRequestIcon } from "lucide-react";
 
 import type { Epic, EpicCrumb } from "@/lib/types";
+// The predicate itself, not a card-local copy: approve and the runner ask the same one.
+import { contractBlocks } from "@/lib/beads/contract";
 import { Button } from "@/components/ui/button";
 import { ConfirmDeleteButton } from "@/components/ui/confirm-delete-button";
 import { cn } from "@/lib/utils";
@@ -16,6 +18,7 @@ import {
   ticketProgress,
 } from "@/components/board/board-utils";
 import { TypeBadge, TypeIcon } from "@/components/board/type-language";
+import { ApproveBlocked, ContractChip } from "@/components/board/contract-mark";
 import { EpicBadge, NoEpicBadge } from "@/components/board/epic-badge";
 import { AbandonedChip, BlockedChip, MetaChip, PrLink, RiskChip } from "@/components/atoms";
 import { ClaimControl } from "@/components/board/claim-control";
@@ -99,6 +102,10 @@ export function EpicCard({
   // blocked epic (open blockers) must not be startable before its blocker completes (mirrors the
   // approve route, which rejects a not-ready epic).
   const showApprove = epic.stage === "backlog" && !approved && epic.ready;
+  // A contract gap is the other reason a run can't start. It differs from a blocker in what it asks
+  // of the founder — a blocker needs waiting, this needs a one-line edit — so the affordance stays in
+  // place and names the missing section instead of disappearing (or 422ing on click).
+  const contractBlocked = contractBlocks(epic.contract);
   const { done, total, pct } = ticketProgress(epic);
   const isDone = epic.stage === "done";
 
@@ -204,6 +211,7 @@ export function EpicCard({
         {epic.agent && <MetaChip dotClass={agentDotClass(epic.agent)}>{epic.agent}</MetaChip>}
         {epic.risk && <RiskChip risk={epic.risk} />}
         {epic.size && <MetaChip>size:{epic.size}</MetaChip>}
+        <ContractChip contract={epic.contract} />
       </div>
 
       {epic.stage === "backlog" && !overlay && (
@@ -217,7 +225,9 @@ export function EpicCard({
           className="mt-0.5"
         >
           {showApprove &&
-            (budgetAware ? (
+            (contractBlocked ? (
+              <ApproveBlocked violations={epic.contract?.blocking ?? []} />
+            ) : budgetAware ? (
               // Budget-aware: let the operator run now or hand the run to the governor's pace-line.
               <span className="pointer-events-auto flex items-center gap-1">
                 <Button
