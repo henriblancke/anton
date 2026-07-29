@@ -55,7 +55,7 @@ describe("buildContractReport", () => {
   it("excludes exempt tiers and unread beads from the denominator", () => {
     const report = buildContractReport([
       ticket(),
-      ticket({ id: "anton-c", issue_type: "chore", description: "", acceptance_criteria: "" }),
+      ticket({ id: "anton-l", issue_type: "learning", description: "", acceptance_criteria: "" }),
       { id: "anton-p", title: "A graph projection", status: "open", issue_type: "task" },
     ]);
     expect(report.judged).toBe(1);

@@ -65,9 +65,17 @@ function withoutSection(description: string, heading: string): string {
 const summarize = (bead: Bead): Array<[ContractSection, ContractSeverity]> =>
   validateBeadContract(bead).map((v) => [v.section, v.severity]);
 
-describe("validateBeadContract — ticket tier (task / bug / feature)", () => {
-  it.each(["task", "bug", "feature"])("passes a fully shaped %s", (issue_type) => {
+describe("validateBeadContract — ticket tier (task / bug / chore / feature)", () => {
+  it.each(["task", "bug", "chore", "feature"])("passes a fully shaped %s", (issue_type) => {
     expect(validateBeadContract(ticket({ issue_type }))).toEqual([]);
+  });
+
+  it("holds a chore to the ticket contract — the runner dispatches it like any other ticket", () => {
+    // A chore under a feature is a run ticket (`runTickets` → execute-epic), so exempting it would
+    // dispatch work with no definition of done and self-review with no rubric.
+    expect(summarize(ticket({ issue_type: "chore", acceptance_criteria: undefined }))).toEqual([
+      ["Acceptance", "blocking"],
+    ]);
   });
 
   // The table the ticket asks for: each section removed in turn, reported at its own severity.
@@ -137,6 +145,87 @@ describe("validateBeadContract — ticket tier (task / bug / feature)", () => {
   });
 });
 
+// anton-8mnr ships the bead formula's defaults as PROMPTS, not content. A bead cooked from it and
+// never authored carries every heading and no spec — so the validator has to read the prompt as the
+// unwritten section it is, or the gate waves through a run whose rubric is a TODO.
+describe("validateBeadContract — the formula's unfilled prompts", () => {
+  it("blocks a ticket whose Acceptance is still the formula's prompt", () => {
+    const [violation] = validateBeadContract(
+      ticket({ acceptance_criteria: "- [ ] TODO — a concrete, checkable statement of done" }),
+    );
+    expect(violation).toMatchObject({ section: "Acceptance", severity: "blocking" });
+    // The heading IS there, so the message must not send the operator looking for a missing one.
+    expect(violation.message).toContain("still the formula's TODO prompt");
+  });
+
+  it("blocks an epic whose Success Criteria is still the formula's prompt", () => {
+    expect(
+      summarize(
+        epic({
+          acceptance_criteria: "- [ ] TODO — the observable state that means this outcome is reached",
+        }),
+      ),
+    ).toEqual([["Success Criteria", "blocking"]]);
+  });
+
+  it("reads a prompt in an advisory section as that section being unwritten", () => {
+    const prompted = ticket({
+      description: DESCRIPTION.replace("Ship the thing.", "TODO — one sentence: what this delivers"),
+    });
+    expect(summarize(prompted)).toEqual([["Goal", "advisory"]]);
+  });
+
+  it("reports every section of a bead cooked from the formula and never authored", () => {
+    const cooked = ticket({
+      acceptance_criteria: "- [ ] TODO — a concrete, checkable statement of done",
+      description: [
+        "## Goal",
+        "TODO — one sentence: what this delivers, and why it matters",
+        "",
+        "## Context",
+        "TODO — touches: <files/areas>; follow the pattern in <file>",
+        "",
+        "## Out of scope",
+        "- TODO — what this deliberately does not change",
+        "",
+        "## Verify",
+        "TODO — the tests that prove this landed, and which to add",
+      ].join("\n"),
+    });
+    expect(summarize(cooked)).toEqual([
+      ["Acceptance", "blocking"],
+      ["Goal", "advisory"],
+      ["Context", "advisory"],
+      ["Out of scope", "advisory"],
+      ["Verify", "advisory"],
+    ]);
+  });
+
+  it("counts a section as written once ONE line is authored, prompt lines beside it or not", () => {
+    // Half-filled is authored: telling the author to write what they already wrote is noise.
+    expect(
+      validateBeadContract(
+        ticket({ acceptance_criteria: "- [ ] the export button ships\n- [ ] TODO — the rest" }),
+      ),
+    ).toEqual([]);
+  });
+
+  it("does not mistake an authored line that merely mentions a TODO for a prompt", () => {
+    expect(
+      validateBeadContract(ticket({ acceptance_criteria: "- [ ] the TODO banner clears on save" })),
+    ).toEqual([]);
+  });
+
+  it("accepts a written description section over a prompt left in bd's own field", () => {
+    // The two homes are judged together: whichever one the author used satisfies the rule.
+    const written = ticket({
+      acceptance_criteria: "- [ ] TODO — a concrete, checkable statement of done",
+      description: `${DESCRIPTION}\n\n## Acceptance\n- [ ] it works`,
+    });
+    expect(validateBeadContract(written)).toEqual([]);
+  });
+});
+
 describe("validateBeadContract — epic tier", () => {
   it("passes an epic carrying outcome + Success Criteria + one area:", () => {
     expect(validateBeadContract(epic())).toEqual([]);
@@ -180,7 +269,7 @@ describe("validateBeadContract — epic tier", () => {
 });
 
 describe("validateBeadContract — exempt types", () => {
-  it.each(["chore", "learning", "molecule", undefined])("exempts %s", (issue_type) => {
+  it.each(["learning", "molecule", undefined])("exempts %s", (issue_type) => {
     expect(
       validateBeadContract({
         id: "anton-3",
@@ -220,7 +309,8 @@ describe("isContractJudged", () => {
   it("separates a judged bead from an exempt or unread one", () => {
     expect(isContractJudged(ticket())).toBe(true);
     expect(isContractJudged(epic())).toBe(true);
-    expect(isContractJudged(ticket({ issue_type: "chore" }))).toBe(false);
+    expect(isContractJudged(ticket({ issue_type: "chore" }))).toBe(true); // working layer, not exempt
+    expect(isContractJudged(ticket({ issue_type: "learning" }))).toBe(false);
     expect(isContractJudged({ id: "anton-5", title: "projection", status: "open", issue_type: "task" })).toBe(false);
   });
 

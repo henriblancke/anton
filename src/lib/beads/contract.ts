@@ -10,7 +10,7 @@
  * done and the rubric self-review scores the diff against, so without it the work is unrunnable.
  * Goal / Context / Out of scope / Verify degrade quality without making it unrunnable — they warn.
  *
- * Two parsing facts this encodes (both measured against bd 1.1.0, 2026-07-28):
+ * Three facts this encodes (the first two measured against bd 1.1.0, 2026-07-28):
  *
  * 1. The contract lives in the DESCRIPTION markdown. `--context` is sugar that appends a
  *    `## Context` section to it; there is no `context` field in `--json`. `acceptance_criteria`
@@ -22,6 +22,10 @@
  *    "the section is there, we just didn't fetch it"; on a bead that came from a bd read it is a
  *    genuine gap. What must never be faulted is a bead that never came from one — see
  *    {@link isContractReadable}.
+ * 3. A section holding the bead formula's `TODO —` prompt is UNWRITTEN, not present. The formula
+ *    (anton-8mnr) ships prompts rather than content precisely so an author fills them; counting the
+ *    prompt as content would let a bead cooked-and-never-authored approve and run against a
+ *    placeholder rubric — see {@link PROMPT_LINE}.
  *
  * Contract text: skills/bd/SKILL.md. Kept dependency-free (a type-only import) so the API route,
  * the job runner, and the board can all import it.
@@ -50,8 +54,13 @@ export interface ContractViolation {
 
 /**
  * Which requirements a bead answers to. `epic` is read, not executed, so it carries less; `exempt`
- * covers `chore` and every non-work type (`learning`, `molecule`, …) — plus a bead whose type the
- * read didn't carry, which cannot be classified and is therefore never faulted.
+ * covers every non-work type (`learning`, `molecule`, …) — plus a bead whose type the read didn't
+ * carry, which cannot be classified and is therefore never faulted.
+ *
+ * `chore` is a TICKET, not an exemption: it is the working layer alongside `task`/`bug`
+ * (skills/bd/SKILL.md), so `runTickets` classifies a chore under a feature as one of that run's
+ * tickets and execute-epic dispatches it. Exempting it would hand an agent a chore with no
+ * definition of done and self-review no rubric — the exact hole this contract exists to close.
  */
 type ContractTier = "ticket" | "epic" | "exempt";
 
@@ -59,6 +68,7 @@ function tierOf(bead: Bead): ContractTier {
   switch (bead.issue_type) {
     case "task":
     case "bug":
+    case "chore":
     case "feature":
       return "ticket";
     case "epic":
@@ -97,21 +107,59 @@ function sectionsOf(description: string): Map<string, string> {
   return out;
 }
 
+/**
+ * Every variable default in `anton-bead.formula.json` is a PROMPT, not content — "- [ ] TODO — a
+ * concrete, checkable statement of done". A bead cooked from the formula and never authored
+ * therefore carries all five headings and none of the spec, and reading it as conformant would let
+ * a run start against a placeholder rubric: exactly the false green the gate exists to prevent.
+ *
+ * Matched after the list scaffolding (`- `, `* `, `- [ ] `) so the checkbox form reads the same as
+ * the bare one, and anchored on the separator that follows `TODO` so an authored line merely
+ * mentioning one ("- [ ] the TODO banner clears") is not mistaken for a prompt.
+ */
+const PROMPT_LINE = /^(?:[-*+]\s+)?(?:\[[ xX]?\][ \t]*)?TODO\s*[—–:-]/;
+
+/** What a section holds. `prompt` is a gap like `absent` — they differ only in the message. */
+type SectionState = "written" | "prompt" | "absent";
+
+/**
+ * The state of a section given every place its text can live. `written` wins over `prompt` (an
+ * author who filled the description section has written it, whatever bd's field still holds), and a
+ * body counts as a prompt only when EVERY line of it is one — a section where boxes were filled and
+ * one TODO left beside them is authored, and calling it unwritten would ask for what is already there.
+ */
+function stateOf(bodies: string[]): SectionState {
+  let state: SectionState = "absent";
+  for (const raw of bodies) {
+    const lines = raw
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+    if (lines.length === 0) continue;
+    if (!lines.every((l) => PROMPT_LINE.test(l))) return "written";
+    state = "prompt";
+  }
+  return state;
+}
+
 interface SectionRule {
   section: ContractSection;
   severity: ContractSeverity;
   /** Slugged headings that satisfy the rule. */
   keys: string[];
   message: string;
+  /** The same gap when the heading IS there — the operator must not be told to add what they see. */
+  promptMessage: string;
 }
 
-/** The four advisory sections every task/bug/feature carries, in the order they read best. */
+/** The four advisory sections every task/bug/chore/feature carries, in the order they read best. */
 const TICKET_RULES: SectionRule[] = [
   {
     section: "Goal",
     severity: "advisory",
     keys: ["goal"],
     message: "no `## Goal` section — nothing states what the work is for",
+    promptMessage: "`## Goal` is still the formula's TODO prompt — nothing states what the work is for",
   },
   {
     section: "Context",
@@ -119,28 +167,39 @@ const TICKET_RULES: SectionRule[] = [
     keys: ["context"],
     message:
       "no `## Context` section — the agent has to rediscover which files and patterns apply (`bd update --context` appends one)",
+    promptMessage:
+      "`## Context` is still the formula's TODO prompt — the agent has to rediscover which files and patterns apply",
   },
   {
     section: "Out of scope",
     severity: "advisory",
     keys: ["outofscope"],
     message: "no `## Out of scope` section — nothing bounds the change",
+    promptMessage: "`## Out of scope` is still the formula's TODO prompt — nothing bounds the change",
   },
   {
     section: "Verify",
     severity: "advisory",
     keys: ["verify", "verification"],
     message: "no `## Verify` section — no stated way to prove the work landed",
+    promptMessage:
+      "`## Verify` is still the formula's TODO prompt — no stated way to prove the work landed",
   },
 ];
 
 const ACCEPTANCE_KEYS = ["acceptance", "acceptancecriteria"];
 const SUCCESS_KEYS = ["successcriteria", "success", ...ACCEPTANCE_KEYS];
 
-/** bd's own acceptance field, under either name a read populates it with. */
-const acceptanceField = (bead: Bead): string =>
-  (typeof bead.acceptance_criteria === "string" ? bead.acceptance_criteria : "").trim() ||
-  (typeof bead.acceptance === "string" ? bead.acceptance : "").trim();
+/**
+ * Every home the tier's acceptance text can occupy: bd's own field (under either name a read
+ * populates it with) and the description section, judged together so a bead satisfies the rule
+ * from whichever one its author used.
+ */
+const acceptanceBodies = (bead: Bead, sections: Map<string, string>, keys: string[]): string[] => [
+  typeof bead.acceptance_criteria === "string" ? bead.acceptance_criteria : "",
+  typeof bead.acceptance === "string" ? bead.acceptance : "",
+  ...keys.map((k) => sections.get(k) ?? ""),
+];
 
 /**
  * Did this bead come from a bd read — one that WOULD have carried the contract fields had the bead
@@ -245,9 +304,9 @@ export function validateBeadContract(bead: Bead): ContractViolation[] {
 
   const description = typeof bead.description === "string" ? bead.description : "";
   const sections = sectionsOf(description);
-  // A heading with an empty body is as absent as no heading at all — it carries no spec.
-  const has = (keys: string[]) => keys.some((k) => (sections.get(k) ?? "").trim() !== "");
-  const acceptance = acceptanceField(bead);
+  // A heading whose body is empty — or still the formula's TODO prompt — carries no spec, so it is
+  // as absent as no heading at all.
+  const sectionState = (keys: string[]) => stateOf(keys.map((k) => sections.get(k) ?? ""));
   const violations: ContractViolation[] = [];
 
   // An epic is read, not executed: a one-line outcome, the Success Criteria its features add up to,
@@ -260,30 +319,40 @@ export function validateBeadContract(bead: Bead): ContractViolation[] {
         message: "no outcome — an epic's description is the result its features add up to",
       });
     }
-    if (!acceptance && !has(SUCCESS_KEYS)) {
+    const success = stateOf(acceptanceBodies(bead, sections, SUCCESS_KEYS));
+    if (success !== "written") {
       violations.push({
         section: "Success Criteria",
         severity: "blocking",
         message:
-          "no Success Criteria — nothing states when the outcome is reached (`bd update --acceptance`)",
+          success === "prompt"
+            ? "Success Criteria is still the formula's TODO prompt — nothing states when the outcome is reached (`bd update --acceptance`)"
+            : "no Success Criteria — nothing states when the outcome is reached (`bd update --acceptance`)",
       });
     }
     violations.push(...areaViolations(bead));
     return violations;
   }
 
-  if (!acceptance && !has(ACCEPTANCE_KEYS)) {
+  const acceptance = stateOf(acceptanceBodies(bead, sections, ACCEPTANCE_KEYS));
+  if (acceptance !== "written") {
     violations.push({
       section: "Acceptance",
       severity: "blocking",
       message:
-        "no Acceptance criteria — the run has no definition of done and self-review has no rubric (`bd update --acceptance`)",
+        acceptance === "prompt"
+          ? "Acceptance criteria is still the formula's TODO prompt — the run has no definition of done and self-review has no rubric (`bd update --acceptance`)"
+          : "no Acceptance criteria — the run has no definition of done and self-review has no rubric (`bd update --acceptance`)",
     });
   }
   for (const rule of TICKET_RULES) {
-    if (!has(rule.keys)) {
-      violations.push({ section: rule.section, severity: rule.severity, message: rule.message });
-    }
+    const state = sectionState(rule.keys);
+    if (state === "written") continue;
+    violations.push({
+      section: rule.section,
+      severity: rule.severity,
+      message: state === "prompt" ? rule.promptMessage : rule.message,
+    });
   }
   return violations;
 }

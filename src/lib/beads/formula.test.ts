@@ -1,8 +1,11 @@
 /**
- * The bead formula's whole promise (anton-8mnr): a bead poured from it passes the contract
- * validator BY CONSTRUCTION. That is asserted here against the SHIPPED asset — not a fixture — so
- * an edit to the formula that drops a section reddens this suite rather than quietly reintroducing
- * the unshaped beads the board then has to flag.
+ * The bead formula's whole promise (anton-8mnr): STRUCTURE by construction, content by the author.
+ * A bead poured from it and filled in passes the contract validator without anyone remembering a
+ * heading — and one poured but never filled is faulted, because its defaults are prompts and a run
+ * against a TODO rubric is the false green the contract exists to prevent. Both halves are asserted
+ * against the SHIPPED asset — not a fixture — so an edit to the formula that drops a section (or
+ * turns a prompt into fake content) reddens this suite rather than quietly reintroducing the
+ * unshaped beads the board then has to flag.
  */
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -79,13 +82,32 @@ describe("the shipped bead formula", () => {
     }
   });
 
-  // The acceptance criterion in one assertion: what the formula renders is conformant before an
-  // author has typed anything, so filling it in can only keep it conformant.
+  // The acceptance criterion in one assertion: the formula supplies the STRUCTURE, so a bead an
+  // author fills through it is conformant without them remembering a single heading.
   it.each([["feature"], ["ticket"]] as const)(
-    "renders a %s the contract validator passes with zero violations",
+    "renders a %s the contract validator passes once its vars are authored",
     async (tier) => {
-      const skeleton = renderBeadSkeleton(await load(), tier);
+      const skeleton = renderBeadSkeleton(await load(), tier, {
+        goal: "Reports leave the app in a format a customer can open.",
+        acceptance: "- [ ] the export button ships",
+        context: "touches: app/reports/*; follow app/reports/pdf.ts",
+        out_of_scope: "- not the PDF path",
+        verify: "- unit test covers the CSV writer",
+      });
       expect(validateBeadContract(beadFrom(skeleton))).toEqual([]);
+    },
+  );
+
+  // The other half of "prompts, not content" (anton-8mnr): the skeleton is a form, not a filled one.
+  // The validator has to say so, or `bd cook anton-bead` alone would produce a bead that approves
+  // and runs against a TODO rubric.
+  it.each([["feature"], ["ticket"]] as const)(
+    "renders an UNAUTHORED %s the validator faults on Acceptance",
+    async (tier) => {
+      const violations = validateBeadContract(beadFrom(renderBeadSkeleton(await load(), tier)));
+      expect(violations.filter((v) => v.severity === "blocking").map((v) => v.section)).toEqual([
+        "Acceptance",
+      ]);
     },
   );
 
@@ -98,9 +120,14 @@ describe("the shipped bead formula", () => {
     expect(validateBeadContract(beadFrom(skeleton, ["area:reports"]))).toEqual([]);
   });
 
-  it("faults an epic with no area: — the one thing the formula cannot supply", async () => {
+  it("faults an unauthored epic on its area: label AND its unfilled Success Criteria", async () => {
+    // The area: label is the one thing the formula cannot supply; the criteria are the one thing
+    // only an author can write.
     const skeleton = renderBeadSkeleton(await load(), "epic");
-    expect(validateBeadContract(beadFrom(skeleton)).map((v) => v.section)).toEqual(["area:"]);
+    expect(validateBeadContract(beadFrom(skeleton)).map((v) => v.section).sort()).toEqual([
+      "Success Criteria",
+      "area:",
+    ]);
   });
 
   it("mirrors the tier's acceptance text for bd's own field", async () => {

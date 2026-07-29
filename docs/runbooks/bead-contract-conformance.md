@@ -29,9 +29,14 @@ reported but never fail the command: they degrade the spec, they do not make the
 The same function the gate will call — `validateBeadContract` in `src/lib/beads/contract.ts`. The
 report re-implements nothing, so the two can't drift.
 
-- **Denominator**: beads the contract applies to. `chore` and non-work types are exempt, and a bead
-  that never came from a bd read is never faulted, so both are excluded rather than counted as
-  passing. A conformance rate over the whole board would be a flattering lie.
+- **Denominator**: beads the contract applies to. `task` / `bug` / `chore` / `feature` are the
+  ticket tier (a `chore` under a feature is dispatched by the run like any other ticket, so it owes
+  the same Acceptance); `epic` is its own tier. Non-work types (`learning`, `molecule`, …) are
+  exempt, and a bead that never came from a bd read is never faulted, so both are excluded rather
+  than counted as passing. A conformance rate over the whole board would be a flattering lie.
+- **Unfilled prompts**: a section still holding the bead formula's `TODO —` default counts as
+  unwritten, not present. The formula ships prompts, not content — a run against a placeholder
+  rubric is the false green the gate exists to prevent.
 - **Statuses**: open, in_progress, blocked, **and deferred**. A snoozed bead is work that comes back
   and hits the gate the day it wakes; closed beads can no longer strand a run.
 

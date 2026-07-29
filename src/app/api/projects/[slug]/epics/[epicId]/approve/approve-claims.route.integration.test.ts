@@ -280,6 +280,42 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
     expect(payload.bypassBudget).toBe(true);
   });
 
+  it("takes over an approved, BLOCKED target whose contract is thin — an ownership move starts no run", async () => {
+    // The contract gate refuses work that is about to start. A pure take-over of a blocked target
+    // enqueues nothing — it only moves the reservation — so refusing it over a missing section
+    // would strand an approved target with its previous owner until someone edited a spec no run of
+    // ours is about to read. Exactly the case of a target approved before the gate existed.
+    const blocker = await beads.create(repo, { title: "Take-over blocker", type: "task", acceptance: "- [ ] it works" });
+    const unshaped = await beads.create(repo, { title: "Approved before the gate", type: "task" });
+    await beads.link(repo, unshaped, blocker, "blocks");
+    await beads.assign(repo, unshaped, "someone-else");
+    await beads.approve(repo, unshaped);
+
+    actAs("anton-test");
+    const res = await POST(jsonRequest("POST", { steal: true }), ctx("approvy", unshaped));
+    expect(res.status).toBe(200);
+    expect((await beads.show(repo, unshaped)).assignee).toBe("anton-test");
+    // Nothing enqueued, so the thin spec never reaches an agent — the gate lost no ground.
+    expect((await res.json()).jobId).toBeUndefined();
+    expect(await executeEpicJobs(unshaped)).toHaveLength(0);
+  });
+
+  it("422s a take-over that WOULD enqueue a run, on a target with no Acceptance", async () => {
+    // The boundary of the case above: with no open blocker the take-over enqueues a run here, so it
+    // is a run trigger and the contract applies. The reservation must stay put — approving would
+    // hand the new owner a job the runner only poison-parks.
+    const unshaped = await beads.create(repo, { title: "Ready but unshaped", type: "task" });
+    await beads.assign(repo, unshaped, "someone-else");
+    await beads.approve(repo, unshaped);
+
+    actAs("anton-test");
+    const res = await POST(jsonRequest("POST", { steal: true }), ctx("approvy", unshaped));
+    expect(res.status).toBe(422);
+    expect((await res.json()).sections).toEqual(["Acceptance"]);
+    expect((await beads.show(repo, unshaped)).assignee).toBe("someone-else");
+    expect(await executeEpicJobs(unshaped)).toHaveLength(0);
+  });
+
   it("does not enqueue a second local job when taking over a ready target this instance already runs", async () => {
     // The same-instance counterpart: this instance already has an active job for the epic (a normal
     // approval enqueued it here). A take-over must reuse that job — reassigning the reservation, not

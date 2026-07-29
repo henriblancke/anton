@@ -31,7 +31,10 @@ import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { BEAD_FORMULA_FILENAME, BEAD_FORMULA_RELPATH } from "./config.mjs";
+import {
+  BEAD_FORMULA_FILENAME,
+  bundledBeadFormulaPath as bundledFormulaUnder,
+} from "./config.mjs";
 
 export { BEAD_FORMULA_FILENAME };
 
@@ -98,11 +101,16 @@ export function projectBeadFormulaPath(repoPath: string): string {
 }
 
 /**
- * anton's bundled copy, resolved against the server's cwd (anton's package root) — the same
- * convention `skillPath` uses for the vendored skills.
+ * anton's bundled copy. The path segments come from `config.mjs` — one definition, so a rename of
+ * the asset moves both the installer and this renderer — but the ANCHOR is supplied here: the
+ * server's cwd (anton's package root; `bin/anton.mjs` launches it with `cwd: APP_ROOT`), the same
+ * convention `skillPath` uses for the vendored skills. config.mjs defaults its anchor to a
+ * module-relative `PACKAGE_ROOT` because the CLI runs from anywhere; that anchor does not survive
+ * the Next server bundle, where `import.meta.url` points at a build chunk rather than the source
+ * tree. Hence one implementation, two anchors — passed explicitly rather than duplicated.
  */
 export function bundledBeadFormulaPath(): string {
-  return join(process.cwd(), ...BEAD_FORMULA_RELPATH);
+  return bundledFormulaUnder(process.cwd());
 }
 
 /** The project's copy when it has one, else anton's bundled asset. Project-local always wins. */

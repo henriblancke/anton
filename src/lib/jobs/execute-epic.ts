@@ -513,6 +513,8 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // as above — a ticket whose work is already committed won't run its agent again, so its spec
       // can't strand this attempt; if it turns out it WILL re-run (the cross-machine
       // commit-missing case), the ticket loop re-applies this gate there.
+      // The standalone branch names no `target` because it already holds it: `tickets` is `[target]`
+      // for a run that doesn't group children (set above), so listing it again would gate it twice.
       const contractGated = standaloneRun
         ? tickets.filter((t) => !isResumeSkipped(t))
         : [target, ...tickets.filter((t) => !isResumeSkipped(t))];

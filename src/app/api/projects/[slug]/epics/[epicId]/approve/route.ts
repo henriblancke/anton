@@ -85,40 +85,23 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
     return NextResponse.json({ error: reason }, { status: 422 });
   }
 
-  // The bead contract, enforced where every run target passes (anton-j9zs). Approve is the run
-  // trigger AND already a validation site, so a target the runner would only poison-park is refused
-  // here instead — the operator gets the missing section named while they're still looking at the
-  // bead, not a parked job later. Only BLOCKING gaps refuse: a ticket with no Acceptance (or an epic
-  // with no Success Criteria) gives the agent no definition of done and self-review no rubric, so
-  // the work is unrunnable. Advisory gaps ride along in the 200 body below — they degrade a run
-  // without stopping it, and blocking approval on them would gate the board on prose. Judged off the
-  // same forced fresh read as the gate above, so a bead repaired a moment ago approves.
-  //
-  // Judged over the SAME set execute-epic gates on — the target plus every ticket the run will
-  // dispatch — not the target alone. A conformant epic with one unshaped child would otherwise be
-  // labeled `approved` and answered "running" here, then poison-parked by the runner before it does
-  // any work: exactly the false green this gate exists to prevent. The ticket set comes from the
-  // shared `runTickets`/`groupsChildren` pair the runner uses, so route and runner never disagree
-  // about what the target contains. Closed tickets are dropped — the runner resume-skips them, so
-  // their spec can't strand a run.
+  // The bead contract, judged over the SAME set execute-epic gates on — the target plus every
+  // ticket the run will dispatch — not the target alone. A conformant epic with one unshaped child
+  // would otherwise be labeled `approved` and answered "running" here, then poison-parked by the
+  // runner before it does any work: exactly the false green this gate exists to prevent. The ticket
+  // set comes from the shared `runTickets`/`groupsChildren` pair the runner uses, so route and
+  // runner never disagree about what the target contains. Closed tickets are dropped — the runner
+  // resume-skips them, so their spec can't strand a run. Judged off the same forced fresh read as
+  // the gate above, so a bead repaired a moment ago approves. The refusal itself is deferred until
+  // we know this request will start work — see the gate below.
   const children = runTickets(allBeads, epicId);
   const contractGated = beads.groupsChildren(target, children)
     ? [target, ...children.filter((t) => t.status !== "closed")]
     : [target];
-  const blocking = contractGaps(contractGated, "blocking");
-  if (blocking.length > 0) {
-    return NextResponse.json(
-      {
-        error: `${epicId} does not meet the bead contract: ${formatContractGaps(blocking)}`,
-        sections: blocking.flatMap((g) => g.violations.map((v) => v.section)),
-      },
-      { status: 422 },
-    );
-  }
-  // Reported, never enforced — see above. Computed over the same dispatch set the gate just judged,
-  // so a thin child is heard here too rather than only in the runner's log. One line PER BEAD,
-  // each naming its own id: across a whole ticket set, bare messages leave the operator no way to
-  // tell which bead is thin.
+  // Reported, never enforced. Computed over the same dispatch set the gate below judges, so a thin
+  // child is heard here too rather than only in the runner's log. One line PER BEAD, each naming
+  // its own id: across a whole ticket set, bare messages leave the operator no way to tell which
+  // bead is thin.
   const advisory = contractGaps(contractGated, "advisory").map((gap) => formatContractGaps([gap]));
 
   // Builds off the snapshot the refresh above just populated — a board rebuild, not a bd read. The
@@ -184,6 +167,33 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
       ? `Epic is blocked by ${openBlockers.join(", ")}`
       : `${epicId} is blocked by ${openBlockers.join(", ")}`;
     return NextResponse.json({ error: message }, { status: 409 });
+  }
+
+  // The bead contract, enforced where every run target passes (anton-j9zs). Approve is the run
+  // trigger AND already a validation site, so a target the runner would only poison-park is refused
+  // here instead — the operator gets the missing section named while they're still looking at the
+  // bead, not a parked job later. Only BLOCKING gaps refuse: a ticket with no Acceptance (or an epic
+  // with no Success Criteria) gives the agent no definition of done and self-review no rubric, so
+  // the work is unrunnable. Advisory gaps ride along in the 200 body — they degrade a run without
+  // stopping it, and blocking approval on them would gate the board on prose.
+  //
+  // Gated on the request actually STARTING work, which is why it sits after the take-over
+  // derivation rather than up with the runnability check. A pure take-over of a blocked target
+  // enqueues nothing (the enqueue gate at the end skips it) — it only moves the reservation — so
+  // refusing it on a contract gap would strand an approved target with its previous owner over a
+  // section no run of ours is about to read. The condition mirrors that enqueue gate exactly: a
+  // non-take-over always enqueues (a blocked one already 409'd above), a take-over only when
+  // nothing is open.
+  const willEnqueue = !takeOver || openBlockers.length === 0;
+  const blocking = willEnqueue ? contractGaps(contractGated, "blocking") : [];
+  if (blocking.length > 0) {
+    return NextResponse.json(
+      {
+        error: `${epicId} does not meet the bead contract: ${formatContractGaps(blocking)}`,
+        sections: blocking.flatMap((g) => g.violations.map((v) => v.section)),
+      },
+      { status: 422 },
+    );
   }
 
   // Enforce the claim as a soft-lock at the run trigger, from the fresh ownership read above.
@@ -328,7 +338,7 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   try {
     if (!takeOver) {
       jobId = await enqueueExecuteEpic(project.id, epicId, { bypassBudget: immediate });
-    } else if (openBlockers.length === 0) {
+    } else if (willEnqueue) {
       jobId = await enqueueExecuteEpicIfAbsent(project.id, epicId, { bypassBudget: immediateExplicit });
     }
   } catch (err) {
