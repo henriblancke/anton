@@ -13,7 +13,13 @@ vi.mock("../resolve-project", () => ({
 }));
 
 const createDraftEpic = vi.fn(async () => "tmp-1");
-vi.mock("@/lib/backlog", () => ({ createDraftEpic }));
+// Keep the real DraftContractError: the route tells a contract refusal (422) apart from a bd
+// failure (500) by instanceof, so the mock must not shadow the class with undefined.
+vi.mock("@/lib/backlog", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/backlog")>()),
+  createDraftEpic,
+}));
+const { DraftContractError } = await import("@/lib/backlog");
 
 const { POST } = await import("./route");
 
@@ -57,6 +63,19 @@ describe("POST /backlog", () => {
   it("rejects an area bd could not round-trip as a label", async () => {
     expect((await post({ ...DRAFT, area: "two words" })).status).toBe(400);
     expect(createDraftEpic).not.toHaveBeenCalled();
+  });
+
+  it("refuses (422) a draft whose rendered bead the contract validator faults", async () => {
+    // Non-empty is not conformant: prompt-only criteria pass the schema but would land a bead the
+    // board immediately flags as unapprovable — createDraftEpic throws before any bead exists.
+    createDraftEpic.mockRejectedValueOnce(
+      new DraftContractError([
+        { section: "Success Criteria", severity: "blocking", message: "no Success Criteria — …" },
+      ]),
+    );
+    const res = await post({ ...DRAFT, successCriteria: "- [ ] TODO — decide later" });
+    expect(res.status).toBe(422);
+    expect((await res.json()).error).toContain("Success Criteria");
   });
 
   it("surfaces a bd failure as a 500 rather than a silent success", async () => {

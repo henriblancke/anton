@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { buildEpicSkeleton, knownAreas } from "./backlog";
+import { buildEpicSkeleton, createDraftEpic, DraftContractError, knownAreas } from "./backlog";
 import { validateBeadContract } from "./beads/contract";
 import { projectBeadFormulaPath } from "./beads/formula";
 import type { Bead } from "./beads/types";
@@ -93,6 +93,34 @@ describe("buildEpicSkeleton", () => {
 
     const { description } = await buildEpicSkeleton(project, DRAFT);
     expect(description).toContain("## House rule");
+  });
+});
+
+describe("createDraftEpic — the contract gate ahead of bead creation", () => {
+  // Both rejections throw BEFORE beads.create, so no bd repo is needed: the whole point is that a
+  // placeholder draft never becomes a bead the board would immediately flag as unapprovable.
+  it("rejects criteria that are still a TODO prompt — the bead would land contract-blocked", async () => {
+    await expect(
+      createDraftEpic(tempProject(), { ...DRAFT, successCriteria: "- [ ] TODO — decide later" }),
+    ).rejects.toThrow(DraftContractError);
+  });
+
+  it("rejects a prompt-only goal too — Add-work lands zero-violation beads by construction", async () => {
+    await expect(
+      createDraftEpic(tempProject(), { ...DRAFT, goal: "TODO — the outcome, one line" }),
+    ).rejects.toThrow(DraftContractError);
+  });
+
+  it("names the gap in the error so the route's 422 tells the founder what to fix", async () => {
+    const rejection = await createDraftEpic(tempProject(), {
+      ...DRAFT,
+      successCriteria: "- [ ] TODO — decide later",
+    }).then(
+      () => undefined,
+      (e: unknown) => e as DraftContractError,
+    );
+    expect(rejection?.violations.map((v) => v.section)).toEqual(["Success Criteria"]);
+    expect(rejection?.message).toContain("Success Criteria");
   });
 });
 

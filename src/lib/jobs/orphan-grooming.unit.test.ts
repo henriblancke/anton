@@ -1,8 +1,9 @@
 /**
  * Unit tests for findOrphans (anton-3t2.4) — the pure "which tickets are loose" logic, exercised
- * without bd. Orphans = open, non-epic, NON-runnable beads with no parent (inline or via a
+ * without bd. Orphans = open, ticket-tier, NON-runnable beads with no parent (inline or via a
  * parent-child edge). Parentless task/bug beads are runnable standalone targets, so grooming leaves
- * them alone (anton-cmz); the loose tickets we bucket are non-runnable types like `chore`.
+ * them alone (anton-cmz); the loose tickets we bucket are non-runnable ticket types like `chore`.
+ * Exempt types (`learning`, `molecule`, custom) ride on no run, so grooming leaves them loose too.
  */
 import { describe, expect, it } from "vitest";
 import type { Bead } from "../beads/bd";
@@ -28,6 +29,19 @@ describe("findOrphans", () => {
       bead("t-1", { issue_type: "task" }), // runnable standalone — not groomed
       bead("b-1", { issue_type: "bug" }), // runnable standalone — not groomed
       bead("c-1"), // the real orphan
+    ];
+    expect(findOrphans(all).map((b) => b.id)).toEqual(["c-1"]);
+  });
+
+  it("leaves exempt-type beads loose — a run never dispatches them, so bucketing would strand them", () => {
+    // A `learning`/`molecule`/custom-type child is not a run ticket (isTicketTier → false): parented
+    // under the grooming epic it would sit undispatched while the epic's run completes around it.
+    const all: Bead[] = [
+      bead("l-1", { issue_type: "learning" }),
+      bead("m-1", { issue_type: "molecule" }),
+      bead("x-1", { issue_type: "custom" }),
+      bead("u-1", { issue_type: undefined }), // typeless read — unclassifiable, never bucketed
+      bead("c-1"), // chore — ticket tier, still groomed
     ];
     expect(findOrphans(all).map((b) => b.id)).toEqual(["c-1"]);
   });

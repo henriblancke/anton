@@ -1,4 +1,5 @@
 import { beads, labelValueOf, type Bead } from "./beads/bd";
+import { validateBeadContract, type ContractViolation } from "./beads/contract";
 import { beadSkeleton, type BeadSkeleton } from "./beads/formula";
 import { allIssues } from "./beads/issues";
 import type { Project } from "./types";
@@ -54,12 +55,37 @@ export function buildEpicSkeleton(project: Project, draft: ShapeDraft): Promise<
   });
 }
 
+/** A draft whose rendered bead the contract validator faults — the route maps this to a 422. */
+export class DraftContractError extends Error {
+  constructor(readonly violations: ContractViolation[]) {
+    super(`draft does not meet the bead contract: ${violations.map((v) => v.message).join(", ")}`);
+    this.name = "DraftContractError";
+  }
+}
+
 /**
  * Create the open, unapproved epic bead from an accepted draft and return its id. No `approved`
  * label + open status → the board derives `backlog`. Bead writes go through `bd` (DESIGN.md §3).
+ *
+ * The rendered skeleton is judged with the contract validator BEFORE the bead exists. A non-empty
+ * field can still be a placeholder ("- [ ] TODO — decide later"), which the validator classifies
+ * as unwritten — creating that bead would land it instantly contract-blocked and unapprovable,
+ * the opposite of this path's by-construction guarantee. Refusing here keeps the founder in the
+ * form, where the fix is one edit away.
  */
 export async function createDraftEpic(project: Project, draft: ShapeDraft): Promise<string> {
   const skeleton = await buildEpicSkeleton(project, draft);
+  const rendered: Bead = {
+    id: "draft",
+    title: draft.title.trim(),
+    status: "open",
+    issue_type: skeleton.type,
+    description: skeleton.description,
+    acceptance_criteria: skeleton.acceptance,
+    labels: [`area:${draft.area.trim()}`],
+  };
+  const violations = validateBeadContract(rendered);
+  if (violations.length > 0) throw new DraftContractError(violations);
   return beads.create(project.repoPath, {
     title: draft.title.trim(),
     type: skeleton.type,
