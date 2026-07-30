@@ -9,7 +9,7 @@
  * Test-only. Skipped suites (no bd/git) never call this.
  */
 import { randomUUID } from "node:crypto";
-import { makeBdRepo, makeFileDb, paramsCtx } from "@/lib/testing/integration";
+import { jsonRequest, makeBdRepo, makeFileDb, paramsCtx } from "@/lib/testing/integration";
 
 /** `resolveOperator`'s memoized identity is reset by `actAs` — captured once `setupApproveSuite` resolves it. */
 let resetOperatorCacheRef: typeof import("@/lib/operator").resetOperatorCache;
@@ -18,6 +18,23 @@ let resetOperatorCacheRef: typeof import("@/lib/operator").resetOperatorCache;
 export function ctx(slug: string, epicId: string): { params: Promise<{ slug: string; epicId: string }> } {
   return paramsCtx({ slug, epicId });
 }
+
+/** The approve route's optional body: take over a teammate's claim, and/or ask to run now. */
+export interface ApproveBody {
+  steal?: boolean;
+  immediate?: boolean;
+}
+
+/**
+ * Call the real approve handler for `epicId` — the request, the dynamic-params ctx, and the POST
+ * are built in one place so a drifting literal (a wrong slug, a mis-encoded body) can't quietly
+ * weaken a case that guards the approve gate. `slug` defaults to the seeded `approvy` project.
+ */
+export type ApprovePost = (
+  epicId: string,
+  body?: ApproveBody,
+  slug?: string,
+) => ReturnType<ApproveSuiteCtx["POST"]>;
 
 /** Set the resolved operator identity for the next route call (the identity is memoized). */
 export function actAs(name: string): void {
@@ -54,6 +71,8 @@ export interface ApproveSuiteCtx {
   bdRepo: ReturnType<typeof makeBdRepo>;
   repo: string;
   POST: typeof import("./approve/route").POST;
+  /** `POST` with its request + params ctx built for you — the way suites should call the route. */
+  approve: ApprovePost;
   beads: typeof import("@/lib/beads/bd").beads;
   resetOperatorCache: typeof import("@/lib/operator").resetOperatorCache;
   getDb: typeof import("@/lib/db").getDb;
@@ -118,11 +137,15 @@ export async function setupApproveSuite(): Promise<ApproveSuiteCtx> {
     repoPath: repo,
   });
 
+  const approve: ApprovePost = (epicId, body, slug = "approvy") =>
+    POST(jsonRequest("POST", body), ctx(slug, epicId));
+
   return {
     fileDb,
     bdRepo,
     repo,
     POST,
+    approve,
     beads,
     resetOperatorCache,
     getDb,

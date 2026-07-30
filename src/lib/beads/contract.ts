@@ -97,27 +97,56 @@ const FENCE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 /** Heading text → comparison key, case- and punctuation-insensitive: `## Out-of-Scope:` → `outofscope`. */
 const slug = (heading: string) => heading.toLowerCase().replace(/[^a-z0-9]+/g, "");
 
+/** The HTML-comment state after `text`, given the state it began in — `<!--`/`-->` toggled in order. */
+function commentStateAfter(text: string, inComment: boolean): boolean {
+  let rest = text;
+  let state = inComment;
+  for (;;) {
+    const at = rest.indexOf(state ? "-->" : "<!--");
+    if (at === -1) return state;
+    rest = rest.slice(at + (state ? 3 : 4));
+    state = !state;
+  }
+}
+
 /**
- * The description's lines, each flagged with whether it sits inside a fenced code block.
+ * The description's lines, each flagged with whether it sits inside a fenced code block or begins
+ * inside a multiline HTML comment.
  *
- * Fences matter because the contract is judged on HEADINGS: a bead whose description quotes the
+ * Both matter because the contract is judged on HEADINGS: a bead whose description quotes the
  * formula (or any markdown sample) in a ``` block carries the literal line `## Acceptance` with
  * example boxes under it, and a scanner blind to fences reads that sample as the real section —
- * passing the blocking gate on a ticket that states no definition of done at all.
+ * passing the blocking gate on a ticket that states no definition of done at all. A `## Acceptance`
+ * hidden inside a `<!-- … -->` comment is the same hole from the other side: the render shows no
+ * heading and no criteria, so a scanner that recognized it would open a section over text the
+ * cleanup pass ({@link renderedLines}) never sees the opening delimiter of — classifying invisible
+ * text as the written spec. Comment state is tracked only OUTSIDE fences, matching the cleanup's
+ * own rule that comments inside fenced code are literal content.
  *
  * CommonMark rules, kept to what a description can hit: a closing fence matches the opening
  * character, is at least as long, and carries nothing but whitespace after it; a backtick fence's
- * info string may not contain a backtick; an unclosed fence runs to the end of the text (so the
- * contract fails closed — the same way the description renders).
+ * info string may not contain a backtick; an unclosed fence (or comment) runs to the end of the
+ * text (so the contract fails closed — the same way the description renders).
  *
  * The delimiter lines themselves are flagged: they are punctuation, not content, so a judge of
  * "does this section say anything" ({@link stateOf}) must skip them — an empty ``` block otherwise
  * reads as two lines of authored text.
  */
-function scanLines(description: string): { text: string; fenced: boolean; delimiter?: boolean }[] {
-  const out: { text: string; fenced: boolean; delimiter?: boolean }[] = [];
+function scanLines(
+  description: string,
+): { text: string; fenced: boolean; delimiter?: boolean; commented?: boolean }[] {
+  const out: { text: string; fenced: boolean; delimiter?: boolean; commented?: boolean }[] = [];
   let open: { char: string; len: number } | undefined;
+  let inComment = false;
   for (const text of description.split(/\r?\n/)) {
+    // A line that BEGINS inside a comment can neither open a section nor a fence — the render hides
+    // it. Text after a `-->` on the same line is kept out of the heading judgement on purpose: a
+    // heading must start the line, and the closing delimiter already occupies that position.
+    if (inComment) {
+      inComment = commentStateAfter(text, true);
+      out.push({ text, fenced: false, commented: true });
+      continue;
+    }
     const fence = FENCE.exec(text);
     if (fence) {
       const [char, len] = [fence[1][0], fence[1].length];
@@ -133,6 +162,7 @@ function scanLines(description: string): { text: string; fenced: boolean; delimi
         continue;
       }
     }
+    if (!open) inComment = commentStateAfter(text, false);
     out.push({ text, fenced: !!open });
   }
   return out;
@@ -165,8 +195,8 @@ function sectionsOf(description: string, keys: ReadonlySet<string>): Map<string,
     const text = [out.get(key), body.join("\n").trim()].filter(Boolean).join("\n");
     out.set(key, text);
   };
-  for (const { text, fenced } of scanLines(description)) {
-    const heading = fenced ? null : HEADING.exec(text);
+  for (const { text, fenced, commented } of scanLines(description)) {
+    const heading = fenced || commented ? null : HEADING.exec(text);
     if (heading) {
       const depth = heading[1].length;
       const slugged = slug(heading[2]);
@@ -188,8 +218,8 @@ function sectionsOf(description: string, keys: ReadonlySet<string>): Map<string,
  * line rather than under `## Goal` still states one, and must not be faulted for it. */
 function preambleOf(description: string): string {
   const lines: string[] = [];
-  for (const { text, fenced } of scanLines(description)) {
-    if (!fenced && HEADING.test(text)) break;
+  for (const { text, fenced, commented } of scanLines(description)) {
+    if (!fenced && !commented && HEADING.test(text)) break;
     lines.push(text);
   }
   return lines.join("\n").trim();
@@ -625,9 +655,12 @@ export function validateBeadContract(bead: Bead): ContractViolation[] {
   return violations;
 }
 
-/** Exactly one `area:` label — the roadmap's Area column and Linear project routing key on it. */
+/** Exactly one `area:` label, with a nonempty value — the roadmap's Area column and Linear project
+ * routing key on it. A bare `area:` names no product surface, so it satisfies nothing. */
 function areaViolations(bead: Bead): ContractViolation[] {
-  const areas = (bead.labels ?? []).filter((l) => l.startsWith("area:"));
+  const areas = (bead.labels ?? []).filter(
+    (l) => l.startsWith("area:") && l.slice("area:".length).trim() !== "",
+  );
   if (areas.length === 1) return [];
   return [
     {

@@ -7,28 +7,20 @@
  * `approve-*.route.integration.test.ts` file (anton-0oi).
  */
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
-import { jsonRequest } from "@/lib/testing/integration";
-import {
-  actAs,
-  ctx,
-  executeEpicJobs,
-  parkJob,
-  setupApproveSuite,
-  type ApproveSuiteCtx,
-} from "../approve.fixture";
+import { actAs, executeEpicJobs, parkJob, setupApproveSuite, type ApproveSuiteCtx } from "../approve.fixture";
 import { describeBd } from "@/lib/testing/integration";
 
 let fileDb: ApproveSuiteCtx["fileDb"];
 let bdRepo: ApproveSuiteCtx["bdRepo"];
 let repo: string;
-let POST: ApproveSuiteCtx["POST"];
+let approve: ApproveSuiteCtx["approve"];
 let beads: ApproveSuiteCtx["beads"];
 let resetOperatorCache: ApproveSuiteCtx["resetOperatorCache"];
 
 describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp anton.db + real bd)", () => {
   beforeAll(async () => {
     const s = await setupApproveSuite();
-    ({ fileDb, bdRepo, repo, POST, beads, resetOperatorCache } = s);
+    ({ fileDb, bdRepo, repo, approve, beads, resetOperatorCache } = s);
   });
 
   afterAll(() => {
@@ -47,16 +39,13 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
     await beads.link(repo, child, epic, "parent-child");
 
     actAs("bob");
-    expect((await POST(jsonRequest("POST"), ctx("approvy", epic))).status).toBe(200);
+    expect((await approve(epic)).status).toBe(200);
     const first = await executeEpicJobs(epic);
     expect(first).toHaveLength(1);
     await parkJob(first[0].id);
 
     actAs("alice");
-    const res = await POST(
-      jsonRequest("POST", { steal: true }),
-      ctx("approvy", epic),
-    );
+    const res = await approve(epic, { steal: true });
     expect(res.status).toBe(200);
     // The reservation moves…
     expect((await beads.show(repo, epic)).assignee).toBe("alice");
@@ -78,7 +67,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
     await beads.approve(repo, epic); // labelled, with no job on THIS machine
     expect(await executeEpicJobs(epic)).toHaveLength(0);
 
-    const res = await POST(jsonRequest("POST"), ctx("approvy", epic));
+    const res = await approve(epic);
     expect(res.status).toBe(200);
     expect((await res.json()).jobId).toBeTruthy();
     expect(await executeEpicJobs(epic)).toHaveLength(1);
@@ -92,8 +81,8 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
     const child = await beads.create(repo, { title: "Double force child", type: "task", acceptance: "- [ ] it works" });
     await beads.link(repo, child, epic, "parent-child");
 
-    const first = await POST(jsonRequest("POST"), ctx("approvy", epic));
-    const second = await POST(jsonRequest("POST"), ctx("approvy", epic));
+    const first = await approve(epic);
+    const second = await approve(epic);
     expect(second.status).toBe(200);
     expect((await second.json()).jobId).toBe((await first.json()).jobId);
     expect(await executeEpicJobs(epic)).toHaveLength(1);
@@ -107,7 +96,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
     await beads.link(repo, child, epic, "parent-child");
     await beads.assign(repo, epic, "someone-else");
 
-    const res = await POST(jsonRequest("POST"), ctx("approvy", epic));
+    const res = await approve(epic);
     expect(res.status).toBe(409);
     const body = await res.json();
     expect(body.error).toContain("someone-else");
@@ -122,10 +111,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
     await beads.link(repo, child, epic, "parent-child");
     await beads.assign(repo, epic, "someone-else");
 
-    const res = await POST(
-      jsonRequest("POST", { steal: true }),
-      ctx("approvy", epic),
-    );
+    const res = await approve(epic, { steal: true });
     expect(res.status).toBe(200);
     const bead = await beads.show(repo, epic);
     expect(beads.isApproved(bead)).toBe(true);
@@ -144,10 +130,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
     await beads.approve(repo, epic);
     await beads.tag(repo, epic, ["stage:implementing"]);
 
-    const res = await POST(
-      jsonRequest("POST", { steal: true }),
-      ctx("approvy", epic),
-    );
+    const res = await approve(epic, { steal: true });
     expect(res.status).toBe(409);
     const body = await res.json();
     expect(body.error).toContain("someone-else");
@@ -182,10 +165,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
 
     actAs("anton-test");
     try {
-      const res = await POST(
-        jsonRequest("POST", { steal: true }),
-        ctx("approvy", epic),
-      );
+      const res = await approve(epic, { steal: true });
       expect(res.status).toBe(409);
       const body = await res.json();
       expect(body.stage).toBe("implementing");
@@ -213,10 +193,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
     await beads.link(repo, child, blocker, "blocks");
 
     actAs("anton-test");
-    const res = await POST(
-      jsonRequest("POST", { steal: true }),
-      ctx("approvy", epic),
-    );
+    const res = await approve(epic, { steal: true });
     expect(res.status).toBe(200);
     // The reservation transfers to the new owner…
     expect((await beads.show(repo, epic)).assignee).toBe("anton-test");
@@ -240,10 +217,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
     expect(await executeEpicJobs(epic)).toHaveLength(0);
 
     actAs("anton-test");
-    const res = await POST(
-      jsonRequest("POST", { steal: true }),
-      ctx("approvy", epic),
-    );
+    const res = await approve(epic, { steal: true });
     expect(res.status).toBe(200);
     // The reservation transfers to the new owner…
     expect((await beads.show(repo, epic)).assignee).toBe("anton-test");
@@ -269,10 +243,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
     await beads.approve(repo, epic);
 
     actAs("anton-test");
-    const res = await POST(
-      jsonRequest("POST", { steal: true, immediate: true }),
-      ctx("approvy", epic),
-    );
+    const res = await approve(epic, { steal: true, immediate: true });
     expect(res.status).toBe(200);
     const jobs = await executeEpicJobs(epic);
     expect(jobs).toHaveLength(1);
@@ -292,7 +263,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
     await beads.approve(repo, unshaped);
 
     actAs("anton-test");
-    const res = await POST(jsonRequest("POST", { steal: true }), ctx("approvy", unshaped));
+    const res = await approve(unshaped, { steal: true });
     expect(res.status).toBe(200);
     expect((await beads.show(repo, unshaped)).assignee).toBe("anton-test");
     // Nothing enqueued, so the thin spec never reaches an agent — the gate lost no ground.
@@ -312,7 +283,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
     await beads.approve(repo, unshaped);
 
     actAs("anton-test");
-    const res = await POST(jsonRequest("POST", { steal: true }), ctx("approvy", unshaped));
+    const res = await approve(unshaped, { steal: true });
     expect(res.status).toBe(422);
     expect((await res.json()).sections).toEqual(["Acceptance"]);
     expect((await beads.show(repo, unshaped)).assignee).toBe("someone-else");
@@ -329,15 +300,12 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
     await beads.link(repo, child, epic, "parent-child");
 
     actAs("bob");
-    expect((await POST(jsonRequest("POST"), ctx("approvy", epic))).status).toBe(200);
+    expect((await approve(epic)).status).toBe(200);
     const first = await executeEpicJobs(epic);
     expect(first).toHaveLength(1);
 
     actAs("alice");
-    const res = await POST(
-      jsonRequest("POST", { steal: true }),
-      ctx("approvy", epic),
-    );
+    const res = await approve(epic, { steal: true });
     expect(res.status).toBe(200);
     expect((await beads.show(repo, epic)).assignee).toBe("alice");
     // The existing job is reused — no new id, still exactly one job for the epic.
@@ -354,7 +322,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
     const child = await beads.create(repo, { title: "Unclaimed epic child", type: "task", acceptance: "- [ ] it works" });
     await beads.link(repo, child, epic, "parent-child");
 
-    const res = await POST(jsonRequest("POST"), ctx("approvy", epic));
+    const res = await approve(epic);
     expect(res.status).toBe(200);
     const bead = await beads.show(repo, epic);
     expect(beads.isApproved(bead)).toBe(true);
@@ -368,7 +336,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
     await beads.link(repo, child, epic, "parent-child");
     await beads.assign(repo, epic, "anton-test");
 
-    const res = await POST(jsonRequest("POST"), ctx("approvy", epic));
+    const res = await approve(epic);
     expect(res.status).toBe(200);
     const bead = await beads.show(repo, epic);
     expect(beads.isApproved(bead)).toBe(true);
@@ -395,7 +363,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
 
     // Responds while the push is still in flight — proof it isn't awaited (an awaited sync would
     // hang the response until this test times out).
-    const res = await POST(jsonRequest("POST"), ctx("approvy", epic));
+    const res = await approve(epic);
     expect(res.status).toBe(200);
     expect(syncSpy).toHaveBeenCalledTimes(1);
 

@@ -5,18 +5,21 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { isRecoverableClaudeError, isUsageLimitError, type RecoverableClaudeError } from "../jobs/errors";
-import { CLAUDE_BIN_ENV, runClaude, type ClaudeEvent } from "./driver";
+import { CLAUDE_BIN_ENV, runClaude, type ClaudeEvent, type RunClaudeOptions } from "./driver";
 
 let dir: string;
 let prevBin: string | undefined;
 
-function writeFakeClaude(name: string, ndjsonLines: string[], exitCode = 0, stderr = ""): string {
+/** One stream-json event a fake claude writes to stdout; serialized by the fake factories. */
+type FakeClaudeEvent = Record<string, unknown>;
+
+function writeFakeClaude(name: string, events: FakeClaudeEvent[], exitCode = 0, stderr = ""): string {
   const path = join(dir, name);
   const body = [
     "#!/usr/bin/env node",
-    `const lines = ${JSON.stringify(ndjsonLines)};`,
+    `const lines = ${JSON.stringify(events.map((e) => JSON.stringify(e)))};`,
     "for (const l of lines) { process.stdout.write(l + \"\\n\"); }",
     `const stderr = ${JSON.stringify(stderr)};`,
     "if (stderr) { process.stderr.write(stderr); }",
@@ -28,12 +31,12 @@ function writeFakeClaude(name: string, ndjsonLines: string[], exitCode = 0, stde
   return path;
 }
 
-/** A fake that emits `ndjsonLines`, then hangs forever without exiting — the wedged-session case. */
-function writeFakeHangingClaude(name: string, ndjsonLines: string[]): string {
+/** A fake that emits `events`, then hangs forever without exiting — the wedged-session case. */
+function writeFakeHangingClaude(name: string, events: FakeClaudeEvent[]): string {
   const path = join(dir, name);
   const body = [
     "#!/usr/bin/env node",
-    `const lines = ${JSON.stringify(ndjsonLines)};`,
+    `const lines = ${JSON.stringify(events.map((e) => JSON.stringify(e)))};`,
     "for (const l of lines) { process.stdout.write(l + \"\\n\"); }",
     "setInterval(() => {}, 1 << 30);", // never exits, never writes again
     "",
@@ -74,12 +77,12 @@ async function waitForProcessExit(pid: number, timeoutMs = 2_000): Promise<boole
   return false;
 }
 
-/** A fake that emits each line `gapMs` apart — slow but demonstrably alive. */
-function writeFakeDripClaude(name: string, gapMs: number, ndjsonLines: string[]): string {
+/** A fake that emits each event `gapMs` apart — slow but demonstrably alive. */
+function writeFakeDripClaude(name: string, gapMs: number, events: FakeClaudeEvent[]): string {
   const path = join(dir, name);
   const body = [
     "#!/usr/bin/env node",
-    `const lines = ${JSON.stringify(ndjsonLines)};`,
+    `const lines = ${JSON.stringify(events.map((e) => JSON.stringify(e)))};`,
     `const gap = ${gapMs};`,
     "let i = 0;",
     "const t = setInterval(() => {",
@@ -91,6 +94,22 @@ function writeFakeDripClaude(name: string, gapMs: number, ndjsonLines: string[])
   writeFileSync(path, body, "utf8");
   chmodSync(path, 0o755);
   return path;
+}
+
+/**
+ * Arrange + act for every failure-path test: point the driver at `bin`, run it, and hand back the
+ * error so each test asserts only on the classification it cares about. A call that RESOLVES is
+ * itself a failure — surfacing that loudly beats leaving `caught` undefined and every downstream
+ * matcher silently passing on it.
+ */
+async function runClaudeExpectingError(bin: string, opts: Partial<RunClaudeOptions> = {}): Promise<unknown> {
+  process.env[CLAUDE_BIN_ENV] = bin;
+  try {
+    await runClaude({ cwd: dir, prompt: "do the thing", ...opts });
+  } catch (err) {
+    return err;
+  }
+  throw new Error(`expected runClaude to reject for ${basename(bin)}, but it resolved`);
 }
 
 beforeAll(() => {
@@ -107,12 +126,12 @@ afterAll(() => {
 describe("runClaude", () => {
   it("resolves the final result and streams normalized events on the happy path", async () => {
     const bin = writeFakeClaude("happy-claude", [
-      JSON.stringify({ type: "system", subtype: "init", session_id: "sess-1" }),
-      JSON.stringify({
+      { type: "system", subtype: "init", session_id: "sess-1" },
+      {
         type: "assistant",
         message: { content: [{ type: "text", text: "hello" }] },
-      }),
-      JSON.stringify({
+      },
+      {
         type: "result",
         subtype: "success",
         is_error: false,
@@ -120,7 +139,7 @@ describe("runClaude", () => {
         num_turns: 2,
         total_cost_usd: 0.01,
         result: "done",
-      }),
+      },
     ]);
     process.env[CLAUDE_BIN_ENV] = bin;
 
@@ -161,23 +180,17 @@ describe("runClaude", () => {
     const bin = writeFakeClaude(
       "limited-claude",
       [
-        JSON.stringify({
+        {
           type: "result",
           subtype: "error",
           is_error: true,
           result: "Claude AI usage limit reached|1700000000",
-        }),
+        },
       ],
       1,
     );
-    process.env[CLAUDE_BIN_ENV] = bin;
 
-    let caught: unknown;
-    try {
-      await runClaude({ cwd: dir, prompt: "do the thing" });
-    } catch (err) {
-      caught = err;
-    }
+    const caught = await runClaudeExpectingError(bin);
 
     expect(caught).toBeDefined();
     expect(isUsageLimitError(caught)).toBe(true);
@@ -194,8 +207,8 @@ describe("runClaude", () => {
     const bin = writeFakeClaude(
       "real-limited-claude",
       [
-        JSON.stringify({ type: "system", subtype: "init", session_id: "abc123", model: "claude-opus-4-8" }),
-        JSON.stringify({
+        { type: "system", subtype: "init", session_id: "abc123", model: "claude-opus-4-8" },
+        {
           type: "result",
           subtype: "error_during_execution",
           is_error: true,
@@ -205,18 +218,12 @@ describe("runClaude", () => {
           session_id: "abc123",
           total_cost_usd: 0,
           result: `Claude AI usage limit reached|${resetSec}`,
-        }),
+        },
       ],
       1,
     );
-    process.env[CLAUDE_BIN_ENV] = bin;
 
-    let caught: unknown;
-    try {
-      await runClaude({ cwd: dir, prompt: "do the thing" });
-    } catch (err) {
-      caught = err;
-    }
+    const caught = await runClaudeExpectingError(bin);
 
     expect(isUsageLimitError(caught)).toBe(true);
     expect((caught as { resetAt?: number }).resetAt).toBe(resetSec);
@@ -232,22 +239,16 @@ describe("runClaude", () => {
     const bin = writeFakeClaude(
       "assistant-limited-claude",
       [
-        JSON.stringify({
+        {
           type: "assistant",
           message: { content: [{ type: "text", text: `Claude AI usage limit reached|${resetSec}` }] },
-        }),
-        JSON.stringify({ type: "result", subtype: "error", is_error: true, result: "error" }),
+        },
+        { type: "result", subtype: "error", is_error: true, result: "error" },
       ],
       1,
     );
-    process.env[CLAUDE_BIN_ENV] = bin;
 
-    let caught: unknown;
-    try {
-      await runClaude({ cwd: dir, prompt: "do the thing" });
-    } catch (err) {
-      caught = err;
-    }
+    const caught = await runClaudeExpectingError(bin);
 
     expect(isUsageLimitError(caught)).toBe(true);
     expect((caught as { resetAt?: number }).resetAt).toBe(resetSec);
@@ -265,30 +266,24 @@ describe("runClaude", () => {
     const bin = writeFakeClaude(
       "spend-limited-claude",
       [
-        JSON.stringify({ type: "system", subtype: "init", session_id: "sess-spend" }),
-        JSON.stringify({
+        { type: "system", subtype: "init", session_id: "sess-spend" },
+        {
           type: "assistant",
           message: { content: [{ type: "text", text: spendLimitText }] },
-        }),
-        JSON.stringify({
+        },
+        {
           type: "result",
           subtype: "error_during_execution",
           is_error: true,
           session_id: "sess-spend",
           total_cost_usd: 0,
           result: spendLimitText,
-        }),
+        },
       ],
       1,
     );
-    process.env[CLAUDE_BIN_ENV] = bin;
 
-    let caught: unknown;
-    try {
-      await runClaude({ cwd: dir, prompt: "do the thing" });
-    } catch (err) {
-      caught = err;
-    }
+    const caught = await runClaudeExpectingError(bin);
 
     expect(isUsageLimitError(caught)).toBe(true);
     // No parseable reset time → runner uses the fallback cool-off (quotaCooloffMs) and refunds.
@@ -307,30 +302,24 @@ describe("runClaude", () => {
     const bin = writeFakeClaude(
       "spend-limited-nolink-claude",
       [
-        JSON.stringify({ type: "system", subtype: "init", session_id: "sess-nolink" }),
-        JSON.stringify({
+        { type: "system", subtype: "init", session_id: "sess-nolink" },
+        {
           type: "assistant",
           message: { content: [{ type: "text", text: spendLimitText }] },
-        }),
-        JSON.stringify({
+        },
+        {
           type: "result",
           subtype: "error_during_execution",
           is_error: true,
           session_id: "sess-nolink",
           total_cost_usd: 0,
           result: spendLimitText,
-        }),
+        },
       ],
       1,
     );
-    process.env[CLAUDE_BIN_ENV] = bin;
 
-    let caught: unknown;
-    try {
-      await runClaude({ cwd: dir, prompt: "do the thing" });
-    } catch (err) {
-      caught = err;
-    }
+    const caught = await runClaudeExpectingError(bin);
 
     expect(isUsageLimitError(caught)).toBe(true);
     expect((caught as { resetAt?: number }).resetAt).toBeUndefined();
@@ -342,22 +331,22 @@ describe("runClaude", () => {
     // exits 0 with is_error false is a success even if its output says "monthly spend limit" (e.g. an
     // agent working this very ticket). It must resolve, not throw UsageLimitError.
     const bin = writeFakeClaude("mentions-spend-limit-claude", [
-      JSON.stringify({
+      {
         type: "assistant",
         message: {
           content: [
             { type: "text", text: 'Made "monthly spend limit" reschedule instead of parking the job.' },
           ],
         },
-      }),
-      JSON.stringify({
+      },
+      {
         type: "result",
         subtype: "success",
         is_error: false,
         session_id: "sess-ok2",
         total_cost_usd: 0.01,
         result: "Implemented the monthly spend-limit detection and pushed.",
-      }),
+      },
     ]);
     process.env[CLAUDE_BIN_ENV] = bin;
 
@@ -378,33 +367,27 @@ describe("runClaude", () => {
     const bin = writeFakeClaude(
       "mentions-monthly-spend-limit-claude",
       [
-        JSON.stringify({
+        {
           type: "assistant",
           message: {
             content: [
               { type: "text", text: "Narrowed the monthly spend limit matcher, but the push failed." },
             ],
           },
-        }),
-        JSON.stringify({
+        },
+        {
           type: "result",
           subtype: "error_during_execution",
           is_error: true,
           session_id: "sess-bare",
           total_cost_usd: 0.01,
           result: "Narrowed the monthly spend limit matcher, but the push failed.",
-        }),
+        },
       ],
       1,
     );
-    process.env[CLAUDE_BIN_ENV] = bin;
 
-    let caught: unknown;
-    try {
-      await runClaude({ cwd: dir, prompt: "work the anton-b9l ticket" });
-    } catch (err) {
-      caught = err;
-    }
+    const caught = await runClaudeExpectingError(bin, { prompt: "work the anton-b9l ticket" });
 
     expect(isUsageLimitError(caught)).toBe(false);
     expect(caught).toBeInstanceOf(Error);
@@ -423,29 +406,23 @@ describe("runClaude", () => {
     const bin = writeFakeClaude(
       "quotes-spend-limit-payload-claude",
       [
-        JSON.stringify({
+        {
           type: "assistant",
           message: { content: [{ type: "text", text: quoted }] },
-        }),
-        JSON.stringify({
+        },
+        {
           type: "result",
           subtype: "error_during_execution",
           is_error: true,
           session_id: "sess-quote",
           total_cost_usd: 0.01,
           result: quoted,
-        }),
+        },
       ],
       1,
     );
-    process.env[CLAUDE_BIN_ENV] = bin;
 
-    let caught: unknown;
-    try {
-      await runClaude({ cwd: dir, prompt: "work the anton-b9l ticket" });
-    } catch (err) {
-      caught = err;
-    }
+    const caught = await runClaudeExpectingError(bin, { prompt: "work the anton-b9l ticket" });
 
     expect(isUsageLimitError(caught)).toBe(false);
     expect(caught).toBeInstanceOf(Error);
@@ -465,29 +442,23 @@ describe("runClaude", () => {
     const bin = writeFakeClaude(
       "spend-limit-heading-no-link-claude",
       [
-        JSON.stringify({
+        {
           type: "assistant",
           message: { content: [{ type: "text", text: heading }] },
-        }),
-        JSON.stringify({
+        },
+        {
           type: "result",
           subtype: "error_during_execution",
           is_error: true,
           session_id: "sess-heading",
           total_cost_usd: 0.01,
           result: heading,
-        }),
+        },
       ],
       1,
     );
-    process.env[CLAUDE_BIN_ENV] = bin;
 
-    let caught: unknown;
-    try {
-      await runClaude({ cwd: dir, prompt: "work the anton-b9l ticket" });
-    } catch (err) {
-      caught = err;
-    }
+    const caught = await runClaudeExpectingError(bin, { prompt: "work the anton-b9l ticket" });
 
     expect(isUsageLimitError(caught)).toBe(false);
     expect(caught).toBeInstanceOf(Error);
@@ -509,29 +480,23 @@ describe("runClaude", () => {
     const bin = writeFakeClaude(
       "quotes-full-nolink-banner-claude",
       [
-        JSON.stringify({
+        {
           type: "assistant",
           message: { content: [{ type: "text", text: quotedBanner }] },
-        }),
-        JSON.stringify({
+        },
+        {
           type: "result",
           subtype: "error_during_execution",
           is_error: true,
           session_id: "sess-fullquote",
           total_cost_usd: 0.02,
           result: "3 tests failed in driver.test.ts; the push was rejected.",
-        }),
+        },
       ],
       1,
     );
-    process.env[CLAUDE_BIN_ENV] = bin;
 
-    let caught: unknown;
-    try {
-      await runClaude({ cwd: dir, prompt: "work the anton-b9l ticket" });
-    } catch (err) {
-      caught = err;
-    }
+    const caught = await runClaudeExpectingError(bin, { prompt: "work the anton-b9l ticket" });
 
     expect(isUsageLimitError(caught)).toBe(false);
     expect(caught).toBeInstanceOf(Error);
@@ -554,25 +519,19 @@ describe("runClaude", () => {
     const bin = writeFakeClaude(
       "result-quotes-full-nolink-banner-claude",
       [
-        JSON.stringify({
+        {
           type: "result",
           subtype: "error_during_execution",
           is_error: true,
           session_id: "sess-resultquote",
           total_cost_usd: 0.02,
           result: resultText,
-        }),
+        },
       ],
       1,
     );
-    process.env[CLAUDE_BIN_ENV] = bin;
 
-    let caught: unknown;
-    try {
-      await runClaude({ cwd: dir, prompt: "work the anton-b9l ticket" });
-    } catch (err) {
-      caught = err;
-    }
+    const caught = await runClaudeExpectingError(bin, { prompt: "work the anton-b9l ticket" });
 
     expect(isUsageLimitError(caught)).toBe(false);
     expect(caught).toBeInstanceOf(Error);
@@ -587,26 +546,20 @@ describe("runClaude", () => {
     const bin = writeFakeClaude(
       "spend-limited-stderr-claude",
       [
-        JSON.stringify({ type: "system", subtype: "init", session_id: "sess-spend-stderr" }),
-        JSON.stringify({
+        { type: "system", subtype: "init", session_id: "sess-spend-stderr" },
+        {
           type: "result",
           subtype: "error_during_execution",
           is_error: true,
           session_id: "sess-spend-stderr",
           total_cost_usd: 0,
-        }),
+        },
       ],
       1,
       "You've hit your monthly spend limit · raise it at claude.ai/settings/usage\n",
     );
-    process.env[CLAUDE_BIN_ENV] = bin;
 
-    let caught: unknown;
-    try {
-      await runClaude({ cwd: dir, prompt: "do the thing" });
-    } catch (err) {
-      caught = err;
-    }
+    const caught = await runClaudeExpectingError(bin);
 
     expect(isUsageLimitError(caught)).toBe(true);
     expect((caught as Error).message).toContain("monthly spend limit");
@@ -618,15 +571,15 @@ describe("runClaude", () => {
     // (e.g. an agent working the anton-ner epic itself, editing these very comments/tests). Such a
     // run must resolve, not throw UsageLimitError — otherwise a completed run is rescheduled forever.
     const bin = writeFakeClaude("mentions-limit-claude", [
-      JSON.stringify({
+      {
         type: "assistant",
         message: {
           content: [
             { type: "text", text: 'Wrote the guard so "Claude AI usage limit reached" reschedules instead of parking.' },
           ],
         },
-      }),
-      JSON.stringify({
+      },
+      {
         type: "result",
         subtype: "success",
         is_error: false,
@@ -634,7 +587,7 @@ describe("runClaude", () => {
         num_turns: 3,
         total_cost_usd: 0.02,
         result: "Implemented the 5-hour limit reached handling and pushed.",
-      }),
+      },
     ]);
     process.env[CLAUDE_BIN_ENV] = bin;
 
@@ -647,12 +600,12 @@ describe("runClaude", () => {
 
   it("passes model, permission-mode, appendSystemPrompt, and allowedTools through as args", async () => {
     const bin = writeFakeClaude("args-claude", [
-      JSON.stringify({
+      {
         type: "result",
         is_error: false,
         session_id: "sess-2",
         result: "ok",
-      }),
+      },
     ]);
     process.env[CLAUDE_BIN_ENV] = bin;
 
@@ -728,18 +681,12 @@ describe("runClaude", () => {
     // captured from init (not the missing result), and the failure classifies transient/resume-eligible.
     const bin = writeFakeClaude(
       "midstream-death-claude",
-      [JSON.stringify({ type: "system", subtype: "init", session_id: "sess-mid" })],
+      [{ type: "system", subtype: "init", session_id: "sess-mid" }],
       1,
       "API Error: Connection closed mid-response\n",
     );
-    process.env[CLAUDE_BIN_ENV] = bin;
 
-    let caught: unknown;
-    try {
-      await runClaude({ cwd: dir, prompt: "do the thing" });
-    } catch (err) {
-      caught = err;
-    }
+    const caught = await runClaudeExpectingError(bin);
 
     expect(isRecoverableClaudeError(caught)).toBe(true);
     expect((caught as { sessionId?: string }).sessionId).toBe("sess-mid");
@@ -752,23 +699,17 @@ describe("runClaude", () => {
     // must run here too (not only on non-zero exits), else it resolves { ok: false } → fresh restart
     // instead of an in-place resume.
     const bin = writeFakeClaude("iserror-exit0-claude", [
-      JSON.stringify({ type: "system", subtype: "init", session_id: "sess-ie0" }),
-      JSON.stringify({
+      { type: "system", subtype: "init", session_id: "sess-ie0" },
+      {
         type: "result",
         subtype: "error",
         is_error: true,
         session_id: "sess-ie0",
         result: "API Error: Connection closed mid-response",
-      }),
+      },
     ]);
-    process.env[CLAUDE_BIN_ENV] = bin;
 
-    let caught: unknown;
-    try {
-      await runClaude({ cwd: dir, prompt: "do the thing" });
-    } catch (err) {
-      caught = err;
-    }
+    const caught = await runClaudeExpectingError(bin);
 
     expect(isRecoverableClaudeError(caught)).toBe(true);
     expect((caught as { sessionId?: string }).sessionId).toBe("sess-ie0");
@@ -780,14 +721,14 @@ describe("runClaude", () => {
     // It must stay a plain { ok: false } (runTicket throws → fresh restart), never a resume that would
     // replay bad state.
     const bin = writeFakeClaude("iserror-exit0-deterministic-claude", [
-      JSON.stringify({ type: "system", subtype: "init", session_id: "sess-ie0d" }),
-      JSON.stringify({
+      { type: "system", subtype: "init", session_id: "sess-ie0d" },
+      {
         type: "result",
         subtype: "error",
         is_error: true,
         session_id: "sess-ie0d",
         result: "the agent could not satisfy the acceptance criteria",
-      }),
+      },
     ]);
     process.env[CLAUDE_BIN_ENV] = bin;
 
@@ -800,17 +741,11 @@ describe("runClaude", () => {
     // A truncated/interrupted stream that exits cleanly but never emits the final result event is a
     // transient death — resume-eligible, carrying the init session id.
     const bin = writeFakeClaude("no-result-claude", [
-      JSON.stringify({ type: "system", subtype: "init", session_id: "sess-noresult" }),
-      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "working" }] } }),
+      { type: "system", subtype: "init", session_id: "sess-noresult" },
+      { type: "assistant", message: { content: [{ type: "text", text: "working" }] } },
     ]);
-    process.env[CLAUDE_BIN_ENV] = bin;
 
-    let caught: unknown;
-    try {
-      await runClaude({ cwd: dir, prompt: "do the thing" });
-    } catch (err) {
-      caught = err;
-    }
+    const caught = await runClaudeExpectingError(bin);
 
     expect(isRecoverableClaudeError(caught)).toBe(true);
     expect((caught as { sessionId?: string }).sessionId).toBe("sess-noresult");
@@ -823,25 +758,19 @@ describe("runClaude", () => {
     const bin = writeFakeClaude(
       "deterministic-fail-claude",
       [
-        JSON.stringify({ type: "system", subtype: "init", session_id: "sess-det" }),
-        JSON.stringify({
+        { type: "system", subtype: "init", session_id: "sess-det" },
+        {
           type: "result",
           subtype: "error_during_execution",
           is_error: true,
           session_id: "sess-det",
           result: "the tool call failed with a syntax error",
-        }),
+        },
       ],
       1,
     );
-    process.env[CLAUDE_BIN_ENV] = bin;
 
-    let caught: unknown;
-    try {
-      await runClaude({ cwd: dir, prompt: "do the thing" });
-    } catch (err) {
-      caught = err;
-    }
+    const caught = await runClaudeExpectingError(bin);
 
     expect(isRecoverableClaudeError(caught)).toBe(false);
     expect(caught).toBeInstanceOf(Error);
@@ -856,25 +785,19 @@ describe("runClaude", () => {
     const bin = writeFakeClaude(
       "model-status-code-claude",
       [
-        JSON.stringify({ type: "system", subtype: "init", session_id: "sess-mac" }),
-        JSON.stringify({
+        { type: "system", subtype: "init", session_id: "sess-mac" },
+        {
           type: "result",
           subtype: "error_during_execution",
           is_error: true,
           session_id: "sess-mac",
           result: "The local endpoint returned 503 Service Unavailable; the migration could not run.",
-        }),
+        },
       ],
       1,
     );
-    process.env[CLAUDE_BIN_ENV] = bin;
 
-    let caught: unknown;
-    try {
-      await runClaude({ cwd: dir, prompt: "do the thing" });
-    } catch (err) {
-      caught = err;
-    }
+    const caught = await runClaudeExpectingError(bin);
 
     expect(isRecoverableClaudeError(caught)).toBe(false);
     expect(caught).toBeInstanceOf(Error);
@@ -886,18 +809,12 @@ describe("runClaude", () => {
     // matcher stays in force there, so the run is resume-eligible.
     const bin = writeFakeClaude(
       "stderr-status-code-claude",
-      [JSON.stringify({ type: "system", subtype: "init", session_id: "sess-ssc" })],
+      [{ type: "system", subtype: "init", session_id: "sess-ssc" }],
       1,
       "API Error: 503 Service Unavailable\n",
     );
-    process.env[CLAUDE_BIN_ENV] = bin;
 
-    let caught: unknown;
-    try {
-      await runClaude({ cwd: dir, prompt: "do the thing" });
-    } catch (err) {
-      caught = err;
-    }
+    const caught = await runClaudeExpectingError(bin);
 
     expect(isRecoverableClaudeError(caught)).toBe(true);
     expect((caught as { sessionId?: string }).sessionId).toBe("sess-ssc");
@@ -932,12 +849,12 @@ describe("runClaude", () => {
     // ANTON-RESULT self-report only in its last assistant message. Without the fallback, `text` would
     // be undefined and a `blocked` self-report on partial work would be lost — a false success.
     const bin = writeFakeClaude("resultless-success-claude", [
-      JSON.stringify({ type: "system", subtype: "init", session_id: "sess-rl" }),
-      JSON.stringify({
+      { type: "system", subtype: "init", session_id: "sess-rl" },
+      {
         type: "assistant",
         message: { content: [{ type: "text", text: "Could not finish.\nANTON-RESULT: blocked — schema mismatch" }] },
-      }),
-      JSON.stringify({ type: "result", subtype: "success", is_error: false, session_id: "sess-rl" }),
+      },
+      { type: "result", subtype: "success", is_error: false, session_id: "sess-rl" },
     ]);
     process.env[CLAUDE_BIN_ENV] = bin;
 
@@ -952,18 +869,12 @@ describe("runClaude", () => {
   // since work may already be banked and the caller escalates a repeated signature to a fresh run.
   it("kills a session that goes silent past stallTimeoutMs and reports it as resume-eligible", async () => {
     const bin = writeFakeHangingClaude("stalled-claude", [
-      JSON.stringify({ type: "system", subtype: "init", session_id: "sess-stall" }),
+      { type: "system", subtype: "init", session_id: "sess-stall" },
     ]);
-    process.env[CLAUDE_BIN_ENV] = bin;
 
-    let caught: unknown;
-    try {
-      // Comfortably longer than node's spawn time: the fake must get its init event out before the
-      // watchdog fires, or this would assert on a session id that never arrived.
-      await runClaude({ cwd: dir, prompt: "wedge", stallTimeoutMs: 1_500 });
-    } catch (err) {
-      caught = err;
-    }
+    // stallTimeoutMs is comfortably longer than node's spawn time: the fake must get its init event
+    // out before the watchdog fires, or this would assert on a session id that never arrived.
+    const caught = await runClaudeExpectingError(bin, { prompt: "wedge", stallTimeoutMs: 1_500 });
 
     expect(isRecoverableClaudeError(caught)).toBe(true);
     const err = caught as RecoverableClaudeError;
@@ -975,11 +886,9 @@ describe("runClaude", () => {
   it.runIf(process.platform !== "win32")("kills descendants when a session stalls", async () => {
     const childPidPath = join(dir, "stalled-child.pid");
     const bin = writeFakeHangingClaudeWithChild("stalled-tree-claude", childPidPath);
-    process.env[CLAUDE_BIN_ENV] = bin;
 
-    await expect(runClaude({ cwd: dir, prompt: "wedge tree", stallTimeoutMs: 1_500 })).rejects.toMatchObject({
-      signature: "stalled",
-    });
+    const caught = await runClaudeExpectingError(bin, { prompt: "wedge tree", stallTimeoutMs: 1_500 });
+    expect(caught).toMatchObject({ signature: "stalled" });
 
     const childPid = Number(readFileSync(childPidPath, "utf8"));
     expect(await waitForProcessExit(childPid)).toBe(true);
@@ -990,9 +899,9 @@ describe("runClaude", () => {
     // gap — not the whole run — so keep the gap well under it and let the total (3 gaps) exceed it:
     // that is what proves the timer is REARMED per chunk rather than bounding the session.
     const bin = writeFakeDripClaude("drip-claude", 600, [
-      JSON.stringify({ type: "system", subtype: "init", session_id: "sess-drip" }),
-      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "working" }] } }),
-      JSON.stringify({ type: "result", subtype: "success", is_error: false, session_id: "sess-drip", result: "done" }),
+      { type: "system", subtype: "init", session_id: "sess-drip" },
+      { type: "assistant", message: { content: [{ type: "text", text: "working" }] } },
+      { type: "result", subtype: "success", is_error: false, session_id: "sess-drip", result: "done" },
     ]);
     process.env[CLAUDE_BIN_ENV] = bin;
 

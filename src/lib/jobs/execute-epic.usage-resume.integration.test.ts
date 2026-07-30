@@ -10,14 +10,11 @@
  * `execute-epic.*.integration.test.ts` files (anton-0oi).
  */
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
-import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { beads } from "../beads/bd";
 import * as schema from "../db/schema";
 import { getJob, park } from "./queue";
-import { JobRunner } from "./runner";
-import { makeExecuteEpicHandler } from "./execute-epic";
 import { resetOperatorCache } from "../operator";
 import { describeBd } from "@/lib/testing/integration";
 import {
@@ -26,6 +23,11 @@ import {
   FakeClock,
   writeBin,
   createExecuteEpicSandbox,
+  createTicket,
+  makeEpicRunner,
+  enqueueEpicJob,
+  tickToIdle,
+  driveEpicRun,
   type ExecuteEpicSandbox,
 } from "./execute-epic.fixture";
 
@@ -64,16 +66,7 @@ describeBd("execute-epic e2e — usage-limit & in-session resume (real handler �
       description: "## Goal\nY",
     });
     await beads.approve(repo, epic2);
-    const ticket2 = (() => {
-      const p = JSON.parse(
-        execFileSync(
-          "bd",
-          ["create", "Only ticket", "--type", "task", "--parent", epic2, "--acceptance", "x", "--json"],
-          { cwd: repo, encoding: "utf8" },
-        ),
-      );
-      return (Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string;
-    })();
+    const ticket2 = createTicket(repo, { title: "Only ticket", parent: epic2 });
 
     const resetSec = Math.floor(clock.now() / 1000) + 3600;
     // Quota-then-success: first invocation hits the usage limit; once a sentinel exists in the
@@ -96,24 +89,14 @@ e({type:'result',subtype:'success',result:'done',session_id:'s2',num_turns:1,is_
 process.exit(0);`,
     );
 
-    const runner = new JobRunner({
-      db: tdb.db,
-      clock,
-      config: { maxConcurrent: 1, leaseMs: 30_000, quotaCooloffMs: 60_000 },
-    });
-    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+    const runner = makeEpicRunner(ctx, { quotaCooloffMs: 60_000 });
 
     process.env.ANTON_CLAUDE_BIN = quotaClaude;
     try {
-      const jobId = await runner.enqueue({
-        type: "execute-epic",
-        projectId,
-        payload: { projectId, epicBeadId: epic2 },
-      });
+      const jobId = await enqueueEpicJob(runner, { projectId, epicBeadId: epic2 });
 
       // First tick → usage limit → job parked (rescheduled), run parked, ticket still open.
-      await runner.tickOnce();
-      await runner.whenIdle();
+      await tickToIdle(runner);
       let job = await getJob(tdb.db, jobId);
       expect(job?.status).toBe("queued"); // rescheduled
       expect(job?.attempts).toBe(0); // quota attempt refunded
@@ -133,8 +116,7 @@ process.exit(0);`,
 
       // Advance past the reset window → resumes on the SAME run/worktree and completes.
       clock.set(resetSec * 1000 + 1);
-      await runner.tickOnce();
-      await runner.whenIdle();
+      await tickToIdle(runner);
 
       job = await getJob(tdb.db, jobId);
       expect(job?.status).toBe("done");
@@ -158,16 +140,7 @@ process.exit(0);`,
       description: "## Goal\nZ",
     });
     await beads.approve(repo, epic3);
-    const ticket3 = (() => {
-      const p = JSON.parse(
-        execFileSync(
-          "bd",
-          ["create", "Doomed ticket", "--type", "task", "--parent", epic3, "--acceptance", "x", "--json"],
-          { cwd: repo, encoding: "utf8" },
-        ),
-      );
-      return (Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string;
-    })();
+    const ticket3 = createTicket(repo, { title: "Doomed ticket", parent: epic3 });
 
     // Fake claude that fails outright (non-quota) before committing anything.
     const failingClaude = writeBin(
@@ -179,23 +152,13 @@ e({type:'result',subtype:'error',result:'boom — claude fell over',is_error:tru
 process.exit(0);`,
     );
 
-    const runner = new JobRunner({
-      db: tdb.db,
-      clock,
-      config: { maxConcurrent: 1, leaseMs: 30_000 },
-    });
-    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+    const runner = makeEpicRunner(ctx);
 
     process.env.ANTON_CLAUDE_BIN = failingClaude;
     let jobId: string;
     try {
-      jobId = await runner.enqueue({
-        type: "execute-epic",
-        projectId,
-        payload: { projectId, epicBeadId: epic3 },
-      });
-      await runner.tickOnce();
-      await runner.whenIdle(); // let the failed run settle (reschedule) before we park it below
+      // Drives to idle so the failed run settles (reschedule) before we park it below.
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: epic3 });
 
       // R10: no bead left looking claimed by a dead session — status back to open, unassigned,
       // stage label removed. (No work was committed, so it returns to the ready pool.)
@@ -247,24 +210,12 @@ e({type:'result',subtype:'success',result:'done',session_id:'s4',num_turns:1,is_
 process.exit(0);`,
     );
 
-    const runner = new JobRunner({
-      db: tdb.db,
-      clock,
-      config: { maxConcurrent: 1, leaseMs: 30_000 },
-    });
-    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+    const runner = makeEpicRunner(ctx);
 
     process.env.ANTON_CLAUDE_BIN = resumeClaude;
     try {
-      const jobId = await runner.enqueue({
-        type: "execute-epic",
-        projectId,
-        payload: { projectId, epicBeadId: target },
-      });
-
       // A single tick completes: the transient death is recovered in-session, not by a job retry.
-      await runner.tickOnce();
-      await runner.whenIdle();
+      const jobId = await driveEpicRun(runner, { projectId, epicBeadId: target });
 
       const job = await getJob(tdb.db, jobId);
       expect(job?.status).toBe("done");

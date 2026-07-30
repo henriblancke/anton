@@ -11,11 +11,11 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { describeBd, makeBdRepo, saveEnv, withOperator, type BdRepo } from "@/lib/testing/integration";
+import { driveJob } from "@/lib/testing/jobs";
 import { makeTestDb, type TestDb } from "../db/testing";
 import { beads, LABELS } from "../beads/bd";
 import * as schema from "../db/schema";
 import { getJob, type Clock } from "./queue";
-import { JobRunner } from "./runner";
 import { makeReviewFixHandler } from "./review-fix";
 import { createWorktree } from "../git/worktree";
 import { resetOperatorCache } from "../operator";
@@ -45,6 +45,18 @@ describeBd("review-fix e2e (real handler · real bd/git · fake claude/gh)", () 
   let epicId: string;
   let branch: string;
   let restoreEnv: () => void;
+
+  /** One review-fix sweep, driven to settlement. `epicBeadId` narrows it to a single epic. */
+  const runSweep = (epicBeadId?: string) =>
+    driveJob({
+      db: tdb.db,
+      clock,
+      type: "review-fix",
+      handler: makeReviewFixHandler,
+      projectId,
+      ...(epicBeadId === undefined ? {} : { payload: { projectId, epicBeadId } }),
+      config: { leaseMs: 30_000 },
+    });
 
   beforeAll(async () => {
     bdRepo = makeBdRepo({ bare: true, initialCommit: true });
@@ -160,16 +172,7 @@ process.exit(0);`,
   });
 
   it("resolves an actionable PR: claude fix → commit → push → thread reply/resolve + comment + re-request", async () => {
-    const runner = new JobRunner({ db: tdb.db, clock, config: { maxConcurrent: 1, leaseMs: 30_000 } });
-    runner.registerHandler("review-fix", makeReviewFixHandler({ db: tdb.db, clock }));
-
-    const jobId = await runner.enqueue({
-      type: "review-fix",
-      projectId,
-      payload: { projectId },
-    });
-    expect(await runner.tickOnce()).toBe(1);
-    await runner.whenIdle();
+    const jobId = await runSweep();
 
     // Job succeeded.
     expect((await getJob(tdb.db, jobId))?.status).toBe("done");
@@ -216,11 +219,7 @@ process.exit(0);`,
       .set({ settingsJson: JSON.stringify({ reviewFixPrompt: `${marker}\nResolve it my way.` }) })
       .where(eq(schema.projects.id, projectId));
     try {
-      const runner = new JobRunner({ db: tdb.db, clock, config: { maxConcurrent: 1, leaseMs: 30_000 } });
-      runner.registerHandler("review-fix", makeReviewFixHandler({ db: tdb.db, clock }));
-      await runner.enqueue({ type: "review-fix", projectId, payload: { projectId } });
-      expect(await runner.tickOnce()).toBe(1);
-      await runner.whenIdle();
+      await runSweep();
 
       const invocations = readFileSync(join(sandbox, "claude-argv.jsonl"), "utf8")
         .trim()
@@ -259,11 +258,7 @@ process.exit(0);`,
     const prev = process.env.ANTON_CLAUDE_BIN;
     process.env.ANTON_CLAUDE_BIN = noopClaude;
     try {
-      const runner = new JobRunner({ db: tdb.db, clock, config: { maxConcurrent: 1, leaseMs: 30_000 } });
-      runner.registerHandler("review-fix", makeReviewFixHandler({ db: tdb.db, clock }));
-      const jobId = await runner.enqueue({ type: "review-fix", projectId, payload: { projectId } });
-      expect(await runner.tickOnce()).toBe(1);
-      await runner.whenIdle();
+      const jobId = await runSweep();
       expect((await getJob(tdb.db, jobId))?.status).toBe("done");
 
       // The previously-unpushed commit is now on origin.
@@ -290,11 +285,7 @@ process.exit(0);`,
     process.env.ANTON_GH_BIN = greenGh;
     const before = (await tdb.db.select().from(schema.sessions)).length;
     try {
-      const runner = new JobRunner({ db: tdb.db, clock, config: { maxConcurrent: 1, leaseMs: 30_000 } });
-      runner.registerHandler("review-fix", makeReviewFixHandler({ db: tdb.db, clock }));
-      const jobId = await runner.enqueue({ type: "review-fix", projectId, payload: { projectId } });
-      expect(await runner.tickOnce()).toBe(1);
-      await runner.whenIdle();
+      const jobId = await runSweep();
       expect((await getJob(tdb.db, jobId))?.status).toBe("done");
       // Nothing actionable → no worktree/claude/session work happened.
       const after = await tdb.db.select().from(schema.sessions);
@@ -348,11 +339,7 @@ process.exit(0);`,
 
     await actAs("alice", async () => {
       process.env.ANTON_GH_BIN = mergedGhFor(8);
-      const runner = new JobRunner({ db: tdb.db, clock, config: { maxConcurrent: 1, leaseMs: 30_000 } });
-      runner.registerHandler("review-fix", makeReviewFixHandler({ db: tdb.db, clock }));
-      const jobId = await runner.enqueue({ type: "review-fix", projectId, payload: { projectId } });
-      expect(await runner.tickOnce()).toBe(1);
-      await runner.whenIdle();
+      const jobId = await runSweep();
       expect((await getJob(tdb.db, jobId))?.status).toBe("done");
     });
 
@@ -375,16 +362,8 @@ process.exit(0);`,
 
     await actAs("alice", async () => {
       process.env.ANTON_GH_BIN = mergedGhFor(9);
-      const runner = new JobRunner({ db: tdb.db, clock, config: { maxConcurrent: 1, leaseMs: 30_000 } });
-      runner.registerHandler("review-fix", makeReviewFixHandler({ db: tdb.db, clock }));
       // Explicit single-epic target bypasses the ownership filter — alice runs bob's epic.
-      const jobId = await runner.enqueue({
-        type: "review-fix",
-        projectId,
-        payload: { projectId, epicBeadId: bobEpic },
-      });
-      expect(await runner.tickOnce()).toBe(1);
-      await runner.whenIdle();
+      const jobId = await runSweep(bobEpic);
       expect((await getJob(tdb.db, jobId))?.status).toBe("done");
     });
 

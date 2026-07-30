@@ -267,6 +267,34 @@ describe("validateBeadContract — headings inside fenced code", () => {
     expect(validateBeadContract(fenced)).toEqual([]);
   });
 
+  it("does not let a heading hidden inside an HTML comment open a section", () => {
+    // A `## Acceptance` inside `<!-- … -->` renders as nothing — recognizing it would classify the
+    // comment's own hidden checklist as the written spec, and approval/execution would proceed with
+    // no rendered criteria at all.
+    const hidden = ticket({
+      acceptance_criteria: undefined,
+      description: [DESCRIPTION, "", "<!--", "## Acceptance", "- [ ] hidden", "-->"].join("\n"),
+    });
+    expect(summarize(hidden)).toEqual([["Acceptance", "blocking"]]);
+  });
+
+  it("still reads a real heading once the comment closes", () => {
+    const after = ticket({
+      acceptance_criteria: undefined,
+      description: [
+        DESCRIPTION,
+        "",
+        "<!--",
+        "## Acceptance",
+        "- [ ] hidden sample",
+        "-->",
+        "## Acceptance",
+        "- [ ] the real one",
+      ].join("\n"),
+    });
+    expect(validateBeadContract(after)).toEqual([]);
+  });
+
   it("reads an epic's outcome past a fenced sample rather than out of it", () => {
     // The preamble scan stops at the first REAL heading, so a fence opened in the outcome text must
     // not hide the `## Success Criteria` that follows it.
@@ -551,6 +579,7 @@ describe("validateBeadContract — epic tier", () => {
   it.each([
     ["no", undefined],
     ["no", ["domain:eng"]],
+    ["a bare (valueless)", ["area:"]],
     ["two", ["area:reports", "area:billing"]],
   ])("reports an epic with %s area: label", (_n, labels) => {
     expect(summarize(epic({ labels }))).toEqual([["area:", "advisory"]]);

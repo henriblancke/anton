@@ -52,9 +52,10 @@ export function createdMeta(bead: Bead): {
 
 /**
  * The contract sections a view RENDERS, read with the validator's own reader (contract.ts's
- * `goalBody`/`acceptanceBody`) rather than a view-local regex. `bd list --json` returns the
- * description but not the acceptance/context fields, so views read the contract out of the
- * description here.
+ * `goalBody`/`acceptanceBody`) rather than a view-local regex. `bd list --json` carries every home
+ * the contract lives in — the description and `acceptance_criteria`, whenever they are non-empty
+ * (measured against bd 1.1.2) — so a list-fed view judges and renders the same bead the gate does,
+ * no `bd show` hydration needed.
  *
  * The shared reader is the point: a view-local one that only accepted `##` left a `# Goal` bead
  * judged conformant by the gate and rendered blank on every card and detail view — the gate said
