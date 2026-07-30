@@ -386,7 +386,11 @@ export async function updateProjectSettings(
  */
 function healBeads(repoPath: string, prefix?: string): boolean {
   try {
-    const result = configureBeadsForRepo(repoPath, { prefix });
+    // appRoot: this runs inside the Next server bundle, where config.mjs's module-relative package
+    // root points at a build chunk. The server's cwd IS the release root (bin/anton.mjs launches it
+    // with cwd: APP_ROOT — the same anchor formula.ts uses), so UI registration installs the bundled
+    // bead formula just like `anton init` instead of reporting `missing-asset`.
+    const result = configureBeadsForRepo(repoPath, { prefix, appRoot: process.cwd() });
     if (result.errors.length) {
       console.warn(
         `[projects] beads config partial for ${repoPath}: ${result.errors.join("; ")}`,

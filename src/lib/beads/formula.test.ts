@@ -149,15 +149,15 @@ describe("the shipped bead formula", () => {
 });
 
 describe("interpolation", () => {
-  const formula = () =>
+  const formula = (ticketDescription = "## Goal\n\n{{ goal }}") =>
     parseBeadFormula(
       JSON.stringify({
         formula: "anton-bead",
-        vars: { goal: { default: "STUB GOAL" } },
+        vars: { goal: { default: "STUB GOAL" }, acceptance: { default: "- [ ] TODO — stub" } },
         steps: [
           { id: "epic", description: "## Goal\n\n{{goal}}" },
           { id: "feature", description: "## Goal\n\n{{goal}}" },
-          { id: "ticket", description: "## Goal\n\n{{ goal }}\n\n## X\n\n{{unknown}}" },
+          { id: "ticket", description: ticketDescription },
         ],
       }),
       "test",
@@ -176,10 +176,32 @@ describe("interpolation", () => {
     );
   });
 
-  // Matches `bd cook --mode=runtime`: an unknown var stays visible instead of vanishing, so the
-  // hole is obvious to whoever reads the bead.
-  it("leaves an unknown var verbatim", () => {
-    expect(renderBeadSkeleton(formula(), "ticket").description).toContain("{{unknown}}");
+  // A literal `{{criteria}}` reads as WRITTEN text to the contract validator, so materializing it
+  // would pass the gate while every view rendered the token instead of the authored criteria. A
+  // misspelled or custom placeholder must fail the render, not become a bead.
+  it("fails loud on an unresolved var instead of materializing the token", () => {
+    expect(() => renderBeadSkeleton(formula("## X\n\n{{unknown}}"), "ticket")).toThrow(
+      /unresolved \{\{unknown\}\} in the `ticket` template/,
+    );
+  });
+
+  it("fails loud when the tier's acceptance var has no value and no default", () => {
+    const doc = JSON.stringify({
+      formula: "anton-bead",
+      vars: {},
+      steps: [
+        { id: "epic", description: "e" },
+        { id: "feature", description: "f" },
+        { id: "ticket", description: "t" },
+      ],
+    });
+    expect(() => renderBeadSkeleton(parseBeadFormula(doc, "test"), "ticket")).toThrow(
+      /unresolved \{\{acceptance\}\}/,
+    );
+    expect(
+      renderBeadSkeleton(parseBeadFormula(doc, "test"), "ticket", { acceptance: "- [ ] ok" })
+        .acceptance,
+    ).toBe("- [ ] ok");
   });
 });
 
@@ -208,9 +230,10 @@ describe("resolution", () => {
       }),
     );
     expect((await loadBeadFormula(repo)).steps).toHaveLength(3);
-    expect(renderBeadSkeleton(await loadBeadFormula(repo), "ticket").description).toBe(
-      "PROJECT LOCAL",
-    );
+    expect(
+      renderBeadSkeleton(await loadBeadFormula(repo), "ticket", { acceptance: "- [ ] ok" })
+        .description,
+    ).toBe("PROJECT LOCAL");
   });
 });
 

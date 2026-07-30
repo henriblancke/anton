@@ -310,7 +310,10 @@ describe("validateBeadContract — subheadings inside a section", () => {
     );
   });
 
-  it("renders the nested content too — the view parses headings the way the gate does", () => {
+  it("keeps non-contract subheadings in the section for a bare-text read (sectionBody)", () => {
+    // sectionBody has no tier to narrow by, so it bounds sections with the all-tier CONTRACT_KEYS —
+    // a tier-specific alias like `### Success` WOULD end the section here (see the tier-aware tests
+    // below, which go through acceptanceBody). Plain subheadings still stay inside.
     const body = sectionBody(grouped, ACCEPTANCE_KEYS);
     expect(body).toContain("### API");
     expect(body).toContain("- [ ] the board marks the offending bead");

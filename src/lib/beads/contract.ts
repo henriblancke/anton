@@ -383,6 +383,13 @@ export function goalKeysOf(bead: Bead): string[] {
  * parser drifts silently and in the worst direction: one that only accepted `##` left a `# Goal`
  * bead judged conformant here and rendered blank everywhere, so the gate said "fine" and the board
  * showed nothing.
+ *
+ * One caveat: handed bare text, this has no tier to narrow by, so it sections by
+ * {@link CONTRACT_KEYS} — every tier's headings merged — while the gate uses the tier's own set.
+ * They diverge exactly on a tier-specific alias nested inside a section: a ticket grouping criteria
+ * under `### Success` inside `## Acceptance` reads as authored to the gate (and to
+ * {@link acceptanceBody}) but ends the section here. Callers holding a Bead must prefer
+ * {@link acceptanceBody} / {@link goalBody}, which judge and render with the same tier keys.
  */
 export function sectionBody(description: string | undefined, keys: string[]): string | undefined {
   if (!description) return undefined;

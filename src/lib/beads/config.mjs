@@ -706,10 +706,14 @@ export function detectHooksManager(dir, priorHooksPath = null) {
  * directory is a safe no-op.
  *
  * @param {string} dir absolute path to the target repo
- * @param {{ prefix?: string|null, log?: (msg: string) => void }} [opts]
+ * @param {{ prefix?: string|null, log?: (msg: string) => void, appRoot?: string }} [opts]
+ *   `appRoot` anchors the bundled bead-formula asset. Default: this module's package root — right
+ *   for the CLI, which runs from anywhere. A caller inside the Next server bundle MUST pass its
+ *   own anchor (`process.cwd()`): there `import.meta.url` points at a build chunk, so the default
+ *   resolves nowhere and registration reports `missing-asset` instead of installing the formula.
  */
 export function configureBeadsForRepo(dir, opts = {}) {
-  const { prefix = null, log } = opts;
+  const { prefix = null, log, appRoot } = opts;
   const emit = typeof log === "function" ? log : () => {};
   const beadsDir = join(dir, ".beads");
   const steps = [];
@@ -842,10 +846,11 @@ export function configureBeadsForRepo(dir, opts = {}) {
 
   // 3c. Install the bead formula so every bead this project creates starts contract-shaped
   //     (anton-8mnr). No-clobber — a project that tuned its own skeleton keeps it.
-  const formula = ensureBeadFormula(beadsDir);
+  const formulaSrc = bundledBeadFormulaPath(appRoot);
+  const formula = ensureBeadFormula(beadsDir, formulaSrc);
   steps.push({ name: "bead formula", status: formula.status, detail: formula.detail });
   if (formula.status === "missing-asset") {
-    emit(`bead formula asset missing from this install (${bundledBeadFormulaPath()}) — skipping.`);
+    emit(`bead formula asset missing from this install (${formulaSrc}) — skipping.`);
   } else if (formula.status === "no-workspace") {
     // Only reachable if the init/bootstrap above reported success without producing `.beads/`.
     emit("no .beads workspace to install the bead formula into — skipping.");

@@ -55,7 +55,13 @@ describe("addProject beads bootstrap (anton-ivtj)", () => {
 
     const project = await addProject({ name: "Fresh", repoPath, prefix: "fresh" });
 
-    expect(configureBeadsForRepo).toHaveBeenCalledWith(resolve(repoPath), { prefix: "fresh" });
+    // appRoot must be the server's cwd: inside the Next bundle config.mjs's module-relative package
+    // root points at a build chunk, so without this anchor UI registration reports `missing-asset`
+    // for the bead formula that `anton init` installs fine.
+    expect(configureBeadsForRepo).toHaveBeenCalledWith(resolve(repoPath), {
+      prefix: "fresh",
+      appRoot: process.cwd(),
+    });
     // configureBeadsForRepo ran bd init and reported a board — addProject surfaces that verdict.
     expect(project.hasBeads).toBe(true);
   });
@@ -68,6 +74,9 @@ describe("addProject beads bootstrap (anton-ivtj)", () => {
     const second = await addProject({ repoPath, prefix: "idem" });
 
     expect(second.id).toBe(first.id);
-    expect(configureBeadsForRepo).toHaveBeenCalledWith(resolve(repoPath), { prefix: "idem" });
+    expect(configureBeadsForRepo).toHaveBeenCalledWith(resolve(repoPath), {
+      prefix: "idem",
+      appRoot: process.cwd(),
+    });
   });
 });

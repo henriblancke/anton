@@ -159,20 +159,32 @@ export async function loadBeadFormula(repoPath: string): Promise<BeadFormula> {
 }
 
 /**
- * Resolve `{{var}}` against the caller's values, then the formula's defaults. An unknown var is left
- * verbatim — exactly what `bd cook --mode=runtime` does, so an author sees the hole rather than a
- * section that silently collapsed to empty.
+ * Resolve `{{var}}` against the caller's values, then the formula's defaults. A var with neither is
+ * left verbatim and its name collected into `unresolved` — {@link renderBeadSkeleton} fails loud on
+ * any rather than materializing the token: `stateOf` reads a literal `{{criteria}}` as written text,
+ * so a misspelled placeholder in a project-local formula would pass validation while every view
+ * rendered the token instead of the authored criteria.
  */
-function interpolate(template: string, formula: BeadFormula, vars: Record<string, string>): string {
+function interpolate(
+  template: string,
+  formula: BeadFormula,
+  vars: Record<string, string>,
+  unresolved: Set<string>,
+): string {
   return template.replace(/\{\{\s*([A-Za-z0-9_]+)\s*\}\}/g, (literal, name: string) => {
     const supplied = vars[name]?.trim();
     if (supplied) return supplied;
     const fallback = formula.vars[name]?.default;
+    if (fallback === undefined) unresolved.add(name);
     return fallback ?? literal;
   });
 }
 
-/** Render one tier of the formula into the fields `beads.create` takes. */
+/**
+ * Render one tier of the formula into the fields `beads.create` takes. Throws on an unresolved
+ * `{{var}}` (no supplied value, no formula default) — a broken project-local formula must surface
+ * as a render error at creation time, not as a bead carrying the literal token as its contract.
+ */
 export function renderBeadSkeleton(
   formula: BeadFormula,
   tier: BeadTier,
@@ -180,11 +192,19 @@ export function renderBeadSkeleton(
 ): BeadSkeleton {
   const step = formula.steps.find((s) => s.id === tier);
   if (!step?.description) throw new Error(`bead formula ${formula.source} has no \`${tier}\` step`);
-  return {
+  const unresolved = new Set<string>();
+  const skeleton: BeadSkeleton = {
     type: TIER_TYPE[tier],
-    description: interpolate(step.description, formula, vars).trim(),
-    acceptance: interpolate(`{{${TIER_ACCEPTANCE_VAR[tier]}}}`, formula, vars).trim(),
+    description: interpolate(step.description, formula, vars, unresolved).trim(),
+    acceptance: interpolate(`{{${TIER_ACCEPTANCE_VAR[tier]}}}`, formula, vars, unresolved).trim(),
   };
+  if (unresolved.size > 0) {
+    const names = [...unresolved].map((n) => `{{${n}}}`).join(", ");
+    throw new Error(
+      `bead formula ${formula.source}: unresolved ${names} in the \`${tier}\` template — supply the value or add a var default`,
+    );
+  }
+  return skeleton;
 }
 
 /** Load the project's formula and render `tier` from it — the one call a creation path needs. */
