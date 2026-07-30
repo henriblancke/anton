@@ -35,6 +35,7 @@ import {
   BEAD_FORMULA_FILENAME,
   bundledBeadFormulaPath as bundledFormulaUnder,
 } from "./config.mjs";
+import { validateBeadContract } from "./contract";
 
 export { BEAD_FORMULA_FILENAME };
 
@@ -158,6 +159,22 @@ export async function loadBeadFormula(repoPath: string): Promise<BeadFormula> {
   return parseBeadFormula(await readFile(path, "utf8"), path);
 }
 
+/** One `{{var}}` token — the shape {@link interpolate} resolves and the consumption check scans. */
+const VAR_TOKEN = /\{\{\s*([A-Za-z0-9_]+)\s*\}\}/g;
+
+/**
+ * The vars that ARE each tier's contract — the ones a creation path submits as the author's actual
+ * spec, so a template that never references one silently discards founder input
+ * ({@link renderBeadSkeleton}). Scoped per tier because callers pass one var bag for the whole
+ * formula (the same way `bd cook --var` does): an epic render legitimately ignores `acceptance`,
+ * and a ticket render legitimately ignores `outcome`.
+ */
+const TIER_CONTRACT_VARS: Record<BeadTier, string[]> = {
+  epic: ["outcome", "success_criteria"],
+  feature: ["goal", "acceptance", "context", "out_of_scope", "verify"],
+  ticket: ["goal", "acceptance", "context", "out_of_scope", "verify"],
+};
+
 /**
  * Resolve `{{var}}` against the caller's values, then the formula's defaults. A var with neither is
  * left verbatim and its name collected into `unresolved` — {@link renderBeadSkeleton} fails loud on
@@ -171,7 +188,7 @@ function interpolate(
   vars: Record<string, string>,
   unresolved: Set<string>,
 ): string {
-  return template.replace(/\{\{\s*([A-Za-z0-9_]+)\s*\}\}/g, (literal, name: string) => {
+  return template.replace(VAR_TOKEN, (literal, name: string) => {
     const supplied = vars[name]?.trim();
     if (supplied) return supplied;
     const fallback = formula.vars[name]?.default;
@@ -184,6 +201,15 @@ function interpolate(
  * Render one tier of the formula into the fields `beads.create` takes. Throws on an unresolved
  * `{{var}}` (no supplied value, no formula default) — a broken project-local formula must surface
  * as a render error at creation time, not as a bead carrying the literal token as its contract.
+ *
+ * The inverse breakage throws too: a supplied CONTRACT var ({@link TIER_CONTRACT_VARS}) the render
+ * would DISCARD. A project-local formula that replaced `{{outcome}}` with static Goal text renders
+ * successfully and validates — the static text reads as written — while the founder's submitted
+ * outcome vanishes. The tier's acceptance var is judged one step further: an unreferencing template
+ * still preserves it through the mirrored bd field, UNLESS the rendered description carries its own
+ * written criteria section — which takes display precedence over the field (acceptanceBody,
+ * contract.ts) and so shadows the submitted criteria. Discarded input must surface as a render
+ * error, not a plausible bead.
  */
 export function renderBeadSkeleton(
   formula: BeadFormula,
@@ -204,7 +230,37 @@ export function renderBeadSkeleton(
       `bead formula ${formula.source}: unresolved ${names} in the \`${tier}\` template — supply the value or add a var default`,
     );
   }
+  const referenced = new Set(
+    [...`${step.title ?? ""}\n${step.description}`.matchAll(VAR_TOKEN)].map((m) => m[1]),
+  );
+  const discarded = TIER_CONTRACT_VARS[tier].filter((n) => {
+    if (!vars[n]?.trim() || referenced.has(n)) return false;
+    if (n !== TIER_ACCEPTANCE_VAR[tier]) return true;
+    return descriptionShadowsAcceptance(skeleton);
+  });
+  if (discarded.length > 0) {
+    const names = discarded.map((n) => `{{${n}}}`).join(", ");
+    throw new Error(
+      `bead formula ${formula.source}: the \`${tier}\` template never references ${names} — the supplied value would be discarded; add the placeholder to the step's template`,
+    );
+  }
   return skeleton;
+}
+
+/**
+ * Does the rendered description carry a WRITTEN criteria section of its own? Judged with the shared
+ * validator over the description alone (no mirrored field): no blocking gap there means the
+ * description's static section satisfies the rubric by itself — and would therefore take display
+ * precedence over the mirrored field the submitted criteria land in, shadowing them.
+ */
+function descriptionShadowsAcceptance(skeleton: BeadSkeleton): boolean {
+  return !validateBeadContract({
+    id: "formula-render",
+    title: "",
+    status: "open",
+    issue_type: skeleton.type,
+    description: skeleton.description,
+  }).some((v) => v.severity === "blocking");
 }
 
 /** Load the project's formula and render `tier` from it — the one call a creation path needs. */

@@ -260,14 +260,19 @@ type SectionState = "written" | "prompt" | "absent";
  * `## Acceptance\n<!-- add criteria here -->` is as empty as the heading alone. Comments inside
  * fenced code are literal content and are kept; an unclosed comment runs to the end of the body, so
  * the judgement fails closed — the same way the description renders.
+ *
+ * Each line keeps its `fenced` flag: fenced content is LITERAL, so the scaffolding filters
+ * {@link stateOf} applies (headings, empty list markers, the TODO prompt) hold only outside fences —
+ * a rubric written as a fenced Markdown example whose content is heading-shaped is still authored
+ * text, and filtering it read the section as absent.
  */
-function renderedLines(raw: string): string[] {
-  const out: string[] = [];
+function renderedLines(raw: string): { text: string; fenced: boolean }[] {
+  const out: { text: string; fenced: boolean }[] = [];
   let inComment = false;
   for (const line of scanLines(raw)) {
     if (line.delimiter) continue;
     if (line.fenced) {
-      if (!inComment) out.push(line.text);
+      if (!inComment) out.push({ text: line.text, fenced: true });
       continue;
     }
     let rest = line.text;
@@ -289,7 +294,7 @@ function renderedLines(raw: string): string[] {
         rest = rest.slice(open + 4);
       }
     }
-    out.push(kept);
+    out.push({ text: kept, fenced: false });
   }
   return out;
 }
@@ -305,17 +310,19 @@ function renderedLines(raw: string): string[] {
  * ({@link EMPTY_LIST_ITEM}) and anything the render hides — fence delimiters and HTML comments
  * ({@link renderedLines}): a section holding only `- [ ]`, an empty ``` block, or a
  * `<!-- template placeholder -->` says nothing, and counting any as text read it as authored —
- * approval and execution proceeded with no definition of done. Fenced CONTENT still counts; only
- * the invisible punctuation is skipped.
+ * approval and execution proceeded with no definition of done. Fenced CONTENT still counts, and
+ * counts as LITERAL: heading-shaped or TODO-shaped lines inside a fence are a quoted example the
+ * author wrote, so the scaffolding and prompt tests apply only outside fences — filtering a fenced
+ * `# Expected title` rubric read an authored section as absent.
  */
 function stateOf(bodies: string[]): SectionState {
   let state: SectionState = "absent";
   for (const raw of bodies) {
     const lines = renderedLines(raw)
-      .map((l) => l.trim())
-      .filter((l) => l && !HEADING.test(l) && !EMPTY_LIST_ITEM.test(l));
+      .map((l) => ({ text: l.text.trim(), fenced: l.fenced }))
+      .filter((l) => l.text && (l.fenced || (!HEADING.test(l.text) && !EMPTY_LIST_ITEM.test(l.text))));
     if (lines.length === 0) continue;
-    if (!lines.every((l) => PROMPT_LINE.test(l))) return "written";
+    if (!lines.every((l) => !l.fenced && PROMPT_LINE.test(l.text))) return "written";
     state = "prompt";
   }
   return state;

@@ -243,6 +243,31 @@ describe("validateBeadContract — headings inside fenced code", () => {
     expect(validateBeadContract(fenced)).toEqual([]);
   });
 
+  it("counts heading-shaped fenced content as authored — literal text, not scaffolding", () => {
+    // A rubric written as a fenced Markdown example can be nothing but heading/list shapes.
+    // Applying the scaffolding filters inside the fence read that authored section as absent.
+    const fenced = ticket({
+      acceptance_criteria: undefined,
+      description: [DESCRIPTION, "", "## Acceptance", "```markdown", "# Expected title", "```"].join("\n"),
+    });
+    expect(validateBeadContract(fenced)).toEqual([]);
+  });
+
+  it("counts a fenced TODO line as authored — a quoted example, not the formula's prompt", () => {
+    const fenced = ticket({
+      acceptance_criteria: undefined,
+      description: [
+        DESCRIPTION,
+        "",
+        "## Acceptance",
+        "```",
+        "- [ ] TODO — a concrete, checkable statement of done",
+        "```",
+      ].join("\n"),
+    });
+    expect(validateBeadContract(fenced)).toEqual([]);
+  });
+
   it("treats a section holding only an HTML comment as unwritten", () => {
     // A template placeholder (`<!-- add criteria here -->`) renders as nothing — counting it as
     // text let a ticket approve and run against an Acceptance section that displays empty.

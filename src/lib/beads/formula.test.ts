@@ -192,7 +192,7 @@ describe("interpolation", () => {
       steps: [
         { id: "epic", description: "e" },
         { id: "feature", description: "f" },
-        { id: "ticket", description: "t" },
+        { id: "ticket", description: "## Acceptance\n\n{{acceptance}}" },
       ],
     });
     expect(() => renderBeadSkeleton(parseBeadFormula(doc, "test"), "ticket")).toThrow(
@@ -202,6 +202,72 @@ describe("interpolation", () => {
       renderBeadSkeleton(parseBeadFormula(doc, "test"), "ticket", { acceptance: "- [ ] ok" })
         .acceptance,
     ).toBe("- [ ] ok");
+  });
+
+  // A formula that renders fine while DROPPING what the founder submitted is the subtler breakage:
+  // a static Goal replacing `{{outcome}}` (or a static Success Criteria section) validates — static
+  // text reads as written — while the submitted value vanishes, the static section even shadowing
+  // the mirrored acceptance field in display precedence. Supplied contract vars must be consumed.
+  it("fails loud when the tier's template never references a supplied contract var", () => {
+    const doc = JSON.stringify({
+      formula: "anton-bead",
+      vars: { success_criteria: { default: "- [ ] TODO — stub" } },
+      steps: [
+        { id: "epic", description: "## Goal\n\nA static goal.\n\n## Success Criteria\n\n{{success_criteria}}" },
+        { id: "feature", description: "f" },
+        { id: "ticket", description: "t" },
+      ],
+    });
+    expect(() =>
+      renderBeadSkeleton(parseBeadFormula(doc, "test"), "epic", {
+        outcome: "Reports leave the app.",
+        success_criteria: "- [ ] every report exports",
+      }),
+    ).toThrow(/the `epic` template never references \{\{outcome\}\}/);
+  });
+
+  it("fails loud when a static criteria section would shadow the submitted criteria", () => {
+    // An unreferencing template still preserves the acceptance var through the mirrored bd field —
+    // but a static WRITTEN criteria section in the description takes display precedence over that
+    // field (acceptanceBody), so the founder's submitted criteria would never render.
+    const doc = JSON.stringify({
+      formula: "anton-bead",
+      vars: {},
+      steps: [
+        {
+          id: "epic",
+          description: "## Goal\n\n{{outcome}}\n\n## Success Criteria\n\n- [ ] a static, already-written box",
+        },
+        { id: "feature", description: "f" },
+        { id: "ticket", description: "t" },
+      ],
+    });
+    expect(() =>
+      renderBeadSkeleton(parseBeadFormula(doc, "test"), "epic", {
+        outcome: "Reports leave the app.",
+        success_criteria: "- [ ] every report exports",
+      }),
+    ).toThrow(/the `epic` template never references \{\{success_criteria\}\}/);
+  });
+
+  it("ignores another tier's vars in the bag — one bag renders every tier, as `bd cook --var` does", () => {
+    const doc = JSON.stringify({
+      formula: "anton-bead",
+      vars: { acceptance: { default: "- [ ] TODO — stub" } },
+      steps: [
+        { id: "epic", description: "## Goal\n\n{{outcome}}\n\n## Success Criteria\n\n{{success_criteria}}" },
+        { id: "feature", description: "f" },
+        { id: "ticket", description: "t" },
+      ],
+    });
+    const skeleton = renderBeadSkeleton(parseBeadFormula(doc, "test"), "epic", {
+      outcome: "Reports leave the app.",
+      success_criteria: "- [ ] every report exports",
+      goal: "a ticket-tier var the epic template rightly ignores",
+      context: "another one",
+    });
+    expect(skeleton.description).toContain("Reports leave the app.");
+    expect(skeleton.description).not.toContain("rightly ignores");
   });
 });
 
