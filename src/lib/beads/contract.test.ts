@@ -141,6 +141,24 @@ describe("validateBeadContract — ticket tier (task / bug / chore / feature)", 
     expect(validateBeadContract(ticket({ acceptance_criteria: "- [ ] it works" }))).toEqual([]);
   });
 
+  it("treats a section holding only a thematic break as unwritten", () => {
+    // `---` renders as a rule, not text — counting it as content let approval and execution
+    // proceed with no definition of done.
+    for (const rule of ["---", "***", "___", "- - -", "*****"]) {
+      const bead = ticket({
+        acceptance_criteria: undefined,
+        description: [DESCRIPTION, "", "## Acceptance", rule].join("\n"),
+      });
+      expect(summarize(bead)).toEqual([["Acceptance", "blocking"]]);
+    }
+    // A rule BESIDE authored text is formatting, not the section's only content.
+    const authored = ticket({
+      acceptance_criteria: undefined,
+      description: [DESCRIPTION, "", "## Acceptance", "- [ ] it works", "---"].join("\n"),
+    });
+    expect(validateBeadContract(authored)).toEqual([]);
+  });
+
   it("reads headings case-, level- and punctuation-insensitively", () => {
     const loose = [
       "# goal",

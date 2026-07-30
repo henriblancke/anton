@@ -250,6 +250,10 @@ const PROMPT_LINE = /^(?:[-*+]\s+)?(?:\[[ xX]?\][ \t]*)?TODO\s*[—–:-]/;
  * a section holding only such markers states no definition of done ({@link stateOf}). */
 const EMPTY_LIST_ITEM = /^(?:[-*+]|\d{1,9}[.)])(?:[ \t]+\[[ xX]?\])?[ \t]*$/;
 
+/** A thematic break — 3+ `-`/`*`/`_` of one kind, spaces between allowed (CommonMark). It renders
+ * as a rule, not text, so a section holding only `---` says nothing ({@link stateOf}). */
+const THEMATIC_BREAK = /^([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
+
 /** What a section holds. `prompt` is a gap like `absent` — they differ only in the message. */
 type SectionState = "written" | "prompt" | "absent";
 
@@ -307,7 +311,8 @@ function renderedLines(raw: string): { text: string; fenced: boolean }[] {
  *
  * Subheadings a section carries (see {@link sectionsOf}) are scaffolding, not spec: `### API` over
  * nothing but TODO boxes is as unwritten as the boxes alone. So are empty list markers
- * ({@link EMPTY_LIST_ITEM}) and anything the render hides — fence delimiters and HTML comments
+ * ({@link EMPTY_LIST_ITEM}), thematic breaks ({@link THEMATIC_BREAK}) and anything the render
+ * hides — fence delimiters and HTML comments
  * ({@link renderedLines}): a section holding only `- [ ]`, an empty ``` block, or a
  * `<!-- template placeholder -->` says nothing, and counting any as text read it as authored —
  * approval and execution proceeded with no definition of done. Fenced CONTENT still counts, and
@@ -320,7 +325,12 @@ function stateOf(bodies: string[]): SectionState {
   for (const raw of bodies) {
     const lines = renderedLines(raw)
       .map((l) => ({ text: l.text.trim(), fenced: l.fenced }))
-      .filter((l) => l.text && (l.fenced || (!HEADING.test(l.text) && !EMPTY_LIST_ITEM.test(l.text))));
+      .filter(
+        (l) =>
+          l.text &&
+          (l.fenced ||
+            (!HEADING.test(l.text) && !EMPTY_LIST_ITEM.test(l.text) && !THEMATIC_BREAK.test(l.text))),
+      );
     if (lines.length === 0) continue;
     if (!lines.every((l) => !l.fenced && PROMPT_LINE.test(l.text))) return "written";
     state = "prompt";
