@@ -8,7 +8,14 @@ import { allIssues, ensureDescription } from "./beads/issues";
 import { nudgeSync } from "./beads/sync-nudge";
 import { formatHumanNote, parseTicketNotes, type TicketNote } from "./beads/notes";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
-import { createdMeta, deriveStage, labelValue, parseAcceptance, parseGoal } from "./ticket-view";
+import {
+  createdMeta,
+  deriveStage,
+  labelValue,
+  parseAcceptance,
+  parseGoal,
+  runContractStatus,
+} from "./ticket-view";
 import { listAllBeads } from "./tickets";
 import type { Bead } from "./beads/bd";
 import type { Project, TicketDetail } from "./types";
@@ -38,6 +45,10 @@ function toTicketDetail(lite: Bead, full: Bead, epic: Bead | undefined): TicketD
     approved: beads.isApproved(lite),
     // Only the full bead read carries `notes` reliably; `bd list` omits it for beads with none.
     notes: parseTicketNotes(full.notes),
+    // Judged over the bead's OWN run (no children), like the standalone chip: the dialog's Run
+    // button posts to the approve route, and gating on the bead alone (contractStatusOf) would
+    // withhold the closed-PR Force run the gate permits on an in-review legacy standalone.
+    contract: runContractStatus(full, []),
   };
 }
 

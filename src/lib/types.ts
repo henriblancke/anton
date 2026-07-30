@@ -247,6 +247,9 @@ export interface TicketDetail extends Ticket {
   epicAssignee?: string | null; // the parent epic's human-claim owner, inherited by this child
   approved: boolean; // has the `approved` label — locks the standalone claim control (see ClaimControl)
   notes: TicketNote[]; // append-only note history (human steering + anton's own machine notes)
+  /** Contract status over the bead's own run (runContractStatus, same as the standalone chip), so
+   * the dialog's Run affordance agrees with the approve gate instead of 422ing on click. */
+  contract?: ContractStatus;
 }
 
 // ── Board drag-and-drop ──

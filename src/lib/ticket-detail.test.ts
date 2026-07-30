@@ -82,6 +82,34 @@ describe("getTicketDetail read economy", () => {
   });
 });
 
+// The dialog's Run affordance gates on this field the way the standalone chip does — over the RUN
+// (runContractStatus with no children), not the bead alone — so it withholds exactly the clicks the
+// approve route would 422 and keeps the ones it permits.
+describe("getTicketDetail contract status", () => {
+  beforeEach(() => resetIssueSnapshots());
+  afterEach(() => vi.restoreAllMocks());
+
+  it("reports a blocking Acceptance gap on a backlog standalone with none", async () => {
+    fakeBd([bead({ id: "t-1", description: "## Goal\nShip it\n" })]);
+
+    const detail = await getTicketDetail(project, "t-1");
+
+    expect(detail.contract?.blocking.map((v) => v.section)).toEqual(["Acceptance"]);
+  });
+
+  it("carries no gaps for an in-review standalone missing Acceptance — its run dispatches no agent", async () => {
+    fakeBd([
+      bead({ id: "t-1", description: "## Goal\nShip it\n", labels: ["stage:in-review"] }),
+    ]);
+
+    const detail = await getTicketDetail(project, "t-1");
+
+    // The approve gate permits Force run on exactly this shape (closed-PR recovery of a legacy
+    // standalone), so the dialog must keep offering it rather than reporting the bead's own gap.
+    expect(detail.contract).toEqual({ blocking: [], advisory: [] });
+  });
+});
+
 describe("updateTicket read economy", () => {
   beforeEach(() => resetIssueSnapshots());
   afterEach(() => vi.restoreAllMocks());
