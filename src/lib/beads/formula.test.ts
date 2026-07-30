@@ -226,6 +226,30 @@ describe("interpolation", () => {
     ).toThrow(/the `epic` template never references \{\{outcome\}\}/);
   });
 
+  it("does not count a var referenced only in the step title — the skeleton never emits it", () => {
+    // `renderBeadSkeleton` renders description + mirrored acceptance only; `createDraftEpic` uses
+    // the draft's own title. A `{{outcome}}` living solely in `step.title` is still discarded.
+    const doc = JSON.stringify({
+      formula: "anton-bead",
+      vars: { success_criteria: { default: "- [ ] TODO — stub" } },
+      steps: [
+        {
+          id: "epic",
+          title: "{{outcome}}",
+          description: "## Goal\n\nA static goal.\n\n## Success Criteria\n\n{{success_criteria}}",
+        },
+        { id: "feature", description: "f" },
+        { id: "ticket", description: "t" },
+      ],
+    });
+    expect(() =>
+      renderBeadSkeleton(parseBeadFormula(doc, "test"), "epic", {
+        outcome: "Reports leave the app.",
+        success_criteria: "- [ ] every report exports",
+      }),
+    ).toThrow(/the `epic` template never references \{\{outcome\}\}/);
+  });
+
   it("fails loud when a static criteria section would shadow the submitted criteria", () => {
     // An unreferencing template still preserves the acceptance var through the mirrored bd field —
     // but a static WRITTEN criteria section in the description takes display precedence over that

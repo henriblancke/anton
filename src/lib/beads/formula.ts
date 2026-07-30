@@ -230,9 +230,10 @@ export function renderBeadSkeleton(
       `bead formula ${formula.source}: unresolved ${names} in the \`${tier}\` template — supply the value or add a var default`,
     );
   }
-  const referenced = new Set(
-    [...`${step.title ?? ""}\n${step.description}`.matchAll(VAR_TOKEN)].map((m) => m[1]),
-  );
+  // Only the description counts as consumption: it is the sole templated field the skeleton emits
+  // (`step.title` is never rendered — `createDraftEpic` uses the draft's own title), so a var
+  // referenced there alone would still vanish from the created bead.
+  const referenced = new Set([...step.description.matchAll(VAR_TOKEN)].map((m) => m[1]));
   const discarded = TIER_CONTRACT_VARS[tier].filter((n) => {
     if (!vars[n]?.trim() || referenced.has(n)) return false;
     if (n !== TIER_ACCEPTANCE_VAR[tier]) return true;
