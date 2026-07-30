@@ -128,6 +128,19 @@ describe("validateBeadContract — ticket tier (task / bug / chore / feature)", 
     expect(summarize(ticket({ acceptance_criteria: "   " }))).toEqual([["Acceptance", "blocking"]]);
   });
 
+  it("treats a section holding only empty checklist scaffolding as unwritten", () => {
+    // `- [ ]` with no text states no criterion — counting the marker as content let approval and
+    // execution proceed with no definition of done at all.
+    expect(summarize(ticket({ acceptance_criteria: "- [ ]" }))).toEqual([["Acceptance", "blocking"]]);
+    const scaffold = ticket({
+      acceptance_criteria: undefined,
+      description: [DESCRIPTION, "", "## Acceptance", "- [ ]", "- [x]", "-", "1."].join("\n"),
+    });
+    expect(summarize(scaffold)).toEqual([["Acceptance", "blocking"]]);
+    // A box WITH text is a criterion — the marker is only scaffolding when it carries nothing.
+    expect(validateBeadContract(ticket({ acceptance_criteria: "- [ ] it works" }))).toEqual([]);
+  });
+
   it("reads headings case-, level- and punctuation-insensitively", () => {
     const loose = [
       "# goal",
@@ -276,6 +289,21 @@ describe("validateBeadContract — headings inside fenced code", () => {
       description: [DESCRIPTION, "", "<!--", "## Acceptance", "- [ ] hidden", "-->"].join("\n"),
     });
     expect(summarize(hidden)).toEqual([["Acceptance", "blocking"]]);
+  });
+
+  it("reads a heading carrying an inline HTML comment by its rendered text", () => {
+    // `## Acceptance <!-- markdownlint-disable-line -->` still renders an Acceptance heading;
+    // slugging the raw annotation missed the section and the hard gate rejected shaped work.
+    const annotated = ticket({
+      acceptance_criteria: undefined,
+      description: [
+        DESCRIPTION,
+        "",
+        "## Acceptance <!-- markdownlint-disable-line -->",
+        "- [ ] it works",
+      ].join("\n"),
+    });
+    expect(validateBeadContract(annotated)).toEqual([]);
   });
 
   it("still reads a real heading once the comment closes", () => {

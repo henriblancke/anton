@@ -96,8 +96,15 @@ const HEADING = /^ {0,3}(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$/;
 /** An opening or closing code fence: up to 3 leading spaces, then 3+ backticks or tildes. */
 const FENCE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 
-/** Heading text → comparison key, case- and punctuation-insensitive: `## Out-of-Scope:` → `outofscope`. */
-const slug = (heading: string) => heading.toLowerCase().replace(/[^a-z0-9]+/g, "");
+/** Heading text → comparison key, case- and punctuation-insensitive: `## Out-of-Scope:` → `outofscope`.
+ * Inline HTML comments are stripped first: `## Acceptance <!-- markdownlint-disable-line -->` still
+ * renders an Acceptance heading, and slugging the raw annotation missed the section — the hard gate
+ * rejected otherwise shaped work. An unclosed comment runs to the end of the line, as it renders. */
+const slug = (heading: string) =>
+  heading
+    .replace(/<!--.*?(?:-->|$)/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
 
 /** The HTML-comment state after `text`, given the state it began in — `<!--`/`-->` toggled in order. */
 function commentStateAfter(text: string, inComment: boolean): boolean {
@@ -239,6 +246,10 @@ function preambleOf(description: string): string {
  */
 const PROMPT_LINE = /^(?:[-*+]\s+)?(?:\[[ xX]?\][ \t]*)?TODO\s*[—–:-]/;
 
+/** A list or task-list marker with nothing after it — `-`, `1.`, `- [ ]`. Scaffolding, not spec:
+ * a section holding only such markers states no definition of done ({@link stateOf}). */
+const EMPTY_LIST_ITEM = /^(?:[-*+]|\d{1,9}[.)])(?:[ \t]+\[[ xX]?\])?[ \t]*$/;
+
 /** What a section holds. `prompt` is a gap like `absent` — they differ only in the message. */
 type SectionState = "written" | "prompt" | "absent";
 
@@ -290,18 +301,19 @@ function renderedLines(raw: string): string[] {
  * one TODO left beside them is authored, and calling it unwritten would ask for what is already there.
  *
  * Subheadings a section carries (see {@link sectionsOf}) are scaffolding, not spec: `### API` over
- * nothing but TODO boxes is as unwritten as the boxes alone. So is anything the render hides —
- * fence delimiters and HTML comments ({@link renderedLines}): a section holding only an empty
- * ``` block or a `<!-- template placeholder -->` says nothing, and counting either as text read it
- * as authored — approval and execution proceeded with no definition of done. Fenced CONTENT still
- * counts; only the invisible punctuation is skipped.
+ * nothing but TODO boxes is as unwritten as the boxes alone. So are empty list markers
+ * ({@link EMPTY_LIST_ITEM}) and anything the render hides — fence delimiters and HTML comments
+ * ({@link renderedLines}): a section holding only `- [ ]`, an empty ``` block, or a
+ * `<!-- template placeholder -->` says nothing, and counting any as text read it as authored —
+ * approval and execution proceeded with no definition of done. Fenced CONTENT still counts; only
+ * the invisible punctuation is skipped.
  */
 function stateOf(bodies: string[]): SectionState {
   let state: SectionState = "absent";
   for (const raw of bodies) {
     const lines = renderedLines(raw)
       .map((l) => l.trim())
-      .filter((l) => l && !HEADING.test(l));
+      .filter((l) => l && !HEADING.test(l) && !EMPTY_LIST_ITEM.test(l));
     if (lines.length === 0) continue;
     if (!lines.every((l) => PROMPT_LINE.test(l))) return "written";
     state = "prompt";
