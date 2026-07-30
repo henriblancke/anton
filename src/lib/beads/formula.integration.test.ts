@@ -7,6 +7,10 @@
  * 2. **By construction, end to end.** A bead materialised with ordinary `bd create` from the cooked
  *    skeleton comes BACK from `bd show` passing `validateBeadContract` with zero violations. Cook
  *    and create — never `bd mol pour`, whose molecule root is a type anton has no tier for.
+ * 3. **The `bd list` projection is contract-complete.** The approve route, the executor, and the
+ *    board all judge beads read from `bd list --json`, on the strength of it carrying every home
+ *    the contract lives in — description and `acceptance_criteria` — whenever they are non-empty
+ *    (ticket-view.ts). That is a property of bd's output, so only a real bd can pin it.
  */
 import { execFileSync } from "node:child_process";
 import { afterAll, beforeAll, expect, it } from "vitest";
@@ -14,7 +18,7 @@ import { afterAll, beforeAll, expect, it } from "vitest";
 import { describeBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
 import { beads } from "./bd";
 import { ensureBeadFormula } from "./config.mjs";
-import { validateBeadContract } from "./contract";
+import { contractGaps, validateBeadContract } from "./contract";
 import {
   BEAD_FORMULA_NAME,
   loadBeadFormula,
@@ -84,6 +88,27 @@ describeBd("bead formula (real bd · cook + create)", () => {
     expect(bead.issue_type).toBe("task");
     expect(bead.labels).toContain("domain:eng");
     expect(validateBeadContract(bead)).toEqual([]);
+  });
+
+  it("judges field-only Acceptance off the `bd list` projection — the read the gates and board use", async () => {
+    // The `bd update --acceptance` repair the blocking gap prescribes writes bd's own field and
+    // leaves the description without an `## Acceptance` section. Every gate call site is list-fed,
+    // so if bd ever dropped `acceptance_criteria` from the list projection, the repaired bead would
+    // stay blocked despite the repair — this pins the projection the comment in ticket-view.ts
+    // documents (measured against bd 1.1.2).
+    const rubric = "- [ ] the list-fed gate reads this rubric";
+    const id = await beads.create(repo, {
+      title: "field-only acceptance",
+      type: "task",
+      description: "## Goal\nProve the list projection is contract-complete.",
+      acceptance: rubric,
+    });
+
+    const listed = (await beads.list(repo, ["--status", "all"])).find((b) => b.id === id);
+    expect(listed).toBeDefined();
+    expect(listed?.acceptance_criteria).toBe(rubric);
+    expect(listed?.description).toContain("## Goal");
+    expect(contractGaps([listed!], "blocking")).toEqual([]);
   });
 
   it("materialises an epic that reads back contract-conformant", async () => {
