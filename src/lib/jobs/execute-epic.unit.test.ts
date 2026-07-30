@@ -113,6 +113,19 @@ describe("ticketPrompt", () => {
     expect(p).toMatch(/not guess or silently bail/);
   });
 
+  it("inlines a description-only Acceptance section, even past the description's truncation cap", () => {
+    // The gate accepts a rubric that lives only in the description; a fields-only read said
+    // "(none stated)" for it whenever the truncated description block cut the section off.
+    const p = ticketPrompt({
+      id: "t-1",
+      title: "T",
+      status: "open",
+      description: `## Context\n${"x".repeat(5000)}\n\n## Acceptance\n- [ ] the buried criterion`,
+    } as Bead);
+    expect(p).not.toContain("(none stated)");
+    expect(p.slice(p.indexOf("## Acceptance criteria"))).toContain("- [ ] the buried criterion");
+  });
+
   it("prefers acceptance_criteria but falls back to the legacy acceptance field", () => {
     const p = ticketPrompt({
       id: "t-1",

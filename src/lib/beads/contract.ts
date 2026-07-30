@@ -12,8 +12,10 @@
  *
  * Three facts this encodes (the first two measured against bd 1.1.0, 2026-07-28):
  *
- * 1. The contract lives in the DESCRIPTION markdown. `--context` is sugar that appends a
- *    `## Context` section to it; there is no `context` field in `--json`. `acceptance_criteria`
+ * 1. The contract lives in the DESCRIPTION markdown. `bd create --context` is sugar that appends a
+ *    `## Context` section to it (`bd update` has no such flag — repairing Context means rewriting
+ *    the description, see docs/runbooks/bead-contract-conformance.md); there is no `context` field
+ *    in `--json`. `acceptance_criteria`
  *    (bd's own field, rendered "Success Criteria" for an epic) is the one genuinely separate home —
  *    and beads edited through the ticket dialog also keep it as `## Acceptance` in the description,
  *    so either home satisfies it.
@@ -333,7 +335,7 @@ const TICKET_RULES: SectionRule[] = [
     severity: "advisory",
     keys: ["context"],
     message:
-      "no `## Context` section — the agent has to rediscover which files and patterns apply (`bd update --context` appends one)",
+      "no `## Context` section — the agent has to rediscover which files and patterns apply (rewrite the description: `bd update <id> --body-file -`)",
     promptMessage:
       "`## Context` is still the formula's TODO prompt — the agent has to rediscover which files and patterns apply",
   },
@@ -656,12 +658,13 @@ export function validateBeadContract(bead: Bead): ContractViolation[] {
 }
 
 /** Exactly one `area:` label, with a nonempty value — the roadmap's Area column and Linear project
- * routing key on it. A bare `area:` names no product surface, so it satisfies nothing. */
+ * routing key on it. Uniqueness counts EVERY `area:` label, valueless ones included: `labelValueOf`
+ * returns whichever matches first (bd.ts), so a bare `area:` beside `area:reports` can still hand
+ * the roadmap an empty surface depending on label order — discarding it here read that epic as
+ * conformant while the board grouped it under nothing. */
 function areaViolations(bead: Bead): ContractViolation[] {
-  const areas = (bead.labels ?? []).filter(
-    (l) => l.startsWith("area:") && l.slice("area:".length).trim() !== "",
-  );
-  if (areas.length === 1) return [];
+  const areas = (bead.labels ?? []).filter((l) => l.startsWith("area:"));
+  if (areas.length === 1 && areas[0].slice("area:".length).trim() !== "") return [];
   return [
     {
       section: "area:",
@@ -669,7 +672,9 @@ function areaViolations(bead: Bead): ContractViolation[] {
       message:
         areas.length === 0
           ? "no `area:` label — the roadmap has no product surface to group this outcome under (`bd tag <id> area:<surface>`)"
-          : `carries ${areas.length} \`area:\` labels (${areas.join(", ")}) — an epic carries exactly one`,
+          : areas.length > 1
+            ? `carries ${areas.length} \`area:\` labels (${areas.join(", ")}) — an epic carries exactly one`
+            : "a bare `area:` label names no product surface — give it a value (`bd tag <id> area:<surface>`)",
     },
   ];
 }

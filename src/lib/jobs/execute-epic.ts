@@ -9,7 +9,7 @@
 import { randomUUID } from "node:crypto";
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { ownerOf } from "../beads/claim";
-import { contractGaps, formatContractGaps } from "../beads/contract";
+import { acceptanceBody, contractGaps, formatContractGaps } from "../beads/contract";
 import { humanNotesPromptBlock } from "../beads/notes";
 import { computeEpicGraph, epicStandaloneBlockers, isUnit, standaloneBlockers } from "../epic-graph";
 import { contractGatedBeads, resumeSkipped, runTickets } from "../ticket-view";
@@ -1465,7 +1465,10 @@ function truncateField(text: string): string {
  */
 export function ticketPrompt(ticket: Bead): string {
   const description = ticket.description?.trim();
-  const acceptance = (ticket.acceptance_criteria ?? ticket.acceptance)?.trim();
+  // The gate's own reader: covers every home the contract accepts — bd's acceptance fields AND a
+  // description-only `## Acceptance` section. Reading the fields alone said "(none stated)" for a
+  // rubric the gate had just accepted, whenever the truncated description block below cut it.
+  const acceptance = acceptanceBody(ticket)?.trim();
   // In some boards Context is a separate column; in others it's folded into `description` as a
   // `## Context` heading. Only inline the standalone field when it isn't already in `description`.
   const context =

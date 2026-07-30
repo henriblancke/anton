@@ -581,6 +581,9 @@ describe("validateBeadContract — epic tier", () => {
     ["no", ["domain:eng"]],
     ["a bare (valueless)", ["area:"]],
     ["two", ["area:reports", "area:billing"]],
+    // The bare label counts toward uniqueness: labelValueOf returns whichever matches first, so a
+    // valueless `area:` beside a real one can still hand the roadmap an empty surface.
+    ["a bare label beside a real", ["area:", "area:reports"]],
   ])("reports an epic with %s area: label", (_n, labels) => {
     expect(summarize(epic({ labels }))).toEqual([["area:", "advisory"]]);
   });
