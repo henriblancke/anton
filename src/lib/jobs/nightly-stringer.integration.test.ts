@@ -9,11 +9,11 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync }
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { describeBd, makeBdRepo, saveEnv, type BdRepo } from "@/lib/testing/integration";
+import { driveJob } from "@/lib/testing/jobs";
 import { makeTestDb, type TestDb } from "../db/testing";
 import { beads } from "../beads/bd";
 import * as schema from "../db/schema";
 import { getJob, type Clock } from "./queue";
-import { JobRunner } from "./runner";
 import { makeNightlyStringerHandler } from "./nightly-stringer";
 
 class FakeClock implements Clock {
@@ -39,6 +39,17 @@ describeBd("nightly-stringer e2e (real handler · real bd · fake stringer/claud
   let clock: FakeClock;
   let projectId: string;
   let restoreEnv: () => void;
+
+  /** One nightly-stringer job, driven to settlement against the suite's db/repo. */
+  const runScan = () =>
+    driveJob({
+      db: tdb.db,
+      clock,
+      type: "nightly-stringer",
+      handler: makeNightlyStringerHandler,
+      projectId,
+      config: { leaseMs: 30_000 },
+    });
 
   beforeAll(async () => {
     bdRepo = makeBdRepo({ initialCommit: true });
@@ -120,11 +131,7 @@ process.stdin.on('end',()=>{
     process.env.FAKE_STRINGER_SIGNALS = "3";
     const beadsBefore = (await beads.list(repo, ["--status", "all"])).length;
 
-    const runner = new JobRunner({ db: tdb.db, clock, config: { maxConcurrent: 1, leaseMs: 30_000 } });
-    runner.registerHandler("nightly-stringer", makeNightlyStringerHandler({ db: tdb.db, clock }));
-    const jobId = await runner.enqueue({ type: "nightly-stringer", projectId, payload: { projectId } });
-    expect(await runner.tickOnce()).toBe(1);
-    await runner.whenIdle();
+    const jobId = await runScan();
 
     expect((await getJob(tdb.db, jobId))?.status).toBe("done");
 
@@ -149,11 +156,7 @@ process.stdin.on('end',()=>{
     rmSync(join(sandbox, "claude-argv.jsonl"), { force: true });
     const beadsBefore = (await beads.list(repo, ["--status", "all"])).length;
 
-    const runner = new JobRunner({ db: tdb.db, clock, config: { maxConcurrent: 1, leaseMs: 30_000 } });
-    runner.registerHandler("nightly-stringer", makeNightlyStringerHandler({ db: tdb.db, clock }));
-    const jobId = await runner.enqueue({ type: "nightly-stringer", projectId, payload: { projectId } });
-    expect(await runner.tickOnce()).toBe(1);
-    await runner.whenIdle();
+    const jobId = await runScan();
 
     expect((await getJob(tdb.db, jobId))?.status).toBe("done");
     // No beads created, claude never ran (no argv file written).
@@ -168,13 +171,10 @@ process.stdin.on('end',()=>{
       `error="opening repo: core.repositoryformatversion does not support extension: worktreeconfig" duration=4ms`;
     const before = new Set((await tdb.db.select().from(schema.sessions)).map((s) => s.id));
 
-    const runner = new JobRunner({ db: tdb.db, clock, config: { maxConcurrent: 1, leaseMs: 30_000 } });
-    runner.registerHandler("nightly-stringer", makeNightlyStringerHandler({ db: tdb.db, clock }));
-    const jobId = await runner.enqueue({ type: "nightly-stringer", projectId, payload: { projectId } });
     // finally: a leaked FAKE_STRINGER_STDERR would fake a collector failure in every later test.
+    let jobId: string;
     try {
-      expect(await runner.tickOnce()).toBe(1);
-      await runner.whenIdle();
+      jobId = await runScan();
     } finally {
       delete process.env.FAKE_STRINGER_STDERR;
     }

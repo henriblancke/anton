@@ -17,8 +17,6 @@ import { join } from "node:path";
 import { beads } from "../beads/bd";
 import * as schema from "../db/schema";
 import { getJob, park } from "./queue";
-import { JobRunner } from "./runner";
-import { makeExecuteEpicHandler } from "./execute-epic";
 import { resetOperatorCache } from "../operator";
 import { describeBd } from "@/lib/testing/integration";
 import {
@@ -29,6 +27,11 @@ import {
   fakeClaudeReadingStdin,
   pushFreshBaseCommit,
   createExecuteEpicSandbox,
+  createTicket,
+  makeEpicRunner,
+  enqueueEpicJob,
+  tickToIdle,
+  driveEpicRun,
   type ExecuteEpicSandbox,
 } from "./execute-epic.fixture";
 
@@ -71,16 +74,7 @@ describeBd("execute-epic e2e — base tip & abandon (real handler · real bd/git
       description: "## Goal\nSB",
     });
     await beads.approve(repo, epicSb);
-    const mkSb = (title: string) => {
-      const p = JSON.parse(
-        execFileSync(
-          "bd",
-          ["create", title, "--type", "task", "--parent", epicSb, "--acceptance", "x", "--json"],
-          { cwd: repo, encoding: "utf8" },
-        ),
-      );
-      return (Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string;
-    };
+    const mkSb = (title: string) => createTicket(repo, { title, parent: epicSb });
     const sb1 = mkSb("SB ticket one");
     const sb2 = mkSb("SB ticket two");
 
@@ -101,23 +95,12 @@ e({type:'result',subtype:'success',result:'Partial progress only.\\nANTON-RESULT
 process.exit(0);`),
     );
 
-    const runner = new JobRunner({
-      db: tdb.db,
-      clock,
-      config: { maxConcurrent: 1, leaseMs: 30_000 },
-    });
-    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+    const runner = makeEpicRunner(ctx);
 
     process.env.ANTON_CLAUDE_BIN = blockedClaude;
     let jobId: string;
     try {
-      jobId = await runner.enqueue({
-        type: "execute-epic",
-        projectId,
-        payload: { projectId, epicBeadId: epicSb },
-      });
-      await runner.tickOnce();
-      await runner.whenIdle();
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: epicSb });
 
       // Poison → job parked (no retry burn); the reason names the self-reported block and is
       // recorded on the run row + the parked job's lastError.
@@ -172,16 +155,7 @@ process.exit(0);`),
       description: "## Goal\nFresh",
     });
     await beads.approve(repo, epic6);
-    const t6 = (() => {
-      const p = JSON.parse(
-        execFileSync(
-          "bd",
-          ["create", "Fresh ticket", "--type", "task", "--parent", epic6, "--acceptance", "x", "--json"],
-          { cwd: repo, encoding: "utf8" },
-        ),
-      );
-      return (Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string;
-    })();
+    const t6 = createTicket(repo, { title: "Fresh ticket", parent: epic6 });
 
     // Push a commit to origin/main WITHOUT updating the sandbox repo's local main.
     const freshSha = pushFreshBaseCommit(sandbox, bare, "FRESH_BASE");
@@ -190,20 +164,8 @@ process.exit(0);`),
       execFileSync("git", ["-C", repo, "log", "--oneline", "main"], { encoding: "utf8" }),
     ).not.toContain("FRESH_BASE");
 
-    const runner = new JobRunner({
-      db: tdb.db,
-      clock,
-      config: { maxConcurrent: 1, leaseMs: 30_000 },
-    });
-    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
-
-    const jobId = await runner.enqueue({
-      type: "execute-epic",
-      projectId,
-      payload: { projectId, epicBeadId: epic6 },
-    });
-    await runner.tickOnce();
-    await runner.whenIdle();
+    const runner = makeEpicRunner(ctx);
+    const jobId = await driveEpicRun(runner, { projectId, epicBeadId: epic6 });
     expect((await getJob(tdb.db, jobId))?.status).toBe("done");
     expect((await beads.show(repo, t6)).status).toBe("closed");
 
@@ -234,16 +196,7 @@ process.exit(0);`),
       description: "## Goal\nStable",
     });
     await beads.approve(repo, epic7);
-    const t7 = (() => {
-      const p = JSON.parse(
-        execFileSync(
-          "bd",
-          ["create", "Stable ticket", "--type", "task", "--parent", epic7, "--acceptance", "x", "--json"],
-          { cwd: repo, encoding: "utf8" },
-        ),
-      );
-      return (Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string;
-    })();
+    const t7 = createTicket(repo, { title: "Stable ticket", parent: epic7 });
 
     const resetSec = Math.floor(clock.now() / 1000) + 3600;
     const quotaClaude = writeBin(
@@ -264,24 +217,14 @@ e({type:'result',subtype:'success',result:'done',session_id:'ss',num_turns:1,is_
 process.exit(0);`,
     );
 
-    const runner = new JobRunner({
-      db: tdb.db,
-      clock,
-      config: { maxConcurrent: 1, leaseMs: 30_000, quotaCooloffMs: 60_000 },
-    });
-    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+    const runner = makeEpicRunner(ctx, { quotaCooloffMs: 60_000 });
 
     process.env.ANTON_CLAUDE_BIN = quotaClaude;
     try {
-      const jobId = await runner.enqueue({
-        type: "execute-epic",
-        projectId,
-        payload: { projectId, epicBeadId: epic7 },
-      });
+      const jobId = await enqueueEpicJob(runner, { projectId, epicBeadId: epic7 });
 
       // First tick → usage limit → run parked, worktree created off whatever origin/main was.
-      await runner.tickOnce();
-      await runner.whenIdle();
+      await tickToIdle(runner);
       const run7 = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === epic7)!;
       expect(run7.status).toBe("parked");
       expect(existsSync(run7.worktreePath!)).toBe(true);
@@ -291,8 +234,7 @@ process.exit(0);`,
 
       // Advance past the reset window → resume completes on the SAME worktree.
       clock.set(resetSec * 1000 + 1);
-      await runner.tickOnce();
-      await runner.whenIdle();
+      await tickToIdle(runner);
       expect((await getJob(tdb.db, jobId))?.status).toBe("done");
       expect((await beads.show(repo, t7)).status).toBe("closed");
 
@@ -329,16 +271,7 @@ process.exit(0);`,
       description: "## Goal\nAB",
     });
     await beads.approve(repo, epicAb);
-    const mk = (title: string) => {
-      const p = JSON.parse(
-        execFileSync(
-          "bd",
-          ["create", title, "--type", "task", "--parent", epicAb, "--acceptance", "x", "--json"],
-          { cwd: repo, encoding: "utf8" },
-        ),
-      );
-      return (Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string;
-    };
+    const mk = (title: string) => createTicket(repo, { title, parent: epicAb });
     const keep = mk("Ticket that ships");
     const drop = mk("Ticket the operator killed");
     await beads.abandon(repo, drop, "not worth building");
@@ -355,23 +288,12 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
     const okGh = process.env.ANTON_GH_BIN!;
     process.env.ANTON_GH_BIN = bodyGh;
 
-    const runner = new JobRunner({
-      db: tdb.db,
-      clock,
-      config: { maxConcurrent: 1, leaseMs: 30_000 },
-    });
-    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+    const runner = makeEpicRunner(ctx);
 
     process.env.ANTON_CLAUDE_BIN = successClaude;
     let jobId: string;
     try {
-      jobId = await runner.enqueue({
-        type: "execute-epic",
-        projectId,
-        payload: { projectId, epicBeadId: epicAb },
-      });
-      await runner.tickOnce();
-      await runner.whenIdle();
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: epicAb });
 
       expect((await getJob(tdb.db, jobId))?.status).toBe("done");
 
@@ -416,14 +338,7 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
       description: "## Goal\nKILL",
     });
     await beads.approve(repo, epicKill);
-    const p = JSON.parse(
-      execFileSync(
-        "bd",
-        ["create", "Long-running ticket", "--type", "task", "--parent", epicKill, "--acceptance", "x", "--json"],
-        { cwd: repo, encoding: "utf8" },
-      ),
-    );
-    const tk = ((Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string);
+    const tk = createTicket(repo, { title: "Long-running ticket", parent: epicKill });
 
     // A claude that announces it started, then hangs until it is killed.
     const startedMarker = join(sandbox, "abandon-started");
@@ -437,20 +352,11 @@ fs.writeFileSync(${JSON.stringify(startedMarker)},'1');
 setTimeout(()=>process.exit(0),60000);`,
     );
 
-    const runner = new JobRunner({
-      db: tdb.db,
-      clock,
-      config: { maxConcurrent: 1, leaseMs: 60_000 },
-    });
-    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+    const runner = makeEpicRunner(ctx, { leaseMs: 60_000 });
 
     process.env.ANTON_CLAUDE_BIN = slowClaude;
     try {
-      const jobId = await runner.enqueue({
-        type: "execute-epic",
-        projectId,
-        payload: { projectId, epicBeadId: epicKill },
-      });
+      const jobId = await enqueueEpicJob(runner, { projectId, epicBeadId: epicKill });
       void runner.tickOnce();
       // Wait for the agent to actually be in flight — abandoning before dispatch would prove nothing.
       const deadline = Date.now() + 40_000;

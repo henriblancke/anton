@@ -10,14 +10,11 @@
  * files (anton-0oi).
  */
 import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
-import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { beads } from "../beads/bd";
 import * as schema from "../db/schema";
 import { getJob } from "./queue";
-import { JobRunner } from "./runner";
-import { makeExecuteEpicHandler } from "./execute-epic";
 import { resetOperatorCache } from "../operator";
 import { describeBd } from "@/lib/testing/integration";
 import {
@@ -27,6 +24,11 @@ import {
   writeBin,
   fakeClaudeReadingStdin,
   createExecuteEpicSandbox,
+  createTicket,
+  makeEpicRunner,
+  enqueueEpicJob,
+  tickToIdle,
+  driveEpicRun,
   type ExecuteEpicSandbox,
 } from "./execute-epic.fixture";
 
@@ -70,22 +72,11 @@ describeBd("execute-epic e2e — recovery & readiness (real handler · real bd/g
     });
     await beads.approve(repo, bugId);
 
-    const runner = new JobRunner({
-      db: tdb.db,
-      clock,
-      config: { maxConcurrent: 1, leaseMs: 30_000 },
-    });
-    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+    const runner = makeEpicRunner(ctx);
 
     // Attempt 1: a normal run carries the bug to in-review (PR opened at gh-42, PR ref stamped to metadata.pr).
     process.env.ANTON_CLAUDE_BIN = successClaude;
-    const job1 = await runner.enqueue({
-      type: "execute-epic",
-      projectId,
-      payload: { projectId, epicBeadId: bugId },
-    });
-    await runner.tickOnce();
-    await runner.whenIdle();
+    const job1 = await driveEpicRun(runner, { projectId, epicBeadId: bugId });
     expect((await getJob(tdb.db, job1))?.status).toBe("done");
     expect(beads.getPrRef(await beads.show(repo, bugId))).toBe("gh-42");
     const sessionsAfter1 = (await tdb.db.select().from(schema.sessions)).filter(
@@ -107,13 +98,7 @@ process.exit(0);`,
     const okGh = process.env.ANTON_GH_BIN!;
     process.env.ANTON_GH_BIN = recoverGh;
     try {
-      const job2 = await runner.enqueue({
-        type: "execute-epic",
-        projectId,
-        payload: { projectId, epicBeadId: bugId },
-      });
-      await runner.tickOnce();
-      await runner.whenIdle();
+      const job2 = await driveEpicRun(runner, { projectId, epicBeadId: bugId });
 
       // The recovery run did NOT short-circuit: it re-opened the PR (PR ref advanced to gh-99)
       // and finished done, rather than reporting a false completion on the dead gh-42.
@@ -143,21 +128,10 @@ process.exit(0);`,
     await beads.link(repo, dependent, blocker, "blocks");
     await beads.approve(repo, dependent);
 
-    const runner = new JobRunner({
-      db: tdb.db,
-      clock,
-      config: { maxConcurrent: 1, leaseMs: 30_000 },
-    });
-    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+    const runner = makeEpicRunner(ctx);
 
     process.env.ANTON_CLAUDE_BIN = successClaude;
-    const jobId = await runner.enqueue({
-      type: "execute-epic",
-      projectId,
-      payload: { projectId, epicBeadId: dependent },
-    });
-    await runner.tickOnce();
-    await runner.whenIdle();
+    const jobId = await driveEpicRun(runner, { projectId, epicBeadId: dependent });
 
     // Poison-parked (blocked target refused), and the bead was never touched (not claimed/closed).
     expect((await getJob(tdb.db, jobId))?.status).toBe("parked");
@@ -169,31 +143,13 @@ process.exit(0);`,
   it("poison-parks a bead that was found but isn't runnable, with an honest (not 'not found') reason", async () => {
     // anton-cmz.1 AC3: a genuinely non-runnable target (here a non-work `chore` type) must poison
     // with a message that names WHY — the bead WAS found — instead of pretending it doesn't exist.
-    const created = JSON.parse(
-      execFileSync(
-        "bd",
-        ["create", "Not a run target", "--type", "chore", "--acceptance", "x", "--json"],
-        { cwd: repo, encoding: "utf8" },
-      ),
-    );
-    const choreId = (Array.isArray(created) ? created[0] : (created.issue ?? created)).id as string;
+    const choreId = createTicket(repo, { title: "Not a run target", type: "chore" });
     await beads.approve(repo, choreId);
 
-    const runner = new JobRunner({
-      db: tdb.db,
-      clock,
-      config: { maxConcurrent: 1, leaseMs: 30_000 },
-    });
-    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+    const runner = makeEpicRunner(ctx);
 
     process.env.ANTON_CLAUDE_BIN = successClaude;
-    const jobId = await runner.enqueue({
-      type: "execute-epic",
-      projectId,
-      payload: { projectId, epicBeadId: choreId },
-    });
-    await runner.tickOnce();
-    await runner.whenIdle();
+    const jobId = await driveEpicRun(runner, { projectId, epicBeadId: choreId });
 
     // Poison → job parked; the reason names the bead and the type, not "not found".
     const job = await getJob(tdb.db, jobId);
@@ -225,21 +181,10 @@ process.exit(0);`,
     await beads.link(repo, featureId, containerId, "parent-child");
     await beads.approve(repo, containerId);
 
-    const runner = new JobRunner({
-      db: tdb.db,
-      clock,
-      config: { maxConcurrent: 1, leaseMs: 30_000 },
-    });
-    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+    const runner = makeEpicRunner(ctx);
 
     process.env.ANTON_CLAUDE_BIN = successClaude;
-    const jobId = await runner.enqueue({
-      type: "execute-epic",
-      projectId,
-      payload: { projectId, epicBeadId: containerId },
-    });
-    await runner.tickOnce();
-    await runner.whenIdle();
+    const jobId = await driveEpicRun(runner, { projectId, epicBeadId: containerId });
 
     const job = await getJob(tdb.db, jobId);
     expect(job?.status).toBe("parked");
@@ -271,21 +216,10 @@ process.exit(0);`,
     await beads.link(repo, featureId, containerId, "parent-child");
     await beads.approve(repo, featureId);
 
-    const runner = new JobRunner({
-      db: tdb.db,
-      clock,
-      config: { maxConcurrent: 1, leaseMs: 30_000 },
-    });
-    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+    const runner = makeEpicRunner(ctx);
 
     process.env.ANTON_CLAUDE_BIN = successClaude;
-    const jobId = await runner.enqueue({
-      type: "execute-epic",
-      projectId,
-      payload: { projectId, epicBeadId: featureId },
-    });
-    await runner.tickOnce();
-    await runner.whenIdle();
+    const jobId = await driveEpicRun(runner, { projectId, epicBeadId: featureId });
 
     expect((await getJob(tdb.db, jobId))?.status).toBe("done");
     const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === featureId)!;
@@ -317,21 +251,10 @@ process.exit(0);`,
     }
     await beads.approve(repo, featureId);
 
-    const runner = new JobRunner({
-      db: tdb.db,
-      clock,
-      config: { maxConcurrent: 1, leaseMs: 30_000 },
-    });
-    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+    const runner = makeEpicRunner(ctx);
 
     process.env.ANTON_CLAUDE_BIN = successClaude;
-    const jobId = await runner.enqueue({
-      type: "execute-epic",
-      projectId,
-      payload: { projectId, epicBeadId: featureId },
-    });
-    await runner.tickOnce();
-    await runner.whenIdle();
+    const jobId = await driveEpicRun(runner, { projectId, epicBeadId: featureId });
 
     expect((await getJob(tdb.db, jobId))?.status).toBe("done");
     // Both children were dispatched and closed; the feature itself is in-review on one PR.
@@ -383,21 +306,10 @@ process.exit(0);`,
     });
 
     try {
-      const runner = new JobRunner({
-        db: tdb.db,
-        clock,
-        config: { maxConcurrent: 1, leaseMs: 30_000 },
-      });
-      runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+      const runner = makeEpicRunner(ctx);
 
       process.env.ANTON_CLAUDE_BIN = successClaude;
-      const jobId = await runner.enqueue({
-        type: "execute-epic",
-        projectId,
-        payload: { projectId, epicBeadId: epicId },
-      });
-      await runner.tickOnce();
-      await runner.whenIdle();
+      const jobId = await driveEpicRun(runner, { projectId, epicBeadId: epicId });
 
       const job = await getJob(tdb.db, jobId);
       expect(job?.status).toBe("parked");
@@ -440,21 +352,10 @@ process.exit(0);`,
     });
 
     try {
-      const runner = new JobRunner({
-        db: tdb.db,
-        clock,
-        config: { maxConcurrent: 1, leaseMs: 30_000 },
-      });
-      runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+      const runner = makeEpicRunner(ctx);
 
       process.env.ANTON_CLAUDE_BIN = successClaude;
-      const jobId = await runner.enqueue({
-        type: "execute-epic",
-        projectId,
-        payload: { projectId, epicBeadId: featureId },
-      });
-      await runner.tickOnce();
-      await runner.whenIdle();
+      const jobId = await driveEpicRun(runner, { projectId, epicBeadId: featureId });
 
       expect((await getJob(tdb.db, jobId))?.status).toBe("done");
       // The late ticket was the unit of work — dispatched and closed; the feature stayed the
@@ -481,16 +382,7 @@ process.exit(0);`,
       description: "## Goal\nZ",
     });
     await beads.approve(repo, epic3);
-    const mkTicket = (title: string) => {
-      const p = JSON.parse(
-        execFileSync(
-          "bd",
-          ["create", title, "--type", "task", "--parent", epic3, "--acceptance", "x", "--json"],
-          { cwd: repo, encoding: "utf8" },
-        ),
-      );
-      return (Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string;
-    };
+    const mkTicket = (title: string) => createTicket(repo, { title, parent: epic3 });
     const ta = mkTicket("Ticket A");
     const tb = mkTicket("Ticket B");
 
@@ -517,25 +409,15 @@ e({type:'result',subtype:'success',result:'done',session_id:'s3',num_turns:1,is_
 process.exit(0);`),
     );
 
-    const runner = new JobRunner({
-      db: tdb.db,
-      clock,
-      config: { maxConcurrent: 1, leaseMs: 30_000, quotaCooloffMs: 60_000 },
-    });
-    runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db: tdb.db, clock }));
+    const runner = makeEpicRunner(ctx, { quotaCooloffMs: 60_000 });
 
     process.env.ANTON_CLAUDE_BIN = countingClaude;
     try {
-      const jobId = await runner.enqueue({
-        type: "execute-epic",
-        projectId,
-        payload: { projectId, epicBeadId: epic3 },
-      });
+      const jobId = await enqueueEpicJob(runner, { projectId, epicBeadId: epic3 });
 
       // First tick: one ticket succeeds + closes, the next hits the usage limit → job rescheduled
       // (quota attempt refunded), run parked, worktree kept.
-      await runner.tickOnce();
-      await runner.whenIdle();
+      await tickToIdle(runner);
       let job = await getJob(tdb.db, jobId);
       expect(job?.status).toBe("queued");
       expect(job?.attempts).toBe(0);
@@ -563,8 +445,7 @@ process.exit(0);`),
 
       // Advance past the reset window → resumes on the SAME run/worktree and completes.
       clock.set(resetSec * 1000 + 1);
-      await runner.tickOnce();
-      await runner.whenIdle();
+      await tickToIdle(runner);
 
       job = await getJob(tdb.db, jobId);
       expect(job?.status).toBe("done");

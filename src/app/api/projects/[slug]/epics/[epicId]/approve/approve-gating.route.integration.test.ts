@@ -10,14 +10,13 @@
  */
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
-import { jsonRequest } from "@/lib/testing/integration";
-import { actAs, ctx, executeEpicJobs, setupApproveSuite, type ApproveSuiteCtx } from "../approve.fixture";
+import { actAs, executeEpicJobs, setupApproveSuite, type ApproveSuiteCtx } from "../approve.fixture";
 import { describeBd } from "@/lib/testing/integration";
 
 let fileDb: ApproveSuiteCtx["fileDb"];
 let bdRepo: ApproveSuiteCtx["bdRepo"];
 let repo: string;
-let POST: ApproveSuiteCtx["POST"];
+let approve: ApproveSuiteCtx["approve"];
 let beads: ApproveSuiteCtx["beads"];
 let resetOperatorCache: ApproveSuiteCtx["resetOperatorCache"];
 
@@ -30,8 +29,18 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
 
   beforeAll(async () => {
     const s = await setupApproveSuite();
-    ({ fileDb, bdRepo, repo, POST, beads, resetOperatorCache, blocked, ready, readyChild, externalBlockerChild } =
-      s);
+    ({
+      fileDb,
+      bdRepo,
+      repo,
+      approve,
+      beads,
+      resetOperatorCache,
+      blocked,
+      ready,
+      readyChild,
+      externalBlockerChild,
+    } = s);
   });
 
   afterAll(() => {
@@ -42,7 +51,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
   });
 
   it("409s a blocked epic without approving it", async () => {
-    const res = await POST(jsonRequest("POST"), ctx("approvy", blocked));
+    const res = await approve(blocked);
     expect(res.status).toBe(409);
     expect((await res.json()).error).toMatch(/blocked by/i);
 
@@ -63,7 +72,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
       stdio: "ignore",
     });
 
-    const res = await POST(jsonRequest("POST"), ctx("approvy", ready));
+    const res = await approve(ready);
     expect(res.status).toBe(409);
     expect((await res.json()).error).toMatch(/blocked by/i);
 
@@ -74,7 +83,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
   it("enqueues a standalone bug and applies the approved label", async () => {
     // A parentless bug is a run target (epic-of-one) — approval must label + enqueue it, not reject.
     const bug = await beads.create(repo, { title: "Loose bug", type: "bug" });
-    const res = await POST(jsonRequest("POST"), ctx("approvy", bug));
+    const res = await approve(bug);
     expect(res.status).toBe(200);
     expect((await res.json()).jobId).toBeTruthy();
     expect(beads.isApproved(await beads.show(repo, bug))).toBe(true);
@@ -87,8 +96,8 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     const bodyless = await beads.create(repo, { title: "Bodyless-immediate bug", type: "bug" });
     const paced = await beads.create(repo, { title: "Opt-in paced bug", type: "bug" });
 
-    expect((await POST(jsonRequest("POST"), ctx("approvy", bodyless))).status).toBe(200);
-    expect((await POST(jsonRequest("POST", { immediate: false }), ctx("approvy", paced))).status).toBe(200);
+    expect((await approve(bodyless)).status).toBe(200);
+    expect((await approve(paced, { immediate: false })).status).toBe(200);
 
     const payloadOf = async (id: string) => {
       const jobs = await executeEpicJobs(id);
@@ -112,7 +121,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     const { allIssues } = await import("@/lib/beads/issues");
     await allIssues(repo);
 
-    const res = await POST(jsonRequest("POST"), ctx("approvy", bug));
+    const res = await approve(bug);
     expect(res.status).toBe(200);
     const { item } = await res.json();
     expect(item.approved).toBe(true);
@@ -127,7 +136,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     const dependent = await beads.create(repo, { title: "Standalone dependent", type: "task" });
     await beads.link(repo, dependent, blocker, "blocks");
 
-    const res = await POST(jsonRequest("POST"), ctx("approvy", dependent));
+    const res = await approve(dependent);
     expect(res.status).toBe(409);
     const body = await res.json();
     expect(body.error).toMatch(/blocked by/i);
@@ -142,7 +151,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     await beads.link(repo, dependent, blocker, "blocks");
     await beads.close(repo, blocker);
 
-    const res = await POST(jsonRequest("POST"), ctx("approvy", dependent));
+    const res = await approve(dependent);
     expect(res.status).toBe(200);
     expect(beads.isApproved(await beads.show(repo, dependent))).toBe(true);
   });
@@ -151,7 +160,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     const epic = await beads.create(repo, { title: "Free epic", type: "epic" });
     const child = await beads.create(repo, { title: "Free epic child", type: "task" });
     await beads.link(repo, child, epic, "parent-child");
-    const res = await POST(jsonRequest("POST"), ctx("approvy", epic));
+    const res = await approve(epic);
     expect(res.status).toBe(200);
     expect(beads.isApproved(await beads.show(repo, epic))).toBe(true);
   });
@@ -161,7 +170,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     const parentEpic = await beads.create(repo, { title: "Parent epic", type: "epic" });
     const child = await beads.create(repo, { title: "Child ticket", type: "task" });
     await beads.link(repo, child, parentEpic, "parent-child");
-    const res = await POST(jsonRequest("POST"), ctx("approvy", child));
+    const res = await approve(child);
     expect(res.status).toBe(422);
     const body = await res.json();
     expect(body.error).toMatch(/child ticket/i);
@@ -172,7 +181,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
   it("enqueues a feature and applies the approved label", async () => {
     // anton-s67y: a feature is THE run target — one worktree, one PR. Approval must label + enqueue.
     const feature = await beads.create(repo, { title: "Shippable feature", type: "feature" });
-    const res = await POST(jsonRequest("POST"), ctx("approvy", feature));
+    const res = await approve(feature);
     expect(res.status).toBe(200);
     expect((await res.json()).jobId).toBeTruthy();
     expect(beads.isApproved(await beads.show(repo, feature))).toBe(true);
@@ -185,7 +194,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     const feature = await beads.create(repo, { title: "Feature under it", type: "feature" });
     await beads.link(repo, feature, container, "parent-child");
 
-    const res = await POST(jsonRequest("POST"), ctx("approvy", container));
+    const res = await approve(container);
     expect(res.status).toBe(422);
     const body = await res.json();
     expect(body.error).toMatch(/container/i);
@@ -198,7 +207,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     const child = await beads.create(repo, { title: "Legacy child", type: "task" });
     await beads.link(repo, child, legacy, "parent-child");
 
-    const res = await POST(jsonRequest("POST"), ctx("approvy", legacy));
+    const res = await approve(legacy);
     expect(res.status).toBe(200);
     expect(beads.isApproved(await beads.show(repo, legacy))).toBe(true);
   });
@@ -210,20 +219,20 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
       encoding: "utf8",
     });
     const molecule = JSON.parse(out).id as string;
-    const res = await POST(jsonRequest("POST"), ctx("approvy", molecule));
+    const res = await approve(molecule);
     expect(res.status).toBe(422);
     expect((await res.json()).error).toMatch(/not runnable/i);
     expect(beads.isApproved(await beads.show(repo, molecule))).toBe(false);
   });
 
   it("404s an unknown bead id without approving anything", async () => {
-    const res = await POST(jsonRequest("POST"), ctx("approvy", "approvy-nope"));
+    const res = await approve("approvy-nope");
     expect(res.status).toBe(404);
     expect((await res.json()).error).toMatch(/not found/i);
   });
 
   it("404s with {error} for an unknown slug", async () => {
-    const res = await POST(jsonRequest("POST"), ctx("nope", blocked));
+    const res = await approve(blocked, undefined, "nope");
     expect(res.status).toBe(404);
     expect((await res.json()).error).toMatch(/not found/i);
   });
@@ -255,7 +264,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
       return realTag(cwd, id, labels);
     });
     try {
-      const res = await POST(jsonRequest("POST"), ctx("approvy", epic));
+      const res = await approve(epic);
       expect(res.status).toBe(200);
       expect(readsAtWrite).toBeLessThanOrEqual(2);
       expect(listSpy).toHaveBeenCalledTimes(1); // the readiness gate; the board build reuses it
@@ -284,7 +293,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     const syncSpy = vi.spyOn(beads, "sync").mockResolvedValue(undefined);
     const listSpy = vi.spyOn(beads, "list");
     try {
-      const res = await POST(jsonRequest("POST"), ctx("approvy", epic));
+      const res = await approve(epic);
       expect(res.status).toBe(200);
       const { item } = await res.json();
       expect(item.approved).toBe(true);
