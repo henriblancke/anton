@@ -593,6 +593,26 @@ describe("validateBeadContract — the formula's unfilled prompts", () => {
     expect(validateBeadContract(written)).toEqual([]);
   });
 
+  it("blocks a prompt written as an ordered list item, `.` or `)`", () => {
+    // EMPTY_LIST_ITEM always accepted ordered markers; PROMPT_LINE did not, so `1. TODO — …`
+    // passed the gate that refused the identical `- TODO — …`.
+    for (const marker of ["1.", "1)", "12."]) {
+      const numbered = ticket({
+        acceptance_criteria: undefined,
+        description: `${DESCRIPTION}\n\n## Acceptance\n${marker} TODO — add a checkable criterion`,
+      });
+      expect(summarize(numbered)).toEqual([["Acceptance", "blocking"]]);
+    }
+  });
+
+  it("does not mistake an authored ordered criterion for a prompt", () => {
+    const numbered = ticket({
+      acceptance_criteria: undefined,
+      description: `${DESCRIPTION}\n\n## Acceptance\n1. the export button ships`,
+    });
+    expect(validateBeadContract(numbered)).toEqual([]);
+  });
+
   it("blocks a prompt styled as a blockquote callout — the marker is not content", () => {
     // A project-local formula may style its placeholders as callouts. The `>` prefix defeated
     // PROMPT_LINE, so the section read as authored and the run started with no rubric at all.

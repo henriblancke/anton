@@ -234,21 +234,28 @@ function preambleOf(description: string): string {
   return lines.join("\n").trim();
 }
 
+/** A list marker — a bullet or an ordered item (`-`, `*`, `+`, `1.`, `1)`), as CommonMark counts
+ * them. Shared by the two scaffolding judges below so an ordered placeholder reads exactly like the
+ * bulleted one: {@link EMPTY_LIST_ITEM} already accepted both, and {@link PROMPT_LINE} not doing so
+ * let `1. TODO — …` pass the blocking gate that `- TODO — …` was refused by. */
+const LIST_MARKER = /(?:[-*+]|\d{1,9}[.)])/;
+
 /**
  * Every variable default in `anton-bead.formula.json` is a PROMPT, not content — "- [ ] TODO — a
  * concrete, checkable statement of done". A bead cooked from the formula and never authored
  * therefore carries all five headings and none of the spec, and reading it as conformant would let
  * a run start against a placeholder rubric: exactly the false green the gate exists to prevent.
  *
- * Matched after the list scaffolding (`- `, `* `, `- [ ] `) so the checkbox form reads the same as
- * the bare one, and anchored on the separator that follows `TODO` so an authored line merely
- * mentioning one ("- [ ] the TODO banner clears") is not mistaken for a prompt.
+ * Matched after the list scaffolding ({@link LIST_MARKER}, with or without a checkbox) so every
+ * shape a placeholder is written in reads the same, and anchored on the separator that follows
+ * `TODO` so an authored line merely mentioning one ("- [ ] the TODO banner clears") is not mistaken
+ * for a prompt.
  */
-const PROMPT_LINE = /^(?:[-*+]\s+)?(?:\[[ xX]?\][ \t]*)?TODO\s*[—–:-]/;
+const PROMPT_LINE = new RegExp(`^(?:${LIST_MARKER.source}\\s+)?(?:\\[[ xX]?\\][ \t]*)?TODO\\s*[—–:-]`);
 
 /** A list or task-list marker with nothing after it — `-`, `1.`, `- [ ]`. Scaffolding, not spec:
  * a section holding only such markers states no definition of done ({@link stateOf}). */
-const EMPTY_LIST_ITEM = /^(?:[-*+]|\d{1,9}[.)])(?:[ \t]+\[[ xX]?\])?[ \t]*$/;
+const EMPTY_LIST_ITEM = new RegExp(`^${LIST_MARKER.source}(?:[ \t]+\\[[ xX]?\\])?[ \t]*$`);
 
 /** A thematic break — 3+ `-`/`*`/`_` of one kind, spaces between allowed (CommonMark). It renders
  * as a rule, not text, so a section holding only `---` says nothing ({@link stateOf}). */
