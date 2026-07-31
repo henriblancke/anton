@@ -12,10 +12,11 @@
  */
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { beads } from "../beads/bd";
+import { worktreePathFor } from "../git/worktree";
 import * as schema from "../db/schema";
 import { getJob, park } from "./queue";
 import { resetOperatorCache } from "../operator";
@@ -121,6 +122,8 @@ const kind=isReview?'review':isFix?'fix':'implement';
 fs.appendFileSync(process.env.ANTON_TEST_REVIEW_DISPATCHES,kind+'\\n');
 let text='done';
 if(isReview){
+  // A reviewer that edits the code it is judging — the read-only guard's target case.
+  if(process.env.ANTON_TEST_REVIEW_MUTATES){fs.writeFileSync(path.join(process.cwd(),'REVIEWER_EDIT.md'),'the reviewer fixed it itself\\n');}
   const reports=JSON.parse(fs.readFileSync(process.env.ANTON_TEST_REVIEW_REPORTS,'utf8'));
   let n=0;try{n=parseInt(fs.readFileSync(process.env.ANTON_TEST_REVIEW_COUNTER,'utf8'),10)||0;}catch(e){}
   fs.writeFileSync(process.env.ANTON_TEST_REVIEW_COUNTER,String(n+1));
@@ -317,8 +320,12 @@ console.error('gh boom: no PR may be opened for an unresolved review');process.e
       const job = await getJob(tdb.db, jobId);
       expect(job?.status).toBe("parked");
       expect(job?.lastError).toMatch(/self-review/i);
+      // The RUN row says parked too, with no end time: this is a run waiting on the founder to
+      // resolve the findings and resume it, not one that crashed.
       const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === targetId)!;
-      expect(run.status).toBe("failed");
+      expect(run.status).toBe("parked");
+      expect(run.endedAt ?? null).toBeNull();
+      expect(run.error).toMatch(/did not pass its pre-PR self-review/);
 
       // The cap bounded the loop: two reviews, one fix in between — not an endless grind.
       expect(dispatches()).toEqual(["implement", "review", "fix", "review"]);
@@ -367,6 +374,53 @@ console.error('gh boom: no PR may be opened on an unreported review');process.ex
       expect(scoreComments(targetId)).toMatchObject([{ round: 1, verdict: "protocol-violation" }]);
       expect((target.labels ?? []).some((l) => l.startsWith("review-score:"))).toBe(false);
     } finally {
+      process.env.ANTON_GH_BIN = okGh;
+      if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  });
+
+  it("reverts a reviewer that edits the worktree and parks instead of trusting its verdict", async () => {
+    // A swapped, implementation-minded reviewer that repairs what it finds and then reports clean
+    // would ship a 9/10 PR whose branch never carried the repair. Its edit is undone and its review
+    // discarded — `gh` booms so a fall-through to the PR step is loud.
+    await setReviewEnabled(true);
+    script({ score: 9, rationale: "I fixed it while I was in there", findings: [] });
+    const targetId = await approvedTarget("Editing reviewer run");
+
+    const boomGh = writeBin(
+      binDir,
+      "gh-boom-editing",
+      `const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='view'){process.exit(1);}
+console.error('gh boom: no PR may be opened on a review that edited the code');process.exit(1);`,
+    );
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = boomGh;
+    process.env.ANTON_TEST_REVIEW_MUTATES = "1";
+
+    const runner = makeEpicRunner(ctx);
+    let jobId: string;
+    try {
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
+
+      expect((await getJob(tdb.db, jobId))?.status).toBe("parked");
+      // One review, no fix round: an untrusted review is never dispatched for repair.
+      expect(dispatches()).toEqual(["implement", "review"]);
+
+      // The reviewer's edit is gone from the worktree, and its branch tip carries only the run's work.
+      const worktree = worktreePathFor(repo, `anton/${targetId}`);
+      expect(existsSync(join(worktree, "REVIEWER_EDIT.md"))).toBe(false);
+      expect(
+        execFileSync("git", ["-C", worktree, "status", "--porcelain"], { encoding: "utf8" }).trim(),
+      ).toBe("");
+
+      const target = await beads.show(repo, targetId);
+      expect(beads.getPrRef(target) ?? null).toBeNull();
+      expect(target.notes ?? "").toMatch(/EDITED the worktree/);
+      expect(scoreComments(targetId)).toMatchObject([{ round: 1, verdict: "protocol-violation" }]);
+      expect((target.labels ?? []).some((l) => l.startsWith("review-score:"))).toBe(false);
+    } finally {
+      delete process.env.ANTON_TEST_REVIEW_MUTATES;
       process.env.ANTON_GH_BIN = okGh;
       if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
     }

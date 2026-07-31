@@ -47,7 +47,7 @@ import {
 } from "../sessions";
 import { buildPrTitle } from "./pr-title";
 import type { ReviewFinding } from "./review-context";
-import { blockingFindings, runReviewGate, type ReviewGateResult } from "./review-gate";
+import { blockingFindings, finalViolation, runReviewGate, type ReviewGateResult } from "./review-gate";
 import { persistReviewScores } from "./review-score";
 import {
   isRecoverableClaudeError,
@@ -935,18 +935,15 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
 
         const blocking = blockingFindings(review.unresolved);
         // Two states must not become a PR: blocking findings the converge loop couldn't clear, and a
-        // reviewer that never spoke the report protocol (silence is not a clean review). Both park
-        // for the founder like a no-delivery ticket does, with the reason on the bead so the board
-        // shows why rather than only the run log.
+        // reviewer that broke the report protocol (silence — or a review that edited the code it was
+        // judging — is not a clean review). Both park for the founder like a no-delivery ticket does,
+        // with the reason on the bead so the board shows why rather than only the run log.
         if (blocking.length > 0 || review.outcome === "protocol-violation") {
           await safe(() => beads.note(repo, epicBeadId, reviewParkNote(review, blocking)));
           throw new ReviewBlockedError(
             `${epicBeadId} did not pass its pre-PR self-review (${review.outcome}): ` +
-              (blocking.length > 0
-                ? `${blocking.length} blocking finding(s) survived the gate`
-                : `the reviewer never reported a valid score`) +
-              `. No PR opened — the findings are on the bead; resolve them (or fix the ticket) and ` +
-              `resume the run.`,
+              `${reviewFailureReason(review, blocking)}. No PR opened — the findings are on the ` +
+              `bead; resolve them (or fix the ticket) and resume the run.`,
           );
         }
         // Advisory findings never park (anton-3apm): they ride along in the PR body so the founder
@@ -981,12 +978,18 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       await updateRun(db, clock, runId, { status: "done", endedAt: clock.now(), error: null });
       await safe(() => removeWorktree(worktree));
     } catch (e) {
-      // Quota or a run already live on another machine (anton-jz1) → park the run (the job
-      // reschedules and re-checks liveness); anything else → the run failed (job retries/parks).
+      // Quota, a run already live on another machine (anton-jz1), or a self-review that refused the
+      // PR → park the run (the job reschedules, re-checks liveness, or waits for the founder);
+      // anything else → the run failed (job retries/parks).
       if (isUsageLimitError(e)) {
         await updateRun(db, clock, runId, { status: "parked", error: "usage-limit" });
       } else if (isRunAlreadyLiveError(e)) {
         await updateRun(db, clock, runId, { status: "parked", error: "run-live-elsewhere" });
+      } else if (e instanceof ReviewBlockedError) {
+        // Parked, not failed, and with no endedAt: the run is waiting on a human to resolve the
+        // findings and resume it — the run history must not read like a crash. Resuming reuses THIS
+        // row (findOpenRunForEpic), so the resumed attempt continues in the same worktree/branch.
+        await updateRun(db, clock, runId, { status: "parked", error: e.message });
       } else {
         await updateRun(db, clock, runId, {
           status: "failed",
@@ -1422,6 +1425,17 @@ class ReviewBlockedError extends Error {
   }
 }
 
+/**
+ * Why the gate refused the PR, in one clause — shared by the park note and the thrown error so the
+ * bead and the run log say the same thing.
+ */
+function reviewFailureReason(review: ReviewGateResult, blocking: ReviewFinding[]): string {
+  if (blocking.length > 0) return `${blocking.length} blocking finding(s) survived the gate`;
+  return finalViolation(review) === "worktree-modified"
+    ? `the reviewer modified the worktree it was judging`
+    : `the reviewer never reported a valid score`;
+}
+
 /** The park reason on the target bead: what the reviewer refused to pass, in its own words. */
 function reviewParkNote(review: ReviewGateResult, blocking: ReviewFinding[]): string {
   const rounds = review.rounds.length;
@@ -1429,8 +1443,12 @@ function reviewParkNote(review: ReviewGateResult, blocking: ReviewFinding[]): st
     blocking.length > 0
       ? `anton: the pre-PR self-review left ${blocking.length} blocking finding(s) unresolved after ` +
         `${rounds} round(s) (${review.outcome}) — no PR was opened:`
-      : `anton: the pre-PR self-review never reported a valid score after ${rounds} round(s) ` +
-        `(${review.outcome}) — no PR was opened, because silence is not a clean review.`;
+      : finalViolation(review) === "worktree-modified"
+        ? `anton: the pre-PR self-review EDITED the worktree it was judging after ${rounds} round(s) ` +
+          `— its changes were reverted and its verdict discarded, because a reviewer that fixes the ` +
+          `code cannot vouch for it. No PR was opened; check which reviewer this project is using.`
+        : `anton: the pre-PR self-review never reported a valid score after ${rounds} round(s) ` +
+          `(${review.outcome}) — no PR was opened, because silence is not a clean review.`;
   return [
     head,
     ...findingLines(blocking),

@@ -14,7 +14,14 @@
  */
 import { type Bead } from "../beads/bd";
 import { runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
-import { commitAll, diffAgainstBase, type BranchDiff } from "../git/ops";
+import {
+  commitAll,
+  diffAgainstBase,
+  readWorktreeState,
+  restoreWorktreeState,
+  type BranchDiff,
+  type WorktreeState,
+} from "../git/ops";
 import { resolveReviewConfig, resolveVerifyGates, type ProjectSettings } from "../projects";
 import { appendSessionLog, endSession, startJobSession } from "../sessions";
 import { PoisonError } from "./errors";
@@ -85,6 +92,10 @@ export interface ReviewGateDeps {
   runClaude?: (options: RunClaudeOptions) => Promise<ClaudeResult>;
   diff?: (worktreePath: string, base: string) => Promise<BranchDiff>;
   commit?: (worktreePath: string, message: string) => Promise<{ committed: boolean }>;
+  /** Fingerprint the worktree around a review — the read-only guard's before/after. */
+  readState?: (worktreePath: string) => Promise<WorktreeState>;
+  /** Undo whatever a review wrote, back to the fingerprint taken before it ran. */
+  restoreState?: (worktreePath: string, state: WorktreeState) => Promise<void>;
 }
 
 /** The slice of the runner's JobContext the gate needs — narrow, so tests can fake it in two lines. */
@@ -114,6 +125,11 @@ export function blockingFindings(findings: ReviewFinding[]): ReviewFinding[] {
   return findings.filter((f) => f.severity === "blocking");
 }
 
+/** How the last round broke the protocol, when it did — what the call-site's park reason reads. */
+export function finalViolation(result: ReviewGateResult): ReviewProtocolViolation | undefined {
+  return result.rounds[result.rounds.length - 1]?.violation;
+}
+
 /**
  * Review → fix → re-review until the reviewer reports nothing blocking or the round cap is reached.
  *
@@ -130,6 +146,8 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
   const claude = args.deps?.runClaude ?? runClaude;
   const readDiff = args.deps?.diff ?? diffAgainstBase;
   const commit = args.deps?.commit ?? commitAll;
+  const readState = args.deps?.readState ?? readWorktreeState;
+  const restoreState = args.deps?.restoreState ?? restoreWorktreeState;
 
   const rounds: ReviewRound[] = [];
   let reviewer: ReviewerSource = { kind: "default" };
@@ -152,6 +170,8 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       round,
       maxRounds: config.maxRounds,
       claude,
+      readState,
+      restoreState,
     });
     reviewer = review.reviewer;
 
@@ -215,6 +235,13 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
  * the reasoning contract and the run context, nothing the implementer was told) plus the parsed
  * report. The session is recorded before the dispatch and closed either way, so a mid-review failure
  * leaves a `failed` session rather than a stuck `running` one.
+ *
+ * The review is READ-ONLY, and enforced rather than merely asked for: the worktree is fingerprinted
+ * around the dispatch, and a reviewer that wrote anything has its changes reverted and its report
+ * rejected. A reviewer runs unattended with the same permissions as the implementer — nothing but
+ * this stops a swapped, implementation-minded agent from silently repairing what it is grading and
+ * then passing it. Its fix would be thrown away (the branch anton pushes is the reviewed HEAD) or,
+ * worse, ride along uninspected in the next fix session's commit.
  */
 async function runReviewSession(args: {
   db: AntonDb;
@@ -230,6 +257,8 @@ async function runReviewSession(args: {
   round: number;
   maxRounds: number;
   claude: (options: RunClaudeOptions) => Promise<ClaudeResult>;
+  readState: (worktreePath: string) => Promise<WorktreeState>;
+  restoreState: (worktreePath: string, state: WorktreeState) => Promise<void>;
 }): Promise<{ sessionId: string; reviewer: ReviewerSource; report: ReviewReportResult }> {
   const { db, clock, ctx, projectId, runId, target, tickets, settings, worktreePath, diff, round, maxRounds, claude } =
     args;
@@ -257,6 +286,7 @@ async function runReviewSession(args: {
         `${describeReviewer(reviewer)}\n`,
     );
 
+    const before = await args.readState(worktreePath);
     const result = await claude({
       cwd: worktreePath,
       prompt,
@@ -269,7 +299,16 @@ async function runReviewSession(args: {
       throw new Error(`claude reported an error reviewing ${target.id}: ${result.text ?? "unknown"}`);
     }
 
-    const report = parseReviewFindings(result.text);
+    const report = await enforceReadOnly({
+      report: parseReviewFindings(result.text),
+      worktreePath,
+      before,
+      logPath,
+      round,
+      maxRounds,
+      readState: args.readState,
+      restoreState: args.restoreState,
+    });
     await appendSessionLog(logPath, `[review] round ${round}/${maxRounds}: ${describeReport(report)}\n`);
     await endSession(db, clock, sessionId, "done");
     return { sessionId, reviewer, report };
@@ -277,6 +316,38 @@ async function runReviewSession(args: {
     await endSession(db, clock, sessionId, "failed");
     throw e; // propagate so the runner applies quota backoff / retry / park
   }
+}
+
+/**
+ * The read-only guard: leave the worktree exactly as the reviewer found it, and reject the report of
+ * a reviewer that touched it. Reverting alone is not enough — a verdict reached on code the reviewer
+ * then edited says nothing about the code anton is about to push — so the round becomes a
+ * `worktree-modified` protocol violation, which the call-site parks on. The reviewer's own findings
+ * are carried through anyway, since they are what tells the founder why it was reaching for the
+ * keyboard.
+ */
+async function enforceReadOnly(args: {
+  report: ReviewReportResult;
+  worktreePath: string;
+  before: WorktreeState;
+  logPath: string;
+  round: number;
+  maxRounds: number;
+  readState: (worktreePath: string) => Promise<WorktreeState>;
+  restoreState: (worktreePath: string, state: WorktreeState) => Promise<void>;
+}): Promise<ReviewReportResult> {
+  const { report, worktreePath, before, logPath, round, maxRounds } = args;
+
+  const after = await args.readState(worktreePath);
+  if (after.head === before.head && after.status === before.status) return report;
+
+  await args.restoreState(worktreePath, before);
+  await appendSessionLog(
+    logPath,
+    `[review] round ${round}/${maxRounds}: the reviewer MODIFIED the worktree — the changes were ` +
+      `reverted to ${before.head.slice(0, 12)} and the review is rejected: a review is read-only\n`,
+  );
+  return { ok: false, violation: "worktree-modified", findings: report.findings };
 }
 
 /**

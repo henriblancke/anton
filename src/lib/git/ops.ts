@@ -199,6 +199,38 @@ export async function diffAgainstBase(
   };
 }
 
+/** A worktree's committed tip plus its working-tree dirt — the fingerprint a read-only phase guards. */
+export interface WorktreeState {
+  head: string;
+  /** `git status --porcelain` output; empty on a clean tree. */
+  status: string;
+}
+
+/** Fingerprint the worktree, so a phase that must not write can be caught having written. */
+export async function readWorktreeState(worktreePath: string): Promise<WorktreeState> {
+  const [head, status] = await Promise.all([
+    git(worktreePath, ["rev-parse", "HEAD"]),
+    git(worktreePath, ["status", "--porcelain"]),
+  ]);
+  return { head, status };
+}
+
+/**
+ * Throw away everything the worktree gained since `state` was read: back to that commit, then drop
+ * the untracked files left behind. Ignored paths (`node_modules`, build caches) are deliberately
+ * kept — `clean -fd` without `-x` — so undoing a stray edit never costs a full reinstall.
+ *
+ * Assumes `state` was captured on a COMMITTED tree (which is where the review gate runs): restoring
+ * onto a dirty baseline would discard that dirt too.
+ */
+export async function restoreWorktreeState(
+  worktreePath: string,
+  state: WorktreeState,
+): Promise<void> {
+  await git(worktreePath, ["reset", "--hard", state.head]);
+  await git(worktreePath, ["clean", "-fd"]);
+}
+
 export interface PullRequest {
   url: string;
   /** beads external-ref form: `gh-<number>` when the number is parseable, else the url. */

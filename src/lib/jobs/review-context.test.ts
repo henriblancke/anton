@@ -99,6 +99,13 @@ describe("reviewContext", () => {
     expect(empty).toContain("NO changes against its base");
   });
 
+  it("forbids writing to the worktree in the appended context, so a swapped reviewer is told too", () => {
+    const out = reviewContext({ target: epic, tickets: [ticket], diff });
+    expect(out).toContain("## This review is READ-ONLY");
+    expect(out).toContain("even if your instructions above tell you to fix what you find");
+    expect(out).toContain("reverted");
+  });
+
   it("demands the mandatory 0-10 score in the appended context, not just in the skill", () => {
     const out = reviewContext({ target: epic, tickets: [ticket], diff });
     expect(out).toContain('"score":<integer 0-10>');
@@ -390,5 +397,35 @@ describe("parseReviewFindings", () => {
     ].join("\n");
 
     expect(parseReviewFindings(text)).toMatchObject({ ok: false, violation: "invalid-score" });
+  });
+
+  it("rejects a truncated final report instead of falling back to the draft it withdrew", () => {
+    // The dangerous shape: a clean draft, then a correction carrying blocking findings that got cut
+    // off mid-block. Scanning past it would open a PR on the verdict the reviewer replaced.
+    const text = [
+      "```json",
+      '{"score":9,"rationale":"clean","findings":[]}',
+      "```",
+      "correction — I missed something:",
+      "```json",
+      '{"score":3,"rationale":"AC-2 unmet","findings":[{"severity":"blocking","location":"src/a.ts:2","not',
+      "```",
+    ].join("\n");
+
+    expect(parseReviewFindings(text)).toEqual({ ok: false, violation: "no-report", findings: [] });
+  });
+
+  it("still skips an unrelated json block that merely fails to parse", () => {
+    const text = [
+      "```json",
+      '{"score":8,"rationale":"good","findings":[]}',
+      "```",
+      "the config I read (as printed, trailing comma and all):",
+      "```json",
+      '{"compilerOptions":{"strict":true,}}',
+      "```",
+    ].join("\n");
+
+    expect(parseReviewFindings(text)).toMatchObject({ ok: true, score: 8 });
   });
 });

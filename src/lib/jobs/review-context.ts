@@ -45,11 +45,11 @@ export interface ReviewerSource {
 }
 
 /**
- * How a review report failed the protocol. Deliberately NOT folded into "no findings": a reviewer
- * that never reported, or reported an unusable score, has told us nothing about the work — treating
- * that as a clean review would open a PR on unreviewed code.
+ * How a review failed the protocol. Deliberately NOT folded into "no findings": a reviewer that
+ * never reported, reported an unusable score, or edited the code it was judging has told us nothing
+ * trustworthy about the work — treating that as a clean review would open a PR on unreviewed code.
  */
-export type ReviewProtocolViolation = "no-report" | "invalid-score";
+export type ReviewProtocolViolation = "no-report" | "invalid-score" | "worktree-modified";
 
 /**
  * Outcome of parsing a review report. `ok: true` is a review that spoke the protocol — the score is
@@ -140,6 +140,7 @@ export function reviewContext(run: ReviewRun): string {
     ...beadsSection(run),
     ...diffSection(run.diff),
     ...principlesSection(run.principles),
+    ...readOnlySection(),
     ...reportingFormatSection(),
   ]
     .join("\n")
@@ -231,6 +232,28 @@ function principlesSection(principles: string | undefined): string[] {
     `These are enforced rules for this project. Each violation in the diff is a finding.`,
     ``,
     truncate(principles, MAX_PRINCIPLES_CHARS),
+    ``,
+  ];
+}
+
+/**
+ * The read-only rule. Lives in anton's own context, not in the (swappable) reasoning contract, so an
+ * implementation-oriented agent swapped in as reviewer is still told not to write: a reviewer that
+ * repairs what it finds and then reports clean would ship its verdict and lose its fix — the branch
+ * anton pushes is the one it just judged, and the gate discards any edit made under a review.
+ */
+function readOnlySection(): string[] {
+  return [
+    `## This review is READ-ONLY`,
+    ``,
+    `Do not modify anything in this worktree — no edits, no new files, no commits, no \`git\` writes,`,
+    `no formatters or codemods, even if your instructions above tell you to fix what you find. anton`,
+    `dispatches the fixes in a separate session after your report.`,
+    ``,
+    `anton compares the worktree before and after this review: any change you make is reverted and`,
+    `the review is discarded as a protocol violation, which parks the run for a human. Reading,`,
+    `searching, and running the project's own read-only checks (tests, type-check, lint) is expected —`,
+    `just leave the tree exactly as you found it.`,
     ``,
   ];
 }
@@ -348,6 +371,15 @@ function isReportBlock(parsed: unknown): parsed is { score?: unknown; findings?:
 }
 
 /**
+ * Does an UNPARSEABLE block still read as an attempted report? A truncated or otherwise broken
+ * report must not fall through to an earlier draft — a clean draft followed by a corrected report
+ * that got cut off would otherwise pass the gate on the verdict the reviewer withdrew.
+ */
+function looksLikeReportText(raw: string): boolean {
+  return /"(?:score|findings)"\s*:/.test(raw);
+}
+
+/**
  * Parse the review report the reviewer is asked (in {@link reportingFormatSection}) to end its
  * final message with: the LAST fenced ```json block that looks like a report. Unrelated json
  * blocks (a config the reviewer quoted) are skipped, not treated as the report.
@@ -355,8 +387,8 @@ function isReportBlock(parsed: unknown): parsed is { score?: unknown; findings?:
  * Tolerant about FINDINGS — malformed entries are dropped, a missing/non-array `findings` yields
  * [] — and strict about the SCORE. A report that never came, or whose score is missing, non-
  * integer, or out of 0-10, returns `ok: false`: the gate must park on that rather than read silence
- * as a clean run. Scanning stops at the first report-shaped block from the end, so a reviewer's
- * earlier draft can never stand in for a broken final report.
+ * as a clean run. Scanning stops at the first report-shaped block from the end — including a
+ * BROKEN one — so a reviewer's earlier draft can never stand in for a final report it withdrew.
  */
 export function parseReviewFindings(text: string | undefined): ReviewReportResult {
   if (!text) return { ok: false, violation: "no-report", findings: [] };
@@ -367,7 +399,10 @@ export function parseReviewFindings(text: string | undefined): ReviewReportResul
     try {
       parsed = JSON.parse(blocks[i][1]);
     } catch {
-      continue; // not the report block — keep scanning backwards.
+      // A block that tried to be the report and failed IS the report — a malformed one. Only
+      // unrelated json (a config the reviewer quoted) keeps the scan going backwards.
+      if (looksLikeReportText(blocks[i][1])) return { ok: false, violation: "no-report", findings: [] };
+      continue;
     }
     if (!isReportBlock(parsed)) continue;
 

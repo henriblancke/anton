@@ -116,12 +116,43 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+/**
+ * An in-memory stand-in for the worktree the read-only guard fingerprints. `mutateOn` names the
+ * claude dispatches (1-based) after which the tree "changed" — how a reviewer that edits the code it
+ * is judging looks to the gate.
+ */
+function fakeWorktree(mutateOn: number[] = []) {
+  const state = { head: "c0ffee", status: "" };
+  const restores: string[] = [];
+  let dispatches = 0;
+  return {
+    restores,
+    /** Called by the fake claude, so a "mutation" lands between the guard's before/after reads. */
+    onDispatch: () => {
+      dispatches += 1;
+      if (mutateOn.includes(dispatches)) state.status = `?? reviewer-edit-${dispatches}.ts`;
+    },
+    readState: async () => ({ ...state }),
+    restoreState: async (_path: string, to: { head: string; status: string }) => {
+      restores.push(state.status);
+      state.status = to.status;
+      state.head = to.head;
+    },
+  };
+}
+
 /** Run the gate against the fake driver. `commits` scripts each fix session's commit verdict. */
 function gate(
   replies: Array<string | Error>,
   settings: ProjectSettings = {},
   commits: boolean[] = [],
-): { result: Promise<ReviewGateResult>; calls: RunClaudeOptions[]; commitMessages: string[] } {
+  worktree = fakeWorktree(),
+): {
+  result: Promise<ReviewGateResult>;
+  calls: RunClaudeOptions[];
+  commitMessages: string[];
+  restores: string[];
+} {
   const { run, calls } = fakeClaude(replies);
   const commitMessages: string[] = [];
   const result = runReviewGate({
@@ -135,15 +166,20 @@ function gate(
     worktreePath: dir,
     baseBranch: "main",
     deps: {
-      runClaude: run,
+      runClaude: async (options) => {
+        worktree.onDispatch();
+        return run(options);
+      },
       diff: async () => diff,
       commit: async (_path, message) => {
         commitMessages.push(message);
         return { committed: commits[commitMessages.length - 1] ?? true };
       },
+      readState: worktree.readState,
+      restoreState: worktree.restoreState,
     },
   });
-  return { result, calls, commitMessages };
+  return { result, calls, commitMessages, restores: worktree.restores };
 }
 
 /** The recorded sessions in start order — the UI's view of the gate. */
@@ -301,6 +337,7 @@ describe("runReviewGate — quota", () => {
 
   it("marks the review session failed when claude reports an error result", async () => {
     const failing = async (): Promise<ClaudeResult> => ({ ok: false, text: "boom" });
+    const worktree = fakeWorktree();
     await expect(
       runReviewGate({
         db: tdb.db,
@@ -312,9 +349,60 @@ describe("runReviewGate — quota", () => {
         settings: {},
         worktreePath: dir,
         baseBranch: "main",
-        deps: { runClaude: failing, diff: async () => diff, commit: async () => ({ committed: true }) },
+        deps: {
+          runClaude: failing,
+          diff: async () => diff,
+          commit: async () => ({ committed: true }),
+          readState: worktree.readState,
+          restoreState: worktree.restoreState,
+        },
       }),
     ).rejects.toThrow(/claude reported an error reviewing anton-gate1/);
     expect(await sessionKinds()).toEqual([{ kind: "review", status: "failed", beadId: "anton-gate1" }]);
+  });
+});
+
+describe("runReviewGate — the review is read-only", () => {
+  it("reverts a reviewer that edited the worktree and refuses to trust its verdict", async () => {
+    // The dangerous shape: the reviewer quietly fixes what it found and then reports clean. Its fix
+    // would be thrown away when anton pushes the reviewed HEAD, shipping the defect with a 9/10.
+    const worktree = fakeWorktree([1]);
+    const { result, calls, restores } = gate([report(9, [])], { reviewMaxRounds: 3 }, [], worktree);
+    const out = await result;
+
+    expect(out.outcome).toBe("protocol-violation");
+    expect(out.rounds[0]).toMatchObject({ violation: "worktree-modified" });
+    expect(out.rounds[0].score).toBeUndefined();
+    expect(out.score).toBeUndefined();
+    // The edit is undone, and the loop stops rather than dispatching a fix off an untrusted review.
+    expect(restores).toEqual(["?? reviewer-edit-1.ts"]);
+    expect((await worktree.readState()).status).toBe("");
+    expect(calls).toHaveLength(1);
+  });
+
+  it("keeps the findings a worktree-editing reviewer reported, as context for the human", async () => {
+    const { result } = gate([report(4, [BLOCKING])], { reviewMaxRounds: 3 }, [], fakeWorktree([1]));
+    const out = await result;
+
+    expect(out.outcome).toBe("protocol-violation");
+    expect(out.unresolved).toEqual([
+      { severity: "blocking", location: "src/a.ts:4", note: "the loop is unbounded" },
+    ]);
+  });
+
+  it("leaves a well-behaved reviewer alone — no restore, and the fix session may still write", async () => {
+    // Dispatch 2 is the FIX session: it is supposed to change the tree, and the guard must not see
+    // its work as a review that misbehaved.
+    const worktree = fakeWorktree([2]);
+    const { result, restores } = gate(
+      [report(4, [BLOCKING]), "fixed the loop bound", report(9, [])],
+      { reviewMaxRounds: 2 },
+      [],
+      worktree,
+    );
+    const out = await result;
+
+    expect(out.outcome).toBe("clean");
+    expect(restores).toEqual([]);
   });
 });
