@@ -61,6 +61,7 @@ export const JOB_TYPE_TIER: Record<JobType, BurnTier> = {
   "orphan-grooming": "S",
   "sync-push": "none",
   "run-health": "none",
+  unstick: "none",
 };
 
 /**

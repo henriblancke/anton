@@ -24,6 +24,7 @@ import { makeNightlyStringerHandler } from "./nightly-stringer";
 import { makeOrphanGroomingHandler } from "./orphan-grooming";
 import { makeSyncPushHandler } from "./sync-push";
 import { makeRunHealthHandler } from "./run-health";
+import { makeUnstickHandler, resumeEpic, type ResumeOutcome } from "./unstick";
 import { JobRunner, type RunnerLogger, type RunningJobInfo } from "./runner";
 import { Scheduler } from "./scheduler";
 import { activeExecuteEpicId, getJob, systemClock } from "./queue";
@@ -153,6 +154,7 @@ export function getRunner(): JobRunner {
   runner.registerHandler("orphan-grooming", makeOrphanGroomingHandler({ db }));
   runner.registerHandler("sync-push", makeSyncPushHandler({ db }));
   runner.registerHandler("run-health", makeRunHealthHandler({ db }));
+  runner.registerHandler("unstick", makeUnstickHandler({ db }));
   s.runner = runner;
   return runner;
 }
@@ -241,6 +243,23 @@ export async function resumeJob(projectId: string, jobId: string): Promise<boole
   const job = await getJob(getDb(), jobId);
   if (!job || job.projectId !== projectId) return false;
   return getRunner().resume(jobId);
+}
+
+/**
+ * Restart a stalled epic from an escalation (anton-wvcy) — the founder-facing half of the unstick
+ * pass's own resume path, sharing its exact decision (`resumeEpic`) so a one-click resume and an
+ * automatic one can never diverge. Routed through the runner so a project mid-teardown is refused
+ * rather than handed a fresh job row.
+ */
+export function resumeStalledEpic(
+  projectId: string,
+  epicBeadId: string,
+): Promise<ResumeOutcome> {
+  const runner = getRunner();
+  return resumeEpic(getDb(), systemClock, projectId, epicBeadId, {
+    resume: (jobId) => runner.resume(jobId),
+    enqueueIfAbsent: (project, epic) => runner.enqueueExecuteEpicIfAbsent(project, epic),
+  });
 }
 
 /**

@@ -43,6 +43,7 @@ const JOB_TYPE_LABELS: Record<JobType, string> = {
   "orphan-grooming": "Orphan grooming",
   "sync-push": "Sync push",
   "run-health": "Run health",
+  unstick: "Unstick",
 };
 
 export const JOB_STATUSES = Object.keys(JOB_STATUS_LABELS) as JobStatus[];

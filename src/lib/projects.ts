@@ -571,7 +571,8 @@ export async function deleteProject(slug: string): Promise<void> {
   }
 
   // 4. Drop the project's anton.db rows atomically, children before parents (no ON DELETE
-  //    CASCADE in the schema): sessions → runs → jobs → schedules → run-health → projects.
+  //    CASCADE in the schema): sessions → runs → jobs → schedules → run-health → escalations →
+  //    projects.
   try {
     db.transaction((tx) => {
       tx.delete(schema.sessions).where(eq(schema.sessions.projectId, project.id)).run();
@@ -582,6 +583,7 @@ export async function deleteProject(slug: string): Promise<void> {
         .delete(schema.runHealthReports)
         .where(eq(schema.runHealthReports.projectId, project.id))
         .run();
+      tx.delete(schema.escalations).where(eq(schema.escalations.projectId, project.id)).run();
       tx.delete(schema.projects).where(eq(schema.projects.id, project.id)).run();
     });
   } catch (e) {

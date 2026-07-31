@@ -43,6 +43,13 @@
       "when": 1785463466284,
       "tag": "0005_living_cassandra_nova",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1785464864705,
+      "tag": "0006_faithful_kabuki",
+      "breakpoints": true
     }
   ]
 }

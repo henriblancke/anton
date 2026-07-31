@@ -7,7 +7,7 @@
  * clock. Times are stored as unix SECONDS (the schema's timestamp mode); this module works in ms
  * and converts at the boundary.
  */
-import { and, eq, gt, inArray, isNull, like, lt, lte, not, notInArray, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, like, lt, lte, not, notInArray, or, sql } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { randomUUID } from "node:crypto";
 import * as schema from "../db/schema";
@@ -20,7 +20,8 @@ export type JobType =
   | "nightly-stringer"
   | "orphan-grooming"
   | "sync-push"
-  | "run-health";
+  | "run-health"
+  | "unstick";
 
 /**
  * `queued`  — eligible when runAt ≤ now (also how a backoff/quota reschedule is represented).
@@ -185,6 +186,66 @@ function coveringExecuteEpicId(
     .limit(1)
     .all();
   return rows[0]?.id;
+}
+
+/** The statuses a settled execute-epic job can be un-parked from — exactly what `resumeJob` accepts. */
+const RESUMABLE_STATUSES = ["parked", "failed"] as const;
+
+/**
+ * Id of a SETTLED-BUT-RECOVERABLE execute-epic job for this project + epic — `parked` or `failed`,
+ * the two statuses `resumeJob` un-parks (anton-wvcy). The unstick pass needs this to pick its resume
+ * verb: a stalled epic that still has a parked job is revived by resuming THAT job (which reuses its
+ * open run and worktree), while one with no job at all needs a fresh enqueue. Calling
+ * `enqueueExecuteEpicIfAbsent` first would be a silent no-op for the former — a parked job "covers"
+ * the epic, so nothing would be enqueued and nothing resumed.
+ *
+ * Newest first, so a re-parked epic resumes its most recent attempt rather than an ancient one.
+ */
+export async function resumableExecuteEpicId(
+  db: AntonDb,
+  projectId: string,
+  epicBeadId: string,
+): Promise<string | undefined> {
+  const rows = await db
+    .select({ id: schema.jobs.id })
+    .from(schema.jobs)
+    .where(
+      and(
+        eq(schema.jobs.type, "execute-epic"),
+        eq(schema.jobs.projectId, projectId),
+        inArray(schema.jobs.status, [...RESUMABLE_STATUSES]),
+        eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
+      ),
+    )
+    .orderBy(desc(schema.jobs.updatedAt))
+    .limit(1);
+  return rows[0]?.id;
+}
+
+/**
+ * The most recent execute-epic job for this project + epic, whatever its status (anton-wvcy). The
+ * unstick pass reads it to learn when a usage-limit park's window reopens: the runner records that
+ * on the JOB (`runAt` + a `usage-limit: resumes at <ISO>` lastError), never on the run row, so the
+ * run's bare `usage-limit` error alone can't say whether the quota is back.
+ */
+export async function latestExecuteEpicJob(
+  db: AntonDb,
+  projectId: string,
+  epicBeadId: string,
+): Promise<JobRow | undefined> {
+  const rows = await db
+    .select()
+    .from(schema.jobs)
+    .where(
+      and(
+        eq(schema.jobs.type, "execute-epic"),
+        eq(schema.jobs.projectId, projectId),
+        eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
+      ),
+    )
+    .orderBy(desc(schema.jobs.updatedAt))
+    .limit(1);
+  return rows[0];
 }
 
 /**

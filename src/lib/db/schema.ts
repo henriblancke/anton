@@ -45,7 +45,7 @@ export const jobs = sqliteTable(
   "jobs",
   {
     id: text("id").primaryKey(),
-    // execute-epic | review-fix | nightly-stringer | orphan-grooming | sync-push | run-health
+    // execute-epic | review-fix | nightly-stringer | orphan-grooming | sync-push | run-health | unstick
     type: text("type").notNull(),
     projectId: text("project_id").references(() => projects.id),
     payloadJson: text("payload_json").notNull().default("{}"),
@@ -140,6 +140,62 @@ export const runHealthReports = sqliteTable("run_health_reports", {
   /** Denormalized so a board badge / refresh token needn't parse the blob. */
   findingCount: integer("finding_count").notNull().default(0),
 });
+
+/**
+ * Founder-facing escalations raised by the unstick pass (anton-wvcy). One row per stall the pass
+ * could NOT prove safe to auto-resume: the run-health finding's evidence, frozen, plus the
+ * open/resolved decision a human makes on the board.
+ *
+ * Unlike `run_health_reports` (one row per project, replaced each sweep) an escalation OUTLIVES the
+ * sweep that raised it — it is the durable record that a human was asked, and its resolution is the
+ * answer. Repeated sweeps over the same still-stuck subject converge on the SAME open row via
+ * `escalations_open_unique`, so the board shows one item per stall rather than one per sweep.
+ */
+export const escalations = sqliteTable(
+  "escalations",
+  {
+    id: text("id").primaryKey(),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id),
+    /** The `RunHealthFinding.key` this was raised from — stable across sweeps for the same stall. */
+    findingKey: text("finding_key").notNull(),
+    /** The finding's kind (`parked-run` | `stale-pr` | `dead-lease` | `exhausted-job`). */
+    kind: text("kind").notNull(),
+    /** Why it's stuck, in the finding's own words — the park reason the founder reads first. */
+    reason: text("reason").notNull(),
+    /** The bead the stall concerns: the resume/abandon target, and where the bd note is written. */
+    beadId: text("bead_id"),
+    /** The epic bead a resume would re-enqueue (jobs are keyed by epic, not by ticket). */
+    epicBeadId: text("epic_bead_id"),
+    runId: text("run_id"),
+    jobId: text("job_id"),
+    /** When the stall started (park time / last PR activity / lease expiry), so age stays live. */
+    since: ts("since"),
+    /** The whole `RunHealthFinding`, serialized — the evidence the panel renders. */
+    evidenceJson: text("evidence_json").notNull().default("{}"),
+    // open | resolved
+    status: text("status").notNull().default("open"),
+    // resumed | abandoned — how the founder settled it (null while open).
+    resolution: text("resolution"),
+    /** When the board-native `bd note` landed. Null with a `beadId` set means the write failed and
+     *  the next pass retries it — the note is what makes the escalation visible off the anton UI. */
+    notedAt: ts("noted_at"),
+    raisedAt: ts("raised_at").notNull().default(now),
+    updatedAt: ts("updated_at").notNull().default(now),
+  },
+  (table) => [
+    // At most one OPEN escalation per (project, finding) — the idempotence guarantee the sweep
+    // relies on: re-running it over an unchanged stall updates nothing and inserts nothing. Partial
+    // on `open` so a stall that recurs after being resolved can raise a fresh escalation rather than
+    // being permanently silenced by its own history.
+    uniqueIndex("escalations_open_unique")
+      .on(table.projectId, table.findingKey)
+      .where(sql`${table.status} = 'open'`),
+    // Serves the board panel's "this project's open escalations" read without a full scan.
+    index("escalations_project_status_idx").on(table.projectId, table.status),
+  ],
+);
 
 /** Claude sessions — for history, diagnostics, and xterm attach. */
 export const sessions = sqliteTable("sessions", {

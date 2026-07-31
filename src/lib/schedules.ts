@@ -16,7 +16,7 @@ import { isValidCron, nextRun } from "./jobs/cron";
 /** Job types that run on a schedule (execute-epic is enqueued on approval, never on cron). */
 export type ScheduledJobType = Extract<
   JobType,
-  "review-fix" | "nightly-stringer" | "orphan-grooming" | "run-health"
+  "review-fix" | "nightly-stringer" | "orphan-grooming" | "run-health" | "unstick"
 >;
 
 export type ScheduleRow = typeof schema.schedules.$inferSelect;
@@ -134,7 +134,9 @@ export async function listSchedules(projectId: string): Promise<ScheduleSummary[
  *
  * `enabled: false` seeds the ROW without arming it — the operator sees the automation in settings
  * and turns it on deliberately. run-health (anton-4ks0) ships that way: it reports on work a human
- * must then judge, so an operator who never asked for it shouldn't start accruing reports.
+ * must then judge, so an operator who never asked for it shouldn't start accruing reports. unstick
+ * (anton-wvcy) is armed by default but is a strict no-op until run-health has written a report, so
+ * turning the sweep on is the single switch that arms the whole detect → act loop.
  */
 export const DEFAULT_SCHEDULES: Array<{
   type: ScheduledJobType;
@@ -145,6 +147,7 @@ export const DEFAULT_SCHEDULES: Array<{
   { type: "nightly-stringer", cron: "0 3 * * *" }, // scan + triage nightly at 03:00
   { type: "orphan-grooming", cron: "0 4 * * 1" }, // bucket loose tickets weekly, Mon 04:00
   { type: "run-health", cron: "0 * * * *", enabled: false }, // sweep for stalls hourly; opt-in
+  { type: "unstick", cron: "10 * * * *" }, // act on the sweep's findings, 10 min after it
 ];
 
 /** Idempotently seed the default schedules for a project (no-op for types it already has). */

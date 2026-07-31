@@ -1,0 +1,201 @@
+/**
+ * Tests for the founder's two answers to an escalation (anton-wvcy), over a real temp anton.db.
+ *
+ * The property under test is the ORDER: settle first, act second. `settleEscalation`'s status CAS is
+ * the lock, so whoever flips `open → resolved` owns the decision — that is what makes a double-click
+ * (or two operators on one board) resume the epic once rather than twice. The verbs themselves are
+ * stubbed; that they are the SAME verbs the automatic path uses is a wiring fact, asserted here by
+ * checking each is called with the right target.
+ */
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { eq } from "drizzle-orm";
+
+import { makeFileDb, type FileDb } from "@/lib/testing/integration";
+import type { RunHealthFinding } from "./run-health";
+import type { Project } from "./types";
+
+const resumeStalledEpic = vi.fn<(projectId: string, epicBeadId: string) => Promise<string>>();
+const abandonTicket = vi.fn<(project: Project, id: string, reason: string) => Promise<unknown>>();
+
+vi.mock("./jobs/service", () => ({
+  resumeStalledEpic: (...args: [string, string]) => resumeStalledEpic(...args),
+}));
+vi.mock("./abandon", async () => {
+  const actual = await vi.importActual<typeof import("./abandon")>("./abandon");
+  return { ...actual, abandonTicket: (...args: [Project, string, string]) => abandonTicket(...args) };
+});
+
+let fileDb: FileDb;
+let actOnEscalation: typeof import("./escalation-actions").actOnEscalation;
+let isEscalationAction: typeof import("./escalation-actions").isEscalationAction;
+let getDb: typeof import("./db").getDb;
+let schema: typeof import("./db/schema");
+let raiseEscalation: typeof import("./escalations").raiseEscalation;
+let settleEscalation: typeof import("./escalations").settleEscalation;
+
+const NOW = 1_700_000_000_000;
+const HOUR = 3_600_000;
+const clock = { now: () => NOW };
+
+const project = { id: "p1", slug: "p1", name: "p1", repoPath: "/tmp/p1" } as Project;
+
+beforeAll(async () => {
+  // MUST precede the getDb-touching imports: the db path is resolved at import time.
+  fileDb = makeFileDb();
+  ({ getDb } = await import("./db"));
+  schema = await import("./db/schema");
+  ({ raiseEscalation, settleEscalation } = await import("./escalations"));
+  ({ actOnEscalation, isEscalationAction } = await import("./escalation-actions"));
+});
+
+afterAll(() => fileDb.cleanup());
+
+beforeEach(() => {
+  getDb().delete(schema.escalations).run();
+  getDb().delete(schema.projects).run();
+  getDb()
+    .insert(schema.projects)
+    .values({ id: "p1", slug: "p1", name: "p1", repoPath: "/tmp/p1" })
+    .run();
+  resumeStalledEpic.mockResolvedValue("enqueued");
+  abandonTicket.mockResolvedValue(undefined);
+});
+
+afterEach(() => vi.clearAllMocks());
+
+function finding(o: Partial<RunHealthFinding> = {}): RunHealthFinding {
+  return {
+    kind: "parked-run",
+    key: "parked-run:r-1",
+    reason: "parked 4h ago: agent exited 1",
+    since: NOW - 4 * HOUR,
+    ageMs: 4 * HOUR,
+    runId: "r-1",
+    beadId: "anton-t9",
+    ...o,
+  };
+}
+
+async function open(o: { finding?: RunHealthFinding; epicBeadId?: string } = {}) {
+  const { escalation } = await raiseEscalation(getDb(), clock, {
+    projectId: "p1",
+    finding: o.finding ?? finding(),
+    epicBeadId: "epicBeadId" in o ? o.epicBeadId : "anton-e1",
+  });
+  return escalation;
+}
+
+const rowOf = (id: string) =>
+  getDb().select().from(schema.escalations).where(eq(schema.escalations.id, id)).get();
+
+describe("actOnEscalation — resume", () => {
+  it("re-enqueues the finding's EPIC and records the answer", async () => {
+    const escalation = await open();
+
+    const result = await actOnEscalation(project, escalation.id, "resume");
+
+    expect(result).toMatchObject({ ok: true, action: "resume", detail: "enqueued" });
+    // The epic, not the ticket bead the finding names — jobs are keyed by epic.
+    expect(resumeStalledEpic).toHaveBeenCalledWith("p1", "anton-e1");
+    expect(rowOf(escalation.id)).toMatchObject({ status: "resolved", resolution: "resumed" });
+  });
+
+  it("resumes ONCE when two clicks race — the loser is refused, not queued", async () => {
+    const escalation = await open();
+
+    const [a, b] = await Promise.all([
+      actOnEscalation(project, escalation.id, "resume"),
+      actOnEscalation(project, escalation.id, "resume"),
+    ]);
+
+    expect([a.ok, b.ok].filter(Boolean)).toHaveLength(1);
+    expect(resumeStalledEpic).toHaveBeenCalledTimes(1);
+    const loser = a.ok ? b : a;
+    expect(loser).toEqual({ ok: false, reason: "not-open" });
+  });
+
+  it("refuses an escalation someone already settled", async () => {
+    const escalation = await open();
+    await settleEscalation(getDb(), clock, escalation.id, "abandoned");
+
+    expect(await actOnEscalation(project, escalation.id, "resume")).toEqual({
+      ok: false,
+      reason: "not-open",
+    });
+    expect(resumeStalledEpic).not.toHaveBeenCalled();
+  });
+
+  it("refuses — without settling — when the finding names no epic to re-enqueue", async () => {
+    const escalation = await open({ epicBeadId: undefined });
+
+    expect(await actOnEscalation(project, escalation.id, "resume")).toEqual({
+      ok: false,
+      reason: "no-target",
+    });
+    // Still open: an escalation nothing can act on must stay visible rather than silently resolve.
+    expect(rowOf(escalation.id)?.status).toBe("open");
+  });
+});
+
+describe("actOnEscalation — abandon", () => {
+  it("closes the finding's BEAD with the escalation's own evidence as the reason", async () => {
+    const escalation = await open();
+
+    const result = await actOnEscalation(project, escalation.id, "abandon");
+
+    expect(result).toMatchObject({ ok: true, action: "abandon", detail: "abandoned" });
+    const [, target, reason] = abandonTicket.mock.calls[0]!;
+    expect(target).toBe("anton-t9"); // the stalled ticket, not the epic
+    expect(reason).toContain("parked 4h ago: agent exited 1");
+    expect(reason).toContain("parked-run");
+    expect(rowOf(escalation.id)).toMatchObject({ status: "resolved", resolution: "abandoned" });
+  });
+
+  it("caps the recorded reason at bd's limit", async () => {
+    const { MAX_ABANDON_REASON_CHARS } = await import("./types");
+    const escalation = await open({ finding: finding({ reason: "x".repeat(2000) }) });
+
+    await actOnEscalation(project, escalation.id, "abandon");
+
+    expect(abandonTicket.mock.calls[0]![2].length).toBeLessThanOrEqual(MAX_ABANDON_REASON_CHARS);
+  });
+
+  it("refuses when the finding names no bead to close", async () => {
+    const escalation = await open({ finding: finding({ beadId: undefined }) });
+
+    expect(await actOnEscalation(project, escalation.id, "abandon")).toEqual({
+      ok: false,
+      reason: "no-target",
+    });
+    expect(abandonTicket).not.toHaveBeenCalled();
+  });
+});
+
+describe("actOnEscalation — scoping", () => {
+  it("reports not-found for an unknown id", async () => {
+    expect(await actOnEscalation(project, "nope", "resume")).toEqual({
+      ok: false,
+      reason: "not-found",
+    });
+  });
+
+  it("cannot settle another project's escalation by id", async () => {
+    const escalation = await open();
+    const other = { ...project, id: "p2" } as Project;
+
+    expect(await actOnEscalation(other, escalation.id, "resume")).toEqual({
+      ok: false,
+      reason: "not-found",
+    });
+    expect(rowOf(escalation.id)?.status).toBe("open");
+  });
+});
+
+describe("isEscalationAction", () => {
+  it("accepts only the two verbs the panel offers", () => {
+    expect(["resume", "abandon"].every(isEscalationAction)).toBe(true);
+    for (const bad of ["retry", "", null, undefined, 1, {}]) {
+      expect(isEscalationAction(bad)).toBe(false);
+    }
+  });
+});
