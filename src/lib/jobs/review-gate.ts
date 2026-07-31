@@ -154,7 +154,6 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
 
   for (let round = 1; round <= config.maxRounds; round++) {
     await ctx.heartbeat();
-    const diff = await readDiff(worktreePath, baseBranch);
 
     const review = await runReviewSession({
       db,
@@ -166,7 +165,8 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       tickets,
       settings,
       worktreePath,
-      diff,
+      baseBranch,
+      readDiff,
       round,
       maxRounds: config.maxRounds,
       claude,
@@ -242,6 +242,9 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
  * this stops a swapped, implementation-minded agent from silently repairing what it is grading and
  * then passing it. Its fix would be thrown away (the branch anton pushes is the reviewed HEAD) or,
  * worse, ride along uninspected in the next fix session's commit.
+ *
+ * The diff and the prompt are read INSIDE the session, after the baseline is settled, so what the
+ * reviewer is shown and what it can read on disk are the same tree.
  */
 async function runReviewSession(args: {
   db: AntonDb;
@@ -253,23 +256,15 @@ async function runReviewSession(args: {
   tickets: Bead[];
   settings: ProjectSettings;
   worktreePath: string;
-  diff: BranchDiff;
+  baseBranch: string;
+  readDiff: (worktreePath: string, base: string) => Promise<BranchDiff>;
   round: number;
   maxRounds: number;
   claude: (options: RunClaudeOptions) => Promise<ClaudeResult>;
   readState: (worktreePath: string) => Promise<WorktreeState>;
   restoreState: (worktreePath: string, state: WorktreeState) => Promise<void>;
 }): Promise<{ sessionId: string; reviewer: ReviewerSource; report: ReviewReportResult }> {
-  const { db, clock, ctx, projectId, runId, target, tickets, settings, worktreePath, diff, round, maxRounds, claude } =
-    args;
-
-  const { prompt, reviewer } = await buildReviewPrompt({
-    target,
-    tickets,
-    diff,
-    settings,
-    projectDir: worktreePath,
-  });
+  const { db, clock, ctx, projectId, runId, target, tickets, settings, worktreePath, round, maxRounds, claude } = args;
 
   const { sessionId, logPath, onEvent } = await startJobSession(db, clock, {
     projectId,
@@ -280,13 +275,29 @@ async function runReviewSession(args: {
   ctx.report({ sessionId, cwd: worktreePath });
 
   try {
+    const before = await settleBaseline({
+      worktreePath,
+      logPath,
+      round,
+      maxRounds,
+      readState: args.readState,
+      restoreState: args.restoreState,
+    });
+
+    const diff = await args.readDiff(worktreePath, args.baseBranch);
+    const { prompt, reviewer } = await buildReviewPrompt({
+      target,
+      tickets,
+      diff,
+      settings,
+      projectDir: worktreePath,
+    });
     await appendSessionLog(
       logPath,
       `[review] round ${round}/${maxRounds}: reviewing ${diff.files.length} changed file(s) as ` +
         `${describeReviewer(reviewer)}\n`,
     );
 
-    const before = await args.readState(worktreePath);
     const result = await claude({
       cwd: worktreePath,
       prompt,
@@ -316,6 +327,43 @@ async function runReviewSession(args: {
     await endSession(db, clock, sessionId, "failed");
     throw e; // propagate so the runner applies quota backoff / retry / park
   }
+}
+
+/**
+ * Settle the tree the review runs on: a COMMITTED baseline, matching the branch anton pushes.
+ *
+ * Uncommitted changes here are leftovers from an attempt that died before its commit — typically a
+ * fix session whose verify gates failed, whose job the runner then retried into this same worktree.
+ * Reviewing around them is unsound in both directions: the diff is taken from HEAD, so the reviewer
+ * would grade a patch that omits files it can read (and can pass work the PR will never carry, since
+ * `openPullRequest` pushes only HEAD and the finished run force-removes the worktree), while the
+ * read-only guard below would adopt that dirt as its baseline and discard it on any restore anyway.
+ *
+ * So the leftovers are dropped, loudly, before anything is read. Nothing is lost that the loop can't
+ * recreate: the discarded fix never passed its gates, and the review that follows re-reports the
+ * findings it was attempting, which the next fix round dispatches again.
+ */
+async function settleBaseline(args: {
+  worktreePath: string;
+  logPath: string;
+  round: number;
+  maxRounds: number;
+  readState: (worktreePath: string) => Promise<WorktreeState>;
+  restoreState: (worktreePath: string, state: WorktreeState) => Promise<void>;
+}): Promise<WorktreeState> {
+  const { worktreePath, logPath, round, maxRounds } = args;
+
+  const state = await args.readState(worktreePath);
+  if (!state.status) return state;
+
+  await args.restoreState(worktreePath, { head: state.head, status: "" });
+  await appendSessionLog(
+    logPath,
+    `[review] round ${round}/${maxRounds}: the worktree carried UNCOMMITTED changes from an earlier ` +
+      `attempt — discarded back to ${state.head.slice(0, 12)} so the review reads what the PR would ` +
+      `push:\n${state.status}\n`,
+  );
+  return args.readState(worktreePath);
 }
 
 /**

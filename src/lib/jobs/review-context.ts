@@ -367,7 +367,9 @@ function toFinding(f: unknown): ReviewFinding | undefined {
 /** Shape of a candidate report block — anything carrying a score or findings key. */
 function isReportBlock(parsed: unknown): parsed is { score?: unknown; findings?: unknown; rationale?: unknown } {
   if (typeof parsed !== "object" || parsed === null) return false;
-  return "score" in parsed || Array.isArray((parsed as { findings?: unknown }).findings);
+  // Key PRESENCE, not value shape: `{"findings":null}` is a broken report, not an unrelated block.
+  // Scanning past it would let an earlier clean draft stand in for the verdict it withdrew.
+  return "score" in parsed || "findings" in parsed;
 }
 
 /**

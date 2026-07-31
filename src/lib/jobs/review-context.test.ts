@@ -399,6 +399,22 @@ describe("parseReviewFindings", () => {
     expect(parseReviewFindings(text)).toMatchObject({ ok: false, violation: "invalid-score" });
   });
 
+  it("treats a parseable but malformed final report as the report, not as unrelated json", () => {
+    // `findings` present but not an array: still the reviewer's final verdict, so it must be graded
+    // (and rejected on its missing score) rather than scanned past onto the clean draft above it.
+    const text = [
+      "```json",
+      '{"score":9,"rationale":"clean","findings":[]}',
+      "```",
+      "correction:",
+      "```json",
+      '{"findings":null}',
+      "```",
+    ].join("\n");
+
+    expect(parseReviewFindings(text)).toEqual({ ok: false, violation: "invalid-score", findings: [] });
+  });
+
   it("rejects a truncated final report instead of falling back to the draft it withdrew", () => {
     // The dangerous shape: a clean draft, then a correction carrying blocking findings that got cut
     // off mid-block. Scanning past it would open a PR on the verdict the reviewer replaced.

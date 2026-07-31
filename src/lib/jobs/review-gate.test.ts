@@ -121,16 +121,23 @@ afterEach(() => {
  * claude dispatches (1-based) after which the tree "changed" — how a reviewer that edits the code it
  * is judging looks to the gate.
  */
-function fakeWorktree(mutateOn: number[] = []) {
-  const state = { head: "c0ffee", status: "" };
+function fakeWorktree(mutateOn: number[] = [], initialStatus = "") {
+  const state = { head: "c0ffee", status: initialStatus };
   const restores: string[] = [];
   let dispatches = 0;
+  let commits = 0;
   return {
     restores,
     /** Called by the fake claude, so a "mutation" lands between the guard's before/after reads. */
     onDispatch: () => {
       dispatches += 1;
       if (mutateOn.includes(dispatches)) state.status = `?? reviewer-edit-${dispatches}.ts`;
+    },
+    /** Mirrors `commitAll`: a committed fix advances HEAD and leaves the tree clean. */
+    onCommit: () => {
+      commits += 1;
+      state.head = `c0mm1t${commits}`;
+      state.status = "";
     },
     readState: async () => ({ ...state }),
     restoreState: async (_path: string, to: { head: string; status: string }) => {
@@ -152,9 +159,12 @@ function gate(
   calls: RunClaudeOptions[];
   commitMessages: string[];
   restores: string[];
+  /** The worktree's dirt as each round's diff was read — the review must see a settled tree. */
+  diffStates: string[];
 } {
   const { run, calls } = fakeClaude(replies);
   const commitMessages: string[] = [];
+  const diffStates: string[] = [];
   const result = runReviewGate({
     db: tdb.db,
     clock,
@@ -170,16 +180,21 @@ function gate(
         worktree.onDispatch();
         return run(options);
       },
-      diff: async () => diff,
+      diff: async () => {
+        diffStates.push((await worktree.readState()).status);
+        return diff;
+      },
       commit: async (_path, message) => {
         commitMessages.push(message);
-        return { committed: commits[commitMessages.length - 1] ?? true };
+        const committed = commits[commitMessages.length - 1] ?? true;
+        if (committed) worktree.onCommit();
+        return { committed };
       },
       readState: worktree.readState,
       restoreState: worktree.restoreState,
     },
   });
-  return { result, calls, commitMessages, restores: worktree.restores };
+  return { result, calls, commitMessages, restores: worktree.restores, diffStates };
 }
 
 /** The recorded sessions in start order — the UI's view of the gate. */
@@ -388,6 +403,35 @@ describe("runReviewGate — the review is read-only", () => {
     expect(out.unresolved).toEqual([
       { severity: "blocking", location: "src/a.ts:4", note: "the loop is unbounded" },
     ]);
+  });
+
+  it("discards a dirty worktree before reading the diff, so the review grades what the PR pushes", async () => {
+    // The dangerous shape: a retried job inherits the uncommitted leftovers of a fix session whose
+    // verify gates failed. The diff still comes from HEAD, so a reviewer reading those files on disk
+    // could pass work `openPullRequest` never pushes — and the removed worktree then loses it.
+    const worktree = fakeWorktree([], "M src/a.ts");
+    const { result, restores, diffStates } = gate([report(9, [])], { reviewMaxRounds: 2 }, [], worktree);
+    const out = await result;
+
+    expect(out.outcome).toBe("clean");
+    expect(restores).toEqual(["M src/a.ts"]);
+    // Settled BEFORE the diff is read, so the prompt and the tree the reviewer can read agree.
+    expect(diffStates).toEqual([""]);
+    expect((await worktree.readState()).status).toBe("");
+  });
+
+  it("does not mistake the leftovers it discarded for a reviewer that edited the worktree", async () => {
+    // The baseline is re-read after the reset, so the guard's before/after compare clean-to-clean.
+    const { result } = gate(
+      [report(4, [BLOCKING]), "fixed it", report(9, [])],
+      { reviewMaxRounds: 2 },
+      [],
+      fakeWorktree([], "?? leftover.ts"),
+    );
+    const out = await result;
+
+    expect(out.outcome).toBe("clean");
+    expect(out.rounds.map((r) => r.violation)).toEqual([undefined, undefined]);
   });
 
   it("leaves a well-behaved reviewer alone — no restore, and the fix session may still write", async () => {
