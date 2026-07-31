@@ -31,6 +31,9 @@ suite("worktree manager (real git)", () => {
   let worktreesRoot: string;
   let prevRoot: string | undefined;
 
+  const listPorcelain = () =>
+    execFileSync("git", ["worktree", "list", "--porcelain"], { cwd: repo, encoding: "utf8" });
+
   beforeAll(() => {
     repo = mkdtempSync(join(tmpdir(), "anton-wt-repo-"));
     worktreesRoot = mkdtempSync(join(tmpdir(), "anton-wt-root-"));
@@ -72,6 +75,36 @@ suite("worktree manager (real git)", () => {
   it("is idempotent — calling twice returns the same worktree", async () => {
     const branch = "anton/run-2";
     const first = await createWorktree({ repoPath: repo, branch });
+    const second = await createWorktree({ repoPath: repo, branch });
+
+    expect(second.path).toBe(first.path);
+    expect(existsSync(second.path)).toBe(true);
+  });
+
+  // anton-2wvb: `git worktree list` reports an administrative record, which outlives a checkout
+  // deleted out from under git. Returning such a path handed a non-existent cwd to `spawn`, which
+  // surfaces as ENOENT naming the *executable* — reading as a missing `claude` binary.
+  it("recreates the checkout when the worktree directory was deleted (prunable record)", async () => {
+    const branch = "anton/run-stale";
+    const first = await createWorktree({ repoPath: repo, branch });
+    rmSync(first.path, { recursive: true, force: true });
+    expect(listPorcelain()).toContain("prunable");
+
+    const second = await createWorktree({ repoPath: repo, branch });
+
+    expect(second.path).toBe(first.path);
+    expect(existsSync(second.path)).toBe(true);
+  });
+
+  // The nastier variant: git skips prunability checks on locked worktrees, so a locked record whose
+  // directory is gone never reports as prunable and `git worktree prune` alone will not clear it.
+  it("recreates the checkout when a locked worktree's directory was deleted", async () => {
+    const branch = "anton/run-stale-locked";
+    const first = await createWorktree({ repoPath: repo, branch });
+    execFileSync("git", ["worktree", "lock", first.path], { cwd: repo });
+    rmSync(first.path, { recursive: true, force: true });
+    expect(listPorcelain()).toContain("locked");
+
     const second = await createWorktree({ repoPath: repo, branch });
 
     expect(second.path).toBe(first.path);

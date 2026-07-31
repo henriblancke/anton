@@ -69,10 +69,16 @@ export async function createWorktree(opts: {
   const { repoPath, branch, warm } = opts;
 
   const existing = await findWorktree(repoPath, branch);
-  if (existing) {
+  // A registration can outlive its checkout: `git worktree list` reports an administrative record,
+  // and the directory may already be gone (anton-2wvb). Reusing such a path hands a non-existent
+  // cwd to `spawn`, which fails as ENOENT naming the *executable* — an error that reads as a
+  // missing `claude` binary and sends debugging in entirely the wrong direction. Verify on disk.
+  if (existing && existsSync(existing.path)) {
     if (warm) await warmWorktree(existing);
     return existing;
   }
+  // Drop the stale record so `git worktree add` below isn't rejected as "already registered".
+  if (existing) await forgetStaleWorktree(repoPath, existing.path);
 
   const baseBranch = opts.baseBranch ?? (await currentBranch(repoPath));
   const path = worktreePathFor(repoPath, branch);
@@ -90,6 +96,26 @@ export async function createWorktree(opts: {
   const wt: Worktree = { path: resolvedPath, branch, baseBranch, repoPath };
   if (warm) await warmWorktree(wt);
   return wt;
+}
+
+/**
+ * Deregister a worktree whose directory no longer exists. `--force` twice is deliberate: the first
+ * discards dirty state, the second is what lets the removal proceed on a *locked* worktree. Locked
+ * entries are the reason `git worktree prune` alone is not enough — git skips prunability checks on
+ * them, so a locked record whose checkout was deleted is never reported as prunable and would
+ * otherwise be reused forever. Best-effort: recreation below is what actually has to succeed.
+ */
+async function forgetStaleWorktree(repoPath: string, path: string): Promise<void> {
+  try {
+    await git(repoPath, ["worktree", "remove", "--force", "--force", path]);
+  } catch {
+    // Fall through to prune, which clears an unlocked record whose gitdir is dangling.
+  }
+  try {
+    await git(repoPath, ["worktree", "prune"]);
+  } catch {
+    // best-effort
+  }
 }
 
 /** Resolve the repo's current HEAD branch, falling back to "HEAD" (detached HEAD). */

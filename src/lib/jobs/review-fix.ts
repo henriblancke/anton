@@ -15,6 +15,7 @@
  * existing branch (a re-run just pushes whatever is left), and finalizing a merge clears
  * `stage:in-review` so a later sweep no longer treats the epic as in-review (never finalized twice).
  */
+import { existsSync } from "node:fs";
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { runClaude } from "../claude/driver";
 import { branchAheadOfRemote, commitAll, fetchOrigin, mergeIntoCurrent, pushBranch } from "../git/ops";
@@ -249,6 +250,14 @@ async function prepareFixWorktree(args: {
   const { ctx, repo, branch, settings, baseBranch, pr, number } = args;
 
   const worktree = await createWorktree({ repoPath: repo, branch, baseBranch: settings.baseBranch, warm: false });
+  // Fail loudly here rather than letting a missing worktree ride through the best-effort git steps
+  // below — `safe()` swallows their errors, so the first thing to actually report the problem would
+  // be `spawn <claude> ENOENT` from the cwd, which names the wrong culprit entirely (anton-2wvb).
+  if (!existsSync(worktree.path)) {
+    throw new Error(
+      `PR #${number}: worktree for ${branch} is missing after creation (${worktree.path}) — refusing to run claude against a non-existent cwd`,
+    );
+  }
   await ctx.heartbeat();
 
   await safe(() => fetchOrigin(worktree.path, baseBranch ? [baseBranch, branch] : [branch]));
