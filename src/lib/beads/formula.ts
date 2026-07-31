@@ -35,7 +35,7 @@ import {
   BEAD_FORMULA_FILENAME,
   bundledBeadFormulaPath as bundledFormulaUnder,
 } from "./config.mjs";
-import { validateBeadContract } from "./contract";
+import { renderedText, validateBeadContract } from "./contract";
 
 export { BEAD_FORMULA_FILENAME };
 
@@ -230,10 +230,12 @@ export function renderBeadSkeleton(
       `bead formula ${formula.source}: unresolved ${names} in the \`${tier}\` template — supply the value or add a var default`,
     );
   }
-  // Only the description counts as consumption: it is the sole templated field the skeleton emits
-  // (`step.title` is never rendered — `createDraftEpic` uses the draft's own title), so a var
-  // referenced there alone would still vanish from the created bead.
-  const referenced = new Set([...step.description.matchAll(VAR_TOKEN)].map((m) => m[1]));
+  // Only OUTPUT-BEARING description text counts as consumption: the description is the sole
+  // templated field the skeleton emits (`step.title` is never rendered — `createDraftEpic` uses the
+  // draft's own title), and within it a placeholder hidden in an HTML comment interpolates into
+  // markup the render never shows — the raw-template scan read `<!-- {{outcome}} -->` as consumed
+  // while the founder's value landed invisibly and a static section shadowed it.
+  const referenced = new Set([...renderedText(step.description).matchAll(VAR_TOKEN)].map((m) => m[1]));
   const discarded = TIER_CONTRACT_VARS[tier].filter((n) => {
     if (!vars[n]?.trim() || referenced.has(n)) return false;
     if (n !== TIER_ACCEPTANCE_VAR[tier]) return true;

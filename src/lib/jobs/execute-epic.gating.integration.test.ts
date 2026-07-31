@@ -488,6 +488,50 @@ process.exit(0);`),
     expect((await beads.show(repo, epicC)).labels ?? []).toContain("stage:in-review");
   });
 
+  it("re-gates the grouped TARGET when regenerating a closed child whose commit is missing", async () => {
+    // A grouped run whose children all arrived closed is gated on nothing at step 0c
+    // (contractGatedBeads returns []) — the closed-PR recovery shape. On a cross-machine resume a
+    // closed child whose commit is absent from this branch regenerates, and its re-gate must read
+    // the TARGET's spec too: the target's criteria are the rubric self-review scores the
+    // regenerated work against, and checking the child alone let a legacy target with no Success
+    // Criteria drive a dispatch the gate would refuse for any normally-open child.
+    const legacy = await beads.create(repo, {
+      title: "Legacy target, no Success Criteria",
+      type: "epic",
+      description: "## Goal\nWritten goal, but no rubric anywhere.",
+    });
+    await beads.approve(repo, legacy);
+    const closedChild = createTicket(repo, {
+      title: "Closed child with no commit",
+      parent: legacy,
+      acceptance: "work file exists",
+    });
+    // Closed on the board with NO commit on any branch — the cross-machine shape: another machine
+    // closed it, then crashed before the PR step ever pushed the branch.
+    await beads.close(repo, closedChild);
+
+    const runner = makeEpicRunner(ctx);
+    const jobId = await driveEpicRun(runner, { projectId, epicBeadId: legacy });
+
+    // Poison → parked naming the TARGET and its missing rubric, before the child is reopened or
+    // any agent dispatched.
+    const job = await getJob(tdb.db, jobId);
+    expect(job?.status).toBe("parked");
+    expect(job?.lastError).toContain(legacy);
+    expect(job?.lastError).toMatch(/Success Criteria/);
+    expect((await beads.show(repo, closedChild)).status).toBe("closed");
+
+    // Recoverable: write the target's rubric → resume → the child regenerates and the run completes.
+    execFileSync("bd", ["update", legacy, "--acceptance", "work file exists"], {
+      cwd: repo,
+      stdio: "ignore",
+    });
+    expect(await resumeJob(tdb.db, clock, jobId)).toBe(true);
+    await tickToIdle(runner);
+    expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+    expect((await beads.show(repo, legacy)).labels ?? []).toContain("stage:in-review");
+  });
+
   it("runs clean when every contract gap is advisory — thin prose never withholds a run", async () => {
     // Goal / Context / Out of scope / Verify cost quality, not runnability: this epic and its ticket
     // carry nothing but Acceptance, and the run must reach a PR exactly as a fully-shaped one does.

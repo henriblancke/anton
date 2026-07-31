@@ -274,6 +274,53 @@ describe("interpolation", () => {
     ).toThrow(/the `epic` template never references \{\{success_criteria\}\}/);
   });
 
+  it("fails loud when the only reference to a contract var hides inside an HTML comment", () => {
+    // A raw-template scan counted `<!-- {{outcome}} -->` as consumption, but interpolation puts the
+    // founder's outcome only in invisible markup — the validator strips the comment and accepts the
+    // static Goal, so the submitted outcome silently vanished from every rendered view.
+    const doc = JSON.stringify({
+      formula: "anton-bead",
+      vars: {},
+      steps: [
+        {
+          id: "epic",
+          description:
+            "## Goal\n\nA static, already-written goal.\n<!-- {{outcome}} -->\n\n## Success Criteria\n\n{{success_criteria}}",
+        },
+        { id: "feature", description: "f" },
+        { id: "ticket", description: "t" },
+      ],
+    });
+    expect(() =>
+      renderBeadSkeleton(parseBeadFormula(doc, "test"), "epic", {
+        outcome: "Reports leave the app.",
+        success_criteria: "- [ ] every report exports",
+      }),
+    ).toThrow(/the `epic` template never references \{\{outcome\}\}/);
+  });
+
+  it("counts a reference inside fenced code — fenced content renders literally, so it survives", () => {
+    // The inverse guard: a `{{outcome}}` inside a ``` block IS output-bearing (renderedLines keeps
+    // fenced content), so the consumption check must not fault a template that renders it there.
+    const doc = JSON.stringify({
+      formula: "anton-bead",
+      vars: {},
+      steps: [
+        {
+          id: "epic",
+          description: "## Goal\n\n```\n{{outcome}}\n```\n\n## Success Criteria\n\n{{success_criteria}}",
+        },
+        { id: "feature", description: "f" },
+        { id: "ticket", description: "t" },
+      ],
+    });
+    const skeleton = renderBeadSkeleton(parseBeadFormula(doc, "test"), "epic", {
+      outcome: "Reports leave the app.",
+      success_criteria: "- [ ] every report exports",
+    });
+    expect(skeleton.description).toContain("Reports leave the app.");
+  });
+
   it("ignores another tier's vars in the bag — one bag renders every tier, as `bd cook --var` does", () => {
     const doc = JSON.stringify({
       formula: "anton-bead",

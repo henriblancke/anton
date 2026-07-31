@@ -862,8 +862,14 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           }
           // Same re-gate for the bead contract (anton-j9zs): step 0c skipped this ticket as
           // resume-skipped, which only holds while it isn't re-run. Regenerating its work under a
-          // spec with no definition of done is the state that gate exists to refuse.
-          const regressed = contractGaps([ticket], "blocking");
+          // spec with no definition of done is the state that gate exists to refuse. The grouped
+          // TARGET is re-checked alongside the ticket: its criteria are the rubric self-review
+          // scores the regenerated work against, and a run whose children all arrived closed was
+          // gated on nothing at 0c — this is the first time that target's spec is read.
+          const regressed = contractGaps(
+            ticket.id === target.id ? [ticket] : [target, ticket],
+            "blocking",
+          );
           if (regressed.length > 0) {
             throw new PoisonEpic(
               `epic ${epicBeadId} has beads that don't meet the bead contract: ` +

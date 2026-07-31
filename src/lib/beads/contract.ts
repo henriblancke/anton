@@ -304,6 +304,19 @@ function renderedLines(raw: string): { text: string; fenced: boolean }[] {
 }
 
 /**
+ * The text a raw markdown body RENDERS, as one string: {@link renderedLines} joined — fence
+ * delimiters dropped, HTML comments stripped, fenced content kept literally. For judges of raw
+ * markdown that are not section-shaped, e.g. the formula's consumption check (formula.ts): a
+ * `{{var}}` referenced only inside a comment interpolates into markup the render never shows, so
+ * scanning the raw template counted it as consumed while the founder's value landed invisibly.
+ */
+export function renderedText(raw: string): string {
+  return renderedLines(raw)
+    .map((l) => l.text)
+    .join("\n");
+}
+
+/**
  * The state of a section given every place its text can live. `written` wins over `prompt` (an
  * author who filled the description section has written it, whatever bd's field still holds), and a
  * body counts as a prompt only when EVERY line of it is one — a section where boxes were filled and
