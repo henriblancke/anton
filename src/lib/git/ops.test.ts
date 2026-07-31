@@ -9,7 +9,13 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openPullRequest, pullRequestState, resolveFreshBase, worktreeHasCommitFor } from "./ops";
+import {
+  diffAgainstBase,
+  openPullRequest,
+  pullRequestState,
+  resolveFreshBase,
+  worktreeHasCommitFor,
+} from "./ops";
 import { GH_BIN_ENV } from "./ops";
 
 function has(cmd: string): boolean {
@@ -286,5 +292,81 @@ suite("resolveFreshBase (real git)", () => {
     expect(ref).toBe("main");
     // No remote → no fetch attempt → no warning.
     expect(warn).not.toHaveBeenCalled();
+  });
+});
+
+suite("diffAgainstBase (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-diffbase-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+    g(["checkout", "-q", "-b", "anton/epic-1"]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("returns the branch's changed files and patch against the base", async () => {
+    writeFileSync(join(repo, "a.ts"), "export const a = 1;\n");
+    writeFileSync(join(repo, "b.ts"), "export const b = 2;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "t1: add a and b"]);
+
+    const diff = await diffAgainstBase(repo, "main");
+
+    expect(diff.files).toEqual(["a.ts", "b.ts"]);
+    expect(diff.patch).toContain("+export const a = 1;");
+    expect(diff.patch).toContain("+export const b = 2;");
+    expect(diff.truncated).toBe(false);
+  });
+
+  it("diffs from the merge base, so later base commits are not attributed to the run", async () => {
+    writeFileSync(join(repo, "a.ts"), "export const a = 1;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "t1: add a"]);
+
+    // The base moves on after the run branched (another PR merged) — not this run's work.
+    g(["checkout", "-q", "main"]);
+    writeFileSync(join(repo, "other.ts"), "export const other = 0;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "someone else"]);
+    g(["checkout", "-q", "anton/epic-1"]);
+
+    const diff = await diffAgainstBase(repo, "main");
+
+    expect(diff.files).toEqual(["a.ts"]);
+    expect(diff.patch).not.toContain("other.ts");
+  });
+
+  it("reports no changes for a branch that committed nothing", async () => {
+    const diff = await diffAgainstBase(repo, "main");
+    expect(diff).toEqual({ files: [], patch: "", truncated: false });
+  });
+
+  it("truncates the patch at maxPatchChars but keeps the full file list", async () => {
+    writeFileSync(join(repo, "big.ts"), "// filler line\n".repeat(500));
+    writeFileSync(join(repo, "small.ts"), "export const s = 1;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "t1: big change"]);
+
+    const diff = await diffAgainstBase(repo, "main", { maxPatchChars: 200 });
+
+    expect(diff.truncated).toBe(true);
+    expect(diff.files).toEqual(["big.ts", "small.ts"]);
+    expect(diff.patch).toContain("patch truncated at 200 chars");
+    // The cap bounds the patch text itself; only the truncation note follows it.
+    expect(diff.patch.length).toBeLessThan(300);
   });
 });

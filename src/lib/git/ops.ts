@@ -152,6 +152,53 @@ export async function worktreeHasCommitFor(
   return subjects.split("\n").some((s) => s.startsWith(prefix));
 }
 
+/** A branch's change set against its base: the changed paths plus the (possibly truncated) patch. */
+export interface BranchDiff {
+  /** Paths the branch changed since it diverged from the base. Always complete. */
+  files: string[];
+  /** Unified patch for those changes, cut at `maxPatchChars`. */
+  patch: string;
+  /** True when `patch` was cut short — the file list still names everything that changed. */
+  truncated: boolean;
+}
+
+/**
+ * Cap on the patch text {@link diffAgainstBase} returns. Generous enough to carry a whole run's
+ * diff into a review prompt, bounded so one pathological change (a lockfile, a vendored blob)
+ * can't blow the context window.
+ */
+export const DEFAULT_DIFF_PATCH_CHARS = 200_000;
+
+/**
+ * The work a branch added on top of `base`: the changed files and the unified patch, for the
+ * pre-PR self-review gate (anton-3apm) to review.
+ *
+ * Diffs from the MERGE BASE, not from the base tip, so commits that landed on the base after the
+ * run branched are never mistaken for the run's own work. When no merge base exists (unrelated
+ * histories) it falls back to diffing against `base` directly rather than failing the review.
+ */
+export async function diffAgainstBase(
+  worktreePath: string,
+  base: string,
+  opts: { maxPatchChars?: number } = {},
+): Promise<BranchDiff> {
+  const from = await git(worktreePath, ["merge-base", base, "HEAD"]).catch(() => base);
+  const names = await git(worktreePath, ["diff", "--name-only", from, "HEAD"]);
+  const files = names
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  const full = await git(worktreePath, ["diff", from, "HEAD"]);
+  const max = opts.maxPatchChars ?? DEFAULT_DIFF_PATCH_CHARS;
+  if (full.length <= max) return { files, patch: full, truncated: false };
+  return {
+    files,
+    patch: `${full.slice(0, max)}\n… [patch truncated at ${max} chars — read the files directly]`,
+    truncated: true,
+  };
+}
+
 export interface PullRequest {
   url: string;
   /** beads external-ref form: `gh-<number>` when the number is parseable, else the url. */
