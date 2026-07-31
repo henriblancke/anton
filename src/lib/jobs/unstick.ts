@@ -22,16 +22,26 @@
  *     it hourly over an unchanged stall re-enqueues once, not once per hour. Escalations converge
  *     the same way, on `escalations_open_unique`.
  *   • RE-VERIFICATION — the report is a candidate list, never an authority. Every finding is
- *     re-checked against live runs/jobs/board before anything is touched, so a report minutes or
- *     hours old can't resurrect a run that has since moved on, nor steal one a live job owns. The
- *     board half of that check is read after a PULL and fails closed when the pull doesn't land:
+ *     re-checked against live runs/jobs/board/PR before anything is touched, so a report minutes or
+ *     hours old can't resurrect a run that has since moved on, steal one a live job owns, or nag a
+ *     founder about a PR that merged or a job someone already resumed. Escalations are re-checked
+ *     for the same reason resumes are: a stale one asks for a decision on work that already moved,
+ *     and its "abandon" would cancel it. The board half of that check is read after a PULL and fails
+ *     closed when the pull doesn't land:
  *     run ownership is cross-machine state, and a stale local mirror of it can only be wrong in the
  *     direction that double-runs.
  */
 import { beads, type Bead } from "../beads/bd";
-import { getProjectById } from "../projects";
+import { getPrActivity, type PrActivity } from "../git/pr";
+import {
+  DEFAULT_MAX_RETRIES,
+  getProjectById,
+  getProjectSettings,
+  resolveRunHealthThresholds,
+} from "../projects";
 import { getRunHealthReport, type RunHealthFinding } from "../run-health";
 import { listRunsByStatus, type RunRow } from "../runs";
+import { detectExhaustedJobs, detectStalePrs } from "./run-health";
 import {
   markEscalationNoted,
   raiseEscalation,
@@ -42,6 +52,7 @@ import {
   activeExecuteEpicId,
   activeExecuteEpicKeys,
   enqueueExecuteEpicIfAbsent,
+  getJob,
   latestExecuteEpicJob,
   resumableExecuteEpicId,
   resumeJob,
@@ -65,6 +76,12 @@ export interface UnstickPayload {
 export interface UnstickDeps {
   db: AntonDb;
   clock?: Clock;
+  /**
+   * How the pass re-reads a PR before escalating a `stale-pr` finding. Injectable for the same
+   * reason the sweep's is (tests, any future non-GitHub forge); the default is the real read-only
+   * `gh pr view`.
+   */
+  readPrActivity?: (repo: string, number: number, signal?: AbortSignal) => Promise<PrActivity>;
 }
 
 /**
@@ -104,6 +121,14 @@ export interface UnstickContext {
   boardFresh: boolean;
   /** When this epic's quota window reopens (ms epoch), or undefined when nothing recorded one. */
   usageWindowEndsAt: (epicBeadId: string) => number | undefined;
+  /**
+   * Whether a `stale-pr` / `exhausted-job` finding STILL satisfies the detector that raised it,
+   * re-checked against the live PR and job rows (see {@link revalidate}). Those two kinds carry no
+   * other live handle in this context — a run row or a bead — so without this the pass would
+   * escalate a PR that merged, or a job an operator resumed, in the window between the sweep and
+   * now. Prefetched, because the classifier stays synchronous and pure.
+   */
+  stillStuck: (finding: RunHealthFinding) => boolean;
 }
 
 function hold(why: string): UnstickVerdict {
@@ -217,7 +242,20 @@ export function classifyFinding(
     }
 
     // stale-pr and exhausted-job are never auto-actionable: a PR nobody reviewed needs a reviewer,
-    // and a job that spent its whole retry budget already proved retrying doesn't fix it.
+    // and a job that spent its whole retry budget already proved retrying doesn't fix it. They are
+    // still re-checked first, for the same reason the two resumable kinds are — the report is a
+    // candidate list. A PR merged since the sweep would otherwise be escalated as idle, and a
+    // resumed job would be escalated as exhausted, where "abandon" then cancels live work.
+    case "stale-pr":
+      return ctx.stillStuck(finding)
+        ? escalate(finding.reason)
+        : hold("the PR has since merged, closed, or been picked back up");
+
+    case "exhausted-job":
+      return ctx.stillStuck(finding)
+        ? escalate(finding.reason)
+        : hold("the job has since been resumed or settled");
+
     default:
       return escalate(finding.reason);
   }
@@ -299,10 +337,11 @@ export interface UnstickSummary {
  * NEXT pass retries the note, rather than failing the pass and losing the resumes it already made.
  */
 export async function unstickPass(
-  deps: { db: AntonDb; clock: Clock },
+  deps: { db: AntonDb; clock: Clock; readPrActivity?: UnstickDeps["readPrActivity"] },
   opts: { projectId: string; repoPath: string; heartbeat?: () => Promise<void> },
 ): Promise<UnstickSummary> {
   const { db, clock } = deps;
+  const readPrActivity = deps.readPrActivity ?? getPrActivity;
   const { projectId, repoPath } = opts;
   const heartbeat = opts.heartbeat ?? (async () => {});
   const summary: UnstickSummary = { findings: 0, resumed: 0, escalated: 0, held: 0 };
@@ -335,6 +374,8 @@ export async function unstickPass(
 
   // One job read per epic at most, memoized: several findings can point at the same epic.
   const usageWindows = new Map<string, number | undefined>();
+  // Per-finding re-check verdicts for the two kinds with no live handle in the context below.
+  const stillStuck = new Map<string, boolean>();
   const ctx: UnstickContext = {
     projectId,
     nowMs: clock.now(),
@@ -343,6 +384,9 @@ export async function unstickPass(
     board: new Map(board.map((b) => [b.id, b])),
     boardFresh,
     usageWindowEndsAt: (epicBeadId) => usageWindows.get(epicBeadId),
+    // Absent → the finding was never re-checked (a kind that judges itself off the context), so the
+    // report's word stands.
+    stillStuck: (finding) => stillStuck.get(finding.key) ?? true,
   };
 
   // Prime the memo before classifying: `usageWindowEndsAt` is synchronous so the pure classifier
@@ -353,6 +397,32 @@ export async function unstickPass(
       run.epicBeadId,
       usageWindowEnd(await latestExecuteEpicJob(db, projectId, run.epicBeadId)),
     );
+  }
+
+  // Same reason, one gh/job read per stale-pr / exhausted-job finding. The thresholds come from the
+  // project's own settings so the re-check applies the SAME bar the sweep did.
+  const settings = await getProjectSettings(db, projectId);
+  const thresholds = resolveRunHealthThresholds(settings);
+  for (const finding of report.findings) {
+    if (finding.kind === "stale-pr") {
+      stillStuck.set(
+        finding.key,
+        await stalePrStillStuck(finding, {
+          repoPath,
+          readPrActivity,
+          nowMs: ctx.nowMs,
+          thresholdMs: thresholds.stalePrHours * 3_600_000,
+          bead: finding.beadId ? ctx.board.get(finding.beadId) : undefined,
+          boardFresh,
+        }),
+      );
+      await heartbeat();
+    } else if (finding.kind === "exhausted-job") {
+      stillStuck.set(
+        finding.key,
+        await exhaustedJobStillStuck(db, finding, settings.maxRetries ?? DEFAULT_MAX_RETRIES, ctx.nowMs),
+      );
+    }
   }
 
   let wroteBeads = false;
@@ -401,6 +471,60 @@ export async function unstickPass(
 }
 
 /**
+ * Does a `stale-pr` finding still hold? Re-read through the sweep's OWN detector, so the two can
+ * never drift on what "idle" means: a PR that merged, closed, or was touched since the report is no
+ * longer stalled, and escalating it would ask a founder to judge work that already moved.
+ *
+ * Fails OPEN — an unreadable PR keeps the finding — because a missed escalation strands the stall
+ * the sweep exists to surface, while a redundant one costs a glance. The bead check only counts on a
+ * FRESH board: a closed bead read off a stale local mirror is not evidence the work is done.
+ */
+async function stalePrStillStuck(
+  finding: RunHealthFinding,
+  opts: {
+    repoPath: string;
+    readPrActivity: NonNullable<UnstickDeps["readPrActivity"]>;
+    nowMs: number;
+    thresholdMs: number;
+    bead: Bead | undefined;
+    boardFresh: boolean;
+  },
+): Promise<boolean> {
+  if (opts.boardFresh && opts.bead?.status === "closed") return false;
+  if (finding.prNumber === undefined || !finding.beadId) return true;
+  try {
+    const activity = await opts.readPrActivity(opts.repoPath, finding.prNumber);
+    return (
+      detectStalePrs([{ beadId: finding.beadId, activity }], opts.nowMs, opts.thresholdMs).length > 0
+    );
+  } catch (e) {
+    console.error(
+      `[unstick] could not re-read PR #${finding.prNumber} for ${finding.beadId}; escalating on the report's word`,
+      e,
+    );
+    return true;
+  }
+}
+
+/**
+ * Does an `exhausted-job` finding still hold? A job an operator (or a prior escalation) resumed
+ * between the sweep and now is live work again — escalating it would offer an "abandon" that
+ * cancels a running job. Judged by the sweep's own detector against the CURRENT row; a job that has
+ * vanished settled its own way.
+ */
+async function exhaustedJobStillStuck(
+  db: AntonDb,
+  finding: RunHealthFinding,
+  maxAttempts: number,
+  nowMs: number,
+): Promise<boolean> {
+  if (!finding.jobId) return true;
+  const job = await getJob(db, finding.jobId);
+  if (!job) return false;
+  return detectExhaustedJobs([job], maxAttempts, nowMs).length > 0;
+}
+
+/**
  * The epic an escalation's resume button would target. For a parked run that's the run's epic (the
  * finding names the ticket, but jobs are keyed by epic); otherwise the finding's own bead, which for
  * a stale PR or a dead lease IS the run target.
@@ -441,6 +565,7 @@ async function writeEscalationNote(
 export function makeUnstickHandler(deps: UnstickDeps): JobHandler {
   const db = deps.db;
   const clock = deps.clock ?? systemClock;
+  const readPrActivity = deps.readPrActivity;
 
   return async function unstick(ctx: JobContext): Promise<void> {
     const { projectId } = ctx.payload as UnstickPayload;
@@ -448,7 +573,7 @@ export function makeUnstickHandler(deps: UnstickDeps): JobHandler {
     if (!project) throw new PoisonError(`project ${projectId} not found`);
 
     const summary = await unstickPass(
-      { db, clock },
+      { db, clock, readPrActivity },
       { projectId, repoPath: project.repoPath, heartbeat: () => ctx.heartbeat() },
     );
     console.log(

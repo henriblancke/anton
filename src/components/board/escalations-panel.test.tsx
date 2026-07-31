@@ -79,6 +79,18 @@ describe("EscalationsPanel", () => {
     expect(html).toContain("PR #42");
   });
 
+  it("offers Dismiss instead of Resume on a stale PR — re-running the epic would change nothing", () => {
+    // execute-epic short-circuits on an open PR, so a resume here settles the row and leaves the PR
+    // exactly as stale; the next sweep raises it again. The founder's move is to review it.
+    const html = render([
+      escalation({ kind: "stale-pr", prNumber: 42, prUrl: "https://github.com/o/r/pull/42" }),
+    ]);
+
+    expect(html).toContain("Dismiss");
+    expect(html).not.toContain("Resume");
+    expect(html).toContain("Abandon"); // the work can still be called won't-do
+  });
+
   it("offers both answers when the escalation names a target for each", () => {
     const html = render([escalation()]);
     expect(html).toContain("Resume");

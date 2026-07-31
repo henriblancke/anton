@@ -15,6 +15,7 @@ import {
   resolveBudgetPolicy as resolveBudgetPolicyFromSettings,
 } from "../projects";
 import { beads } from "../beads/bd";
+import { backfillDefaultSchedules } from "../schedules";
 import { allIssues } from "../beads/issues";
 import { assertRepoSchemaCurrent, preflightBd } from "../beads/bd-bin";
 import { hasLocalDoltDb } from "../beads/config.mjs";
@@ -191,6 +192,19 @@ export async function startRunner(): Promise<void> {
   for (const project of await listProjects()) {
     if (!hasLocalDoltDb(join(project.repoPath, ".beads"))) continue;
     assertRepoSchemaCurrent(bin, project.repoPath);
+  }
+
+  // Backfill schedule types shipped since each project was registered (anton-wvcy): seeding runs
+  // only at project creation and no migration adds schedule rows, so without this an upgraded
+  // installation never gets a new automation at all — enabling run-health would leave unstick
+  // unscheduled, piling up reports with nothing acting on them. Best-effort: a scheduling hiccup
+  // must not block boot, exactly as it doesn't block project creation.
+  try {
+    for (const { projectId, created } of await backfillDefaultSchedules(getDb(), systemClock)) {
+      log.info(`seeded missing schedules for ${projectId}: ${created.join(", ")}`);
+    }
+  } catch (e) {
+    log.error("backfilling default schedules failed", e);
   }
   const s = state();
   if (!s.reconciled) {

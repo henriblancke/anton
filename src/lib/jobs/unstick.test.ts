@@ -14,6 +14,7 @@ import { eq } from "drizzle-orm";
 import * as schema from "../db/schema";
 import { makeTestDb, type TestDb } from "../db/testing";
 import { LABELS, type Bead } from "../beads/bd";
+import type { PrActivity } from "../git/pr";
 import { saveRunHealthReport, type RunHealthFinding } from "../run-health";
 import type { Clock } from "./queue";
 
@@ -49,6 +50,20 @@ function secDate(ms: number): Date {
 
 let t: TestDb;
 
+/** The live PR the pass re-reads before escalating a `stale-pr` finding. Idle by default. */
+const prActivityMock = vi.fn<(repo: string, number: number) => Promise<PrActivity>>();
+
+function prActivity(o: Partial<PrActivity> = {}): PrActivity {
+  return {
+    number: 42,
+    state: "OPEN",
+    url: "https://github.com/o/r/pull/42",
+    updatedAtMs: NOW - 3 * 24 * HOUR,
+    isDraft: false,
+    ...o,
+  };
+}
+
 beforeEach(() => {
   t = makeTestDb();
   t.db
@@ -59,6 +74,7 @@ beforeEach(() => {
   noteMock.mockResolvedValue(undefined);
   syncMock.mockResolvedValue(undefined);
   pullMock.mockResolvedValue(undefined);
+  prActivityMock.mockResolvedValue(prActivity());
 });
 
 afterEach(() => {
@@ -86,6 +102,52 @@ function seedReport(...findings: RunHealthFinding[]): Promise<void> {
   return saveRunHealthReport(t.db, clock, { projectId: "p1", findings });
 }
 
+/** A settled job the report's `exhausted-job` finding points at, re-read before escalating. */
+function seedJob(id: string, o: { status: string; attempts: number; lastError: string }): void {
+  t.db
+    .insert(schema.jobs)
+    .values({
+      id,
+      type: "execute-epic",
+      projectId: "p1",
+      payloadJson: JSON.stringify({ projectId: "p1", epicBeadId: "e-9" }),
+      status: o.status,
+      attempts: o.attempts,
+      lastError: o.lastError,
+      runAt: secDate(NOW - 4 * HOUR),
+      createdAt: secDate(NOW - 5 * HOUR),
+      updatedAt: secDate(NOW - 4 * HOUR),
+    })
+    .run();
+}
+
+function seedStalePrReport(): Promise<void> {
+  return seedReport({
+    kind: "stale-pr",
+    key: "stale-pr:e-3:42",
+    reason: "PR #42 idle 3d with the target still in review",
+    since: NOW - 3 * 24 * HOUR,
+    ageMs: 3 * 24 * HOUR,
+    beadId: "e-3",
+    prNumber: 42,
+    prUrl: "https://github.com/o/r/pull/42",
+  });
+}
+
+function seedExhaustedJobReport(...jobIds: string[]): Promise<void> {
+  return seedReport(
+    ...jobIds.map((jobId) => ({
+      kind: "exhausted-job" as const,
+      key: `exhausted-job:${jobId}`,
+      reason: "execute-epic job parked",
+      since: NOW - 4 * HOUR,
+      ageMs: 4 * HOUR,
+      jobId,
+      beadId: "e-9",
+    })),
+  );
+}
+
 function parkedRunFinding(runId: string, beadId: string, reason: string): RunHealthFinding {
   return {
     kind: "parked-run",
@@ -98,7 +160,11 @@ function parkedRunFinding(runId: string, beadId: string, reason: string): RunHea
   };
 }
 
-const sweep = () => unstickPass({ db: t.db, clock }, { projectId: "p1", repoPath: REPO });
+const sweep = () =>
+  unstickPass(
+    { db: t.db, clock, readPrActivity: (repo, number) => prActivityMock(repo, number) },
+    { projectId: "p1", repoPath: REPO },
+  );
 
 function jobRows() {
   return t.db.select().from(schema.jobs).all();
@@ -351,6 +417,56 @@ describe("non-resumable parks produce exactly one escalation and no enqueue", ()
 
     expect(await sweep()).toMatchObject({ escalated: 0, held: 1 });
     expect(escalationRows()).toHaveLength(1);
+  });
+
+  it("holds a stale-pr finding whose PR merged between the sweep and now", async () => {
+    // The report named it idle; it has since landed. Escalating would ask the founder to judge —
+    // and possibly abandon — work that is already delivered.
+    prActivityMock.mockResolvedValue(prActivity({ state: "MERGED" }));
+    await seedStalePrReport();
+
+    expect(await sweep()).toMatchObject({ findings: 1, escalated: 0, held: 1 });
+    expect(escalationRows()).toEqual([]);
+    expect(prActivityMock).toHaveBeenCalledWith(REPO, 42);
+  });
+
+  it("holds a stale-pr finding whose PR someone has since touched", async () => {
+    // Re-checked through the sweep's own detector, so "idle" means the same thing in both passes:
+    // an hour-old review comment puts this PR well inside the 24h threshold.
+    prActivityMock.mockResolvedValue(prActivity({ updatedAtMs: NOW - HOUR }));
+    await seedStalePrReport();
+
+    expect(await sweep()).toMatchObject({ escalated: 0, held: 1 });
+    expect(escalationRows()).toEqual([]);
+  });
+
+  it("escalates a stale-pr finding the re-read confirms, and once the PR is unreadable", async () => {
+    await seedStalePrReport();
+    expect(await sweep()).toMatchObject({ escalated: 1 });
+
+    // Fails OPEN: a gh outage must not silently drop the stall the sweep exists to surface.
+    t.db.delete(schema.escalations).run();
+    prActivityMock.mockRejectedValue(new Error("gh unavailable"));
+    expect(await sweep()).toMatchObject({ escalated: 1 });
+  });
+
+  it("holds an exhausted-job finding whose job has since been resumed", async () => {
+    // An operator un-parked it after the sweep. Escalating now would offer an "abandon" that
+    // cancels a job which is live again.
+    seedJob("j-9", { status: "queued", attempts: 3, lastError: "tests failed" });
+    await seedExhaustedJobReport("j-9");
+
+    expect(await sweep()).toMatchObject({ findings: 1, escalated: 0, held: 1 });
+    expect(escalationRows()).toEqual([]);
+  });
+
+  it("escalates a job still parked out of attempts, and a poison park that never retried", async () => {
+    seedJob("j-9", { status: "parked", attempts: 3, lastError: "failed 3×: tests failed" });
+    seedJob("j-10", { status: "parked", attempts: 1, lastError: "poison: agent 'x' is disabled" });
+    await seedExhaustedJobReport("j-9", "j-10");
+
+    expect(await sweep()).toMatchObject({ findings: 2, escalated: 2, held: 0 });
+    expect(escalationRows().map((r) => r.jobId).sort()).toEqual(["j-10", "j-9"]);
   });
 
   it("raises a fresh escalation once a resolved one no longer covers the stall", async () => {

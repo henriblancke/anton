@@ -213,6 +213,13 @@ export type Outcome =
   | { kind: "poison"; error: string }
   | { kind: "error"; error: string };
 
+/**
+ * How a poison park spells itself on the job row. Exported because a park is only distinguishable
+ * from a retry-exhausted one by this marker — the run-health sweep reads it to surface a job that
+ * skipped the retry budget entirely (attempts are no evidence there).
+ */
+export const POISON_PARK_PREFIX = "poison:";
+
 export type Action =
   | { action: "complete" }
   | { action: "reschedule"; runAtMs: number; refundAttempt: boolean; lastError?: string }
@@ -272,7 +279,7 @@ export function nextAction(
       };
     }
     case "poison":
-      return { action: "park", lastError: `poison: ${outcome.error}` };
+      return { action: "park", lastError: `${POISON_PARK_PREFIX} ${outcome.error}` };
     case "error": {
       if (job.attempts >= config.maxAttempts) {
         return { action: "park", lastError: `failed ${job.attempts}×: ${outcome.error}` };

@@ -176,7 +176,7 @@ export const escalations = sqliteTable(
     evidenceJson: text("evidence_json").notNull().default("{}"),
     // open | resolved
     status: text("status").notNull().default("open"),
-    // resumed | abandoned — how the founder settled it (null while open).
+    // resumed | abandoned | dismissed — how the founder settled it (null while open).
     resolution: text("resolution"),
     /** When the board-native `bd note` landed. Null with a `beadId` set means the write failed and
      *  the next pass retries it — the note is what makes the escalation visible off the anton UI. */

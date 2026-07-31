@@ -95,6 +95,32 @@ describe("EscalationActions — abandon", () => {
   });
 });
 
+describe("EscalationActions — dismiss", () => {
+  it("settles the row in one click and says the sweep will re-raise it", async () => {
+    // The answer for a stall anton has no verb for (a stale PR waits on a reviewer). It must read
+    // as an acknowledgement, not as a fix — otherwise the panel implies the PR was dealt with.
+    const fetchMock = stubFetch({ action: "dismiss", detail: "dismissed" });
+    mount({ canResume: false, canDismiss: true });
+
+    expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+
+    await waitFor(() => expect(refresh).toHaveBeenCalled());
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/projects/anton/escalations/esc-1",
+      expect.objectContaining({ body: JSON.stringify({ action: "dismiss" }) }),
+    );
+    expect(success).toHaveBeenCalledWith(
+      "Dismissed — anton raises it again if it's still stuck at the next sweep",
+    );
+  });
+
+  it("is absent unless the escalation is one anton cannot act on", () => {
+    mount();
+    expect(screen.queryByRole("button", { name: "Dismiss" })).toBeNull();
+  });
+});
+
 describe("EscalationActions — what the escalation can support", () => {
   it("offers only the answers the finding names a target for", () => {
     mount({ canResume: false });

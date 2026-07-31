@@ -153,20 +153,63 @@ export const DEFAULT_SCHEDULES: Array<{
   { type: "unstick", cron: "10 * * * *" }, // act on the sweep's findings, 10 min after it
 ];
 
-/** Idempotently seed the default schedules for a project (no-op for types it already has). */
+/**
+ * Idempotently seed the default schedules for a project. Returns the types it actually created, so
+ * a backfill can say what it added; a type the project already has is left exactly as the operator
+ * left it — same cron, same enabled — never re-created or re-armed.
+ */
 export async function seedDefaultSchedules(
   db: AntonDb,
   clock: Clock,
   projectId: string,
-): Promise<void> {
+): Promise<ScheduledJobType[]> {
+  const rows = await db
+    .select({ type: schema.schedules.type })
+    .from(schema.schedules)
+    .where(eq(schema.schedules.projectId, projectId));
+  const existing = new Set(rows.map((r) => r.type));
+
+  const created: ScheduledJobType[] = [];
   for (const d of DEFAULT_SCHEDULES) {
-    await ensureSchedule(db, clock, {
+    if (existing.has(d.type)) continue;
+    await createSchedule(db, clock, {
       projectId,
       type: d.type,
       cron: d.cron,
       enabled: d.enabled,
     });
+    created.push(d.type);
   }
+  return created;
+}
+
+/** What a backfill added for one project — empty entries are dropped, so this is a change log. */
+export interface ScheduleBackfill {
+  projectId: string;
+  created: ScheduledJobType[];
+}
+
+/**
+ * Seed every registered project's missing default schedules — the upgrade path for schedule types
+ * shipped after a project was added.
+ *
+ * {@link seedDefaultSchedules} otherwise runs only while INSERTING a project, and no migration
+ * backfills schedule rows, so on an existing installation a newly-shipped type simply never exists:
+ * turning on `run-health` from settings creates just that row and leaves `unstick` unscheduled,
+ * accruing reports with nothing to act on them. Run at boot (jobs/service.ts). Safe to repeat — it
+ * only inserts types the project is missing, so a schedule an operator disabled stays disabled.
+ */
+export async function backfillDefaultSchedules(
+  db: AntonDb,
+  clock: Clock,
+): Promise<ScheduleBackfill[]> {
+  const projects = await db.select({ id: schema.projects.id }).from(schema.projects);
+  const backfills: ScheduleBackfill[] = [];
+  for (const project of projects) {
+    const created = await seedDefaultSchedules(db, clock, project.id);
+    if (created.length > 0) backfills.push({ projectId: project.id, created });
+  }
+  return backfills;
 }
 
 /**

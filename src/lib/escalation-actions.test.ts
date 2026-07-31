@@ -1,5 +1,5 @@
 /**
- * Tests for the founder's two answers to an escalation (anton-wvcy), over a real temp anton.db.
+ * Tests for the founder's answers to an escalation (anton-wvcy), over a real temp anton.db.
  *
  * The property under test is the ORDER: settle first, act second. `settleEscalation`'s status CAS is
  * the lock, so whoever flips `open → resolved` owns the decision — that is what makes a double-click
@@ -177,6 +177,51 @@ describe("actOnEscalation — abandon", () => {
   });
 });
 
+describe("actOnEscalation — dismiss", () => {
+  // The answer for a stall anton has no verb for. A stale PR's work is already delivered and open
+  // for review, so a "resume" would settle the row and change nothing about the PR — the panel must
+  // not offer a resolution that resolves nothing.
+  const stalePr = () =>
+    finding({
+      kind: "stale-pr",
+      key: "stale-pr:anton-t9:42",
+      reason: "PR #42 idle 3d with the target still in review",
+      runId: undefined,
+      prNumber: 42,
+    });
+
+  it("settles the row and touches neither the work nor the job", async () => {
+    const escalation = await open({ finding: stalePr() });
+
+    const result = await actOnEscalation(project, escalation.id, "dismiss");
+
+    expect(result).toMatchObject({ ok: true, action: "dismiss", detail: "dismissed" });
+    expect(rowOf(escalation.id)).toMatchObject({ status: "resolved", resolution: "dismissed" });
+    expect(resumeStalledEpic).not.toHaveBeenCalled();
+    expect(abandonTicket).not.toHaveBeenCalled();
+    expect(cancelJob).not.toHaveBeenCalled();
+  });
+
+  it("needs no target at all — it is the settling move for a finding that names nothing", async () => {
+    const escalation = await open({
+      finding: finding({ beadId: undefined, runId: undefined }),
+      epicBeadId: undefined,
+    });
+
+    expect(await actOnEscalation(project, escalation.id, "dismiss")).toMatchObject({ ok: true });
+  });
+
+  it("refuses a second dismissal, like every other answer", async () => {
+    const escalation = await open({ finding: stalePr() });
+    await actOnEscalation(project, escalation.id, "dismiss");
+
+    expect(await actOnEscalation(project, escalation.id, "dismiss")).toEqual({
+      ok: false,
+      reason: "not-open",
+    });
+  });
+});
+
 describe("actOnEscalation — a stall that names only a job", () => {
   // An exhausted `sync-push`/`run-health`/`unstick` job strands no bead, so neither verb has a work
   // item to act on. Answering on the JOB is what keeps such an escalation settleable at all — and it
@@ -280,8 +325,8 @@ describe("actOnEscalation — scoping", () => {
 });
 
 describe("isEscalationAction", () => {
-  it("accepts only the two verbs the panel offers", () => {
-    expect(["resume", "abandon"].every(isEscalationAction)).toBe(true);
+  it("accepts only the verbs the panel offers", () => {
+    expect(["resume", "abandon", "dismiss"].every(isEscalationAction)).toBe(true);
     for (const bad of ["retry", "", null, undefined, 1, {}]) {
       expect(isEscalationAction(bad)).toBe(false);
     }

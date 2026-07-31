@@ -34,7 +34,7 @@ import {
   type Clock,
   type JobRow,
 } from "./queue";
-import type { JobContext, JobHandler } from "./runner";
+import { POISON_PARK_PREFIX, type JobContext, type JobHandler } from "./runner";
 
 const IN_REVIEW = LABELS.stage("in-review");
 
@@ -169,10 +169,17 @@ export function detectDeadLeases(
 }
 
 /**
- * Jobs that settled `parked`/`failed` having spent their whole attempt budget. These are the ones
- * the runner deliberately stopped retrying — recoverable only by a human resume, so they sit
- * forever unless something surfaces them. A job parked with attempts still on the clock (quota
- * backoff, a held lease) is excluded: those refund the attempt and come back by themselves.
+ * Jobs the runner has stopped retrying — recoverable only by a human, so they sit forever unless
+ * something surfaces them. Two shapes qualify:
+ *
+ *   • a `parked`/`failed` job that SPENT its whole attempt budget; and
+ *   • a POISON park, which skips the budget entirely (`nextAction`), so its attempt count is no
+ *     evidence at all — execute-epic poisons on exactly the actionable conditions (a blocker, a
+ *     disabled agent, a contract gap), and several of those fire before a run row exists, so
+ *     without this the parked-run detector can't see them either and the work waits invisibly.
+ *
+ * A job parked with attempts still on the clock for any OTHER reason (quota backoff, a held lease)
+ * is excluded: those refund the attempt and come back by themselves.
  */
 export function detectExhaustedJobs(
   jobs: JobRow[],
@@ -182,12 +189,16 @@ export function detectExhaustedJobs(
   const findings: RunHealthFinding[] = [];
   for (const job of jobs) {
     if (job.status !== "parked" && job.status !== "failed") continue;
-    if (job.attempts < maxAttempts) continue;
+    const lastError = job.lastError?.trim() || "no error recorded";
+    const poisoned = lastError.startsWith(POISON_PARK_PREFIX);
+    if (!poisoned && job.attempts < maxAttempts) continue;
     const since = toMs(job.updatedAt) ?? nowMs;
     findings.push({
       kind: "exhausted-job",
       key: `exhausted-job:${job.id}`,
-      reason: `${job.type} job ${job.status} after ${job.attempts}/${maxAttempts} attempts: ${job.lastError?.trim() || "no error recorded"}`,
+      reason: poisoned
+        ? `${job.type} job parked without retrying (permanent failure): ${lastError.slice(POISON_PARK_PREFIX.length).trim()}`
+        : `${job.type} job ${job.status} after ${job.attempts}/${maxAttempts} attempts: ${lastError}`,
       since,
       ageMs: Math.max(0, nowMs - since),
       jobId: job.id,

@@ -1,5 +1,6 @@
 /**
- * The two answers a founder can give an escalation (anton-wvcy): retry the work, or call it won't-do.
+ * The answers a founder can give an escalation (anton-wvcy): retry the work, call it won't-do, or —
+ * for a stall anton has no verb for — acknowledge it.
  *
  * Both settle the escalation FIRST, with the status CAS in `settleEscalation` as the lock: whoever
  * flips `open → resolved` owns the decision, so a double-click (or two operators on one board)
@@ -15,6 +16,13 @@
  * exhausted `sync-push`/`run-health`/`unstick`, which strands no bead — is answered with the jobs
  * list's own resume/cancel. Without that last path such an escalation would have no settling move at
  * all and would sit on the board forever.
+ *
+ * `dismiss` is the third answer, and the honest one for a STALE PR: the work is already delivered
+ * and open for review, so execute-epic's PR short-circuit makes a resume a no-op — it would settle
+ * the escalation while changing nothing about the PR, and the next sweep would raise it again. What
+ * a stale PR actually needs is a reviewer, which is a human act outside anton. Dismiss says exactly
+ * that: it settles the row, touches nothing, and lets the sweep re-raise the finding if the PR is
+ * still idle — so acknowledging a stall can never hide one.
  */
 import { getDb } from "./db";
 import { abandonTicket } from "./abandon";
@@ -22,13 +30,13 @@ import { getEscalation, settleEscalation, toEscalationView } from "./escalations
 import { cancelJob, resumeJob, resumeStalledEpic } from "./jobs/service";
 import { systemClock } from "./jobs/queue";
 import { MAX_ABANDON_REASON_CHARS } from "./types";
-import type { EscalationView } from "./escalations";
+import type { EscalationResolution, EscalationView } from "./escalations";
 import type { Project } from "./types";
 
-export type EscalationAction = "resume" | "abandon";
+export type EscalationAction = "resume" | "abandon" | "dismiss";
 
 export function isEscalationAction(value: unknown): value is EscalationAction {
-  return value === "resume" || value === "abandon";
+  return value === "resume" || value === "abandon" || value === "dismiss";
 }
 
 /**
@@ -65,6 +73,15 @@ export async function actOnEscalation(
   if (row.status !== "open") return { ok: false, reason: "not-open" };
 
   const view = toEscalationView(row);
+
+  // Dismiss settles the row and nothing else, so it needs no target and can't fail half-way.
+  if (action === "dismiss") {
+    if (!(await settleEscalation(db, systemClock, escalationId, "dismissed"))) {
+      return { ok: false, reason: "not-open" };
+    }
+    return { ok: true, action, escalation: view, detail: "dismissed" };
+  }
+
   const target = action === "resume" ? view.epicBeadId : view.beadId;
   // No bead to act on falls back to the job the stall named — an alert with no settling move is an
   // alert that trains the operator to ignore the panel.
@@ -123,6 +140,7 @@ async function actOnJob(
   return result.ok ? "cancelled-job" : "job-already-settled";
 }
 
-function resolutionOf(action: EscalationAction): "resumed" | "abandoned" {
-  return action === "resume" ? "resumed" : "abandoned";
+function resolutionOf(action: EscalationAction): EscalationResolution {
+  if (action === "resume") return "resumed";
+  return action === "abandon" ? "abandoned" : "dismissed";
 }

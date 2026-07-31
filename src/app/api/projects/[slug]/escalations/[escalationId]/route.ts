@@ -8,10 +8,10 @@ import { withProject } from "../../resolve-project";
 export const dynamic = "force-dynamic";
 
 /**
- * Settle one escalation (anton-wvcy): `{ action: "resume" | "abandon" }`.
+ * Settle one escalation (anton-wvcy): `{ action: "resume" | "abandon" | "dismiss" }`.
  *
- * A POST on the escalation itself rather than two sub-resources — both verbs are the SAME decision
- * ("how does this stall end?"), and modelling them as one action field keeps the panel's two buttons
+ * A POST on the escalation itself rather than sub-resources — every verb is the SAME decision
+ * ("how does this stall end?"), and modelling them as one action field keeps the panel's buttons
  * on one code path. Returns the remaining open escalations so the board panel re-renders from the
  * response instead of racing a refetch against the write.
  *
@@ -30,7 +30,7 @@ export const POST = withProject<{ slug: string; escalationId: string }>(
     const action = (body as { action?: unknown })?.action;
     if (!isEscalationAction(action)) {
       return NextResponse.json(
-        { error: 'action must be "resume" or "abandon"' },
+        { error: 'action must be "resume", "abandon", or "dismiss"' },
         { status: 400 },
       );
     }

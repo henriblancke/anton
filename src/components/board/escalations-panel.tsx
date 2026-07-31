@@ -109,11 +109,19 @@ export function EscalationsPanel({
             </div>
             {/* A finding that names no bead at all (an exhausted sync-push/run-health job) is
                 answered on the JOB instead — otherwise the row would show no way to settle it and
-                sit here forever. */}
+                sit here forever. A stale PR gets Dismiss instead of Resume: its work is already
+                delivered and open for review, so re-running the epic changes nothing about the PR
+                (execute-epic short-circuits on an open one) — the row would settle and the next
+                sweep would raise it again. What it needs is a reviewer, which is the founder's move,
+                and the PR link above is how they take it. */}
             <EscalationActions
               slug={slug}
               escalationId={escalation.id}
-              canResume={escalation.epicBeadId !== undefined || escalation.jobId !== undefined}
+              canResume={
+                escalation.kind !== "stale-pr" &&
+                (escalation.epicBeadId !== undefined || escalation.jobId !== undefined)
+              }
+              canDismiss={escalation.kind === "stale-pr"}
               canAbandon={escalation.beadId !== undefined || escalation.jobId !== undefined}
               target={
                 escalation.beadId === undefined && escalation.epicBeadId === undefined

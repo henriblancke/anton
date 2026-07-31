@@ -68,6 +68,7 @@ function ctx(o: Partial<UnstickContext> = {}): UnstickContext {
     board: new Map<string, Bead>(),
     boardFresh: true,
     usageWindowEndsAt: () => undefined,
+    stillStuck: () => true,
     ...o,
   };
 }
@@ -236,6 +237,26 @@ describe("classifyFinding — the never-automatic kinds", () => {
       expect(verdict).toMatchObject({ disposition: "escalate", why: "no activity for 3d" });
     },
   );
+
+  it("holds a stale PR that has since merged, closed, or been picked back up", () => {
+    // The report is a candidate list here too: escalating a PR that moved asks the founder to judge
+    // work that is already done, and the abandon they might click closes it as won't-do.
+    const verdict = classifyFinding(
+      finding({ kind: "stale-pr", key: "stale-pr:e-1:42", prNumber: 42 }),
+      ctx({ stillStuck: () => false }),
+    );
+    expect(verdict.disposition).toBe("hold");
+    expect(verdict.why).toContain("merged");
+  });
+
+  it("holds an exhausted job that has since been resumed — abandoning it would cancel live work", () => {
+    const verdict = classifyFinding(
+      finding({ kind: "exhausted-job", key: "exhausted-job:j-1", jobId: "j-1" }),
+      ctx({ stillStuck: () => false }),
+    );
+    expect(verdict.disposition).toBe("hold");
+    expect(verdict.why).toContain("resumed");
+  });
 });
 
 describe("usageWindowEnd", () => {

@@ -232,6 +232,21 @@ describe("detectExhaustedJobs", () => {
     expect(detectExhaustedJobs([job("j-1", { attempts: 1 })], 3, NOW)).toEqual([]);
   });
 
+  it("reports a POISON park regardless of attempts — it skipped the retry budget entirely", () => {
+    // execute-epic poisons on a blocker, a disabled agent, a contract gap: permanent conditions the
+    // runner parks on at attempt 1. Several fire before a run row exists, so if the attempt count
+    // gated this finding, nothing would surface work that is waiting on a human forever.
+    const [finding] = detectExhaustedJobs(
+      [job("j-1", { attempts: 1, lastError: "poison: agent 'svelte' is disabled for this project" })],
+      3,
+      NOW,
+    );
+    expect(finding).toMatchObject({ kind: "exhausted-job", jobId: "j-1" });
+    expect(finding.reason).toContain("agent 'svelte' is disabled");
+    expect(finding.reason).toContain("without retrying");
+    expect(finding.reason).not.toContain("1/3 attempts");
+  });
+
   it("ignores jobs that are still live or already terminal-good", () => {
     const jobs = [
       job("queued", { status: "queued", attempts: 5 }),

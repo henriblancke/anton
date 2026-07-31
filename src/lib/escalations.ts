@@ -21,8 +21,12 @@ import type { AntonDb, Clock } from "./jobs/queue";
 import type { RunHealthFinding, RunHealthFindingKind } from "./run-health";
 
 export type EscalationStatus = "open" | "resolved";
-/** How a founder settled an escalation: retry the work, or call it won't-do. */
-export type EscalationResolution = "resumed" | "abandoned";
+/**
+ * How a founder settled an escalation: retry the work, call it won't-do, or acknowledge a stall
+ * anton cannot act on (`dismissed` — see escalation-actions.ts). A dismissal settles the ROW only;
+ * the next sweep re-raises the finding if it still holds, so it can't silence a live stall.
+ */
+export type EscalationResolution = "resumed" | "abandoned" | "dismissed";
 
 export type EscalationRow = typeof schema.escalations.$inferSelect;
 

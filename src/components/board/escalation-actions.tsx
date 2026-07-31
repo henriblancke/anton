@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
-import { CircleSlashIcon, RotateCcwIcon } from "lucide-react";
+import { CheckIcon, CircleSlashIcon, RotateCcwIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 
@@ -16,6 +16,7 @@ const ACTION_DETAIL: Record<string, string> = {
   abandoned: "Abandoned — the work is closed as won't-do",
   "cancelled-job": "Stopped — the job is cancelled and won't retry",
   "job-already-settled": "Already settled — the job had already stopped",
+  dismissed: "Dismissed — anton raises it again if it's still stuck at the next sweep",
 };
 
 /** Button copy per target: a stall that names only a job is retried/stopped, not abandoned. */
@@ -24,19 +25,30 @@ const COPY = {
   job: { resume: "Retry job", pendingResume: "Retrying…", abandon: "Stop retrying", confirm: "Confirm stop", pendingAbandon: "Stopping…" },
 } as const;
 
+type Action = "resume" | "abandon" | "dismiss";
+
+/** Said plainly when the route reports a detail this build doesn't have copy for. */
+const FALLBACK_DETAIL: Record<Action, string> = {
+  resume: "Resumed",
+  abandon: "Abandoned",
+  dismiss: "Dismissed",
+};
+
 /**
- * The founder's two answers to an escalation (anton-wvcy): retry it, or call it won't-do.
+ * The founder's answers to an escalation (anton-wvcy): retry it, call it won't-do, or acknowledge
+ * one anton has no verb for (a stale PR — see escalation-actions.ts).
  *
  * A client leaf inside the server-rendered panel — the only interactive part, so the escalation
  * list itself stays a Server Component. Abandon is deliberately two-step (it closes the bead and
- * cascades to its open children); Resume is one click because it is idempotent — clicking twice
- * re-queues nothing.
+ * cascades to its open children); Resume and Dismiss are one click because they are idempotent —
+ * clicking twice re-queues nothing and the second settle is refused.
  */
 export function EscalationActions({
   slug,
   escalationId,
   canResume,
   canAbandon,
+  canDismiss = false,
   target = "work",
 }: {
   slug: string;
@@ -45,15 +57,21 @@ export function EscalationActions({
   canResume: boolean;
   /** False when the finding names no bead to close. */
   canAbandon: boolean;
+  /**
+   * Offer "Dismiss" — settle the row without touching the work. Shown where a resume would be
+   * theatre (a stale PR is waiting on a reviewer, not on anton), so the panel never advertises a
+   * resolution that resolves nothing.
+   */
+  canDismiss?: boolean;
   /** What the buttons act on: the work itself, or (no bead named) the job that stranded it. */
   target?: "work" | "job";
 }) {
   const router = useRouter();
   const copy = COPY[target];
-  const [pending, setPending] = useState<"resume" | "abandon" | null>(null);
+  const [pending, setPending] = useState<Action | null>(null);
   const [armed, setArmed] = useState(false);
 
-  async function act(action: "resume" | "abandon") {
+  async function act(action: Action) {
     setPending(action);
     try {
       const res = await fetch(`/api/projects/${slug}/escalations/${escalationId}`, {
@@ -65,9 +83,7 @@ export function EscalationActions({
         | { error?: string; detail?: string }
         | null;
       if (!res.ok) throw new Error(body?.error ?? `Request failed (${res.status})`);
-      toast.success(
-        ACTION_DETAIL[body?.detail ?? ""] ?? (action === "resume" ? "Resumed" : "Abandoned"),
-      );
+      toast.success(ACTION_DETAIL[body?.detail ?? ""] ?? FALLBACK_DETAIL[action]);
       // The panel is server-rendered, so a refresh is what removes the settled row.
       router.refresh();
     } catch (err) {
@@ -89,6 +105,19 @@ export function EscalationActions({
         >
           <RotateCcwIcon aria-hidden="true" />
           {pending === "resume" ? copy.pendingResume : copy.resume}
+        </Button>
+      ) : null}
+      {canDismiss ? (
+        <Button
+          type="button"
+          size="xs"
+          variant="outline"
+          disabled={pending !== null}
+          title="Settle this alert without changing the work — anton raises it again if it's still stuck at the next sweep"
+          onClick={() => void act("dismiss")}
+        >
+          <CheckIcon aria-hidden="true" />
+          {pending === "dismiss" ? "Dismissing…" : "Dismiss"}
         </Button>
       ) : null}
       {canAbandon && armed ? (
