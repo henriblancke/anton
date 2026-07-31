@@ -562,7 +562,9 @@ export function SettingsView({
                 <div className="flex flex-col gap-2">
                   <div className="flex items-center gap-2">
                     <span className="text-[12.5px] font-medium">Review prompt</span>
-                    <span className="text-[11px] text-subtle">editable · what to review for</span>
+                    <span className="text-[11px] text-subtle">
+                      {reviewAgent ? "fallback · unused while a reviewer is named" : "editable · what to review for"}
+                    </span>
                     {reviewPrompt.trim() !== (settings.reviewPrompt ?? "").trim() && (
                       <span className="font-mono text-[10px] text-primary">unsaved</span>
                     )}
@@ -579,7 +581,10 @@ export function SettingsView({
                   />
                   <span className="text-[11px] text-subtle">
                     The reasoning contract for the reviewer. anton appends the run&apos;s diff and
-                    tickets beneath it. Applies to a named reviewer too. Empty = shipped default.{" "}
+                    tickets beneath it.{" "}
+                    {reviewAgent
+                      ? `${reviewAgent} brings its own contract, so this runs only if that agent can't be loaded.`
+                      : "Empty = shipped default (skills/review)."}{" "}
                     {reviewPrompt.length}/8000
                   </span>
                 </div>

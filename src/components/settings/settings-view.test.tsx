@@ -199,6 +199,17 @@ describe("SettingsView self-review section (anton-of1m)", () => {
     expect(screen.getByText(/no longer exists/)).toBeTruthy();
   });
 
+  // The prompt ranks BELOW a named reviewer (buildReviewPrompt), so the copy must say so —
+  // an operator who reads it as additive silently loses the focus they asked for.
+  it("describes the review prompt as a fallback once a reviewer is named", () => {
+    renderView({}, reviewers);
+    expect(screen.getByText(/Empty = shipped default \(skills\/review\)/)).toBeTruthy();
+
+    fireEvent.change(screen.getByLabelText("Reviewer"), { target: { value: "my-reviewer" } });
+    expect(screen.getByText(/my-reviewer brings its own contract/)).toBeTruthy();
+    expect(screen.queryByText(/Empty = shipped default \(skills\/review\)/)).toBeNull();
+  });
+
   it("clamps the round cap to [1,5]", () => {
     renderView({}, reviewers);
     const cap = screen.getByLabelText("Max review rounds") as HTMLInputElement;

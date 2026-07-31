@@ -129,7 +129,8 @@ export interface ProjectSettings {
   /**
    * Operator-editable reasoning prompt for the reviewer, mirroring {@link reviewFixPrompt}: it
    * replaces the shipped review contract, and anton appends the concrete run context beneath it.
-   * Empty = shipped default. Independent of {@link reviewAgent} — a named agent still gets it.
+   * Empty = shipped default. Ranks BELOW {@link reviewAgent} — a resolvable named agent brings its
+   * own contract, so this prompt is what runs when no agent is named or the saved one is gone.
    */
   reviewPrompt?: string;
   /**
@@ -243,7 +244,7 @@ export interface ReviewConfig {
   enabled: boolean;
   /** A discoverable agent id to review as; absent → the shipped review contract. */
   agent?: string;
-  /** Operator prompt replacing the shipped review contract; absent → the shipped default. */
+  /** Operator prompt replacing the shipped contract when no {@link agent} resolves; absent → shipped. */
   prompt?: string;
   maxRounds: number;
 }
