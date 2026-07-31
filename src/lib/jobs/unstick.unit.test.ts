@@ -66,6 +66,7 @@ function ctx(o: Partial<UnstickContext> = {}): UnstickContext {
     activeEpicKeys: new Set<string>(),
     parkedRuns: new Map([["r-1", run()]]),
     board: new Map<string, Bead>(),
+    boardFresh: true,
     usageWindowEndsAt: () => undefined,
     ...o,
   };
@@ -127,6 +128,27 @@ describe("classifyFinding — parked runs", () => {
     expect(verdict.disposition).toBe("resume");
   });
 
+  it("stands down when another machine took the epic while this run sat parked", () => {
+    // Jobs are machine-local, so the live-job check above can't see the other machine's run — the
+    // lease on the epic is the only evidence, and resuming past it double-runs the work.
+    const verdict = classifyFinding(
+      finding(),
+      ctx({ board: new Map([["e-1", bead("e-1", { labels: [LABELS.runLease(NOW + HOUR, "run-x")] })]]) }),
+    );
+    expect(verdict.disposition).toBe("hold");
+    expect(verdict.why).toContain("live run-lease");
+  });
+
+  it("resumes past this run's OWN leftover lease — reviving it is not double-running it", () => {
+    // execute-epic publishes the lease under the run id, so a lease owned by the very run we are
+    // reviving is a crash leftover, not a foreign holder.
+    const verdict = classifyFinding(
+      finding(),
+      ctx({ board: new Map([["e-1", bead("e-1", { labels: [LABELS.runLease(NOW + HOUR, "r-1")] })]]) }),
+    );
+    expect(verdict.disposition).toBe("resume");
+  });
+
   it("targets the RUN's epic, not the ticket bead the finding names", () => {
     // Jobs are keyed by epic; resuming the ticket id would enqueue work for a bead with no job.
     const verdict = classifyFinding(
@@ -174,6 +196,33 @@ describe("classifyFinding — dead leases", () => {
   });
 });
 
+describe("classifyFinding — an untrusted board fails CLOSED", () => {
+  // The pass reads leases off a local Dolt mirror of the shared board. When the pull fails, that
+  // mirror can be arbitrarily behind, so "no live lease" is no longer evidence of anything — and the
+  // only wrong answer that costs more than an hour of stall is the one that double-runs.
+  const stale = (o: Partial<UnstickContext> = {}) => ctx({ boardFresh: false, ...o });
+
+  it("holds a parked run rather than resuming against lease state it cannot confirm", () => {
+    const verdict = classifyFinding(finding(), stale());
+    expect(verdict.disposition).toBe("hold");
+    expect(verdict.why).toContain("could not be pulled");
+  });
+
+  it("holds a dead lease rather than resuming against lease state it cannot confirm", () => {
+    const deadLease = finding({ kind: "dead-lease", key: "dead-lease:e-1", runId: undefined });
+    const board = new Map([["e-1", bead("e-1", { labels: [LABELS.runLease(NOW - HOUR, "run-x")] })]]);
+    expect(classifyFinding(deadLease, stale({ board })).disposition).toBe("hold");
+  });
+
+  it("still escalates — an escalation touches no shared state, so a stale board can't make it wrong", () => {
+    const verdict = classifyFinding(
+      finding({ reason: "parked 4h ago: agent exited 1" }),
+      stale({ parkedRuns: new Map([["r-1", run({ error: "agent exited 1" })]]) }),
+    );
+    expect(verdict.disposition).toBe("escalate");
+  });
+});
+
 describe("classifyFinding — the never-automatic kinds", () => {
   it.each(["stale-pr", "exhausted-job"] as const)(
     "escalates %s rather than retrying it",
@@ -214,15 +263,26 @@ describe("usageWindowEnd", () => {
 });
 
 describe("escalationNote", () => {
+  const ESC_ID = "3f2a1b9c-0000-4000-8000-000000000001";
+
   it("says what stalled and that nothing will retry it", () => {
-    const note = escalationNote(finding({ kind: "stale-pr", reason: "open 3d with no review" }));
+    const note = escalationNote(
+      finding({ kind: "stale-pr", reason: "open 3d with no review" }),
+      ESC_ID,
+    );
     expect(note).toContain("stale-pr");
     expect(note).toContain("open 3d with no review");
     expect(note).toMatch(/Nothing will retry this automatically/);
   });
 
+  it("carries the escalation id, so a note written twice reads as one escalation", () => {
+    // bd notes are append-only with no dedupe: a note that lands while its `notedAt` stamp fails is
+    // re-written next pass, and this token is what tells a human the entries aren't two stalls.
+    expect(escalationNote(finding(), ESC_ID)).toContain("3f2a1b9c");
+  });
+
   it("stays on ONE line — beads splits a note blob on newlines into separate entries", () => {
-    const note = escalationNote(finding({ reason: "parked:\n  agent exited 1\n" }));
+    const note = escalationNote(finding({ reason: "parked:\n  agent exited 1\n" }), ESC_ID);
     expect(note).not.toContain("\n");
     expect(note).toContain("parked: agent exited 1");
   });

@@ -92,6 +92,24 @@ describe("EscalationsPanel", () => {
     expect(noBead).toContain("Resume");
   });
 
+  it("offers job-level answers for a stall that names no bead at all", () => {
+    // An exhausted sync-push/run-health job strands no work item. Without these the row would show
+    // no button that settles it and would sit on the board forever.
+    const html = render([
+      escalation({
+        kind: "exhausted-job",
+        reason: "sync-push job parked after 3/3 attempts",
+        beadId: undefined,
+        epicBeadId: undefined,
+        runId: undefined,
+        jobId: "j-1",
+      }),
+    ]);
+
+    expect(html).toContain("Retry job");
+    expect(html).toContain("Stop retrying");
+  });
+
   it("says so when the board-native bd note has not landed yet", () => {
     // Without this the panel would silently imply the stall is recorded on the board when it isn't.
     const html = render([escalation({ noted: false })]);

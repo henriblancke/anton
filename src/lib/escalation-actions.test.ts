@@ -16,9 +16,13 @@ import type { Project } from "./types";
 
 const resumeStalledEpic = vi.fn<(projectId: string, epicBeadId: string) => Promise<string>>();
 const abandonTicket = vi.fn<(project: Project, id: string, reason: string) => Promise<unknown>>();
+const resumeJob = vi.fn<(projectId: string, jobId: string) => Promise<boolean>>();
+const cancelJob = vi.fn<(projectId: string, jobId: string) => Promise<{ ok: boolean }>>();
 
 vi.mock("./jobs/service", () => ({
   resumeStalledEpic: (...args: [string, string]) => resumeStalledEpic(...args),
+  resumeJob: (...args: [string, string]) => resumeJob(...args),
+  cancelJob: (...args: [string, string]) => cancelJob(...args),
 }));
 vi.mock("./abandon", async () => {
   const actual = await vi.importActual<typeof import("./abandon")>("./abandon");
@@ -59,6 +63,8 @@ beforeEach(() => {
     .run();
   resumeStalledEpic.mockResolvedValue("enqueued");
   abandonTicket.mockResolvedValue(undefined);
+  resumeJob.mockResolvedValue(true);
+  cancelJob.mockResolvedValue({ ok: true });
 });
 
 afterEach(() => vi.clearAllMocks());
@@ -168,6 +174,88 @@ describe("actOnEscalation — abandon", () => {
       reason: "no-target",
     });
     expect(abandonTicket).not.toHaveBeenCalled();
+  });
+});
+
+describe("actOnEscalation — a stall that names only a job", () => {
+  // An exhausted `sync-push`/`run-health`/`unstick` job strands no bead, so neither verb has a work
+  // item to act on. Answering on the JOB is what keeps such an escalation settleable at all — and it
+  // moves the job out of parked/failed, which is the only state the sweep re-reports.
+  const jobFinding = () =>
+    finding({
+      kind: "exhausted-job",
+      key: "exhausted-job:j-1",
+      reason: "sync-push job parked after 3/3 attempts: dolt push rejected",
+      runId: undefined,
+      beadId: undefined,
+      jobId: "j-1",
+    });
+
+  const openJobEscalation = () => open({ finding: jobFinding(), epicBeadId: undefined });
+
+  it("resume gives the job a fresh retry budget", async () => {
+    const escalation = await openJobEscalation();
+
+    const result = await actOnEscalation(project, escalation.id, "resume");
+
+    expect(result).toMatchObject({ ok: true, detail: "resumed-job" });
+    expect(resumeJob).toHaveBeenCalledWith("p1", "j-1");
+    expect(rowOf(escalation.id)).toMatchObject({ status: "resolved", resolution: "resumed" });
+  });
+
+  it("abandon cancels the job so it never runs again", async () => {
+    const escalation = await openJobEscalation();
+
+    const result = await actOnEscalation(project, escalation.id, "abandon");
+
+    expect(result).toMatchObject({ ok: true, detail: "cancelled-job" });
+    expect(cancelJob).toHaveBeenCalledWith("p1", "j-1");
+    expect(rowOf(escalation.id)).toMatchObject({ status: "resolved", resolution: "abandoned" });
+  });
+
+  it("reports a job that has since moved on rather than claiming an action it didn't take", async () => {
+    resumeJob.mockResolvedValue(false);
+    const escalation = await openJobEscalation();
+
+    expect(await actOnEscalation(project, escalation.id, "resume")).toMatchObject({
+      ok: true,
+      detail: "job-not-resumable",
+    });
+  });
+
+  it("still refuses when the finding names no bead AND no job", async () => {
+    const escalation = await open({
+      finding: jobFinding(),
+      epicBeadId: undefined,
+    });
+    // Strip the job pointer the fallback depends on.
+    getDb()
+      .update(schema.escalations)
+      .set({ jobId: null })
+      .where(eq(schema.escalations.id, escalation.id))
+      .run();
+
+    expect(await actOnEscalation(project, escalation.id, "resume")).toEqual({
+      ok: false,
+      reason: "no-target",
+    });
+    expect(rowOf(escalation.id)?.status).toBe("open");
+  });
+});
+
+describe("actOnEscalation — the action fails after the settle", () => {
+  it("leaves a server-side breadcrumb, because the settled row is already gone from the panel", async () => {
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    resumeStalledEpic.mockRejectedValue(new Error("runner refused: project is being deleted"));
+    const escalation = await open();
+
+    await expect(actOnEscalation(project, escalation.id, "resume")).rejects.toThrow("runner refused");
+
+    // Settled by the CAS that owns the decision — the stall itself returns via the next sweep.
+    expect(rowOf(escalation.id)).toMatchObject({ status: "resolved", resolution: "resumed" });
+    expect(logged.mock.calls[0]?.[0]).toContain(escalation.id);
+    expect(logged.mock.calls[0]?.[0]).toContain("re-surfaces on the next run-health sweep");
+    logged.mockRestore();
   });
 });
 

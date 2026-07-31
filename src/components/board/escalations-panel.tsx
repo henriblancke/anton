@@ -107,11 +107,19 @@ export function EscalationsPanel({
                 </p>
               ) : null}
             </div>
+            {/* A finding that names no bead at all (an exhausted sync-push/run-health job) is
+                answered on the JOB instead — otherwise the row would show no way to settle it and
+                sit here forever. */}
             <EscalationActions
               slug={slug}
               escalationId={escalation.id}
-              canResume={escalation.epicBeadId !== undefined}
-              canAbandon={escalation.beadId !== undefined}
+              canResume={escalation.epicBeadId !== undefined || escalation.jobId !== undefined}
+              canAbandon={escalation.beadId !== undefined || escalation.jobId !== undefined}
+              target={
+                escalation.beadId === undefined && escalation.epicBeadId === undefined
+                  ? "job"
+                  : "work"
+              }
             />
           </li>
         ))}

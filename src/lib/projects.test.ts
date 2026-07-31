@@ -272,6 +272,30 @@ describe("updateProjectSettings budgetPolicy deep-merge", () => {
   });
 });
 
+describe("updateProjectSettings runHealth deep-merge", () => {
+  it("merges a partial patch into the stored thresholds instead of replacing them wholesale", async () => {
+    // The thresholds are partial-by-design (each absent knob resolves to its default), so a PATCH
+    // carrying one of them must not silently revert the operator's other tuned values.
+    const created = await addProject({ name: "Health Merge", repoPath: makeRepoDir("health-merge") });
+    await updateProjectSettings(created.slug, {
+      runHealth: { parkedRunMinutes: 45, deadLeaseMinutes: 15 },
+    });
+    const settings = await updateProjectSettings(created.slug, { runHealth: { stalePrHours: 48 } });
+    expect(settings.runHealth).toEqual({
+      parkedRunMinutes: 45,
+      deadLeaseMinutes: 15,
+      stalePrHours: 48,
+    });
+  });
+
+  it("still clears the whole object on an explicit undefined (back to defaults)", async () => {
+    const created = await addProject({ name: "Health Clear", repoPath: makeRepoDir("health-clear") });
+    await updateProjectSettings(created.slug, { runHealth: { stalePrHours: 48 } });
+    const settings = await updateProjectSettings(created.slug, { runHealth: undefined });
+    expect(settings.runHealth).toBeUndefined();
+  });
+});
+
 describe("isBudgetAwareEnabledAnywhere (anton-7mpv.1)", () => {
   it("is false when no project has budget-aware execution on (the default)", async () => {
     const created = await addProject({ name: "Budget Off", repoPath: makeRepoDir("budget-off") });

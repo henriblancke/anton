@@ -16,7 +16,7 @@ export const dynamic = "force-dynamic";
  * response instead of racing a refetch against the write.
  *
  * 409 covers both "already settled" (someone else clicked first) and "nothing to act on" (a finding
- * that names no bead) — in each case the request was valid but the state refuses it.
+ * that names neither a bead nor a job) — in each case the request was valid but the state refuses it.
  */
 export const POST = withProject<{ slug: string; escalationId: string }>(
   async (request, { project, params }) => {
@@ -59,5 +59,5 @@ export const POST = withProject<{ slug: string; escalationId: string }>(
 const FAILURE_MESSAGES = {
   "not-found": "Escalation not found",
   "not-open": "This escalation has already been settled",
-  "no-target": "This escalation names no ticket to act on",
+  "no-target": "This escalation names no ticket or job to act on",
 } as const;

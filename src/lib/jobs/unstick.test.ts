@@ -20,6 +20,7 @@ import type { Clock } from "./queue";
 const listMock = vi.fn<(cwd: string, extra?: string[]) => Promise<Bead[]>>();
 const noteMock = vi.fn<(cwd: string, id: string, text: string) => Promise<void>>();
 const syncMock = vi.fn<(cwd: string) => Promise<void>>();
+const pullMock = vi.fn<(cwd: string) => Promise<void>>();
 
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
@@ -30,6 +31,7 @@ vi.mock("../beads/bd", async () => {
       list: (...args: [string, string[]?]) => listMock(...args),
       note: (...args: [string, string, string]) => noteMock(...args),
       sync: (...args: [string]) => syncMock(...args),
+      pull: (...args: [string]) => pullMock(...args),
     },
   };
 });
@@ -56,6 +58,7 @@ beforeEach(() => {
   listMock.mockResolvedValue([]);
   noteMock.mockResolvedValue(undefined);
   syncMock.mockResolvedValue(undefined);
+  pullMock.mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -178,6 +181,42 @@ describe("resumable parks re-enqueue exactly once across two sweeps", () => {
 
     expect(await sweep()).toMatchObject({ resumed: 0, held: 1 });
     expect(jobRows()).toHaveLength(1);
+  });
+
+  it("pulls the shared board before judging any lease, and resumes nothing when the pull fails", async () => {
+    // The local Dolt working set trails the remote by a sync heartbeat: without a pull, a lease
+    // another machine renewed reads as absent and the resume below would double-run its work. A pull
+    // that fails leaves that unknowable, so every lease-gated resume stands down for this pass.
+    pullMock.mockRejectedValue(new Error("offline"));
+    seedParkedRun("r-1", "e-1", "usage-limit");
+    await seedReport(parkedRunFinding("r-1", "e-1", "parked 4h ago: usage-limit"));
+
+    expect(await sweep()).toMatchObject({ findings: 1, resumed: 0, escalated: 0, held: 1 });
+    expect(pullMock).toHaveBeenCalledWith(REPO);
+    expect(jobRows()).toEqual([]);
+    expect(escalationRows()).toEqual([]); // held, not escalated: nagging about this would be noise
+
+    // The stall is not lost — the next pass, with the board back, does the resume it deferred.
+    pullMock.mockResolvedValue(undefined);
+    expect(await sweep()).toMatchObject({ resumed: 1 });
+    expect(jobRows()).toHaveLength(1);
+  });
+
+  it("stands down on a parked run whose epic another machine has since leased", async () => {
+    seedParkedRun("r-1", "e-1", "usage-limit");
+    listMock.mockResolvedValue([
+      {
+        id: "e-1",
+        title: "e-1",
+        status: "open",
+        issue_type: "epic",
+        labels: [LABELS.runLease(NOW + HOUR, "run-elsewhere")],
+      },
+    ]);
+    await seedReport(parkedRunFinding("r-1", "e-1", "parked 4h ago: usage-limit"));
+
+    expect(await sweep()).toMatchObject({ resumed: 0, escalated: 0, held: 1 });
+    expect(jobRows()).toEqual([]);
   });
 
   it("holds — enqueuing nothing and escalating nothing — while the usage window is still closed", async () => {

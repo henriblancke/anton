@@ -68,7 +68,11 @@ const AUTOMATIONS = [
   { id: "review-fix", label: "review-fix watcher", meta: "poll PRs every 15m" },
   { id: "orphan-grooming", label: "orphan-grooming", meta: "bucket loose tickets · 0 4 * * 1" },
   { id: "run-health", label: "run-health", meta: "report stalled runs hourly · off by default" },
-  { id: "unstick", label: "unstick", meta: "resume safe stalls, escalate the rest · 10 * * * *" },
+  {
+    id: "unstick",
+    label: "unstick",
+    meta: "acts on run-health's findings · idle until run-health is on · 10 * * * *",
+  },
 ];
 
 /** Per-automation schedule state from the server; a missing row means "not scheduled yet". */

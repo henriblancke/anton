@@ -400,10 +400,12 @@ export async function updateProjectSettings(
   const next: ProjectSettings = { ...current };
   for (const [k, v] of Object.entries(patch)) {
     if (v === undefined || v === "") delete (next as Record<string, unknown>)[k];
-    // budgetPolicy is a partial-by-design nested object: merge the patched knobs into the stored
-    // policy so an update carrying only e.g. `weeklyTargetPct` can't silently wipe `dayWindow` or
-    // any other knob the UI/API didn't send. Clearing the whole policy stays `undefined` above.
+    // budgetPolicy and runHealth are partial-by-design nested objects: merge the patched knobs into
+    // the stored value so an update carrying only e.g. `weeklyTargetPct` (or `stalePrHours`) can't
+    // silently revert the ones the UI/API didn't send to their defaults. Clearing the whole object
+    // stays `undefined` above.
     else if (k === "budgetPolicy") next.budgetPolicy = { ...current.budgetPolicy, ...(v as object) };
+    else if (k === "runHealth") next.runHealth = { ...current.runHealth, ...(v as object) };
     else (next as Record<string, unknown>)[k] = v;
   }
   await db

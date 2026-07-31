@@ -107,6 +107,21 @@ describe("EscalationActions — what the escalation can support", () => {
     expect(screen.getByRole("button", { name: "Resume" })).toBeDefined();
   });
 
+  it("says retry/stop when the answer lands on a job rather than on the work", async () => {
+    // "Abandon" would misdescribe cancelling a sync-push job: nothing is being closed as won't-do.
+    const fetchMock = stubFetch({ action: "abandon", detail: "cancelled-job" });
+    mount({ target: "job" });
+
+    expect(screen.getByRole("button", { name: "Retry job" })).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: "Stop retrying" }));
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Confirm stop" }));
+    await waitFor(() =>
+      expect(success).toHaveBeenCalledWith("Stopped — the job is cancelled and won't retry"),
+    );
+  });
+
   it("locks both buttons while a decision is in flight, so one click means one action", async () => {
     stubFetch({ action: "resume", detail: "enqueued" });
     mount();

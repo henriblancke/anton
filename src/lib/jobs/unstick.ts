@@ -23,7 +23,10 @@
  *     the same way, on `escalations_open_unique`.
  *   • RE-VERIFICATION — the report is a candidate list, never an authority. Every finding is
  *     re-checked against live runs/jobs/board before anything is touched, so a report minutes or
- *     hours old can't resurrect a run that has since moved on, nor steal one a live job owns.
+ *     hours old can't resurrect a run that has since moved on, nor steal one a live job owns. The
+ *     board half of that check is read after a PULL and fails closed when the pull doesn't land:
+ *     run ownership is cross-machine state, and a stale local mirror of it can only be wrong in the
+ *     direction that double-runs.
  */
 import { beads, type Bead } from "../beads/bd";
 import { getProjectById } from "../projects";
@@ -93,6 +96,12 @@ export interface UnstickContext {
   parkedRuns: Map<string, RunRow>;
   /** A fresh board read, by bead id. */
   board: Map<string, Bead>;
+  /**
+   * Whether `board` was read after a SUCCESSFUL pull of the shared remote. False means the local
+   * Dolt working set may trail another machine's writes, so run-lease state can't be trusted — every
+   * resume that depends on it stands down (see {@link leaseStandDown}).
+   */
+  boardFresh: boolean;
   /** When this epic's quota window reopens (ms epoch), or undefined when nothing recorded one. */
   usageWindowEndsAt: (epicBeadId: string) => number | undefined;
 }
@@ -103,6 +112,35 @@ function hold(why: string): UnstickVerdict {
 
 function escalate(why: string): UnstickVerdict {
   return { disposition: "escalate", why };
+}
+
+/**
+ * Why a resume must stand down, or undefined when the epic is free to restart. A resume is a
+ * CROSS-MACHINE act: the run-lease on the epic is the only record that another machine is executing
+ * it, and this pass reads that off a board the local Dolt working set mirrors on a sync heartbeat.
+ *
+ * So an untrusted board (the pull failed — see `unstickPass`) fails CLOSED: an unnecessary hold
+ * costs one more hour of stall, a double-run costs a duplicate PR and the quota to produce it.
+ *
+ * `ownRunId`, when given, is the stalled run's own id. execute-epic publishes the lease under the
+ * run id, so a leftover from the very run being revived is ours, not a foreign holder; the dead-lease
+ * path has no run of its own, so there any live lease is foreign.
+ */
+function leaseStandDown(
+  ctx: UnstickContext,
+  epicBeadId: string,
+  ownRunId?: string,
+): UnstickVerdict | undefined {
+  if (!ctx.boardFresh) {
+    return hold("the shared board could not be pulled, so a foreign run-lease can't be ruled out");
+  }
+  const bead = ctx.board.get(epicBeadId);
+  if (!bead) return undefined;
+  const foreign =
+    ownRunId === undefined
+      ? beads.isRunLive(bead, ctx.nowMs)
+      : beads.foreignRunLeaseLive(bead, ctx.nowMs, ownRunId);
+  return foreign ? hold("another machine holds a live run-lease") : undefined;
 }
 
 /**
@@ -149,6 +187,10 @@ export function classifyFinding(
       if (reopensAt !== undefined && reopensAt > ctx.nowMs) {
         return hold(`the usage window reopens at ${new Date(reopensAt).toISOString()}`);
       }
+      // Jobs are machine-local, so `activeEpicKeys` above only rules out a run THIS machine owns.
+      // The lease is what rules out one another machine picked up while this run sat parked.
+      const contested = leaseStandDown(ctx, run.epicBeadId, run.id);
+      if (contested) return contested;
       return {
         disposition: "resume",
         why: "parked on usage-limit and the quota window has passed",
@@ -165,7 +207,8 @@ export function classifyFinding(
       // A lease that is live NOW belongs to a machine that picked the work back up after the sweep
       // saw it expired — resuming here would double-run the epic, the one thing the lease exists to
       // prevent. That is a foreign holder, so this pass stands down entirely.
-      if (beads.isRunLive(bead, ctx.nowMs)) return hold("another machine holds a live run-lease");
+      const contested = leaseStandDown(ctx, bead.id);
+      if (contested) return contested;
       return {
         disposition: "resume",
         why: "the run-lease expired with no foreign holder",
@@ -229,11 +272,14 @@ export async function resumeEpic(
  * construction — beads stores notes as one newline-joined blob where each unindented line is a
  * separate machine entry (see beads/notes.ts), so an embedded newline would split into two notes.
  */
-export function escalationNote(finding: RunHealthFinding): string {
+export function escalationNote(finding: RunHealthFinding, escalationId: string): string {
   const reason = finding.reason.replace(/\s+/g, " ").trim();
+  // The escalation id is stamped in because bd notes are append-only with no dedupe: if the note
+  // lands but `markEscalationNoted` doesn't, the next pass writes it again, and the token is what
+  // tells a human reading the bead that the two entries are one escalation rather than two stalls.
   return (
-    `anton: escalated a ${finding.kind} — ${reason}. Nothing will retry this automatically; ` +
-    `resume or abandon it from the anton board.`
+    `anton: escalated a ${finding.kind} [${escalationId.slice(0, 8)}] — ${reason}. Nothing will ` +
+    `retry this automatically; resume or abandon it from the anton board.`
   );
 }
 
@@ -267,6 +313,20 @@ export async function unstickPass(
   if (!report || report.findings.length === 0) return summary;
   summary.findings = report.findings.length;
 
+  // Pull BEFORE reading the board, exactly as the runner's `liveRunCheck` does: the local Dolt
+  // working set trails the shared remote by a sync heartbeat, so a run-lease another machine renewed
+  // moments ago is invisible without this — and a resume judged against that stale snapshot would
+  // re-run work someone else currently owns. A pull failure doesn't fail the pass (the escalation
+  // half needs no shared state); it marks the board untrusted so the lease-gated resumes stand down.
+  let boardFresh = true;
+  await beads.pull(repoPath).catch((e) => {
+    boardFresh = false;
+    console.error(
+      `[unstick] beads pull failed for ${projectId}; holding every lease-gated resume this pass`,
+      e,
+    );
+  });
+
   const [board, activeEpicKeys, parkedRunRows] = await Promise.all([
     beads.list(repoPath, ["--status", "all"]),
     activeExecuteEpicKeys(db),
@@ -281,6 +341,7 @@ export async function unstickPass(
     activeEpicKeys,
     parkedRuns: new Map(parkedRunRows.map((r) => [r.id, r])),
     board: new Map(board.map((b) => [b.id, b])),
+    boardFresh,
     usageWindowEndsAt: (epicBeadId) => usageWindows.get(epicBeadId),
   };
 
@@ -365,7 +426,7 @@ async function writeEscalationNote(
 ): Promise<boolean> {
   if (!escalation.beadId || escalation.notedAt != null) return false;
   try {
-    await beads.note(repoPath, escalation.beadId, escalationNote(finding));
+    await beads.note(repoPath, escalation.beadId, escalationNote(finding, escalation.id));
     await markEscalationNoted(db, clock, escalation.id);
     return true;
   } catch (e) {

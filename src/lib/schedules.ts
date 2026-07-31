@@ -136,7 +136,10 @@ export async function listSchedules(projectId: string): Promise<ScheduleSummary[
  * and turns it on deliberately. run-health (anton-4ks0) ships that way: it reports on work a human
  * must then judge, so an operator who never asked for it shouldn't start accruing reports. unstick
  * (anton-wvcy) is armed by default but is a strict no-op until run-health has written a report, so
- * turning the sweep on is the single switch that arms the whole detect → act loop.
+ * turning the sweep on is the single switch that arms the whole detect → act loop. The alternative —
+ * shipping both disabled — trades an idle hourly job (one report read, no bd, no writes) for an
+ * operator who enables the sweep and silently gets findings nothing ever acts on. An operator who
+ * won't use run-health can turn unstick off independently; the settings row says as much.
  */
 export const DEFAULT_SCHEDULES: Array<{
   type: ScheduledJobType;
