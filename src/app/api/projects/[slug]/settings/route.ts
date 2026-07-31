@@ -4,6 +4,7 @@ import {
   CONCURRENCY_RANGE,
   JOB_TIMEOUT_MINUTES_RANGE,
   MAX_RETRIES_RANGE,
+  REVIEW_MAX_ROUNDS_RANGE,
   budgetPolicySchema,
   getProjectSettingsBySlug,
   updateProjectSettings,
@@ -30,6 +31,7 @@ export async function GET(_request: Request, { params }: { params: Promise<{ slu
 /** Upper bound on operator-editable prompts — generous for guidance, guards a runaway payload. */
 const MAX_SEED_PROMPT = 8000;
 const MAX_REVIEW_FIX_PROMPT = 8000;
+const MAX_REVIEW_PROMPT = 8000;
 /** Upper bound on an operator verify-gate command (anton-3oh8) — generous for a chained gate. */
 const MAX_COMMAND = 1000;
 
@@ -43,14 +45,15 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
   const patch: Partial<ProjectSettings> = {};
 
   // Numeric job-policy fields: null / "" clears to the default; a concrete value must be an
-  // integer within range. Shared handling so all three behave identically.
+  // integer within range. Shared handling so all four behave identically.
   const numericFields: {
-    key: "concurrency" | "jobTimeoutMinutes" | "maxRetries";
+    key: "concurrency" | "jobTimeoutMinutes" | "maxRetries" | "reviewMaxRounds";
     range: { min: number; max: number };
   }[] = [
     { key: "concurrency", range: CONCURRENCY_RANGE },
     { key: "jobTimeoutMinutes", range: JOB_TIMEOUT_MINUTES_RANGE },
     { key: "maxRetries", range: MAX_RETRIES_RANGE },
+    { key: "reviewMaxRounds", range: REVIEW_MAX_ROUNDS_RANGE },
   ];
   for (const { key, range } of numericFields) {
     if (!(key in body)) continue;
@@ -133,6 +136,53 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
     } else patch.reviewFixPrompt = rf;
   }
 
+  if ("reviewPrompt" in body) {
+    const rp = body.reviewPrompt;
+    // "" / null → clear the override (fall back to the shipped review contract). Otherwise bounded.
+    if (rp == null || rp === "") patch.reviewPrompt = undefined;
+    else if (typeof rp !== "string") {
+      return NextResponse.json({ error: "reviewPrompt must be a string" }, { status: 400 });
+    } else if (rp.length > MAX_REVIEW_PROMPT) {
+      return NextResponse.json(
+        { error: `reviewPrompt too long (max ${MAX_REVIEW_PROMPT} chars)` },
+        { status: 400 },
+      );
+    } else patch.reviewPrompt = rp;
+  }
+
+  // Agent ids this project can actually assign (bundled + its own .claude/agents, anton-dvo.1).
+  // Resolved lazily and at most once: both the allowlist and the reviewer swap validate against it,
+  // and most patches touch neither. A missing project falls through to updateProjectSettings' 400
+  // below, so tolerate null here rather than 404 early.
+  let knownAgents: Set<string> | undefined;
+  async function knownAgentIds(): Promise<Set<string>> {
+    if (!knownAgents) {
+      const { project } = await resolveProject(slug);
+      knownAgents = new Set((await discoverAgents(project?.repoPath)).map((a) => a.id));
+    }
+    return knownAgents;
+  }
+
+  if ("reviewAgent" in body) {
+    const reviewAgent = body.reviewAgent;
+    // "" / null → clear (review runs as the shipped contract). Otherwise an agent this project has.
+    if (reviewAgent == null || reviewAgent === "") patch.reviewAgent = undefined;
+    else if (typeof reviewAgent !== "string") {
+      return NextResponse.json({ error: "reviewAgent must be an agent id" }, { status: 400 });
+    } else if (!(await knownAgentIds()).has(reviewAgent)) {
+      return NextResponse.json({ error: `Unknown agent: ${reviewAgent}` }, { status: 400 });
+    } else patch.reviewAgent = reviewAgent;
+  }
+
+  if ("reviewEnabled" in body) {
+    const reviewEnabled = body.reviewEnabled;
+    // "" / null → clear (default: ON — absent means the gate runs). Otherwise strictly a boolean.
+    if (reviewEnabled == null || reviewEnabled === "") patch.reviewEnabled = undefined;
+    else if (typeof reviewEnabled !== "boolean") {
+      return NextResponse.json({ error: "reviewEnabled must be a boolean" }, { status: 400 });
+    } else patch.reviewEnabled = reviewEnabled;
+  }
+
   if ("agents" in body) {
     const agents = body.agents;
     // "" / null → clear (fall back to the default active set). Otherwise an array of ids that this
@@ -145,10 +195,7 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
         { status: 400 },
       );
     } else if (agents.length > 0) {
-      // Resolve for the project's repoPath only — a missing project falls through to
-      // updateProjectSettings' 400 below, so tolerate null here rather than 404 early.
-      const { project } = await resolveProject(slug);
-      const discovered = new Set((await discoverAgents(project?.repoPath)).map((a) => a.id));
+      const discovered = await knownAgentIds();
       const unknown = agents.find((a) => !discovered.has(a));
       if (unknown !== undefined) {
         return NextResponse.json({ error: `Unknown agent: ${unknown}` }, { status: 400 });

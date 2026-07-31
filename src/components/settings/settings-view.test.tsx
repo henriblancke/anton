@@ -22,14 +22,17 @@ const project: Project = {
   createdAt: 0,
 };
 
-function renderView(settings: Parameters<typeof SettingsView>[0]["settings"] = {}) {
+function renderView(
+  settings: Parameters<typeof SettingsView>[0]["settings"] = {},
+  agents: Parameters<typeof SettingsView>[0]["agents"] = [],
+) {
   return render(
     <SettingsView
       project={project}
       settings={settings}
       basePrompt="base"
       schedules={[]}
-      agents={[]}
+      agents={agents}
       bundledIds={[]}
     />,
   );
@@ -110,5 +113,98 @@ describe("SettingsView budget-aware master-switch (anton-7mpv.1)", () => {
     fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
     const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
     expect(body.budgetAware).toBe(false);
+  });
+});
+
+describe("SettingsView self-review section (anton-of1m)", () => {
+  const reviewers: Parameters<typeof SettingsView>[0]["agents"] = [
+    { id: "nextjs", source: "bundled", description: "frontend" },
+    { id: "my-reviewer", source: "project" },
+  ];
+
+  it("is ON with the default knobs when nothing is persisted", () => {
+    renderView({}, reviewers);
+    expect(
+      screen.getByRole("switch", { name: "Review before opening the PR" }).getAttribute("aria-checked"),
+    ).toBe("true");
+    expect((screen.getByLabelText("Reviewer") as HTMLSelectElement).value).toBe("");
+    expect((screen.getByLabelText("Max review rounds") as HTMLInputElement).value).toBe("2");
+    expect((screen.getByLabelText("Review prompt") as HTMLTextAreaElement).value).toBe("");
+  });
+
+  it("seeds every knob from persisted settings (round-trip in)", () => {
+    renderView(
+      {
+        reviewEnabled: true,
+        reviewAgent: "my-reviewer",
+        reviewPrompt: "Only data loss.",
+        reviewMaxRounds: 4,
+      },
+      reviewers,
+    );
+    expect((screen.getByLabelText("Reviewer") as HTMLSelectElement).value).toBe("my-reviewer");
+    expect((screen.getByLabelText("Max review rounds") as HTMLInputElement).value).toBe("4");
+    expect((screen.getByLabelText("Review prompt") as HTMLTextAreaElement).value).toBe(
+      "Only data loss.",
+    );
+  });
+
+  it("PATCHes the edited reviewer, prompt and cap on Save (round-trip out)", () => {
+    const fetchMock = stubFetch();
+    renderView({}, reviewers);
+
+    fireEvent.change(screen.getByLabelText("Reviewer"), { target: { value: "my-reviewer" } });
+    fireEvent.change(screen.getByLabelText("Max review rounds"), { target: { value: "3" } });
+    fireEvent.change(screen.getByLabelText("Review prompt"), { target: { value: "Only data loss." } });
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body).toMatchObject({
+      reviewEnabled: true,
+      reviewAgent: "my-reviewer",
+      reviewPrompt: "Only data loss.",
+      reviewMaxRounds: 3,
+    });
+  });
+
+  it("PATCHes reviewEnabled:false and disables the knobs when turned off", () => {
+    const fetchMock = stubFetch();
+    renderView({}, reviewers);
+
+    fireEvent.click(screen.getByRole("switch", { name: "Review before opening the PR" }));
+    expect((screen.getByLabelText("Reviewer") as HTMLSelectElement).disabled).toBe(true);
+    expect((screen.getByLabelText("Max review rounds") as HTMLInputElement).disabled).toBe(true);
+    expect((screen.getByLabelText("Review prompt") as HTMLTextAreaElement).disabled).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.reviewEnabled).toBe(false);
+  });
+
+  it("clears the reviewer swap to null so the server falls back to the shipped contract", () => {
+    const fetchMock = stubFetch();
+    renderView({ reviewAgent: "nextjs" }, reviewers);
+
+    fireEvent.change(screen.getByLabelText("Reviewer"), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.reviewAgent).toBeNull();
+  });
+
+  it("keeps a persisted reviewer that no longer resolves selectable, flagged as missing", () => {
+    renderView({ reviewAgent: "deleted-agent" }, reviewers);
+    const select = screen.getByLabelText("Reviewer") as HTMLSelectElement;
+    expect(select.value).toBe("deleted-agent");
+    expect(screen.getByText(/no longer exists/)).toBeTruthy();
+  });
+
+  it("clamps the round cap to [1,5]", () => {
+    renderView({}, reviewers);
+    const cap = screen.getByLabelText("Max review rounds") as HTMLInputElement;
+    fireEvent.change(cap, { target: { value: "9" } });
+    expect(cap.value).toBe("5");
+    fireEvent.change(cap, { target: { value: "0" } });
+    expect(cap.value).toBe("1");
   });
 });

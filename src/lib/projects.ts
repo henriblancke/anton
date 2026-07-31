@@ -114,6 +114,31 @@ export interface ProjectSettings {
    */
   reviewFixPrompt?: string;
   /**
+   * Pre-PR self-review gate (anton-3apm): whether each run is reviewed against its own diff before
+   * the PR opens. Absent → ON, so the founder's merge gate is trustworthy without opting in; set
+   * false to skip the gate entirely (the run goes straight from the ticket loop to the PR).
+   */
+  reviewEnabled?: boolean;
+  /**
+   * Swap the reviewer for a named agent (anton-3apm): any id `discoverAgents` resolves for this
+   * project — anton's bundled specialists or the operator's own `.claude/agents`. Absent → the
+   * shipped review contract. Validated at the API boundary, so a stale id can only come from an
+   * agent deleted after it was saved; the reviewer falls back to the shipped contract in that case.
+   */
+  reviewAgent?: string;
+  /**
+   * Operator-editable reasoning prompt for the reviewer, mirroring {@link reviewFixPrompt}: it
+   * replaces the shipped review contract, and anton appends the concrete run context beneath it.
+   * Empty = shipped default. Independent of {@link reviewAgent} — a named agent still gets it.
+   */
+  reviewPrompt?: string;
+  /**
+   * Cap on review → fix → re-review rounds before the loop stops converging (anton-3apm). Bounds
+   * the gate: a reviewer that keeps reporting the same finding hits the cap instead of looping
+   * forever. Absent → DEFAULT_REVIEW_MAX_ROUNDS.
+   */
+  reviewMaxRounds?: number;
+  /**
    * Max concurrent execute-epic runs for this project (anton-xbk). The runner gates approved-epic
    * execution per project against this; other job types (review-fix/nightly) don't count against
    * it. Absent → DEFAULT_CONCURRENCY.
@@ -204,11 +229,38 @@ export function resolveVerifyGates(settings: ProjectSettings): VerifyGate[] {
 export const DEFAULT_CONCURRENCY = 3;
 export const DEFAULT_JOB_TIMEOUT_MINUTES = 120; // 2 hours
 export const DEFAULT_MAX_RETRIES = 3;
+/** Two rounds: the reviewer's first pass plus one chance to confirm the fixes landed. */
+export const DEFAULT_REVIEW_MAX_ROUNDS = 2;
 
 /** Allowed ranges for the numeric job-policy settings (validated at the API boundary). */
 export const CONCURRENCY_RANGE = { min: 1, max: 6 } as const;
 export const JOB_TIMEOUT_MINUTES_RANGE = { min: 5, max: 720 } as const; // 5 min … 12 h
 export const MAX_RETRIES_RANGE = { min: 1, max: 10 } as const;
+export const REVIEW_MAX_ROUNDS_RANGE = { min: 1, max: 5 } as const;
+
+/** A project's resolved self-review configuration (anton-3apm) — never partial. */
+export interface ReviewConfig {
+  enabled: boolean;
+  /** A discoverable agent id to review as; absent → the shipped review contract. */
+  agent?: string;
+  /** Operator prompt replacing the shipped review contract; absent → the shipped default. */
+  prompt?: string;
+  maxRounds: number;
+}
+
+/**
+ * The self-review gate's settings with defaults applied (anton-3apm). The single seam the review
+ * builder and the execute-epic gate read, so "absent means on" and the round cap can't drift
+ * between them.
+ */
+export function resolveReviewConfig(settings: ProjectSettings): ReviewConfig {
+  return {
+    enabled: settings.reviewEnabled ?? true,
+    agent: settings.reviewAgent || undefined,
+    prompt: settings.reviewPrompt || undefined,
+    maxRounds: settings.reviewMaxRounds ?? DEFAULT_REVIEW_MAX_ROUNDS,
+  };
+}
 
 /** A 0–100 integer percentage — the same scale the governor's {@link BudgetPolicy} uses. */
 const pctSchema = z.number().int().min(0).max(100);

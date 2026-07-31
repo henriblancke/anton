@@ -10,6 +10,8 @@ let addProject: typeof import("./projects").addProject;
 let listProjects: typeof import("./projects").listProjects;
 let getProjectBySlug: typeof import("./projects").getProjectBySlug;
 let resolveVerifyGates: typeof import("./projects").resolveVerifyGates;
+let resolveReviewConfig: typeof import("./projects").resolveReviewConfig;
+let DEFAULT_REVIEW_MAX_ROUNDS: typeof import("./projects").DEFAULT_REVIEW_MAX_ROUNDS;
 let budgetPolicySchema: typeof import("./projects").budgetPolicySchema;
 let resolveProjectBudgetPolicy: typeof import("./projects").resolveProjectBudgetPolicy;
 let resolveBudgetPolicy: typeof import("./projects").resolveBudgetPolicy;
@@ -35,6 +37,8 @@ beforeAll(async () => {
   listProjects = mod.listProjects;
   getProjectBySlug = mod.getProjectBySlug;
   resolveVerifyGates = mod.resolveVerifyGates;
+  resolveReviewConfig = mod.resolveReviewConfig;
+  DEFAULT_REVIEW_MAX_ROUNDS = mod.DEFAULT_REVIEW_MAX_ROUNDS;
   budgetPolicySchema = mod.budgetPolicySchema;
   resolveProjectBudgetPolicy = mod.resolveProjectBudgetPolicy;
   resolveBudgetPolicy = mod.resolveBudgetPolicy;
@@ -155,6 +159,42 @@ describe("resolveVerifyGates (anton-3oh8)", () => {
       { label: "tests", command: "t" },
       { label: "build", command: "b" },
     ]);
+  });
+});
+
+describe("resolveReviewConfig (anton-of1m)", () => {
+  it("is ON with the default round cap when nothing is configured", () => {
+    expect(resolveReviewConfig({})).toEqual({
+      enabled: true,
+      agent: undefined,
+      prompt: undefined,
+      maxRounds: DEFAULT_REVIEW_MAX_ROUNDS,
+    });
+  });
+
+  it("honors an explicit off switch", () => {
+    expect(resolveReviewConfig({ reviewEnabled: false }).enabled).toBe(false);
+  });
+
+  it("carries the swapped reviewer, prompt override and round cap", () => {
+    expect(
+      resolveReviewConfig({
+        reviewAgent: "my-reviewer",
+        reviewPrompt: "Only data loss.",
+        reviewMaxRounds: 4,
+      }),
+    ).toEqual({
+      enabled: true,
+      agent: "my-reviewer",
+      prompt: "Only data loss.",
+      maxRounds: 4,
+    });
+  });
+
+  it("treats an empty stored agent/prompt as absent, so callers never dispatch a blank override", () => {
+    const resolved = resolveReviewConfig({ reviewAgent: "", reviewPrompt: "" });
+    expect(resolved.agent).toBeUndefined();
+    expect(resolved.prompt).toBeUndefined();
   });
 });
 
