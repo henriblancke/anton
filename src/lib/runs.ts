@@ -208,6 +208,24 @@ export async function reconcileInterruptedRuns(
   return orphaned.length;
 }
 
+/**
+ * Every run of a project in the given statuses, oldest activity first (anton-4ks0). The read the
+ * run-health sweep detects over — `updatedAt` on a settled run is when it settled, so ordering by
+ * it puts the most-stalled work first. db-injectable; strictly read-only.
+ */
+export async function listRunsByStatus(
+  db: AntonDb,
+  projectId: string,
+  statuses: readonly RunStatus[],
+): Promise<RunRow[]> {
+  if (statuses.length === 0) return [];
+  return db
+    .select()
+    .from(schema.runs)
+    .where(and(eq(schema.runs.projectId, projectId), inArray(schema.runs.status, [...statuses])))
+    .orderBy(schema.runs.updatedAt);
+}
+
 /** The most-recent still-open run for an epic — used to resume rather than start a duplicate. */
 export async function findOpenRunForEpic(
   db: AntonDb,

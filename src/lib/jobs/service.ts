@@ -23,6 +23,7 @@ import { makeReviewFixHandler } from "./review-fix";
 import { makeNightlyStringerHandler } from "./nightly-stringer";
 import { makeOrphanGroomingHandler } from "./orphan-grooming";
 import { makeSyncPushHandler } from "./sync-push";
+import { makeRunHealthHandler } from "./run-health";
 import { JobRunner, type RunnerLogger, type RunningJobInfo } from "./runner";
 import { Scheduler } from "./scheduler";
 import { activeExecuteEpicId, getJob, systemClock } from "./queue";
@@ -151,6 +152,7 @@ export function getRunner(): JobRunner {
   runner.registerHandler("nightly-stringer", makeNightlyStringerHandler({ db }));
   runner.registerHandler("orphan-grooming", makeOrphanGroomingHandler({ db }));
   runner.registerHandler("sync-push", makeSyncPushHandler({ db }));
+  runner.registerHandler("run-health", makeRunHealthHandler({ db }));
   s.runner = runner;
   return runner;
 }

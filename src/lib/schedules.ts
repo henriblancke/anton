@@ -16,7 +16,7 @@ import { isValidCron, nextRun } from "./jobs/cron";
 /** Job types that run on a schedule (execute-epic is enqueued on approval, never on cron). */
 export type ScheduledJobType = Extract<
   JobType,
-  "review-fix" | "nightly-stringer" | "orphan-grooming"
+  "review-fix" | "nightly-stringer" | "orphan-grooming" | "run-health"
 >;
 
 export type ScheduleRow = typeof schema.schedules.$inferSelect;
@@ -129,13 +129,22 @@ export async function listSchedules(projectId: string): Promise<ScheduleSummary[
 
 /**
  * Sensible per-project cron defaults for the Phase 2 background jobs (anton-3t2). Seeded when a
- * project is added so the jobs run without manual setup; the (future) settings UI edits/disables
- * them. Times are local. review-fix polls often (cheap gh calls); stringer/grooming are periodic.
+ * project is added so the jobs run without manual setup; the settings UI edits/disables them. Times
+ * are local. review-fix polls often (cheap gh calls); stringer/grooming are periodic.
+ *
+ * `enabled: false` seeds the ROW without arming it — the operator sees the automation in settings
+ * and turns it on deliberately. run-health (anton-4ks0) ships that way: it reports on work a human
+ * must then judge, so an operator who never asked for it shouldn't start accruing reports.
  */
-export const DEFAULT_SCHEDULES: Array<{ type: ScheduledJobType; cron: string }> = [
+export const DEFAULT_SCHEDULES: Array<{
+  type: ScheduledJobType;
+  cron: string;
+  enabled?: boolean;
+}> = [
   { type: "review-fix", cron: "*/15 * * * *" }, // poll open PRs every 15 min
   { type: "nightly-stringer", cron: "0 3 * * *" }, // scan + triage nightly at 03:00
   { type: "orphan-grooming", cron: "0 4 * * 1" }, // bucket loose tickets weekly, Mon 04:00
+  { type: "run-health", cron: "0 * * * *", enabled: false }, // sweep for stalls hourly; opt-in
 ];
 
 /** Idempotently seed the default schedules for a project (no-op for types it already has). */
@@ -145,7 +154,12 @@ export async function seedDefaultSchedules(
   projectId: string,
 ): Promise<void> {
   for (const d of DEFAULT_SCHEDULES) {
-    await ensureSchedule(db, clock, { projectId, type: d.type, cron: d.cron });
+    await ensureSchedule(db, clock, {
+      projectId,
+      type: d.type,
+      cron: d.cron,
+      enabled: d.enabled,
+    });
   }
 }
 

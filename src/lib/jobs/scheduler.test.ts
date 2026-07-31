@@ -179,8 +179,14 @@ describe("Scheduler.tickOnce", () => {
     const rows = tdb.db.select().from(schema.schedules).all();
     expect(rows.length).toBe(DEFAULT_SCHEDULES.length);
     expect(new Set(rows.map((r) => r.type))).toEqual(new Set(DEFAULT_SCHEDULES.map((d) => d.type)));
-    // Every seeded schedule is enabled with a computed nextRunAt.
-    expect(rows.every((r) => r.enabled && r.nextRunAt != null)).toBe(true);
+    // A seeded schedule is armed (nextRunAt computed) iff the default says it starts enabled — an
+    // opt-in default like run-health seeds the ROW but never fires until the operator turns it on.
+    for (const d of DEFAULT_SCHEDULES) {
+      const row = rows.find((r) => r.type === d.type)!;
+      const enabled = d.enabled ?? true;
+      expect(row.enabled).toBe(enabled);
+      expect(row.nextRunAt != null).toBe(enabled);
+    }
   });
 
   it("ensureSchedule is idempotent per (project,type)", async () => {

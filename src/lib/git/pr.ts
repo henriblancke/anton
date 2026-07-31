@@ -148,6 +148,52 @@ export async function getPrReview(
   };
 }
 
+/**
+ * A PR's liveness at a glance (anton-4ks0) — state and last-activity, nothing else. Deliberately
+ * NOT `PrReview`: the run-health sweep only asks "has anyone touched this?", and paying for
+ * `getPrReview`'s reviews + CI rollup + GraphQL thread fetch per in-review target would make a
+ * read-only health check the most expensive job on the board.
+ */
+export interface PrActivity {
+  number: number;
+  /** OPEN | MERGED | CLOSED */
+  state: string;
+  url: string;
+  /** ms epoch of the last update GitHub recorded (push, comment, review, label). */
+  updatedAtMs: number;
+  isDraft: boolean;
+}
+
+/** Read a PR's state + last-activity time. Read-only; no writes, no side effects. */
+export async function getPrActivity(
+  repoPath: string,
+  number: number,
+  signal?: AbortSignal,
+): Promise<PrActivity> {
+  const raw = await gh(
+    repoPath,
+    ["pr", "view", String(number), "--json", "number,state,url,updatedAt,isDraft"],
+    signal,
+  );
+  const view = JSON.parse(raw) as {
+    number: number;
+    state: string;
+    url: string;
+    updatedAt?: string;
+    isDraft?: boolean;
+  };
+  const parsed = view.updatedAt ? Date.parse(view.updatedAt) : NaN;
+  return {
+    number: view.number,
+    state: view.state,
+    url: view.url,
+    // An unparseable/absent timestamp reads as "just updated" so a gh quirk can never fabricate a
+    // stale-PR finding out of a PR that may be perfectly active.
+    updatedAtMs: Number.isFinite(parsed) ? parsed : Date.now(),
+    isDraft: view.isDraft ?? false,
+  };
+}
+
 /** `owner/repo` of the repo's default remote, or undefined when gh can't resolve it. */
 async function nameWithOwner(repoPath: string, signal?: AbortSignal): Promise<string | undefined> {
   const nwo = (

@@ -74,10 +74,19 @@ describe("schedules route", () => {
     const res = await GET(new Request("http://t/"), ctx("tmp"));
     expect(res.status).toBe(200);
     const { schedules } = await res.json();
-    expect(schedules).toHaveLength(3);
+    expect(schedules).toHaveLength(4);
     const types = schedules.map((s: { type: string }) => s.type).sort();
-    expect(types).toEqual(["nightly-stringer", "orphan-grooming", "review-fix"]);
-    for (const s of schedules) expect(s.enabled).toBe(true);
+    expect(types).toEqual(["nightly-stringer", "orphan-grooming", "review-fix", "run-health"]);
+    // Enabled state comes straight off the seeded row: run-health is the opt-in one (anton-4ks0).
+    const enabledByType = Object.fromEntries(
+      schedules.map((s: { type: string; enabled: boolean }) => [s.type, s.enabled]),
+    );
+    expect(enabledByType).toEqual({
+      "nightly-stringer": true,
+      "orphan-grooming": true,
+      "review-fix": true,
+      "run-health": false,
+    });
   });
 
   it("GET 404s for an unknown project", async () => {

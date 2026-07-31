@@ -176,6 +176,12 @@ export interface ProjectSettings {
    * {@link budgetAware} is on.
    */
   budgetPolicy?: ProjectBudgetPolicy;
+  /**
+   * How long a run may sit stuck before the run-health sweep (anton-4ks0) calls it a finding.
+   * Absent → {@link DEFAULT_RUN_HEALTH_THRESHOLDS}; a stored value need only carry the knobs the
+   * operator touched. Only consulted by the `run-health` schedule, which is off by default.
+   */
+  runHealth?: RunHealthThresholds;
 }
 
 /** A resolved verify gate (anton-3oh8): a stable label (for logs/errors) + the shell command. */
@@ -286,6 +292,40 @@ export function resolveBudgetPolicy(settings: ProjectSettings): BudgetPolicy {
     weeklyTargetPct: p.weeklyTargetPct,
     nightValueDiscount: p.preferNightForHeavy ? DEFAULT_BUDGET_POLICY.nightValueDiscount : 0,
   };
+}
+
+/**
+ * How stale each class of stall must be before the run-health sweep reports it (anton-4ks0). Every
+ * field optional so a patch carries only the knobs the operator touched; each is range-checked (fail
+ * loud) and unknown keys rejected, matching {@link budgetPolicySchema}.
+ */
+export const runHealthThresholdsSchema = z
+  .object({
+    parkedRunMinutes: z.number().int().min(1).max(10_080), // 1 min … 7 days
+    stalePrHours: z.number().int().min(1).max(720), // 1 h … 30 days
+    deadLeaseMinutes: z.number().int().min(1).max(10_080),
+  })
+  .partial()
+  .strict();
+
+export type RunHealthThresholds = z.infer<typeof runHealthThresholdsSchema>;
+
+/**
+ * Defaults tuned to "longer than the work could plausibly still be moving": a run parked for two
+ * hours is not about to un-park itself, a PR untouched for a day has lost its reviewer, and a
+ * run-lease is refreshed on a heartbeat so 30 minutes past expiry means the owner is gone.
+ */
+export const DEFAULT_RUN_HEALTH_THRESHOLDS: Required<RunHealthThresholds> = {
+  parkedRunMinutes: 120,
+  stalePrHours: 24,
+  deadLeaseMinutes: 30,
+};
+
+/** Overlay the stored (possibly partial) thresholds onto the defaults — never a partial out. */
+export function resolveRunHealthThresholds(
+  settings: ProjectSettings,
+): Required<RunHealthThresholds> {
+  return { ...DEFAULT_RUN_HEALTH_THRESHOLDS, ...(settings.runHealth ?? {}) };
 }
 
 export async function getProjectSettings(db: AntonDb, id: string): Promise<ProjectSettings> {
@@ -531,13 +571,17 @@ export async function deleteProject(slug: string): Promise<void> {
   }
 
   // 4. Drop the project's anton.db rows atomically, children before parents (no ON DELETE
-  //    CASCADE in the schema): sessions → runs → jobs → schedules → projects.
+  //    CASCADE in the schema): sessions → runs → jobs → schedules → run-health → projects.
   try {
     db.transaction((tx) => {
       tx.delete(schema.sessions).where(eq(schema.sessions.projectId, project.id)).run();
       tx.delete(schema.runs).where(eq(schema.runs.projectId, project.id)).run();
       tx.delete(schema.jobs).where(eq(schema.jobs.projectId, project.id)).run();
       tx.delete(schema.schedules).where(eq(schema.schedules.projectId, project.id)).run();
+      tx
+        .delete(schema.runHealthReports)
+        .where(eq(schema.runHealthReports.projectId, project.id))
+        .run();
       tx.delete(schema.projects).where(eq(schema.projects.id, project.id)).run();
     });
   } catch (e) {

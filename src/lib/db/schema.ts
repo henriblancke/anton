@@ -45,7 +45,7 @@ export const jobs = sqliteTable(
   "jobs",
   {
     id: text("id").primaryKey(),
-    // execute-epic | review-fix | nightly-stringer | orphan-grooming | sync-push
+    // execute-epic | review-fix | nightly-stringer | orphan-grooming | sync-push | run-health
     type: text("type").notNull(),
     projectId: text("project_id").references(() => projects.id),
     payloadJson: text("payload_json").notNull().default("{}"),
@@ -121,6 +121,25 @@ export const burnSamples = sqliteTable(
   // Serve the "most recent N samples for this type" query without a full scan.
   (table) => [index("burn_samples_type_created_idx").on(table.jobType, table.createdAt)],
 );
+
+/**
+ * The latest run-health sweep per project (anton-4ks0). The sweep is read-only over runs/jobs/board,
+ * so this row IS its whole output: the typed findings the board renders. Deliberately ONE row per
+ * project (project_id is the key) — each sweep replaces the last, so repeated sweeps over unchanged
+ * state converge on the same row instead of growing an append-only log nobody reads.
+ */
+export const runHealthReports = sqliteTable("run_health_reports", {
+  projectId: text("project_id")
+    .primaryKey()
+    .references(() => projects.id),
+  /** The sweep job that produced this report, so a finding traces back to its job row. */
+  jobId: text("job_id"),
+  generatedAt: ts("generated_at").notNull().default(now),
+  /** `RunHealthFinding[]` (src/lib/run-health.ts), serialized. */
+  findingsJson: text("findings_json").notNull().default("[]"),
+  /** Denormalized so a board badge / refresh token needn't parse the blob. */
+  findingCount: integer("finding_count").notNull().default(0),
+});
 
 /** Claude sessions — for history, diagnostics, and xterm attach. */
 export const sessions = sqliteTable("sessions", {

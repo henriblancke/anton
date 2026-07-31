@@ -19,7 +19,8 @@ export type JobType =
   | "review-fix"
   | "nightly-stringer"
   | "orphan-grooming"
-  | "sync-push";
+  | "sync-push"
+  | "run-health";
 
 /**
  * `queued`  — eligible when runAt ≤ now (also how a backoff/quota reschedule is represented).
@@ -997,6 +998,24 @@ export async function activeExecuteEpicKeys(db: AntonDb): Promise<Set<string>> {
     if (epicBeadId) keys.add(`${row.projectId ?? ""}::${epicBeadId}`);
   }
   return keys;
+}
+
+/**
+ * A project's jobs in the given statuses, oldest activity first (anton-4ks0). The read the
+ * run-health sweep detects exhausted jobs over; strictly read-only, and project-scoped so one
+ * project's report can never surface another's work.
+ */
+export async function listJobsByStatus(
+  db: AntonDb,
+  projectId: string,
+  statuses: readonly JobStatus[],
+): Promise<JobRow[]> {
+  if (statuses.length === 0) return [];
+  return db
+    .select()
+    .from(schema.jobs)
+    .where(and(eq(schema.jobs.projectId, projectId), inArray(schema.jobs.status, [...statuses])))
+    .orderBy(schema.jobs.updatedAt);
 }
 
 /** Key a job's schedule gate by `(type, projectId)` — the grain a `schedules` row is keyed on. */
