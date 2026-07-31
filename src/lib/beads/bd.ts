@@ -40,10 +40,22 @@ export const LABELS = {
    */
   runLease: (expiresAtMs: number, owner?: string) =>
     owner ? `run-lease:${expiresAtMs}:${owner}` : `run-lease:${expiresAtMs}`,
+  /**
+   * Latest pre-PR self-review score on a run target (anton-omum): `review-score:<0-10>`. A state
+   * label, not a bd custom status — divergent label writes merge clean while divergent status
+   * writes hard-wedge Dolt sync (docs/design/2026-07-30-custom-statuses-vs-stage-labels.md).
+   * Written prefix-diffed (remove the old value, add the new) in one update like `stage:*`, so the
+   * dimension stays single-valued; the full per-round history lives in the append-only score
+   * comments beside it.
+   */
+  reviewScore: (score: number) => `review-score:${score}`,
 } as const;
 
 /** Prefix of the run-lease label (see LABELS.runLease). */
 const RUN_LEASE_PREFIX = "run-lease:";
+
+/** Prefix of the review-score label (see LABELS.reviewScore). */
+const REVIEW_SCORE_PREFIX = "review-score:";
 
 /**
  * Shape of a GitHub PR pointer (`gh-<number>`). The ONLY `external_ref` value anton treats as a PR:
@@ -894,6 +906,33 @@ export const beads = {
    */
   note: (cwd: string, id: string, text: string, actor?: string) =>
     bdWrite(cwd, ["note", id, text], actor ? { BEADS_ACTOR: actor } : undefined),
+
+  /**
+   * Append an entry to a bead's comment thread (`bd comment`). Unlike {@link note} — one blob that
+   * later writes edit around — comments are append-only and individually timestamped, which is what
+   * makes them the home for a history a reader replays in order (the per-round review scores,
+   * anton-omum).
+   */
+  comment: (cwd: string, id: string, text: string) => bdWrite(cwd, ["comment", id, text]),
+
+  /** The bead's existing `review-score:*` labels — the stale set {@link setReviewScore} replaces. */
+  reviewScoreLabels: (b: Bead): string[] =>
+    (b.labels ?? []).filter((l) => l.startsWith(REVIEW_SCORE_PREFIX)),
+
+  /**
+   * Publish the latest review score as a state label in ONE update: drop every prior
+   * `review-score:*` (pass them as `stale`) and add the new value, so the prefix stays
+   * single-valued the way `stage:*` does.
+   */
+  setReviewScore: (cwd: string, id: string, score: number, stale: string[] = []) =>
+    bdWrite(cwd, [
+      "update",
+      id,
+      ...stale.flatMap((l) => ["--remove-label", l]),
+      "--add-label",
+      LABELS.reviewScore(score),
+    ]),
+
   close: (cwd: string, id: string) => bdWrite(cwd, ["close", id]),
 
   /**

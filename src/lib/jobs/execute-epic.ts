@@ -29,6 +29,7 @@ import { bundledAgentIds, discoverAgents } from "../agents-discovery";
 import {
   getProjectById,
   getProjectSettings,
+  resolveReviewConfig,
   resolveVerifyGates,
   type ProjectSettings,
 } from "../projects";
@@ -45,6 +46,9 @@ import {
   startJobSession,
 } from "../sessions";
 import { buildPrTitle } from "./pr-title";
+import type { ReviewFinding } from "./review-context";
+import { blockingFindings, runReviewGate, type ReviewGateResult } from "./review-gate";
+import { persistReviewScores } from "./review-score";
 import {
   isRecoverableClaudeError,
   isUsageLimitError,
@@ -691,10 +695,13 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // existing worktree, so the base is never re-applied mid-run. Note the PR `base` below stays
       // the plain branch name (gh needs a branch, not a remote-tracking ref).
       const baseBranch = settings.baseBranch ?? project.defaultBranch;
+      // Held for the review gate below too: it diffs the branch against this base's MERGE BASE, so
+      // the remote-tracking ref is the accurate fork point even when the local base has drifted.
+      const freshBase = await resolveFreshBase(repo, baseBranch);
       const worktree = await createWorktree({
         repoPath: repo,
         branch,
-        baseBranch: await resolveFreshBase(repo, baseBranch),
+        baseBranch: freshBase,
         warm: true,
       });
       await updateRun(db, clock, runId, {
@@ -900,6 +907,53 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         await ctx.heartbeat();
       }
 
+      // 4b. Pre-PR self-review gate (anton-omum): a fresh-context reviewer reads THIS run's diff,
+      //     its blocking findings are fixed on the branch, and only then does the PR open — so the
+      //     PR the founder merges has already been reviewed once. Skipped entirely when the
+      //     operator turned review off (absent ⇒ on). Nothing about the verdict is persisted as a
+      //     resume marker on purpose: a parked run that is resumed re-reviews the worktree as it
+      //     stands now, which is the only state the fixes it just made are visible in. A run that
+      //     already opened its PR never reaches here — step 0a short-circuits it.
+      let advisoryFindings: ReviewFinding[] = [];
+      if (resolveReviewConfig(settings).enabled) {
+        assertLeaseHeld(); // don't review (or fix) under a lease that has silently lapsed
+        const review = await runReviewGate({
+          db,
+          clock,
+          ctx,
+          projectId,
+          runId,
+          target,
+          tickets: live,
+          settings,
+          worktreePath: worktree.path,
+          baseBranch: freshBase,
+        });
+        // The score history belongs to the board, not this run's logs — written on BOTH exits, since
+        // a run parked on blocking findings is exactly the one whose score the founder needs.
+        await persistReviewScores(repo, epicBeadId, review);
+
+        const blocking = blockingFindings(review.unresolved);
+        // Two states must not become a PR: blocking findings the converge loop couldn't clear, and a
+        // reviewer that never spoke the report protocol (silence is not a clean review). Both park
+        // for the founder like a no-delivery ticket does, with the reason on the bead so the board
+        // shows why rather than only the run log.
+        if (blocking.length > 0 || review.outcome === "protocol-violation") {
+          await safe(() => beads.note(repo, epicBeadId, reviewParkNote(review, blocking)));
+          throw new ReviewBlockedError(
+            `${epicBeadId} did not pass its pre-PR self-review (${review.outcome}): ` +
+              (blocking.length > 0
+                ? `${blocking.length} blocking finding(s) survived the gate`
+                : `the reviewer never reported a valid score`) +
+              `. No PR opened — the findings are on the bead; resolve them (or fix the ticket) and ` +
+              `resume the run.`,
+          );
+        }
+        // Advisory findings never park (anton-3apm): they ride along in the PR body so the founder
+        // sees them at the merge gate.
+        advisoryFindings = review.unresolved.filter((f) => f.severity === "advisory");
+      }
+
       // 5. All tickets done → open one PR, stamp the PR ref, and (for an epic) move it to
       //    in-review. A standalone target is NOT closed here: like an epic it stays OPEN, tagged
       //    stage:in-review (runTicket already applied that on commit), carrying its PR ref until
@@ -915,7 +969,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         title: buildPrTitle(target, epicBeadId, settings.conventionalCommits),
         // `live`, not `tickets`: an abandoned ticket contributed no commit, so listing it would
         // advertise work this PR doesn't contain (anton-6xj0).
-        body: prBody(target, live),
+        body: prBody(target, live, advisoryFindings),
       });
       await safe(() => beads.setPrRef(repo, epicBeadId, pr.ref));
       if (!standaloneRun) {
@@ -1355,6 +1409,41 @@ class BlockedByAgentError extends Error {
   }
 }
 
+/**
+ * The pre-PR self-review left blocking findings unresolved, or never reported at all (anton-omum).
+ * Poison-classified (`name = "PoisonError"`) like {@link NoDeliveryError}, so the runner parks the run
+ * for the founder instead of retrying: the reviewer has already had its bounded rounds to converge,
+ * and re-running the same gate on the same diff would reproduce the same verdict.
+ */
+class ReviewBlockedError extends Error {
+  constructor(msg: string) {
+    super(msg);
+    this.name = "PoisonError"; // classified as poison by the runner
+  }
+}
+
+/** The park reason on the target bead: what the reviewer refused to pass, in its own words. */
+function reviewParkNote(review: ReviewGateResult, blocking: ReviewFinding[]): string {
+  const rounds = review.rounds.length;
+  const head =
+    blocking.length > 0
+      ? `anton: the pre-PR self-review left ${blocking.length} blocking finding(s) unresolved after ` +
+        `${rounds} round(s) (${review.outcome}) — no PR was opened:`
+      : `anton: the pre-PR self-review never reported a valid score after ${rounds} round(s) ` +
+        `(${review.outcome}) — no PR was opened, because silence is not a clean review.`;
+  return [
+    head,
+    ...findingLines(blocking),
+    ``,
+    `Resolve them (or correct the ticket), then resume the run.`,
+  ].join("\n");
+}
+
+/** Findings as a markdown list — shared by the park note and the PR body. */
+function findingLines(findings: ReviewFinding[]): string[] {
+  return findings.map((f) => `- ${f.location} — ${f.note}`);
+}
+
 /** Fold the parsed self-report into a zero-diff block reason, when one was emitted (anton-j5i8). */
 function selfReportSuffix(selfReport: ReturnType<typeof parseAntonResult>): string {
   if (!selfReport) return "";
@@ -1510,13 +1599,28 @@ export function ticketPrompt(ticket: Bead): string {
   return lines.join("\n");
 }
 
-function prBody(target: Bead, tickets: Bead[]): string {
+/**
+ * `advisory` — findings the self-review reported and did NOT fix (anton-omum). They never hold the PR
+ * back, so the merge gate is the only place the founder would ever see them; putting them in the body
+ * is what makes "self-reviewed" mean something they can act on rather than trust blindly.
+ */
+function prBody(target: Bead, tickets: Bead[], advisory: ReviewFinding[] = []): string {
   // Standalone run (epic-of-one): the single ticket IS the target, so listing it again is noise.
   const standalone = tickets.length === 1 && tickets[0]?.id === target.id;
   const lines = [
     `Autonomous run for **${target.id}** — ${target.title}.`,
     ``,
     ...(standalone ? [] : [`Tickets:`, ...tickets.map((t) => `- ${t.id} — ${t.title}`), ``]),
+    ...(advisory.length > 0
+      ? [
+          `### Unresolved review findings (${advisory.length}, advisory)`,
+          ``,
+          `anton's pre-PR self-review reported these and left them for you — they don't block the merge.`,
+          ``,
+          ...findingLines(advisory),
+          ``,
+        ]
+      : []),
     `🤖 Generated with [anton](https://github.com/) autonomous execution`,
   ];
   return lines.join("\n");

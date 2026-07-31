@@ -298,6 +298,11 @@ process.exit(0);`),
     settingsJson: JSON.stringify({
       testCommand: "test -f AGENT_WORK.md",
       seedPrompt: "SEED_MARKER_QZX — prefer server components in this repo.",
+      // The pre-PR self-review gate is ON by default in production (anton-omum). These suites cover
+      // the pipeline AROUND it — a review round on every case would add sessions they count and
+      // demand a report protocol their fake claude doesn't speak — so it's off here and exercised
+      // by `execute-epic.review-gate.integration.test.ts`, which turns it back on per case.
+      reviewEnabled: false,
     }),
   });
 
