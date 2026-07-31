@@ -254,6 +254,23 @@ const EMPTY_LIST_ITEM = /^(?:[-*+]|\d{1,9}[.)])(?:[ \t]+\[[ xX]?\])?[ \t]*$/;
  * as a rule, not text, so a section holding only `---` says nothing ({@link stateOf}). */
 const THEMATIC_BREAK = /^([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
 
+/** One blockquote marker — up to 3 leading spaces, `>`, then an optional space (CommonMark). */
+const BLOCKQUOTE = /^ {0,3}>[ \t]?/;
+
+/**
+ * `text` with every blockquote marker stripped, nesting included — the content the callout wraps.
+ *
+ * The marker is punctuation: `> TODO — fill this in` renders the prompt inside a callout, and it is
+ * exactly as unwritten as the bare line. A judge blind to the prefix saw no {@link PROMPT_LINE}
+ * match and read the section as authored, so a project-local formula that styles its placeholders
+ * as callouts passed the blocking gate with no definition of done at all.
+ */
+function unquote(text: string): string {
+  let out = text;
+  while (BLOCKQUOTE.test(out)) out = out.replace(BLOCKQUOTE, "");
+  return out;
+}
+
 /** What a section holds. `prompt` is a gap like `absent` — they differ only in the message. */
 type SectionState = "written" | "prompt" | "absent";
 
@@ -332,12 +349,16 @@ export function renderedText(raw: string): string {
  * counts as LITERAL: heading-shaped or TODO-shaped lines inside a fence are a quoted example the
  * author wrote, so the scaffolding and prompt tests apply only outside fences — filtering a fenced
  * `# Expected title` rubric read an authored section as absent.
+ *
+ * Outside a fence the blockquote marker comes off first ({@link unquote}): it styles its content,
+ * it is not content, so `> TODO — fill this in` must be judged as the prompt it renders. Leaving it
+ * on defeated {@link PROMPT_LINE} and passed the blocking gate on a section stating no rubric.
  */
 function stateOf(bodies: string[]): SectionState {
   let state: SectionState = "absent";
   for (const raw of bodies) {
     const lines = renderedLines(raw)
-      .map((l) => ({ text: l.text.trim(), fenced: l.fenced }))
+      .map((l) => ({ text: (l.fenced ? l.text : unquote(l.text)).trim(), fenced: l.fenced }))
       .filter(
         (l) =>
           l.text &&

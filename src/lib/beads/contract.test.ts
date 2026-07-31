@@ -592,6 +592,48 @@ describe("validateBeadContract — the formula's unfilled prompts", () => {
     });
     expect(validateBeadContract(written)).toEqual([]);
   });
+
+  it("blocks a prompt styled as a blockquote callout — the marker is not content", () => {
+    // A project-local formula may style its placeholders as callouts. The `>` prefix defeated
+    // PROMPT_LINE, so the section read as authored and the run started with no rubric at all.
+    const quoted = ticket({
+      acceptance_criteria: undefined,
+      description: `${DESCRIPTION}\n\n## Acceptance\n> TODO — fill this in`,
+    });
+    expect(summarize(quoted)).toEqual([["Acceptance", "blocking"]]);
+  });
+
+  it("sees through nested and indented blockquote markers", () => {
+    const quoted = ticket({
+      acceptance_criteria: undefined,
+      description: `${DESCRIPTION}\n\n## Acceptance\n  > > TODO — a concrete, checkable statement of done`,
+    });
+    expect(summarize(quoted)).toEqual([["Acceptance", "blocking"]]);
+  });
+
+  it("treats a blockquote holding only scaffolding as unwritten", () => {
+    const quoted = ticket({
+      acceptance_criteria: undefined,
+      description: `${DESCRIPTION}\n\n## Acceptance\n> - [ ]\n>`,
+    });
+    expect(summarize(quoted)).toEqual([["Acceptance", "blocking"]]);
+  });
+
+  it("still counts blockquoted PROSE as authored — the callout styles real criteria too", () => {
+    const quoted = ticket({
+      acceptance_criteria: undefined,
+      description: `${DESCRIPTION}\n\n## Acceptance\n> - [ ] the export button ships`,
+    });
+    expect(validateBeadContract(quoted)).toEqual([]);
+  });
+
+  it("keeps a blockquoted TODO inside a fence authored — fenced content stays literal", () => {
+    const fenced = ticket({
+      acceptance_criteria: undefined,
+      description: `${DESCRIPTION}\n\n## Acceptance\n\`\`\`markdown\n> TODO — fill this in\n\`\`\``,
+    });
+    expect(validateBeadContract(fenced)).toEqual([]);
+  });
 });
 
 describe("validateBeadContract — epic tier", () => {
