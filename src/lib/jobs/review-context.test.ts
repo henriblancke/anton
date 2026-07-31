@@ -1,14 +1,20 @@
 /**
  * Unit tests for the self-review protocol helpers (anton-h4v3): the reviewer prompt and its swap
  * precedence (buildReviewPrompt), the concrete run context handed to the reviewer (reviewContext),
- * and the findings report parsed back out (parseReviewFindings). Running the review and the
- * converge loop are covered by the gate module.
+ * the findings report parsed back out (parseReviewFindings), and the fix prompt the gate hands the
+ * next session (buildFindingsFixPrompt). Running the review and the converge loop are covered by
+ * the gate module.
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildReviewPrompt, parseReviewFindings, reviewContext } from "./review-context";
+import {
+  buildFindingsFixPrompt,
+  buildReviewPrompt,
+  parseReviewFindings,
+  reviewContext,
+} from "./review-context";
 import type { BranchDiff } from "../git/ops";
 import type { Bead } from "../beads/bd";
 import type { ProjectSettings } from "../projects";
@@ -196,6 +202,56 @@ describe("buildReviewPrompt", () => {
     });
 
     expect(prompt).toContain("- Implement only Acceptance.");
+  });
+});
+
+describe("buildFindingsFixPrompt", () => {
+  let projectDir: string;
+
+  beforeEach(() => {
+    projectDir = mkdtempSync(join(tmpdir(), "anton-review-fix-ctx-"));
+  });
+
+  afterEach(() => {
+    rmSync(projectDir, { recursive: true, force: true });
+  });
+
+  it("lists the findings to resolve and the round it is on, under the execution contract", async () => {
+    const { prompt, appendSystemPrompt } = await buildFindingsFixPrompt({
+      target: epic,
+      findings: [
+        { severity: "blocking", location: "src/a.ts:12", note: "drops the error path" },
+        { severity: "blocking", location: "(general)", note: "no test would fail without the change" },
+      ],
+      settings: { seedPrompt: "SEED CONTRACT." },
+      projectDir,
+      round: 1,
+      maxRounds: 2,
+    });
+
+    expect(prompt).toContain("Run target: anton-x1 — Ship X");
+    expect(prompt).toContain("round 1 of 2");
+    expect(prompt).toContain("### Findings to resolve (2)");
+    expect(prompt).toContain("1. [blocking] src/a.ts:12 — drops the error path");
+    expect(prompt).toContain("2. [blocking] (general) — no test would fail without the change");
+    // No report protocol: the next review round reads the diff, not the fixer's summary.
+    expect(prompt).not.toContain("```json");
+    // The fix inherits the locked base contract plus the operator's seed, like an implementation.
+    expect(appendSystemPrompt).toContain("SEED CONTRACT.");
+  });
+
+  it("tells the fixer to decline a wrong finding rather than make a token change", async () => {
+    const { prompt } = await buildFindingsFixPrompt({
+      target: epic,
+      findings: [{ severity: "blocking", location: "src/a.ts:1", note: "rewrite this module" }],
+      settings: {},
+      projectDir,
+      round: 2,
+      maxRounds: 3,
+    });
+
+    expect(prompt).toContain("If a finding is WRONG");
+    expect(prompt).toContain("Do not commit, push, or open a PR");
   });
 });
 

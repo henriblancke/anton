@@ -1,0 +1,320 @@
+/**
+ * Unit tests for the pre-PR self-review gate's converge loop (anton-cbak), driven by a FAKE claude
+ * driver: a scripted queue of replies plus the prompts each dispatch received. The db is real (an
+ * in-memory anton.db) so "each review and each fix is its own recorded session" is asserted on the
+ * rows the UI reads, not on a spy.
+ *
+ * The verify gates are deliberately left unconfigured here: `runVerifyGates` takes the host-wide
+ * verify-gate lock and shells out, which belongs to the execute-epic integration suite (anton-omum),
+ * not to a loop test.
+ */
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { asc } from "drizzle-orm";
+
+import { makeTestDb, type TestDb } from "../db/testing";
+import { schema } from "../db";
+import type { Bead } from "../beads/bd";
+import type { ClaudeResult, RunClaudeOptions } from "../claude/driver";
+import type { BranchDiff } from "../git/ops";
+import type { ProjectSettings } from "../projects";
+import { UsageLimitError, isPoisonError } from "./errors";
+import type { Clock } from "./queue";
+import {
+  blockingFindings,
+  runReviewGate,
+  type ReviewGateContext,
+  type ReviewGateResult,
+} from "./review-gate";
+
+/** Ticks a second per read, so `sessions.startedAt` orders the gate's sessions deterministically. */
+class TickingClock implements Clock {
+  constructor(private t: number) {}
+  now() {
+    this.t += 1000;
+    return this.t;
+  }
+}
+
+const target: Bead = {
+  id: "anton-gate1",
+  title: "Ship the gate",
+  status: "in_progress",
+  issue_type: "epic",
+  description: "## Goal\n\nThe gate ships.\n\n## Acceptance\n\n- [ ] it converges\n",
+};
+
+const ticket: Bead = {
+  id: "anton-gate1.1",
+  title: "Build the loop",
+  status: "closed",
+  issue_type: "task",
+  parent: "anton-gate1",
+  description: "## Goal\n\nA bounded loop.\n\n## Acceptance\n\n- [ ] bounded\n",
+};
+
+const diff: BranchDiff = {
+  files: ["src/lib/jobs/review-gate.ts"],
+  patch: "diff --git a/src/lib/jobs/review-gate.ts\n+export const runReviewGate = () => null;\n",
+  truncated: false,
+};
+
+/** A reviewer report in the protocol's shape, as claude's final message would carry it. */
+function report(score: number, findings: Array<{ severity: string; location: string; note: string }>): string {
+  return ["reviewed.", "```json", JSON.stringify({ score, rationale: `scored ${score}`, findings }), "```"].join("\n");
+}
+
+const BLOCKING = { severity: "blocking", location: "src/a.ts:4", note: "the loop is unbounded" };
+const ADVISORY = { severity: "advisory", location: "src/a.ts:9", note: "the name could be clearer" };
+
+/** A scripted claude: each reply is consumed in dispatch order; a thrown value is thrown as-is. */
+function fakeClaude(replies: Array<string | Error>) {
+  const calls: RunClaudeOptions[] = [];
+  const run = async (options: RunClaudeOptions): Promise<ClaudeResult> => {
+    calls.push(options);
+    const next = replies[calls.length - 1];
+    if (next === undefined) throw new Error(`unscripted claude dispatch #${calls.length}`);
+    if (next instanceof Error) throw next;
+    return { ok: true, text: next };
+  };
+  return { run, calls };
+}
+
+let dir: string;
+let tdb: TestDb;
+let projectId: string;
+let priorSessionsRoot: string | undefined;
+const clock = new TickingClock(1_700_000_000_000);
+const ctx: ReviewGateContext = {
+  signal: new AbortController().signal,
+  heartbeat: async () => {},
+  report: () => {},
+};
+
+beforeEach(async () => {
+  dir = mkdtempSync(join(tmpdir(), "anton-review-gate-"));
+  priorSessionsRoot = process.env.ANTON_SESSIONS_ROOT;
+  process.env.ANTON_SESSIONS_ROOT = join(dir, "sessions");
+  tdb = makeTestDb();
+  projectId = randomUUID();
+  await tdb.db.insert(schema.projects).values({
+    id: projectId,
+    slug: "sandbox",
+    name: "sandbox",
+    repoPath: dir,
+    defaultBranch: "main",
+  });
+});
+
+afterEach(() => {
+  tdb.close();
+  if (priorSessionsRoot === undefined) delete process.env.ANTON_SESSIONS_ROOT;
+  else process.env.ANTON_SESSIONS_ROOT = priorSessionsRoot;
+  rmSync(dir, { recursive: true, force: true });
+});
+
+/** Run the gate against the fake driver. `commits` scripts each fix session's commit verdict. */
+function gate(
+  replies: Array<string | Error>,
+  settings: ProjectSettings = {},
+  commits: boolean[] = [],
+): { result: Promise<ReviewGateResult>; calls: RunClaudeOptions[]; commitMessages: string[] } {
+  const { run, calls } = fakeClaude(replies);
+  const commitMessages: string[] = [];
+  const result = runReviewGate({
+    db: tdb.db,
+    clock,
+    ctx,
+    projectId,
+    target,
+    tickets: [ticket],
+    settings,
+    worktreePath: dir,
+    baseBranch: "main",
+    deps: {
+      runClaude: run,
+      diff: async () => diff,
+      commit: async (_path, message) => {
+        commitMessages.push(message);
+        return { committed: commits[commitMessages.length - 1] ?? true };
+      },
+    },
+  });
+  return { result, calls, commitMessages };
+}
+
+/** The recorded sessions in start order — the UI's view of the gate. */
+async function sessionKinds(): Promise<Array<{ kind: string; status: string; beadId: string | null }>> {
+  const rows = await tdb.db.select().from(schema.sessions).orderBy(asc(schema.sessions.startedAt));
+  return rows.map((r) => ({ kind: r.kind, status: r.status, beadId: r.beadId ?? null }));
+}
+
+describe("runReviewGate — convergence", () => {
+  it("stops after one review when nothing blocking is reported", async () => {
+    const { result, calls, commitMessages } = gate([report(9, [ADVISORY])]);
+    const out = await result;
+
+    expect(out.outcome).toBe("clean");
+    expect(out.score).toBe(9);
+    expect(out.rounds).toHaveLength(1);
+    expect(out.rounds[0]).toMatchObject({ round: 1, score: 9, rationale: "scored 9", blocking: 0, advisory: 1 });
+    expect(out.rounds[0].fixSessionId).toBeUndefined();
+    // Advisory findings are still returned — the call-site surfaces them, it does not park on them.
+    expect(out.unresolved).toEqual([
+      { severity: "advisory", location: "src/a.ts:9", note: "the name could be clearer" },
+    ]);
+    expect(blockingFindings(out.unresolved)).toEqual([]);
+    expect(calls).toHaveLength(1); // one review, no fix
+    expect(commitMessages).toEqual([]);
+  });
+
+  it("fixes a blocking finding, re-reviews, and converges — every round's score recorded", async () => {
+    const { result, calls, commitMessages } = gate([
+      report(4, [BLOCKING, ADVISORY]),
+      "fixed the loop bound",
+      report(9, [ADVISORY]),
+    ]);
+    const out = await result;
+
+    expect(out.outcome).toBe("clean");
+    expect(out.rounds.map((r) => r.score)).toEqual([4, 9]);
+    expect(out.rounds[0]).toMatchObject({ blocking: 1, advisory: 1, fixCommitted: true });
+    expect(out.rounds[0].fixSessionId).toBeTruthy();
+    expect(out.score).toBe(9);
+    expect(blockingFindings(out.unresolved)).toEqual([]);
+    expect(calls).toHaveLength(3); // review → fix → review
+    expect(commitMessages).toEqual(["anton-gate1: address self-review findings (round 1)"]);
+  });
+
+  it("dispatches only the BLOCKING findings to the fix session", async () => {
+    const { result, calls } = gate([report(4, [BLOCKING, ADVISORY]), "fixed", report(8, [])]);
+    await result;
+
+    expect(calls[1].prompt).toContain("the loop is unbounded");
+    expect(calls[1].prompt).not.toContain("the name could be clearer");
+    // The fixer runs under the layered execution contract; the reviewer never does (below).
+    expect(calls[1].appendSystemPrompt).toBeTruthy();
+  });
+});
+
+describe("runReviewGate — bounds", () => {
+  it("stops at reviewMaxRounds with the unresolved findings rather than looping forever", async () => {
+    const stubborn = report(5, [BLOCKING, ADVISORY]);
+    const { result, calls, commitMessages } = gate([stubborn, "tried", stubborn, "tried again", stubborn], {
+      reviewMaxRounds: 3,
+    });
+    const out = await result;
+
+    expect(out.outcome).toBe("unresolved");
+    expect(out.rounds).toHaveLength(3);
+    expect(out.score).toBe(5);
+    // Findings carry their severity so the call-site can park on blocking and surface advisory.
+    expect(blockingFindings(out.unresolved)).toEqual([
+      { severity: "blocking", location: "src/a.ts:4", note: "the loop is unbounded" },
+    ]);
+    expect(out.unresolved).toHaveLength(2);
+    // 3 reviews + 2 fixes: the LAST round is a review, never a fix nothing re-reviews.
+    expect(calls).toHaveLength(5);
+    expect(commitMessages).toHaveLength(2);
+  });
+
+  it("stops when a fix session changes nothing — re-reviewing the same diff cannot help", async () => {
+    const { result, calls } = gate([report(4, [BLOCKING]), "every finding is wrong; left as-is"], { reviewMaxRounds: 3 }, [
+      false,
+    ]);
+    const out = await result;
+
+    expect(out.outcome).toBe("stalled");
+    expect(out.rounds).toHaveLength(1);
+    expect(out.rounds[0].fixCommitted).toBe(false);
+    expect(blockingFindings(out.unresolved)).toHaveLength(1);
+    expect(calls).toHaveLength(2); // no third dispatch: the loop bailed instead of re-reviewing
+  });
+
+  it("never passes a protocol violation as a clean review, and dispatches no fix for it", async () => {
+    const { result, calls } = gate(["I read everything and it looks fine."], { reviewMaxRounds: 3 });
+    const out = await result;
+
+    expect(out.outcome).toBe("protocol-violation");
+    expect(out.rounds[0]).toMatchObject({ violation: "no-report", blocking: 0, advisory: 0 });
+    expect(out.rounds[0].score).toBeUndefined();
+    expect(out.score).toBeUndefined();
+    expect(calls).toHaveLength(1);
+  });
+
+  it("fails loud when the cap forbids the gate from ever reviewing", async () => {
+    const { result, calls } = gate([], { reviewMaxRounds: 0 });
+    // Poison, so the run parks for a human instead of reaching the PR as "reviewed".
+    const error = await result.then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(isPoisonError(error)).toBe(true);
+    expect((error as Error).message).toMatch(/reviewMaxRounds is 0/);
+    expect(calls).toEqual([]);
+  });
+});
+
+describe("runReviewGate — sessions", () => {
+  it("records each review and each fix as its own session against the run target", async () => {
+    const { result } = gate([report(4, [BLOCKING]), "fixed", report(9, [])]);
+    await result;
+
+    expect(await sessionKinds()).toEqual([
+      { kind: "review", status: "done", beadId: "anton-gate1" },
+      { kind: "review-fix", status: "done", beadId: "anton-gate1" },
+      { kind: "review", status: "done", beadId: "anton-gate1" },
+    ]);
+  });
+
+  it("reviews in a NEW context — never resumed, never under the implementer's system prompt", async () => {
+    const { result, calls } = gate([report(4, [BLOCKING]), "fixed", report(9, [])]);
+    await result;
+
+    for (const review of [calls[0], calls[2]]) {
+      expect(review.resumeSessionId).toBeUndefined();
+      expect(review.appendSystemPrompt).toBeUndefined();
+      expect(review.prompt).toContain("You are the **second opinion** on work you did not write.");
+      expect(review.prompt).toContain("Run target: anton-gate1 — Ship the gate");
+    }
+  });
+});
+
+describe("runReviewGate — quota", () => {
+  it("propagates a usage limit from the review and marks that session failed", async () => {
+    const { result } = gate([new UsageLimitError("Claude usage limit reached", 1_700_000_600)]);
+    await expect(result).rejects.toBeInstanceOf(UsageLimitError);
+    expect(await sessionKinds()).toEqual([{ kind: "review", status: "failed", beadId: "anton-gate1" }]);
+  });
+
+  it("propagates a usage limit from the fix session too", async () => {
+    const { result } = gate([report(4, [BLOCKING]), new UsageLimitError("Claude usage limit reached")]);
+    await expect(result).rejects.toBeInstanceOf(UsageLimitError);
+    expect(await sessionKinds()).toEqual([
+      { kind: "review", status: "done", beadId: "anton-gate1" },
+      { kind: "review-fix", status: "failed", beadId: "anton-gate1" },
+    ]);
+  });
+
+  it("marks the review session failed when claude reports an error result", async () => {
+    const failing = async (): Promise<ClaudeResult> => ({ ok: false, text: "boom" });
+    await expect(
+      runReviewGate({
+        db: tdb.db,
+        clock,
+        ctx,
+        projectId,
+        target,
+        tickets: [ticket],
+        settings: {},
+        worktreePath: dir,
+        baseBranch: "main",
+        deps: { runClaude: failing, diff: async () => diff, commit: async () => ({ committed: true }) },
+      }),
+    ).rejects.toThrow(/claude reported an error reviewing anton-gate1/);
+    expect(await sessionKinds()).toEqual([{ kind: "review", status: "failed", beadId: "anton-gate1" }]);
+  });
+});

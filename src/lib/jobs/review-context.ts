@@ -1,7 +1,8 @@
 /**
  * The anton↔claude protocol for the pre-PR self-review gate (anton-3apm): the reviewer's reasoning
  * contract (shipped default, or the operator's swap), the concrete run context appended beneath it,
- * and the machine-readable findings report parsed back out of the reviewer's final message.
+ * and the machine-readable findings report parsed back out of the reviewer's final message — plus
+ * the fix prompt the gate hands the next session when findings come back blocking.
  *
  * Mirrors review-fix-context.ts and its discipline: the report format is DEFINED here (in
  * {@link reviewContext}) and PARSED here ({@link parseReviewFindings}), so swapping the reviewer —
@@ -14,8 +15,10 @@ import { acceptanceBody, goalBody } from "../beads/contract";
 import { type Bead } from "../beads/bd";
 import { loadAgentPrompt } from "../claude/agent-prompt";
 import { loadSkill } from "../claude/prompt";
+import { buildExecutionSystemPrompt } from "../claude/system-prompt";
 import { type BranchDiff } from "../git/ops";
 import { resolveReviewConfig, type ProjectSettings } from "../projects";
+import { labelValue } from "./review-fix-context";
 
 /** The project's own enforced rules, read from the worktree and inlined into the review context. */
 export const PRINCIPLES_PATH = ".product/principles.md";
@@ -260,6 +263,62 @@ function reportingFormatSection(): string[] {
     `(with a line when you have one), or "(general)" for a finding with no single site. An empty`,
     `\`findings\` array is a legitimate clean review; say so with a score rather than padding it.`,
   ];
+}
+
+/**
+ * The prompt for a gate FIX session (anton-cbak): the blocking findings the reviewer reported, in a
+ * fresh context, to be resolved in the worktree. Paired with the layered execution system prompt
+ * (base contract + the target's agent prompt + the operator seed) so the fix obeys the same quality
+ * floor as the implementation it is repairing — notably "never make a check pass by weakening it".
+ *
+ * Deliberately has NO report protocol: the next review round re-reads the diff, so the code is the
+ * only evidence. A fixer that changes nothing (every finding declined) leaves an empty tree, which
+ * the gate reads as no progress and hands to the call-site to park — the right outcome for findings
+ * a fixer believes are wrong.
+ */
+export async function buildFindingsFixPrompt(args: {
+  target: Bead;
+  /** The findings to resolve — the gate passes the blocking ones. */
+  findings: ReviewFinding[];
+  settings: ProjectSettings;
+  /** The worktree the fix runs in — resolves a project-local agent prompt. */
+  projectDir: string;
+  round: number;
+  maxRounds: number;
+}): Promise<{ prompt: string; appendSystemPrompt: string }> {
+  const { target, findings, settings, projectDir, round, maxRounds } = args;
+
+  const appendSystemPrompt = await buildExecutionSystemPrompt({
+    agentPrompt: await loadAgentPrompt(labelValue(target.labels, "agent"), { projectDir }),
+    seedPrompt: settings.seedPrompt,
+  });
+
+  const prompt = [
+    `## Fix the review findings`,
+    ``,
+    `anton's pre-PR self-review read this branch's diff in a fresh context and reported the findings`,
+    `below. Resolve them here in this worktree — round ${round} of ${maxRounds}. Another fresh`,
+    `reviewer re-reads the diff after you, so the code is the only thing that speaks for you.`,
+    ``,
+    `Run target: ${target.id} — ${target.title}`,
+    ``,
+    `### Findings to resolve (${findings.length})`,
+    ``,
+    ...findings.map((f, i) => `${i + 1}. [${f.severity}] ${f.location} — ${f.note}`),
+    ``,
+    `### How to resolve them`,
+    ``,
+    `- Fix the root cause of each finding with a real code change, and add or update the test that`,
+    `  would have caught it. Never make a check pass by weakening it.`,
+    `- Stay inside the findings: no refactor, cleanup, or feature the list above did not ask for.`,
+    `- Leave the project's own checks green — run them before you finish.`,
+    `- If a finding is WRONG or contradicts the run's beads, leave that code alone and say so plainly`,
+    `  in your final message, with the reason. Do NOT make a token change to look responsive: unresolved`,
+    `  findings are surfaced to a human, which is the correct outcome for a bad finding.`,
+    `- Do not commit, push, or open a PR — anton commits what you change.`,
+  ].join("\n");
+
+  return { prompt, appendSystemPrompt };
 }
 
 function truncate(text: string, max: number): string {
