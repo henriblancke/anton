@@ -1,6 +1,6 @@
 /**
  * Load an anton skill body from anton's own `skills/` asset dir. These are anton's vendored,
- * self-contained required skills (`shape`, `bd`, `scan-triage`, `review-fix`) — the machinery
+ * self-contained required skills (`shape`, `bd`, `scan-triage`, `review-fix`, `review`) — the machinery
  * anton owns so it runs standalone (no external plugin or session-start injection). anton's
  * runtime loads the body as its `-p` instruction for a background job; the setup wizard
  * (anton-3n5) installs the same assets into a target project's `.claude/skills/`.
@@ -21,7 +21,7 @@ export const SKILLS_DIR = "skills";
  * cannot deselect them, because anton itself depends on them. This is the canonical runtime list;
  * the installer and the asset test both read it.
  */
-export const REQUIRED_SKILLS = ["shape", "bd", "scan-triage", "review-fix"] as const;
+export const REQUIRED_SKILLS = ["shape", "bd", "scan-triage", "review-fix", "review"] as const;
 
 /**
  * anton's INSTALLED skills: every skill the setup wizard / CLI installs into a target project's

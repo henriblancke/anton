@@ -24,7 +24,7 @@ function frontmatter(raw: string): { name?: string; description?: string } {
 describe("required skill assets", () => {
   it("ships exactly the expected required set", () => {
     expect([...REQUIRED_SKILLS].sort()).toEqual(
-      ["bd", "review-fix", "scan-triage", "shape"].sort(),
+      ["bd", "review", "review-fix", "scan-triage", "shape"].sort(),
     );
   });
 
@@ -126,6 +126,55 @@ describe("required skill assets", () => {
       expect(shape).toMatch(/ask the user/i);
       expect(shape).toMatch(/Never leave a feature parentless/);
       expect(shape).toMatch(/never mint a one-feature epic/);
+    });
+  });
+
+  // The pre-PR self-review contract (anton-6ues). These assert only on the load-bearing guarantees —
+  // fresh-context framing, the anchored mandatory score, and the deferral of the wire format to the
+  // context anton appends — not on prose an operator override is free to restyle.
+  describe("self-review contract", () => {
+    const body = stripFrontmatter(readFileSync(skillPath("review"), "utf8"));
+
+    it("frames the reviewer as a fresh-context second opinion on code it did not write", () => {
+      expect(body).toMatch(/second opinion/i);
+      expect(body).toMatch(/fresh context/i);
+      expect(body).toMatch(/did not write/i);
+    });
+
+    it("grades against the beads' Acceptance criteria and the project's own principles", () => {
+      expect(body).toMatch(/## Acceptance/);
+      expect(body).toMatch(/\.product\/principles\.md/);
+      expect(body).toMatch(/met \/ not met \/\s+unverifiable/);
+    });
+
+    it("splits findings into blocking vs advisory (the severities the gate acts on)", () => {
+      expect(body).toMatch(/\*\*Blocking\*\*/);
+      expect(body).toMatch(/\*\*Advisory\*\*/);
+    });
+
+    it("demands a mandatory 0-10 score with a rationale grounded in the criteria", () => {
+      expect(body).toMatch(/integer overall quality score from 0 to 10/);
+      expect(body).toMatch(/mandatory/i);
+      expect(body).toMatch(/rationale must be grounded in the Acceptance verification/);
+    });
+
+    it("anchors the scale so scores are comparable across runs", () => {
+      for (const anchor of [/\*\*10\*\*/, /\*\*7\*\*/, /\*\*4\*\*/, /\*\*0\*\*/]) {
+        expect(body).toMatch(anchor);
+      }
+    });
+
+    it("defers the machine-readable format to the appended context, not the skill", () => {
+      // The wire format lives in code (mirroring review-fix-context.ts) so a reviewPrompt /
+      // reviewAgent override can restyle the review but never break the protocol anton parses.
+      expect(body).toMatch(/machine-readable report format is specified in the context anton appends/);
+      expect(body).toMatch(/Do not invent your own schema/);
+      // …and the skill must not smuggle a competing schema in.
+      expect(body).not.toMatch(/```json/);
+    });
+
+    it("does not orchestrate — anton owns the diff, the fixes, and the PR", () => {
+      expect(body).toMatch(/Do not edit code, do not\nrun git, do not open or comment on a PR/);
     });
   });
 
