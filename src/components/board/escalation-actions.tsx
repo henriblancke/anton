@@ -16,6 +16,7 @@ const ACTION_DETAIL: Record<string, string> = {
   abandoned: "Abandoned — the work is closed as won't-do",
   "cancelled-job": "Stopped — the job is cancelled and won't retry",
   "job-already-settled": "Already settled — the job had already stopped",
+  "job-restarted": "Not stopped — the job is running again, so it was left alone",
   dismissed: "Dismissed — anton raises it again if it's still stuck at the next sweep",
 };
 
@@ -90,6 +91,9 @@ export function EscalationActions({
       toast.error(err instanceof Error ? err.message : "Failed to settle the escalation");
       setPending(null);
       setArmed(false);
+      // The settle and the action are separate steps server-side, so a failure can still have left
+      // the row resolved. Refresh either way — a stale row here errors on every subsequent click.
+      router.refresh();
     }
   }
 

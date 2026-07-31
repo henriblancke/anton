@@ -322,11 +322,19 @@ export type CancelResult = { ok: true } | { ok: false; reason: "not-found" | "no
  * and durably marks it `cancelled` so no durability path revives it. Scoped to the project so a route
  * can't cancel another project's job by id — a cross-project (or missing) job is `not-found`, an
  * already-terminal one is `not-cancellable`.
+ *
+ * `only` restricts which statuses may be cancelled, for a caller whose decision was made against a
+ * job it read earlier (see `cancelJob` in queue.ts); a job that has since left those statuses
+ * reports `not-cancellable` rather than being killed.
  */
-export async function cancelJob(projectId: string, jobId: string): Promise<CancelResult> {
+export async function cancelJob(
+  projectId: string,
+  jobId: string,
+  only?: readonly string[],
+): Promise<CancelResult> {
   const job = await getJob(getDb(), jobId);
   if (!job || job.projectId !== projectId) return { ok: false, reason: "not-found" };
-  const acted = await getRunner().cancel(jobId);
+  const acted = await getRunner().cancel(jobId, only);
   return acted ? { ok: true } : { ok: false, reason: "not-cancellable" };
 }
 

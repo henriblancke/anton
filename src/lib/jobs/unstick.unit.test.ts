@@ -68,6 +68,7 @@ function ctx(o: Partial<UnstickContext> = {}): UnstickContext {
     board: new Map<string, Bead>(),
     boardFresh: true,
     usageWindowEndsAt: () => undefined,
+    epicCancelled: () => false,
     stillStuck: () => true,
     ...o,
   };
@@ -92,6 +93,17 @@ describe("classifyFinding — parked runs", () => {
     const verdict = classifyFinding(finding(), ctx({ usageWindowEndsAt: () => NOW + HOUR }));
     expect(verdict.disposition).toBe("hold");
     expect(verdict.why).toContain(new Date(NOW + HOUR).toISOString());
+  });
+
+  it("HOLDS a park whose epic an operator cancelled — a cancel must survive the quota window", () => {
+    // Cancelling the queued backoff job of a usage-limit park leaves the RUN row parked, so the
+    // finding outlives the cancel. Resuming here would reverse an explicit stop with a fresh job.
+    const verdict = classifyFinding(
+      finding(),
+      ctx({ usageWindowEndsAt: () => NOW - HOUR, epicCancelled: () => true }),
+    );
+    expect(verdict.disposition).toBe("hold");
+    expect(verdict.why).toContain("cancelled");
   });
 
   it("escalates a park with any other reason — those are judgment calls", () => {

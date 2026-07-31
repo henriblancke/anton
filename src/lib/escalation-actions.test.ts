@@ -17,12 +17,15 @@ import type { Project } from "./types";
 const resumeStalledEpic = vi.fn<(projectId: string, epicBeadId: string) => Promise<string>>();
 const abandonTicket = vi.fn<(project: Project, id: string, reason: string) => Promise<unknown>>();
 const resumeJob = vi.fn<(projectId: string, jobId: string) => Promise<boolean>>();
-const cancelJob = vi.fn<(projectId: string, jobId: string) => Promise<{ ok: boolean }>>();
+const cancelJob =
+  vi.fn<
+    (projectId: string, jobId: string, only?: readonly string[]) => Promise<{ ok: boolean }>
+  >();
 
 vi.mock("./jobs/service", () => ({
   resumeStalledEpic: (...args: [string, string]) => resumeStalledEpic(...args),
   resumeJob: (...args: [string, string]) => resumeJob(...args),
-  cancelJob: (...args: [string, string]) => cancelJob(...args),
+  cancelJob: (...args: [string, string, (readonly string[])?]) => cancelJob(...args),
 }));
 vi.mock("./abandon", async () => {
   const actual = await vi.importActual<typeof import("./abandon")>("./abandon");
@@ -56,6 +59,7 @@ afterAll(() => fileDb.cleanup());
 
 beforeEach(() => {
   getDb().delete(schema.escalations).run();
+  getDb().delete(schema.jobs).run();
   getDb().delete(schema.projects).run();
   getDb()
     .insert(schema.projects)
@@ -89,6 +93,14 @@ async function open(o: { finding?: RunHealthFinding; epicBeadId?: string } = {})
     epicBeadId: "epicBeadId" in o ? o.epicBeadId : "anton-e1",
   });
   return escalation;
+}
+
+/** A real job row, so the refused-cancel path can read the status it reports back to the operator. */
+function seedJob(id: string, status: string): void {
+  getDb()
+    .insert(schema.jobs)
+    .values({ id, type: "sync-push", projectId: "p1", status })
+    .run();
 }
 
 const rowOf = (id: string) =>
@@ -248,14 +260,39 @@ describe("actOnEscalation — a stall that names only a job", () => {
     expect(rowOf(escalation.id)).toMatchObject({ status: "resolved", resolution: "resumed" });
   });
 
-  it("abandon cancels the job so it never runs again", async () => {
+  it("abandon cancels the job so it never runs again — but only from parked/failed", async () => {
     const escalation = await openJobEscalation();
 
     const result = await actOnEscalation(project, escalation.id, "abandon");
 
     expect(result).toMatchObject({ ok: true, detail: "cancelled-job" });
-    expect(cancelJob).toHaveBeenCalledWith("p1", "j-1");
+    // The status guard travels WITH the cancel, so a job resumed since the raise is refused by the
+    // same CAS that terminalizes a still-parked one — not by a read that could race it.
+    expect(cancelJob).toHaveBeenCalledWith("p1", "j-1", ["parked", "failed"]);
     expect(rowOf(escalation.id)).toMatchObject({ status: "resolved", resolution: "abandoned" });
+  });
+
+  it("refuses to stop a job someone resumed since the escalation was raised", async () => {
+    // The unstick pass re-validates before RAISING, but the button lives on the board until it is
+    // clicked. Cancelling here would abort a live child on the strength of a stale control.
+    cancelJob.mockResolvedValue({ ok: false });
+    seedJob("j-1", "running");
+    const escalation = await openJobEscalation();
+
+    const result = await actOnEscalation(project, escalation.id, "abandon");
+
+    expect(result).toMatchObject({ ok: true, detail: "job-restarted" });
+    expect(rowOf(escalation.id)).toMatchObject({ status: "resolved", resolution: "abandoned" });
+  });
+
+  it("still reports a job that simply moved on as settled, not as restarted", async () => {
+    cancelJob.mockResolvedValue({ ok: false });
+    seedJob("j-1", "done");
+    const escalation = await openJobEscalation();
+
+    expect(await actOnEscalation(project, escalation.id, "abandon")).toMatchObject({
+      detail: "job-already-settled",
+    });
   });
 
   it("reports a job that has since moved on rather than claiming an action it didn't take", async () => {

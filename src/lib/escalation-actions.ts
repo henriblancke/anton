@@ -28,7 +28,7 @@ import { getDb } from "./db";
 import { abandonTicket } from "./abandon";
 import { getEscalation, settleEscalation, toEscalationView } from "./escalations";
 import { cancelJob, resumeJob, resumeStalledEpic } from "./jobs/service";
-import { systemClock } from "./jobs/queue";
+import { getJob, systemClock } from "./jobs/queue";
 import { MAX_ABANDON_REASON_CHARS } from "./types";
 import type { EscalationResolution, EscalationView } from "./escalations";
 import type { Project } from "./types";
@@ -123,6 +123,14 @@ async function actOnBead(
 }
 
 /**
+ * The statuses an exhausted-job escalation is raised against, and the only ones its "stop retrying"
+ * may terminalize. The unstick pass re-validates before RAISING, but the button lives on the board
+ * until someone clicks it: an operator who resumed the job in between put it back to work, and
+ * cancelling then would abort a live child on the strength of a stale control.
+ */
+const STOPPABLE_FROM = ["parked", "failed"] as const;
+
+/**
  * The same decision for a stall that names only a job: resume gives it a fresh retry budget, abandon
  * cancels it so it never runs again. Both move the job out of `parked`/`failed` — the only states
  * `detectExhaustedJobs` reports — so settling here also stops the next sweep re-raising this exact
@@ -136,8 +144,14 @@ async function actOnJob(
   if (action === "resume") {
     return (await resumeJob(projectId, jobId)) ? "resumed-job" : "job-not-resumable";
   }
-  const result = await cancelJob(projectId, jobId);
-  return result.ok ? "cancelled-job" : "job-already-settled";
+  const result = await cancelJob(projectId, jobId, STOPPABLE_FROM);
+  if (result.ok) return "cancelled-job";
+  // The guard refused it. Say WHICH way, so the operator learns their stale button hit a job that is
+  // running again rather than one that had merely stopped on its own.
+  const job = await getJob(getDb(), jobId);
+  return job?.status === "queued" || job?.status === "running"
+    ? "job-restarted"
+    : "job-already-settled";
 }
 
 function resolutionOf(action: EscalationAction): EscalationResolution {

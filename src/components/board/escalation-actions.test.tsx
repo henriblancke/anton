@@ -61,7 +61,10 @@ describe("EscalationActions — resume", () => {
     await waitFor(() =>
       expect(error).toHaveBeenCalledWith("This escalation has already been settled"),
     );
-    expect(refresh).not.toHaveBeenCalled();
+    // Refreshed even on the failure path: a 409 can mean the settle LANDED and only the action
+    // threw, so leaving the panel untouched would keep a resolved row on screen that errors on
+    // every subsequent click. The server's answer is the authority either way.
+    expect(refresh).toHaveBeenCalled();
     // Re-enabled: the operator can retry once they know why it failed.
     expect(screen.getByRole("button", { name: "Resume" }).hasAttribute("disabled")).toBe(false);
   });

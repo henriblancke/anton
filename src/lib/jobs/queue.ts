@@ -961,13 +961,27 @@ export async function resumeJob(db: AntonDb, clock: Clock, jobId: string): Promi
  * (`done`/`failed`/`cancelled`) row — updates zero rows and returns false. Returns whether it acted.
  * Aborting the in-flight child is the runner's job (`JobRunner.cancel`); this only writes state, so
  * it also terminalizes a `running` row whose controller lives on a since-restarted process.
+ *
+ * `only` narrows the accepted statuses further — for a caller acting on a job it observed earlier
+ * (an escalation's "stop retrying" button, raised against a `parked`/`failed` job), so a job resumed
+ * in between is refused rather than killed mid-flight. Applied in the same WHERE as the base guard,
+ * so it is a real CAS and not a read-then-write race.
  */
-export async function cancelJob(db: AntonDb, clock: Clock, jobId: string): Promise<boolean> {
+export async function cancelJob(
+  db: AntonDb,
+  clock: Clock,
+  jobId: string,
+  only?: readonly string[],
+): Promise<boolean> {
+  const allowed = only
+    ? CANCELLABLE_STATUSES.filter((s) => only.includes(s))
+    : [...CANCELLABLE_STATUSES];
+  if (allowed.length === 0) return false;
   const nowMs = clock.now();
   const updated = await db
     .update(schema.jobs)
     .set({ status: "cancelled", leaseExpiresAt: null, lastError: "cancelled by operator", updatedAt: secDate(nowMs) })
-    .where(and(eq(schema.jobs.id, jobId), inArray(schema.jobs.status, [...CANCELLABLE_STATUSES])))
+    .where(and(eq(schema.jobs.id, jobId), inArray(schema.jobs.status, allowed)))
     .returning({ id: schema.jobs.id });
   return updated.length > 0;
 }

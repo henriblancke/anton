@@ -60,6 +60,7 @@ import {
   toMs,
   type AntonDb,
   type Clock,
+  type JobRow,
 } from "./queue";
 import type { JobContext, JobHandler } from "./runner";
 
@@ -121,6 +122,13 @@ export interface UnstickContext {
   boardFresh: boolean;
   /** When this epic's quota window reopens (ms epoch), or undefined when nothing recorded one. */
   usageWindowEndsAt: (epicBeadId: string) => number | undefined;
+  /**
+   * Whether the epic's most recent execute-epic job was CANCELLED. A cancel is an operator saying
+   * stop, and `cancelJob` guarantees no durability path revives it — but cancelling the queued
+   * backoff job of a usage-limit park leaves the RUN row parked, so the finding outlives the cancel.
+   * Without this the quota window's expiry would re-enqueue exactly the work that was cancelled.
+   */
+  epicCancelled: (epicBeadId: string) => boolean;
   /**
    * Whether a `stale-pr` / `exhausted-job` finding STILL satisfies the detector that raised it,
    * re-checked against the live PR and job rows (see {@link revalidate}). Those two kinds carry no
@@ -211,6 +219,11 @@ export function classifyFinding(
       const reopensAt = ctx.usageWindowEndsAt(run.epicBeadId);
       if (reopensAt !== undefined && reopensAt > ctx.nowMs) {
         return hold(`the usage window reopens at ${new Date(reopensAt).toISOString()}`);
+      }
+      // An operator who cancelled the backoff job said stop. The run row stays parked regardless, so
+      // this is the only thing standing between a cancel and the window's expiry re-enqueuing it.
+      if (ctx.epicCancelled(run.epicBeadId)) {
+        return hold("this epic's latest job was cancelled by an operator");
       }
       // Jobs are machine-local, so `activeEpicKeys` above only rules out a run THIS machine owns.
       // The lease is what rules out one another machine picked up while this run sat parked.
@@ -338,7 +351,13 @@ export interface UnstickSummary {
  */
 export async function unstickPass(
   deps: { db: AntonDb; clock: Clock; readPrActivity?: UnstickDeps["readPrActivity"] },
-  opts: { projectId: string; repoPath: string; heartbeat?: () => Promise<void> },
+  opts: {
+    projectId: string;
+    repoPath: string;
+    heartbeat?: () => Promise<void>;
+    /** The job's abort signal, so a cancelled/timed-out pass kills its in-flight `gh` child too. */
+    signal?: AbortSignal;
+  },
 ): Promise<UnstickSummary> {
   const { db, clock } = deps;
   const readPrActivity = deps.readPrActivity ?? getPrActivity;
@@ -372,8 +391,9 @@ export async function unstickPass(
     listRunsByStatus(db, projectId, ["parked"]),
   ]);
 
-  // One job read per epic at most, memoized: several findings can point at the same epic.
-  const usageWindows = new Map<string, number | undefined>();
+  // One job read per epic at most, memoized: several findings can point at the same epic. The row
+  // answers both job-side questions — when the quota window reopens, and whether it was cancelled.
+  const latestJobs = new Map<string, JobRow | undefined>();
   // Per-finding re-check verdicts for the two kinds with no live handle in the context below.
   const stillStuck = new Map<string, boolean>();
   const ctx: UnstickContext = {
@@ -383,20 +403,18 @@ export async function unstickPass(
     parkedRuns: new Map(parkedRunRows.map((r) => [r.id, r])),
     board: new Map(board.map((b) => [b.id, b])),
     boardFresh,
-    usageWindowEndsAt: (epicBeadId) => usageWindows.get(epicBeadId),
+    usageWindowEndsAt: (epicBeadId) => usageWindowEnd(latestJobs.get(epicBeadId)),
+    epicCancelled: (epicBeadId) => latestJobs.get(epicBeadId)?.status === "cancelled",
     // Absent → the finding was never re-checked (a kind that judges itself off the context), so the
     // report's word stands.
     stillStuck: (finding) => stillStuck.get(finding.key) ?? true,
   };
 
-  // Prime the memo before classifying: `usageWindowEndsAt` is synchronous so the pure classifier
+  // Prime the memo before classifying: the job-backed lookups are synchronous so the classifier
   // stays pure, which means the async job reads have to happen up front.
   for (const run of parkedRunRows) {
-    if (run.error?.trim() !== USAGE_LIMIT_PARK || usageWindows.has(run.epicBeadId)) continue;
-    usageWindows.set(
-      run.epicBeadId,
-      usageWindowEnd(await latestExecuteEpicJob(db, projectId, run.epicBeadId)),
-    );
+    if (run.error?.trim() !== USAGE_LIMIT_PARK || latestJobs.has(run.epicBeadId)) continue;
+    latestJobs.set(run.epicBeadId, await latestExecuteEpicJob(db, projectId, run.epicBeadId));
   }
 
   // Same reason, one gh/job read per stale-pr / exhausted-job finding. The thresholds come from the
@@ -414,6 +432,7 @@ export async function unstickPass(
           thresholdMs: thresholds.stalePrHours * 3_600_000,
           bead: finding.beadId ? ctx.board.get(finding.beadId) : undefined,
           boardFresh,
+          signal: opts.signal,
         }),
       );
       await heartbeat();
@@ -427,6 +446,9 @@ export async function unstickPass(
 
   let wroteBeads = false;
   for (const finding of report.findings) {
+    // Stop acting the moment the job is cancelled or times out. Everything already done stands —
+    // both verbs are idempotent, so the next pass picks up exactly where this one left off.
+    opts.signal?.throwIfAborted();
     const verdict = classifyFinding(finding, ctx);
     if (verdict.disposition === "hold") {
       summary.held += 1;
@@ -488,16 +510,20 @@ async function stalePrStillStuck(
     thresholdMs: number;
     bead: Bead | undefined;
     boardFresh: boolean;
+    signal?: AbortSignal;
   },
 ): Promise<boolean> {
   if (opts.boardFresh && opts.bead?.status === "closed") return false;
   if (finding.prNumber === undefined || !finding.beadId) return true;
   try {
-    const activity = await opts.readPrActivity(opts.repoPath, finding.prNumber);
+    const activity = await opts.readPrActivity(opts.repoPath, finding.prNumber, opts.signal);
     return (
       detectStalePrs([{ beadId: finding.beadId, activity }], opts.nowMs, opts.thresholdMs).length > 0
     );
   } catch (e) {
+    // An abort is not an unreadable PR — the pass itself is being stopped, so failing open here
+    // would escalate on behalf of a cancelled job. Let it propagate and settle the job instead.
+    opts.signal?.throwIfAborted();
     console.error(
       `[unstick] could not re-read PR #${finding.prNumber} for ${finding.beadId}; escalating on the report's word`,
       e,
@@ -511,6 +537,10 @@ async function stalePrStillStuck(
  * between the sweep and now is live work again — escalating it would offer an "abandon" that
  * cancels a running job. Judged by the sweep's own detector against the CURRENT row; a job that has
  * vanished settled its own way.
+ *
+ * Fails OPEN on a read error, the same posture as {@link stalePrStillStuck}: a locked SQLite would
+ * otherwise throw straight through the caller's loop and abandon every finding after it, losing the
+ * resumes and escalations of a whole pass over one transient error.
  */
 async function exhaustedJobStillStuck(
   db: AntonDb,
@@ -519,9 +549,17 @@ async function exhaustedJobStillStuck(
   nowMs: number,
 ): Promise<boolean> {
   if (!finding.jobId) return true;
-  const job = await getJob(db, finding.jobId);
-  if (!job) return false;
-  return detectExhaustedJobs([job], maxAttempts, nowMs).length > 0;
+  try {
+    const job = await getJob(db, finding.jobId);
+    if (!job) return false;
+    return detectExhaustedJobs([job], maxAttempts, nowMs).length > 0;
+  } catch (e) {
+    console.error(
+      `[unstick] could not re-read job ${finding.jobId}; escalating on the report's word`,
+      e,
+    );
+    return true;
+  }
 }
 
 /**
@@ -574,7 +612,12 @@ export function makeUnstickHandler(deps: UnstickDeps): JobHandler {
 
     const summary = await unstickPass(
       { db, clock, readPrActivity },
-      { projectId, repoPath: project.repoPath, heartbeat: () => ctx.heartbeat() },
+      {
+        projectId,
+        repoPath: project.repoPath,
+        heartbeat: () => ctx.heartbeat(),
+        signal: ctx.signal,
+      },
     );
     console.log(
       `[unstick] ${project.slug}: ${summary.findings} findings — ` +

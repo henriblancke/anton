@@ -37,6 +37,18 @@ vi.mock("../beads/bd", async () => {
   };
 });
 
+/**
+ * The one job read the pass makes per `exhausted-job` finding, wrapped so a test can make it throw.
+ * Defaults to the real implementation, so every other case runs against the real queue module.
+ */
+const getJobMock = vi.fn<typeof import("./queue").getJob>();
+
+vi.mock("./queue", async () => {
+  const actual = await vi.importActual<typeof import("./queue")>("./queue");
+  return { ...actual, getJob: (...args: Parameters<typeof actual.getJob>) => getJobMock(...args) };
+});
+
+const { getJob: realGetJob } = await vi.importActual<typeof import("./queue")>("./queue");
 const { unstickPass } = await import("./unstick");
 
 const NOW = 1_700_000_000_000;
@@ -51,7 +63,8 @@ function secDate(ms: number): Date {
 let t: TestDb;
 
 /** The live PR the pass re-reads before escalating a `stale-pr` finding. Idle by default. */
-const prActivityMock = vi.fn<(repo: string, number: number) => Promise<PrActivity>>();
+const prActivityMock =
+  vi.fn<(repo: string, number: number, signal?: AbortSignal) => Promise<PrActivity>>();
 
 function prActivity(o: Partial<PrActivity> = {}): PrActivity {
   return {
@@ -75,6 +88,7 @@ beforeEach(() => {
   syncMock.mockResolvedValue(undefined);
   pullMock.mockResolvedValue(undefined);
   prActivityMock.mockResolvedValue(prActivity());
+  getJobMock.mockImplementation(realGetJob);
 });
 
 afterEach(() => {
@@ -160,10 +174,14 @@ function parkedRunFinding(runId: string, beadId: string, reason: string): RunHea
   };
 }
 
-const sweep = () =>
+const sweep = (opts: { signal?: AbortSignal } = {}) =>
   unstickPass(
-    { db: t.db, clock, readPrActivity: (repo, number) => prActivityMock(repo, number) },
-    { projectId: "p1", repoPath: REPO },
+    {
+      db: t.db,
+      clock,
+      readPrActivity: (repo, number, signal) => prActivityMock(repo, number, signal),
+    },
+    { projectId: "p1", repoPath: REPO, ...opts },
   );
 
 function jobRows() {
@@ -312,6 +330,32 @@ describe("resumable parks re-enqueue exactly once across two sweeps", () => {
     expect(noteMock).not.toHaveBeenCalled();
   });
 
+  it("never revives an epic whose job an operator cancelled, however long the window has been open", async () => {
+    // Cancelling the queued backoff job of a usage-limit park is an explicit stop, and `cancelJob`
+    // promises no durability path revives it — but the run row stays parked, so the finding keeps
+    // coming back. Without the cancelled-job check this pass would enqueue a fresh job every time.
+    seedParkedRun("r-1", "e-1", "usage-limit");
+    t.db
+      .insert(schema.jobs)
+      .values({
+        id: "j-cancelled",
+        type: "execute-epic",
+        projectId: "p1",
+        payloadJson: JSON.stringify({ projectId: "p1", epicBeadId: "e-1" }),
+        status: "cancelled",
+        lastError: "cancelled by operator",
+        runAt: secDate(NOW - HOUR),
+        createdAt: secDate(NOW - 5 * HOUR),
+        updatedAt: secDate(NOW - HOUR),
+      })
+      .run();
+    await seedReport(parkedRunFinding("r-1", "e-1", "parked 4h ago: usage-limit"));
+
+    expect(await sweep()).toMatchObject({ findings: 1, resumed: 0, escalated: 0, held: 1 });
+    expect(jobRows().map((j) => j.status)).toEqual(["cancelled"]);
+    expect(escalationRows()).toEqual([]);
+  });
+
   it("leaves a run a live job already owns completely alone", async () => {
     seedParkedRun("r-1", "e-1", "usage-limit");
     t.db
@@ -427,7 +471,7 @@ describe("non-resumable parks produce exactly one escalation and no enqueue", ()
 
     expect(await sweep()).toMatchObject({ findings: 1, escalated: 0, held: 1 });
     expect(escalationRows()).toEqual([]);
-    expect(prActivityMock).toHaveBeenCalledWith(REPO, 42);
+    expect(prActivityMock).toHaveBeenCalledWith(REPO, 42, undefined);
   });
 
   it("holds a stale-pr finding whose PR someone has since touched", async () => {
@@ -485,6 +529,64 @@ describe("non-resumable parks produce exactly one escalation and no enqueue", ()
     expect(await sweep()).toMatchObject({ escalated: 1 });
     expect(escalationRows().filter((r) => r.status === "open")).toHaveLength(1);
     expect(escalationRows()).toHaveLength(2);
+  });
+});
+
+describe("a cancelled or timed-out pass", () => {
+  it("hands the job's abort signal to the live PR re-read, so the gh child dies with the job", async () => {
+    // Without this the `gh pr view` subprocess outlives the cancel for the whole CLI timeout.
+    const controller = new AbortController();
+    await seedStalePrReport();
+
+    await sweep({ signal: controller.signal });
+
+    expect(prActivityMock).toHaveBeenCalledWith(REPO, 42, controller.signal);
+  });
+
+  it("stops acting once aborted, rather than escalating on behalf of a cancelled job", async () => {
+    seedParkedRun("r-2", "e-2", "agent exited 1");
+    await seedReport(parkedRunFinding("r-2", "e-2", "parked 4h ago: agent exited 1"));
+
+    await expect(sweep({ signal: AbortSignal.abort() })).rejects.toThrow();
+    expect(escalationRows()).toEqual([]);
+    expect(noteMock).not.toHaveBeenCalled();
+  });
+
+  it("does not turn an abort mid-PR-read into an escalation on the report's word", async () => {
+    // The re-check fails OPEN for an unreadable PR — but an abort is the pass being stopped, not
+    // evidence the PR is still idle, so it must propagate instead of raising a founder-facing row.
+    const controller = new AbortController();
+    controller.abort();
+    prActivityMock.mockRejectedValue(new Error("aborted"));
+    await seedStalePrReport();
+
+    await expect(sweep({ signal: controller.signal })).rejects.toThrow();
+    expect(escalationRows()).toEqual([]);
+  });
+});
+
+describe("a transient read failure costs one finding, not the whole pass", () => {
+  it("escalates on the report's word when the job re-read throws, and still acts on the rest", async () => {
+    // The re-check is a local db read; a locked SQLite used to throw straight through the loop and
+    // abandon every finding after it — losing resumes and escalations to one transient error.
+    getJobMock.mockRejectedValue(new Error("database is locked"));
+    seedParkedRun("r-1", "e-1", "usage-limit");
+    seedJob("j-9", { status: "parked", attempts: 3, lastError: "failed 3×: tests failed" });
+    await seedReport(
+      {
+        kind: "exhausted-job",
+        key: "exhausted-job:j-9",
+        reason: "execute-epic job parked",
+        since: NOW - 4 * HOUR,
+        ageMs: 4 * HOUR,
+        jobId: "j-9",
+        beadId: "e-9",
+      },
+      parkedRunFinding("r-1", "e-1", "parked 4h ago: usage-limit"),
+    );
+
+    expect(await sweep()).toMatchObject({ findings: 2, resumed: 1, escalated: 1, held: 0 });
+    expect(escalationRows().map((r) => r.jobId)).toEqual(["j-9"]);
   });
 });
 

@@ -513,10 +513,11 @@ export class JobRunner {
    * no-op against the now-terminal row instead of rescheduling it back to `queued`. The DB write runs
    * regardless of `inFlight` membership, so a `running` row leased by a since-restarted process (no
    * local controller) is still terminalized and lease-expiry reclaim can't re-run it. Returns whether
-   * it acted (false = the job was already terminal or unknown).
+   * it acted (false = the job was already terminal or unknown). `only` narrows the statuses the
+   * cancel will act on — see `cancelJob`.
    */
-  async cancel(jobId: string): Promise<boolean> {
-    const acted = await cancelJob(this.db, this.clock, jobId);
+  async cancel(jobId: string, only?: readonly string[]): Promise<boolean> {
+    const acted = await cancelJob(this.db, this.clock, jobId, only);
     this.inFlight.get(jobId)?.controller.abort();
     return acted;
   }
