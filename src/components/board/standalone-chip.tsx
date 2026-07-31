@@ -5,6 +5,8 @@ import { toast } from "sonner";
 import { GitPullRequestIcon } from "lucide-react";
 
 import type { StandaloneItem } from "@/lib/types";
+// The predicate itself, not a chip-local copy: approve and the runner ask the same one.
+import { contractBlocks } from "@/lib/beads/contract";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { CopyButton } from "@/components/ui/copy-button";
@@ -13,6 +15,8 @@ import { SnoozeButton } from "@/components/ticket/snooze-button";
 import { ClaimControl } from "@/components/board/claim-control";
 import { TYPE_RAIL, TYPE_TEXT, agentDotClass } from "@/components/board/board-utils";
 import { TypeBadge, TypeIcon } from "@/components/board/type-language";
+import { toastContractAdvisory } from "@/components/board/contract-advisory";
+import { ApproveBlocked, ContractChip } from "@/components/board/contract-mark";
 
 /** Short PR label from a bead external-ref: `gh-218` / a URL ending in `/218` → `#218`. */
 function prLabel(ref: string): string {
@@ -78,6 +82,8 @@ export function StandaloneChip({
       toast.success(
         immediate ? `Approved & running "${item.title}"` : `Queued "${item.title}" for optimal usage`,
       );
+      // The run starts with whatever thin sections it has; say so once, here.
+      await toastContractAdvisory(res);
     } catch (err) {
       setOptimisticApproved(false);
       toast.error(err instanceof Error ? err.message : "Failed to approve run");
@@ -90,6 +96,9 @@ export function StandaloneChip({
   // with 409, so a chip with open blockers must not offer Approve & run (mirrors the epic card).
   // A snoozed item hides it too — the snooze exists to keep this off the runtime's plate.
   const showApproveRun = item.stage === "backlog" && !approved && item.ready && !deferred;
+  // A contract gap withholds the run the same way, but asks for an edit rather than a wait — so the
+  // affordance stays put and names the missing section instead of failing on click (mirrors the card).
+  const contractBlocked = contractBlocks(item.contract);
 
   return (
     <div
@@ -148,6 +157,8 @@ export function StandaloneChip({
         {item.agent && <MetaChip dotClass={agentDotClass(item.agent)}>{item.agent}</MetaChip>}
         {item.risk && <RiskChip risk={item.risk} />}
         {item.stage === "backlog" && <BlockedChip blockedBy={item.blockedBy} />}
+        {/* A closed item's spec gaps are moot — nothing will run off them. */}
+        {item.stage !== "done" && <ContractChip contract={item.contract} />}
         {item.abandoned && <AbandonedChip />}
         {deferred && <SnoozedChip />}
       </div>
@@ -165,7 +176,9 @@ export function StandaloneChip({
           {/* Queue · Approve · Snooze share one line (anton-tc6y); snooze is pushed to the right. */}
           <div className="flex items-center gap-1">
             {showApproveRun &&
-              (budgetAware ? (
+              (contractBlocked ? (
+                <ApproveBlocked violations={item.contract?.blocking ?? []} label="Approve & run" />
+              ) : budgetAware ? (
                 // Budget-aware: run now or hand the run to the governor's pace-line.
                 <span className="pointer-events-auto flex items-center gap-1">
                   <Button

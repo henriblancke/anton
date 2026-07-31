@@ -24,7 +24,7 @@ export type ParsedEpicPatch = { patch: BeadPatch } | { error: string };
  * well-formed label: whitespace or a colon would produce a label bd cannot round-trip through
  * `area:<value>`, and `labelValueOf` would read back something the writer never typed.
  */
-const AREA_SHAPE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+export const AREA_SHAPE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 const areaSlug: FieldParser = (v) =>
   typeof v === "string" && AREA_SHAPE.test(v)

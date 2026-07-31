@@ -175,7 +175,7 @@ describe("contract editing", () => {
 
   it("round-trips an edited goal so parseGoal reads the new text", () => {
     const patch = diffTicketPatch(original, { ...original, goal: "Brand new goal" });
-    expect(parseGoal(patch.description)).toBe("Brand new goal");
+    expect(parseGoal(asBead({ description: patch.description }))).toBe("Brand new goal");
   });
 
   it("round-trips an edited acceptance so parseAcceptance (section-first) reads the new text", () => {

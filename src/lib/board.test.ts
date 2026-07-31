@@ -18,6 +18,7 @@ vi.mock("./beads/bd", async () => {
 
 const { deriveStage, getBoard } = await import("./board");
 const { resetIssueSnapshots } = await import("./beads/snapshot");
+const { contractBlocks, validateBeadContract } = await import("./beads/contract");
 
 beforeEach(() => {
   resetIssueSnapshots();
@@ -537,5 +538,176 @@ describe("getBoard", () => {
 
     expect(board.columns.backlog.some((e) => e.id === "epic-open")).toBe(true);
     expect(board.columns.done.some((e) => e.id === "epic-closed")).toBe(true);
+  });
+});
+
+describe("getBoard contract marking", () => {
+  // The four advisory sections, so a fixture can leave out exactly the one under test.
+  const GOAL = "## Goal\nSurface the gap before Approve.";
+  const CONTEXT = "## Context\ntouches: src/lib/board.ts";
+  const OUT_OF_SCOPE = "## Out of scope\n- Editing beads from the board.";
+  const VERIFY = "## Verify\n- board.test.ts covers it.";
+  const SHAPED = [GOAL, CONTEXT, OUT_OF_SCOPE, VERIFY].join("\n\n");
+
+  /** What the shared validator says, split the way the view model carries it. */
+  const contractOf = (bead: Bead) => ({
+    blocking: validateBeadContract(bead).filter((v) => v.severity === "blocking"),
+    advisory: validateBeadContract(bead).filter((v) => v.severity === "advisory"),
+  });
+
+  it("marks a card with a blocking violation and never advertises it as approvable", async () => {
+    // Fully shaped prose but no Acceptance anywhere — the run would have no definition of done, so
+    // approval refuses it. The board has to say so where it is cheap to fix, not at the 422.
+    const unshaped = makeBead({
+      id: "feat-unshaped",
+      title: "No definition of done",
+      issue_type: "feature",
+      created_at: "2026-07-20T00:00:00.000Z",
+      description: SHAPED,
+    });
+
+    listMock.mockResolvedValue([unshaped]);
+
+    const board = await getBoard(project);
+
+    const card = board.columns.backlog.find((e) => e.id === "feat-unshaped")!;
+    expect(card.contract!.blocking.map((v) => v.section)).toEqual(["Acceptance"]);
+    expect(contractBlocks(card.contract)).toBe(true);
+    // Dependency-readiness is untouched — this card is blocked by a gap, not by a prerequisite.
+    expect(card.ready).toBe(true);
+  });
+
+  it("leaves an advisory-only card approvable, carrying the gap as a nudge", async () => {
+    // Acceptance is present (bd's own field), only `## Verify` is missing: the run is startable, so
+    // nothing may withhold Approve — the gap rides along as advisory.
+    const nudged = makeBead({
+      id: "feat-nudge",
+      title: "Runnable, thinner than it could be",
+      issue_type: "feature",
+      created_at: "2026-07-20T00:00:00.000Z",
+      description: [GOAL, CONTEXT, OUT_OF_SCOPE].join("\n\n"),
+      acceptance_criteria: "- [ ] the board marks unshaped beads",
+    });
+
+    listMock.mockResolvedValue([nudged]);
+
+    const board = await getBoard(project);
+
+    const card = board.columns.backlog.find((e) => e.id === "feat-nudge")!;
+    expect(contractBlocks(card.contract)).toBe(false);
+    expect(card.contract!.advisory.map((v) => v.section)).toEqual(["Verify"]);
+  });
+
+  it("derives the marking from the shared validator, not a board-local check", async () => {
+    // The whole point of the contract module: one judgement, three sites (board, approve, runner).
+    // Assert equality against the validator itself so a board-local re-implementation can't drift.
+    const card = makeBead({
+      id: "feat-partial",
+      title: "Half shaped",
+      issue_type: "feature",
+      created_at: "2026-07-20T00:00:00.000Z",
+      description: GOAL,
+    });
+    const chip = makeBead({
+      id: "task-unshaped",
+      title: "Loose task, no acceptance",
+      issue_type: "task",
+      created_at: "2026-07-20T00:00:00.000Z",
+      description: [GOAL, VERIFY].join("\n\n"),
+    });
+
+    listMock.mockResolvedValue([card, chip]);
+
+    const board = await getBoard(project);
+
+    expect(board.columns.backlog.find((e) => e.id === "feat-partial")!.contract).toEqual(
+      contractOf(card),
+    );
+    const item = board.standalone.backlog.find((i) => i.id === "task-unshaped")!;
+    expect(item.contract).toEqual(contractOf(chip));
+    // A standalone chip is gated exactly like a card — same validator, same severity split.
+    expect(contractBlocks(item.contract)).toBe(true);
+    expect(item.contract!.blocking.map((v) => v.section)).toEqual(["Acceptance"]);
+  });
+
+  it("marks a conformant card whose open ticket is unshaped — the gate judges the whole run", async () => {
+    // Approval refuses `[target, ...open tickets]`, so a card that reported only its own status
+    // rendered no marker, kept Approve enabled, and 422'd on click. The child's id rides in the
+    // message: the section is missing on the ticket, not on the card's own bead.
+    const card = makeBead({
+      id: "feat-parent",
+      title: "Shaped target, unshaped ticket",
+      issue_type: "feature",
+      created_at: "2026-07-20T00:00:00.000Z",
+      description: `${SHAPED}\n\n## Acceptance\n- [ ] it works`,
+    });
+    const child = makeBead({
+      id: "task-thin",
+      title: "No definition of done",
+      parent: "feat-parent",
+      created_at: "2026-07-20T00:00:00.000Z",
+      description: SHAPED,
+    });
+
+    listMock.mockResolvedValue([card, child]);
+
+    const board = await getBoard(project);
+
+    const built = board.columns.backlog.find((e) => e.id === "feat-parent")!;
+    expect(contractBlocks(built.contract)).toBe(true);
+    expect(built.contract!.blocking.map((v) => v.section)).toEqual(["Acceptance"]);
+    expect(built.contract!.blocking[0].message).toContain("task-thin");
+  });
+
+  it("leaves a card whose only unshaped ticket is closed approvable", async () => {
+    // The runner resume-skips a closed ticket, and so does the approve gate — a delivered ticket's
+    // missing spec must not withhold the run the board is advertising.
+    const card = makeBead({
+      id: "feat-delivered",
+      title: "Shaped target, delivered ticket",
+      issue_type: "feature",
+      created_at: "2026-07-20T00:00:00.000Z",
+      description: `${SHAPED}\n\n## Acceptance\n- [ ] it works`,
+    });
+    const done = makeBead({
+      id: "task-done",
+      title: "Already delivered",
+      parent: "feat-delivered",
+      status: "closed",
+      created_at: "2026-07-20T00:00:00.000Z",
+      description: SHAPED,
+    });
+
+    listMock.mockResolvedValue([card, done]);
+
+    const board = await getBoard(project);
+
+    const built = board.columns.backlog.find((e) => e.id === "feat-delivered")!;
+    expect(contractBlocks(built.contract)).toBe(false);
+  });
+
+  it("leaves a conformant target unmarked and a never-judged one unjudged", async () => {
+    const conformant = makeBead({
+      id: "feat-clean",
+      title: "Shaped",
+      issue_type: "feature",
+      created_at: "2026-07-20T00:00:00.000Z",
+      description: `${SHAPED}\n\n## Acceptance\n- [ ] it works`,
+    });
+    // No description, no acceptance, no bd stamps: nothing was read, so nothing may be faulted —
+    // an absent status means "not judged", which contractBlocks must not read as a violation.
+    const unread = makeBead({ id: "task-bare", title: "Bare projection", issue_type: "task" });
+
+    listMock.mockResolvedValue([conformant, unread]);
+
+    const board = await getBoard(project);
+
+    const card = board.columns.backlog.find((e) => e.id === "feat-clean")!;
+    expect(card.contract).toEqual({ blocking: [], advisory: [] });
+    expect(contractBlocks(card.contract)).toBe(false);
+
+    const item = board.standalone.backlog.find((i) => i.id === "task-bare")!;
+    expect(item.contract).toBeUndefined();
+    expect(contractBlocks(item.contract)).toBe(false);
   });
 });

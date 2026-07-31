@@ -29,6 +29,7 @@ import {
   createExecuteEpicSandbox,
   createTicket,
   makeEpicRunner,
+  enqueueEpicJob,
   tickToIdle,
   driveEpicRun,
   type ExecuteEpicSandbox,
@@ -68,6 +69,7 @@ describeBd("execute-epic e2e — claims & gating (real handler · real bd/git ·
     const epic4 = await beads.create(repo, {
       title: "Feature W",
       type: "epic",
+      acceptance: "work file exists",
       description: "## Goal\nW",
     });
     await beads.approve(repo, epic4);
@@ -128,6 +130,7 @@ process.exit(0);`),
     const epic5 = await beads.create(repo, {
       title: "Feature V",
       type: "epic",
+      acceptance: "work file exists",
       description: "## Goal\nV",
     });
     await beads.approve(repo, epic5);
@@ -164,6 +167,7 @@ process.exit(0);`),
     const epic6 = await beads.create(repo, {
       title: "Feature W",
       type: "epic",
+      acceptance: "work file exists",
       description: "## Goal\nW",
     });
     await beads.approve(repo, epic6);
@@ -221,6 +225,7 @@ process.exit(0);`),
     const epic5 = await beads.create(repo, {
       title: "Feature V",
       type: "epic",
+      acceptance: "work file exists",
       description: "## Goal\nV",
     });
     await beads.approve(repo, epic5);
@@ -309,6 +314,7 @@ process.exit(0);`),
     const epicU = await beads.create(repo, {
       title: "Feature U",
       type: "epic",
+      acceptance: "work file exists",
       description: "## Goal\nU",
     });
     await beads.approve(repo, epicU);
@@ -358,10 +364,11 @@ process.exit(0);`),
     const dependent = await beads.create(repo, {
       title: "Dependent epic",
       type: "epic",
+      acceptance: "work file exists",
       description: "## Goal\nD",
     });
     await beads.approve(repo, dependent);
-    const blocker = await beads.create(repo, { title: "Blocker epic", type: "epic" });
+    const blocker = await beads.create(repo, { title: "Blocker epic", type: "epic", acceptance: "work file exists" });
     const child = createTicket(repo, { title: "Dependent ticket", parent: dependent });
     // Direct epic→epic block: `dependent` is blocked by `blocker` while `blocker` isn't done.
     await beads.link(repo, dependent, blocker, "blocks");
@@ -403,10 +410,11 @@ process.exit(0);`),
     const blockedFeature = await beads.create(repo, {
       title: "Blocked feature",
       type: "feature",
+      acceptance: "work file exists",
       description: "## Goal\nBF",
     });
     await beads.approve(repo, blockedFeature);
-    const blockerFeature = await beads.create(repo, { title: "Blocker feature", type: "feature" });
+    const blockerFeature = await beads.create(repo, { title: "Blocker feature", type: "feature", acceptance: "work file exists" });
     const blockedTicket = mkChild("Blocked ticket", blockedFeature);
     const blockerTicket = mkChild("Blocker ticket", blockerFeature);
     // Ticket-level edge: rolls up to blockedFeature → blockerFeature. Neither feature carries the
@@ -425,6 +433,161 @@ process.exit(0);`),
       (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === blockedFeature),
     ).toBeUndefined();
     expect((await beads.show(repo, blockedTicket)).status).toBe("open");
+  });
+
+  // anton-j9zs: the bead contract is a dispatch gate, not just a board mark. A ticket with no
+  // Acceptance gives the agent no definition of done and self-review no rubric, so the run parks
+  // rather than generating work nothing can judge. Same poison shape as the allowlist gate above.
+  it("parks a run whose ticket has no Acceptance, before any worktree, and completes once written", async () => {
+    const epicC = await beads.create(repo, {
+      title: "Feature Contract",
+      type: "epic",
+      acceptance: "work file exists",
+      description: "## Goal\nC",
+    });
+    await beads.approve(repo, epicC);
+    const unshaped = (() => {
+      const p = JSON.parse(
+        execFileSync("bd", ["create", "Unshaped ticket", "--type", "task", "--parent", epicC, "--json"], {
+          cwd: repo,
+          encoding: "utf8",
+        }),
+      );
+      return (Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string;
+    })();
+
+    const runner = makeEpicRunner(ctx);
+    const jobId = await driveEpicRun(runner, { projectId, epicBeadId: epicC });
+
+    // Poison → parked immediately (no retry burn) with a reason naming the bead and the section.
+    const job = await getJob(tdb.db, jobId);
+    expect(job?.status).toBe("parked");
+    expect(job?.lastError).toContain(unshaped);
+    expect(job?.lastError).toMatch(/Acceptance/);
+
+    // Pre-flight: no worktree was ever created and the ticket was never claimed or run.
+    const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === epicC)!;
+    expect(run.status).toBe("failed");
+    expect(run.worktreePath ?? null).toBeNull();
+    expect(
+      execFileSync("git", ["worktree", "list"], { cwd: repo, encoding: "utf8" }),
+    ).not.toContain(epicC);
+    const t = await beads.show(repo, unshaped);
+    expect(t.status).toBe("open");
+    expect(t.assignee ?? null).toBeNull();
+
+    // Recoverable: the operator writes the missing section → resume → the epic completes.
+    execFileSync("bd", ["update", unshaped, "--acceptance", "work file exists"], {
+      cwd: repo,
+      stdio: "ignore",
+    });
+    expect(await resumeJob(tdb.db, clock, jobId)).toBe(true);
+    await tickToIdle(runner);
+    expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+    expect((await beads.show(repo, unshaped)).status).toBe("closed");
+    expect((await beads.show(repo, epicC)).labels ?? []).toContain("stage:in-review");
+  });
+
+  it("re-gates the grouped TARGET when regenerating a closed child whose commit is missing", async () => {
+    // A grouped run whose children all arrived closed is gated on nothing at step 0c
+    // (contractGatedBeads returns []) — the closed-PR recovery shape. On a cross-machine resume a
+    // closed child whose commit is absent from this branch regenerates, and its re-gate must read
+    // the TARGET's spec too: the target's criteria are the rubric self-review scores the
+    // regenerated work against, and checking the child alone let a legacy target with no Success
+    // Criteria drive a dispatch the gate would refuse for any normally-open child.
+    const legacy = await beads.create(repo, {
+      title: "Legacy target, no Success Criteria",
+      type: "epic",
+      description: "## Goal\nWritten goal, but no rubric anywhere.",
+    });
+    await beads.approve(repo, legacy);
+    const closedChild = createTicket(repo, {
+      title: "Closed child with no commit",
+      parent: legacy,
+      acceptance: "work file exists",
+    });
+    // Closed on the board with NO commit on any branch — the cross-machine shape: another machine
+    // closed it, then crashed before the PR step ever pushed the branch.
+    await beads.close(repo, closedChild);
+
+    const runner = makeEpicRunner(ctx);
+    const jobId = await driveEpicRun(runner, { projectId, epicBeadId: legacy });
+
+    // Poison → parked naming the TARGET and its missing rubric, before the child is reopened or
+    // any agent dispatched.
+    const job = await getJob(tdb.db, jobId);
+    expect(job?.status).toBe("parked");
+    expect(job?.lastError).toContain(legacy);
+    expect(job?.lastError).toMatch(/Success Criteria/);
+    expect((await beads.show(repo, closedChild)).status).toBe("closed");
+
+    // Recoverable: write the target's rubric → resume → the child regenerates and the run completes.
+    execFileSync("bd", ["update", legacy, "--acceptance", "work file exists"], {
+      cwd: repo,
+      stdio: "ignore",
+    });
+    expect(await resumeJob(tdb.db, clock, jobId)).toBe(true);
+    await tickToIdle(runner);
+    expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+    expect((await beads.show(repo, legacy)).labels ?? []).toContain("stage:in-review");
+  });
+
+  it("runs clean when every contract gap is advisory — thin prose never withholds a run", async () => {
+    // Goal / Context / Out of scope / Verify cost quality, not runnability: this epic and its ticket
+    // carry nothing but Acceptance, and the run must reach a PR exactly as a fully-shaped one does.
+    const epicA = await beads.create(repo, { title: "Sparse but runnable", type: "epic", acceptance: "work file exists" });
+    await beads.approve(repo, epicA);
+    const sparse = createTicket(repo, {
+      title: "Sparse ticket",
+      parent: epicA,
+      acceptance: "work file exists",
+    });
+
+    const runner = makeEpicRunner(ctx);
+    const jobId = await driveEpicRun(runner, { projectId, epicBeadId: epicA });
+
+    expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+    expect((await beads.show(repo, sparse)).status).toBe("closed");
+    expect((await beads.show(repo, epicA)).labels ?? []).toContain("stage:in-review");
+  });
+
+  it("runs a bead repaired between enqueue and dispatch — the gate reads fresh, not the enqueue snapshot", async () => {
+    // The gate judges the board this run just pulled, so a bead that was non-conformant when the
+    // job was queued (or when the board card was drawn) must run once the section exists — no park
+    // on state that has already been fixed.
+    const epicR = await beads.create(repo, {
+      title: "Repaired between enqueue and dispatch",
+      type: "epic",
+      acceptance: "work file exists",
+      description: "## Goal\nR",
+    });
+    await beads.approve(repo, epicR);
+    const repaired = (() => {
+      const p = JSON.parse(
+        execFileSync("bd", ["create", "Repaired ticket", "--type", "task", "--parent", epicR, "--json"], {
+          cwd: repo,
+          encoding: "utf8",
+        }),
+      );
+      return (Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string;
+    })();
+
+    const runner = makeEpicRunner(ctx);
+
+    // Queued while the ticket still has no Acceptance…
+    const jobId = await enqueueEpicJob(runner, { projectId, epicBeadId: epicR });
+    // …and repaired before the runner ever leases it.
+    execFileSync("bd", ["update", repaired, "--acceptance", "work file exists"], {
+      cwd: repo,
+      stdio: "ignore",
+    });
+
+    await tickToIdle(runner);
+
+    const job = await getJob(tdb.db, jobId);
+    expect(job?.status).toBe("done");
+    expect(job?.lastError ?? "").not.toMatch(/contract/i);
+    expect((await beads.show(repo, repaired)).status).toBe("closed");
   });
 
   it("blocks a zero-diff ticket, halts the epic, and never closes or dispatches downstream (issue #46 root cause #1)", async () => {
@@ -447,6 +610,7 @@ process.exit(0);`),
     const epicNd = await beads.create(repo, {
       title: "No-delivery epic",
       type: "epic",
+      acceptance: "work file exists",
       description: "## Goal\nND",
     });
     await beads.approve(repo, epicNd);

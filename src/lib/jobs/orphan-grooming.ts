@@ -9,6 +9,7 @@
  * epic each time. Idempotent — a ticket already parented is no longer an orphan, so re-runs are safe.
  */
 import { beads, LABELS, type Bead } from "../beads/bd";
+import { isTicketTier } from "../beads/contract";
 import { getProjectById } from "../projects";
 import { PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
@@ -51,13 +52,19 @@ function parentedIds(all: Bead[]): Set<string> {
  * MUST NOT touch those — parenting one under the grooming epic turns it into a child ticket, which
  * `isRunTarget` then rejects, so its standalone chip disappears and the approve route redirects users
  * to run the whole grooming epic instead (anton-cmz review). We only bucket orphans that are NOT
- * independently runnable (learning/chore/… — types that can't be approved on their own).
+ * independently runnable — in practice parentless chores.
+ *
+ * Only TICKET-TIER types are bucketed (`isTicketTier` — the same taxonomy dispatch and the contract
+ * gate share). An exempt type (`learning`, `molecule`, a custom type) rides on NO run: parenting one
+ * here would give the grooming epic a child `runTickets` never dispatches, so the epic's run would
+ * complete and close around it — the orphan stranded open under a done epic. Exempt beads stay
+ * loose instead, visible on the Tickets list for a human to retype or close.
  */
 export function findOrphans(all: Bead[]): Bead[] {
   const parented = parentedIds(all);
   return all.filter(
     (b) =>
-      !beads.isEpic(b) &&
+      isTicketTier(b) &&
       !beads.isRunTarget(b, all) &&
       b.status !== "closed" &&
       !parented.has(b.id) &&

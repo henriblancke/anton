@@ -109,22 +109,23 @@ export async function setupApproveSuite(): Promise<ApproveSuiteCtx> {
   const repo = bdRepo.repo;
 
   // blocked epic's child is blocked by blocker epic's child → inferred blocked→blocker edge.
-  const blocked = await beads.create(repo, { title: "Blocked epic", type: "epic" });
-  const blocker = await beads.create(repo, { title: "Blocker epic", type: "epic" });
-  const t1 = await beads.create(repo, { title: "Ticket in blocked", type: "task" });
-  const t2 = await beads.create(repo, { title: "Ticket in blocker", type: "task" });
+  const blocked = await beads.create(repo, { title: "Blocked epic", type: "epic", acceptance: "- [ ] it works" });
+  const blocker = await beads.create(repo, { title: "Blocker epic", type: "epic", acceptance: "- [ ] it works" });
+  const t1 = await beads.create(repo, { title: "Ticket in blocked", type: "task", acceptance: "- [ ] it works" });
+  const t2 = await beads.create(repo, { title: "Ticket in blocker", type: "task", acceptance: "- [ ] it works" });
   await beads.link(repo, t1, blocked, "parent-child");
   await beads.link(repo, t2, blocker, "parent-child");
   await beads.link(repo, t1, t2, "blocks");
 
   // A second, initially-ready epic plus a standalone blocker whose child we later wire in via a
   // raw `bd` call, simulating another process adding a cross-epic edge behind the board snapshot.
-  const ready = await beads.create(repo, { title: "Ready epic", type: "epic" });
-  const externalBlocker = await beads.create(repo, { title: "External blocker epic", type: "epic" });
-  const readyChild = await beads.create(repo, { title: "Ticket in ready", type: "task" });
+  const ready = await beads.create(repo, { title: "Ready epic", type: "epic", acceptance: "- [ ] it works" });
+  const externalBlocker = await beads.create(repo, { title: "External blocker epic", type: "epic", acceptance: "- [ ] it works" });
+  const readyChild = await beads.create(repo, { title: "Ticket in ready", type: "task", acceptance: "- [ ] it works" });
   const externalBlockerChild = await beads.create(repo, {
     title: "Ticket in external blocker",
     type: "task",
+    acceptance: "- [ ] it works",
   });
   await beads.link(repo, readyChild, ready, "parent-child");
   await beads.link(repo, externalBlockerChild, externalBlocker, "parent-child");

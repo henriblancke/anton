@@ -82,7 +82,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
 
   it("enqueues a standalone bug and applies the approved label", async () => {
     // A parentless bug is a run target (epic-of-one) — approval must label + enqueue it, not reject.
-    const bug = await beads.create(repo, { title: "Loose bug", type: "bug" });
+    const bug = await beads.create(repo, { title: "Loose bug", type: "bug", acceptance: "- [ ] it works" });
     const res = await approve(bug);
     expect(res.status).toBe(200);
     expect((await res.json()).jobId).toBeTruthy();
@@ -93,8 +93,8 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     // Bodyless callers (the ticket dialog's "Approve & run"/"Force run") predate the run-directly
     // flag (anton-d8i4) and promise an immediate run — a missing body must not silently become a
     // paced queue request on a budget-aware project. Only an explicit `immediate: false` opts in.
-    const bodyless = await beads.create(repo, { title: "Bodyless-immediate bug", type: "bug" });
-    const paced = await beads.create(repo, { title: "Opt-in paced bug", type: "bug" });
+    const bodyless = await beads.create(repo, { title: "Bodyless-immediate bug", type: "bug", acceptance: "- [ ] it works" });
+    const paced = await beads.create(repo, { title: "Opt-in paced bug", type: "bug", acceptance: "- [ ] it works" });
 
     expect((await approve(bodyless)).status).toBe(200);
     expect((await approve(paced, { immediate: false })).status).toBe(200);
@@ -116,7 +116,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     // showing no owner until a later poll. The route forces a fresh read before responding, so the
     // body must carry the just-written approval and the auto-claim.
     actAs("anton-test");
-    const bug = await beads.create(repo, { title: "Fresh-body bug", type: "bug" });
+    const bug = await beads.create(repo, { title: "Fresh-body bug", type: "bug", acceptance: "- [ ] it works" });
     // Warm the snapshot with the pre-write (unapproved, unclaimed) bead, reproducing the stale-read race.
     const { allIssues } = await import("@/lib/beads/issues");
     await allIssues(repo);
@@ -132,8 +132,8 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     // A parentless task/bug is a run target, but a `blocks` edge still gates it — its blockers
     // aren't in the epic-graph rollup, so the route derives them from the target's own edges.
     // Approval enqueues immediately, so a still-blocked standalone must be rejected before labeling.
-    const blocker = await beads.create(repo, { title: "Standalone blocker", type: "task" });
-    const dependent = await beads.create(repo, { title: "Standalone dependent", type: "task" });
+    const blocker = await beads.create(repo, { title: "Standalone blocker", type: "task", acceptance: "- [ ] it works" });
+    const dependent = await beads.create(repo, { title: "Standalone dependent", type: "task", acceptance: "- [ ] it works" });
     await beads.link(repo, dependent, blocker, "blocks");
 
     const res = await approve(dependent);
@@ -146,8 +146,8 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
 
   it("enqueues a standalone task once its blocker closes", async () => {
     // The same blocks edge stops gating once the prerequisite is done — the standalone becomes ready.
-    const blocker = await beads.create(repo, { title: "Standalone blocker (closes)", type: "task" });
-    const dependent = await beads.create(repo, { title: "Standalone dependent (ready)", type: "task" });
+    const blocker = await beads.create(repo, { title: "Standalone blocker (closes)", type: "task", acceptance: "- [ ] it works" });
+    const dependent = await beads.create(repo, { title: "Standalone dependent (ready)", type: "task", acceptance: "- [ ] it works" });
     await beads.link(repo, dependent, blocker, "blocks");
     await beads.close(repo, blocker);
 
@@ -157,18 +157,134 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
   });
 
   it("enqueues a real epic with no blockers and applies the approved label", async () => {
-    const epic = await beads.create(repo, { title: "Free epic", type: "epic" });
-    const child = await beads.create(repo, { title: "Free epic child", type: "task" });
+    const epic = await beads.create(repo, { title: "Free epic", type: "epic", acceptance: "- [ ] it works" });
+    const child = await beads.create(repo, { title: "Free epic child", type: "task", acceptance: "- [ ] it works" });
     await beads.link(repo, child, epic, "parent-child");
     const res = await approve(epic);
     expect(res.status).toBe(200);
     expect(beads.isApproved(await beads.show(repo, epic))).toBe(true);
   });
 
+  // anton-j9zs: approve is the chokepoint every run target passes, so the bead contract is enforced
+  // here — but only its BLOCKING half. Approving a bead the runner would just poison-park is a false
+  // green; refusing one over a missing `## Goal` would gate the board on prose.
+  it("422s a run target with no Acceptance, names the section, and does not approve it", async () => {
+    const unshaped = await beads.create(repo, { title: "Unshaped feature", type: "feature" });
+    const res = await approve(unshaped);
+    expect(res.status).toBe(422);
+    const body = await res.json();
+    expect(body.error).toContain(unshaped);
+    expect(body.error).toMatch(/Acceptance/);
+    expect(body.error).toContain("bd update --acceptance"); // the error carries the fix
+    expect(body.sections).toEqual(["Acceptance"]);
+    // Refused before the write: no label, no enqueue — nothing to unwind.
+    expect(beads.isApproved(await beads.show(repo, unshaped))).toBe(false);
+    expect(await executeEpicJobs(unshaped)).toHaveLength(0);
+  });
+
+  it("422s an epic with no Success Criteria — the epic tier's blocking section", async () => {
+    // The tiers gate on different sections: an epic is read, not executed, so what it owes is the
+    // Success Criteria its features add up to.
+    const epic = await beads.create(repo, { title: "Outcome with no criteria", type: "epic" });
+    const child = await beads.create(repo, { title: "Its child", type: "task", acceptance: "- [ ] it works" });
+    await beads.link(repo, child, epic, "parent-child");
+
+    const res = await approve(epic);
+    expect(res.status).toBe(422);
+    expect((await res.json()).sections).toEqual(["Success Criteria"]);
+    expect(beads.isApproved(await beads.show(repo, epic))).toBe(false);
+  });
+
+  it("approves a target whose only gaps are advisory, and reports them in the body", async () => {
+    // Goal / Context / Out of scope / Verify degrade a run without making it unrunnable. Approval
+    // proceeds — and says what's thin, so the gaps are heard once rather than never.
+    const thin = await beads.create(repo, { title: "Thin but runnable", type: "bug", acceptance: "- [ ] the flake stops" });
+    const res = await approve(thin);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.jobId).toBeTruthy();
+    expect(body.advisory.join("\n")).toMatch(/Goal[\s\S]*Context[\s\S]*Out of scope[\s\S]*Verify/);
+    expect(beads.isApproved(await beads.show(repo, thin))).toBe(true);
+  });
+
+  it("422s a conformant epic whose open child ticket has no Acceptance, and names the child", async () => {
+    // The gate must judge the whole dispatch set, not just the target: execute-epic checks
+    // `[target, ...tickets]` and poison-parks on the child, so approving here would write the
+    // `approved` label and answer "running" for a run that never reaches a PR — the false green.
+    const epic = await beads.create(repo, { title: "Conformant epic", type: "epic", acceptance: "- [ ] it works" });
+    const unshaped = await beads.create(repo, { title: "Unshaped child" , type: "task" });
+    await beads.link(repo, unshaped, epic, "parent-child");
+
+    const res = await approve(epic);
+    expect(res.status).toBe(422);
+    const body = await res.json();
+    expect(body.error).toContain(unshaped); // the operator is told WHICH bead to repair
+    expect(body.sections).toEqual(["Acceptance"]);
+    expect(beads.isApproved(await beads.show(repo, epic))).toBe(false);
+    expect(await executeEpicJobs(epic)).toHaveLength(0);
+  });
+
+  it("approves an epic whose only non-conformant child is closed — the runner skips it", async () => {
+    // A closed ticket is resume-skipped by execute-epic: its agent never runs again, so its missing
+    // spec can't strand the run. Gating on it would strand approval on already-delivered work.
+    const epic = await beads.create(repo, { title: "Epic with delivered child", type: "epic", acceptance: "- [ ] it works" });
+    const done = await beads.create(repo, { title: "Delivered child", type: "task" });
+    const open = await beads.create(repo, { title: "Remaining child", type: "task", acceptance: "- [ ] it works" });
+    await beads.link(repo, done, epic, "parent-child");
+    await beads.link(repo, open, epic, "parent-child");
+    await beads.close(repo, done);
+
+    const res = await approve(epic);
+    expect(res.status).toBe(200);
+    expect(beads.isApproved(await beads.show(repo, epic))).toBe(true);
+  });
+
+  it("reports a child's advisory gaps in the 200 body without refusing the approval", async () => {
+    // Advisory gaps degrade a run, they don't stop it — but they're the operator's to hear, and a
+    // thin CHILD is exactly what the target-only check used to swallow.
+    const epic = await beads.create(repo, {
+      title: "Well-shaped epic",
+      type: "epic",
+      acceptance: "- [ ] every child ships",
+      description: "Reports leave the app in a format a customer can open.",
+      labels: ["area:reports"], // an epic owes exactly one — otherwise it carries its own advisory
+    });
+    const thin = await beads.create(repo, { title: "Thin child", type: "task", acceptance: "- [ ] it works" });
+    await beads.link(repo, thin, epic, "parent-child");
+
+    const res = await approve(epic);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    // One line per offending bead, each naming its id — across a ticket set, bare messages leave
+    // the operator no way to tell WHICH bead is thin.
+    expect(body.advisory).toHaveLength(1);
+    expect(body.advisory[0]).toContain(thin);
+    expect(body.advisory[0]).toMatch(/Goal[\s\S]*Context[\s\S]*Out of scope[\s\S]*Verify/);
+    expect(beads.isApproved(await beads.show(repo, epic))).toBe(true);
+  });
+
+  it("approves a bead repaired since the board last read it — the gate reads fresh", async () => {
+    // The contract gate rides the same forced fresh read as the blocker gate: a bead whose
+    // Acceptance was written after the board snapshot warmed must approve, not 422 on stale text.
+    const repaired = await beads.create(repo, { title: "Repaired feature", type: "feature" });
+    const { allIssues } = await import("@/lib/beads/issues");
+    await allIssues(repo); // warm the snapshot while it is still non-conformant
+
+    // Write the acceptance through the raw CLI so the wrapper's snapshot invalidation never fires.
+    execFileSync("bd", ["update", repaired, "--acceptance", "- [ ] it works"], {
+      cwd: repo,
+      stdio: "ignore",
+    });
+
+    const res = await approve(repaired);
+    expect(res.status).toBe(200);
+    expect(beads.isApproved(await beads.show(repo, repaired))).toBe(true);
+  });
+
   it("422s a child ticket of an epic, points at its parent, and does not approve it", async () => {
     // A task WITH a parent runs via its epic's PR, never standalone — approving it must be rejected.
-    const parentEpic = await beads.create(repo, { title: "Parent epic", type: "epic" });
-    const child = await beads.create(repo, { title: "Child ticket", type: "task" });
+    const parentEpic = await beads.create(repo, { title: "Parent epic", type: "epic", acceptance: "- [ ] it works" });
+    const child = await beads.create(repo, { title: "Child ticket", type: "task", acceptance: "- [ ] it works" });
     await beads.link(repo, child, parentEpic, "parent-child");
     const res = await approve(child);
     expect(res.status).toBe(422);
@@ -180,7 +296,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
 
   it("enqueues a feature and applies the approved label", async () => {
     // anton-s67y: a feature is THE run target — one worktree, one PR. Approval must label + enqueue.
-    const feature = await beads.create(repo, { title: "Shippable feature", type: "feature" });
+    const feature = await beads.create(repo, { title: "Shippable feature", type: "feature", acceptance: "- [ ] it works" });
     const res = await approve(feature);
     expect(res.status).toBe(200);
     expect((await res.json()).jobId).toBeTruthy();
@@ -190,8 +306,8 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
   it("422s a container epic — one with feature children — and points at its features", async () => {
     // Approval is a per-PR gate. An epic that groups features would approve N PRs with one click,
     // so it stops being approvable the moment a feature lands under it. The error must say so.
-    const container = await beads.create(repo, { title: "Outcome epic", type: "epic" });
-    const feature = await beads.create(repo, { title: "Feature under it", type: "feature" });
+    const container = await beads.create(repo, { title: "Outcome epic", type: "epic", acceptance: "- [ ] it works" });
+    const feature = await beads.create(repo, { title: "Feature under it", type: "feature", acceptance: "- [ ] it works" });
     await beads.link(repo, feature, container, "parent-child");
 
     const res = await approve(container);
@@ -203,8 +319,8 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
   });
 
   it("still approves a legacy epic whose only children are tasks — the migration-free clause", async () => {
-    const legacy = await beads.create(repo, { title: "Legacy epic", type: "epic" });
-    const child = await beads.create(repo, { title: "Legacy child", type: "task" });
+    const legacy = await beads.create(repo, { title: "Legacy epic", type: "epic", acceptance: "- [ ] it works" });
+    const child = await beads.create(repo, { title: "Legacy child", type: "task", acceptance: "- [ ] it works" });
     await beads.link(repo, child, legacy, "parent-child");
 
     const res = await approve(legacy);
@@ -246,8 +362,8 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     // assignee already where it wants it, so the whole request is one forced `bd list` for the
     // readiness gate plus the CAS's one under-lock re-read — no board refresh, no ownership `show`.
     actAs("anton-test");
-    const epic = await beads.create(repo, { title: "Read-economy epic", type: "epic" });
-    const child = await beads.create(repo, { title: "Read-economy epic child", type: "task" });
+    const epic = await beads.create(repo, { title: "Read-economy epic", type: "epic", acceptance: "- [ ] it works" });
+    const child = await beads.create(repo, { title: "Read-economy epic child", type: "task", acceptance: "- [ ] it works" });
     await beads.link(repo, child, epic, "parent-child");
     await beads.assign(repo, epic, "anton-test");
 
@@ -286,8 +402,8 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     // for the response: the write flags the snapshot pendingWrite, so the client's next poll blocks
     // on a fresh read anyway — and the 200 body still carries the just-written approval + assignee.
     actAs("anton-test");
-    const epic = await beads.create(repo, { title: "Read-economy unclaimed", type: "epic" });
-    const child = await beads.create(repo, { title: "Read-economy unclaimed child", type: "task" });
+    const epic = await beads.create(repo, { title: "Read-economy unclaimed", type: "epic", acceptance: "- [ ] it works" });
+    const child = await beads.create(repo, { title: "Read-economy unclaimed child", type: "task", acceptance: "- [ ] it works" });
     await beads.link(repo, child, epic, "parent-child");
 
     const syncSpy = vi.spyOn(beads, "sync").mockResolvedValue(undefined);

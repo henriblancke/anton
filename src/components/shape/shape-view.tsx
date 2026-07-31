@@ -7,6 +7,7 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { PtyTerminal } from "@/components/pty/pty-terminal";
 import { cn } from "@/lib/utils";
+import { canSubmitDraft, draftGaps, isAreaValid, submitHint } from "./shape-draft";
 
 /**
  * The Add-work / shaping surface (anton-bm4.2). A real `/shape` session runs a `claude` pty
@@ -14,8 +15,22 @@ import { cn } from "@/lib/utils";
  * backlog. Before the session starts the left pane is a description composer; "Start shaping"
  * spawns the pty (POST `…/sessions/shape`) and swaps in the live terminal. "Send to backlog" POSTs
  * the accepted draft (POST `…/backlog`), which creates the open, unapproved epic bead.
+ *
+ * The draft's fields ARE the epic contract — outcome, Success Criteria, one `area:` (anton-8mnr).
+ * The bead is rendered from the project's bead formula, so what lands is contract-shaped by
+ * construction; this panel's job is to make filling those in the path of least resistance rather
+ * than leaving the founder a bead the board immediately flags as unshaped.
  */
-export function ShapeView({ slug, projectName }: { slug: string; projectName: string }) {
+export function ShapeView({
+  slug,
+  projectName,
+  areas,
+}: {
+  slug: string;
+  projectName: string;
+  /** `area:` values already on the board — suggested so surfaces get reused, not re-minted. */
+  areas: string[];
+}) {
   const router = useRouter();
 
   const [description, setDescription] = useState("");
@@ -26,7 +41,14 @@ export function ShapeView({ slug, projectName }: { slug: string; projectName: st
   // freely editable so the founder can refine it as the conversation converges.
   const [title, setTitle] = useState("");
   const [goal, setGoal] = useState("");
+  const [successCriteria, setSuccessCriteria] = useState("");
+  const [area, setArea] = useState("");
   const [submitting, setSubmitting] = useState(false);
+
+  const draft = { title, goal, successCriteria, area };
+  const areaValid = isAreaValid(area);
+  const missing = draftGaps(draft);
+  const canSubmit = sessionId !== null && canSubmitDraft(draft) && !submitting;
 
   async function startShaping() {
     const seed = description.trim();
@@ -53,14 +75,18 @@ export function ShapeView({ slug, projectName }: { slug: string; projectName: st
   }
 
   async function sendToBacklog() {
-    const trimmedTitle = title.trim();
-    if (!trimmedTitle) return;
+    if (!canSubmit) return;
     setSubmitting(true);
     try {
       const res = await fetch(`/api/projects/${slug}/backlog`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: trimmedTitle, goal: goal.trim() || undefined }),
+        body: JSON.stringify({
+          title: title.trim(),
+          goal: goal.trim(),
+          successCriteria: successCriteria.trim(),
+          area: area.trim(),
+        }),
       });
       if (!res.ok) {
         const data = await res.json().catch(() => null);
@@ -127,33 +153,60 @@ export function ShapeView({ slug, projectName }: { slug: string; projectName: st
               <>
                 <DraftInput label="Title" value={title} onChange={setTitle} placeholder="Epic title" />
                 <DraftTextarea
-                  label="Goal"
+                  label="Outcome"
                   value={goal}
                   onChange={setGoal}
-                  placeholder="One or two sentences: the outcome and why."
+                  placeholder="One or two sentences a stakeholder would recognise — the result, and why."
                 />
+                <DraftTextarea
+                  label="Success criteria"
+                  value={successCriteria}
+                  onChange={setSuccessCriteria}
+                  placeholder={"- [ ] the observable state that means this outcome is reached"}
+                  hint="What several features add up to — not one PR's checklist."
+                />
+                <DraftInput
+                  label="Area"
+                  value={area}
+                  onChange={setArea}
+                  placeholder="reports"
+                  list="shape-areas"
+                  invalid={!areaValid}
+                  hint={
+                    areaValid
+                      ? "The product surface the roadmap groups this outcome under."
+                      : "Letters, digits, . _ - only — it becomes the label area:<value>."
+                  }
+                />
+                <datalist id="shape-areas">
+                  {areas.map((a) => (
+                    <option key={a} value={a} />
+                  ))}
+                </datalist>
                 <p className="text-xs leading-relaxed text-subtle">
-                  Shape the epic in the terminal, then refine the title and goal here. Tickets are
-                  proposed live — you decompose after it lands in backlog.
+                  These four are the epic&apos;s contract — anton fills the bead from your project&apos;s
+                  formula, so it lands shaped rather than flagged. Features are decomposed after it
+                  reaches backlog.
                 </p>
               </>
             ) : (
               <p className="text-xs leading-relaxed text-subtle">
                 Describe the work on the left and start shaping. As the conversation converges, the
-                epic&apos;s title and goal form here — then send it to backlog.
+                epic&apos;s outcome, success criteria, and area form here — then send it to backlog.
               </p>
             )}
           </div>
           <div className="flex flex-col gap-2 border-t border-border bg-card/40 px-5 py-4">
-            <Button
-              className="w-full"
-              disabled={!sessionId || !title.trim() || submitting}
-              onClick={sendToBacklog}
-            >
+            <Button className="w-full" disabled={!canSubmit} onClick={sendToBacklog}>
               Send to backlog
             </Button>
-            <span className="text-center text-[11px] text-subtle">
-              Lands as an open bead · unapproved
+            <span
+              className={cn(
+                "text-center text-[11px]",
+                sessionId && !areaValid ? "text-destructive" : "text-subtle",
+              )}
+            >
+              {sessionId ? submitHint(missing, areaValid) : "Lands as an open bead · unapproved"}
             </span>
           </div>
         </div>
@@ -219,16 +272,30 @@ function FieldLabel({ children }: { children: React.ReactNode }) {
   );
 }
 
+function FieldHint({ children, invalid }: { children: React.ReactNode; invalid?: boolean }) {
+  return (
+    <span className={cn("text-[11px] leading-snug", invalid ? "text-destructive" : "text-subtle")}>
+      {children}
+    </span>
+  );
+}
+
 function DraftInput({
   label,
   value,
   onChange,
   placeholder,
+  hint,
+  invalid,
+  list,
 }: {
   label: string;
   value: string;
   onChange: (v: string) => void;
   placeholder?: string;
+  hint?: string;
+  invalid?: boolean;
+  list?: string;
 }) {
   return (
     <label className="flex flex-col gap-1.5">
@@ -237,11 +304,15 @@ function DraftInput({
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}
+        list={list}
+        aria-invalid={invalid || undefined}
         className={cn(
-          "rounded-md border border-border bg-background px-2.5 py-1.5 text-[13px] font-medium leading-snug",
-          "placeholder:font-normal placeholder:text-subtle focus:border-primary/50 focus:outline-none",
+          "rounded-md border bg-background px-2.5 py-1.5 text-[13px] font-medium leading-snug",
+          "placeholder:font-normal placeholder:text-subtle focus:outline-none",
+          invalid ? "border-destructive focus:border-destructive" : "border-border focus:border-primary/50",
         )}
       />
+      {hint && <FieldHint invalid={invalid}>{hint}</FieldHint>}
     </label>
   );
 }
@@ -251,11 +322,13 @@ function DraftTextarea({
   value,
   onChange,
   placeholder,
+  hint,
 }: {
   label: string;
   value: string;
   onChange: (v: string) => void;
   placeholder?: string;
+  hint?: string;
 }) {
   return (
     <label className="flex flex-col gap-1.5">
@@ -270,6 +343,7 @@ function DraftTextarea({
           "placeholder:text-subtle focus:border-primary/50 focus:outline-none",
         )}
       />
+      {hint && <FieldHint>{hint}</FieldHint>}
     </label>
   );
 }

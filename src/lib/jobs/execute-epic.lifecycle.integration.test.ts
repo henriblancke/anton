@@ -481,6 +481,7 @@ process.exit(0);`,
     const epicId = await beads.create(repo, {
       title: "Epic crashed before in-review",
       type: "epic",
+      acceptance: "work file exists",
       description: "## Goal\nProve in-review restoration on the epic short-circuit.",
     });
     const childId = createTicket(repo, { title: "Only child", parent: epicId });

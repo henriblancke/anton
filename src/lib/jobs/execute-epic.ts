@@ -9,9 +9,10 @@
 import { randomUUID } from "node:crypto";
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { ownerOf } from "../beads/claim";
+import { acceptanceBody, contractGaps, formatContractGaps } from "../beads/contract";
 import { humanNotesPromptBlock } from "../beads/notes";
 import { computeEpicGraph, epicStandaloneBlockers, isUnit, standaloneBlockers } from "../epic-graph";
-import { runTickets } from "../ticket-view";
+import { contractGatedBeads, resumeSkipped, runTickets } from "../ticket-view";
 import { loadAgentPrompt } from "../claude/agent-prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
 import { runClaude, type ClaudeEvent, type ClaudeResult } from "../claude/driver";
@@ -469,16 +470,15 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       leaseLabels = beads.runLeaseLabels(leaseTarget);
 
       // A standalone target that already committed on a prior attempt carries stage:in-review and
-      // is skipped straight to the PR step below — its agent never runs again on this resume. Both
-      // the allowlist gate here and the ticket loop share this "won't run" predicate so neither
-      // acts on a resume marker: gating on a since-disabled agent would park a retry that only has
-      // the (agent-free) PR step left to do. Caveat: "won't run" holds only when the ticket's commit
-      // is actually on this branch. A done-on-board ticket whose commit is missing (cross-machine
-      // resume) DOES re-run, so the loop re-applies this allowlist gate there — the worktree needed
-      // to prove commit presence doesn't exist yet at this point.
-      const inReview = LABELS.stage("in-review");
-      const isResumeSkipped = (t: Bead) =>
-        t.status === "closed" || (standaloneRun && (t.labels?.includes(inReview) ?? false));
+      // is skipped straight to the PR step below — its agent never runs again on this resume. The
+      // allowlist gate here, the ticket loop and the approve route share ONE "won't run" predicate
+      // (ticket-view `resumeSkipped`) so none of them acts on a resume marker: gating on a
+      // since-disabled agent would park a retry that only has the (agent-free) PR step left to do.
+      // Caveat: "won't run" holds only when the ticket's commit is actually on this branch. A
+      // done-on-board ticket whose commit is missing (cross-machine resume) DOES re-run, so the loop
+      // re-applies this allowlist gate there — the worktree needed to prove commit presence doesn't
+      // exist yet at this point.
+      const isResumeSkipped = (t: Bead) => resumeSkipped(t, standaloneRun);
 
       // 0b. Dispatch honors the active-agents allowlist for anton's BUNDLED specialists (anton-dm7);
       // the project's own `.claude/agents` (userAgentIds) are always allowed. PARK, don't skip:
@@ -497,6 +497,43 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           `epic ${epicBeadId} needs agents enabled in this project's settings: ` +
             inactive.map((x) => `${x.id} → agent:${x.agent}`).join(", ") +
             ` — enable them in Settings → Agents (or relabel the tickets), then resume the run`,
+        );
+      }
+
+      // 0c. Dispatch honors the bead contract (anton-j9zs) — the target plus every ticket this run
+      // will actually dispatch. A BLOCKING gap (no Acceptance on a ticket, no Success Criteria on
+      // an epic) leaves the agent with no definition of done and self-review with no rubric, so the
+      // run would produce work nothing can judge. PARK, don't skip, for the same reason as the
+      // allowlist gate above: skipping the ticket opens the epic's single PR incomplete. Recoverable
+      // — the operator writes the missing section (`bd update --acceptance`) and resumes.
+      // Judged against the FRESHLY-PULLED board: `target`/`tickets` were re-read in step 0 (and
+      // re-derived in 0a-ter), so a bead repaired between approve and dispatch passes this gate
+      // rather than parking on the enqueue-time snapshot. Resume-skipped beads are excluded exactly
+      // as above — a ticket whose work is already committed won't run its agent again, so its spec
+      // can't strand this attempt; if it turns out it WILL re-run (the cross-machine
+      // commit-missing case), the ticket loop re-applies this gate there. When the whole set is
+      // resume-skipped this run dispatches no agent at all — the closed-PR recovery that falls
+      // through step 0a with only the (agent-free) PR step left — so it is gated on nothing, in the
+      // grouped shape as well as the standalone one.
+      // The set comes from the same helper the approve route and the board card use
+      // (`contractGatedBeads`), so a target this parks on is one the board already marked and
+      // approval already refused, rather than a surprise at dispatch.
+      const contractGated = contractGatedBeads(target, freshChildren);
+      const contractBlocking = contractGaps(contractGated, "blocking");
+      if (contractBlocking.length > 0) {
+        throw new PoisonEpic(
+          `epic ${epicBeadId} has beads that don't meet the bead contract: ` +
+            formatContractGaps(contractBlocking) +
+            ` — write the missing section(s), then resume the run`,
+        );
+      }
+      // Advisory gaps NEVER gate — they cost quality, not runnability. Logged so a degraded run is
+      // visible rather than silent, then the run proceeds.
+      const contractAdvisory = contractGaps(contractGated, "advisory");
+      if (contractAdvisory.length > 0) {
+        console.warn(
+          `[execute-epic] ${epicBeadId} runs with advisory contract gaps: ` +
+            formatContractGaps(contractAdvisory),
         );
       }
 
@@ -794,9 +831,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         // board still marks it done. Re-run it here so its commit lands on this branch. On a
         // same-machine resume the worktree is reused and the commit is present, so this skips as
         // before — no redundant re-run.
-        const doneOnBoard =
-          ticket.status === "closed" ||
-          (standaloneRun && (ticket.labels?.includes(inReview) ?? false));
+        const doneOnBoard = resumeSkipped(ticket, standaloneRun);
         if (doneOnBoard && (await worktreeHasCommitFor(worktree.path, ticket.id))) {
           if (standaloneRun) {
             // Resume after a failed PR step: this standalone ticket committed and moved to in-review
@@ -823,6 +858,23 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
               `epic ${epicBeadId} needs agents enabled in this project's settings: ` +
                 disabled.map((x) => `${x.id} → agent:${x.agent}`).join(", ") +
                 ` — enable them in Settings → Agents (or relabel the tickets), then resume the run`,
+            );
+          }
+          // Same re-gate for the bead contract (anton-j9zs): step 0c skipped this ticket as
+          // resume-skipped, which only holds while it isn't re-run. Regenerating its work under a
+          // spec with no definition of done is the state that gate exists to refuse. The grouped
+          // TARGET is re-checked alongside the ticket: its criteria are the rubric self-review
+          // scores the regenerated work against, and a run whose children all arrived closed was
+          // gated on nothing at 0c — this is the first time that target's spec is read.
+          const regressed = contractGaps(
+            ticket.id === target.id ? [ticket] : [target, ticket],
+            "blocking",
+          );
+          if (regressed.length > 0) {
+            throw new PoisonEpic(
+              `epic ${epicBeadId} has beads that don't meet the bead contract: ` +
+                formatContractGaps(regressed) +
+                ` — write the missing section(s), then resume the run`,
             );
           }
         }
@@ -867,7 +919,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       });
       await safe(() => beads.setPrRef(repo, epicBeadId, pr.ref));
       if (!standaloneRun) {
-        await safe(() => beads.tag(repo, epicBeadId, [inReview]));
+        await safe(() => beads.tag(repo, epicBeadId, [LABELS.stage("in-review")]));
         await safe(() => beads.untag(repo, epicBeadId, [LABELS.stage("implementing")]));
       }
 
@@ -1419,7 +1471,10 @@ function truncateField(text: string): string {
  */
 export function ticketPrompt(ticket: Bead): string {
   const description = ticket.description?.trim();
-  const acceptance = (ticket.acceptance_criteria ?? ticket.acceptance)?.trim();
+  // The gate's own reader: covers every home the contract accepts — bd's acceptance fields AND a
+  // description-only `## Acceptance` section. Reading the fields alone said "(none stated)" for a
+  // rubric the gate had just accepted, whenever the truncated description block below cut it.
+  const acceptance = acceptanceBody(ticket)?.trim();
   // In some boards Context is a separate column; in others it's folded into `description` as a
   // `## Context` heading. Only inline the standalone field when it isn't already in `description`.
   const context =

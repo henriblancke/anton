@@ -7,6 +7,8 @@ import { toast } from "sonner";
 import { CheckIcon, CircleSlashIcon, TriangleAlertIcon } from "lucide-react";
 
 import type { EpicCrumb, EpicDetail, Ticket } from "@/lib/types";
+// The predicate itself, not a page-local copy: approve, the runner, and the board card ask the same one.
+import { contractBlocks } from "@/lib/beads/contract";
 import { cn } from "@/lib/utils";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { ConfirmDeleteButton } from "@/components/ui/confirm-delete-button";
@@ -14,6 +16,8 @@ import { CopyButton } from "@/components/ui/copy-button";
 import { TYPE_LABELS, agentDotClass, ticketProgress } from "@/components/board/board-utils";
 import { AbandonedChip, MetaChip, RelativeTime, RiskChip, StagePill } from "@/components/atoms";
 import { ClaimControl } from "@/components/board/claim-control";
+import { toastContractAdvisory } from "@/components/board/contract-advisory";
+import { ApproveBlocked } from "@/components/board/contract-mark";
 import { EpicBadge } from "@/components/board/epic-badge";
 import { PrLinkControl } from "@/components/board/pr-link-control";
 import { DependencyGraph } from "@/components/epic/dependency-graph";
@@ -196,6 +200,8 @@ export function EpicDetailView({
             ? `Run started for "${title}"`
             : `Queued "${title}" for optimal usage`,
       );
+      // The run starts with whatever thin sections it has; say so once, here.
+      await toastContractAdvisory(res);
       setAttempt((n) => n + 1);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to start run");
@@ -236,6 +242,11 @@ export function EpicDetailView({
   // The page serves every run target, and a feature is the tier anton runs — so the id line and the
   // actions name the bead's real type instead of calling everything an epic.
   const word = TYPE_LABELS[epic.type].toLowerCase();
+  // Every run action here posts to the approve route, which refuses a blocking contract gap on the
+  // target or any open ticket under it (anton-j9zs). Gate the buttons on the same judgement the
+  // board card uses, so the action reads as inert-and-explained rather than 422ing on click.
+  const contractBlocked = contractBlocks(epic.contract);
+  const blocking = epic.contract?.blocking ?? [];
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -270,16 +281,28 @@ export function EpicDetailView({
                   View run
                 </Link>
               )}
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => handleRun(epic.title, { force: true })}
-                disabled={running}
-                title="Re-trigger the execute-epic job (resumes from where it stopped)"
-              >
-                {running ? "Starting…" : "Force run"}
-              </Button>
+              {contractBlocked ? (
+                <ApproveBlocked violations={blocking} label="Force run" size="sm" />
+              ) : (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => handleRun(epic.title, { force: true })}
+                  disabled={running}
+                  title="Re-trigger the execute-epic job (resumes from where it stopped)"
+                >
+                  {running ? "Starting…" : "Force run"}
+                </Button>
+              )}
             </>
+          ) : contractBlocked ? (
+            // One inert action for both the budget-aware and plain layouts: the run is withheld by a
+            // missing section, and neither pacing choice changes that.
+            <ApproveBlocked
+              violations={blocking}
+              label={budgetAware ? "Approve" : `Run ${word}`}
+              size="sm"
+            />
           ) : budgetAware ? (
             // Budget-aware project: let the operator choose immediate execution vs pacing for optimal
             // usage (anton-d8i4). "Approve" runs now (bypasses weekly/daytime pacing, keeps the

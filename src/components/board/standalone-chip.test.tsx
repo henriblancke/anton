@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 
+import { contractStatusOf } from "@/lib/beads/contract";
+import type { Bead } from "@/lib/beads/types";
 import type { StandaloneItem } from "@/lib/types";
 import { StandaloneChip } from "@/components/board/standalone-chip";
 import { StandaloneGroup } from "@/components/board/standalone-group";
@@ -109,6 +111,63 @@ describe("StandaloneChip", () => {
     );
     expect(html).toContain("#42");
     expect(html).toContain("https://x/pull/42");
+  });
+});
+
+describe("StandaloneChip contract marking", () => {
+  // Built through the shared validator, so the chip is tested against the wording approve would use.
+  const statusOf = (over: Partial<Bead>) =>
+    contractStatusOf({
+      id: "t-1",
+      title: "Loose task",
+      status: "open",
+      issue_type: "task",
+      created_at: "2026-07-20T00:00:00.000Z",
+      ...over,
+    });
+
+  const SHAPED = "## Goal\nG\n\n## Context\nC\n\n## Out of scope\nO\n\n## Verify\nV";
+
+  it("marks a blocking gap and keeps Approve & run in place but inert, naming what is missing", () => {
+    const html = renderToStaticMarkup(
+      <StandaloneChip slug="anton" item={makeItem({ contract: statusOf({ description: SHAPED }) })} />,
+    );
+    expect(html).toContain("needs Acceptance");
+    expect(html).toContain("Can&#x27;t approve — no Acceptance criteria");
+    expect(html).toContain("Approve &amp; run"); // the affordance explains rather than vanishing
+    expect(html).toContain('disabled=""');
+  });
+
+  it("shows an advisory gap as a nudge and still runs", () => {
+    const html = renderToStaticMarkup(
+      <StandaloneChip
+        slug="anton"
+        item={makeItem({
+          contract: statusOf({
+            description: "## Goal\nG\n\n## Context\nC\n\n## Out of scope\nO",
+            acceptance_criteria: "- [ ] done",
+          }),
+        })}
+      />,
+    );
+    expect(html).toContain("1 spec gap");
+    expect(html).not.toContain("needs ");
+    expect(html).not.toContain('disabled=""');
+    expect(html).toContain("Approve &amp; run");
+  });
+
+  it("drops the mark on a closed item — its spec gaps can no longer strand a run", () => {
+    const html = renderToStaticMarkup(
+      <StandaloneChip
+        slug="anton"
+        item={makeItem({
+          stage: "done",
+          status: "closed",
+          contract: statusOf({ description: SHAPED, status: "closed" }),
+        })}
+      />,
+    );
+    expect(html).not.toContain("needs Acceptance");
   });
 });
 

@@ -823,13 +823,16 @@ export const beads = {
       type: "epic" | "feature" | "task" | "bug" | "chore";
       acceptance?: string;
       context?: string;
-      description?: string; // Goal / Out of scope / Verify (markdown)
+      description?: string; // the whole contract markdown (Goal / Acceptance / Context / …)
+      labels?: string[]; // e.g. ["area:reports", "domain:eng"] — set at create time, not patched after
       deps?: string[]; // e.g. ["parent-child:bd-100"]
     },
   ): Promise<string> {
     const args = ["create", opts.title, "--type", opts.type];
     if (opts.acceptance) args.push("--acceptance", opts.acceptance);
     if (opts.context) args.push("--context", opts.context);
+    // `bd tag` takes one label per call, so the whole set goes on the create (skills/bd/SKILL.md).
+    if (opts.labels?.length) args.push("--labels", opts.labels.join(","));
     if (opts.deps?.length) args.push("--deps", opts.deps.join(","));
     if (opts.description) args.push("--description", opts.description);
     args.push("--json"); // plain output appends tips/status lines after the id; JSON is clean

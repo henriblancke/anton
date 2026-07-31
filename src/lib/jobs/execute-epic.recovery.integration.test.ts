@@ -119,7 +119,7 @@ process.exit(0);`,
     // anton-cmz review: a standalone's blockers aren't in the epic-graph rollup, so the runner
     // derives them from its own `blocks` edges. An open blocker must PARK the run (poison), not
     // execute — the same gate the approve route enforces, re-checked at lease time.
-    const blocker = await beads.create(repo, { title: "Runner blocker", type: "task" });
+    const blocker = await beads.create(repo, { title: "Runner blocker", type: "task", acceptance: "work file exists" });
     const dependent = await beads.create(repo, {
       title: "Runner dependent",
       type: "bug",
@@ -170,6 +170,7 @@ process.exit(0);`,
     const containerId = await beads.create(repo, {
       title: "Product outcome spanning features",
       type: "epic",
+      acceptance: "work file exists",
       description: "## Goal\nGroup features.",
     });
     const featureId = await beads.create(repo, {
@@ -205,6 +206,7 @@ process.exit(0);`,
     const containerId = await beads.create(repo, {
       title: "Outcome with one runnable feature",
       type: "epic",
+      acceptance: "work file exists",
       description: "## Goal\nGroup features.",
     });
     const featureId = await beads.create(repo, {
@@ -241,6 +243,7 @@ process.exit(0);`,
     const featureId = await beads.create(repo, {
       title: "Feature with shaped tickets",
       type: "feature",
+      acceptance: "work file exists",
       description: "## Goal\nBatch the children.",
     });
     const childIds: string[] = [];
@@ -283,6 +286,7 @@ process.exit(0);`,
     const epicId = await beads.create(repo, {
       title: "Legacy epic that gains a feature mid-flight",
       type: "epic",
+      acceptance: "work file exists",
       description: "## Goal\nGroup work.",
     });
     const taskId = await beads.create(repo, {
@@ -379,6 +383,7 @@ process.exit(0);`,
     const epic3 = await beads.create(repo, {
       title: "Feature Z",
       type: "epic",
+      acceptance: "work file exists",
       description: "## Goal\nZ",
     });
     await beads.approve(repo, epic3);

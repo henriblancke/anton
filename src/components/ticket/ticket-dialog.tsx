@@ -5,8 +5,11 @@ import { toast } from "sonner";
 import { GitPullRequestIcon, TriangleAlertIcon } from "lucide-react";
 
 import type { TicketDetail } from "@/lib/types";
+import { contractBlocks } from "@/lib/beads/contract";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { ApproveBlocked } from "@/components/board/contract-mark";
+import { toastContractAdvisory } from "@/components/board/contract-advisory";
 import { ConfirmDeleteButton } from "@/components/ui/confirm-delete-button";
 import { CopyButton } from "@/components/ui/copy-button";
 import {
@@ -203,6 +206,8 @@ function TicketDialogBody({
         throw new Error(message ?? "Run failed");
       }
       toast.success(wasApproved ? `Re-running "${detail.title}"` : `Approved & running "${detail.title}"`);
+      // The run starts with whatever thin sections it has; say so once, here (mirrors the board chip).
+      await toastContractAdvisory(res);
     } catch (err) {
       setOptimisticApproved(false);
       toast.error(err instanceof Error ? err.message : "Failed to start run");
@@ -243,6 +248,9 @@ function TicketDialogBody({
   // A snoozed target hides it too: the whole point of the snooze is "don't pick this up yet", so
   // offering the one control that would start it immediately contradicts the state it's in.
   const canRun = isRunTarget && detail.stage !== "done" && !detail.deferred;
+  // A blocking contract gap withholds the run the same way the board chip does: the approve route
+  // would 422 the click, so the affordance names the missing section instead of failing on it.
+  const contractBlocked = contractBlocks(detail.contract);
 
   return (
     <div className="flex flex-col gap-4">
@@ -462,21 +470,28 @@ function TicketDialogBody({
           <ConfirmDeleteButton onConfirm={remove} iconOnly title="Delete ticket" />
         </div>
         <div className="flex gap-2">
-          {canRun && (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => run(approved)}
-              disabled={running}
-              title={
-                approved
-                  ? "Re-trigger the run (resumes from where it stopped)"
-                  : "Approve and start the run"
-              }
-            >
-              {running ? "Starting…" : approved ? "Force run" : "Approve & run"}
-            </Button>
-          )}
+          {canRun &&
+            (contractBlocked ? (
+              <ApproveBlocked
+                violations={detail.contract?.blocking ?? []}
+                label={approved ? "Force run" : "Approve & run"}
+                size="sm"
+              />
+            ) : (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => run(approved)}
+                disabled={running}
+                title={
+                  approved
+                    ? "Re-trigger the run (resumes from where it stopped)"
+                    : "Approve and start the run"
+                }
+              >
+                {running ? "Starting…" : approved ? "Force run" : "Approve & run"}
+              </Button>
+            ))}
           <Button
             variant="ghost"
             size="sm"
