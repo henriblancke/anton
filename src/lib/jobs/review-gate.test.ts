@@ -173,6 +173,27 @@ function fakeWorktree(
   };
 }
 
+/**
+ * A worktree whose fingerprint stops being READABLE partway through — git failing under the cleanup
+ * that has to decide whether the dead session left a commit behind. `graceReads` lets the reads
+ * before the one under test through.
+ */
+function unreadableAfterDispatch(inner: ReturnType<typeof fakeWorktree>, dispatch: number, graceReads = 0) {
+  let dispatches = 0;
+  let reads = 0;
+  return {
+    ...inner,
+    onDispatch: () => {
+      dispatches += 1;
+      inner.onDispatch();
+    },
+    readState: async () => {
+      if (dispatches >= dispatch && reads++ >= graceReads) throw new Error("git rev-parse failed");
+      return inner.readState();
+    },
+  };
+}
+
 /** Run the gate against the fake driver. `commits` scripts each fix session's commit verdict. */
 function gate(
   replies: ScriptedReply[],
@@ -676,6 +697,43 @@ describe("runReviewGate — the review is read-only", () => {
     expect(await sessionKinds()).toEqual([{ kind: "review", status: "failed", beadId: "anton-gate1" }]);
   });
 
+  it("resets the worktree anyway when the post-failure state cannot be READ", async () => {
+    // An unreadable fingerprint says nothing about what the dead reviewer left — treating it as
+    // "unchanged" would let a commit it landed survive as the next attempt's baseline. The reset
+    // runs regardless, and because it succeeds the runner still sees the error that drives backoff.
+    const inner = fakeWorktree([], "", [1]);
+    const { result, restores } = gate(
+      [new UsageLimitError("Claude usage limit reached")],
+      {},
+      [],
+      unreadableAfterDispatch(inner, 1),
+    );
+
+    await expect(result).rejects.toBeInstanceOf(UsageLimitError);
+    expect(restores).toHaveLength(1);
+    expect(await inner.readState()).toEqual({ head: "c0ffee", ref: RUN_REF, status: "" });
+  });
+
+  it("parks when the post-failure state can be neither read nor reset", async () => {
+    // Nothing can vouch for this worktree: it may carry the reviewer's own commit, and no retry may
+    // adopt it as a reviewed baseline.
+    const inner = fakeWorktree([], "", [1]);
+    const { result } = gate([new UsageLimitError("Claude usage limit reached")], {}, [], {
+      ...unreadableAfterDispatch(inner, 1),
+      restoreState: async () => {
+        throw new Error("git reset --hard failed");
+      },
+    });
+
+    const error = await result.then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(isPoisonError(error)).toBe(true);
+    expect((error as Error).message).toMatch(/left in a state that could not be read/);
+    expect((error as Error).message).toMatch(/Claude usage limit reached/);
+  });
+
   it("leaves a failed review that wrote nothing alone — no pointless reset", async () => {
     const worktree = fakeWorktree();
     const { result, restores } = gate([new UsageLimitError("Claude usage limit reached")], {}, [], worktree);
@@ -812,6 +870,23 @@ describe("runReviewGate — a failed fix leaves nothing behind", () => {
     expect((error as Error).message).toMatch(/is left at r0gue2 \(on anton\/gate1\)/);
     // The gate that actually failed is carried into the park reason, not lost to the cleanup error.
     expect((error as Error).message).toMatch(/tests gate failed after review round 1/);
+  });
+
+  it("rolls back a self-committed fix whose post-failure state cannot be READ", async () => {
+    // The exact hole a read-first cleanup leaves: the fixer commits, the gate fails, and the
+    // fingerprint read that would spot the commit throws. Reading it as "nothing to undo" would hand
+    // the next attempt a clean tree carrying a fix whose gates never passed.
+    const inner = fakeWorktree([], "", [2]);
+    const { result, restores } = gate(
+      [report(4, [BLOCKING]), "fixed it and committed"],
+      { reviewMaxRounds: 2, testCommand: "exit 1" },
+      [],
+      unreadableAfterDispatch(inner, 2, 1), // the stray-branch check reads first; the cleanup's read fails
+    );
+
+    await expect(result).rejects.toThrow(/tests gate failed after review round 1 for anton-gate1/);
+    expect(restores).toHaveLength(1);
+    expect(await inner.readState()).toEqual({ head: "c0ffee", ref: RUN_REF, status: "" });
   });
 
   it("keeps the commits of a fixer that used a branch of its OWN — parked for a human, not reverted", async () => {

@@ -365,6 +365,29 @@ suite("diffAgainstBase (real git)", () => {
     expect(diff.patch).not.toContain("other.ts");
   });
 
+  it("lists BOTH sides of a rename, so the scope the code left is still covered", async () => {
+    // A detected rename names only its destination, and the file list is what scopes the instruction
+    // files the reviewer is judged against — the rules of the directory the code MOVED OUT of would
+    // go unread while the reviewer is told the inlined ones are the only rules binding the diff.
+    g(["config", "diff.renames", "true"]); // git's default; pinned so the guard is what's tested
+    g(["checkout", "-q", "main"]);
+    mkdirSync(join(repo, "old"), { recursive: true });
+    writeFileSync(join(repo, "old", "file.ts"), "export const moved = 1;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "seed the old scope"]);
+    g(["checkout", "-q", "-B", "anton/epic-1"]);
+
+    mkdirSync(join(repo, "new"), { recursive: true });
+    g(["mv", "old/file.ts", "new/file.ts"]);
+    g(["commit", "-q", "-am", "t1: move the file"]);
+
+    const diff = await diffAgainstBase(repo, "main");
+
+    expect(diff.files).toEqual(["new/file.ts", "old/file.ts"]);
+    // The patch keeps rename detection — it is the file list alone that must be complete.
+    expect(diff.patch).toContain("rename from old/file.ts");
+  });
+
   it("reports no changes for a branch that committed nothing", async () => {
     const diff = await diffAgainstBase(repo, "main");
     expect(diff).toEqual({ files: [], patch: "", truncated: false });

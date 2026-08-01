@@ -364,7 +364,10 @@ export async function worktreeHasCommitFor(
 
 /** A branch's change set against its base: the changed paths plus the (possibly truncated) patch. */
 export interface BranchDiff {
-  /** Paths the branch changed since it diverged from the base. Always complete. */
+  /**
+   * Paths the branch changed since it diverged from the base. Always complete — a rename lists BOTH
+   * its old and its new path, since callers scope rules by path (see {@link diffAgainstBase}).
+   */
   files: string[];
   /** Unified patch for those changes, cut at `maxPatchChars`. */
   patch: string;
@@ -407,6 +410,12 @@ export const DEFAULT_DELETION_PATCH_CHARS = 40_000;
  * lockfile or vendored tree can produce a patch of any size, and buffering it whole only to slice it
  * would fail the review on the exact change truncation exists for.
  *
+ * The FILE LIST is collected with rename detection off, though the patch keeps it: a detected rename
+ * names only its destination, and the list is what scopes the instruction files the reviewer is
+ * judged against (`readInstructions` walks each path's ancestors). Code moved OUT of a directory
+ * would take that directory's rules with it — while the reviewer is told the inlined rules are the
+ * only ones binding the diff. Listing the rename as its removal plus its addition keeps both scopes.
+ *
  * Truncation is survivable because the reviewer can open what the cut omits — with one exception: a
  * file the branch DELETED is not in the worktree to open, and the reviewer is denied `git` (see
  * `REVIEW_DENIED_TOOLS`), so a removed route or validation past the cut would be reviewed by nobody.
@@ -418,7 +427,7 @@ export async function diffAgainstBase(
   opts: { maxPatchChars?: number; maxDeletionChars?: number } = {},
 ): Promise<BranchDiff> {
   const from = await resolveMergeBase(worktreePath, base);
-  const names = await git(worktreePath, ["diff", "--name-only", from, "HEAD"]);
+  const names = await git(worktreePath, ["diff", "--name-only", "--no-renames", from, "HEAD"]);
   const files = names
     .split("\n")
     .map((l) => l.trim())

@@ -572,6 +572,12 @@ interface DiscardCopy {
  * commit off the branch `openPullRequest` pushes. Those cases park the run as poison — deliberately
  * overriding backoff, since no retry may accept this worktree — and carry the original failure in the
  * message so the reason it died isn't lost.
+ *
+ * Which of the two it is can only be told from the post-session fingerprint, so a fingerprint that
+ * cannot be READ does not short-circuit the restore: the reset to `before` runs anyway, and an
+ * unreadable state is treated as the poison case only if that reset ALSO fails. Skipping the restore
+ * on an unreadable read is what would let a self-committed, gate-failing fix survive as the next
+ * attempt's baseline.
  */
 async function discardSessionWrites(args: {
   copy: DiscardCopy;
@@ -589,16 +595,22 @@ async function discardSessionWrites(args: {
   const { copy, worktreePath, targetId, before, logPath, round, maxRounds, cause } = args;
 
   let after: WorktreeState | undefined;
+  let readError: unknown;
   try {
     after = await args.readState(worktreePath);
-    if (sameWorktreeState(after, before)) return;
+  } catch (e) {
+    readError = e; // Unknown state, not a clean one: fall through and reset unconditionally.
+  }
+  if (after && sameWorktreeState(after, before)) return;
 
+  try {
     await args.restoreState(worktreePath, before);
   } catch (e) {
     // A moved HEAD or a switched branch survives a failed revert as a plausible-looking baseline;
-    // uncommitted dirt does not (the next attempt discards it), so only these two park.
-    const stuck =
-      after !== undefined && (after.head !== before.head || after.ref !== before.ref);
+    // uncommitted dirt does not (the next attempt discards it), so only these two park — as does a
+    // state nobody could read, which may be either.
+    const stuck = after === undefined || after.head !== before.head || after.ref !== before.ref;
+    const left = after ? `left at ${describeRef(after)}` : `left in a state that could not be read (${String(readError)})`;
     await appendSessionLog(
       logPath,
       `[${copy.tag}] round ${round}/${maxRounds}: could not revert the failed ${copy.actor}'s changes: ${String(e)}` +
@@ -608,7 +620,7 @@ async function discardSessionWrites(args: {
     if (stuck) {
       throw new PoisonError(
         `the ${copy.actor} of ${targetId} WROTE to its own worktree and the revert failed (${String(e)}): ` +
-          `${worktreePath} is left at ${describeRef(after!)}, not the settled ${describeRef(before)}. ` +
+          `${worktreePath} is ${left}, not the settled ${describeRef(before)}. ` +
           `Parked instead of retried — ${copy.parkRisk}. Reset the worktree by hand, then resume. ` +
           `The ${copy.actor} itself failed with: ${String(cause)}`,
       );
@@ -617,8 +629,12 @@ async function discardSessionWrites(args: {
   }
   await appendSessionLog(
     logPath,
-    `[${copy.tag}] round ${round}/${maxRounds}: the ${copy.actor} FAILED after writing to the worktree — its ` +
-      `changes were reverted to ${before.head.slice(0, 12)} so the next attempt cannot inherit them\n`,
+    after
+      ? `[${copy.tag}] round ${round}/${maxRounds}: the ${copy.actor} FAILED after writing to the worktree — its ` +
+          `changes were reverted to ${before.head.slice(0, 12)} so the next attempt cannot inherit them\n`
+      : `[${copy.tag}] round ${round}/${maxRounds}: the ${copy.actor} FAILED and its post-session state could not be ` +
+          `read (${String(readError)}) — the worktree was reset to ${before.head.slice(0, 12)} regardless, so the ` +
+          `next attempt cannot inherit anything it may have written\n`,
   ).catch(() => {});
 }
 
