@@ -250,6 +250,13 @@ export function classifyFinding(
       const settled = epicSettled(ctx, run.epicBeadId);
       if (settled) return hold(settled);
       if (run.error?.trim() !== USAGE_LIMIT_PARK) {
+        // Jobs are machine-local, so nothing above rules out another machine having picked this
+        // epic back up since the park. Escalating then puts Resume/Abandon in front of the founder
+        // for work that is executing elsewhere, and the abandon closes the bead underneath it.
+        // Only a CONFIRMED foreign lease holds: unlike the resume below, an untrusted board still
+        // escalates — a missed escalation strands the stall, a redundant one costs a glance.
+        const contested = ctx.boardFresh ? leaseStandDown(ctx, run.epicBeadId, run.id) : undefined;
+        if (contested) return contested;
         return escalate(finding.reason);
       }
       const reopensAt = ctx.usageWindowEndsAt(run.epicBeadId);
@@ -325,14 +332,15 @@ export function classifyFinding(
         : hold("the PR has since merged, closed, or been picked back up");
 
     case "exhausted-job":
-      // Same closed-epic rule as the parked-run path, and for the same loop: an abandon closes the
+      // Same settled-epic rule as the parked-run path, and for the same loop: an abandon closes the
       // bead FIRST and only then cancels the job, so a failed cancel leaves a parked job under a
-      // closed epic. Re-escalating that offers an "abandon" whose `abandonTicket` now throws on the
-      // closed bead, settling the escalation without settling the job — forever. Only an
-      // execute-epic finding carries an epic bead id; the job-only kinds skip this and settle
-      // through `actOnJob`.
-      if (ctx.boardFresh && finding.beadId && ctx.board.get(finding.beadId)?.status === "closed") {
-        return hold("the epic has since closed");
+      // closed — or since-deleted — epic. Re-escalating that offers a "resume" that re-poisons on
+      // the missing bead and an "abandon" whose `abandonTicket` now throws, settling the escalation
+      // without settling the job — forever. Only an execute-epic finding carries an epic bead id;
+      // the job-only kinds skip this and settle through `actOnJob`.
+      if (finding.beadId) {
+        const settled = epicSettled(ctx, finding.beadId);
+        if (settled) return hold(settled);
       }
       return ctx.stillStuck(finding)
         ? escalate(finding.reason)

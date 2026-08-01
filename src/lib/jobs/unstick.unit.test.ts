@@ -161,6 +161,34 @@ describe("classifyFinding — parked runs", () => {
     expect(verdict.disposition).toBe("escalate");
   });
 
+  it("HOLDS a non-quota park another machine has since picked back up", () => {
+    // The park is this machine's local row; the lease says the epic is executing elsewhere right
+    // now. Escalating would hand the founder Resume/Abandon over live remote work — abandon closes
+    // the bead underneath the running machine.
+    const verdict = classifyFinding(
+      finding({ reason: "parked 4h ago: agent exited 1" }),
+      ctx({
+        parkedRuns: new Map([["r-1", run({ error: "agent exited 1" })]]),
+        board: new Map([["e-1", bead("e-1", { labels: [LABELS.runLease(NOW + HOUR, "run-x")] })]]),
+      }),
+    );
+    expect(verdict.disposition).toBe("hold");
+    expect(verdict.why).toContain("live run-lease");
+  });
+
+  it("escalates a non-quota park past this run's OWN leftover lease", () => {
+    // A lease owned by the very run that parked is a crash leftover, not a foreign holder — treating
+    // it as one would silently swallow the escalation the stall exists to raise.
+    const verdict = classifyFinding(
+      finding({ reason: "parked 4h ago: agent exited 1" }),
+      ctx({
+        parkedRuns: new Map([["r-1", run({ error: "agent exited 1" })]]),
+        board: new Map([["e-1", bead("e-1", { labels: [LABELS.runLease(NOW + HOUR, "r-1")] })]]),
+      }),
+    );
+    expect(verdict.disposition).toBe("escalate");
+  });
+
   it("escalates a park that recorded no reason at all", () => {
     const verdict = classifyFinding(
       finding(),
@@ -365,6 +393,18 @@ describe("classifyFinding — the never-automatic kinds", () => {
     );
     expect(verdict.disposition).toBe("hold");
     expect(verdict.why).toContain("closed");
+  });
+
+  it("HOLDS an exhausted job whose epic was DELETED — its resume and abandon both dead-end", () => {
+    // A pulled board lists every status, so an absent bead is a deletion. Escalating it offers a
+    // resume that re-parks execute-epic on `bead ... not found` and an abandon whose `bd show`
+    // throws — neither settles the job, so the same alert returns every sweep.
+    const verdict = classifyFinding(
+      finding({ kind: "exhausted-job", key: "exhausted-job:j-1", jobId: "j-1" }),
+      ctx({ board: new Map() }),
+    );
+    expect(verdict.disposition).toBe("hold");
+    expect(verdict.why).toContain("gone from the board");
   });
 
   it("still escalates a closed-epic exhausted job when the board could not be pulled", () => {
