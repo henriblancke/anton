@@ -49,6 +49,8 @@ which is not a gate.
   parentless ticket; it is never a loose child of the epic.
 - A genuine one-off that no epic would honestly hold is a **parentless `task`/`bug`** — a run of
   one. Don't invent a single-feature epic to avoid it, and never nest a feature under a feature.
+  `chore` is not an option here: it only ever runs as a feature's child, so a parentless one is a
+  dead bead.
 
 ### The run-target rule (what anton will actually run)
 

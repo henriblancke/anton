@@ -79,6 +79,7 @@ describe("required skill assets", () => {
   describe("three-tier taxonomy", () => {
     const bd = readFileSync(skillPath("bd"), "utf8");
     const shape = readFileSync(skillPath("shape"), "utf8");
+    const scanTriage = readFileSync(skillPath("scan-triage"), "utf8");
 
     it("bd documents all three tiers and the nesting rule", () => {
       expect(bd).toMatch(/`epic`/);
@@ -126,6 +127,92 @@ describe("required skill assets", () => {
       expect(shape).toMatch(/ask the user/i);
       expect(shape).toMatch(/Never leave a feature parentless/);
       expect(shape).toMatch(/never mint a one-feature epic/);
+    });
+
+    // The second producer (anton-hd9i). Nightly triage must emit the same taxonomy /shape does,
+    // or the board gets one-PR "epics" it can only treat as legacy run targets.
+    it("scan-triage clusters into a feature scoped to one PR, not an epic", () => {
+      expect(scanTriage).toMatch(/anton runs \*\*features\*\*, not epics/);
+      expect(scanTriage).toMatch(/\*\*`feature` scoped to one reviewable PR\*\*/);
+      expect(scanTriage).toMatch(/one `feature` per theme/);
+      expect(scanTriage).not.toMatch(/one epic per theme/);
+    });
+
+    it("scan-triage maps a security signal to a feature or a parentless bug, never a bare ticket", () => {
+      // The one executor-level exception to clustering — it regresses silently if the wording drifts.
+      expect(scanTriage).toMatch(/a `feature` when an epic owns that surface/);
+      expect(scanTriage).toMatch(/otherwise a\s+parentless `bug`/);
+    });
+
+    it("scan-triage looks for an existing epic before creating one", () => {
+      // `--limit 0` on both board reads: bd list defaults to 50, and a truncated board hides the
+      // matching epic (duplicate epic) or an already-tracked signal (duplicate bead). `--all` is
+      // unconditional on the epic read — triage runs unattended, so a closed epic it never sees is
+      // one it can only conclude doesn't exist, and it mints a duplicate.
+      expect(scanTriage).toMatch(/bd list --type epic --all --json --limit 0/);
+      expect(scanTriage).toMatch(/bd list --json --limit 0/);
+      expect(scanTriage).toMatch(/Match on `area:` first/);
+    });
+
+    it("scan-triage screens a reused epic for legacy tickets and a closed status", () => {
+      // Attaching a feature to a pre-tier epic flips it to a container (beads.isContainer), so its
+      // direct tickets land under no card (boardCards.cardOf → undefined) and any run on it is
+      // 422'd; and linking a feature never reopens its parent, so buildRoadmap keeps reporting a
+      // closed epic as a delivered outcome.
+      expect(scanTriage).toMatch(/safe to attach to\*\* — `bd children <epic-id>`/);
+      expect(scanTriage).toMatch(/turns it into a container/);
+      expect(scanTriage).toMatch(/bd reopen <epic-id>/);
+    });
+
+    it("scan-triage hangs child tickets off the feature, never off the epic", () => {
+      expect(scanTriage).toMatch(/hang off the feature, never off the epic/);
+    });
+
+    it("scan-triage files one-small-change work as a childless feature, not a bare ticket", () => {
+      // A bare ticket under an epic is a dead bead; a parentless one leaves the roadmap without the
+      // §4.3 ask. Neither is what "this theme is a single bump" should produce.
+      expect(scanTriage).toMatch(/A bare ticket is never how you file small work/);
+      expect(scanTriage).toMatch(/childless\s+`feature`/);
+      expect(scanTriage).not.toMatch(/or a\s+single ticket if the whole theme/);
+      expect(scanTriage).not.toMatch(/one ticket if it's a single bump/);
+    });
+
+    it("scan-triage refuses to attach cleanup to an already-started run", () => {
+      // runTickets is recomputed at merge time, so a ticket added to an in-flight feature is never
+      // implemented and still gets closed as delivered by finalizeMergedEpic.
+      expect(scanTriage).toMatch(/Never grow a run that has started/);
+      expect(scanTriage).toMatch(/a feature \*this triage just created\*/);
+      expect(scanTriage).toMatch(/no `approved` \/ `stage:\*` label and no PR ref/);
+      // A human claim only sets an assignee (the claim route never enqueues a run), so the prose
+      // must not name it as a disqualifier the actionable check doesn't test.
+      expect(scanTriage).not.toMatch(/already claimed, approved/);
+      expect(scanTriage).toMatch(/An assignee alone is not a disqualifier/);
+      // The guard is narrowing-only: read as a licence it would let a cleanup ticket join any open
+      // unstarted feature, crossing epic boundaries past what the per-class rule allows.
+      expect(scanTriage).toMatch(/only rules candidates \*out\*; it never widens a per-class rule/);
+      expect(scanTriage).toMatch(/never some unrelated open feature under another epic/);
+    });
+
+    it("scan-triage refuses to hand a childless feature its first child", () => {
+      // beads.groupsChildren is `feature && children.length > 0`: the first child flips the feature
+      // from running its own Acceptance to running only its children, so the feature's spec never
+      // reaches the agent and merge closes it on a PR containing just the cleanup.
+      expect(scanTriage).toMatch(/Never give a childless feature its first child/);
+      expect(scanTriage).toMatch(/already\*\* has\s+working-layer children/);
+      expect(scanTriage).toMatch(/this triage just created\* that\s+already carries child tickets/);
+    });
+
+    it("scan-triage surfaces an unattachable cluster instead of orphaning it", () => {
+      // No user to ask on the 03:00 cron — the report is how the run asks (§4.3 → §6).
+      expect(scanTriage).toMatch(/never mint a one-feature epic/i);
+      expect(scanTriage).toMatch(/never leave a `feature` parentless/);
+      expect(scanTriage).toMatch(/needs-an-epic:/);
+      expect(scanTriage).toMatch(/Surfaced, never orphaned/);
+    });
+
+    it("scan-triage's summary line counts features, not epics", () => {
+      expect(scanTriage).toMatch(/created: N \(F features, T tickets\)/);
+      expect(scanTriage).not.toMatch(/created: N \(E epics/);
     });
   });
 
