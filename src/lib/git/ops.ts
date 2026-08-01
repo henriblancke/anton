@@ -206,7 +206,15 @@ export interface WorktreeState {
   status: string;
 }
 
-/** Fingerprint the worktree, so a phase that must not write can be caught having written. */
+/**
+ * Fingerprint the worktree, so a phase that must not write can be caught having written.
+ *
+ * Scoped to git-visible state on purpose. Ignored paths are NOT fingerprinted: they never reach the
+ * PR (the branch carries HEAD, and a finished run force-removes the worktree), and a read-only phase
+ * is explicitly allowed to run the project's own checks — which rewrite exactly those paths
+ * (`.next/`, `.eslintcache`, `*.tsbuildinfo`, coverage). Hashing them would fail every honest review
+ * instead of catching a dishonest one.
+ */
 export async function readWorktreeState(worktreePath: string): Promise<WorktreeState> {
   const [head, status] = await Promise.all([
     git(worktreePath, ["rev-parse", "HEAD"]),

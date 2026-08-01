@@ -40,7 +40,8 @@ type ScriptedReport =
   | {
       score: number;
       rationale?: string;
-      findings: { severity: "blocking" | "advisory"; location: string; note: string }[];
+      /** `unknown` so a case can script a BROKEN findings list, not just a well-formed one. */
+      findings: { severity: "blocking" | "advisory"; location: string; note: string }[] | unknown;
     };
 
 describeBd("execute-epic e2e — pre-PR self-review gate (real handler · real bd/git · fake claude/gh)", () => {
@@ -372,6 +373,44 @@ console.error('gh boom: no PR may be opened on an unreported review');process.ex
       // The round is still recorded — a violation is a data point, not a missing one — but a run
       // with no valid score never gets a score label.
       expect(scoreComments(targetId)).toMatchObject([{ round: 1, verdict: "protocol-violation" }]);
+      expect((target.labels ?? []).some((l) => l.startsWith("review-score:"))).toBe(false);
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+      if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  });
+
+  it("parks when the findings list is unreadable — a valid score does not vouch for a mangled report", async () => {
+    // The shape that must never reach a PR: a good score whose findings anton could not parse. It
+    // reads as "nothing blocking" only because the blocking finding was lost.
+    await setReviewEnabled(true);
+    script({ score: 9, rationale: "clean", findings: null });
+    const targetId = await approvedTarget("Mangled report run");
+
+    const boomGh = writeBin(
+      binDir,
+      "gh-boom-mangled",
+      `const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='view'){process.exit(1);}
+console.error('gh boom: no PR may be opened on an unreadable review report');process.exit(1);`,
+    );
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = boomGh;
+
+    const runner = makeEpicRunner(ctx);
+    let jobId: string;
+    try {
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
+
+      expect((await getJob(tdb.db, jobId))?.status).toBe("parked");
+      // No fix round: an unreadable verdict is never dispatched for repair.
+      expect(dispatches()).toEqual(["implement", "review"]);
+
+      const target = await beads.show(repo, targetId);
+      expect(beads.getPrRef(target) ?? null).toBeNull();
+      expect(target.notes ?? "").toMatch(/unreadable findings list/i);
+      expect(scoreComments(targetId)).toMatchObject([{ round: 1, verdict: "protocol-violation" }]);
+      // The score it claimed is not banked either — it was never a verdict anton could read.
       expect((target.labels ?? []).some((l) => l.startsWith("review-score:"))).toBe(false);
     } finally {
       process.env.ANTON_GH_BIN = okGh;

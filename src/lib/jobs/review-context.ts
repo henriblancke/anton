@@ -46,10 +46,15 @@ export interface ReviewerSource {
 
 /**
  * How a review failed the protocol. Deliberately NOT folded into "no findings": a reviewer that
- * never reported, reported an unusable score, or edited the code it was judging has told us nothing
- * trustworthy about the work — treating that as a clean review would open a PR on unreviewed code.
+ * never reported, reported an unusable score or findings list, or edited the code it was judging has
+ * told us nothing trustworthy about the work — treating that as a clean review would open a PR on
+ * unreviewed code.
  */
-export type ReviewProtocolViolation = "no-report" | "invalid-score" | "worktree-modified";
+export type ReviewProtocolViolation =
+  | "no-report"
+  | "invalid-score"
+  | "malformed-findings"
+  | "worktree-modified";
 
 /**
  * Outcome of parsing a review report. `ok: true` is a review that spoke the protocol — the score is
@@ -280,6 +285,11 @@ function reportingFormatSection(): string[] {
     `0-10 is a protocol violation — anton cannot grade the run and the run is parked for a human.`,
     `Report the score even when you found nothing.`,
     ``,
+    `\`findings\` is MANDATORY too: an array, with every entry carrying a "blocking" or "advisory"`,
+    `\`severity\` and a non-empty \`note\`. Anything else — a null, an object, one garbled entry — is a`,
+    `protocol violation and parks the run, because anton cannot tell a clean review from a blocking`,
+    `finding it failed to read. An empty array is the way to say you found nothing.`,
+    ``,
     `Use "blocking" only for work that fails a stated Acceptance criterion, is wrong or unsafe, or`,
     `reaches green by weakening a check — anton fixes every blocking finding before the PR opens.`,
     `Use "advisory" for real improvements that do not invalidate the work. \`location\` is a path`,
@@ -386,11 +396,15 @@ function looksLikeReportText(raw: string): boolean {
  * final message with: the LAST fenced ```json block that looks like a report. Unrelated json
  * blocks (a config the reviewer quoted) are skipped, not treated as the report.
  *
- * Tolerant about FINDINGS — malformed entries are dropped, a missing/non-array `findings` yields
- * [] — and strict about the SCORE. A report that never came, or whose score is missing, non-
- * integer, or out of 0-10, returns `ok: false`: the gate must park on that rather than read silence
- * as a clean run. Scanning stops at the first report-shaped block from the end — including a
- * BROKEN one — so a reviewer's earlier draft can never stand in for a final report it withdrew.
+ * Strict about BOTH halves of the verdict. A report that never came, whose score is missing,
+ * non-integer or out of 0-10, or whose `findings` is anything but an array of usable findings,
+ * returns `ok: false`. Findings are not salvaged into a verdict: `{"score":3,"findings":null}` and
+ * a list with one garbled entry both look exactly like a report whose blocking finding got mangled,
+ * and quietly reading them as "nothing blocking" is how an unreviewed run reaches a PR. Whatever
+ * findings ARE readable ride along on the violation, as the reason a human is being asked.
+ *
+ * Scanning stops at the first report-shaped block from the end — including a BROKEN one — so a
+ * reviewer's earlier draft can never stand in for a final report it withdrew.
  */
 export function parseReviewFindings(text: string | undefined): ReviewReportResult {
   if (!text) return { ok: false, violation: "no-report", findings: [] };
@@ -408,12 +422,15 @@ export function parseReviewFindings(text: string | undefined): ReviewReportResul
     }
     if (!isReportBlock(parsed)) continue;
 
-    const findings = Array.isArray(parsed.findings)
-      ? parsed.findings.map(toFinding).filter((f): f is ReviewFinding => f !== undefined)
-      : [];
+    const raw = parsed.findings;
+    const entries = Array.isArray(raw) ? raw.map(toFinding) : undefined;
+    const findings = entries?.filter((f): f is ReviewFinding => f !== undefined) ?? [];
     const { score, rationale } = parsed;
     if (typeof score !== "number" || !Number.isInteger(score) || score < 0 || score > 10) {
       return { ok: false, violation: "invalid-score", findings };
+    }
+    if (!entries || entries.some((f) => f === undefined)) {
+      return { ok: false, violation: "malformed-findings", findings };
     }
     return {
       ok: true,

@@ -318,32 +318,54 @@ describe("parseReviewFindings", () => {
     });
   });
 
-  it("drops malformed findings, defaults a missing location, and tolerates a non-array findings", () => {
+  it("defaults a missing location — the only field a finding may omit", () => {
+    expect(parseReviewFindings(block('{"score":5,"findings":[{"severity":"advisory","note":"no location"}]}'))).toEqual({
+      ok: true,
+      score: 5,
+      findings: [{ severity: "advisory", location: "(general)", note: "no location" }],
+    });
+  });
+
+  it("rejects a malformed findings entry rather than dropping it", () => {
+    // A garbled entry is indistinguishable from a mangled BLOCKING finding, so it must never be
+    // silently discarded: the readable ones ride along as context, but the verdict is refused.
     const result = parseReviewFindings(
       block(
         '{"score":5,"findings":[' +
           '{"severity":"blocking","location":"src/a.ts:1","note":"real"},' +
-          '{"severity":"nit","location":"src/b.ts","note":"unknown severity"},' +
-          '{"severity":"advisory","location":"src/c.ts","note":"   "},' +
-          '{"severity":"advisory","note":"no location given"},' +
-          '"junk"]}',
+          '{"severity":"nit","location":"src/b.ts","note":"unknown severity"}]}',
       ),
     );
 
     expect(result).toEqual({
-      ok: true,
-      score: 5,
-      findings: [
-        { severity: "blocking", location: "src/a.ts:1", note: "real" },
-        { severity: "advisory", location: "(general)", note: "no location given" },
-      ],
+      ok: false,
+      violation: "malformed-findings",
+      findings: [{ severity: "blocking", location: "src/a.ts:1", note: "real" }],
     });
 
-    expect(parseReviewFindings(block('{"score":7,"findings":"none"}'))).toEqual({
-      ok: true,
-      score: 7,
-      findings: [],
-    });
+    for (const json of [
+      '{"score":5,"findings":[{"severity":"advisory","location":"src/c.ts","note":"   "}]}',
+      '{"score":5,"findings":["junk"]}',
+      '{"score":5,"findings":[null]}',
+    ]) {
+      expect(parseReviewFindings(block(json))).toEqual({
+        ok: false,
+        violation: "malformed-findings",
+        findings: [],
+      });
+    }
+  });
+
+  it("rejects a non-array or missing findings instead of reading it as a clean review", () => {
+    // The dangerous shape the gate must never pass: a valid score whose findings list is unusable
+    // would otherwise open a PR on a verdict anton never actually read.
+    for (const json of ['{"score":3,"findings":null}', '{"score":7,"findings":"none"}', '{"score":9}']) {
+      expect(parseReviewFindings(block(json))).toEqual({
+        ok: false,
+        violation: "malformed-findings",
+        findings: [],
+      });
+    }
   });
 
   it("reports a missing or unparseable report as a protocol violation, never as clean", () => {

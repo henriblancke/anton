@@ -1431,9 +1431,14 @@ class ReviewBlockedError extends Error {
  */
 function reviewFailureReason(review: ReviewGateResult, blocking: ReviewFinding[]): string {
   if (blocking.length > 0) return `${blocking.length} blocking finding(s) survived the gate`;
-  return finalViolation(review) === "worktree-modified"
-    ? `the reviewer modified the worktree it was judging`
-    : `the reviewer never reported a valid score`;
+  switch (finalViolation(review)) {
+    case "worktree-modified":
+      return `the reviewer modified the worktree it was judging`;
+    case "malformed-findings":
+      return `the reviewer's findings list was unreadable`;
+    default:
+      return `the reviewer never reported a valid score`;
+  }
 }
 
 /** The park reason on the target bead: what the reviewer refused to pass, in its own words. */
@@ -1443,18 +1448,36 @@ function reviewParkNote(review: ReviewGateResult, blocking: ReviewFinding[]): st
     blocking.length > 0
       ? `anton: the pre-PR self-review left ${blocking.length} blocking finding(s) unresolved after ` +
         `${rounds} round(s) (${review.outcome}) — no PR was opened:`
-      : finalViolation(review) === "worktree-modified"
-        ? `anton: the pre-PR self-review EDITED the worktree it was judging after ${rounds} round(s) ` +
-          `— its changes were reverted and its verdict discarded, because a reviewer that fixes the ` +
-          `code cannot vouch for it. No PR was opened; check which reviewer this project is using.`
-        : `anton: the pre-PR self-review never reported a valid score after ${rounds} round(s) ` +
-          `(${review.outcome}) — no PR was opened, because silence is not a clean review.`;
+      : violationParkHead(review, rounds);
   return [
     head,
     ...findingLines(blocking),
     ``,
     `Resolve them (or correct the ticket), then resume the run.`,
   ].join("\n");
+}
+
+/** The park-note headline when the verdict itself was untrustworthy — which way it broke, and why. */
+function violationParkHead(review: ReviewGateResult, rounds: number): string {
+  switch (finalViolation(review)) {
+    case "worktree-modified":
+      return (
+        `anton: the pre-PR self-review EDITED the worktree it was judging after ${rounds} round(s) ` +
+        `— its changes were reverted and its verdict discarded, because a reviewer that fixes the ` +
+        `code cannot vouch for it. No PR was opened; check which reviewer this project is using.`
+      );
+    case "malformed-findings":
+      return (
+        `anton: the pre-PR self-review reported an unreadable findings list after ${rounds} round(s) ` +
+        `(${review.outcome}) — no PR was opened, because a report anton cannot parse may be hiding a ` +
+        `blocking finding.`
+      );
+    default:
+      return (
+        `anton: the pre-PR self-review never reported a valid score after ${rounds} round(s) ` +
+        `(${review.outcome}) — no PR was opened, because silence is not a clean review.`
+      );
+  }
 }
 
 /** Findings as a markdown list — shared by the park note and the PR body. */
