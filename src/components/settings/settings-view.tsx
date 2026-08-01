@@ -215,7 +215,10 @@ export function SettingsView({
           // shipped review contract. The knobs are sent even while the gate is off, so turning it
           // back on restores the operator's reviewer instead of silently resetting it.
           reviewEnabled,
-          reviewAgent: reviewAgent || null,
+          // A stored reviewer whose agent has since been deleted is shown but NOT resubmitted: the
+          // PATCH rejects unknown ids, which would fail every unrelated save until someone noticed.
+          // Omitting the key leaves the stored id untouched — runtime already falls back on its own.
+          ...(reviewerMissing(reviewAgent, agents) ? {} : { reviewAgent: reviewAgent || null }),
           reviewPrompt: reviewPrompt.trim() || null,
           reviewMaxRounds,
           // "" clears a verify gate → it's skipped (no behavior change).
@@ -895,12 +898,18 @@ function PctField({
   );
 }
 
+/** A stored reviewer id that no longer resolves to a discoverable agent — shown, never resubmitted. */
+function reviewerMissing(value: string, agents: DiscoveredAgent[]): boolean {
+  return value !== "" && !agents.some((a) => a.id === value);
+}
+
 /**
  * Reviewer selector for the self-review gate (anton-3apm). Persists to settingsJson.reviewAgent;
  * "" runs the shipped review contract. Any discoverable agent may review — bundled or the
  * operator's own — since the reviewer is deliberately swappable, not gated by the active-agents
  * allowlist. A persisted id that no longer resolves is kept as an option so the operator can see
- * what's stored (and that it's gone) instead of the field silently reading as "Default".
+ * what's stored (and that it's gone) instead of the field silently reading as "Default" — the save
+ * omits it rather than resubmitting an id the API rejects (see {@link reviewerMissing}).
  */
 function ReviewerField({
   value,
@@ -913,7 +922,7 @@ function ReviewerField({
   agents: DiscoveredAgent[];
   disabled?: boolean;
 }) {
-  const missing = value !== "" && !agents.some((a) => a.id === value);
+  const missing = reviewerMissing(value, agents);
   const hint = agents.find((a) => a.id === value)?.description;
   return (
     <div className="flex flex-col gap-1.5">
@@ -938,7 +947,7 @@ function ReviewerField({
       </div>
       <span className="line-clamp-2 text-[11px] text-subtle" title={missing ? undefined : hint}>
         {missing
-          ? "This agent no longer exists — review falls back to the shipped contract."
+          ? "This agent no longer exists — review falls back to the shipped contract. Pick another to replace it."
           : (hint ?? "any agent this project can assign · runs in a fresh context")}
       </span>
     </div>

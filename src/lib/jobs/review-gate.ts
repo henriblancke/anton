@@ -329,12 +329,16 @@ async function runReviewSession(args: {
       await endSession(db, clock, sessionId, "done");
       return { sessionId, reviewer, report };
     } catch (e) {
+      // Throws PoisonError of its own when the reviewer's COMMIT could not be reverted — the one case
+      // where retrying this worktree is more dangerous than losing the original error's backoff.
       await discardReviewWrites({
         worktreePath,
+        targetId: target.id,
         before,
         logPath,
         round,
         maxRounds,
+        cause: e,
         readState: args.readState,
         restoreState: args.restoreState,
       });
@@ -422,36 +426,58 @@ async function enforceReadOnly(args: {
  * failure and the runner's retry re-enters this worktree, where `settleBaseline` reads a committed
  * write as a settled tree, adopts it as the baseline, and a later clean review hands it to the PR.
  *
- * Best-effort by construction: a restore that itself fails must not replace the error the runner
- * needs to see (UsageLimitError in particular drives backoff), so it is logged and swallowed.
+ * A restore that itself fails is best-effort ONLY while the reviewer's write is uncommitted: the next
+ * attempt's `settleBaseline` discards working-tree dirt before it reads anything, so the failure
+ * costs nothing and must not replace the error the runner needs to see (UsageLimitError in particular
+ * drives backoff). A write the reviewer COMMITTED is the opposite: an unrevertable rogue HEAD reads as
+ * a settled tree, so the retry would adopt it as the reviewed baseline and push it. That case parks
+ * the run as poison — deliberately overriding backoff, since no retry may accept this worktree — and
+ * carries the original failure in its message so the reason it died isn't lost.
  */
 async function discardReviewWrites(args: {
   worktreePath: string;
+  targetId: string;
   before: WorktreeState;
   logPath: string;
   round: number;
   maxRounds: number;
+  /** The failure that brought us here — folded into the park reason when the revert can't undo it. */
+  cause: unknown;
   readState: (worktreePath: string) => Promise<WorktreeState>;
   restoreState: (worktreePath: string, state: WorktreeState) => Promise<void>;
 }): Promise<void> {
-  const { worktreePath, before, logPath, round, maxRounds } = args;
+  const { worktreePath, targetId, before, logPath, round, maxRounds, cause } = args;
 
+  let after: WorktreeState | undefined;
   try {
-    const after = await args.readState(worktreePath);
+    after = await args.readState(worktreePath);
     if (after.head === before.head && after.status === before.status) return;
 
     await args.restoreState(worktreePath, before);
-    await appendSessionLog(
-      logPath,
-      `[review] round ${round}/${maxRounds}: the review FAILED after writing to the worktree — its ` +
-        `changes were reverted to ${before.head.slice(0, 12)} so the next attempt cannot inherit them\n`,
-    );
   } catch (e) {
+    const committed = after !== undefined && after.head !== before.head;
     await appendSessionLog(
       logPath,
-      `[review] round ${round}/${maxRounds}: could not revert the failed review's changes: ${String(e)}\n`,
+      `[review] round ${round}/${maxRounds}: could not revert the failed review's changes: ${String(e)}` +
+        (committed ? ` — the worktree is stuck at the reviewer's own commit, so the run is parked` : ``) +
+        `\n`,
     ).catch(() => {});
+    if (committed) {
+      throw new PoisonError(
+        `the review of ${targetId} COMMITTED to its own worktree and the revert failed (${String(e)}): ` +
+          `${worktreePath} is left at ${after!.head.slice(0, 12)}, not the reviewed ${before.head.slice(0, 12)}. ` +
+          `Parked instead of retried — a retry would read that commit as a settled baseline and open a PR ` +
+          `on code no reviewer ever saw. Reset the worktree by hand, then resume. ` +
+          `The review itself failed with: ${String(cause)}`,
+      );
+    }
+    return;
   }
+  await appendSessionLog(
+    logPath,
+    `[review] round ${round}/${maxRounds}: the review FAILED after writing to the worktree — its ` +
+      `changes were reverted to ${before.head.slice(0, 12)} so the next attempt cannot inherit them\n`,
+  ).catch(() => {});
 }
 
 /**

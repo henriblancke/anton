@@ -132,6 +132,8 @@ if(isReview){
   text=report===null
     ? 'I reviewed it. Looks fine to me.'
     : 'Reviewed.\\n\\n\`\`\`json\\n'+JSON.stringify(report)+'\\n\`\`\`\\n';
+  // A courtesy sign-off after the block — the shape that can retract the verdict above it.
+  if(report!==null&&process.env.ANTON_TEST_REVIEW_TRAILING){text+='\\nOn reflection, ignore the score above — AC-2 is missing.\\n';}
 }else if(isFix){
   fs.appendFileSync(path.join(process.cwd(),'REVIEW_FIX.md'),'fixed round '+Date.now()+'\\n');
   text='resolved the findings';
@@ -413,6 +415,47 @@ console.error('gh boom: no PR may be opened on an unreadable review report');pro
       // The score it claimed is not banked either — it was never a verdict anton could read.
       expect((target.labels ?? []).some((l) => l.startsWith("review-score:"))).toBe(false);
     } finally {
+      process.env.ANTON_GH_BIN = okGh;
+      if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  });
+
+  it("parks with the RIGHT reason when the reviewer signs off after its report block", async () => {
+    // A clean-scoring block followed by prose that takes it back. The park note must name the
+    // envelope — an operator told "never reported a valid score" would go hunting for a silent
+    // reviewer when the reviewer in fact scored and then retracted.
+    await setReviewEnabled(true);
+    script({ score: 9, rationale: "clean", findings: [] });
+    const targetId = await approvedTarget("Trailing sign-off run");
+
+    const boomGh = writeBin(
+      binDir,
+      "gh-boom-trailing",
+      `const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='view'){process.exit(1);}
+console.error('gh boom: no PR may be opened on a retracted review');process.exit(1);`,
+    );
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = boomGh;
+    process.env.ANTON_TEST_REVIEW_TRAILING = "1";
+
+    const runner = makeEpicRunner(ctx);
+    let jobId: string;
+    try {
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
+
+      expect((await getJob(tdb.db, jobId))?.status).toBe("parked");
+      expect(dispatches()).toEqual(["implement", "review"]);
+
+      const target = await beads.show(repo, targetId);
+      expect(beads.getPrRef(target) ?? null).toBeNull();
+      expect(target.notes ?? "").toMatch(/appended text AFTER its report block/i);
+      expect(target.notes ?? "").not.toMatch(/never reported a valid score/i);
+      // The 9 it printed is not banked: a retracted verdict is no verdict.
+      expect(scoreComments(targetId)).toMatchObject([{ round: 1, verdict: "protocol-violation" }]);
+      expect((target.labels ?? []).some((l) => l.startsWith("review-score:"))).toBe(false);
+    } finally {
+      delete process.env.ANTON_TEST_REVIEW_TRAILING;
       process.env.ANTON_GH_BIN = okGh;
       if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
     }

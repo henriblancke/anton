@@ -1436,6 +1436,8 @@ function reviewFailureReason(review: ReviewGateResult, blocking: ReviewFinding[]
       return `the reviewer modified the worktree it was judging`;
     case "malformed-findings":
       return `the reviewer's findings list was unreadable`;
+    case "trailing-content":
+      return `the reviewer appended text after its report block`;
     default:
       return `the reviewer never reported a valid score`;
   }
@@ -1471,6 +1473,13 @@ function violationParkHead(review: ReviewGateResult, rounds: number): string {
         `anton: the pre-PR self-review reported an unreadable findings list after ${rounds} round(s) ` +
         `(${review.outcome}) — no PR was opened, because a report anton cannot parse may be hiding a ` +
         `blocking finding.`
+      );
+    case "trailing-content":
+      return (
+        `anton: the pre-PR self-review appended text AFTER its report block after ${rounds} round(s) ` +
+        `(${review.outcome}) — no PR was opened, because trailing prose is where a reviewer retracts ` +
+        `or corrects the verdict above it. Check that the reviewer ends its final message with the ` +
+        `json block and nothing else.`
       );
     default:
       return (

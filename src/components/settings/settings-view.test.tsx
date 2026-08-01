@@ -199,6 +199,31 @@ describe("SettingsView self-review section (anton-of1m)", () => {
     expect(screen.getByText(/no longer exists/)).toBeTruthy();
   });
 
+  it("omits a missing reviewer from the save, so unrelated settings still apply", () => {
+    // The API rejects an unknown agent id, so resubmitting the stale one would fail every save
+    // until the operator worked out that the reviewer field was the culprit.
+    const fetchMock = stubFetch();
+    renderView({ reviewAgent: "deleted-agent" }, reviewers);
+
+    fireEvent.change(screen.getByLabelText("Max review rounds"), { target: { value: "4" } });
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect("reviewAgent" in body).toBe(false); // key absent → the server leaves the stored id alone
+    expect(body.reviewMaxRounds).toBe(4);
+  });
+
+  it("submits the replacement once a missing reviewer is swapped for a live agent", () => {
+    const fetchMock = stubFetch();
+    renderView({ reviewAgent: "deleted-agent" }, reviewers);
+
+    fireEvent.change(screen.getByLabelText("Reviewer"), { target: { value: "nextjs" } });
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.reviewAgent).toBe("nextjs");
+  });
+
   // The prompt ranks BELOW a named reviewer (buildReviewPrompt), so the copy must say so —
   // an operator who reads it as additive silently loses the focus they asked for.
   it("describes the review prompt as a fallback once a reviewer is named", () => {

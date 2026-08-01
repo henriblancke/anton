@@ -470,8 +470,9 @@ describe("runReviewGate — the review is read-only", () => {
     expect(await sessionKinds()).toEqual([{ kind: "review", status: "failed", beadId: "anton-gate1" }]);
   });
 
-  it("propagates the original failure when the revert itself fails", async () => {
-    // Backoff depends on the runner seeing UsageLimitError, not a git error from the cleanup.
+  it("propagates the original failure when the revert of an UNCOMMITTED write fails", async () => {
+    // Backoff depends on the runner seeing UsageLimitError, not a git error from the cleanup — and
+    // the leftover dirt is harmless: the retry's `settleBaseline` discards it before reading anything.
     const worktree = fakeWorktree([1]);
     const { result } = gate([new UsageLimitError("Claude usage limit reached")], {}, [], {
       ...worktree,
@@ -481,6 +482,29 @@ describe("runReviewGate — the review is read-only", () => {
     });
 
     await expect(result).rejects.toBeInstanceOf(UsageLimitError);
+  });
+
+  it("parks instead of retrying when the reviewer's COMMIT cannot be reverted", async () => {
+    // The one case where losing the original error's backoff is the safer trade: an unrevertable
+    // rogue HEAD reads as a settled tree, so a retry would adopt the reviewer's own commit as the
+    // reviewed baseline and open a PR on code no reviewer ever saw.
+    const worktree = fakeWorktree([], "", [1]);
+    const { result } = gate([new UsageLimitError("Claude usage limit reached")], {}, [], {
+      ...worktree,
+      restoreState: async () => {
+        throw new Error("git reset --hard failed");
+      },
+    });
+
+    const error = await result.then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(isPoisonError(error)).toBe(true);
+    expect((error as Error).message).toMatch(/COMMITTED to its own worktree/);
+    // The original failure is carried, not lost — it's why a human is being asked.
+    expect((error as Error).message).toMatch(/Claude usage limit reached/);
+    expect(await sessionKinds()).toEqual([{ kind: "review", status: "failed", beadId: "anton-gate1" }]);
   });
 
   it("leaves a failed review that wrote nothing alone — no pointless reset", async () => {
