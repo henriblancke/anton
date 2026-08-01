@@ -54,7 +54,9 @@ the three tiers, the nesting rule, and the run-target rule.
   deps" with a child ticket per package (or one ticket if it's a single bump).
 - **Risk/hygiene/docs — mostly drop or cluster.** Lottery risk, high-churn, doc drift → a
   bead only if actionable and worth a human's PR review. Merge-conflict markers / large
-  binaries → one hygiene ticket.
+  binaries → one cleanup bead: a child ticket when a feature already covers that surface,
+  otherwise a parentless `task` (the §4.3 fallback). Never file a standalone one as a `chore` —
+  a parentless `chore` isn't a run target, so it would sit on the board unexecuted.
 
 Respect `.product/config.yaml` `stringer.max_beads_per_scan` — if triage exceeds it, keep the
 highest-severity and defer the rest (they resurface next scan). Security is exempt from the cap.
