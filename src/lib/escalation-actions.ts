@@ -5,9 +5,10 @@
  * Both settle the escalation FIRST, with the status CAS in `settleEscalation` as the lock: whoever
  * flips `open → resolved` owns the decision, so a double-click (or two operators on one board)
  * cannot resume the same epic twice or abandon a bead that is already closing. That CAS is local,
- * though, so a bead-backed verb re-reads the shared board's run-lease before it (see
- * {@link contestedByLiveRun}) — the escalation is a frozen snapshot, and another machine may have
- * picked the work up since. The action then runs.
+ * though, and the escalation is a frozen snapshot, so a bead-backed verb first re-reads who is
+ * executing the work now: the shared board's run-lease for another machine (see
+ * {@link contestedByLiveRun}), and the local job queue for a resume that happened right here (see
+ * {@link restartedLocally}). The action then runs.
  * If it fails, the escalation is already resolved but the stall is not — which is recoverable rather
  * than silent: the finding is still in the next run-health report, so the next unstick pass raises a
  * fresh escalation for it. That partial state is logged where an operator debugging the failure will
@@ -33,7 +34,7 @@ import { abandonTicket } from "./abandon";
 import { beads } from "./beads/bd";
 import { getEscalation, settleEscalation, toEscalationView } from "./escalations";
 import { cancelJob, resumeJob, resumeStalledEpic } from "./jobs/service";
-import { getJob, systemClock } from "./jobs/queue";
+import { activeExecuteEpicId, getJob, systemClock } from "./jobs/queue";
 import { settleParkedRun } from "./runs";
 import { MAX_ABANDON_REASON_CHARS } from "./types";
 import type { EscalationResolution, EscalationView } from "./escalations";
@@ -51,7 +52,8 @@ export function isEscalationAction(value: unknown): value is EscalationAction {
  *   • `not-open`   — someone already settled it (409).
  *   • `no-target`  — the finding names neither a bead/epic nor a job, so there is nothing to resume
  *                    or abandon (409).
- *   • `contested`  — another machine picked the work back up since the stall was raised (409).
+ *   • `contested`  — the work was picked back up since the stall was raised, here or on another
+ *                    machine (409).
  */
 export type EscalationActionFailure = "not-found" | "not-open" | "no-target" | "contested";
 
@@ -95,10 +97,17 @@ export async function actOnEscalation(
   if (!target && !view.jobId) return { ok: false, reason: "no-target" };
 
   // The escalation froze the stall as the sweep saw it; a bead-backed verb is applied later, by
-  // hand. Re-check the cross-machine lease first — before the settle, so a refusal leaves the row
-  // on the panel for the next sweep to re-judge.
-  if (target && (await contestedByLiveRun(project, view, target))) {
-    return { ok: false, reason: "contested" };
+  // hand. Re-check that the work is still stopped first — before the settle, so a refusal leaves the
+  // row on the panel for the next sweep to re-judge. Locally first: it costs one indexed read, where
+  // the lease re-check costs a bd pull.
+  if (target) {
+    const epicBeadId = view.epicBeadId ?? target;
+    if (action === "abandon" && restartedLocally(project.id, epicBeadId)) {
+      return { ok: false, reason: "contested" };
+    }
+    if (await contestedByLiveRun(project, view, target)) {
+      return { ok: false, reason: "contested" };
+    }
   }
 
   // Claim the decision before acting — see the module note: the CAS is the lock.
@@ -125,6 +134,25 @@ export async function actOnEscalation(
 }
 
 /**
+ * Has the work restarted on THIS machine since the stall was raised? Runs and jobs are machine-local,
+ * so a local resume reuses the stalled run's id and republishes the lease under it — which
+ * {@link contestedByLiveRun} reads as ours by design, leaving the stale control unguarded.
+ *
+ * Only an abandon consults this, because only an abandon is destructive: `abandonTicket` cancels the
+ * run target's ACTIVE job before closing the bead, so it would kill the execution the resume just
+ * started and undo it. Nothing downstream catches that — `settleAbandonedWork`'s status-guarded
+ * settles run after the cancel already terminalized the job. A resume needs no such guard: `resumeEpic`
+ * absorbs an epic that is already active as a no-op.
+ *
+ * An active execute-epic job is exactly what the abandon's cancel would reach, so this refuses in
+ * precisely the cases where it has something live to destroy — a job that has parked again since is
+ * stopped work, and stays abandonable.
+ */
+function restartedLocally(projectId: string, epicBeadId: string): boolean {
+  return activeExecuteEpicId(getDb(), projectId, epicBeadId) !== undefined;
+}
+
+/**
  * Is the work this escalation names executing on ANOTHER machine right now? Jobs and runs are
  * machine-local, so the run-lease on the epic bead is the only record that someone else picked the
  * stall back up between the sweep raising it and a founder clicking. The unstick pass stands down on
@@ -146,8 +174,11 @@ async function contestedByLiveRun(
   view: EscalationView,
   target: string,
 ): Promise<boolean> {
-  // Runs are keyed by epic, so that is where execute-epic publishes the lease; `target` is the epic
-  // already for a resume, and the fallback for a finding that named no epic at all.
+  // Runs are keyed by RUN TARGET, so that is the bead execute-epic publishes the lease on, and it is
+  // what `epicBeadId` holds for every kind: the run's epic for a parked run, the finding's own bead
+  // for a stale PR or a dead lease (both name a run target — `inReviewTargets` classifies with
+  // `isRunTarget`, and only run targets ever carry a lease). `target` is the fallback for a finding
+  // that recorded no epic at all.
   const epicBeadId = view.epicBeadId ?? target;
   try {
     await beads.pull(project.repoPath).catch(() => {});

@@ -128,6 +128,20 @@ function seedJob(id: string, status: string): void {
     .run();
 }
 
+/** An ACTIVE execute-epic job for the escalation's epic — what a local resume leaves behind. */
+function seedExecuteEpicJob(status: string): void {
+  getDb()
+    .insert(schema.jobs)
+    .values({
+      id: "j-epic",
+      type: "execute-epic",
+      projectId: "p1",
+      status,
+      payloadJson: JSON.stringify({ projectId: "p1", epicBeadId: "anton-e1" }),
+    })
+    .run();
+}
+
 /** The run a `parked-run` escalation was raised against — real, because abandon settles it. */
 function seedParkedRun(id: string, status = "parked"): void {
   getDb()
@@ -472,6 +486,51 @@ describe("actOnEscalation — the work was picked back up elsewhere", () => {
     const escalation = await open();
 
     expect(await actOnEscalation(project, escalation.id, "abandon")).toMatchObject({ ok: true });
+  });
+
+  // The same run resuming HERE is the case the lease can't see: execute-epic republishes it under
+  // the stalled run's own id, so it reads as our crash remnant above while the work is live again.
+  it("refuses an abandon after the same run resumed on this machine", async () => {
+    beadsShow.mockResolvedValue(lease(HOUR, "r-1")); // the resumed run's own lease — not foreign
+    seedExecuteEpicJob("running");
+    const escalation = await open();
+
+    expect(await actOnEscalation(project, escalation.id, "abandon")).toEqual({
+      ok: false,
+      reason: "contested",
+    });
+    // The cancel inside abandonTicket would have killed the resumed job and closed the bead under it.
+    expect(abandonTicket).not.toHaveBeenCalled();
+    expect(rowOf(escalation.id)?.status).toBe("open");
+  });
+
+  it("refuses the abandon on a merely QUEUED resume too — the job is about to be leased", async () => {
+    seedExecuteEpicJob("queued");
+    const escalation = await open();
+
+    expect(await actOnEscalation(project, escalation.id, "abandon")).toEqual({
+      ok: false,
+      reason: "contested",
+    });
+  });
+
+  it("still abandons when the epic's job has since parked again — that is stopped work", async () => {
+    seedExecuteEpicJob("parked");
+    const escalation = await open();
+
+    expect(await actOnEscalation(project, escalation.id, "abandon")).toMatchObject({ ok: true });
+    expect(abandonTicket).toHaveBeenCalled();
+  });
+
+  it("lets a resume through against a live local job — resumeEpic absorbs it as a no-op", async () => {
+    resumeStalledEpic.mockResolvedValue("already-active");
+    seedExecuteEpicJob("running");
+    const escalation = await open();
+
+    expect(await actOnEscalation(project, escalation.id, "resume")).toMatchObject({
+      ok: true,
+      detail: "already-active",
+    });
   });
 
   it("never gates a job-only stall or a dismiss — neither touches the shared board", async () => {
