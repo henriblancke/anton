@@ -33,6 +33,17 @@ import {
   type ReviewGateResult,
 } from "./review-gate";
 
+/** A one-commit `main` repo: the least a gate round needs to read its (absent) rules from. */
+function initRepo(path: string): void {
+  const g = (args: string[]) => execFileSync("git", ["-C", path, ...args], { stdio: "ignore" });
+  execFileSync("git", ["init", "-q", "-b", "main", path], { stdio: "ignore" });
+  g(["config", "user.email", "t@example.com"]);
+  g(["config", "user.name", "anton-test"]);
+  writeFileSync(join(path, "README.md"), "# gate\n");
+  g(["add", "-A"]);
+  g(["commit", "-q", "-m", "init"]);
+}
+
 /** Ticks a second per read, so `sessions.startedAt` orders the gate's sessions deterministically. */
 class TickingClock implements Clock {
   constructor(private t: number) {}
@@ -105,6 +116,10 @@ const ctx: ReviewGateContext = {
 
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "anton-review-gate-"));
+  // A real one-commit repo even though claude, the diff and the worktree state are all faked: the
+  // gate reads its trusted inputs (the rulebook) at the base commit and FAILS on a read it cannot
+  // make, so a bare temp dir would fail every case with "not a git repository".
+  initRepo(dir);
   priorSessionsRoot = process.env.ANTON_SESSIONS_ROOT;
   process.env.ANTON_SESSIONS_ROOT = join(dir, "sessions");
   tdb = makeTestDb();
@@ -993,5 +1008,34 @@ describe("runReviewGate — the base is pinned to the fork point", () => {
     // And the patch comes from that same commit: the base's own work is not this run's.
     expect(calls[0].prompt).toContain("src/a.ts");
     expect(calls[0].prompt).not.toContain("drop the instruction file");
+  });
+
+  it("fails the round when a rulebook file cannot be READ, instead of reviewing without it", async () => {
+    // A read that FAILS is not a project with no rules. The reviewer is told the inlined rules are
+    // the only ones grading the run, so a corrupt object (or a timeout) that reported itself as
+    // "absent" would grade the diff against a rulebook nobody ever read — and pass it.
+    const blob = execFileSync("git", ["-C", repo, "rev-parse", "main:.product/principles.md"], {
+      encoding: "utf8",
+    }).trim();
+    rmSync(join(repo, ".git/objects", blob.slice(0, 2), blob.slice(2)), { force: true });
+
+    const { run, calls } = fakeClaude([report(9, [])]);
+    await expect(
+      runReviewGate({
+        db: tdb.db,
+        clock,
+        ctx,
+        projectId,
+        target,
+        tickets: [ticket],
+        settings: {},
+        worktreePath: repo,
+        baseBranch: "main",
+        deps: { runClaude: run },
+      }),
+    ).rejects.toThrow();
+
+    // And no reviewer was dispatched on the half-read rulebook.
+    expect(calls).toEqual([]);
   });
 });

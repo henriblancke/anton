@@ -211,13 +211,13 @@ async function loadTrustedAgentPrompt(
  * reviewer is instructed to judge the diff's adherence to this file, so a diff that rewrites it would
  * be grading itself. A run that legitimately updates its principles is reviewed against the old ones
  * — the new rules apply from the next run, once they are on the base branch.
+ *
+ * A failed READ is not "the base has none": `readFileAtRev` only answers undefined when git looked
+ * and the file is absent, and everything else propagates — the reviewer is told the inlined rules are
+ * the only ones grading the run, so an unread rulebook must park the run, not silently empty it.
  */
 async function readPrinciples(projectDir: string, baseRev: string): Promise<string | undefined> {
-  try {
-    return (await readFileAtRev(projectDir, baseRev, PRINCIPLES_PATH))?.trim() || undefined;
-  } catch {
-    return undefined;
-  }
+  return (await readFileAtRev(projectDir, baseRev, PRINCIPLES_PATH))?.trim() || undefined;
 }
 
 /**
@@ -272,9 +272,12 @@ async function readInstructions(
   const paths = dirs
     .flatMap((dir) => INSTRUCTION_FILENAMES.map((name) => (dir ? `${dir}/${name}` : name)))
     .filter((path) => present.has(path));
+  // No catch: `present` already says the blob is there, so a failed read is a rule file that exists
+  // and could not be read — inlining the rest as the whole rulebook is exactly the silent gap the
+  // caveat in `rulesCaveat` promises the reviewer does not exist. Park the run instead.
   const files = await Promise.all(
     paths.map(async (path) => {
-      const text = await readFileAtRev(projectDir, baseRev, path).catch(() => undefined);
+      const text = await readFileAtRev(projectDir, baseRev, path);
       return text?.trim() ? { path, text: text.trim() } : undefined;
     }),
   );

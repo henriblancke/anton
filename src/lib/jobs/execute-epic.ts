@@ -1000,6 +1000,13 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         // advertise work this PR doesn't contain (anton-6xj0).
         body: prBody(target, live, advisoryFindings),
       });
+      // A reused PR whose refresh `gh` refused still shows the previous attempt's body, and the run
+      // completes regardless — so this round's advisories would exist nowhere: the score comment
+      // records their COUNT, never their text. Write them onto the bead before the run finishes, so
+      // the founder still has the actionable detail the stale body is hiding.
+      if (pr.bodyStale) {
+        await safe(() => beads.note(repo, epicBeadId, stalePrBodyNote(pr, advisoryFindings)));
+      }
       await safe(() => beads.setPrRef(repo, epicBeadId, pr.ref));
       if (!standaloneRun) {
         await safe(() => beads.tag(repo, epicBeadId, [LABELS.stage("in-review")]));
@@ -1582,6 +1589,26 @@ function violationParkHead(review: ReviewGateResult, rounds: number): string {
 /** Findings as a markdown list — shared by the park note and the PR body. */
 function findingLines(findings: ReviewFinding[]): string[] {
   return findings.map((f) => `- ${f.location} — ${f.note}`);
+}
+
+/**
+ * The salvage note for a reused PR whose body could not be refreshed: this run's advisory findings,
+ * plus the warning that the PR text belongs to an earlier attempt.
+ *
+ * The PR body is the ONLY place the findings' text is written — the score comments carry counts, a
+ * verdict and a rationale, not the notes — so without this a `gh pr edit` that failed on a permission
+ * or a network blip silently discards every actionable detail this review produced, while the founder
+ * reads a stale finding list at the merge gate as if it were current.
+ */
+function stalePrBodyNote(pr: PullRequest, advisory: ReviewFinding[]): string {
+  return [
+    `anton: this run reused the PR at ${pr.url} but could NOT rewrite its title/body — what GitHub ` +
+      `shows is an earlier attempt's text, not this run's. Read the findings below instead of the PR body.`,
+    ``,
+    ...(advisory.length > 0
+      ? [`Advisory findings from this run's self-review (${advisory.length}):`, ...findingLines(advisory)]
+      : [`This run's self-review reported no advisory findings.`]),
+  ].join("\n");
 }
 
 /** Fold the parsed self-report into a zero-diff block reason, when one was emitted (anton-j5i8). */

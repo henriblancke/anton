@@ -292,6 +292,50 @@ process.exit(0);`),
     }
   });
 
+  it("writes the advisories onto the bead when a REUSED PR's body could not be refreshed", async () => {
+    // A resumed run reuses the PR its earlier attempt opened and rewrites the body with this round's
+    // findings. When `gh pr edit` refuses (token permissions, a blip) the run still completes — and
+    // the score comment records only the advisory COUNT, so without this fallback the findings' text
+    // exists nowhere the founder can read at the merge gate.
+    await setReviewEnabled(true);
+    script({
+      score: 8,
+      rationale: "solid, one nit",
+      findings: [{ severity: "advisory", location: "src/a.ts:10", note: "extract the duplicated mapper" }],
+    });
+    const targetId = await approvedTarget("Stale body run");
+
+    const okGh = process.env.ANTON_GH_BIN!;
+    // Reports an open PR for the branch (so the reuse path runs) and refuses every `pr edit`.
+    process.env.ANTON_GH_BIN = writeBin(
+      binDir,
+      "gh-stale-body",
+      `const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='view'){
+  console.log(JSON.stringify({url:'https://github.com/acme/repo/pull/42',number:42,state:'OPEN',isDraft:false}));
+  process.exit(0);
+}
+if(a[0]==='pr'&&a[1]==='edit'){process.stderr.write('HTTP 403\\n');process.exit(1);}
+if(a[0]==='pr'&&a[1]==='create'){process.stderr.write('should have reused the open PR\\n');process.exit(1);}
+process.exit(0);`,
+    );
+
+    const runner = makeEpicRunner(ctx);
+    let jobId: string;
+    try {
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
+      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+
+      const notes = (await beads.show(repo, targetId)).notes ?? "";
+      expect(notes).toContain("could NOT rewrite its title/body");
+      expect(notes).toContain("extract the duplicated mapper");
+      expect(beads.getPrRef(await beads.show(repo, targetId))).toBe("gh-42");
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+      if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  });
+
   it("parks the run with the findings on the bead when BLOCKING findings survive the round cap", async () => {
     // A reviewer that keeps reporting the same blocking finding must hand the run to the founder,
     // not open a PR on work its own review refused to pass. `gh pr create` booms so a wrongful

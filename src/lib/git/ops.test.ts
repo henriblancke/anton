@@ -98,6 +98,7 @@ if(a[0]==='pr'&&a[1]==='create'){
 }
 if(a[0]==='pr'&&a[1]==='edit'){
   const sel=a[2];const s=read();
+  if(s.__editFails){process.stderr.write('HTTP 403: Resource not accessible by integration\\n');process.exit(1);}
   const key=branches(s).find(k=>k===sel||String(s[k].number)===sel||s[k].url===sel);
   if(!key){process.stderr.write('no pull requests found\\n');process.exit(1);}
   s[key].title=get('--title');s[key].body=get('--body');write(s);process.exit(0);
@@ -180,6 +181,24 @@ process.exit(0);
       title: "Epic 1 (retry)",
       body: "round 2 · advisory: unguarded route",
     });
+  });
+
+  it("reports a refused refresh as bodyStale rather than passing the PR off as current", async () => {
+    // `gh pr edit` can fail on a token's permissions or a network blip. The body is the only place
+    // this run's advisory findings are written, so the caller has to be TOLD they never landed —
+    // silently returning the reused PR loses them between the review and the merge gate.
+    const opts = { repoPath: repo, branch: "anton/epic-1", base: "main", title: "Epic 1", body: "round 1" };
+    const opened = await openPullRequest(opts);
+    expect(opened.bodyStale).toBeFalsy();
+
+    const state = JSON.parse(readFileSync(ghState, "utf8"));
+    writeFileSync(ghState, JSON.stringify({ ...state, __editFails: true }));
+
+    const reused = await openPullRequest({ ...opts, body: "round 2 · advisory: unguarded route" });
+
+    expect(reused.number).toBe(42);
+    expect(reused.bodyStale).toBe(true);
+    expect(JSON.parse(readFileSync(ghState, "utf8"))["anton/epic-1"].body).toBe("round 1");
   });
 
   it("rewrites the body of a drafted orphan as it readies it", async () => {
@@ -739,8 +758,10 @@ suite("listDirBlobsAtRev (real git)", () => {
     expect(paths).toContain("CLAUDE.md");
   });
 
-  it("yields nothing for a rev that does not resolve, rather than throwing", async () => {
-    expect(await listDirBlobsAtRev(repo, "origin/nope", [""])).toEqual([]);
+  it("throws on a rev that does not resolve, rather than reporting an empty tree", async () => {
+    // An empty list is the review gate's "no scope here holds an instruction file". A read that
+    // FAILED has established no such thing, and passing it off as one drops the whole rulebook.
+    await expect(listDirBlobsAtRev(repo, "origin/nope", [""])).rejects.toThrow();
   });
 });
 
@@ -809,10 +830,27 @@ suite("readFileAtRev (real git)", () => {
     expect(await readFileAtRev(repo, "main", "loop-a.md")).toBeUndefined();
   });
 
-  it("returns undefined for a missing path, a directory, and a rev that does not resolve", async () => {
+  it("returns undefined for a missing path and for a directory", async () => {
     expect(await readFileAtRev(repo, "main", "nope.md")).toBeUndefined();
     expect(await readFileAtRev(repo, "main", "docs")).toBeUndefined();
-    expect(await readFileAtRev(repo, "origin/nope", "AGENTS.md")).toBeUndefined();
+  });
+
+  it("throws on a rev that does not resolve, instead of reporting the file absent", async () => {
+    // Undefined is the reviewer's "this project states no rules", so it may only ever mean git looked
+    // and found nothing. A base commit it cannot resolve is a failed read — park the run.
+    await expect(readFileAtRev(repo, "origin/nope", "AGENTS.md")).rejects.toThrow();
+  });
+
+  it("throws when a file the tree lists cannot be READ", async () => {
+    // The failure a swallowed error hides: `ls-tree` reads the tree and never touches the blob, so a
+    // corrupt/missing object is reported only by `git show`. Returning undefined there would inline
+    // an empty rulebook and grade the run against rules nobody read.
+    const blob = execFileSync("git", ["-C", repo, "rev-parse", "main:AGENTS.md"], {
+      encoding: "utf8",
+    }).trim();
+    rmSync(join(repo, ".git/objects", blob.slice(0, 2), blob.slice(2)), { force: true });
+
+    await expect(readFileAtRev(repo, "main", "AGENTS.md")).rejects.toThrow();
   });
 });
 

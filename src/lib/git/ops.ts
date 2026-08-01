@@ -110,8 +110,14 @@ const SYMLINK_MODE = "120000";
 const MAX_SYMLINK_HOPS = 4;
 
 /**
- * Read one file as of `rev` (trimmed), or undefined when it doesn't exist there — or when `rev`
- * itself doesn't resolve, which is the same answer for the callers: nothing trustworthy to read.
+ * Read one file as of `rev` (trimmed), or undefined when git reports it is not a file there.
+ *
+ * FAILS CLOSED: undefined means "git looked and it is absent", never "the read failed". A timeout, an
+ * unreadable object, an unresolvable `rev` — anything but a successful absent answer — THROWS. The
+ * callers are the review gate's trusted inputs (its reasoning contract and the rulebook it grades
+ * against), and the reviewer is told the inlined rules are the only ones that grade the run: a
+ * failure quietly returned as absence would swap the reviewer or drop binding rules, and pass work
+ * that was never measured against them. Failing here parks the run for a human instead.
  *
  * For files the working tree must not be trusted to supply. `git show` serves the committed blob, so
  * a run that added or rewrote the path on its own branch cannot change what comes back.
@@ -137,10 +143,12 @@ async function readBlobAtRev(
 ): Promise<string | undefined> {
   const mode = await blobModeAtRev(worktreePath, rev, path);
   if (mode === undefined) return undefined;
-  // `--` disambiguates a path that also parses as a revision; a missing file and a bad rev both exit
-  // non-zero, and neither is an error here.
-  const text = await git(worktreePath, ["show", `${rev}:${path}`, "--"]).catch(() => undefined);
-  if (mode !== SYMLINK_MODE || text === undefined) return text;
+  // `--` disambiguates a path that also parses as a revision. Deliberately uncaught: the tree above
+  // just reported a blob at this path, so a `show` that fails is a failure to READ a file that is
+  // there — a corrupt object, a timeout — and swallowing it would hand the caller the one answer it
+  // must never infer, "this file does not exist".
+  const text = await git(worktreePath, ["show", `${rev}:${path}`, "--"]);
+  if (mode !== SYMLINK_MODE) return text;
 
   // Out-of-tree and runaway links resolve to nothing rather than to their pathname: there is no
   // content at `rev` to trust, and a caller that drops the path is right where one that inlines
@@ -151,9 +159,14 @@ async function readBlobAtRev(
 }
 
 /**
- * The tree mode of `path` at `rev`, or undefined when it is not a file there (missing, a directory,
- * or a rev that doesn't resolve). The mode is the only thing that tells a regular file from a
- * symlink — both are blobs, and `git show` reads them identically.
+ * The tree mode of `path` at `rev`, or undefined when it is not a file there (missing, or a
+ * directory). The mode is the only thing that tells a regular file from a symlink — both are blobs,
+ * and `git show` reads them identically.
+ *
+ * An absent path is not an error to git: `ls-tree` exits 0 with EMPTY output for a pathspec that
+ * matches nothing, which is what "not there" looks like here. So a rejection is something else
+ * entirely — a rev that doesn't resolve, an unreadable object, a killed process — and it propagates
+ * rather than being reported as absence (see {@link readFileAtRev}).
  */
 async function blobModeAtRev(
   worktreePath: string,
@@ -161,8 +174,8 @@ async function blobModeAtRev(
   path: string,
 ): Promise<string | undefined> {
   // -z: git quotes non-ASCII paths otherwise, and a quoted entry no longer splits on a literal tab.
-  const out = await git(worktreePath, ["ls-tree", "-z", rev, "--", path]).catch(() => undefined);
-  const entry = out?.split("\0")[0];
+  const out = await git(worktreePath, ["ls-tree", "-z", rev, "--", path]);
+  const entry = out.split("\0")[0];
   const tab = entry?.indexOf("\t") ?? -1;
   if (!entry || tab < 0) return undefined;
   const [mode, type] = entry.slice(0, tab).split(" ");
@@ -207,8 +220,11 @@ const LS_TREE_BATCH = 500;
  * like the file being looked for is skipped (only blobs are returned), so a caller can treat every
  * path it gets back as readable content.
  *
- * Best-effort: a rev that doesn't resolve yields nothing rather than throwing — the same answer as
- * a tree with none of the files in it, which is what the callers act on.
+ * FAILS CLOSED, like {@link readFileAtRev}: an empty result means git read the trees and found no
+ * files, never that the read failed. `ls-tree` exits 0 with empty output for a directory absent at
+ * `rev`, so anything that rejects — an unresolvable rev, an unreadable object, a killed process —
+ * propagates. Swallowing it would tell the review gate this project states no rules, which is the
+ * one conclusion it must never reach by accident.
  */
 export async function listDirBlobsAtRev(
   worktreePath: string,
@@ -221,7 +237,7 @@ export async function listDirBlobsAtRev(
 
   // -z: git quotes non-ASCII paths otherwise, and a quoted path matches nothing the caller asked for.
   const reads = await Promise.all(
-    batches.map((batch) => git(worktreePath, ["ls-tree", "-z", rev, "--", ...batch]).catch(() => "")),
+    batches.map((batch) => git(worktreePath, ["ls-tree", "-z", rev, "--", ...batch])),
   );
   return reads.flatMap((text) =>
     text
@@ -617,6 +633,13 @@ export interface PullRequest {
   number?: number;
   /** Whether GitHub reports the PR as a draft — see {@link markPullRequestDraft}. */
   isDraft?: boolean;
+  /**
+   * Set when a REUSED PR still shows an earlier attempt's title/body because the refresh failed
+   * (see {@link openPullRequest}). The body is where this run's advisory findings meet the founder,
+   * so a caller holding them must put them somewhere that outlives the run rather than assume the PR
+   * carries them.
+   */
+  bodyStale?: boolean;
 }
 
 function prFromUrl(url: string): PullRequest {
@@ -779,7 +802,10 @@ export async function pullRequestState(
  * the branch is still pushed (to carry any new commits) and the existing PR is reused instead of
  * calling `gh pr create`, which would error on a duplicate. A reused PR has its title and body
  * rewritten to this attempt's (see {@link updatePullRequest}) — the review that just ran is the one
- * the founder must read. A reused PR is also taken OUT of draft:
+ * the founder must read. A refresh `gh` refuses is REPORTED (`bodyStale`) rather than warned about
+ * and dropped: the body is the only place the run's advisory findings are written, so the caller
+ * holding them has to persist them somewhere that survives the run. A reused PR is also taken OUT of
+ * draft:
  * reaching this step means the run's self-review passed, so a PR an earlier parked attempt drafted
  * (see {@link markPullRequestDraft}) must become mergeable again or the epic finishes un-mergeable.
  */
@@ -808,10 +834,10 @@ export async function openPullRequest(opts: {
     if (!refreshed) {
       console.warn(
         `[git] could not refresh the title/body of ${existing.url}; it still shows an earlier ` +
-          `attempt's text, so this run's advisories are on the bead only`,
+          `attempt's text — reported as bodyStale so the caller can preserve this run's findings`,
       );
     }
-    if (!existing.isDraft) return existing;
+    if (!existing.isDraft) return { ...existing, bodyStale: !refreshed };
     // Report what actually happened: a flip gh refused leaves a draft PR the founder must ready by
     // hand, and the work is on the branch either way — not worth failing the run over. Logged as well
     // as returned, because the run goes on to finish `done` with the bead `in-review`: without a line
@@ -823,7 +849,7 @@ export async function openPullRequest(opts: {
           `the PR stays un-mergeable until it is readied by hand`,
       );
     }
-    return { ...existing, isDraft: !ready };
+    return { ...existing, isDraft: !ready, bodyStale: !refreshed };
   }
 
   const gh = process.env[GH_BIN_ENV] ?? "gh";
