@@ -439,8 +439,56 @@ suite("diffAgainstBase (real git)", () => {
 
     const diff = await diffAgainstBase(repo, "main", { maxPatchChars: 200, maxDeletionChars: 60 });
 
-    expect(diff.deletions).toContain("deletions truncated at 60 chars");
+    expect(diff.deletions).toContain("deletion of README.md truncated at 60 chars");
     expect(diff.deletions!.length).toBeLessThan(160);
+  });
+
+  it("spends the deletion budget per file, so one big removal cannot hide the rest", async () => {
+    // A single globally bounded stream is exhausted by whichever deletion git emits first — every
+    // route or guard removed after it would then reach the reviewer as a filename, and neither the
+    // worktree nor (without `git`) the base can show it.
+    writeFileSync(join(repo, "AAA-huge.ts"), "// filler line\n".repeat(2_000));
+    writeFileSync(join(repo, "zzz-guard.ts"), "export const requireAuth = () => true;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "seed"]);
+    g(["checkout", "-q", "main"]);
+    g(["merge", "-q", "--ff-only", "anton/epic-1"]);
+    g(["checkout", "-q", "anton/epic-1"]);
+
+    writeFileSync(join(repo, "big.ts"), "// filler line\n".repeat(500));
+    rmSync(join(repo, "AAA-huge.ts"));
+    rmSync(join(repo, "zzz-guard.ts"));
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "t1: drop both"]);
+
+    const diff = await diffAgainstBase(repo, "main", { maxPatchChars: 200, maxDeletionChars: 4_000 });
+
+    expect(diff.deletions).toContain("deletion of AAA-huge.ts truncated at 2000 chars");
+    // The guard sorts last and is far smaller than the budget's first slice — a global stream would
+    // have spent it all on AAA-huge.ts before reaching it.
+    expect(diff.deletions).toContain("-export const requireAuth = () => true;");
+  });
+
+  it("names the deleted files it had no budget left to quote", async () => {
+    // Honest under-coverage: below one usable slice per file the reviewer is told which removals it
+    // is NOT seeing, rather than reading a partial list as the whole set.
+    for (let i = 0; i < 12; i++) writeFileSync(join(repo, `f${i}.ts`), "// filler line\n".repeat(200));
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "seed"]);
+    g(["checkout", "-q", "main"]);
+    g(["merge", "-q", "--ff-only", "anton/epic-1"]);
+    g(["checkout", "-q", "anton/epic-1"]);
+
+    for (let i = 0; i < 12; i++) rmSync(join(repo, `f${i}.ts`));
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "t1: drop them all"]);
+
+    const diff = await diffAgainstBase(repo, "main", { maxPatchChars: 200, maxDeletionChars: 2_000 });
+
+    expect(diff.deletions).toContain("further deleted file(s) not shown");
+    expect(diff.deletions).toContain("f11.ts");
+    // The bound still holds: the quoted slices stay within the budget.
+    expect(diff.deletions!.length).toBeLessThan(2_000 + 500);
   });
 
   it("leaves the deletions out entirely when the patch fits", async () => {

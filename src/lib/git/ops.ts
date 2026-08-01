@@ -376,7 +376,9 @@ export interface BranchDiff {
   /**
    * The DELETIONS-only patch, collected separately and only when `patch` was cut short: what the
    * truncated patch omits is recoverable from the worktree except for a file the branch removed,
-   * which is gone from it. Absent when nothing was deleted (or nothing was truncated).
+   * which is gone from it. Its budget is spent per deleted file rather than as one stream, so the
+   * first large removal cannot crowd out the ones after it. Absent when nothing was deleted (or
+   * nothing was truncated).
    */
   deletions?: string;
 }
@@ -389,10 +391,10 @@ export interface BranchDiff {
 export const DEFAULT_DIFF_PATCH_CHARS = 200_000;
 
 /**
- * Cap on the deletions-only patch {@link diffAgainstBase} adds when the main patch is truncated.
- * Deliberately a fraction of it: this is a rescue of content the reviewer has no other way to see,
- * not a second copy of the diff, and a run that deletes a vendored tree must not blow the budget
- * the surviving code needs.
+ * Cap on the deletions-only patch {@link diffAgainstBase} adds when the main patch is truncated,
+ * shared out across the deleted files. Deliberately a fraction of the main cap: this is a rescue of
+ * content the reviewer has no other way to see, not a second copy of the diff, and a run that
+ * deletes a vendored tree must not blow the budget the surviving code needs.
  */
 export const DEFAULT_DELETION_PATCH_CHARS = 40_000;
 
@@ -419,7 +421,8 @@ export const DEFAULT_DELETION_PATCH_CHARS = 40_000;
  * Truncation is survivable because the reviewer can open what the cut omits — with one exception: a
  * file the branch DELETED is not in the worktree to open, and the reviewer is denied `git` (see
  * `REVIEW_DENIED_TOOLS`), so a removed route or validation past the cut would be reviewed by nobody.
- * So a truncated patch is followed by a second, separately bounded pass over the deletions alone.
+ * So a truncated patch is followed by a second pass over the deletions alone, bounded per deleted
+ * file so that every removal is represented (see {@link deletionPatch}).
  */
 export async function diffAgainstBase(
   worktreePath: string,
@@ -447,20 +450,62 @@ export async function diffAgainstBase(
 }
 
 /**
+ * Smallest slice of the deletion budget worth spending on one file: under this a "patch" is a diff
+ * header and a line or two — a filename dressed up as content. Once the budget can no longer buy
+ * even this much, the files left are NAMED instead, so the reviewer sees what it was not shown
+ * rather than reading a partial list as the whole set.
+ */
+const MIN_DELETION_SLICE_CHARS = 500;
+
+/**
  * The branch's deletions as their own bounded patch, or undefined when it deleted nothing.
+ *
+ * The budget is allocated PER DELETED FILE, not spent as one stream: a single stream is exhausted by
+ * whichever removal git emits first, leaving every route, guard, or validation deleted after it
+ * represented by a filename alone — unreviewable, since those files are neither in the worktree nor
+ * reachable without `git` (see `REVIEW_DENIED_TOOLS`). Each file draws an even share of what is left,
+ * so a small removal hands its surplus to the ones behind it and one huge removal costs only its own
+ * slice.
  *
  * Best-effort: a failure here must not fail a review that already has the (truncated) patch it was
  * mainly after — the reviewer is told what it is missing either way.
  */
 async function deletionPatch(worktreePath: string, from: string, max: number): Promise<string | undefined> {
   try {
-    const { text, truncated } = await gitBounded(
-      worktreePath,
-      ["diff", "--diff-filter=D", from, "HEAD"],
-      max,
-    );
-    if (!text.trim()) return undefined;
-    return truncated ? `${text}\n… [deletions truncated at ${max} chars]` : text.trim();
+    const names = await git(worktreePath, ["diff", "--name-only", "--diff-filter=D", from, "HEAD"]);
+    const deleted = names
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean);
+    if (deleted.length === 0) return undefined;
+
+    const parts: string[] = [];
+    let remaining = max;
+    let i = 0;
+    for (; i < deleted.length; i++) {
+      const share = Math.floor(remaining / (deleted.length - i));
+      // The first file is always quoted, however small the budget: a caller that asks for less than
+      // one slice wants the deletions bounded, not withheld.
+      if (i > 0 && share < MIN_DELETION_SLICE_CHARS) break;
+      const path = deleted[i]!;
+      const { text, truncated } = await gitBounded(
+        worktreePath,
+        ["diff", "--diff-filter=D", from, "HEAD", "--", path],
+        share,
+      );
+      if (!text.trim()) continue;
+      remaining -= text.length;
+      parts.push(truncated ? `${text}\n… [deletion of ${path} truncated at ${share} chars]` : text.trim());
+    }
+
+    const unshown = deleted.slice(i);
+    if (unshown.length > 0) {
+      parts.push(
+        `… [${unshown.length} further deleted file(s) not shown — deletion budget of ${max} chars` +
+          ` exhausted: ${unshown.join(", ")}]`,
+      );
+    }
+    return parts.length > 0 ? parts.join("\n") : undefined;
   } catch {
     return undefined;
   }
