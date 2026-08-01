@@ -62,6 +62,11 @@ function secDate(ms: number): Date {
 
 let t: TestDb;
 
+/** An epic on the board as the pass expects to find it: open, with no run-lease label. */
+function openEpic(id: string): Bead {
+  return { id, title: id, status: "open", issue_type: "epic", labels: [] };
+}
+
 /** The live PR the pass re-reads before escalating a `stale-pr` finding. Idle by default. */
 const prActivityMock =
   vi.fn<(repo: string, number: number, signal?: AbortSignal) => Promise<PrActivity>>();
@@ -83,7 +88,10 @@ beforeEach(() => {
     .insert(schema.projects)
     .values({ id: "p1", slug: "p1", name: "p1", repoPath: REPO })
     .run();
-  listMock.mockResolvedValue([]);
+  // Every epic these tests reference, open and unleased. The pass pulls the board with `--status
+  // all`, so a bead missing from it reads as DELETED and settles the finding — the default board has
+  // to carry the epics under test, or nothing would ever be resumed or escalated.
+  listMock.mockResolvedValue(["e-1", "e-2", "e-3", "e-9"].map(openEpic));
   noteMock.mockResolvedValue(undefined);
   syncMock.mockResolvedValue(undefined);
   pullMock.mockResolvedValue(undefined);
@@ -513,6 +521,20 @@ describe("non-resumable parks produce exactly one escalation and no enqueue", ()
     expect(escalationRows()).toEqual([]);
     expect(jobRows()).toEqual([]);
     expect(noteMock).not.toHaveBeenCalled();
+  });
+
+  it("holds a park whose epic was DELETED — a deletion must not come back as a poison job", async () => {
+    // The finding outlives the bead: the run row stays parked, and with the quota window long
+    // reopened every other guard says resume. Enqueuing here hands execute-epic an id it can only
+    // fail on (`bead ... not found`), which parks the fresh job as poison and escalates it — an
+    // intentional deletion turned into founder-facing noise, every single hour.
+    seedParkedRun("r-1", "e-1", "usage-limit");
+    listMock.mockResolvedValue([]);
+    await seedReport(parkedRunFinding("r-1", "e-1", "parked 4h ago: usage-limit"));
+
+    expect(await sweep()).toMatchObject({ findings: 1, resumed: 0, escalated: 0, held: 1 });
+    expect(jobRows()).toEqual([]);
+    expect(escalationRows()).toEqual([]);
   });
 
   it("escalates an agent failure once across two sweeps, and never enqueues", async () => {

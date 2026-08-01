@@ -185,6 +185,27 @@ function leaseStandDown(
 }
 
 /**
+ * Why this epic has already settled off-board, or undefined while it is still live work. Two shapes
+ * of settled, one meaning: a CLOSED bead ended deliberately, and so did a DELETED one — the pass
+ * lists every status, so a bead missing from a successfully pulled board was removed, not filtered.
+ *
+ * Neither disposition left makes sense on one: a resume hands execute-epic a bead it can only park
+ * back on with `bead ... not found`, turning an intentional deletion into a poison job, and an
+ * escalation offers an "abandon" that now throws on the gone bead — settling the escalation without
+ * settling anything, every sweep, forever.
+ *
+ * Only trusted on a FRESH board, the same posture as {@link leaseStandDown}: read off a stale local
+ * mirror, "closed" and "absent" are lag rather than evidence.
+ */
+function epicSettled(ctx: UnstickContext, epicBeadId: string): string | undefined {
+  if (!ctx.boardFresh) return undefined;
+  const bead = ctx.board.get(epicBeadId);
+  if (!bead) return "the epic is gone from the board";
+  if (bead.status === "closed") return "the epic has since closed";
+  return undefined;
+}
+
+/**
  * When this job's quota window reopens. The runner records a usage-limit backoff on the JOB — a
  * `usage-limit: resumes at <ISO>` lastError and a `runAt` pushed to the reset — never on the run
  * row, whose bare `usage-limit` error can't say whether the quota is back. The lastError is read
@@ -221,14 +242,13 @@ export function classifyFinding(
       // finished since the sweep, and acting on the stale claim would be acting on a ghost.
       if (!run) return hold("the run is no longer parked");
       if (ownedByLiveJob(run.epicBeadId)) return hold("a live job already owns this run");
-      // A closed epic has settled its own way and its parked run row simply never caught up — an
-      // abandon raised from an `exhausted-job` escalation closes the bead but has no run id to
-      // settle. Escalating that again offers an "abandon" that now fails on the closed bead, so the
-      // finding would return every sweep forever. Only trusted on a FRESH board, the same posture as
-      // {@link leaseStandDown}: "closed" read off a stale local mirror is not evidence of anything.
-      if (ctx.boardFresh && ctx.board.get(run.epicBeadId)?.status === "closed") {
-        return hold("the epic has since closed");
-      }
+      // A settled epic's parked run row simply never caught up — an abandon raised from an
+      // `exhausted-job` escalation closes the bead but has no run id to settle, and a deletion
+      // settles nothing at all. Either way the run has no epic left to act on (see
+      // {@link epicSettled}), and this is the only check standing between a deleted epic and a
+      // resume that parks straight back on `bead ... not found`.
+      const settled = epicSettled(ctx, run.epicBeadId);
+      if (settled) return hold(settled);
       if (run.error?.trim() !== USAGE_LIMIT_PARK) {
         return escalate(finding.reason);
       }

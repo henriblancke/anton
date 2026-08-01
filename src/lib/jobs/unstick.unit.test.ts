@@ -67,7 +67,9 @@ function ctx(o: Partial<UnstickContext> = {}): UnstickContext {
     nowMs: NOW,
     activeEpicKeys: new Set<string>(),
     parkedRuns: new Map([["r-1", run()]]),
-    board: new Map<string, Bead>(),
+    // The epic under test, present and open. A board this pass pulled lists EVERY status, so an
+    // empty one would mean "e-1 was deleted" — the default has to carry the bead the findings name.
+    board: new Map<string, Bead>([["e-1", bead("e-1")]]),
     boardFresh: true,
     deadLeaseGraceMs: GRACE,
     usageWindowEndsAt: () => undefined,
@@ -130,6 +132,19 @@ describe("classifyFinding — parked runs", () => {
     );
     expect(verdict.disposition).toBe("hold");
     expect(verdict.why).toContain("closed");
+  });
+
+  it("HOLDS a park whose epic was DELETED — a deletion is settled, not a stall to resume", () => {
+    // The nastiest shape: the window has reopened, nothing holds a lease, so every other guard says
+    // resume — and execute-epic then parks the fresh run on `bead ... not found`, turning an
+    // intentional deletion into a poison job and an escalation. A pulled board lists every status,
+    // so the bead's absence IS the deletion.
+    const verdict = classifyFinding(
+      finding(),
+      ctx({ usageWindowEndsAt: () => NOW - HOUR, board: new Map() }),
+    );
+    expect(verdict.disposition).toBe("hold");
+    expect(verdict.why).toContain("gone from the board");
   });
 
   it("still escalates a closed-epic park when the board could not be pulled", () => {
@@ -198,7 +213,10 @@ describe("classifyFinding — parked runs", () => {
     // Jobs are keyed by epic; resuming the ticket id would enqueue work for a bead with no job.
     const verdict = classifyFinding(
       finding({ beadId: "t-9" }),
-      ctx({ parkedRuns: new Map([["r-1", run({ ticketBeadId: "t-9", epicBeadId: "e-7" })]]) }),
+      ctx({
+        parkedRuns: new Map([["r-1", run({ ticketBeadId: "t-9", epicBeadId: "e-7" })]]),
+        board: new Map([["e-7", bead("e-7")]]),
+      }),
     );
     expect(verdict.epicBeadId).toBe("e-7");
   });
@@ -229,7 +247,7 @@ describe("classifyFinding — dead leases", () => {
   it("holds a bead that has since closed or vanished from the board", () => {
     expect(classifyFinding(deadLease, withBoard(leased(NOW - HOUR, { status: "closed" })))
       .disposition).toBe("hold");
-    expect(classifyFinding(deadLease, ctx()).disposition).toBe("hold");
+    expect(classifyFinding(deadLease, ctx({ board: new Map() })).disposition).toBe("hold");
   });
 
   it("holds a bead whose lease has since been CLEARED — there is no dead run left to revive", () => {
