@@ -850,7 +850,7 @@ function withCarried(findings: ReviewFinding[], carried: ReviewFinding[]): Revie
  * body — dropping a finding nobody resolved is the failure worth avoiding.
  */
 function findingKey(f: ReviewFinding): string {
-  return `${f.location} ${f.note}`.toLowerCase().replace(/\s+/g, " ");
+  return `${f.location}\0${f.note}`.toLowerCase().replace(/\s+/g, " ");
 }
 
 /** A fingerprint as a human reads it in a park reason: `abc123def456 (on anton/foo)`. */
