@@ -10,6 +10,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  DEFAULT_DIFF_PATCH_CHARS,
   diffAgainstBase,
   openPullRequest,
   pullRequestState,
@@ -371,6 +372,23 @@ suite("diffAgainstBase (real git)", () => {
     expect(diff.patch).toContain("patch truncated at 200 chars");
     // The cap bounds the patch text itself; only the truncation note follows it.
     expect(diff.patch.length).toBeLessThan(300);
+  });
+
+  it("truncates a patch far larger than any exec buffer instead of failing the review", async () => {
+    // A generated lockfile or a vendored source update produces a patch of tens of megabytes.
+    // Collecting it into an exec buffer first throws before any truncation can run — the whole
+    // review then fails on exactly the change truncation exists for. 20 MiB clears the 16 MiB the
+    // module's buffered `git` helper allows.
+    writeFileSync(join(repo, "vendored.txt"), "x".repeat(20 * 1024 * 1024));
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "t1: vendor a blob"]);
+
+    const diff = await diffAgainstBase(repo, "main");
+
+    expect(diff.truncated).toBe(true);
+    expect(diff.files).toEqual(["vendored.txt"]);
+    expect(diff.patch).toContain("patch truncated at 200000 chars");
+    expect(diff.patch.length).toBeLessThan(DEFAULT_DIFF_PATCH_CHARS + 200);
   });
 });
 

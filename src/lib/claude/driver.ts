@@ -60,6 +60,16 @@ export interface RunClaudeOptions {
    */
   disallowedTools?: string[];
   /**
+   * Which settings files the session loads (`--setting-sources`). Omitted → Claude Code's default
+   * of `user,project,local`.
+   *
+   * `project` and `local` are read from the working tree, which for a session judging that tree is
+   * the tree's own configuration: `.claude/settings.json` is source-controlled and can register
+   * hooks, and hooks run shell commands. Restricting a session to `user` leaves it configured only
+   * by the operator's machine.
+   */
+  settingSources?: Array<"user" | "project" | "local">;
+  /**
    * Resume an existing Claude session (`--resume <id>`) instead of starting fresh (anton-juar).
    * Set on a retry after a transient mid-stream death: the run continues with the full in-session
    * conversation, so `prompt` should be a brief continuation, not the whole ticket spec again.
@@ -316,6 +326,9 @@ export async function runClaude(opts: RunClaudeOptions): Promise<ClaudeResult> {
   }
   if (opts.disallowedTools && opts.disallowedTools.length > 0) {
     args.push("--disallowedTools", opts.disallowedTools.join(","));
+  }
+  if (opts.settingSources && opts.settingSources.length > 0) {
+    args.push("--setting-sources", opts.settingSources.join(","));
   }
 
   const runPromise = new Promise<ClaudeResult>((resolve, reject) => {

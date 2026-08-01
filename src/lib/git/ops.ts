@@ -3,7 +3,8 @@
  * worktree, push the branch, and open one PR via `gh`. The `gh` binary is injectable
  * (ANTON_GH_BIN) so tests can point it at a fake. See DESIGN.md §4/§5.
  */
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -17,6 +18,66 @@ async function git(cwd: string, args: string[]): Promise<string> {
     maxBuffer: 16 * 1024 * 1024,
   });
   return stdout.trim();
+}
+
+/**
+ * Run git and keep at most `maxChars` of its stdout, killing it the moment output overflows.
+ *
+ * For commands whose output has no useful upper bound. `git()` collects stdout through execFile's
+ * fixed `maxBuffer` and THROWS on overflow, so a caller that means to truncate never gets the
+ * chance: a generated lockfile or a vendored source update produces a patch past the cap and fails
+ * the command outright. Cutting the stream puts the bound where the memory is actually spent, and
+ * makes truncation the outcome rather than an error.
+ *
+ * The kill is not a failure: once the cap is reached the rest of the output is by definition
+ * discarded, so the non-zero exit it produces is expected and `truncated` is the answer.
+ */
+function gitBounded(
+  cwd: string,
+  args: string[],
+  maxChars: number,
+): Promise<{ text: string; truncated: boolean }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("git", ["-C", cwd, ...args], { timeout: 120_000 });
+    // Decode incrementally so the cap counts characters, not bytes, and a multi-byte sequence split
+    // across two chunks is never mangled.
+    const decoder = new StringDecoder("utf8");
+    let text = "";
+    let stderr = "";
+    let truncated = false;
+    let settled = false;
+    const finish = (act: () => void) => {
+      if (settled) return;
+      settled = true;
+      act();
+    };
+
+    child.stdout?.on("data", (chunk: Buffer) => {
+      if (truncated) return;
+      text += decoder.write(chunk);
+      if (text.length <= maxChars) return;
+      text = text.slice(0, maxChars);
+      truncated = true;
+      child.stdout?.destroy();
+      child.kill("SIGKILL");
+    });
+    // Bounded too: a command failing on every path would otherwise trade one unbounded buffer for
+    // another. 4 KiB is plenty for the message a rejection carries.
+    child.stderr?.on("data", (chunk: Buffer) => {
+      if (stderr.length < 4096) stderr += chunk.toString("utf8");
+    });
+
+    child.on("error", (e) => finish(() => reject(e)));
+    child.on("close", (code) =>
+      finish(() => {
+        if (!truncated && code !== 0) {
+          reject(new Error(`git ${args[0]} failed (exit ${code}): ${stderr.trim()}`));
+          return;
+        }
+        resolve({ text: truncated ? text : text + decoder.end(), truncated });
+      }),
+    );
+  });
 }
 
 /**
@@ -193,6 +254,10 @@ export const DEFAULT_DIFF_PATCH_CHARS = 200_000;
  * Diffs from the MERGE BASE, not from the base tip, so commits that landed on the base after the
  * run branched are never mistaken for the run's own work. When no merge base exists (unrelated
  * histories) it falls back to diffing against `base` directly rather than failing the review.
+ *
+ * The patch is cut at the source (`gitBounded`) rather than after collection: a run that touched a
+ * lockfile or vendored tree can produce a patch of any size, and buffering it whole only to slice it
+ * would fail the review on the exact change truncation exists for.
  */
 export async function diffAgainstBase(
   worktreePath: string,
@@ -206,12 +271,12 @@ export async function diffAgainstBase(
     .map((l) => l.trim())
     .filter(Boolean);
 
-  const full = await git(worktreePath, ["diff", from, "HEAD"]);
   const max = opts.maxPatchChars ?? DEFAULT_DIFF_PATCH_CHARS;
-  if (full.length <= max) return { files, patch: full, truncated: false };
+  const { text, truncated } = await gitBounded(worktreePath, ["diff", from, "HEAD"], max);
+  if (!truncated) return { files, patch: text.trim(), truncated: false };
   return {
     files,
-    patch: `${full.slice(0, max)}\n… [patch truncated at ${max} chars — read the files directly]`,
+    patch: `${text}\n… [patch truncated at ${max} chars — read the files directly]`,
     truncated: true,
   };
 }

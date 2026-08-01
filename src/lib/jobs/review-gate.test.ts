@@ -419,6 +419,18 @@ describe("runReviewGate — sessions", () => {
     // The fixer commits its own work in the normal case; denying it git would break that.
     expect(calls[1].disallowedTools).toBeUndefined();
   });
+
+  it("loads the reviewer from the operator's settings only, never the branch's", async () => {
+    // `.claude/settings.json` is source-controlled, so a diff that adds one would configure the
+    // session judging it — and settings register hooks, which run shell commands.
+    const { result, calls } = gate([report(4, [BLOCKING]), "fixed", report(9, [])]);
+    await result;
+
+    expect(calls[0].settingSources).toEqual(["user"]);
+    expect(calls[2].settingSources).toEqual(["user"]);
+    // The fixer is an implementer: the project's own hooks apply to the code it writes.
+    expect(calls[1].settingSources).toBeUndefined();
+  });
 });
 
 describe("runReviewGate — the run-lease is re-asserted between dispatches", () => {

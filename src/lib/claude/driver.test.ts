@@ -654,6 +654,36 @@ describe("runClaude", () => {
     expect(argv[argv.indexOf("--permission-mode") + 1]).toBe("bypassPermissions");
   });
 
+  it("passes settingSources through as --setting-sources, and omits the flag when unset", async () => {
+    // The review gate's guard against the branch under review configuring (and hooking) the session
+    // that judges it: project/local settings come out of the worktree.
+    const dumpPath = join(dir, "sources-argv-dump.json");
+    const path = join(dir, "sources-argv-claude");
+    writeFileSync(
+      path,
+      [
+        "#!/usr/bin/env node",
+        "const fs = require('node:fs');",
+        `fs.writeFileSync(${JSON.stringify(dumpPath)}, JSON.stringify(process.argv.slice(2)));`,
+        "process.stdout.write(JSON.stringify({ type: 'result', is_error: false, session_id: 'sess-src', result: 'ok' }) + '\\n');",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    chmodSync(path, 0o755);
+    process.env[CLAUDE_BIN_ENV] = path;
+
+    await runClaude({ cwd: dir, prompt: "review the diff", settingSources: ["user"] });
+    let argv = JSON.parse(readFileSync(dumpPath, "utf8")) as string[];
+    expect(argv[argv.indexOf("--setting-sources") + 1]).toBe("user");
+
+    // Every other session keeps Claude Code's own default — the project's hooks are meant to apply
+    // to an implementer.
+    await runClaude({ cwd: dir, prompt: "implement the ticket" });
+    argv = JSON.parse(readFileSync(dumpPath, "utf8")) as string[];
+    expect(argv).not.toContain("--setting-sources");
+  });
+
   it("delivers the task prompt on stdin and the system prompt via --append-system-prompt-file, with neither on argv (anton-14tj)", async () => {
     // The whole point of anton-14tj: no bead/contract text may land on the child's command line, so
     // `ps` during an autonomous run reveals neither. A fake that echoes its stdin and the contents of

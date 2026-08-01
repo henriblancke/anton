@@ -149,6 +149,21 @@ export interface ReviewGateArgs {
  */
 export const REVIEW_DENIED_TOOLS = ["Bash(git:*)"];
 
+/**
+ * Settings sources a review session loads: the operator's `user` settings only.
+ *
+ * `project` (`.claude/settings.json`) and `local` (`.claude/settings.local.json`) are read from the
+ * worktree — the tree under review. Project settings are source-controlled, so a run that adds or
+ * edits them configures the session that judges it, and settings register HOOKS, which run shell
+ * commands: a `Stop` or tool hook could steer the verdict, or reach git indirectly and write a ref
+ * the worktree fingerprint cannot see ({@link REVIEW_DENIED_TOOLS}). Dropping the two branch-owned
+ * sources leaves the reviewer configured only by the machine anton runs on.
+ *
+ * The FIX session keeps the default sources: it is an implementer, and the project's own hooks
+ * (formatters, guards) are supposed to apply to the code it writes.
+ */
+export const REVIEW_SETTING_SOURCES = ["user"] as const;
+
 /** Findings that hold the PR back. The call-site's park decision reads exactly this. */
 export function blockingFindings(findings: ReviewFinding[]): ReviewFinding[] {
   return findings.filter((f) => f.severity === "blocking");
@@ -278,7 +293,9 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
  *
  * The fingerprint covers the worktree, so `git` is denied outright ({@link REVIEW_DENIED_TOOLS}) to
  * cover what it cannot see: the repository the worktree belongs to, where a written ref leaves the
- * tree byte-identical.
+ * tree byte-identical. And the session is loaded from the operator's settings only
+ * ({@link REVIEW_SETTING_SOURCES}), so the branch under review cannot configure — or hook — the
+ * session judging it.
  *
  * The revert runs on EVERY exit once the baseline is settled — a review that throws or reports an
  * error is exactly as capable of having written first, and its leftovers would otherwise outlive it
@@ -349,6 +366,7 @@ async function runReviewSession(args: {
         model: settings.model,
         permissionMode: settings.permissionMode ?? "bypassPermissions",
         disallowedTools: REVIEW_DENIED_TOOLS,
+        settingSources: [...REVIEW_SETTING_SOURCES],
         signal: ctx.signal,
         onEvent,
       });
