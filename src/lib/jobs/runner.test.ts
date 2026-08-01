@@ -391,6 +391,34 @@ describe("JobRunner (live, in-memory db)", () => {
     expect(await r.resume(id)).toBe(false);
   });
 
+  it("cancel() refused by `only` leaves the in-flight child alone (anton-wvcy)", async () => {
+    // The stale-button case: an escalation's "stop retrying" is raised against a parked/failed job,
+    // but an operator resumed it first, so it is running again. The CAS refuses the write — and the
+    // abort must be refused with it, or the click kills the agent that resume put back to work.
+    let sawAbort = false;
+    let finish!: () => void;
+    const running = new Promise<void>((resolveWait) => {
+      finish = resolveWait;
+    });
+    const r = runner(async (ctx) => {
+      ctx.signal.addEventListener("abort", () => {
+        sawAbort = true;
+      });
+      await running;
+    });
+    const id = await r.enqueue({ type: "execute-epic" });
+    expect(await r.tickOnce()).toBe(1);
+    await waitUntil(() => r.activeCount === 1);
+
+    expect(await r.cancel(id, ["parked", "failed"])).toBe(false);
+
+    expect(sawAbort).toBe(false);
+    expect((await getJob(tdb.db, id))?.status).toBe("running");
+    finish();
+    await r.whenIdle();
+    expect((await getJob(tdb.db, id))?.status).toBe("done"); // the resumed run finished normally
+  });
+
   it("cancel() terminalizes a queued job so it is never leased (anton-a4jj)", async () => {
     const r = runner(async () => {});
     const id = await r.enqueue({ type: "execute-epic" });

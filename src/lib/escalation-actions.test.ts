@@ -60,6 +60,7 @@ afterAll(() => fileDb.cleanup());
 beforeEach(() => {
   getDb().delete(schema.escalations).run();
   getDb().delete(schema.jobs).run();
+  getDb().delete(schema.runs).run();
   getDb().delete(schema.projects).run();
   getDb()
     .insert(schema.projects)
@@ -103,8 +104,19 @@ function seedJob(id: string, status: string): void {
     .run();
 }
 
+/** The run a `parked-run` escalation was raised against — real, because abandon settles it. */
+function seedParkedRun(id: string, status = "parked"): void {
+  getDb()
+    .insert(schema.runs)
+    .values({ id, projectId: "p1", epicBeadId: "anton-e1", status, error: "agent exited 1" })
+    .run();
+}
+
 const rowOf = (id: string) =>
   getDb().select().from(schema.escalations).where(eq(schema.escalations.id, id)).get();
+
+const runOf = (id: string) =>
+  getDb().select().from(schema.runs).where(eq(schema.runs.id, id)).get();
 
 describe("actOnEscalation — resume", () => {
   it("re-enqueues the finding's EPIC and records the answer", async () => {
@@ -186,6 +198,54 @@ describe("actOnEscalation — abandon", () => {
       reason: "no-target",
     });
     expect(abandonTicket).not.toHaveBeenCalled();
+  });
+
+  // `abandonTicket` kills only an ACTIVE (queued/running) job, but an escalation is raised precisely
+  // against work that already stopped. Without these settles the bead closes while the local rows
+  // stay exactly as the detectors see them, so the next sweep escalates an already-abandoned target.
+  it("settles the parked RUN the escalation was raised against", async () => {
+    seedParkedRun("r-1");
+    const escalation = await open();
+
+    expect(await actOnEscalation(project, escalation.id, "abandon")).toMatchObject({ ok: true });
+
+    const run = runOf("r-1");
+    expect(run?.status).toBe("failed"); // no longer a `detectParkedRuns` candidate
+    expect(run?.error).toContain("parked 4h ago: agent exited 1");
+    expect(run?.endedAt).toBeTruthy();
+  });
+
+  it("leaves a run that is no longer parked alone — the operator may have restarted it", async () => {
+    seedParkedRun("r-1", "running");
+    const escalation = await open();
+
+    await actOnEscalation(project, escalation.id, "abandon");
+
+    expect(runOf("r-1")?.status).toBe("running");
+  });
+
+  it("stops the parked/failed JOB an exhausted-job escalation names, alongside closing its bead", async () => {
+    const escalation = await open({
+      finding: finding({
+        kind: "exhausted-job",
+        key: "exhausted-job:j-1",
+        runId: undefined,
+        jobId: "j-1",
+      }),
+    });
+
+    expect(await actOnEscalation(project, escalation.id, "abandon")).toMatchObject({ ok: true });
+
+    expect(abandonTicket).toHaveBeenCalled();
+    expect(cancelJob).toHaveBeenCalledWith("p1", "j-1", ["parked", "failed"]);
+  });
+
+  it("touches no run or job when the escalation names neither", async () => {
+    const escalation = await open({ finding: finding({ runId: undefined }) });
+
+    await actOnEscalation(project, escalation.id, "abandon");
+
+    expect(cancelJob).not.toHaveBeenCalled();
   });
 });
 

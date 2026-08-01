@@ -207,6 +207,18 @@ describe("classifyFinding — dead leases", () => {
     );
     expect(verdict.disposition).toBe("hold");
   });
+
+  it("HOLDS a lease left behind by a job an operator cancelled — the cancel outlives its lease", () => {
+    // A cancel settles the JOB; a process that dies (or fails its lease cleanup) right after leaves
+    // the bead's lease to expire into exactly this finding. Resuming it would reverse the stop —
+    // and `resumeEpic` can't catch that, since a cancelled job is outside its covering set.
+    const verdict = classifyFinding(
+      deadLease,
+      withBoard(leased(NOW - 2 * HOUR), { epicCancelled: () => true }),
+    );
+    expect(verdict.disposition).toBe("hold");
+    expect(verdict.why).toContain("cancelled");
+  });
 });
 
 describe("classifyFinding — an untrusted board fails CLOSED", () => {

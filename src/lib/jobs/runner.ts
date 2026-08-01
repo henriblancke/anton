@@ -515,10 +515,16 @@ export class JobRunner {
    * local controller) is still terminalized and lease-expiry reclaim can't re-run it. Returns whether
    * it acted (false = the job was already terminal or unknown). `only` narrows the statuses the
    * cancel will act on — see `cancelJob`.
+   *
+   * The abort is gated on that same CAS: a refused cancel (the job left `only`'s statuses — an
+   * operator resumed it between an escalation being raised and its "stop retrying" being clicked)
+   * must not kill the child of the run that resumed it. Nothing is lost when it doesn't fire — a
+   * cancel that acted on a row with no local controller has nothing to abort, and one refused because
+   * the row was already `cancelled` was aborted by whoever won that CAS.
    */
   async cancel(jobId: string, only?: readonly string[]): Promise<boolean> {
     const acted = await cancelJob(this.db, this.clock, jobId, only);
-    this.inFlight.get(jobId)?.controller.abort();
+    if (acted) this.inFlight.get(jobId)?.controller.abort();
     return acted;
   }
 

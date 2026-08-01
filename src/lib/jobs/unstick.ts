@@ -124,9 +124,11 @@ export interface UnstickContext {
   usageWindowEndsAt: (epicBeadId: string) => number | undefined;
   /**
    * Whether the epic's most recent execute-epic job was CANCELLED. A cancel is an operator saying
-   * stop, and `cancelJob` guarantees no durability path revives it — but cancelling the queued
-   * backoff job of a usage-limit park leaves the RUN row parked, so the finding outlives the cancel.
-   * Without this the quota window's expiry would re-enqueue exactly the work that was cancelled.
+   * stop, and `cancelJob` guarantees no durability path revives it — but it only settles the JOB, so
+   * both resumable findings outlive it: a usage-limit park leaves its RUN row parked, and a cancel
+   * that never reached the board (a crash, a failed `clearRunLease`/sync) leaves the bead's lease to
+   * expire into a `dead-lease`. Without this, either one re-enqueues exactly the work that was
+   * cancelled.
    */
   epicCancelled: (epicBeadId: string) => boolean;
   /**
@@ -242,6 +244,14 @@ export function classifyFinding(
       if (!bead) return hold("the bead is gone from the board");
       if (bead.status === "closed") return hold("the bead has since closed");
       if (ownedByLiveJob(bead.id)) return hold("a live job already owns this run");
+      // Same operator-said-stop rule as the parked-run path. A cancel clears the JOB, not the bead's
+      // run-lease label — a process that dies (or fails its `clearRunLease`/sync) after terminalizing
+      // the row leaves the lease behind to expire, and this finding is what it decays into. Resuming
+      // it would reverse the cancel, and `resumeEpic` can't catch that: cancelled jobs are outside
+      // its covering set, so it would enqueue a fresh one.
+      if (ctx.epicCancelled(bead.id)) {
+        return hold("this epic's latest job was cancelled by an operator");
+      }
       // A lease that is live NOW belongs to a machine that picked the work back up after the sweep
       // saw it expired — resuming here would double-run the epic, the one thing the lease exists to
       // prevent. That is a foreign holder, so this pass stands down entirely.
@@ -411,10 +421,19 @@ export async function unstickPass(
   };
 
   // Prime the memo before classifying: the job-backed lookups are synchronous so the classifier
-  // stays pure, which means the async job reads have to happen up front.
+  // stays pure, which means the async job reads have to happen up front. An epic the memo never
+  // learned about reads as "not cancelled", so every path that consults `epicCancelled` must prime.
+  const primeLatestJob = async (epicBeadId: string) => {
+    if (latestJobs.has(epicBeadId)) return;
+    latestJobs.set(epicBeadId, await latestExecuteEpicJob(db, projectId, epicBeadId));
+  };
   for (const run of parkedRunRows) {
-    if (run.error?.trim() !== USAGE_LIMIT_PARK || latestJobs.has(run.epicBeadId)) continue;
-    latestJobs.set(run.epicBeadId, await latestExecuteEpicJob(db, projectId, run.epicBeadId));
+    if (run.error?.trim() !== USAGE_LIMIT_PARK) continue;
+    await primeLatestJob(run.epicBeadId);
+  }
+  // A dead lease reads the same row for its cancellation guard; there the bead IS the epic.
+  for (const finding of report.findings) {
+    if (finding.kind === "dead-lease" && finding.beadId) await primeLatestJob(finding.beadId);
   }
 
   // Same reason, one gh/job read per stale-pr / exhausted-job finding. The thresholds come from the

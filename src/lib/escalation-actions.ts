@@ -12,7 +12,8 @@
  *
  * The verbs themselves are reused, never re-implemented: resume shares `resumeEpic` with the
  * automatic path, abandon is the same `abandonTicket` the board's own abandon uses (kill the live
- * run, cascade to open descendants, close with a reason), and a stall that names only a JOB — an
+ * run, cascade to open descendants, close with a reason) plus the settle for the stopped rows that
+ * abandon has no reach into (see `settleAbandonedWork`), and a stall that names only a JOB — an
  * exhausted `sync-push`/`run-health`/`unstick`, which strands no bead — is answered with the jobs
  * list's own resume/cancel. Without that last path such an escalation would have no settling move at
  * all and would sit on the board forever.
@@ -29,6 +30,7 @@ import { abandonTicket } from "./abandon";
 import { getEscalation, settleEscalation, toEscalationView } from "./escalations";
 import { cancelJob, resumeJob, resumeStalledEpic } from "./jobs/service";
 import { getJob, systemClock } from "./jobs/queue";
+import { settleParkedRun } from "./runs";
 import { MAX_ABANDON_REASON_CHARS } from "./types";
 import type { EscalationResolution, EscalationView } from "./escalations";
 import type { Project } from "./types";
@@ -118,8 +120,30 @@ async function actOnBead(
   target: string,
 ): Promise<string> {
   if (action === "resume") return resumeStalledEpic(project.id, target);
-  await abandonTicket(project, target, abandonReason(view));
+  const reason = abandonReason(view);
+  await abandonTicket(project, target, reason);
+  await settleAbandonedWork(project.id, view, reason);
   return "abandoned";
+}
+
+/**
+ * The machine-local rows an abandon must settle beyond the bead. `abandonTicket` kills only an ACTIVE
+ * (queued/running) job, but an escalation is raised precisely against work that already STOPPED — a
+ * parked run, a parked/failed job. Left as they are, the bead closes while the local rows stay in the
+ * exact state `detectParkedRuns` / `detectExhaustedJobs` report, so the next sweep escalates work
+ * whose target is already abandoned. Both settles are status-guarded CASes, so work an operator
+ * restarted between the raise and the click keeps running.
+ *
+ * Runs after the bead closes, so a failure here propagates like any other action failure (see the
+ * module note) while the abandon it follows still stands.
+ */
+async function settleAbandonedWork(
+  projectId: string,
+  view: EscalationView,
+  reason: string,
+): Promise<void> {
+  if (view.jobId) await cancelJob(projectId, view.jobId, STOPPABLE_FROM);
+  if (view.runId) await settleParkedRun(getDb(), systemClock, projectId, view.runId, reason);
 }
 
 /**

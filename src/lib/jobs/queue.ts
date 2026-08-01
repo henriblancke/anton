@@ -103,6 +103,16 @@ const ACTIVE_STATUSES = ["queued", "running"] as const;
 const CANCELLABLE_STATUSES = ["queued", "running", "parked"] as const;
 
 /**
+ * What a RESTRICTED cancel (`only`) may act on. `failed` joins the live statuses here because it is
+ * terminal for the runner but NOT settled for the operator: it is one of the two states
+ * `detectExhaustedJobs` reports and `resumeJob` recovers from, so an escalation's "stop retrying"
+ * must be able to terminalize it — otherwise the button no-ops and the sweep re-raises the same
+ * finding forever. Only a caller that names its statuses gets this reach; the unrestricted cancel
+ * still refuses every terminal row, so a `failed` job is never quietly rewritten by a blanket cancel.
+ */
+const RESTRICTED_CANCELLABLE_STATUSES = [...CANCELLABLE_STATUSES, "failed"] as const;
+
+/**
  * Statuses under which a local execute-epic job "covers" an epic for the take-over path: either
  * runnable (`queued`/`running`) or settled-but-recoverable (`parked`/`failed`, both un-parkable via
  * `resumeJob`). `done` is deliberately excluded — a completed run is NOT resumable, so a re-approved
@@ -962,10 +972,11 @@ export async function resumeJob(db: AntonDb, clock: Clock, jobId: string): Promi
  * Aborting the in-flight child is the runner's job (`JobRunner.cancel`); this only writes state, so
  * it also terminalizes a `running` row whose controller lives on a since-restarted process.
  *
- * `only` narrows the accepted statuses further — for a caller acting on a job it observed earlier
- * (an escalation's "stop retrying" button, raised against a `parked`/`failed` job), so a job resumed
- * in between is refused rather than killed mid-flight. Applied in the same WHERE as the base guard,
- * so it is a real CAS and not a read-then-write race.
+ * `only` restricts the accepted statuses to what the caller observed earlier (an escalation's "stop
+ * retrying" button, raised against a `parked`/`failed` job), so a job resumed in between is refused
+ * rather than killed mid-flight. It is applied in the same WHERE as the base guard, so it is a real
+ * CAS and not a read-then-write race — and it selects from
+ * {@link RESTRICTED_CANCELLABLE_STATUSES}, which adds `failed` to the live set.
  */
 export async function cancelJob(
   db: AntonDb,
@@ -973,8 +984,8 @@ export async function cancelJob(
   jobId: string,
   only?: readonly string[],
 ): Promise<boolean> {
-  const allowed = only
-    ? CANCELLABLE_STATUSES.filter((s) => only.includes(s))
+  const allowed: string[] = only
+    ? RESTRICTED_CANCELLABLE_STATUSES.filter((s) => only.includes(s))
     : [...CANCELLABLE_STATUSES];
   if (allowed.length === 0) return false;
   const nowMs = clock.now();

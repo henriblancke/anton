@@ -7,7 +7,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
-import { getJob, park, resumeJob, systemClock } from "./queue";
+import { cancelJob, getJob, park, resumeJob, systemClock } from "./queue";
 
 let t: TestDb;
 beforeEach(() => {
@@ -78,5 +78,46 @@ describe("park", () => {
 
   it("reports false for an unknown job id", async () => {
     expect(await park(t.db, systemClock, "does-not-exist", "nope")).toBe(false);
+  });
+});
+
+/**
+ * The status CAS a restricted cancel runs on (anton-wvcy). An escalation's "stop retrying" names the
+ * statuses it was raised against, so it must reach BOTH of them — `failed` included, which the
+ * unrestricted cancel treats as terminal — while still refusing a job that has since gone back to
+ * work.
+ */
+describe("cancelJob — restricted by status", () => {
+  const STOPPABLE_FROM = ["parked", "failed"] as const;
+
+  it.each(["parked", "failed"] as const)("terminalizes a %s job it was raised against", async (status) => {
+    seed(`${status}-job`, status);
+
+    expect(await cancelJob(t.db, systemClock, `${status}-job`, STOPPABLE_FROM)).toBe(true);
+    expect((await getJob(t.db, `${status}-job`))?.status).toBe("cancelled");
+  });
+
+  it("refuses a job that left those statuses, leaving it exactly as it is", async () => {
+    for (const status of ["queued", "running", "done", "cancelled"]) {
+      const id = `${status}-live`;
+      seed(id, status);
+
+      expect(await cancelJob(t.db, systemClock, id, STOPPABLE_FROM)).toBe(false);
+      expect((await getJob(t.db, id))?.status).toBe(status);
+    }
+  });
+
+  it("still refuses `failed` on an UNRESTRICTED cancel — only a caller that names it gets that reach", async () => {
+    seed("failed-job", "failed");
+
+    expect(await cancelJob(t.db, systemClock, "failed-job")).toBe(false);
+    expect((await getJob(t.db, "failed-job"))?.status).toBe("failed");
+  });
+
+  it("acts on nothing when `only` intersects no cancellable status", async () => {
+    seed("done-job", "done");
+
+    expect(await cancelJob(t.db, systemClock, "done-job", ["done"])).toBe(false);
+    expect((await getJob(t.db, "done-job"))?.status).toBe("done");
   });
 });

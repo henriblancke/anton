@@ -356,6 +356,48 @@ describe("resumable parks re-enqueue exactly once across two sweeps", () => {
     expect(escalationRows()).toEqual([]);
   });
 
+  it("never revives a dead lease left behind by a cancelled job either", async () => {
+    // The same operator stop, reaching the pass by the other route: the cancel terminalized the job
+    // but its lease cleanup never landed on the shared board (a crash, a failed sync), so the label
+    // expired into a `dead-lease`. `resumeEpic` cannot catch this on its own — a cancelled job is
+    // outside its covering set, so it would enqueue a FRESH job and undo the cancel.
+    listMock.mockResolvedValue([
+      {
+        id: "e-1",
+        title: "e-1",
+        status: "open",
+        issue_type: "epic",
+        labels: [LABELS.runLease(NOW - 2 * HOUR, "run-x")],
+      },
+    ]);
+    t.db
+      .insert(schema.jobs)
+      .values({
+        id: "j-cancelled",
+        type: "execute-epic",
+        projectId: "p1",
+        payloadJson: JSON.stringify({ projectId: "p1", epicBeadId: "e-1" }),
+        status: "cancelled",
+        lastError: "cancelled by operator",
+        runAt: secDate(NOW - HOUR),
+        createdAt: secDate(NOW - 5 * HOUR),
+        updatedAt: secDate(NOW - HOUR),
+      })
+      .run();
+    await seedReport({
+      kind: "dead-lease",
+      key: "dead-lease:e-1",
+      reason: "run-lease expired 2h ago",
+      since: NOW - 2 * HOUR,
+      ageMs: 2 * HOUR,
+      beadId: "e-1",
+    });
+
+    expect(await sweep()).toMatchObject({ findings: 1, resumed: 0, escalated: 0, held: 1 });
+    expect(jobRows().map((j) => j.status)).toEqual(["cancelled"]);
+    expect(escalationRows()).toEqual([]);
+  });
+
   it("leaves a run a live job already owns completely alone", async () => {
     seedParkedRun("r-1", "e-1", "usage-limit");
     t.db

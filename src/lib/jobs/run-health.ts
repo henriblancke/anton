@@ -290,6 +290,11 @@ export function makeRunHealthHandler(deps: RunHealthDeps): JobHandler {
  * failing the sweep: one unreachable PR (a deleted repo, a rate-limited token) must not cost the
  * operator the parked-run and dead-lease findings that were already computed. The skip is loud in
  * the logs precisely because a silently under-reported PR class would read as "all clear".
+ *
+ * An ABORT is the one failure that isn't per-PR: the job itself is being cancelled or has timed out,
+ * so every remaining read would fail the same way and the report saved at the end would be a partial
+ * one indistinguishable from a clean sweep (`heartbeat` doesn't inspect the signal, so nothing else
+ * stops the loop). It propagates instead, and the job settles as the cancellation it is.
  */
 async function readInReviewPrs(
   board: Bead[],
@@ -302,6 +307,7 @@ async function readInReviewPrs(
     try {
       prs.push({ beadId: bead.id, activity: await readPrActivity(repo, prNumber, ctx.signal) });
     } catch (e) {
+      ctx.signal.throwIfAborted();
       console.error(`[run-health] could not read PR #${prNumber} for ${bead.id}; skipping`, e);
     }
     await ctx.heartbeat();

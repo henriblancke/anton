@@ -10,13 +10,13 @@
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import { describeBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
-import { driveJob } from "@/lib/testing/jobs";
+import { driveJob, makeJobRunner } from "@/lib/testing/jobs";
 import { makeTestDb, type TestDb } from "../db/testing";
 import { beads, LABELS } from "../beads/bd";
 import type { PrActivity } from "../git/pr";
 import { getRunHealthReport, type RunHealthFinding } from "../run-health";
 import * as schema from "../db/schema";
-import { type Clock } from "./queue";
+import { getJob, type Clock } from "./queue";
 import { makeRunHealthHandler } from "./run-health";
 
 const HOUR = 3_600_000;
@@ -198,6 +198,38 @@ describeBd("run-health e2e (real handler · real bd)", () => {
     const jobAfter = (await tdb.db.select().from(schema.jobs)).find((j) => j.id === jobBefore.id);
     expect(runAfter).toEqual(runBefore);
     expect(jobAfter).toEqual(jobBefore);
+  });
+
+  it("saves NO report when its job is cancelled mid-PR-read", async () => {
+    // `heartbeat` doesn't inspect the signal, so without the abort re-throw the sweep would walk the
+    // remaining PRs and persist a report missing every one of them — a partial sweep that reads
+    // exactly like a clean one, and on a timeout even settles as a success.
+    await tdb.db.delete(schema.runHealthReports);
+
+    let jobId = "";
+    const runner = makeJobRunner({
+      db: tdb.db,
+      clock,
+      type: "run-health",
+      // Stands in for `gh pr view` losing its child to the abort: the cancel fires while the read is
+      // in flight, and the read rejects because of the signal rather than because the PR is bad.
+      handler: (deps) =>
+        makeRunHealthHandler({
+          ...deps,
+          readPrActivity: async (_repo, _number, signal) => {
+            await runner.cancel(jobId);
+            signal?.throwIfAborted();
+            throw new Error("expected the signal to abort the read");
+          },
+        }),
+    });
+
+    jobId = await runner.enqueue({ type: "run-health", projectId, payload: { projectId } });
+    expect(await runner.tickOnce()).toBe(1);
+    await runner.whenIdle();
+
+    expect((await getJob(tdb.db, jobId))?.status).toBe("cancelled");
+    expect(await getRunHealthReport(tdb.db, projectId)).toBeUndefined();
   });
 
   it("is idempotent — a second sweep over unchanged state stores the identical report", async () => {
