@@ -78,8 +78,10 @@ export interface ReviewGateResult {
   /** Every round that ran, in order — each with its validated score for the call-site to persist. */
   rounds: ReviewRound[];
   /**
-   * Findings open at exit, each carrying its severity: the final review's, plus advisories from
-   * earlier rounds that it did not repeat (see {@link carryAdvisory}).
+   * Findings open at exit, each carrying its severity: the final review's — it is shown every
+   * advisory still open from earlier rounds and restates the ones that still apply — plus, when that
+   * review broke the protocol and so settled nothing, the earlier advisories (see
+   * {@link withCarried}).
    */
   unresolved: ReviewFinding[];
   /** Which reasoning contract reviewed: a named agent, the operator's prompt, or the shipped default. */
@@ -133,24 +135,32 @@ export interface ReviewGateArgs {
 }
 
 /**
- * Tools denied to a review session. `git` in full, because the worktree fingerprint cannot see the
- * repository the worktree belongs to: `git branch anton/<future-bead> HEAD` writes a ref while HEAD,
- * the symbolic ref, and porcelain status all stay identical, and `createWorktree` adopts an existing
- * branch instead of cutting one from the base — so a reviewer could plant commits in an unrelated
- * later run's PR and still pass the read-only guard.
+ * Tools denied to a review session — deny rules bind ahead of `bypassPermissions`, which is what
+ * makes them a guard rather than a request.
  *
- * Denied rather than fingerprinted-and-restored because the ref store is SHARED: anton runs several
- * epics per project concurrently in sibling worktrees, and they legitimately create their own
- * branches, commit to them, and update `refs/remotes/*` throughout a review. Snapshotting refs could
+ * Every file-WRITING tool, because a review writes nothing: the guard below reverts what a reviewer
+ * touched, but reverting is after the fact, and the tools cost the review nothing to lose. Naming
+ * them is bounded and stable, unlike enumerating a shell's writing commands.
+ *
+ * `git` in full, because the worktree fingerprint cannot see the repository the worktree belongs to:
+ * `git branch anton/<future-bead> HEAD` writes a ref while HEAD, the symbolic ref, and porcelain
+ * status all stay identical, and `createWorktree` adopts an existing branch instead of cutting one
+ * from the base — so a reviewer could plant commits in an unrelated later run's PR and still pass the
+ * read-only guard. Denied rather than fingerprinted-and-restored because the ref store is SHARED:
+ * anton runs several epics per project concurrently in sibling worktrees, and they legitimately
+ * create branches, commit, and update `refs/remotes/*` throughout a review. Snapshotting refs could
  * not tell a sibling run's branch from a reviewer's, so restoring would delete a branch another
- * worktree has checked out, and merely detecting would park healthy runs. A deny rule has no such
- * blast radius, and it is enforced ahead of `bypassPermissions`.
+ * worktree has checked out, and merely detecting would park healthy runs. All of `git`, not its
+ * writing subcommands: an enumeration rots into a gap the next git release opens, and the reviewer
+ * needs none of it — anton hands it the diff, the file list, and the beads.
  *
- * All of `git`, not an enumeration of its writing subcommands: an enumeration rots into a gap the
- * next git release opens, and the reviewer needs none of it — anton hands it the diff, the file list,
- * and the beads, and the worktree is there to read.
+ * KNOWN RESIDUAL (anton-t6tu): `Bash` itself stays, because the review contract asks the reviewer to
+ * run the project's own read-only checks. A shell can still write bytes anywhere — `printf <sha> >
+ * <repo>/.git/refs/heads/anton/<future-bead>` plants exactly the branch the git deny rule exists to
+ * prevent, with no `git` process and no visible change to this worktree. No tool-name filter closes
+ * that; it needs OS-level filesystem containment for the session, which is that bead's work.
  */
-export const REVIEW_DENIED_TOOLS = ["Bash(git:*)"];
+export const REVIEW_DENIED_TOOLS = ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash(git:*)"];
 
 /**
  * Settings sources a review session loads: the operator's `user` settings only.
@@ -207,8 +217,8 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
 
   const rounds: ReviewRound[] = [];
   let reviewer: ReviewerSource = { kind: "default" };
-  /** Advisories reported in earlier rounds, keyed for dedupe against the round that reports last. */
-  const carried = new Map<string, ReviewFinding>();
+  /** Advisories still open from earlier rounds — shown to the next review, which settles them. */
+  let carried: ReviewFinding[] = [];
 
   for (let round = 1; round <= config.maxRounds; round++) {
     await ctx.heartbeat();
@@ -226,6 +236,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       worktreePath,
       baseBranch,
       readDiff,
+      carried,
       round,
       maxRounds: config.maxRounds,
       claude,
@@ -247,7 +258,11 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
     };
     rounds.push(entry);
 
-    const unresolved = withCarried(findings, carried);
+    // A review that spoke the protocol read the carried advisories (they are in its prompt) against
+    // the diff as it stands now, so its report IS the disposition: one it did not restate is settled
+    // — typically by a blocking fix that shared the advisory's root cause. A broken report settles
+    // nothing, so there the earlier advisories still ride along.
+    const unresolved = review.report.ok ? findings : withCarried(findings, carried);
 
     // A reviewer that never reported, or reported an unusable score, has told us nothing about the
     // work — the run is handed back with whatever findings were salvaged, never as a clean review.
@@ -259,7 +274,9 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       return { outcome: "unresolved", rounds, unresolved, reviewer, score: review.report.score };
     }
 
-    carryAdvisory(findings, carried);
+    // Replaces, never accumulates: this round was shown the previous carry and restated whatever
+    // still applied, so its advisories are the whole open set going into the next round.
+    carried = findings.filter((f) => f.severity === "advisory");
     args.assertLeaseHeld?.(); // don't write a fix under a lease that lapsed while reviewing
     const fix = await runGateFixSession({
       db,
@@ -333,6 +350,8 @@ async function runReviewSession(args: {
   worktreePath: string;
   baseBranch: string;
   readDiff: (worktreePath: string, base: string) => Promise<BranchDiff>;
+  /** Advisories still open from earlier rounds — this review restates or settles each. */
+  carried: ReviewFinding[];
   round: number;
   maxRounds: number;
   claude: (options: RunClaudeOptions) => Promise<ClaudeResult>;
@@ -370,6 +389,7 @@ async function runReviewSession(args: {
         // The same base the diff is taken from: everything the reviewer is handed comes from a
         // revision this run's own diff could not have written.
         baseRev: args.baseBranch,
+        carriedAdvisories: args.carried,
       });
       await appendSessionLog(
         logPath,
@@ -746,24 +766,18 @@ async function runGateFixSession(args: {
 }
 
 /**
- * Remember a round's advisories, so a later round cannot silently drop them.
+ * The salvage path for a round that BROKE the protocol: its findings, then the earlier advisories it
+ * did not restate.
  *
- * Only BLOCKING findings are dispatched to a fix session, so no session is ever asked to resolve an
- * advisory. The confirming review is a fresh context reading the whole diff again: it may well not
- * repeat an advisory it already made (or that a different reviewer made), and reporting only the
- * final round's findings would then lose a finding nobody addressed — breaking the gate's promise
- * that advisories ride along to the founder in the PR body.
+ * Only used there. Only BLOCKING findings are dispatched to a fix session, so no session is ever
+ * asked to resolve an advisory, and a round that reports properly is handed the open advisories in
+ * its prompt and settles them by restating or omitting each. A round that never reported — or
+ * reported an unusable score — settled nothing, and dropping the earlier advisories would lose
+ * findings nobody addressed from the very run a human is being asked to look at.
  */
-function carryAdvisory(findings: ReviewFinding[], carried: Map<string, ReviewFinding>): void {
-  for (const f of findings) {
-    if (f.severity === "advisory") carried.set(findingKey(f), f);
-  }
-}
-
-/** The final review's findings first, then earlier advisories it did not restate. */
-function withCarried(findings: ReviewFinding[], carried: Map<string, ReviewFinding>): ReviewFinding[] {
+function withCarried(findings: ReviewFinding[], carried: ReviewFinding[]): ReviewFinding[] {
   const seen = new Set(findings.map(findingKey));
-  return [...findings, ...[...carried.values()].filter((f) => !seen.has(findingKey(f)))];
+  return [...findings, ...carried.filter((f) => !seen.has(findingKey(f)))];
 }
 
 /**

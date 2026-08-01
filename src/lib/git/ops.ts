@@ -238,6 +238,12 @@ export interface BranchDiff {
   patch: string;
   /** True when `patch` was cut short — the file list still names everything that changed. */
   truncated: boolean;
+  /**
+   * The DELETIONS-only patch, collected separately and only when `patch` was cut short: what the
+   * truncated patch omits is recoverable from the worktree except for a file the branch removed,
+   * which is gone from it. Absent when nothing was deleted (or nothing was truncated).
+   */
+  deletions?: string;
 }
 
 /**
@@ -246,6 +252,14 @@ export interface BranchDiff {
  * can't blow the context window.
  */
 export const DEFAULT_DIFF_PATCH_CHARS = 200_000;
+
+/**
+ * Cap on the deletions-only patch {@link diffAgainstBase} adds when the main patch is truncated.
+ * Deliberately a fraction of it: this is a rescue of content the reviewer has no other way to see,
+ * not a second copy of the diff, and a run that deletes a vendored tree must not blow the budget
+ * the surviving code needs.
+ */
+export const DEFAULT_DELETION_PATCH_CHARS = 40_000;
 
 /**
  * The work a branch added on top of `base`: the changed files and the unified patch, for the
@@ -258,11 +272,16 @@ export const DEFAULT_DIFF_PATCH_CHARS = 200_000;
  * The patch is cut at the source (`gitBounded`) rather than after collection: a run that touched a
  * lockfile or vendored tree can produce a patch of any size, and buffering it whole only to slice it
  * would fail the review on the exact change truncation exists for.
+ *
+ * Truncation is survivable because the reviewer can open what the cut omits — with one exception: a
+ * file the branch DELETED is not in the worktree to open, and the reviewer is denied `git` (see
+ * `REVIEW_DENIED_TOOLS`), so a removed route or validation past the cut would be reviewed by nobody.
+ * So a truncated patch is followed by a second, separately bounded pass over the deletions alone.
  */
 export async function diffAgainstBase(
   worktreePath: string,
   base: string,
-  opts: { maxPatchChars?: number } = {},
+  opts: { maxPatchChars?: number; maxDeletionChars?: number } = {},
 ): Promise<BranchDiff> {
   const from = await git(worktreePath, ["merge-base", base, "HEAD"]).catch(() => base);
   const names = await git(worktreePath, ["diff", "--name-only", from, "HEAD"]);
@@ -274,11 +293,34 @@ export async function diffAgainstBase(
   const max = opts.maxPatchChars ?? DEFAULT_DIFF_PATCH_CHARS;
   const { text, truncated } = await gitBounded(worktreePath, ["diff", from, "HEAD"], max);
   if (!truncated) return { files, patch: text.trim(), truncated: false };
+
+  const deletions = await deletionPatch(worktreePath, from, opts.maxDeletionChars ?? DEFAULT_DELETION_PATCH_CHARS);
   return {
     files,
     patch: `${text}\n… [patch truncated at ${max} chars — read the files directly]`,
     truncated: true,
+    ...(deletions ? { deletions } : {}),
   };
+}
+
+/**
+ * The branch's deletions as their own bounded patch, or undefined when it deleted nothing.
+ *
+ * Best-effort: a failure here must not fail a review that already has the (truncated) patch it was
+ * mainly after — the reviewer is told what it is missing either way.
+ */
+async function deletionPatch(worktreePath: string, from: string, max: number): Promise<string | undefined> {
+  try {
+    const { text, truncated } = await gitBounded(
+      worktreePath,
+      ["diff", "--diff-filter=D", from, "HEAD"],
+      max,
+    );
+    if (!text.trim()) return undefined;
+    return truncated ? `${text}\n… [deletions truncated at ${max} chars]` : text.trim();
+  } catch {
+    return undefined;
+  }
 }
 
 /** A worktree's checked-out branch and committed tip plus its working-tree dirt — the fingerprint a read-only phase guards. */

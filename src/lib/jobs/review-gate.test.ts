@@ -276,28 +276,32 @@ describe("runReviewGate — convergence", () => {
     expect(calls[1].appendSystemPrompt).toBeTruthy();
   });
 
-  it("carries an earlier round's advisory to the exit when the confirming review drops it", async () => {
-    // Nothing ever dispatched the advisory — only blocking findings reach a fix session — so a fresh
-    // confirming review that doesn't restate it must not make it disappear from the PR body.
-    const { result } = gate([report(4, [BLOCKING, ADVISORY]), "fixed the loop bound", report(9, [])]);
+  it("shows an open advisory to the confirming review and drops the one it does not restate", async () => {
+    // Nothing dispatched the advisory — only blocking findings reach a fix session — but the fix may
+    // well have removed its cause, so the confirming review is handed it and its omission settles it.
+    // Reporting it anyway would tell the founder to act on something that is no longer true.
+    const { result, calls } = gate([report(4, [BLOCKING, ADVISORY]), "fixed the loop bound", report(9, [])]);
     const out = await result;
 
+    expect(calls[0].prompt).not.toContain("Advisories still open from an earlier round");
+    expect(calls[2].prompt).toContain("Advisories still open from an earlier round");
+    expect(calls[2].prompt).toContain("src/a.ts:9 — the name could be clearer");
     expect(out.outcome).toBe("clean");
-    expect(out.unresolved).toEqual([
-      { severity: "advisory", location: "src/a.ts:9", note: "the name could be clearer" },
-    ]);
+    expect(out.unresolved).toEqual([]);
   });
 
   it("lists a carried advisory once when the confirming review repeats it", async () => {
     const { result } = gate([report(4, [BLOCKING, ADVISORY]), "fixed", report(9, [ADVISORY])]);
     const out = await result;
 
-    expect(out.unresolved).toHaveLength(1);
+    expect(out.unresolved).toEqual([
+      { severity: "advisory", location: "src/a.ts:9", note: "the name could be clearer" },
+    ]);
   });
 
   it("carries advisories through a round that ends on a protocol violation", async () => {
-    // The findings salvaged from a broken report are why a human is being asked; an advisory an
-    // earlier round reported is part of that picture.
+    // A round that never reported settled nothing — omission there is silence, not a disposition —
+    // so the earlier advisory rides along: the salvaged findings are why a human is being asked.
     const { result } = gate([report(4, [BLOCKING, ADVISORY]), "fixed", "no report at all"]);
     const out = await result;
 
@@ -438,17 +442,20 @@ describe("runReviewGate — sessions", () => {
     }
   });
 
-  it("denies the reviewer `git`, but leaves the fix session free to use it", async () => {
-    // The worktree fingerprint cannot see a written ref: `git branch anton/<future-bead> HEAD` leaves
-    // HEAD, the symbolic ref, and the status identical, and `createWorktree` adopts an existing
-    // branch — so reviewer-chosen commits would ride into an unrelated later run's PR. A deny rule is
-    // the guard, since the ref store is shared with concurrent runs and cannot be restored blindly.
+  it("denies the reviewer every write tool and `git`, but leaves the fix session free", async () => {
+    // The editing tools cost a read-only review nothing to lose, and reverting after the fact is a
+    // worse guard than not handing them over. `git` goes too because the worktree fingerprint cannot
+    // see a written ref: `git branch anton/<future-bead> HEAD` leaves HEAD, the symbolic ref, and the
+    // status identical, and `createWorktree` adopts an existing branch — so reviewer-chosen commits
+    // would ride into an unrelated later run's PR. Deny rules are the guard, since the ref store is
+    // shared with concurrent runs and cannot be restored blindly.
     const { result, calls } = gate([report(4, [BLOCKING]), "fixed", report(9, [])]);
     await result;
 
-    expect(calls[0].disallowedTools).toEqual(["Bash(git:*)"]);
-    expect(calls[2].disallowedTools).toEqual(["Bash(git:*)"]);
-    // The fixer commits its own work in the normal case; denying it git would break that.
+    for (const review of [calls[0], calls[2]]) {
+      expect(review.disallowedTools).toEqual(["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash(git:*)"]);
+    }
+    // The fixer writes code and commits it; denying it those tools would break the round.
     expect(calls[1].disallowedTools).toBeUndefined();
   });
 

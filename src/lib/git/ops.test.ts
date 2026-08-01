@@ -374,6 +374,53 @@ suite("diffAgainstBase (real git)", () => {
     expect(diff.patch.length).toBeLessThan(300);
   });
 
+  it("repeats the deletions in their own patch when the cut hides them", async () => {
+    // Everything a truncated patch omits can be read in the worktree — except a file the run
+    // DELETED, which is gone from it, and the reviewer has no `git` to fetch it from the base.
+    // `AAA-big.ts` sorts first, so the deletion of README.md falls past the cut.
+    writeFileSync(join(repo, "AAA-big.ts"), "// filler line\n".repeat(500));
+    rmSync(join(repo, "README.md"));
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "t1: grow and remove"]);
+
+    const diff = await diffAgainstBase(repo, "main", { maxPatchChars: 200 });
+
+    expect(diff.truncated).toBe(true);
+    expect(diff.patch).not.toContain("README.md");
+    expect(diff.deletions).toContain("README.md");
+    expect(diff.deletions).toContain("-# sandbox");
+    // Deletions only — the surviving files are in the (truncated) patch and in the worktree.
+    expect(diff.deletions).not.toContain("AAA-big.ts");
+  });
+
+  it("bounds the deletions patch of its own, and omits it when the run deleted nothing", async () => {
+    writeFileSync(join(repo, "AAA-big.ts"), "// filler line\n".repeat(500));
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "t1: grow"]);
+    expect((await diffAgainstBase(repo, "main", { maxPatchChars: 200 })).deletions).toBeUndefined();
+
+    rmSync(join(repo, "README.md"));
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "t1: remove readme"]);
+
+    const diff = await diffAgainstBase(repo, "main", { maxPatchChars: 200, maxDeletionChars: 60 });
+
+    expect(diff.deletions).toContain("deletions truncated at 60 chars");
+    expect(diff.deletions!.length).toBeLessThan(160);
+  });
+
+  it("leaves the deletions out entirely when the patch fits", async () => {
+    rmSync(join(repo, "README.md"));
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "t1: remove readme"]);
+
+    const diff = await diffAgainstBase(repo, "main");
+
+    expect(diff.truncated).toBe(false);
+    expect(diff.deletions).toBeUndefined();
+    expect(diff.patch).toContain("-# sandbox"); // the whole patch already carries it
+  });
+
   it("truncates a patch far larger than any exec buffer instead of failing the review", async () => {
     // A generated lockfile or a vendored source update produces a patch of tens of megabytes.
     // Collecting it into an exec buffer first throws before any truncation can run — the whole

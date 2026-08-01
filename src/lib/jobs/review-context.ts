@@ -102,6 +102,11 @@ export interface ReviewRun {
    * reviewer never reads the worktree's copies.
    */
   instructions?: InstructionFile[];
+  /**
+   * Advisories an earlier round of this same review reported and that are still open. Shown so this
+   * round can settle them: restated ⇒ still true, omitted ⇒ the fix removed it.
+   */
+  carriedAdvisories?: ReviewFinding[];
 }
 
 /** One instruction file inlined into the review context, with the path it came from. */
@@ -137,6 +142,8 @@ export async function buildReviewPrompt(args: {
   projectDir: string;
   /** The revision the run branched from — the newest state its own diff cannot have written. */
   baseRev: string;
+  /** Advisories still open from earlier rounds, for this review to restate or settle. */
+  carriedAdvisories?: ReviewFinding[];
 }): Promise<{ prompt: string; reviewer: ReviewerSource }> {
   const { target, tickets, diff, settings, projectDir, baseRev } = args;
   const config = resolveReviewConfig(settings);
@@ -168,7 +175,7 @@ export async function buildReviewPrompt(args: {
     "",
     "---",
     "",
-    reviewContext({ target, tickets, diff, principles, instructions }),
+    reviewContext({ target, tickets, diff, principles, instructions, carriedAdvisories: args.carriedAdvisories }),
   ].join("\n");
   return { prompt, reviewer };
 }
@@ -276,6 +283,7 @@ export function reviewContext(run: ReviewRun): string {
     ...beadsSection(run),
     ...diffSection(run.diff),
     ...principlesSection(run),
+    ...carriedAdvisorySection(run.carriedAdvisories ?? []),
     ...readOnlySection(),
     ...reportingFormatSection(),
   ]
@@ -359,6 +367,29 @@ function diffSection(diff: BranchDiff): string[] {
       : []),
     "```diff",
     diff.patch,
+    "```",
+    ``,
+    ...deletionsBlock(diff),
+  ];
+}
+
+/**
+ * The deletions the truncated patch may have cut off, repeated in full. Everything else a cut omits
+ * is in the worktree to open; a file this run REMOVED is not, and the reviewer has no `git` to fetch
+ * it from the base — so without this a removed route, validation, or guard past the cut is reviewed
+ * by nobody.
+ */
+function deletionsBlock(diff: BranchDiff): string[] {
+  if (!diff.deletions) return [];
+  return [
+    `### Files this run DELETED`,
+    ``,
+    `Repeated here because the patch above is truncated and a deleted file is not in the worktree to`,
+    `read. Judge what was removed as carefully as what was added: behavior deleted without its`,
+    `callers, tests, or a bead asking for it is a finding.`,
+    ``,
+    "```diff",
+    diff.deletions,
     "```",
     ``,
   ];
@@ -453,6 +484,34 @@ function rulesCaveat(): string[] {
 }
 
 /**
+ * The advisories an earlier round left open, put back in front of the reviewer so THIS round decides
+ * their fate. Without it the gate could only guess what an omission means, and had to assume the
+ * worst — an advisory whose cause a blocking fix removed rode into the PR body labelled unresolved.
+ *
+ * Only the earlier round's advisories, never its blocking findings: those were dispatched to a fix
+ * session and are proven by the diff alone, so quoting them would invite grading the repair against
+ * the previous reviewer's word instead of the code.
+ */
+function carriedAdvisorySection(advisories: ReviewFinding[]): string[] {
+  if (advisories.length === 0) return [];
+  return [
+    `## Advisories still open from an earlier round`,
+    ``,
+    `An earlier round of this same review reported the advisories below. Only BLOCKING findings are`,
+    `dispatched for repair, so nobody was asked to resolve these — but the fix that ran since may have`,
+    `removed the cause of one, and the diff above is the state after it.`,
+    ``,
+    ...advisories.map((f, i) => `${i + 1}. ${f.location} — ${f.note}`),
+    ``,
+    `Judge each against the diff as it stands now, not against the earlier reviewer's word. Restate`,
+    `every one that STILL applies in your own findings — anton treats one you leave out as resolved`,
+    `and drops it, and reports the rest to the founder as open. They are advisory either way: they do`,
+    `not hold the PR back, so restating one is not a blocking finding unless you judge it to be one.`,
+    ``,
+  ];
+}
+
+/**
  * The read-only rule. Lives in anton's own context, not in the (swappable) reasoning contract, so an
  * implementation-oriented agent swapped in as reviewer is still told not to write: a reviewer that
  * repairs what it finds and then reports clean would ship its verdict and lose its fix — the branch
@@ -467,11 +526,12 @@ function readOnlySection(): string[] {
     `dispatches the fixes in a separate session after your report.`,
     ``,
     `anton compares the worktree before and after this review: any change you make is reverted and`,
-    `the review is discarded as a protocol violation, which parks the run for a human. \`git\` is`,
-    `blocked outright for this session — a ref you write leaves the worktree byte-identical, so it is`,
-    `denied rather than detected. Everything you would reach for it is already above: the diff, the`,
-    `changed-file list, and the beads. Reading, searching, and running the project's own read-only`,
-    `checks (tests, type-check, lint) is expected — just leave the tree exactly as you found it.`,
+    `the review is discarded as a protocol violation, which parks the run for a human. The editing`,
+    `tools and \`git\` are blocked outright for this session — a ref you write leaves the worktree`,
+    `byte-identical, so it is denied rather than detected. Everything you would reach for git is`,
+    `already above: the diff, the changed-file list, and the beads. Reading, searching, and running`,
+    `the project's own read-only checks (tests, type-check, lint) is expected — just leave the tree`,
+    `exactly as you found it.`,
     ``,
   ];
 }

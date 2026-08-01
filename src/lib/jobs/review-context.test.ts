@@ -167,6 +167,8 @@ describe("reviewContext", () => {
   it("flags a truncated patch and an empty diff", () => {
     const cut = reviewContext({ target: epic, tickets: [ticket], diff: { ...diff, truncated: true } });
     expect(cut).toContain("The patch below is truncated");
+    // No deletions collected ⇒ no section promising content that isn't there.
+    expect(cut).not.toContain("Files this run DELETED");
 
     const empty = reviewContext({
       target: epic,
@@ -176,15 +178,45 @@ describe("reviewContext", () => {
     expect(empty).toContain("NO changes against its base");
   });
 
+  it("repeats a truncated patch's deletions, which the worktree cannot show", () => {
+    // "Read the files in the worktree" is impossible for a file the run removed, and the reviewer has
+    // no `git` to fetch it from the base — so a removed route past the cut would be reviewed by nobody.
+    const out = reviewContext({
+      target: epic,
+      tickets: [ticket],
+      diff: { ...diff, truncated: true, deletions: "diff --git a/src/old-route.ts\n-export const GET = () => null;\n" },
+    });
+
+    expect(out).toContain("### Files this run DELETED");
+    expect(out).toContain("-export const GET = () => null;");
+    expect(out).toContain("a deleted file is not in the worktree to");
+  });
+
+  it("puts an earlier round's open advisories in front of the reviewer to settle", () => {
+    const out = reviewContext({
+      target: epic,
+      tickets: [ticket],
+      diff,
+      carriedAdvisories: [{ severity: "advisory", location: "src/widget.tsx:4", note: "the name could be clearer" }],
+    });
+
+    expect(out).toContain("## Advisories still open from an earlier round");
+    expect(out).toContain("1. src/widget.tsx:4 — the name could be clearer");
+    expect(out).toContain("anton treats one you leave out as resolved");
+    // A first round has none, and an empty list must not print an empty section.
+    expect(reviewContext({ target: epic, tickets: [ticket], diff })).not.toContain("still open from an earlier round");
+  });
+
   it("forbids writing to the worktree in the appended context, so a swapped reviewer is told too", () => {
     const out = reviewContext({ target: epic, tickets: [ticket], diff });
     expect(out).toContain("## This review is READ-ONLY");
     expect(out).toContain("even if your instructions above tell you to fix what you find");
     expect(out).toContain("reverted");
-    // The gate denies `git` outright (a written ref leaves the tree byte-identical), so the reviewer
-    // is told why rather than left to read a tool denial as a broken environment.
-    expect(out).toContain("`git` is");
-    expect(out).toContain("blocked outright for this session");
+    // The gate denies the editing tools and `git` outright (a written ref leaves the tree
+    // byte-identical), so the reviewer is told why rather than left to read a tool denial as a
+    // broken environment.
+    expect(out).toContain("The editing");
+    expect(out).toContain("tools and `git` are blocked outright for this session");
   });
 
   it("demands the mandatory 0-10 score in the appended context, not just in the skill", () => {
