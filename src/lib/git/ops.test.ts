@@ -567,6 +567,35 @@ suite("diffAgainstBase (real git)", () => {
     expect(diff.deletions).not.toContain("AAA-big.ts");
   });
 
+  it("rescues the SOURCE of a detected rename, whose old side is no `D` entry", async () => {
+    // With rename detection on, a move is one `R*` entry naming only its destination — so the
+    // deletion pass would find nothing for it, while the reviewer (denied `git`) can open only the
+    // destination. Behaviour the move dropped on the way would then be reviewed by nobody.
+    g(["config", "diff.renames", "true"]); // git's default; pinned so the guard is what's tested
+    g(["checkout", "-q", "main"]);
+    mkdirSync(join(repo, "old"), { recursive: true });
+    const kept = Array.from({ length: 80 }, (_, i) => `export const v${i} = ${i};`).join("\n");
+    writeFileSync(join(repo, "old", "guard.ts"), `${kept}\nexport const requireAuth = () => true;\n`);
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "seed the guard"]);
+    g(["checkout", "-q", "-B", "anton/epic-1"]);
+
+    // Similar enough for git to score a rename, minus the guard — and `AAA-big.ts` sorts first, so
+    // the move itself falls past the cut.
+    mkdirSync(join(repo, "new"), { recursive: true });
+    writeFileSync(join(repo, "new", "guard.ts"), `${kept}\n`);
+    rmSync(join(repo, "old", "guard.ts"), { recursive: true });
+    writeFileSync(join(repo, "AAA-big.ts"), "// filler line\n".repeat(500));
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "t1: move the guard and drop it"]);
+
+    const diff = await diffAgainstBase(repo, "main", { maxPatchChars: 200 });
+
+    expect(diff.truncated).toBe(true);
+    expect(diff.deletions).toContain("old/guard.ts");
+    expect(diff.deletions).toContain("-export const requireAuth = () => true;");
+  });
+
   it("bounds the deletions patch of its own, and omits it when the run deleted nothing", async () => {
     writeFileSync(join(repo, "AAA-big.ts"), "// filler line\n".repeat(500));
     g(["add", "-A"]);

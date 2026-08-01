@@ -514,7 +514,9 @@ export const DEFAULT_DELETION_PATCH_CHARS = 40_000;
  * file the branch DELETED is not in the worktree to open, and the reviewer is denied `git` (see
  * `REVIEW_DENIED_TOOLS`), so a removed route or validation past the cut would be reviewed by nobody.
  * So a truncated patch is followed by a second pass over the deletions alone, bounded per deleted
- * file so that every removal is represented (see {@link deletionPatch}).
+ * file so that every removal is represented (see {@link deletionPatch}). That pass turns rename
+ * detection off too, for the same reason the file list does: the old side of a rename is content the
+ * branch removed, and with detection on it is not classified as a deletion to rescue.
  */
 export async function diffAgainstBase(
   worktreePath: string,
@@ -554,6 +556,11 @@ const MIN_DELETION_SLICE_CHARS = 500;
 /**
  * The branch's deletions as their own bounded patch — `{}` when it deleted nothing.
  *
+ * "Deleted" is judged with rename detection OFF. A file git scores as a rename is one `R*` entry
+ * naming only its destination, so its old side is not a deletion and this pass would return nothing
+ * for it — while the move may have dropped a guard or a route on the way, and the truncated patch is
+ * the reviewer's only sight of the source it cannot open.
+ *
  * The budget is allocated PER DELETED FILE, not spent as one stream: a single stream is exhausted by
  * whichever removal git emits first, leaving every route, guard, or validation deleted after it
  * represented by a filename alone — unreviewable, since those files are neither in the worktree nor
@@ -573,7 +580,16 @@ async function deletionPatch(
 ): Promise<{ patch?: string; incomplete?: boolean }> {
   const parts: string[] = [];
   try {
-    const deleted = await diffPaths(worktreePath, ["--name-only", "--diff-filter=D", from, "HEAD"]);
+    // `--no-renames`, to match the changed-file list: with detection on, a rename is one `R*` entry
+    // and its old side is not a deletion at all, so the source of a moved file would be rescued by
+    // nobody — the reviewer can open the destination but not what the move dropped on the way.
+    const deleted = await diffPaths(worktreePath, [
+      "--name-only",
+      "--diff-filter=D",
+      "--no-renames",
+      from,
+      "HEAD",
+    ]);
     if (deleted.length === 0) return {};
 
     let remaining = max;
@@ -597,7 +613,7 @@ async function deletionPatch(
         // `:(literal)`, because a pathspec globs by default: these names come from git itself and
         // are exact, but one holding `*` or `[…]` would also match its NEIGHBOURS and spend this
         // file's slice of the budget quoting them.
-        ["diff", "--diff-filter=D", from, "HEAD", "--", `:(literal)${path}`],
+        ["diff", "--diff-filter=D", "--no-renames", from, "HEAD", "--", `:(literal)${path}`],
         share,
       );
       if (!text.trim()) continue;
