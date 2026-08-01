@@ -146,8 +146,10 @@ describe("required skill assets", () => {
 
     it("scan-triage looks for an existing epic before creating one", () => {
       // `--limit 0` on both board reads: bd list defaults to 50, and a truncated board hides the
-      // matching epic (duplicate epic) or an already-tracked signal (duplicate bead).
-      expect(scanTriage).toMatch(/bd list --type epic --json --limit 0/);
+      // matching epic (duplicate epic) or an already-tracked signal (duplicate bead). `--all` is
+      // unconditional on the epic read — triage runs unattended, so a closed epic it never sees is
+      // one it can only conclude doesn't exist, and it mints a duplicate.
+      expect(scanTriage).toMatch(/bd list --type epic --all --json --limit 0/);
       expect(scanTriage).toMatch(/bd list --json --limit 0/);
       expect(scanTriage).toMatch(/Match on `area:` first/);
     });

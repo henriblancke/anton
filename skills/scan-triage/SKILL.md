@@ -81,10 +81,10 @@ A parentless `feature` still runs, but it falls off the roadmap — it advances 
 tracks. Triage usually runs unattended on the nightly cron, so there is nobody to ask mid-run:
 either place the feature, or surface it in §6 for the founder to place.
 
-1. **Look before you create.** `bd list --type epic --json --limit 0` (add `--all` if a closed epic
-   might be the right home; `--limit 0` because the default 50 would hide the matching epic and mint
-   a duplicate). Match on `area:` first — the product surface the signal's files sit on — then
-   on theme. Debt in the auth module belongs under whatever outcome already owns auth.
+1. **Look before you create.** `bd list --type epic --all --json --limit 0` — always `--all`, because
+   the right home may already be closed and you can't judge that from a list that omits it; always
+   `--limit 0`, because the default 50 would hide the matching epic and mint a duplicate.
+   Match on `area:` first — the product surface the signal's files sit on — then on theme. Debt in the auth module belongs under whatever outcome already owns auth.
    Then confirm the match is **safe to attach to** — `bd children <epic-id>`:
    - **Pre-tier epic** (direct `task`/`bug`/`chore` children, no `feature` child): that epic is
      itself a run target, and the first feature you hang under it turns it into a container — its
