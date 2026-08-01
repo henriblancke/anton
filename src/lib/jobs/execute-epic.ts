@@ -672,7 +672,8 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // Cooperative lease-liveness guard (anton-jz1). The refresh timer only LOGS a failed publish;
       // if writes to the shared board keep failing, the lease silently lapses past its TTL while this
       // run is still executing, and another machine's liveRunCheck would then see the epic as free and
-      // start a duplicate. So at each checkpoint below (every ticket boundary, and before the PR) we
+      // start a duplicate. So at each checkpoint below (every ticket boundary, every review-gate
+      // review/fix dispatch — the gate is handed this guard — and before the PR) we
       // re-check the expiry we last successfully PUSHED: once it's in the past we can no longer prove
       // we hold the shared lease, so we yield (RunAlreadyLiveError → park + retry, re-checking liveness
       // next attempt) rather than keep running unguarded. A single ticket that itself runs past the TTL
@@ -916,7 +917,9 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //     already opened its PR never reaches here — step 0a short-circuits it.
       let advisoryFindings: ReviewFinding[] = [];
       if (resolveReviewConfig(settings).enabled) {
-        assertLeaseHeld(); // don't review (or fix) under a lease that has silently lapsed
+        // Handed IN as well as checked here: the gate's review → fix → re-review sequence can run
+        // well past the lease TTL, so it re-asserts at every dispatch rather than only at the edges.
+        assertLeaseHeld();
         const review = await runReviewGate({
           db,
           clock,
@@ -928,6 +931,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           settings,
           worktreePath: worktree.path,
           baseBranch: freshBase,
+          assertLeaseHeld,
         });
         // The score history belongs to the board, not this run's logs — written on BOTH exits, since
         // a run parked on blocking findings is exactly the one whose score the founder needs.

@@ -19,7 +19,7 @@ import { makeTestDb, type TestDb } from "../db/testing";
 import { schema } from "../db";
 import type { Bead } from "../beads/bd";
 import type { ClaudeResult, RunClaudeOptions } from "../claude/driver";
-import type { BranchDiff } from "../git/ops";
+import type { BranchDiff, WorktreeState } from "../git/ops";
 import type { ProjectSettings } from "../projects";
 import { UsageLimitError, isPoisonError } from "./errors";
 import type { Clock } from "./queue";
@@ -122,15 +122,24 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+/** The branch the run's worktree sits on — what `openPullRequest` would push. */
+const RUN_REF = "refs/heads/anton/gate1";
+
 /**
  * An in-memory stand-in for the worktree the read-only guard fingerprints. `mutateOn` names the
  * claude dispatches (1-based) after which the tree "changed" — how a reviewer that edits the code it
  * is judging looks to the gate. `commitOn` names the dispatches after which the agent COMMITTED its
  * write: HEAD moves and the tree reads clean, which is the shape a later `settleBaseline` cannot
- * tell from a settled worktree.
+ * tell from a settled worktree. `branchOn` names the dispatches after which the agent checked out a
+ * branch of its own AT THE SAME COMMIT — invisible to a fingerprint that records only HEAD + status.
  */
-function fakeWorktree(mutateOn: number[] = [], initialStatus = "", commitOn: number[] = []) {
-  const state = { head: "c0ffee", status: initialStatus };
+function fakeWorktree(
+  mutateOn: number[] = [],
+  initialStatus = "",
+  commitOn: number[] = [],
+  branchOn: number[] = [],
+) {
+  const state: WorktreeState = { head: "c0ffee", ref: RUN_REF, status: initialStatus };
   const restores: string[] = [];
   let dispatches = 0;
   let commits = 0;
@@ -140,6 +149,7 @@ function fakeWorktree(mutateOn: number[] = [], initialStatus = "", commitOn: num
     onDispatch: () => {
       dispatches += 1;
       if (mutateOn.includes(dispatches)) state.status = `?? reviewer-edit-${dispatches}.ts`;
+      if (branchOn.includes(dispatches)) state.ref = `refs/heads/review-work-${dispatches}`;
       if (commitOn.includes(dispatches)) {
         state.head = `r0gue${dispatches}`;
         state.status = "";
@@ -152,10 +162,11 @@ function fakeWorktree(mutateOn: number[] = [], initialStatus = "", commitOn: num
       state.status = "";
     },
     readState: async () => ({ ...state }),
-    restoreState: async (_path: string, to: { head: string; status: string }) => {
+    restoreState: async (_path: string, to: WorktreeState) => {
       restores.push(state.status);
       state.status = to.status;
       state.head = to.head;
+      state.ref = to.ref;
     },
   };
 }
@@ -166,6 +177,7 @@ function gate(
   settings: ProjectSettings = {},
   commits: boolean[] = [],
   worktree = fakeWorktree(),
+  assertLeaseHeld?: () => void,
 ): {
   result: Promise<ReviewGateResult>;
   calls: RunClaudeOptions[];
@@ -187,6 +199,7 @@ function gate(
     settings,
     worktreePath: dir,
     baseBranch: "main",
+    ...(assertLeaseHeld ? { assertLeaseHeld } : {}),
     deps: {
       runClaude: async (options) => {
         worktree.onDispatch();
@@ -297,6 +310,54 @@ describe("runReviewGate — bounds", () => {
     expect(calls).toHaveLength(2); // no third dispatch: the loop bailed instead of re-reviewing
   });
 
+  it("treats a fixer that committed its OWN changes as progress, not a stall", async () => {
+    // Project instructions routinely tell an agent to commit, whatever the fix prompt asks. HEAD has
+    // moved, so the branch already carries the repair — reading the empty index as "nothing changed"
+    // would park a run whose fix is done. Dispatch 2 is the fix session.
+    const worktree = fakeWorktree([], "", [2]);
+    const { result, calls } = gate(
+      [report(4, [BLOCKING]), "fixed it and committed", report(9, [])],
+      { reviewMaxRounds: 2 },
+      [false], // `commitAll` finds nothing staged
+      worktree,
+    );
+    const out = await result;
+
+    expect(out.outcome).toBe("clean");
+    expect(out.rounds[0].fixCommitted).toBe(true);
+    expect(calls).toHaveLength(3); // the confirming review still ran
+  });
+
+  it("parks when the fixer committed onto a branch of its OWN instead of the run's", async () => {
+    // The limit of the rule above: anton pushes the run's branch by NAME, so a fix landed on
+    // `review-work` is readable by the confirming review and invisible to the PR. Counting a moved
+    // HEAD as progress without checking the branch would pass a PR missing the fix it just approved.
+    const worktree = fakeWorktree([], "", [2], [2]);
+    const { result, calls } = gate(
+      [report(4, [BLOCKING]), "fixed it on a branch of my own", report(9, [])],
+      { reviewMaxRounds: 2 },
+      [],
+      worktree,
+    );
+
+    const error = await result.then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(isPoisonError(error)).toBe(true);
+    expect((error as Error).message).toMatch(/on a branch of its own: r0gue2 \(on review-work-2\)/);
+    expect(calls).toHaveLength(2); // no confirming review on work the PR would never carry
+  });
+
+  it("still stalls when the fixer neither staged nor committed anything", async () => {
+    const { result, calls } = gate([report(4, [BLOCKING]), "every finding is wrong"], { reviewMaxRounds: 3 }, [false]);
+    const out = await result;
+
+    expect(out.outcome).toBe("stalled");
+    expect(out.rounds[0].fixCommitted).toBe(false);
+    expect(calls).toHaveLength(2);
+  });
+
   it("never passes a protocol violation as a clean review, and dispatches no fix for it", async () => {
     const { result, calls } = gate(["I read everything and it looks fine."], { reviewMaxRounds: 3 });
     const out = await result;
@@ -343,6 +404,45 @@ describe("runReviewGate — sessions", () => {
       expect(review.prompt).toContain("You are the **second opinion** on work you did not write.");
       expect(review.prompt).toContain("Run target: anton-gate1 — Ship the gate");
     }
+  });
+});
+
+describe("runReviewGate — the run-lease is re-asserted between dispatches", () => {
+  it("re-checks before every review and every fix, not just on the way in", async () => {
+    // A review → fix → re-review sequence outlives the 15-minute lease TTL, so a gate checked only
+    // at its edges keeps dispatching after another machine may already have taken the epic.
+    const boundaries: number[] = [];
+    const { result, calls } = gate(
+      [report(4, [BLOCKING]), "fixed it", report(9, [])],
+      { reviewMaxRounds: 2 },
+      [],
+      fakeWorktree(),
+      // `calls` grows as each dispatch starts, so this records how many had run at each check.
+      () => boundaries.push(calls.length),
+    );
+    const out = await result;
+
+    expect(out.outcome).toBe("clean");
+    // One check immediately BEFORE each dispatch: review 1, fix 1, review 2.
+    expect(boundaries).toEqual([0, 1, 2]);
+  });
+
+  it("stops the loop mid-converge when the lease has lapsed", async () => {
+    let checks = 0;
+    const { result, calls } = gate(
+      [report(4, [BLOCKING]), "fixed it", report(9, [])],
+      { reviewMaxRounds: 2 },
+      [],
+      fakeWorktree(),
+      () => {
+        checks += 1;
+        // Lapsed by the time the fix would be dispatched: nothing further may be written here.
+        if (checks > 1) throw new Error("anton-gate1 run-lease expired mid-run");
+      },
+    );
+
+    await expect(result).rejects.toThrow(/run-lease expired mid-run/);
+    expect(calls).toHaveLength(1); // the review ran; no fix was dispatched under a dead lease
   });
 });
 
@@ -454,7 +554,7 @@ describe("runReviewGate — the review is read-only", () => {
 
     await expect(result).rejects.toBeInstanceOf(UsageLimitError);
     expect(restores).toEqual(["?? reviewer-edit-1.ts"]);
-    expect(await worktree.readState()).toEqual({ head: "c0ffee", status: "" });
+    expect(await worktree.readState()).toEqual({ head: "c0ffee", ref: RUN_REF, status: "" });
   });
 
   it("reverts a COMMIT a reviewer landed before reporting an error", async () => {
@@ -466,7 +566,7 @@ describe("runReviewGate — the review is read-only", () => {
 
     await expect(result).rejects.toThrow(/claude reported an error reviewing anton-gate1/);
     expect(restores).toHaveLength(1);
-    expect(await worktree.readState()).toEqual({ head: "c0ffee", status: "" });
+    expect(await worktree.readState()).toEqual({ head: "c0ffee", ref: RUN_REF, status: "" });
     expect(await sessionKinds()).toEqual([{ kind: "review", status: "failed", beadId: "anton-gate1" }]);
   });
 
@@ -501,7 +601,8 @@ describe("runReviewGate — the review is read-only", () => {
       (e: unknown) => e,
     );
     expect(isPoisonError(error)).toBe(true);
-    expect((error as Error).message).toMatch(/COMMITTED to its own worktree/);
+    expect((error as Error).message).toMatch(/WROTE to its own worktree/);
+    expect((error as Error).message).toMatch(/is left at r0gue1 \(on anton\/gate1\)/);
     // The original failure is carried, not lost — it's why a human is being asked.
     expect((error as Error).message).toMatch(/Claude usage limit reached/);
     expect(await sessionKinds()).toEqual([{ kind: "review", status: "failed", beadId: "anton-gate1" }]);
@@ -513,6 +614,40 @@ describe("runReviewGate — the review is read-only", () => {
 
     await expect(result).rejects.toBeInstanceOf(UsageLimitError);
     expect(restores).toEqual([]);
+  });
+
+  it("rejects a reviewer that checked out a branch of its own at the SAME commit", async () => {
+    // The shape a HEAD-and-status fingerprint reads as untouched: `git checkout -b review-work` moves
+    // nothing the old guard recorded, but every later fix commit then lands on a branch the PR push
+    // never sees — the confirming review passes work `openPullRequest` would silently drop.
+    const worktree = fakeWorktree([], "", [], [1]);
+    const { result, calls } = gate([report(9, [])], { reviewMaxRounds: 3 }, [], worktree);
+    const out = await result;
+
+    expect(out.outcome).toBe("protocol-violation");
+    expect(out.rounds[0]).toMatchObject({ violation: "worktree-modified" });
+    // Back on the branch anton pushes, and the loop stops rather than fixing onto the stray one.
+    expect((await worktree.readState()).ref).toBe(RUN_REF);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("parks instead of retrying when a stray branch checkout cannot be reverted", async () => {
+    // Same hazard as an unrevertable commit: the retry reads a clean tree at the reviewed commit and
+    // adopts it, while the branch it fixes and the branch it pushes have quietly diverged.
+    const worktree = fakeWorktree([], "", [], [1]);
+    const { result } = gate([new UsageLimitError("Claude usage limit reached")], {}, [], {
+      ...worktree,
+      restoreState: async () => {
+        throw new Error("git checkout --force failed");
+      },
+    });
+
+    const error = await result.then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(isPoisonError(error)).toBe(true);
+    expect((error as Error).message).toMatch(/is left at c0ffee \(on review-work-1\)/);
   });
 
   it("leaves a well-behaved reviewer alone — no restore, and the fix session may still write", async () => {

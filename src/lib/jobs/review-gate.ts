@@ -19,6 +19,7 @@ import {
   diffAgainstBase,
   readWorktreeState,
   restoreWorktreeState,
+  sameWorktreeState,
   type BranchDiff,
   type WorktreeState,
 } from "../git/ops";
@@ -117,6 +118,14 @@ export interface ReviewGateArgs {
   worktreePath: string;
   /** Branch the run diverged from — the diff is taken against its merge base. */
   baseBranch: string;
+  /**
+   * Re-assert the caller's cross-machine run-lease; throws when it has lapsed.
+   *
+   * Called at every review and fix dispatch, not just on the way in: a review → fix → re-review
+   * sequence outlives the lease TTL, so a gate checked only at its edges can keep dispatching for
+   * minutes after the shared label expired and another machine started the same epic.
+   */
+  assertLeaseHeld?: () => void;
   deps?: ReviewGateDeps;
 }
 
@@ -154,6 +163,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
 
   for (let round = 1; round <= config.maxRounds; round++) {
     await ctx.heartbeat();
+    args.assertLeaseHeld?.(); // don't review under a lease that lapsed during an earlier round
 
     const review = await runReviewSession({
       db,
@@ -198,6 +208,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       return { outcome: "unresolved", rounds, unresolved: findings, reviewer, score: review.report.score };
     }
 
+    args.assertLeaseHeld?.(); // don't write a fix under a lease that lapsed while reviewing
     const fix = await runGateFixSession({
       db,
       clock,
@@ -212,6 +223,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       maxRounds: config.maxRounds,
       claude,
       commit,
+      readState,
     });
     entry.fixSessionId = fix.sessionId;
     entry.fixCommitted = fix.committed;
@@ -377,7 +389,7 @@ async function settleBaseline(args: {
   const state = await args.readState(worktreePath);
   if (!state.status) return state;
 
-  await args.restoreState(worktreePath, { head: state.head, status: "" });
+  await args.restoreState(worktreePath, { ...state, status: "" });
   await appendSessionLog(
     logPath,
     `[review] round ${round}/${maxRounds}: the worktree carried UNCOMMITTED changes from an earlier ` +
@@ -408,7 +420,7 @@ async function enforceReadOnly(args: {
   const { report, worktreePath, before, logPath, round, maxRounds } = args;
 
   const after = await args.readState(worktreePath);
-  if (after.head === before.head && after.status === before.status) return report;
+  if (sameWorktreeState(after, before)) return report;
 
   await args.restoreState(worktreePath, before);
   await appendSessionLog(
@@ -429,10 +441,12 @@ async function enforceReadOnly(args: {
  * A restore that itself fails is best-effort ONLY while the reviewer's write is uncommitted: the next
  * attempt's `settleBaseline` discards working-tree dirt before it reads anything, so the failure
  * costs nothing and must not replace the error the runner needs to see (UsageLimitError in particular
- * drives backoff). A write the reviewer COMMITTED is the opposite: an unrevertable rogue HEAD reads as
- * a settled tree, so the retry would adopt it as the reviewed baseline and push it. That case parks
- * the run as poison — deliberately overriding backoff, since no retry may accept this worktree — and
- * carries the original failure in its message so the reason it died isn't lost.
+ * drives backoff). A reviewer that COMMITTED — or that left HEAD on a branch of its own — is the
+ * opposite: an unrevertable rogue HEAD reads as a settled tree, so the retry would adopt it as the
+ * reviewed baseline and push it, and a stray branch silently diverts every later commit off the
+ * branch `openPullRequest` pushes. Those cases park the run as poison — deliberately overriding
+ * backoff, since no retry may accept this worktree — and carry the original failure in the message so
+ * the reason it died isn't lost.
  */
 async function discardReviewWrites(args: {
   worktreePath: string;
@@ -451,22 +465,25 @@ async function discardReviewWrites(args: {
   let after: WorktreeState | undefined;
   try {
     after = await args.readState(worktreePath);
-    if (after.head === before.head && after.status === before.status) return;
+    if (sameWorktreeState(after, before)) return;
 
     await args.restoreState(worktreePath, before);
   } catch (e) {
-    const committed = after !== undefined && after.head !== before.head;
+    // A moved HEAD or a switched branch survives a failed revert as a plausible-looking baseline;
+    // uncommitted dirt does not (the next attempt discards it), so only these two park.
+    const stuck =
+      after !== undefined && (after.head !== before.head || after.ref !== before.ref);
     await appendSessionLog(
       logPath,
       `[review] round ${round}/${maxRounds}: could not revert the failed review's changes: ${String(e)}` +
-        (committed ? ` — the worktree is stuck at the reviewer's own commit, so the run is parked` : ``) +
+        (stuck ? ` — the worktree is stuck on the reviewer's own commit/branch, so the run is parked` : ``) +
         `\n`,
     ).catch(() => {});
-    if (committed) {
+    if (stuck) {
       throw new PoisonError(
-        `the review of ${targetId} COMMITTED to its own worktree and the revert failed (${String(e)}): ` +
-          `${worktreePath} is left at ${after!.head.slice(0, 12)}, not the reviewed ${before.head.slice(0, 12)}. ` +
-          `Parked instead of retried — a retry would read that commit as a settled baseline and open a PR ` +
+        `the review of ${targetId} WROTE to its own worktree and the revert failed (${String(e)}): ` +
+          `${worktreePath} is left at ${describeRef(after!)}, not the reviewed ${describeRef(before)}. ` +
+          `Parked instead of retried — a retry would read that state as a settled baseline and open a PR ` +
           `on code no reviewer ever saw. Reset the worktree by hand, then resume. ` +
           `The review itself failed with: ${String(cause)}`,
       );
@@ -488,6 +505,15 @@ async function discardReviewWrites(args: {
  *
  * Gate order matches execution and review-fix: gates run BEFORE the commit, so a failing gate leaves
  * the attempted fix uncommitted in the worktree and fails the job rather than pushing red code.
+ *
+ * "Committed" means the ROUND made progress, not that `commitAll` did the committing. A fixer that
+ * commits its own work — which project instructions routinely tell an agent to do, whatever this
+ * prompt asks — leaves nothing staged, and reading that empty index as "no changes" would stall the
+ * gate and park a run whose fix is already on the branch. So HEAD is compared across the session too.
+ *
+ * That only holds while HEAD stays on the run's branch: `openPullRequest` pushes a branch NAME, so a
+ * fix committed onto a branch of the fixer's own is invisible to the PR even though the confirming
+ * review can read it. That case parks rather than counting as progress.
  */
 async function runGateFixSession(args: {
   db: AntonDb;
@@ -503,6 +529,7 @@ async function runGateFixSession(args: {
   maxRounds: number;
   claude: (options: RunClaudeOptions) => Promise<ClaudeResult>;
   commit: (worktreePath: string, message: string) => Promise<{ committed: boolean }>;
+  readState: (worktreePath: string) => Promise<WorktreeState>;
 }): Promise<{ sessionId: string; committed: boolean }> {
   const { db, clock, ctx, projectId, runId, target, settings, worktreePath, findings, round, maxRounds, claude, commit } =
     args;
@@ -529,6 +556,7 @@ async function runGateFixSession(args: {
       logPath,
       `[review-fix] round ${round}/${maxRounds}: fixing ${findings.length} blocking finding(s)\n`,
     );
+    const before = await args.readState(worktreePath);
 
     const result = await claude({
       cwd: worktreePath,
@@ -545,6 +573,19 @@ async function runGateFixSession(args: {
       );
     }
 
+    // Checked before the gates and the commit: work is only a fix if it lands where the PR looks.
+    // The fixer's commits are legitimate, so they are parked for a human rather than reverted —
+    // gating and committing onto the stray branch would only bury them deeper.
+    const afterFix = await args.readState(worktreePath);
+    if (afterFix.ref !== before.ref) {
+      throw new PoisonError(
+        `the review fix for ${target.id} left ${worktreePath} on a branch of its own: ${describeRef(afterFix)}, ` +
+          `not the run's ${describeRef(before)}. Parked instead of retried — anton pushes the run's branch by ` +
+          `name, so the fix (and every later commit) would never reach the PR, while the confirming review ` +
+          `would read it and pass. Move the commits back onto the run's branch by hand, then resume.`,
+      );
+    }
+
     await runVerifyGates(
       resolveVerifyGates(settings),
       worktreePath,
@@ -554,18 +595,29 @@ async function runGateFixSession(args: {
     );
 
     const { committed } = await commit(worktreePath, `${target.id}: address self-review findings (round ${round})`);
+    // Nothing staged is only "no progress" if HEAD also stood still — otherwise the fixer committed
+    // its own work and the branch already carries the repair the next review will read.
+    const selfCommitted = !committed && afterFix.head !== before.head;
     await appendSessionLog(
       logPath,
       committed
         ? `[review-fix] round ${round}/${maxRounds}: committed the fix\n`
-        : `[review-fix] round ${round}/${maxRounds}: no changes produced — findings left unresolved\n`,
+        : selfCommitted
+          ? `[review-fix] round ${round}/${maxRounds}: the fixer committed its own changes — nothing left to stage\n`
+          : `[review-fix] round ${round}/${maxRounds}: no changes produced — findings left unresolved\n`,
     );
     await endSession(db, clock, sessionId, "done");
-    return { sessionId, committed };
+    return { sessionId, committed: committed || selfCommitted };
   } catch (e) {
     await endSession(db, clock, sessionId, "failed");
     throw e; // propagate so the runner applies quota backoff / retry / park
   }
+}
+
+/** A fingerprint as a human reads it in a park reason: `abc123def456 (on anton/foo)`. */
+function describeRef(state: WorktreeState): string {
+  const branch = state.ref?.replace(/^refs\/heads\//, "");
+  return `${state.head.slice(0, 12)}${branch ? ` (on ${branch})` : ` (detached)`}`;
 }
 
 function describeReviewer(reviewer: ReviewerSource): string {

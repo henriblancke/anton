@@ -6,14 +6,17 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   diffAgainstBase,
   openPullRequest,
   pullRequestState,
+  readWorktreeState,
   resolveFreshBase,
+  restoreWorktreeState,
+  sameWorktreeState,
   worktreeHasCommitFor,
 } from "./ops";
 import { GH_BIN_ENV } from "./ops";
@@ -368,5 +371,94 @@ suite("diffAgainstBase (real git)", () => {
     expect(diff.patch).toContain("patch truncated at 200 chars");
     // The cap bounds the patch text itself; only the truncation note follows it.
     expect(diff.patch.length).toBeLessThan(300);
+  });
+});
+
+suite("readWorktreeState / restoreWorktreeState (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+  const out = (args: string[]) =>
+    execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-wtstate-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+    g(["checkout", "-q", "-b", "anton/epic-1"]);
+    writeFileSync(join(repo, "a.ts"), "export const a = 1;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "t1: add a"]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("fingerprints the checked-out branch alongside HEAD and the dirt", async () => {
+    const state = await readWorktreeState(repo);
+
+    expect(state.ref).toBe("refs/heads/anton/epic-1");
+    expect(state.head).toBe(out(["rev-parse", "HEAD"]));
+    expect(state.status).toBe("");
+  });
+
+  it("sees a branch switch at the SAME commit as a change", async () => {
+    const before = await readWorktreeState(repo);
+    g(["checkout", "-q", "-b", "review-work"]);
+    const after = await readWorktreeState(repo);
+
+    // The commit-only fingerprint this replaces read these two as identical.
+    expect(after.head).toBe(before.head);
+    expect(after.status).toBe(before.status);
+    expect(sameWorktreeState(after, before)).toBe(false);
+  });
+
+  it("restores the branch a stray checkout left, not just the commit", async () => {
+    const before = await readWorktreeState(repo);
+    g(["checkout", "-q", "-b", "review-work"]);
+    writeFileSync(join(repo, "b.ts"), "export const b = 2;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "reviewer's own fix"]);
+
+    await restoreWorktreeState(repo, before);
+
+    // Back on the branch openPullRequest pushes, at the reviewed commit, with the write gone.
+    expect(await readWorktreeState(repo)).toEqual(before);
+    expect(existsSync(join(repo, "b.ts"))).toBe(false);
+  });
+
+  it("restores a detached baseline without re-attaching to a branch", async () => {
+    g(["checkout", "-q", "--detach"]);
+    const before = await readWorktreeState(repo);
+    expect(before.ref).toBeUndefined();
+
+    g(["checkout", "-q", "-b", "review-work"]);
+    writeFileSync(join(repo, "b.ts"), "export const b = 2;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "reviewer's own fix"]);
+
+    await restoreWorktreeState(repo, before);
+
+    expect(await readWorktreeState(repo)).toEqual(before);
+  });
+
+  it("still drops uncommitted dirt on the branch it was already on", async () => {
+    const before = await readWorktreeState(repo);
+    writeFileSync(join(repo, "a.ts"), "export const a = 999;\n");
+    writeFileSync(join(repo, "untracked.ts"), "stray\n");
+    expect((await readWorktreeState(repo)).status).not.toBe("");
+
+    await restoreWorktreeState(repo, before);
+
+    expect(await readWorktreeState(repo)).toEqual(before);
+    expect(existsSync(join(repo, "untracked.ts"))).toBe(false);
   });
 });

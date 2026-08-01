@@ -199,11 +199,25 @@ export async function diffAgainstBase(
   };
 }
 
-/** A worktree's committed tip plus its working-tree dirt — the fingerprint a read-only phase guards. */
+/** A worktree's checked-out branch and committed tip plus its working-tree dirt — the fingerprint a read-only phase guards. */
 export interface WorktreeState {
   head: string;
+  /**
+   * The symbolic ref HEAD points at (`refs/heads/<branch>`), absent on a detached HEAD.
+   *
+   * Fingerprinted alongside `head` because a phase can move off the run's branch without moving
+   * the commit: `git checkout -b scratch` leaves HEAD and the status identical, so a commit-only
+   * fingerprint reads it as untouched — while every later commit lands on a branch the PR push
+   * never sees.
+   */
+  ref?: string;
   /** `git status --porcelain` output; empty on a clean tree. */
   status: string;
+}
+
+/** True when two fingerprints describe the same branch, commit, and working-tree dirt. */
+export function sameWorktreeState(a: WorktreeState, b: WorktreeState): boolean {
+  return a.head === b.head && a.status === b.status && a.ref === b.ref;
 }
 
 /**
@@ -216,17 +230,21 @@ export interface WorktreeState {
  * instead of catching a dishonest one.
  */
 export async function readWorktreeState(worktreePath: string): Promise<WorktreeState> {
-  const [head, status] = await Promise.all([
+  const [head, status, ref] = await Promise.all([
     git(worktreePath, ["rev-parse", "HEAD"]),
     git(worktreePath, ["status", "--porcelain"]),
+    // Exits non-zero on a detached HEAD — there is no branch to record, which is itself a state
+    // worth distinguishing from being on one.
+    git(worktreePath, ["symbolic-ref", "--quiet", "HEAD"]).catch(() => ""),
   ]);
-  return { head, status };
+  return { head, status, ...(ref ? { ref } : {}) };
 }
 
 /**
- * Throw away everything the worktree gained since `state` was read: back to that commit, then drop
- * the untracked files left behind. Ignored paths (`node_modules`, build caches) are deliberately
- * kept — `clean -fd` without `-x` — so undoing a stray edit never costs a full reinstall.
+ * Throw away everything the worktree gained since `state` was read: back onto that branch and
+ * commit, then drop the untracked files left behind. Ignored paths (`node_modules`, build caches)
+ * are deliberately kept — `clean -fd` without `-x` — so undoing a stray edit never costs a full
+ * reinstall.
  *
  * Assumes `state` was captured on a COMMITTED tree (which is where the review gate runs): restoring
  * onto a dirty baseline would discard that dirt too.
@@ -235,6 +253,19 @@ export async function restoreWorktreeState(
   worktreePath: string,
   state: WorktreeState,
 ): Promise<void> {
+  const current = await git(worktreePath, ["symbolic-ref", "--quiet", "HEAD"]).catch(() => "");
+  if (current !== (state.ref ?? "")) {
+    // Back onto the recorded branch first — a reset alone would re-pin the commit while leaving
+    // HEAD on whatever branch the stray checkout created, so later commits still miss the PR.
+    // `--force` drops the stray checkout's edits; the reset below re-pins the commit either way.
+    // A short name is required: `git checkout refs/heads/x` detaches instead of attaching.
+    await git(
+      worktreePath,
+      state.ref
+        ? ["checkout", "--force", state.ref.replace(/^refs\/heads\//, "")]
+        : ["checkout", "--force", "--detach", state.head],
+    );
+  }
   await git(worktreePath, ["reset", "--hard", state.head]);
   await git(worktreePath, ["clean", "-fd"]);
 }
