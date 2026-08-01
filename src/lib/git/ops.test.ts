@@ -11,6 +11,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -92,8 +93,14 @@ const branches=s=>Object.keys(s).filter(k=>k!=='__next');
 if(a[0]==='pr'&&a[1]==='create'){
   const branch=get('--head');const s=read();
   if(s[branch]){process.stderr.write('a pull request for branch already exists\\n');process.exit(1);}
-  const n=(s.__next||42);s[branch]={number:n,url:'https://github.com/acme/repo/pull/'+n,state:'OPEN',isDraft:false};s.__next=n+1;write(s);
+  const n=(s.__next||42);s[branch]={number:n,url:'https://github.com/acme/repo/pull/'+n,state:'OPEN',isDraft:false,title:get('--title'),body:get('--body')};s.__next=n+1;write(s);
   process.stdout.write(s[branch].url+'\\n');process.exit(0);
+}
+if(a[0]==='pr'&&a[1]==='edit'){
+  const sel=a[2];const s=read();
+  const key=branches(s).find(k=>k===sel||String(s[k].number)===sel||s[k].url===sel);
+  if(!key){process.stderr.write('no pull requests found\\n');process.exit(1);}
+  s[key].title=get('--title');s[key].body=get('--body');write(s);process.exit(0);
 }
 if(a[0]==='pr'&&a[1]==='view'){
   const branch=a[2];const s=read();const pr=s[branch];
@@ -158,6 +165,32 @@ process.exit(0);
     expect(resumed.number).toBe(42);
     expect(resumed.isDraft).toBe(false);
     expect(await findOpenPullRequest(repo, "anton/epic-1")).toMatchObject({ isDraft: false });
+  });
+
+  it("rewrites the reused PR's title and body with the current attempt's", async () => {
+    // A retry that lost the bead ref re-runs its review and can produce a different advisory set.
+    // The PR body is where those advisories meet the founder at the merge gate, so a reused PR that
+    // kept the first attempt's body would show findings nobody reported and hide the ones that hold.
+    const opts = { repoPath: repo, branch: "anton/epic-1", base: "main", title: "Epic 1", body: "round 1" };
+    await openPullRequest(opts);
+
+    await openPullRequest({ ...opts, title: "Epic 1 (retry)", body: "round 2 · advisory: unguarded route" });
+
+    expect(JSON.parse(readFileSync(ghState, "utf8"))["anton/epic-1"]).toMatchObject({
+      title: "Epic 1 (retry)",
+      body: "round 2 · advisory: unguarded route",
+    });
+  });
+
+  it("rewrites the body of a drafted orphan as it readies it", async () => {
+    const opts = { repoPath: repo, branch: "anton/epic-1", base: "main", title: "Epic 1", body: "round 1" };
+    const opened = await openPullRequest(opts);
+    await markPullRequestDraft(repo, opened.ref);
+
+    const readied = await openPullRequest({ ...opts, body: "round 2" });
+
+    expect(readied.isDraft).toBe(false);
+    expect(JSON.parse(readFileSync(ghState, "utf8"))["anton/epic-1"]).toMatchObject({ body: "round 2" });
   });
 
   it("reports a draft flip gh refused rather than assuming it landed", async () => {
@@ -531,6 +564,32 @@ suite("diffAgainstBase (real git)", () => {
     // The guard sorts last and is far smaller than the budget's first slice — a global stream would
     // have spent it all on AAA-huge.ts before reaching it.
     expect(diff.deletions).toContain("-export const requireAuth = () => true;");
+  });
+
+  it("quotes every deletion the budget can pay a floor slice for, not just the first", async () => {
+    // The even share falls under the per-file floor as soon as the run deletes enough files (81 of
+    // them on the default budget). Treating the floor as a cutoff quoted ONE file and named the
+    // rest — every guard removed after it unreviewable, since a deleted file is in neither the
+    // worktree nor (without `git`) the base.
+    for (let i = 0; i < 12; i++) {
+      writeFileSync(join(repo, `f${i}.ts`), `export const guard${i} = () => true;\n`);
+    }
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "seed"]);
+    g(["checkout", "-q", "main"]);
+    g(["merge", "-q", "--ff-only", "anton/epic-1"]);
+    g(["checkout", "-q", "anton/epic-1"]);
+
+    for (let i = 0; i < 12; i++) rmSync(join(repo, `f${i}.ts`));
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "t1: drop them all"]);
+
+    // 4_000 / 12 = 333, under the floor — but each removal is far smaller than the floor, so the
+    // budget stretches to all twelve.
+    const diff = await diffAgainstBase(repo, "main", { maxPatchChars: 200, maxDeletionChars: 4_000 });
+
+    for (let i = 0; i < 12; i++) expect(diff.deletions).toContain(`-export const guard${i} = () => true;`);
+    expect(diff.deletions).not.toContain("further deleted file(s) not shown");
   });
 
   it("names the deleted files it had no budget left to quote", async () => {

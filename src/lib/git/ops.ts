@@ -466,9 +466,10 @@ export async function diffAgainstBase(
 
 /**
  * Smallest slice of the deletion budget worth spending on one file: under this a "patch" is a diff
- * header and a line or two — a filename dressed up as content. Once the budget can no longer buy
- * even this much, the files left are NAMED instead, so the reviewer sees what it was not shown
- * rather than reading a partial list as the whole set.
+ * header and a line or two — a filename dressed up as content. It is a FLOOR on each slice, not a
+ * cutoff on the even share: once what is LEFT of the budget can no longer buy this much, the files
+ * still to come are NAMED instead, so the reviewer sees what it was not shown rather than reading a
+ * partial list as the whole set.
  */
 const MIN_DELETION_SLICE_CHARS = 500;
 
@@ -478,9 +479,9 @@ const MIN_DELETION_SLICE_CHARS = 500;
  * The budget is allocated PER DELETED FILE, not spent as one stream: a single stream is exhausted by
  * whichever removal git emits first, leaving every route, guard, or validation deleted after it
  * represented by a filename alone — unreviewable, since those files are neither in the worktree nor
- * reachable without `git` (see `REVIEW_DENIED_TOOLS`). Each file draws an even share of what is left,
- * so a small removal hands its surplus to the ones behind it and one huge removal costs only its own
- * slice.
+ * reachable without `git` (see `REVIEW_DENIED_TOOLS`). Each file draws an even share of what is left
+ * — floored at {@link MIN_DELETION_SLICE_CHARS} — so a small removal hands its surplus to the ones
+ * behind it and one huge removal costs only its own slice.
  *
  * Best-effort: a failure here must not fail a review that already has the (truncated) patch it was
  * mainly after — the reviewer is told what it is missing either way.
@@ -494,10 +495,18 @@ async function deletionPatch(worktreePath: string, from: string, max: number): P
     let remaining = max;
     let i = 0;
     for (; i < deleted.length; i++) {
-      const share = Math.floor(remaining / (deleted.length - i));
       // The first file is always quoted, however small the budget: a caller that asks for less than
       // one slice wants the deletions bounded, not withheld.
-      if (i > 0 && share < MIN_DELETION_SLICE_CHARS) break;
+      if (i > 0 && remaining < MIN_DELETION_SLICE_CHARS) break;
+      // An even share under the floor buys a header, not content — so spend the floor rather than
+      // stop at it. Stopping made the split cliff-edged: 81 deletions of the default 40k budget put
+      // the even share at 493, which quoted ONE file and named the other eighty, when the budget can
+      // in fact pay a usable slice for every one of them. Capped by what is left, so a caller whose
+      // whole budget is under one slice still gets it honoured.
+      const share = Math.max(
+        Math.min(remaining, MIN_DELETION_SLICE_CHARS),
+        Math.floor(remaining / (deleted.length - i)),
+      );
       const path = deleted[i]!;
       const { text, truncated } = await gitBounded(
         worktreePath,
@@ -683,6 +692,35 @@ async function setPullRequestDraft(
 }
 
 /**
+ * Overwrite an existing PR's title and body, best-effort — returns whether gh confirmed the edit.
+ *
+ * The body is the founder's merge-gate surface: the review gate reports its advisories there and
+ * nowhere else on the PR. A reused PR still carries the text of the attempt that OPENED it, and a
+ * later attempt re-reviews from scratch — so inheriting that text would show the founder a stale
+ * finding list while this run's advisories reach nobody.
+ */
+async function updatePullRequest(
+  repoPath: string,
+  selector: string,
+  fields: { title: string; body: string },
+): Promise<boolean> {
+  const gh = process.env[GH_BIN_ENV] ?? "gh";
+  // gh takes a number, url, or branch as the selector; the beads `gh-<n>` form is neither.
+  const target = selector.startsWith("gh-") ? selector.slice(3) : selector;
+  if (!target) return false;
+  try {
+    await execFileAsync(gh, ["pr", "edit", target, "--title", fields.title, "--body", fields.body], {
+      cwd: repoPath,
+      timeout: 120_000,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Convert a PR to a draft. Returns whether GitHub confirmed it, so a caller can say so rather than
  * assume it (a failure here leaves the PR mergeable, which is the thing worth reporting).
  *
@@ -739,7 +777,9 @@ export async function pullRequestState(
  *
  * Idempotent: if an open PR already tracks the branch (a resumed run that re-reaches this step),
  * the branch is still pushed (to carry any new commits) and the existing PR is reused instead of
- * calling `gh pr create`, which would error on a duplicate. A reused PR is taken OUT of draft:
+ * calling `gh pr create`, which would error on a duplicate. A reused PR has its title and body
+ * rewritten to this attempt's (see {@link updatePullRequest}) — the review that just ran is the one
+ * the founder must read. A reused PR is also taken OUT of draft:
  * reaching this step means the run's self-review passed, so a PR an earlier parked attempt drafted
  * (see {@link markPullRequestDraft}) must become mergeable again or the epic finishes un-mergeable.
  */
@@ -759,6 +799,18 @@ export async function openPullRequest(opts: {
 
   const existing = await findOpenPullRequest(opts.repoPath, opts.branch);
   if (existing) {
+    // Refresh before returning it, drafted or not: this attempt re-ran the review, so the title and
+    // body it was handed are the current ones and the PR's are the previous attempt's.
+    const refreshed = await updatePullRequest(opts.repoPath, existing.ref, {
+      title: opts.title,
+      body: opts.body,
+    });
+    if (!refreshed) {
+      console.warn(
+        `[git] could not refresh the title/body of ${existing.url}; it still shows an earlier ` +
+          `attempt's text, so this run's advisories are on the bead only`,
+      );
+    }
     if (!existing.isDraft) return existing;
     // Report what actually happened: a flip gh refused leaves a draft PR the founder must ready by
     // hand, and the work is on the branch either way — not worth failing the run over. Logged as well
