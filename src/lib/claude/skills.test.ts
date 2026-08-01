@@ -79,6 +79,7 @@ describe("required skill assets", () => {
   describe("three-tier taxonomy", () => {
     const bd = readFileSync(skillPath("bd"), "utf8");
     const shape = readFileSync(skillPath("shape"), "utf8");
+    const scanTriage = readFileSync(skillPath("scan-triage"), "utf8");
 
     it("bd documents all three tiers and the nesting rule", () => {
       expect(bd).toMatch(/`epic`/);
@@ -126,6 +127,37 @@ describe("required skill assets", () => {
       expect(shape).toMatch(/ask the user/i);
       expect(shape).toMatch(/Never leave a feature parentless/);
       expect(shape).toMatch(/never mint a one-feature epic/);
+    });
+
+    // The second producer (anton-hd9i). Nightly triage must emit the same taxonomy /shape does,
+    // or the board gets one-PR "epics" it can only treat as legacy run targets.
+    it("scan-triage clusters into a feature scoped to one PR, not an epic", () => {
+      expect(scanTriage).toMatch(/anton runs \*\*features\*\*, not epics/);
+      expect(scanTriage).toMatch(/\*\*`feature` scoped to one reviewable PR\*\*/);
+      expect(scanTriage).toMatch(/one `feature` per theme/);
+      expect(scanTriage).not.toMatch(/one epic per theme/);
+    });
+
+    it("scan-triage looks for an existing epic before creating one", () => {
+      expect(scanTriage).toMatch(/bd list --type epic --json/);
+      expect(scanTriage).toMatch(/Match on `area:` first/);
+    });
+
+    it("scan-triage hangs child tickets off the feature, never off the epic", () => {
+      expect(scanTriage).toMatch(/hang off the feature, never off the epic/);
+    });
+
+    it("scan-triage surfaces an unattachable cluster instead of orphaning it", () => {
+      // No user to ask on the 03:00 cron — the report is how the run asks (§4.3 → §6).
+      expect(scanTriage).toMatch(/never mint a one-feature epic/i);
+      expect(scanTriage).toMatch(/never leave a `feature` parentless/);
+      expect(scanTriage).toMatch(/needs-an-epic:/);
+      expect(scanTriage).toMatch(/Surfaced, never orphaned/);
+    });
+
+    it("scan-triage's summary line counts features, not epics", () => {
+      expect(scanTriage).toMatch(/created: N \(F features, T tickets\)/);
+      expect(scanTriage).not.toMatch(/created: N \(E epics/);
     });
   });
 
