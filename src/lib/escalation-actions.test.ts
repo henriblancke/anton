@@ -548,11 +548,12 @@ describe("actOnEscalation — the work was picked back up elsewhere", () => {
   });
 });
 
-describe("actOnEscalation — the work was deleted after the stall was raised", () => {
-  // A deleted bead is a deliberate settle, and neither verb has anything left to act on: a resume
-  // hands execute-epic an id it can only park back on with `bead ... not found` — an intentional
-  // deletion turned into a poison job — and an abandon's `abandonTicket` throws on the gone bead
-  // AFTER the settle. bd saying "no issue found" is the evidence; bd failing to answer is not.
+describe("actOnEscalation — the work settled itself after the stall was raised", () => {
+  // A deleted or hand-closed bead is a deliberate settle, and neither verb has anything left to act
+  // on: a resume hands execute-epic an id it can only park back on with `bead ... not found` — an
+  // intentional deletion turned into a poison job — or restarts work someone explicitly ended, and
+  // an abandon's `abandonTicket` throws on either AFTER the settle. bd saying "no issue found" is
+  // the evidence; bd failing to answer is not.
   const notFound = (id: string) =>
     Object.assign(new Error(`Command failed: bd show ${id} --json\n`), {
       stderr: `Error: no issue found matching "${id}"\n`,
@@ -605,6 +606,33 @@ describe("actOnEscalation — the work was deleted after the stall was raised", 
       ok: true,
       detail: "abandoned",
     });
+  });
+
+  it("refuses to re-enqueue an epic someone closed by hand, however unleased it looks", async () => {
+    // The unstick classifier holds on exactly this (`epicSettled`); without the same rule here a
+    // stale Resume click settles the escalation and hands execute-epic a closed epic, which passes
+    // its runnable gates and starts work that was explicitly called done.
+    beadsShow.mockResolvedValue({ ...bead(), status: "closed" });
+    const escalation = await open();
+
+    expect(await actOnEscalation(project, escalation.id, "resume")).toMatchObject({
+      ok: true,
+      detail: "target-closed",
+    });
+    expect(resumeStalledEpic).not.toHaveBeenCalled();
+    expect(rowOf(escalation.id)).toMatchObject({ status: "resolved", resolution: "dismissed" });
+  });
+
+  it("refuses an abandon of an already-closed ticket, which `abandonTicket` would throw on", async () => {
+    beadsShow.mockResolvedValue({ ...bead(), id: "anton-t9", status: "closed" });
+    const escalation = await open();
+
+    expect(await actOnEscalation(project, escalation.id, "abandon")).toMatchObject({
+      ok: true,
+      detail: "target-closed",
+    });
+    expect(abandonTicket).not.toHaveBeenCalled();
+    expect(rowOf(escalation.id)).toMatchObject({ status: "resolved", resolution: "dismissed" });
   });
 
   it("does NOT read a bd that could not answer as a deletion — that is the offline path", async () => {

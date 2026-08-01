@@ -605,7 +605,8 @@ export async function unstickPass(
  *
  * Fails OPEN — an unreadable PR keeps the finding — because a missed escalation strands the stall
  * the sweep exists to surface, while a redundant one costs a glance. The bead check only counts on a
- * FRESH board: a closed bead read off a stale local mirror is not evidence the work is done.
+ * FRESH board: a closed or absent bead read off a stale local mirror is not evidence the work is
+ * done.
  */
 async function stalePrStillStuck(
   finding: RunHealthFinding,
@@ -619,7 +620,14 @@ async function stalePrStillStuck(
     signal?: AbortSignal;
   },
 ): Promise<boolean> {
-  if (opts.boardFresh && opts.bead?.status === "closed") return false;
+  // Two shapes of settled, one meaning — the same rule {@link epicSettled} applies to the other
+  // kinds: a CLOSED target ended deliberately, and so did a DELETED one, since the pass lists every
+  // status and a bead missing from a pulled board was removed rather than filtered. Escalating
+  // either offers an abandon that throws on the gone bead and a note that fails to write, so the
+  // same finding comes back every sweep.
+  if (opts.boardFresh && finding.beadId && (!opts.bead || opts.bead.status === "closed")) {
+    return false;
+  }
   if (finding.prNumber === undefined || !finding.beadId) return true;
   try {
     const activity = await opts.readPrActivity(opts.repoPath, finding.prNumber, opts.signal);

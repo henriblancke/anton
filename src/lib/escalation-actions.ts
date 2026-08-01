@@ -6,7 +6,7 @@
  * flips `open → resolved` owns the decision, so a double-click (or two operators on one board)
  * cannot resume the same epic twice or abandon a bead that is already closing. That CAS is local,
  * though, and the escalation is a frozen snapshot, so a bead-backed verb first re-reads the board:
- * whether the work still exists at all and whether another machine is executing it (see
+ * whether the work is still unsettled at all and whether another machine is executing it (see
  * {@link readTargetState}), plus the local job queue for a resume that happened right here (see
  * {@link restartedLocally}). The action then runs.
  * If it fails, the escalation is already resolved but the stall is not — which is recoverable rather
@@ -108,15 +108,17 @@ export async function actOnEscalation(
     }
     const state = await readTargetState(project, view, target);
     if (state === "contested") return { ok: false, reason: "contested" };
-    // The work was deleted after the sweep froze this stall, so neither verb has anything to act on
-    // (see {@link readTargetState}). Settle the row as the no-op it is rather than refusing: the
-    // panel offers Dismiss only on a stale PR, so a refusal would strand this escalation with no
-    // move that could ever retire it, and the detail says plainly that nothing was restarted.
-    if (state === "gone") {
+    // The work settled itself after the sweep froze this stall — deleted, or closed by hand — so
+    // neither verb has anything to act on (see {@link readTargetState}). Settle the row as the no-op
+    // it is rather than refusing: the panel offers Dismiss only on a stale PR, so a refusal would
+    // strand this escalation with no move that could ever retire it, and the detail says plainly
+    // which way the work ended and that nothing was restarted.
+    if (state === "gone" || state === "closed") {
       if (!(await settleEscalation(db, systemClock, escalationId, "dismissed"))) {
         return { ok: false, reason: "not-open" };
       }
-      return { ok: true, action, escalation: view, detail: "target-gone" };
+      const detail = state === "gone" ? "target-gone" : "target-closed";
+      return { ok: true, action, escalation: view, detail };
     }
   }
 
@@ -164,9 +166,11 @@ function restartedLocally(projectId: string, epicBeadId: string): boolean {
 
 /**
  * What the board says NOW about the work an escalation froze: `clear` to act on, `contested` by a
- * run on another machine, or `gone` because the bead itself was deleted.
+ * run on another machine, `gone` because the bead itself was deleted, or `closed` because someone
+ * settled it by hand. The last two are one meaning — nothing left to act on — kept apart only so the
+ * panel can say which way the work ended.
  */
-type TargetState = "clear" | "contested" | "gone";
+type TargetState = "clear" | "contested" | "gone" | "closed";
 
 /**
  * One bead as bd answers for it now — the row, `missing` when bd says there is no such bead, or
@@ -193,10 +197,12 @@ async function readBead(repoPath: string, id: string): Promise<BeadRead> {
  *     epic bead is the only record of that. Applying the stale button then resumes work already in
  *     flight — or, worse, abandons it, and `abandonTicket` reads only the bead's own status, so
  *     nothing downstream catches it.
- *   • The bead was DELETED. Then the verb has nothing left to act on: a resume hands execute-epic an
- *     id it can only park back on with `bead ... not found`, turning an intentional deletion into a
- *     poison job, and an abandon's `abandonTicket` throws — after the settle. The unstick pass makes
- *     this exact call on the sweep side (`epicSettled`); this is the same rule for the manual path.
+ *   • The work SETTLED — the bead was deleted, or closed by hand. Then the verb has nothing left to
+ *     act on: a resume hands execute-epic a bead it either can only park back on with
+ *     `bead ... not found`, turning an intentional deletion into a poison job, or runs work that was
+ *     explicitly called done, and an abandon's `abandonTicket` throws on both — after the settle.
+ *     The unstick pass makes this exact call on the sweep side (`epicSettled`); this is the same
+ *     rule for the manual path.
  *
  * Pull before reading, like the runner's enqueue-time `liveRunCheck` and the unstick pass: the local
  * Dolt working set trails the shared remote by a sync heartbeat. A pull that fails (offline,
@@ -217,6 +223,9 @@ async function readTargetState(
   // abandon closes — which is not always the one carrying the lease.
   const acted = await readBead(project.repoPath, target);
   if (acted === "missing") return "gone";
+  // A bead bd could not answer for is no evidence of anything (see {@link BeadRead}) — only a row it
+  // actually returned can say the work was closed out from under this escalation.
+  if (typeof acted !== "string" && acted.status === "closed") return "closed";
 
   // Runs are keyed by RUN TARGET, so that is the bead execute-epic publishes the lease on, and it is
   // what `epicBeadId` holds for every kind: the run's epic for a parked run, the finding's own bead

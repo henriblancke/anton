@@ -642,6 +642,31 @@ describe("non-resumable parks produce exactly one escalation and no enqueue", ()
     expect(escalationRows()).toEqual([]);
   });
 
+  it.each([
+    ["deleted from", [] as Bead[]],
+    ["closed on", [{ id: "e-3", title: "e-3", status: "closed", issue_type: "epic", labels: [] }] as Bead[]],
+  ])("holds a stale-pr finding whose target was %s the board", async (_how, board) => {
+    // The PR is still open and idle, so the re-read alone would escalate work that already settled —
+    // and its bd note would then fail on the gone bead, raising the same finding every sweep.
+    listMock.mockResolvedValue(board);
+    await seedStalePrReport();
+
+    expect(await sweep()).toMatchObject({ findings: 1, escalated: 0, held: 1 });
+    expect(escalationRows()).toEqual([]);
+    expect(prActivityMock).not.toHaveBeenCalled(); // settled work costs no gh read either
+    expect(await sweep()).toMatchObject({ escalated: 0, held: 1 });
+  });
+
+  it("still escalates a stale-pr finding whose bead is absent from an UNTRUSTED board", async () => {
+    // A pull that didn't land means the local mirror may simply not have the bead yet, and a missed
+    // escalation strands the stall the sweep exists to surface.
+    pullMock.mockRejectedValue(new Error("offline"));
+    listMock.mockResolvedValue([]);
+    await seedStalePrReport();
+
+    expect(await sweep()).toMatchObject({ escalated: 1 });
+  });
+
   it("escalates a stale-pr finding the re-read confirms, and once the PR is unreadable", async () => {
     await seedStalePrReport();
     expect(await sweep()).toMatchObject({ escalated: 1 });
