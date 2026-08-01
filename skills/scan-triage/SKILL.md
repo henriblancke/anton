@@ -47,16 +47,28 @@ the three tiers, the nesting rule, and the run-target rule.
   config. One run target each — a `feature` when an epic owns that surface, otherwise a
   parentless `bug` (the §4.3 fallback, surfaced in §6); never cluster away a vuln.
 - **Debt — cluster, `risk:low`.** TODOs/FIXMEs, dead code, duplication, complexity hotspots →
-  group into **one `feature` per theme** ("Pay down auth-module debt") with child tickets, or a
-  single ticket if the whole theme is one small change. Don't create 40 TODO beads — and don't
-  grow one feature past a reviewable PR to keep the count down: two themes are two features.
+  group into **one `feature` per theme** ("Pay down auth-module debt") with child tickets. A theme
+  that is one small change is still a `feature` — childless, its Acceptance carried on the feature
+  itself. Don't create 40 TODO beads — and don't grow one feature past a reviewable PR to keep the
+  count down: two themes are two features.
 - **Dependencies — cluster.** Stale/deprecated/archived packages → one `feature` "Upgrade stale
-  deps" with a child ticket per package (or one ticket if it's a single bump).
+  deps" with a child ticket per package; a single bump is that same feature with no children.
 - **Risk/hygiene/docs — mostly drop or cluster.** Lottery risk, high-churn, doc drift → a
   bead only if actionable and worth a human's PR review. Merge-conflict markers / large
-  binaries → one cleanup bead: a child ticket when a feature already covers that surface,
-  otherwise a parentless `task` (the §4.3 fallback). Never file a standalone one as a `chore` —
-  a parentless `chore` isn't a run target, so it would sit on the board unexecuted.
+  binaries → one cleanup bead: a child ticket only on a feature *this triage just created*,
+  otherwise its own run target — a `feature` under the epic that owns the surface, or a parentless
+  `task` (the §4.3 fallback). Never file a standalone one as a `chore` — a parentless `chore` isn't
+  a run target, so it would sit on the board unexecuted.
+
+**A bare ticket is never how you file small work.** Parented to an epic it's a dead bead; parentless
+it runs but drops off the roadmap. Whenever an epic owns the surface, small work is a **childless
+`feature`** — a parentless `task`/`bug` is reserved for §4.3, where no epic honestly holds it.
+
+**Never grow a run that has started.** A run captures its ticket list when it begins, so a ticket
+attached to a feature that is already claimed, approved, implementing, in review, or carrying a PR
+ref is never implemented — and merge finalization closes it as delivered anyway. Only extend a
+feature this triage created, or one still open with no `approved` / `stage:*` label and no PR ref
+(`bd show <feature-id>` before you link). Anything else gets its own run target.
 
 Respect `.product/config.yaml` `stringer.max_beads_per_scan` — if triage exceeds it, keep the
 highest-severity and defer the rest (they resurface next scan). Security is exempt from the cap.

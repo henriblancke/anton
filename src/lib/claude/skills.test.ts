@@ -156,6 +156,23 @@ describe("required skill assets", () => {
       expect(scanTriage).toMatch(/hang off the feature, never off the epic/);
     });
 
+    it("scan-triage files one-small-change work as a childless feature, not a bare ticket", () => {
+      // A bare ticket under an epic is a dead bead; a parentless one leaves the roadmap without the
+      // §4.3 ask. Neither is what "this theme is a single bump" should produce.
+      expect(scanTriage).toMatch(/A bare ticket is never how you file small work/);
+      expect(scanTriage).toMatch(/childless\s+`feature`/);
+      expect(scanTriage).not.toMatch(/or a\s+single ticket if the whole theme/);
+      expect(scanTriage).not.toMatch(/one ticket if it's a single bump/);
+    });
+
+    it("scan-triage refuses to attach cleanup to an already-started run", () => {
+      // runTickets is recomputed at merge time, so a ticket added to an in-flight feature is never
+      // implemented and still gets closed as delivered by finalizeMergedEpic.
+      expect(scanTriage).toMatch(/Never grow a run that has started/);
+      expect(scanTriage).toMatch(/a feature \*this triage just created\*/);
+      expect(scanTriage).toMatch(/no `approved` \/ `stage:\*` label and no PR ref/);
+    });
+
     it("scan-triage surfaces an unattachable cluster instead of orphaning it", () => {
       // No user to ask on the 03:00 cron — the report is how the run asks (§4.3 → §6).
       expect(scanTriage).toMatch(/never mint a one-feature epic/i);
