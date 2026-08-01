@@ -26,8 +26,9 @@ stringer scan file (JSON) passed as the argument.
 
 - Parse the scan file (stringer JSON). Each signal has a collector, severity, file/line, rule,
   and often a suggested remediation.
-- `bd list --json` the existing open beads. You dedupe against these in §2, and reuse them in §4
-  to find the epic each feature belongs under.
+- `bd list --json --limit 0` the existing open beads — `--limit 0` is required, `bd list` defaults
+  to 50 and a truncated board silently re-creates beads it can't see. You dedupe against these in
+  §2, and reuse them in §4 to find the epic each feature belongs under.
 
 ## 2. Dedupe
 
@@ -44,7 +45,7 @@ the three tiers, the nesting rule, and the run-target rule.
 
 - **Security — always a bead, `risk:high`.** Committed secrets, known CVEs (OSV), unsafe
   config. One run target each — a `feature` when an epic owns that surface, otherwise a
-  parentless `bug` (§4); never cluster away a vuln.
+  parentless `bug` (the §4.3 fallback, surfaced in §6); never cluster away a vuln.
 - **Debt — cluster, `risk:low`.** TODOs/FIXMEs, dead code, duplication, complexity hotspots →
   group into **one `feature` per theme** ("Pay down auth-module debt") with child tickets, or a
   single ticket if the whole theme is one small change. Don't create 40 TODO beads — and don't
@@ -64,8 +65,9 @@ A parentless `feature` still runs, but it falls off the roadmap — it advances 
 tracks. Triage usually runs unattended on the nightly cron, so there is nobody to ask mid-run:
 either place the feature, or surface it in §6 for the founder to place.
 
-1. **Look before you create.** `bd list --type epic --json` (add `--all` if a closed epic might be
-   the right home). Match on `area:` first — the product surface the signal's files sit on — then
+1. **Look before you create.** `bd list --type epic --json --limit 0` (add `--all` if a closed epic
+   might be the right home; `--limit 0` because the default 50 would hide the matching epic and mint
+   a duplicate). Match on `area:` first — the product surface the signal's files sit on — then
    on theme. Debt in the auth module belongs under whatever outcome already owns auth.
 2. **Nothing fits, but you can name the outcome → create the epic.** State it as an outcome a
    stakeholder would recognise ("Dependencies are current and CVE-free"), not a restatement of the

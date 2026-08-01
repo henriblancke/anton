@@ -138,8 +138,17 @@ describe("required skill assets", () => {
       expect(scanTriage).not.toMatch(/one epic per theme/);
     });
 
+    it("scan-triage maps a security signal to a feature or a parentless bug, never a bare ticket", () => {
+      // The one executor-level exception to clustering — it regresses silently if the wording drifts.
+      expect(scanTriage).toMatch(/a `feature` when an epic owns that surface/);
+      expect(scanTriage).toMatch(/otherwise a\s+parentless `bug`/);
+    });
+
     it("scan-triage looks for an existing epic before creating one", () => {
-      expect(scanTriage).toMatch(/bd list --type epic --json/);
+      // `--limit 0` on both board reads: bd list defaults to 50, and a truncated board hides the
+      // matching epic (duplicate epic) or an already-tracked signal (duplicate bead).
+      expect(scanTriage).toMatch(/bd list --type epic --json --limit 0/);
+      expect(scanTriage).toMatch(/bd list --json --limit 0/);
       expect(scanTriage).toMatch(/Match on `area:` first/);
     });
 
