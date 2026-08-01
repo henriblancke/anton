@@ -97,6 +97,14 @@ function runTargetOf(bead: Bead, board: Bead[]): string {
  *
  * Refusing before any write, rather than skipping the cancel, is deliberate: closing the bead while
  * its agent keeps running is the same wrong answer one step later.
+ *
+ * The check is a boundary, not a lock, and deliberately so: a resume landing between it and the last
+ * bd write is caught one layer down instead. execute-epic re-reads the board when it dispatches and
+ * returns cleanly on an abandoned target, and filters abandoned tickets out of every run — the same
+ * defense that already absorbs the identical window for a run on ANOTHER machine, which no local
+ * reservation could ever close (jobs are machine-local). A lock here would narrow one half of that
+ * window at the cost of a global mutable reservation on the resume path, whose own failure mode —
+ * a leaked entry that blocks every future resume of the target — is worse than what it prevents.
  */
 async function stopRun(projectId: string, targetId: string, requireStopped: boolean): Promise<void> {
   if (!requireStopped) {

@@ -777,12 +777,17 @@ function asArray<T>(raw: string): T[] {
  * evidence, so a caller that acts on a deletion (refusing to resume work that no longer exists) must
  * not read it as one. Matches stderr first and the message second: {@link bd}'s rejection carries the
  * raw stderr on both.
+ *
+ * Both alternatives name an ISSUE, because "not found" on its own is a shape half of bd's
+ * operational failures share — a missing database, a missing schema, an unresolvable remote — and
+ * reading one of those as a deletion turns "bd couldn't answer" into "the bead was deleted", which
+ * is the one conversion every caller here is written to prevent.
  */
 export function isMissingBeadError(e: unknown): boolean {
   const err = e as { stderr?: unknown; message?: unknown } | null | undefined;
   const stderr = typeof err?.stderr === "string" ? err.stderr : "";
   const message = typeof err?.message === "string" ? err.message : "";
-  return /no issues? found|not found/i.test(`${stderr}\n${message}`);
+  return /no issues? found|\bissues?(?: \S+)? not found/i.test(`${stderr}\n${message}`);
 }
 
 export const beads = {
