@@ -296,7 +296,7 @@ describe("parseReviewFindings", () => {
     expect(parseReviewFindings(block('{"score":10,"findings":[]}'))).toMatchObject({ ok: true, score: 10 });
   });
 
-  it("uses the LAST report block and skips unrelated json blocks after it", () => {
+  it("uses the LAST report block, not an earlier draft", () => {
     const text = [
       "```json",
       '{"score":3,"findings":[{"severity":"blocking","location":"src/a.ts","note":"draft"}]}',
@@ -304,10 +304,6 @@ describe("parseReviewFindings", () => {
       "after fixing my own mistake, the real report:",
       "```json",
       '{"score":8,"findings":[{"severity":"advisory","location":"src/a.ts","note":"final"}]}',
-      "```",
-      "for reference, the config I read:",
-      "```json",
-      '{"compilerOptions":{"strict":true}}',
       "```",
     ].join("\n");
 
@@ -454,16 +450,69 @@ describe("parseReviewFindings", () => {
   });
 
   it("still skips an unrelated json block that merely fails to parse", () => {
+    // Quoted BEFORE the report, which is the only place anything else may appear now: an
+    // unparseable block that never looked like a report is not a broken verdict.
     const text = [
-      "```json",
-      '{"score":8,"rationale":"good","findings":[]}',
-      "```",
       "the config I read (as printed, trailing comma and all):",
       "```json",
       '{"compilerOptions":{"strict":true,}}',
       "```",
+      "```json",
+      '{"score":8,"rationale":"good","findings":[]}',
+      "```",
     ].join("\n");
 
     expect(parseReviewFindings(text)).toMatchObject({ ok: true, score: 8 });
+  });
+
+  it("rejects a report the reviewer retracts in trailing prose", () => {
+    // What "nothing after it" exists to catch: a clean verdict taken back in ordinary prose. The
+    // block above the retraction is still a perfectly valid report, so nothing else would stop it
+    // from opening a PR on work the reviewer just said was broken.
+    const text = [
+      "```json",
+      '{"score":9,"rationale":"clean","findings":[]}',
+      "```",
+      "Correction: AC-2 is missing — do not merge this.",
+    ].join("\n");
+
+    expect(parseReviewFindings(text)).toEqual({ ok: false, violation: "trailing-content", findings: [] });
+  });
+
+  it("salvages the findings of a report followed by trailing content", () => {
+    const text = [
+      "```json",
+      '{"score":4,"findings":[{"severity":"blocking","location":"src/a.ts:7","note":"unhandled rejection"}]}',
+      "```",
+      "…though I am no longer sure about that one.",
+    ].join("\n");
+
+    expect(parseReviewFindings(text)).toEqual({
+      ok: false,
+      violation: "trailing-content",
+      findings: [{ severity: "blocking", location: "src/a.ts:7", note: "unhandled rejection" }],
+    });
+  });
+
+  it("rejects a json block quoted after the report", () => {
+    // Narrower than a bare-prose retraction, and deliberate: anton cannot tell a harmless quoted
+    // config from a correction, so the protocol's one unambiguous rule is that nothing follows.
+    const text = [
+      "```json",
+      '{"score":8,"rationale":"good","findings":[]}',
+      "```",
+      "```json",
+      '{"compilerOptions":{"strict":true}}',
+      "```",
+    ].join("\n");
+
+    expect(parseReviewFindings(text)).toMatchObject({ ok: false, violation: "trailing-content" });
+  });
+
+  it("allows trailing whitespace after the report", () => {
+    expect(parseReviewFindings(`${block('{"score":9,"findings":[]}')}\n\n   \n`)).toMatchObject({
+      ok: true,
+      score: 9,
+    });
   });
 });

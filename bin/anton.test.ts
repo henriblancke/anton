@@ -39,6 +39,13 @@ import {
   untrackBeadsExports,
 } from "../src/lib/beads/config.mjs";
 
+// The runtime's canonical skill lists. The launcher must stay pure Node (it runs before any build),
+// so it duplicates them; these aliases exist only to pin the copies equal.
+import {
+  INSTALLED_SKILLS as RUNTIME_INSTALLED_SKILLS,
+  REQUIRED_SKILLS as RUNTIME_REQUIRED_SKILLS,
+} from "../src/lib/claude/prompt";
+
 const CLI = join(dirname(fileURLToPath(import.meta.url)), "anton.mjs");
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -447,6 +454,27 @@ describe("registerProject (anton init → projects board, anton-uez)", () => {
   });
 });
 
+// The launcher's skill lists are a hand-maintained copy of src/lib/claude/prompt.ts's — the
+// installer is pure Node and can't import the TS module. Nothing but this assertion stops them
+// drifting, and drift is silent-but-fatal in one direction: a skill the runtime loads but the
+// installer never copies makes every job that needs it die on a missing SKILL.md. Iterating the
+// launcher's own stale list (as the install tests do) can't catch that.
+describe("launcher skill lists match the runtime's", () => {
+  it("REQUIRED_SKILLS is identical to src/lib/claude/prompt.ts's, in order", () => {
+    expect(REQUIRED_SKILLS).toEqual([...RUNTIME_REQUIRED_SKILLS]);
+  });
+
+  it("INSTALLED_SKILLS is identical to src/lib/claude/prompt.ts's, in order", () => {
+    expect(INSTALLED_SKILLS).toEqual([...RUNTIME_INSTALLED_SKILLS]);
+  });
+
+  it("every listed skill exists as a shippable asset", () => {
+    for (const name of INSTALLED_SKILLS) {
+      expect(existsSync(join(REPO_ROOT, "skills", name, "SKILL.md"))).toBe(true);
+    }
+  });
+});
+
 describe("provisionAgentsSkills (into a temp ~/.claude)", () => {
   let claudeRoot: string;
   const skillPath = (name: string) => join(claudeRoot, "skills", name, "SKILL.md");
@@ -460,7 +488,7 @@ describe("provisionAgentsSkills (into a temp ~/.claude)", () => {
 
     // Non-interactive selection via flag so no TTY prompt is needed.
     const first = await provisionAgentsSkills(["--agents", "nextjs"], { claudeRoot, appRoot: REPO_ROOT });
-    expect(first.installed).toBe(INSTALLED_SKILLS.length + 1); // 5 skills (incl. setup) + 1 agent
+    expect(first.installed).toBe(INSTALLED_SKILLS.length + 1); // every installed skill + 1 agent
     for (const req of INSTALLED_SKILLS) expect(await exists(skillPath(req))).toBe(true);
     expect(await exists(join(claudeRoot, "agents", "nextjs.md"))).toBe(true);
     // setup's bundled templates travel with the skill directory (anton-olh).

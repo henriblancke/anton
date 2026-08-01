@@ -54,6 +54,7 @@ export type ReviewProtocolViolation =
   | "no-report"
   | "invalid-score"
   | "malformed-findings"
+  | "trailing-content"
   | "worktree-modified";
 
 /**
@@ -290,6 +291,11 @@ function reportingFormatSection(): string[] {
     `protocol violation and parks the run, because anton cannot tell a clean review from a blocking`,
     `finding it failed to read. An empty array is the way to say you found nothing.`,
     ``,
+    `"Nothing after it" is MANDATORY too: the block must be the last thing in the message. Any`,
+    `trailing text — a closing remark, a correction, a retraction — is a protocol violation and parks`,
+    `the run, because anton cannot tell a courtesy sign-off from a verdict you just took back. If you`,
+    `change your mind, emit a new report block last; do not amend one in prose.`,
+    ``,
     `Use "blocking" only for work that fails a stated Acceptance criterion, is wrong or unsafe, or`,
     `reaches green by weakening a check — anton fixes every blocking finding before the PR opens.`,
     `Use "advisory" for real improvements that do not invalidate the work. \`location\` is a path`,
@@ -404,7 +410,10 @@ function looksLikeReportText(raw: string): boolean {
  * findings ARE readable ride along on the violation, as the reason a human is being asked.
  *
  * Scanning stops at the first report-shaped block from the end — including a BROKEN one — so a
- * reviewer's earlier draft can never stand in for a final report it withdrew.
+ * reviewer's earlier draft can never stand in for a final report it withdrew. For the same reason
+ * the chosen block must actually END the message: anything but whitespace after it is a
+ * `trailing-content` violation, because trailing prose is where a reviewer retracts or corrects
+ * the verdict directly above it.
  */
 export function parseReviewFindings(text: string | undefined): ReviewReportResult {
   if (!text) return { ok: false, violation: "no-report", findings: [] };
@@ -425,6 +434,17 @@ export function parseReviewFindings(text: string | undefined): ReviewReportResul
     const raw = parsed.findings;
     const entries = Array.isArray(raw) ? raw.map(toFinding) : undefined;
     const findings = entries?.filter((f): f is ReviewFinding => f !== undefined) ?? [];
+
+    // The protocol requires the report to END the message ("nothing after it"). Ordinary trailing
+    // prose is how a reviewer takes back a verdict it already printed — a clean block followed by
+    // "Correction: AC-2 is missing" — and reading the block above it would open a PR on a review
+    // the reviewer retracted. Same reasoning as the broken-block path above: an envelope we can't
+    // trust is a violation, not a licence to fall back on an earlier draft. Whitespace is fine.
+    const block = blocks[i];
+    if (text.slice((block.index ?? 0) + block[0].length).trim()) {
+      return { ok: false, violation: "trailing-content", findings };
+    }
+
     const { score, rationale } = parsed;
     if (typeof score !== "number" || !Number.isInteger(score) || score < 0 || score > 10) {
       return { ok: false, violation: "invalid-score", findings };
