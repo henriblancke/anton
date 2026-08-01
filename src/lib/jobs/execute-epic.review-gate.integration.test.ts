@@ -16,6 +16,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { beads } from "../beads/bd";
+import { BD_BIN_ENV, resetBdBinCache, resolveBdBin } from "../beads/bd-bin";
 import { worktreePathFor } from "../git/worktree";
 import * as schema from "../db/schema";
 import { getJob, park } from "./queue";
@@ -337,6 +338,70 @@ process.exit(0);`,
     }
   });
 
+  it("carries the advisories out on the RUN ROW when the bead write fails too", async () => {
+    // Both homes gone at once: `gh pr edit` left the PR showing an earlier attempt's body AND the
+    // beads DB refused the salvage note (locked/unavailable). The run still completes — the work is
+    // on the PR — so without a third home this review's findings would vanish silently behind a
+    // green run and a stale body. The run row is that home.
+    await setReviewEnabled(true);
+    script({
+      score: 8,
+      rationale: "solid, one nit",
+      findings: [{ severity: "advisory", location: "src/a.ts:10", note: "extract the duplicated mapper" }],
+    });
+    const targetId = await approvedTarget("Stale body, unwritable bead");
+
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = writeBin(
+      binDir,
+      "gh-stale-body-unwritable",
+      `const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='list'){
+  console.log(JSON.stringify([{url:'https://github.com/acme/repo/pull/42',number:42,isDraft:false}]));
+  process.exit(0);
+}
+if(a[0]==='pr'&&a[1]==='edit'){process.stderr.write('HTTP 403\\n');process.exit(1);}
+if(a[0]==='pr'&&a[1]==='create'){process.stderr.write('should have reused the open PR\\n');process.exit(1);}
+process.exit(0);`,
+    );
+
+    // A bd that fails `note` the way a locked Dolt DB does and delegates every other command to the
+    // real binary — so only the salvage write is broken, not the run around it.
+    const okBd = process.env[BD_BIN_ENV];
+    process.env[BD_BIN_ENV] = writeBin(
+      binDir,
+      "bd-note-locked",
+      `const {spawnSync}=require('child_process');const a=process.argv.slice(2);
+if(a[0]==='note'){process.stderr.write('bd: database is locked\\n');process.exit(1);}
+const r=spawnSync(${JSON.stringify(resolveBdBin())},a,{stdio:'inherit'});
+process.exit(r.status===null?1:r.status);`,
+    );
+    resetBdBinCache();
+
+    const runner = makeEpicRunner(ctx);
+    let jobId: string;
+    try {
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
+      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+
+      // The bead never got the note — that is the failure being covered, not a missed write.
+      expect((await beads.show(repo, targetId)).notes ?? "").not.toContain("could NOT rewrite");
+
+      const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === targetId)!;
+      // Done, because the delivery landed — with the findings reproduced in full on the row.
+      expect(run.status).toBe("done");
+      expect(run.error).toMatch(/reproduced\s+here in full/);
+      expect(run.error).toContain("extract the duplicated mapper");
+      expect(run.error).toContain("https://github.com/acme/repo/pull/42");
+    } finally {
+      if (okBd === undefined) delete process.env[BD_BIN_ENV];
+      else process.env[BD_BIN_ENV] = okBd;
+      resetBdBinCache();
+      process.env.ANTON_GH_BIN = okGh;
+      if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  });
+
   it("parks the run with the findings on the bead when BLOCKING findings survive the round cap", async () => {
     // A reviewer that keeps reporting the same blocking finding must hand the run to the founder,
     // not open a PR on work its own review refused to pass. `gh pr create` booms so a wrongful
@@ -483,6 +548,77 @@ console.error('gh boom: no PR may be opened for an unresolved review');process.e
       expect(await beads.show(repo, targetId).then((b) => b.notes ?? "")).toContain(
         "could NOT check whether an earlier attempt left a PR open",
       );
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+      if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  });
+
+  it("defuses an orphaned PR when the gate DIES mid-review, not only when it refuses the work", async () => {
+    // The same lost-ref window reached through a different door: the reviewer hits a usage limit
+    // instead of returning a verdict, so the run parks for a retry — while the previous attempt's
+    // untracked PR sits READY on the branch, one click from merging un-reviewed work. A gate exit
+    // anton doesn't compose a park note for is still a gate exit with no PR of its own.
+    await setReviewEnabled(true);
+    const targetId = await approvedTarget("Quota mid-review run");
+
+    const resetSec = Math.floor(clock.now() / 1000) + 3600;
+    // Implements normally, then hits the quota on the review dispatch (told apart by the same
+    // protocol marker the suite's shared fake uses).
+    const quotaReviewClaude = writeBin(
+      binDir,
+      "claude-quota-review",
+      fakeClaudeReadingStdin(`const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+if(prompt.includes('## Reporting format (required)')){
+  e({type:'result',subtype:'error',result:'Claude AI usage limit reached|${resetSec}',is_error:true});
+  process.exit(0);
+}
+fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work '+Date.now()+'\\n');
+e({type:'system',subtype:'init',session_id:'sq'});
+e({type:'assistant',message:{content:[{type:'text',text:'done'}]}});
+e({type:'result',subtype:'success',result:'done',session_id:'sq',num_turns:1,is_error:false});
+process.exit(0);`),
+    );
+
+    const ghLog = join(sandbox, "gh-quota-orphan-calls.jsonl");
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = writeBin(
+      binDir,
+      "gh-quota-orphan",
+      `const fs=require('fs');const a=process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(ghLog)},JSON.stringify(a)+'\\n');
+if(a[0]==='pr'&&a[1]==='list'){
+  process.stdout.write(JSON.stringify([{url:'https://github.com/acme/repo/pull/91',number:91,isDraft:false}])+'\\n');
+  process.exit(0);
+}
+if(a[0]==='pr'&&a[1]==='ready'){process.exit(0);}
+console.error('gh boom: no PR may be opened for a review that never finished');process.exit(1);`,
+    );
+    process.env.ANTON_CLAUDE_BIN = quotaReviewClaude;
+
+    const runner = makeEpicRunner(ctx, { quotaCooloffMs: 60_000 });
+    let jobId: string;
+    try {
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
+      // A quota failure reschedules the job rather than parking it for a human — the run row is what
+      // reports the orphan.
+      expect((await getJob(tdb.db, jobId))?.status).toBe("queued");
+
+      const calls = readFileSync(ghLog, "utf8")
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((l) => JSON.parse(l) as string[]);
+      expect(calls).toContainEqual(["pr", "ready", "91", "--undo"]);
+
+      const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === targetId)!;
+      expect(run.status).toBe("parked");
+      // The quota classification still drives the runner's backoff — the orphan rides along with it.
+      expect(run.error).toMatch(/^usage-limit/);
+      expect(run.error).toContain("https://github.com/acme/repo/pull/91");
+      expect(run.error).toMatch(/converted to a DRAFT/);
+      // Still not stamped as the epic's PR: a ref whose PR is open short-circuits the next resume.
+      expect(beads.getPrRef(await beads.show(repo, targetId)) ?? null).toBeNull();
     } finally {
       process.env.ANTON_GH_BIN = okGh;
       if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");

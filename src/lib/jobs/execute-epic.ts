@@ -260,6 +260,10 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     // `assertLeaseHeld` guard reads it to park the run before a lease whose refresh pushes have been
     // failing silently lapses past its TTL and another machine treats the epic as free (anton-jz1).
     let leaseExpiry = 0;
+    // What the review gate found on the branch when it failed with an error anton rethrows unchanged
+    // (a usage limit, a transient claude failure) — the `catch` below folds it into that attempt's
+    // run error, which is the only report those paths get. Declared out here for that reason.
+    let orphanNotice = "";
     // Publish/refresh this run's lease. Advances `leaseLabels` ONLY after the write lands (not
     // best-effort like the other bd writes): a swallowed failure that still advanced the tracked
     // label would let `finally` clear a label that isn't on the board while the real prior lease
@@ -943,20 +947,34 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           baseBranch: freshBase,
           assertLeaseHeld,
         }).catch(async (e) => {
+          // EVERY gate failure leaves the run without a PR of its own, so every one of them carries
+          // the orphan hazard: a PR a previous attempt opened but never recorded (lost `gh` response
+          // or lost setPrRef) stays READY and mergeable with un-reviewed work whether the gate
+          // refused the verdict, died on a usage limit, or exhausted its retries. Reconcile before
+          // propagating any of them. The one exception is a lease lost to another machine — that run
+          // owns the branch and may have opened this very PR after passing its OWN gate, so drafting
+          // it would strand reviewed work with nobody left to ready it again.
+          const orphan = isRunAlreadyLiveError(e)
+            ? undefined
+            : await reconcileOrphanPullRequest(repo, worktree.branch);
+          // Errors anton doesn't compose a park message for are rethrown untouched — the runner keys
+          // its backoff (quota reschedule, retry) off the error's TYPE, and wrapping them would lose
+          // that. What the reconcile found rides out on the run row instead (see the catch below).
+          if (!isPoisonError(e)) {
+            orphanNotice = orphanClause(orphan);
+            throw e;
+          }
           // The gate parks for a human on more than a blocking verdict: an unrevertable reviewer
           // commit or a fixer that switched branches throws PoisonError from inside it. Those need
           // the SAME parked-run handling — the instruction on both is repair by hand, then resume —
           // so they are re-thrown as a gate block. Left as-is they marked the run `failed`, which
           // hides the row from findOpenRunForEpic, and the resume the human was told to do would
           // start a REPLACEMENT run instead of continuing this one and its session history.
-          if (!isPoisonError(e)) throw e;
           // A poison exit never reaches persistReviewScores below, so the rounds the gate DID finish
           // are written here or lost: a round-3 death still owes the founder rounds 1 and 2.
           if (e instanceof ReviewGatePoisonError) {
             await persistPartialReviewScores(repo, epicBeadId, e.rounds);
           }
-          // Same park, same hazard as the blocking-verdict exit below: an orphaned PR left mergeable.
-          const orphan = await reconcileOrphanPullRequest(repo, worktree.branch);
           throw new ReviewBlockedError(`${e.message}${orphanClause(orphan)}`, { cause: e });
         });
         // The score history belongs to the board, not this run's logs — written on both exits the gate
@@ -1016,8 +1034,16 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // completes regardless — so this round's advisories would exist nowhere: the score comment
       // records their COUNT, never their text. Write them onto the bead before the run finishes, so
       // the founder still has the actionable detail the stale body is hiding.
+      let staleBodyFallback: string | null = null;
       if (pr.bodyStale) {
-        await safe(() => beads.note(repo, epicBeadId, stalePrBodyNote(pr, advisoryFindings)));
+        const note = stalePrBodyNote(pr, advisoryFindings);
+        // If that write ALSO fails (a locked or unavailable beads DB) the findings have no home left,
+        // and the run would still finish `done` — the advisory detail silently dropped between this
+        // review and the merge gate. Carry the whole note out on the run row instead, the same
+        // durable fallback the park path uses (see reviewParkMessage).
+        if (!(await safe(() => beads.note(repo, epicBeadId, note)))) {
+          staleBodyFallback = stalePrBodyRunError(epicBeadId, note);
+        }
       }
       await safe(() => beads.setPrRef(repo, epicBeadId, pr.ref));
       if (!standaloneRun) {
@@ -1025,15 +1051,21 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         await safe(() => beads.untag(repo, epicBeadId, [LABELS.stage("implementing")]));
       }
 
-      // 6. Finalize run + clean up the worktree (the branch/PR carry the work now).
-      await updateRun(db, clock, runId, { status: "done", endedAt: clock.now(), error: null });
+      // 6. Finalize run + clean up the worktree (the branch/PR carry the work now). The run IS done —
+      //    the branch and its PR carry the work — so a stale-body salvage rides along as the row's
+      //    error rather than failing a delivery that landed.
+      await updateRun(db, clock, runId, {
+        status: "done",
+        endedAt: clock.now(),
+        error: staleBodyFallback,
+      });
       await safe(() => removeWorktree(worktree));
     } catch (e) {
       // Quota, a run already live on another machine (anton-jz1), or a self-review that refused the
       // PR → park the run (the job reschedules, re-checks liveness, or waits for the founder);
       // anything else → the run failed (job retries/parks).
       if (isUsageLimitError(e)) {
-        await updateRun(db, clock, runId, { status: "parked", error: "usage-limit" });
+        await updateRun(db, clock, runId, { status: "parked", error: `usage-limit${orphanNotice}` });
       } else if (isRunAlreadyLiveError(e)) {
         await updateRun(db, clock, runId, { status: "parked", error: "run-live-elsewhere" });
       } else if (e instanceof ReviewBlockedError) {
@@ -1044,7 +1076,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       } else {
         await updateRun(db, clock, runId, {
           status: "failed",
-          error: e instanceof Error ? e.message : String(e),
+          error: `${e instanceof Error ? e.message : String(e)}${orphanNotice}`,
           endedAt: clock.now(),
         });
       }
@@ -1690,6 +1722,23 @@ function stalePrBodyNote(pr: PullRequest, advisory: ReviewFinding[]): string {
       ? [`Advisory findings from this run's self-review (${advisory.length}):`, ...findingLines(advisory)]
       : [`This run's self-review reported no advisory findings.`]),
   ].join("\n");
+}
+
+/**
+ * The run-row salvage when BOTH homes for a stale-body run's findings failed: `gh pr edit` refused
+ * the refresh AND `bd note` could not record them either (a locked or unavailable beads DB).
+ *
+ * The run still delivered — the branch and its PR carry the work — so this rides on the completed
+ * run row (persisted by `updateRun` and surfaced to the founder) rather than failing it. It
+ * reproduces the note IN FULL because at this point nothing else holds the findings' text: the PR
+ * body is an earlier attempt's, and the score comment records only their count.
+ */
+export function stalePrBodyRunError(targetId: string, note: string): string {
+  return (
+    `The PR body could not be refreshed AND writing this run's self-review findings to ${targetId} ` +
+    `FAILED (a locked or unavailable beads DB) — nothing else holds them, so they are reproduced ` +
+    `here in full; put them back on the bead by hand:\n\n${note}`
+  );
 }
 
 /** Fold the parsed self-report into a zero-diff block reason, when one was emitted (anton-j5i8). */
