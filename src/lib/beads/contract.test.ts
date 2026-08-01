@@ -7,7 +7,9 @@ import {
   formatContractGaps,
   isContractJudged,
   isContractReadable,
+  outOfScopeBody,
   sectionBody,
+  verifyBody,
   validateBeadContract,
   type ContractSection,
   type ContractSeverity,
@@ -759,6 +761,31 @@ describe("shallow reads", () => {
     expect(isContractReadable({ ...shallow, description: "" })).toBe(true);
     expect(isContractReadable({ ...shallow, acceptance_criteria: "- [ ] x" })).toBe(true);
     expect(isContractReadable({ ...shallow, ...STAMPS })).toBe(true);
+  });
+});
+
+describe("outOfScopeBody + verifyBody (what self-review reads, review-context.ts)", () => {
+  it("reads each section on the tier's own keys, `## Verification` included", () => {
+    expect(outOfScopeBody(ticket())).toBe("- not the other thing");
+    expect(verifyBody(ticket())).toBe("- unit test covers it");
+    const alias = ticket({
+      description: DESCRIPTION.replace("## Verify", "## Verification"),
+    });
+    expect(verifyBody(alias)).toBe("- unit test covers it");
+  });
+
+  it("returns undefined when the bead states neither — the reviewer is told, not shown blank", () => {
+    const bare = ticket({ description: withoutSection(withoutSection(DESCRIPTION, "Verify"), "Out of scope") });
+    expect(outOfScopeBody(bare)).toBeUndefined();
+    expect(verifyBody(bare)).toBeUndefined();
+  });
+
+  it("keeps a section whole across its subheadings, exactly as the gate judges it", () => {
+    const grouped = ticket({
+      description: ["## Verify", "### Unit", "- bun test", "", "## Context", "x"].join("\n"),
+    });
+    expect(verifyBody(grouped)).toContain("- bun test");
+    expect(verifyBody(grouped)).not.toContain("x");
   });
 });
 

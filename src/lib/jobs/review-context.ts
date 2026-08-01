@@ -9,7 +9,7 @@
  * a named agent, an operator prompt, or a rewritten skill — can never break the protocol the gate
  * relies on. That is why the score is demanded by the appended context rather than by the skill.
  */
-import { acceptanceBody, goalBody } from "../beads/contract";
+import { acceptanceBody, goalBody, outOfScopeBody, verifyBody } from "../beads/contract";
 import { type Bead } from "../beads/bd";
 import { loadAgentPrompt, stripFrontmatter, USER_AGENTS_DIR } from "../claude/agent-prompt";
 import { loadSkill } from "../claude/prompt";
@@ -26,13 +26,26 @@ export const PRINCIPLES_PATH = ".product/principles.md";
  * alongside {@link PRINCIPLES_PATH}, not instead of it: a project that has principles still states
  * standing rules here (this repo's own "read the version-matched Next.js docs first" lives in
  * `AGENTS.md`), and omitting them would leave the reviewer unable to flag violations of them.
+ *
+ * Looked for in every directory on the way to a changed file, not just the repo root
+ * ({@link instructionDirs}): these files nest, and a nested one governs its subtree exactly as the
+ * root one governs the repo.
  */
-export const INSTRUCTION_PATHS = ["CLAUDE.md", "AGENTS.md"];
+export const INSTRUCTION_FILENAMES = ["CLAUDE.md", "AGENTS.md"];
 
 /** Bounds on inlined text, so one huge bead or rules file can't crowd out the diff. */
 const MAX_BEAD_FIELD_CHARS = 4000;
 const MAX_PRINCIPLES_CHARS = 8000;
+/** Per instruction file, and across all of them — a deep tree can carry many. */
 const MAX_INSTRUCTIONS_CHARS = 8000;
+const MAX_INSTRUCTIONS_TOTAL_CHARS = 24000;
+
+/**
+ * How many directories are probed for instruction files. Shallow-first (see
+ * {@link instructionDirs}), so what a cap drops is the deepest scope of a sprawling diff while every
+ * rule that binds the widest surface still reaches the reviewer.
+ */
+const MAX_INSTRUCTION_DIRS = 40;
 
 /** One reported problem with the run's diff, parsed from the reviewer's final message. */
 export interface ReviewFinding {
@@ -148,7 +161,7 @@ export async function buildReviewPrompt(args: {
   // the inlined text grades the run — so anything left out cannot be flagged at all.
   const [principles, instructions] = await Promise.all([
     readPrinciples(projectDir, baseRev),
-    readInstructions(projectDir, baseRev),
+    readInstructions(projectDir, baseRev, diff.files),
   ]);
   const prompt = [
     reasoning,
@@ -198,8 +211,33 @@ async function readPrinciples(projectDir: string, baseRev: string): Promise<stri
 }
 
 /**
- * The project's instruction files as of `baseRev` — part of the rulebook every run is judged
- * against, principles or not.
+ * Every directory whose instruction files govern this diff: the repo root, plus each ancestor of a
+ * changed path. Shallow-first and deduped, so the widest-binding rules are read first and a cap
+ * ({@link MAX_INSTRUCTION_DIRS}) trims the narrowest scopes rather than the repo-wide ones.
+ *
+ * The root is always included — it binds every path, and an empty diff still has rules to be judged
+ * against (that a run delivered nothing is itself the finding).
+ */
+function instructionDirs(changedPaths: string[]): string[] {
+  const dirs = new Set<string>([""]);
+  for (const path of changedPaths) {
+    const parts = path.split("/").slice(0, -1);
+    for (let i = 1; i <= parts.length; i++) dirs.add(parts.slice(0, i).join("/"));
+  }
+  const depth = (dir: string) => (dir === "" ? 0 : dir.split("/").length);
+  return [...dirs]
+    .sort((a, b) => depth(a) - depth(b) || a.localeCompare(b))
+    .slice(0, MAX_INSTRUCTION_DIRS);
+}
+
+/**
+ * The instruction files governing this run's changed paths, as of `baseRev` — part of the rulebook
+ * every run is judged against, principles or not.
+ *
+ * Scoped, not just repo-root: instruction files nest, and a `src/app/CLAUDE.md` binds the subtree
+ * under it exactly as the root one binds the repo. Reading only the root told the reviewer that the
+ * inlined rules are the ONLY ones grading the run while the rules actually governing the changed
+ * code sat unread — so a diff that violated them passed the gate.
  *
  * Inlined here rather than named in the prompt, and taken from the base for the same reason as the
  * principles above: naming them sends the reviewer to the worktree's copies, so a run that appends
@@ -207,9 +245,16 @@ async function readPrinciples(projectDir: string, baseRev: string): Promise<stri
  * that legitimately updates them is reviewed against the old text; the new rules apply from the next
  * run, once they are on the base branch.
  */
-async function readInstructions(projectDir: string, baseRev: string): Promise<InstructionFile[]> {
+async function readInstructions(
+  projectDir: string,
+  baseRev: string,
+  changedPaths: string[],
+): Promise<InstructionFile[]> {
+  const paths = instructionDirs(changedPaths).flatMap((dir) =>
+    INSTRUCTION_FILENAMES.map((name) => (dir ? `${dir}/${name}` : name)),
+  );
   const files = await Promise.all(
-    INSTRUCTION_PATHS.map(async (path) => {
+    paths.map(async (path) => {
       const text = await readFileAtRev(projectDir, baseRev, path).catch(() => undefined);
       return text?.trim() ? { path, text: text.trim() } : undefined;
     }),
@@ -219,7 +264,7 @@ async function readInstructions(projectDir: string, baseRev: string): Promise<In
 
 /**
  * The concrete run context appended beneath the (swappable) reasoning contract: which run, the
- * contract it must satisfy (each bead's Goal + Acceptance), the diff it produced, the project's
+ * contract it must satisfy (each bead's contract sections), the diff it produced, the project's
  * principles, and the report format anton parses afterwards. HOW to judge lives in the reasoning
  * contract; WHAT to judge and how to say it live here.
  *
@@ -253,9 +298,9 @@ function headerSection(run: ReviewRun): string[] {
 }
 
 /**
- * The contract the work is measured against: the run target plus every ticket, each with its Goal
- * and Acceptance. A standalone run (epic-of-one) lists its bead once — repeating it as "ticket 1"
- * reads as two separate contracts to grade against.
+ * The contract the work is measured against: the run target plus every ticket, each with its four
+ * contract sections ({@link beadBlock}). A standalone run (epic-of-one) lists its bead once —
+ * repeating it as "ticket 1" reads as two separate contracts to grade against.
  */
 function beadsSection(run: ReviewRun): string[] {
   const standalone = run.tickets.length === 1 && run.tickets[0]?.id === run.target.id;
@@ -266,18 +311,30 @@ function beadsSection(run: ReviewRun): string[] {
   return lines;
 }
 
+/**
+ * One bead as the reviewer reads it: all four contract sections the review contract judges against,
+ * not just the two that state the work.
+ *
+ * `Out of scope` and `Verify` are load-bearing for the two rules the shipped contract
+ * (skills/review/SKILL.md) can otherwise never apply: a criterion whose behavior has no test is NOT
+ * met "if the bead's `## Verify` asked for one", and work outside the run's beads is scope creep.
+ * The reviewer runs in a fresh context with nothing but this block, so a section left out here is a
+ * rule it cannot enforce — it would pass a run that skipped the bead's required verification or
+ * delivered exactly what the bead forbade.
+ */
 function beadBlock(bead: Bead, label: string): string[] {
-  const goal = goalBody(bead)?.trim();
-  const acceptance = acceptanceBody(bead)?.trim();
+  const field = (heading: string, body: string | undefined): string[] => [
+    `**${heading}**`,
+    body?.trim() ? truncate(body, MAX_BEAD_FIELD_CHARS) : `(none stated)`,
+    ``,
+  ];
   return [
     `### ${label}: ${bead.id} — ${bead.title}`,
     ``,
-    `**Goal**`,
-    goal ? truncate(goal, MAX_BEAD_FIELD_CHARS) : `(none stated)`,
-    ``,
-    `**Acceptance**`,
-    acceptance ? truncate(acceptance, MAX_BEAD_FIELD_CHARS) : `(none stated)`,
-    ``,
+    ...field("Goal", goalBody(bead)),
+    ...field("Acceptance", acceptanceBody(bead)),
+    ...field("Out of scope", outOfScopeBody(bead)),
+    ...field("Verify", verifyBody(bead)),
   ];
 }
 
@@ -351,19 +408,31 @@ function rulesBlock(run: ReviewRun): string[] {
           `## Project instructions`,
           ``,
           `These files instruct every agent working in this repo, so they are enforced rules too —`,
-          `each violation in the diff is a finding, exactly like a principle. They are inlined below`,
-          `as of the revision this run branched from, and that text is what to judge adherence to —`,
-          `not the copies in the worktree, which this run's own diff may have rewritten.`,
+          `each violation in the diff is a finding, exactly like a principle. A file nested in a`,
+          `directory governs the changes under that directory, on top of the ones above it. They are`,
+          `inlined below as of the revision this run branched from, and that text is what to judge`,
+          `adherence to — not the copies in the worktree, which this run's own diff may have rewritten.`,
           ``,
-          ...instructions.flatMap((f) => [
-            `### \`${f.path}\``,
-            ``,
-            truncate(f.text, MAX_INSTRUCTIONS_CHARS),
-            ``,
-          ]),
+          ...instructionBlocks(instructions),
         ]
       : []),
   ];
+}
+
+/**
+ * The instruction files as inlined text, under a shared character budget. Each file is capped, and
+ * the budget is spent shallow-first ({@link instructionDirs} orders them), so a repo whose nested
+ * files together dwarf the diff still shows the reviewer every rule that binds the widest surface.
+ * A file the budget cuts short still appears, with `truncate`'s marker — silently dropping one would
+ * read as "this scope has no rules" under the caveat below.
+ */
+function instructionBlocks(instructions: InstructionFile[]): string[] {
+  let remaining = MAX_INSTRUCTIONS_TOTAL_CHARS;
+  return instructions.flatMap((f) => {
+    const text = truncate(f.text, Math.min(MAX_INSTRUCTIONS_CHARS, remaining));
+    remaining = Math.max(0, remaining - text.length);
+    return [`### \`${f.path}\``, ``, text, ``];
+  });
 }
 
 /**

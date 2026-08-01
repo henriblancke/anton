@@ -391,6 +391,12 @@ interface SectionRule {
 
 export const GOAL_KEYS = ["goal"];
 
+/** The bounds on a ticket's change, and the proof its work landed — named here rather than inline
+ * in {@link TICKET_RULES} because self-review reads them too (review-context.ts): a spelling the
+ * gate accepts but the reader misses would hand the reviewer a bead with no bounds and no proof. */
+export const OUT_OF_SCOPE_KEYS = ["outofscope"];
+export const VERIFY_KEYS = ["verify", "verification"];
+
 /** The four advisory sections every task/bug/chore/feature carries, in the order they read best. */
 const TICKET_RULES: SectionRule[] = [
   {
@@ -412,14 +418,14 @@ const TICKET_RULES: SectionRule[] = [
   {
     section: "Out of scope",
     severity: "advisory",
-    keys: ["outofscope"],
+    keys: OUT_OF_SCOPE_KEYS,
     message: "no `## Out of scope` section — nothing bounds the change",
     promptMessage: "`## Out of scope` is still the formula's TODO prompt — nothing bounds the change",
   },
   {
     section: "Verify",
     severity: "advisory",
-    keys: ["verify", "verification"],
+    keys: VERIFY_KEYS,
     message: "no `## Verify` section — no stated way to prove the work landed",
     promptMessage:
       "`## Verify` is still the formula's TODO prompt — no stated way to prove the work landed",
@@ -561,6 +567,38 @@ export function goalBody(bead: Bead): string | undefined {
     ...(tierOf(bead) === "epic" ? [preambleOf(description)] : []),
   ].filter((b): b is string => typeof b === "string" && b.trim() !== "");
   return bodies.find((b) => stateOf([b]) === "written") ?? bodies[0];
+}
+
+/**
+ * The body of the first section among `keys`, sectioned by the bead's OWN tier keys — the tier-aware
+ * reader {@link sectionBody}'s caveat points callers holding a Bead at. A written body wins over one
+ * still holding the formula's TODO prompt, exactly as {@link goalBody} chooses.
+ */
+function tierSectionBody(bead: Bead, keys: string[]): string | undefined {
+  const description = typeof bead.description === "string" ? bead.description : "";
+  const sections = sectionsOf(description, contractKeysOf(tierOf(bead)));
+  const bodies = keys
+    .map((k) => sections.get(k))
+    .filter((b): b is string => typeof b === "string" && b.trim() !== "");
+  return bodies.find((b) => stateOf([b]) === "written") ?? bodies[0];
+}
+
+/**
+ * The bounds a ticket puts on its change, as a view renders them — the reader half of the
+ * `Out of scope` rule above. Self-review needs it to tell scope creep from delivered work: without
+ * it the reviewer has nothing to measure a change the beads never asked for against.
+ */
+export function outOfScopeBody(bead: Bead): string | undefined {
+  return tierSectionBody(bead, OUT_OF_SCOPE_KEYS);
+}
+
+/**
+ * How the ticket says its work is proven, as a view renders them — the reader half of the `Verify`
+ * rule above. Self-review grades a criterion whose behavior has no test as NOT met when this section
+ * asked for one, so a reviewer that never sees it cannot apply the rule.
+ */
+export function verifyBody(bead: Bead): string | undefined {
+  return tierSectionBody(bead, VERIFY_KEYS);
 }
 
 /**
