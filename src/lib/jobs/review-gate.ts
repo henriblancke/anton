@@ -159,6 +159,15 @@ export const REVIEW_DENIED_TOOLS = ["Bash(git:*)"];
  * the worktree fingerprint cannot see ({@link REVIEW_DENIED_TOOLS}). Dropping the two branch-owned
  * sources leaves the reviewer configured only by the machine anton runs on.
  *
+ * The same flag is what isolates the reviewer from the branch's MEMORY. Claude Code gates project
+ * memory on the setting sources, not just settings files: under `--setting-sources user` it loads
+ * neither the worktree's root `CLAUDE.md` / `AGENTS.md` nor the nested per-directory files it would
+ * otherwise pick up as the reviewer reads changed files (verified against Claude Code 2.1.220). So a
+ * run that rewrites its own memory cannot instruct the session grading it — those edits reach the
+ * reviewer as patch content, like every other change. What the reviewer can still do is OPEN one of
+ * those files itself, which is why the prompt also says plainly which text carries authority (see
+ * `rulesCaveat` in review-context).
+ *
  * The FIX session keeps the default sources: it is an implementer, and the project's own hooks
  * (formatters, guards) are supposed to apply to the code it writes.
  */

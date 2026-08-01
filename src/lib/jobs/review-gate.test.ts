@@ -26,6 +26,7 @@ import type { Clock } from "./queue";
 import {
   blockingFindings,
   runReviewGate,
+  REVIEW_SETTING_SOURCES,
   type ReviewGateContext,
   type ReviewGateResult,
 } from "./review-gate";
@@ -422,12 +423,14 @@ describe("runReviewGate — sessions", () => {
 
   it("loads the reviewer from the operator's settings only, never the branch's", async () => {
     // `.claude/settings.json` is source-controlled, so a diff that adds one would configure the
-    // session judging it — and settings register hooks, which run shell commands.
+    // session judging it — and settings register hooks, which run shell commands. The same flag
+    // gates Claude Code's project-memory discovery, so `user` is also what keeps the worktree's
+    // `CLAUDE.md` / `AGENTS.md` (root and nested) out of the reviewer's context.
     const { result, calls } = gate([report(4, [BLOCKING]), "fixed", report(9, [])]);
     await result;
 
-    expect(calls[0].settingSources).toEqual(["user"]);
-    expect(calls[2].settingSources).toEqual(["user"]);
+    expect(calls[0].settingSources).toEqual([...REVIEW_SETTING_SOURCES]);
+    expect(calls[2].settingSources).toEqual([...REVIEW_SETTING_SOURCES]);
     // The fixer is an implementer: the project's own hooks apply to the code it writes.
     expect(calls[1].settingSources).toBeUndefined();
   });

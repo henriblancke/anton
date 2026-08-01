@@ -28,10 +28,11 @@ Before reading the diff, read the run target's `## Goal` / `## Acceptance` / `##
 `## Verify` and the same fields on each ticket in the run. That is the contract the work is measured
 against — not your own idea of what the feature should be.
 
-Then read the project's own rules, because they are part of the standard:
+Then take in the project's own rules, because they are part of the standard:
 
-- `.product/principles.md` — the enforced rules for this project (read it every review; it changes).
-- `CLAUDE.md` / `AGENTS.md` and any nested per-directory instructions covering the changed files.
+- The project's enforced rules — `.product/principles.md`, or its instruction files when it has no
+  such file — inlined in the review context below, quoted from the revision this run branched from.
+  Judge adherence to that text, not to the worktree's copies, which this run's diff may have rewritten.
 - The conventions of the surrounding code — the real style guide is the code next to the diff.
 
 If a bead's Acceptance is ambiguous or self-contradictory, say so as a finding rather than silently
