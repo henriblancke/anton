@@ -666,3 +666,119 @@ describe("runReviewGate — the review is read-only", () => {
     expect(restores).toEqual([]);
   });
 });
+
+/**
+ * Gates run before the commit so a failure leaves the fix uncommitted — but only for a fixer that
+ * left its work staged. One that committed first (as project instructions routinely tell an agent to)
+ * would otherwise keep that commit through the failure, and the runner's retry reuses this worktree:
+ * `settleBaseline` discards dirt but adopts a COMMIT as the settled baseline, so the next round would
+ * review an unverified fix clean and open the PR with the gate it failed never having passed.
+ *
+ * Dispatch 2 is the fix session throughout.
+ */
+describe("runReviewGate — a failed fix leaves nothing behind", () => {
+  it("rolls back the fixer's OWN commit when a verify gate fails", async () => {
+    const worktree = fakeWorktree([], "", [2]);
+    const { result, restores } = gate(
+      [report(4, [BLOCKING]), "fixed it and committed"],
+      { reviewMaxRounds: 2, testCommand: "exit 1" },
+      [],
+      worktree,
+    );
+
+    await expect(result).rejects.toThrow(/tests gate failed after review round 1 for anton-gate1/);
+    expect(restores).toHaveLength(1);
+    // Back at the baseline the round started from: nothing a later `settleBaseline` could adopt.
+    expect(await worktree.readState()).toEqual({ head: "c0ffee", ref: RUN_REF, status: "" });
+  });
+
+  it("rolls back a commit the fix landed before it died mid-dispatch", async () => {
+    // Not just gate failures: an abort or an exhausted quota strands the same unverified commit.
+    const worktree = fakeWorktree([], "", [2]);
+    const { result, restores } = gate(
+      [report(4, [BLOCKING]), new UsageLimitError("Claude usage limit reached")],
+      { reviewMaxRounds: 2 },
+      [],
+      worktree,
+    );
+
+    await expect(result).rejects.toBeInstanceOf(UsageLimitError);
+    expect(restores).toHaveLength(1);
+    expect(await worktree.readState()).toEqual({ head: "c0ffee", ref: RUN_REF, status: "" });
+  });
+
+  it("propagates the gate failure when rolling back an UNCOMMITTED fix fails", async () => {
+    // Dirt is harmless — the retry's `settleBaseline` discards it — so a failed rollback must not
+    // replace the error the runner needs to see.
+    const worktree = fakeWorktree([2]);
+    const { result } = gate([report(4, [BLOCKING]), "fixed it"], { reviewMaxRounds: 2, testCommand: "exit 1" }, [], {
+      ...worktree,
+      restoreState: async () => {
+        throw new Error("git reset --hard failed");
+      },
+    });
+
+    const error = await result.then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(isPoisonError(error)).toBe(false);
+    expect((error as Error).message).toMatch(/tests gate failed after review round 1/);
+  });
+
+  it("parks instead of retrying when a failed fix's COMMIT cannot be rolled back", async () => {
+    const worktree = fakeWorktree([], "", [2]);
+    const { result } = gate([report(4, [BLOCKING]), "fixed it and committed"], { reviewMaxRounds: 2, testCommand: "exit 1" }, [], {
+      ...worktree,
+      restoreState: async () => {
+        throw new Error("git reset --hard failed");
+      },
+    });
+
+    const error = await result.then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(isPoisonError(error)).toBe(true);
+    expect((error as Error).message).toMatch(/the review fix of anton-gate1 WROTE to its own worktree/);
+    expect((error as Error).message).toMatch(/is left at r0gue2 \(on anton\/gate1\)/);
+    // The gate that actually failed is carried into the park reason, not lost to the cleanup error.
+    expect((error as Error).message).toMatch(/tests gate failed after review round 1/);
+  });
+
+  it("keeps the commits of a fixer that used a branch of its OWN — parked for a human, not reverted", async () => {
+    // The one failure that must NOT roll back: those commits are the human's to move, and reverting
+    // them would bury the work the park reason is asking them to rescue.
+    const worktree = fakeWorktree([], "", [2], [2]);
+    const { result, restores } = gate(
+      [report(4, [BLOCKING]), "fixed it on a branch of my own"],
+      { reviewMaxRounds: 2 },
+      [],
+      worktree,
+    );
+
+    const error = await result.then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(isPoisonError(error)).toBe(true);
+    expect((error as Error).message).toMatch(/on a branch of its own/);
+    expect(restores).toEqual([]);
+    expect(await worktree.readState()).toMatchObject({ head: "r0gue2", ref: "refs/heads/review-work-2" });
+  });
+
+  it("leaves a fix that PASSED its gates alone — the round's own commit is not rolled back", async () => {
+    const worktree = fakeWorktree([], "", [2]);
+    const { result, restores } = gate(
+      [report(4, [BLOCKING]), "fixed it and committed", report(9, [])],
+      { reviewMaxRounds: 2, testCommand: "exit 0" },
+      [false], // `commitAll` finds nothing staged — the fixer already committed
+      worktree,
+    );
+    const out = await result;
+
+    expect(out.outcome).toBe("clean");
+    expect(restores).toEqual([]);
+    expect((await worktree.readState()).head).toBe("r0gue2");
+  });
+});

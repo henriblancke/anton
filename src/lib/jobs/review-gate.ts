@@ -224,6 +224,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       claude,
       commit,
       readState,
+      restoreState,
     });
     entry.fixSessionId = fix.sessionId;
     entry.fixCommitted = fix.committed;
@@ -343,7 +344,12 @@ async function runReviewSession(args: {
     } catch (e) {
       // Throws PoisonError of its own when the reviewer's COMMIT could not be reverted — the one case
       // where retrying this worktree is more dangerous than losing the original error's backoff.
-      await discardReviewWrites({
+      await discardSessionWrites({
+        copy: {
+          tag: "review",
+          actor: "review",
+          parkRisk: "a retry would read that state as a settled baseline and open a PR on code no reviewer ever saw",
+        },
         worktreePath,
         targetId: target.id,
         before,
@@ -431,24 +437,45 @@ async function enforceReadOnly(args: {
   return { ok: false, violation: "worktree-modified", findings: report.findings };
 }
 
+/** How `discardSessionWrites` names the session it is cleaning up after, in logs and park reasons. */
+interface DiscardCopy {
+  /** Log tag: `review` or `review-fix`. */
+  tag: string;
+  /** Names the writer, article-free so the templates can supply one — "review", "review fix". */
+  actor: string;
+  /** What a retry would wrongly do with a rogue HEAD it cannot revert. */
+  parkRisk: string;
+}
+
 /**
- * The same revert, for the paths `enforceReadOnly` never reaches: the review threw (abort, quota) or
- * reported an error. A reviewer that wrote before it died is no less of a problem than one that
- * survived — worse, actually, because nothing rejects its round. Its leftovers would outlive the
- * failure and the runner's retry re-enters this worktree, where `settleBaseline` reads a committed
- * write as a settled tree, adopts it as the baseline, and a later clean review hands it to the PR.
+ * Undo what a session that died left behind, for both the review and the fix.
  *
- * A restore that itself fails is best-effort ONLY while the reviewer's write is uncommitted: the next
- * attempt's `settleBaseline` discards working-tree dirt before it reads anything, so the failure
- * costs nothing and must not replace the error the runner needs to see (UsageLimitError in particular
- * drives backoff). A reviewer that COMMITTED — or that left HEAD on a branch of its own — is the
- * opposite: an unrevertable rogue HEAD reads as a settled tree, so the retry would adopt it as the
- * reviewed baseline and push it, and a stray branch silently diverts every later commit off the
- * branch `openPullRequest` pushes. Those cases park the run as poison — deliberately overriding
- * backoff, since no retry may accept this worktree — and carry the original failure in the message so
- * the reason it died isn't lost.
+ * For the REVIEW this is the revert `enforceReadOnly` never reaches: the review threw (abort, quota)
+ * or reported an error. A reviewer that wrote before it died is no less of a problem than one that
+ * survived — worse, actually, because nothing rejects its round.
+ *
+ * For the FIX it is the gate's own guarantee. Gates run before the commit so a failure leaves the
+ * attempt uncommitted, but a fixer that committed its own work first (which project instructions
+ * routinely tell an agent to do) breaks that: the gate failure would leave a verified-by-nothing
+ * commit on the branch.
+ *
+ * Either way the leftovers would outlive the failure and the runner's retry re-enters this worktree,
+ * where `settleBaseline` reads a committed write as a settled tree, adopts it as the baseline, and a
+ * later clean review hands it to the PR. Rolling back to the pre-session fingerprint also makes a
+ * self-committing fixer fail exactly like one that left its fix unstaged — same baseline, and the
+ * gates run again on the next attempt.
+ *
+ * A restore that itself fails is best-effort ONLY while the write is uncommitted: the next attempt's
+ * `settleBaseline` discards working-tree dirt before it reads anything, so the failure costs nothing
+ * and must not replace the error the runner needs to see (UsageLimitError in particular drives
+ * backoff). A session that COMMITTED — or that left HEAD on a branch of its own — is the opposite:
+ * an unrevertable rogue HEAD reads as a settled tree, and a stray branch silently diverts every later
+ * commit off the branch `openPullRequest` pushes. Those cases park the run as poison — deliberately
+ * overriding backoff, since no retry may accept this worktree — and carry the original failure in the
+ * message so the reason it died isn't lost.
  */
-async function discardReviewWrites(args: {
+async function discardSessionWrites(args: {
+  copy: DiscardCopy;
   worktreePath: string;
   targetId: string;
   before: WorktreeState;
@@ -460,7 +487,7 @@ async function discardReviewWrites(args: {
   readState: (worktreePath: string) => Promise<WorktreeState>;
   restoreState: (worktreePath: string, state: WorktreeState) => Promise<void>;
 }): Promise<void> {
-  const { worktreePath, targetId, before, logPath, round, maxRounds, cause } = args;
+  const { copy, worktreePath, targetId, before, logPath, round, maxRounds, cause } = args;
 
   let after: WorktreeState | undefined;
   try {
@@ -475,24 +502,23 @@ async function discardReviewWrites(args: {
       after !== undefined && (after.head !== before.head || after.ref !== before.ref);
     await appendSessionLog(
       logPath,
-      `[review] round ${round}/${maxRounds}: could not revert the failed review's changes: ${String(e)}` +
-        (stuck ? ` — the worktree is stuck on the reviewer's own commit/branch, so the run is parked` : ``) +
+      `[${copy.tag}] round ${round}/${maxRounds}: could not revert the failed ${copy.actor}'s changes: ${String(e)}` +
+        (stuck ? ` — the worktree is stuck on its own commit/branch, so the run is parked` : ``) +
         `\n`,
     ).catch(() => {});
     if (stuck) {
       throw new PoisonError(
-        `the review of ${targetId} WROTE to its own worktree and the revert failed (${String(e)}): ` +
-          `${worktreePath} is left at ${describeRef(after!)}, not the reviewed ${describeRef(before)}. ` +
-          `Parked instead of retried — a retry would read that state as a settled baseline and open a PR ` +
-          `on code no reviewer ever saw. Reset the worktree by hand, then resume. ` +
-          `The review itself failed with: ${String(cause)}`,
+        `the ${copy.actor} of ${targetId} WROTE to its own worktree and the revert failed (${String(e)}): ` +
+          `${worktreePath} is left at ${describeRef(after!)}, not the settled ${describeRef(before)}. ` +
+          `Parked instead of retried — ${copy.parkRisk}. Reset the worktree by hand, then resume. ` +
+          `The ${copy.actor} itself failed with: ${String(cause)}`,
       );
     }
     return;
   }
   await appendSessionLog(
     logPath,
-    `[review] round ${round}/${maxRounds}: the review FAILED after writing to the worktree — its ` +
+    `[${copy.tag}] round ${round}/${maxRounds}: the ${copy.actor} FAILED after writing to the worktree — its ` +
       `changes were reverted to ${before.head.slice(0, 12)} so the next attempt cannot inherit them\n`,
   ).catch(() => {});
 }
@@ -504,7 +530,10 @@ async function discardReviewWrites(args: {
  * work no reviewer asked for.
  *
  * Gate order matches execution and review-fix: gates run BEFORE the commit, so a failing gate leaves
- * the attempted fix uncommitted in the worktree and fails the job rather than pushing red code.
+ * the attempted fix uncommitted in the worktree and fails the job rather than pushing red code. That
+ * ordering is not enough on its own — a fixer that committed its own work first would keep the commit
+ * through the failure — so the failure path rolls the worktree back to the pre-fix fingerprint
+ * (`discardSessionWrites`), leaving nothing a later round could mistake for a verified baseline.
  *
  * "Committed" means the ROUND made progress, not that `commitAll` did the committing. A fixer that
  * commits its own work — which project instructions routinely tell an agent to do, whatever this
@@ -530,6 +559,7 @@ async function runGateFixSession(args: {
   claude: (options: RunClaudeOptions) => Promise<ClaudeResult>;
   commit: (worktreePath: string, message: string) => Promise<{ committed: boolean }>;
   readState: (worktreePath: string) => Promise<WorktreeState>;
+  restoreState: (worktreePath: string, state: WorktreeState) => Promise<void>;
 }): Promise<{ sessionId: string; committed: boolean }> {
   const { db, clock, ctx, projectId, runId, target, settings, worktreePath, findings, round, maxRounds, claude, commit } =
     args;
@@ -557,57 +587,95 @@ async function runGateFixSession(args: {
       `[review-fix] round ${round}/${maxRounds}: fixing ${findings.length} blocking finding(s)\n`,
     );
     const before = await args.readState(worktreePath);
+    // Flips once the gates have passed AND the work is committed: past that point the round's output
+    // is verified, and the rollback below must not touch it however the session ends.
+    let verified = false;
 
-    const result = await claude({
-      cwd: worktreePath,
-      prompt,
-      appendSystemPrompt,
-      model: settings.model,
-      permissionMode: settings.permissionMode ?? "bypassPermissions",
-      signal: ctx.signal,
-      onEvent,
-    });
-    if (!result.ok) {
-      throw new Error(
-        `claude reported an error fixing review findings for ${target.id}: ${result.text ?? "unknown"}`,
+    try {
+      const result = await claude({
+        cwd: worktreePath,
+        prompt,
+        appendSystemPrompt,
+        model: settings.model,
+        permissionMode: settings.permissionMode ?? "bypassPermissions",
+        signal: ctx.signal,
+        onEvent,
+      });
+      if (!result.ok) {
+        throw new Error(
+          `claude reported an error fixing review findings for ${target.id}: ${result.text ?? "unknown"}`,
+        );
+      }
+
+      // Checked before the gates and the commit: work is only a fix if it lands where the PR looks.
+      // The fixer's commits are legitimate, so they are parked for a human rather than reverted —
+      // gating and committing onto the stray branch would only bury them deeper.
+      const afterFix = await args.readState(worktreePath);
+      if (afterFix.ref !== before.ref) {
+        throw new PoisonError(
+          `the review fix for ${target.id} left ${worktreePath} on a branch of its own: ${describeRef(afterFix)}, ` +
+            `not the run's ${describeRef(before)}. Parked instead of retried — anton pushes the run's branch by ` +
+            `name, so the fix (and every later commit) would never reach the PR, while the confirming review ` +
+            `would read it and pass. Move the commits back onto the run's branch by hand, then resume.`,
+        );
+      }
+
+      await runVerifyGates(
+        resolveVerifyGates(settings),
+        worktreePath,
+        ctx.signal,
+        logPath,
+        (gate, code) => `${gate.label} gate failed after review round ${round} for ${target.id} (exit ${code})`,
       );
-    }
 
-    // Checked before the gates and the commit: work is only a fix if it lands where the PR looks.
-    // The fixer's commits are legitimate, so they are parked for a human rather than reverted —
-    // gating and committing onto the stray branch would only bury them deeper.
-    const afterFix = await args.readState(worktreePath);
-    if (afterFix.ref !== before.ref) {
-      throw new PoisonError(
-        `the review fix for ${target.id} left ${worktreePath} on a branch of its own: ${describeRef(afterFix)}, ` +
-          `not the run's ${describeRef(before)}. Parked instead of retried — anton pushes the run's branch by ` +
-          `name, so the fix (and every later commit) would never reach the PR, while the confirming review ` +
-          `would read it and pass. Move the commits back onto the run's branch by hand, then resume.`,
+      const { committed } = await commit(worktreePath, `${target.id}: address self-review findings (round ${round})`);
+      verified = true;
+      // Nothing staged is only "no progress" if HEAD also stood still — otherwise the fixer committed
+      // its own work and the branch already carries the repair the next review will read.
+      const selfCommitted = !committed && afterFix.head !== before.head;
+      await appendSessionLog(
+        logPath,
+        committed
+          ? `[review-fix] round ${round}/${maxRounds}: committed the fix\n`
+          : selfCommitted
+            ? `[review-fix] round ${round}/${maxRounds}: the fixer committed its own changes — nothing left to stage\n`
+            : `[review-fix] round ${round}/${maxRounds}: no changes produced — findings left unresolved\n`,
       );
+      await endSession(db, clock, sessionId, "done");
+      return { sessionId, committed: committed || selfCommitted };
+    } catch (e) {
+      // Gates run before the commit so a failure leaves the fix uncommitted — unless the fixer
+      // committed its own work first, which project instructions routinely tell an agent to do. Then
+      // the failure would strand an unverified commit on the run's branch, and the runner's retry
+      // reuses this worktree: `settleBaseline` discards dirt but adopts a COMMIT as the settled
+      // baseline, so the next round reviews that fix clean and opens the PR with the gate it failed
+      // never having passed. Rolling back to the pre-fix fingerprint closes that, and makes a
+      // self-committing fixer fail exactly like one that left the fix unstaged.
+      //
+      // PoisonError passes through untouched: it means the fixer committed onto a branch of its own,
+      // which is already parked for a human — and those commits must survive for them to move.
+      // Throws a PoisonError of its own when a COMMIT could not be reverted.
+      if (!verified && !(e instanceof PoisonError)) {
+        await discardSessionWrites({
+          copy: {
+            tag: "review-fix",
+            actor: "review fix",
+            parkRisk:
+              "a retry would read that state as a settled baseline and open a PR carrying a fix whose verify gates never passed",
+          },
+          worktreePath,
+          targetId: target.id,
+          before,
+          logPath,
+          round,
+          maxRounds,
+          cause: e,
+          readState: args.readState,
+          restoreState: args.restoreState,
+        });
+      }
+      throw e;
     }
-
-    await runVerifyGates(
-      resolveVerifyGates(settings),
-      worktreePath,
-      ctx.signal,
-      logPath,
-      (gate, code) => `${gate.label} gate failed after review round ${round} for ${target.id} (exit ${code})`,
-    );
-
-    const { committed } = await commit(worktreePath, `${target.id}: address self-review findings (round ${round})`);
-    // Nothing staged is only "no progress" if HEAD also stood still — otherwise the fixer committed
-    // its own work and the branch already carries the repair the next review will read.
-    const selfCommitted = !committed && afterFix.head !== before.head;
-    await appendSessionLog(
-      logPath,
-      committed
-        ? `[review-fix] round ${round}/${maxRounds}: committed the fix\n`
-        : selfCommitted
-          ? `[review-fix] round ${round}/${maxRounds}: the fixer committed its own changes — nothing left to stage\n`
-          : `[review-fix] round ${round}/${maxRounds}: no changes produced — findings left unresolved\n`,
-    );
-    await endSession(db, clock, sessionId, "done");
-    return { sessionId, committed: committed || selfCommitted };
   } catch (e) {
     await endSession(db, clock, sessionId, "failed");
     throw e; // propagate so the runner applies quota backoff / retry / park
