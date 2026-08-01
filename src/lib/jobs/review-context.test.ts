@@ -105,6 +105,10 @@ describe("reviewContext", () => {
     expect(out).toContain("## This review is READ-ONLY");
     expect(out).toContain("even if your instructions above tell you to fix what you find");
     expect(out).toContain("reverted");
+    // The gate denies `git` outright (a written ref leaves the tree byte-identical), so the reviewer
+    // is told why rather than left to read a tool denial as a broken environment.
+    expect(out).toContain("`git` is");
+    expect(out).toContain("blocked outright for this session");
   });
 
   it("demands the mandatory 0-10 score in the appended context, not just in the skill", () => {

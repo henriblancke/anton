@@ -622,6 +622,38 @@ describe("runClaude", () => {
     expect(result.text).toBe("ok");
   });
 
+  it("passes disallowedTools through as --disallowedTools, alongside bypassPermissions", async () => {
+    // The review gate's guard against a reviewer writing git refs: deny rules bind even under
+    // bypassPermissions, so BOTH flags must reach argv together for it to mean anything.
+    const dumpPath = join(dir, "deny-argv-dump.json");
+    const path = join(dir, "deny-argv-claude");
+    writeFileSync(
+      path,
+      [
+        "#!/usr/bin/env node",
+        "const fs = require('node:fs');",
+        `fs.writeFileSync(${JSON.stringify(dumpPath)}, JSON.stringify(process.argv.slice(2)));`,
+        "process.stdout.write(JSON.stringify({ type: 'result', is_error: false, session_id: 'sess-deny', result: 'ok' }) + '\\n');",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    chmodSync(path, 0o755);
+    process.env[CLAUDE_BIN_ENV] = path;
+
+    const result = await runClaude({
+      cwd: dir,
+      prompt: "review the diff",
+      permissionMode: "bypassPermissions",
+      disallowedTools: ["Bash(git:*)", "Bash(gh:*)"],
+    });
+
+    expect(result.ok).toBe(true);
+    const argv = JSON.parse(readFileSync(dumpPath, "utf8")) as string[];
+    expect(argv[argv.indexOf("--disallowedTools") + 1]).toBe("Bash(git:*),Bash(gh:*)");
+    expect(argv[argv.indexOf("--permission-mode") + 1]).toBe("bypassPermissions");
+  });
+
   it("delivers the task prompt on stdin and the system prompt via --append-system-prompt-file, with neither on argv (anton-14tj)", async () => {
     // The whole point of anton-14tj: no bead/contract text may land on the child's command line, so
     // `ps` during an autonomous run reveals neither. A fake that echoes its stdin and the contents of

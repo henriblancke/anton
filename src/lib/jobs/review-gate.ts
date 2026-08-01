@@ -129,6 +129,26 @@ export interface ReviewGateArgs {
   deps?: ReviewGateDeps;
 }
 
+/**
+ * Tools denied to a review session. `git` in full, because the worktree fingerprint cannot see the
+ * repository the worktree belongs to: `git branch anton/<future-bead> HEAD` writes a ref while HEAD,
+ * the symbolic ref, and porcelain status all stay identical, and `createWorktree` adopts an existing
+ * branch instead of cutting one from the base — so a reviewer could plant commits in an unrelated
+ * later run's PR and still pass the read-only guard.
+ *
+ * Denied rather than fingerprinted-and-restored because the ref store is SHARED: anton runs several
+ * epics per project concurrently in sibling worktrees, and they legitimately create their own
+ * branches, commit to them, and update `refs/remotes/*` throughout a review. Snapshotting refs could
+ * not tell a sibling run's branch from a reviewer's, so restoring would delete a branch another
+ * worktree has checked out, and merely detecting would park healthy runs. A deny rule has no such
+ * blast radius, and it is enforced ahead of `bypassPermissions`.
+ *
+ * All of `git`, not an enumeration of its writing subcommands: an enumeration rots into a gap the
+ * next git release opens, and the reviewer needs none of it — anton hands it the diff, the file list,
+ * and the beads, and the worktree is there to read.
+ */
+export const REVIEW_DENIED_TOOLS = ["Bash(git:*)"];
+
 /** Findings that hold the PR back. The call-site's park decision reads exactly this. */
 export function blockingFindings(findings: ReviewFinding[]): ReviewFinding[] {
   return findings.filter((f) => f.severity === "blocking");
@@ -256,6 +276,10 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
  * then passing it. Its fix would be thrown away (the branch anton pushes is the reviewed HEAD) or,
  * worse, ride along uninspected in the next fix session's commit.
  *
+ * The fingerprint covers the worktree, so `git` is denied outright ({@link REVIEW_DENIED_TOOLS}) to
+ * cover what it cannot see: the repository the worktree belongs to, where a written ref leaves the
+ * tree byte-identical.
+ *
  * The revert runs on EVERY exit once the baseline is settled — a review that throws or reports an
  * error is exactly as capable of having written first, and its leftovers would otherwise outlive it
  * (see `discardSessionWrites`).
@@ -324,6 +348,7 @@ async function runReviewSession(args: {
         prompt,
         model: settings.model,
         permissionMode: settings.permissionMode ?? "bypassPermissions",
+        disallowedTools: REVIEW_DENIED_TOOLS,
         signal: ctx.signal,
         onEvent,
       });

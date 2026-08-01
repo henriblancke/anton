@@ -245,6 +245,11 @@ export function sameWorktreeState(a: WorktreeState, b: WorktreeState): boolean {
  * is explicitly allowed to run the project's own checks — which rewrite exactly those paths
  * (`.next/`, `.eslintcache`, `*.tsbuildinfo`, coverage). Hashing them would fail every honest review
  * instead of catching a dishonest one.
+ *
+ * Scoped to this WORKTREE, too. The repository's other refs are deliberately absent: sibling
+ * worktrees of concurrent runs share one ref store and churn it constantly, so a fingerprint there
+ * could not tell their branches from a rogue phase's. A phase that must not write refs is denied
+ * `git` instead — see `REVIEW_DENIED_TOOLS` in jobs/review-gate.
  */
 export async function readWorktreeState(worktreePath: string): Promise<WorktreeState> {
   const [head, status, ref] = await Promise.all([

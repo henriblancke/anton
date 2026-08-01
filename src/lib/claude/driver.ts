@@ -54,6 +54,12 @@ export interface RunClaudeOptions {
   /** Restrict tools (--allowedTools), optional. */
   allowedTools?: string[];
   /**
+   * Hard-deny tools or command prefixes (--disallowedTools), e.g. `Bash(git:*)`. Deny rules are
+   * evaluated ahead of `permissionMode`, so this still binds an unattended `bypassPermissions`
+   * session — which is the only reason it is usable as a guard rather than a request.
+   */
+  disallowedTools?: string[];
+  /**
    * Resume an existing Claude session (`--resume <id>`) instead of starting fresh (anton-juar).
    * Set on a retry after a transient mid-stream death: the run continues with the full in-session
    * conversation, so `prompt` should be a brief continuation, not the whole ticket spec again.
@@ -307,6 +313,9 @@ export async function runClaude(opts: RunClaudeOptions): Promise<ClaudeResult> {
   args.push("--permission-mode", opts.permissionMode ?? "bypassPermissions");
   if (opts.allowedTools && opts.allowedTools.length > 0) {
     args.push("--allowedTools", opts.allowedTools.join(","));
+  }
+  if (opts.disallowedTools && opts.disallowedTools.length > 0) {
+    args.push("--disallowedTools", opts.disallowedTools.join(","));
   }
 
   const runPromise = new Promise<ClaudeResult>((resolve, reject) => {

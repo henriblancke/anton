@@ -293,9 +293,11 @@ function readOnlySection(): string[] {
     `dispatches the fixes in a separate session after your report.`,
     ``,
     `anton compares the worktree before and after this review: any change you make is reverted and`,
-    `the review is discarded as a protocol violation, which parks the run for a human. Reading,`,
-    `searching, and running the project's own read-only checks (tests, type-check, lint) is expected —`,
-    `just leave the tree exactly as you found it.`,
+    `the review is discarded as a protocol violation, which parks the run for a human. \`git\` is`,
+    `blocked outright for this session — a ref you write leaves the worktree byte-identical, so it is`,
+    `denied rather than detected. Everything you would reach for it is already above: the diff, the`,
+    `changed-file list, and the beads. Reading, searching, and running the project's own read-only`,
+    `checks (tests, type-check, lint) is expected — just leave the tree exactly as you found it.`,
     ``,
   ];
 }

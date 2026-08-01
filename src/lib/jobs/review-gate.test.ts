@@ -405,6 +405,20 @@ describe("runReviewGate — sessions", () => {
       expect(review.prompt).toContain("Run target: anton-gate1 — Ship the gate");
     }
   });
+
+  it("denies the reviewer `git`, but leaves the fix session free to use it", async () => {
+    // The worktree fingerprint cannot see a written ref: `git branch anton/<future-bead> HEAD` leaves
+    // HEAD, the symbolic ref, and the status identical, and `createWorktree` adopts an existing
+    // branch — so reviewer-chosen commits would ride into an unrelated later run's PR. A deny rule is
+    // the guard, since the ref store is shared with concurrent runs and cannot be restored blindly.
+    const { result, calls } = gate([report(4, [BLOCKING]), "fixed", report(9, [])]);
+    await result;
+
+    expect(calls[0].disallowedTools).toEqual(["Bash(git:*)"]);
+    expect(calls[2].disallowedTools).toEqual(["Bash(git:*)"]);
+    // The fixer commits its own work in the normal case; denying it git would break that.
+    expect(calls[1].disallowedTools).toBeUndefined();
+  });
 });
 
 describe("runReviewGate — the run-lease is re-asserted between dispatches", () => {
