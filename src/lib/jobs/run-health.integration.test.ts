@@ -156,7 +156,13 @@ describeBd("run-health e2e (real handler · real bd)", () => {
 
     const parked = findingsByKind(report!.findings, "parked-run");
     expect(parked).toHaveLength(1);
-    expect(parked[0]).toMatchObject({ runId: parkedRunId, beadId: healthyEpic });
+    // The job pointer matters as much as the run: an abandon leaves a stopped job alone, so without
+    // it the parked job survives the abandon and keeps offering Resume in the jobs UI.
+    expect(parked[0]).toMatchObject({
+      runId: parkedRunId,
+      beadId: healthyEpic,
+      jobId: exhaustedJobId,
+    });
     expect(parked[0].reason).toContain("verify gate failed");
     expect(parked[0].ageMs).toBe(4 * HOUR);
 

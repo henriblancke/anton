@@ -202,6 +202,18 @@ function coveringExecuteEpicId(
 const RESUMABLE_STATUSES = ["parked", "failed"] as const;
 
 /**
+ * Insert order, as the tie-breaker for every "newest job for this epic" read below. `updatedAt` is
+ * truncated to whole seconds on the way in (`secDate`, matching the schema's timestamp mode), so two
+ * jobs for one epic settled inside the same second sort ARBITRARILY on it alone — and SQLite is free
+ * to hand back the older `done` row instead of the one an operator just cancelled, which is exactly
+ * the evidence `resumeEpic` and the unstick pass read to honour a cancel. SQLite's implicit rowid is
+ * a monotonic insert counter, so it orders same-second rows deterministically by creation, and jobs
+ * for a single epic are created sequentially (`jobs_active_epic_unique` allows only one at a time),
+ * so the last-created row is the latest attempt.
+ */
+const JOB_INSERT_ORDER = sql`${schema.jobs}.rowid`;
+
+/**
  * Id of a SETTLED-BUT-RECOVERABLE execute-epic job for this project + epic — `parked` or `failed`,
  * the two statuses `resumeJob` un-parks (anton-wvcy). The unstick pass needs this to pick its resume
  * verb: a stalled epic that still has a parked job is revived by resuming THAT job (which reuses its
@@ -209,7 +221,8 @@ const RESUMABLE_STATUSES = ["parked", "failed"] as const;
  * `enqueueExecuteEpicIfAbsent` first would be a silent no-op for the former — a parked job "covers"
  * the epic, so nothing would be enqueued and nothing resumed.
  *
- * Newest first, so a re-parked epic resumes its most recent attempt rather than an ancient one.
+ * Newest first (see {@link JOB_INSERT_ORDER} for the tie-break), so a re-parked epic resumes its
+ * most recent attempt rather than an ancient one.
  */
 export async function resumableExecuteEpicId(
   db: AntonDb,
@@ -227,7 +240,7 @@ export async function resumableExecuteEpicId(
         eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
       ),
     )
-    .orderBy(desc(schema.jobs.updatedAt))
+    .orderBy(desc(schema.jobs.updatedAt), desc(JOB_INSERT_ORDER))
     .limit(1);
   return rows[0]?.id;
 }
@@ -237,6 +250,9 @@ export async function resumableExecuteEpicId(
  * unstick pass reads it to learn when a usage-limit park's window reopens: the runner records that
  * on the JOB (`runAt` + a `usage-limit: resumes at <ISO>` lastError), never on the run row, so the
  * run's bare `usage-limit` error alone can't say whether the quota is back.
+ *
+ * Also the cancellation evidence both `resumeEpic` and the classifier's `epicCancelled` read, so the
+ * ordering has to be TOTAL and not merely descending — see {@link JOB_INSERT_ORDER}.
  */
 export async function latestExecuteEpicJob(
   db: AntonDb,
@@ -253,7 +269,7 @@ export async function latestExecuteEpicJob(
         eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
       ),
     )
-    .orderBy(desc(schema.jobs.updatedAt))
+    .orderBy(desc(schema.jobs.updatedAt), desc(JOB_INSERT_ORDER))
     .limit(1);
   return rows[0];
 }

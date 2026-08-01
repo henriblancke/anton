@@ -541,6 +541,41 @@ describe("resumeEpic and a cancel that races it", () => {
     expect(enqueueIfAbsent).toHaveBeenCalledWith("p1", "e-1");
   });
 
+  it("honours a cancel that settled in the SAME SECOND as an older job", async () => {
+    // Every job timestamp is truncated to whole seconds, so `updatedAt` alone cannot separate two
+    // jobs settled inside one second — and without a total order SQLite may hand back the older
+    // `done` row, losing the cancel and restarting work the operator explicitly stopped.
+    const settledAt = secDate(NOW - HOUR);
+    t.db
+      .insert(schema.jobs)
+      .values({
+        id: "j-done",
+        type: "execute-epic",
+        projectId: "p1",
+        payloadJson: JSON.stringify({ projectId: "p1", epicBeadId: "e-1" }),
+        status: "done",
+        runAt: secDate(NOW - 2 * HOUR),
+        createdAt: secDate(NOW - 3 * HOUR),
+        updatedAt: settledAt,
+      })
+      .run();
+    seedParkedJob("j-cancelled", "e-1");
+    t.db
+      .update(schema.jobs)
+      .set({ status: "cancelled", lastError: "cancelled by operator", updatedAt: settledAt })
+      .where(eq(schema.jobs.id, "j-cancelled"))
+      .run();
+    const enqueueIfAbsent = vi.fn(() => "j-fresh");
+
+    const outcome = await resumeEpic(t.db, clock, "p1", "e-1", {
+      resume: vi.fn(async () => false),
+      enqueueIfAbsent,
+    });
+
+    expect(outcome).toBe("job-cancelled");
+    expect(enqueueIfAbsent).not.toHaveBeenCalled();
+  });
+
   it("still enqueues when the resumable job merely vanished — only a cancel is an operator stop", async () => {
     seedParkedJob("j-parked", "e-1");
     const resume = vi.fn(async (jobId: string) => {

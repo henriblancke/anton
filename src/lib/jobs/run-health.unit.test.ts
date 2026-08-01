@@ -13,6 +13,7 @@ import {
   detectParkedRuns,
   detectStalePrs,
   inReviewTargets,
+  settledExecuteEpicJobsByEpic,
   type InReviewPr,
 } from "./run-health";
 import type { RunRow } from "../runs";
@@ -103,6 +104,48 @@ describe("detectParkedRuns", () => {
       run("r-2", { updatedAt: secDate(NOW - 3 * HOUR) }),
     ];
     expect(detectParkedRuns(rows, NOW, 2 * HOUR).map((f) => f.beadId)).toEqual(["t-9", "e-1"]);
+  });
+
+  it("carries the settled job behind the run, so an abandon can cancel it too", () => {
+    const rows = [run("r-1", { updatedAt: secDate(NOW - 3 * HOUR) })];
+    const jobs = settledExecuteEpicJobsByEpic([job("j-parked")]);
+
+    expect(detectParkedRuns(rows, NOW, 2 * HOUR, jobs)[0].jobId).toBe("j-parked");
+  });
+
+  it("leaves the job pointer unset when the epic has no settled job to cancel", () => {
+    const rows = [run("r-1", { updatedAt: secDate(NOW - 3 * HOUR) })];
+    const jobs = settledExecuteEpicJobsByEpic([
+      job("j-other", { payloadJson: JSON.stringify({ epicBeadId: "e-2" }) }),
+    ]);
+
+    expect(detectParkedRuns(rows, NOW, 2 * HOUR, jobs)[0].jobId).toBeUndefined();
+  });
+});
+
+describe("settledExecuteEpicJobsByEpic", () => {
+  it("keys execute-epic jobs by their epic, ignoring other job types", () => {
+    const byEpic = settledExecuteEpicJobsByEpic([
+      job("j-1"),
+      job("j-2", { payloadJson: JSON.stringify({ epicBeadId: "e-2" }) }),
+      job("j-push", { type: "sync-push", payloadJson: "{}" }),
+    ]);
+
+    expect([...byEpic.keys()].sort()).toEqual(["e-1", "e-2"]);
+    expect(byEpic.get("e-1")!.id).toBe("j-1");
+  });
+
+  it("keeps the newest attempt, and breaks a same-second tie deterministically", () => {
+    const older = job("j-old", { updatedAt: secDate(NOW - 3 * HOUR) });
+    const newer = job("j-new", { updatedAt: secDate(NOW - HOUR) });
+    expect(settledExecuteEpicJobsByEpic([newer, older]).get("e-1")!.id).toBe("j-new");
+    expect(settledExecuteEpicJobsByEpic([older, newer]).get("e-1")!.id).toBe("j-new");
+
+    // Timestamps are second-granular, so two jobs settled in the same second must not make the
+    // report depend on row order — the sweep is upserted per project and has to converge.
+    const tied = [job("j-a"), job("j-b")];
+    expect(settledExecuteEpicJobsByEpic(tied).get("e-1")!.id).toBe("j-b");
+    expect(settledExecuteEpicJobsByEpic([...tied].reverse()).get("e-1")!.id).toBe("j-b");
   });
 });
 

@@ -70,15 +70,48 @@ function humanAge(ms: number): string {
 // ── detectors (pure; every one takes an explicit `nowMs` so tests run on a fixed clock) ──
 
 /**
+ * The settled (`parked`/`failed`) execute-epic job behind each epic, keyed by epic bead id — the job
+ * pointer a `parked-run` finding carries. A run parks because its job parked, and the two are settled
+ * SEPARATELY on abandon: `abandonTicket` deliberately leaves a stopped job alone (`requireStopped`),
+ * so `settleAbandonedWork` is what cancels it, and it can only do that from `view.jobId`. Without the
+ * pointer an abandoned epic keeps its parked job — and the Resume control that job still shows in the
+ * jobs UI.
+ *
+ * Newest wins on a duplicate, tie-broken by id so two jobs settled inside the same second (the
+ * timestamps are second-granular) don't make the report non-deterministic.
+ */
+export function settledExecuteEpicJobsByEpic(jobs: JobRow[]): Map<string, JobRow> {
+  const byEpic = new Map<string, JobRow>();
+  for (const job of jobs) {
+    if (job.type !== "execute-epic") continue;
+    const epicBeadId = epicBeadIdOf(job.payloadJson);
+    if (!epicBeadId) continue;
+    const held = byEpic.get(epicBeadId);
+    if (!held || isNewerJob(job, held)) byEpic.set(epicBeadId, job);
+  }
+  return byEpic;
+}
+
+function isNewerJob(job: JobRow, than: JobRow): boolean {
+  const a = toMs(job.updatedAt) ?? 0;
+  const b = toMs(than.updatedAt) ?? 0;
+  return a === b ? job.id > than.id : a > b;
+}
+
+/**
  * Runs parked longer than the threshold. A parked run is waiting on a human by definition — nothing
  * in the runner re-dispatches it — so its age is the whole signal. `updatedAt` is when it parked
  * (nothing touches a parked row afterwards), and `error` carries the park reason the runner or
  * execute-epic recorded (`usage-limit`, `run-live-elsewhere`, an agent failure).
+ *
+ * `jobsByEpic` (from {@link settledExecuteEpicJobsByEpic}) is what lets the finding name the job that
+ * parked alongside the run, so an abandon settles both rows rather than only the run.
  */
 export function detectParkedRuns(
   runs: RunRow[],
   nowMs: number,
   thresholdMs: number,
+  jobsByEpic: Map<string, JobRow> = new Map(),
 ): RunHealthFinding[] {
   const findings: RunHealthFinding[] = [];
   for (const run of runs) {
@@ -95,6 +128,7 @@ export function detectParkedRuns(
       ageMs,
       runId: run.id,
       beadId: run.ticketBeadId ?? run.epicBeadId,
+      jobId: jobsByEpic.get(run.epicBeadId)?.id,
     });
   }
   return findings;
@@ -280,7 +314,12 @@ export function makeRunHealthHandler(deps: RunHealthDeps): JobHandler {
     ]);
 
     const findings: RunHealthFinding[] = [
-      ...detectParkedRuns(parkedRuns, nowMs, thresholds.parkedRunMinutes * 60_000),
+      ...detectParkedRuns(
+        parkedRuns,
+        nowMs,
+        thresholds.parkedRunMinutes * 60_000,
+        settledExecuteEpicJobsByEpic(settledJobs),
+      ),
       ...detectDeadLeases(board, activeEpicKeys, {
         projectId,
         nowMs,
