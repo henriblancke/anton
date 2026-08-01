@@ -974,13 +974,20 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           // The advisories go on the bead with them: this run opens no PR, so its body — their only
           // other home — never exists, and the resumed run starts its review with an empty carry.
           const parkedAdvisories = review.unresolved.filter((f) => f.severity === "advisory");
-          await safe(() =>
-            beads.note(repo, epicBeadId, reviewParkNote(review, blocking, parkedAdvisories, orphan)),
-          );
+          const note = reviewParkNote(review, blocking, parkedAdvisories, orphan);
+          // Whether that write landed decides what the park reason can honestly say: a locked bd DB
+          // would otherwise discard the findings' only copy while the run error told the founder to
+          // read them on the bead (see reviewParkMessage).
+          const noted = await safe(() => beads.note(repo, epicBeadId, note));
           throw new ReviewBlockedError(
-            `${epicBeadId} did not pass its pre-PR self-review (${review.outcome}): ` +
-              `${reviewFailureReason(review, blocking)}. No PR opened — the findings are on the ` +
-              `bead; resolve them (or fix the ticket) and resume the run.${orphanClause(orphan)}`,
+            reviewParkMessage({
+              targetId: epicBeadId,
+              outcome: review.outcome,
+              reason: reviewFailureReason(review, blocking),
+              note,
+              noted,
+              orphan,
+            }),
           );
         }
         // Advisory findings never park (anton-3apm): they ride along in the PR body so the founder
@@ -1550,6 +1557,38 @@ function orphanClause(orphan: OrphanPullRequest | undefined): string {
 }
 
 /**
+ * The park reason on the RUN row — and, when the bead write failed, the findings themselves.
+ *
+ * A parked run opens no PR, and the score comments carry counts and a rationale, never the notes:
+ * the bead note is the findings' only home. If `bd note` fails (locked or unavailable DB) that home
+ * doesn't exist, so the run error stops pointing at the bead and reproduces the whole note instead —
+ * the run row is persisted (`updateRun`) and surfaced to the founder, which makes it the durable
+ * fallback. Claiming "the findings are on the bead" unconditionally was the data loss: the only copy
+ * discarded, under a message that told nobody to go looking.
+ */
+export function reviewParkMessage(args: {
+  targetId: string;
+  outcome: ReviewGateResult["outcome"];
+  /** {@link reviewFailureReason} — the one-line why, without trailing punctuation. */
+  reason: string;
+  /** {@link reviewParkNote} — the full findings text this run tried to write to the bead. */
+  note: string;
+  /** Did that write land? */
+  noted: boolean;
+  orphan?: OrphanPullRequest;
+}): string {
+  const head = `${args.targetId} did not pass its pre-PR self-review (${args.outcome}): ${args.reason}.`;
+  // The note already carries the orphan clause and the resume instruction, so the fallback branch
+  // must not append them a second time.
+  return args.noted
+    ? `${head} No PR opened — the findings are on the bead; resolve them (or fix the ticket) and ` +
+        `resume the run.${orphanClause(args.orphan)}`
+    : `${head} No PR opened, and writing the findings to ${args.targetId} FAILED (a locked or ` +
+        `unavailable beads DB) — nothing else holds them, so they are reproduced here in full; put ` +
+        `them back on the bead by hand before resuming:\n\n${args.note}`;
+}
+
+/**
  * The park reason on the target bead: what the reviewer refused to pass, in its own words.
  *
  * The ADVISORIES ride along with the blocking findings, because this note is the only place they
@@ -1845,11 +1884,16 @@ async function withDispatchNotes(repo: string, ticket: Bead): Promise<Bead> {
   return fresh?.notes ? { ...ticket, notes: fresh.notes } : ticket;
 }
 
-/** Swallow errors from best-effort bd side effects (already-applied labels, etc.). */
-async function safe(fn: () => Promise<unknown>): Promise<void> {
+/**
+ * Swallow errors from best-effort bd side effects (already-applied labels, etc.). Reports whether
+ * the write actually landed, so a caller whose write carries content that exists nowhere else can
+ * fall back instead of assuming it (see {@link reviewParkMessage}).
+ */
+async function safe(fn: () => Promise<unknown>): Promise<boolean> {
   try {
     await fn();
+    return true;
   } catch {
-    // best-effort
+    return false; // best-effort
   }
 }

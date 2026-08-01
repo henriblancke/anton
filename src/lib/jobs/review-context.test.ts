@@ -153,6 +153,24 @@ describe("reviewContext", () => {
     expect(out).toContain("- Read the version-matched docs first.");
   });
 
+  it("resolves a conflict between nested and root instructions in favor of the DEEPER file", () => {
+    // The reviewer loads no project memory of its own, so the inlined text is the only place the
+    // precedence rule can come from. Without it a nested override reads as a violation of the root
+    // rule it supersedes — a false blocker, or a fix dispatched to reverse correct code.
+    const out = reviewContext({
+      target: epic,
+      tickets: [ticket],
+      diff,
+      instructions: [
+        { path: "AGENTS.md", text: "- Default exports only." },
+        { path: "src/widget/AGENTS.md", text: "- Named exports only in this directory." },
+      ],
+    });
+
+    expect(out).toContain("the DEEPEST file wins");
+    expect(out).toContain("reporting it against the rule it overrides is a false finding");
+  });
+
   it("says what a cut cost when the PRINCIPLES are the file over budget", () => {
     // Principles are capped exactly like the instruction files, and the caveat makes the inlined text
     // the only rulebook — so a mandatory rule past the 8k cut is enforced by nobody while the review
