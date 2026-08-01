@@ -49,7 +49,7 @@ vi.mock("./queue", async () => {
 });
 
 const { getJob: realGetJob } = await vi.importActual<typeof import("./queue")>("./queue");
-const { unstickPass } = await import("./unstick");
+const { resumeEpic, unstickPass } = await import("./unstick");
 
 const NOW = 1_700_000_000_000;
 const HOUR = 3_600_000;
@@ -267,6 +267,27 @@ describe("resumable parks re-enqueue exactly once across two sweeps", () => {
     expect(jobRows()).toHaveLength(1);
   });
 
+  it("enqueues nothing for a dead lease the pull reveals was already cleared", async () => {
+    // The owner didn't die: it settled and swept its own lease label, and the pull is what makes that
+    // visible. With no lease left there is no dead run to revive — enqueuing here would start fresh
+    // work on an epic nobody asked to run.
+    listMock.mockResolvedValue([
+      { id: "e-1", title: "e-1", status: "open", issue_type: "epic", labels: [] },
+    ]);
+    await seedReport({
+      kind: "dead-lease",
+      key: "dead-lease:e-1",
+      reason: "run-lease expired 2h ago",
+      since: NOW - 2 * HOUR,
+      ageMs: 2 * HOUR,
+      beadId: "e-1",
+    });
+
+    expect(await sweep()).toMatchObject({ findings: 1, resumed: 0, escalated: 0, held: 1 });
+    expect(jobRows()).toEqual([]);
+    expect(escalationRows()).toEqual([]);
+  });
+
   it("pulls the shared board before judging any lease, and resumes nothing when the pull fails", async () => {
     // The local Dolt working set trails the remote by a sync heartbeat: without a pull, a lease
     // another machine renewed reads as absent and the resume below would double-run its work. A pull
@@ -420,7 +441,80 @@ describe("resumable parks re-enqueue exactly once across two sweeps", () => {
   });
 });
 
+describe("resumeEpic and a cancel that races it", () => {
+  /** The parked execute-epic job `resumeEpic` would revive. */
+  function seedParkedJob(id: string, epicBeadId: string): void {
+    t.db
+      .insert(schema.jobs)
+      .values({
+        id,
+        type: "execute-epic",
+        projectId: "p1",
+        payloadJson: JSON.stringify({ projectId: "p1", epicBeadId }),
+        status: "parked",
+        lastError: "usage-limit",
+        runAt: secDate(NOW - HOUR),
+        createdAt: secDate(NOW - 5 * HOUR),
+        updatedAt: secDate(NOW - 4 * HOUR),
+      })
+      .run();
+  }
+
+  it("does NOT enqueue a fresh job when the resumable one was cancelled under it", async () => {
+    // The classifier's cancellation guard reads a snapshot taken earlier in the pass. An operator who
+    // cancels in the window between that snapshot and this resume makes `resume` refuse — and a
+    // cancelled row does not cover the epic, so falling through to the enqueue would hand them back
+    // the exact job they just stopped.
+    seedParkedJob("j-parked", "e-1");
+    const resume = vi.fn(async (jobId: string) => {
+      t.db
+        .update(schema.jobs)
+        .set({ status: "cancelled", lastError: "cancelled by operator" })
+        .where(eq(schema.jobs.id, jobId))
+        .run();
+      return false;
+    });
+    const enqueueIfAbsent = vi.fn(() => "j-fresh");
+
+    const outcome = await resumeEpic(t.db, clock, "p1", "e-1", { resume, enqueueIfAbsent });
+
+    expect(outcome).toBe("job-cancelled");
+    expect(enqueueIfAbsent).not.toHaveBeenCalled();
+    expect(jobRows().map((j) => j.status)).toEqual(["cancelled"]);
+  });
+
+  it("still enqueues when the resumable job merely vanished — only a cancel is an operator stop", async () => {
+    seedParkedJob("j-parked", "e-1");
+    const resume = vi.fn(async (jobId: string) => {
+      t.db.delete(schema.jobs).where(eq(schema.jobs.id, jobId)).run();
+      return false;
+    });
+    const enqueueIfAbsent = vi.fn(() => "j-fresh");
+
+    const outcome = await resumeEpic(t.db, clock, "p1", "e-1", { resume, enqueueIfAbsent });
+
+    expect(outcome).toBe("enqueued");
+    expect(enqueueIfAbsent).toHaveBeenCalledWith("p1", "e-1");
+  });
+});
+
 describe("non-resumable parks produce exactly one escalation and no enqueue", () => {
+  it("holds a park whose epic has since been abandoned — a closed epic re-escalates forever", async () => {
+    // An abandon raised from an `exhausted-job` escalation closes the bead but has no run id to
+    // settle, so the run stays parked and this finding survives it. Escalating again would offer an
+    // abandon that fails on the closed bead, leaving the row to come back every sweep.
+    seedParkedRun("r-2", "e-2", "agent exited 1");
+    listMock.mockResolvedValue([
+      { id: "e-2", title: "e-2", status: "closed", issue_type: "epic", labels: [] },
+    ]);
+    await seedReport(parkedRunFinding("r-2", "e-2", "parked 4h ago: agent exited 1"));
+
+    expect(await sweep()).toMatchObject({ findings: 1, resumed: 0, escalated: 0, held: 1 });
+    expect(escalationRows()).toEqual([]);
+    expect(jobRows()).toEqual([]);
+    expect(noteMock).not.toHaveBeenCalled();
+  });
+
   it("escalates an agent failure once across two sweeps, and never enqueues", async () => {
     seedParkedRun("r-2", "e-2", "agent exited 1");
     await seedReport(parkedRunFinding("r-2", "e-2", "parked 4h ago: agent exited 1"));

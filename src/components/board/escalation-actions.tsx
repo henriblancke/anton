@@ -12,6 +12,7 @@ const ACTION_DETAIL: Record<string, string> = {
   "resumed-job": "Resumed — the parked run picks up where it stopped",
   enqueued: "Re-queued — the runner starts it on the next tick",
   "already-active": "Already running — nothing to restart",
+  "job-cancelled": "Not resumed — this job was cancelled, and a cancel is never undone",
   "job-not-resumable": "Nothing to retry — the job had already moved on",
   abandoned: "Abandoned — the work is closed as won't-do",
   "cancelled-job": "Stopped — the job is cancelled and won't retry",

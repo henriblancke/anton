@@ -114,6 +114,35 @@ describe("classifyFinding — parked runs", () => {
     expect(verdict).toMatchObject({ disposition: "escalate", why: "parked 4h ago: agent exited 1" });
   });
 
+  it("HOLDS a park whose epic has since closed — an abandoned epic is not a stall to re-raise", () => {
+    // An abandon from an `exhausted-job` escalation closes the bead but carries no run id, so it
+    // can't settle the parked run row. Escalating that row again offers an "abandon" that now fails
+    // on the closed bead, and the finding comes back every single sweep.
+    const verdict = classifyFinding(
+      finding({ reason: "parked 4h ago: agent exited 1" }),
+      ctx({
+        parkedRuns: new Map([["r-1", run({ error: "agent exited 1" })]]),
+        board: new Map([["e-1", bead("e-1", { status: "closed" })]]),
+      }),
+    );
+    expect(verdict.disposition).toBe("hold");
+    expect(verdict.why).toContain("closed");
+  });
+
+  it("still escalates a closed-epic park when the board could not be pulled", () => {
+    // A "closed" read off a stale local mirror is not evidence the work is done, and an escalation
+    // touches no shared state — so the untrusted board fails open here, unlike a resume.
+    const verdict = classifyFinding(
+      finding({ reason: "parked 4h ago: agent exited 1" }),
+      ctx({
+        boardFresh: false,
+        parkedRuns: new Map([["r-1", run({ error: "agent exited 1" })]]),
+        board: new Map([["e-1", bead("e-1", { status: "closed" })]]),
+      }),
+    );
+    expect(verdict.disposition).toBe("escalate");
+  });
+
   it("escalates a park that recorded no reason at all", () => {
     const verdict = classifyFinding(
       finding(),
@@ -198,6 +227,15 @@ describe("classifyFinding — dead leases", () => {
     expect(classifyFinding(deadLease, withBoard(leased(NOW - HOUR, { status: "closed" })))
       .disposition).toBe("hold");
     expect(classifyFinding(deadLease, ctx()).disposition).toBe("hold");
+  });
+
+  it("holds a bead whose lease has since been CLEARED — there is no dead run left to revive", () => {
+    // The owner didn't die after all: it settled and swept its own lease label. Without re-running
+    // the dead-lease predicate on the pulled bead, the absence of any lease reads as "uncontested"
+    // and this pass starts fresh work on an epic nobody asked it to run.
+    const verdict = classifyFinding(deadLease, withBoard(bead("e-1")));
+    expect(verdict.disposition).toBe("hold");
+    expect(verdict.why).toContain("cleared");
   });
 
   it("never touches a bead a live job already owns", () => {

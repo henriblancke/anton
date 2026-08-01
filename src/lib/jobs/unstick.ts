@@ -215,6 +215,14 @@ export function classifyFinding(
       // finished since the sweep, and acting on the stale claim would be acting on a ghost.
       if (!run) return hold("the run is no longer parked");
       if (ownedByLiveJob(run.epicBeadId)) return hold("a live job already owns this run");
+      // A closed epic has settled its own way and its parked run row simply never caught up — an
+      // abandon raised from an `exhausted-job` escalation closes the bead but has no run id to
+      // settle. Escalating that again offers an "abandon" that now fails on the closed bead, so the
+      // finding would return every sweep forever. Only trusted on a FRESH board, the same posture as
+      // {@link leaseStandDown}: "closed" read off a stale local mirror is not evidence of anything.
+      if (ctx.boardFresh && ctx.board.get(run.epicBeadId)?.status === "closed") {
+        return hold("the epic has since closed");
+      }
       if (run.error?.trim() !== USAGE_LIMIT_PARK) {
         return escalate(finding.reason);
       }
@@ -252,6 +260,13 @@ export function classifyFinding(
       if (ctx.epicCancelled(bead.id)) {
         return hold("this epic's latest job was cancelled by an operator");
       }
+      // The finding's whole premise is an EXPIRED lease a dying owner left behind. A bead carrying no
+      // lease at all had it cleared — the owning run settled and swept its own label — so there is no
+      // dead run to revive, and re-enqueuing would start fresh work nobody asked for. The report is a
+      // candidate list, so the predicate that raised it has to still hold against the pulled bead.
+      if (beads.runLeaseExpiry(bead) === undefined) {
+        return hold("the run-lease has since been cleared");
+      }
       // A lease that is live NOW belongs to a machine that picked the work back up after the sweep
       // saw it expired — resuming here would double-run the epic, the one thing the lease exists to
       // prevent. That is a foreign holder, so this pass stands down entirely.
@@ -284,8 +299,12 @@ export function classifyFinding(
   }
 }
 
-/** What a resume attempt actually did — distinct outcomes so the log never overstates the action. */
-export type ResumeOutcome = "resumed-job" | "enqueued" | "already-active";
+/**
+ * What a resume attempt actually did — distinct outcomes so the log never overstates the action.
+ * `job-cancelled` is a deliberate NON-action: an operator cancelled the epic's job under us, and a
+ * cancel is never reversed by a resume.
+ */
+export type ResumeOutcome = "resumed-job" | "enqueued" | "already-active" | "job-cancelled";
 
 /**
  * The two queue verbs a resume needs, injectable so the UI path can route them through the runner
@@ -305,7 +324,11 @@ export interface EpicResumeOps {
  *   2. A settled-but-recoverable (parked/failed) job → resume THAT job, so it reuses its open run and
  *      worktree instead of starting a duplicate. `enqueueExecuteEpicIfAbsent` alone can't do this —
  *      a parked job counts as covering, so it would return undefined and quietly do nothing.
- *   3. Otherwise enqueue a fresh job, which respects `jobs_active_epic_unique` on its own.
+ *   3. A resumable job that refuses to un-park because it was CANCELLED under us → stop. The
+ *      classifier's cancellation guard reads a snapshot taken earlier in the pass, so an operator who
+ *      cancels in that window would otherwise be overruled here: cancelled rows don't cover the epic,
+ *      so the enqueue below would hand them back the exact job they just stopped.
+ *   4. Otherwise enqueue a fresh job, which respects `jobs_active_epic_unique` on its own.
  */
 export async function resumeEpic(
   db: AntonDb,
@@ -321,7 +344,16 @@ export async function resumeEpic(
 
   if (activeExecuteEpicId(db, projectId, epicBeadId)) return "already-active";
   const resumable = await resumableExecuteEpicId(db, projectId, epicBeadId);
-  if (resumable && (await resume(resumable))) return "resumed-job";
+  if (resumable) {
+    if (await resume(resumable)) return "resumed-job";
+    // `resume` refuses a job that left parked/failed while we were deciding. Which way it left
+    // matters for exactly one exit: a CANCEL is an operator saying stop, and `cancelJob` promises no
+    // durability path revives it — but a cancelled row doesn't cover the epic, so falling through
+    // would quietly hand back a fresh job. Every other loser of that race (a concurrent enqueue, a
+    // settle) is safely absorbed below by the enqueue's own covering check.
+    const raced = await getJob(db, resumable);
+    if (raced?.status === "cancelled") return "job-cancelled";
+  }
   // Either there was no job to resume, or one raced us into an active status; both are correctly
   // absorbed here — the enqueue no-ops when a covering job now exists.
   return enqueueIfAbsent(projectId, epicBeadId) ? "enqueued" : "already-active";
@@ -476,14 +508,15 @@ export async function unstickPass(
 
     if (verdict.disposition === "resume" && verdict.epicBeadId) {
       const outcome = await resumeEpic(db, clock, projectId, verdict.epicBeadId);
-      if (outcome === "already-active") {
-        // The idempotent path: a prior pass (or an operator) already restarted this epic.
-        summary.held += 1;
-      } else {
+      if (outcome === "resumed-job" || outcome === "enqueued") {
         summary.resumed += 1;
         console.log(
           `[unstick] ${outcome} ${verdict.epicBeadId} (${finding.key}): ${verdict.why}`,
         );
+      } else {
+        // Nothing was restarted: either a prior pass (or an operator) already did it — the
+        // idempotent path — or an operator cancelled the epic's job after this pass classified it.
+        summary.held += 1;
       }
       await heartbeat();
       continue;
