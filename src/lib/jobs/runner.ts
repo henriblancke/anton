@@ -220,6 +220,26 @@ export type Outcome =
  */
 export const POISON_PARK_PREFIX = "poison:";
 
+/** `failed N×:` — how an attempt-exhausted park spells itself, and how to read N back out. */
+const EXHAUSTED_PARK = /^failed (\d+)×:/;
+
+/** The park reason for a job that spent its whole attempt budget. */
+function exhaustedPark(attempts: number, error: string): string {
+  return `failed ${attempts}×: ${error}`;
+}
+
+/**
+ * The attempt budget a park was actually spent under, or undefined when the row carries no such
+ * marker. The marker is the DURABLE record that the runner stopped retrying: an attempt count on its
+ * own only means something against the limit in force when the job parked, so an operator who later
+ * raises `maxRetries` would otherwise hide a job that is still permanently parked (nothing
+ * re-dispatches a parked job — only a human does).
+ */
+export function exhaustedParkAttempts(lastError: string): number | undefined {
+  const match = EXHAUSTED_PARK.exec(lastError);
+  return match ? Number(match[1]) : undefined;
+}
+
 export type Action =
   | { action: "complete" }
   | { action: "reschedule"; runAtMs: number; refundAttempt: boolean; lastError?: string }
@@ -282,7 +302,7 @@ export function nextAction(
       return { action: "park", lastError: `${POISON_PARK_PREFIX} ${outcome.error}` };
     case "error": {
       if (job.attempts >= config.maxAttempts) {
-        return { action: "park", lastError: `failed ${job.attempts}×: ${outcome.error}` };
+        return { action: "park", lastError: exhaustedPark(job.attempts, outcome.error) };
       }
       const backoff = Math.min(
         config.backoffBaseMs * 2 ** Math.max(0, job.attempts - 1),

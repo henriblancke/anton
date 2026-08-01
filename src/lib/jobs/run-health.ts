@@ -34,7 +34,12 @@ import {
   type Clock,
   type JobRow,
 } from "./queue";
-import { POISON_PARK_PREFIX, type JobContext, type JobHandler } from "./runner";
+import {
+  exhaustedParkAttempts,
+  POISON_PARK_PREFIX,
+  type JobContext,
+  type JobHandler,
+} from "./runner";
 
 const IN_REVIEW = LABELS.stage("in-review");
 
@@ -170,9 +175,16 @@ export function detectDeadLeases(
 
 /**
  * Jobs the runner has stopped retrying — recoverable only by a human, so they sit forever unless
- * something surfaces them. Two shapes qualify:
+ * something surfaces them. Three shapes qualify:
  *
- *   • a `parked`/`failed` job that SPENT its whole attempt budget; and
+ *   • a `parked`/`failed` job carrying the runner's `failed N×:` park marker, which records the
+ *     budget it was actually given up under. That marker is the durable evidence, because
+ *     `maxAttempts` is today's SETTING: raising it after a job parked doesn't restart the job, so
+ *     comparing against the new value alone would retire the finding while the work stays stuck —
+ *     invisibly for a non-execute job like `sync-push`, which strands no run for another detector
+ *     to catch;
+ *   • a `parked`/`failed` job whose attempts have reached the current budget, for a row settled
+ *     without a marker; and
  *   • a POISON park, which skips the budget entirely (`nextAction`), so its attempt count is no
  *     evidence at all — execute-epic poisons on exactly the actionable conditions (a blocker, a
  *     disabled agent, a contract gap), and several of those fire before a run row exists, so
@@ -191,14 +203,19 @@ export function detectExhaustedJobs(
     if (job.status !== "parked" && job.status !== "failed") continue;
     const lastError = job.lastError?.trim() || "no error recorded";
     const poisoned = lastError.startsWith(POISON_PARK_PREFIX);
-    if (!poisoned && job.attempts < maxAttempts) continue;
+    // The budget the runner recorded when it gave up, falling back to the current setting for a row
+    // that carries no marker. Reported as well as tested against, so a job parked under an older,
+    // smaller budget reads as the exhausted one it is rather than as "3/10, retries left".
+    const spentBudget = exhaustedParkAttempts(lastError);
+    const budget = spentBudget ?? maxAttempts;
+    if (!poisoned && spentBudget === undefined && job.attempts < maxAttempts) continue;
     const since = toMs(job.updatedAt) ?? nowMs;
     findings.push({
       kind: "exhausted-job",
       key: `exhausted-job:${job.id}`,
       reason: poisoned
         ? `${job.type} job parked without retrying (permanent failure): ${lastError.slice(POISON_PARK_PREFIX.length).trim()}`
-        : `${job.type} job ${job.status} after ${job.attempts}/${maxAttempts} attempts: ${lastError}`,
+        : `${job.type} job ${job.status} after ${job.attempts}/${budget} attempts: ${lastError}`,
       since,
       ageMs: Math.max(0, nowMs - since),
       jobId: job.id,

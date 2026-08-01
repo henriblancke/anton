@@ -232,6 +232,30 @@ describe("detectExhaustedJobs", () => {
     expect(detectExhaustedJobs([job("j-1", { attempts: 1 })], 3, NOW)).toEqual([]);
   });
 
+  it("keeps reporting a job that exhausted an OLDER budget after maxRetries is raised", () => {
+    // Raising the setting doesn't restart a parked job — nothing re-dispatches one — so judging it
+    // against today's value alone would hide permanently stuck work. The runner's `failed N×:` park
+    // marker is the durable evidence of the budget it actually gave up under. Especially load-
+    // bearing for a non-execute job like `sync-push`, which strands no parked run for the other
+    // detectors to catch.
+    const [finding] = detectExhaustedJobs(
+      [job("j-1", { type: "sync-push", attempts: 3, lastError: "failed 3×: push rejected" })],
+      10,
+      NOW,
+    );
+    expect(finding).toMatchObject({ kind: "exhausted-job", jobId: "j-1" });
+    // Reported against the budget it spent, not the new one: "3/10" would read as retries left.
+    expect(finding.reason).toContain("3/3 attempts");
+    expect(finding.reason).toContain("push rejected");
+  });
+
+  it("still ignores a mid-budget park that carries no exhaustion marker", () => {
+    // A quota backoff records `usage-limit: resumes at …` and refunds the attempt — no marker, so
+    // the current budget is the only bar, and it is not met.
+    const jobs = [job("j-1", { attempts: 1, lastError: "usage-limit: resumes at 2026-01-01T00:00:00Z" })];
+    expect(detectExhaustedJobs(jobs, 3, NOW)).toEqual([]);
+  });
+
   it("reports a POISON park regardless of attempts — it skipped the retry budget entirely", () => {
     // execute-epic poisons on a blocker, a disabled agent, a contract gap: permanent conditions the
     // runner parks on at attempt 1. Several fire before a run row exists, so if the attempt count

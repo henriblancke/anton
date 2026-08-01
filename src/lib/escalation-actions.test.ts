@@ -481,11 +481,58 @@ describe("actOnEscalation — the work was picked back up elsewhere", () => {
     expect(await actOnEscalation(project, escalation.id, "abandon")).toMatchObject({ ok: true });
   });
 
-  it("falls back to the local snapshot when bd can't answer — the panel stays usable offline", async () => {
+  it("refuses when bd can't answer for the lease bead — an unread board rules nothing out", async () => {
     beadsShow.mockRejectedValue(new Error("bd: database is locked"));
     const escalation = await open();
 
-    expect(await actOnEscalation(project, escalation.id, "abandon")).toMatchObject({ ok: true });
+    expect(await actOnEscalation(project, escalation.id, "abandon")).toEqual({
+      ok: false,
+      reason: "unverified",
+    });
+    expect(abandonTicket).not.toHaveBeenCalled();
+    // Deferred, not lost: the row stays on the panel for the next click or sweep.
+    expect(rowOf(escalation.id)?.status).toBe("open");
+  });
+
+  it("refuses when the PULL didn't land — the local mirror can't show a lease it never received", async () => {
+    // The reads all succeed and show no lease; that is only evidence if the pull that would have
+    // brought a foreign one in actually ran. A workspace with no remote resolves `not-wired` here
+    // rather than rejecting, so a single-machine board is unaffected.
+    beadsPull.mockRejectedValue(new Error("dolt pull: remote unreachable"));
+    const escalation = await open();
+
+    expect(await actOnEscalation(project, escalation.id, "resume")).toEqual({
+      ok: false,
+      reason: "unverified",
+    });
+    expect(resumeStalledEpic).not.toHaveBeenCalled();
+    expect(rowOf(escalation.id)?.status).toBe("open");
+  });
+
+  it("still lets a dismiss through on an unreadable board — it touches neither the work nor the lease", async () => {
+    beadsPull.mockRejectedValue(new Error("dolt pull: remote unreachable"));
+    beadsShow.mockRejectedValue(new Error("bd: database is locked"));
+    const escalation = await open();
+
+    expect(await actOnEscalation(project, escalation.id, "dismiss")).toMatchObject({ ok: true });
+  });
+
+  // The window the pre-read guard alone leaves open: `readTargetState` awaits a bd pull that can
+  // take seconds, and a resume landing inside it republishes the stalled run's OWN id, which the
+  // lease check exempts as this escalation's leftover.
+  it("refuses an abandon when the local resume lands DURING the board read", async () => {
+    beadsShow.mockResolvedValue(lease(HOUR, "r-1")); // the resumed run's own lease — not foreign
+    beadsPull.mockImplementation(async () => {
+      seedExecuteEpicJob("running");
+    });
+    const escalation = await open();
+
+    expect(await actOnEscalation(project, escalation.id, "abandon")).toEqual({
+      ok: false,
+      reason: "contested",
+    });
+    expect(abandonTicket).not.toHaveBeenCalled();
+    expect(rowOf(escalation.id)?.status).toBe("open");
   });
 
   // The same run resuming HERE is the case the lease can't see: execute-epic republishes it under
@@ -635,15 +682,18 @@ describe("actOnEscalation — the work settled itself after the stall was raised
     expect(rowOf(escalation.id)).toMatchObject({ status: "resolved", resolution: "dismissed" });
   });
 
-  it("does NOT read a bd that could not answer as a deletion — that is the offline path", async () => {
+  it("does NOT read a bd that could not answer as a deletion — it refuses instead of settling", async () => {
+    // A failed read is not evidence either way: settling the row as `target-gone` would retire a
+    // stall that may still be live work, so the escalation waits for a board it can actually read.
     beadsShow.mockRejectedValue(new Error("bd: database is locked"));
     const escalation = await open();
 
-    expect(await actOnEscalation(project, escalation.id, "resume")).toMatchObject({
-      ok: true,
-      detail: "enqueued",
+    expect(await actOnEscalation(project, escalation.id, "resume")).toEqual({
+      ok: false,
+      reason: "unverified",
     });
-    expect(resumeStalledEpic).toHaveBeenCalledWith("p1", "anton-e1");
+    expect(resumeStalledEpic).not.toHaveBeenCalled();
+    expect(rowOf(escalation.id)?.status).toBe("open");
   });
 });
 

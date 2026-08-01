@@ -55,8 +55,16 @@ export function isEscalationAction(value: unknown): value is EscalationAction {
  *                    or abandon (409).
  *   • `contested`  — the work was picked back up since the stall was raised, here or on another
  *                    machine (409).
+ *   • `unverified` — bd could not confirm CURRENT shared state (the pull or a bead read failed), so
+ *                    a foreign run can't be ruled out. A bead-backed verb stays refused until it
+ *                    can (409); `dismiss` never consults the board and stays available.
  */
-export type EscalationActionFailure = "not-found" | "not-open" | "no-target" | "contested";
+export type EscalationActionFailure =
+  | "not-found"
+  | "not-open"
+  | "no-target"
+  | "contested"
+  | "unverified";
 
 export type EscalationActionResult =
   | { ok: true; action: EscalationAction; escalation: EscalationView; detail: string }
@@ -103,11 +111,22 @@ export async function actOnEscalation(
   // the lease re-check costs a bd pull.
   if (target) {
     const epicBeadId = view.epicBeadId ?? target;
-    if (action === "abandon" && restartedLocally(project.id, epicBeadId)) {
+    // Re-run AFTER the board read as well as before it: `readTargetState` awaits a bd pull that can
+    // take seconds, and a resume that lands inside that window republishes the stalled run's own id
+    // — which the lease check exempts as this escalation's own leftover. Checked before it too
+    // because it is one indexed read and refusing early spares the pull entirely.
+    const abandonWouldKillLiveWork = () =>
+      action === "abandon" && restartedLocally(project.id, epicBeadId);
+    if (abandonWouldKillLiveWork()) return { ok: false, reason: "contested" };
+    const state = await readTargetState(project, view, target);
+    if (state === "contested" || abandonWouldKillLiveWork()) {
       return { ok: false, reason: "contested" };
     }
-    const state = await readTargetState(project, view, target);
-    if (state === "contested") return { ok: false, reason: "contested" };
+    // Shared state couldn't be confirmed. Both verbs are cross-machine acts judged off the run-lease
+    // (see {@link readTargetState}), so they wait rather than act on an unproven snapshot: an extra
+    // sweep of stall costs a glance, a duplicate run costs a duplicate PR and an abandon closes a
+    // bead underneath live work.
+    if (state === "unverified") return { ok: false, reason: "unverified" };
     // The work settled itself after the sweep froze this stall — deleted, or closed by hand — so
     // neither verb has anything to act on (see {@link readTargetState}). Settle the row as the no-op
     // it is rather than refusing: the panel offers Dismiss only on a stale PR, so a refusal would
@@ -166,11 +185,11 @@ function restartedLocally(projectId: string, epicBeadId: string): boolean {
 
 /**
  * What the board says NOW about the work an escalation froze: `clear` to act on, `contested` by a
- * run on another machine, `gone` because the bead itself was deleted, or `closed` because someone
- * settled it by hand. The last two are one meaning — nothing left to act on — kept apart only so the
- * panel can say which way the work ended.
+ * run on another machine, `unverified` when bd couldn't say either way, `gone` because the bead
+ * itself was deleted, or `closed` because someone settled it by hand. The last two are one meaning —
+ * nothing left to act on — kept apart only so the panel can say which way the work ended.
  */
-type TargetState = "clear" | "contested" | "gone" | "closed";
+type TargetState = "clear" | "contested" | "unverified" | "gone" | "closed";
 
 /**
  * One bead as bd answers for it now — the row, `missing` when bd says there is no such bead, or
@@ -205,10 +224,18 @@ async function readBead(repoPath: string, id: string): Promise<BeadRead> {
  *     rule for the manual path.
  *
  * Pull before reading, like the runner's enqueue-time `liveRunCheck` and the unstick pass: the local
- * Dolt working set trails the shared remote by a sync heartbeat. A pull that fails (offline,
- * transient) falls back to the local snapshot rather than disabling the founder's only settling move,
- * and any evidence it does hold still counts — including a deletion, which reaches the mirror as the
- * bead's absence and can only have got there by being made here or synced from elsewhere.
+ * Dolt working set trails the shared remote by a sync heartbeat. Both verbs then FAIL CLOSED on
+ * anything that leaves current shared state unread — a rejected pull, a bead bd couldn't answer for
+ * — exactly as `leaseStandDown` does on the sweep side. A stale mirror can only be wrong in the
+ * direction that double-runs, and neither verb is cheap to be wrong about: a resume duplicates a run
+ * another machine owns, an abandon closes its bead underneath it. Refusing costs one more sweep of
+ * stall and leaves the row on the panel, so the founder's move is deferred, never lost — and a
+ * workspace with no remote at all resolves the pull (`not-wired`) rather than rejecting, so a
+ * single-machine board is unaffected. `dismiss` reads none of this and stays available regardless.
+ *
+ * Evidence the local mirror does hold still counts against the work EXISTING — a deletion or a
+ * close can only have got there by being made here or synced from elsewhere — because settling the
+ * row on those changes nothing about the work.
  *
  * The lease is published under the RUN id, so the stalled run's own leftover is ours, not a foreign
  * holder; a finding with no run of its own (a dead lease) treats any live lease as foreign.
@@ -218,14 +245,18 @@ async function readTargetState(
   view: EscalationView,
   target: string,
 ): Promise<TargetState> {
-  await beads.pull(project.repoPath).catch(() => {});
+  const pulled = await beads.pull(project.repoPath).then(
+    () => true,
+    () => false,
+  );
   // Existence is checked on the bead the VERB acts on — the epic a resume re-enqueues, the ticket an
   // abandon closes — which is not always the one carrying the lease.
   const acted = await readBead(project.repoPath, target);
   if (acted === "missing") return "gone";
-  // A bead bd could not answer for is no evidence of anything (see {@link BeadRead}) — only a row it
-  // actually returned can say the work was closed out from under this escalation.
-  if (typeof acted !== "string" && acted.status === "closed") return "closed";
+  // A bead bd could not answer for is no evidence of anything (see {@link BeadRead}): it can neither
+  // say the work was closed out from under this escalation nor rule out a run holding it.
+  if (acted === "unreadable") return "unverified";
+  if (acted.status === "closed") return "closed";
 
   // Runs are keyed by RUN TARGET, so that is the bead execute-epic publishes the lease on, and it is
   // what `epicBeadId` holds for every kind: the run's epic for a parked run, the finding's own bead
@@ -234,15 +265,19 @@ async function readTargetState(
   // that recorded no epic at all, and the common case where the two coincide costs no second read.
   const epicBeadId = view.epicBeadId ?? target;
   const holder = epicBeadId === target ? acted : await readBead(project.repoPath, epicBeadId);
-  // No readable lease bead is no evidence of a live run: bd being unreachable must not disable the
-  // panel, and a gone EPIC still leaves an abandon of its (existing) ticket worth doing.
-  if (typeof holder === "string") return "clear";
-
-  const nowMs = systemClock.now();
-  const live = view.runId
-    ? beads.foreignRunLeaseLive(holder, nowMs, view.runId)
-    : beads.isRunLive(holder, nowMs);
-  return live ? "contested" : "clear";
+  if (holder === "unreadable") return "unverified";
+  // A gone EPIC carries no lease — and that is evidence, not a failed read — so an abandon of its
+  // (existing) ticket is still worth doing.
+  if (holder !== "missing") {
+    const nowMs = systemClock.now();
+    const live = view.runId
+      ? beads.foreignRunLeaseLive(holder, nowMs, view.runId)
+      : beads.isRunLive(holder, nowMs);
+    if (live) return "contested";
+  }
+  // Every read landed — but a lease another machine published seconds ago reaches this mirror only
+  // through the pull, so without one "no live lease" is an unread answer, not a clear board.
+  return pulled ? "clear" : "unverified";
 }
 
 /** Resume/abandon against the work itself — the epic a run stalled on, or the bead to close. */
