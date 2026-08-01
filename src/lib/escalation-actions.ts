@@ -30,11 +30,11 @@
  * still idle — so acknowledging a stall can never hide one.
  */
 import { getDb } from "./db";
-import { abandonTicket } from "./abandon";
+import { abandonTicket, RunRestartedError } from "./abandon";
 import { beads, isMissingBeadError } from "./beads/bd";
 import { getEscalation, settleEscalation, toEscalationView } from "./escalations";
-import { cancelJob, resumeJob, resumeStalledEpic } from "./jobs/service";
-import { activeExecuteEpicId, getJob, systemClock } from "./jobs/queue";
+import { cancelJob, resumeJob, resumeStalledEpic, runIsLiveForTarget } from "./jobs/service";
+import { getJob, systemClock } from "./jobs/queue";
 import { settleParkedRun } from "./runs";
 import { MAX_ABANDON_REASON_CHARS } from "./types";
 import type { Bead } from "./beads/bd";
@@ -152,6 +152,17 @@ export async function actOnEscalation(
       : await actOnJob(project.id, action, view.jobId!);
     return { ok: true, action, escalation: view, detail };
   } catch (e) {
+    // The abandon's own boundary check caught a resume that landed after the settle: it refused
+    // before touching anything, so the run is still executing and the bead is still open. That is the
+    // same answer the pre-settle checks give, so report `contested` rather than a failure — the only
+    // cost is a row settled as abandoned, which the next sweep re-raises if the work stalls again.
+    if (e instanceof RunRestartedError) {
+      console.warn(
+        `[unstick] escalation ${escalationId} was settled as abandoned but its work restarted first ` +
+          `— nothing was cancelled or closed`,
+      );
+      return { ok: false, reason: "contested" };
+    }
     // Settled but not acted: the route answers 500, and the row is already gone from the panel, so
     // this line is the only place the two halves of that state meet. The stall itself isn't lost —
     // it is still in the next run-health report, which raises it again.
@@ -178,9 +189,13 @@ export async function actOnEscalation(
  * An active execute-epic job is exactly what the abandon's cancel would reach, so this refuses in
  * precisely the cases where it has something live to destroy — a job that has parked again since is
  * stopped work, and stays abandonable.
+ *
+ * Every call here is a SNAPSHOT: the settle, and the bd reads inside the abandon, all await after it.
+ * It refuses early and cheaply; the answer that actually gates the destruction is the identical read
+ * `abandonTicket`'s `requireStopped` makes at the cancel boundary itself.
  */
 function restartedLocally(projectId: string, epicBeadId: string): boolean {
-  return activeExecuteEpicId(getDb(), projectId, epicBeadId) !== undefined;
+  return runIsLiveForTarget(projectId, epicBeadId);
 }
 
 /**
@@ -289,7 +304,11 @@ async function actOnBead(
 ): Promise<string> {
   if (action === "resume") return resumeStalledEpic(project.id, target);
   const reason = abandonReason(view);
-  await abandonTicket(project, target, reason);
+  // `requireStopped`: the checks above are snapshots, and the settle that follows them awaits. The
+  // abandon re-reads liveness where it would actually kill the run and refuses there instead (see
+  // {@link restartedLocally}), so a resume landing in that window is answered with a
+  // `RunRestartedError` and an untouched board rather than a cancelled job and a closed bead.
+  await abandonTicket(project, target, reason, { requireStopped: true });
   await settleAbandonedWork(project.id, view, reason);
   return "abandoned";
 }

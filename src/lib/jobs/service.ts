@@ -353,3 +353,13 @@ export async function cancelRunForTarget(projectId: string, epicBeadId: string):
   if (!jobId) return false;
   return getRunner().cancel(jobId);
 }
+
+/**
+ * Whether a run target has a live (queued/running) execute-epic job on THIS instance — exactly what
+ * `cancelRunForTarget` would kill. The precondition for a caller whose decision was made against work
+ * that had already STOPPED: read it at the moment the kill would land, not from an earlier snapshot
+ * (see `abandonTicket`'s `requireStopped`).
+ */
+export function runIsLiveForTarget(projectId: string, epicBeadId: string): boolean {
+  return activeExecuteEpicId(getDb(), projectId, epicBeadId) !== undefined;
+}

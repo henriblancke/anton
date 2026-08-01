@@ -376,10 +376,10 @@ export interface EpicResumeOps {
  *   2. A settled-but-recoverable (parked/failed) job → resume THAT job, so it reuses its open run and
  *      worktree instead of starting a duplicate. `enqueueExecuteEpicIfAbsent` alone can't do this —
  *      a parked job counts as covering, so it would return undefined and quietly do nothing.
- *   3. A resumable job that refuses to un-park because it was CANCELLED under us → stop. The
- *      classifier's cancellation guard reads a snapshot taken earlier in the pass, so an operator who
- *      cancels in that window would otherwise be overruled here: cancelled rows don't cover the epic,
- *      so the enqueue below would hand them back the exact job they just stopped.
+ *   3. Nothing left to resume, but the epic's LATEST job was CANCELLED → stop. The classifier's
+ *      cancellation guard reads a snapshot taken earlier in the pass, so an operator who cancels in
+ *      that window would otherwise be overruled here: cancelled rows don't cover the epic, so the
+ *      enqueue below would hand them back the exact job they just stopped.
  *   4. Otherwise enqueue a fresh job, which respects `jobs_active_epic_unique` on its own.
  */
 export async function resumeEpic(
@@ -396,18 +396,17 @@ export async function resumeEpic(
 
   if (activeExecuteEpicId(db, projectId, epicBeadId)) return "already-active";
   const resumable = await resumableExecuteEpicId(db, projectId, epicBeadId);
-  if (resumable) {
-    if (await resume(resumable)) return "resumed-job";
-    // `resume` refuses a job that left parked/failed while we were deciding. Which way it left
-    // matters for exactly one exit: a CANCEL is an operator saying stop, and `cancelJob` promises no
-    // durability path revives it — but a cancelled row doesn't cover the epic, so falling through
-    // would quietly hand back a fresh job. Every other loser of that race (a concurrent enqueue, a
-    // settle) is safely absorbed below by the enqueue's own covering check.
-    const raced = await getJob(db, resumable);
-    if (raced?.status === "cancelled") return "job-cancelled";
-  }
-  // Either there was no job to resume, or one raced us into an active status; both are correctly
-  // absorbed here — the enqueue no-ops when a covering job now exists.
+  if (resumable && (await resume(resumable))) return "resumed-job";
+  // Nothing was resumed — which is not the same as nothing having been there. A CANCEL is an
+  // operator saying stop, and `cancelJob` promises no durability path revives it, but a cancelled row
+  // covers neither the resumable lookup above nor the enqueue below, so falling straight through
+  // would quietly hand back the exact job they just stopped. The window is wider than the `resume`
+  // call: a cancel that lands BEFORE the lookup leaves it finding nothing at all. So the check is on
+  // the epic's LATEST job — the same evidence the classifier's `epicCancelled` reads — which covers
+  // both halves. Every other loser of that race (a concurrent enqueue, a settle) leaves a
+  // non-cancelled latest job and is absorbed below by the enqueue's own covering check.
+  const latest = await latestExecuteEpicJob(db, projectId, epicBeadId);
+  if (latest?.status === "cancelled") return "job-cancelled";
   return enqueueIfAbsent(projectId, epicBeadId) ? "enqueued" : "already-active";
 }
 

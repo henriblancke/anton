@@ -491,6 +491,56 @@ describe("resumeEpic and a cancel that races it", () => {
     expect(jobRows().map((j) => j.status)).toEqual(["cancelled"]);
   });
 
+  it("does NOT enqueue when the cancel landed BEFORE the resumable lookup could see the job", async () => {
+    // The other half of the same window: a cancelled row is outside the resumable set too, so the
+    // lookup finds nothing at all and only the epic's latest job records that an operator said stop.
+    seedParkedJob("j-parked", "e-1");
+    t.db
+      .update(schema.jobs)
+      .set({ status: "cancelled", lastError: "cancelled by operator" })
+      .where(eq(schema.jobs.id, "j-parked"))
+      .run();
+    const resume = vi.fn(async () => false);
+    const enqueueIfAbsent = vi.fn(() => "j-fresh");
+
+    const outcome = await resumeEpic(t.db, clock, "p1", "e-1", { resume, enqueueIfAbsent });
+
+    expect(outcome).toBe("job-cancelled");
+    expect(resume).not.toHaveBeenCalled();
+    expect(enqueueIfAbsent).not.toHaveBeenCalled();
+  });
+
+  it("enqueues when a NEWER job settled after the cancel — the stop applied to the older attempt", async () => {
+    seedParkedJob("j-old", "e-1");
+    t.db
+      .update(schema.jobs)
+      .set({ status: "cancelled", updatedAt: secDate(NOW - 3 * HOUR) })
+      .where(eq(schema.jobs.id, "j-old"))
+      .run();
+    t.db
+      .insert(schema.jobs)
+      .values({
+        id: "j-done",
+        type: "execute-epic",
+        projectId: "p1",
+        payloadJson: JSON.stringify({ projectId: "p1", epicBeadId: "e-1" }),
+        status: "done",
+        runAt: secDate(NOW - HOUR),
+        createdAt: secDate(NOW - 2 * HOUR),
+        updatedAt: secDate(NOW - HOUR),
+      })
+      .run();
+    const enqueueIfAbsent = vi.fn(() => "j-fresh");
+
+    const outcome = await resumeEpic(t.db, clock, "p1", "e-1", {
+      resume: vi.fn(async () => false),
+      enqueueIfAbsent,
+    });
+
+    expect(outcome).toBe("enqueued");
+    expect(enqueueIfAbsent).toHaveBeenCalledWith("p1", "e-1");
+  });
+
   it("still enqueues when the resumable job merely vanished — only a cancel is an operator stop", async () => {
     seedParkedJob("j-parked", "e-1");
     const resume = vi.fn(async (jobId: string) => {

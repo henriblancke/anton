@@ -16,21 +16,41 @@ import type { RunHealthFinding } from "./run-health";
 import type { Project } from "./types";
 
 const resumeStalledEpic = vi.fn<(projectId: string, epicBeadId: string) => Promise<string>>();
-const abandonTicket = vi.fn<(project: Project, id: string, reason: string) => Promise<unknown>>();
+const abandonTicket =
+  vi.fn<
+    (
+      project: Project,
+      id: string,
+      reason: string,
+      opts?: { requireStopped?: boolean },
+    ) => Promise<unknown>
+  >();
 const resumeJob = vi.fn<(projectId: string, jobId: string) => Promise<boolean>>();
 const cancelJob =
   vi.fn<
     (projectId: string, jobId: string, only?: readonly string[]) => Promise<{ ok: boolean }>
   >();
 
-vi.mock("./jobs/service", () => ({
-  resumeStalledEpic: (...args: [string, string]) => resumeStalledEpic(...args),
-  resumeJob: (...args: [string, string]) => resumeJob(...args),
-  cancelJob: (...args: [string, string, (readonly string[])?]) => cancelJob(...args),
-}));
+vi.mock("./jobs/service", async () => {
+  // The liveness read stays REAL against the temp db — the seeded job rows are the whole point of
+  // the abandon guard's tests; only the verbs it gates are stubbed.
+  const { activeExecuteEpicId } =
+    await vi.importActual<typeof import("./jobs/queue")>("./jobs/queue");
+  const { getDb: db } = await import("./db");
+  return {
+    resumeStalledEpic: (...args: [string, string]) => resumeStalledEpic(...args),
+    resumeJob: (...args: [string, string]) => resumeJob(...args),
+    cancelJob: (...args: [string, string, (readonly string[])?]) => cancelJob(...args),
+    runIsLiveForTarget: (projectId: string, epicBeadId: string) =>
+      activeExecuteEpicId(db(), projectId, epicBeadId) !== undefined,
+  };
+});
 vi.mock("./abandon", async () => {
   const actual = await vi.importActual<typeof import("./abandon")>("./abandon");
-  return { ...actual, abandonTicket: (...args: [Project, string, string]) => abandonTicket(...args) };
+  return {
+    ...actual,
+    abandonTicket: (...args: Parameters<typeof actual.abandonTicket>) => abandonTicket(...args),
+  };
 });
 
 // The cross-machine half: the pre-settle re-check pulls the shared board and reads the epic's
@@ -56,6 +76,7 @@ let getDb: typeof import("./db").getDb;
 let schema: typeof import("./db/schema");
 let raiseEscalation: typeof import("./escalations").raiseEscalation;
 let settleEscalation: typeof import("./escalations").settleEscalation;
+let RunRestartedError: typeof import("./abandon").RunRestartedError;
 
 const NOW = 1_700_000_000_000;
 const HOUR = 3_600_000;
@@ -69,6 +90,7 @@ beforeAll(async () => {
   ({ getDb } = await import("./db"));
   schema = await import("./db/schema");
   ({ raiseEscalation, settleEscalation } = await import("./escalations"));
+  ({ RunRestartedError } = await import("./abandon"));
   ({ actOnEscalation, isEscalationAction } = await import("./escalation-actions"));
 });
 
@@ -549,6 +571,32 @@ describe("actOnEscalation — the work was picked back up elsewhere", () => {
     // The cancel inside abandonTicket would have killed the resumed job and closed the bead under it.
     expect(abandonTicket).not.toHaveBeenCalled();
     expect(rowOf(escalation.id)?.status).toBe("open");
+  });
+
+  // The last window the pre-settle checks cannot close: the settle itself awaits, so the abandon
+  // re-reads liveness where the kill would land and refuses there (`requireStopped`).
+  it("reports a resume that lands AFTER the settle as contested, having destroyed nothing", async () => {
+    abandonTicket.mockRejectedValue(new RunRestartedError("anton-e1"));
+    const escalation = await open();
+
+    expect(await actOnEscalation(project, escalation.id, "abandon")).toEqual({
+      ok: false,
+      reason: "contested",
+    });
+    // The abandon refused before writing, so nothing settles the rows the live run now owns.
+    expect(cancelJob).not.toHaveBeenCalled();
+    // The row is spent — the CAS already claimed it — but the work it named is untouched and alive.
+    expect(rowOf(escalation.id)).toMatchObject({ status: "resolved", resolution: "abandoned" });
+  });
+
+  it("asks the abandon to enforce the guard itself, not to trust the snapshot above it", async () => {
+    const escalation = await open();
+
+    await actOnEscalation(project, escalation.id, "abandon");
+
+    expect(abandonTicket).toHaveBeenCalledWith(project, "anton-t9", expect.any(String), {
+      requireStopped: true,
+    });
   });
 
   it("refuses the abandon on a merely QUEUED resume too — the job is about to be leased", async () => {

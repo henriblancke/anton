@@ -6,7 +6,7 @@
  */
 import { beads } from "./beads/bd";
 import { nudgeSync } from "./beads/sync-nudge";
-import { cancelRunForTarget } from "./jobs/service";
+import { cancelRunForTarget, runIsLiveForTarget } from "./jobs/service";
 import { freshDetail } from "./ticket-detail";
 import type { Bead } from "./beads/bd";
 import { MAX_ABANDON_REASON_CHARS } from "./types";
@@ -21,6 +21,19 @@ export class NotAbandonableError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "NotAbandonableError";
+  }
+}
+
+/**
+ * Thrown when an abandon that was decided against STOPPED work (`requireStopped`) finds a live run at
+ * the instant it would have killed it. A `NotAbandonableError` so every route already mapping that to
+ * 409 keeps working, and its own class so the escalation path can tell this apart from a bead that
+ * was merely already closed.
+ */
+export class RunRestartedError extends NotAbandonableError {
+  constructor(targetId: string) {
+    super(`${targetId} is executing again — this abandon applies to work that had stopped`);
+    this.name = "RunRestartedError";
   }
 }
 
@@ -75,24 +88,47 @@ function runTargetOf(bead: Bead, board: Bead[]): string {
 }
 
 /**
+ * Stop the run executing `targetId` — or, when the abandon was decided against work that had already
+ * STOPPED, refuse at the instant the kill would land. The liveness read and the destructive act share
+ * one boundary here, which is the only precondition that can tie the cancel to the stopped work it was
+ * decided against: a caller's earlier snapshot goes stale across every await between it and this line
+ * (a bd pull, an escalation settle), and by then the cancel has no way to tell a run that never
+ * stopped from one an operator restarted in the meantime.
+ *
+ * Refusing before any write, rather than skipping the cancel, is deliberate: closing the bead while
+ * its agent keeps running is the same wrong answer one step later.
+ */
+async function stopRun(projectId: string, targetId: string, requireStopped: boolean): Promise<void> {
+  if (!requireStopped) {
+    await cancelRunForTarget(projectId, targetId);
+    return;
+  }
+  if (runIsLiveForTarget(projectId, targetId)) throw new RunRestartedError(targetId);
+}
+
+/**
  * Abandon every still-open descendant of `target`, killing the run of each descendant that owns one
  * before recording anything. Shared by the ticket and epic paths: a bead that groups other work must
  * take that work with it however the abandon was reached, or the descendants sit in `bd ready` as
  * claimable tickets whose run target is already settled — no run path left to reach them. Settled
  * descendants are left exactly as they are; their history is not rewritten. Returns the ids it
  * abandoned, in cascade order.
+ *
+ * Every run is stopped before the first bd write, so a `requireStopped` refusal on ANY descendant
+ * leaves the whole cascade untouched.
  */
 async function cascadeToDescendants(
   project: Project,
   target: Bead,
   board: Bead[],
   why: string,
+  requireStopped = false,
 ): Promise<string[]> {
   const descendants = openDescendants(board, target.id);
 
   for (const descendant of descendants) {
     if (beads.isRunTarget(descendant, board)) {
-      await cancelRunForTarget(project.id, descendant.id);
+      await stopRun(project.id, descendant.id, requireStopped);
     }
   }
 
@@ -121,6 +157,10 @@ async function cascadeToDescendants(
  * deep-links features to the epic route): abandoning it alone would strand its tasks open under a
  * settled run target. A leaf ticket has no descendants, so it costs one board read and nothing else.
  *
+ * `requireStopped` inverts the kill for a caller that decided against work it had observed STOPPED —
+ * an escalation's abandon: a live run then means the decision is stale, so nothing is cancelled or
+ * closed and `RunRestartedError` is thrown (see {@link stopRun}).
+ *
  * Throws on an unknown id (bd's own error → 404), an empty/oversized reason (→ 400), or an
  * already-closed ticket (NotAbandonableError → 409).
  */
@@ -128,14 +168,16 @@ export async function abandonTicket(
   project: Project,
   id: string,
   reason: string,
+  opts?: { requireStopped?: boolean },
 ): Promise<TicketDetail> {
   const why = requireReason(reason);
   const bead = await beads.show(project.repoPath, id); // 404 guard — bd throws on an unknown id
   assertOpen(bead, "Ticket");
 
   const board = await beads.list(project.repoPath, ["--status", "all"]);
-  await cancelRunForTarget(project.id, runTargetOf(bead, board));
-  await cascadeToDescendants(project, bead, board, why);
+  const requireStopped = opts?.requireStopped === true;
+  await stopRun(project.id, runTargetOf(bead, board), requireStopped);
+  await cascadeToDescendants(project, bead, board, why, requireStopped);
 
   // The ticket closes LAST, like the epic cascade: a crash mid-cascade leaves it open with a
   // partially-abandoned child set that re-running abandon finishes.
