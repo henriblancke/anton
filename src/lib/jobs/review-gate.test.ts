@@ -9,7 +9,8 @@
  * not to a loop test.
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -847,5 +848,68 @@ describe("runReviewGate — a failed fix leaves nothing behind", () => {
     expect(out.outcome).toBe("clean");
     expect(restores).toEqual([]);
     expect((await worktree.readState()).head).toBe("r0gue2");
+  });
+});
+
+/**
+ * REAL git, unlike the rest of this file: the drift guarded against here is a property of the base
+ * REF, which a fake diff cannot express. The gate resolves the fork point once and hands that SHA to
+ * both the patch and the reviewer's trusted inputs.
+ */
+describe("runReviewGate — the base is pinned to the fork point", () => {
+  let repo: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+  const commitFile = (rel: string, body: string) => {
+    mkdirSync(join(repo, rel, ".."), { recursive: true });
+    writeFileSync(join(repo, rel), body);
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", `write ${rel}`]);
+  };
+
+  beforeEach(() => {
+    repo = join(dir, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    commitFile(".product/principles.md", "- Every finding must cite a bead.\n");
+    commitFile("CLAUDE.md", "- Extensionless imports only.\n");
+    g(["checkout", "-q", "-b", "anton/gate1"]);
+    commitFile("src/a.ts", "export const a = 1;\n");
+  });
+
+  it("grades against the rules the run branched from, not a base that moved since", async () => {
+    // The base is a MOVABLE ref: a sibling run's fetch, or a resume, advances it mid-review. Reading
+    // the rules from the new tip while the patch comes from the old fork point would let whatever
+    // commit landed in between decide which rules grade this branch — including by deleting one.
+    g(["checkout", "-q", "main"]);
+    commitFile(".product/principles.md", "- Anything goes.\n");
+    writeFileSync(join(repo, "CLAUDE.md"), "");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "drop the instruction file"]);
+    g(["checkout", "-q", "anton/gate1"]);
+
+    const { run, calls } = fakeClaude([report(9, [])]);
+    const out = await runReviewGate({
+      db: tdb.db,
+      clock,
+      ctx,
+      projectId,
+      target,
+      tickets: [ticket],
+      settings: { reviewPrompt: "OPERATOR CONTRACT." },
+      worktreePath: repo,
+      baseBranch: "main",
+      deps: { runClaude: run },
+    });
+
+    expect(out.outcome).toBe("clean");
+    expect(calls[0].prompt).toContain("- Every finding must cite a bead.");
+    expect(calls[0].prompt).toContain("- Extensionless imports only.");
+    expect(calls[0].prompt).not.toContain("- Anything goes.");
+    // And the patch comes from that same commit: the base's own work is not this run's.
+    expect(calls[0].prompt).toContain("src/a.ts");
+    expect(calls[0].prompt).not.toContain("drop the instruction file");
   });
 });

@@ -98,6 +98,64 @@ export async function readFileAtRev(
 }
 
 /**
+ * Repo-relative paths of the FILES sitting directly in each of `dirs` as of `rev` — one tree read
+ * per batch, so a caller can discover which of a set of files exist across many directories without
+ * spawning a probe per candidate path.
+ *
+ * `""` reads the repo root. Directories absent at `rev` contribute nothing, and a directory NAMED
+ * like the file being looked for is skipped (only blobs are returned), so a caller can treat every
+ * path it gets back as readable content.
+ *
+ * Best-effort: a rev that doesn't resolve yields nothing rather than throwing — the same answer as
+ * a tree with none of the files in it, which is what the callers act on.
+ */
+export async function listDirBlobsAtRev(
+  worktreePath: string,
+  rev: string,
+  dirs: string[],
+): Promise<string[]> {
+  const specs = dirs.map((dir) => (dir ? `${dir.replace(/\/+$/, "")}/` : "./"));
+  const batches: string[][] = [];
+  for (let i = 0; i < specs.length; i += LS_TREE_BATCH) batches.push(specs.slice(i, i + LS_TREE_BATCH));
+
+  // -z: git quotes non-ASCII paths otherwise, and a quoted path matches nothing the caller asked for.
+  const reads = await Promise.all(
+    batches.map((batch) => git(worktreePath, ["ls-tree", "-z", rev, "--", ...batch]).catch(() => "")),
+  );
+  return reads.flatMap((text) =>
+    text
+      .split("\0")
+      .map((line) => {
+        const tab = line.indexOf("\t");
+        if (tab < 0) return undefined;
+        return line.slice(0, tab).split(" ")[1] === "blob" ? line.slice(tab + 1) : undefined;
+      })
+      .filter((path): path is string => path !== undefined),
+  );
+}
+
+/**
+ * Directories per `ls-tree` call. The command line is the bound: a diff touching thousands of
+ * directories would otherwise hand the kernel an argument list past `ARG_MAX` and fail outright,
+ * which for the review gate would silently mean "this project states no rules".
+ */
+const LS_TREE_BATCH = 500;
+
+/**
+ * The commit a branch forked from `base`, pinned as a SHA — or `base` itself when no merge base
+ * exists (unrelated histories) or the ref doesn't resolve, which is what the callers diffed against
+ * before and never a failure.
+ *
+ * Resolve ONCE and pass the SHA to everything that reads "at the base". A base like `origin/main`
+ * is a MOVABLE ref: a concurrent run's fetch, or a resumed worktree, can advance it mid-review, and
+ * a patch taken from the old fork point judged against rules read from the new tip is a review the
+ * intervening commit silently rewrote the rules of.
+ */
+export async function resolveMergeBase(worktreePath: string, base: string): Promise<string> {
+  return (await git(worktreePath, ["merge-base", base, "HEAD"]).catch(() => undefined)) || base;
+}
+
+/**
  * Stage everything in the worktree and commit. Returns `{ committed: false }` when there is
  * nothing to commit (claude made no changes) — the caller decides whether that's acceptable.
  */
@@ -268,6 +326,8 @@ export const DEFAULT_DELETION_PATCH_CHARS = 40_000;
  * Diffs from the MERGE BASE, not from the base tip, so commits that landed on the base after the
  * run branched are never mistaken for the run's own work. When no merge base exists (unrelated
  * histories) it falls back to diffing against `base` directly rather than failing the review.
+ * A caller that also reads FILES at the base should resolve it once with {@link resolveMergeBase}
+ * and pass that SHA here, so the patch and those files come from the same commit.
  *
  * The patch is cut at the source (`gitBounded`) rather than after collection: a run that touched a
  * lockfile or vendored tree can produce a patch of any size, and buffering it whole only to slice it
@@ -283,7 +343,7 @@ export async function diffAgainstBase(
   base: string,
   opts: { maxPatchChars?: number; maxDeletionChars?: number } = {},
 ): Promise<BranchDiff> {
-  const from = await git(worktreePath, ["merge-base", base, "HEAD"]).catch(() => base);
+  const from = await resolveMergeBase(worktreePath, base);
   const names = await git(worktreePath, ["diff", "--name-only", from, "HEAD"]);
   const files = names
     .split("\n")

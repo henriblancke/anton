@@ -373,6 +373,31 @@ describe("buildReviewPrompt", () => {
     expect(prompt.indexOf("### `CLAUDE.md`")).toBeLessThan(prompt.indexOf("### `src/app/AGENTS.md`"));
   });
 
+  it("inlines a deep scope's rules however many directories the diff spans", async () => {
+    // A monorepo-wide change crosses hundreds of scopes. Capping the directories probed dropped the
+    // deepest ones before they were looked at, while the prompt still told the reviewer the inlined
+    // rules were the only ones grading the run — so a diff violating an omitted scope's rules passed.
+    commitFile("CLAUDE.md", "- Extensionless imports only.\n");
+    commitFile("packages/p99/src/AGENTS.md", "- The deepest scope has rules too.\n");
+    const files = [
+      ...Array.from({ length: 100 }, (_, i) => `packages/p${i}/src/index.ts`),
+      "packages/p99/src/deep.ts",
+    ];
+
+    const { prompt } = await buildReviewPrompt({
+      target: epic,
+      tickets: [ticket],
+      diff: { files, patch: "+ const x = 1;\n", truncated: false },
+      settings: settings({ reviewPrompt: "OPERATOR CONTRACT." }),
+      projectDir,
+      baseRev: BASE,
+    });
+
+    expect(prompt).toContain("### `packages/p99/src/AGENTS.md`");
+    expect(prompt).toContain("- The deepest scope has rules too.");
+    expect(prompt).toContain("- Extensionless imports only.");
+  });
+
   /**
    * The run under review must not choose the standard it is judged against. Both files are read at
    * the base revision, so neither a commit on the run's own branch nor an uncommitted edit reaches

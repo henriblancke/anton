@@ -12,10 +12,12 @@ import { join } from "node:path";
 import {
   DEFAULT_DIFF_PATCH_CHARS,
   diffAgainstBase,
+  listDirBlobsAtRev,
   openPullRequest,
   pullRequestState,
   readWorktreeState,
   resolveFreshBase,
+  resolveMergeBase,
   restoreWorktreeState,
   sameWorktreeState,
   worktreeHasCommitFor,
@@ -436,6 +438,106 @@ suite("diffAgainstBase (real git)", () => {
     expect(diff.files).toEqual(["vendored.txt"]);
     expect(diff.patch).toContain("patch truncated at 200000 chars");
     expect(diff.patch.length).toBeLessThan(DEFAULT_DIFF_PATCH_CHARS + 200);
+  });
+});
+
+suite("resolveMergeBase (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+  const out = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-mergebase-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+    g(["checkout", "-q", "-b", "anton/epic-1"]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("pins the fork point as a SHA, unmoved by commits landing on the base after it", async () => {
+    const fork = out(["rev-parse", "HEAD"]);
+    writeFileSync(join(repo, "a.ts"), "export const a = 1;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "t1: add a"]);
+
+    g(["checkout", "-q", "main"]);
+    writeFileSync(join(repo, "other.ts"), "export const other = 0;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "someone else"]);
+    g(["checkout", "-q", "anton/epic-1"]);
+
+    // The branch tip moved; the commit the run branched from did not.
+    expect(await resolveMergeBase(repo, "main")).toBe(fork);
+    expect(out(["rev-parse", "main"])).not.toBe(fork);
+  });
+
+  it("falls back to the base itself when it does not resolve", async () => {
+    expect(await resolveMergeBase(repo, "origin/nope")).toBe("origin/nope");
+  });
+});
+
+suite("listDirBlobsAtRev (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+  const write = (rel: string, body: string) => {
+    mkdirSync(join(repo, rel, ".."), { recursive: true });
+    writeFileSync(join(repo, rel), body);
+  };
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-lsblobs-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    write("CLAUDE.md", "root rules\n");
+    write("src/app/AGENTS.md", "app rules\n");
+    write("src/app/page.tsx", "export default () => null;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("lists the files directly inside each directory, and ignores ones that don't exist", async () => {
+    const paths = await listDirBlobsAtRev(repo, "main", ["", "src", "src/app", "packages/nope"]);
+
+    expect([...paths].sort()).toEqual(["CLAUDE.md", "src/app/AGENTS.md", "src/app/page.tsx"]);
+    // `src` holds only the `app` TREE — a directory is not a readable file.
+    expect(paths).not.toContain("src/app");
+  });
+
+  it("covers far more directories than one command line could carry", async () => {
+    // A monorepo-wide diff crosses hundreds of scopes; batching keeps every one of them probed.
+    const dirs = Array.from({ length: 1200 }, (_, i) => `pkg/p${i}`);
+    write("pkg/p1199/CLAUDE.md", "the deepest scope's rules\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "deep rules"]);
+
+    const paths = await listDirBlobsAtRev(repo, "main", ["", ...dirs]);
+
+    expect(paths).toContain("pkg/p1199/CLAUDE.md");
+    expect(paths).toContain("CLAUDE.md");
+  });
+
+  it("yields nothing for a rev that does not resolve, rather than throwing", async () => {
+    expect(await listDirBlobsAtRev(repo, "origin/nope", [""])).toEqual([]);
   });
 });
 

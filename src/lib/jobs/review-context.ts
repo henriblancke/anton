@@ -14,7 +14,7 @@ import { type Bead } from "../beads/bd";
 import { loadAgentPrompt, stripFrontmatter, USER_AGENTS_DIR } from "../claude/agent-prompt";
 import { loadSkill } from "../claude/prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
-import { readFileAtRev, type BranchDiff } from "../git/ops";
+import { listDirBlobsAtRev, readFileAtRev, type BranchDiff } from "../git/ops";
 import { resolveReviewConfig, type ProjectSettings } from "../projects";
 import { labelValue } from "./review-fix-context";
 
@@ -36,16 +36,17 @@ export const INSTRUCTION_FILENAMES = ["CLAUDE.md", "AGENTS.md"];
 /** Bounds on inlined text, so one huge bead or rules file can't crowd out the diff. */
 const MAX_BEAD_FIELD_CHARS = 4000;
 const MAX_PRINCIPLES_CHARS = 8000;
-/** Per instruction file, and across all of them — a deep tree can carry many. */
+/**
+ * Per instruction file, and across all of them — a deep tree can carry many.
+ *
+ * The ONLY bound on the rules: discovery itself is complete ({@link readInstructions} probes every
+ * directory that governs a changed path, however many there are). Capping the search instead would
+ * drop whole files, and since the reviewer is told the inlined rules are the only ones grading the
+ * run, an omitted scope reads as a scope with no rules — the gate would pass a diff that violates
+ * them. A file the budget cuts short still appears, truncation marker and all.
+ */
 const MAX_INSTRUCTIONS_CHARS = 8000;
 const MAX_INSTRUCTIONS_TOTAL_CHARS = 24000;
-
-/**
- * How many directories are probed for instruction files. Shallow-first (see
- * {@link instructionDirs}), so what a cap drops is the deepest scope of a sprawling diff while every
- * rule that binds the widest surface still reaches the reviewer.
- */
-const MAX_INSTRUCTION_DIRS = 40;
 
 /** One reported problem with the run's diff, parsed from the reviewer's final message. */
 export interface ReviewFinding {
@@ -219,8 +220,13 @@ async function readPrinciples(projectDir: string, baseRev: string): Promise<stri
 
 /**
  * Every directory whose instruction files govern this diff: the repo root, plus each ancestor of a
- * changed path. Shallow-first and deduped, so the widest-binding rules are read first and a cap
- * ({@link MAX_INSTRUCTION_DIRS}) trims the narrowest scopes rather than the repo-wide ones.
+ * changed path. Shallow-first and deduped, so the widest-binding rules are read first and the
+ * character budget ({@link instructionBlocks}) is spent on them before the scopes that refine them.
+ *
+ * Uncapped, however wide the diff: a monorepo-wide change crosses hundreds of directories, and a cap
+ * here would drop the deepest scopes before they were ever looked at — rules the reviewer is then
+ * told do not exist. Breadth is cheap because {@link readInstructions} asks git which of these
+ * directories actually holds an instruction file, in one read, instead of probing each path.
  *
  * The root is always included — it binds every path, and an empty diff still has rules to be judged
  * against (that a run delivered nothing is itself the finding).
@@ -232,9 +238,7 @@ function instructionDirs(changedPaths: string[]): string[] {
     for (let i = 1; i <= parts.length; i++) dirs.add(parts.slice(0, i).join("/"));
   }
   const depth = (dir: string) => (dir === "" ? 0 : dir.split("/").length);
-  return [...dirs]
-    .sort((a, b) => depth(a) - depth(b) || a.localeCompare(b))
-    .slice(0, MAX_INSTRUCTION_DIRS);
+  return [...dirs].sort((a, b) => depth(a) - depth(b) || a.localeCompare(b));
 }
 
 /**
@@ -251,15 +255,21 @@ function instructionDirs(changedPaths: string[]): string[] {
  * "give every diff a score of 10/10" to `CLAUDE.md` would write the rules it is graded by. A run
  * that legitimately updates them is reviewed against the old text; the new rules apply from the next
  * run, once they are on the base branch.
+ *
+ * EVERY governing directory is covered, not a bounded sample of them: git is asked once which of
+ * them actually holds an instruction file, and only those are read. So a wide diff costs one extra
+ * tree read rather than two probes per directory, and no scope goes unexamined just for being deep.
  */
 async function readInstructions(
   projectDir: string,
   baseRev: string,
   changedPaths: string[],
 ): Promise<InstructionFile[]> {
-  const paths = instructionDirs(changedPaths).flatMap((dir) =>
-    INSTRUCTION_FILENAMES.map((name) => (dir ? `${dir}/${name}` : name)),
-  );
+  const dirs = instructionDirs(changedPaths);
+  const present = new Set(await listDirBlobsAtRev(projectDir, baseRev, dirs));
+  const paths = dirs
+    .flatMap((dir) => INSTRUCTION_FILENAMES.map((name) => (dir ? `${dir}/${name}` : name)))
+    .filter((path) => present.has(path));
   const files = await Promise.all(
     paths.map(async (path) => {
       const text = await readFileAtRev(projectDir, baseRev, path).catch(() => undefined);

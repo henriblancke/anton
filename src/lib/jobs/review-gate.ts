@@ -18,6 +18,7 @@ import {
   commitAll,
   diffAgainstBase,
   readWorktreeState,
+  resolveMergeBase,
   restoreWorktreeState,
   sameWorktreeState,
   type BranchDiff,
@@ -97,6 +98,8 @@ export interface ReviewGateResult {
 export interface ReviewGateDeps {
   runClaude?: (options: RunClaudeOptions) => Promise<ClaudeResult>;
   diff?: (worktreePath: string, base: string) => Promise<BranchDiff>;
+  /** Pin the movable base branch to the fork-point commit every round is judged against. */
+  mergeBase?: (worktreePath: string, base: string) => Promise<string>;
   commit?: (worktreePath: string, message: string) => Promise<{ committed: boolean }>;
   /** Fingerprint the worktree around a review — the read-only guard's before/after. */
   readState?: (worktreePath: string) => Promise<WorktreeState>;
@@ -121,7 +124,10 @@ export interface ReviewGateArgs {
   settings: ProjectSettings;
   /** The run's worktree: where the diff is read and the fixes land. */
   worktreePath: string;
-  /** Branch the run diverged from — the diff is taken against its merge base. */
+  /**
+   * Branch the run diverged from. Resolved to its merge-base COMMIT once, up front, and every round
+   * reads both the patch and the trusted inputs from that SHA (see {@link runReviewGate}).
+   */
   baseBranch: string;
   /**
    * Re-assert the caller's cross-machine run-lease; throws when it has lapsed.
@@ -211,9 +217,17 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
   const config = resolveReviewConfig(settings);
   const claude = args.deps?.runClaude ?? runClaude;
   const readDiff = args.deps?.diff ?? diffAgainstBase;
+  const mergeBase = args.deps?.mergeBase ?? resolveMergeBase;
   const commit = args.deps?.commit ?? commitAll;
   const readState = args.deps?.readState ?? readWorktreeState;
   const restoreState = args.deps?.restoreState ?? restoreWorktreeState;
+
+  // Pin the fork point once, for every round: `baseBranch` is a MOVABLE ref (`origin/<base>`), and a
+  // sibling run's fetch or a resumed worktree can advance it while this gate runs. Re-resolving it
+  // per read would let the patch come from the old fork point while the reviewer's own inputs — its
+  // contract, the principles, the instruction files — come from a newer tip, so a base commit that
+  // deleted a rule would quietly stop that rule from grading this branch. One SHA, one baseline.
+  const baseRev = await mergeBase(worktreePath, baseBranch);
 
   const rounds: ReviewRound[] = [];
   let reviewer: ReviewerSource = { kind: "default" };
@@ -234,7 +248,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       tickets,
       settings,
       worktreePath,
-      baseBranch,
+      baseRev,
       readDiff,
       carried,
       round,
@@ -348,7 +362,8 @@ async function runReviewSession(args: {
   tickets: Bead[];
   settings: ProjectSettings;
   worktreePath: string;
-  baseBranch: string;
+  /** The pinned fork-point commit: the patch AND the reviewer's trusted inputs both come from it. */
+  baseRev: string;
   readDiff: (worktreePath: string, base: string) => Promise<BranchDiff>;
   /** Advisories still open from earlier rounds — this review restates or settles each. */
   carried: ReviewFinding[];
@@ -379,22 +394,23 @@ async function runReviewSession(args: {
     });
 
     try {
-      const diff = await args.readDiff(worktreePath, args.baseBranch);
+      const diff = await args.readDiff(worktreePath, args.baseRev);
       const { prompt, reviewer } = await buildReviewPrompt({
         target,
         tickets,
         diff,
         settings,
         projectDir: worktreePath,
-        // The same base the diff is taken from: everything the reviewer is handed comes from a
-        // revision this run's own diff could not have written.
-        baseRev: args.baseBranch,
+        // Literally the same commit the diff is taken from — a pinned SHA, not the movable base ref
+        // it was resolved from: everything the reviewer is handed comes from one revision this run's
+        // own diff could not have written, and that no commit landing on the base mid-review moves.
+        baseRev: args.baseRev,
         carriedAdvisories: args.carried,
       });
       await appendSessionLog(
         logPath,
-        `[review] round ${round}/${maxRounds}: reviewing ${diff.files.length} changed file(s) as ` +
-          `${describeReviewer(reviewer)}\n`,
+        `[review] round ${round}/${maxRounds}: reviewing ${diff.files.length} changed file(s) against ` +
+          `${args.baseRev.slice(0, 12)} as ${describeReviewer(reviewer)}\n`,
       );
 
       const result = await claude({
