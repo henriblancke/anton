@@ -72,11 +72,15 @@ working-layer children; anything else gets its own run target.
 
 **Never grow a run that has started.** A run captures its ticket list when it begins, so a ticket
 attached to a feature that is already approved, implementing, in review, or carrying a PR ref is
-never implemented — and merge finalization closes it as delivered anyway. Only extend a feature
-this triage created, or one still open with no `approved` / `stage:*` label and no PR ref
-(`bd show <feature-id>` before you link). An assignee alone is not a disqualifier — a human claim
-reserves a feature without approving it, so no run has captured its tickets yet. Anything else gets
-its own run target.
+never implemented — and merge finalization closes it as delivered anyway. So a feature is extendable
+only if this triage created it, or it is still open with
+no `approved` / `stage:*` label and no PR ref (`bd show <feature-id>` before you link).
+An assignee alone is not a disqualifier — a human claim reserves a feature without approving it,
+so no run has captured its tickets yet. Anything else gets its own run target.
+
+This guard only rules candidates *out*; it never widens a per-class rule above. Which features a
+bead may join at all is decided there first — a cleanup bead, for one, joins only a feature this
+triage just created, never some unrelated open feature under another epic.
 
 Respect `.product/config.yaml` `stringer.max_beads_per_scan` — if triage exceeds it, keep the
 highest-severity and defer the rest (they resurface next scan). Security is exempt from the cap.

@@ -187,6 +187,10 @@ describe("required skill assets", () => {
       // must not name it as a disqualifier the actionable check doesn't test.
       expect(scanTriage).not.toMatch(/already claimed, approved/);
       expect(scanTriage).toMatch(/An assignee alone is not a disqualifier/);
+      // The guard is narrowing-only: read as a licence it would let a cleanup ticket join any open
+      // unstarted feature, crossing epic boundaries past what the per-class rule allows.
+      expect(scanTriage).toMatch(/only rules candidates \*out\*; it never widens a per-class rule/);
+      expect(scanTriage).toMatch(/never some unrelated open feature under another epic/);
     });
 
     it("scan-triage refuses to hand a childless feature its first child", () => {
