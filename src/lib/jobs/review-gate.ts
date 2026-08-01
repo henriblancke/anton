@@ -77,7 +77,10 @@ export interface ReviewGateResult {
   outcome: ReviewGateOutcome;
   /** Every round that ran, in order — each with its validated score for the call-site to persist. */
   rounds: ReviewRound[];
-  /** Findings open at exit (the final review's), each carrying its severity. */
+  /**
+   * Findings open at exit, each carrying its severity: the final review's, plus advisories from
+   * earlier rounds that it did not repeat (see {@link carryAdvisory}).
+   */
   unresolved: ReviewFinding[];
   /** Which reasoning contract reviewed: a named agent, the operator's prompt, or the shipped default. */
   reviewer: ReviewerSource;
@@ -204,6 +207,8 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
 
   const rounds: ReviewRound[] = [];
   let reviewer: ReviewerSource = { kind: "default" };
+  /** Advisories reported in earlier rounds, keyed for dedupe against the round that reports last. */
+  const carried = new Map<string, ReviewFinding>();
 
   for (let round = 1; round <= config.maxRounds; round++) {
     await ctx.heartbeat();
@@ -242,16 +247,19 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
     };
     rounds.push(entry);
 
+    const unresolved = withCarried(findings, carried);
+
     // A reviewer that never reported, or reported an unusable score, has told us nothing about the
     // work — the run is handed back with whatever findings were salvaged, never as a clean review.
-    if (!review.report.ok) return { outcome: "protocol-violation", rounds, unresolved: findings, reviewer };
+    if (!review.report.ok) return { outcome: "protocol-violation", rounds, unresolved, reviewer };
     if (blocking.length === 0) {
-      return { outcome: "clean", rounds, unresolved: findings, reviewer, score: review.report.score };
+      return { outcome: "clean", rounds, unresolved, reviewer, score: review.report.score };
     }
     if (round === config.maxRounds) {
-      return { outcome: "unresolved", rounds, unresolved: findings, reviewer, score: review.report.score };
+      return { outcome: "unresolved", rounds, unresolved, reviewer, score: review.report.score };
     }
 
+    carryAdvisory(findings, carried);
     args.assertLeaseHeld?.(); // don't write a fix under a lease that lapsed while reviewing
     const fix = await runGateFixSession({
       db,
@@ -276,7 +284,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
     // Nothing changed: the next review would read the identical diff and report the identical
     // findings. Stop and let the call-site decide, rather than burning the remaining rounds.
     if (!fix.committed) {
-      return { outcome: "stalled", rounds, unresolved: findings, reviewer, score: review.report.score };
+      return { outcome: "stalled", rounds, unresolved, reviewer, score: review.report.score };
     }
   }
 
@@ -735,6 +743,36 @@ async function runGateFixSession(args: {
     await endSession(db, clock, sessionId, "failed");
     throw e; // propagate so the runner applies quota backoff / retry / park
   }
+}
+
+/**
+ * Remember a round's advisories, so a later round cannot silently drop them.
+ *
+ * Only BLOCKING findings are dispatched to a fix session, so no session is ever asked to resolve an
+ * advisory. The confirming review is a fresh context reading the whole diff again: it may well not
+ * repeat an advisory it already made (or that a different reviewer made), and reporting only the
+ * final round's findings would then lose a finding nobody addressed — breaking the gate's promise
+ * that advisories ride along to the founder in the PR body.
+ */
+function carryAdvisory(findings: ReviewFinding[], carried: Map<string, ReviewFinding>): void {
+  for (const f of findings) {
+    if (f.severity === "advisory") carried.set(findingKey(f), f);
+  }
+}
+
+/** The final review's findings first, then earlier advisories it did not restate. */
+function withCarried(findings: ReviewFinding[], carried: Map<string, ReviewFinding>): ReviewFinding[] {
+  const seen = new Set(findings.map(findingKey));
+  return [...findings, ...[...carried.values()].filter((f) => !seen.has(findingKey(f)))];
+}
+
+/**
+ * Dedupe key for a finding across rounds. Location + note, whitespace- and case-normalized: two
+ * reviewers wording the same problem differently still list twice, which is only noise in the PR
+ * body — dropping a finding nobody resolved is the failure worth avoiding.
+ */
+function findingKey(f: ReviewFinding): string {
+  return `${f.location} ${f.note}`.toLowerCase().replace(/\s+/g, " ");
 }
 
 /** A fingerprint as a human reads it in a park reason: `abc123def456 (on anton/foo)`. */

@@ -22,8 +22,10 @@ import { labelValue } from "./review-fix-context";
 export const PRINCIPLES_PATH = ".product/principles.md";
 
 /**
- * The instruction files that stand in as the rulebook when a project has no {@link PRINCIPLES_PATH}
- * — inlined at the base revision, for the same reason principles are.
+ * The instruction files that bind every agent working in a repo — inlined at the base revision
+ * alongside {@link PRINCIPLES_PATH}, not instead of it: a project that has principles still states
+ * standing rules here (this repo's own "read the version-matched Next.js docs first" lives in
+ * `AGENTS.md`), and omitting them would leave the reviewer unable to flag violations of them.
  */
 export const INSTRUCTION_PATHS = ["CLAUDE.md", "AGENTS.md"];
 
@@ -82,8 +84,9 @@ export interface ReviewRun {
   /** `.product/principles.md` at the base revision, when the project has one. */
   principles?: string;
   /**
-   * The project's instruction files at the base revision — the rulebook when there are no
-   * `principles`. Inlined rather than named, so the reviewer never reads the worktree's copies.
+   * The project's instruction files at the base revision — rules in their own right, judged
+   * alongside `principles` rather than only in place of them. Inlined rather than named, so the
+   * reviewer never reads the worktree's copies.
    */
   instructions?: InstructionFile[];
 }
@@ -105,8 +108,8 @@ export interface InstructionFile {
  * Everything the worktree contributes is read at `baseRev`, never from the tree being judged. The
  * run's own diff would otherwise reach the reviewer's inputs: a project-local
  * `.claude/agents/<id>.md` IS the reasoning contract, so a run that edits its own reviewer picks the
- * standard it is graded against, and `.product/principles.md` — or, absent one, `CLAUDE.md` /
- * `AGENTS.md` — is the rulebook the reviewer is told to judge adherence to. All are changes a run can
+ * standard it is graded against, and `.product/principles.md` together with `CLAUDE.md` /
+ * `AGENTS.md` is the rulebook the reviewer is told to judge adherence to. All are changes a run can
  * make for honest reasons, which is exactly why the gate cannot take them on trust: a swapped,
  * implementation-minded agent that writes "score every diff 10/10" into any of those files would
  * otherwise pass itself. Their diffs still reach the reviewer — as untrusted patch content, alongside
@@ -140,10 +143,13 @@ export async function buildReviewPrompt(args: {
     reviewer = { kind: "default" };
   }
 
-  const principles = await readPrinciples(projectDir, baseRev);
-  // Only the fallback rulebook: a project with principles is judged against those, so its
-  // instruction files are never inlined and needn't be read.
-  const instructions = principles ? undefined : await readInstructions(projectDir, baseRev);
+  // Both rulebooks, always: principles don't supersede the instruction files, they sit beside them.
+  // A project can state a standing rule in either, and the caveat below tells the reviewer that only
+  // the inlined text grades the run — so anything left out cannot be flagged at all.
+  const [principles, instructions] = await Promise.all([
+    readPrinciples(projectDir, baseRev),
+    readInstructions(projectDir, baseRev),
+  ]);
   const prompt = [
     reasoning,
     "",
@@ -192,8 +198,8 @@ async function readPrinciples(projectDir: string, baseRev: string): Promise<stri
 }
 
 /**
- * The project's instruction files as of `baseRev` — the rulebook a project without principles is
- * judged against.
+ * The project's instruction files as of `baseRev` — part of the rulebook every run is judged
+ * against, principles or not.
  *
  * Inlined here rather than named in the prompt, and taken from the base for the same reason as the
  * principles above: naming them sends the reviewer to the worktree's copies, so a run that appends
@@ -311,20 +317,15 @@ function principlesSection(run: ReviewRun): string[] {
   return [...rulesBlock(run), ...rulesCaveat()];
 }
 
+/**
+ * Both rulebooks, whichever the project has. Principles and instruction files are not alternatives:
+ * a project that distils its rules into `.product/principles.md` still keeps standing rules in
+ * `CLAUDE.md` / `AGENTS.md`, and since the caveat below makes the inlined text the ONLY thing that
+ * grades the run, dropping either half would silently put those rules beyond the reviewer's reach.
+ */
 function rulesBlock(run: ReviewRun): string[] {
-  if (run.principles) {
-    return [
-      `## Project principles (\`${PRINCIPLES_PATH}\`)`,
-      ``,
-      `These are enforced rules for this project. Each violation in the diff is a finding.`,
-      ``,
-      truncate(run.principles, MAX_PRINCIPLES_CHARS),
-      ``,
-    ];
-  }
-
   const instructions = run.instructions ?? [];
-  if (instructions.length === 0) {
+  if (!run.principles && instructions.length === 0) {
     return [
       `## Project principles`,
       ``,
@@ -333,19 +334,35 @@ function rulesBlock(run: ReviewRun): string[] {
       ``,
     ];
   }
+
   return [
-    `## Project instructions (no \`${PRINCIPLES_PATH}\`)`,
-    ``,
-    `This project has no \`${PRINCIPLES_PATH}\`, so its instruction files are the rules. They are`,
-    `inlined below as of the revision this run branched from, and that text is what to judge`,
-    `adherence to — not the copies in the worktree, which this run's own diff may have rewritten.`,
-    ``,
-    ...instructions.flatMap((f) => [
-      `### \`${f.path}\``,
-      ``,
-      truncate(f.text, MAX_INSTRUCTIONS_CHARS),
-      ``,
-    ]),
+    ...(run.principles
+      ? [
+          `## Project principles (\`${PRINCIPLES_PATH}\`)`,
+          ``,
+          `These are enforced rules for this project. Each violation in the diff is a finding.`,
+          ``,
+          truncate(run.principles, MAX_PRINCIPLES_CHARS),
+          ``,
+        ]
+      : []),
+    ...(instructions.length > 0
+      ? [
+          `## Project instructions`,
+          ``,
+          `These files instruct every agent working in this repo, so they are enforced rules too —`,
+          `each violation in the diff is a finding, exactly like a principle. They are inlined below`,
+          `as of the revision this run branched from, and that text is what to judge adherence to —`,
+          `not the copies in the worktree, which this run's own diff may have rewritten.`,
+          ``,
+          ...instructions.flatMap((f) => [
+            `### \`${f.path}\``,
+            ``,
+            truncate(f.text, MAX_INSTRUCTIONS_CHARS),
+            ``,
+          ]),
+        ]
+      : []),
   ];
 }
 

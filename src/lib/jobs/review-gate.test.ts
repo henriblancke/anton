@@ -275,6 +275,37 @@ describe("runReviewGate — convergence", () => {
     // The fixer runs under the layered execution contract; the reviewer never does (below).
     expect(calls[1].appendSystemPrompt).toBeTruthy();
   });
+
+  it("carries an earlier round's advisory to the exit when the confirming review drops it", async () => {
+    // Nothing ever dispatched the advisory — only blocking findings reach a fix session — so a fresh
+    // confirming review that doesn't restate it must not make it disappear from the PR body.
+    const { result } = gate([report(4, [BLOCKING, ADVISORY]), "fixed the loop bound", report(9, [])]);
+    const out = await result;
+
+    expect(out.outcome).toBe("clean");
+    expect(out.unresolved).toEqual([
+      { severity: "advisory", location: "src/a.ts:9", note: "the name could be clearer" },
+    ]);
+  });
+
+  it("lists a carried advisory once when the confirming review repeats it", async () => {
+    const { result } = gate([report(4, [BLOCKING, ADVISORY]), "fixed", report(9, [ADVISORY])]);
+    const out = await result;
+
+    expect(out.unresolved).toHaveLength(1);
+  });
+
+  it("carries advisories through a round that ends on a protocol violation", async () => {
+    // The findings salvaged from a broken report are why a human is being asked; an advisory an
+    // earlier round reported is part of that picture.
+    const { result } = gate([report(4, [BLOCKING, ADVISORY]), "fixed", "no report at all"]);
+    const out = await result;
+
+    expect(out.outcome).toBe("protocol-violation");
+    expect(out.unresolved).toEqual([
+      { severity: "advisory", location: "src/a.ts:9", note: "the name could be clearer" },
+    ]);
+  });
 });
 
 describe("runReviewGate — bounds", () => {

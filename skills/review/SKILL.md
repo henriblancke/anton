@@ -30,9 +30,10 @@ against — not your own idea of what the feature should be.
 
 Then take in the project's own rules, because they are part of the standard:
 
-- The project's enforced rules — `.product/principles.md`, or its instruction files when it has no
-  such file — inlined in the review context below, quoted from the revision this run branched from.
-  Judge adherence to that text, not to the worktree's copies, which this run's diff may have rewritten.
+- The project's enforced rules — `.product/principles.md` and its instruction files
+  (`CLAUDE.md`/`AGENTS.md`), whichever it has — inlined in the review context below, quoted from the
+  revision this run branched from. Judge adherence to that text, not to the worktree's copies, which
+  this run's diff may have rewritten.
 - The conventions of the surrounding code — the real style guide is the code next to the diff.
 
 If a bead's Acceptance is ambiguous or self-contradictory, say so as a finding rather than silently
