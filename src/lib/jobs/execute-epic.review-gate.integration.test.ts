@@ -92,14 +92,15 @@ describeBd("execute-epic e2e — pre-PR self-review gate (real handler · real b
   };
 
   /**
-   * A `gh` that dumps the `--body` it was invoked with. Non-JSON on `pr view` (like the fixture's
-   * default fake), so the reuse probe finds no existing PR and `pr create` actually runs.
+   * A `gh` that dumps the `--body` it was invoked with. Reports no open PR on the branch (`pr list`
+   * → empty, like the fixture's default fake), so the reuse probe finds none and `pr create` runs.
    */
   const capturingGh = (name: string, bodyDump: string) =>
     writeBin(
       binDir,
       name,
       `const fs=require('fs');const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='list'){console.log('[]');process.exit(0);}
 const i=a.indexOf('--body');if(i>=0){fs.writeFileSync(${JSON.stringify(bodyDump)},a[i+1]);}
 console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
     );
@@ -311,8 +312,8 @@ process.exit(0);`),
       binDir,
       "gh-stale-body",
       `const a=process.argv.slice(2);
-if(a[0]==='pr'&&a[1]==='view'){
-  console.log(JSON.stringify({url:'https://github.com/acme/repo/pull/42',number:42,state:'OPEN',isDraft:false}));
+if(a[0]==='pr'&&a[1]==='list'){
+  console.log(JSON.stringify([{url:'https://github.com/acme/repo/pull/42',number:42,isDraft:false}]));
   process.exit(0);
 }
 if(a[0]==='pr'&&a[1]==='edit'){process.stderr.write('HTTP 403\\n');process.exit(1);}
@@ -352,7 +353,7 @@ process.exit(0);`,
       binDir,
       "gh-boom-review",
       `const a=process.argv.slice(2);
-if(a[0]==='pr'&&a[1]==='view'){process.exit(1);}
+if(a[0]==='pr'&&a[1]==='list'){process.stdout.write('[]\\n');process.exit(0);}
 console.error('gh boom: no PR may be opened for an unresolved review');process.exit(1);`,
     );
     const okGh = process.env.ANTON_GH_BIN!;
@@ -411,8 +412,8 @@ console.error('gh boom: no PR may be opened for an unresolved review');process.e
       "gh-orphan-review",
       `const fs=require('fs');const a=process.argv.slice(2);
 fs.appendFileSync(${JSON.stringify(ghLog)},JSON.stringify(a)+'\\n');
-if(a[0]==='pr'&&a[1]==='view'){
-  process.stdout.write(JSON.stringify({url:'https://github.com/acme/repo/pull/77',number:77,state:'OPEN',isDraft:false})+'\\n');
+if(a[0]==='pr'&&a[1]==='list'){
+  process.stdout.write(JSON.stringify([{url:'https://github.com/acme/repo/pull/77',number:77,isDraft:false}])+'\\n');
   process.exit(0);
 }
 if(a[0]==='pr'&&a[1]==='ready'){process.exit(0);}
@@ -451,6 +452,74 @@ console.error('gh boom: no PR may be opened for an unresolved review');process.e
     }
   });
 
+  it("says so when the orphan lookup FAILED instead of reporting that no PR was opened", async () => {
+    // `gh` exits non-zero on an auth or network failure exactly as it does for a branch with no PR.
+    // Reading that as "no PR" is the same false green the draft pass exists to prevent, one step
+    // quieter: a live PR from an earlier attempt stays mergeable while anton reports none exists.
+    await setReviewEnabled(true);
+    script({
+      score: 2,
+      rationale: "acceptance not met",
+      findings: [{ severity: "blocking", location: "src/z.ts:1", note: "AC-1 is not implemented" }],
+    });
+    const targetId = await approvedTarget("Unknown orphan run");
+
+    const okGh = process.env.ANTON_GH_BIN!;
+    // Every gh call fails the way an expired token does — including the orphan lookup.
+    process.env.ANTON_GH_BIN = writeBin(
+      binDir,
+      "gh-auth-failed",
+      `process.stderr.write('gh: HTTP 401: Bad credentials\\n');process.exit(1);`,
+    );
+
+    const runner = makeEpicRunner(ctx);
+    let jobId: string;
+    try {
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
+      expect((await getJob(tdb.db, jobId))?.status).toBe("parked");
+
+      const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === targetId)!;
+      expect(run.error).toContain("could NOT check whether an earlier attempt left a PR open");
+      expect(await beads.show(repo, targetId).then((b) => b.notes ?? "")).toContain(
+        "could NOT check whether an earlier attempt left a PR open",
+      );
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+      if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  });
+
+  it("records the review's ADVISORIES on the bead when it parks on a blocking finding", async () => {
+    // A parked run opens no PR, and the PR body is where advisories normally reach the founder. The
+    // resumed run re-reviews from scratch with an empty carry, so an advisory nobody wrote down here
+    // can vanish between the review that found it and the merge gate it was meant to reach.
+    await setReviewEnabled(true);
+    const mixed = {
+      score: 3,
+      rationale: "AC-2 unmet",
+      findings: [
+        { severity: "blocking", location: "src/z.ts:1", note: "AC-2 is not implemented" },
+        { severity: "advisory", location: "src/a.ts:10", note: "extract the duplicated mapper" },
+      ],
+    };
+    script(mixed, mixed); // the fix never resolves it → parks with both findings still open
+    const targetId = await approvedTarget("Parked advisory run");
+
+    const runner = makeEpicRunner(ctx);
+    let jobId: string;
+    try {
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
+      expect((await getJob(tdb.db, jobId))?.status).toBe("parked");
+
+      const notes = (await beads.show(repo, targetId)).notes ?? "";
+      expect(notes).toContain("AC-2 is not implemented");
+      expect(notes).toContain("Advisory findings from the same review (1)");
+      expect(notes).toContain("extract the duplicated mapper");
+    } finally {
+      if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  });
+
   it("parks when the reviewer never reports — silence is not a clean review", async () => {
     await setReviewEnabled(true);
     script(null);
@@ -460,7 +529,7 @@ console.error('gh boom: no PR may be opened for an unresolved review');process.e
       binDir,
       "gh-boom-silent",
       `const a=process.argv.slice(2);
-if(a[0]==='pr'&&a[1]==='view'){process.exit(1);}
+if(a[0]==='pr'&&a[1]==='list'){process.stdout.write('[]\\n');process.exit(0);}
 console.error('gh boom: no PR may be opened on an unreported review');process.exit(1);`,
     );
     const okGh = process.env.ANTON_GH_BIN!;
@@ -496,7 +565,7 @@ console.error('gh boom: no PR may be opened on an unreported review');process.ex
       binDir,
       "gh-boom-mangled",
       `const a=process.argv.slice(2);
-if(a[0]==='pr'&&a[1]==='view'){process.exit(1);}
+if(a[0]==='pr'&&a[1]==='list'){process.stdout.write('[]\\n');process.exit(0);}
 console.error('gh boom: no PR may be opened on an unreadable review report');process.exit(1);`,
     );
     const okGh = process.env.ANTON_GH_BIN!;
@@ -535,7 +604,7 @@ console.error('gh boom: no PR may be opened on an unreadable review report');pro
       binDir,
       "gh-boom-rationale",
       `const a=process.argv.slice(2);
-if(a[0]==='pr'&&a[1]==='view'){process.exit(1);}
+if(a[0]==='pr'&&a[1]==='list'){process.stdout.write('[]\\n');process.exit(0);}
 console.error('gh boom: no PR may be opened on an unjustified score');process.exit(1);`,
     );
     const okGh = process.env.ANTON_GH_BIN!;
@@ -573,7 +642,7 @@ console.error('gh boom: no PR may be opened on an unjustified score');process.ex
       binDir,
       "gh-boom-trailing",
       `const a=process.argv.slice(2);
-if(a[0]==='pr'&&a[1]==='view'){process.exit(1);}
+if(a[0]==='pr'&&a[1]==='list'){process.stdout.write('[]\\n');process.exit(0);}
 console.error('gh boom: no PR may be opened on a retracted review');process.exit(1);`,
     );
     const okGh = process.env.ANTON_GH_BIN!;
@@ -614,7 +683,7 @@ console.error('gh boom: no PR may be opened on a retracted review');process.exit
       binDir,
       "gh-boom-editing",
       `const a=process.argv.slice(2);
-if(a[0]==='pr'&&a[1]==='view'){process.exit(1);}
+if(a[0]==='pr'&&a[1]==='list'){process.stdout.write('[]\\n');process.exit(0);}
 console.error('gh boom: no PR may be opened on a review that edited the code');process.exit(1);`,
     );
     const okGh = process.env.ANTON_GH_BIN!;
@@ -662,7 +731,7 @@ console.error('gh boom: no PR may be opened on a review that edited the code');p
       binDir,
       "gh-boom-gate-poison",
       `const a=process.argv.slice(2);
-if(a[0]==='pr'&&a[1]==='view'){process.exit(1);}
+if(a[0]==='pr'&&a[1]==='list'){process.stdout.write('[]\\n');process.exit(0);}
 console.error('gh boom: no PR may be opened when the gate never reviewed');process.exit(1);`,
     );
     const okGh = process.env.ANTON_GH_BIN!;

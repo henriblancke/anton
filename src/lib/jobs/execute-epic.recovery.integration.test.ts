@@ -92,6 +92,7 @@ describeBd("execute-epic e2e — recovery & readiness (real handler · real bd/g
       "gh-recover-jz1",
       `const a=process.argv.slice(2);
 if(a[0]==='pr'&&a[1]==='view'){process.stdout.write(JSON.stringify({state:'CLOSED'})+'\\n');process.exit(0);}
+if(a[0]==='pr'&&a[1]==='list'){process.stdout.write('[]\\n');process.exit(0);}
 if(a[0]==='pr'&&a[1]==='create'){process.stdout.write('https://github.com/acme/repo/pull/99\\n');process.exit(0);}
 process.exit(0);`,
     );

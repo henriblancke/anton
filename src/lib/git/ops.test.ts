@@ -1,8 +1,9 @@
 /**
  * Integration tests for openPullRequest idempotency (anton-kh6). Uses REAL git against a temp
  * repo + bare `origin`, and a stateful fake `gh` (ANTON_GH_BIN) that models `pr create` failing
- * on a duplicate and `pr view <branch>` resolving the branch's PR. Proves a resumed execute-epic
- * run that re-reaches the PR step reuses the existing PR instead of erroring on `gh pr create`.
+ * on a duplicate and `pr list --head <branch>` resolving the branch's PR. Proves a resumed
+ * execute-epic run that re-reaches the PR step reuses the existing PR instead of erroring on
+ * `gh pr create`.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
@@ -23,6 +24,7 @@ import {
   diffAgainstBase,
   findOpenPullRequest,
   listDirBlobsAtRev,
+  lookupOpenPullRequest,
   markPullRequestDraft,
   openPullRequest,
   pullRequestState,
@@ -102,6 +104,11 @@ if(a[0]==='pr'&&a[1]==='edit'){
   const key=branches(s).find(k=>k===sel||String(s[k].number)===sel||s[k].url===sel);
   if(!key){process.stderr.write('no pull requests found\\n');process.exit(1);}
   s[key].title=get('--title');s[key].body=get('--body');write(s);process.exit(0);
+}
+if(a[0]==='pr'&&a[1]==='list'){
+  // Like the real gh: exit 0 with an empty array when the branch has no open PR.
+  const branch=get('--head');const s=read();const pr=s[branch];
+  process.stdout.write(JSON.stringify(pr&&pr.state==='OPEN'?[pr]:[])+'\\n');process.exit(0);
 }
 if(a[0]==='pr'&&a[1]==='view'){
   const branch=a[2];const s=read();const pr=s[branch];
@@ -219,7 +226,24 @@ process.exit(0);
   });
 
   it("finds no PR for a branch that has none", async () => {
+    expect(await lookupOpenPullRequest(repo, "anton/never-opened")).toEqual({});
     expect(await findOpenPullRequest(repo, "anton/never-opened")).toBeUndefined();
+  });
+
+  it("reports a lookup gh could not answer as failed, not as 'no PR'", async () => {
+    // `gh` exits non-zero on an expired token or a network blip exactly as it would for a branch
+    // with no PR. A caller that drafts an orphaned PR before parking must not read the two as one:
+    // it would report "no PR was opened" over a live PR carrying un-reviewed work.
+    const failing = join(sandbox, "bin", "gh-failing");
+    writeFileSync(failing, `#!/usr/bin/env node\nprocess.stderr.write('HTTP 401\\n');process.exit(1);\n`);
+    chmodSync(failing, 0o755);
+    const ok = process.env[GH_BIN_ENV];
+    process.env[GH_BIN_ENV] = failing;
+    try {
+      expect(await lookupOpenPullRequest(repo, "anton/epic-1")).toEqual({ failed: true });
+    } finally {
+      process.env[GH_BIN_ENV] = ok;
+    }
   });
 });
 
@@ -707,6 +731,21 @@ suite("resolveMergeBase (real git)", () => {
   it("falls back to the base itself when it does not resolve", async () => {
     expect(await resolveMergeBase(repo, "origin/nope")).toBe("origin/nope");
   });
+
+  it("pins a base with NO merge base to its commit, never to the movable ref name", async () => {
+    // A resumed worktree whose base was force-rewritten to an unrelated history: `merge-base` exits
+    // 1. Handing back "main" would leave every later read resolving that ref again, so a sibling
+    // fetch between two of them splits the baseline the pinning exists to hold together.
+    g(["checkout", "-q", "--orphan", "rewritten"]);
+    writeFileSync(join(repo, "b.ts"), "export const b = 1;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "unrelated history"]);
+
+    const pinned = await resolveMergeBase(repo, "main");
+
+    expect(pinned).toMatch(/^[0-9a-f]{40}$/);
+    expect(pinned).toBe(out(["rev-parse", "main"]));
+  });
 });
 
 suite("listDirBlobsAtRev (real git)", () => {
@@ -762,6 +801,22 @@ suite("listDirBlobsAtRev (real git)", () => {
     // An empty list is the review gate's "no scope here holds an instruction file". A read that
     // FAILED has established no such thing, and passing it off as one drops the whole rulebook.
     await expect(listDirBlobsAtRev(repo, "origin/nope", [""])).rejects.toThrow();
+  });
+
+  it("reads a directory whose NAME starts with pathspec magic as a literal path", async () => {
+    // The operands are built from the diff's own directory names. A real directory called
+    // `:(exclude)` parses as an exclusion pathspec instead — git exits with "outside repository",
+    // which fails the read the gate depends on and parks every run that touches that subtree.
+    write(":(exclude)/CLAUDE.md", "magic-named scope rules\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "magic-named dir"]);
+
+    const paths = await listDirBlobsAtRev(repo, "main", ["", ":(exclude)"]);
+
+    expect(paths).toContain(":(exclude)/CLAUDE.md");
+    expect(paths).toContain("CLAUDE.md");
+    // readFileAtRev builds the same kind of operand from an exact rule-file path.
+    expect(await readFileAtRev(repo, "main", ":(exclude)/CLAUDE.md")).toBe("magic-named scope rules");
   });
 });
 

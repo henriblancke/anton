@@ -192,6 +192,46 @@ describe("reviewContext", () => {
     expect(out).toContain("a deleted file is not in the worktree to");
   });
 
+  it("warns when the deletion rescue pass FAILED, so an unseen removal isn't read as none", () => {
+    // git can fail collecting the deletions (a timeout, a killed process). The reviewer cannot open
+    // a deleted file and has no `git` to fetch one, so an unremarked gap reads as "nothing was
+    // removed" — and the removals it never saw are approved by its verdict.
+    const out = reviewContext({
+      target: epic,
+      tickets: [ticket],
+      diff: { ...diff, truncated: true, deletionsIncomplete: true },
+    });
+
+    expect(out).toContain("### Files this run DELETED");
+    expect(out).toContain("git FAILED while collecting this run's deletions");
+    expect(out).toContain("report the removals you could not review as a finding");
+
+    // A rescue pass that worked says nothing of the sort.
+    const clean = reviewContext({
+      target: epic,
+      tickets: [ticket],
+      diff: { ...diff, truncated: true, deletions: "diff --git a/src/old.ts\n-const a = 1;\n" },
+    });
+    expect(clean).not.toContain("git FAILED while collecting");
+  });
+
+  it("tells the reviewer to report a contract section the prompt had to truncate", () => {
+    // The reviewer works from this prompt alone — an Acceptance criterion past the cut is simply not
+    // in front of it, so the criteria that survived would otherwise read as the whole contract.
+    const long: Bead = {
+      ...ticket,
+      description: `## Goal\n\nThe widget renders.\n\n## Acceptance\n\n- [ ] ${"x".repeat(5000)}\n`,
+    };
+    const out = reviewContext({ target: epic, tickets: [long], diff });
+
+    expect(out).toContain("… [truncated]");
+    expect(out).toContain("A section above marked");
+    expect(out).toContain("report every criterion you could not fully read as an");
+
+    // A contract that fits whole carries no such note.
+    expect(reviewContext({ target: epic, tickets: [ticket], diff })).not.toContain("A section above marked");
+  });
+
   it("puts an earlier round's open advisories in front of the reviewer to settle", () => {
     const out = reviewContext({
       target: epic,

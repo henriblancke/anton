@@ -19,7 +19,7 @@ import { runClaude, type ClaudeEvent, type ClaudeResult } from "../claude/driver
 import { formatAntonResult, parseAntonResult } from "../claude/anton-result";
 import {
   commitAll,
-  findOpenPullRequest,
+  lookupOpenPullRequest,
   markPullRequestDraft,
   openPullRequest,
   pullRequestState,
@@ -971,7 +971,12 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         // with the reason on the bead so the board shows why rather than only the run log.
         if (blocking.length > 0 || review.outcome === "protocol-violation") {
           const orphan = await reconcileOrphanPullRequest(repo, worktree.branch);
-          await safe(() => beads.note(repo, epicBeadId, reviewParkNote(review, blocking, orphan)));
+          // The advisories go on the bead with them: this run opens no PR, so its body — their only
+          // other home — never exists, and the resumed run starts its review with an empty carry.
+          const parkedAdvisories = review.unresolved.filter((f) => f.severity === "advisory");
+          await safe(() =>
+            beads.note(repo, epicBeadId, reviewParkNote(review, blocking, parkedAdvisories, orphan)),
+          );
           throw new ReviewBlockedError(
             `${epicBeadId} did not pass its pre-PR self-review (${review.outcome}): ` +
               `${reviewFailureReason(review, blocking)}. No PR opened — the findings are on the ` +
@@ -1488,10 +1493,14 @@ function reviewFailureReason(review: ReviewGateResult, blocking: ReviewFinding[]
   }
 }
 
-/** A PR already open on the run's branch that the board has no ref for, and whether we defused it. */
+/** What the park path found on the run's branch: an untracked PR it defused, or a lookup gh refused. */
 interface OrphanPullRequest {
-  pr: PullRequest;
-  drafted: boolean;
+  /** The untracked PR open on the branch. Absent when the lookup itself failed. */
+  pr?: PullRequest;
+  /** Whether that PR is now a draft — it already was, or we flipped it. */
+  drafted?: boolean;
+  /** True when `gh` could not be asked at all, so an orphan may be sitting there un-drafted. */
+  lookupFailed?: boolean;
 }
 
 /**
@@ -1507,12 +1516,17 @@ interface OrphanPullRequest {
  * The ref is deliberately NOT stamped onto the bead here: step 0a treats a ref whose PR is OPEN as
  * proof another run finished the epic, so recording it would make the next resume short-circuit as
  * done — retiring the epic with its blocking findings unaddressed.
+ *
+ * A lookup gh could not answer is reported as such, never as "no PR": the whole point of this pass is
+ * that an un-drafted orphan stays mergeable, and telling the founder no PR was opened on the strength
+ * of a network blip is the same false green in a quieter form.
  */
 async function reconcileOrphanPullRequest(
   repoPath: string,
   branch: string,
 ): Promise<OrphanPullRequest | undefined> {
-  const pr = await findOpenPullRequest(repoPath, branch);
+  const { pr, failed } = await lookupOpenPullRequest(repoPath, branch);
+  if (failed) return { lookupFailed: true };
   if (!pr) return undefined;
   return { pr, drafted: pr.isDraft === true || (await markPullRequestDraft(repoPath, pr.ref)) };
 }
@@ -1520,6 +1534,13 @@ async function reconcileOrphanPullRequest(
 /** What became of an orphan PR, appended to the park message — empty when the branch had none. */
 function orphanClause(orphan: OrphanPullRequest | undefined): string {
   if (!orphan) return "";
+  if (orphan.lookupFailed || !orphan.pr) {
+    return (
+      ` WARNING: anton could NOT check whether an earlier attempt left a PR open on this branch ` +
+      `(the \`gh\` lookup failed) — if one is open it is still mergeable with this un-reviewed work. ` +
+      `Check the branch by hand.`
+    );
+  }
   return orphan.drafted
     ? ` A PR an earlier attempt had already opened (${orphan.pr.url}) was converted to a DRAFT so ` +
         `this un-reviewed work can't be merged; it returns to ready when the gate passes.`
@@ -1528,10 +1549,19 @@ function orphanClause(orphan: OrphanPullRequest | undefined): string {
         `isn't merged.`;
 }
 
-/** The park reason on the target bead: what the reviewer refused to pass, in its own words. */
+/**
+ * The park reason on the target bead: what the reviewer refused to pass, in its own words.
+ *
+ * The ADVISORIES ride along with the blocking findings, because this note is the only place they
+ * survive. A parked run opens no PR — the body is where advisories normally reach the founder — and
+ * the resumed run re-reviews from scratch with an empty carry, so an advisory the next reviewer
+ * doesn't happen to restate would vanish between the review that found it and the merge gate it was
+ * meant to reach. The score comment records their count, never their text.
+ */
 function reviewParkNote(
   review: ReviewGateResult,
   blocking: ReviewFinding[],
+  advisory: ReviewFinding[],
   orphan?: OrphanPullRequest,
 ): string {
   const rounds = review.rounds.length;
@@ -1545,6 +1575,14 @@ function reviewParkNote(
     head,
     ...findingLines(blocking),
     ``,
+    ...(advisory.length > 0
+      ? [
+          `Advisory findings from the same review (${advisory.length}) — they did not park the run, ` +
+            `but no PR carries them, so they are recorded here:`,
+          ...findingLines(advisory),
+          ``,
+        ]
+      : []),
     ...(orphanLine ? [orphanLine, ``] : []),
     `Resolve them (or correct the ticket), then resume the run.`,
   ].join("\n");

@@ -174,7 +174,10 @@ async function blobModeAtRev(
   path: string,
 ): Promise<string | undefined> {
   // -z: git quotes non-ASCII paths otherwise, and a quoted entry no longer splits on a literal tab.
-  const out = await git(worktreePath, ["ls-tree", "-z", rev, "--", path]);
+  // `:(literal)`, because a pathspec is PARSED before it is matched: a repo whose directory name
+  // starts with pathspec magic — `:(exclude)/rules.md` — makes git read the operand as an exclusion
+  // and fail the command outright, which for the review gate means parking every run touching it.
+  const out = await git(worktreePath, ["ls-tree", "-z", rev, "--", `:(literal)${path}`]);
   const entry = out.split("\0")[0];
   const tab = entry?.indexOf("\t") ?? -1;
   if (!entry || tab < 0) return undefined;
@@ -231,7 +234,11 @@ export async function listDirBlobsAtRev(
   rev: string,
   dirs: string[],
 ): Promise<string[]> {
-  const specs = dirs.map((dir) => (dir ? `${dir.replace(/\/+$/, "")}/` : "./"));
+  // `:(literal)`, for the same reason as {@link blobModeAtRev}: these operands are BUILT from the
+  // diff's own directory names, and one that begins with pathspec magic (`:(exclude)/`) is parsed as
+  // magic rather than matched as a directory — `fatal: outside repository`, which fails the read the
+  // gate depends on instead of returning that scope's rules.
+  const specs = dirs.map((dir) => `:(literal)${dir ? `${dir.replace(/\/+$/, "")}/` : "./"}`);
   const batches: string[][] = [];
   for (let i = 0; i < specs.length; i += LS_TREE_BATCH) batches.push(specs.slice(i, i + LS_TREE_BATCH));
 
@@ -252,17 +259,29 @@ export async function listDirBlobsAtRev(
 }
 
 /**
- * The commit a branch forked from `base`, pinned as a SHA — or `base` itself when no merge base
- * exists (unrelated histories) or the ref doesn't resolve, which is what the callers diffed against
- * before and never a failure.
+ * The commit a branch forked from `base`, pinned as a SHA — or `base` itself when it names nothing
+ * this repo can resolve, which is what the callers diffed against before and never a failure.
  *
  * Resolve ONCE and pass the SHA to everything that reads "at the base". A base like `origin/main`
  * is a MOVABLE ref: a concurrent run's fetch, or a resumed worktree, can advance it mid-review, and
  * a patch taken from the old fork point judged against rules read from the new tip is a review the
  * intervening commit silently rewrote the rules of.
+ *
+ * Which is why the no-merge-base case (unrelated histories — a resumed worktree whose base was
+ * force-rewritten) still resolves the ref itself to a commit rather than handing the NAME back:
+ * callers treat what they get as pinned, so returning `origin/main` would put every later read on
+ * whatever that ref points at then, and a sibling run's fetch between two of them is exactly the
+ * split baseline the pinning exists to rule out.
  */
 export async function resolveMergeBase(worktreePath: string, base: string): Promise<string> {
-  return (await git(worktreePath, ["merge-base", base, "HEAD"]).catch(() => undefined)) || base;
+  const forkPoint = await git(worktreePath, ["merge-base", base, "HEAD"]).catch(() => undefined);
+  if (forkPoint) return forkPoint;
+  // `--verify --quiet`: exits non-zero with no output when the ref doesn't resolve, instead of
+  // echoing the argument back as if it were a revision.
+  const pinned = await git(worktreePath, ["rev-parse", "--verify", "--quiet", `${base}^{commit}`]).catch(
+    () => undefined,
+  );
+  return pinned || base;
 }
 
 /**
@@ -416,6 +435,13 @@ export interface BranchDiff {
    * nothing was truncated).
    */
   deletions?: string;
+  /**
+   * True when the deletion rescue pass FAILED — git errored before it could collect (all of) the
+   * removals. Reported rather than swallowed: the reviewer cannot open a deleted file and has no
+   * `git` to fetch one, so a silent absence here reads as "this run deleted nothing" and the
+   * removals it did make are approved by nobody. The caller must tell the reviewer instead.
+   */
+  deletionsIncomplete?: boolean;
 }
 
 /**
@@ -471,12 +497,17 @@ export async function diffAgainstBase(
   const { text, truncated } = await gitBounded(worktreePath, ["diff", from, "HEAD"], max);
   if (!truncated) return { files, patch: text.trim(), truncated: false };
 
-  const deletions = await deletionPatch(worktreePath, from, opts.maxDeletionChars ?? DEFAULT_DELETION_PATCH_CHARS);
+  const { patch: deletions, incomplete } = await deletionPatch(
+    worktreePath,
+    from,
+    opts.maxDeletionChars ?? DEFAULT_DELETION_PATCH_CHARS,
+  );
   return {
     files,
     patch: `${text}\n… [patch truncated at ${max} chars — read the files directly]`,
     truncated: true,
     ...(deletions ? { deletions } : {}),
+    ...(incomplete ? { deletionsIncomplete: true } : {}),
   };
 }
 
@@ -490,7 +521,7 @@ export async function diffAgainstBase(
 const MIN_DELETION_SLICE_CHARS = 500;
 
 /**
- * The branch's deletions as their own bounded patch, or undefined when it deleted nothing.
+ * The branch's deletions as their own bounded patch — `{}` when it deleted nothing.
  *
  * The budget is allocated PER DELETED FILE, not spent as one stream: a single stream is exhausted by
  * whichever removal git emits first, leaving every route, guard, or validation deleted after it
@@ -499,15 +530,21 @@ const MIN_DELETION_SLICE_CHARS = 500;
  * — floored at {@link MIN_DELETION_SLICE_CHARS} — so a small removal hands its surplus to the ones
  * behind it and one huge removal costs only its own slice.
  *
- * Best-effort: a failure here must not fail a review that already has the (truncated) patch it was
- * mainly after — the reviewer is told what it is missing either way.
+ * A failure does not fail the review that already has the (truncated) patch it was mainly after —
+ * but it is REPORTED (`incomplete`), never swallowed. The reviewer has no other route to a deleted
+ * file, so an empty result it isn't warned about reads as "nothing was removed", and the removals it
+ * never saw are approved by its verdict. Whatever the pass collected before the failure still ships.
  */
-async function deletionPatch(worktreePath: string, from: string, max: number): Promise<string | undefined> {
+async function deletionPatch(
+  worktreePath: string,
+  from: string,
+  max: number,
+): Promise<{ patch?: string; incomplete?: boolean }> {
+  const parts: string[] = [];
   try {
     const deleted = await diffPaths(worktreePath, ["--name-only", "--diff-filter=D", from, "HEAD"]);
-    if (deleted.length === 0) return undefined;
+    if (deleted.length === 0) return {};
 
-    const parts: string[] = [];
     let remaining = max;
     let i = 0;
     for (; i < deleted.length; i++) {
@@ -544,9 +581,13 @@ async function deletionPatch(worktreePath: string, from: string, max: number): P
           ` exhausted: ${unshown.join(", ")}]`,
       );
     }
-    return parts.length > 0 ? parts.join("\n") : undefined;
-  } catch {
-    return undefined;
+    return parts.length > 0 ? { patch: parts.join("\n") } : {};
+  } catch (e) {
+    console.warn(
+      `[git] could not collect the deletions of ${from}..HEAD in ${worktreePath}: ${String(e)} — the` +
+        ` review is told its deletion list is incomplete`,
+    );
+    return { ...(parts.length > 0 ? { patch: parts.join("\n") } : {}), incomplete: true };
   }
 }
 
@@ -649,47 +690,75 @@ function prFromUrl(url: string): PullRequest {
   return { url, ref: number ? `gh-${number}` : url, number, isDraft: false };
 }
 
+/** What a lookup of a branch's open PR actually established — see {@link lookupOpenPullRequest}. */
+export interface OpenPullRequestLookup {
+  /** The open PR tracking the branch. Absent when gh answered and there is none, or when it failed. */
+  pr?: PullRequest;
+  /**
+   * True when `gh` could not answer at all — auth, network, a missing binary, unparseable output.
+   * Deliberately NOT folded into "no PR": the branch may well have one, and a caller that defuses an
+   * orphaned PR before parking would otherwise report "no PR was opened" over a live, mergeable PR
+   * carrying un-reviewed work.
+   */
+  failed?: boolean;
+}
+
 /**
- * Return the open PR already tracking `branch`, or undefined if there is none. Idempotency guard
- * for openPullRequest: a resumed execute-epic run re-reaches the PR step against a branch whose PR
- * already exists (the first run opened it), and `gh pr create` would otherwise error.
+ * Look up the open PR tracking `branch`, distinguishing "there is none" from "gh could not tell us".
+ *
+ * Uses `gh pr list` rather than `gh pr view <branch>` precisely for that: `pr view` exits non-zero
+ * BOTH when the branch has no PR and when the call itself failed, so every transient error read as a
+ * clean "no PR". `pr list` exits 0 with an empty array for a branch that has none, which makes an
+ * absent PR something gh confirmed instead of something inferred from a failure.
+ *
+ * Idempotency guard for openPullRequest: a resumed execute-epic run re-reaches the PR step against a
+ * branch whose PR already exists (the first run opened it), and `gh pr create` would otherwise error.
  *
  * Also how a run RECONCILES a PR the board lost (anton-3apm): `gh pr create` can land server-side
  * with its response — or the follow-up `setPrRef` — lost, leaving a live PR no bead ref points at.
  * The branch is the only surviving handle on it, so it's the one this looks up by.
- *
- * Best-effort: any gh failure reads as "no PR", since the callers' fallbacks (create one / report
- * none) are what an absent PR calls for anyway.
+ */
+export async function lookupOpenPullRequest(
+  repoPath: string,
+  branch: string,
+): Promise<OpenPullRequestLookup> {
+  const gh = process.env[GH_BIN_ENV] ?? "gh";
+  try {
+    const { stdout } = await execFileAsync(
+      gh,
+      ["pr", "list", "--head", branch, "--state", "open", "--limit", "1", "--json", "url,number,isDraft"],
+      { cwd: repoPath, timeout: 120_000, maxBuffer: 4 * 1024 * 1024 },
+    );
+    const [pr] = JSON.parse(stdout) as Array<{ url?: string; number?: number; isDraft?: boolean }>;
+    if (!pr?.url) return {}; // gh looked and the branch has no open PR
+    return {
+      pr: {
+        url: pr.url,
+        ref: pr.number ? `gh-${pr.number}` : pr.url,
+        number: pr.number,
+        isDraft: pr.isDraft === true,
+      },
+    };
+  } catch (e) {
+    console.warn(
+      `[git] could not check for an open PR on ${branch}: ${String(e)} — treated as UNKNOWN, not as` +
+        ` "no PR"`,
+    );
+    return { failed: true };
+  }
+}
+
+/**
+ * The open PR tracking `branch`, or undefined when there is none — for callers whose next move is
+ * the same either way. {@link openPullRequest} is one: it creates a PR when it finds none, and a
+ * lookup that failed surfaces as the `gh pr create` error rather than as a silent skip. A caller
+ * that must not mistake a failed lookup for an absent PR uses {@link lookupOpenPullRequest}.
  */
 export async function findOpenPullRequest(
   repoPath: string,
   branch: string,
 ): Promise<PullRequest | undefined> {
-  const gh = process.env[GH_BIN_ENV] ?? "gh";
-  try {
-    const { stdout } = await execFileAsync(
-      gh,
-      ["pr", "view", branch, "--json", "url,number,state,isDraft"],
-      { cwd: repoPath, timeout: 120_000, maxBuffer: 4 * 1024 * 1024 },
-    );
-    const pr = JSON.parse(stdout) as {
-      url?: string;
-      number?: number;
-      state?: string;
-      isDraft?: boolean;
-    };
-    // `gh pr view <branch>` resolves the PR for that head branch; only reuse an OPEN one.
-    if (!pr?.url || (pr.state && pr.state !== "OPEN")) return undefined;
-    return {
-      url: pr.url,
-      ref: pr.number ? `gh-${pr.number}` : pr.url,
-      number: pr.number,
-      isDraft: pr.isDraft === true,
-    };
-  } catch {
-    // No PR for the branch (gh exits non-zero) → nothing to reuse.
-    return undefined;
-  }
+  return (await lookupOpenPullRequest(repoPath, branch)).pr;
 }
 
 /** `gh pr ready [--undo]`, best-effort — returns whether GitHub confirmed the flip. */

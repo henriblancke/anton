@@ -327,11 +327,16 @@ function headerSection(run: ReviewRun): string[] {
  */
 function beadsSection(run: ReviewRun): string[] {
   const standalone = run.tickets.length === 1 && run.tickets[0]?.id === run.target.id;
-  const lines = [`## What this run had to deliver`, ``, ...beadBlock(run.target, "Run target")];
-  if (!standalone) {
-    for (const t of run.tickets) lines.push(...beadBlock(t, "Ticket"));
-  }
-  return lines;
+  const blocks = [
+    beadBlock(run.target, "Run target"),
+    ...(standalone ? [] : run.tickets.map((t) => beadBlock(t, "Ticket"))),
+  ];
+  return [
+    `## What this run had to deliver`,
+    ``,
+    ...blocks.flatMap((b) => b.lines),
+    ...truncatedContractNote(blocks.some((b) => b.cut)),
+  ];
 }
 
 /**
@@ -345,19 +350,42 @@ function beadsSection(run: ReviewRun): string[] {
  * rule it cannot enforce — it would pass a run that skipped the bead's required verification or
  * delivered exactly what the bead forbade.
  */
-function beadBlock(bead: Bead, label: string): string[] {
-  const field = (heading: string, body: string | undefined): string[] => [
-    `**${heading}**`,
-    body?.trim() ? truncate(body, MAX_BEAD_FIELD_CHARS) : `(none stated)`,
-    ``,
-  ];
-  return [
+function beadBlock(bead: Bead, label: string): { lines: string[]; cut: boolean } {
+  let cut = false;
+  const field = (heading: string, body: string | undefined): string[] => {
+    const stated = body?.trim() ?? "";
+    const text = stated ? truncate(stated, MAX_BEAD_FIELD_CHARS) : `(none stated)`;
+    cut ||= Boolean(stated) && text !== stated;
+    return [`**${heading}**`, text, ``];
+  };
+  const lines = [
     `### ${label}: ${bead.id} — ${bead.title}`,
     ``,
     ...field("Goal", goalBody(bead)),
     ...field("Acceptance", acceptanceBody(bead)),
     ...field("Out of scope", outOfScopeBody(bead)),
     ...field("Verify", verifyBody(bead)),
+  ];
+  return { lines, cut };
+}
+
+/**
+ * What a cut contract section actually costs, said out loud — the counterpart to
+ * {@link truncatedRulesNote}, and load-bearing for the same reason.
+ *
+ * The reviewer works from this prompt alone (it has no `bd` and is told not to trust the worktree),
+ * so an Acceptance criterion past the cut is simply not in front of it. Unremarked, the criteria that
+ * survived read as the whole contract and the run gets a clean verdict for work it never delivered.
+ */
+function truncatedContractNote(cut: boolean): string[] {
+  if (!cut) return [];
+  return [
+    `A section above marked \`… [truncated]\` was cut for length: the rest of it is NOT in this prompt`,
+    `and nothing in this session can recover it. Do not read the missing text as "nothing more was`,
+    `required" — judge what you can see, and report every criterion you could not fully read as an`,
+    `advisory finding naming the bead and section, so a human knows what went unverified. If the`,
+    `visible part of a cut criterion already shows the work does not meet it, that is blocking as usual.`,
+    ``,
   ];
 }
 
@@ -395,7 +423,7 @@ function diffSection(diff: BranchDiff): string[] {
  * by nobody.
  */
 function deletionsBlock(diff: BranchDiff): string[] {
-  if (!diff.deletions) return [];
+  if (!diff.deletions && !diff.deletionsIncomplete) return [];
   return [
     `### Files this run DELETED`,
     ``,
@@ -403,10 +431,17 @@ function deletionsBlock(diff: BranchDiff): string[] {
     `read. Judge what was removed as carefully as what was added: behavior deleted without its`,
     `callers, tests, or a bead asking for it is a finding.`,
     ``,
-    "```diff",
-    diff.deletions,
-    "```",
-    ``,
+    ...(diff.deletions ? ["```diff", diff.deletions, "```", ``] : []),
+    ...(diff.deletionsIncomplete
+      ? [
+          `git FAILED while collecting this run's deletions, so any patch above is PARTIAL and some`,
+          `removals may not appear at all — nothing in this session can recover them (a deleted file`,
+          `is not in the worktree and you have no \`git\`). Do not read their absence as "nothing else`,
+          `was deleted": report the removals you could not review as a finding, so a human checks`,
+          `them. The changed-file list above is still complete.`,
+          ``,
+        ]
+      : []),
   ];
 }
 
