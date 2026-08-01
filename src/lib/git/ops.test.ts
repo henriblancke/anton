@@ -746,6 +746,19 @@ suite("resolveMergeBase (real git)", () => {
     expect(pinned).toMatch(/^[0-9a-f]{40}$/);
     expect(pinned).toBe(out(["rev-parse", "main"]));
   });
+
+  it("throws when the fork point cannot be READ, rather than pinning the base tip", async () => {
+    // merge-base failing operationally (here an unreadable HEAD commit — exit 128, not the exit 1
+    // that means "no common ancestor") must not degrade to the base's tip: that is a commit this
+    // branch never forked from, and the gate would review the wrong diff instead of parking.
+    writeFileSync(join(repo, "a.ts"), "export const a = 1;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "t1: add a"]);
+    const head = out(["rev-parse", "HEAD"]);
+    rmSync(join(repo, ".git", "objects", head.slice(0, 2), head.slice(2)));
+
+    await expect(resolveMergeBase(repo, "main")).rejects.toThrow();
+  });
 });
 
 suite("listDirBlobsAtRev (real git)", () => {

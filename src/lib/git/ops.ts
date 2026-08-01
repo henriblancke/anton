@@ -272,16 +272,47 @@ export async function listDirBlobsAtRev(
  * callers treat what they get as pinned, so returning `origin/main` would put every later read on
  * whatever that ref points at then, and a sibling run's fetch between two of them is exactly the
  * split baseline the pinning exists to rule out.
+ *
+ * A merge-base that FAILS rather than answers — a timeout, a killed process, an unreadable object —
+ * THROWS when the base resolves anyway, instead of degrading to that fallback. The fallback returns
+ * the base TIP, which on a base that has advanced is far past the real fork point: the gate would
+ * review, and let the fixer rewrite, a diff measured against a commit the run never branched from.
+ * Parking the run is the only honest answer to "I could not compute the fork point".
  */
 export async function resolveMergeBase(worktreePath: string, base: string): Promise<string> {
-  const forkPoint = await git(worktreePath, ["merge-base", base, "HEAD"]).catch(() => undefined);
-  if (forkPoint) return forkPoint;
-  // `--verify --quiet`: exits non-zero with no output when the ref doesn't resolve, instead of
-  // echoing the argument back as if it were a revision.
+  let brokenRead: unknown;
+  try {
+    return await git(worktreePath, ["merge-base", base, "HEAD"]);
+  } catch (error) {
+    // Exit 1 is merge-base's ANSWER — these histories share no commit — and falls through to the
+    // pinning below. Any other rejection is the question failing; hold it, because the one thing
+    // that still excuses it is a `base` that names nothing, which only `rev-parse` can settle.
+    brokenRead = exitedWith(error, 1) ? undefined : error;
+  }
+
+  // `--verify --quiet`: exits 1 with no output when the ref doesn't resolve, instead of echoing the
+  // argument back as if it were a revision. Its own operational failures propagate for the same
+  // reason as merge-base's — an unpinned base name is not a safe answer to a read that broke.
   const pinned = await git(worktreePath, ["rev-parse", "--verify", "--quiet", `${base}^{commit}`]).catch(
-    () => undefined,
+    (error: unknown) => {
+      if (exitedWith(error, 1)) return undefined;
+      throw error;
+    },
   );
-  return pinned || base;
+  if (!pinned) return base;
+  // The base DOES resolve, so a merge-base that failed was never "unrelated histories".
+  if (brokenRead) throw brokenRead;
+  return pinned;
+}
+
+/**
+ * Whether a rejected git call is the command exiting with `code` — its own answer — rather than a
+ * run that never got one. A process killed by a timeout carries `code: null` and a signal, and a
+ * spawn failure carries a string errno, so neither is mistaken for an exit status.
+ */
+function exitedWith(error: unknown, code: number): boolean {
+  const err = error as { code?: unknown; killed?: boolean } | null;
+  return err?.code === code && err.killed !== true;
 }
 
 /**
