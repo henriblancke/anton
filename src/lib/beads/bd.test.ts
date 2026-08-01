@@ -7,6 +7,7 @@ import {
   getSyncStatus,
   getSyncStatusToken,
   isBenignSyncOutput,
+  isMissingBeadError,
   isNotWiredOutput,
   LABELS,
   runDoltSync,
@@ -428,6 +429,31 @@ describe("isBenignSyncOutput", () => {
 /** A promisified-execFile-shaped failure: message + captured stdout/stderr. */
 const execError = (out: { stdout?: string; stderr?: string }) =>
   Object.assign(new Error("Command failed: bd"), out);
+
+describe("isMissingBeadError", () => {
+  // The distinction callers act on: bd ANSWERING that a bead is gone is evidence of a deliberate
+  // deletion (refuse to resume it); bd failing to answer is not, and must stay fail-open.
+  it("matches bd's not-found exit, on stderr or on the message alone", () => {
+    expect(isMissingBeadError(execError({ stderr: 'Error: no issue found matching "anton-e1"' }))).toBe(true);
+    expect(isMissingBeadError(execError({ stderr: "no issues found matching the provided IDs" }))).toBe(true);
+    expect(isMissingBeadError(new Error("bd: issue anton-e1 not found"))).toBe(true);
+  });
+
+  it("does not match a bd that could not answer at all", () => {
+    expect(isMissingBeadError(execError({ stderr: "Error 1105: database is locked" }))).toBe(false);
+    expect(isMissingBeadError(new Error("bd timed out after 120000ms"))).toBe(false);
+    expect(isMissingBeadError(undefined)).toBe(false);
+  });
+
+  // A missing RESOURCE is not a missing bead: bd reports a wedged workspace with the same
+  // "not found" wording, and reading that as a deletion would settle an escalation as
+  // `target-gone` on nothing but an operational failure.
+  it("does not match another missing resource reported as 'not found'", () => {
+    expect(isMissingBeadError(execError({ stderr: "Error: database not found" }))).toBe(false);
+    expect(isMissingBeadError(execError({ stderr: 'schema "beads" not found' }))).toBe(false);
+    expect(isMissingBeadError(new Error("bd: executable not found in $PATH"))).toBe(false);
+  });
+});
 
 describe("isNotWiredOutput", () => {
   it("matches only the missing-remote outcome, not a clean working set", () => {

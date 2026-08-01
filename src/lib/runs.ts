@@ -171,6 +171,41 @@ export async function updateRun(
   await db.update(schema.runs).set(set).where(eq(schema.runs.id, id));
 }
 
+/**
+ * Settle a still-PARKED run as `failed` — the run-row half of abandoning the work it was executing
+ * (anton-wvcy). Nothing re-dispatches a parked run, so one whose bead has just been abandoned would
+ * otherwise sit exactly as `detectParkedRuns` sees it and be escalated again on every sweep, now
+ * against a closed target. Both the project and the `parked` status are re-asserted in the WHERE, so
+ * this is a CAS: a run an operator resumed since the decision keeps running, and no other project's
+ * run can be settled by id. Returns whether it settled one.
+ */
+export async function settleParkedRun(
+  db: AntonDb,
+  clock: Clock,
+  projectId: string,
+  runId: string,
+  reason: string,
+): Promise<boolean> {
+  const nowMs = clock.now();
+  const settled = await db
+    .update(schema.runs)
+    .set({
+      status: "failed",
+      error: reason,
+      endedAt: secDate(nowMs),
+      updatedAt: secDate(nowMs),
+    })
+    .where(
+      and(
+        eq(schema.runs.id, runId),
+        eq(schema.runs.projectId, projectId),
+        eq(schema.runs.status, "parked"),
+      ),
+    )
+    .returning({ id: schema.runs.id });
+  return settled.length > 0;
+}
+
 export async function getRunById(db: AntonDb, id: string): Promise<RunRow | undefined> {
   const rows = await db.select().from(schema.runs).where(eq(schema.runs.id, id)).limit(1);
   return rows[0];
@@ -206,6 +241,24 @@ export async function reconcileInterruptedRuns(
     });
   }
   return orphaned.length;
+}
+
+/**
+ * Every run of a project in the given statuses, oldest activity first (anton-4ks0). The read the
+ * run-health sweep detects over — `updatedAt` on a settled run is when it settled, so ordering by
+ * it puts the most-stalled work first. db-injectable; strictly read-only.
+ */
+export async function listRunsByStatus(
+  db: AntonDb,
+  projectId: string,
+  statuses: readonly RunStatus[],
+): Promise<RunRow[]> {
+  if (statuses.length === 0) return [];
+  return db
+    .select()
+    .from(schema.runs)
+    .where(and(eq(schema.runs.projectId, projectId), inArray(schema.runs.status, [...statuses])))
+    .orderBy(schema.runs.updatedAt);
 }
 
 /** The most-recent still-open run for an epic — used to resume rather than start a duplicate. */

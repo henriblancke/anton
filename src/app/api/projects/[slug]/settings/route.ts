@@ -5,6 +5,7 @@ import {
   JOB_TIMEOUT_MINUTES_RANGE,
   MAX_RETRIES_RANGE,
   budgetPolicySchema,
+  runHealthThresholdsSchema,
   getProjectSettingsBySlug,
   updateProjectSettings,
   type ProjectSettings,
@@ -205,6 +206,25 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
         return NextResponse.json({ error: `Invalid budgetPolicy: ${detail}` }, { status: 400 });
       }
       patch.budgetPolicy = parsed.data;
+    }
+  }
+
+  if ("runHealth" in body) {
+    const raw = (body as Record<string, unknown>).runHealth;
+    // "" / null → clear (fall back to DEFAULT_RUN_HEALTH_THRESHOLDS). Otherwise validate strictly,
+    // same posture as budgetPolicy: a bad threshold 400s rather than silently persisting a value
+    // that would make the sweep report everything (or nothing). The parsed partial is deep-merged
+    // into the stored thresholds by updateProjectSettings, so a patch carrying one knob leaves the
+    // operator's other custom thresholds alone.
+    if (raw == null || raw === "") {
+      patch.runHealth = undefined;
+    } else {
+      const parsed = runHealthThresholdsSchema.safeParse(raw);
+      if (!parsed.success) {
+        const detail = parsed.error.issues[0]?.message ?? "out of range";
+        return NextResponse.json({ error: `Invalid runHealth: ${detail}` }, { status: 400 });
+      }
+      patch.runHealth = parsed.data;
     }
   }
 

@@ -74,10 +74,28 @@ describe("schedules route", () => {
     const res = await GET(new Request("http://t/"), ctx("tmp"));
     expect(res.status).toBe(200);
     const { schedules } = await res.json();
-    expect(schedules).toHaveLength(3);
+    expect(schedules).toHaveLength(5);
     const types = schedules.map((s: { type: string }) => s.type).sort();
-    expect(types).toEqual(["nightly-stringer", "orphan-grooming", "review-fix"]);
-    for (const s of schedules) expect(s.enabled).toBe(true);
+    expect(types).toEqual([
+      "nightly-stringer",
+      "orphan-grooming",
+      "review-fix",
+      "run-health",
+      "unstick",
+    ]);
+    // Enabled state comes straight off the seeded row: run-health is the opt-in one (anton-4ks0).
+    // unstick (anton-wvcy) is armed by default but no-ops until run-health has written a report, so
+    // turning the sweep on is the single switch that arms the whole detect → act loop.
+    const enabledByType = Object.fromEntries(
+      schedules.map((s: { type: string; enabled: boolean }) => [s.type, s.enabled]),
+    );
+    expect(enabledByType).toEqual({
+      "nightly-stringer": true,
+      "orphan-grooming": true,
+      "review-fix": true,
+      "run-health": false,
+      unstick: true,
+    });
   });
 
   it("GET 404s for an unknown project", async () => {

@@ -6,6 +6,7 @@ const showMock = vi.fn();
 const listMock = vi.fn();
 const abandonMock = vi.fn();
 const cancelRunMock = vi.fn();
+const runIsLiveMock = vi.fn<(projectId: string, epicBeadId: string) => boolean>();
 
 vi.mock("./beads/bd", async () => {
   const actual = await vi.importActual<typeof import("./beads/bd")>("./beads/bd");
@@ -23,13 +24,14 @@ vi.mock("./beads/bd", async () => {
 
 vi.mock("./jobs/service", () => ({
   cancelRunForTarget: (...args: unknown[]) => cancelRunMock(...args),
+  runIsLiveForTarget: (...args: [string, string]) => runIsLiveMock(...args),
 }));
 
 vi.mock("./ticket-detail", () => ({
   freshDetail: vi.fn().mockResolvedValue({ id: "detail" }),
 }));
 
-const { abandonTicket, openDescendants } = await import("./abandon");
+const { abandonTicket, openDescendants, RunRestartedError } = await import("./abandon");
 
 function makeBead(overrides: Partial<Bead> & { id: string }): Bead {
   return {
@@ -117,6 +119,7 @@ describe("abandonTicket cascade", () => {
     listMock.mockReset();
     abandonMock.mockReset().mockResolvedValue(undefined);
     cancelRunMock.mockReset().mockResolvedValue(false);
+    runIsLiveMock.mockReset().mockReturnValue(false);
   });
 
   /** The route hit by a direct API call on a feature id — the path the UI's epic deep-link skips. */
@@ -192,5 +195,92 @@ describe("abandonTicket cascade", () => {
     await expect(abandonTicket(project, "t1", "too late")).rejects.toThrow(/already closed/);
     expect(abandonMock).not.toHaveBeenCalled();
     expect(cancelRunMock).not.toHaveBeenCalled();
+  });
+});
+
+// An escalation's abandon is decided against work its caller observed STOPPED, several awaits before
+// the kill would land (a bd pull, the escalation settle). `requireStopped` re-reads liveness at that
+// boundary — the only precondition that can tie the cancel to the work the decision was about.
+describe("abandonTicket with requireStopped", () => {
+  const project: Project = {
+    id: "p1",
+    slug: "anton",
+    name: "anton",
+    repoPath: "/tmp/anton",
+    defaultBranch: "main",
+    hasBeads: true,
+    createdAt: 0,
+  };
+
+  beforeEach(() => {
+    showMock.mockReset();
+    listMock.mockReset();
+    abandonMock.mockReset().mockResolvedValue(undefined);
+    cancelRunMock.mockReset().mockResolvedValue(false);
+    runIsLiveMock.mockReset().mockReturnValue(false);
+  });
+
+  it("refuses at the cancel boundary when the run restarted, writing nothing", async () => {
+    const feature = makeBead({ id: "feature", issue_type: "feature", parent: "epic" });
+    showMock.mockResolvedValue(feature);
+    listMock.mockResolvedValue([
+      makeBead({ id: "epic", issue_type: "epic" }),
+      feature,
+      makeBead({ id: "t1", parent: "feature" }),
+    ]);
+    runIsLiveMock.mockReturnValue(true);
+
+    await expect(
+      abandonTicket(project, "feature", "not worth building", { requireStopped: true }),
+    ).rejects.toThrow(RunRestartedError);
+    // The whole point: the restarted job keeps running and the board is untouched.
+    expect(cancelRunMock).not.toHaveBeenCalled();
+    expect(abandonMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses before any write when it is a CASCADED descendant that restarted", async () => {
+    // The caller's own guard only watches the escalated epic; the cascade reaches further down.
+    const epic = makeBead({ id: "epic", issue_type: "epic" });
+    showMock.mockResolvedValue(epic);
+    listMock.mockResolvedValue([
+      epic,
+      makeBead({ id: "feature", issue_type: "feature", parent: "epic" }),
+      makeBead({ id: "t1", parent: "feature" }),
+    ]);
+    runIsLiveMock.mockImplementation((_projectId, targetId) => targetId === "feature");
+
+    await expect(
+      abandonTicket(project, "epic", "won't do", { requireStopped: true }),
+    ).rejects.toThrow(RunRestartedError);
+    expect(abandonMock).not.toHaveBeenCalled();
+  });
+
+  it("abandons normally when nothing is live — and never cancels, since nothing is running", async () => {
+    const ticket = makeBead({ id: "t1", parent: "feature" });
+    showMock.mockResolvedValue(ticket);
+    listMock.mockResolvedValue([
+      makeBead({ id: "feature", issue_type: "feature", parent: "epic" }),
+      ticket,
+    ]);
+
+    await abandonTicket(project, "t1", "stalled for good", { requireStopped: true });
+
+    expect(cancelRunMock).not.toHaveBeenCalled();
+    expect(abandonMock.mock.calls.map((c) => c[1])).toEqual(["t1"]);
+  });
+
+  it("still kills the live run when the option is absent — the board's own abandon is unchanged", async () => {
+    const ticket = makeBead({ id: "t1", parent: "feature" });
+    showMock.mockResolvedValue(ticket);
+    listMock.mockResolvedValue([
+      makeBead({ id: "feature", issue_type: "feature", parent: "epic" }),
+      ticket,
+    ]);
+    runIsLiveMock.mockReturnValue(true);
+
+    await abandonTicket(project, "t1", "obsolete");
+
+    expect(cancelRunMock.mock.calls).toEqual([["p1", "feature"]]);
+    expect(abandonMock.mock.calls.map((c) => c[1])).toEqual(["t1"]);
   });
 });

@@ -176,6 +176,12 @@ export interface ProjectSettings {
    * {@link budgetAware} is on.
    */
   budgetPolicy?: ProjectBudgetPolicy;
+  /**
+   * How long a run may sit stuck before the run-health sweep (anton-4ks0) calls it a finding.
+   * Absent → {@link DEFAULT_RUN_HEALTH_THRESHOLDS}; a stored value need only carry the knobs the
+   * operator touched. Only consulted by the `run-health` schedule, which is off by default.
+   */
+  runHealth?: RunHealthThresholds;
 }
 
 /** A resolved verify gate (anton-3oh8): a stable label (for logs/errors) + the shell command. */
@@ -288,6 +294,40 @@ export function resolveBudgetPolicy(settings: ProjectSettings): BudgetPolicy {
   };
 }
 
+/**
+ * How stale each class of stall must be before the run-health sweep reports it (anton-4ks0). Every
+ * field optional so a patch carries only the knobs the operator touched; each is range-checked (fail
+ * loud) and unknown keys rejected, matching {@link budgetPolicySchema}.
+ */
+export const runHealthThresholdsSchema = z
+  .object({
+    parkedRunMinutes: z.number().int().min(1).max(10_080), // 1 min … 7 days
+    stalePrHours: z.number().int().min(1).max(720), // 1 h … 30 days
+    deadLeaseMinutes: z.number().int().min(1).max(10_080),
+  })
+  .partial()
+  .strict();
+
+export type RunHealthThresholds = z.infer<typeof runHealthThresholdsSchema>;
+
+/**
+ * Defaults tuned to "longer than the work could plausibly still be moving": a run parked for two
+ * hours is not about to un-park itself, a PR untouched for a day has lost its reviewer, and a
+ * run-lease is refreshed on a heartbeat so 30 minutes past expiry means the owner is gone.
+ */
+export const DEFAULT_RUN_HEALTH_THRESHOLDS: Required<RunHealthThresholds> = {
+  parkedRunMinutes: 120,
+  stalePrHours: 24,
+  deadLeaseMinutes: 30,
+};
+
+/** Overlay the stored (possibly partial) thresholds onto the defaults — never a partial out. */
+export function resolveRunHealthThresholds(
+  settings: ProjectSettings,
+): Required<RunHealthThresholds> {
+  return { ...DEFAULT_RUN_HEALTH_THRESHOLDS, ...(settings.runHealth ?? {}) };
+}
+
 export async function getProjectSettings(db: AntonDb, id: string): Promise<ProjectSettings> {
   const rows = await db
     .select({ settingsJson: schema.projects.settingsJson })
@@ -360,10 +400,12 @@ export async function updateProjectSettings(
   const next: ProjectSettings = { ...current };
   for (const [k, v] of Object.entries(patch)) {
     if (v === undefined || v === "") delete (next as Record<string, unknown>)[k];
-    // budgetPolicy is a partial-by-design nested object: merge the patched knobs into the stored
-    // policy so an update carrying only e.g. `weeklyTargetPct` can't silently wipe `dayWindow` or
-    // any other knob the UI/API didn't send. Clearing the whole policy stays `undefined` above.
+    // budgetPolicy and runHealth are partial-by-design nested objects: merge the patched knobs into
+    // the stored value so an update carrying only e.g. `weeklyTargetPct` (or `stalePrHours`) can't
+    // silently revert the ones the UI/API didn't send to their defaults. Clearing the whole object
+    // stays `undefined` above.
     else if (k === "budgetPolicy") next.budgetPolicy = { ...current.budgetPolicy, ...(v as object) };
+    else if (k === "runHealth") next.runHealth = { ...current.runHealth, ...(v as object) };
     else (next as Record<string, unknown>)[k] = v;
   }
   await db
@@ -531,13 +573,19 @@ export async function deleteProject(slug: string): Promise<void> {
   }
 
   // 4. Drop the project's anton.db rows atomically, children before parents (no ON DELETE
-  //    CASCADE in the schema): sessions → runs → jobs → schedules → projects.
+  //    CASCADE in the schema): sessions → runs → jobs → schedules → run-health → escalations →
+  //    projects.
   try {
     db.transaction((tx) => {
       tx.delete(schema.sessions).where(eq(schema.sessions.projectId, project.id)).run();
       tx.delete(schema.runs).where(eq(schema.runs.projectId, project.id)).run();
       tx.delete(schema.jobs).where(eq(schema.jobs.projectId, project.id)).run();
       tx.delete(schema.schedules).where(eq(schema.schedules.projectId, project.id)).run();
+      tx
+        .delete(schema.runHealthReports)
+        .where(eq(schema.runHealthReports.projectId, project.id))
+        .run();
+      tx.delete(schema.escalations).where(eq(schema.escalations.projectId, project.id)).run();
       tx.delete(schema.projects).where(eq(schema.projects.id, project.id)).run();
     });
   } catch (e) {

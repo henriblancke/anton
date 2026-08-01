@@ -10,6 +10,7 @@ import { eq } from "drizzle-orm";
 import type { Clock } from "./queue";
 import { Scheduler } from "./scheduler";
 import {
+  backfillDefaultSchedules,
   createSchedule,
   DEFAULT_SCHEDULES,
   ensureSchedule,
@@ -179,8 +180,67 @@ describe("Scheduler.tickOnce", () => {
     const rows = tdb.db.select().from(schema.schedules).all();
     expect(rows.length).toBe(DEFAULT_SCHEDULES.length);
     expect(new Set(rows.map((r) => r.type))).toEqual(new Set(DEFAULT_SCHEDULES.map((d) => d.type)));
-    // Every seeded schedule is enabled with a computed nextRunAt.
-    expect(rows.every((r) => r.enabled && r.nextRunAt != null)).toBe(true);
+    // A seeded schedule is armed (nextRunAt computed) iff the default says it starts enabled — an
+    // opt-in default like run-health seeds the ROW but never fires until the operator turns it on.
+    for (const d of DEFAULT_SCHEDULES) {
+      const row = rows.find((r) => r.type === d.type)!;
+      const enabled = d.enabled ?? true;
+      expect(row.enabled).toBe(enabled);
+      expect(row.nextRunAt != null).toBe(enabled);
+    }
+  });
+
+  it("seeds once when two boots race the backfill — the read and the inserts are one transaction", async () => {
+    // `startRunner()` backfills before its process-wide re-entry guard, so a dev hot-reload (or any
+    // second call) can enter this concurrently. There is no unique key on (projectId, type), so a
+    // read that yielded before its inserts would let both callers seed the same types and the
+    // scheduler would enqueue every duplicated slot twice.
+    await Promise.all([
+      backfillDefaultSchedules(tdb.db, clock),
+      backfillDefaultSchedules(tdb.db, clock),
+    ]);
+
+    const rows = tdb.db.select().from(schema.schedules).all();
+    expect(rows.length).toBe(DEFAULT_SCHEDULES.length);
+  });
+
+  it("backfillDefaultSchedules gives an EXISTING project a newly-shipped schedule type", async () => {
+    // The upgrade path: seeding runs only while inserting a project and no migration adds schedule
+    // rows, so without this an installed project never gets a new automation — enabling run-health
+    // would leave unstick unscheduled and its reports would pile up with nothing acting on them.
+    await seedProject(tdb, "p2");
+    await createSchedule(tdb.db, clock, {
+      projectId: "p1",
+      type: "review-fix",
+      cron: "*/15 * * * *",
+      enabled: false, // an operator turned this one off
+    });
+
+    const backfills = await backfillDefaultSchedules(tdb.db, clock);
+
+    expect(backfills.map((b) => b.projectId).sort()).toEqual(["p1", "p2"]);
+    expect(backfills.find((b) => b.projectId === "p1")!.created).not.toContain("review-fix");
+    for (const projectId of ["p1", "p2"]) {
+      const rows = tdb.db
+        .select()
+        .from(schema.schedules)
+        .where(eq(schema.schedules.projectId, projectId))
+        .all();
+      expect(new Set(rows.map((r) => r.type))).toEqual(
+        new Set(DEFAULT_SCHEDULES.map((d) => d.type)),
+      );
+    }
+    // The operator's own choice survives the backfill — it only ever inserts MISSING types.
+    const reviewFix = tdb.db
+      .select()
+      .from(schema.schedules)
+      .where(eq(schema.schedules.projectId, "p1"))
+      .all()
+      .find((r) => r.type === "review-fix")!;
+    expect(reviewFix.enabled).toBe(false);
+
+    // Second run adds nothing: a boot-time backfill runs on every start.
+    expect(await backfillDefaultSchedules(tdb.db, clock)).toEqual([]);
   });
 
   it("ensureSchedule is idempotent per (project,type)", async () => {

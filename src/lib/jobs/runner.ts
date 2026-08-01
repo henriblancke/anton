@@ -213,6 +213,33 @@ export type Outcome =
   | { kind: "poison"; error: string }
   | { kind: "error"; error: string };
 
+/**
+ * How a poison park spells itself on the job row. Exported because a park is only distinguishable
+ * from a retry-exhausted one by this marker — the run-health sweep reads it to surface a job that
+ * skipped the retry budget entirely (attempts are no evidence there).
+ */
+export const POISON_PARK_PREFIX = "poison:";
+
+/** `failed N×:` — how an attempt-exhausted park spells itself, and how to read N back out. */
+const EXHAUSTED_PARK = /^failed (\d+)×:/;
+
+/** The park reason for a job that spent its whole attempt budget. */
+function exhaustedPark(attempts: number, error: string): string {
+  return `failed ${attempts}×: ${error}`;
+}
+
+/**
+ * The attempt budget a park was actually spent under, or undefined when the row carries no such
+ * marker. The marker is the DURABLE record that the runner stopped retrying: an attempt count on its
+ * own only means something against the limit in force when the job parked, so an operator who later
+ * raises `maxRetries` would otherwise hide a job that is still permanently parked (nothing
+ * re-dispatches a parked job — only a human does).
+ */
+export function exhaustedParkAttempts(lastError: string): number | undefined {
+  const match = EXHAUSTED_PARK.exec(lastError);
+  return match ? Number(match[1]) : undefined;
+}
+
 export type Action =
   | { action: "complete" }
   | { action: "reschedule"; runAtMs: number; refundAttempt: boolean; lastError?: string }
@@ -272,10 +299,10 @@ export function nextAction(
       };
     }
     case "poison":
-      return { action: "park", lastError: `poison: ${outcome.error}` };
+      return { action: "park", lastError: `${POISON_PARK_PREFIX} ${outcome.error}` };
     case "error": {
       if (job.attempts >= config.maxAttempts) {
-        return { action: "park", lastError: `failed ${job.attempts}×: ${outcome.error}` };
+        return { action: "park", lastError: exhaustedPark(job.attempts, outcome.error) };
       }
       const backoff = Math.min(
         config.backoffBaseMs * 2 ** Math.max(0, job.attempts - 1),
@@ -506,11 +533,18 @@ export class JobRunner {
    * no-op against the now-terminal row instead of rescheduling it back to `queued`. The DB write runs
    * regardless of `inFlight` membership, so a `running` row leased by a since-restarted process (no
    * local controller) is still terminalized and lease-expiry reclaim can't re-run it. Returns whether
-   * it acted (false = the job was already terminal or unknown).
+   * it acted (false = the job was already terminal or unknown). `only` narrows the statuses the
+   * cancel will act on — see `cancelJob`.
+   *
+   * The abort is gated on that same CAS: a refused cancel (the job left `only`'s statuses — an
+   * operator resumed it between an escalation being raised and its "stop retrying" being clicked)
+   * must not kill the child of the run that resumed it. Nothing is lost when it doesn't fire — a
+   * cancel that acted on a row with no local controller has nothing to abort, and one refused because
+   * the row was already `cancelled` was aborted by whoever won that CAS.
    */
-  async cancel(jobId: string): Promise<boolean> {
-    const acted = await cancelJob(this.db, this.clock, jobId);
-    this.inFlight.get(jobId)?.controller.abort();
+  async cancel(jobId: string, only?: readonly string[]): Promise<boolean> {
+    const acted = await cancelJob(this.db, this.clock, jobId, only);
+    if (acted) this.inFlight.get(jobId)?.controller.abort();
     return acted;
   }
 

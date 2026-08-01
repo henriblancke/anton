@@ -7,7 +7,7 @@
  * clock. Times are stored as unix SECONDS (the schema's timestamp mode); this module works in ms
  * and converts at the boundary.
  */
-import { and, eq, gt, inArray, isNull, like, lt, lte, not, notInArray, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, like, lt, lte, not, notInArray, or, sql } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { randomUUID } from "node:crypto";
 import * as schema from "../db/schema";
@@ -19,7 +19,9 @@ export type JobType =
   | "review-fix"
   | "nightly-stringer"
   | "orphan-grooming"
-  | "sync-push";
+  | "sync-push"
+  | "run-health"
+  | "unstick";
 
 /**
  * `queued`  — eligible when runAt ≤ now (also how a backoff/quota reschedule is represented).
@@ -99,6 +101,16 @@ const ACTIVE_STATUSES = ["queued", "running"] as const;
  * `failed`, `cancelled`) are excluded, so a cancel of an already-terminal job is a no-op.
  */
 const CANCELLABLE_STATUSES = ["queued", "running", "parked"] as const;
+
+/**
+ * What a RESTRICTED cancel (`only`) may act on. `failed` joins the live statuses here because it is
+ * terminal for the runner but NOT settled for the operator: it is one of the two states
+ * `detectExhaustedJobs` reports and `resumeJob` recovers from, so an escalation's "stop retrying"
+ * must be able to terminalize it — otherwise the button no-ops and the sweep re-raises the same
+ * finding forever. Only a caller that names its statuses gets this reach; the unrestricted cancel
+ * still refuses every terminal row, so a `failed` job is never quietly rewritten by a blanket cancel.
+ */
+const RESTRICTED_CANCELLABLE_STATUSES = [...CANCELLABLE_STATUSES, "failed"] as const;
 
 /**
  * Statuses under which a local execute-epic job "covers" an epic for the take-over path: either
@@ -184,6 +196,82 @@ function coveringExecuteEpicId(
     .limit(1)
     .all();
   return rows[0]?.id;
+}
+
+/** The statuses a settled execute-epic job can be un-parked from — exactly what `resumeJob` accepts. */
+const RESUMABLE_STATUSES = ["parked", "failed"] as const;
+
+/**
+ * Insert order, as the tie-breaker for every "newest job for this epic" read below. `updatedAt` is
+ * truncated to whole seconds on the way in (`secDate`, matching the schema's timestamp mode), so two
+ * jobs for one epic settled inside the same second sort ARBITRARILY on it alone — and SQLite is free
+ * to hand back the older `done` row instead of the one an operator just cancelled, which is exactly
+ * the evidence `resumeEpic` and the unstick pass read to honour a cancel. SQLite's implicit rowid is
+ * a monotonic insert counter, so it orders same-second rows deterministically by creation, and jobs
+ * for a single epic are created sequentially (`jobs_active_epic_unique` allows only one at a time),
+ * so the last-created row is the latest attempt.
+ */
+const JOB_INSERT_ORDER = sql`${schema.jobs}.rowid`;
+
+/**
+ * Id of a SETTLED-BUT-RECOVERABLE execute-epic job for this project + epic — `parked` or `failed`,
+ * the two statuses `resumeJob` un-parks (anton-wvcy). The unstick pass needs this to pick its resume
+ * verb: a stalled epic that still has a parked job is revived by resuming THAT job (which reuses its
+ * open run and worktree), while one with no job at all needs a fresh enqueue. Calling
+ * `enqueueExecuteEpicIfAbsent` first would be a silent no-op for the former — a parked job "covers"
+ * the epic, so nothing would be enqueued and nothing resumed.
+ *
+ * Newest first (see {@link JOB_INSERT_ORDER} for the tie-break), so a re-parked epic resumes its
+ * most recent attempt rather than an ancient one.
+ */
+export async function resumableExecuteEpicId(
+  db: AntonDb,
+  projectId: string,
+  epicBeadId: string,
+): Promise<string | undefined> {
+  const rows = await db
+    .select({ id: schema.jobs.id })
+    .from(schema.jobs)
+    .where(
+      and(
+        eq(schema.jobs.type, "execute-epic"),
+        eq(schema.jobs.projectId, projectId),
+        inArray(schema.jobs.status, [...RESUMABLE_STATUSES]),
+        eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
+      ),
+    )
+    .orderBy(desc(schema.jobs.updatedAt), desc(JOB_INSERT_ORDER))
+    .limit(1);
+  return rows[0]?.id;
+}
+
+/**
+ * The most recent execute-epic job for this project + epic, whatever its status (anton-wvcy). The
+ * unstick pass reads it to learn when a usage-limit park's window reopens: the runner records that
+ * on the JOB (`runAt` + a `usage-limit: resumes at <ISO>` lastError), never on the run row, so the
+ * run's bare `usage-limit` error alone can't say whether the quota is back.
+ *
+ * Also the cancellation evidence both `resumeEpic` and the classifier's `epicCancelled` read, so the
+ * ordering has to be TOTAL and not merely descending — see {@link JOB_INSERT_ORDER}.
+ */
+export async function latestExecuteEpicJob(
+  db: AntonDb,
+  projectId: string,
+  epicBeadId: string,
+): Promise<JobRow | undefined> {
+  const rows = await db
+    .select()
+    .from(schema.jobs)
+    .where(
+      and(
+        eq(schema.jobs.type, "execute-epic"),
+        eq(schema.jobs.projectId, projectId),
+        eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
+      ),
+    )
+    .orderBy(desc(schema.jobs.updatedAt), desc(JOB_INSERT_ORDER))
+    .limit(1);
+  return rows[0];
 }
 
 /**
@@ -846,7 +934,9 @@ export async function park(
  *
  * Un-parks a `parked` job or a `failed` (reserved terminal) one; a no-op for anything else (returns
  * false) — resuming a running/done/queued job would corrupt its lifecycle. The status guard is
- * applied in the UPDATE's WHERE so a concurrent settle can't race it between the read and the write.
+ * applied in the UPDATE's WHERE so a concurrent settle can't race it between the read and the write,
+ * and the return value is that CAS's affected-row count: `true` means this call un-parked the job,
+ * never merely that it looked resumable a moment earlier.
  */
 export async function resumeJob(db: AntonDb, clock: Clock, jobId: string): Promise<boolean> {
   const nowMs = clock.now();
@@ -867,7 +957,7 @@ export async function resumeJob(db: AntonDb, clock: Clock, jobId: string): Promi
   }
 
   try {
-    await db
+    const updated = await db
       .update(schema.jobs)
       .set({
         status: "queued",
@@ -879,14 +969,19 @@ export async function resumeJob(db: AntonDb, clock: Clock, jobId: string): Promi
       })
       // Re-assert the resumable status in the WHERE so a concurrent settle can't race it between the
       // read above and this write.
-      .where(and(eq(schema.jobs.id, jobId), inArray(schema.jobs.status, ["parked", "failed"])));
+      .where(and(eq(schema.jobs.id, jobId), inArray(schema.jobs.status, ["parked", "failed"])))
+      .returning({ id: schema.jobs.id });
+    // The WHERE is the CAS, so the affected-row count is the only truthful answer: zero means a
+    // concurrent settle (an operator's cancel, most of all) took the row after the read above and
+    // this resume did NOT happen. Reporting `true` there would let `resumeEpic` claim `resumed-job`
+    // and skip its cancellation re-read, so the UI would call a still-cancelled job restarted.
+    return updated.length > 0;
   } catch (e) {
     // Backstop for the race the check above can't fully close: a concurrent enqueue could win the
     // active slot between the check and this write. Absorb the index violation as a clean no-op.
     if (isUniqueViolation(e)) return false;
     throw e;
   }
-  return true;
 }
 
 /**
@@ -899,13 +994,28 @@ export async function resumeJob(db: AntonDb, clock: Clock, jobId: string): Promi
  * (`done`/`failed`/`cancelled`) row — updates zero rows and returns false. Returns whether it acted.
  * Aborting the in-flight child is the runner's job (`JobRunner.cancel`); this only writes state, so
  * it also terminalizes a `running` row whose controller lives on a since-restarted process.
+ *
+ * `only` restricts the accepted statuses to what the caller observed earlier (an escalation's "stop
+ * retrying" button, raised against a `parked`/`failed` job), so a job resumed in between is refused
+ * rather than killed mid-flight. It is applied in the same WHERE as the base guard, so it is a real
+ * CAS and not a read-then-write race — and it selects from
+ * {@link RESTRICTED_CANCELLABLE_STATUSES}, which adds `failed` to the live set.
  */
-export async function cancelJob(db: AntonDb, clock: Clock, jobId: string): Promise<boolean> {
+export async function cancelJob(
+  db: AntonDb,
+  clock: Clock,
+  jobId: string,
+  only?: readonly string[],
+): Promise<boolean> {
+  const allowed: string[] = only
+    ? RESTRICTED_CANCELLABLE_STATUSES.filter((s) => only.includes(s))
+    : [...CANCELLABLE_STATUSES];
+  if (allowed.length === 0) return false;
   const nowMs = clock.now();
   const updated = await db
     .update(schema.jobs)
     .set({ status: "cancelled", leaseExpiresAt: null, lastError: "cancelled by operator", updatedAt: secDate(nowMs) })
-    .where(and(eq(schema.jobs.id, jobId), inArray(schema.jobs.status, [...CANCELLABLE_STATUSES])))
+    .where(and(eq(schema.jobs.id, jobId), inArray(schema.jobs.status, allowed)))
     .returning({ id: schema.jobs.id });
   return updated.length > 0;
 }
@@ -997,6 +1107,24 @@ export async function activeExecuteEpicKeys(db: AntonDb): Promise<Set<string>> {
     if (epicBeadId) keys.add(`${row.projectId ?? ""}::${epicBeadId}`);
   }
   return keys;
+}
+
+/**
+ * A project's jobs in the given statuses, oldest activity first (anton-4ks0). The read the
+ * run-health sweep detects exhausted jobs over; strictly read-only, and project-scoped so one
+ * project's report can never surface another's work.
+ */
+export async function listJobsByStatus(
+  db: AntonDb,
+  projectId: string,
+  statuses: readonly JobStatus[],
+): Promise<JobRow[]> {
+  if (statuses.length === 0) return [];
+  return db
+    .select()
+    .from(schema.jobs)
+    .where(and(eq(schema.jobs.projectId, projectId), inArray(schema.jobs.status, [...statuses])))
+    .orderBy(schema.jobs.updatedAt);
 }
 
 /** Key a job's schedule gate by `(type, projectId)` — the grain a `schedules` row is keyed on. */

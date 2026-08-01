@@ -15,6 +15,7 @@ import {
   resolveBudgetPolicy as resolveBudgetPolicyFromSettings,
 } from "../projects";
 import { beads } from "../beads/bd";
+import { backfillDefaultSchedules } from "../schedules";
 import { allIssues } from "../beads/issues";
 import { assertRepoSchemaCurrent, preflightBd } from "../beads/bd-bin";
 import { hasLocalDoltDb } from "../beads/config.mjs";
@@ -23,6 +24,8 @@ import { makeReviewFixHandler } from "./review-fix";
 import { makeNightlyStringerHandler } from "./nightly-stringer";
 import { makeOrphanGroomingHandler } from "./orphan-grooming";
 import { makeSyncPushHandler } from "./sync-push";
+import { makeRunHealthHandler } from "./run-health";
+import { makeUnstickHandler, resumeEpic, type ResumeOutcome } from "./unstick";
 import { JobRunner, type RunnerLogger, type RunningJobInfo } from "./runner";
 import { Scheduler } from "./scheduler";
 import { activeExecuteEpicId, getJob, systemClock } from "./queue";
@@ -151,6 +154,8 @@ export function getRunner(): JobRunner {
   runner.registerHandler("nightly-stringer", makeNightlyStringerHandler({ db }));
   runner.registerHandler("orphan-grooming", makeOrphanGroomingHandler({ db }));
   runner.registerHandler("sync-push", makeSyncPushHandler({ db }));
+  runner.registerHandler("run-health", makeRunHealthHandler({ db }));
+  runner.registerHandler("unstick", makeUnstickHandler({ db }));
   s.runner = runner;
   return runner;
 }
@@ -187,6 +192,19 @@ export async function startRunner(): Promise<void> {
   for (const project of await listProjects()) {
     if (!hasLocalDoltDb(join(project.repoPath, ".beads"))) continue;
     assertRepoSchemaCurrent(bin, project.repoPath);
+  }
+
+  // Backfill schedule types shipped since each project was registered (anton-wvcy): seeding runs
+  // only at project creation and no migration adds schedule rows, so without this an upgraded
+  // installation never gets a new automation at all — enabling run-health would leave unstick
+  // unscheduled, piling up reports with nothing acting on them. Best-effort: a scheduling hiccup
+  // must not block boot, exactly as it doesn't block project creation.
+  try {
+    for (const { projectId, created } of await backfillDefaultSchedules(getDb(), systemClock)) {
+      log.info(`seeded missing schedules for ${projectId}: ${created.join(", ")}`);
+    }
+  } catch (e) {
+    log.error("backfilling default schedules failed", e);
   }
   const s = state();
   if (!s.reconciled) {
@@ -242,6 +260,23 @@ export async function resumeJob(projectId: string, jobId: string): Promise<boole
 }
 
 /**
+ * Restart a stalled epic from an escalation (anton-wvcy) — the founder-facing half of the unstick
+ * pass's own resume path, sharing its exact decision (`resumeEpic`) so a one-click resume and an
+ * automatic one can never diverge. Routed through the runner so a project mid-teardown is refused
+ * rather than handed a fresh job row.
+ */
+export function resumeStalledEpic(
+  projectId: string,
+  epicBeadId: string,
+): Promise<ResumeOutcome> {
+  const runner = getRunner();
+  return resumeEpic(getDb(), systemClock, projectId, epicBeadId, {
+    resume: (jobId) => runner.resume(jobId),
+    enqueueIfAbsent: (project, epic) => runner.enqueueExecuteEpicIfAbsent(project, epic),
+  });
+}
+
+/**
  * Live info for a running job (anton-susu): the session id + cwd its handler reported via
  * ctx.report, plus the job type. Scoped to the project so a route can't introspect another
  * project's job by id. Undefined when the job doesn't exist, belongs to another project, or is
@@ -287,11 +322,19 @@ export type CancelResult = { ok: true } | { ok: false; reason: "not-found" | "no
  * and durably marks it `cancelled` so no durability path revives it. Scoped to the project so a route
  * can't cancel another project's job by id — a cross-project (or missing) job is `not-found`, an
  * already-terminal one is `not-cancellable`.
+ *
+ * `only` restricts which statuses may be cancelled, for a caller whose decision was made against a
+ * job it read earlier (see `cancelJob` in queue.ts); a job that has since left those statuses
+ * reports `not-cancellable` rather than being killed.
  */
-export async function cancelJob(projectId: string, jobId: string): Promise<CancelResult> {
+export async function cancelJob(
+  projectId: string,
+  jobId: string,
+  only?: readonly string[],
+): Promise<CancelResult> {
   const job = await getJob(getDb(), jobId);
   if (!job || job.projectId !== projectId) return { ok: false, reason: "not-found" };
-  const acted = await getRunner().cancel(jobId);
+  const acted = await getRunner().cancel(jobId, only);
   return acted ? { ok: true } : { ok: false, reason: "not-cancellable" };
 }
 
@@ -309,4 +352,14 @@ export async function cancelRunForTarget(projectId: string, epicBeadId: string):
   const jobId = activeExecuteEpicId(getDb(), projectId, epicBeadId);
   if (!jobId) return false;
   return getRunner().cancel(jobId);
+}
+
+/**
+ * Whether a run target has a live (queued/running) execute-epic job on THIS instance — exactly what
+ * `cancelRunForTarget` would kill. The precondition for a caller whose decision was made against work
+ * that had already STOPPED: read it at the moment the kill would land, not from an earlier snapshot
+ * (see `abandonTicket`'s `requireStopped`).
+ */
+export function runIsLiveForTarget(projectId: string, epicBeadId: string): boolean {
+  return activeExecuteEpicId(getDb(), projectId, epicBeadId) !== undefined;
 }
