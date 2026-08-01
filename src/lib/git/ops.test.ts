@@ -6,7 +6,15 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -15,6 +23,7 @@ import {
   listDirBlobsAtRev,
   openPullRequest,
   pullRequestState,
+  readFileAtRev,
   readWorktreeState,
   resolveFreshBase,
   resolveMergeBase,
@@ -538,6 +547,78 @@ suite("listDirBlobsAtRev (real git)", () => {
 
   it("yields nothing for a rev that does not resolve, rather than throwing", async () => {
     expect(await listDirBlobsAtRev(repo, "origin/nope", [""])).toEqual([]);
+  });
+});
+
+suite("readFileAtRev (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+  const write = (rel: string, body: string) => {
+    mkdirSync(join(repo, rel, ".."), { recursive: true });
+    writeFileSync(join(repo, rel), body);
+  };
+  const link = (rel: string, target: string) => {
+    mkdirSync(join(repo, rel, ".."), { recursive: true });
+    symlinkSync(target, join(repo, rel));
+  };
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-readrev-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    write("docs/rules.md", "the real rules\n");
+    write("AGENTS.md", "root rules\n");
+    // The shapes a project actually uses: a root file linked to its real home, and a nested one
+    // pointing back up out of its own directory.
+    link("CLAUDE.md", "docs/rules.md");
+    link("src/app/AGENTS.md", "../../docs/rules.md");
+    link("outside.md", "../escaped.md");
+    link("absolute.md", "/etc/hostname");
+    link("loop-a.md", "loop-b.md");
+    link("loop-b.md", "loop-a.md");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("reads a regular file's committed contents", async () => {
+    expect(await readFileAtRev(repo, "main", "AGENTS.md")).toBe("root rules");
+  });
+
+  it("follows a symlinked rules file to its contents, never returning the target pathname", async () => {
+    // `git show` serves a symlink's blob, which IS the target path — inlined as the rulebook that
+    // one line would have replaced the project's actual rules with.
+    expect(await readFileAtRev(repo, "main", "CLAUDE.md")).toBe("the real rules");
+    expect(await readFileAtRev(repo, "main", "CLAUDE.md")).not.toBe("docs/rules.md");
+  });
+
+  it("resolves a relative target against the link's own directory", async () => {
+    expect(await readFileAtRev(repo, "main", "src/app/AGENTS.md")).toBe("the real rules");
+  });
+
+  it("returns undefined for a link that leaves the repository", async () => {
+    // Nothing at `rev` backs an out-of-tree target, so there is no trustworthy answer — and reading
+    // the machine's filesystem would judge the run against whatever host it happens to run on.
+    expect(await readFileAtRev(repo, "main", "outside.md")).toBeUndefined();
+    expect(await readFileAtRev(repo, "main", "absolute.md")).toBeUndefined();
+  });
+
+  it("gives up on a symlink cycle instead of looping", async () => {
+    expect(await readFileAtRev(repo, "main", "loop-a.md")).toBeUndefined();
+  });
+
+  it("returns undefined for a missing path, a directory, and a rev that does not resolve", async () => {
+    expect(await readFileAtRev(repo, "main", "nope.md")).toBeUndefined();
+    expect(await readFileAtRev(repo, "main", "docs")).toBeUndefined();
+    expect(await readFileAtRev(repo, "origin/nope", "AGENTS.md")).toBeUndefined();
   });
 });
 

@@ -80,21 +80,95 @@ function gitBounded(
   });
 }
 
+/** The tree mode of a symlink. Its blob holds the TARGET PATHNAME, not the linked file's content. */
+const SYMLINK_MODE = "120000";
+
+/**
+ * Symlink hops followed before giving up. A rules file is one hop from its real home; a longer chain
+ * — or a cycle — is not one, and returning undefined is the safe answer for every caller.
+ */
+const MAX_SYMLINK_HOPS = 4;
+
 /**
  * Read one file as of `rev` (trimmed), or undefined when it doesn't exist there — or when `rev`
  * itself doesn't resolve, which is the same answer for the callers: nothing trustworthy to read.
  *
  * For files the working tree must not be trusted to supply. `git show` serves the committed blob, so
  * a run that added or rewrote the path on its own branch cannot change what comes back.
+ *
+ * Symlinks are FOLLOWED inside the repo at the same `rev`, never returned raw: git stores a link as
+ * a blob holding its target pathname, so a project that keeps `AGENTS.md` as a link to its real
+ * rules file would otherwise hand the caller the one-line pathname where it asked for content — for
+ * the review gate, an empty rulebook that reads as "this project states no rules".
  */
 export async function readFileAtRev(
   worktreePath: string,
   rev: string,
   path: string,
 ): Promise<string | undefined> {
+  return readBlobAtRev(worktreePath, rev, path, MAX_SYMLINK_HOPS);
+}
+
+async function readBlobAtRev(
+  worktreePath: string,
+  rev: string,
+  path: string,
+  hops: number,
+): Promise<string | undefined> {
+  const mode = await blobModeAtRev(worktreePath, rev, path);
+  if (mode === undefined) return undefined;
   // `--` disambiguates a path that also parses as a revision; a missing file and a bad rev both exit
   // non-zero, and neither is an error here.
-  return git(worktreePath, ["show", `${rev}:${path}`, "--"]).catch(() => undefined);
+  const text = await git(worktreePath, ["show", `${rev}:${path}`, "--"]).catch(() => undefined);
+  if (mode !== SYMLINK_MODE || text === undefined) return text;
+
+  // Out-of-tree and runaway links resolve to nothing rather than to their pathname: there is no
+  // content at `rev` to trust, and a caller that drops the path is right where one that inlines
+  // "../../etc/rules.md" as the rules is not.
+  if (hops <= 0) return undefined;
+  const target = resolveSymlinkTarget(path, text);
+  return target ? readBlobAtRev(worktreePath, rev, target, hops - 1) : undefined;
+}
+
+/**
+ * The tree mode of `path` at `rev`, or undefined when it is not a file there (missing, a directory,
+ * or a rev that doesn't resolve). The mode is the only thing that tells a regular file from a
+ * symlink — both are blobs, and `git show` reads them identically.
+ */
+async function blobModeAtRev(
+  worktreePath: string,
+  rev: string,
+  path: string,
+): Promise<string | undefined> {
+  // -z: git quotes non-ASCII paths otherwise, and a quoted entry no longer splits on a literal tab.
+  const out = await git(worktreePath, ["ls-tree", "-z", rev, "--", path]).catch(() => undefined);
+  const entry = out?.split("\0")[0];
+  const tab = entry?.indexOf("\t") ?? -1;
+  if (!entry || tab < 0) return undefined;
+  const [mode, type] = entry.slice(0, tab).split(" ");
+  return type === "blob" ? mode : undefined;
+}
+
+/**
+ * Where a symlink at `linkPath` points, as a repo-relative path — or undefined when it leaves the
+ * repository (an absolute target, or one climbing above the root). Resolved textually against the
+ * link's own directory, because the answer must stay inside the tree `rev` names: following a link
+ * out to the filesystem would read the machine anton happens to run on, not the reviewed revision.
+ */
+function resolveSymlinkTarget(linkPath: string, target: string): string | undefined {
+  const raw = target.trim();
+  if (!raw || raw.startsWith("/")) return undefined;
+  const resolved: string[] = [];
+  for (const segment of [...linkPath.split("/").slice(0, -1), ...raw.split("/")]) {
+    if (segment === "" || segment === ".") continue;
+    if (segment !== "..") {
+      resolved.push(segment);
+      continue;
+    }
+    if (resolved.length === 0) return undefined;
+    resolved.pop();
+  }
+  return resolved.length > 0 ? resolved.join("/") : undefined;
 }
 
 /**

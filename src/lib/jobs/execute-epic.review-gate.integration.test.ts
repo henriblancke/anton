@@ -546,6 +546,47 @@ console.error('gh boom: no PR may be opened on a review that edited the code');p
     }
   });
 
+  it("parks the RUN — not fails it — when the gate itself raises poison", async () => {
+    // The gate parks for a human on more than a blocking verdict: an unrevertable reviewer commit, a
+    // fixer that switched branches, or (scripted here) a round cap that forbids it from ever
+    // reviewing all throw PoisonError from inside it. Marking the run `failed` would hide the row
+    // from findOpenRunForEpic, so the repair-then-resume the founder is told to do would start a
+    // REPLACEMENT run instead of continuing this one and its session history.
+    await setReviewEnabled(true, { reviewMaxRounds: 0 });
+    const targetId = await approvedTarget("Gate poison run");
+
+    const boomGh = writeBin(
+      binDir,
+      "gh-boom-gate-poison",
+      `const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='view'){process.exit(1);}
+console.error('gh boom: no PR may be opened when the gate never reviewed');process.exit(1);`,
+    );
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = boomGh;
+
+    const runner = makeEpicRunner(ctx);
+    let jobId: string;
+    try {
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
+
+      expect((await getJob(tdb.db, jobId))?.status).toBe("parked");
+      // No reviewer ever ran — that is the poison.
+      expect(dispatches()).toEqual(["implement"]);
+
+      const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === targetId)!;
+      expect(run.status).toBe("parked");
+      expect(run.endedAt ?? null).toBeNull();
+      expect(run.error).toMatch(/ran no rounds/);
+
+      expect(beads.getPrRef(await beads.show(repo, targetId)) ?? null).toBeNull();
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+      await setReviewEnabled(true, { reviewMaxRounds: undefined });
+      if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  });
+
   it("does not re-review on a resume once the PR is open", async () => {
     // Review is not free — a retry that lands after the PR opened (a lost lease race, a crash after
     // step 5) must finish idempotently, not re-review and re-score a diff already under review.

@@ -50,6 +50,7 @@ import type { ReviewFinding } from "./review-context";
 import { blockingFindings, finalViolation, runReviewGate, type ReviewGateResult } from "./review-gate";
 import { persistReviewScores } from "./review-score";
 import {
+  isPoisonError,
   isRecoverableClaudeError,
   isUsageLimitError,
   isRunAlreadyLiveError,
@@ -932,6 +933,14 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           worktreePath: worktree.path,
           baseBranch: freshBase,
           assertLeaseHeld,
+        }).catch((e) => {
+          // The gate parks for a human on more than a blocking verdict: an unrevertable reviewer
+          // commit or a fixer that switched branches throws PoisonError from inside it. Those need
+          // the SAME parked-run handling — the instruction on both is repair by hand, then resume —
+          // so they are re-thrown as a gate block. Left as-is they marked the run `failed`, which
+          // hides the row from findOpenRunForEpic, and the resume the human was told to do would
+          // start a REPLACEMENT run instead of continuing this one and its session history.
+          throw isPoisonError(e) ? new ReviewBlockedError(e.message, { cause: e }) : e;
         });
         // The score history belongs to the board, not this run's logs — written on BOTH exits, since
         // a run parked on blocking findings is exactly the one whose score the founder needs.
@@ -990,9 +999,9 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       } else if (isRunAlreadyLiveError(e)) {
         await updateRun(db, clock, runId, { status: "parked", error: "run-live-elsewhere" });
       } else if (e instanceof ReviewBlockedError) {
-        // Parked, not failed, and with no endedAt: the run is waiting on a human to resolve the
-        // findings and resume it — the run history must not read like a crash. Resuming reuses THIS
-        // row (findOpenRunForEpic), so the resumed attempt continues in the same worktree/branch.
+        // Parked, not failed, and with no endedAt: the run is waiting on a human to resolve what the
+        // gate refused on and resume it — the run history must not read like a crash. Resuming reuses
+        // THIS row (findOpenRunForEpic), so the resumed attempt continues in the same worktree/branch.
         await updateRun(db, clock, runId, { status: "parked", error: e.message });
       } else {
         await updateRun(db, clock, runId, {
@@ -1417,14 +1426,18 @@ class BlockedByAgentError extends Error {
 }
 
 /**
- * The pre-PR self-review left blocking findings unresolved, or never reported at all (anton-omum).
+ * The review gate refused to let this run open a PR (anton-omum): blocking findings it could not
+ * converge, a reviewer that broke the report protocol, or poison the gate raised itself (a reviewer
+ * commit it could not revert, a fixer that moved to a branch of its own).
+ *
  * Poison-classified (`name = "PoisonError"`) like {@link NoDeliveryError}, so the runner parks the run
  * for the founder instead of retrying: the reviewer has already had its bounded rounds to converge,
- * and re-running the same gate on the same diff would reproduce the same verdict.
+ * and re-running the same gate on the same diff would reproduce the same verdict. Marks the run
+ * PARKED rather than failed, so the resume the founder is instructed to do reuses this row.
  */
 class ReviewBlockedError extends Error {
-  constructor(msg: string) {
-    super(msg);
+  constructor(msg: string, options?: ErrorOptions) {
+    super(msg, options);
     this.name = "PoisonError"; // classified as poison by the runner
   }
 }
