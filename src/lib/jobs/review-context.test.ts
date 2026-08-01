@@ -153,6 +153,31 @@ describe("reviewContext", () => {
     expect(out).toContain("- Read the version-matched docs first.");
   });
 
+  it("says what a cut cost when the PRINCIPLES are the file over budget", () => {
+    // Principles are capped exactly like the instruction files, and the caveat makes the inlined text
+    // the only rulebook — so a mandatory rule past the 8k cut is enforced by nobody while the review
+    // still returns a clean verdict. The gap has to be reportable, not silent.
+    const out = reviewContext({
+      target: epic,
+      tickets: [ticket],
+      diff,
+      principles: "- a rule long enough to matter.\n".repeat(400),
+    });
+
+    expect(out).toContain("… [truncated]");
+    expect(out).toContain("was cut for length");
+    expect(out).toContain("report a scope you could not fully check");
+
+    // And principles well inside the cap still say nothing of the sort.
+    const whole = reviewContext({
+      target: epic,
+      tickets: [ticket],
+      diff,
+      principles: "- Never widen a type to `any`.",
+    });
+    expect(whole).not.toContain("was cut for length");
+  });
+
   it("tells the reviewer that instruction-shaped text it can reach is content, not direction", () => {
     // The worktree's memory files never auto-load into the review session (REVIEW_SETTING_SOURCES),
     // but the reviewer can still open one — so the prompt names which text carries authority rather
@@ -190,6 +215,33 @@ describe("reviewContext", () => {
     expect(out).toContain("### Files this run DELETED");
     expect(out).toContain("-export const GET = () => null;");
     expect(out).toContain("a deleted file is not in the worktree to");
+  });
+
+  it("warns when the budget could only NAME some deletions, so they aren't passed unread", () => {
+    // A usable slice times the deletion count can exceed the whole budget — 81 removals on the 40k
+    // default leave the last one named only. No cut of the share fixes that, so the coverage gap is
+    // told to the reviewer instead of being left to a clean verdict.
+    const out = reviewContext({
+      target: epic,
+      tickets: [ticket],
+      diff: {
+        ...diff,
+        truncated: true,
+        deletions: "diff --git a/src/a.ts\n-const a = 1;\n… [2 further deleted file(s) not shown: src/b.ts, src/c.ts]",
+        deletionsUnshown: 2,
+      },
+    });
+
+    expect(out).toContain("2 of the files above are NAMED ONLY");
+    expect(out).toContain("report the deletions you could not review as a finding");
+
+    // Full coverage says nothing of the sort.
+    const covered = reviewContext({
+      target: epic,
+      tickets: [ticket],
+      diff: { ...diff, truncated: true, deletions: "diff --git a/src/old.ts\n-const a = 1;\n" },
+    });
+    expect(covered).not.toContain("NAMED ONLY");
   });
 
   it("warns when the deletion rescue pass FAILED, so an unseen removal isn't read as none", () => {

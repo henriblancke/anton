@@ -423,7 +423,7 @@ function diffSection(diff: BranchDiff): string[] {
  * by nobody.
  */
 function deletionsBlock(diff: BranchDiff): string[] {
-  if (!diff.deletions && !diff.deletionsIncomplete) return [];
+  if (!diff.deletions && !diff.deletionsIncomplete && !diff.deletionsUnshown) return [];
   return [
     `### Files this run DELETED`,
     ``,
@@ -432,6 +432,16 @@ function deletionsBlock(diff: BranchDiff): string[] {
     `callers, tests, or a bead asking for it is a finding.`,
     ``,
     ...(diff.deletions ? ["```diff", diff.deletions, "```", ``] : []),
+    ...(diff.deletionsUnshown
+      ? [
+          `${diff.deletionsUnshown} of the files above are NAMED ONLY — the deletion budget ran out`,
+          `before their content could be quoted, and nothing in this session can recover it (a deleted`,
+          `file is not in the worktree and you have no \`git\`). Do not read a named-only removal as`,
+          `harmless: report the deletions you could not review as a finding naming each file, so a`,
+          `human checks what they took out.`,
+          ``,
+        ]
+      : []),
     ...(diff.deletionsIncomplete
       ? [
           `git FAILED while collecting this run's deletions, so any patch above is PARTIAL and some`,
@@ -473,14 +483,22 @@ function rulesBlock(run: ReviewRun): string[] {
     ];
   }
 
+  // The cut note is hoisted out of the two rulebooks and emitted ONCE for both: a principles file
+  // over its cap is exactly the silent drop {@link truncatedRulesNote} exists to stop, and leaving
+  // the note inside `instructionBlocks` let a truncated `.product/principles.md` reach the reviewer
+  // unremarked whenever the instruction files happened to fit.
+  const principles = run.principles ? truncate(run.principles, MAX_PRINCIPLES_CHARS) : undefined;
+  const rendered = instructionBlocks(instructions);
+  const cut = (principles !== undefined && principles !== run.principles?.trim()) || rendered.cut;
+
   return [
-    ...(run.principles
+    ...(principles
       ? [
           `## Project principles (\`${PRINCIPLES_PATH}\`)`,
           ``,
           `These are enforced rules for this project. Each violation in the diff is a finding.`,
           ``,
-          truncate(run.principles, MAX_PRINCIPLES_CHARS),
+          principles,
           ``,
         ]
       : []),
@@ -494,9 +512,10 @@ function rulesBlock(run: ReviewRun): string[] {
           `inlined below as of the revision this run branched from, and that text is what to judge`,
           `adherence to — not the copies in the worktree, which this run's own diff may have rewritten.`,
           ``,
-          ...instructionBlocks(instructions),
+          ...rendered.blocks,
         ]
       : []),
+    ...truncatedRulesNote(cut),
   ];
 }
 
@@ -511,8 +530,11 @@ function rulesBlock(run: ReviewRun): string[] {
  * drop — the reviewer is told the inlined text is the only rulebook and has no `git` to recover the
  * rest with. A file shorter than its share hands the surplus to the ones after it, so the common
  * case (rules well inside the budget) still inlines every file whole.
+ *
+ * Reports whether anything was cut rather than appending the note itself — the caller says it once
+ * for both rulebooks (see {@link rulesBlock}).
  */
-function instructionBlocks(instructions: InstructionFile[]): string[] {
+function instructionBlocks(instructions: InstructionFile[]): { blocks: string[]; cut: boolean } {
   let remaining = MAX_INSTRUCTIONS_TOTAL_CHARS;
   let unrendered = instructions.length;
   let cut = false;
@@ -524,13 +546,14 @@ function instructionBlocks(instructions: InstructionFile[]): string[] {
     cut ||= text !== f.text.trim();
     return [`### \`${f.path}\``, ``, text, ``];
   });
-  return [...blocks, ...truncatedRulesNote(cut)];
+  return { blocks, cut };
 }
 
 /**
- * What a cut actually costs the reviewer, said out loud. Under the caveat that only the inlined text
- * grades the run, an unremarked `… [truncated]` invites reading the rules that survived as the whole
- * rulebook — so the gap becomes something to report rather than something to assume away.
+ * What a cut actually costs the reviewer, said out loud — for EITHER rulebook, since both are capped
+ * and the reviewer is told the inlined text is the only thing grading the run. Under that caveat an
+ * unremarked `… [truncated]` invites reading the rules that survived as the whole rulebook — so the
+ * gap becomes something to report rather than something to assume away.
  */
 function truncatedRulesNote(cut: boolean): string[] {
   if (!cut) return [];

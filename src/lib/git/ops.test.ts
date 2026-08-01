@@ -662,6 +662,7 @@ suite("diffAgainstBase (real git)", () => {
 
     for (let i = 0; i < 12; i++) expect(diff.deletions).toContain(`-export const guard${i} = () => true;`);
     expect(diff.deletions).not.toContain("further deleted file(s) not shown");
+    expect(diff.deletionsUnshown).toBeUndefined();
   });
 
   it("names the deleted files it had no budget left to quote", async () => {
@@ -682,6 +683,9 @@ suite("diffAgainstBase (real git)", () => {
 
     expect(diff.deletions).toContain("further deleted file(s) not shown");
     expect(diff.deletions).toContain("f11.ts");
+    // Counted out too, not just named in the patch text: the review prompt has to turn the gap into
+    // unverified-scope guidance, and it cannot parse that out of the patch.
+    expect(diff.deletionsUnshown).toBeGreaterThan(0);
     // The bound still holds: the quoted slices stay within the budget.
     expect(diff.deletions!.length).toBeLessThan(2_000 + 500);
   });

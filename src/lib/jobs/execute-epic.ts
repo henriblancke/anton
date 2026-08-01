@@ -1584,7 +1584,11 @@ function reviewParkNote(
         ]
       : []),
     ...(orphanLine ? [orphanLine, ``] : []),
-    `Resolve them (or correct the ticket), then resume the run.`,
+    // A protocol violation lists no findings, so there is no "them" to resolve — the head already
+    // named the one thing to fix.
+    blocking.length > 0
+      ? `Resolve them (or correct the ticket), then resume the run.`
+      : `Correct the issue above, then resume the run.`,
   ].join("\n");
 }
 

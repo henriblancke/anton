@@ -473,6 +473,15 @@ export interface BranchDiff {
    * removals it did make are approved by nobody. The caller must tell the reviewer instead.
    */
   deletionsIncomplete?: boolean;
+  /**
+   * How many deleted files the budget could only NAME — their content was never quoted. Zero-cost
+   * when the budget stretches to every removal, but it cannot always: a floor slice worth reading
+   * times the number of deletions can exceed the whole budget, and past that point some removals are
+   * unreviewable however the share is cut. Reported as a count rather than left implicit in the
+   * patch text, because the caller has to turn it into unverified-scope guidance — otherwise the
+   * reviewer returns a clean verdict over removals it never saw.
+   */
+  deletionsUnshown?: number;
 }
 
 /**
@@ -530,7 +539,7 @@ export async function diffAgainstBase(
   const { text, truncated } = await gitBounded(worktreePath, ["diff", from, "HEAD"], max);
   if (!truncated) return { files, patch: text.trim(), truncated: false };
 
-  const { patch: deletions, incomplete } = await deletionPatch(
+  const { patch: deletions, incomplete, unshown } = await deletionPatch(
     worktreePath,
     from,
     opts.maxDeletionChars ?? DEFAULT_DELETION_PATCH_CHARS,
@@ -541,6 +550,7 @@ export async function diffAgainstBase(
     truncated: true,
     ...(deletions ? { deletions } : {}),
     ...(incomplete ? { deletionsIncomplete: true } : {}),
+    ...(unshown ? { deletionsUnshown: unshown } : {}),
   };
 }
 
@@ -568,6 +578,12 @@ const MIN_DELETION_SLICE_CHARS = 500;
  * — floored at {@link MIN_DELETION_SLICE_CHARS} — so a small removal hands its surplus to the ones
  * behind it and one huge removal costs only its own slice.
  *
+ * The floor and the budget can still conflict: `max / MIN_DELETION_SLICE_CHARS` files is all a
+ * usable slice buys, and a run that deletes more than that leaves the tail NAMED only — no cut of
+ * the share fixes that, it is the budget being smaller than the content. Those files are counted out
+ * (`unshown`) as well as named, so the caller can tell the reviewer its coverage was incomplete
+ * instead of letting a clean verdict cover removals nobody read.
+ *
  * A failure does not fail the review that already has the (truncated) patch it was mainly after —
  * but it is REPORTED (`incomplete`), never swallowed. The reviewer has no other route to a deleted
  * file, so an empty result it isn't warned about reads as "nothing was removed", and the removals it
@@ -577,7 +593,7 @@ async function deletionPatch(
   worktreePath: string,
   from: string,
   max: number,
-): Promise<{ patch?: string; incomplete?: boolean }> {
+): Promise<{ patch?: string; incomplete?: boolean; unshown?: number }> {
   const parts: string[] = [];
   try {
     // `--no-renames`, to match the changed-file list: with detection on, a rename is one `R*` entry
@@ -628,7 +644,10 @@ async function deletionPatch(
           ` exhausted: ${unshown.join(", ")}]`,
       );
     }
-    return parts.length > 0 ? { patch: parts.join("\n") } : {};
+    return {
+      ...(parts.length > 0 ? { patch: parts.join("\n") } : {}),
+      ...(unshown.length > 0 ? { unshown: unshown.length } : {}),
+    };
   } catch (e) {
     console.warn(
       `[git] could not collect the deletions of ${from}..HEAD in ${worktreePath}: ${String(e)} — the` +
