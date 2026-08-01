@@ -5,9 +5,9 @@
  * Both settle the escalation FIRST, with the status CAS in `settleEscalation` as the lock: whoever
  * flips `open → resolved` owns the decision, so a double-click (or two operators on one board)
  * cannot resume the same epic twice or abandon a bead that is already closing. That CAS is local,
- * though, and the escalation is a frozen snapshot, so a bead-backed verb first re-reads who is
- * executing the work now: the shared board's run-lease for another machine (see
- * {@link contestedByLiveRun}), and the local job queue for a resume that happened right here (see
+ * though, and the escalation is a frozen snapshot, so a bead-backed verb first re-reads the board:
+ * whether the work still exists at all and whether another machine is executing it (see
+ * {@link readTargetState}), plus the local job queue for a resume that happened right here (see
  * {@link restartedLocally}). The action then runs.
  * If it fails, the escalation is already resolved but the stall is not — which is recoverable rather
  * than silent: the finding is still in the next run-health report, so the next unstick pass raises a
@@ -31,12 +31,13 @@
  */
 import { getDb } from "./db";
 import { abandonTicket } from "./abandon";
-import { beads } from "./beads/bd";
+import { beads, isMissingBeadError } from "./beads/bd";
 import { getEscalation, settleEscalation, toEscalationView } from "./escalations";
 import { cancelJob, resumeJob, resumeStalledEpic } from "./jobs/service";
 import { activeExecuteEpicId, getJob, systemClock } from "./jobs/queue";
 import { settleParkedRun } from "./runs";
 import { MAX_ABANDON_REASON_CHARS } from "./types";
+import type { Bead } from "./beads/bd";
 import type { EscalationResolution, EscalationView } from "./escalations";
 import type { Project } from "./types";
 
@@ -105,8 +106,17 @@ export async function actOnEscalation(
     if (action === "abandon" && restartedLocally(project.id, epicBeadId)) {
       return { ok: false, reason: "contested" };
     }
-    if (await contestedByLiveRun(project, view, target)) {
-      return { ok: false, reason: "contested" };
+    const state = await readTargetState(project, view, target);
+    if (state === "contested") return { ok: false, reason: "contested" };
+    // The work was deleted after the sweep froze this stall, so neither verb has anything to act on
+    // (see {@link readTargetState}). Settle the row as the no-op it is rather than refusing: the
+    // panel offers Dismiss only on a stale PR, so a refusal would strand this escalation with no
+    // move that could ever retire it, and the detail says plainly that nothing was restarted.
+    if (state === "gone") {
+      if (!(await settleEscalation(db, systemClock, escalationId, "dismissed"))) {
+        return { ok: false, reason: "not-open" };
+      }
+      return { ok: true, action, escalation: view, detail: "target-gone" };
     }
   }
 
@@ -153,46 +163,77 @@ function restartedLocally(projectId: string, epicBeadId: string): boolean {
 }
 
 /**
- * Is the work this escalation names executing on ANOTHER machine right now? Jobs and runs are
- * machine-local, so the run-lease on the epic bead is the only record that someone else picked the
- * stall back up between the sweep raising it and a founder clicking. The unstick pass stands down on
- * that lease before it escalates, but an already-open escalation outlives the pass: later sweeps
- * hold the finding without resolving the row, so the stale button survives on the board. Applying it
- * then resumes work already in flight — or, worse, abandons it, and `abandonTicket` reads only the
- * bead's own status, so nothing downstream catches that.
+ * What the board says NOW about the work an escalation froze: `clear` to act on, `contested` by a
+ * run on another machine, or `gone` because the bead itself was deleted.
+ */
+type TargetState = "clear" | "contested" | "gone";
+
+/**
+ * One bead as bd answers for it now — the row, `missing` when bd says there is no such bead, or
+ * `unreadable` when bd could not answer at all. The last two are NOT interchangeable: only `missing`
+ * is evidence, and only evidence may refuse a founder's action (see {@link isMissingBeadError}).
+ */
+type BeadRead = Bead | "missing" | "unreadable";
+
+async function readBead(repoPath: string, id: string): Promise<BeadRead> {
+  try {
+    // A successful lookup that names no issue says the same thing as bd's "no issue found" exit.
+    return (await beads.show(repoPath, id)) ?? "missing";
+  } catch (e) {
+    return isMissingBeadError(e) ? "missing" : "unreadable";
+  }
+}
+
+/**
+ * Re-read the work an escalation names, because the escalation is a frozen snapshot while the button
+ * lives on the board until someone clicks it. Later sweeps hold the finding without resolving the
+ * open row, so nothing else retires a stale control. Two things can have changed underneath it:
+ *
+ *   • Someone else picked the stall back up. Jobs and runs are machine-local, so the run-lease on the
+ *     epic bead is the only record of that. Applying the stale button then resumes work already in
+ *     flight — or, worse, abandons it, and `abandonTicket` reads only the bead's own status, so
+ *     nothing downstream catches it.
+ *   • The bead was DELETED. Then the verb has nothing left to act on: a resume hands execute-epic an
+ *     id it can only park back on with `bead ... not found`, turning an intentional deletion into a
+ *     poison job, and an abandon's `abandonTicket` throws — after the settle. The unstick pass makes
+ *     this exact call on the sweep side (`epicSettled`); this is the same rule for the manual path.
  *
  * Pull before reading, like the runner's enqueue-time `liveRunCheck` and the unstick pass: the local
- * Dolt working set trails the shared remote by a sync heartbeat. Same fail-open posture too — a pull
- * that fails (offline, transient) falls back to the local snapshot rather than disabling the
- * founder's only settling move, and any evidence it does hold still counts.
+ * Dolt working set trails the shared remote by a sync heartbeat. A pull that fails (offline,
+ * transient) falls back to the local snapshot rather than disabling the founder's only settling move,
+ * and any evidence it does hold still counts — including a deletion, which reaches the mirror as the
+ * bead's absence and can only have got there by being made here or synced from elsewhere.
  *
  * The lease is published under the RUN id, so the stalled run's own leftover is ours, not a foreign
  * holder; a finding with no run of its own (a dead lease) treats any live lease as foreign.
  */
-async function contestedByLiveRun(
+async function readTargetState(
   project: Project,
   view: EscalationView,
   target: string,
-): Promise<boolean> {
+): Promise<TargetState> {
+  await beads.pull(project.repoPath).catch(() => {});
+  // Existence is checked on the bead the VERB acts on — the epic a resume re-enqueues, the ticket an
+  // abandon closes — which is not always the one carrying the lease.
+  const acted = await readBead(project.repoPath, target);
+  if (acted === "missing") return "gone";
+
   // Runs are keyed by RUN TARGET, so that is the bead execute-epic publishes the lease on, and it is
   // what `epicBeadId` holds for every kind: the run's epic for a parked run, the finding's own bead
   // for a stale PR or a dead lease (both name a run target — `inReviewTargets` classifies with
   // `isRunTarget`, and only run targets ever carry a lease). `target` is the fallback for a finding
-  // that recorded no epic at all.
+  // that recorded no epic at all, and the common case where the two coincide costs no second read.
   const epicBeadId = view.epicBeadId ?? target;
-  try {
-    await beads.pull(project.repoPath).catch(() => {});
-    const bead = await beads.show(project.repoPath, epicBeadId);
-    const nowMs = systemClock.now();
-    return view.runId
-      ? beads.foreignRunLeaseLive(bead, nowMs, view.runId)
-      : beads.isRunLive(bead, nowMs);
-  } catch {
-    // bd is unreachable, or the bead is gone. Neither is evidence of a live run, and the verbs keep
-    // their own guards (abandonTicket 404s on a missing bead; a resumed epic re-parks on a foreign
-    // lease), so the panel stays usable rather than refusing every action bd can't answer for.
-    return false;
-  }
+  const holder = epicBeadId === target ? acted : await readBead(project.repoPath, epicBeadId);
+  // No readable lease bead is no evidence of a live run: bd being unreachable must not disable the
+  // panel, and a gone EPIC still leaves an abandon of its (existing) ticket worth doing.
+  if (typeof holder === "string") return "clear";
+
+  const nowMs = systemClock.now();
+  const live = view.runId
+    ? beads.foreignRunLeaseLive(holder, nowMs, view.runId)
+    : beads.isRunLive(holder, nowMs);
+  return live ? "contested" : "clear";
 }
 
 /** Resume/abandon against the work itself — the epic a run stalled on, or the bead to close. */

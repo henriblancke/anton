@@ -548,6 +548,77 @@ describe("actOnEscalation — the work was picked back up elsewhere", () => {
   });
 });
 
+describe("actOnEscalation — the work was deleted after the stall was raised", () => {
+  // A deleted bead is a deliberate settle, and neither verb has anything left to act on: a resume
+  // hands execute-epic an id it can only park back on with `bead ... not found` — an intentional
+  // deletion turned into a poison job — and an abandon's `abandonTicket` throws on the gone bead
+  // AFTER the settle. bd saying "no issue found" is the evidence; bd failing to answer is not.
+  const notFound = (id: string) =>
+    Object.assign(new Error(`Command failed: bd show ${id} --json\n`), {
+      stderr: `Error: no issue found matching "${id}"\n`,
+    });
+
+  it("refuses to re-enqueue a deleted epic, and settles the row instead of stranding it", async () => {
+    beadsShow.mockRejectedValue(notFound("anton-e1"));
+    const escalation = await open();
+
+    expect(await actOnEscalation(project, escalation.id, "resume")).toMatchObject({
+      ok: true,
+      detail: "target-gone",
+    });
+    expect(resumeStalledEpic).not.toHaveBeenCalled();
+    // Dismissed, not "resumed": the row must not claim a restart that never happened. The panel
+    // offers Dismiss only on a stale PR, so refusing outright would leave this escalation with no
+    // move that could ever retire it.
+    expect(rowOf(escalation.id)).toMatchObject({ status: "resolved", resolution: "dismissed" });
+  });
+
+  it("refuses an abandon of a deleted ticket the same way", async () => {
+    beadsShow.mockRejectedValue(notFound("anton-t9"));
+    const escalation = await open();
+
+    expect(await actOnEscalation(project, escalation.id, "abandon")).toMatchObject({
+      ok: true,
+      detail: "target-gone",
+    });
+    expect(abandonTicket).not.toHaveBeenCalled();
+    expect(rowOf(escalation.id)).toMatchObject({ status: "resolved", resolution: "dismissed" });
+  });
+
+  it("treats a lookup that returns no issue as the same answer as bd's not-found exit", async () => {
+    beadsShow.mockResolvedValue(undefined as unknown as Bead);
+    const escalation = await open();
+
+    expect(await actOnEscalation(project, escalation.id, "resume")).toMatchObject({
+      detail: "target-gone",
+    });
+  });
+
+  it("still abandons the ticket when only its EPIC is gone — existence is read on the verb's own target", async () => {
+    beadsShow.mockImplementation(async (_repo, id) => {
+      if (id === "anton-e1") throw notFound(id);
+      return bead();
+    });
+    const escalation = await open();
+
+    expect(await actOnEscalation(project, escalation.id, "abandon")).toMatchObject({
+      ok: true,
+      detail: "abandoned",
+    });
+  });
+
+  it("does NOT read a bd that could not answer as a deletion — that is the offline path", async () => {
+    beadsShow.mockRejectedValue(new Error("bd: database is locked"));
+    const escalation = await open();
+
+    expect(await actOnEscalation(project, escalation.id, "resume")).toMatchObject({
+      ok: true,
+      detail: "enqueued",
+    });
+    expect(resumeStalledEpic).toHaveBeenCalledWith("p1", "anton-e1");
+  });
+});
+
 describe("actOnEscalation — the action fails after the settle", () => {
   it("leaves a server-side breadcrumb, because the settled row is already gone from the panel", async () => {
     const logged = vi.spyOn(console, "error").mockImplementation(() => {});

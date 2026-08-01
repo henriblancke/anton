@@ -19,6 +19,7 @@ const ACTION_DETAIL: Record<string, string> = {
   "job-already-settled": "Already settled — the job had already stopped",
   "job-restarted": "Not stopped — the job is running again, so it was left alone",
   dismissed: "Dismissed — anton raises it again if it's still stuck at the next sweep",
+  "target-gone": "Nothing to act on — this work was deleted from the board, so the alert is cleared",
 };
 
 /** Button copy per target: a stall that names only a job is retried/stopped, not abandoned. */

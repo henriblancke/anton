@@ -770,6 +770,21 @@ function asArray<T>(raw: string): T[] {
   return [];
 }
 
+/**
+ * Did bd ANSWER that there is no such bead, or did it fail to answer at all? A lookup for a deleted
+ * id exits non-zero with `no issue found matching …`, and that is evidence the work was removed on
+ * purpose. Every other failure — bd absent, dolt wedged, the step budget expired — is the absence of
+ * evidence, so a caller that acts on a deletion (refusing to resume work that no longer exists) must
+ * not read it as one. Matches stderr first and the message second: {@link bd}'s rejection carries the
+ * raw stderr on both.
+ */
+export function isMissingBeadError(e: unknown): boolean {
+  const err = e as { stderr?: unknown; message?: unknown } | null | undefined;
+  const stderr = typeof err?.stderr === "string" ? err.stderr : "";
+  const message = typeof err?.message === "string" ? err.message : "";
+  return /no issues? found|not found/i.test(`${stderr}\n${message}`);
+}
+
 export const beads = {
   /**
    * Truly claimable work (excludes in_progress/blocked/deferred). `--limit 0` = unlimited:

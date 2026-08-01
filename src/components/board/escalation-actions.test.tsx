@@ -52,6 +52,19 @@ describe("EscalationActions — resume", () => {
     await waitFor(() => expect(success).toHaveBeenCalledWith("Already running — nothing to restart"));
   });
 
+  it("says plainly that a deleted target was cleared rather than restarted", async () => {
+    stubFetch({ action: "resume", detail: "target-gone" });
+    mount();
+
+    fireEvent.click(screen.getByRole("button", { name: "Resume" }));
+
+    await waitFor(() =>
+      expect(success).toHaveBeenCalledWith(
+        "Nothing to act on — this work was deleted from the board, so the alert is cleared",
+      ),
+    );
+  });
+
   it("surfaces the server's reason when the escalation was already settled", async () => {
     stubFetch({ error: "This escalation has already been settled" }, 409);
     mount();

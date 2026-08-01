@@ -918,7 +918,9 @@ export async function park(
  *
  * Un-parks a `parked` job or a `failed` (reserved terminal) one; a no-op for anything else (returns
  * false) — resuming a running/done/queued job would corrupt its lifecycle. The status guard is
- * applied in the UPDATE's WHERE so a concurrent settle can't race it between the read and the write.
+ * applied in the UPDATE's WHERE so a concurrent settle can't race it between the read and the write,
+ * and the return value is that CAS's affected-row count: `true` means this call un-parked the job,
+ * never merely that it looked resumable a moment earlier.
  */
 export async function resumeJob(db: AntonDb, clock: Clock, jobId: string): Promise<boolean> {
   const nowMs = clock.now();
@@ -939,7 +941,7 @@ export async function resumeJob(db: AntonDb, clock: Clock, jobId: string): Promi
   }
 
   try {
-    await db
+    const updated = await db
       .update(schema.jobs)
       .set({
         status: "queued",
@@ -951,14 +953,19 @@ export async function resumeJob(db: AntonDb, clock: Clock, jobId: string): Promi
       })
       // Re-assert the resumable status in the WHERE so a concurrent settle can't race it between the
       // read above and this write.
-      .where(and(eq(schema.jobs.id, jobId), inArray(schema.jobs.status, ["parked", "failed"])));
+      .where(and(eq(schema.jobs.id, jobId), inArray(schema.jobs.status, ["parked", "failed"])))
+      .returning({ id: schema.jobs.id });
+    // The WHERE is the CAS, so the affected-row count is the only truthful answer: zero means a
+    // concurrent settle (an operator's cancel, most of all) took the row after the read above and
+    // this resume did NOT happen. Reporting `true` there would let `resumeEpic` claim `resumed-job`
+    // and skip its cancellation re-read, so the UI would call a still-cancelled job restarted.
+    return updated.length > 0;
   } catch (e) {
     // Backstop for the race the check above can't fully close: a concurrent enqueue could win the
     // active slot between the check and this write. Absorb the index violation as a clean no-op.
     if (isUniqueViolation(e)) return false;
     throw e;
   }
-  return true;
 }
 
 /**

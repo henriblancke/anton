@@ -4,7 +4,8 @@
  * parking a job that had been requeued for a retry silently did nothing and returned `void` — the
  * caller could not tell, and a later `resumeJob` refused the job because it was still `queued`.
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { eq } from "drizzle-orm";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
 import { cancelJob, getJob, park, resumeJob, systemClock } from "./queue";
@@ -78,6 +79,34 @@ describe("park", () => {
 
   it("reports false for an unknown job id", async () => {
     expect(await park(t.db, systemClock, "does-not-exist", "nope")).toBe(false);
+  });
+});
+
+describe("resumeJob — the boolean is the CAS, not the read", () => {
+  it("reports false when a cancel takes the row between the read and the guarded UPDATE", async () => {
+    // The window `resumeJob`'s status guard exists to close: the row still reads `parked` when the
+    // job is loaded, and an operator cancels before the UPDATE lands. The WHERE then matches nothing.
+    // Returning true there would let `resumeEpic` report `resumed-job` and skip its cancellation
+    // re-read, so the escalation panel would claim it restarted a job that is still cancelled.
+    seed("raced-job", "parked");
+    const update = t.db.update.bind(t.db);
+    vi.spyOn(t.db, "update").mockImplementationOnce((table) => {
+      update(schema.jobs)
+        .set({ status: "cancelled", lastError: "cancelled by operator" })
+        .where(eq(schema.jobs.id, "raced-job"))
+        .run();
+      return update(table);
+    });
+
+    expect(await resumeJob(t.db, systemClock, "raced-job")).toBe(false);
+    expect((await getJob(t.db, "raced-job"))?.status).toBe("cancelled");
+  });
+
+  it("still reports true for the resume it actually performed", async () => {
+    seed("parked-job", "parked");
+
+    expect(await resumeJob(t.db, systemClock, "parked-job")).toBe(true);
+    expect((await getJob(t.db, "parked-job"))?.status).toBe("queued");
   });
 });
 
