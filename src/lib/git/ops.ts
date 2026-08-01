@@ -21,6 +21,26 @@ async function git(cwd: string, args: string[]): Promise<string> {
 }
 
 /**
+ * Paths from a `git diff --name-only`-style query, read exactly as they are on disk.
+ *
+ * `-z` is not a micro-optimization. Under git's default `core.quotePath`, a path holding a non-ASCII
+ * byte, a quote, or a newline is printed C-QUOTED — `src/café/page.tsx` comes back as
+ * `"src/caf\303\251/page.tsx"` — and every consumer here treats the result as a real path: the review
+ * gate scopes the reviewer's binding instruction files by walking each changed path's ancestors, and
+ * a mangled path walks the wrong chain, silently dropping a nested AGENTS.md the diff is bound by.
+ * NUL-delimited output is the literal byte sequence, and it also survives a filename containing the
+ * newline this would otherwise split on. Paths are NOT trimmed for the same reason — leading and
+ * trailing whitespace are legal in a filename.
+ */
+async function diffPaths(cwd: string, args: string[]): Promise<string[]> {
+  const { stdout } = await execFileAsync("git", ["-C", cwd, "diff", "-z", ...args], {
+    timeout: 120_000,
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  return stdout.split("\0").filter(Boolean);
+}
+
+/**
  * Run git and keep at most `maxChars` of its stdout, killing it the moment output overflows.
  *
  * For commands whose output has no useful upper bound. `git()` collects stdout through execFile's
@@ -312,8 +332,7 @@ export async function mergeIntoCurrent(
     await git(worktreePath, ["merge", "--no-edit", ...(opts?.ffOnly ? ["--ff-only"] : []), ref]);
     return { ok: true, conflicts: [] };
   } catch (e) {
-    const out = await git(worktreePath, ["diff", "--name-only", "--diff-filter=U"]).catch(() => "");
-    const conflicts = out.split("\n").map((l) => l.trim()).filter(Boolean);
+    const conflicts = await diffPaths(worktreePath, ["--name-only", "--diff-filter=U"]).catch(() => []);
     if (conflicts.length === 0) {
       await git(worktreePath, ["merge", "--abort"]).catch(() => {});
       throw e;
@@ -430,11 +449,7 @@ export async function diffAgainstBase(
   opts: { maxPatchChars?: number; maxDeletionChars?: number } = {},
 ): Promise<BranchDiff> {
   const from = await resolveMergeBase(worktreePath, base);
-  const names = await git(worktreePath, ["diff", "--name-only", "--no-renames", from, "HEAD"]);
-  const files = names
-    .split("\n")
-    .map((l) => l.trim())
-    .filter(Boolean);
+  const files = await diffPaths(worktreePath, ["--name-only", "--no-renames", from, "HEAD"]);
 
   const max = opts.maxPatchChars ?? DEFAULT_DIFF_PATCH_CHARS;
   const { text, truncated } = await gitBounded(worktreePath, ["diff", from, "HEAD"], max);
@@ -472,11 +487,7 @@ const MIN_DELETION_SLICE_CHARS = 500;
  */
 async function deletionPatch(worktreePath: string, from: string, max: number): Promise<string | undefined> {
   try {
-    const names = await git(worktreePath, ["diff", "--name-only", "--diff-filter=D", from, "HEAD"]);
-    const deleted = names
-      .split("\n")
-      .map((l) => l.trim())
-      .filter(Boolean);
+    const deleted = await diffPaths(worktreePath, ["--name-only", "--diff-filter=D", from, "HEAD"]);
     if (deleted.length === 0) return undefined;
 
     const parts: string[] = [];
@@ -490,7 +501,10 @@ async function deletionPatch(worktreePath: string, from: string, max: number): P
       const path = deleted[i]!;
       const { text, truncated } = await gitBounded(
         worktreePath,
-        ["diff", "--diff-filter=D", from, "HEAD", "--", path],
+        // `:(literal)`, because a pathspec globs by default: these names come from git itself and
+        // are exact, but one holding `*` or `[…]` would also match its NEIGHBOURS and spend this
+        // file's slice of the budget quoting them.
+        ["diff", "--diff-filter=D", from, "HEAD", "--", `:(literal)${path}`],
         share,
       );
       if (!text.trim()) continue;
@@ -747,8 +761,16 @@ export async function openPullRequest(opts: {
   if (existing) {
     if (!existing.isDraft) return existing;
     // Report what actually happened: a flip gh refused leaves a draft PR the founder must ready by
-    // hand, and the work is on the branch either way — not worth failing the run over.
+    // hand, and the work is on the branch either way — not worth failing the run over. Logged as well
+    // as returned, because the run goes on to finish `done` with the bead `in-review`: without a line
+    // here the only visible trace of an un-mergeable PR is the draft badge on GitHub.
     const ready = await setPullRequestDraft(opts.repoPath, existing.ref, false);
+    if (!ready) {
+      console.warn(
+        `[git] could not take ${existing.url} out of draft; the run's work is on ${opts.branch} but ` +
+          `the PR stays un-mergeable until it is readied by hand`,
+      );
+    }
     return { ...existing, isDraft: !ready };
   }
 

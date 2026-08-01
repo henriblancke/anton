@@ -50,8 +50,14 @@ import {
 } from "../sessions";
 import { buildPrTitle } from "./pr-title";
 import type { ReviewFinding } from "./review-context";
-import { blockingFindings, finalViolation, runReviewGate, type ReviewGateResult } from "./review-gate";
-import { persistReviewScores } from "./review-score";
+import {
+  blockingFindings,
+  finalViolation,
+  ReviewGatePoisonError,
+  runReviewGate,
+  type ReviewGateResult,
+} from "./review-gate";
+import { persistPartialReviewScores, persistReviewScores } from "./review-score";
 import {
   isPoisonError,
   isRecoverableClaudeError,
@@ -944,12 +950,18 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           // hides the row from findOpenRunForEpic, and the resume the human was told to do would
           // start a REPLACEMENT run instead of continuing this one and its session history.
           if (!isPoisonError(e)) throw e;
+          // A poison exit never reaches persistReviewScores below, so the rounds the gate DID finish
+          // are written here or lost: a round-3 death still owes the founder rounds 1 and 2.
+          if (e instanceof ReviewGatePoisonError) {
+            await persistPartialReviewScores(repo, epicBeadId, e.rounds);
+          }
           // Same park, same hazard as the blocking-verdict exit below: an orphaned PR left mergeable.
           const orphan = await reconcileOrphanPullRequest(repo, worktree.branch);
           throw new ReviewBlockedError(`${e.message}${orphanClause(orphan)}`, { cause: e });
         });
-        // The score history belongs to the board, not this run's logs — written on BOTH exits, since
-        // a run parked on blocking findings is exactly the one whose score the founder needs.
+        // The score history belongs to the board, not this run's logs — written on both exits the gate
+        // RETURNS from, since a run parked on blocking findings is exactly the one whose score the
+        // founder needs. The throwing exit is covered by the catch above.
         await persistReviewScores(repo, epicBeadId, review);
 
         const blocking = blockingFindings(review.unresolved);

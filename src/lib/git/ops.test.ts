@@ -427,6 +427,31 @@ suite("diffAgainstBase (real git)", () => {
     expect(diff.patch).toContain("rename from old/file.ts");
   });
 
+  it("names paths git would QUOTE exactly, so the reviewer's rule scope resolves", async () => {
+    // Under the default `core.quotePath`, a non-ASCII path prints as `"src/caf\303\251/page.tsx"`.
+    // The file list is what scopes the instruction files the reviewer is judged against, and a
+    // C-quoted string walks the wrong ancestors — dropping a nested AGENTS.md that binds the diff.
+    // A `[id]` segment is the App Router's own shape, and a pathspec reads it as a glob.
+    g(["config", "core.quotePath", "true"]); // git's default; pinned so the guard is what's tested
+    g(["checkout", "-q", "main"]);
+    mkdirSync(join(repo, "src", "café", "[id]"), { recursive: true });
+    writeFileSync(join(repo, "src", "café", "[id]", "page.tsx"), "export default () => null;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "seed the quoted path"]);
+    g(["checkout", "-q", "-B", "anton/epic-1"]);
+
+    // `AAA-big.ts` sorts first, so the cut pushes the removal into the deletion pass.
+    writeFileSync(join(repo, "AAA-big.ts"), "// filler line\n".repeat(500));
+    rmSync(join(repo, "src", "café", "[id]", "page.tsx"));
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "t1: grow and remove the quoted path"]);
+
+    const diff = await diffAgainstBase(repo, "main", { maxPatchChars: 200 });
+
+    expect(diff.files).toEqual(["AAA-big.ts", "src/café/[id]/page.tsx"]);
+    expect(diff.deletions).toContain("-export default () => null;");
+  });
+
   it("reports no changes for a branch that committed nothing", async () => {
     const diff = await diffAgainstBase(repo, "main");
     expect(diff).toEqual({ files: [], patch: "", truncated: false });

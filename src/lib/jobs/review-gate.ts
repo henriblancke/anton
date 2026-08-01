@@ -26,7 +26,7 @@ import {
 } from "../git/ops";
 import { resolveReviewConfig, resolveVerifyGates, type ProjectSettings } from "../projects";
 import { appendSessionLog, endSession, startJobSession } from "../sessions";
-import { PoisonError } from "./errors";
+import { isPoisonError, PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
 import {
   buildFindingsFixPrompt,
@@ -203,6 +203,23 @@ export function finalViolation(result: ReviewGateResult): ReviewProtocolViolatio
 }
 
 /**
+ * A poison exit that still carries the rounds the gate COMPLETED before it died.
+ *
+ * The gate returns no result when it throws, so the rounds it already reviewed and scored would be
+ * lost with the stack — even though a poison park is exactly when a founder opens the bead to work
+ * out what the run was doing when its worktree got stuck. The rounds ride on the error instead.
+ */
+export class ReviewGatePoisonError extends PoisonError {
+  readonly rounds: ReviewRound[];
+
+  constructor(message: string, rounds: ReviewRound[], options?: ErrorOptions) {
+    super(message);
+    if (options && "cause" in options) this.cause = options.cause;
+    this.rounds = rounds;
+  }
+}
+
+/**
  * Review → fix → re-review until the reviewer reports nothing blocking or the round cap is reached.
  *
  * A fix is only dispatched while a further round remains: a fix nobody re-reviews has no evidence it
@@ -213,6 +230,22 @@ export function finalViolation(result: ReviewGateResult): ReviewProtocolViolatio
  * any other exhausted-quota failure) after marking the in-flight session failed.
  */
 export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateResult> {
+  // The accumulator lives OUT here so a poison exit — which returns nothing — can still hand the
+  // call-site the rounds that completed before the gate died (see {@link ReviewGatePoisonError}).
+  const rounds: ReviewRound[] = [];
+  try {
+    return await convergeRounds(args, rounds);
+  } catch (e) {
+    if (rounds.length === 0 || !isPoisonError(e) || e instanceof ReviewGatePoisonError) throw e;
+    throw new ReviewGatePoisonError(e.message, [...rounds], { cause: e });
+  }
+}
+
+/**
+ * The converge loop itself. `rounds` is passed IN and appended to rather than built here, so the
+ * wrapper above still holds what completed when this throws — the whole point of the split.
+ */
+async function convergeRounds(args: ReviewGateArgs, rounds: ReviewRound[]): Promise<ReviewGateResult> {
   const { db, clock, ctx, projectId, runId, target, tickets, settings, worktreePath, baseBranch } = args;
   const config = resolveReviewConfig(settings);
   const claude = args.deps?.runClaude ?? runClaude;
@@ -229,7 +262,6 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
   // deleted a rule would quietly stop that rule from grading this branch. One SHA, one baseline.
   const baseRev = await mergeBase(worktreePath, baseBranch);
 
-  const rounds: ReviewRound[] = [];
   let reviewer: ReviewerSource = { kind: "default" };
   /** Advisories still open from earlier rounds — shown to the next review, which settles them. */
   let carried: ReviewFinding[] = [];

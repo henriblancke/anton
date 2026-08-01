@@ -26,6 +26,7 @@ import { UsageLimitError, isPoisonError } from "./errors";
 import type { Clock } from "./queue";
 import {
   blockingFindings,
+  ReviewGatePoisonError,
   runReviewGate,
   REVIEW_SETTING_SOURCES,
   type ReviewGateContext,
@@ -908,6 +909,12 @@ describe("runReviewGate — a failed fix leaves nothing behind", () => {
     expect((error as Error).message).toMatch(/on a branch of its own/);
     expect(restores).toEqual([]);
     expect(await worktree.readState()).toMatchObject({ head: "r0gue2", ref: "refs/heads/review-work-2" });
+    // A poison exit returns no result, so the rounds it DID finish ride out on the error — the
+    // call-site persists them, and the park the founder opens still shows its score history.
+    expect(error).toBeInstanceOf(ReviewGatePoisonError);
+    expect((error as ReviewGatePoisonError).rounds).toMatchObject([
+      { round: 1, score: 4, blocking: 1, advisory: 0 },
+    ]);
   });
 
   it("leaves a fix that PASSED its gates alone — the round's own commit is not rolled back", async () => {

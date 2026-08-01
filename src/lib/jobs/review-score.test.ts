@@ -9,6 +9,8 @@ import { beads, type Bead } from "../beads/bd";
 import type { ReviewGateResult } from "./review-gate";
 import {
   formatReviewScoreComment,
+  partialReviewScoreEntries,
+  persistPartialReviewScores,
   persistReviewScores,
   reviewScoreEntries,
   REVIEW_SCORE_KIND,
@@ -48,6 +50,20 @@ describe("reviewScoreEntries", () => {
     );
     expect(entry.score).toBeUndefined();
     expect(entry.verdict).toBe("protocol-violation");
+  });
+});
+
+describe("partialReviewScoreEntries", () => {
+  it("marks only the round the gate DIED in, so the earlier ones still read as fixed", () => {
+    expect(
+      partialReviewScoreEntries([
+        { round: 1, reviewSessionId: "s1", score: 4, blocking: 2, advisory: 0 },
+        { round: 2, reviewSessionId: "s2", score: 6, blocking: 1, advisory: 1, rationale: "closer" },
+      ]),
+    ).toEqual([
+      { round: 1, score: 4, blocking: 2, advisory: 0, verdict: "fixed" },
+      { round: 2, score: 6, blocking: 1, advisory: 1, verdict: "poisoned", rationale: "closer" },
+    ]);
   });
 });
 
@@ -132,6 +148,23 @@ describe("persistReviewScores", () => {
       }),
     });
     expect(comment).toHaveBeenCalledTimes(1);
+    expect(setReviewScore).not.toHaveBeenCalled();
+  });
+
+  it("still writes the rounds a poisoned gate finished, and nothing at all when it finished none", async () => {
+    // A gate that THROWS returns no result, so without this path the whole series dies with the
+    // stack — and a poison park is exactly when the founder opens the bead to see what happened.
+    await persistPartialReviewScores("/repo", "anton-t", [
+      { round: 1, reviewSessionId: "s1", score: 5, blocking: 2, advisory: 0 },
+    ]);
+    expect(comment).toHaveBeenCalledTimes(1);
+    expect(comment.mock.calls[0][2]).toContain("round 1");
+    expect(comment.mock.calls[0][2]).toContain("poisoned");
+    expect(setReviewScore).toHaveBeenCalledWith("/repo", "anton-t", 5, []);
+
+    vi.clearAllMocks();
+    await persistPartialReviewScores("/repo", "anton-t", []);
+    expect(comment).not.toHaveBeenCalled();
     expect(setReviewScore).not.toHaveBeenCalled();
   });
 

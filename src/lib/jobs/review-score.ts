@@ -11,14 +11,18 @@
  * whose work already landed.
  */
 import { beads } from "../beads/bd";
-import type { ReviewGateOutcome, ReviewGateResult } from "./review-gate";
+import type { ReviewGateOutcome, ReviewGateResult, ReviewRound } from "./review-gate";
 
 /**
  * What a single round settled on. Only the LAST round can carry the gate's outcome — every earlier
  * round reported blocking findings, dispatched a fix for them, and was re-reviewed, which is exactly
  * what `fixed` records.
+ *
+ * `poisoned` is the one verdict no gate OUTCOME produces: the gate died mid-round (an unrevertable
+ * reviewer commit, a fixer that switched branches) and never returned a result at all, so the round
+ * it was in settled nothing.
  */
-export type ReviewRoundVerdict = ReviewGateOutcome | "fixed";
+export type ReviewRoundVerdict = ReviewGateOutcome | "fixed" | "poisoned";
 
 /** The machine-readable payload of one round's comment — the shape the score UI reads back. */
 export interface ReviewScoreEntry {
@@ -36,13 +40,28 @@ export const REVIEW_SCORE_KIND = "anton.review-score";
 
 /** Every round of a finished gate, in order, ready to persist. */
 export function reviewScoreEntries(result: ReviewGateResult): ReviewScoreEntry[] {
-  const last = result.rounds.length - 1;
-  return result.rounds.map((r, i) => ({
+  return toEntries(result.rounds, result.outcome);
+}
+
+/**
+ * The rounds a gate COMPLETED before it went poison mid-flight, ready to persist.
+ *
+ * A poison exit returns no result, so without this the whole series is lost — including the earlier
+ * rounds that reviewed, scored, and dispatched a fix perfectly well. Those rounds are exactly the
+ * context the founder needs when they open the parked run to reset a stuck worktree by hand.
+ */
+export function partialReviewScoreEntries(rounds: ReviewRound[]): ReviewScoreEntry[] {
+  return toEntries(rounds, "poisoned");
+}
+
+function toEntries(rounds: ReviewRound[], final: ReviewRoundVerdict): ReviewScoreEntry[] {
+  const last = rounds.length - 1;
+  return rounds.map((r, i) => ({
     round: r.round,
     ...(r.score !== undefined ? { score: r.score } : {}),
     blocking: r.blocking,
     advisory: r.advisory,
-    verdict: i === last ? result.outcome : ("fixed" as const),
+    verdict: i === last ? final : ("fixed" as const),
     ...(r.rationale ? { rationale: r.rationale } : {}),
   }));
 }
@@ -69,15 +88,36 @@ export function formatReviewScoreComment(entry: ReviewScoreEntry): string {
 /**
  * Persist a finished gate to the run target: a comment per round, then the latest score as a label.
  *
- * Called on BOTH exits — the PR path and the park path — because a run parked on blocking findings is
- * precisely the one whose score the founder needs on the board.
+ * Called on every exit the gate RETURNS from — the PR path and the park path — because a run parked
+ * on blocking findings is precisely the one whose score the founder needs on the board. The exit it
+ * cannot cover is the one that throws; {@link persistPartialReviewScores} is that path.
  */
 export async function persistReviewScores(
   repo: string,
   targetId: string,
   result: ReviewGateResult,
 ): Promise<void> {
-  const entries = reviewScoreEntries(result);
+  return persistEntries(repo, targetId, reviewScoreEntries(result));
+}
+
+/**
+ * Persist the rounds of a gate that THREW poison, so a mid-flight death still leaves its history on
+ * the board rather than only in the run log.
+ */
+export async function persistPartialReviewScores(
+  repo: string,
+  targetId: string,
+  rounds: ReviewRound[],
+): Promise<void> {
+  if (rounds.length === 0) return;
+  return persistEntries(repo, targetId, partialReviewScoreEntries(rounds));
+}
+
+async function persistEntries(
+  repo: string,
+  targetId: string,
+  entries: ReviewScoreEntry[],
+): Promise<void> {
   for (const entry of entries) {
     await safeWrite(`round ${entry.round} comment`, targetId, () =>
       beads.comment(repo, targetId, formatReviewScoreComment(entry)),
