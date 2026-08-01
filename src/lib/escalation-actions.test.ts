@@ -11,6 +11,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { eq } from "drizzle-orm";
 
 import { makeFileDb, type FileDb } from "@/lib/testing/integration";
+import { LABELS, type Bead } from "./beads/bd";
 import type { RunHealthFinding } from "./run-health";
 import type { Project } from "./types";
 
@@ -30,6 +31,22 @@ vi.mock("./jobs/service", () => ({
 vi.mock("./abandon", async () => {
   const actual = await vi.importActual<typeof import("./abandon")>("./abandon");
   return { ...actual, abandonTicket: (...args: [Project, string, string]) => abandonTicket(...args) };
+});
+
+// The cross-machine half: the pre-settle re-check pulls the shared board and reads the epic's
+// run-lease. Stubbed so the lease is the only variable — the real lease parsing is bd.test.ts's job.
+const beadsPull = vi.fn<(repoPath: string) => Promise<void>>();
+const beadsShow = vi.fn<(repoPath: string, id: string) => Promise<Bead>>();
+vi.mock("./beads/bd", async () => {
+  const actual = await vi.importActual<typeof import("./beads/bd")>("./beads/bd");
+  return {
+    ...actual,
+    beads: {
+      ...actual.beads,
+      pull: (...args: [string]) => beadsPull(...args),
+      show: (...args: [string, string]) => beadsShow(...args),
+    },
+  };
 });
 
 let fileDb: FileDb;
@@ -70,7 +87,14 @@ beforeEach(() => {
   abandonTicket.mockResolvedValue(undefined);
   resumeJob.mockResolvedValue(true);
   cancelJob.mockResolvedValue({ ok: true });
+  beadsPull.mockResolvedValue(undefined);
+  beadsShow.mockResolvedValue(bead());
 });
+
+/** The epic bead the re-check reads the run-lease off; unlabelled means nobody is running it. */
+function bead(labels: string[] = []): Bead {
+  return { id: "anton-e1", title: "epic", status: "open", labels } as Bead;
+}
 
 afterEach(() => vi.clearAllMocks());
 
@@ -382,6 +406,86 @@ describe("actOnEscalation — a stall that names only a job", () => {
       reason: "no-target",
     });
     expect(rowOf(escalation.id)?.status).toBe("open");
+  });
+});
+
+describe("actOnEscalation — the work was picked back up elsewhere", () => {
+  // The escalation is a frozen snapshot of the stall, but the button lives on the board until it is
+  // clicked. Jobs and runs are machine-local, so the epic's run-lease is the only record that
+  // another machine restarted the work in between — and later sweeps hold the finding without ever
+  // resolving the open row, so nothing else retires the stale control.
+  // Lease expiries are judged against the real clock (the module settles on `systemClock`), so
+  // these are wall-time relative — unlike the frozen NOW the escalation rows are seeded at.
+  const lease = (offsetMs: number, owner: string) => bead([LABELS.runLease(Date.now() + offsetMs, owner)]);
+  const foreignLease = () => lease(HOUR, "run-elsewhere");
+
+  it("refuses an abandon that would close the bead underneath a live remote run", async () => {
+    beadsShow.mockResolvedValue(foreignLease());
+    const escalation = await open();
+
+    expect(await actOnEscalation(project, escalation.id, "abandon")).toEqual({
+      ok: false,
+      reason: "contested",
+    });
+    expect(abandonTicket).not.toHaveBeenCalled();
+    // Unsettled: the row stays on the panel for the next sweep to re-judge.
+    expect(rowOf(escalation.id)?.status).toBe("open");
+  });
+
+  it("refuses a resume too — re-running an epic another machine owns is a duplicate PR", async () => {
+    beadsShow.mockResolvedValue(foreignLease());
+    const escalation = await open();
+
+    expect(await actOnEscalation(project, escalation.id, "resume")).toEqual({
+      ok: false,
+      reason: "contested",
+    });
+    expect(resumeStalledEpic).not.toHaveBeenCalled();
+  });
+
+  it("pulls the shared board first — a local mirror trails the lease by a sync heartbeat", async () => {
+    const escalation = await open();
+
+    await actOnEscalation(project, escalation.id, "abandon");
+
+    expect(beadsPull).toHaveBeenCalledWith(project.repoPath);
+    // The EPIC carries the lease, not the ticket the finding names.
+    expect(beadsShow).toHaveBeenCalledWith(project.repoPath, "anton-e1");
+  });
+
+  it("acts through the stalled run's OWN leftover lease — that is a crash remnant, not a holder", async () => {
+    beadsShow.mockResolvedValue(lease(HOUR, "r-1"));
+    const escalation = await open();
+
+    expect(await actOnEscalation(project, escalation.id, "abandon")).toMatchObject({ ok: true });
+  });
+
+  it("acts through an EXPIRED foreign lease — the machine that held it is gone", async () => {
+    beadsShow.mockResolvedValue(lease(-HOUR, "run-elsewhere"));
+    const escalation = await open();
+
+    expect(await actOnEscalation(project, escalation.id, "abandon")).toMatchObject({ ok: true });
+  });
+
+  it("falls back to the local snapshot when bd can't answer — the panel stays usable offline", async () => {
+    beadsShow.mockRejectedValue(new Error("bd: database is locked"));
+    const escalation = await open();
+
+    expect(await actOnEscalation(project, escalation.id, "abandon")).toMatchObject({ ok: true });
+  });
+
+  it("never gates a job-only stall or a dismiss — neither touches the shared board", async () => {
+    const jobOnly = await open({
+      finding: finding({ kind: "exhausted-job", key: "exhausted-job:j-1", runId: undefined, beadId: undefined, jobId: "j-1" }),
+      epicBeadId: undefined,
+    });
+    expect(await actOnEscalation(project, jobOnly.id, "abandon")).toMatchObject({ ok: true });
+
+    beadsShow.mockResolvedValue(foreignLease());
+    const dismissable = await open({ finding: finding({ key: "parked-run:r-2", runId: "r-2" }) });
+    expect(await actOnEscalation(project, dismissable.id, "dismiss")).toMatchObject({ ok: true });
+
+    expect(beadsShow).not.toHaveBeenCalled();
   });
 });
 

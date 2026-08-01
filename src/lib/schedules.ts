@@ -61,27 +61,40 @@ export interface CreateScheduleInput {
 }
 
 /**
- * Create a schedule. Validates the cron up front (fail loud) and seeds `nextRunAt` so the loop
- * knows when it first fires. db-injectable for the scheduler/tests.
+ * Insert one schedule row. Synchronous on purpose so it composes inside a transaction — the seed
+ * below needs its read and its inserts to run without an await between them (see
+ * {@link seedDefaultSchedules}). Validates the cron up front (fail loud) and seeds `nextRunAt` so
+ * the loop knows when it first fires.
  */
+function insertSchedule(
+  tx: Pick<AntonDb, "insert">,
+  clock: Clock,
+  input: CreateScheduleInput,
+): string {
+  if (!isValidCron(input.cron)) throw new Error(`invalid cron expression: "${input.cron}"`);
+  const id = randomUUID();
+  const enabled = input.enabled ?? true;
+  const nextRunAt = enabled ? nextRun(input.cron, clock.now()) : null;
+  tx.insert(schema.schedules)
+    .values({
+      id,
+      projectId: input.projectId,
+      type: input.type,
+      cron: input.cron,
+      enabled,
+      nextRunAt: nextRunAt != null ? secDate(nextRunAt) : null,
+    })
+    .run();
+  return id;
+}
+
+/** Create a schedule. db-injectable for the scheduler/tests. */
 export async function createSchedule(
   db: AntonDb,
   clock: Clock,
   input: CreateScheduleInput,
 ): Promise<string> {
-  if (!isValidCron(input.cron)) throw new Error(`invalid cron expression: "${input.cron}"`);
-  const id = randomUUID();
-  const enabled = input.enabled ?? true;
-  const nextRunAt = enabled ? nextRun(input.cron, clock.now()) : null;
-  await db.insert(schema.schedules).values({
-    id,
-    projectId: input.projectId,
-    type: input.type,
-    cron: input.cron,
-    enabled,
-    nextRunAt: nextRunAt != null ? secDate(nextRunAt) : null,
-  });
-  return id;
+  return insertSchedule(db, clock, input);
 }
 
 export interface UpdateSchedulePatch {
@@ -157,30 +170,41 @@ export const DEFAULT_SCHEDULES: Array<{
  * Idempotently seed the default schedules for a project. Returns the types it actually created, so
  * a backfill can say what it added; a type the project already has is left exactly as the operator
  * left it — same cron, same enabled — never re-created or re-armed.
+ *
+ * The read-then-insert runs in ONE synchronous transaction because idempotence here is only as good
+ * as its atomicity: `schedules` has no unique key on `(projectId, type)`, so two callers that
+ * interleave — the boot backfill re-entered by a dev hot-reload, or a second `startRunner()` — would
+ * each see the same missing types and insert them twice, and the scheduler would then enqueue every
+ * duplicated slot twice. No await inside means neither can interleave.
  */
 export async function seedDefaultSchedules(
   db: AntonDb,
   clock: Clock,
   projectId: string,
 ): Promise<ScheduledJobType[]> {
-  const rows = await db
-    .select({ type: schema.schedules.type })
-    .from(schema.schedules)
-    .where(eq(schema.schedules.projectId, projectId));
-  const existing = new Set(rows.map((r) => r.type));
+  return db.transaction((tx) => {
+    const existing = new Set(
+      tx
+        .select({ type: schema.schedules.type })
+        .from(schema.schedules)
+        .where(eq(schema.schedules.projectId, projectId))
+        .all()
+        .map((r) => r.type),
+    );
 
-  const created: ScheduledJobType[] = [];
-  for (const d of DEFAULT_SCHEDULES) {
-    if (existing.has(d.type)) continue;
-    await createSchedule(db, clock, {
-      projectId,
-      type: d.type,
-      cron: d.cron,
-      enabled: d.enabled,
-    });
-    created.push(d.type);
-  }
-  return created;
+    const created: ScheduledJobType[] = [];
+    for (const d of DEFAULT_SCHEDULES) {
+      if (existing.has(d.type)) continue;
+      insertSchedule(tx, clock, {
+        projectId,
+        type: d.type,
+        cron: d.cron,
+        enabled: d.enabled,
+      });
+      created.push(d.type);
+    }
+    return created;
+  });
 }
 
 /** What a backfill added for one project — empty entries are dropped, so this is a change log. */

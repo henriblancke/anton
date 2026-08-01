@@ -15,8 +15,9 @@ export const dynamic = "force-dynamic";
  * on one code path. Returns the remaining open escalations so the board panel re-renders from the
  * response instead of racing a refetch against the write.
  *
- * 409 covers both "already settled" (someone else clicked first) and "nothing to act on" (a finding
- * that names neither a bead nor a job) — in each case the request was valid but the state refuses it.
+ * 409 covers "already settled" (someone else clicked first), "nothing to act on" (a finding that
+ * names neither a bead nor a job), and "contested" (another machine is running the work now) — in
+ * each case the request was valid but the state refuses it.
  */
 export const POST = withProject<{ slug: string; escalationId: string }>(
   async (request, { project, params }) => {
@@ -60,4 +61,5 @@ const FAILURE_MESSAGES = {
   "not-found": "Escalation not found",
   "not-open": "This escalation has already been settled",
   "no-target": "This escalation names no ticket or job to act on",
+  contested: "Another machine has picked this work back up — it is running again, so nothing was changed",
 } as const;

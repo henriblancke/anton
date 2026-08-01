@@ -190,6 +190,20 @@ describe("Scheduler.tickOnce", () => {
     }
   });
 
+  it("seeds once when two boots race the backfill — the read and the inserts are one transaction", async () => {
+    // `startRunner()` backfills before its process-wide re-entry guard, so a dev hot-reload (or any
+    // second call) can enter this concurrently. There is no unique key on (projectId, type), so a
+    // read that yielded before its inserts would let both callers seed the same types and the
+    // scheduler would enqueue every duplicated slot twice.
+    await Promise.all([
+      backfillDefaultSchedules(tdb.db, clock),
+      backfillDefaultSchedules(tdb.db, clock),
+    ]);
+
+    const rows = tdb.db.select().from(schema.schedules).all();
+    expect(rows.length).toBe(DEFAULT_SCHEDULES.length);
+  });
+
   it("backfillDefaultSchedules gives an EXISTING project a newly-shipped schedule type", async () => {
     // The upgrade path: seeding runs only while inserting a project and no migration adds schedule
     // rows, so without this an installed project never gets a new automation — enabling run-health

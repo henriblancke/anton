@@ -4,7 +4,10 @@
  *
  * Both settle the escalation FIRST, with the status CAS in `settleEscalation` as the lock: whoever
  * flips `open → resolved` owns the decision, so a double-click (or two operators on one board)
- * cannot resume the same epic twice or abandon a bead that is already closing. The action then runs.
+ * cannot resume the same epic twice or abandon a bead that is already closing. That CAS is local,
+ * though, so a bead-backed verb re-reads the shared board's run-lease before it (see
+ * {@link contestedByLiveRun}) — the escalation is a frozen snapshot, and another machine may have
+ * picked the work up since. The action then runs.
  * If it fails, the escalation is already resolved but the stall is not — which is recoverable rather
  * than silent: the finding is still in the next run-health report, so the next unstick pass raises a
  * fresh escalation for it. That partial state is logged where an operator debugging the failure will
@@ -27,6 +30,7 @@
  */
 import { getDb } from "./db";
 import { abandonTicket } from "./abandon";
+import { beads } from "./beads/bd";
 import { getEscalation, settleEscalation, toEscalationView } from "./escalations";
 import { cancelJob, resumeJob, resumeStalledEpic } from "./jobs/service";
 import { getJob, systemClock } from "./jobs/queue";
@@ -47,8 +51,9 @@ export function isEscalationAction(value: unknown): value is EscalationAction {
  *   • `not-open`   — someone already settled it (409).
  *   • `no-target`  — the finding names neither a bead/epic nor a job, so there is nothing to resume
  *                    or abandon (409).
+ *   • `contested`  — another machine picked the work back up since the stall was raised (409).
  */
-export type EscalationActionFailure = "not-found" | "not-open" | "no-target";
+export type EscalationActionFailure = "not-found" | "not-open" | "no-target" | "contested";
 
 export type EscalationActionResult =
   | { ok: true; action: EscalationAction; escalation: EscalationView; detail: string }
@@ -89,6 +94,13 @@ export async function actOnEscalation(
   // alert that trains the operator to ignore the panel.
   if (!target && !view.jobId) return { ok: false, reason: "no-target" };
 
+  // The escalation froze the stall as the sweep saw it; a bead-backed verb is applied later, by
+  // hand. Re-check the cross-machine lease first — before the settle, so a refusal leaves the row
+  // on the panel for the next sweep to re-judge.
+  if (target && (await contestedByLiveRun(project, view, target))) {
+    return { ok: false, reason: "contested" };
+  }
+
   // Claim the decision before acting — see the module note: the CAS is the lock.
   if (!(await settleEscalation(db, systemClock, escalationId, resolutionOf(action)))) {
     return { ok: false, reason: "not-open" };
@@ -109,6 +121,46 @@ export async function actOnEscalation(
       e,
     );
     throw e;
+  }
+}
+
+/**
+ * Is the work this escalation names executing on ANOTHER machine right now? Jobs and runs are
+ * machine-local, so the run-lease on the epic bead is the only record that someone else picked the
+ * stall back up between the sweep raising it and a founder clicking. The unstick pass stands down on
+ * that lease before it escalates, but an already-open escalation outlives the pass: later sweeps
+ * hold the finding without resolving the row, so the stale button survives on the board. Applying it
+ * then resumes work already in flight — or, worse, abandons it, and `abandonTicket` reads only the
+ * bead's own status, so nothing downstream catches that.
+ *
+ * Pull before reading, like the runner's enqueue-time `liveRunCheck` and the unstick pass: the local
+ * Dolt working set trails the shared remote by a sync heartbeat. Same fail-open posture too — a pull
+ * that fails (offline, transient) falls back to the local snapshot rather than disabling the
+ * founder's only settling move, and any evidence it does hold still counts.
+ *
+ * The lease is published under the RUN id, so the stalled run's own leftover is ours, not a foreign
+ * holder; a finding with no run of its own (a dead lease) treats any live lease as foreign.
+ */
+async function contestedByLiveRun(
+  project: Project,
+  view: EscalationView,
+  target: string,
+): Promise<boolean> {
+  // Runs are keyed by epic, so that is where execute-epic publishes the lease; `target` is the epic
+  // already for a resume, and the fallback for a finding that named no epic at all.
+  const epicBeadId = view.epicBeadId ?? target;
+  try {
+    await beads.pull(project.repoPath).catch(() => {});
+    const bead = await beads.show(project.repoPath, epicBeadId);
+    const nowMs = systemClock.now();
+    return view.runId
+      ? beads.foreignRunLeaseLive(bead, nowMs, view.runId)
+      : beads.isRunLive(bead, nowMs);
+  } catch {
+    // bd is unreachable, or the bead is gone. Neither is evidence of a live run, and the verbs keep
+    // their own guards (abandonTicket 404s on a missing bead; a resumed epic re-parks on a foreign
+    // lease), so the panel stays usable rather than refusing every action bd can't answer for.
+    return false;
   }
 }
 
