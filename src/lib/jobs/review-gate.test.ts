@@ -70,15 +70,21 @@ function report(score: number, findings: Array<{ severity: string; location: str
 const BLOCKING = { severity: "blocking", location: "src/a.ts:4", note: "the loop is unbounded" };
 const ADVISORY = { severity: "advisory", location: "src/a.ts:9", note: "the name could be clearer" };
 
-/** A scripted claude: each reply is consumed in dispatch order; a thrown value is thrown as-is. */
-function fakeClaude(replies: Array<string | Error>) {
+/**
+ * A scripted claude: each reply is consumed in dispatch order. A string is a successful final
+ * message, an Error is thrown as-is, and a ClaudeResult is returned verbatim (how a failed dispatch
+ * that still returned looks).
+ */
+type ScriptedReply = string | Error | ClaudeResult;
+
+function fakeClaude(replies: ScriptedReply[]) {
   const calls: RunClaudeOptions[] = [];
   const run = async (options: RunClaudeOptions): Promise<ClaudeResult> => {
     calls.push(options);
     const next = replies[calls.length - 1];
     if (next === undefined) throw new Error(`unscripted claude dispatch #${calls.length}`);
     if (next instanceof Error) throw next;
-    return { ok: true, text: next };
+    return typeof next === "string" ? { ok: true, text: next } : next;
   };
   return { run, calls };
 }
@@ -119,9 +125,11 @@ afterEach(() => {
 /**
  * An in-memory stand-in for the worktree the read-only guard fingerprints. `mutateOn` names the
  * claude dispatches (1-based) after which the tree "changed" — how a reviewer that edits the code it
- * is judging looks to the gate.
+ * is judging looks to the gate. `commitOn` names the dispatches after which the agent COMMITTED its
+ * write: HEAD moves and the tree reads clean, which is the shape a later `settleBaseline` cannot
+ * tell from a settled worktree.
  */
-function fakeWorktree(mutateOn: number[] = [], initialStatus = "") {
+function fakeWorktree(mutateOn: number[] = [], initialStatus = "", commitOn: number[] = []) {
   const state = { head: "c0ffee", status: initialStatus };
   const restores: string[] = [];
   let dispatches = 0;
@@ -132,6 +140,10 @@ function fakeWorktree(mutateOn: number[] = [], initialStatus = "") {
     onDispatch: () => {
       dispatches += 1;
       if (mutateOn.includes(dispatches)) state.status = `?? reviewer-edit-${dispatches}.ts`;
+      if (commitOn.includes(dispatches)) {
+        state.head = `r0gue${dispatches}`;
+        state.status = "";
+      }
     },
     /** Mirrors `commitAll`: a committed fix advances HEAD and leaves the tree clean. */
     onCommit: () => {
@@ -150,7 +162,7 @@ function fakeWorktree(mutateOn: number[] = [], initialStatus = "") {
 
 /** Run the gate against the fake driver. `commits` scripts each fix session's commit verdict. */
 function gate(
-  replies: Array<string | Error>,
+  replies: ScriptedReply[],
   settings: ProjectSettings = {},
   commits: boolean[] = [],
   worktree = fakeWorktree(),
@@ -432,6 +444,51 @@ describe("runReviewGate — the review is read-only", () => {
 
     expect(out.outcome).toBe("clean");
     expect(out.rounds.map((r) => r.violation)).toEqual([undefined, undefined]);
+  });
+
+  it("reverts what a reviewer wrote before it died mid-dispatch", async () => {
+    // The guard runs on the success path only, so a review that throws would otherwise leave its
+    // edits behind for the runner's retry to inherit.
+    const worktree = fakeWorktree([1]);
+    const { result, restores } = gate([new UsageLimitError("Claude usage limit reached")], {}, [], worktree);
+
+    await expect(result).rejects.toBeInstanceOf(UsageLimitError);
+    expect(restores).toEqual(["?? reviewer-edit-1.ts"]);
+    expect(await worktree.readState()).toEqual({ head: "c0ffee", status: "" });
+  });
+
+  it("reverts a COMMIT a reviewer landed before reporting an error", async () => {
+    // The dangerous shape the dirty-tree guard can't catch on retry: a committed write reads as a
+    // clean tree, so `settleBaseline` would adopt it as the baseline and a later clean review would
+    // hand it to the PR unreviewed.
+    const worktree = fakeWorktree([], "", [1]);
+    const { result, restores } = gate([{ ok: false, text: "boom" }], {}, [], worktree);
+
+    await expect(result).rejects.toThrow(/claude reported an error reviewing anton-gate1/);
+    expect(restores).toHaveLength(1);
+    expect(await worktree.readState()).toEqual({ head: "c0ffee", status: "" });
+    expect(await sessionKinds()).toEqual([{ kind: "review", status: "failed", beadId: "anton-gate1" }]);
+  });
+
+  it("propagates the original failure when the revert itself fails", async () => {
+    // Backoff depends on the runner seeing UsageLimitError, not a git error from the cleanup.
+    const worktree = fakeWorktree([1]);
+    const { result } = gate([new UsageLimitError("Claude usage limit reached")], {}, [], {
+      ...worktree,
+      restoreState: async () => {
+        throw new Error("git reset --hard failed");
+      },
+    });
+
+    await expect(result).rejects.toBeInstanceOf(UsageLimitError);
+  });
+
+  it("leaves a failed review that wrote nothing alone — no pointless reset", async () => {
+    const worktree = fakeWorktree();
+    const { result, restores } = gate([new UsageLimitError("Claude usage limit reached")], {}, [], worktree);
+
+    await expect(result).rejects.toBeInstanceOf(UsageLimitError);
+    expect(restores).toEqual([]);
   });
 
   it("leaves a well-behaved reviewer alone — no restore, and the fix session may still write", async () => {

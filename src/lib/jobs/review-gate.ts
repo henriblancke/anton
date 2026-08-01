@@ -243,6 +243,10 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
  * then passing it. Its fix would be thrown away (the branch anton pushes is the reviewed HEAD) or,
  * worse, ride along uninspected in the next fix session's commit.
  *
+ * The revert runs on EVERY exit once the baseline is settled — a review that throws or reports an
+ * error is exactly as capable of having written first, and its leftovers would otherwise outlive it
+ * (see `discardReviewWrites`).
+ *
  * The diff and the prompt are read INSIDE the session, after the baseline is settled, so what the
  * reviewer is shown and what it can read on disk are the same tree.
  */
@@ -284,45 +288,58 @@ async function runReviewSession(args: {
       restoreState: args.restoreState,
     });
 
-    const diff = await args.readDiff(worktreePath, args.baseBranch);
-    const { prompt, reviewer } = await buildReviewPrompt({
-      target,
-      tickets,
-      diff,
-      settings,
-      projectDir: worktreePath,
-    });
-    await appendSessionLog(
-      logPath,
-      `[review] round ${round}/${maxRounds}: reviewing ${diff.files.length} changed file(s) as ` +
-        `${describeReviewer(reviewer)}\n`,
-    );
+    try {
+      const diff = await args.readDiff(worktreePath, args.baseBranch);
+      const { prompt, reviewer } = await buildReviewPrompt({
+        target,
+        tickets,
+        diff,
+        settings,
+        projectDir: worktreePath,
+      });
+      await appendSessionLog(
+        logPath,
+        `[review] round ${round}/${maxRounds}: reviewing ${diff.files.length} changed file(s) as ` +
+          `${describeReviewer(reviewer)}\n`,
+      );
 
-    const result = await claude({
-      cwd: worktreePath,
-      prompt,
-      model: settings.model,
-      permissionMode: settings.permissionMode ?? "bypassPermissions",
-      signal: ctx.signal,
-      onEvent,
-    });
-    if (!result.ok) {
-      throw new Error(`claude reported an error reviewing ${target.id}: ${result.text ?? "unknown"}`);
+      const result = await claude({
+        cwd: worktreePath,
+        prompt,
+        model: settings.model,
+        permissionMode: settings.permissionMode ?? "bypassPermissions",
+        signal: ctx.signal,
+        onEvent,
+      });
+      if (!result.ok) {
+        throw new Error(`claude reported an error reviewing ${target.id}: ${result.text ?? "unknown"}`);
+      }
+
+      const report = await enforceReadOnly({
+        report: parseReviewFindings(result.text),
+        worktreePath,
+        before,
+        logPath,
+        round,
+        maxRounds,
+        readState: args.readState,
+        restoreState: args.restoreState,
+      });
+      await appendSessionLog(logPath, `[review] round ${round}/${maxRounds}: ${describeReport(report)}\n`);
+      await endSession(db, clock, sessionId, "done");
+      return { sessionId, reviewer, report };
+    } catch (e) {
+      await discardReviewWrites({
+        worktreePath,
+        before,
+        logPath,
+        round,
+        maxRounds,
+        readState: args.readState,
+        restoreState: args.restoreState,
+      });
+      throw e;
     }
-
-    const report = await enforceReadOnly({
-      report: parseReviewFindings(result.text),
-      worktreePath,
-      before,
-      logPath,
-      round,
-      maxRounds,
-      readState: args.readState,
-      restoreState: args.restoreState,
-    });
-    await appendSessionLog(logPath, `[review] round ${round}/${maxRounds}: ${describeReport(report)}\n`);
-    await endSession(db, clock, sessionId, "done");
-    return { sessionId, reviewer, report };
   } catch (e) {
     await endSession(db, clock, sessionId, "failed");
     throw e; // propagate so the runner applies quota backoff / retry / park
@@ -396,6 +413,45 @@ async function enforceReadOnly(args: {
       `reverted to ${before.head.slice(0, 12)} and the review is rejected: a review is read-only\n`,
   );
   return { ok: false, violation: "worktree-modified", findings: report.findings };
+}
+
+/**
+ * The same revert, for the paths `enforceReadOnly` never reaches: the review threw (abort, quota) or
+ * reported an error. A reviewer that wrote before it died is no less of a problem than one that
+ * survived — worse, actually, because nothing rejects its round. Its leftovers would outlive the
+ * failure and the runner's retry re-enters this worktree, where `settleBaseline` reads a committed
+ * write as a settled tree, adopts it as the baseline, and a later clean review hands it to the PR.
+ *
+ * Best-effort by construction: a restore that itself fails must not replace the error the runner
+ * needs to see (UsageLimitError in particular drives backoff), so it is logged and swallowed.
+ */
+async function discardReviewWrites(args: {
+  worktreePath: string;
+  before: WorktreeState;
+  logPath: string;
+  round: number;
+  maxRounds: number;
+  readState: (worktreePath: string) => Promise<WorktreeState>;
+  restoreState: (worktreePath: string, state: WorktreeState) => Promise<void>;
+}): Promise<void> {
+  const { worktreePath, before, logPath, round, maxRounds } = args;
+
+  try {
+    const after = await args.readState(worktreePath);
+    if (after.head === before.head && after.status === before.status) return;
+
+    await args.restoreState(worktreePath, before);
+    await appendSessionLog(
+      logPath,
+      `[review] round ${round}/${maxRounds}: the review FAILED after writing to the worktree — its ` +
+        `changes were reverted to ${before.head.slice(0, 12)} so the next attempt cannot inherit them\n`,
+    );
+  } catch (e) {
+    await appendSessionLog(
+      logPath,
+      `[review] round ${round}/${maxRounds}: could not revert the failed review's changes: ${String(e)}\n`,
+    ).catch(() => {});
+  }
 }
 
 /**
