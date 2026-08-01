@@ -74,18 +74,20 @@ export interface ReviewerSource {
 export type ReviewProtocolViolation =
   | "no-report"
   | "invalid-score"
+  | "missing-rationale"
   | "malformed-findings"
   | "trailing-content"
   | "worktree-modified";
 
 /**
  * Outcome of parsing a review report. `ok: true` is a review that spoke the protocol — the score is
- * a validated integer 0-10 and the findings (possibly none, which is a legitimate clean review) are
- * actionable. `ok: false` is a protocol violation for the gate to park or retry on; any findings
- * salvaged from the block are carried along, never as evidence the run is clean.
+ * a validated integer 0-10, it comes with the rationale that justifies it, and the findings
+ * (possibly none, which is a legitimate clean review) are actionable. `ok: false` is a protocol
+ * violation for the gate to park or retry on; any findings salvaged from the block are carried
+ * along, never as evidence the run is clean.
  */
 export type ReviewReportResult =
-  | { ok: true; score: number; rationale?: string; findings: ReviewFinding[] }
+  | { ok: true; score: number; rationale: string; findings: ReviewFinding[] }
   | { ok: false; violation: ReviewProtocolViolation; findings: ReviewFinding[] };
 
 /** The run put in front of the reviewer: what it was supposed to do, and what it actually changed. */
@@ -461,19 +463,46 @@ function rulesBlock(run: ReviewRun): string[] {
 }
 
 /**
- * The instruction files as inlined text, under a shared character budget. Each file is capped, and
- * the budget is spent shallow-first ({@link instructionDirs} orders them), so a repo whose nested
- * files together dwarf the diff still shows the reviewer every rule that binds the widest surface.
- * A file the budget cuts short still appears, with `truncate`'s marker — silently dropping one would
- * read as "this scope has no rules" under the caveat below.
+ * The instruction files as inlined text, under a shared character budget. A file the budget cuts
+ * short still appears, with `truncate`'s marker — silently dropping one would read as "this scope
+ * has no rules" under the caveat below.
+ *
+ * Every file still to be rendered keeps an equal share of what is left, rather than the earlier
+ * files spending the budget to exhaustion: shallow-first order ({@link instructionDirs}) meant a
+ * large root file could leave a deep scope as a bare truncation marker, which is the same silent
+ * drop — the reviewer is told the inlined text is the only rulebook and has no `git` to recover the
+ * rest with. A file shorter than its share hands the surplus to the ones after it, so the common
+ * case (rules well inside the budget) still inlines every file whole.
  */
 function instructionBlocks(instructions: InstructionFile[]): string[] {
   let remaining = MAX_INSTRUCTIONS_TOTAL_CHARS;
-  return instructions.flatMap((f) => {
-    const text = truncate(f.text, Math.min(MAX_INSTRUCTIONS_CHARS, remaining));
+  let unrendered = instructions.length;
+  let cut = false;
+  const blocks = instructions.flatMap((f) => {
+    const share = Math.floor(remaining / unrendered);
+    const text = truncate(f.text, Math.min(MAX_INSTRUCTIONS_CHARS, share));
     remaining = Math.max(0, remaining - text.length);
+    unrendered -= 1;
+    cut ||= text !== f.text.trim();
     return [`### \`${f.path}\``, ``, text, ``];
   });
+  return [...blocks, ...truncatedRulesNote(cut)];
+}
+
+/**
+ * What a cut actually costs the reviewer, said out loud. Under the caveat that only the inlined text
+ * grades the run, an unremarked `… [truncated]` invites reading the rules that survived as the whole
+ * rulebook — so the gap becomes something to report rather than something to assume away.
+ */
+function truncatedRulesNote(cut: boolean): string[] {
+  if (!cut) return [];
+  return [
+    `A file above marked \`… [truncated]\` was cut for length: the rules past the cut are NOT in this`,
+    `prompt and nothing in this session can recover them. Do not read their absence as permission —`,
+    `judge what you can see, and report a scope you could not fully check as an advisory finding, so`,
+    `a human knows which rules went unverified.`,
+    ``,
+  ];
 }
 
 /**
@@ -567,6 +596,11 @@ function reportingFormatSection(): string[] {
     `on the anchored scale you were given. A report with no score, a non-integer, or one outside`,
     `0-10 is a protocol violation — anton cannot grade the run and the run is parked for a human.`,
     `Report the score even when you found nothing.`,
+    ``,
+    `\`rationale\` is MANDATORY with it: one line naming which Acceptance criteria are met, which are`,
+    `not, and which findings drove the number. A score with no rationale is not a review — it is the`,
+    `only part of the verdict a human reads on the board — so an absent, empty, or non-string`,
+    `\`rationale\` is a protocol violation and parks the run, exactly like a missing score.`,
     ``,
     `\`findings\` is MANDATORY too: an array, with every entry carrying a "blocking" or "advisory"`,
     `\`severity\` and a non-empty \`note\`. Anything else — a null, an object, one garbled entry — is a`,
@@ -684,9 +718,12 @@ function looksLikeReportText(raw: string): boolean {
  * final message with: the LAST fenced ```json block that looks like a report. Unrelated json
  * blocks (a config the reviewer quoted) are skipped, not treated as the report.
  *
- * Strict about BOTH halves of the verdict. A report that never came, whose score is missing,
- * non-integer or out of 0-10, or whose `findings` is anything but an array of usable findings,
- * returns `ok: false`. Findings are not salvaged into a verdict: `{"score":3,"findings":null}` and
+ * Strict about EVERY part of the verdict. A report that never came, whose score is missing,
+ * non-integer or out of 0-10, whose `findings` is anything but an array of usable findings, or that
+ * scores the run without the rationale the contract demands, returns `ok: false`. A bare number is
+ * not a review — the rationale is what names which Acceptance criteria drove it, and it is the only
+ * part of the verdict a human reads on the board — so it is required rather than discarded when
+ * absent. Findings are not salvaged into a verdict: `{"score":3,"findings":null}` and
  * a list with one garbled entry both look exactly like a report whose blocking finding got mangled,
  * and quietly reading them as "nothing blocking" is how an unreviewed run reaches a PR. Whatever
  * findings ARE readable ride along on the violation, as the reason a human is being asked.
@@ -734,12 +771,10 @@ export function parseReviewFindings(text: string | undefined): ReviewReportResul
     if (!entries || entries.some((f) => f === undefined)) {
       return { ok: false, violation: "malformed-findings", findings };
     }
-    return {
-      ok: true,
-      score,
-      ...(typeof rationale === "string" && rationale.trim() ? { rationale: rationale.trim() } : {}),
-      findings,
-    };
+    if (typeof rationale !== "string" || !rationale.trim()) {
+      return { ok: false, violation: "missing-rationale", findings };
+    }
+    return { ok: true, score, rationale: rationale.trim(), findings };
   }
   return { ok: false, violation: "no-report", findings: [] };
 }

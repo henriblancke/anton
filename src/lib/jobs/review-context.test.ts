@@ -226,6 +226,14 @@ describe("reviewContext", () => {
     expect(out).toContain("even if your instructions above describe a different format");
     expect(out).toContain('"severity":"blocking" | "advisory"');
   });
+
+  it("demands the score's rationale too, since the parser now refuses a bare number", () => {
+    // The skill states it, but a swapped reviewer never reads the skill — so the protocol the parser
+    // enforces has to be stated where every reviewer sees it.
+    const out = reviewContext({ target: epic, tickets: [ticket], diff });
+    expect(out).toContain("`rationale` is MANDATORY");
+    expect(out).toContain("which Acceptance criteria are met");
+  });
 });
 
 describe("buildReviewPrompt", () => {
@@ -396,6 +404,47 @@ describe("buildReviewPrompt", () => {
     expect(prompt).toContain("### `packages/p99/src/AGENTS.md`");
     expect(prompt).toContain("- The deepest scope has rules too.");
     expect(prompt).toContain("- Extensionless imports only.");
+  });
+
+  it("leaves every applicable scope some rules when the files together blow the budget", async () => {
+    // Spending the shared budget shallow-first to exhaustion rendered the later scopes as a heading
+    // and a bare truncation marker — indistinguishable, under the caveat that the inlined text is the
+    // only rulebook, from a scope with no rules, and unrecoverable since the reviewer has no `git`.
+    const filler = "- a rule long enough to matter.\n".repeat(400); // ~12k chars each
+    commitFile("CLAUDE.md", filler);
+    commitFile("src/AGENTS.md", filler);
+    commitFile("src/app/CLAUDE.md", filler);
+    commitFile("src/app/deep/AGENTS.md", "- The deepest scope still binds this diff.\n");
+
+    const { prompt } = await buildReviewPrompt({
+      target: epic,
+      tickets: [ticket],
+      diff: { files: ["src/app/deep/page.tsx"], patch: "+ const Page = () => null;\n", truncated: false },
+      settings: settings({ reviewPrompt: "OPERATOR CONTRACT." }),
+      projectDir,
+      baseRev: BASE,
+    });
+
+    expect(prompt).toContain("### `src/app/deep/AGENTS.md`");
+    expect(prompt).toContain("- The deepest scope still binds this diff.");
+    // And what the cut cost the shallow files is stated, not left to be inferred from a marker.
+    expect(prompt).toContain("… [truncated]");
+    expect(prompt).toContain("was cut for length");
+  });
+
+  it("says nothing about truncation when every rule file fits", async () => {
+    commitFile("CLAUDE.md", "- Extensionless imports only.\n");
+
+    const { prompt } = await buildReviewPrompt({
+      target: epic,
+      tickets: [ticket],
+      diff,
+      settings: settings({ reviewPrompt: "OPERATOR CONTRACT." }),
+      projectDir,
+      baseRev: BASE,
+    });
+
+    expect(prompt).not.toContain("was cut for length");
   });
 
   /**
@@ -584,38 +633,79 @@ describe("parseReviewFindings", () => {
   });
 
   it("accepts a clean review: a valid score with no findings", () => {
-    expect(parseReviewFindings(block('{"score":9,"findings":[]}'))).toEqual({
+    expect(parseReviewFindings(block('{"score":9,"rationale":"every criterion met","findings":[]}'))).toEqual({
       ok: true,
       score: 9,
+      rationale: "every criterion met",
       findings: [],
     });
     // Scores at both ends of the scale are valid.
-    expect(parseReviewFindings(block('{"score":0,"findings":[]}'))).toMatchObject({ ok: true, score: 0 });
-    expect(parseReviewFindings(block('{"score":10,"findings":[]}'))).toMatchObject({ ok: true, score: 10 });
+    expect(parseReviewFindings(block('{"score":0,"rationale":"AC-1 unmet","findings":[]}'))).toMatchObject({
+      ok: true,
+      score: 0,
+    });
+    expect(parseReviewFindings(block('{"score":10,"rationale":"all met","findings":[]}'))).toMatchObject({
+      ok: true,
+      score: 10,
+    });
+  });
+
+  it("rejects a score with no rationale, rather than accepting a bare number", () => {
+    // The contract makes the rationale half of the verdict: it names which Acceptance criteria drove
+    // the score, and it is what a human reads on the board. Silently dropping it would let a reviewer
+    // that never checked the criteria pass the run with a number.
+    for (const json of [
+      '{"score":9,"findings":[]}',
+      '{"score":9,"rationale":"","findings":[]}',
+      '{"score":9,"rationale":"   ","findings":[]}',
+      '{"score":9,"rationale":null,"findings":[]}',
+      '{"score":9,"rationale":7,"findings":[]}',
+    ]) {
+      expect(parseReviewFindings(block(json))).toEqual({
+        ok: false,
+        violation: "missing-rationale",
+        findings: [],
+      });
+    }
+  });
+
+  it("keeps the findings of a rationale-less report but still refuses to call it clean", () => {
+    const result = parseReviewFindings(
+      block('{"score":4,"findings":[{"severity":"blocking","location":"src/a.ts:9","note":"no test covers it"}]}'),
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      violation: "missing-rationale",
+      findings: [{ severity: "blocking", location: "src/a.ts:9", note: "no test covers it" }],
+    });
   });
 
   it("uses the LAST report block, not an earlier draft", () => {
     const text = [
       "```json",
-      '{"score":3,"findings":[{"severity":"blocking","location":"src/a.ts","note":"draft"}]}',
+      '{"score":3,"rationale":"draft verdict","findings":[{"severity":"blocking","location":"src/a.ts","note":"draft"}]}',
       "```",
       "after fixing my own mistake, the real report:",
       "```json",
-      '{"score":8,"findings":[{"severity":"advisory","location":"src/a.ts","note":"final"}]}',
+      '{"score":8,"rationale":"one nit left","findings":[{"severity":"advisory","location":"src/a.ts","note":"final"}]}',
       "```",
     ].join("\n");
 
     expect(parseReviewFindings(text)).toEqual({
       ok: true,
       score: 8,
+      rationale: "one nit left",
       findings: [{ severity: "advisory", location: "src/a.ts", note: "final" }],
     });
   });
 
   it("defaults a missing location — the only field a finding may omit", () => {
-    expect(parseReviewFindings(block('{"score":5,"findings":[{"severity":"advisory","note":"no location"}]}'))).toEqual({
+    const json = '{"score":5,"rationale":"AC met, one nit","findings":[{"severity":"advisory","note":"no location"}]}';
+    expect(parseReviewFindings(block(json))).toEqual({
       ok: true,
       score: 5,
+      rationale: "AC met, one nit",
       findings: [{ severity: "advisory", location: "(general)", note: "no location" }],
     });
   });
@@ -808,7 +898,7 @@ describe("parseReviewFindings", () => {
   });
 
   it("allows trailing whitespace after the report", () => {
-    expect(parseReviewFindings(`${block('{"score":9,"findings":[]}')}\n\n   \n`)).toMatchObject({
+    expect(parseReviewFindings(`${block('{"score":9,"rationale":"clean","findings":[]}')}\n\n   \n`)).toMatchObject({
       ok: true,
       score: 9,
     });

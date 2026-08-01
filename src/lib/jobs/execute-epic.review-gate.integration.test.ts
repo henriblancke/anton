@@ -420,6 +420,44 @@ console.error('gh boom: no PR may be opened on an unreadable review report');pro
     }
   });
 
+  it("parks when the reviewer scores without a rationale — a bare number is not a review", async () => {
+    // The contract makes the rationale the Acceptance-grounded half of the verdict. Accepting a
+    // number on its own would pass a run whose reviewer never said which criteria it checked, and
+    // leave the founder a score on the board with nothing behind it.
+    await setReviewEnabled(true);
+    script({ score: 9, findings: [] });
+    const targetId = await approvedTarget("Rationale-less report run");
+
+    const boomGh = writeBin(
+      binDir,
+      "gh-boom-rationale",
+      `const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='view'){process.exit(1);}
+console.error('gh boom: no PR may be opened on an unjustified score');process.exit(1);`,
+    );
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = boomGh;
+
+    const runner = makeEpicRunner(ctx);
+    let jobId: string;
+    try {
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
+
+      expect((await getJob(tdb.db, jobId))?.status).toBe("parked");
+      expect(dispatches()).toEqual(["implement", "review"]);
+
+      const target = await beads.show(repo, targetId);
+      expect(beads.getPrRef(target) ?? null).toBeNull();
+      expect(target.notes ?? "").toMatch(/score with no rationale/i);
+      expect(scoreComments(targetId)).toMatchObject([{ round: 1, verdict: "protocol-violation" }]);
+      // The 9 is not banked: anton cannot tell a graded run from an ungraded one without the reason.
+      expect((target.labels ?? []).some((l) => l.startsWith("review-score:"))).toBe(false);
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+      if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  });
+
   it("parks with the RIGHT reason when the reviewer signs off after its report block", async () => {
     // A clean-scoring block followed by prose that takes it back. The park note must name the
     // envelope — an operator told "never reported a valid score" would go hunting for a silent

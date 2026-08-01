@@ -48,7 +48,7 @@ export interface ReviewRound {
   reviewSessionId: string;
   /** The reviewer's validated 0-10 score; absent only on a protocol violation. */
   score?: number;
-  /** The reviewer's one-line justification of the score, when it gave one. */
+  /** The reviewer's one-line justification of the score — present whenever `score` is. */
   rationale?: string;
   /** Set instead of `score` when the report never came / carried an unusable score. */
   violation?: ReviewProtocolViolation;
@@ -267,7 +267,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       blocking: blocking.length,
       advisory: findings.length - blocking.length,
       ...(review.report.ok
-        ? { score: review.report.score, ...(review.report.rationale ? { rationale: review.report.rationale } : {}) }
+        ? { score: review.report.score, rationale: review.report.rationale }
         : { violation: review.report.violation }),
     };
     rounds.push(entry);
@@ -819,6 +819,6 @@ function describeReport(report: ReviewReportResult): string {
   const blocking = blockingFindings(report.findings).length;
   const counts = `${blocking} blocking, ${report.findings.length - blocking} advisory`;
   return report.ok
-    ? `score ${report.score}/10 — ${counts}${report.rationale ? ` — ${report.rationale}` : ""}`
+    ? `score ${report.score}/10 — ${counts} — ${report.rationale}`
     : `protocol violation (${report.violation}) — ${counts} salvaged`;
 }

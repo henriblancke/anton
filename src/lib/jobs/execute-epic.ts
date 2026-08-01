@@ -1440,6 +1440,8 @@ function reviewFailureReason(review: ReviewGateResult, blocking: ReviewFinding[]
       return `the reviewer modified the worktree it was judging`;
     case "malformed-findings":
       return `the reviewer's findings list was unreadable`;
+    case "missing-rationale":
+      return `the reviewer scored the run without justifying the score`;
     case "trailing-content":
       return `the reviewer appended text after its report block`;
     default:
@@ -1477,6 +1479,12 @@ function violationParkHead(review: ReviewGateResult, rounds: number): string {
         `anton: the pre-PR self-review reported an unreadable findings list after ${rounds} round(s) ` +
         `(${review.outcome}) — no PR was opened, because a report anton cannot parse may be hiding a ` +
         `blocking finding.`
+      );
+    case "missing-rationale":
+      return (
+        `anton: the pre-PR self-review reported a score with no rationale after ${rounds} round(s) ` +
+        `(${review.outcome}) — no PR was opened, because a bare number says nothing about which ` +
+        `Acceptance criteria were checked. Check that the reviewer emits a "rationale" with its score.`
       );
     case "trailing-content":
       return (
