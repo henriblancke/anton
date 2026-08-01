@@ -348,6 +348,65 @@ console.error('gh boom: no PR may be opened for an unresolved review');process.e
     }
   });
 
+  it("drafts a PR a previous attempt orphaned on the branch instead of parking it mergeable", async () => {
+    // The lost-ref window (anton-3apm): `gh pr create` lands server-side but its response — or the
+    // best-effort setPrRef after it — is lost, so this retry sees no PR ref, re-runs, and blocks on
+    // review. Parking blind would leave un-reviewed work mergeable at the founder's merge gate while
+    // anton reports no PR was opened. The gate must find that PR, draft it, and say so.
+    await setReviewEnabled(true);
+    script({
+      score: 2,
+      rationale: "acceptance not met",
+      findings: [{ severity: "blocking", location: "src/z.ts:1", note: "AC-1 is not implemented" }],
+    });
+    const targetId = await approvedTarget("Orphaned PR run");
+
+    const ghLog = join(sandbox, "gh-orphan-calls.jsonl");
+    const orphanGh = writeBin(
+      binDir,
+      "gh-orphan-review",
+      `const fs=require('fs');const a=process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(ghLog)},JSON.stringify(a)+'\\n');
+if(a[0]==='pr'&&a[1]==='view'){
+  process.stdout.write(JSON.stringify({url:'https://github.com/acme/repo/pull/77',number:77,state:'OPEN',isDraft:false})+'\\n');
+  process.exit(0);
+}
+if(a[0]==='pr'&&a[1]==='ready'){process.exit(0);}
+console.error('gh boom: no PR may be opened for an unresolved review');process.exit(1);`,
+    );
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = orphanGh;
+
+    const runner = makeEpicRunner(ctx);
+    let jobId: string;
+    try {
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
+      expect((await getJob(tdb.db, jobId))?.status).toBe("parked");
+
+      // The orphan was converted to a draft — `--undo` is what makes a PR non-mergeable again.
+      const calls = readFileSync(ghLog, "utf8")
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((l) => JSON.parse(l) as string[]);
+      expect(calls).toContainEqual(["pr", "ready", "77", "--undo"]);
+
+      // Run row and bead both name the PR instead of claiming none exists.
+      const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === targetId)!;
+      expect(run.status).toBe("parked");
+      expect(run.error).toContain("https://github.com/acme/repo/pull/77");
+      expect(run.error).toMatch(/converted to a DRAFT/);
+      const target = await beads.show(repo, targetId);
+      expect(target.notes ?? "").toContain("https://github.com/acme/repo/pull/77");
+      // Still NOT stamped as the epic's PR: a ref whose PR is open makes the next resume
+      // short-circuit as finished, retiring the epic with its blocking findings unaddressed.
+      expect(beads.getPrRef(target) ?? null).toBeNull();
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+      if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  });
+
   it("parks when the reviewer never reports — silence is not a clean review", async () => {
     await setReviewEnabled(true);
     script(null);

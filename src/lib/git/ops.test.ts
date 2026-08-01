@@ -20,7 +20,9 @@ import { join } from "node:path";
 import {
   DEFAULT_DIFF_PATCH_CHARS,
   diffAgainstBase,
+  findOpenPullRequest,
   listDirBlobsAtRev,
+  markPullRequestDraft,
   openPullRequest,
   pullRequestState,
   readFileAtRev,
@@ -86,16 +88,23 @@ const a=process.argv.slice(2);
 const read=()=>{try{return JSON.parse(fs.readFileSync(STATE,'utf8'));}catch{return{};}};
 const write=s=>fs.writeFileSync(STATE,JSON.stringify(s));
 const get=f=>{const i=a.indexOf(f);return i>=0?a[i+1]:undefined;};
+const branches=s=>Object.keys(s).filter(k=>k!=='__next');
 if(a[0]==='pr'&&a[1]==='create'){
   const branch=get('--head');const s=read();
   if(s[branch]){process.stderr.write('a pull request for branch already exists\\n');process.exit(1);}
-  const n=(s.__next||42);s[branch]={number:n,url:'https://github.com/acme/repo/pull/'+n,state:'OPEN'};s.__next=n+1;write(s);
+  const n=(s.__next||42);s[branch]={number:n,url:'https://github.com/acme/repo/pull/'+n,state:'OPEN',isDraft:false};s.__next=n+1;write(s);
   process.stdout.write(s[branch].url+'\\n');process.exit(0);
 }
 if(a[0]==='pr'&&a[1]==='view'){
   const branch=a[2];const s=read();const pr=s[branch];
   if(!pr){process.stderr.write('no pull requests found\\n');process.exit(1);}
   process.stdout.write(JSON.stringify(pr)+'\\n');process.exit(0);
+}
+if(a[0]==='pr'&&a[1]==='ready'){
+  const sel=a[2];const s=read();
+  const key=branches(s).find(k=>k===sel||String(s[k].number)===sel||s[k].url===sel);
+  if(!key){process.stderr.write('no pull requests found\\n');process.exit(1);}
+  s[key].isDraft=a.includes('--undo');write(s);process.exit(0);
 }
 process.exit(0);
 `,
@@ -129,6 +138,36 @@ process.exit(0);
     expect(second.number).toBe(42);
     expect(second.ref).toBe("gh-42");
     expect(second.url).toBe(first.url);
+  });
+
+  it("drafts an orphaned PR, then hands it back ready when the run re-reaches the PR step", async () => {
+    // The park→resume round trip (anton-3apm): a run that parks on its review gate drafts the PR it
+    // finds on the branch so un-reviewed work can't be merged, and the resumed run that passes the
+    // gate must leave a MERGEABLE PR behind — a draft that stays a draft is a stuck epic.
+    const opts = { repoPath: repo, branch: "anton/epic-1", base: "main", title: "Epic 1", body: "b" };
+    const opened = await openPullRequest(opts);
+    expect(opened.isDraft).toBe(false);
+
+    expect(await markPullRequestDraft(repo, opened.ref)).toBe(true);
+    expect(await findOpenPullRequest(repo, "anton/epic-1")).toMatchObject({
+      number: 42,
+      isDraft: true,
+    });
+
+    const resumed = await openPullRequest(opts);
+    expect(resumed.number).toBe(42);
+    expect(resumed.isDraft).toBe(false);
+    expect(await findOpenPullRequest(repo, "anton/epic-1")).toMatchObject({ isDraft: false });
+  });
+
+  it("reports a draft flip gh refused rather than assuming it landed", async () => {
+    // The caller says "still open, draft it by hand" on a false — so a silent true would be the lie.
+    expect(await markPullRequestDraft(repo, "gh-999")).toBe(false);
+    expect(await markPullRequestDraft(repo, "gh-")).toBe(false);
+  });
+
+  it("finds no PR for a branch that has none", async () => {
+    expect(await findOpenPullRequest(repo, "anton/never-opened")).toBeUndefined();
   });
 });
 

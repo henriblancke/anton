@@ -19,10 +19,13 @@ import { runClaude, type ClaudeEvent, type ClaudeResult } from "../claude/driver
 import { formatAntonResult, parseAntonResult } from "../claude/anton-result";
 import {
   commitAll,
+  findOpenPullRequest,
+  markPullRequestDraft,
   openPullRequest,
   pullRequestState,
   resolveFreshBase,
   worktreeHasCommitFor,
+  type PullRequest,
 } from "../git/ops";
 import { createWorktree, findWorktree, removeWorktree } from "../git/worktree";
 import { bundledAgentIds, discoverAgents } from "../agents-discovery";
@@ -933,14 +936,17 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           worktreePath: worktree.path,
           baseBranch: freshBase,
           assertLeaseHeld,
-        }).catch((e) => {
+        }).catch(async (e) => {
           // The gate parks for a human on more than a blocking verdict: an unrevertable reviewer
           // commit or a fixer that switched branches throws PoisonError from inside it. Those need
           // the SAME parked-run handling — the instruction on both is repair by hand, then resume —
           // so they are re-thrown as a gate block. Left as-is they marked the run `failed`, which
           // hides the row from findOpenRunForEpic, and the resume the human was told to do would
           // start a REPLACEMENT run instead of continuing this one and its session history.
-          throw isPoisonError(e) ? new ReviewBlockedError(e.message, { cause: e }) : e;
+          if (!isPoisonError(e)) throw e;
+          // Same park, same hazard as the blocking-verdict exit below: an orphaned PR left mergeable.
+          const orphan = await reconcileOrphanPullRequest(repo, worktree.branch);
+          throw new ReviewBlockedError(`${e.message}${orphanClause(orphan)}`, { cause: e });
         });
         // The score history belongs to the board, not this run's logs — written on BOTH exits, since
         // a run parked on blocking findings is exactly the one whose score the founder needs.
@@ -952,11 +958,12 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         // judging — is not a clean review). Both park for the founder like a no-delivery ticket does,
         // with the reason on the bead so the board shows why rather than only the run log.
         if (blocking.length > 0 || review.outcome === "protocol-violation") {
-          await safe(() => beads.note(repo, epicBeadId, reviewParkNote(review, blocking)));
+          const orphan = await reconcileOrphanPullRequest(repo, worktree.branch);
+          await safe(() => beads.note(repo, epicBeadId, reviewParkNote(review, blocking, orphan)));
           throw new ReviewBlockedError(
             `${epicBeadId} did not pass its pre-PR self-review (${review.outcome}): ` +
               `${reviewFailureReason(review, blocking)}. No PR opened — the findings are on the ` +
-              `bead; resolve them (or fix the ticket) and resume the run.`,
+              `bead; resolve them (or fix the ticket) and resume the run.${orphanClause(orphan)}`,
           );
         }
         // Advisory findings never park (anton-3apm): they ride along in the PR body so the founder
@@ -1462,18 +1469,64 @@ function reviewFailureReason(review: ReviewGateResult, blocking: ReviewFinding[]
   }
 }
 
+/** A PR already open on the run's branch that the board has no ref for, and whether we defused it. */
+interface OrphanPullRequest {
+  pr: PullRequest;
+  drafted: boolean;
+}
+
+/**
+ * Defuse a PR a PREVIOUS attempt opened on this branch that never made it onto the bead (anton-3apm).
+ *
+ * `gh pr create` can succeed server-side with its response — or the best-effort `setPrRef` after it —
+ * lost, so a retry finds no PR ref, re-runs, and reaches this gate with a live PR nobody tracks. Park
+ * without touching it and un-reviewed work stays mergeable at the founder's merge gate while anton
+ * reports no PR was opened: a false green of exactly the kind this gate exists to prevent. Converting
+ * it to a draft keeps the PR (number, threads, body) while making it unmergeable until a resumed run
+ * passes the gate and `openPullRequest` readies it again.
+ *
+ * The ref is deliberately NOT stamped onto the bead here: step 0a treats a ref whose PR is OPEN as
+ * proof another run finished the epic, so recording it would make the next resume short-circuit as
+ * done — retiring the epic with its blocking findings unaddressed.
+ */
+async function reconcileOrphanPullRequest(
+  repoPath: string,
+  branch: string,
+): Promise<OrphanPullRequest | undefined> {
+  const pr = await findOpenPullRequest(repoPath, branch);
+  if (!pr) return undefined;
+  return { pr, drafted: pr.isDraft === true || (await markPullRequestDraft(repoPath, pr.ref)) };
+}
+
+/** What became of an orphan PR, appended to the park message — empty when the branch had none. */
+function orphanClause(orphan: OrphanPullRequest | undefined): string {
+  if (!orphan) return "";
+  return orphan.drafted
+    ? ` A PR an earlier attempt had already opened (${orphan.pr.url}) was converted to a DRAFT so ` +
+        `this un-reviewed work can't be merged; it returns to ready when the gate passes.`
+    : ` WARNING: a PR an earlier attempt had already opened (${orphan.pr.url}) is still open and ` +
+        `could NOT be converted to a draft — draft or close it by hand so this un-reviewed work ` +
+        `isn't merged.`;
+}
+
 /** The park reason on the target bead: what the reviewer refused to pass, in its own words. */
-function reviewParkNote(review: ReviewGateResult, blocking: ReviewFinding[]): string {
+function reviewParkNote(
+  review: ReviewGateResult,
+  blocking: ReviewFinding[],
+  orphan?: OrphanPullRequest,
+): string {
   const rounds = review.rounds.length;
   const head =
     blocking.length > 0
       ? `anton: the pre-PR self-review left ${blocking.length} blocking finding(s) unresolved after ` +
         `${rounds} round(s) (${review.outcome}) — no PR was opened:`
       : violationParkHead(review, rounds);
+  const orphanLine = orphanClause(orphan).trim();
   return [
     head,
     ...findingLines(blocking),
     ``,
+    ...(orphanLine ? [orphanLine, ``] : []),
     `Resolve them (or correct the ticket), then resume the run.`,
   ].join("\n");
 }

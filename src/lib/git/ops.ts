@@ -172,6 +172,13 @@ function resolveSymlinkTarget(linkPath: string, target: string): string | undefi
 }
 
 /**
+ * Directories per `ls-tree` call. The command line is the bound: a diff touching thousands of
+ * directories would otherwise hand the kernel an argument list past `ARG_MAX` and fail outright,
+ * which for the review gate would silently mean "this project states no rules".
+ */
+const LS_TREE_BATCH = 500;
+
+/**
  * Repo-relative paths of the FILES sitting directly in each of `dirs` as of `rev` — one tree read
  * per batch, so a caller can discover which of a set of files exist across many directories without
  * spawning a probe per candidate path.
@@ -207,13 +214,6 @@ export async function listDirBlobsAtRev(
       .filter((path): path is string => path !== undefined),
   );
 }
-
-/**
- * Directories per `ls-tree` call. The command line is the bound: a diff touching thousands of
- * directories would otherwise hand the kernel an argument list past `ARG_MAX` and fail outright,
- * which for the review gate would silently mean "this project states no rules".
- */
-const LS_TREE_BATCH = 500;
 
 /**
  * The commit a branch forked from `base`, pinned as a SHA — or `base` itself when no merge base
@@ -592,20 +592,30 @@ export interface PullRequest {
   /** beads external-ref form: `gh-<number>` when the number is parseable, else the url. */
   ref: string;
   number?: number;
+  /** Whether GitHub reports the PR as a draft — see {@link markPullRequestDraft}. */
+  isDraft?: boolean;
 }
 
 function prFromUrl(url: string): PullRequest {
   const m = url.match(/\/pull\/(\d+)/);
   const number = m ? Number(m[1]) : undefined;
-  return { url, ref: number ? `gh-${number}` : url, number };
+  // `gh pr create` is called without `--draft`, so a PR parsed out of its output is ready to merge.
+  return { url, ref: number ? `gh-${number}` : url, number, isDraft: false };
 }
 
 /**
  * Return the open PR already tracking `branch`, or undefined if there is none. Idempotency guard
  * for openPullRequest: a resumed execute-epic run re-reaches the PR step against a branch whose PR
  * already exists (the first run opened it), and `gh pr create` would otherwise error.
+ *
+ * Also how a run RECONCILES a PR the board lost (anton-3apm): `gh pr create` can land server-side
+ * with its response — or the follow-up `setPrRef` — lost, leaving a live PR no bead ref points at.
+ * The branch is the only surviving handle on it, so it's the one this looks up by.
+ *
+ * Best-effort: any gh failure reads as "no PR", since the callers' fallbacks (create one / report
+ * none) are what an absent PR calls for anyway.
  */
-async function findOpenPullRequest(
+export async function findOpenPullRequest(
   repoPath: string,
   branch: string,
 ): Promise<PullRequest | undefined> {
@@ -613,17 +623,62 @@ async function findOpenPullRequest(
   try {
     const { stdout } = await execFileAsync(
       gh,
-      ["pr", "view", branch, "--json", "url,number,state"],
+      ["pr", "view", branch, "--json", "url,number,state,isDraft"],
       { cwd: repoPath, timeout: 120_000, maxBuffer: 4 * 1024 * 1024 },
     );
-    const pr = JSON.parse(stdout) as { url?: string; number?: number; state?: string };
+    const pr = JSON.parse(stdout) as {
+      url?: string;
+      number?: number;
+      state?: string;
+      isDraft?: boolean;
+    };
     // `gh pr view <branch>` resolves the PR for that head branch; only reuse an OPEN one.
     if (!pr?.url || (pr.state && pr.state !== "OPEN")) return undefined;
-    return { url: pr.url, ref: pr.number ? `gh-${pr.number}` : pr.url, number: pr.number };
+    return {
+      url: pr.url,
+      ref: pr.number ? `gh-${pr.number}` : pr.url,
+      number: pr.number,
+      isDraft: pr.isDraft === true,
+    };
   } catch {
     // No PR for the branch (gh exits non-zero) → nothing to reuse.
     return undefined;
   }
+}
+
+/** `gh pr ready [--undo]`, best-effort — returns whether GitHub confirmed the flip. */
+async function setPullRequestDraft(
+  repoPath: string,
+  selector: string,
+  draft: boolean,
+): Promise<boolean> {
+  const gh = process.env[GH_BIN_ENV] ?? "gh";
+  // gh takes a number, url, or branch as the selector; the beads `gh-<n>` form is neither.
+  const target = selector.startsWith("gh-") ? selector.slice(3) : selector;
+  if (!target) return false;
+  try {
+    await execFileAsync(gh, ["pr", "ready", target, ...(draft ? ["--undo"] : [])], {
+      cwd: repoPath,
+      timeout: 120_000,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Convert a PR to a draft. Returns whether GitHub confirmed it, so a caller can say so rather than
+ * assume it (a failure here leaves the PR mergeable, which is the thing worth reporting).
+ *
+ * How the review gate defuses a PR the board lost (anton-3apm): a run that parks on blocking
+ * findings must not leave un-reviewed work sitting mergeable at the founder's merge gate — the exact
+ * state the gate exists to prevent. Draft rather than close, so the PR keeps its number, body, and
+ * review threads and {@link openPullRequest} can hand it back ready once the gate passes.
+ */
+export async function markPullRequestDraft(repoPath: string, selector: string): Promise<boolean> {
+  return setPullRequestDraft(repoPath, selector, true);
 }
 
 /** Lifecycle state of a GitHub PR, plus `unknown` when it can't be read (no remote/gh error). */
@@ -670,7 +725,9 @@ export async function pullRequestState(
  *
  * Idempotent: if an open PR already tracks the branch (a resumed run that re-reaches this step),
  * the branch is still pushed (to carry any new commits) and the existing PR is reused instead of
- * calling `gh pr create`, which would error on a duplicate.
+ * calling `gh pr create`, which would error on a duplicate. A reused PR is taken OUT of draft:
+ * reaching this step means the run's self-review passed, so a PR an earlier parked attempt drafted
+ * (see {@link markPullRequestDraft}) must become mergeable again or the epic finishes un-mergeable.
  */
 export async function openPullRequest(opts: {
   repoPath: string;
@@ -687,7 +744,13 @@ export async function openPullRequest(opts: {
   await pushBranch(opts.repoPath, opts.branch);
 
   const existing = await findOpenPullRequest(opts.repoPath, opts.branch);
-  if (existing) return existing;
+  if (existing) {
+    if (!existing.isDraft) return existing;
+    // Report what actually happened: a flip gh refused leaves a draft PR the founder must ready by
+    // hand, and the work is on the branch either way — not worth failing the run over.
+    const ready = await setPullRequestDraft(opts.repoPath, existing.ref, false);
+    return { ...existing, isDraft: !ready };
+  }
 
   const gh = process.env[GH_BIN_ENV] ?? "gh";
   const { stdout } = await execFileAsync(
