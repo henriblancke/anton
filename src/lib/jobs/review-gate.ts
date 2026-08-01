@@ -258,7 +258,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
  *
  * The revert runs on EVERY exit once the baseline is settled — a review that throws or reports an
  * error is exactly as capable of having written first, and its leftovers would otherwise outlive it
- * (see `discardReviewWrites`).
+ * (see `discardSessionWrites`).
  *
  * The diff and the prompt are read INSIDE the session, after the baseline is settled, so what the
  * reviewer is shown and what it can read on disk are the same tree.
@@ -309,6 +309,9 @@ async function runReviewSession(args: {
         diff,
         settings,
         projectDir: worktreePath,
+        // The same base the diff is taken from: everything the reviewer is handed comes from a
+        // revision this run's own diff could not have written.
+        baseRev: args.baseBranch,
       });
       await appendSessionLog(
         logPath,

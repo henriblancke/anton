@@ -20,6 +20,23 @@ async function git(cwd: string, args: string[]): Promise<string> {
 }
 
 /**
+ * Read one file as of `rev` (trimmed), or undefined when it doesn't exist there — or when `rev`
+ * itself doesn't resolve, which is the same answer for the callers: nothing trustworthy to read.
+ *
+ * For files the working tree must not be trusted to supply. `git show` serves the committed blob, so
+ * a run that added or rewrote the path on its own branch cannot change what comes back.
+ */
+export async function readFileAtRev(
+  worktreePath: string,
+  rev: string,
+  path: string,
+): Promise<string | undefined> {
+  // `--` disambiguates a path that also parses as a revision; a missing file and a bad rev both exit
+  // non-zero, and neither is an error here.
+  return git(worktreePath, ["show", `${rev}:${path}`, "--"]).catch(() => undefined);
+}
+
+/**
  * Stage everything in the worktree and commit. Returns `{ committed: false }` when there is
  * nothing to commit (claude made no changes) — the caller decides whether that's acceptable.
  */

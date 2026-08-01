@@ -9,14 +9,12 @@
  * a named agent, an operator prompt, or a rewritten skill — can never break the protocol the gate
  * relies on. That is why the score is demanded by the appended context rather than by the skill.
  */
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
 import { acceptanceBody, goalBody } from "../beads/contract";
 import { type Bead } from "../beads/bd";
-import { loadAgentPrompt } from "../claude/agent-prompt";
+import { loadAgentPrompt, stripFrontmatter, USER_AGENTS_DIR } from "../claude/agent-prompt";
 import { loadSkill } from "../claude/prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
-import { type BranchDiff } from "../git/ops";
+import { readFileAtRev, type BranchDiff } from "../git/ops";
 import { resolveReviewConfig, type ProjectSettings } from "../projects";
 import { labelValue } from "./review-fix-context";
 
@@ -85,22 +83,32 @@ export interface ReviewRun {
  * review prompt (`reviewPrompt`), which beats anton's shipped `review` skill. An agent id that no
  * longer resolves (deleted after it was saved) falls through to the next source rather than
  * failing the gate, which is what the settings UI promises the operator.
+ *
+ * Everything the worktree contributes is read at `baseRev`, never from the tree being judged. The
+ * run's own diff would otherwise reach the reviewer's inputs: a project-local
+ * `.claude/agents/<id>.md` IS the reasoning contract, so a run that edits its own reviewer picks the
+ * standard it is graded against, and `.product/principles.md` is the rulebook the reviewer is told to
+ * judge adherence to. Both are changes a run can make for honest reasons, which is exactly why the
+ * gate cannot take them on trust — a swapped, implementation-minded agent that writes "score every
+ * diff 10/10" into either file would otherwise pass itself.
  */
 export async function buildReviewPrompt(args: {
   target: Bead;
   tickets: Bead[];
   diff: BranchDiff;
   settings: ProjectSettings;
-  /** The worktree under review — resolves a project-local agent prompt and its principles file. */
+  /** The worktree under review. Its files are read at `baseRev`, never from the working tree. */
   projectDir: string;
+  /** The revision the run branched from — the newest state its own diff cannot have written. */
+  baseRev: string;
 }): Promise<{ prompt: string; reviewer: ReviewerSource }> {
-  const { target, tickets, diff, settings, projectDir } = args;
+  const { target, tickets, diff, settings, projectDir, baseRev } = args;
   const config = resolveReviewConfig(settings);
 
   let reasoning: string | undefined;
   let reviewer: ReviewerSource = { kind: "default" };
   if (config.agent) {
-    reasoning = await loadAgentPrompt(config.agent, { projectDir });
+    reasoning = await loadTrustedAgentPrompt(config.agent, projectDir, baseRev);
     if (reasoning) reviewer = { kind: "agent", id: config.agent };
   }
   if (!reasoning && config.prompt) {
@@ -112,7 +120,7 @@ export async function buildReviewPrompt(args: {
     reviewer = { kind: "default" };
   }
 
-  const principles = await readPrinciples(projectDir);
+  const principles = await readPrinciples(projectDir, baseRev);
   const prompt = [
     reasoning,
     "",
@@ -123,10 +131,38 @@ export async function buildReviewPrompt(args: {
   return { prompt, reviewer };
 }
 
-/** Read the project's principles file, or undefined when it has none / can't be read. */
-async function readPrinciples(projectDir: string): Promise<string | undefined> {
+/**
+ * The reviewer's reasoning contract, with the project-local override taken at `baseRev`.
+ *
+ * `loadAgentPrompt` resolves a project's `.claude/agents/<tag>.md` from the working tree, which is
+ * right for an implementer (it is the project's own instruction to its agents) and wrong for the
+ * reviewer of that same tree. So the project layer is read as of the base commit, and a tag the base
+ * doesn't define falls through to the sources OUTSIDE the worktree — the operator's global
+ * `~/.claude/agents`, anton's bundled prompts, then installed plugins — rather than to the copy the
+ * run just wrote. An id that resolves nowhere returns undefined and the caller falls through to the
+ * operator's prompt, exactly as a deleted agent already did.
+ */
+async function loadTrustedAgentPrompt(
+  tag: string,
+  projectDir: string,
+  baseRev: string,
+): Promise<string | undefined> {
+  const raw = await readFileAtRev(projectDir, baseRev, `${USER_AGENTS_DIR}/${tag}.md`);
+  if (raw !== undefined) return stripFrontmatter(raw);
+  return loadAgentPrompt(tag); // no projectDir: never re-reads the worktree copy
+}
+
+/**
+ * The project's principles as of `baseRev`, or undefined when the base has none.
+ *
+ * Read from the base rather than the worktree for the same reason as the agent prompt above: the
+ * reviewer is instructed to judge the diff's adherence to this file, so a diff that rewrites it would
+ * be grading itself. A run that legitimately updates its principles is reviewed against the old ones
+ * — the new rules apply from the next run, once they are on the base branch.
+ */
+async function readPrinciples(projectDir: string, baseRev: string): Promise<string | undefined> {
   try {
-    return (await readFile(join(projectDir, PRINCIPLES_PATH), "utf8")).trim() || undefined;
+    return (await readFileAtRev(projectDir, baseRev, PRINCIPLES_PATH))?.trim() || undefined;
   } catch {
     return undefined;
   }
