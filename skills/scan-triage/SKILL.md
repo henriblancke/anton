@@ -65,10 +65,12 @@ it runs but drops off the roadmap. Whenever an epic owns the surface, small work
 `feature`** — a parentless `task`/`bug` is reserved for §4.3, where no epic honestly holds it.
 
 **Never grow a run that has started.** A run captures its ticket list when it begins, so a ticket
-attached to a feature that is already claimed, approved, implementing, in review, or carrying a PR
-ref is never implemented — and merge finalization closes it as delivered anyway. Only extend a
-feature this triage created, or one still open with no `approved` / `stage:*` label and no PR ref
-(`bd show <feature-id>` before you link). Anything else gets its own run target.
+attached to a feature that is already approved, implementing, in review, or carrying a PR ref is
+never implemented — and merge finalization closes it as delivered anyway. Only extend a feature
+this triage created, or one still open with no `approved` / `stage:*` label and no PR ref
+(`bd show <feature-id>` before you link). An assignee alone is not a disqualifier — a human claim
+reserves a feature without approving it, so no run has captured its tickets yet. Anything else gets
+its own run target.
 
 Respect `.product/config.yaml` `stringer.max_beads_per_scan` — if triage exceeds it, keep the
 highest-severity and defer the rest (they resurface next scan). Security is exempt from the cap.
@@ -83,6 +85,17 @@ either place the feature, or surface it in §6 for the founder to place.
    might be the right home; `--limit 0` because the default 50 would hide the matching epic and mint
    a duplicate). Match on `area:` first — the product surface the signal's files sit on — then
    on theme. Debt in the auth module belongs under whatever outcome already owns auth.
+   Then confirm the match is **safe to attach to** — `bd children <epic-id>`:
+   - **Pre-tier epic** (direct `task`/`bug`/`chore` children, no `feature` child): that epic is
+     itself a run target, and the first feature you hang under it turns it into a container — its
+     own tickets then ride on no run at all, and a run already approved or in flight on it is
+     refused at its next gate. Don't attach. File the work per §4.3 and note under `needs-an-epic:`
+     that the epic's legacy tickets need moving under a feature first; that migration is a human's
+     call, not triage's.
+   - **Closed epic**: reopen it (`bd reopen <epic-id> --reason 'new work from stringer triage'`)
+     before linking. Attaching a feature does not reopen its parent, and a closed epic with open
+     features under it reads as a delivered outcome on the roadmap while its features sit in the
+     backlog. If you can't justify reopening it, it isn't the right home.
 2. **Nothing fits, but you can name the outcome → create the epic.** State it as an outcome a
    stakeholder would recognise ("Dependencies are current and CVE-free"), not a restatement of the
    feature ("Upgrade stale deps"). Give it exactly one `area:` label and Success Criteria that

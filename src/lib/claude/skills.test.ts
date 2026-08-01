@@ -152,6 +152,16 @@ describe("required skill assets", () => {
       expect(scanTriage).toMatch(/Match on `area:` first/);
     });
 
+    it("scan-triage screens a reused epic for legacy tickets and a closed status", () => {
+      // Attaching a feature to a pre-tier epic flips it to a container (beads.isContainer), so its
+      // direct tickets land under no card (boardCards.cardOf → undefined) and any run on it is
+      // 422'd; and linking a feature never reopens its parent, so buildRoadmap keeps reporting a
+      // closed epic as a delivered outcome.
+      expect(scanTriage).toMatch(/safe to attach to\*\* — `bd children <epic-id>`/);
+      expect(scanTriage).toMatch(/turns it into a container/);
+      expect(scanTriage).toMatch(/bd reopen <epic-id>/);
+    });
+
     it("scan-triage hangs child tickets off the feature, never off the epic", () => {
       expect(scanTriage).toMatch(/hang off the feature, never off the epic/);
     });
@@ -171,6 +181,10 @@ describe("required skill assets", () => {
       expect(scanTriage).toMatch(/Never grow a run that has started/);
       expect(scanTriage).toMatch(/a feature \*this triage just created\*/);
       expect(scanTriage).toMatch(/no `approved` \/ `stage:\*` label and no PR ref/);
+      // A human claim only sets an assignee (the claim route never enqueues a run), so the prose
+      // must not name it as a disqualifier the actionable check doesn't test.
+      expect(scanTriage).not.toMatch(/already claimed, approved/);
+      expect(scanTriage).toMatch(/An assignee alone is not a disqualifier/);
     });
 
     it("scan-triage surfaces an unattachable cluster instead of orphaning it", () => {
