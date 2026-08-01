@@ -120,6 +120,12 @@ export interface UnstickContext {
    * resume that depends on it stands down (see {@link leaseStandDown}).
    */
   boardFresh: boolean;
+  /**
+   * The project's dead-lease grace, in ms — the same one `detectDeadLeases` applies past expiry. The
+   * re-check has to re-apply it, or it would be strictly weaker than the detector that raised the
+   * finding and would resume inside the window the grace exists to protect.
+   */
+  deadLeaseGraceMs: number;
   /** When this epic's quota window reopens (ms epoch), or undefined when nothing recorded one. */
   usageWindowEndsAt: (epicBeadId: string) => number | undefined;
   /**
@@ -264,7 +270,8 @@ export function classifyFinding(
       // lease at all had it cleared — the owning run settled and swept its own label — so there is no
       // dead run to revive, and re-enqueuing would start fresh work nobody asked for. The report is a
       // candidate list, so the predicate that raised it has to still hold against the pulled bead.
-      if (beads.runLeaseExpiry(bead) === undefined) {
+      const expiry = beads.runLeaseExpiry(bead);
+      if (expiry === undefined) {
         return hold("the run-lease has since been cleared");
       }
       // A lease that is live NOW belongs to a machine that picked the work back up after the sweep
@@ -272,6 +279,14 @@ export function classifyFinding(
       // prevent. That is a foreign holder, so this pass stands down entirely.
       const contested = leaseStandDown(ctx, bead.id);
       if (contested) return contested;
+      // Presence alone is a weaker bar than the detector's `expiry + grace <= now`, and the grace is
+      // the whole allowance for a refresh that ran late or a clock that skews. A lease that lapsed
+      // moments ago — a REPLACEMENT one, taken after the sweep by a machine now missing a heartbeat —
+      // reads as uncontested above while its ticket may still be executing. Wait out the same window
+      // the detector would have.
+      if (expiry + ctx.deadLeaseGraceMs > ctx.nowMs) {
+        return hold("the run-lease expired inside the dead-lease grace window");
+      }
       return {
         disposition: "resume",
         why: "the run-lease expired with no foreign holder",
@@ -290,6 +305,15 @@ export function classifyFinding(
         : hold("the PR has since merged, closed, or been picked back up");
 
     case "exhausted-job":
+      // Same closed-epic rule as the parked-run path, and for the same loop: an abandon closes the
+      // bead FIRST and only then cancels the job, so a failed cancel leaves a parked job under a
+      // closed epic. Re-escalating that offers an "abandon" whose `abandonTicket` now throws on the
+      // closed bead, settling the escalation without settling the job — forever. Only an
+      // execute-epic finding carries an epic bead id; the job-only kinds skip this and settle
+      // through `actOnJob`.
+      if (ctx.boardFresh && finding.beadId && ctx.board.get(finding.beadId)?.status === "closed") {
+        return hold("the epic has since closed");
+      }
       return ctx.stillStuck(finding)
         ? escalate(finding.reason)
         : hold("the job has since been resumed or settled");
@@ -427,11 +451,15 @@ export async function unstickPass(
     );
   });
 
-  const [board, activeEpicKeys, parkedRunRows] = await Promise.all([
+  // The thresholds come from the project's own settings so every re-check below applies the SAME bar
+  // the sweep did — a re-check on a different bar is a second, undeclared policy.
+  const [board, activeEpicKeys, parkedRunRows, settings] = await Promise.all([
     beads.list(repoPath, ["--status", "all"]),
     activeExecuteEpicKeys(db),
     listRunsByStatus(db, projectId, ["parked"]),
+    getProjectSettings(db, projectId),
   ]);
+  const thresholds = resolveRunHealthThresholds(settings);
 
   // One job read per epic at most, memoized: several findings can point at the same epic. The row
   // answers both job-side questions — when the quota window reopens, and whether it was cancelled.
@@ -445,6 +473,7 @@ export async function unstickPass(
     parkedRuns: new Map(parkedRunRows.map((r) => [r.id, r])),
     board: new Map(board.map((b) => [b.id, b])),
     boardFresh,
+    deadLeaseGraceMs: thresholds.deadLeaseMinutes * 60_000,
     usageWindowEndsAt: (epicBeadId) => usageWindowEnd(latestJobs.get(epicBeadId)),
     epicCancelled: (epicBeadId) => latestJobs.get(epicBeadId)?.status === "cancelled",
     // Absent → the finding was never re-checked (a kind that judges itself off the context), so the
@@ -468,10 +497,7 @@ export async function unstickPass(
     if (finding.kind === "dead-lease" && finding.beadId) await primeLatestJob(finding.beadId);
   }
 
-  // Same reason, one gh/job read per stale-pr / exhausted-job finding. The thresholds come from the
-  // project's own settings so the re-check applies the SAME bar the sweep did.
-  const settings = await getProjectSettings(db, projectId);
-  const thresholds = resolveRunHealthThresholds(settings);
+  // Same reason, one gh/job read per stale-pr / exhausted-job finding.
   for (const finding of report.findings) {
     if (finding.kind === "stale-pr") {
       stillStuck.set(

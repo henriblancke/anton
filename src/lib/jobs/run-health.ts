@@ -281,6 +281,12 @@ export function makeRunHealthHandler(deps: RunHealthDeps): JobHandler {
       ),
     );
 
+    // The report is upserted per project, so saving a partial sweep REPLACES the last good one with
+    // something indistinguishable from a clean bill of health. Nothing above is guaranteed to notice
+    // a cancel — `heartbeat` doesn't inspect the signal, the board and db reads aren't abortable, and
+    // the PR loop only re-throws an abort that surfaced as a rejected `gh` call — so the write is
+    // gated here explicitly. A cancelled sweep must leave the previous report standing.
+    ctx.signal.throwIfAborted();
     await saveRunHealthReport(db, clock, { projectId, jobId: ctx.jobId, findings });
   };
 }

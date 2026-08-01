@@ -16,6 +16,8 @@ import { classifyFinding, escalationNote, usageWindowEnd, type UnstickContext } 
 
 const NOW = 1_700_000_000_000;
 const HOUR = 3_600_000;
+/** The dead-lease grace the sweep applied past expiry — the re-check must apply the same one. */
+const GRACE = 30 * 60_000;
 
 function secDate(ms: number): Date {
   return new Date(Math.floor(ms / 1000) * 1000);
@@ -67,6 +69,7 @@ function ctx(o: Partial<UnstickContext> = {}): UnstickContext {
     parkedRuns: new Map([["r-1", run()]]),
     board: new Map<string, Bead>(),
     boardFresh: true,
+    deadLeaseGraceMs: GRACE,
     usageWindowEndsAt: () => undefined,
     epicCancelled: () => false,
     stillStuck: () => true,
@@ -238,6 +241,20 @@ describe("classifyFinding — dead leases", () => {
     expect(verdict.why).toContain("cleared");
   });
 
+  it("HOLDS a lease that expired inside the grace window — the sweep would not have raised it", () => {
+    // The bead carries a REPLACEMENT lease: another machine took the work after the sweep and its
+    // refresh is a minute late (or its clock skews). Presence alone is a weaker bar than the
+    // detector's `expiry + grace <= now`, and resuming here double-runs a ticket still executing.
+    const verdict = classifyFinding(deadLease, withBoard(leased(NOW - GRACE / 2)));
+    expect(verdict.disposition).toBe("hold");
+    expect(verdict.why).toContain("grace");
+  });
+
+  it("resumes once the grace has elapsed — the same bar the detector used", () => {
+    const verdict = classifyFinding(deadLease, withBoard(leased(NOW - GRACE - 1)));
+    expect(verdict.disposition).toBe("resume");
+  });
+
   it("never touches a bead a live job already owns", () => {
     const verdict = classifyFinding(
       deadLease,
@@ -318,6 +335,35 @@ describe("classifyFinding — the never-automatic kinds", () => {
     );
     expect(verdict.disposition).toBe("hold");
     expect(verdict.why).toContain("resumed");
+  });
+
+  it("HOLDS an exhausted job whose epic has since closed — re-escalating it can never settle", () => {
+    // An abandon closes the bead first and cancels the job second, so a failed cancel leaves the job
+    // parked under a closed epic. Escalating it again offers an "abandon" that now throws on the
+    // closed bead — settling the escalation while the job stays exactly as it was, every sweep.
+    const verdict = classifyFinding(
+      finding({ kind: "exhausted-job", key: "exhausted-job:j-1", jobId: "j-1" }),
+      ctx({ board: new Map([["e-1", bead("e-1", { status: "closed" })]]) }),
+    );
+    expect(verdict.disposition).toBe("hold");
+    expect(verdict.why).toContain("closed");
+  });
+
+  it("still escalates a closed-epic exhausted job when the board could not be pulled", () => {
+    const verdict = classifyFinding(
+      finding({ kind: "exhausted-job", key: "exhausted-job:j-1", jobId: "j-1" }),
+      ctx({ boardFresh: false, board: new Map([["e-1", bead("e-1", { status: "closed" })]]) }),
+    );
+    expect(verdict.disposition).toBe("escalate");
+  });
+
+  it("escalates a job-only exhausted finding — no bead id means no epic to be closed", () => {
+    // sync-push / run-health / unstick jobs strand no bead, so the guard above must not swallow them.
+    const verdict = classifyFinding(
+      finding({ kind: "exhausted-job", key: "exhausted-job:j-1", jobId: "j-1", beadId: undefined }),
+      ctx({ board: new Map([["e-1", bead("e-1", { status: "closed" })]]) }),
+    );
+    expect(verdict.disposition).toBe("escalate");
   });
 });
 

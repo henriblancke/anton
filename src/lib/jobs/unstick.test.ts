@@ -640,6 +640,21 @@ describe("non-resumable parks produce exactly one escalation and no enqueue", ()
     expect(escalationRows()).toEqual([]);
   });
 
+  it("holds an exhausted-job finding whose epic has since been abandoned", async () => {
+    // An abandon closes the bead BEFORE cancelling the job, so a cancel that fails leaves the job
+    // parked under a closed epic. Escalating it again offers an abandon whose `abandonTicket` now
+    // throws on the closed bead — settling the escalation without settling the job, every sweep.
+    seedJob("j-9", { status: "parked", attempts: 3, lastError: "failed 3×: tests failed" });
+    listMock.mockResolvedValue([
+      { id: "e-9", title: "e-9", status: "closed", issue_type: "epic", labels: [] },
+    ]);
+    await seedExhaustedJobReport("j-9");
+
+    expect(await sweep()).toMatchObject({ findings: 1, escalated: 0, held: 1 });
+    expect(escalationRows()).toEqual([]);
+    expect(noteMock).not.toHaveBeenCalled();
+  });
+
   it("escalates a job still parked out of attempts, and a poison park that never retried", async () => {
     seedJob("j-9", { status: "parked", attempts: 3, lastError: "failed 3×: tests failed" });
     seedJob("j-10", { status: "parked", attempts: 1, lastError: "poison: agent 'x' is disabled" });

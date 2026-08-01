@@ -232,6 +232,37 @@ describeBd("run-health e2e (real handler · real bd)", () => {
     expect(await getRunHealthReport(tdb.db, projectId)).toBeUndefined();
   });
 
+  it("saves NO report when its job is cancelled after the last PR read succeeds", async () => {
+    // The PR-loop's abort re-throw only fires on a REJECTED read. A cancel that lands between the
+    // final successful read and the write (or during the un-abortable board/db reads) reaches the
+    // save with nothing to stop it — and since the report is upserted per project, it would replace
+    // the last good one with a partial sweep that reads as a clean bill of health.
+    await sweep();
+    const before = await getRunHealthReport(tdb.db, projectId);
+
+    let jobId = "";
+    const runner = makeJobRunner({
+      db: tdb.db,
+      clock,
+      type: "run-health",
+      handler: (deps) =>
+        makeRunHealthHandler({
+          ...deps,
+          readPrActivity: async () => {
+            await runner.cancel(jobId);
+            return stalePr; // resolves fine — the abort never surfaces as a read failure
+          },
+        }),
+    });
+
+    jobId = await runner.enqueue({ type: "run-health", projectId, payload: { projectId } });
+    expect(await runner.tickOnce()).toBe(1);
+    await runner.whenIdle();
+
+    expect((await getJob(tdb.db, jobId))?.status).toBe("cancelled");
+    expect(await getRunHealthReport(tdb.db, projectId)).toEqual(before);
+  });
+
   it("is idempotent — a second sweep over unchanged state stores the identical report", async () => {
     await sweep();
     const first = await getRunHealthReport(tdb.db, projectId);
