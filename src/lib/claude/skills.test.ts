@@ -189,6 +189,15 @@ describe("required skill assets", () => {
       expect(scanTriage).toMatch(/An assignee alone is not a disqualifier/);
     });
 
+    it("scan-triage refuses to hand a childless feature its first child", () => {
+      // beads.groupsChildren is `feature && children.length > 0`: the first child flips the feature
+      // from running its own Acceptance to running only its children, so the feature's spec never
+      // reaches the agent and merge closes it on a PR containing just the cleanup.
+      expect(scanTriage).toMatch(/Never give a childless feature its first child/);
+      expect(scanTriage).toMatch(/already\*\* has\s+working-layer children/);
+      expect(scanTriage).toMatch(/this triage just created\* that\s+already carries child tickets/);
+    });
+
     it("scan-triage surfaces an unattachable cluster instead of orphaning it", () => {
       // No user to ask on the 03:00 cron — the report is how the run asks (§4.3 → §6).
       expect(scanTriage).toMatch(/never mint a one-feature epic/i);

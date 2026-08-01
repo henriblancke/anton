@@ -55,14 +55,20 @@ the three tiers, the nesting rule, and the run-target rule.
   deps" with a child ticket per package; a single bump is that same feature with no children.
 - **Risk/hygiene/docs — mostly drop or cluster.** Lottery risk, high-churn, doc drift → a
   bead only if actionable and worth a human's PR review. Merge-conflict markers / large
-  binaries → one cleanup bead: a child ticket only on a feature *this triage just created*,
-  otherwise its own run target — a `feature` under the epic that owns the surface, or a parentless
-  `task` (the §4.3 fallback). Never file a standalone one as a `chore` — a parentless `chore` isn't
-  a run target, so it would sit on the board unexecuted.
+  binaries → one cleanup bead: a child ticket only on a feature *this triage just created* that
+  already carries child tickets, otherwise its own run target — a `feature` under the epic that owns
+  the surface, or a parentless `task` (the §4.3 fallback). Never file a standalone one as a `chore` —
+  a parentless `chore` isn't a run target, so it would sit on the board unexecuted.
 
 **A bare ticket is never how you file small work.** Parented to an epic it's a dead bead; parentless
 it runs but drops off the roadmap. Whenever an epic owns the surface, small work is a **childless
 `feature`** — a parentless `task`/`bug` is reserved for §4.3, where no epic honestly holds it.
+
+**Never give a childless feature its first child.** A childless feature runs *itself* as its one
+ticket, off its own Acceptance. The moment a ticket hangs under it the run works the children
+instead — the feature's spec is never sent to the agent, and merge closes it as delivered on a PR
+containing only that child. So a cleanup ticket only ever joins a feature that **already** has
+working-layer children; anything else gets its own run target.
 
 **Never grow a run that has started.** A run captures its ticket list when it begins, so a ticket
 attached to a feature that is already approved, implementing, in review, or carrying a PR ref is
