@@ -48,6 +48,7 @@ import {
   setSessionClaudeId,
   startJobSession,
 } from "../sessions";
+import { describeScoreRegression, formatScoreSeries } from "./review-alarm";
 import { findingLines, type ReviewFinding } from "./review-context";
 import {
   blockingFindings,
@@ -1213,11 +1214,16 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           await persistReviewScores(repo, epicBeadId, review);
 
           const blocking = blockingFindings(review.unresolved);
-          // Two states must not become a PR: blocking findings the converge loop couldn't clear, and a
+          // Three states must not become a PR: blocking findings the converge loop couldn't clear, a
           // reviewer that broke the report protocol (silence — or a review that edited the code it was
-          // judging — is not a clean review). Both park for the founder like a no-delivery ticket does,
-          // with the reason on the bead so the board shows why rather than only the run log.
-          if (blocking.length > 0 || review.outcome === "protocol-violation") {
+          // judging — is not a clean review), and a score regression the alarm stopped the loop on
+          // (anton-i98r). All three park for the founder like a no-delivery ticket does, with the
+          // reason on the bead so the board shows why rather than only the run log.
+          if (
+            blocking.length > 0 ||
+            review.outcome === "protocol-violation" ||
+            review.outcome === "score-regression"
+          ) {
             const orphan = await reconcileOrphanPullRequest(repo, worktree.branch);
             // The advisories go on the bead with them: this run opens no PR, so its body — their only
             // other home — never exists, and the resumed run starts its review with an empty carry.
@@ -1918,6 +1924,15 @@ class ReviewBlockedError extends Error {
  * bead and the run log say the same thing.
  */
 function reviewFailureReason(review: ReviewGateResult, blocking: ReviewFinding[]): string {
+  // Ahead of the blocking count: the alarm is why the loop STOPPED where it did, and a founder
+  // reading one sentence in the escalation panel needs the trend, not this round's finding tally.
+  // The series rides along here because the run row is the only copy when the bd note fails.
+  if (review.regression) {
+    return (
+      `${describeScoreRegression(review.regression)} — ${formatScoreSeries(review.rounds)}` +
+      (blocking.length > 0 ? `, with ${blocking.length} blocking finding(s) still open` : ``)
+    );
+  }
   if (blocking.length > 0) return `${blocking.length} blocking finding(s) survived the gate`;
   switch (finalViolation(review)) {
     case "worktree-modified":
@@ -2029,6 +2044,10 @@ export function reviewParkMessage(args: {
  * the resumed run re-reviews from scratch with an empty carry, so an advisory the next reviewer
  * doesn't happen to restate would vanish between the review that found it and the merge gate it was
  * meant to reach. The score comment records their count, never their text.
+ *
+ * A run parked by the score-regression alarm (anton-i98r) leads with the SERIES instead: each round's
+ * comment carries its own score, but nobody deciding rework-vs-accept should have to reassemble the
+ * trend from a comment thread to see what the alarm saw.
  */
 function reviewParkNote(
   review: ReviewGateResult,
@@ -2037,8 +2056,15 @@ function reviewParkNote(
   orphan?: OrphanPullRequest,
 ): string {
   const rounds = review.rounds.length;
-  const head =
-    blocking.length > 0
+  const head = review.regression
+    ? // The series is the finding here: no single round failed, the trend did — so it leads, and the
+      // blocking findings (if any) are listed beneath it as the detail they now are.
+      `anton: the pre-PR self-review stopped on a score regression — ` +
+      `${describeScoreRegression(review.regression)}. ` +
+      `Score series: ${formatScoreSeries(review.rounds)}. No PR was opened; this needs your call, not ` +
+      `another fix round.` +
+      (blocking.length > 0 ? `\n\nStill open at that point:` : ``)
+    : blocking.length > 0
       ? `anton: the pre-PR self-review left ${blocking.length} blocking finding(s) unresolved after ` +
         `${rounds} round(s) (${review.outcome}) — no PR was opened:`
       : violationParkHead(review, rounds);
@@ -2057,10 +2083,14 @@ function reviewParkNote(
       : []),
     ...(orphanLine ? [orphanLine, ``] : []),
     // A protocol violation lists no findings, so there is no "them" to resolve — the head already
-    // named the one thing to fix.
-    blocking.length > 0
-      ? `Resolve them (or correct the ticket), then resume the run.`
-      : `Correct the issue above, then resume the run.`,
+    // named the one thing to fix. A regression names no single fault at all: what it asks for is a
+    // decision about the work, which is the whole point of escalating instead of grinding.
+    review.regression
+      ? `Decide what this run needs — rework the ticket, split it, or accept the work as it stands — ` +
+        `then resume the run.`
+      : blocking.length > 0
+        ? `Resolve them (or correct the ticket), then resume the run.`
+        : `Correct the issue above, then resume the run.`,
   ].join("\n");
 }
 

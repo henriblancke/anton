@@ -339,6 +339,43 @@ describe("settings route — self-review settings (anton-of1m)", () => {
     expect("reviewMaxRounds" in persisted()).toBe(false);
   });
 
+  it("PATCH persists the score-alarm thresholds, including 0 as the off switch (anton-i98r)", async () => {
+    const res = await PATCH(patchReq({ reviewMinScore: 7, reviewLowScoreRounds: 3 }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings).toMatchObject({ reviewMinScore: 7, reviewLowScoreRounds: 3 });
+
+    // 0 is a VALUE here, not a clear: it is how the operator turns the alarm off, so it must persist.
+    const off = await PATCH(patchReq({ reviewMinScore: 0 }), ctx("tmp"));
+    expect((await off.json()).settings.reviewMinScore).toBe(0);
+    expect(persisted().reviewMinScore).toBe(0);
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings).toMatchObject({ reviewMinScore: 0, reviewLowScoreRounds: 3 });
+  });
+
+  it("PATCH rejects out-of-range score-alarm thresholds", async () => {
+    for (const bad of [11, -1, 4.5, "low"]) {
+      const res = await PATCH(patchReq({ reviewMinScore: bad }), ctx("tmp"));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/reviewMinScore/);
+    }
+    for (const bad of [0, 6, 1.5]) {
+      const res = await PATCH(patchReq({ reviewLowScoreRounds: bad }), ctx("tmp"));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/reviewLowScoreRounds/);
+    }
+    expect("reviewMinScore" in persisted()).toBe(false);
+    expect("reviewLowScoreRounds" in persisted()).toBe(false);
+  });
+
+  it('PATCH null clears the score-alarm thresholds back to their defaults (keys removed)', async () => {
+    await PATCH(patchReq({ reviewMinScore: 8, reviewLowScoreRounds: 4 }), ctx("tmp"));
+    const res = await PATCH(patchReq({ reviewMinScore: null, reviewLowScoreRounds: null }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect("reviewMinScore" in persisted()).toBe(false);
+    expect("reviewLowScoreRounds" in persisted()).toBe(false);
+  });
+
   it("round-trips the whole review block in one PATCH, alongside the agents allowlist", async () => {
     const res = await PATCH(
       patchReq({

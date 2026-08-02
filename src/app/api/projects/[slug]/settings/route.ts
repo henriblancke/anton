@@ -4,7 +4,9 @@ import {
   CONCURRENCY_RANGE,
   JOB_TIMEOUT_MINUTES_RANGE,
   MAX_RETRIES_RANGE,
+  REVIEW_LOW_SCORE_ROUNDS_RANGE,
   REVIEW_MAX_ROUNDS_RANGE,
+  REVIEW_MIN_SCORE_RANGE,
   budgetPolicySchema,
   formulaVariantsSchema,
   runHealthThresholdsSchema,
@@ -47,15 +49,25 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
   const patch: Partial<ProjectSettings> = {};
 
   // Numeric job-policy fields: null / "" clears to the default; a concrete value must be an
-  // integer within range. Shared handling so all four behave identically.
+  // integer within range. Shared handling so all of them behave identically.
   const numericFields: {
-    key: "concurrency" | "jobTimeoutMinutes" | "maxRetries" | "reviewMaxRounds";
+    key:
+      | "concurrency"
+      | "jobTimeoutMinutes"
+      | "maxRetries"
+      | "reviewMaxRounds"
+      | "reviewMinScore"
+      | "reviewLowScoreRounds";
     range: { min: number; max: number };
   }[] = [
     { key: "concurrency", range: CONCURRENCY_RANGE },
     { key: "jobTimeoutMinutes", range: JOB_TIMEOUT_MINUTES_RANGE },
     { key: "maxRetries", range: MAX_RETRIES_RANGE },
     { key: "reviewMaxRounds", range: REVIEW_MAX_ROUNDS_RANGE },
+    // 0 is a real value here, not a clear: it is how the operator turns the score-regression alarm
+    // off (anton-i98r). `null` / "" still clears back to the default threshold.
+    { key: "reviewMinScore", range: REVIEW_MIN_SCORE_RANGE },
+    { key: "reviewLowScoreRounds", range: REVIEW_LOW_SCORE_ROUNDS_RANGE },
   ];
   for (const { key, range } of numericFields) {
     if (!(key in body)) continue;
