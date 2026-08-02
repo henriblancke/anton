@@ -23,7 +23,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, beforeAll, expect, it } from "vitest";
-import { describeBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
+import { describeBd, makeBdRepo, makeFileDb, type BdRepo, type FileDb } from "@/lib/testing/integration";
 import { beads, type Bead } from "./beads/bd";
 import { loadAllIssues } from "./beads/issues";
 import { resetIssueSnapshots } from "./beads/snapshot";
@@ -61,6 +61,7 @@ const PROBE_FORMULA = {
 
 describeBd("gate + molecule beads are never work (real pour)", () => {
   let bdRepo: BdRepo;
+  let fileDb: FileDb;
   let repo: string;
   let project: Project;
 
@@ -89,6 +90,9 @@ describeBd("gate + molecule beads are never work (real pour)", () => {
   };
 
   beforeAll(async () => {
+    // getBoard also reads the project's hygiene report (anton-uwal); point it at a temp, migrated
+    // anton.db so the suite never touches (or creates) the developer's real one.
+    fileDb = makeFileDb();
     bdRepo = makeBdRepo();
     repo = bdRepo.repo;
     project = {
@@ -139,7 +143,10 @@ describeBd("gate + molecule beads are never work (real pour)", () => {
       .map((t) => t.id);
   });
 
-  afterAll(() => bdRepo.cleanup());
+  afterAll(() => {
+    bdRepo.cleanup();
+    fileDb.cleanup();
+  });
 
   it("pours the shape this suite depends on: a molecule root with typed steps AND gate children", () => {
     // If bd ever stops pouring gates, every assertion below would pass vacuously — so pin the shape

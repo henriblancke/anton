@@ -21,7 +21,7 @@ export async function GET(
     // A stale TTL or completed sync starts one background comparison. Unchanged data keeps the
     // same version and therefore never causes a full board download.
     probeAllIssues(project.repoPath);
-    const currentVersion = getBoardVersion(project.repoPath);
+    const currentVersion = await getBoardVersion(project);
     if (knownVersion === currentVersion) {
       return new NextResponse(null, { status: 304 });
     }

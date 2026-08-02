@@ -8,14 +8,15 @@
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const project = { slug: "tmp", repoPath: "/tmp/p1" };
+const project = { id: "p1", slug: "tmp", repoPath: "/tmp/p1" };
 
 vi.mock("../resolve-project", () => ({
   resolveProject: vi.fn(async () => ({ project })),
 }));
 
 const getBoard = vi.fn(async () => ({ projectSlug: "tmp", version: "2:sync" }));
-const getBoardVersion = vi.fn(() => "2:sync");
+// Async since anton-uwal: the token now carries the hygiene report's version, which is a db read.
+const getBoardVersion = vi.fn(async () => "2:sync");
 vi.mock("@/lib/board", () => ({ getBoard, getBoardVersion }));
 
 const probeAllIssues = vi.fn();

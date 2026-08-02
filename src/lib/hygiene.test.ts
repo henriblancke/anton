@@ -14,7 +14,9 @@ import {
   countFindings,
   getHygieneReport,
   getHygieneReportForJob,
+  getHygieneVersion,
   listHygieneReports,
+  NO_HYGIENE_REPORT,
   saveHygieneReport,
   sortFindings,
   summarizeReport,
@@ -137,6 +139,48 @@ describe("hygiene report store", () => {
 
   it("has no latest report before the first patrol — patrolled ≠ never patrolled", async () => {
     expect(await getHygieneReport(t.db, projectId)).toBeUndefined();
+  });
+});
+
+describe("hygiene version (the board's refresh token, anton-uwal)", () => {
+  it("names the latest report and moves when a new patrol lands", async () => {
+    // The board poll 304s on an unchanged token, so a patrol that didn't move it would stay
+    // invisible until some unrelated write happened to change the token.
+    expect(await getHygieneVersion(t.db, projectId)).toBe(NO_HYGIENE_REPORT);
+
+    const first = await saveHygieneReport(t.db, clock, {
+      projectId,
+      actions: { closedEpics: [], rowsRecomputed: 0 },
+      findings: [],
+    });
+    expect(await getHygieneVersion(t.db, projectId)).toBe(first);
+
+    // Same second as the first patrol: the token must still move, so a fast follow-up isn't lost.
+    const second = await saveHygieneReport(t.db, clock, {
+      projectId,
+      actions: { closedEpics: [], rowsRecomputed: 0 },
+      findings: [finding("lint", "t-1")],
+    });
+    expect(second).not.toBe(first);
+    expect(await getHygieneVersion(t.db, projectId)).toBe(second);
+  });
+
+  it("is scoped per project — another project's patrol never invalidates this board", async () => {
+    const other = randomUUID();
+    await t.db.insert(schema.projects).values({
+      id: other,
+      slug: "other",
+      name: "other",
+      repoPath: "/tmp/other",
+      defaultBranch: "main",
+    });
+    await saveHygieneReport(t.db, clock, {
+      projectId: other,
+      actions: { closedEpics: [], rowsRecomputed: 0 },
+      findings: [],
+    });
+
+    expect(await getHygieneVersion(t.db, projectId)).toBe(NO_HYGIENE_REPORT);
   });
 });
 

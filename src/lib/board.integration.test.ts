@@ -4,17 +4,21 @@
  * parent-child grouping. Skipped when `bd`/`git` aren't installed.
  */
 import { afterAll, beforeAll, expect, it } from "vitest";
-import { describeBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
+import { describeBd, makeBdRepo, makeFileDb, type BdRepo, type FileDb } from "@/lib/testing/integration";
 import { beads } from "./beads/bd";
 import { getBoard } from "./board";
 import type { Epic, Project } from "./types";
 
 describeBd("board integration (real bd)", () => {
   let bdRepo: BdRepo;
+  let fileDb: FileDb;
   let repo: string;
   let project: Project;
 
   beforeAll(() => {
+    // getBoard also reads the project's hygiene report (anton-uwal); point it at a temp, migrated
+    // anton.db so the suite never touches (or creates) the developer's real one.
+    fileDb = makeFileDb();
     bdRepo = makeBdRepo();
     repo = bdRepo.repo;
     project = {
@@ -25,6 +29,7 @@ describeBd("board integration (real bd)", () => {
 
   afterAll(() => {
     bdRepo.cleanup();
+    fileDb.cleanup();
   });
 
   const find = (epics: Record<string, Epic[]>, id: string) =>

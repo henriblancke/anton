@@ -274,3 +274,34 @@ export async function listHygieneReports(
 export function latestHygieneReport(projectId: string): Promise<HygieneReport | undefined> {
   return getHygieneReport(getDb(), projectId);
 }
+
+/** The refresh-token contribution of a project that has never been patrolled. */
+export const NO_HYGIENE_REPORT = "none";
+
+/**
+ * A report's identity for the board's refresh token (anton-uwal). Report rows are append-only — a
+ * patrol writes a new row and never rewrites an old one — so the row id IS the version: it changes
+ * exactly when there is something new to show, which is what keeps the board's poll 304-friendly.
+ */
+export function hygieneVersion(report: Pick<HygieneReport, "id"> | undefined): string {
+  return report?.id ?? NO_HYGIENE_REPORT;
+}
+
+/**
+ * The latest report's version without paying to read (or parse) its findings blob — this runs on
+ * every board poll, where the answer is almost always "unchanged, 304".
+ */
+export async function getHygieneVersion(db: AntonDb, projectId: string): Promise<string> {
+  const rows = await db
+    .select({ id: schema.hygieneReports.id })
+    .from(schema.hygieneReports)
+    .where(eq(schema.hygieneReports.projectId, projectId))
+    .orderBy(desc(schema.hygieneReports.generatedAt), NEWEST_FIRST)
+    .limit(1);
+  return hygieneVersion(rows[0]);
+}
+
+/** UI read path over the shared anton.db. */
+export function latestHygieneVersion(projectId: string): Promise<string> {
+  return getHygieneVersion(getDb(), projectId);
+}

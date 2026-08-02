@@ -4,12 +4,23 @@
  */
 import type { ContractStatus } from "./beads/contract";
 import type { TicketNote } from "./beads/notes";
+import type { HygieneReport } from "./hygiene";
 
 export type { TicketNote };
 
 // The bead contract, re-exported so client surfaces read its shape without importing the validator
 // module itself. Type-only, so nothing of lib/beads reaches the browser bundle.
 export type { ContractSeverity, ContractStatus, ContractViolation } from "./beads/contract";
+
+// The gardener's report shape, re-exported for the same reason: the board panel renders it, and a
+// value import of lib/hygiene would drag drizzle + better-sqlite3 into the browser bundle.
+export type {
+  HygieneActions,
+  HygieneCounts,
+  HygieneFinding,
+  HygieneFindingKind,
+  HygieneReport,
+} from "./hygiene";
 
 export type Stage = "backlog" | "implementing" | "in-review" | "done";
 export const STAGES: Stage[] = ["backlog", "implementing", "in-review", "done"];
@@ -165,6 +176,12 @@ export interface Board {
   standalone: Record<Stage, StandaloneItem[]>;
   /** Sync health for this project's beads workspace. */
   sync: SyncStatusView;
+  /**
+   * The latest gardener patrol report (anton-uwal) — absent until a project's first patrol, which
+   * is a different claim from "patrolled, board is clean" (an empty report). Rides in the board
+   * payload so it refreshes on the same 304-friendly poll as the cards.
+   */
+  hygiene?: HygieneReport;
 }
 
 // ── Roadmap page ──

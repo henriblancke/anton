@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bead } from "./beads/bd";
 import { STAGES } from "./types";
-import type { Project } from "./types";
+import type { HygieneReport, Project } from "./types";
 
 const listMock = vi.fn();
 
@@ -16,13 +16,28 @@ vi.mock("./beads/bd", async () => {
   };
 });
 
-const { deriveStage, getBoard } = await import("./board");
+// The board folds the gardener's latest report (and its version) into its payload and freshness
+// token. Stubbed at the module seam so these tests need no anton.db; `hygieneReport` is what the
+// project has been patrolled with, and every test but the hygiene ones runs un-patrolled.
+let hygieneReport: HygieneReport | undefined;
+
+vi.mock("./hygiene", async () => {
+  const actual = await vi.importActual<typeof import("./hygiene")>("./hygiene");
+  return {
+    ...actual,
+    latestHygieneReport: async () => hygieneReport,
+    latestHygieneVersion: async () => actual.hygieneVersion(hygieneReport),
+  };
+});
+
+const { deriveStage, getBoard, getBoardVersion } = await import("./board");
 const { resetIssueSnapshots } = await import("./beads/snapshot");
 const { contractBlocks, validateBeadContract } = await import("./beads/contract");
 
 beforeEach(() => {
   resetIssueSnapshots();
   listMock.mockReset();
+  hygieneReport = undefined;
 });
 
 function makeBead(overrides: Partial<Bead> & { id: string; title: string }): Bead {
@@ -814,5 +829,78 @@ describe("getBoard excludes pipeline plumbing (gate + molecule)", () => {
 
     await getBoard(project);
     expect(listMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("hygiene report on the board (anton-uwal)", () => {
+  function report(id: string, overrides: Partial<HygieneReport> = {}): HygieneReport {
+    return {
+      id,
+      projectId: project.id,
+      generatedAt: 1_700_000_000,
+      actions: { closedEpics: [], rowsRecomputed: 0 },
+      findings: [],
+      counts: {
+        lint: 0,
+        "stale-open": 0,
+        "stale-in-progress": 0,
+        orphan: 0,
+        "dep-cycle": 0,
+        duplicate: 0,
+      },
+      ...overrides,
+    };
+  }
+
+  beforeEach(() => {
+    listMock.mockResolvedValue([makeBead({ id: "t-1", title: "Loose task" })]);
+  });
+
+  it("carries the latest patrol report in the board payload", async () => {
+    hygieneReport = report("r-1", {
+      actions: { closedEpics: ["epic-9"], rowsRecomputed: 2 },
+      findings: [{ kind: "orphan", key: "orphan:t-1", beadId: "t-1", detail: "shipped, still open" }],
+    });
+
+    const board = await getBoard(project);
+    expect(board.hygiene?.id).toBe("r-1");
+    expect(board.hygiene?.actions.closedEpics).toEqual(["epic-9"]);
+    expect(board.hygiene?.findings[0]?.beadId).toBe("t-1");
+  });
+
+  it("leaves hygiene absent for a project that has never been patrolled", async () => {
+    // Distinct from an empty report, which is the claim "patrolled, board is clean".
+    expect((await getBoard(project)).hygiene).toBeUndefined();
+  });
+
+  it("changes the refresh token when a new report lands", async () => {
+    // The poll 304s on an unchanged token, so a patrol that didn't move the token would stay
+    // invisible on the board until something else (a bead write, a sync pass) happened to change it.
+    const unpatrolled = (await getBoard(project)).version;
+
+    resetIssueSnapshots();
+    hygieneReport = report("r-1");
+    const first = (await getBoard(project)).version;
+    expect(first).not.toBe(unpatrolled);
+
+    resetIssueSnapshots();
+    hygieneReport = report("r-2", { generatedAt: 1_700_000_600 });
+    const second = (await getBoard(project)).version;
+    expect(second).not.toBe(first);
+  });
+
+  it("keeps the token stable while the same report is the latest one", async () => {
+    hygieneReport = report("r-1");
+    const first = (await getBoard(project)).version;
+    resetIssueSnapshots();
+    expect((await getBoard(project)).version).toBe(first);
+  });
+
+  it("agrees with the version the poll path compares against", async () => {
+    // getBoardVersion is what the 304 check reads; a shape that disagreed with the board's own
+    // stamp would make every poll a full download.
+    hygieneReport = report("r-1");
+    const board = await getBoard(project);
+    expect(await getBoardVersion(project)).toBe(board.version);
   });
 });

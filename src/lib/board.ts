@@ -6,6 +6,13 @@ import { beads, getSyncStatus, getSyncStatusToken, type Bead } from "./beads/bd"
 import { isPipelineArtifact } from "./beads/contract";
 import { readAllIssues } from "./beads/issues";
 import { computeEpicGraph, epicStandaloneBlockers, standaloneBlockers } from "./epic-graph";
+import {
+  hygieneVersion,
+  latestHygieneReport,
+  latestHygieneVersion,
+  NO_HYGIENE_REPORT,
+  type HygieneReport,
+} from "./hygiene";
 import { issueSnapshotVersion, type SnapshotReadOptions } from "./beads/snapshot";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
 import {
@@ -30,8 +37,45 @@ import {
 // deriveStage lives in ticket-view.ts now; re-exported here for existing importers/tests.
 export { deriveStage } from "./ticket-view";
 
-export function getBoardVersion(repoPath: string): string {
-  return `${issueSnapshotVersion(repoPath)}:${getSyncStatusToken(repoPath)}`;
+/**
+ * The board's freshness token. The gardener's report version rides in it beside the snapshot and
+ * sync tokens (anton-uwal), so a fresh patrol breaks a poll that would otherwise 304 and the
+ * hygiene panel updates on the same cadence as the cards. Compared as an opaque string, never
+ * parsed — the hygiene part goes BEFORE the sync token, which ends in a free-text error message.
+ */
+function boardVersion(snapshotVersion: number, hygiene: string, repoPath: string): string {
+  return `${snapshotVersion}:${hygiene}:${getSyncStatusToken(repoPath)}`;
+}
+
+export async function getBoardVersion(project: Project): Promise<string> {
+  return boardVersion(
+    issueSnapshotVersion(project.repoPath),
+    await readHygieneVersion(project),
+    project.repoPath,
+  );
+}
+
+/**
+ * The hygiene reads degrade to "never patrolled" on an anton.db failure instead of taking the board
+ * down with them: the panel is advisory, while the board is where every run is approved. Logged, so
+ * a broken db is visible in the server log rather than silently reading as a clean board.
+ */
+async function readHygiene(project: Project): Promise<HygieneReport | undefined> {
+  try {
+    return await latestHygieneReport(project.id);
+  } catch (err) {
+    console.error(`[board] hygiene report read failed for ${project.slug}`, err);
+    return undefined;
+  }
+}
+
+async function readHygieneVersion(project: Project): Promise<string> {
+  try {
+    return await latestHygieneVersion(project.id);
+  } catch (err) {
+    console.error(`[board] hygiene version read failed for ${project.slug}`, err);
+    return NO_HYGIENE_REPORT;
+  }
 }
 
 /** Standalone chips read newest-first within a stage, but a self-filed unread bug jumps ahead of
@@ -51,7 +95,12 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   // Read beads and their snapshot version together: a background refresh can land mid-build, so
   // stamping the response with a separately-read version would let it advance past the data served
   // here — the client would then poll that version, 304, and never see this board's data refreshed.
-  const { beads: allBeads, version: snapshotVersion } = await readAllIssues(project.repoPath, opts);
+  // The bead read (bd) and the hygiene read (anton.db) are independent — run them concurrently so
+  // the slower one sets the board's latency instead of their sum.
+  const [{ beads: allBeads, version: snapshotVersion }, hygiene] = await Promise.all([
+    readAllIssues(project.repoPath, opts),
+    readHygiene(project),
+  ]);
 
   // Only work items land on the board. Pipeline plumbing — a poured `molecule` root and the `gate`
   // beads hanging off it (isPipelineArtifact) — coordinates work without being work, so it never
@@ -167,10 +216,12 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   return {
     projectSlug: project.slug,
     // Pin the freshness token to the snapshot version the served beads carry (not a re-read of the
-    // live version), so a poll on this token only 304s while this exact data is still current.
-    version: `${snapshotVersion}:${getSyncStatusToken(project.repoPath)}`,
+    // live version), so a poll on this token only 304s while this exact data is still current. Same
+    // reasoning for the hygiene part: it names the report served below, not whatever is newest now.
+    version: boardVersion(snapshotVersion, hygieneVersion(hygiene), project.repoPath),
     columns,
     standalone,
+    hygiene,
     // Read from the globalThis-anchored registry, so the API bundle sees passes run by the
     // instrumentation-started sync engine (see bd.ts).
     sync: getSyncStatus(project.repoPath),
