@@ -129,6 +129,7 @@ describe("option lists", () => {
       "sync-push",
       "run-health",
       "unstick",
+      "gate-check",
     ]);
     expect(JOB_TYPE_FILTER_OPTIONS.map((o) => o.value)).toEqual(["", ...JOB_TYPES]);
   });

@@ -16,7 +16,7 @@ import { isValidCron, nextRun } from "./jobs/cron";
 /** Job types that run on a schedule (execute-epic is enqueued on approval, never on cron). */
 export type ScheduledJobType = Extract<
   JobType,
-  "review-fix" | "nightly-stringer" | "orphan-grooming" | "run-health" | "unstick"
+  "review-fix" | "nightly-stringer" | "orphan-grooming" | "run-health" | "unstick" | "gate-check"
 >;
 
 export type ScheduleRow = typeof schema.schedules.$inferSelect;
@@ -153,6 +153,11 @@ export async function listSchedules(projectId: string): Promise<ScheduleSummary[
  * shipping both disabled — trades an idle hourly job (one report read, no bd, no writes) for an
  * operator who enables the sweep and silently gets findings nothing ever acts on. An operator who
  * won't use run-health can turn unstick off independently; the settings row says as much.
+ *
+ * gate-check (anton-286r) is armed by default and runs often, because it is the ONLY thing that
+ * resumes a run parked on a gate: shipping it off would strand gated work indefinitely, and its
+ * idle cost is two bd reads per slot on a project with no gates. The cadence is the wait's
+ * resolution — a CI run that goes green at :01 resumes at :10, not the next hour.
  */
 export const DEFAULT_SCHEDULES: Array<{
   type: ScheduledJobType;
@@ -164,6 +169,7 @@ export const DEFAULT_SCHEDULES: Array<{
   { type: "orphan-grooming", cron: "0 4 * * 1" }, // bucket loose tickets weekly, Mon 04:00
   { type: "run-health", cron: "0 * * * *", enabled: false }, // sweep for stalls hourly; opt-in
   { type: "unstick", cron: "10 * * * *" }, // act on the sweep's findings, 10 min after it
+  { type: "gate-check", cron: "*/10 * * * *" }, // close satisfied gates + resume their work
 ];
 
 /**

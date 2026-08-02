@@ -26,6 +26,7 @@ import { makeOrphanGroomingHandler } from "./orphan-grooming";
 import { makeSyncPushHandler } from "./sync-push";
 import { makeRunHealthHandler } from "./run-health";
 import { makeUnstickHandler, resumeEpic, type ResumeOutcome } from "./unstick";
+import { makeGateCheckHandler } from "./gate-check";
 import { JobRunner, type RunnerLogger, type RunningJobInfo } from "./runner";
 import { Scheduler } from "./scheduler";
 import { activeExecuteEpicId, getJob, systemClock } from "./queue";
@@ -156,6 +157,7 @@ export function getRunner(): JobRunner {
   runner.registerHandler("sync-push", makeSyncPushHandler({ db }));
   runner.registerHandler("run-health", makeRunHealthHandler({ db }));
   runner.registerHandler("unstick", makeUnstickHandler({ db }));
+  runner.registerHandler("gate-check", makeGateCheckHandler({ db }));
   s.runner = runner;
   return runner;
 }

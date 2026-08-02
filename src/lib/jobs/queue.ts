@@ -21,7 +21,8 @@ export type JobType =
   | "orphan-grooming"
   | "sync-push"
   | "run-health"
-  | "unstick";
+  | "unstick"
+  | "gate-check";
 
 /**
  * `queued`  — eligible when runAt ≤ now (also how a backoff/quota reschedule is represented).
