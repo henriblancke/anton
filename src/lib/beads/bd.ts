@@ -1633,10 +1633,10 @@ export function parseOrphans(raw: string): OrphanBead[] {
 export function parseDepCycles(raw: string): DepCycle[] {
   const parsed = parseHygieneJson(raw, "dep cycles");
   if (!Array.isArray(parsed)) return [];
-  const idsOf = (raw: unknown): string[] => {
-    if (typeof raw === "string") return [raw];
-    if (Array.isArray(raw)) return raw.flatMap(idsOf);
-    const o = raw as Record<string, unknown> | null;
+  const idsOf = (node: unknown): string[] => {
+    if (typeof node === "string") return [node];
+    if (Array.isArray(node)) return node.flatMap(idsOf);
+    const o = node as Record<string, unknown> | null;
     if (!o || typeof o !== "object") return [];
     const named = o.cycle ?? o.path ?? o.ids ?? o.issue_ids ?? o.issues ?? o.nodes;
     if (named !== undefined) return idsOf(named);

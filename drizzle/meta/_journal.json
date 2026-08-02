@@ -64,6 +64,13 @@
       "when": 1785691286106,
       "tag": "0008_sweet_arclight",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1785702884402,
+      "tag": "0009_rich_songbird",
+      "breakpoints": true
     }
   ]
 }

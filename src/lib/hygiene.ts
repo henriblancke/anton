@@ -13,7 +13,7 @@
  * path goes through the shared anton.db.
  */
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, notInArray, sql } from "drizzle-orm";
+import { and, desc, eq, isNotNull, isNull, notInArray, sql } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import type { AntonDb, Clock } from "./jobs/queue";
 
@@ -100,6 +100,9 @@ export const HYGIENE_REPORT_RETENTION = 20;
  */
 const NEWEST_FIRST = sql`rowid desc`;
 
+/** Only a landed report is a report — an in-flight one is nobody's answer to "how is the board?". */
+const COMPLETED = isNotNull(schema.hygieneReports.completedAt);
+
 function secDate(ms: number): Date {
   return new Date(Math.floor(ms / 1000) * 1000);
 }
@@ -158,27 +161,118 @@ export interface SaveHygieneReportInput {
  * A patrol that found nothing still writes a row: an empty report is the signal "patrolled, board is
  * clean", which is a different claim from "never patrolled" — and the board (anton-uwal) must be
  * able to tell them apart.
+ *
+ * The one-shot form, for a caller that has both tiers in hand. The gardener job instead
+ * {@link startHygieneReport}s its actions and {@link completeHygieneReport}s the findings, so a
+ * failing report tier can't lose what the sweep already did.
  */
 export async function saveHygieneReport(
   db: AntonDb,
   clock: Clock,
   input: SaveHygieneReportInput,
 ): Promise<string> {
-  const findings = sortFindings(input.findings);
+  const { id } = await startHygieneReport(db, clock, input);
+  await completeHygieneReport(db, clock, id, input.findings);
+  return id;
+}
+
+/** An opened report row: its id, and the actions it now holds (merged across attempts). */
+export interface OpenHygieneReport {
+  id: string;
+  actions: HygieneActions;
+}
+
+export interface StartHygieneReportInput {
+  projectId: string;
+  jobId?: string;
+  actions: HygieneActions;
+}
+
+/**
+ * Open this patrol's report row with the mechanical tier already recorded — the writes the sweep
+ * made, persisted BEFORE the (fallible, retried) report tier runs.
+ *
+ * The row stays invisible to every read here until {@link completeHygieneReport} lands its findings,
+ * because a findings-less report REPLACES what the board shows and would read as a clean bill of
+ * health. What it buys is honesty across a retry: the patrol's writes are idempotent, so a second
+ * attempt's sweep closes nothing and would otherwise report "closed 0 epics" for a pass that closed
+ * work. Re-opening the same `jobId` MERGES into that attempt's row instead — the union of every
+ * attempt's closures, which is what the patrol actually did.
+ */
+export async function startHygieneReport(
+  db: AntonDb,
+  clock: Clock,
+  input: StartHygieneReportInput,
+): Promise<OpenHygieneReport> {
+  const open = input.jobId ? await findOpenReportForJob(db, input.jobId) : undefined;
+  if (open) {
+    const actions: HygieneActions = {
+      closedEpics: [
+        ...new Set([...parseJson<string[]>(open.closedEpicsJson, []), ...input.actions.closedEpics]),
+      ],
+      // Summed, not replaced: each attempt repaired the rows IT found stale.
+      rowsRecomputed: open.rowsRecomputed + input.actions.rowsRecomputed,
+    };
+    await db
+      .update(schema.hygieneReports)
+      .set({
+        closedEpicsJson: JSON.stringify(actions.closedEpics),
+        closedCount: actions.closedEpics.length,
+        rowsRecomputed: actions.rowsRecomputed,
+      })
+      .where(eq(schema.hygieneReports.id, open.id));
+    return { id: open.id, actions };
+  }
+
   const id = randomUUID();
   await db.insert(schema.hygieneReports).values({
     id,
     projectId: input.projectId,
     jobId: input.jobId ?? null,
     generatedAt: secDate(clock.now()),
-    findingsJson: JSON.stringify(findings),
+    completedAt: null,
     closedEpicsJson: JSON.stringify(input.actions.closedEpics),
     rowsRecomputed: input.actions.rowsRecomputed,
-    findingCount: findings.length,
     closedCount: input.actions.closedEpics.length,
   });
-  await pruneHygieneReports(db, input.projectId);
-  return id;
+  return { id, actions: input.actions };
+}
+
+/**
+ * Land the report tier's findings on an open row and publish it — the point at which the patrol
+ * becomes visible to the board. `generatedAt` is stamped here, not at open, so the report is dated
+ * when it was produced and a later-completing patrol always sorts newer.
+ */
+export async function completeHygieneReport(
+  db: AntonDb,
+  clock: Clock,
+  id: string,
+  findings: HygieneFinding[],
+): Promise<void> {
+  const sorted = sortFindings(findings);
+  const at = secDate(clock.now());
+  const [row] = await db
+    .update(schema.hygieneReports)
+    .set({
+      generatedAt: at,
+      completedAt: at,
+      findingsJson: JSON.stringify(sorted),
+      findingCount: sorted.length,
+    })
+    .where(eq(schema.hygieneReports.id, id))
+    .returning({ projectId: schema.hygieneReports.projectId });
+  if (row) await pruneHygieneReports(db, row.projectId);
+}
+
+/** The still-open row a previous attempt of this job left behind, if any. */
+async function findOpenReportForJob(db: AntonDb, jobId: string) {
+  const rows = await db
+    .select()
+    .from(schema.hygieneReports)
+    .where(and(eq(schema.hygieneReports.jobId, jobId), isNull(schema.hygieneReports.completedAt)))
+    .orderBy(desc(schema.hygieneReports.generatedAt), NEWEST_FIRST)
+    .limit(1);
+  return rows[0];
 }
 
 /** Keep only the newest {@link HYGIENE_REPORT_RETENTION} reports for a project. */
@@ -220,8 +314,11 @@ function toReport(row: typeof schema.hygieneReports.$inferSelect): HygieneReport
 /**
  * A corrupt blob degrades to the empty value rather than crashing the board — the denormalized
  * counts still show the patrol saw something, so the discrepancy is visible instead of silent.
+ *
+ * Both persisted blobs are arrays, so the fallback covers valid-JSON-but-not-an-array too; the
+ * `T extends unknown[]` bound keeps that runtime guard and the caller's type in step.
  */
-function parseJson<T>(raw: string, fallback: T): T {
+function parseJson<T extends unknown[]>(raw: string, fallback: T): T {
   try {
     const parsed = JSON.parse(raw) as unknown;
     return Array.isArray(parsed) ? (parsed as T) : fallback;
@@ -230,7 +327,10 @@ function parseJson<T>(raw: string, fallback: T): T {
   }
 }
 
-/** The project's most recent patrol report, or undefined when it has never been patrolled. */
+/**
+ * The project's most recent COMPLETED patrol report, or undefined when it has never been patrolled.
+ * A patrol still collecting its findings is not a report yet (see {@link startHygieneReport}).
+ */
 export async function getHygieneReport(
   db: AntonDb,
   projectId: string,
@@ -238,7 +338,7 @@ export async function getHygieneReport(
   const rows = await db
     .select()
     .from(schema.hygieneReports)
-    .where(eq(schema.hygieneReports.projectId, projectId))
+    .where(and(eq(schema.hygieneReports.projectId, projectId), COMPLETED))
     .orderBy(desc(schema.hygieneReports.generatedAt), NEWEST_FIRST)
     .limit(1);
   return rows[0] ? toReport(rows[0]) : undefined;
@@ -252,7 +352,7 @@ export async function getHygieneReportForJob(
   const rows = await db
     .select()
     .from(schema.hygieneReports)
-    .where(eq(schema.hygieneReports.jobId, jobId))
+    .where(and(eq(schema.hygieneReports.jobId, jobId), COMPLETED))
     .limit(1);
   return rows[0] ? toReport(rows[0]) : undefined;
 }
@@ -265,7 +365,7 @@ export async function listHygieneReports(
   const rows = await db
     .select()
     .from(schema.hygieneReports)
-    .where(eq(schema.hygieneReports.projectId, projectId))
+    .where(and(eq(schema.hygieneReports.projectId, projectId), COMPLETED))
     .orderBy(desc(schema.hygieneReports.generatedAt), NEWEST_FIRST);
   return rows.map(toReport);
 }
@@ -279,9 +379,10 @@ export function latestHygieneReport(projectId: string): Promise<HygieneReport | 
 export const NO_HYGIENE_REPORT = "none";
 
 /**
- * A report's identity for the board's refresh token (anton-uwal). Report rows are append-only — a
- * patrol writes a new row and never rewrites an old one — so the row id IS the version: it changes
- * exactly when there is something new to show, which is what keeps the board's poll 304-friendly.
+ * A report's identity for the board's refresh token (anton-uwal). A row is served only once it
+ * completes and is never rewritten after that — a patrol publishes a new row rather than editing the
+ * last one — so the row id IS the version: it changes exactly when there is something new to show,
+ * which is what keeps the board's poll 304-friendly.
  */
 export function hygieneVersion(report: Pick<HygieneReport, "id"> | undefined): string {
   return report?.id ?? NO_HYGIENE_REPORT;
@@ -295,7 +396,7 @@ export async function getHygieneVersion(db: AntonDb, projectId: string): Promise
   const rows = await db
     .select({ id: schema.hygieneReports.id })
     .from(schema.hygieneReports)
-    .where(eq(schema.hygieneReports.projectId, projectId))
+    .where(and(eq(schema.hygieneReports.projectId, projectId), COMPLETED))
     .orderBy(desc(schema.hygieneReports.generatedAt), NEWEST_FIRST)
     .limit(1);
   return hygieneVersion(rows[0]);

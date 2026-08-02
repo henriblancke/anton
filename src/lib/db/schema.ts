@@ -155,8 +155,8 @@ export const runHealthReports = sqliteTable("run_health_reports", {
  * job that did it. Collapsing them per project would erase that history the moment the next patrol
  * ran, leaving a closed epic with nothing naming the pass that closed it.
  *
- * Bounded rather than unbounded: `saveHygieneReport` prunes to the newest few per project, so the
- * table stays a short audit trail instead of an append-only log that grows forever.
+ * Bounded rather than unbounded: completing a report prunes to the newest few per project, so the
+ * table stays a short audit trail instead of a log that grows forever.
  */
 export const hygieneReports = sqliteTable(
   "hygiene_reports",
@@ -168,6 +168,13 @@ export const hygieneReports = sqliteTable(
     /** The patrol job that produced this report; null only for a report written outside a job. */
     jobId: text("job_id"),
     generatedAt: ts("generated_at").notNull().default(now),
+    /**
+     * When the report tier finished, or null while it is still in flight. A row is written as soon
+     * as the patrol's WRITES land (so a retry of the report tier cannot lose them) and completed
+     * when the findings are in — and only completed rows are ever served, because a findings-less
+     * row on the board would read as a clean bill of health.
+     */
+    completedAt: ts("completed_at"),
     /** `HygieneFinding[]` (src/lib/hygiene.ts), serialized — everything that needs human eyes. */
     findingsJson: text("findings_json").notNull().default("[]"),
     /** The epic ids the safe sweep closed, serialized — what this patrol changed on the board. */

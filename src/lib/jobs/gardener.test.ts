@@ -25,7 +25,7 @@ import type {
   StaleOpts,
 } from "../beads/bd";
 import { getHygieneReport, getHygieneReportForJob } from "../hygiene";
-import { driveJob, expectJobStatus } from "@/lib/testing/jobs";
+import { driveJob, expectJobStatus, makeJobRunner } from "@/lib/testing/jobs";
 import type { Clock } from "./queue";
 
 const pullMock = vi.fn<(cwd: string) => Promise<void>>();
@@ -229,6 +229,41 @@ describe("gardener patrol", () => {
     const job = await expectJobStatus(t.db, jobId, "queued"); // retried, not settled
     expect(job.lastError).toContain("bd orphans");
     expect(await getHygieneReport(t.db, projectId)).toBeUndefined();
+  });
+
+  it("publishes what the FIRST attempt closed, even though the retry closes nothing", async () => {
+    // Both safe verbs are idempotent, so a retry after a report-verb failure sweeps an already-swept
+    // board. Reporting only the retry's (empty) sweep would leave the panel claiming "closed 0
+    // epics" for a patrol that really did close one — the board's record of its own writes.
+    epicCloseMock.mockResolvedValueOnce({ dryRun: false, eligible: [], closed: ["e-1"] });
+    recomputeMock.mockResolvedValueOnce(2);
+    orphansMock.mockRejectedValueOnce(new Error("bd orphans: output was not JSON"));
+
+    let nowMs = NOW;
+    const runner = makeJobRunner({
+      db: t.db,
+      clock: { now: () => nowMs },
+      type: "gardener",
+      handler: ({ db, clock: c }) => makeGardenerHandler({ db, clock: c, nudge }),
+    });
+    const jobId = await runner.enqueue({ type: "gardener", projectId, payload: { projectId } });
+
+    expect(await runner.tickOnce()).toBe(1);
+    await runner.whenIdle();
+    await expectJobStatus(t.db, jobId, "queued"); // retried, and nothing published
+    expect(await getHygieneReport(t.db, projectId)).toBeUndefined();
+
+    nowMs += 60_000; // past the retry backoff
+    expect(await runner.tickOnce()).toBe(1);
+    await runner.whenIdle();
+    await expectJobStatus(t.db, jobId, "done");
+
+    const report = await getHygieneReport(t.db, projectId);
+    expect(report?.jobId).toBe(jobId);
+    expect(report?.actions).toEqual({ closedEpics: ["e-1"], rowsRecomputed: 2 });
+    // One patrol, one report — and one push: the retry wrote nothing new to propagate.
+    expect(await getHygieneReportForJob(t.db, jobId)).toEqual(report);
+    expect(nudge).toHaveBeenCalledTimes(1);
   });
 
   it("writes an empty report on a clean board — patrolled is not the same as never patrolled", async () => {

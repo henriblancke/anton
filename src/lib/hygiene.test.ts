@@ -11,6 +11,7 @@ import { eq } from "drizzle-orm";
 import * as schema from "./db/schema";
 import { makeTestDb, type TestDb } from "./db/testing";
 import {
+  completeHygieneReport,
   countFindings,
   getHygieneReport,
   getHygieneReportForJob,
@@ -19,6 +20,7 @@ import {
   NO_HYGIENE_REPORT,
   saveHygieneReport,
   sortFindings,
+  startHygieneReport,
   summarizeReport,
   HYGIENE_REPORT_RETENTION,
   type HygieneFinding,
@@ -139,6 +141,74 @@ describe("hygiene report store", () => {
 
   it("has no latest report before the first patrol — patrolled ≠ never patrolled", async () => {
     expect(await getHygieneReport(t.db, projectId)).toBeUndefined();
+  });
+});
+
+describe("a report is published only once it completes", () => {
+  it("keeps an open row off every read until its findings land", async () => {
+    // The row exists so the patrol's WRITES survive a failing report tier — but a findings-less
+    // report on the board would read as a clean bill of health, so nothing serves it yet.
+    const { id } = await startHygieneReport(t.db, clock, {
+      projectId,
+      jobId: "job-1",
+      actions: { closedEpics: ["e-1"], rowsRecomputed: 2 },
+    });
+
+    expect(await getHygieneReport(t.db, projectId)).toBeUndefined();
+    expect(await getHygieneReportForJob(t.db, "job-1")).toBeUndefined();
+    expect(await listHygieneReports(t.db, projectId)).toEqual([]);
+    expect(await getHygieneVersion(t.db, projectId)).toBe(NO_HYGIENE_REPORT);
+
+    await completeHygieneReport(t.db, clock, id, [finding("lint", "t-1")]);
+
+    const report = await getHygieneReport(t.db, projectId);
+    expect(report?.id).toBe(id);
+    expect(report?.actions).toEqual({ closedEpics: ["e-1"], rowsRecomputed: 2 });
+    expect(report?.findings.map((f) => f.key)).toEqual(["lint:t-1"]);
+    // The board's token moves exactly when the report becomes visible.
+    expect(await getHygieneVersion(t.db, projectId)).toBe(id);
+  });
+
+  it("merges a retried attempt into the open row instead of losing the first attempt's work", async () => {
+    // The safe verbs are idempotent: the retry closes nothing, so a fresh row would publish
+    // "closed 0 epics" for a patrol that closed one.
+    const first = await startHygieneReport(t.db, clock, {
+      projectId,
+      jobId: "job-1",
+      actions: { closedEpics: ["e-1"], rowsRecomputed: 2 },
+    });
+    const retry = await startHygieneReport(t.db, clock, {
+      projectId,
+      jobId: "job-1",
+      actions: { closedEpics: [], rowsRecomputed: 1 },
+    });
+
+    expect(retry.id).toBe(first.id);
+    expect(retry.actions).toEqual({ closedEpics: ["e-1"], rowsRecomputed: 3 });
+
+    await completeHygieneReport(t.db, clock, retry.id, []);
+    const history = await listHygieneReports(t.db, projectId);
+    expect(history).toHaveLength(1); // one patrol, one report — not one per attempt
+    expect(history[0]?.actions).toEqual({ closedEpics: ["e-1"], rowsRecomputed: 3 });
+  });
+
+  it("never rewrites a completed report — a later patrol opens its own row", async () => {
+    const done = await saveHygieneReport(t.db, clock, {
+      projectId,
+      jobId: "job-1",
+      actions: { closedEpics: ["e-1"], rowsRecomputed: 0 },
+      findings: [],
+    });
+
+    const next = await startHygieneReport(t.db, clock, {
+      projectId,
+      jobId: "job-1",
+      actions: { closedEpics: ["e-2"], rowsRecomputed: 0 },
+    });
+
+    expect(next.id).not.toBe(done);
+    expect(next.actions.closedEpics).toEqual(["e-2"]);
+    expect((await getHygieneReportForJob(t.db, "job-1"))?.actions.closedEpics).toEqual(["e-1"]);
   });
 });
 

@@ -33,7 +33,8 @@
 import { beads, type DuplicateGroup } from "../beads/bd";
 import { nudgeSync, type NudgeTarget } from "../beads/sync-nudge";
 import {
-  saveHygieneReport,
+  completeHygieneReport,
+  startHygieneReport,
   summarizeReport,
   type HygieneActions,
   type HygieneFinding,
@@ -188,22 +189,29 @@ export function makeGardenerHandler(deps: GardenerDeps): JobHandler {
     const sweep = await beads.epicCloseEligible(repo, { apply: true });
     await ctx.heartbeat();
     const rowsRecomputed = await beads.recomputeBlocked(repo);
-    const actions: HygieneActions = { closedEpics: sweep.closed, rowsRecomputed };
+    const applied: HygieneActions = { closedEpics: sweep.closed, rowsRecomputed };
     await ctx.heartbeat();
 
+    // Record the writes BEFORE the (fallible) report tier, on a row that stays invisible until the
+    // findings land. Both verbs are idempotent, so a retry after a report-verb failure closes
+    // nothing — without this the published report would say "closed 0 epics" for a patrol that did
+    // close work. Re-opening the same job id merges the attempts, so `actions` below is what this
+    // PATROL did, not just this attempt (hygiene.ts).
+    const { id: reportId, actions } = await startHygieneReport(db, clock, {
+      projectId,
+      jobId: ctx.jobId,
+      actions: applied,
+    });
+
     // Propagate the writes before the (slower) report tier: what this patrol closed is what other
-    // machines most need, and a report-verb failure below must not strand it locally. Only when
-    // something actually changed — an idle patrol pushing every slot would make a clean board the
-    // noisiest thing on the remote.
-    //
-    // Logged HERE, not only in the summary below: both verbs are idempotent, so a failure in the
-    // report tier retries the whole pass and the retry's report honestly says it closed nothing —
-    // this line is then the only record of which epics THIS attempt closed.
-    if (actions.closedEpics.length > 0 || rowsRecomputed > 0) {
+    // machines most need, and a report-verb failure below must not strand it locally. Gated on what
+    // THIS attempt wrote — an idle patrol pushing every slot would make a clean board the noisiest
+    // thing on the remote, and a retry that changed nothing has nothing new to push.
+    if (applied.closedEpics.length > 0 || applied.rowsRecomputed > 0) {
       console.log(
-        `[gardener] ${projectId}: closed ${actions.closedEpics.length} epic(s)` +
-          `${actions.closedEpics.length ? ` (${actions.closedEpics.join(", ")})` : ""}, ` +
-          `recomputed ${rowsRecomputed} blocked row(s)`,
+        `[gardener] ${projectId}: closed ${applied.closedEpics.length} epic(s)` +
+          `${applied.closedEpics.length ? ` (${applied.closedEpics.join(", ")})` : ""}, ` +
+          `recomputed ${applied.rowsRecomputed} blocked row(s)`,
       );
       nudge({ id: project.id, repoPath: repo });
     }
@@ -235,10 +243,11 @@ export function makeGardenerHandler(deps: GardenerDeps): JobHandler {
     ];
 
     // Nothing above is guaranteed to notice a cancel — `heartbeat` doesn't inspect the signal and
-    // the bd reads settle on their own — so the write is gated here explicitly: a cancelled patrol
-    // must not persist a half-collected report as this run's answer.
+    // the bd reads settle on their own — so publishing is gated here explicitly: a cancelled patrol
+    // must not present a half-collected report as this run's answer. Its actions row survives,
+    // unpublished, and a resume of the same job completes it.
     ctx.signal.throwIfAborted();
-    await saveHygieneReport(db, clock, { projectId, jobId: ctx.jobId, actions, findings });
+    await completeHygieneReport(db, clock, reportId, findings);
 
     console.log(`[gardener] ${projectId}: ${summarizeReport({ actions, findings })}`);
   };
