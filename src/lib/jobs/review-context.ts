@@ -329,10 +329,16 @@ const MAX_IMPORT_DEPTH = 5;
  * undiscovered nested scope, and the reason a diff violating those rules would pass.
  *
  * Bounded three ways, because the import graph is repo-controlled: {@link MAX_IMPORT_DEPTH} hops,
- * a `seen` set so a cycle (or a file two scopes both import) is read once, and
- * {@link resolveRepoPath}, which drops anything absolute or climbing above the repo root. A
- * candidate that resolves to no blob at `baseRev` simply contributes nothing — that is what an
- * `@mention` in prose looks like — while a read that FAILS propagates, exactly as in the caller.
+ * a per-root `seen` set so a cycle is read once, and {@link resolveRepoPath}, which drops anything
+ * absolute or climbing above the repo root. A candidate that resolves to no blob at `baseRev` simply
+ * contributes nothing — that is what an `@mention` in prose looks like — while a read that FAILS
+ * propagates, exactly as in the caller.
+ *
+ * Dedup is PER governing root, not global: an import inherits its root's scope, so a file that the
+ * repo root and `packages/foo/AGENTS.md` both import is a rule at both scopes. Reading it once
+ * globally rendered it only under the shallowest importer, so a nested rule that should refine — or
+ * override — an intermediate scope's went missing. The cost is a shared file inlined once per scope
+ * that claims it, which is what having two scopes claim it means.
  *
  * Imports follow their importer so the reviewer reads them in the order the rules were written.
  */
@@ -341,10 +347,13 @@ async function expandImports(
   baseRev: string,
   roots: InstructionFile[],
 ): Promise<InstructionFile[]> {
-  const seen = new Set(roots.map((f) => f.path));
+  const rootPaths = new Set(roots.map((f) => f.path));
   const expanded: InstructionFile[] = [];
 
   for (const root of roots) {
+    // Roots stay excluded everywhere: each is already inlined at its own discovered scope, so an
+    // import pointing at one would restate it under a scope it does not have.
+    const seen = new Set(rootPaths);
     expanded.push(root);
     let frontier: InstructionFile[] = [root];
     for (let depth = 0; depth < MAX_IMPORT_DEPTH && frontier.length > 0; depth++) {

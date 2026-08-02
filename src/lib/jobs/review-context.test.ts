@@ -571,6 +571,32 @@ describe("buildReviewPrompt", () => {
     expect(prompt).not.toMatch(/### `[^`]*\.claude\/CLAUDE\.md`/);
   });
 
+  it("inlines a shared import once per scope that claims it", async () => {
+    // An import inherits its importer's scope, so a file two scopes both delegate to is a rule at
+    // BOTH. Deduping across scopes rendered it only under the shallowest importer, so the nested
+    // copy — the one that refines or overrides the scope in between — never reached the reviewer.
+    commitFile("CLAUDE.md", "@docs/shared.md\n");
+    commitFile("src/AGENTS.md", "- The rule in between.\n");
+    commitFile("src/app/CLAUDE.md", "@../../docs/shared.md\n");
+    commitFile("docs/shared.md", "- The shared rule.\n");
+
+    const { prompt } = await buildReviewPrompt({
+      target: epic,
+      tickets: [ticket],
+      diff: { files: ["src/app/page.tsx"], patch: "+ const Page = () => null;\n", truncated: false },
+      settings: settings({ reviewPrompt: "OPERATOR CONTRACT." }),
+      projectDir,
+      baseRev: BASE,
+    });
+
+    expect(prompt).toContain("### `docs/shared.md` — imported by `CLAUDE.md`");
+    expect(prompt).toContain("### `docs/shared.md` — imported by `src/app/CLAUDE.md`");
+    // And the nested copy is read AFTER the scope it refines, so precedence reads in the right order.
+    expect(prompt.indexOf("### `src/AGENTS.md`")).toBeLessThan(
+      prompt.indexOf("### `docs/shared.md` — imported by `src/app/CLAUDE.md`"),
+    );
+  });
+
   it("does not read an `@` inside a code sample as an import", async () => {
     commitFile("CLAUDE.md", "Install with `npm i @scope/pkg`:\n\n```sh\nnpm i @docs/rules.md\n```\n");
     commitFile("docs/rules.md", "- A file the snippet only NAMES.\n");
