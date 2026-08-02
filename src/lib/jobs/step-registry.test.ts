@@ -173,6 +173,43 @@ describe("resolveStep", () => {
     expect(resolveStep(cooked("b", ["step:claude", "skill:review"]), FORMULA).name).toBe("claude");
   });
 
+  // Dispatch reads `prompt:` first and takes the first label of a prefix by array order, so a second
+  // instruction would be silently dropped — which one depending on how the labels happened to sort.
+  it.each([
+    ["a prompt and a skill", ["step:claude", "prompt:security", "skill:release"]],
+    ["two prompts", ["step:claude", "prompt:security", "prompt:release"]],
+    ["two skills", ["step:claude", "skill:security", "skill:release"]],
+  ])("parks on a step:claude naming %s, rather than picking by order", (_what, labels) => {
+    let raised: unknown;
+    try {
+      resolveStep(cooked("custom", labels), FORMULA);
+    } catch (e) {
+      raised = e;
+    }
+    expect(isPoisonError(raised)).toBe(true);
+    const message = (raised as Error).message;
+    expect(message).toContain('"custom"');
+    expect(message).toContain(FORMULA);
+    // Both instructions are named, so the operator can see which two they wrote.
+    for (const label of labels.slice(1)) expect(message).toContain(label);
+  });
+
+  // A valueless `prompt:` names nothing to dispatch, so it must read as "names no prompt" rather
+  // than pushing a step that DOES name one into the ambiguity rejection.
+  it("ignores a valueless instruction label when counting what a step:claude names", () => {
+    expect(resolveStep(cooked("a", ["step:claude", "prompt:", "skill:review"]), FORMULA).name).toBe(
+      "claude",
+    );
+    let raised: unknown;
+    try {
+      resolveStep(cooked("bare", ["step:claude", "prompt:"]), FORMULA);
+    } catch (e) {
+      raised = e;
+    }
+    expect(isPoisonError(raised)).toBe(true);
+    expect((raised as Error).message).toContain("prompt:<id>");
+  });
+
   // `["step:implement", "step:verify"]` would resolve to implement by array order alone and silently
   // never verify — and the floor, seeing a resolved implement, would pass the formula.
   it("parks on a step carrying more than one step: label, rather than picking by order", () => {
@@ -300,6 +337,22 @@ describe("step:claude", () => {
     const claude = fakeClaude("never dispatched");
     await expect(
       claudeStep(context({ step: cooked("mystery", ["step:claude"]), deps: { runClaude: claude.run } })),
+    ).rejects.toSatisfy(isPoisonError);
+    expect(claude.calls).toHaveLength(0);
+  });
+
+  // The backstop for a caller invoking the handler directly: run-start validation rejects this, but
+  // dispatching one of the two by label order would be the silent drop it exists to prevent.
+  it("parks when the step names two instructions", async () => {
+    writeProjectPrompt("design-check", "Check the design system.");
+    const claude = fakeClaude("never dispatched");
+    await expect(
+      claudeStep(
+        context({
+          step: cooked("ambiguous", ["step:claude", "prompt:design-check", "skill:smoke"]),
+          deps: { runClaude: claude.run },
+        }),
+      ),
     ).rejects.toSatisfy(isPoisonError);
     expect(claude.calls).toHaveLength(0);
   });

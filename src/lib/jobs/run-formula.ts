@@ -18,8 +18,9 @@
  *    dropped-key check above would cover only half the pipeline anton then walks.
  * 4. **A cook failure** — bd's own reason, which already names the file.
  * 5. **A step that maps to no handler, or names two** — {@link resolveStep}'s message, naming the
- *    step and label. A `step:claude` naming neither a `prompt:` nor a `skill:` parks there too: it
- *    would otherwise reach a human only at dispatch, after `implement` had already committed.
+ *    step and label. A `step:claude` naming neither a `prompt:` nor a `skill:` — or naming two of
+ *    them, where one would be dropped by label order — parks there too: it would otherwise reach a
+ *    human only at dispatch, after `implement` had already committed.
  * 6. **A step bd gated** — {@link assertNoStepGates}: anton's walker has no gate resolution, so a
  *    gated step would run immediately rather than waiting on what the project gated it behind.
  * 7. **A `{{var}}` in a step's labels** — {@link assertNoLabelPlaceholders}: bd substitutes variables
@@ -404,16 +405,17 @@ export interface RunFormulaOptions {
   /** The project's label→formula map, in precedence order. Absent/empty ⇒ the default, always. */
   variants?: readonly FormulaVariant[];
   /**
-   * The pipeline an already-open run RECORDED, which pins it: selection is skipped and this source is
-   * loaded, cooked and validated instead.
+   * The pipeline a prior attempt on this branch RECORDED, which pins it: selection is skipped and
+   * this source is loaded, cooked and validated instead.
    *
-   * A run is resumable — it survives a crash, a quota backoff, an operator's un-park — and every
-   * attempt re-reads the board and the project's settings. Selecting again on each attempt would let
-   * one run walk two different pipelines: a label added since (including `stage:implementing`, which
-   * the run itself adds) or an edited variant map would re-select midway, so the tickets that already
-   * committed walked one formula and the rest walk another, while the run record claims a single one.
-   * The choice is therefore made ONCE, when the run is first recorded, and honored for its lifetime;
-   * a changed mapping applies to the next run.
+   * Work is resumable — it survives a crash, a quota backoff, a failed attempt the runner retries, an
+   * operator's un-park — and every attempt re-reads the board and the project's settings. Selecting
+   * again on each attempt would let one branch walk two different pipelines: a label added since
+   * (including `stage:implementing`, which the run itself adds) or an edited variant map would
+   * re-select midway, so the tickets that already committed walked one formula and the rest walk
+   * another, while the run record claims a single one. The choice is therefore made ONCE, by the
+   * first attempt that records one, and honored until the branch's work is done; a changed mapping
+   * applies to the next run. The caller supplies it — see `findRunFormulaForBranch`.
    */
   pinned?: FormulaChoice;
   /**

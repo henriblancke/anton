@@ -517,6 +517,95 @@ process.exit(0);`),
     }
   });
 
+  it("keeps a FAILED attempt's pipeline when the runner retries it onto a fresh run row", async () => {
+    // The parked case above shares one run row across attempts. An ordinary handler error does NOT:
+    // it settles the row `failed`, so the retry gets a FRESH row while still reusing the prior
+    // attempt's worktree and skipping the ticket it already committed. Pinning by open run row alone
+    // would therefore re-select here — and a mapping added during the backoff would put the
+    // already-committed ticket on one pipeline and the rest of the branch on another.
+    const orderLog = join(sandbox, "order-retry.log");
+    await recordVerifyInto(orderLog);
+    writeProjectFormula(
+      step("implement", "implement") +
+        "\n" +
+        step("verify", "verify", "implement") +
+        "\n" +
+        step("commit", "commit", "verify") +
+        "\n" +
+        step("pr", "pr", "commit"),
+    );
+    // The heavier pipeline the operator maps mid-backoff: one extra gate over the finished run, so a
+    // switch shows up in the gate log as well as in the run record.
+    writeNamedFormula(
+      "anton-run-risk-high",
+      step("implement", "implement") +
+        "\n" +
+        step("verify", "verify", "implement") +
+        "\n" +
+        step("commit", "commit", "verify") +
+        "\n" +
+        step("final-check", "verify", "commit") +
+        "\n" +
+        step("pr", "pr", "final-check"),
+    );
+    const { id: epicId, tickets } = await approvedEpic("Fails then retries", ["risk:high"]);
+
+    const invLog = join(sandbox, "retry-dispatches.log");
+    const flakyClaude = writeBin(
+      binDir,
+      "claude-retry-pinned",
+      fakeClaudeReadingStdin(`const m=prompt.match(/Ticket: (\\S+)/);const ticket=m?m[1]:'?';
+const log=${JSON.stringify(invLog)};
+fs.appendFileSync(log,ticket+'\\n');
+const n=fs.readFileSync(log,'utf8').trim().split('\\n').length;
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+e({type:'system',subtype:'init',session_id:'sr'});
+if(n===2){e({type:'result',subtype:'error',result:'boom — the attempt fell over',is_error:true});process.exit(0);}
+fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work '+ticket+'\\n');
+e({type:'result',subtype:'success',result:'done',session_id:'sr',num_turns:1,is_error:false});
+process.exit(0);`),
+    );
+
+    const runner = runnerFor();
+    process.env.ANTON_CLAUDE_BIN = flakyClaude;
+    let jobId: string | undefined;
+    try {
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: epicId });
+
+      // Attempt 1 died in the ticket phase with the default pipeline recorded on a now-FAILED row.
+      const failed = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === epicId)!;
+      expect(failed.status).toBe("failed");
+      expect(failed.formula).toBe(formulaPath);
+      expect(failed.formulaVariant).toBeNull();
+
+      // The operator maps risk:high to the heavier pipeline while the retry sits in backoff.
+      await patchSettings({
+        formulaVariants: [{ label: "risk:high", formula: "anton-run-risk-high" }],
+      });
+
+      expect(await park(tdb.db, clock, jobId, "test: simulate retry")).toBe(true);
+      expect(await resumeJob(tdb.db, clock, jobId)).toBe(true);
+      await tickToIdle(runner);
+      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+
+      // A NEW run row (the failed one is never reopened) — carrying the pipeline the branch began on.
+      const retried = (await tdb.db.select().from(schema.runs)).find(
+        (r) => r.epicBeadId === epicId && r.id !== failed.id,
+      )!;
+      expect(retried.status).toBe("done");
+      expect(retried.worktreePath).toBe(failed.worktreePath); // same branch, same work
+      expect(retried.formula).toBe(formulaPath);
+      expect(retried.formulaVariant).toBeNull();
+      // The variant's extra run-wide gate never ran: one gate per ticket, nothing after the commit.
+      expect(lines(orderLog).filter((l) => l === "verify")).toHaveLength(tickets.length);
+      for (const t of tickets) expect((await beads.show(repo, t)).status).toBe("closed");
+      expect(beads.getPrRef(await beads.show(repo, epicId))).toBe("gh-42");
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      if (jobId) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  });
+
   it("keeps a `blocked` self-report when a later agent step in the same ticket reports delivered", async () => {
     // A ticket phase may dispatch more than one agent. The added step reports on ITS OWN work, so a
     // `delivered` from it must not overwrite the implementer's `blocked` — that would close a ticket

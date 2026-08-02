@@ -36,6 +36,7 @@ import { resolveOperator } from "../operator";
 import {
   createRun,
   findOpenRunForEpic,
+  findRunFormulaForBranch,
   updateRun,
 } from "../runs";
 import {
@@ -607,21 +608,26 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //     floor is applied to whatever came back — selection only changes which file is loaded —
       //     so a variant cannot escape it. The choice is then recorded ON THE RUN below rather than
       //     left to be inferred from settings and labels that may since have changed.
-      //     Selection happens ONCE PER RUN, not once per attempt: a run this job is RESUMING already
-      //     recorded the pipeline it walked, so that source is pinned and re-validated instead of
-      //     re-selected. Every attempt re-reads the board and the settings, so re-selecting would let
-      //     a label added since (`stage:implementing` — which this very job adds below — or an
+      //     Selection happens ONCE PER BRANCH, not once per attempt: an attempt that already
+      //     recorded a pipeline pins it, and this one re-validates that source instead of selecting
+      //     again. Every attempt re-reads the board and the settings, so re-selecting would let a
+      //     label added since (`stage:implementing` — which this very job adds below — or an
       //     operator's relabel) or an edited variant map switch pipelines after some tickets had
-      //     already committed, while the record below claimed the whole run used the new one.
+      //     already committed, while the record below claimed the whole run used the new one. The
+      //     pin is not limited to the open run row: an ordinary handler error settles the row
+      //     `failed`, so the runner's retry lands here with `existing` undefined while still reusing
+      //     that attempt's worktree and its committed tickets — hence the branch-scoped lookup
+      //     (findRunFormulaForBranch), which is the same continuity the retry itself resumes by.
       //     `{{var}}` values make this a RUNTIME cook: the pipeline is resolved with the run's own
       //     target, and bd's "every declared variable needs a value" check fires here rather than a
       //     formula anton cannot satisfy walking with literal placeholders in it.
+      const pinnedFormula = existing?.formula
+        ? { source: existing.formula, variant: existing.formulaVariant ?? undefined }
+        : await findRunFormulaForBranch(db, projectId, epicBeadId, branch);
       const formula = await validateRunFormula(repo, {
         labels: target.labels,
         variants: settings.formulaVariants,
-        pinned: existing?.formula
-          ? { source: existing.formula, variant: existing.formulaVariant ?? undefined }
-          : undefined,
+        pinned: pinnedFormula,
         vars: { target: epicBeadId },
       });
       assertRunFormulaFloor(formula);

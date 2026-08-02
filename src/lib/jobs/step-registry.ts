@@ -428,6 +428,41 @@ const NAMES_NO_REASONING =
   `\`.claude/agents/<id>.md\`) or a \`skill:<id>\` label (a \`.claude/skills/<id>/SKILL.md\`) so anton ` +
   `knows what to dispatch`;
 
+/** The label prefixes a `step:claude` names its instruction with. */
+const REASONING_PREFIXES = ["prompt", "skill"] as const;
+
+/**
+ * The instruction labels a step carries. A valueless `prompt:` names nothing, so it doesn't count —
+ * it falls through to the "names no prompt" rejection rather than reading as an ambiguity.
+ */
+function reasoningLabels(labels: string[] | undefined): string[] {
+  return (labels ?? []).filter((l) =>
+    REASONING_PREFIXES.some((p) => l.startsWith(`${p}:`) && l.length > p.length + 1),
+  );
+}
+
+/**
+ * A `step:claude` dispatches EXACTLY ONE instruction. {@link loadStepReasoning} reads `prompt:`
+ * first and `skill:` only if there is none, and `labelValueOf` takes the first label of a prefix by
+ * array order — so `prompt:security` next to `skill:release`, or two `prompt:` labels, would run one
+ * and silently drop the other, with which one it is decided by label ordering. Reject the ambiguity
+ * instead: the operator wrote two instructions and anton cannot know which they meant.
+ *
+ * `subject` names the step (and, at run start, the file), so the same rejection reads correctly from
+ * both the validator and the dispatch-time backstop.
+ */
+function assertOneReasoningLabel(labels: string[] | undefined, subject: string): void {
+  const named = reasoningLabels(labels);
+  if (named.length === 0) throw new PoisonEpic(`${subject} ${NAMES_NO_REASONING}`);
+  if (named.length === 1) return;
+  throw new PoisonEpic(
+    `${subject} carries ${named.length} instruction labels (${named.join(", ")}), but a ` +
+      `\`${STEP_LABEL_PREFIX}:claude\` step dispatches exactly one — anton will not pick one by label ` +
+      `order and silently drop the rest. Keep the one you meant, and give the other its own ` +
+      `\`[[steps]]\` entry.`,
+  );
+}
+
 /**
  * The handler a cooked step resolves to.
  *
@@ -459,11 +494,11 @@ export function resolveStep(step: CookedStep, formulaFile: string): StepDefiniti
   const definition = BUILTIN_STEPS[name];
   if (definition) {
     // The extension point's instruction rides on the step's OWN labels, so whether it can execute is
-    // knowable here. Checking it at dispatch alone (loadStepReasoning) would park a run that had
-    // already implemented and committed — the exact halfway failure run-start validation exists to
-    // prevent.
-    if (definition.name === "claude" && !namesReasoning(step)) {
-      throw new PoisonEpic(`formula step "${step.id}" in ${formulaFile} ${NAMES_NO_REASONING}`);
+    // knowable here — both that it names one, and that it names no more than one. Checking it at
+    // dispatch alone (loadStepReasoning) would park a run that had already implemented and committed
+    // — the exact halfway failure run-start validation exists to prevent.
+    if (definition.name === "claude") {
+      assertOneReasoningLabel(step.labels, `formula step "${step.id}" in ${formulaFile}`);
     }
     return definition;
   }
@@ -482,11 +517,6 @@ export function resolveStep(step: CookedStep, formulaFile: string): StepDefiniti
       `To add a step of your own, use \`${STEP_LABEL_PREFIX}:claude\` with a \`prompt:<id>\` or ` +
       `\`skill:<id>\` label.`,
   );
-}
-
-/** Does a `step:claude` step name what to dispatch? The labels {@link loadStepReasoning} reads. */
-function namesReasoning(step: CookedStep): boolean {
-  return Boolean(labelValueOf(step.labels, "prompt") || labelValueOf(step.labels, "skill"));
 }
 
 function knownStepNames(): string {
@@ -575,10 +605,12 @@ async function dispatchClaude(
  * `.claude/skills/<id>/SKILL.md` and falls back to anton's own vendored skill of that name.
  *
  * An unresolvable name PARKS: an agent dispatched with no instruction would burn a session and
- * report whatever it invented. The "names neither" case is already rejected at run start by
- * {@link resolveStep}; this stays as the backstop for a caller invoking the handler directly.
+ * report whatever it invented. The "names neither" and "names two" cases are already rejected at run
+ * start by {@link resolveStep}; the assertion stays here as the backstop for a caller invoking the
+ * handler directly.
  */
 async function loadStepReasoning(ctx: StepContext, stepId: string): Promise<string> {
+  assertOneReasoningLabel(ctx.step?.labels, `formula step "${stepId}"`);
   const promptId = labelValueOf(ctx.step?.labels, "prompt");
   if (promptId) {
     const body = await loadAgentPrompt(promptId, { projectDir: ctx.worktreePath });
