@@ -16,9 +16,11 @@ const { spawned } = vi.hoisted(() => ({
   spawned: [] as Array<{ file: string; args: string[]; options: Record<string, unknown> | undefined }>,
 }));
 
-vi.mock("node:child_process", async () => {
+// Only `spawn` is faked: bd.ts's own imports (git/remote's execFile) must keep working, so the rest
+// of the module is passed through rather than replaced.
+vi.mock("node:child_process", async (importActual) => {
   const { makeFakeSpawn } = await import("../testing/spawn");
-  return { spawn: makeFakeSpawn(spawned) };
+  return { ...(await importActual<typeof import("node:child_process")>()), spawn: makeFakeSpawn(spawned) };
 });
 
 const { beads } = await import("./bd");

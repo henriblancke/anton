@@ -49,6 +49,25 @@ export async function githubBaseUrl(repoPath: string): Promise<string | undefine
 }
 
 /**
+ * `owner/repo` for a github.com web base, or undefined for any other host (a GHE/GitLab/local
+ * remote). Pure — unit-testable.
+ */
+export function githubSlugFromBase(base: string | undefined): string | undefined {
+  return base?.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)$/)?.[1];
+}
+
+/**
+ * `owner/repo` of the repo's `origin`, or undefined when it isn't a github.com remote. This is the
+ * value `GH_REPO` takes: it overrides how the `gh` CLI resolves which repository a command targets,
+ * which is what makes it the belt-and-braces guard for beads gate checks (bd shells out to `gh`, and
+ * `gh` otherwise resolves the repo from the process cwd — see beads/bd.ts `bdGate`). Rides
+ * `githubBaseUrl`'s per-repo memo, so it costs at most one `git remote get-url` per repo per process.
+ */
+export async function githubRepoSlug(repoPath: string): Promise<string | undefined> {
+  return githubSlugFromBase(await githubBaseUrl(repoPath));
+}
+
+/**
  * Build the browser URL for a bead's PR external-ref. A full http(s) ref is returned as-is; a
  * `gh-<number>` ref is expanded against `base` to `<base>/pull/<number>`. Returns undefined when
  * there's nothing linkable (no ref, or a short ref with no known base). Pure — unit-testable.

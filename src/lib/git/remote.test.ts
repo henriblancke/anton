@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { attachPrUrl, prUrlFromRef, webBaseFromRemote } from "./remote";
+import { attachPrUrl, githubSlugFromBase, prUrlFromRef, webBaseFromRemote } from "./remote";
 
 describe("webBaseFromRemote", () => {
   it("normalizes scp-style ssh remotes", () => {
@@ -28,6 +28,21 @@ describe("webBaseFromRemote", () => {
     expect(webBaseFromRemote(undefined)).toBeUndefined();
     expect(webBaseFromRemote("")).toBeUndefined();
     expect(webBaseFromRemote("not-a-remote")).toBeUndefined();
+  });
+});
+
+describe("githubSlugFromBase", () => {
+  it("yields the owner/repo GH_REPO takes", () => {
+    expect(githubSlugFromBase(webBaseFromRemote("git@github.com:owner/repo.git"))).toBe(
+      "owner/repo",
+    );
+    expect(githubSlugFromBase("https://github.com/owner/repo")).toBe("owner/repo");
+  });
+
+  it("declines anything that isn't github.com — GH_REPO would misdirect gh, not protect it", () => {
+    expect(githubSlugFromBase("https://ghe.corp.com/team/app")).toBeUndefined();
+    expect(githubSlugFromBase("https://github.com/owner")).toBeUndefined();
+    expect(githubSlugFromBase(undefined)).toBeUndefined();
   });
 });
 
