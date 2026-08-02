@@ -29,9 +29,18 @@
  *    prompt as content would let a bead cooked-and-never-authored approve and run against a
  *    placeholder rubric — see {@link PROMPT_LINE}.
  *
- * Contract text: skills/bd/SKILL.md. Kept dependency-free (a type-only import) so the API route,
- * the job runner, and the board can all import it.
+ * Contract text: skills/bd/SKILL.md. Kept dependency-free — a type-only import and the markdown
+ * scanner it judges through (markdown.ts, itself dependency-free) — so the API route, the job
+ * runner, and the board can all import it.
  */
+import {
+  isHeading,
+  renderedLines,
+  scanMarkdown,
+  unquote,
+  type Heading,
+  type RenderedLine,
+} from "./markdown";
 import type { Bead } from "./types";
 
 export type ContractSeverity = "blocking" | "advisory";
@@ -86,20 +95,16 @@ export function isPipelineArtifact(bead: Bead): boolean {
  */
 type ContractTier = "ticket" | "epic" | "exempt";
 
+/** The bd types the ticket contract judges — the working layer bd dispatches an agent against. */
+const TICKET_TYPES: ReadonlySet<string> = new Set(["task", "bug", "chore", "feature"]);
+
 function tierOf(bead: Bead): ContractTier {
-  // Plumbing first, so no later widening of the ticket cases below can promote a gate/molecule.
+  // Plumbing first, so no later widening of the ticket types above can promote a gate/molecule.
   if (isPipelineArtifact(bead)) return "exempt";
-  switch (bead.issue_type) {
-    case "task":
-    case "bug":
-    case "chore":
-    case "feature":
-      return "ticket";
-    case "epic":
-      return "epic";
-    default:
-      return "exempt";
-  }
+  const type = bead.issue_type ?? "";
+  if (TICKET_TYPES.has(type)) return "ticket";
+  if (type === "epic") return "epic";
+  return "exempt";
 }
 
 /**
@@ -113,90 +118,22 @@ export function isTicketTier(bead: Bead): boolean {
   return tierOf(bead) === "ticket";
 }
 
-const HEADING = /^ {0,3}(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$/;
-
-/** An opening or closing code fence: up to 3 leading spaces, then 3+ backticks or tildes. */
-const FENCE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
-
-/** Heading text → comparison key, case- and punctuation-insensitive: `## Out-of-Scope:` → `outofscope`.
- * Inline HTML comments are stripped first: `## Acceptance <!-- markdownlint-disable-line -->` still
- * renders an Acceptance heading, and slugging the raw annotation missed the section — the hard gate
- * rejected otherwise shaped work. An unclosed comment runs to the end of the line, as it renders. */
-const slug = (heading: string) =>
-  heading
-    .replace(/<!--.*?(?:-->|$)/g, "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "");
-
-/** The HTML-comment state after `text`, given the state it began in — `<!--`/`-->` toggled in order. */
-function commentStateAfter(text: string, inComment: boolean): boolean {
-  let rest = text;
-  let state = inComment;
-  for (;;) {
-    const at = rest.indexOf(state ? "-->" : "<!--");
-    if (at === -1) return state;
-    rest = rest.slice(at + (state ? 3 : 4));
-    state = !state;
-  }
+/** A section being read: the heading that opened it and the body accumulated under it. */
+interface OpenSection {
+  key: string;
+  depth: number;
+  body: string[];
 }
 
-/**
- * The description's lines, each flagged with whether it sits inside a fenced code block or begins
- * inside a multiline HTML comment.
- *
- * Both matter because the contract is judged on HEADINGS: a bead whose description quotes the
- * formula (or any markdown sample) in a ``` block carries the literal line `## Acceptance` with
- * example boxes under it, and a scanner blind to fences reads that sample as the real section —
- * passing the blocking gate on a ticket that states no definition of done at all. A `## Acceptance`
- * hidden inside a `<!-- … -->` comment is the same hole from the other side: the render shows no
- * heading and no criteria, so a scanner that recognized it would open a section over text the
- * cleanup pass ({@link renderedLines}) never sees the opening delimiter of — classifying invisible
- * text as the written spec. Comment state is tracked only OUTSIDE fences, matching the cleanup's
- * own rule that comments inside fenced code are literal content.
- *
- * CommonMark rules, kept to what a description can hit: a closing fence matches the opening
- * character, is at least as long, and carries nothing but whitespace after it; a backtick fence's
- * info string may not contain a backtick; an unclosed fence (or comment) runs to the end of the
- * text (so the contract fails closed — the same way the description renders).
- *
- * The delimiter lines themselves are flagged: they are punctuation, not content, so a judge of
- * "does this section say anything" ({@link stateOf}) must skip them — an empty ``` block otherwise
- * reads as two lines of authored text.
- */
-function scanLines(
-  description: string,
-): { text: string; fenced: boolean; delimiter?: boolean; commented?: boolean }[] {
-  const out: { text: string; fenced: boolean; delimiter?: boolean; commented?: boolean }[] = [];
-  let open: { char: string; len: number } | undefined;
-  let inComment = false;
-  for (const text of description.split(/\r?\n/)) {
-    // A line that BEGINS inside a comment can neither open a section nor a fence — the render hides
-    // it. Text after a `-->` on the same line is kept out of the heading judgement on purpose: a
-    // heading must start the line, and the closing delimiter already occupies that position.
-    if (inComment) {
-      inComment = commentStateAfter(text, true);
-      out.push({ text, fenced: false, commented: true });
-      continue;
-    }
-    const fence = FENCE.exec(text);
-    if (fence) {
-      const [char, len] = [fence[1][0], fence[1].length];
-      if (!open) {
-        if (char !== "`" || !fence[2].includes("`")) {
-          open = { char, len };
-          out.push({ text, fenced: true, delimiter: true });
-          continue;
-        }
-      } else if (char === open.char && len >= open.len && fence[2].trim() === "") {
-        out.push({ text, fenced: true, delimiter: true });
-        open = undefined;
-        continue;
-      }
-    }
-    if (!open) inComment = commentStateAfter(text, false);
-    out.push({ text, fenced: !!open });
-  }
-  return out;
+/** Does this heading start ANOTHER section, rather than sit inside the one open? See {@link sectionsOf}. */
+const opensSection = (open: OpenSection | undefined, heading: Heading, keys: ReadonlySet<string>) =>
+  !open || heading.depth <= open.depth || keys.has(heading.key);
+
+/** File a finished section under its key. A repeated heading concatenates rather than replaces. */
+function fileSection(out: Map<string, string>, section: OpenSection | undefined): void {
+  if (!section) return;
+  const text = [out.get(section.key), section.body.join("\n").trim()].filter(Boolean).join("\n");
+  out.set(section.key, text);
 }
 
 /**
@@ -218,30 +155,14 @@ function scanLines(
  */
 function sectionsOf(description: string, keys: ReadonlySet<string>): Map<string, string> {
   const out = new Map<string, string>();
-  let key: string | undefined;
-  let level = 0;
-  let body: string[] = [];
-  const flush = () => {
-    if (!key) return;
-    const text = [out.get(key), body.join("\n").trim()].filter(Boolean).join("\n");
-    out.set(key, text);
-  };
-  for (const { text, fenced, commented } of scanLines(description)) {
-    const heading = fenced || commented ? null : HEADING.exec(text);
-    if (heading) {
-      const depth = heading[1].length;
-      const slugged = slug(heading[2]);
-      if (!key || depth <= level || keys.has(slugged)) {
-        flush();
-        key = slugged;
-        level = depth;
-        body = [];
-        continue;
-      }
-    }
-    if (key) body.push(text);
+  let open: OpenSection | undefined;
+  for (const { text, heading } of scanMarkdown(description)) {
+    if (heading && opensSection(open, heading, keys)) {
+      fileSection(out, open);
+      open = { key: heading.key, depth: heading.depth, body: [] };
+    } else open?.body.push(text);
   }
-  flush();
+  fileSection(out, open);
   return out;
 }
 
@@ -249,8 +170,8 @@ function sectionsOf(description: string, keys: ReadonlySet<string>): Map<string,
  * line rather than under `## Goal` still states one, and must not be faulted for it. */
 function preambleOf(description: string): string {
   const lines: string[] = [];
-  for (const { text, fenced, commented } of scanLines(description)) {
-    if (!fenced && !commented && HEADING.test(text)) break;
+  for (const { text, heading } of scanMarkdown(description)) {
+    if (heading) break;
     lines.push(text);
   }
   return lines.join("\n").trim();
@@ -283,71 +204,8 @@ const EMPTY_LIST_ITEM = new RegExp(`^${LIST_MARKER.source}(?:[ \t]+\\[[ xX]?\\])
  * as a rule, not text, so a section holding only `---` says nothing ({@link stateOf}). */
 const THEMATIC_BREAK = /^([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
 
-/** One blockquote marker — up to 3 leading spaces, `>`, then an optional space (CommonMark). */
-const BLOCKQUOTE = /^ {0,3}>[ \t]?/;
-
-/**
- * `text` with every blockquote marker stripped, nesting included — the content the callout wraps.
- *
- * The marker is punctuation: `> TODO — fill this in` renders the prompt inside a callout, and it is
- * exactly as unwritten as the bare line. A judge blind to the prefix saw no {@link PROMPT_LINE}
- * match and read the section as authored, so a project-local formula that styles its placeholders
- * as callouts passed the blocking gate with no definition of done at all.
- */
-function unquote(text: string): string {
-  let out = text;
-  while (BLOCKQUOTE.test(out)) out = out.replace(BLOCKQUOTE, "");
-  return out;
-}
-
 /** What a section holds. `prompt` is a gap like `absent` — they differ only in the message. */
 type SectionState = "written" | "prompt" | "absent";
-
-/**
- * A body's lines as the rendered description shows them: fence delimiters dropped, HTML comments
- * (`<!-- … -->`, single- or multi-line) stripped. Both are invisible in the render, so a judge of
- * "does this section say anything" must not count them — a template placeholder like
- * `## Acceptance\n<!-- add criteria here -->` is as empty as the heading alone. Comments inside
- * fenced code are literal content and are kept; an unclosed comment runs to the end of the body, so
- * the judgement fails closed — the same way the description renders.
- *
- * Each line keeps its `fenced` flag: fenced content is LITERAL, so the scaffolding filters
- * {@link stateOf} applies (headings, empty list markers, the TODO prompt) hold only outside fences —
- * a rubric written as a fenced Markdown example whose content is heading-shaped is still authored
- * text, and filtering it read the section as absent.
- */
-function renderedLines(raw: string): { text: string; fenced: boolean }[] {
-  const out: { text: string; fenced: boolean }[] = [];
-  let inComment = false;
-  for (const line of scanLines(raw)) {
-    if (line.delimiter) continue;
-    if (line.fenced) {
-      if (!inComment) out.push({ text: line.text, fenced: true });
-      continue;
-    }
-    let rest = line.text;
-    let kept = "";
-    while (rest !== "") {
-      if (inComment) {
-        const close = rest.indexOf("-->");
-        if (close === -1) break;
-        inComment = false;
-        rest = rest.slice(close + 3);
-      } else {
-        const open = rest.indexOf("<!--");
-        if (open === -1) {
-          kept += rest;
-          break;
-        }
-        kept += rest.slice(0, open);
-        inComment = true;
-        rest = rest.slice(open + 4);
-      }
-    }
-    out.push({ text: kept, fenced: false });
-  }
-  return out;
-}
 
 /**
  * The text a raw markdown body RENDERS, as one string: {@link renderedLines} joined — fence
@@ -386,29 +244,44 @@ export function renderedText(raw: string): string {
 function stateOf(bodies: string[]): SectionState {
   let state: SectionState = "absent";
   for (const raw of bodies) {
-    const lines = renderedLines(raw)
-      .map((l) => ({ text: (l.fenced ? l.text : unquote(l.text)).trim(), fenced: l.fenced }))
-      .filter(
-        (l) =>
-          l.text &&
-          (l.fenced ||
-            (!HEADING.test(l.text) && !EMPTY_LIST_ITEM.test(l.text) && !THEMATIC_BREAK.test(l.text))),
-      );
-    if (lines.length === 0) continue;
-    if (!lines.every((l) => !l.fenced && PROMPT_LINE.test(l.text))) return "written";
-    state = "prompt";
+    const body = bodyState(raw);
+    if (body === "written") return "written";
+    if (body === "prompt") state = "prompt";
   }
   return state;
 }
 
-interface SectionRule {
+/** Markup that STRUCTURES a section without saying anything in it. */
+const isScaffolding = (text: string) =>
+  isHeading(text) || EMPTY_LIST_ITEM.test(text) || THEMATIC_BREAK.test(text);
+
+/** The lines of a body that count as authored text — everything the render hides, the blank lines
+ * and the scaffolding dropped. Fenced content is literal, so the scaffolding test skips it. */
+function contentLines(raw: string): RenderedLine[] {
+  return renderedLines(raw)
+    .map((l) => ({ text: (l.fenced ? l.text : unquote(l.text)).trim(), fenced: l.fenced }))
+    .filter((l) => l.text !== "" && (l.fenced || !isScaffolding(l.text)));
+}
+
+/** One body's state. A body is a prompt only when EVERY line of it is one. */
+function bodyState(raw: string): SectionState {
+  const lines = contentLines(raw);
+  if (lines.length === 0) return "absent";
+  return lines.every((l) => !l.fenced && PROMPT_LINE.test(l.text)) ? "prompt" : "written";
+}
+
+/** How one section's gap reads, at either state it can be in. */
+interface SectionGap {
   section: ContractSection;
   severity: ContractSeverity;
-  /** Slugged headings that satisfy the rule. */
-  keys: string[];
   message: string;
   /** The same gap when the heading IS there — the operator must not be told to add what they see. */
   promptMessage: string;
+}
+
+interface SectionRule extends SectionGap {
+  /** Slugged headings that satisfy the rule. */
+  keys: string[];
 }
 
 export const GOAL_KEYS = ["goal"];
@@ -726,65 +599,76 @@ export function validateBeadContract(bead: Bead): ContractViolation[] {
 
   const description = typeof bead.description === "string" ? bead.description : "";
   const sections = sectionsOf(description, contractKeysOf(tier));
-  // A heading whose body is empty — or still the formula's TODO prompt — carries no spec, so it is
-  // as absent as no heading at all.
-  const sectionState = (keys: string[]) => stateOf(keys.map((k) => sections.get(k) ?? ""));
-  const violations: ContractViolation[] = [];
+  if (tier === "epic") return epicViolations(bead, description, sections);
+  return ticketViolations(bead, sections);
+}
 
-  // An epic is read, not executed: a one-line outcome, the Success Criteria its features add up to,
-  // and the one `area:` label the roadmap groups by (skills/bd/SKILL.md).
-  if (tier === "epic") {
-    // The outcome is judged like every other section, not by "is there any description text":
-    // an epic cooked from the formula carries `## Goal` holding the prompt and `## Success Criteria`
-    // holding real boxes, and a non-empty description read as an authored outcome let exactly that
-    // bead report fully conformant.
-    const outcome = stateOf([preambleOf(description), ...OUTCOME_KEYS.map((k) => sections.get(k) ?? "")]);
-    if (outcome !== "written") {
-      violations.push({
-        section: "Outcome",
-        severity: "advisory",
-        message:
-          outcome === "prompt"
-            ? "the outcome is still the formula's TODO prompt — nothing states the result these features add up to"
-            : "no outcome — an epic's description is the result its features add up to",
-      });
-    }
-    const success = stateOf(acceptanceBodies(bead, sections, SUCCESS_KEYS));
-    if (success !== "written") {
-      violations.push({
-        section: "Success Criteria",
-        severity: "blocking",
-        message:
-          success === "prompt"
-            ? "Success Criteria is still the formula's TODO prompt — nothing states when the outcome is reached (`bd update --acceptance`)"
-            : "no Success Criteria — nothing states when the outcome is reached (`bd update --acceptance`)",
-      });
-    }
-    violations.push(...areaViolations(bead));
-    return violations;
-  }
+/** A heading whose body is empty — or still the formula's TODO prompt — carries no spec, so it is
+ * as absent as no heading at all. */
+const sectionState = (sections: Map<string, string>, keys: string[]): SectionState =>
+  stateOf(keys.map((k) => sections.get(k) ?? ""));
 
+/**
+ * An epic is read, not executed: a one-line outcome, the Success Criteria its features add up to,
+ * and the one `area:` label the roadmap groups by (skills/bd/SKILL.md).
+ */
+function epicViolations(
+  bead: Bead,
+  description: string,
+  sections: Map<string, string>,
+): ContractViolation[] {
+  // The outcome is judged like every other section, not by "is there any description text":
+  // an epic cooked from the formula carries `## Goal` holding the prompt and `## Success Criteria`
+  // holding real boxes, and a non-empty description read as an authored outcome let exactly that
+  // bead report fully conformant.
+  const outcome = stateOf([preambleOf(description), ...OUTCOME_KEYS.map((k) => sections.get(k) ?? "")]);
+  const success = stateOf(acceptanceBodies(bead, sections, SUCCESS_KEYS));
+  return [
+    ...gapViolation(outcome, {
+      section: "Outcome",
+      severity: "advisory",
+      message: "no outcome — an epic's description is the result its features add up to",
+      promptMessage:
+        "the outcome is still the formula's TODO prompt — nothing states the result these features add up to",
+    }),
+    ...gapViolation(success, {
+      section: "Success Criteria",
+      severity: "blocking",
+      message: "no Success Criteria — nothing states when the outcome is reached (`bd update --acceptance`)",
+      promptMessage:
+        "Success Criteria is still the formula's TODO prompt — nothing states when the outcome is reached (`bd update --acceptance`)",
+    }),
+    ...areaViolations(bead),
+  ];
+}
+
+/** A ticket's blocking Acceptance, then the four advisory sections in {@link TICKET_RULES} order. */
+function ticketViolations(bead: Bead, sections: Map<string, string>): ContractViolation[] {
   const acceptance = stateOf(acceptanceBodies(bead, sections, ACCEPTANCE_KEYS));
-  if (acceptance !== "written") {
-    violations.push({
+  return [
+    ...gapViolation(acceptance, {
       section: "Acceptance",
       severity: "blocking",
       message:
-        acceptance === "prompt"
-          ? "Acceptance criteria is still the formula's TODO prompt — the run has no definition of done and self-review has no rubric (`bd update --acceptance`)"
-          : "no Acceptance criteria — the run has no definition of done and self-review has no rubric (`bd update --acceptance`)",
-    });
-  }
-  for (const rule of TICKET_RULES) {
-    const state = sectionState(rule.keys);
-    if (state === "written") continue;
-    violations.push({
+        "no Acceptance criteria — the run has no definition of done and self-review has no rubric (`bd update --acceptance`)",
+      promptMessage:
+        "Acceptance criteria is still the formula's TODO prompt — the run has no definition of done and self-review has no rubric (`bd update --acceptance`)",
+    }),
+    ...TICKET_RULES.flatMap((rule) => gapViolation(sectionState(sections, rule.keys), rule)),
+  ];
+}
+
+/** The rule's gap at this state — nothing when the section is written, and the message that names
+ * what the operator can SEE when it is not: an unwritten heading is not a missing one. */
+function gapViolation(state: SectionState, rule: SectionGap): ContractViolation[] {
+  if (state === "written") return [];
+  return [
+    {
       section: rule.section,
       severity: rule.severity,
       message: state === "prompt" ? rule.promptMessage : rule.message,
-    });
-  }
-  return violations;
+    },
+  ];
 }
 
 /** Exactly one `area:` label, with a nonempty value — the roadmap's Area column and Linear project
