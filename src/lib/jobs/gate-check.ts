@@ -19,12 +19,16 @@
  *      board's own answer, so anton keeps NO waiter list: a gate closing by this pass, by a human's
  *      `bd gate resolve`, or on another machine all surface here on the next slot. (A CLI-resolved
  *      human gate notifies no anton instance, which is exactly why the resume half runs every pass
- *      rather than only when this pass closed something.)
+ *      rather than only when this pass closed something.) `bd ready --gated` reports a gated bead
+ *      only when it has a PARENT, so the same resume is derived from the BOARD for gates hung on
+ *      parentless targets (plainGateResumes) — otherwise a standalone task/bug or top-level feature
+ *      parked behind an ad-hoc human/timer gate would wait forever: once that gate closes the bead
+ *      just returns to ordinary `bd ready`, which nothing in anton polls.
  *   4. FINALIZE — a run target whose `gh:pr` merge gate has closed is handed to review-fix, which
  *      closes it out exactly as it always has (anton-k0kj). This is the move that turns "waiting for
  *      merge" from a sweep that re-reads every open PR into one bd call per slot. Its discovery is
- *      the BOARD, not `bd ready --gated` — that call reports molecule steps only and never sees an
- *      ad-hoc gate on a plain bead.
+ *      the BOARD, not `bd ready --gated` — that call reports a gated bead only when it has a PARENT,
+ *      and a run target's merge gate blocks the target itself.
  *
  * IDEMPOTENCE is the property to preserve. `bd ready --gated` keeps reporting an entry for as long
  * as its step is ready — it is a view of the board, not a queue of events — so this pass must never
@@ -38,6 +42,12 @@
 import { beads, LABELS, type Bead, type Gate, type GateCheckScope, type GatedMolecule } from "../beads/bd";
 import { isPipelineArtifact } from "../beads/contract";
 import { loadAllIssues } from "../beads/issues";
+import {
+  computeEpicGraph,
+  epicStandaloneBlockers,
+  isUnit,
+  standaloneBlockers,
+} from "../epic-graph";
 import { prNumberFromRef } from "../git/pr";
 import { resolveOperator } from "../operator";
 import { getProjectById } from "../projects";
@@ -63,6 +73,15 @@ export interface GateCheckDeps {
  * the failure mode bd's own escalation has.
  */
 export const GATE_EXPIRED_LABEL = "gate-expired";
+
+/**
+ * Marks a closed gate whose blocked work this pass has already handed back to the runner. Same
+ * one-shot idiom as {@link GATE_EXPIRED_LABEL}, for a sharper reason: a resolved gate stays on its
+ * bead FOREVER, so without a marker every later pass would re-dispatch the same target — a park a
+ * human asked for would become an endless retry. On the SHARED board, so a second anton reading the
+ * same project doesn't dispatch it again either.
+ */
+export const GATE_RESUMED_LABEL = "gate-resumed";
 
 /** The stage label a run target carries while its PR is in review — cleared by merge-finalization. */
 const IN_REVIEW = LABELS.stage("in-review");
@@ -223,8 +242,9 @@ export function isResumableTarget(target: Bead, nowMs: number): boolean {
  *     TARGETED review-fix, which bypasses the sweep's filter — the concurrent-finalization race that
  *     filter exists to prevent.
  *
- * `bd ready --gated` is not usable here: it reports molecule steps only, so an ad-hoc gate on a
- * plain bead never appears in it, not even the pass after it closes.
+ * `bd ready --gated` is not usable here: it reports a gated bead only when it has a PARENT, and a
+ * merge gate blocks the run target itself — which for a standalone task/bug or a top-level feature
+ * has none, so it never appears there, not even the pass after it closes.
  */
 export function mergedGateTargets(board: Bead[], operator?: string): Bead[] {
   const byId = new Map(board.map((b) => [b.id, b]));
@@ -243,6 +263,68 @@ export function mergedGateTargets(board: Bead[], operator?: string): Bead[] {
       return gate.await_id === String(prNumber);
     });
   });
+}
+
+/**
+ * The target's open blockers, by the SAME rule execute-epic re-checks at job start: a graph unit
+ * (epic/feature) takes them from the epic-graph rollup plus the standalone prerequisites the rollup
+ * drops, a standalone task/bug from its own `blocks` edges. Anything looser here would dispatch work
+ * execute-epic then refuses, turning a wait into a parked job a human has to clear.
+ */
+function openBlockersOf(board: Bead[], target: Bead): string[] {
+  return isUnit(target)
+    ? [
+        ...(computeEpicGraph(board).epics.find((n) => n.id === target.id)?.blockedBy ?? []),
+        ...epicStandaloneBlockers(board, target.id),
+      ]
+    : standaloneBlockers(board, target.id);
+}
+
+/** A gate that has closed, paired with the run target its closing releases. */
+export interface PlainGateResume {
+  gate: Bead;
+  target: Bead;
+}
+
+/**
+ * The gate-closed work `bd ready --gated` CANNOT report. Measured on bd 1.1.2: that call reports a
+ * gated bead only when it HAS a parent (which it names as the `molecule_id`, molecule or not). A gate
+ * hung straight on a PARENTLESS run target — an approved standalone task/bug, a top-level feature,
+ * the founder's `bd gate create --blocks <task>` "not until the design review lands" — never appears
+ * there, before or after it closes: the bead simply returns to ordinary `bd ready`, which nothing in
+ * anton polls. The merge path below doesn't cover it either (that is `gh:pr` + `stage:in-review`
+ * only), so without this half the parked run waits forever on a wait that is already over.
+ *
+ * Derived from the BOARD, for the same reason the merge path is: a gate resolved by a human's CLI or
+ * on another machine has to surface here too, and this pass keeps no waiter list. Each clause:
+ *
+ *   • NOT a `gh:pr` merge wait — that flavour closing means "the PR merged", which is finalization
+ *     (step 4), not a resume. Dispatching both would re-run a target while review-fix closes it out.
+ *   • the target is not `stage:in-review` — step 4's territory, and an implementation that is done
+ *     needs no resume. A timer gate someone hung on work already in review just falls away.
+ *   • no OTHER open blocker — execute-epic's own readiness gate would refuse the dispatch and park
+ *     the job. The gate stays unmarked instead, so the next pass re-evaluates it once that blocker
+ *     lands. (The closed gate itself is `done`, so it never counts against its own release.)
+ *   • not already handed back ({@link GATE_RESUMED_LABEL}) — see there.
+ *
+ * NOT deduped by target: the marker is per-GATE, so two closed gates on one target must both be
+ * marked. The second dispatch is absorbed by `resumeEpic`, which refuses an epic a live job covers.
+ */
+export function plainGateResumes(board: Bead[], nowMs: number): PlainGateResume[] {
+  const out: PlainGateResume[] = [];
+  for (const gate of board) {
+    if (gate.issue_type !== "gate" || gate.status !== "closed") continue;
+    if (beads.isMergeWaitGate(gate)) continue;
+    if (gate.labels?.includes(GATE_RESUMED_LABEL)) continue;
+    const blocked = beadBlockedByGate(board, gate.id);
+    if (!blocked) continue;
+    const target = runTargetAbove(board, blocked.id);
+    if (!target || !isResumableTarget(target, nowMs)) continue;
+    if (target.labels?.includes(IN_REVIEW)) continue;
+    if (openBlockersOf(board, target).length > 0) continue;
+    out.push({ gate, target });
+  }
+  return out;
 }
 
 /**
@@ -292,7 +374,10 @@ export function makeGateCheckHandler(deps: GateCheckDeps): JobHandler {
     // board reads as "nothing to resume" and the gated run silently never restarts — the exact
     // failure this job exists to prevent, and one this pass's own gate writes can trigger. It also
     // carries the gate beads `bd list` omits, which is what makes the blocked-bead lookup possible.
-    const board = await loadAllIssues(repo);
+    // Strict on the gate listing: a swallowed failure there hands this pass a board with the gate
+    // EDGES but not the gates, which reads as "nothing closed" — every resume and finalization below
+    // silently no-ops. A rejection retries the pass instead.
+    const board = await loadAllIssues(repo, { strictGates: true });
     const nowMs = clock.now();
 
     // 2. Surface the waits that died. Re-read the gates when a check ran — the ones it closed are no
@@ -327,6 +412,24 @@ export function makeGateCheckHandler(deps: GateCheckDeps): JobHandler {
         console.log(`[gate-check] ${projectId}: ${target.id} ungated — ${outcome}`);
       }
     }
+
+    // 3b. The same resume for the gates step 3's discovery cannot see — an ad-hoc gate on a plain
+    //     bead (plainGateResumes). Marked one-shot on the gate itself, because a resolved gate stays
+    //     on its bead forever: the marker is what stops the next pass re-dispatching the same target.
+    //     The mark lands AFTER the dispatch decision, so a failed resume is retried next pass rather
+    //     than being silently recorded as handled — and every outcome is marked, including
+    //     `already-active`/`job-cancelled`: the gate has done its job in all four cases.
+    let handedBack = 0;
+    for (const { gate, target } of plainGateResumes(board, nowMs)) {
+      const outcome = await resumeEpic(db, clock, projectId, target.id);
+      console.log(`[gate-check] ${projectId}: ${target.id} released by gate ${gate.id} — ${outcome}`);
+      try {
+        await beads.tag(repo, gate.id, [GATE_RESUMED_LABEL]);
+        handedBack += 1;
+      } catch (e) {
+        console.error(`[gate-check] failed to mark gate ${gate.id} as handed back:`, e);
+      }
+    }
     // 4. Hand every MERGED run target to review-fix (anton-k0kj). This is the whole point of the
     //    merge gate: the sweep no longer has to re-read every open PR to notice a merge — one
     //    `bd gate check` settles the project's merge waits, and the targets whose wait closed are
@@ -352,7 +455,9 @@ export function makeGateCheckHandler(deps: GateCheckDeps): JobHandler {
     // Only when this pass actually wrote to the board. The resume half writes to anton.db alone, and
     // an idle pass is the common case on this cadence — pushing dolt every slot for nothing would
     // make a project with no gates the noisiest thing on the remote.
-    if (resolved > 0 || surfaced > 0) {
+    // `handedBack` counts too, and its push matters most: the marker is what keeps a SECOND anton
+    // sharing this board from re-dispatching the same released target.
+    if (resolved > 0 || surfaced > 0 || handedBack > 0) {
       await beads.sync(repo).catch((e) => console.error("[gate-check] beads dolt sync failed", e));
     }
 

@@ -146,7 +146,10 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     // blocker it can't see as still open (fail safe). Since a run now arms a `gh:pr` merge gate on
     // its own target (step 5, anton-k0kj), a bare list would leave that edge dangling and poison the
     // target's own recovery run forever. The second read only happens when a dangling edge exists.
-    let all = await loadAllIssues(repo);
+    // STRICT: a swallowed gate-listing failure would leave that same edge dangling, and the blocker
+    // check below reads an unknown blocker as open (fail safe) — so a transient bd failure would
+    // poison the run instead of retrying it. Let it reject; the runner retries.
+    let all = await loadAllIssues(repo, { strictGates: true });
     let target = all.find((b) => b.id === epicBeadId);
     if (!target) throw new PoisonEpic(`bead ${epicBeadId} not found on the board`);
     if (!beads.isRunTarget(target, all)) {
@@ -338,7 +341,10 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // target's SHAPE is re-derived from the adopted board too, but in 0a-ter below — after the
       // completion short-circuit, alongside the other gates that must not fire on a finished run.
       try {
-        const fresh = await loadAllIssues(repo); // gate-aware, like the read up top
+        // Strict for the same reason as the read up top — and here the catch already does the right
+        // thing with a rejection: keep the gate-complete pre-pull snapshot rather than adopting a
+        // fresh board whose gates are missing.
+        const fresh = await loadAllIssues(repo, { strictGates: true });
         const freshTarget = fresh.find((b) => b.id === epicBeadId);
         if (freshTarget) {
           all = fresh;

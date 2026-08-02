@@ -1082,9 +1082,12 @@ export const beads = {
    * --gated" on both 1.1.0 and 1.1.2 (contradicting its own usage line), and bare `bd mol ready`
    * lists EVERY ready molecule step, so it is not a substitute.
    *
-   * MOLECULE-ONLY (measured on 1.1.0 and 1.1.2, anton-k0kj): an ad-hoc gate on a plain bead never
-   * appears here, not even the pass after it closes — the blocked bead simply returns to `bd ready`.
-   * So the merge-wait gate above is discovered from the BOARD, not from this call.
+   * PARENTED BEADS ONLY (measured on 1.1.0 and 1.1.2, anton-k0kj): bd reports a gated bead here
+   * only when it HAS a parent — which it names as the `molecule_id`, molecule or not. A gate hung on
+   * a PARENTLESS bead (a standalone task/bug run target, a top-level feature, the target a run's own
+   * `gh:pr` merge gate blocks) never appears, before or after it closes: that bead simply returns to
+   * ordinary `bd ready`, which nothing in anton polls. So both board-derived halves of gate-check —
+   * the merge finalization and `plainGateResumes` — exist because this call cannot see them.
    */
   readyGated: (repo: string): Promise<GatedMolecule[]> =>
     bdGate(repo, ["ready", "--gated", "--json", "--limit", "0"]).then(asArray<GatedMolecule>),

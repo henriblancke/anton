@@ -1,8 +1,9 @@
 /**
  * End-to-end proof of anton-286r's acceptance, against REAL bd and the REAL handler: a satisfied
  * gate closes and its run is re-enqueued exactly once across two OVERLAPPING passes, a human gate is
- * untouched, and a gate that blew its timeout is surfaced for a human instead of being retried
- * forever. Skipped without bd.
+ * untouched, a gate that blew its timeout is surfaced for a human instead of being retried forever,
+ * and a gate on a PARENTLESS target — the one `bd ready --gated` never reports — resumes anyway.
+ * Skipped without bd.
  *
  * Two deliberate choices in the fixture:
  *
@@ -26,7 +27,7 @@ import { beads } from "../beads/bd";
 import { resetIssueSnapshots } from "../beads/snapshot";
 import * as schema from "../db/schema";
 import { systemClock } from "./queue";
-import { GATE_EXPIRED_LABEL, makeGateCheckHandler } from "./gate-check";
+import { GATE_EXPIRED_LABEL, GATE_RESUMED_LABEL, makeGateCheckHandler } from "./gate-check";
 
 /** A child ticket under `parent`, contract-shaped enough for bd to accept it. */
 function createTicket(repo: string, title: string, parent: string): string {
@@ -37,6 +38,17 @@ function createTicket(repo: string, title: string, parent: string): string {
   );
   const p = JSON.parse(raw);
   return (Array.isArray(p) ? p[0] : (p.issue ?? p)).id as string;
+}
+
+/** An approved PARENTLESS task — an epic-of-one, and the shape `bd ready --gated` cannot report. */
+async function createStandalone(repo: string, name: string): Promise<string> {
+  const id = await beads.create(repo, {
+    title: name,
+    type: "task",
+    acceptance: "- [ ] x",
+  });
+  await beads.approve(repo, id);
+  return id;
 }
 
 /** An approved epic with one ticket under it — the shape anton runs. */
@@ -59,9 +71,11 @@ describeBd("gate-check e2e (real handler · real bd)", () => {
   let timed: { epic: string; ticket: string };
   let human: { epic: string; ticket: string };
   let expired: { epic: string; ticket: string };
+  let plain: string;
   let timerGate: string;
   let humanGate: string;
   let expiredGate: string;
+  let plainGate: string;
 
   /** Run `count` gate-check passes CONCURRENTLY — the overlap the idempotence claim is about. */
   async function runPasses(count: number): Promise<void> {
@@ -96,12 +110,14 @@ describeBd("gate-check e2e (real handler · real bd)", () => {
     timed = await createRun(repo, "Timer-gated epic");
     human = await createRun(repo, "Human-gated epic");
     expired = await createRun(repo, "Expired-gate epic");
+    plain = await createStandalone(repo, "Timer-gated standalone task");
 
     timerGate = await beads.gateCreate(repo, {
       blocks: timed.ticket,
       type: "timer",
       timeout: "1s",
     });
+    plainGate = await beads.gateCreate(repo, { blocks: plain, type: "timer", timeout: "1s" });
     humanGate = await beads.gateCreate(repo, {
       blocks: human.ticket,
       type: "human",
@@ -144,7 +160,18 @@ describeBd("gate-check e2e (real handler · real bd)", () => {
   });
 
   it("re-enqueues the ungated run exactly once across two overlapping passes", async () => {
-    expect(await executeEpicJobs()).toEqual([timed.epic]);
+    expect((await executeEpicJobs()).sort()).toEqual([plain, timed.epic].sort());
+  });
+
+  it("resumes a PLAIN target too — the case `bd ready --gated` cannot report", async () => {
+    // Measured on bd 1.1.2: `bd ready --gated` reports a gated bead only when it has a PARENT (it
+    // names that parent as `molecule_id`). A gate hung on a parentless run target — an approved
+    // standalone task/bug, or a top-level feature — never appears there, before or after it closes:
+    // the bead just returns to ordinary `bd ready`, which nothing in anton polls. So the resume is
+    // derived from the board, and marked on the gate so it happens exactly once.
+    expect((await beads.readyGated(repo)).some((g) => g.ready_step?.id === plain)).toBe(false);
+    expect(await executeEpicJobs()).toContain(plain);
+    expect((await gateStatus(plainGate))?.labels ?? []).toContain(GATE_RESUMED_LABEL);
   });
 
   it("never touches the human gate, and never runs the work it blocks", async () => {
@@ -167,7 +194,8 @@ describeBd("gate-check e2e (real handler · real bd)", () => {
     const before = await notesOf(expired.ticket);
     await runPasses(1);
     expect(await notesOf(expired.ticket)).toBe(before);
-    // …and the re-dispatch stays idempotent on a later pass too: still one run for the ungated epic.
-    expect(await executeEpicJobs()).toEqual([timed.epic]);
+    // …and the re-dispatch stays idempotent on a later pass too: still one run each for the ungated
+    // epic and the ungated plain target, whose closed gate stays on its bead forever.
+    expect((await executeEpicJobs()).sort()).toEqual([plain, timed.epic].sort());
   });
 });

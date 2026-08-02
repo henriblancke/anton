@@ -51,14 +51,35 @@ function hasDanglingBlocker(work: Bead[]): boolean {
  * permanently, `bd gate resolve` notwithstanding. Reading them makes their real status knowable;
  * keeping them OUT of the work surfaces is a separate, type-based filter (isPipelineArtifact).
  *
- * Best-effort on purpose: a bd that cannot answer this listing degrades to the pre-gate behaviour
- * (gates absent ⇒ their edges read as open blockers) rather than failing the whole board read.
+ * Best-effort by DEFAULT (a UI read degrades to the pre-gate behaviour — gates absent ⇒ their edges
+ * read as open blockers — rather than failing the whole board read), strict when the caller asks:
+ * see {@link LoadIssuesOptions.strictGates}.
  */
-function loadGateIssues(cwd: string): Promise<Bead[]> {
-  return beads.list(cwd, ["--status", "all", "--type", "gate"]).catch(() => []);
+function loadGateIssues(cwd: string, strict: boolean): Promise<Bead[]> {
+  const gates = beads.list(cwd, ["--status", "all", "--type", "gate"]);
+  return strict ? gates : gates.catch(() => []);
 }
 
-export async function loadAllIssues(cwd: string): Promise<Bead[]> {
+export interface LoadIssuesOptions {
+  /**
+   * Fail the whole read when the gate listing fails, instead of degrading to a gate-less board.
+   *
+   * For a page render, degrading is right: a gate edge that reads as an open blocker renders one
+   * card as blocked and self-corrects on the next read. For a JOB it inverts the fail-safe. A run
+   * target's own `gh:pr` merge gate is a `blocks` edge on the target, and the gate bead is the only
+   * evidence that the edge is the target's own merge wait rather than a prerequisite — so a
+   * transient `bd list` failure makes execute-epic read that dangling id as a real blocker and
+   * PoisonEpic the run. For a PR closed without merging that gate never resolves, and a plain
+   * target's gate is not rediscoverable through `bd ready --gated`, so a park there needs a human.
+   * A rejected read is a normal retry instead — the same transient failure, handled where it can be.
+   */
+  strictGates?: boolean;
+}
+
+export async function loadAllIssues(
+  cwd: string,
+  opts: LoadIssuesOptions = {},
+): Promise<Bead[]> {
   const work = await loadWorkIssues(cwd);
   // CONDITIONAL, not unconditional: a board read sits on the operator's critical path behind the
   // Dolt lock, and anton-hwkx trimmed approve down to exactly one. A board with no dangling blocker
@@ -67,7 +88,7 @@ export async function loadAllIssues(cwd: string): Promise<Bead[]> {
   if (!hasDanglingBlocker(work)) return work;
   // Deduped rather than concatenated: a future bd that starts carrying gates in the ordinary
   // listing must not double them (and a test double answering both reads alike must not either).
-  return dedupeById([...work, ...await loadGateIssues(cwd)]);
+  return dedupeById([...work, ...await loadGateIssues(cwd, opts.strictGates ?? false)]);
 }
 
 export function allIssues(

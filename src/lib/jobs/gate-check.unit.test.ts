@@ -13,9 +13,11 @@ import {
   gateDeadline,
   isResumableTarget,
   mergedGateTargets,
+  plainGateResumes,
   resumeTargets,
   runTargetAbove,
   GATE_EXPIRED_LABEL,
+  GATE_RESUMED_LABEL,
 } from "./gate-check";
 
 const NOW = 1_700_000_000_000;
@@ -248,6 +250,124 @@ describe("resumeTargets", () => {
 
   it("drops an entry that names nothing anton can resolve", () => {
     expect(resumeTargets(board, [{ molecule_id: "" }, entry("ghost", "ghost")], NOW)).toEqual([]);
+  });
+});
+
+/**
+ * The resume `bd ready --gated` cannot report: an ad-hoc gate hung straight on a plain bead. bd
+ * reports gated MOLECULE steps only, so once such a gate closes its bead just returns to ordinary
+ * `bd ready` — and nothing in anton polls that. Without this half the parked run waits forever on a
+ * wait that is already over.
+ */
+describe("plainGateResumes", () => {
+  const approved = [LABELS.approved];
+
+  /** An approved standalone target blocked by `gateId`. */
+  const parked = (id: string, gateId: string, o: Partial<Bead> = {}): Bead =>
+    bead(id, {
+      labels: approved,
+      dependencies: [{ issue_id: id, depends_on_id: gateId, type: "blocks" }],
+      ...o,
+    });
+
+  /** The human gate a founder hung on it, resolved. */
+  const humanGate = (id: string, o: Partial<Gate> = {}): Gate =>
+    gate(id, { await_type: "human", status: "closed", ...o });
+
+  it("hands back a plain target whose ad-hoc gate has closed", () => {
+    const out = plainGateResumes([parked("t-1", "g-1"), humanGate("g-1")], NOW);
+    expect(out.map((r) => [r.gate.id, r.target.id])).toEqual([["g-1", "t-1"]]);
+  });
+
+  it("leaves the target alone while the gate is still open", () => {
+    expect(plainGateResumes([parked("t-1", "g-1"), humanGate("g-1", { status: "open" })], NOW))
+      .toEqual([]);
+  });
+
+  it("never touches a gh:pr gate — a merge is finalization, not a resume", () => {
+    // Both halves would otherwise fire on the same bead: this pass would re-run a target while
+    // review-fix is closing it out off the very same closed gate.
+    const board = [
+      parked("t-1", "g-1", { labels: [...approved, LABELS.stage("in-review")] }),
+      gate("g-1", { await_type: "gh:pr", status: "closed", await_id: "7" }),
+    ];
+    expect(plainGateResumes(board, NOW)).toEqual([]);
+    expect(mergedGateTargets([{ ...board[0], metadata: { pr: "gh-7" } }, board[1]])).toHaveLength(1);
+  });
+
+  it("leaves an in-review target alone — its implementation is done", () => {
+    const board = [
+      parked("t-1", "g-1", { labels: [...approved, LABELS.stage("in-review")] }),
+      humanGate("g-1"),
+    ];
+    expect(plainGateResumes(board, NOW)).toEqual([]);
+  });
+
+  it("marks nothing twice: a gate already handed back is skipped", () => {
+    // A resolved gate stays on its bead FOREVER, so without the marker every later pass would
+    // re-dispatch the same target — an operator's park would become an endless retry.
+    const board = [parked("t-1", "g-1"), humanGate("g-1", { labels: [GATE_RESUMED_LABEL] })];
+    expect(plainGateResumes(board, NOW)).toEqual([]);
+  });
+
+  it("waits while ANOTHER blocker is open, rather than dispatching work execute-epic refuses", () => {
+    const board = [
+      parked("t-1", "g-1", {
+        dependencies: [
+          { issue_id: "t-1", depends_on_id: "g-1", type: "blocks" },
+          { issue_id: "t-1", depends_on_id: "t-9", type: "blocks" },
+        ],
+      }),
+      humanGate("g-1"),
+      bead("t-9"),
+    ];
+    expect(plainGateResumes(board, NOW)).toEqual([]);
+    // …and the moment that prerequisite lands, the still-unmarked gate releases the target.
+    const done = [board[0], board[1], bead("t-9", { status: "closed" })];
+    expect(plainGateResumes(done, NOW).map((r) => r.target.id)).toEqual(["t-1"]);
+  });
+
+  it("applies the same resumability rules as the molecule half", () => {
+    const unapproved = [parked("t-1", "g-1", { labels: [] }), humanGate("g-1")];
+    expect(plainGateResumes(unapproved, NOW)).toEqual([]);
+    const live = [
+      parked("t-1", "g-1", { labels: [...approved, LABELS.runLease(NOW + 60_000)] }),
+      humanGate("g-1"),
+    ];
+    expect(plainGateResumes(live, NOW)).toEqual([]);
+  });
+
+  it("walks up to the run target when the gate sits on a child ticket", () => {
+    const board = [
+      parked("t-1", "g-1", { parent: "f-1" }),
+      bead("f-1", { issue_type: "feature", labels: approved }),
+      humanGate("g-1"),
+    ];
+    expect(plainGateResumes(board, NOW).map((r) => r.target.id)).toEqual(["f-1"]);
+  });
+
+  it("ignores a gate on a poured molecule step — that one bd DOES report", () => {
+    const board = [
+      parked("step-1", "g-1", { parent: "mol-1" }),
+      bead("mol-1", { issue_type: "molecule", parent: "f-1" }),
+      bead("f-1", { issue_type: "feature", labels: approved }),
+      humanGate("g-1"),
+    ];
+    expect(plainGateResumes(board, NOW)).toEqual([]);
+  });
+
+  it("reports every closed gate on one target, so each gets its own marker", () => {
+    const board = [
+      parked("t-1", "g-1", {
+        dependencies: [
+          { issue_id: "t-1", depends_on_id: "g-1", type: "blocks" },
+          { issue_id: "t-1", depends_on_id: "g-2", type: "blocks" },
+        ],
+      }),
+      humanGate("g-1"),
+      humanGate("g-2", { await_type: "timer" }),
+    ];
+    expect(plainGateResumes(board, NOW).map((r) => r.gate.id)).toEqual(["g-1", "g-2"]);
   });
 });
 
