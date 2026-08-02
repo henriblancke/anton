@@ -271,6 +271,20 @@ describe("resumeTargets", () => {
     expect(resumeTargets(done, [entry("t-1", "e-1")], NOW).map((t) => t.id)).toEqual(["e-1"]);
   });
 
+  it("leaves an in-review target alone — step 4 owns the merge, and a resume would double up", () => {
+    // A feature parented under a container epic DOES appear here once its merge gate closes, so
+    // without this guard the same bead gets both a review-fix (step 4) and a redundant execute-epic.
+    const inReview: Bead[] = [
+      bead("f-1", {
+        parent: "e-1",
+        issue_type: "feature",
+        labels: [LABELS.approved, LABELS.stage("in-review")],
+      }),
+      bead("e-1", { issue_type: "epic", labels: [LABELS.approved] }),
+    ];
+    expect(resumeTargets(inReview, [entry("f-1", "e-1")], NOW)).toEqual([]);
+  });
+
   it("resumes only the operator's own targets — a shared board must not double-dispatch", () => {
     // `bd ready --gated` reads the SHARED board, so every instance sees the same released step.
     // Unfiltered, each enqueues an execute-epic in its own machine-local table; the loser then

@@ -353,6 +353,11 @@ export function plainGateResumes(
  * the job, and because the entry stays listed for as long as its step is ready, every later pass
  * would resume and re-park it. Holding costs nothing: the entry is still there when the blocker
  * lands, and the pass logs it as unmatched meanwhile.
+ *
+ * `stage:in-review` targets are held back for plainGateResumes' reason too: an implementation that
+ * is done needs no resume, and its merge is step 4's territory. A parented feature whose `gh:pr`
+ * gate closes DOES surface here, so without this both halves fire on the same bead — step 4's
+ * review-fix plus a redundant execute-epic that reaches step 0a and exits.
  */
 export function resumeTargets(
   board: Bead[],
@@ -367,6 +372,7 @@ export function resumeTargets(
     const target = runTargetAbove(board, startId);
     if (!target || !isResumableTarget(target, nowMs)) continue;
     if (!ownedByOperator(target, operator)) continue;
+    if (target.labels?.includes(IN_REVIEW)) continue;
     targets.set(target.id, target);
   }
   // Blockers last, and once per distinct target: the rollup is a whole-board walk, and two steps of
