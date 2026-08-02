@@ -998,6 +998,12 @@ export interface Gate extends Bead {
   await_type?: GateType;
   /** The condition identifier — a workflow run id for `gh:run`, a PR number for `gh:pr`. */
   await_id?: string;
+  /**
+   * Timeout in NANOSECONDS — bd serialises a Go `time.Duration` as an integer, so `--timeout=2h`
+   * reads back as 7.2e12. Absent when the gate has no deadline (bd's default: wait forever).
+   * {@link gateDeadline} is the only place that converts it.
+   */
+  timeout?: number;
 }
 
 export interface GateCreateOpts {
