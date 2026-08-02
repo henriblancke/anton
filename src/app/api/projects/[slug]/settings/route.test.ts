@@ -208,3 +208,164 @@ describe("settings route — agents allowlist + autonomy (anton-46w)", () => {
     expect("budgetPolicy" in persisted()).toBe(false);
   });
 });
+
+/**
+ * Per-project self-review settings (anton-of1m): the gate's on/off flag, the swapped reviewer
+ * (validated against discoverAgents like the allowlist), the prompt override (mirroring
+ * reviewFixPrompt), and the bounded round cap.
+ */
+describe("settings route — self-review settings (anton-of1m)", () => {
+  beforeEach(async () => {
+    tdb = makeTestDb();
+    await tdb.db.insert(schema.projects).values({
+      id: "p1",
+      slug: "tmp",
+      name: "tmp",
+      repoPath: "/tmp/p1",
+    });
+  });
+
+  it("defaults to ON by absence: a fresh project persists no reviewEnabled key", async () => {
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.reviewEnabled).toBeUndefined();
+    expect("reviewEnabled" in persisted()).toBe(false);
+  });
+
+  it("PATCH persists reviewEnabled:false, and GET restores it", async () => {
+    const res = await PATCH(patchReq({ reviewEnabled: false }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.reviewEnabled).toBe(false);
+    expect(persisted().reviewEnabled).toBe(false);
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.reviewEnabled).toBe(false);
+  });
+
+  it('PATCH "" / null clears reviewEnabled back to the default-ON absence', async () => {
+    await PATCH(patchReq({ reviewEnabled: false }), ctx("tmp"));
+    const res = await PATCH(patchReq({ reviewEnabled: null }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.reviewEnabled).toBeUndefined();
+    expect("reviewEnabled" in persisted()).toBe(false);
+  });
+
+  it("PATCH rejects a non-boolean reviewEnabled", async () => {
+    for (const bad of ["yes", 1, {}]) {
+      const res = await PATCH(patchReq({ reviewEnabled: bad }), ctx("tmp"));
+      expect(res.status).toBe(400);
+    }
+    expect("reviewEnabled" in persisted()).toBe(false);
+  });
+
+  it("PATCH persists a discoverable reviewAgent, and GET restores it", async () => {
+    const res = await PATCH(patchReq({ reviewAgent: "nextjs" }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.reviewAgent).toBe("nextjs");
+    expect(persisted().reviewAgent).toBe("nextjs");
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.reviewAgent).toBe("nextjs");
+  });
+
+  it("PATCH rejects a reviewAgent discoverAgents doesn't know, leaving settings untouched", async () => {
+    await PATCH(patchReq({ reviewAgent: "fastapi" }), ctx("tmp"));
+    const res = await PATCH(patchReq({ reviewAgent: "cobol" }), ctx("tmp"));
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/cobol/);
+    expect(persisted().reviewAgent).toBe("fastapi");
+  });
+
+  it("PATCH rejects a non-string reviewAgent", async () => {
+    for (const bad of [42, ["nextjs"], {}]) {
+      const res = await PATCH(patchReq({ reviewAgent: bad }), ctx("tmp"));
+      expect(res.status).toBe(400);
+    }
+  });
+
+  it('PATCH "" / null clears reviewAgent back to the shipped contract (key removed)', async () => {
+    await PATCH(patchReq({ reviewAgent: "nextjs" }), ctx("tmp"));
+    const res = await PATCH(patchReq({ reviewAgent: "" }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.reviewAgent).toBeUndefined();
+    expect("reviewAgent" in persisted()).toBe(false);
+  });
+
+  it("PATCH persists a reviewPrompt override and clears it on empty", async () => {
+    const res = await PATCH(patchReq({ reviewPrompt: "Review for data loss only." }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.reviewPrompt).toBe("Review for data loss only.");
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.reviewPrompt).toBe("Review for data loss only.");
+
+    const cleared = await PATCH(patchReq({ reviewPrompt: null }), ctx("tmp"));
+    expect((await cleared.json()).settings.reviewPrompt).toBeUndefined();
+    expect("reviewPrompt" in persisted()).toBe(false);
+  });
+
+  it("PATCH rejects an over-long or non-string reviewPrompt", async () => {
+    const tooLong = await PATCH(patchReq({ reviewPrompt: "x".repeat(8001) }), ctx("tmp"));
+    expect(tooLong.status).toBe(400);
+    expect((await tooLong.json()).error).toMatch(/reviewPrompt/);
+
+    const notString = await PATCH(patchReq({ reviewPrompt: 42 }), ctx("tmp"));
+    expect(notString.status).toBe(400);
+    expect("reviewPrompt" in persisted()).toBe(false);
+  });
+
+  it("PATCH persists an in-range reviewMaxRounds, and GET restores it", async () => {
+    const res = await PATCH(patchReq({ reviewMaxRounds: 3 }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.reviewMaxRounds).toBe(3);
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.reviewMaxRounds).toBe(3);
+  });
+
+  it("PATCH rejects an out-of-range or non-integer reviewMaxRounds", async () => {
+    for (const bad of [0, 6, 2.5, "many"]) {
+      const res = await PATCH(patchReq({ reviewMaxRounds: bad }), ctx("tmp"));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/reviewMaxRounds/);
+    }
+    expect("reviewMaxRounds" in persisted()).toBe(false);
+  });
+
+  it('PATCH "" / null clears reviewMaxRounds back to the default (key removed)', async () => {
+    await PATCH(patchReq({ reviewMaxRounds: 4 }), ctx("tmp"));
+    const res = await PATCH(patchReq({ reviewMaxRounds: null }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.reviewMaxRounds).toBeUndefined();
+    expect("reviewMaxRounds" in persisted()).toBe(false);
+  });
+
+  it("round-trips the whole review block in one PATCH, alongside the agents allowlist", async () => {
+    const res = await PATCH(
+      patchReq({
+        agents: ["fastapi"],
+        reviewEnabled: true,
+        reviewAgent: "supabase",
+        reviewPrompt: "Focus on RLS.",
+        reviewMaxRounds: 5,
+      }),
+      ctx("tmp"),
+    );
+    expect(res.status).toBe(200);
+    const { settings } = await res.json();
+    expect(settings).toMatchObject({
+      agents: ["fastapi"],
+      reviewEnabled: true,
+      reviewAgent: "supabase",
+      reviewPrompt: "Focus on RLS.",
+      reviewMaxRounds: 5,
+    });
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings).toMatchObject({
+      reviewEnabled: true,
+      reviewAgent: "supabase",
+      reviewPrompt: "Focus on RLS.",
+      reviewMaxRounds: 5,
+    });
+  });
+});

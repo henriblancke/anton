@@ -19,16 +19,20 @@ import { runClaude, type ClaudeEvent, type ClaudeResult } from "../claude/driver
 import { formatAntonResult, parseAntonResult } from "../claude/anton-result";
 import {
   commitAll,
+  lookupOpenPullRequest,
+  markPullRequestDraft,
   openPullRequest,
   pullRequestState,
   resolveFreshBase,
   worktreeHasCommitFor,
+  type PullRequest,
 } from "../git/ops";
 import { createWorktree, findWorktree, removeWorktree } from "../git/worktree";
 import { bundledAgentIds, discoverAgents } from "../agents-discovery";
 import {
   getProjectById,
   getProjectSettings,
+  resolveReviewConfig,
   resolveVerifyGates,
   type ProjectSettings,
 } from "../projects";
@@ -45,7 +49,17 @@ import {
   startJobSession,
 } from "../sessions";
 import { buildPrTitle } from "./pr-title";
+import type { ReviewFinding } from "./review-context";
 import {
+  blockingFindings,
+  finalViolation,
+  runReviewGate,
+  type ReviewGateResult,
+  type ReviewRound,
+} from "./review-gate";
+import { persistPartialReviewScores, persistReviewScores } from "./review-score";
+import {
+  isPoisonError,
   isRecoverableClaudeError,
   isUsageLimitError,
   isRunAlreadyLiveError,
@@ -246,6 +260,10 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     // `assertLeaseHeld` guard reads it to park the run before a lease whose refresh pushes have been
     // failing silently lapses past its TTL and another machine treats the epic as free (anton-jz1).
     let leaseExpiry = 0;
+    // What the review gate found on the branch when it failed with an error anton rethrows unchanged
+    // (a usage limit, a transient claude failure) — the `catch` below folds it into that attempt's
+    // run error, which is the only report those paths get. Declared out here for that reason.
+    let orphanNotice = "";
     // Publish/refresh this run's lease. Advances `leaseLabels` ONLY after the write lands (not
     // best-effort like the other bd writes): a swallowed failure that still advanced the tracked
     // label would let `finally` clear a label that isn't on the board while the real prior lease
@@ -461,6 +479,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         throw new RunAlreadyLiveError(
           `${epicBeadId} is already running on another machine (unexpired run-lease) — parking; ` +
             `this attempt resumes once that run settles and clears its lease`,
+          "foreign",
         );
       }
       // No foreign live lease: adopt any leftover leases on the freshly-read target (this run's own
@@ -612,12 +631,14 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
             `${epicBeadId} found a live run-lease from another machine after a stale pre-check — parking ` +
               `rather than stealing by owner order (that run started earlier and won't yield); this ` +
               `attempt resumes once it settles and clears its lease`,
+            "foreign",
           );
         }
         if (!beads.winsRunLeaseRace(acquired, clock.now(), runId)) {
           throw new RunAlreadyLiveError(
             `${epicBeadId} lost the run-lease race to a concurrent run on another machine — parking; ` +
               `this attempt resumes once that run settles and clears its lease`,
+            "foreign",
           );
         }
       };
@@ -668,7 +689,8 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // Cooperative lease-liveness guard (anton-jz1). The refresh timer only LOGS a failed publish;
       // if writes to the shared board keep failing, the lease silently lapses past its TTL while this
       // run is still executing, and another machine's liveRunCheck would then see the epic as free and
-      // start a duplicate. So at each checkpoint below (every ticket boundary, and before the PR) we
+      // start a duplicate. So at each checkpoint below (every ticket boundary, every review-gate
+      // review/fix dispatch — the gate is handed this guard — and before the PR) we
       // re-check the expiry we last successfully PUSHED: once it's in the past we can no longer prove
       // we hold the shared lease, so we yield (RunAlreadyLiveError → park + retry, re-checking liveness
       // next attempt) rather than keep running unguarded. A single ticket that itself runs past the TTL
@@ -676,10 +698,14 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // — the exposure to roughly one ticket's worth of work.
       const assertLeaseHeld = () => {
         if (clock.now() >= leaseExpiry) {
+          // `unproven`, not `foreign`: this is OUR lease lapsing, and nothing here read another
+          // machine's. Callers that would hand the branch over to a foreign owner (the review gate's
+          // orphan-PR reconcile) must not do so on this.
           throw new RunAlreadyLiveError(
             `${epicBeadId} run-lease expired mid-run (refresh writes to the shared board have been ` +
               `failing) — parking so another machine doesn't treat the epic as free and double-run ` +
               `it; this attempt resumes once the board is reachable`,
+            "unproven",
           );
         }
       };
@@ -691,10 +717,13 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // existing worktree, so the base is never re-applied mid-run. Note the PR `base` below stays
       // the plain branch name (gh needs a branch, not a remote-tracking ref).
       const baseBranch = settings.baseBranch ?? project.defaultBranch;
+      // Held for the review gate below too: it diffs the branch against this base's MERGE BASE, so
+      // the remote-tracking ref is the accurate fork point even when the local base has drifted.
+      const freshBase = await resolveFreshBase(repo, baseBranch);
       const worktree = await createWorktree({
         repoPath: repo,
         branch,
-        baseBranch: await resolveFreshBase(repo, baseBranch),
+        baseBranch: freshBase,
         warm: true,
       });
       await updateRun(db, clock, runId, {
@@ -900,6 +929,105 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         await ctx.heartbeat();
       }
 
+      // 4b. Pre-PR self-review gate (anton-omum): a fresh-context reviewer reads THIS run's diff,
+      //     its blocking findings are fixed on the branch, and only then does the PR open — so the
+      //     PR the founder merges has already been reviewed once. Skipped entirely when the
+      //     operator turned review off (absent ⇒ on). Nothing about the verdict is persisted as a
+      //     resume marker on purpose: a parked run that is resumed re-reviews the worktree as it
+      //     stands now, which is the only state the fixes it just made are visible in. A run that
+      //     already opened its PR never reaches here — step 0a short-circuits it.
+      let advisoryFindings: ReviewFinding[] = [];
+      if (resolveReviewConfig(settings).enabled) {
+        // Handed IN as well as checked here: the gate's review → fix → re-review sequence can run
+        // well past the lease TTL, so it re-asserts at every dispatch rather than only at the edges.
+        assertLeaseHeld();
+        // Filled by the gate as each round completes, so a gate that THROWS — returning nothing —
+        // still leaves this attempt's score history to persist below.
+        const gateRounds: ReviewRound[] = [];
+        const review = await runReviewGate({
+          db,
+          clock,
+          ctx,
+          projectId,
+          runId,
+          target,
+          tickets: live,
+          settings,
+          worktreePath: worktree.path,
+          baseBranch: freshBase,
+          assertLeaseHeld,
+          rounds: gateRounds,
+        }).catch(async (e) => {
+          // A throwing gate never reaches persistReviewScores below, so the rounds it DID finish are
+          // written here or lost with the attempt — for a poison park (a round-3 death still owes the
+          // founder rounds 1 and 2) and equally for a retryable one, where the run is rescheduled and
+          // the resumed gate restarts from round 1 with nothing of this attempt on the board.
+          await persistPartialReviewScores(repo, epicBeadId, gateRounds);
+          // EVERY gate failure leaves the run without a PR of its own, so every one of them carries
+          // the orphan hazard: a PR a previous attempt opened but never recorded (lost `gh` response
+          // or lost setPrRef) stays READY and mergeable with un-reviewed work whether the gate
+          // refused the verdict, died on a usage limit, or exhausted its retries. Reconcile before
+          // propagating any of them. The one exception is a lease CONFIRMED lost to another machine —
+          // that run owns the branch and may have opened this very PR after passing its OWN gate, so
+          // drafting it would strand reviewed work with nobody left to ready it again. A lease this
+          // run merely couldn't KEEP is not that evidence, and is in fact the only kind reachable
+          // here: `assertLeaseHeld` — local expiry, `unproven` — is the gate's sole source of
+          // RunAlreadyLiveError, and skipping the reconcile on it left the orphan mergeable.
+          const orphan =
+            isRunAlreadyLiveError(e) && e.conflict === "foreign"
+              ? undefined
+              : await reconcileOrphanPullRequest(repo, worktree.branch);
+          // Errors anton doesn't compose a park message for are rethrown untouched — the runner keys
+          // its backoff (quota reschedule, retry) off the error's TYPE, and wrapping them would lose
+          // that. What the reconcile found rides out on the run row instead (see the catch below).
+          if (!isPoisonError(e)) {
+            orphanNotice = orphanClause(orphan);
+            throw e;
+          }
+          // The gate parks for a human on more than a blocking verdict: an unrevertable reviewer
+          // commit or a fixer that switched branches throws PoisonError from inside it. Those need
+          // the SAME parked-run handling — the instruction on both is repair by hand, then resume —
+          // so they are re-thrown as a gate block. Left as-is they marked the run `failed`, which
+          // hides the row from findOpenRunForEpic, and the resume the human was told to do would
+          // start a REPLACEMENT run instead of continuing this one and its session history.
+          throw new ReviewBlockedError(`${e.message}${orphanClause(orphan)}`, { cause: e });
+        });
+        // The score history belongs to the board, not this run's logs — written on both exits the gate
+        // RETURNS from, since a run parked on blocking findings is exactly the one whose score the
+        // founder needs. The throwing exit is covered by the catch above.
+        await persistReviewScores(repo, epicBeadId, review);
+
+        const blocking = blockingFindings(review.unresolved);
+        // Two states must not become a PR: blocking findings the converge loop couldn't clear, and a
+        // reviewer that broke the report protocol (silence — or a review that edited the code it was
+        // judging — is not a clean review). Both park for the founder like a no-delivery ticket does,
+        // with the reason on the bead so the board shows why rather than only the run log.
+        if (blocking.length > 0 || review.outcome === "protocol-violation") {
+          const orphan = await reconcileOrphanPullRequest(repo, worktree.branch);
+          // The advisories go on the bead with them: this run opens no PR, so its body — their only
+          // other home — never exists, and the resumed run starts its review with an empty carry.
+          const parkedAdvisories = review.unresolved.filter((f) => f.severity === "advisory");
+          const note = reviewParkNote(review, blocking, parkedAdvisories, orphan);
+          // Whether that write landed decides what the park reason can honestly say: a locked bd DB
+          // would otherwise discard the findings' only copy while the run error told the founder to
+          // read them on the bead (see reviewParkMessage).
+          const noted = await safe(() => beads.note(repo, epicBeadId, note));
+          throw new ReviewBlockedError(
+            reviewParkMessage({
+              targetId: epicBeadId,
+              outcome: review.outcome,
+              reason: reviewFailureReason(review, blocking),
+              note,
+              noted,
+              orphan,
+            }),
+          );
+        }
+        // Advisory findings never park (anton-3apm): they ride along in the PR body so the founder
+        // sees them at the merge gate.
+        advisoryFindings = review.unresolved.filter((f) => f.severity === "advisory");
+      }
+
       // 5. All tickets done → open one PR, stamp the PR ref, and (for an epic) move it to
       //    in-review. A standalone target is NOT closed here: like an epic it stays OPEN, tagged
       //    stage:in-review (runTicket already applied that on commit), carrying its PR ref until
@@ -915,28 +1043,61 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         title: buildPrTitle(target, epicBeadId, settings.conventionalCommits),
         // `live`, not `tickets`: an abandoned ticket contributed no commit, so listing it would
         // advertise work this PR doesn't contain (anton-6xj0).
-        body: prBody(target, live),
+        body: prBody(target, live, advisoryFindings),
       });
+      // A reused PR whose refresh `gh` refused still shows the previous attempt's body, and the run
+      // completes regardless — so this round's advisories would exist nowhere: the score comment
+      // records their COUNT, never their text. Write them onto the bead before the run finishes, so
+      // the founder still has the actionable detail the stale body is hiding.
+      let staleBodyFallback: string | null = null;
+      if (pr.bodyStale) {
+        const note = stalePrBodyNote(pr, advisoryFindings);
+        // If that write ALSO fails (a locked or unavailable beads DB) the findings have no home left,
+        // and the run would still finish `done` — the advisory detail silently dropped between this
+        // review and the merge gate. Carry the whole note out on the run row instead, the same
+        // durable fallback the park path uses (see reviewParkMessage).
+        if (!(await safe(() => beads.note(repo, epicBeadId, note)))) {
+          staleBodyFallback = stalePrBodyRunError(epicBeadId, note);
+        }
+      }
       await safe(() => beads.setPrRef(repo, epicBeadId, pr.ref));
       if (!standaloneRun) {
         await safe(() => beads.tag(repo, epicBeadId, [LABELS.stage("in-review")]));
         await safe(() => beads.untag(repo, epicBeadId, [LABELS.stage("implementing")]));
       }
 
-      // 6. Finalize run + clean up the worktree (the branch/PR carry the work now).
-      await updateRun(db, clock, runId, { status: "done", endedAt: clock.now(), error: null });
+      // 6. Finalize run + clean up the worktree (the branch/PR carry the work now). The run IS done —
+      //    the branch and its PR carry the work — so a stale-body salvage rides along as the row's
+      //    error rather than failing a delivery that landed.
+      await updateRun(db, clock, runId, {
+        status: "done",
+        endedAt: clock.now(),
+        error: staleBodyFallback,
+      });
       await safe(() => removeWorktree(worktree));
     } catch (e) {
-      // Quota or a run already live on another machine (anton-jz1) → park the run (the job
-      // reschedules and re-checks liveness); anything else → the run failed (job retries/parks).
+      // Quota, a run already live on another machine (anton-jz1), or a self-review that refused the
+      // PR → park the run (the job reschedules, re-checks liveness, or waits for the founder);
+      // anything else → the run failed (job retries/parks).
       if (isUsageLimitError(e)) {
-        await updateRun(db, clock, runId, { status: "parked", error: "usage-limit" });
+        await updateRun(db, clock, runId, { status: "parked", error: `usage-limit${orphanNotice}` });
       } else if (isRunAlreadyLiveError(e)) {
-        await updateRun(db, clock, runId, { status: "parked", error: "run-live-elsewhere" });
+        // The notice rides along here too: a lease that merely lapsed still reconciles the branch's
+        // orphan PR, and what that found (a PR drafted, or a `gh` lookup that failed) has nowhere
+        // else to be reported — this run opens no PR and composes no park message.
+        await updateRun(db, clock, runId, {
+          status: "parked",
+          error: `run-live-elsewhere${orphanNotice}`,
+        });
+      } else if (e instanceof ReviewBlockedError) {
+        // Parked, not failed, and with no endedAt: the run is waiting on a human to resolve what the
+        // gate refused on and resume it — the run history must not read like a crash. Resuming reuses
+        // THIS row (findOpenRunForEpic), so the resumed attempt continues in the same worktree/branch.
+        await updateRun(db, clock, runId, { status: "parked", error: e.message });
       } else {
         await updateRun(db, clock, runId, {
           status: "failed",
-          error: e instanceof Error ? e.message : String(e),
+          error: `${e instanceof Error ? e.message : String(e)}${orphanNotice}`,
           endedAt: clock.now(),
         });
       }
@@ -1355,6 +1516,252 @@ class BlockedByAgentError extends Error {
   }
 }
 
+/**
+ * The review gate refused to let this run open a PR (anton-omum): blocking findings it could not
+ * converge, a reviewer that broke the report protocol, or poison the gate raised itself (a reviewer
+ * commit it could not revert, a fixer that moved to a branch of its own).
+ *
+ * Poison-classified (`name = "PoisonError"`) like {@link NoDeliveryError}, so the runner parks the run
+ * for the founder instead of retrying: the reviewer has already had its bounded rounds to converge,
+ * and re-running the same gate on the same diff would reproduce the same verdict. Marks the run
+ * PARKED rather than failed, so the resume the founder is instructed to do reuses this row.
+ */
+class ReviewBlockedError extends Error {
+  constructor(msg: string, options?: ErrorOptions) {
+    super(msg, options);
+    this.name = "PoisonError"; // classified as poison by the runner
+  }
+}
+
+/**
+ * Why the gate refused the PR, in one clause — shared by the park note and the thrown error so the
+ * bead and the run log say the same thing.
+ */
+function reviewFailureReason(review: ReviewGateResult, blocking: ReviewFinding[]): string {
+  if (blocking.length > 0) return `${blocking.length} blocking finding(s) survived the gate`;
+  switch (finalViolation(review)) {
+    case "worktree-modified":
+      return `the reviewer modified the worktree it was judging`;
+    case "malformed-findings":
+      return `the reviewer's findings list was unreadable`;
+    case "missing-rationale":
+      return `the reviewer scored the run without justifying the score`;
+    case "trailing-content":
+      return `the reviewer appended text after its report block`;
+    default:
+      return `the reviewer never reported a valid score`;
+  }
+}
+
+/** What the park path found on the run's branch: an untracked PR it defused, or a lookup gh refused. */
+interface OrphanPullRequest {
+  /** The untracked PR open on the branch. Absent when the lookup itself failed. */
+  pr?: PullRequest;
+  /** Whether that PR is now a draft — it already was, or we flipped it. */
+  drafted?: boolean;
+  /** True when `gh` could not be asked at all, so an orphan may be sitting there un-drafted. */
+  lookupFailed?: boolean;
+}
+
+/**
+ * Defuse a PR a PREVIOUS attempt opened on this branch that never made it onto the bead (anton-3apm).
+ *
+ * `gh pr create` can succeed server-side with its response — or the best-effort `setPrRef` after it —
+ * lost, so a retry finds no PR ref, re-runs, and reaches this gate with a live PR nobody tracks. Park
+ * without touching it and un-reviewed work stays mergeable at the founder's merge gate while anton
+ * reports no PR was opened: a false green of exactly the kind this gate exists to prevent. Converting
+ * it to a draft keeps the PR (number, threads, body) while making it unmergeable until a resumed run
+ * passes the gate and `openPullRequest` readies it again.
+ *
+ * The ref is deliberately NOT stamped onto the bead here: step 0a treats a ref whose PR is OPEN as
+ * proof another run finished the epic, so recording it would make the next resume short-circuit as
+ * done — retiring the epic with its blocking findings unaddressed.
+ *
+ * A lookup gh could not answer is reported as such, never as "no PR": the whole point of this pass is
+ * that an un-drafted orphan stays mergeable, and telling the founder no PR was opened on the strength
+ * of a network blip is the same false green in a quieter form.
+ */
+async function reconcileOrphanPullRequest(
+  repoPath: string,
+  branch: string,
+): Promise<OrphanPullRequest | undefined> {
+  const { pr, failed } = await lookupOpenPullRequest(repoPath, branch);
+  if (failed) return { lookupFailed: true };
+  if (!pr) return undefined;
+  return { pr, drafted: pr.isDraft === true || (await markPullRequestDraft(repoPath, pr.ref)) };
+}
+
+/** What became of an orphan PR, appended to the park message — empty when the branch had none. */
+function orphanClause(orphan: OrphanPullRequest | undefined): string {
+  if (!orphan) return "";
+  if (orphan.lookupFailed || !orphan.pr) {
+    return (
+      ` WARNING: anton could NOT check whether an earlier attempt left a PR open on this branch ` +
+      `(the \`gh\` lookup failed) — if one is open it is still mergeable with this un-reviewed work. ` +
+      `Check the branch by hand.`
+    );
+  }
+  return orphan.drafted
+    ? ` A PR an earlier attempt had already opened (${orphan.pr.url}) was converted to a DRAFT so ` +
+        `this un-reviewed work can't be merged; it returns to ready when the gate passes.`
+    : ` WARNING: a PR an earlier attempt had already opened (${orphan.pr.url}) is still open and ` +
+        `could NOT be converted to a draft — draft or close it by hand so this un-reviewed work ` +
+        `isn't merged.`;
+}
+
+/**
+ * The park reason on the RUN row — and, when the bead write failed, the findings themselves.
+ *
+ * A parked run opens no PR, and the score comments carry counts and a rationale, never the notes:
+ * the bead note is the findings' only home. If `bd note` fails (locked or unavailable DB) that home
+ * doesn't exist, so the run error stops pointing at the bead and reproduces the whole note instead —
+ * the run row is persisted (`updateRun`) and surfaced to the founder, which makes it the durable
+ * fallback. Claiming "the findings are on the bead" unconditionally was the data loss: the only copy
+ * discarded, under a message that told nobody to go looking.
+ */
+export function reviewParkMessage(args: {
+  targetId: string;
+  outcome: ReviewGateResult["outcome"];
+  /** {@link reviewFailureReason} — the one-line why, without trailing punctuation. */
+  reason: string;
+  /** {@link reviewParkNote} — the full findings text this run tried to write to the bead. */
+  note: string;
+  /** Did that write land? */
+  noted: boolean;
+  orphan?: OrphanPullRequest;
+}): string {
+  const head = `${args.targetId} did not pass its pre-PR self-review (${args.outcome}): ${args.reason}.`;
+  // The note already carries the orphan clause and the resume instruction, so the fallback branch
+  // must not append them a second time.
+  return args.noted
+    ? `${head} No PR opened — the findings are on the bead; resolve them (or fix the ticket) and ` +
+        `resume the run.${orphanClause(args.orphan)}`
+    : `${head} No PR opened, and writing the findings to ${args.targetId} FAILED (a locked or ` +
+        `unavailable beads DB) — nothing else holds them, so they are reproduced here in full; put ` +
+        `them back on the bead by hand before resuming:\n\n${args.note}`;
+}
+
+/**
+ * The park reason on the target bead: what the reviewer refused to pass, in its own words.
+ *
+ * The ADVISORIES ride along with the blocking findings, because this note is the only place they
+ * survive. A parked run opens no PR — the body is where advisories normally reach the founder — and
+ * the resumed run re-reviews from scratch with an empty carry, so an advisory the next reviewer
+ * doesn't happen to restate would vanish between the review that found it and the merge gate it was
+ * meant to reach. The score comment records their count, never their text.
+ */
+function reviewParkNote(
+  review: ReviewGateResult,
+  blocking: ReviewFinding[],
+  advisory: ReviewFinding[],
+  orphan?: OrphanPullRequest,
+): string {
+  const rounds = review.rounds.length;
+  const head =
+    blocking.length > 0
+      ? `anton: the pre-PR self-review left ${blocking.length} blocking finding(s) unresolved after ` +
+        `${rounds} round(s) (${review.outcome}) — no PR was opened:`
+      : violationParkHead(review, rounds);
+  const orphanLine = orphanClause(orphan).trim();
+  return [
+    head,
+    ...findingLines(blocking),
+    ``,
+    ...(advisory.length > 0
+      ? [
+          `Advisory findings from the same review (${advisory.length}) — they did not park the run, ` +
+            `but no PR carries them, so they are recorded here:`,
+          ...findingLines(advisory),
+          ``,
+        ]
+      : []),
+    ...(orphanLine ? [orphanLine, ``] : []),
+    // A protocol violation lists no findings, so there is no "them" to resolve — the head already
+    // named the one thing to fix.
+    blocking.length > 0
+      ? `Resolve them (or correct the ticket), then resume the run.`
+      : `Correct the issue above, then resume the run.`,
+  ].join("\n");
+}
+
+/** The park-note headline when the verdict itself was untrustworthy — which way it broke, and why. */
+function violationParkHead(review: ReviewGateResult, rounds: number): string {
+  switch (finalViolation(review)) {
+    case "worktree-modified":
+      return (
+        `anton: the pre-PR self-review EDITED the worktree it was judging after ${rounds} round(s) ` +
+        `— its changes were reverted and its verdict discarded, because a reviewer that fixes the ` +
+        `code cannot vouch for it. No PR was opened; check which reviewer this project is using.`
+      );
+    case "malformed-findings":
+      return (
+        `anton: the pre-PR self-review reported an unreadable findings list after ${rounds} round(s) ` +
+        `(${review.outcome}) — no PR was opened, because a report anton cannot parse may be hiding a ` +
+        `blocking finding.`
+      );
+    case "missing-rationale":
+      return (
+        `anton: the pre-PR self-review reported a score with no rationale after ${rounds} round(s) ` +
+        `(${review.outcome}) — no PR was opened, because a bare number says nothing about which ` +
+        `Acceptance criteria were checked. Check that the reviewer emits a "rationale" with its score.`
+      );
+    case "trailing-content":
+      return (
+        `anton: the pre-PR self-review appended text AFTER its report block after ${rounds} round(s) ` +
+        `(${review.outcome}) — no PR was opened, because trailing prose is where a reviewer retracts ` +
+        `or corrects the verdict above it. Check that the reviewer ends its final message with the ` +
+        `json block and nothing else.`
+      );
+    default:
+      return (
+        `anton: the pre-PR self-review never reported a valid score after ${rounds} round(s) ` +
+        `(${review.outcome}) — no PR was opened, because silence is not a clean review.`
+      );
+  }
+}
+
+/** Findings as a markdown list — shared by the park note and the PR body. */
+function findingLines(findings: ReviewFinding[]): string[] {
+  return findings.map((f) => `- ${f.location} — ${f.note}`);
+}
+
+/**
+ * The salvage note for a reused PR whose body could not be refreshed: this run's advisory findings,
+ * plus the warning that the PR text belongs to an earlier attempt.
+ *
+ * The PR body is the ONLY place the findings' text is written — the score comments carry counts, a
+ * verdict and a rationale, not the notes — so without this a `gh pr edit` that failed on a permission
+ * or a network blip silently discards every actionable detail this review produced, while the founder
+ * reads a stale finding list at the merge gate as if it were current.
+ */
+function stalePrBodyNote(pr: PullRequest, advisory: ReviewFinding[]): string {
+  return [
+    `anton: this run reused the PR at ${pr.url} but could NOT rewrite its title/body — what GitHub ` +
+      `shows is an earlier attempt's text, not this run's. Read the findings below instead of the PR body.`,
+    ``,
+    ...(advisory.length > 0
+      ? [`Advisory findings from this run's self-review (${advisory.length}):`, ...findingLines(advisory)]
+      : [`This run's self-review reported no advisory findings.`]),
+  ].join("\n");
+}
+
+/**
+ * The run-row salvage when BOTH homes for a stale-body run's findings failed: `gh pr edit` refused
+ * the refresh AND `bd note` could not record them either (a locked or unavailable beads DB).
+ *
+ * The run still delivered — the branch and its PR carry the work — so this rides on the completed
+ * run row (persisted by `updateRun` and surfaced to the founder) rather than failing it. It
+ * reproduces the note IN FULL because at this point nothing else holds the findings' text: the PR
+ * body is an earlier attempt's, and the score comment records only their count.
+ */
+export function stalePrBodyRunError(targetId: string, note: string): string {
+  return (
+    `The PR body could not be refreshed AND writing this run's self-review findings to ${targetId} ` +
+    `FAILED (a locked or unavailable beads DB) — nothing else holds them, so they are reproduced ` +
+    `here in full; put them back on the bead by hand:\n\n${note}`
+  );
+}
+
 /** Fold the parsed self-report into a zero-diff block reason, when one was emitted (anton-j5i8). */
 function selfReportSuffix(selfReport: ReturnType<typeof parseAntonResult>): string {
   if (!selfReport) return "";
@@ -1510,13 +1917,28 @@ export function ticketPrompt(ticket: Bead): string {
   return lines.join("\n");
 }
 
-function prBody(target: Bead, tickets: Bead[]): string {
+/**
+ * `advisory` — findings the self-review reported and did NOT fix (anton-omum). They never hold the PR
+ * back, so the merge gate is the only place the founder would ever see them; putting them in the body
+ * is what makes "self-reviewed" mean something they can act on rather than trust blindly.
+ */
+function prBody(target: Bead, tickets: Bead[], advisory: ReviewFinding[] = []): string {
   // Standalone run (epic-of-one): the single ticket IS the target, so listing it again is noise.
   const standalone = tickets.length === 1 && tickets[0]?.id === target.id;
   const lines = [
     `Autonomous run for **${target.id}** — ${target.title}.`,
     ``,
     ...(standalone ? [] : [`Tickets:`, ...tickets.map((t) => `- ${t.id} — ${t.title}`), ``]),
+    ...(advisory.length > 0
+      ? [
+          `### Unresolved review findings (${advisory.length}, advisory)`,
+          ``,
+          `anton's pre-PR self-review reported these and left them for you — they don't block the merge.`,
+          ``,
+          ...findingLines(advisory),
+          ``,
+        ]
+      : []),
     `🤖 Generated with [anton](https://github.com/) autonomous execution`,
   ];
   return lines.join("\n");
@@ -1532,11 +1954,16 @@ async function withDispatchNotes(repo: string, ticket: Bead): Promise<Bead> {
   return fresh?.notes ? { ...ticket, notes: fresh.notes } : ticket;
 }
 
-/** Swallow errors from best-effort bd side effects (already-applied labels, etc.). */
-async function safe(fn: () => Promise<unknown>): Promise<void> {
+/**
+ * Swallow errors from best-effort bd side effects (already-applied labels, etc.). Reports whether
+ * the write actually landed, so a caller whose write carries content that exists nowhere else can
+ * fall back instead of assuming it (see {@link reviewParkMessage}).
+ */
+async function safe(fn: () => Promise<unknown>): Promise<boolean> {
   try {
     await fn();
+    return true;
   } catch {
-    // best-effort
+    return false; // best-effort
   }
 }

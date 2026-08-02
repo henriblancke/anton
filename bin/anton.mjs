@@ -208,10 +208,12 @@ function runLocal(bin, args, env = {}) {
 // project's own <repo>/.claude/ (project scope wins when `claude` runs there). No-clobber is the
 // invariant: an existing destination — a prior install OR the user's own (possibly modified) file —
 // is never overwritten, so a re-run writes nothing. Keep REQUIRED_SKILLS / INSTALLED_SKILLS in sync
-// with src/lib/claude/prompt.ts.
+// with src/lib/claude/prompt.ts — the launcher must stay pure Node (no TS import), so the lists are
+// duplicated here and pinned equal by a cross-list assertion in bin/anton.test.ts. A skill anton's
+// runtime loads but the installer never copies is a job that dies on a missing SKILL.md.
 const AGENTS_SRC = join(APP_ROOT, "src", "prompts", "agents");
 const SKILLS_SRC = join(APP_ROOT, "skills");
-const REQUIRED_SKILLS = ["shape", "bd", "scan-triage", "review-fix"];
+const REQUIRED_SKILLS = ["shape", "bd", "scan-triage", "review-fix", "review"];
 // The full set installed into a project (non-deselectable): the runtime-required skills + the
 // founder-run `setup` scaffolder. `setup` isn't runtime-loaded, but must be installed so `/setup`
 // resolves; it ships its `.product/` templates under skills/setup/templates/, copied with it.

@@ -10,6 +10,7 @@ import {
   claudeResumeDecision,
   continuationPrompt,
   inactiveAgentTickets,
+  reviewParkMessage,
   ticketPrompt,
 } from "./execute-epic";
 
@@ -249,5 +250,43 @@ describe("claudeResumeDecision (anton-juar)", () => {
         "service-unavailable",
       ),
     ).toEqual({ resume: false, reason: "resume budget spent" });
+  });
+});
+
+describe("reviewParkMessage (anton-3apm)", () => {
+  const note = [
+    "anton: the pre-PR self-review left 1 blocking finding(s) unresolved after 2 round(s):",
+    "- src/z.ts:1 — AC-2 is not implemented",
+    "",
+    "Resolve them (or correct the ticket), then resume the run.",
+  ].join("\n");
+
+  const message = (noted: boolean) =>
+    reviewParkMessage({
+      targetId: "anton-x1",
+      outcome: "unresolved",
+      reason: "1 blocking finding(s) survived the gate",
+      note,
+      noted,
+      orphan: undefined,
+    });
+
+  it("points at the bead when the note landed there", () => {
+    const out = message(true);
+    expect(out).toContain("anton-x1 did not pass its pre-PR self-review (unresolved)");
+    expect(out).toContain("the findings are on the bead");
+    // The bead holds them, so the run error stays a pointer rather than a second copy.
+    expect(out).not.toContain("AC-2 is not implemented");
+  });
+
+  it("reproduces the findings in full when the bd write FAILED — the run error is their only copy", () => {
+    // No PR body exists on a parked run and the score comments carry counts, not notes: without
+    // this the locked-DB path discards every actionable detail while telling the founder to read
+    // them on the bead.
+    const out = message(false);
+    expect(out).toContain("writing the findings to anton-x1 FAILED");
+    expect(out).not.toContain("the findings are on the bead;");
+    expect(out).toContain("AC-2 is not implemented");
+    expect(out).toContain("Resolve them (or correct the ticket), then resume the run.");
   });
 });

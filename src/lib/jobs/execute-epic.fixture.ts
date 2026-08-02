@@ -263,8 +263,14 @@ e({type:'result',subtype:'success',result:'done',session_id:'s',num_turns:1,tota
 process.exit(0);`),
   );
   const successClaude = fakeClaude;
-  // Fake gh: echo a PR url.
-  const fakeGh = writeBin(binDir, "gh", `console.log('https://github.com/acme/repo/pull/42');process.exit(0);`);
+  // Fake gh: no PR on the branch yet (`pr list` → empty), and `pr create` echoes a PR url.
+  const fakeGh = writeBin(
+    binDir,
+    "gh",
+    `const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='list'){console.log('[]');process.exit(0);}
+console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
+  );
 
   // Env overrides scoped to this suite (restored in afterAll via the returned restorer).
   const restoreEnv = saveEnv([
@@ -298,6 +304,11 @@ process.exit(0);`),
     settingsJson: JSON.stringify({
       testCommand: "test -f AGENT_WORK.md",
       seedPrompt: "SEED_MARKER_QZX — prefer server components in this repo.",
+      // The pre-PR self-review gate is ON by default in production (anton-omum). These suites cover
+      // the pipeline AROUND it — a review round on every case would add sessions they count and
+      // demand a report protocol their fake claude doesn't speak — so it's off here and exercised
+      // by `execute-epic.review-gate.integration.test.ts`, which turns it back on per case.
+      reviewEnabled: false,
     }),
   });
 

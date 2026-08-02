@@ -15,6 +15,8 @@ import type { AntonDb, Clock } from "./jobs/queue";
 export type SessionKind =
   | "shape"
   | "execute"
+  /** A pre-PR self-review round (anton-cbak); its fixes are recorded as `review-fix` sessions. */
+  | "review"
   | "review-fix"
   | "nightly-stringer"
   | "orphan-grooming"

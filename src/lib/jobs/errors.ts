@@ -44,11 +44,26 @@ export class PoisonError extends Error {
  * time, and a transient board outage should self-heal rather than park the job for a human).
  */
 export class RunAlreadyLiveError extends Error {
-  constructor(message: string) {
+  readonly conflict: RunLeaseConflict;
+
+  constructor(message: string, conflict: RunLeaseConflict = "unproven") {
     super(message);
     this.name = "RunAlreadyLiveError";
+    this.conflict = conflict;
   }
 }
+
+/**
+ * Which of the two triggers above raised the error — the recovery is identical, but what a caller
+ * may INFER from it is not.
+ *
+ * `foreign` is evidence that another machine owns the epic (a live foreign lease, or a race this run
+ * lost); it is the only value a caller may act on when it treats someone else as the branch's owner.
+ * `unproven` says nothing about who else is running — only that this run can no longer vouch for its
+ * own lease, which the epic being genuinely free is just as consistent with. It is the DEFAULT, so an
+ * unclassified conflict is never mistaken for proof of a foreign owner.
+ */
+export type RunLeaseConflict = "foreign" | "unproven";
 
 /**
  * A headless `claude` run died mid-stream from a TRANSIENT/recoverable cause (anton-juar) —

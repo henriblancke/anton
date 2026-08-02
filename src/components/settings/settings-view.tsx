@@ -16,6 +16,11 @@ interface EditableSettings {
   model?: string;
   seedPrompt?: string;
   reviewFixPrompt?: string;
+  /** Pre-PR self-review gate (anton-3apm); absent = ON. The three knobs below only apply when on. */
+  reviewEnabled?: boolean;
+  reviewAgent?: string;
+  reviewPrompt?: string;
+  reviewMaxRounds?: number;
   testCommand?: string;
   lintCommand?: string;
   typecheckCommand?: string;
@@ -40,6 +45,9 @@ interface EditableSettings {
 const DEFAULT_CONCURRENCY = 3;
 const DEFAULT_JOB_TIMEOUT_MINUTES = 120; // 2h
 const DEFAULT_MAX_RETRIES = 3;
+const DEFAULT_REVIEW_MAX_ROUNDS = 2;
+const REVIEW_MAX_ROUNDS_MIN = 1;
+const REVIEW_MAX_ROUNDS_MAX = 5;
 // Mirror DEFAULT_PROJECT_BUDGET_POLICY (src/lib/projects.ts) for the two operator-facing knobs.
 const DEFAULT_DAYTIME_RESERVE_PCT = 15;
 const DEFAULT_WEEKLY_TARGET_PCT = 90;
@@ -57,6 +65,7 @@ const SECTIONS = [
   { id: "general", label: "General" },
   { id: "agents", label: "Agents" },
   { id: "prompt", label: "Prompt" },
+  { id: "review", label: "Review" },
   { id: "execution", label: "Execution" },
   { id: "automation", label: "Automation" },
 ] as const;
@@ -151,6 +160,13 @@ export function SettingsView({
   const [model, setModel] = useState(settings.model ?? "");
   const [seedPrompt, setSeedPrompt] = useState(settings.seedPrompt ?? "");
   const [reviewFixPrompt, setReviewFixPrompt] = useState(settings.reviewFixPrompt ?? "");
+  // Absent → ON: the self-review gate runs unless the operator turns it off (anton-3apm).
+  const [reviewEnabled, setReviewEnabled] = useState(settings.reviewEnabled ?? true);
+  const [reviewAgent, setReviewAgent] = useState(settings.reviewAgent ?? "");
+  const [reviewPrompt, setReviewPrompt] = useState(settings.reviewPrompt ?? "");
+  const [reviewMaxRounds, setReviewMaxRounds] = useState(
+    settings.reviewMaxRounds ?? DEFAULT_REVIEW_MAX_ROUNDS,
+  );
   const [testCommand, setTestCommand] = useState(settings.testCommand ?? "");
   const [lintCommand, setLintCommand] = useState(settings.lintCommand ?? "");
   const [typecheckCommand, setTypecheckCommand] = useState(settings.typecheckCommand ?? "");
@@ -201,6 +217,16 @@ export function SettingsView({
           model: model || null,
           seedPrompt: seedPrompt.trim() || null,
           reviewFixPrompt: reviewFixPrompt.trim() || null,
+          // Self-review gate (anton-3apm). "" clears the reviewer swap / prompt override → the
+          // shipped review contract. The knobs are sent even while the gate is off, so turning it
+          // back on restores the operator's reviewer instead of silently resetting it.
+          reviewEnabled,
+          // A stored reviewer whose agent has since been deleted is shown but NOT resubmitted: the
+          // PATCH rejects unknown ids, which would fail every unrelated save until someone noticed.
+          // Omitting the key leaves the stored id untouched — runtime already falls back on its own.
+          ...(reviewerMissing(reviewAgent, agents) ? {} : { reviewAgent: reviewAgent || null }),
+          reviewPrompt: reviewPrompt.trim() || null,
+          reviewMaxRounds,
           // "" clears a verify gate → it's skipped (no behavior change).
           testCommand: testCommand.trim() || null,
           lintCommand: lintCommand.trim() || null,
@@ -470,6 +496,109 @@ export function SettingsView({
               build). Empty = skipped. These are the operator-pinned backstop; the agent still
               self-verifies. The same gates run before review-fix pushes.
             </span>
+          </section>
+
+          <Divider />
+
+          {/* Self-review — the pre-PR gate (anton-3apm): on by default, reviewer swappable for one
+              of this project's agents or a raw prompt. */}
+          <section className="flex flex-col gap-3.5">
+            <div className="flex items-baseline gap-2.5">
+              <h2 className="text-[15px] font-semibold">Self-review</h2>
+              <span className="text-xs text-subtle">
+                a fresh-context review of each run&apos;s diff, before the PR opens
+              </span>
+            </div>
+
+            <div className="flex max-w-2xl flex-col gap-3 rounded-[10px] border border-border bg-card px-3 py-3">
+              <div className="flex items-center gap-2.5">
+                <div className="flex flex-col gap-0.5">
+                  <span className="text-[12.5px]">Review before opening the PR</span>
+                  <span className="text-[10.5px] text-subtle">
+                    findings are fixed in a bounded loop · on by default
+                  </span>
+                </div>
+                <span className="ml-auto">
+                  <Toggle
+                    checked={reviewEnabled}
+                    onChange={setReviewEnabled}
+                    label="Review before opening the PR"
+                  />
+                </span>
+              </div>
+
+              <div
+                className={cn(
+                  "flex flex-col gap-3 transition-opacity",
+                  !reviewEnabled && "opacity-50",
+                )}
+              >
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <ReviewerField
+                    value={reviewAgent}
+                    onChange={setReviewAgent}
+                    agents={agents}
+                    disabled={!reviewEnabled}
+                  />
+                  <label className="flex flex-col gap-1.5">
+                    <span className="text-[11px] text-subtle">Max review rounds</span>
+                    <input
+                      type="number"
+                      min={REVIEW_MAX_ROUNDS_MIN}
+                      max={REVIEW_MAX_ROUNDS_MAX}
+                      value={reviewMaxRounds}
+                      disabled={!reviewEnabled}
+                      onChange={(e) => {
+                        const n = Number(e.target.value);
+                        setReviewMaxRounds(
+                          Number.isFinite(n)
+                            ? Math.min(
+                                REVIEW_MAX_ROUNDS_MAX,
+                                Math.max(REVIEW_MAX_ROUNDS_MIN, Math.round(n)),
+                              )
+                            : DEFAULT_REVIEW_MAX_ROUNDS,
+                        );
+                      }}
+                      aria-label="Max review rounds"
+                      className="rounded-[10px] border border-border bg-card px-3 py-2 font-mono text-[12.5px] text-foreground outline-none focus:border-primary/60 disabled:cursor-not-allowed"
+                    />
+                    <span className="text-[11px] text-subtle">
+                      review → fix → re-review · default {DEFAULT_REVIEW_MAX_ROUNDS}
+                    </span>
+                  </label>
+                </div>
+
+                <div className="flex flex-col gap-2">
+                  <div className="flex items-center gap-2">
+                    <span className="text-[12.5px] font-medium">Review prompt</span>
+                    <span className="text-[11px] text-subtle">
+                      {reviewAgent ? "fallback · unused while a reviewer is named" : "editable · what to review for"}
+                    </span>
+                    {reviewPrompt.trim() !== (settings.reviewPrompt ?? "").trim() && (
+                      <span className="font-mono text-[10px] text-primary">unsaved</span>
+                    )}
+                  </div>
+                  <textarea
+                    value={reviewPrompt}
+                    onChange={(e) => setReviewPrompt(e.target.value)}
+                    rows={5}
+                    maxLength={8000}
+                    disabled={!reviewEnabled}
+                    placeholder="Override the default review contract. Empty = anton's shipped default (skills/review)."
+                    aria-label="Review prompt"
+                    className="w-full resize-y rounded-lg border border-border bg-card px-3 py-2.5 font-mono text-[12px] leading-relaxed text-foreground outline-none placeholder:text-subtle focus:border-primary/60 disabled:cursor-not-allowed"
+                  />
+                  <span className="text-[11px] text-subtle">
+                    The reasoning contract for the reviewer. anton appends the run&apos;s diff and
+                    tickets beneath it.{" "}
+                    {reviewAgent
+                      ? `${reviewAgent} brings its own contract, so this runs only if that agent can't be loaded.`
+                      : "Empty = shipped default (skills/review)."}{" "}
+                    {reviewPrompt.length}/8000
+                  </span>
+                </div>
+              </div>
+            </div>
           </section>
 
           <Divider />
@@ -772,6 +901,62 @@ function PctField({
       </div>
       {hint && <span className="text-[11px] text-subtle">{hint}</span>}
     </label>
+  );
+}
+
+/** A stored reviewer id that no longer resolves to a discoverable agent — shown, never resubmitted. */
+function reviewerMissing(value: string, agents: DiscoveredAgent[]): boolean {
+  return value !== "" && !agents.some((a) => a.id === value);
+}
+
+/**
+ * Reviewer selector for the self-review gate (anton-3apm). Persists to settingsJson.reviewAgent;
+ * "" runs the shipped review contract. Any discoverable agent may review — bundled or the
+ * operator's own — since the reviewer is deliberately swappable, not gated by the active-agents
+ * allowlist. A persisted id that no longer resolves is kept as an option so the operator can see
+ * what's stored (and that it's gone) instead of the field silently reading as "Default" — the save
+ * omits it rather than resubmitting an id the API rejects (see {@link reviewerMissing}).
+ */
+function ReviewerField({
+  value,
+  onChange,
+  agents,
+  disabled = false,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  agents: DiscoveredAgent[];
+  disabled?: boolean;
+}) {
+  const missing = reviewerMissing(value, agents);
+  const hint = agents.find((a) => a.id === value)?.description;
+  return (
+    <div className="flex flex-col gap-1.5">
+      <span className="text-[11px] text-subtle">Reviewer</span>
+      <div className="relative flex items-center rounded-[10px] border border-border bg-card text-[12.5px] focus-within:border-primary/60">
+        <select
+          value={value}
+          disabled={disabled}
+          onChange={(e) => onChange(e.target.value)}
+          aria-label="Reviewer"
+          className="w-full appearance-none rounded-[10px] bg-transparent px-3 py-2 pr-8 font-mono text-foreground outline-none disabled:cursor-not-allowed"
+        >
+          <option value="">Default · anton&apos;s review contract</option>
+          {agents.map((a) => (
+            <option key={a.id} value={a.id}>
+              {a.id} · {a.source}
+            </option>
+          ))}
+          {missing && <option value={value}>{value} · missing</option>}
+        </select>
+        <span className="pointer-events-none absolute right-3 text-subtle">▾</span>
+      </div>
+      <span className="line-clamp-2 text-[11px] text-subtle" title={missing ? undefined : hint}>
+        {missing
+          ? "This agent no longer exists — review falls back to the shipped contract. Pick another to replace it."
+          : (hint ?? "any agent this project can assign · runs in a fresh context")}
+      </span>
+    </div>
   );
 }
 
