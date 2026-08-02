@@ -43,7 +43,9 @@ import {
   configureBeadsForRepo,
   ensureBeadFormula,
   ensureBeadsGitignore,
+  ensureRunFormula,
   BEAD_FORMULA_FILENAME,
+  RUN_FORMULA_FILENAME,
   MIN_BD_VERSION,
 } from "../src/lib/beads/config.mjs";
 import { createInterface } from "node:readline/promises";
@@ -897,26 +899,32 @@ async function cmdSetup(args = []) {
 
   await provisionAgentsSkills(args);
 
-  // The bead formula (anton-8mnr): the skeleton every bead anton creates is poured from. It lives in
-  // the repo's `.beads/`, so a project-local copy always wins and a re-run never clobbers it.
+  // anton's formulas: the bead skeleton every bead anton creates is rendered from (anton-8mnr) and
+  // the run pipeline anton walks (anton-hrql). Both live in the repo's `.beads/`, so a project-local
+  // copy always wins and a re-run never clobbers it.
   // Only lands when the package root already IS a beads workspace (anton's own dev checkout) — a
-  // release bundle has none, and ensureBeadFormula refuses to fabricate one there (the Dolt-sync
-  // step below reads a bare `.beads/` as a workspace and would abort setup for having no git
-  // origin). Registered projects get their formula from configureBeadsForRepo (`anton init` /
-  // addProject), which is the path shaping actually reads.
-  const formula = ensureBeadFormula(join(APP_ROOT, ".beads"));
-  if (formula.status === "missing-asset") {
-    console.log(c.yellow(`\n! bead formula missing from this install — skipping ${BEAD_FORMULA_FILENAME}.`));
-  } else if (formula.status === "failed") {
-    // Best-effort, like the missing asset above: setup carries on and anton's renderer falls back
-    // to its packaged copy, so an unwritable `.beads/formulas/` is a warning, not a failed setup.
-    console.log(c.yellow(`\n! could not install the bead formula: ${formula.detail}`));
-  } else if (formula.status !== "no-workspace") {
-    console.log(
-      c.bold("\nBead formula:") +
-        ` .beads/formulas/${BEAD_FORMULA_FILENAME} ` +
-        (formula.status === "installed" ? c.green("installed") : c.dim("already present")),
-    );
+  // release bundle has none, and the installers refuse to fabricate one there (the Dolt-sync step
+  // below reads a bare `.beads/` as a workspace and would abort setup for having no git origin).
+  // Registered projects get their formulas from configureBeadsForRepo (`anton init` / addProject),
+  // which is the path shaping and the run pipeline actually read.
+  for (const asset of [
+    { label: "Bead formula", filename: BEAD_FORMULA_FILENAME, install: ensureBeadFormula },
+    { label: "Run formula", filename: RUN_FORMULA_FILENAME, install: ensureRunFormula },
+  ]) {
+    const formula = asset.install(join(APP_ROOT, ".beads"));
+    if (formula.status === "missing-asset") {
+      console.log(c.yellow(`\n! ${asset.label.toLowerCase()} missing from this install — skipping ${asset.filename}.`));
+    } else if (formula.status === "failed") {
+      // Best-effort, like the missing asset above: setup carries on and anton falls back to its
+      // packaged copy, so an unwritable `.beads/formulas/` is a warning, not a failed setup.
+      console.log(c.yellow(`\n! could not install the ${asset.label.toLowerCase()}: ${formula.detail}`));
+    } else if (formula.status !== "no-workspace") {
+      console.log(
+        c.bold(`\n${asset.label}:`) +
+          ` .beads/formulas/${asset.filename} ` +
+          (formula.status === "installed" ? c.green("installed") : c.dim("already present")),
+      );
+    }
   }
 
   // Beads Dolt sync (anton-pns): the Dolt remote is per-machine (gitignored) state, so every

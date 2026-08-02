@@ -11,6 +11,7 @@ import { agentDotClass } from "@/components/board/board-utils";
 import { RunTerminal } from "@/components/runs/run-terminal";
 import {
   fmtDuration,
+  formatRunPipeline,
   isActiveRun,
   pickAttachSession,
   timelineOrder,
@@ -36,6 +37,9 @@ interface RunDetail {
   attempts: number;
   leaseExpiresAt?: number;
   error?: string;
+  /** The pipeline this run walked, and the label that selected it (anton-aa3m). */
+  formula?: string;
+  formulaVariant?: string;
   startedAt?: number;
   endedAt?: number;
   updatedAt: number;
@@ -186,6 +190,12 @@ export function RunDetailView({ slug, runId }: { slug: string; runId: string }) 
               <MetaRow label="model" value={run.model ?? "default"} mono />
               <MetaRow label="branch" value={run.branch ?? "—"} mono copy />
               <MetaRow label="worktree" value={run.worktreePath ?? "—"} mono title={run.worktreePath} copy />
+              <MetaRow
+                label="pipeline"
+                value={formatRunPipeline(run.formula, run.formulaVariant)}
+                mono
+                title={run.formula}
+              />
               <MetaRow label="attempts" value={String(run.attempts)} mono />
               <MetaRow label="lease" value={fmtTime(run.leaseExpiresAt)} mono />
               <MetaRow label="started" value={fmtTime(run.startedAt)} mono />

@@ -69,6 +69,14 @@ export interface ReviewFinding {
   note: string;
 }
 
+/**
+ * Findings as a markdown list — shared by the PR body, the park note, and the stale-body salvage, so
+ * the founder reads the same rendering wherever a finding reaches them.
+ */
+export function findingLines(findings: ReviewFinding[]): string[] {
+  return findings.map((f) => `- ${f.location} — ${f.note}`);
+}
+
 /** Which reasoning contract the reviewer ran with — reported for logging and the precedence tests. */
 export interface ReviewerSource {
   kind: "agent" | "prompt" | "default";
@@ -738,22 +746,23 @@ function rulesCaveat(): string[] {
 }
 
 /**
- * The advisories an earlier round left open, put back in front of the reviewer so THIS round decides
+ * The advisories an earlier review left open — an earlier round, or an earlier `step:review` when
+ * the formula runs more than one gate — put back in front of the reviewer so THIS round decides
  * their fate. Without it the gate could only guess what an omission means, and had to assume the
  * worst — an advisory whose cause a blocking fix removed rode into the PR body labelled unresolved.
  *
- * Only the earlier round's advisories, never its blocking findings: those were dispatched to a fix
+ * Only the earlier advisories, never the earlier blocking findings: those were dispatched to a fix
  * session and are proven by the diff alone, so quoting them would invite grading the repair against
  * the previous reviewer's word instead of the code.
  */
 function carriedAdvisorySection(advisories: ReviewFinding[]): string[] {
   if (advisories.length === 0) return [];
   return [
-    `## Advisories still open from an earlier round`,
+    `## Advisories still open from an earlier review`,
     ``,
-    `An earlier round of this same review reported the advisories below. Only BLOCKING findings are`,
-    `dispatched for repair, so nobody was asked to resolve these — but the fix that ran since may have`,
-    `removed the cause of one, and the diff above is the state after it.`,
+    `An earlier review of this same run reported the advisories below. Only BLOCKING findings are`,
+    `dispatched for repair, so nobody was asked to resolve these — but any repair that ran since may`,
+    `have removed the cause of one, and the diff above is the state after it.`,
     ``,
     ...advisories.map((f, i) => `${i + 1}. ${f.location} — ${f.note}`),
     ``,

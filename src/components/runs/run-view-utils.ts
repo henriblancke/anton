@@ -46,6 +46,29 @@ export function timelineOrder(sessions: SessionSummary[]): SessionSummary[] {
   return [...sessions].sort((a, b) => (a.startedAt ?? 0) - (b.startedAt ?? 0));
 }
 
+/**
+ * What a run records instead of anton's install-absolute bundled path (`BUNDLED_FORMULA_SOURCE` in
+ * `lib/jobs/run-formula.ts`). Duplicated as a literal so this module stays free of node-only imports;
+ * `run-view-utils.test.ts` pins the two in sync.
+ */
+const BUNDLED_FORMULA_SOURCE = "bundled:anton-run";
+
+/**
+ * How the meta grid names the pipeline a run walked (anton-aa3m): the formula file, and — when a
+ * per-label variant selected it — the bead label that did. The full path rides in the row's title,
+ * so this stays the glanceable form. No formula recorded (a run from before this was tracked, or one
+ * that parked before selection) reads as "—" rather than pretending the default was used.
+ */
+export function formatRunPipeline(formula?: string, variant?: string): string {
+  if (!formula) return "—";
+  // The sentinel is a durable identity, not a path — name the default in the operator's words.
+  const file =
+    formula === BUNDLED_FORMULA_SOURCE
+      ? "anton-run.formula.toml (anton's default)"
+      : formula.split("/").pop() || formula;
+  return variant ? `${file} · ${variant}` : file;
+}
+
 export function fmtDuration(from?: number, to?: number, nowMs: number = Date.now()): string {
   if (from == null) return "—";
   const end = to ?? Math.floor(nowMs / 1000);

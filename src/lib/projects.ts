@@ -12,8 +12,9 @@ import { z } from "zod";
 import { eq } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import { removeWorktree } from "./git/worktree";
-import { configureBeadsForRepo } from "./beads/config.mjs";
+import { FORMULA_NAME_PATTERN, configureBeadsForRepo } from "./beads/config.mjs";
 import { DEFAULT_BUDGET_POLICY, type BudgetPolicy } from "./jobs/budget";
+import type { FormulaVariant } from "./jobs/run-formula";
 import type { AntonDb } from "./jobs/queue";
 import type { Project } from "./types";
 
@@ -203,6 +204,16 @@ export interface ProjectSettings {
    */
   budgetPolicy?: ProjectBudgetPolicy;
   /**
+   * Per-label pipeline variants (anton-aa3m): bead label → the run formula a target carrying it
+   * walks, in PRECEDENCE ORDER (first match wins — see `selectRunFormula`). Lets risk and size drive
+   * process, so `risk:high` can carry a design step or a sign-off gate while a docs-only ticket
+   * skips verify, instead of one pipeline being conservative enough for the worst case. Absent/empty
+   * ⇒ every run walks the project's `anton-run.formula.toml` (else anton's bundled default), so this
+   * is invisible to a zero-config project. Validated with {@link formulaVariantsSchema} at the API
+   * boundary; every selected variant is held to the same invariant floor as the default.
+   */
+  formulaVariants?: FormulaVariant[];
+  /**
    * How long a run may sit stuck before the run-health sweep (anton-4ks0) calls it a finding.
    * Absent → {@link DEFAULT_RUN_HEALTH_THRESHOLDS}; a stored value need only carry the knobs the
    * operator touched. Only consulted by the `run-health` schedule, which is off by default.
@@ -346,6 +357,39 @@ export function resolveBudgetPolicy(settings: ProjectSettings): BudgetPolicy {
     nightValueDiscount: p.preferNightForHeavy ? DEFAULT_BUDGET_POLICY.nightValueDiscount : 0,
   };
 }
+
+/**
+ * Per-label pipeline variants (anton-aa3m). An ORDERED list, not a map, because the order IS the
+ * documented precedence: a bead carrying two mapped labels walks the one the project listed first.
+ *
+ * `formula` is a name under `.beads/formulas/` (`<name>.formula.toml`), constrained by the same
+ * {@link FORMULA_NAME_PATTERN} the loader enforces — no separators, and `..` can't match — so a
+ * mapping can't point the loader outside the project's own formulas, and a map that passes this
+ * boundary cannot park at that one. Duplicate labels are rejected rather than silently shadowed:
+ * a second entry for a label the list already carries can never be selected, so it is a mistake, not
+ * a precedence. Bounded in size for the same reason every other operator field is.
+ */
+export const formulaVariantsSchema = z
+  .array(
+    z
+      .object({
+        label: z.string().trim().min(1).max(120),
+        formula: z
+          .string()
+          .trim()
+          .min(1)
+          .max(120)
+          .regex(FORMULA_NAME_PATTERN, {
+            message:
+              "formula must be a formula name under .beads/formulas/ (letters, digits, . - _)",
+          }),
+      })
+      .strict(),
+  )
+  .max(20)
+  .refine((entries) => new Set(entries.map((e) => e.label)).size === entries.length, {
+    message: "each label may map to at most one formula",
+  });
 
 /**
  * How stale each class of stall must be before the run-health sweep reports it (anton-4ks0). Every

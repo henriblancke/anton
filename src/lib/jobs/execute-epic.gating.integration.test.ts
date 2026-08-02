@@ -720,4 +720,68 @@ process.exit(0);`),
       if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
     }
   });
+
+  // anton-6b99: the project owns the pipeline's steps, anton owns the run's guarantees. A formula
+  // that opens the PR before it commits cooks fine and resolves every handler — bd has no opinion
+  // about it — so the floor is the only thing standing between it and a run that ships nothing.
+  // Same pre-flight shape as the contract gate above: parked before a worktree, recoverable.
+  it("parks a run whose project formula violates the invariant floor, before any worktree", async () => {
+    const epicF = await beads.create(repo, {
+      title: "Feature Floor",
+      type: "epic",
+      acceptance: "work file exists",
+      description: "## Goal\nF",
+    });
+    await beads.approve(repo, epicF);
+    const floorTicket = createTicket(repo, { title: "Floor ticket", parent: epicF });
+
+    // The project-local pipeline wins over anton's bundled default — which is the whole risk this
+    // gate covers.
+    const formulaPath = join(repo, ".beads", "formulas", "anton-run.formula.toml");
+    mkdirSync(join(repo, ".beads", "formulas"), { recursive: true });
+    writeFileSync(
+      formulaPath,
+      `formula = "anton-run"\ntype = "workflow"\nversion = 1\n\n` +
+        `[[steps]]\nid = "implement"\ntype = "task"\ntitle = "Implement"\nlabels = ["step:implement"]\n\n` +
+        `[[steps]]\nid = "ship"\ntype = "task"\nneeds = ["implement"]\ntitle = "Ship"\nlabels = ["step:pr"]\n\n` +
+        `[[steps]]\nid = "commit"\ntype = "task"\nneeds = ["ship"]\ntitle = "Commit"\nlabels = ["step:commit"]\n`,
+      "utf8",
+    );
+
+    const runner = makeEpicRunner(ctx);
+    let jobId: string | undefined;
+    try {
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: epicF });
+
+      // Poison → parked immediately, naming the file, the offending step, and the floor.
+      const job = await getJob(tdb.db, jobId);
+      expect(job?.status).toBe("parked");
+      expect(job?.lastError).toContain(formulaPath);
+      expect(job?.lastError).toContain('"ship"');
+      expect(job?.lastError).toMatch(/invariant floor/);
+
+      // Pre-flight: no worktree was ever created and the ticket was never claimed or run.
+      const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === epicF)!;
+      expect(run.status).toBe("failed");
+      expect(run.worktreePath ?? null).toBeNull();
+      expect(
+        execFileSync("git", ["worktree", "list"], { cwd: repo, encoding: "utf8" }),
+      ).not.toContain(epicF);
+      const t = await beads.show(repo, floorTicket);
+      expect(t.status).toBe("open");
+      expect(t.assignee ?? null).toBeNull();
+
+      // Recoverable: drop the broken pipeline back to anton's default → resume → the epic completes.
+      rmSync(formulaPath);
+      expect(await resumeJob(tdb.db, clock, jobId)).toBe(true);
+      await tickToIdle(runner);
+      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+      expect((await beads.show(repo, floorTicket)).status).toBe("closed");
+      expect((await beads.show(repo, epicF)).labels ?? []).toContain("stage:in-review");
+    } finally {
+      // The formula is project-local: leaving it behind would re-gate every later case in this file.
+      rmSync(formulaPath, { force: true });
+      if (jobId) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  });
 });

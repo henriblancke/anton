@@ -1,27 +1,29 @@
 /**
- * execute-epic job (anton-dzh.4). For an approved epic: warm a worktree, then per ticket run
- * `claude` (with the ticket's agent prompt) → run tests → commit; when all tickets are done, open
- * ONE PR via `gh` and move the epic to in-review. Idempotent/resumable — a re-run (crash, quota
- * backoff) reuses the existing worktree and skips tickets already closed WHOSE COMMIT is on this
- * branch; a cross-machine resume re-runs a board-closed ticket whose commit never got pushed. See
- * DESIGN.md §4/§7.
+ * execute-epic job (anton-dzh.4). For an approved epic: warm a worktree, then WALK THE PROJECT'S RUN
+ * FORMULA (anton-lnkt) — its steps in execution order, one at a time, each dispatched through the
+ * step registry (anton-4npr). The walk owns the ORDER; the guards around it are unchanged.
+ *
+ * The formula is split at its commit ({@link splitFormulaPhases}): the steps up to it run per ticket
+ * (dispatch → gates → commit → close), the steps after it run once for the whole run (self-review →
+ * ONE PR via `gh` → in-review). The pipeline is validated and floor-checked before any worktree
+ * exists, so a broken one parks rather than half-executing.
+ *
+ * Git stays the evidence of record — there is no second store of run progress: idempotent/resumable
+ * because a re-run (crash, quota backoff) reuses the existing worktree and skips tickets already
+ * closed WHOSE COMMIT is on this branch; a cross-machine resume re-runs a board-closed ticket whose
+ * commit never got pushed. See DESIGN.md §4/§7.
  */
 import { randomUUID } from "node:crypto";
-import { beads, LABELS, unclaimableStatus, type Bead } from "../beads/bd";
+import { beads, labelValueOf, LABELS, unclaimableStatus, type Bead } from "../beads/bd";
 import { ownerOf } from "../beads/claim";
-import { acceptanceBody, contractGaps, formatContractGaps } from "../beads/contract";
-import { humanNotesPromptBlock } from "../beads/notes";
+import { contractGaps, formatContractGaps } from "../beads/contract";
 import { computeEpicGraph, epicStandaloneBlockers, isUnit, standaloneBlockers } from "../epic-graph";
 import { contractGatedBeads, resumeSkipped, runTickets } from "../ticket-view";
-import { loadAgentPrompt } from "../claude/agent-prompt";
-import { buildExecutionSystemPrompt } from "../claude/system-prompt";
-import { runClaude, type ClaudeEvent, type ClaudeResult } from "../claude/driver";
-import { formatAntonResult, parseAntonResult } from "../claude/anton-result";
+import { runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
+import { formatAntonResult, type AntonResult } from "../claude/anton-result";
 import {
-  commitAll,
   lookupOpenPullRequest,
   markPullRequestDraft,
-  openPullRequest,
   pullRequestState,
   resolveFreshBase,
   worktreeHasCommitFor,
@@ -29,17 +31,12 @@ import {
 } from "../git/ops";
 import { createWorktree, findWorktree, removeWorktree } from "../git/worktree";
 import { bundledAgentIds, discoverAgents } from "../agents-discovery";
-import {
-  getProjectById,
-  getProjectSettings,
-  resolveReviewConfig,
-  resolveVerifyGates,
-  type ProjectSettings,
-} from "../projects";
+import { getProjectById, getProjectSettings, resolveReviewConfig } from "../projects";
 import { resolveOperator } from "../operator";
 import {
   createRun,
   findOpenRunForEpic,
+  findRunFormulaForBranch,
   updateRun,
 } from "../runs";
 import {
@@ -48,12 +45,10 @@ import {
   setSessionClaudeId,
   startJobSession,
 } from "../sessions";
-import { buildPrTitle } from "./pr-title";
-import type { ReviewFinding } from "./review-context";
+import { findingLines, type ReviewFinding } from "./review-context";
 import {
   blockingFindings,
   finalViolation,
-  runReviewGate,
   type ReviewGateResult,
   type ReviewRound,
 } from "./review-gate";
@@ -63,9 +58,12 @@ import {
   isRecoverableClaudeError,
   isUsageLimitError,
   isRunAlreadyLiveError,
+  PoisonEpic,
   RunAlreadyLiveError,
 } from "./errors";
-import { runVerifyGates } from "./shell";
+import { assertRunFormulaFloor } from "./formula-floor";
+import { validateRunFormula, type ResolvedStep } from "./run-formula";
+import { truncateField, type StepContext } from "./step-registry";
 import type { AntonDb, Clock } from "./queue";
 import { systemClock } from "./queue";
 import type { JobContext, JobHandler } from "./runner";
@@ -73,6 +71,42 @@ import type { JobContext, JobHandler } from "./runner";
 export interface ExecuteEpicPayload {
   projectId: string;
   epicBeadId: string;
+}
+
+/** The step that turns work into evidence — and, for that reason, the walk's phase boundary. */
+const COMMIT_STEP_NAME = "commit";
+
+/** The formula split into the two phases a run walks (anton-lnkt). */
+export interface FormulaPhases {
+  /** Through the commit: dispatched once PER TICKET, in that ticket's own session. */
+  ticketSteps: ResolvedStep[];
+  /** After the commit: dispatched ONCE for the whole run, over every ticket that contributed. */
+  runSteps: ResolvedStep[];
+}
+
+/**
+ * Split the pipeline at its commit (anton-lnkt).
+ *
+ * The commit is where a ticket's work becomes git evidence — an epic's children close as they
+ * commit, and `worktreeHasCommitFor` reads that commit to decide whether a ticket re-runs — so it is
+ * also the line between what belongs to a TICKET and what belongs to the RUN. Everything that writes
+ * to the worktree must precede it (the floor, anton-6b99, enforces exactly that), so the steps
+ * before it are per-ticket work; the steps after it read the run's whole diff and open its single
+ * PR, so they run once. Reordering the file moves that line — which is the point: a project that
+ * moves its verify gates after the commit gets one run-wide verification instead of one per ticket,
+ * with no anton code change.
+ *
+ * The floor guarantees exactly one `step:commit`, so this is a FAIL-LOUD assertion, not a fallback.
+ */
+export function splitFormulaPhases(formula: { source: string; steps: ResolvedStep[] }): FormulaPhases {
+  const at = formula.steps.findIndex((s) => s.definition.name === COMMIT_STEP_NAME);
+  if (at < 0) {
+    throw new PoisonEpic(
+      `run formula ${formula.source} declares no \`step:${COMMIT_STEP_NAME}\` — a run that never ` +
+        `commits leaves no evidence of record, so anton has nothing to walk`,
+    );
+  }
+  return { ticketSteps: formula.steps.slice(0, at + 1), runSteps: formula.steps.slice(at + 1) };
 }
 
 /**
@@ -556,6 +590,59 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         );
       }
 
+      // 0d. Validate the project's run pipeline (anton-hrql). The formula is what a run walks, so a
+      //     broken one must fail at the START of a run rather than halfway through: cook it and
+      //     resolve every step's handler here — before the lease is published and before any worktree
+      //     exists — so an unparseable file, a key bd would silently drop, or a `step:` label that
+      //     maps to no handler parks with the file path and the offending step instead of stranding a
+      //     half-executed run. PARK, like the gates above: the operator fixes the file (or deletes it
+      //     to fall back to anton's default) and resumes. Cheap and read-only — the project copy when
+      //     it has one, else anton's bundled default.
+      //     Then hold the cooked pipeline to anton's invariant floor (anton-6b99): the project owns
+      //     the steps, anton owns the guarantees, so a formula may ADD steps freely but may not omit
+      //     implement/commit/pr or order them so the run's work is thrown away (a PR opened before
+      //     the commit, an agent dispatched after it). Same park, same place — before the worktree.
+      //     WHICH pipeline is a per-label choice (anton-aa3m): the project may map a bead label to a
+      //     formula of its own, so this run walks the first mapped label the TARGET carries (one run
+      //     is one worktree and one PR, so it walks one pipeline), else the project's default. The
+      //     floor is applied to whatever came back — selection only changes which file is loaded —
+      //     so a variant cannot escape it. The choice is then recorded ON THE RUN below rather than
+      //     left to be inferred from settings and labels that may since have changed.
+      //     Selection happens ONCE PER BRANCH, not once per attempt: an attempt that already
+      //     recorded a pipeline pins it, and this one re-validates that source instead of selecting
+      //     again. Every attempt re-reads the board and the settings, so re-selecting would let a
+      //     label added since (`stage:implementing` — which this very job adds below — or an
+      //     operator's relabel) or an edited variant map switch pipelines after some tickets had
+      //     already committed, while the record below claimed the whole run used the new one. The
+      //     pin is not limited to the open run row: an ordinary handler error settles the row
+      //     `failed`, so the runner's retry lands here with `existing` undefined while still reusing
+      //     that attempt's worktree and its committed tickets — hence the branch-scoped lookup
+      //     (findRunFormulaForBranch), which is the same continuity the retry itself resumes by.
+      //     `{{var}}` values make this a RUNTIME cook: the pipeline is resolved with the run's own
+      //     target, and bd's "every declared variable needs a value" check fires here rather than a
+      //     formula anton cannot satisfy walking with literal placeholders in it.
+      const pinnedFormula = existing?.formula
+        ? { source: existing.formula, variant: existing.formulaVariant ?? undefined }
+        : await findRunFormulaForBranch(db, projectId, epicBeadId, branch);
+      const formula = await validateRunFormula(repo, {
+        labels: target.labels,
+        variants: settings.formulaVariants,
+        pinned: pinnedFormula,
+        vars: { target: epicBeadId },
+      });
+      assertRunFormulaFloor(formula);
+      // `recorded`, not `source`: anton's bundled default is stored as a sentinel rather than an
+      // install-absolute path, so a run in flight across an upgrade that moved the install root
+      // re-reads the pipeline it pinned instead of parking on a path that only changed.
+      await updateRun(db, clock, runId, {
+        formula: formula.recorded,
+        formulaVariant: formula.variant ?? null,
+      });
+      // The pipeline this run walks (anton-lnkt), split at the commit into its two phases. Steps run
+      // ONE AT A TIME — they share one worktree and one PR, so a formula whose steps could run
+      // concurrently is not a licence to fan out.
+      const { ticketSteps, runSteps } = splitFormulaPhases(formula);
+
       // 1. Publish the cross-machine run-liveness lease BEFORE any slow setup — worktree creation,
       //    operator resolution, the epic claim — and keep it fresh while this run executes
       //    (anton-jz1). Acquiring it up front closes the window where another machine's Force run
@@ -733,6 +820,26 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       });
       await ctx.heartbeat();
 
+      // Every step below runs through the step registry (anton-4npr) — one entry point per step,
+      // dispatched by the walk in the order the project's formula declares. This is what they all
+      // operate on; each dispatch adds the ticket(s) in scope (and, per ticket, that ticket's
+      // session) plus the formula step itself, which is where a `step:claude` reads its prompt.
+      const runStep: Omit<StepContext, "tickets"> = {
+        db,
+        clock,
+        ctx,
+        projectId,
+        runId,
+        repoPath: repo,
+        worktreePath: worktree.path,
+        branch: worktree.branch,
+        baseBranch,
+        baseRef: freshBase,
+        target,
+        settings,
+        assertLeaseHeld,
+      };
+
       // 3. Assert this process still owns the epic, THEN claim it for the human operator (idempotent).
       //    An approved-but-unstarted (backlog) target can be TAKEN OVER — reassigned to another
       //    operator via the approve route's steal — after this run was queued but before it leased the
@@ -842,7 +949,8 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         .sync(repo)
         .catch((e) => console.error(`[execute-epic] claim sync failed for ${epicBeadId}`, e));
 
-      // 4. Per ticket: claude → tests → commit → (close | in-review). Skip work that already
+      // 4. Per ticket: the formula's ticket phase (its steps up to and including the commit) →
+      //    (close | in-review). Skip work that already
       //    landed on a prior attempt. A closed ticket is done — an epic's children close as they
       //    commit, and any resumed run skips them. A standalone target is NEVER closed here (its
       //    close is a merge-time concern, below): the moment its single ticket commits, runTicket
@@ -929,159 +1037,185 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           await safe(() => beads.reopen(repo, ticket.id));
         }
         await runTicket({
-          db,
-          clock,
-          ctx,
-          projectId,
-          repo,
-          runId,
-          worktreePath: worktree.path,
+          run: runStep,
+          steps: ticketSteps,
           ticket,
-          settings,
           operator,
           closeOnDone: !standaloneRun,
         });
         await ctx.heartbeat();
       }
 
-      // 4b. Pre-PR self-review gate (anton-omum): a fresh-context reviewer reads THIS run's diff,
-      //     its blocking findings are fixed on the branch, and only then does the PR open — so the
-      //     PR the founder merges has already been reviewed once. Skipped entirely when the
-      //     operator turned review off (absent ⇒ on). Nothing about the verdict is persisted as a
-      //     resume marker on purpose: a parked run that is resumed re-reviews the worktree as it
-      //     stands now, which is the only state the fixes it just made are visible in. A run that
-      //     already opened its PR never reaches here — step 0a short-circuits it.
+      // 4b. The RUN phase of the walk (anton-lnkt): every formula step after the commit, in the
+      //     order the project's formula puts them, dispatched through the same registry the ticket
+      //     phase uses. These steps speak for the run as a whole — they read its whole diff and open
+      //     its single PR — so each runs ONCE, and one at a time: they share a worktree and a PR, so
+      //     a formula whose steps could overlap is still not a licence to fan out.
+      //     `live`, not `tickets`: an abandoned ticket contributed no commit, so listing it would
+      //     advertise work this run doesn't contain (anton-6xj0).
       let advisoryFindings: ReviewFinding[] = [];
-      if (resolveReviewConfig(settings).enabled) {
-        // Handed IN as well as checked here: the gate's review → fix → re-review sequence can run
-        // well past the lease TTL, so it re-asserts at every dispatch rather than only at the edges.
+      // A reused PR whose refresh `gh` refused still shows the previous attempt's body, and the run
+      // completes regardless — so that round's advisories would exist nowhere: the score comment
+      // records their COUNT, never their text. The salvage note rides out on the run row when even
+      // the bead write fails (set by the `pr` step below, read by the finalize step).
+      let staleBodyFallback: string | null = null;
+      for (const { step: cooked, definition } of runSteps) {
+        // A step boundary is a lease checkpoint: never dispatch run-level work — and never open a
+        // PR — under a lease this run can no longer prove it holds.
         assertLeaseHeld();
-        // Filled by the gate as each round completes, so a gate that THROWS — returning nothing —
-        // still leaves this attempt's score history to persist below.
-        const gateRounds: ReviewRound[] = [];
-        const review = await runReviewGate({
-          db,
-          clock,
-          ctx,
-          projectId,
-          runId,
-          target,
+        const stepCtx: StepContext = {
+          ...runStep,
           tickets: live,
-          settings,
-          worktreePath: worktree.path,
-          baseBranch: freshBase,
-          assertLeaseHeld,
-          rounds: gateRounds,
-        }).catch(async (e) => {
-          // A throwing gate never reaches persistReviewScores below, so the rounds it DID finish are
-          // written here or lost with the attempt — for a poison park (a round-3 death still owes the
-          // founder rounds 1 and 2) and equally for a retryable one, where the run is rescheduled and
-          // the resumed gate restarts from round 1 with nothing of this attempt on the board.
-          await persistPartialReviewScores(repo, epicBeadId, gateRounds);
-          // EVERY gate failure leaves the run without a PR of its own, so every one of them carries
-          // the orphan hazard: a PR a previous attempt opened but never recorded (lost `gh` response
-          // or lost setPrRef) stays READY and mergeable with un-reviewed work whether the gate
-          // refused the verdict, died on a usage limit, or exhausted its retries. Reconcile before
-          // propagating any of them. The one exception is a lease CONFIRMED lost to another machine —
-          // that run owns the branch and may have opened this very PR after passing its OWN gate, so
-          // drafting it would strand reviewed work with nobody left to ready it again. A lease this
-          // run merely couldn't KEEP is not that evidence, and is in fact the only kind reachable
-          // here: `assertLeaseHeld` — local expiry, `unproven` — is the gate's sole source of
-          // RunAlreadyLiveError, and skipping the reconcile on it left the orphan mergeable.
-          const orphan =
-            isRunAlreadyLiveError(e) && e.conflict === "foreign"
-              ? undefined
-              : await reconcileOrphanPullRequest(repo, worktree.branch);
-          // Errors anton doesn't compose a park message for are rethrown untouched — the runner keys
-          // its backoff (quota reschedule, retry) off the error's TYPE, and wrapping them would lose
-          // that. What the reconcile found rides out on the run row instead (see the catch below).
-          if (!isPoisonError(e)) {
-            orphanNotice = orphanClause(orphan);
-            throw e;
-          }
-          // The gate parks for a human on more than a blocking verdict: an unrevertable reviewer
-          // commit or a fixer that switched branches throws PoisonError from inside it. Those need
-          // the SAME parked-run handling — the instruction on both is repair by hand, then resume —
-          // so they are re-thrown as a gate block. Left as-is they marked the run `failed`, which
-          // hides the row from findOpenRunForEpic, and the resume the human was told to do would
-          // start a REPLACEMENT run instead of continuing this one and its session history.
-          throw new ReviewBlockedError(`${e.message}${orphanClause(orphan)}`, { cause: e });
-        });
-        // The score history belongs to the board, not this run's logs — written on both exits the gate
-        // RETURNS from, since a run parked on blocking findings is exactly the one whose score the
-        // founder needs. The throwing exit is covered by the catch above.
-        await persistReviewScores(repo, epicBeadId, review);
+          step: cooked,
+          advisories: advisoryFindings,
+        };
 
-        const blocking = blockingFindings(review.unresolved);
-        // Two states must not become a PR: blocking findings the converge loop couldn't clear, and a
-        // reviewer that broke the report protocol (silence — or a review that edited the code it was
-        // judging — is not a clean review). Both park for the founder like a no-delivery ticket does,
-        // with the reason on the bead so the board shows why rather than only the run log.
-        if (blocking.length > 0 || review.outcome === "protocol-violation") {
-          const orphan = await reconcileOrphanPullRequest(repo, worktree.branch);
-          // The advisories go on the bead with them: this run opens no PR, so its body — their only
-          // other home — never exists, and the resumed run starts its review with an empty carry.
-          const parkedAdvisories = review.unresolved.filter((f) => f.severity === "advisory");
-          const note = reviewParkNote(review, blocking, parkedAdvisories, orphan);
-          // Whether that write landed decides what the park reason can honestly say: a locked bd DB
-          // would otherwise discard the findings' only copy while the run error told the founder to
-          // read them on the bead (see reviewParkMessage).
-          const noted = await safe(() => beads.note(repo, epicBeadId, note));
-          throw new ReviewBlockedError(
-            reviewParkMessage({
-              targetId: epicBeadId,
-              outcome: review.outcome,
-              reason: reviewFailureReason(review, blocking),
-              note,
-              noted,
-              orphan,
-            }),
+        if (definition.name === "review") {
+          // The pre-PR self-review gate (anton-omum): a fresh-context reviewer reads THIS run's
+          // diff, its blocking findings are fixed on the branch, and only then does the PR open — so
+          // the PR the founder merges has already been reviewed once. The formula says WHERE the
+          // gate runs; the project setting still says WHETHER (absent ⇒ on). Nothing about the
+          // verdict is persisted as a resume marker on purpose: a parked run that is resumed
+          // re-reviews the worktree as it stands now, which is the only state the fixes it just made
+          // are visible in. A run that already opened its PR never reaches here — step 0a
+          // short-circuits it.
+          if (!resolveReviewConfig(settings).enabled) continue;
+          // Filled by the gate as each round completes, so a gate that THROWS — returning nothing —
+          // still leaves this attempt's score history to persist below.
+          const gateRounds: ReviewRound[] = [];
+          const gate = await definition.handler({ ...stepCtx, rounds: gateRounds }).catch(async (e) => {
+            // A throwing gate never reaches persistReviewScores below, so the rounds it DID finish
+            // are written here or lost with the attempt — for a poison park (a round-3 death still
+            // owes the founder rounds 1 and 2) and equally for a retryable one, where the run is
+            // rescheduled and the resumed gate restarts from round 1 with nothing on the board.
+            await persistPartialReviewScores(repo, epicBeadId, gateRounds);
+            // EVERY gate failure leaves the run without a PR of its own, so every one of them carries
+            // the orphan hazard: a PR a previous attempt opened but never recorded (lost `gh` response
+            // or lost setPrRef) stays READY and mergeable with un-reviewed work whether the gate
+            // refused the verdict, died on a usage limit, or exhausted its retries. Reconcile before
+            // propagating any of them. The one exception is a lease CONFIRMED lost to another machine —
+            // that run owns the branch and may have opened this very PR after passing its OWN gate, so
+            // drafting it would strand reviewed work with nobody left to ready it again. A lease this
+            // run merely couldn't KEEP is not that evidence, and is in fact the only kind reachable
+            // here: `assertLeaseHeld` — local expiry, `unproven` — is the gate's sole source of
+            // RunAlreadyLiveError, and skipping the reconcile on it left the orphan mergeable.
+            const orphan =
+              isRunAlreadyLiveError(e) && e.conflict === "foreign"
+                ? undefined
+                : await reconcileOrphanPullRequest(repo, worktree.branch);
+            // Errors anton doesn't compose a park message for are rethrown untouched — the runner keys
+            // its backoff (quota reschedule, retry) off the error's TYPE, and wrapping them would lose
+            // that. What the reconcile found rides out on the run row instead (see the catch below).
+            if (!isPoisonError(e)) {
+              orphanNotice = orphanClause(orphan);
+              throw e;
+            }
+            // The gate parks for a human on more than a blocking verdict: an unrevertable reviewer
+            // commit or a fixer that switched branches throws PoisonError from inside it. Those need
+            // the SAME parked-run handling — the instruction on both is repair by hand, then resume —
+            // so they are re-thrown as a gate block. Left as-is they marked the run `failed`, which
+            // hides the row from findOpenRunForEpic, and the resume the human was told to do would
+            // start a REPLACEMENT run instead of continuing this one and its session history.
+            throw new ReviewBlockedError(`${e.message}${orphanClause(orphan)}`, { cause: e });
+          });
+          // The gate's verdict is the only reason this step exists; a handler that returned none is
+          // an anton bug, not a run outcome, so it fails loud rather than opening an unreviewed PR.
+          const review = gate.facts?.review;
+          if (!review) {
+            throw new Error(
+              `formula step "${cooked.id}" (step:review) returned no verdict — refusing to open a PR ` +
+                `on an unreviewed run`,
+            );
+          }
+          // The score history belongs to the board, not this run's logs — written on both exits the gate
+          // RETURNS from, since a run parked on blocking findings is exactly the one whose score the
+          // founder needs. The throwing exit is covered by the catch above.
+          await persistReviewScores(repo, epicBeadId, review);
+
+          const blocking = blockingFindings(review.unresolved);
+          // Two states must not become a PR: blocking findings the converge loop couldn't clear, and a
+          // reviewer that broke the report protocol (silence — or a review that edited the code it was
+          // judging — is not a clean review). Both park for the founder like a no-delivery ticket does,
+          // with the reason on the bead so the board shows why rather than only the run log.
+          if (blocking.length > 0 || review.outcome === "protocol-violation") {
+            const orphan = await reconcileOrphanPullRequest(repo, worktree.branch);
+            // The advisories go on the bead with them: this run opens no PR, so its body — their only
+            // other home — never exists, and the resumed run starts its review with an empty carry.
+            const parkedAdvisories = review.unresolved.filter((f) => f.severity === "advisory");
+            const note = reviewParkNote(review, blocking, parkedAdvisories, orphan);
+            // Whether that write landed decides what the park reason can honestly say: a locked bd DB
+            // would otherwise discard the findings' only copy while the run error told the founder to
+            // read them on the bead (see reviewParkMessage).
+            const noted = await safe(() => beads.note(repo, epicBeadId, note));
+            throw new ReviewBlockedError(
+              reviewParkMessage({
+                targetId: epicBeadId,
+                outcome: review.outcome,
+                reason: reviewFailureReason(review, blocking),
+                note,
+                noted,
+                orphan,
+              }),
+            );
+          }
+          // Advisory findings never park (anton-3apm): they ride along in the PR body so the founder
+          // sees them at the merge gate — which is why they are carried into the steps that follow.
+          //
+          // Replaces rather than accumulates, and only because the carry runs BOTH ways: a formula
+          // with a second `step:review` seeds that gate with what this one left open (see
+          // `reviewStep`), so its reviewer was shown these and its verdict IS the whole open set —
+          // one it did not restate is settled, not forgotten. Accumulating here would instead
+          // resurrect advisories a later reviewer judged resolved.
+          advisoryFindings = review.unresolved.filter((f) => f.severity === "advisory");
+          continue;
+        }
+
+        if (definition.name === "pr") {
+          // Open the run's ONE PR, stamp the ref, and (for an epic) move it to in-review. A
+          // standalone target is NOT closed here: like an epic it stays OPEN, tagged stage:in-review
+          // (the ticket phase already applied that on commit), carrying its PR ref until the PR
+          // actually MERGES — at which point review-fix's merge-finalize path closes it. Closing it
+          // now would derive it as Done on the board while its PR is still open and drop it out of
+          // review-fix's in-review sweep.
+          const pr = (await definition.handler(stepCtx)).facts?.pr;
+          if (!pr) {
+            throw new Error(
+              `formula step "${cooked.id}" (step:pr) reported no pull request — the run has no way to ` +
+                `reach a human, so it is not done`,
+            );
+          }
+          if (pr.bodyStale) {
+            const note = stalePrBodyNote(pr, advisoryFindings);
+            // If that write ALSO fails (a locked or unavailable beads DB) the findings have no home
+            // left, and the run would still finish `done` — the advisory detail silently dropped
+            // between this review and the merge gate. Carry the whole note out on the run row
+            // instead, the same durable fallback the park path uses (see reviewParkMessage).
+            if (!(await safe(() => beads.note(repo, epicBeadId, note)))) {
+              staleBodyFallback = stalePrBodyRunError(epicBeadId, note);
+            }
+          }
+          await safe(() => beads.setPrRef(repo, epicBeadId, pr.ref));
+          if (!standaloneRun) {
+            await safe(() => beads.tag(repo, epicBeadId, [LABELS.stage("in-review")]));
+            await safe(() => beads.untag(repo, epicBeadId, [LABELS.stage("implementing")]));
+          }
+          continue;
+        }
+
+        // Anything else the project put after its commit — a `step:verify` it moved there, or a
+        // `step:claude` of its own. A step that RAN and did not achieve its work stops the run: the
+        // registry leaves that judgement to the caller, and carrying on would report a delivery on
+        // a pipeline that didn't finish.
+        const result = await definition.handler(stepCtx);
+        if (!result.ok) {
+          throw new Error(
+            result.detail ??
+              `formula step "${cooked.id}" (step:${definition.name}) failed for ${epicBeadId}`,
           );
         }
-        // Advisory findings never park (anton-3apm): they ride along in the PR body so the founder
-        // sees them at the merge gate.
-        advisoryFindings = review.unresolved.filter((f) => f.severity === "advisory");
       }
 
-      // 5. All tickets done → open one PR, stamp the PR ref, and (for an epic) move it to
-      //    in-review. A standalone target is NOT closed here: like an epic it stays OPEN, tagged
-      //    stage:in-review (runTicket already applied that on commit), carrying its PR ref until
-      //    the PR actually MERGES — at which point review-fix's merge-finalize path closes it.
-      //    Closing it now would derive it as Done on the board while its PR is still open and drop
-      //    it out of review-fix's in-review sweep (which is what keeps a standalone PR in the
-      //    automated review/finalization path).
-      assertLeaseHeld(); // don't open a PR under a lease that has silently lapsed
-      const pr = await openPullRequest({
-        repoPath: repo,
-        branch: worktree.branch,
-        base: baseBranch,
-        title: buildPrTitle(target, epicBeadId, settings.conventionalCommits),
-        // `live`, not `tickets`: an abandoned ticket contributed no commit, so listing it would
-        // advertise work this PR doesn't contain (anton-6xj0).
-        body: prBody(target, live, advisoryFindings),
-      });
-      // A reused PR whose refresh `gh` refused still shows the previous attempt's body, and the run
-      // completes regardless — so this round's advisories would exist nowhere: the score comment
-      // records their COUNT, never their text. Write them onto the bead before the run finishes, so
-      // the founder still has the actionable detail the stale body is hiding.
-      let staleBodyFallback: string | null = null;
-      if (pr.bodyStale) {
-        const note = stalePrBodyNote(pr, advisoryFindings);
-        // If that write ALSO fails (a locked or unavailable beads DB) the findings have no home left,
-        // and the run would still finish `done` — the advisory detail silently dropped between this
-        // review and the merge gate. Carry the whole note out on the run row instead, the same
-        // durable fallback the park path uses (see reviewParkMessage).
-        if (!(await safe(() => beads.note(repo, epicBeadId, note)))) {
-          staleBodyFallback = stalePrBodyRunError(epicBeadId, note);
-        }
-      }
-      await safe(() => beads.setPrRef(repo, epicBeadId, pr.ref));
-      if (!standaloneRun) {
-        await safe(() => beads.tag(repo, epicBeadId, [LABELS.stage("in-review")]));
-        await safe(() => beads.untag(repo, epicBeadId, [LABELS.stage("implementing")]));
-      }
-
-      // 6. Finalize run + clean up the worktree (the branch/PR carry the work now). The run IS done —
+      // 5. Finalize run + clean up the worktree (the branch/PR carry the work now). The run IS done —
       //    the branch and its PR carry the work — so a stale-body salvage rides along as the row's
       //    error rather than failing a delivery that landed.
       await updateRun(db, clock, runId, {
@@ -1141,17 +1275,13 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
   };
 }
 
-/** One ticket: session → claude → tests → commit → close. */
+/** One ticket: session → the formula's ticket phase (…→ commit) → close. */
 async function runTicket(args: {
-  db: AntonDb;
-  clock: Clock;
-  ctx: JobContext;
-  projectId: string;
-  repo: string;
-  runId: string;
-  worktreePath: string;
+  /** The run-level step context every ticket shares; this ticket's own is derived from it. */
+  run: Omit<StepContext, "tickets">;
+  /** The formula's ticket phase, in execution order — dispatched once per ticket (anton-lnkt). */
+  steps: ResolvedStep[];
   ticket: Bead;
-  settings: ProjectSettings;
   operator?: string;
   /** Close the bead in beads once its work is committed. False for a standalone (epic-of-one)
    * target, which is never closed by execute-epic: it stays open + stage:in-review + PR ref until
@@ -1160,8 +1290,9 @@ async function runTicket(args: {
    * epic's children close as their work lands). */
   closeOnDone?: boolean;
 }): Promise<void> {
-  const { db, clock, ctx, projectId, repo, runId, worktreePath, ticket, settings, operator } =
-    args;
+  const { run, ticket, operator } = args;
+  const { db, clock, ctx, projectId, runId, worktreePath } = run;
+  const repo = run.repoPath;
   const closeOnDone = args.closeOnDone ?? true;
 
   // Claim the ticket for the operator as a HARD GATE before doing any work. On a shared board
@@ -1188,99 +1319,99 @@ async function runTicket(args: {
     .sync(repo)
     .catch((e) => console.error(`[execute-epic] claim sync failed for ${ticket.id}`, e));
 
-  const agentTag = labelValue(ticket.labels, "agent");
-  // Compose the system prompt: locked base contract + agent-tag prompt + operator seed. The base
-  // is mandatory (buildExecutionSystemPrompt throws if src/prompts/system-base.md is missing).
-  const agentPrompt = await loadAgentPrompt(agentTag, { projectDir: worktreePath });
-  const appendSystemPrompt = await buildExecutionSystemPrompt({
-    agentPrompt,
-    seedPrompt: settings.seedPrompt,
-  });
-
-  const { sessionId, logPath, onEvent } = await startJobSession(db, clock, {
+  const agentTag = labelValueOf(ticket.labels, "agent");
+  const session = await startJobSession(db, clock, {
     projectId,
     runId,
     kind: "execute",
     beadId: ticket.id,
   });
+  const { sessionId, logPath } = session;
   await updateRun(db, clock, runId, { ticketBeadId: ticket.id, agentTag: agentTag ?? null });
   // Live handle (anton-susu): expose this ticket's session + worktree while it runs; each ticket's
   // dispatch overwrites the last, so the handle always names the job's CURRENT session.
   ctx.report({ sessionId, cwd: worktreePath });
 
-  // Human steering (anton-bfy4) can land at any moment — including while this epic's earlier
-  // tickets were running — so the notes that reach the prompt are read HERE, at dispatch, not from
-  // the board snapshot the run started with. Best-effort: an unreadable bead just means no notes.
-  const dispatched = await withDispatchNotes(repo, ticket);
+  // This ticket's step context: the run's, narrowed to this ticket. The session is opened HERE and
+  // handed in, so one session still covers the whole ticket — dispatch, gates and commit — exactly
+  // as before. The claude driver is built per step below, so a resumed session is told which step it
+  // is continuing.
+  const ticketCtx: StepContext = { ...run, tickets: [ticket], session };
 
   let committed = false;
   try {
-    const result = await runClaudeResilient({
-      db,
-      ctx,
-      sessionId,
-      logPath,
-      worktreePath,
-      ticket: dispatched,
-      appendSystemPrompt,
-      model: settings.model,
-      permissionMode: settings.permissionMode ?? "bypassPermissions",
-      onEvent,
-    });
-    if (!result.ok) {
-      throw new Error(`claude reported an error for ${ticket.id}: ${result.text ?? "unknown"}`);
-    }
+    // The ticket phase of the walk (anton-lnkt): the formula's steps up to and including its commit,
+    // in formula order, each dispatched through the registry against THIS ticket. The walk replaces
+    // the order these ran in, never the guards around them — the delivery-evidence gate below is
+    // still what decides whether the ticket is done.
+    // The agent's machine-readable self-report (anton-j5i8) — `delivered` or `blocked — <reason>`,
+    // already recorded on the session log by the dispatching step. It CORROBORATES the
+    // delivery-evidence gate below, never replaces it; a missing/unparseable line (null) simply
+    // falls through to it.
+    let selfReport: AntonResult | null = null;
+    for (const { step: cooked, definition } of args.steps) {
+      // Every step boundary is a lease checkpoint, exactly as every ticket boundary is.
+      run.assertLeaseHeld?.();
+      const result = await definition.handler({
+        ...ticketCtx,
+        step: cooked,
+        // In-session resume for a transient mid-stream death (anton-juar) — the dispatch machinery
+        // the step inherits from the run rather than a second driver of its own.
+        deps: { runClaude: resilientClaude({ db, ctx, sessionId, logPath, ticket, stepId: cooked.id }) },
+      });
+      // A `blocked` self-report is STICKY across a phase with several dispatching steps. A later
+      // agent — a `step:claude` the project added after `implement` — reports on its own work only,
+      // so letting its `delivered` overwrite an earlier block would close a ticket the implementer
+      // declared incomplete on the partial changes it left behind. A missing/unparseable line (null)
+      // keeps whatever the phase reported before it, as it always has.
+      if (selfReport?.outcome !== "blocked") selfReport = result.facts?.selfReport ?? selfReport;
 
-    // Parse the agent's machine-readable self-report (anton-j5i8): the last `ANTON-RESULT:` line
-    // from its output — `delivered` or `blocked — <reason>`. Recorded on the session log here; it
-    // CORROBORATES the delivery-evidence gate below, never replaces it. A missing/unparseable line
-    // (selfReport === null) simply falls through to the commit-evidence gate — never a crash.
-    const selfReport = parseAntonResult(result.text);
-    await appendSessionLog(logPath, `[anton-result] ${formatAntonResult(selfReport)}\n`).catch(() => {});
+      if (definition.name !== "commit") {
+        // A step that RAN and did not achieve its work halts the ticket (and, through it, the epic).
+        // Verify gates and any other throwing step propagate untouched, so the runner's own
+        // classification — quota → backoff, poison → park — still applies unchanged.
+        if (!result.ok) {
+          throw new Error(
+            result.detail ?? `formula step "${cooked.id}" (step:${definition.name}) failed for ${ticket.id}`,
+          );
+        }
+        continue;
+      }
 
-    // Verify gates (optional — configured per project): tests + operator-pinned lint/typecheck/
-    // build (anton-3oh8). Absent → no gates run. A non-zero exit fails the ticket before commit.
-    await runVerifyGates(
-      resolveVerifyGates(settings),
-      worktreePath,
-      ctx.signal,
-      logPath,
-      (gate, code) => `${gate.label} gate failed for ${ticket.id} (exit ${code})`,
-    );
+      // The commit is the ticket's evidence of record — honor the step's { committed } verdict. A
+      // clean agent exit that leaves NO diff delivered nothing: the exact false-success in issue #46
+      // (root cause #1). Do NOT close/advance the ticket on empty delivery. Throw a NoDeliveryError
+      // so the catch below BLOCKS the ticket for a human (never re-queues it open) and the error
+      // propagates out of the ticket loop, halting dispatch of the rest of the epic. NoDeliveryError
+      // is poison, so the runner parks the run for a human instead of retrying claude to the same
+      // empty result forever.
+      if (!result.facts?.committed) {
+        // Empty tree: the delivery-evidence gate blocks + halts. Cross-check the self-report and
+        // fold it into the reason (anton-j5i8): a `delivered` claim on an empty tree is the exact
+        // false success the gate exists to catch; a `blocked` self-report corroborates the block and
+        // carries the agent's own reason forward. A missing line just reads as the plain gate message.
+        throw new NoDeliveryError(
+          `${ticket.id} produced no delivery: claude exited cleanly and passed the verify gates but ` +
+            `left no changes to commit (zero diff). Blocking the ticket for operator review and ` +
+            `halting the epic — nothing landed, so closing it would be a false success.` +
+            selfReportSuffix(selfReport),
+        );
+      }
+      committed = true;
 
-    // Commit whatever claude changed — and honor commitAll's { committed } verdict. A clean agent
-    // exit that leaves NO diff delivered nothing: the exact false-success in issue #46 (root cause
-    // #1). Do NOT close/advance the ticket on empty delivery. Throw a NoDeliveryError so the catch
-    // below BLOCKS the ticket for a human (never re-queues it open) and the error propagates out of
-    // the ticket loop, halting dispatch of the rest of the epic. NoDeliveryError is poison, so the
-    // runner parks the run for a human instead of retrying claude to the same empty result forever.
-    const { committed: didCommit } = await commitAll(worktreePath, `${ticket.id}: ${ticket.title}`);
-    if (!didCommit) {
-      // Empty tree: the delivery-evidence gate blocks + halts. Cross-check the self-report and
-      // fold it into the reason (anton-j5i8): a `delivered` claim on an empty tree is the exact
-      // false success the gate exists to catch; a `blocked` self-report corroborates the block and
-      // carries the agent's own reason forward. A missing line just reads as the plain gate message.
-      throw new NoDeliveryError(
-        `${ticket.id} produced no delivery: claude exited cleanly and passed the verify gates but ` +
-          `left no changes to commit (zero diff). Blocking the ticket for operator review and ` +
-          `halting the epic — nothing landed, so closing it would be a false success.` +
-          selfReportSuffix(selfReport),
-      );
-    }
-    committed = true;
-
-    // Commit evidence exists, but the agent SELF-REPORTED blocked (anton-j5i8): it is telling us
-    // the ticket is not actually done. Honor that honest signal — block the ticket for a human
-    // rather than closing it on a partial change. This is NOT a self-report-alone failure (out of
-    // scope): there IS commit evidence; we surface the contradiction (work committed + agent-declared
-    // block) so the partial work isn't lost and a human decides. A `delivered`/missing self-report
-    // with a real commit is the normal path and proceeds to close/in-review below.
-    if (selfReport?.outcome === "blocked") {
-      throw new BlockedByAgentError(
-        `${ticket.id} was self-reported blocked by the agent (${formatAntonResult(selfReport)}) even ` +
-          `though it committed changes. Blocking the ticket for operator review and halting the epic — ` +
-          `the agent declared the work incomplete, so closing it would be a false success.`,
-      );
+      // Commit evidence exists, but the agent SELF-REPORTED blocked (anton-j5i8): it is telling us
+      // the ticket is not actually done. Honor that honest signal — block the ticket for a human
+      // rather than closing it on a partial change. This is NOT a self-report-alone failure (out of
+      // scope): there IS commit evidence; we surface the contradiction (work committed + agent-declared
+      // block) so the partial work isn't lost and a human decides. A `delivered`/missing self-report
+      // with a real commit is the normal path and proceeds to close/in-review below.
+      if (selfReport?.outcome === "blocked") {
+        throw new BlockedByAgentError(
+          `${ticket.id} was self-reported blocked by the agent (${formatAntonResult(selfReport)}) even ` +
+            `though it committed changes. Blocking the ticket for operator review and halting the epic — ` +
+            `the agent declared the work incomplete, so closing it would be a false success.`,
+        );
+      }
     }
 
     // Persist this ticket's "code done" state the moment it commits. An epic child closes (stage
@@ -1384,7 +1515,9 @@ export function claudeResumeDecision(
 }
 
 /**
- * Run claude for one ticket with resilient in-session recovery (anton-juar). A transient mid-stream
+ * A claude driver with resilient in-session recovery (anton-juar), shaped exactly like `runClaude`
+ * so it drops into the step registry's driver seam and every step inherits the recovery. A transient
+ * mid-stream
  * death (network drop, truncated stream, exit-without-result) that captured a Claude session id is
  * retried with `claude --resume <id>` — continuing the same conversation instead of re-running the
  * whole ticket from scratch — bounded by MAX_RESUME_ATTEMPTS so a flapping connection can't burn the
@@ -1393,82 +1526,92 @@ export function claudeResumeDecision(
  * is spent, the error propagates so the job-level runner does today's fresh spawn (then parks after
  * maxAttempts) — resume is best-effort and never a new failure mode.
  */
-async function runClaudeResilient(args: {
+function resilientClaude(args: {
   db: AntonDb;
-  ctx: JobContext;
+  ctx: Pick<JobContext, "signal">;
+  /** anton's session row for this ticket — where the captured claude id and the resume log land. */
   sessionId: string;
   logPath: string;
-  worktreePath: string;
+  /** The ticket in scope, for the continuation prompt a resumed session gets. */
   ticket: Bead;
-  appendSystemPrompt: string;
-  model?: string;
-  permissionMode: "default" | "acceptEdits" | "bypassPermissions" | "plan";
-  onEvent: (e: ClaudeEvent) => void;
-}): Promise<ClaudeResult> {
-  const { db, ctx, sessionId, logPath, worktreePath, ticket } = args;
-  let resumeId: string | undefined;
-  let priorError: string | undefined;
-  let priorSignature: string | undefined;
+  /**
+   * The formula step being dispatched. Every dispatching step in the ticket phase inherits this
+   * driver — `implement`, and any `step:claude` the project added — so the continuation prompt names
+   * the step rather than implying the resumed session was implementing the ticket.
+   */
+  stepId?: string;
+}): (options: RunClaudeOptions) => Promise<ClaudeResult> {
+  const { db, ctx, sessionId, logPath, ticket, stepId } = args;
+  return async function dispatch(options: RunClaudeOptions): Promise<ClaudeResult> {
+    let resumeId: string | undefined;
+    let priorError: string | undefined;
+    let priorSignature: string | undefined;
 
-  for (let attempt = 0; ; attempt++) {
-    try {
-      const result = await runClaude({
-        cwd: worktreePath,
-        prompt: resumeId ? continuationPrompt(ticket, priorError) : ticketPrompt(ticket),
-        resumeSessionId: resumeId,
-        appendSystemPrompt: args.appendSystemPrompt,
-        model: args.model,
-        permissionMode: args.permissionMode,
-        signal: ctx.signal,
-        onEvent: args.onEvent,
-      });
-      // Persist the real Claude session id once the run reports it (diagnostics + future resume).
-      if (result.sessionId) await setSessionClaudeId(db, sessionId, result.sessionId).catch(() => {});
-      return result;
-    } catch (e) {
-      // Only a transient (RecoverableClaudeError) failure is resume-eligible. A deterministic/content
-      // failure (verify-gate, agent error), poison, or quota is NOT — it propagates unchanged so the
-      // runner applies today's fresh-restart/park policy (never a resume that would replay bad state).
-      if (!isRecoverableClaudeError(e)) throw e;
-      // A killed job (force-kill, or an abandon that cancelled the run — anton-6xj0) aborts the
-      // child mid-stream, which looks exactly like a transient death. Never resume through it: the
-      // operator asked for this agent to stop, and the retry would spawn against an already-aborted
-      // signal anyway. Checked before the resume decision so the abort propagates immediately.
-      if (ctx.signal.aborted) throw e;
-      // Persist the captured id even on the failure path — a mid-stream death may carry it only via
-      // the system-init event, and it's what a fresh-restart's operator or a future resume relies on.
-      if (e.sessionId) await setSessionClaudeId(db, sessionId, e.sessionId).catch(() => {});
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const result = await runClaude(
+          resumeId
+            ? {
+                ...options,
+                // The interrupted step's own context already lives in the resumed conversation, so
+                // the prompt is a brief continuation rather than the whole instruction again.
+                prompt: continuationPrompt(ticket, priorError, stepId),
+                resumeSessionId: resumeId,
+              }
+            : options,
+        );
+        // Persist the real Claude session id once the run reports it (diagnostics + future resume).
+        if (result.sessionId) await setSessionClaudeId(db, sessionId, result.sessionId).catch(() => {});
+        return result;
+      } catch (e) {
+        // Only a transient (RecoverableClaudeError) failure is resume-eligible. A deterministic/content
+        // failure (verify-gate, agent error), poison, or quota is NOT — it propagates unchanged so the
+        // runner applies today's fresh-restart/park policy (never a resume that would replay bad state).
+        if (!isRecoverableClaudeError(e)) throw e;
+        // A killed job (force-kill, or an abandon that cancelled the run — anton-6xj0) aborts the
+        // child mid-stream, which looks exactly like a transient death. Never resume through it: the
+        // operator asked for this agent to stop, and the retry would spawn against an already-aborted
+        // signal anyway. Checked before the resume decision so the abort propagates immediately.
+        if (ctx.signal.aborted) throw e;
+        // Persist the captured id even on the failure path — a mid-stream death may carry it only via
+        // the system-init event, and it's what a fresh-restart's operator or a future resume relies on.
+        if (e.sessionId) await setSessionClaudeId(db, sessionId, e.sessionId).catch(() => {});
 
-      const decision = claudeResumeDecision(e, attempt, priorSignature);
-      if (!decision.resume) {
+        const decision = claudeResumeDecision(e, attempt, priorSignature);
+        if (!decision.resume) {
+          await appendSessionLog(
+            logPath,
+            `[resume] not resuming (${decision.reason}) — escalating to a fresh restart: ${e.message}\n`,
+          ).catch(() => {});
+          throw e;
+        }
+        resumeId = e.sessionId;
+        priorError = e.message;
+        priorSignature = e.signature;
         await appendSessionLog(
           logPath,
-          `[resume] not resuming (${decision.reason}) — escalating to a fresh restart: ${e.message}\n`,
+          `[resume] transient failure (${e.signature}); resuming claude session ${e.sessionId} — ` +
+            `attempt ${attempt + 2}/${MAX_RESUME_ATTEMPTS + 1}: ${e.message}\n`,
         ).catch(() => {});
-        throw e;
       }
-      resumeId = e.sessionId;
-      priorError = e.message;
-      priorSignature = e.signature;
-      await appendSessionLog(
-        logPath,
-        `[resume] transient failure (${e.signature}); resuming claude session ${e.sessionId} — ` +
-          `attempt ${attempt + 2}/${MAX_RESUME_ATTEMPTS + 1}: ${e.message}\n`,
-      ).catch(() => {});
     }
-  }
+  };
 }
 
 /**
- * Brief continuation prompt for a resumed session (anton-juar). The full ticket spec already lives in
- * the resumed conversation, so this only nudges the agent to pick up where it left off. The captured
- * error is injected ONLY when it may have been caused by the agent's own output (e.g. an oversized
- * tool result that tripped a limit) — never for pure infra noise the agent can't act on, which would
- * only distract it.
+ * Brief continuation prompt for a resumed session (anton-juar). Whatever the interrupted session was
+ * given — the ticket spec, or a `step:claude`'s own prompt — already lives in the resumed
+ * conversation, so this only nudges the agent to pick up where it left off. It names the STEP when
+ * there is one: the ticket phase can dispatch several agents, and telling a custom step's agent that
+ * its session "for <ticket>" was interrupted misdescribes the work it was actually doing. The
+ * captured error is injected ONLY when it may have been caused by the agent's own output (e.g. an
+ * oversized tool result that tripped a limit) — never for pure infra noise the agent can't act on,
+ * which would only distract it.
  */
-export function continuationPrompt(ticket: Bead, priorError?: string): string {
+export function continuationPrompt(ticket: Bead, priorError?: string, stepId?: string): string {
+  const subject = stepId ? `the \`${stepId}\` step of ${ticket.id}` : ticket.id;
   const lines = [
-    `Your previous session for ${ticket.id} was interrupted mid-stream by a transient failure and ` +
+    `Your previous session — ${subject} — was interrupted mid-stream by a transient failure and ` +
       `has been resumed with full conversation context. Continue from where you left off — do NOT ` +
       `restart from scratch. Inspect the working tree for partial edits before redoing anything, so ` +
       `you don't duplicate or conflict with work already in progress.`,
@@ -1493,14 +1636,6 @@ function mayBeAgentCaused(message: string): boolean {
   return /prompt is too long|input (?:is )?too long|too many tokens|maximum context|context (?:length|window)|request (?:entity )?too large|payload too large|too large|\b413\b/i.test(
     message,
   );
-}
-
-/** A permanent, human-needed failure (never retried). */
-class PoisonEpic extends Error {
-  constructor(msg: string) {
-    super(msg);
-    this.name = "PoisonError"; // classified as poison by the runner
-  }
 }
 
 /**
@@ -1735,11 +1870,6 @@ function violationParkHead(review: ReviewGateResult, rounds: number): string {
   }
 }
 
-/** Findings as a markdown list — shared by the park note and the PR body. */
-function findingLines(findings: ReviewFinding[]): string[] {
-  return findings.map((f) => `- ${f.location} — ${f.note}`);
-}
-
 /**
  * The salvage note for a reused PR whose body could not be refreshed: this run's advisory findings,
  * plus the warning that the PR text belongs to an earlier attempt.
@@ -1778,16 +1908,11 @@ export function stalePrBodyRunError(targetId: string, note: string): string {
 }
 
 /** Fold the parsed self-report into a zero-diff block reason, when one was emitted (anton-j5i8). */
-function selfReportSuffix(selfReport: ReturnType<typeof parseAntonResult>): string {
+function selfReportSuffix(selfReport: AntonResult | null): string {
   if (!selfReport) return "";
   return selfReport.outcome === "delivered"
     ? ` The agent self-reported ANTON-RESULT: delivered — a false success on an unchanged tree.`
     : ` The agent self-reported ${formatAntonResult(selfReport)}, corroborating the block.`;
-}
-
-function labelValue(labels: string[] | undefined, prefix: string): string | undefined {
-  const l = labels?.find((x) => x.startsWith(`${prefix}:`));
-  return l ? l.slice(prefix.length + 1) : undefined;
 }
 
 /**
@@ -1819,7 +1944,7 @@ export function inactiveAgentTickets(
   const userAgents = userAgentIds ? new Set(userAgentIds) : null;
   const out: { id: string; agent: string }[] = [];
   for (const t of tickets) {
-    const agent = labelValue(t.labels, "agent");
+    const agent = labelValueOf(t.labels, "agent");
     if (!agent) continue;
     if (active.has(agent)) continue;
     if (userAgents?.has(agent)) continue; // the project's own agent — never gated by the allowlist
@@ -1860,113 +1985,6 @@ export function orderTickets(tickets: Bead[], all: Bead[]): Bead[] {
   }
   if (order.length !== tickets.length) return tickets; // cycle → original order
   return order.map((id) => byId.get(id)!);
-}
-
-/**
- * Cap on each inlined ticket field. anton worktrees carry a frozen embedded Dolt with no remote,
- * so `bd show` inside the worktree can fail (issue #46 root cause #3) — the prompt must therefore
- * carry the spec itself and not be load-bearing on in-worktree DB access. A generous per-field
- * budget keeps a pathologically large body from bloating the prompt while still delivering the
- * whole spec for the common case.
- */
-const MAX_TICKET_FIELD_CHARS = 4000;
-
-function truncateField(text: string): string {
-  const trimmed = text.trim();
-  if (trimmed.length <= MAX_TICKET_FIELD_CHARS) return trimmed;
-  return `${trimmed.slice(0, MAX_TICKET_FIELD_CHARS)}\n… [truncated — run \`bd show\` for the full text]`;
-}
-
-/**
- * The concrete task (`-p`) for one ticket. The operating contract (git/beads ownership, scope,
- * learnings, fail-loud) lives in the locked base system prompt (composeSystemPrompt), so it isn't
- * duplicated here.
- *
- * The ticket's full spec — Goal / Out of scope / Verify (the `description` markdown), Acceptance,
- * and Context — is inlined so the agent can implement even when the worktree's beads DB is
- * unreadable (issue #46 root cause #3). `bd show` is offered as a convenience, never as the sole
- * source: a bead whose spec is genuinely empty AND whose `bd show` fails is a fail-loud/blocked
- * condition, not a cue to silently produce nothing.
- *
- * Human notes on the bead (anton-bfy4) are appended last — the operator's steer is the freshest
- * intent, so it reads as a refinement of the contract above it.
- */
-export function ticketPrompt(ticket: Bead): string {
-  const description = ticket.description?.trim();
-  // The gate's own reader: covers every home the contract accepts — bd's acceptance fields AND a
-  // description-only `## Acceptance` section. Reading the fields alone said "(none stated)" for a
-  // rubric the gate had just accepted, whenever the truncated description block below cut it.
-  const acceptance = acceptanceBody(ticket)?.trim();
-  // In some boards Context is a separate column; in others it's folded into `description` as a
-  // `## Context` heading. Only inline the standalone field when it isn't already in `description`.
-  const context =
-    ticket.context?.trim() && ticket.context.trim() !== description
-      ? ticket.context.trim()
-      : undefined;
-
-  const lines = [
-    `Implement this beads ticket in the current worktree:`,
-    ``,
-    `Ticket: ${ticket.id} — ${ticket.title}`,
-  ];
-  if (description) {
-    lines.push(``, `## Goal / Out of scope / Verify`, truncateField(description));
-  }
-  lines.push(``, `## Acceptance criteria`, acceptance ? truncateField(acceptance) : "(none stated)");
-  if (context) {
-    lines.push(``, `## Context`, truncateField(context));
-  }
-  // The human steering channel (anton-bfy4): notes an operator left on the bead between the gates.
-  // They come last so the freshest human intent is what the agent reads before the closing rules.
-  const humanNotes = humanNotesPromptBlock(ticket.notes);
-  if (humanNotes) {
-    lines.push(``, truncateField(humanNotes));
-  }
-  lines.push(
-    ``,
-    `The full ticket spec is inlined above so you can implement it even if the worktree's beads ` +
-      `DB is unreadable. \`bd show ${ticket.id}\` gives the same content when bd is healthy. If ` +
-      `the spec above is empty AND \`bd show\` fails, stop and report the ticket as blocked — do ` +
-      `not guess or silently bail. Follow the operating contract in your system prompt.`,
-  );
-  return lines.join("\n");
-}
-
-/**
- * `advisory` — findings the self-review reported and did NOT fix (anton-omum). They never hold the PR
- * back, so the merge gate is the only place the founder would ever see them; putting them in the body
- * is what makes "self-reviewed" mean something they can act on rather than trust blindly.
- */
-function prBody(target: Bead, tickets: Bead[], advisory: ReviewFinding[] = []): string {
-  // Standalone run (epic-of-one): the single ticket IS the target, so listing it again is noise.
-  const standalone = tickets.length === 1 && tickets[0]?.id === target.id;
-  const lines = [
-    `Autonomous run for **${target.id}** — ${target.title}.`,
-    ``,
-    ...(standalone ? [] : [`Tickets:`, ...tickets.map((t) => `- ${t.id} — ${t.title}`), ``]),
-    ...(advisory.length > 0
-      ? [
-          `### Unresolved review findings (${advisory.length}, advisory)`,
-          ``,
-          `anton's pre-PR self-review reported these and left them for you — they don't block the merge.`,
-          ``,
-          ...findingLines(advisory),
-          ``,
-        ]
-      : []),
-    `🤖 Generated with [anton](https://github.com/) autonomous execution`,
-  ];
-  return lines.join("\n");
-}
-
-/**
- * The ticket as it should be dispatched: the board-snapshot bead plus its CURRENT notes blob, read
- * fresh so an operator's steer written after the run started still reaches this ticket's prompt.
- * `bd show` failing (e.g. a locked DB) must never block the run — the snapshot bead is returned.
- */
-async function withDispatchNotes(repo: string, ticket: Bead): Promise<Bead> {
-  const fresh = await beads.show(repo, ticket.id).catch(() => null);
-  return fresh?.notes ? { ...ticket, notes: fresh.notes } : ticket;
 }
 
 /**

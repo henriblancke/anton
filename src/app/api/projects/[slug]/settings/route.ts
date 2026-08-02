@@ -6,6 +6,7 @@ import {
   MAX_RETRIES_RANGE,
   REVIEW_MAX_ROUNDS_RANGE,
   budgetPolicySchema,
+  formulaVariantsSchema,
   runHealthThresholdsSchema,
   getProjectSettingsBySlug,
   updateProjectSettings,
@@ -253,6 +254,24 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
         return NextResponse.json({ error: `Invalid budgetPolicy: ${detail}` }, { status: 400 });
       }
       patch.budgetPolicy = parsed.data;
+    }
+  }
+
+  if ("formulaVariants" in body) {
+    const raw = (body as Record<string, unknown>).formulaVariants;
+    // "" / null / [] → clear: an empty map IS "no variants", which is exactly the absent case (every
+    // run walks the project's default), so it's stored as absent rather than as an empty array.
+    // Otherwise validate strictly — a bad label→formula entry 400s rather than persisting a mapping
+    // that would park every run carrying that label.
+    if (raw == null || raw === "" || (Array.isArray(raw) && raw.length === 0)) {
+      patch.formulaVariants = undefined;
+    } else {
+      const parsed = formulaVariantsSchema.safeParse(raw);
+      if (!parsed.success) {
+        const detail = parsed.error.issues[0]?.message ?? "invalid entry";
+        return NextResponse.json({ error: `Invalid formulaVariants: ${detail}` }, { status: 400 });
+      }
+      patch.formulaVariants = parsed.data;
     }
   }
 

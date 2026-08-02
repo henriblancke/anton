@@ -10,19 +10,20 @@
  * scripted report from a file so a case can script convergence, a stall, or a broken protocol.
  * Skipped without bd + git.
  */
-import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { beads } from "../beads/bd";
 import { BD_BIN_ENV, resetBdBinCache, resolveBdBin } from "../beads/bd-bin";
 import { worktreePathFor } from "../git/worktree";
 import * as schema from "../db/schema";
-import { getJob, park } from "./queue";
+import { park } from "./queue";
 import { resetOperatorCache } from "../operator";
 import { REVIEW_SCORE_KIND } from "./review-score";
 import { describeBd } from "@/lib/testing/integration";
+import { expectJobStatus } from "@/lib/testing/jobs";
 import {
   BASE_TIME_MS,
   resetPerCaseState,
@@ -55,20 +56,37 @@ describeBd("execute-epic e2e — pre-PR self-review gate (real handler · real b
   let ctx: ExecuteEpicSandbox;
   /** Fake claude that answers implement / review / fix dispatches; reviews follow `script(...)`. */
   let reviewClaude: string;
+  /** The project-local pipeline a case installs; removed after every case. */
+  let formulaPath: string;
   let reportsPath: string;
   let counterPath: string;
   let invocationsPath: string;
+  let carriesPath: string;
 
   /** Script the reports successive review rounds return; the last one repeats if rounds outrun it. */
   const script = (...reports: ScriptedReport[]) => {
     writeFileSync(reportsPath, JSON.stringify(reports));
     writeFileSync(counterPath, "0");
     writeFileSync(invocationsPath, "");
+    writeFileSync(carriesPath, "");
   };
 
   /** Which dispatch kinds the fake claude saw, in order (`implement` | `review` | `fix`). */
   const dispatches = (): string[] =>
     readFileSync(invocationsPath, "utf8").trim().split("\n").filter(Boolean);
+
+  /** Per review dispatch, whether its prompt carried advisories from an earlier one. */
+  const carries = (): string[] => readFileSync(carriesPath, "utf8").trim().split("\n").filter(Boolean);
+
+  /** Install the project's own pipeline — the file that wins over anton's bundled default. */
+  const writeProjectFormula = (steps: string) => {
+    mkdirSync(join(repo, ".beads", "formulas"), { recursive: true });
+    writeFileSync(
+      formulaPath,
+      `formula = "anton-run"\ntype = "workflow"\nversion = 1\n\n${steps}`,
+      "utf8",
+    );
+  };
 
   /** An approved epic-of-one whose run this suite drives. */
   const approvedTarget = async (title: string): Promise<string> => {
@@ -113,6 +131,8 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
     reportsPath = join(sandbox, "review-reports.json");
     counterPath = join(sandbox, "review-round.txt");
     invocationsPath = join(sandbox, "review-dispatches.txt");
+    carriesPath = join(sandbox, "review-carries.txt");
+    formulaPath = join(repo, ".beads", "formulas", "anton-run.formula.toml");
 
     // One fake claude for all three dispatch kinds. It tells them apart by the prompt it is handed
     // — the same protocol markers anton's own prompts define — so a case scripts only the reports.
@@ -125,6 +145,9 @@ const kind=isReview?'review':isFix?'fix':'implement';
 fs.appendFileSync(process.env.ANTON_TEST_REVIEW_DISPATCHES,kind+'\\n');
 let text='done';
 if(isReview){
+  // Whether THIS review was shown advisories an earlier review left open (a round, or an earlier
+  // \`step:review\` — the carry the caller seeds).
+  fs.appendFileSync(process.env.ANTON_TEST_REVIEW_CARRIES,(prompt.includes('Advisories still open from an earlier review')?'carry':'none')+'\\n');
   // A reviewer that edits the code it is judging — the read-only guard's target case.
   if(process.env.ANTON_TEST_REVIEW_MUTATES){fs.writeFileSync(path.join(process.cwd(),'REVIEWER_EDIT.md'),'the reviewer fixed it itself\\n');}
   const reports=JSON.parse(fs.readFileSync(process.env.ANTON_TEST_REVIEW_REPORTS,'utf8'));
@@ -151,12 +174,14 @@ process.exit(0);`),
     process.env.ANTON_TEST_REVIEW_REPORTS = reportsPath;
     process.env.ANTON_TEST_REVIEW_COUNTER = counterPath;
     process.env.ANTON_TEST_REVIEW_DISPATCHES = invocationsPath;
+    process.env.ANTON_TEST_REVIEW_CARRIES = carriesPath;
   });
 
   afterAll(() => {
     delete process.env.ANTON_TEST_REVIEW_REPORTS;
     delete process.env.ANTON_TEST_REVIEW_COUNTER;
     delete process.env.ANTON_TEST_REVIEW_DISPATCHES;
+    delete process.env.ANTON_TEST_REVIEW_CARRIES;
     ctx?.restoreEnv();
     resetOperatorCache();
     ctx?.cleanup();
@@ -167,6 +192,12 @@ process.exit(0);`),
     await resetPerCaseState(tdb);
     process.env.ANTON_CLAUDE_BIN = reviewClaude;
     script({ score: 9, rationale: "clean", findings: [] });
+  });
+
+  // A project-local pipeline is read from the repo on every run, so one left behind would silently
+  // re-shape every later case in this file.
+  afterEach(() => {
+    rmSync(formulaPath, { force: true });
   });
 
   /** The score payloads anton appended to a bead, oldest first. */
@@ -205,7 +236,7 @@ process.exit(0);`),
     let jobId: string;
     try {
       jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
-      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+      await expectJobStatus(tdb.db, jobId, "done");
 
       // review → fix → review, in that order, all AFTER the implementation dispatch.
       expect(dispatches()).toEqual(["implement", "review", "fix", "review"]);
@@ -243,7 +274,7 @@ process.exit(0);`),
     let jobId: string;
     try {
       jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
-      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+      await expectJobStatus(tdb.db, jobId, "done");
 
       // No reviewer ran, nothing was scored, and the PR still opened.
       expect(dispatches()).toEqual(["implement"]);
@@ -279,7 +310,7 @@ process.exit(0);`),
     let jobId: string;
     try {
       jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
-      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+      await expectJobStatus(tdb.db, jobId, "done");
 
       // Advisory never dispatches a fix: one review, no repair, straight to the PR.
       expect(dispatches()).toEqual(["implement", "review"]);
@@ -288,6 +319,55 @@ process.exit(0);`),
       expect(body).toContain("extract the duplicated mapper");
       expect(body).toContain("the new helper deserves a doc line");
       expect(beads.getPrRef(await beads.show(repo, targetId))).toBe("gh-42");
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+      if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  });
+
+  it("hands a SECOND review step what the first left open, so its verdict speaks for both", async () => {
+    // A formula may run the gate twice — the floor constrains omission and order, never extension —
+    // and each `step:review` is its own gate. The run carries one advisory set into the PR body, so
+    // the second gate has to be SHOWN the first's findings: otherwise its report replaces them and
+    // an advisory nobody resolved never reaches the founder.
+    await setReviewEnabled(true);
+    writeProjectFormula(
+      [
+        ["implement", "implement", undefined],
+        ["commit", "commit", "implement"],
+        ["review-first", "review", "commit"],
+        ["review-second", "review", "review-first"],
+        ["pr", "pr", "review-second"],
+      ]
+        .map(
+          ([id, handler, needs]) =>
+            `[[steps]]\nid = "${id}"\ntype = "task"\ntitle = "${id}"\n` +
+            (needs ? `needs = ["${needs}"]\n` : "") +
+            `labels = ["step:${handler}"]\n`,
+        )
+        .join("\n"),
+    );
+    const advisory = { severity: "advisory" as const, location: "src/a.ts:10", note: "extract the mapper" };
+    // Both gates report it: the second was shown it and judged that it still applies.
+    script({ score: 8, rationale: "one nit", findings: [advisory] }, { score: 8, rationale: "still there", findings: [advisory] });
+    const targetId = await approvedTarget("Two-gate run");
+
+    const bodyDump = join(sandbox, "two-gate-pr-body.txt");
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = capturingGh("gh-two-gate", bodyDump);
+
+    const runner = makeEpicRunner(ctx);
+    let jobId: string;
+    try {
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
+      await expectJobStatus(tdb.db, jobId, "done");
+
+      expect(dispatches()).toEqual(["implement", "review", "review"]);
+      // The first gate starts blind; the second is handed what it left open.
+      expect(carries()).toEqual(["none", "carry"]);
+      const body = readFileSync(bodyDump, "utf8");
+      expect(body).toContain("Unresolved review findings (1, advisory)");
+      expect(body.match(/extract the mapper/g)).toHaveLength(1);
     } finally {
       process.env.ANTON_GH_BIN = okGh;
       if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
@@ -326,7 +406,7 @@ process.exit(0);`,
     let jobId: string;
     try {
       jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
-      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+      await expectJobStatus(tdb.db, jobId, "done");
 
       const notes = (await beads.show(repo, targetId)).notes ?? "";
       expect(notes).toContain("could NOT rewrite its title/body");
@@ -382,7 +462,7 @@ process.exit(r.status===null?1:r.status);`,
     let jobId: string;
     try {
       jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
-      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+      await expectJobStatus(tdb.db, jobId, "done");
 
       // The bead never got the note — that is the failure being covered, not a missed write.
       expect((await beads.show(repo, targetId)).notes ?? "").not.toContain("could NOT rewrite");
@@ -430,9 +510,8 @@ console.error('gh boom: no PR may be opened for an unresolved review');process.e
       jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
 
       // Poison → parked for a human immediately, same path as a no-delivery ticket.
-      const job = await getJob(tdb.db, jobId);
-      expect(job?.status).toBe("parked");
-      expect(job?.lastError).toMatch(/self-review/i);
+      const job = await expectJobStatus(tdb.db, jobId, "parked");
+      expect(job.lastError).toMatch(/self-review/i);
       // The RUN row says parked too, with no end time: this is a run waiting on the founder to
       // resolve the findings and resume it, not one that crashed.
       const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === targetId)!;
@@ -491,7 +570,7 @@ console.error('gh boom: no PR may be opened for an unresolved review');process.e
     let jobId: string;
     try {
       jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
-      expect((await getJob(tdb.db, jobId))?.status).toBe("parked");
+      await expectJobStatus(tdb.db, jobId, "parked");
 
       // The orphan was converted to a draft — `--undo` is what makes a PR non-mergeable again.
       const calls = readFileSync(ghLog, "utf8")
@@ -541,7 +620,7 @@ console.error('gh boom: no PR may be opened for an unresolved review');process.e
     let jobId: string;
     try {
       jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
-      expect((await getJob(tdb.db, jobId))?.status).toBe("parked");
+      await expectJobStatus(tdb.db, jobId, "parked");
 
       const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === targetId)!;
       expect(run.error).toContain("could NOT check whether an earlier attempt left a PR open");
@@ -602,7 +681,7 @@ console.error('gh boom: no PR may be opened for a review that never finished');p
       jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
       // A quota failure reschedules the job rather than parking it for a human — the run row is what
       // reports the orphan.
-      expect((await getJob(tdb.db, jobId))?.status).toBe("queued");
+      await expectJobStatus(tdb.db, jobId, "queued");
 
       const calls = readFileSync(ghLog, "utf8")
         .trim()
@@ -668,7 +747,7 @@ console.error('gh boom: no PR may be opened under a lapsed lease');process.exit(
     try {
       jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
       // A lease conflict reschedules the job (and refunds the attempt) rather than parking it.
-      expect((await getJob(tdb.db, jobId))?.status).toBe("queued");
+      await expectJobStatus(tdb.db, jobId, "queued");
       // The lease died before the fix could be dispatched — nothing was written under it.
       expect(dispatches()).toEqual(["implement", "review"]);
 
@@ -717,7 +796,7 @@ console.error('gh boom: no PR may be opened under a lapsed lease');process.exit(
     let jobId: string;
     try {
       jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
-      expect((await getJob(tdb.db, jobId))?.status).toBe("parked");
+      await expectJobStatus(tdb.db, jobId, "parked");
 
       const notes = (await beads.show(repo, targetId)).notes ?? "";
       expect(notes).toContain("AC-2 is not implemented");
@@ -748,7 +827,7 @@ console.error('gh boom: no PR may be opened on an unreported review');process.ex
     try {
       jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
 
-      expect((await getJob(tdb.db, jobId))?.status).toBe("parked");
+      await expectJobStatus(tdb.db, jobId, "parked");
       const target = await beads.show(repo, targetId);
       expect(beads.getPrRef(target) ?? null).toBeNull();
       expect(target.notes ?? "").toMatch(/never reported a valid score/i);
@@ -784,7 +863,7 @@ console.error('gh boom: no PR may be opened on an unreadable review report');pro
     try {
       jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
 
-      expect((await getJob(tdb.db, jobId))?.status).toBe("parked");
+      await expectJobStatus(tdb.db, jobId, "parked");
       // No fix round: an unreadable verdict is never dispatched for repair.
       expect(dispatches()).toEqual(["implement", "review"]);
 
@@ -823,7 +902,7 @@ console.error('gh boom: no PR may be opened on an unjustified score');process.ex
     try {
       jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
 
-      expect((await getJob(tdb.db, jobId))?.status).toBe("parked");
+      await expectJobStatus(tdb.db, jobId, "parked");
       expect(dispatches()).toEqual(["implement", "review"]);
 
       const target = await beads.show(repo, targetId);
@@ -862,7 +941,7 @@ console.error('gh boom: no PR may be opened on a retracted review');process.exit
     try {
       jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
 
-      expect((await getJob(tdb.db, jobId))?.status).toBe("parked");
+      await expectJobStatus(tdb.db, jobId, "parked");
       expect(dispatches()).toEqual(["implement", "review"]);
 
       const target = await beads.show(repo, targetId);
@@ -903,7 +982,7 @@ console.error('gh boom: no PR may be opened on a review that edited the code');p
     try {
       jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
 
-      expect((await getJob(tdb.db, jobId))?.status).toBe("parked");
+      await expectJobStatus(tdb.db, jobId, "parked");
       // One review, no fix round: an untrusted review is never dispatched for repair.
       expect(dispatches()).toEqual(["implement", "review"]);
 
@@ -950,7 +1029,7 @@ console.error('gh boom: no PR may be opened when the gate never reviewed');proce
     try {
       jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
 
-      expect((await getJob(tdb.db, jobId))?.status).toBe("parked");
+      await expectJobStatus(tdb.db, jobId, "parked");
       // No reviewer ever ran — that is the poison.
       expect(dispatches()).toEqual(["implement"]);
 
@@ -978,7 +1057,7 @@ console.error('gh boom: no PR may be opened when the gate never reviewed');proce
     let jobId2: string;
     try {
       jobId1 = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
-      expect((await getJob(tdb.db, jobId1))?.status).toBe("done");
+      await expectJobStatus(tdb.db, jobId1, "done");
       expect(dispatches()).toEqual(["implement", "review"]);
       const scoresAfterFirst = scoreComments(targetId);
       expect(scoresAfterFirst).toHaveLength(1);
@@ -996,7 +1075,7 @@ process.exit(0);`,
       process.env.ANTON_GH_BIN = openGh;
       try {
         jobId2 = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
-        expect((await getJob(tdb.db, jobId2))?.status).toBe("done");
+        await expectJobStatus(tdb.db, jobId2, "done");
         // No further dispatch of any kind, and no second score series on the bead.
         expect(dispatches()).toEqual(["implement", "review"]);
         expect(scoreComments(targetId)).toEqual(scoresAfterFirst);
