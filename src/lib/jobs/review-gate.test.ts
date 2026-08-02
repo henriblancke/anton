@@ -26,11 +26,11 @@ import { UsageLimitError, isPoisonError } from "./errors";
 import type { Clock } from "./queue";
 import {
   blockingFindings,
-  ReviewGatePoisonError,
   runReviewGate,
   REVIEW_SETTING_SOURCES,
   type ReviewGateContext,
   type ReviewGateResult,
+  type ReviewRound,
 } from "./review-gate";
 
 /** A one-commit `main` repo: the least a gate round needs to read its (absent) rules from. */
@@ -224,11 +224,15 @@ function gate(
   restores: string[];
   /** The worktree's dirt as each round's diff was read — the review must see a settled tree. */
   diffStates: string[];
+  /** The caller's accumulator: what the gate completed, readable even when `result` rejects. */
+  rounds: ReviewRound[];
 } {
   const { run, calls } = fakeClaude(replies);
   const commitMessages: string[] = [];
   const diffStates: string[] = [];
+  const rounds: ReviewRound[] = [];
   const result = runReviewGate({
+    rounds,
     db: tdb.db,
     clock,
     ctx,
@@ -258,7 +262,7 @@ function gate(
       restoreState: worktree.restoreState,
     },
   });
-  return { result, calls, commitMessages, restores: worktree.restores, diffStates };
+  return { result, calls, commitMessages, restores: worktree.restores, diffStates, rounds };
 }
 
 /** The recorded sessions in start order — the UI's view of the gate. */
@@ -909,7 +913,7 @@ describe("runReviewGate — a failed fix leaves nothing behind", () => {
     // The one failure that must NOT roll back: those commits are the human's to move, and reverting
     // them would bury the work the park reason is asking them to rescue.
     const worktree = fakeWorktree([], "", [2], [2]);
-    const { result, restores } = gate(
+    const { result, restores, rounds } = gate(
       [report(4, [BLOCKING]), "fixed it on a branch of my own"],
       { reviewMaxRounds: 2 },
       [],
@@ -924,12 +928,24 @@ describe("runReviewGate — a failed fix leaves nothing behind", () => {
     expect((error as Error).message).toMatch(/on a branch of its own/);
     expect(restores).toEqual([]);
     expect(await worktree.readState()).toMatchObject({ head: "r0gue2", ref: "refs/heads/review-work-2" });
-    // A poison exit returns no result, so the rounds it DID finish ride out on the error — the
-    // call-site persists them, and the park the founder opens still shows its score history.
-    expect(error).toBeInstanceOf(ReviewGatePoisonError);
-    expect((error as ReviewGatePoisonError).rounds).toMatchObject([
-      { round: 1, score: 4, blocking: 1, advisory: 0 },
-    ]);
+    // A poison exit returns no result, so the rounds it DID finish are left in the caller's
+    // accumulator — the call-site persists them, and the park the founder opens still shows its
+    // score history.
+    expect(rounds).toMatchObject([{ round: 1, score: 4, blocking: 1, advisory: 0 }]);
+  });
+
+  it("hands back the completed rounds of a RETRYABLE death, with the error's own type intact", async () => {
+    // A usage limit reschedules the run and the resumed gate restarts at round 1, so a round that
+    // reviewed and scored before the quota ran out exists nowhere else. Wrapping the error to carry
+    // it out would have cost the runner the backoff it keys off the type, so the rounds come back on
+    // the accumulator instead.
+    const { result, rounds } = gate(
+      [report(4, [BLOCKING]), new UsageLimitError("out of quota")],
+      { reviewMaxRounds: 2 },
+    );
+
+    await expect(result).rejects.toBeInstanceOf(UsageLimitError);
+    expect(rounds).toMatchObject([{ round: 1, score: 4, blocking: 1, advisory: 0 }]);
   });
 
   it("leaves a fix that PASSED its gates alone — the round's own commit is not rolled back", async () => {

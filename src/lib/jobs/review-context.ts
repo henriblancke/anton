@@ -340,6 +340,13 @@ const MAX_IMPORT_DEPTH = 5;
  * override — an intermediate scope's went missing. The cost is a shared file inlined once per scope
  * that claims it, which is what having two scopes claim it means.
  *
+ * That holds when the import targets a DISCOVERED root too. Only the roots at the importer's OWN
+ * scope are excluded, where re-reading one would restate, verbatim, text already inlined at exactly
+ * that scope (this repo's root `CLAUDE.md` is one `@AGENTS.md` line beside the root `AGENTS.md`).
+ * Excluding every root instead silently dropped the re-import: a `src/app/CLAUDE.md` that imports the
+ * repo-root `AGENTS.md` is claiming those rules at `src/app`, and without them there an intervening
+ * `src/AGENTS.md` overrides rules the deeper scope had re-asserted.
+ *
  * Imports follow their importer so the reviewer reads them in the order the rules were written.
  */
 async function expandImports(
@@ -347,13 +354,19 @@ async function expandImports(
   baseRev: string,
   roots: InstructionFile[],
 ): Promise<InstructionFile[]> {
-  const rootPaths = new Set(roots.map((f) => f.path));
+  const rootsByScope = new Map<string, Set<string>>();
+  for (const file of roots) {
+    const scope = scopeOf(file.path);
+    const at = rootsByScope.get(scope);
+    if (at) at.add(file.path);
+    else rootsByScope.set(scope, new Set([file.path]));
+  }
   const expanded: InstructionFile[] = [];
 
   for (const root of roots) {
-    // Roots stay excluded everywhere: each is already inlined at its own discovered scope, so an
-    // import pointing at one would restate it under a scope it does not have.
-    const seen = new Set(rootPaths);
+    // Per expansion, so a cycle is read once, and seeded with the roots at this scope — the only
+    // ones an import could restate under a scope they already hold (see above).
+    const seen = new Set(rootsByScope.get(scopeOf(root.path)) ?? [root.path]);
     expanded.push(root);
     let frontier: InstructionFile[] = [root];
     for (let depth = 0; depth < MAX_IMPORT_DEPTH && frontier.length > 0; depth++) {
@@ -376,6 +389,12 @@ async function expandImports(
     }
   }
   return expanded;
+}
+
+/** The directory an instruction file's rules bind — `""` for the ones at the repo root. */
+function scopeOf(path: string): string {
+  const cut = path.lastIndexOf("/");
+  return cut === -1 ? "" : path.slice(0, cut);
 }
 
 /** The repo-relative paths one instruction file imports, in the order it states them. */

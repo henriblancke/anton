@@ -625,6 +625,78 @@ console.error('gh boom: no PR may be opened for a review that never finished');p
     }
   });
 
+  it("defuses the orphan — and keeps the finished round — when the run's own LEASE lapses mid-gate", async () => {
+    // A lease this run couldn't KEEP (its refresh writes to the shared board are failing) is not
+    // evidence that another machine owns the branch: nothing read a foreign lease. Treating it as
+    // such skipped the reconcile and left the previous attempt's untracked PR ready and mergeable,
+    // with the round the gate had already scored lost to the reschedule on top of it.
+    await setReviewEnabled(true);
+    script({
+      score: 6,
+      rationale: "one guard missing",
+      findings: [{ severity: "blocking", location: "src/z.ts:1", note: "guard the null case" }],
+    });
+    const targetId = await approvedTarget("Lapsed lease run");
+
+    // Lapses the run-lease the moment the REVIEW has been dispatched — the gate re-checks it before
+    // dispatching the fix, which is the window a review → fix → re-review sequence spends past the
+    // TTL. A full TTL (15 min) plus a minute, so the check reads the lease as expired.
+    const reviewed = () => readFileSync(invocationsPath, "utf8").includes("review");
+    class LapsingClock extends FakeClock {
+      now() {
+        return super.now() + (reviewed() ? 16 * 60_000 : 0);
+      }
+    }
+
+    const ghLog = join(sandbox, "gh-lapsed-lease-calls.jsonl");
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = writeBin(
+      binDir,
+      "gh-lapsed-lease",
+      `const fs=require('fs');const a=process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(ghLog)},JSON.stringify(a)+'\\n');
+if(a[0]==='pr'&&a[1]==='list'){
+  process.stdout.write(JSON.stringify([{url:'https://github.com/acme/repo/pull/58',number:58,isDraft:false}])+'\\n');
+  process.exit(0);
+}
+if(a[0]==='pr'&&a[1]==='ready'){process.exit(0);}
+console.error('gh boom: no PR may be opened under a lapsed lease');process.exit(1);`,
+    );
+
+    const runner = makeEpicRunner({ tdb, clock: new LapsingClock(clock.now()) });
+    let jobId: string;
+    try {
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
+      // A lease conflict reschedules the job (and refunds the attempt) rather than parking it.
+      expect((await getJob(tdb.db, jobId))?.status).toBe("queued");
+      // The lease died before the fix could be dispatched — nothing was written under it.
+      expect(dispatches()).toEqual(["implement", "review"]);
+
+      const calls = readFileSync(ghLog, "utf8")
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((l) => JSON.parse(l) as string[]);
+      expect(calls).toContainEqual(["pr", "ready", "58", "--undo"]);
+
+      const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === targetId)!;
+      expect(run.status).toBe("parked");
+      // The lease classification still drives the runner's recovery — the orphan rides along.
+      expect(run.error).toMatch(/^run-live-elsewhere/);
+      expect(run.error).toContain("https://github.com/acme/repo/pull/58");
+      expect(run.error).toMatch(/converted to a DRAFT/);
+
+      // And the round the gate DID finish is on the board: the run is rescheduled and its resumed
+      // gate restarts at round 1, so a score never written here is lost with the attempt.
+      expect(scoreComments(targetId)).toMatchObject([
+        { round: 1, score: 6, blocking: 1, advisory: 0, verdict: "interrupted" },
+      ]);
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+      if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  });
+
   it("records the review's ADVISORIES on the bead when it parks on a blocking finding", async () => {
     // A parked run opens no PR, and the PR body is where advisories normally reach the founder. The
     // resumed run re-reviews from scratch with an empty carry, so an advisory nobody wrote down here

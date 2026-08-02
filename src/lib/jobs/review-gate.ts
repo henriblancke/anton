@@ -26,7 +26,7 @@ import {
 } from "../git/ops";
 import { resolveReviewConfig, resolveVerifyGates, type ProjectSettings } from "../projects";
 import { appendSessionLog, endSession, startJobSession } from "../sessions";
-import { isPoisonError, PoisonError } from "./errors";
+import { PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
 import {
   buildFindingsFixPrompt,
@@ -137,6 +137,18 @@ export interface ReviewGateArgs {
    * minutes after the shared label expired and another machine started the same epic.
    */
   assertLeaseHeld?: () => void;
+  /**
+   * Where the gate records each COMPLETED round as it runs — the caller's only view of them when the
+   * gate THROWS.
+   *
+   * A gate that dies mid-flight returns no result, and its error has to reach the runner as the type
+   * it was thrown as: the quota backoff, the retry, and the poison park are all keyed off that, so
+   * wrapping the error to carry the rounds out would trade the run's recovery for its history. Both
+   * matter — a round-3 death still owes the founder rounds 1 and 2, and a rescheduled run's resumed
+   * gate restarts at round 1 with nothing of the previous attempt on the board — so the rounds ride
+   * on an accumulator the caller owns instead of on the error.
+   */
+  rounds?: ReviewRound[];
   deps?: ReviewGateDeps;
 }
 
@@ -203,23 +215,6 @@ export function finalViolation(result: ReviewGateResult): ReviewProtocolViolatio
 }
 
 /**
- * A poison exit that still carries the rounds the gate COMPLETED before it died.
- *
- * The gate returns no result when it throws, so the rounds it already reviewed and scored would be
- * lost with the stack — even though a poison park is exactly when a founder opens the bead to work
- * out what the run was doing when its worktree got stuck. The rounds ride on the error instead.
- */
-export class ReviewGatePoisonError extends PoisonError {
-  readonly rounds: ReviewRound[];
-
-  constructor(message: string, rounds: ReviewRound[], options?: ErrorOptions) {
-    super(message);
-    if (options && "cause" in options) this.cause = options.cause;
-    this.rounds = rounds;
-  }
-}
-
-/**
  * Review → fix → re-review until the reviewer reports nothing blocking or the round cap is reached.
  *
  * A fix is only dispatched while a further round remains: a fix nobody re-reviews has no evidence it
@@ -227,25 +222,14 @@ export class ReviewGatePoisonError extends PoisonError {
  * intended shape — one review, one fix, one confirming review.
  *
  * Propagates whatever claude throws (notably UsageLimitError, which parks/reschedules the run like
- * any other exhausted-quota failure) after marking the in-flight session failed.
+ * any other exhausted-quota failure) after marking the in-flight session failed — unwrapped, so the
+ * runner still classifies it. The rounds that completed before such a death are handed back on
+ * {@link ReviewGateArgs.rounds}, which is why nothing needs wrapping.
  */
 export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateResult> {
-  // The accumulator lives OUT here so a poison exit — which returns nothing — can still hand the
-  // call-site the rounds that completed before the gate died (see {@link ReviewGatePoisonError}).
-  const rounds: ReviewRound[] = [];
-  try {
-    return await convergeRounds(args, rounds);
-  } catch (e) {
-    if (rounds.length === 0 || !isPoisonError(e) || e instanceof ReviewGatePoisonError) throw e;
-    throw new ReviewGatePoisonError(e.message, [...rounds], { cause: e });
-  }
-}
-
-/**
- * The converge loop itself. `rounds` is passed IN and appended to rather than built here, so the
- * wrapper above still holds what completed when this throws — the whole point of the split.
- */
-async function convergeRounds(args: ReviewGateArgs, rounds: ReviewRound[]): Promise<ReviewGateResult> {
+  // Appended to as each round finishes rather than built at the end, so the caller's accumulator
+  // holds what completed even when this throws.
+  const rounds: ReviewRound[] = args.rounds ?? [];
   const { db, clock, ctx, projectId, runId, target, tickets, settings, worktreePath, baseBranch } = args;
   const config = resolveReviewConfig(settings);
   const claude = args.deps?.runClaude ?? runClaude;

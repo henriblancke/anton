@@ -18,11 +18,12 @@ import type { ReviewGateOutcome, ReviewGateResult, ReviewRound } from "./review-
  * round reported blocking findings, dispatched a fix for them, and was re-reviewed, which is exactly
  * what `fixed` records.
  *
- * `poisoned` is the one verdict no gate OUTCOME produces: the gate died mid-round (an unrevertable
- * reviewer commit, a fixer that switched branches) and never returned a result at all, so the round
- * it was in settled nothing.
+ * `interrupted` is the one verdict no gate OUTCOME produces: the gate died mid-round — a poison
+ * worktree (an unrevertable reviewer commit, a fixer that switched branches), an exhausted quota, a
+ * claude failure — and never returned a result at all, so the round it was in settled nothing. Named
+ * for what the founder can tell from the comment alone: which of those it was is on the run row.
  */
-export type ReviewRoundVerdict = ReviewGateOutcome | "fixed" | "poisoned";
+export type ReviewRoundVerdict = ReviewGateOutcome | "fixed" | "interrupted";
 
 /** The machine-readable payload of one round's comment — the shape the score UI reads back. */
 export interface ReviewScoreEntry {
@@ -44,14 +45,16 @@ export function reviewScoreEntries(result: ReviewGateResult): ReviewScoreEntry[]
 }
 
 /**
- * The rounds a gate COMPLETED before it went poison mid-flight, ready to persist.
+ * The rounds a gate COMPLETED before it died mid-flight, ready to persist.
  *
- * A poison exit returns no result, so without this the whole series is lost — including the earlier
+ * A throwing exit returns no result, so without this the whole series is lost — including the earlier
  * rounds that reviewed, scored, and dispatched a fix perfectly well. Those rounds are exactly the
- * context the founder needs when they open the parked run to reset a stuck worktree by hand.
+ * context the founder needs when they open the parked run to reset a stuck worktree by hand, and on
+ * a retryable death (a usage limit) they are the only trace of the attempt at all: the run is
+ * rescheduled and the resumed gate starts again at round 1.
  */
 export function partialReviewScoreEntries(rounds: ReviewRound[]): ReviewScoreEntry[] {
-  return toEntries(rounds, "poisoned");
+  return toEntries(rounds, "interrupted");
 }
 
 function toEntries(rounds: ReviewRound[], final: ReviewRoundVerdict): ReviewScoreEntry[] {
@@ -101,8 +104,8 @@ export async function persistReviewScores(
 }
 
 /**
- * Persist the rounds of a gate that THREW poison, so a mid-flight death still leaves its history on
- * the board rather than only in the run log.
+ * Persist the rounds of a gate that THREW — poison or retryable — so a mid-flight death still leaves
+ * its history on the board rather than only in the run log.
  */
 export async function persistPartialReviewScores(
   repo: string,

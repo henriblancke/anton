@@ -53,9 +53,9 @@ import type { ReviewFinding } from "./review-context";
 import {
   blockingFindings,
   finalViolation,
-  ReviewGatePoisonError,
   runReviewGate,
   type ReviewGateResult,
+  type ReviewRound,
 } from "./review-gate";
 import { persistPartialReviewScores, persistReviewScores } from "./review-score";
 import {
@@ -479,6 +479,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         throw new RunAlreadyLiveError(
           `${epicBeadId} is already running on another machine (unexpired run-lease) — parking; ` +
             `this attempt resumes once that run settles and clears its lease`,
+          "foreign",
         );
       }
       // No foreign live lease: adopt any leftover leases on the freshly-read target (this run's own
@@ -630,12 +631,14 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
             `${epicBeadId} found a live run-lease from another machine after a stale pre-check — parking ` +
               `rather than stealing by owner order (that run started earlier and won't yield); this ` +
               `attempt resumes once it settles and clears its lease`,
+            "foreign",
           );
         }
         if (!beads.winsRunLeaseRace(acquired, clock.now(), runId)) {
           throw new RunAlreadyLiveError(
             `${epicBeadId} lost the run-lease race to a concurrent run on another machine — parking; ` +
               `this attempt resumes once that run settles and clears its lease`,
+            "foreign",
           );
         }
       };
@@ -695,10 +698,14 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // — the exposure to roughly one ticket's worth of work.
       const assertLeaseHeld = () => {
         if (clock.now() >= leaseExpiry) {
+          // `unproven`, not `foreign`: this is OUR lease lapsing, and nothing here read another
+          // machine's. Callers that would hand the branch over to a foreign owner (the review gate's
+          // orphan-PR reconcile) must not do so on this.
           throw new RunAlreadyLiveError(
             `${epicBeadId} run-lease expired mid-run (refresh writes to the shared board have been ` +
               `failing) — parking so another machine doesn't treat the epic as free and double-run ` +
               `it; this attempt resumes once the board is reachable`,
+            "unproven",
           );
         }
       };
@@ -934,6 +941,9 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         // Handed IN as well as checked here: the gate's review → fix → re-review sequence can run
         // well past the lease TTL, so it re-asserts at every dispatch rather than only at the edges.
         assertLeaseHeld();
+        // Filled by the gate as each round completes, so a gate that THROWS — returning nothing —
+        // still leaves this attempt's score history to persist below.
+        const gateRounds: ReviewRound[] = [];
         const review = await runReviewGate({
           db,
           clock,
@@ -946,17 +956,27 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           worktreePath: worktree.path,
           baseBranch: freshBase,
           assertLeaseHeld,
+          rounds: gateRounds,
         }).catch(async (e) => {
+          // A throwing gate never reaches persistReviewScores below, so the rounds it DID finish are
+          // written here or lost with the attempt — for a poison park (a round-3 death still owes the
+          // founder rounds 1 and 2) and equally for a retryable one, where the run is rescheduled and
+          // the resumed gate restarts from round 1 with nothing of this attempt on the board.
+          await persistPartialReviewScores(repo, epicBeadId, gateRounds);
           // EVERY gate failure leaves the run without a PR of its own, so every one of them carries
           // the orphan hazard: a PR a previous attempt opened but never recorded (lost `gh` response
           // or lost setPrRef) stays READY and mergeable with un-reviewed work whether the gate
           // refused the verdict, died on a usage limit, or exhausted its retries. Reconcile before
-          // propagating any of them. The one exception is a lease lost to another machine — that run
-          // owns the branch and may have opened this very PR after passing its OWN gate, so drafting
-          // it would strand reviewed work with nobody left to ready it again.
-          const orphan = isRunAlreadyLiveError(e)
-            ? undefined
-            : await reconcileOrphanPullRequest(repo, worktree.branch);
+          // propagating any of them. The one exception is a lease CONFIRMED lost to another machine —
+          // that run owns the branch and may have opened this very PR after passing its OWN gate, so
+          // drafting it would strand reviewed work with nobody left to ready it again. A lease this
+          // run merely couldn't KEEP is not that evidence, and is in fact the only kind reachable
+          // here: `assertLeaseHeld` — local expiry, `unproven` — is the gate's sole source of
+          // RunAlreadyLiveError, and skipping the reconcile on it left the orphan mergeable.
+          const orphan =
+            isRunAlreadyLiveError(e) && e.conflict === "foreign"
+              ? undefined
+              : await reconcileOrphanPullRequest(repo, worktree.branch);
           // Errors anton doesn't compose a park message for are rethrown untouched — the runner keys
           // its backoff (quota reschedule, retry) off the error's TYPE, and wrapping them would lose
           // that. What the reconcile found rides out on the run row instead (see the catch below).
@@ -970,11 +990,6 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           // so they are re-thrown as a gate block. Left as-is they marked the run `failed`, which
           // hides the row from findOpenRunForEpic, and the resume the human was told to do would
           // start a REPLACEMENT run instead of continuing this one and its session history.
-          // A poison exit never reaches persistReviewScores below, so the rounds the gate DID finish
-          // are written here or lost: a round-3 death still owes the founder rounds 1 and 2.
-          if (e instanceof ReviewGatePoisonError) {
-            await persistPartialReviewScores(repo, epicBeadId, e.rounds);
-          }
           throw new ReviewBlockedError(`${e.message}${orphanClause(orphan)}`, { cause: e });
         });
         // The score history belongs to the board, not this run's logs — written on both exits the gate
@@ -1067,7 +1082,13 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       if (isUsageLimitError(e)) {
         await updateRun(db, clock, runId, { status: "parked", error: `usage-limit${orphanNotice}` });
       } else if (isRunAlreadyLiveError(e)) {
-        await updateRun(db, clock, runId, { status: "parked", error: "run-live-elsewhere" });
+        // The notice rides along here too: a lease that merely lapsed still reconciles the branch's
+        // orphan PR, and what that found (a PR drafted, or a `gh` lookup that failed) has nowhere
+        // else to be reported — this run opens no PR and composes no park message.
+        await updateRun(db, clock, runId, {
+          status: "parked",
+          error: `run-live-elsewhere${orphanNotice}`,
+        });
       } else if (e instanceof ReviewBlockedError) {
         // Parked, not failed, and with no endedAt: the run is waiting on a human to resolve what the
         // gate refused on and resume it — the run history must not read like a crash. Resuming reuses

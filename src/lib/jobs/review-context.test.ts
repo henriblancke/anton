@@ -597,6 +597,50 @@ describe("buildReviewPrompt", () => {
     );
   });
 
+  it("re-inlines a governing file that a DEEPER scope imports, at that deeper scope", async () => {
+    // A nested file importing a discovered root is re-asserting those rules at its own scope, where
+    // they outrank the scope in between. Excluding every root from every expansion suppressed that,
+    // so `src/AGENTS.md`'s conflicting rule read as the last word on `src/app` — while the root copy
+    // (which `src/app/CLAUDE.md` had just re-imported) sat above it, outranked.
+    commitFile("AGENTS.md", "- The rule the deep scope re-imports.\n");
+    commitFile("src/AGENTS.md", "- The rule in between.\n");
+    commitFile("src/app/CLAUDE.md", "@../../AGENTS.md\n");
+
+    const { prompt } = await buildReviewPrompt({
+      target: epic,
+      tickets: [ticket],
+      diff: { files: ["src/app/page.tsx"], patch: "+ const Page = () => null;\n", truncated: false },
+      settings: settings({ reviewPrompt: "OPERATOR CONTRACT." }),
+      projectDir,
+      baseRev: BASE,
+    });
+
+    expect(prompt).toContain("### `AGENTS.md` — imported by `src/app/CLAUDE.md`");
+    expect(prompt.indexOf("### `src/AGENTS.md`")).toBeLessThan(
+      prompt.indexOf("### `AGENTS.md` — imported by `src/app/CLAUDE.md`"),
+    );
+  });
+
+  it("does not restate a governing file that a file at its OWN scope imports", async () => {
+    // The other side of the rule above: this repo's own root `CLAUDE.md` is one `@AGENTS.md` line
+    // beside the root `AGENTS.md`. Expanding that import would inline the same text twice at the same
+    // scope, spending the rules budget to tell the reviewer nothing new.
+    commitFile("CLAUDE.md", "@AGENTS.md\n");
+    commitFile("AGENTS.md", "- The rule stated once.\n");
+
+    const { prompt } = await buildReviewPrompt({
+      target: epic,
+      tickets: [ticket],
+      diff: { files: ["src/app/page.tsx"], patch: "+ const Page = () => null;\n", truncated: false },
+      settings: settings({ reviewPrompt: "OPERATOR CONTRACT." }),
+      projectDir,
+      baseRev: BASE,
+    });
+
+    expect(prompt.match(/### `AGENTS\.md`/g)).toHaveLength(1);
+    expect(prompt).not.toContain("imported by `CLAUDE.md`");
+  });
+
   it("does not read an `@` inside a code sample as an import", async () => {
     commitFile("CLAUDE.md", "Install with `npm i @scope/pkg`:\n\n```sh\nnpm i @docs/rules.md\n```\n");
     commitFile("docs/rules.md", "- A file the snippet only NAMES.\n");
