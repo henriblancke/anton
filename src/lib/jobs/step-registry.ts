@@ -31,7 +31,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { beads, type Bead } from "../beads/bd";
+import { beads, type Bead, type CookedStep } from "../beads/bd";
 import { acceptanceBody } from "../beads/contract";
 import { humanNotesPromptBlock } from "../beads/notes";
 import { loadAgentPrompt, stripFrontmatter } from "../claude/agent-prompt";
@@ -74,19 +74,13 @@ export const STEP_LABEL_PREFIX = "step";
 export type StepClass = "required" | "default-on" | "additive";
 
 /**
- * A step as the cooked formula carries it — the minimum the registry reads. The loader (anton-hrql)
- * produces these from `.beads/formulas/anton-run.formula.toml`; `labels` is where the step names its
- * handler (`step:<name>`) and, for `step:claude`, its prompt (`prompt:<id>` / `skill:<id>`).
- *
- * Labels, not a custom TOML key, because `bd cook` silently DROPS non-standard step keys — a step's
- * configuration has to ride somewhere that survives the cook.
+ * A step as the cooked formula carries it, re-exported from the bd seam (anton-brdg) so the registry
+ * and the loader (anton-hrql) read ONE definition of a step rather than two that can drift. `labels`
+ * is where the step names its handler (`step:<name>`) and, for `step:claude`, its prompt
+ * (`prompt:<id>` / `skill:<id>`) — labels, not a custom TOML key, because `bd cook` silently DROPS
+ * non-standard step keys, so a step's configuration has to ride somewhere that survives the cook.
  */
-export interface CookedStep {
-  /** The step's id in the formula (`[[steps]] id = "implement"`). Named in every park message. */
-  id: string;
-  labels?: string[];
-  title?: string;
-}
+export type { CookedStep };
 
 /** What a step produced, for the caller's bookkeeping and for the steps that follow it. */
 export interface StepFacts {
