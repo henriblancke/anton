@@ -254,6 +254,12 @@ export async function verifyStep(ctx: StepContext): Promise<StepResult> {
 
   const subject = stepSubject(ctx).id;
   const { session, owned } = await stepSession(ctx, subject);
+  // The live handle has to name the session the gates are actually writing into. A run-phase verify
+  // (a formula that moved `step:verify` after the commit) opens its OWN session, so without this
+  // observe/investigate would attach to the last ticket's already-ended one for the whole of a
+  // potentially long run-wide gate. Reported unconditionally, like every dispatching step: when the
+  // caller handed its session in, this re-reports the one already on the handle.
+  ctx.ctx.report({ sessionId: session.sessionId, cwd: ctx.worktreePath });
   try {
     await runVerifyGates(
       gates,

@@ -26,6 +26,8 @@
  * 7. **A `{{var}}` in a step's labels** — {@link assertNoLabelPlaceholders}: bd substitutes variables
  *    into a step's `title`/`description`/`notes` but NOT into its `labels`, in either cook mode, and
  *    labels are where every piece of anton's per-step configuration rides.
+ * 8. **A step `condition`** — {@link assertNoStepConditions}: anton's walker has no condition
+ *    evaluation, so a step the project DISABLED would run anyway.
  *
  * What it deliberately does NOT do: check the cooked pipeline against anton's invariant floor (which
  * steps may be omitted or reordered) — that is anton-6b99's, and it consumes what this returns.
@@ -61,6 +63,12 @@ export interface ResolvedStep {
 
 /** A pipeline that parsed, cooked, and resolved — what the walker (anton-lnkt) executes. */
 export interface RunFormula extends FormulaChoice {
+  /**
+   * What the run RECORDS, and what a later attempt pins by — {@link recordedFormulaSource}. Equal to
+   * `source` for a project-local pipeline; {@link BUNDLED_FORMULA_SOURCE} for anton's own asset,
+   * whose absolute path belongs to the install rather than the project.
+   */
+  recorded: string;
   /** The cooked pipeline, its `steps` already in {@link orderFormulaSteps execution order}. */
   cooked: CookedFormula;
   /** Every step in execution order, each with its resolved handler. */
@@ -175,6 +183,30 @@ export function bundledRunFormulaPath(): string {
 }
 
 /**
+ * What a run records when it walks anton's BUNDLED default, in place of that file's absolute path.
+ *
+ * The bundled path is anchored to the server's install root, so recording it would make a run's pin
+ * ({@link RunFormulaOptions.pinned}) survive only as long as the install lives at the same place: an
+ * upgrade that moves the install root would leave every in-flight run pinned to a path that no longer
+ * exists, parked with "restore the file" for a file that was never missing — only moved — and with no
+ * way back other than abandoning the run. A project-local path has no such problem (the repo path is
+ * constant per project), so it is recorded verbatim.
+ *
+ * The `bundled:` shape cannot collide with a real source: a recorded path is always absolute.
+ */
+export const BUNDLED_FORMULA_SOURCE = "bundled:anton-run";
+
+/** The file a recorded source names — the sentinel resolving to THIS install's bundled asset. */
+export function runFormulaPathOf(source: string): string {
+  return source === BUNDLED_FORMULA_SOURCE ? bundledRunFormulaPath() : source;
+}
+
+/** The durable identity of a loaded pipeline — see {@link BUNDLED_FORMULA_SOURCE}. */
+export function recordedFormulaSource(path: string): string {
+  return path === bundledRunFormulaPath() ? BUNDLED_FORMULA_SOURCE : path;
+}
+
+/**
  * The project's pipeline when it has one, else anton's bundled default. Project-local always wins.
  * A `.json` sibling parks — see {@link assertNoJsonFormulaAt}.
  */
@@ -194,9 +226,9 @@ export function resolveRunFormulaPath(repoPath: string): string {
  * `formula`, not `name`: a formula keyed `name` PARSES and then fails cook with "name is required"
  * (anton-upfc) — so `name` is an unknown key here, and reporting it that way is the more useful error.
  *
- * `extends` stays on the list because bd DOES honor it; anton rejects it separately
- * ({@link assertNoExtends}), so the operator reads why anton won't walk it rather than a wrong claim
- * that bd would drop it.
+ * `extends` and `condition` stay on the list because bd DOES honor them; anton rejects each
+ * separately ({@link assertNoExtends}, {@link assertNoStepConditions}), so the operator reads why
+ * anton won't walk it rather than a wrong claim that bd would drop it.
  */
 const KNOWN_KEYS = {
   top: ["formula", "description", "version", "schema_version", "type", "vars", "steps", "extends"],
@@ -288,7 +320,35 @@ export function parseRunFormulaSource(raw: string, source: string): Record<strin
         `nothing, commit nothing, and open no PR`,
     );
   }
+  assertNoStepConditions(doc.steps, source);
   return doc;
+}
+
+/**
+ * A step `condition` PARKS the run. It is a key bd supports and cooks through faithfully — so the
+ * dropped-key check above rightly passes it — but anton evaluates nothing: the cooked-step seam
+ * (`parseCookedFormula`) does not carry the field, and the walker dispatches every step it was
+ * handed. A step the project explicitly DISABLED would therefore run: a conditional verification or
+ * `step:claude` executes unconditionally, which is the exact opposite of what the file asks for.
+ * Checked on the parsed document rather than the cooked pipeline precisely because the cook is where
+ * the field disappears.
+ */
+function assertNoStepConditions(steps: readonly unknown[], source: string): void {
+  const offending = steps.flatMap((step, i) => {
+    if (!isRecord(step) || step.condition === undefined) return [];
+    // Same addressing as the key report: the id an operator can find in the file, else the index.
+    const id = typeof step.id === "string" && step.id ? step.id : String(i);
+    return [`"${id}" (\`condition = ${JSON.stringify(step.condition)}\`)`];
+  });
+  if (offending.length === 0) return;
+  throw new PoisonEpic(
+    `run formula ${source} makes step(s) ${offending.join(", ")} conditional, which anton does not ` +
+      `evaluate: bd cooks \`condition\` through, but anton walks every step of the pipeline it loaded, ` +
+      `so a step the project meant to DISABLE would run anyway — the verification, review or agent ` +
+      `dispatch the condition was written to skip would execute unconditionally. anton parks rather ` +
+      `than ignoring a condition the pipeline asked for. Remove the \`condition\` (a pipeline that ` +
+      `varies by label is a formula variant — Settings → Pipeline variants), then resume the run.`,
+  );
 }
 
 /**
@@ -416,6 +476,9 @@ export interface RunFormulaOptions {
    * another, while the run record claims a single one. The choice is therefore made ONCE, by the
    * first attempt that records one, and honored until the branch's work is done; a changed mapping
    * applies to the next run. The caller supplies it — see `findRunFormulaForBranch`.
+   *
+   * Its `source` is what the prior attempt RECORDED: a project-local absolute path, or
+   * {@link BUNDLED_FORMULA_SOURCE} for anton's own asset, resolved through {@link runFormulaPathOf}.
    */
   pinned?: FormulaChoice;
   /**
@@ -454,7 +517,12 @@ export async function validateRunFormula(
   repoPath: string,
   deps: RunFormulaOptions = {},
 ): Promise<RunFormula> {
-  const { source, variant } = deps.pinned ?? selectRunFormula(repoPath, deps.labels, deps.variants);
+  const choice = deps.pinned ?? selectRunFormula(repoPath, deps.labels, deps.variants);
+  // A pin recorded as `bundled:` resolves to THIS install's asset, so a run in flight across an
+  // anton upgrade that moved the install root keeps walking the same pipeline instead of parking on
+  // a path that only changed. A recorded absolute path is its own answer.
+  const source = runFormulaPathOf(choice.source);
+  const { variant } = choice;
   const read = deps.read ?? ((p: string) => readFile(p, "utf8"));
 
   let raw: string;
@@ -496,5 +564,11 @@ export async function validateRunFormula(
   // Resolution is the whole point of validating early: an unmapped `step:` label parks HERE, before a
   // worktree exists, instead of three steps into a run that has already dispatched an agent.
   const steps = ordered.map((step) => ({ step, definition: resolveStep(step, source) }));
-  return { source, variant, cooked: { ...cooked, steps: ordered }, steps };
+  return {
+    source,
+    recorded: recordedFormulaSource(source),
+    variant,
+    cooked: { ...cooked, steps: ordered },
+    steps,
+  };
 }

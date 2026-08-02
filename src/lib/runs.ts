@@ -272,7 +272,11 @@ export async function listRunsByStatus(
 
 /** The pipeline choice a run recorded (anton-aa3m) — what a later attempt on the same branch pins to. */
 export interface RecordedFormula {
-  /** Absolute path of the formula file that run walked. */
+  /**
+   * The formula that run walked: an absolute path for a project-local pipeline, or the
+   * `bundled:` sentinel for anton's own asset (whose path belongs to the install, not the project —
+   * see `BUNDLED_FORMULA_SOURCE`).
+   */
   source: string;
   /** The bead label that selected it; absent ⇒ the project/bundled default. */
   variant?: string;

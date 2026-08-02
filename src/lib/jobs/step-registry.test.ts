@@ -289,6 +289,39 @@ describe("stepSubject — which bead a step speaks for", () => {
   });
 });
 
+describe("step:verify", () => {
+  // A formula that moves `step:verify` after the commit runs it in the RUN phase, where no session
+  // is handed in — so this handler opens its own. Without a report, the job's live handle keeps
+  // naming the last ticket's already-ended session and observe/investigate attaches to stale output
+  // for the whole of a potentially long run-wide gate.
+  it("reports the session it opened, so the live handle names the gates' own output", async () => {
+    const reported: Array<{ sessionId?: string; cwd?: string }> = [];
+    const ctx = context({ settings: { testCommand: "exit 0" } });
+    const result = await verifyStep({
+      ...ctx,
+      ctx: { ...ctx.ctx, report: (info) => reported.push(info) },
+    });
+
+    expect(result.ok).toBe(true);
+    const sessionId = result.facts?.sessionIds?.[0];
+    expect(sessionId).toBeTruthy();
+    expect(reported).toEqual([{ sessionId, cwd: ctx.worktreePath }]);
+  });
+
+  // No gates ⇒ nothing runs and no session is opened, so there is nothing to point the handle at.
+  it("reports nothing when the project pinned no gates", async () => {
+    const reported: unknown[] = [];
+    const ctx = context();
+    const result = await verifyStep({
+      ...ctx,
+      ctx: { ...ctx.ctx, report: (info) => reported.push(info) },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(reported).toEqual([]);
+  });
+});
+
 describe("step:claude", () => {
   it("dispatches the project-named prompt and records a session", async () => {
     writeProjectPrompt("design-check", "---\nname: design-check\n---\nCheck the design system.");

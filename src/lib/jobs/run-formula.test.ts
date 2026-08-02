@@ -25,6 +25,7 @@ import type { CookedFormula } from "../beads/bd";
 import { PoisonEpic } from "./errors";
 import { assertRunFormulaFloor } from "./formula-floor";
 import {
+  BUNDLED_FORMULA_SOURCE,
   bundledRunFormulaPath,
   orderFormulaSteps,
   parseRunFormulaSource,
@@ -356,6 +357,27 @@ describe("parseRunFormulaSource — the file as written", () => {
       /declares no `\[\[steps\]\]`/,
     );
   });
+
+  // `condition` is a key bd supports and cooks through — so the dropped-key check passes it — but
+  // anton's cooked-step seam doesn't carry it and the walker dispatches every step it was handed. A
+  // step the project DISABLED would run: silently the opposite of what the file asks for.
+  it("parks on a step `condition` — anton evaluates none, so a disabled step would run anyway", () => {
+    const conditional = VALID.replace(
+      `labels = ["step:implement"]`,
+      `labels = ["step:implement"]\ncondition = "vars.mode == 'full'"`,
+    );
+    expect(() => parseRunFormulaSource(conditional, "/repo/f.toml")).toThrow(PoisonEpic);
+    expect(() => parseRunFormulaSource(conditional, "/repo/f.toml")).toThrow(
+      /makes step\(s\) "implement" \(`condition = "vars.mode == 'full'"`\) conditional/,
+    );
+  });
+
+  it("names every conditional step, and addresses an id-less one by index", () => {
+    const doc = `formula = "anton-run"\nversion = 1\n\n[[steps]]\ntitle = "A"\ncondition = "a"\n\n[[steps]]\nid = "b"\ntitle = "B"\ncondition = "b"\n`;
+    expect(() => parseRunFormulaSource(doc, "/repo/f.toml")).toThrow(
+      /step\(s\) "0" \(`condition = "a"`\), "b" \(`condition = "b"`\)/,
+    );
+  });
 });
 
 describe("orderFormulaSteps — the order the walk runs (anton-lnkt)", () => {
@@ -583,5 +605,42 @@ describe("validateRunFormula — a resumed run keeps the pipeline it recorded (a
         },
       }),
     ).rejects.toThrow(/This run already walked that pipeline/);
+  });
+
+  // The pin has to survive an anton upgrade that moves the install root. Recording the bundled
+  // asset's absolute path would leave an in-flight run pinned to a file that only MOVED, parked with
+  // "restore the file" and recoverable only by abandoning the run.
+  it("records anton's bundled default as a sentinel, not the install's absolute path", async () => {
+    const formula = await validateRunFormula("/no-such-repo", {
+      read: async () => VALID,
+      cook: walkable,
+    });
+    expect(formula.source).toBe(bundledRunFormulaPath());
+    expect(formula.recorded).toBe(BUNDLED_FORMULA_SOURCE);
+    expect(BUNDLED_FORMULA_SOURCE.startsWith("/")).toBe(false);
+  });
+
+  it("resolves a `bundled:` pin against THIS install rather than the path it was recorded under", async () => {
+    const cooked: string[] = [];
+    const formula = await validateRunFormula("/repo", {
+      pinned: { source: BUNDLED_FORMULA_SOURCE },
+      read: async () => VALID,
+      cook: async (_repo, path) => {
+        cooked.push(path);
+        return walkable();
+      },
+    });
+    expect(formula.source).toBe(bundledRunFormulaPath());
+    expect(formula.recorded).toBe(BUNDLED_FORMULA_SOURCE);
+    expect(cooked).toEqual([bundledRunFormulaPath()]);
+  });
+
+  it("records a project-local pipeline verbatim — its path is constant per project", async () => {
+    const formula = await validateRunFormula("/repo", {
+      pinned: { source: PINNED },
+      read: async () => VALID,
+      cook: walkable,
+    });
+    expect(formula.recorded).toBe(PINNED);
   });
 });

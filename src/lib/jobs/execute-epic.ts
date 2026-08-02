@@ -631,8 +631,11 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         vars: { target: epicBeadId },
       });
       assertRunFormulaFloor(formula);
+      // `recorded`, not `source`: anton's bundled default is stored as a sentinel rather than an
+      // install-absolute path, so a run in flight across an upgrade that moved the install root
+      // re-reads the pipeline it pinned instead of parking on a path that only changed.
       await updateRun(db, clock, runId, {
-        formula: formula.source,
+        formula: formula.recorded,
         formulaVariant: formula.variant ?? null,
       });
       // The pipeline this run walks (anton-lnkt), split at the commit into its two phases. Steps run

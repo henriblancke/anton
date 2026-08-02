@@ -252,6 +252,21 @@ describeBd("run formula (real bd)", () => {
     await expect(validateRunFormula(repo)).rejects.toThrow(/steps\[implement\]\.estimate/);
   });
 
+  // The mirror of the allowlist pin above: bd HONORS `condition` and cooks it through, which is why
+  // it is a known key — but anton's typed seam drops it and the walker evaluates nothing, so a step
+  // the project disabled would run. The loader is what refuses the pipeline.
+  it("parks on a conditional step bd cooks happily, rather than running a disabled step", async () => {
+    const path = writeProjectFormula(
+      `formula = "anton-run"\ntype = "workflow"\nversion = 1\n\n[[steps]]\nid = "implement"\ntype = "task"\ntitle = "Implement"\nlabels = ["step:implement"]\n\n[[steps]]\nid = "commit"\ntype = "task"\nneeds = ["implement"]\ntitle = "Commit"\nlabels = ["step:commit"]\ncondition = "false"\n`,
+    );
+
+    const cookedStep = (cookRaw(path).steps as Array<Record<string, unknown>>)[1];
+    expect(cookedStep.condition).toBe("false");
+    await expect(validateRunFormula(repo)).rejects.toThrow(
+      new RegExp(`run formula ${path} makes step\\(s\\) "commit" .* conditional`),
+    );
+  });
+
   it("parks on a project-local formula bd itself refuses to cook", async () => {
     // `needs` pointing at a step that doesn't exist: bd's own validation, surfaced with the file.
     const path = writeProjectFormula(

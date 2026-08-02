@@ -27,6 +27,7 @@ import * as schema from "../db/schema";
 import { getJob, park, resumeJob } from "./queue";
 import { resetOperatorCache } from "../operator";
 import { describeBd } from "@/lib/testing/integration";
+import { BUNDLED_FORMULA_SOURCE } from "./run-formula";
 import {
   BASE_TIME_MS,
   resetPerCaseState,
@@ -422,8 +423,9 @@ process.exit(0);`),
       // anton's default: the gate runs once per ticket and not again.
       expect(lines(orderLog).filter((l) => l === "verify")).toHaveLength(2);
 
+      // anton's bundled asset is recorded by its sentinel, not by an install-absolute path.
       const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === epicId)!;
-      expect(run.formula?.endsWith("anton-run.formula.toml")).toBe(true);
+      expect(run.formula).toBe(BUNDLED_FORMULA_SOURCE);
       expect(run.formulaVariant).toBeNull();
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
