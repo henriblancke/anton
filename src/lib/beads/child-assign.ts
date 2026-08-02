@@ -74,6 +74,9 @@ export async function assignChildren(
   const held: string[] = [];
   const reserved: ReservedChild[] = [];
   const failed: FailedChild[] = [];
+  // Serial on purpose. Each swap is three bd spawns, and every bd invocation takes an EXCLUSIVE
+  // Dolt lock on the repo — running the children concurrently just makes them queue on that one
+  // lock instead of the loop, buying no parallelism while risking bd's per-step timeout.
   for (const child of assignableChildren(children)) {
     const swap = await guard
       .setAssigneeIfOwner(repoPath, child.id, undefined, actor)

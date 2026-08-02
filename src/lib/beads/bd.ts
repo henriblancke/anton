@@ -1276,8 +1276,10 @@ export const CLAIM_SETTLE_MS = 2_000;
 /**
  * The verdict of {@link beads.claimVerified}. `lost` is a VALUE, not an exception: losing a race is
  * the protocol working, and a pickup loop must be able to move to the next target without a
- * try/catch. `unverified` is the fail-closed answer — the claim could not be proven, so the caller
- * must NOT run the target; it may retry (a same-actor claim is idempotent).
+ * try/catch — and `lost` with an undefined `owner` means the bead read back unassigned, so it is
+ * neither ours nor anyone else's and retrying it is safe. `unverified` is the fail-closed answer —
+ * the claim could not be proven, so the caller must NOT run the target; it may retry (a same-actor
+ * claim is idempotent).
  */
 export type ClaimVerification =
   | { ok: true; bead: Bead }
@@ -1371,7 +1373,9 @@ async function runClaimVerified(
 
   // 6. Assert the assignee. This is the only step that makes the claim trustworthy: after the merge
   //    of two concurrent claims exactly one actor survives on the bead, and a worker may run only if
-  //    that actor is itself.
+  //    that actor is itself. A `lost` with NO owner is the bead reading back unassigned — our claim
+  //    did not survive the merge, so it is not ours to run, but nobody else holds it either: the
+  //    target may simply be free again, and re-claiming it is safe (a same-actor claim is idempotent).
   const verified = await show(cwd, id).catch(() => null);
   if (!verified) return unverified("could not re-read the bead to verify the claim");
   const owner = ownerOf(verified);
