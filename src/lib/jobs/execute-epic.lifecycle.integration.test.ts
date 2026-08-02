@@ -15,7 +15,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { beads } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
-import { epicStandaloneBlockers } from "../epic-graph";
+import { epicStandaloneBlockers, standaloneBlockers } from "../epic-graph";
 import * as schema from "../db/schema";
 import { getJob, park, resumeJob } from "./queue";
 import { createRun } from "../runs";
@@ -543,5 +543,78 @@ process.exit(0);`,
     expect(epic.labels ?? []).not.toContain("stage:implementing");
     expect(deriveStage(epic)).toBe("in-review");
     expect(beads.getPrRef(epic)).toBe("gh-55");
+  });
+
+  it("arms the missing merge gate on the PR-ref short-circuit (crash after ref, before arming)", async () => {
+    // anton-k0kj review (thread PRRT_kwDOTWcq8c6VuxBt): arming the gate is the LAST write of step 5,
+    // so a crash right after setPrRef — or a `gateCreate` its best-effort `safe` swallowed — leaves
+    // the target with a PR and no wait. Every later attempt then takes THIS short-circuit instead of
+    // step 5, so unless the short-circuit reconciles the gate too the target stays permanently
+    // gate-less: its merge is only ever noticed by the legacy review-fix sweep and no timeout can
+    // surface a stalled PR. A bug, not an epic — bd refuses a gate edge onto an epic.
+    const bugId = await beads.create(repo, {
+      title: "Crashed before arming the merge gate",
+      type: "bug",
+      acceptance: "work file exists",
+      description: "## Goal\nProve the merge gate is reconciled on the idempotent path.",
+    });
+    await beads.approve(repo, bugId);
+    await beads.tag(repo, bugId, ["stage:in-review"]); // runTicket applied it at commit, pre-crash
+    await beads.setPrRef(repo, bugId, "gh-66");
+    const runId = randomUUID();
+    await createRun(tdb.db, clock, {
+      id: runId,
+      projectId,
+      epicBeadId: bugId,
+      branch: `anton/${bugId}`,
+      status: "running",
+    });
+    await beads.sync(repo);
+    // The wait the crash never armed. Scoped to THIS PR: earlier cases in this shared sandbox leave
+    // merge gates of their own on the repo.
+    const gatesFor66 = async () =>
+      (await beads.gateList(repo)).filter(
+        (g) => g.await_type === "gh:pr" && g.await_id === "66",
+      );
+    expect(await gatesFor66()).toEqual([]);
+
+    const runner = makeEpicRunner(ctx);
+    // gh reports the PR OPEN (its real state after the crash); `pr create` booms so a wrongful
+    // fall-through to the PR step would throw instead of short-circuiting.
+    const openGh = writeBin(
+      binDir,
+      "gh-open-gate-k0kj",
+      `const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='view'){process.stdout.write(JSON.stringify({state:'OPEN',url:'https://github.com/acme/repo/pull/66',number:66})+'\\n');process.exit(0);}
+if(a[0]==='pr'&&a[1]==='create'){console.error('gh boom: must not reach PR step');process.exit(1);}
+process.exit(0);`,
+    );
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = openGh;
+    try {
+      const job1 = await driveEpicRun(runner, { projectId, epicBeadId: bugId });
+      expect((await getJob(tdb.db, job1))?.status).toBe("done");
+
+      const armed = await gatesFor66();
+      expect(armed).toHaveLength(1);
+
+      // The gate is wired to THIS target (bd records the edge on the blocked bead) — and must not
+      // read as a prerequisite, or the recovery/Force run this target may still need is refused.
+      const board = await loadAllIssues(repo);
+      const target = board.find((b) => b.id === bugId);
+      expect(
+        (target?.dependencies ?? []).some(
+          (d) => d.type === "blocks" && d.depends_on_id === armed[0].id,
+        ),
+      ).toBe(true);
+      expect(standaloneBlockers(board, bugId)).toEqual([]);
+
+      // A SECOND short-circuit reconciles to a no-op: one PR, one wait, never a duplicate racing it.
+      const job2 = await driveEpicRun(runner, { projectId, epicBeadId: bugId });
+      expect((await getJob(tdb.db, job2))?.status).toBe("done");
+      expect(await gatesFor66()).toHaveLength(1);
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+    }
   });
 });

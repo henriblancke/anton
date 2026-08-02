@@ -422,6 +422,16 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
             await safe(() => beads.tag(repo, epicBeadId, [LABELS.stage("in-review")]));
             await safe(() => beads.untag(repo, epicBeadId, [LABELS.stage("implementing")]));
           }
+          // Reconcile the merge gate here too, for the same reason the stage label is restored
+          // (anton-k0kj): arming it is the LAST thing step 5 does, so a crash after setPrRef — or a
+          // `gateCreate` the best-effort `safe` there swallowed — leaves this target gate-less, and
+          // every later attempt takes THIS return instead of step 5. Without this the wait never
+          // becomes board state: the merge is only ever noticed by the legacy review-fix sweep and no
+          // timeout can surface a stall. Idempotent by construction (mergeGatePlan returns
+          // `create: false` when this PR's gate already exists), so the common no-op short-circuit
+          // writes nothing. Armed for a MERGED ref as well as an open one — gate-check closes it on
+          // the next pass and dispatches finalization, which is exactly what this target still needs.
+          await safe(() => armMergeGate(repo, epicBeadId, prRef, all));
           // Clean up any worktree a prior attempt left behind before short-circuiting (anton-jz1). A
           // resume that crashed AFTER the worktree-warm step (step 2 stamps `worktreePath` on the run
           // row) leaves the git worktree registered/on disk; this idempotent return skips the normal
