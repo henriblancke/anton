@@ -9,7 +9,7 @@
  * approval-time blocker TOCTOU gate, and the zero-diff no-delivery gate — split out so it runs
  * in parallel with its sibling `execute-epic.*.integration.test.ts` files (anton-0oi).
  */
-import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -741,6 +741,126 @@ process.exit(0);`),
       // The formula is project-local: leaving it behind would re-gate every later case in this file.
       rmSync(formulaPath, { force: true });
       if (jobId) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  });
+
+  it("assigns every open child at claim time and hands them back when the run parks (anton-0d85)", async () => {
+    // A run claims its FEATURE, but `bd ready --unassigned` filters on each TASK's assignee — so
+    // without the cascade a running feature keeps offering its own children to every other worker on
+    // the board. The claim must reach the children, and a stop must give back exactly what it took:
+    // a parked run holding its whole subtree would hide the feature from every machine while nothing
+    // at all is executing it.
+    // The park comes from the zero-diff no-delivery gate, so the project gets no verify gates (a
+    // failing test gate is a different, already-covered failure).
+    const cascadeProjectId = randomUUID();
+    await tdb.db.insert(schema.projects).values({
+      id: cascadeProjectId,
+      slug: "sandbox-cascade",
+      name: "sandbox-cascade",
+      repoPath: repo,
+      defaultBranch: "main",
+      settingsJson: JSON.stringify({}),
+    });
+
+    const epicCa = await beads.create(repo, {
+      title: "Cascade epic",
+      type: "epic",
+      acceptance: "work file exists",
+      description: "## Goal\nCA",
+    });
+    await beads.approve(repo, epicCa);
+    const ca1 = createTicket(repo, { title: "Cascade ticket one", parent: epicCa });
+    const ca2 = createTicket(repo, { title: "Cascade ticket two", parent: epicCa });
+
+    // Snapshot both children's assignees from INSIDE the run — the only place the in-flight
+    // reservation is observable — then exit cleanly with no diff so the run parks on no-delivery.
+    const snapshot = join(sandbox, "cascade-midrun.json");
+    const snapshotClaude = writeBin(
+      binDir,
+      "claude-cascade",
+      fakeClaudeReadingStdin(`const cp=require('child_process');
+const read=id=>{const p=JSON.parse(cp.execFileSync('bd',['show',id,'--json'],
+  {cwd:${JSON.stringify(repo)},encoding:'utf8'}));
+  const b=Array.isArray(p)?p[0]:(p.issue||p);return {id:b.id,assignee:b.assignee||null};};
+fs.writeFileSync(${JSON.stringify(snapshot)},JSON.stringify([read(${JSON.stringify(ca1)}),read(${JSON.stringify(ca2)})]));
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+e({type:'system',subtype:'init',session_id:'sca'});
+e({type:'result',subtype:'success',result:'done',session_id:'sca',num_turns:1,is_error:false});
+process.exit(0);`),
+    );
+
+    const runner = makeEpicRunner(ctx);
+
+    process.env.ANTON_CLAUDE_BIN = snapshotClaude;
+    let jobId: string;
+    try {
+      jobId = await driveEpicRun(runner, { projectId: cascadeProjectId, epicBeadId: epicCa });
+      expect((await getJob(tdb.db, jobId))?.status).toBe("parked");
+
+      // Mid-run: BOTH children carry the run's actor — including the one still waiting its turn,
+      // which is the whole point (that is the ticket another worker would otherwise be served).
+      const midRun: Array<{ id: string; assignee: string | null }> = JSON.parse(
+        readFileSync(snapshot, "utf8"),
+      );
+      expect(midRun).toEqual([
+        { id: ca1, assignee: "test-operator" },
+        { id: ca2, assignee: "test-operator" },
+      ]);
+
+      // After the park both are back on the board, whichever the walk dispatched first: that one is
+      // blocked-and-unassigned by the no-delivery gate, its never-dispatched sibling is still open
+      // with the cascade's reservation handed back.
+      const after1 = await beads.show(repo, ca1);
+      const after2 = await beads.show(repo, ca2);
+      expect(after1.assignee ?? null).toBeNull();
+      expect(after2.assignee ?? null).toBeNull();
+      expect([after1.status, after2.status].sort()).toEqual(["blocked", "open"]);
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  });
+
+  it("leaves a child a human reserved alone, reports it, and releases only its own (anton-0d85)", async () => {
+    // A human's reservation outranks a run's: the cascade must report the conflict rather than
+    // clobber it — and the release that follows must give back only what the cascade actually took.
+    const epicHu = await beads.create(repo, {
+      title: "Human-reserved epic",
+      type: "epic",
+      acceptance: "work file exists",
+      description: "## Goal\nHU",
+    });
+    await beads.approve(repo, epicHu);
+    const reserved = createTicket(repo, { title: "Reserved by a human", parent: epicHu });
+    const free = createTicket(repo, { title: "Free ticket", parent: epicHu });
+    // A backlog reservation: assignee set, status untouched — what the board's Claim control does.
+    await beads.assign(repo, reserved, "human-operator");
+
+    const warnings: string[] = [];
+    const warn = vi.spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
+      warnings.push(args.map(String).join(" "));
+    });
+
+    const runner = makeEpicRunner(ctx);
+
+    process.env.ANTON_CLAUDE_BIN = successClaude;
+    let jobId: string;
+    try {
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: epicHu });
+
+      // Surfaced in the run log, naming the ticket and who holds it.
+      const reportLine = warnings.find((w) => w.includes("human-operator"));
+      expect(reportLine).toBeDefined();
+      expect(reportLine).toContain(reserved);
+
+      // The reservation is intact — never overwritten by the cascade, never released by the stop.
+      expect((await beads.show(repo, reserved)).assignee).toBe("human-operator");
+      // The run stops on the reserved ticket's hard claim gate, so its sibling — reserved by the
+      // cascade and only by it — is handed back.
+      expect((await beads.show(repo, free)).assignee ?? null).toBeNull();
+    } finally {
+      warn.mockRestore();
+      if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
     }
   });
 });

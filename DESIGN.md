@@ -54,6 +54,16 @@ stage above) to mark it as executing. The human claim is a `backlog` reservation
 the execution-claim is the runner announcing work is underway. Don't conflate the two — a claimed
 epic is still just reserved until you approve it.
 
+The execution-claim **cascades to the target's open children**. `bd ready --unassigned` filters on
+each *task's* assignee, so a claim that stopped at the feature would leave every child of a running
+feature claimable by any other worker on the board — a second anton instance, or a plain `bd` client
+that has never heard of a run lease. So the runner `bd assign`s each open child to the same actor
+(a reservation: status untouched), and hands them back when the attempt stops — parked, abandoned,
+or backed off after losing the lease race. It gives back only what it took: a child a *person* had
+already reserved is left alone and reported in the run log, and a takeover that lands mid-run keeps
+its new owner. The one attempt that keeps its reservations is a **usage-limit park** — that run
+isn't dead, it's waiting out a quota window and resumes on this machine.
+
 ## 3. Data model — two tiers by shareability
 
 Persistence splits by whether state is **shareable/durable** (belongs in git, follows the repo)

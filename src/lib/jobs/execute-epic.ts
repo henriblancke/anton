@@ -16,6 +16,7 @@
 import { randomUUID } from "node:crypto";
 import { beads, labelValueOf, LABELS, type Bead } from "../beads/bd";
 import { ownerOf } from "../beads/claim";
+import { assignChildren, formatReservedChildren, releaseChildren } from "../beads/child-assign";
 import { contractGaps, formatContractGaps } from "../beads/contract";
 import { computeEpicGraph, epicStandaloneBlockers, isUnit, standaloneBlockers } from "../epic-graph";
 import { contractGatedBeads, resumeSkipped, runTickets } from "../ticket-view";
@@ -298,6 +299,11 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     // (a usage limit, a transient claude failure) — the `catch` below folds it into that attempt's
     // run error, which is the only report those paths get. Declared out here for that reason.
     let orphanNotice = "";
+    // The children this run reserved for its actor when it claimed the target (anton-0d85). Declared
+    // out here for the same reason as `leaseLabels`: the stopping paths below have to hand back what
+    // the try took — and only that — so the set has to outlive the block that took it. Null until the
+    // claim gate runs, so every gate that parks before it releases nothing.
+    let childCascade: { actor: string; ids: string[] } | null = null;
     // Publish/refresh this run's lease. Advances `leaseLabels` ONLY after the write lands (not
     // best-effort like the other bd writes): a swallowed failure that still advanced the tracked
     // label would let `finally` clear a label that isn't on the board while the real prior lease
@@ -930,6 +936,42 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         await safe(() => beads.claim(repo, epicBeadId, operator));
       }
       await safe(() => beads.tag(repo, epicBeadId, [LABELS.stage("implementing")]));
+
+      // 3b. Cascade the claim to the target's open children (anton-0d85). The claim above settles the
+      //     FEATURE, but `bd ready --unassigned` filters on each TASK's assignee — so without this a
+      //     running feature keeps offering its own children to every other worker on the board, and
+      //     the only thing standing between them and a duplicate run is anton-side knowledge no plain
+      //     `bd` client has. Assigning them makes bd's own readiness query exclude them natively.
+      //     A child a DIFFERENT actor holds is left exactly as it is and reported here — a human's
+      //     reservation outranks a run's, and clobbering it would hide the conflict that runTicket's
+      //     hard claim gate is about to stop the run on anyway.
+      //     Only for a grouped run: a standalone target IS its own ticket and was just claimed above.
+      //     Skipped without an operator identity too — `bd assign` names an assignee, and there is
+      //     none to name (the same reason that path keeps a best-effort claim).
+      //     Fails CLOSED, like the run-lease publish and for the same reason: a run executing children
+      //     the board still offers to everyone else is the duplicate-work hazard this exists to
+      //     prevent, so half a cascade must stop the attempt rather than proceed quietly. Retryable
+      //     (a plain Error, not poison) — a locked bd DB self-heals within the retry budget.
+      if (operator && !standaloneRun) {
+        const cascade = await assignChildren(repo, tickets, operator);
+        // Recorded BEFORE the incomplete-cascade throw below, so the stopping path hands back the
+        // reservations this cascade did take rather than stranding them.
+        childCascade = { actor: operator, ids: cascade.held };
+        if (cascade.reserved.length > 0) {
+          console.warn(
+            `[execute-epic] ${epicBeadId}: left ${cascade.reserved.length} child ticket(s) with ` +
+              `another assignee untouched — ${formatReservedChildren(cascade.reserved)}`,
+          );
+        }
+        if (cascade.failed.length > 0) {
+          throw new Error(
+            `${epicBeadId} could not reserve ${cascade.failed.map((f) => f.id).join(", ")} for ` +
+              `${operator} — the beads DB is locked or the assign failed transiently; retrying ` +
+              `rather than running a feature whose children the board still offers to other ` +
+              `workers. (${cascade.failed[0].error})`,
+          );
+        }
+      }
       void beads
         .sync(repo)
         .catch((e) => console.error(`[execute-epic] claim sync failed for ${epicBeadId}`, e));
@@ -1210,6 +1252,29 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       });
       await safe(() => removeWorktree(worktree));
     } catch (e) {
+      // Give the children back before settling the row (anton-0d85). This attempt has stopped —
+      // parked on a blocking review, killed by an abandon, backed off after losing the lease race, or
+      // failed outright — so holding its reservations would leave the whole feature invisible to
+      // `bd ready --unassigned` on every machine while nothing at all is executing it. The CAS
+      // releases only children this run still holds, so a takeover that landed mid-run keeps its new
+      // owner. A resumed attempt re-takes them at its own claim gate, which is what makes this safe to
+      // do on a recoverable stop. It runs on an ABORT too (a kill, an abandon) — unlike runTicket,
+      // which writes nothing there: what runTicket would rewrite is the aborted ticket's STATUS, the
+      // thing the abort's author is deciding, whereas a reservation with no run behind it is anton's
+      // own bookkeeping either way, and the in-flight ticket it gives back is still `in_progress`, so
+      // no `bd ready` serves it to anyone before the resume re-claims it.
+      // The ONE exception is a usage-limit park: that run is not dead, it is waiting out a quota
+      // window and resumes on THIS machine with everything intact — the same reason runTicket keeps
+      // the in-flight ticket's claim on that path, and releasing here would contradict it.
+      if (childCascade && !isUsageLimitError(e)) {
+        const released = await releaseChildren(repo, childCascade.ids, childCascade.actor);
+        if (released.length > 0) {
+          console.warn(
+            `[execute-epic] ${epicBeadId}: released ${released.length} child ticket(s) back to the ` +
+              `board — ${released.join(", ")}`,
+          );
+        }
+      }
       // Quota, a run already live on another machine (anton-jz1), or a self-review that refused the
       // PR → park the run (the job reschedules, re-checks liveness, or waits for the founder);
       // anything else → the run failed (job retries/parks).
