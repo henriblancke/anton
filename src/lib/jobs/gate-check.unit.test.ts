@@ -356,6 +356,30 @@ describe("plainGateResumes", () => {
     expect(plainGateResumes(board, NOW)).toEqual([]);
   });
 
+  it("hands back only the operator's own targets — a shared board must not double-dispatch", () => {
+    // The gate lives on the SHARED board, so every instance's local schedule sees it close. Each
+    // would enqueue an execute-epic for the same bead in its own job table; one wins the claim and
+    // the other retries on RunAlreadyLiveError until the bead closes.
+    const board = [
+      parked("mine", "g-1", { labels: approved, assignee: "alice" }),
+      parked("theirs", "g-2", { labels: approved, assignee: "bob" }),
+      parked("unclaimed", "g-3", { labels: approved, assignee: "" }),
+      humanGate("g-1"),
+      humanGate("g-2"),
+      humanGate("g-3"),
+    ];
+    expect(plainGateResumes(board, NOW, "alice").map((r) => r.target.id)).toEqual([
+      "mine",
+      "unclaimed",
+    ]);
+    expect(plainGateResumes(board, NOW, "bob").map((r) => r.target.id)).toEqual([
+      "theirs",
+      "unclaimed",
+    ]);
+    // An anton that cannot name itself takes unclaimed work only — it never races a claimed run.
+    expect(plainGateResumes(board, NOW, undefined).map((r) => r.target.id)).toEqual(["unclaimed"]);
+  });
+
   it("reports every closed gate on one target, so each gets its own marker", () => {
     const board = [
       parked("t-1", "g-1", {

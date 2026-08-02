@@ -306,11 +306,20 @@ export interface PlainGateResume {
  *     the job. The gate stays unmarked instead, so the next pass re-evaluates it once that blocker
  *     lands. (The closed gate itself is `done`, so it never counts against its own release.)
  *   • not already handed back ({@link GATE_RESUMED_LABEL}) — see there.
+ *   • the target is THIS OPERATOR'S (unclaimed, or claimed by it) — the same anton-zoh test step 4
+ *     applies, for the same reason: the gate is on the SHARED board and this schedule is
+ *     machine-local, so every instance's pass sees it close. Unfiltered, two antons each enqueue an
+ *     execute-epic for the same bead in their own machine-local job tables; one wins the claim and
+ *     the other retries on `RunAlreadyLiveError` until the bead closes.
  *
  * NOT deduped by target: the marker is per-GATE, so two closed gates on one target must both be
  * marked. The second dispatch is absorbed by `resumeEpic`, which refuses an epic a live job covers.
  */
-export function plainGateResumes(board: Bead[], nowMs: number): PlainGateResume[] {
+export function plainGateResumes(
+  board: Bead[],
+  nowMs: number,
+  operator?: string,
+): PlainGateResume[] {
   const out: PlainGateResume[] = [];
   for (const gate of board) {
     if (gate.issue_type !== "gate" || gate.status !== "closed") continue;
@@ -320,6 +329,7 @@ export function plainGateResumes(board: Bead[], nowMs: number): PlainGateResume[
     if (!blocked) continue;
     const target = runTargetAbove(board, blocked.id);
     if (!target || !isResumableTarget(target, nowMs)) continue;
+    if (!ownedByOperator(target, operator)) continue;
     if (target.labels?.includes(IN_REVIEW)) continue;
     if (openBlockersOf(board, target).length > 0) continue;
     out.push({ gate, target });
@@ -419,8 +429,11 @@ export function makeGateCheckHandler(deps: GateCheckDeps): JobHandler {
     //     The mark lands AFTER the dispatch decision, so a failed resume is retried next pass rather
     //     than being silently recorded as handled — and every outcome is marked, including
     //     `already-active`/`job-cancelled`: the gate has done its job in all four cases.
+    //     Scoped to this operator's targets for the same reason step 4 is — the closed gate is on
+    //     the shared board, and an unfiltered dispatch would have two antons race the same bead.
+    const operator = await resolveOperator();
     let handedBack = 0;
-    for (const { gate, target } of plainGateResumes(board, nowMs)) {
+    for (const { gate, target } of plainGateResumes(board, nowMs, operator)) {
       const outcome = await resumeEpic(db, clock, projectId, target.id);
       console.log(`[gate-check] ${projectId}: ${target.id} released by gate ${gate.id} — ${outcome}`);
       try {
@@ -438,7 +451,7 @@ export function makeGateCheckHandler(deps: GateCheckDeps): JobHandler {
     //    the finalize actually lands, so a half-done finalize heals itself.
     //    Scoped to this operator's targets: the closed gate is on the SHARED board, so on a board
     //    two antons share, an unfiltered dispatch would have both finalize the same bead at once.
-    for (const target of mergedGateTargets(board, await resolveOperator())) {
+    for (const target of mergedGateTargets(board, operator)) {
       const jobId = enqueueReviewFixIfAbsent(db, clock, projectId, target.id);
       if (jobId) console.log(`[gate-check] ${projectId}: ${target.id} merged — dispatched review-fix`);
     }
