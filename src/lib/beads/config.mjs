@@ -307,6 +307,18 @@ export const BEAD_FORMULA_FILENAME = "anton-bead.formula.json";
 export const RUN_FORMULA_FILENAME = "anton-run.formula.toml";
 
 /**
+ * What a formula NAME may be — the `<name>` in `<name>.formula.toml`, as a project's per-label
+ * variant map (anton-aa3m) addresses it. Letters, digits, `.`, `-` and `_`, starting and ending
+ * alphanumeric: no path separator, and `..` cannot match, so a mapping can never point the loader
+ * outside `.beads/formulas/`.
+ *
+ * Lives here, with the formula filenames it is the other half of, because it is enforced at two
+ * boundaries a run apart — the settings API that accepts the map, and the loader that reads the file
+ * — and two copies would drift into a mapping that passes one and parks at the other.
+ */
+export const FORMULA_NAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
+
+/**
  * Path segments of a bundled formula, relative to anton's package root (anton-8mnr). Both ride along
  * in the `setup` skill's template tree so `/setup`, `anton setup`, and `anton init` all install the
  * SAME files, and the server-side loaders resolve the same segments against the server's cwd.

@@ -1145,6 +1145,12 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           }
           // Advisory findings never park (anton-3apm): they ride along in the PR body so the founder
           // sees them at the merge gate — which is why they are carried into the steps that follow.
+          //
+          // Replaces rather than accumulates, and only because the carry runs BOTH ways: a formula
+          // with a second `step:review` seeds that gate with what this one left open (see
+          // `reviewStep`), so its reviewer was shown these and its verdict IS the whole open set —
+          // one it did not restate is settled, not forgotten. Accumulating here would instead
+          // resurrect advisories a later reviewer judged resolved.
           advisoryFindings = review.unresolved.filter((f) => f.severity === "advisory");
           continue;
         }

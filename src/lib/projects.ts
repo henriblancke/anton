@@ -12,7 +12,7 @@ import { z } from "zod";
 import { eq } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import { removeWorktree } from "./git/worktree";
-import { configureBeadsForRepo } from "./beads/config.mjs";
+import { FORMULA_NAME_PATTERN, configureBeadsForRepo } from "./beads/config.mjs";
 import { DEFAULT_BUDGET_POLICY, type BudgetPolicy } from "./jobs/budget";
 import type { FormulaVariant } from "./jobs/run-formula";
 import type { AntonDb } from "./jobs/queue";
@@ -362,9 +362,10 @@ export function resolveBudgetPolicy(settings: ProjectSettings): BudgetPolicy {
  * Per-label pipeline variants (anton-aa3m). An ORDERED list, not a map, because the order IS the
  * documented precedence: a bead carrying two mapped labels walks the one the project listed first.
  *
- * `formula` is a name under `.beads/formulas/` (`<name>.formula.toml`), constrained here to what a
- * filename may be — no separators, and `..` can't match — so a mapping can't point the loader
- * outside the project's own formulas. Duplicate labels are rejected rather than silently shadowed:
+ * `formula` is a name under `.beads/formulas/` (`<name>.formula.toml`), constrained by the same
+ * {@link FORMULA_NAME_PATTERN} the loader enforces — no separators, and `..` can't match — so a
+ * mapping can't point the loader outside the project's own formulas, and a map that passes this
+ * boundary cannot park at that one. Duplicate labels are rejected rather than silently shadowed:
  * a second entry for a label the list already carries can never be selected, so it is a mistake, not
  * a precedence. Bounded in size for the same reason every other operator field is.
  */
@@ -378,7 +379,7 @@ export const formulaVariantsSchema = z
           .trim()
           .min(1)
           .max(120)
-          .regex(/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/, {
+          .regex(FORMULA_NAME_PATTERN, {
             message:
               "formula must be a formula name under .beads/formulas/ (letters, digits, . - _)",
           }),

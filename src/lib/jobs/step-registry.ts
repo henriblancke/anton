@@ -162,7 +162,10 @@ export interface StepContext {
   session?: JobSession;
   /** Re-assert the cross-machine run-lease; throws when it has lapsed (anton-jz1). */
   assertLeaseHeld?: () => void;
-  /** Advisory findings an earlier `review` step left open — `pr` carries them into the PR body. */
+  /**
+   * Advisory findings an earlier `review` step left open. `pr` carries them into the PR body, and a
+   * SECOND `review` is seeded with them so its own verdict speaks for the whole open set.
+   */
   advisories?: ReviewFinding[];
   /**
    * Where a step records progress the caller still needs when the step THROWS. The review gate's
@@ -282,6 +285,11 @@ export async function verifyStep(ctx: StepContext): Promise<StepResult> {
  *
  * Reports the verdict rather than acting on it: whether an unresolved verdict parks the run, and
  * where the advisories are recorded, is the caller's call.
+ *
+ * A formula may name this step more than once. Each one is its own gate, so the advisories the
+ * previous one left open ({@link StepContext.advisories}) are seeded as this gate's carry — the
+ * reviewer is shown them and settles them, which is what makes the caller replacing its open set
+ * (rather than accumulating) honest.
  */
 export async function reviewStep(ctx: StepContext): Promise<StepResultWith<"review">> {
   // Asserted here AND handed in: the gate's review → fix → re-review sequence can outlive the lease
@@ -300,6 +308,7 @@ export async function reviewStep(ctx: StepContext): Promise<StepResultWith<"revi
     baseBranch: ctx.baseRef,
     assertLeaseHeld: ctx.assertLeaseHeld,
     rounds: ctx.rounds,
+    carried: ctx.advisories,
   });
   return {
     ok: review.outcome === "clean",

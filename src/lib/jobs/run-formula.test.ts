@@ -22,6 +22,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { CookedFormula } from "../beads/bd";
+import { formulaVariantsSchema } from "../projects";
 import { PoisonEpic } from "./errors";
 import { assertRunFormulaFloor } from "./formula-floor";
 import {
@@ -229,6 +230,28 @@ describe("selectRunFormula — which pipeline this run walks (anton-aa3m)", () =
       expect(() => selectRunFormula(repo, ["risk:high"], [{ label: "risk:high", formula }])).toThrow(
         /not a formula name/,
       );
+    }
+  });
+
+  // The name is constrained twice, a run apart: the settings API accepts the map, this loader turns
+  // it into a path. Two copies of the rule would drift into a mapping that saves fine and then parks
+  // mid-run (or the reverse), so both read FORMULA_NAME_PATTERN and this pins them to one verdict.
+  it("accepts and rejects exactly the names the settings schema does", () => {
+    const repo = repoWith(RUN_FORMULA_FILENAME, "heavy.formula.toml");
+    const loaderAccepts = (formula: string) => {
+      try {
+        selectRunFormula(repo, ["risk:high"], [{ label: "risk:high", formula }]);
+        return true;
+      } catch (e) {
+        // Only the NAME verdict is under test — a well-formed name whose file is missing still parks.
+        return !/not a formula name/.test((e as Error).message);
+      }
+    };
+    const schemaAccepts = (formula: string) =>
+      formulaVariantsSchema.safeParse([{ label: "risk:high", formula }]).success;
+
+    for (const formula of ["heavy", "anton-run.risk_high", "a", "../../etc/passwd", "nested/heavy", "..", "/abs/heavy", "-heavy", "heavy-"]) {
+      expect([formula, schemaAccepts(formula)]).toEqual([formula, loaderAccepts(formula)]);
     }
   });
 

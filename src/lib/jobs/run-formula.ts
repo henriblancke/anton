@@ -44,6 +44,7 @@ import { parse as parseToml } from "smol-toml";
 
 import { beads, type CookedFormula, type CookedStep } from "../beads/bd";
 import {
+  FORMULA_NAME_PATTERN,
   RUN_FORMULA_FILENAME,
   bundledRunFormulaPath as bundledRunFormulaUnder,
 } from "../beads/config.mjs";
@@ -101,14 +102,6 @@ export interface FormulaChoice {
 }
 
 /**
- * A formula NAME as it may appear in a project's variant map: what `<name>.formula.toml` accepts as
- * a filename, and nothing that could climb out of `.beads/formulas/` (no separators, and `..` can't
- * match because the name must start and end alphanumeric). Settings are hand-editable through the
- * API, so this is enforced here as well as at that boundary.
- */
-const FORMULA_NAME = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
-
-/**
  * The pipeline a run over `labels` walks, by a precedence that is deterministic and inspectable:
  *
  * 1. **The first variant, in the project's own declaration order, whose label the run target
@@ -135,7 +128,9 @@ export function selectRunFormula(
   const match = variants.find((v) => carried.has(v.label));
   if (!match) return { source: resolveRunFormulaPath(repoPath) };
 
-  if (!FORMULA_NAME.test(match.formula)) {
+  // Re-checked here, not only at the settings boundary: the map is hand-editable through the API,
+  // and this is the last point before a name becomes a path.
+  if (!FORMULA_NAME_PATTERN.test(match.formula)) {
     throw new PoisonEpic(
       `this project maps label \`${match.label}\` to run formula "${match.formula}", which is not a ` +
         `formula name — a variant names a file in \`.beads/formulas/\` (\`<name>.formula.toml\`), so ` +
