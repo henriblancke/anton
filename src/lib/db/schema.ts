@@ -52,7 +52,7 @@ export const jobs = sqliteTable(
   {
     id: text("id").primaryKey(),
     // execute-epic | review-fix | nightly-stringer | orphan-grooming | sync-push | run-health |
-    // unstick | gate-check
+    // unstick | gate-check | gardener
     type: text("type").notNull(),
     projectId: text("project_id").references(() => projects.id),
     payloadJson: text("payload_json").notNull().default("{}"),
@@ -147,6 +147,40 @@ export const runHealthReports = sqliteTable("run_health_reports", {
   /** Denormalized so a board badge / refresh token needn't parse the blob. */
   findingCount: integer("finding_count").notNull().default(0),
 });
+
+/**
+ * One gardener patrol's hygiene report (anton-3nv7). Unlike `run_health_reports` this is one row PER
+ * RUN, not per project: the patrol WRITES to the board (it closes eligible epics and repairs the
+ * blocked flag), so the row is the durable record of what a given patrol actually did — keyed to the
+ * job that did it. Collapsing them per project would erase that history the moment the next patrol
+ * ran, leaving a closed epic with nothing naming the pass that closed it.
+ *
+ * Bounded rather than unbounded: `saveHygieneReport` prunes to the newest few per project, so the
+ * table stays a short audit trail instead of an append-only log that grows forever.
+ */
+export const hygieneReports = sqliteTable(
+  "hygiene_reports",
+  {
+    id: text("id").primaryKey(),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id),
+    /** The patrol job that produced this report; null only for a report written outside a job. */
+    jobId: text("job_id"),
+    generatedAt: ts("generated_at").notNull().default(now),
+    /** `HygieneFinding[]` (src/lib/hygiene.ts), serialized — everything that needs human eyes. */
+    findingsJson: text("findings_json").notNull().default("[]"),
+    /** The epic ids the safe sweep closed, serialized — what this patrol changed on the board. */
+    closedEpicsJson: text("closed_epics_json").notNull().default("[]"),
+    /** `is_blocked` rows `bd recompute-blocked` repaired — the sweep's other mechanical action. */
+    rowsRecomputed: integer("rows_recomputed").notNull().default(0),
+    /** Denormalized summary counts, so a board badge needn't parse the blobs. */
+    findingCount: integer("finding_count").notNull().default(0),
+    closedCount: integer("closed_count").notNull().default(0),
+  },
+  // Serves "this project's latest patrol" (and the prune) without a full scan.
+  (table) => [index("hygiene_reports_project_idx").on(table.projectId, table.generatedAt)],
+);
 
 /**
  * Founder-facing escalations raised by the unstick pass (anton-wvcy). One row per stall the pass

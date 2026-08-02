@@ -130,6 +130,7 @@ describe("option lists", () => {
       "run-health",
       "unstick",
       "gate-check",
+      "gardener",
     ]);
     expect(JOB_TYPE_FILTER_OPTIONS.map((o) => o.value)).toEqual(["", ...JOB_TYPES]);
   });

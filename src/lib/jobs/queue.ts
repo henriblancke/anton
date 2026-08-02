@@ -22,7 +22,8 @@ export type JobType =
   | "sync-push"
   | "run-health"
   | "unstick"
-  | "gate-check";
+  | "gate-check"
+  | "gardener";
 
 /**
  * `queued`  — eligible when runAt ≤ now (also how a backoff/quota reschedule is represented).

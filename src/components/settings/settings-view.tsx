@@ -110,6 +110,11 @@ const AUTOMATIONS = [
     label: "gate-check",
     meta: "resumes runs whose gate closed · */10 * * * * · human gates never auto-close",
   },
+  {
+    id: "gardener",
+    label: "gardener",
+    meta: "board hygiene patrol · 0 5 * * * · off by default · closes done epics, reports the rest",
+  },
 ];
 
 /** Per-automation schedule state from the server; a missing row means "not scheduled yet". */

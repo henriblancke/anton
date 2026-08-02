@@ -52,7 +52,8 @@ export const TIER_SEEDS: Record<BurnTier, { sessionPct: number; weeklyPct: numbe
  * Static tier per job type (ticket: stringer=S, review-fix=M, execute-epic=L; grooming is cheap).
  * sync-push is a deterministic `git push` of dolt refs — it invokes no Claude at all, so it's `none`:
  * zero cost to the pacer and never worth sampling (see {@link burnsClaudeQuota}). run-health is the
- * same shape: deterministic queries over anton.db, the board, and `gh`.
+ * same shape: deterministic queries over anton.db, the board, and `gh`; so is the gardener patrol,
+ * which is bd hygiene verbs and nothing else.
  */
 export const JOB_TYPE_TIER: Record<JobType, BurnTier> = {
   "nightly-stringer": "S",
@@ -63,6 +64,7 @@ export const JOB_TYPE_TIER: Record<JobType, BurnTier> = {
   "run-health": "none",
   unstick: "none",
   "gate-check": "none",
+  gardener: "none",
 };
 
 /**

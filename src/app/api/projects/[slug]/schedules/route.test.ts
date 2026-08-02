@@ -74,9 +74,10 @@ describe("schedules route", () => {
     const res = await GET(new Request("http://t/"), ctx("tmp"));
     expect(res.status).toBe(200);
     const { schedules } = await res.json();
-    expect(schedules).toHaveLength(6);
+    expect(schedules).toHaveLength(7);
     const types = schedules.map((s: { type: string }) => s.type).sort();
     expect(types).toEqual([
+      "gardener",
       "gate-check",
       "nightly-stringer",
       "orphan-grooming",
@@ -98,6 +99,9 @@ describe("schedules route", () => {
       unstick: true,
       // gate-check (anton-286r) is armed by default: nothing else resumes a run parked on a gate.
       "gate-check": true,
+      // gardener (anton-3nv7) is the other opt-in: it is the only recurring job that writes to the
+      // board unprompted, so an operator arms it deliberately.
+      gardener: false,
     });
   });
 

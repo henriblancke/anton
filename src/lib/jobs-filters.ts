@@ -45,6 +45,7 @@ const JOB_TYPE_LABELS: Record<JobType, string> = {
   "run-health": "Run health",
   unstick: "Unstick",
   "gate-check": "Gate check",
+  gardener: "Gardener",
 };
 
 export const JOB_STATUSES = Object.keys(JOB_STATUS_LABELS) as JobStatus[];
