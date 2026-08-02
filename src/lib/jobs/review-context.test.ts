@@ -333,11 +333,11 @@ describe("reviewContext", () => {
       carriedAdvisories: [{ severity: "advisory", location: "src/widget.tsx:4", note: "the name could be clearer" }],
     });
 
-    expect(out).toContain("## Advisories still open from an earlier round");
+    expect(out).toContain("## Advisories still open from an earlier review");
     expect(out).toContain("1. src/widget.tsx:4 — the name could be clearer");
     expect(out).toContain("anton treats one you leave out as resolved");
     // A first round has none, and an empty list must not print an empty section.
-    expect(reviewContext({ target: epic, tickets: [ticket], diff })).not.toContain("still open from an earlier round");
+    expect(reviewContext({ target: epic, tickets: [ticket], diff })).not.toContain("still open from an earlier review");
   });
 
   it("forbids writing to the worktree in the appended context, so a swapped reviewer is told too", () => {

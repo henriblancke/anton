@@ -369,3 +369,82 @@ describe("settings route — self-review settings (anton-of1m)", () => {
     });
   });
 });
+
+describe("settings route — per-label pipeline variants (anton-aa3m)", () => {
+  beforeEach(async () => {
+    tdb = makeTestDb();
+    await tdb.db.insert(schema.projects).values({
+      id: "p1",
+      slug: "tmp",
+      name: "tmp",
+      repoPath: "/tmp/p1",
+    });
+  });
+
+  it("persists no key for a zero-config project — the map is absent, not empty", async () => {
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.formulaVariants).toBeUndefined();
+    expect("formulaVariants" in persisted()).toBe(false);
+  });
+
+  it("PATCH persists the map IN ORDER — that order is the run-time precedence", async () => {
+    const variants = [
+      { label: "risk:high", formula: "anton-run-risk-high" },
+      { label: "domain:docs", formula: "anton-run-docs" },
+    ];
+    const res = await PATCH(patchReq({ formulaVariants: variants }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.formulaVariants).toEqual(variants);
+    expect(persisted().formulaVariants).toEqual(variants);
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.formulaVariants).toEqual(variants);
+  });
+
+  it("clears the map on [] / null — back to one pipeline for everything", async () => {
+    await PATCH(patchReq({ formulaVariants: [{ label: "risk:high", formula: "heavy" }] }), ctx("tmp"));
+    await PATCH(patchReq({ formulaVariants: [] }), ctx("tmp"));
+    expect("formulaVariants" in persisted()).toBe(false);
+
+    await PATCH(patchReq({ formulaVariants: [{ label: "risk:high", formula: "heavy" }] }), ctx("tmp"));
+    await PATCH(patchReq({ formulaVariants: null }), ctx("tmp"));
+    expect("formulaVariants" in persisted()).toBe(false);
+  });
+
+  it("rejects a formula that isn't a formula name — a mapping can't escape .beads/formulas", async () => {
+    await PATCH(patchReq({ formulaVariants: [{ label: "risk:high", formula: "heavy" }] }), ctx("tmp"));
+    for (const formula of ["../../etc/passwd", "nested/heavy", ""]) {
+      const res = await PATCH(patchReq({ formulaVariants: [{ label: "risk:high", formula }] }), ctx("tmp"));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/formulaVariants/);
+    }
+    // The stored (valid) map is untouched by every rejection.
+    expect(persisted().formulaVariants).toEqual([{ label: "risk:high", formula: "heavy" }]);
+  });
+
+  it("rejects a label mapped twice — a shadowed entry is a mistake, not a precedence", async () => {
+    const res = await PATCH(
+      patchReq({
+        formulaVariants: [
+          { label: "risk:high", formula: "heavy" },
+          { label: "risk:high", formula: "heavier" },
+        ],
+      }),
+      ctx("tmp"),
+    );
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/at most one formula/);
+  });
+
+  it("rejects a malformed entry (missing label, unknown key, non-array)", async () => {
+    for (const value of [
+      [{ formula: "heavy" }],
+      [{ label: "risk:high", formula: "heavy", when: "always" }],
+      "risk:high=heavy",
+      [{ label: "  ", formula: "heavy" }],
+    ]) {
+      const res = await PATCH(patchReq({ formulaVariants: value }), ctx("tmp"));
+      expect(res.status).toBe(400);
+    }
+  });
+});

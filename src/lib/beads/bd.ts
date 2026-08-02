@@ -136,6 +136,121 @@ export function buildUpdateArgs(
   return args.length > 2 ? args : null;
 }
 
+// ── multi-bead transactions (`bd batch`, anton-aijz) ──
+//
+// A sequence of independent `bd` calls can fail half-way and strand a unit in a state no reader can
+// interpret — half a merged epic closed, half a cascade abandoned. `bd batch` reads its commands
+// from stdin and applies them inside ONE dolt transaction: on any error the whole batch rolls back.
+
+/**
+ * One line of a `bd batch` transaction. Only the two verbs anton's multi-bead mutations need —
+ * bd's grammar also accepts `create` and `dep`, deliberately left out (anton-aijz out of scope).
+ */
+export type BatchOp =
+  | { op: "close"; id: string; reason?: string }
+  | { op: "update"; id: string; fields: BatchUpdateFields };
+
+/**
+ * The ONLY fields bd's batch `update` accepts. Notably NOT labels: every label write (`abandoned`,
+ * `stage:*`, `run-lease:*`) has to stay its own `bd update` and therefore cannot join a
+ * transaction — which is why the abandon path labels FIRST and closes in the batch (see
+ * {@link beads.abandonAll}).
+ */
+export interface BatchUpdateFields {
+  status?: string;
+  priority?: number;
+  title?: string;
+  assignee?: string;
+}
+
+/** Fixed key order, so an encoded `update` line is deterministic regardless of object literal order. */
+const BATCH_UPDATE_KEYS = ["status", "priority", "title", "assignee"] as const;
+
+/**
+ * Quote a free-text value for bd's batch tokenizer: whitespace-separated tokens, double-quoted
+ * strings whose ONLY escapes are `\"` and `\\`. There is no newline escape and the grammar is one
+ * command per line, so embedded newlines collapse to spaces — a multi-line abandon reason keeps
+ * every word, not its line breaks.
+ */
+export function quoteBatchValue(value: string): string {
+  return `"${value.replace(/\s+/g, " ").trim().replace(/([\\"])/g, "\\$1")}"`;
+}
+
+/** Render one op as a batch line. */
+function encodeBatchOp(op: BatchOp): string {
+  // A whitespace-bearing id would silently become two tokens (a different command entirely), so it
+  // is a bug to report rather than to quote around.
+  if (!op.id || /[\s"\\]/.test(op.id)) throw new Error(`bd batch: unusable bead id ${JSON.stringify(op.id)}`);
+  if (op.op === "close") {
+    const reason = op.reason?.trim();
+    return reason ? `close ${op.id} ${quoteBatchValue(reason)}` : `close ${op.id}`;
+  }
+  const fields = BATCH_UPDATE_KEYS.filter((k) => op.fields[k] !== undefined).map(
+    (k) => `${k}=${quoteBatchValue(String(op.fields[k]))}`,
+  );
+  if (fields.length === 0) throw new Error(`bd batch: update ${op.id} sets no fields`);
+  return `update ${op.id} ${fields.join(" ")}`;
+}
+
+/** Render batch ops as the line-oriented input `bd batch` reads from stdin. */
+export function encodeBatchOps(ops: BatchOp[]): string {
+  return ops.map(encodeBatchOp).join("\n") + "\n";
+}
+
+/** The argv that applies one batch op on its own — the sequential (non-transactional) fallback. */
+export function batchOpArgs(op: BatchOp): string[] {
+  if (op.op === "close") {
+    const reason = op.reason?.trim();
+    return reason ? ["close", op.id, "--reason", reason] : ["close", op.id];
+  }
+  const args = ["update", op.id];
+  for (const key of BATCH_UPDATE_KEYS) {
+    const value = op.fields[key];
+    if (value !== undefined) args.push(`--${key}`, String(value));
+  }
+  return args;
+}
+
+/**
+ * Force the pre-batch sequential path: set `ANTON_BD_BATCH` to `0`/`off`/`false`/`no` for a bd too
+ * old to have `batch`, or to bisect a suspected batch bug. Read per call so a change lands without
+ * a module reload. Unset (the default) uses the transaction.
+ */
+export const BD_BATCH_ENV = "ANTON_BD_BATCH";
+
+export function batchEnabled(): boolean {
+  const raw = (process.env[BD_BATCH_ENV] ?? "").trim().toLowerCase();
+  return raw !== "0" && raw !== "off" && raw !== "false" && raw !== "no";
+}
+
+/**
+ * Cobra's subcommand-not-found line, verbatim: `Error: unknown command "batch" for "bd"`. bd emits
+ * nothing machine-readable for this case, so the whole gate is a heuristic on that one string —
+ * kept strict (both quoted operands, and the diagnostic must BE the line, not sit inside one) so no
+ * batch line's own text can forge it. bd reports a rolled-back op as `line 1 (close bd-9 "…"): …`,
+ * echoing the operation mid-line, so an abandon reason quoting this phrase never anchors here.
+ */
+const MISSING_BATCH_COMMAND = /^(?:Error:\s*)?unknown command "batch" for "[^"\n]+"\r?$/im;
+
+/**
+ * Does this failure mean "this bd has no `batch` subcommand" rather than "the transaction failed"?
+ * Only the former may fall back to sequential writes: bd rolls the batch back on every other error,
+ * so retrying those one-at-a-time would convert a clean no-op into exactly the half-applied unit
+ * the transaction exists to prevent.
+ *
+ * Each field is tested on its own — concatenating them would let a stderr ending in "unknown
+ * command" and an unrelated message supply half the phrase each. An unrecognized variant falls
+ * through to "the transaction failed", which is the safe direction: loud, with nothing half
+ * applied, and `ANTON_BD_BATCH=0` as the deliberate opt-out. Recheck the pattern above when
+ * upgrading bd across a cobra major — a reworded error silently costs the fallback, not safety.
+ */
+export function isMissingBatchCommand(e: unknown): boolean {
+  const err = e as { stderr?: unknown; message?: unknown } | null | undefined;
+  return [err?.stderr, err?.message].some(
+    (field) => typeof field === "string" && MISSING_BATCH_COMMAND.test(field),
+  );
+}
+
 /** Age scope for `beads.prune`: a relative window bd accepts, or "all" (every closed bead). */
 export type PruneAge = "30d" | "90d" | "all";
 
@@ -208,6 +323,16 @@ function killGraceMs(): number {
   return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_BD_KILL_GRACE_MS;
 }
 
+/** Per-invocation knobs for {@link bd}: extra env, and stdin for the commands that read it. */
+interface BdOpts {
+  /** Merged over `process.env` (e.g. BEADS_ACTOR for an attributed write). An `undefined` value
+   * REMOVES the variable rather than inheriting the server's — see {@link childEnv}. */
+  env?: Record<string, string | undefined>;
+  /** Written to bd's stdin, which is then closed. Required by `bd batch`, which reads its
+   * commands from stdin — without it bd would block on an open pipe until the step budget. */
+  stdin?: string;
+}
+
 /**
  * The server's env with `overrides` applied, where an `undefined` override REMOVES the variable
  * rather than leaving whatever the server was launched with. That deletion is the point: a gate call
@@ -239,11 +364,7 @@ function childEnv(overrides: Record<string, string | undefined>): NodeJS.Process
  * `async` so a resolveBdBin() failure (no bd on the box) surfaces as a rejection rather than a
  * synchronous throw — every call site awaits or `.catch()`es this.
  */
-async function bd(
-  cwd: string,
-  args: string[],
-  env?: Record<string, string | undefined>,
-): Promise<string> {
+async function bd(cwd: string, args: string[], opts?: BdOpts): Promise<string> {
   // Spawn bd by its resolved absolute path (anton-346): a background-launched server's PATH may not
   // reach bd's install dir, so a bare `spawn("bd", …)` fails with `spawn bd ENOENT`.
   const bin = resolveBdBin();
@@ -256,8 +377,16 @@ async function bd(
       cwd,
       // POSIX: make bd the leader of a new process group so the whole tree is reachable as one.
       detached: process.platform !== "win32",
-      ...(env ? { env: childEnv(env) } : {}),
+      ...(opts?.env ? { env: childEnv(opts.env) } : {}),
     });
+
+    if (opts?.stdin !== undefined) {
+      // EPIPE is expected whenever bd rejects its input and exits before draining the pipe (a batch
+      // whose first line is malformed): the exit code carries the verdict, so the write error is
+      // noise. Ignoring it keeps the real failure — bd's own stderr — as the one the caller sees.
+      child.stdin?.on("error", () => {});
+      child.stdin?.end(opts.stdin);
+    }
 
     // StringDecoder, not per-chunk toString: a multi-byte character split across two chunks would
     // otherwise corrupt the JSON every read path parses.
@@ -397,8 +526,8 @@ async function bd(
  */
 export const runBdForTest = bd;
 
-async function bdWrite(cwd: string, args: string[], env?: Record<string, string>): Promise<string> {
-  const stdout = await bd(cwd, args, env);
+async function bdWrite(cwd: string, args: string[], opts?: BdOpts): Promise<string> {
+  const stdout = await bd(cwd, args, opts);
   // Mark the snapshot stale (keeping last-good data) and force a fresh post-write read, so the
   // next board read never blocks on a cold `bd list` queued behind the Dolt lock.
   invalidateIssueSnapshot(cwd, true);
@@ -991,7 +1120,7 @@ export function parseGateCheck(raw: string): GateCheckResult {
 async function bdGate(repo: string, args: string[]): Promise<string> {
   if (!repo) throw new Error(`bd ${args.join(" ")}: a gate call requires the project repo as cwd`);
   const slug = await githubRepoSlug(repo).catch(() => undefined);
-  return bd(repo, args, { GH_REPO: slug });
+  return bd(repo, args, { env: { GH_REPO: slug } });
 }
 
 /** {@link bdGate} for the calls that mutate gates — invalidates the board snapshot like bdWrite. */
@@ -999,6 +1128,184 @@ async function bdGateWrite(repo: string, args: string[]): Promise<string> {
   const stdout = await bdGate(repo, args);
   invalidateIssueSnapshot(repo, true);
   return stdout;
+}
+
+// ── formula cooking (anton-brdg) ──
+//
+// `bd cook` resolves a `.formula.{toml,json}` into its steps. This is the ONLY place anton shells a
+// formula verb, so the pipeline stays swappable: the loader (anton-hrql) and the invariant-floor
+// validator (anton-6b99) consume {@link CookedFormula}, never bd stdout.
+//
+// Deliberately a READ: `--persist` is never passed. Persisting materialises a proto bead, which is a
+// write — it would need bdWrite's snapshot invalidation and a dolt sync, and anton has no use for a
+// stored proto (it cooks per run). See formula.ts for why anton cooks rather than pours.
+
+/**
+ * A step's gate — the async wait condition bd blocks it on. `type` is bd's gate kind (`human`,
+ * `timer`, `gh:run`, `gh:pr`, `bead`); `await_id` and `timeout` are that kind's parameter. Read-only
+ * here: resolving gates is anton-uk95's, so this seam reports a gate rather than acting on one.
+ */
+export interface CookedGate {
+  type: string;
+  /** What the gate waits on: a run/PR ref for `gh:*`, `<rig>:<bead-id>` for `bead`. */
+  await_id?: string;
+  /** `timer` only — the window after which the gate expires. */
+  timeout?: string;
+}
+
+/**
+ * One resolved step of a cooked formula, in declaration order.
+ *
+ * `labels` is where a step names its handler (`step:<name>`) and its prompt: `bd cook` silently
+ * DROPS step keys it doesn't recognise, so anton's per-step configuration has to ride on labels
+ * rather than a custom formula key. `needs` carries the DAG edges (a `blocks` edge once poured).
+ */
+export interface CookedStep {
+  id: string;
+  title?: string;
+  /** The bd issue type the step materialises as (`task`, `feature`, …). */
+  type?: string;
+  labels?: string[];
+  /** Ids of the steps this one depends on — bd's `needs` AND `depends_on` merged (see {@link needsOf}). */
+  needs?: string[];
+  gate?: CookedGate;
+}
+
+/** A cooked formula — the resolved pipeline the runtime walks. */
+export interface CookedFormula {
+  /** The formula's own name. bd's key is `formula`, NOT `name`: a formula written with `name`
+   * parses and then fails cook with "name is required" (verified on bd 1.1.2, anton-upfc). */
+  formula: string;
+  description?: string;
+  /** Absolute path bd cooked from — what a park message must name so an operator finds the file. */
+  source?: string;
+  steps: CookedStep[];
+}
+
+/**
+ * How a formula is cooked. `compile` keeps `{{var}}` placeholders (modelling, validation of the
+ * shipped default); `runtime` substitutes them and requires every variable to have a value —
+ * a missing one exits non-zero rather than rendering a half-resolved pipeline.
+ */
+export type CookMode = "compile" | "runtime";
+
+export interface CookOptions {
+  /** Defaults to `runtime` when `vars` are given, `compile` otherwise. */
+  mode?: CookMode;
+  /** `{{var}}` values for this run, passed as `--var k=v`. */
+  vars?: Record<string, string>;
+}
+
+/**
+ * Pure argv builder for `bd cook`, exposed for testing (like {@link buildUpdateArgs}).
+ *
+ * `--mode` is always explicit so the argv never depends on bd's implicit "any --var enables runtime"
+ * rule. That rule is also why `mode: "compile"` WITH vars is rejected rather than emitted: bd
+ * substitutes whenever a `--var` is present, so such an argv would declare an intent bd ignores.
+ */
+export function buildCookArgs(formula: string, opts: CookOptions = {}): string[] {
+  const vars = Object.entries(opts.vars ?? {});
+  if (opts.mode === "compile" && vars.length > 0) {
+    throw new Error(
+      `bd cook ${formula}: mode "compile" cannot be combined with vars — bd substitutes whenever ` +
+        `--var is present, so the placeholders would not survive. Cook without vars, or use "runtime".`,
+    );
+  }
+  for (const [k] of vars) {
+    // bd splits `--var k=v` on the FIRST `=`, so a key containing one silently sets a different
+    // variable (values may contain `=` freely). Fail loud rather than parameterise the wrong var.
+    if (!k || k.includes("=")) {
+      throw new Error(`bd cook ${formula}: invalid variable name ${JSON.stringify(k)}`);
+    }
+  }
+  const mode: CookMode = opts.mode ?? (vars.length > 0 ? "runtime" : "compile");
+  return [
+    "cook",
+    formula,
+    `--mode=${mode}`,
+    ...vars.flatMap(([k, v]) => ["--var", `${k}=${v}`]),
+    "--json",
+  ];
+}
+
+function str(v: unknown): string | undefined {
+  return typeof v === "string" && v ? v : undefined;
+}
+
+function strings(v: unknown): string[] | undefined {
+  if (!Array.isArray(v)) return undefined;
+  const out = v.filter((x): x is string => typeof x === "string");
+  return out.length > 0 ? out : undefined;
+}
+
+/**
+ * A step's prerequisites, from EITHER spelling bd accepts. bd cooks `needs` and `depends_on` through
+ * verbatim — it normalises neither into the other (measured on bd 1.1.2) — so reading only `needs`
+ * would hand the walker a formula with no edges at all: it would run in declaration order, or be
+ * rejected by the invariant floor for an ordering the file actually expressed. Merged and deduped
+ * here so every consumer downstream reads ONE field.
+ */
+function needsOf(s: Record<string, unknown> | null | undefined): string[] | undefined {
+  const merged = [...(strings(s?.needs) ?? []), ...(strings(s?.depends_on) ?? [])];
+  return merged.length > 0 ? [...new Set(merged)] : undefined;
+}
+
+function gateOf(v: unknown): CookedGate | undefined {
+  const g = v as Record<string, unknown> | null | undefined;
+  const type = str(g?.type);
+  if (!type) return undefined;
+  return { type, ...pick("await_id", str(g?.await_id)), ...pick("timeout", str(g?.timeout)) };
+}
+
+/** Include a key only when it has a value, so an absent field stays absent rather than `undefined`. */
+function pick<K extends string, V>(key: K, value: V | undefined): Partial<Record<K, V>> {
+  return value === undefined ? {} : ({ [key]: value } as Record<K, V>);
+}
+
+/**
+ * Parse `bd cook --json` into the typed pipeline, normalising each step to {@link CookedStep} so no
+ * caller ever touches bd's raw output. Fails loud on anything that is not a cooked formula —
+ * a step with no id has no handler, no park message, and no place in the DAG, so it cannot be
+ * silently dropped. `formula` names the cooked formula in every message.
+ */
+export function parseCookedFormula(raw: string, formula: string): CookedFormula {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    throw new Error(
+      `bd cook ${formula}: output was not JSON (got ${JSON.stringify(raw.slice(0, 200))})`,
+      { cause: e },
+    );
+  }
+  const doc = parsed as Record<string, unknown> | null;
+  if (!doc || typeof doc !== "object" || Array.isArray(doc)) {
+    throw new Error(`bd cook ${formula}: expected a formula object, got ${typeof parsed}`);
+  }
+  if (!Array.isArray(doc.steps)) {
+    throw new Error(`bd cook ${formula}: cooked output has no steps array`);
+  }
+  const steps = doc.steps.map((step, i): CookedStep => {
+    const s = step as Record<string, unknown> | null;
+    const id = str(s?.id)?.trim();
+    if (!id) {
+      throw new Error(`bd cook ${formula}: step ${i} has no id — every step must declare one`);
+    }
+    return {
+      id,
+      ...pick("title", str(s?.title)),
+      ...pick("type", str(s?.type)),
+      ...pick("labels", strings(s?.labels)),
+      ...pick("needs", needsOf(s)),
+      ...pick("gate", gateOf(s?.gate)),
+    };
+  });
+  return {
+    formula: str(doc.formula) ?? formula,
+    ...pick("description", str(doc.description)),
+    ...pick("source", str(doc.source)),
+    steps,
+  };
 }
 
 export const beads = {
@@ -1116,6 +1423,31 @@ export const beads = {
     return parsed.issue ?? parsed;
   },
 
+  /** Pure argv builder for cook, exposed for testing (see buildUpdateArgs). */
+  buildCookArgs,
+
+  /**
+   * Resolve a formula into its steps (`bd cook`, anton-brdg) — the ONLY place anton shells a formula
+   * verb. `formula` is a path to a `.formula.{toml,json}` or a bare name bd resolves through its
+   * search paths (`.beads/formulas/` first). Returns the typed pipeline; callers never parse stdout.
+   *
+   * A cook failure (unreadable file, unknown key, a runtime cook missing a variable) rejects with
+   * {@link bd}'s error, whose message already carries the full argv — formula path included — and
+   * bd's stderr, so a park message can name the file without this wrapper reformatting it.
+   *
+   * `exec` is injectable for tests, like {@link runDoltSync}; production passes none, so every cook
+   * goes through the same bounded, process-group-reaped spawn as the rest of the seam.
+   */
+  cook: async (
+    cwd: string,
+    formula: string,
+    opts: CookOptions = {},
+    exec: BdExec = bd,
+  ): Promise<CookedFormula> => {
+    const out = await exec(cwd, buildCookArgs(formula, opts));
+    return parseCookedFormula(out, formula);
+  },
+
   /** All parent-child + blocks + related edges among the given beads, from inline `dependencies`. */
   edgesOf(beads: Bead[]): Array<{ from: string; to: string; type: string }> {
     const out: Array<{ from: string; to: string; type: string }> = [];
@@ -1207,7 +1539,7 @@ export const beads = {
    * note header itself (see beads/notes.ts), not from bd.
    */
   note: (cwd: string, id: string, text: string, actor?: string) =>
-    bdWrite(cwd, ["note", id, text], actor ? { BEADS_ACTOR: actor } : undefined),
+    bdWrite(cwd, ["note", id, text], actor ? { env: { BEADS_ACTOR: actor } } : undefined),
 
   /**
    * Append an entry to a bead's comment thread (`bd comment`). Unlike {@link note} — one blob that
@@ -1236,6 +1568,34 @@ export const beads = {
     ]),
 
   close: (cwd: string, id: string) => bdWrite(cwd, ["close", id]),
+
+  /**
+   * Apply several board writes as ONE `bd batch` transaction (anton-aijz): every op lands or none
+   * does, so a mid-flight failure leaves each bead in its prior state instead of stranding a
+   * half-closed unit. Empty ops spawn nothing.
+   *
+   * Rejects on a real failure — with the batch already rolled back, so the caller's retry starts
+   * from the state it expected. The ONE tolerated failure is a bd with no `batch` subcommand: those
+   * ops are re-applied sequentially (loudly, since that path is not atomic), which is also what
+   * `ANTON_BD_BATCH=0` selects up front.
+   */
+  batch: async (cwd: string, ops: BatchOp[]): Promise<void> => {
+    if (ops.length === 0) return;
+    if (batchEnabled()) {
+      try {
+        await bdWrite(cwd, ["batch", "--json"], { stdin: encodeBatchOps(ops) });
+        return;
+      } catch (e) {
+        if (!isMissingBatchCommand(e)) throw e;
+        console.warn(
+          `[beads.batch] this bd has no 'batch' subcommand — applying ${ops.length} writes ` +
+            `sequentially, which is NOT all-or-nothing. Upgrade bd, or set ${BD_BATCH_ENV}=0 to ` +
+            `choose the sequential path deliberately and silence this.`,
+        );
+      }
+    }
+    for (const op of ops) await bdWrite(cwd, batchOpArgs(op));
+  },
 
   /**
    * Permanently delete a bead and clean up references (`bd delete --force`). `cascade` also
@@ -1283,32 +1643,52 @@ export const beads = {
   isDeferred: (b: Bead) => b.status === "deferred",
 
   /**
-   * Abandon a bead — the won't-do outcome (anton-6xj0). Two writes, in this order: `bd close
-   * --reason "abandoned: <why>"` (the reason is the durable record of the decision, so it is
-   * REQUIRED here rather than optional) then the `abandoned` label. Closing first means a crash
-   * between the two leaves the bead closed-without-the-label — visible as done, which understates
-   * the decision but never re-queues work a human killed; the label write is retried by re-running
-   * abandon. Deliberately NOT a delete (that destroys the history a won't-do decision is made of)
-   * and NOT a plain close (that reads as shipped).
+   * Abandon a whole unit of work — the won't-do outcome (anton-6xj0), applied as a transaction
+   * (anton-aijz). A cascade passes every bead it settles (descendants first, the target last); a
+   * single abandon is the one-entry case. Each reason is REQUIRED — it is the durable record of the
+   * decision — and every reason is validated before the first write, so a blank one writes nothing.
+   * Deliberately NOT a delete (that destroys the history a won't-do decision is made of) and NOT a
+   * plain close (that reads as shipped).
+   *
+   * Two phases, in this order:
+   *   1. label each bead `abandoned` and drop its stage label. The stage is a claim on in-flight
+   *      work — an abandoned bead has none, and leaving `stage:implementing` behind (set by the run
+   *      that was killed to make room for this abandon) would keep it reading as in-flight. bd's
+   *      batch grammar has no label key, so these stay N separate updates.
+   *   2. close them all, with their reasons, in ONE `bd batch` — all-or-nothing.
+   *
+   * Label-then-close (the reverse of the original single-bead order) is what makes a cascade
+   * recoverable. The only state a crash can leave is "open + abandoned", which no run picks up —
+   * execute-epic gates on the LABEL, not the status — and which re-running abandon finishes,
+   * because an open bead is still found by openDescendants and still passes the already-closed
+   * guard. Closing first would leave N beads closed-without-the-label, reading as SHIPPED, with no
+   * path left to correct them.
    */
-  abandon: async (cwd: string, id: string, reason: string): Promise<void> => {
-    const why = reason.trim();
-    if (!why) throw new Error("abandon requires a reason");
-    await bdWrite(cwd, ["close", id, "--reason", `abandoned: ${why}`]);
-    // One update: tag it abandoned and drop any stage label. The stage is a claim on in-flight work
-    // — an abandoned bead has none, and leaving `stage:implementing` behind (the run that was
-    // killed to make room for this abandon set it) would keep it reading as in-flight work.
-    await bdWrite(cwd, [
-      "update",
-      id,
-      "--add-label",
-      LABELS.abandoned,
-      "--remove-label",
-      LABELS.stage("implementing"),
-      "--remove-label",
-      LABELS.stage("in-review"),
-    ]);
+  abandonAll: async (cwd: string, entries: Array<{ id: string; reason: string }>): Promise<void> => {
+    const closes = entries.map(({ id, reason }): BatchOp => {
+      const why = reason.trim();
+      if (!why) throw new Error("abandon requires a reason");
+      return { op: "close", id, reason: `abandoned: ${why}` };
+    });
+    if (closes.length === 0) return;
+    for (const { id } of entries) {
+      await bdWrite(cwd, [
+        "update",
+        id,
+        "--add-label",
+        LABELS.abandoned,
+        "--remove-label",
+        LABELS.stage("implementing"),
+        "--remove-label",
+        LABELS.stage("in-review"),
+      ]);
+    }
+    await beads.batch(cwd, closes);
   },
+
+  /** Abandon a single bead — see {@link beads.abandonAll}, of which this is the one-entry case. */
+  abandon: (cwd: string, id: string, reason: string): Promise<void> =>
+    beads.abandonAll(cwd, [{ id, reason }]),
 
   /** A bead a human abandoned (closed + `abandoned`) — closed, but explicitly NOT delivered. */
   isAbandoned: (b: Bead) => b.labels?.includes(LABELS.abandoned) ?? false,
@@ -1323,7 +1703,7 @@ export const beads = {
    * instance — not whatever unix user the server happens to run as.
    */
   claim: (cwd: string, id: string, actor?: string) =>
-    bdWrite(cwd, ["update", id, "--claim"], actor ? { BEADS_ACTOR: actor } : undefined),
+    bdWrite(cwd, ["update", id, "--claim"], actor ? { env: { BEADS_ACTOR: actor } } : undefined),
 
   /**
    * Set a bead's assignee WITHOUT touching status (`bd assign <id> <actor>`). This is the

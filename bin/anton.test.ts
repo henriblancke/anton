@@ -491,10 +491,15 @@ describe("provisionAgentsSkills (into a temp ~/.claude)", () => {
     expect(first.installed).toBe(INSTALLED_SKILLS.length + 1); // every installed skill + 1 agent
     for (const req of INSTALLED_SKILLS) expect(await exists(skillPath(req))).toBe(true);
     expect(await exists(join(claudeRoot, "agents", "nextjs.md"))).toBe(true);
-    // setup's bundled templates travel with the skill directory (anton-olh).
-    expect(
-      await exists(join(claudeRoot, "skills", "setup", "templates", ".product", "PRODUCT.md")),
-    ).toBe(true);
+    // setup's bundled templates travel with the skill directory (anton-olh) — the `.product/` layer
+    // and the `.beads/formulas/` assets `/setup` installs into a project (anton-8mnr, anton-hrql).
+    for (const rel of [
+      [".product", "PRODUCT.md"],
+      [".beads", "formulas", "anton-bead.formula.json"],
+      [".beads", "formulas", "anton-run.formula.toml"],
+    ]) {
+      expect(await exists(join(claudeRoot, "skills", "setup", "templates", ...rel))).toBe(true);
+    }
 
     // Re-run: everything already present, zero writes.
     const second = await provisionAgentsSkills(["--agents", "nextjs"], { claudeRoot, appRoot: REPO_ROOT });

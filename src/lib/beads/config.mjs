@@ -2,8 +2,8 @@
  * Reusable beads team-config for a target repo (anton-uez). The single config path shared by the
  * `anton init` CLI (bin/anton.mjs) and `addProject` (src/lib/projects.ts) so a repo configured from
  * the terminal and one added through the UI/API converge to the SAME end state: bd init (when
- * absent) → config.yaml enforcement → .beads/.gitignore → bead formula (anton-8mnr) → [Dolt remote
- * wiring — anton-43b].
+ * absent) → config.yaml enforcement → .beads/.gitignore → formulas (bead skeleton anton-8mnr, run
+ * pipeline anton-hrql) → [Dolt remote wiring — anton-43b].
  *
  * Plain JS, node built-ins only (fs + child_process), so it imports cleanly from both the pure-node
  * CLI and the TypeScript server. See DESIGN.md §3 (beads is the work source of truth).
@@ -300,18 +300,33 @@ export function untrackBeadsExports(dir, entries = BEADS_GITIGNORE_ENTRIES) {
 export const BEAD_FORMULA_FILENAME = "anton-bead.formula.json";
 
 /**
- * Path segments of the bundled bead formula, relative to anton's package root (anton-8mnr). It rides
- * along in the `setup` skill's template tree so `/setup`, `anton setup`, and `anton init` all install
- * the SAME file, and `src/lib/beads/formula.ts` resolves the same segments against the server's cwd.
+ * The run-formula asset's filename (anton-hrql) — the PIPELINE anton walks, as opposed to the bead
+ * SKELETON above. Same install shape, same no-clobber rule, same `.beads/formulas/` home, so a
+ * project owns its pipeline the way it already owns its bead shape.
  */
-export const BEAD_FORMULA_RELPATH = [
-  "skills",
-  "setup",
-  "templates",
-  ".beads",
-  "formulas",
-  BEAD_FORMULA_FILENAME,
-];
+export const RUN_FORMULA_FILENAME = "anton-run.formula.toml";
+
+/**
+ * What a formula NAME may be — the `<name>` in `<name>.formula.toml`, as a project's per-label
+ * variant map (anton-aa3m) addresses it. Letters, digits, `.`, `-` and `_`, starting and ending
+ * alphanumeric: no path separator, and `..` cannot match, so a mapping can never point the loader
+ * outside `.beads/formulas/`.
+ *
+ * Lives here, with the formula filenames it is the other half of, because it is enforced at two
+ * boundaries a run apart — the settings API that accepts the map, and the loader that reads the file
+ * — and two copies would drift into a mapping that passes one and parks at the other.
+ */
+export const FORMULA_NAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
+
+/**
+ * Path segments of a bundled formula, relative to anton's package root (anton-8mnr). Both ride along
+ * in the `setup` skill's template tree so `/setup`, `anton setup`, and `anton init` all install the
+ * SAME files, and the server-side loaders resolve the same segments against the server's cwd.
+ */
+const formulaRelpath = (filename) => ["skills", "setup", "templates", ".beads", "formulas", filename];
+
+export const BEAD_FORMULA_RELPATH = formulaRelpath(BEAD_FORMULA_FILENAME);
+export const RUN_FORMULA_RELPATH = formulaRelpath(RUN_FORMULA_FILENAME);
 
 /** anton's package root, resolved from this module rather than cwd (the CLI runs from anywhere). */
 const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
@@ -321,11 +336,16 @@ export function bundledBeadFormulaPath(appRoot = PACKAGE_ROOT) {
   return join(appRoot, ...BEAD_FORMULA_RELPATH);
 }
 
+/** Absolute path to the bundled run formula shipped with this anton install (anton-hrql). */
+export function bundledRunFormulaPath(appRoot = PACKAGE_ROOT) {
+  return join(appRoot, ...RUN_FORMULA_RELPATH);
+}
+
 /**
- * Install the bead formula into `<repo>/.beads/formulas/`, NO-CLOBBER (anton-8mnr). A project-local
- * copy always wins: once a team has tuned its own bead shape, re-running setup must never overwrite
- * it. Living under `.beads/` (which git tracks — only the JSONL exports and the Dolt runtime are
- * ignored) is what carries the shape to every clone and teammate.
+ * Install a bundled formula into `<repo>/.beads/formulas/`, NO-CLOBBER (anton-8mnr). A project-local
+ * copy always wins: once a team has tuned its own bead shape or pipeline, re-running setup must never
+ * overwrite it. Living under `.beads/` (which git tracks — only the JSONL exports and the Dolt runtime
+ * are ignored) is what carries it to every clone and teammate.
  *
  * Never CREATES the workspace: a formula under a `.beads/` that no `bd init` made is a half-
  * workspace, and every downstream probe reads the directory's mere existence as "this is a beads
@@ -333,15 +353,15 @@ export function bundledBeadFormulaPath(appRoot = PACKAGE_ROOT) {
  * origin). So an absent `.beads/` is a skip, not a mkdir.
  *
  * Returns { status, detail? } — "installed" | "already" | "missing-asset" (the bundled file isn't in
- * this install — a warning, never fatal: anton's own renderer falls back to its packaged copy) |
+ * this install — a warning, never fatal: anton's own loaders fall back to their packaged copy) |
  * "no-workspace" | "failed".
  *
  * A filesystem error (read-only checkout, no write permission, transient I/O) is REPORTED as
  * "failed", never thrown: this is one best-effort step among a dozen in setup/registration, and an
- * unwritable `.beads/formulas/` must not abort the whole run over a skeleton anton can fall back to.
+ * unwritable `.beads/formulas/` must not abort the whole run over an asset anton can fall back to.
  */
-export function ensureBeadFormula(beadsDir, src = bundledBeadFormulaPath()) {
-  const dest = join(beadsDir, "formulas", BEAD_FORMULA_FILENAME);
+function ensureFormula(beadsDir, filename, src) {
+  const dest = join(beadsDir, "formulas", filename);
   if (existsSync(dest)) return { status: "already" };
   if (!existsSync(beadsDir)) return { status: "no-workspace" };
   if (!existsSync(src)) return { status: "missing-asset" };
@@ -352,6 +372,16 @@ export function ensureBeadFormula(beadsDir, src = bundledBeadFormulaPath()) {
     return { status: "failed", detail: err?.message || String(err) };
   }
   return { status: "installed" };
+}
+
+/** Install the bead skeleton every bead anton creates is rendered from (anton-8mnr). */
+export function ensureBeadFormula(beadsDir, src = bundledBeadFormulaPath()) {
+  return ensureFormula(beadsDir, BEAD_FORMULA_FILENAME, src);
+}
+
+/** Install the run pipeline anton walks (anton-hrql). */
+export function ensureRunFormula(beadsDir, src = bundledRunFormulaPath()) {
+  return ensureFormula(beadsDir, RUN_FORMULA_FILENAME, src);
 }
 
 /**
@@ -693,10 +723,10 @@ export function detectHooksManager(dir, priorHooksPath = null) {
 /**
  * Run the full beads team-config path for `dir`, idempotently. Steps: workspace creation
  * (`bd init` when `.beads/` is absent, `bd bootstrap` for a fresh clone with no local Dolt DB, else
- * no-op) → config.yaml enforcement → `.beads/.gitignore` → bead formula → Dolt remote wiring. Every step is
- * best-effort and its outcome is collected in `steps`/`errors` rather than thrown — the caller
- * decides how loud to be (the CLI prints each step; addProject logs a summary) and a step failure
- * never aborts the caller.
+ * no-op) → config.yaml enforcement → `.beads/.gitignore` → formulas (bead skeleton + run pipeline) →
+ * Dolt remote wiring. Every step is best-effort and its outcome is collected in `steps`/`errors`
+ * rather than thrown — the caller decides how loud to be (the CLI prints each step; addProject logs
+ * a summary) and a step failure never aborts the caller.
  *
  * Returns:
  *   { configured, skipped, reason?, ranInit, ranBootstrap, steps: [{name,status,detail?}], errors, hasBeads }
@@ -707,7 +737,7 @@ export function detectHooksManager(dir, priorHooksPath = null) {
  *
  * @param {string} dir absolute path to the target repo
  * @param {{ prefix?: string|null, log?: (msg: string) => void, appRoot?: string }} [opts]
- *   `appRoot` anchors the bundled bead-formula asset. Default: this module's package root — right
+ *   `appRoot` anchors the bundled formula assets. Default: this module's package root — right
  *   for the CLI, which runs from anywhere. A caller inside the Next server bundle MUST pass its
  *   own anchor (`process.cwd()`): there `import.meta.url` points at a build chunk, so the default
  *   resolves nowhere and registration reports `missing-asset` instead of installing the formula.
@@ -844,21 +874,26 @@ export function configureBeadsForRepo(dir, opts = {}) {
     steps.push({ name: "untrack exports", status: "already" });
   }
 
-  // 3c. Install the bead formula so every bead this project creates starts contract-shaped
-  //     (anton-8mnr). No-clobber — a project that tuned its own skeleton keeps it.
-  const formulaSrc = bundledBeadFormulaPath(appRoot);
-  const formula = ensureBeadFormula(beadsDir, formulaSrc);
-  steps.push({ name: "bead formula", status: formula.status, detail: formula.detail });
-  if (formula.status === "missing-asset") {
-    emit(`bead formula asset missing from this install (${formulaSrc}) — skipping.`);
-  } else if (formula.status === "no-workspace") {
-    // Only reachable if the init/bootstrap above reported success without producing `.beads/`.
-    emit("no .beads workspace to install the bead formula into — skipping.");
-  } else if (formula.status === "failed") {
-    emit(`could not install the bead formula: ${formula.detail}`);
-    errors.push(`could not install the bead formula: ${formula.detail}`);
-  } else {
-    emit(`.beads/formulas/${BEAD_FORMULA_FILENAME} (${formula.status})`);
+  // 3c. Install anton's formulas: the bead skeleton, so every bead this project creates starts
+  //     contract-shaped (anton-8mnr), and the run pipeline anton walks (anton-hrql). No-clobber —
+  //     a project that tuned either one keeps it.
+  for (const asset of [
+    { label: "bead formula", filename: BEAD_FORMULA_FILENAME, src: bundledBeadFormulaPath(appRoot), install: ensureBeadFormula },
+    { label: "run formula", filename: RUN_FORMULA_FILENAME, src: bundledRunFormulaPath(appRoot), install: ensureRunFormula },
+  ]) {
+    const formula = asset.install(beadsDir, asset.src);
+    steps.push({ name: asset.label, status: formula.status, detail: formula.detail });
+    if (formula.status === "missing-asset") {
+      emit(`${asset.label} asset missing from this install (${asset.src}) — skipping.`);
+    } else if (formula.status === "no-workspace") {
+      // Only reachable if the init/bootstrap above reported success without producing `.beads/`.
+      emit(`no .beads workspace to install the ${asset.label} into — skipping.`);
+    } else if (formula.status === "failed") {
+      emit(`could not install the ${asset.label}: ${formula.detail}`);
+      errors.push(`could not install the ${asset.label}: ${formula.detail}`);
+    } else {
+      emit(`.beads/formulas/${asset.filename} (${formula.status})`);
+    }
   }
 
   // 4. Wire the git-backed Dolt remote (remote add → hydrate pull → publish push). Shared here so

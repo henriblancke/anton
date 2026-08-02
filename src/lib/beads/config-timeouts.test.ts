@@ -26,8 +26,15 @@ import {
 
 const CONFIG_SRC = join(process.cwd(), "src/lib/beads/config.mjs");
 
-/** Budget cap for the hang tests: long enough to clear node startup, short enough to stay a unit test. */
-const CAP_MS = "400";
+/**
+ * Budget cap for the hang tests: long enough to clear node startup, short enough to stay a unit test.
+ * The cap applies to EVERY probe, healthy ones included, and the stubs are node scripts — so it has
+ * to clear node's startup on a machine running the whole suite in parallel, not on an idle one. At
+ * 400ms a loaded box killed the healthy probes too and `configured` flipped false; the headroom
+ * costs a second per wedged probe and gives up nothing, since a probe that lost its timeout hangs
+ * for 60s and still blows NO_HANG_MS.
+ */
+const CAP_MS = "2000";
 /** A killed probe must return in ~CAP_MS; anything near this bound is a lost timeout, not slowness. */
 const NO_HANG_MS = 15_000;
 

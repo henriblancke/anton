@@ -16,14 +16,31 @@ export interface FakeSpawnCall {
   file: string;
   args: string[];
   options: Record<string, unknown> | undefined;
+  /** Everything the caller wrote to the child's stdin — undefined when it never wrote any. */
+  stdin?: string;
 }
 
-/** A fake child process: an EventEmitter carrying the two output streams and a no-op kill. */
+/** A fake child process: an EventEmitter carrying the three stdio streams and a no-op kill. */
 class FakeChild extends EventEmitter {
   stdout = Object.assign(new EventEmitter(), { destroy: () => {} });
   stderr = Object.assign(new EventEmitter(), { destroy: () => {} });
+  /** Records what the caller piped in (`bd batch` reads its commands from stdin) onto its call. */
+  stdin: EventEmitter & { write(c?: unknown): boolean; end(c?: unknown): void; destroy(): void };
   pid = 4242;
   killed = false;
+
+  constructor(call: FakeSpawnCall) {
+    super();
+    const record = (chunk?: unknown) => {
+      if (chunk === undefined) return;
+      call.stdin = (call.stdin ?? "") + String(chunk);
+    };
+    this.stdin = Object.assign(new EventEmitter(), {
+      write: (c?: unknown) => (record(c), true),
+      end: record,
+      destroy: () => {},
+    });
+  }
 
   kill(): boolean {
     this.killed = true;
@@ -31,18 +48,37 @@ class FakeChild extends EventEmitter {
   }
 }
 
+/** What a faked invocation answers with. Every field is optional — the default is a clean exit-0. */
+export interface FakeSpawnReply {
+  code?: number;
+  stdout?: string;
+  stderr?: string;
+}
+
 /**
  * Build a `spawn` replacement that records every invocation into `calls` and answers each with a
  * clean exit-0 and no output. Pair it with `vi.mock("node:child_process", …)`.
+ *
+ * `respond` overrides that answer per call — the seam for suites that need a wrapper's FAILURE
+ * path (a non-zero exit plus the stderr the wrapper matches on), not just its argv.
  */
-export function makeFakeSpawn(calls: FakeSpawnCall[]) {
+export function makeFakeSpawn(
+  calls: FakeSpawnCall[],
+  respond?: (call: FakeSpawnCall) => FakeSpawnReply | undefined,
+) {
   return (file: string, args: string[] = [], options?: Record<string, unknown>) => {
-    calls.push({ file, args, options });
-    const child = new FakeChild();
+    const call: FakeSpawnCall = { file, args, options };
+    calls.push(call);
+    const child = new FakeChild(call);
+    // Resolved at spawn time, not at emit time: a suite that rearms `respond` between cases must
+    // not have that land on a child already in flight.
+    const { code = 0, stdout, stderr } = respond?.(call) ?? {};
     // Async, so listeners registered after the spawn call still see every event.
     setImmediate(() => {
-      child.emit("exit", 0, null);
-      child.emit("close", 0, null);
+      if (stdout) child.stdout.emit("data", Buffer.from(stdout));
+      if (stderr) child.stderr.emit("data", Buffer.from(stderr));
+      child.emit("exit", code, null);
+      child.emit("close", code, null);
     });
     return child;
   };

@@ -1,7 +1,8 @@
 /**
- * Argv-level unit test for the won't-do primitive (anton-6xj0): `beads.abandon` must issue bd's own
- * `close --reason` (the decision's durable record) followed by the `abandoned` label — beads has no
- * cancelled status, so that pair IS the outcome. `spawn` is faked so no bd is launched.
+ * Argv-level unit test for the won't-do primitive (anton-6xj0): `beads.abandon` must write the
+ * `abandoned` label and then bd's own `close --reason` (the decision's durable record) — beads has
+ * no cancelled status, so that pair IS the outcome. The close goes through `bd batch` so a cascade
+ * settles as one transaction (anton-aijz). `spawn` is faked so no bd is launched.
  * Mirrors bd-defer.test.ts.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -13,7 +14,12 @@ import { BD_BIN_ENV, resetBdBinCache } from "./bd-bin";
 const BD = process.execPath;
 
 const { spawned } = vi.hoisted(() => ({
-  spawned: [] as Array<{ file: string; args: string[]; options: Record<string, unknown> | undefined }>,
+  spawned: [] as Array<{
+    file: string;
+    args: string[];
+    options: Record<string, unknown> | undefined;
+    stdin?: string;
+  }>,
 }));
 
 // Only `spawn` is faked: bd.ts's own imports (git/remote's execFile) must keep working, so the rest
@@ -38,10 +44,9 @@ describe("beads.abandon", () => {
     resetBdBinCache();
   });
 
-  it("closes with the reason, then tags the bead abandoned and clears its stage", async () => {
+  it("tags the bead abandoned and clears its stage, then closes it with the reason", async () => {
     await beads.abandon("/repo", "bd-1", "superseded by bd-9");
     expect(calls()).toEqual([
-      [BD, "close", "bd-1", "--reason", "abandoned: superseded by bd-9"],
       [
         BD,
         "update",
@@ -53,12 +58,14 @@ describe("beads.abandon", () => {
         "--remove-label",
         "stage:in-review",
       ],
+      [BD, "batch", "--json"],
     ]);
+    expect(spawned[1].stdin).toBe('close bd-1 "abandoned: superseded by bd-9"\n');
   });
 
   it("trims the reason", async () => {
     await beads.abandon("/repo", "bd-1", "  no longer needed \n");
-    expect(calls()[0]).toContain("abandoned: no longer needed");
+    expect(spawned[1].stdin).toContain("abandoned: no longer needed");
   });
 
   it("refuses a blank reason — and writes nothing", async () => {

@@ -2,7 +2,7 @@
  * Read-only access to the machine-local `runs` table. Runs are execution plumbing (worktree,
  * lease, model, agent); stage/PR live in beads. See DESIGN.md §3.
  */
-import { and, count, desc, eq, inArray } from "drizzle-orm";
+import { and, count, desc, eq, inArray, isNotNull } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import type { AntonDb, Clock } from "./jobs/queue";
 
@@ -91,6 +91,10 @@ export async function listRunsPaged(
 export interface RunDetail extends RunSummary {
   leaseExpiresAt?: number;
   error?: string;
+  /** The pipeline this run walked — the formula file it was read from (anton-aa3m). */
+  formula?: string;
+  /** The bead label that selected that pipeline; absent ⇒ the project/bundled default. */
+  formulaVariant?: string;
 }
 
 export async function getRunDetail(
@@ -108,6 +112,8 @@ export async function getRunDetail(
     ...toSummary(row),
     leaseExpiresAt: toEpoch(row.leaseExpiresAt),
     error: row.error ?? undefined,
+    formula: row.formula ?? undefined,
+    formulaVariant: row.formulaVariant ?? undefined,
   };
 }
 
@@ -151,6 +157,9 @@ export type RunPatch = Partial<{
   branch: string | null;
   model: string | null;
   agentTag: string | null;
+  /** The pipeline this run walked (anton-aa3m) — written once the formula is selected + validated. */
+  formula: string | null;
+  formulaVariant: string | null;
   attempts: number;
   error: string | null;
   endedAt: number; // ms; converted to seconds
@@ -259,6 +268,56 @@ export async function listRunsByStatus(
     .from(schema.runs)
     .where(and(eq(schema.runs.projectId, projectId), inArray(schema.runs.status, [...statuses])))
     .orderBy(schema.runs.updatedAt);
+}
+
+/** The pipeline choice a run recorded (anton-aa3m) — what a later attempt on the same branch pins to. */
+export interface RecordedFormula {
+  /**
+   * The formula that run walked: an absolute path for a project-local pipeline, or the
+   * `bundled:` sentinel for anton's own asset (whose path belongs to the install, not the project —
+   * see `BUNDLED_FORMULA_SOURCE`).
+   */
+  source: string;
+  /** The bead label that selected it; absent ⇒ the project/bundled default. */
+  variant?: string;
+}
+
+/**
+ * The pipeline the most recent attempt on this epic's BRANCH recorded, whatever became of that run.
+ *
+ * A run's pipeline is chosen once and honored for the life of the work, not re-selected per attempt
+ * — but attempts do not all share a run row. An ordinary handler error settles the row `failed`, and
+ * `findOpenRunForEpic` returns only open ones, so the runner's automatic retry gets a FRESH row while
+ * reusing the prior attempt's worktree and skipping the tickets it already committed. Selecting again
+ * there would let a label or a variant mapping edited during the retry backoff switch pipelines
+ * mid-branch: the committed tickets walked one formula, the rest walk another.
+ *
+ * So the branch is the unit of continuity — the same thing the retry itself resumes by. A run on a
+ * branch no prior run recorded a formula for (a first run, or a new branch prefix) selects normally.
+ */
+export async function findRunFormulaForBranch(
+  db: AntonDb,
+  projectId: string,
+  epicBeadId: string,
+  branch: string,
+): Promise<RecordedFormula | undefined> {
+  const rows = await db
+    .select()
+    .from(schema.runs)
+    .where(
+      and(
+        eq(schema.runs.projectId, projectId),
+        eq(schema.runs.epicBeadId, epicBeadId),
+        eq(schema.runs.branch, branch),
+        isNotNull(schema.runs.formula),
+      ),
+    )
+    // `updatedAt` is second-granular, so two attempts inside one second can tie; `startedAt` breaks it.
+    .orderBy(desc(schema.runs.updatedAt), desc(schema.runs.startedAt))
+    .limit(1);
+  const row = rows[0];
+  if (!row?.formula) return undefined;
+  return { source: row.formula, variant: row.formulaVariant ?? undefined };
 }
 
 /** The most-recent still-open run for an epic — used to resume rather than start a duplicate. */

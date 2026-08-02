@@ -1,6 +1,13 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
+import {
+  ArrowRightIcon,
+  ChevronDownIcon,
+  ChevronUpIcon,
+  PlusIcon,
+  XIcon,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import type { Project } from "@/lib/types";
@@ -10,6 +17,20 @@ import { Toggle } from "@/components/atoms";
 import { agentDotClass } from "@/components/board/board-utils";
 import { DeleteProjectDialog } from "@/components/settings/delete-project-dialog";
 import { PruneBeadsSection } from "@/components/settings/prune-beads-section";
+
+/**
+ * One label→formula mapping (anton-aa3m), mirrored from the server's FormulaVariant. Local for the
+ * same reason as EditableSettings: this client module never imports server code.
+ */
+interface FormulaVariant {
+  label: string;
+  formula: string;
+}
+
+/** A variant row being edited: the mapping plus a stable local id used only as the React key. */
+interface VariantRow extends FormulaVariant {
+  id: string;
+}
 
 /** Settings the UI can edit today. Kept local so this client module never imports server code. */
 interface EditableSettings {
@@ -25,6 +46,8 @@ interface EditableSettings {
   lintCommand?: string;
   typecheckCommand?: string;
   buildCommand?: string;
+  /** Per-label pipeline variants (anton-aa3m), in precedence order — first matching label wins. */
+  formulaVariants?: FormulaVariant[];
   concurrency?: number;
   jobTimeoutMinutes?: number;
   maxRetries?: number;
@@ -176,6 +199,14 @@ export function SettingsView({
   const [lintCommand, setLintCommand] = useState(settings.lintCommand ?? "");
   const [typecheckCommand, setTypecheckCommand] = useState(settings.typecheckCommand ?? "");
   const [buildCommand, setBuildCommand] = useState(settings.buildCommand ?? "");
+  // Per-label pipeline variants (anton-aa3m). The array order IS the precedence, so edits preserve
+  // it and the row controls move an entry rather than re-sorting behind the operator's back. Rows
+  // carry a stable local id purely as a React key — reordering with index keys would move the
+  // operator's cursor between inputs.
+  const [variantRows, setVariantRows] = useState<VariantRow[]>(() =>
+    (settings.formulaVariants ?? []).map((v, i) => ({ id: `v${i}`, ...v })),
+  );
+  const nextVariantId = useRef(variantRows.length);
   const [saving, setSaving] = useState(false);
 
   /**
@@ -200,6 +231,22 @@ export function SettingsView({
       setAutomations((p) => ({ ...p, [id]: prev }));
       toast.error(err instanceof Error ? err.message : `Failed to update ${id}`);
     }
+  }
+
+  function patchVariant(id: string, patch: Partial<FormulaVariant>) {
+    setVariantRows((rows) => rows.map((r) => (r.id === id ? { ...r, ...patch } : r)));
+  }
+
+  /** Move a mapping one place up or down — the list's order is the precedence an operator tunes. */
+  function moveVariant(id: string, delta: -1 | 1) {
+    setVariantRows((rows) => {
+      const at = rows.findIndex((r) => r.id === id);
+      const to = at + delta;
+      if (at < 0 || to < 0 || to >= rows.length) return rows;
+      const next = [...rows];
+      [next[at], next[to]] = [next[to], next[at]];
+      return next;
+    });
   }
 
   function toggleAgent(agent: string) {
@@ -237,6 +284,12 @@ export function SettingsView({
           lintCommand: lintCommand.trim() || null,
           typecheckCommand: typecheckCommand.trim() || null,
           buildCommand: buildCommand.trim() || null,
+          // Per-label pipeline variants (anton-aa3m), in the order shown — that order is the
+          // precedence. A half-filled row is scaffolding, not a mapping, so it's dropped rather
+          // than 400ing the whole save; [] clears the map (every run walks the project's default).
+          formulaVariants: variantRows
+            .map((v) => ({ label: v.label.trim(), formula: v.formula.trim() }))
+            .filter((v) => v.label && v.formula),
           concurrency,
           jobTimeoutMinutes,
           maxRetries,
@@ -500,6 +553,109 @@ export function SettingsView({
               Each gate runs in the ticket&apos;s worktree in order (test → lint → typecheck →
               build). Empty = skipped. These are the operator-pinned backstop; the agent still
               self-verifies. The same gates run before review-fix pushes.
+            </span>
+          </section>
+
+          <Divider />
+
+          {/* Pipeline variants — let the work's own labels pick the pipeline (anton-aa3m) */}
+          <section className="flex flex-col gap-3.5">
+            <div className="flex items-baseline gap-2.5">
+              <h2 className="text-[15px] font-semibold">Pipeline variants</h2>
+              <span className="text-xs text-subtle">
+                run a different formula for beads carrying a label · first match wins
+              </span>
+            </div>
+
+            <div className="flex max-w-2xl flex-col gap-2">
+              {variantRows.length === 0 ? (
+                <p className="rounded-[10px] border border-dashed border-border px-3 py-3 text-[11.5px] text-subtle">
+                  No variants — every run walks{" "}
+                  <code className="font-mono text-[11px]">.beads/formulas/anton-run.formula.toml</code>.
+                </p>
+              ) : (
+                <ul className="flex flex-col gap-2">
+                  {variantRows.map((row, i) => (
+                    <li
+                      key={row.id}
+                      className="flex items-center gap-2 rounded-[10px] border border-border bg-card px-2.5 py-2"
+                    >
+                      <span className="w-4 shrink-0 text-center font-mono text-[10px] text-subtle">
+                        {i + 1}
+                      </span>
+                      <input
+                        type="text"
+                        value={row.label}
+                        onChange={(e) => patchVariant(row.id, { label: e.target.value })}
+                        placeholder="risk:high"
+                        maxLength={120}
+                        aria-label={`Variant ${i + 1} label`}
+                        className="min-w-0 flex-1 rounded-lg border border-border bg-background px-2.5 py-1.5 font-mono text-[12px] text-foreground outline-none placeholder:text-subtle focus:border-primary/60"
+                      />
+                      <ArrowRightIcon className="size-3 shrink-0 text-subtle" aria-hidden="true" />
+                      <input
+                        type="text"
+                        value={row.formula}
+                        onChange={(e) => patchVariant(row.id, { formula: e.target.value })}
+                        placeholder="anton-run-risk-high"
+                        maxLength={120}
+                        aria-label={`Variant ${i + 1} formula`}
+                        className="min-w-0 flex-1 rounded-lg border border-border bg-background px-2.5 py-1.5 font-mono text-[12px] text-foreground outline-none placeholder:text-subtle focus:border-primary/60"
+                      />
+                      <Button
+                        size="icon-xs"
+                        variant="ghost"
+                        onClick={() => moveVariant(row.id, -1)}
+                        disabled={i === 0}
+                        aria-label={`Move variant ${i + 1} up`}
+                      >
+                        <ChevronUpIcon aria-hidden="true" />
+                      </Button>
+                      <Button
+                        size="icon-xs"
+                        variant="ghost"
+                        onClick={() => moveVariant(row.id, 1)}
+                        disabled={i === variantRows.length - 1}
+                        aria-label={`Move variant ${i + 1} down`}
+                      >
+                        <ChevronDownIcon aria-hidden="true" />
+                      </Button>
+                      <Button
+                        size="icon-xs"
+                        variant="ghost"
+                        onClick={() => setVariantRows((rows) => rows.filter((r) => r.id !== row.id))}
+                        aria-label={`Remove variant ${i + 1}`}
+                      >
+                        <XIcon aria-hidden="true" />
+                      </Button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              <Button
+                size="sm"
+                variant="outline"
+                className="self-start"
+                onClick={() =>
+                  setVariantRows((rows) => [
+                    ...rows,
+                    { id: `new-${nextVariantId.current++}`, label: "", formula: "" },
+                  ])
+                }
+              >
+                <PlusIcon aria-hidden="true" />
+                Add variant
+              </Button>
+            </div>
+
+            <span className="max-w-2xl text-[11px] text-subtle">
+              A run target carrying a mapped label walks{" "}
+              <code className="font-mono text-[11px]">.beads/formulas/&lt;formula&gt;.formula.toml</code>{" "}
+              instead of the default — so <code className="font-mono text-[11px]">risk:high</code> can
+              carry extra steps and a docs-only ticket can skip verify. Two mapped labels on one bead?
+              The first row wins, which is why order is editable. Every variant is held to the same
+              floor as the default (implement → commit → PR); a missing or floor-violating one parks
+              the run instead of silently falling back.
             </span>
           </section>
 

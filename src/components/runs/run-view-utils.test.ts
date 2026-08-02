@@ -4,9 +4,13 @@
  */
 import { describe, expect, it } from "vitest";
 
+// The view module keeps the sentinel as a literal so it stays free of node-only imports; this pins
+// it against the loader's definition, which is the value a run actually records.
+import { BUNDLED_FORMULA_SOURCE } from "@/lib/jobs/run-formula";
 import {
   ACTIVE_RUN_STATUSES,
   fmtDuration,
+  formatRunPipeline,
   isActiveRun,
   pickAttachSession,
   timelineOrder,
@@ -74,5 +78,29 @@ describe("fmtDuration", () => {
   });
   it("returns a dash without a start", () => {
     expect(fmtDuration(undefined)).toBe("—");
+  });
+});
+
+describe("formatRunPipeline (anton-aa3m)", () => {
+  it("names the formula file, and the label that selected it when a variant applied", () => {
+    expect(formatRunPipeline("/repo/.beads/formulas/anton-run-risk-high.formula.toml", "risk:high")).toBe(
+      "anton-run-risk-high.formula.toml · risk:high",
+    );
+  });
+  it("names just the file when the default pipeline ran", () => {
+    expect(formatRunPipeline("/repo/.beads/formulas/anton-run.formula.toml")).toBe(
+      "anton-run.formula.toml",
+    );
+  });
+  it("shows a dash for a run with nothing recorded rather than claiming the default", () => {
+    expect(formatRunPipeline(undefined, "risk:high")).toBe("—");
+  });
+  // A run on anton's bundled pipeline records a sentinel, not a path (the install root can move
+  // under an in-flight run). The meta grid names the file an operator would recognise.
+  it("names anton's default in words rather than showing the `bundled:` sentinel", () => {
+    expect(formatRunPipeline(BUNDLED_FORMULA_SOURCE)).toBe("anton-run.formula.toml (anton's default)");
+    expect(formatRunPipeline(BUNDLED_FORMULA_SOURCE, "risk:high")).toBe(
+      "anton-run.formula.toml (anton's default) · risk:high",
+    );
   });
 });
