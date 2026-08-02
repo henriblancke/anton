@@ -4,7 +4,7 @@
  * than polling: the whole project's waits cost a couple of bd calls per cron slot, whatever their
  * number, and nothing at all in between.
  *
- * Three moves, in order, each idempotent on its own:
+ * Four moves, in order, each idempotent on its own:
  *
  *   1. EVALUATE — `bd gate check`, scoped to the gate types actually open. `human` is NEVER among
  *      those scopes: a human gate is a founder control point and only an explicit action resolves
@@ -36,7 +36,9 @@
  * every gate call here inherits — the seam in beads/bd.ts holds it).
  */
 import { beads, LABELS, type Bead, type Gate, type GateCheckScope, type GatedMolecule } from "../beads/bd";
+import { isPipelineArtifact } from "../beads/contract";
 import { loadAllIssues } from "../beads/issues";
+import { prNumberFromRef } from "../git/pr";
 import { getProjectById } from "../projects";
 import { PoisonError } from "./errors";
 import { enqueueReviewFixIfAbsent, systemClock, type AntonDb, type Clock } from "./queue";
@@ -153,6 +155,13 @@ export function expiredGateNote(gate: Gate, nowMs: number): string {
  * The bead anton would actually run for a gated step: the first bead at or above it that is a run
  * target. Walking UP is what makes the mapping work at all — bd reports the gated STEP, while anton
  * runs the epic/feature above it (`bd ready --gated` names that parent as `molecule_id`).
+ *
+ * The walk STOPS at pipeline plumbing, exactly as `boardCards` does (anton-ve2r): a poured
+ * molecule's steps ride on that molecule, whose gates bd sequences, so a molecule parented under a
+ * feature does NOT make its steps that feature's work. Walking through it would resume the feature
+ * for a step `runTickets` deliberately never dispatches — an unrelated run, after which the same
+ * `bd ready --gated` entry stays eligible and re-triggers on every later slot. No run target above
+ * plumbing means no resume; the pass logs the unmatched step instead.
  */
 export function runTargetAbove(board: Bead[], startId: string): Bead | undefined {
   const byId = new Map(board.map((b) => [b.id, b]));
@@ -161,6 +170,7 @@ export function runTargetAbove(board: Bead[], startId: string): Bead | undefined
   for (let depth = 0; current && depth < MAX_PARENT_DEPTH; depth += 1) {
     if (seen.has(current.id)) return undefined;
     seen.add(current.id);
+    if (isPipelineArtifact(current)) return undefined;
     if (beads.isRunTarget(current, board)) return current;
     const parent = beads.parentOf(current);
     current = parent ? byId.get(parent) : undefined;
@@ -196,6 +206,10 @@ export function isResumableTarget(target: Bead, nowMs: number): boolean {
  *     WITHOUT merging leaves it open forever (bd reports "escalate", changes no state; measured on
  *     1.1.0 and 1.1.2), which is precisely what keeps a closed-unmerged PR out of this list and its
  *     PR ref in place for a recovery run.
+ *   • the gate awaits the target's CURRENT PR. A recovery run resolves the superseded PR's gate
+ *     itself (armMergeGate) and that resolved edge stays on the bead forever — so without this
+ *     clause a target whose replacement PR is still open would read as merged and be dispatched to
+ *     review-fix on every single pass.
  *   • the target is still OPEN and still `stage:in-review` — the two things finalization clears. A
  *     finalized target therefore drops out on the next pass, which is what stops a permanently
  *     closed gate from re-dispatching forever; a finalize that FAILED half-way leaves them in place
@@ -209,10 +223,15 @@ export function mergedGateTargets(board: Bead[]): Bead[] {
   return board.filter((bead) => {
     if (bead.status === "closed") return false;
     if (!(bead.labels?.includes(IN_REVIEW) ?? false)) return false;
+    const prNumber = prNumberFromRef(beads.getPrRef(bead));
+    if (prNumber === undefined) return false; // no PR to finalize (a tracker ref, or none at all)
     return (bead.dependencies ?? []).some((d) => {
       if (d.type !== "blocks") return false;
       const gate = byId.get(d.depends_on_id);
-      return gate !== undefined && gate.status === "closed" && beads.isMergeWaitGate(gate);
+      if (gate === undefined || gate.status !== "closed" || !beads.isMergeWaitGate(gate)) {
+        return false;
+      }
+      return (gate as Gate).await_id === String(prNumber);
     });
   });
 }
@@ -276,9 +295,13 @@ export function makeGateCheckHandler(deps: GateCheckDeps): JobHandler {
       const blocked = beadBlockedByGate(board, gate.id);
       try {
         await beads.note(repo, blocked?.id ?? gate.id, expiredGateNote(gate, nowMs));
-        await beads.tag(repo, gate.id, [GATE_EXPIRED_LABEL]);
+        // Counted the moment the NOTE lands, not after the label: a note this pass wrote but did
+        // not sync is invisible to every other reader of the board, so a failed tag must still
+        // push. The gate is then re-surfaced next pass (it carries no marker yet) — one duplicate
+        // note on a partial write, versus a stall nobody outside this machine can see.
         surfaced += 1;
         console.log(`[gate-check] ${projectId}: gate ${gate.id} blew its timeout — surfaced for a human`);
+        await beads.tag(repo, gate.id, [GATE_EXPIRED_LABEL]);
       } catch (e) {
         console.error(`[gate-check] failed to surface expired gate ${gate.id}:`, e);
       }
@@ -295,12 +318,12 @@ export function makeGateCheckHandler(deps: GateCheckDeps): JobHandler {
         console.log(`[gate-check] ${projectId}: ${target.id} ungated — ${outcome}`);
       }
     }
-    // 3b. Hand every MERGED run target to review-fix (anton-k0kj). This is the whole point of the
-    //     merge gate: the sweep no longer has to re-read every open PR to notice a merge — one
-    //     `bd gate check` settles the project's merge waits, and the targets whose wait closed are
-    //     dispatched by id. review-fix's merge-finalize behaviour is untouched; only its trigger
-    //     moved. Deduped against a live job for the same target, and re-dispatched every pass until
-    //     the finalize actually lands, so a half-done finalize heals itself.
+    // 4. Hand every MERGED run target to review-fix (anton-k0kj). This is the whole point of the
+    //    merge gate: the sweep no longer has to re-read every open PR to notice a merge — one
+    //    `bd gate check` settles the project's merge waits, and the targets whose wait closed are
+    //    dispatched by id. review-fix's merge-finalize behaviour is untouched; only its trigger
+    //    moved. Deduped against a live job for the same target, and re-dispatched every pass until
+    //    the finalize actually lands, so a half-done finalize heals itself.
     for (const target of mergedGateTargets(board)) {
       const jobId = enqueueReviewFixIfAbsent(db, clock, projectId, target.id);
       if (jobId) console.log(`[gate-check] ${projectId}: ${target.id} merged — dispatched review-fix`);

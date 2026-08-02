@@ -1419,17 +1419,26 @@ async function armMergeGate(
   const armed = (board.find((b) => b.id === targetId)?.dependencies ?? [])
     .filter((d) => d.type === "blocks")
     .map((d) => byId.get(d.depends_on_id))
-    .filter((b): b is Bead => b !== undefined && b.status !== "closed" && beads.isMergeWaitGate(b));
+    .filter((b): b is Gate => b !== undefined && b.status !== "closed" && beads.isMergeWaitGate(b));
 
   for (const gate of armed) {
-    if ((gate as Gate).await_id === awaitId) return; // this PR is already the wait
-    await safe(() =>
+    if (gate.await_id === awaitId) return; // this PR is already the wait
+    const resolved = await safe(() =>
       beads.gateResolve(
         repo,
         gate.id,
-        `PR #${(gate as Gate).await_id} is no longer ${targetId}'s pull request — superseded by #${awaitId}`,
+        `PR #${gate.await_id} is no longer ${targetId}'s pull request — superseded by #${awaitId}`,
       ),
     );
+    // A stale gate bd never auto-resolves (a closed-unmerged PR escalates forever) is a permanent
+    // artifact if this write is lost — say so rather than leaving a dead wait to be surfaced later
+    // against a PR nobody is waiting on.
+    if (!resolved) {
+      console.warn(
+        `[execute-epic] could not resolve ${targetId}'s superseded merge gate ${gate.id} ` +
+          `(PR #${gate.await_id}) — it stays open alongside the gate for #${awaitId}`,
+      );
+    }
   }
 
   await beads.gateCreate(repo, {

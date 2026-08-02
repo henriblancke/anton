@@ -167,6 +167,18 @@ describe("runTargetAbove", () => {
     expect(runTargetAbove(board, "t-1")?.id).toBe("f-1");
   });
 
+  it("stops at a molecule between the step and a feature — those steps are not that feature's run", () => {
+    // The poured shape: a molecule root reparented under a feature. `runTickets` stops at the
+    // molecule, so resuming the feature would run unrelated work and leave the step gated forever.
+    const board = [
+      bead("s-1", { parent: "m-1" }),
+      bead("m-1", { issue_type: "molecule", parent: "f-1" }),
+      bead("f-1", { issue_type: "feature", labels: [LABELS.approved] }),
+    ];
+    expect(runTargetAbove(board, "s-1")).toBeUndefined();
+    expect(runTargetAbove(board, "m-1")).toBeUndefined();
+  });
+
   it("is undefined for an unknown id or a chain that reaches no run target", () => {
     const board = [bead("t-1", { parent: "missing" })];
     expect(runTargetAbove(board, "nope")).toBeUndefined();
@@ -245,42 +257,74 @@ describe("resumeTargets", () => {
  * closed without merging leaves the gate open and the target alone.
  */
 describe("mergedGateTargets", () => {
+  /** An in-review target on PR #7, blocked by `gateId`. */
   const gated = (id: string, gateId: string, o: Partial<Bead> = {}): Bead =>
     bead(id, {
       issue_type: "epic",
       labels: [LABELS.stage("in-review")],
+      metadata: { pr: "gh-7" },
       dependencies: [{ issue_id: id, depends_on_id: gateId, type: "blocks" }],
       ...o,
     });
 
+  /** The gate that awaits that PR. */
+  const mergeGate = (id: string, o: Partial<Gate> = {}): Gate =>
+    gate(id, { await_id: "7", status: "closed", ...o });
+
   it("dispatches an in-review target whose merge gate has closed", () => {
-    const board = [gated("e-1", "g-1"), gate("g-1", { status: "closed" })];
+    const board = [gated("e-1", "g-1"), mergeGate("g-1")];
     expect(mergedGateTargets(board).map((b) => b.id)).toEqual(["e-1"]);
   });
 
   it("leaves a target whose merge gate is still open — an unmerged PR is not a merge", () => {
-    const board = [gated("e-1", "g-1"), gate("g-1", { status: "open" })];
+    const board = [gated("e-1", "g-1"), mergeGate("g-1", { status: "open" })];
     expect(mergedGateTargets(board)).toEqual([]);
   });
 
   it("ignores a closed gate of another flavour — only gh:pr means merged", () => {
-    const board = [gated("e-1", "g-1"), gate("g-1", { status: "closed", await_type: "timer" })];
+    const board = [gated("e-1", "g-1"), mergeGate("g-1", { await_type: "timer" })];
     expect(mergedGateTargets(board)).toEqual([]);
   });
 
+  it("ignores a closed gate for a SUPERSEDED PR — the recovery PR is still open", () => {
+    // armMergeGate resolves the old gate when a closed-unmerged PR is re-opened under a new number,
+    // and that resolved edge stays on the bead forever. Reading it as a merge would dispatch
+    // review-fix against the live PR on every pass.
+    const board = [
+      gated("e-1", "g-old", {
+        dependencies: [
+          { issue_id: "e-1", depends_on_id: "g-old", type: "blocks" },
+          { issue_id: "e-1", depends_on_id: "g-new", type: "blocks" },
+        ],
+      }),
+      mergeGate("g-old", { await_id: "3" }),
+      mergeGate("g-new", { status: "open" }),
+    ];
+    expect(mergedGateTargets(board)).toEqual([]);
+    // …and once THAT PR merges, the target is dispatched off its own gate.
+    const merged = [board[0], board[1], mergeGate("g-new")];
+    expect(mergedGateTargets(merged).map((b) => b.id)).toEqual(["e-1"]);
+  });
+
+  it("ignores a target with no PR number — there is nothing to finalize", () => {
+    expect(mergedGateTargets([gated("e-1", "g-1", { metadata: {} }), mergeGate("g-1")])).toEqual([]);
+    expect(
+      mergedGateTargets([gated("e-1", "g-1", { metadata: { pr: "ENG-4" } }), mergeGate("g-1")]),
+    ).toEqual([]);
+  });
+
   it("drops a target once finalization lands, so a closed gate can't re-dispatch forever", () => {
-    const closedGate = gate("g-1", { status: "closed" });
+    const closedGate = mergeGate("g-1");
     expect(mergedGateTargets([gated("e-1", "g-1", { status: "closed" }), closedGate])).toEqual([]);
     expect(mergedGateTargets([gated("e-1", "g-1", { labels: [] }), closedGate])).toEqual([]);
   });
 
   it("ignores a non-blocks edge to a closed gate", () => {
     const board = [
-      bead("e-1", {
-        labels: [LABELS.stage("in-review")],
+      gated("e-1", "g-1", {
         dependencies: [{ issue_id: "e-1", depends_on_id: "g-1", type: "related" }],
       }),
-      gate("g-1", { status: "closed" }),
+      mergeGate("g-1"),
     ];
     expect(mergedGateTargets(board)).toEqual([]);
   });

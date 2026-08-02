@@ -102,18 +102,14 @@ describeBd("execute-epic e2e — lifecycle (real handler · real bd/git · fake 
     expect(beads.getPrRef(epic)).toBe("gh-42");
     expect(epic.labels ?? []).toContain("stage:in-review");
 
-    // …and the merge wait is board state, not a polling job (anton-k0kj): one `gh:pr` gate on THIS
-    // PR number, blocking the epic, for gate-check to settle. Nothing else waits on the merge.
-    const gates = await beads.gateList(repo);
-    const merge = gates.filter((g) => g.await_type === "gh:pr");
-    expect(merge).toHaveLength(1);
-    expect(merge[0].await_id).toBe("42");
-    expect(merge[0].status).not.toBe("closed");
-    expect(
-      (epic.dependencies ?? []).some((d) => d.type === "blocks" && d.depends_on_id === merge[0].id),
-    ).toBe(true);
-    // The gate must NOT read as a prerequisite — an in-review target that looks blocked by its own
-    // PR can never be force-run or recovered (epic-graph skips gh:pr gates for exactly this).
+    // A LEGACY EPIC target takes NO merge gate (anton-k0kj): bd refuses a gate edge onto an epic
+    // ("epics can only block other epics, not tasks") and a failed create still leaves the gate bead
+    // behind, blocking nothing, so the case is refused up front — this target keeps learning about
+    // its merge from the review-fix sweep, exactly as before. The gated shape belongs to the run
+    // targets the tier split produces, and merge-gate.integration.test.ts proves it on a feature.
+    expect((await beads.gateList(repo)).filter((g) => g.await_type === "gh:pr")).toEqual([]);
+    // Nothing the run armed may read as a prerequisite either — an in-review target that looks
+    // blocked can never be force-run or recovered.
     expect(epicStandaloneBlockers(await loadAllIssues(repo), epicId)).toEqual([]);
 
     // The run CLAIMED the epic + each ticket for the human operator (assignee set, not just
