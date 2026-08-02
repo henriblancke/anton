@@ -711,3 +711,108 @@ describe("getBoard contract marking", () => {
     expect(contractBlocks(item.contract)).toBe(false);
   });
 });
+
+/**
+ * Pipeline plumbing on the board (anton-ve2r). The fixture mirrors the shape `bd mol pour` really
+ * produces — a `molecule` root, typed `task` step children, and one `gate` child per gated step —
+ * plus the ad-hoc gate `bd gate create --blocks <bead>` hangs off a bead. That shape is pinned
+ * against real bd in src/lib/gate-molecule.integration.test.ts, so this fixture can't quietly drift
+ * from what bd pours.
+ *
+ * Gates are IN this list on purpose: `loadAllIssues` reads them (`--type gate` is bd's only listing
+ * that carries them) because their status is what tells a `blocks` edge from a resolved gate apart
+ * from an open one. Reaching the list is exactly why they must never reach a card.
+ */
+describe("getBoard excludes pipeline plumbing (gate + molecule)", () => {
+  const pouredBoard = (gateStatus: "open" | "closed") => [
+    makeBead({ id: "feat-1", title: "Ship the exporter", issue_type: "feature" }),
+    makeBead({
+      id: "task-1",
+      title: "Write the exporter",
+      parent: "feat-1",
+      dependencies: [{ issue_id: "task-1", depends_on_id: "gate-adhoc", type: "blocks" }],
+    }),
+    makeBead({ id: "gate-adhoc", title: "Gate: human", issue_type: "gate", parent: "task-1", status: gateStatus }),
+    makeBead({ id: "mol-1", title: "release", issue_type: "molecule", parent: "feat-1" }),
+    makeBead({ id: "step-1", title: "build", parent: "mol-1" }),
+    makeBead({
+      id: "step-2",
+      title: "review",
+      parent: "mol-1",
+      dependencies: [{ issue_id: "step-2", depends_on_id: "gate-poured", type: "blocks" }],
+    }),
+    makeBead({ id: "gate-poured", title: "Gate: human", issue_type: "gate", parent: "mol-1" }),
+  ];
+
+  const card = async () => {
+    const board = await getBoard(project);
+    return board.columns.backlog.find((e) => e.id === "feat-1")!;
+  };
+
+  it("renders no gate or molecule as a card, a ticket, or a chip", async () => {
+    listMock.mockResolvedValue(pouredBoard("open"));
+
+    const board = await getBoard(project);
+    const rendered = STAGES.flatMap((s) => [
+      ...board.columns[s].map((e) => e.id),
+      ...board.columns[s].flatMap((e) => e.tickets.map((t) => t.id)),
+      ...board.standalone[s].map((i) => i.id),
+    ]);
+
+    expect(rendered).toContain("feat-1");
+    expect(rendered).not.toContain("gate-adhoc");
+    expect(rendered).not.toContain("gate-poured");
+    expect(rendered).not.toContain("mol-1");
+  });
+
+  it("counts only real tickets — the poured steps ride on their molecule, not on the feature", async () => {
+    // `bd mol current` counts a molecule's gates and steps as its own progress; anton must not
+    // inherit them onto the run target the molecule happens to hang under, whose run would dispatch
+    // them in one worktree with their gates ignored.
+    listMock.mockResolvedValue(pouredBoard("open"));
+
+    expect((await card()).tickets.map((t) => t.id)).toEqual(["task-1"]);
+  });
+
+  it("keeps a run target blocked while its gate is open", async () => {
+    listMock.mockResolvedValue(pouredBoard("open"));
+
+    const built = await card();
+    expect(built.blockedBy).toEqual(["gate-adhoc"]);
+    expect(built.ready).toBe(false);
+  });
+
+  it("releases it the moment the gate resolves — a gate is a wait, not a permanent blocker", async () => {
+    // The regression: a gate absent from the bead list hits the blocker helpers' missing-bead
+    // fail-safe and reads as open FOREVER, so `bd gate resolve` never returns the target to ready
+    // and its approve route 409s permanently.
+    listMock.mockResolvedValue(pouredBoard("closed"));
+
+    const built = await card();
+    expect(built.blockedBy).toEqual([]);
+    expect(built.ready).toBe(true);
+  });
+
+  it("pays a second `--type gate` read only when an edge points at a bead the listing omits", async () => {
+    // bd's real asymmetry: the ordinary listing carries the gate's `blocks` edge but not the gate.
+    // Resolving it costs a read on the operator's critical path, so it is spent only on a board
+    // that actually holds a dangling edge — a board without one keeps the single read anton-hwkx
+    // trimmed approve down to.
+    const ordinary = pouredBoard("closed").filter((b) => b.issue_type !== "gate");
+    const gates = pouredBoard("closed").filter((b) => b.issue_type === "gate");
+    listMock.mockImplementation(async (_cwd: string, extra: string[] = []) =>
+      extra.includes("gate") ? gates : ordinary,
+    );
+
+    expect((await card()).ready, "the resolved gate is found by the second read").toBe(true);
+    expect(listMock.mock.calls.some((c) => (c[1] as string[]).includes("gate"))).toBe(true);
+
+    // Same board with the gate edge gone: nothing dangles, so nothing beyond the one read is spent.
+    resetIssueSnapshots();
+    listMock.mockClear();
+    listMock.mockImplementation(async () => ordinary.map((b) => ({ ...b, dependencies: [] })));
+
+    await getBoard(project);
+    expect(listMock).toHaveBeenCalledTimes(1);
+  });
+});

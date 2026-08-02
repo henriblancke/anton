@@ -4,13 +4,14 @@
  * exercised end-to-end in execute-epic.integration.test.ts.
  */
 import { describe, expect, it } from "vitest";
-import type { Bead } from "../beads/bd";
+import type { Bead, Gate } from "../beads/bd";
 import { formatHumanNote } from "../beads/notes";
 import { PoisonEpic } from "./errors";
 import {
   claudeResumeDecision,
   continuationPrompt,
   inactiveAgentTickets,
+  mergeGatePlan,
   reviewParkMessage,
   splitFormulaPhases,
 } from "./execute-epic";
@@ -338,5 +339,65 @@ describe("reviewParkMessage (anton-3apm)", () => {
     expect(out).not.toContain("the findings are on the bead;");
     expect(out).toContain("AC-2 is not implemented");
     expect(out).toContain("Resolve them (or correct the ticket), then resume the run.");
+  });
+});
+
+/**
+ * anton-k0kj: arming the merge wait is a decision about EVERY gate on the target, not just the
+ * first one seen — a resolve that failed on an earlier run leaves a stale gate open alongside the
+ * live one, and bd never auto-resolves it (a closed-unmerged PR escalates forever).
+ */
+describe("mergeGatePlan", () => {
+  const gate = (id: string, awaitId: string, o: Partial<Gate> = {}): Gate =>
+    ({ id, title: id, status: "open", issue_type: "gate", await_type: "gh:pr", await_id: awaitId, ...o }) as Gate;
+
+  const target = (...gateIds: string[]): Bead =>
+    ({
+      id: "f-1",
+      title: "f-1",
+      status: "open",
+      dependencies: gateIds.map((g) => ({ issue_id: "f-1", depends_on_id: g, type: "blocks" })),
+    }) as Bead;
+
+  it("creates the wait when the target carries none", () => {
+    expect(mergeGatePlan([target()], "f-1", "9")).toEqual({ stale: [], create: true });
+  });
+
+  it("creates nothing when this PR's wait is already armed", () => {
+    const board = [target("g-9"), gate("g-9", "9")];
+    expect(mergeGatePlan(board, "f-1", "9")).toEqual({ stale: [], create: false });
+  });
+
+  it("resolves EVERY stale gate even when the current one is seen first", () => {
+    // The failure this guards: a prior gateResolve that failed leaves #3 open next to #9. Returning
+    // at #9 would leave #3 to be surfaced later as a stall against a PR nobody is waiting on.
+    const board = [target("g-9", "g-3"), gate("g-9", "9"), gate("g-3", "3")];
+    const plan = mergeGatePlan(board, "f-1", "9");
+    expect(plan.stale.map((g) => g.id)).toEqual(["g-3"]);
+    expect(plan.create).toBe(false); // …and no second gate races the live wait
+  });
+
+  it("supersedes an old PR's wait and arms the new one", () => {
+    const board = [target("g-3"), gate("g-3", "3")];
+    const plan = mergeGatePlan(board, "f-1", "9");
+    expect(plan.stale.map((g) => g.id)).toEqual(["g-3"]);
+    expect(plan.create).toBe(true);
+  });
+
+  it("ignores closed gates, non-blocks edges, and gates of another flavour", () => {
+    const board = [
+      target("g-closed", "g-related", "g-timer"),
+      gate("g-closed", "3", { status: "closed" }),
+      gate("g-related", "4"),
+      gate("g-timer", "5", { await_type: "timer" }),
+    ];
+    const withRelated = [
+      { ...board[0], dependencies: [{ issue_id: "f-1", depends_on_id: "g-related", type: "related" }] } as Bead,
+      board[1],
+      board[2],
+      board[3],
+    ];
+    expect(mergeGatePlan(board, "f-1", "9").stale.map((g) => g.id)).toEqual(["g-related"]);
+    expect(mergeGatePlan(withRelated, "f-1", "9")).toEqual({ stale: [], create: true });
   });
 });

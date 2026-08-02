@@ -266,14 +266,18 @@ bd dolt commit && bd dolt push               # 3. publish; a claim nobody else c
 sleep 2                                      # 4. settle — let a near-simultaneous rival reach the remote
 bd dolt pull                                 # 5. re-read after the merge has picked a winner
 bd show <id> --json                          # 6. assert assignee == "$ACTOR"
+bd list --status all --json --limit 0        # 7. re-apply §1 to the target you now hold
 ```
 
-Step 6 is the only one that makes the claim trustworthy. Three outcomes, and only the first licenses
-a run:
+Steps 6 and 7 are what make the claim trustworthy — winning the assignee proves the race, not that
+the prize is still worth having. Four outcomes, and only the first licenses a run:
 
-- **assignee is you** → you hold it; run it.
+- **assignee is you, and §1 still holds** → you hold it; run it.
 - **assignee is someone else** → you lost the race. Back off *without writing anything* and move to
   the next target. Losing is the protocol working, not an error.
+- **assignee is you, but the target left the claimable set** — closed, `abandoned`, no longer
+  `approved`, or now a container epic (a `feature` landed under it while you settled) → do not run
+  it. Hand the claim back (`bd assign <id> ""`) and move on; a retry can only reach the same verdict.
 - **could not prove it either way** (any step failed) → fail closed: do not run the target. Retrying
   is safe — `--claim` is idempotent for the same actor.
 

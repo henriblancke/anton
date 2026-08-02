@@ -15,10 +15,20 @@ const ID = "bd-1";
 
 /**
  * A fake board plus a log of the legs driven against it. `claim` mirrors bd's own semantics: it
- * refuses a bead another actor holds and is idempotent for the same one.
+ * refuses a bead another actor holds and is idempotent for the same one; `show` returns a bead that
+ * passes the post-settle re-validation unless a test mutates it, so the legs stay the subject.
  */
-function fakeBoard(opts: { owner?: string; push?: SyncOutcome } = {}) {
+function fakeBoard(
+  opts: { owner?: string; push?: SyncOutcome; bead?: Partial<Bead>; siblings?: Bead[] } = {},
+) {
   let owner = opts.owner;
+  let target: Bead = {
+    id: ID,
+    issue_type: "feature",
+    status: "in_progress",
+    labels: ["approved"],
+    ...opts.bead,
+  } as Bead;
   const legs: string[] = [];
   const deps: ClaimVerifiedDeps = {
     settleMs: 0,
@@ -39,20 +49,30 @@ function fakeBoard(opts: { owner?: string; push?: SyncOutcome } = {}) {
     },
     show: async (_cwd, id) => {
       legs.push("show");
-      return { id, assignee: owner } as Bead;
+      return { ...target, id, assignee: owner };
+    },
+    board: async () => {
+      legs.push("board");
+      return [target, ...(opts.siblings ?? [])];
     },
   };
-  return { deps, legs, owner: () => owner, setOwner: (next: string | undefined) => (owner = next) };
+  return {
+    deps,
+    legs,
+    owner: () => owner,
+    setOwner: (next: string | undefined) => (owner = next),
+    setTarget: (patch: Partial<Bead>) => (target = { ...target, ...patch }),
+  };
 }
 
 describe("beads.claimVerified — the happy path", () => {
-  it("pulls, claims, publishes, settles, re-reads, then asserts the assignee", async () => {
+  it("pulls, claims, publishes, settles, re-reads, asserts the assignee, re-validates", async () => {
     const board = fakeBoard();
 
     const result = await beads.claimVerified(REPO, ID, "alice", board.deps);
 
-    expect(result).toEqual({ ok: true, bead: { id: ID, assignee: "alice" } });
-    expect(board.legs).toEqual(["pull", "claim alice", "push", "settle", "pull", "show"]);
+    expect(result).toMatchObject({ ok: true, bead: { id: ID, assignee: "alice" } });
+    expect(board.legs).toEqual(["pull", "claim alice", "push", "settle", "pull", "show", "board"]);
   });
 
   it("waits the run-lease propagation window before trusting its own read", async () => {
@@ -71,7 +91,7 @@ describe("beads.claimVerified — the happy path", () => {
     await expect(beads.claimVerified(REPO, ID, "alice", board.deps)).resolves.toMatchObject({
       ok: true,
     });
-    expect(board.legs).toEqual(["pull", "claim alice", "push", "show"]);
+    expect(board.legs).toEqual(["pull", "claim alice", "push", "show", "board"]);
   });
 
   it("re-claiming your own target is idempotent", async () => {
@@ -133,6 +153,55 @@ describe("beads.claimVerified — losing the race", () => {
   });
 });
 
+/**
+ * Winning the assignee proves the race, not that the prize is still worth having: the same settle
+ * window a rival claim propagates through is one another machine can close, abandon, unapprove or
+ * re-parent the target in. A verified claim that ignored that would license a run the claimable set
+ * refuses.
+ */
+describe("beads.claimVerified — the target left the claimable set while we settled", () => {
+  const stale = async (patch: Partial<Bead>, match: RegExp) => {
+    const board = fakeBoard();
+    board.deps.sleep = async () => {
+      board.setTarget(patch); // another machine's write lands while we wait out the window
+    };
+
+    const result = await beads.claimVerified(REPO, ID, "alice", board.deps);
+
+    expect(result).toMatchObject({ ok: false, reason: "stale", bead: { assignee: "alice" } });
+    expect((result as { detail: string }).detail).toMatch(match);
+  };
+
+  it("rejects a target closed under us", () => stale({ status: "closed" }, /closed/));
+
+  it("rejects a target abandoned under us", () =>
+    stale({ labels: ["approved", "abandoned"] }, /abandoned/));
+
+  it("rejects a target whose approval was withdrawn", () =>
+    stale({ labels: [] }, /approval was withdrawn/));
+
+  it("rejects a legacy epic that became a container while we settled", async () => {
+    const board = fakeBoard({
+      bead: { issue_type: "epic" },
+      siblings: [{ id: "bd-child", issue_type: "feature", parent: ID } as Bead],
+    });
+
+    await expect(beads.claimVerified(REPO, ID, "alice", board.deps)).resolves.toMatchObject({
+      ok: false,
+      reason: "stale",
+      detail: expect.stringMatching(/no longer a run target/),
+    });
+  });
+
+  it("still accepts a claim on a legacy epic with no feature children", async () => {
+    const board = fakeBoard({ bead: { issue_type: "epic" } });
+
+    await expect(beads.claimVerified(REPO, ID, "alice", board.deps)).resolves.toMatchObject({
+      ok: true,
+    });
+  });
+});
+
 describe("beads.claimVerified — failing closed", () => {
   const unverified = async (deps: ClaimVerifiedDeps, match: RegExp) => {
     const result = await beads.claimVerified(REPO, ID, "alice", deps);
@@ -172,6 +241,14 @@ describe("beads.claimVerified — failing closed", () => {
     };
     await unverified(board.deps, /could not re-read the bead/);
   });
+
+  it("is unverified when the re-validating board read fails", async () => {
+    const board = fakeBoard();
+    board.deps.board = async () => {
+      throw new Error("bd exploded");
+    };
+    await unverified(board.deps, /could not re-read the board to re-validate/);
+  });
 });
 
 describe("beads.claimVerified — composition with the human-claim guard", () => {
@@ -184,7 +261,14 @@ describe("beads.claimVerified — composition with the human-claim guard", () =>
       if (owner && owner !== actor) throw new Error(`issue already claimed by ${owner}`);
       owner = actor;
     };
-    board.deps.show = async (_cwd, id) => ({ id, assignee: owner }) as Bead;
+    board.deps.show = async (_cwd, id) =>
+      ({
+        id,
+        assignee: owner,
+        issue_type: "feature",
+        status: "in_progress",
+        labels: ["approved"],
+      }) as Bead;
     board.deps.sleep = async () => {
       await new Promise((r) => setTimeout(r, 20)); // long enough that an unlocked CAS would win
     };

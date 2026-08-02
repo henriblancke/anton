@@ -158,6 +158,47 @@ process.exit(0);`),
     expect((await beads.show(repo, ticket5)).status).not.toBe("closed");
   });
 
+  it("parks on attempt 1 with the real reason when the epic's status isn't claimable (anton-e5ix)", async () => {
+    // `bd update --claim` refuses a bead whose STATUS is blocked/closed/deferred, with no ownership
+    // change at all — so the take-over re-read sees nothing wrong. That used to land in the transient
+    // bucket: 3 attempts against an error that can never change, then a park blaming a locked Dolt DB
+    // (observed on anton-f5f3), sending the operator to debug beads instead of the status the runtime
+    // itself wrote. It must park on the FIRST attempt, naming the status and the fix.
+    const epicB = await beads.create(repo, {
+      title: "Feature B-blocked",
+      type: "epic",
+      acceptance: "work file exists",
+      description: "## Goal\nB",
+    });
+    await beads.approve(repo, epicB);
+    const ticketB = createTicket(repo, { title: "B ticket", parent: epicB });
+    // The permanent refusal: status blocked. No `blocks` EDGE (that gate fires earlier, pre-claim) —
+    // just the status, which is what the claim itself rejects.
+    execFileSync("bd", ["update", epicB, "--status", "blocked"], { cwd: repo, stdio: "ignore" });
+
+    const runner = makeEpicRunner(ctx);
+
+    process.env.ANTON_CLAUDE_BIN = successClaude;
+    const jobId = await driveEpicRun(runner, { projectId, epicBeadId: epicB });
+
+    const job = await getJob(tdb.db, jobId);
+    expect(job?.status).toBe("parked");
+    expect(job?.attempts).toBe(1); // poison on the first try — no retry budget burned
+    expect(job?.lastError).toContain(epicB);
+    // The CLAIM refusal specifically — not the pre-claim `blocks`-edge gate, which also says
+    // "blocked" — plus bd's own words and the operator action.
+    expect(job?.lastError).toContain('status is "blocked"');
+    expect(job?.lastError).toContain("not claimable: status blocked");
+    expect(job?.lastError).toContain("Reopen/unblock");
+    expect(job?.lastError).not.toContain("DB is locked"); // never the misdirecting transient reason
+
+    // Nothing ran under the unclaimable epic: it kept its status and its ticket is untouched.
+    const epic = await beads.show(repo, epicB);
+    expect(epic.status).toBe("blocked");
+    expect(epic.labels ?? []).not.toContain("stage:in-review");
+    expect((await beads.show(repo, ticketB)).status).toBe("open");
+  });
+
   it("parks an owned epic when the runner has no operator identity (anton-i71 review)", async () => {
     // Same soft-lock as the take-over above, but the runner can't resolve an operator at all
     // (no ANTON_OPERATOR, no global git user.name) — an older queued job on an unconfigured
@@ -816,6 +857,66 @@ process.exit(0);`),
       expect(after2.assignee ?? null).toBeNull();
       expect([after1.status, after2.status].sort()).toEqual(["blocked", "open"]);
     } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  });
+
+  it("refuses to execute tickets when the claim cannot be published to the shared board", async () => {
+    // A reservation nobody else can read is not a reservation: if the claim + cascade land only in
+    // this machine's clone, every other worker keeps seeing the work as unassigned for the whole
+    // run — the duplicate-work window the cascade exists to close. So the publish fails CLOSED and
+    // no ticket runs, rather than the run proceeding on an unpublished claim.
+    const epicPu = await beads.create(repo, {
+      title: "Unpublishable claim epic",
+      type: "epic",
+      acceptance: "work file exists",
+      description: "## Goal\nPU",
+    });
+    await beads.approve(repo, epicPu);
+    const pu1 = createTicket(repo, { title: "Never dispatched", parent: epicPu });
+
+    const invLog = join(sandbox, "publish-inv.jsonl");
+    const loggingClaude = writeBin(
+      binDir,
+      "claude-publish",
+      fakeClaudeReadingStdin(`const m=prompt.match(/Ticket: (\\S+)/);
+fs.appendFileSync(${JSON.stringify(invLog)},(m?m[1]:'unknown')+'\\n');
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+e({type:'result',subtype:'success',result:'done',session_id:'sp',num_turns:1,is_error:false});
+process.exit(0);`),
+    );
+
+    // Fail only the publish that follows the claim — the run-lease publish (step 1) syncs before any
+    // claim happens, so keying off the claim isolates the leg under test.
+    let claimed = false;
+    const realClaim = beads.claim;
+    const claimSpy = vi.spyOn(beads, "claim").mockImplementation(async (...args) => {
+      const out = await realClaim(...args);
+      claimed = true;
+      return out;
+    });
+    const realSync = beads.sync;
+    const syncSpy = vi.spyOn(beads, "sync").mockImplementation(async (cwd) => {
+      if (claimed) throw new Error("dolt remote unreachable");
+      await realSync(cwd);
+    });
+
+    const runner = makeEpicRunner(ctx);
+
+    process.env.ANTON_CLAUDE_BIN = loggingClaude;
+    let jobId: string;
+    try {
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: epicPu });
+
+      // Retryable, not poison — a locked/unreachable remote self-heals — but nothing ran.
+      expect((await getJob(tdb.db, jobId))?.status).toBe("queued");
+      const invoked = existsSync(invLog) ? readFileSync(invLog, "utf8") : "";
+      expect(invoked).not.toContain(pu1);
+      expect((await beads.show(repo, epicPu)).labels ?? []).not.toContain("stage:in-review");
+    } finally {
+      claimSpy.mockRestore();
+      syncSpy.mockRestore();
       process.env.ANTON_CLAUDE_BIN = successClaude;
       if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
     }

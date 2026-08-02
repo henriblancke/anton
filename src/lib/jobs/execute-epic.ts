@@ -14,7 +14,8 @@
  * commit never got pushed. See DESIGN.md §4/§7.
  */
 import { randomUUID } from "node:crypto";
-import { beads, labelValueOf, LABELS, type Bead } from "../beads/bd";
+import { beads, labelValueOf, LABELS, unclaimableStatus, type Bead, type Gate } from "../beads/bd";
+import { loadAllIssues } from "../beads/issues";
 import { ownerOf } from "../beads/claim";
 import { assignChildren, formatReservedChildren, releaseChildren } from "../beads/child-assign";
 import { contractGaps, formatContractGaps } from "../beads/contract";
@@ -30,6 +31,7 @@ import {
   worktreeHasCommitFor,
   type PullRequest,
 } from "../git/ops";
+import { prNumberFromRef } from "../git/pr";
 import { createWorktree, findWorktree, removeWorktree } from "../git/worktree";
 import { bundledAgentIds, discoverAgents } from "../agents-discovery";
 import { getProjectById, getProjectSettings, resolveReviewConfig } from "../projects";
@@ -174,7 +176,15 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     // feature children (isRunTarget). Distinguish the non-runnable cases so the poison message is
     // honest: a bead that WAS found but isn't a valid target must not read "not found" (that sends
     // the operator hunting for a missing bead), and a container epic must be told it is one.
-    let all = await beads.list(repo, ["--status", "all"]);
+    // `loadAllIssues`, not a bare `bd list`: bd OMITS gate beads from every ordinary listing while
+    // carrying the `blocks` edge a gate puts on the bead it gates, and every blocker helper treats a
+    // blocker it can't see as still open (fail safe). Since a run now arms a `gh:pr` merge gate on
+    // its own target (step 5, anton-k0kj), a bare list would leave that edge dangling and poison the
+    // target's own recovery run forever. The second read only happens when a dangling edge exists.
+    // STRICT: a swallowed gate-listing failure would leave that same edge dangling, and the blocker
+    // check below reads an unknown blocker as open (fail safe) — so a transient bd failure would
+    // poison the run instead of retrying it. Let it reject; the runner retries.
+    let all = await loadAllIssues(repo, { strictGates: true });
     let target = all.find((b) => b.id === epicBeadId);
     if (!target) throw new PoisonEpic(`bead ${epicBeadId} not found on the board`);
     if (!beads.isRunTarget(target, all)) {
@@ -371,7 +381,10 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // target's SHAPE is re-derived from the adopted board too, but in 0a-ter below — after the
       // completion short-circuit, alongside the other gates that must not fire on a finished run.
       try {
-        const fresh = await beads.list(repo, ["--status", "all"]);
+        // Strict for the same reason as the read up top — and here the catch already does the right
+        // thing with a rejection: keep the gate-complete pre-pull snapshot rather than adopting a
+        // fresh board whose gates are missing.
+        const fresh = await loadAllIssues(repo, { strictGates: true });
         const freshTarget = fresh.find((b) => b.id === epicBeadId);
         if (freshTarget) {
           all = fresh;
@@ -455,6 +468,16 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
             await safe(() => beads.tag(repo, epicBeadId, [LABELS.stage("in-review")]));
             await safe(() => beads.untag(repo, epicBeadId, [LABELS.stage("implementing")]));
           }
+          // Reconcile the merge gate here too, for the same reason the stage label is restored
+          // (anton-k0kj): arming it is the LAST thing step 5 does, so a crash after setPrRef — or a
+          // `gateCreate` the best-effort `safe` there swallowed — leaves this target gate-less, and
+          // every later attempt takes THIS return instead of step 5. Without this the wait never
+          // becomes board state: the merge is only ever noticed by the legacy review-fix sweep and no
+          // timeout can surface a stall. Idempotent by construction (mergeGatePlan returns
+          // `create: false` when this PR's gate already exists), so the common no-op short-circuit
+          // writes nothing. Armed for a MERGED ref as well as an open one — gate-check closes it on
+          // the next pass and dispatches finalization, which is exactly what this target still needs.
+          await safe(() => armMergeGate(repo, epicBeadId, prRef, all));
           // Clean up any worktree a prior attempt left behind before short-circuiting (anton-jz1). A
           // resume that crashed AFTER the worktree-warm step (step 2 stamps `worktreePath` on the run
           // row) leaves the git worktree registered/on disk; this idempotent return skips the normal
@@ -888,15 +911,15 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         try {
           await beads.claim(repo, epicBeadId, operator);
         } catch (e) {
-          // A claim failure has two very different causes and only one warrants poisoning. Re-read the
-          // owner to tell them apart: if a DIFFERENT operator now holds the epic, this is a confirmed
+          // A claim failure has three causes and only the transient one is worth retrying. Re-read the
+          // owner to spot the first: if a DIFFERENT operator now holds the epic, this is a confirmed
           // take-over — retrying is pointless, so poison (human must re-approve as the current owner).
           // But `bd update --claim` also throws on transient failures (a Dolt lock, a CLI timeout) with
           // NO ownership change; poisoning those would park a valid approved epic that a retry would
           // claim cleanly. Treat that class as a normal retryable error — the same call runTicket's
           // hard gate makes — so the runner retries instead of parking. A racing steal is still caught:
           // either this re-read sees it, or the pre-read gate above does on the next attempt. If the
-          // re-read ITSELF fails we can't confirm a take-over, so fall through to the retryable path.
+          // re-read ITSELF fails we can't confirm a take-over, so fall through to the status check.
           const ownerNow = await beads
             .show(repo, epicBeadId)
             .then(ownerOf)
@@ -906,6 +929,21 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
               `${epicBeadId} is reserved by ${ownerNow}, not ${operator} — it was taken over after this ` +
                 `run was queued; refusing to run under another operator's claim. Approve ${epicBeadId} as ` +
                 `${ownerNow} to start a run under the current owner. ` +
+                `(${e instanceof Error ? e.message : String(e)})`,
+            );
+          }
+          // The third cause: bd refused because the bead's STATUS isn't claimable (blocked, closed,
+          // deferred), with no ownership change at all — so the re-read above sees nothing wrong and
+          // the old code bucketed it as transient, retried it 3× against an error that can never
+          // change, and parked telling the operator the Dolt DB was locked (anton-e5ix, observed on
+          // anton-f5f3). Poison on the FIRST attempt instead, naming the status and the fix: only a
+          // human moving the bead out of that status can make the claim succeed.
+          const status = unclaimableStatus(e);
+          if (status) {
+            throw new PoisonEpic(
+              `${epicBeadId} cannot be claimed while its status is "${status}" — bd refuses the claim ` +
+                `and no retry can change that. Reopen/unblock ${epicBeadId} (its status must be ` +
+                `claimable, e.g. open) and approve it again to start a run. ` +
                 `(${e instanceof Error ? e.message : String(e)})`,
             );
           }
@@ -972,9 +1010,24 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           );
         }
       }
-      void beads
-        .sync(repo)
-        .catch((e) => console.error(`[execute-epic] claim sync failed for ${epicBeadId}`, e));
+      // 3c. PUBLISH the claim and the cascade before executing anything (anton-0d85). A reservation
+      //     only exists locally until it reaches the Dolt remote, so a fire-and-forget push would
+      //     leave every other machine reading these beads as unassigned for the whole run — exactly
+      //     the duplicate-work window 3a/3b are here to close, reopened at the last step. Await it
+      //     and fail CLOSED, the same rule the run-lease publish follows and for the same reason.
+      //     Retryable (a plain Error): the claim and the cascade are idempotent for this actor, so a
+      //     retry re-publishes rather than re-reserving. `beads.sync` tolerates a no-remote
+      //     workspace, so a single-machine run is unaffected.
+      try {
+        await beads.sync(repo);
+      } catch (e) {
+        throw new Error(
+          `${epicBeadId} was claimed${operator ? ` for ${operator}` : ""} but the claim could not be ` +
+            `published to the shared board — other machines would still see this work as unassigned; ` +
+            `retrying rather than running it unpublished. ` +
+            `(${e instanceof Error ? e.message : String(e)})`,
+        );
+      }
 
       // 4. Per ticket: the formula's ticket phase (its steps up to and including the commit) →
       //    (close | in-review). Skip work that already
@@ -1222,6 +1275,12 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
             }
           }
           await safe(() => beads.setPrRef(repo, epicBeadId, pr.ref));
+          // The merge wait becomes board state, not a polling job (anton-k0kj): past this step the
+          // only thing left to learn is whether this PR merges, which `bd gate check` answers for the
+          // whole project in one call per slot. Best-effort like the writes around it — the
+          // review-fix sweep still finalizes a merge it happens to see, so a failed arm costs
+          // latency, not correctness.
+          await safe(() => armMergeGate(repo, epicBeadId, pr.ref, all));
           if (!standaloneRun) {
             await safe(() => beads.tag(repo, epicBeadId, [LABELS.stage("in-review")]));
             await safe(() => beads.untag(repo, epicBeadId, [LABELS.stage("implementing")]));
@@ -1552,6 +1611,117 @@ async function runTicket(args: {
     }
     throw e;
   }
+}
+
+// ── merge wait (anton-k0kj) ──
+
+/**
+ * How long a merge wait may go unanswered before it stops being a wait and becomes a stall. Nothing
+ * in bd acts on it — a `gh:pr` gate resolves on MERGE and on nothing else, and the `timer` scope
+ * does not even enumerate a gh gate that carries a timeout (measured on bd 1.1.0 and 1.1.2) — so
+ * this is purely the deadline gate-check's expiry pass reads to surface the wait for a human ONCE.
+ * Generous on purpose: a week of review is slow, not broken, and the note costs one glance.
+ * Go duration syntax, which has no `d` unit.
+ */
+const MERGE_GATE_TIMEOUT = "168h";
+
+/**
+ * Arm the run target's merge wait: a `gh:pr` gate on THIS PR number, so "waiting for merge" is board
+ * state that `bd gate check` settles project-wide in one call, instead of a sweep that re-reads every
+ * open PR to discover a merge (anton-k0kj). gate-check closes the gate when the PR merges and hands
+ * the target to review-fix, whose merge-finalize behaviour is unchanged.
+ *
+ * Two cases the arm has to get right, both on the recovery path:
+ *
+ *   • ALREADY ARMED for this same PR (a re-run that reused the open PR) — create nothing. Re-creating
+ *     would leave two gates racing to close the same wait. Every OTHER open merge gate on the target
+ *     is still resolved first, so a stale one left behind by a failed resolve doesn't survive.
+ *   • ARMED FOR A DIFFERENT PR — this target's previous PR was closed without merging and this run
+ *     re-opened it under a new number. bd leaves that gate open FOREVER (a closed-unmerged PR
+ *     escalates, it never resolves), so it must be resolved here or it lingers as a dead wait that
+ *     gate-check would later surface as a stall against a PR nobody is waiting on.
+ *
+ * `board` is the run's own snapshot; gate beads reach it via loadAllIssues. A snapshot too old to
+ * carry a gate just means a duplicate gate on the same PR number — both resolve on the same merge.
+ *
+ * A legacy `epic` run target gets NO gate: bd refuses the edge outright ("epics can only block other
+ * epics, not tasks" — a gate bead is not an epic), and a failed `gate create` still leaves the gate
+ * bead behind, blocking nothing. So the case is refused here rather than attempted: that target keeps
+ * learning about its merge from the review-fix sweep, exactly as before. Features and standalone
+ * task/bug targets — every run target the tier split produces — take the gate.
+ */
+/**
+ * What arming this target's merge wait has to do, from the board alone: every open merge gate that
+ * awaits a DIFFERENT PR (`stale`), and whether this PR's own wait still has to be created.
+ *
+ * ALL the stale gates, not the first: a `gateResolve` that failed on an earlier run leaves a
+ * superseded gate open ALONGSIDE the replacement, and dependency order says nothing about which is
+ * seen first. Stopping at the current PR's gate would strand the other as a dead wait that
+ * gate-check later surfaces as a stall against a PR nobody is waiting on.
+ */
+export function mergeGatePlan(
+  board: Bead[],
+  targetId: string,
+  awaitId: string,
+): { stale: Gate[]; create: boolean } {
+  const byId = new Map(board.map((b) => [b.id, b]));
+  const armed = (board.find((b) => b.id === targetId)?.dependencies ?? [])
+    .filter((d) => d.type === "blocks")
+    .map((d) => byId.get(d.depends_on_id))
+    .filter((b): b is Gate => b !== undefined && b.status !== "closed" && beads.isMergeWaitGate(b));
+  return {
+    stale: armed.filter((g) => g.await_id !== awaitId),
+    create: !armed.some((g) => g.await_id === awaitId),
+  };
+}
+
+async function armMergeGate(
+  repo: string,
+  targetId: string,
+  prRef: string,
+  board: Bead[],
+): Promise<void> {
+  const number = prNumberFromRef(prRef);
+  if (number === undefined) return; // not a PR pointer (a tracker ref) — nothing to wait on
+  const target = board.find((b) => b.id === targetId);
+  if (target && beads.isEpic(target)) {
+    console.log(
+      `[execute-epic] ${targetId} is an epic — bd refuses a gate edge onto one, so its merge stays ` +
+        `on the review-fix sweep (no gh:pr gate armed for PR #${number})`,
+    );
+    return;
+  }
+  const awaitId = String(number);
+
+  const { stale, create } = mergeGatePlan(board, targetId, awaitId);
+
+  for (const gate of stale) {
+    const resolved = await safe(() =>
+      beads.gateResolve(
+        repo,
+        gate.id,
+        `PR #${gate.await_id} is no longer ${targetId}'s pull request — superseded by #${awaitId}`,
+      ),
+    );
+    // A stale gate bd never auto-resolves (a closed-unmerged PR escalates forever) is a permanent
+    // artifact if this write is lost — say so rather than leaving a dead wait to be surfaced later
+    // against a PR nobody is waiting on.
+    if (!resolved) {
+      console.warn(
+        `[execute-epic] could not resolve ${targetId}'s superseded merge gate ${gate.id} ` +
+          `(PR #${gate.await_id}) — it stays open alongside the gate for #${awaitId}`,
+      );
+    }
+  }
+  if (!create) return; // the wait for this PR already exists — a second gate would race it
+
+  await beads.gateCreate(repo, {
+    blocks: targetId,
+    type: "gh:pr",
+    awaitId,
+    timeout: MERGE_GATE_TIMEOUT,
+    reason: `${targetId} is in review — waiting for PR #${awaitId} to merge`,
+  });
 }
 
 // ── helpers ──

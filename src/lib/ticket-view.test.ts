@@ -8,7 +8,7 @@ import {
   runTickets,
   toStandaloneItem,
 } from "./ticket-view";
-import type { Bead } from "./beads/bd";
+import { beads, type Bead } from "./beads/bd";
 
 function makeBead(overrides: Partial<Bead> & { id: string }): Bead {
   return {
@@ -76,6 +76,40 @@ describe("runTickets (the tickets a run target contains)", () => {
       makeBead({ id: "mol-1", issue_type: "molecule", parent: "feat-1" }),
     ];
     expect(runTickets(board, "feat-1").map((b) => b.id)).toEqual(["task-1", "chore-1"]);
+  });
+
+  it("never dispatches a gate, wherever in the subtree it is parented (anton-ve2r)", () => {
+    // The three placements a gate really takes: `bd gate create --blocks <bead>` leaves it
+    // parentless or hung off the bead it gates, and `bd mol pour` hangs one off the molecule root.
+    // This is the set execute-epic works through AND the set the PR body lists, so a gate reaching
+    // it would hand an agent an async wait to implement and advertise it as shipped work.
+    const board = [
+      makeBead({ id: "feat-1", issue_type: "feature" }),
+      makeBead({ id: "task-1", parent: "feat-1" }),
+      makeBead({ id: "gate-on-feature", issue_type: "gate", parent: "feat-1" }),
+      makeBead({ id: "gate-on-task", issue_type: "gate", parent: "task-1" }),
+      makeBead({ id: "gate-loose", issue_type: "gate" }),
+    ];
+    expect(runTickets(board, "feat-1").map((b) => b.id)).toEqual(["task-1"]);
+  });
+
+  it("leaves a poured molecule's steps on their molecule, not on the target it hangs under", () => {
+    // A molecule root parented under a feature: bd sequences its steps behind their gates, so the
+    // feature's run must not sweep them into one worktree and dispatch them ungated. The board
+    // already drops them (it filters plumbing before resolving cards); this keeps the runner, which
+    // resolves cards over the RAW list, from disagreeing with it.
+    const board = [
+      makeBead({ id: "feat-1", issue_type: "feature" }),
+      makeBead({ id: "task-1", parent: "feat-1" }),
+      makeBead({ id: "mol-1", issue_type: "molecule", parent: "feat-1" }),
+      makeBead({ id: "step-1", parent: "mol-1" }),
+      makeBead({ id: "gate-1", issue_type: "gate", parent: "mol-1" }),
+    ];
+    expect(runTickets(board, "feat-1").map((b) => b.id)).toEqual(["task-1"]);
+    // And the plumbing owns no run of its own to sweep them into either.
+    expect(runTickets(board, "mol-1")).toEqual([]);
+    expect(beads.isRunTarget(board[2]!, board), "a molecule is not runnable").toBe(false);
+    expect(beads.isRunTarget(board[4]!, board), "a gate is not runnable").toBe(false);
   });
 
   it("closes over a malformed parent cycle rather than hanging", () => {

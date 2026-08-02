@@ -44,14 +44,15 @@ describe("the pickup protocol is teachable without the anton runtime", () => {
       });
 
       it("gives the full claim-verify sequence, in order", () => {
-        // The six legs of beads.claimVerified. A doc that drops the settle or the re-read teaches a
-        // claim that looks held on one machine and isn't.
+        // The seven legs of beads.claimVerified. A doc that drops the settle, the re-read or the
+        // re-validation teaches a claim that looks held — or still runnable — and isn't.
         const legs = [
           /bd dolt pull/,
           /BEADS_ACTOR="\$ACTOR" bd update <id> --claim/,
           /bd dolt commit && bd dolt push/,
           /sleep 2/,
           /bd show <id> --json/,
+          /re-apply §1 to the target you now hold/,
         ];
         let cursor = 0;
         for (const leg of legs) {
@@ -62,9 +63,12 @@ describe("the pickup protocol is teachable without the anton runtime", () => {
         expect(doc).toMatch(/assert assignee == "\$ACTOR"/);
       });
 
-      it("names all three claim outcomes, and licenses a run only on the first", () => {
-        expect(doc).toMatch(/assignee is you\*\* → you hold it/);
+      it("names all four claim outcomes, and licenses a run only on the first", () => {
+        expect(doc).toMatch(/assignee is you, and §1 still holds\*\* → you hold it/);
         expect(doc).toMatch(/Back off \*without writing anything\*/);
+        // The target left the claimable set while we settled: ours on paper, not runnable.
+        expect(doc).toMatch(/but the target left the claimable set\*\*/);
+        expect(doc).toMatch(/Hand the claim back \(`bd assign <id> ""`\)/);
         expect(doc).toMatch(/fail closed: do not run the target/);
       });
 

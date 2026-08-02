@@ -105,6 +105,11 @@ const AUTOMATIONS = [
     label: "unstick",
     meta: "acts on run-health's findings · idle until run-health is on · 10 * * * *",
   },
+  {
+    id: "gate-check",
+    label: "gate-check",
+    meta: "resumes runs whose gate closed · */10 * * * * · human gates never auto-close",
+  },
 ];
 
 /** Per-automation schedule state from the server; a missing row means "not scheduled yet". */

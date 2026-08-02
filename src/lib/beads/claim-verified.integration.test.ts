@@ -125,6 +125,27 @@ describeBd("the pickup protocol (real bd)", () => {
     expect(await claimableIds()).not.toContain(target);
   });
 
+  it("rejects a target that left the claimable set while the claim settled", async () => {
+    const target = await beads.create(repo, {
+      title: "unapproved mid-claim",
+      type: "feature",
+      labels: ["approved"],
+    });
+
+    // Another machine's write lands between our claim and its verification. Winning the assignee
+    // must not license a run — the fresh board says this target is no longer approved. Only the
+    // interleaving is injected; both writes and both reads are real bd.
+    const result = await beads.claimVerified(repo, target, "worker-a", {
+      claim: async (cwd, id, actor) => {
+        await beads.claim(cwd, id, actor);
+        await beads.untag(repo, target, ["approved"]);
+      },
+    });
+
+    expect(result).toMatchObject({ ok: false, reason: "stale" });
+    expect((result as { detail: string }).detail).toMatch(/approval was withdrawn/);
+  });
+
   it("re-claiming your own target verifies clean, and another actor still loses", async () => {
     const target = await beads.create(repo, {
       title: "re-claimed feature",

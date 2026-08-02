@@ -12,6 +12,7 @@ import {
   acceptanceBody,
   contractStatusOf,
   goalBody,
+  isPipelineArtifact,
   isTicketTier,
   type ContractStatus,
 } from "./beads/contract";
@@ -169,6 +170,12 @@ export interface BoardCards {
  * Returns undefined when no ancestor is a card (a task directly under a container epic — work no
  * run ships; it stays visible on the epic detail page and the Tickets list). Guards against a
  * malformed parent cycle.
+ *
+ * The walk STOPS at pipeline plumbing (anton-ve2r): a poured molecule's steps ride on that molecule,
+ * whose gates bd sequences — so if the molecule root is parented under a feature, they are still not
+ * that feature's tickets. Walking through it would dispatch a gated step in the feature's worktree
+ * before its gate ever resolved, and would make the runner (which resolves cards over the raw list)
+ * dispatch tickets the board (which filters plumbing out first) never showed.
  */
 export function boardCards(all: Bead[]): BoardCards {
   const byId = new Map(all.map((b) => [b.id, b]));
@@ -182,6 +189,7 @@ export function boardCards(all: Bead[]): BoardCards {
         if (ids.has(parentId)) return parentId;
         seen.add(parentId);
         const parent = byId.get(parentId);
+        if (parent && isPipelineArtifact(parent)) return undefined;
         parentId = parent ? beads.parentOf(parent) : undefined;
       }
       return undefined;
@@ -193,13 +201,18 @@ export function boardCards(all: Bead[]): BoardCards {
  * A working-layer bead: a ticket-tier type (task/bug/chore/feature — the contract's own
  * `isTicketTier`) that is not itself a card. These are the beads that ride on a run target as its
  * tickets, and the tier gate is what keeps dispatch and contract one taxonomy: an exempt-type
- * descendant (`learning`, `molecule`, a custom type) rides on NO run — dispatching it would hand an
- * agent a bead whose spec `contractGaps` never judges, and closing it on merge would retire an
- * artifact that was never work. A container epic falls out the same way (`epic` is not ticket
- * tier); a non-container epic and every feature are already cards.
+ * descendant (`learning`, a custom type) rides on NO run — dispatching it would hand an agent a
+ * bead whose spec `contractGaps` never judges, and closing it on merge would retire an artifact that
+ * was never work. A container epic falls out the same way (`epic` is not ticket tier); a
+ * non-container epic and every feature are already cards.
+ *
+ * Pipeline plumbing (`molecule`/`gate`) is refused explicitly ahead of the tier gate (anton-ve2r),
+ * so a gate parented ANYWHERE in a run target's subtree — `bd mol pour` hangs one off the molecule
+ * root, and `bd gate create` can hang one off the gated bead — can never be dispatched, counted, or
+ * rendered as one of that run's tickets.
  */
 export function isRunTicket(bead: Bead, cards: BoardCards): boolean {
-  return !cards.ids.has(bead.id) && isTicketTier(bead);
+  return !cards.ids.has(bead.id) && !isPipelineArtifact(bead) && isTicketTier(bead);
 }
 
 /**

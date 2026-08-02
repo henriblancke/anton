@@ -24,9 +24,10 @@ const { spawned, failWith } = vi.hoisted(() => ({
   failWith: { batchStderr: undefined as string | undefined },
 }));
 
-vi.mock("node:child_process", async () => {
+vi.mock("node:child_process", async (importActual) => {
   const { makeFakeSpawn } = await import("../testing/spawn");
   return {
+    ...(await importActual<typeof import("node:child_process")>()),
     spawn: makeFakeSpawn(spawned, ({ args }) =>
       args[0] === "batch" && failWith.batchStderr !== undefined
         ? { code: 1, stderr: failWith.batchStderr }

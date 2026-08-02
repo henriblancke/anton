@@ -375,3 +375,44 @@ describe("epicStandaloneBlockers", () => {
     expect(epicStandaloneBlockers(beads, "MISSING")).toEqual([]);
   });
 });
+
+/**
+ * anton-k0kj: a `gh:pr` gate awaits the blocked bead's OWN pull request, so it is a merge wait, not a
+ * prerequisite. Counting it would make an in-review target read as blocked by itself — and bd never
+ * resolves a gh:pr gate whose PR was closed without merging, so that state would be permanent and
+ * the recovery run unreachable.
+ */
+describe("a target's own merge gate is not a blocker", () => {
+  const mergeGate = (id: string, o: Partial<Bead> = {}): Bead =>
+    ({ id, title: `Gate: gh:pr`, status: "open", issue_type: "gate", await_type: "gh:pr", ...o }) as Bead;
+
+  it("does not block the epic it gates", () => {
+    const beads = [epic("E", { dependencies: [blocks("E", "G")] }), mergeGate("G")];
+    expect(epicStandaloneBlockers(beads, "E")).toEqual([]);
+  });
+
+  it("does not block a standalone (epic-of-one) target either", () => {
+    const beads = [standalone("S", { dependencies: [blocks("S", "G")] }), mergeGate("G")];
+    expect(standaloneBlockers(beads, "S")).toEqual([]);
+  });
+
+  it("still blocks on human and timer gates — those ARE prerequisites someone put in the way", () => {
+    const human = mergeGate("H", { await_type: "human" } as Partial<Bead>);
+    const timer = mergeGate("T", { await_type: "timer" } as Partial<Bead>);
+    const beads = [
+      epic("E", { dependencies: [blocks("E", "H")] }),
+      standalone("S", { dependencies: [blocks("S", "T")] }),
+      human,
+      timer,
+    ];
+    expect(epicStandaloneBlockers(beads, "E")).toEqual(["H"]);
+    expect(standaloneBlockers(beads, "S")).toEqual(["T"]);
+  });
+
+  it("keeps the fail-safe for a gate the board read could not carry", () => {
+    // No gate bead present ⇒ unclassifiable ⇒ still an open blocker. Which is exactly why the run
+    // path reads the board through loadAllIssues (it fetches gate beads) rather than a bare bd list.
+    const beads = [epic("E", { dependencies: [blocks("E", "G")] })];
+    expect(epicStandaloneBlockers(beads, "E")).toEqual(["G"]);
+  });
+});

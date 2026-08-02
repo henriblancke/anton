@@ -74,9 +74,10 @@ describe("schedules route", () => {
     const res = await GET(new Request("http://t/"), ctx("tmp"));
     expect(res.status).toBe(200);
     const { schedules } = await res.json();
-    expect(schedules).toHaveLength(5);
+    expect(schedules).toHaveLength(6);
     const types = schedules.map((s: { type: string }) => s.type).sort();
     expect(types).toEqual([
+      "gate-check",
       "nightly-stringer",
       "orphan-grooming",
       "review-fix",
@@ -95,6 +96,8 @@ describe("schedules route", () => {
       "review-fix": true,
       "run-health": false,
       unstick: true,
+      // gate-check (anton-286r) is armed by default: nothing else resumes a run parked on a gate.
+      "gate-check": true,
     });
   });
 
