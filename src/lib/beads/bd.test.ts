@@ -463,6 +463,14 @@ describe("isNotWiredOutput", () => {
   it("matches only the missing-remote outcome, not a clean working set", () => {
     expect(isNotWiredOutput("No remote is configured — skipping.")).toBe(true);
     expect(isNotWiredOutput("No remotes configured.")).toBe(true);
+    // The same condition as bd's PULL words it — a solo board must not read as `failing`.
+    expect(
+      isNotWiredOutput("Error: fetch from origin/main: Error 1105: no remote\n\nPulling..."),
+    ).toBe(true);
+    // …but a real fetch failure that merely mentions a remote is not "no remote at all".
+    expect(isNotWiredOutput("fetch from origin/main: Error 1105: no remote branch found")).toBe(
+      false,
+    );
     expect(isNotWiredOutput("Nothing to commit.")).toBe(false);
   });
 });
