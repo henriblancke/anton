@@ -1,0 +1,1 @@
+ALTER TABLE `hygiene_reports` ADD `completed_at` integer;

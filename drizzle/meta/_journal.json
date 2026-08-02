@@ -57,6 +57,20 @@
       "when": 1785645487881,
       "tag": "0007_busy_captain_stacy",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1785691286106,
+      "tag": "0008_sweet_arclight",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1785702884402,
+      "tag": "0009_rich_songbird",
+      "breakpoints": true
     }
   ]
 }
