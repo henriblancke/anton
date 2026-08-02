@@ -21,7 +21,8 @@ export type JobType =
   | "orphan-grooming"
   | "sync-push"
   | "run-health"
-  | "unstick";
+  | "unstick"
+  | "gate-check";
 
 /**
  * `queued`  — eligible when runAt ≤ now (also how a backoff/quota reschedule is represented).
@@ -347,6 +348,64 @@ export function enqueueExecuteEpicIfAbsent(
     if (isUniqueViolation(e)) return undefined;
     throw e;
   }
+}
+
+/**
+ * Enqueue a review-fix job SCOPED TO ONE run target, unless an identical one is already live. This
+ * is how a closed merge gate reaches review-fix (anton-k0kj): gate-check learns the PR merged from
+ * the board and hands that one target to the sweep, which finalizes it exactly as it always has.
+ *
+ * Deduped on (project, epicBeadId) over queued/running rows only. A settled row — done, parked,
+ * failed — must NOT hold a target back: gate-check re-dispatches every pass until the finalize
+ * actually lands (the target closes and loses `stage:in-review`), which is what makes a failed
+ * finalize self-healing rather than a one-shot that silently lost. The project-wide sweep is not
+ * counted as covering either; it is a different job (no `epicBeadId`) and may skip this target on
+ * ownership, so treating it as coverage could strand the finalize until the next slot.
+ *
+ * Synchronous transaction with no awaits inside, like the execute-epic helpers above: better-sqlite3
+ * runs one connection, so the read→write pair cannot interleave and two overlapping gate-check
+ * passes yield exactly one job. There is no partial-unique backstop for review-fix rows, so the
+ * transaction IS the guarantee — don't make this async.
+ */
+export function enqueueReviewFixIfAbsent(
+  db: AntonDb,
+  clock: Clock,
+  projectId: string,
+  epicBeadId: string,
+): string | undefined {
+  const nowMs = clock.now();
+  return db.transaction((tx) => {
+    const existing = tx
+      .select({ id: schema.jobs.id })
+      .from(schema.jobs)
+      .where(
+        and(
+          eq(schema.jobs.type, "review-fix"),
+          eq(schema.jobs.projectId, projectId),
+          inArray(schema.jobs.status, [...ACTIVE_STATUSES]),
+          eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
+        ),
+      )
+      .limit(1)
+      .all();
+    if (existing[0]) return undefined;
+
+    const id = randomUUID();
+    tx.insert(schema.jobs)
+      .values({
+        id,
+        type: "review-fix",
+        projectId,
+        payloadJson: JSON.stringify({ projectId, epicBeadId }),
+        status: "queued",
+        runAt: secDate(nowMs),
+        attempts: 0,
+        createdAt: secDate(nowMs),
+        updatedAt: secDate(nowMs),
+      })
+      .run();
+    return id;
+  });
 }
 
 /**

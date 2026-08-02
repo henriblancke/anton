@@ -1,15 +1,26 @@
 /**
  * Resolve a project's GitHub web base from its `origin` remote so the UI can turn a bead's
  * external-ref (stored as `gh-<number>`, see git/ops.ts `prFromUrl`) into a clickable PR link.
- * The remote lookup is a fast local `git` call, memoized per repo path for the process lifetime.
+ * The remote lookup is a fast local `git` call, cached per repo path for {@link REMOTE_TTL_MS}.
  */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
-/** repoPath → resolved base (or undefined). `null` marks "resolved, but none" to avoid re-spawning. */
-const cache = new Map<string, string | null>();
+/** repoPath → resolved base + when it was read. `null` marks "resolved, but none". */
+const cache = new Map<string, { base: string | null; at: number }>();
+
+/**
+ * How long a resolved `origin` is trusted. Deliberately short rather than a process-lifetime memo:
+ * `githubRepoSlug` is what `GH_REPO` takes, and GH_REPO overrides how `gh` resolves the repository
+ * a command targets — so an origin retargeted under a long-running anton would keep every gate
+ * check pointed at the OLD repository, where a same-numbered PR or run can close a gate that isn't
+ * satisfied (and the real one stays open). One TTL bounds that window; gate-check's own cadence is
+ * coarser than this, so in practice each pass re-reads the remote while a page render still costs
+ * at most one `git remote get-url`.
+ */
+export const REMOTE_TTL_MS = 60_000;
 
 /**
  * Normalize a git remote URL to its web base, e.g.
@@ -33,19 +44,44 @@ export function webBaseFromRemote(remote: string | undefined): string | undefine
 /** Resolve (and cache) the GitHub web base for a repo's `origin`. undefined when there's no remote. */
 export async function githubBaseUrl(repoPath: string): Promise<string | undefined> {
   const cached = cache.get(repoPath);
-  if (cached !== undefined) return cached ?? undefined;
+  if (cached && Date.now() - cached.at < REMOTE_TTL_MS) return cached.base ?? undefined;
   try {
     const { stdout } = await execFileAsync("git", ["remote", "get-url", "origin"], {
       cwd: repoPath,
       timeout: 10_000,
     });
     const base = webBaseFromRemote(stdout) ?? null;
-    cache.set(repoPath, base);
+    cache.set(repoPath, { base, at: Date.now() });
     return base ?? undefined;
   } catch {
-    cache.set(repoPath, null);
+    cache.set(repoPath, { base: null, at: Date.now() });
     return undefined;
   }
+}
+
+/** Test hook: drop every cached remote so the next read re-spawns `git`. */
+export function resetRemoteCache(): void {
+  cache.clear();
+}
+
+/**
+ * `owner/repo` for a github.com web base, or undefined for any other host (a GHE/GitLab/local
+ * remote). Pure — unit-testable.
+ */
+export function githubSlugFromBase(base: string | undefined): string | undefined {
+  return base?.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)$/)?.[1];
+}
+
+/**
+ * `owner/repo` of the repo's `origin`, or undefined when it isn't a github.com remote. This is the
+ * value `GH_REPO` takes: it overrides how the `gh` CLI resolves which repository a command targets,
+ * which is what makes it the belt-and-braces guard for beads gate checks (bd shells out to `gh`, and
+ * `gh` otherwise resolves the repo from the process cwd — see beads/bd.ts `bdGate`). Rides
+ * `githubBaseUrl`'s per-repo cache, so it costs at most one `git remote get-url` per repo per
+ * {@link REMOTE_TTL_MS} — short enough that a retargeted origin can't misdirect a later gate check.
+ */
+export async function githubRepoSlug(repoPath: string): Promise<string | undefined> {
+  return githubSlugFromBase(await githubBaseUrl(repoPath));
 }
 
 /**

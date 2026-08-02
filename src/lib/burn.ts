@@ -62,6 +62,7 @@ export const JOB_TYPE_TIER: Record<JobType, BurnTier> = {
   "sync-push": "none",
   "run-health": "none",
   unstick: "none",
+  "gate-check": "none",
 };
 
 /**

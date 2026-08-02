@@ -10,6 +10,19 @@
  * is left alone. Living here — rather than in a new job type — means every existing project gets
  * merge finalization on its next poll without re-seeding schedules.
  *
+ * HOW A MERGE IS LEARNED changed in anton-k0kj; what is DONE about it did not. execute-epic arms a
+ * `gh:pr` gate on the target when it opens the PR, gate-check settles every merge wait in the
+ * project with one `bd gate check`, and a closed gate dispatches this job scoped to that one target
+ * (`epicBeadId`) — so the merge arrives as a board event instead of being discovered by re-reading
+ * every open PR. The `pr.state === "MERGED"` branch below is unchanged and stays the executor of it.
+ *
+ * THE REVIEW-EVENT POLL SURVIVES, BY DESIGN. It is the one wait gates cannot replace: a `gh:pr` gate
+ * resolves on MERGE and escalates on CLOSE, its whole GitHub read is `gh pr view <id> --json
+ * state,title`, and bd offers no review-flavoured gate type at all (`--type` = human|timer|gh:run|
+ * gh:pr). Requested changes, a new review comment and red CI are therefore invisible to the gate
+ * model, so the periodic sweep below remains the trigger for them. See
+ * .product/decisions/2026-08-02-pr-merge-as-gh-pr-gate.md.
+ *
  * Enqueued per-project by the scheduler (a polling job): each run sweeps every in-review epic once.
  * Idempotent — a PR with nothing actionable is skipped, claude's fixes are plain commits on the
  * existing branch (a re-run just pushes whatever is left), and finalizing a merge clears
@@ -78,14 +91,17 @@ const consoleLog: RunnerLogger = {
 
 /**
  * Does the current operator own this epic? On a shared board an operator may only fix/finalize the
- * in-review PRs it claimed (or unclaimed ones) — never another operator's. `assignee` is the claim
+ * in-review PRs it claimed (or unclaimed ones) — never another operator's. Exported because
+ * gate-check applies the SAME test before it dispatches a merged target by id: its discovery is the
+ * shared board, so every instance sees the same closed gate, and a targeted dispatch bypasses the
+ * filter below (anton-k0kj). `assignee` is the claim
  * execute-epic stamps (beads.claim → `bd update --claim`, actor = resolveOperator); unclaimed beads
  * carry null/absent/empty. resolveOperator resolves the same identity — down to bd's $USER fallback
  * (anton-g3v) — that stamped the claim, so a claim this instance made always matches. `operator`
  * is undefined only in the degenerate case where even $USER is unset; then nothing but unclaimed
  * epics match, so an anton that genuinely can't name itself never races a claimed PR.
  */
-function ownedByOperator(b: Bead, operator: string | undefined): boolean {
+export function ownedByOperator(b: Bead, operator: string | undefined): boolean {
   const assignee = (b.assignee ?? undefined)?.trim() || undefined;
   if (!assignee) return true; // unclaimed — free to take
   return assignee === operator; // claimed-by-me; a different operator's claim is excluded
@@ -207,7 +223,9 @@ async function handleEpic(args: {
 
   // A merged PR is terminal — finalize the epic (done + cleanup) rather than fixing feedback. A PR
   // merely CLOSED (not merged) falls through to classifyReview, which treats any non-OPEN state as
-  // not-actionable, so it is left untouched.
+  // not-actionable, so it is left untouched — PR ref and all, which is what a recovery re-run reads
+  // (execute-epic step 0a). Its merge gate stays open for the same reason: bd never resolves a
+  // gh:pr gate on a closed-unmerged PR, so nothing here or in gate-check can mistake it for done.
   if (pr.state === "MERGED") {
     await finalizeMergedEpic({
       db,

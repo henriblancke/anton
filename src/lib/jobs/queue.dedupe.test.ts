@@ -12,6 +12,7 @@ import {
   deferQueuedJobs,
   enqueueExecuteEpicDeduped,
   enqueueExecuteEpicIfAbsent,
+  enqueueReviewFixIfAbsent,
   getJob,
   resumeJob,
   systemClock,
@@ -311,5 +312,63 @@ describe("resumeJob vs the active-epic index (anton-ner)", () => {
     const job = await getJob(t.db, parked);
     expect(job?.status).toBe("queued");
     expect(job?.attempts).toBe(0);
+  });
+});
+
+/**
+ * anton-k0kj: the gate-driven merge dispatch. Every gate-check pass re-derives its list from the
+ * board, so overlapping passes must converge on one job — and a SETTLED job must not hold a target
+ * back, or a finalize that failed once would never be retried.
+ */
+describe("enqueueReviewFixIfAbsent", () => {
+  it("enqueues one targeted review-fix job and dedupes the next pass onto it", () => {
+    const a = enqueueReviewFixIfAbsent(t.db, systemClock, "p1", "epic-1");
+    expect(a).toBeDefined();
+    expect(enqueueReviewFixIfAbsent(t.db, systemClock, "p1", "epic-1")).toBeUndefined();
+    expect(activeRows()).toHaveLength(1);
+    expect(JSON.parse(activeRows()[0].payloadJson)).toEqual({
+      projectId: "p1",
+      epicBeadId: "epic-1",
+    });
+  });
+
+  it("dedupes against a running job too", () => {
+    const a = enqueueReviewFixIfAbsent(t.db, systemClock, "p1", "epic-1")!;
+    t.db.update(schema.jobs).set({ status: "running" }).where(eq(schema.jobs.id, a)).run();
+    expect(enqueueReviewFixIfAbsent(t.db, systemClock, "p1", "epic-1")).toBeUndefined();
+    expect(activeRows()).toHaveLength(1);
+  });
+
+  it("re-dispatches after a settled attempt — a failed finalize must be retryable", () => {
+    for (const status of ["done", "failed", "parked"] as const) {
+      const id = enqueueReviewFixIfAbsent(t.db, systemClock, "p1", `epic-${status}`)!;
+      t.db.update(schema.jobs).set({ status }).where(eq(schema.jobs.id, id)).run();
+      expect(enqueueReviewFixIfAbsent(t.db, systemClock, "p1", `epic-${status}`)).toBeDefined();
+    }
+  });
+
+  it("does not treat the project-wide sweep as covering a target", () => {
+    t.db
+      .insert(schema.jobs)
+      .values({
+        id: "sweep",
+        type: "review-fix",
+        projectId: "p1",
+        payloadJson: JSON.stringify({ projectId: "p1" }),
+        status: "queued",
+        runAt: new Date(),
+        attempts: 0,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .run();
+    expect(enqueueReviewFixIfAbsent(t.db, systemClock, "p1", "epic-1")).toBeDefined();
+  });
+
+  it("keeps targets and projects independent", () => {
+    const a = enqueueReviewFixIfAbsent(t.db, systemClock, "p1", "epic-1");
+    const b = enqueueReviewFixIfAbsent(t.db, systemClock, "p1", "epic-2");
+    const c = enqueueReviewFixIfAbsent(t.db, systemClock, "p2", "epic-1");
+    expect(new Set([a, b, c]).size).toBe(3);
   });
 });

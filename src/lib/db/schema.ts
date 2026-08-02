@@ -51,7 +51,8 @@ export const jobs = sqliteTable(
   "jobs",
   {
     id: text("id").primaryKey(),
-    // execute-epic | review-fix | nightly-stringer | orphan-grooming | sync-push | run-health | unstick
+    // execute-epic | review-fix | nightly-stringer | orphan-grooming | sync-push | run-health |
+    // unstick | gate-check
     type: text("type").notNull(),
     projectId: text("project_id").references(() => projects.id),
     payloadJson: text("payload_json").notNull().default("{}"),

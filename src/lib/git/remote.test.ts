@@ -1,5 +1,17 @@
-import { describe, expect, it } from "vitest";
-import { attachPrUrl, prUrlFromRef, webBaseFromRemote } from "./remote";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  attachPrUrl,
+  githubRepoSlug,
+  githubSlugFromBase,
+  prUrlFromRef,
+  REMOTE_TTL_MS,
+  resetRemoteCache,
+  webBaseFromRemote,
+} from "./remote";
 
 describe("webBaseFromRemote", () => {
   it("normalizes scp-style ssh remotes", () => {
@@ -31,6 +43,21 @@ describe("webBaseFromRemote", () => {
   });
 });
 
+describe("githubSlugFromBase", () => {
+  it("yields the owner/repo GH_REPO takes", () => {
+    expect(githubSlugFromBase(webBaseFromRemote("git@github.com:owner/repo.git"))).toBe(
+      "owner/repo",
+    );
+    expect(githubSlugFromBase("https://github.com/owner/repo")).toBe("owner/repo");
+  });
+
+  it("declines anything that isn't github.com — GH_REPO would misdirect gh, not protect it", () => {
+    expect(githubSlugFromBase("https://ghe.corp.com/team/app")).toBeUndefined();
+    expect(githubSlugFromBase("https://github.com/owner")).toBeUndefined();
+    expect(githubSlugFromBase(undefined)).toBeUndefined();
+  });
+});
+
 describe("prUrlFromRef", () => {
   const base = "https://github.com/owner/repo";
 
@@ -48,6 +75,55 @@ describe("prUrlFromRef", () => {
     expect(prUrlFromRef("gh-218", undefined)).toBeUndefined();
     expect(prUrlFromRef(undefined, base)).toBeUndefined();
     expect(prUrlFromRef("", base)).toBeUndefined();
+  });
+});
+
+/**
+ * The slug is what `GH_REPO` takes, and GH_REPO overrides which repository `gh` resolves for every
+ * beads gate check — so it must not outlive the remote it was read from. Real git, real cache.
+ */
+describe("githubRepoSlug caching", () => {
+  const repos: string[] = [];
+
+  const repoWithOrigin = (url: string): string => {
+    const dir = mkdtempSync(join(tmpdir(), "anton-remote-"));
+    repos.push(dir);
+    execFileSync("git", ["init", "-q"], { cwd: dir });
+    execFileSync("git", ["remote", "add", "origin", url], { cwd: dir });
+    return dir;
+  };
+
+  afterEach(() => {
+    vi.useRealTimers();
+    resetRemoteCache();
+    for (const dir of repos.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("re-reads a retargeted origin once the TTL lapses", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const repo = repoWithOrigin("git@github.com:owner/old.git");
+    expect(await githubRepoSlug(repo)).toBe("owner/old");
+
+    execFileSync("git", ["remote", "set-url", "origin", "git@github.com:owner/new.git"], {
+      cwd: repo,
+    });
+    expect(await githubRepoSlug(repo)).toBe("owner/old"); // still inside the TTL
+
+    vi.setSystemTime(Date.now() + REMOTE_TTL_MS + 1);
+    // A gate evaluated against `owner/old` here could close on a same-numbered PR in the wrong repo.
+    expect(await githubRepoSlug(repo)).toBe("owner/new");
+  });
+
+  it("yields no slug for a non-github origin, and re-checks that too", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const repo = repoWithOrigin("git@ghe.corp.com:team/app.git");
+    expect(await githubRepoSlug(repo)).toBeUndefined();
+
+    execFileSync("git", ["remote", "set-url", "origin", "git@github.com:owner/repo.git"], {
+      cwd: repo,
+    });
+    vi.setSystemTime(Date.now() + REMOTE_TTL_MS + 1);
+    expect(await githubRepoSlug(repo)).toBe("owner/repo");
   });
 });
 

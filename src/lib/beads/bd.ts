@@ -5,7 +5,9 @@
  */
 import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
+import { githubRepoSlug } from "../git/remote";
 import { resolveBdBin } from "./bd-bin";
+import { isPipelineArtifact } from "./contract";
 import { invalidateIssueSnapshot } from "./snapshot";
 
 // Bead/BeadDep live in the leaf ./types module so snapshot.ts can share them without importing
@@ -323,11 +325,24 @@ function killGraceMs(): number {
 
 /** Per-invocation knobs for {@link bd}: extra env, and stdin for the commands that read it. */
 interface BdOpts {
-  /** Merged over `process.env` (e.g. BEADS_ACTOR for an attributed write). */
-  env?: Record<string, string>;
+  /** Merged over `process.env` (e.g. BEADS_ACTOR for an attributed write). An `undefined` value
+   * REMOVES the variable rather than inheriting the server's — see {@link childEnv}. */
+  env?: Record<string, string | undefined>;
   /** Written to bd's stdin, which is then closed. Required by `bd batch`, which reads its
    * commands from stdin — without it bd would block on an open pipe until the step budget. */
   stdin?: string;
+}
+
+/**
+ * The server's env with `overrides` applied, where an `undefined` override REMOVES the variable
+ * rather than leaving whatever the server was launched with. That deletion is the point: a gate call
+ * that can't derive a slug must not inherit an ambient `GH_REPO`, which would override `gh`'s repo
+ * resolution and answer this project's gates with another repository's verdict.
+ */
+function childEnv(overrides: Record<string, string | undefined>): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, ...overrides };
+  for (const [key, value] of Object.entries(overrides)) if (value === undefined) delete env[key];
+  return env;
 }
 
 /**
@@ -362,7 +377,7 @@ async function bd(cwd: string, args: string[], opts?: BdOpts): Promise<string> {
       cwd,
       // POSIX: make bd the leader of a new process group so the whole tree is reachable as one.
       detached: process.platform !== "win32",
-      ...(opts?.env ? { env: { ...process.env, ...opts.env } } : {}),
+      ...(opts?.env ? { env: childEnv(opts.env) } : {}),
     });
 
     if (opts?.stdin !== undefined) {
@@ -905,12 +920,16 @@ const doltSync = ((globalThis as unknown as Record<symbol, ReturnType<typeof cre
   DOLT_SYNC_KEY
 ] ??= createDoltSync());
 
-/** bd --json returns either a top-level array or `{ issues: [...] }`. Normalize to an array. */
+/**
+ * bd --json returns either a top-level array or a `{ <key>: [...] }` envelope. Normalize to an
+ * array. `molecules` is `bd ready --gated`'s envelope (`{ count, molecules }`).
+ */
 function asArray<T>(raw: string): T[] {
   const d = JSON.parse(raw || "[]");
   if (Array.isArray(d)) return d;
   if (d && Array.isArray(d.issues)) return d.issues;
   if (d && Array.isArray(d.results)) return d.results;
+  if (d && Array.isArray(d.molecules)) return d.molecules;
   return [];
 }
 
@@ -950,6 +969,189 @@ export function unclaimableStatus(e: unknown): string | undefined {
   const stderr = typeof err?.stderr === "string" ? err.stderr : "";
   const message = typeof err?.message === "string" ? err.message : "";
   return /not claimable:\s*status\s+([a-z_]+)/i.exec(`${stderr}\n${message}`)?.[1];
+}
+
+// ── gate seam (anton-uk95) ──
+//
+// A gate is a real bead (`issue_type: gate`) that blocks its step with an ordinary `blocks` edge, so
+// an async wait is board-visible state and costs nothing while it waits. `bd gate check` evaluates
+// open timer/GitHub gates and closes the satisfied ones.
+//
+// THE INVARIANT EVERY CALL HERE EXISTS TO HOLD: bd is spawned with `cwd` = the project repo, and
+// NEVER with `-C`. `bd -C <dir>` changes only which DATABASE bd reads — it does not change the
+// process cwd — while the `gh` subprocess bd spawns to evaluate a `gh:run` / `gh:pr` gate resolves
+// its repository from that cwd. So `-C` yields a verdict from whatever repo the caller happened to
+// start in, in BOTH directions: a green CI run in project A resolves project B's gate (a false
+// green), and a failed run in A escalates B's (a false escalation). Proven on bd 1.1.0 and 1.1.2 in
+// .product/decisions/2026-07-28-bd-workflow-primitives.md §5; locked in by gate-cwd.integration.test.ts.
+// `bd gate discover` draws its candidate runs from the same cwd, so the rule covers it too.
+
+/** Gate flavours `bd gate create --type` accepts. `bead` is deliberately absent — unresolvable here. */
+export type GateType = "human" | "timer" | "gh:run" | "gh:pr";
+
+/** What `bd gate check --type` may be scoped to: one gate type, `gh` (both GitHub types), or all. */
+export type GateCheckScope = GateType | "gh" | "bead" | "all";
+
+/** A gate bead, as `bd gate list --json` returns it. */
+export interface Gate extends Bead {
+  /** The gate's flavour (bd's `await_type`). */
+  await_type?: GateType;
+  /** The condition identifier — a workflow run id for `gh:run`, a PR number for `gh:pr`. */
+  await_id?: string;
+  /**
+   * Timeout in NANOSECONDS — bd serialises a Go `time.Duration` as an integer, so `--timeout=2h`
+   * reads back as 7.2e12. Absent when the gate has no deadline (bd's default: wait forever).
+   * {@link gateDeadline} is the only place that converts it.
+   */
+  timeout?: number;
+}
+
+export interface GateCreateOpts {
+  /** Bead the gate blocks (required by bd). */
+  blocks: string;
+  /** Defaults to bd's own default, `human`. */
+  type?: GateType;
+  /** Workflow run id (`gh:run`) or PR number (`gh:pr`). Omit for a gate `gate discover` will fill. */
+  awaitId?: string;
+  /** Timer gates only, e.g. `2h`. */
+  timeout?: string;
+  reason?: string;
+}
+
+export interface GateCheckOpts {
+  scope?: GateCheckScope;
+  /** Report the verdicts without closing anything. */
+  dryRun?: boolean;
+  /** Also run bd's escalation for failed/expired gates. Escalation does NOT close the gate. */
+  escalate?: boolean;
+}
+
+export interface GateDiscoverOpts {
+  dryRun?: boolean;
+  /** Branch whose runs are candidates; bd defaults to the cwd repo's current branch. */
+  branch?: string;
+  /** Max runs to query from GitHub. */
+  limit?: number;
+  /** Max age for gate/run matching, e.g. `30m`. */
+  maxAge?: string;
+}
+
+/**
+ * What one `bd gate check` pass did. `errors` is the field that must never be ignored: a gate bd
+ * could not evaluate (no `gh`, an API failure) is UNKNOWN — not resolved and not unresolved — so a
+ * caller must treat `errors > 0` the way execute-epic treats an unreadable PR state: retry with a
+ * counting error rather than reading `resolved: 0` as "still waiting".
+ */
+export interface GateCheckResult {
+  checked: number;
+  resolved: number;
+  escalated: number;
+  errors: number;
+  dryRun: boolean;
+}
+
+/** One entry of `bd ready --gated` — a molecule whose gate closed, with the step now runnable. */
+export interface GatedMolecule {
+  molecule_id: string;
+  molecule_title?: string;
+  closed_gate?: Gate;
+  ready_step?: Bead;
+}
+
+/** Pure argv builder for `bd gate create`, exposed for testing (like buildUpdateArgs). */
+export function buildGateCreateArgs(opts: GateCreateOpts): string[] {
+  if (!opts.blocks) throw new Error("bd gate create requires the id of the bead the gate blocks");
+  const args = ["gate", "create", "--blocks", opts.blocks];
+  if (opts.type) args.push("--type", opts.type);
+  if (opts.awaitId) args.push("--await-id", opts.awaitId);
+  if (opts.timeout) args.push("--timeout", opts.timeout);
+  if (opts.reason) args.push("--reason", opts.reason);
+  args.push("--json"); // plain output appends dispatch hints (for `bd sling`, which doesn't exist)
+  return args;
+}
+
+/** Pure argv builder for `bd gate check`, exposed for testing. */
+export function buildGateCheckArgs(opts: GateCheckOpts = {}): string[] {
+  const args = ["gate", "check"];
+  if (opts.scope) args.push("--type", opts.scope);
+  if (opts.dryRun) args.push("--dry-run");
+  if (opts.escalate) args.push("--escalate");
+  args.push("--json");
+  return args;
+}
+
+/** Pure argv builder for `bd gate discover`, exposed for testing. */
+export function buildGateDiscoverArgs(opts: GateDiscoverOpts = {}): string[] {
+  const args = ["gate", "discover"];
+  if (opts.dryRun) args.push("--dry-run");
+  if (opts.branch) args.push("--branch", opts.branch);
+  if (opts.limit !== undefined) args.push("--limit", String(opts.limit));
+  if (opts.maxAge) args.push("--max-age", opts.maxAge);
+  return args;
+}
+
+/**
+ * Pull the trailing `--json` object out of a bd stdout that also carries progress lines. `bd gate
+ * check --json` prints its per-gate verdicts and a "Checked N gates" summary on STDOUT before the
+ * JSON, so a plain JSON.parse of the whole stream throws. Scans candidate `{` offsets from the last
+ * back to the first and returns the first that parses, so a future nested summary still lands.
+ */
+function parseJsonTail(raw: string): unknown {
+  // The `i > 0` guard is load-bearing: `lastIndexOf("{", -1)` clamps its start to 0 rather than
+  // giving up, so a leading `{` that fails to parse would hand back 0 forever.
+  for (let i = raw.lastIndexOf("{"); i >= 0; i = i > 0 ? raw.lastIndexOf("{", i - 1) : -1) {
+    try {
+      return JSON.parse(raw.slice(i));
+    } catch {
+      // not the start of the summary object — keep walking left
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Read a `bd gate check` summary, or THROW. The throw is the point: a check whose result can't be
+ * read is the unknown state, and returning zeros would render it as "nothing satisfied yet" — a
+ * wait that never ends on a bd whose output format moved. Fail loud instead.
+ */
+export function parseGateCheck(raw: string): GateCheckResult {
+  const s = parseJsonTail(raw) as Record<string, unknown> | undefined;
+  if (!s || typeof s.checked !== "number") {
+    throw new Error(
+      `bd gate check: could not read its --json summary (bd output format changed?) — refusing to ` +
+        `report an unreadable check as "no gates resolved". Output: ${raw.slice(0, 200)}`,
+    );
+  }
+  const n = (v: unknown) => (typeof v === "number" ? v : 0);
+  return {
+    checked: s.checked,
+    resolved: n(s.resolved),
+    escalated: n(s.escalated),
+    errors: n(s.errors),
+    dryRun: s.dry_run === true,
+  };
+}
+
+/**
+ * The ONE invoker every gate call goes through. It exists so the cwd invariant cannot be forgotten
+ * at a call site: `repo` is bd's spawn cwd (empty is a loud failure, never the server's own cwd),
+ * and `GH_REPO` is set alongside it — belt and braces for the case a future call site can't control
+ * cwd, since GH_REPO overrides gh's repo resolution outright. A non-github.com origin (or no remote)
+ * yields no slug, and then GH_REPO is explicitly UNSET rather than left inherited: a server launched
+ * with GH_REPO in its own environment would otherwise have every gate here evaluated against that
+ * other repository. No slug means cwd alone governs. Never pass `-C` in `args`.
+ */
+async function bdGate(repo: string, args: string[]): Promise<string> {
+  if (!repo) throw new Error(`bd ${args.join(" ")}: a gate call requires the project repo as cwd`);
+  const slug = await githubRepoSlug(repo).catch(() => undefined);
+  return bd(repo, args, { env: { GH_REPO: slug } });
+}
+
+/** {@link bdGate} for the calls that mutate gates — invalidates the board snapshot like bdWrite. */
+async function bdGateWrite(repo: string, args: string[]): Promise<string> {
+  const stdout = await bdGate(repo, args);
+  invalidateIssueSnapshot(repo, true);
+  return stdout;
 }
 
 // ── formula cooking (anton-brdg) ──
@@ -1137,6 +1339,89 @@ export const beads = {
    * repo with a large ready queue.
    */
   ready: (cwd: string) => bd(cwd, ["ready", "--json", "--limit", "0"]).then(asArray<Bead>),
+
+  // ── gates (anton-uk95) ── every call spawns in `repo`, never with `-C`; see bdGate above.
+
+  /**
+   * Create a gate that blocks `opts.blocks` until it resolves; returns the gate bead's id. A
+   * `gh:run`/`gh:pr` gate created here is later evaluated against THIS repo, because that is the
+   * cwd its check runs in.
+   */
+  async gateCreate(repo: string, opts: GateCreateOpts): Promise<string> {
+    const out = await bdGateWrite(repo, buildGateCreateArgs(opts));
+    const parsed = JSON.parse(out);
+    const gate = Array.isArray(parsed) ? parsed[0] : parsed;
+    if (!gate?.id) throw new Error("bd gate create: could not parse gate id from output");
+    return gate.id as string;
+  },
+
+  /**
+   * Evaluate this repo's open gates and close the satisfied ones. The GitHub verdicts come from a
+   * `gh` subprocess that resolves its repository from the cwd this spawns in — which is why the
+   * project repo is a required argument and `-C` is never used.
+   *
+   * Callers MUST branch on `errors`: an un-evaluatable gate is unknown, not unresolved (see
+   * {@link GateCheckResult}).
+   */
+  gateCheck: (repo: string, opts: GateCheckOpts = {}): Promise<GateCheckResult> =>
+    (opts.dryRun ? bdGate : bdGateWrite)(repo, buildGateCheckArgs(opts)).then(parseGateCheck),
+
+  /** Manually resolve (close) a gate — the human-gate path, and the operator override for the rest. */
+  gateResolve: (repo: string, id: string, reason?: string) =>
+    bdGateWrite(repo, ["gate", "resolve", id, ...(reason ? ["--reason", reason] : [])]),
+
+  /**
+   * This repo's gates — open only by default, `all` to include resolved ones. `--limit 0`
+   * (unlimited) for the same reason `list` passes it: bd's default 50 would silently truncate.
+   */
+  gateList: (repo: string, opts: { all?: boolean } = {}): Promise<Gate[]> =>
+    bdGate(repo, [
+      "gate",
+      "list",
+      "--json",
+      "--limit",
+      "0",
+      ...(opts.all ? ["--all"] : []),
+    ]).then(asArray<Gate>),
+
+  /**
+   * Fill in the `await_id` of `gh:run` gates created before their workflow run existed, by matching
+   * recent runs on branch/SHA/time. Its candidate runs come from the cwd repo's GitHub remote, so it
+   * carries the same cwd rule as `gateCheck` — run from the wrong directory it matches another
+   * project's runs. Returns bd's human summary: at bd 1.1.2 `gate discover` emits no JSON.
+   */
+  gateDiscover: (repo: string, opts: GateDiscoverOpts = {}): Promise<string> =>
+    (opts.dryRun ? bdGate : bdGateWrite)(repo, buildGateDiscoverArgs(opts)),
+
+  /**
+   * A `gh:pr` gate — the merge wait anton arms on a run target when it opens that target's PR
+   * (anton-k0kj). It is the ONE gate flavour anton creates on work it runs, and it is deliberately
+   * NOT a prerequisite: it awaits the target's OWN pull request, so every "what blocks this bead?"
+   * computation skips it (see epic-graph). Anything else would make an in-review target read as
+   * blocked by itself and refuse the recovery run its closed-unmerged PR needs.
+   *
+   * `await_type` lives on {@link Gate}, and gate beads reach a board read through
+   * `bd list --type gate` (loadAllIssues), which carries the field — so the cast is the seam's, not
+   * a caller's.
+   */
+  isMergeWaitGate: (b: Bead): b is Gate =>
+    b.issue_type === "gate" && (b as Gate).await_type === "gh:pr",
+
+  /**
+   * Molecules whose gate has closed and whose next step is runnable — the gate-resume discovery
+   * call. It is `bd ready --gated`, NOT `bd mol ready --gated`: that form errors with "unknown flag:
+   * --gated" on both 1.1.0 and 1.1.2 (contradicting its own usage line), and bare `bd mol ready`
+   * lists EVERY ready molecule step, so it is not a substitute.
+   *
+   * PARENTED BEADS ONLY (measured on 1.1.0 and 1.1.2, anton-k0kj): bd reports a gated bead here
+   * only when it HAS a parent — which it names as the `molecule_id`, molecule or not. A gate hung on
+   * a PARENTLESS bead (a standalone task/bug run target, a top-level feature, the target a run's own
+   * `gh:pr` merge gate blocks) never appears, before or after it closes: that bead simply returns to
+   * ordinary `bd ready`, which nothing in anton polls. So both board-derived halves of gate-check —
+   * the merge finalization and `plainGateResumes` — exist because this call cannot see them.
+   */
+  readyGated: (repo: string): Promise<GatedMolecule[]> =>
+    bdGate(repo, ["ready", "--gated", "--json", "--limit", "0"]).then(asArray<GatedMolecule>),
 
   /**
    * ONE call for the whole board: `bd list --json` carries each issue's `parent` and inline
@@ -1551,11 +1836,16 @@ export const beads = {
    * holds only a single `bd show` bead, letting a container epic be claimed, PR-linked and moved
    * to review, after which review-fix would run it and close its feature children on merge. Every
    * classification site loads the full list already; pass it.
+   *
+   * Pipeline plumbing (`molecule`/`gate`) is refused UP FRONT rather than left to fall out of the
+   * whitelist below (anton-ve2r): the whitelist excludes it only by luck of type, and a run target
+   * is what approval enqueues — a gate reaching it would hand a run an async wait to execute.
    */
   isRunTarget: (b: Bead, board: Bead[]): boolean =>
-    b.issue_type === "feature" ||
-    (beads.isEpic(b) && !beads.isContainer(b, board)) ||
-    ((b.issue_type === "task" || b.issue_type === "bug") && !beads.parentOf(b)),
+    !isPipelineArtifact(b) &&
+    (b.issue_type === "feature" ||
+      (beads.isEpic(b) && !beads.isContainer(b, board)) ||
+      ((b.issue_type === "task" || b.issue_type === "bug") && !beads.parentOf(b))),
 
   /**
    * Does this run target execute its CHILDREN as its tickets, rather than being its own single

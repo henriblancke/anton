@@ -1,16 +1,15 @@
 /**
  * The Tickets page: a flat, filterable view over every work bead — epics included (each epic row is
- * followed by its subtree, features and their tickets), excluding only `molecule` coordination
- * artifacts.
+ * followed by its subtree, features and their tickets), excluding only pipeline plumbing (a poured
+ * `molecule` root and its `gate` children — see isPipelineArtifact).
  * Mirrors board.ts's read + section-parsing patterns — see DESIGN.md §2/§3.
  */
 import { beads, type Bead } from "./beads/bd";
+import { isPipelineArtifact } from "./beads/contract";
 import { allIssues } from "./beads/issues";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
 import { createdMeta, deriveStage, labelValue, parseAcceptance } from "./ticket-view";
 import type { Project, TicketFilters, TicketRow } from "./types";
-
-const NON_WORK = new Set(["molecule"]);
 
 // Re-exported for callers/tests that read the ticket contract off a bead; the implementations
 // live in ticket-view.ts (the single source of truth).
@@ -166,7 +165,7 @@ export function buildTicketRows(allBeads: Bead[]): TicketRow[] {
 }
 
 export async function getTickets(project: Project, filters: TicketFilters): Promise<TicketRow[]> {
-  const allBeads = (await listAllBeads(project)).filter((b) => !NON_WORK.has(b.issue_type ?? ""));
+  const allBeads = (await listAllBeads(project)).filter((b) => !isPipelineArtifact(b));
   const rows = buildTicketRows(allBeads);
 
   const base = await githubBaseUrl(project.repoPath);
