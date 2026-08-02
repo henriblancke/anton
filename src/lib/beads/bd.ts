@@ -7,6 +7,7 @@ import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { githubRepoSlug } from "../git/remote";
 import { resolveBdBin } from "./bd-bin";
+import { withBeadWriteLock } from "./claim-lock";
 import { isPipelineArtifact } from "./contract";
 import { invalidateIssueSnapshot } from "./snapshot";
 
@@ -552,9 +553,22 @@ export function isBenignSyncOutput(output: string): boolean {
   return BENIGN_SYNC_OUTPUT.some((re) => re.test(output));
 }
 
-/** A workspace with no Dolt remote — not an error, but a distinct visible state (not-wired):
- * the board must show "not wired to a shared remote" rather than pretending it's synced. */
-const NOT_WIRED_OUTPUT = [/no remotes? (?:is )?configured/i];
+/**
+ * A workspace with no Dolt remote — not an error, but a distinct visible state (not-wired): the
+ * board must show "not wired to a shared remote" rather than pretending it's synced.
+ *
+ * bd words the SAME condition differently per verb: `dolt push` prints "No remote is configured —
+ * skipping.", while `dolt pull` fails with dolt's own `fetch from origin/main: Error 1105: no
+ * remote`. Matching only the push wording left a solo board reading as `failing` on every heartbeat
+ * pull, and would have failed a verified claim closed on a board that has no second machine to race
+ * (anton-9anc). The pull pattern is deliberately strict — the whole `fetch from <ref>: Error <n>: no
+ * remote` shape, and it must END the line, so a genuine fetch failure that merely starts that way
+ * ("… no remote branch found") can't be read as "this workspace has no remote".
+ */
+const NOT_WIRED_OUTPUT = [
+  /no remotes? (?:is )?configured/i,
+  /fetch from \S+: Error \d+: no remote\s*$/im,
+];
 
 export function isNotWiredOutput(output: string): boolean {
   return NOT_WIRED_OUTPUT.some((re) => re.test(output));
@@ -1332,6 +1346,312 @@ export function parseCookedFormula(raw: string, formula: string): CookedFormula 
   };
 }
 
+// ── the claimable set + the verified claim (anton-9anc) ──
+//
+// ONE definition of "what any worker may claim" and "how a claim becomes trustworthy", so a second
+// anton, a headless job, and a plain Claude Code session on another machine all pick up the same
+// work in the same order and never both believe they hold it. Everything else (the runner's pickup,
+// the ready-count nudge, board ordering) consumes this rather than re-deriving the rule.
+
+/** A bead's claim holder, normalized — blank/whitespace assignee means unclaimed. */
+export const ownerOf = (b: Bead | undefined): string | undefined => b?.assignee?.trim() || undefined;
+
+/**
+ * A claimable run target plus the facts it was ranked on, so "why is this next?" is answerable from
+ * the value itself rather than by re-deriving the comparator at each consumer.
+ */
+export interface ClaimableTarget {
+  bead: Bead;
+  /** bd priority: 0 = critical … 4 = lowest. A bead with none is treated as lowest. */
+  priority: number;
+  /** How many open beads this target transitively unblocks via `blocks` edges. */
+  unblocks: number;
+  /** The bead's `created_at`, the age tiebreak (oldest first); "" when bd reported none. */
+  createdAt: string;
+}
+
+/**
+ * The claimable POOL query: every approved, unclaimed bead bd itself considers ready — its
+ * blocker-aware `GetReadyWork` semantics, which also drop in_progress/blocked/deferred/hooked work.
+ * Readiness is bd's to answer and is deliberately not re-derived here; anton only narrows the answer
+ * (see {@link rankClaimableTargets}).
+ *
+ * Deliberately WITHOUT `--type feature`, which the shaped ticket named: bd's `-t/--type` takes ONE
+ * type (verified on bd 1.1.2) while the claimable set spans features, parentless task/bug
+ * epics-of-one, and legacy childless epics — so a per-type argv would cost three spawns whose
+ * results couldn't even be read as one consistent board. The type split happens in-process against
+ * the board read {@link beads.claimableTargets} needs anyway for parentage and `blocks` edges.
+ */
+export function buildClaimableReadyArgs(): string[] {
+  return ["ready", "--label", LABELS.approved, "--unassigned", "--json", "--limit", "0"];
+}
+
+/** Missing bead priority sorts after every explicit priority (bd uses 0=critical … 4=lowest). */
+const DEFAULT_CLAIMABLE_PRIORITY = 4;
+
+/** A bead with no `created_at` sorts LAST on the age tiebreak — an unstamped bead must not jump
+ * the queue ahead of work that has genuinely been waiting. */
+const UNDATED = "\uffff";
+
+/**
+ * May a worker claim this bead and run it? The anton-side half of the claimable rule, applied to a
+ * bead bd already reported as ready:
+ *   - `open` — a claimed/closed/deferred bead is somebody's or nobody's work, never free work.
+ *   - `approved` — the human gate. execute-epic poisons an unapproved target, so a set that
+ *     included one would name work anton refuses to run.
+ *   - unassigned — a claim already held is not up for grabs, even when bd's `--unassigned` filter
+ *     wasn't the source of this pool.
+ *   - {@link beads.isRunTarget} — the SAME predicate the approve route and the runner gate on, so
+ *     the claimable set can never disagree with what anton will actually execute. That is what
+ *     keeps container epics (their features each run on their own) and child tickets (executed as
+ *     part of their target's run, never distributed) out of the set.
+ */
+function isClaimable(b: Bead, board: Bead[]): boolean {
+  return (
+    b.status === "open" &&
+    beads.isApproved(b) &&
+    !ownerOf(b) &&
+    beads.isRunTarget(b, board)
+  );
+}
+
+/**
+ * `id → how many open beads it transitively unblocks`, built once per board.
+ *
+ * A `blocks` edge is (from = dependent, to = blocker), so the dependents of a target are what its
+ * completion releases; the count is the transitive closure of that, restricted to beads that are
+ * still open (a closed dependent was never waiting). Cycle-guarded via `seen`, and a dependent that
+ * isn't on the board is traversed but not counted — it is evidence of an edge, not of open work.
+ */
+function unblockCounter(board: Bead[]): (id: string) => number {
+  const dependents = new Map<string, string[]>();
+  for (const e of beads.edgesOf(board)) {
+    if (e.type !== "blocks") continue;
+    const list = dependents.get(e.to);
+    if (list) list.push(e.from);
+    else dependents.set(e.to, [e.from]);
+  }
+  const openIds = new Set(board.filter((b) => b.status !== "closed").map((b) => b.id));
+
+  return (id: string): number => {
+    const seen = new Set<string>([id]);
+    const queue = [id];
+    let count = 0;
+    while (queue.length) {
+      for (const next of dependents.get(queue.shift() as string) ?? []) {
+        if (seen.has(next)) continue;
+        seen.add(next);
+        queue.push(next);
+        if (openIds.has(next)) count++;
+      }
+    }
+    return count;
+  };
+}
+
+/**
+ * The rank order itself — priority, then unblocking value, then age, then id. Total and
+ * deterministic (the id tiebreak is what makes it total), so two machines reading the same board
+ * agree on what anton picks up next.
+ */
+function compareClaimable(a: ClaimableTarget, b: ClaimableTarget): number {
+  if (a.priority !== b.priority) return a.priority - b.priority; // P0 first
+  if (a.unblocks !== b.unblocks) return b.unblocks - a.unblocks; // frees the most work first
+  const ageA = a.createdAt || UNDATED;
+  const ageB = b.createdAt || UNDATED;
+  if (ageA !== ageB) return ageA < ageB ? -1 : 1; // oldest first
+  return a.bead.id < b.bead.id ? -1 : 1;
+}
+
+/**
+ * Narrow bd's ready pool to the claimable run targets and RANK them (see {@link compareClaimable}).
+ * Pure over its input — no bd spawn — so the rule is testable against fixture boards and reusable by
+ * any caller that already holds a board.
+ *
+ * `pool` is bd's blocker-aware ready answer; `board` is the full `--status all` list, which supplies
+ * the parentage, `blocks` edges and feature children the narrowing and the unblocking count need.
+ */
+export function rankClaimableTargets(pool: Bead[], board: Bead[]): ClaimableTarget[] {
+  const unblocks = unblockCounter(board);
+  return pool
+    .filter((b) => isClaimable(b, board))
+    .map((bead) => ({
+      bead,
+      priority: bead.priority ?? DEFAULT_CLAIMABLE_PRIORITY,
+      unblocks: unblocks(bead.id),
+      createdAt: bead.created_at ?? "",
+    }))
+    .sort(compareClaimable);
+}
+
+/**
+ * Propagation window a verified claim settles for before it trusts its own read. Reused verbatim
+ * from the run-lease arbitration (execute-epic's RUN_LEASE_SETTLE_MS): concluding "we hold it" from
+ * seeing only our own assignee is a decision made on the ABSENCE of a rival claim, and absence is
+ * unreliable on an eventually-consistent board — a machine that claimed the same instant may not
+ * have propagated yet. Comfortably above sync round-trip latency, far below any run's lifetime.
+ */
+export const CLAIM_SETTLE_MS = 2_000;
+
+/**
+ * The verdict of {@link beads.claimVerified}. `lost` is a VALUE, not an exception: losing a race is
+ * the protocol working, and a pickup loop must be able to move to the next target without a
+ * try/catch — and `lost` with an undefined `owner` means the bead read back unassigned, so it is
+ * neither ours nor anyone else's and retrying it is safe. `unverified` is the fail-closed answer —
+ * the claim could not be proven, so the caller must NOT run the target; it may retry (a same-actor
+ * claim is idempotent). `stale` is the claim we WON on work that left the claimable set while we
+ * settled — ours on paper, not runnable: a retry can only reach the same verdict, and the local
+ * claim is the caller's to release.
+ */
+export type ClaimVerification =
+  | { ok: true; bead: Bead }
+  | { ok: false; reason: "lost"; owner: string | undefined }
+  | { ok: false; reason: "stale"; detail: string; bead: Bead }
+  | { ok: false; reason: "unverified"; detail: string };
+
+/** The seam a verified claim drives, injectable so tests can interleave claimers without a board. */
+export interface ClaimVerifiedDeps {
+  pull?: (cwd: string) => Promise<unknown>;
+  push?: (cwd: string) => Promise<SyncOutcome>;
+  claim?: (cwd: string, id: string, actor: string) => Promise<unknown>;
+  show?: (cwd: string, id: string) => Promise<Bead>;
+  /** Fresh `--status all` board, for the post-settle re-validation (see {@link staleClaimReason}). */
+  board?: (cwd: string) => Promise<Bead[]>;
+  sleep?: (ms: number) => Promise<void>;
+  settleMs?: number;
+}
+
+/**
+ * Why this target is no longer runnable, or undefined when it still is — the post-settle half of
+ * {@link isClaimable}, applied to the bead WE now hold (anton-9anc review).
+ *
+ * Owning the assignee proves the race was won, not that the prize is still worth having: another
+ * machine can close or abandon the target, drop `approved`, or land a feature under a legacy epic
+ * (turning it into a container) inside the very settle window this protocol waits out. Re-asserting
+ * the rest of the claimable rule against a FRESH board is what keeps a verified claim from licensing
+ * a run the claimable set would refuse.
+ *
+ * The assignee/`open` legs of {@link isClaimable} are deliberately NOT re-checked: `bd update
+ * --claim` has by now made us the assignee and flipped the status to in_progress, so both would
+ * reject the very claim they were meant to confirm.
+ */
+export function staleClaimReason(bead: Bead, board: Bead[]): string | undefined {
+  if (beads.isAbandoned(bead)) return "the target was abandoned while the claim settled";
+  if (bead.status !== "open" && bead.status !== "in_progress") {
+    return `the target is ${bead.status} — no longer runnable work`;
+  }
+  if (!beads.isApproved(bead)) return "approval was withdrawn while the claim settled";
+  if (!beads.isRunTarget(bead, board)) {
+    return "the target is no longer a run target (a container epic or a child ticket)";
+  }
+  return undefined;
+}
+
+const sleepMs = (ms: number): Promise<void> =>
+  new Promise((resolve) => {
+    const t = setTimeout(resolve, ms);
+    if (typeof t.unref === "function") t.unref();
+  });
+
+function errorText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * Claim `id` for `actor` and prove the claim held — the write half of the cross-machine pickup
+ * protocol (anton-9anc). See {@link beads.claimVerified} for the contract; this is the body, split
+ * out so the whole sequence is one readable unit.
+ */
+async function runClaimVerified(
+  cwd: string,
+  id: string,
+  actor: string,
+  deps: ClaimVerifiedDeps,
+): Promise<ClaimVerification> {
+  const pull = deps.pull ?? beads.pull;
+  const push = deps.push ?? beads.push;
+  const claim = deps.claim ?? beads.claim;
+  const show = deps.show ?? beads.show;
+  const readBoard = deps.board ?? ((c: string) => beads.list(c, ["--status", "all"]));
+  const sleep = deps.sleep ?? sleepMs;
+  const settleMs = deps.settleMs ?? CLAIM_SETTLE_MS;
+  const unverified = (detail: string): ClaimVerification => ({
+    ok: false,
+    reason: "unverified",
+    detail: `${id}: ${detail}`,
+  });
+
+  // 1. Pull first, so a claim another machine already published is visible locally — bd's own
+  //    `--claim` then refuses ours outright, and we lose cheaply without writing anything.
+  try {
+    await pull(cwd);
+  } catch (e) {
+    return unverified(`could not refresh the board before claiming (${errorText(e)})`);
+  }
+
+  // 2. Claim. `bd update --claim` is the atomic local compare-and-swap (it refuses a bead already
+  //    claimed by someone else and is idempotent for the same actor), so no read-then-write CAS is
+  //    re-implemented here. On refusal, read the board for the holder rather than parsing bd's
+  //    message: the assignee IS the evidence, and it can't rot the way an error string can.
+  try {
+    await claim(cwd, id, actor);
+  } catch (e) {
+    const current = await show(cwd, id).catch(() => null);
+    const holder = ownerOf(current ?? undefined);
+    if (current && holder && holder !== actor) return { ok: false, reason: "lost", owner: holder };
+    return unverified(`bd refused the claim (${errorText(e)})`);
+  }
+
+  // 3. Publish it. A claim no other machine can see is not a claim; if the push fails we cannot
+  //    prove we hold it, so we fail closed. The local claim stands and a retry re-claims idempotently.
+  let outcome: SyncOutcome;
+  try {
+    outcome = await push(cwd);
+  } catch (e) {
+    return unverified(`claimed locally but could not publish the claim (${errorText(e)})`);
+  }
+
+  // 4/5. Settle, then re-pull — but only when there is a remote at all. A not-wired board has no
+  //      second machine to race, so waiting out a propagation window it can't have would stall every
+  //      single-machine pickup for nothing.
+  if (outcome !== "not-wired") {
+    await sleep(settleMs);
+    try {
+      await pull(cwd);
+    } catch (e) {
+      return unverified(`could not re-read the board to verify the claim (${errorText(e)})`);
+    }
+  }
+
+  // 6. Assert the assignee. This is the only step that makes the claim trustworthy: after the merge
+  //    of two concurrent claims exactly one actor survives on the bead, and a worker may run only if
+  //    that actor is itself. A `lost` with NO owner is the bead reading back unassigned — our claim
+  //    did not survive the merge, so it is not ours to run, but nobody else holds it either: the
+  //    target may simply be free again, and re-claiming it is safe (a same-actor claim is idempotent).
+  const verified = await show(cwd, id).catch(() => null);
+  if (!verified) return unverified("could not re-read the bead to verify the claim");
+  const owner = ownerOf(verified);
+  if (owner !== actor) return { ok: false, reason: "lost", owner };
+
+  // 7. Re-assert the REST of the claimable rule against a fresh board. Winning the assignee proves
+  //    the race, not that the target is still work anton may run — see staleClaimReason. The board
+  //    read is the same `--status all` list claimableTargets narrows, so the two can't disagree.
+  let board: Bead[];
+  try {
+    board = await readBoard(cwd);
+  } catch (e) {
+    return unverified(`could not re-read the board to re-validate the target (${errorText(e)})`);
+  }
+  // Judge the BOARD's copy when it has one: `bd list` is the read the claimable rule was written
+  // against (it carries parentage the way isRunTarget expects), so judging it keeps this verdict and
+  // claimableTargets from disagreeing on the same bead. `show`'s copy stays the assignee evidence.
+  const onBoard = board.find((b) => b.id === id) ?? verified;
+  const stale = staleClaimReason(onBoard, board);
+  return stale
+    ? { ok: false, reason: "stale", detail: `${id}: ${stale}`, bead: verified }
+    : { ok: true, bead: verified };
+}
+
 export const beads = {
   /**
    * Truly claimable work (excludes in_progress/blocked/deferred). `--limit 0` = unlimited:
@@ -1725,9 +2045,83 @@ export const beads = {
    * the same actor (`bd update --claim`). The actor is passed explicitly via BEADS_ACTOR (bd's
    * highest-precedence identity) so the claim lands on the human operator who owns this anton
    * instance — not whatever unix user the server happens to run as.
+   *
+   * REJECTS when another actor already holds the bead ("issue already claimed by …"), which is what
+   * makes this the local compare-and-swap {@link beads.claimVerified} builds the cross-machine
+   * protocol on. It is the automation primitive: it flips status, so a human reservation goes
+   * through {@link beads.assign} instead.
    */
   claim: (cwd: string, id: string, actor?: string) =>
     bdWrite(cwd, ["update", id, "--claim"], actor ? { env: { BEADS_ACTOR: actor } } : undefined),
+
+  /** Pure argv builder for the claimable pool query, exposed for testing (see buildUpdateArgs). */
+  buildClaimableReadyArgs,
+
+  /** Pure ranker over an already-loaded board — see {@link rankClaimableTargets}. */
+  rankClaimableTargets,
+
+  /** Pure post-claim re-validation of a held target — see {@link staleClaimReason}. */
+  staleClaimReason,
+
+  /**
+   * What any worker may claim right now, RANKED (anton-9anc): approved, unclaimed, blocker-free run
+   * targets, ordered by priority, then by how many open beads each transitively unblocks, then by
+   * age. One deterministic, explainable answer to "what does anton pick up next" — every consumer
+   * reads this order rather than inventing its own, so the runner, the board, and the ready-count
+   * nudge can never disagree about the queue.
+   *
+   * Two reads, taken together: bd's own ready query (blocker-awareness stays bd's job) and the full
+   * board (`--status all`, the same read the approve route and execute-epic gate on, so a target
+   * this returns is one anton will actually run). Reads only — claiming is {@link beads.claimVerified}.
+   * `deps` is injectable for tests, like {@link runDoltSync}'s `exec`.
+   */
+  claimableTargets: async (
+    cwd: string,
+    deps: {
+      ready?: (cwd: string) => Promise<Bead[]>;
+      board?: (cwd: string) => Promise<Bead[]>;
+    } = {},
+  ): Promise<ClaimableTarget[]> => {
+    const readPool = deps.ready ?? ((c: string) => bd(c, buildClaimableReadyArgs()).then(asArray<Bead>));
+    const readBoard = deps.board ?? ((c: string) => beads.list(c, ["--status", "all"]));
+    const [pool, board] = await Promise.all([readPool(cwd), readBoard(cwd)]);
+    return rankClaimableTargets(pool, board);
+  },
+
+  /**
+   * Claim a target for `actor` and PROVE the claim held (anton-9anc) — pull, claim, push, settle,
+   * re-pull, re-show, assert assignee, re-validate the target. Never throws: it answers `ok` (we
+   * hold it and it is still runnable), `lost` (another actor holds it — the protocol working, so a
+   * pickup loop moves on), `stale` (we hold it but it left the claimable set while we settled; the
+   * caller must not run it and owns releasing the claim) or `unverified` (we could not prove either
+   * way, so the caller must not run the target; a retry is safe).
+   *
+   * Why each leg exists — claims ride eventually-consistent Dolt sync, so no single step is enough:
+   * the pull surfaces a claim another machine already published (bd then refuses ours for free), the
+   * push publishes ours, the settle gives a near-simultaneous rival time to reach the remote, and
+   * the re-read is what turns "we wrote it" into "we hold it" after the merge picks a winner. This
+   * is the run-lease arbitration pattern (anton-jz1) applied to the assignee, and it NARROWS rather
+   * than closes the window — a real cross-process lock needs a bd primitive that doesn't exist
+   * (anton-od4), which is why a claim remains advisory.
+   *
+   * Composes with the human-claim guard rather than duplicating it: the whole sequence runs on the
+   * SAME per-bead write chain claim.ts's CAS uses, so an operator's Claim and a worker's pickup are
+   * ordered against each other in this process, and bd's `--claim` — not a re-implemented
+   * read-then-write CAS — is the local compare-and-swap. Never call it from inside a
+   * `withClaimLock` body (it would wait on the lock that body holds).
+   */
+  claimVerified: (
+    cwd: string,
+    id: string,
+    actor: string,
+    deps: ClaimVerifiedDeps = {},
+  ): Promise<ClaimVerification> => {
+    const who = actor.trim();
+    // A blank actor can't be asserted against the post-claim assignee (bd would fall back to
+    // git user.name / $USER), so every verdict below would be a guess. Caller bug — fail loud.
+    if (!who) throw new Error(`claimVerified(${id}): an actor is required to verify a claim`);
+    return withBeadWriteLock(cwd, id, () => runClaimVerified(cwd, id, who, deps));
+  },
 
   /**
    * Set a bead's assignee WITHOUT touching status (`bd assign <id> <actor>`). This is the

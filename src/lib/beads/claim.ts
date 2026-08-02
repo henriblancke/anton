@@ -32,7 +32,15 @@
  * read-decide-write sequence on the bead's chain; `setAssigneeIfOwner` is the one-shot swap built
  * on it.
  */
-import { beads, type Bead } from "./bd";
+import { beads, ownerOf, type Bead } from "./bd";
+import { withBeadWriteLock } from "./claim-lock";
+
+/**
+ * A bead's claim holder, normalized — blank/whitespace assignee means unclaimed. Defined on the bd
+ * seam (where beads.claimVerified also asserts ownership) and re-exported here so this module stays
+ * the import site every claim caller already uses.
+ */
+export { ownerOf };
 
 /**
  * The outcome of a swap: `ok` when the assignee is now `next`, else the owner that beat us. A
@@ -47,9 +55,6 @@ export interface AssigneeStore {
   assign: (cwd: string, id: string, actor: string) => Promise<unknown>;
   unassign: (cwd: string, id: string) => Promise<unknown>;
 }
-
-/** A bead's claim holder, normalized — blank/whitespace assignee means unclaimed. */
-export const ownerOf = (b: Bead | undefined): string | undefined => b?.assignee?.trim() || undefined;
 
 /**
  * The 409 body for a swap that lost the race, so claim and approve report a stolen window the
@@ -93,14 +98,10 @@ export interface ClaimGuard {
 
 /**
  * Build a claim guard bound to a bd surface. Exported for testing; production callers use the
- * module's default instance, whose in-process lock only serializes work it shares a Map with.
+ * module's default instance. Every guard — and beads.claimVerified — queues on the ONE process-wide
+ * chain map in ./claim-lock, so a test guard bound to a fake board still orders against the real one.
  */
 export function createClaimGuard(store: AssigneeStore = beads): ClaimGuard {
-  // Per repo+bead write chain. Keyed so unrelated beads never wait on each other; entries are
-  // dropped once their chain drains, so this can't grow with the board. The separator is NUL —
-  // it can't occur in a path or a bead id, so no pair of distinct beads can collide on one key.
-  const chains = new Map<string, Promise<unknown>>();
-
   const swapUnlocked =
     (repoPath: string, id: string): LockedSwap =>
     async (expectedOwner, next, current) => {
@@ -129,21 +130,14 @@ export function createClaimGuard(store: AssigneeStore = beads): ClaimGuard {
       return after === next ? { ok: true, bead: written } : { ok: false, owner: after };
     };
 
+  // The lock itself lives in ./claim-lock, shared with beads.claimVerified: a worker's claim
+  // sequence and a human's Claim must queue on the SAME chain, or neither orders the other.
   function withClaimLock<T>(
     repoPath: string,
     id: string,
     fn: (swap: LockedSwap) => Promise<T>,
   ): Promise<T> {
-    const key = `${repoPath}\u0000${id}`;
-    const prev = chains.get(key) ?? Promise.resolve();
-    const run = prev.catch(() => {}).then(() => fn(swapUnlocked(repoPath, id)));
-    chains.set(key, run);
-    void run
-      .catch(() => {}) // the caller owns this run's rejection; this chain is bookkeeping only
-      .finally(() => {
-        if (chains.get(key) === run) chains.delete(key);
-      });
-    return run;
+    return withBeadWriteLock(repoPath, id, () => fn(swapUnlocked(repoPath, id)));
   }
 
   return {
