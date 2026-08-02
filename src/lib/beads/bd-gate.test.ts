@@ -11,7 +11,7 @@
  * gate-cwd.integration.test.ts; this suite pins the seam that prevents it.
  */
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -55,6 +55,18 @@ function recorded(): Call[] {
       // The fake bd joins argv with US (\u001f) so an arg containing spaces survives the round-trip.
       return { cwd, ghRepo, argv: args.split("\u001f").filter(Boolean) };
     });
+}
+
+/** A repo whose origin isn't github.com, so the seam derives no slug. Built once, reused. */
+function nonGithubRepo(): string {
+  const local = join(dir, "local");
+  if (!existsSync(local)) {
+    execFileSync("git", ["init", "-q", "-b", "main", local], { stdio: "ignore" });
+    execFileSync("git", ["-C", local, "remote", "add", "origin", join(dir, "bare.git")], {
+      stdio: "ignore",
+    });
+  }
+  return local;
 }
 
 /** The single call a case made — asserts exactly one bd spawn, which is what each wrapper owes. */
@@ -184,15 +196,23 @@ describe("gate seam · spawn contract", () => {
   });
 
   it("leaves GH_REPO unset when origin isn't a github.com remote — cwd still governs", async () => {
-    const local = join(dir, "local");
-    execFileSync("git", ["init", "-q", "-b", "main", local], { stdio: "ignore" });
-    execFileSync("git", ["-C", local, "remote", "add", "origin", join(dir, "bare.git")], {
-      stdio: "ignore",
-    });
-    await beads.gateList(local);
+    await beads.gateList(nonGithubRepo());
     const call = onlyCall();
     expect(call.ghRepo).toBe("");
-    expect(realpathSync(call.cwd)).toBe(realpathSync(local));
+    expect(realpathSync(call.cwd)).toBe(realpathSync(nonGithubRepo()));
+  });
+
+  it("clears an inherited GH_REPO when there's no slug — never gh's verdict for another repo", async () => {
+    const prev = process.env.GH_REPO;
+    process.env.GH_REPO = "intruder/elsewhere";
+    try {
+      await beads.gateList(nonGithubRepo());
+      // Inheriting here would point gh at intruder/elsewhere and close this repo's gates on its CI.
+      expect(onlyCall().ghRepo).toBe("");
+    } finally {
+      if (prev === undefined) delete process.env.GH_REPO;
+      else process.env.GH_REPO = prev;
+    }
   });
 });
 

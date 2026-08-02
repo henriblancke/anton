@@ -209,6 +209,18 @@ function killGraceMs(): number {
 }
 
 /**
+ * The server's env with `overrides` applied, where an `undefined` override REMOVES the variable
+ * rather than leaving whatever the server was launched with. That deletion is the point: a gate call
+ * that can't derive a slug must not inherit an ambient `GH_REPO`, which would override `gh`'s repo
+ * resolution and answer this project's gates with another repository's verdict.
+ */
+function childEnv(overrides: Record<string, string | undefined>): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, ...overrides };
+  for (const [key, value] of Object.entries(overrides)) if (value === undefined) delete env[key];
+  return env;
+}
+
+/**
  * Run one `bd` command and return its stdout.
  *
  * Two properties this owes its callers, both learned the hard way (anton-jfjw.1 — a `bd dolt pull`
@@ -227,7 +239,11 @@ function killGraceMs(): number {
  * `async` so a resolveBdBin() failure (no bd on the box) surfaces as a rejection rather than a
  * synchronous throw — every call site awaits or `.catch()`es this.
  */
-async function bd(cwd: string, args: string[], env?: Record<string, string>): Promise<string> {
+async function bd(
+  cwd: string,
+  args: string[],
+  env?: Record<string, string | undefined>,
+): Promise<string> {
   // Spawn bd by its resolved absolute path (anton-346): a background-launched server's PATH may not
   // reach bd's install dir, so a bare `spawn("bd", …)` fails with `spawn bd ENOENT`.
   const bin = resolveBdBin();
@@ -240,7 +256,7 @@ async function bd(cwd: string, args: string[], env?: Record<string, string>): Pr
       cwd,
       // POSIX: make bd the leader of a new process group so the whole tree is reachable as one.
       detached: process.platform !== "win32",
-      ...(env ? { env: { ...process.env, ...env } } : {}),
+      ...(env ? { env: childEnv(env) } : {}),
     });
 
     // StringDecoder, not per-chunk toString: a multi-byte character split across two chunks would
@@ -966,12 +982,14 @@ export function parseGateCheck(raw: string): GateCheckResult {
  * at a call site: `repo` is bd's spawn cwd (empty is a loud failure, never the server's own cwd),
  * and `GH_REPO` is set alongside it — belt and braces for the case a future call site can't control
  * cwd, since GH_REPO overrides gh's repo resolution outright. A non-github.com origin (or no remote)
- * yields no slug; cwd alone still governs. Never pass `-C` in `args`.
+ * yields no slug, and then GH_REPO is explicitly UNSET rather than left inherited: a server launched
+ * with GH_REPO in its own environment would otherwise have every gate here evaluated against that
+ * other repository. No slug means cwd alone governs. Never pass `-C` in `args`.
  */
 async function bdGate(repo: string, args: string[]): Promise<string> {
   if (!repo) throw new Error(`bd ${args.join(" ")}: a gate call requires the project repo as cwd`);
   const slug = await githubRepoSlug(repo).catch(() => undefined);
-  return bd(repo, args, slug ? { GH_REPO: slug } : undefined);
+  return bd(repo, args, { GH_REPO: slug });
 }
 
 /** {@link bdGate} for the calls that mutate gates — invalidates the board snapshot like bdWrite. */
