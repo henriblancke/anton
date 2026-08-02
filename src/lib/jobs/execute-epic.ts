@@ -1316,7 +1316,12 @@ async function runTicket(args: {
       // Every step boundary is a lease checkpoint, exactly as every ticket boundary is.
       run.assertLeaseHeld?.();
       const result = await definition.handler({ ...ticketCtx, step: cooked });
-      selfReport = result.facts?.selfReport ?? selfReport;
+      // A `blocked` self-report is STICKY across a phase with several dispatching steps. A later
+      // agent — a `step:claude` the project added after `implement` — reports on its own work only,
+      // so letting its `delivered` overwrite an earlier block would close a ticket the implementer
+      // declared incomplete on the partial changes it left behind. A missing/unparseable line (null)
+      // keeps whatever the phase reported before it, as it always has.
+      if (selfReport?.outcome !== "blocked") selfReport = result.facts?.selfReport ?? selfReport;
 
       if (definition.name !== "commit") {
         // A step that RAN and did not achieve its work halts the ticket (and, through it, the epic).

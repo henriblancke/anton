@@ -429,6 +429,59 @@ process.exit(0);`),
     }
   });
 
+  it("keeps a `blocked` self-report when a later agent step in the same ticket reports delivered", async () => {
+    // A ticket phase may dispatch more than one agent. The added step reports on ITS OWN work, so a
+    // `delivered` from it must not overwrite the implementer's `blocked` — that would close a ticket
+    // its implementer declared incomplete, on the partial changes it left behind.
+    const invLog = join(sandbox, "sticky-blocked.log");
+    writeProjectFormula(
+      step("implement", "implement") +
+        "\n" +
+        // The project's own extra agent step, dispatched between the implement and the commit.
+        `[[steps]]\nid = "polish"\ntype = "task"\ntitle = "polish"\nneeds = ["implement"]\n` +
+        `labels = ["step:claude", "prompt:nextjs"]\n` +
+        "\n" +
+        step("commit", "commit", "polish") +
+        "\n" +
+        step("pr", "pr", "commit"),
+    );
+    const { id: epicId, tickets } = await approvedEpic("Blocked then polished");
+
+    // The implementer commits partial work and self-reports `blocked`; the polish step that follows
+    // it reports a clean `delivered`.
+    const stickyClaude = writeBin(
+      binDir,
+      "claude-sticky-blocked",
+      fakeClaudeReadingStdin(`const implementing=prompt.includes('Implement this beads ticket');
+fs.appendFileSync(${JSON.stringify(invLog)},(implementing?'implement':'polish')+'\\n');
+fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'partial '+Date.now()+'\\n');
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+e({type:'system',subtype:'init',session_id:'sb'});
+const r=implementing?'ANTON-RESULT: blocked — the acceptance criteria contradict the existing API':'ANTON-RESULT: delivered';
+e({type:'result',subtype:'success',result:r,session_id:'sb',num_turns:1,is_error:false});
+process.exit(0);`),
+    );
+
+    process.env.ANTON_CLAUDE_BIN = stickyClaude;
+    try {
+      const jobId = await driveEpicRun(runnerFor(), { projectId, epicBeadId: epicId });
+
+      // Both steps ran, and the run still parked on the implementer's block.
+      expect(lines(invLog)).toEqual(["implement", "polish"]);
+      expect((await getJob(tdb.db, jobId))?.status).toBe("parked");
+      expect((await getJob(tdb.db, jobId))?.lastError).toMatch(/self-reported blocked/i);
+
+      // The ticket is blocked for a human, not closed — and the epic halted with no PR.
+      const first = (await beads.show(repo, tickets[0])).status;
+      const second = (await beads.show(repo, tickets[1])).status;
+      expect([first, second]).toContain("blocked");
+      expect([first, second]).not.toContain("closed");
+      expect(beads.getPrRef(await beads.show(repo, epicId)) ?? null).toBeNull();
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+    }
+  });
+
   /** The runner every case drives — one job in flight, on the shared sandbox db + clock. */
   function runnerFor() {
     return makeEpicRunner({ tdb, clock });

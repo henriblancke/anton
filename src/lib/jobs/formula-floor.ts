@@ -6,7 +6,8 @@
  * one PR, git as the evidence of record, park-on-failure); the project owns the steps. So the floor
  * constrains OMISSION and ORDER, never extension: a formula may add as many steps as it likes, but
  * it may not define a run that never implements, never commits, or never reaches a human — and it
- * may not order the steps so that the work it does is thrown away.
+ * may not order the steps so that the work it does is thrown away, reviewed before it exists, or
+ * gated behind a step the run's own completion marker would let a resume skip.
  *
  * This module is pure. It takes a cooked formula plus the step registry (anton-4npr, which DECLARES
  * the classes and which steps write to the worktree) and returns the full list of violations —
@@ -31,13 +32,15 @@ import {
 export type StepRegistry = Readonly<Record<string, StepDefinition>>;
 
 /**
- * The two ordering invariants name specific steps rather than classes: git is the run's evidence of
- * record (`commit`) and the PR is the only way the work reaches a human (`pr`). They live here, not
- * in the registry, because the ORDER is anton's invariant — the registry only declares what a step
- * is and whether it writes to the worktree.
+ * The ordering invariants name specific steps rather than classes: git is the run's evidence of
+ * record (`commit`), the PR is the only way the work reaches a human (`pr`), and the self-review is
+ * the one step that reads the committed diff (`review`). They live here, not in the registry,
+ * because the ORDER is anton's invariant — the registry only declares what a step is and whether it
+ * writes to the worktree.
  */
 const COMMIT_STEP = "commit";
 const PR_STEP = "pr";
+const REVIEW_STEP = "review";
 
 export type FloorViolationKind =
   | "unresolved-step"
@@ -45,6 +48,8 @@ export type FloorViolationKind =
   | "missing-required-step"
   | "duplicate-required-step"
   | "pr-before-commit"
+  | "step-after-pr"
+  | "review-before-commit"
   | "diff-after-commit";
 
 export interface FloorViolation {
@@ -140,6 +145,7 @@ export function checkFormulaFloor(cooked: CookedFormula, registry: StepRegistry)
   const indexOf = (name: string) => classified.findIndex((c) => c.definition?.name === name);
   const commitAt = indexOf(COMMIT_STEP);
   const prAt = indexOf(PR_STEP);
+  const reviewAt = indexOf(REVIEW_STEP);
 
   if (commitAt >= 0 && prAt >= 0 && prAt < commitAt) {
     violations.push({
@@ -150,6 +156,47 @@ export function checkFormulaFloor(cooked: CookedFormula, registry: StepRegistry)
         `commits — the PR would be opened on a branch carrying none of the run's work, and the commit ` +
         `that followed would land where no reviewer is looking. The floor requires \`` +
         `${STEP_LABEL_PREFIX}:${COMMIT_STEP}\` to precede \`${STEP_LABEL_PREFIX}:${PR_STEP}\``,
+    });
+  }
+
+  // The PR is the run's TERMINUS, not merely its last required step. anton stamps the PR ref on the
+  // target the moment `pr` returns, and a resumed run reads a live ref as proof the run finished
+  // (execute-epic step 0a) — so a step placed after the PR that failed would be skipped by the next
+  // attempt, which would settle the run `done` with that step never having run. Requiring `pr` last
+  // is what makes the completion marker honest.
+  //
+  // Reported only when the PR is otherwise well placed: a `pr` before the commit is already named by
+  // `pr-before-commit`, and a second `pr` step by `duplicate-required-step`. Repeating them here
+  // would tell the operator to move the wrong step.
+  if (prAt >= 0 && (commitAt < 0 || commitAt < prAt)) {
+    for (const { step, definition } of classified.slice(prAt + 1)) {
+      if (definition?.name === PR_STEP) continue;
+      violations.push({
+        kind: "step-after-pr",
+        step: step.id,
+        detail:
+          `step "${step.id}" runs after "${classified[prAt].step.id}" opens the run's pull request — ` +
+          `the PR ref anton stamps there is what a resumed run reads as proof the run FINISHED, so a ` +
+          `step that failed after it would be silently skipped on the next attempt and the run would ` +
+          `settle as done anyway. The floor requires \`${STEP_LABEL_PREFIX}:${PR_STEP}\` to be the ` +
+          `pipeline's LAST step — move this one before it`,
+      });
+    }
+  }
+
+  // The self-review reads the run's COMMITTED diff (`merge-base..HEAD`). Before the commit that diff
+  // is empty, so the gate would review nothing, find nothing, and report clean — a silent pass, which
+  // is worse than a rejected run. Rejected rather than reordered for the operator: a formula that
+  // asks to review before it commits is asking for a gate that cannot see the work.
+  if (reviewAt >= 0 && commitAt >= 0 && reviewAt < commitAt) {
+    violations.push({
+      kind: "review-before-commit",
+      step: classified[reviewAt].step.id,
+      detail:
+        `step "${classified[reviewAt].step.id}" self-reviews before "${classified[commitAt].step.id}" ` +
+        `commits — the gate reads the run's committed diff (\`merge-base..HEAD\`), which is empty ` +
+        `until the commit lands, so it would review nothing and pass on nothing. The floor requires ` +
+        `\`${STEP_LABEL_PREFIX}:${REVIEW_STEP}\` to run after \`${STEP_LABEL_PREFIX}:${COMMIT_STEP}\``,
     });
   }
 
@@ -193,7 +240,8 @@ export function assertRunFormulaFloor(
       violations.map((v) => `  • ${v.detail}`).join("\n") +
       `\nThe floor is what anton guarantees about a run, not a style rule: it must implement, commit, ` +
       `and open a PR, in that order, with everything that writes to the worktree happening before the ` +
-      `commit. A project may ADD steps freely — the floor constrains omission and ordering, never ` +
+      `commit, the self-review (when present) between the commit and the PR, and the PR opening LAST. ` +
+      `A project may ADD steps freely — the floor constrains omission and ordering, never ` +
       `extension. Fix ${formula.source} (or delete it to fall back to anton's default), then resume ` +
       `the run.`,
   );

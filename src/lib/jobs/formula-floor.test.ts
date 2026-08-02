@@ -142,6 +142,51 @@ describe("the floor rejects broken ordering", () => {
         .ok,
     ).toBe(true);
   });
+
+  it("a self-review placed before the commit — the gate would read an empty diff and pass", () => {
+    const { ok, violations } = check([
+      step("implement", "implement"),
+      step("review", "review"),
+      step("commit", "commit"),
+      step("pr", "pr"),
+    ]);
+
+    expect(ok).toBe(false);
+    expect(violations.map((v) => [v.kind, v.step])).toEqual([["review-before-commit", "review"]]);
+    expect(violations[0].detail).toContain("merge-base..HEAD");
+  });
+
+  it("any step after the PR — the completion marker would let a resume skip it", () => {
+    // The PR ref anton stamps at `step:pr` is the run's completion marker: a later step that failed
+    // would be skipped on the next attempt, which would settle the run done regardless.
+    const { ok, violations } = check([
+      step("implement", "implement"),
+      step("commit", "commit"),
+      step("pr", "pr"),
+      step("smoke", "verify"),
+      step("announce", "claude"),
+    ]);
+
+    expect(ok).toBe(false);
+    expect(violations.map((v) => [v.kind, v.step])).toEqual([
+      ["step-after-pr", "smoke"],
+      ["step-after-pr", "announce"],
+      // `announce` also writes to the worktree after the commit — both faults are reported at once.
+      ["diff-after-commit", "announce"],
+    ]);
+    expect(violations[0].detail).toContain("LAST step");
+  });
+
+  it("a self-review placed after the PR — reviewing work a human can already merge", () => {
+    const { violations } = check([
+      step("implement", "implement"),
+      step("commit", "commit"),
+      step("pr", "pr"),
+      step("review", "review"),
+    ]);
+
+    expect(violations.map((v) => [v.kind, v.step])).toEqual([["step-after-pr", "review"]]);
+  });
 });
 
 describe("the floor rejects a step declared twice", () => {

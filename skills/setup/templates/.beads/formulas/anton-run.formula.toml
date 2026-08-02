@@ -34,7 +34,7 @@ labels = ["step:verify"]
 
 # Commit precedes review deliberately: the self-review gate reads the run's diff as
 # `merge-base..HEAD`, so a review placed before the commit would read an empty diff and pass on
-# nothing. A project reordering these two loses the review, not just its position.
+# nothing. The floor rejects that ordering rather than letting the gate silently pass.
 [[steps]]
 id = "commit"
 type = "task"
@@ -49,6 +49,9 @@ needs = ["commit"]
 title = "Self-review {{target}} before the PR opens"
 labels = ["step:review"]
 
+# The PR is the pipeline's LAST step, and the floor requires that: anton stamps the PR ref when it
+# opens, and a resumed run reads a live ref as proof the run finished — so a step added after the PR
+# would be skipped by the next attempt if it failed. Put extra steps before the PR.
 [[steps]]
 id = "pr"
 type = "task"
