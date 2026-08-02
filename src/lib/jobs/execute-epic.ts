@@ -53,6 +53,7 @@ import {
   PoisonEpic,
   RunAlreadyLiveError,
 } from "./errors";
+import { assertRunFormulaFloor } from "./formula-floor";
 import { validateRunFormula } from "./run-formula";
 import {
   commitStep,
@@ -561,7 +562,11 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //     half-executed run. PARK, like the gates above: the operator fixes the file (or deletes it
       //     to fall back to anton's default) and resumes. Cheap and read-only — the project copy when
       //     it has one, else anton's bundled default.
-      await validateRunFormula(repo);
+      //     Then hold the cooked pipeline to anton's invariant floor (anton-6b99): the project owns
+      //     the steps, anton owns the guarantees, so a formula may ADD steps freely but may not omit
+      //     implement/commit/pr or order them so the run's work is thrown away (a PR opened before
+      //     the commit, an agent dispatched after it). Same park, same place — before the worktree.
+      assertRunFormulaFloor(await validateRunFormula(repo));
 
       // 1. Publish the cross-machine run-liveness lease BEFORE any slow setup — worktree creation,
       //    operator resolution, the epic claim — and keep it fresh while this run executes

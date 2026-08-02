@@ -192,6 +192,13 @@ export interface StepDefinition {
   class: StepClass;
   /** One line, used by the validator's rejection messages. */
   summary: string;
+  /**
+   * The step leaves work in the worktree that only `step:commit` turns into evidence — so the floor
+   * (anton-6b99) requires it to run BEFORE the commit, or the work is silently thrown away. False
+   * for a step that commits its own output: the review gate does, which is why it may sit after the
+   * commit (and must, since it reads the run's diff).
+   */
+  producesDiff: boolean;
   handler: StepHandler;
 }
 
@@ -357,36 +364,46 @@ export const BUILTIN_STEPS: Readonly<Record<string, StepDefinition>> = Object.fr
     name: "implement",
     class: "required",
     summary: "dispatch the ticket's agent in the run's worktree",
+    producesDiff: true,
     handler: implementStep,
   },
   verify: {
     name: "verify",
     class: "default-on",
     summary: "run the project's verify gates (tests, lint, typecheck, build)",
+    // Gates read the worktree and report; anything they write (a lockfile, a formatter's output) is
+    // incidental, so a project is free to verify again after the commit.
+    producesDiff: false,
     handler: verifyStep,
   },
   review: {
     name: "review",
     class: "default-on",
     summary: "run the pre-PR self-review gate",
+    // The gate commits its own fixes onto the run's branch, so it strands nothing uncommitted.
+    producesDiff: false,
     handler: reviewStep,
   },
   commit: {
     name: "commit",
     class: "required",
     summary: "commit the run's work — git is the evidence of record",
+    producesDiff: false,
     handler: commitStep,
   },
   pr: {
     name: "pr",
     class: "required",
     summary: "open the run's single pull request",
+    producesDiff: false,
     handler: prStep,
   },
   claude: {
     name: "claude",
     class: "additive",
     summary: "dispatch a project-named prompt or skill in the run's worktree",
+    // The extension point dispatches an agent with no commit of its own — same as `implement`.
+    producesDiff: true,
     handler: claudeStep,
   },
 });
