@@ -20,6 +20,7 @@ import type { CookedFormula } from "../beads/bd";
 import { PoisonEpic } from "./errors";
 import {
   bundledRunFormulaPath,
+  orderFormulaSteps,
   parseRunFormulaSource,
   projectRunFormulaPath,
   resolveRunFormulaPath,
@@ -222,6 +223,62 @@ describe("parseRunFormulaSource — the file as written", () => {
     expect(() => parseRunFormulaSource(`formula = "anton-run"\nversion = 1\n`, "/repo/f.toml")).toThrow(
       /declares no `\[\[steps\]\]`/,
     );
+  });
+});
+
+describe("orderFormulaSteps — the order the walk runs (anton-lnkt)", () => {
+  const ids = (steps: CookedFormula["steps"]) => steps.map((s) => s.id);
+
+  it("keeps declaration order when a formula wires no `needs`", () => {
+    const steps = [{ id: "a" }, { id: "b" }, { id: "c" }];
+    expect(ids(orderFormulaSteps(steps, "/repo/f.toml"))).toEqual(["a", "b", "c"]);
+  });
+
+  it("sorts by `needs` — a step declared first still runs after what it waits on", () => {
+    const steps = [
+      { id: "pr", needs: ["commit"] },
+      { id: "commit", needs: ["implement"] },
+      { id: "implement" },
+    ];
+    expect(ids(orderFormulaSteps(steps, "/repo/f.toml"))).toEqual(["implement", "commit", "pr"]);
+  });
+
+  it("breaks ties by declaration order, so an unordered pair reads as the file writes it", () => {
+    const steps = [
+      { id: "implement" },
+      { id: "lint", needs: ["implement"] },
+      { id: "test", needs: ["implement"] },
+    ];
+    expect(ids(orderFormulaSteps(steps, "/repo/f.toml"))).toEqual(["implement", "lint", "test"]);
+  });
+
+  it("parks on a `needs` cycle — no order satisfies it, so there is no pipeline to walk", () => {
+    const steps = [
+      { id: "implement", needs: ["commit"] },
+      { id: "commit", needs: ["implement"] },
+    ];
+    expect(() => orderFormulaSteps(steps, "/repo/f.toml")).toThrow(PoisonEpic);
+    expect(() => orderFormulaSteps(steps, "/repo/f.toml")).toThrow(/cycle among "implement", "commit"/);
+  });
+
+  it("leaves duplicate ids in declaration order — the floor names the duplicate instead", () => {
+    // `needs` can't address a repeated id unambiguously, so sorting would be guesswork; anton-6b99
+    // rejects the formula right after this with a message an operator can act on.
+    const steps = [{ id: "commit" }, { id: "implement" }, { id: "commit" }];
+    expect(ids(orderFormulaSteps(steps, "/repo/f.toml"))).toEqual(["commit", "implement", "commit"]);
+  });
+
+  it("hands the ordered pipeline to the caller — cooked steps and resolved handlers alike", async () => {
+    const validated = await validateRunFormula("/repo", {
+      read: async () => VALID,
+      cook: cookYielding([
+        { id: "pr", labels: ["step:pr"], needs: ["commit"] },
+        { id: "commit", labels: ["step:commit"], needs: ["implement"] },
+        { id: "implement", labels: ["step:implement"] },
+      ]),
+    });
+    expect(validated.steps.map((s) => s.definition.name)).toEqual(["implement", "commit", "pr"]);
+    expect(ids(validated.cooked.steps)).toEqual(["implement", "commit", "pr"]);
   });
 });
 

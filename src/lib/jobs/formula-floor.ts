@@ -14,8 +14,9 @@
  * problem. {@link assertRunFormulaFloor} is the thin FAIL-LOUD wrapper execute-epic calls at run
  * start, before the lease is published and before a worktree exists.
  *
- * Order here means DECLARATION order, because that is what the walker executes: the loader hands
- * back `cooked.steps` in file order and the walk follows it.
+ * Order here means EXECUTION order, because that is what the walker runs: the loader (anton-hrql)
+ * hands back `cooked.steps` already sorted by `needs` (declaration order breaking ties), and the
+ * walk follows that list one step at a time.
  */
 import type { CookedFormula, CookedStep } from "../beads/bd";
 import { PoisonEpic } from "./errors";

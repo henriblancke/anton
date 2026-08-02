@@ -48,8 +48,9 @@ export interface ResolvedStep {
 export interface RunFormula {
   /** Absolute path the pipeline was read from — the project's copy, or anton's bundled asset. */
   source: string;
+  /** The cooked pipeline, its `steps` already in {@link orderFormulaSteps execution order}. */
   cooked: CookedFormula;
-  /** Every step in declaration order, each with its resolved handler. */
+  /** Every step in execution order, each with its resolved handler. */
   steps: ResolvedStep[];
 }
 
@@ -192,6 +193,45 @@ export function parseRunFormulaSource(raw: string, source: string): Record<strin
   return doc;
 }
 
+/**
+ * The steps in EXECUTION order: topologically sorted by `needs`, ties broken by declaration order
+ * (anton-lnkt). This is the order the walker runs and the order the invariant floor (anton-6b99) is
+ * checked against, so the pipeline anton executes is the one the file describes — whether the
+ * project expressed that shape by ordering the steps or by wiring `needs` between them.
+ *
+ * A `needs` cycle PARKS: no order satisfies it, so there is no pipeline to walk. Duplicate step ids
+ * are left in declaration order instead of sorted — `needs` cannot address them unambiguously, and
+ * the floor rejects the formula with a message that names the duplicate.
+ */
+export function orderFormulaSteps(steps: CookedStep[], source: string): CookedStep[] {
+  const ids = steps.map((s) => s.id);
+  if (new Set(ids).size !== ids.length) return steps;
+  const declared = new Set(ids);
+  const done = new Set<string>();
+  const order: CookedStep[] = [];
+  while (order.length < steps.length) {
+    // Kahn's algorithm with a declaration-order scan for the tie-break: among the steps whose
+    // prerequisites have all run, the earliest-declared one goes next — so a formula that wires no
+    // `needs` at all runs exactly as written. A `needs` naming a step outside this formula is
+    // ignored here (bd's own cook already refuses one).
+    const next = steps.find(
+      (s) => !done.has(s.id) && (s.needs ?? []).every((n) => !declared.has(n) || done.has(n)),
+    );
+    if (!next) {
+      throw new PoisonEpic(
+        `run formula ${source} has a \`needs\` cycle among ${steps
+          .filter((s) => !done.has(s.id))
+          .map((s) => `"${s.id}"`)
+          .join(", ")} — no order satisfies it, so anton has no pipeline to walk. Break the cycle ` +
+          `(or delete the file to fall back to anton's default), then resume the run.`,
+      );
+    }
+    done.add(next.id);
+    order.push(next);
+  }
+  return order;
+}
+
 /** Machinery a caller may swap. Production passes none; the unit tests pass a fake cook. */
 export interface RunFormulaDeps {
   /** The `bd cook` seam (anton-brdg). Defaults to {@link beads.cook}. */
@@ -238,8 +278,11 @@ export async function validateRunFormula(
     );
   }
 
+  // Ordering before resolution so everything downstream — the floor check and the walk — reads ONE
+  // order, the one the run actually executes.
+  const ordered = orderFormulaSteps(cooked.steps, source);
   // Resolution is the whole point of validating early: an unmapped `step:` label parks HERE, before a
   // worktree exists, instead of three steps into a run that has already dispatched an agent.
-  const steps = cooked.steps.map((step) => ({ step, definition: resolveStep(step, source) }));
-  return { source, cooked, steps };
+  const steps = ordered.map((step) => ({ step, definition: resolveStep(step, source) }));
+  return { source, cooked: { ...cooked, steps: ordered }, steps };
 }

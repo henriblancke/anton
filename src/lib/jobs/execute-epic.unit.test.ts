@@ -6,17 +6,58 @@
 import { describe, expect, it } from "vitest";
 import type { Bead } from "../beads/bd";
 import { formatHumanNote } from "../beads/notes";
+import { PoisonEpic } from "./errors";
 import {
   claudeResumeDecision,
   continuationPrompt,
   inactiveAgentTickets,
   reviewParkMessage,
+  splitFormulaPhases,
 } from "./execute-epic";
-import { ticketPrompt } from "./step-registry";
+import { BUILTIN_STEPS, ticketPrompt } from "./step-registry";
+import type { ResolvedStep } from "./run-formula";
 
 function ticket(id: string, labels?: string[]): Bead {
   return { id, title: id, status: "open", labels } as Bead;
 }
+
+/** A resolved pipeline addressed the way a formula does: one `step:<name>` per step. */
+function pipeline(...names: string[]): { source: string; steps: ResolvedStep[] } {
+  return {
+    source: "/repo/.beads/formulas/anton-run.formula.toml",
+    steps: names.map((name) => ({
+      step: { id: name, labels: [`step:${name}`] },
+      definition: BUILTIN_STEPS[name],
+    })),
+  };
+}
+
+describe("splitFormulaPhases — where a ticket's work ends and the run's begins (anton-lnkt)", () => {
+  const names = (steps: ResolvedStep[]) => steps.map((s) => s.definition.name);
+
+  it("splits the shipped pipeline at its commit: per-ticket work, then the run's own steps", () => {
+    const { ticketSteps, runSteps } = splitFormulaPhases(
+      pipeline("implement", "verify", "commit", "review", "pr"),
+    );
+    expect(names(ticketSteps)).toEqual(["implement", "verify", "commit"]);
+    expect(names(runSteps)).toEqual(["review", "pr"]);
+  });
+
+  it("moves the boundary when the project moves the step — reorder is the whole point", () => {
+    // Verify gates after the commit: one run-wide verification instead of one per ticket, with no
+    // anton code change.
+    const { ticketSteps, runSteps } = splitFormulaPhases(
+      pipeline("implement", "commit", "verify", "pr"),
+    );
+    expect(names(ticketSteps)).toEqual(["implement", "commit"]);
+    expect(names(runSteps)).toEqual(["verify", "pr"]);
+  });
+
+  it("fails loud on a pipeline with no commit — a run with no evidence of record", () => {
+    expect(() => splitFormulaPhases(pipeline("implement", "pr"))).toThrow(PoisonEpic);
+    expect(() => splitFormulaPhases(pipeline("implement", "pr"))).toThrow(/no `step:commit`/);
+  });
+});
 
 describe("inactiveAgentTickets", () => {
   it("flags a ticket whose agent: label is not in a non-empty allowlist", () => {
