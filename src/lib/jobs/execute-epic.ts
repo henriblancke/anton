@@ -9,19 +9,14 @@
 import { randomUUID } from "node:crypto";
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { ownerOf } from "../beads/claim";
-import { acceptanceBody, contractGaps, formatContractGaps } from "../beads/contract";
-import { humanNotesPromptBlock } from "../beads/notes";
+import { contractGaps, formatContractGaps } from "../beads/contract";
 import { computeEpicGraph, epicStandaloneBlockers, isUnit, standaloneBlockers } from "../epic-graph";
 import { contractGatedBeads, resumeSkipped, runTickets } from "../ticket-view";
-import { loadAgentPrompt } from "../claude/agent-prompt";
-import { buildExecutionSystemPrompt } from "../claude/system-prompt";
-import { runClaude, type ClaudeEvent, type ClaudeResult } from "../claude/driver";
-import { formatAntonResult, parseAntonResult } from "../claude/anton-result";
+import { runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
+import { formatAntonResult, type AntonResult } from "../claude/anton-result";
 import {
-  commitAll,
   lookupOpenPullRequest,
   markPullRequestDraft,
-  openPullRequest,
   pullRequestState,
   resolveFreshBase,
   worktreeHasCommitFor,
@@ -29,13 +24,7 @@ import {
 } from "../git/ops";
 import { createWorktree, findWorktree, removeWorktree } from "../git/worktree";
 import { bundledAgentIds, discoverAgents } from "../agents-discovery";
-import {
-  getProjectById,
-  getProjectSettings,
-  resolveReviewConfig,
-  resolveVerifyGates,
-  type ProjectSettings,
-} from "../projects";
+import { getProjectById, getProjectSettings, resolveReviewConfig } from "../projects";
 import { resolveOperator } from "../operator";
 import {
   createRun,
@@ -48,12 +37,10 @@ import {
   setSessionClaudeId,
   startJobSession,
 } from "../sessions";
-import { buildPrTitle } from "./pr-title";
-import type { ReviewFinding } from "./review-context";
+import { findingLines, type ReviewFinding } from "./review-context";
 import {
   blockingFindings,
   finalViolation,
-  runReviewGate,
   type ReviewGateResult,
   type ReviewRound,
 } from "./review-gate";
@@ -63,9 +50,18 @@ import {
   isRecoverableClaudeError,
   isUsageLimitError,
   isRunAlreadyLiveError,
+  PoisonEpic,
   RunAlreadyLiveError,
 } from "./errors";
-import { runVerifyGates } from "./shell";
+import {
+  commitStep,
+  implementStep,
+  prStep,
+  reviewStep,
+  truncateField,
+  verifyStep,
+  type StepContext,
+} from "./step-registry";
 import type { AntonDb, Clock } from "./queue";
 import { systemClock } from "./queue";
 import type { JobContext, JobHandler } from "./runner";
@@ -733,6 +729,26 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       });
       await ctx.heartbeat();
 
+      // Every step below runs through the step registry (anton-4npr) — one entry point per step, so
+      // this fixed sequence and the formula walk that replaces it execute the same handlers. This is
+      // what they all operate on; each call adds the ticket(s) in scope (and, per ticket, that
+      // ticket's session).
+      const runStep: Omit<StepContext, "tickets"> = {
+        db,
+        clock,
+        ctx,
+        projectId,
+        runId,
+        repoPath: repo,
+        worktreePath: worktree.path,
+        branch: worktree.branch,
+        baseBranch,
+        baseRef: freshBase,
+        target,
+        settings,
+        assertLeaseHeld,
+      };
+
       // 3. Assert this process still owns the epic, THEN claim it for the human operator (idempotent).
       //    An approved-but-unstarted (backlog) target can be TAKEN OVER — reassigned to another
       //    operator via the approve route's steal — after this run was queued but before it leased the
@@ -914,15 +930,8 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           await safe(() => beads.reopen(repo, ticket.id));
         }
         await runTicket({
-          db,
-          clock,
-          ctx,
-          projectId,
-          repo,
-          runId,
-          worktreePath: worktree.path,
+          run: runStep,
           ticket,
-          settings,
           operator,
           closeOnDone: !standaloneRun,
         });
@@ -944,20 +953,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         // Filled by the gate as each round completes, so a gate that THROWS — returning nothing —
         // still leaves this attempt's score history to persist below.
         const gateRounds: ReviewRound[] = [];
-        const review = await runReviewGate({
-          db,
-          clock,
-          ctx,
-          projectId,
-          runId,
-          target,
-          tickets: live,
-          settings,
-          worktreePath: worktree.path,
-          baseBranch: freshBase,
-          assertLeaseHeld,
-          rounds: gateRounds,
-        }).catch(async (e) => {
+        const gate = await reviewStep({ ...runStep, tickets: live, rounds: gateRounds }).catch(async (e) => {
           // A throwing gate never reaches persistReviewScores below, so the rounds it DID finish are
           // written here or lost with the attempt — for a poison park (a round-3 death still owes the
           // founder rounds 1 and 2) and equally for a retryable one, where the run is rescheduled and
@@ -992,6 +988,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           // start a REPLACEMENT run instead of continuing this one and its session history.
           throw new ReviewBlockedError(`${e.message}${orphanClause(orphan)}`, { cause: e });
         });
+        const review = gate.facts.review;
         // The score history belongs to the board, not this run's logs — written on both exits the gate
         // RETURNS from, since a run parked on blocking findings is exactly the one whose score the
         // founder needs. The throwing exit is covered by the catch above.
@@ -1035,16 +1032,12 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //    Closing it now would derive it as Done on the board while its PR is still open and drop
       //    it out of review-fix's in-review sweep (which is what keeps a standalone PR in the
       //    automated review/finalization path).
-      assertLeaseHeld(); // don't open a PR under a lease that has silently lapsed
-      const pr = await openPullRequest({
-        repoPath: repo,
-        branch: worktree.branch,
-        base: baseBranch,
-        title: buildPrTitle(target, epicBeadId, settings.conventionalCommits),
-        // `live`, not `tickets`: an abandoned ticket contributed no commit, so listing it would
-        // advertise work this PR doesn't contain (anton-6xj0).
-        body: prBody(target, live, advisoryFindings),
-      });
+      // The step asserts the lease itself — don't open a PR under one that has silently lapsed.
+      // `live`, not `tickets`: an abandoned ticket contributed no commit, so listing it would
+      // advertise work this PR doesn't contain (anton-6xj0).
+      const { pr } = (
+        await prStep({ ...runStep, tickets: live, advisories: advisoryFindings })
+      ).facts;
       // A reused PR whose refresh `gh` refused still shows the previous attempt's body, and the run
       // completes regardless — so this round's advisories would exist nowhere: the score comment
       // records their COUNT, never their text. Write them onto the bead before the run finishes, so
@@ -1128,15 +1121,9 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
 
 /** One ticket: session → claude → tests → commit → close. */
 async function runTicket(args: {
-  db: AntonDb;
-  clock: Clock;
-  ctx: JobContext;
-  projectId: string;
-  repo: string;
-  runId: string;
-  worktreePath: string;
+  /** The run-level step context every ticket shares; this ticket's own is derived from it. */
+  run: Omit<StepContext, "tickets">;
   ticket: Bead;
-  settings: ProjectSettings;
   operator?: string;
   /** Close the bead in beads once its work is committed. False for a standalone (epic-of-one)
    * target, which is never closed by execute-epic: it stays open + stage:in-review + PR ref until
@@ -1145,8 +1132,9 @@ async function runTicket(args: {
    * epic's children close as their work lands). */
   closeOnDone?: boolean;
 }): Promise<void> {
-  const { db, clock, ctx, projectId, repo, runId, worktreePath, ticket, settings, operator } =
-    args;
+  const { run, ticket, operator } = args;
+  const { db, clock, ctx, projectId, runId, worktreePath } = run;
+  const repo = run.repoPath;
   const closeOnDone = args.closeOnDone ?? true;
 
   // Claim the ticket for the operator as a HARD GATE before doing any work. On a shared board
@@ -1174,73 +1162,53 @@ async function runTicket(args: {
     .catch((e) => console.error(`[execute-epic] claim sync failed for ${ticket.id}`, e));
 
   const agentTag = labelValue(ticket.labels, "agent");
-  // Compose the system prompt: locked base contract + agent-tag prompt + operator seed. The base
-  // is mandatory (buildExecutionSystemPrompt throws if src/prompts/system-base.md is missing).
-  const agentPrompt = await loadAgentPrompt(agentTag, { projectDir: worktreePath });
-  const appendSystemPrompt = await buildExecutionSystemPrompt({
-    agentPrompt,
-    seedPrompt: settings.seedPrompt,
-  });
-
-  const { sessionId, logPath, onEvent } = await startJobSession(db, clock, {
+  const session = await startJobSession(db, clock, {
     projectId,
     runId,
     kind: "execute",
     beadId: ticket.id,
   });
+  const { sessionId, logPath } = session;
   await updateRun(db, clock, runId, { ticketBeadId: ticket.id, agentTag: agentTag ?? null });
   // Live handle (anton-susu): expose this ticket's session + worktree while it runs; each ticket's
   // dispatch overwrites the last, so the handle always names the job's CURRENT session.
   ctx.report({ sessionId, cwd: worktreePath });
 
-  // Human steering (anton-bfy4) can land at any moment — including while this epic's earlier
-  // tickets were running — so the notes that reach the prompt are read HERE, at dispatch, not from
-  // the board snapshot the run started with. Best-effort: an unreadable bead just means no notes.
-  const dispatched = await withDispatchNotes(repo, ticket);
+  // This ticket's step context: the run's, narrowed to this ticket. The session is opened HERE and
+  // handed in, so one session still covers the whole ticket — dispatch, gates and commit — exactly
+  // as before.
+  const step: StepContext = {
+    ...run,
+    tickets: [ticket],
+    session,
+    // In-session resume for a transient mid-stream death (anton-juar) — the dispatch machinery the
+    // step inherits from the run rather than a second driver of its own.
+    deps: { runClaude: resilientClaude({ db, ctx, sessionId, logPath, ticket }) },
+  };
 
   let committed = false;
   try {
-    const result = await runClaudeResilient({
-      db,
-      ctx,
-      sessionId,
-      logPath,
-      worktreePath,
-      ticket: dispatched,
-      appendSystemPrompt,
-      model: settings.model,
-      permissionMode: settings.permissionMode ?? "bypassPermissions",
-      onEvent,
-    });
-    if (!result.ok) {
-      throw new Error(`claude reported an error for ${ticket.id}: ${result.text ?? "unknown"}`);
+    const implemented = await implementStep(step);
+    if (!implemented.ok) {
+      throw new Error(implemented.detail ?? `claude reported an error for ${ticket.id}`);
     }
-
-    // Parse the agent's machine-readable self-report (anton-j5i8): the last `ANTON-RESULT:` line
-    // from its output — `delivered` or `blocked — <reason>`. Recorded on the session log here; it
-    // CORROBORATES the delivery-evidence gate below, never replaces it. A missing/unparseable line
-    // (selfReport === null) simply falls through to the commit-evidence gate — never a crash.
-    const selfReport = parseAntonResult(result.text);
-    await appendSessionLog(logPath, `[anton-result] ${formatAntonResult(selfReport)}\n`).catch(() => {});
+    // The agent's machine-readable self-report (anton-j5i8) — `delivered` or `blocked — <reason>`,
+    // already recorded on the session log by the step. It CORROBORATES the delivery-evidence gate
+    // below, never replaces it; a missing/unparseable line (null) simply falls through to it.
+    const selfReport = implemented.facts.selfReport ?? null;
 
     // Verify gates (optional — configured per project): tests + operator-pinned lint/typecheck/
     // build (anton-3oh8). Absent → no gates run. A non-zero exit fails the ticket before commit.
-    await runVerifyGates(
-      resolveVerifyGates(settings),
-      worktreePath,
-      ctx.signal,
-      logPath,
-      (gate, code) => `${gate.label} gate failed for ${ticket.id} (exit ${code})`,
-    );
+    await verifyStep(step);
 
-    // Commit whatever claude changed — and honor commitAll's { committed } verdict. A clean agent
+    // Commit whatever claude changed — and honor the step's { committed } verdict. A clean agent
     // exit that leaves NO diff delivered nothing: the exact false-success in issue #46 (root cause
     // #1). Do NOT close/advance the ticket on empty delivery. Throw a NoDeliveryError so the catch
     // below BLOCKS the ticket for a human (never re-queues it open) and the error propagates out of
     // the ticket loop, halting dispatch of the rest of the epic. NoDeliveryError is poison, so the
     // runner parks the run for a human instead of retrying claude to the same empty result forever.
-    const { committed: didCommit } = await commitAll(worktreePath, `${ticket.id}: ${ticket.title}`);
-    if (!didCommit) {
+    const commit = await commitStep(step);
+    if (!commit.facts.committed) {
       // Empty tree: the delivery-evidence gate blocks + halts. Cross-check the self-report and
       // fold it into the reason (anton-j5i8): a `delivered` claim on an empty tree is the exact
       // false success the gate exists to catch; a `blocked` self-report corroborates the block and
@@ -1369,7 +1337,9 @@ export function claudeResumeDecision(
 }
 
 /**
- * Run claude for one ticket with resilient in-session recovery (anton-juar). A transient mid-stream
+ * A claude driver with resilient in-session recovery (anton-juar), shaped exactly like `runClaude`
+ * so it drops into the step registry's driver seam and every step inherits the recovery. A transient
+ * mid-stream
  * death (network drop, truncated stream, exit-without-result) that captured a Claude session id is
  * retried with `claude --resume <id>` — continuing the same conversation instead of re-running the
  * whole ticket from scratch — bounded by MAX_RESUME_ATTEMPTS so a flapping connection can't burn the
@@ -1378,70 +1348,70 @@ export function claudeResumeDecision(
  * is spent, the error propagates so the job-level runner does today's fresh spawn (then parks after
  * maxAttempts) — resume is best-effort and never a new failure mode.
  */
-async function runClaudeResilient(args: {
+function resilientClaude(args: {
   db: AntonDb;
-  ctx: JobContext;
+  ctx: Pick<JobContext, "signal">;
+  /** anton's session row for this ticket — where the captured claude id and the resume log land. */
   sessionId: string;
   logPath: string;
-  worktreePath: string;
+  /** The ticket being implemented, for the continuation prompt a resumed session gets. */
   ticket: Bead;
-  appendSystemPrompt: string;
-  model?: string;
-  permissionMode: "default" | "acceptEdits" | "bypassPermissions" | "plan";
-  onEvent: (e: ClaudeEvent) => void;
-}): Promise<ClaudeResult> {
-  const { db, ctx, sessionId, logPath, worktreePath, ticket } = args;
-  let resumeId: string | undefined;
-  let priorError: string | undefined;
-  let priorSignature: string | undefined;
+}): (options: RunClaudeOptions) => Promise<ClaudeResult> {
+  const { db, ctx, sessionId, logPath, ticket } = args;
+  return async function dispatch(options: RunClaudeOptions): Promise<ClaudeResult> {
+    let resumeId: string | undefined;
+    let priorError: string | undefined;
+    let priorSignature: string | undefined;
 
-  for (let attempt = 0; ; attempt++) {
-    try {
-      const result = await runClaude({
-        cwd: worktreePath,
-        prompt: resumeId ? continuationPrompt(ticket, priorError) : ticketPrompt(ticket),
-        resumeSessionId: resumeId,
-        appendSystemPrompt: args.appendSystemPrompt,
-        model: args.model,
-        permissionMode: args.permissionMode,
-        signal: ctx.signal,
-        onEvent: args.onEvent,
-      });
-      // Persist the real Claude session id once the run reports it (diagnostics + future resume).
-      if (result.sessionId) await setSessionClaudeId(db, sessionId, result.sessionId).catch(() => {});
-      return result;
-    } catch (e) {
-      // Only a transient (RecoverableClaudeError) failure is resume-eligible. A deterministic/content
-      // failure (verify-gate, agent error), poison, or quota is NOT — it propagates unchanged so the
-      // runner applies today's fresh-restart/park policy (never a resume that would replay bad state).
-      if (!isRecoverableClaudeError(e)) throw e;
-      // A killed job (force-kill, or an abandon that cancelled the run — anton-6xj0) aborts the
-      // child mid-stream, which looks exactly like a transient death. Never resume through it: the
-      // operator asked for this agent to stop, and the retry would spawn against an already-aborted
-      // signal anyway. Checked before the resume decision so the abort propagates immediately.
-      if (ctx.signal.aborted) throw e;
-      // Persist the captured id even on the failure path — a mid-stream death may carry it only via
-      // the system-init event, and it's what a fresh-restart's operator or a future resume relies on.
-      if (e.sessionId) await setSessionClaudeId(db, sessionId, e.sessionId).catch(() => {});
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const result = await runClaude(
+          resumeId
+            ? {
+                ...options,
+                // The full ticket spec already lives in the resumed conversation, so the prompt is
+                // a brief continuation rather than the whole spec again.
+                prompt: continuationPrompt(ticket, priorError),
+                resumeSessionId: resumeId,
+              }
+            : options,
+        );
+        // Persist the real Claude session id once the run reports it (diagnostics + future resume).
+        if (result.sessionId) await setSessionClaudeId(db, sessionId, result.sessionId).catch(() => {});
+        return result;
+      } catch (e) {
+        // Only a transient (RecoverableClaudeError) failure is resume-eligible. A deterministic/content
+        // failure (verify-gate, agent error), poison, or quota is NOT — it propagates unchanged so the
+        // runner applies today's fresh-restart/park policy (never a resume that would replay bad state).
+        if (!isRecoverableClaudeError(e)) throw e;
+        // A killed job (force-kill, or an abandon that cancelled the run — anton-6xj0) aborts the
+        // child mid-stream, which looks exactly like a transient death. Never resume through it: the
+        // operator asked for this agent to stop, and the retry would spawn against an already-aborted
+        // signal anyway. Checked before the resume decision so the abort propagates immediately.
+        if (ctx.signal.aborted) throw e;
+        // Persist the captured id even on the failure path — a mid-stream death may carry it only via
+        // the system-init event, and it's what a fresh-restart's operator or a future resume relies on.
+        if (e.sessionId) await setSessionClaudeId(db, sessionId, e.sessionId).catch(() => {});
 
-      const decision = claudeResumeDecision(e, attempt, priorSignature);
-      if (!decision.resume) {
+        const decision = claudeResumeDecision(e, attempt, priorSignature);
+        if (!decision.resume) {
+          await appendSessionLog(
+            logPath,
+            `[resume] not resuming (${decision.reason}) — escalating to a fresh restart: ${e.message}\n`,
+          ).catch(() => {});
+          throw e;
+        }
+        resumeId = e.sessionId;
+        priorError = e.message;
+        priorSignature = e.signature;
         await appendSessionLog(
           logPath,
-          `[resume] not resuming (${decision.reason}) — escalating to a fresh restart: ${e.message}\n`,
+          `[resume] transient failure (${e.signature}); resuming claude session ${e.sessionId} — ` +
+            `attempt ${attempt + 2}/${MAX_RESUME_ATTEMPTS + 1}: ${e.message}\n`,
         ).catch(() => {});
-        throw e;
       }
-      resumeId = e.sessionId;
-      priorError = e.message;
-      priorSignature = e.signature;
-      await appendSessionLog(
-        logPath,
-        `[resume] transient failure (${e.signature}); resuming claude session ${e.sessionId} — ` +
-          `attempt ${attempt + 2}/${MAX_RESUME_ATTEMPTS + 1}: ${e.message}\n`,
-      ).catch(() => {});
     }
-  }
+  };
 }
 
 /**
@@ -1478,14 +1448,6 @@ function mayBeAgentCaused(message: string): boolean {
   return /prompt is too long|input (?:is )?too long|too many tokens|maximum context|context (?:length|window)|request (?:entity )?too large|payload too large|too large|\b413\b/i.test(
     message,
   );
-}
-
-/** A permanent, human-needed failure (never retried). */
-class PoisonEpic extends Error {
-  constructor(msg: string) {
-    super(msg);
-    this.name = "PoisonError"; // classified as poison by the runner
-  }
 }
 
 /**
@@ -1720,11 +1682,6 @@ function violationParkHead(review: ReviewGateResult, rounds: number): string {
   }
 }
 
-/** Findings as a markdown list — shared by the park note and the PR body. */
-function findingLines(findings: ReviewFinding[]): string[] {
-  return findings.map((f) => `- ${f.location} — ${f.note}`);
-}
-
 /**
  * The salvage note for a reused PR whose body could not be refreshed: this run's advisory findings,
  * plus the warning that the PR text belongs to an earlier attempt.
@@ -1763,7 +1720,7 @@ export function stalePrBodyRunError(targetId: string, note: string): string {
 }
 
 /** Fold the parsed self-report into a zero-diff block reason, when one was emitted (anton-j5i8). */
-function selfReportSuffix(selfReport: ReturnType<typeof parseAntonResult>): string {
+function selfReportSuffix(selfReport: AntonResult | null): string {
   if (!selfReport) return "";
   return selfReport.outcome === "delivered"
     ? ` The agent self-reported ANTON-RESULT: delivered — a false success on an unchanged tree.`
@@ -1845,113 +1802,6 @@ export function orderTickets(tickets: Bead[], all: Bead[]): Bead[] {
   }
   if (order.length !== tickets.length) return tickets; // cycle → original order
   return order.map((id) => byId.get(id)!);
-}
-
-/**
- * Cap on each inlined ticket field. anton worktrees carry a frozen embedded Dolt with no remote,
- * so `bd show` inside the worktree can fail (issue #46 root cause #3) — the prompt must therefore
- * carry the spec itself and not be load-bearing on in-worktree DB access. A generous per-field
- * budget keeps a pathologically large body from bloating the prompt while still delivering the
- * whole spec for the common case.
- */
-const MAX_TICKET_FIELD_CHARS = 4000;
-
-function truncateField(text: string): string {
-  const trimmed = text.trim();
-  if (trimmed.length <= MAX_TICKET_FIELD_CHARS) return trimmed;
-  return `${trimmed.slice(0, MAX_TICKET_FIELD_CHARS)}\n… [truncated — run \`bd show\` for the full text]`;
-}
-
-/**
- * The concrete task (`-p`) for one ticket. The operating contract (git/beads ownership, scope,
- * learnings, fail-loud) lives in the locked base system prompt (composeSystemPrompt), so it isn't
- * duplicated here.
- *
- * The ticket's full spec — Goal / Out of scope / Verify (the `description` markdown), Acceptance,
- * and Context — is inlined so the agent can implement even when the worktree's beads DB is
- * unreadable (issue #46 root cause #3). `bd show` is offered as a convenience, never as the sole
- * source: a bead whose spec is genuinely empty AND whose `bd show` fails is a fail-loud/blocked
- * condition, not a cue to silently produce nothing.
- *
- * Human notes on the bead (anton-bfy4) are appended last — the operator's steer is the freshest
- * intent, so it reads as a refinement of the contract above it.
- */
-export function ticketPrompt(ticket: Bead): string {
-  const description = ticket.description?.trim();
-  // The gate's own reader: covers every home the contract accepts — bd's acceptance fields AND a
-  // description-only `## Acceptance` section. Reading the fields alone said "(none stated)" for a
-  // rubric the gate had just accepted, whenever the truncated description block below cut it.
-  const acceptance = acceptanceBody(ticket)?.trim();
-  // In some boards Context is a separate column; in others it's folded into `description` as a
-  // `## Context` heading. Only inline the standalone field when it isn't already in `description`.
-  const context =
-    ticket.context?.trim() && ticket.context.trim() !== description
-      ? ticket.context.trim()
-      : undefined;
-
-  const lines = [
-    `Implement this beads ticket in the current worktree:`,
-    ``,
-    `Ticket: ${ticket.id} — ${ticket.title}`,
-  ];
-  if (description) {
-    lines.push(``, `## Goal / Out of scope / Verify`, truncateField(description));
-  }
-  lines.push(``, `## Acceptance criteria`, acceptance ? truncateField(acceptance) : "(none stated)");
-  if (context) {
-    lines.push(``, `## Context`, truncateField(context));
-  }
-  // The human steering channel (anton-bfy4): notes an operator left on the bead between the gates.
-  // They come last so the freshest human intent is what the agent reads before the closing rules.
-  const humanNotes = humanNotesPromptBlock(ticket.notes);
-  if (humanNotes) {
-    lines.push(``, truncateField(humanNotes));
-  }
-  lines.push(
-    ``,
-    `The full ticket spec is inlined above so you can implement it even if the worktree's beads ` +
-      `DB is unreadable. \`bd show ${ticket.id}\` gives the same content when bd is healthy. If ` +
-      `the spec above is empty AND \`bd show\` fails, stop and report the ticket as blocked — do ` +
-      `not guess or silently bail. Follow the operating contract in your system prompt.`,
-  );
-  return lines.join("\n");
-}
-
-/**
- * `advisory` — findings the self-review reported and did NOT fix (anton-omum). They never hold the PR
- * back, so the merge gate is the only place the founder would ever see them; putting them in the body
- * is what makes "self-reviewed" mean something they can act on rather than trust blindly.
- */
-function prBody(target: Bead, tickets: Bead[], advisory: ReviewFinding[] = []): string {
-  // Standalone run (epic-of-one): the single ticket IS the target, so listing it again is noise.
-  const standalone = tickets.length === 1 && tickets[0]?.id === target.id;
-  const lines = [
-    `Autonomous run for **${target.id}** — ${target.title}.`,
-    ``,
-    ...(standalone ? [] : [`Tickets:`, ...tickets.map((t) => `- ${t.id} — ${t.title}`), ``]),
-    ...(advisory.length > 0
-      ? [
-          `### Unresolved review findings (${advisory.length}, advisory)`,
-          ``,
-          `anton's pre-PR self-review reported these and left them for you — they don't block the merge.`,
-          ``,
-          ...findingLines(advisory),
-          ``,
-        ]
-      : []),
-    `🤖 Generated with [anton](https://github.com/) autonomous execution`,
-  ];
-  return lines.join("\n");
-}
-
-/**
- * The ticket as it should be dispatched: the board-snapshot bead plus its CURRENT notes blob, read
- * fresh so an operator's steer written after the run started still reaches this ticket's prompt.
- * `bd show` failing (e.g. a locked DB) must never block the run — the snapshot bead is returned.
- */
-async function withDispatchNotes(repo: string, ticket: Bead): Promise<Bead> {
-  const fresh = await beads.show(repo, ticket.id).catch(() => null);
-  return fresh?.notes ? { ...ticket, notes: fresh.notes } : ticket;
 }
 
 /**

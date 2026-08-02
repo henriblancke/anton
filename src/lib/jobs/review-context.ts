@@ -69,6 +69,14 @@ export interface ReviewFinding {
   note: string;
 }
 
+/**
+ * Findings as a markdown list — shared by the PR body, the park note, and the stale-body salvage, so
+ * the founder reads the same rendering wherever a finding reaches them.
+ */
+export function findingLines(findings: ReviewFinding[]): string[] {
+  return findings.map((f) => `- ${f.location} — ${f.note}`);
+}
+
 /** Which reasoning contract the reviewer ran with — reported for logging and the precedence tests. */
 export interface ReviewerSource {
   kind: "agent" | "prompt" | "default";

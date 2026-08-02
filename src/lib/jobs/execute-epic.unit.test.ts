@@ -11,8 +11,8 @@ import {
   continuationPrompt,
   inactiveAgentTickets,
   reviewParkMessage,
-  ticketPrompt,
 } from "./execute-epic";
+import { ticketPrompt } from "./step-registry";
 
 function ticket(id: string, labels?: string[]): Bead {
   return { id, title: id, status: "open", labels } as Bead;

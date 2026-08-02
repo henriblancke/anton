@@ -31,6 +31,17 @@ export class PoisonError extends Error {
 }
 
 /**
+ * A run cannot proceed and no retry can change that — a bead that isn't a run target, an agent the
+ * project disabled, a formula step that maps to no handler. Poison (`name = "PoisonError"`), so the
+ * runner parks the run for a human immediately instead of burning attempts.
+ *
+ * Lives here rather than in execute-epic because the step handlers (step-registry.ts) raise it too:
+ * every one of them parks the same way, and a second poison class per module is how the runner's
+ * classification quietly drifts.
+ */
+export class PoisonEpic extends PoisonError {}
+
+/**
  * This run cannot safely proceed because it can't prove it exclusively holds the epic's live
  * run-lease (anton-jz1). Two triggers, same recovery:
  *   1. Another machine already holds a live run-lease — a Force run started elsewhere is
