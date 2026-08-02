@@ -4,6 +4,7 @@
  * of the epic's own graph. See DESIGN.md §2/§3.
  */
 import { beads, type BeadPatch } from "./beads/bd";
+import { isPipelineArtifact } from "./beads/contract";
 import { ensureDescription } from "./beads/issues";
 import { nudgeSync } from "./beads/sync-nudge";
 import { getDb } from "./db";
@@ -43,9 +44,12 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
   // parent hop — the same set the board card counts and the run executes, so the page never shows
   // fewer tickets than the PR will contain. A container epic owns no run: its members are the
   // feature cards directly beneath it, each shipping its own PR, so it still reads one hop down.
+  // Either way, pipeline plumbing is not a member: `runTickets` refuses it, and the one-hop read
+  // must too — a poured molecule or a gate hung under a container epic is coordination, not a
+  // deliverable this page may count (anton-ve2r).
   const childBeads = beads.isRunTarget(lite, all)
     ? runTickets(all, epicId)
-    : all.filter((b) => beads.parentOf(b) === epicId);
+    : all.filter((b) => beads.parentOf(b) === epicId && !isPipelineArtifact(b));
 
   // A LEAF target — a parentless task/bug chip, or a feature shaped as one unit of work — is its
   // own single ticket, so it renders as an epic whose only member is itself, with no children and

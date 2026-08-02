@@ -7,6 +7,7 @@ import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { githubRepoSlug } from "../git/remote";
 import { resolveBdBin } from "./bd-bin";
+import { isPipelineArtifact } from "./contract";
 import { invalidateIssueSnapshot } from "./snapshot";
 
 // Bead/BeadDep live in the leaf ./types module so snapshot.ts can share them without importing
@@ -1390,11 +1391,16 @@ export const beads = {
    * holds only a single `bd show` bead, letting a container epic be claimed, PR-linked and moved
    * to review, after which review-fix would run it and close its feature children on merge. Every
    * classification site loads the full list already; pass it.
+   *
+   * Pipeline plumbing (`molecule`/`gate`) is refused UP FRONT rather than left to fall out of the
+   * whitelist below (anton-ve2r): the whitelist excludes it only by luck of type, and a run target
+   * is what approval enqueues — a gate reaching it would hand a run an async wait to execute.
    */
   isRunTarget: (b: Bead, board: Bead[]): boolean =>
-    b.issue_type === "feature" ||
-    (beads.isEpic(b) && !beads.isContainer(b, board)) ||
-    ((b.issue_type === "task" || b.issue_type === "bug") && !beads.parentOf(b)),
+    !isPipelineArtifact(b) &&
+    (b.issue_type === "feature" ||
+      (beads.isEpic(b) && !beads.isContainer(b, board)) ||
+      ((b.issue_type === "task" || b.issue_type === "bug") && !beads.parentOf(b))),
 
   /**
    * Does this run target execute its CHILDREN as its tickets, rather than being its own single

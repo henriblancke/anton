@@ -55,6 +55,26 @@ export interface ContractViolation {
 }
 
 /**
+ * bd's PIPELINE PLUMBING types — beads that COORDINATE work rather than being work (anton-ve2r).
+ * `bd mol pour` materialises both: a `molecule` root holding the poured workflow, and one `gate`
+ * child per gated step (an async wait that blocks its step with an ordinary `blocks` edge). Neither
+ * is ever a ticket, a run target, or a step anton counts — `bd mol current` counts gates as steps;
+ * anton must not.
+ *
+ * Named EXPLICITLY rather than left to fall out of the ticket-tier whitelist, which is the whole
+ * point of this set: `gate` was excluded only by luck of type, so a future bd type — or a future
+ * edit that widens the whitelist — would silently promote plumbing to work. Every work surface
+ * (board, tickets list, dispatch, contract) filters on {@link isPipelineArtifact}, so the exclusion
+ * holds by construction in one place instead of four.
+ */
+export const PIPELINE_TYPES: ReadonlySet<string> = new Set(["molecule", "gate"]);
+
+/** Is this bead pipeline plumbing rather than work? See {@link PIPELINE_TYPES}. */
+export function isPipelineArtifact(bead: Bead): boolean {
+  return PIPELINE_TYPES.has(bead.issue_type ?? "");
+}
+
+/**
  * Which requirements a bead answers to. `epic` is read, not executed, so it carries less; `exempt`
  * covers every non-work type (`learning`, `molecule`, …) — plus a bead whose type the read didn't
  * carry, which cannot be classified and is therefore never faulted.
@@ -67,6 +87,8 @@ export interface ContractViolation {
 type ContractTier = "ticket" | "epic" | "exempt";
 
 function tierOf(bead: Bead): ContractTier {
+  // Plumbing first, so no later widening of the ticket cases below can promote a gate/molecule.
+  if (isPipelineArtifact(bead)) return "exempt";
   switch (bead.issue_type) {
     case "task":
     case "bug":

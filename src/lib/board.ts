@@ -3,6 +3,7 @@
  */
 import { compareBacklogEpics } from "@/components/board/board-utils";
 import { beads, getSyncStatus, getSyncStatusToken, type Bead } from "./beads/bd";
+import { isPipelineArtifact } from "./beads/contract";
 import { readAllIssues } from "./beads/issues";
 import { computeEpicGraph, epicStandaloneBlockers, standaloneBlockers } from "./epic-graph";
 import { issueSnapshotVersion, type SnapshotReadOptions } from "./beads/snapshot";
@@ -45,17 +46,17 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   // The raw, unfiltered bead list. Keep it around for blocker readiness below: the standalone-blocker
   // helpers treat a blocker missing from the list as still-open (fail-safe), so readiness must be
   // derived against every bead — including intentionally-hidden types — or a `blocks` edge to an
-  // already-closed `molecule` would surface as a phantom open blocker (matches the approve route,
-  // which gates on the same unfiltered `--status all` read).
+  // already-closed `molecule` or a resolved `gate` would surface as a phantom open blocker (matches
+  // the approve route, which gates on the same unfiltered read).
   // Read beads and their snapshot version together: a background refresh can land mid-build, so
   // stamping the response with a separately-read version would let it advance past the data served
   // here — the client would then poll that version, 304, and never see this board's data refreshed.
   const { beads: allBeads, version: snapshotVersion } = await readAllIssues(project.repoPath, opts);
 
-  // Only work items land on the board. `molecule` (swarm coordination) and similar artifacts
-  // are excluded; features/tasks/bugs are tickets.
-  const NON_WORK = new Set(["molecule"]);
-  const workBeads = allBeads.filter((b) => !NON_WORK.has(b.issue_type ?? ""));
+  // Only work items land on the board. Pipeline plumbing — a poured `molecule` root and the `gate`
+  // beads hanging off it (isPipelineArtifact) — coordinates work without being work, so it never
+  // renders as a card, a ticket or a chip.
+  const workBeads = allBeads.filter((b) => !isPipelineArtifact(b));
 
   // Cards key off RUN TARGETS, not epic ids (docs/design/2026-07-26-tier-and-linear-ux.md): a
   // `feature` is what anton runs, a legacy epic with no feature children still runs as it always
@@ -107,8 +108,8 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
     // gates on — so the board's blockedBy/ready match what approval will actually enforce and the
     // card doesn't show a not-ready run target as approvable.
     const blockedBy = [...(node?.blockedBy ?? []), ...epicStandaloneBlockers(allBeads, card.id)];
-    // ^ allBeads (unfiltered) on purpose: a closed `molecule` blocker must resolve to done here,
-    //   not read as a phantom open blocker via the helper's missing-bead fail-safe.
+    // ^ allBeads (unfiltered) on purpose: a closed `molecule` or resolved `gate` blocker must
+    //   resolve to done here, not read as a phantom open blocker via the missing-bead fail-safe.
     const built = toEpic(card, {
       goal: parseGoal(card),
       acceptance: parseAcceptance(card),
