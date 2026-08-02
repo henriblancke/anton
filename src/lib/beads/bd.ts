@@ -934,6 +934,24 @@ export function isMissingBeadError(e: unknown): boolean {
   return /no issues? found|\bissues?(?: \S+)? not found/i.test(`${stderr}\n${message}`);
 }
 
+/**
+ * Did bd refuse a `--claim` because the bead's STATUS can never be claimed — `issue not claimable:
+ * status blocked` (also `closed`, `deferred`, `in_progress` when the bead isn't already ours)? That
+ * refusal is permanent: a status is a decision written to the board, so the identical call repeats
+ * the identical error and a caller that buckets it with a Dolt lock burns its whole retry budget
+ * before parking with the wrong cause (anton-e5ix). Returns the status bd named so the caller can
+ * report it; undefined for every other failure — including "already claimed by <other>", which is an
+ * ownership conflict, not a status one — which keeps the retryable path unchanged.
+ *
+ * Reads stderr first and the message second: {@link bd}'s rejection carries the raw stderr on both.
+ */
+export function unclaimableStatus(e: unknown): string | undefined {
+  const err = e as { stderr?: unknown; message?: unknown } | null | undefined;
+  const stderr = typeof err?.stderr === "string" ? err.stderr : "";
+  const message = typeof err?.message === "string" ? err.message : "";
+  return /not claimable:\s*status\s+([a-z_]+)/i.exec(`${stderr}\n${message}`)?.[1];
+}
+
 export const beads = {
   /**
    * Truly claimable work (excludes in_progress/blocked/deferred). `--limit 0` = unlimited:

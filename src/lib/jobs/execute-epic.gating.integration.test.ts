@@ -158,6 +158,47 @@ process.exit(0);`),
     expect((await beads.show(repo, ticket5)).status).not.toBe("closed");
   });
 
+  it("parks on attempt 1 with the real reason when the epic's status isn't claimable (anton-e5ix)", async () => {
+    // `bd update --claim` refuses a bead whose STATUS is blocked/closed/deferred, with no ownership
+    // change at all — so the take-over re-read sees nothing wrong. That used to land in the transient
+    // bucket: 3 attempts against an error that can never change, then a park blaming a locked Dolt DB
+    // (observed on anton-f5f3), sending the operator to debug beads instead of the status the runtime
+    // itself wrote. It must park on the FIRST attempt, naming the status and the fix.
+    const epicB = await beads.create(repo, {
+      title: "Feature B-blocked",
+      type: "epic",
+      acceptance: "work file exists",
+      description: "## Goal\nB",
+    });
+    await beads.approve(repo, epicB);
+    const ticketB = createTicket(repo, { title: "B ticket", parent: epicB });
+    // The permanent refusal: status blocked. No `blocks` EDGE (that gate fires earlier, pre-claim) —
+    // just the status, which is what the claim itself rejects.
+    execFileSync("bd", ["update", epicB, "--status", "blocked"], { cwd: repo, stdio: "ignore" });
+
+    const runner = makeEpicRunner(ctx);
+
+    process.env.ANTON_CLAUDE_BIN = successClaude;
+    const jobId = await driveEpicRun(runner, { projectId, epicBeadId: epicB });
+
+    const job = await getJob(tdb.db, jobId);
+    expect(job?.status).toBe("parked");
+    expect(job?.attempts).toBe(1); // poison on the first try — no retry budget burned
+    expect(job?.lastError).toContain(epicB);
+    // The CLAIM refusal specifically — not the pre-claim `blocks`-edge gate, which also says
+    // "blocked" — plus bd's own words and the operator action.
+    expect(job?.lastError).toContain('status is "blocked"');
+    expect(job?.lastError).toContain("not claimable: status blocked");
+    expect(job?.lastError).toContain("Reopen/unblock");
+    expect(job?.lastError).not.toContain("DB is locked"); // never the misdirecting transient reason
+
+    // Nothing ran under the unclaimable epic: it kept its status and its ticket is untouched.
+    const epic = await beads.show(repo, epicB);
+    expect(epic.status).toBe("blocked");
+    expect(epic.labels ?? []).not.toContain("stage:in-review");
+    expect((await beads.show(repo, ticketB)).status).toBe("open");
+  });
+
   it("parks an owned epic when the runner has no operator identity (anton-i71 review)", async () => {
     // Same soft-lock as the take-over above, but the runner can't resolve an operator at all
     // (no ANTON_OPERATOR, no global git user.name) — an older queued job on an unconfigured

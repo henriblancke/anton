@@ -7,7 +7,7 @@
  * DESIGN.md §4/§7.
  */
 import { randomUUID } from "node:crypto";
-import { beads, LABELS, type Bead } from "../beads/bd";
+import { beads, LABELS, unclaimableStatus, type Bead } from "../beads/bd";
 import { ownerOf } from "../beads/claim";
 import { acceptanceBody, contractGaps, formatContractGaps } from "../beads/contract";
 import { humanNotesPromptBlock } from "../beads/notes";
@@ -775,15 +775,15 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         try {
           await beads.claim(repo, epicBeadId, operator);
         } catch (e) {
-          // A claim failure has two very different causes and only one warrants poisoning. Re-read the
-          // owner to tell them apart: if a DIFFERENT operator now holds the epic, this is a confirmed
+          // A claim failure has three causes and only the transient one is worth retrying. Re-read the
+          // owner to spot the first: if a DIFFERENT operator now holds the epic, this is a confirmed
           // take-over — retrying is pointless, so poison (human must re-approve as the current owner).
           // But `bd update --claim` also throws on transient failures (a Dolt lock, a CLI timeout) with
           // NO ownership change; poisoning those would park a valid approved epic that a retry would
           // claim cleanly. Treat that class as a normal retryable error — the same call runTicket's
           // hard gate makes — so the runner retries instead of parking. A racing steal is still caught:
           // either this re-read sees it, or the pre-read gate above does on the next attempt. If the
-          // re-read ITSELF fails we can't confirm a take-over, so fall through to the retryable path.
+          // re-read ITSELF fails we can't confirm a take-over, so fall through to the status check.
           const ownerNow = await beads
             .show(repo, epicBeadId)
             .then(ownerOf)
@@ -793,6 +793,21 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
               `${epicBeadId} is reserved by ${ownerNow}, not ${operator} — it was taken over after this ` +
                 `run was queued; refusing to run under another operator's claim. Approve ${epicBeadId} as ` +
                 `${ownerNow} to start a run under the current owner. ` +
+                `(${e instanceof Error ? e.message : String(e)})`,
+            );
+          }
+          // The third cause: bd refused because the bead's STATUS isn't claimable (blocked, closed,
+          // deferred), with no ownership change at all — so the re-read above sees nothing wrong and
+          // the old code bucketed it as transient, retried it 3× against an error that can never
+          // change, and parked telling the operator the Dolt DB was locked (anton-e5ix, observed on
+          // anton-f5f3). Poison on the FIRST attempt instead, naming the status and the fix: only a
+          // human moving the bead out of that status can make the claim succeed.
+          const status = unclaimableStatus(e);
+          if (status) {
+            throw new PoisonEpic(
+              `${epicBeadId} cannot be claimed while its status is "${status}" — bd refuses the claim ` +
+                `and no retry can change that. Reopen/unblock ${epicBeadId} (its status must be ` +
+                `claimable, e.g. open) and approve it again to start a run. ` +
                 `(${e instanceof Error ? e.message : String(e)})`,
             );
           }
