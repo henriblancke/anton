@@ -9,6 +9,11 @@
  *    — the offending step. Unknown TOML keys included: bd drops them silently, so the loader is the
  *    only thing standing between a typo and a pipeline that isn't the one written.
  *
+ * 3. **Per-label variants (anton-aa3m) select exactly one pipeline, by a precedence that doesn't
+ *    move.** Two mapped labels on one bead resolve the same way every time; no mapping resolves to
+ *    the default; a mapping pointing at a file that isn't there parks instead of quietly running
+ *    something else.
+ *
  * The `bd cook` round-trip itself is pinned against a real bd in `run-formula.integration.test.ts`.
  */
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -18,12 +23,14 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import type { CookedFormula } from "../beads/bd";
 import { PoisonEpic } from "./errors";
+import { assertRunFormulaFloor } from "./formula-floor";
 import {
   bundledRunFormulaPath,
   orderFormulaSteps,
   parseRunFormulaSource,
   projectRunFormulaPath,
   resolveRunFormulaPath,
+  selectRunFormula,
   unknownFormulaKeys,
   validateRunFormula,
   RUN_FORMULA_FILENAME,
@@ -134,6 +141,113 @@ describe("resolveRunFormulaPath", () => {
     // would run something else with no signal anywhere.
     const repo = repoWithFormula("anton-run.formula.json");
     expect(() => resolveRunFormulaPath(repo)).toThrow(/anton does not read/);
+  });
+});
+
+describe("selectRunFormula — which pipeline this run walks (anton-aa3m)", () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** A repo carrying the named formula files under `.beads/formulas/`. */
+  const repoWith = (...filenames: string[]): string => {
+    const repo = mkdtempSync(join(tmpdir(), "anton-formula-variant-"));
+    dirs.push(repo);
+    mkdirSync(join(repo, ".beads", "formulas"), { recursive: true });
+    for (const f of filenames) writeFileSync(join(repo, ".beads", "formulas", f), VALID);
+    return repo;
+  };
+
+  const variantPath = (repo: string, name: string) =>
+    join(repo, ".beads", "formulas", `${name}.formula.toml`);
+
+  it("uses the project's default when no variant is configured — invisible to a zero-config project", () => {
+    const repo = repoWith(RUN_FORMULA_FILENAME);
+    expect(selectRunFormula(repo, ["risk:high"], [])).toEqual({
+      source: projectRunFormulaPath(repo),
+    });
+    // …and anton's bundled asset when the project never installed one, exactly as before.
+    expect(selectRunFormula("/no-such-repo", ["risk:high"])).toEqual({
+      source: bundledRunFormulaPath(),
+    });
+  });
+
+  it("uses the default for a bead carrying none of the mapped labels", () => {
+    const repo = repoWith(RUN_FORMULA_FILENAME, "anton-run-risk-high.formula.toml");
+    expect(
+      selectRunFormula(repo, ["risk:low", "size:S"], [
+        { label: "risk:high", formula: "anton-run-risk-high" },
+      ]),
+    ).toEqual({ source: projectRunFormulaPath(repo) });
+  });
+
+  it("selects the mapped variant, recording the label that chose it", () => {
+    const repo = repoWith(RUN_FORMULA_FILENAME, "anton-run-risk-high.formula.toml");
+    expect(
+      selectRunFormula(repo, ["domain:eng", "risk:high"], [
+        { label: "risk:high", formula: "anton-run-risk-high" },
+      ]),
+    ).toEqual({ source: variantPath(repo, "anton-run-risk-high"), variant: "risk:high" });
+  });
+
+  it("resolves two mapped labels deterministically: the project's own order is the precedence", () => {
+    const repo = repoWith("heavy.formula.toml", "light.formula.toml");
+    const bead = ["size:S", "risk:high"];
+    const riskFirst = [
+      { label: "risk:high", formula: "heavy" },
+      { label: "size:S", formula: "light" },
+    ];
+    // The BEAD's label order is irrelevant — only the project's list decides, so the same bead
+    // resolves the same way on every run and every machine.
+    expect(selectRunFormula(repo, bead, riskFirst).variant).toBe("risk:high");
+    expect(selectRunFormula(repo, [...bead].reverse(), riskFirst).variant).toBe("risk:high");
+    // Reordering the project's list — and only that — moves the winner.
+    expect(selectRunFormula(repo, bead, [...riskFirst].reverse()).variant).toBe("size:S");
+  });
+
+  it("parks when a mapped variant's file is missing — never a silent fall back to the default", () => {
+    const repo = repoWith(RUN_FORMULA_FILENAME);
+    const select = () =>
+      selectRunFormula(repo, ["risk:high"], [{ label: "risk:high", formula: "anton-run-risk-high" }]);
+    expect(select).toThrow(PoisonEpic);
+    expect(select).toThrow(/risk:high/);
+    expect(select).toThrow(/anton-run-risk-high\.formula\.toml does not exist/);
+  });
+
+  it("parks on a variant written as `.json`, the pipeline bd cooks but anton doesn't read", () => {
+    const repo = repoWith(RUN_FORMULA_FILENAME, "heavy.formula.json");
+    expect(() => selectRunFormula(repo, ["risk:high"], [{ label: "risk:high", formula: "heavy" }])).toThrow(
+      /anton does not read/,
+    );
+  });
+
+  it("refuses a mapping that isn't a formula name — a variant can't point outside .beads/formulas", () => {
+    const repo = repoWith(RUN_FORMULA_FILENAME);
+    for (const formula of ["../../etc/passwd", "nested/heavy", "..", "/abs/heavy"]) {
+      expect(() => selectRunFormula(repo, ["risk:high"], [{ label: "risk:high", formula }])).toThrow(
+        /not a formula name/,
+      );
+    }
+  });
+
+  it("validates the selected variant exactly like the default — the floor is not escapable", async () => {
+    // The whole safety argument for project-owned pipelines: selection changes WHICH file loads and
+    // nothing else, so anton-6b99's floor still rejects a variant that would open a PR on nothing.
+    const repo = repoWith(RUN_FORMULA_FILENAME, "no-pr.formula.toml");
+    const formula = await validateRunFormula(repo, {
+      labels: ["risk:high"],
+      variants: [{ label: "risk:high", formula: "no-pr" }],
+      cook: cookYielding([
+        { id: "implement", labels: ["step:implement"] },
+        { id: "commit", labels: ["step:commit"], needs: ["implement"] },
+      ]),
+    });
+    expect(formula.source).toBe(variantPath(repo, "no-pr"));
+    expect(formula.variant).toBe("risk:high");
+    expect(() => assertRunFormulaFloor(formula)).toThrow(PoisonEpic);
+    expect(() => assertRunFormulaFloor(formula)).toThrow(/no-pr\.formula\.toml/);
+    expect(() => assertRunFormulaFloor(formula)).toThrow(/no step is labelled `step:pr`/);
   });
 });
 

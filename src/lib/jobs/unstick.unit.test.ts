@@ -33,6 +33,8 @@ function run(o: Partial<RunRow> = {}): RunRow {
     branch: null,
     model: null,
     agentTag: null,
+    formula: null,
+    formulaVariant: null,
     status: "parked",
     attempts: 1,
     leaseExpiresAt: null,

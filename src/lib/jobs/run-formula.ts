@@ -19,6 +19,10 @@
  *
  * What it deliberately does NOT do: check the cooked pipeline against anton's invariant floor (which
  * steps may be omitted or reordered) — that is anton-6b99's, and it consumes what this returns.
+ *
+ * It is also where a run picks WHICH pipeline it walks (anton-aa3m): a project may map a bead label
+ * to a formula of its own, so `risk:high` can carry extra steps while everything else walks the
+ * default. See {@link selectRunFormula} for the precedence.
  */
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -45,9 +49,7 @@ export interface ResolvedStep {
 }
 
 /** A pipeline that parsed, cooked, and resolved — what the walker (anton-lnkt) executes. */
-export interface RunFormula {
-  /** Absolute path the pipeline was read from — the project's copy, or anton's bundled asset. */
-  source: string;
+export interface RunFormula extends FormulaChoice {
   /** The cooked pipeline, its `steps` already in {@link orderFormulaSteps execution order}. */
   cooked: CookedFormula;
   /** Every step in execution order, each with its resolved handler. */
@@ -57,6 +59,97 @@ export interface RunFormula {
 /** Where a project keeps its own pipeline — the path bd's own formula search hits first. */
 export function projectRunFormulaPath(repoPath: string): string {
   return join(repoPath, ".beads", "formulas", RUN_FORMULA_FILENAME);
+}
+
+/**
+ * One entry of a project's label→formula map (anton-aa3m). A LABEL, not a predicate: the whole
+ * feature is "risk:high runs a different pipeline", and an expression language would buy nothing a
+ * label doesn't already say.
+ */
+export interface FormulaVariant {
+  /** An exact bead label — `risk:high`, `size:S`, `domain:docs`. Matched literally; no globs. */
+  label: string;
+  /** The formula's name: `.beads/formulas/<formula>.formula.toml` in the project. */
+  formula: string;
+}
+
+/** Which pipeline a run walks, and why — the two things the run record has to name (anton-aa3m). */
+export interface FormulaChoice {
+  /** Absolute path the pipeline is read from — a variant, the project's copy, or anton's asset. */
+  source: string;
+  /** The mapped label that selected it; absent ⇒ no mapping matched, so the default applies. */
+  variant?: string;
+}
+
+/**
+ * A formula NAME as it may appear in a project's variant map: what `<name>.formula.toml` accepts as
+ * a filename, and nothing that could climb out of `.beads/formulas/` (no separators, and `..` can't
+ * match because the name must start and end alphanumeric). Settings are hand-editable through the
+ * API, so this is enforced here as well as at that boundary.
+ */
+const FORMULA_NAME = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
+
+/**
+ * The pipeline a run over `labels` walks, by a precedence that is deterministic and inspectable:
+ *
+ * 1. **The first variant, in the project's own declaration order, whose label the run target
+ *    carries.** The operator's ORDER IS THE PRECEDENCE — a bead labelled both `risk:high` and
+ *    `size:S` walks whichever of the two the project listed first, every time, with no tie-break
+ *    anton invents on its behalf.
+ * 2. Else the project's own `anton-run.formula.toml`.
+ * 3. Else anton's bundled default.
+ *
+ * So a project with no map configured is exactly where it was before this existed (2 → 3), which is
+ * the point: the feature is invisible until someone maps a label.
+ *
+ * The labels are the RUN TARGET's, not its tickets': a run is one worktree and one PR, so it walks
+ * one pipeline. A mapped variant whose file is missing PARKS rather than falling back to the default
+ * — the project asked for a different pipeline, and silently walking another one is the failure this
+ * whole seam exists to make impossible.
+ */
+export function selectRunFormula(
+  repoPath: string,
+  labels: readonly string[] = [],
+  variants: readonly FormulaVariant[] = [],
+): FormulaChoice {
+  const carried = new Set(labels);
+  const match = variants.find((v) => carried.has(v.label));
+  if (!match) return { source: resolveRunFormulaPath(repoPath) };
+
+  if (!FORMULA_NAME.test(match.formula)) {
+    throw new PoisonEpic(
+      `this project maps label \`${match.label}\` to run formula "${match.formula}", which is not a ` +
+        `formula name — a variant names a file in \`.beads/formulas/\` (\`<name>.formula.toml\`), so ` +
+        `it may only contain letters, digits, \`.\`, \`-\` and \`_\`. Correct the mapping in ` +
+        `Settings → Pipeline variants, then resume the run.`,
+    );
+  }
+
+  const path = join(repoPath, ".beads", "formulas", `${match.formula}.formula.toml`);
+  if (existsSync(path)) return { source: path, variant: match.label };
+  assertNoJsonFormulaAt(path);
+  throw new PoisonEpic(
+    `this project maps label \`${match.label}\` to run formula "${match.formula}", but ${path} does ` +
+      `not exist — anton parks rather than walking its default pipeline for a bead the project ` +
+      `asked to run differently. Add the formula (or remove the mapping in Settings → Pipeline ` +
+      `variants), then resume the run.`,
+  );
+}
+
+/**
+ * A `.json` sibling PARKS rather than being passed over: `bd cook` accepts either extension, so a
+ * project that wrote `<name>.formula.json` has written a pipeline anton would silently ignore in
+ * favour of another — running something other than what the project asked for, with no signal
+ * anywhere. anton reads one filename; say so instead.
+ */
+function assertNoJsonFormulaAt(tomlPath: string): void {
+  const asJson = tomlPath.replace(/\.toml$/, ".json");
+  if (!existsSync(asJson)) return;
+  throw new PoisonEpic(
+    `${asJson} is a run formula anton does not read — a pipeline must be \`<name>.formula.toml\`. ` +
+      `Convert it (\`bd formula convert\`) or rename it, then resume the run; anton would otherwise ` +
+      `walk a different pipeline and silently ignore this one.`,
+  );
 }
 
 /**
@@ -72,23 +165,12 @@ export function bundledRunFormulaPath(): string {
 
 /**
  * The project's pipeline when it has one, else anton's bundled default. Project-local always wins.
- *
- * A `.json` sibling PARKS rather than being passed over: `bd cook` accepts either extension, so a
- * project that wrote `anton-run.formula.json` has written a pipeline anton would silently ignore in
- * favour of the shipped default — running something other than what the project asked for, with no
- * signal anywhere. anton reads one filename; say so instead.
+ * A `.json` sibling parks — see {@link assertNoJsonFormulaAt}.
  */
 export function resolveRunFormulaPath(repoPath: string): string {
   const local = projectRunFormulaPath(repoPath);
   if (existsSync(local)) return local;
-  const asJson = local.replace(/\.toml$/, ".json");
-  if (existsSync(asJson)) {
-    throw new PoisonEpic(
-      `${asJson} is a run formula anton does not read — the pipeline must be \`${RUN_FORMULA_FILENAME}\`. ` +
-        `Convert it (\`bd formula convert\`) or rename it, then resume the run; anton would otherwise ` +
-        `walk its own default and silently ignore this project's pipeline.`,
-    );
-  }
+  assertNoJsonFormulaAt(local);
   return bundledRunFormulaPath();
 }
 
@@ -232,8 +314,12 @@ export function orderFormulaSteps(steps: CookedStep[], source: string): CookedSt
   return order;
 }
 
-/** Machinery a caller may swap. Production passes none; the unit tests pass a fake cook. */
-export interface RunFormulaDeps {
+/** What the pipeline is selected BY, plus machinery a caller may swap (the unit tests fake the cook). */
+export interface RunFormulaOptions {
+  /** The run target's labels — what a per-label variant is selected by (anton-aa3m). */
+  labels?: readonly string[];
+  /** The project's label→formula map, in precedence order. Absent/empty ⇒ the default, always. */
+  variants?: readonly FormulaVariant[];
   /** The `bd cook` seam (anton-brdg). Defaults to {@link beads.cook}. */
   cook?: (repoPath: string, formulaPath: string) => Promise<CookedFormula>;
   /** Read the formula source. Defaults to the filesystem. */
@@ -241,18 +327,22 @@ export interface RunFormulaDeps {
 }
 
 /**
- * Load, cook, and fully resolve the pipeline that applies to `repoPath`. Every failure PARKS
+ * Select, load, cook, and fully resolve the pipeline this run walks. Every failure PARKS
  * ({@link PoisonEpic}) naming the file — and, where there is one, the offending step — because a run
  * that cannot read its own pipeline has no safe way to proceed.
+ *
+ * A variant (anton-aa3m) only changes WHICH file is loaded: everything past the selection — the
+ * parse, the cook, handler resolution, and the invariant floor the caller applies to what this
+ * returns — is identical, so a variant is validated exactly like the default and cannot escape it.
  *
  * Cooked in COMPILE mode (no `--var`): `{{var}}` placeholders survive, so validation never depends on
  * per-run values that don't exist yet. Substitution belongs to the walk.
  */
 export async function validateRunFormula(
   repoPath: string,
-  deps: RunFormulaDeps = {},
+  deps: RunFormulaOptions = {},
 ): Promise<RunFormula> {
-  const source = resolveRunFormulaPath(repoPath);
+  const { source, variant } = selectRunFormula(repoPath, deps.labels, deps.variants);
   const read = deps.read ?? ((p: string) => readFile(p, "utf8"));
 
   let raw: string;
@@ -284,5 +374,5 @@ export async function validateRunFormula(
   // Resolution is the whole point of validating early: an unmapped `step:` label parks HERE, before a
   // worktree exists, instead of three steps into a run that has already dispatched an agent.
   const steps = ordered.map((step) => ({ step, definition: resolveStep(step, source) }));
-  return { source, cooked: { ...cooked, steps: ordered }, steps };
+  return { source, variant, cooked: { ...cooked, steps: ordered }, steps };
 }

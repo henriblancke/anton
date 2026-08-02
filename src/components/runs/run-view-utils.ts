@@ -46,6 +46,18 @@ export function timelineOrder(sessions: SessionSummary[]): SessionSummary[] {
   return [...sessions].sort((a, b) => (a.startedAt ?? 0) - (b.startedAt ?? 0));
 }
 
+/**
+ * How the meta grid names the pipeline a run walked (anton-aa3m): the formula file, and — when a
+ * per-label variant selected it — the bead label that did. The full path rides in the row's title,
+ * so this stays the glanceable form. No formula recorded (a run from before this was tracked, or one
+ * that parked before selection) reads as "—" rather than pretending the default was used.
+ */
+export function formatRunPipeline(formula?: string, variant?: string): string {
+  if (!formula) return "—";
+  const file = formula.split("/").pop() || formula;
+  return variant ? `${file} · ${variant}` : file;
+}
+
 export function fmtDuration(from?: number, to?: number, nowMs: number = Date.now()): string {
   if (from == null) return "—";
   const end = to ?? Math.floor(nowMs / 1000);

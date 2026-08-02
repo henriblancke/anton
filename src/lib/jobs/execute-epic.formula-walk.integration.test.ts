@@ -9,6 +9,9 @@
  * 2. **A run that dies mid-walk resumes at the step git says it reached.** There is no second store
  *    of run progress: the resumed walk re-reads the board and the branch, skips the ticket whose
  *    commit is already there, and re-runs the one that never landed.
+ * 3. **The work's own labels can pick the pipeline (anton-aa3m).** With a `risk:high → <formula>`
+ *    mapping configured, a run over a `risk:high` target walks that formula's extra step and its run
+ *    row NAMES the formula; an unlabelled target in the same project still walks the default.
  *
  * The "formula walk" slice of `execute-epic.integration.test.ts`, split out to run in parallel with
  * its siblings (anton-0oi). Drives the REAL handler + runner + bd/git with fake `claude`/`gh`.
@@ -55,6 +58,8 @@ describeBd("execute-epic e2e — the formula walk (real handler · real bd/git �
   let ctx: ExecuteEpicSandbox;
   /** The project-local pipeline a case installs; removed after every case. */
   let formulaPath: string;
+  /** Any NAMED pipelines a case installs (per-label variants); removed after every case. */
+  const extraFormulas: string[] = [];
 
   /** Install the project's own pipeline — the file that wins over anton's bundled default. */
   const writeProjectFormula = (steps: string) => {
@@ -66,31 +71,43 @@ describeBd("execute-epic e2e — the formula walk (real handler · real bd/git �
     );
   };
 
-  /** Point the project's verify gate at a command that records each time it runs. */
-  const recordVerifyInto = async (orderLog: string) => {
+  /** A named pipeline of the project's own — how a per-label variant (anton-aa3m) is installed. */
+  const writeNamedFormula = (name: string, steps: string) => {
+    mkdirSync(join(repo, ".beads", "formulas"), { recursive: true });
+    const path = join(repo, ".beads", "formulas", `${name}.formula.toml`);
+    writeFileSync(path, `formula = "${name}"\ntype = "workflow"\nversion = 1\n\n${steps}`, "utf8");
+    extraFormulas.push(path);
+    return path;
+  };
+
+  /** Merge a settings patch into the sandbox project's settingsJson. */
+  const patchSettings = async (patch: Record<string, unknown>) => {
     const proj = (
       await tdb.db.select().from(schema.projects).where(eq(schema.projects.id, projectId))
     )[0];
     const base = JSON.parse(proj.settingsJson ?? "{}") as Record<string, unknown>;
     await tdb.db
       .update(schema.projects)
-      .set({
-        settingsJson: JSON.stringify({
-          ...base,
-          // Still a real gate (the work file must exist) — it just leaves a trace of WHEN it ran.
-          testCommand: `test -f AGENT_WORK.md && printf 'verify\\n' >> ${orderLog}`,
-        }),
-      })
+      .set({ settingsJson: JSON.stringify({ ...base, ...patch }) })
       .where(eq(schema.projects.id, projectId));
   };
 
+  /** Point the project's verify gate at a command that records each time it runs. */
+  const recordVerifyInto = (orderLog: string) =>
+    // Still a real gate (the work file must exist) — it just leaves a trace of WHEN it ran.
+    patchSettings({ testCommand: `test -f AGENT_WORK.md && printf 'verify\\n' >> ${orderLog}` });
+
   /** An approved epic with two tickets — enough for "per ticket" and "per run" to differ. */
-  const approvedEpic = async (title: string): Promise<{ id: string; tickets: string[] }> => {
+  const approvedEpic = async (
+    title: string,
+    labels?: string[],
+  ): Promise<{ id: string; tickets: string[] }> => {
     const id = await beads.create(repo, {
       title,
       type: "epic",
       acceptance: "work file exists",
       description: `## Goal\n${title}`,
+      labels,
     });
     const tickets = ["one", "two"].map((n) =>
       createTicket(repo, { title: `${title} ${n}`, parent: id, acceptance: "work file exists" }),
@@ -121,7 +138,13 @@ describeBd("execute-epic e2e — the formula walk (real handler · real bd/git �
 
   // A project-local pipeline is read from the repo on every run, so leaving one behind would
   // silently re-shape every later case in this file.
-  afterEach(() => rmSync(formulaPath, { force: true }));
+  afterEach(async () => {
+    rmSync(formulaPath, { force: true });
+    for (const path of extraFormulas.splice(0)) rmSync(path, { force: true });
+    // Settings outlive a case (only sessions/runs/jobs are reset), and a stray label→formula map
+    // would re-shape every later case in this file.
+    await patchSettings({ formulaVariants: undefined });
+  });
 
   it("walks anton's default pipeline: the verify gate runs once per TICKET, before each commit", async () => {
     // The baseline the reordering case is measured against. No project formula → anton's bundled
@@ -298,6 +321,111 @@ process.exit(0);`),
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
       if (jobId) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  });
+
+  it("walks the label's own pipeline: risk:high runs the variant's extra step, and the run names it", async () => {
+    // The point of per-label variants (anton-aa3m): risk drives process. The heavy pipeline verifies
+    // ONE MORE TIME over the finished run — a step the default doesn't have — and the run record has
+    // to say which formula it walked, because "why did this run do that" is now project-specific.
+    const orderLog = join(sandbox, "order-variant.log");
+    await recordVerifyInto(orderLog);
+    const variantPath = writeNamedFormula(
+      "anton-run-risk-high",
+      step("implement", "implement") +
+        "\n" +
+        step("verify", "verify", "implement") +
+        "\n" +
+        step("commit", "commit", "verify") +
+        "\n" +
+        step("final-check", "verify", "commit") +
+        "\n" +
+        step("pr", "pr", "final-check"),
+    );
+    await patchSettings({
+      formulaVariants: [{ label: "risk:high", formula: "anton-run-risk-high" }],
+    });
+    const { id: epicId, tickets } = await approvedEpic("Risky work", ["risk:high"]);
+
+    const orderClaude = writeBin(
+      binDir,
+      "claude-order-variant",
+      fakeClaudeReadingStdin(`const m=prompt.match(/Ticket: (\\S+)/);
+fs.appendFileSync(${JSON.stringify(orderLog)},'implement '+(m?m[1]:'?')+'\\n');
+fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work '+Date.now()+'\\n');
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+e({type:'system',subtype:'init',session_id:'s'});
+e({type:'result',subtype:'success',result:'done',session_id:'s',num_turns:1,is_error:false});
+process.exit(0);`),
+    );
+
+    process.env.ANTON_CLAUDE_BIN = orderClaude;
+    try {
+      const jobId = await driveEpicRun(runnerFor(), { projectId, epicBeadId: epicId });
+      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+
+      // Two tickets verified in the ticket phase, then the variant's extra run-wide check — three
+      // gate runs where the default pipeline does two.
+      const order = lines(orderLog);
+      expect(order.filter((l) => l === "verify")).toHaveLength(3);
+      expect(order[order.length - 1]).toBe("verify");
+
+      // The run record NAMES the pipeline and the label that chose it.
+      const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === epicId)!;
+      expect(run.formula).toBe(variantPath);
+      expect(run.formulaVariant).toBe("risk:high");
+
+      // And the floor still held: both tickets committed and closed, one PR, epic in review.
+      for (const t of tickets) expect((await beads.show(repo, t)).status).toBe("closed");
+      const epic = await beads.show(repo, epicId);
+      expect(beads.getPrRef(epic)).toBe("gh-42");
+      expect(epic.labels ?? []).toContain("stage:in-review");
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+    }
+  });
+
+  it("leaves an unmapped target on the default pipeline, in the same project, same settings", async () => {
+    // The other half of the guarantee: a variant map changes NOTHING for work that doesn't carry a
+    // mapped label — same project, same mapping in settings, plain default walk.
+    const orderLog = join(sandbox, "order-unmapped.log");
+    await recordVerifyInto(orderLog);
+    writeNamedFormula(
+      "anton-run-risk-high",
+      step("implement", "implement") +
+        "\n" +
+        step("commit", "commit", "implement") +
+        "\n" +
+        step("pr", "pr", "commit"),
+    );
+    await patchSettings({
+      formulaVariants: [{ label: "risk:high", formula: "anton-run-risk-high" }],
+    });
+    const { id: epicId } = await approvedEpic("Routine work", ["risk:low"]);
+
+    const orderClaude = writeBin(
+      binDir,
+      "claude-order-unmapped",
+      fakeClaudeReadingStdin(`fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work '+Date.now()+'\\n');
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+e({type:'system',subtype:'init',session_id:'s'});
+e({type:'result',subtype:'success',result:'done',session_id:'s',num_turns:1,is_error:false});
+process.exit(0);`),
+    );
+
+    process.env.ANTON_CLAUDE_BIN = orderClaude;
+    try {
+      const jobId = await driveEpicRun(runnerFor(), { projectId, epicBeadId: epicId });
+      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+
+      // anton's default: the gate runs once per ticket and not again.
+      expect(lines(orderLog).filter((l) => l === "verify")).toHaveLength(2);
+
+      const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === epicId)!;
+      expect(run.formula?.endsWith("anton-run.formula.toml")).toBe(true);
+      expect(run.formulaVariant).toBeNull();
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
     }
   });
 

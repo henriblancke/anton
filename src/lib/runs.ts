@@ -91,6 +91,10 @@ export async function listRunsPaged(
 export interface RunDetail extends RunSummary {
   leaseExpiresAt?: number;
   error?: string;
+  /** The pipeline this run walked — the formula file it was read from (anton-aa3m). */
+  formula?: string;
+  /** The bead label that selected that pipeline; absent ⇒ the project/bundled default. */
+  formulaVariant?: string;
 }
 
 export async function getRunDetail(
@@ -108,6 +112,8 @@ export async function getRunDetail(
     ...toSummary(row),
     leaseExpiresAt: toEpoch(row.leaseExpiresAt),
     error: row.error ?? undefined,
+    formula: row.formula ?? undefined,
+    formulaVariant: row.formulaVariant ?? undefined,
   };
 }
 
@@ -151,6 +157,9 @@ export type RunPatch = Partial<{
   branch: string | null;
   model: string | null;
   agentTag: string | null;
+  /** The pipeline this run walked (anton-aa3m) — written once the formula is selected + validated. */
+  formula: string | null;
+  formulaVariant: string | null;
   attempts: number;
   error: string | null;
   endedAt: number; // ms; converted to seconds

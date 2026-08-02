@@ -76,6 +76,12 @@ commit, self-review, open the PR — with each step naming its handler via a `st
 it and the project owns its own pipeline. anton validates it at run start, so a broken one parks the
 run before any worktree is created rather than halfway through.
 
+One pipeline need not fit every ticket: a project can add more formulas beside it (say
+`anton-run-risk-high.formula.toml`) and map a bead label to one in **Settings → Pipeline variants**,
+so a `risk:high` target walks the heavier pipeline while everything else walks the default. The
+first mapping in that list whose label the run target carries wins, and every variant is held to the
+same floor. Nothing to do here — mention it only if the project asks for per-risk process.
+
 Both belong under `.beads/` because git tracks that directory — only the JSONL exports and the Dolt
 runtime are ignored — so the project's bead shape and pipeline reach every clone and teammate.
 Confirm with `bd formula list` (it should list `anton-bead` and `anton-run`).

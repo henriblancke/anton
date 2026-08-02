@@ -601,8 +601,21 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //     the steps, anton owns the guarantees, so a formula may ADD steps freely but may not omit
       //     implement/commit/pr or order them so the run's work is thrown away (a PR opened before
       //     the commit, an agent dispatched after it). Same park, same place — before the worktree.
-      const formula = await validateRunFormula(repo);
+      //     WHICH pipeline is a per-label choice (anton-aa3m): the project may map a bead label to a
+      //     formula of its own, so this run walks the first mapped label the TARGET carries (one run
+      //     is one worktree and one PR, so it walks one pipeline), else the project's default. The
+      //     floor is applied to whatever came back — selection only changes which file is loaded —
+      //     so a variant cannot escape it. The choice is then recorded ON THE RUN below rather than
+      //     left to be inferred from settings and labels that may since have changed.
+      const formula = await validateRunFormula(repo, {
+        labels: target.labels,
+        variants: settings.formulaVariants,
+      });
       assertRunFormulaFloor(formula);
+      await updateRun(db, clock, runId, {
+        formula: formula.source,
+        formulaVariant: formula.variant ?? null,
+      });
       // The pipeline this run walks (anton-lnkt), split at the commit into its two phases. Steps run
       // ONE AT A TIME — they share one worktree and one PR, so a formula whose steps could run
       // concurrently is not a licence to fan out.

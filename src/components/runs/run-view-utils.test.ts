@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 import {
   ACTIVE_RUN_STATUSES,
   fmtDuration,
+  formatRunPipeline,
   isActiveRun,
   pickAttachSession,
   timelineOrder,
@@ -74,5 +75,21 @@ describe("fmtDuration", () => {
   });
   it("returns a dash without a start", () => {
     expect(fmtDuration(undefined)).toBe("—");
+  });
+});
+
+describe("formatRunPipeline (anton-aa3m)", () => {
+  it("names the formula file, and the label that selected it when a variant applied", () => {
+    expect(formatRunPipeline("/repo/.beads/formulas/anton-run-risk-high.formula.toml", "risk:high")).toBe(
+      "anton-run-risk-high.formula.toml · risk:high",
+    );
+  });
+  it("names just the file when the default pipeline ran", () => {
+    expect(formatRunPipeline("/repo/.beads/formulas/anton-run.formula.toml")).toBe(
+      "anton-run.formula.toml",
+    );
+  });
+  it("shows a dash for a run with nothing recorded rather than claiming the default", () => {
+    expect(formatRunPipeline(undefined, "risk:high")).toBe("—");
   });
 });

@@ -30,6 +30,12 @@ export const runs = sqliteTable("runs", {
   branch: text("branch"),
   model: text("model"),
   agentTag: text("agent_tag"),
+  // The pipeline this run walked (anton-aa3m): the formula file's absolute path, and the bead label
+  // that selected it when a per-label variant applied (null = the project/bundled default). Recorded
+  // rather than inferred — per-project pipelines make "why did this run do that" project-specific,
+  // and settings or the target's labels may have changed by the time anyone asks.
+  formula: text("formula"),
+  formulaVariant: text("formula_variant"),
   // queued | running | parked | done | failed
   status: text("status").notNull().default("queued"),
   attempts: integer("attempts").notNull().default(0),
