@@ -209,16 +209,99 @@ bd link <new> <origin> --type discovered-from   # provenance for work found mid-
 ## Read the board (dedupe / inspect)
 
 ```bash
-bd list --json                          # existing beads (dedupe /scan-triage against these)
-bd ready --json                         # what the executor would consider claimable
+bd list --json --limit 0                # existing beads (dedupe /scan-triage against these)
+bd list --status all --json --limit 0   # + closed: parentage and edges, the board read pickup needs
 bd show <id>
+```
+
+`bd ready` is deliberately absent from that list — what a worker may take is the claimable set
+below, never the raw ready list.
+
+## The pickup protocol — how any worker takes work
+
+The board is the work queue. A second anton, a headless job, or a plain Claude Code session in
+another clone must pull the same set, in the same order, and must never both believe they hold the
+same target. anton implements this in `src/lib/beads/bd.ts` (`beads.claimableTargets`,
+`beads.claimVerified`) and `src/lib/beads/child-assign.ts`; the CLI form below is the same protocol
+for a worker with no anton runtime.
+
+### 1. The claimable set — never bare `bd ready`
+
+**No worker runs bare `bd ready`.** It answers "what is unblocked", not "what may I take": it
+includes unapproved work (which anton refuses to run), targets another machine already holds,
+container epics (whose features each run on their own), and the child tickets of a feature already
+in flight. Acting on it means claiming work that will be rejected, or stealing work in progress.
+
+The canonical pool query:
+
+```bash
+bd ready --label approved --unassigned --json --limit 0
+```
+
+- `--label approved` — the human gate; unapproved work is not claimable at all.
+- `--unassigned` — a claim already held is not up for grabs.
+- `--limit 0` — unlimited; `bd ready` truncates at 50 by default and silently drops work.
+- No `--type`: bd's `-t/--type` takes ONE type (verified on 1.1.2) and the set spans three shapes.
+
+Then narrow the pool to **run targets** (the run-target rule above) against one full board read
+(`bd list --status all --json --limit 0`, which carries parentage and `blocks` edges), keeping only
+beads that are `open`, carry `approved`, and have no assignee. Rank what survives — the order is
+total and deterministic, so two machines agree on what is next:
+
+1. **priority**, P0 first (a bead with none sorts last);
+2. then **unblocking value** — how many open beads it transitively unblocks via `blocks` edges, most
+   first;
+3. then **age**, oldest `created_at` first;
+4. then **id**, which is what makes the order total.
+
+### 2. Claim, then prove the claim held
+
+Claims ride eventually-consistent Dolt sync, so *writing* a claim is not *holding* one. Run the
+whole sequence, in order, for the top-ranked target:
+
+```bash
+bd dolt pull                                 # 1. see a claim another machine already published
+BEADS_ACTOR="$ACTOR" bd update <id> --claim  # 2. bd's atomic local CAS — refuses a bead someone else holds
+bd dolt commit && bd dolt push               # 3. publish; a claim nobody else can see is not a claim
+sleep 2                                      # 4. settle — let a near-simultaneous rival reach the remote
+bd dolt pull                                 # 5. re-read after the merge has picked a winner
+bd show <id> --json                          # 6. assert assignee == "$ACTOR"
+```
+
+Step 6 is the only one that makes the claim trustworthy. Three outcomes, and only the first licenses
+a run:
+
+- **assignee is you** → you hold it; run it.
+- **assignee is someone else** → you lost the race. Back off *without writing anything* and move to
+  the next target. Losing is the protocol working, not an error.
+- **could not prove it either way** (any step failed) → fail closed: do not run the target. Retrying
+  is safe — `--claim` is idempotent for the same actor.
+
+### 3. Claiming a feature reserves its children
+
+`bd ready --unassigned` filters on each **ticket's** own assignee, so a running feature keeps serving
+its children to every other worker until they are reserved. After winning a feature, reserve each
+open, non-abandoned child for the same actor:
+
+```bash
+bd assign <child-id> "$ACTOR"     # reservation, NOT a claim
+```
+
+`bd assign`, never `bd update --claim`: assignment leaves the child `open` (still backlog) while the
+run's own per-ticket claim stays the one thing that marks a ticket in flight. Leave alone — and
+report — any child a different actor already holds. When the run releases, parks, or abandons, hand
+back only the children still assigned to you:
+
+```bash
+bd assign <child-id> ""
 ```
 
 ## Not shaping's job (the execution runtime owns these)
 
 Claiming, dispatching, worktrees, review/scoring, merges, park/unpark, and coordination are the
 **executor's** responsibility. Shaping never claims, closes, or merges beads — it only creates
-and links them.
+and links them. The pickup protocol above is documented here because it is the one definition of
+what "claimable" means; producing work never executes it.
 
 ## Cross-domain
 
