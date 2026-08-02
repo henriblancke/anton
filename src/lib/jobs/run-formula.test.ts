@@ -333,6 +333,24 @@ describe("parseRunFormulaSource — the file as written", () => {
     );
   });
 
+  // bd merges an inherited formula's steps into the cooked pipeline but anton only ever reads the
+  // selected file, so every check above would cover half the pipeline it then walks — a `gtae` typo
+  // in a base erases the gate assertNoStepGates would have parked on, silently.
+  it("parks on `extends` — anton never scans the inherited source", () => {
+    const inheriting = VALID.replace("version = 1", 'version = 1\nextends = ["base"]');
+    expect(() => parseRunFormulaSource(inheriting, "/repo/f.toml")).toThrow(PoisonEpic);
+    expect(() => parseRunFormulaSource(inheriting, "/repo/f.toml")).toThrow(/inherits from another formula/);
+    expect(() => parseRunFormulaSource(inheriting, "/repo/f.toml")).toThrow(/base/);
+  });
+
+  // A formula that inherits ALL its steps declares none of its own — it must read as the `extends`
+  // rejection, not as "declares no [[steps]]", or the operator is sent to fix the wrong thing.
+  it("names `extends` ahead of the no-steps rejection", () => {
+    expect(() =>
+      parseRunFormulaSource(`formula = "anton-run"\nversion = 1\nextends = "base"\n`, "/repo/f.toml"),
+    ).toThrow(/inherits from another formula/);
+  });
+
   it("parks on a pipeline with no steps — it would implement, commit, and ship nothing", () => {
     expect(() => parseRunFormulaSource(`formula = "anton-run"\nversion = 1\n`, "/repo/f.toml")).toThrow(
       /declares no `\[\[steps\]\]`/,

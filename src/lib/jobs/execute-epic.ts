@@ -1291,15 +1291,9 @@ async function runTicket(args: {
 
   // This ticket's step context: the run's, narrowed to this ticket. The session is opened HERE and
   // handed in, so one session still covers the whole ticket — dispatch, gates and commit — exactly
-  // as before.
-  const ticketCtx: StepContext = {
-    ...run,
-    tickets: [ticket],
-    session,
-    // In-session resume for a transient mid-stream death (anton-juar) — the dispatch machinery the
-    // step inherits from the run rather than a second driver of its own.
-    deps: { runClaude: resilientClaude({ db, ctx, sessionId, logPath, ticket }) },
-  };
+  // as before. The claude driver is built per step below, so a resumed session is told which step it
+  // is continuing.
+  const ticketCtx: StepContext = { ...run, tickets: [ticket], session };
 
   let committed = false;
   try {
@@ -1315,7 +1309,13 @@ async function runTicket(args: {
     for (const { step: cooked, definition } of args.steps) {
       // Every step boundary is a lease checkpoint, exactly as every ticket boundary is.
       run.assertLeaseHeld?.();
-      const result = await definition.handler({ ...ticketCtx, step: cooked });
+      const result = await definition.handler({
+        ...ticketCtx,
+        step: cooked,
+        // In-session resume for a transient mid-stream death (anton-juar) — the dispatch machinery
+        // the step inherits from the run rather than a second driver of its own.
+        deps: { runClaude: resilientClaude({ db, ctx, sessionId, logPath, ticket, stepId: cooked.id }) },
+      });
       // A `blocked` self-report is STICKY across a phase with several dispatching steps. A later
       // agent — a `step:claude` the project added after `implement` — reports on its own work only,
       // so letting its `delivered` overwrite an earlier block would close a ticket the implementer
@@ -1489,10 +1489,16 @@ function resilientClaude(args: {
   /** anton's session row for this ticket — where the captured claude id and the resume log land. */
   sessionId: string;
   logPath: string;
-  /** The ticket being implemented, for the continuation prompt a resumed session gets. */
+  /** The ticket in scope, for the continuation prompt a resumed session gets. */
   ticket: Bead;
+  /**
+   * The formula step being dispatched. Every dispatching step in the ticket phase inherits this
+   * driver — `implement`, and any `step:claude` the project added — so the continuation prompt names
+   * the step rather than implying the resumed session was implementing the ticket.
+   */
+  stepId?: string;
 }): (options: RunClaudeOptions) => Promise<ClaudeResult> {
-  const { db, ctx, sessionId, logPath, ticket } = args;
+  const { db, ctx, sessionId, logPath, ticket, stepId } = args;
   return async function dispatch(options: RunClaudeOptions): Promise<ClaudeResult> {
     let resumeId: string | undefined;
     let priorError: string | undefined;
@@ -1504,9 +1510,9 @@ function resilientClaude(args: {
           resumeId
             ? {
                 ...options,
-                // The full ticket spec already lives in the resumed conversation, so the prompt is
-                // a brief continuation rather than the whole spec again.
-                prompt: continuationPrompt(ticket, priorError),
+                // The interrupted step's own context already lives in the resumed conversation, so
+                // the prompt is a brief continuation rather than the whole instruction again.
+                prompt: continuationPrompt(ticket, priorError, stepId),
                 resumeSessionId: resumeId,
               }
             : options,
@@ -1550,15 +1556,19 @@ function resilientClaude(args: {
 }
 
 /**
- * Brief continuation prompt for a resumed session (anton-juar). The full ticket spec already lives in
- * the resumed conversation, so this only nudges the agent to pick up where it left off. The captured
- * error is injected ONLY when it may have been caused by the agent's own output (e.g. an oversized
- * tool result that tripped a limit) — never for pure infra noise the agent can't act on, which would
- * only distract it.
+ * Brief continuation prompt for a resumed session (anton-juar). Whatever the interrupted session was
+ * given — the ticket spec, or a `step:claude`'s own prompt — already lives in the resumed
+ * conversation, so this only nudges the agent to pick up where it left off. It names the STEP when
+ * there is one: the ticket phase can dispatch several agents, and telling a custom step's agent that
+ * its session "for <ticket>" was interrupted misdescribes the work it was actually doing. The
+ * captured error is injected ONLY when it may have been caused by the agent's own output (e.g. an
+ * oversized tool result that tripped a limit) — never for pure infra noise the agent can't act on,
+ * which would only distract it.
  */
-export function continuationPrompt(ticket: Bead, priorError?: string): string {
+export function continuationPrompt(ticket: Bead, priorError?: string, stepId?: string): string {
+  const subject = stepId ? `the \`${stepId}\` step of ${ticket.id}` : ticket.id;
   const lines = [
-    `Your previous session for ${ticket.id} was interrupted mid-stream by a transient failure and ` +
+    `Your previous session — ${subject} — was interrupted mid-stream by a transient failure and ` +
       `has been resumed with full conversation context. Continue from where you left off — do NOT ` +
       `restart from scratch. Inspect the working tree for partial edits before redoing anything, so ` +
       `you don't duplicate or conflict with work already in progress.`,

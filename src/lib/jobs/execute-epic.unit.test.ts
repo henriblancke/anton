@@ -247,6 +247,15 @@ describe("continuationPrompt (anton-juar)", () => {
     expect(p).not.toContain("The whole detailed spec body");
   });
 
+  // The ticket phase can dispatch several agents (a project's `step:claude` after `implement`), and
+  // they all inherit this driver — so a resumed custom step must not be told its session was the
+  // ticket's implementation.
+  it("names the step being resumed, not just the ticket", () => {
+    const t = { id: "t-1", title: "Do X", status: "open" } as Bead;
+    expect(continuationPrompt(t, undefined, "smoke-test")).toContain("`smoke-test` step of t-1");
+    expect(continuationPrompt(t)).toContain("t-1");
+  });
+
   it("injects the prior error ONLY when it may be agent-caused (oversized output/context)", () => {
     const t = { id: "t-1", title: "Do X", status: "open" } as Bead;
     const agentCaused = continuationPrompt(t, "API Error: prompt is too long: 250000 tokens > 200000");

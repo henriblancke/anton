@@ -134,19 +134,60 @@ function writeProjectPrompt(id: string, body: string): void {
 
 describe("resolveStep", () => {
   it("resolves every built-in label to its handler", () => {
-    const expected: Array<[string, unknown]> = [
-      ["implement", implementStep],
-      ["verify", verifyStep],
-      ["review", reviewStep],
-      ["commit", commitStep],
-      ["pr", prStep],
-      ["claude", claudeStep],
+    const expected: Array<[string, unknown, string[]]> = [
+      ["implement", implementStep, []],
+      ["verify", verifyStep, []],
+      ["review", reviewStep, []],
+      ["commit", commitStep, []],
+      ["pr", prStep, []],
+      // The extension point only resolves once it names what to dispatch (below).
+      ["claude", claudeStep, ["prompt:smoke"]],
     ];
-    for (const [name, handler] of expected) {
-      const definition = resolveStep(cooked(name, [`step:${name}`]), FORMULA);
+    for (const [name, handler, extra] of expected) {
+      const definition = resolveStep(cooked(name, [`step:${name}`, ...extra]), FORMULA);
       expect(definition.name).toBe(name);
       expect(definition.handler).toBe(handler);
     }
+  });
+
+  // Without this the step resolves cleanly and the run parks only when the step is REACHED — after
+  // `implement` has already committed work to the worktree, which is the halfway failure run-start
+  // validation exists to prevent.
+  it("parks at resolution on a step:claude that names neither a prompt nor a skill", () => {
+    let raised: unknown;
+    try {
+      resolveStep(cooked("custom", ["step:claude"]), FORMULA);
+    } catch (e) {
+      raised = e;
+    }
+    expect(isPoisonError(raised)).toBe(true);
+    const message = (raised as Error).message;
+    expect(message).toContain('"custom"');
+    expect(message).toContain(FORMULA);
+    expect(message).toContain("prompt:<id>");
+    expect(message).toContain("skill:<id>");
+  });
+
+  it("resolves a step:claude that names either a prompt or a skill", () => {
+    expect(resolveStep(cooked("a", ["step:claude", "prompt:smoke"]), FORMULA).name).toBe("claude");
+    expect(resolveStep(cooked("b", ["step:claude", "skill:review"]), FORMULA).name).toBe("claude");
+  });
+
+  // `["step:implement", "step:verify"]` would resolve to implement by array order alone and silently
+  // never verify — and the floor, seeing a resolved implement, would pass the formula.
+  it("parks on a step carrying more than one step: label, rather than picking by order", () => {
+    let raised: unknown;
+    try {
+      resolveStep(cooked("both", ["step:implement", "step:verify"]), FORMULA);
+    } catch (e) {
+      raised = e;
+    }
+    expect(isPoisonError(raised)).toBe(true);
+    const message = (raised as Error).message;
+    expect(message).toContain('"both"');
+    expect(message).toContain("step:implement");
+    expect(message).toContain("step:verify");
+    expect(message).toContain(FORMULA);
   });
 
   it("declares the class of each built-in — required, default-on, additive", () => {

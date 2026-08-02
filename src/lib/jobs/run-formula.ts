@@ -14,9 +14,13 @@
  * 2. **A key bd does not recognise** — `bd cook` DROPS unknown keys silently and exits 0, so a
  *    `lables = ["step:implement"]` typo would cook into a step with no handler and park mid-run (or,
  *    worse, define a pipeline that quietly never opens a PR). anton reports them instead.
- * 3. **A cook failure** — bd's own reason, which already names the file.
- * 4. **A step that maps to no handler** — {@link resolveStep}'s message, naming the step and label.
- * 5. **A step bd gated** — {@link assertNoStepGates}: anton's walker has no gate resolution, so a
+ * 3. **An `extends`** — {@link assertNoExtends}: the inherited source is never scanned, so the
+ *    dropped-key check above would cover only half the pipeline anton then walks.
+ * 4. **A cook failure** — bd's own reason, which already names the file.
+ * 5. **A step that maps to no handler, or names two** — {@link resolveStep}'s message, naming the
+ *    step and label. A `step:claude` naming neither a `prompt:` nor a `skill:` parks there too: it
+ *    would otherwise reach a human only at dispatch, after `implement` had already committed.
+ * 6. **A step bd gated** — {@link assertNoStepGates}: anton's walker has no gate resolution, so a
  *    gated step would run immediately rather than waiting on what the project gated it behind.
  *
  * What it deliberately does NOT do: check the cooked pipeline against anton's invariant floor (which
@@ -184,6 +188,10 @@ export function resolveRunFormulaPath(repoPath: string): string {
  *
  * `formula`, not `name`: a formula keyed `name` PARSES and then fails cook with "name is required"
  * (anton-upfc) — so `name` is an unknown key here, and reporting it that way is the more useful error.
+ *
+ * `extends` stays on the list because bd DOES honor it; anton rejects it separately
+ * ({@link assertNoExtends}), so the operator reads why anton won't walk it rather than a wrong claim
+ * that bd would drop it.
  */
 const KNOWN_KEYS = {
   top: ["formula", "description", "version", "schema_version", "type", "vars", "steps", "extends"],
@@ -268,6 +276,7 @@ export function parseRunFormulaSource(raw: string, source: string): Record<strin
         `key would not survive the cook.)`,
     );
   }
+  assertNoExtends(doc, source);
   if (!Array.isArray(doc.steps) || doc.steps.length === 0) {
     throw new PoisonEpic(
       `run formula ${source} declares no \`[[steps]]\` — a pipeline with no steps would implement ` +
@@ -275,6 +284,29 @@ export function parseRunFormulaSource(raw: string, source: string): Record<strin
     );
   }
   return doc;
+}
+
+/**
+ * `extends` PARKS the run. bd merges the inherited formula's steps into the cooked pipeline, but the
+ * checks above read only the file anton loaded — and bd resolves an inherited name through its own
+ * search path (the repo's `.beads/formulas/`, then `~/.beads/formulas/`, then `$GT_ROOT`), so an
+ * inherited source may not even be project data anton could reach. So every guarantee this module
+ * makes about the file evaporates for the half of the pipeline that came from somewhere else: a
+ * `gtae` typo in a base erases the gate `assertNoStepGates` would have parked on, and a `lables`
+ * typo there erases a step's handler — both dropped silently by the cook, before anton sees the
+ * result. anton refuses the pipeline rather than validating half of it and walking all of it.
+ */
+function assertNoExtends(doc: Record<string, unknown>, source: string): void {
+  if (doc.extends === undefined) return;
+  const inherited = Array.isArray(doc.extends) ? doc.extends.join(", ") : String(doc.extends);
+  throw new PoisonEpic(
+    `run formula ${source} inherits from another formula (\`extends = ${inherited}\`), which anton ` +
+      `does not walk: bd merges the inherited steps into the cooked pipeline, but anton validates only ` +
+      `THIS file — and bd DROPS unknown keys silently, so a typo in an inherited source (a \`gtae\` ` +
+      `block that erases a gate, a \`lables\` key that erases a step's handler) would be gone before ` +
+      `anton could report it, and the pipeline anton walked would not be the one the project wrote. ` +
+      `Inline the inherited steps into ${source}, then resume the run.`,
+  );
 }
 
 /**
