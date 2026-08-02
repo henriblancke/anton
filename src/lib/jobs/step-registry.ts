@@ -31,7 +31,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { beads, type Bead, type CookedStep } from "../beads/bd";
+import { beads, labelValueOf, type Bead, type CookedStep } from "../beads/bd";
 import { acceptanceBody } from "../beads/contract";
 import { humanNotesPromptBlock } from "../beads/notes";
 import { loadAgentPrompt, stripFrontmatter } from "../claude/agent-prompt";
@@ -217,7 +217,7 @@ export async function implementStep(ctx: StepContext): Promise<StepResultWith<"s
   let last: StepResult = { ok: true };
   for (const ticket of ctx.tickets) {
     ctx.assertLeaseHeld?.();
-    const agentTag = labelValue(ticket.labels, "agent");
+    const agentTag = labelValueOf(ticket.labels, "agent");
     // The base contract is mandatory (buildExecutionSystemPrompt throws without it); the agent tag
     // and the operator's seed layer on top.
     const appendSystemPrompt = await buildExecutionSystemPrompt({
@@ -252,7 +252,7 @@ export async function verifyStep(ctx: StepContext): Promise<StepResult> {
   // empty log.
   if (gates.length === 0) return { ok: true, detail: "no verify gates configured" };
 
-  const subject = ctx.tickets[0]?.id ?? ctx.target.id;
+  const subject = stepSubject(ctx).id;
   const { session, owned } = await stepSession(ctx, subject);
   try {
     await runVerifyGates(
@@ -415,7 +415,7 @@ export const REQUIRED_STEP_NAMES: readonly string[] = Object.values(BUILTIN_STEP
 
 /** The `step:<name>` suffix a cooked step names its handler with, if any. */
 export function stepName(step: CookedStep): string | undefined {
-  return labelValue(step.labels, STEP_LABEL_PREFIX);
+  return labelValueOf(step.labels, STEP_LABEL_PREFIX);
 }
 
 /**
@@ -541,7 +541,7 @@ async function dispatchClaude(
  * report whatever it invented.
  */
 async function loadStepReasoning(ctx: StepContext, stepId: string): Promise<string> {
-  const promptId = labelValue(ctx.step?.labels, "prompt");
+  const promptId = labelValueOf(ctx.step?.labels, "prompt");
   if (promptId) {
     const body = await loadAgentPrompt(promptId, { projectDir: ctx.worktreePath });
     if (body?.trim()) return body.trim();
@@ -550,7 +550,7 @@ async function loadStepReasoning(ctx: StepContext, stepId: string): Promise<stri
         `add \`.claude/agents/${promptId}.md\` to the project, or correct the label`,
     );
   }
-  const skillId = labelValue(ctx.step?.labels, "skill");
+  const skillId = labelValueOf(ctx.step?.labels, "skill");
   if (skillId) {
     const body = await loadProjectSkill(ctx.worktreePath, skillId);
     if (body) return body;
@@ -598,9 +598,22 @@ function stepTaskBlock(ctx: StepContext, stepId: string): string {
   return lines.join("\n");
 }
 
-/** The commit message for the run's work: the ticket when a step covers one, else the target. */
+/**
+ * Which bead a step SPEAKS FOR — the one its commit message names and its session is filed under:
+ * the single ticket in scope, else the run target.
+ *
+ * The distinction is the walk's two phases (anton-lnkt). A ticket-phase step is handed exactly one
+ * ticket and speaks for it; a run-phase step is handed every live ticket and speaks for the run as a
+ * whole, so filing its record under `tickets[0]` would send anyone diagnosing it to one arbitrary
+ * bead's log for work that covered all of them.
+ */
+export function stepSubject(ctx: Pick<StepContext, "tickets" | "target">): Bead {
+  return (ctx.tickets.length === 1 ? ctx.tickets[0] : undefined) ?? ctx.target;
+}
+
+/** The commit message for the run's work. */
 function commitMessage(ctx: StepContext): string {
-  const subject = ctx.tickets.length === 1 ? ctx.tickets[0] : ctx.target;
+  const subject = stepSubject(ctx);
   return `${subject.id}: ${subject.title}`;
 }
 
@@ -709,9 +722,4 @@ export function prBody(target: Bead, tickets: Bead[], advisory: ReviewFinding[] 
     `🤖 Generated with [anton](https://github.com/) autonomous execution`,
   ];
   return lines.join("\n");
-}
-
-function labelValue(labels: string[] | undefined, prefix: string): string | undefined {
-  const l = labels?.find((x) => x.startsWith(`${prefix}:`));
-  return l ? l.slice(prefix.length + 1) : undefined;
 }

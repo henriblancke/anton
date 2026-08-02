@@ -14,7 +14,7 @@
  * commit never got pushed. See DESIGN.md §4/§7.
  */
 import { randomUUID } from "node:crypto";
-import { beads, LABELS, type Bead } from "../beads/bd";
+import { beads, labelValueOf, LABELS, type Bead } from "../beads/bd";
 import { ownerOf } from "../beads/claim";
 import { contractGaps, formatContractGaps } from "../beads/contract";
 import { computeEpicGraph, epicStandaloneBlockers, isUnit, standaloneBlockers } from "../epic-graph";
@@ -1276,7 +1276,7 @@ async function runTicket(args: {
     .sync(repo)
     .catch((e) => console.error(`[execute-epic] claim sync failed for ${ticket.id}`, e));
 
-  const agentTag = labelValue(ticket.labels, "agent");
+  const agentTag = labelValueOf(ticket.labels, "agent");
   const session = await startJobSession(db, clock, {
     projectId,
     runId,
@@ -1857,11 +1857,6 @@ function selfReportSuffix(selfReport: AntonResult | null): string {
     : ` The agent self-reported ${formatAntonResult(selfReport)}, corroborating the block.`;
 }
 
-function labelValue(labels: string[] | undefined, prefix: string): string | undefined {
-  const l = labels?.find((x) => x.startsWith(`${prefix}:`));
-  return l ? l.slice(prefix.length + 1) : undefined;
-}
-
 /**
  * Tickets whose `agent:` label names a specialist agent the project has disabled (anton-dm7).
  * `activeAgents` is settings.agents; `userAgentIds` are the project's own agents — discoverable
@@ -1891,7 +1886,7 @@ export function inactiveAgentTickets(
   const userAgents = userAgentIds ? new Set(userAgentIds) : null;
   const out: { id: string; agent: string }[] = [];
   for (const t of tickets) {
-    const agent = labelValue(t.labels, "agent");
+    const agent = labelValueOf(t.labels, "agent");
     if (!agent) continue;
     if (active.has(agent)) continue;
     if (userAgents?.has(agent)) continue; // the project's own agent — never gated by the allowlist

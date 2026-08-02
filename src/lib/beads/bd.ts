@@ -838,7 +838,7 @@ export interface CookedStep {
   /** The bd issue type the step materialises as (`task`, `feature`, …). */
   type?: string;
   labels?: string[];
-  /** Ids of the steps this one depends on. */
+  /** Ids of the steps this one depends on — bd's `needs` AND `depends_on` merged (see {@link needsOf}). */
   needs?: string[];
   gate?: CookedGate;
 }
@@ -910,6 +910,18 @@ function strings(v: unknown): string[] | undefined {
   return out.length > 0 ? out : undefined;
 }
 
+/**
+ * A step's prerequisites, from EITHER spelling bd accepts. bd cooks `needs` and `depends_on` through
+ * verbatim — it normalises neither into the other (measured on bd 1.1.2) — so reading only `needs`
+ * would hand the walker a formula with no edges at all: it would run in declaration order, or be
+ * rejected by the invariant floor for an ordering the file actually expressed. Merged and deduped
+ * here so every consumer downstream reads ONE field.
+ */
+function needsOf(s: Record<string, unknown> | null | undefined): string[] | undefined {
+  const merged = [...(strings(s?.needs) ?? []), ...(strings(s?.depends_on) ?? [])];
+  return merged.length > 0 ? [...new Set(merged)] : undefined;
+}
+
 function gateOf(v: unknown): CookedGate | undefined {
   const g = v as Record<string, unknown> | null | undefined;
   const type = str(g?.type);
@@ -956,7 +968,7 @@ export function parseCookedFormula(raw: string, formula: string): CookedFormula 
       ...pick("title", str(s?.title)),
       ...pick("type", str(s?.type)),
       ...pick("labels", strings(s?.labels)),
-      ...pick("needs", strings(s?.needs)),
+      ...pick("needs", needsOf(s)),
       ...pick("gate", gateOf(s?.gate)),
     };
   });

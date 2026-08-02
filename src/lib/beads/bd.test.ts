@@ -1307,6 +1307,33 @@ describe("parseCookedFormula (anton-brdg)", () => {
     });
     expect(parseCookedFormula(doc, "anton-run").steps[0]).toEqual({ id: "implement" });
   });
+
+  // bd accepts both spellings and cooks each through verbatim (pinned against a real bd in
+  // cook.integration.test.ts). Reading only `needs` would hand the walker a formula with no edges,
+  // so a `depends_on` pipeline would run in declaration order — or be rejected by the invariant
+  // floor for an ordering the file actually expressed.
+  it("normalises `depends_on` into `needs` — bd's other spelling of the same edge", () => {
+    const doc = JSON.stringify({
+      formula: "anton-run",
+      steps: [{ id: "commit", depends_on: ["implement"] }],
+    });
+    expect(parseCookedFormula(doc, "anton-run").steps[0]).toEqual({
+      id: "commit",
+      needs: ["implement"],
+    });
+  });
+
+  it("merges both spellings on one step, deduped — an edge declared twice is still one edge", () => {
+    const doc = JSON.stringify({
+      formula: "anton-run",
+      steps: [{ id: "pr", needs: ["commit", "review"], depends_on: ["commit", "verify"] }],
+    });
+    expect(parseCookedFormula(doc, "anton-run").steps[0].needs).toEqual([
+      "commit",
+      "review",
+      "verify",
+    ]);
+  });
 });
 
 describe("the bd seam takes cwd explicitly (anton-brdg)", () => {

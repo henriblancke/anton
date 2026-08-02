@@ -16,6 +16,8 @@
  *    worse, define a pipeline that quietly never opens a PR). anton reports them instead.
  * 3. **A cook failure** — bd's own reason, which already names the file.
  * 4. **A step that maps to no handler** — {@link resolveStep}'s message, naming the step and label.
+ * 5. **A step bd gated** — {@link assertNoStepGates}: anton's walker has no gate resolution, so a
+ *    gated step would run immediately rather than waiting on what the project gated it behind.
  *
  * What it deliberately does NOT do: check the cooked pipeline against anton's invariant floor (which
  * steps may be omitted or reordered) — that is anton-6b99's, and it consumes what this returns.
@@ -276,6 +278,27 @@ export function parseRunFormulaSource(raw: string, source: string): Record<strin
 }
 
 /**
+ * A `[steps.gate]` PARKS the run. bd cooks the gate through faithfully, but anton's walker
+ * dispatches each step the moment the one before it returns — gate RESOLUTION is not built (it is
+ * anton-uk95's), so a gated step would run immediately rather than waiting on the human, the CI run,
+ * or the timer the project gated it behind. A gated `step:pr` opening its PR anyway is precisely the
+ * failure the gate was written to prevent, so anton refuses the pipeline rather than walking past a
+ * wait the project asked for.
+ */
+export function assertNoStepGates(cooked: CookedFormula, source: string): void {
+  const gated = cooked.steps.filter((s) => s.gate);
+  if (gated.length === 0) return;
+  throw new PoisonEpic(
+    `run formula ${source} gates step(s) anton cannot wait on: ` +
+      gated.map((s) => `"${s.id}" (\`gate.type = "${s.gate?.type}"\`)`).join(", ") +
+      ` — anton walks each step as soon as the previous one returns and does not resolve gates yet, ` +
+      `so a gated step would run IMMEDIATELY instead of waiting. anton parks rather than silently ` +
+      `bypassing a wait the pipeline asked for. Remove the \`[steps.gate]\` block(s) — the merge gate ` +
+      `on the run's PR is where a human still signs off — then resume the run.`,
+  );
+}
+
+/**
  * The steps in EXECUTION order: topologically sorted by `needs`, ties broken by declaration order
  * (anton-lnkt). This is the order the walker runs and the order the invariant floor (anton-6b99) is
  * checked against, so the pipeline anton executes is the one the file describes — whether the
@@ -368,6 +391,7 @@ export async function validateRunFormula(
     );
   }
 
+  assertNoStepGates(cooked, source);
   // Ordering before resolution so everything downstream — the floor check and the walk — reads ONE
   // order, the one the run actually executes.
   const ordered = orderFormulaSteps(cooked.steps, source);

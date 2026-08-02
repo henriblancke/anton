@@ -96,6 +96,23 @@ describeBd("bd cook seam (real bd)", () => {
     expect(cooked.steps[2].gate).toEqual({ type: "human" });
   });
 
+  // bd accepts `depends_on` as a second spelling of the same edge and cooks each through VERBATIM —
+  // it normalises neither into the other — so the seam is where they become one field. Left unmerged,
+  // a `depends_on` pipeline reaches the walker with no edges at all.
+  it("normalises bd's `depends_on` spelling into `needs`", async () => {
+    const path = join(repo, "depends-on.formula.toml");
+    writeFileSync(
+      path,
+      `formula = "depends-on"\ntype = "workflow"\nversion = 1\n\n[[steps]]\nid = "implement"\n` +
+        `type = "task"\ntitle = "Implement"\nlabels = ["step:implement"]\n\n[[steps]]\nid = "commit"\n` +
+        `type = "task"\ndepends_on = ["implement"]\ntitle = "Commit"\nlabels = ["step:commit"]\n`,
+      "utf8",
+    );
+
+    const cooked = await beads.cook(repo, path);
+    expect(cooked.steps.map((s) => s.needs)).toEqual([undefined, ["implement"]]);
+  });
+
   it("cooks runtime: every {{var}} is substituted from the values passed", async () => {
     const cooked = await beads.cook(repo, formula, { vars: { target: "anton-ev6d" } });
 

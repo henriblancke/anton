@@ -28,6 +28,7 @@ import {
   resolveStep,
   reviewStep,
   stepName,
+  stepSubject,
   verifyStep,
   type CookedStep,
   type StepContext,
@@ -186,6 +187,27 @@ describe("resolveStep", () => {
   it("reads the handler name off the step's labels", () => {
     expect(stepName(cooked("x", ["domain:eng", "step:implement"]))).toBe("implement");
     expect(stepName(cooked("x", ["domain:eng"]))).toBeUndefined();
+  });
+});
+
+describe("stepSubject — which bead a step speaks for", () => {
+  const ticket = (id: string): Bead => ({ ...target, id, title: `ticket ${id}` });
+
+  it("names the ticket when a step covers exactly one — the walk's ticket phase", () => {
+    expect(stepSubject({ target, tickets: [ticket("anton-a")] }).id).toBe("anton-a");
+  });
+
+  // A run-phase step (verify moved after the commit, the review gate, the PR) is handed every live
+  // ticket and covers all of them, so its session and failure message must not be filed under
+  // whichever ticket happened to be first.
+  it("names the run target when a step covers several — the walk's run phase", () => {
+    expect(stepSubject({ target, tickets: [ticket("anton-a"), ticket("anton-b")] }).id).toBe(
+      target.id,
+    );
+  });
+
+  it("falls back to the target when a step covers no tickets at all", () => {
+    expect(stepSubject({ target, tickets: [] }).id).toBe(target.id);
   });
 });
 

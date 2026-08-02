@@ -435,4 +435,38 @@ describe("validateRunFormula — the whole gate", () => {
       }),
     ).rejects.toThrow(/could not be read \(EACCES: permission denied\)/);
   });
+
+  // bd cooks a gate through, and anton's walker dispatches every step the moment the previous one
+  // returns — so a gated step would run IMMEDIATELY. Parking is the only honest answer until gate
+  // resolution exists: a gated `step:pr` that opens its PR anyway defeats the gate entirely.
+  it("parks on a gated step — anton has no gate resolution, so it must not walk past the wait", async () => {
+    await expect(
+      validateRunFormula("/repo", {
+        read: async () => VALID,
+        cook: cookYielding([
+          { id: "implement", labels: ["step:implement"] },
+          { id: "commit", labels: ["step:commit"], needs: ["implement"] },
+          {
+            id: "ship",
+            labels: ["step:pr"],
+            needs: ["commit"],
+            gate: { type: "human" },
+          },
+        ]),
+      }),
+    ).rejects.toThrow(/gates step\(s\) anton cannot wait on: "ship" \(`gate\.type = "human"`\)/);
+  });
+
+  it("names every gated step, so an operator clears the file in one pass", async () => {
+    await expect(
+      validateRunFormula("/repo", {
+        read: async () => VALID,
+        cook: cookYielding([
+          { id: "implement", labels: ["step:implement"], gate: { type: "timer", timeout: "1h" } },
+          { id: "commit", labels: ["step:commit"], needs: ["implement"] },
+          { id: "ship", labels: ["step:pr"], needs: ["commit"], gate: { type: "gh:run" } },
+        ]),
+      }),
+    ).rejects.toThrow(/"implement" \(`gate\.type = "timer"`\), "ship" \(`gate\.type = "gh:run"`\)/);
+  });
 });
