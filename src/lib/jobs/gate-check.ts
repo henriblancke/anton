@@ -346,6 +346,13 @@ export function plainGateResumes(
  * every instance's pass sees the same released step. Unfiltered, each would enqueue a machine-local
  * execute job for another operator's target; the local dedupe cannot see across machines, so the
  * loser keeps retrying on the foreign run lease.
+ *
+ * Targets carrying an OTHER open blocker are held back, exactly as plainGateResumes holds them: the
+ * gated entry says the STEP is ready, never that the ancestor anton would actually run is — that
+ * ancestor can sit behind a prerequisite of its own. execute-epic re-checks the same rule and parks
+ * the job, and because the entry stays listed for as long as its step is ready, every later pass
+ * would resume and re-park it. Holding costs nothing: the entry is still there when the blocker
+ * lands, and the pass logs it as unmatched meanwhile.
  */
 export function resumeTargets(
   board: Bead[],
@@ -362,7 +369,9 @@ export function resumeTargets(
     if (!ownedByOperator(target, operator)) continue;
     targets.set(target.id, target);
   }
-  return [...targets.values()];
+  // Blockers last, and once per distinct target: the rollup is a whole-board walk, and two steps of
+  // one epic must not pay for it twice.
+  return [...targets.values()].filter((target) => openBlockersOf(board, target).length === 0);
 }
 
 /** Build the runner handler bound to a db/clock. Register it as the "gate-check" handler. */

@@ -252,6 +252,25 @@ describe("resumeTargets", () => {
     expect(resumeTargets(board, [{ molecule_id: "" }, entry("ghost", "ghost")], NOW)).toEqual([]);
   });
 
+  it("waits while the TARGET has another open blocker, though its gated step is ready", () => {
+    // `bd ready --gated` speaks for the step, not for the epic above it. Dispatching anyway parks
+    // the job on execute-epic's own blocker check, and the entry stays listed — so every later pass
+    // would resume and re-park the same job until the unrelated prerequisite lands.
+    const blocked: Bead[] = [
+      bead("t-1", { parent: "e-1" }),
+      bead("e-1", {
+        issue_type: "epic",
+        labels: [LABELS.approved],
+        dependencies: [{ issue_id: "e-1", depends_on_id: "e-0", type: "blocks" }],
+      }),
+      bead("e-0", { issue_type: "epic" }),
+    ];
+    expect(resumeTargets(blocked, [entry("t-1", "e-1")], NOW)).toEqual([]);
+    // …and the moment that prerequisite lands, the still-listed entry releases the target.
+    const done = [blocked[0], blocked[1], bead("e-0", { issue_type: "epic", status: "closed" })];
+    expect(resumeTargets(done, [entry("t-1", "e-1")], NOW).map((t) => t.id)).toEqual(["e-1"]);
+  });
+
   it("resumes only the operator's own targets — a shared board must not double-dispatch", () => {
     // `bd ready --gated` reads the SHARED board, so every instance sees the same released step.
     // Unfiltered, each enqueues an execute-epic in its own machine-local table; the loser then
