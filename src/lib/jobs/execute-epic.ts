@@ -53,6 +53,7 @@ import {
   PoisonEpic,
   RunAlreadyLiveError,
 } from "./errors";
+import { validateRunFormula } from "./run-formula";
 import {
   commitStep,
   implementStep,
@@ -551,6 +552,16 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
             formatContractGaps(contractAdvisory),
         );
       }
+
+      // 0d. Validate the project's run pipeline (anton-hrql). The formula is what a run walks, so a
+      //     broken one must fail at the START of a run rather than halfway through: cook it and
+      //     resolve every step's handler here — before the lease is published and before any worktree
+      //     exists — so an unparseable file, a key bd would silently drop, or a `step:` label that
+      //     maps to no handler parks with the file path and the offending step instead of stranding a
+      //     half-executed run. PARK, like the gates above: the operator fixes the file (or deletes it
+      //     to fall back to anton's default) and resumes. Cheap and read-only — the project copy when
+      //     it has one, else anton's bundled default.
+      await validateRunFormula(repo);
 
       // 1. Publish the cross-machine run-liveness lease BEFORE any slow setup — worktree creation,
       //    operator resolution, the epic claim — and keep it fresh while this run executes

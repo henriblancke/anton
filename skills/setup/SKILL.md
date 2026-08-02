@@ -58,17 +58,27 @@ as `BD_INIT_FLAGS` — keep the two in sync). Cases:
 Then confirm `bd ready --json` works. If `bd init`/`bd bootstrap` errors, **stop and say so** — do
 not leave a half-initialized project.
 
-### 2b. Install the bead formula
+### 2b. Install anton's formulas
 
-Copy `${CLAUDE_SKILL_DIR}/templates/.beads/formulas/anton-bead.formula.json` to
-`<repo-root>/.beads/formulas/anton-bead.formula.json`. **No-clobber — if the file already exists,
-leave it alone and report it as skipped**: a project that has tuned its own bead skeleton keeps it.
+Copy both files from `${CLAUDE_SKILL_DIR}/templates/.beads/formulas/` to
+`<repo-root>/.beads/formulas/`:
 
-This is the skeleton `/shape` and anton's Add-work UI pour every bead from (one step per tier, the
-contract sections pre-stubbed), so the conformant shape is structural instead of a prompt
-remembering five headings. It belongs under `.beads/` because git tracks that directory — only the
-JSONL exports and the Dolt runtime are ignored — so the project's bead shape reaches every clone and
-teammate. Confirm with `bd formula list` (it should list `anton-bead`).
+- `anton-bead.formula.json` — the bead SKELETON.
+- `anton-run.formula.toml` — the run PIPELINE.
+
+**No-clobber — if a file already exists, leave it alone and report it as skipped**: a project that
+has tuned its own bead skeleton or pipeline keeps it.
+
+The bead formula is the skeleton `/shape` and anton's Add-work UI pour every bead from (one step per
+tier, the contract sections pre-stubbed), so the conformant shape is structural instead of a prompt
+remembering five headings. The run formula is the pipeline anton walks for a run — implement, verify,
+commit, self-review, open the PR — with each step naming its handler via a `step:<name>` label; edit
+it and the project owns its own pipeline. anton validates it at run start, so a broken one parks the
+run before any worktree is created rather than halfway through.
+
+Both belong under `.beads/` because git tracks that directory — only the JSONL exports and the Dolt
+runtime are ignored — so the project's bead shape and pipeline reach every clone and teammate.
+Confirm with `bd formula list` (it should list `anton-bead` and `anton-run`).
 
 ## 3. Detect the stack
 

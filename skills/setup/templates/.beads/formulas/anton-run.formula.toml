@@ -1,0 +1,57 @@
+# anton's default run pipeline (anton-hrql). Copy this file, edit it, and the project owns its own
+# pipeline — anton ships this only as the fallback for a repo that never ran the installer.
+#
+# The key is `formula`, NOT `name`: a formula keyed `name` parses and then fails `bd cook` with
+# "name is required" (verified on bd 1.1.2, anton-upfc).
+#
+# Every step names its handler with a `step:<name>` label rather than a custom TOML key, because
+# `bd cook` silently DROPS step keys it doesn't recognise. anton knows: step:implement, step:verify,
+# step:review, step:commit, step:pr, and step:claude — the extension point, which dispatches a
+# `prompt:<id>` or `skill:<id>` of the project's own with no anton code change. An unmapped step
+# parks the run rather than being skipped.
+formula = "anton-run"
+description = "anton's default run pipeline: implement, verify, commit, self-review, open the PR. implement/commit/pr are anton's invariant floor — a run that never implements, never commits, or never reaches a human has no evidence of record. verify and review may be removed; that costs quality, never the run's integrity."
+type = "workflow"
+version = 1
+
+[vars]
+[vars.target]
+description = "The run target — the epic, feature, or standalone bead this run delivers"
+default = "the run target"
+
+[[steps]]
+id = "implement"
+type = "task"
+title = "Implement {{target}}"
+labels = ["step:implement"]
+
+[[steps]]
+id = "verify"
+type = "task"
+needs = ["implement"]
+title = "Run the project's verify gates for {{target}}"
+labels = ["step:verify"]
+
+# Commit precedes review deliberately: the self-review gate reads the run's diff as
+# `merge-base..HEAD`, so a review placed before the commit would read an empty diff and pass on
+# nothing. A project reordering these two loses the review, not just its position.
+[[steps]]
+id = "commit"
+type = "task"
+needs = ["verify"]
+title = "Commit the work for {{target}}"
+labels = ["step:commit"]
+
+[[steps]]
+id = "review"
+type = "task"
+needs = ["commit"]
+title = "Self-review {{target}} before the PR opens"
+labels = ["step:review"]
+
+[[steps]]
+id = "pr"
+type = "task"
+needs = ["review"]
+title = "Open the pull request for {{target}}"
+labels = ["step:pr"]

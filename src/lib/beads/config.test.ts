@@ -13,9 +13,12 @@ import {
   bdVersionAtLeast,
   BEAD_FORMULA_FILENAME,
   bundledBeadFormulaPath,
+  bundledRunFormulaPath,
   configYamlHas,
   ensureBeadFormula,
+  ensureRunFormula,
   MIN_BD_VERSION,
+  RUN_FORMULA_FILENAME,
 } from "./config.mjs";
 
 // bd 1.0.4: settings appended as flat dotted lines after a comment header.
@@ -197,5 +200,55 @@ describe("ensureBeadFormula (anton-8mnr)", () => {
 
   it("resolves the bundled asset from the package, not the cwd", () => {
     expect(existsSync(bundledBeadFormulaPath())).toBe(true);
+  });
+});
+
+/**
+ * The setup half of anton-hrql: the RUN pipeline installs on the same terms as the bead skeleton
+ * above — a fresh project gets anton's default, and a project that wrote its own keeps it across
+ * every `anton setup` / `anton init` / addProject re-run. Both assets share one installer, so only
+ * the run-formula-specific behavior is asserted here.
+ */
+describe("ensureRunFormula (anton-hrql)", () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  const beadsDir = () => {
+    const dir = join(mkdtempSync(join(tmpdir(), "anton-run-formula-")), ".beads");
+    dirs.push(join(dir, ".."));
+    mkdirSync(dir, { recursive: true });
+    return dir;
+  };
+
+  const dest = (dir: string) => join(dir, "formulas", RUN_FORMULA_FILENAME);
+
+  it("installs the bundled pipeline into .beads/formulas/, creating the dir", () => {
+    const dir = beadsDir();
+    expect(ensureRunFormula(dir).status).toBe("installed");
+    // `formula`, not `name` — the key bd validates on (anton-upfc).
+    expect(readFileSync(dest(dir), "utf8")).toContain('formula = "anton-run"');
+  });
+
+  it("never clobbers a project's own pipeline", () => {
+    const dir = beadsDir();
+    ensureRunFormula(dir);
+    writeFileSync(dest(dir), 'formula = "anton-run"\n# ours\n');
+
+    expect(ensureRunFormula(dir).status).toBe("already");
+    expect(readFileSync(dest(dir), "utf8")).toContain("# ours");
+  });
+
+  it("lands beside the bead formula rather than replacing it", () => {
+    const dir = beadsDir();
+    ensureBeadFormula(dir);
+    ensureRunFormula(dir);
+    expect(existsSync(join(dir, "formulas", BEAD_FORMULA_FILENAME))).toBe(true);
+    expect(existsSync(dest(dir))).toBe(true);
+  });
+
+  it("resolves the bundled asset from the package, not the cwd", () => {
+    expect(existsSync(bundledRunFormulaPath())).toBe(true);
   });
 });
