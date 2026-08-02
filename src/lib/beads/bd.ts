@@ -222,11 +222,13 @@ export function batchEnabled(): boolean {
 }
 
 /**
- * Cobra's subcommand-not-found line, verbatim: `unknown command "batch" for "bd"`. bd emits nothing
- * machine-readable for this case, so the whole gate is a heuristic on that one string — kept strict
- * (both quoted operands, not just the words) so no batch line's own text can forge it.
+ * Cobra's subcommand-not-found line, verbatim: `Error: unknown command "batch" for "bd"`. bd emits
+ * nothing machine-readable for this case, so the whole gate is a heuristic on that one string —
+ * kept strict (both quoted operands, and the diagnostic must BE the line, not sit inside one) so no
+ * batch line's own text can forge it. bd reports a rolled-back op as `line 1 (close bd-9 "…"): …`,
+ * echoing the operation mid-line, so an abandon reason quoting this phrase never anchors here.
  */
-const MISSING_BATCH_COMMAND = /unknown command "batch" for "[^"\n]+"/i;
+const MISSING_BATCH_COMMAND = /^(?:Error:\s*)?unknown command "batch" for "[^"\n]+"\r?$/im;
 
 /**
  * Does this failure mean "this bd has no `batch` subcommand" rather than "the transaction failed"?

@@ -166,6 +166,8 @@ describe("beads.batch", () => {
 
   it("tells a missing `batch` subcommand apart from a failed transaction", () => {
     expect(isMissingBatchCommand({ stderr: 'unknown command "batch" for "bd"' })).toBe(true);
+    // Cobra's own wording, and the same line reached via bd's `Command failed: …\n<stderr>` message.
+    expect(isMissingBatchCommand({ stderr: 'Error: unknown command "batch" for "bd"\n' })).toBe(true);
     expect(isMissingBatchCommand(new Error('Command failed\nunknown command "batch" for "bd"'))).toBe(
       true,
     );
@@ -180,6 +182,19 @@ describe("beads.batch", () => {
     expect(
       isMissingBatchCommand({
         stderr: 'line 1 (close bd-9): not found: issue titled unknown command "batch" fallback',
+      }),
+    ).toBe(false);
+    // …even when it reproduces the diagnostic word for word: bd echoes the op mid-line, and only a
+    // line that IS the diagnostic counts.
+    expect(
+      isMissingBatchCommand({
+        stderr:
+          'line 1 (close bd-9 "unknown command \\"batch\\" for \\"bd\\""): not found: issue bd-9',
+      }),
+    ).toBe(false);
+    expect(
+      isMissingBatchCommand({
+        stderr: 'line 1 (close bd-9 unknown command "batch" for "bd"): not found: issue bd-9',
       }),
     ).toBe(false);
     // Neither field carries the phrase on its own, so joining them must not manufacture it.
