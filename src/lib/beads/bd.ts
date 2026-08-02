@@ -944,7 +944,9 @@ export function buildGateDiscoverArgs(opts: GateDiscoverOpts = {}): string[] {
  * back to the first and returns the first that parses, so a future nested summary still lands.
  */
 function parseJsonTail(raw: string): unknown {
-  for (let i = raw.lastIndexOf("{"); i >= 0; i = raw.lastIndexOf("{", i - 1)) {
+  // The `i > 0` guard is load-bearing: `lastIndexOf("{", -1)` clamps its start to 0 rather than
+  // giving up, so a leading `{` that fails to parse would hand back 0 forever.
+  for (let i = raw.lastIndexOf("{"); i >= 0; i = i > 0 ? raw.lastIndexOf("{", i - 1) : -1) {
     try {
       return JSON.parse(raw.slice(i));
     } catch {
@@ -1071,7 +1073,7 @@ export const beads = {
    * `bd list --type gate` (loadAllIssues), which carries the field — so the cast is the seam's, not
    * a caller's.
    */
-  isMergeWaitGate: (b: Bead): boolean =>
+  isMergeWaitGate: (b: Bead): b is Gate =>
     b.issue_type === "gate" && (b as Gate).await_type === "gh:pr",
 
   /**

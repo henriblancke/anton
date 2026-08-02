@@ -319,6 +319,23 @@ describe("mergedGateTargets", () => {
     expect(mergedGateTargets([gated("e-1", "g-1", { labels: [] }), closedGate])).toEqual([]);
   });
 
+  it("dispatches only the operator's own targets — a shared board must not double-finalize", () => {
+    // The gate lives on the SHARED board, so every instance's local schedule sees it close. A
+    // targeted review-fix bypasses the sweep's ownership filter, so it has to be applied here.
+    const board = [
+      gated("mine", "g-1", { assignee: "alice" }),
+      gated("theirs", "g-2", { assignee: "bob" }),
+      gated("unclaimed", "g-3", { assignee: "" }),
+      mergeGate("g-1"),
+      mergeGate("g-2"),
+      mergeGate("g-3"),
+    ];
+    expect(mergedGateTargets(board, "alice").map((b) => b.id)).toEqual(["mine", "unclaimed"]);
+    expect(mergedGateTargets(board, "bob").map((b) => b.id)).toEqual(["theirs", "unclaimed"]);
+    // An anton that cannot name itself takes unclaimed work only — it never races a claimed PR.
+    expect(mergedGateTargets(board, undefined).map((b) => b.id)).toEqual(["unclaimed"]);
+  });
+
   it("ignores a non-blocks edge to a closed gate", () => {
     const board = [
       gated("e-1", "g-1", {

@@ -1381,8 +1381,9 @@ const MERGE_GATE_TIMEOUT = "168h";
  *
  * Two cases the arm has to get right, both on the recovery path:
  *
- *   • ALREADY ARMED for this same PR (a re-run that reused the open PR) — leave it alone. Re-creating
- *     would leave two gates racing to close the same wait.
+ *   • ALREADY ARMED for this same PR (a re-run that reused the open PR) — create nothing. Re-creating
+ *     would leave two gates racing to close the same wait. Every OTHER open merge gate on the target
+ *     is still resolved first, so a stale one left behind by a failed resolve doesn't survive.
  *   • ARMED FOR A DIFFERENT PR — this target's previous PR was closed without merging and this run
  *     re-opened it under a new number. bd leaves that gate open FOREVER (a closed-unmerged PR
  *     escalates, it never resolves), so it must be resolved here or it lingers as a dead wait that
@@ -1397,6 +1398,31 @@ const MERGE_GATE_TIMEOUT = "168h";
  * learning about its merge from the review-fix sweep, exactly as before. Features and standalone
  * task/bug targets — every run target the tier split produces — take the gate.
  */
+/**
+ * What arming this target's merge wait has to do, from the board alone: every open merge gate that
+ * awaits a DIFFERENT PR (`stale`), and whether this PR's own wait still has to be created.
+ *
+ * ALL the stale gates, not the first: a `gateResolve` that failed on an earlier run leaves a
+ * superseded gate open ALONGSIDE the replacement, and dependency order says nothing about which is
+ * seen first. Stopping at the current PR's gate would strand the other as a dead wait that
+ * gate-check later surfaces as a stall against a PR nobody is waiting on.
+ */
+export function mergeGatePlan(
+  board: Bead[],
+  targetId: string,
+  awaitId: string,
+): { stale: Gate[]; create: boolean } {
+  const byId = new Map(board.map((b) => [b.id, b]));
+  const armed = (board.find((b) => b.id === targetId)?.dependencies ?? [])
+    .filter((d) => d.type === "blocks")
+    .map((d) => byId.get(d.depends_on_id))
+    .filter((b): b is Gate => b !== undefined && b.status !== "closed" && beads.isMergeWaitGate(b));
+  return {
+    stale: armed.filter((g) => g.await_id !== awaitId),
+    create: !armed.some((g) => g.await_id === awaitId),
+  };
+}
+
 async function armMergeGate(
   repo: string,
   targetId: string,
@@ -1415,14 +1441,9 @@ async function armMergeGate(
   }
   const awaitId = String(number);
 
-  const byId = new Map(board.map((b) => [b.id, b]));
-  const armed = (board.find((b) => b.id === targetId)?.dependencies ?? [])
-    .filter((d) => d.type === "blocks")
-    .map((d) => byId.get(d.depends_on_id))
-    .filter((b): b is Gate => b !== undefined && b.status !== "closed" && beads.isMergeWaitGate(b));
+  const { stale, create } = mergeGatePlan(board, targetId, awaitId);
 
-  for (const gate of armed) {
-    if (gate.await_id === awaitId) return; // this PR is already the wait
+  for (const gate of stale) {
     const resolved = await safe(() =>
       beads.gateResolve(
         repo,
@@ -1440,6 +1461,7 @@ async function armMergeGate(
       );
     }
   }
+  if (!create) return; // the wait for this PR already exists — a second gate would race it
 
   await beads.gateCreate(repo, {
     blocks: targetId,

@@ -314,4 +314,11 @@ describe("parseGateCheck", () => {
     );
     expect(() => parseGateCheck("")).toThrow(/could not read its --json summary/);
   });
+
+  it("throws on output that OPENS with malformed JSON instead of scanning forever", () => {
+    // `lastIndexOf("{", -1)` clamps to 0 rather than reporting "no more" — a leading unparseable
+    // `{` would otherwise hand back offset 0 on every iteration and hang the gate-check job.
+    expect(() => parseGateCheck('{"checked":')).toThrow(/could not read its --json summary/);
+    expect(() => parseGateCheck("{truncated")).toThrow(/could not read its --json summary/);
+  });
 });

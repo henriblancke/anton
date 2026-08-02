@@ -39,9 +39,11 @@ import { beads, LABELS, type Bead, type Gate, type GateCheckScope, type GatedMol
 import { isPipelineArtifact } from "../beads/contract";
 import { loadAllIssues } from "../beads/issues";
 import { prNumberFromRef } from "../git/pr";
+import { resolveOperator } from "../operator";
 import { getProjectById } from "../projects";
 import { PoisonError } from "./errors";
 import { enqueueReviewFixIfAbsent, systemClock, type AntonDb, type Clock } from "./queue";
+import { ownedByOperator } from "./review-fix";
 import type { JobContext, JobHandler } from "./runner";
 import { resumeEpic } from "./unstick";
 
@@ -215,14 +217,21 @@ export function isResumableTarget(target: Bead, nowMs: number): boolean {
  *     closed gate from re-dispatching forever; a finalize that FAILED half-way leaves them in place
  *     and gets retried.
  *
+ *   • the target is THIS OPERATOR'S (unclaimed, or claimed by it) — the same anton-zoh ownership
+ *     test the review-fix sweep applies. The board is shared but this schedule is machine-local, so
+ *     without it every instance sharing a board would see the same closed gate and dispatch a
+ *     TARGETED review-fix, which bypasses the sweep's filter — the concurrent-finalization race that
+ *     filter exists to prevent.
+ *
  * `bd ready --gated` is not usable here: it reports molecule steps only, so an ad-hoc gate on a
  * plain bead never appears in it, not even the pass after it closes.
  */
-export function mergedGateTargets(board: Bead[]): Bead[] {
+export function mergedGateTargets(board: Bead[], operator?: string): Bead[] {
   const byId = new Map(board.map((b) => [b.id, b]));
   return board.filter((bead) => {
     if (bead.status === "closed") return false;
     if (!(bead.labels?.includes(IN_REVIEW) ?? false)) return false;
+    if (!ownedByOperator(bead, operator)) return false;
     const prNumber = prNumberFromRef(beads.getPrRef(bead));
     if (prNumber === undefined) return false; // no PR to finalize (a tracker ref, or none at all)
     return (bead.dependencies ?? []).some((d) => {
@@ -231,7 +240,7 @@ export function mergedGateTargets(board: Bead[]): Bead[] {
       if (gate === undefined || gate.status !== "closed" || !beads.isMergeWaitGate(gate)) {
         return false;
       }
-      return (gate as Gate).await_id === String(prNumber);
+      return gate.await_id === String(prNumber);
     });
   });
 }
@@ -324,7 +333,9 @@ export function makeGateCheckHandler(deps: GateCheckDeps): JobHandler {
     //    dispatched by id. review-fix's merge-finalize behaviour is untouched; only its trigger
     //    moved. Deduped against a live job for the same target, and re-dispatched every pass until
     //    the finalize actually lands, so a half-done finalize heals itself.
-    for (const target of mergedGateTargets(board)) {
+    //    Scoped to this operator's targets: the closed gate is on the SHARED board, so on a board
+    //    two antons share, an unfiltered dispatch would have both finalize the same bead at once.
+    for (const target of mergedGateTargets(board, await resolveOperator())) {
       const jobId = enqueueReviewFixIfAbsent(db, clock, projectId, target.id);
       if (jobId) console.log(`[gate-check] ${projectId}: ${target.id} merged — dispatched review-fix`);
     }
