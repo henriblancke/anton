@@ -115,41 +115,39 @@ async function stopRun(projectId: string, targetId: string, requireStopped: bool
 }
 
 /**
- * Abandon every still-open descendant of `target`, killing the run of each descendant that owns one
- * before recording anything. Shared by the ticket and epic paths: a bead that groups other work must
- * take that work with it however the abandon was reached, or the descendants sit in `bd ready` as
- * claimable tickets whose run target is already settled — no run path left to reach them. Settled
- * descendants are left exactly as they are; their history is not rewritten. Returns the ids it
- * abandoned, in cascade order.
+ * The still-open descendants an abandon of `target` must take with it, with the run of each
+ * descendant that owns one already killed. Shared by the ticket and epic paths: a bead that groups
+ * other work must take that work with it however the abandon was reached, or the descendants sit in
+ * `bd ready` as claimable tickets whose run target is already settled — no run path left to reach
+ * them. Settled descendants are left out entirely; their history is not rewritten.
  *
- * Every run is stopped before the first bd write, so a `requireStopped` refusal on ANY descendant
- * leaves the whole cascade untouched.
+ * Every run is stopped before the caller's first bd write, so a `requireStopped` refusal on ANY
+ * descendant leaves the whole cascade untouched.
  */
-async function cascadeToDescendants(
+async function stopDescendantRuns(
   project: Project,
   target: Bead,
   board: Bead[],
-  why: string,
-  requireStopped = false,
-): Promise<string[]> {
+  requireStopped: boolean,
+): Promise<Bead[]> {
   const descendants = openDescendants(board, target.id);
-
   for (const descendant of descendants) {
     if (beads.isRunTarget(descendant, board)) {
       await stopRun(project.id, descendant.id, requireStopped);
     }
   }
+  return descendants;
+}
 
-  const children: string[] = [];
-  for (const descendant of descendants) {
-    await beads.abandon(
-      project.repoPath,
-      descendant.id,
-      `${why} (parent ${target.issue_type ?? "ticket"} ${target.id} abandoned)`,
-    );
-    children.push(descendant.id);
-  }
-  return children;
+/**
+ * The abandon entries for a cascade: every open descendant (in cascade order) followed by the
+ * target itself. The target comes LAST for the same reason it always did — the batch applies in
+ * order, and the label pass that precedes it must reach the descendants before the target, so a
+ * crash can only ever leave a still-open target whose re-run finishes the job.
+ */
+function cascadeEntries(target: Bead, descendants: Bead[], why: string): Array<{ id: string; reason: string }> {
+  const inherited = `${why} (parent ${target.issue_type ?? "ticket"} ${target.id} abandoned)`;
+  return [...descendants.map((d) => ({ id: d.id, reason: inherited })), { id: target.id, reason: why }];
 }
 
 /**
@@ -185,11 +183,11 @@ export async function abandonTicket(
   const board = await beads.list(project.repoPath, ["--status", "all"]);
   const requireStopped = opts?.requireStopped === true;
   await stopRun(project.id, runTargetOf(bead, board), requireStopped);
-  await cascadeToDescendants(project, bead, board, why, requireStopped);
+  const descendants = await stopDescendantRuns(project, bead, board, requireStopped);
 
-  // The ticket closes LAST, like the epic cascade: a crash mid-cascade leaves it open with a
-  // partially-abandoned child set that re-running abandon finishes.
-  await beads.abandon(project.repoPath, id, why);
+  // The ticket and its cascade settle as one unit — every close in a single bd transaction, the
+  // ticket last (see beads.abandonAll).
+  await beads.abandonAll(project.repoPath, cascadeEntries(bead, descendants, why));
   // Read-after-write, like setTicketDeferred: the `bd show` bead is authoritative for the abandoned
   // state it just wrote, so the response never reflects the board's stale snapshot.
   const detail = await freshDetail(project, await beads.show(project.repoPath, id));
@@ -264,18 +262,18 @@ export async function abandonEpic(
   const all = await beads.list(repo, ["--status", "all", "--skip-labels"]);
 
   // Kill every live run this abandon settles, BEFORE recording it. A container epic never runs
-  // itself — the active job is keyed by the FEATURE below it, which cascadeToDescendants cancels —
+  // itself — the active job is keyed by the FEATURE below it, which stopDescendantRuns cancels —
   // so cancelling only `epicId` would mark the feature and its tickets abandoned while its agent
   // kept running from the bead snapshot it loaded at start, and still committed and opened a PR for
   // work the board now calls won't-do. The epic's own id is cancelled too: a legacy (non-container)
   // epic is its own run target.
   await cancelRunForTarget(project.id, epicId);
-  const children = await cascadeToDescendants(project, epic, all, why);
+  const descendants = await stopDescendantRuns(project, epic, all, false);
 
-  // The epic closes LAST: a crash mid-cascade leaves it open with a partially-abandoned child set,
-  // which re-running abandon finishes — the reverse order would leave orphaned open children under
-  // an epic that already reads as settled.
-  await beads.abandon(repo, epicId, why);
+  // The epic and its whole cascade settle as one unit — every close in a single bd transaction,
+  // the epic last (see beads.abandonAll), so no state exists in which the epic reads as settled
+  // above still-open orphaned children.
+  await beads.abandonAll(repo, cascadeEntries(epic, descendants, why));
   nudgeSync(project, "abandon");
-  return { epicId, children };
+  return { epicId, children: descendants.map((d) => d.id) };
 }

@@ -4,7 +4,7 @@ import type { Project } from "./types";
 
 const showMock = vi.fn();
 const listMock = vi.fn();
-const abandonMock = vi.fn();
+const abandonAllMock = vi.fn();
 const cancelRunMock = vi.fn();
 const runIsLiveMock = vi.fn<(projectId: string, epicBeadId: string) => boolean>();
 
@@ -16,7 +16,7 @@ vi.mock("./beads/bd", async () => {
       ...actual.beads,
       show: (...args: unknown[]) => showMock(...args),
       list: (...args: unknown[]) => listMock(...args),
-      abandon: (...args: unknown[]) => abandonMock(...args),
+      abandonAll: (...args: unknown[]) => abandonAllMock(...args),
       sync: vi.fn().mockResolvedValue(undefined),
     },
   };
@@ -32,6 +32,12 @@ vi.mock("./ticket-detail", () => ({
 }));
 
 const { abandonTicket, openDescendants, RunRestartedError } = await import("./abandon");
+
+/** The ids of the single unit `beads.abandonAll` was asked to settle, in cascade order. */
+const abandonedIds = (): string[] => {
+  expect(abandonAllMock).toHaveBeenCalledTimes(1);
+  return (abandonAllMock.mock.calls[0][1] as Array<{ id: string }>).map((e) => e.id);
+};
 
 function makeBead(overrides: Partial<Bead> & { id: string }): Bead {
   return {
@@ -117,7 +123,7 @@ describe("abandonTicket cascade", () => {
   beforeEach(() => {
     showMock.mockReset();
     listMock.mockReset();
-    abandonMock.mockReset().mockResolvedValue(undefined);
+    abandonAllMock.mockReset().mockResolvedValue(undefined);
     cancelRunMock.mockReset().mockResolvedValue(false);
     runIsLiveMock.mockReset().mockReturnValue(false);
   });
@@ -139,8 +145,14 @@ describe("abandonTicket cascade", () => {
 
     // The feature is its own run target, so its run — not the container epic's — is the one killed.
     expect(cancelRunMock).toHaveBeenCalledWith("p1", "feature");
-    const abandoned = abandonMock.mock.calls.map((c) => c[1]);
-    expect(abandoned).toEqual(["t1", "t3", "feature"]); // settled t2 untouched, feature closes last
+    // One transaction for the whole unit: settled t2 untouched, the feature itself closing last.
+    expect(abandonedIds()).toEqual(["t1", "t3", "feature"]);
+    // Each cascaded bead still records WHY it went — the parent's decision, named.
+    expect(abandonAllMock.mock.calls[0][1]).toEqual([
+      { id: "t1", reason: "not worth building (parent feature feature abandoned)" },
+      { id: "t3", reason: "not worth building (parent feature feature abandoned)" },
+      { id: "feature", reason: "not worth building" },
+    ]);
   });
 
   it("leaves the run of a still-live sibling alone when a leaf ticket is abandoned", async () => {
@@ -156,7 +168,7 @@ describe("abandonTicket cascade", () => {
 
     // A child ticket executes under its feature's run, and has nothing beneath it to cascade to.
     expect(cancelRunMock.mock.calls).toEqual([["p1", "feature"]]);
-    expect(abandonMock.mock.calls.map((c) => c[1])).toEqual(["t1"]);
+    expect(abandonedIds()).toEqual(["t1"]);
   });
 
   it("kills the FEATURE's run when a subtask two levels below it is abandoned", async () => {
@@ -174,7 +186,7 @@ describe("abandonTicket cascade", () => {
     await abandonTicket(project, "s1", "covered by another ticket");
 
     expect(cancelRunMock.mock.calls).toEqual([["p1", "feature"]]);
-    expect(abandonMock.mock.calls.map((c) => c[1])).toEqual(["s1"]);
+    expect(abandonedIds()).toEqual(["s1"]);
   });
 
   it("terminates on a malformed parent cycle above the abandoned ticket", async () => {
@@ -193,7 +205,7 @@ describe("abandonTicket cascade", () => {
     showMock.mockResolvedValue(makeBead({ id: "t1", status: "closed" }));
 
     await expect(abandonTicket(project, "t1", "too late")).rejects.toThrow(/already closed/);
-    expect(abandonMock).not.toHaveBeenCalled();
+    expect(abandonAllMock).not.toHaveBeenCalled();
     expect(cancelRunMock).not.toHaveBeenCalled();
   });
 });
@@ -215,7 +227,7 @@ describe("abandonTicket with requireStopped", () => {
   beforeEach(() => {
     showMock.mockReset();
     listMock.mockReset();
-    abandonMock.mockReset().mockResolvedValue(undefined);
+    abandonAllMock.mockReset().mockResolvedValue(undefined);
     cancelRunMock.mockReset().mockResolvedValue(false);
     runIsLiveMock.mockReset().mockReturnValue(false);
   });
@@ -235,7 +247,7 @@ describe("abandonTicket with requireStopped", () => {
     ).rejects.toThrow(RunRestartedError);
     // The whole point: the restarted job keeps running and the board is untouched.
     expect(cancelRunMock).not.toHaveBeenCalled();
-    expect(abandonMock).not.toHaveBeenCalled();
+    expect(abandonAllMock).not.toHaveBeenCalled();
   });
 
   it("refuses before any write when it is a CASCADED descendant that restarted", async () => {
@@ -252,7 +264,7 @@ describe("abandonTicket with requireStopped", () => {
     await expect(
       abandonTicket(project, "epic", "won't do", { requireStopped: true }),
     ).rejects.toThrow(RunRestartedError);
-    expect(abandonMock).not.toHaveBeenCalled();
+    expect(abandonAllMock).not.toHaveBeenCalled();
   });
 
   it("abandons normally when nothing is live — and never cancels, since nothing is running", async () => {
@@ -266,7 +278,7 @@ describe("abandonTicket with requireStopped", () => {
     await abandonTicket(project, "t1", "stalled for good", { requireStopped: true });
 
     expect(cancelRunMock).not.toHaveBeenCalled();
-    expect(abandonMock.mock.calls.map((c) => c[1])).toEqual(["t1"]);
+    expect(abandonedIds()).toEqual(["t1"]);
   });
 
   it("still kills the live run when the option is absent — the board's own abandon is unchanged", async () => {
@@ -281,6 +293,6 @@ describe("abandonTicket with requireStopped", () => {
     await abandonTicket(project, "t1", "obsolete");
 
     expect(cancelRunMock.mock.calls).toEqual([["p1", "feature"]]);
-    expect(abandonMock.mock.calls.map((c) => c[1])).toEqual(["t1"]);
+    expect(abandonedIds()).toEqual(["t1"]);
   });
 });

@@ -276,7 +276,9 @@ describe("bd normal calls are unchanged (anton-jfjw.1)", () => {
 
   it("passes the caller's env through to bd", async () => {
     fakeBd("bd-echo-actor", ["#!/bin/sh", 'printf "%s" "$BEADS_ACTOR"']);
-    await expect(runBd(dir, ["note", "bd-1", "hi"], { BEADS_ACTOR: "ada" })).resolves.toBe("ada");
+    await expect(runBd(dir, ["note", "bd-1", "hi"], { env: { BEADS_ACTOR: "ada" } })).resolves.toBe(
+      "ada",
+    );
   });
 
   it("rejects a non-zero exit with the captured streams attached (runDoltSync reads them)", async () => {
