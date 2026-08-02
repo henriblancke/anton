@@ -3,6 +3,7 @@ import { discoverAgents } from "@/lib/agents-discovery";
 import {
   CONCURRENCY_RANGE,
   JOB_TIMEOUT_MINUTES_RANGE,
+  TICKET_TIMEOUT_MINUTES_RANGE,
   MAX_RETRIES_RANGE,
   REVIEW_MAX_ROUNDS_RANGE,
   budgetPolicySchema,
@@ -47,13 +48,19 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
   const patch: Partial<ProjectSettings> = {};
 
   // Numeric job-policy fields: null / "" clears to the default; a concrete value must be an
-  // integer within range. Shared handling so all four behave identically.
+  // integer within range. Shared handling so all five behave identically.
   const numericFields: {
-    key: "concurrency" | "jobTimeoutMinutes" | "maxRetries" | "reviewMaxRounds";
+    key:
+      | "concurrency"
+      | "jobTimeoutMinutes"
+      | "ticketTimeoutMinutes"
+      | "maxRetries"
+      | "reviewMaxRounds";
     range: { min: number; max: number };
   }[] = [
     { key: "concurrency", range: CONCURRENCY_RANGE },
     { key: "jobTimeoutMinutes", range: JOB_TIMEOUT_MINUTES_RANGE },
+    { key: "ticketTimeoutMinutes", range: TICKET_TIMEOUT_MINUTES_RANGE },
     { key: "maxRetries", range: MAX_RETRIES_RANGE },
     { key: "reviewMaxRounds", range: REVIEW_MAX_ROUNDS_RANGE },
   ];
