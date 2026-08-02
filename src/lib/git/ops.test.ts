@@ -979,8 +979,11 @@ suite("readWorktreeState / restoreWorktreeState (real git)", () => {
     g(["commit", "-q", "-m", "t1: add a"]);
   });
 
+  // Retried, like the bd suites' teardown: `readWorktreeState` reads with `Promise.all`, so a
+  // rejection returns while the sibling `git status` is still refreshing the index — a bare rmSync
+  // then walks the dir underneath it and dies ENOTEMPTY with every assertion already green.
   afterEach(() => {
-    rmSync(sandbox, { recursive: true, force: true });
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
   });
 
   it("fingerprints the checked-out branch alongside HEAD and the dirt", async () => {

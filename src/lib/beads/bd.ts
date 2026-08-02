@@ -1646,7 +1646,11 @@ export function parseDepCycles(raw: string): DepCycle[] {
   return parsed.map((entry) => ({ ids: idsOf(entry), raw: entry }));
 }
 
-/** Read `bd duplicates --json` — an object envelope, `{duplicate_groups, groups, schema_version}`. */
+/**
+ * Read `bd duplicates --json` — an object envelope `{duplicate_groups, groups, schema_version}`
+ * where `groups` carries the groups and `duplicate_groups` is their COUNT, not a second encoding of
+ * them. Only `groups` is read; the count is redundant with it.
+ */
 export function parseDuplicateGroups(raw: string): DuplicateGroup[] {
   const doc = parseHygieneJson(raw, "duplicates") as Record<string, unknown> | null;
   const groups = Array.isArray(doc?.groups) ? doc.groups : [];

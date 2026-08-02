@@ -96,6 +96,54 @@ describe("hygiene report store", () => {
     expect(await getHygieneReportForJob(t.db, "job-0")).toBeUndefined();
   });
 
+  it("spends retention slots on visible reports only — an open row neither counts nor dies", async () => {
+    // A patrol parked between start and complete leaves an open row the board never shows. Counting
+    // it toward the cap would shrink the visible history; deleting it would lose the sweep's actions.
+    const day = 86_400_000;
+    const stale = await startHygieneReport(t.db, clock, {
+      projectId,
+      jobId: "parked-stale",
+      actions: { closedEpics: ["e-stale"], rowsRecomputed: 1 },
+    });
+    for (let i = 0; i < HYGIENE_REPORT_RETENTION; i += 1) {
+      nowMs = NOW + (i + 1) * day;
+      await saveHygieneReport(t.db, clock, {
+        projectId,
+        jobId: `job-${i}`,
+        actions: { closedEpics: [], rowsRecomputed: 0 },
+        findings: [],
+      });
+    }
+    // Newest of all, so a prune that counted open rows would evict a real report to hold it.
+    nowMs = NOW + (HYGIENE_REPORT_RETENTION + 1) * day;
+    await startHygieneReport(t.db, clock, {
+      projectId,
+      jobId: "parked-live",
+      actions: { closedEpics: ["e-live"], rowsRecomputed: 1 },
+    });
+    nowMs = NOW + (HYGIENE_REPORT_RETENTION + 2) * day;
+    await saveHygieneReport(t.db, clock, {
+      projectId,
+      jobId: "job-last",
+      actions: { closedEpics: [], rowsRecomputed: 0 },
+      findings: [],
+    });
+
+    // A full window of history the board can actually show, not 20 minus the invisible rows.
+    expect(await listHygieneReports(t.db, projectId)).toHaveLength(HYGIENE_REPORT_RETENTION);
+    // And the stale row survived: a retry still merges into what its first pass recorded.
+    const reopened = await startHygieneReport(t.db, clock, {
+      projectId,
+      jobId: "parked-stale",
+      actions: { closedEpics: ["e-second-pass"], rowsRecomputed: 1 },
+    });
+    expect(reopened.id).toBe(stale.id);
+    expect(reopened.actions).toEqual({
+      closedEpics: ["e-stale", "e-second-pass"],
+      rowsRecomputed: 2,
+    });
+  });
+
   it("prunes only its own project's history", async () => {
     const other = randomUUID();
     await t.db.insert(schema.projects).values({

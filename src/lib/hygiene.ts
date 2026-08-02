@@ -275,18 +275,26 @@ async function findOpenReportForJob(db: AntonDb, jobId: string) {
   return rows[0];
 }
 
-/** Keep only the newest {@link HYGIENE_REPORT_RETENTION} reports for a project. */
+/**
+ * Keep only the newest {@link HYGIENE_REPORT_RETENTION} COMPLETED reports for a project.
+ *
+ * Open rows are outside the window on both sides — neither counted nor deleted. Counting them would
+ * shrink the history the board can actually show (every read here filters on {@link COMPLETED}, so a
+ * parked patrol's leftover row would silently cost a real report its slot); deleting them would tear
+ * a live patrol's row out from under it, losing the sweep's already-persisted actions.
+ */
 async function pruneHygieneReports(db: AntonDb, projectId: string): Promise<void> {
   const keep = await db
     .select({ id: schema.hygieneReports.id })
     .from(schema.hygieneReports)
-    .where(eq(schema.hygieneReports.projectId, projectId))
+    .where(and(eq(schema.hygieneReports.projectId, projectId), COMPLETED))
     .orderBy(desc(schema.hygieneReports.generatedAt), NEWEST_FIRST)
     .limit(HYGIENE_REPORT_RETENTION);
   if (keep.length < HYGIENE_REPORT_RETENTION) return;
   await db.delete(schema.hygieneReports).where(
     and(
       eq(schema.hygieneReports.projectId, projectId),
+      COMPLETED,
       notInArray(
         schema.hygieneReports.id,
         keep.map((r) => r.id),
