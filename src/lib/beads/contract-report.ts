@@ -47,7 +47,7 @@ export interface ContractReport {
   rows: ContractReportRow[];
 }
 
-/** Blocking beads first, then the messiest, then by id so two runs of the report read the same. */
+/** Does this row carry a gap the hard gate would refuse the run over? Blocking rows rank first. */
 function severityRank(row: ContractReportRow): number {
   return row.violations.some((v) => v.severity === "blocking") ? 0 : 1;
 }
@@ -59,56 +59,61 @@ function severityRank(row: ContractReportRow): number {
  * tell a container epic from a run target, and drops the closed and resume-skipped beads itself.
  */
 export function buildContractReport(all: Bead[]): ContractReport {
-  const rows: ContractReportRow[] = [];
-  const counts = new Map<string, ContractSectionCount>();
-  let judged = 0;
-  let blocking = 0;
-  let advisory = 0;
+  const judged = contractGatedBoard(all).filter(isContractJudged);
+  const rows = judged
+    .map(rowOf)
+    .filter((row): row is ContractReportRow => row !== undefined)
+    .sort(byWorstFirst);
+  const violations = rows.flatMap((row) => row.violations);
 
-  for (const bead of contractGatedBoard(all)) {
-    if (!isContractJudged(bead)) continue;
-    judged++;
-    const violations = validateBeadContract(bead);
-    if (violations.length === 0) continue;
-    for (const v of violations) {
-      if (v.severity === "blocking") blocking++;
-      else advisory++;
-      const key = `${v.severity}:${v.section}`;
-      const seen = counts.get(key);
-      if (seen) seen.count++;
-      else counts.set(key, { section: v.section, severity: v.severity, count: 1 });
-    }
-    rows.push({
-      id: bead.id,
-      title: bead.title,
-      issueType: bead.issue_type ?? "",
-      status: bead.status,
-      violations,
-    });
-  }
+  return {
+    judged: judged.length,
+    conformant: judged.length - rows.length,
+    blocked: rows.filter((r) => severityRank(r) === 0).length,
+    blocking: violations.filter((v) => v.severity === "blocking").length,
+    advisory: violations.filter((v) => v.severity !== "blocking").length,
+    bySection: tallySections(violations),
+    rows,
+  };
+}
 
-  rows.sort(
-    (a, b) =>
-      severityRank(a) - severityRank(b) ||
-      b.violations.length - a.violations.length ||
-      a.id.localeCompare(b.id),
+/** A bead's row, or undefined when it is conformant — the report lists only what falls short. */
+function rowOf(bead: Bead): ContractReportRow | undefined {
+  const violations = validateBeadContract(bead);
+  if (violations.length === 0) return undefined;
+  return {
+    id: bead.id,
+    title: bead.title,
+    issueType: bead.issue_type ?? "",
+    status: bead.status,
+    violations,
+  };
+}
+
+/** Blocking beads first, then the messiest, then by id so two runs of the report read the same. */
+function byWorstFirst(a: ContractReportRow, b: ContractReportRow): number {
+  return (
+    severityRank(a) - severityRank(b) ||
+    b.violations.length - a.violations.length ||
+    a.id.localeCompare(b.id)
   );
-  const bySection = [...counts.values()].sort(
+}
+
+/** How often each section is missing, blocking sections first then by frequency. */
+function tallySections(violations: ContractViolation[]): ContractSectionCount[] {
+  const counts = new Map<string, ContractSectionCount>();
+  for (const v of violations) {
+    const key = `${v.severity}:${v.section}`;
+    const seen = counts.get(key);
+    if (seen) seen.count++;
+    else counts.set(key, { section: v.section, severity: v.severity, count: 1 });
+  }
+  return [...counts.values()].sort(
     (a, b) =>
       Number(a.severity !== "blocking") - Number(b.severity !== "blocking") ||
       b.count - a.count ||
       a.section.localeCompare(b.section),
   );
-
-  return {
-    judged,
-    conformant: judged - rows.length,
-    blocked: rows.filter((r) => severityRank(r) === 0).length,
-    blocking,
-    advisory,
-    bySection,
-    rows,
-  };
 }
 
 const pct = (part: number, whole: number) => (whole === 0 ? 100 : Math.round((part / whole) * 100));
