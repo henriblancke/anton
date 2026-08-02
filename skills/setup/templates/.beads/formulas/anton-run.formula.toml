@@ -9,11 +9,19 @@
 # step:review, step:commit, step:pr, and step:claude — the extension point, which dispatches a
 # `prompt:<id>` or `skill:<id>` of the project's own with no anton code change. An unmapped step
 # parks the run rather than being skipped.
+#
+# Labels must be LITERAL: bd resolves `{{var}}` in a step's title/description/notes but copies
+# `labels` through verbatim, so a `prompt:{{prompt}}` would never resolve. anton parks on one at run
+# start. To vary the pipeline by the work's own labels, map a label to a formula of its own in
+# Settings → Pipeline variants.
 formula = "anton-run"
 description = "anton's default run pipeline: implement, verify, commit, self-review, open the PR. implement/commit/pr are anton's invariant floor — a run that never implements, never commits, or never reaches a human has no evidence of record. verify and review may be removed; that costs quality, never the run's integrity."
 type = "workflow"
 version = 1
 
+# `target` is supplied by anton on every run (the run target's bead id); the default below only
+# applies to a validation-only cook. A variable anton does not supply and that declares no default
+# parks the run at its start — anton has no value to give it.
 [vars]
 [vars.target]
 description = "The run target — the epic, feature, or standalone bead this run delivers"

@@ -36,6 +36,7 @@ import {
   createExecuteEpicSandbox,
   createTicket,
   makeEpicRunner,
+  enqueueEpicJob,
   driveEpicRun,
   tickToIdle,
   type ExecuteEpicSandbox,
@@ -424,6 +425,93 @@ process.exit(0);`),
       const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === epicId)!;
       expect(run.formula?.endsWith("anton-run.formula.toml")).toBe(true);
       expect(run.formulaVariant).toBeNull();
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+    }
+  });
+
+  it("keeps a parked run on the pipeline it recorded, even after the mapping changes under it", async () => {
+    // A run outlives its attempts: it parks on a quota limit and resumes later, re-reading the board
+    // and the project's settings every time. If the pipeline were re-selected per attempt, a mapping
+    // added in between would switch the run's pipeline halfway through — the tickets that already
+    // committed on one formula, the rest on another, with the run record naming only the new one.
+    const orderLog = join(sandbox, "order-pinned.log");
+    await recordVerifyInto(orderLog);
+    writeProjectFormula(
+      step("implement", "implement") +
+        "\n" +
+        step("verify", "verify", "implement") +
+        "\n" +
+        step("commit", "commit", "verify") +
+        "\n" +
+        step("pr", "pr", "commit"),
+    );
+    // The pipeline the operator maps MID-RUN: it verifies once more over the finished run, so a
+    // switch would be visible in the gate log as well as in the run record.
+    writeNamedFormula(
+      "anton-run-risk-high",
+      step("implement", "implement") +
+        "\n" +
+        step("verify", "verify", "implement") +
+        "\n" +
+        step("commit", "commit", "verify") +
+        "\n" +
+        step("final-check", "verify", "commit") +
+        "\n" +
+        step("pr", "pr", "final-check"),
+    );
+    // Labelled for the variant from the start — only the MAPPING is missing when the run begins.
+    const { id: epicId, tickets } = await approvedEpic("Parks then resumes", ["risk:high"]);
+
+    const resetSec = Math.floor(clock.now() / 1000) + 3600;
+    const quotaClaude = writeBin(
+      binDir,
+      "claude-quota-pinned",
+      fakeClaudeReadingStdin(`const sentinel=path.join(process.cwd(),'.quota-hit');
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+if(!fs.existsSync(sentinel)){
+  fs.writeFileSync(sentinel,'1');
+  e({type:'result',subtype:'error',result:'Claude AI usage limit reached|${resetSec}',is_error:true});
+  process.exit(0);
+}
+fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work '+Date.now()+'\\n');
+e({type:'system',subtype:'init',session_id:'sp'});
+e({type:'result',subtype:'success',result:'done',session_id:'sp',num_turns:1,is_error:false});
+process.exit(0);`),
+    );
+
+    const runner = makeEpicRunner({ tdb, clock }, { quotaCooloffMs: 60_000 });
+    process.env.ANTON_CLAUDE_BIN = quotaClaude;
+    try {
+      const jobId = await enqueueEpicJob(runner, { projectId, epicBeadId: epicId });
+      await tickToIdle(runner);
+
+      // Attempt 1 parked on the quota limit with the default pipeline already recorded.
+      const parked = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === epicId)!;
+      expect(parked.status).toBe("parked");
+      expect(parked.formula).toBe(formulaPath);
+      expect(parked.formulaVariant).toBeNull();
+
+      // The operator maps risk:high to the heavier pipeline while the run sits parked.
+      await patchSettings({
+        formulaVariants: [{ label: "risk:high", formula: "anton-run-risk-high" }],
+      });
+
+      clock.set(resetSec * 1000 + 1);
+      await tickToIdle(runner);
+      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+
+      // Same run row, same pipeline: the mapping applies to the NEXT run, not this one.
+      const resumed = (await tdb.db.select().from(schema.runs)).find(
+        (r) => r.epicBeadId === epicId,
+      )!;
+      expect(resumed.id).toBe(parked.id);
+      expect(resumed.formula).toBe(formulaPath);
+      expect(resumed.formulaVariant).toBeNull();
+      // The variant's extra run-wide gate never ran — one gate per ticket, and nothing after the commit.
+      expect(lines(orderLog).filter((l) => l === "verify")).toHaveLength(tickets.length);
+      for (const t of tickets) expect((await beads.show(repo, t)).status).toBe("closed");
+      expect(beads.getPrRef(await beads.show(repo, epicId))).toBe("gh-42");
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
     }

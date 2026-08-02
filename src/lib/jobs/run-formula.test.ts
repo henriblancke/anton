@@ -487,4 +487,101 @@ describe("validateRunFormula — the whole gate", () => {
       }),
     ).rejects.toThrow(/"implement" \(`gate\.type = "timer"`\), "ship" \(`gate\.type = "gh:run"`\)/);
   });
+
+  // bd substitutes variables into a step's title/description/notes and copies `labels` through
+  // verbatim — in runtime mode as much as in compile (pinned against a real bd in the integration
+  // suite). Every piece of anton's per-step configuration rides on labels, so a placeholder there can
+  // NEVER resolve: `prompt:{{prompt}}` would be looked up as a prompt named `{{prompt}}` and park at
+  // dispatch, after the run had implemented and committed.
+  it("parks on a `{{var}}` in a step's labels — bd never substitutes there, so it can't resolve", async () => {
+    await expect(
+      validateRunFormula("/repo", {
+        vars: { target: "anton-1" },
+        read: async () => VALID,
+        cook: cookYielding([
+          { id: "implement", labels: ["step:implement"] },
+          { id: "commit", labels: ["step:commit"], needs: ["implement"] },
+          { id: "extra", labels: ["step:claude", "prompt:{{prompt}}"], needs: ["commit"] },
+        ]),
+      }),
+    ).rejects.toThrow(/parameterises the labels of step\(s\) "extra" \(`prompt:\{\{prompt\}\}`\)/);
+  });
+
+  it("cooks with the run's values so bd's own variable check fires before a worktree exists", async () => {
+    const seen: Array<Record<string, string> | undefined> = [];
+    await validateRunFormula("/repo", {
+      vars: { target: "anton-1" },
+      read: async () => VALID,
+      cook: async (_repo, _path, vars) => {
+        seen.push(vars);
+        return { formula: "anton-run", steps: [{ id: "implement", labels: ["step:implement"] }] };
+      },
+    });
+    expect(seen).toEqual([{ target: "anton-1" }]);
+  });
+});
+
+// A run survives a crash, a quota backoff and an operator's un-park, and every attempt re-reads the
+// board and the project's settings. Re-selecting per attempt would let ONE run walk two pipelines —
+// the tickets that already committed on the old one, the rest on the new — while the run record
+// claimed a single formula for all of it.
+describe("validateRunFormula — a resumed run keeps the pipeline it recorded (anton-aa3m)", () => {
+  const PINNED = "/repo/.beads/formulas/anton-run.formula.toml";
+  const walkable = cookYielding([
+    { id: "implement", labels: ["step:implement"] },
+    { id: "commit", labels: ["step:commit"], needs: ["implement"] },
+    { id: "pr", labels: ["step:pr"], needs: ["commit"] },
+  ]);
+
+  it("loads the recorded source, ignoring labels and a mapping that would now select otherwise", async () => {
+    const cooked: string[] = [];
+    const formula = await validateRunFormula("/repo", {
+      // A label the run itself added, plus a mapping added since it started. Selection would pick
+      // `heavy` — whose file doesn't exist, so it would throw — if it ran at all.
+      labels: ["risk:high", "stage:implementing"],
+      variants: [{ label: "risk:high", formula: "heavy" }],
+      pinned: { source: PINNED },
+      read: async () => VALID,
+      cook: async (_repo, path) => {
+        cooked.push(path);
+        return walkable();
+      },
+    });
+    expect(formula.source).toBe(PINNED);
+    expect(formula.variant).toBeUndefined();
+    expect(cooked).toEqual([PINNED]);
+  });
+
+  it("keeps the recorded variant label even after the mapping that chose it is gone", async () => {
+    const formula = await validateRunFormula("/repo", {
+      labels: ["risk:high"],
+      variants: [],
+      pinned: { source: "/repo/.beads/formulas/heavy.formula.toml", variant: "risk:high" },
+      read: async () => VALID,
+      cook: walkable,
+    });
+    expect(formula.source).toBe("/repo/.beads/formulas/heavy.formula.toml");
+    expect(formula.variant).toBe("risk:high");
+  });
+
+  it("validates the pinned pipeline exactly like a selected one — no escape via resume", async () => {
+    await expect(
+      validateRunFormula("/repo", {
+        pinned: { source: PINNED },
+        read: async () => VALID,
+        cook: cookYielding([{ id: "deploy", labels: ["step:deploy"] }]),
+      }),
+    ).rejects.toThrow(/names `step:deploy`, which maps to no anton handler/);
+  });
+
+  it("says the run is pinned when the recorded file has since gone missing", async () => {
+    await expect(
+      validateRunFormula("/repo", {
+        pinned: { source: PINNED },
+        read: async () => {
+          throw new Error("ENOENT: no such file or directory");
+        },
+      }),
+    ).rejects.toThrow(/This run already walked that pipeline/);
+  });
 });

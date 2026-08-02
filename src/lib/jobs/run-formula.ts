@@ -22,13 +22,17 @@
  *    would otherwise reach a human only at dispatch, after `implement` had already committed.
  * 6. **A step bd gated** — {@link assertNoStepGates}: anton's walker has no gate resolution, so a
  *    gated step would run immediately rather than waiting on what the project gated it behind.
+ * 7. **A `{{var}}` in a step's labels** — {@link assertNoLabelPlaceholders}: bd substitutes variables
+ *    into a step's `title`/`description`/`notes` but NOT into its `labels`, in either cook mode, and
+ *    labels are where every piece of anton's per-step configuration rides.
  *
  * What it deliberately does NOT do: check the cooked pipeline against anton's invariant floor (which
  * steps may be omitted or reordered) — that is anton-6b99's, and it consumes what this returns.
  *
  * It is also where a run picks WHICH pipeline it walks (anton-aa3m): a project may map a bead label
  * to a formula of its own, so `risk:high` can carry extra steps while everything else walks the
- * default. See {@link selectRunFormula} for the precedence.
+ * default. See {@link selectRunFormula} for the precedence — and {@link RunFormulaOptions.pinned} for
+ * why a RESUMED run re-reads the pipeline it already recorded instead of selecting again.
  */
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -331,6 +335,30 @@ export function assertNoStepGates(cooked: CookedFormula, source: string): void {
 }
 
 /**
+ * A `{{var}}` in a step's LABELS parks the run. bd substitutes variables into a step's `title`,
+ * `description` and `notes`, but it copies `labels` through verbatim — in runtime mode as much as in
+ * compile mode (measured on bd 1.1.2). Labels are where ALL of anton's per-step configuration lives
+ * (`step:<name>`, `prompt:<id>`, `skill:<id>`), precisely because bd drops unknown step keys, so a
+ * parameterised label can never resolve: `prompt:{{prompt}}` would be looked up as a prompt literally
+ * named `{{prompt}}` and the step would park at dispatch — after the run had already implemented and
+ * committed. Say so at run start instead, where it costs nothing.
+ */
+export function assertNoLabelPlaceholders(cooked: CookedFormula, source: string): void {
+  const offending = cooked.steps.flatMap((s) =>
+    (s.labels ?? []).filter((l) => l.includes("{{")).map((l) => `"${s.id}" (\`${l}\`)`),
+  );
+  if (offending.length === 0) return;
+  throw new PoisonEpic(
+    `run formula ${source} parameterises the labels of step(s) ${offending.join(", ")}, which bd ` +
+      `never substitutes: it resolves \`{{var}}\` in a step's title, description and notes, but copies ` +
+      `\`labels\` through verbatim in every cook mode. anton reads its whole per-step configuration ` +
+      `from labels (\`step:\`, \`prompt:\`, \`skill:\`), so the placeholder would reach dispatch as ` +
+      `written. Name the step's handler and prompt literally — a pipeline that varies by label is a ` +
+      `formula variant (Settings → Pipeline variants) — then resume the run.`,
+  );
+}
+
+/**
  * The steps in EXECUTION order: topologically sorted by `needs`, ties broken by declaration order
  * (anton-lnkt). This is the order the walker runs and the order the invariant floor (anton-6b99) is
  * checked against, so the pipeline anton executes is the one the file describes — whether the
@@ -375,8 +403,30 @@ export interface RunFormulaOptions {
   labels?: readonly string[];
   /** The project's label→formula map, in precedence order. Absent/empty ⇒ the default, always. */
   variants?: readonly FormulaVariant[];
+  /**
+   * The pipeline an already-open run RECORDED, which pins it: selection is skipped and this source is
+   * loaded, cooked and validated instead.
+   *
+   * A run is resumable — it survives a crash, a quota backoff, an operator's un-park — and every
+   * attempt re-reads the board and the project's settings. Selecting again on each attempt would let
+   * one run walk two different pipelines: a label added since (including `stage:implementing`, which
+   * the run itself adds) or an edited variant map would re-select midway, so the tickets that already
+   * committed walked one formula and the rest walk another, while the run record claims a single one.
+   * The choice is therefore made ONCE, when the run is first recorded, and honored for its lifetime;
+   * a changed mapping applies to the next run.
+   */
+  pinned?: FormulaChoice;
+  /**
+   * `{{var}}` values for this run. Present ⇒ a RUNTIME cook, so placeholders resolve and bd enforces
+   * that every declared variable has a value; absent ⇒ compile (see {@link validateRunFormula}).
+   */
+  vars?: Record<string, string>;
   /** The `bd cook` seam (anton-brdg). Defaults to {@link beads.cook}. */
-  cook?: (repoPath: string, formulaPath: string) => Promise<CookedFormula>;
+  cook?: (
+    repoPath: string,
+    formulaPath: string,
+    vars?: Record<string, string>,
+  ) => Promise<CookedFormula>;
   /** Read the formula source. Defaults to the filesystem. */
   read?: (path: string) => Promise<string>;
 }
@@ -389,15 +439,20 @@ export interface RunFormulaOptions {
  * A variant (anton-aa3m) only changes WHICH file is loaded: everything past the selection — the
  * parse, the cook, handler resolution, and the invariant floor the caller applies to what this
  * returns — is identical, so a variant is validated exactly like the default and cannot escape it.
+ * A resumed run skips the selection entirely and re-loads what it recorded ({@link
+ * RunFormulaOptions.pinned}), so one run cannot change pipelines halfway through.
  *
- * Cooked in COMPILE mode (no `--var`): `{{var}}` placeholders survive, so validation never depends on
- * per-run values that don't exist yet. Substitution belongs to the walk.
+ * Cooked in RUNTIME mode when the caller supplies `vars` (a real run does): placeholders resolve, and
+ * bd's own "every variable needs a value" check fires HERE — before a worktree exists — rather than
+ * leaving a formula anton cannot supply a value for to walk with literal `{{var}}` in it. Absent vars
+ * it cooks in COMPILE mode, which is what a pure validation pass wants: the placeholders survive and
+ * nothing depends on per-run values.
  */
 export async function validateRunFormula(
   repoPath: string,
   deps: RunFormulaOptions = {},
 ): Promise<RunFormula> {
-  const { source, variant } = selectRunFormula(repoPath, deps.labels, deps.variants);
+  const { source, variant } = deps.pinned ?? selectRunFormula(repoPath, deps.labels, deps.variants);
   const read = deps.read ?? ((p: string) => readFile(p, "utf8"));
 
   let raw: string;
@@ -406,15 +461,23 @@ export async function validateRunFormula(
   } catch (e) {
     throw new PoisonEpic(
       `run formula ${source} could not be read (${e instanceof Error ? e.message : String(e)}) — ` +
-        `anton cannot start a run without the pipeline it is supposed to walk`,
+        `anton cannot start a run without the pipeline it is supposed to walk` +
+        (deps.pinned
+          ? `. This run already walked that pipeline, so anton re-reads it rather than selecting a ` +
+            `different one midway; restore the file, or abandon this run and start a fresh one on the ` +
+            `pipeline you want`
+          : ""),
     );
   }
   parseRunFormulaSource(raw, source);
 
-  const cook = deps.cook ?? ((repo: string, path: string) => beads.cook(repo, path));
+  const cook =
+    deps.cook ??
+    ((repo: string, path: string, vars?: Record<string, string>) =>
+      beads.cook(repo, path, vars ? { mode: "runtime", vars } : { mode: "compile" }));
   let cooked: CookedFormula;
   try {
-    cooked = await cook(repoPath, source);
+    cooked = await cook(repoPath, source, deps.vars);
   } catch (e) {
     // bd's own message already carries the full argv (formula path included) and its stderr, so it is
     // passed through rather than reformatted.
@@ -424,6 +487,7 @@ export async function validateRunFormula(
   }
 
   assertNoStepGates(cooked, source);
+  assertNoLabelPlaceholders(cooked, source);
   // Ordering before resolution so everything downstream — the floor check and the walk — reads ONE
   // order, the one the run actually executes.
   const ordered = orderFormulaSteps(cooked.steps, source);

@@ -110,6 +110,71 @@ describeBd("run formula (real bd)", () => {
     ]);
   });
 
+  // The real run path: anton supplies `{{target}}`, so the pipeline is cooked in RUNTIME mode and the
+  // shipped default has to survive it — a formula that only cooks in compile mode would park every run.
+  it("cooks the shipped default in runtime mode with anton's run values", async () => {
+    const validated = await validateRunFormula(repo, { vars: { target: "anton-1" } });
+
+    expect(validated.source).toBe(bundledRunFormulaPath());
+    expect(validated.cooked.steps.map((s) => s.title)).toContain("Implement anton-1");
+    expect(validated.steps.map((s) => s.definition.name)).toEqual([
+      "implement",
+      "verify",
+      "commit",
+      "review",
+      "pr",
+    ]);
+  });
+
+  // The measured fact assertNoLabelPlaceholders rests on: bd resolves `{{var}}` in a step's title,
+  // description and notes, and copies `labels` through verbatim even in runtime mode. anton reads its
+  // whole per-step configuration from labels, so a parameterised one can never resolve.
+  it("proves a runtime cook substitutes titles but NEVER labels", () => {
+    const path = join(bdRepo.dir, "placeholder.formula.toml");
+    writeFileSync(
+      path,
+      `formula = "placeholder"\ntype = "workflow"\nversion = 1\n\n[vars]\n[vars.target]\ndescription = "d"\ndefault = "t"\n\n[[steps]]\nid = "a"\ntype = "task"\ntitle = "Implement {{target}}"\nnotes = "for {{target}}"\nlabels = ["step:claude", "prompt:{{target}}"]\n`,
+      "utf8",
+    );
+
+    const cooked = JSON.parse(
+      execFileSync("bd", ["cook", path, "--mode=runtime", "--var", "target=anton-1", "--json"], {
+        cwd: repo,
+        encoding: "utf8",
+      }),
+    ) as Record<string, unknown>;
+    const step = (cooked.steps as Array<Record<string, unknown>>)[0];
+    expect(step.title).toBe("Implement anton-1");
+    expect(step.notes).toBe("for anton-1");
+    expect(step.labels).toEqual(["step:claude", "prompt:{{target}}"]);
+  });
+
+  it("parks on a parameterised label rather than dispatching `prompt:{{…}}` literally", async () => {
+    writeProjectFormula(
+      `formula = "anton-run"\ntype = "workflow"\nversion = 1\n\n[vars]\n[vars.prompt]\ndescription = "d"\ndefault = "reviewer"\n\n[[steps]]\nid = "implement"\ntype = "task"\ntitle = "Implement"\nlabels = ["step:implement"]\n\n[[steps]]\nid = "commit"\ntype = "task"\nneeds = ["implement"]\ntitle = "Commit"\nlabels = ["step:commit"]\n\n[[steps]]\nid = "extra"\ntype = "task"\nneeds = ["commit"]\ntitle = "Extra"\nlabels = ["step:claude", "prompt:{{prompt}}"]\n`,
+    );
+
+    await expect(validateRunFormula(repo, { vars: { target: "anton-1" } })).rejects.toThrow(
+      /parameterises the labels of step\(s\) "extra" \(`prompt:\{\{prompt\}\}`\)/,
+    );
+  });
+
+  // A variable anton has no value for can never be supplied, so the pipeline is unwalkable. bd's own
+  // runtime check says so at run START — before a worktree exists — instead of the run walking with a
+  // literal placeholder in it.
+  it("parks at run start on a required variable anton cannot supply", async () => {
+    const path = writeProjectFormula(
+      `formula = "anton-run"\ntype = "workflow"\nversion = 1\n\n[vars]\n[vars.reviewer]\ndescription = "who reviews"\nrequired = true\n\n[[steps]]\nid = "implement"\ntype = "task"\ntitle = "Implement for {{reviewer}}"\nlabels = ["step:implement"]\n\n[[steps]]\nid = "commit"\ntype = "task"\nneeds = ["implement"]\ntitle = "Commit"\nlabels = ["step:commit"]\n`,
+    );
+
+    // The same file cooks fine in compile mode — the placeholder just survives — so only the run's
+    // own runtime cook can catch it.
+    expect(() => cookRaw(path)).not.toThrow();
+    await expect(validateRunFormula(repo, { vars: { target: "anton-1" } })).rejects.toThrow(
+      new RegExp(`run formula ${path} could not be cooked[\\s\\S]*reviewer`),
+    );
+  });
+
   it("keeps every key the allowlist honors through a real cook — none silently dropped", () => {
     const path = join(bdRepo.dir, "all-keys.formula.toml");
     writeFileSync(path, ALL_KEYS_TOML, "utf8");
