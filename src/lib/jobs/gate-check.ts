@@ -340,14 +340,26 @@ export function plainGateResumes(
 /**
  * The distinct run targets a gate-closed board says are ready to move again. Deduped by id, because
  * two steps of the same epic ungating in the same pass are still one run.
+ *
+ * Scoped to targets THIS OPERATOR owns (unclaimed, or claimed by it) — the same anton-zoh test the
+ * other two dispatch paths apply, for the same reason: `bd ready --gated` reads the SHARED board, so
+ * every instance's pass sees the same released step. Unfiltered, each would enqueue a machine-local
+ * execute job for another operator's target; the local dedupe cannot see across machines, so the
+ * loser keeps retrying on the foreign run lease.
  */
-export function resumeTargets(board: Bead[], gated: GatedMolecule[], nowMs: number): Bead[] {
+export function resumeTargets(
+  board: Bead[],
+  gated: GatedMolecule[],
+  nowMs: number,
+  operator?: string,
+): Bead[] {
   const targets = new Map<string, Bead>();
   for (const entry of gated) {
     const startId = entry.ready_step?.id ?? entry.molecule_id;
     if (!startId) continue;
     const target = runTargetAbove(board, startId);
     if (!target || !isResumableTarget(target, nowMs)) continue;
+    if (!ownedByOperator(target, operator)) continue;
     targets.set(target.id, target);
   }
   return [...targets.values()];
@@ -413,9 +425,12 @@ export function makeGateCheckHandler(deps: GateCheckDeps): JobHandler {
 
     // 3. Re-dispatch the work whose gate has closed. `resumeEpic` decides the verb (resume a parked
     //    job, or enqueue a fresh one) and refuses anything an active job already covers — which is
-    //    what makes an overlapping pass a no-op instead of a second run.
+    //    what makes an overlapping pass a no-op instead of a second run. Every dispatch below is
+    //    scoped to this operator's targets: the board is shared, this schedule is machine-local, and
+    //    `resumeEpic`'s dedupe only sees the local job table (anton-zoh).
+    const operator = await resolveOperator();
     const gated = await beads.readyGated(repo);
-    const targets = resumeTargets(board, gated, nowMs);
+    const targets = resumeTargets(board, gated, nowMs, operator);
     for (const target of targets) {
       const outcome = await resumeEpic(db, clock, projectId, target.id);
       if (outcome === "resumed-job" || outcome === "enqueued") {
@@ -431,7 +446,6 @@ export function makeGateCheckHandler(deps: GateCheckDeps): JobHandler {
     //     `already-active`/`job-cancelled`: the gate has done its job in all four cases.
     //     Scoped to this operator's targets for the same reason step 4 is — the closed gate is on
     //     the shared board, and an unfiltered dispatch would have two antons race the same bead.
-    const operator = await resolveOperator();
     let handedBack = 0;
     for (const { gate, target } of plainGateResumes(board, nowMs, operator)) {
       const outcome = await resumeEpic(db, clock, projectId, target.id);

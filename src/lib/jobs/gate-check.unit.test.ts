@@ -251,6 +251,35 @@ describe("resumeTargets", () => {
   it("drops an entry that names nothing anton can resolve", () => {
     expect(resumeTargets(board, [{ molecule_id: "" }, entry("ghost", "ghost")], NOW)).toEqual([]);
   });
+
+  it("resumes only the operator's own targets — a shared board must not double-dispatch", () => {
+    // `bd ready --gated` reads the SHARED board, so every instance sees the same released step.
+    // Unfiltered, each enqueues an execute-epic in its own machine-local table; the loser then
+    // retries against the winner's run lease, which no local dedupe can see.
+    const shared: Bead[] = [
+      bead("s-mine", { parent: "e-mine" }),
+      bead("e-mine", { issue_type: "epic", labels: [LABELS.approved], assignee: "alice" }),
+      bead("s-theirs", { parent: "e-theirs" }),
+      bead("e-theirs", { issue_type: "epic", labels: [LABELS.approved], assignee: "bob" }),
+      bead("s-free", { parent: "e-free" }),
+      bead("e-free", { issue_type: "epic", labels: [LABELS.approved] }),
+    ];
+    const gated = [
+      entry("s-mine", "e-mine"),
+      entry("s-theirs", "e-theirs"),
+      entry("s-free", "e-free"),
+    ];
+    expect(resumeTargets(shared, gated, NOW, "alice").map((t) => t.id)).toEqual([
+      "e-mine",
+      "e-free",
+    ]);
+    expect(resumeTargets(shared, gated, NOW, "bob").map((t) => t.id)).toEqual([
+      "e-theirs",
+      "e-free",
+    ]);
+    // An anton that cannot name itself takes unclaimed work only — it never races a claimed run.
+    expect(resumeTargets(shared, gated, NOW, undefined).map((t) => t.id)).toEqual(["e-free"]);
+  });
 });
 
 /**
