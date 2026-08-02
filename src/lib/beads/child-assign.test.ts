@@ -106,15 +106,19 @@ describe("assignChildren", () => {
 describe("releaseChildren", () => {
   it("hands back only the children the actor still holds", async () => {
     const { guard, calls, owner } = fakeBoard({ "t-1": "anton", "t-stolen": "founder" });
-    const released = await releaseChildren("/repo", ["t-1", "t-stolen"], "anton", guard);
+    const result = await releaseChildren("/repo", ["t-1", "t-stolen"], "anton", guard);
 
-    expect(released).toEqual(["t-1"]);
+    // A takeover is not a failure — that child has a new owner, so it is neither ours to hand back
+    // nor stranded.
+    expect(result).toEqual({ released: ["t-1"], failed: [] });
     expect(owner("t-1")).toBeUndefined();
     expect(owner("t-stolen")).toBe("founder"); // a takeover mid-run keeps its new owner
     expect(calls).toEqual(["unassign t-1"]);
   });
 
-  it("survives a bd write that fails, releasing the rest", async () => {
+  // The strand the caller has to surface: a child still assigned to a run that has stopped is
+  // invisible to `bd ready --unassigned` everywhere until a human clears it.
+  it("names a bd write that fails while releasing the rest", async () => {
     const { guard } = fakeBoard({ "t-1": "anton", "t-2": "anton" });
     const flaky = {
       ...guard,
@@ -123,9 +127,10 @@ describe("releaseChildren", () => {
           ? Promise.reject(new Error("bd db is locked"))
           : guard.setAssigneeIfOwner(repo, id, expected, next),
     };
-    await expect(releaseChildren("/repo", ["t-1", "t-2"], "anton", flaky)).resolves.toEqual([
-      "t-2",
-    ]);
+    await expect(releaseChildren("/repo", ["t-1", "t-2"], "anton", flaky)).resolves.toEqual({
+      released: ["t-2"],
+      failed: [{ id: "t-1", error: "bd db is locked" }],
+    });
   });
 });
 

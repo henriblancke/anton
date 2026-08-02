@@ -1267,11 +1267,21 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // window and resumes on THIS machine with everything intact — the same reason runTicket keeps
       // the in-flight ticket's claim on that path, and releasing here would contradict it.
       if (childCascade && !isUsageLimitError(e)) {
-        const released = await releaseChildren(repo, childCascade.ids, childCascade.actor);
-        if (released.length > 0) {
+        const release = await releaseChildren(repo, childCascade.ids, childCascade.actor);
+        if (release.released.length > 0) {
           console.warn(
-            `[execute-epic] ${epicBeadId}: released ${released.length} child ticket(s) back to the ` +
-              `board — ${released.join(", ")}`,
+            `[execute-epic] ${epicBeadId}: released ${release.released.length} child ticket(s) back ` +
+              `to the board — ${release.released.join(", ")}`,
+          );
+        }
+        // A release that never landed is the one outcome nothing downstream reports: the run settles
+        // below either way, and those children stay assigned to an actor with no run behind them —
+        // hidden from `bd ready --unassigned` on every machine until someone clears them by hand.
+        if (release.failed.length > 0) {
+          console.error(
+            `[execute-epic] ${epicBeadId}: could not release ${release.failed.length} child ` +
+              `ticket(s) — ${release.failed.map((f) => f.id).join(", ")} — they remain assigned to ` +
+              `${childCascade.actor} with no active run. (${release.failed[0].error})`,
           );
         }
       }

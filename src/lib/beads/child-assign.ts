@@ -32,6 +32,19 @@ export interface FailedChild {
   error: string;
 }
 
+/** What a release did: what went back to the board, what stayed reserved because the write broke. */
+export interface ChildRelease {
+  /** Children no longer held by this run — handed back, or already gone to a new owner. */
+  released: string[];
+  /**
+   * Children whose release write failed, so they are STILL assigned to the stopping run with no
+   * run behind them — invisible to `bd ready --unassigned` on every machine until someone clears
+   * them. Reported rather than thrown: the stopping path must not let one locked bd write hide the
+   * run's own error, but an operator needs to see the strand.
+   */
+  failed: FailedChild[];
+}
+
 /** What a cascade did: what the run now holds, what it deliberately did not touch, what broke. */
 export interface ChildAssignment {
   /** Children the run holds — exactly the set {@link releaseChildren} hands back. */
@@ -98,22 +111,30 @@ export async function assignChildren(
  * child a human has taken over since is left with its new owner, and one already unassigned costs a
  * read and no write.
  *
- * Returns the ids that are no longer held by this run, for the caller's log. Per-child failures are
- * swallowed: this runs on the stopping path, where one locked bd write must not hide the run's own
- * error or strand the remaining children.
+ * Reports what came back and what broke, for the caller's log. A failure never throws — this runs on
+ * the stopping path, where one locked bd write must not hide the run's own error or strand the
+ * remaining children — but it is named, because a release that never lands leaves the child assigned
+ * to a run that no longer exists. A CAS the guard merely REFUSED is neither: that child has a new
+ * owner, so it is not ours to hand back and nothing is stranded.
  */
 export async function releaseChildren(
   repoPath: string,
   ids: string[],
   actor: string,
   guard: ClaimGuard = claimGuard,
-): Promise<string[]> {
+): Promise<ChildRelease> {
   const released: string[] = [];
+  const failed: FailedChild[] = [];
   for (const id of ids) {
-    const swap = await guard.setAssigneeIfOwner(repoPath, id, actor, undefined).catch(() => null);
+    const swap = await guard
+      .setAssigneeIfOwner(repoPath, id, actor, undefined)
+      .catch((e: unknown) => {
+        failed.push({ id, error: e instanceof Error ? e.message : String(e) });
+        return null;
+      });
     if (swap?.ok) released.push(id);
   }
-  return released;
+  return { released, failed };
 }
 
 /** `id → owner` pairs, for the run log line that surfaces what the cascade left alone. */
