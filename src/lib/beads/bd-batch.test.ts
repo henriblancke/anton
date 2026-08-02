@@ -172,6 +172,21 @@ describe("beads.batch", () => {
     expect(isMissingBatchCommand({ stderr: "line 2 (close bd-9): not found: issue bd-9" })).toBe(false);
     expect(isMissingBatchCommand(undefined)).toBe(false);
   });
+
+  /** Every false positive here rolls a clean rollback forward into a half-applied unit. */
+  it("does not read a rolled-back transaction as a missing subcommand", () => {
+    // A batch line carrying the phrase in its own text (an abandon reason, a title) is a REAL
+    // failure — bd already rolled the whole unit back.
+    expect(
+      isMissingBatchCommand({
+        stderr: 'line 1 (close bd-9): not found: issue titled unknown command "batch" fallback',
+      }),
+    ).toBe(false);
+    // Neither field carries the phrase on its own, so joining them must not manufacture it.
+    expect(isMissingBatchCommand({ stderr: "unknown command", message: '"batch" for "bd"' })).toBe(
+      false,
+    );
+  });
 });
 
 describe("beads.abandonAll", () => {

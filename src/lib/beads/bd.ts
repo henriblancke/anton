@@ -222,16 +222,29 @@ export function batchEnabled(): boolean {
 }
 
 /**
+ * Cobra's subcommand-not-found line, verbatim: `unknown command "batch" for "bd"`. bd emits nothing
+ * machine-readable for this case, so the whole gate is a heuristic on that one string — kept strict
+ * (both quoted operands, not just the words) so no batch line's own text can forge it.
+ */
+const MISSING_BATCH_COMMAND = /unknown command "batch" for "[^"\n]+"/i;
+
+/**
  * Does this failure mean "this bd has no `batch` subcommand" rather than "the transaction failed"?
  * Only the former may fall back to sequential writes: bd rolls the batch back on every other error,
  * so retrying those one-at-a-time would convert a clean no-op into exactly the half-applied unit
  * the transaction exists to prevent.
+ *
+ * Each field is tested on its own — concatenating them would let a stderr ending in "unknown
+ * command" and an unrelated message supply half the phrase each. An unrecognized variant falls
+ * through to "the transaction failed", which is the safe direction: loud, with nothing half
+ * applied, and `ANTON_BD_BATCH=0` as the deliberate opt-out. Recheck the pattern above when
+ * upgrading bd across a cobra major — a reworded error silently costs the fallback, not safety.
  */
 export function isMissingBatchCommand(e: unknown): boolean {
   const err = e as { stderr?: unknown; message?: unknown } | null | undefined;
-  const stderr = typeof err?.stderr === "string" ? err.stderr : "";
-  const message = typeof err?.message === "string" ? err.message : "";
-  return /unknown command\s+"?batch/i.test(`${stderr}\n${message}`);
+  return [err?.stderr, err?.message].some(
+    (field) => typeof field === "string" && MISSING_BATCH_COMMAND.test(field),
+  );
 }
 
 /** Age scope for `beads.prune`: a relative window bd accepts, or "all" (every closed bead). */
