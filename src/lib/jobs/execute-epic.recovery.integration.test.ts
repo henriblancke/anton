@@ -14,9 +14,9 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { beads } from "../beads/bd";
 import * as schema from "../db/schema";
-import { getJob } from "./queue";
 import { resetOperatorCache } from "../operator";
 import { describeBd } from "@/lib/testing/integration";
+import { expectJobStatus } from "@/lib/testing/jobs";
 import {
   BASE_TIME_MS,
   resetPerCaseState,
@@ -77,7 +77,7 @@ describeBd("execute-epic e2e — recovery & readiness (real handler · real bd/g
     // Attempt 1: a normal run carries the bug to in-review (PR opened at gh-42, PR ref stamped to metadata.pr).
     process.env.ANTON_CLAUDE_BIN = successClaude;
     const job1 = await driveEpicRun(runner, { projectId, epicBeadId: bugId });
-    expect((await getJob(tdb.db, job1))?.status).toBe("done");
+    await expectJobStatus(tdb.db, job1, "done");
     expect(beads.getPrRef(await beads.show(repo, bugId))).toBe("gh-42");
     const sessionsAfter1 = (await tdb.db.select().from(schema.sessions)).filter(
       (s) => s.beadId === bugId,
@@ -103,7 +103,7 @@ process.exit(0);`,
 
       // The recovery run did NOT short-circuit: it re-opened the PR (PR ref advanced to gh-99)
       // and finished done, rather than reporting a false completion on the dead gh-42.
-      expect((await getJob(tdb.db, job2))?.status).toBe("done");
+      await expectJobStatus(tdb.db, job2, "done");
       expect(beads.getPrRef(await beads.show(repo, bugId))).toBe("gh-99");
       // The standalone target is stage:in-review from attempt 1, so its ticket is resume-skipped —
       // claude is not re-run; only the (agent-free) PR step executes on recovery.
@@ -135,7 +135,7 @@ process.exit(0);`,
     const jobId = await driveEpicRun(runner, { projectId, epicBeadId: dependent });
 
     // Poison-parked (blocked target refused), and the bead was never touched (not claimed/closed).
-    expect((await getJob(tdb.db, jobId))?.status).toBe("parked");
+    await expectJobStatus(tdb.db, jobId, "parked");
     const bead = await beads.show(repo, dependent);
     expect(bead.status).not.toBe("closed");
     expect(bead.assignee ?? null).toBeNull();
@@ -153,11 +153,10 @@ process.exit(0);`,
     const jobId = await driveEpicRun(runner, { projectId, epicBeadId: choreId });
 
     // Poison → job parked; the reason names the bead and the type, not "not found".
-    const job = await getJob(tdb.db, jobId);
-    expect(job?.status).toBe("parked");
-    expect(job?.lastError).toContain(choreId);
-    expect(job?.lastError).toMatch(/not runnable/i);
-    expect(job?.lastError).not.toMatch(/not found/i);
+    const job = await expectJobStatus(tdb.db, jobId, "parked");
+    expect(job.lastError).toContain(choreId);
+    expect(job.lastError).toMatch(/not runnable/i);
+    expect(job.lastError).not.toMatch(/not found/i);
     // Pre-flight gate: no run row created.
     expect(
       (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === choreId),
@@ -188,12 +187,11 @@ process.exit(0);`,
     process.env.ANTON_CLAUDE_BIN = successClaude;
     const jobId = await driveEpicRun(runner, { projectId, epicBeadId: containerId });
 
-    const job = await getJob(tdb.db, jobId);
-    expect(job?.status).toBe("parked");
-    expect(job?.lastError).toContain(containerId);
-    expect(job?.lastError).toMatch(/container/i);
-    expect(job?.lastError).toMatch(/feature/i);
-    expect(job?.lastError).not.toMatch(/not found/i);
+    const job = await expectJobStatus(tdb.db, jobId, "parked");
+    expect(job.lastError).toContain(containerId);
+    expect(job.lastError).toMatch(/container/i);
+    expect(job.lastError).toMatch(/feature/i);
+    expect(job.lastError).not.toMatch(/not found/i);
     // Pre-flight gate: no run row, and neither bead was touched.
     expect(
       (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === containerId),
@@ -224,7 +222,7 @@ process.exit(0);`,
     process.env.ANTON_CLAUDE_BIN = successClaude;
     const jobId = await driveEpicRun(runner, { projectId, epicBeadId: featureId });
 
-    expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+    await expectJobStatus(tdb.db, jobId, "done");
     const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === featureId)!;
     expect(run.status).toBe("done");
     expect(run.branch).toBe(`anton/${featureId}`);
@@ -260,7 +258,7 @@ process.exit(0);`,
     process.env.ANTON_CLAUDE_BIN = successClaude;
     const jobId = await driveEpicRun(runner, { projectId, epicBeadId: featureId });
 
-    expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+    await expectJobStatus(tdb.db, jobId, "done");
     // Both children were dispatched and closed; the feature itself is in-review on one PR.
     const board = await beads.list(repo, ["--status", "all"]);
     for (const id of childIds) {
@@ -316,10 +314,9 @@ process.exit(0);`,
       process.env.ANTON_CLAUDE_BIN = successClaude;
       const jobId = await driveEpicRun(runner, { projectId, epicBeadId: epicId });
 
-      const job = await getJob(tdb.db, jobId);
-      expect(job?.status).toBe("parked");
-      expect(job?.lastError).toContain(epicId);
-      expect(job?.lastError).toMatch(/container/i);
+      const job = await expectJobStatus(tdb.db, jobId, "parked");
+      expect(job.lastError).toContain(epicId);
+      expect(job.lastError).toMatch(/container/i);
       // Nothing was executed: the late feature is untouched and no PR was opened.
       const board = await beads.list(repo, ["--status", "all"]);
       expect(board.find((b) => b.id === lateFeatureId)?.status).not.toBe("closed");
@@ -362,7 +359,7 @@ process.exit(0);`,
       process.env.ANTON_CLAUDE_BIN = successClaude;
       const jobId = await driveEpicRun(runner, { projectId, epicBeadId: featureId });
 
-      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+      await expectJobStatus(tdb.db, jobId, "done");
       // The late ticket was the unit of work — dispatched and closed; the feature stayed the
       // delivery unit, left open and in-review on its one PR.
       expect((await beads.show(repo, lateTaskId)).status).toBe("closed");
@@ -424,9 +421,8 @@ process.exit(0);`),
       // First tick: one ticket succeeds + closes, the next hits the usage limit → job rescheduled
       // (quota attempt refunded), run parked, worktree kept.
       await tickToIdle(runner);
-      let job = await getJob(tdb.db, jobId);
-      expect(job?.status).toBe("queued");
-      expect(job?.attempts).toBe(0);
+      const parkedJob = await expectJobStatus(tdb.db, jobId, "queued");
+      expect(parkedJob.attempts).toBe(0);
       const run3 = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === epic3)!;
       expect(run3.status).toBe("parked");
       expect(existsSync(run3.worktreePath!)).toBe(true);
@@ -453,8 +449,7 @@ process.exit(0);`),
       clock.set(resetSec * 1000 + 1);
       await tickToIdle(runner);
 
-      job = await getJob(tdb.db, jobId);
-      expect(job?.status).toBe("done");
+      await expectJobStatus(tdb.db, jobId, "done");
       const run3b = (await tdb.db.select().from(schema.runs)).filter((r) => r.epicBeadId === epic3);
       expect(run3b).toHaveLength(1); // resumed, not duplicated
       expect(run3b[0].id).toBe(run3.id);
