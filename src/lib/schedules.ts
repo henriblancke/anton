@@ -145,6 +145,10 @@ export async function listSchedules(projectId: string): Promise<ScheduleSummary[
  * project is added so the jobs run without manual setup; the settings UI edits/disables them. Times
  * are local. review-fix polls often (cheap gh calls); stringer/grooming are periodic.
  *
+ * review-fix is a REVIEW-EVENT poll, not a merge poll (anton-k0kj): merges arrive as a closed
+ * `gh:pr` gate via gate-check. Requested changes, review comments and red CI have no gate flavour in
+ * bd, so this cadence is the one wait gates cannot replace — see review-fix.ts's header.
+ *
  * `enabled: false` seeds the ROW without arming it — the operator sees the automation in settings
  * and turns it on deliberately. run-health (anton-4ks0) ships that way: it reports on work a human
  * must then judge, so an operator who never asked for it shouldn't start accruing reports. unstick
@@ -164,7 +168,7 @@ export const DEFAULT_SCHEDULES: Array<{
   cron: string;
   enabled?: boolean;
 }> = [
-  { type: "review-fix", cron: "*/15 * * * *" }, // poll open PRs every 15 min
+  { type: "review-fix", cron: "*/15 * * * *" }, // poll open PRs for review events every 15 min
   { type: "nightly-stringer", cron: "0 3 * * *" }, // scan + triage nightly at 03:00
   { type: "orphan-grooming", cron: "0 4 * * 1" }, // bucket loose tickets weekly, Mon 04:00
   { type: "run-health", cron: "0 * * * *", enabled: false }, // sweep for stalls hourly; opt-in

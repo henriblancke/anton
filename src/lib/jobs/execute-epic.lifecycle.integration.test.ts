@@ -14,6 +14,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { beads } from "../beads/bd";
+import { loadAllIssues } from "../beads/issues";
+import { epicStandaloneBlockers } from "../epic-graph";
 import * as schema from "../db/schema";
 import { getJob, park, resumeJob } from "./queue";
 import { createRun } from "../runs";
@@ -99,6 +101,20 @@ describeBd("execute-epic e2e — lifecycle (real handler · real bd/git · fake 
     const epic = await beads.show(repo, epicId);
     expect(beads.getPrRef(epic)).toBe("gh-42");
     expect(epic.labels ?? []).toContain("stage:in-review");
+
+    // …and the merge wait is board state, not a polling job (anton-k0kj): one `gh:pr` gate on THIS
+    // PR number, blocking the epic, for gate-check to settle. Nothing else waits on the merge.
+    const gates = await beads.gateList(repo);
+    const merge = gates.filter((g) => g.await_type === "gh:pr");
+    expect(merge).toHaveLength(1);
+    expect(merge[0].await_id).toBe("42");
+    expect(merge[0].status).not.toBe("closed");
+    expect(
+      (epic.dependencies ?? []).some((d) => d.type === "blocks" && d.depends_on_id === merge[0].id),
+    ).toBe(true);
+    // The gate must NOT read as a prerequisite — an in-review target that looks blocked by its own
+    // PR can never be force-run or recovered (epic-graph skips gh:pr gates for exactly this).
+    expect(epicStandaloneBlockers(await loadAllIssues(repo), epicId)).toEqual([]);
 
     // The run CLAIMED the epic + each ticket for the human operator (assignee set, not just
     // in_progress) so the board shows who owns in-flight work — anton-ner.1 / anton-live-sync R6.

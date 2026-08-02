@@ -20,6 +20,11 @@
  *      `bd gate resolve`, or on another machine all surface here on the next slot. (A CLI-resolved
  *      human gate notifies no anton instance, which is exactly why the resume half runs every pass
  *      rather than only when this pass closed something.)
+ *   4. FINALIZE — a run target whose `gh:pr` merge gate has closed is handed to review-fix, which
+ *      closes it out exactly as it always has (anton-k0kj). This is the move that turns "waiting for
+ *      merge" from a sweep that re-reads every open PR into one bd call per slot. Its discovery is
+ *      the BOARD, not `bd ready --gated` — that call reports molecule steps only and never sees an
+ *      ad-hoc gate on a plain bead.
  *
  * IDEMPOTENCE is the property to preserve. `bd ready --gated` keeps reporting an entry for as long
  * as its step is ready — it is a view of the board, not a queue of events — so this pass must never
@@ -30,11 +35,11 @@
  * See DESIGN §4/§6 and .product/decisions/2026-07-28-bd-workflow-primitives.md §5 (the cwd hazard
  * every gate call here inherits — the seam in beads/bd.ts holds it).
  */
-import { beads, type Bead, type Gate, type GateCheckScope, type GatedMolecule } from "../beads/bd";
+import { beads, LABELS, type Bead, type Gate, type GateCheckScope, type GatedMolecule } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
 import { getProjectById } from "../projects";
 import { PoisonError } from "./errors";
-import { systemClock, type AntonDb, type Clock } from "./queue";
+import { enqueueReviewFixIfAbsent, systemClock, type AntonDb, type Clock } from "./queue";
 import type { JobContext, JobHandler } from "./runner";
 import { resumeEpic } from "./unstick";
 
@@ -54,6 +59,9 @@ export interface GateCheckDeps {
  * the failure mode bd's own escalation has.
  */
 export const GATE_EXPIRED_LABEL = "gate-expired";
+
+/** The stage label a run target carries while its PR is in review — cleared by merge-finalization. */
+const IN_REVIEW = LABELS.stage("in-review");
 
 /** Ancestor walk depth — a guard against a cyclic parent chain, not a real board shape. */
 const MAX_PARENT_DEPTH = 20;
@@ -177,6 +185,39 @@ export function isResumableTarget(target: Bead, nowMs: number): boolean {
 }
 
 /**
+ * The in-review run targets whose merge wait has been ANSWERED BY A MERGE — the beads to hand to
+ * review-fix for finalization (anton-k0kj). Derived from the board rather than from "what this pass
+ * closed", for the same reason the resume half is: a gate closed on another machine, or by an
+ * operator's `bd gate resolve`, has to surface here too, and this pass keeps no waiter list.
+ *
+ * Every clause carries weight:
+ *
+ *   • the gate is CLOSED — and a `gh:pr` gate closes on MERGE and on nothing else. A PR closed
+ *     WITHOUT merging leaves it open forever (bd reports "escalate", changes no state; measured on
+ *     1.1.0 and 1.1.2), which is precisely what keeps a closed-unmerged PR out of this list and its
+ *     PR ref in place for a recovery run.
+ *   • the target is still OPEN and still `stage:in-review` — the two things finalization clears. A
+ *     finalized target therefore drops out on the next pass, which is what stops a permanently
+ *     closed gate from re-dispatching forever; a finalize that FAILED half-way leaves them in place
+ *     and gets retried.
+ *
+ * `bd ready --gated` is not usable here: it reports molecule steps only, so an ad-hoc gate on a
+ * plain bead never appears in it, not even the pass after it closes.
+ */
+export function mergedGateTargets(board: Bead[]): Bead[] {
+  const byId = new Map(board.map((b) => [b.id, b]));
+  return board.filter((bead) => {
+    if (bead.status === "closed") return false;
+    if (!(bead.labels?.includes(IN_REVIEW) ?? false)) return false;
+    return (bead.dependencies ?? []).some((d) => {
+      if (d.type !== "blocks") return false;
+      const gate = byId.get(d.depends_on_id);
+      return gate !== undefined && gate.status === "closed" && beads.isMergeWaitGate(gate);
+    });
+  });
+}
+
+/**
  * The distinct run targets a gate-closed board says are ready to move again. Deduped by id, because
  * two steps of the same epic ungating in the same pass are still one run.
  */
@@ -254,6 +295,17 @@ export function makeGateCheckHandler(deps: GateCheckDeps): JobHandler {
         console.log(`[gate-check] ${projectId}: ${target.id} ungated — ${outcome}`);
       }
     }
+    // 3b. Hand every MERGED run target to review-fix (anton-k0kj). This is the whole point of the
+    //     merge gate: the sweep no longer has to re-read every open PR to notice a merge — one
+    //     `bd gate check` settles the project's merge waits, and the targets whose wait closed are
+    //     dispatched by id. review-fix's merge-finalize behaviour is untouched; only its trigger
+    //     moved. Deduped against a live job for the same target, and re-dispatched every pass until
+    //     the finalize actually lands, so a half-done finalize heals itself.
+    for (const target of mergedGateTargets(board)) {
+      const jobId = enqueueReviewFixIfAbsent(db, clock, projectId, target.id);
+      if (jobId) console.log(`[gate-check] ${projectId}: ${target.id} merged — dispatched review-fix`);
+    }
+
     // Ungated work anton chose not to run is a decision worth seeing: unapproved, abandoned, or
     // already live. Silence here would be indistinguishable from a resume that never happened.
     if (gated.length > 0 && targets.length === 0) {

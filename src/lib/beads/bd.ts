@@ -1043,10 +1043,28 @@ export const beads = {
     (opts.dryRun ? bdGate : bdGateWrite)(repo, buildGateDiscoverArgs(opts)),
 
   /**
+   * A `gh:pr` gate — the merge wait anton arms on a run target when it opens that target's PR
+   * (anton-k0kj). It is the ONE gate flavour anton creates on work it runs, and it is deliberately
+   * NOT a prerequisite: it awaits the target's OWN pull request, so every "what blocks this bead?"
+   * computation skips it (see epic-graph). Anything else would make an in-review target read as
+   * blocked by itself and refuse the recovery run its closed-unmerged PR needs.
+   *
+   * `await_type` lives on {@link Gate}, and gate beads reach a board read through
+   * `bd list --type gate` (loadAllIssues), which carries the field — so the cast is the seam's, not
+   * a caller's.
+   */
+  isMergeWaitGate: (b: Bead): boolean =>
+    b.issue_type === "gate" && (b as Gate).await_type === "gh:pr",
+
+  /**
    * Molecules whose gate has closed and whose next step is runnable — the gate-resume discovery
    * call. It is `bd ready --gated`, NOT `bd mol ready --gated`: that form errors with "unknown flag:
    * --gated" on both 1.1.0 and 1.1.2 (contradicting its own usage line), and bare `bd mol ready`
    * lists EVERY ready molecule step, so it is not a substitute.
+   *
+   * MOLECULE-ONLY (measured on 1.1.0 and 1.1.2, anton-k0kj): an ad-hoc gate on a plain bead never
+   * appears here, not even the pass after it closes — the blocked bead simply returns to `bd ready`.
+   * So the merge-wait gate above is discovered from the BOARD, not from this call.
    */
   readyGated: (repo: string): Promise<GatedMolecule[]> =>
     bdGate(repo, ["ready", "--gated", "--json", "--limit", "0"]).then(asArray<GatedMolecule>),
