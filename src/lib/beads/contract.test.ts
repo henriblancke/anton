@@ -325,6 +325,27 @@ describe("validateBeadContract — headings inside fenced code", () => {
     expect(validateBeadContract(fenced)).toEqual([]);
   });
 
+  it("strips several comments on one line and keeps the text between them", () => {
+    const many = ticket({
+      acceptance_criteria: undefined,
+      description: [
+        DESCRIPTION,
+        "",
+        "## Acceptance",
+        "<!-- a -->- [ ] it<!-- b --> works<!-- c -->",
+      ].join("\n"),
+    });
+    expect(validateBeadContract(many)).toEqual([]);
+    // The last comment left open swallows the rest, so only what precedes it is authored text.
+    const trailing = ticket({
+      acceptance_criteria: undefined,
+      description: [DESCRIPTION, "", "## Acceptance", "<!-- a --><!-- b --><!-- never closed"].join(
+        "\n",
+      ),
+    });
+    expect(summarize(trailing)).toEqual([["Acceptance", "blocking"]]);
+  });
+
   it("does not let a heading hidden inside an HTML comment open a section", () => {
     // A `## Acceptance` inside `<!-- … -->` renders as nothing — recognizing it would classify the
     // comment's own hidden checklist as the written spec, and approval/execution would proceed with

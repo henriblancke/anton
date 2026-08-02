@@ -93,13 +93,16 @@ const afterComment = (text: string): string | undefined => {
 
 /** {@link stripComments} for text that starts OUTSIDE a comment. */
 function stripFromOutside(text: string): CommentScan {
-  const at = text.indexOf(COMMENT_OPEN);
-  if (at === -1) return { visible: text, inComment: false };
-  const before = text.slice(0, at);
-  const rest = afterComment(text.slice(at + COMMENT_OPEN.length));
-  if (rest === undefined) return { visible: before, inComment: true };
-  const tail = stripFromOutside(rest);
-  return { visible: before + tail.visible, inComment: tail.inComment };
+  let visible = "";
+  let rest = text;
+  for (;;) {
+    const at = rest.indexOf(COMMENT_OPEN);
+    if (at === -1) return { visible: visible + rest, inComment: false };
+    visible += rest.slice(0, at);
+    const after = afterComment(rest.slice(at + COMMENT_OPEN.length));
+    if (after === undefined) return { visible, inComment: true };
+    rest = after;
+  }
 }
 
 /**
