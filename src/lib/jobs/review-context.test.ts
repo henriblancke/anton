@@ -171,6 +171,29 @@ describe("reviewContext", () => {
     expect(out).toContain("reporting it against the rule it overrides is a false finding");
   });
 
+  it("gives every instruction file real rules, not just a truncation marker, at any file count", () => {
+    // The marker `truncate` appends used to be charged to the shared budget without being reserved
+    // in the slice that produced it, so `remaining` drained faster than it was allocated and the
+    // deficit compounded through the equal shares — the tail of a long list rendered as a heading
+    // and a bare `… [truncated]`, which under the caveat reads as a scope that states no rules.
+    const marker = "… [truncated]";
+    const instructions = Array.from({ length: 500 }, (_, i) => ({
+      path: `packages/p${i}/AGENTS.md`,
+      text: "- a rule long enough to matter.\n".repeat(100),
+    }));
+
+    const out = reviewContext({ target: epic, tickets: [ticket], diff, instructions });
+
+    for (const f of instructions) {
+      const start = out.indexOf(`### \`${f.path}\``);
+      expect(start).toBeGreaterThan(-1);
+      const block = out.slice(start, out.indexOf(marker, start));
+      // Whatever the cut left must be an actual rule, not a header followed by the marker alone.
+      expect(block).toContain("- a rule long enough to matter.");
+    }
+    expect(out).toContain("was cut for length");
+  });
+
   it("says what a cut cost when the PRINCIPLES are the file over budget", () => {
     // Principles are capped exactly like the instruction files, and the caveat makes the inlined text
     // the only rulebook — so a mandatory rule past the 8k cut is enforced by nobody while the review
@@ -489,6 +512,79 @@ describe("buildReviewPrompt", () => {
     expect(prompt).not.toContain("a subtree this run never touched");
     // Root first: the widest-binding rules are read before the scopes that refine them.
     expect(prompt.indexOf("### `CLAUDE.md`")).toBeLessThan(prompt.indexOf("### `src/app/AGENTS.md`"));
+  });
+
+  it("follows an instruction file's `@path` imports, recursively, as rules in their own right", async () => {
+    // A `CLAUDE.md` that delegates through Claude's import syntax (this repo's own opens with
+    // `@AGENTS.md`) inlined the literal directive and nothing else, while the caveat told the
+    // reviewer the inlined text was the only rulebook — so the delegated rules graded nothing.
+    commitFile("CLAUDE.md", "@docs/rules.md\n\n- And one rule stated inline.\n");
+    // Relative to the importing file's own directory, as Claude resolves them.
+    commitFile("docs/rules.md", "- The delegated rule.\n\nSee @deeper.md for the rest.\n");
+    commitFile("docs/deeper.md", "- The rule two hops out.\n");
+
+    const { prompt } = await buildReviewPrompt({
+      target: epic,
+      tickets: [ticket],
+      diff: { files: ["src/app/page.tsx"], patch: "+ const Page = () => null;\n", truncated: false },
+      settings: settings({ reviewPrompt: "OPERATOR CONTRACT." }),
+      projectDir,
+      baseRev: BASE,
+    });
+
+    expect(prompt).toContain("- The delegated rule.");
+    expect(prompt).toContain("- The rule two hops out.");
+    // An import carries its importer's authority and scope, so the prompt says whose rules they are
+    // rather than letting `docs/` read as the scope they bind.
+    expect(prompt).toContain("### `docs/rules.md` — imported by `CLAUDE.md`");
+    expect(prompt).toContain('A file marked "imported by" another');
+    // And they follow the file that imported them.
+    expect(prompt.indexOf("### `CLAUDE.md`")).toBeLessThan(prompt.indexOf("### `docs/rules.md`"));
+  });
+
+  it("bounds import traversal: cycles, escapes, and code samples", async () => {
+    // The import graph is repo-controlled, so it is also run-controlled on the next branch: a cycle
+    // must terminate, and a path out of the repo must resolve to nothing rather than to the operator's
+    // own machine — the base revision is the whole point of reading these files at all.
+    commitFile("CLAUDE.md", "@docs/a.md\n@/etc/passwd\n@~/.claude/CLAUDE.md\n@../escape.md\n");
+    commitFile("docs/a.md", "- Rule A.\n@b.md\n");
+    commitFile("docs/b.md", "- Rule B.\n@a.md\n@../CLAUDE.md\n");
+
+    const { prompt } = await buildReviewPrompt({
+      target: epic,
+      tickets: [ticket],
+      diff: { files: ["src/app/page.tsx"], patch: "+ const Page = () => null;\n", truncated: false },
+      settings: settings({ reviewPrompt: "OPERATOR CONTRACT." }),
+      projectDir,
+      baseRev: BASE,
+    });
+
+    expect(prompt).toContain("- Rule A.");
+    expect(prompt).toContain("- Rule B.");
+    // Read once each: a cycle re-inlining a file would spend the rules budget on it forever.
+    expect(prompt.match(/### `docs\/a\.md`/g)).toHaveLength(1);
+    expect(prompt.match(/### `CLAUDE\.md`/g)).toHaveLength(1);
+    // Nothing outside the repo is inlined — the directives themselves are quoted, as CLAUDE.md's own
+    // content, but no block is opened for what they point at.
+    expect(prompt).not.toMatch(/### `[^`]*etc\/passwd`/);
+    expect(prompt).not.toMatch(/### `[^`]*escape\.md`/);
+    expect(prompt).not.toMatch(/### `[^`]*\.claude\/CLAUDE\.md`/);
+  });
+
+  it("does not read an `@` inside a code sample as an import", async () => {
+    commitFile("CLAUDE.md", "Install with `npm i @scope/pkg`:\n\n```sh\nnpm i @docs/rules.md\n```\n");
+    commitFile("docs/rules.md", "- A file the snippet only NAMES.\n");
+
+    const { prompt } = await buildReviewPrompt({
+      target: epic,
+      tickets: [ticket],
+      diff: { files: ["src/app/page.tsx"], patch: "+ const Page = () => null;\n", truncated: false },
+      settings: settings({ reviewPrompt: "OPERATOR CONTRACT." }),
+      projectDir,
+      baseRev: BASE,
+    });
+
+    expect(prompt).not.toContain("- A file the snippet only NAMES.");
   });
 
   it("inlines a deep scope's rules however many directories the diff spans", async () => {

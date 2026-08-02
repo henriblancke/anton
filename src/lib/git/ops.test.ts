@@ -1042,4 +1042,35 @@ suite("readWorktreeState / restoreWorktreeState (real git)", () => {
     expect(await readWorktreeState(repo)).toEqual(before);
     expect(existsSync(join(repo, "untracked.ts"))).toBe(false);
   });
+
+  it("propagates an OPERATIONAL symbolic-ref failure instead of recording a detached baseline", async () => {
+    // A swallowed failure here reads as "detached": the post-review read then succeeds, the
+    // fingerprint differs on `ref` alone, and the gate reverts — detaching a worktree nobody wrote
+    // to. Shim git so `symbolic-ref` exits 128 (git's unusable-repository status) while every other
+    // subcommand answers normally, which is exactly the case the old catch-all could not tell from
+    // exit 1.
+    const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+    const binDir = join(sandbox, "bin");
+    mkdirSync(binDir);
+    writeFileSync(
+      join(binDir, "git"),
+      `#!/usr/bin/env node
+const {spawnSync}=require('node:child_process');
+const a=process.argv.slice(2);
+if(a.includes('symbolic-ref')){process.stderr.write('fatal: not a git repository\\n');process.exit(128);}
+const r=spawnSync(${JSON.stringify(realGit)},a,{stdio:'inherit'});
+process.exit(r.status ?? 1);
+`,
+    );
+    chmodSync(join(binDir, "git"), 0o755);
+    const prevPath = process.env.PATH;
+    process.env.PATH = `${binDir}:${prevPath}`;
+    try {
+      // Named explicitly, so the shim delegating the other subcommands is part of what is proven:
+      // a rejection from `rev-parse` would mean the test never exercised the classification.
+      await expect(readWorktreeState(repo)).rejects.toThrow(/symbolic-ref/);
+    } finally {
+      process.env.PATH = prevPath;
+    }
+  });
 });

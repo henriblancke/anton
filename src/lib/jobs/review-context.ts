@@ -14,7 +14,7 @@ import { type Bead } from "../beads/bd";
 import { loadAgentPrompt, stripFrontmatter, USER_AGENTS_DIR } from "../claude/agent-prompt";
 import { loadSkill } from "../claude/prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
-import { listDirBlobsAtRev, readFileAtRev, type BranchDiff } from "../git/ops";
+import { listDirBlobsAtRev, readFileAtRev, resolveRepoPath, type BranchDiff } from "../git/ops";
 import { resolveReviewConfig, type ProjectSettings } from "../projects";
 import { labelValue } from "./review-fix-context";
 
@@ -47,6 +47,17 @@ const MAX_PRINCIPLES_CHARS = 8000;
  */
 const MAX_INSTRUCTIONS_CHARS = 8000;
 const MAX_INSTRUCTIONS_TOTAL_CHARS = 24000;
+
+/**
+ * The smallest slice worth spending on an instruction file, and the one bound the total may exceed.
+ *
+ * Under {@link rulesCaveat} a block that is all truncation marker and no rule is indistinguishable
+ * from a scope that states none, so a share that has fallen below this floor is rounded UP to it —
+ * the same trade `collectDeletions` makes with its own floor. The total is what gives way, because
+ * the alternative is a governing scope the reviewer cannot read a single rule of. Only a diff
+ * crossing well over a hundred instruction files reaches that point at all.
+ */
+const MIN_INSTRUCTION_SLICE_CHARS = 200;
 
 /** One reported problem with the run's diff, parsed from the reviewer's final message. */
 export interface ReviewFinding {
@@ -116,6 +127,13 @@ export interface ReviewRun {
 export interface InstructionFile {
   path: string;
   text: string;
+  /**
+   * Set when another instruction file pulled this one in with Claude's `@path` import syntax. The
+   * import carries the IMPORTER's authority and scope — a `docs/rules.md` imported by the root
+   * `CLAUDE.md` binds the whole repo, not just `docs/` — so the prompt names the importer rather
+   * than letting the path imply a scope of its own.
+   */
+  importedBy?: string;
 }
 
 /**
@@ -261,6 +279,10 @@ function instructionDirs(changedPaths: string[]): string[] {
  * EVERY governing directory is covered, not a bounded sample of them: git is asked once which of
  * them actually holds an instruction file, and only those are read. So a wide diff costs one extra
  * tree read rather than two probes per directory, and no scope goes unexamined just for being deep.
+ *
+ * What each file DELEGATES comes too ({@link expandImports}): a `CLAUDE.md` that is one `@path`
+ * line is a rulebook whose rules live elsewhere, and inlining the directive alone would leave them
+ * unread while the prompt claims the inlined text is the whole of them.
  */
 async function readInstructions(
   projectDir: string,
@@ -281,7 +303,94 @@ async function readInstructions(
       return text?.trim() ? { path, text: text.trim() } : undefined;
     }),
   );
-  return files.filter((f): f is InstructionFile => f !== undefined);
+  return expandImports(
+    projectDir,
+    baseRev,
+    files.filter((f): f is InstructionFile => f !== undefined),
+  );
+}
+
+/**
+ * An `@path` import — Claude's syntax for an instruction file that delegates its rules to another
+ * file (this repo's own `CLAUDE.md` opens with `@AGENTS.md`). Matched only at a token boundary, so
+ * an email address or an `@scope/package` mid-word is never mistaken for one.
+ */
+const IMPORT_TOKEN = /(?:^|\s)@([^\s`]+)/g;
+
+/** Import hops followed from an instruction file, matching Claude's own limit. Also the cycle bound. */
+const MAX_IMPORT_DEPTH = 5;
+
+/**
+ * The files an instruction file delegates its rules to, pulled in as rules in their own right.
+ *
+ * Without this the gate reads the literal `@AGENTS.md` directive and stops: a project whose real
+ * rulebook lives behind an import has it inlined nowhere, while {@link rulesCaveat} tells the
+ * reviewer the inlined text is the only thing grading the run — the same silent gap as an
+ * undiscovered nested scope, and the reason a diff violating those rules would pass.
+ *
+ * Bounded three ways, because the import graph is repo-controlled: {@link MAX_IMPORT_DEPTH} hops,
+ * a `seen` set so a cycle (or a file two scopes both import) is read once, and
+ * {@link resolveRepoPath}, which drops anything absolute or climbing above the repo root. A
+ * candidate that resolves to no blob at `baseRev` simply contributes nothing — that is what an
+ * `@mention` in prose looks like — while a read that FAILS propagates, exactly as in the caller.
+ *
+ * Imports follow their importer so the reviewer reads them in the order the rules were written.
+ */
+async function expandImports(
+  projectDir: string,
+  baseRev: string,
+  roots: InstructionFile[],
+): Promise<InstructionFile[]> {
+  const seen = new Set(roots.map((f) => f.path));
+  const expanded: InstructionFile[] = [];
+
+  for (const root of roots) {
+    expanded.push(root);
+    let frontier: InstructionFile[] = [root];
+    for (let depth = 0; depth < MAX_IMPORT_DEPTH && frontier.length > 0; depth++) {
+      const wanted: string[] = [];
+      for (const path of frontier.flatMap(importTargets)) {
+        if (seen.has(path)) continue;
+        seen.add(path);
+        wanted.push(path);
+      }
+      const read = await Promise.all(
+        wanted.map(async (path): Promise<InstructionFile | undefined> => {
+          const text = await readFileAtRev(projectDir, baseRev, path);
+          // An import inherits the ROOT's scope, not its immediate importer's: nesting is what a
+          // discovered file's own path means, and an imported one has no scope of its own.
+          return text?.trim() ? { path, text: text.trim(), importedBy: root.path } : undefined;
+        }),
+      );
+      frontier = read.filter((f): f is InstructionFile => f !== undefined);
+      expanded.push(...frontier);
+    }
+  }
+  return expanded;
+}
+
+/** The repo-relative paths one instruction file imports, in the order it states them. */
+function importTargets(file: InstructionFile): string[] {
+  const targets: string[] = [];
+  for (const [, raw] of withoutCode(file.text).matchAll(IMPORT_TOKEN)) {
+    // Trailing sentence punctuation belongs to the prose, not the path ("see @docs/rules.md.").
+    const target = raw.replace(/[.,;:!?)\]}'"]+$/, "");
+    // `~` is the operator's home directory, not a repo path — outside the base revision entirely,
+    // so there is nothing here that a run's own diff could not have written.
+    if (!target || target.startsWith("~")) continue;
+    const path = resolveRepoPath(file.path, target);
+    if (path) targets.push(path);
+  }
+  return targets;
+}
+
+/**
+ * The text with code fences and inline spans blanked out. Claude does not treat an `@path` inside
+ * code as an import, and neither does the gate: a rules file quoting `@scope/pkg` in an install
+ * snippet is documenting a command, not delegating its rules.
+ */
+function withoutCode(text: string): string {
+  return text.replace(/^```[\s\S]*?^```|^~~~[\s\S]*?^~~~|`[^`\n]*`/gm, " ");
 }
 
 /**
@@ -511,9 +620,11 @@ function rulesBlock(run: ReviewRun): string[] {
           `directory governs the changes under that directory, on top of the ones above it, and`,
           `where the two conflict the DEEPEST file wins: code under that directory following the`,
           `nested rule is correct, and reporting it against the rule it overrides is a false finding.`,
-          `They are inlined below (shallowest first) as of the revision this run branched from, and`,
-          `that text is what to judge adherence to — not the copies in the worktree, which this`,
-          `run's own diff may have rewritten.`,
+          `A file marked "imported by" another was pulled in through that file's \`@\` import: it`,
+          `states the importer's rules and binds the importer's scope, not the scope its own path`,
+          `sits in. They are inlined below (shallowest first) as of the revision this run branched`,
+          `from, and that text is what to judge adherence to — not the copies in the worktree, which`,
+          `this run's own diff may have rewritten.`,
           ``,
           ...rendered.blocks,
         ]
@@ -532,7 +643,9 @@ function rulesBlock(run: ReviewRun): string[] {
  * large root file could leave a deep scope as a bare truncation marker, which is the same silent
  * drop — the reviewer is told the inlined text is the only rulebook and has no `git` to recover the
  * rest with. A file shorter than its share hands the surplus to the ones after it, so the common
- * case (rules well inside the budget) still inlines every file whole.
+ * case (rules well inside the budget) still inlines every file whole. Each share covers the marker
+ * a cut appends and never falls below {@link MIN_INSTRUCTION_SLICE_CHARS}, so "some rules" is a
+ * guarantee at any file count rather than the property of a short enough list.
  *
  * Reports whether anything was cut rather than appending the note itself — the caller says it once
  * for both rulebooks (see {@link rulesBlock}).
@@ -542,12 +655,22 @@ function instructionBlocks(instructions: InstructionFile[]): { blocks: string[];
   let unrendered = instructions.length;
   let cut = false;
   const blocks = instructions.flatMap((f) => {
-    const share = Math.floor(remaining / unrendered);
+    // A cutting file pays for its own marker out of its share, rather than out of the budget the
+    // files after it are counting on. Charging the rendered length against a slice computed without
+    // it over-drains `remaining` by the marker's width per cut file, and the deficit compounds
+    // through the equal shares: a long enough list ends with scopes rendered as a bare
+    // `… [truncated]` — the very starvation the equal split exists to prevent, and unrecoverable,
+    // since the reviewer is told the inlined text is the only rulebook and has no `git`.
+    const share = Math.max(
+      MIN_INSTRUCTION_SLICE_CHARS,
+      Math.floor(remaining / unrendered) - TRUNCATION_MARKER.length,
+    );
     const text = truncate(f.text, Math.min(MAX_INSTRUCTIONS_CHARS, share));
     remaining = Math.max(0, remaining - text.length);
     unrendered -= 1;
     cut ||= text !== f.text.trim();
-    return [`### \`${f.path}\``, ``, text, ``];
+    const heading = f.importedBy ? `\`${f.path}\` — imported by \`${f.importedBy}\`` : `\`${f.path}\``;
+    return [`### ${heading}`, ``, text, ``];
   });
   return { blocks, cut };
 }
@@ -740,10 +863,16 @@ export async function buildFindingsFixPrompt(args: {
   return { prompt, appendSystemPrompt };
 }
 
+/**
+ * Appended to whatever survives a cut. Named because a SHARED budget has to pay for it out of the
+ * cutting file's own slice ({@link instructionBlocks}) — measuring it by hand would drift.
+ */
+const TRUNCATION_MARKER = "\n… [truncated]";
+
 function truncate(text: string, max: number): string {
   const trimmed = text.trim();
   if (trimmed.length <= max) return trimmed;
-  return `${trimmed.slice(0, max)}\n… [truncated]`;
+  return `${trimmed.slice(0, max)}${TRUNCATION_MARKER}`;
 }
 
 /** True iff `f` is a usable finding: a known severity and a note a fixer can act on. */

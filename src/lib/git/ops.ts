@@ -154,7 +154,7 @@ async function readBlobAtRev(
   // content at `rev` to trust, and a caller that drops the path is right where one that inlines
   // "../../etc/rules.md" as the rules is not.
   if (hops <= 0) return undefined;
-  const target = resolveSymlinkTarget(path, text);
+  const target = resolveRepoPath(path, text);
   return target ? readBlobAtRev(worktreePath, rev, target, hops - 1) : undefined;
 }
 
@@ -186,16 +186,19 @@ async function blobModeAtRev(
 }
 
 /**
- * Where a symlink at `linkPath` points, as a repo-relative path — or undefined when it leaves the
- * repository (an absolute target, or one climbing above the root). Resolved textually against the
- * link's own directory, because the answer must stay inside the tree `rev` names: following a link
- * out to the filesystem would read the machine anton happens to run on, not the reviewed revision.
+ * Where a path written INSIDE the repo — a symlink's target, a rules file's `@path` import — points,
+ * as a repo-relative path. Undefined when it leaves the repository: an absolute target, or one
+ * climbing above the root.
+ *
+ * Resolved textually against `fromPath`'s own directory, because the answer must stay inside the
+ * tree a `rev` names: following it out to the filesystem would read the machine anton happens to run
+ * on, not the revision being read.
  */
-function resolveSymlinkTarget(linkPath: string, target: string): string | undefined {
+export function resolveRepoPath(fromPath: string, target: string): string | undefined {
   const raw = target.trim();
   if (!raw || raw.startsWith("/")) return undefined;
   const resolved: string[] = [];
-  for (const segment of [...linkPath.split("/").slice(0, -1), ...raw.split("/")]) {
+  for (const segment of [...fromPath.split("/").slice(0, -1), ...raw.split("/")]) {
     if (segment === "" || segment === ".") continue;
     if (segment !== "..") {
       resolved.push(segment);
@@ -696,11 +699,30 @@ export async function readWorktreeState(worktreePath: string): Promise<WorktreeS
   const [head, status, ref] = await Promise.all([
     git(worktreePath, ["rev-parse", "HEAD"]),
     git(worktreePath, ["status", "--porcelain"]),
-    // Exits non-zero on a detached HEAD — there is no branch to record, which is itself a state
-    // worth distinguishing from being on one.
-    git(worktreePath, ["symbolic-ref", "--quiet", "HEAD"]).catch(() => ""),
+    symbolicHeadRef(worktreePath),
   ]);
   return { head, status, ...(ref ? { ref } : {}) };
+}
+
+/**
+ * The branch HEAD points at (`refs/heads/<branch>`), or `""` when HEAD is detached.
+ *
+ * Only git's "HEAD is not a symbolic ref" answer counts as detached: `symbolic-ref --quiet` prints
+ * nothing and exits 1 for that, while an unusable repository exits 128 and a timeout or a spawn
+ * failure carries no exit status at all. Reading those as "detached" writes a false baseline — the
+ * post-review read then succeeds, the fingerprint differs on `ref` alone, and the gate reverts a
+ * worktree nobody wrote to, detaching the run's branch on the way. Everything but exit 1 propagates
+ * so the run parks instead.
+ */
+async function symbolicHeadRef(worktreePath: string): Promise<string> {
+  try {
+    return await git(worktreePath, ["symbolic-ref", "--quiet", "HEAD"]);
+  } catch (e) {
+    // execFile reports a clean non-zero exit as a numeric `code`; a spawn error carries the string
+    // errno (`ENOENT`) and a timeout kills the process, leaving `code` null with a `signal` set.
+    if ((e as { code?: unknown } | null)?.code === 1) return "";
+    throw e;
+  }
 }
 
 /**
@@ -716,7 +738,9 @@ export async function restoreWorktreeState(
   worktreePath: string,
   state: WorktreeState,
 ): Promise<void> {
-  const current = await git(worktreePath, ["symbolic-ref", "--quiet", "HEAD"]).catch(() => "");
+  // Same classification as the read above: an operational failure here must not pass for a detached
+  // HEAD, or the restore skips the checkout that puts the run back on its branch.
+  const current = await symbolicHeadRef(worktreePath);
   if (current !== (state.ref ?? "")) {
     // Back onto the recorded branch first — a reset alone would re-pin the commit while leaving
     // HEAD on whatever branch the stray checkout created, so later commits still miss the PR.
