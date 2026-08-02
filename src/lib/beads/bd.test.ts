@@ -16,6 +16,7 @@ import {
   parseCookedFormula,
   runDoltSync,
   SYNC_STALL_MS,
+  unclaimableStatus,
   type Bead,
 } from "./bd";
 
@@ -456,6 +457,35 @@ describe("isMissingBeadError", () => {
     expect(isMissingBeadError(execError({ stderr: "Error: database not found" }))).toBe(false);
     expect(isMissingBeadError(execError({ stderr: 'schema "beads" not found' }))).toBe(false);
     expect(isMissingBeadError(new Error("bd: executable not found in $PATH"))).toBe(false);
+  });
+});
+
+describe("unclaimableStatus", () => {
+  // The distinction the epic-claim path acts on (anton-e5ix): a status refusal repeats identically
+  // forever (park now, name the status), everything else is worth a retry.
+  it("returns the status bd named, from stderr or from the message alone", () => {
+    expect(
+      unclaimableStatus(
+        execError({ stderr: "Error claiming anton-f5f3: issue not claimable: status blocked\n" }),
+      ),
+    ).toBe("blocked");
+    expect(unclaimableStatus(execError({ stderr: "issue not claimable: status closed" }))).toBe(
+      "closed",
+    );
+    expect(
+      unclaimableStatus(new Error("Command failed: bd\nissue not claimable: status in_progress")),
+    ).toBe("in_progress");
+  });
+
+  it("ignores failures a retry can clear, and an ownership conflict", () => {
+    // "already claimed by" is the take-over branch's business, not a status refusal — classifying it
+    // here would poison a run the owner re-read is written to explain.
+    expect(
+      unclaimableStatus(execError({ stderr: "Error claiming anton-f5f3: issue already claimed by bob" })),
+    ).toBeUndefined();
+    expect(unclaimableStatus(execError({ stderr: "Error 1105: database is locked" }))).toBeUndefined();
+    expect(unclaimableStatus(new Error("bd update --claim exceeded its 60000ms budget"))).toBeUndefined();
+    expect(unclaimableStatus(undefined)).toBeUndefined();
   });
 });
 
