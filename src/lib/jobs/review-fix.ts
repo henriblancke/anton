@@ -16,7 +16,7 @@
  * `stage:in-review` so a later sweep no longer treats the epic as in-review (never finalized twice).
  */
 import { existsSync } from "node:fs";
-import { beads, LABELS, type Bead } from "../beads/bd";
+import { beads, LABELS, type BatchOp, type Bead } from "../beads/bd";
 import { runClaude } from "../claude/driver";
 import { branchAheadOfRemote, commitAll, fetchOrigin, mergeIntoCurrent, pushBranch } from "../git/ops";
 import {
@@ -481,16 +481,19 @@ export async function finalizeMergedEpic(args: {
 }): Promise<void> {
   const { db, clock, repo, projectId, epic, children, branch } = args;
 
-  // 1. Close remaining open tickets, then the epic. Only drop the in-review stage once every close
-  //    has actually succeeded — a transient `bd close` failure (swallowed by `safe`) must leave the
-  //    label in place so the next review-fix sweep re-selects the epic (inReviewEpics) and retries,
-  //    rather than orphaning a still-open ticket/epic behind a run already marked done.
-  let allClosed = true;
-  for (const ticket of children) {
-    if (ticket.status !== "closed") allClosed = (await safe(() => beads.close(repo, ticket.id))) && allClosed;
-  }
-  if (epic.status !== "closed") allClosed = (await safe(() => beads.close(repo, epic.id))) && allClosed;
-  if (allClosed) await safe(() => beads.untag(repo, epic.id, [IN_REVIEW]));
+  // 1. Close the remaining open tickets and the target in ONE bd transaction (anton-aijz), children
+  //    first. All-or-nothing: a failure part-way leaves every bead exactly as it was, rather than a
+  //    half-closed unit no reader can interpret. Only drop the in-review stage once that
+  //    transaction lands — a transient failure (swallowed by `safe`) must leave the label in place
+  //    so the next review-fix sweep re-selects the epic (inReviewEpics) and retries, rather than
+  //    orphaning a still-open ticket/epic behind a run already marked done.
+  const stillOpen = new Map(
+    [...children, epic].filter((b) => b.status !== "closed").map((b) => [b.id, b]),
+  ); // by id: a leaf run target is its own ticket, so it can appear on both sides
+  const closed = await safe(() =>
+    beads.batch(repo, [...stillOpen.keys()].map((id): BatchOp => ({ op: "close", id }))),
+  );
+  if (closed) await safe(() => beads.untag(repo, epic.id, [IN_REVIEW]));
 
   // 2. Remove the merged branch and its worktree. If the worktree is already gone (the common case),
   //    removeWorktree still prunes and deletes the local branch off a synthetic descriptor.
