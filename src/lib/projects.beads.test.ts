@@ -7,8 +7,13 @@ import Database from "better-sqlite3";
 // Stub the beads config path so the threading is observable without a real bd/git repo (CI has
 // neither). We assert addProject hands configureBeadsForRepo the chosen prefix and surfaces its
 // hasBeads verdict on the returned project.
+// Partial: only the repo-touching call is stubbed. The module's constants (the formula-name rule
+// projects.ts validates against) must stay real, or the schema is built from an undefined pattern.
 const configureBeadsForRepo = vi.fn();
-vi.mock("./beads/config.mjs", () => ({ configureBeadsForRepo }));
+vi.mock("./beads/config.mjs", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./beads/config.mjs")>()),
+  configureBeadsForRepo,
+}));
 
 let workDir: string;
 let addProject: typeof import("./projects").addProject;

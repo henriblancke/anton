@@ -80,9 +80,9 @@ export interface ReviewGateResult {
   rounds: ReviewRound[];
   /**
    * Findings open at exit, each carrying its severity: the final review's — it is shown every
-   * advisory still open from earlier rounds and restates the ones that still apply — plus, when that
-   * review broke the protocol and so settled nothing, the earlier advisories (see
-   * {@link withCarried}).
+   * advisory still open from earlier rounds (and from an earlier `step:review`, via
+   * {@link ReviewGateArgs.carried}) and restates the ones that still apply — plus, when that review
+   * broke the protocol and so settled nothing, the earlier advisories (see {@link withCarried}).
    */
   unresolved: ReviewFinding[];
   /** Which reasoning contract reviewed: a named agent, the operator's prompt, or the shipped default. */
@@ -149,6 +149,17 @@ export interface ReviewGateArgs {
    * on an accumulator the caller owns instead of on the error.
    */
   rounds?: ReviewRound[];
+  /**
+   * Advisories an EARLIER `step:review` in the same run left open, seeded as this gate's round-0
+   * carry so its first review is shown them exactly as a second round would be.
+   *
+   * A formula may name `step:review` more than once (the floor constrains omission and order, never
+   * extension), and each step is its own gate: without this seam the second gate would start blind,
+   * and the caller's `unresolved` — which REPLACES, on the strength of the reviewer having been
+   * shown the open set — would silently drop every advisory the first gate reported. Seeded, the
+   * replacement stays honest: this gate's reviewer decides their fate against the diff as it stands.
+   */
+  carried?: ReviewFinding[];
   deps?: ReviewGateDeps;
 }
 
@@ -247,8 +258,12 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
   const baseRev = await mergeBase(worktreePath, baseBranch);
 
   let reviewer: ReviewerSource = { kind: "default" };
-  /** Advisories still open from earlier rounds — shown to the next review, which settles them. */
-  let carried: ReviewFinding[] = [];
+  /**
+   * Advisories still open from earlier rounds — shown to the next review, which settles them. Seeded
+   * from an earlier `step:review`'s open set when the formula runs more than one gate, so round 1
+   * here is handed what that gate left rather than starting blind (see {@link ReviewGateArgs.carried}).
+   */
+  let carried: ReviewFinding[] = args.carried ?? [];
 
   for (let round = 1; round <= config.maxRounds; round++) {
     await ctx.heartbeat();

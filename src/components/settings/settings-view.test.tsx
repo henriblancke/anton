@@ -244,3 +244,74 @@ describe("SettingsView self-review section (anton-of1m)", () => {
     expect(cap.value).toBe("1");
   });
 });
+
+describe("SettingsView pipeline variants (anton-aa3m)", () => {
+  it("shows the zero-config state: no variants, one pipeline for everything", () => {
+    renderView({});
+    expect(screen.getByText(/No variants — every run walks/)).toBeTruthy();
+  });
+
+  it("seeds the rows from the persisted map, in precedence order", () => {
+    renderView({
+      formulaVariants: [
+        { label: "risk:high", formula: "anton-run-risk-high" },
+        { label: "domain:docs", formula: "anton-run-docs" },
+      ],
+    });
+    expect((screen.getByLabelText("Variant 1 label") as HTMLInputElement).value).toBe("risk:high");
+    expect((screen.getByLabelText("Variant 2 formula") as HTMLInputElement).value).toBe(
+      "anton-run-docs",
+    );
+  });
+
+  it("PATCHes an added mapping on Save, dropping the half-filled row", () => {
+    const fetchMock = stubFetch();
+    renderView({});
+
+    fireEvent.click(screen.getByRole("button", { name: /add variant/i }));
+    fireEvent.change(screen.getByLabelText("Variant 1 label"), { target: { value: " risk:high " } });
+    fireEvent.change(screen.getByLabelText("Variant 1 formula"), {
+      target: { value: "anton-run-risk-high" },
+    });
+    // A second row the operator started and abandoned must not fail the save.
+    fireEvent.click(screen.getByRole("button", { name: /add variant/i }));
+    fireEvent.change(screen.getByLabelText("Variant 2 label"), { target: { value: "size:S" } });
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.formulaVariants).toEqual([
+      { label: "risk:high", formula: "anton-run-risk-high" },
+    ]);
+  });
+
+  it("reorders a mapping — the list's order is the precedence, so it must be editable", () => {
+    const fetchMock = stubFetch();
+    renderView({
+      formulaVariants: [
+        { label: "risk:high", formula: "heavy" },
+        { label: "size:S", formula: "light" },
+      ],
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Move variant 2 up" }));
+    expect((screen.getByLabelText("Variant 1 label") as HTMLInputElement).value).toBe("size:S");
+
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.formulaVariants).toEqual([
+      { label: "size:S", formula: "light" },
+      { label: "risk:high", formula: "heavy" },
+    ]);
+  });
+
+  it("removes a mapping, and an emptied list clears the map", () => {
+    const fetchMock = stubFetch();
+    renderView({ formulaVariants: [{ label: "risk:high", formula: "heavy" }] });
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove variant 1" }));
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.formulaVariants).toEqual([]);
+  });
+});

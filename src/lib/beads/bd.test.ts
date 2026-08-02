@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   beads,
+  buildCookArgs,
   buildPruneArgs,
   buildUpdateArgs,
   createDoltSync,
@@ -10,6 +13,7 @@ import {
   isMissingBeadError,
   isNotWiredOutput,
   LABELS,
+  parseCookedFormula,
   runDoltSync,
   SYNC_STALL_MS,
   type Bead,
@@ -1062,5 +1066,279 @@ describe("sync stall detection (anton-jfjw.3)", () => {
     const status = getSyncStatus(cwd, startedAt + SYNC_STALL_MS * 10);
     expect(status.state).toBe("synced");
     expect(status.stalledForMs).toBeNull();
+  });
+});
+
+// ── beads.cook: the formula seam (anton-brdg) ──
+
+/**
+ * Recorded verbatim from `bd cook <file> --mode=compile --json` on bd 1.1.2 against a six-step
+ * anton-run formula (one gate, one `needs` chain). Recorded rather than hand-written so the parser
+ * is pinned to bd's ACTUAL output — including the details a hand-written fixture would get wrong:
+ * bd sorts each step's keys alphabetically, echoes the absolute `source` path, and reports the
+ * formula's name under `formula` (not `name`).
+ */
+const COOK_COMPILE_JSON = JSON.stringify({
+  description: "anton's default run pipeline",
+  formula: "anton-run",
+  schema_version: 1,
+  source: "/repo/.beads/formulas/anton-run.formula.toml",
+  steps: [
+    { id: "implement", labels: ["step:implement"], title: "Implement {{target}}", type: "task" },
+    {
+      id: "verify",
+      labels: ["step:verify"],
+      needs: ["implement"],
+      title: "Verify {{target}}",
+      type: "task",
+    },
+    {
+      id: "review",
+      labels: ["step:review"],
+      needs: ["verify"],
+      title: "Self-review {{target}}",
+      type: "task",
+    },
+    {
+      id: "commit",
+      labels: ["step:commit"],
+      needs: ["review"],
+      title: "Commit {{target}}",
+      type: "task",
+    },
+    {
+      gate: { type: "human" },
+      id: "signoff",
+      needs: ["commit"],
+      title: "Human sign-off on {{target}}",
+      type: "task",
+    },
+    {
+      id: "pr",
+      labels: ["step:pr"],
+      needs: ["signoff"],
+      title: "Open the PR for {{target}}",
+      type: "task",
+    },
+  ],
+  type: "workflow",
+  vars: { target: { default: "TODO", description: "The run target bead" } },
+  version: 1,
+});
+
+/** The same formula recorded from `--mode=runtime --var target=anton-ev6d`: titles substituted. */
+const COOK_RUNTIME_JSON = COOK_COMPILE_JSON.replaceAll("{{target}}", "anton-ev6d");
+
+/** An exec that records what it was handed and replays a recorded cook. */
+function recordingExec(stdout: string) {
+  const calls: Array<{ cwd: string; args: string[] }> = [];
+  return {
+    calls,
+    exec: async (cwd: string, args: string[]) => {
+      calls.push({ cwd, args });
+      return stdout;
+    },
+  };
+}
+
+describe("buildCookArgs (anton-brdg)", () => {
+  it("cooks compile-time by default: --mode is explicit and --json is always on", () => {
+    expect(buildCookArgs(".beads/formulas/anton-run.formula.toml")).toEqual([
+      "cook",
+      ".beads/formulas/anton-run.formula.toml",
+      "--mode=compile",
+      "--json",
+    ]);
+  });
+
+  it("infers runtime mode from vars and passes each as --var k=v", () => {
+    expect(buildCookArgs("anton-run", { vars: { target: "anton-ev6d", run: "42" } })).toEqual([
+      "cook",
+      "anton-run",
+      "--mode=runtime",
+      "--var",
+      "target=anton-ev6d",
+      "--var",
+      "run=42",
+      "--json",
+    ]);
+  });
+
+  it("honours an explicit runtime mode with no vars (every var must then have a default)", () => {
+    expect(buildCookArgs("anton-run", { mode: "runtime" })).toEqual([
+      "cook",
+      "anton-run",
+      "--mode=runtime",
+      "--json",
+    ]);
+  });
+
+  it("passes a value containing '=' through untouched — bd splits on the FIRST '=' only", () => {
+    expect(buildCookArgs("anton-run", { vars: { flag: "a=b" } })).toContain("flag=a=b");
+  });
+
+  it("rejects compile mode with vars — bd substitutes anyway, so the argv would lie", () => {
+    expect(() => buildCookArgs("anton-run", { mode: "compile", vars: { target: "x" } })).toThrow(
+      /cannot be combined with vars/,
+    );
+  });
+
+  it("rejects a variable NAME containing '=' — it would silently set a different variable", () => {
+    expect(() => buildCookArgs("anton-run", { vars: { "a=b": "c" } })).toThrow(
+      /invalid variable name/,
+    );
+    expect(() => buildCookArgs("anton-run", { vars: { "": "c" } })).toThrow(/invalid variable name/);
+  });
+
+  it("never persists — cooking is a read, and --persist would materialise a proto bead", () => {
+    expect(buildCookArgs("anton-run", { vars: { target: "x" } })).not.toContain("--persist");
+  });
+});
+
+describe("beads.cook (anton-brdg)", () => {
+  it("spawns bd in the cwd it was GIVEN, never process.cwd()", async () => {
+    const { calls, exec } = recordingExec(COOK_COMPILE_JSON);
+    const cwd = "/repos/some-other-project";
+    expect(cwd).not.toBe(process.cwd()); // the fallback this test exists to rule out
+    await beads.cook(cwd, "anton-run", {}, exec);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].cwd).toBe(cwd);
+    expect(calls[0].cwd).not.toBe(process.cwd());
+  });
+
+  it("builds the expected argv and returns the typed pipeline in declaration order", async () => {
+    const { calls, exec } = recordingExec(COOK_COMPILE_JSON);
+    const cooked = await beads.cook("/repo", "anton-run", {}, exec);
+    expect(calls[0].args).toEqual(["cook", "anton-run", "--mode=compile", "--json"]);
+    expect(cooked.formula).toBe("anton-run");
+    expect(cooked.source).toBe("/repo/.beads/formulas/anton-run.formula.toml");
+    expect(cooked.steps.map((s) => s.id)).toEqual([
+      "implement",
+      "verify",
+      "review",
+      "commit",
+      "signoff",
+      "pr",
+    ]);
+  });
+
+  it("carries each step's type, labels, needs and gate — callers never parse bd stdout", async () => {
+    const { exec } = recordingExec(COOK_COMPILE_JSON);
+    const cooked = await beads.cook("/repo", "anton-run", {}, exec);
+    expect(cooked.steps[0]).toEqual({
+      id: "implement",
+      title: "Implement {{target}}",
+      type: "task",
+      labels: ["step:implement"],
+    });
+    // The DAG edge the floor validator (anton-6b99) orders steps by.
+    expect(cooked.steps[1].needs).toEqual(["implement"]);
+    // A gated step: the gate is reported, not resolved (gate verbs are anton-uk95's).
+    expect(cooked.steps[4].gate).toEqual({ type: "human" });
+    expect(cooked.steps[4].labels).toBeUndefined();
+  });
+
+  it("substitutes variables: a runtime cook returns steps with {{var}} resolved", async () => {
+    const { calls, exec } = recordingExec(COOK_RUNTIME_JSON);
+    const cooked = await beads.cook(
+      "/repo",
+      "anton-run",
+      { vars: { target: "anton-ev6d" } },
+      exec,
+    );
+    expect(calls[0].args).toEqual([
+      "cook",
+      "anton-run",
+      "--mode=runtime",
+      "--var",
+      "target=anton-ev6d",
+      "--json",
+    ]);
+    expect(cooked.steps.map((s) => s.title)).toEqual([
+      "Implement anton-ev6d",
+      "Verify anton-ev6d",
+      "Self-review anton-ev6d",
+      "Commit anton-ev6d",
+      "Human sign-off on anton-ev6d",
+      "Open the PR for anton-ev6d",
+    ]);
+    expect(JSON.stringify(cooked)).not.toContain("{{");
+  });
+
+  it("propagates bd's failure with its stderr intact — the park message reads it, not a rewrite", async () => {
+    await expect(
+      beads.cook("/repo", "anton-run", { mode: "runtime" }, async () => {
+        throw execError({ stderr: "Error: runtime mode requires all variables to have values\n" });
+      }),
+    ).rejects.toMatchObject({
+      stderr: expect.stringContaining("runtime mode requires all variables"),
+    });
+  });
+});
+
+describe("parseCookedFormula (anton-brdg)", () => {
+  it("fails loud when bd printed something that is not JSON", () => {
+    expect(() => parseCookedFormula("Error: no such formula\n", "anton-run")).toThrow(
+      /output was not JSON/,
+    );
+  });
+
+  it("fails loud on a cooked document with no steps array", () => {
+    expect(() => parseCookedFormula(JSON.stringify({ formula: "anton-run" }), "anton-run")).toThrow(
+      /no steps array/,
+    );
+    expect(() => parseCookedFormula(JSON.stringify([]), "anton-run")).toThrow(
+      /expected a formula object/,
+    );
+  });
+
+  it("fails loud on a step with no id — an unidentifiable step can't be dispatched or named", () => {
+    const doc = JSON.stringify({
+      formula: "anton-run",
+      steps: [{ id: "implement" }, { title: "nameless" }],
+    });
+    expect(() => parseCookedFormula(doc, "anton-run")).toThrow(/step 1 has no id/);
+  });
+
+  it("drops empty/malformed optional fields rather than surfacing them as empty values", () => {
+    const doc = JSON.stringify({
+      formula: "anton-run",
+      steps: [{ id: "implement", labels: [], needs: "not-an-array", gate: {} }],
+    });
+    expect(parseCookedFormula(doc, "anton-run").steps[0]).toEqual({ id: "implement" });
+  });
+
+  // bd accepts both spellings and cooks each through verbatim (pinned against a real bd in
+  // cook.integration.test.ts). Reading only `needs` would hand the walker a formula with no edges,
+  // so a `depends_on` pipeline would run in declaration order — or be rejected by the invariant
+  // floor for an ordering the file actually expressed.
+  it("normalises `depends_on` into `needs` — bd's other spelling of the same edge", () => {
+    const doc = JSON.stringify({
+      formula: "anton-run",
+      steps: [{ id: "commit", depends_on: ["implement"] }],
+    });
+    expect(parseCookedFormula(doc, "anton-run").steps[0]).toEqual({
+      id: "commit",
+      needs: ["implement"],
+    });
+  });
+
+  it("merges both spellings on one step, deduped — an edge declared twice is still one edge", () => {
+    const doc = JSON.stringify({
+      formula: "anton-run",
+      steps: [{ id: "pr", needs: ["commit", "review"], depends_on: ["commit", "verify"] }],
+    });
+    expect(parseCookedFormula(doc, "anton-run").steps[0].needs).toEqual([
+      "commit",
+      "review",
+      "verify",
+    ]);
+  });
+});
+
+describe("the bd seam takes cwd explicitly (anton-brdg)", () => {
+  it("bd.ts never calls process.cwd() — every verb is told which repo it acts on", () => {
+    const src = readFileSync(join(process.cwd(), "src/lib/beads/bd.ts"), "utf8");
+    expect(src).not.toContain("process.cwd()");
   });
 });

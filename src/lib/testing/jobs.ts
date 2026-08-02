@@ -1,5 +1,5 @@
 /**
- * Test-only: drive ONE job through a REAL `JobRunner`, end to end.
+ * Test-only: drive ONE job through a REAL `JobRunner`, end to end — and assert on how it settled.
  *
  * Every job suite — unit and integration — repeats the same five-line arrange block: build a
  * runner, register the one handler under test, enqueue, `tickOnce()`, `whenIdle()`. `driveJob`
@@ -10,7 +10,14 @@
  * `runner.test.ts` should not pay just to reach this helper.
  */
 import { expect } from "vitest";
-import type { AntonDb, Clock, JobType } from "@/lib/jobs/queue";
+import {
+  getJob,
+  type AntonDb,
+  type Clock,
+  type JobRow,
+  type JobStatus,
+  type JobType,
+} from "@/lib/jobs/queue";
 import { JobRunner, type JobHandler, type RunnerConfig } from "@/lib/jobs/runner";
 
 export interface DriveJobOptions {
@@ -40,6 +47,30 @@ export function makeJobRunner(
   const runner = new JobRunner({ db, clock, config: { maxConcurrent: 1, ...config } });
   runner.registerHandler(type, handler({ db, clock }));
   return runner;
+}
+
+/**
+ * Assert a driven job settled in `expected`, and return the row so a caller can go on asserting on
+ * it.
+ *
+ * The reason it exists rather than `expect((await getJob(db, id))?.status).toBe(...)`: these suites
+ * build the runner with no logger, so `noopLog` swallows the error the runner classified — and the
+ * bare assertion then reports only `expected 'queued' to be 'done'`, with the actual failure (which
+ * the row is holding in `lastError`) nowhere in the CI log. Attaching it costs nothing on the green
+ * path and turns a red one into a single look.
+ */
+export async function expectJobStatus(
+  db: AntonDb,
+  jobId: string,
+  expected: JobStatus,
+): Promise<JobRow> {
+  const job = await getJob(db, jobId);
+  expect(
+    job?.status,
+    `job ${jobId} settled "${job?.status ?? "missing"}" after ${job?.attempts ?? 0} attempt(s): ` +
+      `${job?.lastError ?? "no error recorded"}`,
+  ).toBe(expected);
+  return job as JobRow;
 }
 
 /**

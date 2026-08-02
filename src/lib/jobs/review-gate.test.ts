@@ -23,6 +23,7 @@ import type { ClaudeResult, RunClaudeOptions } from "../claude/driver";
 import type { BranchDiff, WorktreeState } from "../git/ops";
 import type { ProjectSettings } from "../projects";
 import { UsageLimitError, isPoisonError } from "./errors";
+import type { ReviewFinding } from "./review-context";
 import type { Clock } from "./queue";
 import {
   blockingFindings,
@@ -83,6 +84,12 @@ function report(score: number, findings: Array<{ severity: string; location: str
 
 const BLOCKING = { severity: "blocking", location: "src/a.ts:4", note: "the loop is unbounded" };
 const ADVISORY = { severity: "advisory", location: "src/a.ts:9", note: "the name could be clearer" };
+/** What an earlier `step:review` left open, as the caller seeds it into the next gate's carry. */
+const EARLIER_ADVISORY: ReviewFinding = {
+  severity: "advisory",
+  location: "src/b.ts:2",
+  note: "an earlier gate flagged this",
+};
 
 /**
  * A scripted claude: each reply is consumed in dispatch order. A string is a successful final
@@ -210,13 +217,17 @@ function unreadableAfterDispatch(inner: ReturnType<typeof fakeWorktree>, dispatc
   };
 }
 
-/** Run the gate against the fake driver. `commits` scripts each fix session's commit verdict. */
+/**
+ * Run the gate against the fake driver. `commits` scripts each fix session's commit verdict;
+ * `carried` seeds the open advisories an earlier `step:review` left, as execute-epic passes them.
+ */
 function gate(
   replies: ScriptedReply[],
   settings: ProjectSettings = {},
   commits: boolean[] = [],
   worktree = fakeWorktree(),
   assertLeaseHeld?: () => void,
+  carried?: ReviewFinding[],
 ): {
   result: Promise<ReviewGateResult>;
   calls: RunClaudeOptions[];
@@ -243,6 +254,7 @@ function gate(
     worktreePath: dir,
     baseBranch: "main",
     ...(assertLeaseHeld ? { assertLeaseHeld } : {}),
+    ...(carried ? { carried } : {}),
     deps: {
       runClaude: async (options) => {
         worktree.onDispatch();
@@ -325,8 +337,8 @@ describe("runReviewGate — convergence", () => {
     const { result, calls } = gate([report(4, [BLOCKING, ADVISORY]), "fixed the loop bound", report(9, [])]);
     const out = await result;
 
-    expect(calls[0].prompt).not.toContain("Advisories still open from an earlier round");
-    expect(calls[2].prompt).toContain("Advisories still open from an earlier round");
+    expect(calls[0].prompt).not.toContain("Advisories still open from an earlier review");
+    expect(calls[2].prompt).toContain("Advisories still open from an earlier review");
     expect(calls[2].prompt).toContain("src/a.ts:9 — the name could be clearer");
     expect(out.outcome).toBe("clean");
     expect(out.unresolved).toEqual([]);
@@ -339,6 +351,38 @@ describe("runReviewGate — convergence", () => {
     expect(out.unresolved).toEqual([
       { severity: "advisory", location: "src/a.ts:9", note: "the name could be clearer" },
     ]);
+  });
+
+  it("seeds the carry from an EARLIER review step, so this gate's first round is not blind", async () => {
+    // A formula may run `step:review` twice. Each step is its own gate, so without the seed the
+    // second reviewer never sees what the first left open — and the caller, which replaces its
+    // advisory set with each gate's verdict, would drop those findings before the PR body is built.
+    const { result, calls } = gate([report(9, [EARLIER_ADVISORY])], {}, [], fakeWorktree(), undefined, [
+      EARLIER_ADVISORY,
+    ]);
+    const out = await result;
+
+    expect(calls[0].prompt).toContain("Advisories still open from an earlier review");
+    expect(calls[0].prompt).toContain("src/b.ts:2 — an earlier gate flagged this");
+    // Restated once, not twice: this reviewer's report IS the whole open set.
+    expect(out.unresolved).toEqual([EARLIER_ADVISORY]);
+  });
+
+  it("settles an earlier STEP's advisory the same way a round's: by the next reviewer's silence", async () => {
+    const { result } = gate([report(9, [])], {}, [], fakeWorktree(), undefined, [EARLIER_ADVISORY]);
+
+    expect((await result).unresolved).toEqual([]);
+  });
+
+  it("keeps an earlier STEP's advisory when this gate's reviewer breaks the protocol", async () => {
+    // Silence settles nothing, so the finding the previous gate reported still needs a human.
+    const { result } = gate(["I had a look. Seems fine."], {}, [], fakeWorktree(), undefined, [
+      EARLIER_ADVISORY,
+    ]);
+    const out = await result;
+
+    expect(out.outcome).toBe("protocol-violation");
+    expect(out.unresolved).toEqual([EARLIER_ADVISORY]);
   });
 
   it("carries advisories through a round that ends on a protocol violation", async () => {
