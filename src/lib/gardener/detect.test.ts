@@ -11,7 +11,7 @@
  */
 import { describe, expect, it } from "vitest";
 
-import type { Bead } from "../beads/bd";
+import { LABELS, type Bead } from "../beads/bd";
 import type { HygieneFinding } from "../hygiene";
 import { detectBoard, type GardenerDetection } from "./detect";
 import { GARDENER_LABEL_PREFIX, concernedBeads } from "./detections";
@@ -108,6 +108,24 @@ describe("container orphans (the anton-do0q class)", () => {
     expect(only(detections).subjects).toEqual(["anton-lost"]);
   });
 
+  // A mid-run feature has already selected the tickets its run will work through, so a bead moved
+  // under it now would never be dispatched and would strand when the run settles the card. Rather
+  // than name it, the ask goes to the approver with no target — the same answer as an ambiguous home.
+  it("names no home when the container's only feature is mid-run", () => {
+    for (const busy of [{ labels: ["stage:in-review"] }, { labels: [LABELS.runLease(NOW + 60_000, "run-9")] }]) {
+      const detection = only(
+        detect([
+          epic("anton-cont"),
+          feature("anton-feat", { parent: "anton-cont", ...busy }),
+          feature("anton-shipped", { parent: "anton-cont", status: "closed" }),
+          bead("anton-lost", { parent: "anton-cont" }),
+        ]),
+      );
+      expect(detection.kind).toBe("container-orphan");
+      expect(detection.target).toBeUndefined();
+    }
+  });
+
   it("leaves work a run is already shipping alone", () => {
     expect(
       detect([
@@ -179,6 +197,18 @@ describe("parentless clusters", () => {
         ...homes,
         bead("anton-p1", { title: "Escalation docker retry" }),
         bead("anton-p2", { title: "Escalation docker banner" }),
+      ]),
+    ).toEqual([]);
+  });
+
+  // The card is a legal home on paper, but its run has already picked up its tickets: moving beads
+  // under it now would leave them undispatched beneath a card about to settle, which apply refuses.
+  it("says nothing when the only matching card is mid-run", () => {
+    expect(
+      detect([
+        feature("anton-esc", { title: "Escalation settle route", labels: ["stage:in-review"] }),
+        bead("anton-p1", { title: "Escalation panel copy" }),
+        bead("anton-p2", { title: "Escalation retry banner" }),
       ]),
     ).toEqual([]);
   });

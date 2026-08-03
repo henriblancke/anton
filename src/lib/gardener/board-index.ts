@@ -36,6 +36,14 @@ export interface BoardIndex {
    */
   hasBlocksEdge(a: string, b: string): boolean;
   /**
+   * Is `blockerId` recorded as a DIRECT blocker of `id`? Directed and direct, unlike both
+   * {@link hasBlocksEdge} (undirected) and {@link isBlockedBy} (transitive). Asked in the one place
+   * the direction decides the OUTCOME rather than safety: a proposal may only settle as "already
+   * recorded" against the edge it actually asked for — the reverse edge is a contradiction to hand
+   * back to a human, not the ask half-done.
+   */
+  recordsBlocker(id: string, blockerId: string): boolean;
+  /**
    * Is `id` already blocked by `blockerId`, directly or through any chain of `blocks` edges?
    * DIRECTED, unlike {@link hasBlocksEdge}, and asked in the one place direction decides safety:
    * recording "X blocks Y" when X is itself already waiting on Y closes a dependency cycle, and bd
@@ -100,6 +108,7 @@ export function indexBoard(all: Bead[]): BoardIndex {
       return found;
     },
     hasBlocksEdge: (a, b) => blocks.has(pairKey(a, b)),
+    recordsBlocker: (id, blockerId) => (blockers.get(id) ?? []).includes(blockerId),
     isBlockedBy: (id, blockerId) => {
       // Walks blocker-ward from `id`; `seen` also guards a graph that ALREADY holds a cycle (a merge
       // can leave one, see beads.depCycles), which must not spin this walk forever.

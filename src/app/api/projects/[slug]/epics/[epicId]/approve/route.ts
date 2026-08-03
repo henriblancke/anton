@@ -72,6 +72,12 @@ async function applyProposalResponse(
     nudgeSync({ id: project.id, repoPath: project.repoPath }, "approve");
     return NextResponse.json({ applied });
   } catch (err) {
+    // A failed apply is not an untouched board: `applyProposal` attaches the reason to the proposal
+    // as a note (and a partial move may have been rolled back), so it propagates like the success
+    // path — otherwise the explanation the operator is promised stays on this machine while their
+    // teammates see a proposal that silently never moved. The nudge coalesces per repo and dedupes
+    // its backstop job, so a failure that happened to write nothing costs a no-op push.
+    nudgeSync({ id: project.id, repoPath: project.repoPath }, "approve");
     if (err instanceof ProposalApplyError) {
       return NextResponse.json(
         { error: err.message, proposal: proposal.id },

@@ -110,6 +110,10 @@ function blockedBy(id: string, blocker: string, extra: Partial<Bead> = {}): Bead
   };
 }
 
+/** The `anton-a`/`anton-b` pair with ONE blocks edge between them: `from` waits on `to`. */
+const edged = (from: string, to: string): Bead[] =>
+  ["anton-a", "anton-b"].map((id) => (id === from ? blockedBy(id, to) : bead(id)));
+
 /**
  * A plan fingerprinted the way the emitter would fingerprint it — through the SAME key builder, not
  * a copy of it, because apply now recomputes that hash from the plan's own fields and a fixture with
@@ -281,17 +285,22 @@ describe("planApply — what an approval means against the board as it now is", 
     });
   });
 
-  it("settles a link whose edge already exists — in EITHER direction", () => {
-    const edged = (from: string, to: string): Bead[] => [
-      {
-        ...bead("anton-a"),
-        dependencies: [{ issue_id: from, depends_on_id: to, type: "blocks" }],
-      },
-      bead("anton-b"),
-    ];
-    // A reversed edge is somebody's recorded decision, never something to overwrite.
-    expect(planApply(LINK, edged("anton-a", "anton-b")).status).toBe("settled");
-    expect(planApply(LINK, edged("anton-b", "anton-a")).status).toBe("settled");
+  it("settles a link whose edge already runs the way the proposal states", () => {
+    expect(planApply(LINK, edged("anton-a", "anton-b"))).toEqual({
+      status: "settled",
+      summary: "a blocks edge already records anton-b → anton-a",
+    });
+  });
+
+  // The REVERSE edge is somebody's recorded decision that the ordering runs the other way — never
+  // something to overwrite, and never something to close this proposal over: settling would file a
+  // summary claiming an edge (`anton-b → anton-a`) the board does not hold.
+  it("refuses a link the board already records in the opposite direction", () => {
+    const decision = planApply(LINK, edged("anton-b", "anton-a"));
+    expect(decision).toMatchObject({ status: "refuse" });
+    expect(decision.status === "refuse" && decision.reason).toMatch(
+      /opposite ordering — anton-a blocks anton-b/,
+    );
   });
 
   // bd rejects a blocking cycle at every write path, so an edge that closes one can only ever be
@@ -366,6 +375,17 @@ describe("planApply — what an approval means against the board as it now is", 
       const container = bead("anton-card", { issue_type: "epic" });
       const board = [container, child("anton-f", container.id, { issue_type: "feature" }), bead("anton-a")];
       expect(refusal(planApply(REPARENT, board))).toMatch(/not a board card/);
+    });
+
+    // The home is written to as surely as the subject is, just indirectly: a run that has already
+    // selected its tickets would never dispatch the newcomers, and settles the card out from under
+    // them when it finishes.
+    it("refuses a home a run owns — the subjects would strand under a card about to settle", () => {
+      for (const live of [{ ...leased(CARD.id, NOW), issue_type: "feature" }, { ...inReview(CARD.id), issue_type: "feature" }]) {
+        expect(refusal(planApply(REPARENT, [live, bead("anton-a")], NOW))).toMatch(
+          /anton-card is mid-run .* hanging more work under it/,
+        );
+      }
     });
 
     it("refuses a re-parent that would make a subtree its own ancestor", () => {
@@ -484,6 +504,20 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
   // The snapshot is stale the instant it is taken, and a runner publishing a lease in that window is
   // exactly what the in-flight bar exists for — so the last word belongs to a read taken under the
   // subject's own write lock, the one a run's claim also queues on.
+  // Two Approve clicks on one proposal: the settled check ran against a snapshot taken before the
+  // first one landed, and a re-parent re-applies idempotently, so the loser gets all the way to the
+  // settlement. Closing an already-closed bead would 500 a request whose board is correct.
+  it("leaves a proposal a concurrent approve already closed alone", async () => {
+    const proposal = proposalFor(REPARENT);
+    liveBeads.set(proposal.id, { ...proposal, status: "closed" });
+
+    const result = await apply(proposal, [CARD, bead("anton-a"), proposal]);
+
+    expect(result.summary).toBe("re-parented anton-a under anton-card");
+    // The move still runs (it is idempotent); the settlement the winner already wrote is not redone.
+    expect(calls).toEqual(["reparent anton-a anton-card"]);
+  });
+
   it("refuses a subject a run claimed AFTER the snapshot, without writing to it", async () => {
     const proposal = proposalFor(DEFER);
     liveBeads.set("anton-a", leased("anton-a", Date.now()));

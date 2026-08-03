@@ -38,9 +38,13 @@ export function detectContainerOrphans(index: BoardIndex, nowMs: number): Garden
     if (!parent || !index.isContainer(parent)) continue;
 
     const features = index.childrenOf(parent.id).filter((c) => c.issue_type === "feature");
-    const open = features.filter(isOpenWork);
-    // One open feature is an unambiguous home; several (or none) leave the choice to the approver,
-    // who gets the candidate list as evidence rather than a coin-flip dressed up as a suggestion.
+    // A feature a run OWNS is not a home: that run already selected the tickets it will work through,
+    // so a bead attached now rides along unrun and is left beneath a card the run is about to settle.
+    // Apply refuses such a home for the same reason, so proposing one could only end in a refusal.
+    const open = features.filter((f) => isOpenWork(f) && !isInFlight(f, nowMs));
+    // One available feature is an unambiguous home; several (or none) leave the choice to the
+    // approver, who gets the candidate list as evidence rather than a coin-flip dressed up as a
+    // suggestion.
     const target = open.length === 1 ? open[0] : undefined;
 
     detections.push(
@@ -57,8 +61,8 @@ export function detectContainerOrphans(index: BoardIndex, nowMs: number): Garden
           `${bead.id} (${bead.issue_type ?? "bead"}, ${bead.status}) has no board-card ancestor — no run will dispatch it and the board shows it nowhere`,
           `nothing has shipped it: no PR ref and no live run lease`,
           open.length === 0
-            ? `${parent.id} has no OPEN feature to host it — the approver may need to shape one first`
-            : `open feature homes under ${parent.id}: ${idList(open)}`,
+            ? `${parent.id} has no feature free to host it — each is settled or mid-run, so the approver may need to shape one first`
+            : `available feature homes under ${parent.id}: ${idList(open)}`,
         ],
       }),
     );
@@ -149,7 +153,12 @@ export function topicKeys(bead: Bead): Set<string> {
  * dropped as ambiguous. A key half the board shares says nothing about where work belongs.
  */
 export function detectParentlessClusters(index: BoardIndex, nowMs: number): GardenerDetection[] {
-  const homes = index.all.filter((b) => index.cards.ids.has(b.id) && isOpenWork(b));
+  // Mid-run cards are not homes: their run has already chosen its tickets, so beads moved under one
+  // now would never be dispatched and would strand when the run settles the card (apply refuses one
+  // for the same reason).
+  const homes = index.all.filter(
+    (b) => index.cards.ids.has(b.id) && isOpenWork(b) && !isInFlight(b, nowMs),
+  );
   const homeKeys = new Map(homes.map((h) => [h.id, topicKeys(h)]));
 
   const keyOwners = new Map<string, number>();

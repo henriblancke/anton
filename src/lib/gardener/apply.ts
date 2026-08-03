@@ -119,6 +119,13 @@ function planReparent(plan: GardenerPlan, index: BoardIndex, nowMs: number): App
       reason: `${plan.target} is not a board card — re-parenting under it would leave the work riding no card, which is the state this proposal is about`,
     };
   }
+  // A home a run OWNS is off limits for the same reason a subject is, and the harm is worse: that run
+  // already selected the tickets it will work through, so work attached now rides along unrun — and
+  // when the run settles the card, the newcomers are left beneath a target nothing will claim, which
+  // is the unreachable state this proposal exists to fix.
+  if (isInFlight(target, nowMs)) {
+    return { status: "refuse", reason: inFlightReason(target, nowMs, "hanging more work under it") };
+  }
 
   const steps: ApplyStep[] = [];
   for (const id of plan.subjects) {
@@ -168,10 +175,20 @@ function planLink(plan: GardenerPlan, index: BoardIndex, nowMs: number): ApplyDe
   if (!blocked) return { status: "refuse", reason: missing(id) };
   if (!blocker) return { status: "refuse", reason: missing(plan.target) };
 
-  // The edge already exists (in either direction): the ordering is recorded, which is all the
-  // proposal asked for. A reversed edge is someone's explicit decision — never overwrite it.
-  if (index.hasBlocksEdge(id, plan.target)) {
+  // The edge the proposal asked for is already drawn: the ordering is recorded, so there is nothing
+  // to write and the ask is answered.
+  if (index.recordsBlocker(id, plan.target)) {
     return { status: "settled", summary: `a blocks edge already records ${plan.target} → ${id}` };
+  }
+  // The OPPOSITE edge is not this ask half-done — it is someone's explicit decision that the ordering
+  // runs the other way, made after this was filed. Settling on it would close the proposal claiming
+  // an edge the board does not hold, and writing ours would fight the human who drew theirs. Refuse,
+  // and let them re-decide against the contradiction.
+  if (index.hasBlocksEdge(id, plan.target)) {
+    return {
+      status: "refuse",
+      reason: `the board records the opposite ordering — ${id} blocks ${plan.target} — which is someone's explicit decision; recording ${plan.target} as ${id}'s blocker would contradict it`,
+    };
   }
   if (!isOpenWork(blocked)) {
     return {
@@ -387,9 +404,21 @@ export async function applyProposal(
   // The move landed (or was already true). Record what changed on the proposal itself and settle it
   // — a plain close, not an abandon: the ask was answered, and only a DECLINE suppresses the
   // fingerprint (see the module header).
+  //
+  // Under the PROPOSAL's own write lock, re-reading it inside: the already-settled check at the top
+  // judged the caller's snapshot, so two approvals of the same proposal can both reach here — a
+  // re-parent or a link re-applies idempotently, so neither trips the subject guard. Whoever loses
+  // the lock finds the proposal already closed and writes nothing, rather than closing a closed bead
+  // and answering 500 for a board that is correct.
   const summary = decision.summary;
-  await beads.note(repo, proposal.id, `${NOTE_PREFIX}: applied — ${summary}.`);
-  await beads.close(repo, proposal.id, `applied: ${summary}`);
+  await withBeadWriteLock(repo, proposal.id, async () => {
+    // A read that failed says nothing about whether the proposal settled, and the move HAS landed —
+    // so fall through and let a real write failure surface rather than leaving it silently open.
+    const live = await beads.show(repo, proposal.id).catch(() => undefined);
+    if (live && (live.status === "closed" || beads.isAbandoned(live))) return;
+    await beads.note(repo, proposal.id, `${NOTE_PREFIX}: applied — ${summary}.`);
+    await beads.close(repo, proposal.id, `applied: ${summary}`);
+  });
 
   return { proposalId: proposal.id, plan, summary, changed: changed.map((s) => s.id) };
 }
