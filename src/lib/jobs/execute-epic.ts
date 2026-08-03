@@ -2095,8 +2095,11 @@ class TicketTimeoutError extends Error {
   ) {
     super(
       `${ticketId} exceeded its ${Math.round(budgetMs / 60_000)}m ticket budget and was stopped. ` +
-        `Its partial work was rolled back and the ticket is blocked for review; the rest of the ` +
-        `run continued. Re-scope it (or raise ticketTimeoutMinutes), then resume.`,
+        (committed
+          ? `Its work IS committed on the branch (only its bead was left unfinished)`
+          : `Its partial work was rolled back`) +
+        ` and the ticket is blocked for review; the rest of the run continued. ` +
+        `Re-scope it (or raise ticketTimeoutMinutes), then resume.`,
     );
     this.name = "TicketTimeoutError";
   }
