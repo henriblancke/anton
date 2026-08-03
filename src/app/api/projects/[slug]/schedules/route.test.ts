@@ -1,8 +1,9 @@
 /**
  * Schedules route tests against a real in-memory anton.db: GET returns the project's real
- * schedule rows; PATCH flips schedules.enabled (clearing/reseeding nextRunAt so the scheduler
- * loop actually stops/starts enqueuing); a missing row is created explicitly (created: true),
- * not silently no-oped; bad input 400s and an unknown project 404s.
+ * schedule rows; PATCH edits cron and/or enabled (recomputing nextRunAt so the scheduler loop
+ * actually starts/stops enqueuing, on the new cadence, without a restart); a missing row is
+ * created explicitly (created: true) at the submitted cron, not silently no-oped; an invalid cron
+ * 400s leaving the row untouched, and an unknown project 404s.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
@@ -38,6 +39,10 @@ class FakeClock implements Clock {
   constructor(private t: number) {}
   now() {
     return this.t;
+  }
+  /** Advance a live scheduler's clock so one instance can span several ticks. */
+  set(t: number) {
+    this.t = t;
   }
 }
 
@@ -171,6 +176,105 @@ describe("schedules route", () => {
     const row = scheduleRow("review-fix");
     expect(row.enabled).toBe(false);
     expect(row.nextRunAt).toBeNull();
+  });
+
+  it("PATCH cron persists the new cadence and advances nextRunAt", async () => {
+    const before = scheduleRow("nightly-stringer");
+
+    const res = await PATCH(patchReq({ type: "nightly-stringer", cron: "*/30 * * * *" }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.created).toBe(false);
+    expect(body.schedule.cron).toBe("*/30 * * * *");
+    expect(body.schedule.enabled).toBe(true);
+    // The response carries the recomputed fire time, so the client renders it instead of guessing.
+    expect(body.schedule.nextRunAt).toBeGreaterThan(0);
+
+    const row = scheduleRow("nightly-stringer");
+    expect(row.cron).toBe("*/30 * * * *");
+    expect(row.nextRunAt!.getTime()).not.toBe(before.nextRunAt!.getTime());
+    expect(body.schedule.nextRunAt).toBe(Math.floor(row.nextRunAt!.getTime() / 1000));
+  });
+
+  it("PATCH cron + enabled applies both in one patch", async () => {
+    await PATCH(patchReq({ type: "nightly-stringer", enabled: false }), ctx("tmp"));
+
+    const res = await PATCH(
+      patchReq({ type: "nightly-stringer", cron: "5 4 * * *", enabled: true }),
+      ctx("tmp"),
+    );
+    expect(res.status).toBe(200);
+    const { schedule } = await res.json();
+    expect(schedule.cron).toBe("5 4 * * *");
+    expect(schedule.enabled).toBe(true);
+
+    const row = scheduleRow("nightly-stringer");
+    expect(row.cron).toBe("5 4 * * *");
+    expect(row.nextRunAt).not.toBeNull();
+  });
+
+  it("PATCH with an invalid cron 400s and leaves the row untouched", async () => {
+    const before = scheduleRow("nightly-stringer");
+
+    const res = await PATCH(patchReq({ type: "nightly-stringer", cron: "99 * * * *" }), ctx("tmp"));
+    expect(res.status).toBe(400);
+    // The message names the problem rather than just "invalid".
+    expect((await res.json()).error).toMatch(/99/);
+
+    const after = scheduleRow("nightly-stringer");
+    expect(after.cron).toBe(before.cron);
+    expect(after.nextRunAt!.getTime()).toBe(before.nextRunAt!.getTime());
+    expect(after.enabled).toBe(before.enabled);
+  });
+
+  it("PATCH with a non-string cron 400s", async () => {
+    const res = await PATCH(patchReq({ type: "nightly-stringer", cron: 15 }), ctx("tmp"));
+    expect(res.status).toBe(400);
+    expect(scheduleRow("nightly-stringer").cron).toBe("0 3 * * *");
+  });
+
+  it("PATCH with neither cron nor enabled 400s", async () => {
+    const res = await PATCH(patchReq({ type: "nightly-stringer" }), ctx("tmp"));
+    expect(res.status).toBe(400);
+  });
+
+  it("PATCH creates a missing row at the SUBMITTED cron, not the default", async () => {
+    await tdb.db.delete(schema.schedules).where(eq(schema.schedules.type, "review-fix"));
+
+    const res = await PATCH(patchReq({ type: "review-fix", cron: "*/45 * * * *" }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.created).toBe(true);
+    expect(body.schedule.cron).toBe("*/45 * * * *");
+    expect(scheduleRow("review-fix").cron).toBe("*/45 * * * *");
+  });
+
+  it("PATCH creating an opt-in type's row by cron alone leaves it opt-in", async () => {
+    await tdb.db.delete(schema.schedules).where(eq(schema.schedules.type, "gardener"));
+
+    const res = await PATCH(patchReq({ type: "gardener", cron: "0 6 * * *" }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    const row = scheduleRow("gardener");
+    expect(row.cron).toBe("0 6 * * *");
+    expect(row.enabled).toBe(false);
+    expect(row.nextRunAt).toBeNull();
+  });
+
+  it("the scheduler enqueues on the new cadence after a cron edit, without a restart", async () => {
+    // One instance, constructed BEFORE the edit and never restarted: it re-reads schedules per tick.
+    const clock = new FakeClock(0);
+    const scheduler = new Scheduler({ db: tdb.db, clock });
+
+    await PATCH(patchReq({ type: "nightly-stringer", cron: "*/5 * * * *" }), ctx("tmp"));
+    const row = scheduleRow("nightly-stringer");
+
+    clock.set(row.nextRunAt!.getTime() - 60_000);
+    await scheduler.tickOnce();
+    expect(jobs().filter((j) => j.type === "nightly-stringer")).toHaveLength(0);
+
+    clock.set(row.nextRunAt!.getTime());
+    await scheduler.tickOnce();
+    expect(jobs().filter((j) => j.type === "nightly-stringer")).toHaveLength(1);
   });
 
   it("PATCH with an unknown type 400s", async () => {
