@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import {
   DEFAULT_SCAN_SEVERITY_POLICY,
   SCAN_SEVERITIES,
+  annotateSignal,
   classOfSignal,
   formatScanSeverityPolicy,
   resolveScanSeverityPolicy,
@@ -129,5 +130,25 @@ describe("formatScanSeverityPolicy", () => {
     );
     expect(table).toContain("| low | risk:high | P0 |");
     expect(table).not.toContain("| low | risk:low | P3 |");
+  });
+});
+
+describe("annotateSignal", () => {
+  it("stamps the derived reading in place, so re-serializing the envelope carries it", () => {
+    const envelope = { signals: [signal({ Source: "vuln", Kind: "cve" })] };
+    const annotated = annotateSignal(envelope.signals[0]);
+
+    expect(annotated).toMatchObject({ AntonSeverity: "critical", AntonClass: "security" });
+    expect(envelope.signals[0]).toBe(annotated); // mutated, not copied
+    expect(JSON.parse(JSON.stringify(envelope)).signals[0].AntonSeverity).toBe("critical");
+  });
+
+  it("re-derives from stringer's own fields rather than echoing a previous annotation", () => {
+    // The annotation must not shadow `Severity`, which rankSignal reads first — a re-scan of an
+    // annotated file would otherwise keep answering with anton's last verdict.
+    const once = annotateSignal(signal({ Source: "todos", Kind: "todo" }));
+    expect(once.AntonSeverity).toBe("low");
+    once.Source = "vuln";
+    expect(annotateSignal(once).AntonSeverity).toBe("critical");
   });
 });

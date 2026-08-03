@@ -29,8 +29,8 @@ stringer scan file (JSON) passed as the argument.
   and often a suggested remediation.
 - **Read the board.** anton's nightly-stringer job appends a **`## Board context`** section to this
   prompt, after the scan-file line and the severity table — the open features with their touch
-  surfaces, the open epics with their tier verdict, and every producer fingerprint already on the
-  board, resolved from `bd` moments before this prompt. **When that section is present it IS this read**; use it in §2 (dedupe), §4
+  surfaces, **every epic (open and closed)** with its tier verdict, and every producer fingerprint
+  already on the board, resolved from `bd` moments before this prompt. **When that section is present it IS this read**; use it in §2 (dedupe), §4
   (placement), and `bd show <id>` anything you intend to write to before you write. When it is
   absent or marked UNAVAILABLE, do the read yourself: `bd list --json --limit 0` and `bd list
   --type epic --all --json --limit 0` — `--limit 0` is required, `bd list` defaults to 50 and a
@@ -64,16 +64,24 @@ the `<hash>` identifies the underlying issue, not the producer. So:
 
 ### 3.1 Severity → `risk:` and priority
 
-stringer's JSON carries no severity field, so anton derives one per signal — from the signal's
-`Priority` when a collector sets one, else its kind, else its collector's default (`vuln` →
-critical, `dephealth`/`githygiene` → medium, `todos`/`deadcode`/`duplication` → low, an unknown
-collector → medium). A secret or a CVE is then FLOORED at `critical` whatever emitted it and
-whatever `Priority` it carried: a collector's priority is a queueing hint, not a security
-judgment, and it never demotes one of these. That derivation is
+stringer's JSON carries no severity field, so anton derives one per signal and **stamps it onto the
+scan file**: every signal you read carries `AntonSeverity` (and `AntonClass`). **Take the severity
+from that field. Never re-derive one** from `Priority`/`Kind`/`Source` — the derivation has rules
+this prose does not restate (a merge-conflict marker floors to `high` however it was prioritized),
+so a re-derived label would contradict the trend the board charts for the same signal.
+
+For background, the derivation reads the signal's `Priority` when a collector sets one, else its
+kind, else its collector's default (`vuln` → critical, `dephealth`/`githygiene` → medium,
+`todos`/`deadcode`/`duplication` → low, an unknown collector → medium), and then FLOORS a secret or
+a CVE at `critical` whatever emitted it and whatever `Priority` it carried: a collector's priority
+is a queueing hint, not a security judgment, and it never demotes one of these. It lives in
 `src/lib/scan-severity.ts` — the same one the per-scan health record counts by, so the trend on the
 board and the labels on these beads mean the same thing.
 
-The severity you get is then labelled by this mapping:
+If a scan file predates the annotation and carries no `AntonSeverity`, fall back to the derivation
+above and say so in §6.
+
+`AntonSeverity` is then labelled by this mapping:
 
 | severity | label | priority |
 | --- | --- | --- |
@@ -175,21 +183,23 @@ falls off the roadmap — it advances no outcome anyone tracks. Triage usually r
 nightly cron, so there is nobody to ask mid-run: either place the feature, or surface it in §6 for
 the founder to place.
 
-1. **Look before you create.** `bd list --type epic --all --json --limit 0` — always `--all`, because
+1. **Look before you create.** The board-context epic section IS this read — it carries every epic,
+   open and closed. Only when it is absent, marked UNAVAILABLE, or reports epics omitted over its
+   cap do you run it yourself: `bd list --type epic --all --json --limit 0` — always `--all`, because
    the right home may already be closed and you can't judge that from a list that omits it; always
    `--limit 0`, because the default 50 would hide the matching epic and mint a duplicate.
    Match on `area:` first — the product surface the signal's files sit on — then on theme. Debt in the auth module belongs under whatever outcome already owns auth.
    Then confirm the match is **safe to attach to** — the board-context epic lines already carry that
-   verdict for every OPEN epic (`attach:feature` / `attach:no (PRE-TIER …)`); for a closed one, or
-   when the section is unavailable, derive it with `bd children <epic-id>`:
+   verdict (`attach:feature` / `attach:reopen-first` / `attach:no (PRE-TIER …)`); for an epic that
+   section omitted, or when it is unavailable, derive it with `bd children <epic-id>`:
    - **Pre-tier epic** (direct `task`/`bug`/`chore` children, no `feature` child): that epic is
      itself a run target, and the first feature you hang under it turns it into a container — its
      own tickets then ride on no run at all, and a run already approved or in flight on it is
      refused at its next gate. Don't attach. File the work per §4.3 and note under `needs-an-epic:`
      that the epic's legacy tickets need moving under a feature first; that migration is a human's
      call, not triage's.
-   - **Closed epic**: reopen it (`bd reopen <epic-id> --reason 'new work from stringer triage'`)
-     before linking. Attaching a feature does not reopen its parent, and a closed epic with open
+   - **Closed epic** (`attach:reopen-first` in the board context): reopen it
+     (`bd reopen <epic-id> --reason 'new work from stringer triage'`) before linking. Attaching a feature does not reopen its parent, and a closed epic with open
      features under it reads as a delivered outcome on the roadmap while its features sit in the
      backlog. If you can't justify reopening it, it isn't the right home.
 2. **Nothing fits, but you can name the outcome → create the epic.** State it as an outcome a

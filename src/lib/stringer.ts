@@ -9,9 +9,9 @@
  */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { readFile, mkdir } from "node:fs/promises";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
-import type { ScanSignal } from "./scan-severity";
+import { annotateSignal, type ScanSignal } from "./scan-severity";
 
 const execFileAsync = promisify(execFile);
 
@@ -114,7 +114,7 @@ function toScanError(err: unknown, opts: { timeoutMs: number }): unknown {
 }
 
 export interface ScanResult {
-  /** Absolute path to the JSON scan file written by stringer. */
+  /** Absolute path to the JSON scan file — stringer's, re-written with anton's severity annotation. */
   scanFile: string;
   /**
    * The signals stringer wrote (empty means nothing to triage). Carried rather than just counted:
@@ -210,11 +210,46 @@ export function extractSignals(parsed: unknown): ScanSignal[] {
 }
 
 /**
+ * Read the scan stringer just wrote, stamp anton's derived severity onto every signal, and write it
+ * back. Two guarantees ride on this one parse:
+ *
+ * - **Unreadable output is a failed scan, not a clean one.** stringer exits 0 having written the
+ *   `-o` file even for zero new signals, so a missing or truncated file is a process-boundary
+ *   failure. Reading it as "no signals" would skip triage, chart a zero-signal point, and end the
+ *   session `done` — the board would report a clean scan nobody could read. So it throws, and the
+ *   runner retries or parks the job.
+ * - **Triage labels the signal anton counted.** stringer emits no severity of its own; annotating
+ *   here means the agent reads anton's derivation off the file instead of re-deriving one from the
+ *   raw fields and drifting from the trend (see {@link annotateSignal}).
+ */
+async function readAnnotatedSignals(scanFile: string): Promise<ScanSignal[]> {
+  let parsed: unknown;
+  try {
+    const raw = await readFile(scanFile, "utf8");
+    if (!raw.trim()) throw new Error("the file is empty");
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `stringer exited 0 but its scan output at ${scanFile} is unreadable (${reason}) — ` +
+        `reading it as an empty scan would record a clean pass for a scan nobody read`,
+      { cause: err },
+    );
+  }
+
+  const signals = extractSignals(parsed);
+  for (const signal of signals) annotateSignal(signal);
+  await writeFile(scanFile, JSON.stringify(parsed), "utf8");
+  return signals;
+}
+
+/**
  * Run `stringer scan <repo> --delta --format json -o <scanFile>` and return the signals it produced,
  * plus any collector that died mid-scan (stringer exits 0 either way — see
  * `parseCollectorFailures`). `delta` (default true) restricts to new signals since the last scan.
- * Throws on a stringer failure (fail loud), so the job then retries/parks per the runner's policy --
- * a deadline kill throws a distinct "timed out" error rather than stringer's misleading partial stderr.
+ * Throws on a stringer failure OR on output it can't read (fail loud — see
+ * `readAnnotatedSignals`), so the job then retries/parks per the runner's policy; a deadline kill
+ * throws a distinct "timed out" error rather than stringer's misleading partial stderr.
  */
 export async function scan(opts: {
   repoPath: string;
@@ -248,17 +283,9 @@ export async function scan(opts: {
     throw toScanError(err, { timeoutMs });
   }
 
-  let signals: ScanSignal[] = [];
-  try {
-    const raw = await readFile(opts.scanFile, "utf8");
-    signals = extractSignals(JSON.parse(raw || "[]"));
-  } catch {
-    // No file / unparseable output means zero signals (nothing to triage).
-    signals = [];
-  }
   return {
     scanFile: opts.scanFile,
-    signals,
+    signals: await readAnnotatedSignals(opts.scanFile),
     collectorFailures: parseCollectorFailures(stderr),
   };
 }

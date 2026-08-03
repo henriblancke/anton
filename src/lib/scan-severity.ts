@@ -203,6 +203,36 @@ export function severityOfSignal(signal: ScanSignal): ScanSeverity {
   return floor ? worst(ranked, floor) : ranked;
 }
 
+/**
+ * A signal carrying anton's own reading of it, as the scan file hands it to /scan-triage. Written
+ * back into the scan file (lib/stringer) so the agent labels the signal anton COUNTED rather than
+ * re-deriving a severity from the raw fields: the rules above are not all restatable in a prompt —
+ * a `merge-conflict` kind at `Priority: 2` floors to `high` here — so an agent left to re-derive
+ * would label a bead `medium`/P2 for a signal the trend charts as high.
+ *
+ * Deliberately NOT stringer's own `Severity` key: {@link rankSignal} reads that first, so reusing it
+ * would make a re-scan of an annotated file echo anton's previous answer instead of stringer's input.
+ */
+export interface AnnotatedScanSignal extends ScanSignal {
+  AntonSeverity: ScanSeverity;
+  AntonClass: SignalClass;
+}
+
+/** The annotation keys, named once so stringer, the prompt, and the tests can't drift apart. */
+export const ANTON_SEVERITY_KEY = "AntonSeverity";
+export const ANTON_CLASS_KEY = "AntonClass";
+
+/**
+ * Stamp anton's derived reading onto a signal, IN PLACE — the caller re-serializes the envelope the
+ * signal sits inside, so a copy would leave the scan file unannotated.
+ */
+export function annotateSignal(signal: ScanSignal): AnnotatedScanSignal {
+  return Object.assign(signal, {
+    [ANTON_SEVERITY_KEY]: severityOfSignal(signal),
+    [ANTON_CLASS_KEY]: classOfSignal(signal),
+  }) as AnnotatedScanSignal;
+}
+
 /** What a bead triaged from a signal of some severity must carry. */
 export interface SeverityRule {
   /** The `risk:` label — bd's vocabulary is low|high (see the `bd` skill). */

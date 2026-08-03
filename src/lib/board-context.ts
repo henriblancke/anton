@@ -1,7 +1,7 @@
 /**
  * The board as /scan-triage needs to see it (anton-ol1l): which open features already own which
- * files, which epics can take a new feature, and every fingerprint an automated producer has
- * already put on the board.
+ * files, which epics — open or closed — can take a new feature, and every fingerprint an automated
+ * producer has already put on the board.
  *
  * Resolved here, in code, rather than left to the triage agent's own `bd` reads. A scan runs
  * unattended, so a board read the agent skips or truncates costs a duplicate bead nobody catches —
@@ -66,11 +66,13 @@ export interface FeatureCandidate extends TouchSurface {
   attachReason: string;
 }
 
-/** An open epic, with whether a new feature may hang under it (§4.1's pre-tier trap). */
+/** An epic, with whether a new feature may hang under it (§4.1's pre-tier trap). */
 export interface EpicCandidate {
   id: string;
   title: string;
   area?: string;
+  /** bd status — a CLOSED epic is still a candidate, but only after `bd reopen` (§4.1). */
+  status: string;
   /** False for a pre-tier epic — its own tickets would stop running the moment a feature lands. */
   attachable: boolean;
   attachReason: string;
@@ -213,6 +215,9 @@ function featureVerdict(bead: Bead, children: Bead[]): { attachable: boolean; re
  * pre-tier — refusing the one placement its next feature had, for work that cannot strand. A CLOSED
  * feature child still counts above: it proves the epic is a container, which is a claim about shape,
  * not about pending work.
+ *
+ * The epic's OWN status stays out of this — a closed epic is still a placement candidate; the
+ * `bd reopen` precondition rides on its rendered verdict ({@link epicVerdictLine}).
  */
 function epicVerdict(children: Bead[]): { attachable: boolean; reason: string } {
   const features = children.filter((c) => c.issue_type === "feature");
@@ -284,19 +289,27 @@ export function buildBoardContext(board: Bead[]): BoardContext {
       };
     });
 
-  const epics: EpicCandidate[] = open
-    .filter((b) => b.issue_type === "epic")
-    .map((b) => {
-      const verdict = epicVerdict(children.get(b.id) ?? []);
-      const area = (b.labels ?? []).find((l) => l.startsWith("area:"));
-      return {
-        id: b.id,
-        title: b.title,
-        ...(area ? { area } : {}),
-        attachable: verdict.attachable,
-        attachReason: verdict.reason,
-      };
-    });
+  // Epics span the WHOLE board, unlike every other section: §4.1's correct outcome for a signal is
+  // often an epic that is already CLOSED and needs reopening, and §1 declares this section to BE the
+  // `bd list --type epic --all` read. Omitting closed ones let unattended triage conclude no home
+  // exists and mint a duplicate outcome (or fall back to a parentless bead). Open ones lead, so the
+  // MAX_EPICS cap drops closed candidates first.
+  const allEpics = board.filter((b) => b.issue_type === "epic");
+  const epics: EpicCandidate[] = [
+    ...allEpics.filter((b) => OPEN_STATUSES.has(b.status)),
+    ...allEpics.filter((b) => !OPEN_STATUSES.has(b.status)),
+  ].map((b) => {
+    const verdict = epicVerdict(children.get(b.id) ?? []);
+    const area = (b.labels ?? []).find((l) => l.startsWith("area:"));
+    return {
+      id: b.id,
+      title: b.title,
+      ...(area ? { area } : {}),
+      status: b.status,
+      attachable: verdict.attachable,
+      attachReason: verdict.reason,
+    };
+  });
 
   const producers: ProducerBead[] = open
     .map((b) => ({ bead: b, fingerprints: fingerprintsOf(b) }))
@@ -337,8 +350,20 @@ function surface({ touches, touchesOmitted }: TouchSurface): string {
     : touches.join(", ");
 }
 
-function omissionLine(count: number, what: string): string[] {
-  return count > 0 ? [`- … and ${count} more ${what} (omitted — ask \`bd list\` for the rest)`] : [];
+function omissionLine(count: number, what: string, how = "`bd list`"): string[] {
+  return count > 0 ? [`- … and ${count} more ${what} (omitted — ask ${how} for the rest)`] : [];
+}
+
+/**
+ * An epic's line verdict. A closed epic reads `attach:reopen-first`, never a bare `attach:feature`:
+ * linking a feature does not reopen its parent, so a closed epic with open features under it reads
+ * as a delivered outcome on the roadmap while its work sits in the backlog (§4.1).
+ */
+function epicVerdictLine(epic: EpicCandidate): string {
+  if (!epic.attachable) return `attach:no (${epic.attachReason})`;
+  return OPEN_STATUSES.has(epic.status)
+    ? `attach:feature (${epic.attachReason})`
+    : `attach:reopen-first (${epic.status} — \`bd reopen ${epic.id}\` before linking; ${epic.attachReason})`;
 }
 
 /**
@@ -375,17 +400,23 @@ export function formatBoardContext(ctx: BoardContext): string {
 
   lines.push(
     "",
-    "### Open epics — where a genuinely unowned cluster hangs (§4.1)",
+    "### Epics — where a genuinely unowned cluster hangs (§4.1)",
+    "",
+    "Every epic on the board, **open and closed** — this IS the `bd list --type epic --all` read of",
+    "§4.1, so a closed outcome that already owns the surface is visible rather than looking like a",
+    "home that doesn't exist. `attach:reopen-first` means it fits but must be reopened before you",
+    "link. Open epics are listed first.",
     "",
   );
   if (ctx.epics.length === 0) {
-    lines.push("- (no open epics)");
+    lines.push("- (no epics on the board)");
   } else {
     for (const e of ctx.epics) {
-      const verdict = e.attachable ? `attach:feature (${e.attachReason})` : `attach:no (${e.attachReason})`;
-      lines.push(`- ${e.id} · ${verdict} · ${e.area ?? "no area:"} · ${e.title}`);
+      lines.push(`- ${e.id} · ${epicVerdictLine(e)} · ${e.area ?? "no area:"} · ${e.title}`);
     }
-    lines.push(...omissionLine(ctx.omitted.epics, "open epic(s)"));
+    lines.push(
+      ...omissionLine(ctx.omitted.epics, "epic(s)", "`bd list --type epic --all --json --limit 0`"),
+    );
   }
 
   lines.push(

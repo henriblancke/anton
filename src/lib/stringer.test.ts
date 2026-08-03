@@ -33,7 +33,7 @@ function writeScript(name: string, body: string[]): string {
  * Fake stringer: records argv (minus node/script) to argvDump, writes canned signals to the -o path,
  * and optionally echoes canned slog lines to stderr (how a dead collector announces itself).
  */
-function writeFakeStringer(argvDump: string, signals: unknown[], stderr = ""): string {
+function writeFakeStringer(argvDump: string, signals: unknown, stderr = ""): string {
   const path = join(dir, "fake-stringer");
   const body = [
     "#!/usr/bin/env node",
@@ -121,15 +121,61 @@ describe("scan", () => {
     expect(argvOf(argvDump)).not.toContain("--delta");
   });
 
-  it("reports zero signals when the scan file is missing or unparseable", async () => {
-    // Fake writes no -o file (drop the flag by not passing it) → scan() tolerates it as 0 signals.
-    const bin = join(dir, "noop-stringer");
-    writeFileSync(bin, "#!/usr/bin/env node\nprocess.exit(0);\n", "utf8");
-    chmodSync(bin, 0o755);
-    process.env[STRINGER_BIN_ENV] = bin;
+  // stringer writes the -o file even for a zero-signal delta scan, so unreadable output is a
+  // process-boundary failure — reading it as "no signals" would skip triage, chart a zero-signal
+  // point, and report a clean pass for a scan nobody read.
+  it("rejects a scan whose output is missing, empty, or truncated", async () => {
+    process.env[STRINGER_BIN_ENV] = writeScript("noop-stringer", ["process.exit(0);"]);
+    await expect(scan({ repoPath: "/repo", scanFile: join(dir, "missing.json") })).rejects.toThrow(
+      /scan output at .*missing\.json is unreadable/,
+    );
 
-    const result = await scan({ repoPath: "/repo", scanFile: join(dir, "missing.json") });
-    expect(result.signals).toHaveLength(0);
+    process.env[STRINGER_BIN_ENV] = writeScript("empty-stringer", [
+      "const fs = require('fs');",
+      "fs.writeFileSync(process.argv[process.argv.indexOf('-o') + 1], '  ');",
+    ]);
+    await expect(scan({ repoPath: "/repo", scanFile: join(dir, "empty.json") })).rejects.toThrow(
+      /unreadable \(the file is empty\)/,
+    );
+
+    process.env[STRINGER_BIN_ENV] = writeScript("truncated-stringer", [
+      "const fs = require('fs');",
+      `fs.writeFileSync(process.argv[process.argv.indexOf('-o') + 1], '{"signals":[{"Source":"vu');`,
+    ]);
+    await expect(
+      scan({ repoPath: "/repo", scanFile: join(dir, "truncated.json") }),
+    ).rejects.toThrow(/is unreadable/);
+  });
+
+  // The chart and the beads must label the same signal the same way (anton-bz1w): triage reads the
+  // severity off the file rather than re-deriving one from `Priority`, which would miss the floors.
+  it("stamps anton's derived severity and class onto every signal in the scan file", async () => {
+    const argvDump = join(dir, "argv.json");
+    const scanFile = join(dir, "scan.json");
+    process.env[STRINGER_BIN_ENV] = writeFakeStringer(argvDump, {
+      signals: [
+        { Source: "githygiene", Kind: "merge-conflict", Priority: 2 },
+        { Source: "todos", Kind: "todo", Priority: 3 },
+      ],
+      metadata: { total_count: 2 },
+    });
+
+    const result = await scan({ repoPath: "/repo", scanFile });
+
+    // `Priority: 2` alone reads as medium; the merge-conflict floor is what makes it high, and it is
+    // exactly the rule an agent re-deriving from the raw fields would miss.
+    expect(result.signals).toMatchObject([
+      { AntonSeverity: "high", AntonClass: "security" },
+      { AntonSeverity: "low", AntonClass: "debt" },
+    ]);
+
+    // Written back into the file triage actually reads — and the envelope survives the round-trip.
+    const written = JSON.parse(readFileSync(scanFile, "utf8")) as {
+      signals: { AntonSeverity: string }[];
+      metadata: { total_count: number };
+    };
+    expect(written.signals.map((s) => s.AntonSeverity)).toEqual(["high", "low"]);
+    expect(written.metadata.total_count).toBe(2);
   });
 
   it("reports a collector that died even though the scan exited 0 (anton-uspu)", async () => {

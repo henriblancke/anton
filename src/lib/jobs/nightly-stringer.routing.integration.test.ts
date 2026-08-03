@@ -248,6 +248,16 @@ process.exit(0);`,
     expect(prompt).toContain(`${stringerBeadId} · open · stringer:duplication:${SHARED_HASH}`);
     expect(prompt).toContain(`${gardenerBeadId} · open · gardener:duplicate:${SHARED_HASH}`);
 
+    // …and resolved each signal's severity INTO the file it hands over, so a bead's label and this
+    // pass's health point can't describe the same signal differently.
+    expect(prompt).toContain("do NOT re-derive one");
+    const scanFile = /scan file to triage is: (\S+)/.exec(prompt)![1];
+    const replayed = JSON.parse(readFileSync(scanFile, "utf8")) as {
+      signals: { AntonSeverity: string; AntonClass: string }[];
+    };
+    expect(replayed.signals.map((s) => s.AntonSeverity)).toEqual(["low", "low"]);
+    expect(replayed.signals.map((s) => s.AntonClass)).toEqual(["debt", "debt"]);
+
     const after = await board();
     // Two signals in, ONE bead out: the owned one landed, the already-raised one did not.
     expect(after.length).toBe(before.length + 1);

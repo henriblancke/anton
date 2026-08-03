@@ -227,6 +227,26 @@ describe("buildBoardContext — epic attach verdicts", () => {
     ]);
     expect(ctx.epics.map((e) => e.attachable)).toEqual([true, true]);
   });
+
+  // §4.1's correct outcome for a signal is often an epic that already shipped: hiding it lets an
+  // unattended triage conclude no home exists and mint a duplicate outcome.
+  it("offers CLOSED epics too, ranked after the open ones", () => {
+    const ctx = buildBoardContext([
+      bead({ id: "e-closed", issue_type: "epic", status: "closed", title: "Deps are current" }),
+      bead({ id: "e-open", issue_type: "epic" }),
+    ]);
+    expect(ctx.epics.map((e) => e.id)).toEqual(["e-open", "e-closed"]);
+    expect(ctx.epics[1]).toMatchObject({ status: "closed", attachable: true });
+  });
+
+  it("still refuses a closed epic that is pre-tier — reopening it would strand its open tickets", () => {
+    const ctx = buildBoardContext([
+      bead({ id: "e-1", issue_type: "epic", status: "closed" }),
+      childOf(bead({ id: "t-1", issue_type: "task" }), "e-1"),
+    ]);
+    expect(ctx.epics[0].attachable).toBe(false);
+    expect(ctx.epics[0].attachReason).toContain("PRE-TIER");
+  });
 });
 
 describe("buildBoardContext — cross-producer fingerprints", () => {
@@ -282,6 +302,18 @@ describe("formatBoardContext", () => {
     expect(out).toContain("g-1 · open · gardener:duplicate:8000d8e1");
   });
 
+  // A bare `attach:feature` on a closed epic would have triage link under it and leave a delivered
+  // outcome on the roadmap with backlog work beneath it — linking never reopens the parent.
+  it("marks a closed epic reopen-first, naming the command that makes it linkable", () => {
+    const out = formatBoardContext(
+      buildBoardContext([
+        bead({ id: "e-9", issue_type: "epic", status: "closed", title: "Deps are current" }),
+      ]),
+    );
+    expect(out).toContain("e-9 · attach:reopen-first (closed — `bd reopen e-9` before linking");
+    expect(out).toContain("open and closed");
+  });
+
   it("says what it dropped instead of truncating silently", () => {
     const board = Array.from({ length: MAX_FEATURES + 3 }, (_, i) =>
       bead({ id: `f-${i}`, issue_type: "feature", context: "touches: src/x.ts" }),
@@ -317,7 +349,7 @@ describe("formatBoardContext", () => {
   it("names the empty sections rather than rendering a blank the agent reads as noise", () => {
     const out = formatBoardContext(buildBoardContext([]));
     expect(out).toContain("(no open features)");
-    expect(out).toContain("(no open epics)");
+    expect(out).toContain("(no epics on the board)");
     expect(out).toContain("(no producer-filed beads open)");
   });
 
