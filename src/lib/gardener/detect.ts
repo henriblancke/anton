@@ -13,7 +13,12 @@
 import type { Bead } from "../beads/bd";
 import type { HygieneFinding } from "../hygiene";
 import { indexBoard } from "./board-index";
-import { dedupeDetections, sortDetections, type GardenerDetection } from "./detections";
+import {
+  dedupeDetections,
+  isProposalBead,
+  sortDetections,
+  type GardenerDetection,
+} from "./detections";
 import { detectImpliedOrdering } from "./relink";
 import { detectContainerOrphans, detectParentlessClusters } from "./reparent";
 import { detectRetirementCandidates } from "./retire";
@@ -34,7 +39,10 @@ export interface DetectInput {
  * caller answer "is this new?" without re-reading the board.
  */
 export function detectBoard(input: DetectInput): GardenerDetection[] {
-  const index = indexBoard(input.board);
+  // The gardener's own proposals are excluded from the shape it judges: they are beads ABOUT the
+  // board, and a parentless one would read as a cluster candidate — the patrol proposing to garden
+  // itself. They still reach emission, which needs them to recognise a claim it already made.
+  const index = indexBoard(input.board.filter((b) => !isProposalBead(b)));
   const now = input.now ?? Date.now();
   const findings = input.hygiene?.findings ?? [];
 

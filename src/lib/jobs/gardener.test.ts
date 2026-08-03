@@ -3,8 +3,9 @@
  * anton.db, with only `bd` and the sync nudge stubbed — they are the pass's whole outside world.
  *
  * Three properties carry this job, and each is a way it could silently do harm:
- *   • it writes ONLY the two safe verbs. A patrol that merged duplicates or "fixed" orphans would be
- *     making judgment calls nobody asked it to make (anton-bci0 "Out of scope").
+ *   • the only beads it MUTATES are the two safe verbs' (anton-bci0 "Out of scope"). A judgment call
+ *     — merging duplicates, retiring stale work, relinking orphans — is filed as a proposal bead for
+ *     a human (anton-9qwq), never applied.
  *   • the report is complete or absent. A partial report REPLACES what the board shows, so a verb
  *     that fails must fail the pass rather than persist a clean bill of health.
  *   • it pulls before reading and nudges after writing — and only after writing, so a clean board
@@ -36,6 +37,8 @@ const staleMock = vi.fn<(cwd: string, opts?: StaleOpts) => Promise<Bead[]>>();
 const orphansMock = vi.fn<(cwd: string) => Promise<OrphanBead[]>>();
 const cyclesMock = vi.fn<(cwd: string) => Promise<DepCycle[]>>();
 const duplicatesMock = vi.fn<(cwd: string) => Promise<DuplicateGroup[]>>();
+const listMock = vi.fn<(cwd: string, extra?: string[]) => Promise<Bead[]>>();
+const createMock = vi.fn<(cwd: string, opts: { title: string; labels?: string[] }) => Promise<string>>();
 
 /** Every bd verb the patrol calls, in call order — the evidence for "only the safe verbs write". */
 const calls: string[] = [];
@@ -62,6 +65,10 @@ vi.mock("../beads/bd", async () => {
       orphansList: trace("orphansList", (...a: [string]) => orphansMock(...a)),
       depCycles: trace("depCycles", (...a: [string]) => cyclesMock(...a)),
       duplicateGroups: trace("duplicateGroups", (...a: [string]) => duplicatesMock(...a)),
+      list: trace("list", (...a: [string, string[]?]) => listMock(...a)),
+      create: trace("create", (...a: [string, { title: string; labels?: string[] }]) =>
+        createMock(...a),
+      ),
     },
   };
 });
@@ -113,6 +120,8 @@ beforeEach(async () => {
   orphansMock.mockResolvedValue([]);
   cyclesMock.mockResolvedValue([]);
   duplicatesMock.mockResolvedValue([]);
+  listMock.mockResolvedValue([]);
+  createMock.mockImplementation(async () => "p-1");
 });
 
 afterEach(() => {
@@ -163,6 +172,7 @@ describe("gardener patrol", () => {
       "orphansList",
       "depCycles",
       "duplicateGroups",
+      "list", // the judgment tier's board read, last: it sees everything the pass already did
     ]);
     expect(epicCloseMock).toHaveBeenCalledWith(REPO, { apply: true });
     expect(staleMock).toHaveBeenCalledWith(REPO, { status: "open", days: STALE_OPEN_DAYS });
@@ -282,6 +292,59 @@ describe("gardener patrol", () => {
 
     expect((await getHygieneReportForJob(t.db, first))?.actions.closedEpics).toEqual(["e-1"]);
     expect((await getHygieneReport(t.db, projectId))?.jobId).toBe(second);
+  });
+
+  it("files a proposal for the judgment the report can only describe — and pushes it", async () => {
+    // An orphan is a report LINE bd owns; "close it, a commit shipped it" is a decision, so the
+    // patrol asks instead of acting.
+    orphansMock.mockResolvedValue([
+      { id: "t-4", title: "shipped", status: "open", latestCommit: "abc1234" },
+    ]);
+    listMock.mockResolvedValue([bead("t-4", { title: "shipped" })]);
+
+    const jobId = await runPatrol();
+    await expectJobStatus(t.db, jobId, "done");
+
+    expect(createMock).toHaveBeenCalledTimes(1);
+    const [, draft] = createMock.mock.calls[0];
+    expect(draft.title).toContain("t-4");
+    expect(draft.labels?.some((l) => l.startsWith("gardener:shipped-orphan:"))).toBe(true);
+    // t-4 itself is untouched — the proposal is the pass's only judgment-tier write.
+    expect(calls).toEqual([
+      "pull",
+      "epicCloseEligible",
+      "recomputeBlocked",
+      "lintReport",
+      "staleList",
+      "staleList",
+      "orphansList",
+      "depCycles",
+      "duplicateGroups",
+      "list",
+      "create",
+    ]);
+    expect(nudge).toHaveBeenCalledWith({ id: projectId, repoPath: REPO });
+  });
+
+  it("asks once: a fingerprint already on the board files nothing the next pass", async () => {
+    orphansMock.mockResolvedValue([
+      { id: "t-4", title: "shipped", status: "open", latestCommit: "abc1234" },
+    ]);
+    listMock.mockResolvedValue([bead("t-4", { title: "shipped" })]);
+    await runPatrol();
+
+    const [, draft] = createMock.mock.calls[0];
+    // The second patrol reads the board the first one wrote to.
+    listMock.mockResolvedValue([
+      bead("t-4", { title: "shipped" }),
+      bead("p-1", { title: draft.title, labels: draft.labels }),
+    ]);
+    createMock.mockClear();
+    nudge.mockClear();
+
+    await runPatrol();
+    expect(createMock).not.toHaveBeenCalled();
+    expect(nudge).not.toHaveBeenCalled();
   });
 
   it("parks without retrying when the project is gone", async () => {

@@ -135,6 +135,29 @@ export function gardenerFingerprint(kind: GardenerDetectionKind, subjectKey: str
   return `${GARDENER_LABEL_PREFIX}:${kind}:${hash}`;
 }
 
+/** The fingerprint label's exact shape, so an unrelated `gardener:`-ish label is never mistaken for one. */
+const FINGERPRINT_LABEL = new RegExp(
+  `^${GARDENER_LABEL_PREFIX}:[a-z-]+:[0-9a-f]{${FINGERPRINT_HASH_LENGTH}}$`,
+);
+
+/**
+ * The `gardener:<kind>:<hash>` label a bead carries, if any. Structurally typed rather than taking a
+ * `Bead`, so this module stays free of the bd seam — a fingerprint is a fact about labels.
+ */
+export function fingerprintLabelOf(bead: { labels?: string[] }): string | undefined {
+  return (bead.labels ?? []).find((l) => FINGERPRINT_LABEL.test(l));
+}
+
+/**
+ * Is this bead one of the gardener's own proposals (anton-9qwq)? Both tiers need the question and
+ * for opposite reasons: emission asks it to dedup, and detection asks it to EXCLUDE — a proposal is
+ * a bead about the board, not part of its shape, so left in the snapshot every parentless proposal
+ * would read as a cluster candidate and every forgotten one as a retirement candidate.
+ */
+export function isProposalBead(bead: { labels?: string[] }): boolean {
+  return fingerprintLabelOf(bead) !== undefined;
+}
+
 /**
  * Every bead a detection concerns — its subjects plus whatever it points at. This is the set the
  * emitter hangs `discovered-from` edges off (anton-9qwq), so a proposal is reachable from each bead

@@ -6,7 +6,7 @@
  * reimplementing epic-closure, staleness or duplicate detection over a board read: bd owns those
  * rules, and a second implementation here would drift from the one `bd ready` and the CLI answer to.
  *
- * Two tiers, in this order:
+ * Three tiers, in this order:
  *
  *   1. SAFE VERBS — the only two writes the patrol may make, both provably mechanical:
  *      `bd epic close-eligible` (an epic whose children are ALL closed is done by definition; bd
@@ -18,6 +18,11 @@
  *      REPORTED and nothing more. Merging duplicates, retiring stale work, relinking orphans are
  *      judgment moves that need a human (anton-bci0 "Out of scope"); the seam deliberately has no
  *      wrapper for `--auto-merge`/`--fix`, so one cannot leak in here either.
+ *   3. PROPOSALS (anton-9qwq) — the judgment tier. The board-shape claims the report has no verb for
+ *      (misfiled work, missing ordering edges, retirement candidates) become approvable proposal
+ *      beads, deduplicated by fingerprint so a nightly patrol over an unfixed board asks once. This
+ *      tier only ever CREATES proposals: applying one is an approval away (anton-1t3n), so nothing
+ *      here touches the beads a proposal is about.
  *
  * The board is PULLED first and NUDGED after — the patrol reads the shared board and writes to it,
  * so it must not act on a working set that is a sync heartbeat behind (an epic whose child another
@@ -32,6 +37,8 @@
  */
 import { beads, type DuplicateGroup } from "../beads/bd";
 import { nudgeSync, type NudgeTarget } from "../beads/sync-nudge";
+import { detectBoard } from "../gardener/detect";
+import { emitProposals, MAX_PROPOSALS_PER_PASS } from "../gardener/emit";
 import {
   completeHygieneReport,
   startHygieneReport,
@@ -250,5 +257,34 @@ export function makeGardenerHandler(deps: GardenerDeps): JobHandler {
     await completeHygieneReport(db, clock, reportId, findings);
 
     console.log(`[gardener] ${projectId}: ${summarizeReport({ actions, findings })}`);
+
+    // ── tier 3: proposals (anton-9qwq) ──
+    //
+    // After the report is published, so a failure filing proposals costs the pass its judgment tier
+    // and not its findings. The board read is `--status all` for two reasons: detection reads
+    // container-ness and superseding twins off the whole graph, and a DECLINED proposal is a closed
+    // bead — a live-only read would miss it and re-ask a question a human already answered.
+    ctx.signal.throwIfAborted();
+    const board = await beads.list(repo, ["--status", "all"]);
+    const detections = detectBoard({ board, hygiene: { findings }, now: clock.now() });
+    await ctx.heartbeat();
+    const emission = await emitProposals(repo, { board, detections });
+
+    if (emission.created.length > 0) {
+      console.log(
+        `[gardener] ${projectId}: filed ${emission.created.length} proposal(s) ` +
+          `(${emission.created.map((p) => p.id).join(", ")})` +
+          `${emission.suppressed > 0 ? `, ${emission.suppressed} already on the board` : ""}`,
+      );
+      nudge({ id: project.id, repoPath: repo });
+    }
+    // Never a silent cap: the overflow is deterministic and the next pass files it, but a reader has
+    // to be able to tell "the board is this clean" from "we stopped at ten".
+    if (emission.deferred > 0) {
+      console.log(
+        `[gardener] ${projectId}: held back ${emission.deferred} proposal(s) — one pass files at ` +
+          `most ${MAX_PROPOSALS_PER_PASS}; the next patrol picks them up`,
+      );
+    }
   };
 }
