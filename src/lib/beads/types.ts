@@ -29,7 +29,22 @@ export interface Bead {
   parent_id?: string;
   dependencies?: BeadDep[]; // edges carried inline by `bd list --json`
   dependency_type?: string; // set on beads returned by `bd dep list`
+  /** Only ever populated by a read that ASKED for them — see `beads.showWithComments`. */
+  comments?: BeadComment[];
   [k: string]: unknown;
+}
+
+/**
+ * One entry of a bead's append-only comment thread. Distinct from the `notes` blob: comments are
+ * individually timestamped and never edited, which is why the per-round review scores live here
+ * (see lib/jobs/review-score.ts) and why the review report can be replayed off the board.
+ */
+export interface BeadComment {
+  id?: string;
+  issue_id?: string;
+  author?: string;
+  text: string;
+  created_at?: string;
 }
 
 export interface BeadDep {

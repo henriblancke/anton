@@ -12,6 +12,8 @@ let getProjectBySlug: typeof import("./projects").getProjectBySlug;
 let resolveVerifyGates: typeof import("./projects").resolveVerifyGates;
 let resolveReviewConfig: typeof import("./projects").resolveReviewConfig;
 let DEFAULT_REVIEW_MAX_ROUNDS: typeof import("./projects").DEFAULT_REVIEW_MAX_ROUNDS;
+let DEFAULT_REVIEW_MIN_SCORE: typeof import("./projects").DEFAULT_REVIEW_MIN_SCORE;
+let DEFAULT_REVIEW_LOW_SCORE_ROUNDS: typeof import("./projects").DEFAULT_REVIEW_LOW_SCORE_ROUNDS;
 let budgetPolicySchema: typeof import("./projects").budgetPolicySchema;
 let resolveProjectBudgetPolicy: typeof import("./projects").resolveProjectBudgetPolicy;
 let resolveBudgetPolicy: typeof import("./projects").resolveBudgetPolicy;
@@ -39,6 +41,8 @@ beforeAll(async () => {
   resolveVerifyGates = mod.resolveVerifyGates;
   resolveReviewConfig = mod.resolveReviewConfig;
   DEFAULT_REVIEW_MAX_ROUNDS = mod.DEFAULT_REVIEW_MAX_ROUNDS;
+  DEFAULT_REVIEW_MIN_SCORE = mod.DEFAULT_REVIEW_MIN_SCORE;
+  DEFAULT_REVIEW_LOW_SCORE_ROUNDS = mod.DEFAULT_REVIEW_LOW_SCORE_ROUNDS;
   budgetPolicySchema = mod.budgetPolicySchema;
   resolveProjectBudgetPolicy = mod.resolveProjectBudgetPolicy;
   resolveBudgetPolicy = mod.resolveBudgetPolicy;
@@ -163,12 +167,16 @@ describe("resolveVerifyGates (anton-3oh8)", () => {
 });
 
 describe("resolveReviewConfig (anton-of1m)", () => {
-  it("is ON with the default round cap when nothing is configured", () => {
+  it("is ON with the default round cap and score alarm when nothing is configured", () => {
     expect(resolveReviewConfig({})).toEqual({
       enabled: true,
       agent: undefined,
       prompt: undefined,
       maxRounds: DEFAULT_REVIEW_MAX_ROUNDS,
+      scoreAlarm: {
+        minScore: DEFAULT_REVIEW_MIN_SCORE,
+        rounds: DEFAULT_REVIEW_LOW_SCORE_ROUNDS,
+      },
     });
   });
 
@@ -183,7 +191,7 @@ describe("resolveReviewConfig (anton-of1m)", () => {
         reviewPrompt: "Only data loss.",
         reviewMaxRounds: 4,
       }),
-    ).toEqual({
+    ).toMatchObject({
       enabled: true,
       agent: "my-reviewer",
       prompt: "Only data loss.",
@@ -195,6 +203,19 @@ describe("resolveReviewConfig (anton-of1m)", () => {
     const resolved = resolveReviewConfig({ reviewAgent: "", reviewPrompt: "" });
     expect(resolved.agent).toBeUndefined();
     expect(resolved.prompt).toBeUndefined();
+  });
+
+  it("carries the operator's score-alarm thresholds (anton-i98r)", () => {
+    expect(resolveReviewConfig({ reviewMinScore: 7, reviewLowScoreRounds: 3 }).scoreAlarm).toEqual({
+      minScore: 7,
+      rounds: 3,
+    });
+  });
+
+  it("resolves a minimum score of 0 to NO alarm — that is the operator's off switch", () => {
+    expect(resolveReviewConfig({ reviewMinScore: 0 }).scoreAlarm).toBeUndefined();
+    // The streak length is still stored; turning the alarm back on must restore it, not reset it.
+    expect(resolveReviewConfig({ reviewMinScore: 0, reviewLowScoreRounds: 4 }).scoreAlarm).toBeUndefined();
   });
 });
 

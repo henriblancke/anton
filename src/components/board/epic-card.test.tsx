@@ -111,3 +111,39 @@ describe("EpicCard contract marking", () => {
     expect(html).not.toContain('disabled=""');
   });
 });
+
+describe("EpicCard review score (anton-tprv)", () => {
+  it("shows the target's latest score, tinted by what the band means", () => {
+    const shipped = renderToStaticMarkup(
+      <EpicCard slug="anton" epic={makeEpic({ reviewScore: 9 })} />,
+    );
+    expect(shipped).toContain("review 9/10");
+    expect(shipped).toContain("ships as-is");
+
+    const rework = renderToStaticMarkup(
+      <EpicCard slug="anton" epic={makeEpic({ reviewScore: 3 })} />,
+    );
+    expect(rework).toContain("review 3/10");
+    expect(rework).toContain("substantial rework");
+  });
+
+  it("carries the score onto a done card — the last word on what the run delivered", () => {
+    const html = renderToStaticMarkup(
+      <EpicCard slug="anton" epic={makeEpic({ stage: "done", reviewScore: 7 })} />,
+    );
+    expect(html).toContain("review 7/10");
+  });
+
+  it("shows nothing for a target no review has scored", () => {
+    const html = renderToStaticMarkup(<EpicCard slug="anton" epic={makeEpic()} />);
+    expect(html).not.toMatch(/review \d/);
+    expect(html).not.toContain("0/10");
+  });
+
+  it("still renders a genuine zero — a run CAN score nothing usable", () => {
+    const html = renderToStaticMarkup(
+      <EpicCard slug="anton" epic={makeEpic({ reviewScore: 0 })} />,
+    );
+    expect(html).toContain("review 0/10");
+  });
+});

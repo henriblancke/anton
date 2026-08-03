@@ -197,3 +197,17 @@ describe("StandaloneGroup", () => {
     expect(renderToStaticMarkup(<StandaloneGroup slug="anton" items={[]} />)).toBe("");
   });
 });
+
+describe("StandaloneChip review score (anton-tprv)", () => {
+  it("shows a scored standalone target's latest score", () => {
+    const html = renderToStaticMarkup(
+      <StandaloneChip slug="anton" item={makeItem({ stage: "done", reviewScore: 6 })} />,
+    );
+    expect(html).toContain("review 6/10");
+  });
+
+  it("shows nothing for one no review has scored", () => {
+    const html = renderToStaticMarkup(<StandaloneChip slug="anton" item={makeItem()} />);
+    expect(html).not.toMatch(/review \d/);
+  });
+});

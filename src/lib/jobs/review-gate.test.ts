@@ -504,6 +504,94 @@ describe("runReviewGate — bounds", () => {
   });
 });
 
+/**
+ * The score-regression alarm (anton-i98r): the loop stops grinding when the reviewer keeps scoring
+ * the run low, and hands the founder the series instead of another fix round.
+ */
+describe("runReviewGate — the score-regression alarm", () => {
+  /** minScore 5 / K 2, with room to spare on the round cap so "stops EARLY" is observable. */
+  const ALARM = { reviewMinScore: 5, reviewLowScoreRounds: 2, reviewMaxRounds: 4 };
+
+  it("stops the loop on K consecutive low rounds, carrying the streak as evidence", async () => {
+    const low = report(3, [BLOCKING]);
+    const { result, calls, commitMessages } = gate([low, "tried", low, "tried again", low], ALARM);
+    const out = await result;
+
+    expect(out.outcome).toBe("score-regression");
+    expect(out.regression).toEqual({ streak: [3, 3], minScore: 5 });
+    expect(out.score).toBe(3);
+    expect(out.rounds).toHaveLength(2);
+    // Early: the cap allowed four rounds, and the second review ends it — no third fix is dispatched.
+    expect(calls).toHaveLength(3); // review → fix → review
+    expect(commitMessages).toHaveLength(1);
+  });
+
+  it("resets on recovery — a round at or above the minimum zeroes the streak", async () => {
+    // 3 → 8 → 3 → clean. Without the reset the third round's 3 would complete a [3, 3] streak and
+    // park a run that had already shown it could recover.
+    const { result } = gate(
+      [report(3, [BLOCKING]), "fixed", report(8, [BLOCKING]), "fixed", report(3, [BLOCKING]), "fixed", report(9, [])],
+      { ...ALARM, reviewMaxRounds: 5 },
+    );
+    const out = await result;
+
+    expect(out.outcome).toBe("clean");
+    expect(out.regression).toBeUndefined();
+    expect(out.rounds.map((r) => r.score)).toEqual([3, 8, 3, 9]);
+  });
+
+  it("never fires on an advisory-only round ABOVE the threshold, even at K=1", async () => {
+    const { result } = gate([report(6, [ADVISORY])], { ...ALARM, reviewLowScoreRounds: 1 });
+    const out = await result;
+
+    expect(out.outcome).toBe("clean");
+    expect(out.regression).toBeUndefined();
+  });
+
+  it("parks a low-scoring round that blocks NOTHING — a 3/10 is not a merge-ready PR", async () => {
+    // The alarm outranks the clean exit: the reviewer cleared the blocking finding but still says
+    // the work is a 3, twice running. That verdict must not reach the founder wearing a PR.
+    const { result } = gate([report(3, [BLOCKING]), "fixed", report(3, [ADVISORY])], ALARM);
+    const out = await result;
+
+    expect(out.outcome).toBe("score-regression");
+    expect(out.regression).toEqual({ streak: [3, 3], minScore: 5 });
+    expect(blockingFindings(out.unresolved)).toEqual([]);
+    // The advisory still rides out on `unresolved`, so the park note can record it.
+    expect(out.unresolved).toHaveLength(1);
+  });
+
+  it("honors K=1 — a single low round parks before any fix is dispatched", async () => {
+    const { result, calls, commitMessages } = gate([report(3, [BLOCKING])], {
+      ...ALARM,
+      reviewLowScoreRounds: 1,
+    });
+    const out = await result;
+
+    expect(out.outcome).toBe("score-regression");
+    expect(out.regression).toEqual({ streak: [3], minScore: 5 });
+    expect(calls).toHaveLength(1);
+    expect(commitMessages).toEqual([]);
+  });
+
+  it("is off at a minimum score of 0 — the loop runs to the cap whatever it scores", async () => {
+    const low = report(0, [BLOCKING]);
+    const { result } = gate([low, "tried", low], { reviewMinScore: 0, reviewMaxRounds: 2 });
+    const out = await result;
+
+    expect(out.outcome).toBe("unresolved");
+    expect(out.regression).toBeUndefined();
+  });
+
+  it("leaves a round that never scored to its own protocol violation, not to the alarm", async () => {
+    const { result } = gate(["no report at all"], { ...ALARM, reviewLowScoreRounds: 1 });
+    const out = await result;
+
+    expect(out.outcome).toBe("protocol-violation");
+    expect(out.regression).toBeUndefined();
+  });
+});
+
 describe("runReviewGate — sessions", () => {
   it("records each review and each fix as its own session against the run target", async () => {
     const { result } = gate([report(4, [BLOCKING]), "fixed", report(9, [])]);

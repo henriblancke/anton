@@ -9,8 +9,9 @@
  *
  * This module DECIDES NOTHING about parking. It returns the rounds it ran (each with the validated
  * score) plus the findings still unresolved at exit, each carrying its severity; the call-site
- * (anton-omum) parks on unresolved blocking findings or proceeds with advisory ones. Keeping the
- * converge loop free of execute-epic wiring is what makes it unit-testable against a fake driver.
+ * (anton-omum) parks on unresolved blocking findings — or on a score regression the loop refused to
+ * keep grinding at — and proceeds with advisory ones. Keeping the converge loop free of execute-epic
+ * wiring is what makes it unit-testable against a fake driver.
  */
 import { type Bead } from "../beads/bd";
 import { runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
@@ -28,6 +29,7 @@ import { resolveReviewConfig, resolveVerifyGates, type ProjectSettings } from ".
 import { appendSessionLog, endSession, startJobSession } from "../sessions";
 import { PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
+import { detectScoreRegression, type ScoreRegression } from "./review-alarm";
 import {
   buildFindingsFixPrompt,
   buildReviewPrompt,
@@ -54,6 +56,14 @@ export interface ReviewRound {
   violation?: ReviewProtocolViolation;
   blocking: number;
   advisory: number;
+  /**
+   * The findings this round reported, verbatim — always set by the gate. Counts alone tell the
+   * founder a round went badly; only the findings themselves can be sent back to a ticket as fix
+   * instructions (anton-4ocm), and the worktree they were reviewed in is gone by then, so they ride
+   * to the board with the score. Optional because a round replayed from an OLDER board (written
+   * before this field existed) legitimately carries none.
+   */
+  findings?: ReviewFinding[];
   /** The recorded fix session, when this round's blocking findings were dispatched for repair. */
   fixSessionId?: string;
   /** Whether the fix session actually changed (and so committed) anything. */
@@ -72,7 +82,9 @@ export type ReviewGateOutcome =
   /** A fix session left the tree unchanged, so re-reviewing the same diff cannot change anything. */
   | "stalled"
   /** The final review never spoke the report protocol — silence is not a clean review. */
-  | "protocol-violation";
+  | "protocol-violation"
+  /** K consecutive rounds scored below the operator's threshold (anton-i98r). */
+  | "score-regression";
 
 export interface ReviewGateResult {
   outcome: ReviewGateOutcome;
@@ -89,6 +101,8 @@ export interface ReviewGateResult {
   reviewer: ReviewerSource;
   /** The final round's validated score, when that review spoke the protocol. */
   score?: number;
+  /** Set with the `score-regression` outcome: the low scores that tripped the alarm (anton-i98r). */
+  regression?: ScoreRegression;
 }
 
 /**
@@ -297,6 +311,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       reviewSessionId: review.sessionId,
       blocking: blocking.length,
       advisory: findings.length - blocking.length,
+      findings,
       ...(review.report.ok
         ? { score: review.report.score, rationale: review.report.rationale }
         : { violation: review.report.violation }),
@@ -312,6 +327,18 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
     // A reviewer that never reported, or reported an unusable score, has told us nothing about the
     // work — the run is handed back with whatever findings were salvaged, never as a clean review.
     if (!review.report.ok) return { outcome: "protocol-violation", rounds, unresolved, reviewer };
+
+    // The score-regression alarm (anton-i98r), read across every round so far. Checked BEFORE the
+    // clean and cap exits, and so ahead of both: a run the reviewer has scored low K times running
+    // is the founder's call whichever of them it would otherwise have taken. Ahead of `clean`
+    // because "nothing blocks, and it is still 3/10" is exactly the verdict that must not reach a
+    // merge gate wearing a self-reviewed badge; ahead of the cap because the alarm's reason (a
+    // score that isn't moving) is the more useful thing to say about why the run stopped.
+    const regression = detectScoreRegression(rounds, config.scoreAlarm);
+    if (regression) {
+      return { outcome: "score-regression", rounds, unresolved, reviewer, score: review.report.score, regression };
+    }
+
     if (blocking.length === 0) {
       return { outcome: "clean", rounds, unresolved, reviewer, score: review.report.score };
     }

@@ -5,6 +5,7 @@
 import type { ContractStatus } from "./beads/contract";
 import type { TicketNote } from "./beads/notes";
 import type { HygieneReport } from "./hygiene";
+import type { ReviewTrajectory } from "./review-trajectory";
 
 export type { TicketNote };
 
@@ -32,6 +33,52 @@ export const STAGES: Stage[] = ["backlog", "implementing", "in-review", "done"];
  * the server still enforces it.
  */
 export const MAX_ABANDON_REASON_CHARS = 500;
+
+// The self-review's own shapes, re-exported type-only for the same reason as the contract above:
+// the rework dialog renders findings and score rounds, and a value import of lib/jobs would drag
+// the whole job runtime into the browser bundle.
+export type { ReviewFinding } from "./jobs/review-context";
+export type { ReviewReport, ReviewReportRound } from "./review-report";
+export type { ReviewTrajectory, ScoredTarget } from "./review-trajectory";
+
+/**
+ * Which way a ticket is sent back (anton-4ocm). `reopen` says the acceptance was never actually met
+ * — the same bead runs again, carrying a reason. `follow-up` says it WAS met and the founder wants
+ * another pass: a new bead, linked `discovered-from` the original, so the score the first round
+ * earned stays attached to the work that earned it.
+ */
+export type ReworkMode = "reopen" | "follow-up";
+
+/**
+ * Caps on a rework's two text fields. The summary becomes a `bd reopen --reason` / a follow-up
+ * bead's title, so it is a line; the instructions are inlined verbatim into the implementer's
+ * prompt, so an unbounded one is an unbounded prompt (the same reasoning as MAX_NOTE_CHARS). Here,
+ * not in lib/rework.ts, so the client form can bound the inputs without pulling the server-only
+ * module into the browser bundle; the server still enforces both.
+ */
+export const MAX_REWORK_SUMMARY_CHARS = 200;
+export const MAX_REWORK_INSTRUCTIONS_CHARS = 2000;
+
+/** What a rework settled — the bead that will re-run, and whether this request is what created it. */
+export interface ReworkResult {
+  mode: ReworkMode;
+  /** The ticket the founder sent back. */
+  ticketId: string;
+  /** The bead that re-enters the pipeline: the ticket itself, or the follow-up that was created. */
+  reworkedId: string;
+  /** The instruction note, as it landed on the bead. */
+  note: string;
+  /**
+   * False when this request found its own work already done — a double-submit. Nothing was written
+   * the second time, and `reworkedId` still names the bead the first one produced.
+   */
+  applied: boolean;
+  /**
+   * Why the reworked bead will NOT be picked up by the target's next run as things stand — today,
+   * only an open PR, whose run short-circuits as complete. Absent when the path is clear.
+   */
+  warning?: string;
+}
 
 /** The board's shared type language — the three tiers of
  * docs/design/2026-07-26-tier-and-linear-ux.md: an `epic` is a product outcome spanning features,
@@ -103,6 +150,11 @@ export interface Epic {
   contract?: ContractStatus;
   rank: number; // topological rank (0 = no blockers); drives dependency-aware backlog order
   priority: number; // bead priority (0=critical … 4=lowest); backlog tiebreak after rank
+  /**
+   * The latest self-review score off the card's `review-score:<n>` label (anton-tprv). ABSENT means
+   * never reviewed, which no surface may render as 0 — see `reviewScoreOf`.
+   */
+  reviewScore?: number;
   /** Abandoned (closed + `abandoned` label, anton-6xj0) — a won't-do outcome, never a delivery. */
   abandoned: boolean;
   /**
@@ -141,6 +193,8 @@ export interface StandaloneItem {
   ready: boolean; // no open blockers — mirrors what the approve route enforces
   /** Contract conformance from the shared validator, exactly as on an epic card (see Epic.contract). */
   contract?: ContractStatus;
+  /** Latest self-review score, exactly as on an epic card — absent when never reviewed (Epic.reviewScore). */
+  reviewScore?: number;
   /** A self-filed bug (source:<x> label) still untouched (backlog, unclaimed, not approved) — it
    * wants a human's triage before it runs. Derived each build; there is no stored read-state. */
   unread: boolean;
@@ -182,6 +236,12 @@ export interface Board {
    * payload so it refreshes on the same 304-friendly poll as the cards.
    */
   hygiene?: HygieneReport;
+  /**
+   * How this project's recent runs have been scoring (anton-tprv) — derived from the same labels
+   * the cards carry, so it costs no read of its own. Absent until something has actually been
+   * reviewed: an un-scored project shows no panel rather than a zero trend.
+   */
+  reviewTrajectory?: ReviewTrajectory;
 }
 
 // ── Roadmap page ──

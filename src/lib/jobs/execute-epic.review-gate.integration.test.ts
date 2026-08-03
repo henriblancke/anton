@@ -486,9 +486,12 @@ process.exit(r.status===null?1:r.status);`,
     // A reviewer that keeps reporting the same blocking finding must hand the run to the founder,
     // not open a PR on work its own review refused to pass. `gh pr create` booms so a wrongful
     // fall-through to the PR step is a loud failure rather than a silent duplicate.
+    //
+    // Scored AT the default score-regression threshold (anton-i98r) so this case stays about the
+    // round cap: a lower score would park on the alarm first, which is its own case below.
     await setReviewEnabled(true);
     script({
-      score: 3,
+      score: 5,
       rationale: "acceptance not met",
       findings: [{ severity: "blocking", location: "src/y.ts:7", note: "AC-2 is not implemented" }],
     });
@@ -527,8 +530,66 @@ console.error('gh boom: no PR may be opened for an unresolved review');process.e
       expect(beads.getPrRef(target) ?? null).toBeNull();
       expect(target.notes ?? "").toContain("AC-2 is not implemented");
       expect(scoreComments(targetId)).toMatchObject([
-        { round: 1, score: 3, blocking: 1, verdict: "fixed" },
-        { round: 2, score: 3, blocking: 1, verdict: "unresolved" },
+        { round: 1, score: 5, blocking: 1, verdict: "fixed" },
+        { round: 2, score: 5, blocking: 1, verdict: "unresolved" },
+      ]);
+      expect(target.labels ?? []).toContain("review-score:5");
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+      if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  });
+
+  it("parks on K consecutive LOW SCORES with the series attached, before the round cap (anton-i98r)", async () => {
+    // Sustained low quality is a founder decision, not an infinite fix loop: two rounds at 3/10 stop
+    // the converge loop with four rounds still on the clock, and the score SERIES — not just this
+    // round's findings — is what the park carries, on the bead and on the run row.
+    await setReviewEnabled(true, { reviewMaxRounds: 4, reviewMinScore: 5, reviewLowScoreRounds: 2 });
+    const low = {
+      score: 3,
+      rationale: "the acceptance criteria are not met",
+      findings: [{ severity: "blocking" as const, location: "src/q.ts:3", note: "AC-1 is not implemented" }],
+    };
+    script(low, low, low, low);
+    const targetId = await approvedTarget("Regressing run");
+
+    // Any attempt to open a PR is a loud failure: a run the reviewer scored 3/10 twice must not
+    // reach the founder's merge gate wearing a self-reviewed badge.
+    const boomGh = writeBin(
+      binDir,
+      "gh-boom-regression",
+      `const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='list'){process.stdout.write('[]\\n');process.exit(0);}
+console.error('gh boom: no PR may be opened for a score-regressed run');process.exit(1);`,
+    );
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = boomGh;
+
+    const runner = makeEpicRunner(ctx);
+    let jobId: string;
+    try {
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
+      await expectJobStatus(tdb.db, jobId, "parked");
+
+      // Stopped EARLY: the cap allowed four rounds and the alarm ended it after two.
+      expect(dispatches()).toEqual(["implement", "review", "fix", "review"]);
+
+      const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === targetId)!;
+      expect(run.status).toBe("parked");
+      expect(run.error).toContain("(score-regression)");
+      expect(run.error).toContain("2 consecutive review round(s) scored below 5/10 (3, 3)");
+      expect(run.error).toContain("round 1: 3/10 · round 2: 3/10");
+
+      // No PR, and the board carries the evidence a founder decides on.
+      const target = await beads.show(repo, targetId);
+      expect(beads.getPrRef(target) ?? null).toBeNull();
+      const notes = target.notes ?? "";
+      expect(notes).toContain("2 consecutive review round(s) scored below 5/10 (3, 3)");
+      expect(notes).toContain("Score series: round 1: 3/10 · round 2: 3/10");
+      expect(notes).toContain("AC-1 is not implemented");
+      expect(scoreComments(targetId)).toMatchObject([
+        { round: 1, score: 3, verdict: "fixed" },
+        { round: 2, score: 3, verdict: "score-regression" },
       ]);
       expect(target.labels ?? []).toContain("review-score:3");
     } finally {
@@ -781,8 +842,9 @@ console.error('gh boom: no PR may be opened under a lapsed lease');process.exit(
     // resumed run re-reviews from scratch with an empty carry, so an advisory nobody wrote down here
     // can vanish between the review that found it and the merge gate it was meant to reach.
     await setReviewEnabled(true);
+    // At the alarm's threshold, so the park under test is the blocking one (see the cap case above).
     const mixed = {
-      score: 3,
+      score: 5,
       rationale: "AC-2 unmet",
       findings: [
         { severity: "blocking", location: "src/z.ts:1", note: "AC-2 is not implemented" },

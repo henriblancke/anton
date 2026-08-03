@@ -37,6 +37,28 @@ export function labelValue(labels: string[] | undefined, prefix: string): string
   return label ? label.slice(prefix.length + 1) : undefined;
 }
 
+/**
+ * The latest self-review score a run target carries, off its `review-score:<n>` label
+ * (lib/jobs/review-score.ts). Every board surface reads it from here, so no card costs a bd read of
+ * its own — the label is already in the snapshot (anton-tprv).
+ *
+ * Defensive, because a label is free text on the board: anything that isn't an integer 0–10 reads
+ * as NOT REVIEWED rather than as a zero. A fabricated 0 is the one answer worse than no answer —
+ * it claims the reviewer judged the work and found nothing usable.
+ *
+ * Several valid labels at once means a round's prefix-diff failed (see `setReviewScore`), so the
+ * board cannot tell which is current. It reports the LOWEST: an ambiguous history may under-sell a
+ * target, but it must never flatter one.
+ */
+export function reviewScoreOf(bead: Bead): number | undefined {
+  const scores = (bead.labels ?? []).flatMap((label) => {
+    const m = /^review-score:(\d{1,2})$/.exec(label);
+    const score = m ? Number(m[1]) : NaN;
+    return score >= 0 && score <= 10 ? [score] : [];
+  });
+  return scores.length === 0 ? undefined : Math.min(...scores);
+}
+
 /** The claimed-by + created metadata carried straight off the raw bead, null-safe (an unclaimed
  * ticket has no assignee/created_by). Shared by every bead→view mapper. */
 export function createdMeta(bead: Bead): {
@@ -105,6 +127,7 @@ export function isUnreadBug(bead: Bead): boolean {
  * `blockedBy` is the item's open blockers (standaloneBlockers, computed in board.ts) — the chip
  * gates its Approve & run affordance on `ready` the same way the epic card does. */
 export function toStandaloneItem(bead: Bead, blockedBy: string[] = []): StandaloneItem {
+  const reviewScore = reviewScoreOf(bead);
   return {
     id: bead.id,
     title: bead.title,
@@ -117,6 +140,7 @@ export function toStandaloneItem(bead: Bead, blockedBy: string[] = []): Standalo
     size: labelValue(bead.labels, "size"),
     ...createdMeta(bead),
     prRef: beads.getPrRef(bead),
+    ...(reviewScore !== undefined ? { reviewScore } : {}),
     blockedBy,
     ready: blockedBy.length === 0,
     // Judged over the RUN, not the bead alone (runContractStatus, same as toEpic): a standalone
@@ -398,6 +422,7 @@ export function issueTypeOf(bead: Bead): IssueType {
 export function toEpic(bead: Bead, opts: ToEpicOptions): Epic {
   const withChips = opts.chips ?? true;
   const withPrRef = opts.prRef ?? true;
+  const reviewScore = reviewScoreOf(bead);
   return {
     id: bead.id,
     title: bead.title,
@@ -415,6 +440,8 @@ export function toEpic(bead: Bead, opts: ToEpicOptions): Epic {
       : {}),
     ...createdMeta(bead),
     ...(withPrRef ? { prRef: beads.getPrRef(bead) } : {}),
+    // Absent when the target was never reviewed — a card must show nothing there, never a 0.
+    ...(reviewScore !== undefined ? { reviewScore } : {}),
     blockedBy: opts.blockedBy ?? [],
     ready: opts.ready ?? true,
     // Derived here, not passed in: contract conformance is a pure read of the beads, so every

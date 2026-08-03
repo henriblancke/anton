@@ -37,11 +37,14 @@ interface EditableSettings {
   model?: string;
   seedPrompt?: string;
   reviewFixPrompt?: string;
-  /** Pre-PR self-review gate (anton-3apm); absent = ON. The three knobs below only apply when on. */
+  /** Pre-PR self-review gate (anton-3apm); absent = ON. The knobs below only apply when on. */
   reviewEnabled?: boolean;
   reviewAgent?: string;
   reviewPrompt?: string;
   reviewMaxRounds?: number;
+  /** Score-regression alarm (anton-i98r): park after `reviewLowScoreRounds` rounds below this. */
+  reviewMinScore?: number;
+  reviewLowScoreRounds?: number;
   testCommand?: string;
   lintCommand?: string;
   typecheckCommand?: string;
@@ -73,6 +76,14 @@ const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_REVIEW_MAX_ROUNDS = 2;
 const REVIEW_MAX_ROUNDS_MIN = 1;
 const REVIEW_MAX_ROUNDS_MAX = 5;
+// Score-regression alarm (anton-i98r). A min score of 0 is the off switch — no review can score
+// below zero — which is why the min of the range is 0 rather than 1.
+const DEFAULT_REVIEW_MIN_SCORE = 5;
+const REVIEW_MIN_SCORE_MIN = 0;
+const REVIEW_MIN_SCORE_MAX = 10;
+const DEFAULT_REVIEW_LOW_SCORE_ROUNDS = 2;
+const REVIEW_LOW_SCORE_ROUNDS_MIN = 1;
+const REVIEW_LOW_SCORE_ROUNDS_MAX = 5;
 // Mirror DEFAULT_PROJECT_BUDGET_POLICY (src/lib/projects.ts) for the two operator-facing knobs.
 const DEFAULT_DAYTIME_RESERVE_PCT = 15;
 const DEFAULT_WEEKLY_TARGET_PCT = 90;
@@ -205,6 +216,12 @@ export function SettingsView({
   const [reviewMaxRounds, setReviewMaxRounds] = useState(
     settings.reviewMaxRounds ?? DEFAULT_REVIEW_MAX_ROUNDS,
   );
+  const [reviewMinScore, setReviewMinScore] = useState(
+    settings.reviewMinScore ?? DEFAULT_REVIEW_MIN_SCORE,
+  );
+  const [reviewLowScoreRounds, setReviewLowScoreRounds] = useState(
+    settings.reviewLowScoreRounds ?? DEFAULT_REVIEW_LOW_SCORE_ROUNDS,
+  );
   const [testCommand, setTestCommand] = useState(settings.testCommand ?? "");
   const [lintCommand, setLintCommand] = useState(settings.lintCommand ?? "");
   const [typecheckCommand, setTypecheckCommand] = useState(settings.typecheckCommand ?? "");
@@ -289,6 +306,8 @@ export function SettingsView({
           ...(reviewerMissing(reviewAgent, agents) ? {} : { reviewAgent: reviewAgent || null }),
           reviewPrompt: reviewPrompt.trim() || null,
           reviewMaxRounds,
+          reviewMinScore,
+          reviewLowScoreRounds,
           // "" clears a verify gate → it's skipped (no behavior change).
           testCommand: testCommand.trim() || null,
           lintCommand: lintCommand.trim() || null,
@@ -712,32 +731,67 @@ export function SettingsView({
                     agents={agents}
                     disabled={!reviewEnabled}
                   />
-                  <label className="flex flex-col gap-1.5">
-                    <span className="text-[11px] text-subtle">Max review rounds</span>
-                    <input
-                      type="number"
-                      min={REVIEW_MAX_ROUNDS_MIN}
-                      max={REVIEW_MAX_ROUNDS_MAX}
-                      value={reviewMaxRounds}
-                      disabled={!reviewEnabled}
-                      onChange={(e) => {
-                        const n = Number(e.target.value);
-                        setReviewMaxRounds(
-                          Number.isFinite(n)
-                            ? Math.min(
-                                REVIEW_MAX_ROUNDS_MAX,
-                                Math.max(REVIEW_MAX_ROUNDS_MIN, Math.round(n)),
-                              )
-                            : DEFAULT_REVIEW_MAX_ROUNDS,
-                        );
-                      }}
-                      aria-label="Max review rounds"
-                      className="rounded-[10px] border border-border bg-card px-3 py-2 font-mono text-[12.5px] text-foreground outline-none focus:border-primary/60 disabled:cursor-not-allowed"
-                    />
-                    <span className="text-[11px] text-subtle">
-                      review → fix → re-review · default {DEFAULT_REVIEW_MAX_ROUNDS}
+                  <CountField
+                    label="Max review rounds"
+                    value={reviewMaxRounds}
+                    onChange={setReviewMaxRounds}
+                    min={REVIEW_MAX_ROUNDS_MIN}
+                    max={REVIEW_MAX_ROUNDS_MAX}
+                    fallback={DEFAULT_REVIEW_MAX_ROUNDS}
+                    disabled={!reviewEnabled}
+                    hint={`review → fix → re-review · default ${DEFAULT_REVIEW_MAX_ROUNDS}`}
+                  />
+                </div>
+
+                {/* Score-regression alarm (anton-i98r) — a policy of its own, not another rounds
+                    knob: it decides when anton stops fixing and hands the run back. */}
+                <div className="flex flex-col gap-2.5 rounded-[10px] border border-border bg-background/40 px-3 py-2.5">
+                  <div className="flex items-baseline gap-2">
+                    <span className="text-[12.5px] font-medium">Score-regression alarm</span>
+                    {/* A streak longer than the round cap can never be reached — the loop stops at
+                        the cap first — so the contradiction is named here, not left to the save's 400. */}
+                    <span
+                      className={cn(
+                        "text-[11px]",
+                        reviewMinScore !== REVIEW_MIN_SCORE_MIN && reviewLowScoreRounds > reviewMaxRounds
+                          ? "text-risk-high"
+                          : "text-subtle",
+                      )}
+                    >
+                      {reviewMinScore === REVIEW_MIN_SCORE_MIN
+                        ? "off · the loop runs to the round cap whatever it scores"
+                        : reviewLowScoreRounds > reviewMaxRounds
+                          ? `never fires · ${reviewLowScoreRounds} low rounds can't happen in ${reviewMaxRounds} review round${reviewMaxRounds === 1 ? "" : "s"}`
+                          : `park after ${reviewLowScoreRounds} round${reviewLowScoreRounds === 1 ? "" : "s"} below ${reviewMinScore}/10`}
                     </span>
-                  </label>
+                  </div>
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                    <CountField
+                      label="Minimum score"
+                      value={reviewMinScore}
+                      onChange={setReviewMinScore}
+                      min={REVIEW_MIN_SCORE_MIN}
+                      max={REVIEW_MIN_SCORE_MAX}
+                      fallback={DEFAULT_REVIEW_MIN_SCORE}
+                      disabled={!reviewEnabled}
+                      hint={`0 turns the alarm off · default ${DEFAULT_REVIEW_MIN_SCORE}`}
+                    />
+                    <CountField
+                      label="Consecutive low rounds"
+                      value={reviewLowScoreRounds}
+                      onChange={setReviewLowScoreRounds}
+                      min={REVIEW_LOW_SCORE_ROUNDS_MIN}
+                      max={REVIEW_LOW_SCORE_ROUNDS_MAX}
+                      fallback={DEFAULT_REVIEW_LOW_SCORE_ROUNDS}
+                      disabled={!reviewEnabled || reviewMinScore === REVIEW_MIN_SCORE_MIN}
+                      hint={`a round at or above the minimum resets the streak · default ${DEFAULT_REVIEW_LOW_SCORE_ROUNDS}`}
+                    />
+                  </div>
+                  <span className="text-[11px] text-subtle">
+                    Sustained low scores are a decision for you, not another fix round: when the
+                    streak trips, anton stops the loop, opens no PR, and parks the run with the score
+                    series attached.
+                  </span>
                 </div>
 
                 <div className="flex flex-col gap-2">
@@ -1095,6 +1149,57 @@ function PctField({
         <span className="pointer-events-none absolute right-3 text-[11px] text-subtle">%</span>
       </div>
       {hint && <span className="text-[11px] text-subtle">{hint}</span>}
+    </label>
+  );
+}
+
+/**
+ * A clamped integer knob for the self-review section — max rounds, and the two score-alarm
+ * thresholds (anton-i98r). Clamps on change like {@link PctField}, so a typed-in 99 lands on the
+ * bound the API would have rejected instead of round-tripping as a 400.
+ */
+function CountField({
+  label,
+  value,
+  onChange,
+  min,
+  max,
+  fallback,
+  hint,
+  disabled = false,
+}: {
+  label: string;
+  value: number;
+  onChange: (value: number) => void;
+  min: number;
+  max: number;
+  /** Where a cleared or unparseable input lands — the shipped default for this knob. */
+  fallback: number;
+  hint: React.ReactNode;
+  disabled?: boolean;
+}) {
+  return (
+    <label className="flex flex-col gap-1.5">
+      <span className="text-[11px] text-subtle">{label}</span>
+      <input
+        type="number"
+        step={1}
+        min={min}
+        max={max}
+        value={value}
+        disabled={disabled}
+        onChange={(e) => {
+          const n = Number(e.target.value);
+          onChange(
+            Number.isFinite(n) && e.target.value !== ""
+              ? Math.min(max, Math.max(min, Math.round(n)))
+              : fallback,
+          );
+        }}
+        aria-label={label}
+        className="rounded-[10px] border border-border bg-card px-3 py-2 font-mono text-[12.5px] text-foreground outline-none focus:border-primary/60 disabled:cursor-not-allowed"
+      />
+      <span className="text-[11px] text-subtle">{hint}</span>
     </label>
   );
 }

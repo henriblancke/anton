@@ -129,7 +129,41 @@ describe("SettingsView self-review section (anton-of1m)", () => {
     ).toBe("true");
     expect((screen.getByLabelText("Reviewer") as HTMLSelectElement).value).toBe("");
     expect((screen.getByLabelText("Max review rounds") as HTMLInputElement).value).toBe("2");
+    expect((screen.getByLabelText("Minimum score") as HTMLInputElement).value).toBe("5");
+    expect((screen.getByLabelText("Consecutive low rounds") as HTMLInputElement).value).toBe("2");
     expect((screen.getByLabelText("Review prompt") as HTMLTextAreaElement).value).toBe("");
+  });
+
+  it("seeds, clamps and PATCHes the score-alarm thresholds (anton-i98r)", () => {
+    const fetchMock = stubFetch();
+    renderView({ reviewMaxRounds: 3, reviewMinScore: 7, reviewLowScoreRounds: 3 }, reviewers);
+    expect((screen.getByLabelText("Minimum score") as HTMLInputElement).value).toBe("7");
+    expect((screen.getByLabelText("Consecutive low rounds") as HTMLInputElement).value).toBe("3");
+
+    // Clamped in the field, so a typo lands on the bound instead of round-tripping as a 400.
+    fireEvent.change(screen.getByLabelText("Minimum score"), { target: { value: "99" } });
+    expect((screen.getByLabelText("Minimum score") as HTMLInputElement).value).toBe("10");
+
+    fireEvent.change(screen.getByLabelText("Minimum score"), { target: { value: "4" } });
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body).toMatchObject({ reviewMinScore: 4, reviewLowScoreRounds: 3 });
+  });
+
+  it("says the alarm can never fire when the streak outruns the round cap", () => {
+    renderView({ reviewMaxRounds: 2, reviewMinScore: 5, reviewLowScoreRounds: 4 }, reviewers);
+    expect(screen.getByText(/never fires · 4 low rounds can't happen in 2 review rounds/)).toBeTruthy();
+
+    // Raising the cap past the streak restores the ordinary summary.
+    fireEvent.change(screen.getByLabelText("Max review rounds"), { target: { value: "4" } });
+    expect(screen.getByText(/park after 4 rounds below 5\/10/)).toBeTruthy();
+  });
+
+  it("turns the alarm off at a minimum score of 0, and says so", () => {
+    renderView({ reviewMinScore: 0 }, reviewers);
+    expect(screen.getByText(/off · the loop runs to the round cap/)).toBeTruthy();
+    // The streak knob is meaningless with no threshold — disabled, never silently reset.
+    expect((screen.getByLabelText("Consecutive low rounds") as HTMLInputElement).disabled).toBe(true);
   });
 
   it("seeds every knob from persisted settings (round-trip in)", () => {
@@ -174,6 +208,7 @@ describe("SettingsView self-review section (anton-of1m)", () => {
     fireEvent.click(screen.getByRole("switch", { name: "Review before opening the PR" }));
     expect((screen.getByLabelText("Reviewer") as HTMLSelectElement).disabled).toBe(true);
     expect((screen.getByLabelText("Max review rounds") as HTMLInputElement).disabled).toBe(true);
+    expect((screen.getByLabelText("Minimum score") as HTMLInputElement).disabled).toBe(true);
     expect((screen.getByLabelText("Review prompt") as HTMLTextAreaElement).disabled).toBe(true);
 
     fireEvent.click(screen.getByRole("button", { name: /save changes/i }));

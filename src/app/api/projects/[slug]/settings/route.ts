@@ -2,10 +2,15 @@ import { NextResponse } from "next/server";
 import { discoverAgents } from "@/lib/agents-discovery";
 import {
   CONCURRENCY_RANGE,
+  DEFAULT_REVIEW_LOW_SCORE_ROUNDS,
+  DEFAULT_REVIEW_MAX_ROUNDS,
+  DEFAULT_REVIEW_MIN_SCORE,
   JOB_TIMEOUT_MINUTES_RANGE,
   TICKET_TIMEOUT_MINUTES_RANGE,
   MAX_RETRIES_RANGE,
+  REVIEW_LOW_SCORE_ROUNDS_RANGE,
   REVIEW_MAX_ROUNDS_RANGE,
+  REVIEW_MIN_SCORE_RANGE,
   budgetPolicySchema,
   formulaVariantsSchema,
   runHealthThresholdsSchema,
@@ -48,14 +53,16 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
   const patch: Partial<ProjectSettings> = {};
 
   // Numeric job-policy fields: null / "" clears to the default; a concrete value must be an
-  // integer within range. Shared handling so all five behave identically.
+  // integer within range. Shared handling so all of them behave identically.
   const numericFields: {
     key:
       | "concurrency"
       | "jobTimeoutMinutes"
       | "ticketTimeoutMinutes"
       | "maxRetries"
-      | "reviewMaxRounds";
+      | "reviewMaxRounds"
+      | "reviewMinScore"
+      | "reviewLowScoreRounds";
     range: { min: number; max: number };
   }[] = [
     { key: "concurrency", range: CONCURRENCY_RANGE },
@@ -63,6 +70,10 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
     { key: "ticketTimeoutMinutes", range: TICKET_TIMEOUT_MINUTES_RANGE },
     { key: "maxRetries", range: MAX_RETRIES_RANGE },
     { key: "reviewMaxRounds", range: REVIEW_MAX_ROUNDS_RANGE },
+    // 0 is a real value here, not a clear: it is how the operator turns the score-regression alarm
+    // off (anton-i98r). `null` / "" still clears back to the default threshold.
+    { key: "reviewMinScore", range: REVIEW_MIN_SCORE_RANGE },
+    { key: "reviewLowScoreRounds", range: REVIEW_LOW_SCORE_ROUNDS_RANGE },
   ];
   for (const { key, range } of numericFields) {
     if (!(key in body)) continue;
@@ -79,6 +90,32 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
       );
     }
     patch[key] = n;
+  }
+
+  // The score-regression alarm counts its streak over rounds the converge loop actually RUNS
+  // (lib/jobs/review-alarm.ts), so a streak longer than the round cap can never trip: the loop hits
+  // the cap and parks as `unresolved` — or opens the PR on a clean-but-low round — while the alarm
+  // stays silently dead. Neither knob is wrong on its own, so the contradiction is only visible
+  // against the values a run will resolve: the patched one, else the stored one, else the default.
+  const alarmKeys = ["reviewMinScore", "reviewMaxRounds", "reviewLowScoreRounds"] as const;
+  if (alarmKeys.some((key) => key in body)) {
+    const stored = await getProjectSettingsBySlug(slug);
+    const effective = (key: (typeof alarmKeys)[number], fallback: number): number =>
+      (key in patch ? patch[key] : stored[key]) ?? fallback;
+    const minScore = effective("reviewMinScore", DEFAULT_REVIEW_MIN_SCORE);
+    const maxRounds = effective("reviewMaxRounds", DEFAULT_REVIEW_MAX_ROUNDS);
+    const lowScoreRounds = effective("reviewLowScoreRounds", DEFAULT_REVIEW_LOW_SCORE_ROUNDS);
+    // A minimum score of 0 is the alarm's off switch — an unreachable streak is moot while it's off.
+    if (minScore > 0 && lowScoreRounds > maxRounds) {
+      return NextResponse.json(
+        {
+          error:
+            `reviewLowScoreRounds (${lowScoreRounds}) cannot exceed reviewMaxRounds (${maxRounds}) — ` +
+            `the alarm would never fire, because the review loop stops at the round cap first`,
+        },
+        { status: 400 },
+      );
+    }
   }
 
   // Verify-gate commands (anton-3oh8): tests + operator-pinned lint/typecheck/build. "" / null

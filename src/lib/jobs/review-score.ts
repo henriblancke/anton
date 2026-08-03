@@ -11,6 +11,7 @@
  * whose work already landed.
  */
 import { beads } from "../beads/bd";
+import { findingLines, type ReviewFinding } from "./review-context";
 import type { ReviewGateOutcome, ReviewGateResult, ReviewRound } from "./review-gate";
 
 /**
@@ -34,6 +35,13 @@ export interface ReviewScoreEntry {
   advisory: number;
   verdict: ReviewRoundVerdict;
   rationale?: string;
+  /**
+   * What the round actually found, so the report survives the worktree it was reviewed in. The
+   * rework action (anton-4ocm) sends a selection of these back to a ticket as fix instructions;
+   * with counts alone the founder would have to retype the reviewer's own words. Absent on a round
+   * that reported nothing.
+   */
+  findings?: ReviewFinding[];
 }
 
 /** Marks a comment as anton's score payload, so a reader can skip every other comment on the bead. */
@@ -66,6 +74,7 @@ function toEntries(rounds: ReviewRound[], final: ReviewRoundVerdict): ReviewScor
     advisory: r.advisory,
     verdict: i === last ? final : ("fixed" as const),
     ...(r.rationale ? { rationale: r.rationale } : {}),
+    ...(r.findings?.length ? { findings: r.findings } : {}),
   }));
 }
 
@@ -81,6 +90,7 @@ export function formatReviewScoreComment(entry: ReviewScoreEntry): string {
   return [
     head,
     ...(entry.rationale ? ["", entry.rationale] : []),
+    ...(entry.findings?.length ? ["", ...findingLines(entry.findings)] : []),
     "",
     "```json",
     JSON.stringify({ kind: REVIEW_SCORE_KIND, ...entry }),

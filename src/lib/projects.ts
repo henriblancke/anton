@@ -14,6 +14,7 @@ import { getDb, schema } from "./db";
 import { removeWorktree } from "./git/worktree";
 import { FORMULA_NAME_PATTERN, configureBeadsForRepo } from "./beads/config.mjs";
 import { DEFAULT_BUDGET_POLICY, type BudgetPolicy } from "./jobs/budget";
+import type { ScoreAlarm } from "./jobs/review-alarm";
 import type { FormulaVariant } from "./jobs/run-formula";
 import type { AntonDb } from "./jobs/queue";
 import type { Project } from "./types";
@@ -140,6 +141,18 @@ export interface ProjectSettings {
    * forever. Absent → DEFAULT_REVIEW_MAX_ROUNDS.
    */
   reviewMaxRounds?: number;
+  /**
+   * Score-regression alarm threshold (anton-i98r): a review round scoring BELOW this counts toward
+   * the low-score streak. `0` turns the alarm off outright — no score is below zero — which is the
+   * single knob an operator flips to opt out. Absent → DEFAULT_REVIEW_MIN_SCORE.
+   */
+  reviewMinScore?: number;
+  /**
+   * How many CONSECUTIVE rounds below {@link reviewMinScore} park the run for the founder
+   * (anton-i98r). A round at or above the threshold zeroes the streak. Absent →
+   * DEFAULT_REVIEW_LOW_SCORE_ROUNDS.
+   */
+  reviewLowScoreRounds?: number;
   /**
    * Max concurrent execute-epic runs for this project (anton-xbk). The runner gates approved-epic
    * execution per project against this; other job types (review-fix/nightly) don't count against
@@ -268,6 +281,14 @@ export const DEFAULT_TICKET_TIMEOUT_MINUTES = 45;
 export const DEFAULT_MAX_RETRIES = 3;
 /** Two rounds: the reviewer's first pass plus one chance to confirm the fixes landed. */
 export const DEFAULT_REVIEW_MAX_ROUNDS = 2;
+/**
+ * Below 5 on the review contract's anchored scale (skills/review) is "substantial rework" or worse:
+ * criteria unmet, a real bug, the `## Verify` tests missing. A 5-6 is mixed and genuinely wants
+ * another fix round, so it deliberately does NOT count as low.
+ */
+export const DEFAULT_REVIEW_MIN_SCORE = 5;
+/** Twice is a trend, once is a round the fix loop exists to answer. */
+export const DEFAULT_REVIEW_LOW_SCORE_ROUNDS = 2;
 
 /** Allowed ranges for the numeric job-policy settings (validated at the API boundary). */
 export const CONCURRENCY_RANGE = { min: 1, max: 6 } as const;
@@ -275,6 +296,9 @@ export const JOB_TIMEOUT_MINUTES_RANGE = { min: 5, max: 720 } as const; // 5 min
 export const TICKET_TIMEOUT_MINUTES_RANGE = { min: 5, max: 240 } as const; // 5 min … 4 h
 export const MAX_RETRIES_RANGE = { min: 1, max: 10 } as const;
 export const REVIEW_MAX_ROUNDS_RANGE = { min: 1, max: 5 } as const;
+/** `0` is in range on purpose: it is how the operator turns the score-regression alarm off. */
+export const REVIEW_MIN_SCORE_RANGE = { min: 0, max: 10 } as const;
+export const REVIEW_LOW_SCORE_ROUNDS_RANGE = { min: 1, max: 5 } as const;
 
 /** A project's resolved self-review configuration (anton-3apm) — never partial. */
 export interface ReviewConfig {
@@ -284,6 +308,11 @@ export interface ReviewConfig {
   /** Operator prompt replacing the shipped contract when no {@link agent} resolves; absent → shipped. */
   prompt?: string;
   maxRounds: number;
+  /**
+   * The score-regression alarm (anton-i98r); absent when the operator turned it off with a
+   * `reviewMinScore` of 0.
+   */
+  scoreAlarm?: ScoreAlarm;
 }
 
 /**
@@ -292,11 +321,22 @@ export interface ReviewConfig {
  * between them.
  */
 export function resolveReviewConfig(settings: ProjectSettings): ReviewConfig {
+  const minScore = settings.reviewMinScore ?? DEFAULT_REVIEW_MIN_SCORE;
   return {
     enabled: settings.reviewEnabled ?? true,
     agent: settings.reviewAgent || undefined,
     prompt: settings.reviewPrompt || undefined,
     maxRounds: settings.reviewMaxRounds ?? DEFAULT_REVIEW_MAX_ROUNDS,
+    // Resolved to absent rather than to a threshold of 0, so the gate reads "no alarm" as a shape
+    // instead of having to know that 0 is the off switch.
+    ...(minScore > 0
+      ? {
+          scoreAlarm: {
+            minScore,
+            rounds: settings.reviewLowScoreRounds ?? DEFAULT_REVIEW_LOW_SCORE_ROUNDS,
+          },
+        }
+      : {}),
   };
 }
 

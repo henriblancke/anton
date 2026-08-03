@@ -904,3 +904,92 @@ describe("hygiene report on the board (anton-uwal)", () => {
     expect(await getBoardVersion(project)).toBe(board.version);
   });
 });
+
+describe("review scores on the board (anton-tprv)", () => {
+  it("carries each run target's latest score — cards and standalone chips alike", async () => {
+    listMock.mockResolvedValue([
+      makeBead({
+        id: "feat-1",
+        title: "Scored feature",
+        issue_type: "feature",
+        labels: ["review-score:9"],
+        updated_at: "2026-08-02T00:00:00Z",
+      }),
+      makeBead({ id: "t-1", title: "Its ticket", parent: "feat-1" }),
+      makeBead({
+        id: "task-1",
+        title: "Scored standalone",
+        labels: ["review-score:4"],
+        updated_at: "2026-08-01T00:00:00Z",
+      }),
+    ]);
+
+    const board = await getBoard(project);
+
+    expect(board.columns.backlog.find((e) => e.id === "feat-1")?.reviewScore).toBe(9);
+    expect(board.standalone.backlog.find((i) => i.id === "task-1")?.reviewScore).toBe(4);
+    // Read off labels the snapshot already carries — one bd list for the whole board, no per-card read.
+    expect(listMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves an unreviewed target with no score at all, never a zero", async () => {
+    listMock.mockResolvedValue([
+      makeBead({ id: "feat-1", title: "Never reviewed", issue_type: "feature" }),
+      makeBead({ id: "task-1", title: "Never reviewed either" }),
+      // A malformed label is not a score either — it must not read as 0/10 on a card.
+      makeBead({ id: "task-2", title: "Garbled", labels: ["review-score:oops"] }),
+    ]);
+
+    const board = await getBoard(project);
+
+    expect(board.columns.backlog[0].reviewScore).toBeUndefined();
+    expect(board.standalone.backlog.map((i) => i.reviewScore)).toEqual([undefined, undefined]);
+    expect(board.reviewTrajectory).toBeUndefined();
+  });
+
+  it("rolls the scores up into the project's trajectory, worst target named", async () => {
+    listMock.mockResolvedValue([
+      makeBead({
+        id: "feat-1",
+        title: "Shipped well",
+        issue_type: "feature",
+        labels: ["review-score:9"],
+        updated_at: "2026-08-03T00:00:00Z",
+      }),
+      makeBead({
+        id: "feat-2",
+        title: "Shipped badly",
+        issue_type: "feature",
+        labels: ["review-score:3"],
+        updated_at: "2026-08-02T00:00:00Z",
+      }),
+      makeBead({
+        id: "task-1",
+        title: "Standalone run",
+        labels: ["review-score:6"],
+        updated_at: "2026-08-01T00:00:00Z",
+      }),
+    ]);
+
+    const trajectory = (await getBoard(project)).reviewTrajectory;
+
+    expect(trajectory?.recent.map((t) => t.id)).toEqual(["feat-1", "feat-2", "task-1"]);
+    expect(trajectory?.average).toBe(6);
+    expect(trajectory?.worst).toMatchObject({ id: "feat-2", score: 3, title: "Shipped badly" });
+    expect(trajectory?.scored).toBe(3);
+  });
+
+  it("does not count a ticket's score — only run targets have runs to score", async () => {
+    // A ticket can carry a stale label from a run in which it was the target; it rides on a card
+    // now, so counting it would double-count that card's own run.
+    listMock.mockResolvedValue([
+      makeBead({ id: "feat-1", title: "Target", issue_type: "feature", labels: ["review-score:8"] }),
+      makeBead({ id: "t-1", title: "Ticket", parent: "feat-1", labels: ["review-score:1"] }),
+    ]);
+
+    const trajectory = (await getBoard(project)).reviewTrajectory;
+
+    expect(trajectory?.scored).toBe(1);
+    expect(trajectory?.worst.id).toBe("feat-1");
+  });
+});
