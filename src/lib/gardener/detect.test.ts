@@ -241,6 +241,18 @@ describe("implied ordering with no blocks edge", () => {
     ).toEqual([]);
   });
 
+  // The pair has no direct edge, so it reads as unrelated — but bd refuses to write an edge that
+  // closes a blocking cycle, so filing this would put a proposal on the board that can never apply.
+  it("stays silent when the edge would close a cycle through other beads", () => {
+    expect(
+      detect([
+        feature("anton-alpha", { description: "## Context\nBlocked on anton-beta landing first." }),
+        feature("anton-beta", { dependencies: [blocks("anton-beta", "anton-gamma")] }),
+        feature("anton-gamma", { dependencies: [blocks("anton-gamma", "anton-alpha")] }),
+      ]),
+    ).toEqual([]);
+  });
+
   it("stays silent when the named prerequisite already landed", () => {
     expect(
       detect([

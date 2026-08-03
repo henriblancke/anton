@@ -14,7 +14,11 @@
  *     That includes the bar every detector proposes under — work a run owns is off limits — since
  *     the run that now holds the bead usually started AFTER the proposal was filed. Stale plans
  *     refuse loudly; a board that already reads as applied SETTLES the proposal instead of writing
- *     again, so a retry after a half-finished approve converges rather than double-moves.
+ *     again, so a retry after a half-finished approve converges rather than double-moves. And
+ *     because a snapshot is stale the instant it is taken, each subject is re-read and re-judged
+ *     under its own write lock immediately before it is mutated — the same lock a run's claim takes
+ *     (see `applyStep`), so a lease published mid-approval orders against this apply instead of
+ *     racing it.
  *   • NO PARTIAL SILENT STATE. The only multi-write move is a cluster re-parent, and its steps carry
  *     their own undo: a failure part-way rolls the applied prefix back and leaves the proposal OPEN
  *     with the error attached as a note. What a reader must never find is a board half-moved and a
@@ -25,6 +29,7 @@
  * emission already suppresses on (see emit.ts `suppressedFingerprints`). The board is the memory.
  */
 import { beads, LABELS, type Bead } from "../beads/bd";
+import { withBeadWriteLock } from "../beads/claim-lock";
 import { indexBoard, isInFlight, isOpenWork, type BoardIndex } from "./board-index";
 import {
   fingerprintLabelOf,
@@ -184,6 +189,15 @@ function planLink(plan: GardenerPlan, index: BoardIndex, nowMs: number): ApplyDe
   // edge against it would tell every other reader that live work is waiting on something.
   if (isInFlight(blocked, nowMs)) {
     return { status: "refuse", reason: inFlightReason(blocked, nowMs, "recording it as blocked") };
+  }
+  // The blocker already waits on the blocked bead through other beads: no direct edge, so the pair
+  // read as unrelated above, but this edge would close the loop — and bd rejects a blocking cycle at
+  // every write path, so applying it would only 500 and leave the proposal open forever.
+  if (index.isBlockedBy(plan.target, id)) {
+    return {
+      status: "refuse",
+      reason: `${plan.target} is already blocked by ${id} through other beads — recording ${plan.target} as ${id}'s blocker would close a dependency cycle, which bd refuses to write`,
+    };
   }
 
   return {
@@ -348,17 +362,23 @@ export async function applyProposal(
   if (decision.status === "apply") {
     try {
       for (const step of decision.steps) {
-        await runStep(repo, step);
+        await applyStep(repo, step);
         changed.push(step);
       }
     } catch (e) {
       const rollback = await rollbackSteps(repo, changed);
+      // A subject that moved under us is the board refusing, not a bd write breaking — but only
+      // while nothing has landed yet. Once a prefix is written the outcome is a partial apply that
+      // was rolled back, which is `failed` whatever tripped it.
+      const stale = e instanceof SubjectMovedError && changed.length === 0;
       throw await attachFailure(
         repo,
         proposal.id,
         new ProposalApplyError(
-          "failed",
-          `applying ${proposal.id} failed: ${messageOf(e)}${rollback}`,
+          stale ? "refused" : "failed",
+          stale
+            ? `cannot apply ${proposal.id}: ${messageOf(e)}`
+            : `applying ${proposal.id} failed: ${messageOf(e)}${rollback}`,
         ),
       );
     }
@@ -396,6 +416,62 @@ export function declineNote(proposal: Bead): string | undefined {
 }
 
 // ── execution (the only writes in this module) ──
+
+/** A subject the board moved on between the decision and the write. Never a bd failure. */
+class SubjectMovedError extends Error {}
+
+/** What each verb would be DOING to the subject, for a refusal that reads as a sentence. */
+const DOING: Record<ApplyStep["verb"], string> = {
+  reparent: "moving it",
+  link: "recording it as blocked",
+  close: "retiring it",
+  supersede: "retiring it",
+  defer: "retiring it",
+};
+
+/**
+ * One write, taken under the SUBJECT'S OWN write lock and re-judged against a read from inside it.
+ *
+ * `planApply` decides against the caller's board snapshot, which is already seconds old by the time
+ * the first bd write spawns — and the thing it is guarding against, a runner publishing a lease or
+ * flipping a status, happens in exactly that window. Worse, a run's claim is serialized on this same
+ * per-bead chain (beads/claim-lock.ts, shared with claimVerified and the human-claim CAS), so an
+ * apply that stayed outside it wasn't racing the claim protocol so much as ignoring it: the snapshot
+ * check could pass, a claim could land, and the move would still execute against work that had begun.
+ *
+ * Holding the lock makes the two orders: either the claim lands first and this read sees it (refuse),
+ * or this write lands first and the claim queues behind it. The re-check is deliberately the SUBJECT
+ * bar only — is this bead still open, and does a run own it — because that is what the lock covers;
+ * the relational preconditions (target is a card, no cycle, no open descendants) belong to the board
+ * as a whole and stay with the snapshot decision.
+ */
+async function applyStep(repo: string, step: ApplyStep): Promise<void> {
+  await withBeadWriteLock(repo, step.id, async () => {
+    let subject: Bead | undefined;
+    try {
+      subject = await beads.show(repo, step.id);
+    } catch (e) {
+      // A read that failed is not a bead that vanished, and saying so would misdiagnose a flaky bd
+      // as a board that moved. Either way nothing is written to this bead.
+      throw new SubjectMovedError(
+        `${step.id} could not be re-read before writing to it (${messageOf(e)}) — nothing was written`,
+      );
+    }
+    const moved = subjectMoved(step, subject, Date.now());
+    if (moved) throw new SubjectMovedError(moved);
+    await runStep(repo, step);
+  });
+}
+
+/** Why this subject can no longer be written to, or undefined when the plan still holds for it. */
+function subjectMoved(step: ApplyStep, subject: Bead | undefined, nowMs: number): string | undefined {
+  if (!subject) return missing(step.id);
+  if (!isOpenWork(subject)) {
+    return `${step.id} is ${settledWord(subject)} — the board moved on since this was proposed`;
+  }
+  if (isInFlight(subject, nowMs)) return inFlightReason(subject, nowMs, DOING[step.verb]);
+  return undefined;
+}
 
 async function runStep(repo: string, step: ApplyStep): Promise<void> {
   switch (step.verb) {
@@ -435,7 +511,9 @@ async function rollbackSteps(repo: string, applied: ApplyStep[]): Promise<string
       continue;
     }
     try {
-      await beads.reparent(repo, step.id, step.undoParent);
+      // Undone under the same per-bead lock the write took, so a claim that queued behind the
+      // failed apply doesn't interleave with its rollback.
+      await withBeadWriteLock(repo, step.id, () => beads.reparent(repo, step.id, step.undoParent));
     } catch {
       stranded.push(step.id);
     }

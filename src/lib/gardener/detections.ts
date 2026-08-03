@@ -59,6 +59,26 @@ export const GARDENER_DETECTION_KINDS: readonly GardenerDetectionKind[] = [
  */
 export type RetireVerb = "close" | "supersede" | "defer";
 
+/**
+ * The one move each kind resolves to. A detection still STATES its move (see {@link GardenerMove}) —
+ * this is the table that says the statement was true, and it is the only thing binding `move` and
+ * `retireAs` to a proposal's identity: the fingerprint hashes what the claim is ABOUT (kind,
+ * subjects, target), so without a canonical pairing a hand-edited bead could keep its label and its
+ * hash while swapping a `stale` defer for a close. Every kind is listed, so adding one without
+ * deciding its verb is a type error rather than a silent default.
+ */
+export const CANONICAL_MOVE: Record<
+  GardenerDetectionKind,
+  { move: GardenerMove; retireAs?: RetireVerb }
+> = {
+  "container-orphan": { move: "reparent" },
+  "parentless-cluster": { move: "reparent" },
+  "implied-order": { move: "link" },
+  superseded: { move: "retire", retireAs: "supersede" },
+  stale: { move: "retire", retireAs: "defer" },
+  "shipped-orphan": { move: "retire", retireAs: "close" },
+};
+
 export interface GardenerDetection {
   kind: GardenerDetectionKind;
   move: GardenerMove;
@@ -113,9 +133,17 @@ export interface DetectionInput {
  * first one approved suppress the second forever.
  */
 export function makeDetection(input: DetectionInput): GardenerDetection {
+  const canonical = CANONICAL_MOVE[input.kind];
+  if (canonical.move !== input.move || canonical.retireAs !== input.retireAs) {
+    // Fail loud at emission rather than filing a bead nobody can approve: apply reads the plan back
+    // against this same table, so a detector that drifts from it would put proposals on the board
+    // that refuse forever as "no readable move".
+    throw new Error(
+      `${input.kind} is a ${canonical.move}${canonical.retireAs ? `/${canonical.retireAs}` : ""} detection, not ${input.move}${input.retireAs ? `/${input.retireAs}` : ""}`,
+    );
+  }
   const subjects = [...input.subjects].sort();
-  const subjectKey =
-    `${input.kind}:${subjects.join("+")}` + (input.target ? `>${input.target}` : "");
+  const subjectKey = detectionSubjectKey(input.kind, subjects, input.target);
   return {
     kind: input.kind,
     move: input.move,
@@ -127,6 +155,21 @@ export function makeDetection(input: DetectionInput): GardenerDetection {
     summary: input.summary,
     evidence: input.evidence,
   };
+}
+
+/**
+ * What a detection is ABOUT, as one readable string: the kind, its subjects (sorted, so two patrols
+ * that walk the board in different orders agree), and whatever it points at. The identity the
+ * fingerprint hashes — and the thing apply RECOMPUTES from a proposal's own fields, so a bead whose
+ * subjects or target were edited after emission no longer matches its label.
+ */
+export function detectionSubjectKey(
+  kind: GardenerDetectionKind,
+  subjects: string[],
+  target?: string,
+): string {
+  const sorted = [...subjects].sort();
+  return `${kind}:${sorted.join("+")}` + (target ? `>${target}` : "");
 }
 
 /** `gardener:<kind>:<hash>` — the label a proposal bead carries so a re-run recognises its own work. */
@@ -203,6 +246,15 @@ const RETIRE_VERBS: readonly RetireVerb[] = ["close", "supersede", "defer"];
  *
  * `retireAs` is required exactly when the move is `retire` and forbidden otherwise, which is the
  * same invariant {@link GardenerDetection} documents; a retire with no verb has no safe default.
+ *
+ * Two checks bind the plan to the ONE claim its fingerprint stands for, so an approver cannot read
+ * one ask and have another execute:
+ *   • the fingerprint is RECOMPUTED from the parsed kind/subjects/target and must match the field
+ *     carried alongside them — editing the subjects or the target of a proposal now invalidates it
+ *     rather than silently redirecting the move;
+ *   • the move and retirement verb must be the ones {@link CANONICAL_MOVE} pairs with the kind,
+ *     which is what covers the two fields the hash can't (a `stale` bead reads as a defer, so it
+ *     must not execute a close).
  */
 export function parseGardenerPlan(value: unknown): GardenerPlan | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
@@ -233,6 +285,17 @@ export function parseGardenerPlan(value: unknown): GardenerPlan | undefined {
     return undefined;
   }
 
+  // The move must be the one this kind means, and the identity must be the one these fields hash to.
+  const canonical = CANONICAL_MOVE[kind as GardenerDetectionKind];
+  if (canonical.move !== move || canonical.retireAs !== (move === "retire" ? retireAs : undefined)) {
+    return undefined;
+  }
+  const recomputed = gardenerFingerprint(
+    kind as GardenerDetectionKind,
+    detectionSubjectKey(kind as GardenerDetectionKind, subjects as string[], target as string | undefined),
+  );
+  if (recomputed !== fingerprint) return undefined;
+
   return {
     kind: kind as GardenerDetectionKind,
     move: move as GardenerMove,
@@ -244,9 +307,11 @@ export function parseGardenerPlan(value: unknown): GardenerPlan | undefined {
 }
 
 /**
- * The move a PROPOSAL BEAD carries, if it carries a readable one. The bead's own fingerprint label
- * has to agree with the plan's: they are two records of one claim, and a mismatch means the bead was
- * assembled by something other than the emitter — which is exactly when applying it blind is worst.
+ * The move a PROPOSAL BEAD carries, if it carries a readable one. The plan has already been checked
+ * against ITSELF ({@link parseGardenerPlan} recomputes the fingerprint from the fields it parsed);
+ * what this adds is the bead's own label, the third record of the same claim. A mismatch anywhere
+ * means the bead was assembled by something other than the emitter — which is exactly when applying
+ * it blind is worst.
  */
 export function proposalPlanOf(bead: { labels?: string[]; metadata?: Record<string, unknown> }):
   | GardenerPlan

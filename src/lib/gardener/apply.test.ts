@@ -17,10 +17,21 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { LABELS, type Bead } from "../beads/bd";
-import { gardenerFingerprint, parseGardenerPlan, type GardenerPlan } from "./detections";
+import {
+  detectionSubjectKey,
+  gardenerFingerprint,
+  parseGardenerPlan,
+  type GardenerPlan,
+} from "./detections";
 
 /** Every bd write the module made, in order: `<verb> <args…>`. */
 const calls: string[] = [];
+/**
+ * What `bd show` answers with under the write lock — the board AS OF THE WRITE, which is a different
+ * question from the snapshot `applyProposal` decided on. Defaults to the snapshot; a test primes an
+ * entry here to stage the exact race the lock exists for (a run claiming mid-approval).
+ */
+const liveBeads = new Map<string, Bead | undefined>();
 /**
  * Writes primed to reject, keyed by `<verb>:<id>` → which occurrence fails (1-based). The occurrence
  * matters: rolling a re-parent back re-issues the SAME verb on the SAME bead, so "fail the second
@@ -38,12 +49,20 @@ function record(verb: string, ...args: string[]): Promise<string> {
   return Promise.resolve("");
 }
 
+/** The board `applyProposal` was handed — what the under-lock re-read sees unless a test overrides it. */
+let snapshot: Bead[] = [];
+
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
   return {
     ...actual,
     beads: {
       ...actual.beads,
+      // Reads stay out of `calls`: what matters is which WRITE hit which bead.
+      show: (_cwd: string, id: string) => {
+        const live = liveBeads.has(id) ? liveBeads.get(id) : snapshot.find((b) => b.id === id);
+        return live ? Promise.resolve(live) : Promise.reject(new Error(`bd show: no such issue ${id}`));
+      },
       reparent: (_cwd: string, id: string, parent: string) => record("reparent", id, parent),
       link: (_cwd: string, a: string, b: string, type: string) => record("link", a, b, type),
       close: (_cwd: string, id: string, reason?: string) => record("close", id, reason ?? ""),
@@ -57,6 +76,16 @@ vi.mock("../beads/bd", async () => {
 const { ProposalApplyError, applyProposal, declineNote, planApply } = await import("./apply");
 
 const REPO = "/tmp/gardener-apply";
+
+/**
+ * Apply against `board`, with that same board answering the under-lock re-read of every subject —
+ * i.e. nothing changed between the decision and the writes. A test that wants something to change
+ * primes {@link liveBeads} for the bead it wants to move under the apply.
+ */
+function apply(proposal: Bead, board: Bead[]) {
+  snapshot = board;
+  return applyProposal(REPO, proposal, board);
+}
 
 // ── fixture builders ──
 
@@ -73,8 +102,27 @@ function child(id: string, parent: string, extra: Partial<Bead> = {}): Bead {
   };
 }
 
+/** A bead waiting on `blocker`, carried the way `bd list --json` carries a blocks edge. */
+function blockedBy(id: string, blocker: string, extra: Partial<Bead> = {}): Bead {
+  return {
+    ...bead(id, extra),
+    dependencies: [{ issue_id: id, depends_on_id: blocker, type: "blocks" }],
+  };
+}
+
+/**
+ * A plan fingerprinted the way the emitter would fingerprint it — through the SAME key builder, not
+ * a copy of it, because apply now recomputes that hash from the plan's own fields and a fixture with
+ * a hand-rolled fingerprint would prove the opposite of what these tests claim.
+ */
 function planFor(input: Omit<GardenerPlan, "fingerprint">): GardenerPlan {
-  return { ...input, fingerprint: gardenerFingerprint(input.kind, input.subjects.join("+")) };
+  return {
+    ...input,
+    fingerprint: gardenerFingerprint(
+      input.kind,
+      detectionSubjectKey(input.kind, input.subjects, input.target),
+    ),
+  };
 }
 
 /** The proposal bead as the board hands it back: fingerprint label + the plan as metadata. */
@@ -147,6 +195,8 @@ beforeEach(() => {
   calls.length = 0;
   failOn.clear();
   seen.clear();
+  liveBeads.clear();
+  snapshot = [];
 });
 
 describe("the plan a proposal carries — read strictly, because it decides what gets mutated", () => {
@@ -168,6 +218,33 @@ describe("the plan a proposal carries — read strictly, because it decides what
     ["a retirement verb on a move that takes none", { ...REPARENT, retireAs: "close" }],
   ])("rejects %s", (_case, value) => {
     expect(parseGardenerPlan(value)).toBeUndefined();
+  });
+
+  // The fingerprint is what an approver's bead and its plan have IN COMMON, so every field it
+  // covers has to be recomputed from the plan rather than trusted — otherwise editing the metadata
+  // and keeping the hash makes the bead describe one move and execute another.
+  it.each([
+    ["subjects swapped under a kept fingerprint", { ...REPARENT, subjects: ["anton-zzz"] }],
+    ["a target redirected under a kept fingerprint", { ...REPARENT, target: "anton-elsewhere" }],
+    ["a subject appended under a kept fingerprint", { ...CLUSTER, subjects: ["anton-a", "anton-b", "anton-c"] }],
+  ])("rejects %s", (_case, value) => {
+    expect(parseGardenerPlan(value)).toBeUndefined();
+  });
+
+  // `move` and `retireAs` are the two fields the hash can't cover, so the kind→verb pairing is what
+  // binds them: a bead whose prose says "defer" must never execute a close.
+  it("rejects a move or a retirement verb its kind does not mean", () => {
+    expect(parseGardenerPlan({ ...DEFER, retireAs: "close" })).toBeUndefined();
+    expect(parseGardenerPlan({ ...CLOSE, retireAs: "defer" })).toBeUndefined();
+    expect(parseGardenerPlan({ ...REPARENT, move: "link" })).toBeUndefined();
+    // …and a `stale` bead that kept its own verb still reads fine.
+    expect(parseGardenerPlan(DEFER)).toEqual(DEFER);
+  });
+
+  // Subjects are a SET: the fingerprint sorts them, so a reordered list is the same claim.
+  it("accepts subjects in any order — the identity is the set, not the listing", () => {
+    const reordered = { ...CLUSTER, subjects: ["anton-b", "anton-a"] };
+    expect(parseGardenerPlan(reordered)).toEqual(reordered);
   });
 });
 
@@ -215,6 +292,29 @@ describe("planApply — what an approval means against the board as it now is", 
     // A reversed edge is somebody's recorded decision, never something to overwrite.
     expect(planApply(LINK, edged("anton-a", "anton-b")).status).toBe("settled");
     expect(planApply(LINK, edged("anton-b", "anton-a")).status).toBe("settled");
+  });
+
+  // bd rejects a blocking cycle at every write path, so an edge that closes one can only ever be
+  // approved into a 500 — leaving an open proposal that will never apply. The DIRECT reverse pair is
+  // caught above; this is the transitive case, where the pair looks unrelated.
+  it("refuses a link that would close a dependency cycle through other beads", () => {
+    // anton-b waits on anton-c, which waits on anton-a — so "anton-b blocks anton-a" closes the loop.
+    const board = [
+      bead("anton-a"),
+      blockedBy("anton-b", "anton-c"),
+      blockedBy("anton-c", "anton-a"),
+    ];
+    const decision = planApply(LINK, board);
+    expect(decision).toMatchObject({ status: "refuse" });
+    expect(decision.status === "refuse" && decision.reason).toMatch(
+      /anton-b is already blocked by anton-a through other beads/,
+    );
+  });
+
+  it("still records an edge whose chain runs the other way — that is an ordering, not a cycle", () => {
+    // anton-a already waits on anton-c: adding anton-b as another of its blockers closes nothing.
+    const board = [blockedBy("anton-a", "anton-c"), bead("anton-b"), bead("anton-c")];
+    expect(planApply(LINK, board).status).toBe("apply");
   });
 
   it("maps each retirement to ITS OWN verb — close, defer and supersede are not interchangeable", () => {
@@ -358,7 +458,7 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     const proposal = proposalFor(REPARENT);
     const board = [CARD, bead("anton-a"), proposal];
 
-    const result = await applyProposal(REPO, proposal, board);
+    const result = await apply(proposal, board);
 
     expect(result).toMatchObject({
       proposalId: proposal.id,
@@ -374,11 +474,62 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
 
   it("closes a proposal the board already satisfied WITHOUT touching a subject bead", async () => {
     const proposal = proposalFor(REPARENT);
-    const result = await applyProposal(REPO, proposal, [CARD, child("anton-a", CARD.id), proposal]);
+    const result = await apply(proposal, [CARD, child("anton-a", CARD.id), proposal]);
 
     expect(result.changed).toEqual([]);
     expect(calls.filter((c) => c.startsWith("reparent"))).toEqual([]);
     expect(calls.at(-1)).toContain(`close ${proposal.id}`);
+  });
+
+  // The snapshot is stale the instant it is taken, and a runner publishing a lease in that window is
+  // exactly what the in-flight bar exists for — so the last word belongs to a read taken under the
+  // subject's own write lock, the one a run's claim also queues on.
+  it("refuses a subject a run claimed AFTER the snapshot, without writing to it", async () => {
+    const proposal = proposalFor(DEFER);
+    liveBeads.set("anton-a", leased("anton-a", Date.now()));
+
+    await expect(apply(proposal, [bead("anton-a"), proposal])).rejects.toMatchObject({
+      failure: "refused",
+    });
+    // The snapshot said "open and unclaimed"; the locked read said otherwise, and nothing was written.
+    expect(calls).toEqual([
+      `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-a is mid-run — a run holds a live lease on it (runner-1), so retiring it would race the run that owns it`,
+    ]);
+  });
+
+  it("refuses a subject that settled after the snapshot, per verb", async () => {
+    for (const [plan, gone] of [
+      [REPARENT, bead("anton-a", { status: "closed" })],
+      [LINK, bead("anton-a", { labels: [LABELS.abandoned], status: "closed" })],
+      [CLOSE, undefined], // left the board entirely
+    ] as const) {
+      calls.length = 0;
+      liveBeads.clear();
+      liveBeads.set("anton-a", gone);
+      const proposal = proposalFor(plan);
+      await expect(
+        apply(proposal, [CARD, bead("anton-a"), bead("anton-b"), proposal]),
+      ).rejects.toMatchObject({ failure: "refused" });
+      expect(calls.filter((c) => !c.startsWith("note"))).toEqual([]);
+    }
+  });
+
+  // A cluster that loses its second subject mid-apply is a PARTIAL application, not a clean refusal:
+  // the prefix has to come back out, and the proposal has to stay open saying so.
+  it("rolls back the prefix when a later subject moves under the apply", async () => {
+    const proposal = proposalFor(CLUSTER);
+    liveBeads.set("anton-b", leased("anton-b", Date.now()));
+
+    await expect(
+      apply(proposal, [CARD, child("anton-a", "anton-old"), bead("anton-b"), proposal]),
+    ).rejects.toMatchObject({ failure: "failed" });
+
+    expect(calls).toEqual([
+      "reparent anton-a anton-card",
+      "reparent anton-a anton-old", // undone, back to where it was
+      `note ${proposal.id} gardener: apply FAILED — applying ${proposal.id} failed: anton-b is mid-run — a run holds a live lease on it (runner-1), so moving it would race the run that owns it — the 1 write(s) already made were rolled back, so the board is unchanged`,
+    ]);
+    expect(calls.some((c) => c.startsWith(`close ${proposal.id}`))).toBe(false);
   });
 
   it("rolls back a half-applied cluster and leaves the proposal OPEN with the error attached", async () => {
@@ -386,7 +537,7 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     const board = [CARD, child("anton-a", "anton-old"), bead("anton-b"), proposal];
     failOn.set("reparent:anton-b", 1);
 
-    await expect(applyProposal(REPO, proposal, board)).rejects.toThrow(/rolled back/);
+    await expect(apply(proposal, board)).rejects.toThrow(/rolled back/);
 
     expect(calls).toEqual([
       "reparent anton-a anton-card",
@@ -405,7 +556,7 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     // The SECOND write to anton-a is its undo — fail that too, and the board is left half-moved.
     failOn.set("reparent:anton-a", 2);
 
-    await expect(applyProposal(REPO, proposal, board)).rejects.toThrow(/ROLLBACK INCOMPLETE/);
+    await expect(apply(proposal, board)).rejects.toThrow(/ROLLBACK INCOMPLETE/);
     expect(calls.some((c) => c.startsWith(`close ${proposal.id}`))).toBe(false);
   });
 
@@ -413,7 +564,7 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     const proposal = proposalFor(REPARENT);
     const board = [CARD, bead("anton-a", { status: "closed" }), proposal];
 
-    await expect(applyProposal(REPO, proposal, board)).rejects.toMatchObject({
+    await expect(apply(proposal, board)).rejects.toMatchObject({
       failure: "refused",
     });
     expect(calls).toEqual([
@@ -426,7 +577,7 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     const proposal = proposalFor(DEFER);
     const live = leased("anton-a", Date.now());
 
-    await expect(applyProposal(REPO, proposal, [live, proposal])).rejects.toMatchObject({
+    await expect(apply(proposal, [live, proposal])).rejects.toMatchObject({
       failure: "refused",
     });
     // Nothing but the explanation on the proposal: the subject bead is left to its run.
@@ -437,20 +588,20 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     calls.length = 0;
     const reparent = proposalFor(REPARENT);
     await expect(
-      applyProposal(REPO, reparent, [CARD, inReview("anton-a"), reparent]),
+      apply(reparent, [CARD, inReview("anton-a"), reparent]),
     ).rejects.toMatchObject({ failure: "refused" });
     expect(calls.filter((c) => !c.startsWith("note"))).toEqual([]);
   });
 
   it("refuses a bead whose plan cannot be read, rather than guessing one from its prose", async () => {
     const noPlan = bead("anton-p2", { labels: [REPARENT.fingerprint] });
-    await expect(applyProposal(REPO, noPlan, [noPlan])).rejects.toMatchObject({
+    await expect(apply(noPlan, [noPlan])).rejects.toMatchObject({
       failure: "unusable",
     });
 
     // A plan whose fingerprint disagrees with the bead's label is not this bead's plan.
     const mismatched = proposalFor(REPARENT, { labels: [CLUSTER.fingerprint] });
-    await expect(applyProposal(REPO, mismatched, [mismatched])).rejects.toMatchObject({
+    await expect(apply(mismatched, [mismatched])).rejects.toMatchObject({
       failure: "unusable",
     });
 
@@ -460,16 +611,16 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
 
   it("refuses a bead that is not a proposal, and one that already settled", async () => {
     const plain = bead("anton-x");
-    await expect(applyProposal(REPO, plain, [plain])).rejects.toThrow(/not a gardener proposal/);
+    await expect(apply(plain, [plain])).rejects.toThrow(/not a gardener proposal/);
 
     const settled = proposalFor(REPARENT, { status: "closed" });
-    await expect(applyProposal(REPO, settled, [settled])).rejects.toThrow(/already settled/);
+    await expect(apply(settled, [settled])).rejects.toThrow(/already settled/);
     expect(calls).toEqual([]);
   });
 
   it("carries a failure class every caller can map to a status", async () => {
     const proposal = proposalFor(REPARENT);
-    const err = await applyProposal(REPO, proposal, [proposal]).catch((e) => e);
+    const err = await apply(proposal, [proposal]).catch((e) => e);
     expect(err).toBeInstanceOf(ProposalApplyError);
     expect(err.failure).toBe("refused");
   });

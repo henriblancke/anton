@@ -35,6 +35,14 @@ export interface BoardIndex {
    * already drew would fight a human's recorded decision.
    */
   hasBlocksEdge(a: string, b: string): boolean;
+  /**
+   * Is `id` already blocked by `blockerId`, directly or through any chain of `blocks` edges?
+   * DIRECTED, unlike {@link hasBlocksEdge}, and asked in the one place direction decides safety:
+   * recording "X blocks Y" when X is itself already waiting on Y closes a dependency cycle, and bd
+   * rejects cycles at every write path (bd-hygiene.integration.test.ts) — so a proposal that only
+   * looked at the direct pair could be approved into a 500 and never apply.
+   */
+  isBlockedBy(id: string, blockerId: string): boolean;
   discoveries: Discovery[];
   /** Is `ancestorId` this bead, or anywhere on its parent chain? Cycle-guarded. */
   isAncestor(ancestorId: string, id: string): boolean;
@@ -55,10 +63,18 @@ export function indexBoard(all: Bead[]): BoardIndex {
   }
 
   const blocks = new Set<string>();
+  // The same edges, kept DIRECTED: `from` depends on `to` (bd's `blocks` edge points at the blocker,
+  // matching beads.unblocksCount), which is what makes reachability — and so cycle detection —
+  // answerable at all.
+  const blockers = new Map<string, string[]>();
   const discoveries: Discovery[] = [];
   for (const edge of beads.edgesOf(all)) {
-    if (edge.type === "blocks") blocks.add(pairKey(edge.from, edge.to));
-    else if (edge.type === "discovered-from") {
+    if (edge.type === "blocks") {
+      blocks.add(pairKey(edge.from, edge.to));
+      const known = blockers.get(edge.from);
+      if (known) known.push(edge.to);
+      else blockers.set(edge.from, [edge.to]);
+    } else if (edge.type === "discovered-from") {
       discoveries.push({ discovered: edge.from, source: edge.to });
     }
   }
@@ -84,6 +100,20 @@ export function indexBoard(all: Bead[]): BoardIndex {
       return found;
     },
     hasBlocksEdge: (a, b) => blocks.has(pairKey(a, b)),
+    isBlockedBy: (id, blockerId) => {
+      // Walks blocker-ward from `id`; `seen` also guards a graph that ALREADY holds a cycle (a merge
+      // can leave one, see beads.depCycles), which must not spin this walk forever.
+      const seen = new Set<string>([id]);
+      const queue = [...(blockers.get(id) ?? [])];
+      while (queue.length > 0) {
+        const next = queue.shift() as string;
+        if (next === blockerId) return true;
+        if (seen.has(next)) continue;
+        seen.add(next);
+        queue.push(...(blockers.get(next) ?? []));
+      }
+      return false;
+    },
     discoveries,
     isAncestor: (ancestorId, id) => {
       const seen = new Set<string>();

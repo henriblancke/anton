@@ -145,6 +145,11 @@ function discoveryImplied(index: BoardIndex, nowMs: number): GardenerDetection[]
  * Mid-flight work is off limits, the same bar every other detector proposes under: apply refuses to
  * record a live bead as blocked, and by the time its run lands the bead is settled — so the proposal
  * would never become appliable and would suppress the claim until someone declined it by hand.
+ *
+ * The same reasoning bars a CYCLE. A blocker that already waits on the blocked bead through other
+ * beads has no direct edge, so the pair reads as unrelated — but bd refuses to write the edge that
+ * would close the loop (bd-hygiene.integration.test.ts), so the proposal could only ever be approved
+ * into an error. Checked here as well as at apply, so the ask is never filed in the first place.
  */
 function canOrder(index: BoardIndex, blocked: Bead, blocker: Bead, nowMs: number): boolean {
   if (blocked.id === blocker.id) return false;
@@ -152,6 +157,7 @@ function canOrder(index: BoardIndex, blocked: Bead, blocker: Bead, nowMs: number
   if (!isOpenWork(blocked) || !isOpenWork(blocker)) return false;
   if (isInFlight(blocked, nowMs) || isInFlight(blocker, nowMs)) return false;
   if (index.hasBlocksEdge(blocked.id, blocker.id)) return false;
+  if (index.isBlockedBy(blocker.id, blocked.id)) return false;
   return !index.isAncestor(blocked.id, blocker.id) && !index.isAncestor(blocker.id, blocked.id);
 }
 
