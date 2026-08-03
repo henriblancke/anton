@@ -16,6 +16,7 @@ import { schema } from "../db";
 import type { Bead } from "../beads/bd";
 import type { ClaudeResult, RunClaudeOptions } from "../claude/driver";
 import type { ProjectSettings } from "../projects";
+import { ANTON_REPO_URL } from "../repo";
 import { isPoisonError, isUsageLimitError, RunAlreadyLiveError, UsageLimitError } from "./errors";
 import type { Clock } from "./queue";
 import {
@@ -24,6 +25,7 @@ import {
   claudeStep,
   commitStep,
   implementStep,
+  prBody,
   prStep,
   resolveStep,
   reviewStep,
@@ -464,5 +466,17 @@ describe("step:claude", () => {
     expect(sessions).toHaveLength(1);
     // The caller owns its lifecycle — the step must not close a session it did not open.
     expect(sessions[0].status).toBe("running");
+  });
+});
+
+describe("prBody — the attribution footer", () => {
+  // Pinned literally: a bare https://github.com/ still renders as a working link in the PR, so only
+  // an exact assertion catches the attribution silently pointing at GitHub's homepage (anton-ztv7).
+  it("links [anton] at the public repo, not GitHub's homepage", () => {
+    const footer = "🤖 Generated with [anton](https://github.com/henriblancke/anton) autonomous execution";
+
+    expect(prBody(target, [target]).split("\n").at(-1)).toBe(footer);
+    // Also tied to the constant, so moving the repo moves the footer with it.
+    expect(footer).toContain(`[anton](${ANTON_REPO_URL})`);
   });
 });
