@@ -337,18 +337,6 @@ export async function applyProposal(
     );
   }
   const plan = proposalPlanOf(proposal);
-  if (!plan) {
-    // No plan, or one that disagrees with the bead's own fingerprint. Either way there is no move
-    // to run, and guessing one from the prose would mutate beads nobody approved.
-    throw await attachFailure(
-      repo,
-      proposal.id,
-      new ProposalApplyError(
-        "unusable",
-        `${proposal.id} carries no readable gardener move — it cannot be applied; apply it by hand and decline it`,
-      ),
-    );
-  }
 
   // The WHOLE application — decide, write every step, settle — runs under the proposal's own write
   // lock, not just its closing write. A cluster re-parent releases each subject's lock between
@@ -356,7 +344,22 @@ export async function applyProposal(
   // a subject to its stale `undoParent` while the other, which had already moved that subject, runs
   // on and closes the proposal — a settled proposal claiming a cluster the board only half holds.
   // Serialized, the second approval finds the proposal already closed and writes nothing at all.
-  return withBeadWriteLock(repo, proposal.id, () => applyApproved(repo, proposal, plan, board));
+  return withBeadWriteLock(repo, proposal.id, async () => {
+    if (!plan) {
+      // No plan, or one that disagrees with the bead's own fingerprint. Either way there is no move
+      // to run, and guessing one from the prose would mutate beads nobody approved. Inside the lock
+      // like every other write this module makes to a proposal — the refusal still notes the bead.
+      throw await attachFailure(
+        repo,
+        proposal.id,
+        new ProposalApplyError(
+          "unusable",
+          `${proposal.id} carries no readable gardener move — it cannot be applied; apply it by hand and decline it`,
+        ),
+      );
+    }
+    return applyApproved(repo, proposal, plan, board);
+  });
 }
 
 /** The application itself: decide, write, settle — always under the proposal's lock (see caller). */
