@@ -93,6 +93,16 @@ function proposalFor(plan: GardenerPlan, extra: Partial<Bead> = {}): Bead {
   });
 }
 
+/** The moment every decision below is judged at — only the run-lease checks read it. */
+const NOW = Date.parse("2026-08-03T00:00:00Z");
+
+/** A bead a run owns right now: an unexpired lease, dated relative to `at`. */
+const leased = (id: string, at: number): Bead =>
+  bead(id, { assignee: "runner-1", labels: [LABELS.runLease(at + 60_000, "run-9")] });
+
+/** The other half of the same bar (board-index `isInFlight`): a run whose PR is up. */
+const inReview = (id: string): Bead => bead(id, { labels: ["stage:in-review"] });
+
 /** A feature card with an open ticket under it — a legal re-parent home. */
 const CARD = bead("anton-card", { issue_type: "feature" });
 
@@ -283,6 +293,40 @@ describe("planApply — what an approval means against the board as it now is", 
       const board = [bead("anton-a"), bead("anton-b")];
       expect(refusal(planApply(SUPERSEDE, board))).toMatch(/has not landed/);
     });
+
+    // The bar every detector proposes under (board-index `isInFlight`), re-checked HERE because the
+    // run usually claims the bead AFTER the proposal was filed: approving last night's ask would
+    // re-parent or retire work an agent is mid-flight over.
+    it("refuses every move against a bead a run owns — live lease or open PR alike", () => {
+      for (const live of [leased("anton-a", NOW), inReview("anton-a")]) {
+        expect(refusal(planApply(REPARENT, [CARD, live], NOW))).toMatch(/anton-a is mid-run/);
+        expect(refusal(planApply(CLUSTER, [CARD, live, bead("anton-b")], NOW))).toMatch(
+          /anton-a is mid-run/,
+        );
+        expect(refusal(planApply(LINK, [live, bead("anton-b")], NOW))).toMatch(/anton-a is mid-run/);
+        expect(refusal(planApply(DEFER, [live], NOW))).toMatch(/anton-a is mid-run/);
+        expect(refusal(planApply(CLOSE, [live], NOW))).toMatch(/anton-a is mid-run/);
+        const survivor = bead("anton-b", { status: "closed" });
+        expect(refusal(planApply(SUPERSEDE, [live, survivor], NOW))).toMatch(/anton-a is mid-run/);
+      }
+    });
+
+    it("names the run that owns it, so the operator knows what they are waiting on", () => {
+      expect(refusal(planApply(DEFER, [leased("anton-a", NOW)], NOW))).toMatch(
+        /live lease on it \(runner-1\)/,
+      );
+      expect(refusal(planApply(DEFER, [inReview("anton-a")], NOW))).toMatch(/it is in review/);
+    });
+
+    it("applies against an EXPIRED lease — a crashed run owns nothing", () => {
+      const dead = bead("anton-a", { labels: [LABELS.runLease(NOW - 1, "run-9")] });
+      expect(planApply(DEFER, [dead], NOW).status).toBe("apply");
+    });
+
+    it("still SETTLES a mid-run bead the board already retired — there is nothing to write", () => {
+      const done = { ...leased("anton-a", NOW), status: "deferred" };
+      expect(planApply(DEFER, [done], NOW).status).toBe("settled");
+    });
   });
 });
 
@@ -352,6 +396,27 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     expect(calls).toEqual([
       `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-a is closed — the board moved on since this was proposed`,
     ]);
+  });
+
+  it("refuses to touch a bead a run claimed since the proposal was filed", async () => {
+    // Dated off the wall clock the apply itself reads, which is what makes the lease unexpired.
+    const proposal = proposalFor(DEFER);
+    const live = leased("anton-a", Date.now());
+
+    await expect(applyProposal(REPO, proposal, [live, proposal])).rejects.toMatchObject({
+      failure: "refused",
+    });
+    // Nothing but the explanation on the proposal: the subject bead is left to its run.
+    expect(calls).toEqual([
+      `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-a is mid-run — a run holds a live lease on it (runner-1), so retiring it would race the run that owns it`,
+    ]);
+
+    calls.length = 0;
+    const reparent = proposalFor(REPARENT);
+    await expect(
+      applyProposal(REPO, reparent, [CARD, inReview("anton-a"), reparent]),
+    ).rejects.toMatchObject({ failure: "refused" });
+    expect(calls.filter((c) => !c.startsWith("note"))).toEqual([]);
   });
 
   it("refuses a bead whose plan cannot be read, rather than guessing one from its prose", async () => {

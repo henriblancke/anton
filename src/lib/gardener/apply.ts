@@ -11,8 +11,10 @@
  *     approver never read about.
  *   • THE BOARD DECIDES, NOT THE PLAN. Every precondition is re-checked against a FRESH board read
  *     at approve time, because a proposal filed last night describes a board that has since moved.
- *     Stale plans refuse loudly; a board that already reads as applied SETTLES the proposal instead
- *     of writing again, so a retry after a half-finished approve converges rather than double-moves.
+ *     That includes the bar every detector proposes under — work a run owns is off limits — since
+ *     the run that now holds the bead usually started AFTER the proposal was filed. Stale plans
+ *     refuse loudly; a board that already reads as applied SETTLES the proposal instead of writing
+ *     again, so a retry after a half-finished approve converges rather than double-moves.
  *   • NO PARTIAL SILENT STATE. The only multi-write move is a cluster re-parent, and its steps carry
  *     their own undo: a failure part-way rolls the applied prefix back and leaves the proposal OPEN
  *     with the error attached as a note. What a reader must never find is a board half-moved and a
@@ -24,7 +26,7 @@
  */
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { boardCards } from "../ticket-view";
-import { isOpenWork } from "./board-index";
+import { isInFlight, isOpenWork } from "./board-index";
 import {
   fingerprintLabelOf,
   isProposalBead,
@@ -65,16 +67,22 @@ export type ApplyDecision =
 /**
  * Decide a plan against a board, writing nothing. Pure, so every precondition — the ones that
  * protect other people's beads — is testable from a fixture board rather than a live one.
+ *
+ * `nowMs` is the moment the approval is being decided; it only dates the run-lease check below.
  */
-export function planApply(plan: GardenerPlan, board: Bead[]): ApplyDecision {
+export function planApply(
+  plan: GardenerPlan,
+  board: Bead[],
+  nowMs: number = Date.now(),
+): ApplyDecision {
   const byId = new Map(board.map((b) => [b.id, b]));
   switch (plan.move) {
     case "reparent":
-      return planReparent(plan, board, byId);
+      return planReparent(plan, board, byId, nowMs);
     case "link":
-      return planLink(plan, board, byId);
+      return planLink(plan, board, byId, nowMs);
     case "retire":
-      return planRetire(plan, byId);
+      return planRetire(plan, byId, nowMs);
   }
 }
 
@@ -82,6 +90,7 @@ function planReparent(
   plan: GardenerPlan,
   board: Bead[],
   byId: Map<string, Bead>,
+  nowMs: number,
 ): ApplyDecision {
   // A container-orphan detection with no single obvious home deliberately files WITHOUT a target —
   // it asks the approver to pick one. Approving it as-is would have to invent that answer.
@@ -120,6 +129,9 @@ function planReparent(
         reason: `${id} is ${settledWord(subject)} — the board moved on since this was proposed`,
       };
     }
+    if (isInFlight(subject, nowMs)) {
+      return { status: "refuse", reason: inFlightReason(subject, nowMs, "moving it") };
+    }
     // A parent that sits UNDER one of the subjects would make the subtree its own ancestor.
     if (isAncestor(byId, id, plan.target)) {
       return {
@@ -141,7 +153,12 @@ function planReparent(
   };
 }
 
-function planLink(plan: GardenerPlan, board: Bead[], byId: Map<string, Bead>): ApplyDecision {
+function planLink(
+  plan: GardenerPlan,
+  board: Bead[],
+  byId: Map<string, Bead>,
+  nowMs: number,
+): ApplyDecision {
   const [id] = plan.subjects;
   if (plan.subjects.length !== 1 || !id) {
     return { status: "refuse", reason: "a link proposal names exactly one blocked bead" };
@@ -170,6 +187,11 @@ function planLink(plan: GardenerPlan, board: Bead[], byId: Map<string, Bead>): A
       reason: `${plan.target} is ${settledWord(blocker)} — the work ${id} was waiting on has landed, so the edge would only make ${id} read as blocked forever`,
     };
   }
+  // Only the blocked bead is written to, and a run is executing it right now: recording an ordering
+  // edge against it would tell every other reader that live work is waiting on something.
+  if (isInFlight(blocked, nowMs)) {
+    return { status: "refuse", reason: inFlightReason(blocked, nowMs, "recording it as blocked") };
+  }
 
   return {
     status: "apply",
@@ -178,7 +200,7 @@ function planLink(plan: GardenerPlan, board: Bead[], byId: Map<string, Bead>): A
   };
 }
 
-function planRetire(plan: GardenerPlan, byId: Map<string, Bead>): ApplyDecision {
+function planRetire(plan: GardenerPlan, byId: Map<string, Bead>, nowMs: number): ApplyDecision {
   const [id] = plan.subjects;
   if (plan.subjects.length !== 1 || !id) {
     return { status: "refuse", reason: "a retirement proposal names exactly one bead" };
@@ -192,6 +214,15 @@ function planRetire(plan: GardenerPlan, byId: Map<string, Bead>): ApplyDecision 
   if (subject.status === "closed" || beads.isAbandoned(subject)) {
     return { status: "settled", summary: `${id} is already ${settledWord(subject)}` };
   }
+  if (plan.retireAs === "defer" && beads.isDeferred(subject)) {
+    return { status: "settled", summary: `${id} is already deferred` };
+  }
+  // Nothing left to settle, so from here every branch WRITES — and a bead a run owns is the one
+  // thing retirement must not write to. Closing or deferring work an agent is mid-flight over would
+  // pull the bead out from under the run that is shipping it.
+  if (isInFlight(subject, nowMs)) {
+    return { status: "refuse", reason: inFlightReason(subject, nowMs, "retiring it") };
+  }
 
   switch (plan.retireAs) {
     case "close":
@@ -201,9 +232,6 @@ function planRetire(plan: GardenerPlan, byId: Map<string, Bead>): ApplyDecision 
         summary: `closed ${id} as shipped`,
       };
     case "defer":
-      if (beads.isDeferred(subject)) {
-        return { status: "settled", summary: `${id} is already deferred` };
-      }
       return {
         status: "apply",
         steps: [{ verb: "defer", id }],
@@ -301,7 +329,7 @@ export async function applyProposal(
     );
   }
 
-  const decision = planApply(plan, board);
+  const decision = planApply(plan, board, Date.now());
   if (decision.status === "refuse") {
     throw await attachFailure(
       repo,
@@ -455,6 +483,20 @@ function closeReason(plan: GardenerPlan): string {
 
 const missing = (id: string): string =>
   `${id} is no longer on the board — the proposal describes a board that has changed`;
+
+/**
+ * Why a bead a run owns is off limits, naming the run that owns it. Every detector already refuses
+ * to PROPOSE against in-flight work (see board-index `isInFlight`) — this is the same bar re-checked
+ * at approve time, because the run may have claimed the bead AFTER the proposal was filed, and a
+ * proposal is only ever as fresh as the night it was written.
+ */
+function inFlightReason(bead: Bead, nowMs: number, doing: string): string {
+  const pr = beads.getPrRef(bead);
+  const owner = beads.isRunLive(bead, nowMs)
+    ? `a run holds a live lease on it${bead.assignee ? ` (${bead.assignee})` : ""}`
+    : `it is in review${pr ? ` on ${pr}` : ""}`;
+  return `${bead.id} is mid-run — ${owner}, so ${doing} would race the run that owns it`;
+}
 
 const settledWord = (bead: Bead): string =>
   beads.isAbandoned(bead) ? "abandoned" : bead.status === "closed" ? "closed" : bead.status;
