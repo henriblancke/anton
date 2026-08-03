@@ -57,9 +57,21 @@ function scanFilePath(id: string): string {
  * A failed read degrades to an explicit UNAVAILABLE notice rather than an omitted section: triage
  * still has `bd` and can read the board itself, whereas silence would read as an empty board and
  * every signal would mint a fresh orphan cluster.
+ *
+ * Pulled first, as the gardener does before any board-derived write: this checkout's local Dolt
+ * state can be a sync heartbeat behind another machine's push, and a bead invisible here is a
+ * fingerprint and a touch surface triage will not dedupe against. Best-effort — an unreachable
+ * remote costs freshness, not the section, and every verdict below is still correct against the
+ * local board.
  */
 async function readBoardContext(repoPath: string, logPath: string, slug: string): Promise<string> {
   try {
+    await appendSessionLog(logPath, `[stringer] board pull before read\n`);
+    await beads.pull(repoPath).catch(async (e) => {
+      const reason = e instanceof Error ? e.message : String(e);
+      await appendSessionLog(logPath, `[stringer] WARNING: board pull failed — ${reason}\n`);
+      console.warn(`[nightly-stringer] ${slug}: board pull failed — ${reason}`);
+    });
     const board = await beads.list(repoPath, ["--status", "all"]);
     const ctx = buildBoardContext(board);
     await appendSessionLog(

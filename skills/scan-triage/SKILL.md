@@ -149,7 +149,8 @@ puts two agents in the same file, and hides the debt from the person already rew
 ### 4.0 A live feature already owns these files → route there
 
 The board-context lines (§1) carry each open feature's touch surface, parsed from its `## Context`
-`touches:`. A signal whose file falls inside one belongs to **that feature**. Match on the surface,
+`touches:` **and every child ticket's** — its run implements those children, so it owns the files
+they declare. A signal whose file falls inside one belongs to **that feature**. Match on the surface,
 not the theme — same file, or the same module that feature is named for. Two files in the same repo
 is not ownership; when the signal's file is outside the surface, this rule does not fire.
 

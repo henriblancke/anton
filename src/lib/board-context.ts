@@ -51,7 +51,11 @@ export interface TouchSurface {
   touchesOmitted: number;
 }
 
-/** An open feature a signal might belong to, with the mechanical verdict on attaching to it. */
+/**
+ * An open feature a signal might belong to, with the mechanical verdict on attaching to it. Its
+ * `touches` is the whole RUN's surface — the feature's own plus its child tickets' (see
+ * {@link buildBoardContext}) — because that is what the feature's PR actually changes.
+ */
 export interface FeatureCandidate extends TouchSurface {
   id: string;
   title: string;
@@ -225,13 +229,36 @@ function epicVerdict(children: Bead[]): { attachable: boolean; reason: string } 
   return { attachable: true, reason: "empty" };
 }
 
-/** A bead's declared touch surface, capped and with the cap's cost carried alongside it. */
-function touchSurface(bead: Bead): TouchSurface {
-  const declared = parseTouches(bead);
+/** A declared surface, capped and with the cap's cost carried alongside it. */
+function capSurface(declared: string[]): TouchSurface {
   return {
     touches: declared.slice(0, MAX_TOUCHES),
     touchesOmitted: Math.max(0, declared.length - MAX_TOUCHES),
   };
+}
+
+/**
+ * Everything a bead's RUN touches: its own `touches:` plus every descendant's. A feature's run
+ * implements its child tickets, so it owns the files they declare — and a child naming a file the
+ * feature's own Context doesn't repeat would otherwise leave that file reading as unowned, which is
+ * exactly when triage mints a run target beside the feature already changing it.
+ *
+ * The bead's own paths come first, so the {@link MAX_TOUCHES} cap drops inherited surface before it
+ * drops the feature's own. Breadth-first over `parent-child`, visited-guarded — a board read is not
+ * a place to trust the edges to be acyclic.
+ */
+function runSurface(bead: Bead, children: Map<string, Bead[]>): string[] {
+  const seen = new Set<string>();
+  const visited = new Set<string>();
+  const queue: Bead[] = [bead];
+  for (let i = 0; i < queue.length; i++) {
+    const current = queue[i];
+    if (visited.has(current.id)) continue;
+    visited.add(current.id);
+    for (const path of parseTouches(current)) seen.add(path);
+    queue.push(...(children.get(current.id) ?? []));
+  }
+  return [...seen];
 }
 
 /**
@@ -251,7 +278,7 @@ export function buildBoardContext(board: Bead[]): BoardContext {
         id: b.id,
         title: b.title,
         ...(epicId ? { epicId } : {}),
-        ...touchSurface(b),
+        ...capSurface(runSurface(b, children)),
         attachable: verdict.attachable,
         attachReason: verdict.reason,
       };
@@ -279,7 +306,7 @@ export function buildBoardContext(board: Bead[]): BoardContext {
       title: bead.title,
       status: bead.status,
       fingerprints,
-      ...touchSurface(bead),
+      ...capSurface(parseTouches(bead)),
     }));
 
   return {

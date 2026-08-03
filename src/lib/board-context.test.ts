@@ -119,6 +119,37 @@ describe("buildBoardContext — feature attach verdicts", () => {
     });
   });
 
+  it("owns the files its child tickets declare, not just the ones it repeats itself", () => {
+    // The feature's RUN implements its children, so a file only a child names is still owned — read
+    // as unowned, it is the signal that mints a run target beside the run already changing it.
+    const feature = bead({ id: "f-1", issue_type: "feature", ...surface });
+    const child = childOf(
+      bead({ id: "t-1", issue_type: "task", context: "touches: src/lib/auth/token.ts" }),
+      "f-1",
+    );
+    const grandchild = childOf(
+      bead({ id: "t-2", issue_type: "task", context: "touches: src/lib/auth/cookie.ts" }),
+      "t-1",
+    );
+    const ctx = buildBoardContext([feature, child, grandchild]);
+
+    expect(ctx.features[0].touches).toEqual([
+      "src/lib/auth/session.ts",
+      "src/lib/auth/token.ts",
+      "src/lib/auth/cookie.ts",
+    ]);
+  });
+
+  it("survives a cyclic parent-child edge rather than hanging on the board read", () => {
+    const feature = childOf(bead({ id: "f-1", issue_type: "feature", ...surface }), "t-1");
+    const child = childOf(
+      bead({ id: "t-1", issue_type: "task", context: "touches: src/lib/auth/token.ts" }),
+      "f-1",
+    );
+    const ctx = buildBoardContext([feature, child]);
+    expect(ctx.features[0].touches).toEqual(["src/lib/auth/session.ts", "src/lib/auth/token.ts"]);
+  });
+
   it("refuses a childless feature — its first child would replace its own spec", () => {
     const ctx = buildBoardContext([bead({ id: "f-1", issue_type: "feature", ...surface })]);
     expect(ctx.features[0].attachable).toBe(false);

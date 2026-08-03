@@ -269,6 +269,18 @@ process.exit(0);`,
     expect(summary?.triage).toEqual({ created: 1, deduped: 1 });
   });
 
+  it("pulls the board before deriving the routing context", async () => {
+    // The context is only as fresh as this checkout's local Dolt working set. A bead another machine
+    // pushed since the last sync is an invisible fingerprint AND an invisible touch surface, so an
+    // unpulled read is exactly how an unattended scan re-raises work that is already on the board.
+    const sessions = await tdb.db.select().from(schema.sessions);
+    const latest = sessions.sort((a, b) => Number(b.startedAt) - Number(a.startedAt))[0];
+    const log = readFileSync(latest.logPath!, "utf8");
+
+    expect(log).toContain("[stringer] board pull before read");
+    expect(log.indexOf("board pull before read")).toBeLessThan(log.indexOf("board context:"));
+  });
+
   it("files a discovered-from sibling instead when the owning feature's run has been captured", async () => {
     // The debt bead from the first pass is closed (so the signal is fresh again), and the feature is
     // now mid-run — a ticket added to it now would never be implemented.
