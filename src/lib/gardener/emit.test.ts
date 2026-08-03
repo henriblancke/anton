@@ -18,6 +18,7 @@ import { detectBoard } from "./detect";
 import {
   concernedBeads,
   makeDetection,
+  proposalPlanOf,
   type DetectionInput,
   type GardenerDetection,
 } from "./detections";
@@ -137,6 +138,30 @@ describe("the proposal bead", () => {
     expect(draft.labels.some((l) => l.startsWith("agent:"))).toBe(false);
     for (const line of detection.evidence) expect(draft.description).toContain(line);
     expect(draft.description).toContain(detection.fingerprint);
+  });
+
+  it("carries its MOVE as metadata, so applying it never has to parse the prose (anton-1t3n)", () => {
+    const detection = reparent();
+    const draft = proposalDraft(detection);
+
+    // The bead as the next board read hands it back: label + metadata, both written by this create.
+    const asBoardSees: Bead = {
+      id: "anton-prop",
+      title: draft.title,
+      status: "open",
+      issue_type: draft.type,
+      labels: draft.labels,
+      metadata: draft.metadata,
+    };
+    expect(proposalPlanOf(asBoardSees)).toEqual({
+      kind: detection.kind,
+      move: detection.move,
+      fingerprint: detection.fingerprint,
+      subjects: detection.subjects,
+      target: detection.target,
+    });
+    // A plan whose fingerprint disagrees with the bead's own label is not this bead's plan.
+    expect(proposalPlanOf({ ...asBoardSees, labels: ["gardener:stale:0123456789ab"] })).toBeUndefined();
   });
 
   it("hangs a discovered-from edge off EVERY bead the move concerns, not just the one it acts on", () => {

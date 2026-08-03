@@ -23,7 +23,14 @@
  */
 import { beads, type Bead } from "../beads/bd";
 import { isOpenWork } from "./board-index";
-import { concernedBeads, fingerprintLabelOf, type GardenerDetection } from "./detections";
+import {
+  concernedBeads,
+  fingerprintLabelOf,
+  GARDENER_PLAN_KEY,
+  planOf,
+  type GardenerDetection,
+  type GardenerPlan,
+} from "./detections";
 
 /** `source:` provenance every proposal carries — the `source:stringer` convention, one namespace over. */
 export const GARDENER_SOURCE = "gardener";
@@ -107,12 +114,20 @@ export interface ProposalDraft {
   acceptance: string;
   description: string;
   deps: string[];
+  /** The move, as data, under {@link GARDENER_PLAN_KEY} — what apply-on-approve reads (anton-1t3n). */
+  metadata: Record<typeof GARDENER_PLAN_KEY, GardenerPlan>;
 }
 
 /**
  * The proposal bead for one detection: the full ticket contract (Goal / Acceptance / Context / Out of
- * scope / Verify), the evidence, the fingerprint, and a `discovered-from` edge to every bead the move
- * concerns — so the proposal is reachable from each bead it would touch, not just the one it acts on.
+ * scope / Verify), the evidence, the fingerprint, a `discovered-from` edge to every bead the move
+ * concerns — so the proposal is reachable from each bead it would touch, not just the one it acts on
+ * — and the MOVE ITSELF as metadata.
+ *
+ * The prose and the metadata are for different readers and neither substitutes for the other: a
+ * human decides from the evidence, and apply-on-approve (anton-1t3n) executes from the plan. Both
+ * land in one `bd create`, so no proposal ever exists in a state where the board shows the ask but
+ * approving it has nothing to run.
  *
  * `task` and parentless is what makes it a run target the board renders as a chip; a `chore`, or a
  * child of anything, would be a bead only the tickets list ever shows.
@@ -125,6 +140,7 @@ export function proposalDraft(detection: GardenerDetection): ProposalDraft {
     acceptance: acceptanceOf(detection),
     description: descriptionOf(detection),
     deps: concernedBeads(detection).map((id) => `discovered-from:${id}`),
+    metadata: { [GARDENER_PLAN_KEY]: planOf(detection) },
   };
 }
 

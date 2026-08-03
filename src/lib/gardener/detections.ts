@@ -159,6 +159,104 @@ export function isProposalBead(bead: { labels?: string[] }): boolean {
 }
 
 /**
+ * The metadata key a proposal bead carries its move under (anton-1t3n). A proposal's prose is for
+ * the human deciding; THIS is what the apply step reads — the move as data, written in the same
+ * `bd create` as the bead itself, so approving one never depends on parsing a description a person
+ * is free to edit.
+ */
+export const GARDENER_PLAN_KEY = "gardener";
+
+/**
+ * The move a proposal would apply, stripped of everything only a reader needs (summary, evidence).
+ * Exactly the fields the executors branch on — anything else would be state the board and the plan
+ * could disagree about.
+ */
+export interface GardenerPlan {
+  kind: GardenerDetectionKind;
+  move: GardenerMove;
+  fingerprint: string;
+  subjects: string[];
+  target?: string;
+  retireAs?: RetireVerb;
+}
+
+/** The plan half of a detection — what rides on the proposal bead as metadata. */
+export function planOf(detection: GardenerDetection): GardenerPlan {
+  return {
+    kind: detection.kind,
+    move: detection.move,
+    fingerprint: detection.fingerprint,
+    subjects: detection.subjects,
+    ...(detection.target ? { target: detection.target } : {}),
+    ...(detection.retireAs ? { retireAs: detection.retireAs } : {}),
+  };
+}
+
+const GARDENER_MOVES: readonly GardenerMove[] = ["reparent", "link", "retire"];
+const RETIRE_VERBS: readonly RetireVerb[] = ["close", "supersede", "defer"];
+
+/**
+ * Read a plan back off a bead's metadata, or `undefined` when what is there is not one. Validated
+ * field by field rather than cast: this value decides which beads get MUTATED, so anything the
+ * emitter did not write — a hand-edited metadata blob, a plan from a future anton that added a move
+ * — must read as "no readable plan" and stop the apply, not fall through to a default branch.
+ *
+ * `retireAs` is required exactly when the move is `retire` and forbidden otherwise, which is the
+ * same invariant {@link GardenerDetection} documents; a retire with no verb has no safe default.
+ */
+export function parseGardenerPlan(value: unknown): GardenerPlan | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+
+  const kind = raw.kind;
+  const move = raw.move;
+  const fingerprint = raw.fingerprint;
+  if (typeof kind !== "string" || !GARDENER_DETECTION_KINDS.includes(kind as GardenerDetectionKind)) {
+    return undefined;
+  }
+  if (typeof move !== "string" || !GARDENER_MOVES.includes(move as GardenerMove)) return undefined;
+  if (typeof fingerprint !== "string" || !FINGERPRINT_LABEL.test(fingerprint)) return undefined;
+
+  const subjects = raw.subjects;
+  if (!Array.isArray(subjects) || subjects.length === 0) return undefined;
+  if (!subjects.every((s) => typeof s === "string" && s.length > 0)) return undefined;
+
+  const target = raw.target;
+  if (target !== undefined && (typeof target !== "string" || !target)) return undefined;
+
+  const retireAs = raw.retireAs;
+  if (move === "retire") {
+    if (typeof retireAs !== "string" || !RETIRE_VERBS.includes(retireAs as RetireVerb)) {
+      return undefined;
+    }
+  } else if (retireAs !== undefined) {
+    return undefined;
+  }
+
+  return {
+    kind: kind as GardenerDetectionKind,
+    move: move as GardenerMove,
+    fingerprint,
+    subjects: subjects as string[],
+    ...(target ? { target: target as string } : {}),
+    ...(move === "retire" ? { retireAs: retireAs as RetireVerb } : {}),
+  };
+}
+
+/**
+ * The move a PROPOSAL BEAD carries, if it carries a readable one. The bead's own fingerprint label
+ * has to agree with the plan's: they are two records of one claim, and a mismatch means the bead was
+ * assembled by something other than the emitter — which is exactly when applying it blind is worst.
+ */
+export function proposalPlanOf(bead: { labels?: string[]; metadata?: Record<string, unknown> }):
+  | GardenerPlan
+  | undefined {
+  const plan = parseGardenerPlan(bead.metadata?.[GARDENER_PLAN_KEY]);
+  if (!plan) return undefined;
+  return fingerprintLabelOf(bead) === plan.fingerprint ? plan : undefined;
+}
+
+/**
  * Every bead a detection concerns — its subjects plus whatever it points at. This is the set the
  * emitter hangs `discovered-from` edges off (anton-9qwq), so a proposal is reachable from each bead
  * it would touch, not just from the one it acts on.

@@ -6,6 +6,7 @@
  */
 import { beads } from "./beads/bd";
 import { nudgeSync } from "./beads/sync-nudge";
+import { declineNote } from "./gardener/apply";
 import { cancelRunForTarget, runIsLiveForTarget } from "./jobs/service";
 import { freshDetail } from "./ticket-detail";
 import type { Bead } from "./beads/bd";
@@ -188,6 +189,16 @@ export async function abandonTicket(
   // The ticket and its cascade settle as one unit — every close in a single bd transaction, the
   // ticket last (see beads.abandonAll).
   await beads.abandonAll(project.repoPath, cascadeEntries(bead, descendants, why));
+  // Abandoning a gardener PROPOSAL is a DECLINE (anton-1t3n): the `abandoned` label it just gained
+  // is what stops the patrol re-filing the same claim, so say that on the bead — the suppression is
+  // a consequence of the label that nothing else spells out. After the settle and best-effort: the
+  // decision has landed either way, and a failed note must not fail the abandon.
+  const declined = declineNote(bead);
+  if (declined) {
+    await beads
+      .note(project.repoPath, id, declined)
+      .catch((e) => console.error(`[abandon] could not record the decline on ${id}`, e));
+  }
   // Read-after-write, like setTicketDeferred: the `bd show` bead is authoritative for the abandoned
   // state it just wrote, so the response never reflects the board's stale snapshot.
   const detail = await freshDetail(project, await beads.show(project.repoPath, id));

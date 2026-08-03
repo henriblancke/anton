@@ -17,6 +17,7 @@ import { ClaimControl } from "@/components/board/claim-control";
 import { TYPE_RAIL, TYPE_TEXT, agentDotClass } from "@/components/board/board-utils";
 import { TypeBadge, TypeIcon } from "@/components/board/type-language";
 import { toastContractAdvisory } from "@/components/board/contract-advisory";
+import { readAppliedSummary } from "@/components/board/proposal-applied";
 import { ApproveBlocked, ContractChip } from "@/components/board/contract-mark";
 
 /** Short PR label from a bead external-ref: `gh-218` / a URL ending in `/218` → `#218`. */
@@ -80,8 +81,15 @@ export function StandaloneChip({
         const body = (await res.json().catch(() => null)) as { error?: string } | null;
         throw new Error(body?.error ?? `Approve failed (${res.status})`);
       }
+      // A gardener proposal is applied, not run: report the board move it made rather than a run
+      // that never started (anton-1t3n).
+      const applied = await readAppliedSummary(res);
       toast.success(
-        immediate ? `Approved & running "${item.title}"` : `Queued "${item.title}" for optimal usage`,
+        applied
+          ? `Applied — ${applied}`
+          : immediate
+            ? `Approved & running "${item.title}"`
+            : `Queued "${item.title}" for optimal usage`,
       );
       // The run starts with whatever thin sections it has; say so once, here.
       await toastContractAdvisory(res);

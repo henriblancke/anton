@@ -6,8 +6,11 @@ import { beads, type Bead } from "@/lib/beads/bd";
 import { contractGaps, formatContractGaps } from "@/lib/beads/contract";
 import { nudgeSync } from "@/lib/beads/sync-nudge";
 import { conflictBody, ownerOf, withClaimLock } from "@/lib/beads/claim";
+import { applyProposal, ProposalApplyError } from "@/lib/gardener/apply";
+import { isProposalBead } from "@/lib/gardener/detections";
 import { enqueueExecuteEpic, enqueueExecuteEpicIfAbsent } from "@/lib/jobs/service";
 import { resolveOperator } from "@/lib/operator";
+import type { Project } from "@/lib/types";
 import { contractGatedBeads, deriveStage, runTickets } from "@/lib/ticket-view";
 import { STAGES } from "@/lib/types";
 import { notFoundResponse, withProject } from "../../../resolve-project";
@@ -45,6 +48,43 @@ async function readApprovalBody(
   }
 }
 
+/** HTTP status per apply failure: the caller's mistake, the board's, or ours. */
+const APPLY_STATUS = { unusable: 422, refused: 409, failed: 500 } as const;
+
+/**
+ * Approve a gardener proposal: apply its board move and close it (anton-1t3n). Never enqueues a run
+ * and never writes the `approved` label — a proposal is a decision, and the decision IS the move.
+ *
+ * A failure answers with the reason the apply refused and leaves the proposal OPEN with that reason
+ * noted on the bead, so the operator finds the same explanation whether they look at the toast or at
+ * the ticket. `refused` in particular is the ordinary case: a proposal filed last night describes a
+ * board that has since moved, and the honest answer is to say what changed, not to force the move.
+ */
+async function applyProposalResponse(
+  project: Project,
+  proposal: Bead,
+  board: Bead[],
+): Promise<NextResponse> {
+  try {
+    const applied = await applyProposal(project.repoPath, proposal, board);
+    // The move landed locally; propagate it like every other operator write (immediate coalesced
+    // push + the durable backstop), off the response path.
+    nudgeSync({ id: project.id, repoPath: project.repoPath }, "approve");
+    return NextResponse.json({ applied });
+  } catch (err) {
+    if (err instanceof ProposalApplyError) {
+      return NextResponse.json(
+        { error: err.message, proposal: proposal.id },
+        { status: APPLY_STATUS[err.failure] },
+      );
+    }
+    // Not a decision this module made — a bd read/write that broke outside the apply's own guards.
+    console.error(`[approve] applying proposal ${proposal.id} failed`, err);
+    const message = err instanceof Error ? err.message : "Failed to apply the proposal";
+    return NextResponse.json({ error: message, proposal: proposal.id }, { status: 500 });
+  }
+}
+
 export const POST = withProject<{ slug: string; epicId: string }>(async (request, { project, params }) => {
   const { epicId } = params;
 
@@ -69,6 +109,16 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   if (!target) {
     return notFoundResponse(`Ticket ${epicId} not found on the board`);
   }
+
+  // A gardener PROPOSAL is approved, not run (anton-1t3n). It is shaped as a parentless task, so
+  // every gate below would happily pass it through to `enqueueExecuteEpic` — which would dispatch an
+  // agent to "implement" a decision whose whole content is a board move anton can apply itself. So
+  // the branch sits here, ahead of the label and the enqueue: approving one applies its move through
+  // the beads seam and closes it, and nothing about the run path is reached.
+  if (isProposalBead(target)) {
+    return applyProposalResponse(project, target, allBeads);
+  }
+
   if (!beads.isRunTarget(target, allBeads)) {
     const parent = beads.parentOf(target);
     const type = target.issue_type ?? "unknown";
