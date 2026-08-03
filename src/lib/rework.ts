@@ -86,6 +86,10 @@ export async function reworkTicket(
 ): Promise<ReworkResult> {
   const summary = input.summary?.trim() ?? "";
   const instructions = input.instructions?.trim() ?? "";
+  // A missing id is a malformed request (400), not a rework that can't apply (422) — without this it
+  // would fall through to the membership check and be reported as `'' is not part of <target>'s run`.
+  const ticketId = input.ticketId?.trim() ?? "";
+  if (!ticketId) throw new ReworkInvalidError("A ticket to send back is required");
   if (!summary) throw new ReworkInvalidError("A one-line summary is required");
   if (summary.length > MAX_REWORK_SUMMARY_CHARS) {
     throw new ReworkInvalidError(
@@ -113,10 +117,10 @@ export async function reworkTicket(
         `back a ticket of the feature (or standalone item) that actually ran`,
     );
   }
-  const ticket = runMembers(target, all).find((b) => b.id === input.ticketId);
+  const ticket = runMembers(target, all).find((b) => b.id === ticketId);
   if (!ticket) {
     throw new ReworkNotAllowedError(
-      `${input.ticketId} is not part of ${targetId}'s run — only the work that run reviewed can be ` +
+      `${ticketId} is not part of ${targetId}'s run — only the work that run reviewed can be ` +
         `sent back from its report`,
     );
   }

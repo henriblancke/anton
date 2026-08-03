@@ -105,6 +105,16 @@ describe("validation", () => {
     expect(noteMock).not.toHaveBeenCalled();
   });
 
+  it("refuses a missing ticket id as malformed, not as a rework that can't apply", async () => {
+    await expect(reworkTicket(project, "feat", input({ ticketId: "" }))).rejects.toBeInstanceOf(
+      ReworkInvalidError,
+    );
+    await expect(reworkTicket(project, "feat", input({ ticketId: "  " }))).rejects.toBeInstanceOf(
+      ReworkInvalidError,
+    );
+    expect(noteMock).not.toHaveBeenCalled();
+  });
+
   it("refuses an oversized instruction — it is inlined verbatim into the agent's prompt", async () => {
     await expect(
       reworkTicket(project, "feat", input({ instructions: "x".repeat(2001) })),
