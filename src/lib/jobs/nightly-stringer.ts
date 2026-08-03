@@ -15,6 +15,11 @@ import { runClaude } from "../claude/driver";
 import { describeCollectorFailure, scan } from "../stringer";
 import { formatScanSeverityPolicy } from "../scan-severity";
 import {
+  buildBoardContext,
+  formatBoardContext,
+  formatBoardContextUnavailable,
+} from "../board-context";
+import {
   parseTriageOutcome,
   saveScanSummary,
   summarizeScanFile,
@@ -42,6 +47,33 @@ export interface NightlyStringerDeps {
 function scanFilePath(id: string): string {
   const root = process.env.ANTON_SCANS_ROOT ?? join(process.cwd(), ".anton", "scans");
   return join(root, `${id}.json`);
+}
+
+/**
+ * The board section of the triage prompt (anton-ol1l). Read from the whole board — `--status all`,
+ * because a feature's children and an epic's tier are only legible with closed beads in the read,
+ * and buildBoardContext offers only the open ones as routing targets.
+ *
+ * A failed read degrades to an explicit UNAVAILABLE notice rather than an omitted section: triage
+ * still has `bd` and can read the board itself, whereas silence would read as an empty board and
+ * every signal would mint a fresh orphan cluster.
+ */
+async function readBoardContext(repoPath: string, logPath: string, slug: string): Promise<string> {
+  try {
+    const board = await beads.list(repoPath, ["--status", "all"]);
+    const ctx = buildBoardContext(board);
+    await appendSessionLog(
+      logPath,
+      `[stringer] board context: ${ctx.features.length} open feature(s), ${ctx.epics.length} open epic(s), ` +
+        `${ctx.producers.length} producer-filed bead(s)\n`,
+    );
+    return formatBoardContext(ctx);
+  } catch (e) {
+    const reason = e instanceof Error ? e.message : String(e);
+    await appendSessionLog(logPath, `[stringer] WARNING: board context unavailable — ${reason}\n`);
+    console.warn(`[nightly-stringer] ${slug}: board context unavailable — ${reason}`);
+    return formatBoardContextUnavailable(reason);
+  }
 }
 
 /** Build the runner handler bound to a db/clock. Register it as the "nightly-stringer" handler. */
@@ -124,10 +156,13 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
       }
       await appendSessionLog(logPath, `[stringer] ${result.signalCount} signal(s) → /scan-triage\n`);
 
-      // 3. Dispatch claude with the scan-triage prompt to turn signals into beads (via bd). The
-      // severity mapping rides along resolved (anton-bz1w): the skill documents the default, but
-      // only the project's own policy tells this agent how to label what it files.
+      // 3. Dispatch claude with the scan-triage prompt to turn signals into beads (via bd). Two
+      // things ride along resolved rather than left to the agent: the project's severity mapping
+      // (anton-bz1w — the skill documents the default, only the project says how to label), and the
+      // board itself (anton-ol1l — the structure a signal routes into and the fingerprints every
+      // producer already filed, so an unattended scan can't miss a read and duplicate work).
       const triagePrompt = await loadSkill("scan-triage");
+      const boardSection = await readBoardContext(project.repoPath, logPath, project.slug);
       const prompt = [
         triagePrompt,
         ``,
@@ -139,6 +174,8 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
         `This project's severity mapping — label and prioritize every bead you file by it:`,
         ``,
         formatScanSeverityPolicy(resolveScanSeverity(settings)),
+        ``,
+        boardSection,
       ].join("\n");
 
       const claudeResult = await runClaude({

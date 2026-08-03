@@ -1,0 +1,27 @@
+{
+  "metadata": {
+    "repo": "sandbox",
+    "generated_at": "2026-08-01T03:12:44Z",
+    "mode": "delta"
+  },
+  "signals": [
+    {
+      "Source": "complexity",
+      "Kind": "complexity",
+      "FilePath": "src/lib/auth/session.ts",
+      "Line": 88,
+      "Title": "refreshSession cyclomatic complexity 18.4",
+      "Priority": 3,
+      "Detail": "refreshSession (line 88) scores 18.4; the branch tree around token refresh is the bulk of it."
+    },
+    {
+      "Source": "duplication",
+      "Kind": "duplication",
+      "FilePath": "src/lib/runs.ts",
+      "Line": 9,
+      "Title": "RunDetail declared twice — run-detail-view.tsx:28-42 and runs.ts:9-31",
+      "Priority": 3,
+      "Detail": "0.91 similarity across the two declarations."
+    }
+  ]
+}
