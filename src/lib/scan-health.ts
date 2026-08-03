@@ -19,7 +19,6 @@
  * backlog otherwise.
  */
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
 import { and, desc, eq, notInArray, sql } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import type { AntonDb, Clock } from "./jobs/queue";
@@ -127,33 +126,6 @@ export function summarizeSignals(signals: ScanSignal[]): ScanCounts {
   return counts;
 }
 
-/** stringer JSON is either a top-level array or an object carrying `signals`/`issues`/`results`. */
-function extractSignals(parsed: unknown): ScanSignal[] {
-  if (Array.isArray(parsed)) return parsed as ScanSignal[];
-  if (parsed && typeof parsed === "object") {
-    const o = parsed as Record<string, unknown>;
-    for (const key of ["signals", "issues", "results"]) {
-      if (Array.isArray(o[key])) return o[key] as ScanSignal[];
-    }
-  }
-  return [];
-}
-
-/**
- * Summarize the scan file stringer just wrote. An unreadable or unparseable file summarizes as
- * ZERO signals rather than throwing: the scan itself already succeeded (the job's own error path
- * owns a failed scan), and losing the health point would be a worse outcome than a point that says
- * "this pass saw nothing" — which is exactly what the job's no-signals branch reports anyway.
- */
-export async function summarizeScanFile(scanFile: string): Promise<ScanCounts> {
-  try {
-    const raw = await readFile(scanFile, "utf8");
-    return summarizeSignals(extractSignals(JSON.parse(raw || "[]")));
-  } catch {
-    return emptyScanCounts();
-  }
-}
-
 /**
  * The bead counts out of the /scan-triage session's closing report (skills/scan-triage §6):
  * `created: N (F features, T tickets) · epics: … · deduped: D · …`.
@@ -161,6 +133,11 @@ export async function summarizeScanFile(scanFile: string): Promise<ScanCounts> {
  * Undefined when the line isn't there — a session that skipped its own protocol reported nothing,
  * and recording a zero would put "triage created no beads" on the chart for a pass that may well
  * have created several.
+ *
+ * BOTH counters are required, not either: the report is written by an agent, so partial protocol
+ * compliance is a live failure mode, and half a line is still an unreported outcome. Defaulting the
+ * missing half to 0 would assert a triage result the session never claimed — which is the one thing
+ * "not reported" exists to avoid.
  */
 export function parseTriageOutcome(text: string | undefined): TriageOutcome | undefined {
   if (!text) return undefined;
@@ -168,11 +145,8 @@ export function parseTriageOutcome(text: string | undefined): TriageOutcome | un
   // anchored `created:\s*(\d+)` can only match the bead count.
   const created = /created:\s*(\d+)/i.exec(text);
   const deduped = /deduped:\s*(\d+)/i.exec(text);
-  if (!created && !deduped) return undefined;
-  return {
-    created: created ? Number(created[1]) : 0,
-    deduped: deduped ? Number(deduped[1]) : 0,
-  };
+  if (!created || !deduped) return undefined;
+  return { created: Number(created[1]), deduped: Number(deduped[1]) };
 }
 
 /** This scan minus the previous one, per severity and in total. */

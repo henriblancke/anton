@@ -140,11 +140,20 @@ export function ScanHealthPanel({ health }: { health: ScanHealth | undefined }) 
         scanned <RelativeTime iso={iso(latest.at)} />
       </span>
 
-      {/* The headline number, with what it is made of one hover away. */}
+      {/* The headline number, with what it is made of one hover away. "new … since the previous scan"
+          is a claim only a scan that HAD a previous one can make: on a first pass `--delta` has no
+          baseline, so stringer emits everything it finds and the count is a standing total, not an
+          arrival rate. Saying "new since the previous scan" there names a comparison never made. */}
       <span className="text-xs text-muted-foreground" title={classSplit(byClass)}>
-        <span className="font-mono text-foreground">{latest.total}</span> new{" "}
-        {latest.total === 1 ? "signal" : "signals"}{" "}
-        <span className="text-subtle">since the previous scan</span>
+        <span className="font-mono text-foreground">{latest.total}</span>{" "}
+        {delta === undefined ? (
+          <>{latest.total === 1 ? "signal" : "signals"} found</>
+        ) : (
+          <>
+            new {latest.total === 1 ? "signal" : "signals"}{" "}
+            <span className="text-subtle">since the previous scan</span>
+          </>
+        )}
       </span>
 
       <DeltaChip delta={delta?.total} />

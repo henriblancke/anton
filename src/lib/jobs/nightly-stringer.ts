@@ -22,8 +22,8 @@ import {
 import {
   parseTriageOutcome,
   saveScanSummary,
-  summarizeScanFile,
   summarizeScanLine,
+  summarizeSignals,
   type ScanCounts,
   type TriageOutcome,
 } from "../scan-health";
@@ -134,7 +134,10 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
       const scanFile = scanFilePath(sessionId);
       await appendSessionLog(logPath, `[stringer] scan --delta ${project.repoPath}\n`);
       const result = await scan({ repoPath: project.repoPath, scanFile, signal: ctx.signal });
-      counts = await summarizeScanFile(scanFile);
+      // Summarized from the signals the scan already parsed — the dispatch decision below and this
+      // point on the trend must describe the same read, or the next delta is computed off a baseline
+      // that never existed.
+      counts = summarizeSignals(result.signals);
       collectorFailures = result.collectorFailures.length;
       await ctx.heartbeat();
 
@@ -148,13 +151,13 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
 
       // 2. No new signals → nothing to triage. That's a success, not an error — and a real data
       // point: a clean pass is what a falling trend is made of, so it is recorded like any other.
-      if (result.signalCount === 0) {
+      if (counts.total === 0) {
         await appendSessionLog(logPath, `[stringer] no new signals — nothing to triage\n`);
         await recordHealth(counts, { failures: collectorFailures });
         await endSession(db, clock, sessionId, "done");
         return;
       }
-      await appendSessionLog(logPath, `[stringer] ${result.signalCount} signal(s) → /scan-triage\n`);
+      await appendSessionLog(logPath, `[stringer] ${counts.total} signal(s) → /scan-triage\n`);
 
       // 3. Dispatch claude with the scan-triage prompt to turn signals into beads (via bd). Two
       // things ride along resolved rather than left to the agent: the project's severity mapping

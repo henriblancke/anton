@@ -5,9 +5,6 @@
  * nothing" — stay distinguishable all the way to the board's view model.
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { makeTestDb, type TestDb } from "./db/testing";
@@ -22,7 +19,6 @@ import {
   saveScanSummary,
   scanHealth,
   scanHealthVersion,
-  summarizeScanFile,
   summarizeScanLine,
   summarizeSignals,
   type ScanCounts,
@@ -62,43 +58,6 @@ describe("summarizeSignals", () => {
   });
 });
 
-describe("summarizeScanFile", () => {
-  let dir: string;
-
-  beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "anton-scan-"));
-  });
-  afterEach(() => {
-    rmSync(dir, { recursive: true, force: true });
-  });
-
-  const write = (name: string, body: string): string => {
-    const path = join(dir, name);
-    writeFileSync(path, body);
-    return path;
-  };
-
-  it("reads stringer's `{signals: [...]}` shape", async () => {
-    const path = write(
-      "scan.json",
-      JSON.stringify({ signals: [{ Source: "todos" }, { Source: "vuln" }], metadata: {} }),
-    );
-    const counts = await summarizeScanFile(path);
-    expect(counts.total).toBe(2);
-    expect(counts.bySeverity.critical).toBe(1);
-  });
-
-  it("reads a bare array too", async () => {
-    const path = write("array.json", JSON.stringify([{ Source: "todos" }]));
-    expect((await summarizeScanFile(path)).total).toBe(1);
-  });
-
-  it("degrades an unreadable scan file to zero rather than failing the pass", async () => {
-    expect(await summarizeScanFile(join(dir, "nope.json"))).toEqual(emptyScanCounts());
-    expect(await summarizeScanFile(write("bad.json", "{not json"))).toEqual(emptyScanCounts());
-  });
-});
-
 describe("parseTriageOutcome", () => {
   it("reads the /scan-triage report line", () => {
     const line =
@@ -110,6 +69,13 @@ describe("parseTriageOutcome", () => {
   it("is undefined when the session reported nothing parseable — never a fabricated zero", () => {
     expect(parseTriageOutcome(undefined)).toBeUndefined();
     expect(parseTriageOutcome("I triaged some things.")).toBeUndefined();
+  });
+
+  it("rejects a HALF-reported line — an agent's partial protocol is still no outcome", () => {
+    // Storing `deduped: 0` here would put "triage deduped nothing" on the chart for a pass that
+    // never said so; "not reported" is the only honest reading of a broken report line.
+    expect(parseTriageOutcome("created: 3 (1 features, 2 tickets)")).toBeUndefined();
+    expect(parseTriageOutcome("deduped: 5 (cross-linked: 2)")).toBeUndefined();
   });
 });
 

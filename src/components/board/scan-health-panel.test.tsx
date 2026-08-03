@@ -45,13 +45,21 @@ describe("ScanHealthPanel", () => {
       <ScanHealthPanel
         health={health({
           points: [point("a", 1_700_000_000, { critical: 1, low: 5 })],
+          delta: { total: 2, bySeverity: severities({ low: 2 }) },
         })}
       />,
     );
     expect(screen.getByText("6")).toBeTruthy();
     expect(screen.getByText(/new signals/)).toBeTruthy();
+    expect(screen.getByText(/since the previous scan/)).toBeTruthy();
     expect(screen.getByText("1 critical")).toBeTruthy();
     expect(screen.getByText("5 low")).toBeTruthy();
+  });
+
+  it("does not claim a comparison on a first scan — there is no previous scan to be new since", () => {
+    render(<ScanHealthPanel health={health({ points: [point("a", 1_700_000_000, { low: 4 })] })} />);
+    expect(screen.getByText(/signals found/)).toBeTruthy();
+    expect(screen.queryByText(/since the previous scan/)).toBeNull();
   });
 
   it("says a clean scan is clean — never an empty panel", () => {

@@ -11,6 +11,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { readFile, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
+import type { ScanSignal } from "./scan-severity";
 
 const execFileAsync = promisify(execFile);
 
@@ -115,8 +116,14 @@ function toScanError(err: unknown, opts: { timeoutMs: number }): unknown {
 export interface ScanResult {
   /** Absolute path to the JSON scan file written by stringer. */
   scanFile: string;
-  /** Number of signals in the scan (0 means nothing to triage). */
-  signalCount: number;
+  /**
+   * The signals stringer wrote (empty means nothing to triage). Carried rather than just counted:
+   * the health record summarizes THESE, so the dispatch decision and the recorded counts come from
+   * one parse of one read. Re-reading the file downstream let a storage error land a zeroed point on
+   * the trend for a pass that had just dispatched triage, and split the envelope-shape knowledge
+   * across two modules that could drift apart.
+   */
+  signals: ScanSignal[];
   /** Collectors that died during the scan — their signals are silently absent from the JSON. */
   collectorFailures: CollectorFailure[];
 }
@@ -186,21 +193,25 @@ export function describeCollectorFailure(failure: CollectorFailure): string {
     : base;
 }
 
-/** stringer JSON is either a top-level array or an object carrying `signals`/`issues`. */
-function countSignals(parsed: unknown): number {
-  if (Array.isArray(parsed)) return parsed.length;
+/**
+ * stringer JSON is either a top-level array or an object carrying `signals`/`issues`/`results`.
+ * The ONE place that shape is known: every reader takes its signals from here, so a stringer that
+ * renames its envelope key can't leave the scan dispatching triage while the health record counts zero.
+ */
+export function extractSignals(parsed: unknown): ScanSignal[] {
+  if (Array.isArray(parsed)) return parsed as ScanSignal[];
   if (parsed && typeof parsed === "object") {
     const o = parsed as Record<string, unknown>;
     for (const key of ["signals", "issues", "results"]) {
-      if (Array.isArray(o[key])) return (o[key] as unknown[]).length;
+      if (Array.isArray(o[key])) return o[key] as ScanSignal[];
     }
   }
-  return 0;
+  return [];
 }
 
 /**
- * Run `stringer scan <repo> --delta --format json -o <scanFile>` and report how many signals it
- * produced, plus any collector that died mid-scan (stringer exits 0 either way — see
+ * Run `stringer scan <repo> --delta --format json -o <scanFile>` and return the signals it produced,
+ * plus any collector that died mid-scan (stringer exits 0 either way — see
  * `parseCollectorFailures`). `delta` (default true) restricts to new signals since the last scan.
  * Throws on a stringer failure (fail loud), so the job then retries/parks per the runner's policy --
  * a deadline kill throws a distinct "timed out" error rather than stringer's misleading partial stderr.
@@ -237,17 +248,17 @@ export async function scan(opts: {
     throw toScanError(err, { timeoutMs });
   }
 
-  let signalCount = 0;
+  let signals: ScanSignal[] = [];
   try {
     const raw = await readFile(opts.scanFile, "utf8");
-    signalCount = countSignals(JSON.parse(raw || "[]"));
+    signals = extractSignals(JSON.parse(raw || "[]"));
   } catch {
     // No file / unparseable output means zero signals (nothing to triage).
-    signalCount = 0;
+    signals = [];
   }
   return {
     scanFile: opts.scanFile,
-    signalCount,
+    signals,
     collectorFailures: parseCollectorFailures(stderr),
   };
 }

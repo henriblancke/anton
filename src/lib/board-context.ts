@@ -14,6 +14,7 @@
  * only checks `stringer:*` fingerprints re-raises what the gardener or a PM pass already raised.
  */
 import { beads, type Bead } from "./beads/bd";
+import { sectionBody } from "./beads/contract";
 
 /**
  * The automated producers whose fingerprints triage must arbitrate across. Fingerprints are
@@ -40,13 +41,22 @@ export interface Fingerprint {
   hash: string;
 }
 
+/**
+ * A bead's declared touch surface as the context carries it: capped at {@link MAX_TOUCHES}, plus how
+ * many the cap dropped. The count is not bookkeeping — a signal landing on a dropped file would read
+ * as unowned, so the omission is rendered and the agent is told to look the rest up before deciding.
+ */
+export interface TouchSurface {
+  touches: string[];
+  touchesOmitted: number;
+}
+
 /** An open feature a signal might belong to, with the mechanical verdict on attaching to it. */
-export interface FeatureCandidate {
+export interface FeatureCandidate extends TouchSurface {
   id: string;
   title: string;
   /** The epic it hangs under — where a genuinely unowned sibling feature would go instead. */
   epicId?: string;
-  touches: string[];
   /** True when this triage may hang a child ticket here; `attachReason` says why not when false. */
   attachable: boolean;
   attachReason: string;
@@ -63,12 +73,11 @@ export interface EpicCandidate {
 }
 
 /** A bead some automated producer already filed, as the dedup check reads it. */
-export interface ProducerBead {
+export interface ProducerBead extends TouchSurface {
   id: string;
   title: string;
   status: string;
   fingerprints: Fingerprint[];
-  touches: string[];
 }
 
 export interface BoardContext {
@@ -96,15 +105,16 @@ export function fingerprintsOf(bead: Bead): Fingerprint[] {
   return out;
 }
 
-/** The `## Context` body of a bead — its own field when bd carries one, else the description section. */
+/**
+ * The `## Context` body of a bead — its own field when bd carries one, else the description section,
+ * read through the CANONICAL contract parser (beads/contract.ts). Not a local regex: the gate accepts
+ * a heading at any depth, so a second parser that only took `##` read a conformant `# Context` bead
+ * as having no touch surface — routing then saw it as unowned and triage minted work beside the
+ * feature already changing those files.
+ */
 function contextOf(bead: Bead): string {
   if (typeof bead.context === "string" && bead.context.trim()) return bead.context;
-  const desc = bead.description ?? "";
-  const start = desc.search(/^##+\s*Context\s*$/im);
-  if (start === -1) return "";
-  const rest = desc.slice(start).replace(/^.*\n/, "");
-  const next = rest.search(/^##+\s+/m);
-  return next === -1 ? rest : rest.slice(0, next);
+  return sectionBody(bead.description, ["context"]) ?? "";
 }
 
 /** A token that reads as a repo path rather than prose — the filter that keeps `touches:` usable. */
@@ -163,6 +173,9 @@ function parentOf(bead: Bead): string | undefined {
   )?.depends_on_id;
 }
 
+/** The statuses that make a bead live work — a routing target, and a ticket a feature can strand. */
+const OPEN_STATUSES = new Set(["open", "in_progress", "blocked", "deferred"]);
+
 /**
  * Whether this triage may hang a child ticket on an open feature. Mirrors skills/scan-triage §3.2:
  * a run captures its ticket list when it starts, so a ticket added to a feature that is approved,
@@ -190,11 +203,19 @@ function featureVerdict(bead: Bead, children: Bead[]): { attachable: boolean; re
  * Whether a new feature may hang under an epic. An epic with only ticket children is itself the run
  * target (the run-target rule); the first feature under it turns it into a container and strands
  * those tickets on no run at all — a migration only a human should decide.
+ *
+ * Only OPEN tickets can be stranded, so only those count: `children` comes from the whole board read
+ * (`--status all`), and counting closed ones flagged an epic whose tickets are all long since done as
+ * pre-tier — refusing the one placement its next feature had, for work that cannot strand. A CLOSED
+ * feature child still counts above: it proves the epic is a container, which is a claim about shape,
+ * not about pending work.
  */
 function epicVerdict(children: Bead[]): { attachable: boolean; reason: string } {
   const features = children.filter((c) => c.issue_type === "feature");
   if (features.length > 0) return { attachable: true, reason: `${features.length} feature(s)` };
-  const tickets = children.filter((c) => c.issue_type !== "feature");
+  const tickets = children.filter(
+    (c) => c.issue_type !== "feature" && OPEN_STATUSES.has(c.status),
+  );
   if (tickets.length > 0) {
     return {
       attachable: false,
@@ -204,7 +225,14 @@ function epicVerdict(children: Bead[]): { attachable: boolean; reason: string } 
   return { attachable: true, reason: "empty" };
 }
 
-const OPEN_STATUSES = new Set(["open", "in_progress", "blocked", "deferred"]);
+/** A bead's declared touch surface, capped and with the cap's cost carried alongside it. */
+function touchSurface(bead: Bead): TouchSurface {
+  const declared = parseTouches(bead);
+  return {
+    touches: declared.slice(0, MAX_TOUCHES),
+    touchesOmitted: Math.max(0, declared.length - MAX_TOUCHES),
+  };
+}
 
 /**
  * Turn one full board read into the context /scan-triage routes and dedupes against. Pure: the
@@ -223,7 +251,7 @@ export function buildBoardContext(board: Bead[]): BoardContext {
         id: b.id,
         title: b.title,
         ...(epicId ? { epicId } : {}),
-        touches: parseTouches(b).slice(0, MAX_TOUCHES),
+        ...touchSurface(b),
         attachable: verdict.attachable,
         attachReason: verdict.reason,
       };
@@ -251,7 +279,7 @@ export function buildBoardContext(board: Bead[]): BoardContext {
       title: bead.title,
       status: bead.status,
       fingerprints,
-      touches: parseTouches(bead).slice(0, MAX_TOUCHES),
+      ...touchSurface(bead),
     }));
 
   return {
@@ -269,8 +297,17 @@ export function buildBoardContext(board: Bead[]): BoardContext {
 /** The heading the triage prompt refers to — one string, so skill and job can't drift apart. */
 export const BOARD_CONTEXT_HEADING = "## Board context — the board as anton read it at scan time";
 
-function surface(touches: string[]): string {
-  return touches.length > 0 ? touches.join(", ") : "(no touch surface declared)";
+/**
+ * A bead's touch surface as the agent reads it. A capped surface says SO: a signal on a file the cap
+ * dropped would otherwise read as unowned, and triage would mint a cluster beside the run already
+ * changing it — the duplicate §4.0 exists to prevent. So the line names the omission and the lookup
+ * that closes it, rather than presenting a partial surface as the whole one.
+ */
+function surface({ touches, touchesOmitted }: TouchSurface): string {
+  if (touches.length === 0) return "(no touch surface declared)";
+  return touchesOmitted > 0
+    ? `${touches.join(", ")} (+${touchesOmitted} more not shown — \`bd show\` it before deciding this signal is unowned)`
+    : touches.join(", ");
 }
 
 function omissionLine(count: number, what: string): string[] {
@@ -303,7 +340,7 @@ export function formatBoardContext(ctx: BoardContext): string {
     for (const f of ctx.features) {
       const verdict = f.attachable ? "attach:child" : `attach:no (${f.attachReason})`;
       lines.push(
-        `- ${f.id} · ${verdict} · epic:${f.epicId ?? "none"} · ${f.title} · touches: ${surface(f.touches)}`,
+        `- ${f.id} · ${verdict} · epic:${f.epicId ?? "none"} · ${f.title} · touches: ${surface(f)}`,
       );
     }
     lines.push(...omissionLine(ctx.omitted.features, "open feature(s)"));
@@ -338,7 +375,7 @@ export function formatBoardContext(ctx: BoardContext): string {
   } else {
     for (const p of ctx.producers) {
       const fps = p.fingerprints.map((f) => f.label).join(" · ");
-      lines.push(`- ${p.id} · ${p.status} · ${fps} · touches: ${surface(p.touches)} · ${p.title}`);
+      lines.push(`- ${p.id} · ${p.status} · ${fps} · touches: ${surface(p)} · ${p.title}`);
     }
     lines.push(...omissionLine(ctx.omitted.producers, "producer-filed bead(s)"));
   }

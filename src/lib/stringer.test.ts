@@ -11,6 +11,7 @@ import {
   DEFAULT_SCAN_EXCLUDES,
   STRINGER_BIN_ENV,
   describeCollectorFailure,
+  extractSignals,
   formatTimeout,
   parseCollectorFailures,
   scan,
@@ -96,7 +97,7 @@ describe("scan", () => {
     expect(argv[argv.indexOf("--collector-timeout") + 1]).toMatch(/^\d+[a-z]+$/);
     expect(argv).toContain("--delta"); // delta on by default
     expect(argv).toContain("--no-color"); // keeps stderr parseable for collector failures
-    expect(result.signalCount).toBe(2);
+    expect(result.signals).toHaveLength(2);
     expect(result.collectorFailures).toEqual([]);
   });
 
@@ -128,7 +129,7 @@ describe("scan", () => {
     process.env[STRINGER_BIN_ENV] = bin;
 
     const result = await scan({ repoPath: "/repo", scanFile: join(dir, "missing.json") });
-    expect(result.signalCount).toBe(0);
+    expect(result.signals).toHaveLength(0);
   });
 
   it("reports a collector that died even though the scan exited 0 (anton-uspu)", async () => {
@@ -138,7 +139,7 @@ describe("scan", () => {
     const result = await scan({ repoPath: "/repo", scanFile: join(dir, "scan.json") });
 
     // The scan still succeeded with the surviving collectors' signals — the loss is reported, not thrown.
-    expect(result.signalCount).toBe(1);
+    expect(result.signals).toHaveLength(1);
     expect(result.collectorFailures).toEqual([
       {
         name: "gitlog",
@@ -186,6 +187,23 @@ describe("scan", () => {
     await expect(
       scan({ repoPath: "/repo", scanFile: join(dir, "s.json"), signal: ac.signal }),
     ).rejects.toMatchObject({ name: "AbortError" });
+  });
+});
+
+// The ONE reader of stringer's envelope — the dispatch decision and the health record both take
+// their signals from here, so a shape this misses can't make them disagree about the same scan.
+describe("extractSignals", () => {
+  it("reads every envelope shape stringer emits, and a bare array", () => {
+    expect(extractSignals([{ Source: "todos" }])).toHaveLength(1);
+    expect(extractSignals({ signals: [{ Source: "todos" }, { Source: "vuln" }] })).toHaveLength(2);
+    expect(extractSignals({ issues: [{ Source: "vuln" }] })).toHaveLength(1);
+    expect(extractSignals({ results: [{ Source: "vuln" }] })).toHaveLength(1);
+  });
+
+  it("yields nothing for output carrying no signal array", () => {
+    expect(extractSignals({ metadata: {} })).toEqual([]);
+    expect(extractSignals(null)).toEqual([]);
+    expect(extractSignals("nope")).toEqual([]);
   });
 });
 

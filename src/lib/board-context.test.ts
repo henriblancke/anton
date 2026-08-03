@@ -9,6 +9,7 @@ import type { Bead } from "./beads/bd";
 import {
   BOARD_CONTEXT_HEADING,
   MAX_FEATURES,
+  MAX_TOUCHES,
   buildBoardContext,
   fingerprintsOf,
   formatBoardContext,
@@ -93,6 +94,15 @@ describe("parseTouches", () => {
     expect(parseTouches(bead({ id: "a-1", context: "Found while implementing anton-286r." }))).toEqual([]);
     expect(parseTouches(bead({ id: "a-1" }))).toEqual([]);
   });
+
+  it("reads a heading at ANY depth, exactly as the contract gate does", () => {
+    // A `# Context` bead passes validation, so a routing parser that only took `##` reported no
+    // touch surface for a conformant bead — and triage minted work beside it.
+    for (const heading of ["# Context", "### Context"]) {
+      const b = bead({ id: "a-1", description: `${heading}\ntouches: src/lib/runs.ts` });
+      expect(parseTouches(b)).toEqual(["src/lib/runs.ts"]);
+    }
+  });
 });
 
 describe("buildBoardContext — feature attach verdicts", () => {
@@ -146,6 +156,34 @@ describe("buildBoardContext — epic attach verdicts", () => {
     const ctx = buildBoardContext([epic, childOf(bead({ id: "t-1", issue_type: "task" }), "e-1")]);
     expect(ctx.epics[0]).toMatchObject({ attachable: false, area: "area:auth" });
     expect(ctx.epics[0].attachReason).toContain("PRE-TIER");
+  });
+
+  it("offers an epic whose only ticket children are CLOSED — nothing is left to strand", () => {
+    const epic = bead({ id: "e-1", issue_type: "epic" });
+    const ctx = buildBoardContext([
+      epic,
+      childOf(bead({ id: "t-1", issue_type: "task", status: "closed" }), "e-1"),
+      childOf(bead({ id: "t-2", issue_type: "task", status: "done" }), "e-1"),
+    ]);
+    expect(ctx.epics[0].attachable).toBe(true);
+  });
+
+  it("still refuses when ONE open ticket remains among closed ones", () => {
+    const ctx = buildBoardContext([
+      bead({ id: "e-1", issue_type: "epic" }),
+      childOf(bead({ id: "t-1", issue_type: "task", status: "closed" }), "e-1"),
+      childOf(bead({ id: "t-2", issue_type: "task" }), "e-1"),
+    ]);
+    expect(ctx.epics[0].attachReason).toContain("PRE-TIER");
+  });
+
+  it("counts a CLOSED feature child as proof the epic is a container", () => {
+    const ctx = buildBoardContext([
+      bead({ id: "e-1", issue_type: "epic" }),
+      childOf(bead({ id: "f-1", issue_type: "feature", status: "closed" }), "e-1"),
+      childOf(bead({ id: "t-1", issue_type: "task" }), "e-1"),
+    ]);
+    expect(ctx.epics[0].attachable).toBe(true);
   });
 
   it("offers an epic that already groups features, and an empty one", () => {
@@ -220,6 +258,29 @@ describe("formatBoardContext", () => {
     const ctx = buildBoardContext(board);
     expect(ctx.omitted.features).toBe(3);
     expect(formatBoardContext(ctx)).toContain("and 3 more open feature(s) (omitted");
+  });
+
+  it("says a touch surface was CAPPED rather than presenting part of it as the whole", () => {
+    // A signal on file 13 must not read as unowned — that is how a duplicate cluster gets minted
+    // beside the run already changing that file.
+    const declared = Array.from({ length: MAX_TOUCHES + 5 }, (_, i) => `src/lib/f${i}.ts`);
+    const feature = bead({
+      id: "f-1",
+      issue_type: "feature",
+      context: `touches: ${declared.join(", ")}`,
+    });
+    const ctx = buildBoardContext([feature, childOf(bead({ id: "t-1", issue_type: "task" }), "f-1")]);
+
+    expect(ctx.features[0].touches).toHaveLength(MAX_TOUCHES);
+    expect(ctx.features[0].touchesOmitted).toBe(5);
+    expect(formatBoardContext(ctx)).toContain("+5 more not shown");
+  });
+
+  it("leaves a surface inside the cap unqualified", () => {
+    const feature = bead({ id: "f-1", issue_type: "feature", context: "touches: src/lib/runs.ts" });
+    const ctx = buildBoardContext([feature, childOf(bead({ id: "t-1", issue_type: "task" }), "f-1")]);
+    expect(ctx.features[0].touchesOmitted).toBe(0);
+    expect(formatBoardContext(ctx)).not.toContain("more not shown");
   });
 
   it("names the empty sections rather than rendering a blank the agent reads as noise", () => {
