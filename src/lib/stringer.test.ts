@@ -165,7 +165,7 @@ describe("scan", () => {
     // `Priority: 2` alone reads as medium; the merge-conflict floor is what makes it high, and it is
     // exactly the rule an agent re-deriving from the raw fields would miss.
     expect(result.signals).toMatchObject([
-      { AntonSeverity: "high", AntonClass: "security" },
+      { AntonSeverity: "high", AntonClass: "risk" },
       { AntonSeverity: "low", AntonClass: "debt" },
     ]);
 

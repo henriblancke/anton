@@ -171,6 +171,9 @@ describe("the persisted series", () => {
       jobId: "job-1",
       counts: counts({ low: 7 }),
     });
+    const version = async () => scanHealthVersion(scanHealth(await listScanSummaries(tdb.db, projectId, 100)));
+    const before = await version();
+
     const retry = await saveScanSummary(tdb.db, clock, {
       projectId,
       jobId: "job-1",
@@ -183,6 +186,26 @@ describe("the persisted series", () => {
       created: 2,
       deduped: 4,
     });
+    // The backfill rewrites the row in place: a token built from the row id alone would keep 304-ing
+    // the board past the very write it exists to show.
+    expect(await version()).not.toBe(before);
+  });
+
+  it("reads a half-written triage row as unreported, never as a zero someone claimed", async () => {
+    // Both counters come from one TriageOutcome, so one column alone is a broken write — filling the
+    // other with 0 would put a triage result on the chart that no session ever reported.
+    await tdb.db.insert(schema.scanSummaries).values({
+      id: randomUUID(),
+      projectId,
+      generatedAt: new Date(clock.now()),
+      totalSignals: 1,
+      bySeverityJson: "{}",
+      byClassJson: "{}",
+      beadsCreated: 3,
+      beadsDeduped: null,
+      collectorFailures: 0,
+    });
+    expect((await listScanSummaries(tdb.db, projectId))[0].triage).toBeUndefined();
   });
 
   it("records triage counts only when triage reported them", async () => {
@@ -250,6 +273,14 @@ describe("scanHealth (the board's view)", () => {
     expect(health.latest.id).toBe("c");
     expect(health.delta?.total).toBe(-3);
     expect(scanHealthVersion(health)).toBe("c");
+  });
+
+  it("stamps the triage counts into the version — a backfill rewrites them in an existing row", () => {
+    const latest = summary("c", 300, 2);
+    expect(scanHealthVersion(scanHealth([latest]))).toBe("c");
+    expect(scanHealthVersion(scanHealth([{ ...latest, triage: { created: 2, deduped: 1 } }]))).toBe(
+      "c:2:1",
+    );
   });
 
   it("keeps a first-ever scan's missing delta missing", () => {

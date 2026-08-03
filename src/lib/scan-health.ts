@@ -302,10 +302,28 @@ function parseCounts<T extends object>(raw: string, fallback: T): T {
   }
 }
 
+/** The two triage columns as they are stored — the only mutable part of an otherwise append-only row. */
+interface TriageColumns {
+  beadsCreated: number | null;
+  beadsDeduped: number | null;
+}
+
+/**
+ * Both counters are written from one {@link TriageOutcome}, so a row carrying only one of them is a
+ * half-written outcome — the case {@link parseTriageOutcome} refuses for the same reason. Filling the
+ * missing half with 0 would assert a triage result no session ever reported.
+ */
+function rowTriage(row: TriageColumns): TriageOutcome | undefined {
+  return row.beadsCreated !== null && row.beadsDeduped !== null
+    ? { created: row.beadsCreated, deduped: row.beadsDeduped }
+    : undefined;
+}
+
 function toSummary(row: typeof schema.scanSummaries.$inferSelect): ScanSummary {
   const delta = row.deltaJson
     ? parseCounts<ScanDelta>(row.deltaJson, { total: 0, bySeverity: emptySeverityCounts() })
     : undefined;
+  const triage = rowTriage(row);
   return {
     id: row.id,
     projectId: row.projectId,
@@ -318,10 +336,7 @@ function toSummary(row: typeof schema.scanSummaries.$inferSelect): ScanSummary {
       byClass: parseCounts(row.byClassJson, emptyClassCounts()),
     },
     ...(delta ? { delta } : {}),
-    // Both columns are written together, so either one present means triage reported.
-    ...(row.beadsCreated !== null || row.beadsDeduped !== null
-      ? { triage: { created: row.beadsCreated ?? 0, deduped: row.beadsDeduped ?? 0 } }
-      : {}),
+    ...(triage ? { triage } : {}),
     collectorFailures: row.collectorFailures,
   };
 }
@@ -417,23 +432,36 @@ export async function latestScanHealth(projectId: string): Promise<ScanHealth | 
 export const NO_SCAN_HEALTH = "none";
 
 /**
- * The series' identity for the board's refresh token. Summary rows are append-only and never
- * rewritten, so the newest row's id changes exactly when there is a new scan to show — which is
- * what keeps the board's poll 304-friendly.
+ * The newest row's identity for the board's refresh token. The id alone is not enough: a retried job
+ * backfills triage counts INTO the existing row ({@link backfillTriage}), so a token built from the
+ * id would keep matching and a board polling between the two writes would never show the
+ * created/deduped figures. Everything else about a row is append-only, so stamping the one mutable
+ * pair keeps the poll 304-friendly while still moving when there is something new to render.
  */
+function scanVersion(id: string, triage: TriageOutcome | undefined): string {
+  return triage ? `${id}:${triage.created}:${triage.deduped}` : id;
+}
+
+/** The series' identity for the board's refresh token. */
 export function scanHealthVersion(health: ScanHealth | undefined): string {
-  return health?.latest.id ?? NO_SCAN_HEALTH;
+  const latest = health?.latest;
+  return latest ? scanVersion(latest.id, latest.triage) : NO_SCAN_HEALTH;
 }
 
 /** The version without paying to read the whole window — one row, no blob parse. */
 export async function latestScanHealthVersion(projectId: string): Promise<string> {
   const rows = await getDb()
-    .select({ id: schema.scanSummaries.id })
+    .select({
+      id: schema.scanSummaries.id,
+      beadsCreated: schema.scanSummaries.beadsCreated,
+      beadsDeduped: schema.scanSummaries.beadsDeduped,
+    })
     .from(schema.scanSummaries)
     .where(eq(schema.scanSummaries.projectId, projectId))
     .orderBy(desc(schema.scanSummaries.generatedAt), NEWEST_FIRST)
     .limit(1);
-  return rows[0]?.id ?? NO_SCAN_HEALTH;
+  const row = rows[0];
+  return row ? scanVersion(row.id, rowTriage(row)) : NO_SCAN_HEALTH;
 }
 
 /** One-line summary for the job log: what this scan found, and how it moved. */

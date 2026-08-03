@@ -52,10 +52,13 @@ export interface ScanSignal {
   tags?: string[] | null;
 }
 
+/** Anything that reads as a leaked credential, wherever it was found. */
+const SECRET_PATTERN = /secret|credential|password|private[-_]?key|api[-_]?key/i;
+
 /** Which class each stringer collector reports on (`stringer collectors list`). */
 const CLASS_BY_COLLECTOR: Record<string, SignalClass> = {
   vuln: "security",
-  githygiene: "security", // committed secrets, merge-conflict markers, large binaries
+  githygiene: "risk", // merge-conflict markers, large binaries — its secrets refine to `security`
   dephealth: "dependencies",
   todos: "debt",
   deadcode: "debt",
@@ -108,7 +111,7 @@ const UNKNOWN_COLLECTOR_SEVERITY: ScanSeverity = "medium";
  * `high-churn` is a churn signal, not a high-severity one.
  */
 const SECURITY_SEVERITY_FLOORS: [pattern: RegExp, severity: ScanSeverity][] = [
-  [/secret|credential|password|private[-_]?key|api[-_]?key/i, "critical"],
+  [SECRET_PATTERN, "critical"],
   [/\bcve\b|vulnerab|osv-/i, "critical"],
   [/merge[-_]?conflict|conflict[-_]?marker/i, "high"],
 ];
@@ -152,9 +155,36 @@ export function collectorOf(signal: ScanSignal): string {
   return firstString(signal.Source, signal.source);
 }
 
+/**
+ * Collectors that report on more than one class, refined by what the signal itself says. `githygiene`
+ * finds committed secrets beside merge-conflict markers and large binaries — and the triage contract
+ * files only the first as security, the rest as risk/hygiene cleanup. Classing them all `security`
+ * would over-report the health panel's security column AND stamp an `AntonClass` triage then acts on.
+ */
+const CLASS_REFINEMENTS: Record<string, [pattern: RegExp, cls: SignalClass][]> = {
+  githygiene: [[SECRET_PATTERN, "security"]],
+};
+
+/** The kind/tag/collector words a rule is matched against. */
+function haystackOf(signal: ScanSignal): string {
+  return text(
+    signal.Kind ?? signal.kind,
+    ...(signal.Tags ?? signal.tags ?? []),
+    collectorOf(signal),
+  );
+}
+
 /** The class of problem a signal reports — `other` for a collector anton doesn't know. */
 export function classOfSignal(signal: ScanSignal): SignalClass {
-  return CLASS_BY_COLLECTOR[collectorOf(signal)] ?? "other";
+  const collector = collectorOf(signal);
+  const refinements = CLASS_REFINEMENTS[collector];
+  if (refinements) {
+    const haystack = haystackOf(signal);
+    for (const [pattern, cls] of refinements) {
+      if (pattern.test(haystack)) return cls;
+    }
+  }
+  return CLASS_BY_COLLECTOR[collector] ?? "other";
 }
 
 /** The worse of two readings — SCAN_SEVERITIES is ordered worst-first, so the lower index wins. */
@@ -193,11 +223,7 @@ function rankSignal(signal: ScanSignal, haystack: string): ScanSeverity {
  * {@link SECURITY_SEVERITY_FLOORS} so a secret or a CVE can never be recorded below its worth.
  */
 export function severityOfSignal(signal: ScanSignal): ScanSeverity {
-  const haystack = text(
-    signal.Kind ?? signal.kind,
-    ...(signal.Tags ?? signal.tags ?? []),
-    collectorOf(signal),
-  );
+  const haystack = haystackOf(signal);
   const ranked = rankSignal(signal, haystack);
   const floor = matchRule(SECURITY_SEVERITY_FLOORS, haystack);
   return floor ? worst(ranked, floor) : ranked;

@@ -123,6 +123,15 @@ function contextOf(bead: Bead): string {
   return sectionBody(bead.description, ["context"]) ?? "";
 }
 
+/**
+ * Extensionless repo-root files a `touches:` line legitimately names. The slash-or-dot test below is
+ * what separates a path from prose ("touches: auth, routing"), and it would drop every one of these —
+ * leaving the file unowned, so a Stringer signal against it routes into a competing feature even
+ * though a run already owns it. Named exhaustively rather than loosened, so prose stays out.
+ */
+const EXTENSIONLESS_ROOT_FILES =
+  /^(Dockerfile|Containerfile|Makefile|Justfile|Taskfile|Procfile|Rakefile|Gemfile|Brewfile|Vagrantfile|Caddyfile|Jenkinsfile|CODEOWNERS)$/i;
+
 /** A token that reads as a repo path rather than prose — the filter that keeps `touches:` usable. */
 function asPath(token: string): string | undefined {
   const cleaned = token
@@ -133,6 +142,7 @@ function asPath(token: string): string | undefined {
     ?.replace(/:\d+(-\d+)?$/, "") // file:14 / file:28-42 — the surface is the file
     .replace(/[.,;]+$/, "");
   if (!cleaned || cleaned.length > 200) return undefined;
+  if (EXTENSIONLESS_ROOT_FILES.test(cleaned)) return cleaned;
   return /^[\w@./~-]*[/.][\w@./~-]+$/.test(cleaned) ? cleaned : undefined;
 }
 

@@ -95,6 +95,16 @@ describe("parseTouches", () => {
     expect(parseTouches(bead({ id: "a-1" }))).toEqual([]);
   });
 
+  it("keeps extensionless root files, which have neither a slash nor a dot to prove them", () => {
+    // Dropping one leaves the file unowned, so a signal against it routes into a rival feature.
+    const b = bead({ id: "a-1", context: "touches: Dockerfile, Makefile, src/lib/runs.ts" });
+    expect(parseTouches(b)).toEqual(["Dockerfile", "Makefile", "src/lib/runs.ts"]);
+  });
+
+  it("still refuses the prose words that allowlist could have opened the door to", () => {
+    expect(parseTouches(bead({ id: "a-1", context: "touches: auth, routing, the build" }))).toEqual([]);
+  });
+
   it("reads a heading at ANY depth, exactly as the contract gate does", () => {
     // A `# Context` bead passes validation, so a routing parser that only took `##` reported no
     // touch surface for a conformant bead — and triage minted work beside it.

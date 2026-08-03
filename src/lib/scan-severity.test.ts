@@ -22,11 +22,22 @@ const signal = (s: ScanSignal): ScanSignal => s;
 describe("classOfSignal", () => {
   it("maps each collector to the class a founder would file it under", () => {
     expect(classOfSignal(signal({ Source: "vuln" }))).toBe("security");
-    expect(classOfSignal(signal({ Source: "githygiene" }))).toBe("security");
     expect(classOfSignal(signal({ Source: "dephealth" }))).toBe("dependencies");
     expect(classOfSignal(signal({ Source: "todos" }))).toBe("debt");
     expect(classOfSignal(signal({ Source: "lotteryrisk" }))).toBe("risk");
     expect(classOfSignal(signal({ Source: "docstale" }))).toBe("docs");
+  });
+
+  it("splits githygiene by what it found — a secret is security, the rest is hygiene risk", () => {
+    // The triage contract files merge-conflict markers and large binaries as risk/hygiene cleanup;
+    // classing them `security` both over-reports the panel and mislabels triage's own input.
+    expect(classOfSignal(signal({ Source: "githygiene", Kind: "committed-secret" }))).toBe(
+      "security",
+    );
+    expect(classOfSignal(signal({ Source: "githygiene", Tags: ["aws-api-key"] }))).toBe("security");
+    expect(classOfSignal(signal({ Source: "githygiene", Kind: "merge-conflict" }))).toBe("risk");
+    expect(classOfSignal(signal({ Source: "githygiene", Kind: "large-binary" }))).toBe("risk");
+    expect(classOfSignal(signal({ Source: "githygiene" }))).toBe("risk");
   });
 
   it("files an unknown collector as `other` rather than dropping it", () => {
