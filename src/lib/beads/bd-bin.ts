@@ -9,6 +9,7 @@
  */
 import { spawnSync } from "node:child_process";
 import { resolveBin, type BinSpec } from "../bin";
+import { ANTON_REPO_URL } from "../repo";
 
 /** Override: absolute path (or bare name) of the bd binary. Also used by tests to point at a fake. */
 export const BD_BIN_ENV = "ANTON_BD_BIN";
@@ -28,8 +29,7 @@ const MIN_BD = { major: 1, minor: 1, patch: 0 };
  * version gate fires for npm/bundle installs too, where `docs/` isn't shipped (package.json `files`
  * and build-bundle.mjs omit it), so a relative path would dangle exactly when a user needs it.
  */
-export const BD_MIGRATION_RUNBOOK =
-  "https://github.com/henriblancke/anton/blob/main/docs/runbooks/bd-1.0.4-to-1.1.0-migration.md";
+export const BD_MIGRATION_RUNBOOK = `${ANTON_REPO_URL}/blob/main/docs/runbooks/bd-1.0.4-to-1.1.0-migration.md`;
 
 /** A `bd --version` runner, injectable for tests. */
 export type VersionRun = (bin: string) => { status: number | null; stdout?: string; stderr?: string; error?: unknown };

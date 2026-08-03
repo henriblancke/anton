@@ -41,6 +41,7 @@ import { loadSkill } from "../claude/prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
 import { commitAll, openPullRequest, type PullRequest } from "../git/ops";
 import { resolveVerifyGates, type ProjectSettings } from "../projects";
+import { ANTON_REPO_URL } from "../repo";
 import {
   appendSessionLog,
   endSession,
@@ -800,7 +801,7 @@ export function prBody(target: Bead, tickets: Bead[], advisory: ReviewFinding[] 
           ``,
         ]
       : []),
-    `🤖 Generated with [anton](https://github.com/) autonomous execution`,
+    `🤖 Generated with [anton](${ANTON_REPO_URL}) autonomous execution`,
   ];
   return lines.join("\n");
 }
