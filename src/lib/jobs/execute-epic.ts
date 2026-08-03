@@ -30,8 +30,10 @@ import {
   readWorktreeState,
   resolveFreshBase,
   restoreWorktreeState,
+  sameWorktreeState,
   worktreeHasCommitFor,
   type PullRequest,
+  type WorktreeState,
 } from "../git/ops";
 import { prNumberFromRef } from "../git/pr";
 import { createWorktree, findWorktree, removeWorktree } from "../git/worktree";
@@ -1683,6 +1685,12 @@ async function runTicket(args: {
         !committed && baseline
           ? await safe(() => restoreWorktreeState(worktreePath, baseline))
           : false;
+      // A rollback that failed — or was impossible, because the baseline itself was unreadable —
+      // may have left this ticket's files in the worktree the NEXT ticket commits from. Re-read the
+      // tree rather than assume: only changes actually left behind are dangerous, and a tree that
+      // can't be read at all counts as dangerous.
+      const leftovers =
+        !committed && !rolledBack && (await leftChangesBehind(worktreePath, baseline));
       await safe(() => beads.setStatus(repo, ticket.id, "blocked"));
       await safe(() => beads.unassign(repo, ticket.id));
       await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
@@ -1695,13 +1703,27 @@ async function runTicket(args: {
             (committed
               ? `Its work IS committed on the branch (it was stopped after the commit) — review it ` +
                 `and close the ticket by hand if it is complete. `
-              : rolledBack
-                ? `Its partial work was rolled back (nothing from it is on the branch). `
-                : `Its partial work could NOT be rolled back — check the run's worktree for ` +
-                  `uncommitted changes before resuming. `) +
+              : leftovers
+                ? `Its partial work could NOT be rolled back and is STILL in the run's worktree ` +
+                  `(${worktreePath}), so the run stopped rather than let another ticket commit it — ` +
+                  `clear the worktree by hand before resuming. `
+                : `Its partial work was rolled back (nothing from it is on the branch). `) +
             `Re-scope it into smaller tickets, or raise ticketTimeoutMinutes, then resume the run`,
         ),
       );
+      // The rollback is what keeps the REST of the run honest, so its failure cannot be absorbed
+      // the way the timeout itself is: the next ticket captures its baseline from this same tree
+      // and would commit these leftovers under its own name. The bead note can't prevent that —
+      // nothing pauses the run, so the wrong commit lands long before an operator reads it. Halt
+      // instead (poison → park) and let a human clear the tree before anything else commits.
+      if (leftovers) {
+        throw new PoisonEpic(
+          `${ticket.id} exceeded its ${Math.round(timeoutMs / 60_000)}m ticket budget and its ` +
+            `partial work could NOT be rolled back — the run's worktree (${worktreePath}) still ` +
+            `carries changes that the next ticket would commit as its own, so the run stopped ` +
+            `here. Clear the worktree by hand, then resume the run`,
+        );
+      }
       throw new TicketTimeoutError(ticket.id, timeoutMs, committed);
     }
     // An ABORTED ticket writes nothing to the board (anton-6xj0). The abort's author decides this
@@ -2055,6 +2077,10 @@ class BlockedByAgentError extends Error {
  * error and moves to the next ticket, so a feature is never ended by a single ticket that couldn't
  * converge. runTicket has already blocked the bead and rolled its partial work back by the time this
  * is thrown, so nothing downstream needs to settle it — the loop only records which ticket it was.
+ *
+ * Carrying on is safe only because the worktree is provably clean of this ticket: a rollback that
+ * could not prove that raises {@link PoisonEpic} instead, halting the run so no later ticket commits
+ * the leftovers as its own.
  */
 class TicketTimeoutError extends Error {
   constructor(
@@ -2395,6 +2421,23 @@ export function orderTickets(tickets: Bead[], all: Bead[]): Bead[] {
   }
   if (order.length !== tickets.length) return tickets; // cycle → original order
   return order.map((id) => byId.get(id)!);
+}
+
+/**
+ * Whether a stopped ticket left changes behind in the shared worktree — the state that would ride
+ * into the NEXT ticket's commit under the wrong name.
+ *
+ * Anything unreadable counts as left behind: a tree we cannot prove clean is exactly the one that
+ * must not be waved through. With no baseline to compare against (its read failed), working-tree
+ * dirt alone is the signal — that is what the commit step would pick up.
+ */
+async function leftChangesBehind(
+  worktreePath: string,
+  baseline: WorktreeState | null,
+): Promise<boolean> {
+  const now = await readWorktreeState(worktreePath).catch(() => null);
+  if (!now) return true;
+  return baseline ? !sameWorktreeState(now, baseline) : now.status !== "";
 }
 
 /**

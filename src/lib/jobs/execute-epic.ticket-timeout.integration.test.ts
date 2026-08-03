@@ -13,6 +13,8 @@
  *    so no later ticket can commit it as its own.
  * 3. **A feature where EVERY ticket times out parks.** Absorbing the timeouts is only honest while
  *    something landed; an empty PR is the false success the delivery gate already refuses.
+ * 4. **A rollback that FAILS halts the run.** Carrying on past leftovers it could not remove would
+ *    hand them to the next ticket's commit — the mis-attribution above, by another route.
  *
  * Drives the REAL handler + runner + bd/git with fake `claude`/`gh`. Skipped without bd + git.
  */
@@ -97,9 +99,16 @@ describeBd("execute-epic e2e — the per-ticket budget (real handler · real bd/
    * stall to the FIRST ticket dispatched; without it every ticket stalls.
    *
    * The partial file is deliberately named apart from the success path's `AGENT_WORK.md`: the
-   * rollback assertion is that THIS file never reaches the branch while that one does.
+   * rollback assertion is that THIS file never reaches the branch while that one does. Pass
+   * `unrollbackable` to drop it into a directory the agent then makes read-only, so `git clean -fd`
+   * cannot remove it — a rollback that fails for real rather than a mocked one.
    */
-  const hangingClaude = (name: string, invLog: string, only: "first" | "always") =>
+  const hangingClaude = (
+    name: string,
+    invLog: string,
+    only: "first" | "always",
+    unrollbackable = false,
+  ) =>
     writeBin(
       binDir,
       name,
@@ -109,7 +118,14 @@ fs.appendFileSync(${JSON.stringify(invLog)},id+'\\n');
 const nth=fs.readFileSync(${JSON.stringify(invLog)},'utf8').trim().split('\\n').filter(Boolean).length;
 const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
 if(${only === "always" ? "true" : "nth===1"}){
-  fs.appendFileSync(path.join(process.cwd(),'HALF_WRITTEN.md'),'partial '+id+'\\n');
+${
+  unrollbackable
+    ? `  const d=path.join(process.cwd(),'locked');
+  fs.mkdirSync(d,{recursive:true});
+  fs.appendFileSync(path.join(d,'HALF_WRITTEN.md'),'partial '+id+'\\n');
+  fs.chmodSync(d,0o555); // git clean -fd cannot unlink through it`
+    : `  fs.appendFileSync(path.join(process.cwd(),'HALF_WRITTEN.md'),'partial '+id+'\\n');`
+}
   e({type:'system',subtype:'init',session_id:'hang'});
   setInterval(()=>{},1000); // never exits — only the ticket budget can stop it
   return;
@@ -201,7 +217,7 @@ process.exit(0);`),
 
     const runner = makeEpicRunner(ctx);
     process.env.ANTON_CLAUDE_BIN = claude;
-    let jobId: string;
+    let jobId: string | undefined;
     try {
       jobId = await driveEpicRun(runner, { projectId, epicBeadId: epic.id });
 
@@ -219,7 +235,48 @@ process.exit(0);`),
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
       await patchSettings({ ticketTimeoutMinutes: undefined });
-      if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+      if (jobId) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  });
+
+  it("halts the run when the rollback FAILS — leftovers never reach the next ticket's commit", async () => {
+    const epic = await approvedEpic("Unrollbackable");
+    const invLog = join(sandbox, "stuck-inv.jsonl");
+    // Only the FIRST ticket stalls: without the halt, the second would run and the feature would
+    // ship a PR — so "the run stopped here" is the fix's doing and nothing else's.
+    const claude = hangingClaude("claude-hang-unrollbackable", invLog, "first", true);
+
+    await patchSettings({ ticketTimeoutMinutes: 0.1 });
+
+    const runner = makeEpicRunner(ctx);
+    process.env.ANTON_CLAUDE_BIN = claude;
+    let jobId: string | undefined;
+    try {
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: epic.id });
+
+      // The run STOPPED instead of absorbing the timeout: a dirty worktree is swept into whatever
+      // commits next, so there is no safe way to carry on. Parked for a human to clear it.
+      const job = await getJob(tdb.db, jobId);
+      expect(job?.status).toBe("parked");
+      expect(job?.lastError).toMatch(/could NOT be rolled back/i);
+
+      // The second ticket was never dispatched — nothing committed on top of the leftovers.
+      const invoked = readFileSync(invLog, "utf8").trim().split("\n").filter(Boolean);
+      expect(invoked).toHaveLength(1);
+
+      // The stalled ticket is still blocked with a note that says where its work actually is.
+      const stalled = await beads.show(repo, invoked[0]);
+      expect(stalled.status).toBe("blocked");
+      expect(JSON.stringify(stalled)).toMatch(/STILL in the run's worktree/i);
+
+      // No PR: this run delivered nothing a reviewer should see.
+      expect(beads.getPrRef(await beads.show(repo, epic.id)) ?? null).toBeNull();
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      await patchSettings({ ticketTimeoutMinutes: undefined });
+      if (jobId) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+      // Hand the read-only directory back, or the sandbox teardown inherits the same failure.
+      execFileSync("chmod", ["-R", "u+rwX", join(sandbox, "worktrees")]);
     }
   });
 });
