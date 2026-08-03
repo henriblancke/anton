@@ -249,6 +249,22 @@ describe("buildBoardContext — epic attach verdicts", () => {
     expect(ctx.epics[1]).toMatchObject({ status: "closed", attachable: true });
   });
 
+  // A delivered outcome is reusable; an abandoned one is a human won't-do. Offering it has triage
+  // reopen it off a signal that merely matched its area, reversing the decision unattended.
+  it("drops ABANDONED epics from the candidates entirely", () => {
+    const ctx = buildBoardContext([
+      bead({
+        id: "e-dropped",
+        issue_type: "epic",
+        status: "closed",
+        labels: ["abandoned", "area:auth"],
+      }),
+      bead({ id: "e-shipped", issue_type: "epic", status: "closed" }),
+    ]);
+    expect(ctx.epics.map((e) => e.id)).toEqual(["e-shipped"]);
+    expect(formatBoardContext(ctx)).not.toContain("e-dropped");
+  });
+
   it("still refuses a closed epic that is pre-tier — reopening it would strand its open tickets", () => {
     const ctx = buildBoardContext([
       bead({ id: "e-1", issue_type: "epic", status: "closed" }),

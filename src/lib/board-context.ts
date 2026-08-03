@@ -304,7 +304,10 @@ export function buildBoardContext(board: Bead[]): BoardContext {
   // `bd list --type epic --all` read. Omitting closed ones let unattended triage conclude no home
   // exists and mint a duplicate outcome (or fall back to a parentless bead). Open ones lead, so the
   // MAX_EPICS cap drops closed candidates first.
-  const allEpics = board.filter((b) => b.issue_type === "epic");
+  // Abandoned epics are the one closed outcome that is NOT reusable: `abandoned` records a human
+  // won't-do decision, and offering it as a candidate has triage `bd reopen` it — silently reversing
+  // that decision on a signal that merely matched its area.
+  const allEpics = board.filter((b) => b.issue_type === "epic" && !beads.isAbandoned(b));
   const epics: EpicCandidate[] = [
     ...allEpics.filter((b) => OPEN_STATUSES.has(b.status)),
     ...allEpics.filter((b) => !OPEN_STATUSES.has(b.status)),
@@ -415,7 +418,8 @@ export function formatBoardContext(ctx: BoardContext): string {
     "Every epic on the board, **open and closed** — this IS the `bd list --type epic --all` read of",
     "§4.1, so a closed outcome that already owns the surface is visible rather than looking like a",
     "home that doesn't exist. `attach:reopen-first` means it fits but must be reopened before you",
-    "link. Open epics are listed first.",
+    "link. Open epics are listed first. Abandoned epics are omitted — a won't-do decision is not a",
+    "placement candidate; if a signal genuinely revives one, that is a human's call, not this pass's.",
     "",
   );
   if (ctx.epics.length === 0) {
