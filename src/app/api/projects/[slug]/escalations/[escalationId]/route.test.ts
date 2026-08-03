@@ -174,6 +174,51 @@ describe("POST /api/projects/[slug]/escalations/[escalationId]", () => {
       expect(abandonTicket).toHaveBeenCalled();
     });
 
+    // A stall that names only a job (an exhausted sync-push/run-health/unstick) has no bead to act
+    // on, so it settles through the jobs list's own verbs — the only settling move it has at all.
+    it("resumes a job-only stall", async () => {
+      const id = await open({
+        finding: finding({
+          kind: "exhausted-job",
+          key: "exhausted-job:j-1",
+          beadId: undefined,
+          runId: undefined,
+          jobId: "j-1",
+        }),
+        epicBeadId: undefined,
+      });
+
+      const res = await POST(req({ action: "resume" }), ctx("alpha", id));
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ action: "resume", detail: "resumed-job" });
+      expect(resumeJob).toHaveBeenCalledWith("p-alpha", "j-1");
+      // No bead means no run-lease to contest, so the board read is skipped entirely.
+      expect(beadsShow).not.toHaveBeenCalled();
+      expect(rowOf(id)).toMatchObject({ status: "resolved", resolution: "resumed" });
+    });
+
+    it("cancels a job-only stall on abandon, only out of the states the stall was raised from", async () => {
+      const id = await open({
+        finding: finding({
+          kind: "exhausted-job",
+          key: "exhausted-job:j-1",
+          beadId: undefined,
+          runId: undefined,
+          jobId: "j-1",
+        }),
+        epicBeadId: undefined,
+      });
+
+      const res = await POST(req({ action: "abandon" }), ctx("alpha", id));
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ action: "abandon", detail: "cancelled-job" });
+      expect(cancelJob).toHaveBeenCalledWith("p-alpha", "j-1", ["parked", "failed"]);
+      expect(abandonTicket).not.toHaveBeenCalled();
+      expect(rowOf(id)).toMatchObject({ status: "resolved", resolution: "abandoned" });
+    });
+
     it("dismisses without consulting the board at all", async () => {
       const id = await open();
 
