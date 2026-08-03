@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getDb } from "@/lib/db";
+import { parseCron } from "@/lib/jobs/cron";
 import { systemClock } from "@/lib/jobs/queue";
 import {
   DEFAULT_SCHEDULES,
@@ -22,10 +23,15 @@ export async function GET(_request: Request, { params }: { params: Promise<{ slu
 }
 
 /**
- * PATCH { type, enabled } — flip one automation's schedules.enabled row. A missing row (e.g. a
- * project added before that schedule type existed) is created with its default cron rather than
- * silently no-oping; `created: true` in the response says so. updateSchedule clears/reseeds
- * nextRunAt, so the scheduler loop stops/starts enqueuing immediately.
+ * PATCH { type, cron?, enabled? } — edit one automation's cadence and/or its enabled flag. Either
+ * field alone is a valid patch; what is omitted is left as-is. A missing row (e.g. a project added
+ * before that schedule type existed) is created rather than silently no-oped — at the SUBMITTED
+ * cron, falling back to the default only when the caller sent none; `created: true` says so.
+ *
+ * The cron is parsed before anything is written, so a bad expression 400s with the parser's own
+ * message and leaves the stored row untouched. updateSchedule recomputes nextRunAt off the new
+ * cron, and the scheduler re-reads schedules every tick — so an edited cadence takes effect without
+ * a restart. The response carries the full row, including that recomputed nextRunAt.
  */
 export async function PATCH(request: Request, { params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
@@ -37,7 +43,7 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
     return NextResponse.json({ error: "Invalid body" }, { status: 400 });
   }
 
-  const { type, enabled } = body as { type?: unknown; enabled?: unknown };
+  const { type, cron, enabled } = body as { type?: unknown; cron?: unknown; enabled?: unknown };
   const known = DEFAULT_SCHEDULES.find((d) => d.type === type);
   if (typeof type !== "string" || !known) {
     return NextResponse.json(
@@ -45,8 +51,28 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
       { status: 400 },
     );
   }
-  if (typeof enabled !== "boolean") {
+  if (cron !== undefined && typeof cron !== "string") {
+    return NextResponse.json({ error: "cron must be a string" }, { status: 400 });
+  }
+  if (enabled !== undefined && typeof enabled !== "boolean") {
     return NextResponse.json({ error: "enabled must be a boolean" }, { status: 400 });
+  }
+  if (cron === undefined && enabled === undefined) {
+    return NextResponse.json({ error: "Provide cron and/or enabled" }, { status: 400 });
+  }
+
+  let nextCron: string | undefined;
+  if (cron !== undefined) {
+    nextCron = cron.trim();
+    try {
+      parseCron(nextCron);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : "unparseable";
+      return NextResponse.json(
+        { error: `Invalid cron "${nextCron}": ${detail}` },
+        { status: 400 },
+      );
+    }
   }
 
   try {
@@ -54,14 +80,15 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
     const existing = (await listSchedules(project.id)).find((s) => s.type === type);
     const id =
       existing?.id ??
+      // A type the operator has to opt into stays opt-in when a cron-only PATCH creates its row.
       (await ensureSchedule(db, systemClock, {
         projectId: project.id,
         type: type as ScheduledJobType,
-        cron: known.cron,
-        enabled,
+        cron: nextCron ?? known.cron,
+        enabled: enabled ?? known.enabled,
       }));
-    // ensureSchedule already created the row with the right enabled; only patch an existing one.
-    if (existing) await updateSchedule(db, systemClock, id, { enabled });
+    // ensureSchedule already created the row from this patch; only patch an existing one.
+    if (existing) await updateSchedule(db, systemClock, id, { cron: nextCron, enabled });
 
     const schedule = (await listSchedules(project.id)).find((s) => s.id === id);
     return NextResponse.json({ schedule, created: !existing });

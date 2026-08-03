@@ -11,10 +11,15 @@ import {
 import { toast } from "sonner";
 
 import type { Project } from "@/lib/types";
+import { describeCron } from "@/lib/jobs/cadence";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Toggle } from "@/components/atoms";
 import { agentDotClass } from "@/components/board/board-utils";
+import {
+  AutomationRow,
+  type AutomationScheduleState,
+} from "@/components/settings/automation-row";
 import { DeleteProjectDialog } from "@/components/settings/delete-project-dialog";
 import { PruneBeadsSection } from "@/components/settings/prune-beads-section";
 
@@ -106,27 +111,28 @@ const SECTIONS = [
   { id: "automation", label: "Automation" },
 ] as const;
 
-// Display copy for the scheduled automations. Ids match the schedule row `type`; crons mirror
-// DEFAULT_SCHEDULES in src/lib/schedules.ts — keep in sync. Enabled state comes from `schedules`.
+// What each scheduled automation DOES. Ids match the schedule row `type`. Cadence, next-run time
+// and enabled state all come from the schedules row — never from copy here, which could disagree
+// with the row that actually fires.
 const AUTOMATIONS = [
-  { id: "nightly-stringer", label: "nightly-stringer", meta: "scan → triage · 0 3 * * *" },
-  { id: "review-fix", label: "review-fix watcher", meta: "poll PRs every 15m" },
-  { id: "orphan-grooming", label: "orphan-grooming", meta: "bucket loose tickets · 0 4 * * 1" },
-  { id: "run-health", label: "run-health", meta: "report stalled runs hourly · off by default" },
+  { id: "nightly-stringer", label: "nightly-stringer", description: "scan → triage" },
+  { id: "review-fix", label: "review-fix watcher", description: "poll open PRs for review events" },
+  { id: "orphan-grooming", label: "orphan-grooming", description: "bucket loose tickets" },
+  { id: "run-health", label: "run-health", description: "report stalled runs · off by default" },
   {
     id: "unstick",
     label: "unstick",
-    meta: "acts on run-health's findings · idle until run-health is on · 10 * * * *",
+    description: "acts on run-health's findings · idle until run-health is on",
   },
   {
     id: "gate-check",
     label: "gate-check",
-    meta: "resumes runs whose gate closed · */10 * * * * · human gates never auto-close",
+    description: "resumes runs whose gate closed · human gates never auto-close",
   },
   {
     id: "gardener",
     label: "gardener",
-    meta: "board hygiene patrol · 0 5 * * * · off by default · closes done epics, reports the rest",
+    description: "board hygiene patrol · off by default · closes done epics, reports the rest",
   },
 ];
 
@@ -134,6 +140,9 @@ const AUTOMATIONS = [
 interface AutomationSchedule {
   type: string;
   enabled: boolean;
+  cron: string;
+  /** Epoch SECONDS; absent while the schedule is disabled. */
+  nextRunAt?: number;
 }
 
 /**
@@ -151,6 +160,7 @@ export function SettingsView({
   settings,
   basePrompt,
   schedules,
+  defaultCrons,
   agents,
   bundledIds,
 }: {
@@ -158,8 +168,10 @@ export function SettingsView({
   settings: EditableSettings;
   /** The locked base system prompt, shown read-only so operators see what always applies. */
   basePrompt: string;
-  /** The project's schedule rows (schedules.enabled) backing the Automation toggles. */
+  /** The project's schedule rows (cadence, next run, enabled) backing the Automation section. */
   schedules: AutomationSchedule[];
+  /** DEFAULT_SCHEDULES' cron per type — the cadence "Reset to default" restores. */
+  defaultCrons: Record<string, string>;
   /** Every agent this project can assign — bundled + the operator's own .claude/agents. */
   agents: DiscoveredAgent[];
   /** Ids anton ships as bundled specialists — the only agents the allowlist gates. */
@@ -200,10 +212,22 @@ export function SettingsView({
   const [weeklyTargetPct, setWeeklyTargetPct] = useState(
     settings.budgetPolicy?.weeklyTargetPct ?? DEFAULT_WEEKLY_TARGET_PCT,
   );
-  // null = no schedule row for this project yet (shown as "not scheduled"; toggling creates it).
-  const [automations, setAutomations] = useState<Record<string, boolean | null>>(() =>
+  // enabled: null = no schedule row for this project yet (shown as "not scheduled"; editing the row
+  // creates it). A row-less automation still shows a cadence — the default one it would be created
+  // at — so the picker is never blank.
+  const [automations, setAutomations] = useState<Record<string, AutomationScheduleState>>(() =>
     Object.fromEntries(
-      AUTOMATIONS.map((a) => [a.id, schedules.find((s) => s.type === a.id)?.enabled ?? null]),
+      AUTOMATIONS.map((a) => {
+        const row = schedules.find((s) => s.type === a.id);
+        return [
+          a.id,
+          {
+            enabled: row?.enabled ?? null,
+            cron: row?.cron ?? defaultCrons[a.id] ?? "",
+            nextRunAt: row?.nextRunAt,
+          },
+        ];
+      }),
     ),
   );
   const [model, setModel] = useState(settings.model ?? "");
@@ -237,27 +261,58 @@ export function SettingsView({
   const [saving, setSaving] = useState(false);
 
   /**
-   * Flip one automation's schedules.enabled row immediately (not via Save) — optimistic flip,
-   * reverted with a toast if the PATCH fails. A missing row is created server-side.
+   * Persist one automation's cadence and/or enabled flag immediately (not via Save) — optimistic,
+   * reverted with a toast if the PATCH fails. A missing row is created server-side. The response
+   * carries the row as stored, so the next-run readout is the server's recomputed nextRunAt rather
+   * than a guess made here.
    */
-  async function toggleAutomation(id: string, next: boolean) {
+  async function patchSchedule(
+    id: string,
+    patch: { cron?: string; enabled?: boolean },
+    message: string,
+  ) {
     const prev = automations[id];
-    setAutomations((p) => ({ ...p, [id]: next }));
+    setAutomations((p) => ({ ...p, [id]: { ...prev, ...patch } }));
     try {
       const res = await fetch(`/api/projects/${project.slug}/schedules`, {
         method: "PATCH",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ type: id, enabled: next }),
+        body: JSON.stringify({ type: id, ...patch }),
       });
       if (!res.ok) {
         const { error } = await res.json().catch(() => ({ error: "Update failed" }));
         throw new Error(error ?? "Update failed");
       }
-      toast.success(`${id} ${next ? "enabled" : "disabled"}`);
+      const { schedule } = await res.json().catch(() => ({ schedule: undefined }));
+      if (schedule) {
+        setAutomations((p) => ({
+          ...p,
+          [id]: { enabled: schedule.enabled, cron: schedule.cron, nextRunAt: schedule.nextRunAt },
+        }));
+      }
+      toast.success(message);
     } catch (err) {
-      setAutomations((p) => ({ ...p, [id]: prev }));
+      // Undo only the fields this patch wrote. Restoring the whole `prev` snapshot would also roll
+      // back a concurrent patch for the same automation (toggle while a cadence save is in flight),
+      // leaving the row wrong until reload.
+      setAutomations((p) => ({
+        ...p,
+        [id]: {
+          ...p[id],
+          ...(patch.cron !== undefined ? { cron: prev.cron } : {}),
+          ...(patch.enabled !== undefined ? { enabled: prev.enabled } : {}),
+        },
+      }));
       toast.error(err instanceof Error ? err.message : `Failed to update ${id}`);
     }
+  }
+
+  function toggleAutomation(id: string, next: boolean) {
+    return patchSchedule(id, { enabled: next }, `${id} ${next ? "enabled" : "disabled"}`);
+  }
+
+  function setAutomationCron(id: string, cron: string) {
+    return patchSchedule(id, { cron }, `${id} · ${describeCron(cron)}`);
   }
 
   function patchVariant(id: string, patch: Partial<FormulaVariant>) {
@@ -978,40 +1033,23 @@ export function SettingsView({
             </section>
 
             <section className="flex flex-col gap-3.5">
-              <h2 className="text-[15px] font-semibold">Automation</h2>
+              <div className="flex items-baseline gap-2.5">
+                <h2 className="text-[15px] font-semibold">Automation</h2>
+                {/* Stated once for the section: cron and next-run times use this machine's clock. */}
+                <span className="text-xs text-subtle">cadences and next-run times are local</span>
+              </div>
               <div className="flex flex-col gap-2.5">
-                {AUTOMATIONS.map((a) => {
-                  const state = automations[a.id];
-                  const on = state === true;
-                  const missing = state === null;
-                  return (
-                    <div
-                      key={a.id}
-                      className={cn(
-                        "flex items-center gap-2.5 rounded-[10px] border border-border bg-card px-3 py-2.5",
-                        !on && "opacity-70",
-                      )}
-                    >
-                      <span
-                        className={cn("size-1.5 rounded-full", on ? "bg-stage-done" : "bg-stage-backlog")}
-                        aria-hidden="true"
-                      />
-                      <div className="flex flex-col gap-0.5">
-                        <span className="text-[12.5px]">{a.label}</span>
-                        <span className="font-mono text-[10.5px] text-subtle">
-                          {missing ? `${a.meta} · not scheduled` : a.meta}
-                        </span>
-                      </div>
-                      <span className="ml-auto">
-                        <Toggle
-                          checked={on}
-                          onChange={(next) => toggleAutomation(a.id, next)}
-                          label={a.label}
-                        />
-                      </span>
-                    </div>
-                  );
-                })}
+                {AUTOMATIONS.map((a) => (
+                  <AutomationRow
+                    key={a.id}
+                    label={a.label}
+                    description={a.description}
+                    state={automations[a.id]}
+                    defaultCron={defaultCrons[a.id] ?? automations[a.id].cron}
+                    onCronChange={(cron) => setAutomationCron(a.id, cron)}
+                    onToggle={(next) => toggleAutomation(a.id, next)}
+                  />
+                ))}
               </div>
             </section>
           </div>
