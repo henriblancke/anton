@@ -4,9 +4,11 @@
  * inputs seed from a persisted policy (round-trip in), and Save PATCHes the edited values back.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { toast } from "sonner";
 
 import { SettingsView } from "@/components/settings/settings-view";
+import { formatExactTime } from "@/lib/time";
 import type { Project } from "@/lib/types";
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn() }) }));
@@ -22,16 +24,29 @@ const project: Project = {
   createdAt: 0,
 };
 
+/** Mirrors DEFAULT_SCHEDULES (src/lib/schedules.ts), which the page passes in from the server. */
+const DEFAULT_CRONS = {
+  "review-fix": "*/15 * * * *",
+  "nightly-stringer": "0 3 * * *",
+  "orphan-grooming": "0 4 * * 1",
+  "run-health": "0 * * * *",
+  unstick: "10 * * * *",
+  "gate-check": "*/10 * * * *",
+  gardener: "0 5 * * *",
+};
+
 function renderView(
   settings: Parameters<typeof SettingsView>[0]["settings"] = {},
   agents: Parameters<typeof SettingsView>[0]["agents"] = [],
+  schedules: Parameters<typeof SettingsView>[0]["schedules"] = [],
 ) {
   return render(
     <SettingsView
       project={project}
       settings={settings}
       basePrompt="base"
-      schedules={[]}
+      schedules={schedules}
+      defaultCrons={DEFAULT_CRONS}
       agents={agents}
       bundledIds={[]}
     />,
@@ -313,5 +328,209 @@ describe("SettingsView pipeline variants (anton-aa3m)", () => {
 
     const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
     expect(body.formulaVariants).toEqual([]);
+  });
+});
+
+describe("SettingsView automation cadence (anton-bfwq)", () => {
+  /** A fixed future instant, in the epoch SECONDS the schedules row stores. */
+  const NEXT_RUN = Math.floor(Date.UTC(2026, 7, 3, 10, 0, 0) / 1000);
+  const LATER_RUN = NEXT_RUN + 3600;
+
+  /** The schedule row shape the settings page passes through, defaulted to a half-hourly stringer. */
+  function stringer(
+    overrides: Partial<NonNullable<Parameters<typeof renderView>[2]>[number]> = {},
+  ) {
+    return [
+      {
+        type: "nightly-stringer",
+        enabled: true,
+        cron: "*/30 * * * *",
+        nextRunAt: NEXT_RUN,
+        ...overrides,
+      },
+    ];
+  }
+
+  /** Stub fetch with the PATCH response the schedules route returns (the row as stored). */
+  function stubSchedulePatch(schedule?: Record<string, unknown>, status = 200) {
+    const fetchMock = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(
+      () =>
+        Promise.resolve(
+          new Response(JSON.stringify(status === 200 ? { schedule } : schedule), { status }),
+        ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  }
+
+  function body(fetchMock: ReturnType<typeof stubSchedulePatch>, call = 0) {
+    return JSON.parse((fetchMock.mock.calls[call][1] as RequestInit).body as string);
+  }
+
+  const cadencePicker = () => screen.getByRole("combobox", { name: "nightly-stringer cadence" });
+
+  /**
+   * Open the row's picker and choose one of its items. The popup commits on pointerup (base-ui),
+   * so a bare click never selects — drive the same pointer sequence a mouse produces.
+   */
+  async function chooseCadence(option: string | RegExp) {
+    fireEvent.click(cadencePicker());
+    const item = await screen.findByRole("option", { name: option });
+    fireEvent.pointerDown(item, { pointerType: "mouse", button: 0 });
+    fireEvent.pointerUp(item, { pointerType: "mouse", button: 0 });
+    fireEvent.click(item);
+  }
+
+  const at = (seconds: number) => formatExactTime(new Date(seconds * 1000).toISOString());
+
+  afterEach(() => {
+    vi.mocked(toast.error).mockClear();
+    vi.mocked(toast.success).mockClear();
+  });
+
+  it("shows the stored cadence and next run, not hardcoded copy", () => {
+    renderView({}, [], stringer());
+
+    expect(cadencePicker().textContent).toContain("Every 30 minutes");
+    expect(screen.getByText(`scan → triage · next ${at(NEXT_RUN)}`)).toBeTruthy();
+    // The cron strings that used to be baked into AUTOMATIONS are gone from the row copy.
+    expect(screen.queryByText(/0 3 \* \* \*/)).toBeNull();
+    expect(screen.queryByText(/poll PRs every 15m/)).toBeNull();
+  });
+
+  it("reads 'not scheduled' when the automation is off or has no row", () => {
+    renderView({}, [], stringer({ enabled: false, nextRunAt: undefined }));
+
+    expect(screen.getByText("scan → triage · not scheduled")).toBeTruthy();
+    // gardener has no row at all — it still shows the cadence it would be created at.
+    expect(
+      screen.getByRole("combobox", { name: "gardener cadence" }).textContent,
+    ).toContain("Daily at 05:00");
+    expect(screen.getByText(/board hygiene patrol.*· not scheduled$/)).toBeTruthy();
+  });
+
+  it("PATCHes a chosen preset and renders the next run the server computed", async () => {
+    const fetchMock = stubSchedulePatch({
+      type: "nightly-stringer",
+      enabled: true,
+      cron: "0 * * * *",
+      nextRunAt: LATER_RUN,
+    });
+    renderView({}, [], stringer());
+
+    await chooseCadence("Hourly, on the hour");
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/projects/tmp/schedules");
+    expect(body(fetchMock)).toEqual({ type: "nightly-stringer", cron: "0 * * * *" });
+    await waitFor(() =>
+      expect(screen.getByText(`scan → triage · next ${at(LATER_RUN)}`)).toBeTruthy(),
+    );
+    expect(cadencePicker().textContent).toContain("Hourly, on the hour");
+  });
+
+  it("reverts the row and toasts when the PATCH fails", async () => {
+    stubSchedulePatch({ error: "invalid cron" }, 400);
+    renderView({}, [], stringer());
+
+    await chooseCadence("Hourly, on the hour");
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("invalid cron"));
+    expect(cadencePicker().textContent).toContain("Every 30 minutes");
+    expect(screen.getByText(`scan → triage · next ${at(NEXT_RUN)}`)).toBeTruthy();
+  });
+
+  it("blocks an invalid custom cron with the parser's own message, then saves a valid one", async () => {
+    const fetchMock = stubSchedulePatch({
+      type: "nightly-stringer",
+      enabled: true,
+      cron: "0 6 * * *",
+      nextRunAt: LATER_RUN,
+    });
+    renderView({}, [], stringer());
+
+    await chooseCadence("Custom cron…");
+    const input = screen.getByLabelText("nightly-stringer cron expression") as HTMLInputElement;
+    expect(input.value).toBe("*/30 * * * *");
+
+    fireEvent.change(input, { target: { value: "nope" } });
+    const save = screen.getByRole("button", { name: "Save cadence" }) as HTMLButtonElement;
+    expect(screen.getByText(/must have 5 fields/)).toBeTruthy();
+    expect(save.disabled).toBe(true);
+    fireEvent.click(save);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    fireEvent.change(input, { target: { value: "0 6 * * *" } });
+    expect(screen.queryByText(/must have 5 fields/)).toBeNull();
+    expect(save.disabled).toBe(false);
+    fireEvent.click(save);
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(body(fetchMock)).toEqual({ type: "nightly-stringer", cron: "0 6 * * *" });
+  });
+
+  it("warns that a sub-5-minute cadence burns budget, but still lets it save", async () => {
+    const fetchMock = stubSchedulePatch({
+      type: "nightly-stringer",
+      enabled: true,
+      cron: "*/2 * * * *",
+      nextRunAt: LATER_RUN,
+    });
+    renderView({}, [], stringer());
+
+    await chooseCadence("Custom cron…");
+    fireEvent.change(screen.getByLabelText("nightly-stringer cron expression"), {
+      target: { value: "*/2 * * * *" },
+    });
+
+    expect(screen.getByText(/burn budget/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save cadence" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(body(fetchMock)).toEqual({ type: "nightly-stringer", cron: "*/2 * * * *" });
+    // The warning survives the save — it describes the cadence that is now stored.
+    await waitFor(() => expect(screen.getByText(/burn budget/)).toBeTruthy());
+  });
+
+  it("resets an edited cadence to the automation's default", async () => {
+    const fetchMock = stubSchedulePatch({
+      type: "nightly-stringer",
+      enabled: true,
+      cron: "0 3 * * *",
+      nextRunAt: LATER_RUN,
+    });
+    renderView({}, [], stringer({ cron: "0 9 * * *" }));
+    expect(cadencePicker().textContent).toContain("Daily at 09:00");
+
+    await chooseCadence("Reset to default");
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(body(fetchMock)).toEqual({ type: "nightly-stringer", cron: "0 3 * * *" });
+    await waitFor(() => expect(cadencePicker().textContent).toContain("Daily at 03:00"));
+  });
+
+  it("offers no reset once the row is already at its default cadence", async () => {
+    stubSchedulePatch();
+    renderView({}, [], stringer({ cron: "0 3 * * *" }));
+
+    fireEvent.click(cadencePicker());
+    const reset = await screen.findByRole("option", { name: "Reset to default" });
+    expect(reset.getAttribute("data-disabled")).not.toBeNull();
+  });
+
+  it("keeps the enable toggle patching schedules.enabled as before", async () => {
+    const fetchMock = stubSchedulePatch({
+      type: "gardener",
+      enabled: true,
+      cron: "0 5 * * *",
+      nextRunAt: LATER_RUN,
+    });
+    renderView({}, [], stringer());
+
+    fireEvent.click(screen.getByRole("switch", { name: "gardener" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(body(fetchMock)).toEqual({ type: "gardener", enabled: true });
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith("gardener enabled"));
   });
 });
