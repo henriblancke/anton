@@ -33,6 +33,51 @@ export const STAGES: Stage[] = ["backlog", "implementing", "in-review", "done"];
  */
 export const MAX_ABANDON_REASON_CHARS = 500;
 
+// The self-review's own shapes, re-exported type-only for the same reason as the contract above:
+// the rework dialog renders findings and score rounds, and a value import of lib/jobs would drag
+// the whole job runtime into the browser bundle.
+export type { ReviewFinding } from "./jobs/review-context";
+export type { ReviewReport, ReviewReportRound } from "./review-report";
+
+/**
+ * Which way a ticket is sent back (anton-4ocm). `reopen` says the acceptance was never actually met
+ * — the same bead runs again, carrying a reason. `follow-up` says it WAS met and the founder wants
+ * another pass: a new bead, linked `discovered-from` the original, so the score the first round
+ * earned stays attached to the work that earned it.
+ */
+export type ReworkMode = "reopen" | "follow-up";
+
+/**
+ * Caps on a rework's two text fields. The summary becomes a `bd reopen --reason` / a follow-up
+ * bead's title, so it is a line; the instructions are inlined verbatim into the implementer's
+ * prompt, so an unbounded one is an unbounded prompt (the same reasoning as MAX_NOTE_CHARS). Here,
+ * not in lib/rework.ts, so the client form can bound the inputs without pulling the server-only
+ * module into the browser bundle; the server still enforces both.
+ */
+export const MAX_REWORK_SUMMARY_CHARS = 200;
+export const MAX_REWORK_INSTRUCTIONS_CHARS = 2000;
+
+/** What a rework settled — the bead that will re-run, and whether this request is what created it. */
+export interface ReworkResult {
+  mode: ReworkMode;
+  /** The ticket the founder sent back. */
+  ticketId: string;
+  /** The bead that re-enters the pipeline: the ticket itself, or the follow-up that was created. */
+  reworkedId: string;
+  /** The instruction note, as it landed on the bead. */
+  note: string;
+  /**
+   * False when this request found its own work already done — a double-submit. Nothing was written
+   * the second time, and `reworkedId` still names the bead the first one produced.
+   */
+  applied: boolean;
+  /**
+   * Why the reworked bead will NOT be picked up by the target's next run as things stand — today,
+   * only an open PR, whose run short-circuits as complete. Absent when the path is clear.
+   */
+  warning?: string;
+}
+
 /** The board's shared type language — the three tiers of
  * docs/design/2026-07-26-tier-and-linear-ux.md: an `epic` is a product outcome spanning features,
  * a `feature` is the shippable delivery unit anton runs, and `task`/`bug`/`chore` are the working

@@ -56,6 +56,14 @@ export interface ReviewRound {
   violation?: ReviewProtocolViolation;
   blocking: number;
   advisory: number;
+  /**
+   * The findings this round reported, verbatim — always set by the gate. Counts alone tell the
+   * founder a round went badly; only the findings themselves can be sent back to a ticket as fix
+   * instructions (anton-4ocm), and the worktree they were reviewed in is gone by then, so they ride
+   * to the board with the score. Optional because a round replayed from an OLDER board (written
+   * before this field existed) legitimately carries none.
+   */
+  findings?: ReviewFinding[];
   /** The recorded fix session, when this round's blocking findings were dispatched for repair. */
   fixSessionId?: string;
   /** Whether the fix session actually changed (and so committed) anything. */
@@ -303,6 +311,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       reviewSessionId: review.sessionId,
       blocking: blocking.length,
       advisory: findings.length - blocking.length,
+      findings,
       ...(review.report.ok
         ? { score: review.report.score, rationale: review.report.rationale }
         : { violation: review.report.violation }),

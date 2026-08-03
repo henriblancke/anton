@@ -14,7 +14,7 @@ import { invalidateIssueSnapshot } from "./snapshot";
 // Bead/BeadDep live in the leaf ./types module so snapshot.ts can share them without importing
 // bd.ts back (breaking the bd ↔ snapshot cycle, anton-mur). Re-exported here so every existing
 // `from ".../beads/bd"` import keeps working.
-export type { Bead, BeadDep } from "./types";
+export type { Bead, BeadComment, BeadDep } from "./types";
 import type { Bead } from "./types";
 
 export const LABELS = {
@@ -2122,6 +2122,22 @@ export const beads = {
     return parsed.issue ?? parsed;
   },
 
+  /**
+   * The bead WITH its comment thread hydrated (`--include-comments`) — the explicit opt-in
+   * {@link beads.show} deliberately withholds, because streaming comment bodies is slow on a hub
+   * bead and nothing else needs them.
+   *
+   * One caller today: the review report (lib/review-report.ts), which replays the per-round score
+   * comments a finished self-review appended to the run target. bd omits `comments` entirely on a
+   * bead that has none, so the field is normalized to `[]` here — a reader must not have to tell
+   * "no comments" from "the read didn't carry them".
+   */
+  showWithComments: async (cwd: string, id: string): Promise<Bead> => {
+    const parsed = JSON.parse(await bd(cwd, ["show", id, "--json", "--include-comments"]));
+    const bead: Bead = Array.isArray(parsed) ? parsed[0] : (parsed.issue ?? parsed);
+    return { ...bead, comments: bead?.comments ?? [] };
+  },
+
   /** Pure argv builder for cook, exposed for testing (see buildUpdateArgs). */
   buildCookArgs,
 
@@ -2394,7 +2410,16 @@ export const beads = {
   recomputeBlocked: (cwd: string): Promise<number> =>
     bdWrite(cwd, ["recompute-blocked", "--json"]).then(parseRecomputeBlocked),
 
-  reopen: (cwd: string, id: string) => bdWrite(cwd, ["reopen", id]),
+  /**
+   * Return a closed bead to `open` (`bd reopen`), emitting bd's own Reopened event.
+   *
+   * `reason` is the durable record of WHY the work was reopened — the provenance a rework leaves
+   * behind (anton-4ocm), so a score attributed to an earlier round can still be read against the
+   * decision that sent the ticket back. Omitted by the runner's cross-machine resume, which reopens
+   * a bead only to re-run work its own branch is missing: that is bookkeeping, not a judgement.
+   */
+  reopen: (cwd: string, id: string, reason?: string) =>
+    bdWrite(cwd, ["reopen", id, ...(reason ? ["--reason", reason] : [])]),
 
   /**
    * Snooze a bead (`bd defer`) / restore it (`bd undefer`) — the "not now, but not dead" state

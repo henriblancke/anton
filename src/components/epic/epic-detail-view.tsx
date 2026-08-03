@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
-import { CheckIcon, CircleSlashIcon, TriangleAlertIcon } from "lucide-react";
+import { CheckIcon, CircleSlashIcon, RotateCcwIcon, TriangleAlertIcon } from "lucide-react";
 
 import type { EpicCrumb, EpicDetail, Ticket } from "@/lib/types";
 // The predicate itself, not a page-local copy: approve, the runner, and the board card ask the same one.
@@ -22,6 +22,7 @@ import { EpicBadge } from "@/components/board/epic-badge";
 import { PrLinkControl } from "@/components/board/pr-link-control";
 import { DependencyGraph } from "@/components/epic/dependency-graph";
 import { EpicPriorityControl } from "@/components/epic/epic-priority-control";
+import { ReworkDialog } from "@/components/epic/rework-dialog";
 import { AbandonButton } from "@/components/ticket/abandon-button";
 import { TicketDialog } from "@/components/ticket/ticket-dialog";
 
@@ -138,6 +139,7 @@ export function EpicDetailView({
   const [attempt, setAttempt] = useState(0);
   const [openTicketId, setOpenTicketId] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
+  const [reworkOpen, setReworkOpen] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -247,6 +249,10 @@ export function EpicDetailView({
   // board card uses, so the action reads as inert-and-explained rather than 422ing on click.
   const contractBlocked = contractBlocks(epic.contract);
   const blocking = epic.contract?.blocking ?? [];
+  // Rework acts on work a run has already produced and reviewed, so it is offered exactly once the
+  // target has left backlog — that covers the run that parked on its own self-review (the case this
+  // exists for) as well as one waiting at the merge gate. An abandoned target has no work to redo.
+  const canRework = !epic.abandoned && epic.stage !== "backlog" && tickets.length > 0;
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -334,6 +340,17 @@ export function EpicDetailView({
               disabled={running}
             >
               {running ? "Starting…" : `Run ${word}`}
+            </Button>
+          )}
+          {canRework && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setReworkOpen(true)}
+              title="Attach fix instructions to one of this run's tickets and put it back in the pipeline"
+            >
+              <RotateCcwIcon aria-hidden="true" />
+              Send back
             </Button>
           )}
           <Button
@@ -540,6 +557,15 @@ export function EpicDetailView({
           </div>
         </div>
       </div>
+
+      <ReworkDialog
+        slug={slug}
+        targetId={epic.id}
+        tickets={tickets}
+        open={reworkOpen}
+        onClose={() => setReworkOpen(false)}
+        onReworked={() => setAttempt((n) => n + 1)}
+      />
 
       <TicketDialog
         slug={slug}
