@@ -14,6 +14,7 @@ import {
   budgetPolicySchema,
   formulaVariantsSchema,
   runHealthThresholdsSchema,
+  scanSeverityPolicySchema,
   getProjectSettingsBySlug,
   updateProjectSettings,
   type ProjectSettings,
@@ -335,6 +336,25 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
         return NextResponse.json({ error: `Invalid runHealth: ${detail}` }, { status: 400 });
       }
       patch.runHealth = parsed.data;
+    }
+  }
+
+  if ("scanSeverity" in body) {
+    const raw = (body as Record<string, unknown>).scanSeverity;
+    // "" / null → clear (fall back to DEFAULT_SCAN_SEVERITY_POLICY). Otherwise validate strictly:
+    // a bad rule 400s rather than persisting a mapping that would send every stringer bead to the
+    // triage prompt with a label bd doesn't recognise. Deep-merged per severity by
+    // updateProjectSettings, so re-weighting `critical` leaves the operator's other overrides alone.
+    if (raw == null || raw === "") {
+      patch.scanSeverity = undefined;
+    } else {
+      const parsed = scanSeverityPolicySchema.safeParse(raw);
+      if (!parsed.success) {
+        const issue = parsed.error.issues[0];
+        const detail = issue ? `${issue.path.join(".") || "policy"}: ${issue.message}` : "invalid";
+        return NextResponse.json({ error: `Invalid scanSeverity: ${detail}` }, { status: 400 });
+      }
+      patch.scanSeverity = parsed.data;
     }
   }
 

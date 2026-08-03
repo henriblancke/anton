@@ -15,6 +15,13 @@ import {
 } from "./hygiene";
 import { issueSnapshotVersion, type SnapshotReadOptions } from "./beads/snapshot";
 import { reviewTrajectory } from "./review-trajectory";
+import {
+  latestScanHealth,
+  latestScanHealthVersion,
+  NO_SCAN_HEALTH,
+  scanHealthVersion,
+  type ScanHealth,
+} from "./scan-health";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
 import {
   boardCards,
@@ -44,16 +51,21 @@ export { deriveStage } from "./ticket-view";
  * hygiene panel updates on the same cadence as the cards. Compared as an opaque string, never
  * parsed — the hygiene part goes BEFORE the sync token, which ends in a free-text error message.
  */
-function boardVersion(snapshotVersion: number, hygiene: string, repoPath: string): string {
-  return `${snapshotVersion}:${hygiene}:${getSyncStatusToken(repoPath)}`;
+function boardVersion(
+  snapshotVersion: number,
+  hygiene: string,
+  scan: string,
+  repoPath: string,
+): string {
+  return `${snapshotVersion}:${hygiene}:${scan}:${getSyncStatusToken(repoPath)}`;
 }
 
 export async function getBoardVersion(project: Project): Promise<string> {
-  return boardVersion(
-    issueSnapshotVersion(project.repoPath),
-    await readHygieneVersion(project),
-    project.repoPath,
-  );
+  const [hygiene, scan] = await Promise.all([
+    readHygieneVersion(project),
+    readScanHealthVersion(project),
+  ]);
+  return boardVersion(issueSnapshotVersion(project.repoPath), hygiene, scan, project.repoPath);
 }
 
 /**
@@ -79,6 +91,25 @@ async function readHygieneVersion(project: Project): Promise<string> {
   }
 }
 
+/** The scan-health reads degrade to "never scanned" for the same reason the hygiene ones do. */
+async function readScanHealth(project: Project): Promise<ScanHealth | undefined> {
+  try {
+    return await latestScanHealth(project.id);
+  } catch (err) {
+    console.error(`[board] scan health read failed for ${project.slug}`, err);
+    return undefined;
+  }
+}
+
+async function readScanHealthVersion(project: Project): Promise<string> {
+  try {
+    return await latestScanHealthVersion(project.id);
+  } catch (err) {
+    console.error(`[board] scan health version read failed for ${project.slug}`, err);
+    return NO_SCAN_HEALTH;
+  }
+}
+
 /** Standalone chips read newest-first within a stage, but a self-filed unread bug jumps ahead of
  * its read siblings so triage-worthy work surfaces above the "+N more" cap. */
 function compareStandalone(a: StandaloneItem, b: StandaloneItem): number {
@@ -96,11 +127,12 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   // Read beads and their snapshot version together: a background refresh can land mid-build, so
   // stamping the response with a separately-read version would let it advance past the data served
   // here — the client would then poll that version, 304, and never see this board's data refreshed.
-  // The bead read (bd) and the hygiene read (anton.db) are independent — run them concurrently so
-  // the slower one sets the board's latency instead of their sum.
-  const [{ beads: allBeads, version: snapshotVersion }, hygiene] = await Promise.all([
+  // The bead read (bd) and the anton.db reads (hygiene, scan health) are independent — run them
+  // concurrently so the slowest sets the board's latency instead of their sum.
+  const [{ beads: allBeads, version: snapshotVersion }, hygiene, scan] = await Promise.all([
     readAllIssues(project.repoPath, opts),
     readHygiene(project),
+    readScanHealth(project),
   ]);
 
   // Only work items land on the board. Pipeline plumbing — a poured `molecule` root and the `gate`
@@ -222,12 +254,19 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
     projectSlug: project.slug,
     // Pin the freshness token to the snapshot version the served beads carry (not a re-read of the
     // live version), so a poll on this token only 304s while this exact data is still current. Same
-    // reasoning for the hygiene part: it names the report served below, not whatever is newest now.
-    version: boardVersion(snapshotVersion, hygieneVersion(hygiene), project.repoPath),
+    // reasoning for the hygiene and scan parts: they name what is served below, not whatever is
+    // newest now.
+    version: boardVersion(
+      snapshotVersion,
+      hygieneVersion(hygiene),
+      scanHealthVersion(scan),
+      project.repoPath,
+    ),
     columns,
     standalone,
     hygiene,
     ...(trajectory ? { reviewTrajectory: trajectory } : {}),
+    ...(scan ? { scanHealth: scan } : {}),
     // Read from the globalThis-anchored registry, so the API bundle sees passes run by the
     // instrumentation-started sync engine (see bd.ts).
     sync: getSyncStatus(project.repoPath),

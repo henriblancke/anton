@@ -38,6 +38,33 @@ already drops signals seen last scan; this catches ones already turned into bead
 
 ## 3. Triage by class (queue quality)
 
+### 3.1 Severity → `risk:` and priority
+
+stringer's JSON carries no severity field, so anton derives one per signal — from the signal's
+`Priority` when a collector sets one, else its kind (a secret or a CVE is `critical` whatever
+emitted it), else its collector's default (`vuln` → critical, `dephealth`/`githygiene` → medium,
+`todos`/`deadcode`/`duplication` → low, an unknown collector → medium). That derivation is
+`src/lib/scan-severity.ts` — the same one the per-scan health record counts by, so the trend on the
+board and the labels on these beads mean the same thing.
+
+The severity you get is then labelled by this mapping:
+
+| severity | label | priority |
+| --- | --- | --- |
+| critical | risk:high | P0 |
+| high | risk:high | P1 |
+| medium | risk:low | P2 |
+| low | risk:low | P3 |
+
+**Per project adjustable**, via `scanSeverity` in project settings (`PATCH
+/api/projects/<slug>/settings`, e.g. `{"scanSeverity":{"medium":{"risk":"high","priority":1}}}`) —
+one entry per severity, both knobs required. anton's nightly-stringer job resolves the project's
+policy and appends it to this prompt: **when a mapping table follows the scan-file line below, that
+table wins over the defaults above.** The per-class rules below still decide what becomes a bead at
+all; this only decides how it is labelled.
+
+### 3.2 What becomes a bead
+
 anton runs **features**, not epics: a cluster is a **`feature` scoped to one reviewable PR** (one
 worktree, one PR) with its child tickets under it. The `epic` is the tier *above* — the product
 outcome several features add up to — and you attach the feature to one in §4. The `bd` skill holds

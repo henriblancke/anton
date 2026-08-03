@@ -190,6 +190,56 @@ export const hygieneReports = sqliteTable(
 );
 
 /**
+ * One nightly-stringer scan's health summary (anton-bz1w) — the append-only series the board trends
+ * over. One row PER SCAN, never replaced: the point of the table is the shape of the last N scans,
+ * so collapsing it per project (the `run_health_reports` pattern) would erase the only thing it is
+ * for.
+ *
+ * anton.db rather than a bd comment thread (the review-score pattern) because a scan is measured
+ * against `stringer --delta`'s baseline, which is machine-local and per-checkout: two machines
+ * scanning one repo produce two independent series, and interleaving them on a shared bead would
+ * chart the cron schedule rather than the codebase. See src/lib/scan-health.ts.
+ *
+ * Bounded like `hygiene_reports`: each write prunes to the newest few dozen per project.
+ */
+export const scanSummaries = sqliteTable(
+  "scan_summaries",
+  {
+    id: text("id").primaryKey(),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id),
+    /** The nightly-stringer job that produced it; null for a summary written outside a job. */
+    jobId: text("job_id"),
+    /** That job's session — the route back to the scan log and the scan file. */
+    sessionId: text("session_id"),
+    generatedAt: ts("generated_at").notNull().default(now),
+    /** Denormalized so a board badge needn't parse the blobs. */
+    totalSignals: integer("total_signals").notNull().default(0),
+    /** `SeverityCounts` (src/lib/scan-health.ts), serialized — the chart's severity split. */
+    bySeverityJson: text("by_severity_json").notNull().default("{}"),
+    /** `ClassCounts`, serialized — security / dependencies / debt / risk / docs / other. */
+    byClassJson: text("by_class_json").notNull().default("{}"),
+    /**
+     * `ScanDelta` against the previous scan, serialized. NULL on a project's FIRST scan — nothing
+     * to compare to, which is not the same claim as "no change". Stored rather than derived so a
+     * point still names what it moved once its predecessor has aged out of the retention window.
+     */
+    deltaJson: text("delta_json"),
+    /**
+     * What /scan-triage reported doing with the signals. NULL when triage never ran (a scan with no
+     * new signals) or broke its report protocol — "not reported", never "created nothing".
+     */
+    beadsCreated: integer("beads_created"),
+    beadsDeduped: integer("beads_deduped"),
+    /** Collectors that died mid-scan: every one is a hole in the counts above. */
+    collectorFailures: integer("collector_failures").notNull().default(0),
+  },
+  // Serves "this project's last N scans" (and the prune) without a full scan.
+  (table) => [index("scan_summaries_project_idx").on(table.projectId, table.generatedAt)],
+);
+
+/**
  * Founder-facing escalations raised by the unstick pass (anton-wvcy). One row per stall the pass
  * could NOT prove safe to auto-resume: the run-health finding's evidence, frozen, plus the
  * open/resolved decision a human makes on the board.

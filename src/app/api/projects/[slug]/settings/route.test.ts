@@ -207,6 +207,51 @@ describe("settings route — agents allowlist + autonomy (anton-46w)", () => {
     expect((await res.json()).settings.budgetPolicy).toBeUndefined();
     expect("budgetPolicy" in persisted()).toBe(false);
   });
+
+  it("PATCH persists a scanSeverity override, and GET restores it (anton-bz1w)", async () => {
+    const scanSeverity = { medium: { risk: "high", priority: 1 } };
+    const res = await PATCH(patchReq({ scanSeverity }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.scanSeverity).toEqual(scanSeverity);
+    expect(persisted().scanSeverity).toEqual(scanSeverity);
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.scanSeverity).toEqual(scanSeverity);
+  });
+
+  it("PATCH merges a scanSeverity patch per severity, leaving the others alone (anton-bz1w)", async () => {
+    await PATCH(patchReq({ scanSeverity: { low: { risk: "high", priority: 2 } } }), ctx("tmp"));
+    const res = await PATCH(
+      patchReq({ scanSeverity: { critical: { risk: "high", priority: 0 } } }),
+      ctx("tmp"),
+    );
+    expect((await res.json()).settings.scanSeverity).toEqual({
+      low: { risk: "high", priority: 2 },
+      critical: { risk: "high", priority: 0 },
+    });
+  });
+
+  it("PATCH rejects an invalid scanSeverity without persisting (anton-bz1w)", async () => {
+    for (const bad of [
+      { medium: { risk: "medium", priority: 1 } }, // bd's risk vocabulary is low|high
+      { medium: { risk: "high", priority: 9 } }, // priority is 0…4
+      { medium: { risk: "high" } }, // half a rule is a question the prompt can't answer
+      { nonsense: { risk: "high", priority: 1 } },
+    ]) {
+      const res = await PATCH(patchReq({ scanSeverity: bad }), ctx("tmp"));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/scanSeverity/);
+    }
+    expect("scanSeverity" in persisted()).toBe(false);
+  });
+
+  it('PATCH "" / null clears scanSeverity back to the shipped mapping (anton-bz1w)', async () => {
+    await PATCH(patchReq({ scanSeverity: { low: { risk: "high", priority: 0 } } }), ctx("tmp"));
+    const res = await PATCH(patchReq({ scanSeverity: null }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.scanSeverity).toBeUndefined();
+    expect("scanSeverity" in persisted()).toBe(false);
+  });
 });
 
 /**

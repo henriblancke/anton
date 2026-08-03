@@ -16,7 +16,7 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["src/**/*.test.ts", "src/**/*.test.tsx", "bin/**/*.test.ts"],
-    exclude: [...configDefaults.exclude, "**/*.integration.test.ts"],
+    exclude: [...configDefaults.exclude, "**/*.integration.test.ts", "**/*.integration.test.tsx"],
     // A handful of non-integration suites still touch a temp sqlite db; keep vitest's 5s default
     // comfortably clear of that under load.
     testTimeout: 60_000,

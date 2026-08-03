@@ -9,10 +9,19 @@
  */
 import { join } from "node:path";
 import { beads } from "../beads/bd";
-import { getProjectById, getProjectSettings } from "../projects";
+import { getProjectById, getProjectSettings, resolveScanSeverity } from "../projects";
 import { loadSkill } from "../claude/prompt";
 import { runClaude } from "../claude/driver";
 import { describeCollectorFailure, scan } from "../stringer";
+import { formatScanSeverityPolicy } from "../scan-severity";
+import {
+  parseTriageOutcome,
+  saveScanSummary,
+  summarizeScanFile,
+  summarizeScanLine,
+  type ScanCounts,
+  type TriageOutcome,
+} from "../scan-health";
 import { appendSessionLog, endSession, startJobSession } from "../sessions";
 import { PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
@@ -54,11 +63,47 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
     // the in-flight session. It runs claude directly in the project repo — no worktree.
     ctx.report({ sessionId, cwd: project.repoPath });
 
+    /**
+     * Land this pass's health record (anton-bz1w) — at most once, and never fatally. Best-effort
+     * because the record is a monitor, not the work: an anton.db hiccup must not fail (or retry) a
+     * scan whose beads already landed. Idempotent because it is called on both the success paths and
+     * the failure path, and a pass is ONE point on the trend however it ended.
+     */
+    let recorded = false;
+    const recordHealth = async (counts: ScanCounts, opts: {
+      failures: number;
+      triage?: TriageOutcome;
+    }): Promise<void> => {
+      if (recorded) return;
+      recorded = true;
+      try {
+        const summary = await saveScanSummary(db, clock, {
+          projectId,
+          jobId: ctx.jobId,
+          sessionId,
+          counts,
+          collectorFailures: opts.failures,
+          ...(opts.triage ? { triage: opts.triage } : {}),
+        });
+        await appendSessionLog(logPath, `[stringer] health: ${summarizeScanLine(summary)}\n`);
+      } catch (e) {
+        console.error(`[nightly-stringer] ${project.slug}: recording scan health failed`, e);
+      }
+    };
+
+    // Held outside the try so the failure path can still record what this pass SAW: triage dying is
+    // not the scan being wrong, and dropping the point would put a gap in the trend exactly where
+    // something went wrong.
+    let counts: ScanCounts | undefined;
+    let collectorFailures = 0;
+
     try {
       // 1. Scan the repo for new signals.
       const scanFile = scanFilePath(sessionId);
       await appendSessionLog(logPath, `[stringer] scan --delta ${project.repoPath}\n`);
       const result = await scan({ repoPath: project.repoPath, scanFile, signal: ctx.signal });
+      counts = await summarizeScanFile(scanFile);
+      collectorFailures = result.collectorFailures.length;
       await ctx.heartbeat();
 
       // 1b. A dead collector still exits 0 (anton-uspu) — say so on the session, before the
@@ -69,15 +114,19 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
         console.warn(`[nightly-stringer] ${project.slug}: ${detail}`);
       }
 
-      // 2. No new signals → nothing to triage. That's a success, not an error.
+      // 2. No new signals → nothing to triage. That's a success, not an error — and a real data
+      // point: a clean pass is what a falling trend is made of, so it is recorded like any other.
       if (result.signalCount === 0) {
         await appendSessionLog(logPath, `[stringer] no new signals — nothing to triage\n`);
+        await recordHealth(counts, { failures: collectorFailures });
         await endSession(db, clock, sessionId, "done");
         return;
       }
       await appendSessionLog(logPath, `[stringer] ${result.signalCount} signal(s) → /scan-triage\n`);
 
-      // 3. Dispatch claude with the scan-triage prompt to turn signals into beads (via bd).
+      // 3. Dispatch claude with the scan-triage prompt to turn signals into beads (via bd). The
+      // severity mapping rides along resolved (anton-bz1w): the skill documents the default, but
+      // only the project's own policy tells this agent how to label what it files.
       const triagePrompt = await loadSkill("scan-triage");
       const prompt = [
         triagePrompt,
@@ -86,6 +135,10 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
         ``,
         `The stringer scan file to triage is: ${scanFile}`,
         `Create the beads in this repository's beads tracker using \`bd\`. Report your summary line at the end.`,
+        ``,
+        `This project's severity mapping — label and prioritize every bead you file by it:`,
+        ``,
+        formatScanSeverityPolicy(resolveScanSeverity(settings)),
       ].join("\n");
 
       const claudeResult = await runClaude({
@@ -100,6 +153,11 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
         throw new Error(`scan-triage reported an error: ${claudeResult.text ?? "unknown"}`);
       }
 
+      // 4. What triage did with the signals, out of its own closing report (skills/scan-triage §6).
+      // A session that skipped the line records no counts rather than a fabricated zero.
+      const triage = parseTriageOutcome(claudeResult.text);
+      await recordHealth(counts, { failures: collectorFailures, ...(triage ? { triage } : {}) });
+
       // The triage session wrote its beads via `bd`; push them to the Dolt remote.
       await beads
         .sync(project.repoPath)
@@ -107,6 +165,9 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
 
       await endSession(db, clock, sessionId, "done");
     } catch (e) {
+      // A pass that scanned and then died still saw the repo. Record what it saw before the failure
+      // propagates, so the trend keeps its point and the next scan's delta compares to reality.
+      if (counts) await recordHealth(counts, { failures: collectorFailures });
       await endSession(db, clock, sessionId, "failed");
       throw e; // let the runner apply job-level durability (quota backoff / retry / park)
     }

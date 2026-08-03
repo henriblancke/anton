@@ -6,6 +6,7 @@ import type { ContractStatus } from "./beads/contract";
 import type { TicketNote } from "./beads/notes";
 import type { HygieneReport } from "./hygiene";
 import type { ReviewTrajectory } from "./review-trajectory";
+import type { ScanHealth } from "./scan-health";
 
 export type { TicketNote };
 
@@ -22,6 +23,19 @@ export type {
   HygieneFindingKind,
   HygieneReport,
 } from "./hygiene";
+
+// The stringer health series' shapes, re-exported type-only for the same reason as hygiene above:
+// the trend panel renders them, and a value import of lib/scan-health would drag drizzle +
+// better-sqlite3 into the browser bundle.
+export type {
+  ClassCounts,
+  ScanDelta,
+  ScanHealth,
+  ScanHealthPoint,
+  SeverityCounts,
+  TriageOutcome,
+} from "./scan-health";
+export type { ScanSeverity, SignalClass } from "./scan-severity";
 
 export type Stage = "backlog" | "implementing" | "in-review" | "done";
 export const STAGES: Stage[] = ["backlog", "implementing", "in-review", "done"];
@@ -242,6 +256,12 @@ export interface Board {
    * reviewed: an un-scored project shows no panel rather than a zero trend.
    */
   reviewTrajectory?: ReviewTrajectory;
+  /**
+   * How this project's codebase health has been trending (anton-bz1w) — one point per nightly
+   * stringer pass. Absent until the first scan: "never scanned" is not "scanned, nothing found",
+   * and only the second is news.
+   */
+  scanHealth?: ScanHealth;
 }
 
 // ── Roadmap page ──

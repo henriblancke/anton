@@ -39,6 +39,7 @@ import { useBoardGrouping } from "@/lib/use-board-grouping";
 import { SyncStatusBadge } from "@/components/board/sync-status-badge";
 import { HygienePanel } from "@/components/board/hygiene-panel";
 import { ReviewTrajectoryPanel } from "@/components/board/review-trajectory-panel";
+import { ScanHealthPanel } from "@/components/board/scan-health-panel";
 import { Button } from "@/components/ui/button";
 import { TicketDialog } from "@/components/ticket/ticket-dialog";
 
@@ -302,6 +303,9 @@ export function EpicBoard({
       {/* Alongside hygiene, and for the same reason: the trend rides the board payload, so it moves
           on the same poll as the scores its cards carry. */}
       <ReviewTrajectoryPanel slug={slug} trajectory={board.reviewTrajectory} />
+      {/* The third supervision surface, and the one that looks OUTWARD: hygiene says how the board
+          is kept, the trajectory how the runs scored, this how the codebase itself is trending. */}
+      <ScanHealthPanel health={board.scanHealth} />
       {lanes ? (
         // The lanes share one horizontal scroller so every lane's stage columns line up under the
         // single stage strip, at any width.

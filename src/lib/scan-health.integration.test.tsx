@@ -1,0 +1,203 @@
+// @vitest-environment jsdom
+/**
+ * End-to-end proof of anton-bz1w's acceptance: replay two consecutive scans through the REAL
+ * nightly-stringer handler + REAL runner (fake `stringer` writing a canned scan, fake `claude`
+ * standing in for /scan-triage), then read the stored summaries back and RENDER the board panel off
+ * them — the delta a founder actually sees has to survive the whole path, not just the unit that
+ * computes it. Skipped without bd + git.
+ */
+import { afterAll, beforeAll, expect, it } from "vitest";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { render, screen } from "@testing-library/react";
+
+import { describeBd, makeBdRepo, saveEnv, type BdRepo } from "@/lib/testing/integration";
+import { driveJob } from "@/lib/testing/jobs";
+import { makeTestDb, type TestDb } from "@/lib/db/testing";
+import * as schema from "@/lib/db/schema";
+import { getJob, type Clock } from "@/lib/jobs/queue";
+import { makeNightlyStringerHandler } from "@/lib/jobs/nightly-stringer";
+import { listScanSummaries, scanHealth } from "@/lib/scan-health";
+import { ScanHealthPanel } from "@/components/board/scan-health-panel";
+
+class FakeClock implements Clock {
+  constructor(private t: number) {}
+  now() {
+    return this.t;
+  }
+  advance(ms: number) {
+    this.t += ms;
+  }
+}
+
+function writeBin(dir: string, name: string, body: string): string {
+  const p = join(dir, name);
+  writeFileSync(p, `#!/usr/bin/env node\n${body}`);
+  chmodSync(p, 0o755);
+  return p;
+}
+
+/** A day's worth of stringer output: one CVE and two TODOs — critical + low, security + debt. */
+const NOISY_SCAN = JSON.stringify({
+  signals: [
+    { Source: "vuln", Kind: "vulnerability", FilePath: "package.json", Line: 1, Title: "CVE-1" },
+    { Source: "todos", Kind: "todo", FilePath: "a.ts", Line: 3, Title: "TODO a" },
+    { Source: "todos", Kind: "todo", FilePath: "b.ts", Line: 7, Title: "TODO b" },
+  ],
+  metadata: {},
+});
+
+/** The next night: the CVE is gone and only one new TODO arrived — the codebase is calming down. */
+const QUIETER_SCAN = JSON.stringify({
+  signals: [{ Source: "todos", Kind: "todo", FilePath: "c.ts", Line: 2, Title: "TODO c" }],
+  metadata: {},
+});
+
+describeBd("scan health e2e (real handler · real bd · fake stringer/claude)", () => {
+  let bdRepo: BdRepo;
+  let sandbox: string;
+  let tdb: TestDb;
+  let clock: FakeClock;
+  let projectId: string;
+  let restoreEnv: () => void;
+
+  const runScan = () =>
+    driveJob({
+      db: tdb.db,
+      clock,
+      type: "nightly-stringer",
+      handler: makeNightlyStringerHandler,
+      projectId,
+      config: { leaseMs: 30_000 },
+    });
+
+  beforeAll(async () => {
+    bdRepo = makeBdRepo({ initialCommit: true });
+    sandbox = bdRepo.dir;
+    const binDir = join(sandbox, "bin");
+    mkdirSync(binDir);
+
+    // Fake stringer: replay whatever scan FAKE_SCAN_JSON holds, honouring `-o <file>`.
+    const fakeStringer = writeBin(
+      binDir,
+      "stringer",
+      `const fs=require('fs');const a=process.argv.slice(2);
+const oi=a.indexOf('-o');const out=oi>=0?a[oi+1]:null;
+if(out)fs.writeFileSync(out,process.env.FAKE_SCAN_JSON||'{"signals":[]}');
+process.exit(0);`,
+    );
+
+    // Fake /scan-triage: create one bead per signal via bd, then close with the report line §6
+    // specifies — which is where the summary's created/deduped counts come from.
+    const fakeClaude = writeBin(
+      binDir,
+      "claude",
+      `const fs=require('fs');const cp=require('child_process');
+let prompt='';process.stdin.setEncoding('utf8');
+process.stdin.on('data',c=>{prompt+=c;});
+process.stdin.on('end',()=>{
+  if(process.env.ANTON_TEST_CLAUDE_ARGV)fs.appendFileSync(process.env.ANTON_TEST_CLAUDE_ARGV,JSON.stringify({prompt})+'\\n');
+  const m=prompt.match(/scan file to triage is: (\\S+)/);
+  let n=0;
+  if(m){const scan=JSON.parse(fs.readFileSync(m[1],'utf8'));
+    for(const s of (scan.signals||[])){
+      n++;
+      cp.execFileSync('bd',['create','Triaged: '+s.Title,'--type','task','--acceptance','fix it','--json'],{cwd:process.cwd()});
+    }
+  }
+  const line='created: '+n+' ('+n+' features, 0 tickets) · epics: 1 attached, 0 created · deduped: 1 · dropped-as-noise: 0 · deferred (over cap): 0';
+  process.stdout.write(JSON.stringify({type:'result',subtype:'success',result:line,is_error:false})+'\\n');
+  process.exit(0);
+});`,
+    );
+
+    restoreEnv = saveEnv([
+      "ANTON_STRINGER_BIN",
+      "ANTON_CLAUDE_BIN",
+      "ANTON_SESSIONS_ROOT",
+      "ANTON_SCANS_ROOT",
+      "ANTON_TEST_CLAUDE_ARGV",
+      "FAKE_SCAN_JSON",
+    ]);
+    process.env.ANTON_STRINGER_BIN = fakeStringer;
+    process.env.ANTON_CLAUDE_BIN = fakeClaude;
+    process.env.ANTON_SESSIONS_ROOT = join(sandbox, "sessions");
+    process.env.ANTON_SCANS_ROOT = join(sandbox, "scans");
+    process.env.ANTON_TEST_CLAUDE_ARGV = join(sandbox, "claude-argv.jsonl");
+
+    tdb = makeTestDb();
+    clock = new FakeClock(1_700_000_000_000);
+    projectId = randomUUID();
+    await tdb.db.insert(schema.projects).values({
+      id: projectId,
+      slug: "sandbox",
+      name: "sandbox",
+      repoPath: bdRepo.repo,
+      defaultBranch: "main",
+    });
+  });
+
+  afterAll(() => {
+    tdb?.close();
+    restoreEnv();
+    bdRepo.cleanup();
+  });
+
+  it("replays two scans into a stored, charted delta", async () => {
+    // Night one: three signals, one of them a CVE.
+    process.env.FAKE_SCAN_JSON = NOISY_SCAN;
+    expect((await getJob(tdb.db, await runScan()))?.status).toBe("done");
+
+    // Night two, a day later: one TODO and no CVE.
+    clock.advance(86_400_000);
+    process.env.FAKE_SCAN_JSON = QUIETER_SCAN;
+    expect((await getJob(tdb.db, await runScan()))?.status).toBe("done");
+
+    // 1. Both passes left a comparable record, newest first.
+    const summaries = await listScanSummaries(tdb.db, projectId);
+    expect(summaries.length).toBe(2);
+    const [second, first] = summaries;
+
+    expect(first.counts.total).toBe(3);
+    expect(first.counts.bySeverity).toEqual({ critical: 1, high: 0, medium: 0, low: 2 });
+    expect(first.counts.byClass.security).toBe(1);
+    expect(first.counts.byClass.debt).toBe(2);
+    // Nothing preceded it, so it carries no delta — a first scan is not a scan with no change.
+    expect(first.delta).toBeUndefined();
+    // The triage session's own report line, parsed back off the health record.
+    expect(first.triage).toEqual({ created: 3, deduped: 1 });
+    expect(first.jobId).toBeTruthy();
+    expect(first.sessionId).toBeTruthy();
+
+    expect(second.counts.total).toBe(1);
+    expect(second.counts.bySeverity).toEqual({ critical: 0, high: 0, medium: 0, low: 1 });
+    expect(second.delta).toEqual({
+      total: -2,
+      bySeverity: { critical: -1, high: 0, medium: 0, low: -1 },
+    });
+
+    // 2. The board's view of the same two rows — oldest → newest, delta on the latest.
+    const health = scanHealth(summaries)!;
+    expect(health.points.map((p) => p.total)).toEqual([3, 1]);
+    expect(health.latest.id).toBe(second.id);
+    expect(health.delta?.total).toBe(-2);
+
+    // 3. And what the founder actually reads: the charted delta, on the panel.
+    render(<ScanHealthPanel health={health} />);
+    expect(screen.getByText(/−2 vs previous scan/)).toBeTruthy();
+    expect(screen.getByTitle(/arriving more slowly/)).toBeTruthy();
+    const chartLabel = screen.getByRole("img").getAttribute("aria-label")!;
+    expect(chartLabel).toContain("3 (1 critical, 2 low)");
+    expect(chartLabel).toContain("1 (1 low)");
+    expect(screen.getByText("1 low")).toBeTruthy();
+  });
+
+  it("hands the triage prompt this project's severity mapping", () => {
+    const log = readFileSync(join(sandbox, "claude-argv.jsonl"), "utf8");
+    const prompt = (JSON.parse(log.trim().split("\n").pop()!) as { prompt: string }).prompt;
+    expect(prompt).toContain("This project's severity mapping");
+    expect(prompt).toContain("| critical | risk:high | P0 |");
+    expect(prompt).toContain("| low | risk:low | P3 |");
+  });
+});
