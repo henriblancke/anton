@@ -340,7 +340,12 @@ describe("settings route — self-review settings (anton-of1m)", () => {
   });
 
   it("PATCH persists the score-alarm thresholds, including 0 as the off switch (anton-i98r)", async () => {
-    const res = await PATCH(patchReq({ reviewMinScore: 7, reviewLowScoreRounds: 3 }), ctx("tmp"));
+    // The cap rides along: a 3-round streak under the default cap of 2 could never trip, and is
+    // rejected by the cross-check below.
+    const res = await PATCH(
+      patchReq({ reviewMaxRounds: 3, reviewMinScore: 7, reviewLowScoreRounds: 3 }),
+      ctx("tmp"),
+    );
     expect(res.status).toBe(200);
     expect((await res.json()).settings).toMatchObject({ reviewMinScore: 7, reviewLowScoreRounds: 3 });
 
@@ -368,8 +373,48 @@ describe("settings route — self-review settings (anton-of1m)", () => {
     expect("reviewLowScoreRounds" in persisted()).toBe(false);
   });
 
+  it("PATCH rejects a low-round streak longer than the round cap — the alarm could never fire", async () => {
+    const res = await PATCH(
+      patchReq({ reviewMaxRounds: 2, reviewMinScore: 5, reviewLowScoreRounds: 3 }),
+      ctx("tmp"),
+    );
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/reviewLowScoreRounds/);
+    expect("reviewMaxRounds" in persisted()).toBe(false);
+
+    // Equal is reachable: the alarm is evaluated after every round, the last one included.
+    const ok = await PATCH(patchReq({ reviewMaxRounds: 2, reviewLowScoreRounds: 2 }), ctx("tmp"));
+    expect(ok.status).toBe(200);
+  });
+
+  it("cross-checks the streak against the STORED round cap, not just the patched fields", async () => {
+    await PATCH(patchReq({ reviewMaxRounds: 2 }), ctx("tmp"));
+    // Only the streak is patched here — the cap it contradicts is the one already persisted.
+    const res = await PATCH(patchReq({ reviewLowScoreRounds: 4 }), ctx("tmp"));
+    expect(res.status).toBe(400);
+    expect("reviewLowScoreRounds" in persisted()).toBe(false);
+
+    // Raising the cap in the same patch resolves it.
+    const ok = await PATCH(patchReq({ reviewMaxRounds: 5, reviewLowScoreRounds: 4 }), ctx("tmp"));
+    expect(ok.status).toBe(200);
+    expect(persisted()).toMatchObject({ reviewMaxRounds: 5, reviewLowScoreRounds: 4 });
+  });
+
+  it("allows an unreachable streak while the alarm is OFF (minimum score 0)", async () => {
+    const res = await PATCH(
+      patchReq({ reviewMinScore: 0, reviewMaxRounds: 1, reviewLowScoreRounds: 4 }),
+      ctx("tmp"),
+    );
+    expect(res.status).toBe(200);
+    expect(persisted()).toMatchObject({ reviewMinScore: 0, reviewLowScoreRounds: 4 });
+  });
+
   it('PATCH null clears the score-alarm thresholds back to their defaults (keys removed)', async () => {
-    await PATCH(patchReq({ reviewMinScore: 8, reviewLowScoreRounds: 4 }), ctx("tmp"));
+    await PATCH(
+      patchReq({ reviewMaxRounds: 4, reviewMinScore: 8, reviewLowScoreRounds: 4 }),
+      ctx("tmp"),
+    );
+    expect(persisted()).toMatchObject({ reviewMinScore: 8, reviewLowScoreRounds: 4 });
     const res = await PATCH(patchReq({ reviewMinScore: null, reviewLowScoreRounds: null }), ctx("tmp"));
     expect(res.status).toBe(200);
     expect("reviewMinScore" in persisted()).toBe(false);

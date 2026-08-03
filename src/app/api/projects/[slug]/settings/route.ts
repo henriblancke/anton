@@ -2,6 +2,9 @@ import { NextResponse } from "next/server";
 import { discoverAgents } from "@/lib/agents-discovery";
 import {
   CONCURRENCY_RANGE,
+  DEFAULT_REVIEW_LOW_SCORE_ROUNDS,
+  DEFAULT_REVIEW_MAX_ROUNDS,
+  DEFAULT_REVIEW_MIN_SCORE,
   JOB_TIMEOUT_MINUTES_RANGE,
   MAX_RETRIES_RANGE,
   REVIEW_LOW_SCORE_ROUNDS_RANGE,
@@ -84,6 +87,32 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
       );
     }
     patch[key] = n;
+  }
+
+  // The score-regression alarm counts its streak over rounds the converge loop actually RUNS
+  // (lib/jobs/review-alarm.ts), so a streak longer than the round cap can never trip: the loop hits
+  // the cap and parks as `unresolved` — or opens the PR on a clean-but-low round — while the alarm
+  // stays silently dead. Neither knob is wrong on its own, so the contradiction is only visible
+  // against the values a run will resolve: the patched one, else the stored one, else the default.
+  const alarmKeys = ["reviewMinScore", "reviewMaxRounds", "reviewLowScoreRounds"] as const;
+  if (alarmKeys.some((key) => key in body)) {
+    const stored = await getProjectSettingsBySlug(slug);
+    const effective = (key: (typeof alarmKeys)[number], fallback: number): number =>
+      (key in patch ? patch[key] : stored[key]) ?? fallback;
+    const minScore = effective("reviewMinScore", DEFAULT_REVIEW_MIN_SCORE);
+    const maxRounds = effective("reviewMaxRounds", DEFAULT_REVIEW_MAX_ROUNDS);
+    const lowScoreRounds = effective("reviewLowScoreRounds", DEFAULT_REVIEW_LOW_SCORE_ROUNDS);
+    // A minimum score of 0 is the alarm's off switch — an unreachable streak is moot while it's off.
+    if (minScore > 0 && lowScoreRounds > maxRounds) {
+      return NextResponse.json(
+        {
+          error:
+            `reviewLowScoreRounds (${lowScoreRounds}) cannot exceed reviewMaxRounds (${maxRounds}) — ` +
+            `the alarm would never fire, because the review loop stops at the round cap first`,
+        },
+        { status: 400 },
+      );
+    }
   }
 
   // Verify-gate commands (anton-3oh8): tests + operator-pinned lint/typecheck/build. "" / null

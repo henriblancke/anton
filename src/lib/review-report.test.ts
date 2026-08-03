@@ -59,6 +59,30 @@ describe("parseReviewScoreComment", () => {
     expect(parseReviewScoreComment(comment(text))?.findings).toEqual([]);
   });
 
+  it("reads a score off the 0-10 scale as NO score — the surfaces size a bar by it", () => {
+    const off = (score: unknown) =>
+      comment(
+        "```json\n" +
+          JSON.stringify({
+            kind: "anton.review-score",
+            round: 1,
+            score,
+            blocking: 0,
+            advisory: 0,
+            verdict: "clean",
+          }) +
+          "\n```",
+      );
+    for (const bad of [99, -1, 4.5]) {
+      const parsed = parseReviewScoreComment(off(bad));
+      expect(parsed).toBeDefined(); // the round still replays; only its score is unusable
+      expect(parsed?.score).toBeUndefined();
+    }
+    // The bounds themselves are real scores.
+    expect(parseReviewScoreComment(off(0))?.score).toBe(0);
+    expect(parseReviewScoreComment(off(10))?.score).toBe(10);
+  });
+
   it("drops a finding with no note — it would render as an empty instruction", () => {
     const text = "```json\n" +
       JSON.stringify({

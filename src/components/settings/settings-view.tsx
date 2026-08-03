@@ -742,10 +742,21 @@ export function SettingsView({
                 <div className="flex flex-col gap-2.5 rounded-[10px] border border-border bg-background/40 px-3 py-2.5">
                   <div className="flex items-baseline gap-2">
                     <span className="text-[12.5px] font-medium">Score-regression alarm</span>
-                    <span className="text-[11px] text-subtle">
+                    {/* A streak longer than the round cap can never be reached — the loop stops at
+                        the cap first — so the contradiction is named here, not left to the save's 400. */}
+                    <span
+                      className={cn(
+                        "text-[11px]",
+                        reviewMinScore !== REVIEW_MIN_SCORE_MIN && reviewLowScoreRounds > reviewMaxRounds
+                          ? "text-risk-high"
+                          : "text-subtle",
+                      )}
+                    >
                       {reviewMinScore === REVIEW_MIN_SCORE_MIN
                         ? "off · the loop runs to the round cap whatever it scores"
-                        : `park after ${reviewLowScoreRounds} round${reviewLowScoreRounds === 1 ? "" : "s"} below ${reviewMinScore}/10`}
+                        : reviewLowScoreRounds > reviewMaxRounds
+                          ? `never fires · ${reviewLowScoreRounds} low rounds can't happen in ${reviewMaxRounds} review round${reviewMaxRounds === 1 ? "" : "s"}`
+                          : `park after ${reviewLowScoreRounds} round${reviewLowScoreRounds === 1 ? "" : "s"} below ${reviewMinScore}/10`}
                     </span>
                   </div>
                   <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">

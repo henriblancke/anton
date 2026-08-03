@@ -51,7 +51,7 @@ export function parseReviewScoreComment(comment: BeadComment): ReviewReportRound
     if (entry?.kind !== REVIEW_SCORE_KIND || typeof entry.round !== "number") continue;
     return {
       round: entry.round,
-      ...(typeof entry.score === "number" ? { score: entry.score } : {}),
+      ...(isScore(entry.score) ? { score: entry.score } : {}),
       blocking: typeof entry.blocking === "number" ? entry.blocking : 0,
       advisory: typeof entry.advisory === "number" ? entry.advisory : 0,
       verdict: entry.verdict ?? "interrupted",
@@ -61,6 +61,17 @@ export function parseReviewScoreComment(comment: BeadComment): ReviewReportRound
     };
   }
   return undefined;
+}
+
+/**
+ * A score the report may carry: the same 0-10 integer `reviewScoreOf` accepts off a label, and the
+ * only scale the review contract defines. A comment is free text on the board, so a hand-edited or
+ * future-format payload can put anything in this field — and the surfaces size a sparkline bar by
+ * it, where an unbounded number draws straight out of its container. Out of range reads as NO
+ * score, exactly like a round that never reported one.
+ */
+function isScore(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 10;
 }
 
 /**

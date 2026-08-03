@@ -74,9 +74,10 @@ const INHERITED_LABEL_PREFIXES = ["agent:", "domain:", "risk:", "size:", "area:"
  * Apply a rework to one ticket of a run target.
  *
  * Idempotent by construction rather than by token: a repeat of the same request finds its own note
- * already on the bead (reopen) or its own follow-up already linked (follow-up) and writes nothing,
- * so a double-click leaves one note and one bead. The check and the write are serialized on the
- * ticket's own write lock, which is what makes that hold for two requests in flight at once.
+ * already on a bead already in the state it wanted (reopen) or its own follow-up already linked
+ * (follow-up) and writes nothing, so a double-click leaves one note and one bead. The check and the
+ * write are serialized on the ticket's own write lock, which is what makes that hold for two
+ * requests in flight at once.
  */
 export async function reworkTicket(
   project: Project,
@@ -207,9 +208,13 @@ async function applyReopen(
   const body = reworkNoteBody({ mode: "reopen", targetId: target.id, summary, instructions, findings });
 
   // Re-read under the lock: the dedupe is decided on the note blob as it is at the instant we write,
-  // so a request that lost the race to an identical one sees its work already done.
+  // so a request that lost the race to an identical one sees its work already done. "Already done"
+  // is the note AND the state the rework produces — an open bead with the finished run's stage
+  // labels gone. On text alone, sending the same instructions back a SECOND time (after a later run
+  // re-closed the ticket) would skip the reopen and leave the bead closed while the founder is told
+  // it went back.
   const fresh = await beads.show(repo, ticket.id);
-  if (hasHumanNote(fresh, body)) {
+  if (hasHumanNote(fresh, body) && fresh.status !== "closed" && !hasStageLabel(fresh)) {
     return { mode: "reopen", ticketId: ticket.id, reworkedId: ticket.id, note: body, applied: false };
   }
 
@@ -324,7 +329,13 @@ function inheritedLabels(ticket: Bead): string[] {
   return (ticket.labels ?? []).filter((l) => INHERITED_LABEL_PREFIXES.some((p) => l.startsWith(p)));
 }
 
-/** Is this exact instruction already on the bead as a human note? The reopen path's double-submit guard. */
+/** Stage labels a reopen strips — one still on the bead means this rework's untag hasn't run yet. */
+function hasStageLabel(bead: Bead): boolean {
+  const stages: string[] = [LABELS.stage("implementing"), LABELS.stage("in-review")];
+  return (bead.labels ?? []).some((l) => stages.includes(l));
+}
+
+/** Is this exact instruction already on the bead as a human note? Half of the double-submit guard. */
 function hasHumanNote(bead: Bead, body: string): boolean {
   const wanted = normalize(body);
   return parseTicketNotes(bead.notes).some(

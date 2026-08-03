@@ -175,6 +175,16 @@ describe("live-run race check", () => {
 });
 
 describe("reopen", () => {
+  /** The note body {@link input}'s rework writes — what a repeat of it finds already on the bead. */
+  const sameNote = () =>
+    reworkNoteBody({
+      mode: "reopen",
+      targetId: "feat",
+      summary: "the API is still untested",
+      instructions: "Add a test that fails without the null guard.",
+      findings: [],
+    });
+
   it("writes the instructions as a HUMAN note, then reopens with the reason", async () => {
     const result = await reworkTicket(project, "feat", input());
 
@@ -215,20 +225,9 @@ describe("reopen", () => {
     expect(reopenMock).not.toHaveBeenCalled();
   });
 
-  it("is a no-op on a double submit: the identical note is already on the bead", async () => {
-    const body = reworkNoteBody({
-      mode: "reopen",
-      targetId: "feat",
-      summary: "the API is still untested",
-      instructions: "Add a test that fails without the null guard.",
-      findings: [],
-    });
+  it("is a no-op on a double submit: the identical note is on an already-reopened bead", async () => {
     showMock.mockResolvedValue(
-      makeBead({
-        id: "t1",
-        status: "closed",
-        notes: formatHumanNote(body, "founder", new Date()),
-      }),
+      makeBead({ id: "t1", status: "open", notes: formatHumanNote(sameNote(), "founder", new Date()) }),
     );
 
     const result = await reworkTicket(project, "feat", input());
@@ -236,6 +235,36 @@ describe("reopen", () => {
     expect(result.reworkedId).toBe("t1");
     expect(noteMock).not.toHaveBeenCalled();
     expect(reopenMock).not.toHaveBeenCalled();
+  });
+
+  it("re-applies when the bead carrying the note has since been CLOSED again", async () => {
+    // The founder sent this ticket back once, a run closed it, and they are sending the same
+    // instructions back again. On note text alone the second send-back would silently do nothing
+    // and leave the ticket closed while the UI says it went back.
+    showMock.mockResolvedValue(
+      makeBead({ id: "t1", status: "closed", notes: formatHumanNote(sameNote(), "founder", new Date()) }),
+    );
+
+    const result = await reworkTicket(project, "feat", input());
+    expect(result.applied).toBe(true);
+    expect(reopenMock).toHaveBeenCalledWith("/repo", "t1", "rework: the API is still untested");
+  });
+
+  it("re-applies when the note landed but the run's stage labels are still on the bead", async () => {
+    // A half-applied rework (the untag never ran): `stage:in-review` left on makes the next run skip
+    // the very ticket it was told to redo, so the repeat must finish the job, not report it done.
+    showMock.mockResolvedValue(
+      makeBead({
+        id: "t1",
+        status: "open",
+        labels: ["stage:in-review"],
+        notes: formatHumanNote(sameNote(), "founder", new Date()),
+      }),
+    );
+
+    const result = await reworkTicket(project, "feat", input());
+    expect(result.applied).toBe(true);
+    expect(untagMock).toHaveBeenCalledWith("/repo", "t1", ["stage:implementing", "stage:in-review"]);
   });
 
   it("still applies a DIFFERENT rework of the same ticket", async () => {
