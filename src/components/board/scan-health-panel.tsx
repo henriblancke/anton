@@ -203,7 +203,7 @@ function DeltaChip({ delta }: { delta: number | undefined }) {
     return (
       <span
         className="text-xs text-subtle"
-        title="A trend needs two scans measuring the same thing. A project's first scan has no baseline, so it counts everything in the repo rather than what arrived since — the comparison starts one scan later."
+        title="A trend needs two scans measuring the same thing. A scan with no baseline behind it — a project's first, or the first after the scanner's baseline was reset — counts everything in the repo rather than what arrived since, so the comparison starts one scan later."
       >
         no trend yet
       </span>

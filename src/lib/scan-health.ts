@@ -22,6 +22,7 @@ import { randomUUID } from "node:crypto";
 import { and, desc, eq, notInArray, sql } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import type { AntonDb, Clock } from "./jobs/queue";
+import type { DeltaState } from "./stringer";
 import {
   SCAN_SEVERITIES,
   SIGNAL_CLASSES,
@@ -66,11 +67,19 @@ export interface ScanSummary {
   generatedAt: number;
   counts: ScanCounts;
   /**
-   * Against the previous scan. Absent until there is a COMPARABLE one — the first scan has nothing
-   * before it, and the second's predecessor is a baseline counting the whole repo rather than an
-   * arrival rate. Absent is "not comparable yet", a different claim from "no change".
+   * Against the previous scan. Absent unless this scan measured arrivals since exactly the baseline
+   * that scan left ({@link deltaState}) — a scan that established the baseline counts the whole repo
+   * rather than an arrival rate, and the two are not the same quantity. Absent is "not comparable",
+   * a different claim from "no change".
    */
   delta?: ScanDelta;
+  /**
+   * The `stringer --delta` baseline this scan left, published only when the scan measured against a
+   * baseline itself — so the next scan can prove it is comparing arrival rates, not subtracting a
+   * standing total. Absent when this scan (re-)established the baseline, or when anton could not
+   * identify stringer's state.
+   */
+  deltaState?: string;
   /**
    * Absent when triage never ran (a scan with no new signals) or when the session broke the report
    * protocol. Absent means "not reported", never "created nothing".
@@ -166,6 +175,8 @@ export interface SaveScanSummaryInput {
   counts: ScanCounts;
   triage?: TriageOutcome;
   collectorFailures?: number;
+  /** The baselines the scan consumed and left, as `lib/stringer` read them — what makes a delta honest. */
+  deltaState?: DeltaState;
 }
 
 /**
@@ -211,8 +222,9 @@ async function backfillTriage(
 
 /**
  * Append this scan's summary and prune the project back to {@link SCAN_SUMMARY_RETENTION} rows.
- * The delta is computed HERE, against the row this one lands on top of, and stored — so a point
- * still names what it changed once the scan it was compared to has aged out of the window.
+ * The delta is computed HERE, against the row this one lands on top of when the two are provably
+ * comparable, and stored — so a point still names what it changed once the scan it was compared to
+ * has aged out of the window.
  *
  * Every pass writes one, including a scan that found nothing: "scanned, clean" is the data point
  * that makes a falling trend readable, and skipping it would leave the chart claiming the last
@@ -230,13 +242,23 @@ export async function saveScanSummary(
     if (already) return backfillTriage(db, already, input.triage);
   }
 
-  // A project's FIRST scan has no `--delta` baseline, so stringer emits everything in the repo:
-  // that point is a standing total, not the arrival rate every later point measures. Subtracting it
-  // from the first genuinely incremental scan charts a collapse that never happened — a 100-signal
-  // baseline followed by one new signal would read "−99, problems arriving more slowly". So the
-  // trend starts comparing at the scan AFTER the baseline, where both sides are the same quantity.
-  const [previous, beforeThat] = await listScanSummaries(db, input.projectId, 2);
-  const delta = previous && beforeThat ? computeDelta(input.counts, previous.counts) : undefined;
+  // Comparable ONLY when this scan measured arrivals since exactly the baseline the previous point
+  // left. A scan with no baseline to measure against emits everything in the repo — a standing
+  // total, not the arrival rate every incremental point measures — and subtracting the two charts a
+  // move that never happened (a 100-signal baseline after one quiet night reads "+99, debt pouring
+  // in"). Counting predecessors can't tell them apart (anton-3flx): stringer's baseline lives in the
+  // REPO while this series lives in a disposable anton.db, so either is reset without the other —
+  // a rebuilt anton.db would suppress two honest deltas, and a re-established baseline mid-series
+  // would sail straight through the count and chart a regression.
+  const consumed = input.deltaState?.before;
+  const [previous] = await listScanSummaries(db, input.projectId, 1);
+  const delta =
+    consumed && previous?.deltaState === consumed
+      ? computeDelta(input.counts, previous.counts)
+      : undefined;
+  // Published only by a scan whose own counts are an arrival rate: a baseline scan leaves a baseline
+  // behind too, but nothing may ever be measured against ITS standing total.
+  const deltaState = consumed ? input.deltaState?.after : undefined;
   const summary: ScanSummary = {
     id: randomUUID(),
     projectId: input.projectId,
@@ -245,6 +267,7 @@ export async function saveScanSummary(
     generatedAt: Math.floor(clock.now() / 1000),
     counts: input.counts,
     ...(delta ? { delta } : {}),
+    ...(deltaState ? { deltaState } : {}),
     ...(input.triage ? { triage: input.triage } : {}),
     collectorFailures: input.collectorFailures ?? 0,
   };
@@ -259,6 +282,7 @@ export async function saveScanSummary(
     bySeverityJson: JSON.stringify(summary.counts.bySeverity),
     byClassJson: JSON.stringify(summary.counts.byClass),
     deltaJson: delta ? JSON.stringify(delta) : null,
+    deltaState: deltaState ?? null,
     beadsCreated: summary.triage?.created ?? null,
     beadsDeduped: summary.triage?.deduped ?? null,
     collectorFailures: summary.collectorFailures,
@@ -336,6 +360,7 @@ function toSummary(row: typeof schema.scanSummaries.$inferSelect): ScanSummary {
       byClass: parseCounts(row.byClassJson, emptyClassCounts()),
     },
     ...(delta ? { delta } : {}),
+    ...(row.deltaState ? { deltaState: row.deltaState } : {}),
     ...(triage ? { triage } : {}),
     collectorFailures: row.collectorFailures,
   };

@@ -12,7 +12,7 @@ import { beads } from "../beads/bd";
 import { getProjectById, getProjectSettings, resolveScanSeverity } from "../projects";
 import { loadSkill } from "../claude/prompt";
 import { runClaude } from "../claude/driver";
-import { describeCollectorFailure, scan } from "../stringer";
+import { describeCollectorFailure, scan, type DeltaState } from "../stringer";
 import {
   ANTON_CLASS_KEY,
   ANTON_SEVERITY_KEY,
@@ -125,6 +125,7 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
     const recordHealth = async (counts: ScanCounts, opts: {
       failures: number;
       triage?: TriageOutcome;
+      deltaState?: DeltaState;
     }): Promise<void> => {
       if (recorded) return;
       recorded = true;
@@ -135,6 +136,7 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
           sessionId,
           counts,
           collectorFailures: opts.failures,
+          ...(opts.deltaState ? { deltaState: opts.deltaState } : {}),
           ...(opts.triage ? { triage: opts.triage } : {}),
         });
         await appendSessionLog(logPath, `[stringer] health: ${summarizeScanLine(summary)}\n`);
@@ -148,6 +150,7 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
     // something went wrong.
     let counts: ScanCounts | undefined;
     let collectorFailures = 0;
+    let deltaState: DeltaState | undefined;
 
     try {
       // 1. Scan the repo for new signals.
@@ -159,7 +162,19 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
       // that never existed.
       counts = summarizeSignals(result.signals);
       collectorFailures = result.collectorFailures.length;
+      deltaState = result.deltaState;
       await ctx.heartbeat();
+
+      // The trend can only subtract two scans that measured against the same stringer baseline, and
+      // that proof is the baseline anton read off the repo. If it isn't where anton looks, every
+      // point stays uncomparable — say so, rather than letting the trend quietly lose its deltas.
+      if (!deltaState.after) {
+        const detail =
+          `stringer's --delta baseline was not found under ${project.repoPath} — this scan's point ` +
+          `carries no comparison, and none will until anton can identify it`;
+        await appendSessionLog(logPath, `[stringer] WARNING: ${detail}\n`);
+        console.warn(`[nightly-stringer] ${project.slug}: ${detail}`);
+      }
 
       // 1b. A dead collector still exits 0 (anton-uspu) — say so on the session, before the
       // no-signals early return, so a scan that lost gitlog doesn't read as a clean nothing-to-do.
@@ -173,7 +188,10 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
       // point: a clean pass is what a falling trend is made of, so it is recorded like any other.
       if (counts.total === 0) {
         await appendSessionLog(logPath, `[stringer] no new signals — nothing to triage\n`);
-        await recordHealth(counts, { failures: collectorFailures });
+        await recordHealth(counts, {
+          failures: collectorFailures,
+          ...(deltaState ? { deltaState } : {}),
+        });
         await endSession(db, clock, sessionId, "done");
         return;
       }
@@ -223,7 +241,11 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
       // 4. What triage did with the signals, out of its own closing report (skills/scan-triage §6).
       // A session that skipped the line records no counts rather than a fabricated zero.
       const triage = parseTriageOutcome(claudeResult.text);
-      await recordHealth(counts, { failures: collectorFailures, ...(triage ? { triage } : {}) });
+      await recordHealth(counts, {
+        failures: collectorFailures,
+        ...(deltaState ? { deltaState } : {}),
+        ...(triage ? { triage } : {}),
+      });
 
       // The triage session wrote its beads via `bd`; push them to the Dolt remote.
       await beads
@@ -234,7 +256,12 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
     } catch (e) {
       // A pass that scanned and then died still saw the repo. Record what it saw before the failure
       // propagates, so the trend keeps its point and the next scan's delta compares to reality.
-      if (counts) await recordHealth(counts, { failures: collectorFailures });
+      if (counts) {
+        await recordHealth(counts, {
+          failures: collectorFailures,
+          ...(deltaState ? { deltaState } : {}),
+        });
+      }
       await endSession(db, clock, sessionId, "failed");
       throw e; // let the runner apply job-level durability (quota backoff / retry / park)
     }

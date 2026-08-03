@@ -92,13 +92,20 @@ describeBd("scan health e2e (real handler · real bd · fake stringer/claude)", 
     const binDir = join(sandbox, "bin");
     mkdirSync(binDir);
 
-    // Fake stringer: replay whatever scan FAKE_SCAN_JSON holds, honouring `-o <file>`.
+    // Fake stringer: replay whatever scan FAKE_SCAN_JSON holds, honouring `-o <file>`, and rewrite
+    // the `--delta` baseline under the scanned repo the way the real one does — that file is how
+    // anton tells an arrival rate from a whole-repo baseline scan, so a fake without it would prove
+    // the delta path against a series that could never happen.
     const fakeStringer = writeBin(
       binDir,
       "stringer",
-      `const fs=require('fs');const a=process.argv.slice(2);
+      `const fs=require('fs');const path=require('path');const a=process.argv.slice(2);
 const oi=a.indexOf('-o');const out=oi>=0?a[oi+1]:null;
 if(out)fs.writeFileSync(out,process.env.FAKE_SCAN_JSON||'{"signals":[]}');
+const state=path.join(a[1],'.stringer','last-scan.json');
+let n=0;try{n=JSON.parse(fs.readFileSync(state,'utf8')).n+1;}catch{}
+fs.mkdirSync(path.dirname(state),{recursive:true});
+fs.writeFileSync(state,JSON.stringify({n}));
 process.exit(0);`,
     );
 

@@ -85,6 +85,13 @@
       "when": 1785791100848,
       "tag": "0011_shiny_nemesis",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "6",
+      "when": 1785801308544,
+      "tag": "0012_lying_harrier",
+      "breakpoints": true
     }
   ]
 }

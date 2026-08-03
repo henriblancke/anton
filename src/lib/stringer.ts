@@ -8,9 +8,10 @@
  * nightly pass cheap and the board from re-flooding.
  */
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { annotateSignal, type ScanSignal } from "./scan-severity";
 
 const execFileAsync = promisify(execFile);
@@ -113,6 +114,23 @@ function toScanError(err: unknown, opts: { timeoutMs: number }): unknown {
   );
 }
 
+/**
+ * stringer's `--delta` baseline, identified either side of a scan (anton-3flx). The baseline lives
+ * in the REPO (`.stringer/last-scan.json`, rewritten on every delta scan) while anton's health
+ * series lives in a disposable anton.db — two independent lifetimes, so neither can be inferred
+ * from the other. Only these identities can tell a reader whether two scans measured the same
+ * quantity: an arrival rate since a shared baseline, or a whole-repo standing total.
+ */
+export interface DeltaState {
+  /**
+   * The baseline this scan measured against. Absent when the scan ESTABLISHED it — nothing was
+   * suppressed, so its signals are everything in the repo — or when it ran without `--delta`.
+   */
+  before?: string;
+  /** The baseline it left for the next scan. Absent when anton could not read stringer's state. */
+  after?: string;
+}
+
 export interface ScanResult {
   /** Absolute path to the JSON scan file — stringer's, re-written with anton's severity annotation. */
   scanFile: string;
@@ -126,6 +144,28 @@ export interface ScanResult {
   signals: ScanSignal[];
   /** Collectors that died during the scan — their signals are silently absent from the JSON. */
   collectorFailures: CollectorFailure[];
+  /** Which baseline this scan measured against, and which one it left (see {@link DeltaState}). */
+  deltaState: DeltaState;
+}
+
+/** Where stringer keeps the delta baseline — under the scanned repo, whatever anton's own cwd is. */
+const DELTA_STATE_FILE = join(".stringer", "last-scan.json");
+
+/**
+ * The baseline's identity as it stands right now, or undefined when there is none anton can read.
+ *
+ * A content hash rather than a parsed field: every delta scan rewrites the file (it carries the
+ * scan's timestamp and signal hashes), so the bytes already ARE the identity, and reading them this
+ * way can't drift when stringer renames a key. Unreadable is reported as unknown, never as
+ * unchanged — a state anton can't identify is one it can't prove two scans share.
+ */
+async function deltaStateId(repoPath: string): Promise<string | undefined> {
+  try {
+    const raw = await readFile(join(repoPath, DELTA_STATE_FILE));
+    return createHash("sha256").update(raw).digest("hex").slice(0, 16);
+  } catch {
+    return undefined;
+  }
 }
 
 /** A collector stringer ran but that returned an error (or timed out) — a silent hole in the scan. */
@@ -246,7 +286,8 @@ async function readAnnotatedSignals(scanFile: string): Promise<ScanSignal[]> {
 /**
  * Run `stringer scan <repo> --delta --format json -o <scanFile>` and return the signals it produced,
  * plus any collector that died mid-scan (stringer exits 0 either way — see
- * `parseCollectorFailures`). `delta` (default true) restricts to new signals since the last scan.
+ * `parseCollectorFailures`) and the baseline this pass measured against (see {@link DeltaState}).
+ * `delta` (default true) restricts to new signals since the last scan.
  * Throws on a stringer failure OR on output it can't read (fail loud — see
  * `readAnnotatedSignals`), so the job then retries/parks per the runner's policy; a deadline kill
  * throws a distinct "timed out" error rather than stringer's misleading partial stderr.
@@ -262,8 +303,14 @@ export async function scan(opts: {
   const bin = process.env[STRINGER_BIN_ENV] ?? "stringer";
   await mkdir(dirname(opts.scanFile), { recursive: true });
 
+  const delta = opts.delta ?? true;
+  // Read BEFORE the run: only the pre-scan state distinguishes a pass that measured arrivals since
+  // a baseline from one that established it, and stringer overwrites the state on its way out. A
+  // non-delta scan counts the whole repo whatever is on disk, so it consumes no baseline at all.
+  const before = delta ? await deltaStateId(opts.repoPath) : undefined;
+
   const args = ["scan", opts.repoPath, "--format", "json", "-o", opts.scanFile];
-  if (opts.delta ?? true) args.push("--delta");
+  if (delta) args.push("--delta");
   // Skip build output / caches so the walk stays on source (the .next build dir alone made this scan
   // time out), and cap each collector so a runaway one can't hang the whole scan past the timeout.
   args.push("--exclude", [...DEFAULT_SCAN_EXCLUDES, ...(opts.exclude ?? [])].join(","));
@@ -283,9 +330,11 @@ export async function scan(opts: {
     throw toScanError(err, { timeoutMs });
   }
 
+  const after = delta ? await deltaStateId(opts.repoPath) : undefined;
   return {
     scanFile: opts.scanFile,
     signals: await readAnnotatedSignals(opts.scanFile),
     collectorFailures: parseCollectorFailures(stderr),
+    deltaState: { ...(before ? { before } : {}), ...(after ? { after } : {}) },
   };
 }

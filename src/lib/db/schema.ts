@@ -227,6 +227,16 @@ export const scanSummaries = sqliteTable(
      */
     deltaJson: text("delta_json"),
     /**
+     * The `stringer --delta` baseline this scan LEFT behind, and NULL when the scan established that
+     * baseline (so its counts are a whole-repo standing total, not an arrival rate) or when anton
+     * could not identify it. A later scan may be compared to this row only if it measured against
+     * exactly this baseline: the baseline lives in the repo while this table lives in a disposable
+     * anton.db, so either side can be reset without the other — and counting rows would then
+     * subtract a fresh baseline scan from the incremental one before it and chart a regression that
+     * never happened (anton-3flx). See `DeltaState` in src/lib/stringer.ts.
+     */
+    deltaState: text("delta_state"),
+    /**
      * What /scan-triage reported doing with the signals. NULL when triage never ran (a scan with no
      * new signals) or broke its report protocol — "not reported", never "created nothing".
      */

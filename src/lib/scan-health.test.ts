@@ -26,6 +26,7 @@ import {
   type TriageOutcome,
 } from "./scan-health";
 import { SCAN_SEVERITIES } from "./scan-severity";
+import type { DeltaState } from "./stringer";
 
 class FakeClock implements Clock {
   constructor(private t: number) {}
@@ -97,6 +98,8 @@ describe("the persisted series", () => {
     tdb = makeTestDb();
     clock = new FakeClock(1_700_000_000_000);
     projectId = randomUUID();
+    left = undefined;
+    baselines = 0;
     await tdb.db.insert(schema.projects).values({
       id: projectId,
       slug: "p",
@@ -107,10 +110,26 @@ describe("the persisted series", () => {
   });
   afterEach(() => tdb.close());
 
+  /**
+   * The scan chain a nightly series really forms: each pass measures against the stringer baseline
+   * the pass before it left, and leaves a fresh one. The first has none to measure against — it
+   * establishes the baseline, so its counts are the whole repo.
+   */
+  let left: string | undefined;
+  let baselines = 0;
+  const chained = (): DeltaState => {
+    const before = left;
+    left = `baseline-${(baselines += 1)}`;
+    return { ...(before ? { before } : {}), after: left };
+  };
+
   const save = (
     c: ScanCounts,
-    extra: { triage?: TriageOutcome; collectorFailures?: number } = {},
-  ) => saveScanSummary(tdb.db, clock, { projectId, counts: c, ...extra });
+    extra: { triage?: TriageOutcome; collectorFailures?: number; deltaState?: DeltaState } = {},
+  ) => {
+    const { deltaState = chained(), ...rest } = extra;
+    return saveScanSummary(tdb.db, clock, { projectId, counts: c, deltaState, ...rest });
+  };
 
   it("stores the first scan with no delta — nothing to compare to is not `no change`", async () => {
     const first = await save(counts({ low: 4 }));
@@ -142,6 +161,65 @@ describe("the persisted series", () => {
     });
     // Read back, not just returned: the chart reads rows, not the write's return value.
     expect((await getLatestScanSummary(tdb.db, projectId))?.delta?.total).toBe(-4);
+  });
+
+  it("suppresses the delta when stringer's baseline was reset under a running series", async () => {
+    // The two states have independent lifetimes: stringer keeps its baseline in the REPO, this
+    // series lives in a disposable anton.db. Wiping `.stringer/` mid-series makes the next scan a
+    // whole-repo baseline again — and counting predecessors would happily subtract a settled
+    // incremental scan from it and chart a spike nothing in the codebase caused.
+    await save(counts({ low: 5 })); // establishes the baseline
+    clock.advance(1000);
+    await save(counts({ low: 2 })); // incremental — the first comparable point
+    clock.advance(1000);
+
+    const reset = await save(counts({ low: 90 }), { deltaState: { after: "baseline-fresh" } });
+    expect(reset.delta).toBeUndefined();
+
+    // And nothing may be compared to a standing total either — the point AFTER the reset is the
+    // first honest one, exactly as after a project's very first scan.
+    clock.advance(1000);
+    const afterReset = await save(counts({ low: 3 }), {
+      deltaState: { before: "baseline-fresh", after: "baseline-next" },
+    });
+    expect(afterReset.delta).toBeUndefined();
+
+    clock.advance(1000);
+    const settled = await save(counts({ low: 1 }), {
+      deltaState: { before: "baseline-next", after: "baseline-after" },
+    });
+    expect(settled.delta?.total).toBe(-2);
+  });
+
+  it("compares from its SECOND point when the series outlives its anton.db", async () => {
+    // A rebuilt anton.db leaves the repo's baseline standing, so the first scan of the new series is
+    // already incremental — its successor is comparable, and suppressing it (as a predecessor count
+    // must) would throw away an honest delta.
+    const first = await save(counts({ low: 4 }), {
+      deltaState: { before: "baseline-survived", after: "baseline-1" },
+    });
+    expect(first.delta).toBeUndefined(); // nothing stored before it to compare against
+
+    clock.advance(1000);
+    const second = await save(counts({ low: 1 }), {
+      deltaState: { before: "baseline-1", after: "baseline-2" },
+    });
+    expect(second.delta?.total).toBe(-3);
+  });
+
+  it("suppresses the delta when a scan anton never recorded consumed the baseline in between", async () => {
+    // Someone ran `stringer scan --delta` by hand between two nightlies: the pass that follows
+    // measures a window that starts somewhere anton's series never saw, so its counts are not
+    // against the previous point at all.
+    await save(counts({ low: 5 }));
+    clock.advance(1000);
+    await save(counts({ low: 4 }));
+    clock.advance(1000);
+
+    const stranded = await save(counts({ low: 1 }), {
+      deltaState: { before: "baseline-elsewhere", after: "baseline-later" },
+    });
+    expect(stranded.delta).toBeUndefined();
   });
 
   it("records one point per job, however many attempts it took", async () => {

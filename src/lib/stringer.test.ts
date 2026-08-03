@@ -225,6 +225,78 @@ describe("scan", () => {
     );
   });
 
+  // anton-3flx: the health series can only subtract two scans that measured against the SAME
+  // stringer baseline, and the baseline lives in the repo — nowhere anton's own db can see it.
+  describe("the --delta baseline it reports", () => {
+    /** Fake stringer that rewrites `.stringer/last-scan.json` under the scanned repo, as the real one does. */
+    function writeBaselineStringer(): string {
+      return writeScript("baseline-stringer", [
+        "const fs = require('fs'); const path = require('path');",
+        "const repo = process.argv[3];", // node, script, "scan", <repo>
+        "fs.writeFileSync(process.argv[process.argv.indexOf('-o') + 1], '[]');",
+        "if (!process.argv.includes('--delta')) process.exit(0);",
+        "const state = path.join(repo, '.stringer', 'last-scan.json');",
+        "let n = 0;",
+        "try { n = JSON.parse(fs.readFileSync(state, 'utf8')).n + 1; } catch {}",
+        "fs.mkdirSync(path.dirname(state), { recursive: true });",
+        "fs.writeFileSync(state, JSON.stringify({ n }));",
+      ]);
+    }
+
+    it("reports no baseline consumed by the scan that established one", async () => {
+      process.env[STRINGER_BIN_ENV] = writeBaselineStringer();
+
+      const first = await scan({ repoPath: dir, scanFile: join(dir, "s1.json") });
+
+      // Nothing was suppressed, so these signals are the whole repo — not an arrival rate.
+      expect(first.deltaState.before).toBeUndefined();
+      expect(first.deltaState.after).toBeTruthy();
+    });
+
+    it("chains each later scan to the baseline the one before it left", async () => {
+      process.env[STRINGER_BIN_ENV] = writeBaselineStringer();
+
+      const first = await scan({ repoPath: dir, scanFile: join(dir, "s1.json") });
+      const second = await scan({ repoPath: dir, scanFile: join(dir, "s2.json") });
+      const third = await scan({ repoPath: dir, scanFile: join(dir, "s3.json") });
+
+      expect(second.deltaState.before).toBe(first.deltaState.after);
+      expect(third.deltaState.before).toBe(second.deltaState.after);
+      expect(second.deltaState.after).not.toBe(second.deltaState.before);
+    });
+
+    it("re-reads the baseline after a reset, so the rescan reads as the baseline it is", async () => {
+      process.env[STRINGER_BIN_ENV] = writeBaselineStringer();
+      await scan({ repoPath: dir, scanFile: join(dir, "s1.json") });
+      await scan({ repoPath: dir, scanFile: join(dir, "s2.json") });
+
+      rmSync(join(dir, ".stringer"), { recursive: true, force: true });
+      const rescan = await scan({ repoPath: dir, scanFile: join(dir, "s3.json") });
+
+      expect(rescan.deltaState.before).toBeUndefined();
+    });
+
+    it("consumes no baseline when the scan ran without --delta — that's the whole repo", async () => {
+      process.env[STRINGER_BIN_ENV] = writeBaselineStringer();
+      await scan({ repoPath: dir, scanFile: join(dir, "s1.json") });
+
+      const full = await scan({ repoPath: dir, scanFile: join(dir, "s2.json"), delta: false });
+
+      expect(full.deltaState).toEqual({});
+    });
+
+    it("reports an unreadable baseline as unknown rather than as unchanged", async () => {
+      const argvDump = join(dir, "argv.json");
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(argvDump, []);
+
+      // A stringer that keeps its state somewhere anton doesn't look leaves nothing to chain: the
+      // series then carries no deltas at all, which is the honest reading of "cannot prove it".
+      const result = await scan({ repoPath: dir, scanFile: join(dir, "s.json") });
+
+      expect(result.deltaState).toEqual({});
+    });
+  });
+
   it("keeps a caller abort an AbortError rather than reporting a timeout", async () => {
     process.env[STRINGER_BIN_ENV] = writeScript("slow-stringer", ["setTimeout(() => {}, 60000);"]);
     const ac = new AbortController();
