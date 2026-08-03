@@ -147,6 +147,11 @@ describe("POST /api/projects/[slug]/escalations/[escalationId]", () => {
       const other = await open({
         finding: finding({ key: "parked-run:r-2", runId: "r-2", beadId: "anton-t8" }),
       });
+      // Another project's open escalation: its absence is what proves the read is project-scoped.
+      await open({
+        projectId: "p-beta",
+        finding: finding({ key: "parked-run:r-3", runId: "r-3", beadId: "anton-t7" }),
+      });
 
       const res = await POST(req({ action: "resume" }), ctx("alpha", settled));
 
