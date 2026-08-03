@@ -15,21 +15,23 @@
  *     the run that now holds the bead usually started AFTER the proposal was filed. Stale plans
  *     refuse loudly; a board that already reads as applied SETTLES the proposal instead of writing
  *     again, so a retry after a half-finished approve converges rather than double-moves. And
- *     because a snapshot is stale the instant it is taken, each subject is re-read and re-judged
- *     under its own write lock immediately before it is mutated — the same lock a run's claim takes
- *     (see `applyStep`), so a lease published mid-approval orders against this apply instead of
- *     racing it.
+ *     because a snapshot is stale the instant it is taken, every bead a write rests on — the subject
+ *     AND the home/blocker/survivor it points at — is re-read and re-judged under its own write lock
+ *     immediately before the write, on the same lock a run's claim takes (see `applyStep`), so a
+ *     lease published mid-approval orders against this apply instead of racing it.
  *   • NO PARTIAL SILENT STATE. The only multi-write move is a cluster re-parent, and its steps carry
  *     their own undo: a failure part-way rolls the applied prefix back and leaves the proposal OPEN
- *     with the error attached as a note. What a reader must never find is a board half-moved and a
- *     proposal reading as done.
+ *     with the error attached as a note. Applying a proposal is serialized on the PROPOSAL's own
+ *     lock for the same reason, so a second approve can't be part-way through the same steps while
+ *     this one rolls them back or declares them done. What a reader must never find is a board
+ *     half-moved and a proposal reading as done.
  *
  * Declining is the other half of the loop and needs no store of its own: a declined proposal is an
  * ABANDONED bead (closed + `abandoned`) still carrying its fingerprint label, which is exactly what
  * emission already suppresses on (see emit.ts `suppressedFingerprints`). The board is the memory.
  */
 import { beads, LABELS, type Bead } from "../beads/bd";
-import { withBeadWriteLock } from "../beads/claim-lock";
+import { withBeadWriteLock, withBeadWriteLocks } from "../beads/claim-lock";
 import { indexBoard, isInFlight, isOpenWork, type BoardIndex } from "./board-index";
 import {
   fingerprintLabelOf,
@@ -105,12 +107,10 @@ function planReparent(plan: GardenerPlan, index: BoardIndex, nowMs: number): App
   }
   const target = index.byId.get(plan.target);
   if (!target) return { status: "refuse", reason: missing(plan.target) };
-  if (!isOpenWork(target)) {
-    return {
-      status: "refuse",
-      reason: `${plan.target} is ${settledWord(target)} — re-parenting work under it would hang it off a card nothing will run`,
-    };
-  }
+  // The home's own state — settled, or owned by a run. Shared with the under-lock re-check in
+  // `applyStep`, so the snapshot decision and the write refuse the same home for the same reason.
+  const homeGone = homeUnusable(target, nowMs);
+  if (homeGone) return { status: "refuse", reason: homeGone };
   // The same bar the detector proposes against: a home must be a BOARD CARD, or the move recreates
   // the very state (work riding no card) the proposal exists to fix.
   if (!index.cards.ids.has(plan.target)) {
@@ -118,13 +118,6 @@ function planReparent(plan: GardenerPlan, index: BoardIndex, nowMs: number): App
       status: "refuse",
       reason: `${plan.target} is not a board card — re-parenting under it would leave the work riding no card, which is the state this proposal is about`,
     };
-  }
-  // A home a run OWNS is off limits for the same reason a subject is, and the harm is worse: that run
-  // already selected the tickets it will work through, so work attached now rides along unrun — and
-  // when the run settles the card, the newcomers are left beneath a target nothing will claim, which
-  // is the unreachable state this proposal exists to fix.
-  if (isInFlight(target, nowMs)) {
-    return { status: "refuse", reason: inFlightReason(target, nowMs, "hanging more work under it") };
   }
 
   const steps: ApplyStep[] = [];
@@ -196,12 +189,9 @@ function planLink(plan: GardenerPlan, index: BoardIndex, nowMs: number): ApplyDe
       reason: `${id} is ${settledWord(blocked)} — an ordering edge would constrain nothing`,
     };
   }
-  if (!isOpenWork(blocker)) {
-    return {
-      status: "refuse",
-      reason: `${plan.target} is ${settledWord(blocker)} — the work ${id} was waiting on has landed, so the edge would only make ${id} read as blocked forever`,
-    };
-  }
+  // Shared with the under-lock re-check in `applyStep` for the same reason the home bar is.
+  const blockerGone = blockerUnusable(blocker, id);
+  if (blockerGone) return { status: "refuse", reason: blockerGone };
   // Only the blocked bead is written to, and a run is executing it right now: recording an ordering
   // edge against it would tell every other reader that live work is waiting on something.
   if (isInFlight(blocked, nowMs)) {
@@ -280,14 +270,8 @@ function planRetire(plan: GardenerPlan, index: BoardIndex, nowMs: number): Apply
       }
       const survivor = index.byId.get(plan.target);
       if (!survivor) return { status: "refuse", reason: missing(plan.target) };
-      // The whole claim is "the work landed over there". A survivor that is open again means it
-      // did not, and closing this one would write off work nothing has delivered.
-      if (survivor.status !== "closed") {
-        return {
-          status: "refuse",
-          reason: `${plan.target} is ${survivor.status} again — it has not landed, so ${id} is not superseded by it`,
-        };
-      }
+      const survivorGone = survivorUnusable(survivor, id);
+      if (survivorGone) return { status: "refuse", reason: survivorGone };
       return {
         status: "apply",
         steps: [{ verb: "supersede", id, replacement: plan.target }],
@@ -366,6 +350,34 @@ export async function applyProposal(
     );
   }
 
+  // The WHOLE application — decide, write every step, settle — runs under the proposal's own write
+  // lock, not just its closing write. A cluster re-parent releases each subject's lock between
+  // steps, so two approvals of one proposal could interleave there: one fails part-way and restores
+  // a subject to its stale `undoParent` while the other, which had already moved that subject, runs
+  // on and closes the proposal — a settled proposal claiming a cluster the board only half holds.
+  // Serialized, the second approval finds the proposal already closed and writes nothing at all.
+  return withBeadWriteLock(repo, proposal.id, () => applyApproved(repo, proposal, plan, board));
+}
+
+/** The application itself: decide, write, settle — always under the proposal's lock (see caller). */
+async function applyApproved(
+  repo: string,
+  proposal: Bead,
+  plan: GardenerPlan,
+  board: Bead[],
+): Promise<ApplyResult> {
+  // The settled check above judged the CALLER's snapshot — taken before whoever held this lock ran —
+  // so re-read the proposal under it: two Approve clicks both pass that check, and the loser must
+  // refuse rather than re-run a move that already landed. A read that FAILED says nothing either
+  // way, so fall through and let the per-step guards, which re-read every bead they touch, decide.
+  const live = await beads.show(repo, proposal.id).catch(() => undefined);
+  if (live && (live.status === "closed" || beads.isAbandoned(live))) {
+    throw new ProposalApplyError(
+      "unusable",
+      `${proposal.id} is already settled — a proposal is applied or declined once`,
+    );
+  }
+
   const decision = planApply(plan, board, Date.now());
   if (decision.status === "refuse") {
     throw await attachFailure(
@@ -403,22 +415,11 @@ export async function applyProposal(
 
   // The move landed (or was already true). Record what changed on the proposal itself and settle it
   // — a plain close, not an abandon: the ask was answered, and only a DECLINE suppresses the
-  // fingerprint (see the module header).
-  //
-  // Under the PROPOSAL's own write lock, re-reading it inside: the already-settled check at the top
-  // judged the caller's snapshot, so two approvals of the same proposal can both reach here — a
-  // re-parent or a link re-applies idempotently, so neither trips the subject guard. Whoever loses
-  // the lock finds the proposal already closed and writes nothing, rather than closing a closed bead
-  // and answering 500 for a board that is correct.
+  // fingerprint (see the module header). Still under the lock this whole application holds, so no
+  // second approve can be part-way through the same steps while this one declares them done.
   const summary = decision.summary;
-  await withBeadWriteLock(repo, proposal.id, async () => {
-    // A read that failed says nothing about whether the proposal settled, and the move HAS landed —
-    // so fall through and let a real write failure surface rather than leaving it silently open.
-    const live = await beads.show(repo, proposal.id).catch(() => undefined);
-    if (live && (live.status === "closed" || beads.isAbandoned(live))) return;
-    await beads.note(repo, proposal.id, `${NOTE_PREFIX}: applied — ${summary}.`);
-    await beads.close(repo, proposal.id, `applied: ${summary}`);
-  });
+  await beads.note(repo, proposal.id, `${NOTE_PREFIX}: applied — ${summary}.`);
+  await beads.close(repo, proposal.id, `applied: ${summary}`);
 
   return { proposalId: proposal.id, plan, summary, changed: changed.map((s) => s.id) };
 }
@@ -459,7 +460,27 @@ const DOING: Record<ApplyStep["verb"], string> = {
 };
 
 /**
- * One write, taken under the SUBJECT'S OWN write lock and re-judged against a read from inside it.
+ * The bead a step points AT rather than writes to: a re-parent's new home, a link's blocker, a
+ * supersede's survivor. The move's correctness rests on it as surely as on the subject — attaching
+ * work under a home a run just claimed strands it, and an edge to a blocker that just closed leaves
+ * the blocked bead reading as blocked forever — so it is locked and re-judged alongside the subject.
+ */
+function counterpartOf(step: ApplyStep): string | undefined {
+  switch (step.verb) {
+    case "reparent":
+      return step.parent;
+    case "link":
+      return step.blocker;
+    case "supersede":
+      return step.replacement;
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * One write, taken under the write lock of EVERY bead it rests on — the subject and its counterpart
+ * — and re-judged against reads taken from inside those locks.
  *
  * `planApply` decides against the caller's board snapshot, which is already seconds old by the time
  * the first bd write spawns — and the thing it is guarding against, a runner publishing a lease or
@@ -468,28 +489,43 @@ const DOING: Record<ApplyStep["verb"], string> = {
  * apply that stayed outside it wasn't racing the claim protocol so much as ignoring it: the snapshot
  * check could pass, a claim could land, and the move would still execute against work that had begun.
  *
- * Holding the lock makes the two orders: either the claim lands first and this read sees it (refuse),
- * or this write lands first and the claim queues behind it. The re-check is deliberately the SUBJECT
- * bar only — is this bead still open, and does a run own it — because that is what the lock covers;
- * the relational preconditions (target is a card, no cycle, no open descendants) belong to the board
- * as a whole and stay with the snapshot decision.
+ * Holding the locks makes the two orders: either the claim lands first and these reads see it
+ * (refuse), or this write lands first and the claim queues behind it. Both ends need it, not just
+ * the subject — a run claiming the HOME between the decision and the write has already selected its
+ * tickets, so work attached now rides along unrun and is stranded when that run settles the card.
+ *
+ * What stays with the snapshot decision is the board-wide topology — is the home a card, would the
+ * move close a cycle, does the subject still carry open descendants. Those rest on beads this step
+ * never names, so no set of locks taken here would make them any fresher than the read they came
+ * from; re-deriving them per step would buy a whole board read and still guarantee nothing.
  */
 async function applyStep(repo: string, step: ApplyStep): Promise<void> {
-  await withBeadWriteLock(repo, step.id, async () => {
-    let subject: Bead | undefined;
-    try {
-      subject = await beads.show(repo, step.id);
-    } catch (e) {
-      // A read that failed is not a bead that vanished, and saying so would misdiagnose a flaky bd
-      // as a board that moved. Either way nothing is written to this bead.
-      throw new SubjectMovedError(
-        `${step.id} could not be re-read before writing to it (${messageOf(e)}) — nothing was written`,
-      );
-    }
+  const counterpart = counterpartOf(step);
+  const locked = counterpart ? [step.id, counterpart] : [step.id];
+  await withBeadWriteLocks(repo, locked, async () => {
+    const subject = await reread(repo, step.id);
     const moved = subjectMoved(step, subject, Date.now());
     if (moved) throw new SubjectMovedError(moved);
+    if (counterpart) {
+      const other = await reread(repo, counterpart);
+      const otherMoved = counterpartMoved(step, counterpart, other, Date.now());
+      if (otherMoved) throw new SubjectMovedError(otherMoved);
+    }
     await runStep(repo, step);
   });
+}
+
+/** A bead read from inside its own write lock. A read that FAILED is never a bead that vanished. */
+async function reread(repo: string, id: string): Promise<Bead | undefined> {
+  try {
+    return await beads.show(repo, id);
+  } catch (e) {
+    // Saying "gone" here would misdiagnose a flaky bd as a board that moved. Either way, the step
+    // refuses and nothing is written.
+    throw new SubjectMovedError(
+      `${id} could not be re-read before applying the move (${messageOf(e)}) — nothing was written`,
+    );
+  }
 }
 
 /** Why this subject can no longer be written to, or undefined when the plan still holds for it. */
@@ -500,6 +536,30 @@ function subjectMoved(step: ApplyStep, subject: Bead | undefined, nowMs: number)
   }
   if (isInFlight(subject, nowMs)) return inFlightReason(subject, nowMs, DOING[step.verb]);
   return undefined;
+}
+
+/**
+ * Why the bead this step points at can no longer stand behind it, or undefined. Each verb re-asks
+ * the SAME question `planApply` asked of it — through the same helper, so the write cannot hold a
+ * counterpart to a laxer bar than the decision did.
+ */
+function counterpartMoved(
+  step: ApplyStep,
+  id: string,
+  counterpart: Bead | undefined,
+  nowMs: number,
+): string | undefined {
+  if (!counterpart) return missing(id);
+  switch (step.verb) {
+    case "reparent":
+      return homeUnusable(counterpart, nowMs);
+    case "link":
+      return blockerUnusable(counterpart, step.id);
+    case "supersede":
+      return survivorUnusable(counterpart, step.id);
+    default:
+      return undefined;
+  }
 }
 
 async function runStep(repo: string, step: ApplyStep): Promise<void> {
@@ -534,6 +594,7 @@ async function runStep(repo: string, step: ApplyStep): Promise<void> {
 async function rollbackSteps(repo: string, applied: ApplyStep[]): Promise<string> {
   if (applied.length === 0) return " — nothing had been written";
   const stranded: string[] = [];
+  const overtaken: string[] = [];
   for (const step of [...applied].reverse()) {
     if (step.verb !== "reparent") {
       stranded.push(step.id);
@@ -542,14 +603,29 @@ async function rollbackSteps(repo: string, applied: ApplyStep[]): Promise<string
     try {
       // Undone under the same per-bead lock the write took, so a claim that queued behind the
       // failed apply doesn't interleave with its rollback.
-      await withBeadWriteLock(repo, step.id, () => beads.reparent(repo, step.id, step.undoParent));
+      await withBeadWriteLock(repo, step.id, async () => {
+        // Undo only what is still OURS to undo. Another approval — of a different proposal naming
+        // the same subject — can land between this apply's per-step locks, and restoring the parent
+        // this plan happened to record would clobber a move somebody else has since made and now
+        // reads as the board's truth. A read that FAILED tells us nothing, so it falls through to
+        // the restore rather than silently leaving a half-applied move in place.
+        const live = await beads.show(repo, step.id).catch(() => undefined);
+        if (live && (beads.parentOf(live) ?? "") !== step.parent) {
+          overtaken.push(step.id);
+          return;
+        }
+        await beads.reparent(repo, step.id, step.undoParent);
+      });
     } catch {
       stranded.push(step.id);
     }
   }
-  return stranded.length === 0
+  if (stranded.length > 0) {
+    return ` — ROLLBACK INCOMPLETE: ${list(stranded)} could not be restored and need a human`;
+  }
+  return overtaken.length === 0
     ? ` — the ${applied.length} write(s) already made were rolled back, so the board is unchanged`
-    : ` — ROLLBACK INCOMPLETE: ${list(stranded)} could not be restored and need a human`;
+    : ` — the ${applied.length} write(s) already made were rolled back, except ${list(overtaken)}, which another write has since moved and was left where it now sits`;
 }
 
 /**
@@ -579,6 +655,44 @@ function closeReason(plan: GardenerPlan): string {
 
 const missing = (id: string): string =>
   `${id} is no longer on the board — the proposal describes a board that has changed`;
+
+/**
+ * Why this bead can no longer be a re-parent HOME, or undefined. A settled home hangs the work off a
+ * card nothing will run; a home a run OWNS is worse — that run already selected the tickets it will
+ * work through, so work attached now rides along unrun, and when the run settles the card the
+ * newcomers are left beneath a target nothing will claim, which is the unreachable state the
+ * proposal exists to fix.
+ */
+function homeUnusable(home: Bead, nowMs: number): string | undefined {
+  if (!isOpenWork(home)) {
+    return `${home.id} is ${settledWord(home)} — re-parenting work under it would hang it off a card nothing will run`;
+  }
+  if (isInFlight(home, nowMs)) return inFlightReason(home, nowMs, "hanging more work under it");
+  return undefined;
+}
+
+/**
+ * Why this bead can no longer order `blockedId`, or undefined. Only the blocked bead is written to,
+ * so a run holding the blocker is no obstacle — but a blocker that has LANDED makes the edge a lie.
+ */
+function blockerUnusable(blocker: Bead, blockedId: string): string | undefined {
+  if (!isOpenWork(blocker)) {
+    return `${blocker.id} is ${settledWord(blocker)} — the work ${blockedId} was waiting on has landed, so the edge would only make ${blockedId} read as blocked forever`;
+  }
+  return undefined;
+}
+
+/**
+ * Why this bead is not a survivor `subjectId` can be superseded by, or undefined. The whole claim is
+ * "the work landed over there": a survivor that is open again means it did not, and closing the
+ * subject would write off work nothing has delivered.
+ */
+function survivorUnusable(survivor: Bead, subjectId: string): string | undefined {
+  if (survivor.status !== "closed") {
+    return `${survivor.id} is ${survivor.status} again — it has not landed, so ${subjectId} is not superseded by it`;
+  }
+  return undefined;
+}
 
 /**
  * Why a bead a run owns is off limits, naming the run that owns it. Every detector already refuses

@@ -39,14 +39,32 @@ const liveBeads = new Map<string, Bead | undefined>();
  */
 const failOn = new Map<string, number>();
 const seen = new Map<string, number>();
+/**
+ * Run after every write that landed — the seam a test uses to make the board ANSWER differently once
+ * something has been written to it, which is how a second concurrent approve is staged.
+ */
+let onWrite: ((call: string) => void) | undefined;
 
 function record(verb: string, ...args: string[]): Promise<string> {
   const key = `${verb}:${args[0]}`;
-  calls.push([verb, ...args].join(" "));
+  const call = [verb, ...args].join(" ");
+  calls.push(call);
   const nth = (seen.get(key) ?? 0) + 1;
   seen.set(key, nth);
   if (failOn.get(key) === nth) return Promise.reject(new Error(`bd ${verb} exploded`));
+  // bd reflects a write immediately, and this module re-reads what it wrote — the rollback before it
+  // undoes a move, the next approval before it re-applies one. A board that answered with pre-write
+  // state would make those guards untestable.
+  if (verb === "reparent") setLive(args[0] as string, { parent: args[1] || undefined });
+  if (verb === "close") setLive(args[0] as string, { status: "closed" });
+  onWrite?.(call);
   return Promise.resolve("");
+}
+
+/** What the next `bd show` of this bead answers with — the board as the writes have left it. */
+function setLive(id: string, patch: Partial<Bead>): void {
+  const current = liveBeads.get(id) ?? snapshot.find((b) => b.id === id);
+  if (current) liveBeads.set(id, { ...current, ...patch });
 }
 
 /** The board `applyProposal` was handed — what the under-lock re-read sees unless a test overrides it. */
@@ -200,6 +218,7 @@ beforeEach(() => {
   failOn.clear();
   seen.clear();
   liveBeads.clear();
+  onWrite = undefined;
   snapshot = [];
 });
 
@@ -504,18 +523,102 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
   // The snapshot is stale the instant it is taken, and a runner publishing a lease in that window is
   // exactly what the in-flight bar exists for — so the last word belongs to a read taken under the
   // subject's own write lock, the one a run's claim also queues on.
-  // Two Approve clicks on one proposal: the settled check ran against a snapshot taken before the
-  // first one landed, and a re-parent re-applies idempotently, so the loser gets all the way to the
-  // settlement. Closing an already-closed bead would 500 a request whose board is correct.
-  it("leaves a proposal a concurrent approve already closed alone", async () => {
+  // Two Approve clicks on one proposal: the settled check at the top ran against a snapshot taken
+  // before the first one landed, so the loser reaches the apply — and must find, under the lock, a
+  // proposal already answered and write nothing at all.
+  it("refuses a proposal a concurrent approve already settled, re-running nothing", async () => {
     const proposal = proposalFor(REPARENT);
     liveBeads.set(proposal.id, { ...proposal, status: "closed" });
 
-    const result = await apply(proposal, [CARD, bead("anton-a"), proposal]);
+    await expect(apply(proposal, [CARD, bead("anton-a"), proposal])).rejects.toMatchObject({
+      failure: "unusable",
+      message: expect.stringContaining("already settled"),
+    });
+    expect(calls).toEqual([]);
+  });
 
-    expect(result.summary).toBe("re-parented anton-a under anton-card");
-    // The move still runs (it is idempotent); the settlement the winner already wrote is not redone.
-    expect(calls).toEqual(["reparent anton-a anton-card"]);
+  // The interleave the proposal lock exists for: two approvals of one CLUSTER, whose per-subject
+  // locks are released between steps. Unserialized, the loser could restore a subject to its stale
+  // `undoParent` while the winner closed the proposal — a settled proposal claiming a move the board
+  // only half holds.
+  it("serializes two approvals of one cluster — the loser writes nothing", async () => {
+    const proposal = proposalFor(CLUSTER);
+    const board = [CARD, bead("anton-a"), bead("anton-b"), proposal];
+    snapshot = board; // the winner's close lands on this board, and is what the loser then reads
+
+    const [winner, loser] = await Promise.allSettled([
+      applyProposal(REPO, proposal, board),
+      applyProposal(REPO, proposal, board),
+    ]);
+
+    expect(winner.status).toBe("fulfilled");
+    expect(loser).toMatchObject({ status: "rejected", reason: { failure: "unusable" } });
+    // One application's worth of writes, start to finish — no second pass over the subjects.
+    expect(calls).toEqual([
+      "reparent anton-a anton-card",
+      "reparent anton-b anton-card",
+      `note ${proposal.id} gardener: applied — re-parented anton-a, anton-b under anton-card.`,
+      `close ${proposal.id} applied: re-parented anton-a, anton-b under anton-card`,
+    ]);
+  });
+
+  // The other half of the same staleness: the bead a step points AT. A run claiming the HOME between
+  // the snapshot and the write has already selected its tickets, so subjects attached now ride along
+  // unrun and strand when that run settles the card.
+  it("refuses a home a run claimed AFTER the snapshot, without moving a subject", async () => {
+    const proposal = proposalFor(REPARENT);
+    liveBeads.set(CARD.id, { ...leased(CARD.id, Date.now()), issue_type: "feature" });
+
+    await expect(apply(proposal, [CARD, bead("anton-a"), proposal])).rejects.toMatchObject({
+      failure: "refused",
+    });
+    expect(calls).toEqual([
+      `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-card is mid-run — a run holds a live lease on it (runner-1), so hanging more work under it would race the run that owns it`,
+    ]);
+  });
+
+  it("refuses a blocker that landed, and a survivor that reopened, under the write lock", async () => {
+    const link = proposalFor(LINK);
+    liveBeads.set("anton-b", bead("anton-b", { status: "closed" }));
+    await expect(
+      apply(link, [bead("anton-a"), bead("anton-b"), link]),
+    ).rejects.toMatchObject({ failure: "refused" });
+    expect(calls).toEqual([
+      `note ${link.id} gardener: apply FAILED — cannot apply ${link.id}: anton-b is closed — the work anton-a was waiting on has landed, so the edge would only make anton-a read as blocked forever`,
+    ]);
+
+    calls.length = 0;
+    liveBeads.clear();
+    const supersede = proposalFor(SUPERSEDE);
+    // The snapshot says the survivor landed; by the time the write runs it is open again.
+    liveBeads.set("anton-b", bead("anton-b", { status: "open" }));
+    await expect(
+      apply(supersede, [bead("anton-a"), bead("anton-b", { status: "closed" }), supersede]),
+    ).rejects.toMatchObject({ failure: "refused" });
+    expect(calls).toEqual([
+      `note ${supersede.id} gardener: apply FAILED — cannot apply ${supersede.id}: anton-b is open again — it has not landed, so anton-a is not superseded by it`,
+    ]);
+  });
+
+  // A rollback must undo THIS apply's move, not whatever the bead's parent happens to be now: a
+  // concurrent approval of a different proposal can move the same subject between the per-step
+  // locks, and restoring the old parent over it would clobber a move that is now the board's truth.
+  it("leaves a rolled-back subject alone when another write has since moved it", async () => {
+    const proposal = proposalFor(CLUSTER);
+    const board = [CARD, child("anton-a", "anton-old"), bead("anton-b"), proposal];
+    failOn.set("reparent:anton-b", 1);
+    // Somebody else re-parents anton-a the moment this apply moves on to anton-b.
+    onWrite = (call) => {
+      if (call === "reparent anton-a anton-card") setLive("anton-a", { parent: "anton-elsewhere" });
+    };
+
+    await expect(apply(proposal, board)).rejects.toThrow(/another write has since moved/);
+
+    // No second write to anton-a: its undo would have fought the move that overtook it.
+    expect(calls.filter((c) => c.startsWith("reparent anton-a"))).toEqual([
+      "reparent anton-a anton-card",
+    ]);
+    expect(calls.some((c) => c.startsWith(`close ${proposal.id}`))).toBe(false);
   });
 
   it("refuses a subject a run claimed AFTER the snapshot, without writing to it", async () => {
