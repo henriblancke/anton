@@ -107,6 +107,20 @@ and reschedules. Durability = **resumability, not retry-in-place**:
 - **API-limit backoff** — a run that hits a usage limit **parks** and the job is rescheduled
   past the reset window. You cannot retry an exhausted quota.
 - **Poison-pill** — a job that fails `maxAttempts` times parks for a human (visible in the UI).
+- **Two clocks, two different verdicts** (anton-t1mo) — a heartbeating handler is never reclaimed
+  by the lease sweep, so timeouts are the only thing that catches a wedge. They are scoped so that
+  "wedged" and "long" don't get the same answer:
+  - `jobTimeoutMinutes` bounds **silence, not runtime**: the runner aborts a job that goes that
+    long without a `ctx.heartbeat()`. A handler that reports no progress is bounded from dispatch,
+    exactly as a total wall clock would be.
+  - `ticketTimeoutMinutes` bounds **one ticket** — the knob an operator actually tunes.
+    execute-epic's length is a function of how many tickets the feature has, so a whole-run budget
+    guillotines a twenty-ticket feature mid-ticket however well it was going.
+
+  A ticket that outlives its budget is **not fatal to the run**: its partial work is rolled back
+  (otherwise the next ticket's commit sweeps it up under the wrong name), the bead is blocked with
+  a note, and the walk continues — the feature ships what landed and leaves one thing for a human.
+  A run where *every* ticket times out parks instead: an empty PR is a false success.
 
 Job types:
 1. **execute-epic** — approved epic → warm worktree → per ticket: `claude` (agent prompt) →

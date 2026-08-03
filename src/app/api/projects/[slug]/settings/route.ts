@@ -6,6 +6,7 @@ import {
   DEFAULT_REVIEW_MAX_ROUNDS,
   DEFAULT_REVIEW_MIN_SCORE,
   JOB_TIMEOUT_MINUTES_RANGE,
+  TICKET_TIMEOUT_MINUTES_RANGE,
   MAX_RETRIES_RANGE,
   REVIEW_LOW_SCORE_ROUNDS_RANGE,
   REVIEW_MAX_ROUNDS_RANGE,
@@ -57,6 +58,7 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
     key:
       | "concurrency"
       | "jobTimeoutMinutes"
+      | "ticketTimeoutMinutes"
       | "maxRetries"
       | "reviewMaxRounds"
       | "reviewMinScore"
@@ -65,6 +67,7 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
   }[] = [
     { key: "concurrency", range: CONCURRENCY_RANGE },
     { key: "jobTimeoutMinutes", range: JOB_TIMEOUT_MINUTES_RANGE },
+    { key: "ticketTimeoutMinutes", range: TICKET_TIMEOUT_MINUTES_RANGE },
     { key: "maxRetries", range: MAX_RETRIES_RANGE },
     { key: "reviewMaxRounds", range: REVIEW_MAX_ROUNDS_RANGE },
     // 0 is a real value here, not a clear: it is how the operator turns the score-regression alarm

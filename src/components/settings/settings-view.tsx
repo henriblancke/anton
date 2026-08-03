@@ -53,6 +53,7 @@ interface EditableSettings {
   formulaVariants?: FormulaVariant[];
   concurrency?: number;
   jobTimeoutMinutes?: number;
+  ticketTimeoutMinutes?: number;
   maxRetries?: number;
   agents?: string[];
   autonomy?: boolean;
@@ -69,7 +70,8 @@ interface EditableSettings {
 // Defaults mirror the server (src/lib/projects.ts DEFAULT_*); duplicated so this client module
 // stays server-import-free. Keep in sync.
 const DEFAULT_CONCURRENCY = 3;
-const DEFAULT_JOB_TIMEOUT_MINUTES = 120; // 2h
+const DEFAULT_JOB_TIMEOUT_MINUTES = 120; // 2h without progress
+const DEFAULT_TICKET_TIMEOUT_MINUTES = 45;
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_REVIEW_MAX_ROUNDS = 2;
 const REVIEW_MAX_ROUNDS_MIN = 1;
@@ -182,6 +184,9 @@ export function SettingsView({
   const [concurrency, setConcurrency] = useState(settings.concurrency ?? DEFAULT_CONCURRENCY);
   const [jobTimeoutMinutes, setJobTimeoutMinutes] = useState(
     settings.jobTimeoutMinutes ?? DEFAULT_JOB_TIMEOUT_MINUTES,
+  );
+  const [ticketTimeoutMinutes, setTicketTimeoutMinutes] = useState(
+    settings.ticketTimeoutMinutes ?? DEFAULT_TICKET_TIMEOUT_MINUTES,
   );
   const [maxRetries, setMaxRetries] = useState(settings.maxRetries ?? DEFAULT_MAX_RETRIES);
   const [autonomy, setAutonomy] = useState(settings.autonomy ?? true);
@@ -316,6 +321,7 @@ export function SettingsView({
             .filter((v) => v.label && v.formula),
           concurrency,
           jobTimeoutMinutes,
+          ticketTimeoutMinutes,
           maxRetries,
           // The enabled BUNDLED ids, in discovered order. Only bundled ids we actually rendered — a
           // stale id from a since-deleted or user agent (still in the seeded set) is pruned rather
@@ -861,7 +867,30 @@ export function SettingsView({
                       min
                     </span>
                   </div>
-                  <span className="text-[11px] text-subtle">per run · default 120 (2h)</span>
+                  <span className="text-[11px] text-subtle">
+                    without progress · default 120 (2h)
+                  </span>
+                </label>
+
+                <label className="flex flex-col gap-1.5">
+                  <span className="text-[12.5px] text-muted-foreground">Ticket timeout</span>
+                  <div className="relative flex items-center rounded-[10px] border border-border bg-card focus-within:border-primary/60">
+                    <input
+                      type="number"
+                      min={5}
+                      max={240}
+                      value={ticketTimeoutMinutes}
+                      onChange={(e) => setTicketTimeoutMinutes(Number(e.target.value))}
+                      aria-label="Ticket timeout in minutes"
+                      className="w-full rounded-[10px] bg-transparent px-3 py-2 pr-9 font-mono text-[12.5px] text-foreground outline-none"
+                    />
+                    <span className="pointer-events-none absolute right-3 text-[11px] text-subtle">
+                      min
+                    </span>
+                  </div>
+                  <span className="text-[11px] text-subtle">
+                    per ticket · blocks it, run continues · default 45
+                  </span>
                 </label>
 
                 <label className="flex flex-col gap-1.5">

@@ -982,18 +982,32 @@ export class JobRunner {
         void renewLease(this.db, this.clock, job.id, this.config.leaseMs).catch(() => {});
       }, renewEvery);
 
-      // Wall-clock timeout: abort the handler if it runs past the project's budget, so one stuck
-      // run can't hold its concurrency slot forever (a heartbeating handler is never reclaimed).
+      // NO-PROGRESS timeout: abort the handler once it goes `policy.timeoutMs` without reporting
+      // progress, so one stuck run can't hold its concurrency slot forever (a heartbeating handler
+      // is never reclaimed by the lease sweep, so this is the only thing that catches a wedge).
+      //
+      // Measured from the last `ctx.heartbeat()`, not from dispatch (anton-t1mo). A TOTAL wall clock
+      // is the wrong shape for a handler whose length is a function of its input: execute-epic walks
+      // N tickets, so the budget that bounds a two-ticket feature guillotines a twenty-ticket one
+      // mid-ticket — killing work in flight and burning a retry, however well the run was going. A
+      // handler that never heartbeats is unaffected: with no progress to report, "since the last
+      // heartbeat" is "since dispatch", exactly as before.
       let timedOut = false;
-      const timeoutTimer =
-        Number.isFinite(policy.timeoutMs) && policy.timeoutMs > 0
-          ? setTimeout(() => {
-              timedOut = true;
-              controller.abort();
-            }, policy.timeoutMs)
-          : null;
-      // Don't let the timeout keep the process alive when idle.
-      if (timeoutTimer && typeof timeoutTimer.unref === "function") timeoutTimer.unref();
+      const bounded = Number.isFinite(policy.timeoutMs) && policy.timeoutMs > 0;
+      let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
+      const armTimeout = () => {
+        // Never re-arm past an abort: a handler that heartbeats while unwinding (or after a kill)
+        // would otherwise start a fresh clock on a job that is already over.
+        if (!bounded || controller.signal.aborted) return;
+        if (timeoutTimer) clearTimeout(timeoutTimer);
+        timeoutTimer = setTimeout(() => {
+          timedOut = true;
+          controller.abort();
+        }, policy.timeoutMs);
+        // Don't let the timeout keep the process alive when idle.
+        if (typeof timeoutTimer.unref === "function") timeoutTimer.unref();
+      };
+      armTimeout();
 
       let outcome: Outcome;
       try {
@@ -1004,7 +1018,11 @@ export class JobRunner {
           projectId: job.projectId ?? undefined,
           payload: parsePayload(job.payloadJson),
           attempt: job.attempts,
-          heartbeat: () => renewLease(this.db, this.clock, job.id, this.config.leaseMs),
+          heartbeat: () => {
+            // Progress reported — the handler is alive and moving, so restart the no-progress clock.
+            armTimeout();
+            return renewLease(this.db, this.clock, job.id, this.config.leaseMs);
+          },
           signal: controller.signal,
           report: (info) => Object.assign(entry.live, info),
         };
@@ -1013,7 +1031,10 @@ export class JobRunner {
       } catch (e) {
         // A timeout abort is a retryable failure with a clear reason (not a poison/quota misread).
         outcome = timedOut
-          ? { kind: "error", error: `timed out after ${Math.round(policy.timeoutMs / 60_000)}m` }
+          ? {
+              kind: "error",
+              error: `made no progress for ${Math.round(policy.timeoutMs / 60_000)}m`,
+            }
           : classifyError(e);
         this.log.error(`job ${job.id} (${job.type}) failed: ${outcome.kind}`, e);
       } finally {

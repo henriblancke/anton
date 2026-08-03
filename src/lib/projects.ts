@@ -160,10 +160,28 @@ export interface ProjectSettings {
    */
   concurrency?: number;
   /**
-   * Wall-clock timeout for a single job attempt, in minutes (anton-xbk). On expiry the run is
-   * aborted and retried/parked like any other failure. Absent → DEFAULT_JOB_TIMEOUT_MINUTES (2h).
+   * How long a job attempt may go WITHOUT PROGRESS before the runner aborts it, in minutes
+   * (anton-xbk; re-scoped from a total wall clock in anton-t1mo). Measured from the handler's last
+   * `ctx.heartbeat()` — a wedge backstop, NOT the per-task budget. On expiry the run is aborted and
+   * retried/parked like any other failure. Absent → DEFAULT_JOB_TIMEOUT_MINUTES (2h).
+   *
+   * A handler that reports no progress is bounded exactly as before (its last heartbeat is its
+   * dispatch). For execute-epic — whose length is a function of how many tickets the feature has —
+   * {@link ticketTimeoutMinutes} is the budget that actually bounds the work.
    */
   jobTimeoutMinutes?: number;
+  /**
+   * Wall-clock budget for ONE ticket, in minutes (anton-t1mo) — the per-task control. A ticket that
+   * outlives it is aborted alone: its partial work is rolled back, the bead is blocked with a note
+   * for a human, and the run CONTINUES with the next ticket. Absent →
+   * DEFAULT_TICKET_TIMEOUT_MINUTES (45).
+   *
+   * Deliberately not fatal to the run. One ticket that can't converge — an endpoint that never
+   * answers, an agent looping on a gate — used to end the whole feature, so the tickets behind it
+   * never ran at all. Blocking that one and carrying on delivers the rest and leaves exactly one
+   * thing on the board for a human.
+   */
+  ticketTimeoutMinutes?: number;
   /**
    * Max attempts for a job before it is parked for a human (anton-xbk). A failed ticket fails the
    * execute-epic job, which retries and resumes past already-closed tickets — so this is the
@@ -258,7 +276,8 @@ export function resolveVerifyGates(settings: ProjectSettings): VerifyGate[] {
 
 /** Defaults for the per-project job policy when a setting is unset. */
 export const DEFAULT_CONCURRENCY = 3;
-export const DEFAULT_JOB_TIMEOUT_MINUTES = 120; // 2 hours
+export const DEFAULT_JOB_TIMEOUT_MINUTES = 120; // 2 hours without progress
+export const DEFAULT_TICKET_TIMEOUT_MINUTES = 45;
 export const DEFAULT_MAX_RETRIES = 3;
 /** Two rounds: the reviewer's first pass plus one chance to confirm the fixes landed. */
 export const DEFAULT_REVIEW_MAX_ROUNDS = 2;
@@ -274,6 +293,7 @@ export const DEFAULT_REVIEW_LOW_SCORE_ROUNDS = 2;
 /** Allowed ranges for the numeric job-policy settings (validated at the API boundary). */
 export const CONCURRENCY_RANGE = { min: 1, max: 6 } as const;
 export const JOB_TIMEOUT_MINUTES_RANGE = { min: 5, max: 720 } as const; // 5 min … 12 h
+export const TICKET_TIMEOUT_MINUTES_RANGE = { min: 5, max: 240 } as const; // 5 min … 4 h
 export const MAX_RETRIES_RANGE = { min: 1, max: 10 } as const;
 export const REVIEW_MAX_ROUNDS_RANGE = { min: 1, max: 5 } as const;
 /** `0` is in range on purpose: it is how the operator turns the score-regression alarm off. */
@@ -318,6 +338,19 @@ export function resolveReviewConfig(settings: ProjectSettings): ReviewConfig {
         }
       : {}),
   };
+}
+
+/**
+ * One ticket's wall-clock budget in ms (anton-t1mo) — see {@link ProjectSettings.ticketTimeoutMinutes}.
+ *
+ * A non-finite or non-positive stored value means "no per-ticket bound", the pre-anton-t1mo
+ * behaviour: the ticket runs until the job's own no-progress timeout catches it. Only reachable by
+ * hand-editing settings (the API range-checks the field), and honoured rather than coerced so an
+ * operator who deliberately unbounds a long ticket isn't silently put back on the default.
+ */
+export function resolveTicketTimeoutMs(settings: ProjectSettings): number {
+  const minutes = settings.ticketTimeoutMinutes ?? DEFAULT_TICKET_TIMEOUT_MINUTES;
+  return Number.isFinite(minutes) && minutes > 0 ? minutes * 60_000 : Infinity;
 }
 
 /** A 0–100 integer percentage — the same scale the governor's {@link BudgetPolicy} uses. */

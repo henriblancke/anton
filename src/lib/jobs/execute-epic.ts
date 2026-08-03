@@ -27,14 +27,23 @@ import {
   lookupOpenPullRequest,
   markPullRequestDraft,
   pullRequestState,
+  readWorktreeState,
   resolveFreshBase,
+  restoreWorktreeState,
+  sameWorktreeState,
   worktreeHasCommitFor,
   type PullRequest,
+  type WorktreeState,
 } from "../git/ops";
 import { prNumberFromRef } from "../git/pr";
 import { createWorktree, findWorktree, removeWorktree } from "../git/worktree";
 import { bundledAgentIds, discoverAgents } from "../agents-discovery";
-import { getProjectById, getProjectSettings, resolveReviewConfig } from "../projects";
+import {
+  getProjectById,
+  getProjectSettings,
+  resolveReviewConfig,
+  resolveTicketTimeoutMs,
+} from "../projects";
 import { resolveOperator } from "../operator";
 import {
   createRun,
@@ -156,6 +165,12 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
 
     const repo = project.repoPath;
     const settings = await getProjectSettings(db, projectId);
+    // One ticket's budget (anton-t1mo). Read once for the whole run so every ticket in a feature is
+    // measured against the same clock, and collected here so the run can report which tickets it
+    // had to leave behind.
+    const ticketTimeoutMs = resolveTicketTimeoutMs(settings);
+    /** Tickets this run had to stop, and whether each got its work committed before it was stopped. */
+    const timedOut: { id: string; committed: boolean }[] = [];
 
     // The project's OWN agents — a discoverable `agent:<id>` whose id anton does NOT ship as a
     // bundled specialist — are NEVER gated by the active-agents allowlist (anton-dvo.1 reversed):
@@ -1117,13 +1132,27 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         if (doneOnBoard && ticket.status === "closed") {
           await safe(() => beads.reopen(repo, ticket.id));
         }
-        await runTicket({
-          run: runStep,
-          steps: ticketSteps,
-          ticket,
-          operator,
-          closeOnDone: !standaloneRun,
-        });
+        try {
+          await runTicket({
+            run: runStep,
+            steps: ticketSteps,
+            ticket,
+            operator,
+            closeOnDone: !standaloneRun,
+            timeoutMs: ticketTimeoutMs,
+          });
+        } catch (e) {
+          // A ticket that ran out of time is the ONE failure this loop absorbs (anton-t1mo). It has
+          // already blocked its own bead and rolled its partial work back, so the feature can carry
+          // on: the tickets behind it are independent work, and ending the run here would deliver
+          // none of them — the exact failure this budget exists to prevent. Every other failure
+          // still halts the run, unchanged.
+          if (!(e instanceof TicketTimeoutError)) throw e;
+          timedOut.push({ id: e.ticketId, committed: e.committed });
+          console.warn(`[execute-epic] ${epicBeadId}: ${e.message}`);
+        }
+        // A finished ticket is progress — reported here so the runner's no-progress timeout
+        // measures a wedge rather than a long-but-healthy feature (anton-t1mo).
         await ctx.heartbeat();
       }
 
@@ -1133,7 +1162,26 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //     its single PR — so each runs ONCE, and one at a time: they share a worktree and a PR, so
       //     a formula whose steps could overlap is still not a licence to fan out.
       //     `live`, not `tickets`: an abandoned ticket contributed no commit, so listing it would
-      //     advertise work this run doesn't contain (anton-6xj0).
+      //     advertise work this run doesn't contain (anton-6xj0). A ticket ROLLED BACK by its budget
+      //     is dropped for the same reason (anton-t1mo) — leaving it in would put it in the PR body
+      //     as delivered and hand the reviewer a diff it isn't in. One stopped AFTER its commit
+      //     stays: its code is in the diff, so dropping it would hide work the reviewer must read.
+      const rolledBack = new Set(timedOut.filter((t) => !t.committed).map((t) => t.id));
+      const delivered = live.filter((t) => !rolledBack.has(t.id));
+
+      // Nothing survived, so this run has nothing to show (anton-t1mo). Absorbing the timeouts is
+      // only correct while SOMETHING landed — carrying on here would run the review gate over an
+      // empty diff and open a PR that delivers nothing, the same false success the no-delivery gate
+      // refuses. Park instead: a whole feature timing out is a budget or a scoping problem, and a
+      // human has to pick which.
+      if (timedOut.length > 0 && delivered.length === 0) {
+        throw new PoisonEpic(
+          `every ticket under ${epicBeadId} ran out of time ` +
+            `(${timedOut.map((t) => t.id).join(", ")}) — nothing was delivered. Re-scope them into ` +
+            `smaller tickets, or raise this project's ticketTimeoutMinutes, then resume the run`,
+        );
+      }
+
       let advisoryFindings: ReviewFinding[] = [];
       // A reused PR whose refresh `gh` refused still shows the previous attempt's body, and the run
       // completes regardless — so that round's advisories would exist nowhere: the score comment
@@ -1146,7 +1194,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         assertLeaseHeld();
         const stepCtx: StepContext = {
           ...runStep,
-          tickets: live,
+          tickets: delivered,
           step: cooked,
           advisories: advisoryFindings,
         };
@@ -1307,13 +1355,25 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         }
       }
 
+      // A feature that delivered most of itself still owes the founder the part it didn't
+      // (anton-t1mo). The timed-out tickets are blocked on the board with their own notes, but the
+      // TARGET is what the founder opens at the merge gate — so it says, in one place, that this PR
+      // is the feature minus these tickets. Best-effort like the other target writes; the run row
+      // below carries the same sentence when the bead write fails.
+      const timeoutNotice = timedOut.length
+        ? `${timedOut.length} ticket(s) ran out of time and did not finish — ` +
+          `${timedOut.map((t) => t.id).join(", ")}. Each is blocked with its own note saying ` +
+          `whether its work is in this PR; re-scope them or raise ticketTimeoutMinutes, then run them.`
+        : null;
+      if (timeoutNotice) await safe(() => beads.note(repo, epicBeadId, `anton: ${timeoutNotice}`));
+
       // 5. Finalize run + clean up the worktree (the branch/PR carry the work now). The run IS done —
       //    the branch and its PR carry the work — so a stale-body salvage rides along as the row's
       //    error rather than failing a delivery that landed.
       await updateRun(db, clock, runId, {
         status: "done",
         endedAt: clock.now(),
-        error: staleBodyFallback,
+        error: [timeoutNotice, staleBodyFallback].filter(Boolean).join(" — ") || null,
       });
       await safe(() => removeWorktree(worktree));
     } catch (e) {
@@ -1414,8 +1474,10 @@ async function runTicket(args: {
    * moves the bead to stage:in-review — the resume marker + board state. Defaults to true (an
    * epic's children close as their work lands). */
   closeOnDone?: boolean;
+  /** This ticket's wall-clock budget (anton-t1mo); `Infinity` leaves it unbounded. */
+  timeoutMs: number;
 }): Promise<void> {
-  const { run, ticket, operator } = args;
+  const { run, ticket, operator, timeoutMs } = args;
   const { db, clock, ctx, projectId, runId, worktreePath } = run;
   const repo = run.repoPath;
   const closeOnDone = args.closeOnDone ?? true;
@@ -1457,11 +1519,40 @@ async function runTicket(args: {
   // dispatch overwrites the last, so the handle always names the job's CURRENT session.
   ctx.report({ sessionId, cwd: worktreePath });
 
+  // This ticket's wall clock (anton-t1mo). A DERIVED signal — the job's abort still propagates
+  // through it — so every child process a step spawns dies on either. The job-level signal is left
+  // untouched: it means "the whole run is over", and the catch below reads it (not this one) to tell
+  // an operator's kill from a ticket that merely ran long.
+  //
+  // Snapshot the tree BEFORE any step runs, so the timeout path can put back exactly what this
+  // ticket found. Everything committed at this point belongs to earlier tickets; the delta a
+  // timeout leaves behind is this ticket's alone — which is what makes rolling it back safe, and
+  // what stops half-finished work from being swept into the NEXT ticket's commit.
+  const ticketAbort = new AbortController();
+  const abortTicket = () => ticketAbort.abort();
+  ctx.signal.addEventListener("abort", abortTicket, { once: true });
+  if (ctx.signal.aborted) ticketAbort.abort();
+  let ranOutOfTime = false;
+  const deadline =
+    Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? setTimeout(() => {
+          ranOutOfTime = true;
+          ticketAbort.abort();
+        }, timeoutMs)
+      : null;
+  if (deadline && typeof deadline.unref === "function") deadline.unref();
+  // Best-effort: an unreadable baseline costs the rollback, not the timeout — the ticket is still
+  // stopped and blocked, and the run reports that its partial work had to be left in place.
+  const baseline = deadline
+    ? await readWorktreeState(worktreePath).catch(() => null)
+    : null;
+
   // This ticket's step context: the run's, narrowed to this ticket. The session is opened HERE and
   // handed in, so one session still covers the whole ticket — dispatch, gates and commit — exactly
   // as before. The claude driver is built per step below, so a resumed session is told which step it
   // is continuing.
-  const ticketCtx: StepContext = { ...run, tickets: [ticket], session };
+  const ticketRunCtx = { ...ctx, signal: ticketAbort.signal };
+  const ticketCtx: StepContext = { ...run, ctx: ticketRunCtx, tickets: [ticket], session };
 
   let committed = false;
   try {
@@ -1481,8 +1572,19 @@ async function runTicket(args: {
         ...ticketCtx,
         step: cooked,
         // In-session resume for a transient mid-stream death (anton-juar) — the dispatch machinery
-        // the step inherits from the run rather than a second driver of its own.
-        deps: { runClaude: resilientClaude({ db, ctx, sessionId, logPath, ticket, stepId: cooked.id }) },
+        // the step inherits from the run rather than a second driver of its own. On the TICKET's
+        // context, so a resume is refused once this ticket's budget is spent, exactly as it is on a
+        // job-level abort (resuming into a signal that is already aborted only burns the budget).
+        deps: {
+          runClaude: resilientClaude({
+            db,
+            ctx: ticketRunCtx,
+            sessionId,
+            logPath,
+            ticket,
+            stepId: cooked.id,
+          }),
+        },
       });
       // A `blocked` self-report is STICKY across a phase with several dispatching steps. A later
       // agent — a `step:claude` the project added after `implement` — reports on its own work only,
@@ -1563,6 +1665,73 @@ async function runTicket(args: {
     } else if (agentBlocked) {
       await appendSessionLog(logPath, `[agent-blocked] ${e.message}\n`).catch(() => {});
     }
+    // OUT OF TIME (anton-t1mo) — checked FIRST, because this ticket's signal is aborted on this
+    // path too and every check below would read it as an operator's kill. This abort has a known
+    // author (anton) and a known remedy, so unlike a kill it settles the ticket here: roll the
+    // partial work back, block the bead with the reason, and let the caller carry on with the next
+    // ticket.
+    //
+    // The rollback is the half that keeps the REST of the run honest. A ticket stopped mid-edit
+    // leaves a dirty tree, and the next ticket's commit step would sweep those changes up as its
+    // own — the feature's history then attributes work to a ticket that never did it, and
+    // unreviewed half-work rides into the PR under someone else's name.
+    // `!ctx.signal.aborted` breaks the tie when both fired: an operator's kill outranks the budget,
+    // and the abort path below is the one that writes nothing to a board a human is deciding on.
+    if (ranOutOfTime && !ctx.signal.aborted) {
+      await appendSessionLog(
+        logPath,
+        `[ticket-timeout] ${ticket.id} exceeded its ${Math.round(timeoutMs / 60_000)}m budget\n`,
+      ).catch(() => {});
+      // NEVER roll back a ticket that already committed. The baseline is the commit this ticket
+      // STARTED from, so a reset onto it would delete that commit — and a ticket whose commit
+      // landed has delivered real, gate-passed work; only its bookkeeping was cut short. The
+      // rollback exists for the uncommitted case, which is the only one that can leak into the
+      // next ticket's commit.
+      const rolledBack =
+        !committed && baseline
+          ? await safe(() => restoreWorktreeState(worktreePath, baseline))
+          : false;
+      // A rollback that failed — or was impossible, because the baseline itself was unreadable —
+      // may have left this ticket's files in the worktree the NEXT ticket commits from. Re-read the
+      // tree rather than assume: only changes actually left behind are dangerous, and a tree that
+      // can't be read at all counts as dangerous.
+      const leftovers =
+        !committed && !rolledBack && (await leftChangesBehind(worktreePath, baseline));
+      await safe(() => beads.setStatus(repo, ticket.id, "blocked"));
+      await safe(() => beads.unassign(repo, ticket.id));
+      await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
+      await safe(() =>
+        beads.note(
+          repo,
+          ticket.id,
+          `anton: stopped after ${Math.round(timeoutMs / 60_000)}m — the ticket outlived its ` +
+            `budget, so the run blocked it and carried on with the rest of the feature. ` +
+            (committed
+              ? `Its work IS committed on the branch (it was stopped after the commit) — review it ` +
+                `and close the ticket by hand if it is complete. `
+              : leftovers
+                ? `Its partial work could NOT be rolled back and is STILL in the run's worktree ` +
+                  `(${worktreePath}), so the run stopped rather than let another ticket commit it — ` +
+                  `clear the worktree by hand before resuming. `
+                : `Its partial work was rolled back (nothing from it is on the branch). `) +
+            `Re-scope it into smaller tickets, or raise ticketTimeoutMinutes, then resume the run`,
+        ),
+      );
+      // The rollback is what keeps the REST of the run honest, so its failure cannot be absorbed
+      // the way the timeout itself is: the next ticket captures its baseline from this same tree
+      // and would commit these leftovers under its own name. The bead note can't prevent that —
+      // nothing pauses the run, so the wrong commit lands long before an operator reads it. Halt
+      // instead (poison → park) and let a human clear the tree before anything else commits.
+      if (leftovers) {
+        throw new PoisonEpic(
+          `${ticket.id} exceeded its ${Math.round(timeoutMs / 60_000)}m ticket budget and its ` +
+            `partial work could NOT be rolled back — the run's worktree (${worktreePath}) still ` +
+            `carries changes that the next ticket would commit as its own, so the run stopped ` +
+            `here. Clear the worktree by hand, then resume the run`,
+        );
+      }
+      throw new TicketTimeoutError(ticket.id, timeoutMs, committed);
+    }
     // An ABORTED ticket writes nothing to the board (anton-6xj0). The abort's author decides this
     // ticket's fate, not this unwinding handler: an abandon settles it (closed + `abandoned`, the
     // stage label cleared — beads.abandon does all three), a force-kill or a lost lease leaves it
@@ -1616,6 +1785,11 @@ async function runTicket(args: {
       await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
     }
     throw e;
+  } finally {
+    // The ticket is over either way — stop its clock and stop listening to the job's, so a long run
+    // doesn't accumulate one live timer and one abort listener per ticket it has already finished.
+    if (deadline) clearTimeout(deadline);
+    ctx.signal.removeEventListener("abort", abortTicket);
   }
 }
 
@@ -1899,6 +2073,41 @@ class BlockedByAgentError extends Error {
   constructor(msg: string) {
     super(msg);
     this.name = "PoisonError"; // classified as poison by the runner
+  }
+}
+
+/**
+ * One ticket outlived its wall-clock budget (anton-t1mo — `ticketTimeoutMinutes`).
+ *
+ * Deliberately NOT poison, and deliberately not fatal to the run: the ticket loop catches this one
+ * error and moves to the next ticket, so a feature is never ended by a single ticket that couldn't
+ * converge. runTicket has already blocked the bead and rolled its partial work back by the time this
+ * is thrown, so nothing downstream needs to settle it — the loop only records which ticket it was.
+ *
+ * Carrying on is safe only because the worktree is provably clean of this ticket: a rollback that
+ * could not prove that raises {@link PoisonEpic} instead, halting the run so no later ticket commits
+ * the leftovers as its own.
+ */
+class TicketTimeoutError extends Error {
+  constructor(
+    readonly ticketId: string,
+    readonly budgetMs: number,
+    /**
+     * Whether this ticket's work made it into a commit before the clock ran out (the narrow case of
+     * a deadline landing on the bookkeeping AFTER the commit step). Its diff is on the branch, so
+     * the run still lists it as delivered — only its bead is left unfinished.
+     */
+    readonly committed: boolean,
+  ) {
+    super(
+      `${ticketId} exceeded its ${Math.round(budgetMs / 60_000)}m ticket budget and was stopped. ` +
+        (committed
+          ? `Its work IS committed on the branch (only its bead was left unfinished)`
+          : `Its partial work was rolled back`) +
+        ` and the ticket is blocked for review; the rest of the run continued. ` +
+        `Re-scope it (or raise ticketTimeoutMinutes), then resume.`,
+    );
+    this.name = "TicketTimeoutError";
   }
 }
 
@@ -2245,6 +2454,23 @@ export function orderTickets(tickets: Bead[], all: Bead[]): Bead[] {
   }
   if (order.length !== tickets.length) return tickets; // cycle → original order
   return order.map((id) => byId.get(id)!);
+}
+
+/**
+ * Whether a stopped ticket left changes behind in the shared worktree — the state that would ride
+ * into the NEXT ticket's commit under the wrong name.
+ *
+ * Anything unreadable counts as left behind: a tree we cannot prove clean is exactly the one that
+ * must not be waved through. With no baseline to compare against (its read failed), working-tree
+ * dirt alone is the signal — that is what the commit step would pick up.
+ */
+async function leftChangesBehind(
+  worktreePath: string,
+  baseline: WorktreeState | null,
+): Promise<boolean> {
+  const now = await readWorktreeState(worktreePath).catch(() => null);
+  if (!now) return true;
+  return baseline ? !sameWorktreeState(now, baseline) : now.status !== "";
 }
 
 /**
