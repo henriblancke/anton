@@ -14,7 +14,7 @@
  */
 import type { Bead } from "../beads/bd";
 import { isUnit } from "../epic-graph";
-import { isOpenWork, type BoardIndex } from "./board-index";
+import { isInFlight, isOpenWork, type BoardIndex } from "./board-index";
 import { makeDetection, type GardenerDetection } from "./detections";
 
 /** Phrases placing the MENTIONING bead after the bead it names. */
@@ -66,11 +66,11 @@ const DIRECTIONS = [
  * Both are proposals, never applied — a phrase in prose is evidence, not proof, so the matched
  * sentence travels with the detection for the approver to read.
  */
-export function detectImpliedOrdering(index: BoardIndex): GardenerDetection[] {
-  return [...bodyImplied(index), ...discoveryImplied(index)];
+export function detectImpliedOrdering(index: BoardIndex, nowMs: number): GardenerDetection[] {
+  return [...bodyImplied(index, nowMs), ...discoveryImplied(index, nowMs)];
 }
 
-function bodyImplied(index: BoardIndex): GardenerDetection[] {
+function bodyImplied(index: BoardIndex, nowMs: number): GardenerDetection[] {
   const detections: GardenerDetection[] = [];
 
   for (const bead of index.all) {
@@ -85,7 +85,7 @@ function bodyImplied(index: BoardIndex): GardenerDetection[] {
           if (!other) continue;
           const blocked = mentionedIsBlocker ? bead : other;
           const blocker = mentionedIsBlocker ? other : bead;
-          if (!canOrder(index, blocked, blocker)) continue;
+          if (!canOrder(index, blocked, blocker, nowMs)) continue;
           detections.push(
             makeDetection({
               kind: "implied-order",
@@ -110,13 +110,13 @@ function bodyImplied(index: BoardIndex): GardenerDetection[] {
   return detections;
 }
 
-function discoveryImplied(index: BoardIndex): GardenerDetection[] {
+function discoveryImplied(index: BoardIndex, nowMs: number): GardenerDetection[] {
   const detections: GardenerDetection[] = [];
 
   for (const { discovered, source } of index.discoveries) {
     const blocked = index.byId.get(discovered);
     const blocker = index.byId.get(source);
-    if (!blocked || !blocker || !canOrder(index, blocked, blocker)) continue;
+    if (!blocked || !blocker || !canOrder(index, blocked, blocker, nowMs)) continue;
     detections.push(
       makeDetection({
         kind: "implied-order",
@@ -141,11 +141,16 @@ function discoveryImplied(index: BoardIndex): GardenerDetection[] {
  * unrelated today: an existing blocks edge in EITHER direction is already someone's answer (the
  * reverse one is a contradiction to raise with a human, not to silently invert), and a
  * parent/ancestor pair sequences through the hierarchy rather than through `blocks`.
+ *
+ * Mid-flight work is off limits, the same bar every other detector proposes under: apply refuses to
+ * record a live bead as blocked, and by the time its run lands the bead is settled — so the proposal
+ * would never become appliable and would suppress the claim until someone declined it by hand.
  */
-function canOrder(index: BoardIndex, blocked: Bead, blocker: Bead): boolean {
+function canOrder(index: BoardIndex, blocked: Bead, blocker: Bead, nowMs: number): boolean {
   if (blocked.id === blocker.id) return false;
   if (!isUnit(blocked) || !isUnit(blocker)) return false;
   if (!isOpenWork(blocked) || !isOpenWork(blocker)) return false;
+  if (isInFlight(blocked, nowMs) || isInFlight(blocker, nowMs)) return false;
   if (index.hasBlocksEdge(blocked.id, blocker.id)) return false;
   return !index.isAncestor(blocked.id, blocker.id) && !index.isAncestor(blocker.id, blocked.id);
 }

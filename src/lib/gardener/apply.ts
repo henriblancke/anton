@@ -25,8 +25,7 @@
  * emission already suppresses on (see emit.ts `suppressedFingerprints`). The board is the memory.
  */
 import { beads, LABELS, type Bead } from "../beads/bd";
-import { boardCards } from "../ticket-view";
-import { isInFlight, isOpenWork } from "./board-index";
+import { indexBoard, isInFlight, isOpenWork, type BoardIndex } from "./board-index";
 import {
   fingerprintLabelOf,
   isProposalBead,
@@ -68,6 +67,10 @@ export type ApplyDecision =
  * Decide a plan against a board, writing nothing. Pure, so every precondition — the ones that
  * protect other people's beads — is testable from a fixture board rather than a live one.
  *
+ * The board is read through the SAME `indexBoard` the detectors use: parentage, card attribution and
+ * `blocks` edges have to mean one thing on both halves of the loop, or a proposal could be filed
+ * under one answer and applied under another.
+ *
  * `nowMs` is the moment the approval is being decided; it only dates the run-lease check below.
  */
 export function planApply(
@@ -75,23 +78,18 @@ export function planApply(
   board: Bead[],
   nowMs: number = Date.now(),
 ): ApplyDecision {
-  const byId = new Map(board.map((b) => [b.id, b]));
+  const index = indexBoard(board);
   switch (plan.move) {
     case "reparent":
-      return planReparent(plan, board, byId, nowMs);
+      return planReparent(plan, index, nowMs);
     case "link":
-      return planLink(plan, board, byId, nowMs);
+      return planLink(plan, index, nowMs);
     case "retire":
-      return planRetire(plan, byId, nowMs);
+      return planRetire(plan, index, nowMs);
   }
 }
 
-function planReparent(
-  plan: GardenerPlan,
-  board: Bead[],
-  byId: Map<string, Bead>,
-  nowMs: number,
-): ApplyDecision {
+function planReparent(plan: GardenerPlan, index: BoardIndex, nowMs: number): ApplyDecision {
   // A container-orphan detection with no single obvious home deliberately files WITHOUT a target —
   // it asks the approver to pick one. Approving it as-is would have to invent that answer.
   if (!plan.target) {
@@ -100,7 +98,7 @@ function planReparent(
       reason: `this proposal names no new parent — it asks for a home to be chosen, so re-parent ${plan.subjects.join(", ")} by hand and decline it`,
     };
   }
-  const target = byId.get(plan.target);
+  const target = index.byId.get(plan.target);
   if (!target) return { status: "refuse", reason: missing(plan.target) };
   if (!isOpenWork(target)) {
     return {
@@ -110,7 +108,7 @@ function planReparent(
   }
   // The same bar the detector proposes against: a home must be a BOARD CARD, or the move recreates
   // the very state (work riding no card) the proposal exists to fix.
-  if (!boardCards(board).ids.has(plan.target)) {
+  if (!index.cards.ids.has(plan.target)) {
     return {
       status: "refuse",
       reason: `${plan.target} is not a board card — re-parenting under it would leave the work riding no card, which is the state this proposal is about`,
@@ -119,7 +117,7 @@ function planReparent(
 
   const steps: ApplyStep[] = [];
   for (const id of plan.subjects) {
-    const subject = byId.get(id);
+    const subject = index.byId.get(id);
     if (!subject) return { status: "refuse", reason: missing(id) };
     const currentParent = beads.parentOf(subject);
     if (currentParent === plan.target) continue; // already where the proposal wants it
@@ -133,7 +131,7 @@ function planReparent(
       return { status: "refuse", reason: inFlightReason(subject, nowMs, "moving it") };
     }
     // A parent that sits UNDER one of the subjects would make the subtree its own ancestor.
-    if (isAncestor(byId, id, plan.target)) {
+    if (index.isAncestor(id, plan.target)) {
       return {
         status: "refuse",
         reason: `${plan.target} sits under ${id} — re-parenting it there would make the subtree its own ancestor`,
@@ -153,26 +151,21 @@ function planReparent(
   };
 }
 
-function planLink(
-  plan: GardenerPlan,
-  board: Bead[],
-  byId: Map<string, Bead>,
-  nowMs: number,
-): ApplyDecision {
+function planLink(plan: GardenerPlan, index: BoardIndex, nowMs: number): ApplyDecision {
   const [id] = plan.subjects;
   if (plan.subjects.length !== 1 || !id) {
     return { status: "refuse", reason: "a link proposal names exactly one blocked bead" };
   }
   if (!plan.target) return { status: "refuse", reason: "this proposal names no blocker to record" };
 
-  const blocked = byId.get(id);
-  const blocker = byId.get(plan.target);
+  const blocked = index.byId.get(id);
+  const blocker = index.byId.get(plan.target);
   if (!blocked) return { status: "refuse", reason: missing(id) };
   if (!blocker) return { status: "refuse", reason: missing(plan.target) };
 
   // The edge already exists (in either direction): the ordering is recorded, which is all the
   // proposal asked for. A reversed edge is someone's explicit decision — never overwrite it.
-  if (hasBlocksEdge(board, id, plan.target)) {
+  if (index.hasBlocksEdge(id, plan.target)) {
     return { status: "settled", summary: `a blocks edge already records ${plan.target} → ${id}` };
   }
   if (!isOpenWork(blocked)) {
@@ -200,12 +193,12 @@ function planLink(
   };
 }
 
-function planRetire(plan: GardenerPlan, byId: Map<string, Bead>, nowMs: number): ApplyDecision {
+function planRetire(plan: GardenerPlan, index: BoardIndex, nowMs: number): ApplyDecision {
   const [id] = plan.subjects;
   if (plan.subjects.length !== 1 || !id) {
     return { status: "refuse", reason: "a retirement proposal names exactly one bead" };
   }
-  const subject = byId.get(id);
+  const subject = index.byId.get(id);
   if (!subject) return { status: "refuse", reason: missing(id) };
   // Already settled by whatever means: the outcome the proposal wanted is the board's state, so
   // there is nothing to write and no reason to keep asking. An ABANDONED bead counts even in the
@@ -222,6 +215,19 @@ function planRetire(plan: GardenerPlan, byId: Map<string, Bead>, nowMs: number):
   // pull the bead out from under the run that is shipping it.
   if (isInFlight(subject, nowMs)) {
     return { status: "refuse", reason: inFlightReason(subject, nowMs, "retiring it") };
+  }
+  // Settling a bead that still has open work under it strands that work: the children stay in the
+  // ready set with a parent no run will ever reach — the unreachable state `detectContainerOrphans`
+  // exists to flag, arrived at by approving a proposal. Only the SETTLING verbs are barred; `defer`
+  // parks the subtree with its contract intact and is undone by reopening the parent.
+  if (plan.retireAs === "close" || plan.retireAs === "supersede") {
+    const open = index.openDescendants(id);
+    if (open.length > 0) {
+      return {
+        status: "refuse",
+        reason: `${id} still has open work under it (${namesSome(open.map((b) => b.id))}) — settling it would strand that work beneath a card nothing will run; close or retire the children first`,
+      };
+    }
   }
 
   switch (plan.retireAs) {
@@ -241,7 +247,7 @@ function planRetire(plan: GardenerPlan, byId: Map<string, Bead>, nowMs: number):
       if (!plan.target) {
         return { status: "refuse", reason: "this proposal names no bead that superseded it" };
       }
-      const survivor = byId.get(plan.target);
+      const survivor = index.byId.get(plan.target);
       if (!survivor) return { status: "refuse", reason: missing(plan.target) };
       // The whole claim is "the work landed over there". A survivor that is open again means it
       // did not, and closing this one would write off work nothing has delivered.
@@ -371,23 +377,6 @@ export async function applyProposal(
 // ── declining (the other half of the loop) ──
 
 /**
- * The fingerprints the board records as DECLINED: every abandoned proposal's. This is the whole
- * "decline store" — a human's "no" lives on the bead they said it about, which is why a decline
- * survives a re-clone, reaches every machine through the same Dolt sync as the work, and needs no
- * table of its own. {@link import("./emit").suppressedFingerprints} is what reads it back on the
- * next patrol; this is the same fact stated for a reader who wants only the declines.
- */
-export function declinedFingerprints(board: Bead[]): Set<string> {
-  const out = new Set<string>();
-  for (const bead of board) {
-    if (!beads.isAbandoned(bead)) continue;
-    const fingerprint = fingerprintLabelOf(bead);
-    if (fingerprint) out.add(fingerprint);
-  }
-  return out;
-}
-
-/**
  * The note a DECLINE leaves on a proposal, or undefined when the bead is not one.
  *
  * Declining is abandon — anton's existing won't-do outcome, which already closes the bead with the
@@ -503,29 +492,14 @@ const settledWord = (bead: Bead): string =>
 
 const list = (ids: string[]): string => ids.join(", ");
 
+/** How many ids a refusal spells out before it counts the rest — a reason stays one readable line. */
+const NAMED_IDS = 5;
+
+const namesSome = (ids: string[]): string =>
+  ids.length <= NAMED_IDS
+    ? list(ids)
+    : `${list(ids.slice(0, NAMED_IDS))} and ${ids.length - NAMED_IDS} more`;
+
 const oneLine = (text: string): string => text.replace(/\s+/g, " ").trim();
 
 const messageOf = (e: unknown): string => oneLine(e instanceof Error ? e.message : String(e));
-
-/** Is `ancestorId` this bead or anywhere on its parent chain? Cycle-guarded (see board-index). */
-function isAncestor(byId: Map<string, Bead>, ancestorId: string, id: string): boolean {
-  const seen = new Set<string>();
-  let current: string | undefined = id;
-  while (current && !seen.has(current)) {
-    if (current === ancestorId) return true;
-    seen.add(current);
-    const bead = byId.get(current);
-    current = bead ? beads.parentOf(bead) : undefined;
-  }
-  return false;
-}
-
-/** A `blocks` edge between these two in EITHER direction — a reversed edge is a decision, not a gap. */
-function hasBlocksEdge(board: Bead[], a: string, b: string): boolean {
-  return beads
-    .edgesOf(board)
-    .some(
-      (e) =>
-        e.type === "blocks" && ((e.from === a && e.to === b) || (e.from === b && e.to === a)),
-    );
-}

@@ -50,7 +50,7 @@ export function detectBoard(input: DetectInput): GardenerDetection[] {
     dedupeDetections([
       ...detectContainerOrphans(index, now),
       ...detectParentlessClusters(index, now),
-      ...detectImpliedOrdering(index),
+      ...detectImpliedOrdering(index, now),
       ...detectRetirementCandidates(index, findings, now),
     ]),
   );

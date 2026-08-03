@@ -273,6 +273,24 @@ describe("implied ordering with no blocks edge", () => {
     expect(detection.evidence.join("\n")).toContain("discovered-from");
   });
 
+  // The same bar every other detector proposes under: apply refuses to record a live bead as
+  // blocked, and once its run lands the bead is settled — so the proposal could never be applied.
+  it("stays silent while either end is mid-run", () => {
+    const body = "## Context\nBlocked on anton-beta landing first.";
+    expect(
+      detect([
+        feature("anton-alpha", { description: body, labels: ["stage:in-review"] }),
+        feature("anton-beta"),
+      ]),
+    ).toEqual([]);
+    expect(
+      detect([
+        feature("anton-alpha", { description: body }),
+        feature("anton-beta", { labels: ["stage:in-review"] }),
+      ]),
+    ).toEqual([]);
+  });
+
   it("never proposes an edge between a bead and its own ancestor", () => {
     expect(
       detect([
@@ -380,6 +398,42 @@ describe("retirement candidates", () => {
     expect(detection.kind).toBe("shipped-orphan");
     expect(detection.retireAs).toBe("close");
     expect(detection.evidence.join("\n")).toContain("abc1234");
+  });
+
+  // Settling a run target with tickets still under it would leave them beneath a card no run can
+  // reach — the container-orphan state, reached by approving a proposal. bd's report line still
+  // names the bead, so nothing is hidden; only the ask nobody could approve is.
+  it("does not propose SETTLING a bead that still has open work under it", () => {
+    expect(
+      detect(
+        [feature("anton-shipped"), bead("anton-t1", { parent: "anton-shipped" })],
+        [orphan("anton-shipped")],
+      ),
+    ).toEqual([]);
+    expect(
+      detect(
+        [
+          feature("anton-live", { title: "Same" }),
+          feature("anton-landed", { title: "Same", status: "closed" }),
+          bead("anton-t1", { parent: "anton-live" }),
+        ],
+        [duplicate(["anton-landed", "anton-live"])],
+      ),
+    ).toEqual([]);
+  });
+
+  it("still proposes DEFERRING a stale bead with open children — parking is reversible", () => {
+    const detection = only(
+      detect(
+        [
+          feature("anton-cold", { updated_at: daysAgo(RETIRE_STALE_OPEN_DAYS + 10) }),
+          bead("anton-t1", { parent: "anton-cold" }),
+        ],
+        [stale("anton-cold", "open")],
+      ),
+    );
+
+    expect(detection.retireAs).toBe("defer");
   });
 
   it("keeps only the most certain claim when several fire on one bead", () => {

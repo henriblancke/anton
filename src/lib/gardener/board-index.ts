@@ -24,6 +24,12 @@ export interface BoardIndex {
   /** Direct children of a bead, in board order. */
   childrenOf(id: string): Bead[];
   /**
+   * Every still-open bead beneath this one, at any depth. Retirement asks this before it settles a
+   * bead: closing a parent with open children leaves them hanging off a card nothing will ever run,
+   * which is the same unreachable state `detectContainerOrphans` exists to flag.
+   */
+  openDescendants(id: string): Bead[];
+  /**
    * Is there a `blocks` edge between these two, in EITHER direction? Undirected on purpose: a
    * backwards edge is a contradiction, not a gap, and proposing the reverse of an edge someone
    * already drew would fight a human's recorded decision.
@@ -57,11 +63,26 @@ export function indexBoard(all: Bead[]): BoardIndex {
     }
   }
 
+  const childrenOf = (id: string): Bead[] => children.get(id) ?? [];
+
   return {
     all,
     byId,
     cards: boardCards(all),
-    childrenOf: (id) => children.get(id) ?? [],
+    childrenOf,
+    openDescendants: (id) => {
+      const found: Bead[] = [];
+      const seen = new Set<string>([id]);
+      const queue = [...childrenOf(id)];
+      while (queue.length > 0) {
+        const bead = queue.shift() as Bead;
+        if (seen.has(bead.id)) continue; // a parent cycle must not spin this walk forever
+        seen.add(bead.id);
+        if (isOpenWork(bead)) found.push(bead);
+        queue.push(...childrenOf(bead.id));
+      }
+      return found;
+    },
     hasBlocksEdge: (a, b) => blocks.has(pairKey(a, b)),
     discoveries,
     isAncestor: (ancestorId, id) => {

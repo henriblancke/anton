@@ -80,6 +80,7 @@ function detectSuperseded(
 
     for (const member of members) {
       if (!isOpenWork(member) || isInFlight(member, nowMs)) continue;
+      if (strandsOpenWork(index, member)) continue;
       detections.push(
         makeDetection({
           kind: "superseded",
@@ -120,6 +121,7 @@ function detectShippedOrphans(
     if (finding.kind !== "orphan" || !finding.beadId) continue;
     const bead = index.byId.get(finding.beadId);
     if (!bead || !isOpenWork(bead) || isInFlight(bead, nowMs)) continue;
+    if (strandsOpenWork(index, bead)) continue;
     detections.push(
       makeDetection({
         kind: "shipped-orphan",
@@ -191,6 +193,20 @@ function detectStale(
   }
 
   return detections;
+}
+
+/**
+ * Would SETTLING this bead (close/supersede) leave open work hanging under it? Those children would
+ * sit beneath a card no run can reach — the unreachable state `detectContainerOrphans` flags — so the
+ * subtree is retired from the bottom up or not at all. Apply re-checks this against a fresh board
+ * (see apply.ts `planRetire`); here it keeps a proposal nobody could approve off the board, and bd's
+ * own report line still names the bead for a human.
+ *
+ * `defer` is deliberately not gated: it parks the subtree with its contract intact and is undone by
+ * reopening the parent.
+ */
+function strandsOpenWork(index: BoardIndex, bead: Bead): boolean {
+  return index.openDescendants(bead.id).length > 0;
 }
 
 /** One retirement ask per bead, keeping the most certain claim (see {@link RETIRE_PRECEDENCE}). */

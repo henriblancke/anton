@@ -226,11 +226,24 @@ function appliedState(detection: GardenerDetection): string {
   }
 }
 
+/**
+ * Does this proposal name a move anton can run, or only a question a human can answer? A container
+ * orphan with no single open feature home files WITHOUT a target on purpose (see reparent.ts) — the
+ * ask is real, but the answer is a choice, so apply refuses it by design. The bead has to SAY that:
+ * a card that reads "approving it applies the move" while Approve always refuses is worse than the
+ * misfiled bead it is about.
+ */
+function isManual(detection: GardenerDetection): boolean {
+  return detection.move === "reparent" && !detection.target;
+}
+
 function acceptanceOf(detection: GardenerDetection): string {
   return [
     `- [ ] ${appliedState(detection)}`,
     "- [ ] no other bead is re-parented, linked or retired — the move above is the whole change",
-    "- [ ] this proposal is closed with a note naming what changed",
+    isManual(detection)
+      ? "- [ ] this proposal is DECLINED once the move is made by hand — approving it is refused, so declining is what settles it"
+      : "- [ ] this proposal is closed with a note naming what changed",
   ].join("\n");
 }
 
@@ -244,8 +257,17 @@ function descriptionOf(detection: GardenerDetection): string {
     "",
     "## Context",
     `Filed by the gardener patrol from a \`${detection.kind}\` board-shape detection (anton-e42l).`,
-    "This bead is a DECISION, not implementation work: approving it applies the move through the",
-    "beads seam, declining it records the reason.",
+    ...(isManual(detection)
+      ? [
+          "This bead is a DECISION only a human can make: no single home was obvious, so the proposal",
+          "names none and **Approve is refused**. Pick a board card (the Evidence lists what is open",
+          "under the container), move it by hand with `bd update <id> --parent <card>`, then DECLINE",
+          "this proposal — declining is what settles it and stops the patrol re-asking.",
+        ]
+      : [
+          "This bead is a DECISION, not implementation work: approving it applies the move through the",
+          "beads seam, declining it records the reason.",
+        ]),
     "",
     `- move: \`${detection.move}\`${detection.retireAs ? ` (\`${detection.retireAs}\`)` : ""}`,
     `- subjects: ${detection.subjects.join(", ")}`,
@@ -259,7 +281,7 @@ function descriptionOf(detection: GardenerDetection): string {
     "- the other proposals this pass filed — each is approved or declined on its own",
     "",
     "## Verify",
-    `- after applying, the board shows that ${appliedState(detection)}`,
+    `- after the move, the board shows that ${appliedState(detection)}`,
     `- the next patrol files nothing new for \`${detection.fingerprint}\``,
   ].join("\n");
 }

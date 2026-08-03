@@ -286,16 +286,3 @@ export function dedupeDetections(detections: GardenerDetection[]): GardenerDetec
   }
   return [...byFingerprint.values()];
 }
-
-/** Per-kind counts with every kind present — an absent kind counts 0, never `undefined`. */
-export type GardenerCounts = Record<GardenerDetectionKind, number>;
-
-export function countDetections(detections: GardenerDetection[]): GardenerCounts {
-  const counts = Object.fromEntries(
-    GARDENER_DETECTION_KINDS.map((k) => [k, 0]),
-  ) as GardenerCounts;
-  for (const detection of detections) {
-    if (detection.kind in counts) counts[detection.kind] += 1;
-  }
-  return counts;
-}

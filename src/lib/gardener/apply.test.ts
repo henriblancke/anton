@@ -54,13 +54,7 @@ vi.mock("../beads/bd", async () => {
   };
 });
 
-const {
-  ProposalApplyError,
-  applyProposal,
-  declineNote,
-  declinedFingerprints,
-  planApply,
-} = await import("./apply");
+const { ProposalApplyError, applyProposal, declineNote, planApply } = await import("./apply");
 
 const REPO = "/tmp/gardener-apply";
 
@@ -294,6 +288,35 @@ describe("planApply — what an approval means against the board as it now is", 
       expect(refusal(planApply(SUPERSEDE, board))).toMatch(/has not landed/);
     });
 
+    // Settling a run target with work still under it is how an approval could CREATE the very state
+    // the gardener exists to flag: tickets left beneath a card no run will ever reach.
+    it("refuses to close or supersede a bead that still has open work under it, at any depth", () => {
+      const feature = bead("anton-a", { issue_type: "feature" });
+      const survivor = bead("anton-b", { status: "closed" });
+      const shipped = child("anton-t1", "anton-a", { status: "closed" });
+      const buried = child("anton-t2", "anton-t1");
+
+      const board = [feature, survivor, shipped, buried];
+      expect(refusal(planApply(CLOSE, board))).toMatch(/still has open work under it \(anton-t2\)/);
+      expect(refusal(planApply(SUPERSEDE, board))).toMatch(/anton-t2/);
+    });
+
+    it("closes a bead whose whole subtree has settled", () => {
+      const board = [
+        bead("anton-a", { issue_type: "feature" }),
+        child("anton-t1", "anton-a", { status: "closed" }),
+        child("anton-t2", "anton-a", { labels: [LABELS.abandoned], status: "closed" }),
+      ];
+      expect(planApply(CLOSE, board).status).toBe("apply");
+    });
+
+    // Deferring is the reversible half: the subtree parks with its contract intact and reopening the
+    // parent undoes it, so open children are not a reason to refuse.
+    it("defers a bead with open children rather than refusing", () => {
+      const board = [bead("anton-a", { issue_type: "feature" }), child("anton-t1", "anton-a")];
+      expect(planApply(DEFER, board).status).toBe("apply");
+    });
+
     // The bar every detector proposes under (board-index `isInFlight`), re-checked HERE because the
     // run usually claims the bead AFTER the proposal was filed: approving last night's ask would
     // re-parent or retire work an agent is mid-flight over.
@@ -462,16 +485,5 @@ describe("declining — the board's own memory of a no", () => {
 
   it("has nothing to say about a bead that is not a proposal", () => {
     expect(declineNote(bead("anton-x"))).toBeUndefined();
-  });
-
-  it("reads declines off ABANDONED proposals only — an applied one is not a no", () => {
-    const declined = proposalFor(REPARENT, {
-      status: "closed",
-      labels: [REPARENT.fingerprint, LABELS.abandoned],
-    });
-    const applied = proposalFor(CLUSTER, { id: "anton-p3", status: "closed" });
-    expect([...declinedFingerprints([declined, applied, bead("anton-x")])]).toEqual([
-      REPARENT.fingerprint,
-    ]);
   });
 });

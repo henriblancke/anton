@@ -205,6 +205,18 @@ describe("the proposal bead", () => {
     });
     expect(proposalDraft(supersede).acceptance).toContain("superseded by anton-kept");
   });
+
+  // A container orphan with no single obvious home files without a target on purpose, and apply
+  // refuses every targetless re-parent — so the bead must not read as one an approval can settle.
+  it("tells a proposal that names no home to be applied by hand and DECLINED, not approved", () => {
+    const homeless = reparent({ target: undefined });
+    const draft = proposalDraft(homeless);
+
+    expect(draft.description).toContain("Approve is refused");
+    expect(draft.description).toContain("bd update <id> --parent <card>");
+    expect(draft.description).not.toContain("approving it applies the move");
+    expect(draft.acceptance).toContain("DECLINED");
+  });
 });
 
 describe("dedup by fingerprint", () => {
