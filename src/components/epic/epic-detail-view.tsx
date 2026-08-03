@@ -6,7 +6,7 @@ import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import { CheckIcon, CircleSlashIcon, RotateCcwIcon, TriangleAlertIcon } from "lucide-react";
 
-import type { EpicCrumb, EpicDetail, Ticket } from "@/lib/types";
+import type { EpicCrumb, EpicDetail, ReviewReport, Ticket } from "@/lib/types";
 // The predicate itself, not a page-local copy: approve, the runner, and the board card ask the same one.
 import { contractBlocks } from "@/lib/beads/contract";
 import { cn } from "@/lib/utils";
@@ -22,6 +22,7 @@ import { EpicBadge } from "@/components/board/epic-badge";
 import { PrLinkControl } from "@/components/board/pr-link-control";
 import { DependencyGraph } from "@/components/epic/dependency-graph";
 import { EpicPriorityControl } from "@/components/epic/epic-priority-control";
+import { ReviewScorePanel } from "@/components/epic/review-score-panel";
 import { ReworkDialog } from "@/components/epic/rework-dialog";
 import { AbandonButton } from "@/components/ticket/abandon-button";
 import { TicketDialog } from "@/components/ticket/ticket-dialog";
@@ -136,6 +137,12 @@ export function EpicDetailView({
   const router = useRouter();
   const [detail, setDetail] = useState<EpicDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The self-review history (anton-tprv), loaded beside the detail rather than inside it: it costs a
+  // hydrated `bd show --include-comments`, and the detail open is deliberately spawn-free
+  // (anton-8s1t). Two concurrent fetches, never a waterfall — the page paints off the snapshot while
+  // the score series fills in.
+  const [review, setReview] = useState<ReviewReport | undefined>(undefined);
+  const [reviewError, setReviewError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
   const [openTicketId, setOpenTicketId] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
@@ -156,7 +163,25 @@ export function EpicDetailView({
         if (!cancelled) setError(err instanceof Error ? err.message : "Failed to load epic");
       }
     }
+    async function loadReview() {
+      try {
+        const res = await fetch(`/api/projects/${slug}/epics/${epicId}/review`);
+        if (!res.ok) throw new Error(`Couldn't load the self-review history (${res.status})`);
+        const data = (await res.json()) as { report: ReviewReport };
+        if (!cancelled) {
+          setReview(data.report);
+          setReviewError(null);
+        }
+      } catch (err) {
+        // A history that can't be read never blocks the page: the score is a record of past runs,
+        // and every action here operates on the beads, not on it.
+        if (!cancelled) {
+          setReviewError(err instanceof Error ? err.message : "Couldn't load the self-review history");
+        }
+      }
+    }
     void load();
+    void loadReview();
     return () => {
       cancelled = true;
     };
@@ -436,6 +461,14 @@ export function EpicDetailView({
             </div>
           </div>
 
+          {/* Beside completion on purpose: how much of the run landed, then how well it scored. */}
+          <ReviewScorePanel
+            report={review}
+            stage={epic.stage}
+            loading={review === undefined && reviewError === null}
+            error={reviewError}
+          />
+
           {/* claimed-by + created — mirrors the ticket surfaces */}
           <dl className="flex flex-col gap-2">
             <div className="flex items-center gap-2 text-[12.5px]">
@@ -562,6 +595,9 @@ export function EpicDetailView({
         slug={slug}
         targetId={epic.id}
         tickets={tickets}
+        // The page already holds the report its findings are picked from — hand it over rather than
+        // spend a second hydrated read when the dialog opens.
+        report={review}
         open={reworkOpen}
         onClose={() => setReworkOpen(false)}
         onReworked={() => setAttempt((n) => n + 1)}

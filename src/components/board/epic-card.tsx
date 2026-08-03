@@ -22,6 +22,7 @@ import { toastContractAdvisory } from "@/components/board/contract-advisory";
 import { ApproveBlocked, ContractChip } from "@/components/board/contract-mark";
 import { EpicBadge, NoEpicBadge } from "@/components/board/epic-badge";
 import { AbandonedChip, BlockedChip, MetaChip, PrLink, RiskChip } from "@/components/atoms";
+import { ReviewScoreChip } from "@/components/review-score";
 import { ClaimControl } from "@/components/board/claim-control";
 import { CopyButton } from "@/components/ui/copy-button";
 
@@ -154,6 +155,9 @@ export function EpicCard({
                 ? `${done} / ${total} tickets`
                 : "complete"}
           </span>
+          {/* A shipped card is where the score matters most: it is the last word on what this run
+              actually delivered. */}
+          <ReviewScoreChip score={epic.reviewScore} className="ml-auto" />
         </div>
       </CardShell>
     );
@@ -214,6 +218,8 @@ export function EpicCard({
         {epic.agent && <MetaChip dotClass={agentDotClass(epic.agent)}>{epic.agent}</MetaChip>}
         {epic.risk && <RiskChip risk={epic.risk} />}
         {epic.size && <MetaChip>size:{epic.size}</MetaChip>}
+        {/* Renders only once a review has actually scored this target (anton-tprv). */}
+        <ReviewScoreChip score={epic.reviewScore} />
         <ContractChip contract={epic.contract} />
       </div>
 

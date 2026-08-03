@@ -14,6 +14,7 @@ import {
   type HygieneReport,
 } from "./hygiene";
 import { issueSnapshotVersion, type SnapshotReadOptions } from "./beads/snapshot";
+import { reviewTrajectory } from "./review-trajectory";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
 import {
   boardCards,
@@ -197,6 +198,10 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
     if (!standalone[stage]) standalone[stage] = [];
   }
 
+  // Every run target the board holds — cards and standalone chips alike — rolled up into the
+  // project's score trend (anton-tprv). Off the labels already in this snapshot: no per-card read.
+  const trajectory = reviewTrajectory([...cardBeads, ...orphanTasks]);
+
   // Only the backlog is dependency-aware ordered (ready-first → rank → priority → createdAt); the
   // other columns are stage-based, so deps can't reorder across them — they keep insertion order.
   columns.backlog.sort(compareBacklogEpics);
@@ -222,6 +227,7 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
     columns,
     standalone,
     hygiene,
+    ...(trajectory ? { reviewTrajectory: trajectory } : {}),
     // Read from the globalThis-anchored registry, so the API bundle sees passes run by the
     // instrumentation-started sync engine (see bd.ts).
     sync: getSyncStatus(project.repoPath),

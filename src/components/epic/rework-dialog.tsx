@@ -27,6 +27,11 @@ export interface ReworkDialogProps {
   targetId: string;
   /** The tickets that run covers — what may be sent back. */
   tickets: Ticket[];
+  /**
+   * The target's self-review report, when the surface opening this dialog already holds it (the
+   * epic page loads it for its score series). Absent → the dialog reads it itself.
+   */
+  report?: ReviewReport;
   open: boolean;
   onClose: () => void;
   /** Fired after a successful submit, so the page can refetch. */
@@ -46,7 +51,15 @@ export interface ReworkDialogProps {
  * fix instructions available, and they are already gone from the worktree by the time anyone reads
  * this.
  */
-export function ReworkDialog({ slug, targetId, tickets, open, onClose, onReworked }: ReworkDialogProps) {
+export function ReworkDialog({
+  slug,
+  targetId,
+  tickets,
+  report,
+  open,
+  onClose,
+  onReworked,
+}: ReworkDialogProps) {
   return (
     <Dialog
       open={open}
@@ -64,6 +77,7 @@ export function ReworkDialog({ slug, targetId, tickets, open, onClose, onReworke
             slug={slug}
             targetId={targetId}
             tickets={tickets}
+            report={report}
             onClose={onClose}
             onReworked={onReworked}
           />
@@ -77,12 +91,14 @@ function ReworkForm({
   slug,
   targetId,
   tickets,
+  report: given,
   onClose,
   onReworked,
 }: {
   slug: string;
   targetId: string;
   tickets: Ticket[];
+  report?: ReviewReport;
   onClose: () => void;
   onReworked?: (result: ReworkResult) => void;
 }) {
@@ -93,19 +109,21 @@ function ReworkForm({
   const [summary, setSummary] = useState("");
   const [instructions, setInstructions] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [report, setReport] = useState<ReviewReport | null>(null);
+  const [fetched, setFetched] = useState<ReviewReport | null>(null);
   const [reportError, setReportError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const ids = useId();
+  const report = given ?? fetched;
 
   useEffect(() => {
+    if (given) return; // handed down by the page that already loaded it
     let cancelled = false;
     async function load() {
       try {
-        const res = await fetch(`/api/projects/${slug}/epics/${targetId}/rework`);
+        const res = await fetch(`/api/projects/${slug}/epics/${targetId}/review`);
         if (!res.ok) throw new Error(`Couldn't load the review report (${res.status})`);
         const data = (await res.json()) as { report: ReviewReport };
-        if (!cancelled) setReport(data.report);
+        if (!cancelled) setFetched(data.report);
       } catch (err) {
         // A missing report never blocks the action — the founder can still write instructions by
         // hand, which is exactly what this replaces.
@@ -116,7 +134,7 @@ function ReworkForm({
     return () => {
       cancelled = true;
     };
-  }, [slug, targetId]);
+  }, [slug, targetId, given]);
 
   const findings = report?.findings ?? [];
   const canSubmit = !!ticketId && summary.trim().length > 0 && instructions.trim().length > 0 && !submitting;

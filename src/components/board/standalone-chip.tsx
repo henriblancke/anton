@@ -11,6 +11,7 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { CopyButton } from "@/components/ui/copy-button";
 import { AbandonedChip, BlockedChip, MetaChip, PrLink, RiskChip, SnoozedChip } from "@/components/atoms";
+import { ReviewScoreChip } from "@/components/review-score";
 import { SnoozeButton } from "@/components/ticket/snooze-button";
 import { ClaimControl } from "@/components/board/claim-control";
 import { TYPE_RAIL, TYPE_TEXT, agentDotClass } from "@/components/board/board-utils";
@@ -156,6 +157,8 @@ export function StandaloneChip({
         </CopyButton>
         {item.agent && <MetaChip dotClass={agentDotClass(item.agent)}>{item.agent}</MetaChip>}
         {item.risk && <RiskChip risk={item.risk} />}
+        {/* Renders only once a review has actually scored this target (anton-tprv). */}
+        <ReviewScoreChip score={item.reviewScore} />
         {item.stage === "backlog" && <BlockedChip blockedBy={item.blockedBy} />}
         {/* A closed item's spec gaps are moot — nothing will run off them. */}
         {item.stage !== "done" && <ContractChip contract={item.contract} />}

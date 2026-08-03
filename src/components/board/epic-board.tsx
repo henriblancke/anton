@@ -38,6 +38,7 @@ import { EpicLaneView, LaneStageStrip } from "@/components/board/epic-lane";
 import { useBoardGrouping } from "@/lib/use-board-grouping";
 import { SyncStatusBadge } from "@/components/board/sync-status-badge";
 import { HygienePanel } from "@/components/board/hygiene-panel";
+import { ReviewTrajectoryPanel } from "@/components/board/review-trajectory-panel";
 import { Button } from "@/components/ui/button";
 import { TicketDialog } from "@/components/ticket/ticket-dialog";
 
@@ -298,6 +299,9 @@ export function EpicBoard({
           the same 304-friendly poll as the cards instead of going stale until a reload. A finding's
           bead opens the same detail dialog the standalone chips use. */}
       <HygienePanel report={board.hygiene} onOpenBead={setOpenTicketId} />
+      {/* Alongside hygiene, and for the same reason: the trend rides the board payload, so it moves
+          on the same poll as the scores its cards carry. */}
+      <ReviewTrajectoryPanel slug={slug} trajectory={board.reviewTrajectory} />
       {lanes ? (
         // The lanes share one horizontal scroller so every lane's stage columns line up under the
         // single stage strip, at any width.

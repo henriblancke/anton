@@ -1,6 +1,4 @@
 import { NextResponse } from "next/server";
-import { isMissingBeadError } from "@/lib/beads/bd";
-import { getReviewReport } from "@/lib/review-report";
 import {
   reworkTicket,
   ReworkConflictError,
@@ -15,32 +13,12 @@ import { withProject } from "../../../resolve-project";
 export const dynamic = "force-dynamic";
 
 /**
- * The rework surface for a run target (anton-4ocm):
+ * Send one ticket of a run target back with instructions (anton-4ocm) — as a reopen, or as a
+ * discovered-from follow-up.
  *
- *   GET  → the self-review report the founder decides from — every round this target recorded, and
- *          the findings still on the table.
- *   POST → send one ticket back with instructions, as a reopen or a discovered-from follow-up.
- *
- * The report is a separate GET rather than a field on the epic detail because it costs a hydrated
- * `bd show --include-comments`: every epic page would pay for a thread only the rework dialog reads.
+ * The report this decision is made from is served by the sibling `review` route, which the epic
+ * page already loads for its score series — so opening this dialog costs no second read.
  */
-export const GET = withProject<{ slug: string; epicId: string }>(async (_request, { project, params }) => {
-  try {
-    return NextResponse.json({ report: await getReviewReport(project.repoPath, params.epicId) });
-  } catch (err) {
-    // Only bd ANSWERING "no such bead" is a 404. A bd that couldn't answer at all (absent, dolt
-    // wedged) is a 500 — reporting it as not-found would tell the founder their target is gone.
-    if (isMissingBeadError(err)) {
-      return NextResponse.json(
-        { error: `Ticket ${params.epicId} not found on the board` },
-        { status: 404 },
-      );
-    }
-    console.error(`[rework] could not read ${params.epicId}'s review report`, err);
-    return NextResponse.json({ error: "Could not read the review report" }, { status: 500 });
-  }
-});
-
 export const POST = withProject<{ slug: string; epicId: string }>(async (request, { project, params }) => {
   let body: unknown;
   try {

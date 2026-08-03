@@ -179,4 +179,14 @@ describe("ReworkDialog", () => {
       expect(toast.success).toHaveBeenCalledWith(expect.stringContaining("Already sent back"), undefined),
     );
   });
+
+  it("uses the report the page already loaded instead of reading it again (anton-tprv)", async () => {
+    // The epic page holds the same report for its score series; a second hydrated read per dialog
+    // open would be pure duplication.
+    const fetchMock = stubFetch();
+    open({ report: REPORT });
+
+    await screen.findByText("no null guard");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });

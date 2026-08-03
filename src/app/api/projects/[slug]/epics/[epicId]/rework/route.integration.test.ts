@@ -1,7 +1,8 @@
 /**
  * Real-db + real-bd route test for the rework action (anton-4ocm):
- *   GET  /api/projects/[slug]/epics/[epicId]/rework  → the self-review report to decide from
  *   POST /api/projects/[slug]/epics/[epicId]/rework  → send one ticket back
+ *
+ * The report this decision is made from is the sibling `review` route's, tested there.
  *
  * The assertions are deliberately made against the BOARD and against the shared predicates the
  * runtime itself uses — `runTickets`/`resumeSkipped` (what the next run dispatches) and
@@ -22,7 +23,6 @@ import {
   withOperator,
 } from "@/lib/testing/integration";
 
-const get = (slug: string, id: string) => GET(jsonRequest("GET"), paramsCtx({ slug, epicId: id }));
 const post = (slug: string, id: string, body?: unknown) =>
   POST(jsonRequest("POST", body), paramsCtx({ slug, epicId: id }));
 
@@ -30,14 +30,12 @@ let fileDb: FileDb;
 let bdRepo: BdRepo;
 let repo: string;
 let projectId: string;
-let GET: typeof import("./route").GET;
 let POST: typeof import("./route").POST;
 let beads: typeof import("@/lib/beads/bd").beads;
 let loadAllIssues: typeof import("@/lib/beads/issues").loadAllIssues;
 let runTickets: typeof import("@/lib/ticket-view").runTickets;
 let resumeSkipped: typeof import("@/lib/ticket-view").resumeSkipped;
 let ticketPrompt: typeof import("@/lib/jobs/step-registry").ticketPrompt;
-let formatReviewScoreComment: typeof import("@/lib/jobs/review-score").formatReviewScoreComment;
 let getDb: typeof import("@/lib/db").getDb;
 let schema: typeof import("@/lib/db/schema");
 let resetOperatorCache: typeof import("@/lib/operator").resetOperatorCache;
@@ -68,12 +66,11 @@ describeBd("rework route (temp anton.db + real bd)", () => {
   beforeAll(async () => {
     fileDb = makeFileDb();
 
-    ({ GET, POST } = await import("./route"));
+    ({ POST } = await import("./route"));
     ({ beads } = await import("@/lib/beads/bd"));
     ({ loadAllIssues } = await import("@/lib/beads/issues"));
     ({ runTickets, resumeSkipped } = await import("@/lib/ticket-view"));
     ({ ticketPrompt } = await import("@/lib/jobs/step-registry"));
-    ({ formatReviewScoreComment } = await import("@/lib/jobs/review-score"));
     ({ getDb } = await import("@/lib/db"));
     schema = await import("@/lib/db/schema");
     ({ resetOperatorCache } = await import("@/lib/operator"));
@@ -113,30 +110,6 @@ describeBd("rework route (temp anton.db + real bd)", () => {
       deps: [`parent-child:${feature}`],
     });
     await getDb().delete(schema.jobs);
-  });
-
-  it("serves the review report the founder decides from, findings and all", async () => {
-    await beads.comment(
-      repo,
-      feature,
-      formatReviewScoreComment({
-        round: 1,
-        score: 4,
-        blocking: 1,
-        advisory: 0,
-        verdict: "unresolved",
-        rationale: "the retry path is untested",
-        findings: [{ severity: "blocking", location: "src/retry.ts:20", note: "no backoff cap" }],
-      }),
-    );
-
-    const res = await get("reworky", feature);
-    expect(res.status).toBe(200);
-    const { report } = await res.json();
-    expect(report.score).toBe(4);
-    expect(report.findings).toEqual([
-      { severity: "blocking", location: "src/retry.ts:20", note: "no backoff cap" },
-    ]);
   });
 
   it("reopen: the ticket re-enters the next run, carrying the note in the implementer's prompt", async () => {
