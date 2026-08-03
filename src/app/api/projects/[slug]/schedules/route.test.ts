@@ -9,6 +9,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { makeTestDb, type TestDb } from "@/lib/db/testing";
 import * as schema from "@/lib/db/schema";
+import { nextRun } from "@/lib/jobs/cron";
 import type { Clock } from "@/lib/jobs/queue";
 import { Scheduler } from "@/lib/jobs/scheduler";
 import { seedDefaultSchedules } from "@/lib/schedules";
@@ -179,9 +180,9 @@ describe("schedules route", () => {
   });
 
   it("PATCH cron persists the new cadence and advances nextRunAt", async () => {
-    const before = scheduleRow("nightly-stringer");
-
+    const before = Date.now();
     const res = await PATCH(patchReq({ type: "nightly-stringer", cron: "*/30 * * * *" }), ctx("tmp"));
+    const after = Date.now();
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.created).toBe(false);
@@ -192,7 +193,13 @@ describe("schedules route", () => {
 
     const row = scheduleRow("nightly-stringer");
     expect(row.cron).toBe("*/30 * * * *");
-    expect(row.nextRunAt!.getTime()).not.toBe(before.nextRunAt!.getTime());
+    // Pin the fire time to what the NEW cadence computes, not merely "different from the seeded
+    // one": between 02:30 and 03:00 the seeded `0 3 * * *` and `*/30` share a next fire, so an
+    // inequality check passes or fails by time of day. The route stamps it off the real clock, so
+    // bracket by the instants either side of the call — a minute rollover mid-PATCH is then benign.
+    expect([nextRun("*/30 * * * *", before), nextRun("*/30 * * * *", after)]).toContain(
+      row.nextRunAt!.getTime(),
+    );
     expect(body.schedule.nextRunAt).toBe(Math.floor(row.nextRunAt!.getTime() / 1000));
   });
 
@@ -267,14 +274,22 @@ describe("schedules route", () => {
 
     await PATCH(patchReq({ type: "nightly-stringer", cron: "*/5 * * * *" }), ctx("tmp"));
     const row = scheduleRow("nightly-stringer");
+    // Prove the edit landed before driving the ticks: the seeded `0 3 * * *` also has exactly one
+    // fire time, so both tick assertions below would pass unchanged if the cron never moved.
+    expect(row.cron).toBe("*/5 * * * *");
 
-    clock.set(row.nextRunAt!.getTime() - 60_000);
+    const dueMs = row.nextRunAt!.getTime();
+    clock.set(dueMs - 60_000);
     await scheduler.tickOnce();
     expect(jobs().filter((j) => j.type === "nightly-stringer")).toHaveLength(0);
 
-    clock.set(row.nextRunAt!.getTime());
+    clock.set(dueMs);
     await scheduler.tickOnce();
     expect(jobs().filter((j) => j.type === "nightly-stringer")).toHaveLength(1);
+    // …and it re-armed on the new CADENCE — five minutes on, not the seeded cron's next 03:00.
+    expect(scheduleRow("nightly-stringer").nextRunAt!.getTime()).toBe(
+      nextRun("*/5 * * * *", dueMs),
+    );
   });
 
   it("PATCH with an unknown type 400s", async () => {

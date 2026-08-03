@@ -275,7 +275,17 @@ export function SettingsView({
       }
       toast.success(message);
     } catch (err) {
-      setAutomations((p) => ({ ...p, [id]: prev }));
+      // Undo only the fields this patch wrote. Restoring the whole `prev` snapshot would also roll
+      // back a concurrent patch for the same automation (toggle while a cadence save is in flight),
+      // leaving the row wrong until reload.
+      setAutomations((p) => ({
+        ...p,
+        [id]: {
+          ...p[id],
+          ...(patch.cron !== undefined ? { cron: prev.cron } : {}),
+          ...(patch.enabled !== undefined ? { enabled: prev.enabled } : {}),
+        },
+      }));
       toast.error(err instanceof Error ? err.message : `Failed to update ${id}`);
     }
   }

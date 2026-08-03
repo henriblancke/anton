@@ -26,7 +26,7 @@ export type CadencePresetId =
   | "weekly"
   | "custom";
 
-/** Which inputs a preset needs from the operator — the picker renders exactly these. */
+/** The parts a preset names — which values carry over when the operator switches between presets. */
 export type CadenceField = "minute" | "hour" | "weekday";
 
 /** The knobs a preset can read. Unused fields keep their default so switching presets is lossless. */

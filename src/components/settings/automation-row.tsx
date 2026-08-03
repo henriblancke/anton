@@ -19,6 +19,7 @@ import { formatExactTime } from "@/lib/time";
 import { cn } from "@/lib/utils";
 import { Toggle } from "@/components/atoms";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   Select,
   SelectContent,
@@ -191,17 +192,15 @@ export function AutomationRow({
       {editing && (
         <div className="flex flex-col gap-1.5 pl-4">
           <div className="flex items-center gap-2">
-            <input
+            <Input
               value={expr}
               onChange={(e) => setDraft(e.target.value)}
               aria-label={`${label} cron expression`}
+              // The primitive renders the invalid border/ring off aria-invalid.
               aria-invalid={error ? true : undefined}
               spellCheck={false}
               placeholder="*/15 * * * *"
-              className={cn(
-                "w-44 rounded-lg border border-border bg-background px-2.5 py-1 font-mono text-[12px] text-foreground outline-none focus:border-primary/60",
-                error && "border-risk-high/60",
-              )}
+              className="w-44 font-mono text-[12px]"
             />
             <Button
               size="sm"
