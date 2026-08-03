@@ -849,8 +849,9 @@ describe("JobRunner (live, in-memory db)", () => {
     expect((await getJob(tdb.db, "leasable"))?.status).toBe("done");
   });
 
-  it("aborts a job that exceeds its per-project timeout and retries it", async () => {
-    // Handler blocks until aborted; a 20ms timeout fires, aborts it → retryable 'timed out' error.
+  it("aborts a job that makes no progress for its per-project timeout and retries it", async () => {
+    // Handler blocks until aborted and never heartbeats; the 20ms budget fires, aborts it →
+    // retryable 'made no progress' error.
     const r = policyRunner(
       (ctx) =>
         new Promise<void>((_resolve, reject) => {
@@ -867,7 +868,33 @@ describe("JobRunner (live, in-memory db)", () => {
     const job = await getJob(tdb.db, id);
     expect(job?.status).toBe("queued"); // rescheduled (attempt 1 < maxAttempts)
     expect(job?.attempts).toBe(1);
-    expect(job?.lastError).toMatch(/timed out/);
+    expect(job?.lastError).toMatch(/made no progress/);
+  });
+
+  it("lets a heartbeating handler outlive the timeout — it bounds silence, not total runtime (anton-t1mo)", async () => {
+    // The point of the re-scope: a handler whose length is a function of its input (execute-epic
+    // walking N tickets) must not be guillotined for being long. It reports progress between units
+    // of work, and each heartbeat restarts the no-progress clock — so this handler runs several
+    // times its budget and still completes. Under a TOTAL wall clock it would abort at 20ms.
+    let finished = false;
+    const r = policyRunner(
+      async (ctx) => {
+        for (let i = 0; i < 5; i++) {
+          await new Promise((res) => setTimeout(res, 15));
+          await ctx.heartbeat(); // progress reported → clock restarts
+        }
+        finished = true;
+      },
+      () => policy({ timeoutMs: 20 }),
+    );
+    await seedProjects("A");
+    const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
+
+    await r.tickOnce();
+    await r.whenIdle();
+    expect(finished).toBe(true);
+    const job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("done");
   });
 
   it("parks after the project's retry budget (per-project maxAttempts overrides config)", async () => {
