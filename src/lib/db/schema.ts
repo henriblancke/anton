@@ -235,8 +235,14 @@ export const scanSummaries = sqliteTable(
     /** Collectors that died mid-scan: every one is a hole in the counts above. */
     collectorFailures: integer("collector_failures").notNull().default(0),
   },
-  // Serves "this project's last N scans" (and the prune) without a full scan.
-  (table) => [index("scan_summaries_project_idx").on(table.projectId, table.generatedAt)],
+  (table) => [
+    // Serves "this project's last N scans" (and the prune) without a full scan.
+    index("scan_summaries_project_idx").on(table.projectId, table.generatedAt),
+    // One point per scheduled pass, enforced: a retried job runs the handler again, and a second
+    // insert would chart a phantom scan of a baseline the first attempt already consumed. SQLite
+    // treats NULLs as distinct, so a summary written outside a job is unaffected.
+    uniqueIndex("scan_summaries_job_unique").on(table.jobId),
+  ],
 );
 
 /**

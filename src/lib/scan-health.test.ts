@@ -118,17 +118,71 @@ describe("the persisted series", () => {
     expect((await getLatestScanSummary(tdb.db, projectId))?.delta).toBeUndefined();
   });
 
+  it("does not compare the second scan to the baseline — unlike quantities, not a trend", async () => {
+    // The first scan has no `--delta` baseline, so stringer emits the whole repo: 100 outstanding
+    // signals followed by 1 newly arrived is NOT "-99, problems arriving more slowly".
+    await save(counts({ low: 100 }));
+    clock.advance(86_400_000);
+    const second = await save(counts({ low: 1 }));
+
+    expect(second.delta).toBeUndefined();
+    expect((await getLatestScanSummary(tdb.db, projectId))?.delta).toBeUndefined();
+  });
+
   it("stores each later scan's delta against the one before it", async () => {
+    await save(counts({ low: 9 })); // baseline — the second scan is the first comparable one
+    clock.advance(86_400_000);
     await save(counts({ critical: 1, low: 5 }));
     clock.advance(86_400_000);
-    const second = await save(counts({ critical: 0, low: 2 }));
+    const third = await save(counts({ critical: 0, low: 2 }));
 
-    expect(second.delta).toEqual({
+    expect(third.delta).toEqual({
       total: -4,
       bySeverity: { critical: -1, high: 0, medium: 0, low: -3 },
     });
     // Read back, not just returned: the chart reads rows, not the write's return value.
     expect((await getLatestScanSummary(tdb.db, projectId))?.delta?.total).toBe(-4);
+  });
+
+  it("records one point per job, however many attempts it took", async () => {
+    // The runner retries a failed job under the same id, and the retry rescans a baseline the first
+    // attempt already consumed — a second row would chart a phantom scan and skew the next delta.
+    const first = await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 7 }),
+    });
+    clock.advance(60_000);
+    const retry = await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: emptyScanCounts(),
+    });
+
+    expect(retry.id).toBe(first.id);
+    const all = await listScanSummaries(tdb.db, projectId, 100);
+    expect(all.length).toBe(1);
+    expect(all[0].counts.total).toBe(7);
+  });
+
+  it("lets a retry contribute the triage outcome its first attempt died before reporting", async () => {
+    await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 7 }),
+    });
+    const retry = await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 7 }),
+      triage: { created: 2, deduped: 4 },
+    });
+
+    expect(retry.triage).toEqual({ created: 2, deduped: 4 });
+    expect((await listScanSummaries(tdb.db, projectId, 100))[0].triage).toEqual({
+      created: 2,
+      deduped: 4,
+    });
   });
 
   it("records triage counts only when triage reported them", async () => {
@@ -142,6 +196,8 @@ describe("the persisted series", () => {
   });
 
   it("keeps a scan that found nothing — a clean pass is the point of the trend", async () => {
+    await save(counts({ low: 1 })); // baseline
+    clock.advance(1000);
     await save(counts({ low: 3 }));
     clock.advance(1000);
     const clean = await save(emptyScanCounts());
@@ -221,7 +277,7 @@ describe("summarizeScanLine", () => {
     expect(line).toContain("triage created 2, deduped 1");
   });
 
-  it("names a first scan as a first scan rather than showing a zero delta", () => {
+  it("names an uncomparable scan as such rather than showing a zero delta", () => {
     const line = summarizeScanLine({
       id: "x",
       projectId: "p",
@@ -229,6 +285,6 @@ describe("summarizeScanLine", () => {
       counts: emptyScanCounts(),
       collectorFailures: 0,
     });
-    expect(line).toContain("first scan — no delta");
+    expect(line).toContain("no comparable previous scan — no delta");
   });
 });

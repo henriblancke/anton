@@ -66,8 +66,9 @@ export interface ScanSummary {
   generatedAt: number;
   counts: ScanCounts;
   /**
-   * Against the previous scan. Absent on a project's FIRST scan — there is nothing to compare to,
-   * which is a different claim from "no change" and must not render as one.
+   * Against the previous scan. Absent until there is a COMPARABLE one — the first scan has nothing
+   * before it, and the second's predecessor is a baseline counting the whole repo rather than an
+   * arrival rate. Absent is "not comparable yet", a different claim from "no change".
    */
   delta?: ScanDelta;
   /**
@@ -168,6 +169,47 @@ export interface SaveScanSummaryInput {
 }
 
 /**
+ * The point a job already landed, if it landed one. One scheduled pass is ONE point on the trend
+ * however many attempts it took: the runner retries a failed job under the same job id with a fresh
+ * handler, and a retry rescans a baseline the first attempt already consumed — so a second insert
+ * would chart a phantom zero-signal scan and hand the next delta a baseline that never existed,
+ * distorting both the trend and the retention window.
+ */
+async function findScanSummaryByJob(
+  db: AntonDb,
+  projectId: string,
+  jobId: string,
+): Promise<ScanSummary | undefined> {
+  const rows = await db
+    .select()
+    .from(schema.scanSummaries)
+    .where(
+      and(eq(schema.scanSummaries.projectId, projectId), eq(schema.scanSummaries.jobId, jobId)),
+    )
+    .limit(1);
+  return rows[0] ? toSummary(rows[0]) : undefined;
+}
+
+/**
+ * A later attempt adds only what the first one died before knowing. The first attempt's counts are
+ * the ones measured against the baseline the pass began with, so they stand — but an attempt that
+ * finally got a triage report out of the session contributes it, rather than leaving the point
+ * claiming triage never reported.
+ */
+async function backfillTriage(
+  db: AntonDb,
+  existing: ScanSummary,
+  triage: TriageOutcome | undefined,
+): Promise<ScanSummary> {
+  if (!triage || existing.triage) return existing;
+  await db
+    .update(schema.scanSummaries)
+    .set({ beadsCreated: triage.created, beadsDeduped: triage.deduped })
+    .where(eq(schema.scanSummaries.id, existing.id));
+  return { ...existing, triage };
+}
+
+/**
  * Append this scan's summary and prune the project back to {@link SCAN_SUMMARY_RETENTION} rows.
  * The delta is computed HERE, against the row this one lands on top of, and stored — so a point
  * still names what it changed once the scan it was compared to has aged out of the window.
@@ -175,14 +217,26 @@ export interface SaveScanSummaryInput {
  * Every pass writes one, including a scan that found nothing: "scanned, clean" is the data point
  * that makes a falling trend readable, and skipping it would leave the chart claiming the last
  * noisy scan is still the state of the repo.
+ *
+ * ONE point per job, however many attempts it took — see {@link findScanSummaryByJob}.
  */
 export async function saveScanSummary(
   db: AntonDb,
   clock: Clock,
   input: SaveScanSummaryInput,
 ): Promise<ScanSummary> {
-  const previous = await getLatestScanSummary(db, input.projectId);
-  const delta = previous ? computeDelta(input.counts, previous.counts) : undefined;
+  if (input.jobId) {
+    const already = await findScanSummaryByJob(db, input.projectId, input.jobId);
+    if (already) return backfillTriage(db, already, input.triage);
+  }
+
+  // A project's FIRST scan has no `--delta` baseline, so stringer emits everything in the repo:
+  // that point is a standing total, not the arrival rate every later point measures. Subtracting it
+  // from the first genuinely incremental scan charts a collapse that never happened — a 100-signal
+  // baseline followed by one new signal would read "−99, problems arriving more slowly". So the
+  // trend starts comparing at the scan AFTER the baseline, where both sides are the same quantity.
+  const [previous, beforeThat] = await listScanSummaries(db, input.projectId, 2);
+  const delta = previous && beforeThat ? computeDelta(input.counts, previous.counts) : undefined;
   const summary: ScanSummary = {
     id: randomUUID(),
     projectId: input.projectId,
@@ -316,7 +370,7 @@ export interface ScanHealth {
   points: ScanHealthPoint[];
   /** The most recent scan; always the last of {@link points}. */
   latest: ScanHealthPoint;
-  /** What the latest scan changed. Absent on a project's first-ever scan. */
+  /** What the latest scan changed. Absent until a comparable predecessor exists (see ScanSummary). */
   delta?: ScanDelta;
   /** The latest scan's class split — what KIND of problems arrived, beside how many. */
   byClass: ClassCounts;
@@ -389,7 +443,7 @@ export function summarizeScanLine(summary: ScanSummary): string {
     .join(", ");
   const delta =
     summary.delta === undefined
-      ? "first scan — no delta"
+      ? "no comparable previous scan — no delta"
       : `${summary.delta.total >= 0 ? "+" : ""}${summary.delta.total} vs previous scan`;
   const triage = summary.triage
     ? `; triage created ${summary.triage.created}, deduped ${summary.triage.deduped}`

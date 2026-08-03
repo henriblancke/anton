@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX `scan_summaries_job_unique` ON `scan_summaries` (`job_id`);

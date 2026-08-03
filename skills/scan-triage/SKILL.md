@@ -65,9 +65,11 @@ the `<hash>` identifies the underlying issue, not the producer. So:
 ### 3.1 Severity → `risk:` and priority
 
 stringer's JSON carries no severity field, so anton derives one per signal — from the signal's
-`Priority` when a collector sets one, else its kind (a secret or a CVE is `critical` whatever
-emitted it), else its collector's default (`vuln` → critical, `dephealth`/`githygiene` → medium,
-`todos`/`deadcode`/`duplication` → low, an unknown collector → medium). That derivation is
+`Priority` when a collector sets one, else its kind, else its collector's default (`vuln` →
+critical, `dephealth`/`githygiene` → medium, `todos`/`deadcode`/`duplication` → low, an unknown
+collector → medium). A secret or a CVE is then FLOORED at `critical` whatever emitted it and
+whatever `Priority` it carried: a collector's priority is a queueing hint, not a security
+judgment, and it never demotes one of these. That derivation is
 `src/lib/scan-severity.ts` — the same one the per-scan health record counts by, so the trend on the
 board and the labels on these beads mean the same thing.
 

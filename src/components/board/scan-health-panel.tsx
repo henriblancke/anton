@@ -141,9 +141,10 @@ export function ScanHealthPanel({ health }: { health: ScanHealth | undefined }) 
       </span>
 
       {/* The headline number, with what it is made of one hover away. "new … since the previous scan"
-          is a claim only a scan that HAD a previous one can make: on a first pass `--delta` has no
-          baseline, so stringer emits everything it finds and the count is a standing total, not an
-          arrival rate. Saying "new since the previous scan" there names a comparison never made. */}
+          is a claim only a scan with a COMPARABLE predecessor can make: on a first pass `--delta` has
+          no baseline, so stringer emits everything it finds and the count is a standing total, not an
+          arrival rate. Where no delta was computed, the panel falls back to the weaker claim it can
+          stand behind rather than naming a comparison that was never made. */}
       <span className="text-xs text-muted-foreground" title={classSplit(byClass)}>
         <span className="font-mono text-foreground">{latest.total}</span>{" "}
         {delta === undefined ? (
@@ -194,12 +195,19 @@ export function ScanHealthPanel({ health }: { health: ScanHealth | undefined }) 
 
 /**
  * The move since the last scan. FEWER new signals is the good direction, so the tint follows health
- * rather than the sign of the number — and a first scan says so instead of showing a zero it hasn't
- * earned.
+ * rather than the sign of the number — and a scan with nothing comparable behind it says so instead
+ * of showing a zero it hasn't earned.
  */
 function DeltaChip({ delta }: { delta: number | undefined }) {
   if (delta === undefined) {
-    return <span className="text-xs text-subtle">first scan — no trend yet</span>;
+    return (
+      <span
+        className="text-xs text-subtle"
+        title="A trend needs two scans measuring the same thing. A project's first scan has no baseline, so it counts everything in the repo rather than what arrived since — the comparison starts one scan later."
+      >
+        no trend yet
+      </span>
+    );
   }
   if (delta === 0) return <MetaChip>no change</MetaChip>;
   const better = delta < 0;

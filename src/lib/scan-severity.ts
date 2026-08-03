@@ -97,14 +97,28 @@ const SEVERITY_BY_COLLECTOR: Record<string, ScanSeverity> = {
 const UNKNOWN_COLLECTOR_SEVERITY: ScanSeverity = "medium";
 
 /**
- * Kind/tag patterns that outrank the collector's default, in order. Deliberately narrow and
- * security-shaped: a signal that names a secret or a CVE is critical whatever emitted it, while a
- * generic word like "high" is NOT matched — `high-churn` is a churn signal, not a high-severity one.
+ * The severity a security-shaped signal cannot be scored BELOW, whatever else the scan file says.
+ * A committed secret or a CVE is critical wherever it came from, and a collector's generic
+ * `Priority` is a queueing hint rather than a security judgment — letting `Priority: 2` demote a
+ * leaked key to `medium` would understate it on the trend AND hand triage a `risk:low` bead, against
+ * what this module and the triage contract both promise.
+ *
+ * A floor, not an override: a signal already ranked worse (a P0 merge-conflict) keeps its rank.
+ * Deliberately narrow and security-shaped — a generic word like "high" is NOT matched, because
+ * `high-churn` is a churn signal, not a high-severity one.
  */
-const KIND_SEVERITY_RULES: [pattern: RegExp, severity: ScanSeverity][] = [
+const SECURITY_SEVERITY_FLOORS: [pattern: RegExp, severity: ScanSeverity][] = [
   [/secret|credential|password|private[-_]?key|api[-_]?key/i, "critical"],
   [/\bcve\b|vulnerab|osv-/i, "critical"],
   [/merge[-_]?conflict|conflict[-_]?marker/i, "high"],
+];
+
+/**
+ * Kind/tag patterns that refine the collector's default when nothing more specific ranked the
+ * signal. Not a floor: these describe how a dependency is aging, so a collector that priced one
+ * itself has the better number.
+ */
+const KIND_SEVERITY_RULES: [pattern: RegExp, severity: ScanSeverity][] = [
   [/deprecat|yanked|archived/i, "medium"],
 ];
 
@@ -143,11 +157,23 @@ export function classOfSignal(signal: ScanSignal): SignalClass {
   return CLASS_BY_COLLECTOR[collectorOf(signal)] ?? "other";
 }
 
-/**
- * How severe a signal is, resolved in falling order of authority: stringer's own severity if it
- * ever emits one, then its `Priority`, then what the kind/tags say, then the collector's default.
- */
-export function severityOfSignal(signal: ScanSignal): ScanSeverity {
+/** The worse of two readings — SCAN_SEVERITIES is ordered worst-first, so the lower index wins. */
+function worst(a: ScanSeverity, b: ScanSeverity): ScanSeverity {
+  return SCAN_SEVERITIES.indexOf(a) <= SCAN_SEVERITIES.indexOf(b) ? a : b;
+}
+
+function matchRule(
+  rules: [pattern: RegExp, severity: ScanSeverity][],
+  haystack: string,
+): ScanSeverity | undefined {
+  for (const [pattern, severity] of rules) {
+    if (pattern.test(haystack)) return severity;
+  }
+  return undefined;
+}
+
+/** Falling order of authority: stringer's own severity, its `Priority`, its kind, its collector. */
+function rankSignal(signal: ScanSignal, haystack: string): ScanSeverity {
   const explicit = firstString(signal.Severity, signal.severity);
   const named = explicit ? normalizeSeverity(explicit) : undefined;
   if (named) return named;
@@ -155,16 +181,26 @@ export function severityOfSignal(signal: ScanSignal): ScanSeverity {
   const fromPriority = severityFromPriority(signal.Priority ?? signal.priority);
   if (fromPriority) return fromPriority;
 
+  return (
+    matchRule(KIND_SEVERITY_RULES, haystack) ??
+    SEVERITY_BY_COLLECTOR[collectorOf(signal)] ??
+    UNKNOWN_COLLECTOR_SEVERITY
+  );
+}
+
+/**
+ * How severe a signal is: what the scan file's own ranking says, floored by
+ * {@link SECURITY_SEVERITY_FLOORS} so a secret or a CVE can never be recorded below its worth.
+ */
+export function severityOfSignal(signal: ScanSignal): ScanSeverity {
   const haystack = text(
     signal.Kind ?? signal.kind,
     ...(signal.Tags ?? signal.tags ?? []),
     collectorOf(signal),
   );
-  for (const [pattern, severity] of KIND_SEVERITY_RULES) {
-    if (pattern.test(haystack)) return severity;
-  }
-
-  return SEVERITY_BY_COLLECTOR[collectorOf(signal)] ?? UNKNOWN_COLLECTOR_SEVERITY;
+  const ranked = rankSignal(signal, haystack);
+  const floor = matchRule(SECURITY_SEVERITY_FLOORS, haystack);
+  return floor ? worst(ranked, floor) : ranked;
 }
 
 /** What a bead triaged from a signal of some severity must carry. */

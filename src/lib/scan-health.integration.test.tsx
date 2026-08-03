@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
 /**
- * End-to-end proof of anton-bz1w's acceptance: replay two consecutive scans through the REAL
+ * End-to-end proof of anton-bz1w's acceptance: replay three consecutive scans through the REAL
  * nightly-stringer handler + REAL runner (fake `stringer` writing a canned scan, fake `claude`
  * standing in for /scan-triage), then read the stored summaries back and RENDER the board panel off
  * them — the delta a founder actually sees has to survive the whole path, not just the unit that
- * computes it. Skipped without bd + git.
+ * computes it. Three, not two: the first pass is a baseline scan of the whole repo, so the first
+ * comparison a founder may be shown is the third point. Skipped without bd + git.
  */
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -37,6 +38,19 @@ function writeBin(dir: string, name: string, body: string): string {
   chmodSync(p, 0o755);
   return p;
 }
+
+/**
+ * Night one. A project's first scan has no `--delta` baseline, so stringer emits everything already
+ * in the repo: a standing total, not the arrival rate every later pass measures. Nothing may be
+ * subtracted from it.
+ */
+const BASELINE_SCAN = JSON.stringify({
+  signals: [
+    { Source: "todos", Kind: "todo", FilePath: "old.ts", Line: 1, Title: "TODO old" },
+    { Source: "todos", Kind: "todo", FilePath: "older.ts", Line: 4, Title: "TODO older" },
+  ],
+  metadata: {},
+});
 
 /** A day's worth of stringer output: one CVE and two TODOs — critical + low, security + debt. */
 const NOISY_SCAN = JSON.stringify({
@@ -144,43 +158,54 @@ process.stdin.on('end',()=>{
     bdRepo.cleanup();
   });
 
-  it("replays two scans into a stored, charted delta", async () => {
-    // Night one: three signals, one of them a CVE.
+  it("replays three scans into a stored, charted delta", async () => {
+    // Night one: the baseline pass — what was already in the repo.
+    process.env.FAKE_SCAN_JSON = BASELINE_SCAN;
+    expect((await getJob(tdb.db, await runScan()))?.status).toBe("done");
+
+    // Night two, a day later: three signals, one of them a CVE.
+    clock.advance(86_400_000);
     process.env.FAKE_SCAN_JSON = NOISY_SCAN;
     expect((await getJob(tdb.db, await runScan()))?.status).toBe("done");
 
-    // Night two, a day later: one TODO and no CVE.
+    // Night three: one TODO and no CVE.
     clock.advance(86_400_000);
     process.env.FAKE_SCAN_JSON = QUIETER_SCAN;
     expect((await getJob(tdb.db, await runScan()))?.status).toBe("done");
 
-    // 1. Both passes left a comparable record, newest first.
+    // 1. Every pass left a record, newest first.
     const summaries = await listScanSummaries(tdb.db, projectId);
-    expect(summaries.length).toBe(2);
-    const [second, first] = summaries;
+    expect(summaries.length).toBe(3);
+    const [third, second, first] = summaries;
 
-    expect(first.counts.total).toBe(3);
-    expect(first.counts.bySeverity).toEqual({ critical: 1, high: 0, medium: 0, low: 2 });
-    expect(first.counts.byClass.security).toBe(1);
-    expect(first.counts.byClass.debt).toBe(2);
     // Nothing preceded it, so it carries no delta — a first scan is not a scan with no change.
+    expect(first.counts.total).toBe(2);
     expect(first.delta).toBeUndefined();
-    // The triage session's own report line, parsed back off the health record.
-    expect(first.triage).toEqual({ created: 3, deduped: 1 });
     expect(first.jobId).toBeTruthy();
     expect(first.sessionId).toBeTruthy();
 
-    expect(second.counts.total).toBe(1);
-    expect(second.counts.bySeverity).toEqual({ critical: 0, high: 0, medium: 0, low: 1 });
-    expect(second.delta).toEqual({
+    expect(second.counts.total).toBe(3);
+    expect(second.counts.bySeverity).toEqual({ critical: 1, high: 0, medium: 0, low: 2 });
+    expect(second.counts.byClass.security).toBe(1);
+    expect(second.counts.byClass.debt).toBe(2);
+    // Its predecessor is the BASELINE — a standing total. Subtracting it would chart "+1, problems
+    // arriving faster" out of two quantities that were never the same measurement.
+    expect(second.delta).toBeUndefined();
+    // The triage session's own report line, parsed back off the health record.
+    expect(second.triage).toEqual({ created: 3, deduped: 1 });
+
+    // The first honest comparison: two incremental scans, one day apart.
+    expect(third.counts.total).toBe(1);
+    expect(third.counts.bySeverity).toEqual({ critical: 0, high: 0, medium: 0, low: 1 });
+    expect(third.delta).toEqual({
       total: -2,
       bySeverity: { critical: -1, high: 0, medium: 0, low: -1 },
     });
 
-    // 2. The board's view of the same two rows — oldest → newest, delta on the latest.
+    // 2. The board's view of the same rows — oldest → newest, delta on the latest.
     const health = scanHealth(summaries)!;
-    expect(health.points.map((p) => p.total)).toEqual([3, 1]);
-    expect(health.latest.id).toBe(second.id);
+    expect(health.points.map((p) => p.total)).toEqual([2, 3, 1]);
+    expect(health.latest.id).toBe(third.id);
     expect(health.delta?.total).toBe(-2);
 
     // 3. And what the founder actually reads: the charted delta, on the panel.

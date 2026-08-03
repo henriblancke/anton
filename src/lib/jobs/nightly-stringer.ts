@@ -98,8 +98,12 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
     /**
      * Land this pass's health record (anton-bz1w) — at most once, and never fatally. Best-effort
      * because the record is a monitor, not the work: an anton.db hiccup must not fail (or retry) a
-     * scan whose beads already landed. Idempotent because it is called on both the success paths and
-     * the failure path, and a pass is ONE point on the trend however it ended.
+     * scan whose beads already landed.
+     *
+     * The flag guards the two call sites in THIS attempt; a retry runs a fresh handler with the flag
+     * back to false, so the durable half of the guarantee is `saveScanSummary` keying on the job id
+     * (a retried scan finds a baseline the first attempt already consumed, and would otherwise chart
+     * a phantom zero-signal point). A pass is ONE point on the trend however many attempts it took.
      */
     let recorded = false;
     const recordHealth = async (counts: ScanCounts, opts: {

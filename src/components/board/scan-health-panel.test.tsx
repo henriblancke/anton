@@ -67,9 +67,9 @@ describe("ScanHealthPanel", () => {
     expect(screen.getByText(/clean scan/)).toBeTruthy();
   });
 
-  it("says a first scan has no trend rather than showing a zero delta", () => {
+  it("says there is no trend rather than showing a zero delta it hasn't earned", () => {
     render(<ScanHealthPanel health={health()} />);
-    expect(screen.getByText(/first scan — no trend yet/)).toBeTruthy();
+    expect(screen.getByText(/no trend yet/)).toBeTruthy();
   });
 
   it("reads a fall as the good direction and a rise as the bad one", () => {

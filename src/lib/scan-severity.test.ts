@@ -57,6 +57,31 @@ describe("severityOfSignal", () => {
     expect(severityOfSignal(signal({ Source: "github", Tags: ["cve"] }))).toBe("critical");
   });
 
+  it("promotes a secret or a CVE OVER a collector's own Priority", () => {
+    // `Priority` is a queueing hint, not a security judgment: a committed key carrying P2 must not
+    // be recorded as medium, or the trend understates it and triage files it `risk:low`.
+    expect(
+      severityOfSignal(signal({ Source: "githygiene", Kind: "committed-secret", Priority: 2 })),
+    ).toBe("critical");
+    expect(severityOfSignal(signal({ Source: "dephealth", Tags: ["CVE-2026-1"], Priority: 3 }))).toBe(
+      "critical",
+    );
+  });
+
+  it("floors rather than overrides — a signal already ranked worse keeps its rank", () => {
+    expect(
+      severityOfSignal(signal({ Source: "githygiene", Kind: "merge-conflict", Priority: 0 })),
+    ).toBe("critical");
+  });
+
+  it("lets a collector's Priority outrank the non-security kind rules", () => {
+    // "deprecated" describes how a dependency is aging; a collector that priced it P1 itself has
+    // the better number, so this rule stays a default rather than becoming a ceiling.
+    expect(severityOfSignal(signal({ Source: "dephealth", Kind: "deprecated-dep", Priority: 1 }))).toBe(
+      "high",
+    );
+  });
+
   it("does not promote on a generic word — `high-churn` is churn, not high severity", () => {
     expect(severityOfSignal(signal({ Source: "gitlog", Kind: "high-churn" }))).toBe("low");
   });
