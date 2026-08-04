@@ -81,9 +81,10 @@ export interface ScanSummary {
    *
    * It proves CONTIGUITY, and contiguity alone: a retry measuring from exactly this state scanned
    * the window that begins where this point's ends ({@link reconcileAttempt}), and so does the next
-   * nightly. Subtracting two points additionally requires this one's counts to be an arrival rate
-   * ({@link baselineScan} `=== false`) — a baseline scan leaves a baseline behind too, and nothing
-   * may be measured against ITS standing total.
+   * nightly. Subtracting two points — or folding a retry's window into one — additionally requires
+   * this one's counts to be an arrival rate ({@link baselineScan} `=== false`): a baseline scan
+   * leaves a baseline behind too, and nothing may be measured against, or added to, ITS standing
+   * total.
    */
   deltaState?: string;
   /**
@@ -269,7 +270,8 @@ async function findScanSummaryByJob(
  *   ABUT: fold its counts in, and the point measures the whole pass, start to finish. The stored
  *   delta widens with them ({@link extendDelta}) — the point it was measured against hasn't moved.
  *   Without that proof of contiguity there is no union to count: a retry that re-established the
- *   baseline emitted a standing total, which double-counts the retained signals.
+ *   baseline emitted a standing total, which double-counts the retained signals. The point's own
+ *   counts must be an arrival rate too ({@link ScanSummary.baselineScan} `=== false`) — see below.
  * - TRIAGE: an outcome covers the WINDOW it triaged, not the point. An attempt that consumed no
  *   window of its own reported on the retained signals, so it backfills a report the first attempt
  *   never got out. An attempt carrying a window of its own reported on THAT window: it joins the
@@ -283,23 +285,28 @@ async function findScanSummaryByJob(
  *   the repo, the same rule {@link saveScanSummary} applies across adjacent scans.
  * - THE BASELINE IT LEFT: the retry scanned again, so stringer's `--delta` state has advanced past
  *   the one the first attempt published, and the stale value is a claim nothing holds. What replaces
- *   it depends on whether the window folded. FOLDED, the point's counts run right up to the state the
- *   retry left, so the point publishes that state and the next nightly measures an honest delta from
+ *   it depends on whether the windows ABUT. They do, and the state the retry left is where the next
+ *   window honestly starts: the point publishes it and the next nightly measures an honest delta from
  *   it — where keeping the stale one would leave that scan unable to prove comparability, suppressing
- *   a delta that was there to be had. NOT FOLDED, the retry consumed a window this point counts
+ *   a delta that was there to be had. They don't, and the retry consumed a window this point counts
  *   nothing of: publishing where that window ended would sell the next scan a contiguity proof across
  *   the hole, and it would difference its arrivals against counts from an unrelated window — a trend
  *   move nothing in the codebase caused. So the point publishes NO baseline at all. Absent is
  *   "nothing after this point can be proven contiguous", which is exactly true of a point with a gap
  *   behind it.
  *
- * A point whose counts are a whole-repo STANDING TOTAL folds like any other: the arrivals since the
- * baseline it established, added to the total as of that baseline, are the standing total at the
- * retry's end. It stays flagged as one, so the chart and the next scan go on treating it as
- * incomparable — the fold accounts for the retry's window without inventing a quantity to subtract.
- * (Refusing to fold there stranded the window entirely: a baseline attempt that dies is followed by
- * a retry whose delta window is a real day's arrivals, consumed from stringer's state and reportable
- * by nobody after.)
+ * A point whose counts are a whole-repo STANDING TOTAL never folds, however cleanly the windows abut.
+ * `--delta` reports what stringer newly OBSERVED, never what was REMOVED, so a standing total plus
+ * the arrivals since it is an upper bound rather than the repo at the retry's end: 100 outstanding,
+ * 20 fixed and 3 arrived is 83 in the repo, and 103 is a quantity nobody measured. The retained total
+ * IS a measurement — the repo as that scan saw it — so it stands, and the retry's window goes
+ * uncounted. The hole costs the trend nothing it could have used: a standing total is charted apart
+ * from the arrival columns and licenses no subtraction, so those arrivals were never going to move a
+ * trend line, where inflating the column misstates the one thing it does say. Folding is the same
+ * class of claim as subtracting and takes the same proof — `baselineScan === false`, an arrival rate,
+ * where two abutting windows' arrivals sum EXACTLY. (A standing total still abuts for the correction
+ * above: the state it hands on can be consumed into no wrong number, since both the delta and the
+ * fold demand that same proof of it.)
  *
  * Both the fold and the correction need the point to name where its own window ENDED
  * ({@link ScanSummary.deltaState}). Absent, nothing can be proven contiguous — and advancing to the
@@ -315,29 +322,32 @@ async function reconcileAttempt(
   // baseline anton could not identify, which clears the point's rather than leaving a stale claim.
   const rescanned = input.deltaState !== undefined && existing.deltaState !== undefined;
   // Exactly the state this point ended at: proof the retry's window starts where the point's ends,
-  // and the only case where their counts are one measurement.
+  // and the only case where their counts can be one measurement.
   const abuts =
     input.deltaState?.before !== undefined && input.deltaState.before === existing.deltaState;
-  // Publishable only behind a fold — a point may only name a baseline its own counts run up to. A
-  // non-abutting retry leaves a window nothing here counts, so the point names none: see above.
+  // Contiguity alone is not enough: only an ARRIVAL RATE may absorb a later window's arrivals, since
+  // `--delta` never reports what was fixed and a standing total would inflate instead. See above.
+  const folds = abuts && existing.baselineScan === false;
+  // Publishable only behind a contiguous retry — a non-abutting one leaves a window nothing here
+  // counts, so the point names no baseline: see above.
   const left = rescanned ? (abuts ? (input.deltaState?.after ?? null) : null) : undefined;
   const advanced = left !== undefined && left !== existing.deltaState;
-  const counts = abuts ? addCounts(existing.counts, input.counts) : existing.counts;
+  const counts = folds ? addCounts(existing.counts, input.counts) : existing.counts;
   const grew = counts.total !== existing.counts.total;
   // Only a folded window is part of this point's measurement, so only its outages are holes in it.
   const collectorFailures =
-    existing.collectorFailures + (abuts ? (input.collectorFailures ?? 0) : 0);
+    existing.collectorFailures + (folds ? (input.collectorFailures ?? 0) : 0);
   const failuresGrew = collectorFailures !== existing.collectorFailures;
 
   // A scan window of its own is what makes this attempt's report someone else's — see above.
   const backfill = input.deltaState === undefined && !existing.triage ? input.triage : undefined;
   const retained = existing.triage ?? backfill;
-  const folded = abuts ? input.triage : undefined;
+  const folded = folds ? input.triage : undefined;
   // Every window the point counts needs its own report, or the point has none: an empty window is
   // covered by nobody having triaged it, since there was nothing there to triage.
   const covered =
     (retained !== undefined || existing.counts.total === 0) &&
-    (!abuts || folded !== undefined || input.counts.total === 0);
+    (!folds || folded !== undefined || input.counts.total === 0);
   const triage = covered ? addTriage(retained, folded) : undefined;
   const triageChanged = !sameTriage(triage, existing.triage);
   if (!triageChanged && !advanced && !grew && !failuresGrew) return existing;

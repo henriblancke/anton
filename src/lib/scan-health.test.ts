@@ -658,12 +658,13 @@ describe("the persisted series", () => {
     expect(next.delta).toBeUndefined();
   });
 
-  it("folds a retry's window into a whole-repo point instead of stranding it", async () => {
-    // The first attempt ESTABLISHED the baseline (100 outstanding) and died before triage. A retry
-    // after a quota backoff measures a real day's arrivals from exactly that baseline: those signals
-    // are consumed from stringer's state and no later scan can report them. A standing total plus
-    // the arrivals since it is the standing total at the retry's end — one honest point, still whole
-    // repo, still nothing to subtract from.
+  it("never folds a retry's arrivals into a whole-repo point — that total is not a sum", async () => {
+    // The first attempt ESTABLISHED the baseline (100 outstanding) and died before triage; the retry
+    // measures 3 arrivals from exactly that baseline. `--delta` reports what stringer newly OBSERVED
+    // and never what was FIXED, so 103 would be a repo state nobody measured — 20 fixes in between
+    // make the truth 83. The retained 100 is a real measurement, so it stands, and the retry's window
+    // is left uncounted: nothing may ever be subtracted from a standing total, so those arrivals were
+    // never going to move a trend line anyway.
     const first = await saveScanSummary(tdb.db, clock, {
       projectId,
       jobId: "job-1",
@@ -682,20 +683,51 @@ describe("the persisted series", () => {
       triage: { created: 2, deduped: 0 },
     });
 
-    expect(retry.counts.total).toBe(103);
-    expect(retry.counts.bySeverity).toEqual({ critical: 1, high: 0, medium: 0, low: 102 });
-    expect(retry.collectorFailures).toBe(1);
+    expect(retry.counts.total).toBe(100);
+    expect(retry.counts.bySeverity).toEqual({ critical: 0, high: 0, medium: 0, low: 100 });
+    // The retry's window is no part of this point, so neither its outage nor its report is either.
+    expect(retry.collectorFailures).toBe(0);
+    expect(retry.triage).toBeUndefined();
+    // The pass still left b2 behind, and naming it can mislead nobody: both the delta and the fold
+    // demand an arrival rate of the point they read it off.
     expect(retry.deltaState).toBe("b2");
     expect(retry.baselineScan).toBe(true);
-    // The retry reported on its 3 signals only; the 100 it inherited were never triaged.
-    expect(retry.triage).toBeUndefined();
 
     // Read back, not just returned — the chart reads rows, and the pass is still one row.
     const rows = await listScanSummaries(tdb.db, projectId, 100);
     expect(rows.length).toBe(1);
-    expect(rows[0].counts.total).toBe(103);
+    expect(rows[0].counts.total).toBe(100);
+    expect(rows[0].collectorFailures).toBe(0);
     expect(rows[0].deltaState).toBe("b2");
     expect(rows[0].baselineScan).toBe(true);
+
+    // And the next nightly still measures its own window against nothing — a standing total is not
+    // an arrival rate whatever happened to the pass that produced it.
+    clock.advance(86_400_000);
+    const next = await save(counts({ low: 4 }), { deltaState: since("b2", "b3") });
+    expect(next.delta).toBeUndefined();
+  });
+
+  it("refuses to fold into a point whose basis anton never identified", async () => {
+    // stringer's state was unreadable going in, so what the first attempt counted — arrivals or the
+    // whole repo — is unknown, and adding to a standing total is the error that cannot be undone.
+    // Folding takes the same proof as subtracting: an observed arrival rate, not an absent flag.
+    await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 5 }),
+      deltaState: { after: "b1" },
+    });
+    const retry = await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 2 }),
+      deltaState: since("b1", "b2"),
+    });
+
+    expect(retry.baselineScan).toBeUndefined();
+    expect(retry.counts.total).toBe(5);
+    expect((await listScanSummaries(tdb.db, projectId))[0].counts.total).toBe(5);
   });
 
   it("reads a half-written triage row as unreported, never as a zero someone claimed", async () => {
