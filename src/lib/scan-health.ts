@@ -172,6 +172,29 @@ export function parseTriageOutcome(text: string | undefined): TriageOutcome | un
   return { created: Number(created[1]), deduped: Number(deduped[1]) };
 }
 
+/** Two abutting scan windows as one — what a single scan over their union would have counted. */
+function addCounts(a: ScanCounts, b: ScanCounts): ScanCounts {
+  const bySeverity = emptySeverityCounts();
+  for (const severity of SCAN_SEVERITIES) {
+    bySeverity[severity] = a.bySeverity[severity] + b.bySeverity[severity];
+  }
+  const byClass = emptyClassCounts();
+  for (const cls of SIGNAL_CLASSES) byClass[cls] = a.byClass[cls] + b.byClass[cls];
+  return { total: a.total + b.total, bySeverity, byClass };
+}
+
+/**
+ * A stored delta carried onto counts that just grew: it was `counts - previous`, and the previous
+ * point hasn't moved, so the delta over the widened window is `delta + added` — no re-read needed.
+ */
+function extendDelta(delta: ScanDelta, added: ScanCounts): ScanDelta {
+  const bySeverity = emptySeverityCounts();
+  for (const severity of SCAN_SEVERITIES) {
+    bySeverity[severity] = delta.bySeverity[severity] + added.bySeverity[severity];
+  }
+  return { total: delta.total + added.total, bySeverity };
+}
+
 /** This scan minus the previous one, per severity and in total. */
 export function computeDelta(counts: ScanCounts, previous: ScanCounts): ScanDelta {
   const bySeverity = emptySeverityCounts();
@@ -215,24 +238,32 @@ async function findScanSummaryByJob(
 }
 
 /**
- * A later attempt adds only what the first one died before knowing, and corrects the one thing it
- * invalidated. The first attempt's counts are the ones measured against the baseline the pass began
- * with, so they stand — but two facts about the point move:
+ * A later attempt adds only what the first one died before knowing, and corrects what it
+ * invalidated. Three facts about the point move:
  *
+ * - THE WINDOW IT MEASURED: a retry that ran stringer again consumed a window of its own, and those
+ *   signals are gone from stringer's baseline — no later scan will ever report them. Dropping them
+ *   would leave a hole in the series exactly where a pass was slow (a long quota backoff is where
+ *   the retry's window is most likely to be a real day's arrivals, not an empty re-check). So when
+ *   the retry measured arrivals since exactly the baseline this point publishes, the two windows
+ *   ABUT: fold its counts in, and the point measures the whole pass, start to finish. The stored
+ *   delta widens with them ({@link extendDelta}) — the point it was measured against hasn't moved.
+ *   Without that proof of contiguity there is no union to count: a retry that re-established the
+ *   baseline emitted a standing total (which double-counts the retained signals), and a point
+ *   holding a standing total of its own never published a baseline to abut in the first place.
  * - TRIAGE: an attempt that finally got a report out of the session contributes it — but only one
- *   that triaged THESE signals. An attempt carrying a scan window of its own rescanned, against a
- *   baseline this point already consumed, so whatever it reported covers a different set of signals:
- *   pinning it here would show seven retained signals triaged into the two beads a later window's
- *   two signals produced. That attempt's outcome is dropped and the point stays "not reported",
- *   which is the honest claim — until something replays the retained scan, nobody triaged it.
+ *   that triaged THESE signals. An attempt carrying a scan window of its own rescanned, so whatever
+ *   it reported covers only that later window: pinning it here would show a point's nine folded
+ *   signals triaged into the two beads its last two produced. That outcome is dropped and the point
+ *   stays "not reported", which is the honest claim — nobody triaged the rest.
  * - THE BASELINE IT LEFT: the retry scanned again, so stringer's `--delta` state has advanced past
  *   the one the first attempt published. Keeping the stale value would leave the next scan measuring
  *   from a baseline nothing holds, so it could never prove comparability and an honest delta would be
- *   suppressed. The point keeps its counts and publishes the baseline the pass ULTIMATELY left.
+ *   suppressed. The point publishes the baseline the pass ULTIMATELY left.
  *
- * Only for a point that published a baseline at all: absent means the first attempt's counts are a
- * standing total (or of unidentified basis), and nothing may ever be measured against those — the
- * retry's baseline must not create a comparison the counts can't support.
+ * The last two only for a point that published a baseline at all: absent means the first attempt's
+ * counts are a standing total (or of unidentified basis), and nothing may ever be measured against
+ * those — the retry's baseline must not create a comparison the counts can't support.
  */
 async function reconcileAttempt(
   db: AntonDb,
@@ -246,17 +277,36 @@ async function reconcileAttempt(
   const rescanned = input.deltaState !== undefined && existing.deltaState !== undefined;
   const left = rescanned ? (input.deltaState?.after ?? null) : undefined;
   const advanced = left !== undefined && left !== existing.deltaState;
-  if (!triage && !advanced) return existing;
+  // Exactly the baseline this point publishes: proof the retry's window starts where the point's
+  // ends, and the only case where their counts are one measurement.
+  const abuts = input.deltaState?.before !== undefined && input.deltaState.before === existing.deltaState;
+  const counts = abuts ? addCounts(existing.counts, input.counts) : existing.counts;
+  const grew = counts.total !== existing.counts.total;
+  if (!triage && !advanced && !grew) return existing;
 
+  const delta = grew && existing.delta ? extendDelta(existing.delta, input.counts) : undefined;
   await db
     .update(schema.scanSummaries)
     .set({
       ...(triage ? { beadsCreated: triage.created, beadsDeduped: triage.deduped } : {}),
       ...(advanced ? { deltaState: left } : {}),
+      ...(grew
+        ? {
+            totalSignals: counts.total,
+            bySeverityJson: JSON.stringify(counts.bySeverity),
+            byClassJson: JSON.stringify(counts.byClass),
+            ...(delta ? { deltaJson: JSON.stringify(delta) } : {}),
+          }
+        : {}),
     })
     .where(eq(schema.scanSummaries.id, existing.id));
 
-  const reconciled: ScanSummary = { ...existing, ...(triage ? { triage } : {}) };
+  const reconciled: ScanSummary = {
+    ...existing,
+    counts,
+    ...(delta ? { delta } : {}),
+    ...(triage ? { triage } : {}),
+  };
   if (advanced) {
     if (left === null) delete reconciled.deltaState;
     else reconciled.deltaState = left;
@@ -531,20 +581,22 @@ export const NO_SCAN_HEALTH = "none";
 
 /**
  * The newest row's identity for the board's refresh token. The id alone is not enough: a retried job
- * backfills triage counts INTO the existing row ({@link reconcileAttempt}), so a token built from the
- * id would keep matching and a board polling between the two writes would never show the
- * created/deduped figures. The other value a retry rewrites — the baseline the point left — is
- * bookkeeping the board never renders, so stamping the one visible mutable pair keeps the poll
- * 304-friendly while still moving when there is something new to render.
+ * rewrites the existing row ({@link reconcileAttempt}) — backfilling triage counts, and folding a
+ * contiguous retry's signals into the point's own — so a token built from the id would keep matching
+ * and a board polling between the two writes would never show either. The total stands in for the
+ * whole fold: counts only ever grow by it, and a fold that added nothing changed no severity or
+ * class either. The remaining value a retry rewrites — the baseline the point left — is bookkeeping
+ * the board never renders, so stamping the visible mutable fields keeps the poll 304-friendly while
+ * still moving when there is something new to render.
  */
-function scanVersion(id: string, triage: TriageOutcome | undefined): string {
-  return triage ? `${id}:${triage.created}:${triage.deduped}` : id;
+function scanVersion(id: string, total: number, triage: TriageOutcome | undefined): string {
+  return `${id}:${total}${triage ? `:${triage.created}:${triage.deduped}` : ""}`;
 }
 
 /** The series' identity for the board's refresh token. */
 export function scanHealthVersion(health: ScanHealth | undefined): string {
   const latest = health?.latest;
-  return latest ? scanVersion(latest.id, latest.triage) : NO_SCAN_HEALTH;
+  return latest ? scanVersion(latest.id, latest.total, latest.triage) : NO_SCAN_HEALTH;
 }
 
 /** The version without paying to read the whole window — one row, no blob parse. */
@@ -552,6 +604,7 @@ export async function latestScanHealthVersion(projectId: string): Promise<string
   const rows = await getDb()
     .select({
       id: schema.scanSummaries.id,
+      totalSignals: schema.scanSummaries.totalSignals,
       beadsCreated: schema.scanSummaries.beadsCreated,
       beadsDeduped: schema.scanSummaries.beadsDeduped,
     })
@@ -560,7 +613,7 @@ export async function latestScanHealthVersion(projectId: string): Promise<string
     .orderBy(desc(schema.scanSummaries.generatedAt), NEWEST_FIRST)
     .limit(1);
   const row = rows[0];
-  return row ? scanVersion(row.id, rowTriage(row)) : NO_SCAN_HEALTH;
+  return row ? scanVersion(row.id, row.totalSignals, rowTriage(row)) : NO_SCAN_HEALTH;
 }
 
 /** One-line summary for the job log: what this scan found, and how it moved. */
