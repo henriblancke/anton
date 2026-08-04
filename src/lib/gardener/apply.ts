@@ -52,6 +52,7 @@ import {
   fingerprintLabelOf,
   isProposalBead,
   proposalPlanOf,
+  type GardenerDetectionKind,
   type GardenerPlan,
 } from "./detections";
 
@@ -382,14 +383,12 @@ function planRetire(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): App
     const ownerClaimed = claimedSinceFiling(owner, at, doing, CLAIM_COST.ticketSet);
     if (ownerClaimed) return { status: "refuse", reason: ownerClaimed };
   }
-  // The premise `detectStale` filed on is that NOTHING has touched this bead (retire.ts), and that
-  // premise is the one thing a fresh board read alone cannot confirm — silence is a claim about the
-  // moment the patrol looked. Re-confirmed against the filing stamp so approving a months-old ask
-  // cannot park work somebody has since picked back up.
-  if (plan.kind === "stale") {
-    const active = staleTouched(subject, at);
-    if (active) return { status: "refuse", reason: active };
-  }
+  // Every retirement rests on a claim about the subject AS THE PATROL FOUND IT (retire.ts), and that
+  // is the one thing a fresh board read cannot confirm: it shows the bead as it IS, never as it was
+  // edited. Re-confirmed against the filing stamp so approving a months-old ask cannot settle a bead
+  // that has since been written out from under its own evidence.
+  const touched = premiseTouched(plan, subject, at);
+  if (touched) return { status: "refuse", reason: touched };
   // Settling a bead that still has open work under it strands that work: the children stay in the
   // ready set with a parent no run will ever reach — the unreachable state `detectContainerOrphans`
   // exists to flag, arrived at by approving a proposal. Only the SETTLING verbs are barred; `defer`
@@ -530,21 +529,64 @@ function reparentPremiseGone(
   return `${subject.id} now rides board card ${card} — it was given a home since this proposal was filed, so moving it under ${plan.target} would overwrite that newer decision`;
 }
 
+/** What a retirement's evidence says the subject still IS, and what settling it anyway gets wrong. */
+interface RetirePremise {
+  /** The bead the evidence describes — read as "still …". */
+  still: string;
+  /** The harm of retiring a bead that is no longer it — read as "and …". */
+  harm: string;
+}
+
 /**
- * Why this bead is no longer the stale one the proposal describes, or undefined.
+ * What each detection claims about the subject AS THE PATROL FOUND IT — the one premise a plan cannot
+ * restate, because it is a fact about a moment rather than about the board now. Every kind is listed
+ * so adding one without deciding whether an edit falsifies it is a type error; the three re-parent and
+ * link kinds have no such premise, because both re-derive their whole claim from the fresh board.
  *
- * `detectStale` measured SILENCE (retire.ts), and silence is the one premise a plan cannot restate:
- * it is a fact about the moment the patrol looked. Confirmed against that moment rather than by
- * re-deriving the day threshold, because "has anyone touched it since we asked" is the question the
- * approver's evidence actually rests on — a bead nobody wrote to has only grown staler, while one
- * edited, re-prioritised or picked back up is simply no longer the bead the ask describes.
+ * All three retirements are fenced, not just `stale`: each measured something about the bead's
+ * CONTENTS that an edit since the filing can invalidate — silence for `stale`, a match against a
+ * closed twin for `superseded`, a match against the commit that delivered it for `shipped-orphan`.
+ * A commit is immutable, but the bead it shipped is not: work added after it landed would be settled
+ * as delivered. Refusing is loud and a human re-decides; settling a rescoped bead loses that work
+ * silently.
  */
-function staleTouched(subject: Bead, at: ApplyMoment): string | undefined {
+const RETIRE_PREMISE: Record<GardenerDetectionKind, RetirePremise | undefined> = {
+  "container-orphan": undefined,
+  "parentless-cluster": undefined,
+  "implied-order": undefined,
+  stale: {
+    still: "the untouched bead the ask describes",
+    harm: "deferring it now would park work somebody has since picked back up",
+  },
+  superseded: {
+    still: "the bead whose contents matched the twin this supersede points at",
+    harm: "retiring it against that twin now would settle work that may have moved past it",
+  },
+  "shipped-orphan": {
+    still: "the bead the commit behind this ask shipped",
+    harm: "closing it as shipped now would record a landing for work that may have been rescoped since",
+  },
+};
+
+/**
+ * Why this bead is no longer the one its retirement proposal describes, or undefined.
+ *
+ * Confirmed against the moment the patrol looked rather than by re-deriving the detection, because
+ * "has anyone touched it since we asked" is the question the approver's evidence actually rests on —
+ * and it is the only half of that evidence a board read can answer at all.
+ */
+function premiseTouched(
+  plan: GardenerPlan,
+  subject: Bead,
+  at: ApplyMoment,
+): string | undefined {
+  const premise = RETIRE_PREMISE[plan.kind];
+  if (!premise) return undefined;
   const since = writtenSinceFiling(subject, at);
   if (since === false) return undefined;
   return since === undefined
-    ? `${subject.id} carries no write stamp this proposal's filing can be ordered against, so nothing confirms it is still the untouched bead the ask describes`
-    : `${subject.id} has been written to since this proposal was filed — it is no longer the untouched bead the ask describes, and deferring it now would park work somebody has picked back up`;
+    ? `${subject.id} carries no write stamp this proposal's filing can be ordered against, so nothing confirms it is still ${premise.still}`
+    : `${subject.id} has been written to since this proposal was filed — it is no longer ${premise.still}, and ${premise.harm}`;
 }
 
 /** Why a proposal could not be applied — mapped to a status by the route, never swallowed. */
@@ -810,6 +852,9 @@ const DOING: Record<ApplyStep["verb"], string> = {
 /** The verbs that SETTLE the subject — the ones that would strand whatever still hangs under it. */
 const SETTLING: ReadonlySet<ApplyStep["verb"]> = new Set(["close", "supersede"]);
 
+/** The verbs that take the subject OUT of whatever run's ticket set it rides. */
+const RETIRING: ReadonlySet<ApplyStep["verb"]> = new Set(["close", "supersede", "defer"]);
+
 /**
  * The bead a step points AT rather than writes to: a re-parent's new home, a link's blocker, a
  * supersede's survivor. The move's correctness rests on it as surely as on the subject — attaching
@@ -865,11 +910,13 @@ function ownerOf(step: ApplyStep): TicketOwner["owner"] {
  * lands first and the run's own post-lease re-confirmation sees its ticket set move (execute-epic
  * step 1c) and retries — rather than aborting mid-flight on a bead the board no longer holds.
  *
- * Two topology questions are re-asked under the locks rather than left with the snapshot: whether a
- * bead about to be SETTLED still has open work under it (see {@link assertNothingStranded}), and
- * whether a re-parent's home is still a BOARD CARD (see {@link assertHomeIsCard}). Both earn their
- * board read the same way — the write that flips the answer is itself a locked write on a bead this
- * step holds. Attaching work under a bead is a re-parent, which takes that bead's lock as its home;
+ * Three topology questions are re-asked under the locks rather than left with the snapshot: whether
+ * the subject still rides the TICKET SET the step captured (see {@link assertOwnerUnchanged}),
+ * whether a bead about to be SETTLED still has open work under it (see
+ * {@link assertNothingStranded}), and whether a re-parent's home is still a BOARD CARD (see
+ * {@link assertHomeIsCard}). All three earn their board read the same way — the write that flips the
+ * answer is itself a locked write on a bead this step holds. Attaching work under a bead, and moving
+ * a bead onto another card, are both re-parents, which take those beads' locks as subject and home;
  * and the one home that can STOP being a card is a legacy epic, which stops the moment a feature
  * lands under it — that same locked write. So the two approvals genuinely order against each other.
  * The rest of the board-wide topology stays with the snapshot — whether the edge closes a cycle —
@@ -894,11 +941,64 @@ async function applyStep(repo: string, step: ApplyStep): Promise<void> {
       const started = ownerStarted(step, owner, live, Date.now());
       if (started) throw new SubjectMovedError(started);
     }
-    if (SETTLING.has(step.verb)) await assertNothingStranded(repo, step.id);
-    if (step.verb === "reparent") await assertHomeIsCard(repo, step.parent);
+    if (RETIRING.has(step.verb)) {
+      const board = await lockedBoard(repo, `before retiring ${step.id}`);
+      assertOwnerUnchanged(step, board);
+      if (SETTLING.has(step.verb)) assertNothingStranded(step.id, board);
+    }
+    if (step.verb === "reparent") {
+      const doing = `before re-parenting under ${step.parent}`;
+      assertHomeIsCard(step.parent, await lockedBoard(repo, doing));
+    }
     await runStep(repo, step);
   });
 }
+
+/**
+ * A fresh board for the topology re-checks, indexed the way both halves of the loop read it — or a
+ * refusal naming what the read was needed for. Same rule as `reread`'s: a board we could not read
+ * says nothing, so the step refuses and nothing is written.
+ */
+async function lockedBoard(repo: string, doing: string): Promise<BoardIndex> {
+  try {
+    return indexBoard(await readWholeBoard(repo));
+  } catch (e) {
+    throw new SubjectMovedError(
+      `the board could not be re-read ${doing} (${messageOf(e)}) — nothing was written`,
+    );
+  }
+}
+
+/**
+ * Refuse a retirement whose subject has changed hands since the decision, judged from a board read
+ * taken INSIDE the subject's write lock.
+ *
+ * {@link ownerStarted} re-reads the owner the STEP captured and asks whether a run has started on it.
+ * Neither it nor {@link subjectMoved} — which compares parents for a re-parent alone — can see the
+ * other half: a re-parent approval landing in this window moves the subject under a DIFFERENT run
+ * target, one this step holds no lock on and never re-reads, so retiring it here takes a ticket out
+ * of a live run the decision never looked at, and that run aborts when its claim reaches the bead.
+ * Re-derived through the same {@link ticketOwnerOf} the decision used, so the write cannot hold
+ * ownership to a different bar than `planRetire` held the snapshot to.
+ *
+ * Refused on the IDENTITY change alone rather than on the newcomer's liveness: nothing locks the new
+ * owner, so any liveness read of it would be racing the very claim this serialization exists to
+ * order against — while "the subject no longer rides the set this proposal was decided against" is
+ * settled by the read whose lock we do hold.
+ */
+function assertOwnerUnchanged(step: ApplyStep, board: BoardIndex): void {
+  const subject = board.byId.get(step.id);
+  if (!subject) throw new SubjectMovedError(missing(step.id));
+  const now = ticketOwnerOf(board, subject)?.id;
+  const was = ownerOf(step)?.id;
+  if (now === was) return;
+  throw new SubjectMovedError(
+    `${step.id} now rides ${ticketSet(now)} rather than ${ticketSet(was)} — the run target it hangs under changed since this proposal was decided, so ${retiringTicket(step.id)} would act on a ticket set this approval never looked at`,
+  );
+}
+
+/** A run target as an ownership refusal names it — absent means the subject rides no ticket set. */
+const ticketSet = (id: string | undefined): string => (id ? `${id}'s ticket set` : "no ticket set");
 
 /**
  * Refuse to settle a bead that still has open work beneath it, judged from a board read taken INSIDE
@@ -912,17 +1012,8 @@ async function applyStep(repo: string, step: ApplyStep): Promise<void> {
  * re-parent's own home re-check refuses. Without it, both pass against snapshots taken before either
  * wrote, and the newly attached ticket is left beneath a card no run will ever reach.
  */
-async function assertNothingStranded(repo: string, id: string): Promise<void> {
-  let board: Bead[];
-  try {
-    board = await readWholeBoard(repo);
-  } catch (e) {
-    // Same call as `reread`'s: a board we could not read says nothing, so the step refuses.
-    throw new SubjectMovedError(
-      `the board could not be re-read before settling ${id} (${messageOf(e)}) — nothing was written`,
-    );
-  }
-  const open = indexBoard(board).openDescendants(id);
+function assertNothingStranded(id: string, board: BoardIndex): void {
+  const open = board.openDescendants(id);
   if (open.length > 0) {
     throw new SubjectMovedError(
       `${id} has open work under it (${namesSome(open.map((b) => b.id))}) since this proposal was filed — settling it would strand that work beneath a card nothing will run`,
@@ -942,17 +1033,8 @@ async function assertNothingStranded(repo: string, id: string): Promise<void> {
  * taken before either wrote, and this step attaches its subject directly to what is now a container
  * epic — work riding no card and reachable by no run, which is the state the proposal exists to fix.
  */
-async function assertHomeIsCard(repo: string, parentId: string): Promise<void> {
-  let board: Bead[];
-  try {
-    board = await readWholeBoard(repo);
-  } catch (e) {
-    // Same call as `reread`'s: a board we could not read says nothing, so the step refuses.
-    throw new SubjectMovedError(
-      `the board could not be re-read before re-parenting under ${parentId} (${messageOf(e)}) — nothing was written`,
-    );
-  }
-  if (!indexBoard(board).cards.ids.has(parentId)) {
+function assertHomeIsCard(parentId: string, board: BoardIndex): void {
+  if (!board.cards.ids.has(parentId)) {
     throw new SubjectMovedError(
       `${parentId} is no longer a board card — re-parenting under it would leave the work riding no card, which is the state this proposal is about`,
     );
@@ -1046,6 +1128,10 @@ function counterpartMoved(
  *
  * An owner that has LEFT the board is no obstacle: nothing is running a ticket set that no longer
  * exists, and the subject's own re-read already covers what became of it.
+ *
+ * This asks only whether the CAPTURED owner has started. Whether it is still the owner at all is
+ * {@link assertOwnerUnchanged}'s question, and it has to be a separate one: a subject re-parented
+ * since the decision rides a target this step never locked.
  */
 function ownerStarted(
   step: ApplyStep,
