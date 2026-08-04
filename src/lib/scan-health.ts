@@ -69,8 +69,10 @@ export interface ScanSummary {
   /**
    * Against the previous scan. Absent unless this scan measured arrivals since exactly the baseline
    * that scan left ({@link deltaState}) — a scan that established the baseline counts the whole repo
-   * rather than an arrival rate, and the two are not the same quantity. Absent is "not comparable",
-   * a different claim from "no change".
+   * rather than an arrival rate, and the two are not the same quantity — and unless BOTH scans ran
+   * every collector ({@link collectorFailures}), since two undercounts from different collector sets
+   * difference to the outage, not the repo. Absent is "not comparable", a different claim from
+   * "no change".
    */
   delta?: ScanDelta;
   /**
@@ -261,10 +263,16 @@ export async function saveScanSummary(
   // REPO while this series lives in a disposable anton.db, so either is reset without the other —
   // a rebuilt anton.db would suppress two honest deltas, and a re-established baseline mid-series
   // would sail straight through the count and chart a regression.
+  //
+  // A scan that lost a collector is not comparable either, in either direction: its total covers only
+  // the collectors that survived, so differencing it against a scan built from another set measures
+  // the outage rather than the repo — a collector dying reads as "problems arriving more slowly" and
+  // its recovery as a regression. Both adjacent scans must be whole.
   const consumed = input.deltaState?.before;
   const [previous] = await listScanSummaries(db, input.projectId, 1);
+  const whole = (input.collectorFailures ?? 0) === 0 && previous?.collectorFailures === 0;
   const delta =
-    consumed && previous?.deltaState === consumed
+    consumed && whole && previous?.deltaState === consumed
       ? computeDelta(input.counts, previous.counts)
       : undefined;
   // Published only by a scan whose own counts are an arrival rate: a baseline scan leaves a baseline
@@ -524,7 +532,9 @@ export function summarizeScanLine(summary: ScanSummary): string {
       ? `${summary.delta.total >= 0 ? "+" : ""}${summary.delta.total} vs previous scan`
       : summary.baselineScan
         ? "baseline scan — the whole repo, not new arrivals; no delta"
-        : "no comparable previous scan — no delta";
+        : summary.collectorFailures > 0
+          ? "collector failures — counts are an undercount, not comparable; no delta"
+          : "no comparable previous scan — no delta";
   const triage = summary.triage
     ? `; triage created ${summary.triage.created}, deduped ${summary.triage.deduped}`
     : "";

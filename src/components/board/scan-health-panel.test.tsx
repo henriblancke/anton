@@ -67,6 +67,18 @@ describe("ScanHealthPanel", () => {
     expect(screen.getByText(/clean scan/)).toBeTruthy();
   });
 
+  it("does not call a zero-result scan clean when a collector died on it", () => {
+    // Zero from an incomplete scan is "nothing was found by what ran", not a clean bill of health —
+    // the failure chip below it would otherwise contradict the panel's own headline.
+    render(
+      <ScanHealthPanel
+        health={health({ points: [point("a", 1_700_000_000, {})], collectorFailures: 1 })}
+      />,
+    );
+    expect(screen.getByText(/nothing found — incomplete scan/)).toBeTruthy();
+    expect(screen.queryByText(/clean scan/)).toBeNull();
+  });
+
   it("says there is no trend rather than showing a zero delta it hasn't earned", () => {
     render(<ScanHealthPanel health={health()} />);
     expect(screen.getByText(/no trend yet/)).toBeTruthy();

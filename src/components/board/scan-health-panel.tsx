@@ -208,6 +208,16 @@ export function ScanHealthPanel({ health }: { health: ScanHealth | undefined }) 
             {latest.bySeverity[severity]} {severity}
           </MetaChip>
         ))
+      ) : collectorFailures > 0 ? (
+        // Zero from a scan that lost a collector is not a clean bill of health — nothing was found by
+        // the collectors that RAN, and whatever the dead ones would have found is simply unmeasured.
+        // Calling that "clean" makes a claim the scan never earned.
+        <span
+          className="text-xs text-subtle"
+          title="Every collector that ran found nothing, but at least one failed — this scan cannot say the repo is clean."
+        >
+          nothing found — incomplete scan
+        </span>
       ) : (
         // The honest zero-state: a scan that found nothing still says so. "clean" and "never
         // scanned" are different claims, and only one of them is good news.

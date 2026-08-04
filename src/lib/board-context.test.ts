@@ -391,6 +391,27 @@ describe("formatBoardContext", () => {
     expect(out).toContain("open and closed");
   });
 
+  // An open feature carrying a fingerprint is legitimately both a routing candidate and a dedup
+  // target, so it renders under two headings with two different verdicts. Dropping it from either
+  // list would cost triage something it needs (the dedup target, or the surface it routes into), so
+  // the prose says which verdict wins instead.
+  it("tells triage which verdict wins when a bead is listed under two headings", () => {
+    const feature = bead({
+      id: "f-1",
+      issue_type: "feature",
+      title: "Retire the duplicated helpers",
+      labels: ["stringer:duplication:8000d8e1"],
+    });
+    const out = formatBoardContext(
+      buildBoardContext([feature, childOf(bead({ id: "t-1", issue_type: "task" }), "f-1")]),
+    );
+
+    expect(out).toContain("f-1 · attach:child");
+    expect(out).toContain("f-1 · open · stringer:duplication:8000d8e1");
+    expect(out).toContain("may ALSO appear under **Open features**");
+    expect(out).toContain("cross-link it and stop");
+  });
+
   it("says what it dropped instead of truncating silently", () => {
     const board = Array.from({ length: MAX_FEATURES + 3 }, (_, i) =>
       bead({ id: `f-${i}`, issue_type: "feature", context: "touches: src/x.ts" }),

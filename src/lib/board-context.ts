@@ -490,6 +490,11 @@ export function formatBoardContext(ctx: BoardContext): string {
     "against these by `<hash>` ACROSS namespaces first, then by touched file when the hashes differ.",
     "A match is a `related` cross-link on the existing bead — never a second bead.",
     "",
+    "A bead listed here may ALSO appear under **Open features** above: a producer-filed feature is",
+    "both a dedup target and a routing candidate. This section wins. If a signal matches a",
+    "fingerprint here, cross-link it and stop — do not additionally hang the child ticket that",
+    "feature's `attach:child` verdict would otherwise allow.",
+    "",
   );
   if (ctx.producers.length === 0) {
     lines.push("- (no producer-filed beads open)");

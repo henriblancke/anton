@@ -349,6 +349,23 @@ describe("the persisted series", () => {
     expect(summary.collectorFailures).toBe(2);
     expect((await getLatestScanSummary(tdb.db, projectId))?.collectorFailures).toBe(2);
   });
+
+  it("suppresses the delta on both sides of a scan that lost a collector", async () => {
+    await save(counts({ low: 5 })); // baseline
+    clock.advance(1000);
+    // The outage undercounts, so the drop it shows is the dead collector, not a quieter repo …
+    const incomplete = await save(counts({ low: 1 }), { collectorFailures: 1 });
+    clock.advance(1000);
+    // … and the recovery back to a full collector set is not a regression either.
+    const recovered = await save(counts({ low: 4 }));
+    clock.advance(1000);
+    const whole = await save(counts({ low: 2 }));
+
+    expect(incomplete.delta).toBeUndefined();
+    expect(recovered.delta).toBeUndefined();
+    // Two whole scans in a row: comparable again, no permanent break in the chain.
+    expect(whole.delta?.total).toBe(-2);
+  });
 });
 
 describe("scanHealth (the board's view)", () => {
@@ -423,5 +440,16 @@ describe("summarizeScanLine", () => {
       collectorFailures: 0,
     });
     expect(line).toContain("no comparable previous scan — no delta");
+  });
+
+  it("names a collector failure as the reason a scan has no delta", () => {
+    const line = summarizeScanLine({
+      id: "x",
+      projectId: "p",
+      generatedAt: 1,
+      counts: emptyScanCounts(),
+      collectorFailures: 2,
+    });
+    expect(line).toContain("collector failures — counts are an undercount");
   });
 });
