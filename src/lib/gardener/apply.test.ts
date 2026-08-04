@@ -235,7 +235,7 @@ const landed = (extra: Partial<Bead> = {}): Bead =>
  * A test that needs a different pair of moments calls `planApply` itself.
  */
 const decide = (plan: GardenerPlan, board: Bead[], nowMs: number = NOW) =>
-  planApply(plan, board, { nowMs, filedAtMs: Date.parse(FILED) });
+  planApply(plan, board, { nowMs, observedAtMs: Date.parse(FILED) });
 
 /** A bead a run owns right now: an unexpired lease, dated relative to `at`. */
 const leased = (id: string, at: number): Bead =>
@@ -700,7 +700,7 @@ describe("planApply — what an approval means against the board as it now is", 
 
       const unfiled = planApply(DEFER, [cold("anton-a", { status: "in_progress" })], {
         nowMs: NOW,
-        filedAtMs: undefined,
+        observedAtMs: undefined,
       });
       expect(reason(unfiled)).toMatch(/nothing dates that claim/);
     });
@@ -1435,6 +1435,41 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
       apply(reparent, [CARD, inReview("anton-a"), reparent]),
     ).rejects.toMatchObject({ failure: "refused" });
     expect(calls.filter((c) => !c.startsWith("note"))).toEqual([]);
+  });
+
+  // A pass reads the board ONCE and then files its proposals through sequential bd writes, so a
+  // subject edited inside that window is a change the detection never saw — while the proposal's own
+  // `created_at`, stamped at the end of it, would date the edit as already-observed. The fence is the
+  // snapshot the emitter recorded, which is what makes a late proposal in the loop as safe as the
+  // first one.
+  it("dates a premise from the board snapshot, not from when the bead was written", async () => {
+    const proposal = proposalFor(DEFER, {
+      metadata: { gardener: DEFER, gardenerObservedAt: "2026-07-01T00:00:00Z" },
+      created_at: "2026-07-01T00:00:30Z", // filed half a minute into the same pass
+    });
+    // Edited inside the window: after the snapshot, before this proposal existed.
+    const edited = bead("anton-a", { updated_at: "2026-07-01T00:00:20Z" });
+
+    await expect(apply(proposal, [edited, proposal])).rejects.toMatchObject({
+      failure: "refused",
+    });
+    // Nothing but the explanation: the edit is refused, not written over.
+    expect(calls).toEqual([
+      expect.stringContaining("anton-a has been written to since this proposal was filed"),
+    ]);
+  });
+
+  // Metadata is hand-editable, and a fence pushed LATER is the one edit that would launder a write
+  // the detection never saw into "the board the patrol judged". Clamped to the bead's own creation
+  // stamp, the worst a rewritten value can do is refuse more.
+  it("never lets a stamped snapshot push the fence later than the bead's own creation", async () => {
+    const proposal = proposalFor(DEFER, {
+      metadata: { gardener: DEFER, gardenerObservedAt: "2026-08-01T00:00:00Z" },
+      created_at: FILED,
+    });
+    await expect(apply(proposal, [warm("anton-a"), proposal])).rejects.toMatchObject({
+      failure: "refused",
+    });
   });
 
   it("refuses a bead whose plan cannot be read, rather than guessing one from its prose", async () => {

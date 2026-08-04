@@ -50,6 +50,7 @@ import {
 } from "./board-index";
 import {
   fingerprintLabelOf,
+  GARDENER_OBSERVED_AT_KEY,
   isProposalBead,
   proposalPlanOf,
   type GardenerDetectionKind,
@@ -145,21 +146,21 @@ export type ApplyDecision =
   | { status: "refuse"; reason: string };
 
 /**
- * The two moments an approval sits between: when the patrol FILED the proposal — the board its
- * evidence describes — and NOW, the board the writes would land on. Both are needed because a
- * precondition re-checked only against the approval's fresh snapshot is blind to everything that
- * moved BEFORE that snapshot was taken: the plan carries no state of its own to compare against, so
- * the filing stamp is what dates a change as "since we asked".
+ * The two moments an approval sits between: when the patrol OBSERVED the board its evidence
+ * describes, and NOW, the board the writes would land on. Both are needed because a precondition
+ * re-checked only against the approval's fresh snapshot is blind to everything that moved BEFORE
+ * that snapshot was taken: the plan carries no state of its own to compare against, so the
+ * observation stamp is what dates a change as "since we asked".
  */
 export interface ApplyMoment {
   /** When the approval is being decided. */
   nowMs: number;
   /**
-   * When the proposal bead was created, or undefined when it carries no readable stamp. Undefined
-   * FAILS CLOSED wherever it is read: with nothing to date a change against, we cannot prove the
-   * board still reads as the approver was shown.
+   * When the detection READ the board — see {@link observedAtOf}, which is deliberately not the
+   * proposal's creation stamp. Undefined FAILS CLOSED wherever it is read: with nothing to date a
+   * change against, we cannot prove the board still reads as the approver was shown.
    */
-  filedAtMs: number | undefined;
+  observedAtMs: number | undefined;
 }
 
 /**
@@ -449,23 +450,23 @@ function planRetire(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): App
 }
 
 /**
- * Has this bead been written to since the proposal was filed? `undefined` when either stamp is
- * unreadable — the honest answer when there is nothing to compare, which every caller fails closed
- * on. bd's own creation and write stamps are the only filing-time facts available here, and they are
- * better than any the plan could carry: a hand-edited metadata blob cannot rewrite them.
+ * Has this bead been written to since the patrol observed the board? `undefined` when either stamp
+ * is unreadable — the honest answer when there is nothing to compare, which every caller fails
+ * closed on.
  *
  * bd stamps at ONE-SECOND resolution, so an EQUAL stamp orders nothing: the write may have landed
- * before the proposal was created or after it, and the two readings mean opposite things here. It is
- * answered `undefined` — the same fail-closed "we cannot tell" a missing stamp gets — rather than
- * `false`, because `false` is a positive claim that the plan already saw this write, and nothing
- * downstream re-asks it: the step records exactly that state as its own baseline
- * ({@link StepSubject.claim}) and the under-lock re-check then compares it against itself.
+ * before the observation or after it, and the two readings mean opposite things here. It is answered
+ * `undefined` — the same fail-closed "we cannot tell" a missing stamp gets — rather than `false`,
+ * because `false` is a positive claim that the plan already saw this write, and nothing downstream
+ * re-asks it: the step records exactly that state as its own baseline ({@link StepSubject.claim})
+ * and the under-lock re-check then compares it against itself. {@link observedAtOf} floors the fence
+ * to the same one-second grid so that tie is reachable at all.
  */
 function writtenSinceFiling(subject: Bead, at: ApplyMoment): boolean | undefined {
   const writtenAt = stampMsOf(subject);
-  if (at.filedAtMs === undefined || writtenAt === undefined) return undefined;
-  if (writtenAt === at.filedAtMs) return undefined;
-  return writtenAt > at.filedAtMs;
+  if (at.observedAtMs === undefined || writtenAt === undefined) return undefined;
+  if (writtenAt === at.observedAtMs) return undefined;
+  return writtenAt > at.observedAtMs;
 }
 
 /**
@@ -749,9 +750,10 @@ async function applyApproved(
     );
   }
 
-  // Dated from the proposal the approver read, not from `live`: `created_at` is the moment the
-  // patrol judged the board, which is what every "has this moved since we asked" check compares to.
-  const at: ApplyMoment = { nowMs: Date.now(), filedAtMs: filedAtOf(proposal) };
+  // Dated from the proposal the approver read, not from `live`: its observation stamp is the moment
+  // the patrol judged the board, which is what every "has this moved since we asked" check compares
+  // to.
+  const at: ApplyMoment = { nowMs: Date.now(), observedAtMs: observedAtOf(proposal) };
   const decision = planApply(plan, board, at);
   if (decision.status === "refuse") {
     throw await attachFailure(
@@ -1288,14 +1290,45 @@ async function attachFailure(
 // ── small pure helpers ──
 
 /**
- * When the proposal was FILED, in epoch ms, or undefined when it carries no readable `created_at`.
- * bd stamps every bead at creation, so this is the plan's filing time without the plan having to
- * carry a copy of it — and a copy is exactly what a hand-edited metadata blob could rewrite.
+ * The moment the proposal's EVIDENCE describes, in epoch ms — the fence every "has this moved since
+ * we asked" check dates against.
+ *
+ * Not the bead's `created_at`: one patrol pass reads the board once and then files up to ten
+ * proposals through sequential bd writes, so a subject edited after that read but before ITS
+ * proposal was created is a change the detection never saw, which `created_at` would date as
+ * already-observed. The emitter therefore stamps the snapshot's own moment onto the bead
+ * ({@link GARDENER_OBSERVED_AT_KEY}).
+ *
+ * Two guards make trusting a metadata value safe here:
+ *   • CLAMPED to `created_at`, so the stamp can only pull the fence EARLIER — the direction that
+ *     costs refusals, never permission. Metadata is hand-editable, and a LATER fence is the one
+ *     edit that would let a write the detection never saw pass as observed.
+ *   • FLOORED to bd's one-second stamp grid, so a subject written in the same second as the
+ *     observation still reads as the unorderable tie {@link writtenSinceFiling} fails closed on
+ *     rather than as a write the plan saw.
+ *
+ * A missing or unreadable stamp falls back to `created_at` — a fence later by the length of one
+ * pass, which is what anton shipped before this and is far better than refusing every proposal an
+ * older patrol filed. An unreadable `created_at` stays `undefined`, which every caller fails closed
+ * on.
  */
-function filedAtOf(proposal: Bead): number | undefined {
-  const at = typeof proposal.created_at === "string" ? Date.parse(proposal.created_at) : NaN;
+function observedAtOf(proposal: Bead): number | undefined {
+  const created = msOf(proposal.created_at);
+  if (created === undefined) return undefined;
+  const observed = msOf(proposal.metadata?.[GARDENER_OBSERVED_AT_KEY]);
+  return toBdStampGrid(observed === undefined ? created : Math.min(observed, created));
+}
+
+/** An ISO stamp (or an epoch-ms number) as epoch ms, or undefined when it is neither. */
+function msOf(value: unknown): number | undefined {
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  if (typeof value !== "string" || !value) return undefined;
+  const at = Date.parse(value);
   return Number.isFinite(at) ? at : undefined;
 }
+
+/** bd stamps beads at whole seconds; the fence is floored to match — see {@link writtenSinceFiling}. */
+const toBdStampGrid = (ms: number): number => Math.floor(ms / 1000) * 1000;
 
 /** The close reason a retirement writes — evidence lives on the proposal, so this stays one line. */
 function closeReason(plan: GardenerPlan): string {

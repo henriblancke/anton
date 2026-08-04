@@ -26,6 +26,7 @@ import { isOpenWork } from "./board-index";
 import {
   concernedBeads,
   fingerprintLabelOf,
+  GARDENER_OBSERVED_AT_KEY,
   GARDENER_PLAN_KEY,
   planOf,
   type GardenerDetection,
@@ -81,6 +82,19 @@ export interface EmissionInput {
   detections: GardenerDetection[];
   /** The full board (`--status all`): a DECLINED proposal is closed, so a live-only read misses it. */
   board: Bead[];
+  /**
+   * When `board` was read — the moment every proposal's evidence describes. Rides onto each bead so
+   * apply dates changes against the snapshot the detection actually saw rather than against the
+   * bead's creation stamp, which the sequential creates below push later (see
+   * {@link GARDENER_OBSERVED_AT_KEY}). Omitted only by callers with no snapshot to name.
+   */
+  observedAtMs?: number;
+  /**
+   * The job's cancel signal, checked between creates. A pass files up to ten beads through
+   * sequential bd writes, so a cancel arriving mid-loop has to stop the rest of them — without it a
+   * cancelled patrol runs every judgment-tier write it planned before noticing.
+   */
+  signal?: AbortSignal;
   limit?: number;
 }
 
@@ -114,8 +128,14 @@ export interface ProposalDraft {
   acceptance: string;
   description: string;
   deps: string[];
-  /** The move, as data, under {@link GARDENER_PLAN_KEY} — what apply-on-approve reads (anton-1t3n). */
-  metadata: Record<typeof GARDENER_PLAN_KEY, GardenerPlan>;
+  /**
+   * The move, as data, under {@link GARDENER_PLAN_KEY} — what apply-on-approve reads (anton-1t3n) —
+   * alongside the evidence snapshot's stamp, which dates every premise check apply makes.
+   */
+  metadata: {
+    [GARDENER_PLAN_KEY]: GardenerPlan;
+    [GARDENER_OBSERVED_AT_KEY]?: string;
+  };
 }
 
 /**
@@ -131,8 +151,15 @@ export interface ProposalDraft {
  *
  * `task` and parentless is what makes it a run target the board renders as a chip; a `chore`, or a
  * child of anything, would be a bead only the tickets list ever shows.
+ *
+ * `observedAtMs` is when the board this detection came from was READ. It is stamped separately from
+ * the bead's own creation time because the two drift apart within a single pass — see
+ * {@link GARDENER_OBSERVED_AT_KEY}.
  */
-export function proposalDraft(detection: GardenerDetection): ProposalDraft {
+export function proposalDraft(
+  detection: GardenerDetection,
+  observedAtMs?: number,
+): ProposalDraft {
   return {
     title: `Gardener: ${moveClause(detection)}`,
     type: "task",
@@ -140,7 +167,12 @@ export function proposalDraft(detection: GardenerDetection): ProposalDraft {
     acceptance: acceptanceOf(detection),
     description: descriptionOf(detection),
     deps: concernedBeads(detection).map((id) => `discovered-from:${id}`),
-    metadata: { [GARDENER_PLAN_KEY]: planOf(detection) },
+    metadata: {
+      [GARDENER_PLAN_KEY]: planOf(detection),
+      ...(observedAtMs !== undefined && Number.isFinite(observedAtMs)
+        ? { [GARDENER_OBSERVED_AT_KEY]: new Date(observedAtMs).toISOString() }
+        : {}),
+    },
   };
 }
 
@@ -159,10 +191,11 @@ export interface EmissionResult {
 }
 
 /**
- * A create that failed part-way, carrying what DID land. The proposals already filed are real board
- * state that exists only in the local Dolt working set, so the failure has to hand them back rather
- * than swallow them: if the failing create keeps failing the job parks, and a caller that never
- * learned about the earlier ones never propagates them to the other machines (see jobs/gardener.ts).
+ * A pass that stopped part-way — a create that failed, or a cancel that arrived mid-loop — carrying
+ * what DID land. The proposals already filed are real board state that exists only in the local Dolt
+ * working set, so the stop has to hand them back rather than swallow them: if the failing create
+ * keeps failing the job parks, and a caller that never learned about the earlier ones never
+ * propagates them to the other machines (see jobs/gardener.ts).
  */
 export class PartialEmissionError extends Error {
   constructor(
@@ -170,7 +203,7 @@ export class PartialEmissionError extends Error {
     cause: unknown,
   ) {
     super(
-      `filing gardener proposals failed after ${result.created.length} of the pass's creates landed: ` +
+      `filing gardener proposals stopped after ${result.created.length} of the pass's creates landed: ` +
         (cause instanceof Error ? cause.message : String(cause)),
       { cause },
     );
@@ -183,7 +216,7 @@ export class PartialEmissionError extends Error {
  * working set, and a failure part-way leaves the proposals already filed standing — they carry their
  * fingerprints, so the retry that re-reads the board files only what is still missing.
  *
- * Standing locally is not the same as being SEEN, though, so a failure throws
+ * Standing locally is not the same as being SEEN, though, so a stop throws
  * {@link PartialEmissionError} with the landed proposals attached instead of losing them.
  */
 export async function emitProposals(repo: string, input: EmissionInput): Promise<EmissionResult> {
@@ -196,9 +229,14 @@ export async function emitProposals(repo: string, input: EmissionInput): Promise
   });
 
   for (const detection of plan.emit) {
+    // Between EVERY create, not once before the loop: a cancel arriving after the first write must
+    // stop the rest of the pass rather than let a cancelled patrol finish all ten of its
+    // judgment-tier writes. Reported the same way a failed create is — what landed is board state
+    // either way, and the caller has to propagate it.
+    if (input.signal?.aborted) throw new PartialEmissionError(sofar(), input.signal.reason);
     let id: string;
     try {
-      id = await beads.create(repo, proposalDraft(detection));
+      id = await beads.create(repo, proposalDraft(detection, input.observedAtMs));
     } catch (e) {
       throw new PartialEmissionError(sofar(), e);
     }

@@ -210,6 +210,19 @@ export function isProposalBead(bead: { labels?: string[] }): boolean {
 export const GARDENER_PLAN_KEY = "gardener";
 
 /**
+ * The metadata key a proposal carries the moment its EVIDENCE describes: the board snapshot the
+ * detection ran against, as an ISO stamp.
+ *
+ * Not the same instant as the bead's own `created_at`, and the gap matters. One pass reads the board
+ * ONCE and then files up to ten proposals through sequential bd writes, so a subject edited after
+ * that read — especially before a later proposal in the loop is created — is a change the detection
+ * never saw. Every "has this moved since we asked" check in apply.ts dates against this stamp for
+ * that reason; `created_at` would read such an edit as already-observed and let a retirement settle
+ * a bead written out from under its own evidence.
+ */
+export const GARDENER_OBSERVED_AT_KEY = "gardenerObservedAt";
+
+/**
  * The move a proposal would apply, stripped of everything only a reader needs (summary, evidence).
  * Exactly the fields the executors branch on — anything else would be state the board and the plan
  * could disagree about.

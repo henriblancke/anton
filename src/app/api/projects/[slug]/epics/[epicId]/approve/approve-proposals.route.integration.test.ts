@@ -41,11 +41,18 @@ describeBd("POST approve — gardener proposals apply their move (temp anton.db 
   const nextSecond = (): Promise<void> =>
     new Promise((resolve) => setTimeout(resolve, 1_050 - (Date.now() % 1_000)));
 
-  /** File a proposal the way the patrol would: the emitter's own draft, created through the seam. */
-  const file = async (input: DetectionInput): Promise<{ id: string; fingerprint: string }> => {
+  /**
+   * File a proposal the way the patrol would: the emitter's own draft, created through the seam.
+   * `observedAtMs` is when the board the detection judged was READ — passed only by the case that
+   * proves it fences separately from the bead's own creation stamp.
+   */
+  const file = async (
+    input: DetectionInput,
+    observedAtMs?: number,
+  ): Promise<{ id: string; fingerprint: string }> => {
     await nextSecond(); // the subjects were just written — see nextSecond
     const detection = makeDetection(input);
-    const id = await beads.create(repo, proposalDraft(detection));
+    const id = await beads.create(repo, proposalDraft(detection, observedAtMs));
     return { id, fingerprint: detection.fingerprint };
   };
 
@@ -268,6 +275,47 @@ describeBd("POST approve — gardener proposals apply their move (temp anton.db 
     const held = await show(ticket);
     expect(beads.parentOf(held)).toBeUndefined();
     expect(held.status).toBe("in_progress");
+    expect((await show(proposal.id)).status).toBe("open");
+  });
+
+  // The other half of that window, and the reason a proposal carries its snapshot's stamp at all: a
+  // patrol reads the board ONCE and then files up to ten proposals through sequential bd writes, so
+  // a later proposal in that loop is created SECONDS after the evidence behind it was gathered. An
+  // edit landing in between is a change the detection never saw — and dating it off the bead's own
+  // `created_at` would count it as observed and retire work somebody had just put in.
+  it("refuses a subject edited after the board snapshot but before the proposal was created", async () => {
+    const ticket = await beads.create(repo, { title: "Rescoped mid-pass", type: "task", acceptance: "- [ ] a" });
+
+    await nextSecond();
+    const observedAtMs = Date.now(); // the patrol reads the board here…
+
+    await nextSecond();
+    // …somebody rescopes the subject here. A description edit, because that is what bd's own write
+    // stamp moves — the fact every premise check downstream reads.
+    await beads.update(repo, ticket, { description: "Goal: actually, there is more to do here." });
+
+    await nextSecond();
+    const proposal = await file(
+      {
+        kind: "stale",
+        move: "retire",
+        retireAs: "defer",
+        subjects: [ticket],
+        summary: "untouched far past the retirement window",
+        evidence: ["bd stale named it"],
+      },
+      observedAtMs, // …and only now is the proposal written
+    );
+    resetIssueSnapshots();
+
+    const res = await approve(proposal.id);
+    const body = (await res.json()) as { error?: string };
+
+    expect(res.status).toBe(409);
+    expect(body.error).toContain("written to since this proposal was filed");
+    // Inert: the edit stands and the proposal is still there for a human to re-decide.
+    const untouched = await show(ticket);
+    expect(untouched.status).toBe("open");
     expect((await show(proposal.id)).status).toBe("open");
   });
 

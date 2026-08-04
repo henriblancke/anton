@@ -165,6 +165,19 @@ describe("the proposal bead", () => {
     expect(proposalPlanOf({ ...asBoardSees, labels: ["gardener:stale:0123456789ab"] })).toBeUndefined();
   });
 
+  // Apply dates every "has this moved since we asked" check against this stamp. It has to be the
+  // snapshot's moment rather than the bead's `created_at`, because a pass reads the board once and
+  // then files up to ten proposals through sequential writes — a subject edited in that window is a
+  // change the detection never saw, and `created_at` would date it as already-observed.
+  it("carries the moment its evidence describes, which is not when the bead was written", () => {
+    const observedAtMs = Date.parse("2026-08-01T09:30:00Z");
+    expect(proposalDraft(reparent(), observedAtMs).metadata).toMatchObject({
+      gardenerObservedAt: "2026-08-01T09:30:00.000Z",
+    });
+    // Absent rather than null when a caller names no snapshot — apply falls back to `created_at`.
+    expect(proposalDraft(reparent()).metadata).not.toHaveProperty("gardenerObservedAt");
+  });
+
   it("hangs a discovered-from edge off EVERY bead the move concerns, not just the one it acts on", () => {
     const draft = proposalDraft(reparent());
     expect(concernedBeads(reparent())).toEqual(["anton-feat", "anton-lost"]);
@@ -333,6 +346,27 @@ describe("a patrol pass", () => {
     expect(error).toBeInstanceOf(PartialEmissionError);
     expect(error.result.created.map((p: { id: string }) => p.id)).toEqual(["anton-p1"]);
     expect(error.message).toContain("bd create exploded");
+  });
+
+  // A cancel arriving after the first create must stop the rest of the pass. Checked only before the
+  // loop, a cancelled patrol would still run every judgment-tier write it had planned.
+  it("stops filing when a cancel arrives mid-pass, handing back what landed", async () => {
+    const detections = [reparent(), reparent({ subjects: ["anton-b"] }), reparent({ subjects: ["anton-c"] })];
+    const controller = new AbortController();
+    createMock.mockImplementationOnce(async () => {
+      controller.abort();
+      return "anton-p1";
+    });
+
+    const error = await emitProposals(REPO, {
+      board: MISPARENTED,
+      detections,
+      signal: controller.signal,
+    }).catch((e) => e);
+
+    expect(error).toBeInstanceOf(PartialEmissionError);
+    expect(error.result.created.map((p: { id: string }) => p.id)).toEqual(["anton-p1"]);
+    expect(createMock).toHaveBeenCalledTimes(1);
   });
 
   it("writes nothing on a quiet board", async () => {

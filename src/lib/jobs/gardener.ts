@@ -273,12 +273,18 @@ export function makeGardenerHandler(deps: GardenerDeps): JobHandler {
     // `loadAllIssues`, not a bare `bd list --status all`: that flag is unsupported on some bd
     // versions, and a patrol that threw here would park every pass without ever filing a proposal.
     ctx.signal.throwIfAborted();
+    // Stamped BEFORE the read, not after: a bead written while the read is in flight may or may not
+    // be in the snapshot, and the earlier fence dates it as unseen — a refusal at approve time,
+    // which is the safe direction. This is what apply compares "has this moved since we asked"
+    // against; the proposals' own `created_at` land later, once the sequential creates below run.
+    const observedAtMs = clock.now();
     const board = await loadAllIssues(repo);
     const detections = detectBoard({ board, hygiene: { findings }, now: clock.now() });
     await ctx.heartbeat();
     // Re-check RIGHT before the first write. The board read and detection above take real time, and
     // a cancel arriving inside them is invisible to `ctx.heartbeat()` — which does not inspect the
     // signal — so without this a cancelled patrol would still file judgment-tier proposal beads.
+    // `emitProposals` carries the signal on from here and re-checks between its own creates.
     ctx.signal.throwIfAborted();
 
     // Whatever landed before a create failed is real board state living only in the local working
@@ -304,7 +310,7 @@ export function makeGardenerHandler(deps: GardenerDeps): JobHandler {
     };
 
     try {
-      report(await emitProposals(repo, { board, detections }));
+      report(await emitProposals(repo, { board, detections, observedAtMs, signal: ctx.signal }));
     } catch (e) {
       if (e instanceof PartialEmissionError) report(e.result);
       throw e;
