@@ -228,9 +228,10 @@ function classifyScanBasis(
 /**
  * Put the baseline back exactly as the scan found it. Returns why it couldn't, or undefined on success.
  *
- * stringer advances `.stringer/last-scan.json` on its way out, so a scan anton then REJECTS
- * (unreadable output — see {@link readAnnotatedSignals}) has already consumed the window it failed
- * to report. Left alone, the runner's `--delta` retry measures against the ADVANCED baseline, finds
+ * stringer advances `.stringer/last-scan.json` on its way out, so a scan that then FAILS — anton
+ * refused the output (see {@link readAnnotatedSignals}), or the process itself exited non-zero, hit
+ * the deadline, or was cancelled — has already consumed the window it failed to report. Left alone,
+ * the runner's `--delta` retry measures against the ADVANCED baseline, finds
  * nothing new, and records a clean pass for findings nobody ever triaged — the exact false green the
  * rejection exists to prevent. Restoring makes the retry rescan the same window.
  */
@@ -261,8 +262,8 @@ async function restoreBaseline(
  * off), so the job parks for one instead of burning attempts on a retry that cannot see the window.
  *
  * Exported because rejecting the scan's OUTPUT is not the only way a pass consumes a window without
- * reporting it: a scan whose triage then dies has the same problem, and must fail the same way
- * (see {@link ScanResult.restoreBaseline}).
+ * reporting it: a scan whose PROCESS dies mid-run, and one whose triage dies afterwards, have the
+ * same problem and must fail the same way (see {@link ScanResult.restoreBaseline}).
  */
 export async function rejectWithBaselineRestored(
   err: unknown,
@@ -432,8 +433,9 @@ async function readAnnotatedSignals(scanFile: string): Promise<ScanSignal[]> {
  * `delta` (default true) restricts to new signals since the last scan.
  * Throws on a stringer failure OR on output it can't read (fail loud — see
  * `readAnnotatedSignals`), so the job then retries/parks per the runner's policy; a deadline kill
- * throws a distinct "timed out" error rather than stringer's misleading partial stderr. A rejected
- * scan leaves the `--delta` baseline where it found it, so the retry rescans the same window rather
+ * throws a distinct "timed out" error rather than stringer's misleading partial stderr. Any failed
+ * scan — refused output or a dead process — leaves the `--delta` baseline where it found it, so the
+ * retry rescans the same window rather
  * than the empty one this attempt advanced past — and when it CAN'T put the baseline back, it throws
  * poison so the runner parks the job instead of retrying past the lost window (see
  * `rejectWithBaselineRestored`).
@@ -477,7 +479,13 @@ export async function scan(opts: {
       signal: opts.signal,
     }));
   } catch (err) {
-    throw toScanError(err, { timeoutMs });
+    // A scan that DIED still consumed the window: stringer rewrites its state as it goes, so a
+    // non-zero exit, a deadline kill, or a caller abort can leave the baseline advanced past
+    // signals it produced but never wrote out. Unwind here too — without it the next attempt
+    // measures from the advanced state, finds nothing, and closes green over findings nobody
+    // triaged. The original error passes through unchanged when the unwind works, so the runner
+    // still classifies a timeout as a timeout and an abort as cancellation.
+    throw await rejectWithBaselineRestored(toScanError(err, { timeoutMs }), unwind);
   }
 
   let signals: ScanSignal[];

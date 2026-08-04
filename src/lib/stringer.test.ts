@@ -421,6 +421,91 @@ describe("scan", () => {
       expect(isPoisonError(err)).toBe(false);
     });
 
+    // A scan that dies mid-run has advanced the window just the same: stringer rewrites its state as
+    // it goes, so the signals it had already produced sit behind an advanced baseline the retry
+    // would scan past — a clean-looking pass over findings nobody parsed.
+    it("puts the baseline back when the scanner process itself fails", async () => {
+      process.env[STRINGER_BIN_ENV] = writeBaselineStringer();
+      const first = await scan({ repoPath: dir, scanFile: join(dir, "s1.json") });
+      const state = join(dir, ".stringer", "last-scan.json");
+      const consumed = readFileSync(state, "utf8");
+
+      // Advances the baseline, then dies non-zero without writing the -o file.
+      process.env[STRINGER_BIN_ENV] = writeScript("advancing-failing-stringer", [
+        "const fs = require('fs'); const path = require('path');",
+        "const state = path.join(process.argv[3], '.stringer', 'last-scan.json');",
+        "let n = 0;",
+        "try { n = JSON.parse(fs.readFileSync(state, 'utf8')).n + 1; } catch {}",
+        "fs.mkdirSync(path.dirname(state), { recursive: true });",
+        "fs.writeFileSync(state, JSON.stringify({ n }));",
+        "process.stderr.write('scan aborted: collector panic\\n');",
+        "process.exit(2);",
+      ]);
+      await expect(scan({ repoPath: dir, scanFile: join(dir, "s2.json") })).rejects.toThrow(
+        /collector panic/,
+      );
+      expect(readFileSync(state, "utf8")).toBe(consumed);
+
+      process.env[STRINGER_BIN_ENV] = writeBaselineStringer();
+      const retry = await scan({ repoPath: dir, scanFile: join(dir, "s3.json") });
+      expect(retry.deltaState.before).toBe(first.deltaState.after);
+    });
+
+    it("unwinds a deadline kill too — the killed scan's window is not the retry's", async () => {
+      process.env[STRINGER_BIN_ENV] = writeBaselineStringer();
+      await scan({ repoPath: dir, scanFile: join(dir, "s1.json") });
+      const state = join(dir, ".stringer", "last-scan.json");
+      const consumed = readFileSync(state, "utf8");
+
+      // Advances the baseline, then outlives the deadline → SIGTERM before any output is written.
+      process.env[STRINGER_BIN_ENV] = writeScript("advancing-slow-stringer", [
+        "const fs = require('fs'); const path = require('path');",
+        "const state = path.join(process.argv[3], '.stringer', 'last-scan.json');",
+        "fs.writeFileSync(state, JSON.stringify({ n: 99 }));",
+        "setTimeout(() => {}, 60000);",
+      ]);
+      process.env.ANTON_STRINGER_TIMEOUT_MS = "250";
+
+      await expect(scan({ repoPath: dir, scanFile: join(dir, "s2.json") })).rejects.toThrow(
+        /stringer timed out after 250ms/,
+      );
+      expect(readFileSync(state, "utf8")).toBe(consumed);
+    });
+
+    it("PARKS a failed scan whose advanced baseline cannot be put back", async () => {
+      // Same false green as a refused scan, arrived at by a different door: an ordinary error is
+      // rescheduled, and the retry measures against the baseline the dead scan advanced.
+      mkdirSync(join(dir, ".stringer", "last-scan.json"), { recursive: true });
+      process.env[STRINGER_BIN_ENV] = writeScript("failing-poison-stringer", ["process.exit(2);"]);
+
+      const err = await scan({ repoPath: dir, scanFile: join(dir, "s.json") }).catch((e) => e);
+
+      expect(isPoisonError(err)).toBe(true);
+      expect((err as Error).message).toMatch(/baseline could not be restored/);
+    });
+
+    // The unwind must not relabel the failure it unwinds: the runner classifies a cancelled scan by
+    // the error it gets, and a restored baseline is not news it needs.
+    it("unwinds a cancelled scan while keeping it an AbortError", async () => {
+      process.env[STRINGER_BIN_ENV] = writeBaselineStringer();
+      await scan({ repoPath: dir, scanFile: join(dir, "s1.json") });
+      const state = join(dir, ".stringer", "last-scan.json");
+      const consumed = readFileSync(state, "utf8");
+
+      process.env[STRINGER_BIN_ENV] = writeScript("advancing-hanging-stringer", [
+        "const fs = require('fs'); const path = require('path');",
+        "fs.writeFileSync(path.join(process.argv[3], '.stringer', 'last-scan.json'), '{\"n\":99}');",
+        "setTimeout(() => {}, 60000);",
+      ]);
+      const ac = new AbortController();
+      setTimeout(() => ac.abort(), 50);
+
+      await expect(
+        scan({ repoPath: dir, scanFile: join(dir, "s2.json"), signal: ac.signal }),
+      ).rejects.toMatchObject({ name: "AbortError" });
+      expect(readFileSync(state, "utf8")).toBe(consumed);
+    });
+
     it("reports an unreadable baseline as unknown rather than as unchanged", async () => {
       const argvDump = join(dir, "argv.json");
       process.env[STRINGER_BIN_ENV] = writeFakeStringer(argvDump, []);
