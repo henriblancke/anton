@@ -965,6 +965,29 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     expect(calls.some((c) => c.startsWith(`close ${proposal.id}`))).toBe(false);
   });
 
+  // The ownership read is what tells a rollback the step is still ours to undo. When it FAILS it
+  // proves nothing — and restoring blind would overwrite a newer move with no trace that it happened,
+  // so the step is named for a human instead.
+  it("strands a rolled-back subject whose ownership read fails, rather than restoring blind", async () => {
+    const proposal = proposalFor(CLUSTER);
+    const board = [CARD, child("anton-a", "anton-old"), bead("anton-b"), proposal];
+    failOn.set("reparent:anton-b", 1);
+    // anton-a becomes unreadable the moment its move lands, so the rollback can't prove it owns it.
+    onWrite = (call) => {
+      if (call === "reparent anton-a anton-card") liveBeads.set("anton-a", undefined);
+    };
+
+    await expect(apply(proposal, board)).rejects.toThrow(
+      /ROLLBACK INCOMPLETE: anton-a could not be restored/,
+    );
+
+    // One write to anton-a: the move. No blind restore behind an unreadable board.
+    expect(calls.filter((c) => c.startsWith("reparent anton-a"))).toEqual([
+      "reparent anton-a anton-card",
+    ]);
+    expect(calls.some((c) => c.startsWith(`close ${proposal.id}`))).toBe(false);
+  });
+
   it("refuses a stale plan without writing anything, and notes why on the proposal", async () => {
     const proposal = proposalFor(REPARENT);
     const board = [CARD, bead("anton-a", { status: "closed" }), proposal];

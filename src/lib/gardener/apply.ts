@@ -834,10 +834,18 @@ async function rollbackSteps(repo: string, applied: ApplyStep[]): Promise<string
         // Undo only what is still OURS to undo. Another approval — of a different proposal naming
         // the same subject — can land between this apply's per-step locks, and restoring the parent
         // this plan happened to record would clobber a move somebody else has since made and now
-        // reads as the board's truth. A read that FAILED tells us nothing, so it falls through to
-        // the restore rather than silently leaving a half-applied move in place.
+        // reads as the board's truth.
+        //
+        // A read that FAILED proves nothing either way, so it is STRANDED rather than restored: the
+        // two mistakes are not symmetric. Restoring on a blind read overwrites a newer move
+        // silently, and nothing on the board says it happened; leaving the step applied names the
+        // bead in the error for a human to settle. Fail loud beats fail quiet.
         const live = await beads.show(repo, step.id).catch(() => undefined);
-        if (live && (beads.parentOf(live) ?? "") !== step.parent) {
+        if (!live) {
+          stranded.push(step.id);
+          return;
+        }
+        if ((beads.parentOf(live) ?? "") !== step.parent) {
           overtaken.push(step.id);
           return;
         }
@@ -894,6 +902,11 @@ const NO_SURVIVOR = "this proposal names no bead that superseded it";
  * work through, so work attached now rides along unrun, and when the run settles the card the
  * newcomers are left beneath a target nothing will claim, which is the unreachable state the
  * proposal exists to fix.
+ *
+ * This is only half of the guarantee, and it cannot be the other half: a run selects its tickets
+ * before it publishes anything for this check to observe. The run closes its own side — it
+ * re-confirms the selection once its lease is live and retries if the set moved (execute-epic step
+ * 1c) — so a move that beats the lease is picked up rather than dropped.
  */
 function homeUnusable(home: Bead, nowMs: number): string | undefined {
   if (!isOpenWork(home)) {

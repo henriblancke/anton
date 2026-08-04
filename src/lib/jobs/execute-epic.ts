@@ -792,6 +792,43 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       await clock.sleep?.(RUN_LEASE_SETTLE_MS);
       await arbitrateRunLease();
 
+      // 1c. Re-confirm the ticket selection against a board that can SEE this run (anton-e42l).
+      //     Steps 0a-ter/0b/0c chose and gated the tickets from a read taken BEFORE the publish
+      //     above, and until that lease landed the target carried neither a lease nor a claim — so
+      //     for that whole window it reads as free work to anyone else. An approved gardener
+      //     re-parent is the case that matters: its home check (gardener/apply.ts `homeUnusable`)
+      //     asks exactly "is a run holding this card", sees nothing, and attaches a ticket this run
+      //     has already finished selecting. That newcomer is never dispatched, and merge
+      //     finalization closes it unrun along with the rest of the target's subtree.
+      //     The lease is now published, pushed and arbitrated, so this read is the serialization
+      //     point: a move that landed before it is IN this board, and one that starts after it is
+      //     refused by the live lease. A set that differs means our selection is the stale half of
+      //     that race — retry (a plain Error, not a park) so the next attempt re-gates and runs the
+      //     whole set rather than silently dropping the newcomer. Converges: the retry re-reads the
+      //     board from the top and selects the set this read just saw.
+      //     Fails closed on an unreadable board, like the arbitration reads above — we cannot prove
+      //     the set is stable — and costs nothing, since no worktree exists yet.
+      //     Status-blind by construction: `runTickets` filters on shape, not state, so a ticket
+      //     another machine closed mid-window is still in both sets and doesn't trip this.
+      let confirmedChildren: Bead[];
+      try {
+        confirmedChildren = runTickets(await loadAllIssues(repo, { strictGates: true }), epicBeadId);
+      } catch (e) {
+        throw new Error(
+          `${epicBeadId} could not re-read the board after publishing its run-lease to confirm its ` +
+            `ticket set — retrying rather than executing a selection that may already be stale. ` +
+            `(${e instanceof Error ? e.message : String(e)})`,
+        );
+      }
+      const drift = ticketSetDrift(freshChildren, confirmedChildren);
+      if (drift) {
+        throw new Error(
+          `${epicBeadId}'s ticket set changed while this run was starting (${drift}) — retrying so ` +
+            `the run gates and executes the whole set rather than dropping work moved under it ` +
+            `before its run-lease was visible`,
+        );
+      }
+
       leaseTimer = setInterval(() => {
         if (leaseSettled) return; // run is settling — don't publish a fresh lease behind finally's clear
         // Serialize refreshes by CHAINING onto the in-flight promise rather than overwriting it
@@ -2420,6 +2457,30 @@ export function inactiveAgentTickets(
     out.push({ id: t.id, agent });
   }
   return out;
+}
+
+/**
+ * How the target's ticket subtree moved between this run's selection and a board that can see the
+ * run's lease (anton-e42l), named for the error — or undefined when it didn't move.
+ *
+ * Ids only, and status-blind on purpose: `runTickets` filters on SHAPE, not state, so a ticket
+ * another machine merely closed mid-window is in both sets and reads as no drift. What this is for
+ * is a bead genuinely attached to (or pulled out of) the target while the run was starting up —
+ * chiefly an approved gardener re-parent, which is allowed to attach work to any card no run is
+ * visibly holding.
+ */
+export function ticketSetDrift(selected: Bead[], confirmed: Bead[]): string | undefined {
+  const before = new Set(selected.map((t) => t.id));
+  const after = new Set(confirmed.map((t) => t.id));
+  const attached = [...after].filter((id) => !before.has(id));
+  const detached = [...before].filter((id) => !after.has(id));
+  if (attached.length === 0 && detached.length === 0) return undefined;
+  return [
+    attached.length > 0 ? `attached ${attached.join(", ")}` : "",
+    detached.length > 0 ? `detached ${detached.join(", ")}` : "",
+  ]
+    .filter(Boolean)
+    .join("; ");
 }
 
 /**
