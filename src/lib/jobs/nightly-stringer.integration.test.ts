@@ -64,11 +64,16 @@ describeBd("nightly-stringer e2e (real handler · real bd · fake stringer/claud
     const fakeStringer = writeBin(
       binDir,
       "stringer",
-      `const fs=require('fs');const a=process.argv.slice(2);
+      `const fs=require('fs');const path=require('path');const a=process.argv.slice(2);
 const oi=a.indexOf('-o');const out=oi>=0?a[oi+1]:null;
 const n=Number(process.env.FAKE_STRINGER_SIGNALS||'0');
 const signals=Array.from({length:n},(_,i)=>({Source:'todo',Kind:'todo',FilePath:'x.ts',Line:i+1,Title:'TODO '+i}));
 if(out)fs.writeFileSync(out,JSON.stringify({signals,metadata:{}}));
+// Advance the --delta baseline on the way out, as the real stringer does: the window a scan saw
+// is gone from the next one unless the caller puts this file back.
+if(a.includes('--delta')){const state=path.join(a[1],'.stringer','last-scan.json');
+  let m=0;try{m=JSON.parse(fs.readFileSync(state,'utf8')).n+1;}catch{}
+  fs.mkdirSync(path.dirname(state),{recursive:true});fs.writeFileSync(state,JSON.stringify({n:m}));}
 if(process.env.FAKE_STRINGER_STDERR)process.stderr.write(process.env.FAKE_STRINGER_STDERR+'\\n');
 process.exit(0);`,
     );
@@ -84,6 +89,11 @@ let prompt='';process.stdin.setEncoding('utf8');
 process.stdin.on('data',c=>{prompt+=c;});
 process.stdin.on('end',()=>{
   if(process.env.ANTON_TEST_CLAUDE_ARGV)fs.appendFileSync(process.env.ANTON_TEST_CLAUDE_ARGV,JSON.stringify({prompt})+'\\n');
+  // Triage dying before it writes a bead — a quota abort reports is_error while still exiting 0.
+  if(process.env.FAKE_CLAUDE_FAIL){
+    process.stdout.write(JSON.stringify({type:'result',subtype:'error_during_execution',result:'usage limit reached',is_error:true})+'\\n');
+    process.exit(0);
+  }
   const m=prompt.match(/scan file to triage is: (\\S+)/);
   if(m){const scan=JSON.parse(fs.readFileSync(m[1],'utf8'));
     for(const s of (scan.signals||[])){
@@ -162,6 +172,42 @@ process.stdin.on('end',()=>{
     // No beads created, claude never ran (no argv file written).
     expect((await beads.list(repo, ["--status", "all"])).length).toBe(beadsBefore);
     expect(existsSync(join(sandbox, "claude-argv.jsonl"))).toBe(false);
+  });
+
+  // The scan consumed a --delta window it never reported: left advanced, the retry would find
+  // nothing new and close the pass green over findings nobody triaged.
+  it("puts the --delta baseline back when triage dies, so the retry re-triages the same window", async () => {
+    process.env.FAKE_STRINGER_SIGNALS = "2";
+    process.env.FAKE_CLAUDE_FAIL = "1";
+    const state = join(repo, ".stringer", "last-scan.json");
+    const readState = () => (existsSync(state) ? readFileSync(state, "utf8") : null);
+    const before = readState();
+    const beadsBefore = (await beads.list(repo, ["--status", "all"])).length;
+    const sessionsBefore = new Set((await tdb.db.select().from(schema.sessions)).map((s) => s.id));
+
+    let jobId: string;
+    try {
+      jobId = await runScan();
+    } finally {
+      delete process.env.FAKE_CLAUDE_FAIL;
+    }
+
+    // Rescheduled behind the quota cool-off, no beads written — and the window is back where the
+    // pass found it, so the post-quota retry is the one that triages these signals.
+    const failed = await getJob(tdb.db, jobId);
+    expect(failed?.status).not.toBe("done");
+    expect(failed?.lastError).toContain("usage-limit");
+    expect(readState()).toBe(before);
+    expect((await beads.list(repo, ["--status", "all"])).length).toBe(beadsBefore);
+
+    // The session says what it unwound, so an operator reads the retry's rescan as intended.
+    const sessions = await tdb.db.select().from(schema.sessions);
+    const session = sessions.find((s) => !sessionsBefore.has(s.id))!;
+    expect(readFileSync(session.logPath!, "utf8")).toContain("--delta baseline restored");
+
+    // ...and the retry gets all the way to beads.
+    expect((await getJob(tdb.db, await runScan()))?.status).toBe("done");
+    expect((await beads.list(repo, ["--status", "all"])).length).toBe(beadsBefore + 2);
   });
 
   it("warns on the session when a collector died, even with no signals to triage (anton-uspu)", async () => {

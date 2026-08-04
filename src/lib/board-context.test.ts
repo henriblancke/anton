@@ -441,6 +441,20 @@ describe("formatBoardContext", () => {
     expect(out).toContain("open and closed");
   });
 
+  // `bd defer` is a human's "not now". A bare `attach:feature` would have an unattended nightly
+  // scan grow a snoozed outcome, reversing that decision without anyone deciding to — and dropping
+  // the epic instead would read as "no home exists" and mint a duplicate outcome beside it.
+  it("marks a deferred epic undefer-first rather than freely attachable", () => {
+    const out = formatBoardContext(
+      buildBoardContext([
+        bead({ id: "e-7", issue_type: "epic", status: "deferred", title: "Search is fast" }),
+      ]),
+    );
+
+    expect(out).toContain("e-7 · attach:undefer-first (deferred — `bd undefer e-7` before linking");
+    expect(out).not.toContain("e-7 · attach:feature");
+  });
+
   // An open feature carrying a fingerprint is legitimately both a routing candidate and a dedup
   // target, so it renders under two headings with two different verdicts. Dropping it from either
   // list would cost triage something it needs (the dedup target, or the surface it routes into), so

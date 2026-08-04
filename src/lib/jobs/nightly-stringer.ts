@@ -4,15 +4,22 @@
  * worth doing into contract-shaped beads (claude writes them via `bd`). One scan → a handful of
  * beads per project, deduped and clustered by the prompt. See DESIGN §4/§6 and skills/scan-triage/SKILL.md.
  *
- * Idempotent: `--delta` means a re-run (crash / quota backoff) doesn't re-triage signals already
- * seen; the worst case is claude re-reading a scan and deduping against the board it already wrote.
+ * Idempotent: `--delta` means a re-run (crash / quota backoff) doesn't re-triage signals a pass
+ * already triaged; a pass that died BEFORE triage puts its baseline back, so the retry rescans that
+ * window rather than skipping it. The worst case either way is claude re-reading a scan and deduping
+ * against the board it already wrote.
  */
 import { join } from "node:path";
 import { beads } from "../beads/bd";
 import { getProjectById, getProjectSettings, resolveScanSeverity } from "../projects";
 import { loadSkill } from "../claude/prompt";
 import { runClaude } from "../claude/driver";
-import { describeCollectorFailure, scan, type DeltaState } from "../stringer";
+import {
+  describeCollectorFailure,
+  rejectWithBaselineRestored,
+  scan,
+  type DeltaState,
+} from "../stringer";
 import {
   ANTON_CLASS_KEY,
   ANTON_SEVERITY_KEY,
@@ -117,9 +124,9 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
      * scan whose beads already landed.
      *
      * The flag guards the two call sites in THIS attempt; a retry runs a fresh handler with the flag
-     * back to false, so the durable half of the guarantee is `saveScanSummary` keying on the job id
-     * (a retried scan finds a baseline the first attempt already consumed, and would otherwise chart
-     * a phantom zero-signal point). A pass is ONE point on the trend however many attempts it took.
+     * back to false, so the durable half of the guarantee is `saveScanSummary` keying on the job id —
+     * a retry rescans the window this attempt unwound (see below) and would otherwise chart a second
+     * point for it. A pass is ONE point on the trend however many attempts it took.
      */
     let recorded = false;
     const recordHealth = async (counts: ScanCounts, opts: {
@@ -152,6 +159,22 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
     let collectorFailures = 0;
     let deltaState: DeltaState | undefined;
 
+    /**
+     * The scan's `--delta` unwind, and whether the pass got far enough to owe nothing to it.
+     *
+     * A delta scan CONSUMES its window: stringer advances the baseline on its way out, so signals
+     * this pass saw are not in the next scan. That is only sound once triage has actually read them —
+     * a pass that scanned and then died before triage (quota, abort, a crash between the two) would
+     * otherwise leave the retry rescanning the window AFTER the findings, seeing nothing new, and
+     * closing green over signals nobody ever triaged. So the failure path puts the baseline back.
+     *
+     * `triaged` flips only once triage returned ok. A triage that ran and then errored still replays:
+     * its beads are on the board, and §2 dedupes the rescan against the fingerprints it wrote — a
+     * duplicate bead is recoverable, a silently dropped finding is not.
+     */
+    let restoreScanBaseline: (() => Promise<string | undefined>) | undefined;
+    let triaged = false;
+
     try {
       // 1. Scan the repo for new signals.
       const scanFile = scanFilePath(sessionId);
@@ -163,6 +186,7 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
       counts = summarizeSignals(result.signals);
       collectorFailures = result.collectorFailures.length;
       deltaState = result.deltaState;
+      restoreScanBaseline = result.restoreBaseline;
       await ctx.heartbeat();
 
       // The trend can only subtract two scans that measured against the same stringer baseline, and
@@ -237,6 +261,8 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
       if (!claudeResult.ok) {
         throw new Error(`scan-triage reported an error: ${claudeResult.text ?? "unknown"}`);
       }
+      // Triage read the signals; from here the consumed --delta window is legitimately spent.
+      triaged = true;
 
       // 4. What triage did with the signals, out of its own closing report (skills/scan-triage §6).
       // A session that skipped the line records no counts rather than a fabricated zero.
@@ -262,8 +288,21 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
           ...(deltaState ? { deltaState } : {}),
         });
       }
+      // Give the untriaged window back (see `restoreScanBaseline`). When it can't go back, this
+      // returns poison and the runner parks for a human rather than retrying past lost findings —
+      // including past a quota backoff, whose retry would be the one closing green over them.
+      let failure = e;
+      if (!triaged && restoreScanBaseline) {
+        failure = await rejectWithBaselineRestored(e, restoreScanBaseline);
+        await appendSessionLog(
+          logPath,
+          failure === e
+            ? `[stringer] triage did not complete — --delta baseline restored; the retry rescans this window\n`
+            : `[stringer] ERROR: ${failure instanceof Error ? failure.message : String(failure)}\n`,
+        );
+      }
       await endSession(db, clock, sessionId, "failed");
-      throw e; // let the runner apply job-level durability (quota backoff / retry / park)
+      throw failure; // let the runner apply job-level durability (quota backoff / retry / park)
     }
   };
 }

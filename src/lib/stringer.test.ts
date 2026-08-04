@@ -347,6 +347,37 @@ describe("scan", () => {
       expect(retry.deltaState.before).toBe(first.deltaState.after);
     });
 
+    // Refusing the OUTPUT is not the only way a pass consumes a window without reporting it: a scan
+    // anton accepted and whose triage then died (quota, abort) leaves the same untriaged findings
+    // behind the advanced baseline, so the unwind is handed to the caller rather than kept private.
+    it("hands the caller an unwind for a scan it accepted but could not report", async () => {
+      process.env[STRINGER_BIN_ENV] = writeBaselineStringer();
+      const state = join(dir, ".stringer", "last-scan.json");
+      await scan({ repoPath: dir, scanFile: join(dir, "s1.json") });
+      const beforeSecond = readFileSync(state, "utf8");
+
+      const second = await scan({ repoPath: dir, scanFile: join(dir, "s2.json") });
+      expect(readFileSync(state, "utf8")).not.toBe(beforeSecond);
+      expect(await second.restoreBaseline()).toBeUndefined();
+      expect(readFileSync(state, "utf8")).toBe(beforeSecond);
+
+      // ...so the retry measures the window the failed pass saw, not the empty one after it.
+      const retry = await scan({ repoPath: dir, scanFile: join(dir, "s3.json") });
+      expect(retry.deltaState.before).toBe(second.deltaState.before);
+    });
+
+    it("reports why an unwind failed, so the caller can fail loud instead of silently retrying", async () => {
+      process.env[STRINGER_BIN_ENV] = writeBaselineStringer();
+      const result = await scan({ repoPath: dir, scanFile: join(dir, "s1.json") });
+
+      // Nowhere to put the bytes back (the state path is now a directory) — the honest answer is a
+      // reason, never a silent success that leaves the retry measuring past the lost window.
+      rmSync(join(dir, ".stringer", "last-scan.json"), { force: true });
+      mkdirSync(join(dir, ".stringer", "last-scan.json"), { recursive: true });
+
+      expect(await result.restoreBaseline()).toMatch(/last-scan\.json/);
+    });
+
     it("undoes the baseline a refused FIRST scan established — there was none to go back to", async () => {
       process.env[STRINGER_BIN_ENV] = writeRejectingStringer("rejecting-first");
 

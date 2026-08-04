@@ -194,7 +194,7 @@ the founder to place.
    `--limit 0`, because the default 50 would hide the matching epic and mint a duplicate.
    Match on `area:` first — the product surface the signal's files sit on — then on theme. Debt in the auth module belongs under whatever outcome already owns auth.
    Then confirm the match is **safe to attach to** — the board-context epic lines already carry that
-   verdict (`attach:feature` / `attach:reopen-first` / `attach:no (PRE-TIER …)`); for an epic that
+   verdict (`attach:feature` / `attach:reopen-first` / `attach:undefer-first` / `attach:no (PRE-TIER …)`); for an epic that
    section omitted, or when it is unavailable, derive it with `bd children <epic-id>`:
    - **Pre-tier epic** (direct `task`/`bug`/`chore` children, no `feature` child): that epic is
      itself a run target, and the first feature you hang under it turns it into a container — its
@@ -206,6 +206,10 @@ the founder to place.
      (`bd reopen <epic-id> --reason 'new work from stringer triage'`) before linking. Attaching a feature does not reopen its parent, and a closed epic with open
      features under it reads as a delivered outcome on the roadmap while its features sit in the
      backlog. If you can't justify reopening it, it isn't the right home.
+   - **Deferred epic** (`attach:undefer-first` in the board context): a human snoozed that outcome
+     with `bd defer`. Undefer it (`bd undefer <epic-id>`) before linking, so resuming the outcome is
+     a recorded act rather than a side effect of a nightly scan. If you can't justify waking it,
+     it isn't the right home — file the work per §4.3 instead.
 2. **Nothing fits, but you can name the outcome → create the epic.** State it as an outcome a
    stakeholder would recognise ("Dependencies are current and CVE-free"), not a restatement of the
    feature ("Upgrade stale deps"). Give it exactly one `area:` label and Success Criteria that

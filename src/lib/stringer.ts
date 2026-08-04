@@ -158,6 +158,13 @@ export interface ScanResult {
   collectorFailures: CollectorFailure[];
   /** Which baseline this scan measured against, and which one it left (see {@link DeltaState}). */
   deltaState: DeltaState;
+  /**
+   * Put the `--delta` baseline back where this scan found it, for a caller that consumed this
+   * window and then failed to REPORT it (triage died, the job was aborted). Returns why it couldn't,
+   * or undefined on success — see {@link rejectWithBaselineRestored}, which turns that into the
+   * right kind of failure. A no-op for a non-delta scan, which consumed no window.
+   */
+  restoreBaseline: () => Promise<string | undefined>;
 }
 
 /** Where stringer keeps the delta baseline — under the scanned repo, whatever anton's own cwd is. */
@@ -252,13 +259,16 @@ async function restoreBaseline(
  * over findings nobody triaged — the same false green the rejection exists to prevent, now dressed
  * as a success. Only a human can put the window back (reset the state file, or rescan with delta
  * off), so the job parks for one instead of burning attempts on a retry that cannot see the window.
+ *
+ * Exported because rejecting the scan's OUTPUT is not the only way a pass consumes a window without
+ * reporting it: a scan whose triage then dies has the same problem, and must fail the same way
+ * (see {@link ScanResult.restoreBaseline}).
  */
-async function rejectWithBaselineRestored(
+export async function rejectWithBaselineRestored(
   err: unknown,
-  repoPath: string,
-  baseline: BaselineSnapshot,
+  restore: () => Promise<string | undefined>,
 ): Promise<unknown> {
-  const problem = await restoreBaseline(repoPath, baseline);
+  const problem = await restore();
   if (!problem) return err;
   return new PoisonError(
     `${err instanceof Error ? err.message : String(err)}. Worse, stringer's --delta baseline could ` +
@@ -446,6 +456,8 @@ export async function scan(opts: {
   // scan counts the whole repo whatever is on disk, so it consumes no baseline at all.
   const baseline = delta ? await readBaseline(opts.repoPath) : undefined;
   const before = baseline?.kind === "read" ? baseline.id : undefined;
+  const unwind = async (): Promise<string | undefined> =>
+    baseline ? restoreBaseline(opts.repoPath, baseline) : undefined;
 
   const args = ["scan", opts.repoPath, "--format", "json", "-o", opts.scanFile];
   if (delta) args.push("--delta");
@@ -474,7 +486,7 @@ export async function scan(opts: {
   } catch (err) {
     // Refusing the output means refusing the whole pass, baseline included: the retry has to see the
     // same window this attempt consumed, or its findings are lost to a clean-looking rescan.
-    throw baseline ? await rejectWithBaselineRestored(err, opts.repoPath, baseline) : err;
+    throw await rejectWithBaselineRestored(err, unwind);
   }
 
   const after = delta ? await deltaStateId(opts.repoPath) : undefined;
@@ -488,5 +500,6 @@ export async function scan(opts: {
       ...(after ? { after } : {}),
       ...(baselineScan === undefined ? {} : { baselineScan }),
     },
+    restoreBaseline: unwind,
   };
 }

@@ -240,8 +240,11 @@ function parentOf(bead: Bead): string | undefined {
   )?.depends_on_id;
 }
 
+/** `bd defer` — snoozed out of the ready queue by a human, but still live work (see `beads.defer`). */
+const DEFERRED = "deferred";
+
 /** The statuses that make a bead live work — a routing target, and a ticket a feature can strand. */
-const OPEN_STATUSES = new Set(["open", "in_progress", "blocked", "deferred"]);
+const OPEN_STATUSES = new Set(["open", "in_progress", "blocked", DEFERRED]);
 
 /**
  * Whether this triage may hang a child ticket on an open feature. Mirrors skills/scan-triage §3.2:
@@ -435,12 +438,22 @@ function omissionLine(count: number, what: string, how = "`bd list --json --limi
 }
 
 /**
- * An epic's line verdict. A closed epic reads `attach:reopen-first`, never a bare `attach:feature`:
- * linking a feature does not reopen its parent, so a closed epic with open features under it reads
- * as a delivered outcome on the roadmap while its work sits in the backlog (§4.1).
+ * An epic's line verdict. Two statuses are structurally attachable but carry a human decision that a
+ * bare `attach:feature` would silently reverse, so each names the command that reverses it explicitly:
+ *
+ * - **closed** → `attach:reopen-first`: linking a feature does not reopen its parent, so a closed
+ *   epic with open features under it reads as a delivered outcome on the roadmap while its work sits
+ *   in the backlog (§4.1).
+ * - **deferred** → `attach:undefer-first`: `bd defer` is a human's "not now" (see `beads.defer`), and
+ *   hanging fresh work under a snoozed outcome resumes it without anyone deciding to. Not dropped
+ *   from the candidates entirely — an invisible home is one triage concludes doesn't exist, and it
+ *   mints a duplicate outcome beside it — so it stays visible behind an explicit `bd undefer`.
  */
 function epicVerdictLine(epic: EpicCandidate): string {
   if (!epic.attachable) return `attach:no (${epic.attachReason})`;
+  if (epic.status === DEFERRED) {
+    return `attach:undefer-first (deferred — \`bd undefer ${epic.id}\` before linking; ${epic.attachReason})`;
+  }
   return OPEN_STATUSES.has(epic.status)
     ? `attach:feature (${epic.attachReason})`
     : `attach:reopen-first (${epic.status} — \`bd reopen ${epic.id}\` before linking; ${epic.attachReason})`;
@@ -485,8 +498,10 @@ export function formatBoardContext(ctx: BoardContext): string {
     "Every epic on the board, **open and closed** — this IS the `bd list --type epic --all` read of",
     "§4.1, so a closed outcome that already owns the surface is visible rather than looking like a",
     "home that doesn't exist. `attach:reopen-first` means it fits but must be reopened before you",
-    "link. Open epics are listed first. Abandoned epics are omitted — a won't-do decision is not a",
-    "placement candidate; if a signal genuinely revives one, that is a human's call, not this pass's.",
+    "link; `attach:undefer-first` means a human snoozed it (`bd defer`) and it must be undeferred",
+    "before you link — run that command, don't link under a snoozed outcome. Open epics are listed",
+    "first. Abandoned epics are omitted — a won't-do decision is not a placement candidate; if a",
+    "signal genuinely revives one, that is a human's call, not this pass's.",
     "",
   );
   if (ctx.epics.length === 0) {
