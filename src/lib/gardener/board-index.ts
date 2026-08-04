@@ -208,8 +208,10 @@ export function runClaimOf(bead: Bead): string {
  * signal until its execute job publishes. A detector that proposes against it is proposing to move
  * work another machine already owns.
  *
- * Asked only where the proposal would MOVE a bead (reparent.ts). Retirement deliberately does not
- * ask it: a claim nobody has touched for weeks is exactly what the stale detector is about.
+ * Asked wherever a proposal would MOVE, ORDER or SETTLE a bead — reparent.ts, relink.ts's
+ * `canOrder`, retire.ts's superseded and shipped-orphan detectors — and by emit.ts before folding a
+ * duplicate proposal into its twin. Retirement's `stale` detector is the one deliberate exception:
+ * a claim nobody has touched for weeks is exactly what that detector is about.
  */
 export function isClaimed(bead: Bead): boolean {
   return runClaimOf(bead) !== "";
