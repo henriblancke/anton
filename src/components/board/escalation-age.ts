@@ -14,8 +14,15 @@ export function stuckFor(ms: number): string {
  * the age the sweep froze into the finding. The live value is the honest one: an escalation raised
  * at 02:00 and still open at 09:00 has been stuck seven hours, not the twenty minutes the sweep saw.
  *
- * A plain function, not a prop default, so the clock read stays out of the component's render.
+ * A plain function, not a prop default, so the clock read stays out of the component's render — and
+ * `nowMs` is REQUIRED to get the live value rather than defaulting to `Date.now()`. The caller is a
+ * Client Component, which renders once on the server and again when the browser hydrates; a default
+ * clock read here would give those two renders two different answers whenever a stall crossed a
+ * minute boundary between them, which React reports as a hydration mismatch. Callers with no clock
+ * to offer (the server pass, the pre-hydration pass) get the sweep's frozen age, which is server
+ * data and therefore identical on both sides. See StuckFor in attention-strip.tsx.
  */
-export function escalationAge(escalation: EscalationView, nowMs = Date.now()): string {
-  return stuckFor(escalation.since ? nowMs - escalation.since * 1000 : escalation.ageMs);
+export function escalationAge(escalation: EscalationView, nowMs?: number): string {
+  if (nowMs === undefined || !escalation.since) return stuckFor(escalation.ageMs);
+  return stuckFor(nowMs - escalation.since * 1000);
 }

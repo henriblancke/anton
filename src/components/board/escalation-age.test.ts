@@ -37,6 +37,18 @@ describe("escalationAge", () => {
   it("uses the sweep's frozen age only when nothing recorded a start time", () => {
     expect(at({ since: undefined, ageMs: 2 * HOUR })).toBe("2h");
   });
+
+  it("reads the sweep's frozen age when given no clock, so a prerender and its hydration agree", () => {
+    // The caller is a Client Component, rendered once on the server and once again in the browser.
+    // A Date.now() default here would hand those two renders two different clocks, and a stall
+    // sitting on a minute boundary would print different text on each side — which React treats as
+    // a hydration mismatch and resolves by throwing the subtree away. With no clock the answer is
+    // server data, identical on both sides however far apart they happen.
+    const stalled = { ...escalation(), since: Math.floor((NOW - 7 * HOUR) / 1000), ageMs: 20 * 60_000 };
+    expect(escalationAge(stalled)).toBe("20m");
+    // …and the live clock still wins once there is one to offer.
+    expect(escalationAge(stalled, NOW)).toBe("7h");
+  });
 });
 
 describe("stuckFor", () => {

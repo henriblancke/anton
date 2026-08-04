@@ -1,6 +1,6 @@
 "use client";
 
-import { useId, useState } from "react";
+import { useId, useState, useSyncExternalStore } from "react";
 import { ChevronDownIcon, ChevronRightIcon, TriangleAlertIcon } from "lucide-react";
 import Link from "next/link";
 
@@ -115,6 +115,10 @@ export function AttentionStrip({
 
   const applied = hasAppliedActions(hygiene);
   const patrolled = hygiene ? <RelativeTime iso={iso(hygiene.generatedAt)} /> : null;
+  // What the patrol closed, by id. The header only has room for the count, so the ids live in the
+  // disclosure — which therefore has to open for them even on a board with no housekeeping at all.
+  const closedEpics = hygiene?.actions.closedEpics ?? [];
+  const expandable = counts.housekeeping > 0 || closedEpics.length > 0;
 
   // Nothing has stopped and nothing is untrustworthy: one line, whether the patrol found literally
   // nothing or only tidy-up. Housekeeping is real but it is not a reason to push the columns down,
@@ -152,7 +156,7 @@ export function AttentionStrip({
             </span>
           ) : null}
           <span className="flex-1" />
-          {counts.housekeeping > 0 ? (
+          {expandable ? (
             <DisclosureButton
               open={showHousekeeping}
               controls={`${bodyId}-housekeeping`}
@@ -160,17 +164,22 @@ export function AttentionStrip({
             />
           ) : null}
         </div>
-        {showHousekeeping && counts.housekeeping > 0 ? (
-          <ul
+        {showHousekeeping && expandable ? (
+          <div
             id={`${bodyId}-housekeeping`}
             className="flex flex-col gap-1.5 border-t border-border/60 px-3 py-2"
           >
-            {housekeeping.map((item) => (
-              <li key={item.key} className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
-                <AttentionRow slug={slug} item={item} onOpenBead={onOpenBead} />
-              </li>
-            ))}
-          </ul>
+            <AppliedEpics closedEpics={closedEpics} onOpenBead={onOpenBead} />
+            {counts.housekeeping > 0 ? (
+              <ul className="flex flex-col gap-1.5">
+                {housekeeping.map((item) => (
+                  <li key={item.key} className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+                    <AttentionRow slug={slug} item={item} onOpenBead={onOpenBead} />
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </div>
         ) : null}
       </section>
     );
@@ -232,11 +241,16 @@ export function AttentionStrip({
           </li>
         ))}
 
-        {housekeeping.length > 0 ? (
+        {expandable ? (
           <li className="flex flex-col gap-1.5 px-3 py-2">
             <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+              {/* The folded line names what opening it will show. With no housekeeping the only
+                  thing inside is the patrol's own writes, so it says that rather than sitting
+                  blank next to a Show button. */}
               <span className="text-xs text-muted-foreground">
-                {housekeepingSummary(housekeeping)}
+                {housekeeping.length > 0
+                  ? housekeepingSummary(housekeeping)
+                  : "which epics the patrol closed"}
               </span>
               <span className="flex-1" />
               <DisclosureButton
@@ -246,13 +260,18 @@ export function AttentionStrip({
               />
             </div>
             {showHousekeeping ? (
-              <ul id={`${bodyId}-housekeeping`} className="flex flex-col gap-1.5 pt-1">
-                {housekeeping.map((item) => (
-                  <li key={item.key} className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
-                    <AttentionRow slug={slug} item={item} onOpenBead={onOpenBead} />
-                  </li>
-                ))}
-              </ul>
+              <div id={`${bodyId}-housekeeping`} className="flex flex-col gap-1.5 pt-1">
+                <AppliedEpics closedEpics={closedEpics} onOpenBead={onOpenBead} />
+                {housekeeping.length > 0 ? (
+                  <ul className="flex flex-col gap-1.5">
+                    {housekeeping.map((item) => (
+                      <li key={item.key} className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+                        <AttentionRow slug={slug} item={item} onOpenBead={onOpenBead} />
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
+              </div>
             ) : null}
           </li>
         ) : null}
@@ -286,6 +305,66 @@ function DisclosureButton({
       )}
       {open ? "Hide" : "Show"}
     </button>
+  );
+}
+
+/** Nothing to watch: the answer flips once, when React finishes hydrating, and never again. */
+function subscribeToHydration(): () => void {
+  return () => {};
+}
+
+/**
+ * How long a stall has been stuck — the sweep's frozen age until the browser has hydrated, the live
+ * age afterwards.
+ *
+ * This strip is a Client Component, so every row renders twice: once in the server prerender and
+ * once in the browser's hydration pass. Reading the clock in both would give two different answers
+ * for any stall that crossed a minute (or hour, or day) boundary between them, and React resolves a
+ * subtree that hydrates to different text by throwing it away. The sweep's `ageMs` is server data
+ * and so reads identically on both sides.
+ *
+ * `useSyncExternalStore` with a server snapshot — the shape `useActiveSection` uses in the settings
+ * form — rather than an effect that seeds state: React reads `getServerSnapshot` on BOTH sides of
+ * hydration by construction, so there is no render where the two can disagree.
+ *
+ * The clock is read once per mount rather than on every render: an age that changed mid-render
+ * would make this component impure, and the value is printed beside "patrolled 6h ago" in units no
+ * finer than a minute, so a strip that re-renders is not a strip that needs a new reading.
+ */
+function StuckFor({ escalation }: { escalation: EscalationView }) {
+  const hydrated = useSyncExternalStore(
+    subscribeToHydration,
+    () => true,
+    () => false,
+  );
+  const [mountedAt] = useState(() => Date.now());
+  return <>stuck {escalationAge(escalation, hydrated ? mountedAt : undefined)}</>;
+}
+
+/**
+ * The epics the patrol closed on its own pass, named rather than counted.
+ *
+ * The collapsed line says how many; this says WHICH. The retired hygiene panel linked every one,
+ * and a count alone tells an operator that the board changed under them without telling them what
+ * changed — the half of the report they can actually act on. Folded into the disclosure so the
+ * collapsed strip stays one line.
+ */
+function AppliedEpics({
+  closedEpics,
+  onOpenBead,
+}: {
+  closedEpics: string[];
+  onOpenBead: (beadId: string) => void;
+}) {
+  if (closedEpics.length === 0) return null;
+  return (
+    <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1 text-xs text-muted-foreground">
+      <span className="text-foreground">Applied</span>
+      <span>every child was closed, so the patrol closed:</span>
+      {closedEpics.map((id) => (
+        <BeadLink key={id} id={id} onOpenBead={onOpenBead} />
+      ))}
+    </div>
   );
 }
 
@@ -346,7 +425,9 @@ function AttentionRow({
             <MetaChip tone="risk-high">
               {ESCALATION_LABELS[escalation.kind] ?? escalation.kind}
             </MetaChip>
-            <MetaChip>stuck {escalationAge(escalation)}</MetaChip>
+            <MetaChip>
+              <StuckFor escalation={escalation} />
+            </MetaChip>
             {escalation.epicBeadId ? (
               <Link
                 href={`/projects/${slug}/epics/${escalation.epicBeadId}`}

@@ -124,6 +124,59 @@ describe("AttentionStrip", () => {
     });
   });
 
+  /**
+   * The patrol writes to the board on its own authority. A count of what it changed is not a report
+   * an operator can act on — the retired hygiene panel named every epic it closed, and that is the
+   * part they need to go and check. Compact when folded, complete when opened.
+   */
+  describe("what the patrol closed", () => {
+    const closed = { closedEpics: ["anton-e1", "anton-e2"], rowsRecomputed: 0 };
+
+    it("names the epics it closed, behind the disclosure, on an otherwise clean board", () => {
+      renderStrip({ hygiene: report([], { actions: closed }) });
+      // Folded: the count only.
+      expect(screen.queryByText("anton-e1")).toBeNull();
+
+      fireEvent.click(screen.getByRole("button", { name: /show/i }));
+      expect(screen.getByText("anton-e1")).toBeTruthy();
+      expect(screen.getByText("anton-e2")).toBeTruthy();
+    });
+
+    it("keeps them alongside the housekeeping list when there is one", () => {
+      renderStrip({
+        hygiene: report([finding("lint", "anton-t1")], { actions: closed }),
+      });
+      fireEvent.click(screen.getByRole("button", { name: /show/i }));
+      expect(screen.getByText("anton-e1")).toBeTruthy();
+      expect(screen.getByText("lint on anton-t1")).toBeTruthy();
+    });
+
+    it("keeps them reachable when something more urgent is holding the rows", () => {
+      // Escalations push housekeeping into the folded tail; the closed epics ride along with it
+      // rather than disappearing because the strip had a stall to show instead.
+      renderStrip({
+        escalations: [escalation()],
+        // Not anton-e1: the stall already links that epic, and this asserts the disclosure's copy.
+        hygiene: report([], { actions: { closedEpics: ["anton-e7"], rowsRecomputed: 0 } }),
+      });
+      fireEvent.click(screen.getByRole("button", { name: /show/i }));
+      expect(screen.getByText("anton-e7")).toBeTruthy();
+    });
+
+    it("opens the ticket dialog for a closed epic, like every other bead the strip names", () => {
+      const onOpenBead = vi.fn();
+      renderStrip({ hygiene: report([], { actions: closed }), onOpenBead });
+      fireEvent.click(screen.getByRole("button", { name: /show/i }));
+      fireEvent.click(screen.getByText("anton-e1"));
+      expect(onOpenBead).toHaveBeenCalledWith("anton-e1");
+    });
+
+    it("offers no disclosure when the patrol neither changed nor found anything", () => {
+      renderStrip({ hygiene: report([]) });
+      expect(screen.queryByRole("button", { name: /show/i })).toBeNull();
+    });
+  });
+
   describe("escalations — everything the old panel offered", () => {
     it("leads with what stalled, for how long, and why", () => {
       renderStrip({ escalations: [escalation()] });
@@ -137,6 +190,38 @@ describe("AttentionStrip", () => {
     it("falls back to the sweep's frozen age when the finding recorded no start time", () => {
       renderStrip({ escalations: [escalation({ since: undefined, ageMs: 2 * HOUR })] });
       expect(screen.getByText("stuck 2h")).toBeTruthy();
+    });
+
+    it("shows the frozen age until hydration, so the two renders can't disagree", () => {
+      // The strip is a Client Component: it renders once on the server and again when the browser
+      // hydrates. Reading the clock in both would print two different ages for any stall sitting on
+      // a minute boundary, and React discards a subtree that hydrates to different text. The first
+      // render therefore has to use server data — the age the sweep froze — and only reach for the
+      // live clock in the effect that runs after hydration.
+      const sweptAt = Date.now() - 9 * HOUR;
+      const { rerender } = render(
+        <AttentionStrip
+          slug="anton"
+          escalations={[escalation({ since: Math.floor(sweptAt / 1000), ageMs: 2 * HOUR })]}
+          hygiene={undefined}
+          trajectory={undefined}
+          onOpenBead={vi.fn()}
+        />,
+      );
+      // Effects have flushed by now, so this is the post-hydration value: aged as of NOW (9h), not
+      // the 2h the sweep recorded. The pre-hydration value is asserted through the pure helper in
+      // escalation-age.test.ts, which is where the two-clock rule actually lives.
+      expect(screen.getByText("stuck 9h")).toBeTruthy();
+      rerender(
+        <AttentionStrip
+          slug="anton"
+          escalations={[escalation({ since: Math.floor(sweptAt / 1000), ageMs: 2 * HOUR })]}
+          hygiene={undefined}
+          trajectory={undefined}
+          onOpenBead={vi.fn()}
+        />,
+      );
+      expect(screen.getByText("stuck 9h")).toBeTruthy();
     });
 
     it("links the epic a resume would target, and the PR when the stall is a review", () => {
