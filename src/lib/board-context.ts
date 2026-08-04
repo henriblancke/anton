@@ -211,7 +211,10 @@ export function parseTouches(bead: Bead): string[] {
       const path = asPath(part);
       if (path) seen.add(path);
     }
-    if (rest.length > 0 || !/,\s*$/.test(line)) break;
+    // An empty header line is not a closed list: a bead that indents every path below `touches:`
+    // leaves nothing here that COULD have ended in a comma, and breaking on that reports no surface
+    // at all — the misroute this module exists to prevent.
+    if (rest.length > 0 || (line.trim() !== "" && !/,\s*$/.test(line))) break;
   }
   return [...seen];
 }

@@ -93,8 +93,9 @@ export interface ScanSummary {
    *
    * It is what tells a retry's rescan apart from a continuation: a pass that dies before triage puts
    * the baseline BACK (src/lib/jobs/nightly-stringer.ts), so the retry measures from THIS value
-   * again and REPLAYS the same window — see {@link reconcileAttempt}. Written once, at insert:
-   * neither a replay nor a fold moves where the window opens.
+   * again and REPLAYS the same window — see {@link reconcileAttempt}. A whole-repo pass opens at no
+   * baseline, so absent here plus an observed {@link baselineScan} is that same proof. Written once,
+   * at insert: neither a replay nor a fold moves where the window opens.
    */
   deltaStateBefore?: string;
   /**
@@ -298,7 +299,11 @@ async function findScanSummaryByJob(
  *   triage, collector failures, and the baseline it left. Adding them instead would double-count the
  *   window; keeping the retained ones would strand a real day's arrivals and the successful triage
  *   report that came with them. A replay's re-measurement can also come back LOWER (fixed in the
- *   meantime), which is a fact about the repo and belongs on the point.
+ *   meantime), which is a fact about the repo and belongs on the point. A pass that ESTABLISHED the
+ *   baseline replays the same way, and names neither end: its window opens at no baseline at all, so
+ *   handing it back deletes the state file and the retry scanned the whole repo from absent again.
+ *   That is read off what both attempts OBSERVED ({@link ScanSummary.baselineScan}), never off a
+ *   missing `before` — an unidentified basis is not evidence of a window that reopened here.
  * - A CONTINUATION — the retry measured from where this point's window CLOSES, so the two windows
  *   abut and its signals fold in below. This is the shape of a pass that already triaged and then
  *   died: nothing was handed back, so the retry scanned the next window along.
@@ -369,10 +374,18 @@ async function reconcileAttempt(
   // baseline anton could not identify, which clears the point's rather than leaving a stale claim.
   const rescanned = input.deltaState !== undefined && existing.deltaState !== undefined;
   // Exactly where this point's own window OPENS: the retry rescanned it whole (the failure path
-  // handed it back), so its measurement replaces the retained one rather than joining it.
+  // handed it back), so its measurement replaces the retained one rather than joining it. A pass
+  // that ESTABLISHED the baseline opens at no baseline at all — handing that window back DELETES
+  // stringer's state file (lib/stringer), so the retry scanned from absent again and re-measured the
+  // same whole repo. Both ends must be an OBSERVED baseline scan: a missing `before` on a basis
+  // anton never identified is not evidence the window reopened where this one did.
   const replays =
-    input.deltaState?.before !== undefined &&
-    input.deltaState.before === existing.deltaStateBefore;
+    (input.deltaState?.before !== undefined &&
+      input.deltaState.before === existing.deltaStateBefore) ||
+    (input.deltaState?.baselineScan === true &&
+      input.deltaState.before === undefined &&
+      existing.baselineScan === true &&
+      existing.deltaStateBefore === undefined);
   // Exactly the state this point ended at: proof the retry's window starts where the point's ends,
   // and the only case where their counts can be one measurement. A replay wins the tie a point whose
   // window opened and closed on the same state would otherwise create — nothing was consumed there,

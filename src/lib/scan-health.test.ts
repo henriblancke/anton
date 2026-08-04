@@ -685,6 +685,66 @@ describe("the persisted series", () => {
     expect(next.delta).toBeUndefined();
   });
 
+  it("replays a retry of the pass that ESTABLISHED the baseline — the restore reopened that window", async () => {
+    // The project's first delta scan has no baseline to measure from, so it counts the whole repo;
+    // dying before triage hands that window back by DELETING the state file (lib/stringer), and the
+    // retry scans from absent again — the same whole repo, start to finish, so its 4 supersede the 9
+    // and the report it filed is the point's. Neither attempt names a `before`, which is exactly the
+    // shape of a window that opens at no baseline: reading it as a continuation charted the stale
+    // count, threw away a successful triage report, and left the point publishing no baseline at all.
+    await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 9 }),
+      deltaState: { after: "b1", baselineScan: true },
+    });
+    clock.advance(60_000);
+    const retry = await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 4 }),
+      deltaState: { after: "b2", baselineScan: true },
+      triage: { created: 2, deduped: 1 },
+    });
+
+    expect(retry.counts.total).toBe(4);
+    expect(retry.triage).toEqual({ created: 2, deduped: 1 });
+    expect(retry.deltaState).toBe("b2");
+
+    const rows = await listScanSummaries(tdb.db, projectId, 100);
+    expect(rows.length).toBe(1);
+    expect(rows[0].counts.total).toBe(4);
+    expect(rows[0].triage).toEqual({ created: 2, deduped: 1 });
+    expect(rows[0].deltaState).toBe("b2");
+    expect(rows[0].baselineScan).toBe(true);
+  });
+
+  it("refuses to replay into a point whose basis anton never identified", async () => {
+    // A missing `before` alone proves nothing: this point's basis was unreadable, so whether it
+    // counted the whole repo or arrivals is unknown, and a retry that established the baseline may
+    // have scanned a window this one never covered. Replacing a real measurement on that guess is
+    // the error that cannot be undone — an OBSERVED baseline on both ends is the proof, and without
+    // it the point keeps its counts and publishes no baseline (the gap behind it is real).
+    await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 5 }),
+      deltaState: { after: "b1" },
+    });
+    const retry = await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 90 }),
+      deltaState: { after: "b2", baselineScan: true },
+      triage: { created: 7, deduped: 0 },
+    });
+
+    expect(retry.counts.total).toBe(5);
+    expect(retry.triage).toBeUndefined();
+    expect(retry.deltaState).toBeUndefined();
+    expect((await listScanSummaries(tdb.db, projectId))[0].counts.total).toBe(5);
+  });
+
   it("moves the refresh token when a fold rewrites the newest row's counts", async () => {
     // The fold rewrites the row in place: a token that ignored the counts would keep 304-ing the
     // board past the very signals the fold exists to put on the chart.

@@ -182,6 +182,20 @@ describe("parseTouches", () => {
     ]);
   });
 
+  it("reads a list a hand-edited bead indented wholly below the `touches:` line", () => {
+    // Nothing on the header line means nothing that COULD have ended in a comma — reading that as a
+    // closed list reported no surface at all, routing every signal under those files as unowned.
+    const b = bead({
+      id: "a-1",
+      context: "touches:\n  src/lib/auth.ts, src/lib/sessions.ts,\n  src/lib/csv.ts\nrisk: low",
+    });
+    expect(parseTouches(b)).toEqual(["src/lib/auth.ts", "src/lib/sessions.ts", "src/lib/csv.ts"]);
+
+    // The empty line is not a licence to run on: an unindented line below it is still a sibling field.
+    const nothing = bead({ id: "a-2", context: "touches:\nrisk: low\n  src/lib/csv.ts" });
+    expect(parseTouches(nothing)).toEqual([]);
+  });
+
   it("stops at the next field, however the list below it is punctuated", () => {
     // The comma is what continues a list; without it the following line is another field, and the
     // path-shaped words in its prose are not surface this bead declared.
