@@ -219,8 +219,12 @@ async function findScanSummaryByJob(
  * invalidated. The first attempt's counts are the ones measured against the baseline the pass began
  * with, so they stand — but two facts about the point move:
  *
- * - TRIAGE: an attempt that finally got a report out of the session contributes it, rather than
- *   leaving the point claiming triage never reported.
+ * - TRIAGE: an attempt that finally got a report out of the session contributes it — but only one
+ *   that triaged THESE signals. An attempt carrying a scan window of its own rescanned, against a
+ *   baseline this point already consumed, so whatever it reported covers a different set of signals:
+ *   pinning it here would show seven retained signals triaged into the two beads a later window's
+ *   two signals produced. That attempt's outcome is dropped and the point stays "not reported",
+ *   which is the honest claim — until something replays the retained scan, nobody triaged it.
  * - THE BASELINE IT LEFT: the retry scanned again, so stringer's `--delta` state has advanced past
  *   the one the first attempt published. Keeping the stale value would leave the next scan measuring
  *   from a baseline nothing holds, so it could never prove comparability and an honest delta would be
@@ -235,7 +239,8 @@ async function reconcileAttempt(
   existing: ScanSummary,
   input: SaveScanSummaryInput,
 ): Promise<ScanSummary> {
-  const triage = !existing.triage && input.triage ? input.triage : undefined;
+  // A scan window of its own is what makes this attempt's report someone else's — see above.
+  const triage = !existing.triage && input.triage && !input.deltaState ? input.triage : undefined;
   // `deltaState` present at all means this attempt ran stringer, so the state moved — including to a
   // baseline anton could not identify, which clears the point's rather than leaving a stale claim.
   const rescanned = input.deltaState !== undefined && existing.deltaState !== undefined;

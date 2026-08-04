@@ -163,6 +163,49 @@ describe("parseTouches", () => {
     expect(parseTouches(bead({ id: "a-1", context: "touches: auth, routing, the build" }))).toEqual([]);
   });
 
+  it("follows a list an editor word-wrapped across lines", () => {
+    // A hand-edited bead wraps at 80 chars, and the trailing comma says the list is still open.
+    // Stopping at the newline dropped the tail silently — the file read as unowned, and nothing
+    // said a path had been left out.
+    const b = bead({
+      id: "a-1",
+      context:
+        "touches: src/lib/stringer.ts, src/lib/scan-health.ts, src/lib/board-context.ts,\n  src/lib/scan-severity.ts, src/lib/runs.ts,\n  Dockerfile\nrisk: low",
+    });
+    expect(parseTouches(b)).toEqual([
+      "src/lib/stringer.ts",
+      "src/lib/scan-health.ts",
+      "src/lib/board-context.ts",
+      "src/lib/scan-severity.ts",
+      "src/lib/runs.ts",
+      "Dockerfile",
+    ]);
+  });
+
+  it("stops at the next field, however the list below it is punctuated", () => {
+    // The comma is what continues a list; without it the following line is another field, and the
+    // path-shaped words in its prose are not surface this bead declared.
+    const b = bead({
+      id: "a-1",
+      context: "touches: src/lib/csv.ts\n  found while reading src/lib/runs.ts",
+    });
+    expect(parseTouches(b)).toEqual(["src/lib/csv.ts"]);
+
+    // Indentation is the other half: an unindented line is a sibling field even mid-list.
+    const unindented = bead({
+      id: "a-2",
+      context: "touches: src/lib/csv.ts,\nremediation: extract src/lib/runs.ts",
+    });
+    expect(parseTouches(unindented)).toEqual(["src/lib/csv.ts"]);
+
+    // And `;` closes the list on the line it appears, wrap or no wrap.
+    const semicolon = bead({
+      id: "a-3",
+      context: "touches: src/lib/csv.ts; remediation: extract,\n  src/lib/runs.ts",
+    });
+    expect(parseTouches(semicolon)).toEqual(["src/lib/csv.ts"]);
+  });
+
   it("reads a heading at ANY depth, exactly as the contract gate does", () => {
     // A `# Context` bead passes validation, so a routing parser that only took `##` reported no
     // touch surface for a conformant bead — and triage minted work beside it.

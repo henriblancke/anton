@@ -196,12 +196,22 @@ export function parseTouches(bead: Bead): string[] {
   const context = contextOf(bead);
   const marker = /(^|\n)\s*touches\s*:/i.exec(context);
   if (!marker) return [];
-  const after = context.slice(marker.index + marker[0].length);
-  const line = after.split(/\n|;/)[0] ?? "";
   const seen = new Set<string>();
-  for (const part of line.split(",")) {
-    const path = asPath(part);
-    if (path) seen.add(path);
+  // A hand-edited bead is the commonest source of a Context block, and an editor that word-wraps
+  // splits one list across lines — so the list continues onto an INDENTED line whenever the comma
+  // left it open. Both halves are required: a comma alone would join the next field on a bead that
+  // ends its list with one, and indentation alone would swallow the prose under a `Context:` heading,
+  // handing a feature paths it never declared. Anything else closes the list, dropping nothing that
+  // was declared as surface.
+  const lines = context.slice(marker.index + marker[0].length).split("\n");
+  for (const [i, raw] of lines.entries()) {
+    if (i > 0 && !/^\s+\S/.test(raw)) break;
+    const [line = "", ...rest] = raw.split(";");
+    for (const part of line.split(",")) {
+      const path = asPath(part);
+      if (path) seen.add(path);
+    }
+    if (rest.length > 0 || !/,\s*$/.test(line)) break;
   }
   return [...seen];
 }

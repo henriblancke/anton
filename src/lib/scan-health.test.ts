@@ -271,7 +271,9 @@ describe("the persisted series", () => {
     expect(all[0].counts.total).toBe(7);
   });
 
-  it("lets a retry contribute the triage outcome its first attempt died before reporting", async () => {
+  it("lets an attempt that scanned nothing of its own contribute the triage outcome", async () => {
+    // Only such an attempt can be reporting on the RETAINED signals: it consumed no window, so it
+    // triaged the one already on the point (see the rescan case below).
     await saveScanSummary(tdb.db, clock, {
       projectId,
       jobId: "job-1",
@@ -295,6 +297,33 @@ describe("the persisted series", () => {
     // The backfill rewrites the row in place: a token built from the row id alone would keep 304-ing
     // the board past the very write it exists to show.
     expect(await version()).not.toBe(before);
+  });
+
+  it("refuses a rescanning retry's triage — it reports on a different delta window", async () => {
+    // The first attempt found 7 signals against b0 and died before triage reported. The retry
+    // measures against b1, which the first attempt already advanced to: its 2 signals are new
+    // arrivals, and the 2 beads it filed are for THOSE. Copying that outcome onto the retained point
+    // would read "7 signals triaged into 2 beads" for seven signals nobody ever triaged.
+    await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 7 }),
+      deltaState: { before: "b0", after: "b1" },
+    });
+    const retry = await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 2 }),
+      deltaState: { before: "b1", after: "b2" },
+      triage: { created: 2, deduped: 0 },
+    });
+
+    expect(retry.counts.total).toBe(7);
+    expect(retry.triage).toBeUndefined();
+    const [row] = await listScanSummaries(tdb.db, projectId);
+    expect(row.triage).toBeUndefined();
+    // The baseline correction is a separate fact and still lands — the next scan consumes b2.
+    expect(row.deltaState).toBe("b2");
   });
 
   it("carries a retry's final baseline into the point it retained", async () => {
