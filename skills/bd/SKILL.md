@@ -37,20 +37,54 @@ only when it needs a dependency edge).
 Approval and execution stay per feature — approving an epic would be one button launching N PRs,
 which is not a gate.
 
-### The nesting rule
+### How big is a feature? (the two readings, settled)
 
-`epic → feature → task | bug | chore`. One parent per bead.
+One `feature` is **one worktree, one PR** — and it carries **2–6 tickets**. Those are not in
+tension: a feature's tickets are the *steps executed inside its single run*, not separate PRs. The
+run works through them in order and opens one PR at the end.
 
-- Every `feature` hangs off an `epic`. A feature with no plausible epic is a **question for the
-  user**, never a silent orphan (see the `shape` skill).
-- `task` / `bug` / `chore` hang off **a feature**, never off an epic. A ticket parented straight to
-  an epic is a dead bead: it isn't a run target (it has a parent), and no feature's run covers it.
-  Work that no feature holds — the security page, the ops step — is its own `feature`, or a
-  parentless ticket; it is never a loose child of the epic.
-- A genuine one-off that no epic would honestly hold is a **parentless `task`/`bug`** — a run of
-  one. Don't invent a single-feature epic to avoid it, and never nest a feature under a feature.
-  `chore` is not an option here: it only ever runs as a feature's child, so a parentless one is a
-  dead bead.
+So the tiers answer three different questions, and the ticket count is how you tell which one you're
+holding:
+
+- can't be delivered in one PR → it's an **epic**, split it into features;
+- one PR, several steps → it's a **feature**, 2–6 tickets under it;
+- one step → it's a **ticket**, and it belongs under some feature.
+
+A feature with **1** ticket is a shape question — you probably described the same work twice. A
+feature with **0** is legal (see invariant 5) but is what "make everything a feature" produces in
+bulk. Past **6**, the diff stops being reviewable in one sitting: that's two features.
+
+### The nesting rule — five invariants
+
+`epic → feature → task | bug | chore`. One parent per bead. These are checkable, and they are
+checked — `npm run board:check` (`scripts/board-structure.ts`, judging through
+`src/lib/beads/structure.ts`) prints every violation, and the approve route refuses on 1–3. Severity
+is one question and only one: **can this bead ever run?**
+
+**Blocking — a dead bead. It will never run, and no amount of waiting changes that.**
+
+1. **No ticket under a container epic.** A `task`/`bug`/`chore` whose parent is an epic that already
+   has a `feature` child is unreachable: it isn't a run target (it has a parent), and no feature's
+   run covers its parent's strays. Work that no feature holds — the security page, the ops step —
+   is its own `feature`, or a parentless ticket; never a loose child of the epic.
+   *(An epic with NO feature children still runs its own tickets — pre-tier boards are untouched.
+   The epic becomes a container the moment a feature lands under it, and its strays die then.)*
+2. **A feature hangs off an epic and nothing else.** Never a feature under a feature. Both are run
+   targets, so a nested one ships the same work twice — two claims, two worktrees, two PRs.
+3. **No parentless `chore`.** Only `task`/`bug` run standalone; a parentless chore is a dead bead.
+   Give it a feature parent or re-type it.
+
+**Advisory — it runs, but the shape costs later. Fix it; never let it block honest work.**
+
+4. **Every feature has an epic.** A parentless feature runs fine and appears on no roadmap. A
+   feature with no plausible epic is a **question for the user**, never a silent orphan (see the
+   `shape` skill).
+5. **A feature carries 2–6 tickets.** Zero is legal — `beads.groupsChildren` reads a childless
+   feature as its own single ticket, which is right for a genuinely atomic PR — but fifteen of them
+   at once means leaves got mistyped as features. Over six means it's two features.
+
+A genuine one-off that no epic would honestly hold is a **parentless `task`/`bug`** — a run of one.
+Don't invent a single-feature epic to avoid it.
 
 ### The run-target rule (what anton will actually run)
 
@@ -159,24 +193,72 @@ Then label and link (below). Run `bd lint <id>` — it enforces Acceptance Crite
 `feature`) / Success Criteria (`epic`); `/shape` and `/scan-triage` enforce the rest of the
 contract.
 
-## Epic → feature → tickets
+## Epic → feature → tickets — create the tree in ONE call
 
-Create the parent first, then link each child to it — the child is `bd link`'s first argument:
+**Write the whole tree as a graph plan and create it with `bd create --graph`.** A tree built by N
+sequential `bd create` + `bd link` calls fails halfway — a quoting error on ticket 9 of 21 leaves an
+epic and eight beads on the board, and the retry renumbers around the orphans. One plan file is
+reviewable *before* it is written, `--dry-run`-able, and atomic:
 
 ```bash
-# The outcome. Several features add up to it; it is never run itself.
-bd create "Reports are shareable outside the app" --type epic \
-  --acceptance $'- [ ] every report view leaves the app in a format a customer can open'
-# → EPIC_ID
-bd tag "$EPIC_ID" area:reports                           # exactly one area: on an epic
+cat > /tmp/plan.json <<'EOF'
+{
+  "nodes": [
+    {"key": "e", "title": "Reports are shareable outside the app", "type": "epic",
+     "labels": ["area:reports"],
+     "description": "## Outcome\nReports leave the app in a format customers open.\n\n## Success Criteria\n- [ ] every report view exports"},
 
-# The run target: one worktree, one PR.
-bd create "CSV export" --type feature --acceptance ...   # → FEAT_ID
-bd link "$FEAT_ID" "$EPIC_ID" --type parent-child        # feature is child of epic
+    {"key": "f", "title": "CSV export", "type": "feature", "parent_key": "e",
+     "labels": ["domain:eng", "risk:low", "size:S"],
+     "description": "## Goal\n…\n\n## Acceptance Criteria\n- [ ] …\n\n## Context\ntouches: …\n\n## Out of scope\n- …\n\n## Verify\n- …"},
 
-# The working layer, executed inside the feature's run.
-bd create "Add export button" --type task ...            # → T1
-bd link "$T1" "$FEAT_ID" --type parent-child             # T1 is child of the feature
+    {"key": "t1", "title": "Add export button", "type": "task", "parent_key": "f",
+     "labels": ["domain:eng"], "description": "## Goal\n…\n\n## Acceptance Criteria\n- [ ] …\n\n## Context\n…\n\n## Out of scope\n- …\n\n## Verify\n- …"},
+    {"key": "t2", "title": "Wire the endpoint", "type": "task", "parent_key": "f",
+     "description": "…"}
+  ],
+  "edges": [{"from_key": "t2", "to_key": "t1", "type": "blocks"}]
+}
+EOF
+
+bd create --graph /tmp/plan.json --dry-run   # read the tree back BEFORE writing it
+bd create --graph /tmp/plan.json             # prints key → real id for every node
+```
+
+The plan schema, verified on bd 1.1.2 — **unknown fields are dropped with only a warning**, so read
+the warnings:
+
+- node: `key` (plan-local handle), `title`, `type`, `parent_key` (another node) or `parent_id` (an
+  existing bead), `description`, `labels`, `priority`, `assignee`, `metadata`.
+- edge: `from_key`/`from_id`, `to_key`/`to_id`, `type` (`blocks`, `related`, `discovered-from`).
+- **There is no acceptance field.** `--graph` cannot set `acceptance_criteria`, so write the rubric
+  into the description under the heading **`## Acceptance Criteria`** — the one spelling both
+  `bd lint` and anton's contract read. (Bare `## Acceptance` satisfies anton and fails `bd lint`.)
+
+Parentage rides `parent_key`; there is no `bd link` step, and no shell variable to lose.
+
+### If you are creating beads one at a time anyway
+
+```bash
+FEAT_ID=$(bd create "CSV export" --type feature --description "$(cat body.md)" --silent)
+bd create "Add export button" --type task --parent "$FEAT_ID" ...   # --parent, not a second bd link
+```
+
+- `--silent` prints only the id — that is how you capture one. Don't parse the human output.
+- **Never put a heredoc inside command substitution.** `ID=$(bd create … <<'EOF' … EOF)` is a real
+  bash/zsh parser trap, and an apostrophe in the body is enough to detonate it. Write the body to a
+  file and pass `--body-file`, or use `--graph`.
+- `bd create --parent <id>` sets parentage at create time; `bd update <id> --parent <id>` reparents
+  later (empty string detaches). `bd link … --type parent-child` is the old two-step form.
+
+### A creation run that aborted halfway
+
+Before retrying, **list what landed and clean it up** — otherwise the retry renumbers around the
+orphans and you get an empty duplicate of the tree you meant to build:
+
+```bash
+bd list --status all --json --limit 0 | jq -r '.[] | select(.created_at > "<when you started>") | "\(.id) \(.issue_type) \(.title)"'
+bd delete <orphan-id>          # or `bd close <id>` if it is real work you'll keep
 ```
 
 Find the epic a feature belongs to before creating a new one:
@@ -216,6 +298,25 @@ bd show <id>
 
 `bd ready` is deliberately absent from that list — what a worker may take is the claimable set
 below, never the raw ready list.
+
+## Verify the tiers — `bd children` cannot
+
+`bd children <epic-id>` prints **titles**. Not types, not child counts. A board of fifteen features
+with no tickets under them and a task hung off the epic renders there as a perfectly healthy tree,
+which is exactly how that board gets shipped. Never treat it as a structural check.
+
+Two commands that do check:
+
+```bash
+npm run board:check              # every violation of the five invariants; non-zero exit = a dead bead
+bd list --status all --json --limit 0 \
+  | jq -r '.[] | select(.status != "closed") | "\(.id)\t\(.issue_type)\tparent=\(.parent // "-")"'
+```
+
+The second is the **type audit** — one line per bead carrying its tier and its parent. Print it and
+read it before telling anyone the tree is right; `board:check` then judges the same board
+mechanically. If `board:check` isn't available (a repo with no anton checkout), the jq line plus the
+five invariants is the manual equivalent.
 
 ## The pickup protocol — how any worker takes work
 
@@ -323,3 +424,6 @@ contract. But their **entities** (a customer, competitor, content calendar) live
   board to fit the tiers; the run-target rule keeps them running as they are.
 - Don't leave a `feature` parentless to avoid picking an epic, and don't mint a one-feature epic to
   avoid asking. Ask the user.
+- Don't build a tree with N sequential `bd create`/`bd link` calls when `bd create --graph` writes it
+  in one, and never nest a heredoc inside `$( )`.
+- Don't call `bd children` a verification. It shows titles; the tiers are what you're checking.

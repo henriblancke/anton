@@ -267,6 +267,15 @@ function installFile(src, dest) {
   return "installed";
 }
 
+/** Byte-equal? The drift test — an installed asset differing from the bundled one is out of date. */
+function sameBytes(a, b) {
+  try {
+    return readFileSync(a).equals(readFileSync(b));
+  } catch {
+    return false;
+  }
+}
+
 /** Recursively list every file under `dir` as paths relative to `dir` (files only). */
 function walkFiles(dir, base = dir) {
   const out = [];
@@ -280,13 +289,36 @@ function walkFiles(dir, base = dir) {
 
 /**
  * Install a whole skill DIRECTORY (SKILL.md + any bundled assets, e.g. setup's templates/) no-clobber.
- * The SKILL.md is the presence sentinel: if it already exists the skill is left untouched ("skipped");
- * otherwise every file under the bundled skill dir is copied. Returns "installed" | "skipped".
+ * The SKILL.md is the presence sentinel: if it already exists the skill is not re-copied; otherwise
+ * every file under the bundled skill dir is written.
+ *
+ * No-clobber is right for a file a user tunes and wrong for one anton's runtime reads as a contract:
+ * a skill installed once stays frozen at that release forever, and every later `anton setup` prints
+ * "already present" over it (anton-tier-invariants — a three-week-old `/shape` shaped against a
+ * taxonomy the bundle had already replaced). So drift is DETECTED rather than silently kept:
+ *
+ *   "installed" — nothing was there; the whole skill was written.
+ *   "skipped"   — present and byte-identical to the bundle. Nothing to do.
+ *   "stale"     — present but DIFFERENT. Left untouched (it may be the user's own edit), and the
+ *                 caller warns with the fix. This is the outcome no-clobber used to hide.
+ *   "updated"   — present, different, and `force` was set: every bundled file overwritten. Files the
+ *                 user added that the bundle doesn't ship are left alone.
  */
-function installSkillDir(srcDir, destDir) {
-  if (existsSync(join(destDir, "SKILL.md"))) return "skipped";
-  for (const rel of walkFiles(srcDir)) installFile(join(srcDir, rel), join(destDir, rel));
-  return "installed";
+function installSkillDir(srcDir, destDir, { force = false } = {}) {
+  const bundled = walkFiles(srcDir);
+  if (!existsSync(join(destDir, "SKILL.md"))) {
+    for (const rel of bundled) installFile(join(srcDir, rel), join(destDir, rel));
+    return "installed";
+  }
+  const drifted = bundled.filter((rel) => !sameBytes(join(srcDir, rel), join(destDir, rel)));
+  if (drifted.length === 0) return "skipped";
+  if (!force) return "stale";
+  for (const rel of drifted) {
+    const dest = join(destDir, rel);
+    mkdirSync(dirname(dest), { recursive: true });
+    copyFileSync(join(srcDir, rel), dest);
+  }
+  return "updated";
 }
 
 /** Parse `--agents <csv|all>` / `--no-agents` from the setup args, or null if unspecified. */
@@ -365,7 +397,15 @@ async function provisionAgentsSkills(args, opts = {}) {
   const agentsSrc =
     opts.agentsSrc ?? (opts.appRoot ? join(opts.appRoot, "src", "prompts", "agents") : AGENTS_SRC);
 
-  console.log(c.bold("\nInstalling agents & skills into ") + c.bold(claudeRoot) + c.dim(" (no-clobber):"));
+  // `--force-skills` re-syncs installed SKILLS to the bundled copies. Deliberately not the default
+  // and deliberately not `--force`: it discards local edits, and it is the answer to the stale-skill
+  // warning below rather than something a routine setup should do behind the user's back.
+  const force = args.includes("--force-skills");
+  console.log(
+    c.bold("\nInstalling agents & skills into ") +
+      c.bold(claudeRoot) +
+      c.dim(force ? " (--force-skills: skills re-synced from bundle):" : " (no-clobber):"),
+  );
   const selected = await resolveAgentSelection(args, agentsSrc);
 
   const jobs = [
@@ -390,23 +430,49 @@ async function provisionAgentsSkills(args, opts = {}) {
 
   let installed = 0;
   let skipped = 0;
+  let updated = 0;
+  const stale = [];
   for (const job of jobs) {
     if (!existsSync(job.sentinel)) {
       console.log(`  ${c.yellow("!")} ${job.kind} ${c.bold(job.name)} ${c.yellow("missing from package")} ${c.dim(job.src)}`);
       continue;
     }
+    // Only skills are drift-checked. An agent prompt is exactly the file a user is meant to tune, so
+    // reporting their edits as staleness would nag them for using the product as intended; a skill
+    // is a runtime contract anton's own jobs read, so a stale one is a real defect.
     const outcome =
-      job.kind === "skill" ? installSkillDir(job.src, job.dest) : installFile(job.src, job.dest);
+      job.kind === "skill" ? installSkillDir(job.src, job.dest, { force }) : installFile(job.src, job.dest);
     if (outcome === "installed") installed++;
+    else if (outcome === "updated") updated++;
+    else if (outcome === "stale") stale.push(job.name);
     else skipped++;
-    const tag = outcome === "installed" ? c.green("installed") : c.dim("already present");
+    const marks = {
+      installed: [c.green("✓"), c.green("installed")],
+      updated: [c.green("↑"), c.green("updated from bundle")],
+      stale: [c.yellow("!"), c.yellow("differs from bundle — left as-is")],
+      skipped: ["·", c.dim("already present")],
+    };
+    const [mark, tag] = marks[outcome];
     const req = job.required ? c.dim(" (required)") : "";
-    console.log(`  ${outcome === "installed" ? c.green("✓") : "·"} ${job.kind.padEnd(5)} ${c.bold(job.name.padEnd(12))} ${tag}${req}`);
+    console.log(`  ${mark} ${job.kind.padEnd(5)} ${c.bold(job.name.padEnd(12))} ${tag}${req}`);
   }
-  console.log(
-    c.dim(`  → ${installed} installed, ${skipped} already present. Existing files are never overwritten.`),
-  );
-  return { installed, skipped, agents: selected };
+  const counts = [
+    `${installed} installed`,
+    ...(updated > 0 ? [`${updated} updated`] : []),
+    `${skipped} already current`,
+    ...(stale.length > 0 ? [c.yellow(`${stale.length} stale`)] : []),
+  ].join(", ");
+  console.log(c.dim(`  → ${counts}. Your own edits are never overwritten.`));
+  if (stale.length > 0) {
+    console.log(
+      c.yellow(`  ! ${stale.join(", ")} differ from the bundled version`) +
+        c.dim(" — anton's runtime reads these as a contract, so a stale copy shapes work against\n") +
+        c.dim("    rules this release has replaced. Re-run with ") +
+        c.bold("--force-skills") +
+        c.dim(" to overwrite (your edits are lost)."),
+    );
+  }
+  return { installed, skipped, updated, stale, agents: selected };
 }
 
 // The Beads Dolt sync provisioning (anton-pns) lives in ../src/lib/beads/config.mjs as the single
@@ -796,8 +862,48 @@ function cmdVersion() {
   return 0;
 }
 
+/**
+ * Which installed skills differ from the bundled ones, checked at BOTH scopes anton installs into:
+ * the global ~/.claude (every repo resolves it) and this repo's own .claude/ (which wins locally).
+ * A skill is a runtime contract — a copy frozen at an old release keeps shaping work against rules
+ * the bundle has replaced, and until now nothing ever said so out loud (anton-tier-invariants).
+ * Returns `[{ scope, name }]`, empty when everything is current or nothing is installed.
+ */
+function staleSkills(skillsSrc = SKILLS_SRC) {
+  const scopes = [
+    ["global", CLAUDE_ROOT],
+    ["project", join(process.cwd(), ".claude")],
+  ];
+  const out = [];
+  for (const [scope, root] of scopes) {
+    for (const name of INSTALLED_SKILLS) {
+      const src = join(skillsSrc, name);
+      const dest = join(root, "skills", name);
+      if (!existsSync(join(src, "SKILL.md")) || !existsSync(join(dest, "SKILL.md"))) continue;
+      if (walkFiles(src).some((rel) => !sameBytes(join(src, rel), join(dest, rel)))) {
+        out.push({ scope, name });
+      }
+    }
+  }
+  return out;
+}
+
 function cmdDoctor() {
   const ok = checkPrereqs();
+  const stale = staleSkills();
+  if (stale.length === 0) {
+    console.log(`  ${c.green("✓")} ${"skills".padEnd(9)} ${c.green("installed copies match the bundle")}`);
+  } else {
+    for (const { scope, name } of stale) {
+      console.log(
+        `  ${c.yellow("!")} ${"skills".padEnd(9)} ${c.yellow(`${name} (${scope}) differs from the bundled version`)}`,
+      );
+    }
+    console.log(
+      c.dim("    Re-sync with `anton setup --force-skills` (global) or `anton init --force-skills`\n") +
+        c.dim("    (this repo). Skip if the difference is your own deliberate edit."),
+    );
+  }
   // Resolve the DB the same way the server does: in a bundle it lives in the persistent state dir
   // (where `anton setup` creates it), NOT under the runtime dir — so doctor must check there too.
   const dbPath = IS_BUNDLE ? bundleStateEnv().ANTON_DB : (process.env.ANTON_DB ?? join(APP_ROOT, "anton.db"));
@@ -1272,9 +1378,9 @@ const USAGE = `${c.bold("anton")} — local autonomous-coding orchestrator
 
 ${c.bold("Usage:")} anton <command>
 
-  ${c.bold("setup")}    check prereqs, migrate DB, rebuild node-pty, install agents & skills, wire beads Dolt sync  ${c.dim("[--agents <a,b,c>|all]")}
-  ${c.bold("init")}     configure beads in a target repo + register it with anton  ${c.dim("[path] [--prefix <p>]")}
-  ${c.bold("doctor")}   check prereqs + anton.db (non-destructive)
+  ${c.bold("setup")}    check prereqs, migrate DB, rebuild node-pty, install agents & skills, wire beads Dolt sync  ${c.dim("[--agents <a,b,c>|all] [--force-skills]")}
+  ${c.bold("init")}     configure beads in a target repo + register it with anton  ${c.dim("[path] [--prefix <p>] [--force-skills]")}
+  ${c.bold("doctor")}   check prereqs + anton.db + stale skills (non-destructive)
   ${c.bold("dev")}      run the dev server (next dev)          ${c.dim("[--port <n>]")}
   ${c.bold("start")}    run the server ${c.dim("(installed: background; source: foreground)")}  ${c.dim("[--port <n>] [--foreground]")}
   ${c.bold("stop")}     stop the background server             ${c.dim("(installed bundle)")}
@@ -1344,6 +1450,8 @@ export {
   resolveAntonDb,
   agentsFromArgs,
   provisionAgentsSkills,
+  installSkillDir,
+  staleSkills,
   REQUIRED_SKILLS,
   INSTALLED_SKILLS,
   compareVersions,

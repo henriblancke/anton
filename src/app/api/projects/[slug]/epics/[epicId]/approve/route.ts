@@ -4,6 +4,7 @@ import { epicStandaloneBlockers, standaloneBlockers } from "@/lib/epic-graph";
 import { refreshAllIssues } from "@/lib/beads/issues";
 import { beads, type Bead } from "@/lib/beads/bd";
 import { contractGaps, formatContractGaps } from "@/lib/beads/contract";
+import { formatStructureViolations, structureGaps } from "@/lib/beads/structure";
 import { nudgeSync } from "@/lib/beads/sync-nudge";
 import { conflictBody, ownerOf, withClaimLock } from "@/lib/beads/claim";
 import { enqueueExecuteEpic, enqueueExecuteEpicIfAbsent } from "@/lib/jobs/service";
@@ -193,14 +194,44 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
       { status: 422 },
     );
   }
+  // The tier taxonomy, enforced beside the contract (anton-tier-invariants). Same shape, different
+  // question: the contract judges what is INSIDE a bead, this judges where the bead HANGS. Only a
+  // dead bead refuses — one `beads.isRunTarget` will never admit and no ticket sweep reaches, so
+  // approving this target would enqueue a run that silently skips it and leave it on the board
+  // looking like queued work forever.
+  //
+  // Scoped to this target's SUBTREE, never the whole board: a stray chore three branches away is not
+  // this feature's fault and must not strand it. That scope is deliberately narrow, and it means this
+  // gate is a BACKSTOP, not the primary check — a nested feature is caught here, while a ticket
+  // stranded under a container epic is not (the container can't be approved at all, so no request
+  // ever reaches this line carrying it). `npm run board:check` judges the whole board and is what
+  // `/shape` runs before it hands a tree over; this catches what survives to a run trigger.
+  const structural = willEnqueue ? structureGaps(epicId, allBeads, "blocking") : [];
+  if (structural.length > 0) {
+    return NextResponse.json(
+      {
+        error: `${epicId} breaks the tier structure: ${formatStructureViolations(structural)}`,
+        rules: structural.map((v) => v.rule),
+      },
+      { status: 422 },
+    );
+  }
   // Reported, never enforced. Computed over the same dispatch set the gate above judges, so a thin
   // child is heard here too rather than only in the runner's log. One line PER BEAD, each naming
   // its own id: across a whole ticket set, bare messages leave the operator no way to tell which
   // bead is thin. Gated on `willEnqueue` for the same reason the refusal is: a pure take-over of a
   // blocked target starts no run, so warnings about the spec no run is about to read would tell the
   // operator a run is degraded when none began.
+  //
+  // Tier advisories ride the same channel: a feature with no epic or no tickets runs fine, so it is
+  // heard, never enforced.
   const advisory = willEnqueue
-    ? contractGaps(contractGated, "advisory").map((gap) => formatContractGaps([gap]))
+    ? [
+        ...contractGaps(contractGated, "advisory").map((gap) => formatContractGaps([gap])),
+        ...structureGaps(epicId, allBeads, "advisory").map((v) =>
+          formatStructureViolations([v]),
+        ),
+      ]
     : [];
 
   // Enforce the claim as a soft-lock at the run trigger, from the fresh ownership read above.

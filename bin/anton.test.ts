@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { createRequire } from "node:module";
-import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import {
   agentsFromArgs,
   applyMigrations,
@@ -23,6 +23,7 @@ import {
   parseInitArgs,
   platformLabel,
   provisionAgentsSkills,
+  installSkillDir,
   registerProject,
   INSTALLED_SKILLS,
   REQUIRED_SKILLS,
@@ -513,6 +514,88 @@ describe("provisionAgentsSkills (into a temp ~/.claude)", () => {
     expect(r.installed).toBe(INSTALLED_SKILLS.length);
     expect(r.agents).toEqual([]);
     expect(await exists(join(claudeRoot, "agents"))).toBe(false);
+  });
+
+  // No-clobber used to make a skill installed once frozen at that release forever, reported as
+  // "already present" by every later setup (anton-tier-invariants). Drift is now named, and
+  // --force-skills is the way out.
+  it("reports a drifted skill as stale and leaves it untouched", async () => {
+    claudeRoot = await mkdtemp(join(tmpdir(), "anton-claude-"));
+    await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
+
+    writeFileSync(skillPath("shape"), "# an old release's copy\n");
+    const r = await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
+
+    expect(r.stale).toEqual(["shape"]);
+    expect(r.updated).toBe(0);
+    expect(r.skipped).toBe(INSTALLED_SKILLS.length - 1);
+    expect(await readFile(skillPath("shape"), "utf8")).toBe("# an old release's copy\n");
+  });
+
+  it("--force-skills re-syncs a drifted skill from the bundle", async () => {
+    claudeRoot = await mkdtemp(join(tmpdir(), "anton-claude-"));
+    await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
+    writeFileSync(skillPath("shape"), "# an old release's copy\n");
+
+    const r = await provisionAgentsSkills(["--no-agents", "--force-skills"], {
+      claudeRoot,
+      appRoot: REPO_ROOT,
+    });
+
+    expect(r.stale).toEqual([]);
+    expect(r.updated).toBe(1);
+    const bundled = await readFile(join(REPO_ROOT, "skills", "shape", "SKILL.md"), "utf8");
+    expect(await readFile(skillPath("shape"), "utf8")).toBe(bundled);
+  });
+
+  it("leaves a user's extra file in a skill dir alone when forcing", async () => {
+    claudeRoot = await mkdtemp(join(tmpdir(), "anton-claude-"));
+    await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
+    const mine = join(claudeRoot, "skills", "shape", "NOTES.md");
+    writeFileSync(mine, "mine\n");
+    writeFileSync(skillPath("shape"), "drifted\n");
+
+    await provisionAgentsSkills(["--no-agents", "--force-skills"], { claudeRoot, appRoot: REPO_ROOT });
+
+    expect(await readFile(mine, "utf8")).toBe("mine\n");
+  });
+});
+
+describe("installSkillDir", () => {
+  let dest: string;
+  let src: string;
+
+  beforeEach(async () => {
+    src = await mkdtemp(join(tmpdir(), "anton-skill-src-"));
+    dest = await mkdtemp(join(tmpdir(), "anton-skill-dest-"));
+    writeFileSync(join(src, "SKILL.md"), "v2\n");
+    await rm(dest, { recursive: true, force: true }); // an absent destination, not an empty one
+  });
+
+  afterEach(async () => {
+    for (const d of [src, dest]) if (d) await rm(d, { recursive: true, force: true });
+  });
+
+  it("installs when absent, skips when byte-identical", () => {
+    expect(installSkillDir(src, dest)).toBe("installed");
+    expect(installSkillDir(src, dest)).toBe("skipped");
+  });
+
+  it("reports stale rather than clobbering, and updates only under force", () => {
+    installSkillDir(src, dest);
+    writeFileSync(join(dest, "SKILL.md"), "v1\n");
+    expect(installSkillDir(src, dest)).toBe("stale");
+    expect(installSkillDir(src, dest, { force: true })).toBe("updated");
+    expect(installSkillDir(src, dest)).toBe("skipped");
+  });
+
+  it("restores a bundled file the user deleted", () => {
+    writeFileSync(join(src, "templates.md"), "t\n");
+    installSkillDir(src, dest);
+    rmSync(join(dest, "templates.md"));
+    expect(installSkillDir(src, dest)).toBe("stale");
+    expect(installSkillDir(src, dest, { force: true })).toBe("updated");
+    expect(existsSync(join(dest, "templates.md"))).toBe(true);
   });
 });
 
