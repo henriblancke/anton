@@ -552,7 +552,8 @@ export function SettingsView({
   useEffect(() => {
     if (active !== "automation") return;
     let cancelled = false;
-    const id = setInterval(async () => {
+
+    async function refresh() {
       if (schedulePatchesInFlight.current > 0) return;
       const completedBefore = schedulePatchesCompleted.current;
       let rows: unknown;
@@ -561,7 +562,7 @@ export function SettingsView({
         if (!res.ok) return;
         ({ schedules: rows } = await res.json());
       } catch {
-        // Transient — the next tick retries. A failed poll must not toast or blank the table; the
+        // Transient — the next tick retries. A failed read must not toast or blank the table; the
         // times simply stay as stale as they were before it ran.
         return;
       }
@@ -584,7 +585,14 @@ export function SettingsView({
         }
         return next;
       });
-    }, SCHEDULE_POLL_MS);
+    }
+
+    // Once on arrival, then on the interval. Switching sections is a hash change, not a navigation,
+    // so nothing re-reads the server on the way in: without the leading read, a panel opened from a
+    // page that had been sitting for an hour would show that hour-old snapshot — and now that the
+    // countdown ticks, it would confidently count it down — for the first thirty seconds.
+    void refresh();
+    const id = setInterval(refresh, SCHEDULE_POLL_MS);
     return () => {
       cancelled = true;
       clearInterval(id);

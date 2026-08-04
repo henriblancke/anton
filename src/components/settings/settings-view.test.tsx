@@ -425,8 +425,16 @@ describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
     return fetchMock;
   }
 
+  /**
+   * The PATCH calls only. The open panel also GETs the rows — once on arrival and then on its poll —
+   * so "the write this test made" is no longer "the first fetch this test saw".
+   */
+  function patches(fetchMock: ReturnType<typeof stubSchedulePatch>) {
+    return fetchMock.mock.calls.filter((c) => (c[1] as RequestInit | undefined)?.method === "PATCH");
+  }
+
   function body(fetchMock: ReturnType<typeof stubSchedulePatch>, call = 0) {
-    return JSON.parse((fetchMock.mock.calls[call][1] as RequestInit).body as string);
+    return JSON.parse((patches(fetchMock)[call][1] as RequestInit).body as string);
   }
 
   const cadenceButton = (name = "nightly-stringer") =>
@@ -536,18 +544,23 @@ describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
       ],
     );
     try {
-      // Nothing has run yet: seven rows, none carrying a lastRunAt.
+      // Rendered from the page's snapshot: due in a minute, and never run.
       expect(screen.getAllByText("never").length).toBe(7);
 
-      await tick(POLL_MS);
-
+      // Arriving at the panel re-reads once — a hash switch is not a navigation, so the snapshot
+      // this page was rendered with could be an hour old.
+      await tick(0);
       expect(fetchMock).toHaveBeenCalledWith("/api/projects/tmp/schedules");
       // Both time columns moved to what the server now holds...
-      expect(screen.getByText("in 29m")).toBeTruthy();
+      expect(screen.getByText("in 30m")).toBeTruthy();
       expect(screen.getByText("1m ago")).toBeTruthy();
       expect(screen.getAllByText("never").length).toBe(6);
       // ...while the cadence stayed the operator's, not the poll's.
       expect(cadenceButton().textContent).toContain("Every 30 minutes");
+
+      // ...and it keeps re-reading for as long as the panel stays open.
+      await tick(POLL_MS);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
     } finally {
       vi.useRealTimers();
     }
@@ -573,8 +586,8 @@ describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
     fireEvent.click(frequency("Hourly"));
     fireEvent.click(setCadence());
 
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
-    expect(fetchMock.mock.calls[0][0]).toBe("/api/projects/tmp/schedules");
+    await waitFor(() => expect(patches(fetchMock)).toHaveLength(1));
+    expect(patches(fetchMock)[0][0]).toBe("/api/projects/tmp/schedules");
     expect(body(fetchMock)).toEqual({ type: "nightly-stringer", cron: "0 * * * *" });
     await waitFor(() => expect(cadenceButton().textContent).toContain("Hourly, on the hour"));
     // Committing closes the popover — the operator is done with it.
@@ -694,14 +707,14 @@ describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
     expect(screen.getByText(/must have 5 fields/)).toBeTruthy();
     expect(setCadence().disabled).toBe(true);
     fireEvent.click(setCadence());
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(patches(fetchMock)).toHaveLength(0);
 
     fireEvent.change(input, { target: { value: "0 6 * * *" } });
     expect(screen.queryByText(/must have 5 fields/)).toBeNull();
     expect(setCadence().disabled).toBe(false);
     fireEvent.click(setCadence());
 
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(patches(fetchMock)).toHaveLength(1));
     expect(body(fetchMock)).toEqual({ type: "nightly-stringer", cron: "0 6 * * *" });
   });
 
@@ -725,7 +738,7 @@ describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
     expect(setCadence().disabled).toBe(false);
     fireEvent.click(setCadence());
 
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(patches(fetchMock)).toHaveLength(1));
     expect(body(fetchMock)).toEqual({ type: "nightly-stringer", cron: "*/2 * * * *" });
   });
 
@@ -742,10 +755,10 @@ describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
     openEditor();
     fireEvent.click(screen.getByRole("button", { name: "Reset" }));
     // Reset stages the default like every other edit in this popover; nothing is stored until Set.
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(patches(fetchMock)).toHaveLength(0);
     fireEvent.click(setCadence());
 
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(patches(fetchMock)).toHaveLength(1));
     expect(body(fetchMock)).toEqual({ type: "nightly-stringer", cron: "0 3 * * *" });
     await waitFor(() => expect(cadenceButton().textContent).toContain("Daily at 03:00"));
   });
@@ -769,7 +782,7 @@ describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
 
     fireEvent.click(screen.getByRole("switch", { name: "gardener" }));
 
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(patches(fetchMock)).toHaveLength(1));
     expect(body(fetchMock)).toEqual({ type: "gardener", enabled: true });
     await waitFor(() => expect(toast.success).toHaveBeenCalledWith("gardener enabled"));
   });
