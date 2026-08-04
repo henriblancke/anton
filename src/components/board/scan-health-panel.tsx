@@ -100,7 +100,9 @@ function ScanTrend({ points, className }: { points: ScanHealthPoint[]; className
     <div
       className={cn("flex h-9 items-end gap-1", className)}
       role="img"
-      aria-label={`New signals per scan, oldest to newest: ${points.map(pointLabel).join("; ")}`}
+      // Not "new signals per scan": a baseline column is a whole-repo standing total, so a label
+      // claiming new-arrivals contradicts every baseline point. `pointLabel` says which each is.
+      aria-label={`scan history, oldest to newest: ${points.map(pointLabel).join("; ")}`}
     >
       {points.map((point) =>
         point.baseline ? (

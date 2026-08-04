@@ -406,7 +406,13 @@ function runSurfaceLookup(id: string): string {
   return `\`bd show ${id}\` and \`bd children ${id}\` (then \`bd show\` each — a dropped path may be a child's)`;
 }
 
-function omissionLine(count: number, what: string, how = "`bd list`"): string[] {
+/**
+ * The line that names what a section's cap dropped, and the read that recovers it. The default MUST
+ * carry `--limit 0`: bare `bd list` is capped at 50 (see `bd.list`), so a triage pass following the
+ * hint after the 80-entry producer cap fired would get a truncated slice back and still miss the
+ * owning feature or existing fingerprint — minting the duplicate the cap disclosure exists to prevent.
+ */
+function omissionLine(count: number, what: string, how = "`bd list --json --limit 0`"): string[] {
   return count > 0 ? [`- … and ${count} more ${what} (omitted — ask ${how} for the rest)`] : [];
 }
 

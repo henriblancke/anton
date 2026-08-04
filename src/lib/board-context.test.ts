@@ -9,6 +9,7 @@ import type { Bead } from "./beads/bd";
 import {
   BOARD_CONTEXT_HEADING,
   MAX_FEATURES,
+  MAX_PRODUCER_BEADS,
   MAX_TOUCHES,
   buildBoardContext,
   fingerprintsOf,
@@ -397,6 +398,25 @@ describe("formatBoardContext", () => {
     const ctx = buildBoardContext(board);
     expect(ctx.omitted.features).toBe(3);
     expect(formatBoardContext(ctx)).toContain("and 3 more open feature(s) (omitted");
+  });
+
+  // Bare `bd list` is capped at 50, so a hint naming it hands back another truncated slice — triage
+  // still misses the owning feature or existing fingerprint and mints the duplicate anyway.
+  it("points every capped section at an UNLIMITED board read, never a bare `bd list`", () => {
+    const board = [
+      ...Array.from({ length: MAX_FEATURES + 1 }, (_, i) =>
+        bead({ id: `f-${i}`, issue_type: "feature", context: "touches: src/x.ts" }),
+      ),
+      ...Array.from({ length: MAX_PRODUCER_BEADS + 1 }, (_, i) =>
+        bead({ id: `p-${i}`, labels: [`stringer:duplication:${i.toString(16).padStart(8, "0")}`] }),
+      ),
+    ];
+    const out = formatBoardContext(buildBoardContext(board));
+    expect(out).toContain("and 1 more open feature(s) (omitted — ask `bd list --json --limit 0`");
+    expect(out).toContain(
+      "and 1 more producer-filed bead(s) (omitted — ask `bd list --json --limit 0`",
+    );
+    expect(out).not.toMatch(/ask `bd list` for the rest/);
   });
 
   it("says a touch surface was CAPPED rather than presenting part of it as the whole", () => {

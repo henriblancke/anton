@@ -128,6 +128,9 @@ describe("ScanHealthPanel", () => {
     const label = screen.getByRole("img").getAttribute("aria-label")!;
     expect(label).toContain("baseline scan: 100 signals already in the repo");
     expect(label).not.toContain("100 (100 low)");
+    // The chart-level label must not call the whole series new arrivals — a screen reader user
+    // would hear it contradict the baseline point it introduces.
+    expect(label).not.toMatch(/new signals per scan/i);
 
     // Scaled to the noisiest INCREMENTAL scan (3), not to the baseline's 100.
     const bar = screen.getByTitle(/2 new signals/).firstElementChild as HTMLElement;
