@@ -297,6 +297,78 @@ describe("the persisted series", () => {
     expect(await version()).not.toBe(before);
   });
 
+  it("carries a retry's final baseline into the point it retained", async () => {
+    // The first attempt measured against b0 and left b1, then died after scanning; the retry ran
+    // stringer again and left b2. The point keeps the counts the pass measured, but the baseline it
+    // publishes has to be the one the pass ULTIMATELY left — the next nightly consumes b2, and a
+    // point still claiming b1 could never prove comparability, suppressing an honest delta forever.
+    await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 7 }),
+      deltaState: { before: "b0", after: "b1" },
+    });
+    clock.advance(60_000);
+    const retry = await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: emptyScanCounts(),
+      deltaState: { before: "b1", after: "b2" },
+    });
+
+    expect(retry.counts.total).toBe(7); // the retry's own counts are NOT the pass's measurement
+    expect(retry.deltaState).toBe("b2");
+    expect((await listScanSummaries(tdb.db, projectId))[0].deltaState).toBe("b2");
+
+    clock.advance(86_400_000);
+    const next = await save(counts({ low: 4 }), { deltaState: { before: "b2", after: "b3" } });
+    expect(next.delta?.total).toBe(-3);
+  });
+
+  it("clears the retained baseline when the retry left one anton cannot identify", async () => {
+    // The retry still advanced stringer's state, so the published baseline is stale whatever anton
+    // could read — and a stale one is a claim, where absent is the honest "not comparable".
+    await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 7 }),
+      deltaState: { before: "b0", after: "b1" },
+    });
+    const retry = await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: emptyScanCounts(),
+      deltaState: {},
+    });
+
+    expect(retry.deltaState).toBeUndefined();
+    expect((await listScanSummaries(tdb.db, projectId))[0].deltaState).toBeUndefined();
+  });
+
+  it("never lets a retry give a whole-repo point a baseline to be measured against", async () => {
+    // The retained counts are a standing total, so nothing may be subtracted from them — the retry's
+    // baseline must not manufacture the comparison the first attempt refused to offer.
+    const first = await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 100 }),
+      deltaState: { after: "b1", baselineScan: true },
+    });
+    expect(first.deltaState).toBeUndefined();
+
+    const retry = await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: emptyScanCounts(),
+      deltaState: { before: "b1", after: "b2" },
+    });
+    expect(retry.deltaState).toBeUndefined();
+
+    clock.advance(86_400_000);
+    const next = await save(counts({ low: 3 }), { deltaState: { before: "b2", after: "b3" } });
+    expect(next.delta).toBeUndefined();
+  });
+
   it("reads a half-written triage row as unreported, never as a zero someone claimed", async () => {
     // Both counters come from one TriageOutcome, so one column alone is a broken write — filling the
     // other with 0 would put a triage result on the chart that no session ever reported.
@@ -404,6 +476,19 @@ describe("scanHealth (the board's view)", () => {
     expect(scanHealthVersion(scanHealth([{ ...latest, triage: { created: 2, deduped: 1 } }]))).toBe(
       "c:2:1",
     );
+  });
+
+  it("marks every incomplete column, not only the latest scan", () => {
+    // Suppressing the delta keeps an outage out of the TREND, but its column stays on the chart for
+    // the whole window — unmarked, an incomplete zero is drawn as the clean-pass tick and the next
+    // honest scan reads as a regression from an improvement that never happened.
+    const health = scanHealth([
+      summary("c", 300, 2),
+      { ...summary("b", 200, 0), collectorFailures: 2 },
+      summary("a", 100, 1),
+    ])!;
+    expect(health.points.map((p) => p.incomplete)).toEqual([undefined, true, undefined]);
+    expect(health.latest.incomplete).toBeUndefined();
   });
 
   it("keeps a first-ever scan's missing delta missing", () => {

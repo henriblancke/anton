@@ -215,22 +215,48 @@ async function findScanSummaryByJob(
 }
 
 /**
- * A later attempt adds only what the first one died before knowing. The first attempt's counts are
- * the ones measured against the baseline the pass began with, so they stand — but an attempt that
- * finally got a triage report out of the session contributes it, rather than leaving the point
- * claiming triage never reported.
+ * A later attempt adds only what the first one died before knowing, and corrects the one thing it
+ * invalidated. The first attempt's counts are the ones measured against the baseline the pass began
+ * with, so they stand — but two facts about the point move:
+ *
+ * - TRIAGE: an attempt that finally got a report out of the session contributes it, rather than
+ *   leaving the point claiming triage never reported.
+ * - THE BASELINE IT LEFT: the retry scanned again, so stringer's `--delta` state has advanced past
+ *   the one the first attempt published. Keeping the stale value would leave the next scan measuring
+ *   from a baseline nothing holds, so it could never prove comparability and an honest delta would be
+ *   suppressed. The point keeps its counts and publishes the baseline the pass ULTIMATELY left.
+ *
+ * Only for a point that published a baseline at all: absent means the first attempt's counts are a
+ * standing total (or of unidentified basis), and nothing may ever be measured against those — the
+ * retry's baseline must not create a comparison the counts can't support.
  */
-async function backfillTriage(
+async function reconcileAttempt(
   db: AntonDb,
   existing: ScanSummary,
-  triage: TriageOutcome | undefined,
+  input: SaveScanSummaryInput,
 ): Promise<ScanSummary> {
-  if (!triage || existing.triage) return existing;
+  const triage = !existing.triage && input.triage ? input.triage : undefined;
+  // `deltaState` present at all means this attempt ran stringer, so the state moved — including to a
+  // baseline anton could not identify, which clears the point's rather than leaving a stale claim.
+  const rescanned = input.deltaState !== undefined && existing.deltaState !== undefined;
+  const left = rescanned ? (input.deltaState?.after ?? null) : undefined;
+  const advanced = left !== undefined && left !== existing.deltaState;
+  if (!triage && !advanced) return existing;
+
   await db
     .update(schema.scanSummaries)
-    .set({ beadsCreated: triage.created, beadsDeduped: triage.deduped })
+    .set({
+      ...(triage ? { beadsCreated: triage.created, beadsDeduped: triage.deduped } : {}),
+      ...(advanced ? { deltaState: left } : {}),
+    })
     .where(eq(schema.scanSummaries.id, existing.id));
-  return { ...existing, triage };
+
+  const reconciled: ScanSummary = { ...existing, ...(triage ? { triage } : {}) };
+  if (advanced) {
+    if (left === null) delete reconciled.deltaState;
+    else reconciled.deltaState = left;
+  }
+  return reconciled;
 }
 
 /**
@@ -252,7 +278,7 @@ export async function saveScanSummary(
 ): Promise<ScanSummary> {
   if (input.jobId) {
     const already = await findScanSummaryByJob(db, input.projectId, input.jobId);
-    if (already) return backfillTriage(db, already, input.triage);
+    if (already) return reconcileAttempt(db, already, input);
   }
 
   // Comparable ONLY when this scan measured arrivals since exactly the baseline the previous point
@@ -434,6 +460,14 @@ export interface ScanHealthPoint {
    * chart must render it apart from the incremental columns and never scale them against it.
    */
   baseline?: boolean;
+  /**
+   * At least one collector died on this scan, so the column is a floor rather than a measurement —
+   * see {@link ScanSummary.collectorFailures}. It travels with every point, not just the latest one:
+   * suppressing the delta keeps the outage out of the TREND, but the raw column stays on the chart
+   * forever, and drawn like a whole scan an incomplete zero becomes the clean-pass tick — the next
+   * scan then reads as a regression from an improvement that never happened.
+   */
+  incomplete?: boolean;
   triage?: TriageOutcome;
 }
 
@@ -457,6 +491,7 @@ function toPoint(summary: ScanSummary): ScanHealthPoint {
     total: summary.counts.total,
     bySeverity: summary.counts.bySeverity,
     ...(summary.baselineScan ? { baseline: true } : {}),
+    ...(summary.collectorFailures > 0 ? { incomplete: true } : {}),
     ...(summary.triage ? { triage: summary.triage } : {}),
   };
 }
@@ -491,10 +526,11 @@ export const NO_SCAN_HEALTH = "none";
 
 /**
  * The newest row's identity for the board's refresh token. The id alone is not enough: a retried job
- * backfills triage counts INTO the existing row ({@link backfillTriage}), so a token built from the
+ * backfills triage counts INTO the existing row ({@link reconcileAttempt}), so a token built from the
  * id would keep matching and a board polling between the two writes would never show the
- * created/deduped figures. Everything else about a row is append-only, so stamping the one mutable
- * pair keeps the poll 304-friendly while still moving when there is something new to render.
+ * created/deduped figures. The other value a retry rewrites — the baseline the point left — is
+ * bookkeeping the board never renders, so stamping the one visible mutable pair keeps the poll
+ * 304-friendly while still moving when there is something new to render.
  */
 function scanVersion(id: string, triage: TriageOutcome | undefined): string {
   return triage ? `${id}:${triage.created}:${triage.deduped}` : id;

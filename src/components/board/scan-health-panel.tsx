@@ -62,9 +62,27 @@ function baselineNote(point: ScanHealthPoint): string {
   );
 }
 
+/**
+ * What an incomplete column is. A dead collector leaves a hole in the counts, and the hole outlives
+ * the scan: the delta is suppressed on both sides, but the column stays on the chart, so it has to
+ * carry its own caveat — otherwise a zero-result outage reads as the best night the repo ever had and
+ * the next honest scan reads as the regression from it.
+ */
+function incompleteNote(point: ScanHealthPoint): string {
+  return point.total === 0
+    ? "incomplete scan: every collector that ran found nothing, but at least one failed — not a clean pass"
+    : `incomplete scan: ${point.total} (${severitySplit(point)}) from the collectors that ran, at least one failed — an undercount`;
+}
+
+function pointNote(point: ScanHealthPoint): string {
+  if (point.baseline) return baselineNote(point);
+  if (point.incomplete) return incompleteNote(point);
+  return `${point.total} new signal${point.total === 1 ? "" : "s"} (${severitySplit(point)})`;
+}
+
 function pointLabel(point: ScanHealthPoint): string {
-  return point.baseline
-    ? `${shortDate(point.at)}, ${baselineNote(point)}`
+  return point.baseline || point.incomplete
+    ? `${shortDate(point.at)}, ${pointNote(point)}`
     : `${shortDate(point.at)}, ${point.total} (${severitySplit(point)})`;
 }
 
@@ -91,6 +109,11 @@ function shortDate(unixSeconds: number): string {
  * would both make the incremental scans after it look like a collapse and squash them to nothing
  * against a total they were never measured against. Kept in place rather than dropped — the gap
  * would read as a night nobody scanned.
+ *
+ * An INCOMPLETE scan — one that lost a collector — is dimmed and struck with an amber rule at its
+ * base (anton-3flx). Its column is a floor, not a measurement, and the zero-result case is the one
+ * that misleads hardest: drawn as the green clean-pass tick, an outage would read as the best night
+ * the repo ever had, and the honest scan after it as the regression from it.
  */
 function ScanTrend({ points, className }: { points: ScanHealthPoint[]; className?: string }) {
   if (points.length === 0) return null;
@@ -116,17 +139,19 @@ function ScanTrend({ points, className }: { points: ScanHealthPoint[]; className
         ) : (
           <span
             key={point.id}
-            title={`${shortDate(point.at)} — ${point.total} new signal${point.total === 1 ? "" : "s"} (${severitySplit(point)})`}
+            title={`${shortDate(point.at)} — ${pointNote(point)}`}
             className="flex h-full min-w-1.5 flex-1 flex-col justify-end"
           >
-            {point.total === 0 ? (
-              <span className="h-0.5 w-full rounded-[1px] bg-stage-done/60" />
-            ) : (
+            {point.total > 0 ? (
               // Worst first, so a column reads top-down the way the legend does.
               SCAN_SEVERITIES.filter((s) => point.bySeverity[s] > 0).map((severity) => (
                 <span
                   key={severity}
-                  className={cn("w-full rounded-[1px]", SEVERITY_BAR[severity])}
+                  className={cn(
+                    "w-full rounded-[1px]",
+                    SEVERITY_BAR[severity],
+                    point.incomplete && "opacity-40",
+                  )}
                   // Floored so a single signal still draws — an invisible segment reads as absent,
                   // which is the one thing it is not.
                   style={{
@@ -134,7 +159,14 @@ function ScanTrend({ points, className }: { points: ScanHealthPoint[]; className
                   }}
                 />
               ))
+            ) : point.incomplete ? null : (
+              <span className="h-0.5 w-full rounded-[1px] bg-stage-done/60" />
             )}
+            {point.incomplete ? (
+              // The amber base rule IS the zero-result incomplete column: nothing was measured, so
+              // there is no clean-pass tick to draw — only the mark saying the scan couldn't tell.
+              <span className="mt-px h-0.5 w-full rounded-[1px] bg-risk-med/70" />
+            ) : null}
           </span>
         ),
       )}

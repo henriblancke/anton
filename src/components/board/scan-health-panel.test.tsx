@@ -156,6 +156,41 @@ describe("ScanHealthPanel", () => {
     expect(screen.queryByText(/signals found/)).toBeNull();
   });
 
+  // A scan that lost a collector measured a floor, not the repo. Drawn like a whole scan, its
+  // zero-result column becomes the green clean-pass tick — the best night the chart can show — and
+  // the honest scan after it reads as the regression from an improvement that never happened.
+  it("marks an incomplete column instead of drawing it as a clean pass", () => {
+    const points: ScanHealthPoint[] = [
+      point("a", 1_700_000_000, { low: 4 }),
+      { ...point("b", 1_700_086_400, {}), incomplete: true },
+      point("c", 1_700_172_800, { low: 3 }),
+    ];
+    render(<ScanHealthPanel health={health({ points })} />);
+
+    const label = screen.getByRole("img").getAttribute("aria-label")!;
+    expect(label).toContain("incomplete scan: every collector that ran found nothing");
+    expect(label).not.toContain("0 (no new signals)");
+
+    const column = screen.getByTitle(/incomplete scan/);
+    expect(column.innerHTML).toContain("bg-risk-med/70");
+    expect(column.innerHTML).not.toContain("bg-stage-done");
+  });
+
+  it("dims an incomplete column that did find signals — its counts are a floor", () => {
+    const points: ScanHealthPoint[] = [
+      { ...point("a", 1_700_000_000, { critical: 1, low: 1 }), incomplete: true },
+      point("b", 1_700_086_400, { low: 3 }),
+    ];
+    render(<ScanHealthPanel health={health({ points })} />);
+
+    const label = screen.getByRole("img").getAttribute("aria-label")!;
+    expect(label).toContain("2 (1 critical, 1 low) from the collectors that ran");
+
+    const column = screen.getByTitle(/from the collectors that ran/);
+    expect(column.innerHTML).toContain("opacity-40");
+    expect(column.innerHTML).toContain("bg-risk-med/70");
+  });
+
   it("reports what triage did with the scan, when triage reported it", () => {
     const points = [{ ...point("a", 1_700_000_000, { low: 3 }), triage: { created: 2, deduped: 1 } }];
     render(<ScanHealthPanel health={health({ points })} />);
