@@ -241,6 +241,19 @@ export const scanSummaries = sqliteTable(
      */
     deltaState: text("delta_state"),
     /**
+     * The `stringer --delta` baseline this scan STARTED from — where its window OPENS — and NULL
+     * when there was none anton could read (a whole-repo pass, or a state it could not identify).
+     *
+     * Kept beside the one it left because a retried job's rescan is only legible against both. When
+     * a pass dies before triage the handler puts the baseline BACK (src/lib/jobs/nightly-stringer.ts),
+     * so the retry measures from this value again: it REPLAYED the row's own window rather than
+     * continuing past it, and its counts supersede rather than fold. A retry measuring from
+     * `delta_state` instead scanned the next window along, and folds in. Written once, at insert —
+     * neither a replay nor a fold moves where the window opens. See `reconcileAttempt` in
+     * src/lib/scan-health.ts.
+     */
+    deltaStateBefore: text("delta_state_before"),
+    /**
      * TRUE when this row's counts are a whole-repo STANDING TOTAL rather than the arrival rate the
      * trend charts: the scan established `--delta`'s baseline (a project's first, or the first after
      * `.stringer` was reset) or ran without `--delta` at all. The chart must not scale incremental

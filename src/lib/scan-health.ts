@@ -88,6 +88,16 @@ export interface ScanSummary {
    */
   deltaState?: string;
   /**
+   * The `stringer --delta` baseline this scan STARTED from — where this point's window OPENS.
+   * Absent when there was none anton could read (a whole-repo pass, or an unidentified state).
+   *
+   * It is what tells a retry's rescan apart from a continuation: a pass that dies before triage puts
+   * the baseline BACK (src/lib/jobs/nightly-stringer.ts), so the retry measures from THIS value
+   * again and REPLAYS the same window — see {@link reconcileAttempt}. Written once, at insert:
+   * neither a replay nor a fold moves where the window opens.
+   */
+  deltaStateBefore?: string;
+  /**
    * True when these counts are a whole-repo STANDING TOTAL, not the arrival rate every incremental
    * point measures — the scan established `--delta`'s baseline, or ran without `--delta`. The trend
    * has to keep the two apart: charting them on one scale reads a baseline followed by two quiet
@@ -189,15 +199,29 @@ function addCounts(a: ScanCounts, b: ScanCounts): ScanCounts {
 }
 
 /**
- * A stored delta carried onto counts that just grew: it was `counts - previous`, and the previous
- * point hasn't moved, so the delta over the widened window is `delta + added` — no re-read needed.
+ * A stored delta carried onto counts that just moved: it was `counts - previous`, and the previous
+ * point hasn't moved, so the delta over the new counts is `delta + moved` — no re-read needed.
+ * Signed, because a retry does not only widen a window: one that REPLAYED it can re-measure the
+ * same window lower (see {@link reconcileAttempt}).
  */
-function extendDelta(delta: ScanDelta, added: ScanCounts): ScanDelta {
+function extendDelta(delta: ScanDelta, moved: ScanDelta): ScanDelta {
   const bySeverity = emptySeverityCounts();
   for (const severity of SCAN_SEVERITIES) {
-    bySeverity[severity] = delta.bySeverity[severity] + added.bySeverity[severity];
+    bySeverity[severity] = delta.bySeverity[severity] + moved.bySeverity[severity];
   }
-  return { total: delta.total + added.total, bySeverity };
+  return { total: delta.total + moved.total, bySeverity };
+}
+
+/**
+ * Every axis, not just the total: a replayed window can come back with the same number of signals
+ * split differently (one fixed, one arrived), and that is a rewrite the chart has to see.
+ */
+function sameCounts(a: ScanCounts, b: ScanCounts): boolean {
+  return (
+    a.total === b.total &&
+    SCAN_SEVERITIES.every((s) => a.bySeverity[s] === b.bySeverity[s]) &&
+    SIGNAL_CLASSES.every((c) => a.byClass[c] === b.byClass[c])
+  );
 }
 
 /**
@@ -260,7 +284,28 @@ async function findScanSummaryByJob(
 
 /**
  * A later attempt adds only what the first one died before knowing, and corrects what it
- * invalidated. Four facts about the point move:
+ * invalidated.
+ *
+ * WHICH WINDOW THE RETRY SCANNED decides all of it, and the point names both ends of its own
+ * ({@link ScanSummary.deltaStateBefore}, {@link ScanSummary.deltaState}) so the two cases can't be
+ * confused:
+ *
+ * - A REPLAY — the retry measured from where this point's window OPENS. That is the ordinary shape
+ *   of a retry, not an oddity: a pass that dies before triage hands its window back
+ *   (src/lib/jobs/nightly-stringer.ts), precisely so the retry rescans it rather than closing green
+ *   over untriaged findings. So the retry re-measured everything this point holds, plus whatever
+ *   arrived during the backoff, and its numbers SUPERSEDE the retained ones wholesale — counts,
+ *   triage, collector failures, and the baseline it left. Adding them instead would double-count the
+ *   window; keeping the retained ones would strand a real day's arrivals and the successful triage
+ *   report that came with them. A replay's re-measurement can also come back LOWER (fixed in the
+ *   meantime), which is a fact about the repo and belongs on the point.
+ * - A CONTINUATION — the retry measured from where this point's window CLOSES, so the two windows
+ *   abut and its signals fold in below. This is the shape of a pass that already triaged and then
+ *   died: nothing was handed back, so the retry scanned the next window along.
+ *
+ * Neither moves where the window opens, so that end is written once and never corrected.
+ *
+ * For a continuation, four facts about the point move:
  *
  * - THE WINDOW IT MEASURED: a retry that ran stringer again consumed a window of its own, and those
  *   signals are gone from stringer's baseline — no later scan will ever report them. Dropping them
@@ -306,7 +351,9 @@ async function findScanSummaryByJob(
  * class of claim as subtracting and takes the same proof — `baselineScan === false`, an arrival rate,
  * where two abutting windows' arrivals sum EXACTLY. (A standing total still abuts for the correction
  * above: the state it hands on can be consumed into no wrong number, since both the delta and the
- * fold demand that same proof of it.)
+ * fold demand that same proof of it.) A REPLAY needs no such guard: it never adds to a total, it
+ * replaces one measured over the same window — and a point that names where its window opens read a
+ * baseline off the repo to begin with, which is what makes it incremental (`lib/stringer`).
  *
  * Both the fold and the correction need the point to name where its own window ENDED
  * ({@link ScanSummary.deltaState}). Absent, nothing can be proven contiguous — and advancing to the
@@ -321,23 +368,45 @@ async function reconcileAttempt(
   // `deltaState` present at all means this attempt ran stringer, so the state moved — including to a
   // baseline anton could not identify, which clears the point's rather than leaving a stale claim.
   const rescanned = input.deltaState !== undefined && existing.deltaState !== undefined;
+  // Exactly where this point's own window OPENS: the retry rescanned it whole (the failure path
+  // handed it back), so its measurement replaces the retained one rather than joining it.
+  const replays =
+    input.deltaState?.before !== undefined &&
+    input.deltaState.before === existing.deltaStateBefore;
   // Exactly the state this point ended at: proof the retry's window starts where the point's ends,
-  // and the only case where their counts can be one measurement.
+  // and the only case where their counts can be one measurement. A replay wins the tie a point whose
+  // window opened and closed on the same state would otherwise create — nothing was consumed there,
+  // so there is no second window to add.
   const abuts =
-    input.deltaState?.before !== undefined && input.deltaState.before === existing.deltaState;
+    !replays &&
+    input.deltaState?.before !== undefined &&
+    input.deltaState.before === existing.deltaState;
   // Contiguity alone is not enough: only an ARRIVAL RATE may absorb a later window's arrivals, since
   // `--delta` never reports what was fixed and a standing total would inflate instead. See above.
   const folds = abuts && existing.baselineScan === false;
-  // Publishable only behind a contiguous retry — a non-abutting one leaves a window nothing here
-  // counts, so the point names no baseline: see above.
-  const left = rescanned ? (abuts ? (input.deltaState?.after ?? null) : null) : undefined;
+  // Publishable behind a replay (it re-measured the whole window, so where it ended is where the
+  // point ends) or a contiguous retry. A non-abutting one leaves a window nothing here counts, so
+  // the point names no baseline: see above.
+  const left = replays
+    ? (input.deltaState?.after ?? null)
+    : rescanned
+      ? (abuts ? (input.deltaState?.after ?? null) : null)
+      : undefined;
   const advanced = left !== undefined && left !== existing.deltaState;
-  const counts = folds ? addCounts(existing.counts, input.counts) : existing.counts;
-  const grew = counts.total !== existing.counts.total;
-  // Only a folded window is part of this point's measurement, so only its outages are holes in it.
-  const collectorFailures =
-    existing.collectorFailures + (folds ? (input.collectorFailures ?? 0) : 0);
-  const failuresGrew = collectorFailures !== existing.collectorFailures;
+  const counts = replays
+    ? input.counts
+    : folds
+      ? addCounts(existing.counts, input.counts)
+      : existing.counts;
+  // Every axis: a replay can re-measure the same total over a different split, and the chart draws
+  // both. A fold only ever grows the counts, so this reads as "grew" there.
+  const countsChanged = !sameCounts(counts, existing.counts);
+  // A replay re-measured the whole window, so its collectors decide whether the point is whole; a
+  // fold adds a window, and only a folded one is part of this point's measurement.
+  const collectorFailures = replays
+    ? (input.collectorFailures ?? 0)
+    : existing.collectorFailures + (folds ? (input.collectorFailures ?? 0) : 0);
+  const failuresChanged = collectorFailures !== existing.collectorFailures;
 
   // A scan window of its own is what makes this attempt's report someone else's — see above.
   const backfill = input.deltaState === undefined && !existing.triage ? input.triage : undefined;
@@ -348,17 +417,23 @@ async function reconcileAttempt(
   const covered =
     (retained !== undefined || existing.counts.total === 0) &&
     (!folds || folded !== undefined || input.counts.total === 0);
-  const triage = covered ? addTriage(retained, folded) : undefined;
+  // A replay triaged the point's whole window, so its report is the point's — and the retained one
+  // described a measurement that no longer stands, however it came out.
+  const triage = replays ? input.triage : covered ? addTriage(retained, folded) : undefined;
   const triageChanged = !sameTriage(triage, existing.triage);
-  if (!triageChanged && !advanced && !grew && !failuresGrew) return existing;
+  if (!triageChanged && !advanced && !countsChanged && !failuresChanged) return existing;
 
-  // The point the delta was measured against hasn't moved, so a widened window just widens it —
-  // unless the fold made these counts an undercount, which is not comparable in either direction.
+  // The point the delta was measured against hasn't moved, so however these counts moved — widened
+  // by a fold, re-measured by a replay over the same starting baseline — the stored delta moves with
+  // them. Dropped when the point is an undercount, which is not comparable in either direction. A
+  // point that HAD none stays without one even where the retry made it whole again: the predecessor's
+  // counts are not in hand here, and understating comparability costs a delta where inventing one
+  // would cost the trend.
   const delta =
     collectorFailures > 0
       ? undefined
-      : grew && existing.delta
-        ? extendDelta(existing.delta, input.counts)
+      : countsChanged && existing.delta
+        ? extendDelta(existing.delta, computeDelta(counts, existing.counts))
         : existing.delta;
   await db
     .update(schema.scanSummaries)
@@ -367,8 +442,8 @@ async function reconcileAttempt(
         ? { beadsCreated: triage?.created ?? null, beadsDeduped: triage?.deduped ?? null }
         : {}),
       ...(advanced ? { deltaState: left } : {}),
-      ...(failuresGrew ? { collectorFailures } : {}),
-      ...(grew
+      ...(failuresChanged ? { collectorFailures } : {}),
+      ...(countsChanged
         ? {
             totalSignals: counts.total,
             bySeverityJson: JSON.stringify(counts.bySeverity),
@@ -443,6 +518,10 @@ export async function saveScanSummary(
   // real day's arrivals were stranded (see reconcileAttempt). What it does NOT do is license a
   // subtraction: `baselineScan` above decides that.
   const deltaState = input.deltaState?.after;
+  // Where this point's window OPENS, recorded so a retry's rescan is legible: measuring from here
+  // again means the failure path handed the window back and the retry REPLAYED it, where measuring
+  // from `deltaState` means it scanned the next window along (see reconcileAttempt).
+  const deltaStateBefore = consumed;
   // Recorded rather than re-derived at read time: the same fact keeps the trend from scaling
   // incremental columns against a whole-repo total long after the baseline itself is gone. Taken as
   // the scan OBSERVED it rather than inferred from a missing `before` — a scan whose basis anton
@@ -457,6 +536,7 @@ export async function saveScanSummary(
     counts: input.counts,
     ...(delta ? { delta } : {}),
     ...(deltaState ? { deltaState } : {}),
+    ...(deltaStateBefore ? { deltaStateBefore } : {}),
     ...(baselineScan === undefined ? {} : { baselineScan }),
     ...(input.triage ? { triage: input.triage } : {}),
     collectorFailures: input.collectorFailures ?? 0,
@@ -473,6 +553,7 @@ export async function saveScanSummary(
     byClassJson: JSON.stringify(summary.counts.byClass),
     deltaJson: delta ? JSON.stringify(delta) : null,
     deltaState: deltaState ?? null,
+    deltaStateBefore: deltaStateBefore ?? null,
     baselineScan: baselineScan ?? null,
     beadsCreated: summary.triage?.created ?? null,
     beadsDeduped: summary.triage?.deduped ?? null,
@@ -552,6 +633,7 @@ function toSummary(row: typeof schema.scanSummaries.$inferSelect): ScanSummary {
     },
     ...(delta ? { delta } : {}),
     ...(row.deltaState ? { deltaState: row.deltaState } : {}),
+    ...(row.deltaStateBefore ? { deltaStateBefore: row.deltaStateBefore } : {}),
     ...(row.baselineScan === null ? {} : { baselineScan: row.baselineScan }),
     ...(triage ? { triage } : {}),
     collectorFailures: row.collectorFailures,
@@ -663,40 +745,58 @@ export async function latestScanHealth(projectId: string): Promise<ScanHealth | 
 /** The refresh-token contribution of a project that has never been scanned. */
 export const NO_SCAN_HEALTH = "none";
 
+/** The counts the chart draws, on every axis, in one comparable component. */
+function countsStamp(counts: ScanCounts): string {
+  return [
+    counts.total,
+    ...SCAN_SEVERITIES.map((s) => counts.bySeverity[s]),
+    ...SIGNAL_CLASSES.map((c) => counts.byClass[c]),
+  ].join(".");
+}
+
 /**
  * The newest row's identity for the board's refresh token. The id alone is not enough: a retried job
- * rewrites the existing row ({@link reconcileAttempt}) — backfilling or clearing triage counts, and
- * folding a contiguous retry's signals and collector outages into the point's own — so a token built
- * from the id would keep matching and a board polling between the two writes would never show
- * either. The total stands in for the counts: they only ever grow by the fold, and a fold that added
- * nothing changed no severity or class either. The failure count is stamped in its own right, since
- * a fold can mark the column incomplete (and drop its delta) without moving a single count. The
- * remaining value a retry rewrites — the baseline the point left — is bookkeeping the board never
- * renders, so stamping the visible mutable fields keeps the poll 304-friendly while still moving
- * when there is something new to render.
+ * rewrites the existing row ({@link reconcileAttempt}) — backfilling or clearing triage counts,
+ * folding a contiguous retry's signals and collector outages into the point's own, replacing the
+ * whole measurement when the retry replayed the window — so a token built from the id would keep
+ * matching and a board polling between the two writes would never show either. The counts are
+ * stamped on every axis rather than by their total, because a replay can come back with the same
+ * number of signals split differently and the chart draws the split. The failure count is stamped in
+ * its own right, since a retry can mark the column incomplete (and drop its delta) without moving a
+ * single count. The remaining value a retry rewrites — the baseline the point left — is bookkeeping
+ * the board never renders, so stamping the visible mutable fields keeps the poll 304-friendly while
+ * still moving when there is something new to render.
  */
 function scanVersion(
   id: string,
-  total: number,
+  counts: ScanCounts,
   triage: TriageOutcome | undefined,
   collectorFailures: number,
 ): string {
-  return `${id}:${total}:${collectorFailures}${triage ? `:${triage.created}:${triage.deduped}` : ""}`;
+  return `${id}:${countsStamp(counts)}:${collectorFailures}${triage ? `:${triage.created}:${triage.deduped}` : ""}`;
 }
 
 /** The series' identity for the board's refresh token. */
 export function scanHealthVersion(health: ScanHealth | undefined): string {
   if (!health) return NO_SCAN_HEALTH;
   const { latest } = health;
-  return scanVersion(latest.id, latest.total, latest.triage, health.collectorFailures);
+  const counts = { total: latest.total, bySeverity: latest.bySeverity, byClass: health.byClass };
+  return scanVersion(latest.id, counts, latest.triage, health.collectorFailures);
 }
 
-/** The version without paying to read the whole window — one row, no blob parse. */
+/**
+ * The version without paying to read the whole window — one row. The newest row's splits are parsed
+ * through the same {@link parseCounts} the served view uses, so the cheap token and the served one
+ * are the same string for the same row (a poll compares them; two spellings would 304 forever or
+ * never).
+ */
 export async function latestScanHealthVersion(projectId: string): Promise<string> {
   const rows = await getDb()
     .select({
       id: schema.scanSummaries.id,
       totalSignals: schema.scanSummaries.totalSignals,
+      bySeverityJson: schema.scanSummaries.bySeverityJson,
+      byClassJson: schema.scanSummaries.byClassJson,
       beadsCreated: schema.scanSummaries.beadsCreated,
       beadsDeduped: schema.scanSummaries.beadsDeduped,
       collectorFailures: schema.scanSummaries.collectorFailures,
@@ -706,9 +806,13 @@ export async function latestScanHealthVersion(projectId: string): Promise<string
     .orderBy(desc(schema.scanSummaries.generatedAt), NEWEST_FIRST)
     .limit(1);
   const row = rows[0];
-  return row
-    ? scanVersion(row.id, row.totalSignals, rowTriage(row), row.collectorFailures)
-    : NO_SCAN_HEALTH;
+  if (!row) return NO_SCAN_HEALTH;
+  const counts: ScanCounts = {
+    total: row.totalSignals,
+    bySeverity: parseCounts(row.bySeverityJson, emptySeverityCounts()),
+    byClass: parseCounts(row.byClassJson, emptyClassCounts()),
+  };
+  return scanVersion(row.id, counts, rowTriage(row), row.collectorFailures);
 }
 
 /** One-line summary for the job log: what this scan found, and how it moved. */

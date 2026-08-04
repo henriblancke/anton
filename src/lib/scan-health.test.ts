@@ -379,6 +379,131 @@ describe("the persisted series", () => {
     expect(next.delta?.total).toBe(-2);
   });
 
+  it("takes a REPLAYED window's measurement, report and all — the retry rescanned the same window", async () => {
+    // The ordinary retry: the first attempt scanned b0 → b1 and died before triage, so the handler
+    // put the baseline BACK and the retry measured from b0 again. It re-saw those 5 signals plus 3
+    // that arrived during the backoff and triaged all 8, so the point is its measurement — not 13
+    // (which double-counts the replayed window), and not 5 with the arrivals and the report thrown
+    // away because the retry's window "didn't abut".
+    await save(counts({ low: 3 }), { deltaState: since("b-1", "b0") });
+    clock.advance(86_400_000);
+    const first = await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 5 }),
+      deltaState: since("b0", "b1"),
+    });
+    expect(first.delta?.total).toBe(2);
+
+    clock.advance(86_400_000);
+    const retry = await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ critical: 1, low: 7 }),
+      deltaState: since("b0", "b2"),
+      triage: { created: 2, deduped: 6 },
+    });
+
+    expect(retry.counts.total).toBe(8);
+    expect(retry.counts.bySeverity).toEqual({ critical: 1, high: 0, medium: 0, low: 7 });
+    expect(retry.triage).toEqual({ created: 2, deduped: 6 });
+    expect(retry.deltaState).toBe("b2");
+    expect(retry.delta).toEqual({
+      total: 5,
+      bySeverity: { critical: 1, high: 0, medium: 0, low: 4 },
+    });
+
+    // Read back, not just returned — the chart reads rows, and the pass is still one row.
+    const rows = await listScanSummaries(tdb.db, projectId, 100);
+    expect(rows.length).toBe(2);
+    expect(rows[0].counts.total).toBe(8);
+    expect(rows[0].triage).toEqual({ created: 2, deduped: 6 });
+    expect(rows[0].deltaState).toBe("b2");
+    // And the next nightly measures from where the REPLAY ended, against the counts it left.
+    clock.advance(86_400_000);
+    const next = await save(counts({ low: 6 }), { deltaState: since("b2", "b3") });
+    expect(next.delta?.total).toBe(-2);
+  });
+
+  it("lands the triage report of a replay that found exactly what the first attempt did", async () => {
+    // The common shape of a quota retry: nothing arrived during the backoff, so the rescan re-reports
+    // the same 7 signals and triages them. Only the report is new — and refusing it (as a retry that
+    // scanned a DIFFERENT window is refused) would leave the pass permanently "not reported".
+    await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 7 }),
+      deltaState: since("b0", "b1"),
+    });
+    const retry = await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 7 }),
+      deltaState: since("b0", "b2"),
+      triage: { created: 3, deduped: 4 },
+    });
+
+    expect(retry.counts.total).toBe(7);
+    expect(retry.triage).toEqual({ created: 3, deduped: 4 });
+    const [row] = await listScanSummaries(tdb.db, projectId);
+    expect(row.triage).toEqual({ created: 3, deduped: 4 });
+    expect(row.deltaState).toBe("b2");
+  });
+
+  it("takes a replay's collector failures instead of adding them — it re-measured the window", async () => {
+    // The retained measurement is gone, so the point is whole exactly when the REPLAY was. Adding
+    // would strand an outage on a point no longer built from the scan that suffered it.
+    await save(counts({ low: 3 }), { deltaState: since("b-1", "b0") });
+    clock.advance(86_400_000);
+    await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 5 }),
+      deltaState: since("b0", "b1"),
+      collectorFailures: 2,
+    });
+
+    const retry = await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 6 }),
+      deltaState: since("b0", "b2"),
+    });
+
+    expect(retry.collectorFailures).toBe(0);
+    expect(retry.counts.total).toBe(6);
+    const [row] = await listScanSummaries(tdb.db, projectId);
+    expect(row.collectorFailures).toBe(0);
+    // The delta stays absent all the same: the point it would be measured against is not in hand
+    // here, and understating comparability costs a delta where inventing one costs the trend.
+    expect(row.delta).toBeUndefined();
+  });
+
+  it("moves the refresh token when a replay only re-splits the counts", async () => {
+    // One signal fixed, one of another severity arrived: the total is untouched and the chart's
+    // columns are not — a token that stood in for the counts by their total would 304 past it.
+    await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 5 }),
+      deltaState: since("b0", "b1"),
+    });
+    const version = async () =>
+      scanHealthVersion(scanHealth(await listScanSummaries(tdb.db, projectId, 100)));
+    const before = await version();
+
+    const retry = await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ critical: 1, low: 4 }),
+      deltaState: since("b0", "b2"),
+    });
+
+    expect(retry.counts.total).toBe(5);
+    expect(retry.counts.bySeverity.critical).toBe(1);
+    expect(await version()).not.toBe(before);
+  });
+
   it("folds a retry's collector failures too, and drops the delta the fold undercuts", async () => {
     // The first attempt was whole; the retry lost a collector mid-window. The point now counts a
     // window it only partly saw, so it is a floor — and a delta spanning it (or the next scan
@@ -817,6 +942,9 @@ describe("scanHealth (the board's view)", () => {
     collectorFailures: 0,
   });
 
+  /** The counts component of the token, for the all-low/all-debt shape `summary` builds. */
+  const stamp = (low: number) => [low, 0, 0, 0, low, 0, 0, low, 0, 0, 0].join(".");
+
   it("is undefined for a project nothing has ever scanned", () => {
     expect(scanHealth([])).toBeUndefined();
     expect(scanHealthVersion(undefined)).toBe("none");
@@ -828,19 +956,34 @@ describe("scanHealth (the board's view)", () => {
     expect(health.points.map((p) => p.id)).toEqual(["a", "b", "c"]);
     expect(health.latest.id).toBe("c");
     expect(health.delta?.total).toBe(-3);
-    expect(scanHealthVersion(health)).toBe("c:2:0");
+    expect(scanHealthVersion(health)).toBe(`c:${stamp(2)}:0`);
   });
 
   it("stamps the mutable fields into the version — a retry rewrites them in an existing row", () => {
     const latest = summary("c", 300, 2);
-    expect(scanHealthVersion(scanHealth([latest]))).toBe("c:2:0");
+    expect(scanHealthVersion(scanHealth([latest]))).toBe(`c:${stamp(2)}:0`);
     // Triage backfilled, a folded retry window growing the counts, and a fold that only marked the
     // point incomplete: each moves the token.
     expect(scanHealthVersion(scanHealth([{ ...latest, triage: { created: 2, deduped: 1 } }]))).toBe(
-      "c:2:0:2:1",
+      `c:${stamp(2)}:0:2:1`,
     );
-    expect(scanHealthVersion(scanHealth([summary("c", 300, 9)]))).toBe("c:9:0");
-    expect(scanHealthVersion(scanHealth([{ ...latest, collectorFailures: 1 }]))).toBe("c:2:1");
+    expect(scanHealthVersion(scanHealth([summary("c", 300, 9)]))).toBe(`c:${stamp(9)}:0`);
+    expect(scanHealthVersion(scanHealth([{ ...latest, collectorFailures: 1 }]))).toBe(
+      `c:${stamp(2)}:1`,
+    );
+  });
+
+  it("stamps every axis, so a replay that only re-splits the counts still moves the token", () => {
+    const latest = summary("c", 300, 2);
+    const resplit = {
+      ...latest,
+      counts: {
+        total: 2,
+        bySeverity: { critical: 1, high: 0, medium: 0, low: 1 },
+        byClass: { security: 1, dependencies: 0, debt: 1, risk: 0, docs: 0, other: 0 },
+      },
+    };
+    expect(scanHealthVersion(scanHealth([resplit]))).not.toBe(scanHealthVersion(scanHealth([latest])));
   });
 
   it("marks every incomplete column, not only the latest scan", () => {

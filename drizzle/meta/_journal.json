@@ -99,6 +99,13 @@
       "when": 1785803279532,
       "tag": "0013_opposite_crystal",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "6",
+      "when": 1785848364109,
+      "tag": "0014_shocking_red_hulk",
+      "breakpoints": true
     }
   ]
 }

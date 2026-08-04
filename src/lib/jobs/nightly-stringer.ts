@@ -126,7 +126,10 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
      * The flag guards the two call sites in THIS attempt; a retry runs a fresh handler with the flag
      * back to false, so the durable half of the guarantee is `saveScanSummary` keying on the job id —
      * a retry rescans the window this attempt unwound (see below) and would otherwise chart a second
-     * point for it. A pass is ONE point on the trend however many attempts it took.
+     * point for it. A pass is ONE point on the trend however many attempts it took: the retry's scan
+     * REPLAYS the restored window, so its counts and its triage report replace the ones recorded
+     * here rather than adding to them (`reconcileAttempt`), which is why the delta state travels
+     * with them — it is what proves the retry started where this attempt did.
      */
     let recorded = false;
     const recordHealth = async (counts: ScanCounts, opts: {
