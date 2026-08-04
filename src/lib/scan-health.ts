@@ -81,6 +81,16 @@ export interface ScanSummary {
    */
   deltaState?: string;
   /**
+   * True when these counts are a whole-repo STANDING TOTAL, not the arrival rate every incremental
+   * point measures — the scan established `--delta`'s baseline, or ran without `--delta`. The trend
+   * has to keep the two apart: charting them on one scale reads a baseline followed by two quiet
+   * nights as a dramatic improvement out of measurements that were never comparable.
+   *
+   * Absent is "not known" (a row predating the flag), which renders as incremental — a point is only
+   * set apart with evidence.
+   */
+  baselineScan?: boolean;
+  /**
    * Absent when triage never ran (a scan with no new signals) or when the session broke the report
    * protocol. Absent means "not reported", never "created nothing".
    */
@@ -259,6 +269,9 @@ export async function saveScanSummary(
   // Published only by a scan whose own counts are an arrival rate: a baseline scan leaves a baseline
   // behind too, but nothing may ever be measured against ITS standing total.
   const deltaState = consumed ? input.deltaState?.after : undefined;
+  // Recorded rather than re-derived at read time: the same fact keeps the trend from scaling
+  // incremental columns against a whole-repo total long after the baseline itself is gone.
+  const baselineScan = input.deltaState ? consumed === undefined : undefined;
   const summary: ScanSummary = {
     id: randomUUID(),
     projectId: input.projectId,
@@ -268,6 +281,7 @@ export async function saveScanSummary(
     counts: input.counts,
     ...(delta ? { delta } : {}),
     ...(deltaState ? { deltaState } : {}),
+    ...(baselineScan === undefined ? {} : { baselineScan }),
     ...(input.triage ? { triage: input.triage } : {}),
     collectorFailures: input.collectorFailures ?? 0,
   };
@@ -283,6 +297,7 @@ export async function saveScanSummary(
     byClassJson: JSON.stringify(summary.counts.byClass),
     deltaJson: delta ? JSON.stringify(delta) : null,
     deltaState: deltaState ?? null,
+    baselineScan: baselineScan ?? null,
     beadsCreated: summary.triage?.created ?? null,
     beadsDeduped: summary.triage?.deduped ?? null,
     collectorFailures: summary.collectorFailures,
@@ -361,6 +376,7 @@ function toSummary(row: typeof schema.scanSummaries.$inferSelect): ScanSummary {
     },
     ...(delta ? { delta } : {}),
     ...(row.deltaState ? { deltaState: row.deltaState } : {}),
+    ...(row.baselineScan === null ? {} : { baselineScan: row.baselineScan }),
     ...(triage ? { triage } : {}),
     collectorFailures: row.collectorFailures,
   };
@@ -402,6 +418,11 @@ export interface ScanHealthPoint {
   at: number;
   total: number;
   bySeverity: SeverityCounts;
+  /**
+   * This column counts the whole repo, not what arrived — see {@link ScanSummary.baselineScan}. The
+   * chart must render it apart from the incremental columns and never scale them against it.
+   */
+  baseline?: boolean;
   triage?: TriageOutcome;
 }
 
@@ -424,6 +445,7 @@ function toPoint(summary: ScanSummary): ScanHealthPoint {
     at: summary.generatedAt,
     total: summary.counts.total,
     bySeverity: summary.counts.bySeverity,
+    ...(summary.baselineScan ? { baseline: true } : {}),
     ...(summary.triage ? { triage: summary.triage } : {}),
   };
 }
@@ -495,9 +517,11 @@ export function summarizeScanLine(summary: ScanSummary): string {
     .map((s) => `${summary.counts.bySeverity[s]} ${s}`)
     .join(", ");
   const delta =
-    summary.delta === undefined
-      ? "no comparable previous scan — no delta"
-      : `${summary.delta.total >= 0 ? "+" : ""}${summary.delta.total} vs previous scan`;
+    summary.delta !== undefined
+      ? `${summary.delta.total >= 0 ? "+" : ""}${summary.delta.total} vs previous scan`
+      : summary.baselineScan
+        ? "baseline scan — the whole repo, not new arrivals; no delta"
+        : "no comparable previous scan — no delta";
   const triage = summary.triage
     ? `; triage created ${summary.triage.created}, deduped ${summary.triage.deduped}`
     : "";

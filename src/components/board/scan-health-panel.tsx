@@ -50,6 +50,24 @@ function severitySplit(point: ScanHealthPoint): string {
   return parts.length > 0 ? parts.join(", ") : "no new signals";
 }
 
+/**
+ * What a baseline column is, wherever it is announced. It counts everything already in the repo, so
+ * it is a different quantity from every incremental column beside it — the panel says that rather
+ * than letting the eye read a 100-signal baseline followed by 2 and 3 as debt collapsing.
+ */
+function baselineNote(point: ScanHealthPoint): string {
+  return (
+    `baseline scan: ${point.total} signal${point.total === 1 ? "" : "s"} already in the repo, ` +
+    `not new arrivals — not comparable to the scans beside it`
+  );
+}
+
+function pointLabel(point: ScanHealthPoint): string {
+  return point.baseline
+    ? `${shortDate(point.at)}, ${baselineNote(point)}`
+    : `${shortDate(point.at)}, ${point.total} (${severitySplit(point)})`;
+}
+
 function iso(unixSeconds: number): string {
   return new Date(unixSeconds * 1000).toISOString();
 }
@@ -62,49 +80,62 @@ function shortDate(unixSeconds: number): string {
 }
 
 /**
- * One column per scan, oldest → newest, stacked by severity and scaled to the noisiest scan in the
- * window. Bars rather than a line: each column is one nightly pass — a discrete event with an
- * internal split — not a sample of a continuous signal.
+ * One column per scan, oldest → newest, stacked by severity. Bars rather than a line: each column is
+ * one nightly pass — a discrete event with an internal split — not a sample of a continuous signal.
  *
- * A scan that found nothing draws a baseline tick, never an empty slot: "we scanned and it was
- * clean" is the best point on this chart and has to be visible as a point at all.
+ * A scan that found nothing draws a floor tick, never an empty slot: "we scanned and it was clean"
+ * is the best point on this chart and has to be visible as a point at all.
+ *
+ * A BASELINE scan is drawn as an outline, not a bar, and is left out of the scale (anton-3flx). Its
+ * count is every signal already in the repo rather than what arrived, so plotting it as a column
+ * would both make the incremental scans after it look like a collapse and squash them to nothing
+ * against a total they were never measured against. Kept in place rather than dropped — the gap
+ * would read as a night nobody scanned.
  */
 function ScanTrend({ points, className }: { points: ScanHealthPoint[]; className?: string }) {
   if (points.length === 0) return null;
-  const peak = Math.max(...points.map((p) => p.total), 1);
+  const peak = Math.max(...points.filter((p) => !p.baseline).map((p) => p.total), 1);
 
   return (
     <div
       className={cn("flex h-9 items-end gap-1", className)}
       role="img"
-      aria-label={`New signals per scan, oldest to newest: ${points
-        .map((p) => `${shortDate(p.at)}, ${p.total} (${severitySplit(p)})`)
-        .join("; ")}`}
+      aria-label={`New signals per scan, oldest to newest: ${points.map(pointLabel).join("; ")}`}
     >
-      {points.map((point) => (
-        <span
-          key={point.id}
-          title={`${shortDate(point.at)} — ${point.total} new signal${point.total === 1 ? "" : "s"} (${severitySplit(point)})`}
-          className="flex h-full min-w-1.5 flex-1 flex-col justify-end"
-        >
-          {point.total === 0 ? (
-            <span className="h-0.5 w-full rounded-[1px] bg-stage-done/60" />
-          ) : (
-            // Worst first, so a column reads top-down the way the legend does.
-            SCAN_SEVERITIES.filter((s) => point.bySeverity[s] > 0).map((severity) => (
-              <span
-                key={severity}
-                className={cn("w-full rounded-[1px]", SEVERITY_BAR[severity])}
-                // Floored so a single signal still draws — an invisible segment reads as absent,
-                // which is the one thing it is not.
-                style={{
-                  height: `${Math.max(6, (point.bySeverity[severity] / peak) * 100)}%`,
-                }}
-              />
-            ))
-          )}
-        </span>
-      ))}
+      {points.map((point) =>
+        point.baseline ? (
+          <span
+            key={point.id}
+            title={`${shortDate(point.at)} — ${baselineNote(point)}`}
+            className="flex h-full min-w-1.5 flex-1 flex-col justify-end"
+          >
+            <span className="h-full w-full rounded-[1px] border border-dashed border-subtle/60" />
+          </span>
+        ) : (
+          <span
+            key={point.id}
+            title={`${shortDate(point.at)} — ${point.total} new signal${point.total === 1 ? "" : "s"} (${severitySplit(point)})`}
+            className="flex h-full min-w-1.5 flex-1 flex-col justify-end"
+          >
+            {point.total === 0 ? (
+              <span className="h-0.5 w-full rounded-[1px] bg-stage-done/60" />
+            ) : (
+              // Worst first, so a column reads top-down the way the legend does.
+              SCAN_SEVERITIES.filter((s) => point.bySeverity[s] > 0).map((severity) => (
+                <span
+                  key={severity}
+                  className={cn("w-full rounded-[1px]", SEVERITY_BAR[severity])}
+                  // Floored so a single signal still draws — an invisible segment reads as absent,
+                  // which is the one thing it is not.
+                  style={{
+                    height: `${Math.max(6, (point.bySeverity[severity] / peak) * 100)}%`,
+                  }}
+                />
+              ))
+            )}
+          </span>
+        ),
+      )}
     </div>
   );
 }
@@ -116,7 +147,9 @@ function ScanTrend({ points, className }: { points: ScanHealthPoint[]; className
  * Every column is one nightly pass and every scan runs `--delta`, so the numbers are NEW problems
  * arriving, not the backlog outstanding: falling is healthy, and a scan finding nothing is a good
  * data point rather than a missing one. The panel says that out loud — read as a backlog, "6" would
- * look like a clean repo when it is in fact six new problems since yesterday.
+ * look like a clean repo when it is in fact six new problems since yesterday. The one pass that
+ * ISN'T an arrival rate — the scan that established the baseline — is marked as such everywhere it
+ * appears, rather than being plotted as the biggest week of debt the repo ever had.
  *
  * Renders nothing for a project that has never been scanned: the nightly-stringer schedule is
  * opt-in, so an un-scanned project would otherwise carry a permanent empty panel it can do nothing
@@ -147,13 +180,20 @@ export function ScanHealthPanel({ health }: { health: ScanHealth | undefined }) 
           stand behind rather than naming a comparison that was never made. */}
       <span className="text-xs text-muted-foreground" title={classSplit(byClass)}>
         <span className="font-mono text-foreground">{latest.total}</span>{" "}
-        {delta === undefined ? (
-          <>{latest.total === 1 ? "signal" : "signals"} found</>
-        ) : (
+        {delta !== undefined ? (
           <>
             new {latest.total === 1 ? "signal" : "signals"}{" "}
             <span className="text-subtle">since the previous scan</span>
           </>
+        ) : latest.baseline ? (
+          <>
+            {latest.total === 1 ? "signal" : "signals"}{" "}
+            <span className="text-subtle" title={baselineNote(latest)}>
+              in the repo — baseline scan
+            </span>
+          </>
+        ) : (
+          <>{latest.total === 1 ? "signal" : "signals"} found</>
         )}
       </span>
 

@@ -3,8 +3,16 @@
  * that keep a scan off a huge node_modules and away from the 10-minute timeout) and signal counting,
  * against a fake stringer binary that records its argv and writes a canned scan file.
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -147,6 +155,24 @@ describe("scan", () => {
     ).rejects.toThrow(/is unreadable/);
   });
 
+  // A stringer that renames its envelope key would otherwise chart a green point for output nobody
+  // parsed: both readers agree on zero, and the agreement is on a false zero.
+  it("counts an unrecognized envelope as zero, loudly", async () => {
+    const argvDump = join(dir, "argv.json");
+    process.env[STRINGER_BIN_ENV] = writeFakeStringer(argvDump, {
+      findings: [{ Source: "todos" }],
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const result = await scan({ repoPath: "/repo", scanFile: join(dir, "scan.json") });
+
+    expect(result.signals).toEqual([]);
+    const line = String(warn.mock.calls[0]?.[0]);
+    expect(line).toContain("no recognized signal array");
+    expect(line).toContain("findings"); // the shape it DID see, so a rename is identifiable
+    warn.mockRestore();
+  });
+
   // The chart and the beads must label the same signal the same way (anton-bz1w): triage reads the
   // severity off the file rather than re-deriving one from `Priority`, which would miss the floors.
   it("stamps anton's derived severity and class onto every signal in the scan file", async () => {
@@ -243,6 +269,19 @@ describe("scan", () => {
       ]);
     }
 
+    /** Fake stringer that advances the baseline and then writes NO scan file — output anton refuses. */
+    function writeRejectingStringer(name: string): string {
+      return writeScript(name, [
+        "const fs = require('fs'); const path = require('path');",
+        "const state = path.join(process.argv[3], '.stringer', 'last-scan.json');",
+        "let n = 0;",
+        "try { n = JSON.parse(fs.readFileSync(state, 'utf8')).n + 1; } catch {}",
+        "fs.mkdirSync(path.dirname(state), { recursive: true });",
+        "fs.writeFileSync(state, JSON.stringify({ n }));",
+        "process.exit(0);", // ...and never writes the -o file
+      ]);
+    }
+
     it("reports no baseline consumed by the scan that established one", async () => {
       process.env[STRINGER_BIN_ENV] = writeBaselineStringer();
 
@@ -285,6 +324,47 @@ describe("scan", () => {
       expect(full.deltaState).toEqual({});
     });
 
+    // stringer advances the baseline before anton ever reads the output, so a refused scan has
+    // already consumed its window. Leaving that advance in place lets the retry find nothing new and
+    // record a clean pass for findings nobody triaged — the false green the refusal exists to stop.
+    it("puts the baseline back when it refuses the scan output, so a retry rescans the same window", async () => {
+      process.env[STRINGER_BIN_ENV] = writeBaselineStringer();
+      const first = await scan({ repoPath: dir, scanFile: join(dir, "s1.json") });
+      const state = join(dir, ".stringer", "last-scan.json");
+      const consumed = readFileSync(state, "utf8");
+
+      process.env[STRINGER_BIN_ENV] = writeRejectingStringer("rejecting-stringer");
+      await expect(scan({ repoPath: dir, scanFile: join(dir, "s2.json") })).rejects.toThrow(
+        /is unreadable/,
+      );
+      expect(readFileSync(state, "utf8")).toBe(consumed);
+
+      process.env[STRINGER_BIN_ENV] = writeBaselineStringer();
+      const retry = await scan({ repoPath: dir, scanFile: join(dir, "s3.json") });
+      expect(retry.deltaState.before).toBe(first.deltaState.after);
+    });
+
+    it("undoes the baseline a refused FIRST scan established — there was none to go back to", async () => {
+      process.env[STRINGER_BIN_ENV] = writeRejectingStringer("rejecting-first");
+
+      await expect(scan({ repoPath: dir, scanFile: join(dir, "s1.json") })).rejects.toThrow(
+        /is unreadable/,
+      );
+
+      expect(existsSync(join(dir, ".stringer", "last-scan.json"))).toBe(false);
+    });
+
+    it("says so when the baseline behind a refused scan cannot be put back", async () => {
+      // No bytes to restore (here the state path is a directory), so the next --delta scan measures
+      // against whatever stringer left — an operator has to be told, not left with a silent retry.
+      mkdirSync(join(dir, ".stringer", "last-scan.json"), { recursive: true });
+      process.env[STRINGER_BIN_ENV] = writeScript("noop-stringer", ["process.exit(0);"]);
+
+      await expect(scan({ repoPath: dir, scanFile: join(dir, "s.json") })).rejects.toThrow(
+        /baseline could not be restored/,
+      );
+    });
+
     it("reports an unreadable baseline as unknown rather than as unchanged", async () => {
       const argvDump = join(dir, "argv.json");
       process.env[STRINGER_BIN_ENV] = writeFakeStringer(argvDump, []);
@@ -318,10 +398,13 @@ describe("extractSignals", () => {
     expect(extractSignals({ results: [{ Source: "vuln" }] })).toHaveLength(1);
   });
 
-  it("yields nothing for output carrying no signal array", () => {
-    expect(extractSignals({ metadata: {} })).toEqual([]);
-    expect(extractSignals(null)).toEqual([]);
-    expect(extractSignals("nope")).toEqual([]);
+  // `undefined`, not `[]`: a shape this doesn't know is a fact the caller has to be able to report,
+  // where an empty array would assert a scan that genuinely found nothing.
+  it("reports output carrying no signal array as unrecognized, not as empty", () => {
+    expect(extractSignals({ signals: [] })).toEqual([]);
+    expect(extractSignals({ metadata: {} })).toBeUndefined();
+    expect(extractSignals(null)).toBeUndefined();
+    expect(extractSignals("nope")).toBeUndefined();
   });
 });
 

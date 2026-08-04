@@ -148,6 +148,20 @@ describe("the persisted series", () => {
     expect((await getLatestScanSummary(tdb.db, projectId))?.delta).toBeUndefined();
   });
 
+  it("flags the whole-repo scans, so the chart never plots one as arrivals", async () => {
+    const baseline = await save(counts({ low: 100 }));
+    clock.advance(1000);
+    const incremental = await save(counts({ low: 2 }));
+
+    expect(baseline.baselineScan).toBe(true);
+    expect(incremental.baselineScan).toBe(false);
+    // Read back, not just returned — the chart reads rows, and the flag has to outlive the baseline.
+    const [latest, first] = await listScanSummaries(tdb.db, projectId);
+    expect(latest.baselineScan).toBe(false);
+    expect(first.baselineScan).toBe(true);
+    expect(scanHealth([latest, first])?.points.map((p) => p.baseline)).toEqual([true, undefined]);
+  });
+
   it("stores each later scan's delta against the one before it", async () => {
     await save(counts({ low: 9 })); // baseline — the second scan is the first comparable one
     clock.advance(86_400_000);

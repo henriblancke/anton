@@ -237,6 +237,17 @@ export const scanSummaries = sqliteTable(
      */
     deltaState: text("delta_state"),
     /**
+     * TRUE when this row's counts are a whole-repo STANDING TOTAL rather than the arrival rate the
+     * trend charts: the scan established `--delta`'s baseline (a project's first, or the first after
+     * `.stringer` was reset) or ran without `--delta` at all. The chart must not scale incremental
+     * columns against one of these — a 100-signal baseline beside 2 and 3 new signals reads as a
+     * dramatic improvement out of two incomparable measurements (anton-3flx).
+     *
+     * NULL is "anton didn't say": rows written before this was tracked, and scans whose basis it
+     * could not identify. A point is only set apart with evidence, so NULL renders as incremental.
+     */
+    baselineScan: integer("baseline_scan", { mode: "boolean" }),
+    /**
      * What /scan-triage reported doing with the signals. NULL when triage never ran (a scan with no
      * new signals) or broke its report protocol — "not reported", never "created nothing".
      */

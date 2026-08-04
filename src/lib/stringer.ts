@@ -10,7 +10,7 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readFile, writeFile, mkdir, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { annotateSignal, type ScanSignal } from "./scan-severity";
 
@@ -152,20 +152,81 @@ export interface ScanResult {
 const DELTA_STATE_FILE = join(".stringer", "last-scan.json");
 
 /**
- * The baseline's identity as it stands right now, or undefined when there is none anton can read.
+ * The baseline as it stood at one moment — its identity, and enough to put it back.
  *
- * A content hash rather than a parsed field: every delta scan rewrites the file (it carries the
- * scan's timestamp and signal hashes), so the bytes already ARE the identity, and reading them this
- * way can't drift when stringer renames a key. Unreadable is reported as unknown, never as
- * unchanged — a state anton can't identify is one it can't prove two scans share.
+ * The identity is a content hash rather than a parsed field: every delta scan rewrites the file (it
+ * carries the scan's timestamp and signal hashes), so the bytes already ARE the identity, and
+ * reading them this way can't drift when stringer renames a key. Unreadable is reported as unknown,
+ * never as unchanged — a state anton can't identify is one it can't prove two scans share.
+ *
+ * `absent` and `unreadable` are kept apart because only the first is restorable: a baseline that
+ * wasn't there is put back by deleting the one stringer wrote, while bytes anton never read cannot
+ * be reconstructed at all (see {@link restoreBaseline}).
  */
-async function deltaStateId(repoPath: string): Promise<string | undefined> {
+type BaselineSnapshot =
+  | { kind: "read"; id: string; raw: Buffer }
+  | { kind: "absent" }
+  | { kind: "unreadable"; reason: string };
+
+async function readBaseline(repoPath: string): Promise<BaselineSnapshot> {
   try {
     const raw = await readFile(join(repoPath, DELTA_STATE_FILE));
-    return createHash("sha256").update(raw).digest("hex").slice(0, 16);
-  } catch {
-    return undefined;
+    return { kind: "read", id: createHash("sha256").update(raw).digest("hex").slice(0, 16), raw };
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException | null;
+    if (e?.code === "ENOENT") return { kind: "absent" };
+    return { kind: "unreadable", reason: e?.message ?? String(err) };
   }
+}
+
+/** The baseline's identity as it stands right now, or undefined when there is none anton can read. */
+async function deltaStateId(repoPath: string): Promise<string | undefined> {
+  const snapshot = await readBaseline(repoPath);
+  return snapshot.kind === "read" ? snapshot.id : undefined;
+}
+
+/**
+ * Put the baseline back exactly as the scan found it. Returns why it couldn't, or undefined on success.
+ *
+ * stringer advances `.stringer/last-scan.json` on its way out, so a scan anton then REJECTS
+ * (unreadable output — see {@link readAnnotatedSignals}) has already consumed the window it failed
+ * to report. Left alone, the runner's `--delta` retry measures against the ADVANCED baseline, finds
+ * nothing new, and records a clean pass for findings nobody ever triaged — the exact false green the
+ * rejection exists to prevent. Restoring makes the retry rescan the same window.
+ */
+async function restoreBaseline(
+  repoPath: string,
+  snapshot: BaselineSnapshot,
+): Promise<string | undefined> {
+  const file = join(repoPath, DELTA_STATE_FILE);
+  try {
+    if (snapshot.kind === "read") await writeFile(file, snapshot.raw);
+    // Nothing was there before, so the baseline stringer just established is the thing to undo.
+    else if (snapshot.kind === "absent") await rm(file, { force: true });
+    else return `anton could not read it before the scan (${snapshot.reason})`;
+    return undefined;
+  } catch (err) {
+    return `rewriting ${file} failed (${err instanceof Error ? err.message : String(err)})`;
+  }
+}
+
+/**
+ * Rejecting a scan means unwinding it. When the baseline can't go back, the error says so rather
+ * than leaving a retry to quietly measure against a baseline the rejected scan advanced.
+ */
+async function rejectWithBaselineRestored(
+  err: unknown,
+  repoPath: string,
+  baseline: BaselineSnapshot,
+): Promise<unknown> {
+  const problem = await restoreBaseline(repoPath, baseline);
+  if (!problem) return err;
+  return new Error(
+    `${err instanceof Error ? err.message : String(err)}. Worse, stringer's --delta baseline could ` +
+      `not be restored (${problem}): a retry will measure against the baseline this scan advanced, ` +
+      `so these findings will not reappear — rescan with delta off, or reset ${DELTA_STATE_FILE}`,
+    { cause: err },
+  );
 }
 
 /** A collector stringer ran but that returned an error (or timed out) — a silent hole in the scan. */
@@ -233,20 +294,36 @@ export function describeCollectorFailure(failure: CollectorFailure): string {
     : base;
 }
 
+/** The envelope keys stringer has used for its signal array, in the order they are recognized. */
+const SIGNAL_ENVELOPE_KEYS = ["signals", "issues", "results"] as const;
+
 /**
  * stringer JSON is either a top-level array or an object carrying `signals`/`issues`/`results`.
  * The ONE place that shape is known: every reader takes its signals from here, so a stringer that
  * renames its envelope key can't leave the scan dispatching triage while the health record counts zero.
+ *
+ * `undefined` — distinct from an empty array — for a shape carrying NONE of those keys. Both readers
+ * would otherwise agree on a FALSE zero: a renamed envelope reads as a clean scan, skips triage, and
+ * charts a green point for output nobody parsed. Only the caller can say what to do about that, so
+ * this returns the fact rather than deciding (see {@link readAnnotatedSignals}).
  */
-export function extractSignals(parsed: unknown): ScanSignal[] {
+export function extractSignals(parsed: unknown): ScanSignal[] | undefined {
   if (Array.isArray(parsed)) return parsed as ScanSignal[];
   if (parsed && typeof parsed === "object") {
     const o = parsed as Record<string, unknown>;
-    for (const key of ["signals", "issues", "results"]) {
+    for (const key of SIGNAL_ENVELOPE_KEYS) {
       if (Array.isArray(o[key])) return o[key] as ScanSignal[];
     }
   }
-  return [];
+  return undefined;
+}
+
+/** What the unrecognized output looked like, so an operator can tell a rename from a broken write. */
+function describeShape(parsed: unknown): string {
+  if (parsed === null) return "null";
+  if (typeof parsed !== "object") return typeof parsed;
+  const keys = Object.keys(parsed as Record<string, unknown>);
+  return keys.length > 0 ? `object with keys: ${keys.join(", ")}` : "empty object";
 }
 
 /**
@@ -257,7 +334,8 @@ export function extractSignals(parsed: unknown): ScanSignal[] {
  *   `-o` file even for zero new signals, so a missing or truncated file is a process-boundary
  *   failure. Reading it as "no signals" would skip triage, chart a zero-signal point, and end the
  *   session `done` — the board would report a clean scan nobody could read. So it throws, and the
- *   runner retries or parks the job.
+ *   runner retries or parks the job. The caller unwinds the `--delta` baseline on the way out, so
+ *   the retry measures the window this attempt consumed rather than the one after it.
  * - **Triage labels the signal anton counted.** stringer emits no severity of its own; annotating
  *   here means the agent reads anton's derivation off the file instead of re-deriving one from the
  *   raw fields and drifting from the trend (see {@link annotateSignal}).
@@ -277,7 +355,19 @@ async function readAnnotatedSignals(scanFile: string): Promise<ScanSignal[]> {
     );
   }
 
-  const signals = extractSignals(parsed);
+  // Loud but not fatal: an unrecognized envelope is far more likely a stringer version bump than a
+  // broken scan, so the pass continues on zero signals — with a line an operator can trace, instead
+  // of a silently green health point.
+  const extracted = extractSignals(parsed);
+  if (!extracted) {
+    console.warn(
+      `[stringer] ${scanFile} carries no recognized signal array (${describeShape(parsed)}; ` +
+        `expected a top-level array or one of ${SIGNAL_ENVELOPE_KEYS.join("/")}) — counted as zero ` +
+        `signals. If stringer renamed its envelope key, this pass's clean scan is false.`,
+    );
+  }
+
+  const signals = extracted ?? [];
   for (const signal of signals) annotateSignal(signal);
   await writeFile(scanFile, JSON.stringify(parsed), "utf8");
   return signals;
@@ -290,7 +380,9 @@ async function readAnnotatedSignals(scanFile: string): Promise<ScanSignal[]> {
  * `delta` (default true) restricts to new signals since the last scan.
  * Throws on a stringer failure OR on output it can't read (fail loud — see
  * `readAnnotatedSignals`), so the job then retries/parks per the runner's policy; a deadline kill
- * throws a distinct "timed out" error rather than stringer's misleading partial stderr.
+ * throws a distinct "timed out" error rather than stringer's misleading partial stderr. A rejected
+ * scan leaves the `--delta` baseline where it found it, so the retry rescans the same window rather
+ * than the empty one this attempt advanced past (see `restoreBaseline`).
  */
 export async function scan(opts: {
   repoPath: string;
@@ -305,9 +397,11 @@ export async function scan(opts: {
 
   const delta = opts.delta ?? true;
   // Read BEFORE the run: only the pre-scan state distinguishes a pass that measured arrivals since
-  // a baseline from one that established it, and stringer overwrites the state on its way out. A
-  // non-delta scan counts the whole repo whatever is on disk, so it consumes no baseline at all.
-  const before = delta ? await deltaStateId(opts.repoPath) : undefined;
+  // a baseline from one that established it, and stringer overwrites the state on its way out. The
+  // BYTES come along so a scan anton refuses can be unwound (see `restoreBaseline`). A non-delta
+  // scan counts the whole repo whatever is on disk, so it consumes no baseline at all.
+  const baseline = delta ? await readBaseline(opts.repoPath) : undefined;
+  const before = baseline?.kind === "read" ? baseline.id : undefined;
 
   const args = ["scan", opts.repoPath, "--format", "json", "-o", opts.scanFile];
   if (delta) args.push("--delta");
@@ -330,10 +424,19 @@ export async function scan(opts: {
     throw toScanError(err, { timeoutMs });
   }
 
+  let signals: ScanSignal[];
+  try {
+    signals = await readAnnotatedSignals(opts.scanFile);
+  } catch (err) {
+    // Refusing the output means refusing the whole pass, baseline included: the retry has to see the
+    // same window this attempt consumed, or its findings are lost to a clean-looking rescan.
+    throw baseline ? await rejectWithBaselineRestored(err, opts.repoPath, baseline) : err;
+  }
+
   const after = delta ? await deltaStateId(opts.repoPath) : undefined;
   return {
     scanFile: opts.scanFile,
-    signals: await readAnnotatedSignals(opts.scanFile),
+    signals,
     collectorFailures: parseCollectorFailures(stderr),
     deltaState: { ...(before ? { before } : {}), ...(after ? { after } : {}) },
   };

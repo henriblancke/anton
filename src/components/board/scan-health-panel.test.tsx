@@ -114,6 +114,33 @@ describe("ScanHealthPanel", () => {
     expect(label).toContain("0 (no new signals)");
   });
 
+  // A baseline scan counts every signal already in the repo. Charted as a column it both reads as
+  // the worst night the repo ever had and squashes the real arrivals after it against a total they
+  // were never measured against — 100 then 2 then 3 would look like debt collapsing.
+  it("sets a baseline scan apart instead of charting it as new arrivals", () => {
+    const points: ScanHealthPoint[] = [
+      { ...point("a", 1_700_000_000, { low: 100 }), baseline: true },
+      point("b", 1_700_086_400, { low: 2 }),
+      point("c", 1_700_172_800, { low: 3 }),
+    ];
+    render(<ScanHealthPanel health={health({ points })} />);
+
+    const label = screen.getByRole("img").getAttribute("aria-label")!;
+    expect(label).toContain("baseline scan: 100 signals already in the repo");
+    expect(label).not.toContain("100 (100 low)");
+
+    // Scaled to the noisiest INCREMENTAL scan (3), not to the baseline's 100.
+    const bar = screen.getByTitle(/2 new signals/).firstElementChild as HTMLElement;
+    expect(Number.parseFloat(bar.style.height)).toBeCloseTo(66.7, 0);
+  });
+
+  it("says the latest scan is a baseline rather than calling its total new", () => {
+    const points = [{ ...point("a", 1_700_000_000, { low: 100 }), baseline: true }];
+    render(<ScanHealthPanel health={health({ points })} />);
+    expect(screen.getByText(/in the repo — baseline scan/)).toBeTruthy();
+    expect(screen.queryByText(/signals found/)).toBeNull();
+  });
+
   it("reports what triage did with the scan, when triage reported it", () => {
     const points = [{ ...point("a", 1_700_000_000, { low: 3 }), triage: { created: 2, deduped: 1 } }];
     render(<ScanHealthPanel health={health({ points })} />);
