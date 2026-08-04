@@ -403,6 +403,28 @@ describe("duplicate proposals from overlapping patrols", () => {
     expect(closeMock).not.toHaveBeenCalled();
   });
 
+  it("keeps the last ask standing when the survivor was deleted under the lock", async () => {
+    const board = onBoard(twin("anton-p1"), twin("anton-p2"));
+    liveBeads.delete("anton-p1"); // an operator deleted the survivor while this fold waited
+
+    const result = await reconcileDuplicateProposals(REPO, board);
+
+    // Folding here would close the only open twin as a duplicate of a bead that is no longer there,
+    // leaving the claim with no standing ask at all until a later patrol re-derived it.
+    expect(result.folded).toEqual([]);
+    expect(closeMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps the last ask standing when the survivor no longer carries the fingerprint", async () => {
+    const board = onBoard(twin("anton-p1"), twin("anton-p2"));
+    liveBeads.set("anton-p1", bead("anton-p1", { labels: [...PROPOSAL_LABELS] }));
+
+    const result = await reconcileDuplicateProposals(REPO, board);
+
+    expect(result.folded).toEqual([]);
+    expect(closeMock).not.toHaveBeenCalled();
+  });
+
   it("reports a fold that failed instead of costing the pass its proposals", async () => {
     const board = onBoard(twin("anton-p1"), twin("anton-p2"));
     closeMock.mockRejectedValueOnce(new Error("bd close exploded"));

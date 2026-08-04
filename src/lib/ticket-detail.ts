@@ -152,6 +152,14 @@ export const MAX_NOTE_CHARS = 2000;
  * builder reads when the executor picks the ticket up — no new gate, no status change.
  *
  * Throws on an unknown id (bd's own error, so the route can 404) or an empty/oversized note.
+ *
+ * Taken under the bead's own write lock, like updateTicket, and for the same reason: `bd note` is a
+ * bd write, so it moves the last-write stamp a gardener RETIREMENT rests on ("nobody has rewritten
+ * this since the patrol read it"), which `applyProposal` re-asks from a read taken inside this very
+ * lock (gardener/apply.ts). Unserialized, a steer landing after that locked re-read would be closed,
+ * deferred or superseded against the old stamp — hiding freshly-steered work from the ready set.
+ * Serialized, the note either lands first (and the apply refuses on the newer stamp) or waits until
+ * the proposal has settled.
  */
 export async function addTicketNote(
   project: Project,
@@ -164,15 +172,18 @@ export async function addTicketNote(
   if (trimmed.length > MAX_NOTE_CHARS) {
     throw new Error(`Note is too long (${trimmed.length} > ${MAX_NOTE_CHARS} characters)`);
   }
-  await beads.show(project.repoPath, id); // 404 guard — bd throws on an unknown id
-  await beads.note(
-    project.repoPath,
-    id,
-    formatHumanNote(trimmed, author, new Date()),
-    author || undefined,
-  );
-  // Read-after-write so the response carries the note just appended, not a stale blob.
-  const fresh = await beads.show(project.repoPath, id);
+  // Read-after-write so the response carries the note just appended, not a stale blob. Inside the
+  // lock, so it cannot read a competing write's result back as this note's outcome.
+  const fresh = await withBeadWriteLock(project.repoPath, id, async () => {
+    await beads.show(project.repoPath, id); // 404 guard — bd throws on an unknown id
+    await beads.note(
+      project.repoPath,
+      id,
+      formatHumanNote(trimmed, author, new Date()),
+      author || undefined,
+    );
+    return beads.show(project.repoPath, id);
+  });
   // The note landed locally; propagate via the immediate push + durable sync-push job (anton-nowq).
   nudgeSync(project, "ticket-detail");
   return parseTicketNotes(fresh.notes);

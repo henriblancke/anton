@@ -25,7 +25,7 @@
  * Applying an approved proposal is anton-1t3n's job; nothing here mutates a subject bead.
  */
 import { beads, LABELS, type Bead } from "../beads/bd";
-import { withBeadWriteLock } from "../beads/claim-lock";
+import { withBeadWriteLocks } from "../beads/claim-lock";
 import { isClaimed, isOpenWork } from "./board-index";
 import {
   concernedBeads,
@@ -322,6 +322,24 @@ export function planReconciliation(board: Bead[]): DuplicateProposals[] {
   return duplicates.sort((a, b) => a.fingerprint.localeCompare(b.fingerprint));
 }
 
+/**
+ * Does the survivor still carry this claim, read from inside its own write lock? A fold's whole
+ * premise is that the ask survives on `keep`; a deleted or re-labelled survivor makes the close a
+ * silent retraction of the last standing ask.
+ *
+ * Fails CLOSED — an unreadable survivor answers "no", so the twin is left standing and the next
+ * patrol re-asks. Judged on the fingerprint alone, not on openness: a survivor closed since the
+ * snapshot was answered (applied, or declined and now suppressed), which is a legitimate end for the
+ * ask, while requiring it open would strand duplicate noise whenever an apply settles it mid-fold.
+ */
+async function survivorHolds(repo: string, duplicate: DuplicateProposals): Promise<boolean> {
+  try {
+    return fingerprintLabelOf(await beads.show(repo, duplicate.keep)) === duplicate.fingerprint;
+  } catch {
+    return false;
+  }
+}
+
 export interface ReconcileResult {
   folded: Array<{ id: string; into: string }>;
   /** Duplicates an approval or a run holds — left for a human rather than folded under them. */
@@ -338,11 +356,15 @@ export interface ReconcileResult {
  * SURVIVOR still needs — the patrol would stop re-asking a question nobody answered. A plain close
  * carries bd's own reason instead, which names the bead that kept the ask.
  *
- * Each fold takes the twin's own write lock and re-reads it there, for the same reason every other
- * write in this feature does: `board` is a snapshot, and the states that make a twin untouchable —
- * an approval, a run's claim, an apply already settling it — all land through that lock. Under it
- * the orders are decided: either the approval lands first and this fold sees it and skips, or the
- * fold lands first and `applyProposal`'s own locked re-read refuses a settled proposal.
+ * Each fold takes the write lock of BOTH twins — the one being folded and the survivor it is folded
+ * into — and re-reads both there, for the same reason every other write in this feature does:
+ * `board` is a snapshot, and the states that make a twin untouchable — an approval, a run's claim,
+ * an apply already settling it — all land through that lock. Under it the orders are decided: either
+ * the approval lands first and this fold sees it and skips, or the fold lands first and
+ * `applyProposal`'s own locked re-read refuses a settled proposal. The SURVIVOR earns its lock the
+ * same way from the other direction: a delete lands through that lock too (`deleteTicket`), and
+ * closing the last open twin as a duplicate of a bead that is no longer there would leave the claim
+ * with no standing ask at all until a later patrol re-derived it.
  *
  * A failed close is REPORTED rather than thrown. It leaves board noise, not a wrong write, and the
  * duplicate is still there for the next patrol — parking a patrol over cosmetic cleanup would cost
@@ -362,7 +384,8 @@ export async function reconcileDuplicateProposals(
       // already landed is board state the caller still has to propagate.
       if (signal?.aborted) return result;
       try {
-        const folded = await withBeadWriteLock(repo, id, async () => {
+        const folded = await withBeadWriteLocks(repo, [duplicate.keep, id], async () => {
+          if (!(await survivorHolds(repo, duplicate))) return false;
           const live = await beads.show(repo, id);
           const stale =
             fingerprintLabelOf(live) !== duplicate.fingerprint ||

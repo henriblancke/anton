@@ -10,7 +10,13 @@ import { beads } from "./beads/bd";
 import { withBeadWriteLock } from "./beads/claim-lock";
 import { invalidateIssueSnapshot, resetIssueSnapshots } from "./beads/snapshot";
 import { allIssues } from "./beads/issues";
-import { deleteTicket, getTicketDetail, setTicketDeferred, updateTicket } from "./ticket-detail";
+import {
+  addTicketNote,
+  deleteTicket,
+  getTicketDetail,
+  setTicketDeferred,
+  updateTicket,
+} from "./ticket-detail";
 import type { Bead } from "./beads/bd";
 import type { Project } from "./types";
 
@@ -291,5 +297,57 @@ describe("setTicketDeferred serializes with the gardener's apply lock", () => {
 
     await expect(deferring).rejects.toThrow(/no such bead/);
     expect(defer).not.toHaveBeenCalled();
+  });
+});
+
+// `bd note` is a bd write, so a steer moves the last-write stamp a retirement's premise rests on
+// ("nobody has rewritten this since the patrol read it"). Landing outside the lock, it slips between
+// `applyProposal`'s locked re-read of that stamp and the close/defer/supersede that follows — hiding
+// work a human just steered. The lock is what orders the two.
+describe("addTicketNote serializes with the gardener's apply lock", () => {
+  /** Let the pending note reach the lock (or the write it would have made without one). */
+  const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 10));
+
+  beforeEach(() => resetIssueSnapshots());
+  afterEach(() => vi.restoreAllMocks());
+
+  it("waits for the bead's write lock instead of noting under a concurrent apply", async () => {
+    fakeBd([bead({ id: "anton-n1" })]);
+    const note = vi.spyOn(beads, "note").mockResolvedValue("");
+    let release!: () => void;
+    const apply = withBeadWriteLock(
+      "/repo",
+      "anton-n1",
+      () => new Promise<void>((r) => (release = r)),
+    );
+
+    const noting = addTicketNote(project, "anton-n1", "try the other branch", "alice");
+    await settle();
+    expect(note).not.toHaveBeenCalled();
+
+    release();
+    await apply;
+    await noting;
+    expect(note).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-reads under the lock, so a bead deleted while it waited 404s rather than writing blind", async () => {
+    const bd = fakeBd([bead({ id: "anton-n1" })]);
+    const note = vi.spyOn(beads, "note").mockResolvedValue("");
+    let release!: () => void;
+    const apply = withBeadWriteLock(
+      "/repo",
+      "anton-n1",
+      () => new Promise<void>((r) => (release = r)),
+    );
+
+    const noting = addTicketNote(project, "anton-n1", "try the other branch", "alice");
+    await settle();
+    bd.show.mockRejectedValue(new Error("no such bead anton-n1"));
+    release();
+    await apply;
+
+    await expect(noting).rejects.toThrow(/no such bead/);
+    expect(note).not.toHaveBeenCalled();
   });
 });
