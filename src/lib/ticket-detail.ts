@@ -4,6 +4,7 @@
  * Mirrors the read/parse patterns in epic-detail.ts and tickets.ts. See DESIGN.md §2/§3.
  */
 import { beads, type BeadPatch } from "./beads/bd";
+import { withBeadWriteLock } from "./beads/claim-lock";
 import { allIssues, ensureDescription } from "./beads/issues";
 import { nudgeSync } from "./beads/sync-nudge";
 import { formatHumanNote, parseTicketNotes, type TicketNote } from "./beads/notes";
@@ -108,19 +109,31 @@ export async function freshDetail(project: Project, bead: Bead): Promise<TicketD
  * Apply a field patch to the bead and return the refreshed detail. The bead is read first so
  * label edits diff against its current labels (preserving the approved, stage, and source
  * control labels); an empty patch writes nothing.
+ *
+ * Taken under the bead's own write lock, like deleteTicket, and for the same class of reason: a
+ * gardener RETIREMENT rests on a premise about this bead's contents — "nobody has rewritten it
+ * since the patrol read it" — which `applyProposal` re-asks from a read taken inside this very lock
+ * (gardener/apply.ts). Unserialized, an edit landing after that locked re-read would be closed,
+ * deferred or superseded against the old contents, with the premise fence having already passed.
+ * Serialized, the edit either lands first (and the apply refuses on the newer write stamp) or waits
+ * until the proposal has settled.
  */
 export async function updateTicket(
   project: Project,
   id: string,
   patch: BeadPatch,
 ): Promise<TicketDetail> {
-  const current = await beads.show(project.repoPath, id);
-  await beads.update(project.repoPath, id, patch, current.labels ?? []);
   // Read-after-write: the response must reflect the write, not the stale board the snapshot serves,
   // or the edit form resets to pre-write title/labels/approval. One `bd show` is the whole read —
   // it goes straight to bd, so unlike a snapshot refresh it can't be discarded by the sync below
-  // bumping the snapshot generation.
-  const detail = await freshDetail(project, await beads.show(project.repoPath, id));
+  // bumping the snapshot generation. Inside the lock, so it cannot read a competing write's result
+  // back as this patch's outcome.
+  const written = await withBeadWriteLock(project.repoPath, id, async () => {
+    const current = await beads.show(project.repoPath, id);
+    await beads.update(project.repoPath, id, patch, current.labels ?? []);
+    return beads.show(project.repoPath, id);
+  });
+  const detail = await freshDetail(project, written);
   // The update landed locally; propagate via the immediate push + durable sync-push job (anton-nowq)
   // without blocking the save response on a slow/unreachable remote.
   nudgeSync(project, "ticket-detail");
@@ -139,6 +152,14 @@ export const MAX_NOTE_CHARS = 2000;
  * builder reads when the executor picks the ticket up — no new gate, no status change.
  *
  * Throws on an unknown id (bd's own error, so the route can 404) or an empty/oversized note.
+ *
+ * Taken under the bead's own write lock, like updateTicket, and for the same reason: `bd note` is a
+ * bd write, so it moves the last-write stamp a gardener RETIREMENT rests on ("nobody has rewritten
+ * this since the patrol read it"), which `applyProposal` re-asks from a read taken inside this very
+ * lock (gardener/apply.ts). Unserialized, a steer landing after that locked re-read would be closed,
+ * deferred or superseded against the old stamp — hiding freshly-steered work from the ready set.
+ * Serialized, the note either lands first (and the apply refuses on the newer stamp) or waits until
+ * the proposal has settled.
  */
 export async function addTicketNote(
   project: Project,
@@ -151,15 +172,18 @@ export async function addTicketNote(
   if (trimmed.length > MAX_NOTE_CHARS) {
     throw new Error(`Note is too long (${trimmed.length} > ${MAX_NOTE_CHARS} characters)`);
   }
-  await beads.show(project.repoPath, id); // 404 guard — bd throws on an unknown id
-  await beads.note(
-    project.repoPath,
-    id,
-    formatHumanNote(trimmed, author, new Date()),
-    author || undefined,
-  );
-  // Read-after-write so the response carries the note just appended, not a stale blob.
-  const fresh = await beads.show(project.repoPath, id);
+  // Read-after-write so the response carries the note just appended, not a stale blob. Inside the
+  // lock, so it cannot read a competing write's result back as this note's outcome.
+  const fresh = await withBeadWriteLock(project.repoPath, id, async () => {
+    await beads.show(project.repoPath, id); // 404 guard — bd throws on an unknown id
+    await beads.note(
+      project.repoPath,
+      id,
+      formatHumanNote(trimmed, author, new Date()),
+      author || undefined,
+    );
+    return beads.show(project.repoPath, id);
+  });
   // The note landed locally; propagate via the immediate push + durable sync-push job (anton-nowq).
   nudgeSync(project, "ticket-detail");
   return parseTicketNotes(fresh.notes);
@@ -171,18 +195,29 @@ export async function addTicketNote(
  * runtime never dispatches it until a human un-snoozes. Nothing else about the ticket changes.
  *
  * Throws on an unknown id (bd's own error, so the route can 404).
+ *
+ * Taken under the bead's own write lock, like updateTicket, and for the same class of reason: a
+ * gardener STALE/DEFER proposal rests on a premise about this bead's snoozed state, which
+ * `applyProposal` re-confirms from a read taken inside this very lock (gardener/apply.ts). An
+ * un-snooze landing between that confirmation and the proposal's close would settle the proposal as
+ * "already deferred" over a ticket that is ready again. Serialized, the un-snooze either lands first
+ * (and the apply refuses as drifted) or waits until the proposal has settled.
  */
 export async function setTicketDeferred(
   project: Project,
   id: string,
   deferred: boolean,
 ): Promise<TicketDetail> {
-  await beads.show(project.repoPath, id); // 404 guard — bd throws on an unknown id
-  if (deferred) await beads.defer(project.repoPath, id);
-  else await beads.undefer(project.repoPath, id);
   // Read-after-write, like updateTicket: the `bd show` bead is authoritative for the snoozed state
-  // it just set, so the response never reflects the board's stale snapshot.
-  const detail = await freshDetail(project, await beads.show(project.repoPath, id));
+  // it just set, so the response never reflects the board's stale snapshot. Inside the lock, so it
+  // cannot read a competing write's result back as this toggle's outcome.
+  const written = await withBeadWriteLock(project.repoPath, id, async () => {
+    await beads.show(project.repoPath, id); // 404 guard — bd throws on an unknown id
+    if (deferred) await beads.defer(project.repoPath, id);
+    else await beads.undefer(project.repoPath, id);
+    return beads.show(project.repoPath, id);
+  });
+  const detail = await freshDetail(project, written);
   // The deferral landed locally; propagate via the immediate push + durable sync-push job (anton-nowq).
   nudgeSync(project, "ticket-detail");
   return detail;
@@ -192,10 +227,20 @@ export async function setTicketDeferred(
  * Permanently delete a ticket bead. Throws if the id doesn't resolve to a bead, so the API can
  * answer 404 instead of silently succeeding. A ticket may have dependents (e.g. a sibling that
  * `blocks`-links it); `bd delete --force` orphans those links rather than failing.
+ *
+ * Taken under the bead's own write lock, with the 404 guard re-read INSIDE it, for the reason the
+ * decline path takes the same lock (abandon.ts): a gardener proposal is a bead like any other, and
+ * `applyProposal` holds this lock for its whole run. Unserialized, a delete could remove the
+ * proposal after that apply had passed its locked re-read — the subject moves still land, then
+ * `settleProposal` fails on a bead that no longer exists, leaving board mutations with nothing
+ * recording the decision. Serialized, the delete either lands first (and the apply's re-read refuses,
+ * writing nothing) or waits until the apply has settled the proposal.
  */
 export async function deleteTicket(project: Project, id: string): Promise<void> {
-  await beads.show(project.repoPath, id); // 404 guard — bd throws on an unknown id
-  await beads.delete(project.repoPath, id);
+  await withBeadWriteLock(project.repoPath, id, async () => {
+    await beads.show(project.repoPath, id); // 404 guard — bd throws on an unknown id
+    await beads.delete(project.repoPath, id);
+  });
   // The delete landed locally; propagate via the immediate push + durable sync-push job (anton-nowq).
   nudgeSync(project, "ticket-detail");
 }

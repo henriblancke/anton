@@ -17,6 +17,7 @@ import { randomUUID } from "node:crypto";
 import { beads, labelValueOf, LABELS, unclaimableStatus, type Bead, type Gate } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
 import { ownerOf } from "../beads/claim";
+import { withBeadWriteLock } from "../beads/claim-lock";
 import { assignChildren, formatReservedChildren, releaseChildren } from "../beads/child-assign";
 import { contractGaps, formatContractGaps } from "../beads/contract";
 import { computeEpicGraph, epicStandaloneBlockers, isUnit, standaloneBlockers } from "../epic-graph";
@@ -705,92 +706,161 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //    reachable). Marking it `failed` instead would burn retry attempts on a temporary outage and
       //    eventually strand an approved job for a human. Not proceeding is what matters here; parking
       //    doesn't proceed any more than failing does, and it recovers on its own.
-      try {
-        await publishLease();
-      } catch (e) {
-        throw new RunAlreadyLiveError(
-          `${epicBeadId} could not publish its run-lease to the shared board (${
-            e instanceof Error ? e.message : String(e)
-          }) — parking rather than proceeding without a lease other machines can see; this attempt ` +
-            `resumes once the board is reachable`,
-        );
-      }
-
-      // 1b. Read-after-write conflict check (anton-jz1). The foreign-lease gate in step 0 read the
-      //     board BEFORE this publish, so it can't serialize two machines that force-run the same
-      //     epic at the same instant: both clear the gate before either lease is visible remotely,
-      //     then both publish. Our lease was already pushed to the remote by the required publish in
-      //     step 1; now re-pull so a concurrently-published foreign lease becomes visible, then
-      //     re-read and arbitrate: winsRunLeaseRace keeps the lease for the lexicographically-lowest
-      //     owner runId, so of two runs that both published, exactly one proceeds and the other parks
-      //     (RunAlreadyLiveError → reschedules, re-checks once the winner settles). The pull is
-      //     REQUIRED, not best-effort (anton-jz1): a swallowed pull failure would arbitrate against a
-      //     stale local view that can't see the other machine's lease, so both could conclude they
-      //     won — the exact double-run this step exists to break. If the pull fails we can't prove we
-      //     won, so we fail closed (park + retry) rather than proceed. Throwing here (before the
-      //     refresh timer is armed) means `finally` (leaseTimer still null) tears down only the lease
-      //     this run published.
-      const arbitrateRunLease = async () => {
+      // Steps 1 → 1c run under the TARGET's own bead write lock (anton-e42l). The lease and the
+      // confirmation read below are what stop an approved gardener re-parent attaching a ticket to a
+      // set this run has already selected — but a read alone serializes nothing: the gardener writes
+      // under `withBeadWriteLock` (gardener/apply.ts `applyStep` locks the subject AND the home), and
+      // it yields between passing `homeUnusable` and running the write. Outside that lock, this
+      // confirmation could land in exactly that gap, see the old ticket set, and let the run proceed
+      // while the delayed re-parent hangs a ticket nothing will dispatch — later closed unrun with
+      // the target. Holding the home's lock across the publish and the confirmation makes the two
+      // orders real: either the re-parent completes first and this read sees the drift (retry), or it
+      // queues behind this block and its own locked re-read finds the live lease (refuse). Released
+      // before the claim in step 3, which takes this same lock (beads/claim.ts) — nothing inside here
+      // may take it, on pain of deadlock.
+      await withBeadWriteLock(repo, epicBeadId, async () => {
         try {
-          await beads.pull(repo);
+          await publishLease();
         } catch (e) {
           throw new RunAlreadyLiveError(
-            `${epicBeadId} could not refresh the shared board to arbitrate the run-lease race (${
+            `${epicBeadId} could not publish its run-lease to the shared board (${
               e instanceof Error ? e.message : String(e)
-            }) — parking so a concurrent run on another machine isn't ignored; this attempt resumes ` +
-              `once the board is reachable`,
+            }) — parking rather than proceeding without a lease other machines can see; this attempt ` +
+              `resumes once the board is reachable`,
           );
         }
-        const acquired = await beads.show(repo, epicBeadId).catch(() => null);
-        // Fail closed when this re-read fails (anton-jz1). It's the ONLY check confirming no
-        // concurrent lease won the race; a null here (DB lock, transient CLI error, malformed output)
-        // means we can't prove we won, so park + retry like the pull failure above rather than fall
-        // through and proceed while another machine may hold a live lease.
-        if (!acquired) {
-          throw new RunAlreadyLiveError(
-            `${epicBeadId} could not re-read the target to arbitrate the run-lease race — parking so a ` +
-              `concurrent run on another machine isn't ignored; this attempt resumes once the board is reachable`,
+
+        // 1b. Read-after-write conflict check (anton-jz1). The foreign-lease gate in step 0 read the
+        //     board BEFORE this publish, so it can't serialize two machines that force-run the same
+        //     epic at the same instant: both clear the gate before either lease is visible remotely,
+        //     then both publish. Our lease was already pushed to the remote by the required publish in
+        //     step 1; now re-pull so a concurrently-published foreign lease becomes visible, then
+        //     re-read and arbitrate: winsRunLeaseRace keeps the lease for the lexicographically-lowest
+        //     owner runId, so of two runs that both published, exactly one proceeds and the other parks
+        //     (RunAlreadyLiveError → reschedules, re-checks once the winner settles). The pull is
+        //     REQUIRED, not best-effort (anton-jz1): a swallowed pull failure would arbitrate against a
+        //     stale local view that can't see the other machine's lease, so both could conclude they
+        //     won — the exact double-run this step exists to break. If the pull fails we can't prove we
+        //     won, so we fail closed (park + retry) rather than proceed. Throwing here (before the
+        //     refresh timer is armed) means `finally` (leaseTimer still null) tears down only the lease
+        //     this run published.
+        const arbitrateRunLease = async () => {
+          try {
+            await beads.pull(repo);
+          } catch (e) {
+            throw new RunAlreadyLiveError(
+              `${epicBeadId} could not refresh the shared board to arbitrate the run-lease race (${
+                e instanceof Error ? e.message : String(e)
+              }) — parking so a concurrent run on another machine isn't ignored; this attempt resumes ` +
+                `once the board is reachable`,
+            );
+          }
+          const acquired = await beads.show(repo, epicBeadId).catch(() => null);
+          // Fail closed when this re-read fails (anton-jz1). It's the ONLY check confirming no
+          // concurrent lease won the race; a null here (DB lock, transient CLI error, malformed output)
+          // means we can't prove we won, so park + retry like the pull failure above rather than fall
+          // through and proceed while another machine may hold a live lease.
+          if (!acquired) {
+            throw new RunAlreadyLiveError(
+              `${epicBeadId} could not re-read the target to arbitrate the run-lease race — parking so a ` +
+                `concurrent run on another machine isn't ignored; this attempt resumes once the board is reachable`,
+            );
+          }
+          // If the step-0 pre-check was stale, an already-live incumbent lease could have been invisible
+          // then and only surfaces now. That incumbent won't re-arbitrate, so winsRunLeaseRace's
+          // lowest-owner-wins tiebreak would let us steal the lease and double-run. Park on ANY foreign
+          // live lease instead of arbitrating by owner order (anton-jz1). A trusted (fresh) pre-check
+          // guarantees no incumbent existed, so a foreign lease seen now is a symmetric racer and IS
+          // safely arbitrable below.
+          if (!preCheckTrusted && beads.foreignRunLeaseLive(acquired, clock.now(), runId)) {
+            throw new RunAlreadyLiveError(
+              `${epicBeadId} found a live run-lease from another machine after a stale pre-check — parking ` +
+                `rather than stealing by owner order (that run started earlier and won't yield); this ` +
+                `attempt resumes once it settles and clears its lease`,
+              "foreign",
+            );
+          }
+          if (!beads.winsRunLeaseRace(acquired, clock.now(), runId)) {
+            throw new RunAlreadyLiveError(
+              `${epicBeadId} lost the run-lease race to a concurrent run on another machine — parking; ` +
+                `this attempt resumes once that run settles and clears its lease`,
+              "foreign",
+            );
+          }
+        };
+        // Arbitrate, settle, then arbitrate AGAIN before committing to run (anton-jz1). A single
+        // post-publish read can't close the race the reviewer flagged: winsRunLeaseRace returning true
+        // means "no foreign lease that beats us is VISIBLE", but on an eventually-consistent board a
+        // machine that force-ran the same instant may simply not have propagated its lease yet — so a
+        // fast publish→read wins uncontested while the slower racer, re-reading later, sees both leases
+        // and (if it sorts lower) also wins. That's the asymmetric-read double-run. The first call
+        // parks us fast if we've already clearly lost; the settle then gives a near-simultaneous foreign
+        // lease time to reach the remote, and the second call re-reads and re-arbitrates against it — so
+        // an "uncontested" win is only trusted once it has survived a propagation window rather than
+        // being acted on the instant no rival is visible. `clock.sleep` is the real wall-clock wait in
+        // production (systemClock); test clocks omit it, so the settle is a no-op and the second read
+        // runs immediately against the same fake board. This narrows, but (like the rest of this
+        // protocol) can't fully close, the window — a true cross-machine lock/CAS would; beads/Dolt
+        // offers none.
+        await arbitrateRunLease();
+        await clock.sleep?.(RUN_LEASE_SETTLE_MS);
+        await arbitrateRunLease();
+
+        // 1c. Re-confirm the ticket selection against a board that can SEE this run (anton-e42l).
+        //     Steps 0a-ter/0b/0c chose and gated the tickets from a read taken BEFORE the publish
+        //     above, and until that lease landed the target carried neither a lease nor a claim — so
+        //     for that whole window it reads as free work to anyone else. An approved gardener
+        //     re-parent is the case that matters: its home check (gardener/apply.ts `homeUnusable`)
+        //     asks exactly "is a run holding this card", sees nothing, and attaches a ticket this run
+        //     has already finished selecting. That newcomer is never dispatched, and merge
+        //     finalization closes it unrun along with the rest of the target's subtree.
+        //     The lease is now published, pushed and arbitrated, and this read runs under the
+        //     target's write lock (see the wrapper above) — which is what makes it a serialization
+        //     point rather than just a later read: a move that landed before it is IN this board, and
+        //     one that has not written yet cannot write until the lock is released, by which time its
+        //     own locked re-read sees the live lease and refuses. Cross-machine the lock buys
+        //     nothing, and the lease is still the only guard there. A set that differs means our
+        //     selection is the stale half of
+        //     that race — retry (a plain Error, not a park) so the next attempt re-gates and runs the
+        //     whole set rather than silently dropping the newcomer. Converges: the retry re-reads the
+        //     board from the top and selects the set this read just saw.
+        //     Fails closed on an unreadable board, like the arbitration reads above — we cannot prove
+        //     the set is stable — and costs nothing, since no worktree exists yet.
+        //     Status-blind by construction: `runTickets` filters on shape, not state, so a ticket
+        //     another machine closed mid-window is still in both sets and doesn't trip this.
+        let confirmedBoard: Bead[];
+        try {
+          confirmedBoard = await loadAllIssues(repo, { strictGates: true });
+        } catch (e) {
+          throw new Error(
+            `${epicBeadId} could not re-read the board after publishing its run-lease to confirm its ` +
+              `ticket set — retrying rather than executing a selection that may already be stale. ` +
+              `(${e instanceof Error ? e.message : String(e)})`,
           );
         }
-        // If the step-0 pre-check was stale, an already-live incumbent lease could have been invisible
-        // then and only surfaces now. That incumbent won't re-arbitrate, so winsRunLeaseRace's
-        // lowest-owner-wins tiebreak would let us steal the lease and double-run. Park on ANY foreign
-        // live lease instead of arbitrating by owner order (anton-jz1). A trusted (fresh) pre-check
-        // guarantees no incumbent existed, so a foreign lease seen now is a symmetric racer and IS
-        // safely arbitrable below.
-        if (!preCheckTrusted && beads.foreignRunLeaseLive(acquired, clock.now(), runId)) {
-          throw new RunAlreadyLiveError(
-            `${epicBeadId} found a live run-lease from another machine after a stale pre-check — parking ` +
-              `rather than stealing by owner order (that run started earlier and won't yield); this ` +
-              `attempt resumes once it settles and clears its lease`,
-            "foreign",
+        //     The target's OWN run shape is re-confirmed here, not just its subtree: a parentless
+        //     task/bug re-parented under another card in this same window keeps an EMPTY ticket set
+        //     on both sides of the drift check below, so nothing would fire while the bead has
+        //     become a ticket in someone else's run — executed here as well as there. PARK rather
+        //     than retry, like 0a-ter: a target that stopped being one doesn't become one again by
+        //     trying, and the message names what took it.
+        const targetDrift = runTargetDrift(epicBeadId, confirmedBoard);
+        if (targetDrift) {
+          throw new PoisonEpic(
+            `${epicBeadId} stopped being a run target while this run was starting (${targetDrift}) ` +
+              `— refusing to execute work another target now owns`,
           );
         }
-        if (!beads.winsRunLeaseRace(acquired, clock.now(), runId)) {
-          throw new RunAlreadyLiveError(
-            `${epicBeadId} lost the run-lease race to a concurrent run on another machine — parking; ` +
-              `this attempt resumes once that run settles and clears its lease`,
-            "foreign",
+        const confirmedChildren = runTickets(confirmedBoard, epicBeadId);
+        const drift = ticketSetDrift(freshChildren, confirmedChildren);
+        if (drift) {
+          throw new Error(
+            `${epicBeadId}'s ticket set changed while this run was starting (${drift}) — retrying so ` +
+              `the run gates and executes the whole set rather than dropping work moved under it ` +
+              `before its run-lease was visible`,
           );
         }
-      };
-      // Arbitrate, settle, then arbitrate AGAIN before committing to run (anton-jz1). A single
-      // post-publish read can't close the race the reviewer flagged: winsRunLeaseRace returning true
-      // means "no foreign lease that beats us is VISIBLE", but on an eventually-consistent board a
-      // machine that force-ran the same instant may simply not have propagated its lease yet — so a
-      // fast publish→read wins uncontested while the slower racer, re-reading later, sees both leases
-      // and (if it sorts lower) also wins. That's the asymmetric-read double-run. The first call
-      // parks us fast if we've already clearly lost; the settle then gives a near-simultaneous foreign
-      // lease time to reach the remote, and the second call re-reads and re-arbitrates against it — so
-      // an "uncontested" win is only trusted once it has survived a propagation window rather than
-      // being acted on the instant no rival is visible. `clock.sleep` is the real wall-clock wait in
-      // production (systemClock); test clocks omit it, so the settle is a no-op and the second read
-      // runs immediately against the same fake board. This narrows, but (like the rest of this
-      // protocol) can't fully close, the window — a true cross-machine lock/CAS would; beads/Dolt
-      // offers none.
-      await arbitrateRunLease();
-      await clock.sleep?.(RUN_LEASE_SETTLE_MS);
-      await arbitrateRunLease();
+      });
 
       leaseTimer = setInterval(() => {
         if (leaseSettled) return; // run is settling — don't publish a fresh lease behind finally's clear
@@ -2420,6 +2490,53 @@ export function inactiveAgentTickets(
     out.push({ id: t.id, agent });
   }
   return out;
+}
+
+/**
+ * How the TARGET itself stopped being a run target while its run was starting (anton-e42l), named
+ * for the error — or undefined when it is still one.
+ *
+ * {@link ticketSetDrift} watches the subtree; this watches the bead. A parentless task/bug that a
+ * re-parent moved under another card has an empty ticket set on BOTH sides of that check — nothing
+ * attached, nothing detached — while the bead itself has become a child ticket of somebody else's
+ * run target. Left unasked, this run would execute (and settle) a bead the other target's run also
+ * owns. Judged with the same `isRunTarget` predicate as the pre-lease gate, so the two agree.
+ */
+export function runTargetDrift(id: string, board: Bead[]): string | undefined {
+  const live = board.find((b) => b.id === id);
+  if (!live) return "it is no longer on the board";
+  if (beads.isRunTarget(live, board)) return undefined;
+  if (beads.isContainer(live, board)) {
+    return "it gained a feature child and is now a container epic — run one of its features instead";
+  }
+  const parent = beads.parentOf(live);
+  return parent
+    ? `it now hangs under ${parent}, whose run owns it as a ticket`
+    : `its type is now "${live.issue_type ?? "unknown"}", which anton never runs on its own`;
+}
+
+/**
+ * How the target's ticket subtree moved between this run's selection and a board that can see the
+ * run's lease (anton-e42l), named for the error — or undefined when it didn't move.
+ *
+ * Ids only, and status-blind on purpose: `runTickets` filters on SHAPE, not state, so a ticket
+ * another machine merely closed mid-window is in both sets and reads as no drift. What this is for
+ * is a bead genuinely attached to (or pulled out of) the target while the run was starting up —
+ * chiefly an approved gardener re-parent, which is allowed to attach work to any card no run is
+ * visibly holding.
+ */
+export function ticketSetDrift(selected: Bead[], confirmed: Bead[]): string | undefined {
+  const before = new Set(selected.map((t) => t.id));
+  const after = new Set(confirmed.map((t) => t.id));
+  const attached = [...after].filter((id) => !before.has(id));
+  const detached = [...before].filter((id) => !after.has(id));
+  if (attached.length === 0 && detached.length === 0) return undefined;
+  return [
+    attached.length > 0 ? `attached ${attached.join(", ")}` : "",
+    detached.length > 0 ? `detached ${detached.join(", ")}` : "",
+  ]
+    .filter(Boolean)
+    .join("; ");
 }
 
 /**

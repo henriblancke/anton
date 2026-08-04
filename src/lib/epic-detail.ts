@@ -3,9 +3,11 @@
  * among {epic + tickets}. Edges come from `bd dep list` on each ticket, filtered to members
  * of the epic's own graph. See DESIGN.md §2/§3.
  */
-import { beads, type BeadPatch } from "./beads/bd";
+import { beads, type Bead, type BeadPatch } from "./beads/bd";
+import { withBeadWriteLocks } from "./beads/claim-lock";
 import { isPipelineArtifact } from "./beads/contract";
 import { ensureDescription } from "./beads/issues";
+import { descendantsOf } from "./beads/subtree";
 import { nudgeSync } from "./beads/sync-nudge";
 import { getDb } from "./db";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
@@ -125,15 +127,96 @@ export async function updateEpic(
   return detail;
 }
 
+/** Thrown when the subtree a delete would destroy moved while the delete was landing (route → 409). */
+export class DeleteConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DeleteConflictError";
+  }
+}
+
+/** The beads `bd delete --cascade` destroys: the epic plus its WHOLE subtree, settled ones included. */
+const cascadeIds = (epicId: string, subtree: Bead[]): string[] => [
+  epicId,
+  ...subtree.map((b) => b.id),
+];
+
+/**
+ * The subtree this delete would erase, or a refusal naming the read it needed. A board we could not
+ * read says nothing, and a delete is permanent — so refusing costs a retry, while deleting blind
+ * cannot be taken back.
+ */
+async function cascadeSubtree(repo: string, epicId: string): Promise<Bead[]> {
+  try {
+    // --skip-labels (bd 1.1.0): the walk reads parent and id only, so label hydration is dead weight.
+    return descendantsOf(await beads.list(repo, ["--status", "all", "--skip-labels"]), epicId);
+  } catch (e) {
+    const why = e instanceof Error ? e.message : String(e);
+    throw new DeleteConflictError(
+      `the work under ${epicId} could not be read (${why}) — nothing was deleted; try again`,
+    );
+  }
+}
+
 /**
  * Permanently delete an epic and all of its child tickets (`bd delete --cascade`). Cascade is
  * required because the children depend on the epic via parent-child edges — a plain delete would
  * fail. Throws if the id doesn't resolve, so the API can answer 404.
+ *
+ * Taken under the write lock of the epic AND every bead the cascade destroys, with the 404 guard
+ * re-read inside them — the same serialization `abandonEpic` settles under, and for a strictly
+ * stronger reason: abandon closes the subtree, this erases it (anton-e42l). A gardener approval
+ * attaching work anywhere beneath this epic takes the write lock of the bead it moves AND of the
+ * card it moves it under (gardener/apply.ts `applyStep`), so an unlocked delete could land between
+ * that step's locked re-read and its write — destroying the home mid-move, while the step still
+ * reported success and its proposal closed as applied over a subject that no longer exists.
+ * Serialized, the delete either lands first — and the step's own locked home re-check refuses
+ * (`assertHomeIsCard`: a deleted bead is no board card) — or it waits behind the move and then sees
+ * the newcomer in the re-derived subtree below.
+ *
+ * The subtree is re-derived inside the locks and a CHANGED one refuses, because the lock set was
+ * chosen from a snapshot: `bd delete --cascade` erases whatever hangs beneath the epic at write
+ * time, so a bead attached after that snapshot would be destroyed while this call holds no lock on
+ * it — the one bead a concurrent gardener step could still be writing. Refusing (rather than
+ * re-locking the fresh set) keeps the destructive act to work the operator actually saw; nothing has
+ * been written yet, so a retry re-plans against the board it just read.
  */
 export async function deleteEpic(project: Project, epicId: string): Promise<void> {
-  await beads.show(project.repoPath, epicId); // 404 guard — bd throws on an unknown id
-  await beads.delete(project.repoPath, epicId, { cascade: true });
+  const repo = project.repoPath;
+  await beads.show(repo, epicId); // 404 guard — bd throws on an unknown id
+  const subtree = await cascadeSubtree(repo, epicId);
+
+  await withBeadWriteLocks(repo, cascadeIds(epicId, subtree), async () => {
+    await beads.show(repo, epicId); // re-read under the locks: the guard above judged a pre-lock board
+    assertSubtreeUnchanged(epicId, subtree, await cascadeSubtree(repo, epicId));
+    await beads.delete(repo, epicId, { cascade: true });
+  });
   // The delete already landed locally; propagate without blocking the response. nudgeSync fires the
   // immediate push AND enqueues the durable sync-push backstop (anton-nowq).
   nudgeSync(project, "epic-detail");
+}
+
+/**
+ * Refuse a delete whose subtree moved between the snapshot its locks were chosen from and the locks
+ * it now holds — the gardener re-parent race {@link deleteEpic} serializes against, seen from the
+ * side where the move won: the approval attached a bead this delete never locked and would silently
+ * erase, while its proposal closes as applied. Naming the ids is the point — the operator retries
+ * against a board that now shows the newcomer, and decides again.
+ */
+function assertSubtreeUnchanged(epicId: string, before: Bead[], after: Bead[]): void {
+  const beforeIds = new Set(before.map((b) => b.id));
+  const afterIds = new Set(after.map((b) => b.id));
+  const attached = [...afterIds].filter((id) => !beforeIds.has(id));
+  const detached = [...beforeIds].filter((id) => !afterIds.has(id));
+  if (attached.length === 0 && detached.length === 0) return;
+  const moved = [
+    attached.length > 0 ? `attached ${attached.join(", ")}` : "",
+    detached.length > 0 ? `detached ${detached.join(", ")}` : "",
+  ]
+    .filter(Boolean)
+    .join("; ");
+  throw new DeleteConflictError(
+    `the work under ${epicId} changed while this delete was landing (${moved}) — nothing was ` +
+      `deleted; try again so the delete destroys the work the board actually holds`,
+  );
 }

@@ -72,7 +72,7 @@ under it. **Never re-type an existing bead to "migrate" it.**
 | `risk:`   | `low`, `high`                                              | `high` = security / schema / auth / payments / migrations / infra |
 | `agent:`  | `nextjs`, `supabase`, `fastapi`, `pydantic`, `alembic`, … or omitted | which specialist fits |
 | `size:`   | `S`, `M`, `L`                                              | sanity check; `L` on a ticket is a smell — split it |
-| `source:` | `stringer`, or omitted                                     | provenance; scan beads also carry `stringer:<collector>:<hash>` for dedup |
+| `source:` | `stringer`, `gardener`, or omitted                         | provenance; scan beads also carry `stringer:<collector>:<hash>` for dedup, and gardener proposals `gardener:<class>:<hash>` (an open or declined fingerprint stops the patrol re-asking) |
 
 (Model routing is the executor's concern — shaping does not set a `model:` label.)
 
