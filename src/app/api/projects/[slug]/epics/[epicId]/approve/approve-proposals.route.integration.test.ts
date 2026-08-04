@@ -105,7 +105,15 @@ describeBd("POST approve — gardener proposals apply their move (temp anton.db 
 
   it("draws the blocks edge in the direction the proposal states", async () => {
     const blocker = await beads.create(repo, { title: "Goes first", type: "task", acceptance: "- [ ] a" });
-    const blocked = await beads.create(repo, { title: "Goes second", type: "task", acceptance: "- [ ] a" });
+    // The body phrase the detection read, in the bead's REAL prose: approving re-derives the implied
+    // ordering from the board rather than taking the plan's word for it, so a proposal whose only
+    // evidence has been edited away since the filing would (rightly) refuse.
+    const blocked = await beads.create(repo, {
+      title: "Goes second",
+      type: "task",
+      acceptance: "- [ ] a",
+      description: `Goal: the second half.\n\nBlocked on ${blocker}, which has to land first.`,
+    });
     const proposal = await file({
       kind: "implied-order",
       move: "link",

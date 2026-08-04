@@ -210,6 +210,27 @@ const warm = (id: string, extra: Partial<Bead> = {}): Bead =>
   bead(id, { updated_at: "2026-07-15T00:00:00Z", ...extra });
 
 /**
+ * A {@link LINK} subject still carrying the `discovered-from` edge its proposal read. An
+ * `implied-order` ask rests on nothing but that edge or a body phrase, so apply re-derives it from
+ * the board — a bead the board no longer places after its blocker is a proposal whose only evidence
+ * somebody removed.
+ */
+const ordered = (base: Bead = bead("anton-a")): Bead => ({
+  ...base,
+  dependencies: [
+    ...(base.dependencies ?? []),
+    { issue_id: base.id, depends_on_id: "anton-b", type: "discovered-from" },
+  ],
+});
+
+/**
+ * The landed twin a {@link SUPERSEDE} points at, untouched since the filing like its subject: the
+ * contents match is symmetric, so the survivor's own edits falsify it too.
+ */
+const landed = (extra: Partial<Bead> = {}): Bead =>
+  cold("anton-b", { status: "closed", ...extra });
+
+/**
  * Decide against a fixture board the way the route does: now, against a proposal filed a month ago.
  * A test that needs a different pair of moments calls `planApply` itself.
  */
@@ -242,7 +263,7 @@ const ticket = (extra: Partial<Bead> = {}): Bead =>
 const retirements = (board: Bead[]): [GardenerPlan, Bead[]][] => [
   [DEFER, board],
   [CLOSE, board],
-  [SUPERSEDE, [...board, bead("anton-b", { status: "closed" })]],
+  [SUPERSEDE, [...board, landed()]],
 ];
 
 const REPARENT = planFor({
@@ -388,7 +409,7 @@ describe("planApply — what an approval means against the board as it now is", 
   });
 
   it("records the blocks edge in the direction the detection states", () => {
-    const board = [bead("anton-a"), bead("anton-b")];
+    const board = [ordered(), bead("anton-b")];
     expect(decide(LINK, board)).toEqual({
       status: "apply",
       summary: "recorded that anton-b blocks anton-a",
@@ -420,7 +441,7 @@ describe("planApply — what an approval means against the board as it now is", 
   it("refuses a link that would close a dependency cycle through other beads", () => {
     // anton-b waits on anton-c, which waits on anton-a — so "anton-b blocks anton-a" closes the loop.
     const board = [
-      bead("anton-a"),
+      ordered(),
       blockedBy("anton-b", "anton-c"),
       blockedBy("anton-c", "anton-a"),
     ];
@@ -433,7 +454,7 @@ describe("planApply — what an approval means against the board as it now is", 
 
   it("still records an edge whose chain runs the other way — that is an ordering, not a cycle", () => {
     // anton-a already waits on anton-c: adding anton-b as another of its blockers closes nothing.
-    const board = [blockedBy("anton-a", "anton-c"), bead("anton-b"), bead("anton-c")];
+    const board = [ordered(blockedBy("anton-a", "anton-c")), bead("anton-b"), bead("anton-c")];
     expect(decide(LINK, board).status).toBe("apply");
   });
 
@@ -446,9 +467,7 @@ describe("planApply — what an approval means against the board as it now is", 
       status: "apply",
       steps: [{ verb: "defer", id: "anton-a" }],
     });
-    expect(
-      decide(SUPERSEDE, [cold("anton-a"), bead("anton-b", { status: "closed" })]),
-    ).toMatchObject({
+    expect(decide(SUPERSEDE, [cold("anton-a"), landed()])).toMatchObject({
       status: "apply",
       steps: [{ verb: "supersede", id: "anton-a", replacement: "anton-b" }],
     });
@@ -735,6 +754,35 @@ describe("planApply — what an approval means against the board as it now is", 
       expect(decide(REPARENT, [CARD, child("anton-a", "anton-container")]).status).toBe("apply");
     });
 
+    // An `implied-order` ask rests on ONE piece of evidence — a body phrase or a discovered-from
+    // edge — and nothing downstream re-derives it: the step carries only the pair, and the
+    // under-lock re-check asks whether the beads are writable, never whether the ordering is still
+    // stated. Removing the evidence is a newer decision than the proposal, so drawing the edge
+    // anyway would take the blocked bead back out of the ready set that edit put it in.
+    it("refuses a link whose implied ordering the board no longer states", () => {
+      expect(reason(decide(LINK, [bead("anton-a"), bead("anton-b")]))).toMatch(
+        /nothing on the board still places anton-a after anton-b/,
+      );
+    });
+
+    it("applies a link the board still implies, by provenance or by prose", () => {
+      expect(decide(LINK, [ordered(), bead("anton-b")]).status).toBe("apply");
+
+      // The other signal, read through the detector's own scanner: a body that still spells the
+      // ordering out in words.
+      const spelled = planFor({
+        kind: "implied-order",
+        move: "link",
+        subjects: ["anton-aaa"],
+        target: "anton-bbb",
+      });
+      const board = [
+        bead("anton-aaa", { description: "blocked on anton-bbb" }),
+        bead("anton-bbb"),
+      ];
+      expect(decide(spelled, board).status).toBe("apply");
+    });
+
     // A `stale` proposal's whole premise is silence — a claim about the moment the patrol looked,
     // which no fresh board read can restate. An edit, a re-prioritisation or a fresh pickup since
     // makes the bead no longer the untouched one the ask describes.
@@ -810,6 +858,20 @@ describe("planApply — what an approval means against the board as it now is", 
       );
       // …and fails closed on a subject nothing can date against the filing, like `stale` does.
       expect(reason(decide(CLOSE, [bead("anton-a")]))).toMatch(/no write stamp/);
+    });
+
+    // The twin match is symmetric, and the SURVIVOR's end is the one nothing else notices: it stays
+    // closed and non-abandoned however far its contents drift, so `survivorUnusable` still reads it
+    // as landed work. Superseding onto a twin that no longer holds the work would retire the only
+    // copy of it the board still has open.
+    it("holds a supersede to the twin its evidence describes, not just the subject", () => {
+      expect(
+        reason(decide(SUPERSEDE, [cold("anton-a"), warm("anton-b", { status: "closed" })])),
+      ).toMatch(/anton-b has been written to since this proposal was filed — it is no longer the landed twin/);
+      // …and fails closed on a survivor nothing can date against the filing, like the subject does.
+      expect(
+        reason(decide(SUPERSEDE, [cold("anton-a"), bead("anton-b", { status: "closed" })])),
+      ).toMatch(/anton-b carries no write stamp/);
     });
 
     // Silence, a twin match and a shipping commit all still stand over a bead nobody has written to.
@@ -1026,7 +1088,7 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     const link = proposalFor(LINK);
     liveBeads.set("anton-b", bead("anton-b", { status: "closed" }));
     await expect(
-      apply(link, [bead("anton-a"), bead("anton-b"), link]),
+      apply(link, [ordered(), bead("anton-b"), link]),
     ).rejects.toMatchObject({ failure: "refused" });
     expect(calls).toEqual([
       `note ${link.id} gardener: apply FAILED — cannot apply ${link.id}: anton-b is closed — the work anton-a was waiting on has landed, so the edge would only make anton-a read as blocked forever`,
@@ -1038,7 +1100,7 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     // The snapshot says the survivor landed; by the time the write runs it is open again.
     liveBeads.set("anton-b", bead("anton-b", { status: "open" }));
     await expect(
-      apply(supersede, [cold("anton-a"), bead("anton-b", { status: "closed" }), supersede]),
+      apply(supersede, [cold("anton-a"), landed(), supersede]),
     ).rejects.toMatchObject({ failure: "refused" });
     expect(calls).toEqual([
       `note ${supersede.id} gardener: apply FAILED — cannot apply ${supersede.id}: anton-b is open again — it has not landed, so anton-a is not superseded by it`,
@@ -1053,7 +1115,7 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     liveBeads.set("anton-b", bead("anton-b", { labels: [LABELS.abandoned], status: "closed" }));
 
     await expect(
-      apply(supersede, [cold("anton-a"), bead("anton-b", { status: "closed" }), supersede]),
+      apply(supersede, [cold("anton-a"), landed(), supersede]),
     ).rejects.toMatchObject({ failure: "refused" });
     expect(calls).toEqual([
       `note ${supersede.id} gardener: apply FAILED — cannot apply ${supersede.id}: anton-b is abandoned — a recorded won't-do delivered nothing, so anton-a is not superseded by it`,

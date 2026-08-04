@@ -72,42 +72,91 @@ export function detectImpliedOrdering(index: BoardIndex, nowMs: number): Gardene
 
 function bodyImplied(index: BoardIndex, nowMs: number): GardenerDetection[] {
   const detections: GardenerDetection[] = [];
+  const units = index.all.filter((bead) => isUnit(bead) && isOpenWork(bead));
 
-  for (const bead of index.all) {
-    if (!isUnit(bead) || !isOpenWork(bead)) continue;
+  for (const { writer, blocked, blocker, mention } of bodyOrderings(index, units)) {
+    if (!canOrder(index, blocked, blocker, nowMs)) continue;
+    detections.push(
+      makeDetection({
+        kind: "implied-order",
+        move: "link",
+        subjects: [blocked.id],
+        target: blocker.id,
+        // Named after the bead that WROTE the ordering, which is not always the blocked one:
+        // "this blocks anton-x" puts the writer first.
+        summary: `${writer.id}'s body places ${blocked.id} after ${blocker.id}, but no blocks edge records it`,
+        evidence: [
+          `${writer.id} body: "${mention.snippet}"`,
+          `"${mention.phrase}" places ${blocked.id} after ${blocker.id}`,
+          `no blocks edge exists between them, so ${blocked.id} reads as ready while ${blocker.id} is still open`,
+        ],
+      }),
+    );
+  }
+
+  return detections;
+}
+
+/** One ordering a bead's own prose states, before any bar on whether it is worth proposing. */
+interface BodyOrdering {
+  /** The bead whose body carries the phrase — either end of the pair, depending on the wording. */
+  writer: Bead;
+  blocked: Bead;
+  blocker: Bead;
+  mention: OrderingMention;
+}
+
+/**
+ * Every ordering the bodies of `candidates` state, as resolved pairs. Split out from
+ * {@link bodyImplied} so the EVIDENCE half is derivable on its own: apply re-asks it at approve time
+ * ({@link impliesOrdering}), and a second reading of the same prose would be a second answer.
+ */
+function* bodyOrderings(index: BoardIndex, candidates: Iterable<Bead>): Generator<BodyOrdering> {
+  for (const bead of candidates) {
     const body = bodyOf(bead);
     if (!body) continue;
-
     for (const { regex, mentionedIsBlocker } of DIRECTIONS) {
       for (const mention of scanOrdering(body, regex)) {
         for (const id of mention.ids) {
           const other = index.byId.get(id);
           if (!other) continue;
-          const blocked = mentionedIsBlocker ? bead : other;
-          const blocker = mentionedIsBlocker ? other : bead;
-          if (!canOrder(index, blocked, blocker, nowMs)) continue;
-          detections.push(
-            makeDetection({
-              kind: "implied-order",
-              move: "link",
-              subjects: [blocked.id],
-              target: blocker.id,
-              // Named after the bead that WROTE the ordering, which is not always the blocked one:
-              // "this blocks anton-x" puts the writer first.
-              summary: `${bead.id}'s body places ${blocked.id} after ${blocker.id}, but no blocks edge records it`,
-              evidence: [
-                `${bead.id} body: "${mention.snippet}"`,
-                `"${mention.phrase}" places ${blocked.id} after ${blocker.id}`,
-                `no blocks edge exists between them, so ${blocked.id} reads as ready while ${blocker.id} is still open`,
-              ],
-            }),
-          );
+          yield {
+            writer: bead,
+            blocked: mentionedIsBlocker ? bead : other,
+            blocker: mentionedIsBlocker ? other : bead,
+            mention,
+          };
         }
       }
     }
   }
+}
 
-  return detections;
+/**
+ * Does the board STILL state this ordering — the evidence an `implied-order` proposal rests on?
+ *
+ * A body phrase can be edited out and a `discovered-from` edge dropped, and either removal is a
+ * newer decision than the proposal: someone took the ordering away on purpose. Approving the ask
+ * anyway would draw a `blocks` edge whose only evidence no longer exists, and take the blocked bead
+ * back out of the ready set that edit put it in.
+ *
+ * The EVIDENCE alone, deliberately — not the whole detection. {@link canOrder}'s bars (open units,
+ * nothing mid-flight, no cycle) say whether the ask was worth FILING; apply holds those beads to its
+ * own bars, which are not the same ones, and re-running them here would refuse moves the approval
+ * path has always allowed. Only the two beads' own bodies are read, because the phrase always sits
+ * on one end of the pair (see {@link bodyOrderings}).
+ */
+export function impliesOrdering(index: BoardIndex, blockedId: string, blockerId: string): boolean {
+  if (index.discoveries.some((d) => d.discovered === blockedId && d.source === blockerId)) {
+    return true;
+  }
+  const pair = [index.byId.get(blockedId), index.byId.get(blockerId)].filter(
+    (b): b is Bead => b !== undefined,
+  );
+  for (const { blocked, blocker } of bodyOrderings(index, pair)) {
+    if (blocked.id === blockedId && blocker.id === blockerId) return true;
+  }
+  return false;
 }
 
 function discoveryImplied(index: BoardIndex, nowMs: number): GardenerDetection[] {

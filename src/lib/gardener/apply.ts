@@ -55,6 +55,7 @@ import {
   type GardenerDetectionKind,
   type GardenerPlan,
 } from "./detections";
+import { impliesOrdering } from "./relink";
 
 /** The `notes` prefix every gardener apply writes under — one line, like anton's other job notes. */
 const NOTE_PREFIX = "gardener";
@@ -311,6 +312,8 @@ function planLink(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): Apply
   }
   const claimed = claimedSinceFiling(blocked, at, "recording it as blocked", CLAIM_COST.subject);
   if (claimed) return { status: "refuse", reason: claimed };
+  const unstated = linkPremiseGone(plan, id, index);
+  if (unstated) return { status: "refuse", reason: unstated };
   // The blocker already waits on the blocked bead through other beads: no direct edge, so the pair
   // read as unrelated above, but this edge would close the loop — and bd rejects a blocking cycle at
   // every write path, so applying it would only 500 and leave the proposal open forever.
@@ -387,7 +390,7 @@ function planRetire(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): App
   // is the one thing a fresh board read cannot confirm: it shows the bead as it IS, never as it was
   // edited. Re-confirmed against the filing stamp so approving a months-old ask cannot settle a bead
   // that has since been written out from under its own evidence.
-  const touched = premiseTouched(plan, subject, at);
+  const touched = premiseTouched(subject, RETIRE_PREMISE[plan.kind], at);
   if (touched) return { status: "refuse", reason: touched };
   // Settling a bead that still has open work under it strands that work: the children stay in the
   // ready set with a parent no run will ever reach — the unreachable state `detectContainerOrphans`
@@ -430,6 +433,10 @@ function planRetire(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): App
       if (!survivor) return { status: "refuse", reason: missing(plan.target) };
       const survivorGone = survivorUnusable(survivor, id);
       if (survivorGone) return { status: "refuse", reason: survivorGone };
+      // The other end of the same premise: `survivorUnusable` asks only whether the survivor still
+      // reads as landed work, which a rewrite leaves untouched.
+      const survivorTouched = premiseTouched(survivor, RETIRE_PREMISE[plan.kind]?.twin, at);
+      if (survivorTouched) return { status: "refuse", reason: survivorTouched };
       return {
         status: "apply",
         steps: [{ verb: "supersede", ...on, replacement: plan.target }],
@@ -529,19 +536,49 @@ function reparentPremiseGone(
   return `${subject.id} now rides board card ${card} — it was given a home since this proposal was filed, so moving it under ${plan.target} would overwrite that newer decision`;
 }
 
-/** What a retirement's evidence says the subject still IS, and what settling it anyway gets wrong. */
+/**
+ * Why the board no longer states the ordering this link proposal read, or undefined. An
+ * `implied-order` ask rests on exactly one piece of evidence — a body phrase or a `discovered-from`
+ * edge — and unlike a status or a parent, nothing downstream re-derives it: the step carries only the
+ * pair, and the under-lock re-check asks whether the two beads are still writable, never whether the
+ * ordering is still stated anywhere.
+ *
+ * So a phrase edited out or an edge dropped since the filing would otherwise apply anyway, restoring
+ * an ordering a newer board edit explicitly removed and taking the blocked bead back out of the ready
+ * set that edit put it in. Re-derived from the fresh board through the detector's own reader (see
+ * `relink.ts` {@link impliesOrdering}), so approval cannot hold the premise to a laxer bar than the
+ * patrol held it to.
+ */
+function linkPremiseGone(
+  plan: GardenerPlan,
+  blockedId: string,
+  index: BoardIndex,
+): string | undefined {
+  if (plan.kind !== "implied-order" || !plan.target) return undefined;
+  if (impliesOrdering(index, blockedId, plan.target)) return undefined;
+  return `nothing on the board still places ${blockedId} after ${plan.target} — the body phrase or discovered-from edge this proposal read has been removed since it was filed, so recording the edge would restore an ordering a newer decision took away`;
+}
+
+/** What a retirement's evidence says a bead still IS, and what retiring against it anyway gets wrong. */
 interface RetirePremise {
   /** The bead the evidence describes — read as "still …". */
   still: string;
-  /** The harm of retiring a bead that is no longer it — read as "and …". */
+  /** The harm of retiring against a bead that is no longer it — read as "and …". */
   harm: string;
+  /**
+   * The same claim about the bead the plan POINTS AT, for evidence that is a MATCH BETWEEN TWO beads
+   * rather than a fact about the subject alone. Absent where the ask rests on the subject only —
+   * `stale` measures silence and `shipped-orphan` a commit, and neither names a live counterpart.
+   */
+  twin?: RetirePremise;
 }
 
 /**
  * What each detection claims about the subject AS THE PATROL FOUND IT — the one premise a plan cannot
  * restate, because it is a fact about a moment rather than about the board now. Every kind is listed
- * so adding one without deciding whether an edit falsifies it is a type error; the three re-parent and
- * link kinds have no such premise, because both re-derive their whole claim from the fresh board.
+ * so adding one without deciding whether an edit falsifies it is a type error; the re-parent and link
+ * kinds carry no entry because their whole claim IS re-derivable from the fresh board (see
+ * {@link reparentPremiseGone} and {@link linkPremiseGone}).
  *
  * All three retirements are fenced, not just `stale`: each measured something about the bead's
  * CONTENTS that an edit since the filing can invalidate — silence for `stale`, a match against a
@@ -561,6 +598,14 @@ const RETIRE_PREMISE: Record<GardenerDetectionKind, RetirePremise | undefined> =
   superseded: {
     still: "the bead whose contents matched the twin this supersede points at",
     harm: "retiring it against that twin now would settle work that may have moved past it",
+    // The match is symmetric, so an edit to EITHER end falsifies it — and the survivor's end is the
+    // dangerous one: it stays closed and non-abandoned however far its contents drift, so nothing
+    // else here notices, and superseding onto a twin that no longer holds the work would close the
+    // last live copy of it.
+    twin: {
+      still: "the landed twin whose contents this bead matched",
+      harm: "superseding onto it now could retire the only copy of that work still open",
+    },
   },
   "shipped-orphan": {
     still: "the bead the commit behind this ask shipped",
@@ -569,24 +614,26 @@ const RETIRE_PREMISE: Record<GardenerDetectionKind, RetirePremise | undefined> =
 };
 
 /**
- * Why this bead is no longer the one its retirement proposal describes, or undefined.
+ * Why this bead is no longer the one its retirement proposal describes, or undefined — asked of the
+ * SUBJECT under the kind's own premise, and of a supersede's survivor under that premise's
+ * {@link RetirePremise.twin}. `undefined` premise means the ask makes no filing-time claim about
+ * this bead, so nothing here can go stale.
  *
  * Confirmed against the moment the patrol looked rather than by re-deriving the detection, because
  * "has anyone touched it since we asked" is the question the approver's evidence actually rests on —
  * and it is the only half of that evidence a board read can answer at all.
  */
 function premiseTouched(
-  plan: GardenerPlan,
-  subject: Bead,
+  bead: Bead,
+  premise: RetirePremise | undefined,
   at: ApplyMoment,
 ): string | undefined {
-  const premise = RETIRE_PREMISE[plan.kind];
   if (!premise) return undefined;
-  const since = writtenSinceFiling(subject, at);
+  const since = writtenSinceFiling(bead, at);
   if (since === false) return undefined;
   return since === undefined
-    ? `${subject.id} carries no write stamp this proposal's filing can be ordered against, so nothing confirms it is still ${premise.still}`
-    : `${subject.id} has been written to since this proposal was filed — it is no longer ${premise.still}, and ${premise.harm}`;
+    ? `${bead.id} carries no write stamp this proposal's filing can be ordered against, so nothing confirms it is still ${premise.still}`
+    : `${bead.id} has been written to since this proposal was filed — it is no longer ${premise.still}, and ${premise.harm}`;
 }
 
 /** Why a proposal could not be applied — mapped to a status by the route, never swallowed. */
