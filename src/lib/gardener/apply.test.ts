@@ -1122,6 +1122,45 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     ]);
   });
 
+  // Every retirement rests on a claim about the subject's CONTENTS, and an edit that rescopes the
+  // work leaves status, liveness, claim and topology exactly as the plan found them — so nothing
+  // else under the lock notices. The filing-time check ran against the route's snapshot, which is
+  // already stale when the first write spawns; the step carries the fence forward so the locked
+  // re-read asks it again.
+  it("refuses a retirement whose subject was rewritten after the snapshot", async () => {
+    for (const [plan, still] of [
+      [DEFER, "the untouched bead the ask describes"],
+      [CLOSE, "the bead the commit behind this ask shipped"],
+    ] as const) {
+      calls.length = 0;
+      liveBeads.clear();
+      const proposal = proposalFor(plan);
+      liveBeads.set("anton-a", warm("anton-a"));
+
+      await expect(apply(proposal, [cold("anton-a"), proposal])).rejects.toMatchObject({
+        failure: "refused",
+      });
+      expect(calls).toEqual([
+        `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-a has been written to since this proposal was filed — it is no longer ${still}, and ${plan === DEFER ? "deferring it now would park work somebody has since picked back up" : "closing it as shipped now would record a landing for work that may have been rescoped since"}`,
+      ]);
+    }
+  });
+
+  // The survivor's end of the same premise. It stays `closed` and non-abandoned however far its
+  // contents drift, so `survivorUnusable` waves it through — and superseding onto a twin that no
+  // longer holds the work would close the last live copy of it.
+  it("refuses a supersede whose survivor was rewritten after the snapshot", async () => {
+    const proposal = proposalFor(SUPERSEDE);
+    liveBeads.set("anton-b", warm("anton-b", { status: "closed" }));
+
+    await expect(
+      apply(proposal, [cold("anton-a"), landed(), proposal]),
+    ).rejects.toMatchObject({ failure: "refused" });
+    expect(calls).toEqual([
+      `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-b has been written to since this proposal was filed — it is no longer the landed twin whose contents this bead matched, and superseding onto it now could retire the only copy of that work still open`,
+    ]);
+  });
+
   // A re-parent is the one verb whose subject can move without changing status, so the status checks
   // above see nothing: another approval or an operator re-homing it is a NEWER decision than this
   // plan, and applying over it would silently undo their move.
@@ -1185,6 +1224,33 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
       "reparent anton-a anton-card",
     ]);
     expect(calls.some((c) => c.startsWith(`close ${proposal.id}`))).toBe(false);
+  });
+
+  // A cluster member somebody else has already moved to the target is accepted as idempotent — the
+  // same move, so refusing would fail the whole cluster over an agreement. But it is not OUR write,
+  // and a later member failing must not restore `undoParent` over the other writer's move.
+  it("never rolls back a member the board already satisfied — that write was not ours", async () => {
+    const proposal = proposalFor(CLUSTER);
+    const board = [CARD, child("anton-a", "anton-old"), bead("anton-b"), proposal];
+    // Another approval lands anton-a's move between the snapshot and this apply's per-step lock.
+    liveBeads.set("anton-a", child("anton-a", CARD.id));
+    failOn.set("reparent:anton-b", 1);
+
+    await expect(apply(proposal, board)).rejects.toThrow(/nothing had been written/);
+
+    // Neither a redundant re-write nor — the bug — an undo back to anton-old.
+    expect(calls.filter((c) => c.startsWith("reparent anton-a"))).toEqual([]);
+    expect(calls.some((c) => c.startsWith(`close ${proposal.id}`))).toBe(false);
+  });
+
+  it("reports only the members it actually wrote to", async () => {
+    const proposal = proposalFor(CLUSTER);
+    liveBeads.set("anton-a", child("anton-a", CARD.id));
+
+    const result = await apply(proposal, [CARD, bead("anton-a"), bead("anton-b"), proposal]);
+
+    expect(result.changed).toEqual(["anton-b"]);
+    expect(calls.filter((c) => c.startsWith("reparent"))).toEqual(["reparent anton-b anton-card"]);
   });
 
   it("refuses a subject a run claimed AFTER the snapshot, without writing to it", async () => {
@@ -1300,10 +1366,13 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
   // The stale-in-progress detector proposes against beads that are ALREADY claimed — a claim that
   // outlived its run is the whole finding. Refusing on the claim the plan itself was decided against
   // would make that proposal permanently unapprovable.
+  // Both live reads stay `cold`: the locked re-read re-asks the retirement's PREMISE too, and a
+  // subject with no write stamp — or one dated since the filing — refuses on that instead, which
+  // would prove nothing about the claim baseline this case is here for.
   it("applies to a bead whose claim the plan already saw, and to one released since", async () => {
     for (const live of [
-      bead("anton-a", { assignee: "runner-7", status: "in_progress" }),
-      bead("anton-a", { status: "open" }),
+      cold("anton-a", { assignee: "runner-7", status: "in_progress" }),
+      cold("anton-a", { status: "open" }),
     ]) {
       calls.length = 0;
       liveBeads.clear();

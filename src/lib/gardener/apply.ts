@@ -100,9 +100,32 @@ export type ApplyStep =
       parentClaim: string;
     })
   | (StepSubject & { verb: "link"; blocker: string })
-  | (StepSubject & TicketOwner & { verb: "close"; reason: string })
-  | (StepSubject & TicketOwner & { verb: "supersede"; replacement: string })
-  | (StepSubject & TicketOwner & { verb: "defer" });
+  | (StepSubject & TicketOwner & RetireEvidence & { verb: "close"; reason: string })
+  | (StepSubject & TicketOwner & RetireEvidence & { verb: "supersede"; replacement: string })
+  | (StepSubject & TicketOwner & RetireEvidence & { verb: "defer" });
+
+/**
+ * What a RETIREMENT's evidence rests on, carried forward so the locked re-read can re-ask it — the
+ * {@link StepSubject.claim} treatment for the one precondition no board read re-derives.
+ *
+ * Every other bar a retirement holds its subject to is a fact about the board's CURRENT shape:
+ * status, liveness, claim, ticket set, open descendants. The premise is not — it is "nobody has
+ * rewritten this bead since the patrol read it" ({@link premiseTouched}), and `planRetire` asks it
+ * of the route's snapshot, which is already seconds old when the first bd write spawns. An edit
+ * landing in that window rescopes the work while leaving every other bar untouched, so without this
+ * the close/defer/supersede goes ahead on evidence the edit falsified.
+ *
+ * The kind (not the resolved premise) so the write re-derives through the same `RETIRE_PREMISE` the
+ * decision used, and the observation stamp verbatim so both readings date against the same fence.
+ * Unlike the topology re-checks, this one is a NARROWING rather than a serialization: an operator's
+ * `bd update` takes no in-process lock, so the window it closes is snapshot→lock, not lock→write.
+ */
+interface RetireEvidence {
+  /** The detection kind whose premise this rests on — {@link RETIRE_PREMISE}'s key. */
+  kind: GardenerDetectionKind;
+  /** The moment the patrol observed the board — {@link ApplyMoment.observedAtMs}, carried as-is. */
+  observedAtMs: number | undefined;
+}
 
 /**
  * The run target whose TICKET SET a retirement's subject rides, or absent when the subject is its
@@ -391,7 +414,7 @@ function planRetire(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): App
   // is the one thing a fresh board read cannot confirm: it shows the bead as it IS, never as it was
   // edited. Re-confirmed against the filing stamp so approving a months-old ask cannot settle a bead
   // that has since been written out from under its own evidence.
-  const touched = premiseTouched(subject, RETIRE_PREMISE[plan.kind], at);
+  const touched = premiseTouched(subject, RETIRE_PREMISE[plan.kind], at.observedAtMs);
   if (touched) return { status: "refuse", reason: touched };
   // Settling a bead that still has open work under it strands that work: the children stay in the
   // ready set with a parent no run will ever reach — the unreachable state `detectContainerOrphans`
@@ -408,11 +431,14 @@ function planRetire(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): App
   }
 
   // Whatever the verb, the write rests on the same two beads: the subject, and the run target whose
-  // ticket set it rides (absent when it rides none). Both are re-read under their own locks.
+  // ticket set it rides (absent when it rides none). Both are re-read under their own locks, and so
+  // is the premise the checks above just cleared (see {@link RetireEvidence}).
   const on = {
     id,
     claim: runClaimOf(subject),
     owner: owner ? { id: owner.id, claim: runClaimOf(owner) } : undefined,
+    kind: plan.kind,
+    observedAtMs: at.observedAtMs,
   };
 
   switch (plan.retireAs) {
@@ -436,7 +462,11 @@ function planRetire(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): App
       if (survivorGone) return { status: "refuse", reason: survivorGone };
       // The other end of the same premise: `survivorUnusable` asks only whether the survivor still
       // reads as landed work, which a rewrite leaves untouched.
-      const survivorTouched = premiseTouched(survivor, RETIRE_PREMISE[plan.kind]?.twin, at);
+      const survivorTouched = premiseTouched(
+        survivor,
+        RETIRE_PREMISE[plan.kind]?.twin,
+        at.observedAtMs,
+      );
       if (survivorTouched) return { status: "refuse", reason: survivorTouched };
       return {
         status: "apply",
@@ -462,11 +492,11 @@ function planRetire(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): App
  * and the under-lock re-check then compares it against itself. {@link observedAtOf} floors the fence
  * to the same one-second grid so that tie is reachable at all.
  */
-function writtenSinceFiling(subject: Bead, at: ApplyMoment): boolean | undefined {
+function writtenSinceFiling(subject: Bead, observedAtMs: number | undefined): boolean | undefined {
   const writtenAt = stampMsOf(subject);
-  if (at.observedAtMs === undefined || writtenAt === undefined) return undefined;
-  if (writtenAt === at.observedAtMs) return undefined;
-  return writtenAt > at.observedAtMs;
+  if (observedAtMs === undefined || writtenAt === undefined) return undefined;
+  if (writtenAt === observedAtMs) return undefined;
+  return writtenAt > observedAtMs;
 }
 
 /**
@@ -505,7 +535,7 @@ function claimedSinceFiling(
 ): string | undefined {
   const claim = runClaimOf(subject);
   if (!claim) return undefined;
-  const since = writtenSinceFiling(subject, at);
+  const since = writtenSinceFiling(subject, at.observedAtMs);
   if (since === false) return undefined; // the claim the plan was made against, not a newer one
   const dated =
     since === undefined
@@ -623,14 +653,18 @@ const RETIRE_PREMISE: Record<GardenerDetectionKind, RetirePremise | undefined> =
  * Confirmed against the moment the patrol looked rather than by re-deriving the detection, because
  * "has anyone touched it since we asked" is the question the approver's evidence actually rests on —
  * and it is the only half of that evidence a board read can answer at all.
+ *
+ * Asked TWICE per retirement: once by `planRetire` against the route's snapshot, and again against
+ * the re-read taken under the bead's own write lock (see {@link RetireEvidence}), because an edit
+ * landing between those two moments leaves every other bar the write holds untouched.
  */
 function premiseTouched(
   bead: Bead,
   premise: RetirePremise | undefined,
-  at: ApplyMoment,
+  observedAtMs: number | undefined,
 ): string | undefined {
   if (!premise) return undefined;
-  const since = writtenSinceFiling(bead, at);
+  const since = writtenSinceFiling(bead, observedAtMs);
   if (since === false) return undefined;
   return since === undefined
     ? `${bead.id} carries no write stamp this proposal's filing can be ordered against, so nothing confirms it is still ${premise.still}`
@@ -782,11 +816,13 @@ async function applyApproved(
     });
   }
 
+  // Only steps that actually WROTE — a step the board already satisfied is not ours to roll back
+  // (see {@link alreadySatisfied}), and `changed` is both the rollback prefix and what the proposal
+  // reports as touched.
   const changed: ApplyStep[] = [];
   try {
     for (const step of decision.steps) {
-      await applyStep(repo, step);
-      changed.push(step);
+      if (await applyStep(repo, step)) changed.push(step);
     }
   } catch (e) {
     const rollback = await rollbackSteps(repo, changed);
@@ -924,6 +960,21 @@ function counterpartOf(step: ApplyStep): string | undefined {
 }
 
 /**
+ * The filing-time premise a RETIREMENT rests on, or absent for the verbs that make no claim about a
+ * bead's contents. See {@link RetireEvidence} for why the step has to carry it at all.
+ */
+function evidenceOf(step: ApplyStep): RetireEvidence | undefined {
+  switch (step.verb) {
+    case "close":
+    case "supersede":
+    case "defer":
+      return { kind: step.kind, observedAtMs: step.observedAtMs };
+    default:
+      return undefined;
+  }
+}
+
+/**
  * The run target whose ticket set a RETIREMENT would take its subject out of, when it rides one. Not
  * written to and not pointed at — but the run that owns it is the one this write can abort, and the
  * only place that run is visible (see {@link TicketOwner}), so it is locked and re-judged too.
@@ -971,15 +1022,19 @@ function ownerOf(step: ApplyStep): TicketOwner["owner"] {
  * The rest of the board-wide topology stays with the snapshot — whether the edge closes a cycle —
  * because it rests on beads no lock taken here covers, so re-deriving it would buy a whole board
  * read and still guarantee nothing.
+ *
+ * Answers whether this step LANDED a write, which is not the same as whether it succeeded: see
+ * {@link alreadySatisfied}.
  */
-async function applyStep(repo: string, step: ApplyStep): Promise<void> {
+async function applyStep(repo: string, step: ApplyStep): Promise<boolean> {
   const counterpart = counterpartOf(step);
   const owner = ownerOf(step);
   const locked = [step.id, counterpart, owner?.id].filter((id): id is string => id !== undefined);
-  await withBeadWriteLocks(repo, locked, async () => {
+  return withBeadWriteLocks(repo, locked, async () => {
     const subject = await reread(repo, step.id);
     const moved = subjectMoved(step, subject, Date.now());
     if (moved) throw new SubjectMovedError(moved);
+    if (subject && alreadySatisfied(step, subject)) return false;
     if (counterpart) {
       const other = await reread(repo, counterpart);
       const otherMoved = counterpartMoved(step, counterpart, other, Date.now());
@@ -1000,7 +1055,24 @@ async function applyStep(repo: string, step: ApplyStep): Promise<void> {
       assertHomeIsCard(step.parent, await lockedBoard(repo, doing));
     }
     await runStep(repo, step);
+    return true;
   });
+}
+
+/**
+ * Is this step's move already ON the board, put there by somebody else? Then this apply has nothing
+ * to write, and — the reason it matters — nothing to UNDO either.
+ *
+ * A re-parent is the only verb that can reach here already satisfied: {@link subjectMoved}
+ * deliberately accepts a subject sitting at `step.parent`, because another approval or an operator
+ * landing the same move is the same move, and refusing would fail a cluster over a move that agrees
+ * with it. But treating that no-op as a write this apply made puts it in the rollback prefix, so a
+ * LATER member of the same cluster failing would restore `undoParent` over the other writer's
+ * successful move — undoing a write we never made. Every other verb's idempotent state is caught
+ * earlier, by `planApply`'s `settled` branch, and never becomes a step at all.
+ */
+function alreadySatisfied(step: ApplyStep, subject: Bead): boolean {
+  return step.verb === "reparent" && (beads.parentOf(subject) ?? "") === step.parent;
 }
 
 /**
@@ -1132,6 +1204,15 @@ function subjectMoved(step: ApplyStep, subject: Bead | undefined, nowMs: number)
   if (claim && claim !== step.claim) {
     return `${step.id} was claimed by ${claim} since this proposal was decided — ${DOING[step.verb]} would pull the bead out from under the run that now owns it`;
   }
+  // A retirement rests on a claim about the subject's CONTENTS that every check above is blind to —
+  // a rescoping edit leaves status, liveness and claim exactly as the plan found them. `planRetire`
+  // asked it of the route's snapshot; re-asked here against the read taken under this bead's own
+  // lock, so an edit landing in that window refuses instead of being settled as delivered.
+  const evidence = evidenceOf(step);
+  if (evidence) {
+    const touched = premiseTouched(subject, RETIRE_PREMISE[evidence.kind], evidence.observedAtMs);
+    if (touched) return touched;
+  }
   // A re-parent is the one verb whose subject can move WITHOUT changing status: another approval or
   // an operator re-homing it since the plan was made is a newer decision than this one, and writing
   // over it would silently undo their move — then, on a cluster rollback, restore a parent two moves
@@ -1163,7 +1244,14 @@ function counterpartMoved(
     case "link":
       return blockerUnusable(counterpart, step.id);
     case "supersede":
-      return survivorUnusable(counterpart, step.id);
+      // The survivor's end of the same premise, re-asked under its own lock for the reason the
+      // subject's is: `survivorUnusable` only asks whether it still reads as landed work, which a
+      // rewrite leaves untouched — and superseding onto a twin that no longer holds the work would
+      // close the last live copy of it.
+      return (
+        survivorUnusable(counterpart, step.id) ??
+        premiseTouched(counterpart, RETIRE_PREMISE[step.kind]?.twin, step.observedAtMs)
+      );
     default:
       return undefined;
   }
