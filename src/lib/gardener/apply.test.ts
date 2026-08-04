@@ -583,6 +583,37 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     expect(calls.at(-1)).toContain(`close ${proposal.id}`);
   });
 
+  // A settled decision runs no step, so nothing else re-reads the beads it rests on — its whole
+  // claim is the caller's snapshot. Closing on a snapshot the board has since contradicted would
+  // settle the proposal as applied over a state that is no longer there.
+  it("refuses to settle when the move was undone after the snapshot", async () => {
+    const proposal = proposalFor(REPARENT);
+    liveBeads.set("anton-a", bead("anton-a")); // moved back out from under the card since
+
+    await expect(
+      apply(proposal, [CARD, child("anton-a", CARD.id), proposal]),
+    ).rejects.toMatchObject({
+      failure: "refused",
+      message: expect.stringContaining("no longer reads as applied"),
+    });
+    expect(calls.filter((c) => !c.startsWith("note"))).toEqual([]);
+  });
+
+  it("refuses to settle when the live board now refuses the move outright", async () => {
+    // The subject still sits where the proposal wanted it, but the home has closed since — the same
+    // answer a fresh snapshot would give, rather than a close resting on the stale one.
+    const proposal = proposalFor(REPARENT);
+    liveBeads.set(CARD.id, { ...CARD, status: "closed" });
+
+    await expect(
+      apply(proposal, [CARD, child("anton-a", CARD.id), proposal]),
+    ).rejects.toMatchObject({
+      failure: "refused",
+      message: expect.stringContaining("no longer reads as applied"),
+    });
+    expect(calls.filter((c) => !c.startsWith("note"))).toEqual([]);
+  });
+
   // The snapshot is stale the instant it is taken, and a runner publishing a lease in that window is
   // exactly what the in-flight bar exists for — so the last word belongs to a read taken under the
   // subject's own write lock, the one a run's claim also queues on.
@@ -596,6 +627,20 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     await expect(apply(proposal, [CARD, bead("anton-a"), proposal])).rejects.toMatchObject({
       failure: "unusable",
       message: expect.stringContaining("already settled"),
+    });
+    expect(calls).toEqual([]);
+  });
+
+  // The proposal is what RECORDS the decision, and settling it happens outside the rollback. One we
+  // cannot read is one we probably cannot close either, so moving subjects first would leave board
+  // writes with nothing saying who authorized them.
+  it("refuses when the proposal itself cannot be re-read under its lock", async () => {
+    const proposal = proposalFor(REPARENT);
+    liveBeads.set(proposal.id, undefined); // deleted since the route took its snapshot
+
+    await expect(apply(proposal, [CARD, bead("anton-a"), proposal])).rejects.toMatchObject({
+      failure: "refused",
+      message: expect.stringContaining("could not be re-read"),
     });
     expect(calls).toEqual([]);
   });

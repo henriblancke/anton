@@ -51,6 +51,7 @@ vi.mock("../beads/bd", async () => {
 const {
   MAX_PROPOSALS_PER_PASS,
   PROPOSAL_LABELS,
+  PartialEmissionError,
   emitProposals,
   planEmission,
   proposalDraft,
@@ -316,6 +317,22 @@ describe("a patrol pass", () => {
     );
 
     expect(detect(aged, stale).flatMap((d) => d.subjects)).not.toContain(createdBeads[0].id);
+  });
+
+  // The proposals a failed pass already filed are real board state, but only in the LOCAL working
+  // set. Losing them with the error would leave the caller with nothing to propagate — and if the
+  // failing create keeps failing, the job parks and no other machine ever sees them.
+  it("hands back the proposals that DID land when a later create fails", async () => {
+    const detections = [reparent(), reparent({ subjects: ["anton-other"] })];
+    createMock.mockImplementationOnce(async () => "anton-p1").mockImplementationOnce(async () => {
+      throw new Error("bd create exploded");
+    });
+
+    const error = await emitProposals(REPO, { board: MISPARENTED, detections }).catch((e) => e);
+
+    expect(error).toBeInstanceOf(PartialEmissionError);
+    expect(error.result.created.map((p: { id: string }) => p.id)).toEqual(["anton-p1"]);
+    expect(error.message).toContain("bd create exploded");
   });
 
   it("writes nothing on a quiet board", async () => {

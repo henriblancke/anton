@@ -38,7 +38,12 @@
 import { beads, type DuplicateGroup } from "../beads/bd";
 import { nudgeSync, type NudgeTarget } from "../beads/sync-nudge";
 import { detectBoard } from "../gardener/detect";
-import { emitProposals, MAX_PROPOSALS_PER_PASS } from "../gardener/emit";
+import {
+  emitProposals,
+  MAX_PROPOSALS_PER_PASS,
+  PartialEmissionError,
+  type EmissionResult,
+} from "../gardener/emit";
 import {
   completeHygieneReport,
   startHygieneReport,
@@ -268,23 +273,38 @@ export function makeGardenerHandler(deps: GardenerDeps): JobHandler {
     const board = await beads.list(repo, ["--status", "all"]);
     const detections = detectBoard({ board, hygiene: { findings }, now: clock.now() });
     await ctx.heartbeat();
-    const emission = await emitProposals(repo, { board, detections });
+    // Re-check RIGHT before the first write. The board read and detection above take real time, and
+    // a cancel arriving inside them is invisible to `ctx.heartbeat()` — which does not inspect the
+    // signal — so without this a cancelled patrol would still file judgment-tier proposal beads.
+    ctx.signal.throwIfAborted();
 
-    if (emission.created.length > 0) {
-      console.log(
-        `[gardener] ${projectId}: filed ${emission.created.length} proposal(s) ` +
-          `(${emission.created.map((p) => p.id).join(", ")})` +
-          `${emission.suppressed > 0 ? `, ${emission.suppressed} already on the board` : ""}`,
-      );
-      nudge({ id: project.id, repoPath: repo });
-    }
-    // Never a silent cap: the overflow is deterministic and the next pass files it, but a reader has
-    // to be able to tell "the board is this clean" from "we stopped at ten".
-    if (emission.deferred > 0) {
-      console.log(
-        `[gardener] ${projectId}: held back ${emission.deferred} proposal(s) — one pass files at ` +
-          `most ${MAX_PROPOSALS_PER_PASS}; the next patrol picks them up`,
-      );
+    // Whatever landed before a create failed is real board state living only in the local working
+    // set. Report and propagate it on the way out, or a pass that parks on the failing proposal
+    // leaves the ones that DID file invisible to every other machine.
+    const report = (emission: EmissionResult) => {
+      if (emission.created.length > 0) {
+        console.log(
+          `[gardener] ${projectId}: filed ${emission.created.length} proposal(s) ` +
+            `(${emission.created.map((p) => p.id).join(", ")})` +
+            `${emission.suppressed > 0 ? `, ${emission.suppressed} already on the board` : ""}`,
+        );
+        nudge({ id: project.id, repoPath: repo });
+      }
+      // Never a silent cap: the overflow is deterministic and the next pass files it, but a reader
+      // has to be able to tell "the board is this clean" from "we stopped at ten".
+      if (emission.deferred > 0) {
+        console.log(
+          `[gardener] ${projectId}: held back ${emission.deferred} proposal(s) — one pass files at ` +
+            `most ${MAX_PROPOSALS_PER_PASS}; the next patrol picks them up`,
+        );
+      }
+    };
+
+    try {
+      report(await emitProposals(repo, { board, detections }));
+    } catch (e) {
+      if (e instanceof PartialEmissionError) report(e.result);
+      throw e;
     }
   };
 }

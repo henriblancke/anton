@@ -159,20 +159,53 @@ export interface EmissionResult {
 }
 
 /**
+ * A create that failed part-way, carrying what DID land. The proposals already filed are real board
+ * state that exists only in the local Dolt working set, so the failure has to hand them back rather
+ * than swallow them: if the failing create keeps failing the job parks, and a caller that never
+ * learned about the earlier ones never propagates them to the other machines (see jobs/gardener.ts).
+ */
+export class PartialEmissionError extends Error {
+  constructor(
+    readonly result: EmissionResult,
+    cause: unknown,
+  ) {
+    super(
+      `filing gardener proposals failed after ${result.created.length} of the pass's creates landed: ` +
+        (cause instanceof Error ? cause.message : String(cause)),
+      { cause },
+    );
+    this.name = "PartialEmissionError";
+  }
+}
+
+/**
  * File this pass's proposals. Sequential on purpose: each create is a bd write against the same Dolt
  * working set, and a failure part-way leaves the proposals already filed standing — they carry their
  * fingerprints, so the retry that re-reads the board files only what is still missing.
+ *
+ * Standing locally is not the same as being SEEN, though, so a failure throws
+ * {@link PartialEmissionError} with the landed proposals attached instead of losing them.
  */
 export async function emitProposals(repo: string, input: EmissionInput): Promise<EmissionResult> {
   const plan = planEmission(input);
   const created: EmittedProposal[] = [];
+  const sofar = (): EmissionResult => ({
+    created,
+    suppressed: plan.suppressed.length,
+    deferred: plan.deferred.length,
+  });
 
   for (const detection of plan.emit) {
-    const id = await beads.create(repo, proposalDraft(detection));
+    let id: string;
+    try {
+      id = await beads.create(repo, proposalDraft(detection));
+    } catch (e) {
+      throw new PartialEmissionError(sofar(), e);
+    }
     created.push({ id, fingerprint: detection.fingerprint, detection });
   }
 
-  return { created, suppressed: plan.suppressed.length, deferred: plan.deferred.length };
+  return sofar();
 }
 
 // ── the proposal's prose (pure) ──

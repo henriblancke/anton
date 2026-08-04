@@ -347,6 +347,52 @@ describe("gardener patrol", () => {
     expect(nudge).not.toHaveBeenCalled();
   });
 
+  it("pushes the proposals that landed when a later create fails", async () => {
+    // A create that fails part-way leaves the earlier proposals in the local working set only. If
+    // the failing one keeps failing the pass parks, so the nudge has to happen on the way out.
+    orphansMock.mockResolvedValue([
+      { id: "t-4", title: "shipped", status: "open", latestCommit: "abc1234" },
+      { id: "t-5", title: "also shipped", status: "open", latestCommit: "def5678" },
+    ]);
+    listMock.mockResolvedValue([
+      bead("t-4", { title: "shipped" }),
+      bead("t-5", { title: "also shipped" }),
+    ]);
+    createMock.mockImplementationOnce(async () => "p-1").mockImplementationOnce(async () => {
+      throw new Error("bd create exploded");
+    });
+
+    const jobId = await runPatrol();
+    const job = await expectJobStatus(t.db, jobId, "queued"); // retried, not settled
+    expect(job.lastError).toContain("bd create exploded");
+    expect(nudge).toHaveBeenCalledWith({ id: projectId, repoPath: REPO });
+  });
+
+  it("files nothing for a patrol cancelled while it read the board", async () => {
+    // `ctx.heartbeat()` does not inspect the signal, so a cancel arriving during the judgment
+    // tier's board read is invisible until the check that guards the first write.
+    orphansMock.mockResolvedValue([
+      { id: "t-4", title: "shipped", status: "open", latestCommit: "abc1234" },
+    ]);
+    const runner = makeJobRunner({
+      db: t.db,
+      clock,
+      type: "gardener",
+      handler: ({ db, clock: c }) => makeGardenerHandler({ db, clock: c, nudge }),
+    });
+    const jobId = await runner.enqueue({ type: "gardener", projectId, payload: { projectId } });
+    listMock.mockImplementation(async () => {
+      await runner.cancel(jobId);
+      return [bead("t-4", { title: "shipped" })];
+    });
+
+    expect(await runner.tickOnce()).toBe(1);
+    await runner.whenIdle();
+
+    await expectJobStatus(t.db, jobId, "cancelled");
+    expect(createMock).not.toHaveBeenCalled();
+  });
+
   it("parks without retrying when the project is gone", async () => {
     await t.db.delete(schema.projects);
 

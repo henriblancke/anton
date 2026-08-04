@@ -14,7 +14,9 @@
  *     That includes the bar every detector proposes under — work a run owns is off limits — since
  *     the run that now holds the bead usually started AFTER the proposal was filed. Stale plans
  *     refuse loudly; a board that already reads as applied SETTLES the proposal instead of writing
- *     again, so a retry after a half-finished approve converges rather than double-moves. And
+ *     again — re-confirmed under the affected beads' own locks, because that path runs no step and
+ *     so has nothing else to re-read them — and a retry after a half-finished approve therefore
+ *     converges rather than double-moves. And
  *     because a snapshot is stale the instant it is taken, every bead a write rests on — the subject
  *     AND the home/blocker/survivor it points at — is re-read and re-judged under its own write lock
  *     immediately before the write, on the same lock a run's claim takes (see `applyStep`), so a
@@ -417,10 +419,25 @@ async function applyApproved(
 ): Promise<ApplyResult> {
   // The settled check above judged the CALLER's snapshot — taken before whoever held this lock ran —
   // so re-read the proposal under it: two Approve clicks both pass that check, and the loser must
-  // refuse rather than re-run a move that already landed. A read that FAILED says nothing either
-  // way, so fall through and let the per-step guards, which re-read every bead they touch, decide.
-  const live = await beads.show(repo, proposal.id).catch(() => undefined);
-  if (live && (live.status === "closed" || beads.isAbandoned(live))) {
+  // refuse rather than re-run a move that already landed.
+  //
+  // A read that FAILS is not permission to proceed. The proposal is what RECORDS the decision, and
+  // every path out of here ends in a note + close on it — which runs OUTSIDE the rollback block. A
+  // proposal we cannot read is one we probably cannot settle either (a deleted bead, an unreachable
+  // bd), so falling through would move subjects and then fail to record any of it, leaving board
+  // mutations with no settled proposal explaining them. Nothing has been written yet, so refusing
+  // here costs nothing and a retry re-decides against a board it can actually see.
+  let live: Bead;
+  try {
+    live = await beads.show(repo, proposal.id);
+  } catch (e) {
+    throw new ProposalApplyError(
+      "refused",
+      `cannot apply ${proposal.id}: it could not be re-read under its own write lock ` +
+        `(${messageOf(e)}) — nothing was written`,
+    );
+  }
+  if (live.status === "closed" || beads.isAbandoned(live)) {
     throw new ProposalApplyError(
       "unusable",
       `${proposal.id} is already settled — a proposal is applied or declined once`,
@@ -436,41 +453,100 @@ async function applyApproved(
     );
   }
 
-  const changed: ApplyStep[] = [];
-  if (decision.status === "apply") {
-    try {
-      for (const step of decision.steps) {
-        await applyStep(repo, step);
-        changed.push(step);
+  // A SETTLED decision writes nothing, so — unlike an applied one — NO step ever locks or re-reads
+  // the beads it rests on: the whole claim is the caller's snapshot, and a snapshot is stale the
+  // instant it is taken. Re-confirm it under those beads' own write locks, and settle the proposal
+  // inside them, so a subject moved away or an edge dropped after the route's refresh cannot leave
+  // this proposal closed as applied over a board that no longer holds the state its summary names.
+  if (decision.status === "settled") {
+    return withBeadWriteLocks(repo, affectedBeads(plan), async () => {
+      const drifted = await settledDrifted(repo, plan);
+      if (drifted) {
+        throw await attachFailure(
+          repo,
+          proposal.id,
+          new ProposalApplyError("refused", `cannot apply ${proposal.id}: ${drifted}`),
+        );
       }
-    } catch (e) {
-      const rollback = await rollbackSteps(repo, changed);
-      // A subject that moved under us is the board refusing, not a bd write breaking — but only
-      // while nothing has landed yet. Once a prefix is written the outcome is a partial apply that
-      // was rolled back, which is `failed` whatever tripped it.
-      const stale = e instanceof SubjectMovedError && changed.length === 0;
-      throw await attachFailure(
-        repo,
-        proposal.id,
-        new ProposalApplyError(
-          stale ? "refused" : "failed",
-          stale
-            ? `cannot apply ${proposal.id}: ${messageOf(e)}`
-            : `applying ${proposal.id} failed: ${messageOf(e)}${rollback}`,
-        ),
-      );
-    }
+      return settleProposal(repo, proposal.id, plan, decision.summary, []);
+    });
   }
 
-  // The move landed (or was already true). Record what changed on the proposal itself and settle it
-  // — a plain close, not an abandon: the ask was answered, and only a DECLINE suppresses the
-  // fingerprint (see the module header). Still under the lock this whole application holds, so no
-  // second approve can be part-way through the same steps while this one declares them done.
-  const summary = decision.summary;
-  await beads.note(repo, proposal.id, `${NOTE_PREFIX}: applied — ${summary}.`);
-  await beads.close(repo, proposal.id, `applied: ${summary}`);
+  const changed: ApplyStep[] = [];
+  try {
+    for (const step of decision.steps) {
+      await applyStep(repo, step);
+      changed.push(step);
+    }
+  } catch (e) {
+    const rollback = await rollbackSteps(repo, changed);
+    // A subject that moved under us is the board refusing, not a bd write breaking — but only
+    // while nothing has landed yet. Once a prefix is written the outcome is a partial apply that
+    // was rolled back, which is `failed` whatever tripped it.
+    const stale = e instanceof SubjectMovedError && changed.length === 0;
+    throw await attachFailure(
+      repo,
+      proposal.id,
+      new ProposalApplyError(
+        stale ? "refused" : "failed",
+        stale
+          ? `cannot apply ${proposal.id}: ${messageOf(e)}`
+          : `applying ${proposal.id} failed: ${messageOf(e)}${rollback}`,
+      ),
+    );
+  }
 
-  return { proposalId: proposal.id, plan, summary, changed: changed.map((s) => s.id) };
+  return settleProposal(repo, proposal.id, plan, decision.summary, changed);
+}
+
+/**
+ * Record what changed on the proposal itself and settle it — a plain close, not an abandon: the ask
+ * was answered, and only a DECLINE suppresses the fingerprint (see the module header). Always under
+ * the lock the whole application holds, so no second approve can be part-way through the same steps
+ * while this one declares them done.
+ */
+async function settleProposal(
+  repo: string,
+  proposalId: string,
+  plan: GardenerPlan,
+  summary: string,
+  changed: ApplyStep[],
+): Promise<ApplyResult> {
+  await beads.note(repo, proposalId, `${NOTE_PREFIX}: applied — ${summary}.`);
+  await beads.close(repo, proposalId, `applied: ${summary}`);
+  return { proposalId, plan, summary, changed: changed.map((s) => s.id) };
+}
+
+/** Every bead a plan's outcome rests on: the subjects it acts on, plus the bead it points at. */
+function affectedBeads(plan: GardenerPlan): string[] {
+  return plan.target ? [...plan.subjects, plan.target] : [...plan.subjects];
+}
+
+/**
+ * Why the board no longer reads as already-applied, or undefined when it still does. Re-decided from
+ * a FRESH board read through `planApply` itself rather than a hand-rolled per-verb re-check, so the
+ * confirmation cannot hold the live board to a different bar than the decision held the snapshot to.
+ */
+async function settledDrifted(repo: string, plan: GardenerPlan): Promise<string | undefined> {
+  let board: Bead[];
+  try {
+    board = await beads.list(repo, ["--status", "all"]);
+  } catch (e) {
+    // Same rule as `reread`'s: a board we could not read says nothing, so the proposal stays open.
+    return `the board could not be re-read to confirm the move is already applied (${messageOf(e)}) — nothing was written`;
+  }
+  const now = planApply(plan, board, Date.now());
+  switch (now.status) {
+    case "settled":
+      return undefined;
+    case "refuse":
+      return `the board no longer reads as applied — ${now.reason}`;
+    default:
+      return (
+        "the board no longer reads as applied — the move was undone since this approval was " +
+        "decided, so approving it again against the current board is what applies it"
+      );
+  }
 }
 
 // ── declining (the other half of the loop) ──
