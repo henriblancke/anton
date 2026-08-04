@@ -103,8 +103,8 @@ const UNKNOWN_COLLECTOR_SEVERITY: ScanSeverity = "medium";
  * The severity a security-shaped signal cannot be scored BELOW, whatever else the scan file says.
  * A committed secret or a CVE is critical wherever it came from, and a collector's generic
  * `Priority` is a queueing hint rather than a security judgment — letting `Priority: 2` demote a
- * leaked key to `medium` would understate it on the trend AND hand triage a `risk:low` bead, against
- * what this module and the triage contract both promise.
+ * leaked key to `medium` would understate it on the trend AND file the bead at whatever the project
+ * reserves for routine work.
  *
  * A floor, not an override: a signal already ranked worse (a P0 merge-conflict) keeps its rank.
  * Deliberately narrow and security-shaped — a generic word like "high" is NOT matched, because
@@ -270,9 +270,10 @@ export interface SeverityRule {
 export type ScanSeverityPolicy = Record<ScanSeverity, SeverityRule>;
 
 /**
- * The shipped mapping. It restates in one table what skills/scan-triage already says in prose —
- * security is always `risk:high`, debt is always `risk:low` — so triage stops re-deriving it per
- * scan and the health record can be read against the same scale.
+ * The shipped mapping — the one place a triaged bead's `risk:`/priority is decided, so triage stops
+ * re-deriving it per scan and the health record can be read against the same scale. skills/scan-
+ * triage's per-class rules say what becomes a bead and defer the labelling here, because a project
+ * that overrides an entry must not meet prose insisting on the default.
  */
 export const DEFAULT_SCAN_SEVERITY_POLICY: ScanSeverityPolicy = {
   critical: { risk: "high", priority: 0 },

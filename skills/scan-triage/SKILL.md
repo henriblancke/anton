@@ -99,15 +99,19 @@ all; this only decides how it is labelled.
 
 ### 3.2 What becomes a bead
 
+These rules decide **what becomes a bead and in what shape** — never how it is labelled. The
+`risk:`/priority every bead carries comes from §3.1's mapping (the appended table when there is one),
+whatever a class of signal conventionally looks like.
+
 anton runs **features**, not epics: a cluster is a **`feature` scoped to one reviewable PR** (one
 worktree, one PR) with its child tickets under it. The `epic` is the tier *above* — the product
 outcome several features add up to — and you attach the feature to one in §4. The `bd` skill holds
 the three tiers, the nesting rule, and the run-target rule.
 
-- **Security — always a bead, `risk:high`.** Committed secrets, known CVEs (OSV), unsafe
+- **Security — always a bead.** Committed secrets, known CVEs (OSV), unsafe
   config. One run target each — a `feature` when an epic owns that surface, otherwise a
   parentless `bug` (the §4.3 fallback, surfaced in §6); never cluster away a vuln.
-- **Debt — cluster, `risk:low`.** TODOs/FIXMEs, dead code, duplication, complexity hotspots →
+- **Debt — cluster.** TODOs/FIXMEs, dead code, duplication, complexity hotspots →
   group into **one `feature` per theme** ("Pay down auth-module debt") with child tickets. A theme
   that is one small change is still a `feature` — childless, its Acceptance carried on the feature
   itself. Don't create 40 TODO beads — and don't grow one feature past a reviewable PR to keep the
