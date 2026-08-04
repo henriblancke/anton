@@ -38,6 +38,7 @@
  */
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { withBeadWriteLock, withBeadWriteLocks } from "../beads/claim-lock";
+import { loadAllIssues } from "../beads/issues";
 import { indexBoard, isInFlight, isOpenWork, stampMsOf, type BoardIndex } from "./board-index";
 import {
   fingerprintLabelOf,
@@ -672,7 +673,7 @@ async function settledDrifted(
 ): Promise<string | undefined> {
   let board: Bead[];
   try {
-    board = await beads.list(repo, ["--status", "all"]);
+    board = await readWholeBoard(repo);
   } catch (e) {
     // Same rule as `reread`'s: a board we could not read says nothing, so the proposal stays open.
     return `the board could not be re-read to confirm the move is already applied (${messageOf(e)}) — nothing was written`;
@@ -808,7 +809,7 @@ async function applyStep(repo: string, step: ApplyStep): Promise<void> {
 async function assertNothingStranded(repo: string, id: string): Promise<void> {
   let board: Bead[];
   try {
-    board = await beads.list(repo, ["--status", "all"]);
+    board = await readWholeBoard(repo);
   } catch (e) {
     // Same call as `reread`'s: a board we could not read says nothing, so the step refuses.
     throw new SubjectMovedError(
@@ -838,7 +839,7 @@ async function assertNothingStranded(repo: string, id: string): Promise<void> {
 async function assertHomeIsCard(repo: string, parentId: string): Promise<void> {
   let board: Bead[];
   try {
-    board = await beads.list(repo, ["--status", "all"]);
+    board = await readWholeBoard(repo);
   } catch (e) {
     // Same call as `reread`'s: a board we could not read says nothing, so the step refuses.
     throw new SubjectMovedError(
@@ -850,6 +851,17 @@ async function assertHomeIsCard(repo: string, parentId: string): Promise<void> {
       `${parentId} is no longer a board card — re-parenting under it would leave the work riding no card, which is the state this proposal is about`,
     );
   }
+}
+
+/**
+ * A fresh whole-board read for the topology re-checks — through `loadAllIssues` rather than a bare
+ * `bd list --status all`, because that flag is unsupported on some bd versions and every re-check
+ * here treats a failed read as a refusal. On such a bd a sound approval would refuse forever;
+ * `loadAllIssues` falls back to merging the open and closed listings instead. Callers phrase their
+ * own refusal for the read that genuinely fails.
+ */
+function readWholeBoard(repo: string): Promise<Bead[]> {
+  return loadAllIssues(repo);
 }
 
 /** A bead read from inside its own write lock. A read that FAILED is never a bead that vanished. */

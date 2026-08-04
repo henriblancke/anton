@@ -84,6 +84,12 @@ function liveBoard(): Bead[] {
 /** The board `applyProposal` was handed — what the under-lock re-read sees unless a test overrides it. */
 let snapshot: Bead[] = [];
 
+/**
+ * A `bd list` that answers by the FLAGS it was given, when a test needs one — the way to stage a bd
+ * that rejects `--status all`. Unset, every listing answers with the whole {@link liveBoard}.
+ */
+let listByFlags: ((extra: string[]) => Promise<Bead[]>) | undefined;
+
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
   return {
@@ -95,7 +101,8 @@ vi.mock("../beads/bd", async () => {
         const live = liveBeads.has(id) ? liveBeads.get(id) : snapshot.find((b) => b.id === id);
         return live ? Promise.resolve(live) : Promise.reject(new Error(`bd show: no such issue ${id}`));
       },
-      list: () => Promise.resolve(liveBoard()),
+      list: (_cwd: string, extra: string[] = []) =>
+        listByFlags ? listByFlags(extra) : Promise.resolve(liveBoard()),
       reparent: (_cwd: string, id: string, parent: string) => record("reparent", id, parent),
       link: (_cwd: string, a: string, b: string, type: string) => record("link", a, b, type),
       close: (_cwd: string, id: string, reason?: string) => record("close", id, reason ?? ""),
@@ -269,6 +276,7 @@ beforeEach(() => {
   liveBeads.clear();
   onWrite = undefined;
   snapshot = [];
+  listByFlags = undefined;
 });
 
 describe("the plan a proposal carries — read strictly, because it decides what gets mutated", () => {
@@ -690,6 +698,25 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
       `note ${proposal.id} gardener: applied — re-parented anton-a under anton-card.`,
       `close ${proposal.id} applied: re-parented anton-a under anton-card`,
     ]);
+  });
+
+  // Every topology re-check treats a board read it could not make as a refusal, so on a bd without
+  // `--status all` a sound approval would refuse forever. The read goes through `loadAllIssues`,
+  // which falls back to merging the open and closed listings.
+  it("applies against a bd whose `list --status all` is unsupported", async () => {
+    const proposal = proposalFor(REPARENT);
+    listByFlags = async (extra) => {
+      if (extra.includes("all")) throw new Error("unknown value for --status: all");
+      const live = liveBoard();
+      return extra.includes("closed")
+        ? live.filter((b) => b.status === "closed")
+        : live.filter((b) => b.status !== "closed");
+    };
+
+    const result = await apply(proposal, [CARD, bead("anton-a"), proposal]);
+
+    expect(result.changed).toEqual(["anton-a"]);
+    expect(calls[0]).toBe("reparent anton-a anton-card");
   });
 
   it("closes a proposal the board already satisfied WITHOUT touching a subject bead", async () => {

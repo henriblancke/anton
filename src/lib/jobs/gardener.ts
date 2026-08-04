@@ -36,6 +36,7 @@
  * concurrent sweeps racing the same `epic close-eligible`.
  */
 import { beads, type DuplicateGroup } from "../beads/bd";
+import { loadAllIssues } from "../beads/issues";
 import { nudgeSync, type NudgeTarget } from "../beads/sync-nudge";
 import { detectBoard } from "../gardener/detect";
 import {
@@ -266,11 +267,13 @@ export function makeGardenerHandler(deps: GardenerDeps): JobHandler {
     // ── tier 3: proposals (anton-9qwq) ──
     //
     // After the report is published, so a failure filing proposals costs the pass its judgment tier
-    // and not its findings. The board read is `--status all` for two reasons: detection reads
+    // and not its findings. The board read spans EVERY status for two reasons: detection reads
     // container-ness and superseding twins off the whole graph, and a DECLINED proposal is a closed
-    // bead — a live-only read would miss it and re-ask a question a human already answered.
+    // bead — a live-only read would miss it and re-ask a question a human already answered. Through
+    // `loadAllIssues`, not a bare `bd list --status all`: that flag is unsupported on some bd
+    // versions, and a patrol that threw here would park every pass without ever filing a proposal.
     ctx.signal.throwIfAborted();
-    const board = await beads.list(repo, ["--status", "all"]);
+    const board = await loadAllIssues(repo);
     const detections = detectBoard({ board, hygiene: { findings }, now: clock.now() });
     await ctx.heartbeat();
     // Re-check RIGHT before the first write. The board read and detection above take real time, and

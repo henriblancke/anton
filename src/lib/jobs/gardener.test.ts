@@ -326,6 +326,26 @@ describe("gardener patrol", () => {
     expect(nudge).toHaveBeenCalledWith({ id: projectId, repoPath: REPO });
   });
 
+  it("files proposals on a bd whose `list --status all` is unsupported", async () => {
+    // The judgment tier runs AFTER the report, so a bare `--status all` that throws on such a bd
+    // would park every pass with the report published and no proposal ever filed. The read goes
+    // through `loadAllIssues`, which falls back to merging the open and closed listings.
+    orphansMock.mockResolvedValue([
+      { id: "t-4", title: "shipped", status: "open", latestCommit: "abc1234" },
+    ]);
+    listMock.mockImplementation(async (_cwd, extra = []) => {
+      if (extra.includes("all")) throw new Error("unknown value for --status: all");
+      return extra.includes("closed") ? [] : [bead("t-4", { title: "shipped" })];
+    });
+
+    const jobId = await runPatrol();
+    await expectJobStatus(t.db, jobId, "done");
+
+    expect(createMock).toHaveBeenCalledTimes(1);
+    const [, draft] = createMock.mock.calls[0];
+    expect(draft.labels?.some((l) => l.startsWith("gardener:shipped-orphan:"))).toBe(true);
+  });
+
   it("asks once: a fingerprint already on the board files nothing the next pass", async () => {
     orphansMock.mockResolvedValue([
       { id: "t-4", title: "shipped", status: "open", latestCommit: "abc1234" },
