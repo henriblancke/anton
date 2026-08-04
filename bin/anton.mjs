@@ -44,10 +44,12 @@ import {
   ensureBeadFormula,
   ensureBeadsGitignore,
   ensureRunFormula,
+  hasBeadsDir,
   BEAD_FORMULA_FILENAME,
   RUN_FORMULA_FILENAME,
   MIN_BD_VERSION,
 } from "../src/lib/beads/config.mjs";
+import { buildStructureReport, formatStructureReport } from "../src/lib/beads/tiers.mjs";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { fileURLToPath } from "node:url";
@@ -267,6 +269,15 @@ function installFile(src, dest) {
   return "installed";
 }
 
+/** Byte-equal? The drift test — an installed asset differing from the bundled one is out of date. */
+function sameBytes(a, b) {
+  try {
+    return readFileSync(a).equals(readFileSync(b));
+  } catch {
+    return false;
+  }
+}
+
 /** Recursively list every file under `dir` as paths relative to `dir` (files only). */
 function walkFiles(dir, base = dir) {
   const out = [];
@@ -280,13 +291,36 @@ function walkFiles(dir, base = dir) {
 
 /**
  * Install a whole skill DIRECTORY (SKILL.md + any bundled assets, e.g. setup's templates/) no-clobber.
- * The SKILL.md is the presence sentinel: if it already exists the skill is left untouched ("skipped");
- * otherwise every file under the bundled skill dir is copied. Returns "installed" | "skipped".
+ * The SKILL.md is the presence sentinel: if it already exists the skill is not re-copied; otherwise
+ * every file under the bundled skill dir is written.
+ *
+ * No-clobber is right for a file a user tunes and wrong for one anton's runtime reads as a contract:
+ * a skill installed once stays frozen at that release forever, and every later `anton setup` prints
+ * "already present" over it (anton-tier-invariants — a three-week-old `/shape` shaped against a
+ * taxonomy the bundle had already replaced). So drift is DETECTED rather than silently kept:
+ *
+ *   "installed" — nothing was there; the whole skill was written.
+ *   "skipped"   — present and byte-identical to the bundle. Nothing to do.
+ *   "stale"     — present but DIFFERENT. Left untouched (it may be the user's own edit), and the
+ *                 caller warns with the fix. This is the outcome no-clobber used to hide.
+ *   "updated"   — present, different, and `force` was set: every bundled file overwritten. Files the
+ *                 user added that the bundle doesn't ship are left alone.
  */
-function installSkillDir(srcDir, destDir) {
-  if (existsSync(join(destDir, "SKILL.md"))) return "skipped";
-  for (const rel of walkFiles(srcDir)) installFile(join(srcDir, rel), join(destDir, rel));
-  return "installed";
+function installSkillDir(srcDir, destDir, { force = false } = {}) {
+  const bundled = walkFiles(srcDir);
+  if (!existsSync(join(destDir, "SKILL.md"))) {
+    for (const rel of bundled) installFile(join(srcDir, rel), join(destDir, rel));
+    return "installed";
+  }
+  const drifted = bundled.filter((rel) => !sameBytes(join(srcDir, rel), join(destDir, rel)));
+  if (drifted.length === 0) return "skipped";
+  if (!force) return "stale";
+  for (const rel of drifted) {
+    const dest = join(destDir, rel);
+    mkdirSync(dirname(dest), { recursive: true });
+    copyFileSync(join(srcDir, rel), dest);
+  }
+  return "updated";
 }
 
 /** Parse `--agents <csv|all>` / `--no-agents` from the setup args, or null if unspecified. */
@@ -365,7 +399,15 @@ async function provisionAgentsSkills(args, opts = {}) {
   const agentsSrc =
     opts.agentsSrc ?? (opts.appRoot ? join(opts.appRoot, "src", "prompts", "agents") : AGENTS_SRC);
 
-  console.log(c.bold("\nInstalling agents & skills into ") + c.bold(claudeRoot) + c.dim(" (no-clobber):"));
+  // `--force-skills` re-syncs installed SKILLS to the bundled copies. Deliberately not the default
+  // and deliberately not `--force`: it discards local edits, and it is the answer to the stale-skill
+  // warning below rather than something a routine setup should do behind the user's back.
+  const force = args.includes("--force-skills");
+  console.log(
+    c.bold("\nInstalling agents & skills into ") +
+      c.bold(claudeRoot) +
+      c.dim(force ? " (--force-skills: skills re-synced from bundle):" : " (no-clobber):"),
+  );
   const selected = await resolveAgentSelection(args, agentsSrc);
 
   const jobs = [
@@ -390,23 +432,49 @@ async function provisionAgentsSkills(args, opts = {}) {
 
   let installed = 0;
   let skipped = 0;
+  let updated = 0;
+  const stale = [];
   for (const job of jobs) {
     if (!existsSync(job.sentinel)) {
       console.log(`  ${c.yellow("!")} ${job.kind} ${c.bold(job.name)} ${c.yellow("missing from package")} ${c.dim(job.src)}`);
       continue;
     }
+    // Only skills are drift-checked. An agent prompt is exactly the file a user is meant to tune, so
+    // reporting their edits as staleness would nag them for using the product as intended; a skill
+    // is a runtime contract anton's own jobs read, so a stale one is a real defect.
     const outcome =
-      job.kind === "skill" ? installSkillDir(job.src, job.dest) : installFile(job.src, job.dest);
+      job.kind === "skill" ? installSkillDir(job.src, job.dest, { force }) : installFile(job.src, job.dest);
     if (outcome === "installed") installed++;
+    else if (outcome === "updated") updated++;
+    else if (outcome === "stale") stale.push(job.name);
     else skipped++;
-    const tag = outcome === "installed" ? c.green("installed") : c.dim("already present");
+    const marks = {
+      installed: [c.green("✓"), c.green("installed")],
+      updated: [c.green("↑"), c.green("updated from bundle")],
+      stale: [c.yellow("!"), c.yellow("differs from bundle — left as-is")],
+      skipped: ["·", c.dim("already present")],
+    };
+    const [mark, tag] = marks[outcome];
     const req = job.required ? c.dim(" (required)") : "";
-    console.log(`  ${outcome === "installed" ? c.green("✓") : "·"} ${job.kind.padEnd(5)} ${c.bold(job.name.padEnd(12))} ${tag}${req}`);
+    console.log(`  ${mark} ${job.kind.padEnd(5)} ${c.bold(job.name.padEnd(12))} ${tag}${req}`);
   }
-  console.log(
-    c.dim(`  → ${installed} installed, ${skipped} already present. Existing files are never overwritten.`),
-  );
-  return { installed, skipped, agents: selected };
+  const counts = [
+    `${installed} installed`,
+    ...(updated > 0 ? [`${updated} updated`] : []),
+    `${skipped} already current`,
+    ...(stale.length > 0 ? [c.yellow(`${stale.length} stale`)] : []),
+  ].join(", ");
+  console.log(c.dim(`  → ${counts}. Your own edits are never overwritten.`));
+  if (stale.length > 0) {
+    console.log(
+      c.yellow(`  ! ${stale.join(", ")} differ from the bundled version`) +
+        c.dim(" — anton's runtime reads these as a contract, so a stale copy shapes work against\n") +
+        c.dim("    rules this release has replaced. Re-run with ") +
+        c.bold("--force-skills") +
+        c.dim(" to overwrite (your edits are lost)."),
+    );
+  }
+  return { installed, skipped, updated, stale, agents: selected };
 }
 
 // The Beads Dolt sync provisioning (anton-pns) lives in ../src/lib/beads/config.mjs as the single
@@ -782,6 +850,108 @@ function checkPrereqs() {
   return ok && nodeOk;
 }
 
+/** One `bd list` in `repo`, always JSON and never truncated (bd caps at 50 by default). */
+function bdList(repo, extra) {
+  return spawnSync("bd", ["-C", repo, "list", ...extra, "--json", "--limit", "0"], {
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
+  });
+}
+
+/** bd's listing as an array, or null when this build's output can't be parsed. */
+function parseBoard(stdout) {
+  try {
+    const parsed = JSON.parse(stdout || "[]");
+    // bd omits the key entirely on an empty board rather than emitting [].
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The WHOLE board — closed beads included, because container-ness is read off the parent graph and
+ * an epic whose only feature child is closed still strands its loose tickets.
+ *
+ * `--status all` first, then the fallback the app already relies on: some bd builds reject that
+ * flag, and `src/lib/beads/issues.ts` treats it as a supported CLI variation by merging the default
+ * open listing with `--status closed`. This checker is invoked from `/shape`'s mandatory Phase 5, so
+ * without the same fallback it would fail there having checked nothing.
+ *
+ * Returns `{ board }` or `{ error }` — never both.
+ */
+function readBoard(repo) {
+  const all = bdList(repo, ["--status", "all"]);
+  // bd missing altogether is not a flag problem, and there is no point retrying: `spawnSync` reports
+  // ENOENT on `error` with a NULL `stderr`, so reporting stderr alone printed a bare "bd list
+  // failed" and left a user without bd installed with nothing to act on.
+  if (all.error) {
+    return {
+      error:
+        all.error.code === "ENOENT"
+          ? "bd not found on PATH — install it with `brew install gastownhall/tap/bd`"
+          : all.error.message,
+    };
+  }
+  if (all.status === 0) {
+    const board = parseBoard(all.stdout);
+    return board ? { board } : { error: "bd returned output this build can't parse." };
+  }
+
+  const [open, closed] = [bdList(repo, []), bdList(repo, ["--status", "closed"])];
+  const failed = [open, closed].some((r) => r.error || r.status !== 0);
+  // Report the ORIGINAL failure: the fallback is a guess about which bd this is, and if it fails too
+  // the useful message is why `--status all` was refused, not why the second guess was.
+  if (failed) return { error: (all.stderr ?? "").trim() || `bd list exited ${all.status}` };
+
+  const listings = [parseBoard(open.stdout), parseBoard(closed.stdout)];
+  if (listings.some((l) => l === null)) return { error: "bd returned output this build can't parse." };
+  const byId = new Map();
+  for (const bead of listings.flat()) if (!byId.has(bead.id)) byId.set(bead.id, bead);
+  return { board: [...byId.values()] };
+}
+
+/**
+ * `anton board-check [path...]` — every live bead whose place in `epic → feature → ticket` is wrong.
+ *
+ * The mechanical half of `/shape`'s Phase 5, and it lives on the CLI rather than in an npm script
+ * for one reason: `/shape` runs inside the USER's repo, from an installed bundle that ships no
+ * TypeScript and no package scripts. A `npm run …` in the skill would have resolved against
+ * whatever `package.json` that repo happens to have (anton-i4al). The judgement itself is
+ * `src/lib/beads/tiers.mjs`, shared byte-for-byte with the approve gate — the command and the gate
+ * cannot disagree.
+ *
+ * Exit code is the point: non-zero means the board carries a DEAD bead — one no run target and no
+ * ticket sweep will ever reach. Advisory faults (a feature with no epic, with no tickets, past its
+ * ticket budget) print and exit 0; they cost later, they do not strand work.
+ *
+ * Read-only: it never writes a bead. Repair is authoring work — the report names the bead in the
+ * wrong place and the command that moves it, never what the right shape of the work is.
+ */
+function cmdBoardCheck(args) {
+  const paths = args.filter((a) => !a.startsWith("-"));
+  const repos = paths.length > 0 ? paths.map((p) => resolve(p)) : [process.cwd()];
+
+  let blocking = 0;
+  for (const repo of repos) {
+    if (!hasBeadsDir(repo)) {
+      console.error(c.red(`No .beads/ at ${repo}`) + c.dim(" — run `anton init` there, or pass a repo path."));
+      return 1;
+    }
+    const { board, error } = readBoard(repo);
+    if (error) {
+      console.error(c.red(`bd list failed in ${repo}`) + c.dim(`\n${error}`));
+      return 1;
+    }
+
+    const report = buildStructureReport(board);
+    blocking += report.blocking;
+    console.log(formatStructureReport(report, repos.length > 1 ? repo : ""));
+    console.log("");
+  }
+  return blocking > 0 ? 1 : 0;
+}
+
 /** Print anton's version — the bundle's RELEASE_VERSION when installed, else package.json. */
 function cmdVersion() {
   let v = bundleVersion();
@@ -796,8 +966,54 @@ function cmdVersion() {
   return 0;
 }
 
+/**
+ * Which installed skills differ from the bundled ones, checked at BOTH scopes anton installs into:
+ * the global ~/.claude (every repo resolves it) and this repo's own .claude/ (which wins locally).
+ * A skill is a runtime contract — a copy frozen at an old release keeps shaping work against rules
+ * the bundle has replaced, and until now nothing ever said so out loud (anton-tier-invariants).
+ * Returns `[{ scope, name }]`, empty when everything is current or nothing is installed.
+ *
+ * Both roots are injectable so this can be exercised against fixture directories — matching
+ * `provisionAgentsSkills`, which already takes `opts.claudeRoot`. `cmdDoctor` passes neither and
+ * gets the real ones; without the seam the only way to test drift detection was to `chdir` the
+ * process. `projectRoot` defaults at CALL time rather than module load, because `process.cwd()` is
+ * what "this repo" means for the command being run.
+ */
+function staleSkills(skillsSrc = SKILLS_SRC, { claudeRoot = CLAUDE_ROOT, projectRoot = process.cwd() } = {}) {
+  const scopes = [
+    ["global", claudeRoot],
+    ["project", join(projectRoot, ".claude")],
+  ];
+  const out = [];
+  for (const [scope, root] of scopes) {
+    for (const name of INSTALLED_SKILLS) {
+      const src = join(skillsSrc, name);
+      const dest = join(root, "skills", name);
+      if (!existsSync(join(src, "SKILL.md")) || !existsSync(join(dest, "SKILL.md"))) continue;
+      if (walkFiles(src).some((rel) => !sameBytes(join(src, rel), join(dest, rel)))) {
+        out.push({ scope, name });
+      }
+    }
+  }
+  return out;
+}
+
 function cmdDoctor() {
   const ok = checkPrereqs();
+  const stale = staleSkills();
+  if (stale.length === 0) {
+    console.log(`  ${c.green("✓")} ${"skills".padEnd(9)} ${c.green("installed copies match the bundle")}`);
+  } else {
+    for (const { scope, name } of stale) {
+      console.log(
+        `  ${c.yellow("!")} ${"skills".padEnd(9)} ${c.yellow(`${name} (${scope}) differs from the bundled version`)}`,
+      );
+    }
+    console.log(
+      c.dim("    Re-sync with `anton setup --force-skills` (global) or `anton init --force-skills`\n") +
+        c.dim("    (this repo). Skip if the difference is your own deliberate edit."),
+    );
+  }
   // Resolve the DB the same way the server does: in a bundle it lives in the persistent state dir
   // (where `anton setup` creates it), NOT under the runtime dir — so doctor must check there too.
   const dbPath = IS_BUNDLE ? bundleStateEnv().ANTON_DB : (process.env.ANTON_DB ?? join(APP_ROOT, "anton.db"));
@@ -1272,9 +1488,10 @@ const USAGE = `${c.bold("anton")} — local autonomous-coding orchestrator
 
 ${c.bold("Usage:")} anton <command>
 
-  ${c.bold("setup")}    check prereqs, migrate DB, rebuild node-pty, install agents & skills, wire beads Dolt sync  ${c.dim("[--agents <a,b,c>|all]")}
-  ${c.bold("init")}     configure beads in a target repo + register it with anton  ${c.dim("[path] [--prefix <p>]")}
-  ${c.bold("doctor")}   check prereqs + anton.db (non-destructive)
+  ${c.bold("setup")}    check prereqs, migrate DB, rebuild node-pty, install agents & skills, wire beads Dolt sync  ${c.dim("[--agents <a,b,c>|all] [--force-skills]")}
+  ${c.bold("init")}     configure beads in a target repo + register it with anton  ${c.dim("[path] [--prefix <p>] [--force-skills]")}
+  ${c.bold("doctor")}   check prereqs + anton.db + stale skills (non-destructive)
+  ${c.bold("board-check")} report beads that break epic → feature → ticket  ${c.dim("[path...] (default: cwd)")}
   ${c.bold("dev")}      run the dev server (next dev)          ${c.dim("[--port <n>]")}
   ${c.bold("start")}    run the server ${c.dim("(installed: background; source: foreground)")}  ${c.dim("[--port <n>] [--foreground]")}
   ${c.bold("stop")}     stop the background server             ${c.dim("(installed bundle)")}
@@ -1298,6 +1515,8 @@ function main(argv) {
       return cmdInit(rest);
     case "doctor":
       return cmdDoctor();
+    case "board-check":
+      return cmdBoardCheck(rest);
     case "dev":
       return cmdDev(rest);
     case "start":
@@ -1344,6 +1563,8 @@ export {
   resolveAntonDb,
   agentsFromArgs,
   provisionAgentsSkills,
+  installSkillDir,
+  staleSkills,
   REQUIRED_SKILLS,
   INSTALLED_SKILLS,
   compareVersions,

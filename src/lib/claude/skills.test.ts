@@ -116,11 +116,77 @@ describe("required skill assets", () => {
       expect(shape).toMatch(/Nothing fits → create the epic/);
     });
 
-    it("warns that a ticket parented to an epic never runs", () => {
+    it("warns that a ticket parented to a container epic never runs", () => {
       // A live /shape run hung a task straight off the epic — neither a run target (it has a
       // parent) nor covered by any feature's run. Both producers must name that trap.
-      expect(bd).toMatch(/hang off \*\*a feature\*\*, never off an epic/);
-      expect(shape).toMatch(/parented straight to the epic never runs/);
+      expect(bd).toMatch(/No ticket under a container epic/);
+      expect(shape).toMatch(/parented straight\s+to that epic never runs/);
+    });
+
+    // anton-tier-invariants: stating the taxonomy in prose was not enough — a /shape run read all
+    // of it and still shipped fifteen zero-ticket features. These pin the parts that made the rule
+    // CHECKABLE, so a future edit can't quietly soften them back into vibes.
+    it("bd numbers the five invariants and splits them by whether the bead can run", () => {
+      expect(bd).toMatch(/five invariants/i);
+      expect(bd).toMatch(/\*\*Blocking — a dead bead/);
+      expect(bd).toMatch(/\*\*Advisory — it runs, but the shape costs later/);
+      for (const rule of [
+        /No ticket under a container epic/,
+        /A feature hangs off an epic and nothing else/,
+        /No parentless `chore`/,
+        /Every feature has an epic/,
+        /A feature carries 2–6 tickets/,
+      ]) {
+        expect(bd).toMatch(rule);
+      }
+    });
+
+    it("bd settles feature size: one PR AND 2–6 tickets, which are steps not PRs", () => {
+      // The one contradiction the taxonomy left open — "a feature is one PR" vs "a feature holds
+      // many tickets" — resolved rather than restated, since either reading alone mis-shapes a board.
+      expect(bd).toMatch(/one worktree, one PR\*\* — and it carries \*\*2–6 tickets\*\*/);
+      expect(bd).toMatch(/steps executed inside its single run\*, not separate PRs/);
+    });
+
+    it("bd keeps the zero-ticket feature legal, matching beads.groupsChildren", () => {
+      // Hardening this into an error would refuse runs the runtime executes happily: a childless
+      // feature IS its own single ticket.
+      expect(bd).toMatch(/Zero is legal/);
+      expect(bd).toMatch(/groupsChildren/);
+    });
+
+    it("both producers deny that `bd children` verifies the tiers", () => {
+      expect(bd).toMatch(/`bd children <epic-id>` prints \*\*titles\*\*/);
+      expect(bd).toMatch(/Never treat it as a structural check/);
+      expect(shape).toMatch(/`bd children` does not/);
+    });
+
+    it("shape's Phase 5 requires the type audit and the mechanical check", () => {
+      expect(shape).toMatch(/Audit the tiers\. This step is not optional/);
+      expect(shape).toMatch(/anton board-check/);
+      expect(shape).toMatch(/If the audit and your intent disagree, the audit is right/);
+    });
+
+    it("shape maps a mid-shape structural instruction onto the tiers instead of obeying it", () => {
+      // "make everything a feature", applied literally, is exactly what produced the bad board.
+      expect(shape).toMatch(/structural instruction mid-shape is a reading, not a command/i);
+      expect(shape).toMatch(/do \*\*not\*\* apply it literally/);
+    });
+
+    it("shape reads the board's own shape before adding to it", () => {
+      expect(shape).toMatch(/Read the board's shape before you add to it/);
+      expect(shape).toMatch(/surface the difference to the user/);
+    });
+
+    it("bd creates a tree atomically and names the graph plan's traps", () => {
+      expect(bd).toMatch(/bd create --graph/);
+      expect(bd).toMatch(/parent_key/);
+      expect(bd).toMatch(/--dry-run/);
+      // Verified on bd 1.1.2: the graph plan has no acceptance field, and `## Acceptance` alone
+      // fails `bd lint` — one heading satisfies both readers.
+      expect(bd).toMatch(/There is no acceptance field/);
+      expect(bd).toMatch(/`## Acceptance Criteria`\*\* — the one spelling/);
+      expect(bd).toMatch(/Never put a heredoc inside command substitution/);
     });
 
     it("shape escalates an unattachable feature instead of orphaning it", () => {

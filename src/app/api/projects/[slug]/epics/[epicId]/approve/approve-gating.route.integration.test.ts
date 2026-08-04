@@ -195,6 +195,37 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     expect(beads.isApproved(await beads.show(repo, epic))).toBe(false);
   });
 
+  // anton-tier-invariants: the tier taxonomy gates beside the contract. Same severity split — a
+  // DEAD bead refuses, a merely wrong shape rides the 200 body.
+  it("422s a feature nested under a feature — both are run targets, so it ships twice", async () => {
+    const outer = await beads.create(repo, { title: "Outer feature", type: "feature", acceptance: "- [ ] it works" });
+    const inner = await beads.create(repo, { title: "Nested feature", type: "feature", acceptance: "- [ ] it works" });
+    await beads.link(repo, inner, outer, "parent-child");
+
+    const res = await approve(outer);
+    expect(res.status).toBe(422);
+    const body = await res.json();
+    expect(body.error).toContain(inner); // the operator is told WHICH bead is misplaced
+    expect(body.error).toMatch(/tier structure/i);
+    expect(body.rules).toEqual(["feature-under-non-epic"]);
+    expect(beads.isApproved(await beads.show(repo, outer))).toBe(false);
+    expect(await executeEpicJobs(outer)).toHaveLength(0);
+  });
+
+  it("approves a childless, parentless feature and reports both shapes as advisory", async () => {
+    // A feature with no tickets is a legitimate single-ticket run (beads.groupsChildren), and a
+    // parentless one runs fine — it just shows on no roadmap. Refusing either would strand honest
+    // work over shape judgement, so both are heard and neither blocks.
+    const solo = await beads.create(repo, { title: "Solo feature", type: "feature", acceptance: "- [ ] it works" });
+
+    const res = await approve(solo);
+    expect(res.status).toBe(200);
+    const advisory = (await res.json()).advisory.join("\n");
+    expect(advisory).toMatch(/no tickets/);
+    expect(advisory).toMatch(/no epic parent/);
+    expect(beads.isApproved(await beads.show(repo, solo))).toBe(true);
+  });
+
   it("approves a target whose only gaps are advisory, and reports them in the body", async () => {
     // Goal / Context / Out of scope / Verify degrade a run without making it unrunnable. Approval
     // proceeds — and says what's thin, so the gaps are heard once rather than never.

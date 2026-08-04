@@ -172,9 +172,10 @@ The **job runner and cron scheduler start automatically** with the server (via `
 ### CLI
 
 ```
-anton setup     check prereqs, migrate DB, install agents & skills   [--agents <a,b,c>|all]
-anton init      configure beads in a target repo + register it       [path] [--prefix <p>]
-anton doctor    check prereqs + anton.db (non-destructive)
+anton setup     check prereqs, migrate DB, install agents & skills   [--agents <a,b,c>|all] [--force-skills]
+anton init      configure beads in a target repo + register it       [path] [--prefix <p>] [--force-skills]
+anton doctor    check prereqs + anton.db + stale skills (non-destructive)
+anton board-check  report beads that break epic → feature → ticket   [path...] (default: cwd)
 anton dev       run the dev server (next dev)                         [--port <n>]
 anton start     run the server — bundle: background, source: foreground  [--port <n>] [--foreground]
 anton stop      stop the background server                            (installed bundle)
@@ -189,8 +190,10 @@ anton --help    show help
 Run in a real terminal, `anton setup` is **interactive**: after the prereq, migration, and native-build steps it provisions the agents and skills that `claude` uses, installing them into your **global `~/.claude/`** so they're discoverable from every repo `claude` runs in.
 
 - **Bundled agents — you choose.** anton ships specialist agent prompts (`alembic`, `docker`, `fastapi`, `kubernetes`, `nextjs`, `pydantic`, `supabase`, `terraform`). Setup lists them with a one-line description each and prompts for the ones that match your stack (enter numbers, `a` for all, or Enter for none). They land in `~/.claude/agents/<tag>.md`.
-- **Required skills — always installed.** The machinery anton itself needs — the `shape`, `bd`, `scan-triage`, and `review-fix` skills — is installed automatically into `~/.claude/skills/<name>/SKILL.md` and can't be deselected.
-- **Your own files are respected.** Any agent or skill already present at the destination — a prior anton install *or* your own file — is left **byte-for-byte untouched** and reported as *already present*. Re-running `anton setup` is idempotent: no duplicate installs, no clobbering.
+- **Required skills — always installed.** The machinery anton itself needs — the `shape`, `bd`, `scan-triage`, `review`, and `review-fix` skills, plus the founder-run `setup` scaffolder — is installed automatically into `~/.claude/skills/<name>/SKILL.md` and can't be deselected.
+- **Your own files are respected.** Nothing at the destination is ever overwritten — a prior anton install *or* your own file is left **byte-for-byte untouched**. Re-running `anton setup` is idempotent: no duplicate installs, no clobbering.
+- **A skill that has fallen behind is named, not hidden.** Agents are yours to tune, so an edited one is simply *already present* and never nagged about. Skills are different: anton's own jobs load them as a runtime contract, so a copy installed by an older release keeps shaping work against rules the current one has replaced. Setup now compares each installed skill against the bundled version and reports any difference as *differs from bundle — left as-is*; `anton doctor` lists the same thing for both scopes (global `~/.claude/` and the current repo's `.claude/`). Neither one changes a file.
+- **`--force-skills` re-syncs them.** `anton setup --force-skills` (global) or `anton init --force-skills` (that repo) overwrites the bundled files of a drifted skill. **Local edits to those files are lost** — that's why it's opt-in and separate from `--agents`. Files you added to a skill directory that anton doesn't ship are left alone. Skip it when the difference is a deliberate customization of your own.
 - **Non-interactive / CI.** When stdin isn't a TTY, setup skips the picker and installs just the required skills. Select agents non-interactively with `anton setup --agents nextjs,fastapi` (or `--agents all`); `--no-agents` installs skills only.
 
 **How an agent tag resolves at run time.** When a ticket carries an `agent:<tag>` label, anton loads the prompt for `<tag>` and appends it to the run's system prompt, resolving in order: the target project's `.claude/agents/<tag>.md`, then your global `~/.claude/agents/<tag>.md`, then anton's bundled prompt. The first match wins — your customization takes precedence, and anton's bundled copy is always the fallback, so a run works even before setup installs anything.
@@ -278,6 +281,10 @@ Then restart the server. (A node upgrade can break the ABI again — re-run the 
 **A run never opens a PR, or review-fix does nothing.** These need `gh` authenticated against the repo's remote. Check `gh auth status` and that the project's remote is reachable. review-fix also only acts once a PR exists and a reviewer has requested changes or a check has failed.
 
 **`anton doctor` shows `anton.db not created`.** Run `anton setup` — it applies the Drizzle migrations that create/update `anton.db`. `anton.db` is disposable machine-local state; deleting it and re-running `anton setup` is a safe reset (your work lives in beads + git, not here).
+
+**`anton doctor` says a skill `differs from the bundled version`.** The copy in `~/.claude/skills/` (or the repo's `.claude/skills/`) isn't the one this release ships. Because installs never overwrite, a skill provisioned by an older anton stays at that version forever — and `/shape` will keep shaping work against rules the current release has replaced. Re-sync with `anton setup --force-skills` (global) or `anton init --force-skills` (that repo), then restart any running `claude` session: skills are read at session start, so an updated file doesn't reach a session already open. Ignore the warning if the difference is your own deliberate edit — forcing discards it.
+
+**`/shape` produced a board that doesn't match `epic → feature → ticket`.** Run `anton board-check` in that repo (or pass one or more repo paths) for every violation on the board and the `bd` command that fixes each one. It exits non-zero only on a *dead* bead — one no run will ever reach, such as a ticket left under an epic that has features under it. Features outside the 2–6 ticket budget, features with no epic, and beads whose parent isn't on the board print as advisories: they run, they just cost you later. The same judgement gates approval for the target being approved, so a dead bead can't reach a run. It needs `bd` on PATH and nothing else — no anton checkout, no build.
 
 ## Stack
 

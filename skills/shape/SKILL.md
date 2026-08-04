@@ -71,11 +71,43 @@ Before decomposing, pass the idea through three quick lenses (inline, no separat
 anton runs **features**, not epics. Emit a **`feature`** scoped to **one reviewable PR** (one
 worktree, one PR — the unit that gets approved, claimed, and shipped), its **child tickets**
 (`task`/`bug`/`chore`), and attach the feature to the **`epic`** — the product outcome — it
-advances. The `bd` skill holds the three tiers, the nesting rule, and the exact commands.
+advances. The `bd` skill holds the three tiers, the **five structural invariants**, and the exact
+commands. Read that section before you decompose; do not shape the tree from memory of it.
 
 If the idea is bigger than one PR, that is the shape: **one epic, several features**, each its own
 reviewable PR, with `blocks` edges where order matters. Don't grow a feature past one PR to keep
 the count down.
+
+The count is the tell for which tier you are holding: **can't ship in one PR → epic; one PR, several
+steps → feature (2–6 tickets); one step → ticket.** A feature you can't name two tickets for was
+probably a ticket.
+
+### Read the board's shape before you add to it
+
+Before creating anything, sample a healthy existing tree and match it:
+
+```bash
+bd list --type epic --json
+bd list --status all --json --limit 0 \
+  | jq -r '.[] | select(.status != "closed") | "\(.id)\t\(.issue_type)\tparent=\(.parent // "-")"'
+```
+
+That shows how this board actually tiers — depth, typical tickets-per-feature, whether epics carry
+loose tickets from before the taxonomy. Match the convention you observe. If what you observe and
+what the `bd` skill states disagree, **surface the difference to the user**; don't quietly pick one.
+
+### A structural instruction mid-shape is a reading, not a command
+
+If the user says something like "make everything a feature" or "these should all be tasks" while you
+are shaping, do **not** apply it literally to every bead. Map it onto the tier model, state the
+reading, then apply it:
+
+> "Features are containers for one PR's worth of work — applying that literally would turn 15 leaf
+> steps into 15 separate PRs. I read this as either (a) promote the sub-epics to features, or
+> (b) these leaves need a feature parent. Which?"
+
+A literal apply is how a board ends up with fifteen zero-ticket features. The instruction is real;
+the mapping onto the tiers is your job.
 
 ### Every feature gets an epic
 
@@ -94,10 +126,10 @@ the count down.
 A genuine one-off with no epic worth inventing is a parentless `task` — a run of one. That is a
 call you state to the user, not a default you fall back to.
 
-**Every ticket hangs off a feature.** A `task` parented straight to the epic never runs — nothing
-claims it. Work that none of your features holds (the docs page, the ops step, the trust-page copy)
-is its own `feature` or a parentless ticket. Before you finish, check every bead you created has
-the right parent: `bd children <epic-id>`.
+**Every ticket hangs off a feature.** Once a feature lands under an epic, a `task` parented straight
+to that epic never runs — nothing claims it. Work that none of your features holds (the docs page,
+the ops step, the trust-page copy) is its own `feature` or a parentless ticket. Phase 5 checks this
+mechanically; `bd children <epic-id>` does not (it prints titles, not tiers).
 
 For every feature and ticket, the description MUST contain, or it is not `shaped`:
 
@@ -125,19 +157,45 @@ is the executor's call — don't set a `model:` label.)
 **Specify the what and the done, not the how.** No line-by-line implementation plans — the
 executor plans in its own session. Over-specification goes stale before it gets picked up.
 
-## Phase 5 — Create the beads and confirm
+## Phase 5 — Create the beads, audit the tiers, then confirm
 
-Use `bd` (following the `bd` skill's conventions) to create the feature, its tickets, and — when
-none fitted — its epic, cooking each one from the `anton-bead` formula so the contract sections are
-structural rather than retyped, then filling every var and setting labels and edges. Then show the user the tree
-(`bd children <epic-id>`) with the feature's one-line PR scope, name the epic it attached to and
-whether you created it, and confirm before finishing. The user approves what gets built — you
-don't merge scope silently.
+**Create.** Write the whole tree as one `bd create --graph` plan (the `bd` skill has the schema) —
+epic, feature, tickets, and `blocks` edges in a single atomic call. Cook each description from the
+`anton-bead` formula so the contract sections are structural rather than retyped, fill every var,
+and set labels. `--dry-run` first and read the tree back before writing it. If a creation run
+aborts partway, list what landed and delete the orphans before retrying.
+
+**Audit the tiers. This step is not optional and `bd children` does not satisfy it** — it prints
+titles, so a board of empty features looks identical to a healthy one there. Print the type audit
+and run the check:
+
+```bash
+bd list --status all --json --limit 0 \
+  | jq -r '.[] | select(.status != "closed") | "\(.id)\t\(.issue_type)\tparent=\(.parent // "-")"'
+anton board-check            # non-zero exit = a dead bead; fix it before confirming
+bd lint                      # the contract sections, per bead
+```
+
+Then assert the five invariants out loud against what you just printed, naming counts:
+
+- every `feature` has an `epic` parent;
+- every `task`/`bug`/`chore` has a `feature` parent (no ticket under a container epic);
+- no feature under a feature; no parentless `chore`;
+- each feature carries **2–6** tickets — say the number per feature. `feature … 0` repeated is the
+  signature of leaves mistyped as features; fix it before you confirm, don't explain it away.
+
+If the audit and your intent disagree, the audit is right.
+
+**Confirm.** Show the user the tree with the feature's one-line PR scope and its ticket count, name
+the epic it attached to and whether you created it, report the `anton board-check` result, and confirm
+before finishing. The user approves what gets built — you don't merge scope silently.
 
 ## Output
 
 - Beads created in `.beads/`, every feature under an epic, all children `shaped`, deps set.
-- A short summary: the epic (and its `area:`), the feature(s) under it, their tickets, total
-  `size`, and any `domain:research` beads you recommended first.
+- The Phase 5 type audit, and a clean `anton board-check` — or the violations named, with what
+  you changed to clear them.
+- A short summary: the epic (and its `area:`), the feature(s) under it, their tickets **with counts**,
+  total `size`, and any `domain:research` beads you recommended first.
 - Any feature whose epic you had to ask about — surfaced as an open question, not a silent orphan.
 - If you couldn't validate the problem, say so and stop before creating `domain:eng` beads.
