@@ -31,8 +31,19 @@ let approve: ApproveSuiteCtx["approve"];
 let beads: ApproveSuiteCtx["beads"];
 
 describeBd("POST approve — gardener proposals apply their move (temp anton.db + real bd)", () => {
+  /**
+   * Wait out the current second. bd stamps at ONE-SECOND resolution, so a subject written in the
+   * SAME second the proposal was filed cannot be ordered against it, and every retirement then fails
+   * closed on "carries no write stamp this proposal's filing can be ordered against" (apply.ts
+   * `writtenSinceFiling`). A real patrol files hours after the writes it judges; only a fixture is
+   * fast enough to collide, so the wait belongs here — not in a looser rule.
+   */
+  const nextSecond = (): Promise<void> =>
+    new Promise((resolve) => setTimeout(resolve, 1_050 - (Date.now() % 1_000)));
+
   /** File a proposal the way the patrol would: the emitter's own draft, created through the seam. */
   const file = async (input: DetectionInput): Promise<{ id: string; fingerprint: string }> => {
+    await nextSecond(); // the subjects were just written — see nextSecond
     const detection = makeDetection(input);
     const id = await beads.create(repo, proposalDraft(detection));
     return { id, fingerprint: detection.fingerprint };

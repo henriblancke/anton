@@ -1276,7 +1276,9 @@ const retiringTicket = (id: string): string => `retiring ${id} out of its ticket
  * This is only half of the guarantee, and it cannot be the other half: a run selects its tickets
  * before it publishes anything for this check to observe. The run closes its own side — it
  * re-confirms the selection once its lease is live and retries if the set moved (execute-epic step
- * 1c) — so a move that beats the lease is picked up rather than dropped.
+ * 1c) — so a move that beats the lease is picked up rather than dropped. That confirmation runs
+ * under THIS bead's write lock, the one `applyStep` holds around the check and the write below, so
+ * the two genuinely order: this step cannot slip its write into the window after that read.
  */
 function homeUnusable(home: Bead, nowMs: number): string | undefined {
   if (!isOpenWork(home)) {

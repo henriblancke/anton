@@ -4,6 +4,7 @@
  * Mirrors the read/parse patterns in epic-detail.ts and tickets.ts. See DESIGN.md §2/§3.
  */
 import { beads, type BeadPatch } from "./beads/bd";
+import { withBeadWriteLock } from "./beads/claim-lock";
 import { allIssues, ensureDescription } from "./beads/issues";
 import { nudgeSync } from "./beads/sync-nudge";
 import { formatHumanNote, parseTicketNotes, type TicketNote } from "./beads/notes";
@@ -192,10 +193,20 @@ export async function setTicketDeferred(
  * Permanently delete a ticket bead. Throws if the id doesn't resolve to a bead, so the API can
  * answer 404 instead of silently succeeding. A ticket may have dependents (e.g. a sibling that
  * `blocks`-links it); `bd delete --force` orphans those links rather than failing.
+ *
+ * Taken under the bead's own write lock, with the 404 guard re-read INSIDE it, for the reason the
+ * decline path takes the same lock (abandon.ts): a gardener proposal is a bead like any other, and
+ * `applyProposal` holds this lock for its whole run. Unserialized, a delete could remove the
+ * proposal after that apply had passed its locked re-read — the subject moves still land, then
+ * `settleProposal` fails on a bead that no longer exists, leaving board mutations with nothing
+ * recording the decision. Serialized, the delete either lands first (and the apply's re-read refuses,
+ * writing nothing) or waits until the apply has settled the proposal.
  */
 export async function deleteTicket(project: Project, id: string): Promise<void> {
-  await beads.show(project.repoPath, id); // 404 guard — bd throws on an unknown id
-  await beads.delete(project.repoPath, id);
+  await withBeadWriteLock(project.repoPath, id, async () => {
+    await beads.show(project.repoPath, id); // 404 guard — bd throws on an unknown id
+    await beads.delete(project.repoPath, id);
+  });
   // The delete landed locally; propagate via the immediate push + durable sync-push job (anton-nowq).
   nudgeSync(project, "ticket-detail");
 }

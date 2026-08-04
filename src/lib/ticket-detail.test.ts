@@ -7,9 +7,10 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { beads } from "./beads/bd";
+import { withBeadWriteLock } from "./beads/claim-lock";
 import { invalidateIssueSnapshot, resetIssueSnapshots } from "./beads/snapshot";
 import { allIssues } from "./beads/issues";
-import { getTicketDetail, updateTicket } from "./ticket-detail";
+import { deleteTicket, getTicketDetail, updateTicket } from "./ticket-detail";
 import type { Bead } from "./beads/bd";
 import type { Project } from "./types";
 
@@ -148,5 +149,59 @@ describe("updateTicket read economy", () => {
     expect(detail.epicAssignee).toBe("alice");
     // At most the background refresh the client's next poll shares — never awaited here.
     expect(bd.list.mock.calls.length).toBeLessThanOrEqual(1);
+  });
+});
+
+// A gardener proposal is a ticket bead like any other, and `applyProposal` holds its per-bead write
+// lock for the WHOLE apply. A delete outside that lock lands between the apply's locked re-read and
+// its writes: the subject moves still go in, then `settleProposal` fails on a bead that is gone —
+// board mutations with no proposal recording the decision. The lock is what orders the two.
+describe("deleteTicket serializes with the gardener's apply lock", () => {
+  /** Let the pending delete reach the lock (or the write it would have made without one). */
+  const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 10));
+
+  beforeEach(() => resetIssueSnapshots());
+  afterEach(() => vi.restoreAllMocks());
+
+  it("waits for the bead's write lock instead of deleting under a concurrent apply", async () => {
+    fakeBd([bead({ id: "anton-p1" })]);
+    const del = vi.spyOn(beads, "delete").mockResolvedValue("");
+    let release!: () => void;
+    const apply = withBeadWriteLock(
+      "/repo",
+      "anton-p1",
+      () => new Promise<void>((r) => (release = r)),
+    );
+
+    const deleting = deleteTicket(project, "anton-p1");
+    await settle();
+    expect(del).not.toHaveBeenCalled();
+
+    release();
+    await apply;
+    await deleting;
+    expect(del).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-reads under the lock, so a bead settled while it waited 404s rather than deleting blind", async () => {
+    const bd = fakeBd([bead({ id: "anton-p1" })]);
+    const del = vi.spyOn(beads, "delete").mockResolvedValue("");
+    let release!: () => void;
+    const apply = withBeadWriteLock(
+      "/repo",
+      "anton-p1",
+      () => new Promise<void>((r) => (release = r)),
+    );
+
+    const deleting = deleteTicket(project, "anton-p1");
+    await settle();
+    // The apply finished and took the bead with it — the 404 guard has to see that, which it only
+    // can from inside the lock.
+    bd.show.mockRejectedValue(new Error("no such bead anton-p1"));
+    release();
+    await apply;
+
+    await expect(deleting).rejects.toThrow(/no such bead/);
+    expect(del).not.toHaveBeenCalled();
   });
 });
