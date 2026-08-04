@@ -11,12 +11,6 @@ import { beads, type Bead } from "../beads/bd";
 import { isPipelineArtifact } from "../beads/contract";
 import { boardCards, deriveStage, type BoardCards } from "../ticket-view";
 
-/** A `discovered-from` edge: `discovered` was filed while working on `source`. */
-export interface Discovery {
-  discovered: string;
-  source: string;
-}
-
 export interface BoardIndex {
   /** The snapshot itself — closed beads included; container-ness is read off the whole graph. */
   all: Bead[];
@@ -59,7 +53,14 @@ export interface BoardIndex {
    * because a subject closed by any other means since the filing carries no such pointer.
    */
   recordsSupersedes(id: string, replacementId: string): boolean;
-  discoveries: Discovery[];
+  /**
+   * Does the board record `discoveredId` as discovered FROM `sourceId` — the directed
+   * `discovered-from` edge bd files for provenance? Directed like {@link recordsSupersedes}, and
+   * asked in the one place a non-`blocks` edge decides whether a `blocks` edge can be written at
+   * all: bd keeps ONE edge per directed pair and rejects a second type over it rather than replacing
+   * it, so a pair already carrying provenance can never also carry ordering.
+   */
+  recordsDiscovery(discoveredId: string, sourceId: string): boolean;
   /** Is `ancestorId` this bead, or anywhere on its parent chain? Cycle-guarded. */
   isAncestor(ancestorId: string, id: string): boolean;
   /** An epic that groups run targets rather than being one (`beads.isContainer`, board-wide). */
@@ -86,7 +87,9 @@ export function indexBoard(all: Bead[]): BoardIndex {
   const blockers = new Map<string, Set<string>>();
   // `bd supersede <id> --with <replacement>` writes (from = the superseded bead, to = the survivor).
   const supersedes = new Set<string>();
-  const discoveries: Discovery[] = [];
+  // `bd link <discovered> <source> --type discovered-from` writes (from = the bead that was found,
+  // to = the work it was found while doing).
+  const discoveries = new Set<string>();
   for (const edge of beads.edgesOf(all)) {
     if (edge.type === "blocks") {
       blocks.add(pairKey(edge.from, edge.to));
@@ -96,7 +99,7 @@ export function indexBoard(all: Bead[]): BoardIndex {
     } else if (edge.type === "supersedes") {
       supersedes.add(directedKey(edge.from, edge.to));
     } else if (edge.type === "discovered-from") {
-      discoveries.push({ discovered: edge.from, source: edge.to });
+      discoveries.add(directedKey(edge.from, edge.to));
     }
   }
 
@@ -137,7 +140,8 @@ export function indexBoard(all: Bead[]): BoardIndex {
       return false;
     },
     recordsSupersedes: (id, replacementId) => supersedes.has(directedKey(id, replacementId)),
-    discoveries,
+    recordsDiscovery: (discoveredId, sourceId) =>
+      discoveries.has(directedKey(discoveredId, sourceId)),
     isAncestor: (ancestorId, id) => {
       const seen = new Set<string>();
       let current: string | undefined = id;

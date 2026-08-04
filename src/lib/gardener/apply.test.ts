@@ -158,9 +158,13 @@ function supersededBy(id: string, survivor: string, extra: Partial<Bead> = {}): 
   };
 }
 
-/** The `anton-a`/`anton-b` pair with ONE blocks edge between them: `from` waits on `to`. */
+/**
+ * The {@link LINK} pair with ONE blocks edge between them: `from` waits on `to`. Its ids are two
+ * characters wide because the body scanner only reads bd ids as bd writes them (`anton-02oc`) — a
+ * one-character suffix never matches, so an `anton-a` pair could not state an ordering in prose.
+ */
 const edged = (from: string, to: string): Bead[] =>
-  ["anton-a", "anton-b"].map((id) => (id === from ? blockedBy(id, to) : bead(id)));
+  ["anton-aa", "anton-bb"].map((id) => (id === from ? blockedBy(id, to) : bead(id)));
 
 /**
  * A plan fingerprinted the way the emitter would fingerprint it — through the SAME key builder, not
@@ -210,16 +214,24 @@ const warm = (id: string, extra: Partial<Bead> = {}): Bead =>
   bead(id, { updated_at: "2026-07-15T00:00:00Z", ...extra });
 
 /**
- * A {@link LINK} subject still carrying the `discovered-from` edge its proposal read. An
- * `implied-order` ask rests on nothing but that edge or a body phrase, so apply re-derives it from
- * the board — a bead the board no longer places after its blocker is a proposal whose only evidence
- * somebody removed.
+ * A {@link LINK} subject whose own body still spells the ordering out. An `implied-order` ask rests
+ * on nothing but that phrase, so apply re-derives it from the board — a bead the board no longer
+ * places after its blocker is a proposal whose only evidence somebody removed.
  */
-const ordered = (base: Bead = bead("anton-a")): Bead => ({
+const ordered = (base: Bead = bead("anton-aa")): Bead => ({
+  ...base,
+  description: "## Context\nBlocked on anton-bb landing first.",
+});
+
+/**
+ * The same pair with a `discovered-from` edge between them. bd keeps one edge per directed pair and
+ * refuses to write `blocks` over provenance, so this is the pair no link ask may name (anton-wsap).
+ */
+const provenanced = (base: Bead = ordered()): Bead => ({
   ...base,
   dependencies: [
     ...(base.dependencies ?? []),
-    { issue_id: base.id, depends_on_id: "anton-b", type: "discovered-from" },
+    { issue_id: base.id, depends_on_id: "anton-bb", type: "discovered-from" },
   ],
 });
 
@@ -283,8 +295,8 @@ const CLUSTER = planFor({
 const LINK = planFor({
   kind: "implied-order",
   move: "link",
-  subjects: ["anton-a"],
-  target: "anton-b",
+  subjects: ["anton-aa"],
+  target: "anton-bb",
 });
 
 const DEFER = planFor({
@@ -409,29 +421,40 @@ describe("planApply — what an approval means against the board as it now is", 
   });
 
   it("records the blocks edge in the direction the detection states", () => {
-    const board = [ordered(), bead("anton-b")];
+    const board = [ordered(), bead("anton-bb")];
     expect(decide(LINK, board)).toEqual({
       status: "apply",
-      summary: "recorded that anton-b blocks anton-a",
-      steps: [{ verb: "link", id: "anton-a", claim: "", blocker: "anton-b" }],
+      summary: "recorded that anton-bb blocks anton-aa",
+      steps: [{ verb: "link", id: "anton-aa", claim: "", blocker: "anton-bb" }],
     });
   });
 
   it("settles a link whose edge already runs the way the proposal states", () => {
-    expect(decide(LINK, edged("anton-a", "anton-b"))).toEqual({
+    expect(decide(LINK, edged("anton-aa", "anton-bb"))).toEqual({
       status: "settled",
-      summary: "a blocks edge already records anton-b → anton-a",
+      summary: "a blocks edge already records anton-bb → anton-aa",
     });
+  });
+
+  // bd stores ONE edge per directed pair and answers a second type with "already exists with type
+  // discovered-from … remove it first", so an ask whose pair already carries provenance can only
+  // ever be approved into that error and would sit open until a human declined it (anton-wsap).
+  it("refuses a link over a pair the board already records as discovered-from", () => {
+    const decision = decide(LINK, [provenanced(), bead("anton-bb")]);
+    expect(decision).toMatchObject({ status: "refuse" });
+    expect(decision.status === "refuse" && decision.reason).toMatch(
+      /already records anton-aa as discovered from anton-bb/,
+    );
   });
 
   // The REVERSE edge is somebody's recorded decision that the ordering runs the other way — never
   // something to overwrite, and never something to close this proposal over: settling would file a
   // summary claiming an edge (`anton-b → anton-a`) the board does not hold.
   it("refuses a link the board already records in the opposite direction", () => {
-    const decision = decide(LINK, edged("anton-b", "anton-a"));
+    const decision = decide(LINK, edged("anton-bb", "anton-aa"));
     expect(decision).toMatchObject({ status: "refuse" });
     expect(decision.status === "refuse" && decision.reason).toMatch(
-      /opposite ordering — anton-a blocks anton-b/,
+      /opposite ordering — anton-aa blocks anton-bb/,
     );
   });
 
@@ -439,22 +462,22 @@ describe("planApply — what an approval means against the board as it now is", 
   // approved into a 500 — leaving an open proposal that will never apply. The DIRECT reverse pair is
   // caught above; this is the transitive case, where the pair looks unrelated.
   it("refuses a link that would close a dependency cycle through other beads", () => {
-    // anton-b waits on anton-c, which waits on anton-a — so "anton-b blocks anton-a" closes the loop.
+    // anton-bb waits on anton-cc, which waits on anton-aa — "anton-bb blocks anton-aa" closes the loop.
     const board = [
       ordered(),
-      blockedBy("anton-b", "anton-c"),
-      blockedBy("anton-c", "anton-a"),
+      blockedBy("anton-bb", "anton-cc"),
+      blockedBy("anton-cc", "anton-aa"),
     ];
     const decision = decide(LINK, board);
     expect(decision).toMatchObject({ status: "refuse" });
     expect(decision.status === "refuse" && decision.reason).toMatch(
-      /anton-b is already blocked by anton-a through other beads/,
+      /anton-bb is already blocked by anton-aa through other beads/,
     );
   });
 
   it("still records an edge whose chain runs the other way — that is an ordering, not a cycle", () => {
-    // anton-a already waits on anton-c: adding anton-b as another of its blockers closes nothing.
-    const board = [ordered(blockedBy("anton-a", "anton-c")), bead("anton-b"), bead("anton-c")];
+    // anton-aa already waits on anton-cc: adding anton-bb as another blocker closes nothing.
+    const board = [ordered(blockedBy("anton-aa", "anton-cc")), bead("anton-bb"), bead("anton-cc")];
     expect(decide(LINK, board).status).toBe("apply");
   });
 
@@ -553,8 +576,8 @@ describe("planApply — what an approval means against the board as it now is", 
     });
 
     it("refuses an ordering edge once the blocker has landed", () => {
-      const board = [bead("anton-a"), bead("anton-b", { status: "closed" })];
-      expect(refusal(decide(LINK, board))).toMatch(/anton-b is closed/);
+      const board = [ordered(), bead("anton-bb", { status: "closed" })];
+      expect(refusal(decide(LINK, board))).toMatch(/anton-bb is closed/);
     });
 
     it("refuses to supersede when the survivor is open again — nothing landed over there", () => {
@@ -609,7 +632,10 @@ describe("planApply — what an approval means against the board as it now is", 
         expect(refusal(decide(CLUSTER, [CARD, live, bead("anton-b")], NOW))).toMatch(
           /anton-a is mid-run/,
         );
-        expect(refusal(decide(LINK, [live, bead("anton-b")], NOW))).toMatch(/anton-a is mid-run/);
+        const liveBlocked = ordered(live.assignee ? leased("anton-aa", NOW) : inReview("anton-aa"));
+        expect(refusal(decide(LINK, [liveBlocked, bead("anton-bb")], NOW))).toMatch(
+          /anton-aa is mid-run/,
+        );
         expect(refusal(decide(DEFER, [live], NOW))).toMatch(/anton-a is mid-run/);
         expect(refusal(decide(CLOSE, [live], NOW))).toMatch(/anton-a is mid-run/);
         const survivor = bead("anton-b", { status: "closed" });
@@ -682,7 +708,10 @@ describe("planApply — what an approval means against the board as it now is", 
       const claimed = warm("anton-a", { assignee: "runner-7", status: "in_progress" });
       expect(reason(decide(DEFER, [claimed]))).toMatch(/is held by runner-7/);
       expect(reason(decide(CLOSE, [claimed]))).toMatch(/retiring it would pull the bead out/);
-      expect(reason(decide(LINK, [claimed, bead("anton-b")]))).toMatch(/recording it as blocked/);
+      const claimedBlocked = ordered(warm("anton-aa", { assignee: "runner-7", status: "in_progress" }));
+      expect(reason(decide(LINK, [claimedBlocked, bead("anton-bb")]))).toMatch(
+        /recording it as blocked/,
+      );
       expect(reason(decide(REPARENT, [CARD, claimed]))).toMatch(/moving it would pull the bead/);
     });
 
@@ -754,22 +783,21 @@ describe("planApply — what an approval means against the board as it now is", 
       expect(decide(REPARENT, [CARD, child("anton-a", "anton-container")]).status).toBe("apply");
     });
 
-    // An `implied-order` ask rests on ONE piece of evidence — a body phrase or a discovered-from
-    // edge — and nothing downstream re-derives it: the step carries only the pair, and the
+    // An `implied-order` ask rests on ONE piece of evidence — a body phrase on one end of the pair —
+    // and nothing downstream re-derives it: the step carries only the pair, and the
     // under-lock re-check asks whether the beads are writable, never whether the ordering is still
     // stated. Removing the evidence is a newer decision than the proposal, so drawing the edge
     // anyway would take the blocked bead back out of the ready set that edit put it in.
     it("refuses a link whose implied ordering the board no longer states", () => {
-      expect(reason(decide(LINK, [bead("anton-a"), bead("anton-b")]))).toMatch(
-        /nothing on the board still places anton-a after anton-b/,
+      expect(reason(decide(LINK, [bead("anton-aa"), bead("anton-bb")]))).toMatch(
+        /nothing on the board still places anton-aa after anton-bb/,
       );
     });
 
-    it("applies a link the board still implies, by provenance or by prose", () => {
-      expect(decide(LINK, [ordered(), bead("anton-b")]).status).toBe("apply");
+    it("applies a link the board still implies, from either end's prose", () => {
+      expect(decide(LINK, [ordered(), bead("anton-bb")]).status).toBe("apply");
 
-      // The other signal, read through the detector's own scanner: a body that still spells the
-      // ordering out in words.
+      // The same signal read from the OTHER end: the blocker's own body puts itself first.
       const spelled = planFor({
         kind: "implied-order",
         move: "link",
@@ -777,8 +805,8 @@ describe("planApply — what an approval means against the board as it now is", 
         target: "anton-bbb",
       });
       const board = [
-        bead("anton-aaa", { description: "blocked on anton-bbb" }),
-        bead("anton-bbb"),
+        bead("anton-aaa"),
+        bead("anton-bbb", { description: "this blocks anton-aaa" }),
       ];
       expect(decide(spelled, board).status).toBe("apply");
     });
@@ -1086,12 +1114,12 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
 
   it("refuses a blocker that landed, and a survivor that reopened, under the write lock", async () => {
     const link = proposalFor(LINK);
-    liveBeads.set("anton-b", bead("anton-b", { status: "closed" }));
+    liveBeads.set("anton-bb", bead("anton-bb", { status: "closed" }));
     await expect(
-      apply(link, [ordered(), bead("anton-b"), link]),
+      apply(link, [ordered(), bead("anton-bb"), link]),
     ).rejects.toMatchObject({ failure: "refused" });
     expect(calls).toEqual([
-      `note ${link.id} gardener: apply FAILED — cannot apply ${link.id}: anton-b is closed — the work anton-a was waiting on has landed, so the edge would only make anton-a read as blocked forever`,
+      `note ${link.id} gardener: apply FAILED — cannot apply ${link.id}: anton-bb is closed — the work anton-aa was waiting on has landed, so the edge would only make anton-aa read as blocked forever`,
     ]);
 
     calls.length = 0;
@@ -1108,17 +1136,17 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
   });
 
   // The link's own premise, which nothing else under the lock reads: the blocker stays perfectly
-  // usable while the ONE piece of evidence for the ordering — the prose on either end, or the
-  // discovered-from edge between them — is edited away. A body edit takes these very locks
-  // (ticket-detail's updateTicket), so re-deriving the premise from a board read taken inside them is
-  // what orders the two; left with the snapshot, the edge is drawn after its evidence is gone and the
-  // blocked bead leaves the ready set that edit put it in.
+  // usable while the ONE piece of evidence for the ordering — the prose on either end — is edited
+  // away. A body edit takes these very locks (ticket-detail's updateTicket), so re-deriving the
+  // premise from a board read taken inside them is what orders the two; left with the snapshot, the
+  // edge is drawn after its evidence is gone and the blocked bead leaves the ready set that edit
+  // put it in.
   it("refuses a link whose ordering evidence was removed after the snapshot", async () => {
-    const gone = `nothing on the board still places anton-a after anton-b — the body phrase or discovered-from edge this proposal read has been removed since it was filed, so recording the edge would restore an ordering a newer decision took away`;
+    const gone = `nothing on the board still places anton-aa after anton-bb — the body phrase this proposal read has been removed since it was filed, so recording the edge would restore an ordering a newer decision took away`;
 
     const link = proposalFor(LINK);
-    liveBeads.set("anton-a", bead("anton-a")); // the discovered-from edge, dropped mid-approval
-    await expect(apply(link, [ordered(), bead("anton-b"), link])).rejects.toMatchObject({
+    liveBeads.set("anton-aa", bead("anton-aa")); // the ordering phrase, rewritten mid-approval
+    await expect(apply(link, [ordered(), bead("anton-bb"), link])).rejects.toMatchObject({
       failure: "refused",
     });
     expect(calls).toEqual([
@@ -1127,12 +1155,12 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
 
     calls.length = 0;
     liveBeads.clear();
-    // The other signal: the blocker's body spelled the ordering out, and the phrase was edited out.
+    // The same premise read from the other end: the BLOCKER's body carried the phrase, and it went.
     const prose = proposalFor(LINK);
-    const spelled = bead("anton-b", { description: "this blocks anton-a" });
-    liveBeads.set("anton-b", bead("anton-b", { description: "rewritten" }));
+    const spelled = bead("anton-bb", { description: "this blocks anton-aa" });
+    liveBeads.set("anton-bb", bead("anton-bb", { description: "rewritten" }));
     await expect(
-      apply(prose, [bead("anton-a"), spelled, prose]),
+      apply(prose, [bead("anton-aa"), spelled, prose]),
     ).rejects.toMatchObject({ failure: "refused" });
     expect(calls).toEqual([
       `note ${prose.id} gardener: apply FAILED — cannot apply ${prose.id}: ${gone}`,
@@ -1479,6 +1507,32 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     failOn.set("reparent:anton-a", 2);
 
     await expect(apply(proposal, board)).rejects.toThrow(/ROLLBACK INCOMPLETE/);
+    expect(calls.some((c) => c.startsWith(`close ${proposal.id}`))).toBe(false);
+  });
+
+  // The rollback's other end: an early cluster member lands, a run starts on the HOME and confirms
+  // that member into its ticket set (execute-epic step 1c, under the home's own lock), and only then
+  // does a later member fail. Detaching now would pull a ticket out of a selection that run has
+  // already fixed — so the move is left in place and named, which is why the rollback takes the
+  // home's lock as well as the subject's.
+  it("leaves a rolled-back subject under a home a run has since started on", async () => {
+    const proposal = proposalFor(CLUSTER);
+    const board = [CARD, child("anton-a", "anton-old"), bead("anton-b"), proposal];
+    // The run picks the card up the instant the first member lands under it.
+    onWrite = (call) => {
+      if (call === "reparent anton-a anton-card") {
+        liveBeads.set(CARD.id, leased(CARD.id, Date.now()));
+      }
+    };
+
+    await expect(apply(proposal, board)).rejects.toThrow(
+      /ROLLBACK INCOMPLETE: anton-a was left in place because a run has since started on the card/,
+    );
+
+    // One write to anton-a: the move. No detach out from under the run that now owns the card.
+    expect(calls.filter((c) => c.startsWith("reparent anton-a"))).toEqual([
+      "reparent anton-a anton-card",
+    ]);
     expect(calls.some((c) => c.startsWith(`close ${proposal.id}`))).toBe(false);
   });
 

@@ -1,7 +1,6 @@
 /**
  * MISSING TIER EDGES (anton-02oc): two run targets whose ordering is already written down somewhere
- * the graph can't read — in a body, or in the board's own provenance — while `blocks` says they are
- * independent.
+ * the graph can't read — in a body — while `blocks` says they are independent.
  *
  * This matters more than tidiness. `bd ready`, the claimable set and the board's readiness badges
  * all derive from `blocks` edges, so an ordering that lives only in prose is an ordering nothing
@@ -53,24 +52,21 @@ const DIRECTIONS = [
 ] as const;
 
 /**
- * Ordering the board states but does not enforce, from two independent signals:
+ * Ordering the board states but does not enforce: a run target's own prose names another run target
+ * after an ordering phrase ("blocked on anton-x", "once anton-y lands"). Whoever wrote it already
+ * made the call; the edge was just never drawn.
  *
- *   • BODY — a run target's own prose names another run target after an ordering phrase ("blocked on
- *     anton-x", "once anton-y lands"). Whoever wrote it already made the call; the edge was just
- *     never drawn.
- *   • TIMING — a `discovered-from` edge. It records that this work was found WHILE doing the other,
- *     which is a fact about sequence: as long as the source is still open, its landing is what the
- *     discovered work is waiting for. bd files that edge for provenance and gives it no ordering
- *     weight (see computeEpicGraph), so the sequence it implies is invisible to every reader.
+ * PROSE IS THE ONLY SIGNAL READ HERE, and the one that reads like a second — a `discovered-from`
+ * edge, which records that this work was found WHILE doing the other — deliberately is not. bd keeps
+ * one edge per directed pair and rejects a second type over it, so the very pairs provenance names
+ * are the pairs `bd link --type blocks` refuses to write (anton-wsap): proposing them would file asks
+ * that fail on every approve and sit open until a human declined them by hand. {@link canOrder} bars
+ * the pair for that reason, whichever signal surfaced it.
  *
- * Both are proposals, never applied — a phrase in prose is evidence, not proof, so the matched
+ * Always a proposal, never applied — a phrase in prose is evidence, not proof, so the matched
  * sentence travels with the detection for the approver to read.
  */
 export function detectImpliedOrdering(index: BoardIndex, nowMs: number): GardenerDetection[] {
-  return [...bodyImplied(index, nowMs), ...discoveryImplied(index, nowMs)];
-}
-
-function bodyImplied(index: BoardIndex, nowMs: number): GardenerDetection[] {
   const detections: GardenerDetection[] = [];
   const units = index.all.filter((bead) => isUnit(bead) && isOpenWork(bead));
 
@@ -108,8 +104,9 @@ interface BodyOrdering {
 
 /**
  * Every ordering the bodies of `candidates` state, as resolved pairs. Split out from
- * {@link bodyImplied} so the EVIDENCE half is derivable on its own: apply re-asks it at approve time
- * ({@link impliesOrdering}), and a second reading of the same prose would be a second answer.
+ * {@link detectImpliedOrdering} so the EVIDENCE half is derivable on its own: apply re-asks it at
+ * approve time ({@link impliesOrdering}), and a second reading of the same prose would be a second
+ * answer.
  */
 function* bodyOrderings(index: BoardIndex, candidates: Iterable<Bead>): Generator<BodyOrdering> {
   for (const bead of candidates) {
@@ -135,21 +132,17 @@ function* bodyOrderings(index: BoardIndex, candidates: Iterable<Bead>): Generato
 /**
  * Does the board STILL state this ordering — the evidence an `implied-order` proposal rests on?
  *
- * A body phrase can be edited out and a `discovered-from` edge dropped, and either removal is a
- * newer decision than the proposal: someone took the ordering away on purpose. Approving the ask
- * anyway would draw a `blocks` edge whose only evidence no longer exists, and take the blocked bead
- * back out of the ready set that edit put it in.
+ * A body phrase can be edited out, and that removal is a newer decision than the proposal: someone
+ * took the ordering away on purpose. Approving the ask anyway would draw a `blocks` edge whose only
+ * evidence no longer exists, and take the blocked bead back out of the ready set that edit put it in.
  *
  * The EVIDENCE alone, deliberately — not the whole detection. {@link canOrder}'s bars (open units,
- * nothing mid-flight, no cycle) say whether the ask was worth FILING; apply holds those beads to its
- * own bars, which are not the same ones, and re-running them here would refuse moves the approval
- * path has always allowed. Only the two beads' own bodies are read, because the phrase always sits
- * on one end of the pair (see {@link bodyOrderings}).
+ * nothing mid-flight, no cycle, no provenance edge in the way) say whether the ask was worth FILING;
+ * apply holds those beads to its own bars, which are not the same ones, and re-running them here
+ * would refuse moves the approval path has always allowed. Only the two beads' own bodies are read,
+ * because the phrase always sits on one end of the pair (see {@link bodyOrderings}).
  */
 export function impliesOrdering(index: BoardIndex, blockedId: string, blockerId: string): boolean {
-  if (index.discoveries.some((d) => d.discovered === blockedId && d.source === blockerId)) {
-    return true;
-  }
   const pair = [index.byId.get(blockedId), index.byId.get(blockerId)].filter(
     (b): b is Bead => b !== undefined,
   );
@@ -159,37 +152,17 @@ export function impliesOrdering(index: BoardIndex, blockedId: string, blockerId:
   return false;
 }
 
-function discoveryImplied(index: BoardIndex, nowMs: number): GardenerDetection[] {
-  const detections: GardenerDetection[] = [];
-
-  for (const { discovered, source } of index.discoveries) {
-    const blocked = index.byId.get(discovered);
-    const blocker = index.byId.get(source);
-    if (!blocked || !blocker || !canOrder(index, blocked, blocker, nowMs)) continue;
-    detections.push(
-      makeDetection({
-        kind: "implied-order",
-        move: "link",
-        subjects: [blocked.id],
-        target: blocker.id,
-        summary: `${blocked.id} was discovered from ${blocker.id}, which is still open — no blocks edge records the sequence`,
-        evidence: [
-          `discovered-from edge: ${blocked.id} was filed while working on ${blocker.id}`,
-          `${blocker.id} is still ${blocker.status} — the work ${blocked.id} came out of has not landed`,
-          `discovered-from carries no ordering weight, so ${blocked.id} is claimable before ${blocker.id} ships`,
-        ],
-      }),
-    );
-  }
-
-  return detections;
-}
-
 /**
  * Is proposing `blocker` → `blocked` meaningful? Both must be open units, and the pair must be
  * unrelated today: an existing blocks edge in EITHER direction is already someone's answer (the
  * reverse one is a contradiction to raise with a human, not to silently invert), and a
  * parent/ancestor pair sequences through the hierarchy rather than through `blocks`.
+ *
+ * A `discovered-from` edge on the same DIRECTED pair bars it for a blunter reason: bd stores one edge
+ * per pair and answers `bd link --type blocks` with "already exists with type discovered-from …
+ * remove it first", so the proposal could only ever be approved into that error and would sit open
+ * until someone declined it by hand (anton-wsap). Checked here as well as at approve time, so the ask
+ * is never filed in the first place — the same bargain the cycle bar strikes below.
  *
  * Mid-flight work is off limits, the same bar every other detector proposes under: apply refuses to
  * record a live bead as blocked, and by the time its run lands the bead is settled — so the proposal
@@ -206,6 +179,7 @@ function canOrder(index: BoardIndex, blocked: Bead, blocker: Bead, nowMs: number
   if (!isOpenWork(blocked) || !isOpenWork(blocker)) return false;
   if (isInFlight(blocked, nowMs) || isInFlight(blocker, nowMs)) return false;
   if (index.hasBlocksEdge(blocked.id, blocker.id)) return false;
+  if (index.recordsDiscovery(blocked.id, blocker.id)) return false;
   if (index.isBlockedBy(blocker.id, blocked.id)) return false;
   return !index.isAncestor(blocked.id, blocker.id) && !index.isAncestor(blocker.id, blocked.id);
 }

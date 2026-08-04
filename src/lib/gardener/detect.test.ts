@@ -359,17 +359,35 @@ describe("implied ordering with no blocks edge", () => {
     ).toEqual([]);
   });
 
-  it("treats a discovered-from edge to still-open work as implied timing", () => {
+  // bd keeps ONE edge per directed pair and answers `bd link --type blocks` over provenance with
+  // "already exists with type discovered-from … remove it first", so an ask naming this pair could
+  // only ever be approved into that error and would sit open until a human declined it (anton-wsap).
+  it("stays silent when a discovered-from edge already occupies the pair bd would have to write", () => {
+    expect(
+      detect([
+        feature("anton-child", {
+          description: "## Context\nBlocked on anton-source landing first.",
+          dependencies: [discoveredFrom("anton-child", "anton-source")],
+        }),
+        feature("anton-source"),
+      ]),
+    ).toEqual([]);
+  });
+
+  // The other direction is bd's to write: provenance points source-ward, so the pair this ordering
+  // needs (`child → source`) is still free.
+  it("still proposes when the provenance edge runs the other way", () => {
     const detection = only(
       detect([
-        feature("anton-child", { dependencies: [discoveredFrom("anton-child", "anton-source")] }),
-        feature("anton-source"),
+        feature("anton-child", { description: "## Context\nBlocked on anton-source landing first." }),
+        feature("anton-source", {
+          dependencies: [discoveredFrom("anton-source", "anton-child")],
+        }),
       ]),
     );
 
     expect(detection.subjects).toEqual(["anton-child"]);
     expect(detection.target).toBe("anton-source");
-    expect(detection.evidence.join("\n")).toContain("discovered-from");
   });
 
   // The same bar every other detector proposes under: apply refuses to record a live bead as

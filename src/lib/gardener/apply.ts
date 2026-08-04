@@ -310,6 +310,16 @@ function planLink(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): Apply
       reason: `the board records the opposite ordering — ${id} blocks ${plan.target} — which is someone's explicit decision; recording ${plan.target} as ${id}'s blocker would contradict it`,
     };
   }
+  // bd stores ONE edge per directed pair: a pair that already carries `discovered-from` answers
+  // `bd link --type blocks` with "already exists with type discovered-from … remove it first" rather
+  // than replacing the edge. `canOrder` bars the pair at filing time; an edge drawn since would
+  // otherwise leave this ask failing on every approve until a human declined it (anton-wsap).
+  if (index.recordsDiscovery(id, plan.target)) {
+    return {
+      status: "refuse",
+      reason: `the board already records ${id} as discovered from ${plan.target}, and bd keeps one edge per pair — it refuses to write a blocks edge over that provenance, so this ask can only fail; drop the discovered-from edge by hand first if the ordering is what you want recorded`,
+    };
+  }
   if (!isOpenWork(blocked)) {
     return {
       status: "refuse",
@@ -559,14 +569,14 @@ function reparentPremiseGone(
 
 /**
  * Why the board no longer states the ordering this link proposal read, or undefined. An
- * `implied-order` ask rests on exactly one piece of evidence — a body phrase or a `discovered-from`
- * edge — and unlike a status or a parent, no other bar reads it: the step carries only the pair, and
- * every remaining check asks whether the two beads are writable, never whether the ordering is still
- * stated anywhere.
+ * `implied-order` ask rests on exactly one piece of evidence — a body phrase on one end of the pair
+ * — and unlike a status or a parent, no other bar reads it: the step carries only the pair, and every
+ * remaining check asks whether the two beads are writable, never whether the ordering is still stated
+ * anywhere.
  *
- * So a phrase edited out or an edge dropped since the filing would otherwise apply anyway, restoring
- * an ordering a newer board edit explicitly removed and taking the blocked bead back out of the ready
- * set that edit put it in. Re-derived from the fresh board through the detector's own reader (see
+ * So a phrase edited out since the filing would otherwise apply anyway, restoring an ordering a newer
+ * board edit explicitly removed and taking the blocked bead back out of the ready set that edit put
+ * it in. Re-derived from the fresh board through the detector's own reader (see
  * `relink.ts` {@link impliesOrdering}), so approval cannot hold the premise to a laxer bar than the
  * patrol held it to — and re-derived once more from a read taken under the pair's own write locks
  * ({@link assertOrderingStated}), because this snapshot is stale by the time the write spawns.
@@ -1169,12 +1179,10 @@ function assertHomeIsCard(parentId: string, board: BoardIndex): void {
  * without this the edge lands after its sole evidence was removed, taking the blocked bead back out
  * of the ready set that edit put it in.
  *
- * The evidence sits on the pair itself — a body phrase on one of the two beads, or a
- * `discovered-from` edge between them (see `relink.ts` {@link impliesOrdering}) — and both beads are
- * locked here, so a body edit, which takes the same per-bead lock (`ticket-detail.ts` `updateTicket`),
- * either lands first and this read finds the phrase gone or queues behind this write. An operator
- * dropping the EDGE by hand takes no such lock, so for that half this is a narrowing of the
- * snapshot→lock window rather than a serialization — the same bargain {@link RetireEvidence} strikes.
+ * The evidence sits on the pair itself — a body phrase on one of the two beads (see `relink.ts`
+ * {@link impliesOrdering}) — and both beads are locked here, so a body edit, which takes the same
+ * per-bead lock (`ticket-detail.ts` `updateTicket`), either lands first and this read finds the
+ * phrase gone or queues behind this write.
  */
 function assertOrderingStated(blockedId: string, blockerId: string, board: BoardIndex): void {
   if (impliesOrdering(board, blockedId, blockerId)) return;
@@ -1183,7 +1191,7 @@ function assertOrderingStated(blockedId: string, blockerId: string, board: Board
 
 /** The one phrasing both readings of the link premise refuse with — snapshot and under-lock alike. */
 const orderingUnstated = (blockedId: string, blockerId: string): string =>
-  `nothing on the board still places ${blockedId} after ${blockerId} — the body phrase or discovered-from edge this proposal read has been removed since it was filed, so recording the edge would restore an ordering a newer decision took away`;
+  `nothing on the board still places ${blockedId} after ${blockerId} — the body phrase this proposal read has been removed since it was filed, so recording the edge would restore an ordering a newer decision took away`;
 
 /**
  * A fresh whole-board read for the topology re-checks — through `loadAllIssues` rather than a bare
@@ -1338,6 +1346,7 @@ async function runStep(repo: string, step: ApplyStep): Promise<void> {
 async function rollbackSteps(repo: string, applied: ApplyStep[]): Promise<string> {
   if (applied.length === 0) return " — nothing had been written";
   const stranded: string[] = [];
+  const adopted: string[] = [];
   const overtaken: string[] = [];
   for (const step of [...applied].reverse()) {
     if (step.verb !== "reparent") {
@@ -1345,9 +1354,14 @@ async function rollbackSteps(repo: string, applied: ApplyStep[]): Promise<string
       continue;
     }
     try {
-      // Undone under the same per-bead lock the write took, so a claim that queued behind the
-      // failed apply doesn't interleave with its rollback.
-      await withBeadWriteLock(repo, step.id, async () => {
+      // Undone under the same per-bead locks the write took — the subject AND the home. The subject's
+      // keeps a claim that queued behind the failed apply from interleaving with its rollback; the
+      // HOME's is what makes the liveness check below mean anything (anton-e42l). An early cluster
+      // member can land, a run start on `step.parent` and confirm that member into its ticket set
+      // (execute-epic step 1c, which holds this very lock), and only THEN a later member fail — so a
+      // rollback that took the subject's lock alone would detach a ticket out from under a live run
+      // while it works, on a selection that run has already fixed.
+      await withBeadWriteLocks(repo, [step.id, step.parent], async () => {
         // Undo only what is still OURS to undo. Another approval — of a different proposal naming
         // the same subject — can land between this apply's per-step locks, and restoring the parent
         // this plan happened to record would clobber a move somebody else has since made and now
@@ -1366,14 +1380,30 @@ async function rollbackSteps(repo: string, applied: ApplyStep[]): Promise<string
           overtaken.push(step.id);
           return;
         }
+        // The home, judged by the same two bars the write held it to: a live run, and a claim taken
+        // since the step was decided. Either means the card has become a run's ticket set with this
+        // bead in it, and detaching now is the harm — so the move is LEFT and named, not undone. A
+        // home we could not read says nothing, and says it in the direction that would detach, so it
+        // is treated like a live one for the same fail-loud reason the subject read is.
+        const home = await beads.show(repo, step.parent).catch(() => undefined);
+        if (!home || isInFlight(home, Date.now()) || homeClaimed(step, home)) {
+          adopted.push(step.id);
+          return;
+        }
         await beads.reparent(repo, step.id, step.undoParent);
       });
     } catch {
       stranded.push(step.id);
     }
   }
-  if (stranded.length > 0) {
-    return ` — ROLLBACK INCOMPLETE: ${list(stranded)} could not be restored and need a human`;
+  if (stranded.length > 0 || adopted.length > 0) {
+    const why = [
+      stranded.length > 0 ? `${list(stranded)} could not be restored` : undefined,
+      adopted.length > 0
+        ? `${list(adopted)} was left in place because a run has since started on the card it was moved under, and detaching it would pull a ticket out of a selection that run has already made`
+        : undefined,
+    ].filter((clause): clause is string => clause !== undefined);
+    return ` — ROLLBACK INCOMPLETE: ${why.join("; ")} — a human has to settle it`;
   }
   return overtaken.length === 0
     ? ` — the ${applied.length} write(s) already made were rolled back, so the board is unchanged`

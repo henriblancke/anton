@@ -27,8 +27,8 @@ export type GardenerMove = "reparent" | "link" | "retire";
  *   • `container-orphan`    — a working-layer bead whose parent is a CONTAINER epic, so no board
  *                             card carries it and no run will ever ship it (the anton-do0q class).
  *   • `parentless-cluster`  — parentless working-layer beads that share one obvious card home.
- *   • `implied-order`       — two run targets whose bodies or provenance state an ordering the
- *                             graph has no `blocks` edge for.
+ *   • `implied-order`       — two run targets whose bodies state an ordering the graph has no
+ *                             `blocks` edge for.
  *   • `superseded`          — an open bead whose identical twin already landed.
  *   • `stale`               — untouched far past the report threshold for its status.
  *   • `shipped-orphan`      — a commit shipped it, the board never closed it.
