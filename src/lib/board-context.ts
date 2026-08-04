@@ -149,10 +149,15 @@ const MD_EMPHASIS = /^(\*+)(.+?)\1$/;
  */
 const ROUTE_GROUP = /^\([\w@.-]+\)$/;
 
-/** A path-shaped token: a segment separator plus a segment, with globs allowed on either side. */
-const PATH_RE = /^[\w@.*/~()[\]-]*[/.][\w@.*/~()[\]-]+$/;
+/**
+ * A path-shaped token: a segment separator plus a segment, with globs allowed on either side. `+` is
+ * a path character because SvelteKit names every route file with it (`src/routes/+page.svelte`) — a
+ * stack this scanner supports, per the `.svelte-kit/**` exclusion in stringer.ts. The separator is
+ * still required, so prose stays out.
+ */
+const PATH_RE = /^[\w@.*/~+()[\]-]*[/.][\w@.*/~+()[\]-]+$/;
 /** A directory surface — `app/` — which {@link PATH_RE} would drop for want of a trailing segment. */
-const DIR_RE = /^[\w@.*~()[\]-][\w@.*/~()[\]-]*\/$/;
+const DIR_RE = /^[\w@.*~+()[\]-][\w@.*/~+()[\]-]*\/$/;
 
 /** A token that reads as a repo path rather than prose — the filter that keeps `touches:` usable. */
 function asPath(token: string): string | undefined {

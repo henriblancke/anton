@@ -133,6 +133,19 @@ describe("parseTouches", () => {
     ]);
   });
 
+  it("keeps SvelteKit's plus-prefixed route files", () => {
+    // Every SvelteKit route file starts with `+`; dropping them left the whole routes tree unowned.
+    const b = bead({
+      id: "a-1",
+      context: "touches: src/routes/+page.svelte, src/routes/(app)/+layout.server.ts, src/routes/+*",
+    });
+    expect(parseTouches(b)).toEqual([
+      "src/routes/+page.svelte",
+      "src/routes/(app)/+layout.server.ts",
+      "src/routes/+*",
+    ]);
+  });
+
   it("unwraps markdown emphasis without mistaking a trailing glob for it", () => {
     const b = bead({ id: "a-1", context: "touches: **src/lib/runs.ts**, *src/x.ts:14*, src/api/*" });
     expect(parseTouches(b)).toEqual(["src/lib/runs.ts", "src/x.ts", "src/api/*"]);
