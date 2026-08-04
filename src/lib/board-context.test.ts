@@ -117,6 +117,22 @@ describe("parseTouches", () => {
     ]);
   });
 
+  it("keeps the App Router segments this repo's own paths are full of", () => {
+    // Dropping `[slug]` or collapsing `(board)` to `src/app/` is the misroute this module prevents:
+    // the first leaves the route unowned, the second hands the feature every file under `src/app`.
+    const b = bead({
+      id: "a-1",
+      context:
+        "touches: src/app/projects/[slug]/settings/route.ts, src/app/(board)/page.tsx (54 lines, one export), src/app/(board)/, src/app/api/[[...path]]/route.ts",
+    });
+    expect(parseTouches(b)).toEqual([
+      "src/app/projects/[slug]/settings/route.ts",
+      "src/app/(board)/page.tsx",
+      "src/app/(board)/",
+      "src/app/api/[[...path]]/route.ts",
+    ]);
+  });
+
   it("unwraps markdown emphasis without mistaking a trailing glob for it", () => {
     const b = bead({ id: "a-1", context: "touches: **src/lib/runs.ts**, *src/x.ts:14*, src/api/*" });
     expect(parseTouches(b)).toEqual(["src/lib/runs.ts", "src/x.ts", "src/api/*"]);

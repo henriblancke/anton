@@ -141,15 +141,28 @@ const EXTENSIONLESS_ROOT_FILES =
  */
 const MD_EMPHASIS = /^(\*+)(.+?)\1$/;
 
+/**
+ * An App Router route group — `(board)` — as opposed to the `(54 lines, exports …)` annotation the
+ * strip below removes. Told apart by adjacency to a segment separator, since an annotation always
+ * follows whitespace. Erasing one collapsed `src/app/(board)/page.tsx` to `src/app/`, handing the
+ * feature the whole directory so unrelated signals under `src/app` routed into it.
+ */
+const ROUTE_GROUP = /^\([\w@.-]+\)$/;
+
 /** A path-shaped token: a segment separator plus a segment, with globs allowed on either side. */
-const PATH_RE = /^[\w@.*/~-]*[/.][\w@.*/~-]+$/;
+const PATH_RE = /^[\w@.*/~()[\]-]*[/.][\w@.*/~()[\]-]+$/;
 /** A directory surface — `app/` — which {@link PATH_RE} would drop for want of a trailing segment. */
-const DIR_RE = /^[\w@.*~-][\w@.*/~-]*\/$/;
+const DIR_RE = /^[\w@.*~()[\]-][\w@.*/~()[\]-]*\/$/;
 
 /** A token that reads as a repo path rather than prose — the filter that keeps `touches:` usable. */
 function asPath(token: string): string | undefined {
   const cleaned = token
-    .replace(/\([^)]*\)?/g, " ") // drop the "(54 lines, exports …)" annotations beads carry
+    // drop the "(54 lines, exports …)" annotations beads carry, but keep route groups
+    .replace(/\([^)]*\)?/g, (match: string, offset: number, whole: string) =>
+      ROUTE_GROUP.test(match) && (whole[offset - 1] === "/" || whole[offset + match.length] === "/")
+        ? match
+        : " ",
+    )
     .replace(/[`"']/g, " ")
     .trim()
     .split(/\s+/)[0]
