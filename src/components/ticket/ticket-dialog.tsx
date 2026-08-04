@@ -10,6 +10,7 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { ApproveBlocked } from "@/components/board/contract-mark";
 import { toastContractAdvisory } from "@/components/board/contract-advisory";
+import { readAppliedSummary } from "@/components/board/proposal-applied";
 import { ConfirmDeleteButton } from "@/components/ui/confirm-delete-button";
 import { CopyButton } from "@/components/ui/copy-button";
 import {
@@ -205,7 +206,16 @@ function TicketDialogBody({
         const { error: message } = await res.json().catch(() => ({ error: "Run failed" }));
         throw new Error(message ?? "Run failed");
       }
-      toast.success(wasApproved ? `Re-running "${detail.title}"` : `Approved & running "${detail.title}"`);
+      // A gardener proposal is applied, not run: report the board move it made rather than a run
+      // that never started (anton-1t3n).
+      const applied = await readAppliedSummary(res);
+      toast.success(
+        applied
+          ? `Applied — ${applied}`
+          : wasApproved
+            ? `Re-running "${detail.title}"`
+            : `Approved & running "${detail.title}"`,
+      );
       // The run starts with whatever thin sections it has; say so once, here (mirrors the board chip).
       await toastContractAdvisory(res);
     } catch (err) {

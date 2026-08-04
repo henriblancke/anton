@@ -1,0 +1,225 @@
+/**
+ * MISSING TIER EDGES (anton-02oc): two run targets whose ordering is already written down somewhere
+ * the graph can't read — in a body — while `blocks` says they are independent.
+ *
+ * This matters more than tidiness. `bd ready`, the claimable set and the board's readiness badges
+ * all derive from `blocks` edges, so an ordering that lives only in prose is an ordering nothing
+ * enforces: two machines will happily claim both ends at once, and the second one lands on a base
+ * that doesn't have the first one's work yet.
+ *
+ * Scoped to features/epics — the units `computeEpicGraph` ranks. A missing ticket-level edge inside
+ * one run target is invisible to sequencing (the run works through its tickets in order anyway), so
+ * proposing one would be noise.
+ */
+import type { Bead } from "../beads/bd";
+import { isUnit } from "../epic-graph";
+import { isClaimed, isInFlight, isOpenWork, type BoardIndex } from "./board-index";
+import { makeDetection, type GardenerDetection } from "./detections";
+
+/** Phrases placing the MENTIONING bead after the bead it names. */
+const AFTER_PHRASES = [
+  "blocked on",
+  "blocked by",
+  "depends on",
+  "depend on",
+  "dependent on",
+  "waiting on",
+  "waits on",
+  "prerequisite",
+  "requires",
+  "needs",
+  "follows",
+  "once",
+  "after",
+];
+
+/** Phrases placing the MENTIONING bead before the bead it names. */
+const BEFORE_PHRASES = ["unblocks", "blocks", "precedes", "before"];
+
+/** How far past an ordering phrase a bead id still counts as that phrase's object. */
+const MENTION_WINDOW = 100;
+
+/** bd ids as they appear in prose (`anton-02oc`). Membership in the board decides what is real. */
+const ID_PATTERN = /\b[a-z][a-z0-9]*-[a-z0-9]{2,12}\b/gi;
+
+const AFTER_RE = phraseRegex(AFTER_PHRASES);
+const BEFORE_RE = phraseRegex(BEFORE_PHRASES);
+
+/** Both readings of a mention: whose side of the ordering the NAMED bead lands on. */
+const DIRECTIONS = [
+  { regex: AFTER_RE, mentionedIsBlocker: true },
+  { regex: BEFORE_RE, mentionedIsBlocker: false },
+] as const;
+
+/**
+ * Ordering the board states but does not enforce: a run target's own prose names another run target
+ * after an ordering phrase ("blocked on anton-x", "once anton-y lands"). Whoever wrote it already
+ * made the call; the edge was just never drawn.
+ *
+ * PROSE IS THE ONLY SIGNAL READ HERE, and the one that reads like a second — a `discovered-from`
+ * edge, which records that this work was found WHILE doing the other — deliberately is not. bd keeps
+ * one edge per directed pair and rejects a second type over it, so the very pairs provenance names
+ * are the pairs `bd link --type blocks` refuses to write (anton-wsap): proposing them would file asks
+ * that fail on every approve and sit open until a human declined them by hand. {@link canOrder} bars
+ * the pair for that reason, whichever signal surfaced it.
+ *
+ * Always a proposal, never applied — a phrase in prose is evidence, not proof, so the matched
+ * sentence travels with the detection for the approver to read.
+ */
+export function detectImpliedOrdering(index: BoardIndex, nowMs: number): GardenerDetection[] {
+  const detections: GardenerDetection[] = [];
+  const units = index.all.filter((bead) => isUnit(bead) && isOpenWork(bead));
+
+  for (const { writer, blocked, blocker, mention } of bodyOrderings(index, units)) {
+    if (!canOrder(index, blocked, blocker, nowMs)) continue;
+    detections.push(
+      makeDetection({
+        kind: "implied-order",
+        move: "link",
+        subjects: [blocked.id],
+        target: blocker.id,
+        // Named after the bead that WROTE the ordering, which is not always the blocked one:
+        // "this blocks anton-x" puts the writer first.
+        summary: `${writer.id}'s body places ${blocked.id} after ${blocker.id}, but no blocks edge records it`,
+        evidence: [
+          `${writer.id} body: "${mention.snippet}"`,
+          `"${mention.phrase}" places ${blocked.id} after ${blocker.id}`,
+          `no blocks edge exists between them, so ${blocked.id} reads as ready while ${blocker.id} is still open`,
+        ],
+      }),
+    );
+  }
+
+  return detections;
+}
+
+/** One ordering a bead's own prose states, before any bar on whether it is worth proposing. */
+interface BodyOrdering {
+  /** The bead whose body carries the phrase — either end of the pair, depending on the wording. */
+  writer: Bead;
+  blocked: Bead;
+  blocker: Bead;
+  mention: OrderingMention;
+}
+
+/**
+ * Every ordering the bodies of `candidates` state, as resolved pairs. Split out from
+ * {@link detectImpliedOrdering} so the EVIDENCE half is derivable on its own: apply re-asks it at
+ * approve time ({@link impliesOrdering}), and a second reading of the same prose would be a second
+ * answer.
+ */
+function* bodyOrderings(index: BoardIndex, candidates: Iterable<Bead>): Generator<BodyOrdering> {
+  for (const bead of candidates) {
+    const body = bodyOf(bead);
+    if (!body) continue;
+    for (const { regex, mentionedIsBlocker } of DIRECTIONS) {
+      for (const mention of scanOrdering(body, regex)) {
+        for (const id of mention.ids) {
+          const other = index.byId.get(id);
+          if (!other) continue;
+          yield {
+            writer: bead,
+            blocked: mentionedIsBlocker ? bead : other,
+            blocker: mentionedIsBlocker ? other : bead,
+            mention,
+          };
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Does the board STILL state this ordering — the evidence an `implied-order` proposal rests on?
+ *
+ * A body phrase can be edited out, and that removal is a newer decision than the proposal: someone
+ * took the ordering away on purpose. Approving the ask anyway would draw a `blocks` edge whose only
+ * evidence no longer exists, and take the blocked bead back out of the ready set that edit put it in.
+ *
+ * The EVIDENCE alone, deliberately — not the whole detection. {@link canOrder}'s bars (open units,
+ * nothing mid-flight, no cycle, no provenance edge in the way) say whether the ask was worth FILING;
+ * apply holds those beads to its own bars, which are not the same ones, and re-running them here
+ * would refuse moves the approval path has always allowed. Only the two beads' own bodies are read,
+ * because the phrase always sits on one end of the pair (see {@link bodyOrderings}).
+ */
+export function impliesOrdering(index: BoardIndex, blockedId: string, blockerId: string): boolean {
+  const pair = [index.byId.get(blockedId), index.byId.get(blockerId)].filter(
+    (b): b is Bead => b !== undefined,
+  );
+  for (const { blocked, blocker } of bodyOrderings(index, pair)) {
+    if (blocked.id === blockedId && blocker.id === blockerId) return true;
+  }
+  return false;
+}
+
+/**
+ * Is proposing `blocker` → `blocked` meaningful? Both must be open units, and the pair must be
+ * unrelated today: an existing blocks edge in EITHER direction is already someone's answer (the
+ * reverse one is a contradiction to raise with a human, not to silently invert), and a
+ * parent/ancestor pair sequences through the hierarchy rather than through `blocks`.
+ *
+ * A `discovered-from` edge on the same DIRECTED pair bars it for a blunter reason: bd stores one edge
+ * per pair and answers `bd link --type blocks` with "already exists with type discovered-from …
+ * remove it first", so the proposal could only ever be approved into that error and would sit open
+ * until someone declined it by hand (anton-wsap). Checked here as well as at approve time, so the ask
+ * is never filed in the first place — the same bargain the cycle bar strikes below.
+ *
+ * Mid-flight work is off limits, the same bar every other detector proposes under: apply refuses to
+ * record a live bead as blocked, and by the time its run lands the bead is settled — so the proposal
+ * would never become appliable and would suppress the claim until someone declined it by hand.
+ *
+ * A CLAIM on the blocked end bars it too, for a harm liveness cannot see: `beads.claimVerified`
+ * writes the assignee and `in_progress` before the execute job publishes a lease, so a bead picked up
+ * seconds ago still reads as free (see {@link isClaimed}) — and approval is no backstop, because
+ * apply refuses only a claim it can date to AFTER the filing. Recording a new blocker over a live
+ * pickup parks that run: it refreshes the board and finds a dependency that was absent when it was
+ * selected. Only the blocked end carries this bar, because only its readiness changes.
+ *
+ * The same reasoning bars a CYCLE. A blocker that already waits on the blocked bead through other
+ * beads has no direct edge, so the pair reads as unrelated — but bd refuses to write the edge that
+ * would close the loop (bd-hygiene.integration.test.ts), so the proposal could only ever be approved
+ * into an error. Checked here as well as at apply, so the ask is never filed in the first place.
+ */
+function canOrder(index: BoardIndex, blocked: Bead, blocker: Bead, nowMs: number): boolean {
+  if (blocked.id === blocker.id) return false;
+  if (!isUnit(blocked) || !isUnit(blocker)) return false;
+  if (!isOpenWork(blocked) || !isOpenWork(blocker)) return false;
+  if (isInFlight(blocked, nowMs) || isInFlight(blocker, nowMs)) return false;
+  if (isClaimed(blocked)) return false;
+  if (index.hasBlocksEdge(blocked.id, blocker.id)) return false;
+  if (index.recordsDiscovery(blocked.id, blocker.id)) return false;
+  if (index.isBlockedBy(blocker.id, blocked.id)) return false;
+  return !index.isAncestor(blocked.id, blocker.id) && !index.isAncestor(blocker.id, blocked.id);
+}
+
+/** Every place a bead states its ordering in prose — `bd list --json` carries all of them. */
+function bodyOf(bead: Bead): string {
+  return [bead.description, bead.context, bead.acceptance, bead.acceptance_criteria]
+    .filter((s): s is string => typeof s === "string" && s.length > 0)
+    .join("\n");
+}
+
+interface OrderingMention {
+  phrase: string;
+  snippet: string;
+  ids: string[];
+}
+
+/** Ordering phrases in `body`, each with the ids that follow it on the same line. */
+function scanOrdering(body: string, regex: RegExp): OrderingMention[] {
+  const mentions: OrderingMention[] = [];
+  for (const match of body.matchAll(regex)) {
+    const start = match.index ?? 0;
+    const [line] = body.slice(start, start + MENTION_WINDOW).split("\n");
+    const after = line.slice(match[0].length);
+    const ids = [...after.matchAll(ID_PATTERN)].map((m) => m[0].toLowerCase());
+    if (ids.length > 0) mentions.push({ phrase: match[0], snippet: line.trim(), ids });
+  }
+  return mentions;
+}
+
+/** Longest phrase first, so "blocked on" is never truncated to a shorter alternative. */
+function phraseRegex(phrases: string[]): RegExp {
+  const ordered = [...phrases].sort((a, b) => b.length - a.length);
+  return new RegExp(`\\b(?:${ordered.join("|")})\\b`, "gi");
+}

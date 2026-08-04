@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { deleteEpic, getEpicDetail, updateEpic } from "@/lib/epic-detail";
+import { DeleteConflictError, deleteEpic, getEpicDetail, updateEpic } from "@/lib/epic-detail";
 import { parseEpicPatch } from "@/lib/epic-patch";
 import { notFoundResponse, withProject } from "../../resolve-project";
 
@@ -50,7 +50,13 @@ export const DELETE = withProject<{ slug: string; epicId: string }>(
     try {
       await deleteEpic(project, params.epicId);
       return NextResponse.json({ ok: true });
-    } catch {
+    } catch (e) {
+      // A delete that refused because the work under the epic moved while it was landing is a
+      // CONFLICT, not a missing epic (see deleteEpic): the operator has to see the newcomer named
+      // and decide again, which "Epic not found" would hide behind a lie.
+      if (e instanceof DeleteConflictError) {
+        return NextResponse.json({ error: e.message }, { status: 409 });
+      }
       return notFoundResponse("Epic not found");
     }
   },

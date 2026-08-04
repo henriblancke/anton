@@ -6,7 +6,7 @@
  * reimplementing epic-closure, staleness or duplicate detection over a board read: bd owns those
  * rules, and a second implementation here would drift from the one `bd ready` and the CLI answer to.
  *
- * Two tiers, in this order:
+ * Three tiers, in this order:
  *
  *   1. SAFE VERBS — the only two writes the patrol may make, both provably mechanical:
  *      `bd epic close-eligible` (an epic whose children are ALL closed is done by definition; bd
@@ -18,6 +18,12 @@
  *      REPORTED and nothing more. Merging duplicates, retiring stale work, relinking orphans are
  *      judgment moves that need a human (anton-bci0 "Out of scope"); the seam deliberately has no
  *      wrapper for `--auto-merge`/`--fix`, so one cannot leak in here either.
+ *   3. PROPOSALS (anton-9qwq) — the judgment tier. The board-shape claims the report has no verb for
+ *      (misfiled work, missing ordering edges, retirement candidates) become approvable proposal
+ *      beads, deduplicated by fingerprint so a nightly patrol over an unfixed board asks once — and,
+ *      for the duplicates only overlapping patrols on different machines can create, folded back to
+ *      one ask before new ones are filed. This tier writes to PROPOSALS alone: applying one is an
+ *      approval away (anton-1t3n), so nothing here touches the beads a proposal is about.
  *
  * The board is PULLED first and NUDGED after — the patrol reads the shared board and writes to it,
  * so it must not act on a working set that is a sync heartbeat behind (an epic whose child another
@@ -31,7 +37,16 @@
  * concurrent sweeps racing the same `epic close-eligible`.
  */
 import { beads, type DuplicateGroup } from "../beads/bd";
+import { loadAllIssues } from "../beads/issues";
 import { nudgeSync, type NudgeTarget } from "../beads/sync-nudge";
+import { detectBoard } from "../gardener/detect";
+import {
+  emitProposals,
+  MAX_PROPOSALS_PER_PASS,
+  PartialEmissionError,
+  reconcileDuplicateProposals,
+  type EmissionResult,
+} from "../gardener/emit";
 import {
   completeHygieneReport,
   startHygieneReport,
@@ -222,6 +237,17 @@ export function makeGardenerHandler(deps: GardenerDeps): JobHandler {
     // the board shows, so a partial one is indistinguishable from a clean bill of health. The runner
     // retries the pass, and a verb that keeps failing parks the job for a human — which is the
     // honest outcome for a patrol that can no longer see the board.
+    //
+    // The premise fence opens HERE, before the first read this pass judges from — not just before
+    // tier 3's board snapshot. A retirement's evidence IS a hygiene finding (retire.ts reads the
+    // stale and duplicate rows below), so a fence stamped after these verbs would date an edit that
+    // landed mid-report as already observed, and approval would settle a bead against a premise
+    // that edit falsified. Stamped BEFORE rather than after for the same reason at every read: a
+    // bead written while one is in flight may or may not be in its result, and the earlier fence
+    // dates it as unseen — a refusal at approve time, which is the safe direction. This is what
+    // apply compares "has this moved since we asked" against; the proposals' own `created_at` land
+    // later, once the sequential creates in tier 3 run.
+    const observedAtMs = clock.now();
     const lint = await beads.lintReport(repo);
     const staleOpen = await beads.staleList(repo, { status: "open", days: STALE_OPEN_DAYS });
     const staleInProgress = await beads.staleList(repo, {
@@ -250,5 +276,78 @@ export function makeGardenerHandler(deps: GardenerDeps): JobHandler {
     await completeHygieneReport(db, clock, reportId, findings);
 
     console.log(`[gardener] ${projectId}: ${summarizeReport({ actions, findings })}`);
+
+    // ── tier 3: proposals (anton-9qwq) ──
+    //
+    // After the report is published, so a failure filing proposals costs the pass its judgment tier
+    // and not its findings. The board read spans EVERY status for two reasons: detection reads
+    // container-ness and superseding twins off the whole graph, and a DECLINED proposal is a closed
+    // bead — a live-only read would miss it and re-ask a question a human already answered. Through
+    // `loadAllIssues`, not a bare `bd list --status all`: that flag is unsupported on some bd
+    // versions, and a patrol that threw here would park every pass without ever filing a proposal.
+    ctx.signal.throwIfAborted();
+    const board = await loadAllIssues(repo);
+    const detections = detectBoard({ board, hygiene: { findings }, now: clock.now() });
+    await ctx.heartbeat();
+    // Re-check RIGHT before the first write. The board read and detection above take real time, and
+    // a cancel arriving inside them is invisible to `ctx.heartbeat()` — which does not inspect the
+    // signal — so without this a cancelled patrol would still file judgment-tier proposal beads.
+    // `emitProposals` carries the signal on from here and re-checks between its own creates.
+    ctx.signal.throwIfAborted();
+
+    // Converge on ONE ask per claim before filing new ones. Fingerprint suppression is only atomic
+    // within a patrol: two on different machines each read a working set the other's proposal has
+    // not synced into yet, so the same claim can reach the board twice with nothing to refuse the
+    // second. Folding the twins here is the only place that duplication is ever undone — see
+    // gardener/emit.ts. Best-effort by design: a failed fold is noise the next patrol retries, not a
+    // reason to cost this pass its proposals.
+    const reconciled = await reconcileDuplicateProposals(repo, board, ctx.signal);
+    if (reconciled.folded.length > 0) {
+      console.log(
+        `[gardener] ${projectId}: folded ${reconciled.folded.length} duplicate proposal(s) ` +
+          `(${reconciled.folded.map((f) => `${f.id}→${f.into}`).join(", ")})`,
+      );
+      nudge({ id: project.id, repoPath: repo });
+    }
+    // Neither silence nor a fold: a twin an approval or a run holds is left for a human, and a close
+    // that failed is a duplicate still standing. Both have to be visible to tell either from a board
+    // that simply has no duplicates.
+    if (reconciled.held.length > 0 || reconciled.failed.length > 0) {
+      console.log(
+        `[gardener] ${projectId}: left ${reconciled.held.length} duplicate proposal(s) standing ` +
+          `(approved or claimed: ${reconciled.held.join(", ") || "none"})` +
+          `${reconciled.failed.length > 0 ? `, ${reconciled.failed.length} fold(s) failed: ${reconciled.failed.join(", ")}` : ""}`,
+      );
+    }
+    ctx.signal.throwIfAborted();
+
+    // Whatever landed before a create failed is real board state living only in the local working
+    // set. Report and propagate it on the way out, or a pass that parks on the failing proposal
+    // leaves the ones that DID file invisible to every other machine.
+    const report = (emission: EmissionResult) => {
+      if (emission.created.length > 0) {
+        console.log(
+          `[gardener] ${projectId}: filed ${emission.created.length} proposal(s) ` +
+            `(${emission.created.map((p) => p.id).join(", ")})` +
+            `${emission.suppressed > 0 ? `, ${emission.suppressed} already on the board` : ""}`,
+        );
+        nudge({ id: project.id, repoPath: repo });
+      }
+      // Never a silent cap: the overflow is deterministic and the next pass files it, but a reader
+      // has to be able to tell "the board is this clean" from "we stopped at ten".
+      if (emission.deferred > 0) {
+        console.log(
+          `[gardener] ${projectId}: held back ${emission.deferred} proposal(s) — one pass files at ` +
+            `most ${MAX_PROPOSALS_PER_PASS}; the next patrol picks them up`,
+        );
+      }
+    };
+
+    try {
+      report(await emitProposals(repo, { board, detections, observedAtMs, signal: ctx.signal }));
+    } catch (e) {
+      if (e instanceof PartialEmissionError) report(e.result);
+      throw e;
+    }
   };
 }

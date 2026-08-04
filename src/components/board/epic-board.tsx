@@ -18,7 +18,14 @@ import {
 } from "@dnd-kit/core";
 import { restrictToWindowEdges } from "@dnd-kit/modifiers";
 
-import { STAGES, type Board, type Epic, type MoveRequest, type Stage } from "@/lib/types";
+import {
+  STAGES,
+  type Board,
+  type Epic,
+  type EscalationView,
+  type MoveRequest,
+  type Stage,
+} from "@/lib/types";
 import { EpicCard } from "@/components/board/epic-card";
 import { BoardColumn } from "@/components/board/board-column";
 import { BoardSkeleton } from "@/components/board/board-skeleton";
@@ -37,8 +44,8 @@ import { BoardGroupingToggle } from "@/components/board/board-grouping-toggle";
 import { EpicLaneView, LaneStageStrip } from "@/components/board/epic-lane";
 import { useBoardGrouping } from "@/lib/use-board-grouping";
 import { SyncStatusBadge } from "@/components/board/sync-status-badge";
-import { HygienePanel } from "@/components/board/hygiene-panel";
-import { ReviewTrajectoryPanel } from "@/components/board/review-trajectory-panel";
+import { AttentionStrip } from "@/components/board/attention-strip";
+import { ReviewTrendPill } from "@/components/board/review-trend-pill";
 import { ScanHealthPanel } from "@/components/board/scan-health-panel";
 import { Button } from "@/components/ui/button";
 import { TicketDialog } from "@/components/ticket/ticket-dialog";
@@ -55,10 +62,17 @@ const BOARD_POLL_MS = 30_000;
 export function EpicBoard({
   slug,
   initialBoard,
+  escalations = [],
   budgetAware = false,
 }: {
   slug: string;
   initialBoard: Board | null;
+  /**
+   * Open escalations, server-rendered by the page (anton-ue90.1). They are merged with the polled
+   * hygiene report into one ranked strip, so they have to reach the same component — and they are
+   * answered by an action that reloads the page, so they don't need the board's poll.
+   */
+  escalations?: EscalationView[];
   /** Project budget-aware flag (anton-y2ue): when on, cards offer Approve (immediate) vs Queue (paced). */
   budgetAware?: boolean;
 }) {
@@ -294,17 +308,26 @@ export function EpicBoard({
             ))}
           </select>
         </label>
+        {/* A trend is not an alert, so it sits on the toolbar rather than in a band of its own; the
+            attention strip below promotes only a rework-band worst score into a row. */}
+        <ReviewTrendPill slug={slug} trajectory={board.reviewTrajectory} />
         <SyncStatusBadge sync={board.sync} />
       </div>
-      {/* Inside the board, not on the page: the report rides the board payload, so it refreshes on
-          the same 304-friendly poll as the cards instead of going stale until a reload. A finding's
-          bead opens the same detail dialog the standalone chips use. */}
-      <HygienePanel report={board.hygiene} onOpenBead={setOpenTicketId} />
-      {/* Alongside hygiene, and for the same reason: the trend rides the board payload, so it moves
-          on the same poll as the scores its cards carry. */}
-      <ReviewTrajectoryPanel slug={slug} trajectory={board.reviewTrajectory} />
-      {/* The third supervision surface, and the one that looks OUTWARD: hygiene says how the board
-          is kept, the trajectory how the runs scored, this how the codebase itself is trending. */}
+      {/* Inside the board, not on the page: hygiene and the trend ride the board payload, so they
+          refresh on the same 304-friendly poll as the cards instead of going stale until a reload.
+          Escalations come from the page's server render — they are answered by an action that
+          reloads, not by a poll. A finding's bead opens the same detail dialog the standalone chips
+          use. */}
+      <AttentionStrip
+        slug={slug}
+        escalations={escalations}
+        hygiene={board.hygiene}
+        trajectory={board.reviewTrajectory}
+        onOpenBead={setOpenTicketId}
+      />
+      {/* The strip above says what needs answering on the board; this looks OUTWARD at the codebase
+          itself. A trend is not an alert, so it stays a single line below the strip rather than
+          competing with it for the operator's attention. */}
       <ScanHealthPanel health={board.scanHealth} />
       {lanes ? (
         // The lanes share one horizontal scroller so every lane's stage columns line up under the

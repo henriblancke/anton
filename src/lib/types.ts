@@ -37,6 +37,12 @@ export type {
 } from "./scan-health";
 export type { ScanSeverity, SignalClass } from "./scan-severity";
 
+// An open escalation and the stall class it was raised from, re-exported for the same reason: the
+// attention strip is a client component (it rides the board poll alongside hygiene), and both
+// lib/escalations and lib/run-health reach the database.
+export type { EscalationResolution, EscalationStatus, EscalationView } from "./escalations";
+export type { RunHealthFindingKind } from "./run-health";
+
 export type Stage = "backlog" | "implementing" | "in-review" | "done";
 export const STAGES: Stage[] = ["backlog", "implementing", "in-review", "done"];
 

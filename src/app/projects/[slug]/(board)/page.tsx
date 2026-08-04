@@ -3,7 +3,6 @@ import { Suspense } from "react";
 import { getProjectBySlug, getProjectSettingsBySlug } from "@/lib/projects";
 import { EpicBoard } from "@/components/board/epic-board";
 import { BoardSkeleton } from "@/components/board/board-skeleton";
-import { EscalationsPanel } from "@/components/board/escalations-panel";
 import { Topbar } from "@/components/shell/topbar";
 import { getBoard } from "@/lib/board";
 import { openEscalations } from "@/lib/escalations";
@@ -32,13 +31,17 @@ export default async function ProjectBoardPage({
     <div className="flex min-h-0 flex-1 flex-col">
       <Topbar projectSlug={slug} projectName={project?.name} />
       <div className="flex min-h-0 flex-1 flex-col p-[18px]">
-        {/* Above the columns on purpose: an escalation is work that has STOPPED, and the board is
-            where the operator decides what runs next. It renders nothing when there are none. */}
-        <EscalationsPanel slug={slug} escalations={escalations} />
-        {/* The board reads its Epic/Area narrowing from the URL (useSearchParams), which needs a
-            Suspense boundary so the shell above it isn't dragged into client-side rendering. */}
+        {/* Escalations are handed to the board rather than rendered here: they are one severity band
+            of the attention strip, alongside the polled hygiene report (anton-ue90.1). The board
+            reads its Epic/Area narrowing from the URL (useSearchParams), which needs a Suspense
+            boundary so the shell above it isn't dragged into client-side rendering. */}
         <Suspense fallback={<BoardSkeleton />}>
-          <EpicBoard slug={slug} initialBoard={board} budgetAware={settings.budgetAware === true} />
+          <EpicBoard
+            slug={slug}
+            initialBoard={board}
+            escalations={escalations}
+            budgetAware={settings.budgetAware === true}
+          />
         </Suspense>
       </div>
     </div>

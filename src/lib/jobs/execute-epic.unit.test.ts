@@ -13,8 +13,11 @@ import {
   inactiveAgentTickets,
   mergeGatePlan,
   reviewParkMessage,
+  runTargetDrift,
   splitFormulaPhases,
+  ticketSetDrift,
 } from "./execute-epic";
+import { runTickets } from "../ticket-view";
 import { BUILTIN_STEPS, ticketPrompt } from "./step-registry";
 import type { ResolvedStep } from "./run-formula";
 
@@ -129,6 +132,73 @@ describe("inactiveAgentTickets", () => {
       { id: "t-1", agent: "docker" },
       { id: "t-2", agent: "alembic" },
     ]);
+  });
+});
+
+describe("ticketSetDrift — the selection-to-lease window (anton-e42l)", () => {
+  // A run picks its tickets before it publishes the lease that makes it visible, so for that window
+  // the target reads as free to an approved gardener re-parent. The newcomer is never dispatched and
+  // merge finalization closes it unrun — so the run re-confirms its set once the lease is live, and
+  // a set that moved has to retry rather than run the stale half of the race.
+  it("names a ticket attached to the target while the run was starting", () => {
+    expect(ticketSetDrift([ticket("t-1")], [ticket("t-1"), ticket("t-2")])).toBe("attached t-2");
+  });
+
+  it("names one pulled out of the target too — the same race, the other direction", () => {
+    expect(ticketSetDrift([ticket("t-1"), ticket("t-2")], [ticket("t-1")])).toBe("detached t-2");
+  });
+
+  it("reports both sides when a re-parent swapped one for another", () => {
+    expect(ticketSetDrift([ticket("t-1")], [ticket("t-2")])).toBe("attached t-2; detached t-1");
+  });
+
+  it("catches a standalone target that gained its first child — the shape changed too", () => {
+    expect(ticketSetDrift([], [ticket("t-1")])).toBe("attached t-1");
+  });
+
+  // runTickets filters on shape, not state, so a ticket another machine merely closed is in both
+  // sets. Tripping on it would retry every run that races an ordinary cross-machine close.
+  it("does not trip on a ticket whose STATE changed, or on ordering", () => {
+    const closed = { ...ticket("t-2"), status: "closed" } as Bead;
+    expect(ticketSetDrift([ticket("t-1"), ticket("t-2")], [closed, ticket("t-1")])).toBeUndefined();
+  });
+});
+
+describe("runTargetDrift — the target's own shape in that same window (anton-e42l)", () => {
+  const bead = (id: string, extra: Partial<Bead> = {}): Bead =>
+    ({ id, title: id, status: "open", issue_type: "task", ...extra }) as Bead;
+
+  // The case ticketSetDrift structurally cannot see: a parentless task has no tickets before OR
+  // after the move, so the set check stays silent while the bead itself became someone else's
+  // ticket — and this run would execute it alongside the run that now owns it.
+  it("catches a parentless task re-parented under another card mid-startup", () => {
+    const board = [bead("t-1", { parent: "epic-1" }), bead("epic-1", { issue_type: "epic" })];
+    expect(ticketSetDrift([], runTickets(board, "t-1"))).toBeUndefined();
+    expect(runTargetDrift("t-1", board)).toBe("it now hangs under epic-1, whose run owns it as a ticket");
+  });
+
+  it("catches a legacy epic that gained a feature child — a container is nobody's run", () => {
+    const board = [
+      bead("epic-1", { issue_type: "epic" }),
+      bead("f-1", { issue_type: "feature", parent: "epic-1" }),
+    ];
+    expect(runTargetDrift("epic-1", board)).toMatch(/container epic/);
+  });
+
+  it("catches a target re-typed into something anton never runs on its own", () => {
+    expect(runTargetDrift("c-1", [bead("c-1", { issue_type: "chore" })])).toBe(
+      'its type is now "chore", which anton never runs on its own',
+    );
+  });
+
+  it("catches a target that left the board entirely", () => {
+    expect(runTargetDrift("t-1", [bead("other")])).toBe("it is no longer on the board");
+  });
+
+  it("stays silent for a target that is still a run target", () => {
+    const board = [bead("f-1", { issue_type: "feature" }), bead("t-1", { parent: "f-1" })];
+    expect(runTargetDrift("f-1", board)).toBeUndefined();
+    expect(runTargetDrift("t-1", board)).toBe("it now hangs under f-1, whose run owns it as a ticket");
   });
 });
 

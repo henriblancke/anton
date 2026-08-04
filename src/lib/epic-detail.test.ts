@@ -6,13 +6,16 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { beads } from "./beads/bd";
+import { withBeadWriteLock } from "./beads/claim-lock";
 import { allIssues } from "./beads/issues";
 import { resetIssueSnapshots } from "./beads/snapshot";
 import * as db from "./db";
-import { getEpicDetail } from "./epic-detail";
+import { DeleteConflictError, deleteEpic, getEpicDetail } from "./epic-detail";
 import * as runs from "./runs";
 import type { Bead } from "./beads/bd";
 import type { Project } from "./types";
+
+vi.mock("./beads/sync-nudge", () => ({ nudgeSync: vi.fn() }));
 
 const project: Project = {
   id: "p",
@@ -160,5 +163,87 @@ describe("getEpicDetail feature targets", () => {
 
     expect(detail.tickets.map((t) => t.id)).toEqual(["f-1"]);
     expect(detail.edges).toEqual([]);
+  });
+});
+
+/**
+ * The delete cascade's serialization (anton-e42l review). `bd delete --cascade` erases the epic's
+ * whole subtree, so it has to hold the same per-bead write locks the gardener's apply takes for the
+ * bead it moves and the card it moves it under — otherwise a re-parent can land inside the delete
+ * and lose its subject, while its proposal still closes as applied.
+ */
+describe("deleteEpic cascade serialization", () => {
+  const subtree = () => [
+    bead({ id: "e-1", title: "Epic", issue_type: "epic" }),
+    bead({ id: "f-1", title: "Feature", issue_type: "feature", parent: "e-1" }),
+    bead({ id: "t-1", title: "Task", parent: "f-1" }),
+  ];
+
+  beforeEach(() => resetIssueSnapshots());
+  afterEach(() => vi.restoreAllMocks());
+
+  it("deletes the epic with --cascade once the locks are held", async () => {
+    fakeBd(subtree());
+    const del = vi.spyOn(beads, "delete").mockResolvedValue(undefined as never);
+
+    await deleteEpic(project, "e-1");
+
+    expect(del).toHaveBeenCalledWith("/repo", "e-1", { cascade: true });
+  });
+
+  // The nested FEATURE, not just the epic: a gardener re-parent whose home is a feature under this
+  // epic locks only that feature, so a delete holding the epic's lock alone would serialize nothing.
+  it("waits on the write lock of a bead nested under the epic", async () => {
+    fakeBd(subtree());
+    const del = vi.spyOn(beads, "delete").mockResolvedValue(undefined as never);
+
+    let releaseHolder!: () => void;
+    const held = withBeadWriteLock(
+      "/repo",
+      "f-1",
+      () => new Promise<void>((resolve) => (releaseHolder = resolve)),
+    );
+
+    const deleting = deleteEpic(project, "e-1");
+    await new Promise((r) => setImmediate(r));
+    expect(del).not.toHaveBeenCalled(); // blocked behind the descendant's lock
+
+    releaseHolder();
+    await held;
+    await deleting;
+    expect(del).toHaveBeenCalledTimes(1);
+  });
+
+  // The race the lock alone can't answer: the lock set was chosen from a pre-lock board, so a bead
+  // attached after it would be erased while this call holds no lock on it.
+  it("refuses and writes nothing when work is attached under the epic while it lands", async () => {
+    const board = subtree();
+    const shown = new Map(board.map((b) => [b.id, b]));
+    vi.spyOn(beads, "show").mockImplementation(async (_cwd, id) => {
+      const found = shown.get(id);
+      if (!found) throw new Error(`no such bead ${id}`);
+      return found;
+    });
+    let reads = 0;
+    vi.spyOn(beads, "list").mockImplementation(async () => {
+      reads += 1;
+      // The second read is the one taken under the locks — a re-parent landed in between.
+      return reads === 1 ? board : [...board, bead({ id: "t-9", title: "Newcomer", parent: "f-1" })];
+    });
+    const del = vi.spyOn(beads, "delete").mockResolvedValue(undefined as never);
+
+    const refusal = await deleteEpic(project, "e-1").catch((e: unknown) => e);
+    expect(refusal).toBeInstanceOf(DeleteConflictError);
+    expect((refusal as Error).message).toMatch(/attached t-9/); // the newcomer is named for the operator
+    expect(del).not.toHaveBeenCalled();
+  });
+
+  it("refuses rather than deleting blind when the board read fails", async () => {
+    fakeBd(subtree());
+    vi.spyOn(beads, "list").mockRejectedValue(new Error("dolt is locked"));
+    const del = vi.spyOn(beads, "delete").mockResolvedValue(undefined as never);
+
+    await expect(deleteEpic(project, "e-1")).rejects.toThrow(DeleteConflictError);
+    expect(del).not.toHaveBeenCalled();
   });
 });

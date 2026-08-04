@@ -2187,6 +2187,14 @@ export const beads = {
       description?: string; // the whole contract markdown (Goal / Acceptance / Context / …)
       labels?: string[]; // e.g. ["area:reports", "domain:eng"] — set at create time, not patched after
       deps?: string[]; // e.g. ["parent-child:bd-100"]
+      /**
+       * Custom metadata, set in the SAME write as the bead (`bd create --metadata <json>`) rather
+       * than patched after: a bead whose machine-readable payload arrives in a second write has a
+       * window in which it exists without it, and a reader that lands there can only guess. Nested
+       * objects round-trip through `bd show --json` and `bd list --json` (measured on 1.1.2), which
+       * is what lets a gardener proposal carry its move as data instead of prose (anton-1t3n).
+       */
+      metadata?: Record<string, unknown>;
     },
   ): Promise<string> {
     const args = ["create", opts.title, "--type", opts.type];
@@ -2196,6 +2204,7 @@ export const beads = {
     if (opts.labels?.length) args.push("--labels", opts.labels.join(","));
     if (opts.deps?.length) args.push("--deps", opts.deps.join(","));
     if (opts.description) args.push("--description", opts.description);
+    if (opts.metadata) args.push("--metadata", JSON.stringify(opts.metadata));
     args.push("--json"); // plain output appends tips/status lines after the id; JSON is clean
     const out = await bdWrite(cwd, args);
     const parsed = JSON.parse(out);
@@ -2212,6 +2221,24 @@ export const beads = {
 
   link: (cwd: string, a: string, b: string, type: string) =>
     bdWrite(cwd, ["link", a, b, "--type", type]),
+
+  /**
+   * Move a bead under a new parent (`bd update --parent`), or — with an empty `parentId` — detach
+   * it entirely, which is bd's own clear-the-field form and therefore the undo of a re-parent that
+   * has to be rolled back (see gardener/apply.ts). One write per bead: bd's batch grammar has no
+   * parent key, so a multi-bead regroup is N writes and the caller owns their atomicity.
+   */
+  reparent: (cwd: string, id: string, parentId: string) =>
+    bdWrite(cwd, ["update", id, "--parent", parentId]),
+
+  /**
+   * Close a bead as SUPERSEDED by another (`bd supersede <id> --with <replacement>`) — closed, plus
+   * a `supersedes` edge naming where the work actually landed. Distinct from a plain close, whose
+   * reason is prose: the survivor's id is the record, so a reader following the graph finds it
+   * without parsing anything.
+   */
+  supersede: (cwd: string, id: string, replacementId: string) =>
+    bdWrite(cwd, ["supersede", id, "--with", replacementId]),
 
   /** Attach the PR to the bead as its external reference (git-shareable). */
   setExternalRef: (cwd: string, id: string, ref: string) =>
@@ -2282,7 +2309,14 @@ export const beads = {
       LABELS.reviewScore(score),
     ]),
 
-  close: (cwd: string, id: string) => bdWrite(cwd, ["close", id]),
+  /**
+   * Close a bead as DONE. `reason` is bd's own close reason — the durable record of what settled it,
+   * which a plain close leaves blank. Deliberately NOT the abandon path: a reason here describes
+   * work that landed, while a won't-do outcome goes through {@link beads.abandon}, which also labels
+   * the bead so nothing downstream reads it as shipped.
+   */
+  close: (cwd: string, id: string, reason?: string) =>
+    bdWrite(cwd, ["close", id, ...(reason?.trim() ? ["--reason", reason.trim()] : [])]),
 
   /**
    * Apply several board writes as ONE `bd batch` transaction (anton-aijz): every op lands or none

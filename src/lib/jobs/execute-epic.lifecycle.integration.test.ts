@@ -14,6 +14,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { beads } from "../beads/bd";
+import { withBeadWriteLock } from "../beads/claim-lock";
 import { loadAllIssues } from "../beads/issues";
 import { epicStandaloneBlockers, standaloneBlockers } from "../epic-graph";
 import * as schema from "../db/schema";
@@ -616,5 +617,55 @@ process.exit(0);`,
     } finally {
       process.env.ANTON_GH_BIN = okGh;
     }
+  });
+
+  // The gardener's other half (gardener/apply.ts `applyStep`) holds the HOME's per-bead write lock
+  // across its `homeUnusable` re-check AND its write, and it yields in between. A run that published
+  // its lease and confirmed its ticket set outside that lock could slot both into exactly that gap:
+  // it would confirm the OLD set and start, then the delayed re-parent attaches a ticket nothing
+  // dispatches, later closed unrun with the target. So the publish and the confirmation have to hold
+  // the target's lock too — which is what this pins (anton-e42l).
+  it("publishes its run-lease only under the TARGET's write lock, not alongside a gardener apply", async () => {
+    const bugId = await beads.create(repo, {
+      title: "Locked while a proposal applies",
+      type: "bug",
+      acceptance: "work file exists",
+      description: "## Goal\nProve the lease waits on the target's write lock.",
+    });
+    await beads.approve(repo, bugId);
+
+    const runner = makeEpicRunner(ctx);
+    // Stand in for an apply mid-flight: the lock is held, nothing has been written yet.
+    let release!: () => void;
+    const apply = withBeadWriteLock(repo, bugId, () => new Promise<void>((r) => (release = r)));
+
+    const jobId = await enqueueEpicJob(runner, { projectId, epicBeadId: bugId });
+    const settled = tickToIdle(runner);
+
+    // Wait until the run has walked every gate BEFORE the lock — the cooked pipeline is recorded on
+    // the run row in the statement immediately preceding it — then give the publish that follows it
+    // ample time to land. Without the lock the lease is on the board by now. Released in `finally`
+    // whatever happens: a lock left held would hang the runner this suite shares.
+    try {
+      const deadline = Date.now() + 60_000;
+      let recorded = false;
+      while (!recorded && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 100));
+        recorded = (await tdb.db.select().from(schema.runs)).some(
+          (r) => r.epicBeadId === bugId && r.formula !== null,
+        );
+      }
+      expect(recorded).toBe(true); // the run reached the lock rather than parking short of it
+      await new Promise((r) => setTimeout(r, 2_000));
+
+      expect(beads.runLeaseLabels(await beads.show(repo, bugId))).toEqual([]);
+    } finally {
+      // Released — the run takes the lock the apply just gave up and carries the target to its PR.
+      release();
+    }
+    await apply;
+    expect(await settled).toBe(1);
+    expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+    expect(beads.getPrRef(await beads.show(repo, bugId))).toBe("gh-42");
   });
 });

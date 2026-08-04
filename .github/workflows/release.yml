@@ -63,7 +63,7 @@ jobs:
       # mismatch for users on other Node majors, but this makes the common (current-Node) case just work.
       - uses: actions/setup-node@v7
         with:
-          node-version: "24.18.0"
+          node-version: "24.18.1"
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: "1.3.14"

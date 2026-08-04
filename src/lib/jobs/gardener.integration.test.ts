@@ -5,10 +5,13 @@
  * The unit suite pins the pass's shape with bd stubbed; only a live board can prove the two claims
  * that actually matter to a founder:
  *
- *   1. the epic whose children are all closed IS closed, and its report says so; and
+ *   1. the epic whose children are all closed IS closed, and its report says so;
  *   2. NOTHING ELSE ON THE BOARD MOVED. The patrol sees stale beads, duplicates and orphans, and is
  *      entitled to act on none of them — so the board is snapshotted before and after and compared
- *      bead by bead. That assertion is the whole safety case for arming this job.
+ *      bead by bead. That assertion is the whole safety case for arming this job. What it may ADD is
+ *      a proposal: a new bead asking a human, never a change to one of theirs; and
+ *   3. the proposal is a REAL BEAD — bd round-trips its contract, labels and `discovered-from` edges
+ *      — and the patrol asks ONCE: a second pass over the same board files nothing (anton-9qwq).
  */
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -18,8 +21,10 @@ import { afterAll, beforeAll, expect, it, vi } from "vitest";
 
 import { describeBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
 import { driveJob, expectJobStatus } from "@/lib/testing/jobs";
-import { beads } from "../beads/bd";
+import { beads, type Bead } from "../beads/bd";
+import { contractGaps } from "../beads/contract";
 import { resetIssueSnapshots } from "../beads/snapshot";
+import { isProposalBead } from "../gardener/detections";
 import * as schema from "../db/schema";
 import { makeTestDb, type TestDb } from "../db/testing";
 import { getHygieneReportForJob, type HygieneReport } from "../hygiene";
@@ -54,8 +59,26 @@ describeBd("gardener patrol e2e (real handler · real bd)", () => {
       (await beads.list(repo, ["--status", "all"])).map((b) => [b.id, b.status ?? ""]),
     );
 
+  /** Every gardener proposal currently on the board, read back through bd like any other bead. */
+  const proposals = async (): Promise<Bead[]> =>
+    (await beads.list(repo, ["--status", "all"])).filter(isProposalBead);
+
+  /** One patrol, driven to settlement; returns its job id. */
+  const patrol = async (): Promise<string> => {
+    const jobId = await driveJob({
+      db: tdb.db,
+      clock,
+      type: "gardener",
+      handler: ({ db, clock: c }) => makeGardenerHandler({ db, clock: c, nudge }),
+      projectId,
+    });
+    await expectJobStatus(tdb.db, jobId, "done");
+    return jobId;
+  };
+
   let before: Record<string, string>;
   let report: HygieneReport | undefined;
+  let proposalsAfterFirst: Bead[];
 
   beforeAll(async () => {
     repoDir = makeBdRepo();
@@ -135,16 +158,14 @@ describeBd("gardener patrol e2e (real handler · real bd)", () => {
     });
 
     before = await boardStatuses();
-    const jobId = await driveJob({
-      db: tdb.db,
-      clock,
-      type: "gardener",
-      handler: ({ db, clock: c }) => makeGardenerHandler({ db, clock: c, nudge }),
-      projectId,
-    });
-    await expectJobStatus(tdb.db, jobId, "done");
+    const jobId = await patrol();
     report = await getHygieneReportForJob(tdb.db, jobId);
-  }, 120_000);
+    proposalsAfterFirst = await proposals();
+
+    // A second pass over the same board: everything the first one found is still true, so the
+    // fingerprints it filed are what must keep it quiet.
+    await patrol();
+  }, 180_000);
 
   afterAll(() => {
     resetIssueSnapshots();
@@ -173,8 +194,12 @@ describeBd("gardener patrol e2e (real handler · real bd)", () => {
 
   it("mutates NOTHING else: the eligible epic is the board's only change", async () => {
     const after = await boardStatuses();
-    expect(Object.keys(after).sort()).toEqual(Object.keys(before).sort());
+    // The only ids the patrol may ADD are its own proposals — beads asking a human, not changes to
+    // anyone's work.
+    const added = Object.keys(after).filter((id) => !(id in before));
+    expect(added.sort()).toEqual((await proposals()).map((p) => p.id).sort());
     for (const [id, status] of Object.entries(after)) {
+      if (added.includes(id)) continue;
       expect({ id, status }).toEqual({
         id,
         status: id === eligibleEpic ? "closed" : before[id],
@@ -190,5 +215,62 @@ describeBd("gardener patrol e2e (real handler · real bd)", () => {
 
   it("nudges the sync coalescer, because it wrote to the board", () => {
     expect(nudge).toHaveBeenCalledWith({ id: projectId, repoPath: repo });
+  });
+
+  it("proposes retiring the shipped orphan — the judgment bd's report can only describe", () => {
+    // `untemplated` is named by a commit and still open: closing it is a decision, so the patrol
+    // asks rather than acts (the assertion above proves the bead itself never moved).
+    const proposal = proposalsAfterFirst.find((p) =>
+      p.labels?.some((l) => l.startsWith("gardener:shipped-orphan:")),
+    );
+    expect(proposal?.title).toContain(untemplated);
+    expect(proposal?.status).toBe("open");
+    // bd round-trips the whole contract, so the board renders it like any other bead.
+    expect(contractGaps([proposal as Bead], "blocking")).toEqual([]);
+    expect(contractGaps([proposal as Bead], "advisory")).toEqual([]);
+    // Provenance: the proposal is reachable from the bead it concerns.
+    expect(beads.edgesOf([proposal as Bead])).toContainEqual({
+      from: proposal?.id,
+      to: untemplated,
+      type: "discovered-from",
+    });
+  });
+
+  it("asks once: a second patrol over the same board files no duplicate proposal", async () => {
+    expect(proposalsAfterFirst.length).toBeGreaterThan(0);
+    expect((await proposals()).map((p) => p.id).sort()).toEqual(
+      proposalsAfterFirst.map((p) => p.id).sort(),
+    );
+  });
+
+  // The one duplicate suppression cannot prevent: two patrols on different machines each check a
+  // working set the other's create has not synced into yet. Seeded by hand — a second bead carrying
+  // a fingerprint the board already holds — because that is the only way to reach the state locally.
+  it("folds a claim filed twice back to one ask, plainly closed", async () => {
+    const standing = proposalsAfterFirst[0];
+    const fingerprint = standing.labels?.find((l) => l.startsWith("gardener:")) as string;
+    const twin = await beads.create(repo, {
+      title: `${standing.title} (filed by the other machine)`,
+      type: "task",
+      acceptance: "- [ ] the same ask as its twin",
+      description: standing.description,
+      labels: [fingerprint],
+    });
+
+    await patrol();
+
+    const after = await beads.list(repo, ["--status", "all"]);
+    const pair = [standing.id, twin].map((id) => after.find((b) => b.id === id) as Bead);
+    const [folded, kept] = pair.every((b) => b !== undefined)
+      ? [pair.find((b) => b.status === "closed"), pair.find((b) => b.status !== "closed")]
+      : [];
+
+    // Which one survives is decided by a total order, not by filing time — the point is that exactly
+    // one ask is left standing and the other names it.
+    expect(kept?.status).toBe("open");
+    expect(folded?.id).toBeDefined();
+    // Plainly closed, never abandoned: abandonment is a human's "no", and it would suppress the
+    // fingerprint the survivor is still asking about.
+    expect(beads.isAbandoned(folded as Bead)).toBe(false);
   });
 });
