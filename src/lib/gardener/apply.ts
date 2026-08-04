@@ -81,6 +81,10 @@ export type ApplyStep =
        * window before its lease is published reads as unowned to {@link isInFlight}, and it has
        * already selected the tickets it will work through — so work attached now rides along unrun
        * and is stranded the moment that run settles the card.
+       *
+       * Only ever a claim that PREDATES the filing: `planReparent` refuses a home claimed since (see
+       * {@link claimedSinceFiling}), which is what stops a newcomer's claim from being recorded here
+       * as its own baseline and then compared against itself under the lock.
        */
       parentClaim: string;
     })
@@ -174,6 +178,13 @@ function planReparent(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): A
   // `applyStep`, so the snapshot decision and the write refuse the same home for the same reason.
   const homeGone = homeUnusable(target, nowMs);
   if (homeGone) return { status: "refuse", reason: homeGone };
+  // The home's half of the claim window no liveness signal covers — and the check the step's
+  // `parentClaim` baseline rests on. A run that picked the target up AFTER the filing reads as free
+  // to `homeUnusable`, so without this the step would record that newcomer's claim as its own
+  // baseline and the under-lock re-check ({@link homeClaimed}) would compare it against itself and
+  // wave the move through, hanging tickets under a run that has already chosen what it will run.
+  const homeTaken = claimedSinceFiling(target, at, "hanging work under it", CLAIM_COST.home);
+  if (homeTaken) return { status: "refuse", reason: homeTaken };
   // The same bar the detector proposes against: a home must be a BOARD CARD, or the move recreates
   // the very state (work riding no card) the proposal exists to fix.
   if (!index.cards.ids.has(plan.target)) {
@@ -198,7 +209,7 @@ function planReparent(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): A
     if (isInFlight(subject, nowMs)) {
       return { status: "refuse", reason: inFlightReason(subject, nowMs, "moving it") };
     }
-    const claimed = claimedSinceFiling(subject, at, "moving it");
+    const claimed = claimedSinceFiling(subject, at, "moving it", CLAIM_COST.subject);
     if (claimed) return { status: "refuse", reason: claimed };
     const rehomed = reparentPremiseGone(plan, subject, index);
     if (rehomed) return { status: "refuse", reason: rehomed };
@@ -272,7 +283,7 @@ function planLink(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): Apply
   if (isInFlight(blocked, nowMs)) {
     return { status: "refuse", reason: inFlightReason(blocked, nowMs, "recording it as blocked") };
   }
-  const claimed = claimedSinceFiling(blocked, at, "recording it as blocked");
+  const claimed = claimedSinceFiling(blocked, at, "recording it as blocked", CLAIM_COST.subject);
   if (claimed) return { status: "refuse", reason: claimed };
   // The blocker already waits on the blocked bead through other beads: no direct edge, so the pair
   // read as unrelated above, but this edge would close the loop — and bd rejects a blocking cycle at
@@ -329,7 +340,7 @@ function planRetire(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): App
   if (isInFlight(subject, nowMs)) {
     return { status: "refuse", reason: inFlightReason(subject, nowMs, "retiring it") };
   }
-  const claimed = claimedSinceFiling(subject, at, "retiring it");
+  const claimed = claimedSinceFiling(subject, at, "retiring it", CLAIM_COST.subject);
   if (claimed) return { status: "refuse", reason: claimed };
   // The premise `detectStale` filed on is that NOTHING has touched this bead (retire.ts), and that
   // premise is the one thing a fresh board read alone cannot confirm — silence is a claim about the
@@ -403,7 +414,20 @@ function writtenSinceFiling(subject: Bead, at: ApplyMoment): boolean | undefined
 }
 
 /**
- * Why a run claim taken SINCE the proposal was filed bars this move, or undefined.
+ * What a claim taken since the filing costs, per END of the move. The subject is written to, so its
+ * run loses the bead out from under it; a re-parent's HOME is not written to at all — there the
+ * damage is to the work being attached, which a run that has already selected its tickets will
+ * never pick up.
+ */
+const CLAIM_COST = {
+  subject: "would pull the bead out from under the run that owns it",
+  home: "would leave that work riding along unrun, because the run has already selected the tickets it will work through",
+} as const;
+
+/**
+ * Why a run claim taken SINCE the proposal was filed bars this move, or undefined. Asked of BOTH
+ * ends of a move — the bead being written to and the home it would be attached under — because the
+ * blind spot below is a property of the claim, not of which side of the move the bead sits on.
  *
  * {@link isInFlight} is blind to a pickup for longer than it looks: `beads.claimVerified` writes the
  * assignee and `in_progress` first and publishes the run-lease afterwards, and a grouped run's child
@@ -415,7 +439,12 @@ function writtenSinceFiling(subject: Bead, at: ApplyMoment): boolean | undefined
  * while one already there at filing is the very thing being proposed against ({@link StepSubject}
  * carries it forward as the step's baseline).
  */
-function claimedSinceFiling(subject: Bead, at: ApplyMoment, doing: string): string | undefined {
+function claimedSinceFiling(
+  subject: Bead,
+  at: ApplyMoment,
+  doing: string,
+  cost: string,
+): string | undefined {
   const claim = runClaimOf(subject);
   if (!claim) return undefined;
   const since = writtenSinceFiling(subject, at);
@@ -424,7 +453,7 @@ function claimedSinceFiling(subject: Bead, at: ApplyMoment, doing: string): stri
     since === undefined
       ? "nothing dates that claim against this proposal's filing"
       : "it was claimed since this proposal was filed";
-  return `${subject.id} is held by ${claim} and ${dated} — ${doing} would pull the bead out from under the run that owns it; decline it and act by hand if the claim is dead`;
+  return `${subject.id} is held by ${claim} and ${dated} — ${doing} ${cost}; decline it and act by hand if the claim is dead`;
 }
 
 /**

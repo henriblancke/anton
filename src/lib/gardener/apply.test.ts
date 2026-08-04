@@ -638,6 +638,36 @@ describe("planApply — what an approval means against the board as it now is", 
       expect(reason(unfiled)).toMatch(/nothing dates that claim/);
     });
 
+    // The HOME's half of the same window, and the one the step's `parentClaim` baseline rests on: a
+    // target claimed after the filing reads as free to every liveness signal, so approving would
+    // record that newcomer's claim as the step's own baseline — and the under-lock re-check, which
+    // compares against exactly that value, would then wave the move through and hang the tickets
+    // under a run that has already chosen what it will work through.
+    const heldHome = (make: (id: string, extra: Partial<Bead>) => Bead): Bead =>
+      make("anton-card", { issue_type: "feature", assignee: "runner-7", status: "in_progress" });
+
+    it("refuses to hang work under a home claimed since the filing", () => {
+      const home = heldHome(warm);
+      expect(reason(decide(REPARENT, [home, cold("anton-a")]))).toMatch(
+        /anton-card is held by runner-7 and it was claimed since this proposal was filed/,
+      );
+      expect(reason(decide(CLUSTER, [home, cold("anton-a"), cold("anton-b")]))).toMatch(
+        /riding along unrun/,
+      );
+    });
+
+    // Same rule as the subject's: the claim the plan was made against is not news, and a home whose
+    // claim predates the filing is the one `parentClaim` legitimately carries forward.
+    it("applies under a home whose claim the proposal was made against", () => {
+      expect(decide(REPARENT, [heldHome(cold), cold("anton-a")]).status).toBe("apply");
+    });
+
+    it("refuses a home claim nothing can date against the filing", () => {
+      expect(reason(decide(REPARENT, [heldHome(bead), cold("anton-a")]))).toMatch(
+        /nothing dates that claim/,
+      );
+    });
+
     // Approving would record that newer card as the step's own `undoParent` and write straight over
     // it — and the under-lock re-check, which compares against exactly that value, cannot object.
     it("refuses to re-home a subject somebody has already given a card", () => {
@@ -833,15 +863,12 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
   // The home's half of the window `isInFlight` cannot see: `bd --claim` writes assignee +
   // in_progress and publishes the lease a moment later, and a run that got that far has already
   // selected its tickets — so a subject attached now rides along unrun and strands when that run
-  // settles the card. A claim the PLAN itself saw is not news and still applies.
+  // settles the card. A claim the PLAN itself saw is not news and still applies — but only one the
+  // filing stamp can DATE as older than the ask, which is what keeps the baseline honest.
   it("refuses a home claimed after the snapshot, before its run-lease is published", async () => {
-    const claimedHome = bead(CARD.id, {
-      issue_type: "feature",
-      assignee: "runner-7",
-      status: "in_progress",
-    });
+    const held = { issue_type: "feature" as const, assignee: "runner-7", status: "in_progress" };
     const proposal = proposalFor(REPARENT);
-    liveBeads.set(CARD.id, claimedHome);
+    liveBeads.set(CARD.id, bead(CARD.id, held));
 
     await expect(apply(proposal, [CARD, bead("anton-a"), proposal])).rejects.toMatchObject({
       failure: "refused",
@@ -852,9 +879,10 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
 
     calls.length = 0;
     liveBeads.clear();
-    liveBeads.set(CARD.id, claimedHome);
+    const sawItClaimed = cold(CARD.id, held);
+    liveBeads.set(CARD.id, sawItClaimed);
     const again = proposalFor(REPARENT);
-    await expect(apply(again, [claimedHome, bead("anton-a"), again])).resolves.toMatchObject({
+    await expect(apply(again, [sawItClaimed, bead("anton-a"), again])).resolves.toMatchObject({
       changed: ["anton-a"],
     });
     expect(calls[0]).toBe("reparent anton-a anton-card");
