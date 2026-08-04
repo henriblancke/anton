@@ -101,6 +101,27 @@ describe("parseTouches", () => {
     expect(parseTouches(b)).toEqual(["Dockerfile", "Makefile", "src/lib/runs.ts"]);
   });
 
+  it("keeps the glob and directory surfaces the contract's own documented form uses", () => {
+    // `touches: app/reports/*` is skills/bd/SKILL.md's example. Stripping the `*` erased `app/*`
+    // and `src/**` entirely, so files a run already owns read as unowned to the next triage.
+    const b = bead({
+      id: "a-1",
+      context: "touches: app/reports/*, app/*, src/**/*.ts, src/lib/*.ts, src/components/",
+    });
+    expect(parseTouches(b)).toEqual([
+      "app/reports/*",
+      "app/*",
+      "src/**/*.ts",
+      "src/lib/*.ts",
+      "src/components/",
+    ]);
+  });
+
+  it("unwraps markdown emphasis without mistaking a trailing glob for it", () => {
+    const b = bead({ id: "a-1", context: "touches: **src/lib/runs.ts**, *src/x.ts:14*, src/api/*" });
+    expect(parseTouches(b)).toEqual(["src/lib/runs.ts", "src/x.ts", "src/api/*"]);
+  });
+
   it("still refuses the prose words that allowlist could have opened the door to", () => {
     expect(parseTouches(bead({ id: "a-1", context: "touches: auth, routing, the build" }))).toEqual([]);
   });

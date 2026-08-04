@@ -132,18 +132,33 @@ function contextOf(bead: Bead): string {
 const EXTENSIONLESS_ROOT_FILES =
   /^(Dockerfile|Containerfile|Makefile|Justfile|Taskfile|Procfile|Rakefile|Gemfile|Brewfile|Vagrantfile|Caddyfile|Jenkinsfile|CODEOWNERS)$/i;
 
+/**
+ * Markdown emphasis around a path (`**src/x.ts**`), which is BALANCED — the leading run of `*` is
+ * only decoration when the same run closes the token. An unbalanced `*` is a glob, and the contract's
+ * own documented form uses one (`touches: app/reports/*`, skills/bd/SKILL.md), so it is kept: deleting
+ * it turned `app/*` and `src/**` into nothing at all, leaving files a run already owns reading as
+ * unowned — the misroute this whole module exists to prevent.
+ */
+const MD_EMPHASIS = /^(\*+)(.+?)\1$/;
+
+/** A path-shaped token: a segment separator plus a segment, with globs allowed on either side. */
+const PATH_RE = /^[\w@.*/~-]*[/.][\w@.*/~-]+$/;
+/** A directory surface — `app/` — which {@link PATH_RE} would drop for want of a trailing segment. */
+const DIR_RE = /^[\w@.*~-][\w@.*/~-]*\/$/;
+
 /** A token that reads as a repo path rather than prose — the filter that keeps `touches:` usable. */
 function asPath(token: string): string | undefined {
   const cleaned = token
     .replace(/\([^)]*\)?/g, " ") // drop the "(54 lines, exports …)" annotations beads carry
-    .replace(/[`*"']/g, " ")
+    .replace(/[`"']/g, " ")
     .trim()
     .split(/\s+/)[0]
-    ?.replace(/:\d+(-\d+)?$/, "") // file:14 / file:28-42 — the surface is the file
+    ?.replace(MD_EMPHASIS, "$2")
+    .replace(/:\d+(-\d+)?$/, "") // file:14 / file:28-42 — the surface is the file
     .replace(/[.,;]+$/, "");
   if (!cleaned || cleaned.length > 200) return undefined;
   if (EXTENSIONLESS_ROOT_FILES.test(cleaned)) return cleaned;
-  return /^[\w@./~-]*[/.][\w@./~-]+$/.test(cleaned) ? cleaned : undefined;
+  return PATH_RE.test(cleaned) || DIR_RE.test(cleaned) ? cleaned : undefined;
 }
 
 /**
