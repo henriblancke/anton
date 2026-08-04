@@ -20,7 +20,11 @@
  *     because a snapshot is stale the instant it is taken, every bead a write rests on — the subject
  *     AND the home/blocker/survivor it points at — is re-read and re-judged under its own write lock
  *     immediately before the write, on the same lock a run's claim takes (see `applyStep`), so a
- *     lease published mid-approval orders against this apply instead of racing it.
+ *     lease published mid-approval orders against this apply instead of racing it. A fresh read is
+ *     not the whole answer either: it shows the board as it IS, never as it MOVED. So the two facts
+ *     it cannot express — that the bead's claim is the one the plan was made about, and that a
+ *     `stale` subject really has stayed silent — are settled against the PROPOSAL's own filing
+ *     stamp, the one filing-time fact bd already keeps and no hand-edited plan can rewrite.
  *   • NO PARTIAL SILENT STATE. The only multi-write move is a cluster re-parent, and its steps carry
  *     their own undo: a failure part-way rolls the applied prefix back and leaves the proposal OPEN
  *     with the error attached as a note. Applying a proposal is serialized on the PROPOSAL's own
@@ -34,7 +38,7 @@
  */
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { withBeadWriteLock, withBeadWriteLocks } from "../beads/claim-lock";
-import { indexBoard, isInFlight, isOpenWork, type BoardIndex } from "./board-index";
+import { indexBoard, isInFlight, isOpenWork, stampMsOf, type BoardIndex } from "./board-index";
 import {
   fingerprintLabelOf,
   isProposalBead,
@@ -109,6 +113,24 @@ export type ApplyDecision =
   | { status: "refuse"; reason: string };
 
 /**
+ * The two moments an approval sits between: when the patrol FILED the proposal — the board its
+ * evidence describes — and NOW, the board the writes would land on. Both are needed because a
+ * precondition re-checked only against the approval's fresh snapshot is blind to everything that
+ * moved BEFORE that snapshot was taken: the plan carries no state of its own to compare against, so
+ * the filing stamp is what dates a change as "since we asked".
+ */
+export interface ApplyMoment {
+  /** When the approval is being decided. */
+  nowMs: number;
+  /**
+   * When the proposal bead was created, or undefined when it carries no readable stamp. Undefined
+   * FAILS CLOSED wherever it is read: with nothing to date a change against, we cannot prove the
+   * board still reads as the approver was shown.
+   */
+  filedAtMs: number | undefined;
+}
+
+/**
  * Decide a plan against a board, writing nothing. Pure, so every precondition — the ones that
  * protect other people's beads — is testable from a fixture board rather than a live one.
  *
@@ -116,25 +138,27 @@ export type ApplyDecision =
  * `blocks` edges have to mean one thing on both halves of the loop, or a proposal could be filed
  * under one answer and applied under another.
  *
- * `nowMs` is the moment the approval is being decided; it only dates the run-lease check below.
+ * Two classes of precondition run here. SAFETY — is this bead free to write to — and PREMISE: is the
+ * board still the one the detector judged? The second exists because approval can come days after
+ * filing, and a proposal whose premise has been fixed by hand (an orphan re-homed, a stale bead
+ * picked back up) would otherwise apply a move for a problem that no longer exists — undoing the fix
+ * instead of the fault. Premise is re-derived from `plan.kind`, which the fingerprint binds, rather
+ * than from filing-time state the plan would have to carry.
  */
-export function planApply(
-  plan: GardenerPlan,
-  board: Bead[],
-  nowMs: number = Date.now(),
-): ApplyDecision {
+export function planApply(plan: GardenerPlan, board: Bead[], at: ApplyMoment): ApplyDecision {
   const index = indexBoard(board);
   switch (plan.move) {
     case "reparent":
-      return planReparent(plan, index, nowMs);
+      return planReparent(plan, index, at);
     case "link":
-      return planLink(plan, index, nowMs);
+      return planLink(plan, index, at);
     case "retire":
-      return planRetire(plan, index, nowMs);
+      return planRetire(plan, index, at);
   }
 }
 
-function planReparent(plan: GardenerPlan, index: BoardIndex, nowMs: number): ApplyDecision {
+function planReparent(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): ApplyDecision {
+  const { nowMs } = at;
   // A container-orphan detection with no single obvious home deliberately files WITHOUT a target —
   // it asks the approver to pick one. Approving it as-is would have to invent that answer.
   if (!plan.target) {
@@ -173,6 +197,10 @@ function planReparent(plan: GardenerPlan, index: BoardIndex, nowMs: number): App
     if (isInFlight(subject, nowMs)) {
       return { status: "refuse", reason: inFlightReason(subject, nowMs, "moving it") };
     }
+    const claimed = claimedSinceFiling(subject, at, "moving it");
+    if (claimed) return { status: "refuse", reason: claimed };
+    const rehomed = reparentPremiseGone(plan, subject, index);
+    if (rehomed) return { status: "refuse", reason: rehomed };
     // A parent that sits UNDER one of the subjects would make the subtree its own ancestor.
     if (index.isAncestor(id, plan.target)) {
       return {
@@ -201,7 +229,8 @@ function planReparent(plan: GardenerPlan, index: BoardIndex, nowMs: number): App
   };
 }
 
-function planLink(plan: GardenerPlan, index: BoardIndex, nowMs: number): ApplyDecision {
+function planLink(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): ApplyDecision {
+  const { nowMs } = at;
   const [id] = plan.subjects;
   if (plan.subjects.length !== 1 || !id) {
     return { status: "refuse", reason: "a link proposal names exactly one blocked bead" };
@@ -242,6 +271,8 @@ function planLink(plan: GardenerPlan, index: BoardIndex, nowMs: number): ApplyDe
   if (isInFlight(blocked, nowMs)) {
     return { status: "refuse", reason: inFlightReason(blocked, nowMs, "recording it as blocked") };
   }
+  const claimed = claimedSinceFiling(blocked, at, "recording it as blocked");
+  if (claimed) return { status: "refuse", reason: claimed };
   // The blocker already waits on the blocked bead through other beads: no direct edge, so the pair
   // read as unrelated above, but this edge would close the loop — and bd rejects a blocking cycle at
   // every write path, so applying it would only 500 and leave the proposal open forever.
@@ -259,7 +290,8 @@ function planLink(plan: GardenerPlan, index: BoardIndex, nowMs: number): ApplyDe
   };
 }
 
-function planRetire(plan: GardenerPlan, index: BoardIndex, nowMs: number): ApplyDecision {
+function planRetire(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): ApplyDecision {
+  const { nowMs } = at;
   const [id] = plan.subjects;
   if (plan.subjects.length !== 1 || !id) {
     return { status: "refuse", reason: "a retirement proposal names exactly one bead" };
@@ -295,6 +327,16 @@ function planRetire(plan: GardenerPlan, index: BoardIndex, nowMs: number): Apply
   // pull the bead out from under the run that is shipping it.
   if (isInFlight(subject, nowMs)) {
     return { status: "refuse", reason: inFlightReason(subject, nowMs, "retiring it") };
+  }
+  const claimed = claimedSinceFiling(subject, at, "retiring it");
+  if (claimed) return { status: "refuse", reason: claimed };
+  // The premise `detectStale` filed on is that NOTHING has touched this bead (retire.ts), and that
+  // premise is the one thing a fresh board read alone cannot confirm — silence is a claim about the
+  // moment the patrol looked. Re-confirmed against the filing stamp so approving a months-old ask
+  // cannot park work somebody has since picked back up.
+  if (plan.kind === "stale") {
+    const active = staleTouched(subject, at);
+    if (active) return { status: "refuse", reason: active };
   }
   // Settling a bead that still has open work under it strands that work: the children stay in the
   // ready set with a parent no run will ever reach — the unreachable state `detectContainerOrphans`
@@ -340,6 +382,88 @@ function planRetire(plan: GardenerPlan, index: BoardIndex, nowMs: number): Apply
     default:
       return { status: "refuse", reason: `unknown retirement verb "${plan.retireAs}"` };
   }
+}
+
+/**
+ * Has this bead been written to since the proposal was filed? `undefined` when either stamp is
+ * unreadable — the honest answer when there is nothing to compare, which every caller fails closed
+ * on. bd's own creation and write stamps are the only filing-time facts available here, and they are
+ * better than any the plan could carry: a hand-edited metadata blob cannot rewrite them.
+ *
+ * bd stamps at ONE-SECOND resolution, so a write landing in the very second the proposal was created
+ * reads as part of the board the patrol judged. That is the right way round: the window this closes
+ * is the hours or nights between a patrol and an approval, and the sub-second remainder is covered
+ * by the under-lock baseline ({@link StepSubject.claim}) like every other late arrival.
+ */
+function writtenSinceFiling(subject: Bead, at: ApplyMoment): boolean | undefined {
+  const writtenAt = stampMsOf(subject);
+  if (at.filedAtMs === undefined || writtenAt === undefined) return undefined;
+  return writtenAt > at.filedAtMs;
+}
+
+/**
+ * Why a run claim taken SINCE the proposal was filed bars this move, or undefined.
+ *
+ * {@link isInFlight} is blind to a pickup for longer than it looks: `beads.claimVerified` writes the
+ * assignee and `in_progress` first and publishes the run-lease afterwards, and a grouped run's child
+ * tickets never carry a lease of their own at all — the lease lives on the target they hang under.
+ * So "a run owns this right now" can be true while every liveness signal reads free.
+ *
+ * What separates that from the DEAD claim a retirement proposal is usually about is not the claim's
+ * shape but its age: a claim written after the patrol filed is news the approver was never shown,
+ * while one already there at filing is the very thing being proposed against ({@link StepSubject}
+ * carries it forward as the step's baseline).
+ */
+function claimedSinceFiling(subject: Bead, at: ApplyMoment, doing: string): string | undefined {
+  const claim = runClaimOf(subject);
+  if (!claim) return undefined;
+  const since = writtenSinceFiling(subject, at);
+  if (since === false) return undefined; // the claim the plan was made against, not a newer one
+  const dated =
+    since === undefined
+      ? "nothing dates that claim against this proposal's filing"
+      : "it was claimed since this proposal was filed";
+  return `${subject.id} is held by ${claim} and ${dated} — ${doing} would pull the bead out from under the run that owns it; decline it and act by hand if the claim is dead`;
+}
+
+/**
+ * Why the subject no longer has the parent shape its detection was based on, or undefined. Both
+ * re-parent kinds rest on one claim about where the bead sits — NO BOARD CARD CARRIES IT, whether it
+ * hangs off a container epic (`container-orphan`) or off nothing at all (`parentless-cluster`) — so
+ * that claim is re-derived from the fresh board rather than from a filing-time parent the plan would
+ * have to carry.
+ *
+ * A bead somebody has since given a card has already been answered, by a decision newer than the one
+ * being approved. Nothing downstream can object on its own: the step records that newer parent as
+ * its own `undoParent`, and the under-lock re-check compares against that same value. Judged on the
+ * CARD rather than the raw parent because that is what the move is for — a bead moved under another
+ * container is still as unreachable as the proposal says, and re-homing it is still the fix.
+ */
+function reparentPremiseGone(
+  plan: GardenerPlan,
+  subject: Bead,
+  index: BoardIndex,
+): string | undefined {
+  const card = index.cards.cardOf(subject);
+  if (!card) return undefined;
+  return `${subject.id} now rides board card ${card} — it was given a home since this proposal was filed, so moving it under ${plan.target} would overwrite that newer decision`;
+}
+
+/**
+ * Why this bead is no longer the stale one the proposal describes, or undefined.
+ *
+ * `detectStale` measured SILENCE (retire.ts), and silence is the one premise a plan cannot restate:
+ * it is a fact about the moment the patrol looked. Confirmed against that moment rather than by
+ * re-deriving the day threshold, because "has anyone touched it since we asked" is the question the
+ * approver's evidence actually rests on — a bead nobody wrote to has only grown staler, while one
+ * edited, re-prioritised or picked back up is simply no longer the bead the ask describes.
+ */
+function staleTouched(subject: Bead, at: ApplyMoment): string | undefined {
+  const since = writtenSinceFiling(subject, at);
+  if (since === false) return undefined;
+  return since === undefined
+    ? `${subject.id} carries no write stamp this proposal's filing can be compared to, so nothing confirms it is still the untouched bead the ask describes`
+    : `${subject.id} has been written to since this proposal was filed — it is no longer the untouched bead the ask describes, and deferring it now would park work somebody has picked back up`;
 }
 
 /** Why a proposal could not be applied — mapped to a status by the route, never swallowed. */
@@ -455,7 +579,10 @@ async function applyApproved(
     );
   }
 
-  const decision = planApply(plan, board, Date.now());
+  // Dated from the proposal the approver read, not from `live`: `created_at` is the moment the
+  // patrol judged the board, which is what every "has this moved since we asked" check compares to.
+  const at: ApplyMoment = { nowMs: Date.now(), filedAtMs: filedAtOf(proposal) };
+  const decision = planApply(plan, board, at);
   if (decision.status === "refuse") {
     throw await attachFailure(
       repo,
@@ -471,7 +598,7 @@ async function applyApproved(
   // this proposal closed as applied over a board that no longer holds the state its summary names.
   if (decision.status === "settled") {
     return withBeadWriteLocks(repo, affectedBeads(plan), async () => {
-      const drifted = await settledDrifted(repo, plan);
+      const drifted = await settledDrifted(repo, plan, at);
       if (drifted) {
         throw await attachFailure(
           repo,
@@ -538,7 +665,11 @@ function affectedBeads(plan: GardenerPlan): string[] {
  * a FRESH board read through `planApply` itself rather than a hand-rolled per-verb re-check, so the
  * confirmation cannot hold the live board to a different bar than the decision held the snapshot to.
  */
-async function settledDrifted(repo: string, plan: GardenerPlan): Promise<string | undefined> {
+async function settledDrifted(
+  repo: string,
+  plan: GardenerPlan,
+  at: ApplyMoment,
+): Promise<string | undefined> {
   let board: Bead[];
   try {
     board = await beads.list(repo, ["--status", "all"]);
@@ -546,7 +677,7 @@ async function settledDrifted(repo: string, plan: GardenerPlan): Promise<string 
     // Same rule as `reread`'s: a board we could not read says nothing, so the proposal stays open.
     return `the board could not be re-read to confirm the move is already applied (${messageOf(e)}) — nothing was written`;
   }
-  const now = planApply(plan, board, Date.now());
+  const now = planApply(plan, board, { ...at, nowMs: Date.now() });
   switch (now.status) {
     case "settled":
       return undefined;
@@ -882,6 +1013,16 @@ async function attachFailure(
 }
 
 // ── small pure helpers ──
+
+/**
+ * When the proposal was FILED, in epoch ms, or undefined when it carries no readable `created_at`.
+ * bd stamps every bead at creation, so this is the plan's filing time without the plan having to
+ * carry a copy of it — and a copy is exactly what a hand-edited metadata blob could rewrite.
+ */
+function filedAtOf(proposal: Bead): number | undefined {
+  const at = typeof proposal.created_at === "string" ? Date.parse(proposal.created_at) : NaN;
+  return Number.isFinite(at) ? at : undefined;
+}
 
 /** The close reason a retirement writes — evidence lives on the proposal, so this stays one line. */
 function closeReason(plan: GardenerPlan): string {

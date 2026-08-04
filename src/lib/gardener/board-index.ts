@@ -80,8 +80,9 @@ export function indexBoard(all: Bead[]): BoardIndex {
   const blocks = new Set<string>();
   // The same edges, kept DIRECTED: `from` depends on `to` (bd's `blocks` edge points at the blocker,
   // matching beads.unblocksCount), which is what makes reachability — and so cycle detection —
-  // answerable at all.
-  const blockers = new Map<string, string[]>();
+  // answerable at all. A Set per bead so a direct-blocker lookup costs the same as every other edge
+  // question here.
+  const blockers = new Map<string, Set<string>>();
   // `bd supersede <id> --with <replacement>` writes (from = the superseded bead, to = the survivor).
   const supersedes = new Set<string>();
   const discoveries: Discovery[] = [];
@@ -89,8 +90,8 @@ export function indexBoard(all: Bead[]): BoardIndex {
     if (edge.type === "blocks") {
       blocks.add(pairKey(edge.from, edge.to));
       const known = blockers.get(edge.from);
-      if (known) known.push(edge.to);
-      else blockers.set(edge.from, [edge.to]);
+      if (known) known.add(edge.to);
+      else blockers.set(edge.from, new Set([edge.to]));
     } else if (edge.type === "supersedes") {
       supersedes.add(directedKey(edge.from, edge.to));
     } else if (edge.type === "discovered-from") {
@@ -119,7 +120,7 @@ export function indexBoard(all: Bead[]): BoardIndex {
       return found;
     },
     hasBlocksEdge: (a, b) => blocks.has(pairKey(a, b)),
-    recordsBlocker: (id, blockerId) => (blockers.get(id) ?? []).includes(blockerId),
+    recordsBlocker: (id, blockerId) => blockers.get(id)?.has(blockerId) ?? false,
     isBlockedBy: (id, blockerId) => {
       // Walks blocker-ward from `id`; `seen` also guards a graph that ALREADY holds a cycle (a merge
       // can leave one, see beads.depCycles), which must not spin this walk forever.
@@ -185,6 +186,18 @@ export function stampOf(bead: Bead): string | undefined {
   return typeof bead.created_at === "string" && bead.created_at ? bead.created_at : undefined;
 }
 
+/**
+ * The same stamp as epoch ms, or undefined when it is missing or unparseable. Both tiers ask WHEN a
+ * bead was last written — the detectors to measure silence, apply to date a claim against the moment
+ * its proposal was filed — so the parse lives in one place.
+ */
+export function stampMsOf(bead: Bead): number | undefined {
+  const stamp = stampOf(bead);
+  if (!stamp) return undefined;
+  const at = Date.parse(stamp);
+  return Number.isFinite(at) ? at : undefined;
+}
+
 const DAY_MS = 86_400_000;
 
 /**
@@ -193,9 +206,6 @@ const DAY_MS = 86_400_000;
  * today", which would silently exempt exactly the oldest rows from every age-gated detector.
  */
 export function ageInDays(bead: Bead, nowMs: number): number | undefined {
-  const stamp = stampOf(bead);
-  if (!stamp) return undefined;
-  const at = Date.parse(stamp);
-  if (!Number.isFinite(at)) return undefined;
-  return Math.floor((nowMs - at) / DAY_MS);
+  const at = stampMsOf(bead);
+  return at === undefined ? undefined : Math.floor((nowMs - at) / DAY_MS);
 }

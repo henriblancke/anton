@@ -170,18 +170,44 @@ function planFor(input: Omit<GardenerPlan, "fingerprint">): GardenerPlan {
   };
 }
 
-/** The proposal bead as the board hands it back: fingerprint label + the plan as metadata. */
+/**
+ * The proposal bead as the board hands it back: fingerprint label + the plan as metadata, filed at
+ * {@link FILED}. The filing stamp is not decoration — it is what dates a claim or an edit as "since
+ * we asked", so a proposal without one fails those checks closed.
+ */
 function proposalFor(plan: GardenerPlan, extra: Partial<Bead> = {}): Bead {
   return bead("anton-p1", {
     title: "Gardener: do the thing",
     labels: [plan.fingerprint, "domain:eng", "source:gardener"],
     metadata: { gardener: plan },
+    created_at: FILED,
     ...extra,
   });
 }
 
 /** The moment every decision below is judged at — only the run-lease checks read it. */
 const NOW = Date.parse("2026-08-03T00:00:00Z");
+
+/** When the proposals below were FILED: the board their evidence describes is a month old. */
+const FILED = "2026-07-01T00:00:00Z";
+
+/**
+ * A bead nobody has written to in over a year — what a `stale` proposal's subject still has to look
+ * like at approve time, and old enough that any claim on it long predates {@link FILED}.
+ */
+const cold = (id: string, extra: Partial<Bead> = {}): Bead =>
+  bead(id, { updated_at: "2025-01-01T00:00:00Z", ...extra });
+
+/** Its opposite: a bead written SINCE {@link FILED} — a change the approver was never shown. */
+const warm = (id: string, extra: Partial<Bead> = {}): Bead =>
+  bead(id, { updated_at: "2026-07-15T00:00:00Z", ...extra });
+
+/**
+ * Decide against a fixture board the way the route does: now, against a proposal filed a month ago.
+ * A test that needs a different pair of moments calls `planApply` itself.
+ */
+const decide = (plan: GardenerPlan, board: Bead[], nowMs: number = NOW) =>
+  planApply(plan, board, { nowMs, filedAtMs: Date.parse(FILED) });
 
 /** A bead a run owns right now: an unexpired lease, dated relative to `at`. */
 const leased = (id: string, at: number): Bead =>
@@ -297,7 +323,7 @@ describe("the plan a proposal carries — read strictly, because it decides what
 describe("planApply — what an approval means against the board as it now is", () => {
   it("re-parents every subject that isn't already home, remembering the parent to undo to", () => {
     const board = [CARD, child("anton-a", "anton-container"), bead("anton-b")];
-    const decision = planApply(CLUSTER, board);
+    const decision = decide(CLUSTER, board);
 
     expect(decision).toEqual({
       status: "apply",
@@ -328,7 +354,7 @@ describe("planApply — what an approval means against the board as it now is", 
 
   it("settles a re-parent the board already reads as applied, rather than writing again", () => {
     const board = [CARD, child("anton-a", CARD.id)];
-    expect(planApply(REPARENT, board)).toEqual({
+    expect(decide(REPARENT, board)).toEqual({
       status: "settled",
       summary: "anton-a already sits under anton-card",
     });
@@ -336,7 +362,7 @@ describe("planApply — what an approval means against the board as it now is", 
 
   it("records the blocks edge in the direction the detection states", () => {
     const board = [bead("anton-a"), bead("anton-b")];
-    expect(planApply(LINK, board)).toEqual({
+    expect(decide(LINK, board)).toEqual({
       status: "apply",
       summary: "recorded that anton-b blocks anton-a",
       steps: [{ verb: "link", id: "anton-a", claim: "", blocker: "anton-b" }],
@@ -344,7 +370,7 @@ describe("planApply — what an approval means against the board as it now is", 
   });
 
   it("settles a link whose edge already runs the way the proposal states", () => {
-    expect(planApply(LINK, edged("anton-a", "anton-b"))).toEqual({
+    expect(decide(LINK, edged("anton-a", "anton-b"))).toEqual({
       status: "settled",
       summary: "a blocks edge already records anton-b → anton-a",
     });
@@ -354,7 +380,7 @@ describe("planApply — what an approval means against the board as it now is", 
   // something to overwrite, and never something to close this proposal over: settling would file a
   // summary claiming an edge (`anton-b → anton-a`) the board does not hold.
   it("refuses a link the board already records in the opposite direction", () => {
-    const decision = planApply(LINK, edged("anton-b", "anton-a"));
+    const decision = decide(LINK, edged("anton-b", "anton-a"));
     expect(decision).toMatchObject({ status: "refuse" });
     expect(decision.status === "refuse" && decision.reason).toMatch(
       /opposite ordering — anton-a blocks anton-b/,
@@ -371,7 +397,7 @@ describe("planApply — what an approval means against the board as it now is", 
       blockedBy("anton-b", "anton-c"),
       blockedBy("anton-c", "anton-a"),
     ];
-    const decision = planApply(LINK, board);
+    const decision = decide(LINK, board);
     expect(decision).toMatchObject({ status: "refuse" });
     expect(decision.status === "refuse" && decision.reason).toMatch(
       /anton-b is already blocked by anton-a through other beads/,
@@ -381,20 +407,20 @@ describe("planApply — what an approval means against the board as it now is", 
   it("still records an edge whose chain runs the other way — that is an ordering, not a cycle", () => {
     // anton-a already waits on anton-c: adding anton-b as another of its blockers closes nothing.
     const board = [blockedBy("anton-a", "anton-c"), bead("anton-b"), bead("anton-c")];
-    expect(planApply(LINK, board).status).toBe("apply");
+    expect(decide(LINK, board).status).toBe("apply");
   });
 
   it("maps each retirement to ITS OWN verb — close, defer and supersede are not interchangeable", () => {
-    expect(planApply(CLOSE, [bead("anton-a")])).toMatchObject({
+    expect(decide(CLOSE, [bead("anton-a")])).toMatchObject({
       status: "apply",
       steps: [{ verb: "close", id: "anton-a" }],
     });
-    expect(planApply(DEFER, [bead("anton-a")])).toMatchObject({
+    expect(decide(DEFER, [cold("anton-a")])).toMatchObject({
       status: "apply",
       steps: [{ verb: "defer", id: "anton-a" }],
     });
     expect(
-      planApply(SUPERSEDE, [bead("anton-a"), bead("anton-b", { status: "closed" })]),
+      decide(SUPERSEDE, [bead("anton-a"), bead("anton-b", { status: "closed" })]),
     ).toMatchObject({
       status: "apply",
       steps: [{ verb: "supersede", id: "anton-a", replacement: "anton-b" }],
@@ -402,11 +428,11 @@ describe("planApply — what an approval means against the board as it now is", 
   });
 
   it("settles a retirement the board already carried out, however it was carried out", () => {
-    expect(planApply(CLOSE, [bead("anton-a", { status: "closed" })]).status).toBe("settled");
-    expect(planApply(DEFER, [bead("anton-a", { status: "deferred" })]).status).toBe("settled");
+    expect(decide(CLOSE, [bead("anton-a", { status: "closed" })]).status).toBe("settled");
+    expect(decide(DEFER, [bead("anton-a", { status: "deferred" })]).status).toBe("settled");
     // Even half-abandoned (the state a crashed abandon leaves): closing it would read as shipped.
     expect(
-      planApply(CLOSE, [bead("anton-a", { labels: [LABELS.abandoned] })]),
+      decide(CLOSE, [bead("anton-a", { labels: [LABELS.abandoned] })]),
     ).toEqual({ status: "settled", summary: "anton-a is already abandoned" });
   });
 
@@ -415,22 +441,22 @@ describe("planApply — what an approval means against the board as it now is", 
   // closing the proposal as answered would claim a record the board never got.
   it("settles a supersede only where the board records the edge, and refuses where it does not", () => {
     const survivor = bead("anton-b", { status: "closed" });
-    expect(planApply(SUPERSEDE, [supersededBy("anton-a", "anton-b"), survivor])).toEqual({
+    expect(decide(SUPERSEDE, [supersededBy("anton-a", "anton-b"), survivor])).toEqual({
       status: "settled",
       summary: "anton-a is already superseded by anton-b",
     });
 
-    const byHand = planApply(SUPERSEDE, [bead("anton-a", { status: "closed" }), survivor]);
+    const byHand = decide(SUPERSEDE, [bead("anton-a", { status: "closed" }), survivor]);
     expect(byHand).toMatchObject({ status: "refuse" });
     expect(byHand.status === "refuse" && byHand.reason).toMatch(
       /nothing on the board records it as superseded by anton-b/,
     );
     // An abandoned subject is the same gap: a won't-do says nothing about where work landed.
     const abandoned = bead("anton-a", { labels: [LABELS.abandoned], status: "closed" });
-    expect(planApply(SUPERSEDE, [abandoned, survivor])).toMatchObject({ status: "refuse" });
+    expect(decide(SUPERSEDE, [abandoned, survivor])).toMatchObject({ status: "refuse" });
     // …and an edge pointing at some OTHER bead is not this proposal's answer either.
     expect(
-      planApply(SUPERSEDE, [supersededBy("anton-a", "anton-c"), survivor]),
+      decide(SUPERSEDE, [supersededBy("anton-a", "anton-c"), survivor]),
     ).toMatchObject({ status: "refuse" });
   });
 
@@ -441,22 +467,22 @@ describe("planApply — what an approval means against the board as it now is", 
     };
 
     it("refuses when a bead the plan names has left the board", () => {
-      expect(refusal(planApply(REPARENT, [CARD]))).toMatch(/anton-a is no longer on the board/);
-      expect(refusal(planApply(REPARENT, [bead("anton-a")]))).toMatch(/anton-card is no longer/);
+      expect(refusal(decide(REPARENT, [CARD]))).toMatch(/anton-a is no longer on the board/);
+      expect(refusal(decide(REPARENT, [bead("anton-a")]))).toMatch(/anton-card is no longer/);
     });
 
     it("refuses to move a subject that settled since the proposal was filed", () => {
       const board = [CARD, bead("anton-a", { status: "closed" })];
-      expect(refusal(planApply(REPARENT, board))).toMatch(/anton-a is closed/);
+      expect(refusal(decide(REPARENT, board))).toMatch(/anton-a is closed/);
       const abandoned = [CARD, bead("anton-a", { labels: [LABELS.abandoned], status: "closed" })];
-      expect(refusal(planApply(REPARENT, abandoned))).toMatch(/anton-a is abandoned/);
+      expect(refusal(decide(REPARENT, abandoned))).toMatch(/anton-a is abandoned/);
     });
 
     it("refuses a home that is not a board card — the state the proposal exists to fix", () => {
       // An epic WITH a feature child is a container: work parented to it rides no card.
       const container = bead("anton-card", { issue_type: "epic" });
       const board = [container, child("anton-f", container.id, { issue_type: "feature" }), bead("anton-a")];
-      expect(refusal(planApply(REPARENT, board))).toMatch(/not a board card/);
+      expect(refusal(decide(REPARENT, board))).toMatch(/not a board card/);
     });
 
     // The home is written to as surely as the subject is, just indirectly: a run that has already
@@ -464,7 +490,7 @@ describe("planApply — what an approval means against the board as it now is", 
     // them when it finishes.
     it("refuses a home a run owns — the subjects would strand under a card about to settle", () => {
       for (const live of [{ ...leased(CARD.id, NOW), issue_type: "feature" }, { ...inReview(CARD.id), issue_type: "feature" }]) {
-        expect(refusal(planApply(REPARENT, [live, bead("anton-a")], NOW))).toMatch(
+        expect(refusal(decide(REPARENT, [live, bead("anton-a")], NOW))).toMatch(
           /anton-card is mid-run .* hanging more work under it/,
         );
       }
@@ -472,29 +498,29 @@ describe("planApply — what an approval means against the board as it now is", 
 
     it("refuses a re-parent that would make a subtree its own ancestor", () => {
       const board = [child(CARD.id, "anton-a", { issue_type: "feature" }), bead("anton-a")];
-      expect(refusal(planApply(REPARENT, board))).toMatch(/its own ancestor/);
+      expect(refusal(decide(REPARENT, board))).toMatch(/its own ancestor/);
     });
 
     it("refuses a proposal that names no home — it asks a human to choose one", () => {
       const homeless = planFor({ kind: "container-orphan", move: "reparent", subjects: ["anton-a"] });
-      expect(refusal(planApply(homeless, [bead("anton-a")]))).toMatch(/names no new parent/);
+      expect(refusal(decide(homeless, [bead("anton-a")]))).toMatch(/names no new parent/);
     });
 
     it("refuses an ordering edge once the blocker has landed", () => {
       const board = [bead("anton-a"), bead("anton-b", { status: "closed" })];
-      expect(refusal(planApply(LINK, board))).toMatch(/anton-b is closed/);
+      expect(refusal(decide(LINK, board))).toMatch(/anton-b is closed/);
     });
 
     it("refuses to supersede when the survivor is open again — nothing landed over there", () => {
       const board = [bead("anton-a"), bead("anton-b")];
-      expect(refusal(planApply(SUPERSEDE, board))).toMatch(/has not landed/);
+      expect(refusal(decide(SUPERSEDE, board))).toMatch(/has not landed/);
     });
 
     // Abandoned is `closed` PLUS a label, so a status check alone reads a recorded won't-do as
     // delivered work — and retires the last live copy of it in favour of a bead nobody will finish.
     it("refuses to supersede onto an ABANDONED survivor — closed, but nothing was delivered", () => {
       const dropped = bead("anton-b", { labels: [LABELS.abandoned], status: "closed" });
-      expect(refusal(planApply(SUPERSEDE, [bead("anton-a"), dropped]))).toMatch(
+      expect(refusal(decide(SUPERSEDE, [bead("anton-a"), dropped]))).toMatch(
         /anton-b is abandoned — a recorded won't-do delivered nothing/,
       );
     });
@@ -508,8 +534,8 @@ describe("planApply — what an approval means against the board as it now is", 
       const buried = child("anton-t2", "anton-t1");
 
       const board = [feature, survivor, shipped, buried];
-      expect(refusal(planApply(CLOSE, board))).toMatch(/still has open work under it \(anton-t2\)/);
-      expect(refusal(planApply(SUPERSEDE, board))).toMatch(/anton-t2/);
+      expect(refusal(decide(CLOSE, board))).toMatch(/still has open work under it \(anton-t2\)/);
+      expect(refusal(decide(SUPERSEDE, board))).toMatch(/anton-t2/);
     });
 
     it("closes a bead whose whole subtree has settled", () => {
@@ -518,14 +544,14 @@ describe("planApply — what an approval means against the board as it now is", 
         child("anton-t1", "anton-a", { status: "closed" }),
         child("anton-t2", "anton-a", { labels: [LABELS.abandoned], status: "closed" }),
       ];
-      expect(planApply(CLOSE, board).status).toBe("apply");
+      expect(decide(CLOSE, board).status).toBe("apply");
     });
 
     // Deferring is the reversible half: the subtree parks with its contract intact and reopening the
     // parent undoes it, so open children are not a reason to refuse.
     it("defers a bead with open children rather than refusing", () => {
-      const board = [bead("anton-a", { issue_type: "feature" }), child("anton-t1", "anton-a")];
-      expect(planApply(DEFER, board).status).toBe("apply");
+      const board = [cold("anton-a", { issue_type: "feature" }), child("anton-t1", "anton-a")];
+      expect(decide(DEFER, board).status).toBe("apply");
     });
 
     // The bar every detector proposes under (board-index `isInFlight`), re-checked HERE because the
@@ -533,33 +559,116 @@ describe("planApply — what an approval means against the board as it now is", 
     // re-parent or retire work an agent is mid-flight over.
     it("refuses every move against a bead a run owns — live lease or open PR alike", () => {
       for (const live of [leased("anton-a", NOW), inReview("anton-a")]) {
-        expect(refusal(planApply(REPARENT, [CARD, live], NOW))).toMatch(/anton-a is mid-run/);
-        expect(refusal(planApply(CLUSTER, [CARD, live, bead("anton-b")], NOW))).toMatch(
+        expect(refusal(decide(REPARENT, [CARD, live], NOW))).toMatch(/anton-a is mid-run/);
+        expect(refusal(decide(CLUSTER, [CARD, live, bead("anton-b")], NOW))).toMatch(
           /anton-a is mid-run/,
         );
-        expect(refusal(planApply(LINK, [live, bead("anton-b")], NOW))).toMatch(/anton-a is mid-run/);
-        expect(refusal(planApply(DEFER, [live], NOW))).toMatch(/anton-a is mid-run/);
-        expect(refusal(planApply(CLOSE, [live], NOW))).toMatch(/anton-a is mid-run/);
+        expect(refusal(decide(LINK, [live, bead("anton-b")], NOW))).toMatch(/anton-a is mid-run/);
+        expect(refusal(decide(DEFER, [live], NOW))).toMatch(/anton-a is mid-run/);
+        expect(refusal(decide(CLOSE, [live], NOW))).toMatch(/anton-a is mid-run/);
         const survivor = bead("anton-b", { status: "closed" });
-        expect(refusal(planApply(SUPERSEDE, [live, survivor], NOW))).toMatch(/anton-a is mid-run/);
+        expect(refusal(decide(SUPERSEDE, [live, survivor], NOW))).toMatch(/anton-a is mid-run/);
       }
     });
 
     it("names the run that owns it, so the operator knows what they are waiting on", () => {
-      expect(refusal(planApply(DEFER, [leased("anton-a", NOW)], NOW))).toMatch(
+      expect(refusal(decide(DEFER, [leased("anton-a", NOW)], NOW))).toMatch(
         /live lease on it \(runner-1\)/,
       );
-      expect(refusal(planApply(DEFER, [inReview("anton-a")], NOW))).toMatch(/it is in review/);
+      expect(refusal(decide(DEFER, [inReview("anton-a")], NOW))).toMatch(/it is in review/);
     });
 
     it("applies against an EXPIRED lease — a crashed run owns nothing", () => {
-      const dead = bead("anton-a", { labels: [LABELS.runLease(NOW - 1, "run-9")] });
-      expect(planApply(DEFER, [dead], NOW).status).toBe("apply");
+      const dead = cold("anton-a", { labels: [LABELS.runLease(NOW - 1, "run-9")] });
+      expect(decide(DEFER, [dead], NOW).status).toBe("apply");
     });
 
     it("still SETTLES a mid-run bead the board already retired — there is nothing to write", () => {
       const done = { ...leased("anton-a", NOW), status: "deferred" };
-      expect(planApply(DEFER, [done], NOW).status).toBe("settled");
+      expect(decide(DEFER, [done], NOW).status).toBe("settled");
+    });
+  });
+
+  // The filing→approval window, which the in-flight bar and the under-lock re-check both miss: the
+  // first because the signals it reads can be absent for a bead a run owns, the second because it
+  // compares against the approval's own snapshot, which is already downstream of the change.
+  describe("what moved between the filing and the approval — a premise, not just a safety bar", () => {
+    const reason = (decision: ReturnType<typeof planApply>): string => {
+      expect(decision.status).toBe("refuse");
+      return decision.status === "refuse" ? decision.reason : "";
+    };
+
+    // `bd --claim` writes the assignee and in_progress as one act and publishes the run-lease a
+    // moment later; a grouped run's tickets never carry a lease of their own at all — it lives on
+    // the target they hang under. So a bead a run owns can read as free to every liveness signal,
+    // and the only thing separating it from the dead claim a retirement is usually about is WHEN
+    // the claim was taken.
+    it("refuses every move against a subject claimed since the filing, lease or no lease", () => {
+      const claimed = warm("anton-a", { assignee: "runner-7", status: "in_progress" });
+      expect(reason(decide(DEFER, [claimed]))).toMatch(/is held by runner-7/);
+      expect(reason(decide(CLOSE, [claimed]))).toMatch(/retiring it would pull the bead out/);
+      expect(reason(decide(LINK, [claimed, bead("anton-b")]))).toMatch(/recording it as blocked/);
+      expect(reason(decide(REPARENT, [CARD, claimed]))).toMatch(/moving it would pull the bead/);
+    });
+
+    // The stale-in-progress detector proposes against claimed beads on purpose — a claim that
+    // outlived its run IS the finding — so the claim the proposal was made about is not news.
+    it("applies against the claim the proposal was made about", () => {
+      const outlived = cold("anton-a", { assignee: "runner-7", status: "in_progress" });
+      expect(decide(DEFER, [outlived]).status).toBe("apply");
+    });
+
+    // Fails closed both ways: without two stamps nothing shows the claim predates the ask.
+    it("refuses a claim nothing can date against the filing", () => {
+      const undated = bead("anton-a", { assignee: "runner-7", status: "in_progress" });
+      expect(reason(decide(DEFER, [undated]))).toMatch(/nothing dates that claim/);
+
+      const unfiled = planApply(DEFER, [cold("anton-a", { status: "in_progress" })], {
+        nowMs: NOW,
+        filedAtMs: undefined,
+      });
+      expect(reason(unfiled)).toMatch(/nothing dates that claim/);
+    });
+
+    // Approving would record that newer card as the step's own `undoParent` and write straight over
+    // it — and the under-lock re-check, which compares against exactly that value, cannot object.
+    it("refuses to re-home a subject somebody has already given a card", () => {
+      const other = bead("anton-other", { issue_type: "feature" });
+      const rehomed = child("anton-a", other.id);
+      expect(reason(decide(REPARENT, [CARD, other, rehomed]))).toMatch(
+        /now rides board card anton-other/,
+      );
+      expect(reason(decide(CLUSTER, [CARD, other, rehomed, bead("anton-b")]))).toMatch(
+        /now rides board card anton-other/,
+      );
+    });
+
+    // A move under another CONTAINER leaves the bead exactly as unreachable as the proposal says,
+    // so it is still the fix rather than a decision to preserve.
+    it("still re-homes a subject moved under something that is not a card", () => {
+      expect(decide(REPARENT, [CARD, child("anton-a", "anton-container")]).status).toBe("apply");
+    });
+
+    // A `stale` proposal's whole premise is silence — a claim about the moment the patrol looked,
+    // which no fresh board read can restate. An edit, a re-prioritisation or a fresh pickup since
+    // makes the bead no longer the untouched one the ask describes.
+    it("refuses a stale retirement whose subject has been written to since the filing", () => {
+      expect(reason(decide(DEFER, [warm("anton-a")]))).toMatch(/written to since this proposal/);
+      expect(reason(decide(DEFER, [bead("anton-a")]))).toMatch(/no write stamp/);
+    });
+
+    // Silence that held at filing has only lengthened, so an untouched bead still applies.
+    it("applies a stale retirement to a bead nobody has touched since", () => {
+      expect(decide(DEFER, [cold("anton-a")]).status).toBe("apply");
+    });
+
+    // Only `stale` rests on silence. A shipped-orphan's commit and a supersede's landed twin are
+    // facts an edit does not undo, so a touched subject is no reason to refuse those.
+    it("holds only the stale kind to the silence its detector measured", () => {
+      expect(decide(CLOSE, [warm("anton-a")]).status).toBe("apply");
+      expect(
+        decide(SUPERSEDE, [warm("anton-a"), bead("anton-b", { status: "closed" })]).status,
+      ).toBe("apply");
     });
   });
 });
@@ -855,7 +964,7 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     const proposal = proposalFor(DEFER);
     liveBeads.set("anton-a", leased("anton-a", Date.now()));
 
-    await expect(apply(proposal, [bead("anton-a"), proposal])).rejects.toMatchObject({
+    await expect(apply(proposal, [cold("anton-a"), proposal])).rejects.toMatchObject({
       failure: "refused",
     });
     // The snapshot said "open and unclaimed"; the locked read said otherwise, and nothing was written.
@@ -873,7 +982,7 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     const proposal = proposalFor(DEFER);
     liveBeads.set("anton-a", bead("anton-a", { assignee: "runner-7", status: "in_progress" }));
 
-    await expect(apply(proposal, [bead("anton-a"), proposal])).rejects.toMatchObject({
+    await expect(apply(proposal, [cold("anton-a"), proposal])).rejects.toMatchObject({
       failure: "refused",
     });
     expect(calls).toEqual([
@@ -893,7 +1002,7 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
       liveBeads.clear();
       liveBeads.set("anton-a", live);
       const proposal = proposalFor(DEFER);
-      const claimed = bead("anton-a", { assignee: "runner-7", status: "in_progress" });
+      const claimed = cold("anton-a", { assignee: "runner-7", status: "in_progress" });
 
       await expect(apply(proposal, [claimed, proposal])).resolves.toMatchObject({
         changed: ["anton-a"],

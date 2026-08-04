@@ -219,6 +219,39 @@ describeBd("POST approve — gardener proposals apply their move (temp anton.db 
     expect(String(still.notes ?? "")).toContain("apply FAILED");
   });
 
+  // The filing→approval window a live board is the only place to prove: `bd update --claim` writes
+  // the assignee and in_progress with NO run-lease behind it, so the bead reads as free work to
+  // every liveness signal the approval consults. What dates it as news is bd's own write stamp
+  // against the proposal's creation.
+  it("refuses a subject a run claimed after the proposal was filed, lease or no lease", async () => {
+    const card = await beads.create(repo, { title: "Claim home", type: "feature", acceptance: "- [ ] a" });
+    const ticket = await beads.create(repo, { title: "Picked up", type: "task", acceptance: "- [ ] a" });
+    const proposal = await file({
+      kind: "container-orphan",
+      move: "reparent",
+      subjects: [ticket],
+      target: card,
+      summary: "it rides no card",
+      evidence: ["its parent is a container epic"],
+    });
+    // bd stamps at one-second resolution, so the claim has to land in a LATER second than the
+    // proposal's creation for the two to be orderable at all.
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    await beads.claim(repo, ticket, "runner-e2e");
+    resetIssueSnapshots();
+
+    const res = await approve(proposal.id);
+    const body = (await res.json()) as { error?: string };
+
+    expect(res.status).toBe(409);
+    expect(body.error).toContain("claimed since this proposal was filed");
+    // Inert: the run keeps its ticket exactly as it claimed it.
+    const held = await show(ticket);
+    expect(beads.parentOf(held)).toBeUndefined();
+    expect(held.status).toBe("in_progress");
+    expect((await show(proposal.id)).status).toBe("open");
+  });
+
   it("declines through abandon: the reason is recorded and the patrol never re-files it", async () => {
     const { abandonTicket } = await import("@/lib/abandon");
     const { getProjectBySlug } = await import("@/lib/projects");
