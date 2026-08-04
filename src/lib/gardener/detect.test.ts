@@ -701,6 +701,36 @@ describe("retirement candidates", () => {
     expect(detection.subjects).toEqual(["anton-t1"]);
   });
 
+  // bd's report verbs are untyped, so a poured workflow parked on a human shows up as stale like
+  // anything else. Every work surface holds plumbing out (isPipelineArtifact); retiring one would
+  // mutate a hidden workflow-control bead an approver never meant to see on the board.
+  it("never proposes retiring pipeline plumbing the untyped report sweeps in", () => {
+    const cold = daysAgo(RETIRE_STALE_OPEN_DAYS + 30);
+    expect(
+      detect(
+        [
+          bead("anton-mol", { issue_type: "molecule", title: "Poured workflow", updated_at: cold }),
+          bead("anton-gate", {
+            issue_type: "gate",
+            title: "Poured workflow",
+            parent: "anton-mol",
+            updated_at: cold,
+          }),
+          bead("anton-gate-landed", {
+            issue_type: "gate",
+            title: "Poured workflow",
+            status: "closed",
+          }),
+        ],
+        [
+          stale("anton-mol", "open"),
+          orphan("anton-gate"),
+          duplicate(["anton-gate-landed", "anton-gate"]),
+        ],
+      ),
+    ).toEqual([]);
+  });
+
   it("finds nothing without a hygiene report — bd owns stale/orphans/duplicates", () => {
     expect(
       detectBoard({

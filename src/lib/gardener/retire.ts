@@ -13,6 +13,7 @@
  * be an order of magnitude past "worth mentioning" before it is worth proposing.
  */
 import { beads, type Bead } from "../beads/bd";
+import { isPipelineArtifact } from "../beads/contract";
 import type { HygieneFinding } from "../hygiene";
 import {
   ageInDays,
@@ -41,6 +42,22 @@ export const RETIRE_STALE_IN_PROGRESS_DAYS = 21;
  * "defer it, it went cold" would ask an approver to arbitrate between two of anton's own detectors.
  */
 const RETIRE_PRECEDENCE: readonly GardenerDetectionKind[] = ["shipped-orphan", "superseded", "stale"];
+
+/**
+ * Work this tier may ask about at all: still wanted, and actual WORK rather than pipeline plumbing.
+ *
+ * The plumbing half is the one the findings can smuggle in (anton-ve2r). bd's report verbs are
+ * untyped — an open `molecule` or `gate` is as stale to `bd stale` as any ticket — while every work
+ * surface holds them out through {@link isPipelineArtifact}. Without this bar a poured workflow
+ * waiting on a human reads as three months of silence, and approving the proposal would defer a
+ * hidden workflow-control bead nobody meant to put on the board.
+ *
+ * The MISPARENTED detectors need no such bar: they are already scoped to work types
+ * (`isRunTicket`, task/bug/chore) and to graph units (`isUnit`), neither of which plumbing is.
+ */
+function isRetirable(bead: Bead): boolean {
+  return isOpenWork(bead) && !isPipelineArtifact(bead);
+}
 
 /**
  * Every retirement candidate the hygiene report supports, one per bead. `findings` is the report
@@ -87,7 +104,7 @@ function detectSuperseded(
     const survivor = [...landed].sort(byRecencyThenId)[0];
 
     for (const member of members) {
-      if (!isOpenWork(member) || runOwned(index, member, nowMs)) continue;
+      if (!isRetirable(member) || runOwned(index, member, nowMs)) continue;
       if (runClaimed(index, member) || strandsOpenWork(index, member)) continue;
       detections.push(
         makeDetection({
@@ -129,7 +146,7 @@ function detectShippedOrphans(
   for (const finding of findings) {
     if (finding.kind !== "orphan" || !finding.beadId) continue;
     const bead = index.byId.get(finding.beadId);
-    if (!bead || !isOpenWork(bead) || runOwned(index, bead, nowMs)) continue;
+    if (!bead || !isRetirable(bead) || runOwned(index, bead, nowMs)) continue;
     if (runClaimed(index, bead) || strandsOpenWork(index, bead)) continue;
     detections.push(
       makeDetection({
@@ -176,7 +193,7 @@ function detectStale(
     if (threshold === undefined || !finding.beadId) continue;
 
     const bead = index.byId.get(finding.beadId);
-    if (!bead || !isOpenWork(bead) || beads.isDeferred(bead) || runOwned(index, bead, nowMs)) {
+    if (!bead || !isRetirable(bead) || beads.isDeferred(bead) || runOwned(index, bead, nowMs)) {
       continue;
     }
 
