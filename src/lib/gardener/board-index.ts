@@ -51,6 +51,13 @@ export interface BoardIndex {
    * looked at the direct pair could be approved into a 500 and never apply.
    */
   isBlockedBy(id: string, blockerId: string): boolean;
+  /**
+   * Does the board record `id` as superseded BY `replacementId` — the directed edge `bd supersede`
+   * writes alongside the close? A supersede's claim is narrower than "this bead settled": it names
+   * WHERE the work landed, and this edge is the only thing that carries that. Asked at approve time,
+   * because a subject closed by any other means since the filing carries no such pointer.
+   */
+  recordsSupersedes(id: string, replacementId: string): boolean;
   discoveries: Discovery[];
   /** Is `ancestorId` this bead, or anywhere on its parent chain? Cycle-guarded. */
   isAncestor(ancestorId: string, id: string): boolean;
@@ -75,6 +82,8 @@ export function indexBoard(all: Bead[]): BoardIndex {
   // matching beads.unblocksCount), which is what makes reachability — and so cycle detection —
   // answerable at all.
   const blockers = new Map<string, string[]>();
+  // `bd supersede <id> --with <replacement>` writes (from = the superseded bead, to = the survivor).
+  const supersedes = new Set<string>();
   const discoveries: Discovery[] = [];
   for (const edge of beads.edgesOf(all)) {
     if (edge.type === "blocks") {
@@ -82,6 +91,8 @@ export function indexBoard(all: Bead[]): BoardIndex {
       const known = blockers.get(edge.from);
       if (known) known.push(edge.to);
       else blockers.set(edge.from, [edge.to]);
+    } else if (edge.type === "supersedes") {
+      supersedes.add(directedKey(edge.from, edge.to));
     } else if (edge.type === "discovered-from") {
       discoveries.push({ discovered: edge.from, source: edge.to });
     }
@@ -123,6 +134,7 @@ export function indexBoard(all: Bead[]): BoardIndex {
       }
       return false;
     },
+    recordsSupersedes: (id, replacementId) => supersedes.has(directedKey(id, replacementId)),
     discoveries,
     isAncestor: (ancestorId, id) => {
       const seen = new Set<string>();
@@ -142,6 +154,14 @@ export function indexBoard(all: Bead[]): BoardIndex {
 /** Undirected edge key — `a|b` and `b|a` are the same edge to every question asked here. */
 function pairKey(a: string, b: string): string {
   return a < b ? `${a}|${b}` : `${b}|${a}`;
+}
+
+/**
+ * Directed edge key — unlike {@link pairKey}, `a → b` and `b → a` are different edges. The separator
+ * is NUL, which no bead id can contain, so no two distinct pairs can collide on one key.
+ */
+function directedKey(from: string, to: string): string {
+  return `${from}\u0000${to}`;
 }
 
 /** A bead the board still holds as work to do. */

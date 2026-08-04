@@ -5,6 +5,7 @@ import type { Project } from "./types";
 const showMock = vi.fn();
 const listMock = vi.fn();
 const abandonAllMock = vi.fn();
+const noteMock = vi.fn();
 const cancelRunMock = vi.fn();
 const runIsLiveMock = vi.fn<(projectId: string, epicBeadId: string) => boolean>();
 
@@ -17,6 +18,7 @@ vi.mock("./beads/bd", async () => {
       show: (...args: unknown[]) => showMock(...args),
       list: (...args: unknown[]) => listMock(...args),
       abandonAll: (...args: unknown[]) => abandonAllMock(...args),
+      note: (...args: unknown[]) => noteMock(...args),
       sync: vi.fn().mockResolvedValue(undefined),
     },
   };
@@ -127,6 +129,7 @@ describe("abandonTicket cascade", () => {
     showMock.mockReset();
     listMock.mockReset();
     abandonAllMock.mockReset().mockResolvedValue(undefined);
+    noteMock.mockReset().mockResolvedValue(undefined);
     cancelRunMock.mockReset().mockResolvedValue(false);
     runIsLiveMock.mockReset().mockReturnValue(false);
   });
@@ -211,6 +214,46 @@ describe("abandonTicket cascade", () => {
     expect(abandonAllMock).not.toHaveBeenCalled();
     expect(cancelRunMock).not.toHaveBeenCalled();
   });
+
+  // Abandoning a gardener proposal is the DECLINE half of the gardener loop, and its other half —
+  // applyProposal — runs entirely under the proposal's per-bead write lock. This path takes the same
+  // lock and re-reads inside it, so the two decisions order instead of racing: an approval that has
+  // passed its own re-read must not still be writing subject moves while this closes the proposal.
+  describe("declining a gardener proposal", () => {
+    const PROPOSAL = makeBead({
+      id: "anton-p1",
+      title: "Gardener: re-parent anton-a",
+      labels: ["gardener:container-orphan:0123456789ab"],
+    });
+
+    it("records the decline on the bead, after the settle that earned it", async () => {
+      showMock.mockResolvedValue(PROPOSAL);
+      listMock.mockResolvedValue([PROPOSAL]);
+
+      await abandonTicket(project, PROPOSAL.id, "not worth doing");
+
+      expect(soleAbandonedIds()).toEqual([PROPOSAL.id]);
+      const [, , note] = noteMock.mock.calls[0] as string[];
+      expect(note).toContain("gardener:container-orphan:0123456789ab");
+      expect(abandonAllMock.mock.invocationCallOrder[0]).toBeLessThan(
+        noteMock.mock.invocationCallOrder[0],
+      );
+    });
+
+    it("refuses one an approval settled between the first read and the lock, writing nothing", async () => {
+      // Open when the caller looked; closed by the concurrent apply by the time the lock is held.
+      showMock
+        .mockResolvedValueOnce(PROPOSAL)
+        .mockResolvedValue({ ...PROPOSAL, status: "closed" });
+      listMock.mockResolvedValue([PROPOSAL]);
+
+      await expect(abandonTicket(project, PROPOSAL.id, "too late")).rejects.toThrow(
+        /already closed/,
+      );
+      expect(abandonAllMock).not.toHaveBeenCalled();
+      expect(noteMock).not.toHaveBeenCalled();
+    });
+  });
 });
 
 // An escalation's abandon is decided against work its caller observed STOPPED, several awaits before
@@ -231,6 +274,7 @@ describe("abandonTicket with requireStopped", () => {
     showMock.mockReset();
     listMock.mockReset();
     abandonAllMock.mockReset().mockResolvedValue(undefined);
+    noteMock.mockReset().mockResolvedValue(undefined);
     cancelRunMock.mockReset().mockResolvedValue(false);
     runIsLiveMock.mockReset().mockReturnValue(false);
   });

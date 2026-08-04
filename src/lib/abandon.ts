@@ -5,6 +5,7 @@
  * about the exit reads as a delivery. See DESIGN.md §3 — beads owns status, anton.db gains no column.
  */
 import { beads } from "./beads/bd";
+import { withBeadWriteLock } from "./beads/claim-lock";
 import { nudgeSync } from "./beads/sync-nudge";
 import { declineNote } from "./gardener/apply";
 import { cancelRunForTarget, runIsLiveForTarget } from "./jobs/service";
@@ -186,18 +187,32 @@ export async function abandonTicket(
   await stopRun(project.id, runTargetOf(bead, board), requireStopped);
   const descendants = await stopDescendantRuns(project, bead, board, requireStopped);
 
-  // The ticket and its cascade settle as one unit — every close in a single bd transaction, the
-  // ticket last (see beads.abandonAll).
-  await beads.abandonAll(project.repoPath, cascadeEntries(bead, descendants, why));
   // Abandoning a gardener PROPOSAL is a DECLINE (anton-1t3n): the `abandoned` label it just gained
   // is what stops the patrol re-filing the same claim, so say that on the bead — the suppression is
-  // a consequence of the label that nothing else spells out. After the settle and best-effort: the
-  // decision has landed either way, and a failed note must not fail the abandon.
+  // a consequence of the label that nothing else spells out. The note comes after the settle and is
+  // best-effort: the decision has landed either way, and a failed note must not fail the abandon.
   const declined = declineNote(bead);
-  if (declined) {
-    await beads
-      .note(project.repoPath, id, declined)
-      .catch((e) => console.error(`[abandon] could not record the decline on ${id}`, e));
+  // The ticket and its cascade settle as one unit — every close in a single bd transaction, the
+  // ticket last (see beads.abandonAll).
+  const settle = () => beads.abandonAll(project.repoPath, cascadeEntries(bead, descendants, why));
+
+  if (!declined) {
+    await settle();
+  } else {
+    // A proposal is settled by EITHER half of the gardener loop — declined here, or applied by
+    // applyProposal — so the decline takes the same per-bead lock the apply holds for its whole
+    // run. Unserialized, an approval that has passed its own re-read can still be writing the
+    // subject moves while this decline closes the proposal underneath it: the board ends up mutated
+    // by a decision it records as declined. Re-read inside the lock for the same reason the apply
+    // does — the `assertOpen` above judged a snapshot taken before whoever held the lock ran.
+    await withBeadWriteLock(project.repoPath, id, async () => {
+      const live = await beads.show(project.repoPath, id).catch(() => undefined);
+      if (live) assertOpen(live, "Ticket");
+      await settle();
+      await beads
+        .note(project.repoPath, id, declined)
+        .catch((e) => console.error(`[abandon] could not record the decline on ${id}`, e));
+    });
   }
   // Read-after-write, like setTicketDeferred: the `bd show` bead is authoritative for the abandoned
   // state it just wrote, so the response never reflects the board's stale snapshot.

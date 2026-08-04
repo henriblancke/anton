@@ -67,6 +67,20 @@ function setLive(id: string, patch: Partial<Bead>): void {
   if (current) liveBeads.set(id, { ...current, ...patch });
 }
 
+/**
+ * The board a `bd list` taken under the write lock answers with: the snapshot with every
+ * {@link liveBeads} override applied, INCLUDING ids the snapshot never carried — which is how a test
+ * stages work another approval attached mid-apply.
+ */
+function liveBoard(): Bead[] {
+  const merged = new Map(snapshot.map((b) => [b.id, b]));
+  for (const [id, live] of liveBeads) {
+    if (live) merged.set(id, live);
+    else merged.delete(id);
+  }
+  return [...merged.values()];
+}
+
 /** The board `applyProposal` was handed — what the under-lock re-read sees unless a test overrides it. */
 let snapshot: Bead[] = [];
 
@@ -81,6 +95,7 @@ vi.mock("../beads/bd", async () => {
         const live = liveBeads.has(id) ? liveBeads.get(id) : snapshot.find((b) => b.id === id);
         return live ? Promise.resolve(live) : Promise.reject(new Error(`bd show: no such issue ${id}`));
       },
+      list: () => Promise.resolve(liveBoard()),
       reparent: (_cwd: string, id: string, parent: string) => record("reparent", id, parent),
       link: (_cwd: string, a: string, b: string, type: string) => record("link", a, b, type),
       close: (_cwd: string, id: string, reason?: string) => record("close", id, reason ?? ""),
@@ -125,6 +140,14 @@ function blockedBy(id: string, blocker: string, extra: Partial<Bead> = {}): Bead
   return {
     ...bead(id, extra),
     dependencies: [{ issue_id: id, depends_on_id: blocker, type: "blocks" }],
+  };
+}
+
+/** A closed bead the board records as superseded by `survivor` — the edge `bd supersede` writes. */
+function supersededBy(id: string, survivor: string, extra: Partial<Bead> = {}): Bead {
+  return {
+    ...bead(id, { status: "closed", ...extra }),
+    dependencies: [{ issue_id: id, depends_on_id: survivor, type: "supersedes" }],
   };
 }
 
@@ -280,9 +303,16 @@ describe("planApply — what an approval means against the board as it now is", 
       status: "apply",
       summary: "re-parented anton-a, anton-b under anton-card",
       steps: [
-        { verb: "reparent", id: "anton-a", parent: "anton-card", undoParent: "anton-container" },
+        // `claim: ""` — neither subject is owned by a run, which is what the write re-checks.
+        {
+          verb: "reparent",
+          id: "anton-a",
+          claim: "",
+          parent: "anton-card",
+          undoParent: "anton-container",
+        },
         // A parentless subject undoes to bd's detach form, not to some invented parent.
-        { verb: "reparent", id: "anton-b", parent: "anton-card", undoParent: "" },
+        { verb: "reparent", id: "anton-b", claim: "", parent: "anton-card", undoParent: "" },
       ],
     });
   });
@@ -300,7 +330,7 @@ describe("planApply — what an approval means against the board as it now is", 
     expect(planApply(LINK, board)).toEqual({
       status: "apply",
       summary: "recorded that anton-b blocks anton-a",
-      steps: [{ verb: "link", id: "anton-a", blocker: "anton-b" }],
+      steps: [{ verb: "link", id: "anton-a", claim: "", blocker: "anton-b" }],
     });
   });
 
@@ -371,6 +401,30 @@ describe("planApply — what an approval means against the board as it now is", 
     ).toEqual({ status: "settled", summary: "anton-a is already abandoned" });
   });
 
+  // A supersede's outcome is narrower than "the subject settled": it is the POINTER at where the
+  // work landed. A subject closed by any other means since the filing carries no such edge, so
+  // closing the proposal as answered would claim a record the board never got.
+  it("settles a supersede only where the board records the edge, and refuses where it does not", () => {
+    const survivor = bead("anton-b", { status: "closed" });
+    expect(planApply(SUPERSEDE, [supersededBy("anton-a", "anton-b"), survivor])).toEqual({
+      status: "settled",
+      summary: "anton-a is already superseded by anton-b",
+    });
+
+    const byHand = planApply(SUPERSEDE, [bead("anton-a", { status: "closed" }), survivor]);
+    expect(byHand).toMatchObject({ status: "refuse" });
+    expect(byHand.status === "refuse" && byHand.reason).toMatch(
+      /nothing on the board records it as superseded by anton-b/,
+    );
+    // An abandoned subject is the same gap: a won't-do says nothing about where work landed.
+    const abandoned = bead("anton-a", { labels: [LABELS.abandoned], status: "closed" });
+    expect(planApply(SUPERSEDE, [abandoned, survivor])).toMatchObject({ status: "refuse" });
+    // …and an edge pointing at some OTHER bead is not this proposal's answer either.
+    expect(
+      planApply(SUPERSEDE, [supersededBy("anton-a", "anton-c"), survivor]),
+    ).toMatchObject({ status: "refuse" });
+  });
+
   describe("refusals — every one of them writes nothing at all", () => {
     const refusal = (decision: ReturnType<typeof planApply>): string => {
       expect(decision.status).toBe("refuse");
@@ -425,6 +479,15 @@ describe("planApply — what an approval means against the board as it now is", 
     it("refuses to supersede when the survivor is open again — nothing landed over there", () => {
       const board = [bead("anton-a"), bead("anton-b")];
       expect(refusal(planApply(SUPERSEDE, board))).toMatch(/has not landed/);
+    });
+
+    // Abandoned is `closed` PLUS a label, so a status check alone reads a recorded won't-do as
+    // delivered work — and retires the last live copy of it in favour of a bead nobody will finish.
+    it("refuses to supersede onto an ABANDONED survivor — closed, but nothing was delivered", () => {
+      const dropped = bead("anton-b", { labels: [LABELS.abandoned], status: "closed" });
+      expect(refusal(planApply(SUPERSEDE, [bead("anton-a"), dropped]))).toMatch(
+        /anton-b is abandoned — a recorded won't-do delivered nothing/,
+      );
     });
 
     // Settling a run target with work still under it is how an approval could CREATE the very state
@@ -600,6 +663,65 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     ]);
   });
 
+  // A survivor abandoned in the window between the proposal and the approval stays `closed`, so the
+  // status alone still reads as "the work landed over there". It did not: superseding onto it would
+  // retire the last live copy of the work in favour of a recorded won't-do.
+  it("refuses a survivor abandoned since the snapshot, under the write lock", async () => {
+    const supersede = proposalFor(SUPERSEDE);
+    liveBeads.set("anton-b", bead("anton-b", { labels: [LABELS.abandoned], status: "closed" }));
+
+    await expect(
+      apply(supersede, [bead("anton-a"), bead("anton-b", { status: "closed" }), supersede]),
+    ).rejects.toMatchObject({ failure: "refused" });
+    expect(calls).toEqual([
+      `note ${supersede.id} gardener: apply FAILED — cannot apply ${supersede.id}: anton-b is abandoned — a recorded won't-do delivered nothing, so anton-a is not superseded by it`,
+    ]);
+  });
+
+  // A re-parent is the one verb whose subject can move without changing status, so the status checks
+  // above see nothing: another approval or an operator re-homing it is a NEWER decision than this
+  // plan, and applying over it would silently undo their move.
+  it("refuses a subject another write has re-parented since the plan was made", async () => {
+    const proposal = proposalFor(REPARENT);
+    liveBeads.set("anton-a", child("anton-a", "anton-elsewhere"));
+
+    await expect(
+      apply(proposal, [CARD, child("anton-a", "anton-old"), proposal]),
+    ).rejects.toMatchObject({ failure: "refused" });
+    expect(calls).toEqual([
+      `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-a now sits under anton-elsewhere rather than anton-old — it was re-parented since this proposal was filed, and moving it to anton-card would overwrite that`,
+    ]);
+  });
+
+  // Two approvals whose snapshots each say the card is empty: a re-parent attaching work under it
+  // takes the SAME lock this settle holds, so re-reading the subtree under that lock is what orders
+  // them. Without it the newcomer is left beneath a card no run will ever reach.
+  it("refuses to settle a bead that gained open work under it since the snapshot", async () => {
+    const proposal = proposalFor(CLOSE);
+    liveBeads.set("anton-t9", child("anton-t9", "anton-a"));
+
+    await expect(
+      apply(proposal, [bead("anton-a", { issue_type: "feature" }), proposal]),
+    ).rejects.toMatchObject({ failure: "refused" });
+    expect(calls).toEqual([
+      `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-a has open work under it (anton-t9) since this proposal was filed — settling it would strand that work beneath a card nothing will run`,
+    ]);
+  });
+
+  it("settles a bead whose subtree is all closed, on the board as the lock reads it", async () => {
+    const proposal = proposalFor(CLOSE);
+    const board = [
+      bead("anton-a", { issue_type: "feature" }),
+      child("anton-t1", "anton-a", { status: "closed" }),
+      proposal,
+    ];
+
+    const result = await apply(proposal, board);
+
+    expect(result.changed).toEqual(["anton-a"]);
+    expect(calls[0]).toBe("close anton-a closed by an approved gardener proposal (shipped-orphan)");
+  });
+
   // A rollback must undo THIS apply's move, not whatever the bead's parent happens to be now: a
   // concurrent approval of a different proposal can move the same subject between the per-step
   // locks, and restoring the old parent over it would clobber a move that is now the board's truth.
@@ -632,6 +754,44 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     expect(calls).toEqual([
       `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-a is mid-run — a run holds a live lease on it (runner-1), so retiring it would race the run that owns it`,
     ]);
+  });
+
+  // The lease is published a moment AFTER the assignee and in_progress that `bd --claim` writes as
+  // one act, so for that window a freshly claimed bead reads as unowned work to the in-flight bar.
+  // A pickup queues on the same per-bead chain this apply locks, which is what makes the window
+  // closable at all: take the claim protocol's lock and then ignore what the claim wrote, and the
+  // move lands on work a runner has already started.
+  it("refuses a subject claimed after the snapshot, before its run-lease is published", async () => {
+    const proposal = proposalFor(DEFER);
+    liveBeads.set("anton-a", bead("anton-a", { assignee: "runner-7", status: "in_progress" }));
+
+    await expect(apply(proposal, [bead("anton-a"), proposal])).rejects.toMatchObject({
+      failure: "refused",
+    });
+    expect(calls).toEqual([
+      `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-a was claimed by runner-7 since this proposal was decided — retiring it would pull the bead out from under the run that now owns it`,
+    ]);
+  });
+
+  // The stale-in-progress detector proposes against beads that are ALREADY claimed — a claim that
+  // outlived its run is the whole finding. Refusing on the claim the plan itself was decided against
+  // would make that proposal permanently unapprovable.
+  it("applies to a bead whose claim the plan already saw, and to one released since", async () => {
+    for (const live of [
+      bead("anton-a", { assignee: "runner-7", status: "in_progress" }),
+      bead("anton-a", { status: "open" }),
+    ]) {
+      calls.length = 0;
+      liveBeads.clear();
+      liveBeads.set("anton-a", live);
+      const proposal = proposalFor(DEFER);
+      const claimed = bead("anton-a", { assignee: "runner-7", status: "in_progress" });
+
+      await expect(apply(proposal, [claimed, proposal])).resolves.toMatchObject({
+        changed: ["anton-a"],
+      });
+      expect(calls[0]).toBe("defer anton-a");
+    }
   });
 
   it("refuses a subject that settled after the snapshot, per verb", async () => {

@@ -43,19 +43,45 @@ import {
 /** The `notes` prefix every gardener apply writes under — one line, like anton's other job notes. */
 const NOTE_PREFIX = "gardener";
 
+/** What every step carries about the bead it writes to, whatever the verb. */
+interface StepSubject {
+  id: string;
+  /**
+   * The run claim the subject carried when this step was DECIDED, or `""` for none — captured like
+   * `undoParent`, and re-compared under the write lock (see {@link subjectMoved}).
+   *
+   * It exists because a claim is not visible as in-flight for its first moments: `beads.claimVerified`
+   * writes the assignee and `in_progress` first and publishes the run-lease afterwards, so a bead in
+   * that window reads as unowned work to {@link isInFlight}. A pickup serializes on the same per-bead
+   * chain this apply locks, so without capturing the claim the apply takes the claim protocol's own
+   * lock and then ignores what the claim wrote.
+   */
+  claim: string;
+}
+
 /** One board write an approved proposal resolves to, with whatever it takes to undo it. */
 export type ApplyStep =
-  | {
+  | (StepSubject & {
       verb: "reparent";
-      id: string;
       parent: string;
       /** The parent to restore on rollback; `""` is bd's detach form, for a bead that had none. */
       undoParent: string;
-    }
-  | { verb: "link"; id: string; blocker: string }
-  | { verb: "close"; id: string; reason: string }
-  | { verb: "supersede"; id: string; replacement: string }
-  | { verb: "defer"; id: string };
+    })
+  | (StepSubject & { verb: "link"; blocker: string })
+  | (StepSubject & { verb: "close"; reason: string })
+  | (StepSubject & { verb: "supersede"; replacement: string })
+  | (StepSubject & { verb: "defer" });
+
+/**
+ * Who a RUN holds this bead for, or `""` when nobody does. `bd update --claim` — the worker pickup
+ * primitive behind `beads.claimVerified` — writes the assignee and `in_progress` as one act, so that
+ * pair IS the claim. A bare `bd assign` reserves a bead for a person without starting work on it
+ * (DESIGN.md §Soft-lock) and deliberately does not count.
+ */
+function runClaimOf(bead: Bead): string {
+  if (bead.status !== "in_progress") return "";
+  return bead.assignee || "an unnamed runner";
+}
 
 /**
  * What approving this proposal means against the board AS IT NOW IS:
@@ -142,7 +168,13 @@ function planReparent(plan: GardenerPlan, index: BoardIndex, nowMs: number): App
         reason: `${plan.target} sits under ${id} — re-parenting it there would make the subtree its own ancestor`,
       };
     }
-    steps.push({ verb: "reparent", id, parent: plan.target, undoParent: currentParent ?? "" });
+    steps.push({
+      verb: "reparent",
+      id,
+      claim: runClaimOf(subject),
+      parent: plan.target,
+      undoParent: currentParent ?? "",
+    });
   }
 
   if (steps.length === 0) {
@@ -209,7 +241,7 @@ function planLink(plan: GardenerPlan, index: BoardIndex, nowMs: number): ApplyDe
 
   return {
     status: "apply",
-    steps: [{ verb: "link", id, blocker: plan.target }],
+    steps: [{ verb: "link", id, claim: runClaimOf(blocked), blocker: plan.target }],
     summary: `recorded that ${plan.target} blocks ${id}`,
   };
 }
@@ -226,6 +258,20 @@ function planRetire(plan: GardenerPlan, index: BoardIndex, nowMs: number): Apply
   // "open + abandoned" state a crashed abandon can leave — retiring it with `close` would turn a
   // recorded won't-do into work that reads as shipped, which is the one lie retirement must not tell.
   if (subject.status === "closed" || beads.isAbandoned(subject)) {
+    // …except a SUPERSEDE, whose outcome is narrower than "settled": it records where the work
+    // landed, and only the `supersedes` edge carries that answer. A subject closed or abandoned by
+    // other means since the filing has no such edge, so settling here would close the ask as
+    // answered while its one product — the pointer at the survivor — was never written.
+    if (plan.retireAs === "supersede") {
+      if (!plan.target) return { status: "refuse", reason: NO_SURVIVOR };
+      if (!index.recordsSupersedes(id, plan.target)) {
+        return {
+          status: "refuse",
+          reason: `${id} is ${settledWord(subject)}, but nothing on the board records it as superseded by ${plan.target} — it settled by other means, so this proposal's answer to "where did the work go" was never written; decline it, and supersede by hand if that is still the record you want`,
+        };
+      }
+      return { status: "settled", summary: `${id} is already superseded by ${plan.target}` };
+    }
     return { status: "settled", summary: `${id} is already ${settledWord(subject)}` };
   }
   if (plan.retireAs === "defer" && beads.isDeferred(subject)) {
@@ -255,26 +301,26 @@ function planRetire(plan: GardenerPlan, index: BoardIndex, nowMs: number): Apply
     case "close":
       return {
         status: "apply",
-        steps: [{ verb: "close", id, reason: closeReason(plan) }],
+        steps: [{ verb: "close", id, claim: runClaimOf(subject), reason: closeReason(plan) }],
         summary: `closed ${id} as shipped`,
       };
     case "defer":
       return {
         status: "apply",
-        steps: [{ verb: "defer", id }],
+        steps: [{ verb: "defer", id, claim: runClaimOf(subject) }],
         summary: `deferred ${id} out of the ready set`,
       };
     case "supersede": {
-      if (!plan.target) {
-        return { status: "refuse", reason: "this proposal names no bead that superseded it" };
-      }
+      if (!plan.target) return { status: "refuse", reason: NO_SURVIVOR };
       const survivor = index.byId.get(plan.target);
       if (!survivor) return { status: "refuse", reason: missing(plan.target) };
       const survivorGone = survivorUnusable(survivor, id);
       if (survivorGone) return { status: "refuse", reason: survivorGone };
       return {
         status: "apply",
-        steps: [{ verb: "supersede", id, replacement: plan.target }],
+        steps: [
+          { verb: "supersede", id, claim: runClaimOf(subject), replacement: plan.target },
+        ],
         summary: `closed ${id} as superseded by ${plan.target}`,
       };
     }
@@ -462,6 +508,9 @@ const DOING: Record<ApplyStep["verb"], string> = {
   defer: "retiring it",
 };
 
+/** The verbs that SETTLE the subject — the ones that would strand whatever still hangs under it. */
+const SETTLING: ReadonlySet<ApplyStep["verb"]> = new Set(["close", "supersede"]);
+
 /**
  * The bead a step points AT rather than writes to: a re-parent's new home, a link's blocker, a
  * supersede's survivor. The move's correctness rests on it as surely as on the subject — attaching
@@ -497,10 +546,13 @@ function counterpartOf(step: ApplyStep): string | undefined {
  * the subject — a run claiming the HOME between the decision and the write has already selected its
  * tickets, so work attached now rides along unrun and is stranded when that run settles the card.
  *
- * What stays with the snapshot decision is the board-wide topology — is the home a card, would the
- * move close a cycle, does the subject still carry open descendants. Those rest on beads this step
- * never names, so no set of locks taken here would make them any fresher than the read they came
- * from; re-deriving them per step would buy a whole board read and still guarantee nothing.
+ * One topology question is re-asked under the locks rather than left with the snapshot: whether a
+ * bead about to be SETTLED still has open work under it (see {@link assertNothingStranded}). It
+ * earns its board read because attaching that work is itself a locked write on this same bead — a
+ * re-parent takes its new home's lock — so the two approvals genuinely order against each other.
+ * The rest of the board-wide topology stays with the snapshot: whether the home is a card, whether
+ * the edge closes a cycle. Those rest on beads no lock taken here covers, so re-deriving them per
+ * step would buy a whole board read and still guarantee nothing.
  */
 async function applyStep(repo: string, step: ApplyStep): Promise<void> {
   const counterpart = counterpartOf(step);
@@ -514,8 +566,39 @@ async function applyStep(repo: string, step: ApplyStep): Promise<void> {
       const otherMoved = counterpartMoved(step, counterpart, other, Date.now());
       if (otherMoved) throw new SubjectMovedError(otherMoved);
     }
+    if (SETTLING.has(step.verb)) await assertNothingStranded(repo, step.id);
     await runStep(repo, step);
   });
+}
+
+/**
+ * Refuse to settle a bead that still has open work beneath it, judged from a board read taken INSIDE
+ * the subject's write lock rather than from the approval's snapshot.
+ *
+ * `planApply` asks the same question of the snapshot, and against a lone approval that is enough.
+ * What it cannot see is a CONCURRENT one: a re-parent approval attaching work under this bead takes
+ * this bead's write lock too (it is that step's home — see {@link applyStep}), so the two orders are
+ * already serialized, and re-asking here is what makes the ordering mean something. Either the
+ * re-parent lands first and this read finds the newcomer, or this settle lands first and the
+ * re-parent's own home re-check refuses. Without it, both pass against snapshots taken before either
+ * wrote, and the newly attached ticket is left beneath a card no run will ever reach.
+ */
+async function assertNothingStranded(repo: string, id: string): Promise<void> {
+  let board: Bead[];
+  try {
+    board = await beads.list(repo, ["--status", "all"]);
+  } catch (e) {
+    // Same call as `reread`'s: a board we could not read says nothing, so the step refuses.
+    throw new SubjectMovedError(
+      `the board could not be re-read before settling ${id} (${messageOf(e)}) — nothing was written`,
+    );
+  }
+  const open = indexBoard(board).openDescendants(id);
+  if (open.length > 0) {
+    throw new SubjectMovedError(
+      `${id} has open work under it (${namesSome(open.map((b) => b.id))}) since this proposal was filed — settling it would strand that work beneath a card nothing will run`,
+    );
+  }
 }
 
 /** A bead read from inside its own write lock. A read that FAILED is never a bead that vanished. */
@@ -538,6 +621,27 @@ function subjectMoved(step: ApplyStep, subject: Bead | undefined, nowMs: number)
     return `${step.id} is ${settledWord(subject)} — the board moved on since this was proposed`;
   }
   if (isInFlight(subject, nowMs)) return inFlightReason(subject, nowMs, DOING[step.verb]);
+  // A pickup that landed since this step was decided, in the window `isInFlight` cannot see: the
+  // claim writes assignee + `in_progress` and publishes the run-lease a moment later. That sequence
+  // serializes on the very per-bead chain this apply holds, so the claim either lands before the
+  // re-read above or queues behind this write — and refusing here is what makes that ordering worth
+  // anything. A claim the plan already saw is not news (the stale-in-progress detector proposes
+  // against exactly those); one since RELEASED leaves the bead freer than the plan assumed. So only
+  // a new owner refuses.
+  const claim = runClaimOf(subject);
+  if (claim && claim !== step.claim) {
+    return `${step.id} was claimed by ${claim} since this proposal was decided — ${DOING[step.verb]} would pull the bead out from under the run that now owns it`;
+  }
+  // A re-parent is the one verb whose subject can move WITHOUT changing status: another approval or
+  // an operator re-homing it since the plan was made is a newer decision than this one, and writing
+  // over it would silently undo their move — then, on a cluster rollback, restore a parent two moves
+  // stale. Landing where this step was already headed is the same move, so it stays idempotent.
+  if (step.verb === "reparent") {
+    const parent = beads.parentOf(subject) ?? "";
+    if (parent !== step.undoParent && parent !== step.parent) {
+      return `${step.id} now sits under ${home(parent)} rather than ${home(step.undoParent)} — it was re-parented since this proposal was filed, and moving it to ${step.parent} would overwrite that`;
+    }
+  }
   return undefined;
 }
 
@@ -659,6 +763,11 @@ function closeReason(plan: GardenerPlan): string {
 const missing = (id: string): string =>
   `${id} is no longer on the board — the proposal describes a board that has changed`;
 
+/** A parent id as a refusal names it — `""` is bd's detached form, not a bead called nothing. */
+const home = (parentId: string): string => parentId || "no parent";
+
+const NO_SURVIVOR = "this proposal names no bead that superseded it";
+
 /**
  * Why this bead can no longer be a re-parent HOME, or undefined. A settled home hangs the work off a
  * card nothing will run; a home a run OWNS is worse — that run already selected the tickets it will
@@ -689,8 +798,15 @@ function blockerUnusable(blocker: Bead, blockedId: string): string | undefined {
  * Why this bead is not a survivor `subjectId` can be superseded by, or undefined. The whole claim is
  * "the work landed over there": a survivor that is open again means it did not, and closing the
  * subject would write off work nothing has delivered.
+ *
+ * ABANDONED is the case a status check alone gets wrong — it IS `closed`, plus a label that says the
+ * work was explicitly not done. Superseding onto it would retire the last live copy of the work in
+ * favour of a recorded won't-do. Same bar `detectSuperseded` emits under (retire.ts).
  */
 function survivorUnusable(survivor: Bead, subjectId: string): string | undefined {
+  if (beads.isAbandoned(survivor)) {
+    return `${survivor.id} is abandoned — a recorded won't-do delivered nothing, so ${subjectId} is not superseded by it`;
+  }
   if (survivor.status !== "closed") {
     return `${survivor.id} is ${survivor.status} again — it has not landed, so ${subjectId} is not superseded by it`;
   }
