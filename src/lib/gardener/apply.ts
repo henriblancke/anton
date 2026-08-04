@@ -1402,6 +1402,11 @@ async function rollbackSteps(repo: string, applied: ApplyStep[]): Promise<string
       adopted.length > 0
         ? `${list(adopted)} was left in place because a run has since started on the card it was moved under, and detaching it would pull a ticket out of a selection that run has already made`
         : undefined,
+      // Named here too: a human told to settle the board by hand needs every bead sitting somewhere
+      // unexpected, not just the ones this rollback failed on.
+      overtaken.length > 0
+        ? `${list(overtaken)} was left where another write has since moved it`
+        : undefined,
     ].filter((clause): clause is string => clause !== undefined);
     return ` — ROLLBACK INCOMPLETE: ${why.join("; ")} — a human has to settle it`;
   }

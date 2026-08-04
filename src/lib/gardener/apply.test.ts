@@ -1559,6 +1559,45 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     expect(calls.some((c) => c.startsWith(`close ${proposal.id}`))).toBe(false);
   });
 
+  // An incomplete rollback is the one message a human acts on by hand, so it has to name EVERY bead
+  // left somewhere other than where it started — including the ones a concurrent write moved, which
+  // are otherwise only reported when the rollback was otherwise clean.
+  it("names overtaken subjects alongside the ones it could not restore", async () => {
+    const plan = planFor({
+      kind: "parentless-cluster",
+      move: "reparent",
+      subjects: ["anton-a", "anton-b", "anton-c"],
+      target: CARD.id,
+    });
+    const proposal = proposalFor(plan);
+    const board = [
+      CARD,
+      child("anton-a", "anton-old"),
+      child("anton-b", "anton-old"),
+      child("anton-c", "anton-old"),
+      proposal,
+    ];
+    failOn.set("reparent:anton-c", 1);
+    onWrite = (call) => {
+      if (call !== "reparent anton-b anton-card") return;
+      // Someone else's approval moves anton-a on; anton-b becomes unreadable.
+      liveBeads.set("anton-a", child("anton-a", "anton-elsewhere"));
+      liveBeads.set("anton-b", undefined);
+    };
+
+    await expect(apply(proposal, board)).rejects.toThrow(
+      /ROLLBACK INCOMPLETE: anton-b could not be restored; anton-a was left where another write has since moved it/,
+    );
+
+    // Neither was written to twice: no blind restore, no clobbering the newer move.
+    expect(calls.filter((c) => c.startsWith("reparent"))).toEqual([
+      "reparent anton-a anton-card",
+      "reparent anton-b anton-card",
+      "reparent anton-c anton-card",
+    ]);
+    expect(calls.some((c) => c.startsWith(`close ${proposal.id}`))).toBe(false);
+  });
+
   it("refuses a stale plan without writing anything, and notes why on the proposal", async () => {
     const proposal = proposalFor(REPARENT);
     const board = [CARD, bead("anton-a", { status: "closed" }), proposal];

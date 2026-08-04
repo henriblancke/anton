@@ -489,6 +489,32 @@ describe("retirement candidates", () => {
     expect(detection.target).toBe("anton-landed");
   });
 
+  // The survivor is "the twin that carries the work's history", which is a question about MOMENTS,
+  // not about strings: bd stamps that differ in UTC offset order the wrong way lexicographically, and
+  // the loser would be recorded as where the work landed.
+  it("picks the chronologically newest twin when the stamps carry different offsets", () => {
+    const detection = only(
+      detect(
+        [
+          feature("anton-live", { title: "Ship the thing" }),
+          feature("anton-earlier", {
+            title: "Ship the thing",
+            status: "closed",
+            updated_at: "2026-07-02T00:30:00+05:30", // 2026-07-01T19:00Z
+          }),
+          feature("anton-newest", {
+            title: "Ship the thing",
+            status: "closed",
+            updated_at: "2026-07-01T20:00:00Z",
+          }),
+        ],
+        [duplicate(["anton-earlier", "anton-newest", "anton-live"])],
+      ),
+    );
+
+    expect(detection.target).toBe("anton-newest");
+  });
+
   it("leaves a duplicate group with no landed member to the report", () => {
     expect(
       detect(

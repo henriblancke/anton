@@ -20,6 +20,7 @@ import {
   isClaimed,
   isInFlight,
   isOpenWork,
+  stampMsOf,
   stampOf,
   ticketOwnerOf,
   type BoardIndex,
@@ -287,13 +288,19 @@ const rankOf = (d: GardenerDetection): number => {
   return rank === -1 ? RETIRE_PRECEDENCE.length : rank;
 };
 
-/** Newest first; an undated bead sorts last, then by id so the pick is stable across patrols. */
+/**
+ * Newest first; an undated bead sorts last, then by id so the pick is stable across patrols.
+ *
+ * Compared as epoch ms, not as strings: ISO stamps only order lexicographically when they share an
+ * offset, and picking the wrong twin as survivor points the supersede proposal at the bead that does
+ * NOT carry the work's most recent history.
+ */
 function byRecencyThenId(a: Bead, b: Bead): number {
-  const sa = stampOf(a);
-  const sb = stampOf(b);
+  const sa = stampMsOf(a);
+  const sb = stampMsOf(b);
   if (sa !== sb) {
-    if (!sa) return 1;
-    if (!sb) return -1;
+    if (sa === undefined) return 1;
+    if (sb === undefined) return -1;
     return sa > sb ? -1 : 1;
   }
   return a.id < b.id ? -1 : 1;
