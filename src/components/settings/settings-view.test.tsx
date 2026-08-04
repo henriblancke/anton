@@ -3,12 +3,11 @@
  * Budget-policy knobs in the settings form (anton-egrg): the daytime-reserve and weekly-target
  * inputs seed from a persisted policy (round-trip in), and Save PATCHes the edited values back.
  */
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { toast } from "sonner";
 
 import { SettingsView } from "@/components/settings/settings-view";
-import { formatExactTime } from "@/lib/time";
 import type { Project } from "@/lib/types";
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn() }) }));
@@ -65,9 +64,22 @@ function stubFetch() {
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  window.location.hash = "";
 });
 
+/**
+ * The nav switches which panel renders (anton-ue90.3) and the URL hash is that choice, so a test
+ * that exercises one section says which one before rendering — exactly as a deep link would.
+ */
+function showing(section: string) {
+  beforeEach(() => {
+    window.location.hash = `#${section}`;
+  });
+}
+
 describe("SettingsView budget policy (anton-egrg)", () => {
+  showing("execution");
+
   it("seeds the two knobs from a persisted policy (round-trip in)", () => {
     renderView({ budgetPolicy: { daytimeReservePct: 25, weeklyTargetPct: 80 } });
     expect((screen.getByLabelText("Daytime reserve") as HTMLInputElement).value).toBe("25");
@@ -109,6 +121,8 @@ describe("SettingsView budget policy (anton-egrg)", () => {
 });
 
 describe("SettingsView budget-aware master-switch (anton-7mpv.1)", () => {
+  showing("execution");
+
   it("is off by default and disables the knobs", () => {
     renderView({});
     expect(screen.getByRole("switch", { name: "Budget-aware execution" }).getAttribute("aria-checked")).toBe("false");
@@ -125,6 +139,10 @@ describe("SettingsView budget-aware master-switch (anton-7mpv.1)", () => {
   it("PATCHes budgetAware:false when left off (round-trip out)", () => {
     const fetchMock = stubFetch();
     renderView({});
+    // Save is only offered once something is staged (anton-ue90.3), so dirty an unrelated knob: the
+    // claim under test is that the untouched flag still goes out as an explicit false, not as an
+    // omission the server would read as "leave it alone".
+    fireEvent.click(screen.getByRole("switch", { name: "Autonomous execution" }));
     fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
     const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
     expect(body.budgetAware).toBe(false);
@@ -132,6 +150,8 @@ describe("SettingsView budget-aware master-switch (anton-7mpv.1)", () => {
 });
 
 describe("SettingsView self-review section (anton-of1m)", () => {
+  showing("review");
+
   const reviewers: Parameters<typeof SettingsView>[0]["agents"] = [
     { id: "nextjs", source: "bundled", description: "frontend" },
     { id: "my-reviewer", source: "project" },
@@ -296,6 +316,8 @@ describe("SettingsView self-review section (anton-of1m)", () => {
 });
 
 describe("SettingsView pipeline variants (anton-aa3m)", () => {
+  showing("variants");
+
   it("shows the zero-config state: no variants, one pipeline for everything", () => {
     renderView({});
     expect(screen.getByText(/No variants — every run walks/)).toBeTruthy();
@@ -366,10 +388,15 @@ describe("SettingsView pipeline variants (anton-aa3m)", () => {
   });
 });
 
-describe("SettingsView automation cadence (anton-bfwq)", () => {
-  /** A fixed future instant, in the epoch SECONDS the schedules row stores. */
-  const NEXT_RUN = Math.floor(Date.UTC(2026, 7, 3, 10, 0, 0) / 1000);
-  const LATER_RUN = NEXT_RUN + 3600;
+describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
+  showing("automation");
+
+  /**
+   * Anchored to the real clock, a comfortable distance from the rounding boundary: the Next-run
+   * column is a countdown, so a fixed calendar instant would drift into the past and read "due now".
+   */
+  const NEXT_RUN = Math.floor(Date.now() / 1000) + 2 * 3600 + 60;
+  const LAST_RUN = Math.floor(Date.now() / 1000) - 3 * 3600 - 60;
 
   /** The schedule row shape the settings page passes through, defaulted to a half-hourly stringer. */
   function stringer(
@@ -402,129 +429,170 @@ describe("SettingsView automation cadence (anton-bfwq)", () => {
     return JSON.parse((fetchMock.mock.calls[call][1] as RequestInit).body as string);
   }
 
-  const cadencePicker = () => screen.getByRole("combobox", { name: "nightly-stringer cadence" });
+  const cadenceButton = (name = "nightly-stringer") =>
+    screen.getByRole("button", { name: `${name} cadence` });
 
-  /**
-   * Open the row's picker and choose one of its items. The popup commits on pointerup (base-ui),
-   * so a bare click never selects — drive the same pointer sequence a mouse produces.
-   */
-  async function chooseCadence(option: string | RegExp) {
-    fireEvent.click(cadencePicker());
-    const item = await screen.findByRole("option", { name: option });
-    fireEvent.pointerDown(item, { pointerType: "mouse", button: 0 });
-    fireEvent.pointerUp(item, { pointerType: "mouse", button: 0 });
-    fireEvent.click(item);
+  /** Open one row's cadence editor. A popover, so the rows below it never move. */
+  function openEditor(name = "nightly-stringer") {
+    fireEvent.click(cadenceButton(name));
   }
 
-  const at = (seconds: number) => formatExactTime(new Date(seconds * 1000).toISOString());
+  const frequency = (label: string) => screen.getByRole("button", { name: label });
+  const setCadence = () => screen.getByRole("button", { name: "Set cadence" }) as HTMLButtonElement;
 
   afterEach(() => {
     vi.mocked(toast.error).mockClear();
     vi.mocked(toast.success).mockClear();
   });
 
-  it("shows the stored cadence and next run, not hardcoded copy", () => {
-    renderView({}, [], stringer());
+  it("shows the stored cadence, and when it last and next fires", () => {
+    renderView({}, [], stringer({ lastRunAt: LAST_RUN }));
 
-    expect(cadencePicker().textContent).toContain("Every 30 minutes");
-    expect(screen.getByText(`scan → triage · next ${at(NEXT_RUN)}`)).toBeTruthy();
+    expect(cadenceButton().textContent).toContain("Every 30 minutes");
+    expect(screen.getByText("in 2h")).toBeTruthy();
+    expect(screen.getByText("3h ago")).toBeTruthy();
     // The cron strings that used to be baked into AUTOMATIONS are gone from the row copy.
     expect(screen.queryByText(/0 3 \* \* \*/)).toBeNull();
-    expect(screen.queryByText(/poll PRs every 15m/)).toBeNull();
+  });
+
+  it("says an automation has never run rather than leaving the column blank", () => {
+    renderView({}, [], stringer());
+    // Every row but the stringer has no schedule row at all, so "never" is the honest answer.
+    expect(screen.getAllByText("never").length).toBeGreaterThan(0);
   });
 
   it("reads 'not scheduled' when the automation is off or has no row", () => {
     renderView({}, [], stringer({ enabled: false, nextRunAt: undefined }));
 
-    expect(screen.getByText("scan → triage · not scheduled")).toBeTruthy();
+    expect(screen.getAllByText("not scheduled").length).toBe(7);
     // gardener has no row at all — it still shows the cadence it would be created at.
-    expect(
-      screen.getByRole("combobox", { name: "gardener cadence" }).textContent,
-    ).toContain("Daily at 05:00");
-    expect(screen.getByText(/board hygiene patrol.*· not scheduled$/)).toBeTruthy();
+    expect(cadenceButton("gardener").textContent).toContain("Daily at 05:00");
   });
 
-  it("PATCHes a chosen preset and renders the next run the server computed", async () => {
+  it("says which automations are idle because the one that feeds them is off", () => {
+    // unstick acts on run-health's findings, and both ship disabled. Without this the operator reads
+    // a healthy no-op as a failure.
+    renderView({}, [], stringer());
+    expect(screen.getByText(/idle until run-health is on/)).toBeTruthy();
+  });
+
+  it("PATCHes a cadence built from the frequency picker, with no cron typed", async () => {
     const fetchMock = stubSchedulePatch({
       type: "nightly-stringer",
       enabled: true,
       cron: "0 * * * *",
-      nextRunAt: LATER_RUN,
+      nextRunAt: NEXT_RUN + 3600,
     });
     renderView({}, [], stringer());
 
-    await chooseCadence("Hourly, on the hour");
+    openEditor();
+    fireEvent.click(frequency("Hourly"));
+    fireEvent.click(setCadence());
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     expect(fetchMock.mock.calls[0][0]).toBe("/api/projects/tmp/schedules");
     expect(body(fetchMock)).toEqual({ type: "nightly-stringer", cron: "0 * * * *" });
-    await waitFor(() =>
-      expect(screen.getByText(`scan → triage · next ${at(LATER_RUN)}`)).toBeTruthy(),
-    );
-    expect(cadencePicker().textContent).toContain("Hourly, on the hour");
+    await waitFor(() => expect(cadenceButton().textContent).toContain("Hourly, on the hour"));
+    // Committing closes the popover — the operator is done with it.
+    expect(screen.queryByRole("button", { name: "Set cadence" })).toBeNull();
+  });
+
+  it("previews when the cadence will actually fire, before it is committed", () => {
+    renderView({}, [], stringer());
+    openEditor();
+    fireEvent.click(frequency("Daily"));
+
+    expect(screen.getByText("Next 3 runs")).toBeTruthy();
+    // The footer shows the expression the draft stands for — staged, not stored: the row behind the
+    // popover still reads the cadence that actually fires.
+    expect(screen.getByText("0 3 * * *")).toBeTruthy();
+    expect(cadenceButton().textContent).toContain("Every 30 minutes");
   });
 
   it("reverts the row and toasts when the PATCH fails", async () => {
     stubSchedulePatch({ error: "invalid cron" }, 400);
     renderView({}, [], stringer());
 
-    await chooseCadence("Hourly, on the hour");
+    openEditor();
+    fireEvent.click(frequency("Hourly"));
+    fireEvent.click(setCadence());
 
     await waitFor(() => expect(toast.error).toHaveBeenCalledWith("invalid cron"));
-    expect(cadencePicker().textContent).toContain("Every 30 minutes");
-    expect(screen.getByText(`scan → triage · next ${at(NEXT_RUN)}`)).toBeTruthy();
+    expect(cadenceButton().textContent).toContain("Every 30 minutes");
+    expect(screen.getByText("in 2h")).toBeTruthy();
   });
 
-  it("blocks an invalid custom cron with the parser's own message, then saves a valid one", async () => {
+  it("keeps the raw expression reachable, seeded with what the picker would store", () => {
+    renderView({}, [], stringer());
+    openEditor();
+    fireEvent.click(frequency("Cron"));
+
+    expect(
+      (screen.getByLabelText("nightly-stringer cron expression") as HTMLInputElement).value,
+    ).toBe("*/30 * * * *");
+  });
+
+  it("opens straight on the raw editor for an expression no preset can spell", () => {
+    // A hand-written cadence must round-trip: opening the editor on a preset would silently offer to
+    // overwrite it.
+    renderView({}, [], stringer({ cron: "0 0,12 * * 1-5" }));
+    openEditor();
+
+    expect(
+      (screen.getByLabelText("nightly-stringer cron expression") as HTMLInputElement).value,
+    ).toBe("0 0,12 * * 1-5");
+  });
+
+  it("blocks an invalid cron with the parser's own message, then saves a valid one", async () => {
     const fetchMock = stubSchedulePatch({
       type: "nightly-stringer",
       enabled: true,
       cron: "0 6 * * *",
-      nextRunAt: LATER_RUN,
+      nextRunAt: NEXT_RUN,
     });
     renderView({}, [], stringer());
 
-    await chooseCadence("Custom cron…");
+    openEditor();
+    fireEvent.click(frequency("Cron"));
     const input = screen.getByLabelText("nightly-stringer cron expression") as HTMLInputElement;
-    expect(input.value).toBe("*/30 * * * *");
 
     fireEvent.change(input, { target: { value: "nope" } });
-    const save = screen.getByRole("button", { name: "Save cadence" }) as HTMLButtonElement;
     expect(screen.getByText(/must have 5 fields/)).toBeTruthy();
-    expect(save.disabled).toBe(true);
-    fireEvent.click(save);
+    expect(setCadence().disabled).toBe(true);
+    fireEvent.click(setCadence());
     expect(fetchMock).not.toHaveBeenCalled();
 
     fireEvent.change(input, { target: { value: "0 6 * * *" } });
     expect(screen.queryByText(/must have 5 fields/)).toBeNull();
-    expect(save.disabled).toBe(false);
-    fireEvent.click(save);
+    expect(setCadence().disabled).toBe(false);
+    fireEvent.click(setCadence());
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     expect(body(fetchMock)).toEqual({ type: "nightly-stringer", cron: "0 6 * * *" });
   });
 
-  it("warns that a sub-5-minute cadence burns budget, but still lets it save", async () => {
+  it("names a fast cadence's cost in runs per day, and still lets it save", async () => {
     const fetchMock = stubSchedulePatch({
       type: "nightly-stringer",
       enabled: true,
       cron: "*/2 * * * *",
-      nextRunAt: LATER_RUN,
+      nextRunAt: NEXT_RUN,
     });
     renderView({}, [], stringer());
 
-    await chooseCadence("Custom cron…");
+    openEditor();
+    fireEvent.click(frequency("Cron"));
     fireEvent.change(screen.getByLabelText("nightly-stringer cron expression"), {
       target: { value: "*/2 * * * *" },
     });
 
-    expect(screen.getByText(/burn budget/)).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Save cadence" }));
+    // The threshold constant means nothing to an operator; 720 runs a day does.
+    expect(screen.getByText(/720 runs a day/)).toBeTruthy();
+    expect(setCadence().disabled).toBe(false);
+    fireEvent.click(setCadence());
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     expect(body(fetchMock)).toEqual({ type: "nightly-stringer", cron: "*/2 * * * *" });
-    // The warning survives the save — it describes the cadence that is now stored.
-    await waitFor(() => expect(screen.getByText(/burn budget/)).toBeTruthy());
   });
 
   it("resets an edited cadence to the automation's default", async () => {
@@ -532,25 +600,28 @@ describe("SettingsView automation cadence (anton-bfwq)", () => {
       type: "nightly-stringer",
       enabled: true,
       cron: "0 3 * * *",
-      nextRunAt: LATER_RUN,
+      nextRunAt: NEXT_RUN,
     });
     renderView({}, [], stringer({ cron: "0 9 * * *" }));
-    expect(cadencePicker().textContent).toContain("Daily at 09:00");
+    expect(cadenceButton().textContent).toContain("Daily at 09:00");
 
-    await chooseCadence("Reset to default");
+    openEditor();
+    fireEvent.click(screen.getByRole("button", { name: "Reset" }));
+    // Reset stages the default like every other edit in this popover; nothing is stored until Set.
+    expect(fetchMock).not.toHaveBeenCalled();
+    fireEvent.click(setCadence());
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     expect(body(fetchMock)).toEqual({ type: "nightly-stringer", cron: "0 3 * * *" });
-    await waitFor(() => expect(cadencePicker().textContent).toContain("Daily at 03:00"));
+    await waitFor(() => expect(cadenceButton().textContent).toContain("Daily at 03:00"));
   });
 
-  it("offers no reset once the row is already at its default cadence", async () => {
+  it("offers no reset once the row is already at its default cadence", () => {
     stubSchedulePatch();
     renderView({}, [], stringer({ cron: "0 3 * * *" }));
 
-    fireEvent.click(cadencePicker());
-    const reset = await screen.findByRole("option", { name: "Reset to default" });
-    expect(reset.getAttribute("data-disabled")).not.toBeNull();
+    openEditor();
+    expect((screen.getByRole("button", { name: "Reset" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("keeps the enable toggle patching schedules.enabled as before", async () => {
@@ -558,7 +629,7 @@ describe("SettingsView automation cadence (anton-bfwq)", () => {
       type: "gardener",
       enabled: true,
       cron: "0 5 * * *",
-      nextRunAt: LATER_RUN,
+      nextRunAt: NEXT_RUN,
     });
     renderView({}, [], stringer());
 
@@ -567,5 +638,69 @@ describe("SettingsView automation cadence (anton-bfwq)", () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     expect(body(fetchMock)).toEqual({ type: "gardener", enabled: true });
     await waitFor(() => expect(toast.success).toHaveBeenCalledWith("gardener enabled"));
+  });
+});
+
+describe("SettingsView navigation (anton-ue90.3)", () => {
+  const navButton = (name: string | RegExp) => screen.getByRole("button", { name });
+
+  it("lists every section that renders, and renders only the one selected", () => {
+    renderView({});
+
+    // The old nav named six of eight sections; these four were unreachable by name.
+    for (const label of ["Verify gates", "Pipeline variants", "Self-review", "Danger zone"]) {
+      expect(navButton(label)).toBeTruthy();
+    }
+    // General is the default panel, and nothing else is on screen with it.
+    expect(screen.getByRole("heading", { name: "General" })).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: "Verify gates" })).toBeNull();
+  });
+
+  it("changes what is displayed when a section is clicked", () => {
+    renderView({});
+    fireEvent.click(navButton("Verify gates"));
+
+    expect(screen.getByRole("heading", { name: "Verify gates" })).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: "General" })).toBeNull();
+    // …and says so in the URL, so a reload and a shared link land in the same place.
+    expect(window.location.hash).toBe("#gates");
+  });
+
+  it("opens on the section named by the URL", () => {
+    window.location.hash = "#automation";
+    renderView({});
+    expect(screen.getByRole("heading", { name: "Automation" })).toBeTruthy();
+  });
+
+  it("falls back to General for a hash that names nothing", () => {
+    window.location.hash = "#does-not-exist";
+    renderView({});
+    expect(screen.getByRole("heading", { name: "General" })).toBeTruthy();
+  });
+
+  it("names which sections are unsaved, and offers Save only when something is", () => {
+    window.location.hash = "#prompt";
+    renderView({});
+    const save = () => screen.getByRole("button", { name: /save changes/i }) as HTMLButtonElement;
+    expect(save().disabled).toBe(true);
+
+    fireEvent.change(screen.getByLabelText("Seed prompt"), { target: { value: "prefer RSC" } });
+    expect(save().disabled).toBe(false);
+    expect(screen.getByText("execution prompt")).toBeTruthy();
+  });
+
+  it("saves an edit made in a panel that is no longer displayed", async () => {
+    // The panels are a view, not a form boundary: staged edits survive navigating away from them.
+    const fetchMock = stubFetch();
+    window.location.hash = "#prompt";
+    renderView({});
+
+    fireEvent.change(screen.getByLabelText("Seed prompt"), { target: { value: "prefer RSC" } });
+    fireEvent.click(navButton("Verify gates"));
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const sent = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(sent.seedPrompt).toBe("prefer RSC");
   });
 });

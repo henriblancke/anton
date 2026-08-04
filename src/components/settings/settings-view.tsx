@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useRef, useState, useSyncExternalStore } from "react";
 import {
   ArrowRightIcon,
   ChevronDownIcon,
@@ -17,9 +17,10 @@ import { Button } from "@/components/ui/button";
 import { Toggle } from "@/components/atoms";
 import { agentDotClass } from "@/components/board/board-utils";
 import {
-  AutomationRow,
+  AutomationTable,
   type AutomationScheduleState,
-} from "@/components/settings/automation-row";
+  type AutomationSpec,
+} from "@/components/settings/automation-table";
 import { DeleteProjectDialog } from "@/components/settings/delete-project-dialog";
 import { PruneBeadsSection } from "@/components/settings/prune-beads-section";
 
@@ -102,37 +103,166 @@ const MODELS: { value: string; label: string; hint?: string }[] = [
   { value: "claude-fable-5", label: "Fable 5", hint: "frontier" },
 ];
 
+/**
+ * The settings sections, in lifecycle order (anton-ue90.3): what identifies the project, then what
+ * happens while a run works, then what has to pass before a PR opens, then what runs on a schedule,
+ * then what cannot be undone.
+ *
+ * Every section that renders is listed here, and the nav SWITCHES which one renders — the previous
+ * list named six of eight and only repainted a highlight. `dirtyKeys` names the form fields a
+ * section owns, so the save bar can say which section is unsaved instead of offering a bare button
+ * on a page whose top is out of view.
+ */
 const SECTIONS = [
-  { id: "general", label: "General" },
-  { id: "agents", label: "Agents" },
-  { id: "prompt", label: "Prompt" },
-  { id: "review", label: "Review" },
-  { id: "execution", label: "Execution" },
-  { id: "automation", label: "Automation" },
+  {
+    id: "general",
+    label: "General",
+    group: "The project",
+    dirtyKeys: ["model"],
+  },
+  { id: "agents", label: "Active agents", group: "The project", dirtyKeys: ["agents"] },
+  {
+    id: "prompt",
+    label: "Execution prompt",
+    group: "While a run works",
+    dirtyKeys: ["seedPrompt"],
+  },
+  {
+    id: "variants",
+    label: "Pipeline variants",
+    group: "While a run works",
+    dirtyKeys: ["formulaVariants"],
+  },
+  {
+    id: "execution",
+    label: "Concurrency & limits",
+    group: "While a run works",
+    dirtyKeys: [
+      "concurrency",
+      "jobTimeoutMinutes",
+      "ticketTimeoutMinutes",
+      "maxRetries",
+      "autonomy",
+      "conventionalCommits",
+      "budget",
+    ],
+  },
+  { id: "gates", label: "Verify gates", group: "Before the PR opens", dirtyKeys: ["gates"] },
+  {
+    id: "review",
+    label: "Self-review",
+    group: "Before the PR opens",
+    dirtyKeys: ["review"],
+  },
+  {
+    id: "review-fix",
+    label: "Review-fix",
+    group: "Before the PR opens",
+    dirtyKeys: ["reviewFixPrompt"],
+  },
+  { id: "automation", label: "Automation", group: "On a schedule", dirtyKeys: [] },
+  { id: "danger", label: "Danger zone", group: "Irreversible", dirtyKeys: [] },
 ] as const;
 
-// What each scheduled automation DOES. Ids match the schedule row `type`. Cadence, next-run time
-// and enabled state all come from the schedules row — never from copy here, which could disagree
-// with the row that actually fires.
-const AUTOMATIONS = [
-  { id: "nightly-stringer", label: "nightly-stringer", description: "scan → triage" },
-  { id: "review-fix", label: "review-fix watcher", description: "poll open PRs for review events" },
-  { id: "orphan-grooming", label: "orphan-grooming", description: "bucket loose tickets" },
-  { id: "run-health", label: "run-health", description: "report stalled runs · off by default" },
+type SectionId = (typeof SECTIONS)[number]["id"];
+
+/** Group headings in the order the sections above declare them. */
+const SECTION_GROUPS = SECTIONS.reduce<string[]>(
+  (groups, s) => (groups.includes(s.group) ? groups : [...groups, s.group]),
+  [],
+);
+
+const SECTION_IDS = new Set<string>(SECTIONS.map((s) => s.id));
+
+function isSectionId(value: string): value is SectionId {
+  return SECTION_IDS.has(value);
+}
+
+/**
+ * `history.replaceState` fires no event, so a section change has to announce itself for the store
+ * below to re-read the URL. Same-tab only, which is all this needs.
+ */
+const SECTION_CHANGE_EVENT = "anton:settings-section";
+
+function subscribeToHash(onChange: () => void): () => void {
+  window.addEventListener("hashchange", onChange);
+  window.addEventListener(SECTION_CHANGE_EVENT, onChange);
+  return () => {
+    window.removeEventListener("hashchange", onChange);
+    window.removeEventListener(SECTION_CHANGE_EVENT, onChange);
+  };
+}
+
+/**
+ * The displayed panel, read from the URL rather than mirrored into React state (anton-ue90.3).
+ *
+ * `useSyncExternalStore` and not a state-seeding effect: the hash is an external system, the server
+ * has no access to it, and this is the shape that renders "general" on the server and the real
+ * section on the client without a hydration mismatch or a cascading render. An unknown or absent
+ * hash falls back rather than rendering a blank body.
+ */
+function useActiveSection(): SectionId {
+  const hash = useSyncExternalStore(
+    subscribeToHash,
+    () => window.location.hash.slice(1),
+    () => "",
+  );
+  return isSectionId(hash) ? hash : "general";
+}
+
+function showSection(id: SectionId): void {
+  // replaceState, not a router navigation: this is which panel is on screen, not a new page, and
+  // pushing it would turn Back into "undo the last tab click" nine times over.
+  window.history.replaceState(null, "", `#${id}`);
+  window.dispatchEvent(new Event(SECTION_CHANGE_EVENT));
+}
+
+// What each scheduled automation DOES, and what makes it idle. Ids match the schedule row `type`.
+// Cadence, next-run time, last-run time and enabled state all come from the schedules row — never
+// from copy here, which could disagree with the row that actually fires.
+const AUTOMATIONS: AutomationSpec[] = [
+  {
+    id: "nightly-stringer",
+    label: "nightly-stringer",
+    description: "scan → triage",
+    group: "Board maintenance",
+  },
+  {
+    id: "orphan-grooming",
+    label: "orphan-grooming",
+    description: "bucket loose tickets",
+    group: "Board maintenance",
+  },
+  {
+    id: "gardener",
+    label: "gardener",
+    description: "hygiene patrol · closes done epics, reports the rest",
+    group: "Board maintenance",
+  },
+  {
+    id: "run-health",
+    label: "run-health",
+    description: "report stalled runs",
+    group: "Run health",
+  },
   {
     id: "unstick",
     label: "unstick",
-    description: "acts on run-health's findings · idle until run-health is on",
+    description: "acts on run-health's findings",
+    dependsOn: "run-health",
+    group: "Run health",
   },
   {
     id: "gate-check",
     label: "gate-check",
     description: "resumes runs whose gate closed · human gates never auto-close",
+    group: "Run health",
   },
   {
-    id: "gardener",
-    label: "gardener",
-    description: "board hygiene patrol · off by default · closes done epics, reports the rest",
+    id: "review-fix",
+    label: "review-fix watcher",
+    description: "poll open PRs for review events",
+    group: "Delivery",
   },
 ];
 
@@ -143,6 +273,8 @@ interface AutomationSchedule {
   cron: string;
   /** Epoch SECONDS; absent while the schedule is disabled. */
   nextRunAt?: number;
+  /** Epoch SECONDS of the last fire; absent until it has run once. */
+  lastRunAt?: number;
 }
 
 /**
@@ -177,7 +309,11 @@ export function SettingsView({
   /** Ids anton ships as bundled specialists — the only agents the allowlist gates. */
   bundledIds: string[];
 }) {
-  const [active, setActive] = useState<(typeof SECTIONS)[number]["id"]>("general");
+  // Which panel is displayed. The URL hash IS the state — not a copy of it — so /settings#automation
+  // lands where it says it will, a reload returns to the same place, and a link points at a section
+  // rather than at the top of a page.
+  const active = useActiveSection();
+
   // The allowlist gates anton's BUNDLED agents only; the project's own `.claude/agents` (an id anton
   // doesn't ship) always run and are shown separately as "always active", not toggled here
   // (anton-dvo.1 reversal — see inactiveAgentTickets / ProjectSettings.agents). Partition by
@@ -225,6 +361,7 @@ export function SettingsView({
             enabled: row?.enabled ?? null,
             cron: row?.cron ?? defaultCrons[a.id] ?? "",
             nextRunAt: row?.nextRunAt,
+            lastRunAt: row?.lastRunAt,
           },
         ];
       }),
@@ -261,6 +398,55 @@ export function SettingsView({
   const [saving, setSaving] = useState(false);
 
   /**
+   * Which staged edits differ from what is persisted, keyed by the names {@link SECTIONS} declares.
+   *
+   * The save bar reads this to name the sections it is about to submit. Without it, the only signal
+   * that anything was edited is a button that looks identical whether or not it will do something —
+   * which on a page where one panel (Automation) saves immediately and every other waits for Save is
+   * how an operator loses an edit they thought had landed.
+   *
+   * Compared the same way the save body serializes: trimmed text, so trailing whitespace is not an
+   * edit, and the persisted defaults, so an untouched form is never dirty.
+   */
+  const dirty: Record<string, boolean> = {
+    model: model !== (settings.model ?? ""),
+    agents: !sameIds(
+      bundledAgents.filter((a) => activeAgents.has(a.id)).map((a) => a.id),
+      settings.agents ?? bundledAgents.map((a) => a.id),
+    ),
+    seedPrompt: seedPrompt.trim() !== (settings.seedPrompt ?? "").trim(),
+    reviewFixPrompt: reviewFixPrompt.trim() !== (settings.reviewFixPrompt ?? "").trim(),
+    formulaVariants: !sameVariants(variantRows, settings.formulaVariants ?? []),
+    concurrency: concurrency !== (settings.concurrency ?? DEFAULT_CONCURRENCY),
+    jobTimeoutMinutes:
+      jobTimeoutMinutes !== (settings.jobTimeoutMinutes ?? DEFAULT_JOB_TIMEOUT_MINUTES),
+    ticketTimeoutMinutes:
+      ticketTimeoutMinutes !== (settings.ticketTimeoutMinutes ?? DEFAULT_TICKET_TIMEOUT_MINUTES),
+    maxRetries: maxRetries !== (settings.maxRetries ?? DEFAULT_MAX_RETRIES),
+    autonomy: autonomy !== (settings.autonomy ?? true),
+    conventionalCommits: conventionalCommits !== (settings.conventionalCommits ?? false),
+    budget:
+      budgetAware !== (settings.budgetAware ?? false) ||
+      daytimeReservePct !==
+        (settings.budgetPolicy?.daytimeReservePct ?? DEFAULT_DAYTIME_RESERVE_PCT) ||
+      weeklyTargetPct !== (settings.budgetPolicy?.weeklyTargetPct ?? DEFAULT_WEEKLY_TARGET_PCT),
+    gates:
+      testCommand.trim() !== (settings.testCommand ?? "").trim() ||
+      lintCommand.trim() !== (settings.lintCommand ?? "").trim() ||
+      typecheckCommand.trim() !== (settings.typecheckCommand ?? "").trim() ||
+      buildCommand.trim() !== (settings.buildCommand ?? "").trim(),
+    review:
+      reviewEnabled !== (settings.reviewEnabled ?? true) ||
+      reviewAgent !== (settings.reviewAgent ?? "") ||
+      reviewPrompt.trim() !== (settings.reviewPrompt ?? "").trim() ||
+      reviewMaxRounds !== (settings.reviewMaxRounds ?? DEFAULT_REVIEW_MAX_ROUNDS) ||
+      reviewMinScore !== (settings.reviewMinScore ?? DEFAULT_REVIEW_MIN_SCORE) ||
+      reviewLowScoreRounds !==
+        (settings.reviewLowScoreRounds ?? DEFAULT_REVIEW_LOW_SCORE_ROUNDS),
+  };
+  const dirtySections = SECTIONS.filter((s) => s.dirtyKeys.some((key) => dirty[key]));
+
+  /**
    * Persist one automation's cadence and/or enabled flag immediately (not via Save) — optimistic,
    * reverted with a toast if the PATCH fails. A missing row is created server-side. The response
    * carries the row as stored, so the next-run readout is the server's recomputed nextRunAt rather
@@ -287,7 +473,12 @@ export function SettingsView({
       if (schedule) {
         setAutomations((p) => ({
           ...p,
-          [id]: { enabled: schedule.enabled, cron: schedule.cron, nextRunAt: schedule.nextRunAt },
+          [id]: {
+            enabled: schedule.enabled,
+            cron: schedule.cron,
+            nextRunAt: schedule.nextRunAt,
+            lastRunAt: schedule.lastRunAt,
+          },
         }));
       }
       toast.success(message);
@@ -410,37 +601,70 @@ export function SettingsView({
           <span className="text-subtle">/</span>
           <span className="font-medium text-foreground">Settings</span>
         </div>
-        <Button size="sm" className="ml-auto" onClick={save} disabled={saving}>
-          {saving ? "Saving…" : "Save changes"}
-        </Button>
+        {/* The count is the point, not the button: it names what a save will actually submit, from
+            anywhere in the page. Automation is absent from it on purpose — it saves on change. */}
+        <span className="ml-auto flex items-center gap-2.5">
+          {dirtySections.length > 0 && (
+            <span
+              className="text-[11.5px] text-subtle"
+              title={dirtySections.map((s) => s.label).join(", ")}
+            >
+              unsaved in{" "}
+              <span className="text-primary">
+                {dirtySections.length === 1
+                  ? dirtySections[0].label.toLowerCase()
+                  : `${dirtySections.length} sections`}
+              </span>
+            </span>
+          )}
+          <Button size="sm" onClick={save} disabled={saving || dirtySections.length === 0}>
+            {saving ? "Saving…" : "Save changes"}
+          </Button>
+        </span>
       </header>
 
-      <div className="grid min-h-0 flex-1 grid-cols-1 md:grid-cols-[168px_1fr]">
-        {/* subnav */}
-        <nav className="flex flex-row gap-1 border-border p-3 md:flex-col md:border-r md:p-4">
-          {SECTIONS.map((s) => (
-            <button
-              key={s.id}
-              type="button"
-              onClick={() => setActive(s.id)}
-              className={cn(
-                "rounded-lg px-2.5 py-1.5 text-left text-[12.5px] transition-colors",
-                active === s.id
-                  ? "bg-card font-medium text-foreground"
-                  : "text-muted-foreground hover:text-foreground",
-              )}
-            >
-              {s.label}
-            </button>
+      <div className="grid min-h-0 flex-1 grid-cols-1 md:grid-cols-[192px_1fr]">
+        {/* subnav — switches which panel renders, so every section is one click deep and none of
+            them is reachable only by scrolling past two 8000-character textareas. */}
+        <nav
+          aria-label="Settings sections"
+          className="flex flex-row flex-wrap gap-1 border-border p-3 md:flex-col md:flex-nowrap md:overflow-y-auto md:border-r md:p-4"
+        >
+          {SECTION_GROUPS.map((group) => (
+            <div key={group} className="contents md:block">
+              <span className="hidden px-2.5 pt-3 pb-1 font-mono text-[9.5px] tracking-[0.12em] text-subtle uppercase first:pt-0 md:block">
+                {group}
+              </span>
+              {SECTIONS.filter((s) => s.group === group).map((s) => (
+                <button
+                  key={s.id}
+                  type="button"
+                  aria-current={active === s.id ? "true" : undefined}
+                  onClick={() => showSection(s.id)}
+                  className={cn(
+                    "flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-[12.5px] transition-colors",
+                    active === s.id
+                      ? "bg-card font-medium text-foreground"
+                      : "text-muted-foreground hover:text-foreground",
+                    s.id === "danger" && active !== s.id && "text-risk-high",
+                  )}
+                >
+                  <span className="truncate">{s.label}</span>
+                  {s.dirtyKeys.some((key) => dirty[key]) && (
+                    <span
+                      className="ml-auto size-1.5 shrink-0 rounded-full bg-primary"
+                      title="unsaved changes in this section"
+                    />
+                  )}
+                </button>
+              ))}
+            </div>
           ))}
-          <span className="mt-auto hidden px-2.5 py-1.5 text-left text-[12.5px] text-risk-high md:block">
-            Danger zone
-          </span>
         </nav>
 
-        {/* panels */}
+        {/* panels — exactly one renders at a time, chosen by the nav */}
         <div className="flex flex-col gap-7 overflow-y-auto p-6 md:p-7">
-          {/* General */}
+          {active === "general" && (
           <section className="flex flex-col gap-3.5">
             <div className="flex items-center gap-2.5">
               <h2 className="text-[15px] font-semibold">General</h2>
@@ -454,11 +678,11 @@ export function SettingsView({
               <ModelField value={model} onChange={setModel} className="sm:col-span-2" />
             </div>
           </section>
-
-          <Divider />
+          )}
 
           {/* Agents — the allowlist gates anton's bundled specialists; your own .claude/agents
               always run and are listed below as always-active (anton-dvo.1 reversal). */}
+          {active === "agents" && (
           <section className="flex flex-col gap-3.5">
             <div className="flex items-baseline gap-2.5">
               <h2 className="text-[15px] font-semibold">Active agents</h2>
@@ -524,10 +748,10 @@ export function SettingsView({
               </div>
             )}
           </section>
-
-          <Divider />
+          )}
 
           {/* Prompt — locked base contract (read-only) + editable operator seed */}
+          {active === "prompt" && (
           <section className="flex flex-col gap-3.5">
             <div className="flex items-baseline gap-2.5">
               <h2 className="text-[15px] font-semibold">Execution prompt</h2>
@@ -559,6 +783,35 @@ export function SettingsView({
 
             <div className="flex max-w-2xl flex-col gap-2">
               <div className="flex items-center gap-2">
+                <span className="text-[12.5px] font-medium">Base contract</span>
+                <span className="inline-flex items-center gap-1 rounded-full border border-border bg-secondary px-2 py-0.5 font-mono text-[10px] text-muted-foreground">
+                  locked · always applied
+                </span>
+              </div>
+              <pre className="max-h-64 max-w-2xl overflow-auto rounded-lg border border-border bg-card px-3 py-2.5 font-mono text-[11px] leading-relaxed whitespace-pre-wrap text-muted-foreground">
+                {basePrompt || "(base prompt unavailable)"}
+              </pre>
+              <span className="text-[11px] text-subtle">
+                Core operating rules — git &amp; beads ownership, learnings capture, scope,
+                fail-loud. Defined in code; not editable here.
+              </span>
+            </div>
+          </section>
+          )}
+
+          {/* Review-fix — how claude answers a PR's review, grouped with the other things that
+              happen after the work is written rather than with the run's own seed prompt. */}
+          {active === "review-fix" && (
+          <section className="flex flex-col gap-3.5">
+            <div className="flex items-baseline gap-2.5">
+              <h2 className="text-[15px] font-semibold">Review-fix</h2>
+              <span className="text-xs text-subtle">
+                how claude resolves feedback on an open PR
+              </span>
+            </div>
+
+            <div className="flex max-w-2xl flex-col gap-2">
+              <div className="flex items-center gap-2">
                 <span className="text-[12.5px] font-medium">Review-fix prompt</span>
                 <span className="text-[11px] text-subtle">editable · how claude resolves PR feedback</span>
                 {reviewFixPrompt.trim() !== (settings.reviewFixPrompt ?? "").trim() && (
@@ -579,27 +832,11 @@ export function SettingsView({
                 (comments, failing checks) beneath it. Empty = shipped default. {reviewFixPrompt.length}/8000
               </span>
             </div>
-
-            <div className="flex max-w-2xl flex-col gap-2">
-              <div className="flex items-center gap-2">
-                <span className="text-[12.5px] font-medium">Base contract</span>
-                <span className="inline-flex items-center gap-1 rounded-full border border-border bg-secondary px-2 py-0.5 font-mono text-[10px] text-muted-foreground">
-                  locked · always applied
-                </span>
-              </div>
-              <pre className="max-h-64 max-w-2xl overflow-auto rounded-lg border border-border bg-card px-3 py-2.5 font-mono text-[11px] leading-relaxed whitespace-pre-wrap text-muted-foreground">
-                {basePrompt || "(base prompt unavailable)"}
-              </pre>
-              <span className="text-[11px] text-subtle">
-                Core operating rules — git &amp; beads ownership, learnings capture, scope,
-                fail-loud. Defined in code; not editable here.
-              </span>
-            </div>
           </section>
-
-          <Divider />
+          )}
 
           {/* Verify gates — operator-pinned hard checks run in the worktree before commit */}
+          {active === "gates" && (
           <section className="flex flex-col gap-3.5">
             <div className="flex items-baseline gap-2.5">
               <h2 className="text-[15px] font-semibold">Verify gates</h2>
@@ -640,10 +877,10 @@ export function SettingsView({
               self-verifies. The same gates run before review-fix pushes.
             </span>
           </section>
-
-          <Divider />
+          )}
 
           {/* Pipeline variants — let the work's own labels pick the pipeline (anton-aa3m) */}
+          {active === "variants" && (
           <section className="flex flex-col gap-3.5">
             <div className="flex items-baseline gap-2.5">
               <h2 className="text-[15px] font-semibold">Pipeline variants</h2>
@@ -743,11 +980,11 @@ export function SettingsView({
               the run instead of silently falling back.
             </span>
           </section>
-
-          <Divider />
+          )}
 
           {/* Self-review — the pre-PR gate (anton-3apm): on by default, reviewer swappable for one
               of this project's agents or a raw prompt. */}
+          {active === "review" && (
           <section className="flex flex-col gap-3.5">
             <div className="flex items-baseline gap-2.5">
               <h2 className="text-[15px] font-semibold">Self-review</h2>
@@ -881,13 +1118,19 @@ export function SettingsView({
               </div>
             </div>
           </section>
+          )}
 
-          <Divider />
-
-          {/* Execution + Automation */}
-          <div className="grid max-w-3xl grid-cols-1 gap-7 md:grid-cols-2">
+          {/* Execution — concurrency, timeouts, retries and the budget policy. Its own panel now,
+              not half a two-column grid shared with Automation. */}
+          {active === "execution" && (
+          <div className="grid max-w-3xl grid-cols-1 gap-7">
             <section className="flex flex-col gap-3.5">
-              <h2 className="text-[15px] font-semibold">Execution</h2>
+              <div className="flex items-baseline gap-2.5">
+                <h2 className="text-[15px] font-semibold">Concurrency &amp; limits</h2>
+                <span className="text-xs text-subtle">
+                  how much runs at once, and when anton gives up on one
+                </span>
+              </div>
               <div className="flex flex-col gap-2">
                 <div className="flex justify-between">
                   <span className="text-[12.5px] text-muted-foreground">Max concurrent runs</span>
@@ -905,7 +1148,7 @@ export function SettingsView({
                 <span className="text-[11px] text-subtle">1 — 6 · worktrees run in parallel</span>
               </div>
 
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
                 <label className="flex flex-col gap-1.5">
                   <span className="text-[12.5px] text-muted-foreground">Job timeout</span>
                   <div className="relative flex items-center rounded-[10px] border border-border bg-card focus-within:border-primary/60">
@@ -1031,32 +1274,29 @@ export function SettingsView({
                 </div>
               </div>
             </section>
-
-            <section className="flex flex-col gap-3.5">
-              <div className="flex items-baseline gap-2.5">
-                <h2 className="text-[15px] font-semibold">Automation</h2>
-                {/* Stated once for the section: cron and next-run times use this machine's clock. */}
-                <span className="text-xs text-subtle">cadences and next-run times are local</span>
-              </div>
-              <div className="flex flex-col gap-2.5">
-                {AUTOMATIONS.map((a) => (
-                  <AutomationRow
-                    key={a.id}
-                    label={a.label}
-                    description={a.description}
-                    state={automations[a.id]}
-                    defaultCron={defaultCrons[a.id] ?? automations[a.id].cron}
-                    onCronChange={(cron) => setAutomationCron(a.id, cron)}
-                    onToggle={(next) => toggleAutomation(a.id, next)}
-                  />
-                ))}
-              </div>
-            </section>
           </div>
+          )}
 
-          <Divider />
+          {/* Automation — full width, because seven schedules are records with identical fields and
+              a table is how you compare them (anton-ue90.4). */}
+          {active === "automation" && (
+          <section className="flex flex-col gap-3.5">
+            <div className="flex items-baseline gap-2.5">
+              <h2 className="text-[15px] font-semibold">Automation</h2>
+              <span className="text-xs text-subtle">what anton does on its own, and how often</span>
+            </div>
+            <AutomationTable
+              automations={AUTOMATIONS}
+              state={automations}
+              defaultCrons={defaultCrons}
+              onCronChange={setAutomationCron}
+              onToggle={toggleAutomation}
+            />
+          </section>
+          )}
 
           {/* Danger zone */}
+          {active === "danger" && (
           <section className="flex max-w-2xl flex-col gap-3.5">
             <h2 className="text-[15px] font-semibold text-risk-high">Danger zone</h2>
             <div className="flex items-center gap-3.5 rounded-xl border border-risk-high/25 bg-risk-high/5 p-4">
@@ -1083,10 +1323,31 @@ export function SettingsView({
               <PruneBeadsSection project={project} />
             </div>
           </section>
+          )}
         </div>
       </div>
     </div>
   );
+}
+
+/** Order-insensitive id-set equality — the allowlist is a set, so a reorder is not an edit. */
+function sameIds(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  const left = new Set(a);
+  return b.every((id) => left.has(id));
+}
+
+/**
+ * Variant equality, compared the way the save serializes: trimmed, and half-filled scaffolding rows
+ * dropped. Order IS significant here — the list's order is the precedence an operator tunes, so
+ * moving a row is a real edit even though the set is unchanged.
+ */
+function sameVariants(rows: VariantRow[], stored: FormulaVariant[]): boolean {
+  const staged = rows
+    .map((v) => ({ label: v.label.trim(), formula: v.formula.trim() }))
+    .filter((v) => v.label && v.formula);
+  if (staged.length !== stored.length) return false;
+  return staged.every((v, i) => v.label === stored[i].label && v.formula === stored[i].formula);
 }
 
 function Field({
@@ -1353,6 +1614,3 @@ function BeadsStatus({ connected }: { connected: boolean }) {
   );
 }
 
-function Divider() {
-  return <div className="h-px bg-border" />;
-}
