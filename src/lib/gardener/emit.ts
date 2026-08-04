@@ -9,7 +9,10 @@
  *   • ONE proposal per claim. The detection's `gardener:<kind>:<hash>` fingerprint rides on the bead
  *     as a label, and a fingerprint already on the board suppresses re-emission — so a patrol that
  *     runs nightly over an unfixed board asks once, not thirty times. (Mirrors the
- *     `stringer:<collector>:<hash>` convention /scan-triage dedups against.)
+ *     `stringer:<collector>:<hash>` convention /scan-triage dedups against.) Suppression cannot be
+ *     the whole answer, though: it reads the LOCAL working set, so two patrols on different machines
+ *     can both miss a fingerprint neither has pushed yet and file the same ask twice — see
+ *     {@link reconcileDuplicateProposals} for the other half.
  *   • DECLINED STAYS DECLINED. Suppression keys on "not settled", not on "open": an abandoned
  *     proposal — anton's won't-do outcome (LABELS.abandoned) — suppresses forever, which is what
  *     makes declining meaningful. A PLAINLY closed proposal (one that was applied, anton-1t3n) does
@@ -21,13 +24,15 @@
  *
  * Applying an approved proposal is anton-1t3n's job; nothing here mutates a subject bead.
  */
-import { beads, type Bead } from "../beads/bd";
-import { isOpenWork } from "./board-index";
+import { beads, LABELS, type Bead } from "../beads/bd";
+import { withBeadWriteLock } from "../beads/claim-lock";
+import { isClaimed, isOpenWork } from "./board-index";
 import {
   concernedBeads,
   fingerprintLabelOf,
   GARDENER_OBSERVED_AT_KEY,
   GARDENER_PLAN_KEY,
+  isProposalBead,
   planOf,
   type GardenerDetection,
   type GardenerPlan,
@@ -244,6 +249,142 @@ export async function emitProposals(repo: string, input: EmissionInput): Promise
   }
 
   return sofar();
+}
+
+// ── reconciling duplicate claims ──
+
+/**
+ * A twin nobody has acted on yet. The two states that make a proposal untouchable are a human's
+ * APPROVAL and a run's CLAIM: folding an approved twin discards a decision somebody already made,
+ * and folding a claimed one races the apply that holds it (`applyProposal` runs the whole
+ * application under the proposal's write lock and refuses a settled bead).
+ */
+function unclaimedTwin(bead: Bead): boolean {
+  return !(bead.labels ?? []).includes(LABELS.approved) && !isClaimed(bead);
+}
+
+/** Ranks the twin the board is most invested in first, then oldest id — total, so two patrols agree. */
+function survivorFirst(a: Bead, b: Bead): number {
+  return Number(unclaimedTwin(a)) - Number(unclaimedTwin(b)) || a.id.localeCompare(b.id);
+}
+
+/** One fingerprint the board carries more than once: the proposal that stands, and its twins. */
+export interface DuplicateProposals {
+  fingerprint: string;
+  /** The twin that keeps the ask — approved or claimed if any is, else the first filed. */
+  keep: string;
+  /** Twins to fold into `keep`: same claim, nobody acting on them. */
+  fold: string[];
+  /** Twins left standing because an approval or a run holds them. Named, never quietly folded. */
+  held: string[];
+}
+
+/**
+ * Duplicate open proposals, decided without writing anything — the answer to the one gap
+ * fingerprint suppression structurally cannot close.
+ *
+ * Suppression is a check against a board read, and the creation it guards is a separate bd write, so
+ * it is only atomic within one patrol. Two patrols on DIFFERENT machines each read a working set the
+ * other's proposal has not synced into yet, so both see the fingerprint missing and both file it;
+ * bd has no uniqueness constraint on a label to refuse the second, and no cross-process lock exists
+ * to serialize them (see beads/claim-lock.ts — the same limit every anton claim lives with). Making
+ * the check and the create atomic across machines is therefore not on the table; converging AFTER
+ * the fact is, and it is enough, because a fingerprint means the two beads ask exactly the same
+ * question: it is recomputed from the parsed kind/subjects/target at apply time
+ * (`parseGardenerPlan`, detections.ts), so twins that share one cannot name different moves.
+ *
+ * The survivor is picked by a TOTAL order both machines compute alike, so two patrols reconciling
+ * the same board concurrently converge on the same bead rather than folding each other away.
+ */
+export function planReconciliation(board: Bead[]): DuplicateProposals[] {
+  const groups = new Map<string, Bead[]>();
+  for (const bead of board) {
+    const fingerprint = fingerprintLabelOf(bead);
+    // Open only: a declined twin is a recorded answer and a plainly-closed one is already folded or
+    // applied — neither is a second ask standing on the board.
+    if (!fingerprint || !isProposalBead(bead) || !isOpenWork(bead)) continue;
+    const group = groups.get(fingerprint);
+    if (group) group.push(bead);
+    else groups.set(fingerprint, [bead]);
+  }
+
+  const duplicates: DuplicateProposals[] = [];
+  for (const [fingerprint, group] of groups) {
+    if (group.length < 2) continue;
+    const [keep, ...twins] = [...group].sort(survivorFirst);
+    duplicates.push({
+      fingerprint,
+      keep: keep.id,
+      fold: twins.filter(unclaimedTwin).map((b) => b.id),
+      held: twins.filter((b) => !unclaimedTwin(b)).map((b) => b.id),
+    });
+  }
+  return duplicates.sort((a, b) => a.fingerprint.localeCompare(b.fingerprint));
+}
+
+export interface ReconcileResult {
+  folded: Array<{ id: string; into: string }>;
+  /** Duplicates an approval or a run holds — left for a human rather than folded under them. */
+  held: string[];
+  /** Folds whose close failed. Reported, not thrown: the next patrol sees the twin and retries. */
+  failed: string[];
+}
+
+/**
+ * Fold this board's duplicate proposals into one ask each.
+ *
+ * PLAINLY closed, never abandoned: `suppressedFingerprints` reads abandonment as "a human declined
+ * this claim" and suppresses it forever, so abandoning a twin would poison the fingerprint the
+ * SURVIVOR still needs — the patrol would stop re-asking a question nobody answered. A plain close
+ * carries bd's own reason instead, which names the bead that kept the ask.
+ *
+ * Each fold takes the twin's own write lock and re-reads it there, for the same reason every other
+ * write in this feature does: `board` is a snapshot, and the states that make a twin untouchable —
+ * an approval, a run's claim, an apply already settling it — all land through that lock. Under it
+ * the orders are decided: either the approval lands first and this fold sees it and skips, or the
+ * fold lands first and `applyProposal`'s own locked re-read refuses a settled proposal.
+ *
+ * A failed close is REPORTED rather than thrown. It leaves board noise, not a wrong write, and the
+ * duplicate is still there for the next patrol — parking a patrol over cosmetic cleanup would cost
+ * the tiers that matter.
+ */
+export async function reconcileDuplicateProposals(
+  repo: string,
+  board: Bead[],
+  signal?: AbortSignal,
+): Promise<ReconcileResult> {
+  const result: ReconcileResult = { folded: [], held: [], failed: [] };
+
+  for (const duplicate of planReconciliation(board)) {
+    result.held.push(...duplicate.held);
+    for (const id of duplicate.fold) {
+      // Between every close, like the emission loop: a cancelled patrol must stop writing, and what
+      // already landed is board state the caller still has to propagate.
+      if (signal?.aborted) return result;
+      try {
+        const folded = await withBeadWriteLock(repo, id, async () => {
+          const live = await beads.show(repo, id);
+          const stale =
+            fingerprintLabelOf(live) !== duplicate.fingerprint ||
+            !isOpenWork(live) ||
+            !unclaimedTwin(live);
+          if (stale) return false;
+          await beads.close(
+            repo,
+            id,
+            `duplicate of ${duplicate.keep}: overlapping patrols filed the same claim ` +
+              `(${duplicate.fingerprint}) twice — ${duplicate.keep} carries the ask`,
+          );
+          return true;
+        });
+        if (folded) result.folded.push({ id, into: duplicate.keep });
+      } catch {
+        result.failed.push(id);
+      }
+    }
+  }
+
+  return result;
 }
 
 // ── the proposal's prose (pure) ──

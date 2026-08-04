@@ -40,11 +40,36 @@ const createMock = vi.fn(async (_cwd: string, opts: Record<string, unknown>) => 
   return id;
 });
 
+/**
+ * What a locked re-read hands back, per bead id — the reconciliation cases drive this to make a twin
+ * change under the lock (approved, claimed, already settled) between the snapshot and the fold.
+ */
+const liveBeads = new Map<string, Bead>();
+const showMock = vi.fn(async (_cwd: string, id: string) => {
+  const live = liveBeads.get(id);
+  if (!live) throw new Error(`no such bead: ${id}`);
+  return live;
+});
+const closeMock = vi.fn(async (...args: [string, string, string?]) => {
+  // Reflected into the live map so a folded twin reads as settled to anything that looks again.
+  const [, id] = args;
+  const live = liveBeads.get(id);
+  if (live) liveBeads.set(id, { ...live, status: "closed" });
+  return "";
+});
+const abandonMock = vi.fn(async () => "");
+
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
   return {
     ...actual,
-    beads: { ...actual.beads, create: (...a: [string, Record<string, unknown>]) => createMock(...a) },
+    beads: {
+      ...actual.beads,
+      create: (...a: [string, Record<string, unknown>]) => createMock(...a),
+      show: (...a: [string, string]) => showMock(...a),
+      close: (...a: [string, string, string?]) => closeMock(...a),
+      abandon: () => abandonMock(),
+    },
   };
 });
 
@@ -54,7 +79,9 @@ const {
   PartialEmissionError,
   emitProposals,
   planEmission,
+  planReconciliation,
   proposalDraft,
+  reconcileDuplicateProposals,
   suppressedFingerprints,
 } = await import("./emit");
 
@@ -98,7 +125,11 @@ const proposal = (fingerprint: string, over: Partial<Bead> = {}): Bead =>
 
 beforeEach(() => {
   createdBeads.length = 0;
+  liveBeads.clear();
   createMock.mockClear();
+  showMock.mockClear();
+  closeMock.mockClear();
+  abandonMock.mockClear();
 });
 
 describe("the proposal bead", () => {
@@ -281,6 +312,116 @@ describe("dedup by fingerprint", () => {
     expect(plan.emit).toHaveLength(MAX_PROPOSALS_PER_PASS);
     expect(plan.deferred).toHaveLength(3);
     expect([...plan.emit, ...plan.deferred]).toEqual(many);
+  });
+});
+
+/**
+ * Suppression is only atomic within ONE patrol: it checks a local working set the other machine's
+ * proposal has not synced into yet, and no cross-process lock exists to serialize the check with the
+ * create. So the same claim can reach the board twice, and folding the twins afterwards is the only
+ * thing that ever undoes it.
+ */
+describe("duplicate proposals from overlapping patrols", () => {
+  const fingerprint = reparent().fingerprint;
+
+  const twin = (id: string, over: Partial<Bead> = {}): Bead =>
+    bead(id, { labels: [fingerprint, ...PROPOSAL_LABELS], ...over });
+
+  const approved = (id: string) =>
+    twin(id, { labels: [fingerprint, ...PROPOSAL_LABELS, LABELS.approved] });
+
+  /** Put these on the board AND behind the locked re-read every fold takes. */
+  const onBoard = (...board: Bead[]): Bead[] => {
+    for (const b of board) liveBeads.set(b.id, b);
+    return board;
+  };
+
+  it("folds the later ask into the first, deterministically on every machine", () => {
+    // Ordered by id, not by board order: two patrols reconciling the same board concurrently must
+    // pick the same survivor, or they fold each other away and no ask survives.
+    expect(planReconciliation([twin("anton-p2"), twin("anton-p1")])).toEqual([
+      { fingerprint, keep: "anton-p1", fold: ["anton-p2"], held: [] },
+    ]);
+  });
+
+  it("keeps the twin a human approved, however late it was filed", () => {
+    const [duplicate] = planReconciliation([twin("anton-p1"), approved("anton-p2")]);
+    expect(duplicate.keep).toBe("anton-p2");
+    expect(duplicate.fold).toEqual(["anton-p1"]);
+  });
+
+  it("keeps the twin a run is applying rather than closing it mid-flight", () => {
+    const claimed = twin("anton-p2", { status: "in_progress", assignee: "runner-1" });
+    const [duplicate] = planReconciliation([twin("anton-p1"), claimed]);
+    expect(duplicate.keep).toBe("anton-p2");
+    expect(duplicate.fold).toEqual(["anton-p1"]);
+  });
+
+  it("leaves a second APPROVED twin standing — folding one discards a decision", () => {
+    const [duplicate] = planReconciliation([approved("anton-p1"), approved("anton-p2")]);
+    expect(duplicate.fold).toEqual([]);
+    expect(duplicate.held).toEqual(["anton-p2"]);
+  });
+
+  it("sees no duplicate in a settled twin: only OPEN asks stand on the board", () => {
+    const declined = twin("anton-p2", {
+      status: "closed",
+      labels: [fingerprint, ...PROPOSAL_LABELS, LABELS.abandoned],
+    });
+    expect(planReconciliation([twin("anton-p1"), declined])).toEqual([]);
+    expect(planReconciliation([twin("anton-p1"), twin("anton-p2", { status: "closed" })])).toEqual([]);
+  });
+
+  it("closes the fold plainly, naming the survivor — never as abandoned", async () => {
+    const board = onBoard(twin("anton-p1"), twin("anton-p2"));
+
+    const result = await reconcileDuplicateProposals(REPO, board);
+
+    expect(result.folded).toEqual([{ id: "anton-p2", into: "anton-p1" }]);
+    expect(closeMock).toHaveBeenCalledTimes(1);
+    const [, closedId, reason] = closeMock.mock.calls[0];
+    expect(closedId).toBe("anton-p2");
+    expect(reason).toContain("anton-p1");
+    // Abandoning would read as "a human declined this claim" and suppress the fingerprint FOREVER —
+    // the patrol would stop re-asking a question the survivor is still asking.
+    expect(abandonMock).not.toHaveBeenCalled();
+  });
+
+  it("leaves the fingerprint suppressed by the survivor alone", () => {
+    const folded = twin("anton-p2", { status: "closed" });
+    expect(suppressedFingerprints([twin("anton-p1"), folded])).toEqual(new Set([fingerprint]));
+    expect(suppressedFingerprints([folded]).size).toBe(0);
+  });
+
+  it("skips a twin approved under the lock — the snapshot is not what it writes against", async () => {
+    const board = onBoard(twin("anton-p1"), twin("anton-p2"));
+    liveBeads.set("anton-p2", approved("anton-p2")); // approved while this fold waited for the lock
+
+    const result = await reconcileDuplicateProposals(REPO, board);
+
+    expect(result.folded).toEqual([]);
+    expect(closeMock).not.toHaveBeenCalled();
+  });
+
+  it("reports a fold that failed instead of costing the pass its proposals", async () => {
+    const board = onBoard(twin("anton-p1"), twin("anton-p2"));
+    closeMock.mockRejectedValueOnce(new Error("bd close exploded"));
+
+    const result = await reconcileDuplicateProposals(REPO, board);
+
+    expect(result.failed).toEqual(["anton-p2"]);
+    expect(result.folded).toEqual([]);
+  });
+
+  it("stops folding when the patrol is cancelled", async () => {
+    const board = onBoard(twin("anton-p1"), twin("anton-p2"));
+    const controller = new AbortController();
+    controller.abort();
+
+    const result = await reconcileDuplicateProposals(REPO, board, controller.signal);
+
+    expect(result.folded).toEqual([]);
+    expect(closeMock).not.toHaveBeenCalled();
   });
 });
 

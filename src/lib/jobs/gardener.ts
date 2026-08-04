@@ -20,9 +20,10 @@
  *      wrapper for `--auto-merge`/`--fix`, so one cannot leak in here either.
  *   3. PROPOSALS (anton-9qwq) — the judgment tier. The board-shape claims the report has no verb for
  *      (misfiled work, missing ordering edges, retirement candidates) become approvable proposal
- *      beads, deduplicated by fingerprint so a nightly patrol over an unfixed board asks once. This
- *      tier only ever CREATES proposals: applying one is an approval away (anton-1t3n), so nothing
- *      here touches the beads a proposal is about.
+ *      beads, deduplicated by fingerprint so a nightly patrol over an unfixed board asks once — and,
+ *      for the duplicates only overlapping patrols on different machines can create, folded back to
+ *      one ask before new ones are filed. This tier writes to PROPOSALS alone: applying one is an
+ *      approval away (anton-1t3n), so nothing here touches the beads a proposal is about.
  *
  * The board is PULLED first and NUDGED after — the patrol reads the shared board and writes to it,
  * so it must not act on a working set that is a sync heartbeat behind (an epic whose child another
@@ -43,6 +44,7 @@ import {
   emitProposals,
   MAX_PROPOSALS_PER_PASS,
   PartialEmissionError,
+  reconcileDuplicateProposals,
   type EmissionResult,
 } from "../gardener/emit";
 import {
@@ -291,6 +293,32 @@ export function makeGardenerHandler(deps: GardenerDeps): JobHandler {
     // a cancel arriving inside them is invisible to `ctx.heartbeat()` — which does not inspect the
     // signal — so without this a cancelled patrol would still file judgment-tier proposal beads.
     // `emitProposals` carries the signal on from here and re-checks between its own creates.
+    ctx.signal.throwIfAborted();
+
+    // Converge on ONE ask per claim before filing new ones. Fingerprint suppression is only atomic
+    // within a patrol: two on different machines each read a working set the other's proposal has
+    // not synced into yet, so the same claim can reach the board twice with nothing to refuse the
+    // second. Folding the twins here is the only place that duplication is ever undone — see
+    // gardener/emit.ts. Best-effort by design: a failed fold is noise the next patrol retries, not a
+    // reason to cost this pass its proposals.
+    const reconciled = await reconcileDuplicateProposals(repo, board, ctx.signal);
+    if (reconciled.folded.length > 0) {
+      console.log(
+        `[gardener] ${projectId}: folded ${reconciled.folded.length} duplicate proposal(s) ` +
+          `(${reconciled.folded.map((f) => `${f.id}→${f.into}`).join(", ")})`,
+      );
+      nudge({ id: project.id, repoPath: repo });
+    }
+    // Neither silence nor a fold: a twin an approval or a run holds is left for a human, and a close
+    // that failed is a duplicate still standing. Both have to be visible to tell either from a board
+    // that simply has no duplicates.
+    if (reconciled.held.length > 0 || reconciled.failed.length > 0) {
+      console.log(
+        `[gardener] ${projectId}: left ${reconciled.held.length} duplicate proposal(s) standing ` +
+          `(approved or claimed: ${reconciled.held.join(", ") || "none"})` +
+          `${reconciled.failed.length > 0 ? `, ${reconciled.failed.length} fold(s) failed: ${reconciled.failed.join(", ")}` : ""}`,
+      );
+    }
     ctx.signal.throwIfAborted();
 
     // Whatever landed before a create failed is real board state living only in the local working

@@ -242,4 +242,35 @@ describeBd("gardener patrol e2e (real handler · real bd)", () => {
       proposalsAfterFirst.map((p) => p.id).sort(),
     );
   });
+
+  // The one duplicate suppression cannot prevent: two patrols on different machines each check a
+  // working set the other's create has not synced into yet. Seeded by hand — a second bead carrying
+  // a fingerprint the board already holds — because that is the only way to reach the state locally.
+  it("folds a claim filed twice back to one ask, plainly closed", async () => {
+    const standing = proposalsAfterFirst[0];
+    const fingerprint = standing.labels?.find((l) => l.startsWith("gardener:")) as string;
+    const twin = await beads.create(repo, {
+      title: `${standing.title} (filed by the other machine)`,
+      type: "task",
+      acceptance: "- [ ] the same ask as its twin",
+      description: standing.description,
+      labels: [fingerprint],
+    });
+
+    await patrol();
+
+    const after = await beads.list(repo, ["--status", "all"]);
+    const pair = [standing.id, twin].map((id) => after.find((b) => b.id === id) as Bead);
+    const [folded, kept] = pair.every((b) => b !== undefined)
+      ? [pair.find((b) => b.status === "closed"), pair.find((b) => b.status !== "closed")]
+      : [];
+
+    // Which one survives is decided by a total order, not by filing time — the point is that exactly
+    // one ask is left standing and the other names it.
+    expect(kept?.status).toBe("open");
+    expect(folded?.id).toBeDefined();
+    // Plainly closed, never abandoned: abandonment is a human's "no", and it would suppress the
+    // fingerprint the survivor is still asking about.
+    expect(beads.isAbandoned(folded as Bead)).toBe(false);
+  });
 });
