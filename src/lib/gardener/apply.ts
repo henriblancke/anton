@@ -17,8 +17,9 @@
  *     again — re-confirmed under the affected beads' own locks, because that path runs no step and
  *     so has nothing else to re-read them — and a retry after a half-finished approve therefore
  *     converges rather than double-moves. And
- *     because a snapshot is stale the instant it is taken, every bead a write rests on — the subject
- *     AND the home/blocker/survivor it points at — is re-read and re-judged under its own write lock
+ *     because a snapshot is stale the instant it is taken, every bead a write rests on — the subject,
+ *     the home/blocker/survivor it points at, and the run target whose ticket set a retirement would
+ *     take it out of — is re-read and re-judged under its own write lock
  *     immediately before the write, on the same lock a run's claim takes (see `applyStep`), so a
  *     lease published mid-approval orders against this apply instead of racing it. A fresh read is
  *     not the whole answer either: it shows the board as it IS, never as it MOVED. So the two facts
@@ -39,7 +40,14 @@
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { withBeadWriteLock, withBeadWriteLocks } from "../beads/claim-lock";
 import { loadAllIssues } from "../beads/issues";
-import { indexBoard, isInFlight, isOpenWork, stampMsOf, type BoardIndex } from "./board-index";
+import {
+  indexBoard,
+  isInFlight,
+  isOpenWork,
+  stampMsOf,
+  ticketOwnerOf,
+  type BoardIndex,
+} from "./board-index";
 import {
   fingerprintLabelOf,
   isProposalBead,
@@ -89,9 +97,26 @@ export type ApplyStep =
       parentClaim: string;
     })
   | (StepSubject & { verb: "link"; blocker: string })
-  | (StepSubject & { verb: "close"; reason: string })
-  | (StepSubject & { verb: "supersede"; replacement: string })
-  | (StepSubject & { verb: "defer" });
+  | (StepSubject & TicketOwner & { verb: "close"; reason: string })
+  | (StepSubject & TicketOwner & { verb: "supersede"; replacement: string })
+  | (StepSubject & TicketOwner & { verb: "defer" });
+
+/**
+ * The run target whose TICKET SET a retirement's subject rides, or absent when the subject is its
+ * own run target — its own claim is then the check — or hangs under nothing that runs.
+ *
+ * Carried by the retirement verbs alone because they are the ones that take the bead AWAY: a run
+ * that has selected this ticket aborts when its claim reaches a bead the board has since closed,
+ * deferred or superseded. The run target is where the only liveness signal lives (see
+ * {@link ticketOwnerOf}), so it is locked and re-judged alongside the subject.
+ *
+ * `claim` is the owner's run claim when the step was decided, re-compared under the owner's own
+ * write lock exactly like {@link StepSubject.claim} — and, like a re-parent's `parentClaim`, only
+ * ever a claim that PREDATES the filing, because `planRetire` refuses an owner claimed since.
+ */
+interface TicketOwner {
+  owner?: { id: string; claim: string };
+}
 
 /**
  * Who a RUN holds this bead for, or `""` when nobody does. `bd update --claim` — the worker pickup
@@ -342,6 +367,21 @@ function planRetire(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): App
   }
   const claimed = claimedSinceFiling(subject, at, "retiring it", CLAIM_COST.subject);
   if (claimed) return { status: "refuse", reason: claimed };
+  // The subject's own signals are only half the question. A grouped run publishes ONE lease, on the
+  // run target its tickets hang under, so a ticket that run has selected but not yet reached carries
+  // no lease, no PR ref and no claim of its own — retiring it would take a bead out of a live run's
+  // ticket set, and the run aborts when its claim reaches a bead the board no longer holds. Asked of
+  // the OWNER by the same two bars the subject answers to: is a run live on it, and was it claimed
+  // in the window before a lease exists to see (see `claimedSinceFiling`).
+  const owner = ticketOwnerOf(index, subject);
+  if (owner) {
+    const doing = retiringTicket(id);
+    if (isInFlight(owner, nowMs)) {
+      return { status: "refuse", reason: inFlightReason(owner, nowMs, doing) };
+    }
+    const ownerClaimed = claimedSinceFiling(owner, at, doing, CLAIM_COST.ticketSet);
+    if (ownerClaimed) return { status: "refuse", reason: ownerClaimed };
+  }
   // The premise `detectStale` filed on is that NOTHING has touched this bead (retire.ts), and that
   // premise is the one thing a fresh board read alone cannot confirm — silence is a claim about the
   // moment the patrol looked. Re-confirmed against the filing stamp so approving a months-old ask
@@ -364,17 +404,25 @@ function planRetire(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): App
     }
   }
 
+  // Whatever the verb, the write rests on the same two beads: the subject, and the run target whose
+  // ticket set it rides (absent when it rides none). Both are re-read under their own locks.
+  const on = {
+    id,
+    claim: runClaimOf(subject),
+    owner: owner ? { id: owner.id, claim: runClaimOf(owner) } : undefined,
+  };
+
   switch (plan.retireAs) {
     case "close":
       return {
         status: "apply",
-        steps: [{ verb: "close", id, claim: runClaimOf(subject), reason: closeReason(plan) }],
+        steps: [{ verb: "close", ...on, reason: closeReason(plan) }],
         summary: `closed ${id} as shipped`,
       };
     case "defer":
       return {
         status: "apply",
-        steps: [{ verb: "defer", id, claim: runClaimOf(subject) }],
+        steps: [{ verb: "defer", ...on }],
         summary: `deferred ${id} out of the ready set`,
       };
     case "supersede": {
@@ -385,9 +433,7 @@ function planRetire(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): App
       if (survivorGone) return { status: "refuse", reason: survivorGone };
       return {
         status: "apply",
-        steps: [
-          { verb: "supersede", id, claim: runClaimOf(subject), replacement: plan.target },
-        ],
+        steps: [{ verb: "supersede", ...on, replacement: plan.target }],
         summary: `closed ${id} as superseded by ${plan.target}`,
       };
     }
@@ -402,14 +448,17 @@ function planRetire(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): App
  * on. bd's own creation and write stamps are the only filing-time facts available here, and they are
  * better than any the plan could carry: a hand-edited metadata blob cannot rewrite them.
  *
- * bd stamps at ONE-SECOND resolution, so a write landing in the very second the proposal was created
- * reads as part of the board the patrol judged. That is the right way round: the window this closes
- * is the hours or nights between a patrol and an approval, and the sub-second remainder is covered
- * by the under-lock baseline ({@link StepSubject.claim}) like every other late arrival.
+ * bd stamps at ONE-SECOND resolution, so an EQUAL stamp orders nothing: the write may have landed
+ * before the proposal was created or after it, and the two readings mean opposite things here. It is
+ * answered `undefined` — the same fail-closed "we cannot tell" a missing stamp gets — rather than
+ * `false`, because `false` is a positive claim that the plan already saw this write, and nothing
+ * downstream re-asks it: the step records exactly that state as its own baseline
+ * ({@link StepSubject.claim}) and the under-lock re-check then compares it against itself.
  */
 function writtenSinceFiling(subject: Bead, at: ApplyMoment): boolean | undefined {
   const writtenAt = stampMsOf(subject);
   if (at.filedAtMs === undefined || writtenAt === undefined) return undefined;
+  if (writtenAt === at.filedAtMs) return undefined;
   return writtenAt > at.filedAtMs;
 }
 
@@ -422,6 +471,8 @@ function writtenSinceFiling(subject: Bead, at: ApplyMoment): boolean | undefined
 const CLAIM_COST = {
   subject: "would pull the bead out from under the run that owns it",
   home: "would leave that work riding along unrun, because the run has already selected the tickets it will work through",
+  ticketSet:
+    "would take a bead out of a set that run has already selected, and it aborts when its claim reaches a ticket the board no longer holds",
 } as const;
 
 /**
@@ -492,7 +543,7 @@ function staleTouched(subject: Bead, at: ApplyMoment): string | undefined {
   const since = writtenSinceFiling(subject, at);
   if (since === false) return undefined;
   return since === undefined
-    ? `${subject.id} carries no write stamp this proposal's filing can be compared to, so nothing confirms it is still the untouched bead the ask describes`
+    ? `${subject.id} carries no write stamp this proposal's filing can be ordered against, so nothing confirms it is still the untouched bead the ask describes`
     : `${subject.id} has been written to since this proposal was filed — it is no longer the untouched bead the ask describes, and deferring it now would park work somebody has picked back up`;
 }
 
@@ -779,8 +830,24 @@ function counterpartOf(step: ApplyStep): string | undefined {
 }
 
 /**
- * One write, taken under the write lock of EVERY bead it rests on — the subject and its counterpart
- * — and re-judged against reads taken from inside those locks.
+ * The run target whose ticket set a RETIREMENT would take its subject out of, when it rides one. Not
+ * written to and not pointed at — but the run that owns it is the one this write can abort, and the
+ * only place that run is visible (see {@link TicketOwner}), so it is locked and re-judged too.
+ */
+function ownerOf(step: ApplyStep): TicketOwner["owner"] {
+  switch (step.verb) {
+    case "close":
+    case "supersede":
+    case "defer":
+      return step.owner;
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * One write, taken under the write lock of EVERY bead it rests on — the subject, its counterpart and
+ * a retirement's ticket owner — and re-judged against reads taken from inside those locks.
  *
  * `planApply` decides against the caller's board snapshot, which is already seconds old by the time
  * the first bd write spawns — and the thing it is guarding against, a runner publishing a lease or
@@ -793,6 +860,10 @@ function counterpartOf(step: ApplyStep): string | undefined {
  * (refuse), or this write lands first and the claim queues behind it. Both ends need it, not just
  * the subject — a run claiming the HOME between the decision and the write has already selected its
  * tickets, so work attached now rides along unrun and is stranded when that run settles the card.
+ * The ticket OWNER earns its lock the same way, from the other direction: a run picks its target up
+ * on this very chain, so either its claim lands first and this read refuses, or this retirement
+ * lands first and the run's own post-lease re-confirmation sees its ticket set move (execute-epic
+ * step 1c) and retries — rather than aborting mid-flight on a bead the board no longer holds.
  *
  * Two topology questions are re-asked under the locks rather than left with the snapshot: whether a
  * bead about to be SETTLED still has open work under it (see {@link assertNothingStranded}), and
@@ -807,7 +878,8 @@ function counterpartOf(step: ApplyStep): string | undefined {
  */
 async function applyStep(repo: string, step: ApplyStep): Promise<void> {
   const counterpart = counterpartOf(step);
-  const locked = counterpart ? [step.id, counterpart] : [step.id];
+  const owner = ownerOf(step);
+  const locked = [step.id, counterpart, owner?.id].filter((id): id is string => id !== undefined);
   await withBeadWriteLocks(repo, locked, async () => {
     const subject = await reread(repo, step.id);
     const moved = subjectMoved(step, subject, Date.now());
@@ -816,6 +888,11 @@ async function applyStep(repo: string, step: ApplyStep): Promise<void> {
       const other = await reread(repo, counterpart);
       const otherMoved = counterpartMoved(step, counterpart, other, Date.now());
       if (otherMoved) throw new SubjectMovedError(otherMoved);
+    }
+    if (owner) {
+      const live = await reread(repo, owner.id);
+      const started = ownerStarted(step, owner, live, Date.now());
+      if (started) throw new SubjectMovedError(started);
     }
     if (SETTLING.has(step.verb)) await assertNothingStranded(repo, step.id);
     if (step.verb === "reparent") await assertHomeIsCard(repo, step.parent);
@@ -961,6 +1038,28 @@ function counterpartMoved(
   }
 }
 
+/**
+ * Why a run has started on the target whose ticket set this retirement's subject rides, or
+ * undefined. Judged by the same two bars `planRetire` held the snapshot to — a live run, and a claim
+ * taken in the window before a lease exists to see — so the write cannot pass an owner the decision
+ * would have refused.
+ *
+ * An owner that has LEFT the board is no obstacle: nothing is running a ticket set that no longer
+ * exists, and the subject's own re-read already covers what became of it.
+ */
+function ownerStarted(
+  step: ApplyStep,
+  owner: NonNullable<TicketOwner["owner"]>,
+  live: Bead | undefined,
+  nowMs: number,
+): string | undefined {
+  if (!live) return undefined;
+  if (isInFlight(live, nowMs)) return inFlightReason(live, nowMs, retiringTicket(step.id));
+  const claim = runClaimOf(live);
+  if (!claim || claim === owner.claim) return undefined;
+  return `${live.id} was claimed by ${claim} since this proposal was decided — that run has already selected the tickets it will work through, so ${retiringTicket(step.id)} would abort it when its claim reaches a bead the board no longer holds`;
+}
+
 async function runStep(repo: string, step: ApplyStep): Promise<void> {
   switch (step.verb) {
     case "reparent":
@@ -1077,6 +1176,9 @@ const missing = (id: string): string =>
 const home = (parentId: string): string => parentId || "no parent";
 
 const NO_SURVIVOR = "this proposal names no bead that superseded it";
+
+/** What a retirement is doing to the RUN that holds the subject's ticket set, as a refusal reads. */
+const retiringTicket = (id: string): string => `retiring ${id} out of its ticket set`;
 
 /**
  * Why this bead can no longer be a re-parent HOME, or undefined. A settled home hangs the work off a

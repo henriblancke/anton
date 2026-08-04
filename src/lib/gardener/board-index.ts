@@ -8,6 +8,7 @@
  * eventually propose re-parenting beads the board shows perfectly well, or miss the ones it hides.
  */
 import { beads, type Bead } from "../beads/bd";
+import { isPipelineArtifact } from "../beads/contract";
 import { boardCards, deriveStage, type BoardCards } from "../ticket-view";
 
 /** A `discovered-from` edge: `discovered` was filed while working on `source`. */
@@ -174,9 +175,40 @@ export function isOpenWork(bead: Bead): boolean {
  * Is a run touching this bead right now — an unexpired run-lease, or a commit already on a branch
  * waiting for its PR? Never a proposal subject: the runner is mid-flight over it, and a proposal to
  * re-parent or retire work that is actively shipping would race the run that owns it.
+ *
+ * Answered from the bead ALONE, which is exactly what it cannot answer for a run's child tickets:
+ * see {@link ticketOwnerOf} for the other half.
  */
 export function isInFlight(bead: Bead, nowMs: number): boolean {
   return beads.isRunLive(bead, nowMs) || deriveStage(bead) === "in-review";
+}
+
+/**
+ * The RUN TARGET whose ticket set this bead rides, or undefined when the bead is its own run target
+ * (its own signals are then the whole answer) or hangs under nothing that runs.
+ *
+ * {@link isInFlight} is blind here by construction: a grouped run publishes ONE run-lease, on the
+ * target its tickets hang under, and cascades only an assignee to the children it has selected — so
+ * a not-yet-reached ticket of a live feature carries no lease, no PR ref and no claim, and reads as
+ * free work to every per-bead signal. Acting on it anyway pulls a bead out of a set that run has
+ * already selected, and the run aborts when its claim reaches a bead the board no longer holds.
+ *
+ * Resolved through `beads.isRunTarget` — the same predicate execute-epic and the approve route run
+ * on — rather than through {@link BoardIndex.cards}, which is narrower: a parentless task/bug runs
+ * without ever being a board card.
+ */
+export function ticketOwnerOf(index: BoardIndex, bead: Bead): Bead | undefined {
+  const seen = new Set<string>();
+  let current: Bead | undefined = bead;
+  while (current && !seen.has(current.id)) {
+    // Plumbing coordinates work rather than running it, and nothing above it runs this bead either.
+    if (isPipelineArtifact(current)) return undefined;
+    if (beads.isRunTarget(current, index.all)) return current.id === bead.id ? undefined : current;
+    seen.add(current.id);
+    const parent = beads.parentOf(current);
+    current = parent ? index.byId.get(parent) : undefined;
+  }
+  return undefined;
 }
 
 /** bd's last-write stamp, falling back to creation — a bead carrying neither is simply undated. */

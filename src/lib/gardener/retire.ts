@@ -14,7 +14,14 @@
  */
 import { beads, type Bead } from "../beads/bd";
 import type { HygieneFinding } from "../hygiene";
-import { ageInDays, isInFlight, isOpenWork, stampOf, type BoardIndex } from "./board-index";
+import {
+  ageInDays,
+  isInFlight,
+  isOpenWork,
+  stampOf,
+  ticketOwnerOf,
+  type BoardIndex,
+} from "./board-index";
 import { makeDetection, type GardenerDetection, type GardenerDetectionKind } from "./detections";
 
 /**
@@ -79,7 +86,7 @@ function detectSuperseded(
     const survivor = [...landed].sort(byRecencyThenId)[0];
 
     for (const member of members) {
-      if (!isOpenWork(member) || isInFlight(member, nowMs)) continue;
+      if (!isOpenWork(member) || runOwned(index, member, nowMs)) continue;
       if (strandsOpenWork(index, member)) continue;
       detections.push(
         makeDetection({
@@ -120,7 +127,7 @@ function detectShippedOrphans(
   for (const finding of findings) {
     if (finding.kind !== "orphan" || !finding.beadId) continue;
     const bead = index.byId.get(finding.beadId);
-    if (!bead || !isOpenWork(bead) || isInFlight(bead, nowMs)) continue;
+    if (!bead || !isOpenWork(bead) || runOwned(index, bead, nowMs)) continue;
     if (strandsOpenWork(index, bead)) continue;
     detections.push(
       makeDetection({
@@ -167,7 +174,9 @@ function detectStale(
     if (threshold === undefined || !finding.beadId) continue;
 
     const bead = index.byId.get(finding.beadId);
-    if (!bead || !isOpenWork(bead) || beads.isDeferred(bead) || isInFlight(bead, nowMs)) continue;
+    if (!bead || !isOpenWork(bead) || beads.isDeferred(bead) || runOwned(index, bead, nowMs)) {
+      continue;
+    }
 
     // No readable stamp ⇒ no measurable age ⇒ no proposal. The report line already carries bd's own
     // verdict for a human; a retirement ask with nothing to point at is worse than silence.
@@ -193,6 +202,19 @@ function detectStale(
   }
 
   return detections;
+}
+
+/**
+ * Is a run mid-flight over this bead — over the bead ITSELF, or over the run target whose ticket set
+ * it rides? The second half is the one a per-bead signal cannot see: a grouped run's lease lives on
+ * the target, so a ticket it has selected but not yet reached reads as free work (see
+ * {@link ticketOwnerOf}). Proposing to retire one asks a human to abort a live run — apply refuses
+ * it under the target's own write lock (apply.ts `planRetire`), and this keeps the ask off the board.
+ */
+function runOwned(index: BoardIndex, bead: Bead, nowMs: number): boolean {
+  if (isInFlight(bead, nowMs)) return true;
+  const owner = ticketOwnerOf(index, bead);
+  return owner !== undefined && isInFlight(owner, nowMs);
 }
 
 /**

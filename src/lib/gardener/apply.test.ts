@@ -226,6 +226,25 @@ const inReview = (id: string): Bead => bead(id, { labels: ["stage:in-review"] })
 /** A feature card with an open ticket under it — a legal re-parent home. */
 const CARD = bead("anton-card", { issue_type: "feature" });
 
+/**
+ * The run target a retirement subject can ride as a TICKET. A grouped run publishes ONE lease, on
+ * this bead — its tickets carry no liveness signal of their own — so this is where "a run is already
+ * under way over that work" is readable at all.
+ */
+const runCard = (extra: Partial<Bead> = {}): Bead =>
+  bead("anton-run", { issue_type: "feature", ...extra });
+
+/** The subject as a ticket of {@link runCard}, untouched since the filing like every retirement's. */
+const ticket = (extra: Partial<Bead> = {}): Bead =>
+  child("anton-a", "anton-run", { updated_at: "2025-01-01T00:00:00Z", ...extra });
+
+/** The three retirement plans against one subject, with the board each needs. */
+const retirements = (board: Bead[]): [GardenerPlan, Bead[]][] => [
+  [DEFER, board],
+  [CLOSE, board],
+  [SUPERSEDE, [...board, bead("anton-b", { status: "closed" })]],
+];
+
 const REPARENT = planFor({
   kind: "container-orphan",
   move: "reparent",
@@ -591,6 +610,35 @@ describe("planApply — what an approval means against the board as it now is", 
       expect(decide(DEFER, [dead], NOW).status).toBe("apply");
     });
 
+    // The other half of that bar, and the half a per-bead signal cannot answer: a grouped run's
+    // lease lives on the CARD its tickets hang under, so a ticket that run has selected but not yet
+    // reached reads as free work. Retiring it takes a bead out of a live run's ticket set, and the
+    // run aborts when its claim reaches a bead the board no longer holds.
+    it("refuses to retire a ticket of a card a run is executing, at any depth", () => {
+      for (const live of [
+        runCard({ labels: [LABELS.runLease(NOW + 60_000, "run-9")] }),
+        runCard({ labels: ["stage:in-review"] }),
+      ]) {
+        for (const [plan, board] of retirements([live, ticket()])) {
+          expect(refusal(decide(plan, board, NOW))).toMatch(
+            /anton-run is mid-run .* retiring anton-a out of its ticket set/,
+          );
+        }
+        // Nesting is arbitrary-depth: a subtask under a task ships in the same run as the task.
+        const deep = [live, child("anton-mid", live.id), ticket({ parent: "anton-mid" })];
+        expect(refusal(decide(DEFER, deep, NOW))).toMatch(/anton-run is mid-run/);
+      }
+    });
+
+    it("retires a ticket of a card nothing is running", () => {
+      for (const [plan, board] of retirements([runCard(), ticket()])) {
+        expect(decide(plan, board, NOW).status).toBe("apply");
+      }
+      // An expired lease is a crashed run: it holds no ticket set either.
+      const dead = runCard({ labels: [LABELS.runLease(NOW - 1, "run-9")] });
+      expect(decide(DEFER, [dead, ticket()], NOW).status).toBe("apply");
+    });
+
     it("still SETTLES a mid-run bead the board already retired — there is nothing to write", () => {
       const done = { ...leased("anton-a", NOW), status: "deferred" };
       expect(decide(DEFER, [done], NOW).status).toBe("settled");
@@ -698,6 +746,55 @@ describe("planApply — what an approval means against the board as it now is", 
     // Silence that held at filing has only lengthened, so an untouched bead still applies.
     it("applies a stale retirement to a bead nobody has touched since", () => {
       expect(decide(DEFER, [cold("anton-a")]).status).toBe("apply");
+    });
+
+    // The ticket owner's half of the same window: a run that picked the CARD up after the filing has
+    // already selected the tickets it will work through, and neither the card nor the ticket carries
+    // a lease yet for the in-flight bar to read.
+    it("refuses to retire a ticket of a card claimed since the filing", () => {
+      const held = runCard({ assignee: "runner-7", status: "in_progress" });
+      const since = { ...held, updated_at: "2026-07-15T00:00:00Z" };
+      for (const [plan, board] of retirements([since, ticket()])) {
+        expect(reason(decide(plan, board))).toMatch(
+          /anton-run is held by runner-7 and it was claimed since this proposal was filed — retiring anton-a out of its ticket set/,
+        );
+      }
+      // Fails closed with nothing to date the claim against, exactly like the subject's own.
+      const undated = { ...held, updated_at: undefined, created_at: undefined };
+      expect(reason(decide(DEFER, [undated, ticket()]))).toMatch(/nothing dates that claim/);
+    });
+
+    // A claim the plan was made against is the finding, not news — the same rule the subject and a
+    // re-parent's home are held to, and what lets a dead run's stale ticket be retired at all.
+    it("retires a ticket of a card whose claim the proposal was made against", () => {
+      const outlived = runCard({
+        assignee: "runner-7",
+        status: "in_progress",
+        updated_at: "2025-01-01T00:00:00Z",
+      });
+      expect(decide(DEFER, [outlived, ticket()]).status).toBe("apply");
+    });
+
+    // bd stamps at one-second resolution, so a stamp EQUAL to the filing second orders nothing: the
+    // write may have landed either side of it. Reading it as "the board the patrol judged" would let
+    // a claim taken in that second be recorded as the step's own baseline and compared against
+    // itself under the lock — the one place nothing else re-asks the question.
+    it("treats a stamp in the filing's own second as ambiguous, not as the board it judged", () => {
+      const claimed = bead("anton-a", {
+        assignee: "runner-7",
+        status: "in_progress",
+        updated_at: FILED,
+      });
+      expect(reason(decide(DEFER, [claimed]))).toMatch(/nothing dates that claim/);
+      expect(reason(decide(CLOSE, [claimed]))).toMatch(/nothing dates that claim/);
+
+      const home = { ...heldHome(bead), updated_at: FILED };
+      expect(reason(decide(REPARENT, [home, cold("anton-a")]))).toMatch(/nothing dates that claim/);
+
+      // And a `stale` subject's silence is unprovable in that second for the same reason.
+      expect(reason(decide(DEFER, [bead("anton-a", { updated_at: FILED })]))).toMatch(
+        /nothing confirms it is still the untouched bead/,
+      );
     });
 
     // Only `stale` rests on silence. A shipped-orphan's commit and a supersede's landed twin are
@@ -1043,6 +1140,51 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     expect(calls).toEqual([
       `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-a was claimed by runner-7 since this proposal was decided — retiring it would pull the bead out from under the run that now owns it`,
     ]);
+  });
+
+  // A retirement's subject can be a TICKET of a run target, and that target is where a run becomes
+  // visible at all. A run picks it up on the very per-bead chain this apply locks, so the claim
+  // either lands before this read or queues behind the write — and refusing here is what makes that
+  // ordering worth anything. The run's own post-lease re-confirmation (execute-epic step 1c) closes
+  // the other side.
+  it("refuses to retire a ticket of a card a run claimed AFTER the snapshot", async () => {
+    const proposal = proposalFor(DEFER);
+    liveBeads.set("anton-run", runCard({ assignee: "runner-7", status: "in_progress" }));
+
+    await expect(apply(proposal, [runCard(), ticket(), proposal])).rejects.toMatchObject({
+      failure: "refused",
+    });
+    expect(calls).toEqual([
+      `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-run was claimed by runner-7 since this proposal was decided — that run has already selected the tickets it will work through, so retiring anton-a out of its ticket set would abort it when its claim reaches a bead the board no longer holds`,
+    ]);
+  });
+
+  it("refuses to retire a ticket of a card whose run published its lease after the snapshot", async () => {
+    const proposal = proposalFor(DEFER);
+    liveBeads.set("anton-run", runCard({ labels: [LABELS.runLease(Date.now() + 60_000, "run-9")] }));
+
+    await expect(apply(proposal, [runCard(), ticket(), proposal])).rejects.toMatchObject({
+      failure: "refused",
+    });
+    expect(calls.some((c) => c.startsWith("defer"))).toBe(false);
+    expect(calls[0]).toMatch(/anton-run is mid-run .* retiring anton-a out of its ticket set/);
+  });
+
+  // The card is not written to, so a run that RELEASED it since — or held it all along, which is
+  // what a stale ticket under a dead run looks like — is no reason to refuse.
+  it("retires a ticket of a card no run holds under the lock", async () => {
+    const proposal = proposalFor(DEFER);
+    liveBeads.set("anton-run", runCard());
+
+    const held = runCard({
+      assignee: "runner-7",
+      status: "in_progress",
+      updated_at: "2025-01-01T00:00:00Z",
+    });
+    await expect(apply(proposal, [held, ticket(), proposal])).resolves.toMatchObject({
+      changed: ["anton-a"],
+    });
+    expect(calls[0]).toBe("defer anton-a");
   });
 
   // The stale-in-progress detector proposes against beads that are ALREADY claimed — a claim that

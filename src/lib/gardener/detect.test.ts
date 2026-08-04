@@ -504,6 +504,43 @@ describe("retirement candidates", () => {
     ).toEqual([]);
   });
 
+  // A grouped run publishes ONE lease, on the card its tickets hang under, so a ticket it has
+  // selected but not yet reached carries no liveness signal of its own. Retiring one would take a
+  // bead out of a live run's ticket set, and the run aborts when its claim reaches it.
+  it("never retires a ticket of a card whose run is already under way", () => {
+    const cold = daysAgo(RETIRE_STALE_OPEN_DAYS + 5);
+    expect(
+      detect(
+        [
+          feature("anton-running", { labels: [`run-lease:${NOW + 60_000}`] }),
+          bead("anton-t1", { parent: "anton-running", updated_at: cold }),
+          bead("anton-t2", { parent: "anton-t1", updated_at: cold }),
+        ],
+        [stale("anton-t1", "open"), orphan("anton-t2")],
+      ),
+    ).toEqual([]);
+  });
+
+  // The same subtree with nothing running it is ordinary retirement work, so the bar stays on the
+  // RUN rather than on being somebody's child.
+  it("still retires a ticket whose card no run holds", () => {
+    const detection = only(
+      detect(
+        [
+          feature("anton-idle"),
+          bead("anton-t1", {
+            parent: "anton-idle",
+            updated_at: daysAgo(RETIRE_STALE_OPEN_DAYS + 5),
+          }),
+        ],
+        [stale("anton-t1", "open")],
+      ),
+    );
+
+    expect(detection.kind).toBe("stale");
+    expect(detection.subjects).toEqual(["anton-t1"]);
+  });
+
   it("finds nothing without a hygiene report — bd owns stale/orphans/duplicates", () => {
     expect(
       detectBoard({
