@@ -152,6 +152,42 @@ describe("updateTicket read economy", () => {
   });
 });
 
+// The edit path takes the same lock, for the premise rather than the proposal bead: a retirement
+// rests on "nobody has rewritten this bead since the patrol read it", re-asked from a read
+// `applyProposal` takes INSIDE this lock. An edit landing after that read but before the proposal's
+// write would be closed as shipped — or superseded onto a twin it no longer matches — against
+// contents it had already replaced.
+describe("updateTicket serializes with the gardener's apply lock", () => {
+  /** Let the pending save reach the lock (or the write it would have made without one). */
+  const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 10));
+
+  beforeEach(() => resetIssueSnapshots());
+  afterEach(() => vi.restoreAllMocks());
+
+  it("waits for the bead's write lock instead of editing under a concurrent apply", async () => {
+    const bd = fakeBd([bead({ id: "anton-t1", title: "Old" })]);
+    let release!: () => void;
+    const apply = withBeadWriteLock(
+      "/repo",
+      "anton-t1",
+      () => new Promise<void>((r) => (release = r)),
+    );
+
+    const saving = updateTicket(project, "anton-t1", { title: "New" });
+    await settle();
+    expect(bd.update).not.toHaveBeenCalled();
+    // The label read waits too: it is what the write diffs against, so a read taken outside the lock
+    // would carry pre-apply labels into a post-apply write.
+    expect(bd.show).not.toHaveBeenCalled();
+
+    release();
+    await apply;
+
+    await expect(saving).resolves.toMatchObject({ title: "New" });
+    expect(bd.update).toHaveBeenCalledTimes(1);
+  });
+});
+
 // A gardener proposal is a ticket bead like any other, and `applyProposal` holds its per-bead write
 // lock for the WHOLE apply. A delete outside that lock lands between the apply's locked re-read and
 // its writes: the subject moves still go in, then `settleProposal` fails on a bead that is gone —

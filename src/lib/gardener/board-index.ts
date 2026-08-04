@@ -184,6 +184,34 @@ export function isInFlight(bead: Bead, nowMs: number): boolean {
 }
 
 /**
+ * Who a RUN holds this bead for, or `""` when nobody does. `bd update --claim` — the worker pickup
+ * primitive behind `beads.claimVerified` — writes the assignee and `in_progress` as one act, so that
+ * pair IS the claim. A bare `bd assign` reserves a bead for a person without starting work on it
+ * (DESIGN.md §Soft-lock) and deliberately does not count.
+ *
+ * Shared by both halves of the loop so "a run holds this" means one thing to the detectors and to
+ * apply's under-lock re-checks.
+ */
+export function runClaimOf(bead: Bead): string {
+  if (bead.status !== "in_progress") return "";
+  return bead.assignee || "an unnamed runner";
+}
+
+/**
+ * Does a run hold this bead — the half of "busy" that {@link isInFlight} structurally cannot see?
+ * `beads.claimVerified` writes the assignee and `in_progress` first and publishes the run-lease
+ * afterwards, so a bead that has completed the pickup protocol reads as free to every liveness
+ * signal until its execute job publishes. A detector that proposes against it is proposing to move
+ * work another machine already owns.
+ *
+ * Asked only where the proposal would MOVE a bead (reparent.ts). Retirement deliberately does not
+ * ask it: a claim nobody has touched for weeks is exactly what the stale detector is about.
+ */
+export function isClaimed(bead: Bead): boolean {
+  return runClaimOf(bead) !== "";
+}
+
+/**
  * The RUN TARGET whose ticket set this bead rides, or undefined when the bead is its own run target
  * (its own signals are then the whole answer) or hangs under nothing that runs.
  *

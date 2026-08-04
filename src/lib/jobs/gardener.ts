@@ -235,6 +235,17 @@ export function makeGardenerHandler(deps: GardenerDeps): JobHandler {
     // the board shows, so a partial one is indistinguishable from a clean bill of health. The runner
     // retries the pass, and a verb that keeps failing parks the job for a human — which is the
     // honest outcome for a patrol that can no longer see the board.
+    //
+    // The premise fence opens HERE, before the first read this pass judges from — not just before
+    // tier 3's board snapshot. A retirement's evidence IS a hygiene finding (retire.ts reads the
+    // stale and duplicate rows below), so a fence stamped after these verbs would date an edit that
+    // landed mid-report as already observed, and approval would settle a bead against a premise
+    // that edit falsified. Stamped BEFORE rather than after for the same reason at every read: a
+    // bead written while one is in flight may or may not be in its result, and the earlier fence
+    // dates it as unseen — a refusal at approve time, which is the safe direction. This is what
+    // apply compares "has this moved since we asked" against; the proposals' own `created_at` land
+    // later, once the sequential creates in tier 3 run.
+    const observedAtMs = clock.now();
     const lint = await beads.lintReport(repo);
     const staleOpen = await beads.staleList(repo, { status: "open", days: STALE_OPEN_DAYS });
     const staleInProgress = await beads.staleList(repo, {
@@ -273,11 +284,6 @@ export function makeGardenerHandler(deps: GardenerDeps): JobHandler {
     // `loadAllIssues`, not a bare `bd list --status all`: that flag is unsupported on some bd
     // versions, and a patrol that threw here would park every pass without ever filing a proposal.
     ctx.signal.throwIfAborted();
-    // Stamped BEFORE the read, not after: a bead written while the read is in flight may or may not
-    // be in the snapshot, and the earlier fence dates it as unseen — a refusal at approve time,
-    // which is the safe direction. This is what apply compares "has this moved since we asked"
-    // against; the proposals' own `created_at` land later, once the sequential creates below run.
-    const observedAtMs = clock.now();
     const board = await loadAllIssues(repo);
     const detections = detectBoard({ board, hygiene: { findings }, now: clock.now() });
     await ctx.heartbeat();

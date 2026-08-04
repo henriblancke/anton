@@ -25,6 +25,7 @@ import type {
   DepCycle,
   StaleOpts,
 } from "../beads/bd";
+import { GARDENER_OBSERVED_AT_KEY } from "../gardener/detections";
 import { getHygieneReport, getHygieneReportForJob } from "../hygiene";
 import { driveJob, expectJobStatus, makeJobRunner } from "@/lib/testing/jobs";
 import type { Clock } from "./queue";
@@ -38,7 +39,13 @@ const orphansMock = vi.fn<(cwd: string) => Promise<OrphanBead[]>>();
 const cyclesMock = vi.fn<(cwd: string) => Promise<DepCycle[]>>();
 const duplicatesMock = vi.fn<(cwd: string) => Promise<DuplicateGroup[]>>();
 const listMock = vi.fn<(cwd: string, extra?: string[]) => Promise<Bead[]>>();
-const createMock = vi.fn<(cwd: string, opts: { title: string; labels?: string[] }) => Promise<string>>();
+const createMock =
+  vi.fn<
+    (
+      cwd: string,
+      opts: { title: string; labels?: string[]; metadata?: Record<string, unknown> },
+    ) => Promise<string>
+  >();
 
 /** Every bd verb the patrol calls, in call order — the evidence for "only the safe verbs write". */
 const calls: string[] = [];
@@ -66,8 +73,10 @@ vi.mock("../beads/bd", async () => {
       depCycles: trace("depCycles", (...a: [string]) => cyclesMock(...a)),
       duplicateGroups: trace("duplicateGroups", (...a: [string]) => duplicatesMock(...a)),
       list: trace("list", (...a: [string, string[]?]) => listMock(...a)),
-      create: trace("create", (...a: [string, { title: string; labels?: string[] }]) =>
-        createMock(...a),
+      create: trace(
+        "create",
+        (...a: [string, { title: string; labels?: string[]; metadata?: Record<string, unknown> }]) =>
+          createMock(...a),
       ),
     },
   };
@@ -77,7 +86,9 @@ const { makeGardenerHandler, STALE_IN_PROGRESS_DAYS, STALE_OPEN_DAYS } = await i
 
 const NOW = 1_700_000_000_000;
 const REPO = "/tmp/gardener-repo";
-const clock: Clock = { now: () => NOW };
+// Mutable so a case can let time pass INSIDE a bd verb — which is how the premise fence is dated.
+let now = NOW;
+const clock: Clock = { now: () => now };
 
 let t: TestDb;
 let projectId: string;
@@ -110,6 +121,7 @@ beforeEach(async () => {
   });
 
   calls.length = 0;
+  now = NOW;
   nudge.mockClear();
   // A clean board by default; each test seeds only the rot it is about.
   pullMock.mockResolvedValue(undefined);
@@ -324,6 +336,23 @@ describe("gardener patrol", () => {
       "create",
     ]);
     expect(nudge).toHaveBeenCalledWith({ id: projectId, repoPath: REPO });
+  });
+
+  it("fences the premise before the hygiene evidence its proposals rest on", async () => {
+    // A retirement's premise IS a hygiene finding, so the fence has to predate the report verbs and
+    // not just the board read: an edit landing while `orphansList` runs must date as UNSEEN. Were
+    // the fence stamped after them, apply would read that edit as already observed and close a bead
+    // that had been rescoped since the evidence was collected.
+    orphansMock.mockImplementation(async () => {
+      now += 60_000; // somebody rewrites the board mid-report
+      return [{ id: "t-4", title: "shipped", status: "open", latestCommit: "abc1234" }];
+    });
+    listMock.mockResolvedValue([bead("t-4", { title: "shipped" })]);
+
+    await expectJobStatus(t.db, await runPatrol(), "done");
+
+    const [, draft] = createMock.mock.calls[0];
+    expect(draft.metadata?.[GARDENER_OBSERVED_AT_KEY]).toBe(new Date(NOW).toISOString());
   });
 
   it("files proposals on a bd whose `list --status all` is unsupported", async () => {

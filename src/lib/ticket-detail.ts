@@ -109,19 +109,31 @@ export async function freshDetail(project: Project, bead: Bead): Promise<TicketD
  * Apply a field patch to the bead and return the refreshed detail. The bead is read first so
  * label edits diff against its current labels (preserving the approved, stage, and source
  * control labels); an empty patch writes nothing.
+ *
+ * Taken under the bead's own write lock, like deleteTicket, and for the same class of reason: a
+ * gardener RETIREMENT rests on a premise about this bead's contents — "nobody has rewritten it
+ * since the patrol read it" — which `applyProposal` re-asks from a read taken inside this very lock
+ * (gardener/apply.ts). Unserialized, an edit landing after that locked re-read would be closed,
+ * deferred or superseded against the old contents, with the premise fence having already passed.
+ * Serialized, the edit either lands first (and the apply refuses on the newer write stamp) or waits
+ * until the proposal has settled.
  */
 export async function updateTicket(
   project: Project,
   id: string,
   patch: BeadPatch,
 ): Promise<TicketDetail> {
-  const current = await beads.show(project.repoPath, id);
-  await beads.update(project.repoPath, id, patch, current.labels ?? []);
   // Read-after-write: the response must reflect the write, not the stale board the snapshot serves,
   // or the edit form resets to pre-write title/labels/approval. One `bd show` is the whole read —
   // it goes straight to bd, so unlike a snapshot refresh it can't be discarded by the sync below
-  // bumping the snapshot generation.
-  const detail = await freshDetail(project, await beads.show(project.repoPath, id));
+  // bumping the snapshot generation. Inside the lock, so it cannot read a competing write's result
+  // back as this patch's outcome.
+  const written = await withBeadWriteLock(project.repoPath, id, async () => {
+    const current = await beads.show(project.repoPath, id);
+    await beads.update(project.repoPath, id, patch, current.labels ?? []);
+    return beads.show(project.repoPath, id);
+  });
+  const detail = await freshDetail(project, written);
   // The update landed locally; propagate via the immediate push + durable sync-push job (anton-nowq)
   // without blocking the save response on a slow/unreachable remote.
   nudgeSync(project, "ticket-detail");

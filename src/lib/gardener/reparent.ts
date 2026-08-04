@@ -9,8 +9,22 @@
  */
 import { beads, type Bead } from "../beads/bd";
 import { isRunTicket } from "../ticket-view";
-import { isInFlight, isOpenWork, type BoardIndex } from "./board-index";
+import { isClaimed, isInFlight, isOpenWork, type BoardIndex } from "./board-index";
 import { makeDetection, type GardenerDetection } from "./detections";
+
+/**
+ * Free to be moved, or to have work moved under it: still wanted, no run mid-flight over it, and no
+ * run holding a claim on it.
+ *
+ * The claim is asked separately because {@link isInFlight} cannot see it: a bead that has completed
+ * the verified pickup protocol carries the assignee and `in_progress` for as long as it takes its
+ * execute job to publish a lease, and reads as free work until then (see {@link isClaimed}). Every
+ * bar here matters at BOTH ends of a re-parent — proposing to move a claimed bead hands an approver
+ * work another machine owns, and the queued run then parks when it refreshes the board and finds its
+ * target is now somebody's child rather than a run target.
+ */
+const isFree = (bead: Bead, nowMs: number): boolean =>
+  isOpenWork(bead) && !isInFlight(bead, nowMs) && !isClaimed(bead);
 
 /**
  * Work whose parent is a CONTAINER epic — the anton-do0q class. An epic with feature children groups
@@ -29,7 +43,7 @@ export function detectContainerOrphans(index: BoardIndex, nowMs: number): Garden
   const detections: GardenerDetection[] = [];
 
   for (const bead of index.all) {
-    if (!isOpenWork(bead) || isInFlight(bead, nowMs)) continue;
+    if (!isFree(bead, nowMs)) continue;
     if (!isRunTicket(bead, index.cards)) continue;
     if (index.cards.cardOf(bead) !== undefined) continue;
 
@@ -41,7 +55,7 @@ export function detectContainerOrphans(index: BoardIndex, nowMs: number): Garden
     // A feature a run OWNS is not a home: that run already selected the tickets it will work through,
     // so a bead attached now rides along unrun and is left beneath a card the run is about to settle.
     // Apply refuses such a home for the same reason, so proposing one could only end in a refusal.
-    const open = features.filter((f) => isOpenWork(f) && !isInFlight(f, nowMs));
+    const open = features.filter((f) => isFree(f, nowMs));
     // One available feature is an unambiguous home; several (or none) leave the choice to the
     // approver, who gets the candidate list as evidence rather than a coin-flip dressed up as a
     // suggestion.
@@ -156,9 +170,7 @@ export function detectParentlessClusters(index: BoardIndex, nowMs: number): Gard
   // Mid-run cards are not homes: their run has already chosen its tickets, so beads moved under one
   // now would never be dispatched and would strand when the run settles the card (apply refuses one
   // for the same reason).
-  const homes = index.all.filter(
-    (b) => index.cards.ids.has(b.id) && isOpenWork(b) && !isInFlight(b, nowMs),
-  );
+  const homes = index.all.filter((b) => index.cards.ids.has(b.id) && isFree(b, nowMs));
   const homeKeys = new Map(homes.map((h) => [h.id, topicKeys(h)]));
 
   const keyOwners = new Map<string, number>();
@@ -213,12 +225,16 @@ export function detectParentlessClusters(index: BoardIndex, nowMs: number): Gard
   return detections;
 }
 
-/** The working layer a cluster can be built from: parentless, still wanted, and not mid-run. */
+/**
+ * The working layer a cluster can be built from: parentless, still wanted, and held by nobody — no
+ * live run over it and no run claim on it (see {@link isFree}). A parentless task or bug IS a run
+ * target, so a claim on one is a machine that has already picked it up.
+ */
 function isClusterCandidate(bead: Bead, nowMs: number): boolean {
   const type = bead.issue_type ?? "";
   if (type !== "task" && type !== "bug" && type !== "chore") return false;
   if (beads.parentOf(bead)) return false;
-  return isOpenWork(bead) && !isInFlight(bead, nowMs);
+  return isFree(bead, nowMs);
 }
 
 const idList = (list: Bead[]): string => (list.length ? list.map((b) => b.id).join(", ") : "none");

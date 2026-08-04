@@ -44,6 +44,7 @@ import {
   indexBoard,
   isInFlight,
   isOpenWork,
+  runClaimOf,
   stampMsOf,
   ticketOwnerOf,
   type BoardIndex,
@@ -142,17 +143,6 @@ interface RetireEvidence {
  */
 interface TicketOwner {
   owner?: { id: string; claim: string };
-}
-
-/**
- * Who a RUN holds this bead for, or `""` when nobody does. `bd update --claim` — the worker pickup
- * primitive behind `beads.claimVerified` — writes the assignee and `in_progress` as one act, so that
- * pair IS the claim. A bare `bd assign` reserves a bead for a person without starting work on it
- * (DESIGN.md §Soft-lock) and deliberately does not count.
- */
-function runClaimOf(bead: Bead): string {
-  if (bead.status !== "in_progress") return "";
-  return bead.assignee || "an unnamed runner";
 }
 
 /**

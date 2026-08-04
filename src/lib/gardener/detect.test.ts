@@ -136,6 +136,32 @@ describe("container orphans (the anton-do0q class)", () => {
       ]),
     ).toEqual([]);
   });
+
+  // The window no liveness signal covers: `bd update --claim` writes the assignee and `in_progress`,
+  // and the lease only appears once the execute job publishes it. Proposing a move in between hands
+  // an approver work another machine already owns.
+  it("leaves a bead a run has claimed but not yet leased alone", () => {
+    expect(
+      detect([
+        epic("anton-cont"),
+        feature("anton-feat", { parent: "anton-cont" }),
+        bead("anton-lost", { parent: "anton-cont", status: "in_progress", assignee: "box-2" }),
+      ]),
+    ).toEqual([]);
+  });
+
+  it("names no home when the container's only feature is claimed but not yet leased", () => {
+    const detection = only(
+      detect([
+        epic("anton-cont"),
+        feature("anton-feat", { parent: "anton-cont", status: "in_progress", assignee: "box-2" }),
+        bead("anton-lost", { parent: "anton-cont" }),
+      ]),
+    );
+
+    expect(detection.kind).toBe("container-orphan");
+    expect(detection.target).toBeUndefined();
+  });
 });
 
 describe("parentless clusters", () => {
@@ -207,6 +233,37 @@ describe("parentless clusters", () => {
     expect(
       detect([
         feature("anton-esc", { title: "Escalation settle route", labels: ["stage:in-review"] }),
+        bead("anton-p1", { title: "Escalation panel copy" }),
+        bead("anton-p2", { title: "Escalation retry banner" }),
+      ]),
+    ).toEqual([]);
+  });
+
+  // A parentless task IS a run target, so an `in_progress` claim on one is a machine that has picked
+  // it up — its lease just hasn't been published yet. Regrouping it makes it somebody's child, and
+  // the queued execute job parks when it refreshes the board and no longer finds a run target.
+  it("drops a member a run has claimed but not yet leased", () => {
+    expect(
+      detect([
+        ...homes,
+        bead("anton-p1", { title: "Escalation panel copy" }),
+        bead("anton-p2", {
+          title: "Escalation retry banner",
+          status: "in_progress",
+          assignee: "box-2",
+        }),
+      ]),
+    ).toEqual([]); // one free bead left is not a cluster
+  });
+
+  it("says nothing when the only matching card is claimed but not yet leased", () => {
+    expect(
+      detect([
+        feature("anton-esc", {
+          title: "Escalation settle route",
+          status: "in_progress",
+          assignee: "box-2",
+        }),
         bead("anton-p1", { title: "Escalation panel copy" }),
         bead("anton-p2", { title: "Escalation retry banner" }),
       ]),
