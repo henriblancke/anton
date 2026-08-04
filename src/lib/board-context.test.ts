@@ -102,6 +102,13 @@ describe("parseTouches", () => {
     expect(parseTouches(b)).toEqual(["Dockerfile", "Makefile", "src/lib/runs.ts"]);
   });
 
+  it("keeps conventional root files whose names double as English words, uppercase only", () => {
+    const b = bead({ id: "a-1", context: "touches: LICENSE, NOTICE, CHANGELOG, src/lib/runs.ts" });
+    expect(parseTouches(b)).toEqual(["LICENSE", "NOTICE", "CHANGELOG", "src/lib/runs.ts"]);
+    // Lowercase is prose, not a path — admitting it would hand a feature a surface it never claimed.
+    expect(parseTouches(bead({ id: "a-2", context: "touches: license, notice" }))).toEqual([]);
+  });
+
   it("keeps the glob and directory surfaces the contract's own documented form uses", () => {
     // `touches: app/reports/*` is skills/bd/SKILL.md's example. Stripping the `*` erased `app/*`
     // and `src/**` entirely, so files a run already owns read as unowned to the next triage.

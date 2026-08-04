@@ -133,6 +133,14 @@ const EXTENSIONLESS_ROOT_FILES =
   /^(Dockerfile|Containerfile|Makefile|Justfile|Taskfile|Procfile|Rakefile|Gemfile|Brewfile|Vagrantfile|Caddyfile|Jenkinsfile|CODEOWNERS)$/i;
 
 /**
+ * The same, for root files whose names are also ordinary English words. Matched CASE-SENSITIVELY —
+ * convention spells the file `LICENSE`, while a lowercase `license` in `touches: license, routing`
+ * is prose, and admitting it would hand a feature a surface it never claimed.
+ */
+const UPPERCASE_ROOT_FILES =
+  /^(LICEN[CS]E|NOTICE|COPYING|AUTHORS|CONTRIBUTORS|MAINTAINERS|PATENTS|CHANGELOG|README|VERSION)$/;
+
+/**
  * Markdown emphasis around a path (`**src/x.ts**`), which is BALANCED — the leading run of `*` is
  * only decoration when the same run closes the token. An unbalanced `*` is a glob, and the contract's
  * own documented form uses one (`touches: app/reports/*`, skills/bd/SKILL.md), so it is kept: deleting
@@ -175,7 +183,7 @@ function asPath(token: string): string | undefined {
     .replace(/:\d+(-\d+)?$/, "") // file:14 / file:28-42 — the surface is the file
     .replace(/[.,;]+$/, "");
   if (!cleaned || cleaned.length > 200) return undefined;
-  if (EXTENSIONLESS_ROOT_FILES.test(cleaned)) return cleaned;
+  if (EXTENSIONLESS_ROOT_FILES.test(cleaned) || UPPERCASE_ROOT_FILES.test(cleaned)) return cleaned;
   return PATH_RE.test(cleaned) || DIR_RE.test(cleaned) ? cleaned : undefined;
 }
 
