@@ -1107,6 +1107,38 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     ]);
   });
 
+  // The link's own premise, which nothing else under the lock reads: the blocker stays perfectly
+  // usable while the ONE piece of evidence for the ordering — the prose on either end, or the
+  // discovered-from edge between them — is edited away. A body edit takes these very locks
+  // (ticket-detail's updateTicket), so re-deriving the premise from a board read taken inside them is
+  // what orders the two; left with the snapshot, the edge is drawn after its evidence is gone and the
+  // blocked bead leaves the ready set that edit put it in.
+  it("refuses a link whose ordering evidence was removed after the snapshot", async () => {
+    const gone = `nothing on the board still places anton-a after anton-b — the body phrase or discovered-from edge this proposal read has been removed since it was filed, so recording the edge would restore an ordering a newer decision took away`;
+
+    const link = proposalFor(LINK);
+    liveBeads.set("anton-a", bead("anton-a")); // the discovered-from edge, dropped mid-approval
+    await expect(apply(link, [ordered(), bead("anton-b"), link])).rejects.toMatchObject({
+      failure: "refused",
+    });
+    expect(calls).toEqual([
+      `note ${link.id} gardener: apply FAILED — cannot apply ${link.id}: ${gone}`,
+    ]);
+
+    calls.length = 0;
+    liveBeads.clear();
+    // The other signal: the blocker's body spelled the ordering out, and the phrase was edited out.
+    const prose = proposalFor(LINK);
+    const spelled = bead("anton-b", { description: "this blocks anton-a" });
+    liveBeads.set("anton-b", bead("anton-b", { description: "rewritten" }));
+    await expect(
+      apply(prose, [bead("anton-a"), spelled, prose]),
+    ).rejects.toMatchObject({ failure: "refused" });
+    expect(calls).toEqual([
+      `note ${prose.id} gardener: apply FAILED — cannot apply ${prose.id}: ${gone}`,
+    ]);
+  });
+
   // A survivor abandoned in the window between the proposal and the approval stays `closed`, so the
   // status alone still reads as "the work landed over there". It did not: superseding onto it would
   // retire the last live copy of the work in favour of a recorded won't-do.

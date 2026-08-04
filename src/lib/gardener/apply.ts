@@ -560,15 +560,16 @@ function reparentPremiseGone(
 /**
  * Why the board no longer states the ordering this link proposal read, or undefined. An
  * `implied-order` ask rests on exactly one piece of evidence — a body phrase or a `discovered-from`
- * edge — and unlike a status or a parent, nothing downstream re-derives it: the step carries only the
- * pair, and the under-lock re-check asks whether the two beads are still writable, never whether the
- * ordering is still stated anywhere.
+ * edge — and unlike a status or a parent, no other bar reads it: the step carries only the pair, and
+ * every remaining check asks whether the two beads are writable, never whether the ordering is still
+ * stated anywhere.
  *
  * So a phrase edited out or an edge dropped since the filing would otherwise apply anyway, restoring
  * an ordering a newer board edit explicitly removed and taking the blocked bead back out of the ready
  * set that edit put it in. Re-derived from the fresh board through the detector's own reader (see
  * `relink.ts` {@link impliesOrdering}), so approval cannot hold the premise to a laxer bar than the
- * patrol held it to.
+ * patrol held it to — and re-derived once more from a read taken under the pair's own write locks
+ * ({@link assertOrderingStated}), because this snapshot is stale by the time the write spawns.
  */
 function linkPremiseGone(
   plan: GardenerPlan,
@@ -577,7 +578,7 @@ function linkPremiseGone(
 ): string | undefined {
   if (plan.kind !== "implied-order" || !plan.target) return undefined;
   if (impliesOrdering(index, blockedId, plan.target)) return undefined;
-  return `nothing on the board still places ${blockedId} after ${plan.target} — the body phrase or discovered-from edge this proposal read has been removed since it was filed, so recording the edge would restore an ordering a newer decision took away`;
+  return orderingUnstated(blockedId, plan.target);
 }
 
 /** What a retirement's evidence says a bead still IS, and what retiring against it anyway gets wrong. */
@@ -1000,15 +1001,17 @@ function ownerOf(step: ApplyStep): TicketOwner["owner"] {
  * lands first and the run's own post-lease re-confirmation sees its ticket set move (execute-epic
  * step 1c) and retries — rather than aborting mid-flight on a bead the board no longer holds.
  *
- * Three topology questions are re-asked under the locks rather than left with the snapshot: whether
- * the subject still rides the TICKET SET the step captured (see {@link assertOwnerUnchanged}),
- * whether a bead about to be SETTLED still has open work under it (see
- * {@link assertNothingStranded}), and whether a re-parent's home is still a BOARD CARD (see
- * {@link assertHomeIsCard}). All three earn their board read the same way — the write that flips the
- * answer is itself a locked write on a bead this step holds. Attaching work under a bead, and moving
- * a bead onto another card, are both re-parents, which take those beads' locks as subject and home;
- * and the one home that can STOP being a card is a legacy epic, which stops the moment a feature
- * lands under it — that same locked write. So the two approvals genuinely order against each other.
+ * Four questions are re-asked under the locks rather than left with the snapshot: whether the subject
+ * still rides the TICKET SET the step captured (see {@link assertOwnerUnchanged}), whether a bead
+ * about to be SETTLED still has open work under it (see {@link assertNothingStranded}), whether a
+ * re-parent's home is still a BOARD CARD (see {@link assertHomeIsCard}), and whether the board still
+ * STATES the ordering a link rests on (see {@link assertOrderingStated}). All four earn their board
+ * read the same way — the write that flips the answer is itself a locked write on a bead this step
+ * holds. Attaching work under a bead, and moving a bead onto another card, are both re-parents, which
+ * take those beads' locks as subject and home; the one home that can STOP being a card is a legacy
+ * epic, which stops the moment a feature lands under it — that same locked write; and a link's
+ * evidence sits on the PAIR, whose bodies are edited under these very locks (`ticket-detail.ts`
+ * `updateTicket`). So those writes genuinely order against each other.
  * The rest of the board-wide topology stays with the snapshot — whether the edge closes a cycle —
  * because it rests on beads no lock taken here covers, so re-deriving it would buy a whole board
  * read and still guarantee nothing.
@@ -1043,6 +1046,10 @@ async function applyStep(repo: string, step: ApplyStep): Promise<boolean> {
     if (step.verb === "reparent") {
       const doing = `before re-parenting under ${step.parent}`;
       assertHomeIsCard(step.parent, await lockedBoard(repo, doing));
+    }
+    if (step.verb === "link") {
+      const doing = `before recording ${step.blocker} as ${step.id}'s blocker`;
+      assertOrderingStated(step.id, step.blocker, await lockedBoard(repo, doing));
     }
     await runStep(repo, step);
     return true;
@@ -1151,6 +1158,32 @@ function assertHomeIsCard(parentId: string, board: BoardIndex): void {
     );
   }
 }
+
+/**
+ * Refuse to draw an ordering edge whose evidence the board no longer states, judged from a board read
+ * taken INSIDE the pair's write locks rather than from the approval's snapshot.
+ *
+ * `planApply` asks the same question of the snapshot ({@link linkPremiseGone}), and that snapshot is
+ * already seconds old when the first bd write spawns — while everything else the locked half checks
+ * asks only whether the two beads are still WRITABLE, which a deleted phrase leaves untouched. So
+ * without this the edge lands after its sole evidence was removed, taking the blocked bead back out
+ * of the ready set that edit put it in.
+ *
+ * The evidence sits on the pair itself — a body phrase on one of the two beads, or a
+ * `discovered-from` edge between them (see `relink.ts` {@link impliesOrdering}) — and both beads are
+ * locked here, so a body edit, which takes the same per-bead lock (`ticket-detail.ts` `updateTicket`),
+ * either lands first and this read finds the phrase gone or queues behind this write. An operator
+ * dropping the EDGE by hand takes no such lock, so for that half this is a narrowing of the
+ * snapshot→lock window rather than a serialization — the same bargain {@link RetireEvidence} strikes.
+ */
+function assertOrderingStated(blockedId: string, blockerId: string, board: BoardIndex): void {
+  if (impliesOrdering(board, blockedId, blockerId)) return;
+  throw new SubjectMovedError(orderingUnstated(blockedId, blockerId));
+}
+
+/** The one phrasing both readings of the link premise refuse with — snapshot and under-lock alike. */
+const orderingUnstated = (blockedId: string, blockerId: string): string =>
+  `nothing on the board still places ${blockedId} after ${blockerId} — the body phrase or discovered-from edge this proposal read has been removed since it was filed, so recording the edge would restore an ordering a newer decision took away`;
 
 /**
  * A fresh whole-board read for the topology re-checks — through `loadAllIssues` rather than a bare
