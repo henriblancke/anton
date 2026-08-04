@@ -248,7 +248,7 @@ export function ScanHealthPanel({ health }: { health: ScanHealth | undefined }) 
         )}
       </span>
 
-      <DeltaChip delta={delta?.total} />
+      <DeltaChip delta={delta?.total} paused={pausedBy(health)} />
       <ScanTrend points={points} className="w-28 shrink-0" />
 
       {severities.length > 0 ? (
@@ -295,17 +295,49 @@ export function ScanHealthPanel({ health }: { health: ScanHealth | undefined }) 
 }
 
 /**
+ * Which scan paused the trend, when a collector outage is what suppressed the delta — the delta
+ * needs BOTH adjacent scans whole, so the one before the latest can pause it just as well, and by
+ * then its own failure chip is long gone. A baseline latest is never "paused": nothing may be
+ * subtracted from a standing total, outage or not, so that case belongs to the missing-baseline copy.
+ */
+function pausedBy(health: ScanHealth): "latest" | "previous" | undefined {
+  const { points, latest, collectorFailures } = health;
+  if (latest.baseline) return undefined;
+  if (collectorFailures > 0) return "latest";
+  return points.at(-2)?.incomplete ? "previous" : undefined;
+}
+
+/**
+ * Why there is no trend. A delta goes missing for reasons that ask different things of the reader,
+ * so the panel names the one that applies rather than the most common one: an outage is a trend
+ * PAUSED, and it resumes on its own — sending that reader after a missing baseline points them at a
+ * problem they don't have.
+ */
+function noTrendNote(paused: "latest" | "previous" | undefined): string {
+  if (paused === "latest") {
+    return "Trend paused — at least one collector failed on this scan, so its count is an undercount; differencing it would measure the outage rather than the repo. The trend resumes on the next complete scan.";
+  }
+  if (paused === "previous") {
+    return "Trend paused — at least one collector failed on the previous scan, so there is no whole measurement behind this one to compare against. The trend resumes once two complete scans run back to back.";
+  }
+  return "A trend needs two scans measuring the same thing. A scan with no baseline behind it — a project's first, or the first after the scanner's baseline was reset — counts everything in the repo rather than what arrived since, so the comparison starts one scan later.";
+}
+
+/**
  * The move since the last scan. FEWER new signals is the good direction, so the tint follows health
  * rather than the sign of the number — and a scan with nothing comparable behind it says so instead
  * of showing a zero it hasn't earned.
  */
-function DeltaChip({ delta }: { delta: number | undefined }) {
+function DeltaChip({
+  delta,
+  paused,
+}: {
+  delta: number | undefined;
+  paused?: "latest" | "previous";
+}) {
   if (delta === undefined) {
     return (
-      <span
-        className="text-xs text-subtle"
-        title="A trend needs two scans measuring the same thing. A scan with no baseline behind it — a project's first, or the first after the scanner's baseline was reset — counts everything in the repo rather than what arrived since, so the comparison starts one scan later."
-      >
+      <span className="text-xs text-subtle" title={noTrendNote(paused)}>
         no trend yet
       </span>
     );

@@ -534,6 +534,32 @@ describe("the persisted series", () => {
     expect((await listScanSummaries(tdb.db, projectId))[0].counts.total).toBe(5);
   });
 
+  it("publishes no baseline for a retry that did not fold — the point has a gap behind it", async () => {
+    // The retry re-established the baseline, so its counts were discarded above — but its window was
+    // still consumed from stringer's state and nobody counts it. Naming where THAT window ended would
+    // hand the next nightly a contiguity proof across the hole, and it would difference its arrivals
+    // against counts measured over an unrelated window.
+    await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 5 }),
+      deltaState: since("b0", "b1"),
+    });
+    const retry = await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 90 }),
+      deltaState: { after: "b2", baselineScan: true },
+    });
+
+    expect(retry.deltaState).toBeUndefined();
+    expect((await listScanSummaries(tdb.db, projectId))[0].deltaState).toBeUndefined();
+
+    clock.advance(86_400_000);
+    const next = await save(counts({ low: 3 }), { deltaState: since("b2", "b3") });
+    expect(next.delta).toBeUndefined();
+  });
+
   it("moves the refresh token when a fold rewrites the newest row's counts", async () => {
     // The fold rewrites the row in place: a token that ignored the counts would keep 304-ing the
     // board past the very signals the fold exists to put on the chart.

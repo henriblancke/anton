@@ -82,6 +82,51 @@ describe("ScanHealthPanel", () => {
   it("says there is no trend rather than showing a zero delta it hasn't earned", () => {
     render(<ScanHealthPanel health={health()} />);
     expect(screen.getByText(/no trend yet/)).toBeTruthy();
+    expect(screen.getByText(/no trend yet/).getAttribute("title")).toContain("needs two scans");
+  });
+
+  it("blames the collector outage, not a missing baseline, when that is what paused the trend", () => {
+    // A delta needs both adjacent scans whole, so an outage suppresses it too — and telling that
+    // reader their baseline is missing sends them after a problem they do not have.
+    render(
+      <ScanHealthPanel
+        health={health({ points: [point("a", 1_700_000_000, { low: 4 })], collectorFailures: 1 })}
+      />,
+    );
+    const title = screen.getByText(/no trend yet/).getAttribute("title");
+    expect(title).toContain("Trend paused");
+    expect(title).toContain("failed on this scan");
+  });
+
+  it("names the PREVIOUS scan's outage — by now it is the only thing left that can", () => {
+    // The failure chip only ever describes the latest scan, so once a whole scan follows a broken
+    // one nothing else on the panel explains why the trend is still missing.
+    render(
+      <ScanHealthPanel
+        health={health({
+          points: [
+            { ...point("a", 1_700_000_000, {}), incomplete: true },
+            point("b", 1_700_086_400, { low: 4 }),
+          ],
+        })}
+      />,
+    );
+    const title = screen.getByText(/no trend yet/).getAttribute("title");
+    expect(title).toContain("Trend paused");
+    expect(title).toContain("failed on the previous scan");
+  });
+
+  it("keeps the missing-baseline reading for a baseline scan that also lost a collector", () => {
+    // Both are true, but a standing total is never "paused": no outage recovery makes it comparable.
+    render(
+      <ScanHealthPanel
+        health={health({
+          points: [{ ...point("a", 1_700_000_000, { low: 100 }), baseline: true }],
+          collectorFailures: 1,
+        })}
+      />,
+    );
+    expect(screen.getByText(/no trend yet/).getAttribute("title")).toContain("needs two scans");
   });
 
   it("reads a fall as the good direction and a rise as the bad one", () => {
@@ -219,6 +264,8 @@ describe("ScanHealthPanel", () => {
   it("flags a scan whose collectors died — its counts are an undercount", () => {
     render(<ScanHealthPanel health={health({ collectorFailures: 1 })} />);
     expect(screen.getByText("1 collector failed")).toBeTruthy();
-    expect(screen.getByTitle(/undercount/)).toBeTruthy();
+    // The chip's own tooltip, not merely something on the panel saying "undercount" — the paused
+    // trend says that too, and the chip is the one that points at the session log.
+    expect(screen.getByTitle(/collector\(s\) failed during this scan/)).toBeTruthy();
   });
 });

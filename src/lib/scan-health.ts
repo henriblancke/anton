@@ -282,9 +282,16 @@ async function findScanSummaryByJob(
  *   also drops its delta: differencing it against a whole predecessor measures the outage rather than
  *   the repo, the same rule {@link saveScanSummary} applies across adjacent scans.
  * - THE BASELINE IT LEFT: the retry scanned again, so stringer's `--delta` state has advanced past
- *   the one the first attempt published. Keeping the stale value would leave the next scan measuring
- *   from a baseline nothing holds, so it could never prove comparability and an honest delta would be
- *   suppressed. The point records the baseline the pass ULTIMATELY left.
+ *   the one the first attempt published, and the stale value is a claim nothing holds. What replaces
+ *   it depends on whether the window folded. FOLDED, the point's counts run right up to the state the
+ *   retry left, so the point publishes that state and the next nightly measures an honest delta from
+ *   it — where keeping the stale one would leave that scan unable to prove comparability, suppressing
+ *   a delta that was there to be had. NOT FOLDED, the retry consumed a window this point counts
+ *   nothing of: publishing where that window ended would sell the next scan a contiguity proof across
+ *   the hole, and it would difference its arrivals against counts from an unrelated window — a trend
+ *   move nothing in the codebase caused. So the point publishes NO baseline at all. Absent is
+ *   "nothing after this point can be proven contiguous", which is exactly true of a point with a gap
+ *   behind it.
  *
  * A point whose counts are a whole-repo STANDING TOTAL folds like any other: the arrivals since the
  * baseline it established, added to the total as of that baseline, are the standing total at the
@@ -307,11 +314,14 @@ async function reconcileAttempt(
   // `deltaState` present at all means this attempt ran stringer, so the state moved — including to a
   // baseline anton could not identify, which clears the point's rather than leaving a stale claim.
   const rescanned = input.deltaState !== undefined && existing.deltaState !== undefined;
-  const left = rescanned ? (input.deltaState?.after ?? null) : undefined;
-  const advanced = left !== undefined && left !== existing.deltaState;
   // Exactly the state this point ended at: proof the retry's window starts where the point's ends,
   // and the only case where their counts are one measurement.
-  const abuts = input.deltaState?.before !== undefined && input.deltaState.before === existing.deltaState;
+  const abuts =
+    input.deltaState?.before !== undefined && input.deltaState.before === existing.deltaState;
+  // Publishable only behind a fold — a point may only name a baseline its own counts run up to. A
+  // non-abutting retry leaves a window nothing here counts, so the point names none: see above.
+  const left = rescanned ? (abuts ? (input.deltaState?.after ?? null) : null) : undefined;
+  const advanced = left !== undefined && left !== existing.deltaState;
   const counts = abuts ? addCounts(existing.counts, input.counts) : existing.counts;
   const grew = counts.total !== existing.counts.total;
   // Only a folded window is part of this point's measurement, so only its outages are holes in it.
