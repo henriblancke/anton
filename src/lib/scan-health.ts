@@ -195,6 +195,22 @@ function extendDelta(delta: ScanDelta, added: ScanCounts): ScanDelta {
   return { total: delta.total + added.total, bySeverity };
 }
 
+/**
+ * Two attempts' reports as one. A folded point spans both windows, so its outcome is what each
+ * attempt filed for the window it triaged — the pass's beads, counted once each.
+ */
+function addTriage(
+  a: TriageOutcome | undefined,
+  b: TriageOutcome | undefined,
+): TriageOutcome | undefined {
+  if (!a || !b) return a ?? b;
+  return { created: a.created + b.created, deduped: a.deduped + b.deduped };
+}
+
+function sameTriage(a: TriageOutcome | undefined, b: TriageOutcome | undefined): boolean {
+  return a?.created === b?.created && a?.deduped === b?.deduped;
+}
+
 /** This scan minus the previous one, per severity and in total. */
 export function computeDelta(counts: ScanCounts, previous: ScanCounts): ScanDelta {
   const bySeverity = emptySeverityCounts();
@@ -239,7 +255,7 @@ async function findScanSummaryByJob(
 
 /**
  * A later attempt adds only what the first one died before knowing, and corrects what it
- * invalidated. Three facts about the point move:
+ * invalidated. Four facts about the point move:
  *
  * - THE WINDOW IT MEASURED: a retry that ran stringer again consumed a window of its own, and those
  *   signals are gone from stringer's baseline — no later scan will ever report them. Dropping them
@@ -251,27 +267,32 @@ async function findScanSummaryByJob(
  *   Without that proof of contiguity there is no union to count: a retry that re-established the
  *   baseline emitted a standing total (which double-counts the retained signals), and a point
  *   holding a standing total of its own never published a baseline to abut in the first place.
- * - TRIAGE: an attempt that finally got a report out of the session contributes it — but only one
- *   that triaged THESE signals. An attempt carrying a scan window of its own rescanned, so whatever
- *   it reported covers only that later window: pinning it here would show a point's nine folded
- *   signals triaged into the two beads its last two produced. That outcome is dropped and the point
- *   stays "not reported", which is the honest claim — nobody triaged the rest.
+ * - TRIAGE: an outcome covers the WINDOW it triaged, not the point. An attempt that consumed no
+ *   window of its own reported on the retained signals, so it backfills a report the first attempt
+ *   never got out. An attempt carrying a window of its own reported on THAT window: it joins the
+ *   first attempt's outcome when its signals folded in above, and is dropped when they didn't —
+ *   nothing on the point is what it triaged. The point keeps an outcome only while every window it
+ *   counts has one: a point whose nine folded signals include seven nobody reported on stays "not
+ *   reported", rather than showing all nine triaged into the two beads the last two produced.
+ * - COMPLETENESS: a folded window brings its collector outages with it, so the failures add — the
+ *   union is whole only if BOTH attempts ran every collector. A point that just became an undercount
+ *   also drops its delta: differencing it against a whole predecessor measures the outage rather than
+ *   the repo, the same rule {@link saveScanSummary} applies across adjacent scans.
  * - THE BASELINE IT LEFT: the retry scanned again, so stringer's `--delta` state has advanced past
  *   the one the first attempt published. Keeping the stale value would leave the next scan measuring
  *   from a baseline nothing holds, so it could never prove comparability and an honest delta would be
  *   suppressed. The point publishes the baseline the pass ULTIMATELY left.
  *
- * The last two only for a point that published a baseline at all: absent means the first attempt's
- * counts are a standing total (or of unidentified basis), and nothing may ever be measured against
- * those — the retry's baseline must not create a comparison the counts can't support.
+ * Folding and the baseline correction happen only for a point that published a baseline at all:
+ * absent means the first attempt's counts are a standing total (or of unidentified basis), and
+ * nothing may ever be measured against those — the retry's baseline must not create a comparison the
+ * counts can't support.
  */
 async function reconcileAttempt(
   db: AntonDb,
   existing: ScanSummary,
   input: SaveScanSummaryInput,
 ): Promise<ScanSummary> {
-  // A scan window of its own is what makes this attempt's report someone else's — see above.
-  const triage = !existing.triage && input.triage && !input.deltaState ? input.triage : undefined;
   // `deltaState` present at all means this attempt ran stringer, so the state moved — including to a
   // baseline anton could not identify, which clears the point's rather than leaving a stale claim.
   const rescanned = input.deltaState !== undefined && existing.deltaState !== undefined;
@@ -282,31 +303,56 @@ async function reconcileAttempt(
   const abuts = input.deltaState?.before !== undefined && input.deltaState.before === existing.deltaState;
   const counts = abuts ? addCounts(existing.counts, input.counts) : existing.counts;
   const grew = counts.total !== existing.counts.total;
-  if (!triage && !advanced && !grew) return existing;
+  // Only a folded window is part of this point's measurement, so only its outages are holes in it.
+  const collectorFailures =
+    existing.collectorFailures + (abuts ? (input.collectorFailures ?? 0) : 0);
+  const failuresGrew = collectorFailures !== existing.collectorFailures;
 
-  const delta = grew && existing.delta ? extendDelta(existing.delta, input.counts) : undefined;
+  // A scan window of its own is what makes this attempt's report someone else's — see above.
+  const backfill = input.deltaState === undefined && !existing.triage ? input.triage : undefined;
+  const retained = existing.triage ?? backfill;
+  const folded = abuts ? input.triage : undefined;
+  // Every window the point counts needs its own report, or the point has none: an empty window is
+  // covered by nobody having triaged it, since there was nothing there to triage.
+  const covered =
+    (retained !== undefined || existing.counts.total === 0) &&
+    (!abuts || folded !== undefined || input.counts.total === 0);
+  const triage = covered ? addTriage(retained, folded) : undefined;
+  const triageChanged = !sameTriage(triage, existing.triage);
+  if (!triageChanged && !advanced && !grew && !failuresGrew) return existing;
+
+  // The point the delta was measured against hasn't moved, so a widened window just widens it —
+  // unless the fold made these counts an undercount, which is not comparable in either direction.
+  const delta =
+    collectorFailures > 0
+      ? undefined
+      : grew && existing.delta
+        ? extendDelta(existing.delta, input.counts)
+        : existing.delta;
   await db
     .update(schema.scanSummaries)
     .set({
-      ...(triage ? { beadsCreated: triage.created, beadsDeduped: triage.deduped } : {}),
+      ...(triageChanged
+        ? { beadsCreated: triage?.created ?? null, beadsDeduped: triage?.deduped ?? null }
+        : {}),
       ...(advanced ? { deltaState: left } : {}),
+      ...(failuresGrew ? { collectorFailures } : {}),
       ...(grew
         ? {
             totalSignals: counts.total,
             bySeverityJson: JSON.stringify(counts.bySeverity),
             byClassJson: JSON.stringify(counts.byClass),
-            ...(delta ? { deltaJson: JSON.stringify(delta) } : {}),
           }
         : {}),
+      ...(delta === existing.delta ? {} : { deltaJson: delta ? JSON.stringify(delta) : null }),
     })
     .where(eq(schema.scanSummaries.id, existing.id));
 
-  const reconciled: ScanSummary = {
-    ...existing,
-    counts,
-    ...(delta ? { delta } : {}),
-    ...(triage ? { triage } : {}),
-  };
+  const reconciled: ScanSummary = { ...existing, counts, collectorFailures };
+  if (delta) reconciled.delta = delta;
+  else delete reconciled.delta;
+  if (triage) reconciled.triage = triage;
+  else delete reconciled.triage;
   if (advanced) {
     if (left === null) delete reconciled.deltaState;
     else reconciled.deltaState = left;
@@ -581,22 +627,30 @@ export const NO_SCAN_HEALTH = "none";
 
 /**
  * The newest row's identity for the board's refresh token. The id alone is not enough: a retried job
- * rewrites the existing row ({@link reconcileAttempt}) — backfilling triage counts, and folding a
- * contiguous retry's signals into the point's own — so a token built from the id would keep matching
- * and a board polling between the two writes would never show either. The total stands in for the
- * whole fold: counts only ever grow by it, and a fold that added nothing changed no severity or
- * class either. The remaining value a retry rewrites — the baseline the point left — is bookkeeping
- * the board never renders, so stamping the visible mutable fields keeps the poll 304-friendly while
- * still moving when there is something new to render.
+ * rewrites the existing row ({@link reconcileAttempt}) — backfilling or clearing triage counts, and
+ * folding a contiguous retry's signals and collector outages into the point's own — so a token built
+ * from the id would keep matching and a board polling between the two writes would never show
+ * either. The total stands in for the counts: they only ever grow by the fold, and a fold that added
+ * nothing changed no severity or class either. The failure count is stamped in its own right, since
+ * a fold can mark the column incomplete (and drop its delta) without moving a single count. The
+ * remaining value a retry rewrites — the baseline the point left — is bookkeeping the board never
+ * renders, so stamping the visible mutable fields keeps the poll 304-friendly while still moving
+ * when there is something new to render.
  */
-function scanVersion(id: string, total: number, triage: TriageOutcome | undefined): string {
-  return `${id}:${total}${triage ? `:${triage.created}:${triage.deduped}` : ""}`;
+function scanVersion(
+  id: string,
+  total: number,
+  triage: TriageOutcome | undefined,
+  collectorFailures: number,
+): string {
+  return `${id}:${total}:${collectorFailures}${triage ? `:${triage.created}:${triage.deduped}` : ""}`;
 }
 
 /** The series' identity for the board's refresh token. */
 export function scanHealthVersion(health: ScanHealth | undefined): string {
-  const latest = health?.latest;
-  return latest ? scanVersion(latest.id, latest.total, latest.triage) : NO_SCAN_HEALTH;
+  if (!health) return NO_SCAN_HEALTH;
+  const { latest } = health;
+  return scanVersion(latest.id, latest.total, latest.triage, health.collectorFailures);
 }
 
 /** The version without paying to read the whole window — one row, no blob parse. */
@@ -607,13 +661,16 @@ export async function latestScanHealthVersion(projectId: string): Promise<string
       totalSignals: schema.scanSummaries.totalSignals,
       beadsCreated: schema.scanSummaries.beadsCreated,
       beadsDeduped: schema.scanSummaries.beadsDeduped,
+      collectorFailures: schema.scanSummaries.collectorFailures,
     })
     .from(schema.scanSummaries)
     .where(eq(schema.scanSummaries.projectId, projectId))
     .orderBy(desc(schema.scanSummaries.generatedAt), NEWEST_FIRST)
     .limit(1);
   const row = rows[0];
-  return row ? scanVersion(row.id, row.totalSignals, rowTriage(row)) : NO_SCAN_HEALTH;
+  return row
+    ? scanVersion(row.id, row.totalSignals, rowTriage(row), row.collectorFailures)
+    : NO_SCAN_HEALTH;
 }
 
 /** One-line summary for the job log: what this scan found, and how it moved. */

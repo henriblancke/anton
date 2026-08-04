@@ -367,6 +367,141 @@ describe("the persisted series", () => {
     expect(next.delta?.total).toBe(-2);
   });
 
+  it("folds a retry's collector failures too, and drops the delta the fold undercuts", async () => {
+    // The first attempt was whole; the retry lost a collector mid-window. The point now counts a
+    // window it only partly saw, so it is a floor — and a delta spanning it (or the next scan
+    // differencing against it) would measure the outage rather than the repo.
+    await save(counts({ low: 3 }), { deltaState: { before: "b-1", after: "b0" } });
+    clock.advance(86_400_000);
+    const first = await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 5 }),
+      deltaState: { before: "b0", after: "b1" },
+    });
+    expect(first.delta?.total).toBe(2);
+    expect(first.collectorFailures).toBe(0);
+
+    const retry = await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 2 }),
+      collectorFailures: 1,
+      deltaState: { before: "b1", after: "b2" },
+    });
+
+    expect(retry.counts.total).toBe(7); // the window still folds — those signals are gone from stringer
+    expect(retry.collectorFailures).toBe(1);
+    expect(retry.delta).toBeUndefined();
+    const [row] = await listScanSummaries(tdb.db, projectId);
+    expect(row.collectorFailures).toBe(1);
+    expect(row.delta).toBeUndefined();
+
+    // And the next nightly can't be compared to an undercount either.
+    clock.advance(86_400_000);
+    const next = await save(counts({ low: 6 }), { deltaState: { before: "b2", after: "b3" } });
+    expect(next.delta).toBeUndefined();
+  });
+
+  it("moves the refresh token when a fold only marks the newest row incomplete", async () => {
+    // A retry that re-checked an empty window but lost a collector changes no count — the column
+    // still flips to incomplete on the chart, and a token blind to that would 304 past it.
+    await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 5 }),
+      deltaState: { before: "b0", after: "b1" },
+    });
+    const version = async () =>
+      scanHealthVersion(scanHealth(await listScanSummaries(tdb.db, projectId, 100)));
+    const before = await version();
+
+    const retry = await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: emptyScanCounts(),
+      collectorFailures: 2,
+      deltaState: { before: "b1", after: "b2" },
+    });
+
+    expect(retry.counts.total).toBe(5);
+    expect(retry.collectorFailures).toBe(2);
+    expect(await version()).not.toBe(before);
+  });
+
+  it("clears a triage outcome the fold left covering only part of the point", async () => {
+    // The first attempt triaged its 5 signals and then died syncing the board; the retry scanned an
+    // abutting window of 2 and never reported. Keeping "3 created" on a point of 7 would claim two
+    // signals nobody looked at were triaged — "not reported" is the honest reading again.
+    await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 5 }),
+      deltaState: { before: "b0", after: "b1" },
+      triage: { created: 3, deduped: 1 },
+    });
+    const retry = await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 2 }),
+      deltaState: { before: "b1", after: "b2" },
+    });
+
+    expect(retry.counts.total).toBe(7);
+    expect(retry.triage).toBeUndefined();
+    expect((await listScanSummaries(tdb.db, projectId))[0].triage).toBeUndefined();
+  });
+
+  it("keeps the triage outcome when the folded retry window held nothing to triage", async () => {
+    // An empty window has no untriaged signals in it, so the first attempt's report still covers
+    // every signal the point counts — clearing it would lose a real outcome to a no-op re-check.
+    await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 5 }),
+      deltaState: { before: "b0", after: "b1" },
+      triage: { created: 3, deduped: 1 },
+    });
+    const retry = await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: emptyScanCounts(),
+      deltaState: { before: "b1", after: "b2" },
+    });
+
+    expect(retry.triage).toEqual({ created: 3, deduped: 1 });
+    expect((await listScanSummaries(tdb.db, projectId))[0].triage).toEqual({
+      created: 3,
+      deduped: 1,
+    });
+  });
+
+  it("adds up the two attempts' triage when each reported on the window it scanned", async () => {
+    // Both windows are accounted for, so the pass's outcome is both reports — the point folded 7
+    // signals and 5 beads came out of them, which is exactly what each attempt filed.
+    await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 5 }),
+      deltaState: { before: "b0", after: "b1" },
+      triage: { created: 3, deduped: 1 },
+    });
+    const retry = await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 2 }),
+      deltaState: { before: "b1", after: "b2" },
+      triage: { created: 2, deduped: 4 },
+    });
+
+    expect(retry.counts.total).toBe(7);
+    expect(retry.triage).toEqual({ created: 5, deduped: 5 });
+    expect((await listScanSummaries(tdb.db, projectId))[0].triage).toEqual({
+      created: 5,
+      deduped: 5,
+    });
+  });
+
   it("does not fold a retry that rescanned from somewhere else — no proof the windows abut", async () => {
     // The retry re-established the baseline (or measured from one this point never published), so
     // its counts overlap the retained ones by an unknown amount. Adding them would invent arrivals.
@@ -580,17 +715,19 @@ describe("scanHealth (the board's view)", () => {
     expect(health.points.map((p) => p.id)).toEqual(["a", "b", "c"]);
     expect(health.latest.id).toBe("c");
     expect(health.delta?.total).toBe(-3);
-    expect(scanHealthVersion(health)).toBe("c:2");
+    expect(scanHealthVersion(health)).toBe("c:2:0");
   });
 
   it("stamps the mutable fields into the version — a retry rewrites them in an existing row", () => {
     const latest = summary("c", 300, 2);
-    expect(scanHealthVersion(scanHealth([latest]))).toBe("c:2");
-    // Triage backfilled, and a folded retry window growing the counts, both move the token.
+    expect(scanHealthVersion(scanHealth([latest]))).toBe("c:2:0");
+    // Triage backfilled, a folded retry window growing the counts, and a fold that only marked the
+    // point incomplete: each moves the token.
     expect(scanHealthVersion(scanHealth([{ ...latest, triage: { created: 2, deduped: 1 } }]))).toBe(
-      "c:2:2:1",
+      "c:2:0:2:1",
     );
-    expect(scanHealthVersion(scanHealth([summary("c", 300, 9)]))).toBe("c:9");
+    expect(scanHealthVersion(scanHealth([summary("c", 300, 9)]))).toBe("c:9:0");
+    expect(scanHealthVersion(scanHealth([{ ...latest, collectorFailures: 1 }]))).toBe("c:2:1");
   });
 
   it("marks every incomplete column, not only the latest scan", () => {
