@@ -1,0 +1,1 @@
+ALTER TABLE `scan_summaries` ADD `baseline_scan` integer;

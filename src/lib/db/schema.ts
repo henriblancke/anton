@@ -190,6 +190,100 @@ export const hygieneReports = sqliteTable(
 );
 
 /**
+ * One nightly-stringer scan's health summary (anton-bz1w) — the append-only series the board trends
+ * over. One row PER SCAN, never replaced: the point of the table is the shape of the last N scans,
+ * so collapsing it per project (the `run_health_reports` pattern) would erase the only thing it is
+ * for.
+ *
+ * anton.db rather than a bd comment thread (the review-score pattern) because a scan is measured
+ * against `stringer --delta`'s baseline, which is machine-local and per-checkout: two machines
+ * scanning one repo produce two independent series, and interleaving them on a shared bead would
+ * chart the cron schedule rather than the codebase. See src/lib/scan-health.ts.
+ *
+ * Bounded like `hygiene_reports`: each write prunes to the newest few dozen per project.
+ */
+export const scanSummaries = sqliteTable(
+  "scan_summaries",
+  {
+    id: text("id").primaryKey(),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id),
+    /** The nightly-stringer job that produced it; null for a summary written outside a job. */
+    jobId: text("job_id"),
+    /** That job's session — the route back to the scan log and the scan file. */
+    sessionId: text("session_id"),
+    generatedAt: ts("generated_at").notNull().default(now),
+    /** Denormalized so a board badge needn't parse the blobs. */
+    totalSignals: integer("total_signals").notNull().default(0),
+    /** `SeverityCounts` (src/lib/scan-health.ts), serialized — the chart's severity split. */
+    bySeverityJson: text("by_severity_json").notNull().default("{}"),
+    /** `ClassCounts`, serialized — security / dependencies / debt / risk / docs / other. */
+    byClassJson: text("by_class_json").notNull().default("{}"),
+    /**
+     * `ScanDelta` against the previous scan, serialized. NULL on a project's FIRST scan — nothing
+     * to compare to, which is not the same claim as "no change". Stored rather than derived so a
+     * point still names what it moved once its predecessor has aged out of the retention window.
+     */
+    deltaJson: text("delta_json"),
+    /**
+     * The `stringer --delta` baseline this scan LEFT behind — where the next scan's window starts —
+     * and NULL only when anton could not identify it. A later scan may be compared to this row only
+     * if it measured against exactly this baseline AND `baseline_scan` is false: the baseline lives
+     * in the repo while this table lives in a disposable anton.db, so either side can be reset
+     * without the other — and counting rows would then subtract a fresh baseline scan from the
+     * incremental one before it and chart a regression that never happened (anton-3flx).
+     *
+     * Recorded by whole-repo passes too, though nothing may be measured against their counts: it is
+     * what lets a retried job prove its own scan window abuts the one already on the row, instead of
+     * discarding a window stringer's state has already advanced past. See `DeltaState` in
+     * src/lib/stringer.ts and `reconcileAttempt` in src/lib/scan-health.ts.
+     */
+    deltaState: text("delta_state"),
+    /**
+     * The `stringer --delta` baseline this scan STARTED from — where its window OPENS — and NULL
+     * when there was none anton could read (a whole-repo pass, or a state it could not identify).
+     *
+     * Kept beside the one it left because a retried job's rescan is only legible against both. When
+     * a pass dies before triage the handler puts the baseline BACK (src/lib/jobs/nightly-stringer.ts),
+     * so the retry measures from this value again: it REPLAYED the row's own window rather than
+     * continuing past it, and its counts supersede rather than fold. A retry measuring from
+     * `delta_state` instead scanned the next window along, and folds in. Written once, at insert —
+     * neither a replay nor a fold moves where the window opens. See `reconcileAttempt` in
+     * src/lib/scan-health.ts.
+     */
+    deltaStateBefore: text("delta_state_before"),
+    /**
+     * TRUE when this row's counts are a whole-repo STANDING TOTAL rather than the arrival rate the
+     * trend charts: the scan established `--delta`'s baseline (a project's first, or the first after
+     * `.stringer` was reset) or ran without `--delta` at all. The chart must not scale incremental
+     * columns against one of these — a 100-signal baseline beside 2 and 3 new signals reads as a
+     * dramatic improvement out of two incomparable measurements (anton-3flx).
+     *
+     * NULL is "anton didn't say": rows written before this was tracked, and scans whose basis it
+     * could not identify. A point is only set apart with evidence, so NULL renders as incremental.
+     */
+    baselineScan: integer("baseline_scan", { mode: "boolean" }),
+    /**
+     * What /scan-triage reported doing with the signals. NULL when triage never ran (a scan with no
+     * new signals) or broke its report protocol — "not reported", never "created nothing".
+     */
+    beadsCreated: integer("beads_created"),
+    beadsDeduped: integer("beads_deduped"),
+    /** Collectors that died mid-scan: every one is a hole in the counts above. */
+    collectorFailures: integer("collector_failures").notNull().default(0),
+  },
+  (table) => [
+    // Serves "this project's last N scans" (and the prune) without a full scan.
+    index("scan_summaries_project_idx").on(table.projectId, table.generatedAt),
+    // One point per scheduled pass, enforced: a retried job runs the handler again, and a second
+    // insert would chart a phantom scan of a baseline the first attempt already consumed. SQLite
+    // treats NULLs as distinct, so a summary written outside a job is unaffected.
+    uniqueIndex("scan_summaries_job_unique").on(table.jobId),
+  ],
+);
+
+/**
  * Founder-facing escalations raised by the unstick pass (anton-wvcy). One row per stall the pass
  * could NOT prove safe to auto-resume: the run-health finding's evidence, frozen, plus the
  * open/resolved decision a human makes on the board.

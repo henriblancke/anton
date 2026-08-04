@@ -1,0 +1,1 @@
+ALTER TABLE `scan_summaries` ADD `delta_state` text;

@@ -46,6 +46,7 @@ import { useBoardGrouping } from "@/lib/use-board-grouping";
 import { SyncStatusBadge } from "@/components/board/sync-status-badge";
 import { AttentionStrip } from "@/components/board/attention-strip";
 import { ReviewTrendPill } from "@/components/board/review-trend-pill";
+import { ScanHealthPanel } from "@/components/board/scan-health-panel";
 import { Button } from "@/components/ui/button";
 import { TicketDialog } from "@/components/ticket/ticket-dialog";
 
@@ -324,6 +325,10 @@ export function EpicBoard({
         trajectory={board.reviewTrajectory}
         onOpenBead={setOpenTicketId}
       />
+      {/* The strip above says what needs answering on the board; this looks OUTWARD at the codebase
+          itself. A trend is not an alert, so it stays a single line below the strip rather than
+          competing with it for the operator's attention. */}
+      <ScanHealthPanel health={board.scanHealth} />
       {lanes ? (
         // The lanes share one horizontal scroller so every lane's stage columns line up under the
         // single stage strip, at any width.

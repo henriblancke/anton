@@ -159,7 +159,10 @@ describe("required skill assets", () => {
       // direct tickets land under no card (boardCards.cardOf → undefined) and any run on it is
       // 422'd; and linking a feature never reopens its parent, so buildRoadmap keeps reporting a
       // closed epic as a delivered outcome.
-      expect(scanTriage).toMatch(/safe to attach to\*\* — `bd children <epic-id>`/);
+      expect(scanTriage).toMatch(/safe to attach to\*\*/);
+      // The board-context section carries the verdict for open epics; `bd children` stays the
+      // derivation for a closed one (and for a run where the section never arrived).
+      expect(scanTriage).toMatch(/bd children <epic-id>/);
       expect(scanTriage).toMatch(/turns it into a container/);
       expect(scanTriage).toMatch(/bd reopen <epic-id>/);
     });
@@ -188,9 +191,12 @@ describe("required skill assets", () => {
       expect(scanTriage).not.toMatch(/already claimed, approved/);
       expect(scanTriage).toMatch(/An assignee alone is not a disqualifier/);
       // The guard is narrowing-only: read as a licence it would let a cleanup ticket join any open
-      // unstarted feature, crossing epic boundaries past what the per-class rule allows.
+      // unstarted feature, crossing epic boundaries past what the per-class rule allows. Routing
+      // (§4.0) widens the ways IN to exactly two, and both are named — surface ownership is the
+      // qualifier, so "sounds related" never becomes a home.
       expect(scanTriage).toMatch(/only rules candidates \*out\*; it never widens a per-class rule/);
-      expect(scanTriage).toMatch(/never some unrelated open feature under another epic/);
+      expect(scanTriage).toMatch(/this triage\s+just created\*\*, or the open feature whose \*\*touch surface owns/);
+      expect(scanTriage).toMatch(/merely sounds related, under another epic, is not\s+a home/);
     });
 
     it("scan-triage refuses to hand a childless feature its first child", () => {
@@ -213,6 +219,38 @@ describe("required skill assets", () => {
     it("scan-triage's summary line counts features, not epics", () => {
       expect(scanTriage).toMatch(/created: N \(F features, T tickets\)/);
       expect(scanTriage).not.toMatch(/created: N \(E epics/);
+      // scan-health parses `created:`/`deduped:` off this line — the later counters must not
+      // displace them, or every scan lands on the trend as a triage that did nothing.
+      expect(scanTriage).toMatch(/created:.*deduped: D \(cross-linked: L\)/);
+    });
+
+    // Routing + cross-producer dedup (anton-ol1l). The prompt is half of this contract; the other
+    // half is the `## Board context` section nightly-stringer resolves into it (board-context.ts),
+    // so the section's own name and verdict vocabulary are asserted here too — a rename on either
+    // side leaves triage reading rules it has no data for.
+    it("scan-triage routes a signal INTO the feature whose touch surface owns its file", () => {
+      expect(scanTriage).toMatch(/## Board context/);
+      expect(scanTriage).toMatch(/route INTO existing structure before you build new/i);
+      expect(scanTriage).toMatch(/attach:child/);
+      expect(scanTriage).toMatch(/attach:no/);
+      expect(scanTriage).toMatch(/--type discovered-from/);
+      // Ownership is the FILE, not the theme — the failure mode is a plausible-sounding parent.
+      expect(scanTriage).toMatch(/Match on the surface,\s*\n?not the theme/);
+    });
+
+    it("scan-triage dedupes across every producer namespace, not just stringer", () => {
+      expect(scanTriage).toMatch(/`stringer:`, `gardener:`, `pm:`/);
+      expect(scanTriage).toMatch(/Match on `<hash>` across ALL three namespaces/);
+      expect(scanTriage).toMatch(/A match is a cross-link, never a second bead/);
+      expect(scanTriage).toMatch(/--type related/);
+      // A hash keyed on anything volatile can't collide across producers — the whole check dies.
+      expect(scanTriage).toMatch(/derive it from the file \+ rule/);
+    });
+
+    it("scan-triage records WHY each bead landed where it did, for the gardener to audit", () => {
+      expect(scanTriage).toMatch(/records its routing decision/);
+      expect(scanTriage).toMatch(/routed: <parent-id\|none> — <why THIS parent>/);
+      expect(scanTriage).toMatch(/is not a decision — name\s*\n?the file\/surface/);
     });
   });
 

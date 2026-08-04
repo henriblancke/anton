@@ -14,6 +14,12 @@ import { getDb, schema } from "./db";
 import { removeWorktree } from "./git/worktree";
 import { FORMULA_NAME_PATTERN, configureBeadsForRepo } from "./beads/config.mjs";
 import { DEFAULT_BUDGET_POLICY, type BudgetPolicy } from "./jobs/budget";
+import {
+  DEFAULT_SCAN_SEVERITY_POLICY,
+  resolveScanSeverityPolicy,
+  type ScanSeverityOverrides,
+  type ScanSeverityPolicy,
+} from "./scan-severity";
 import type { ScoreAlarm } from "./jobs/review-alarm";
 import type { FormulaVariant } from "./jobs/run-formula";
 import type { AntonDb } from "./jobs/queue";
@@ -250,6 +256,14 @@ export interface ProjectSettings {
    * operator touched. Only consulted by the `run-health` schedule, which is off by default.
    */
   runHealth?: RunHealthThresholds;
+  /**
+   * How /scan-triage must label a bead it files from a stringer signal of a given severity
+   * (anton-bz1w): the `risk:` label and the bd priority. Absent → {@link
+   * DEFAULT_SCAN_SEVERITY_POLICY}; a stored value need only carry the severities the operator
+   * re-weighted. Resolved by the nightly-stringer job and injected into the triage prompt, so what
+   * a project configures is what the triaging agent actually applies.
+   */
+  scanSeverity?: ScanSeverityOverrides;
 }
 
 /** A resolved verify gate (anton-3oh8): a stable label (for logs/errors) + the shell command. */
@@ -491,6 +505,36 @@ export const DEFAULT_RUN_HEALTH_THRESHOLDS: Required<RunHealthThresholds> = {
   deadLeaseMinutes: 30,
 };
 
+/**
+ * A project's stringer severity → `risk:`/priority mapping (anton-bz1w). Optional per SEVERITY, but
+ * each override carries BOTH knobs: a half-specified rule ("high is now P0", label unstated) is a
+ * question the triage prompt can't answer, and the merge that applies these is per severity.
+ */
+const severityRuleSchema = z
+  .object({
+    risk: z.enum(["low", "high"]),
+    // bd's own priority scale: 0 = critical … 4 = backlog.
+    priority: z.number().int().min(0).max(4),
+  })
+  .strict();
+
+export const scanSeverityPolicySchema = z
+  .object({
+    critical: severityRuleSchema,
+    high: severityRuleSchema,
+    medium: severityRuleSchema,
+    low: severityRuleSchema,
+  })
+  .partial()
+  .strict();
+
+/** The shipped mapping with this project's overrides applied — never partial. */
+export function resolveScanSeverity(settings: ProjectSettings): ScanSeverityPolicy {
+  return resolveScanSeverityPolicy(settings.scanSeverity);
+}
+
+export { DEFAULT_SCAN_SEVERITY_POLICY };
+
 /** Overlay the stored (possibly partial) thresholds onto the defaults — never a partial out. */
 export function resolveRunHealthThresholds(
   settings: ProjectSettings,
@@ -576,6 +620,9 @@ export async function updateProjectSettings(
     // stays `undefined` above.
     else if (k === "budgetPolicy") next.budgetPolicy = { ...current.budgetPolicy, ...(v as object) };
     else if (k === "runHealth") next.runHealth = { ...current.runHealth, ...(v as object) };
+    // Same reasoning, one level down: the merge is per SEVERITY, and each severity's rule carries
+    // both knobs (the schema requires it), so re-weighting `critical` can't half-write `high`.
+    else if (k === "scanSeverity") next.scanSeverity = { ...current.scanSeverity, ...(v as object) };
     else (next as Record<string, unknown>)[k] = v;
   }
   await db
@@ -744,7 +791,7 @@ export async function deleteProject(slug: string): Promise<void> {
 
   // 4. Drop the project's anton.db rows atomically, children before parents (no ON DELETE
   //    CASCADE in the schema): sessions → runs → jobs → schedules → run-health → hygiene →
-  //    escalations → projects.
+  //    scan summaries → escalations → projects.
   try {
     db.transaction((tx) => {
       tx.delete(schema.sessions).where(eq(schema.sessions.projectId, project.id)).run();
@@ -756,6 +803,7 @@ export async function deleteProject(slug: string): Promise<void> {
         .where(eq(schema.runHealthReports.projectId, project.id))
         .run();
       tx.delete(schema.hygieneReports).where(eq(schema.hygieneReports.projectId, project.id)).run();
+      tx.delete(schema.scanSummaries).where(eq(schema.scanSummaries.projectId, project.id)).run();
       tx.delete(schema.escalations).where(eq(schema.escalations.projectId, project.id)).run();
       tx.delete(schema.projects).where(eq(schema.projects.id, project.id)).run();
     });
