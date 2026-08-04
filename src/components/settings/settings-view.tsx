@@ -1,6 +1,7 @@
 "use client";
 
 import { useRef, useState, useSyncExternalStore } from "react";
+import { useRouter } from "next/navigation";
 import {
   ArrowRightIcon,
   ChevronDownIcon,
@@ -313,6 +314,18 @@ export function SettingsView({
   // lands where it says it will, a reload returns to the same place, and a link points at a section
   // rather than at the top of a page.
   const active = useActiveSection();
+  const router = useRouter();
+
+  /**
+   * What "saved" currently means — the values every field is diffed against to decide it is dirty.
+   *
+   * Seeded from the SSR snapshot, then MOVED to the row the server stored on each successful save.
+   * The `settings` prop cannot serve as this baseline: it is fixed for the component's lifetime, so
+   * after a save the nav dots and the "unsaved in X" line would stay lit until a reload — and worse,
+   * an operator who restored a field to its pre-save value would see the Save button go disabled
+   * while the server still held the new value, with no way to put the original back.
+   */
+  const [baseline, setBaseline] = useState<EditableSettings>(settings);
 
   // The allowlist gates anton's BUNDLED agents only; the project's own `.claude/agents` (an id anton
   // doesn't ship) always run and are shown separately as "always active", not toggled here
@@ -407,42 +420,45 @@ export function SettingsView({
    *
    * Compared the same way the save body serializes: trimmed text, so trailing whitespace is not an
    * edit, and the persisted defaults, so an untouched form is never dirty.
+   *
+   * Against {@link baseline}, not the `settings` prop — the prop is the SSR snapshot and never
+   * moves, so a save would leave every indicator here stuck on.
    */
   const dirty: Record<string, boolean> = {
-    model: model !== (settings.model ?? ""),
+    model: model !== (baseline.model ?? ""),
     agents: !sameIds(
       bundledAgents.filter((a) => activeAgents.has(a.id)).map((a) => a.id),
-      settings.agents ?? bundledAgents.map((a) => a.id),
+      baseline.agents ?? bundledAgents.map((a) => a.id),
     ),
-    seedPrompt: seedPrompt.trim() !== (settings.seedPrompt ?? "").trim(),
-    reviewFixPrompt: reviewFixPrompt.trim() !== (settings.reviewFixPrompt ?? "").trim(),
-    formulaVariants: !sameVariants(variantRows, settings.formulaVariants ?? []),
-    concurrency: concurrency !== (settings.concurrency ?? DEFAULT_CONCURRENCY),
+    seedPrompt: seedPrompt.trim() !== (baseline.seedPrompt ?? "").trim(),
+    reviewFixPrompt: reviewFixPrompt.trim() !== (baseline.reviewFixPrompt ?? "").trim(),
+    formulaVariants: !sameVariants(variantRows, baseline.formulaVariants ?? []),
+    concurrency: concurrency !== (baseline.concurrency ?? DEFAULT_CONCURRENCY),
     jobTimeoutMinutes:
-      jobTimeoutMinutes !== (settings.jobTimeoutMinutes ?? DEFAULT_JOB_TIMEOUT_MINUTES),
+      jobTimeoutMinutes !== (baseline.jobTimeoutMinutes ?? DEFAULT_JOB_TIMEOUT_MINUTES),
     ticketTimeoutMinutes:
-      ticketTimeoutMinutes !== (settings.ticketTimeoutMinutes ?? DEFAULT_TICKET_TIMEOUT_MINUTES),
-    maxRetries: maxRetries !== (settings.maxRetries ?? DEFAULT_MAX_RETRIES),
-    autonomy: autonomy !== (settings.autonomy ?? true),
-    conventionalCommits: conventionalCommits !== (settings.conventionalCommits ?? false),
+      ticketTimeoutMinutes !== (baseline.ticketTimeoutMinutes ?? DEFAULT_TICKET_TIMEOUT_MINUTES),
+    maxRetries: maxRetries !== (baseline.maxRetries ?? DEFAULT_MAX_RETRIES),
+    autonomy: autonomy !== (baseline.autonomy ?? true),
+    conventionalCommits: conventionalCommits !== (baseline.conventionalCommits ?? false),
     budget:
-      budgetAware !== (settings.budgetAware ?? false) ||
+      budgetAware !== (baseline.budgetAware ?? false) ||
       daytimeReservePct !==
-        (settings.budgetPolicy?.daytimeReservePct ?? DEFAULT_DAYTIME_RESERVE_PCT) ||
-      weeklyTargetPct !== (settings.budgetPolicy?.weeklyTargetPct ?? DEFAULT_WEEKLY_TARGET_PCT),
+        (baseline.budgetPolicy?.daytimeReservePct ?? DEFAULT_DAYTIME_RESERVE_PCT) ||
+      weeklyTargetPct !== (baseline.budgetPolicy?.weeklyTargetPct ?? DEFAULT_WEEKLY_TARGET_PCT),
     gates:
-      testCommand.trim() !== (settings.testCommand ?? "").trim() ||
-      lintCommand.trim() !== (settings.lintCommand ?? "").trim() ||
-      typecheckCommand.trim() !== (settings.typecheckCommand ?? "").trim() ||
-      buildCommand.trim() !== (settings.buildCommand ?? "").trim(),
+      testCommand.trim() !== (baseline.testCommand ?? "").trim() ||
+      lintCommand.trim() !== (baseline.lintCommand ?? "").trim() ||
+      typecheckCommand.trim() !== (baseline.typecheckCommand ?? "").trim() ||
+      buildCommand.trim() !== (baseline.buildCommand ?? "").trim(),
     review:
-      reviewEnabled !== (settings.reviewEnabled ?? true) ||
-      reviewAgent !== (settings.reviewAgent ?? "") ||
-      reviewPrompt.trim() !== (settings.reviewPrompt ?? "").trim() ||
-      reviewMaxRounds !== (settings.reviewMaxRounds ?? DEFAULT_REVIEW_MAX_ROUNDS) ||
-      reviewMinScore !== (settings.reviewMinScore ?? DEFAULT_REVIEW_MIN_SCORE) ||
+      reviewEnabled !== (baseline.reviewEnabled ?? true) ||
+      reviewAgent !== (baseline.reviewAgent ?? "") ||
+      reviewPrompt.trim() !== (baseline.reviewPrompt ?? "").trim() ||
+      reviewMaxRounds !== (baseline.reviewMaxRounds ?? DEFAULT_REVIEW_MAX_ROUNDS) ||
+      reviewMinScore !== (baseline.reviewMinScore ?? DEFAULT_REVIEW_MIN_SCORE) ||
       reviewLowScoreRounds !==
-        (settings.reviewLowScoreRounds ?? DEFAULT_REVIEW_LOW_SCORE_ROUNDS),
+        (baseline.reviewLowScoreRounds ?? DEFAULT_REVIEW_LOW_SCORE_ROUNDS),
   };
   const dirtySections = SECTIONS.filter((s) => s.dirtyKeys.some((key) => dirty[key]));
 
@@ -581,11 +597,22 @@ export function SettingsView({
           budgetPolicy: { daytimeReservePct, weeklyTargetPct },
         }),
       });
-      if (!res.ok) {
-        const { error } = await res.json().catch(() => ({ error: "Save failed" }));
-        throw new Error(error ?? "Save failed");
-      }
+      const body = (await res.json().catch(() => null)) as {
+        settings?: EditableSettings;
+        error?: string;
+      } | null;
+      if (!res.ok) throw new Error(body?.error ?? "Save failed");
+      // The new baseline is what the server STORED, not what we sent: the PATCH deep-merges
+      // (budgetPolicy), prunes (half-filled variant rows, a missing reviewer we deliberately
+      // omitted) and recomputes, so the response row is the only honest answer to "what is saved
+      // now". Without this the form keeps diffing against the SSR snapshot for the rest of the
+      // session. If the response somehow carries no row we leave the baseline alone rather than
+      // guess — an over-eager clear would claim edits were persisted that may not have been.
+      if (body?.settings) setBaseline(body.settings);
       toast.success("Settings saved");
+      // The server tree still holds the pre-save row; refresh it so navigating away and back
+      // doesn't restore stale values out of the router cache.
+      router.refresh();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Save failed");
     } finally {

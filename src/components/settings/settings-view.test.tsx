@@ -522,6 +522,56 @@ describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
     expect(screen.getByText("in 2h")).toBeTruthy();
   });
 
+  /**
+   * The cadence editor is a popover that closes on a click outside it, and its time pickers render
+   * their menus in a portal — outside that subtree, at the end of <body>. So "outside the popover"
+   * and "outside the editor" are not the same place, and the guard that tells them apart keys on
+   * the marker the Select portal carries. Untested, a picker that stopped emitting that marker
+   * would fail SILENTLY: every click on an hour would close the editor and bin the draft, with no
+   * error anywhere. These two tests are the tripwire — one on the guard, one on the contract it
+   * depends on.
+   */
+  describe("the click-away guard vs. the portalled pickers", () => {
+    /** Open the editor on Daily, then open its hour picker. Returns the menu's options. */
+    function openHourPicker() {
+      openEditor();
+      fireEvent.click(frequency("Daily"));
+      fireEvent.click(screen.getByLabelText("Hour"));
+      return screen.getAllByRole("option");
+    }
+
+    it("does not read picking an hour as clicking away", () => {
+      renderView({}, [], stringer());
+      const options = openHourPicker();
+      const nine = options.find((o) => o.textContent === "09");
+      expect(nine).toBeTruthy();
+
+      // mousedown is what the guard listens for, and it bubbles to the document from the portal.
+      fireEvent.mouseDown(nine as Element);
+
+      // Still open: the draft survived, and "Set cadence" only exists inside the popover.
+      expect(setCadence()).toBeTruthy();
+    });
+
+    it("still closes on a click that is genuinely outside the editor", () => {
+      renderView({}, [], stringer());
+      openEditor();
+      fireEvent.mouseDown(document.body);
+      expect(screen.queryByRole("button", { name: "Set cadence" })).toBeNull();
+    });
+
+    it("keys on a marker the Select portal actually renders", () => {
+      // The guard's premise, asserted against the real component rather than assumed. If the Select
+      // primitive is ever swapped or restyled out of this attribute, this fails here — loudly, in
+      // CI — instead of out in the UI as a dropdown that silently discards what the operator typed.
+      renderView({}, [], stringer());
+      const options = openHourPicker();
+      const positioner = document.querySelector("[data-slot='select-positioner']");
+      expect(positioner).not.toBeNull();
+      expect(positioner?.contains(options[0])).toBe(true);
+    });
+  });
+
   it("keeps the raw expression reachable, seeded with what the picker would store", () => {
     renderView({}, [], stringer());
     openEditor();
@@ -702,5 +752,78 @@ describe("SettingsView navigation (anton-ue90.3)", () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     const sent = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
     expect(sent.seedPrompt).toBe("prefer RSC");
+  });
+
+  /**
+   * A save has to MOVE what "saved" means. Diffing against the SSR snapshot forever leaves the
+   * operator with a page that says it has unsaved work seconds after it saved, and — worse — one
+   * that refuses to persist a reversal because it mistakes the original value for the stored one.
+   */
+  describe("the dirty baseline after a save", () => {
+    /** Save resolving with the row the server stored, as the real PATCH route answers. */
+    function stubSaveReturning(stored: Record<string, unknown>) {
+      const fetchMock = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(
+        () => Promise.resolve(new Response(JSON.stringify({ settings: stored }), { status: 200 })),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      return fetchMock;
+    }
+
+    it("clears the unsaved indicators once the save lands", async () => {
+      const fetchMock = stubSaveReturning({ seedPrompt: "prefer RSC" });
+      window.location.hash = "#prompt";
+      renderView({});
+      const save = () => screen.getByRole("button", { name: /save changes/i }) as HTMLButtonElement;
+
+      fireEvent.change(screen.getByLabelText("Seed prompt"), { target: { value: "prefer RSC" } });
+      expect(save().disabled).toBe(false);
+      expect(screen.getByText("execution prompt")).toBeTruthy();
+
+      fireEvent.click(save());
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+      await waitFor(() => expect(save().disabled).toBe(true));
+      expect(screen.queryByText("execution prompt")).toBeNull();
+    });
+
+    it("re-arms Save when a field is put back to what it held before the save", async () => {
+      // The server now holds "prefer RSC". Typing the original text back is an EDIT against that,
+      // and it must be submittable — otherwise the only way to undo a save is to reload the page.
+      const fetchMock = stubSaveReturning({ seedPrompt: "prefer RSC" });
+      window.location.hash = "#prompt";
+      renderView({ seedPrompt: "original" });
+      const save = () => screen.getByRole("button", { name: /save changes/i }) as HTMLButtonElement;
+      const field = () => screen.getByLabelText("Seed prompt");
+
+      fireEvent.change(field(), { target: { value: "prefer RSC" } });
+      fireEvent.click(save());
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(save().disabled).toBe(true));
+
+      fireEvent.change(field(), { target: { value: "original" } });
+      expect(save().disabled).toBe(false);
+
+      fireEvent.click(save());
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+      const sent = JSON.parse((fetchMock.mock.calls[1][1] as RequestInit).body as string);
+      expect(sent.seedPrompt).toBe("original");
+    });
+
+    it("leaves the baseline alone when the save fails, so the edit is not lost", async () => {
+      const fetchMock = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(
+        () => Promise.resolve(new Response(JSON.stringify({ error: "nope" }), { status: 400 })),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      window.location.hash = "#prompt";
+      renderView({});
+      const save = () => screen.getByRole("button", { name: /save changes/i }) as HTMLButtonElement;
+
+      fireEvent.change(screen.getByLabelText("Seed prompt"), { target: { value: "prefer RSC" } });
+      fireEvent.click(save());
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+      await waitFor(() => expect(vi.mocked(toast.error)).toHaveBeenCalledWith("nope"));
+      expect(save().disabled).toBe(false);
+    });
   });
 });
