@@ -191,6 +191,25 @@ describe("ScanHealthPanel", () => {
     expect(column.innerHTML).toContain("bg-risk-med/70");
   });
 
+  // A baseline that also lost a collector is both things at once, and the failure is the harder one
+  // to recover: once the scan is no longer latest its failure chip is gone, and every later delta is
+  // measured against a total nobody said was short.
+  it("keeps the collector failure visible on a baseline column", () => {
+    const points: ScanHealthPoint[] = [
+      { ...point("a", 1_700_000_000, { low: 100 }), baseline: true, incomplete: true },
+      point("b", 1_700_086_400, { low: 2 }),
+    ];
+    render(<ScanHealthPanel health={health({ points })} />);
+
+    const label = screen.getByRole("img").getAttribute("aria-label")!;
+    expect(label).toContain("baseline scan: 100 signals already in the repo");
+    expect(label).toContain("at least one collector failed");
+
+    const column = screen.getByTitle(/baseline scan/);
+    expect(column.innerHTML).toContain("bg-risk-med/70");
+    expect(column.innerHTML).toContain("opacity-40");
+  });
+
   it("reports what triage did with the scan, when triage reported it", () => {
     const points = [{ ...point("a", 1_700_000_000, { low: 3 }), triage: { created: 2, deduped: 1 } }];
     render(<ScanHealthPanel health={health({ points })} />);

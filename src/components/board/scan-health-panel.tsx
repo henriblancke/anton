@@ -54,12 +54,18 @@ function severitySplit(point: ScanHealthPoint): string {
  * What a baseline column is, wherever it is announced. It counts everything already in the repo, so
  * it is a different quantity from every incremental column beside it — the panel says that rather
  * than letting the eye read a 100-signal baseline followed by 2 and 3 as debt collapsing.
+ *
+ * A baseline that ALSO lost a collector is both things at once, and being the baseline is the worse
+ * place to hide an undercount: every later delta is measured against this total. Once the scan is no
+ * longer latest its failure chip is gone, so the column is the only thing left that can say so.
  */
 function baselineNote(point: ScanHealthPoint): string {
-  return (
+  const note =
     `baseline scan: ${point.total} signal${point.total === 1 ? "" : "s"} already in the repo, ` +
-    `not new arrivals — not comparable to the scans beside it`
-  );
+    `not new arrivals — not comparable to the scans beside it`;
+  return point.incomplete
+    ? `${note}; at least one collector failed — this baseline is itself an undercount`
+    : note;
 }
 
 /**
@@ -134,7 +140,18 @@ function ScanTrend({ points, className }: { points: ScanHealthPoint[]; className
             title={`${shortDate(point.at)} — ${baselineNote(point)}`}
             className="flex h-full min-w-1.5 flex-1 flex-col justify-end"
           >
-            <span className="h-full w-full rounded-[1px] border border-dashed border-subtle/60" />
+            <span
+              className={cn(
+                "w-full flex-1 rounded-[1px] border border-dashed border-subtle/60",
+                point.incomplete && "opacity-40",
+              )}
+            />
+            {/* A baseline that lost a collector carries BOTH marks: the outline says the total isn't
+                comparable, the amber rule says it is short whatever the dead collector would have
+                found. Drawing only the outline would let `baseline` mask the failure. */}
+            {point.incomplete ? (
+              <span className="mt-px h-0.5 w-full rounded-[1px] bg-risk-med/70" />
+            ) : null}
           </span>
         ) : (
           <span
