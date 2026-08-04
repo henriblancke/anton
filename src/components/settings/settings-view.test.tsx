@@ -4,7 +4,7 @@
  * inputs seed from a persisted policy (round-trip in), and Save PATCHes the edited values back.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { toast } from "sonner";
 
 import { SettingsView } from "@/components/settings/settings-view";
@@ -467,6 +467,90 @@ describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
     expect(screen.getAllByText("not scheduled").length).toBe(7);
     // gardener has no row at all — it still shows the cadence it would be created at.
     expect(cadenceButton("gardener").textContent).toContain("Daily at 05:00");
+  });
+
+  /** Mirrors SCHEDULE_POLL_MS in settings-view.tsx — how often the open panel re-reads the rows. */
+  const POLL_MS = 30_000;
+
+  /**
+   * The panel left open, with the clock and the poll both under our control.
+   *
+   * The clock is pinned to a WHOLE second before anything reads it: the countdown floors to the
+   * second, so starting part-way through one would make "90s out" render as "in 1m" or "in 89s"
+   * depending on when the test happened to run.
+   *
+   * `fetch` is stubbed even where the poll's answer does not matter — the countdown test advances
+   * past the poll interval, and an unstubbed poll would reach for a relative URL jsdom cannot serve.
+   */
+  function openPanel(
+    schedulesFor: (nowSec: number) => Parameters<typeof renderView>[2],
+    polledFor: (nowSec: number) => unknown[] = () => [],
+  ) {
+    const nowSec = Math.floor(Date.now() / 1000);
+    vi.useFakeTimers();
+    vi.setSystemTime(nowSec * 1000);
+    const fetchMock = vi.fn(() =>
+      Promise.resolve(new Response(JSON.stringify({ schedules: polledFor(nowSec) }))),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderView({}, [], schedulesFor(nowSec));
+    return { fetchMock, nowSec };
+  }
+
+  /** Advance the fake clock AND let the poll's promise chain settle, inside act(). */
+  async function tick(ms: number) {
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ms);
+    });
+  }
+
+  it("counts the next run down while the panel sits open, without a reload", async () => {
+    // The defect this pins: the countdown was read only during a render, and nothing on this panel
+    // re-renders on its own — so a row that said "in 1m" kept saying it long after the run was due.
+    openPanel((nowSec) => stringer({ nextRunAt: nowSec + 90 }));
+    try {
+      expect(screen.getByText("in 1m")).toBeTruthy();
+
+      await tick(60_000);
+      expect(screen.getByText("in 30s")).toBeTruthy();
+
+      await tick(35_000);
+      expect(screen.getByText("due now")).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("re-reads the schedule rows so a fire refreshes both time columns", async () => {
+    const { fetchMock } = openPanel(
+      (nowSec) => stringer({ nextRunAt: nowSec + 60 }),
+      (nowSec) => [
+        {
+          type: "nightly-stringer",
+          enabled: true,
+          // Deliberately different from the row on screen — the poll must NOT move the cadence.
+          cron: "0 * * * *",
+          nextRunAt: nowSec + 1800,
+          lastRunAt: nowSec - 60,
+        },
+      ],
+    );
+    try {
+      // Nothing has run yet: seven rows, none carrying a lastRunAt.
+      expect(screen.getAllByText("never").length).toBe(7);
+
+      await tick(POLL_MS);
+
+      expect(fetchMock).toHaveBeenCalledWith("/api/projects/tmp/schedules");
+      // Both time columns moved to what the server now holds...
+      expect(screen.getByText("in 29m")).toBeTruthy();
+      expect(screen.getByText("1m ago")).toBeTruthy();
+      expect(screen.getAllByText("never").length).toBe(6);
+      // ...while the cadence stayed the operator's, not the poll's.
+      expect(cadenceButton().textContent).toContain("Every 30 minutes");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("says which automations are idle because the one that feeds them is off", () => {

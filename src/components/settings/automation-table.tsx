@@ -38,6 +38,36 @@ export interface AutomationSpec {
 /** Group order — board first (what the operator curates), then health, then delivery. */
 export const AUTOMATION_GROUPS = ["Board maintenance", "Run health", "Delivery"] as const;
 
+/**
+ * How often the time columns re-read the clock. Five seconds and not a minute because the countdown
+ * prints seconds inside the last minute ("in 45s"), so a minute-long tick would let a row sit a full
+ * minute past due still claiming time was left; five seconds and not one because seven rows of text
+ * do not need sixty renders a minute to stay honest.
+ */
+const CLOCK_TICK_MS = 5_000;
+
+/**
+ * The clock, as a value that re-renders its reader.
+ *
+ * {@link formatCountdown} and `formatRelativeTime` are pure functions of "now", so without something
+ * moving that argument this table is frozen at whatever the clock read when it last rendered — and
+ * nothing else on this panel re-renders on its own. That is what let a row keep saying `in 9m` long
+ * after the run was due.
+ *
+ * Seeded straight from `Date.now()` rather than the hydration-deferred shape `StuckFor` uses on the
+ * board: the settings panels are gated on `useActiveSection`, whose server snapshot is always
+ * "general", so this table only ever mounts in the browser and never takes part in a hydration
+ * comparison. There is no render where a server clock and a client clock could disagree.
+ */
+function useNow(intervalMs: number): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), intervalMs);
+    return () => clearInterval(id);
+  }, [intervalMs]);
+  return now;
+}
+
 function formatInstant(unixSeconds: number): string {
   return formatExactTime(new Date(unixSeconds * 1000).toISOString()) ?? "unknown";
 }
@@ -48,7 +78,7 @@ function formatInstant(unixSeconds: number): string {
  * cell's tooltip for when it matters. `formatRelativeTime` can't serve this: it clamps the future to
  * zero and would render every pending run as "0s ago".
  */
-function formatCountdown(unixSeconds: number, nowMs = Date.now()): string {
+function formatCountdown(unixSeconds: number, nowMs: number): string {
   const seconds = Math.floor((unixSeconds * 1000 - nowMs) / 1000);
   if (seconds <= 0) return "due now";
   if (seconds < 60) return `in ${seconds}s`;
@@ -83,6 +113,9 @@ export function AutomationTable({
   onToggle: (id: string, next: boolean) => void;
 }) {
   const enabledCount = automations.filter((a) => state[a.id]?.enabled === true).length;
+  // Read once for the whole table so every row's countdown and last-run age agree on the instant
+  // they are relative to, and one tick re-renders them together.
+  const now = useNow(CLOCK_TICK_MS);
 
   return (
     <div className="flex flex-col gap-3">
@@ -135,6 +168,7 @@ export function AutomationTable({
                     key={automation.id}
                     automation={automation}
                     state={state[automation.id]}
+                    now={now}
                     producerOn={
                       automation.dependsOn ? state[automation.dependsOn]?.enabled === true : true
                     }
@@ -155,6 +189,7 @@ export function AutomationTable({
 function AutomationTableRow({
   automation,
   state,
+  now,
   producerOn,
   defaultCron,
   onCronChange,
@@ -162,6 +197,8 @@ function AutomationTableRow({
 }: {
   automation: AutomationSpec;
   state: AutomationScheduleState;
+  /** Epoch ms from the table's ticking clock — what both time columns are relative to. */
+  now: number;
   /** Whether the automation this one consumes is itself on. */
   producerOn: boolean;
   defaultCron: string;
@@ -212,7 +249,9 @@ function AutomationTableRow({
 
       <td className="px-2.5 py-2 align-middle font-mono text-[11.5px] tabular-nums whitespace-nowrap text-muted-foreground">
         {on && state.nextRunAt ? (
-          <span title={formatInstant(state.nextRunAt)}>{formatCountdown(state.nextRunAt)}</span>
+          <span title={formatInstant(state.nextRunAt)}>
+            {formatCountdown(state.nextRunAt, now)}
+          </span>
         ) : (
           <span className="text-subtle">not scheduled</span>
         )}
@@ -221,7 +260,7 @@ function AutomationTableRow({
       <td className="px-2.5 py-2 align-middle font-mono text-[11.5px] tabular-nums whitespace-nowrap text-muted-foreground">
         {state.lastRunAt ? (
           <span title={formatInstant(state.lastRunAt)}>
-            {formatRelativeTime(new Date(state.lastRunAt * 1000).toISOString())}
+            {formatRelativeTime(new Date(state.lastRunAt * 1000).toISOString(), now)}
           </span>
         ) : (
           <span className="text-subtle">never</span>

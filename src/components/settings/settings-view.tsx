@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState, useSyncExternalStore } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useRouter } from "next/navigation";
 import {
   ArrowRightIcon,
@@ -267,6 +267,19 @@ const AUTOMATIONS: AutomationSpec[] = [
   },
 ];
 
+/**
+ * How often the open Automation panel re-reads the schedule rows.
+ *
+ * The table's countdown ticks on its own clock, but a fire is a SERVER event: when a job runs, the
+ * row gets a new nextRunAt and a new lastRunAt, and neither is knowable here. Without this the panel
+ * holds the snapshot it was rendered with — the countdown would tick down to "due now" and then sit
+ * there, with "Last run" still naming the fire before this one, until someone reloaded the page.
+ *
+ * Thirty seconds is comfortably inside the fastest cadence the editor offers and costs one small
+ * indexed query per open panel; the interval is only mounted while that panel is open.
+ */
+const SCHEDULE_POLL_MS = 30_000;
+
 /** Per-automation schedule state from the server; a missing row means "not scheduled yet". */
 interface AutomationSchedule {
   type: string;
@@ -380,6 +393,14 @@ export function SettingsView({
       }),
     ),
   );
+  // A schedule PATCH and the schedule poll both write the same rows, and the PATCH is the one that
+  // knows the truth — its response carries the server's recomputed nextRunAt. These two let a poll
+  // recognise that it raced a write and drop its own (pre-write) answer rather than applying it on
+  // top: `inFlight` catches a write still running, `completed` a write that started AND finished
+  // inside the poll's request window, which a plain in-flight check would miss entirely.
+  const schedulePatchesInFlight = useRef(0);
+  const schedulePatchesCompleted = useRef(0);
+
   const [model, setModel] = useState(settings.model ?? "");
   const [seedPrompt, setSeedPrompt] = useState(settings.seedPrompt ?? "");
   const [reviewFixPrompt, setReviewFixPrompt] = useState(settings.reviewFixPrompt ?? "");
@@ -475,6 +496,7 @@ export function SettingsView({
   ) {
     const prev = automations[id];
     setAutomations((p) => ({ ...p, [id]: { ...prev, ...patch } }));
+    schedulePatchesInFlight.current += 1;
     try {
       const res = await fetch(`/api/projects/${project.slug}/schedules`, {
         method: "PATCH",
@@ -511,8 +533,63 @@ export function SettingsView({
         },
       }));
       toast.error(err instanceof Error ? err.message : `Failed to update ${id}`);
+    } finally {
+      // In `finally` so a rejected patch also clears the in-flight count — otherwise one network
+      // failure would leave the counter above zero and silently stop the poll for the whole session.
+      schedulePatchesInFlight.current -= 1;
+      schedulePatchesCompleted.current += 1;
     }
   }
+
+  /**
+   * Keep the open Automation panel's next-run and last-run times live (anton-ue90).
+   *
+   * Only the two TIME fields are taken from the poll. Cadence and enabled state are owned by this
+   * page's optimistic writes, and letting a poll land on them would let a response that left the
+   * server before an edit arrive after it and quietly put the old cadence back on screen — while the
+   * editor's own draft, seeded once from the `cron` prop, kept showing the new one.
+   */
+  useEffect(() => {
+    if (active !== "automation") return;
+    let cancelled = false;
+    const id = setInterval(async () => {
+      if (schedulePatchesInFlight.current > 0) return;
+      const completedBefore = schedulePatchesCompleted.current;
+      let rows: unknown;
+      try {
+        const res = await fetch(`/api/projects/${project.slug}/schedules`);
+        if (!res.ok) return;
+        ({ schedules: rows } = await res.json());
+      } catch {
+        // Transient — the next tick retries. A failed poll must not toast or blank the table; the
+        // times simply stay as stale as they were before it ran.
+        return;
+      }
+      if (cancelled || !Array.isArray(rows)) return;
+      // Re-checked AFTER the await: a write that started and landed while this request was open
+      // holds the newer times, so this response is stale even though it arrived later.
+      if (
+        schedulePatchesInFlight.current > 0 ||
+        schedulePatchesCompleted.current !== completedBefore
+      ) {
+        return;
+      }
+      setAutomations((p) => {
+        const next = { ...p };
+        for (const row of rows as AutomationSchedule[]) {
+          const current = next[row.type];
+          // A row for a type this build doesn't list is not ours to show.
+          if (!current) continue;
+          next[row.type] = { ...current, nextRunAt: row.nextRunAt, lastRunAt: row.lastRunAt };
+        }
+        return next;
+      });
+    }, SCHEDULE_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [active, project.slug]);
 
   function toggleAutomation(id: string, next: boolean) {
     return patchSchedule(id, { enabled: next }, `${id} ${next ? "enabled" : "disabled"}`);
