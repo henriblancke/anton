@@ -76,10 +76,14 @@ export interface ScanSummary {
    */
   delta?: ScanDelta;
   /**
-   * The `stringer --delta` baseline this scan left, published only when the scan measured against a
-   * baseline itself — so the next scan can prove it is comparing arrival rates, not subtracting a
-   * standing total. Absent when this scan (re-)established the baseline, or when anton could not
-   * identify stringer's state.
+   * The `stringer --delta` baseline this scan LEFT — where the next window starts, whatever basis
+   * this scan itself measured on. Absent only when anton could not identify stringer's state.
+   *
+   * It proves CONTIGUITY, and contiguity alone: a retry measuring from exactly this state scanned
+   * the window that begins where this point's ends ({@link reconcileAttempt}), and so does the next
+   * nightly. Subtracting two points additionally requires this one's counts to be an arrival rate
+   * ({@link baselineScan} `=== false`) — a baseline scan leaves a baseline behind too, and nothing
+   * may be measured against ITS standing total.
    */
   deltaState?: string;
   /**
@@ -265,8 +269,7 @@ async function findScanSummaryByJob(
  *   ABUT: fold its counts in, and the point measures the whole pass, start to finish. The stored
  *   delta widens with them ({@link extendDelta}) — the point it was measured against hasn't moved.
  *   Without that proof of contiguity there is no union to count: a retry that re-established the
- *   baseline emitted a standing total (which double-counts the retained signals), and a point
- *   holding a standing total of its own never published a baseline to abut in the first place.
+ *   baseline emitted a standing total, which double-counts the retained signals.
  * - TRIAGE: an outcome covers the WINDOW it triaged, not the point. An attempt that consumed no
  *   window of its own reported on the retained signals, so it backfills a report the first attempt
  *   never got out. An attempt carrying a window of its own reported on THAT window: it joins the
@@ -281,12 +284,20 @@ async function findScanSummaryByJob(
  * - THE BASELINE IT LEFT: the retry scanned again, so stringer's `--delta` state has advanced past
  *   the one the first attempt published. Keeping the stale value would leave the next scan measuring
  *   from a baseline nothing holds, so it could never prove comparability and an honest delta would be
- *   suppressed. The point publishes the baseline the pass ULTIMATELY left.
+ *   suppressed. The point records the baseline the pass ULTIMATELY left.
  *
- * Folding and the baseline correction happen only for a point that published a baseline at all:
- * absent means the first attempt's counts are a standing total (or of unidentified basis), and
- * nothing may ever be measured against those — the retry's baseline must not create a comparison the
- * counts can't support.
+ * A point whose counts are a whole-repo STANDING TOTAL folds like any other: the arrivals since the
+ * baseline it established, added to the total as of that baseline, are the standing total at the
+ * retry's end. It stays flagged as one, so the chart and the next scan go on treating it as
+ * incomparable — the fold accounts for the retry's window without inventing a quantity to subtract.
+ * (Refusing to fold there stranded the window entirely: a baseline attempt that dies is followed by
+ * a retry whose delta window is a real day's arrivals, consumed from stringer's state and reportable
+ * by nobody after.)
+ *
+ * Both the fold and the correction need the point to name where its own window ENDED
+ * ({@link ScanSummary.deltaState}). Absent, nothing can be proven contiguous — and advancing to the
+ * retry's state would then hand the next scan a baseline to measure from while the counts it would
+ * be differenced against silently exclude the retry's window.
  */
 async function reconcileAttempt(
   db: AntonDb,
@@ -298,8 +309,8 @@ async function reconcileAttempt(
   const rescanned = input.deltaState !== undefined && existing.deltaState !== undefined;
   const left = rescanned ? (input.deltaState?.after ?? null) : undefined;
   const advanced = left !== undefined && left !== existing.deltaState;
-  // Exactly the baseline this point publishes: proof the retry's window starts where the point's
-  // ends, and the only case where their counts are one measurement.
+  // Exactly the state this point ended at: proof the retry's window starts where the point's ends,
+  // and the only case where their counts are one measurement.
   const abuts = input.deltaState?.before !== undefined && input.deltaState.before === existing.deltaState;
   const counts = abuts ? addCounts(existing.counts, input.counts) : existing.counts;
   const grew = counts.total !== existing.counts.total;
@@ -383,10 +394,11 @@ export async function saveScanSummary(
   }
 
   // Comparable ONLY when this scan measured arrivals since exactly the baseline the previous point
-  // left. A scan with no baseline to measure against emits everything in the repo — a standing
-  // total, not the arrival rate every incremental point measures — and subtracting the two charts a
-  // move that never happened (a 100-signal baseline after one quiet night reads "+99, debt pouring
-  // in"). Counting predecessors can't tell them apart (anton-3flx): stringer's baseline lives in the
+  // left, and that point measured an arrival rate itself. A scan with no baseline to measure against
+  // emits everything in the repo — a standing total, not the arrival rate every incremental point
+  // measures — and subtracting the two charts a move that never happened (a 100-signal baseline
+  // after one quiet night reads "+99, debt pouring in"). Counting predecessors can't tell them
+  // apart (anton-3flx): stringer's baseline lives in the
   // REPO while this series lives in a disposable anton.db, so either is reset without the other —
   // a rebuilt anton.db would suppress two honest deltas, and a re-established baseline mid-series
   // would sail straight through the count and chart a regression.
@@ -398,13 +410,19 @@ export async function saveScanSummary(
   const consumed = input.deltaState?.before;
   const [previous] = await listScanSummaries(db, input.projectId, 1);
   const whole = (input.collectorFailures ?? 0) === 0 && previous?.collectorFailures === 0;
+  // Two conditions, not one: the windows must be contiguous (this scan measured from exactly where
+  // that point's ended) AND the point must hold an arrival rate of its own. `baselineScan === false`
+  // is that proof — absent is an unidentified basis, which is not evidence of one.
   const delta =
-    consumed && whole && previous?.deltaState === consumed
+    consumed && whole && previous?.deltaState === consumed && previous?.baselineScan === false
       ? computeDelta(input.counts, previous.counts)
       : undefined;
-  // Published only by a scan whose own counts are an arrival rate: a baseline scan leaves a baseline
-  // behind too, but nothing may ever be measured against ITS standing total.
-  const deltaState = consumed ? input.deltaState?.after : undefined;
+  // Recorded by every scan that left a state anton could read, a baseline scan included: it says
+  // where the next window STARTS, which is as true of a whole-repo pass as of an incremental one —
+  // and dropping it left a retry of a baseline pass unable to prove its own window abutted, so a
+  // real day's arrivals were stranded (see reconcileAttempt). What it does NOT do is license a
+  // subtraction: `baselineScan` above decides that.
+  const deltaState = input.deltaState?.after;
   // Recorded rather than re-derived at read time: the same fact keeps the trend from scaling
   // incremental columns against a whole-repo total long after the baseline itself is gone. Taken as
   // the scan OBSERVED it rather than inferred from a missing `before` — a scan whose basis anton

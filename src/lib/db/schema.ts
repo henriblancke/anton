@@ -227,13 +227,17 @@ export const scanSummaries = sqliteTable(
      */
     deltaJson: text("delta_json"),
     /**
-     * The `stringer --delta` baseline this scan LEFT behind, and NULL when the scan established that
-     * baseline (so its counts are a whole-repo standing total, not an arrival rate) or when anton
-     * could not identify it. A later scan may be compared to this row only if it measured against
-     * exactly this baseline: the baseline lives in the repo while this table lives in a disposable
-     * anton.db, so either side can be reset without the other — and counting rows would then
-     * subtract a fresh baseline scan from the incremental one before it and chart a regression that
-     * never happened (anton-3flx). See `DeltaState` in src/lib/stringer.ts.
+     * The `stringer --delta` baseline this scan LEFT behind — where the next scan's window starts —
+     * and NULL only when anton could not identify it. A later scan may be compared to this row only
+     * if it measured against exactly this baseline AND `baseline_scan` is false: the baseline lives
+     * in the repo while this table lives in a disposable anton.db, so either side can be reset
+     * without the other — and counting rows would then subtract a fresh baseline scan from the
+     * incremental one before it and chart a regression that never happened (anton-3flx).
+     *
+     * Recorded by whole-repo passes too, though nothing may be measured against their counts: it is
+     * what lets a retried job prove its own scan window abuts the one already on the row, instead of
+     * discarding a window stringer's state has already advanced past. See `DeltaState` in
+     * src/lib/stringer.ts and `reconcileAttempt` in src/lib/scan-health.ts.
      */
     deltaState: text("delta_state"),
     /**

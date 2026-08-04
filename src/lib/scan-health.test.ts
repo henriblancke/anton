@@ -123,6 +123,18 @@ describe("the persisted series", () => {
     return { ...(before ? { before } : {}), after: left, baselineScan: before === undefined };
   };
 
+  /**
+   * One delta scan of that chain, named explicitly. `baselineScan: false` rides along because that
+   * is what stringer reports whenever it read a baseline off the repo (`before`) — a scan measuring
+   * arrivals since one is by definition not a whole-repo pass, and the delta gate wants the fact
+   * observed, not inferred from the shape of the fixture.
+   */
+  const since = (before: string, after: string): DeltaState => ({
+    before,
+    after,
+    baselineScan: false,
+  });
+
   const save = (
     c: ScanCounts,
     extra: { triage?: TriageOutcome; collectorFailures?: number; deltaState?: DeltaState } = {},
@@ -208,13 +220,13 @@ describe("the persisted series", () => {
     // first honest one, exactly as after a project's very first scan.
     clock.advance(1000);
     const afterReset = await save(counts({ low: 3 }), {
-      deltaState: { before: "baseline-fresh", after: "baseline-next" },
+      deltaState: since("baseline-fresh", "baseline-next"),
     });
     expect(afterReset.delta).toBeUndefined();
 
     clock.advance(1000);
     const settled = await save(counts({ low: 1 }), {
-      deltaState: { before: "baseline-next", after: "baseline-after" },
+      deltaState: since("baseline-next", "baseline-after"),
     });
     expect(settled.delta?.total).toBe(-2);
   });
@@ -224,13 +236,13 @@ describe("the persisted series", () => {
     // already incremental — its successor is comparable, and suppressing it (as a predecessor count
     // must) would throw away an honest delta.
     const first = await save(counts({ low: 4 }), {
-      deltaState: { before: "baseline-survived", after: "baseline-1" },
+      deltaState: since("baseline-survived", "baseline-1"),
     });
     expect(first.delta).toBeUndefined(); // nothing stored before it to compare against
 
     clock.advance(1000);
     const second = await save(counts({ low: 1 }), {
-      deltaState: { before: "baseline-1", after: "baseline-2" },
+      deltaState: since("baseline-1", "baseline-2"),
     });
     expect(second.delta?.total).toBe(-3);
   });
@@ -245,7 +257,7 @@ describe("the persisted series", () => {
     clock.advance(1000);
 
     const stranded = await save(counts({ low: 1 }), {
-      deltaState: { before: "baseline-elsewhere", after: "baseline-later" },
+      deltaState: since("baseline-elsewhere", "baseline-later"),
     });
     expect(stranded.delta).toBeUndefined();
   });
@@ -307,13 +319,13 @@ describe("the persisted series", () => {
       projectId,
       jobId: "job-1",
       counts: counts({ low: 7 }),
-      deltaState: { before: "b0", after: "b1" },
+      deltaState: since("b0", "b1"),
     });
     const retry = await saveScanSummary(tdb.db, clock, {
       projectId,
       jobId: "job-1",
       counts: counts({ low: 2 }),
-      deltaState: { before: "b1", after: "b2" },
+      deltaState: since("b1", "b2"),
       triage: { created: 2, deduped: 0 },
     });
 
@@ -329,13 +341,13 @@ describe("the persisted series", () => {
     // consumed from stringer's baseline and no scan will ever report them again. The retry measured
     // from exactly the baseline the point publishes, so the two windows abut — the point is the
     // whole pass, b0 → b2, and its delta against the previous point widens with it.
-    await save(counts({ low: 3 }), { deltaState: { before: "b-1", after: "b0" } });
+    await save(counts({ low: 3 }), { deltaState: since("b-1", "b0") });
     clock.advance(86_400_000);
     const first = await saveScanSummary(tdb.db, clock, {
       projectId,
       jobId: "job-1",
       counts: counts({ low: 5 }),
-      deltaState: { before: "b0", after: "b1" },
+      deltaState: since("b0", "b1"),
     });
     expect(first.delta?.total).toBe(2);
 
@@ -344,7 +356,7 @@ describe("the persisted series", () => {
       projectId,
       jobId: "job-1",
       counts: counts({ critical: 1, low: 2 }),
-      deltaState: { before: "b1", after: "b2" },
+      deltaState: since("b1", "b2"),
     });
 
     expect(retry.counts.total).toBe(8);
@@ -363,7 +375,7 @@ describe("the persisted series", () => {
     expect(rows[0].delta?.total).toBe(5);
     // And the next nightly measures against the folded point, not the first attempt's counts.
     clock.advance(86_400_000);
-    const next = await save(counts({ low: 6 }), { deltaState: { before: "b2", after: "b3" } });
+    const next = await save(counts({ low: 6 }), { deltaState: since("b2", "b3") });
     expect(next.delta?.total).toBe(-2);
   });
 
@@ -371,13 +383,13 @@ describe("the persisted series", () => {
     // The first attempt was whole; the retry lost a collector mid-window. The point now counts a
     // window it only partly saw, so it is a floor — and a delta spanning it (or the next scan
     // differencing against it) would measure the outage rather than the repo.
-    await save(counts({ low: 3 }), { deltaState: { before: "b-1", after: "b0" } });
+    await save(counts({ low: 3 }), { deltaState: since("b-1", "b0") });
     clock.advance(86_400_000);
     const first = await saveScanSummary(tdb.db, clock, {
       projectId,
       jobId: "job-1",
       counts: counts({ low: 5 }),
-      deltaState: { before: "b0", after: "b1" },
+      deltaState: since("b0", "b1"),
     });
     expect(first.delta?.total).toBe(2);
     expect(first.collectorFailures).toBe(0);
@@ -387,7 +399,7 @@ describe("the persisted series", () => {
       jobId: "job-1",
       counts: counts({ low: 2 }),
       collectorFailures: 1,
-      deltaState: { before: "b1", after: "b2" },
+      deltaState: since("b1", "b2"),
     });
 
     expect(retry.counts.total).toBe(7); // the window still folds — those signals are gone from stringer
@@ -399,7 +411,7 @@ describe("the persisted series", () => {
 
     // And the next nightly can't be compared to an undercount either.
     clock.advance(86_400_000);
-    const next = await save(counts({ low: 6 }), { deltaState: { before: "b2", after: "b3" } });
+    const next = await save(counts({ low: 6 }), { deltaState: since("b2", "b3") });
     expect(next.delta).toBeUndefined();
   });
 
@@ -410,7 +422,7 @@ describe("the persisted series", () => {
       projectId,
       jobId: "job-1",
       counts: counts({ low: 5 }),
-      deltaState: { before: "b0", after: "b1" },
+      deltaState: since("b0", "b1"),
     });
     const version = async () =>
       scanHealthVersion(scanHealth(await listScanSummaries(tdb.db, projectId, 100)));
@@ -421,7 +433,7 @@ describe("the persisted series", () => {
       jobId: "job-1",
       counts: emptyScanCounts(),
       collectorFailures: 2,
-      deltaState: { before: "b1", after: "b2" },
+      deltaState: since("b1", "b2"),
     });
 
     expect(retry.counts.total).toBe(5);
@@ -437,14 +449,14 @@ describe("the persisted series", () => {
       projectId,
       jobId: "job-1",
       counts: counts({ low: 5 }),
-      deltaState: { before: "b0", after: "b1" },
+      deltaState: since("b0", "b1"),
       triage: { created: 3, deduped: 1 },
     });
     const retry = await saveScanSummary(tdb.db, clock, {
       projectId,
       jobId: "job-1",
       counts: counts({ low: 2 }),
-      deltaState: { before: "b1", after: "b2" },
+      deltaState: since("b1", "b2"),
     });
 
     expect(retry.counts.total).toBe(7);
@@ -459,14 +471,14 @@ describe("the persisted series", () => {
       projectId,
       jobId: "job-1",
       counts: counts({ low: 5 }),
-      deltaState: { before: "b0", after: "b1" },
+      deltaState: since("b0", "b1"),
       triage: { created: 3, deduped: 1 },
     });
     const retry = await saveScanSummary(tdb.db, clock, {
       projectId,
       jobId: "job-1",
       counts: emptyScanCounts(),
-      deltaState: { before: "b1", after: "b2" },
+      deltaState: since("b1", "b2"),
     });
 
     expect(retry.triage).toEqual({ created: 3, deduped: 1 });
@@ -483,14 +495,14 @@ describe("the persisted series", () => {
       projectId,
       jobId: "job-1",
       counts: counts({ low: 5 }),
-      deltaState: { before: "b0", after: "b1" },
+      deltaState: since("b0", "b1"),
       triage: { created: 3, deduped: 1 },
     });
     const retry = await saveScanSummary(tdb.db, clock, {
       projectId,
       jobId: "job-1",
       counts: counts({ low: 2 }),
-      deltaState: { before: "b1", after: "b2" },
+      deltaState: since("b1", "b2"),
       triage: { created: 2, deduped: 4 },
     });
 
@@ -509,7 +521,7 @@ describe("the persisted series", () => {
       projectId,
       jobId: "job-1",
       counts: counts({ low: 5 }),
-      deltaState: { before: "b0", after: "b1" },
+      deltaState: since("b0", "b1"),
     });
     const retry = await saveScanSummary(tdb.db, clock, {
       projectId,
@@ -529,7 +541,7 @@ describe("the persisted series", () => {
       projectId,
       jobId: "job-1",
       counts: counts({ low: 5 }),
-      deltaState: { before: "b0", after: "b1" },
+      deltaState: since("b0", "b1"),
     });
     const version = async () =>
       scanHealthVersion(scanHealth(await listScanSummaries(tdb.db, projectId, 100)));
@@ -539,7 +551,7 @@ describe("the persisted series", () => {
       projectId,
       jobId: "job-1",
       counts: counts({ low: 2 }),
-      deltaState: { before: "b1", after: "b2" },
+      deltaState: since("b1", "b2"),
     });
 
     expect(await version()).not.toBe(before);
@@ -554,14 +566,14 @@ describe("the persisted series", () => {
       projectId,
       jobId: "job-1",
       counts: counts({ low: 7 }),
-      deltaState: { before: "b0", after: "b1" },
+      deltaState: since("b0", "b1"),
     });
     clock.advance(60_000);
     const retry = await saveScanSummary(tdb.db, clock, {
       projectId,
       jobId: "job-1",
       counts: emptyScanCounts(),
-      deltaState: { before: "b1", after: "b2" },
+      deltaState: since("b1", "b2"),
     });
 
     expect(retry.counts.total).toBe(7); // the retry's own counts are NOT the pass's measurement
@@ -569,7 +581,7 @@ describe("the persisted series", () => {
     expect((await listScanSummaries(tdb.db, projectId))[0].deltaState).toBe("b2");
 
     clock.advance(86_400_000);
-    const next = await save(counts({ low: 4 }), { deltaState: { before: "b2", after: "b3" } });
+    const next = await save(counts({ low: 4 }), { deltaState: since("b2", "b3") });
     expect(next.delta?.total).toBe(-3);
   });
 
@@ -580,7 +592,7 @@ describe("the persisted series", () => {
       projectId,
       jobId: "job-1",
       counts: counts({ low: 7 }),
-      deltaState: { before: "b0", after: "b1" },
+      deltaState: since("b0", "b1"),
     });
     const retry = await saveScanSummary(tdb.db, clock, {
       projectId,
@@ -594,27 +606,70 @@ describe("the persisted series", () => {
   });
 
   it("never lets a retry give a whole-repo point a baseline to be measured against", async () => {
-    // The retained counts are a standing total, so nothing may be subtracted from them — the retry's
-    // baseline must not manufacture the comparison the first attempt refused to offer.
+    // The point tracks where its window ended either way — that is what the fold below needs — but
+    // its counts are a standing total, so nothing may be subtracted from them however contiguous the
+    // next scan is. The flag decides that, not the presence of a baseline.
     const first = await saveScanSummary(tdb.db, clock, {
       projectId,
       jobId: "job-1",
       counts: counts({ low: 100 }),
       deltaState: { after: "b1", baselineScan: true },
     });
-    expect(first.deltaState).toBeUndefined();
+    expect(first.deltaState).toBe("b1");
+    expect(first.baselineScan).toBe(true);
 
     const retry = await saveScanSummary(tdb.db, clock, {
       projectId,
       jobId: "job-1",
       counts: emptyScanCounts(),
-      deltaState: { before: "b1", after: "b2" },
+      deltaState: since("b1", "b2"),
     });
-    expect(retry.deltaState).toBeUndefined();
+    expect(retry.deltaState).toBe("b2");
+    expect(retry.baselineScan).toBe(true);
 
     clock.advance(86_400_000);
-    const next = await save(counts({ low: 3 }), { deltaState: { before: "b2", after: "b3" } });
+    const next = await save(counts({ low: 3 }), { deltaState: since("b2", "b3") });
     expect(next.delta).toBeUndefined();
+  });
+
+  it("folds a retry's window into a whole-repo point instead of stranding it", async () => {
+    // The first attempt ESTABLISHED the baseline (100 outstanding) and died before triage. A retry
+    // after a quota backoff measures a real day's arrivals from exactly that baseline: those signals
+    // are consumed from stringer's state and no later scan can report them. A standing total plus
+    // the arrivals since it is the standing total at the retry's end — one honest point, still whole
+    // repo, still nothing to subtract from.
+    const first = await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 100 }),
+      deltaState: { after: "b1", baselineScan: true },
+    });
+    expect(first.counts.total).toBe(100);
+
+    clock.advance(86_400_000);
+    const retry = await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ critical: 1, low: 2 }),
+      collectorFailures: 1,
+      deltaState: since("b1", "b2"),
+      triage: { created: 2, deduped: 0 },
+    });
+
+    expect(retry.counts.total).toBe(103);
+    expect(retry.counts.bySeverity).toEqual({ critical: 1, high: 0, medium: 0, low: 102 });
+    expect(retry.collectorFailures).toBe(1);
+    expect(retry.deltaState).toBe("b2");
+    expect(retry.baselineScan).toBe(true);
+    // The retry reported on its 3 signals only; the 100 it inherited were never triaged.
+    expect(retry.triage).toBeUndefined();
+
+    // Read back, not just returned — the chart reads rows, and the pass is still one row.
+    const rows = await listScanSummaries(tdb.db, projectId, 100);
+    expect(rows.length).toBe(1);
+    expect(rows[0].counts.total).toBe(103);
+    expect(rows[0].deltaState).toBe("b2");
+    expect(rows[0].baselineScan).toBe(true);
   });
 
   it("reads a half-written triage row as unreported, never as a zero someone claimed", async () => {
