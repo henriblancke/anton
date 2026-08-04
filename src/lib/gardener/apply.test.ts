@@ -303,16 +303,25 @@ describe("planApply — what an approval means against the board as it now is", 
       status: "apply",
       summary: "re-parented anton-a, anton-b under anton-card",
       steps: [
-        // `claim: ""` — neither subject is owned by a run, which is what the write re-checks.
+        // `claim`/`parentClaim` empty — neither end of the move is owned by a run, which is the
+        // pair the write re-checks under the locks it takes on both.
         {
           verb: "reparent",
           id: "anton-a",
           claim: "",
           parent: "anton-card",
           undoParent: "anton-container",
+          parentClaim: "",
         },
         // A parentless subject undoes to bd's detach form, not to some invented parent.
-        { verb: "reparent", id: "anton-b", claim: "", parent: "anton-card", undoParent: "" },
+        {
+          verb: "reparent",
+          id: "anton-b",
+          claim: "",
+          parent: "anton-card",
+          undoParent: "",
+          parentClaim: "",
+        },
       ],
     });
   });
@@ -682,6 +691,60 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     });
     expect(calls).toEqual([
       `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-card is mid-run — a run holds a live lease on it (runner-1), so hanging more work under it would race the run that owns it`,
+    ]);
+  });
+
+  // The home's half of the window `isInFlight` cannot see: `bd --claim` writes assignee +
+  // in_progress and publishes the lease a moment later, and a run that got that far has already
+  // selected its tickets — so a subject attached now rides along unrun and strands when that run
+  // settles the card. A claim the PLAN itself saw is not news and still applies.
+  it("refuses a home claimed after the snapshot, before its run-lease is published", async () => {
+    const claimedHome = bead(CARD.id, {
+      issue_type: "feature",
+      assignee: "runner-7",
+      status: "in_progress",
+    });
+    const proposal = proposalFor(REPARENT);
+    liveBeads.set(CARD.id, claimedHome);
+
+    await expect(apply(proposal, [CARD, bead("anton-a"), proposal])).rejects.toMatchObject({
+      failure: "refused",
+    });
+    expect(calls).toEqual([
+      `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-card was claimed by runner-7 since this proposal was decided — that run has already selected the tickets it will work through, so work hung under it now would ride along unrun`,
+    ]);
+
+    calls.length = 0;
+    liveBeads.clear();
+    liveBeads.set(CARD.id, claimedHome);
+    const again = proposalFor(REPARENT);
+    await expect(apply(again, [claimedHome, bead("anton-a"), again])).resolves.toMatchObject({
+      changed: ["anton-a"],
+    });
+    expect(calls[0]).toBe("reparent anton-a anton-card");
+  });
+
+  // Card attribution is board-wide, but the write that revokes it takes THIS lock: a legacy epic
+  // stops being a card the instant a feature lands under it, and hanging one there is a re-parent
+  // whose home is this same epic. Left with the snapshot, both approvals pass and the subject ends
+  // up directly under a container epic — riding no card, which is the state the proposal fixes.
+  it("refuses a home that stopped being a board card since the snapshot", async () => {
+    const epic = bead("anton-epic", { issue_type: "epic" });
+    const plan = planFor({
+      kind: "container-orphan",
+      move: "reparent",
+      subjects: ["anton-a"],
+      target: epic.id,
+    });
+    const proposal = proposalFor(plan);
+    // Another approval hangs a feature under the epic between the snapshot and this write.
+    liveBeads.set("anton-f1", child("anton-f1", epic.id, { issue_type: "feature" }));
+
+    await expect(apply(proposal, [epic, bead("anton-a"), proposal])).rejects.toMatchObject({
+      failure: "refused",
+    });
+    expect(calls).toEqual([
+      `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-epic is no longer a board card — re-parenting under it would leave the work riding no card, which is the state this proposal is about`,
     ]);
   });
 

@@ -205,9 +205,19 @@ export async function abandonTicket(
     // subject moves while this decline closes the proposal underneath it: the board ends up mutated
     // by a decision it records as declined. Re-read inside the lock for the same reason the apply
     // does — the `assertOpen` above judged a snapshot taken before whoever held the lock ran.
+    //
+    // A read that FAILS is not permission to proceed — the same fail-closed rule `applyApproved`
+    // holds itself to. Declining is the one outcome that is permanent: the `abandoned` label
+    // suppresses the fingerprint for good, so a decline written over a proposal that a concurrent
+    // approve had already APPLIED would record an approved move as a no and stop the patrol ever
+    // asking again. Nothing has been written yet, so refusing costs only a retry.
     await withBeadWriteLock(project.repoPath, id, async () => {
-      const live = await beads.show(project.repoPath, id).catch(() => undefined);
-      if (live) assertOpen(live, "Ticket");
+      const live = await beads.show(project.repoPath, id).catch((e: unknown) => {
+        throw new NotAbandonableError(
+          `${id} could not be re-read under its write lock (${e instanceof Error ? e.message : String(e)}) — decline it by hand`,
+        );
+      });
+      assertOpen(live, "Ticket");
       await settle();
       await beads
         .note(project.repoPath, id, declined)

@@ -253,6 +253,20 @@ describe("abandonTicket cascade", () => {
       expect(abandonAllMock).not.toHaveBeenCalled();
       expect(noteMock).not.toHaveBeenCalled();
     });
+
+    // Fail-closed, like the apply half: a decline is permanent — the `abandoned` label suppresses
+    // the fingerprint for good — so writing one over a proposal we could not confirm is still open
+    // risks recording an already-APPLIED move as a no that is never asked about again.
+    it("refuses one it cannot re-read under the lock, rather than declining it blind", async () => {
+      showMock.mockResolvedValueOnce(PROPOSAL).mockRejectedValue(new Error("bd show exploded"));
+      listMock.mockResolvedValue([PROPOSAL]);
+
+      await expect(abandonTicket(project, PROPOSAL.id, "no thanks")).rejects.toThrow(
+        /could not be re-read under its write lock/,
+      );
+      expect(abandonAllMock).not.toHaveBeenCalled();
+      expect(noteMock).not.toHaveBeenCalled();
+    });
   });
 });
 

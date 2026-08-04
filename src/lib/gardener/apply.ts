@@ -68,6 +68,16 @@ export type ApplyStep =
       parent: string;
       /** The parent to restore on rollback; `""` is bd's detach form, for a bead that had none. */
       undoParent: string;
+      /**
+       * The run claim the HOME carried when this step was decided, or `""` — {@link StepSubject.claim}
+       * for the other end of the move, re-compared under the home's own write lock.
+       *
+       * Same blind spot as the subject's, and worse consequences: a run that claimed the home in the
+       * window before its lease is published reads as unowned to {@link isInFlight}, and it has
+       * already selected the tickets it will work through — so work attached now rides along unrun
+       * and is stranded the moment that run settles the card.
+       */
+      parentClaim: string;
     })
   | (StepSubject & { verb: "link"; blocker: string })
   | (StepSubject & { verb: "close"; reason: string })
@@ -176,6 +186,7 @@ function planReparent(plan: GardenerPlan, index: BoardIndex, nowMs: number): App
       claim: runClaimOf(subject),
       parent: plan.target,
       undoParent: currentParent ?? "",
+      parentClaim: runClaimOf(target),
     });
   }
 
@@ -622,13 +633,16 @@ function counterpartOf(step: ApplyStep): string | undefined {
  * the subject — a run claiming the HOME between the decision and the write has already selected its
  * tickets, so work attached now rides along unrun and is stranded when that run settles the card.
  *
- * One topology question is re-asked under the locks rather than left with the snapshot: whether a
- * bead about to be SETTLED still has open work under it (see {@link assertNothingStranded}). It
- * earns its board read because attaching that work is itself a locked write on this same bead — a
- * re-parent takes its new home's lock — so the two approvals genuinely order against each other.
- * The rest of the board-wide topology stays with the snapshot: whether the home is a card, whether
- * the edge closes a cycle. Those rest on beads no lock taken here covers, so re-deriving them per
- * step would buy a whole board read and still guarantee nothing.
+ * Two topology questions are re-asked under the locks rather than left with the snapshot: whether a
+ * bead about to be SETTLED still has open work under it (see {@link assertNothingStranded}), and
+ * whether a re-parent's home is still a BOARD CARD (see {@link assertHomeIsCard}). Both earn their
+ * board read the same way — the write that flips the answer is itself a locked write on a bead this
+ * step holds. Attaching work under a bead is a re-parent, which takes that bead's lock as its home;
+ * and the one home that can STOP being a card is a legacy epic, which stops the moment a feature
+ * lands under it — that same locked write. So the two approvals genuinely order against each other.
+ * The rest of the board-wide topology stays with the snapshot — whether the edge closes a cycle —
+ * because it rests on beads no lock taken here covers, so re-deriving it would buy a whole board
+ * read and still guarantee nothing.
  */
 async function applyStep(repo: string, step: ApplyStep): Promise<void> {
   const counterpart = counterpartOf(step);
@@ -643,6 +657,7 @@ async function applyStep(repo: string, step: ApplyStep): Promise<void> {
       if (otherMoved) throw new SubjectMovedError(otherMoved);
     }
     if (SETTLING.has(step.verb)) await assertNothingStranded(repo, step.id);
+    if (step.verb === "reparent") await assertHomeIsCard(repo, step.parent);
     await runStep(repo, step);
   });
 }
@@ -673,6 +688,35 @@ async function assertNothingStranded(repo: string, id: string): Promise<void> {
   if (open.length > 0) {
     throw new SubjectMovedError(
       `${id} has open work under it (${namesSome(open.map((b) => b.id))}) since this proposal was filed — settling it would strand that work beneath a card nothing will run`,
+    );
+  }
+}
+
+/**
+ * Refuse to hang work under a home that is no longer a BOARD CARD, judged from a board read taken
+ * INSIDE the home's write lock rather than from the approval's snapshot.
+ *
+ * `planReparent` asks the same question of the snapshot, and against a lone approval that is enough.
+ * What it cannot see is a CONCURRENT one: the only home that can stop being a card is a legacy epic,
+ * and it stops the instant a FEATURE lands under it — a re-parent that takes this very epic's write
+ * lock as its own home (see {@link applyStep}). So the two orders are already serialized, and
+ * re-asking here is what makes the ordering mean something. Without it, both pass against snapshots
+ * taken before either wrote, and this step attaches its subject directly to what is now a container
+ * epic — work riding no card and reachable by no run, which is the state the proposal exists to fix.
+ */
+async function assertHomeIsCard(repo: string, parentId: string): Promise<void> {
+  let board: Bead[];
+  try {
+    board = await beads.list(repo, ["--status", "all"]);
+  } catch (e) {
+    // Same call as `reread`'s: a board we could not read says nothing, so the step refuses.
+    throw new SubjectMovedError(
+      `the board could not be re-read before re-parenting under ${parentId} (${messageOf(e)}) — nothing was written`,
+    );
+  }
+  if (!indexBoard(board).cards.ids.has(parentId)) {
+    throw new SubjectMovedError(
+      `${parentId} is no longer a board card — re-parenting under it would leave the work riding no card, which is the state this proposal is about`,
     );
   }
 }
@@ -735,7 +779,7 @@ function counterpartMoved(
   if (!counterpart) return missing(id);
   switch (step.verb) {
     case "reparent":
-      return homeUnusable(counterpart, nowMs);
+      return homeUnusable(counterpart, nowMs) ?? homeClaimed(step, counterpart);
     case "link":
       return blockerUnusable(counterpart, step.id);
     case "supersede":
@@ -857,6 +901,21 @@ function homeUnusable(home: Bead, nowMs: number): string | undefined {
   }
   if (isInFlight(home, nowMs)) return inFlightReason(home, nowMs, "hanging more work under it");
   return undefined;
+}
+
+/**
+ * Why a run that picked the HOME up since this step was decided bars the move, or undefined. This is
+ * the home's half of the claim window {@link isInFlight} cannot see (see `parentClaim`), judged by
+ * the same rule the subject's claim is: a claim the plan already saw is not news, and one RELEASED
+ * since leaves the home freer than the plan assumed — only a NEW owner refuses.
+ */
+function homeClaimed(
+  step: Extract<ApplyStep, { verb: "reparent" }>,
+  home: Bead,
+): string | undefined {
+  const claim = runClaimOf(home);
+  if (!claim || claim === step.parentClaim) return undefined;
+  return `${home.id} was claimed by ${claim} since this proposal was decided — that run has already selected the tickets it will work through, so work hung under it now would ride along unrun`;
 }
 
 /**
