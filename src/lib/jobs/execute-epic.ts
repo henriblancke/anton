@@ -828,9 +828,9 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         //     the set is stable — and costs nothing, since no worktree exists yet.
         //     Status-blind by construction: `runTickets` filters on shape, not state, so a ticket
         //     another machine closed mid-window is still in both sets and doesn't trip this.
-        let confirmedChildren: Bead[];
+        let confirmedBoard: Bead[];
         try {
-          confirmedChildren = runTickets(await loadAllIssues(repo, { strictGates: true }), epicBeadId);
+          confirmedBoard = await loadAllIssues(repo, { strictGates: true });
         } catch (e) {
           throw new Error(
             `${epicBeadId} could not re-read the board after publishing its run-lease to confirm its ` +
@@ -838,6 +838,20 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
               `(${e instanceof Error ? e.message : String(e)})`,
           );
         }
+        //     The target's OWN run shape is re-confirmed here, not just its subtree: a parentless
+        //     task/bug re-parented under another card in this same window keeps an EMPTY ticket set
+        //     on both sides of the drift check below, so nothing would fire while the bead has
+        //     become a ticket in someone else's run — executed here as well as there. PARK rather
+        //     than retry, like 0a-ter: a target that stopped being one doesn't become one again by
+        //     trying, and the message names what took it.
+        const targetDrift = runTargetDrift(epicBeadId, confirmedBoard);
+        if (targetDrift) {
+          throw new PoisonEpic(
+            `${epicBeadId} stopped being a run target while this run was starting (${targetDrift}) ` +
+              `— refusing to execute work another target now owns`,
+          );
+        }
+        const confirmedChildren = runTickets(confirmedBoard, epicBeadId);
         const drift = ticketSetDrift(freshChildren, confirmedChildren);
         if (drift) {
           throw new Error(
@@ -2476,6 +2490,29 @@ export function inactiveAgentTickets(
     out.push({ id: t.id, agent });
   }
   return out;
+}
+
+/**
+ * How the TARGET itself stopped being a run target while its run was starting (anton-e42l), named
+ * for the error — or undefined when it is still one.
+ *
+ * {@link ticketSetDrift} watches the subtree; this watches the bead. A parentless task/bug that a
+ * re-parent moved under another card has an empty ticket set on BOTH sides of that check — nothing
+ * attached, nothing detached — while the bead itself has become a child ticket of somebody else's
+ * run target. Left unasked, this run would execute (and settle) a bead the other target's run also
+ * owns. Judged with the same `isRunTarget` predicate as the pre-lease gate, so the two agree.
+ */
+export function runTargetDrift(id: string, board: Bead[]): string | undefined {
+  const live = board.find((b) => b.id === id);
+  if (!live) return "it is no longer on the board";
+  if (beads.isRunTarget(live, board)) return undefined;
+  if (beads.isContainer(live, board)) {
+    return "it gained a feature child and is now a container epic — run one of its features instead";
+  }
+  const parent = beads.parentOf(live);
+  return parent
+    ? `it now hangs under ${parent}, whose run owns it as a ticket`
+    : `its type is now "${live.issue_type ?? "unknown"}", which anton never runs on its own`;
 }
 
 /**

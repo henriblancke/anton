@@ -5,7 +5,7 @@
  * about the exit reads as a delivery. See DESIGN.md §3 — beads owns status, anton.db gains no column.
  */
 import { beads } from "./beads/bd";
-import { withBeadWriteLock } from "./beads/claim-lock";
+import { withBeadWriteLocks } from "./beads/claim-lock";
 import { nudgeSync } from "./beads/sync-nudge";
 import { declineNote } from "./gardener/apply";
 import { cancelRunForTarget, runIsLiveForTarget } from "./jobs/service";
@@ -141,6 +141,84 @@ async function stopDescendantRuns(
   return descendants;
 }
 
+const messageOf = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
+/**
+ * The write locks an abandon settles under: the target plus every bead its cascade closes. The
+ * gardener takes both ends of a move (gardener/apply.ts `applyStep` locks the subject AND the home),
+ * so holding the whole cascade is what puts this abandon in an order with an approval attaching work
+ * anywhere beneath it — not just when the abandoned bead is itself a proposal.
+ */
+const cascadeLocks = (target: Bead, descendants: Bead[]): string[] => [
+  target.id,
+  ...descendants.map((d) => d.id),
+];
+
+/**
+ * The target, re-read from inside its own write lock. The `assertOpen` before the lock judged a
+ * snapshot taken before whoever held the lock ran — an apply that has passed its own re-read can
+ * still be writing when this abandon is planned. A read that FAILS is never permission to write:
+ * nothing has been written yet, so refusing costs only a retry, while an abandon written blind is
+ * permanent (for a proposal the `abandoned` label suppresses its fingerprint for good).
+ */
+async function rereadLocked(repo: string, id: string): Promise<Bead> {
+  try {
+    return await beads.show(repo, id);
+  } catch (e) {
+    throw new NotAbandonableError(
+      `${id} could not be re-read under its write lock (${messageOf(e)}) — nothing was written; try again`,
+    );
+  }
+}
+
+/**
+ * Refuse an abandon whose cascade moved between the snapshot it was planned from and the locks it
+ * now holds (anton-e42l).
+ *
+ * The race is a gardener re-parent, which takes the write lock of the bead it moves AND of the card
+ * it moves it under, and yields between passing its home check (`homeUnusable`) and writing. An
+ * abandon that settled outside those locks could land in exactly that gap: its descendant snapshot
+ * predates the newcomer, so the cascade misses it, and the approval then attaches an open bead
+ * beneath a card this abandon has just closed — while closing its proposal as applied. Re-deriving
+ * here is what makes the ordering mean something: either the re-parent landed first and shows up in
+ * this read, or it queues behind the settle and its own locked home re-check refuses.
+ *
+ * Refuse rather than adopt the fresh set: a bead that arrived (or left) after the locks were chosen
+ * is one this abandon holds no lock on, so closing it would race the very writes this serializes
+ * against. Nothing has been written yet, so a retry re-plans against the board it just saw.
+ */
+async function assertCascadeUnchanged(
+  repo: string,
+  target: Bead,
+  descendants: Bead[],
+  listArgs: string[],
+): Promise<void> {
+  let board: Bead[];
+  try {
+    board = await beads.list(repo, listArgs);
+  } catch (e) {
+    throw new NotAbandonableError(
+      `the board under ${target.id} could not be re-read under its write lock (${messageOf(e)}) — nothing was written; try again`,
+    );
+  }
+  const before = new Set(descendants.map((d) => d.id));
+  const after = openDescendants(board, target.id);
+  const afterIds = new Set(after.map((b) => b.id));
+  const attached = [...afterIds].filter((id) => !before.has(id));
+  const detached = [...before].filter((id) => !afterIds.has(id));
+  if (attached.length === 0 && detached.length === 0) return;
+  const moved = [
+    attached.length > 0 ? `attached ${attached.join(", ")}` : "",
+    detached.length > 0 ? `detached ${detached.join(", ")}` : "",
+  ]
+    .filter(Boolean)
+    .join("; ");
+  throw new NotAbandonableError(
+    `the open work under ${target.id} changed while this abandon was landing (${moved}) — nothing ` +
+      `was written; try again so the cascade settles the work the board actually holds`,
+  );
+}
+
 /**
  * The abandon entries for a cascade: every open descendant (in cascade order) followed by the
  * target itself. The target comes LAST for the same reason it always did — the batch applies in
@@ -179,10 +257,12 @@ export async function abandonTicket(
   opts?: { requireStopped?: boolean },
 ): Promise<TicketDetail> {
   const why = requireReason(reason);
-  const bead = await beads.show(project.repoPath, id); // 404 guard — bd throws on an unknown id
+  const repo = project.repoPath;
+  const bead = await beads.show(repo, id); // 404 guard — bd throws on an unknown id
   assertOpen(bead, "Ticket");
 
-  const board = await beads.list(project.repoPath, ["--status", "all"]);
+  const listArgs = ["--status", "all"];
+  const board = await beads.list(repo, listArgs);
   const requireStopped = opts?.requireStopped === true;
   await stopRun(project.id, runTargetOf(bead, board), requireStopped);
   const descendants = await stopDescendantRuns(project, bead, board, requireStopped);
@@ -192,41 +272,30 @@ export async function abandonTicket(
   // a consequence of the label that nothing else spells out. The note comes after the settle and is
   // best-effort: the decision has landed either way, and a failed note must not fail the abandon.
   const declined = declineNote(bead);
-  // The ticket and its cascade settle as one unit — every close in a single bd transaction, the
-  // ticket last (see beads.abandonAll).
-  const settle = () => beads.abandonAll(project.repoPath, cascadeEntries(bead, descendants, why));
 
-  if (!declined) {
-    await settle();
-  } else {
-    // A proposal is settled by EITHER half of the gardener loop — declined here, or applied by
-    // applyProposal — so the decline takes the same per-bead lock the apply holds for its whole
-    // run. Unserialized, an approval that has passed its own re-read can still be writing the
-    // subject moves while this decline closes the proposal underneath it: the board ends up mutated
-    // by a decision it records as declined. Re-read inside the lock for the same reason the apply
-    // does — the `assertOpen` above judged a snapshot taken before whoever held the lock ran.
-    //
-    // A read that FAILS is not permission to proceed — the same fail-closed rule `applyApproved`
-    // holds itself to. Declining is the one outcome that is permanent: the `abandoned` label
-    // suppresses the fingerprint for good, so a decline written over a proposal that a concurrent
-    // approve had already APPLIED would record an approved move as a no and stop the patrol ever
-    // asking again. Nothing has been written yet, so refusing costs only a retry.
-    await withBeadWriteLock(project.repoPath, id, async () => {
-      const live = await beads.show(project.repoPath, id).catch((e: unknown) => {
-        throw new NotAbandonableError(
-          `${id} could not be re-read under its write lock (${e instanceof Error ? e.message : String(e)}) — decline it by hand`,
-        );
-      });
-      assertOpen(live, "Ticket");
-      await settle();
+  // EVERY abandon settles under the cascade's write locks, not only a proposal's decline. A proposal
+  // is settled by either half of the gardener loop — declined here, or applied by applyProposal — so
+  // the decline has to hold the lock that apply holds for its whole run. An ordinary ticket needs the
+  // same serialization for the other direction (see assertCascadeUnchanged): the gardener's own
+  // subject and home checks rest on these locks, and an abandon outside them can close a card the
+  // approval is still attaching work under. Re-read the target and re-derive the cascade inside, for
+  // the same reason the apply re-reads: the checks above judged a snapshot taken before whoever held
+  // the lock ran.
+  await withBeadWriteLocks(repo, cascadeLocks(bead, descendants), async () => {
+    assertOpen(await rereadLocked(repo, id), "Ticket");
+    await assertCascadeUnchanged(repo, bead, descendants, listArgs);
+    // The ticket and its cascade settle as one unit — every close in a single bd transaction, the
+    // ticket last (see beads.abandonAll).
+    await beads.abandonAll(repo, cascadeEntries(bead, descendants, why));
+    if (declined) {
       await beads
-        .note(project.repoPath, id, declined)
+        .note(repo, id, declined)
         .catch((e) => console.error(`[abandon] could not record the decline on ${id}`, e));
-    });
-  }
+    }
+  });
   // Read-after-write, like setTicketDeferred: the `bd show` bead is authoritative for the abandoned
   // state it just wrote, so the response never reflects the board's stale snapshot.
-  const detail = await freshDetail(project, await beads.show(project.repoPath, id));
+  const detail = await freshDetail(project, await beads.show(repo, id));
   nudgeSync(project, "abandon");
   return detail;
 }
@@ -295,7 +364,8 @@ export async function abandonEpic(
   // --skip-labels (bd 1.1.0): the cascade only inspects parent, status and type — openDescendants
   // walks the subtree, isRunTarget classifies it — so skipping label hydration keeps this
   // full-board read lean.
-  const all = await beads.list(repo, ["--status", "all", "--skip-labels"]);
+  const listArgs = ["--status", "all", "--skip-labels"];
+  const all = await beads.list(repo, listArgs);
 
   // Kill every live run this abandon settles, BEFORE recording it. A container epic never runs
   // itself — the active job is keyed by the FEATURE below it, which stopDescendantRuns cancels —
@@ -306,10 +376,18 @@ export async function abandonEpic(
   await cancelRunForTarget(project.id, epicId);
   const descendants = await stopDescendantRuns(project, epic, all, false);
 
-  // The epic and its whole cascade settle as one unit — every close in a single bd transaction,
-  // the epic last (see beads.abandonAll), so no state exists in which the epic reads as settled
-  // above still-open orphaned children.
-  await beads.abandonAll(repo, cascadeEntries(epic, descendants, why));
+  // Under the cascade's write locks, re-read and re-derived inside them, exactly as abandonTicket
+  // settles: a gardener re-parent attaching work anywhere beneath this epic takes those same locks,
+  // so either it lands first and this read refuses (the retry then cascades over the newcomer too),
+  // or it queues behind this settle and its own home re-check refuses.
+  await withBeadWriteLocks(repo, cascadeLocks(epic, descendants), async () => {
+    assertOpen(await rereadLocked(repo, epicId), "Epic");
+    await assertCascadeUnchanged(repo, epic, descendants, listArgs);
+    // The epic and its whole cascade settle as one unit — every close in a single bd transaction,
+    // the epic last (see beads.abandonAll), so no state exists in which the epic reads as settled
+    // above still-open orphaned children.
+    await beads.abandonAll(repo, cascadeEntries(epic, descendants, why));
+  });
   nudgeSync(project, "abandon");
   return { epicId, children: descendants.map((d) => d.id) };
 }

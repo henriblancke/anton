@@ -13,9 +13,11 @@ import {
   inactiveAgentTickets,
   mergeGatePlan,
   reviewParkMessage,
+  runTargetDrift,
   splitFormulaPhases,
   ticketSetDrift,
 } from "./execute-epic";
+import { runTickets } from "../ticket-view";
 import { BUILTIN_STEPS, ticketPrompt } from "./step-registry";
 import type { ResolvedStep } from "./run-formula";
 
@@ -159,6 +161,44 @@ describe("ticketSetDrift — the selection-to-lease window (anton-e42l)", () => 
   it("does not trip on a ticket whose STATE changed, or on ordering", () => {
     const closed = { ...ticket("t-2"), status: "closed" } as Bead;
     expect(ticketSetDrift([ticket("t-1"), ticket("t-2")], [closed, ticket("t-1")])).toBeUndefined();
+  });
+});
+
+describe("runTargetDrift — the target's own shape in that same window (anton-e42l)", () => {
+  const bead = (id: string, extra: Partial<Bead> = {}): Bead =>
+    ({ id, title: id, status: "open", issue_type: "task", ...extra }) as Bead;
+
+  // The case ticketSetDrift structurally cannot see: a parentless task has no tickets before OR
+  // after the move, so the set check stays silent while the bead itself became someone else's
+  // ticket — and this run would execute it alongside the run that now owns it.
+  it("catches a parentless task re-parented under another card mid-startup", () => {
+    const board = [bead("t-1", { parent: "epic-1" }), bead("epic-1", { issue_type: "epic" })];
+    expect(ticketSetDrift([], runTickets(board, "t-1"))).toBeUndefined();
+    expect(runTargetDrift("t-1", board)).toBe("it now hangs under epic-1, whose run owns it as a ticket");
+  });
+
+  it("catches a legacy epic that gained a feature child — a container is nobody's run", () => {
+    const board = [
+      bead("epic-1", { issue_type: "epic" }),
+      bead("f-1", { issue_type: "feature", parent: "epic-1" }),
+    ];
+    expect(runTargetDrift("epic-1", board)).toMatch(/container epic/);
+  });
+
+  it("catches a target re-typed into something anton never runs on its own", () => {
+    expect(runTargetDrift("c-1", [bead("c-1", { issue_type: "chore" })])).toBe(
+      'its type is now "chore", which anton never runs on its own',
+    );
+  });
+
+  it("catches a target that left the board entirely", () => {
+    expect(runTargetDrift("t-1", [bead("other")])).toBe("it is no longer on the board");
+  });
+
+  it("stays silent for a target that is still a run target", () => {
+    const board = [bead("f-1", { issue_type: "feature" }), bead("t-1", { parent: "f-1" })];
+    expect(runTargetDrift("f-1", board)).toBeUndefined();
+    expect(runTargetDrift("t-1", board)).toBe("it now hangs under f-1, whose run owns it as a ticket");
   });
 });
 

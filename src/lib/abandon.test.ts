@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bead } from "./beads/bd";
+import { withBeadWriteLock } from "./beads/claim-lock";
 import type { Project } from "./types";
 
 const showMock = vi.fn();
@@ -33,7 +34,7 @@ vi.mock("./ticket-detail", () => ({
   freshDetail: vi.fn().mockResolvedValue({ id: "detail" }),
 }));
 
-const { abandonTicket, openDescendants, RunRestartedError } = await import("./abandon");
+const { abandonEpic, abandonTicket, openDescendants, RunRestartedError } = await import("./abandon");
 
 /** The one unit `beads.abandonAll` was asked to settle — asserting it IS one, not N writes. */
 const soleAbandonUnit = (): Array<{ id: string; reason: string }> => {
@@ -213,6 +214,108 @@ describe("abandonTicket cascade", () => {
     await expect(abandonTicket(project, "t1", "too late")).rejects.toThrow(/already closed/);
     expect(abandonAllMock).not.toHaveBeenCalled();
     expect(cancelRunMock).not.toHaveBeenCalled();
+  });
+
+  // A gardener re-parent holds the write lock of the bead it moves AND of the card it moves it
+  // under, and yields between passing its home check and writing. An abandon that settled outside
+  // those locks could land in exactly that gap: its snapshot predates the newcomer, so the cascade
+  // misses it and the approval attaches an open bead beneath a card this just closed. Every abandon
+  // therefore settles under the cascade's locks and re-derives inside them (anton-e42l).
+  describe("re-validating under the cascade's write locks", () => {
+    const FEATURE = makeBead({ id: "feature", issue_type: "feature", parent: "epic" });
+    const BOARD = [
+      makeBead({ id: "epic", issue_type: "epic" }),
+      FEATURE,
+      makeBead({ id: "t1", parent: "feature" }),
+    ];
+
+    it("refuses when a re-parent attached open work beneath the target, writing nothing", async () => {
+      showMock.mockResolvedValue(FEATURE);
+      listMock
+        .mockResolvedValueOnce(BOARD)
+        .mockResolvedValue([...BOARD, makeBead({ id: "t9", parent: "feature" })]);
+
+      await expect(abandonTicket(project, "feature", "not worth building")).rejects.toThrow(
+        /changed while this abandon was landing \(attached t9\)/,
+      );
+      expect(abandonAllMock).not.toHaveBeenCalled();
+    });
+
+    it("refuses when a descendant was pulled out from under it — the same race, reversed", async () => {
+      showMock.mockResolvedValue(FEATURE);
+      listMock
+        .mockResolvedValueOnce(BOARD)
+        .mockResolvedValue([...BOARD.filter((b) => b.id !== "t1"), makeBead({ id: "t1" })]);
+
+      await expect(abandonTicket(project, "feature", "not worth building")).rejects.toThrow(
+        /changed while this abandon was landing \(detached t1\)/,
+      );
+      expect(abandonAllMock).not.toHaveBeenCalled();
+    });
+
+    it("refuses an ORDINARY ticket that settled between the first read and the lock", async () => {
+      const ticket = makeBead({ id: "t1", parent: "feature" });
+      showMock.mockResolvedValueOnce(ticket).mockResolvedValue({ ...ticket, status: "closed" });
+      listMock.mockResolvedValue([FEATURE, ticket]);
+
+      await expect(abandonTicket(project, "t1", "too late")).rejects.toThrow(/already closed/);
+      expect(abandonAllMock).not.toHaveBeenCalled();
+    });
+
+    // A read that failed says nothing about the board, and an abandon is permanent.
+    it("refuses when the board can't be re-read under the lock, rather than settling blind", async () => {
+      showMock.mockResolvedValue(FEATURE);
+      listMock.mockResolvedValueOnce(BOARD).mockRejectedValue(new Error("bd list exploded"));
+
+      await expect(abandonTicket(project, "feature", "no thanks")).rejects.toThrow(
+        /could not be re-read under its write lock/,
+      );
+      expect(abandonAllMock).not.toHaveBeenCalled();
+    });
+
+    it("guards the epic path the same way — the cascade is the same cascade", async () => {
+      const epic = makeBead({ id: "epic", issue_type: "epic" });
+      showMock.mockResolvedValue(epic);
+      listMock
+        .mockResolvedValueOnce(BOARD)
+        .mockResolvedValue([...BOARD, makeBead({ id: "t9", parent: "feature" })]);
+
+      await expect(abandonEpic(project, "epic", "won't do")).rejects.toThrow(
+        /changed while this abandon was landing \(attached t9\)/,
+      );
+      expect(abandonAllMock).not.toHaveBeenCalled();
+    });
+
+    // The lock is what makes the re-derive above mean anything: an apply mid-flight holds it across
+    // its own check and its write, so this abandon must queue behind it rather than settle alongside.
+    it("waits on a lock an apply is holding on the target instead of settling alongside it", async () => {
+      showMock.mockResolvedValue(FEATURE);
+      listMock.mockResolvedValue(BOARD);
+      let release!: () => void;
+      const held = withBeadWriteLock(
+        project.repoPath,
+        "feature",
+        () => new Promise<void>((r) => (release = r)),
+      );
+
+      const abandoning = abandonTicket(project, "feature", "not worth building");
+      await new Promise((r) => setTimeout(r, 20));
+      expect(abandonAllMock).not.toHaveBeenCalled();
+
+      release();
+      await held;
+      await abandoning;
+      expect(soleAbandonedIds()).toEqual(["t1", "feature"]);
+    });
+
+    it("settles as one unit when nothing moved under the locks", async () => {
+      showMock.mockResolvedValue(FEATURE);
+      listMock.mockResolvedValue(BOARD);
+
+      await abandonTicket(project, "feature", "not worth building");
+
+      expect(soleAbandonedIds()).toEqual(["t1", "feature"]);
+    });
   });
 
   // Abandoning a gardener proposal is the DECLINE half of the gardener loop, and its other half —
