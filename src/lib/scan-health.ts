@@ -86,8 +86,9 @@ export interface ScanSummary {
    * has to keep the two apart: charting them on one scale reads a baseline followed by two quiet
    * nights as a dramatic improvement out of measurements that were never comparable.
    *
-   * Absent is "not known" (a row predating the flag), which renders as incremental — a point is only
-   * set apart with evidence.
+   * Absent is "not known" — a row predating the flag, or a scan whose basis anton could not identify
+   * ({@link DeltaState.baselineScan}). It renders as incremental: a point is only set apart with
+   * evidence, and an unidentified basis is not evidence of a baseline.
    */
   baselineScan?: boolean;
   /**
@@ -270,8 +271,10 @@ export async function saveScanSummary(
   // behind too, but nothing may ever be measured against ITS standing total.
   const deltaState = consumed ? input.deltaState?.after : undefined;
   // Recorded rather than re-derived at read time: the same fact keeps the trend from scaling
-  // incremental columns against a whole-repo total long after the baseline itself is gone.
-  const baselineScan = input.deltaState ? consumed === undefined : undefined;
+  // incremental columns against a whole-repo total long after the baseline itself is gone. Taken as
+  // the scan OBSERVED it rather than inferred from a missing `before` — a scan whose basis anton
+  // couldn't identify is unknown, and outlining it as a baseline would claim a measurement nobody made.
+  const baselineScan = input.deltaState?.baselineScan;
   const summary: ScanSummary = {
     id: randomUUID(),
     projectId: input.projectId,

@@ -120,7 +120,7 @@ describe("the persisted series", () => {
   const chained = (): DeltaState => {
     const before = left;
     left = `baseline-${(baselines += 1)}`;
-    return { ...(before ? { before } : {}), after: left };
+    return { ...(before ? { before } : {}), after: left, baselineScan: before === undefined };
   };
 
   const save = (
@@ -162,6 +162,18 @@ describe("the persisted series", () => {
     expect(scanHealth([latest, first])?.points.map((p) => p.baseline)).toEqual([true, undefined]);
   });
 
+  it("leaves a scan whose basis anton could not identify unclassified, not baseline", async () => {
+    // stringer keeping its state where anton doesn't look reports no baseline either side of every
+    // scan. Reading that as "established the baseline" would label an incremental series whole-repo
+    // forever — the flag has to come from what the scan observed, not from a missing `before`.
+    const unknown = await save(counts({ low: 6 }), { deltaState: {} });
+
+    expect(unknown.baselineScan).toBeUndefined();
+    const [row] = await listScanSummaries(tdb.db, projectId);
+    expect(row.baselineScan).toBeUndefined();
+    expect(summarizeScanLine(row)).toContain("no comparable previous scan");
+  });
+
   it("stores each later scan's delta against the one before it", async () => {
     await save(counts({ low: 9 })); // baseline — the second scan is the first comparable one
     clock.advance(86_400_000);
@@ -187,7 +199,9 @@ describe("the persisted series", () => {
     await save(counts({ low: 2 })); // incremental — the first comparable point
     clock.advance(1000);
 
-    const reset = await save(counts({ low: 90 }), { deltaState: { after: "baseline-fresh" } });
+    const reset = await save(counts({ low: 90 }), {
+      deltaState: { after: "baseline-fresh", baselineScan: true },
+    });
     expect(reset.delta).toBeUndefined();
 
     // And nothing may be compared to a standing total either — the point AFTER the reset is the

@@ -129,6 +129,17 @@ export interface DeltaState {
   before?: string;
   /** The baseline it left for the next scan. Absent when anton could not read stringer's state. */
   after?: string;
+  /**
+   * True when these counts are a whole-repo STANDING TOTAL rather than an arrival rate — the scan
+   * established `--delta`'s baseline, or ran without `--delta` at all.
+   *
+   * ABSENT is "anton cannot say", which is not the same claim and must not be recorded as one: a
+   * missing `before` alone proves nothing, because a stringer that keeps its state somewhere anton
+   * doesn't look answers `absent` to every scan, and reading that as "established" would label an
+   * incremental series whole-repo forever. Only this module can tell the two apart — it saw the
+   * state either side of the run (see {@link readBaseline}).
+   */
+  baselineScan?: boolean;
 }
 
 export interface ScanResult {
@@ -183,6 +194,27 @@ async function readBaseline(repoPath: string): Promise<BaselineSnapshot> {
 async function deltaStateId(repoPath: string): Promise<string | undefined> {
   const snapshot = await readBaseline(repoPath);
   return snapshot.kind === "read" ? snapshot.id : undefined;
+}
+
+/**
+ * Whether this pass's counts are a whole-repo standing total — the fact the trend renders on
+ * (see {@link DeltaState.baselineScan}). Undefined wherever the evidence doesn't reach.
+ *
+ * @param baseline the state as it stood BEFORE the run; `undefined` for a non-delta scan.
+ * @param after the state anton could identify afterwards.
+ */
+function classifyScanBasis(
+  baseline: BaselineSnapshot | undefined,
+  after: string | undefined,
+): boolean | undefined {
+  // No baseline was consulted at all, so stringer emitted everything in the repo.
+  if (!baseline) return true;
+  // It measured arrivals since a baseline anton read off the repo.
+  if (baseline.kind === "read") return false;
+  // Nothing there before and a baseline anton can see now: THIS scan established it. Without that
+  // second half, an absent state is just a state anton can't find — unknown, not a baseline.
+  if (baseline.kind === "absent" && after) return true;
+  return undefined;
 }
 
 /**
@@ -304,8 +336,8 @@ const SIGNAL_ENVELOPE_KEYS = ["signals", "issues", "results"] as const;
  *
  * `undefined` — distinct from an empty array — for a shape carrying NONE of those keys. Both readers
  * would otherwise agree on a FALSE zero: a renamed envelope reads as a clean scan, skips triage, and
- * charts a green point for output nobody parsed. Only the caller can say what to do about that, so
- * this returns the fact rather than deciding (see {@link readAnnotatedSignals}).
+ * charts a green point for output nobody parsed. Reporting the fact rather than flattening it to
+ * `[]` is what lets the caller refuse the scan (see {@link readAnnotatedSignals}).
  */
 export function extractSignals(parsed: unknown): ScanSignal[] | undefined {
   if (Array.isArray(parsed)) return parsed as ScanSignal[];
@@ -330,12 +362,12 @@ function describeShape(parsed: unknown): string {
  * Read the scan stringer just wrote, stamp anton's derived severity onto every signal, and write it
  * back. Two guarantees ride on this one parse:
  *
- * - **Unreadable output is a failed scan, not a clean one.** stringer exits 0 having written the
- *   `-o` file even for zero new signals, so a missing or truncated file is a process-boundary
- *   failure. Reading it as "no signals" would skip triage, chart a zero-signal point, and end the
- *   session `done` — the board would report a clean scan nobody could read. So it throws, and the
- *   runner retries or parks the job. The caller unwinds the `--delta` baseline on the way out, so
- *   the retry measures the window this attempt consumed rather than the one after it.
+ * - **Output anton can't read is a failed scan, not a clean one.** stringer exits 0 having written
+ *   the `-o` file even for zero new signals, so a missing, truncated, or unrecognized file is a
+ *   process-boundary failure. Reading it as "no signals" would skip triage, chart a zero-signal
+ *   point, and end the session `done` — the board would report a clean scan nobody could read. So
+ *   it throws, and the runner retries or parks the job. The caller unwinds the `--delta` baseline on
+ *   the way out, so the retry measures the window this attempt consumed rather than the one after it.
  * - **Triage labels the signal anton counted.** stringer emits no severity of its own; annotating
  *   here means the agent reads anton's derivation off the file instead of re-deriving one from the
  *   raw fields and drifting from the trend (see {@link annotateSignal}).
@@ -355,19 +387,21 @@ async function readAnnotatedSignals(scanFile: string): Promise<ScanSignal[]> {
     );
   }
 
-  // Loud but not fatal: an unrecognized envelope is far more likely a stringer version bump than a
-  // broken scan, so the pass continues on zero signals — with a line an operator can trace, instead
-  // of a silently green health point.
-  const extracted = extractSignals(parsed);
-  if (!extracted) {
-    console.warn(
-      `[stringer] ${scanFile} carries no recognized signal array (${describeShape(parsed)}; ` +
-        `expected a top-level array or one of ${SIGNAL_ENVELOPE_KEYS.join("/")}) — counted as zero ` +
-        `signals. If stringer renamed its envelope key, this pass's clean scan is false.`,
+  // Valid JSON anton can't find signals in is the same false green as no JSON at all: stringer
+  // spells "nothing new" as `[]` or an empty envelope array, so a shape carrying neither is output
+  // nobody parsed — counting it as zero would skip triage and chart a clean point over whatever a
+  // renamed envelope was holding. Refusing it instead unwinds the baseline, so the findings come
+  // back on the rescan once the new key is recognized.
+  const signals = extractSignals(parsed);
+  if (!signals) {
+    throw new Error(
+      `stringer exited 0 but its scan output at ${scanFile} carries no recognized signal array ` +
+        `(${describeShape(parsed)}; expected a top-level array or one of ` +
+        `${SIGNAL_ENVELOPE_KEYS.join("/")}) — reading it as an empty scan would record a clean pass ` +
+        `for output nobody parsed. If stringer renamed its envelope key, add it to SIGNAL_ENVELOPE_KEYS.`,
     );
   }
 
-  const signals = extracted ?? [];
   for (const signal of signals) annotateSignal(signal);
   await writeFile(scanFile, JSON.stringify(parsed), "utf8");
   return signals;
@@ -434,10 +468,15 @@ export async function scan(opts: {
   }
 
   const after = delta ? await deltaStateId(opts.repoPath) : undefined;
+  const baselineScan = classifyScanBasis(baseline, after);
   return {
     scanFile: opts.scanFile,
     signals,
     collectorFailures: parseCollectorFailures(stderr),
-    deltaState: { ...(before ? { before } : {}), ...(after ? { after } : {}) },
+    deltaState: {
+      ...(before ? { before } : {}),
+      ...(after ? { after } : {}),
+      ...(baselineScan === undefined ? {} : { baselineScan }),
+    },
   };
 }

@@ -3,7 +3,7 @@
  * that keep a scan off a huge node_modules and away from the 10-minute timeout) and signal counting,
  * against a fake stringer binary that records its argv and writes a canned scan file.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   chmodSync,
   existsSync,
@@ -156,21 +156,19 @@ describe("scan", () => {
   });
 
   // A stringer that renames its envelope key would otherwise chart a green point for output nobody
-  // parsed: both readers agree on zero, and the agreement is on a false zero.
-  it("counts an unrecognized envelope as zero, loudly", async () => {
+  // parsed: both readers agree on zero, and the agreement is on a false zero. Valid JSON is no
+  // reassurance when the signals are in a key anton never looked at.
+  it("refuses an unrecognized envelope rather than counting it as zero", async () => {
     const argvDump = join(dir, "argv.json");
     process.env[STRINGER_BIN_ENV] = writeFakeStringer(argvDump, {
       findings: [{ Source: "todos" }],
     });
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 
-    const result = await scan({ repoPath: "/repo", scanFile: join(dir, "scan.json") });
+    const rejection = scan({ repoPath: "/repo", scanFile: join(dir, "scan.json") });
 
-    expect(result.signals).toEqual([]);
-    const line = String(warn.mock.calls[0]?.[0]);
-    expect(line).toContain("no recognized signal array");
-    expect(line).toContain("findings"); // the shape it DID see, so a rename is identifiable
-    warn.mockRestore();
+    await expect(rejection).rejects.toThrow(/carries no recognized signal array/);
+    // The shape it DID see, so an operator can tell a rename from a broken write.
+    await expect(rejection).rejects.toThrow(/object with keys: findings/);
   });
 
   // The chart and the beads must label the same signal the same way (anton-bz1w): triage reads the
@@ -290,6 +288,10 @@ describe("scan", () => {
       // Nothing was suppressed, so these signals are the whole repo — not an arrival rate.
       expect(first.deltaState.before).toBeUndefined();
       expect(first.deltaState.after).toBeTruthy();
+      expect(first.deltaState.baselineScan).toBe(true);
+      // ...and the scan after it measures arrivals, so it is not a standing total.
+      const second = await scan({ repoPath: dir, scanFile: join(dir, "s2.json") });
+      expect(second.deltaState.baselineScan).toBe(false);
     });
 
     it("chains each later scan to the baseline the one before it left", async () => {
@@ -321,7 +323,7 @@ describe("scan", () => {
 
       const full = await scan({ repoPath: dir, scanFile: join(dir, "s2.json"), delta: false });
 
-      expect(full.deltaState).toEqual({});
+      expect(full.deltaState).toEqual({ baselineScan: true });
     });
 
     // stringer advances the baseline before anton ever reads the output, so a refused scan has
@@ -373,7 +375,35 @@ describe("scan", () => {
       // series then carries no deltas at all, which is the honest reading of "cannot prove it".
       const result = await scan({ repoPath: dir, scanFile: join(dir, "s.json") });
 
+      // And unknown all the way down: a missing state is not evidence this scan established one, so
+      // the point must not be outlined as a baseline — every scan would be, forever.
       expect(result.deltaState).toEqual({});
+      expect(result.deltaState.baselineScan).toBeUndefined();
+    });
+
+    // The refusal is only half the guarantee: a scan whose envelope anton didn't recognize has
+    // already advanced the window, and leaving that advance in place loses the findings for good.
+    it("puts the baseline back when it refuses an unrecognized envelope", async () => {
+      process.env[STRINGER_BIN_ENV] = writeBaselineStringer();
+      const first = await scan({ repoPath: dir, scanFile: join(dir, "s1.json") });
+      const consumed = readFileSync(join(dir, ".stringer", "last-scan.json"), "utf8");
+
+      process.env[STRINGER_BIN_ENV] = writeScript("renamed-envelope-stringer", [
+        "const fs = require('fs'); const path = require('path');",
+        "const state = path.join(process.argv[3], '.stringer', 'last-scan.json');",
+        "let n = 0;",
+        "try { n = JSON.parse(fs.readFileSync(state, 'utf8')).n + 1; } catch {}",
+        "fs.writeFileSync(state, JSON.stringify({ n }));",
+        `fs.writeFileSync(process.argv[process.argv.indexOf('-o') + 1], '{"findings":[{"Source":"todos"}]}');`,
+      ]);
+      await expect(scan({ repoPath: dir, scanFile: join(dir, "s2.json") })).rejects.toThrow(
+        /carries no recognized signal array/,
+      );
+      expect(readFileSync(join(dir, ".stringer", "last-scan.json"), "utf8")).toBe(consumed);
+
+      process.env[STRINGER_BIN_ENV] = writeBaselineStringer();
+      const retry = await scan({ repoPath: dir, scanFile: join(dir, "s3.json") });
+      expect(retry.deltaState.before).toBe(first.deltaState.after);
     });
   });
 
