@@ -16,6 +16,7 @@ import { beads, type Bead } from "../beads/bd";
 import type { HygieneFinding } from "../hygiene";
 import {
   ageInDays,
+  isClaimed,
   isInFlight,
   isOpenWork,
   stampOf,
@@ -87,7 +88,7 @@ function detectSuperseded(
 
     for (const member of members) {
       if (!isOpenWork(member) || runOwned(index, member, nowMs)) continue;
-      if (strandsOpenWork(index, member)) continue;
+      if (runClaimed(index, member) || strandsOpenWork(index, member)) continue;
       detections.push(
         makeDetection({
           kind: "superseded",
@@ -115,7 +116,8 @@ function detectSuperseded(
  * and any other verb would misrepresent it.
  *
  * A bead already in review is skipped: its run's merge finalization closes it, and a proposal here
- * would race the runner to the same outcome.
+ * would race the runner to the same outcome. So is one a run has merely CLAIMED — the same bar
+ * {@link detectSuperseded} holds, and for the same reason (see {@link runClaimed}).
  */
 function detectShippedOrphans(
   index: BoardIndex,
@@ -128,7 +130,7 @@ function detectShippedOrphans(
     if (finding.kind !== "orphan" || !finding.beadId) continue;
     const bead = index.byId.get(finding.beadId);
     if (!bead || !isOpenWork(bead) || runOwned(index, bead, nowMs)) continue;
-    if (strandsOpenWork(index, bead)) continue;
+    if (runClaimed(index, bead) || strandsOpenWork(index, bead)) continue;
     detections.push(
       makeDetection({
         kind: "shipped-orphan",
@@ -212,9 +214,30 @@ function detectStale(
  * it under the target's own write lock (apply.ts `planRetire`), and this keeps the ask off the board.
  */
 function runOwned(index: BoardIndex, bead: Bead, nowMs: number): boolean {
-  if (isInFlight(bead, nowMs)) return true;
+  return onEitherEnd(index, bead, (b) => isInFlight(b, nowMs));
+}
+
+/**
+ * The half of "a run owns this" that {@link runOwned} structurally cannot see: `beads.claimVerified`
+ * writes the assignee and `in_progress` first and publishes the run-lease afterwards, so a bead a
+ * machine picked up seconds ago reads as free to every liveness signal (see {@link isClaimed}).
+ * Approval is no backstop either — apply bars only a claim it can date to AFTER the filing
+ * (apply.ts `claimedSinceFiling`), so a pickup that predates the patrol's snapshot clears both tiers
+ * and `bd close`/`bd supersede` settles a bead a queued runner already owns.
+ *
+ * Asked by the SETTLING detectors only. `stale` deliberately keeps proposing against a claim: a bead
+ * in_progress and untouched for three weeks IS a dead claim, which is the whole finding — barring
+ * claims there would silence the detector on exactly the beads it exists for.
+ */
+function runClaimed(index: BoardIndex, bead: Bead): boolean {
+  return onEitherEnd(index, bead, isClaimed);
+}
+
+/** Does a signal fire on the bead itself, or on the run target whose ticket set it rides? */
+function onEitherEnd(index: BoardIndex, bead: Bead, signal: (b: Bead) => boolean): boolean {
+  if (signal(bead)) return true;
   const owner = ticketOwnerOf(index, bead);
-  return owner !== undefined && isInFlight(owner, nowMs);
+  return owner !== undefined && signal(owner);
 }
 
 /**

@@ -408,6 +408,36 @@ describe("implied ordering with no blocks edge", () => {
     ).toEqual([]);
   });
 
+  // The window no liveness signal covers: `bd update --claim` writes the assignee and `in_progress`
+  // before the execute job publishes a lease. Recording a new blocker over a pickup parks that run —
+  // it refreshes the board and finds a dependency that was absent when it was selected.
+  it("stays silent while the blocked end is claimed but not yet leased", () => {
+    expect(
+      detect([
+        feature("anton-alpha", {
+          description: "## Context\nBlocked on anton-beta landing first.",
+          status: "in_progress",
+          assignee: "box-2",
+        }),
+        feature("anton-beta"),
+      ]),
+    ).toEqual([]);
+  });
+
+  // The edge leaves the BLOCKER's readiness untouched, so a claim on that end is not this detector's
+  // business — the bar stays on the bead the edge would take out of the ready set.
+  it("still proposes when only the blocker is claimed", () => {
+    const detection = only(
+      detect([
+        feature("anton-alpha", { description: "## Context\nBlocked on anton-beta landing first." }),
+        feature("anton-beta", { status: "in_progress", assignee: "box-2" }),
+      ]),
+    );
+
+    expect(detection.subjects).toEqual(["anton-alpha"]);
+    expect(detection.target).toBe("anton-beta");
+  });
+
   it("never proposes an edge between a bead and its own ancestor", () => {
     expect(
       detect([
@@ -594,6 +624,61 @@ describe("retirement candidates", () => {
         [stale("anton-t1", "open"), orphan("anton-t2")],
       ),
     ).toEqual([]);
+  });
+
+  // A claim is written before its run publishes a lease, so a bead picked up seconds ago reads as
+  // free to every liveness signal — and apply refuses only a claim it can date to after the filing.
+  // A settling ask filed here would close work a queued runner already owns.
+  it("never settles a bead a run has claimed but not yet leased", () => {
+    expect(
+      detect([feature("anton-shipped", { status: "in_progress", assignee: "box-2" })], [
+        orphan("anton-shipped"),
+      ]),
+    ).toEqual([]);
+    expect(
+      detect(
+        [
+          feature("anton-live", { title: "Same", status: "in_progress", assignee: "box-2" }),
+          feature("anton-landed", { title: "Same", status: "closed" }),
+        ],
+        [duplicate(["anton-landed", "anton-live"])],
+      ),
+    ).toEqual([]);
+  });
+
+  // The same blind spot one level down: a grouped run cascades an assignee onto the card it picked
+  // up, and its unreached tickets carry no signal of their own.
+  it("never settles a ticket whose card a run has claimed but not yet leased", () => {
+    expect(
+      detect(
+        [
+          feature("anton-card", { status: "in_progress", assignee: "box-2" }),
+          bead("anton-t1", { parent: "anton-card" }),
+        ],
+        [orphan("anton-t1")],
+      ),
+    ).toEqual([]);
+  });
+
+  // …and the exception that bar is carved around: a bead in_progress and untouched for three weeks
+  // IS a dead claim, which is the whole stale finding — deferring it is the one retirement verb a
+  // claim must not silence.
+  it("still defers a stale bead whose claim outlived its run", () => {
+    const detection = only(
+      detect(
+        [
+          feature("anton-dead", {
+            status: "in_progress",
+            assignee: "box-2",
+            updated_at: daysAgo(RETIRE_STALE_IN_PROGRESS_DAYS + 2),
+          }),
+        ],
+        [stale("anton-dead", "in_progress")],
+      ),
+    );
+
+    expect(detection.kind).toBe("stale");
+    expect(detection.retireAs).toBe("defer");
   });
 
   // The same subtree with nothing running it is ordinary retirement work, so the bar stays on the

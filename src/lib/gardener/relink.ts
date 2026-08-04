@@ -13,7 +13,7 @@
  */
 import type { Bead } from "../beads/bd";
 import { isUnit } from "../epic-graph";
-import { isInFlight, isOpenWork, type BoardIndex } from "./board-index";
+import { isClaimed, isInFlight, isOpenWork, type BoardIndex } from "./board-index";
 import { makeDetection, type GardenerDetection } from "./detections";
 
 /** Phrases placing the MENTIONING bead after the bead it names. */
@@ -168,6 +168,13 @@ export function impliesOrdering(index: BoardIndex, blockedId: string, blockerId:
  * record a live bead as blocked, and by the time its run lands the bead is settled — so the proposal
  * would never become appliable and would suppress the claim until someone declined it by hand.
  *
+ * A CLAIM on the blocked end bars it too, for a harm liveness cannot see: `beads.claimVerified`
+ * writes the assignee and `in_progress` before the execute job publishes a lease, so a bead picked up
+ * seconds ago still reads as free (see {@link isClaimed}) — and approval is no backstop, because
+ * apply refuses only a claim it can date to AFTER the filing. Recording a new blocker over a live
+ * pickup parks that run: it refreshes the board and finds a dependency that was absent when it was
+ * selected. Only the blocked end carries this bar, because only its readiness changes.
+ *
  * The same reasoning bars a CYCLE. A blocker that already waits on the blocked bead through other
  * beads has no direct edge, so the pair reads as unrelated — but bd refuses to write the edge that
  * would close the loop (bd-hygiene.integration.test.ts), so the proposal could only ever be approved
@@ -178,6 +185,7 @@ function canOrder(index: BoardIndex, blocked: Bead, blocker: Bead, nowMs: number
   if (!isUnit(blocked) || !isUnit(blocker)) return false;
   if (!isOpenWork(blocked) || !isOpenWork(blocker)) return false;
   if (isInFlight(blocked, nowMs) || isInFlight(blocker, nowMs)) return false;
+  if (isClaimed(blocked)) return false;
   if (index.hasBlocksEdge(blocked.id, blocker.id)) return false;
   if (index.recordsDiscovery(blocked.id, blocker.id)) return false;
   if (index.isBlockedBy(blocker.id, blocked.id)) return false;
