@@ -25,6 +25,7 @@ import {
   provisionAgentsSkills,
   installSkillDir,
   registerProject,
+  staleSkills,
   INSTALLED_SKILLS,
   REQUIRED_SKILLS,
   resolvePort,
@@ -1230,5 +1231,145 @@ describe("fetchLatestRelease", () => {
     process.env.ANTON_GITHUB_TOKEN = "secret-token";
     await fetchLatestRelease();
     expect(capturedHeaders.Authorization).toBe("Bearer secret-token");
+  });
+});
+
+// `anton board-check` against a STUB `bd` on PATH — the same process-boundary seam the init tests
+// use. What's under test is the READ, not the tier rules (those are unit-tested off literal boards
+// in src/lib/beads/structure.test.ts): which bd invocations the checker survives.
+describe("anton board-check (bd stubbed on PATH)", () => {
+  const cleanups: string[] = [];
+  let repo: string;
+
+  async function tmp(prefix: string): Promise<string> {
+    const d = await mkdtemp(join(tmpdir(), prefix));
+    cleanups.push(d);
+    return d;
+  }
+
+  /** A `bd` whose `list` serves BOARD, optionally refusing `--status all` the way lean builds do. */
+  async function fakeBd(board: unknown[], { rejectsStatusAll = false } = {}): Promise<string> {
+    const bin = await tmp("anton-bdbin-");
+    const open = board.filter((b) => (b as { status?: string }).status !== "closed");
+    const closed = board.filter((b) => (b as { status?: string }).status === "closed");
+    writeFileSync(
+      join(bin, "bd"),
+      [
+        "#!/usr/bin/env node",
+        "const a = process.argv.slice(2);",
+        `const open = ${JSON.stringify(JSON.stringify(open))};`,
+        `const closed = ${JSON.stringify(JSON.stringify(closed))};`,
+        `const all = ${JSON.stringify(JSON.stringify(board))};`,
+        'const i = a.indexOf("--status");',
+        'const status = i >= 0 ? a[i + 1] : "";',
+        `if (status === "all" && ${rejectsStatusAll}) {`,
+        '  console.error("unknown value for --status: all");',
+        "  process.exit(2);",
+        "}",
+        'console.log(status === "all" ? all : status === "closed" ? closed : open);',
+        "process.exit(0);",
+      ].join("\n"),
+    );
+    chmodSync(join(bin, "bd"), 0o755);
+    return bin;
+  }
+
+  function runCheck(bin: string | null) {
+    return spawnSync(process.execPath, [CLI, "board-check", repo], {
+      encoding: "utf8",
+      // A PATH holding ONLY the stub (plus node, which the stub's shebang resolves through) — so
+      // `bin: null` reproduces "bd is not installed", where spawnSync reports ENOENT on `error` with
+      // a null `stderr`.
+      env: {
+        ...process.env,
+        PATH: [bin, dirname(process.execPath)].filter(Boolean).join(delimiter),
+      },
+    });
+  }
+
+  beforeEach(async () => {
+    repo = await tmp("anton-boardcheck-");
+    mkdirSync(join(repo, ".beads"), { recursive: true });
+  });
+
+  afterEach(async () => {
+    for (const d of cleanups.splice(0)) await rm(d, { recursive: true, force: true });
+  });
+
+  const HEALTHY = [
+    { id: "e1", issue_type: "epic", status: "open" },
+    { id: "f1", issue_type: "feature", status: "open", parent: "e1" },
+    { id: "t1", issue_type: "task", status: "open", parent: "f1" },
+    { id: "t2", issue_type: "task", status: "open", parent: "f1" },
+  ];
+  // A ticket hung straight off a container epic: the dead bead the exit code exists for.
+  const STRAY = { id: "stray", issue_type: "task", status: "open", parent: "e1" };
+
+  it("reports a clean board and exits 0", async () => {
+    const r = runCheck(await fakeBd(HEALTHY));
+    expect(r.stdout).toContain("epic → feature → ticket holds");
+    expect(r.status).toBe(0);
+  });
+
+  it("exits non-zero on a dead bead", async () => {
+    const r = runCheck(await fakeBd([...HEALTHY, STRAY]));
+    expect(r.stdout).toContain("stray");
+    expect(r.status).toBe(1);
+  });
+
+  // Some bd builds reject `--status all`; src/lib/beads/issues.ts already treats that as a supported
+  // variation. Without the same fallback here, /shape's mandatory Phase 5 audit failed having
+  // checked nothing at all on exactly those installs.
+  it("falls back to open + closed when bd rejects --status all", async () => {
+    const board = [...HEALTHY, STRAY, { id: "gone", issue_type: "task", status: "closed", parent: "f1" }];
+    const r = runCheck(await fakeBd(board, { rejectsStatusAll: true }));
+    expect(r.stdout).toContain("stray");
+    // The closed bead is read (so container-ness sees the whole graph) but never judged: 5 live of 6.
+    expect(r.stdout).toContain("5 live beads");
+    expect(r.status).toBe(1);
+  });
+
+  // The ENOENT is on `error`, never on `stderr` — reporting stderr alone printed a bare failure and
+  // left a user without bd installed nothing to act on.
+  it("says bd is missing rather than failing with an empty reason", () => {
+    const r = runCheck(null);
+    expect(r.stderr).toContain("bd not found");
+    expect(r.status).toBe(1);
+  });
+});
+
+describe("staleSkills", () => {
+  const cleanups: string[] = [];
+
+  async function tmp(prefix: string): Promise<string> {
+    const d = await mkdtemp(join(tmpdir(), prefix));
+    cleanups.push(d);
+    return d;
+  }
+
+  afterEach(async () => {
+    for (const d of cleanups.splice(0)) await rm(d, { recursive: true, force: true });
+  });
+
+  /** A skill source tree with one skill, plus an install root holding a copy of it. */
+  async function fixture(body: string) {
+    const src = await tmp("anton-skillsrc-");
+    const root = await tmp("anton-skillroot-");
+    mkdirSync(join(src, "bd"), { recursive: true });
+    writeFileSync(join(src, "bd", "SKILL.md"), "bundled\n");
+    mkdirSync(join(root, ".claude", "skills", "bd"), { recursive: true });
+    writeFileSync(join(root, ".claude", "skills", "bd", "SKILL.md"), body);
+    return { src, root };
+  }
+
+  it("reports a project-scope skill that differs from the bundle", async () => {
+    const { src, root } = await fixture("frozen at an old release\n");
+    const stale = staleSkills(src, { claudeRoot: await tmp("anton-empty-"), projectRoot: root });
+    expect(stale).toEqual([{ scope: "project", name: "bd" }]);
+  });
+
+  it("stays silent when the installed copy matches", async () => {
+    const { src, root } = await fixture("bundled\n");
+    expect(staleSkills(src, { claudeRoot: await tmp("anton-empty-"), projectRoot: root })).toEqual([]);
   });
 });

@@ -850,6 +850,67 @@ function checkPrereqs() {
   return ok && nodeOk;
 }
 
+/** One `bd list` in `repo`, always JSON and never truncated (bd caps at 50 by default). */
+function bdList(repo, extra) {
+  return spawnSync("bd", ["-C", repo, "list", ...extra, "--json", "--limit", "0"], {
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
+  });
+}
+
+/** bd's listing as an array, or null when this build's output can't be parsed. */
+function parseBoard(stdout) {
+  try {
+    const parsed = JSON.parse(stdout || "[]");
+    // bd omits the key entirely on an empty board rather than emitting [].
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The WHOLE board — closed beads included, because container-ness is read off the parent graph and
+ * an epic whose only feature child is closed still strands its loose tickets.
+ *
+ * `--status all` first, then the fallback the app already relies on: some bd builds reject that
+ * flag, and `src/lib/beads/issues.ts` treats it as a supported CLI variation by merging the default
+ * open listing with `--status closed`. This checker is invoked from `/shape`'s mandatory Phase 5, so
+ * without the same fallback it would fail there having checked nothing.
+ *
+ * Returns `{ board }` or `{ error }` — never both.
+ */
+function readBoard(repo) {
+  const all = bdList(repo, ["--status", "all"]);
+  // bd missing altogether is not a flag problem, and there is no point retrying: `spawnSync` reports
+  // ENOENT on `error` with a NULL `stderr`, so reporting stderr alone printed a bare "bd list
+  // failed" and left a user without bd installed with nothing to act on.
+  if (all.error) {
+    return {
+      error:
+        all.error.code === "ENOENT"
+          ? "bd not found on PATH — install it with `brew install gastownhall/tap/bd`"
+          : all.error.message,
+    };
+  }
+  if (all.status === 0) {
+    const board = parseBoard(all.stdout);
+    return board ? { board } : { error: "bd returned output this build can't parse." };
+  }
+
+  const [open, closed] = [bdList(repo, []), bdList(repo, ["--status", "closed"])];
+  const failed = [open, closed].some((r) => r.error || r.status !== 0);
+  // Report the ORIGINAL failure: the fallback is a guess about which bd this is, and if it fails too
+  // the useful message is why `--status all` was refused, not why the second guess was.
+  if (failed) return { error: (all.stderr ?? "").trim() || `bd list exited ${all.status}` };
+
+  const listings = [parseBoard(open.stdout), parseBoard(closed.stdout)];
+  if (listings.some((l) => l === null)) return { error: "bd returned output this build can't parse." };
+  const byId = new Map();
+  for (const bead of listings.flat()) if (!byId.has(bead.id)) byId.set(bead.id, bead);
+  return { board: [...byId.values()] };
+}
+
 /**
  * `anton board-check [path...]` — every live bead whose place in `epic → feature → ticket` is wrong.
  *
@@ -877,26 +938,11 @@ function cmdBoardCheck(args) {
       console.error(c.red(`No .beads/ at ${repo}`) + c.dim(" — run `anton init` there, or pass a repo path."));
       return 1;
     }
-    // The WHOLE board, closed beads included — container-ness is read off the parent graph, and an
-    // epic whose only feature child is closed still strands its loose tickets. `--limit 0` because
-    // bd truncates at 50 by default and would silently drop the rest of the board.
-    const r = spawnSync("bd", ["-C", repo, "list", "--status", "all", "--json", "--limit", "0"], {
-      encoding: "utf8",
-      maxBuffer: 64 * 1024 * 1024,
-    });
-    if (r.status !== 0) {
-      console.error(c.red(`bd list failed in ${repo}`) + c.dim(`\n${(r.stderr ?? "").trim()}`));
+    const { board, error } = readBoard(repo);
+    if (error) {
+      console.error(c.red(`bd list failed in ${repo}`) + c.dim(`\n${error}`));
       return 1;
     }
-    let board;
-    try {
-      board = JSON.parse(r.stdout || "[]");
-    } catch {
-      console.error(c.red(`bd returned output this build can't parse (${repo}).`));
-      return 1;
-    }
-    // bd omits the key entirely on an empty board rather than emitting [].
-    if (!Array.isArray(board)) board = [];
 
     const report = buildStructureReport(board);
     blocking += report.blocking;
@@ -926,11 +972,17 @@ function cmdVersion() {
  * A skill is a runtime contract — a copy frozen at an old release keeps shaping work against rules
  * the bundle has replaced, and until now nothing ever said so out loud (anton-tier-invariants).
  * Returns `[{ scope, name }]`, empty when everything is current or nothing is installed.
+ *
+ * Both roots are injectable so this can be exercised against fixture directories — matching
+ * `provisionAgentsSkills`, which already takes `opts.claudeRoot`. `cmdDoctor` passes neither and
+ * gets the real ones; without the seam the only way to test drift detection was to `chdir` the
+ * process. `projectRoot` defaults at CALL time rather than module load, because `process.cwd()` is
+ * what "this repo" means for the command being run.
  */
-function staleSkills(skillsSrc = SKILLS_SRC) {
+function staleSkills(skillsSrc = SKILLS_SRC, { claudeRoot = CLAUDE_ROOT, projectRoot = process.cwd() } = {}) {
   const scopes = [
-    ["global", CLAUDE_ROOT],
-    ["project", join(process.cwd(), ".claude")],
+    ["global", claudeRoot],
+    ["project", join(projectRoot, ".claude")],
   ];
   const out = [];
   for (const [scope, root] of scopes) {
