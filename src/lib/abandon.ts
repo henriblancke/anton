@@ -6,6 +6,7 @@
  */
 import { beads } from "./beads/bd";
 import { withBeadWriteLocks } from "./beads/claim-lock";
+import { descendantsOf } from "./beads/subtree";
 import { nudgeSync } from "./beads/sync-nudge";
 import { declineNote } from "./gardener/apply";
 import { cancelRunForTarget, runIsLiveForTarget } from "./jobs/service";
@@ -318,27 +319,7 @@ export interface EpicAbandonResult {
  * Pure over a bead list, so the cascade costs one bd read and is testable from a fixture board.
  */
 export function openDescendants(board: Bead[], epicId: string): Bead[] {
-  const childrenByParent = new Map<string, Bead[]>();
-  for (const bead of board) {
-    const parent = beads.parentOf(bead);
-    if (!parent) continue;
-    const siblings = childrenByParent.get(parent);
-    if (siblings) siblings.push(bead);
-    else childrenByParent.set(parent, [bead]);
-  }
-
-  const open: Bead[] = [];
-  const seen = new Set<string>([epicId]); // also the cycle guard on a malformed parent chain
-  const stack = [...(childrenByParent.get(epicId) ?? [])].reverse();
-  while (stack.length > 0) {
-    const bead = stack.pop()!;
-    if (seen.has(bead.id)) continue;
-    seen.add(bead.id);
-    if (bead.status !== "closed") open.push(bead);
-    const children = childrenByParent.get(bead.id) ?? [];
-    for (let i = children.length - 1; i >= 0; i--) stack.push(children[i]);
-  }
-  return open;
+  return descendantsOf(board, epicId, (bead) => bead.status !== "closed");
 }
 
 /**
