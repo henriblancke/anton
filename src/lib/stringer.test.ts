@@ -24,6 +24,7 @@ import {
   parseCollectorFailures,
   scan,
 } from "./stringer";
+import { isPoisonError } from "./jobs/errors";
 
 let dir: string;
 let prevBin: string | undefined;
@@ -365,6 +366,28 @@ describe("scan", () => {
       await expect(scan({ repoPath: dir, scanFile: join(dir, "s.json") })).rejects.toThrow(
         /baseline could not be restored/,
       );
+    });
+
+    it("PARKS the job when the baseline cannot be put back — a retry can't see the lost window", async () => {
+      // An ordinary error gets rescheduled, and the retry measures --delta against the baseline this
+      // scan advanced: zero signals, job done, findings nobody triaged. Poison instead, so the pass
+      // stops at the human who has to reset the state file.
+      mkdirSync(join(dir, ".stringer", "last-scan.json"), { recursive: true });
+      process.env[STRINGER_BIN_ENV] = writeScript("noop-poison-stringer", ["process.exit(0);"]);
+
+      await expect(scan({ repoPath: dir, scanFile: join(dir, "s.json") })).rejects.toSatisfy(
+        isPoisonError,
+      );
+    });
+
+    it("keeps a refusal it COULD unwind retryable — the retry rescans the same window", async () => {
+      process.env[STRINGER_BIN_ENV] = writeBaselineStringer();
+      await scan({ repoPath: dir, scanFile: join(dir, "s1.json") });
+
+      process.env[STRINGER_BIN_ENV] = writeRejectingStringer("rejecting-retryable");
+      const err = await scan({ repoPath: dir, scanFile: join(dir, "s2.json") }).catch((e) => e);
+
+      expect(isPoisonError(err)).toBe(false);
     });
 
     it("reports an unreadable baseline as unknown rather than as unchanged", async () => {

@@ -412,7 +412,25 @@ describe("formatBoardContext", () => {
 
     expect(ctx.features[0].touches).toHaveLength(MAX_TOUCHES);
     expect(ctx.features[0].touchesOmitted).toBe(5);
-    expect(formatBoardContext(ctx)).toContain("+5 more not shown");
+    // A feature's surface aggregates its children's paths, so the dropped one may be a child's — and
+    // `bd show` on the feature cannot show a child's Context. Point at the read that can.
+    expect(formatBoardContext(ctx)).toContain(
+      "+5 more not shown — `bd show f-1` and `bd children f-1`",
+    );
+  });
+
+  it("sends a capped producer bead to its OWN show — its surface inherits nothing", () => {
+    const declared = Array.from({ length: MAX_TOUCHES + 2 }, (_, i) => `src/lib/f${i}.ts`);
+    const ctx = buildBoardContext([
+      bead({
+        id: "s-1",
+        issue_type: "task",
+        labels: ["stringer:duplication:8000d8e1"],
+        context: `touches: ${declared.join(", ")}`,
+      }),
+    ]);
+
+    expect(formatBoardContext(ctx)).toContain("+2 more not shown — `bd show s-1` before deciding");
   });
 
   it("leaves a surface inside the cap unqualified", () => {

@@ -24,8 +24,8 @@ export class UsageLimitError extends Error {
  * (skips the remaining `maxAttempts` budget).
  */
 export class PoisonError extends Error {
-  constructor(message: string) {
-    super(message);
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
     this.name = "PoisonError";
   }
 }

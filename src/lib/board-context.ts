@@ -388,12 +388,22 @@ export const BOARD_CONTEXT_HEADING = "## Board context — the board as anton re
  * dropped would otherwise read as unowned, and triage would mint a cluster beside the run already
  * changing it — the duplicate §4.0 exists to prevent. So the line names the omission and the lookup
  * that closes it, rather than presenting a partial surface as the whole one.
+ *
+ * `lookup` is that lookup, and it differs by bead: a dropped path on a bead's OWN surface is in its
+ * `bd show`, but a feature's surface aggregates its descendants ({@link runSurface}) — and `bd show`
+ * on the feature cannot reveal a child ticket's Context, so a hint naming only it sends triage to a
+ * read that can't answer the question.
  */
-function surface({ touches, touchesOmitted }: TouchSurface): string {
+function surface({ touches, touchesOmitted }: TouchSurface, lookup: string): string {
   if (touches.length === 0) return "(no touch surface declared)";
   return touchesOmitted > 0
-    ? `${touches.join(", ")} (+${touchesOmitted} more not shown — \`bd show\` it before deciding this signal is unowned)`
+    ? `${touches.join(", ")} (+${touchesOmitted} more not shown — ${lookup} before deciding this signal is unowned)`
     : touches.join(", ");
+}
+
+/** The read that reveals a RUN's whole surface: the bead's own Context plus every descendant's. */
+function runSurfaceLookup(id: string): string {
+  return `\`bd show ${id}\` and \`bd children ${id}\` (then \`bd show\` each — a dropped path may be a child's)`;
 }
 
 function omissionLine(count: number, what: string, how = "`bd list`"): string[] {
@@ -438,7 +448,7 @@ export function formatBoardContext(ctx: BoardContext): string {
     for (const f of ctx.features) {
       const verdict = f.attachable ? "attach:child" : `attach:no (${f.attachReason})`;
       lines.push(
-        `- ${f.id} · ${verdict} · epic:${f.epicId ?? "none"} · ${f.title} · touches: ${surface(f)}`,
+        `- ${f.id} · ${verdict} · epic:${f.epicId ?? "none"} · ${f.title} · touches: ${surface(f, runSurfaceLookup(f.id))}`,
       );
     }
     lines.push(...omissionLine(ctx.omitted.features, "open feature(s)"));
@@ -480,7 +490,9 @@ export function formatBoardContext(ctx: BoardContext): string {
   } else {
     for (const p of ctx.producers) {
       const fps = p.fingerprints.map((f) => f.label).join(" · ");
-      lines.push(`- ${p.id} · ${p.status} · ${fps} · touches: ${surface(p)} · ${p.title}`);
+      lines.push(
+        `- ${p.id} · ${p.status} · ${fps} · touches: ${surface(p, `\`bd show ${p.id}\``)} · ${p.title}`,
+      );
     }
     lines.push(...omissionLine(ctx.omitted.producers, "producer-filed bead(s)"));
   }

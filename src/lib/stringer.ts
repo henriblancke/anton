@@ -13,6 +13,7 @@ import { promisify } from "node:util";
 import { readFile, writeFile, mkdir, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { annotateSignal, type ScanSignal } from "./scan-severity";
+import { PoisonError } from "./jobs/errors";
 
 const execFileAsync = promisify(execFile);
 
@@ -245,6 +246,12 @@ async function restoreBaseline(
 /**
  * Rejecting a scan means unwinding it. When the baseline can't go back, the error says so rather
  * than leaving a retry to quietly measure against a baseline the rejected scan advanced.
+ *
+ * That case is POISON, not an ordinary failure: the runner reschedules a plain error, and the retry
+ * would measure `--delta` against the advanced baseline, find nothing new, and close the pass green
+ * over findings nobody triaged — the same false green the rejection exists to prevent, now dressed
+ * as a success. Only a human can put the window back (reset the state file, or rescan with delta
+ * off), so the job parks for one instead of burning attempts on a retry that cannot see the window.
  */
 async function rejectWithBaselineRestored(
   err: unknown,
@@ -253,10 +260,11 @@ async function rejectWithBaselineRestored(
 ): Promise<unknown> {
   const problem = await restoreBaseline(repoPath, baseline);
   if (!problem) return err;
-  return new Error(
+  return new PoisonError(
     `${err instanceof Error ? err.message : String(err)}. Worse, stringer's --delta baseline could ` +
-      `not be restored (${problem}): a retry will measure against the baseline this scan advanced, ` +
-      `so these findings will not reappear — rescan with delta off, or reset ${DELTA_STATE_FILE}`,
+      `not be restored (${problem}): a retry would measure against the baseline this scan advanced, ` +
+      `so these findings will not reappear — parked for a human: rescan with delta off, or reset ` +
+      `${DELTA_STATE_FILE}`,
     { cause: err },
   );
 }
@@ -416,7 +424,9 @@ async function readAnnotatedSignals(scanFile: string): Promise<ScanSignal[]> {
  * `readAnnotatedSignals`), so the job then retries/parks per the runner's policy; a deadline kill
  * throws a distinct "timed out" error rather than stringer's misleading partial stderr. A rejected
  * scan leaves the `--delta` baseline where it found it, so the retry rescans the same window rather
- * than the empty one this attempt advanced past (see `restoreBaseline`).
+ * than the empty one this attempt advanced past — and when it CAN'T put the baseline back, it throws
+ * poison so the runner parks the job instead of retrying past the lost window (see
+ * `rejectWithBaselineRestored`).
  */
 export async function scan(opts: {
   repoPath: string;
