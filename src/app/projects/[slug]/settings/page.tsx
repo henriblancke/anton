@@ -20,13 +20,15 @@ export default async function ProjectSettingsPage({
   const settings = await getProjectSettingsBySlug(slug);
   // The locked base prompt is shown read-only so operators see what's always applied.
   const basePrompt = await loadBaseSystemPrompt().catch(() => "");
-  // Real per-project schedule state — cadence, next fire and enabled — so the Automation rows show
-  // the row that actually fires rather than copy that can drift from it.
+  // Real per-project schedule state — cadence, last fire, next fire and enabled — so the Automation
+  // table shows the row that actually fires rather than copy that can drift from it. lastRunAt is
+  // the one fact the old rows dropped, and it is what answers "is this thing working".
   const schedules = (await listSchedules(project.id)).map((s) => ({
     type: s.type,
     enabled: s.enabled,
     cron: s.cron,
     nextRunAt: s.nextRunAt,
+    lastRunAt: s.lastRunAt,
   }));
   // The cadence each automation ships with, so "Reset to default" has one source of truth.
   const defaultCrons = Object.fromEntries(DEFAULT_SCHEDULES.map((d) => [d.type, d.cron]));
