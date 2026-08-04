@@ -184,18 +184,29 @@ export async function addTicketNote(
  * runtime never dispatches it until a human un-snoozes. Nothing else about the ticket changes.
  *
  * Throws on an unknown id (bd's own error, so the route can 404).
+ *
+ * Taken under the bead's own write lock, like updateTicket, and for the same class of reason: a
+ * gardener STALE/DEFER proposal rests on a premise about this bead's snoozed state, which
+ * `applyProposal` re-confirms from a read taken inside this very lock (gardener/apply.ts). An
+ * un-snooze landing between that confirmation and the proposal's close would settle the proposal as
+ * "already deferred" over a ticket that is ready again. Serialized, the un-snooze either lands first
+ * (and the apply refuses as drifted) or waits until the proposal has settled.
  */
 export async function setTicketDeferred(
   project: Project,
   id: string,
   deferred: boolean,
 ): Promise<TicketDetail> {
-  await beads.show(project.repoPath, id); // 404 guard — bd throws on an unknown id
-  if (deferred) await beads.defer(project.repoPath, id);
-  else await beads.undefer(project.repoPath, id);
   // Read-after-write, like updateTicket: the `bd show` bead is authoritative for the snoozed state
-  // it just set, so the response never reflects the board's stale snapshot.
-  const detail = await freshDetail(project, await beads.show(project.repoPath, id));
+  // it just set, so the response never reflects the board's stale snapshot. Inside the lock, so it
+  // cannot read a competing write's result back as this toggle's outcome.
+  const written = await withBeadWriteLock(project.repoPath, id, async () => {
+    await beads.show(project.repoPath, id); // 404 guard — bd throws on an unknown id
+    if (deferred) await beads.defer(project.repoPath, id);
+    else await beads.undefer(project.repoPath, id);
+    return beads.show(project.repoPath, id);
+  });
+  const detail = await freshDetail(project, written);
   // The deferral landed locally; propagate via the immediate push + durable sync-push job (anton-nowq).
   nudgeSync(project, "ticket-detail");
   return detail;

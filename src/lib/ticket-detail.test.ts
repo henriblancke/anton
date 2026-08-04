@@ -10,7 +10,7 @@ import { beads } from "./beads/bd";
 import { withBeadWriteLock } from "./beads/claim-lock";
 import { invalidateIssueSnapshot, resetIssueSnapshots } from "./beads/snapshot";
 import { allIssues } from "./beads/issues";
-import { deleteTicket, getTicketDetail, updateTicket } from "./ticket-detail";
+import { deleteTicket, getTicketDetail, setTicketDeferred, updateTicket } from "./ticket-detail";
 import type { Bead } from "./beads/bd";
 import type { Project } from "./types";
 
@@ -239,5 +239,57 @@ describe("deleteTicket serializes with the gardener's apply lock", () => {
 
     await expect(deleting).rejects.toThrow(/no such bead/);
     expect(del).not.toHaveBeenCalled();
+  });
+});
+
+// A stale/defer proposal that finds its subject already deferred writes nothing and settles on that
+// premise, re-confirmed under the subject's write lock. An un-snooze outside that lock lands between
+// the confirmation and the close, settling the proposal as "already deferred" over a ticket that is
+// ready again. The lock is what orders the two.
+describe("setTicketDeferred serializes with the gardener's apply lock", () => {
+  /** Let the pending toggle reach the lock (or the write it would have made without one). */
+  const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 10));
+
+  beforeEach(() => resetIssueSnapshots());
+  afterEach(() => vi.restoreAllMocks());
+
+  it("waits for the bead's write lock instead of un-snoozing under a concurrent apply", async () => {
+    fakeBd([bead({ id: "anton-s1" })]);
+    const undefer = vi.spyOn(beads, "undefer").mockResolvedValue("");
+    let release!: () => void;
+    const apply = withBeadWriteLock(
+      "/repo",
+      "anton-s1",
+      () => new Promise<void>((r) => (release = r)),
+    );
+
+    const undeferring = setTicketDeferred(project, "anton-s1", false);
+    await settle();
+    expect(undefer).not.toHaveBeenCalled();
+
+    release();
+    await apply;
+    await undeferring;
+    expect(undefer).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-reads under the lock, so a bead deleted while it waited 404s rather than writing blind", async () => {
+    const bd = fakeBd([bead({ id: "anton-s1" })]);
+    const defer = vi.spyOn(beads, "defer").mockResolvedValue("");
+    let release!: () => void;
+    const apply = withBeadWriteLock(
+      "/repo",
+      "anton-s1",
+      () => new Promise<void>((r) => (release = r)),
+    );
+
+    const deferring = setTicketDeferred(project, "anton-s1", true);
+    await settle();
+    bd.show.mockRejectedValue(new Error("no such bead anton-s1"));
+    release();
+    await apply;
+
+    await expect(deferring).rejects.toThrow(/no such bead/);
+    expect(defer).not.toHaveBeenCalled();
   });
 });
