@@ -57,9 +57,9 @@ bulk. Past **6**, the diff stops being reviewable in one sitting: that's two fea
 ### The nesting rule — five invariants
 
 `epic → feature → task | bug | chore`. One parent per bead. These are checkable, and they are
-checked — `npm run board:check` (`scripts/board-structure.ts`, judging through
-`src/lib/beads/structure.ts`) prints every violation, and the approve route refuses on 1–3. Severity
-is one question and only one: **can this bead ever run?**
+checked — `anton board-check` prints every violation on the board, and the approve route refuses on
+1–3 for the target it is approving. Severity is one question and only one: **can this bead ever
+run?**
 
 **Blocking — a dead bead. It will never run, and no amount of waiting changes that.**
 
@@ -308,15 +308,16 @@ which is exactly how that board gets shipped. Never treat it as a structural che
 Two commands that do check:
 
 ```bash
-npm run board:check              # every violation of the five invariants; non-zero exit = a dead bead
+anton board-check                # every violation of the five invariants; non-zero exit = a dead bead
 bd list --status all --json --limit 0 \
   | jq -r '.[] | select(.status != "closed") | "\(.id)\t\(.issue_type)\tparent=\(.parent // "-")"'
 ```
 
 The second is the **type audit** — one line per bead carrying its tier and its parent. Print it and
-read it before telling anyone the tree is right; `board:check` then judges the same board
-mechanically. If `board:check` isn't available (a repo with no anton checkout), the jq line plus the
-five invariants is the manual equivalent.
+read it before telling anyone the tree is right; `anton board-check` then judges the same board
+mechanically. It runs in any repo anton is installed for — it reads the board through `bd`, not
+through an anton checkout. If `anton` isn't on PATH at all, the jq line plus the five invariants is
+the manual equivalent.
 
 ## The pickup protocol — how any worker takes work
 

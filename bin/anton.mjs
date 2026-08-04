@@ -44,10 +44,12 @@ import {
   ensureBeadFormula,
   ensureBeadsGitignore,
   ensureRunFormula,
+  hasBeadsDir,
   BEAD_FORMULA_FILENAME,
   RUN_FORMULA_FILENAME,
   MIN_BD_VERSION,
 } from "../src/lib/beads/config.mjs";
+import { buildStructureReport, formatStructureReport } from "../src/lib/beads/tiers.mjs";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { fileURLToPath } from "node:url";
@@ -848,6 +850,62 @@ function checkPrereqs() {
   return ok && nodeOk;
 }
 
+/**
+ * `anton board-check [path...]` — every live bead whose place in `epic → feature → ticket` is wrong.
+ *
+ * The mechanical half of `/shape`'s Phase 5, and it lives on the CLI rather than in an npm script
+ * for one reason: `/shape` runs inside the USER's repo, from an installed bundle that ships no
+ * TypeScript and no package scripts. A `npm run …` in the skill would have resolved against
+ * whatever `package.json` that repo happens to have (anton-i4al). The judgement itself is
+ * `src/lib/beads/tiers.mjs`, shared byte-for-byte with the approve gate — the command and the gate
+ * cannot disagree.
+ *
+ * Exit code is the point: non-zero means the board carries a DEAD bead — one no run target and no
+ * ticket sweep will ever reach. Advisory faults (a feature with no epic, with no tickets, past its
+ * ticket budget) print and exit 0; they cost later, they do not strand work.
+ *
+ * Read-only: it never writes a bead. Repair is authoring work — the report names the bead in the
+ * wrong place and the command that moves it, never what the right shape of the work is.
+ */
+function cmdBoardCheck(args) {
+  const paths = args.filter((a) => !a.startsWith("-"));
+  const repos = paths.length > 0 ? paths.map((p) => resolve(p)) : [process.cwd()];
+
+  let blocking = 0;
+  for (const repo of repos) {
+    if (!hasBeadsDir(repo)) {
+      console.error(c.red(`No .beads/ at ${repo}`) + c.dim(" — run `anton init` there, or pass a repo path."));
+      return 1;
+    }
+    // The WHOLE board, closed beads included — container-ness is read off the parent graph, and an
+    // epic whose only feature child is closed still strands its loose tickets. `--limit 0` because
+    // bd truncates at 50 by default and would silently drop the rest of the board.
+    const r = spawnSync("bd", ["-C", repo, "list", "--status", "all", "--json", "--limit", "0"], {
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    if (r.status !== 0) {
+      console.error(c.red(`bd list failed in ${repo}`) + c.dim(`\n${(r.stderr ?? "").trim()}`));
+      return 1;
+    }
+    let board;
+    try {
+      board = JSON.parse(r.stdout || "[]");
+    } catch {
+      console.error(c.red(`bd returned output this build can't parse (${repo}).`));
+      return 1;
+    }
+    // bd omits the key entirely on an empty board rather than emitting [].
+    if (!Array.isArray(board)) board = [];
+
+    const report = buildStructureReport(board);
+    blocking += report.blocking;
+    console.log(formatStructureReport(report, repos.length > 1 ? repo : ""));
+    console.log("");
+  }
+  return blocking > 0 ? 1 : 0;
+}
+
 /** Print anton's version — the bundle's RELEASE_VERSION when installed, else package.json. */
 function cmdVersion() {
   let v = bundleVersion();
@@ -1381,6 +1439,7 @@ ${c.bold("Usage:")} anton <command>
   ${c.bold("setup")}    check prereqs, migrate DB, rebuild node-pty, install agents & skills, wire beads Dolt sync  ${c.dim("[--agents <a,b,c>|all] [--force-skills]")}
   ${c.bold("init")}     configure beads in a target repo + register it with anton  ${c.dim("[path] [--prefix <p>] [--force-skills]")}
   ${c.bold("doctor")}   check prereqs + anton.db + stale skills (non-destructive)
+  ${c.bold("board-check")} report beads that break epic → feature → ticket  ${c.dim("[path...] (default: cwd)")}
   ${c.bold("dev")}      run the dev server (next dev)          ${c.dim("[--port <n>]")}
   ${c.bold("start")}    run the server ${c.dim("(installed: background; source: foreground)")}  ${c.dim("[--port <n>] [--foreground]")}
   ${c.bold("stop")}     stop the background server             ${c.dim("(installed bundle)")}
@@ -1404,6 +1463,8 @@ function main(argv) {
       return cmdInit(rest);
     case "doctor":
       return cmdDoctor();
+    case "board-check":
+      return cmdBoardCheck(rest);
     case "dev":
       return cmdDev(rest);
     case "start":

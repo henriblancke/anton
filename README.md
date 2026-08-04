@@ -175,6 +175,7 @@ The **job runner and cron scheduler start automatically** with the server (via `
 anton setup     check prereqs, migrate DB, install agents & skills   [--agents <a,b,c>|all] [--force-skills]
 anton init      configure beads in a target repo + register it       [path] [--prefix <p>] [--force-skills]
 anton doctor    check prereqs + anton.db + stale skills (non-destructive)
+anton board-check  report beads that break epic → feature → ticket   [path...] (default: cwd)
 anton dev       run the dev server (next dev)                         [--port <n>]
 anton start     run the server — bundle: background, source: foreground  [--port <n>] [--foreground]
 anton stop      stop the background server                            (installed bundle)
@@ -283,7 +284,7 @@ Then restart the server. (A node upgrade can break the ABI again — re-run the 
 
 **`anton doctor` says a skill `differs from the bundled version`.** The copy in `~/.claude/skills/` (or the repo's `.claude/skills/`) isn't the one this release ships. Because installs never overwrite, a skill provisioned by an older anton stays at that version forever — and `/shape` will keep shaping work against rules the current release has replaced. Re-sync with `anton setup --force-skills` (global) or `anton init --force-skills` (that repo), then restart any running `claude` session: skills are read at session start, so an updated file doesn't reach a session already open. Ignore the warning if the difference is your own deliberate edit — forcing discards it.
 
-**`/shape` produced a board that doesn't match `epic → feature → ticket`.** Run `npm run board:check` (from a source checkout, optionally with a repo path) for every violation on the board and the `bd` command that fixes each one. It exits non-zero only on a *dead* bead — one no run will ever reach, such as a ticket left under an epic that has features under it. Zero-ticket features and features with no epic print as advisories: they run, they just cost you later. The same judgement gates approval for the target being approved, so a dead bead can't reach a run.
+**`/shape` produced a board that doesn't match `epic → feature → ticket`.** Run `anton board-check` in that repo (or pass one or more repo paths) for every violation on the board and the `bd` command that fixes each one. It exits non-zero only on a *dead* bead — one no run will ever reach, such as a ticket left under an epic that has features under it. Zero-ticket features and features with no epic print as advisories: they run, they just cost you later. The same judgement gates approval for the target being approved, so a dead bead can't reach a run.
 
 ## Stack
 

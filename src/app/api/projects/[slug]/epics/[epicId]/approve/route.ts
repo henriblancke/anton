@@ -204,7 +204,7 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // this feature's fault and must not strand it. That scope is deliberately narrow, and it means this
   // gate is a BACKSTOP, not the primary check — a nested feature is caught here, while a ticket
   // stranded under a container epic is not (the container can't be approved at all, so no request
-  // ever reaches this line carrying it). `npm run board:check` judges the whole board and is what
+  // ever reaches this line carrying it). `anton board-check` judges the whole board and is what
   // `/shape` runs before it hands a tree over; this catches what survives to a run trigger.
   const structural = willEnqueue ? structureGaps(epicId, allBeads, "blocking") : [];
   if (structural.length > 0) {

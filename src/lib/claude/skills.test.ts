@@ -163,7 +163,7 @@ describe("required skill assets", () => {
 
     it("shape's Phase 5 requires the type audit and the mechanical check", () => {
       expect(shape).toMatch(/Audit the tiers\. This step is not optional/);
-      expect(shape).toMatch(/npm run board:check/);
+      expect(shape).toMatch(/anton board-check/);
       expect(shape).toMatch(/If the audit and your intent disagree, the audit is right/);
     });
 

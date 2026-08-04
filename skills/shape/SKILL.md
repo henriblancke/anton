@@ -172,7 +172,7 @@ and run the check:
 ```bash
 bd list --status all --json --limit 0 \
   | jq -r '.[] | select(.status != "closed") | "\(.id)\t\(.issue_type)\tparent=\(.parent // "-")"'
-npm run board:check          # non-zero exit = a dead bead; fix it before confirming
+anton board-check            # non-zero exit = a dead bead; fix it before confirming
 bd lint                      # the contract sections, per bead
 ```
 
@@ -187,13 +187,13 @@ Then assert the five invariants out loud against what you just printed, naming c
 If the audit and your intent disagree, the audit is right.
 
 **Confirm.** Show the user the tree with the feature's one-line PR scope and its ticket count, name
-the epic it attached to and whether you created it, report the `board:check` result, and confirm
+the epic it attached to and whether you created it, report the `anton board-check` result, and confirm
 before finishing. The user approves what gets built — you don't merge scope silently.
 
 ## Output
 
 - Beads created in `.beads/`, every feature under an epic, all children `shaped`, deps set.
-- The Phase 5 type audit, and a clean `npm run board:check` — or the violations named, with what
+- The Phase 5 type audit, and a clean `anton board-check` — or the violations named, with what
   you changed to clear them.
 - A short summary: the epic (and its `area:`), the feature(s) under it, their tickets **with counts**,
   total `size`, and any `domain:research` beads you recommended first.
