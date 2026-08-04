@@ -29,8 +29,10 @@ export type StructureRule =
   | "ticket-under-container-epic"
   | "feature-under-non-epic"
   | "parentless-chore"
+  | "dangling-parent"
   | "feature-without-epic"
   | "feature-without-tickets"
+  | "feature-under-ticket-budget"
   | "feature-over-ticket-budget";
 
 export interface StructureViolation {
@@ -54,12 +56,20 @@ export interface StructureReport {
 export const validateBoardStructure = (board: Bead[]): StructureViolation[] =>
   validateBoardStructureJs(board);
 
-/** The violations a single run target owns: its own, plus every descendant's. */
-export const structureGaps = (
-  targetId: string,
-  board: Bead[],
-  severity: StructureSeverity,
-): StructureViolation[] => structureGapsJs(targetId, board, severity);
+/** A target's own faults and its descendants', split by severity — one board pass, both sets. */
+export interface StructureGaps {
+  /** The refusal set: dead beads under this target. */
+  blocking: StructureViolation[];
+  /** Reported, never enforced. */
+  advisory: StructureViolation[];
+}
+
+/**
+ * The violations a single run target owns: its own, plus every descendant's, by severity. Both sets
+ * come from one pass so a caller that needs the refusal AND the warning can't walk the board twice.
+ */
+export const structureGaps = (targetId: string, board: Bead[]): StructureGaps =>
+  structureGapsJs(targetId, board);
 
 /** Violations as one line naming every offender and what is wrong — the body of a 422 or a park note. */
 export const formatStructureViolations = (violations: StructureViolation[]): string =>

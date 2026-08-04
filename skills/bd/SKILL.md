@@ -81,7 +81,9 @@ run?**
    `shape` skill).
 5. **A feature carries 2–6 tickets.** Zero is legal — `beads.groupsChildren` reads a childless
    feature as its own single ticket, which is right for a genuinely atomic PR — but fifteen of them
-   at once means leaves got mistyped as features. Over six means it's two features.
+   at once means leaves got mistyped as features. **One** is the same work described at two levels.
+   Over six means it's two features. The count is the RUN's: every working-layer descendant, since
+   `feature → task → subtask` ships all of it in one worktree and one PR — not just direct children.
 
 A genuine one-off that no epic would honestly hold is a **parentless `task`/`bug`** — a run of one.
 Don't invent a single-feature epic to avoid it.

@@ -89,12 +89,7 @@ function isJudged(bead) {
  */
 export function validateBoardStructure(board) {
   const byId = new Map(board.map((b) => [b.id, b]));
-  const openTicketChildren = new Map();
-  for (const bead of board) {
-    if (!isTicketType(bead) || !isJudged(bead)) continue;
-    const parentId = parentOf(bead);
-    if (parentId) openTicketChildren.set(parentId, (openTicketChildren.get(parentId) ?? 0) + 1);
-  }
+  const childrenOf = childIndex(board);
 
   const violations = [];
   const fault = (id, rule, severity, message) => violations.push({ id, rule, severity, message });
@@ -103,6 +98,30 @@ export function validateBoardStructure(board) {
     if (!isJudged(bead)) continue;
     const parentId = parentOf(bead);
     const parent = parentId ? byId.get(parentId) : undefined;
+
+    // A parent id pointing at a bead this board doesn't contain — a bd-level inconsistency, not a
+    // shape one (a re-parent that lost its target, a hand-edited export). The one rule here that
+    // judges EVERY live bead rather than tickets and features: a broken edge is a graph fault, and
+    // an epic or a `learning` hanging off nothing is as worth naming as a ticket is. Not hidden:
+    // `cardOf` walks the parent chain and stops dead here, so a ticket in this state rides on no run
+    // target and is as unreachable as one under a container epic, yet every rule below tests either
+    // `parent` (undefined) or `!parentId` (false) and would let it through silently.
+    //
+    // Advisory, not blocking, even for a ticket that genuinely can't run: the fault is a broken
+    // reference rather than a decision about where the work hangs, and the remedy is a re-parent or
+    // a bd repair. Nothing is lost by not blocking — a bead with a dangling parent is reachable from
+    // no run target's subtree, so {@link structureGaps} never sees it and no approval was ever going
+    // to refuse on it. It surfaces where it can be acted on: `anton board-check`.
+    if (parentId && !parent) {
+      fault(
+        bead.id,
+        "dangling-parent",
+        "advisory",
+        `parent ${parentId} is not on this board — a dangling reference, so nothing owns this bead ` +
+          `and no run reaches it. Re-parent it (\`bd update ${bead.id} --parent <id>\`) or check ` +
+          `whether ${parentId} was deleted without its children being moved.`,
+      );
+    }
 
     if (isTicketType(bead)) {
       // A ticket under a CONTAINER epic is unreachable: it is not a run target (it has a parent),
@@ -154,7 +173,7 @@ export function validateBoardStructure(board) {
       );
     }
 
-    const tickets = openTicketChildren.get(bead.id) ?? 0;
+    const tickets = runTicketCount(bead.id, childrenOf);
     if (tickets === 0) {
       fault(
         bead.id,
@@ -163,6 +182,15 @@ export function validateBoardStructure(board) {
         "no tickets — it runs as a single-ticket run, which is right for a genuinely atomic PR " +
           "and wrong in bulk (leaves mistyped as features). Shape its steps under it, or make it " +
           "a `task` under the feature that delivers it.",
+      );
+    } else if (tickets === 1) {
+      fault(
+        bead.id,
+        "feature-under-ticket-budget",
+        "advisory",
+        `1 ticket (budget 2–${FEATURE_TICKET_BUDGET}) — a feature with a single step usually means ` +
+          "the same work was described at two levels. Merge them (make the feature the ticket, or " +
+          "the ticket the feature), or name the second step this feature is missing.",
       );
     } else if (tickets > FEATURE_TICKET_BUDGET) {
       fault(
@@ -179,19 +207,28 @@ export function validateBoardStructure(board) {
 }
 
 /**
- * The violations a single run target owns: its own, plus every descendant's.
+ * The violations a single run target owns — its own plus every descendant's — split by severity.
  *
  * The approve route's unit of refusal. Board-wide judgement would strand an honest feature over a
  * stray chore three branches away, which is the failure mode of every lint that gates on the repo
  * instead of the change.
+ *
+ * BOTH severities come back from ONE pass on purpose. The route needs the refusal set and the
+ * advisory set for the same target, and a per-severity signature made that two full
+ * {@link validateBoardStructure} sweeps over the whole board — a quadratic walk each, since
+ * container-ness is read per bead. Returning the split removes the choice rather than documenting it.
  */
-export function structureGaps(targetId, board, severity) {
+export function structureGaps(targetId, board) {
   const subtree = descendantsOf(targetId, board);
-  return validateBoardStructure(board).filter((v) => v.severity === severity && subtree.has(v.id));
+  const owned = validateBoardStructure(board).filter((v) => subtree.has(v.id));
+  return {
+    blocking: owned.filter((v) => v.severity === "blocking"),
+    advisory: owned.filter((v) => v.severity === "advisory"),
+  };
 }
 
-/** `targetId` and every bead reachable from it through `parent-child`, cycle-safe. */
-function descendantsOf(targetId, board) {
+/** Children by parent id, in board order — the parent graph both walks below read. */
+function childIndex(board) {
   const childrenOf = new Map();
   for (const bead of board) {
     const parentId = parentOf(bead);
@@ -200,6 +237,41 @@ function descendantsOf(targetId, board) {
     if (siblings) siblings.push(bead);
     else childrenOf.set(parentId, [bead]);
   }
+  return childrenOf;
+}
+
+/**
+ * The live tickets one feature's run would dispatch — every ticket-tier DESCENDANT, not just its
+ * direct children. That is the set `ticket-view.runTickets` executes: under `feature → task →
+ * subtask` the subtask ships in the same worktree and the same PR, so counting direct children only
+ * would read a feature carrying seven tickets as carrying one and stay silent past the budget.
+ *
+ * The descent stops at anything that is not ticket-tier — a nested feature or epic owns its own run
+ * and its own PR, pipeline plumbing is never work — mirroring `boardCards.cardOf`, which attributes
+ * a bead to its NEAREST card ancestor.
+ *
+ * Descends THROUGH closed and abandoned tickets while never counting them, for the same reason
+ * `cardOf` ignores status: an open subtask under a finished task still rides on this feature's run.
+ */
+function runTicketCount(featureId, childrenOf) {
+  let count = 0;
+  const seen = new Set([featureId]);
+  const queue = [featureId];
+  while (queue.length > 0) {
+    for (const child of childrenOf.get(queue.pop()) ?? []) {
+      if (seen.has(child.id)) continue;
+      seen.add(child.id);
+      if (!isTicketType(child)) continue;
+      if (isJudged(child)) count += 1;
+      queue.push(child.id);
+    }
+  }
+  return count;
+}
+
+/** `targetId` and every bead reachable from it through `parent-child`, cycle-safe. */
+function descendantsOf(targetId, board) {
+  const childrenOf = childIndex(board);
   const seen = new Set([targetId]);
   const queue = [targetId];
   while (queue.length > 0) {

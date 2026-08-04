@@ -206,12 +206,17 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // stranded under a container epic is not (the container can't be approved at all, so no request
   // ever reaches this line carrying it). `anton board-check` judges the whole board and is what
   // `/shape` runs before it hands a tree over; this catches what survives to a run trigger.
-  const structural = willEnqueue ? structureGaps(epicId, allBeads, "blocking") : [];
-  if (structural.length > 0) {
+  //
+  // One call, both severities: the refusal below and the advisory further down are the same subtree
+  // read, and asking twice would walk the whole board twice.
+  const structural = willEnqueue
+    ? structureGaps(epicId, allBeads)
+    : { blocking: [], advisory: [] };
+  if (structural.blocking.length > 0) {
     return NextResponse.json(
       {
-        error: `${epicId} breaks the tier structure: ${formatStructureViolations(structural)}`,
-        rules: structural.map((v) => v.rule),
+        error: `${epicId} breaks the tier structure: ${formatStructureViolations(structural.blocking)}`,
+        rules: structural.blocking.map((v) => v.rule),
       },
       { status: 422 },
     );
@@ -228,9 +233,7 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   const advisory = willEnqueue
     ? [
         ...contractGaps(contractGated, "advisory").map((gap) => formatContractGaps([gap])),
-        ...structureGaps(epicId, allBeads, "advisory").map((v) =>
-          formatStructureViolations([v]),
-        ),
+        ...structural.advisory.map((v) => formatStructureViolations([v])),
       ]
     : [];
 
