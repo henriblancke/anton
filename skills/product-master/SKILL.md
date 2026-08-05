@@ -1,5 +1,6 @@
 ---
 name: product-master
+version: fca7d147ffa2
 description: >-
   Reasoning contract for anton's scheduled product-master pass: in a fresh context, read the whole
   board — tiers, ordering edges, priorities, ages, sizes, review-score history, recent run outcomes —
