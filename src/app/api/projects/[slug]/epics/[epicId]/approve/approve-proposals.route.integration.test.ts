@@ -32,14 +32,23 @@ let beads: ApproveSuiteCtx["beads"];
 
 describeBd("POST approve — gardener proposals apply their move (temp anton.db + real bd)", () => {
   /**
-   * Wait out the current second. bd stamps at ONE-SECOND resolution, so a subject written in the
-   * SAME second the proposal was filed cannot be ordered against it, and every retirement then fails
-   * closed on "carries no write stamp this proposal's filing can be ordered against" (apply.ts
-   * `writtenSinceFiling`). A real patrol files hours after the writes it judges; only a fixture is
-   * fast enough to collide, so the wait belongs here — not in a looser rule.
+   * Wait until every write already made carries a stamp STRICTLY BELOW the current second. bd stamps
+   * at one-second resolution, so a subject stamped in the same second the proposal was filed cannot
+   * be ordered against it, and every retirement then fails closed on "carries no write stamp this
+   * proposal's filing can be ordered against" (apply.ts `writtenSinceFiling`). A real patrol files
+   * hours after the writes it judges; only a fixture is fast enough to collide, so the wait belongs
+   * here — not in a looser rule.
+   *
+   * bd ROUNDS to that grid rather than truncating: a write landing at `S.6` is stamped `S+1`, a
+   * second AHEAD of the clock it landed on. So clearing the boundary is not enough — waiting to
+   * `S+1.05` leaves a subject written at `S.6` sharing the filing's second, which is exactly the tie
+   * this exists to avoid (it flaked CI ~1 run in 4). The target second is therefore taken from the
+   * highest stamp a completed write can already hold, `round(now)`, not from `now`.
    */
-  const nextSecond = (): Promise<void> =>
-    new Promise((resolve) => setTimeout(resolve, 1_050 - (Date.now() % 1_000)));
+  const nextSecond = (): Promise<void> => {
+    const settled = Math.round(Date.now() / 1_000) * 1_000; // the latest stamp prior writes can carry
+    return new Promise((resolve) => setTimeout(resolve, settled + 1_050 - Date.now()));
+  };
 
   /**
    * File a proposal the way the patrol would: the emitter's own draft, created through the seam.

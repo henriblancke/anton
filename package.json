@@ -27,6 +27,7 @@
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "test:all": "vitest run && vitest run --config vitest.integration.config.ts",
     "board:check": "node bin/anton.mjs board-check",
+    "skills:stamp": "node scripts/stamp-skills.mjs",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
     "prepare": "husky || true"

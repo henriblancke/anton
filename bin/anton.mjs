@@ -50,6 +50,7 @@ import {
   MIN_BD_VERSION,
 } from "../src/lib/beads/config.mjs";
 import { buildStructureReport, formatStructureReport } from "../src/lib/beads/tiers.mjs";
+import { listFiles, skillState } from "../src/lib/claude/skill-stamp.mjs";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { fileURLToPath } from "node:url";
@@ -209,9 +210,10 @@ function runLocal(bin, args, env = {}) {
 // The authoritative installer (anton-jvsd), dependency-free so the launcher stays pure Node and
 // runs before any build. Two install targets, chosen by the caller's `claudeRoot`: `anton setup`
 // provisions the GLOBAL ~/.claude (discoverable from every repo), while `anton init` provisions a
-// project's own <repo>/.claude/ (project scope wins when `claude` runs there). No-clobber is the
-// invariant: an existing destination — a prior install OR the user's own (possibly modified) file —
-// is never overwritten, so a re-run writes nothing. Keep REQUIRED_SKILLS / INSTALLED_SKILLS in sync
+// project's own <repo>/.claude/ (project scope wins when `claude` runs there). The invariant is that
+// no local WORK is ever overwritten: an agent prompt (yours to tune) and an edited skill are left
+// exactly as they are, while a skill copy whose version stamp proves it untouched is re-synced from
+// the bundle (see installSkillDir). Keep REQUIRED_SKILLS / INSTALLED_SKILLS in sync
 // with src/lib/claude/prompt.ts — the launcher must stay pure Node (no TS import), so the lists are
 // duplicated here and pinned equal by a cross-list assertion in bin/anton.test.ts. A skill anton's
 // runtime loads but the installer never copies is a job that dies on a missing SKILL.md.
@@ -269,58 +271,62 @@ function installFile(src, dest) {
   return "installed";
 }
 
-/** Byte-equal? The drift test — an installed asset differing from the bundled one is out of date. */
-function sameBytes(a, b) {
-  try {
-    return readFileSync(a).equals(readFileSync(b));
-  } catch {
-    return false;
+/**
+ * Remove now-empty subdirectories under `root` (never `root` itself), depth-first. Cosmetic only —
+ * the digest lists files, so an empty `templates/` left by a refresh would not affect any verdict,
+ * but it reads as debris in a directory the user browses.
+ */
+function pruneEmptyDirs(root) {
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const abs = join(root, entry.name);
+    pruneEmptyDirs(abs);
+    if (readdirSync(abs).length === 0) rmSync(abs, { recursive: true, force: true });
   }
-}
-
-/** Recursively list every file under `dir` as paths relative to `dir` (files only). */
-function walkFiles(dir, base = dir) {
-  const out = [];
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    const abs = join(dir, entry.name);
-    if (entry.isDirectory()) out.push(...walkFiles(abs, base));
-    else if (entry.isFile()) out.push(abs.slice(base.length + 1));
-  }
-  return out;
 }
 
 /**
- * Install a whole skill DIRECTORY (SKILL.md + any bundled assets, e.g. setup's templates/) no-clobber.
- * The SKILL.md is the presence sentinel: if it already exists the skill is not re-copied; otherwise
- * every file under the bundled skill dir is written.
+ * Install a whole skill DIRECTORY (SKILL.md + any bundled assets, e.g. setup's templates/).
  *
  * No-clobber is right for a file a user tunes and wrong for one anton's runtime reads as a contract:
- * a skill installed once stays frozen at that release forever, and every later `anton setup` prints
- * "already present" over it (anton-tier-invariants — a three-week-old `/shape` shaped against a
- * taxonomy the bundle had already replaced). So drift is DETECTED rather than silently kept:
+ * a skill installed once used to stay frozen at that release forever, with every later `anton setup`
+ * printing "already present" over it (anton-tier-invariants — a three-week-old `/shape` shaped
+ * against a taxonomy the bundle had already replaced). The `version:` stamp every shipped skill
+ * carries (src/lib/claude/skill-stamp.mjs) is what makes the difference actionable: it says whether
+ * the installed copy is untouched (anton's to refresh) or hand-edited (the user's to keep).
  *
  *   "installed" — nothing was there; the whole skill was written.
  *   "skipped"   — present and byte-identical to the bundle. Nothing to do.
- *   "stale"     — present but DIFFERENT. Left untouched (it may be the user's own edit), and the
- *                 caller warns with the fix. This is the outcome no-clobber used to hide.
- *   "updated"   — present, different, and `force` was set: every bundled file overwritten. Files the
+ *   "refreshed" — present, different, and PRISTINE (stamp matches its own content) — some other
+ *                 release's copy with no local work in it. Re-synced from the bundle, and reported.
+ *   "stale"     — present, different, and either hand-edited or pre-stamp. Left untouched and the
+ *                 caller warns with the fix; only `force` overwrites it.
+ *   "updated"   — as "stale", but `force` was set: every drifted bundled file overwritten. Files the
  *                 user added that the bundle doesn't ship are left alone.
+ *
+ * A refresh also DELETES files the bundle no longer ships, which `force` deliberately does not: only
+ * on the refresh path does the pristine stamp prove those leftovers are an older bundle's rather
+ * than the user's. Leaving them would keep the refreshed copy's own digest off the stamp it just
+ * received, so it would read as hand-edited from then on and never auto-refresh again.
  */
 function installSkillDir(srcDir, destDir, { force = false } = {}) {
-  const bundled = walkFiles(srcDir);
-  if (!existsSync(join(destDir, "SKILL.md"))) {
-    for (const rel of bundled) installFile(join(srcDir, rel), join(destDir, rel));
+  const { state, drifted, extra } = skillState(srcDir, destDir);
+  if (state === "missing") {
+    for (const rel of drifted) installFile(join(srcDir, rel), join(destDir, rel));
     return "installed";
   }
-  const drifted = bundled.filter((rel) => !sameBytes(join(srcDir, rel), join(destDir, rel)));
-  if (drifted.length === 0) return "skipped";
-  if (!force) return "stale";
+  if (state === "current") return "skipped";
+  if (state !== "outdated" && !force) return "stale";
   for (const rel of drifted) {
     const dest = join(destDir, rel);
     mkdirSync(dirname(dest), { recursive: true });
     copyFileSync(join(srcDir, rel), dest);
   }
-  return "updated";
+  if (state === "outdated") {
+    for (const rel of extra) rmSync(join(destDir, rel), { force: true });
+    pruneEmptyDirs(destDir);
+  }
+  return state === "outdated" ? "refreshed" : "updated";
 }
 
 /** Parse `--agents <csv|all>` / `--no-agents` from the setup args, or null if unspecified. */
@@ -390,8 +396,10 @@ async function resolveAgentSelection(args, agentsSrc = AGENTS_SRC) {
 
 /**
  * Provision anton's required skills (always) + the selected specialist agents into the user's
- * global ~/.claude, never overwriting existing files. Returns 0 (best-effort — a missing bundled
- * asset warns but doesn't fail setup, since anton also loads its own skills from the package dir).
+ * global ~/.claude (or, from `anton init`, a repo's own .claude/). Agents and any file carrying
+ * local work are never overwritten; a skill copy left behind by another release IS refreshed, since
+ * its version stamp proves nothing of the user's is in it (installSkillDir). Best-effort — a missing
+ * bundled asset warns but doesn't fail setup, since anton also loads its skills from the package dir.
  */
 async function provisionAgentsSkills(args, opts = {}) {
   const claudeRoot = opts.claudeRoot ?? CLAUDE_ROOT;
@@ -406,7 +414,7 @@ async function provisionAgentsSkills(args, opts = {}) {
   console.log(
     c.bold("\nInstalling agents & skills into ") +
       c.bold(claudeRoot) +
-      c.dim(force ? " (--force-skills: skills re-synced from bundle):" : " (no-clobber):"),
+      c.dim(force ? " (--force-skills: skills re-synced from bundle):" : " (edited files kept):"),
   );
   const selected = await resolveAgentSelection(args, agentsSrc);
 
@@ -434,6 +442,7 @@ async function provisionAgentsSkills(args, opts = {}) {
   let skipped = 0;
   let updated = 0;
   const stale = [];
+  const refreshed = [];
   for (const job of jobs) {
     if (!existsSync(job.sentinel)) {
       console.log(`  ${c.yellow("!")} ${job.kind} ${c.bold(job.name)} ${c.yellow("missing from package")} ${c.dim(job.src)}`);
@@ -446,11 +455,13 @@ async function provisionAgentsSkills(args, opts = {}) {
       job.kind === "skill" ? installSkillDir(job.src, job.dest, { force }) : installFile(job.src, job.dest);
     if (outcome === "installed") installed++;
     else if (outcome === "updated") updated++;
+    else if (outcome === "refreshed") refreshed.push(job.name);
     else if (outcome === "stale") stale.push(job.name);
     else skipped++;
     const marks = {
       installed: [c.green("✓"), c.green("installed")],
       updated: [c.green("↑"), c.green("updated from bundle")],
+      refreshed: [c.green("↻"), c.green("refreshed — was another release's copy")],
       stale: [c.yellow("!"), c.yellow("differs from bundle — left as-is")],
       skipped: ["·", c.dim("already present")],
     };
@@ -460,21 +471,30 @@ async function provisionAgentsSkills(args, opts = {}) {
   }
   const counts = [
     `${installed} installed`,
+    ...(refreshed.length > 0 ? [c.green(`${refreshed.length} refreshed`)] : []),
     ...(updated > 0 ? [`${updated} updated`] : []),
     `${skipped} already current`,
     ...(stale.length > 0 ? [c.yellow(`${stale.length} stale`)] : []),
   ].join(", ");
   console.log(c.dim(`  → ${counts}. Your own edits are never overwritten.`));
+  if (refreshed.length > 0) {
+    console.log(
+      c.green(`  ↻ ${refreshed.join(", ")} re-synced from the bundle`) +
+        c.dim(" — those copies were untouched (their version stamp\n") +
+        c.dim("    matched their content), so they carried no edits to lose."),
+    );
+  }
   if (stale.length > 0) {
     console.log(
       c.yellow(`  ! ${stale.join(", ")} differ from the bundled version`) +
-        c.dim(" — anton's runtime reads these as a contract, so a stale copy shapes work against\n") +
-        c.dim("    rules this release has replaced. Re-run with ") +
+        c.dim(" — and carry edits (or predate version stamps), so\n") +
+        c.dim("    anton won't touch them. A stale copy shapes work against rules this release has\n") +
+        c.dim("    replaced. Re-run with ") +
         c.bold("--force-skills") +
         c.dim(" to overwrite (your edits are lost)."),
     );
   }
-  return { installed, skipped, updated, stale, agents: selected };
+  return { installed, skipped, updated, stale, refreshed, agents: selected };
 }
 
 // The Beads Dolt sync provisioning (anton-pns) lives in ../src/lib/beads/config.mjs as the single
@@ -971,7 +991,10 @@ function cmdVersion() {
  * the global ~/.claude (every repo resolves it) and this repo's own .claude/ (which wins locally).
  * A skill is a runtime contract — a copy frozen at an old release keeps shaping work against rules
  * the bundle has replaced, and until now nothing ever said so out loud (anton-tier-invariants).
- * Returns `[{ scope, name }]`, empty when everything is current or nothing is installed.
+ * Returns `[{ scope, name, state, installed, bundled }]` — `state` is the skill-stamp verdict
+ * ("outdated" | "modified" | "unstamped"), which is what decides whether a refresh is anton's call
+ * or the user's. Empty when everything is current or nothing is installed. Read-only by
+ * construction: doctor reports drift, it never writes a skill file.
  *
  * Both roots are injectable so this can be exercised against fixture directories — matching
  * `provisionAgentsSkills`, which already takes `opts.claudeRoot`. `cmdDoctor` passes neither and
@@ -990,9 +1013,8 @@ function staleSkills(skillsSrc = SKILLS_SRC, { claudeRoot = CLAUDE_ROOT, project
       const src = join(skillsSrc, name);
       const dest = join(root, "skills", name);
       if (!existsSync(join(src, "SKILL.md")) || !existsSync(join(dest, "SKILL.md"))) continue;
-      if (walkFiles(src).some((rel) => !sameBytes(join(src, rel), join(dest, rel)))) {
-        out.push({ scope, name });
-      }
+      const { state, installed, bundled } = skillState(src, dest);
+      if (state !== "current") out.push({ scope, name, state, installed, bundled });
     }
   }
   return out;
@@ -1004,15 +1026,29 @@ function cmdDoctor() {
   if (stale.length === 0) {
     console.log(`  ${c.green("✓")} ${"skills".padEnd(9)} ${c.green("installed copies match the bundle")}`);
   } else {
-    for (const { scope, name } of stale) {
+    // A user-level ~/.claude copy is the dangerous one: every plain `claude` session in every repo
+    // resolves it, so a pre-tier copy there silently reintroduces retired conventions (anton-gsyh).
+    // Doctor names each drift and its fix — and mutates nothing, at either scope.
+    for (const { scope, name, state, installed, bundled } of stale) {
+      const why = {
+        outdated: `is another release's copy (${installed} → ${bundled}) — untouched, so a refresh loses nothing`,
+        modified: `differs from the bundled version and carries local edits`,
+        unstamped: `differs from the bundled version and predates version stamps`,
+      }[state];
+      console.log(`  ${c.yellow("!")} ${"skills".padEnd(9)} ${c.yellow(`${name} (${scope}) ${why}`)}`);
+    }
+    const scopeFix = (scope) => (scope === "global" ? "anton setup" : "anton init");
+    if (stale.some((s) => s.state === "outdated")) {
+      const cmds = [...new Set(stale.filter((s) => s.state === "outdated").map((s) => scopeFix(s.scope)))];
+      console.log(c.dim(`    Refresh untouched copies by re-running \`${cmds.join("` / `")}\` — no flag needed.`));
+    }
+    if (stale.some((s) => s.state !== "outdated")) {
       console.log(
-        `  ${c.yellow("!")} ${"skills".padEnd(9)} ${c.yellow(`${name} (${scope}) differs from the bundled version`)}`,
+        c.dim("    anton won't overwrite an edited (or pre-stamp) copy. Adopt this release's with\n") +
+          c.dim("    `anton setup --force-skills` (global) or `anton init --force-skills` (this repo);\n") +
+          c.dim("    skip it if the difference is your own deliberate edit — forcing discards it."),
       );
     }
-    console.log(
-      c.dim("    Re-sync with `anton setup --force-skills` (global) or `anton init --force-skills`\n") +
-        c.dim("    (this repo). Skip if the difference is your own deliberate edit."),
-    );
   }
   // Resolve the DB the same way the server does: in a bundle it lives in the persistent state dir
   // (where `anton setup` creates it), NOT under the runtime dir — so doctor must check there too.
@@ -1366,7 +1402,7 @@ function scaffoldProductDir(dir) {
   const destRoot = join(dir, ".product");
   const created = [];
   const skipped = [];
-  for (const rel of walkFiles(PRODUCT_TEMPLATES_SRC)) {
+  for (const rel of listFiles(PRODUCT_TEMPLATES_SRC)) {
     const status = installFile(join(PRODUCT_TEMPLATES_SRC, rel), join(destRoot, rel));
     (status === "installed" ? created : skipped).push(rel);
   }
@@ -1416,9 +1452,9 @@ async function cmdInit(args = []) {
 
   // Install anton's required skills (+ any --agents selection) into the repo's OWN .claude/ so
   // `claude` resolves them at project scope when it runs here — not just the global ~/.claude that
-  // `anton setup` provisions (anton-jvsd). Best-effort + no-clobber: a missing bundled asset or a
-  // pre-existing (user-modified) file is left untouched, and a skills-install hiccup never fails an
-  // otherwise-good beads init.
+  // `anton setup` provisions (anton-jvsd). Best-effort: a missing bundled asset or a user-modified
+  // file is left untouched (an untouched older copy is refreshed, anton-gsyh), and a skills-install
+  // hiccup never fails an otherwise-good beads init.
   try {
     await provisionAgentsSkills(args, { claudeRoot: join(dir, ".claude") });
   } catch (e) {
@@ -1488,7 +1524,7 @@ const USAGE = `${c.bold("anton")} — local autonomous-coding orchestrator
 
 ${c.bold("Usage:")} anton <command>
 
-  ${c.bold("setup")}    check prereqs, migrate DB, rebuild node-pty, install agents & skills, wire beads Dolt sync  ${c.dim("[--agents <a,b,c>|all] [--force-skills]")}
+  ${c.bold("setup")}    check prereqs, migrate DB, rebuild node-pty, install/refresh agents & skills, wire beads Dolt sync  ${c.dim("[--agents <a,b,c>|all] [--force-skills]")}
   ${c.bold("init")}     configure beads in a target repo + register it with anton  ${c.dim("[path] [--prefix <p>] [--force-skills]")}
   ${c.bold("doctor")}   check prereqs + anton.db + stale skills (non-destructive)
   ${c.bold("board-check")} report beads that break epic → feature → ticket  ${c.dim("[path...] (default: cwd)")}

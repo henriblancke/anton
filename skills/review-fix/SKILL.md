@@ -1,5 +1,6 @@
 ---
 name: review-fix
+version: 83916e76a43f
 description: >-
   Reasoning contract for anton's review-fix job: given an open PR's requested changes and failing
   CI, triage each finding, resist low-value nits, and resolve the valid ones with real code changes
