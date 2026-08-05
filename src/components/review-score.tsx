@@ -68,6 +68,11 @@ export interface SparklinePoint {
  * judgements, not a continuous signal — and because a missing score has to be visible AS missing.
  * The whole series is announced as one image label, so a screen reader reads the trend in order
  * rather than hearing an unlabelled bar per column.
+ *
+ * Each column keeps a minimum width, so a caller's width is a FLOOR, not a cap: `min-w-min` lets the
+ * series grow past it rather than spill its bars over the edge of whatever contains it. Without it,
+ * an eight-point window in the toolbar pill's `w-12` needed 76px of columns and gaps, and drew the
+ * overflow straight through the pill's own border.
  */
 export function ScoreSparkline({
   points,
@@ -79,7 +84,7 @@ export function ScoreSparkline({
   if (points.length === 0) return null;
   return (
     <div
-      className={cn("flex h-9 items-end gap-1", className)}
+      className={cn("flex h-9 min-w-min items-end gap-1", className)}
       role="img"
       aria-label={points
         .map((p) => `${p.label}: ${p.score === undefined ? "no score" : `${p.score} out of 10`}`)
