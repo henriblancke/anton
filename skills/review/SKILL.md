@@ -1,5 +1,6 @@
 ---
 name: review
+version: 16ad20660756
 description: >-
   Reasoning contract for anton's pre-PR self-review gate: in a fresh context, review the diff the
   run's implementing agent just produced — correctness, code quality, project principle adherence,

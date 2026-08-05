@@ -8,6 +8,7 @@ import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { INSTALLED_SKILLS, REQUIRED_SKILLS, loadSkill, skillPath } from "./prompt";
 import { stripFrontmatter } from "./agent-prompt";
+import { readSkillStamp, skillDigest } from "./skill-stamp.mjs";
 
 /** Pull `name:` and `description:` out of a SKILL.md frontmatter block. */
 function frontmatter(raw: string): { name?: string; description?: string } {
@@ -56,6 +57,27 @@ describe("required skill assets", () => {
       });
     });
   }
+
+  // The stamp is the anti-drift mechanism itself (anton-gsyh): an installed copy is refreshable
+  // precisely when its declared `version:` still matches its own content. A skill edited without
+  // restamping would ship a stamp that describes an older body — every installed copy of it would
+  // then look hand-edited and never auto-refresh. This is the forcing function that prevents it.
+  describe("version stamps", () => {
+    for (const name of INSTALLED_SKILLS) {
+      it(`skills/${name} is stamped with its own content digest`, () => {
+        const dir = dirname(skillPath(name));
+        expect(
+          readSkillStamp(dir),
+          `skills/${name} changed without restamping — run \`bun run skills:stamp\``,
+        ).toBe(skillDigest(dir));
+      });
+    }
+
+    it("gives every skill a distinct stamp", () => {
+      const stamps = INSTALLED_SKILLS.map((n) => readSkillStamp(dirname(skillPath(n))));
+      expect(new Set(stamps).size).toBe(INSTALLED_SKILLS.length);
+    });
+  });
 
   it("shape and scan-triage point at the bd skill for conventions", () => {
     for (const name of ["shape", "scan-triage"] as const) {

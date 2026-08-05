@@ -8,9 +8,9 @@ import { spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { delimiter, dirname, join, resolve } from "node:path";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { createRequire } from "node:module";
-import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import {
   agentsFromArgs,
   applyMigrations,
@@ -47,9 +47,23 @@ import {
   INSTALLED_SKILLS as RUNTIME_INSTALLED_SKILLS,
   REQUIRED_SKILLS as RUNTIME_REQUIRED_SKILLS,
 } from "../src/lib/claude/prompt";
+import { skillDigest } from "../src/lib/claude/skill-stamp.mjs";
 
 const CLI = join(dirname(fileURLToPath(import.meta.url)), "anton.mjs");
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+
+/**
+ * Overwrite an installed skill copy so it looks like an UNTOUCHED copy of some other release:
+ * different content, carrying a `version:` stamp that matches that content (anton-gsyh). This is the
+ * state anton is allowed to refresh on its own — as opposed to a hand-edited copy, whose stamp
+ * describes a body it no longer has. Two writes because the stamp digests the file minus its own
+ * stamp line, so the placeholder pass computes the value the final pass declares.
+ */
+function seedOtherRelease(skillDir: string, body: string) {
+  const render = (stamp: string) => `---\nname: ${basename(skillDir)}\nversion: ${stamp}\n---\n\n${body}`;
+  writeFileSync(join(skillDir, "SKILL.md"), render("placeholder"));
+  writeFileSync(join(skillDir, "SKILL.md"), render(skillDigest(skillDir)));
+}
 
 async function exists(p: string): Promise<boolean> {
   try {
@@ -529,8 +543,46 @@ describe("provisionAgentsSkills (into a temp ~/.claude)", () => {
 
     expect(r.stale).toEqual(["shape"]);
     expect(r.updated).toBe(0);
+    expect(r.refreshed).toEqual([]);
     expect(r.skipped).toBe(INSTALLED_SKILLS.length - 1);
     expect(await readFile(skillPath("shape"), "utf8")).toBe("# an old release's copy\n");
+  });
+
+  // The regression the stamp exists for (anton-gsyh): a copy left behind by an older release keeps
+  // producing that release's conventions — a pre-tier `~/.claude/skills/bd` shaped epics-as-work-
+  // buckets for weeks. Because such a copy is UNTOUCHED (its stamp matches its own content), a plain
+  // re-run may re-sync it: no flag, no lost edits, and it says which skills it refreshed.
+  it("refreshes an untouched copy of another release with no flag, and reports it", async () => {
+    claudeRoot = await mkdtemp(join(tmpdir(), "anton-claude-"));
+    await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
+    seedOtherRelease(join(claudeRoot, "skills", "bd"), "# the pre-tier conventions\n");
+
+    const r = await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
+
+    expect(r.refreshed).toEqual(["bd"]);
+    expect(r.stale).toEqual([]);
+    expect(r.updated).toBe(0);
+    const bundled = await readFile(join(REPO_ROOT, "skills", "bd", "SKILL.md"), "utf8");
+    expect(await readFile(skillPath("bd"), "utf8")).toBe(bundled);
+
+    // …and the re-run after that has nothing left to do.
+    expect((await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT })).refreshed).toEqual([]);
+  });
+
+  it("never auto-refreshes a copy carrying local edits", async () => {
+    claudeRoot = await mkdtemp(join(tmpdir(), "anton-claude-"));
+    await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
+    // A stamped copy the user then edited: the stamp no longer describes the body, which is exactly
+    // how anton tells "my file, out of date" from "their file, customized".
+    seedOtherRelease(join(claudeRoot, "skills", "bd"), "# mine\n");
+    const edited = (await readFile(skillPath("bd"), "utf8")) + "\nmy own note\n";
+    writeFileSync(skillPath("bd"), edited);
+
+    const r = await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
+
+    expect(r.refreshed).toEqual([]);
+    expect(r.stale).toEqual(["bd"]);
+    expect(await readFile(skillPath("bd"), "utf8")).toBe(edited);
   });
 
   it("--force-skills re-syncs a drifted skill from the bundle", async () => {
@@ -587,6 +639,14 @@ describe("installSkillDir", () => {
     writeFileSync(join(dest, "SKILL.md"), "v1\n");
     expect(installSkillDir(src, dest)).toBe("stale");
     expect(installSkillDir(src, dest, { force: true })).toBe("updated");
+    expect(installSkillDir(src, dest)).toBe("skipped");
+  });
+
+  it("refreshes — without force — a copy whose stamp still matches its own content", () => {
+    installSkillDir(src, dest);
+    seedOtherRelease(dest, "an older release\n");
+    expect(installSkillDir(src, dest)).toBe("refreshed");
+    expect(readFileSync(join(dest, "SKILL.md"), "utf8")).toBe("v2\n");
     expect(installSkillDir(src, dest)).toBe("skipped");
   });
 
@@ -1352,24 +1412,113 @@ describe("staleSkills", () => {
   });
 
   /** A skill source tree with one skill, plus an install root holding a copy of it. */
-  async function fixture(body: string) {
+  async function fixture(body: string | ((dir: string) => void)) {
     const src = await tmp("anton-skillsrc-");
     const root = await tmp("anton-skillroot-");
     mkdirSync(join(src, "bd"), { recursive: true });
-    writeFileSync(join(src, "bd", "SKILL.md"), "bundled\n");
-    mkdirSync(join(root, ".claude", "skills", "bd"), { recursive: true });
-    writeFileSync(join(root, ".claude", "skills", "bd", "SKILL.md"), body);
+    writeFileSync(join(src, "bd", "SKILL.md"), "---\nname: bd\nversion: bundled-stamp\n---\n\nbundled\n");
+    const installed = join(root, ".claude", "skills", "bd");
+    mkdirSync(installed, { recursive: true });
+    if (typeof body === "string") writeFileSync(join(installed, "SKILL.md"), body);
+    else body(installed);
     return { src, root };
   }
 
+  const check = async (src: string, root: string) =>
+    staleSkills(src, { claudeRoot: await tmp("anton-empty-"), projectRoot: root });
+
   it("reports a project-scope skill that differs from the bundle", async () => {
     const { src, root } = await fixture("frozen at an old release\n");
-    const stale = staleSkills(src, { claudeRoot: await tmp("anton-empty-"), projectRoot: root });
-    expect(stale).toEqual([{ scope: "project", name: "bd" }]);
+    expect(await check(src, root)).toEqual([
+      { scope: "project", name: "bd", state: "unstamped", installed: null, bundled: "bundled-stamp" },
+    ]);
+  });
+
+  // The state is the whole point: it decides whether the fix anton prints is "re-run setup" or
+  // "your call — --force-skills". An untouched copy of another release is anton's to refresh…
+  it("calls an untouched copy of another release outdated", async () => {
+    const { src, root } = await fixture((dir) => seedOtherRelease(dir, "an older release\n"));
+    const [drift] = await check(src, root);
+    expect(drift.state).toBe("outdated");
+    expect(drift.bundled).toBe("bundled-stamp");
+  });
+
+  // …while a stamped copy whose content no longer matches its stamp was edited by hand.
+  it("calls a hand-edited copy modified", async () => {
+    const { src, root } = await fixture((dir) => {
+      seedOtherRelease(dir, "an older release\n");
+      writeFileSync(join(dir, "SKILL.md"), readFileSync(join(dir, "SKILL.md"), "utf8") + "my note\n");
+    });
+    expect((await check(src, root))[0].state).toBe("modified");
   });
 
   it("stays silent when the installed copy matches", async () => {
-    const { src, root } = await fixture("bundled\n");
-    expect(staleSkills(src, { claudeRoot: await tmp("anton-empty-"), projectRoot: root })).toEqual([]);
+    const { src, root } = await fixture("---\nname: bd\nversion: bundled-stamp\n---\n\nbundled\n");
+    expect(await check(src, root)).toEqual([]);
+  });
+});
+
+// End-to-end via the real command, against the REAL bundled skills: doctor is the only thing that
+// sees the user-level ~/.claude shadow copy every plain `claude` session resolves (anton-gsyh), and
+// it must report it without ever writing to it.
+describe("anton doctor — skill drift", () => {
+  const cleanups: string[] = [];
+
+  async function tmp(prefix: string): Promise<string> {
+    const d = await mkdtemp(join(tmpdir(), prefix));
+    cleanups.push(d);
+    return d;
+  }
+
+  afterEach(async () => {
+    for (const d of cleanups.splice(0)) await rm(d, { recursive: true, force: true });
+  });
+
+  /** Run `anton doctor` with HOME and cwd pointed at throwaway roots so both scopes are ours. */
+  function runDoctor(home: string, cwd: string) {
+    return spawnSync(process.execPath, [CLI, "doctor"], {
+      encoding: "utf8",
+      cwd,
+      env: { ...process.env, HOME: home, ANTON_DB: join(home, "anton.db") },
+    });
+  }
+
+  /** Seed `<root>/.claude/skills/bd/SKILL.md` and return its path. */
+  function seedCopy(root: string, write: (dir: string) => void): string {
+    const dir = join(root, ".claude", "skills", "bd");
+    mkdirSync(dir, { recursive: true });
+    write(dir);
+    return join(dir, "SKILL.md");
+  }
+
+  it("warns on a user-level copy that predates stamps, and does not touch it", async () => {
+    const home = await tmp("anton-home-");
+    const path = seedCopy(home, (dir) => writeFileSync(join(dir, "SKILL.md"), "# the pre-tier copy\n"));
+
+    const r = runDoctor(home, await tmp("anton-cwd-"));
+
+    expect(r.stdout).toContain("bd (global)");
+    expect(r.stdout).toContain("predates version stamps");
+    expect(r.stdout).toContain("--force-skills");
+    expect(readFileSync(path, "utf8")).toBe("# the pre-tier copy\n"); // read-only, always
+  });
+
+  it("names an untouched copy of another release as refreshable by a plain re-run", async () => {
+    const home = await tmp("anton-home-");
+    const cwd = await tmp("anton-cwd-");
+    const path = seedCopy(cwd, (dir) => seedOtherRelease(dir, "# an older release\n"));
+    const before = readFileSync(path, "utf8");
+
+    const r = runDoctor(home, cwd);
+
+    expect(r.stdout).toContain("bd (project)");
+    expect(r.stdout).toContain("another release's copy");
+    expect(r.stdout).toContain("anton init");
+    expect(readFileSync(path, "utf8")).toBe(before);
+  });
+
+  it("says nothing is drifted when no copy is installed at either scope", async () => {
+    const r = runDoctor(await tmp("anton-home-"), await tmp("anton-cwd-"));
+    expect(r.stdout).toContain("installed copies match the bundle");
   });
 });
