@@ -23,9 +23,6 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { basename, join } from "node:path";
 
-/** Frontmatter key carrying the stamp. `version:` is standard skill frontmatter, so tools ignore it. */
-export const STAMP_KEY = "version";
-
 /** Digest length. 12 hex chars (48 bits) — collision-proof for a handful of files, readable in a warning. */
 const STAMP_LENGTH = 12;
 
@@ -60,7 +57,10 @@ function frontmatterBounds(md) {
   return end < 0 ? null : { start: 4, end: end + 1 };
 }
 
-/** The declared `version:` stamp of a SKILL.md's text, or null when unstamped. */
+/**
+ * The declared stamp of a SKILL.md's text, or null when unstamped. The key is `version:` because
+ * that is standard skill frontmatter — every other tool already ignores it.
+ */
 export function readStamp(md) {
   const bounds = frontmatterBounds(md);
   if (!bounds) return null;
@@ -108,9 +108,9 @@ export function skillDigest(dir) {
 
 /**
  * Classify an installed skill copy against the bundled source. Returns
- * `{ state, bundled, installed, drifted }` where `drifted` lists the bundled files (relative paths)
- * whose bytes differ — the exact set a refresh must rewrite, and the whole bundle when nothing is
- * installed yet.
+ * `{ state, bundled, installed, drifted, extra }` where `drifted` lists the bundled files (relative
+ * paths) whose bytes differ — the exact set a refresh must rewrite, and the whole bundle when
+ * nothing is installed yet — and `extra` lists installed files the bundle no longer ships.
  *
  *   "missing"   — nothing installed there yet.
  *   "current"   — every bundled file is byte-identical. Nothing to do.
@@ -122,16 +122,25 @@ export function skillDigest(dir) {
  *
  * Drift is judged on bytes rather than on stamps alone, so a bundled file the user DELETED still
  * counts as drift (a stamp comparison would call that copy current).
+ *
+ * `extra` exists because the digest walks the DESTINATION: a file an older bundle shipped and this
+ * one dropped would otherwise survive a refresh and keep the refreshed copy's digest off its own
+ * freshly-written stamp forever — reported to the user as "carries local edits" when it carries
+ * none. Only a refresh may act on it, and safely: a "pristine" verdict means the whole directory
+ * hashes to the stamp some release wrote, which no user-added file could survive, so on that path
+ * every extra file is provably a previous bundle's leftover rather than the user's.
  */
 export function skillState(srcDir, destDir) {
   const bundled = readSkillStamp(srcDir);
   if (!existsSync(join(destDir, "SKILL.md"))) {
-    return { state: "missing", bundled, installed: null, drifted: listFiles(srcDir) };
+    return { state: "missing", bundled, installed: null, drifted: listFiles(srcDir), extra: [] };
   }
   const installed = readSkillStamp(destDir);
-  const drifted = listFiles(srcDir).filter((rel) => !sameBytes(join(srcDir, rel), join(destDir, rel)));
-  if (drifted.length === 0) return { state: "current", bundled, installed, drifted };
-  if (installed === null) return { state: "unstamped", bundled, installed, drifted };
+  const shipped = new Set(listFiles(srcDir));
+  const drifted = [...shipped].filter((rel) => !sameBytes(join(srcDir, rel), join(destDir, rel)));
+  const extra = listFiles(destDir).filter((rel) => !shipped.has(rel) && !IGNORED_FILES.has(basename(rel)));
+  if (drifted.length === 0 && extra.length === 0) return { state: "current", bundled, installed, drifted, extra };
+  if (installed === null) return { state: "unstamped", bundled, installed, drifted, extra };
   const pristine = installed === skillDigest(destDir);
-  return { state: pristine ? "outdated" : "modified", bundled, installed, drifted };
+  return { state: pristine ? "outdated" : "modified", bundled, installed, drifted, extra };
 }

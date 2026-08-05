@@ -47,7 +47,7 @@ import {
   INSTALLED_SKILLS as RUNTIME_INSTALLED_SKILLS,
   REQUIRED_SKILLS as RUNTIME_REQUIRED_SKILLS,
 } from "../src/lib/claude/prompt";
-import { skillDigest } from "../src/lib/claude/skill-stamp.mjs";
+import { readSkillStamp, skillDigest } from "../src/lib/claude/skill-stamp.mjs";
 
 const CLI = join(dirname(fileURLToPath(import.meta.url)), "anton.mjs");
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -597,6 +597,46 @@ describe("provisionAgentsSkills (into a temp ~/.claude)", () => {
 
     // …and the re-run after that has nothing left to do.
     expect((await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT })).refreshed).toEqual([]);
+  });
+
+  // A refresh has to leave the copy hashing to the stamp it just wrote. When an older bundle shipped
+  // an asset this one dropped, rewriting only what the bundle still ships leaves that file behind and
+  // the digest permanently off its own stamp — so the copy reads as hand-edited from then on, doctor
+  // tells the user it "carries local edits" when it carries none, and it never auto-refreshes again.
+  it("deletes assets the bundle no longer ships, so a refreshed copy matches its own stamp", async () => {
+    claudeRoot = await mkdtemp(join(tmpdir(), "anton-claude-"));
+    await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
+    const dest = join(claudeRoot, "skills", "bd");
+    // An asset the older release shipped and this bundle does not. Seeding AFTER it means the stamp
+    // covers it — this is a pristine copy of that release, not a user who added a file.
+    mkdirSync(join(dest, "templates"), { recursive: true });
+    writeFileSync(join(dest, "templates", "dropped.md"), "# shipped by v1, gone in v2\n");
+    seedOtherRelease(dest, "# the pre-tier conventions\n");
+
+    const r = await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
+
+    expect(r.refreshed).toEqual(["bd"]);
+    expect(await exists(join(dest, "templates", "dropped.md"))).toBe(false);
+    expect(await exists(join(dest, "templates"))).toBe(false); // …and no empty debris directory.
+    // The point of the prune: the copy's content hashes to the stamp it now declares, so it stays
+    // refreshable instead of being misread as edited forever.
+    expect(readSkillStamp(dest)).toBe(skillDigest(dest));
+    expect((await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT })).stale).toEqual([]);
+  });
+
+  // The mirror case: an extra file anton cannot prove it wrote. A user who ADDS a file breaks the
+  // digest, so the copy classifies modified — left alone, never pruned.
+  it("leaves a user-added file alone and does not call the copy refreshable", async () => {
+    claudeRoot = await mkdtemp(join(tmpdir(), "anton-claude-"));
+    await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
+    const dest = join(claudeRoot, "skills", "bd");
+    writeFileSync(join(dest, "my-notes.md"), "# mine\n");
+
+    const r = await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
+
+    expect(r.refreshed).toEqual([]);
+    expect(r.stale).toEqual(["bd"]);
+    expect(await readFile(join(dest, "my-notes.md"), "utf8")).toBe("# mine\n");
   });
 
   it("never auto-refreshes a copy carrying local edits", async () => {

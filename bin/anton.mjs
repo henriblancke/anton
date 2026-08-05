@@ -272,6 +272,20 @@ function installFile(src, dest) {
 }
 
 /**
+ * Remove now-empty subdirectories under `root` (never `root` itself), depth-first. Cosmetic only —
+ * the digest lists files, so an empty `templates/` left by a refresh would not affect any verdict,
+ * but it reads as debris in a directory the user browses.
+ */
+function pruneEmptyDirs(root) {
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const abs = join(root, entry.name);
+    pruneEmptyDirs(abs);
+    if (readdirSync(abs).length === 0) rmSync(abs, { recursive: true, force: true });
+  }
+}
+
+/**
  * Install a whole skill DIRECTORY (SKILL.md + any bundled assets, e.g. setup's templates/).
  *
  * No-clobber is right for a file a user tunes and wrong for one anton's runtime reads as a contract:
@@ -289,9 +303,14 @@ function installFile(src, dest) {
  *                 caller warns with the fix; only `force` overwrites it.
  *   "updated"   — as "stale", but `force` was set: every drifted bundled file overwritten. Files the
  *                 user added that the bundle doesn't ship are left alone.
+ *
+ * A refresh also DELETES files the bundle no longer ships, which `force` deliberately does not: only
+ * on the refresh path does the pristine stamp prove those leftovers are an older bundle's rather
+ * than the user's. Leaving them would keep the refreshed copy's own digest off the stamp it just
+ * received, so it would read as hand-edited from then on and never auto-refresh again.
  */
 function installSkillDir(srcDir, destDir, { force = false } = {}) {
-  const { state, drifted } = skillState(srcDir, destDir);
+  const { state, drifted, extra } = skillState(srcDir, destDir);
   if (state === "missing") {
     for (const rel of drifted) installFile(join(srcDir, rel), join(destDir, rel));
     return "installed";
@@ -302,6 +321,10 @@ function installSkillDir(srcDir, destDir, { force = false } = {}) {
     const dest = join(destDir, rel);
     mkdirSync(dirname(dest), { recursive: true });
     copyFileSync(join(srcDir, rel), dest);
+  }
+  if (state === "outdated") {
+    for (const rel of extra) rmSync(join(destDir, rel), { force: true });
+    pruneEmptyDirs(destDir);
   }
   return state === "outdated" ? "refreshed" : "updated";
 }
