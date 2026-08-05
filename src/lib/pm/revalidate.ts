@@ -7,8 +7,8 @@
  * `blocks` edge in front of it. The approval outlives the facts it was given for, and the queue
  * quietly holds work anton would now refuse to start.
  *
- * So the pass re-asks the gate's own three questions ({@link makeApprovalGate}) of every
- * approved-but-unclaimed run target, on the product-master cadence. What it finds becomes an ordinary
+ * So the pass re-asks the gate's own four questions ({@link makeApprovalGate}) of every
+ * approved-but-unclaimed bead, on the product-master cadence. What it finds becomes an ordinary
  * `pm:` proposal: evidence naming each violation, fingerprinted, approved or declined like every
  * other. It NEVER unapproves anything itself — withdrawing a founder's decision without asking is the
  * one move this feature must not make, and the whole design is that the ask goes back to them.
@@ -34,20 +34,25 @@ import { isProposalBead, makeDetection, type GardenerDetection } from "../garden
  * already reading the spec, so the gaps are its problem to hit and report; and withdrawing the
  * `approved` label under a live run kills it outright (execute-epic re-checks approval after its
  * claim settles).
+ *
+ * Deliberately NOT narrowed to run targets, though the gate's other three questions are only ever
+ * interesting for one. Ceasing to be a run target — a legacy epic gaining a feature child, a task
+ * re-parented under an epic — is itself the severest rot there is, and a filter here would be exactly
+ * what hid it: the bead keeps its `approved` label, the claimable set skips it, and no worker ever
+ * comes. The gate answers that as its own `runnable` gap.
  */
-const isQueuedApproval = (bead: Bead, board: Bead[], nowMs: number): boolean =>
+const isQueuedApproval = (bead: Bead, nowMs: number): boolean =>
   beads.isApproved(bead) &&
   isOpenWork(bead) &&
   !isProposalBead(bead) &&
   !isClaimed(bead) &&
-  !isInFlight(bead, nowMs) &&
-  beads.isRunTarget(bead, board);
+  !isInFlight(bead, nowMs);
 
 /**
- * Every approved run target that no longer clears the gate it was approved through, as proposals.
+ * Every approved bead that no longer clears the gate it was approved through, as proposals.
  *
  * Pure over the board snapshot — one gate build for the whole pass, then one question per approved
- * target. A board whose approvals all still hold yields NOTHING, which is the expected outcome and
+ * bead. A board whose approvals all still hold yields NOTHING, which is the expected outcome and
  * never a failure to look.
  *
  * The fingerprint is keyed to the BEAD, not to the violations, so a target that degrades a second way
@@ -60,7 +65,7 @@ export function revalidateApprovals(board: Bead[], nowMs: number): GardenerDetec
   const detections: GardenerDetection[] = [];
 
   for (const bead of board) {
-    if (!isQueuedApproval(bead, board, nowMs)) continue;
+    if (!isQueuedApproval(bead, nowMs)) continue;
     const gaps = gate.gapsFor(bead);
     if (gaps.length === 0) continue;
     detections.push(
@@ -72,7 +77,7 @@ export function revalidateApprovals(board: Bead[], nowMs: number): GardenerDetec
           `${bead.id} is approved but no longer meets the gate it was approved through ` +
           `(${gaps.map((gap) => gap.rule).join(", ")}) — fix it, or withdraw the approval`,
         evidence: [
-          `${bead.id} carries \`approved\` and no run holds it, so a worker can pick it up as it now stands`,
+          standingLine(bead, gaps),
           ...gaps.map(evidenceLine),
           `approving this proposal removes the \`approved\` label and notes why on ${bead.id}; repairing the gaps instead settles it with the approval intact`,
         ],
@@ -82,9 +87,24 @@ export function revalidateApprovals(board: Bead[], nowMs: number): GardenerDetec
   return detections;
 }
 
+/**
+ * Where the approval leaves this bead standing right now — the line that makes the ask urgent. A
+ * degraded SPEC is work a worker can still pick up as it stands; an unrunnable target is the opposite
+ * failure, and saying "a worker can pick it up" about it would misstate the harm entirely.
+ */
+function standingLine(bead: Bead, gaps: ApprovalGap[]): string {
+  return gaps.some((gap) => gap.rule === "runnable")
+    ? `${bead.id} carries \`approved\` but nothing can dispatch it, so it sits in the queue waiting for a worker that will never come`
+    : `${bead.id} carries \`approved\` and no run holds it, so a worker can pick it up as it now stands`;
+}
+
 /** One gap as evidence: the gate's own message, prefixed with the promise it breaks. */
 function evidenceLine(gap: ApprovalGap): string {
   switch (gap.rule) {
+    case "runnable":
+      // The one gap that is not about the SPEC: nothing will ever dispatch this bead, so the approval
+      // promises a run that cannot happen.
+      return `nothing can run it any more: ${gap.message}`;
     case "contract":
       return `the bead contract no longer holds: ${gap.message}`;
     case "structure":

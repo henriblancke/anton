@@ -106,18 +106,15 @@ export type ApplyStep =
        */
       parentClaim: string;
     })
-  | (StepSubject & {
-      verb: "link";
-      blocker: string;
-      /**
-       * Which ask drew this edge. Carried because the two link kinds rest on DIFFERENT evidence: an
-       * `implied-order` reads a phrase in one of the beads' bodies, so the write re-derives it under
-       * the pair's locks ({@link assertOrderingStated}); a `missing-order` is the product master's
-       * own judgment, which no board read can restate — holding it to the phrase check would refuse
-       * it forever.
-       */
-      kind: GardenerDetectionKind;
-    })
+  /**
+   * The two link kinds rest on DIFFERENT evidence, and {@link EvidenceFence.kind} is what tells them
+   * apart under the lock: an `implied-order` reads a phrase in one of the beads' bodies, so the write
+   * re-derives it from the fresh board ({@link assertOrderingStated}); a `missing-order` is the
+   * product master's own judgment, which no board read can restate — holding it to the phrase check
+   * would refuse it forever, so it is fenced on the observation stamp instead
+   * ({@link EVIDENCE_PREMISE}).
+   */
+  | (StepSubject & EvidenceFence & { verb: "link"; blocker: string })
   | (StepSubject &
       EvidenceFence & {
         verb: "reprioritize";
@@ -156,10 +153,12 @@ export type ApplyStep =
  * landing in that window rescopes the work while leaving every other bar untouched, so without this
  * the write goes ahead on evidence the edit falsified.
  *
- * Carried by the retirements and by `reprioritize`: all four rest on a reading of what the bead IS
- * — silence, a match against a twin, a commit that shipped it, a judgment of what it is worth — and
- * none of those survives a rewrite. The topology verbs (`reparent`, `link`) carry none, because
- * their whole claim is re-derivable from a fresh board read.
+ * Carried by the retirements, by `reprioritize` and by `link`: each rests on a reading of what the
+ * bead IS — silence, a match against a twin, a commit that shipped it, a judgment of what it is
+ * worth or of what has to land before it — and none of those survives a rewrite. `reparent` carries
+ * none, and neither does the `implied-order` half of `link`, because their whole claim is
+ * re-derivable from a fresh board read; a link step still carries the fence so the ONE kind that
+ * isn't ({@link EVIDENCE_PREMISE}'s `missing-order`) is guarded rather than trusted.
  *
  * The kind (not the resolved premise) so the write re-derives through the same
  * {@link EVIDENCE_PREMISE} the decision used, and the observation stamp verbatim so both readings
@@ -396,6 +395,12 @@ function planLink(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): Apply
   if (claimed) return { status: "refuse", reason: claimed };
   const unstated = linkPremiseGone(plan, id, index);
   if (unstated) return { status: "refuse", reason: unstated };
+  // The other link kind's premise, which no board read restates: a `missing-order` is the product
+  // master's judgment about the bead as it read that night, and every bar above asks only whether the
+  // pair is still writable — which a rescoping edit leaves untouched. Without this, approving a
+  // months-old ordering ask would constrain work somebody has since rewritten.
+  const touched = premiseTouched(blocked, EVIDENCE_PREMISE[plan.kind], at.observedAtMs);
+  if (touched) return { status: "refuse", reason: touched };
   // The blocker already waits on the blocked bead through other beads: no direct edge, so the pair
   // read as unrelated above, but this edge would close the loop — and bd rejects a blocking cycle at
   // every write path, so applying it would only 500 and leave the proposal open forever.
@@ -408,7 +413,16 @@ function planLink(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): Apply
 
   return {
     status: "apply",
-    steps: [{ verb: "link", id, claim: runClaimOf(blocked), blocker: plan.target, kind: plan.kind }],
+    steps: [
+      {
+        verb: "link",
+        id,
+        claim: runClaimOf(blocked),
+        blocker: plan.target,
+        kind: plan.kind,
+        observedAtMs: at.observedAtMs,
+      },
+    ],
     summary: `recorded that ${plan.target} blocks ${id}`,
   };
 }
@@ -794,9 +808,15 @@ interface EvidencePremise {
 /**
  * What each detection claims about the subject AS THE PASS FOUND IT — the one premise a plan cannot
  * restate, because it is a fact about a moment rather than about the board now. Every kind is listed
- * so adding one without deciding whether an edit falsifies it is a type error; the topology kinds
- * carry no entry because their whole claim IS re-derivable from the fresh board (see
+ * so adding one without deciding whether an edit falsifies it is a type error; the GARDENER's
+ * topology kinds carry no entry because their whole claim IS re-derivable from the fresh board (see
  * {@link reparentPremiseGone} and {@link linkPremiseGone}).
+ *
+ * `missing-order` is topology too and still fenced, because that re-derivation is what it lacks:
+ * {@link linkPremiseGone} and {@link assertOrderingStated} both answer only for `implied-order`, the
+ * kind whose evidence is a body phrase. The product master's ordering claim is a judgment, so no
+ * board read restates it and the stamp is the only thing left standing between it and a bead
+ * somebody has since rewritten.
  *
  * All three retirements are fenced, not just `stale`: each measured something about the bead's
  * CONTENTS that an edit since the filing can invalidate — silence for `stale`, a match against a
@@ -815,7 +835,10 @@ const EVIDENCE_PREMISE: Record<GardenerDetectionKind, EvidencePremise | undefine
   "container-orphan": undefined,
   "parentless-cluster": undefined,
   "implied-order": undefined,
-  "missing-order": undefined,
+  "missing-order": {
+    still: "the bead this ordering judgment was made about",
+    harm: "recording the edge now would hold work somebody has since rewritten behind a prerequisite chosen for the version it replaced",
+  },
   // A split is never applied (see `planApply`), so nothing here can act on a stale premise.
   oversized: undefined,
   stale: {
@@ -1175,8 +1198,11 @@ function counterpartOf(step: ApplyStep): string | undefined {
 }
 
 /**
- * The filing-time premise a CONTENT-derived move rests on, or absent for the topology verbs that
- * make no claim about a bead's contents. See {@link EvidenceFence} for why the step carries it.
+ * The filing-time premise a CONTENT-derived move rests on, or absent for the verbs that make no claim
+ * about a bead's contents. See {@link EvidenceFence} for why the step carries it.
+ *
+ * `link` is here for its `missing-order` half alone; an `implied-order` resolves to no premise in
+ * {@link EVIDENCE_PREMISE} and is re-derived from the board instead ({@link assertOrderingStated}).
  */
 function evidenceOf(step: ApplyStep): EvidenceFence | undefined {
   switch (step.verb) {
@@ -1184,6 +1210,7 @@ function evidenceOf(step: ApplyStep): EvidenceFence | undefined {
     case "supersede":
     case "defer":
     case "reprioritize":
+    case "link":
       return { kind: step.kind, observedAtMs: step.observedAtMs };
     default:
       return undefined;
@@ -1273,8 +1300,8 @@ async function applyStep(repo: string, step: ApplyStep): Promise<boolean> {
       assertHomeIsCard(step.parent, await lockedBoard(repo, doing));
     }
     // Only the kind whose evidence IS a body phrase. A `missing-order` ask rests on the product
-    // master's judgment, which nothing on the board restates — re-deriving it here would refuse
-    // every one of them (see the `kind` field on the link step).
+    // master's judgment, which nothing on the board restates — re-deriving it here would refuse every
+    // one of them; its premise is held by the evidence fence instead (see the link step's docs).
     if (step.verb === "link" && step.kind === "implied-order") {
       const doing = `before recording ${step.blocker} as ${step.id}'s blocker`;
       assertOrderingStated(step.id, step.blocker, await lockedBoard(repo, doing));
@@ -1499,10 +1526,11 @@ function subjectMoved(step: ApplyStep, subject: Bead | undefined, nowMs: number)
   if (claim && claim !== step.claim) {
     return `${step.id} was claimed by ${claim} since this proposal was decided — ${DOING[step.verb]} would pull the bead out from under the run that now owns it`;
   }
-  // A retirement rests on a claim about the subject's CONTENTS that every check above is blind to —
-  // a rescoping edit leaves status, liveness and claim exactly as the plan found them. `planRetire`
-  // asked it of the route's snapshot; re-asked here against the read taken under this bead's own
-  // lock, so an edit landing in that window refuses instead of being settled as delivered.
+  // A retirement, a re-ranking and a `missing-order` all rest on a claim about the subject's CONTENTS
+  // that every check above is blind to — a rescoping edit leaves status, liveness and claim exactly
+  // as the plan found them. Each planner asked it of the route's snapshot; re-asked here against the
+  // read taken under this bead's own lock, so an edit landing in that window refuses instead of being
+  // settled as delivered.
   // …but not when the board already reads as applied. Setting the asked-for priority BY HAND is
   // itself a write since the filing, so an unguarded fence would refuse the very state the ask
   // wanted — the same reason `planReprioritize` settles before it consults the premise.

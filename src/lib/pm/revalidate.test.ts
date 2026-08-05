@@ -2,10 +2,11 @@
  * Post-approval re-validation (anton-xg5y), over fixture boards.
  *
  * The claim worth proving here is narrow and total: an approval is only as good as the facts it was
- * given for, and this is what notices when those facts stop holding. So the cases are the three ways
+ * given for, and this is what notices when those facts stop holding. So the cases are the four ways
  * the approve gate can start refusing work it already let through — a rubric edited away, a tier
- * shape broken under it, an ordering edge drawn in front of it — plus the two ways this pass must
- * stay quiet: work no approval covers, and work a run already owns.
+ * shape broken under it, an ordering edge drawn in front of it, and the target ceasing to be one at
+ * all — plus the two ways this pass must stay quiet: work no approval covers, and work a run already
+ * owns.
  *
  * Pure over the board, so a fixture is a complete test of what a pass would find.
  */
@@ -131,15 +132,36 @@ describe("re-validating approvals the board has moved past", () => {
     expect(subjectsOf([claimed, inReview])).toEqual([]);
   });
 
-  it("never proposes against a child ticket or a container epic — only what anton runs", () => {
-    // The ticket is unrunnable on its own and the epic launches one PR per feature, so neither is a
-    // bead approval covers. Only the feature between them is a run target.
+  it("surfaces an approved epic that became a container — the rot that hides best", () => {
+    // A feature landed under an epic approved as one unit of work. It is no longer a run target, so
+    // the claimable set skips it and a dispatch would poison-park: the approval promises a run that
+    // can never happen, and nothing else on the board says so.
     const board = [
-      approved("anton-e", { issue_type: "epic", acceptance_criteria: undefined }),
-      child("anton-f", "anton-e", { issue_type: "feature", labels: [LABELS.approved] }),
-      child("anton-t", "anton-f", { labels: [LABELS.approved] }),
+      approved("anton-e", { issue_type: "epic" }),
+      child("anton-f", "anton-e", { issue_type: "feature", acceptance_criteria: "- [ ] ok" }),
     ];
-    expect(subjectsOf(board)).toEqual([["anton-f"]]);
+    const [detection, ...rest] = revalidateApprovals(board, NOW);
+
+    expect(rest).toEqual([]);
+    expect(detection.subjects).toEqual(["anton-e"]);
+    expect(detection.evidence.join("\n")).toMatch(/no longer a run target/);
+    expect(detection.evidence.join("\n")).toMatch(/container epic/);
+    // Stated as the harm it actually is: nothing will come for it, not "a worker can pick it up".
+    expect(detection.evidence.join("\n")).toMatch(/a worker that will never come/);
+  });
+
+  it("surfaces an approved bead re-parented into somebody else's ticket set", () => {
+    // A parentless task approved on its own, since re-homed under a feature: it now runs as one of
+    // that feature's tickets, so its own approval stops meaning anything.
+    const board = [
+      approved("anton-f", { issue_type: "feature" }),
+      child("anton-t", "anton-f", { labels: [LABELS.approved], acceptance_criteria: "- [ ] ok" }),
+    ];
+    const [detection, ...rest] = revalidateApprovals(board, NOW);
+
+    expect(rest).toEqual([]);
+    expect(detection.subjects).toEqual(["anton-t"]);
+    expect(detection.evidence.join("\n")).toMatch(/now sits under anton-f/);
   });
 
   it("skips a settled bead: a closed target's approval queues nothing", () => {

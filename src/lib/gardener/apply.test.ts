@@ -434,7 +434,16 @@ describe("planApply — what an approval means against the board as it now is", 
       status: "apply",
       summary: "recorded that anton-bb blocks anton-aa",
       steps: [
-        { verb: "link", id: "anton-aa", claim: "", blocker: "anton-bb", kind: "implied-order" },
+        {
+          verb: "link",
+          id: "anton-aa",
+          claim: "",
+          blocker: "anton-bb",
+          kind: "implied-order",
+          // Carried by every link, consulted only by `missing-order`: an `implied-order` resolves to
+          // no premise, because its evidence is re-derived from the board under the pair's locks.
+          observedAtMs: Date.parse(FILED),
+        },
       ],
     });
   });
@@ -1806,13 +1815,23 @@ describe("the product master's moves", () => {
   it("records the ordering edge a missing-order ask names, with no body phrase to re-derive", async () => {
     // Unlike the gardener's `implied-order`, this ask rests on the pass's judgment rather than on a
     // phrase in the bead — so apply must not hold it to the phrase check that kind carries.
-    const decision = planApply(ORDER, [bead("anton-aa"), bead("anton-bb")], {
-      nowMs: NOW,
-      observedAtMs: Date.parse(FILED),
-    });
+    const untouched = [cold("anton-aa"), cold("anton-bb")];
+    const decision = planApply(ORDER, untouched, { nowMs: NOW, observedAtMs: Date.parse(FILED) });
     expect(decision.status).toBe("apply");
-    await applyWith(proposalFor(ORDER), [bead("anton-aa"), bead("anton-bb")]);
+    await applyWith(proposalFor(ORDER), untouched);
     expect(calls[0]).toBe("link anton-aa anton-bb blocks");
+  });
+
+  it("refuses an ordering judgment about a bead somebody has since rewritten", async () => {
+    // The judgment was made about a contract that no longer exists: nothing on the board restates
+    // it, and every other bar here only asks whether the pair is still writable — which a rescoping
+    // edit leaves exactly as the pass found it. So the filing stamp is the only fence there is.
+    const err = (await applyWith(proposalFor(ORDER), [warm("anton-aa"), cold("anton-bb")]).catch(
+      (e) => e,
+    )) as InstanceType<typeof ProposalApplyError>;
+    expect(err.failure).toBe("refused");
+    expect(err.message).toMatch(/written to since this proposal was filed/);
+    expect(calls.filter((c) => c.startsWith("link"))).toEqual([]);
   });
 
   /**

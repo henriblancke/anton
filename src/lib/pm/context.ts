@@ -561,6 +561,16 @@ function kindRefusal(claim: PmClaim, index: BoardIndex): string | undefined {
     }
     case "order":
       return orderRefusal(claim, index);
+    // A deferred bead is still OPEN work, so `subjectRefusal` waves it through — but a kill applies as
+    // `defer`, and `planRetire` settles an already-deferred subject without writing anything. Left
+    // unchecked the ask reaches the board, costs a founder a decision, and settles as a no-op. The
+    // gardener's stale detector excludes deferred beads for this exact reason (gardener/retire.ts).
+    case "kill": {
+      const subject = index.byId.get(claim.bead);
+      return subject && beads.isDeferred(subject)
+        ? `${claim.bead} is already deferred — killing it again would change nothing`
+        : undefined;
+    }
     default:
       return undefined;
   }

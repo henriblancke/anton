@@ -13,7 +13,10 @@
  *      bead. That assertion is the whole safety case for arming this job;
  *   3. a healthy board yields ZERO proposals — the pass has no noise floor;
  *   4. the pass asks ONCE, and a DECLINE is permanent: an abandoned proposal keeps its fingerprint,
- *      and that is the memory a later pass reads.
+ *      and that is the memory a later pass reads;
+ *   5. APPROVING a kill actually writes: `applyProposal` — the function the approve route calls —
+ *      defers the subject against real bd and settles the ask. The one pm kind that changes board
+ *      state has to be proven end to end, not just through the mocked bd seam.
  */
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
@@ -23,9 +26,11 @@ import { driveJob, expectJobStatus } from "@/lib/testing/jobs";
 import { beads, type Bead } from "../beads/bd";
 import type { ClaudeResult } from "../claude/driver";
 import { contractGaps } from "../beads/contract";
+import { loadAllIssues } from "../beads/issues";
 import { resetIssueSnapshots } from "../beads/snapshot";
 import * as schema from "../db/schema";
 import { makeTestDb, type TestDb } from "../db/testing";
+import { applyProposal } from "../gardener/apply";
 import { isProposalBead, proposalPlanOf } from "../gardener/detections";
 import { makeProductMasterHandler } from "./product-master";
 import type { Clock } from "./queue";
@@ -46,6 +51,12 @@ describeBd("product-master pass e2e (real handler · real bd)", () => {
   let oversized: string;
   /** Healthy work the pass has no claim about; it must come out of every pass unchanged. */
   let healthy: string;
+  /**
+   * The subject of the kill this suite APPLIES at the end. Seeded here rather than in that test so
+   * bd's write stamp on it predates the pass that files the ask by more than a second: the evidence
+   * fence orders the two, and stamps landing in the same whole second cannot be ordered at all.
+   */
+  let doomed: string;
 
   /** What the stubbed session reports this pass — set per phase. */
   let reported = `{"proposals":[]}`;
@@ -62,10 +73,10 @@ describeBd("product-master pass e2e (real handler · real bd)", () => {
     (await beads.list(repo, ["--status", "all"])).filter(isProposalBead);
 
   /** One pass, driven to settlement. */
-  const pass = async (): Promise<string> => {
+  const pass = async (at: Clock = clock): Promise<string> => {
     const jobId = await driveJob({
       db: tdb.db,
-      clock,
+      clock: at,
       type: "product-master",
       handler: ({ db, clock: c }) =>
         makeProductMasterHandler({ db, clock: c, nudge, runClaude: fakeClaude }),
@@ -103,6 +114,12 @@ describeBd("product-master pass e2e (real handler · real bd)", () => {
       title: "a perfectly ordinary ticket",
       type: "task",
       acceptance: "- [ ] does its one thing",
+    });
+    doomed = await beads.create(repo, {
+      title: "a half-built importer nobody asked for",
+      type: "task",
+      acceptance: "- [ ] imports something",
+      labels: ["review-score:2"],
     });
 
     tdb = makeTestDb();
@@ -245,6 +262,47 @@ describeBd("product-master pass e2e (real handler · real bd)", () => {
     await pass();
 
     expect((await proposals()).map((p) => p.id).sort()).toEqual(standing);
+  });
+
+  /**
+   * The other half of the acceptance: a kill is the one pm kind that WRITES board state, and until
+   * here nothing proved that write lands against real bd. `applyProposal` is the same function the
+   * approve route calls; the route around it only maps failures to HTTP statuses.
+   */
+  it("applies an approved kill through the 1t3n verbs: deferred, never closed", async () => {
+    reported = JSON.stringify({
+      proposals: [
+        {
+          kind: "kill",
+          bead: doomed,
+          summary: "nothing downstream wants this",
+          evidence: [`${doomed} scored 2 and nothing depends on it`],
+        },
+      ],
+    });
+    // Real time, unlike the frozen clock the rest of the suite runs on: the evidence fence dates the
+    // filing against bd's own stamps, and a 2023 filing over a bead bd stamped today would read as
+    // work rewritten since the ask and refuse it.
+    await pass({ now: () => Date.now() });
+
+    const proposal = (await proposals()).find(
+      (p) => proposalPlanOf(p)?.subjects[0] === doomed,
+    ) as Bead;
+    expect(proposalPlanOf(proposal)).toMatchObject({ kind: "low-value", retireAs: "defer" });
+
+    const result = await applyProposal(repo, proposal, await loadAllIssues(repo));
+    expect(result.changed).toEqual([doomed]);
+
+    // Deferred, not closed: a product judgment must stay reversible with `bd undefer`.
+    const subject = await beads.show(repo, doomed);
+    expect(beads.isDeferred(subject)).toBe(true);
+    expect(subject.status).not.toBe("closed");
+    expect(beads.isAbandoned(subject)).toBe(false);
+
+    // Applied, not declined — the distinction a later pass reads to know the ask was answered.
+    const settled = await beads.show(repo, proposal.id);
+    expect(settled.status).toBe("closed");
+    expect(beads.isAbandoned(settled)).toBe(false);
   });
 
   it("refuses a claim about a bead that is not there, rather than filing an ask that can only fail", async () => {

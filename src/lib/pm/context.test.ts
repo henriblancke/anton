@@ -265,11 +265,20 @@ describe("detectionsFor", () => {
       claim({ kind: "order", blockedBy: "anton-a" }),
       /cannot block itself/,
     ],
+    [
+      // A deferred bead is still OPEN work, so nothing above this catches it — and a kill applies as
+      // `defer`, which apply settles as a no-op. The ask would cost a founder a decision and write
+      // nothing at all.
+      "a kill on a bead a previous kill already deferred",
+      claim({ kind: "kill", bead: "anton-parked" }),
+      /already deferred/,
+    ],
   ])("refuses %s, and says why rather than dropping it", (_label, bad, reason) => {
     const board = [
       subject,
       blocker,
       bead("anton-done", { status: "closed" }),
+      bead("anton-parked", { status: "deferred" }),
       bead("anton-live", { labels: [LABELS.runLease(NOW + 600_000, "abc")] }),
       bead("anton-prop", { labels: ["pm:low-value:0123456789ab"] }),
       bead("anton-linked", {
