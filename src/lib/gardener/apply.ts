@@ -37,6 +37,7 @@
  * ABANDONED bead (closed + `abandoned`) still carrying its fingerprint label, which is exactly what
  * emission already suppresses on (see emit.ts `suppressedFingerprints`). The board is the memory.
  */
+import { approvalGaps, formatApprovalGaps, type ApprovalGap } from "../approval-gate";
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { withBeadWriteLock, withBeadWriteLocks } from "../beads/claim-lock";
 import { loadAllIssues } from "../beads/issues";
@@ -127,6 +128,19 @@ export type ApplyStep =
          */
         priority: number;
       })
+  | (StepSubject & {
+      verb: "unapprove";
+      /**
+       * What the withdrawal leaves ON the subject — the gaps that cost it its approval, written to
+       * the bead itself. Without it a founder finds a target that silently left the queue: the
+       * proposal explains it, but only to whoever thinks to look for the proposal.
+       *
+       * Re-derived from the board read taken under the subject's own lock rather than used as
+       * captured (see {@link applyStep}), so it names what is wrong at the WRITE — an approver who
+       * repaired one gap and introduced another must not be told about the repaired one.
+       */
+      note: string;
+    })
   | (StepSubject & TicketOwner & EvidenceFence & { verb: "close"; reason: string })
   | (StepSubject & TicketOwner & EvidenceFence & { verb: "supersede"; replacement: string })
   | (StepSubject & TicketOwner & EvidenceFence & { verb: "defer" });
@@ -234,6 +248,8 @@ export function planApply(plan: GardenerPlan, board: Bead[], at: ApplyMoment): A
       return planRetire(plan, index, at);
     case "reprioritize":
       return planReprioritize(plan, index, at);
+    case "unapprove":
+      return planUnapprove(plan, index, at);
     case "split":
       // The one move anton never runs. Decomposing a ticket writes new contracts — `/shape`'s work,
       // and a human's call — so the proposal carries the sketch and the evidence, and settling it is
@@ -457,6 +473,70 @@ function planReprioritize(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment
   };
 }
 
+/**
+ * Withdrawing an approval that has stopped holding (anton-xg5y) — the one move that writes a CONTROL
+ * label rather than the graph, a field or a status.
+ *
+ * Its premise is re-derived rather than fenced, which is what makes "fix or unapprove" two real
+ * answers instead of one. The ask is "this target no longer clears the approve gate", and the gate is
+ * a pure function of the board ({@link approvalGaps}) — so approving after a REPAIR settles the
+ * proposal with the approval intact, and approving while it is still broken strips the label. An
+ * evidence fence would have refused both: repairing a bead is itself a write since the filing, so the
+ * one outcome the proposal most wants would have been the one it could never record.
+ *
+ * The safety bars are the usual ones with one edge sharpened: withdrawing `approved` under a live run
+ * does not merely race it, it KILLS it — execute-epic re-reads approval after its claim settles and
+ * poisons the run when the label is gone. So a claimed subject refuses like everywhere else, and the
+ * next pass re-asks once the run lets go.
+ */
+function planUnapprove(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): ApplyDecision {
+  const { nowMs } = at;
+  const [id] = plan.subjects;
+  if (plan.subjects.length !== 1 || !id) {
+    return { status: "refuse", reason: "an approval proposal names exactly one bead" };
+  }
+  const subject = index.byId.get(id);
+  if (!subject) return { status: "refuse", reason: missing(id) };
+  // Nothing left to withdraw: a settled bead queues no run, and a label somebody has already dropped
+  // by hand is the outcome this ask wanted, whoever wrote it.
+  if (!isOpenWork(subject)) {
+    return { status: "settled", summary: `${id} is ${settledWord(subject)} — its approval queues nothing` };
+  }
+  if (!beads.isApproved(subject)) {
+    return { status: "settled", summary: `${id} no longer carries \`${LABELS.approved}\`` };
+  }
+  if (isInFlight(subject, nowMs)) {
+    return { status: "refuse", reason: inFlightReason(subject, nowMs, DOING.unapprove) };
+  }
+  const claimed = claimedSinceFiling(subject, at, DOING.unapprove, CLAIM_COST.approval);
+  if (claimed) return { status: "refuse", reason: claimed };
+
+  const gaps = approvalGaps(subject, index.all);
+  if (gaps.length === 0) {
+    return {
+      status: "settled",
+      summary: `${id} meets the approve gate again — the gaps were repaired, so the approval stands`,
+    };
+  }
+  return {
+    status: "apply",
+    steps: [{ verb: "unapprove", id, claim: runClaimOf(subject), note: unapproveNote(gaps) }],
+    summary: `withdrew the approval on ${id} — ${formatApprovalGaps(gaps)}`,
+  };
+}
+
+/**
+ * What a withdrawal writes onto the SUBJECT: why the label went, and how to get it back. Prefixed
+ * like every other note this module leaves ({@link notePrefix}), off the kind rather than a literal,
+ * so the producer a reader sees is the one that filed the ask.
+ */
+function unapproveNote(gaps: ApprovalGap[]): string {
+  return (
+    `${namespaceOf("degraded-approval")}: approval withdrawn by an approved proposal — ` +
+    `${formatApprovalGaps(gaps)}. Fix those and approve it again; nothing else about the bead changed.`
+  );
+}
+
 function planRetire(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): ApplyDecision {
   const { nowMs } = at;
   const [id] = plan.subjects;
@@ -612,6 +692,10 @@ const CLAIM_COST = {
   home: "would leave that work riding along unrun, because the run has already selected the tickets it will work through",
   ticketSet:
     "would take a bead out of a set that run has already selected, and it aborts when its claim reaches a ticket the board no longer holds",
+  // Sharper than `subject`: execute-epic re-reads the approval after its claim settles and poisons
+  // the run when the label is gone, so this does not race the run — it ends it.
+  approval:
+    "would poison the run that owns it, which re-checks the approval after its claim settles and stops when the label is gone",
 } as const;
 
 /**
@@ -762,6 +846,11 @@ const EVIDENCE_PREMISE: Record<GardenerDetectionKind, EvidencePremise | undefine
     still: "the low-value bead the evidence describes",
     harm: "deferring it now would park work somebody has since given a reason to keep",
   },
+  // No fence, deliberately — the one pm kind whose premise IS re-derivable (see `planUnapprove`).
+  // Its whole claim is "this bead does not clear the approve gate", which `approvalGaps` re-answers
+  // from the fresh board; fencing it would refuse the repair the proposal is half asking for, since
+  // repairing a bead is itself a write since the filing.
+  "degraded-approval": undefined,
 };
 
 /**
@@ -1054,6 +1143,7 @@ const DOING: Record<ApplyStep["verb"], string> = {
   reparent: "moving it",
   link: "recording it as blocked",
   reprioritize: "re-ranking it",
+  unapprove: "withdrawing its approval",
   close: "retiring it",
   supersede: "retiring it",
   defer: "retiring it",
@@ -1189,7 +1279,18 @@ async function applyStep(repo: string, step: ApplyStep): Promise<boolean> {
       const doing = `before recording ${step.blocker} as ${step.id}'s blocker`;
       assertOrderingStated(step.id, step.blocker, await lockedBoard(repo, doing));
     }
-    await runStep(repo, step);
+    // The approval gaps, re-derived once more from a board read taken inside the subject's own lock,
+    // and carried into the write. The decision asked the same question of the route's snapshot,
+    // which is already seconds old when this write spawns — and a repair landing in that window
+    // leaves every other bar here untouched, so without this the label comes off work that is sound
+    // again. Genuine serialization for the target's own body (`updateTicket` takes this very lock);
+    // a narrowing for the rest of the subtree, whose repairs take their own beads' locks.
+    let write = step;
+    if (step.verb === "unapprove") {
+      const doing = `before withdrawing the approval on ${step.id}`;
+      write = { ...step, note: unapproveNote(assertStillDegraded(step.id, await lockedBoard(repo, doing))) };
+    }
+    await runStep(repo, write);
     return true;
   });
 }
@@ -1213,6 +1314,10 @@ function alreadySatisfied(step: ApplyStep, subject: Bead): boolean {
   // undo. `subjectMoved` deliberately lets such a subject through (a re-ranked bead is not a bead
   // that moved out from under the plan), so without this the no-op would join the rollback prefix.
   if (step.verb === "reprioritize") return subject.priority === step.priority;
+  // Somebody dropped the label by hand between the decision and this lock: the ask's outcome is the
+  // board's state, so there is no write to make — and no second note to leave on a bead whose
+  // approval is already gone.
+  if (step.verb === "unapprove") return !beads.isApproved(subject);
   return false;
 }
 
@@ -1321,6 +1426,31 @@ function assertHomeIsCard(parentId: string, board: BoardIndex): void {
 function assertOrderingStated(blockedId: string, blockerId: string, board: BoardIndex): void {
   if (impliesOrdering(board, blockedId, blockerId)) return;
   throw new SubjectMovedError(orderingUnstated(blockedId, blockerId));
+}
+
+/**
+ * The gaps that still cost this target its approval, from a board read taken INSIDE its write lock —
+ * or a refusal when there are none left.
+ *
+ * A repair is the OTHER answer to a fix-or-unapprove ask, and it lands as an ordinary bead edit that
+ * changes nothing else this step checks: the subject stays open, unclaimed and approved. So the
+ * question has to be re-asked here, or an approval clicked moments after somebody wrote the missing
+ * Acceptance would strip the label off work that is sound again.
+ *
+ * Returns them so the write NAMES the gaps as they are now: repairing one and introducing another is
+ * a real sequence, and a note quoting the decision's list would tell the founder to fix something
+ * they already fixed.
+ */
+function assertStillDegraded(id: string, board: BoardIndex): ApprovalGap[] {
+  const subject = board.byId.get(id);
+  if (!subject) throw new SubjectMovedError(missing(id));
+  const gaps = approvalGaps(subject, board.all);
+  if (gaps.length === 0) {
+    throw new SubjectMovedError(
+      `${id} meets the approve gate again — the gaps this proposal names were repaired since it was decided, so withdrawing the approval would take sound work out of the queue`,
+    );
+  }
+  return gaps;
 }
 
 /** The one phrasing both readings of the link premise refuse with — snapshot and under-lock alike. */
@@ -1464,6 +1594,14 @@ async function runStep(repo: string, step: ApplyStep): Promise<void> {
       // Priority alone — no `currentLabels`, so `buildUpdateArgs` diffs no managed prefix and the
       // bead's `approved` / `stage:*` / `source:*` labels are untouched by the write.
       await beads.update(repo, step.id, { priority: step.priority });
+      return;
+    case "unapprove":
+      // The note FIRST, then the label. Two writes, and only this order is safe to fail between: a
+      // note that lands without the untag leaves the approval standing beside an explanation the
+      // retry repeats, while an untag that lands without the note leaves a target that dropped out
+      // of the queue saying nothing about why.
+      await beads.note(repo, step.id, step.note);
+      await beads.untag(repo, step.id, [LABELS.approved]);
       return;
     case "close":
       await beads.close(repo, step.id, step.reason);

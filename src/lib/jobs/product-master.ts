@@ -16,6 +16,12 @@
  * Off by default: the schedule is seeded disabled (schedules.ts). A pass costs a claude session and
  * spends a founder's attention on every proposal it files, so arming it is a deliberate act.
  *
+ * TWO TIERS run here, and only one of them needs a session. Ahead of the judgment, a DETERMINISTIC
+ * pre-pass re-runs the approve gate's own validator over the board snapshot (anton-xg5y): an approved
+ * target whose Acceptance was edited away, whose tier shape broke, or that has been blocked since is
+ * work the queue would hand a worker and anton would then refuse to start. That check is a fact, not
+ * an opinion — so it costs no tokens, files ahead of the session, and survives a session that breaks.
+ *
  * A pass over a healthy board files NOTHING and is a success. That is the outcome the pass is
  * designed around: an empty report is the answer, never a failure to find one, and the two are kept
  * distinguishable at every step — a session that breaks the protocol throws rather than degrading to
@@ -26,6 +32,7 @@ import { loadAllIssues } from "../beads/issues";
 import { stampMsOf } from "../gardener/board-index";
 import { nudgeSync, type NudgeTarget } from "../beads/sync-nudge";
 import { runClaude } from "../claude/driver";
+import type { GardenerDetection } from "../gardener/detections";
 import {
   emitProposals,
   MAX_PROPOSALS_PER_PASS,
@@ -39,6 +46,7 @@ import {
   parsePmReport,
   type PmBoardInput,
 } from "../pm/context";
+import { revalidateApprovals } from "../pm/revalidate";
 import { getProjectById, getProjectSettings } from "../projects";
 import { reviewReportOf } from "../review-report";
 import { listRecentRuns } from "../runs";
@@ -125,6 +133,57 @@ export function makeProductMasterHandler(deps: ProductMasterDeps): JobHandler {
       const board = await loadAllIssues(repo);
       await ctx.heartbeat();
 
+      const logEmission = (emission: EmissionResult) => {
+        if (emission.created.length > 0) {
+          console.log(
+            `[product-master] ${project.slug}: filed ${emission.created.length} proposal(s) ` +
+              `(${emission.created.map((p) => p.id).join(", ")})` +
+              `${emission.suppressed > 0 ? `, ${emission.suppressed} already on the board` : ""}`,
+          );
+          nudge({ id: project.id, repoPath: repo });
+        }
+        // Never a silent cap: the overflow is deterministic and the next pass files it, but a reader
+        // has to be able to tell "the board is this healthy" from "we stopped at ten".
+        if (emission.deferred > 0) {
+          console.log(
+            `[product-master] ${project.slug}: held back ${emission.deferred} proposal(s) — one pass ` +
+              `files at most ${MAX_PROPOSALS_PER_PASS}; the next one picks them up`,
+          );
+        }
+      };
+
+      /** File one tier's detections, reporting whatever landed before a failure rather than losing it. */
+      const file = async (detections: GardenerDetection[]): Promise<void> => {
+        ctx.signal.throwIfAborted();
+        try {
+          logEmission(
+            await emitProposals(repo, { board, detections, observedAtMs, signal: ctx.signal }),
+          );
+        } catch (e) {
+          // Whatever landed before a create failed is real board state living only in the local
+          // working set — report and propagate it, or a pass that parks leaves the proposals that DID
+          // file invisible to every other machine.
+          if (e instanceof PartialEmissionError) logEmission(e.result);
+          throw e;
+        }
+      };
+
+      // The deterministic pre-pass (anton-xg5y), filed AHEAD of the session on purpose. Approval rot
+      // is a FACT — the approve gate's own validator, re-run over the snapshot just read — so it
+      // costs no judgment and must not depend on one: filed here, it lands even on a pass whose
+      // session errors or breaks the report protocol. It reuses this board and spawns no `bd` of its
+      // own. Its own emission, so the two tiers cannot cap each other out: the judgment pass is
+      // entitled to its full ten proposals whether or not approvals have rotted.
+      const degraded = revalidateApprovals(board, observedAtMs);
+      if (degraded.length > 0) {
+        await appendSessionLog(
+          logPath,
+          `[product-master] ${degraded.length} approved target(s) no longer meet the approve gate\n`,
+        );
+      }
+      await file(degraded);
+      await ctx.heartbeat();
+
       const boardInput: PmBoardInput = {
         board,
         scores: await scoreSeries(repo, board, logPath, project.slug),
@@ -177,35 +236,7 @@ export function makeProductMasterHandler(deps: ProductMasterDeps): JobHandler {
         `[product-master] ${report.claims.length} claim(s) reported, ${detections.length} accepted\n`,
       );
 
-      ctx.signal.throwIfAborted();
-      const logEmission = (emission: EmissionResult) => {
-        if (emission.created.length > 0) {
-          console.log(
-            `[product-master] ${project.slug}: filed ${emission.created.length} proposal(s) ` +
-              `(${emission.created.map((p) => p.id).join(", ")})` +
-              `${emission.suppressed > 0 ? `, ${emission.suppressed} already on the board` : ""}`,
-          );
-          nudge({ id: project.id, repoPath: repo });
-        }
-        // Never a silent cap: the overflow is deterministic and the next pass files it, but a reader
-        // has to be able to tell "the board is this healthy" from "we stopped at ten".
-        if (emission.deferred > 0) {
-          console.log(
-            `[product-master] ${project.slug}: held back ${emission.deferred} proposal(s) — one pass ` +
-              `files at most ${MAX_PROPOSALS_PER_PASS}; the next one picks them up`,
-          );
-        }
-      };
-
-      try {
-        logEmission(await emitProposals(repo, { board, detections, observedAtMs, signal: ctx.signal }));
-      } catch (e) {
-        // Whatever landed before a create failed is real board state living only in the local
-        // working set — report and propagate it, or a pass that parks leaves the proposals that DID
-        // file invisible to every other machine.
-        if (e instanceof PartialEmissionError) logEmission(e.result);
-        throw e;
-      }
+      await file(detections);
 
       await endSession(db, clock, sessionId, "done");
     } catch (e) {

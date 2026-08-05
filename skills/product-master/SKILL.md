@@ -109,6 +109,12 @@ epics that should be closed, orphans a commit already shipped — belongs to the
 not yours. Shaping new work from scratch is `/shape`'s. If the right answer to something is "this
 needs shaping", the honest move is a `split` with a sketch or nothing at all.
 
+**Approval conformance is already checked.** Whether an approved bead still meets the gate it was
+approved through — a missing Acceptance, a broken tier shape, a blocker drawn since — is a fact, and
+anton re-checks it deterministically before this pass runs. Those asks may already be on the board
+below. Say nothing about them: a contract gap is not a product judgment, and restating one costs a
+founder a second look at a question already asked.
+
 ## Report
 
 The **machine-readable report format is specified in the context anton appends below this

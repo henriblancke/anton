@@ -42,7 +42,13 @@ export const PROPOSAL_NAMESPACES: readonly ProposalNamespace[] = ["gardener", "p
  * still belongs on the board with evidence and a fingerprint — approving it is refused, and
  * declining is what settles it (the same shape as a targetless re-parent; see `isManualProposal`).
  */
-export type GardenerMove = "reparent" | "link" | "retire" | "reprioritize" | "split";
+export type GardenerMove =
+  | "reparent"
+  | "link"
+  | "retire"
+  | "reprioritize"
+  | "split"
+  | "unapprove";
 
 /**
  * The claims the two producers know how to name.
@@ -62,6 +68,10 @@ export type GardenerMove = "reparent" | "link" | "retire" | "reprioritize" | "sp
  *   • `missing-order`       — one top-tier bead has to land before another and no edge says so.
  *   • `oversized`           — one ticket carries several concerns, with a decomposition sketch.
  *   • `low-value`           — work whose value the evidence no longer supports: kill it.
+ *   • `degraded-approval`   — approved work that has since stopped clearing the approve gate. The one
+ *                             pm kind that is DETERMINISTIC rather than judged: it re-runs the gate's
+ *                             own validator over the pass's board snapshot (anton-xg5y), so it costs
+ *                             no session and never depends on one.
  */
 export type GardenerDetectionKind =
   | "container-orphan"
@@ -73,7 +83,8 @@ export type GardenerDetectionKind =
   | "mispriority"
   | "missing-order"
   | "oversized"
-  | "low-value";
+  | "low-value"
+  | "degraded-approval";
 
 export const GARDENER_DETECTION_KINDS: readonly GardenerDetectionKind[] = [
   "container-orphan",
@@ -86,6 +97,7 @@ export const GARDENER_DETECTION_KINDS: readonly GardenerDetectionKind[] = [
   "missing-order",
   "oversized",
   "low-value",
+  "degraded-approval",
 ];
 
 /**
@@ -144,6 +156,7 @@ export const KINDS: Record<GardenerDetectionKind, KindSpec> = {
   "missing-order": { namespace: "pm", move: "link" },
   oversized: { namespace: "pm", move: "split" },
   "low-value": { namespace: "pm", move: "retire", retireAs: "defer" },
+  "degraded-approval": { namespace: "pm", move: "unapprove" },
 };
 
 /** Which producer files this kind — the fingerprint's prefix and the proposal's `source:` label. */
@@ -394,6 +407,7 @@ const GARDENER_MOVES: readonly GardenerMove[] = [
   "retire",
   "reprioritize",
   "split",
+  "unapprove",
 ];
 const RETIRE_VERBS: readonly RetireVerb[] = ["close", "supersede", "defer"];
 

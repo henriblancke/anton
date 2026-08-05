@@ -441,6 +441,8 @@ function moveClause(detection: GardenerDetection): string {
       return `move ${subjects} to ${detection.detail ?? "a different priority"}`;
     case "split":
       return `split ${subjects} into separate tickets`;
+    case "unapprove":
+      return `fix ${subjects} or withdraw its approval`;
   }
 }
 
@@ -476,6 +478,11 @@ function appliedState(detection: GardenerDetection): string {
       return `${subjects} ${is} at priority ${detection.detail}, so ranked pickup reaches ${detection.subjects.length === 1 ? "it" : "them"} in that order`;
     case "split":
       return `${subjects} ${is} replaced by the separate tickets sketched below, each with its own contract`;
+    case "unapprove":
+      // Both outcomes are stated, because both settle this ask: repairing the gaps is the OTHER
+      // answer, and approving after a repair records that rather than stripping the label off work
+      // that is sound again (see apply.ts `planUnapprove`).
+      return `${subjects} either meets the approve gate again, or no longer carries \`approved\` — with a note on the bead naming the gaps that withdrew it`;
   }
 }
 
@@ -498,7 +505,7 @@ const MANUAL_INSTRUCTIONS: Partial<Record<GardenerDetection["move"], string[]>> 
 function acceptanceOf(detection: GardenerDetection): string {
   return [
     `- [ ] ${appliedState(detection)}`,
-    "- [ ] no other bead is re-parented, linked, reprioritized or retired — the move above is the whole change",
+    "- [ ] no other bead is re-parented, linked, reprioritized, retired or unapproved — the move above is the whole change",
     isManualProposal(detection)
       ? "- [ ] this proposal is DECLINED once the move is made by hand — approving it is refused, so declining is what settles it"
       : "- [ ] this proposal is closed with a note naming what changed",

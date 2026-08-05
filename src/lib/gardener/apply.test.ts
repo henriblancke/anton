@@ -111,6 +111,7 @@ vi.mock("../beads/bd", async () => {
       update: (_cwd: string, id: string, patch: { priority?: number }) =>
         record("update", id, `P${patch.priority}`),
       note: (_cwd: string, id: string, text: string) => record("note", id, text),
+      untag: (_cwd: string, id: string, labels: string[]) => record("untag", id, labels.join(",")),
     },
   };
 });
@@ -1812,6 +1813,78 @@ describe("the product master's moves", () => {
     expect(decision.status).toBe("apply");
     await applyWith(proposalFor(ORDER), [bead("anton-aa"), bead("anton-bb")]);
     expect(calls[0]).toBe("link anton-aa anton-bb blocks");
+  });
+
+  /**
+   * Post-approval re-validation (anton-xg5y). Unlike every other pm move, this one's premise is
+   * RE-DERIVED at approve time rather than fenced against the filing stamp — because repairing the
+   * bead is the other answer to the ask, and a fence would have refused exactly that outcome.
+   */
+  describe("withdrawing an approval that stopped holding", () => {
+    const UNAPPROVE = planFor({
+      kind: "degraded-approval",
+      move: "unapprove",
+      subjects: ["anton-a"],
+    });
+
+    /** Approved, and missing the one section that blocks a run: no rubric, no definition of done. */
+    const degraded = (extra: Partial<Bead> = {}): Bead =>
+      cold("anton-a", { labels: [LABELS.approved], ...extra });
+
+    /** The same bead repaired — the gaps the ask names are gone, so the approval is sound again. */
+    const repaired = (): Bead =>
+      warm("anton-a", {
+        labels: [LABELS.approved],
+        description: "## Goal\nship it\n\n## Context\nhere\n\n## Out of scope\nnothing\n\n## Verify\ntests",
+        acceptance_criteria: "- [ ] it ships",
+      });
+
+    it("takes the label off and leaves the reason ON THE BEAD, not only on the proposal", async () => {
+      const result = await applyWith(proposalFor(UNAPPROVE), [degraded()]);
+      // The note lands FIRST: a bead that drops out of the queue must never be the only trace.
+      expect(calls[0]).toMatch(/^note anton-a pm: approval withdrawn by an approved proposal — /);
+      expect(calls[0]).toMatch(/no Acceptance criteria/);
+      expect(calls[1]).toBe(`untag anton-a ${LABELS.approved}`);
+      expect(result.changed).toEqual(["anton-a"]);
+      expect(calls.at(-1)).toMatch(/^close anton-p1 applied: withdrew the approval on anton-a/);
+    });
+
+    it("settles with the approval INTACT once the gaps are repaired — fix is the other answer", async () => {
+      await applyWith(proposalFor(UNAPPROVE), [repaired()]);
+      expect(calls.filter((c) => c.startsWith("untag"))).toEqual([]);
+      expect(calls.at(-1)).toBe(
+        "close anton-p1 applied: anton-a meets the approve gate again — the gaps were repaired, so the approval stands",
+      );
+    });
+
+    it("settles when somebody dropped the label by hand — the ask's outcome, whoever wrote it", async () => {
+      await applyWith(proposalFor(UNAPPROVE), [warm("anton-a")]);
+      expect(calls.filter((c) => c.startsWith("untag"))).toEqual([]);
+      expect(calls.at(-1)).toMatch(/close anton-p1 applied: anton-a no longer carries/);
+    });
+
+    it("refuses while a run owns it: withdrawing approval does not race that run, it kills it", async () => {
+      const claimed = degraded({ status: "in_progress", assignee: "runner-1", updated_at: "2026-07-15T00:00:00Z" });
+      const err = (await applyWith(proposalFor(UNAPPROVE), [claimed]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+      expect(err.failure).toBe("refused");
+      expect(err.message).toMatch(/re-checks the approval after its claim settles/);
+      expect(calls.filter((c) => c.startsWith("untag"))).toEqual([]);
+    });
+
+    it("refuses a repair that landed between the decision and the write, under the bead's own lock", async () => {
+      // The snapshot still shows the degraded bead; the read taken inside the write lock shows the
+      // repair. Every other bar — open, unclaimed, still approved — is untouched by that edit, so
+      // only the re-derived gate can catch it.
+      liveBeads.set("anton-a", repaired());
+      const err = (await applyWith(proposalFor(UNAPPROVE), [degraded()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+      expect(err.failure).toBe("refused");
+      expect(err.message).toMatch(/meets the approve gate again/);
+      expect(calls.filter((c) => !c.startsWith("note anton-p1"))).toEqual([]);
+    });
   });
 
   it("refuses a split with an answer, because anton will not write new contracts on its own", async () => {
