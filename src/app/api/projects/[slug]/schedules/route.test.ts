@@ -80,13 +80,14 @@ describe("schedules route", () => {
     const res = await GET(new Request("http://t/"), ctx("tmp"));
     expect(res.status).toBe(200);
     const { schedules } = await res.json();
-    expect(schedules).toHaveLength(7);
+    expect(schedules).toHaveLength(8);
     const types = schedules.map((s: { type: string }) => s.type).sort();
     expect(types).toEqual([
       "gardener",
       "gate-check",
       "nightly-stringer",
       "orphan-grooming",
+      "product-master",
       "review-fix",
       "run-health",
       "unstick",
@@ -108,6 +109,9 @@ describe("schedules route", () => {
       // gardener (anton-3nv7) is the other opt-in: it is the only recurring job that writes to the
       // board unprompted, so an operator arms it deliberately.
       gardener: false,
+      // product-master (anton-d2sx) likewise: it spends a claude session and a founder's attention
+      // on every proposal it files.
+      "product-master": false,
     });
   });
 

@@ -217,7 +217,7 @@ function runLocal(bin, args, env = {}) {
 // runtime loads but the installer never copies is a job that dies on a missing SKILL.md.
 const AGENTS_SRC = join(APP_ROOT, "src", "prompts", "agents");
 const SKILLS_SRC = join(APP_ROOT, "skills");
-const REQUIRED_SKILLS = ["shape", "bd", "scan-triage", "review-fix", "review"];
+const REQUIRED_SKILLS = ["shape", "bd", "scan-triage", "review-fix", "review", "product-master"];
 // The full set installed into a project (non-deselectable): the runtime-required skills + the
 // founder-run `setup` scaffolder. `setup` isn't runtime-loaded, but must be installed so `/setup`
 // resolves; it ships its `.product/` templates under skills/setup/templates/, copied with it.

@@ -9,7 +9,13 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describeBd, makeBdRepo, removeTempRepo, type BdRepo } from "@/lib/testing/integration";
+import {
+  describeBd,
+  initBareRemote,
+  makeBdRepo,
+  removeTempRepo,
+  type BdRepo,
+} from "@/lib/testing/integration";
 import { beads } from "./bd";
 import { configureBeadsForRepo, configYamlHas, hasLocalDoltDb } from "./config.mjs";
 import { updateTicket } from "../ticket-detail";
@@ -136,10 +142,9 @@ describeBd("two managed repos exchange a change over refs/dolt/data with export.
     repoB = join(sandbox, "b");
 
     // Bare git remote seeded with an initial main branch (Dolt's git backend refuses an empty remote).
-    // Pin HEAD to main so the clone at repoB checks out the pushed branch — without this the bare repo's
-    // HEAD follows git's default (still `master` on many hosts), and the clone would land on an empty
-    // working tree that never receives .beads/config.yaml, silently defeating the repoB assertions.
-    execFileSync("git", ["init", "--bare", "-q", "-b", "main", bare]);
+    // Pinning HEAD to main matters here: without it the clone at repoB would land on an empty working
+    // tree that never receives .beads/config.yaml, silently defeating the repoB assertions.
+    initBareRemote(bare);
     execFileSync("git", ["init", "-q", "-b", "main", repoA]);
     gitIn(repoA, ["config", "user.email", "a@example.com"]);
     gitIn(repoA, ["config", "user.name", "anton-a"]);
@@ -232,7 +237,7 @@ describeBd("fresh clone hydrates via configureBeadsForRepo → bd bootstrap (ant
     repoA = join(sandbox, "a");
     repoB = join(sandbox, "b");
 
-    execFileSync("git", ["init", "--bare", "-q", "-b", "main", bare]);
+    initBareRemote(bare);
     execFileSync("git", ["init", "-q", "-b", "main", repoA]);
     gitIn(repoA, ["config", "user.email", "a@example.com"]);
     gitIn(repoA, ["config", "user.name", "anton-a"]);

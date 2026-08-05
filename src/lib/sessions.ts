@@ -20,6 +20,8 @@ export type SessionKind =
   | "review-fix"
   | "nightly-stringer"
   | "orphan-grooming"
+  /** A scheduled product-master pass (anton-d2sx) — judgment in, proposal beads out. */
+  | "product-master"
   | "interactive";
 export type SessionStatus = "running" | "done" | "failed";
 

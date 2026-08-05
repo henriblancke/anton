@@ -30,6 +30,7 @@ describe("describeCron", () => {
       unstick: "Hourly at :10",
       "gate-check": "Every 10 minutes",
       gardener: "Daily at 05:00",
+      "product-master": "Weekly on Monday at 06:00",
     });
   });
 

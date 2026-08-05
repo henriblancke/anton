@@ -41,6 +41,7 @@ export async function GET(_request: Request, { params }: { params: Promise<{ slu
 const MAX_SEED_PROMPT = 8000;
 const MAX_REVIEW_FIX_PROMPT = 8000;
 const MAX_REVIEW_PROMPT = 8000;
+const MAX_PRODUCT_MASTER_PROMPT = 8000;
 /** Upper bound on an operator verify-gate command (anton-3oh8) — generous for a chained gate. */
 const MAX_COMMAND = 1000;
 
@@ -181,6 +182,20 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
         { status: 400 },
       );
     } else patch.reviewFixPrompt = rf;
+  }
+
+  if ("productMasterPrompt" in body) {
+    const pm = body.productMasterPrompt;
+    // "" / null → clear the override (fall back to the shipped contract). Otherwise a bounded string.
+    if (pm == null || pm === "") patch.productMasterPrompt = undefined;
+    else if (typeof pm !== "string") {
+      return NextResponse.json({ error: "productMasterPrompt must be a string" }, { status: 400 });
+    } else if (pm.length > MAX_PRODUCT_MASTER_PROMPT) {
+      return NextResponse.json(
+        { error: `productMasterPrompt too long (max ${MAX_PRODUCT_MASTER_PROMPT} chars)` },
+        { status: 400 },
+      );
+    } else patch.productMasterPrompt = pm;
   }
 
   if ("reviewPrompt" in body) {

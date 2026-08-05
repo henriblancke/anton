@@ -44,6 +44,7 @@ interface EditableSettings {
   model?: string;
   seedPrompt?: string;
   reviewFixPrompt?: string;
+  productMasterPrompt?: string;
   /** Pre-PR self-review gate (anton-3apm); absent = ON. The knobs below only apply when on. */
   reviewEnabled?: boolean;
   reviewAgent?: string;
@@ -161,7 +162,12 @@ const SECTIONS = [
     group: "Before the PR opens",
     dirtyKeys: ["reviewFixPrompt"],
   },
-  { id: "automation", label: "Automation", group: "On a schedule", dirtyKeys: [] },
+  {
+    id: "automation",
+    label: "Automation",
+    group: "On a schedule",
+    dirtyKeys: ["productMasterPrompt"],
+  },
   { id: "danger", label: "Danger zone", group: "Irreversible", dirtyKeys: [] },
 ] as const;
 
@@ -258,6 +264,12 @@ const AUTOMATIONS: AutomationSpec[] = [
     label: "gate-check",
     description: "resumes runs whose gate closed · human gates never auto-close",
     group: "Run health",
+  },
+  {
+    id: "product-master",
+    label: "product-master",
+    description: "product judgment · proposes reprioritize / split / kill, never applies",
+    group: "Board maintenance",
   },
   {
     id: "review-fix",
@@ -404,6 +416,9 @@ export function SettingsView({
   const [model, setModel] = useState(settings.model ?? "");
   const [seedPrompt, setSeedPrompt] = useState(settings.seedPrompt ?? "");
   const [reviewFixPrompt, setReviewFixPrompt] = useState(settings.reviewFixPrompt ?? "");
+  const [productMasterPrompt, setProductMasterPrompt] = useState(
+    settings.productMasterPrompt ?? "",
+  );
   // Absent → ON: the self-review gate runs unless the operator turns it off (anton-3apm).
   const [reviewEnabled, setReviewEnabled] = useState(settings.reviewEnabled ?? true);
   const [reviewAgent, setReviewAgent] = useState(settings.reviewAgent ?? "");
@@ -453,6 +468,8 @@ export function SettingsView({
     ),
     seedPrompt: seedPrompt.trim() !== (baseline.seedPrompt ?? "").trim(),
     reviewFixPrompt: reviewFixPrompt.trim() !== (baseline.reviewFixPrompt ?? "").trim(),
+    productMasterPrompt:
+      productMasterPrompt.trim() !== (baseline.productMasterPrompt ?? "").trim(),
     formulaVariants: !sameVariants(variantRows, baseline.formulaVariants ?? []),
     concurrency: concurrency !== (baseline.concurrency ?? DEFAULT_CONCURRENCY),
     jobTimeoutMinutes:
@@ -643,6 +660,7 @@ export function SettingsView({
           model: model || null,
           seedPrompt: seedPrompt.trim() || null,
           reviewFixPrompt: reviewFixPrompt.trim() || null,
+          productMasterPrompt: productMasterPrompt.trim() || null,
           // Self-review gate (anton-3apm). "" clears the reviewer swap / prompt override → the
           // shipped review contract. The knobs are sent even while the gate is off, so turning it
           // back on restores the operator's reviewer instead of silently resetting it.
@@ -1404,6 +1422,36 @@ export function SettingsView({
               onCronChange={setAutomationCron}
               onToggle={toggleAutomation}
             />
+
+            {/* The one automation whose behaviour is a reasoning contract rather than a rule set:
+                product-master judges the board in a fresh claude session, so its prompt is the
+                knob — grouped with the schedule that fires it, not with the run's own prompts. */}
+            <div className="flex max-w-2xl flex-col gap-2">
+              <div className="flex items-center gap-2">
+                <span className="text-[12.5px] font-medium">Product-master prompt</span>
+                <span className="text-[11px] text-subtle">
+                  editable · how claude judges what matters next
+                </span>
+                {productMasterPrompt.trim() !== (settings.productMasterPrompt ?? "").trim() && (
+                  <span className="font-mono text-[10px] text-primary">unsaved</span>
+                )}
+              </div>
+              <textarea
+                value={productMasterPrompt}
+                onChange={(e) => setProductMasterPrompt(e.target.value)}
+                rows={6}
+                maxLength={8000}
+                placeholder="Override the default product-master reasoning contract. Empty = anton's shipped default (skills/product-master/SKILL.md)."
+                aria-label="Product-master prompt"
+                className="w-full resize-y rounded-lg border border-border bg-card px-3 py-2.5 font-mono text-[12px] leading-relaxed text-foreground outline-none placeholder:text-subtle focus:border-primary/60"
+              />
+              <span className="text-[11px] text-subtle">
+                The reasoning contract for the product-master pass. anton appends the board (tiers,
+                ordering edges, priorities, ages, sizes, review scores, recent runs) and the report
+                format beneath it — the pass emits proposals only and never writes to the board.
+                Empty = shipped default. {productMasterPrompt.length}/8000
+              </span>
+            </div>
           </section>
           )}
 

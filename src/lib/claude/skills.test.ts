@@ -24,7 +24,7 @@ function frontmatter(raw: string): { name?: string; description?: string } {
 describe("required skill assets", () => {
   it("ships exactly the expected required set", () => {
     expect([...REQUIRED_SKILLS].sort()).toEqual(
-      ["bd", "review", "review-fix", "scan-triage", "shape"].sort(),
+      ["bd", "review", "review-fix", "scan-triage", "shape", "product-master"].sort(),
     );
   });
 
@@ -366,6 +366,57 @@ describe("required skill assets", () => {
 
     it("does not orchestrate — anton owns the diff, the fixes, and the PR", () => {
       expect(body).toMatch(/Do not edit code, do not\nrun git, do not open or comment on a PR/);
+    });
+  });
+
+  // The product-master contract (anton-d2sx). These assert only on the load-bearing guarantees — the
+  // three claim classes the runtime knows how to file, the propose-never-act rule, the "empty is the
+  // answer" floor, and the deferral of the wire format — not on prose an operator override may
+  // restyle. Each one, if it drifted out, would turn the pass into something anton cannot execute.
+  describe("product-master contract", () => {
+    const body = stripFrontmatter(readFileSync(skillPath("product-master"), "utf8"));
+
+    it("frames the pass as fresh-context product judgment over the whole board", () => {
+      expect(body).toMatch(/fresh context/i);
+      expect(body).toMatch(/what matters next/i);
+      expect(body).toMatch(/what is too big/i);
+      expect(body).toMatch(/what should die/i);
+    });
+
+    it("names exactly the three claim classes the runtime can file", () => {
+      // Drift here is silent-but-fatal: a class anton has no detection kind for is dropped at
+      // validation, so the pass would spend its judgment on asks nobody ever sees.
+      expect(body).toMatch(/`reprioritize`/);
+      expect(body).toMatch(/`split`/);
+      expect(body).toMatch(/`kill`/);
+      expect(body).toMatch(/Exactly three classes/);
+    });
+
+    it("states that the pass proposes and never writes", () => {
+      expect(body).toMatch(/proposing\*\*, never by acting/);
+      expect(body).toMatch(/do not run `bd`/);
+    });
+
+    it("makes an empty report the expected outcome, so the pass has no noise floor", () => {
+      expect(body).toMatch(/\*\*Proposing nothing is the normal outcome\.\*\*/);
+      expect(body).toMatch(/empty report is a success/);
+    });
+
+    it("holds a kill to VALUE evidence, not to silence — that is the gardener's business", () => {
+      expect(body).toMatch(/\*\*Silence is\s*\n?not evidence\.\*\*/);
+      expect(body).toMatch(/Age alone is the gardener's business/);
+    });
+
+    it("says a split is a decision bead whose approve is refused", () => {
+      // The prose has to match `planApply`, which refuses every split by design.
+      expect(body).toMatch(/approving it is refused by design/);
+      expect(body).toMatch(/`\/shape`/);
+    });
+
+    it("defers the machine-readable format to the appended context, not the skill", () => {
+      expect(body).toMatch(/machine-readable report format is specified in the context anton appends/);
+      expect(body).toMatch(/Do not invent your own schema/);
+      expect(body).not.toMatch(/```json/);
     });
   });
 
