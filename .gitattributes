@@ -1,0 +1,9 @@
+# Source is always diffable. Without this, a single stray control byte makes git classify a
+# whole module as binary, and every diff-based reviewer (PR page, anton self-review) sees
+# nothing for it.
+*.ts text diff
+*.tsx text diff
+*.mjs text diff
+*.js text diff
+*.json text diff
+*.md text diff
