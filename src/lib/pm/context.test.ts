@@ -56,6 +56,46 @@ describe("formatPmBoardContext", () => {
     expect(text).toContain("30d since last write");
   });
 
+  /** One `### ` block of the rendered context, so a section's CONTENTS can be asserted on. */
+  const sectionOf = (text: string, heading: string): string =>
+    text.split(`### ${heading}\n`)[1]?.split("\n### ")[0] ?? "";
+
+  // The bug this guards: a parentless task/bug IS a run target (beads.isRunTarget, the approve
+  // route's standalone branch), but it is not a board CARD — so splitting on cards filed the most
+  // urgent thing on the board under "nothing will ship this", which is a kill proposal waiting to
+  // happen against the work anton runs next.
+  it("renders a standalone run target as its own block, not as work nothing will ship", () => {
+    const text = formatPmBoardContext({
+      board: [...board, bead("anton-bug", { issue_type: "bug", priority: 0 })],
+      now: NOW,
+    });
+    expect(sectionOf(text, "Run targets")).toContain("- anton-bug [bug] · P0");
+    expect(text).not.toContain("Work no run target carries");
+  });
+
+  it("carries a ticket under the run target that ships it, however deep it hangs", () => {
+    const text = formatPmBoardContext({
+      board: [...board, bead("anton-sub", { parent: "anton-tick" })],
+      now: NOW,
+    });
+    expect(sectionOf(text, "Run targets")).toMatch(/anton-feat[^\n]*\n(?: {2}- anton-\w+\n)* {2}- anton-sub/);
+  });
+
+  it("still flags work a container epic holds — no run target carries it", () => {
+    const text = formatPmBoardContext({
+      board: [
+        bead("anton-cont", { issue_type: "epic" }),
+        bead("anton-child", { issue_type: "feature", parent: "anton-cont" }),
+        bead("anton-orphan", { parent: "anton-cont" }),
+      ],
+      now: NOW,
+    });
+    expect(sectionOf(text, "Run targets")).toContain("- anton-child [feature]");
+    // The container itself is a grouping shell, so it is neither a run target nor loose work.
+    expect(text).not.toContain("anton-cont ");
+    expect(sectionOf(text, "Work no run target carries")).toContain("- anton-orphan");
+  });
+
   it("carries the review-score SERIES, which no board read alone can produce", () => {
     const text = formatPmBoardContext({
       board,

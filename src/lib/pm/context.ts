@@ -16,8 +16,16 @@
  * gardener's own detectors produce, after checking every claim against the board it was made about.
  */
 import { beads, labelValueOf, type Bead } from "../beads/bd";
+import { isPipelineArtifact } from "../beads/contract";
 import { loadSkill } from "../claude/prompt";
-import { ageInDays, indexBoard, isInFlight, isOpenWork, type BoardIndex } from "../gardener/board-index";
+import {
+  ageInDays,
+  indexBoard,
+  isInFlight,
+  isOpenWork,
+  ticketOwnerOf,
+  type BoardIndex,
+} from "../gardener/board-index";
 import { isProposalBead, makeDetection, type GardenerDetection } from "../gardener/detections";
 import { resolveProductMasterConfig, type ProjectSettings } from "../projects";
 import type { RunSummary } from "../runs";
@@ -150,50 +158,103 @@ export interface PmBoardInput {
  */
 export function formatPmBoardContext(input: PmBoardInput): string {
   const index = indexBoard(input.board);
+  const split = partitionBoard(index);
   return [
     `## Board context`,
     ``,
     `Everything below is anton's own read of this project's board, taken just now. It is the only`,
     `board you have — you cannot run \`bd\`, and nothing you write reaches it. Judge from this.`,
     ``,
-    ...cardsSection(index, input),
-    ...looseSection(index, input),
+    ...targetsSection(split, index, input),
+    ...looseSection(split, index, input),
     ...proposalsSection(input.board),
     ...runsSection(input.runs ?? []),
   ].join("\n");
 }
 
+/** The board split the way anton RUNS it: what is a run target, what rides one, what rides nothing. */
+interface PmBoardSplit {
+  /** Every open run target, in board order. */
+  targets: Bead[];
+  /** The open working-layer beads a given target carries, at any depth. */
+  ticketsOf(id: string): Bead[];
+  /** Open work no runnable target carries — nothing will ship it as it stands. */
+  loose: Bead[];
+}
+
 /**
- * The run targets, each with the tickets it carries. Grouped by card rather than listed flat because
- * every question the pass answers is relational — is THIS ranked right against the things it blocks,
- * is THIS one bead doing several jobs — and a flat list of two hundred ids answers none of them.
+ * Who runs what, resolved through `beads.isRunTarget` and {@link ticketOwnerOf} — the SAME predicates
+ * execute-epic and the approve route gate on — rather than through `index.cards`, which is narrower.
+ *
+ * The distinction is not cosmetic: `isBoardCard` restricts to epic/feature because the board renders
+ * a parentless task/bug as a standalone chip instead of a card, but that bead is a run target and
+ * anton will run it. Splitting on cards therefore filed every standalone target under "no board card
+ * carries this" — telling the pass that a parentless P0 bug, the most urgent thing on the board, can
+ * never ship, which is exactly the input that produces a kill proposal on the work anton runs next.
  */
-function cardsSection(index: BoardIndex, input: PmBoardInput): string[] {
-  const cards = index.all
-    .filter((b) => index.cards.ids.has(b.id) && isOpenWork(b))
-    .sort(byPriorityThenId);
-  const shown = cards.slice(0, MAX_CARDS);
+function partitionBoard(index: BoardIndex): PmBoardSplit {
+  const targets: Bead[] = [];
+  const targetIds = new Set<string>();
+  for (const bead of index.all) {
+    if (!isOpenWork(bead) || isProposalBead(bead)) continue;
+    if (!beads.isRunTarget(bead, index.all)) continue;
+    targets.push(bead);
+    targetIds.add(bead.id);
+  }
+
+  const tickets = new Map<string, Bead[]>();
+  const loose: Bead[] = [];
+  for (const bead of index.all) {
+    if (!isOpenWork(bead) || isProposalBead(bead) || targetIds.has(bead.id)) continue;
+    // Plumbing coordinates work rather than being it; ranking or killing a gate is meaningless.
+    if (isPipelineArtifact(bead)) continue;
+    const owner = ticketOwnerOf(index, bead);
+    if (owner && targetIds.has(owner.id)) {
+      const carried = tickets.get(owner.id);
+      if (carried) carried.push(bead);
+      else tickets.set(owner.id, [bead]);
+    } else if (!beads.isContainer(bead, index.all)) {
+      loose.push(bead);
+    }
+  }
+
+  return {
+    targets: targets.sort(byPriorityThenId),
+    ticketsOf: (id) => (tickets.get(id) ?? []).sort(byPriorityThenId),
+    loose: loose.sort(byPriorityThenId),
+  };
+}
+
+/**
+ * The run targets, each with the tickets it carries. Grouped by target rather than listed flat
+ * because every question the pass answers is relational — is THIS ranked right against the things it
+ * blocks, is THIS one bead doing several jobs — and a flat list of two hundred ids answers none of
+ * them.
+ */
+function targetsSection(split: PmBoardSplit, index: BoardIndex, input: PmBoardInput): string[] {
+  const shown = split.targets.slice(0, MAX_CARDS);
   const lines: string[] = [
     `### Run targets`,
     ``,
-    `Each block is one board card — the unit anton actually runs — followed by the tickets it`,
-    `carries. \`blocked by\` is a \`blocks\` edge the graph already records.`,
+    `Each block is one run target — the unit anton actually runs — followed by the tickets it`,
+    `carries. A block with no tickets under it runs as a single ticket, itself. \`blocked by\` is a`,
+    `\`blocks\` edge the graph already records.`,
     ``,
   ];
-  for (const card of shown) {
-    lines.push(beadLine(card, index, input, ""));
-    const tickets = index.childrenOf(card.id).filter(isOpenWork).sort(byPriorityThenId);
+  for (const target of shown) {
+    lines.push(beadLine(target, index, input, ""));
+    const tickets = split.ticketsOf(target.id);
     for (const ticket of tickets.slice(0, MAX_TICKETS_PER_CARD)) {
       lines.push(beadLine(ticket, index, input, "  "));
     }
     const dropped = tickets.length - MAX_TICKETS_PER_CARD;
-    if (dropped > 0) lines.push(`  - …and ${dropped} more ticket(s) under ${card.id}, not shown`);
+    if (dropped > 0) lines.push(`  - …and ${dropped} more ticket(s) under ${target.id}, not shown`);
   }
   if (shown.length === 0) lines.push(`(no open run targets)`);
-  if (cards.length > shown.length) {
+  if (split.targets.length > shown.length) {
     lines.push(
       ``,
-      `${cards.length - shown.length} further run target(s) are NOT shown — this list is capped at`,
+      `${split.targets.length - shown.length} further run target(s) are NOT shown — this list is capped at`,
       `${MAX_CARDS}, lowest priority first. Do not read their absence as "the board holds nothing else".`,
     );
   }
@@ -202,29 +263,19 @@ function cardsSection(index: BoardIndex, input: PmBoardInput): string[] {
 }
 
 /**
- * Open working-layer beads no card carries. Shown because they are still work the project is holding
- * — and flagged as unowned, because "give this a home" is the GARDENER's proposal, not this pass's:
- * without the flag a ranking judgment made about them would silently duplicate that ask.
+ * Open working-layer beads no run target carries. Shown because they are still work the project is
+ * holding — and flagged as unowned, because "give this a home" is the GARDENER's proposal, not this
+ * pass's: without the flag a ranking judgment made about them would silently duplicate that ask.
  */
-function looseSection(index: BoardIndex, input: PmBoardInput): string[] {
-  const loose = index.all
-    .filter(
-      (b) =>
-        isOpenWork(b) &&
-        !isProposalBead(b) &&
-        !index.cards.ids.has(b.id) &&
-        !index.cards.cardOf(b) &&
-        !beads.isContainer(b, index.all),
-    )
-    .sort(byPriorityThenId);
-  if (loose.length === 0) return [];
+function looseSection(split: PmBoardSplit, index: BoardIndex, input: PmBoardInput): string[] {
+  if (split.loose.length === 0) return [];
   return [
-    `### Work no board card carries`,
+    `### Work no run target carries`,
     ``,
     `These ride no run target, so nothing will ship them as they stand. Re-homing them is the`,
     `gardener pass's proposal, not yours — rank, split or kill them only on their own merits.`,
     ``,
-    ...loose.slice(0, MAX_CARDS).map((b) => beadLine(b, index, input, "")),
+    ...split.loose.slice(0, MAX_CARDS).map((b) => beadLine(b, index, input, "")),
     ``,
   ];
 }
