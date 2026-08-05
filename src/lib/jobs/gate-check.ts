@@ -232,7 +232,9 @@ async function surfaceStall(
   );
   await beads
     .tag(pass.repo, gate.id, [GATE_EXPIRED_LABEL])
-    .catch((e) => console.error(`[gate-check] failed to surface expired gate ${gate.id}:`, e));
+    .catch((e) =>
+      console.error(`[gate-check] failed to tag expired gate ${gate.id} (${GATE_EXPIRED_LABEL}):`, e),
+    );
   return true;
 }
 
