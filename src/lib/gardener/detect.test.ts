@@ -14,7 +14,7 @@ import { describe, expect, it } from "vitest";
 import { LABELS, type Bead } from "../beads/bd";
 import type { HygieneFinding } from "../hygiene";
 import { detectBoard, type GardenerDetection } from "./detect";
-import { GARDENER_LABEL_PREFIX, concernedBeads } from "./detections";
+import { concernedBeads, namespaceOf } from "./detections";
 import { RETIRE_STALE_IN_PROGRESS_DAYS, RETIRE_STALE_OPEN_DAYS } from "./retire";
 
 const NOW = Date.parse("2026-08-03T00:00:00Z");
@@ -812,7 +812,7 @@ describe("fingerprints", () => {
     expect(new Set(fingerprints).size).toBe(2);
     for (const fingerprint of fingerprints) {
       expect(fingerprint).toMatch(
-        new RegExp(`^${GARDENER_LABEL_PREFIX}:container-orphan:[0-9a-f]{12}$`),
+        new RegExp(`^${namespaceOf("container-orphan")}:container-orphan:[0-9a-f]{12}$`),
       );
     }
   });

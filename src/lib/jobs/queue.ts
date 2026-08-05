@@ -23,7 +23,8 @@ export type JobType =
   | "run-health"
   | "unstick"
   | "gate-check"
-  | "gardener";
+  | "gardener"
+  | "product-master";
 
 /**
  * `queued`  — eligible when runAt ≤ now (also how a backoff/quota reschedule is represented).

@@ -65,6 +65,8 @@ export const JOB_TYPE_TIER: Record<JobType, BurnTier> = {
   unstick: "none",
   "gate-check": "none",
   gardener: "none",
+  // One judgment session over the board, no worktree and no code: closer to a triage pass than a run.
+  "product-master": "S",
 };
 
 /**

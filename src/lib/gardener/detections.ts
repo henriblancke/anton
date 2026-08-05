@@ -1,13 +1,20 @@
 /**
- * What a gardener DETECTION is (anton-02oc): one evidenced claim that the board's SHAPE is wrong,
- * carrying everything a proposal bead needs and nothing it doesn't.
+ * What a PROPOSAL DETECTION is (anton-02oc): one evidenced claim that something about the board is
+ * wrong, carrying everything a proposal bead needs and nothing it doesn't.
+ *
+ * TWO PRODUCERS share this module, and the sharing is the point. The gardener (anton-e42l) detects
+ * STRUCTURAL hygiene — work that rides no card, an ordering no edge records, work reality has moved
+ * past — in code, from a board snapshot. The product master (anton-d2sx) exercises PRODUCT judgment
+ * — what matters next, what is too big, what should die — in an LLM session, and its claims arrive
+ * as a report anton turns into detections here. Both then travel the identical path: fingerprint
+ * dedup (anton-9qwq), evidence and `discovered-from` provenance on the bead, apply-on-approve
+ * (anton-1t3n), decline-as-abandon. One machinery, two namespaces — `gardener:` and `pm:` — so a
+ * reader, a re-run, and the approve route each have exactly one convention to know.
  *
  * The split from the hygiene report (src/lib/hygiene.ts) is deliberate. A hygiene FINDING is bd's
  * own verdict on one bead — bd owns lint/stale/orphans/duplicates and the patrol never re-derives
- * them. A DETECTION is anton's judgment about how beads relate: work that rides no board card, a
- * cluster that obviously belongs under one feature, an ordering a body states but no edge records,
- * work the board still holds open that reality has moved past. bd has no verb for any of those,
- * because they are questions about anton's own tier model.
+ * them. A DETECTION is anton's judgment: about how beads relate, or about what they are worth. bd
+ * has no verb for any of it, because they are questions about anton's own tier and product model.
  *
  * Detections are pure VALUES: nothing here reads a repo or writes a bead. Emission is anton-9qwq's
  * job and application anton-1t3n's — a detector that could apply itself would make the approval gate
@@ -16,14 +23,31 @@
 import { createHash } from "node:crypto";
 
 /**
+ * Which producer filed a proposal. It is the fingerprint's label prefix, the `source:` label, and
+ * the word the bead's prose introduces itself with — so a founder reading a proposal knows whether a
+ * mechanical patrol or a judgment pass raised it, and `/scan-triage` can dedup across both
+ * (board-context.ts `PRODUCER_NAMESPACES`).
+ */
+export type ProposalNamespace = "gardener" | "pm";
+
+export const PROPOSAL_NAMESPACES: readonly ProposalNamespace[] = ["gardener", "pm"];
+
+/**
  * The apply verb class a detection would resolve to if approved (anton-1t3n). Carried on the
  * detection rather than inferred later from `kind`, so a new kind must state which move it wants
  * instead of silently falling into someone's default branch.
+ *
+ * `split` is the one move anton deliberately CANNOT run: decomposing a ticket means writing new
+ * contracts, which is `/shape`'s job and a human's call. It is a move all the same, because the ask
+ * still belongs on the board with evidence and a fingerprint — approving it is refused, and
+ * declining is what settles it (the same shape as a targetless re-parent; see `isManualProposal`).
  */
-export type GardenerMove = "reparent" | "link" | "retire";
+export type GardenerMove = "reparent" | "link" | "retire" | "reprioritize" | "split";
 
 /**
- * The board-shape smells the detectors know how to name:
+ * The claims the two producers know how to name.
+ *
+ * The gardener's — board SHAPE, detected mechanically:
  *   • `container-orphan`    — a working-layer bead whose parent is a CONTAINER epic, so no board
  *                             card carries it and no run will ever ship it (the anton-do0q class).
  *   • `parentless-cluster`  — parentless working-layer beads that share one obvious card home.
@@ -32,6 +56,12 @@ export type GardenerMove = "reparent" | "link" | "retire";
  *   • `superseded`          — an open bead whose identical twin already landed.
  *   • `stale`               — untouched far past the report threshold for its status.
  *   • `shipped-orphan`      — a commit shipped it, the board never closed it.
+ *
+ * The product master's — PRODUCT judgment, reported by a fresh-context session (anton-d2sx):
+ *   • `mispriority`         — the bead's priority contradicts what the board says it is worth.
+ *   • `missing-order`       — one top-tier bead has to land before another and no edge says so.
+ *   • `oversized`           — one ticket carries several concerns, with a decomposition sketch.
+ *   • `low-value`           — work whose value the evidence no longer supports: kill it.
  */
 export type GardenerDetectionKind =
   | "container-orphan"
@@ -39,7 +69,11 @@ export type GardenerDetectionKind =
   | "implied-order"
   | "superseded"
   | "stale"
-  | "shipped-orphan";
+  | "shipped-orphan"
+  | "mispriority"
+  | "missing-order"
+  | "oversized"
+  | "low-value";
 
 export const GARDENER_DETECTION_KINDS: readonly GardenerDetectionKind[] = [
   "container-orphan",
@@ -48,6 +82,10 @@ export const GARDENER_DETECTION_KINDS: readonly GardenerDetectionKind[] = [
   "superseded",
   "stale",
   "shipped-orphan",
+  "mispriority",
+  "missing-order",
+  "oversized",
+  "low-value",
 ];
 
 /**
@@ -60,33 +98,94 @@ export const GARDENER_DETECTION_KINDS: readonly GardenerDetectionKind[] = [
 export type RetireVerb = "close" | "supersede" | "defer";
 
 /**
- * The one move each kind resolves to. A detection still STATES its move (see {@link GardenerMove}) —
- * this is the table that says the statement was true, and it is the only thing binding `move` and
- * `retireAs` to a proposal's identity: the fingerprint hashes what the claim is ABOUT (kind,
- * subjects, target), so without a canonical pairing a hand-edited bead could keep its label and its
- * hash while swapping a `stale` defer for a close. Every kind is listed, so adding one without
- * deciding its verb is a type error rather than a silent default.
+ * The shape of the one PARAMETER a move can take that is not a bead id — carried in
+ * {@link GardenerDetection.detail} and validated against this pattern at both ends.
+ *
+ * Only `reprioritize` needs one today: "which priority" is neither a subject nor a target, and it is
+ * the whole content of the ask. It is part of the fingerprinted identity (see
+ * {@link detectionSubjectKey}) precisely because it decides what gets written — without that, a
+ * hand-edited bead could keep its label and its hash while swapping P3 for P0.
  */
-export const CANONICAL_MOVE: Record<
-  GardenerDetectionKind,
-  { move: GardenerMove; retireAs?: RetireVerb }
-> = {
-  "container-orphan": { move: "reparent" },
-  "parentless-cluster": { move: "reparent" },
-  "implied-order": { move: "link" },
-  superseded: { move: "retire", retireAs: "supersede" },
-  stale: { move: "retire", retireAs: "defer" },
-  "shipped-orphan": { move: "retire", retireAs: "close" },
+export type DetailShape = "priority";
+
+const DETAIL_PATTERN: Record<DetailShape, RegExp> = { priority: /^P[0-4]$/ };
+
+/** What one detection kind IS: who files it, what it applies as, and what parameter it carries. */
+export interface KindSpec {
+  namespace: ProposalNamespace;
+  move: GardenerMove;
+  retireAs?: RetireVerb;
+  /** Set exactly when the move takes a non-bead parameter; absent means `detail` is forbidden. */
+  detail?: DetailShape;
+}
+
+/**
+ * The one move each kind resolves to, and the producer it belongs to. A detection still STATES its
+ * move (see {@link GardenerMove}) — this is the table that says the statement was true, and it is
+ * the only thing binding `move` and `retireAs` to a proposal's identity: the fingerprint hashes what
+ * the claim is ABOUT (kind, subjects, target, detail), so without a canonical pairing a hand-edited
+ * bead could keep its label and its hash while swapping a `stale` defer for a close. Every kind is
+ * listed, so adding one without deciding its verb is a type error rather than a silent default.
+ *
+ * The product master's kills DEFER rather than close. `close` records work that LANDED and `abandon`
+ * is the human's recorded won't-do (and the verb that DECLINES a proposal), so neither is honest for
+ * a judgment pass: deferring takes the bead out of the ready set and off the roadmap with its
+ * contract intact, and `bd undefer` puts it back. A permanent won't-do stays a human's act — which
+ * is the right bar for a kill an LLM proposed.
+ */
+export const KINDS: Record<GardenerDetectionKind, KindSpec> = {
+  "container-orphan": { namespace: "gardener", move: "reparent" },
+  "parentless-cluster": { namespace: "gardener", move: "reparent" },
+  "implied-order": { namespace: "gardener", move: "link" },
+  superseded: { namespace: "gardener", move: "retire", retireAs: "supersede" },
+  stale: { namespace: "gardener", move: "retire", retireAs: "defer" },
+  "shipped-orphan": { namespace: "gardener", move: "retire", retireAs: "close" },
+  mispriority: { namespace: "pm", move: "reprioritize", detail: "priority" },
+  "missing-order": { namespace: "pm", move: "link" },
+  oversized: { namespace: "pm", move: "split" },
+  "low-value": { namespace: "pm", move: "retire", retireAs: "defer" },
 };
+
+/** Which producer files this kind — the fingerprint's prefix and the proposal's `source:` label. */
+export function namespaceOf(kind: GardenerDetectionKind): ProposalNamespace {
+  return KINDS[kind].namespace;
+}
+
+/**
+ * Does this proposal name a move anton can RUN, or only a question a human can answer?
+ *
+ * Two shapes reach here. A `split` never has a mechanical answer — decomposing a ticket writes new
+ * contracts, which is `/shape`'s work. A container orphan with no single open feature home files
+ * WITHOUT a target on purpose (see reparent.ts): the ask is real, but the answer is a choice.
+ *
+ * Both are filed anyway, because the ASK belongs on the board with its evidence and its fingerprint;
+ * what changes is how it settles. Approve refuses, and DECLINING is what records the answer — which
+ * both the proposal's own prose (emit.ts) and the apply's refusal have to say out loud, or a card
+ * that reads "approving applies the move" while Approve always refuses is worse than the bead it is
+ * about.
+ */
+export function isManualProposal(plan: { move: GardenerMove; target?: string }): boolean {
+  return plan.move === "split" || (plan.move === "reparent" && !plan.target);
+}
+
+/**
+ * The bd priority a `reprioritize` plan asks for, or undefined when it carries none. Parsed rather
+ * than stored as a number so the wire form stays the `P<n>` an operator reads on the bead, and so a
+ * detail that is not a priority at all can never be coerced into one.
+ */
+export function priorityOf(plan: { move: GardenerMove; detail?: string }): number | undefined {
+  if (plan.move !== "reprioritize" || !plan.detail) return undefined;
+  return DETAIL_PATTERN.priority.test(plan.detail) ? Number(plan.detail.slice(1)) : undefined;
+}
 
 export interface GardenerDetection {
   kind: GardenerDetectionKind;
   move: GardenerMove;
   /**
-   * Stable dedup key, label-safe: `gardener:<kind>:<hash of subjectKey>`. Hashed rather than spelled
-   * out because a cluster's key spans every member — an id list grows past what belongs in a bd
-   * label. Mirrors the `stringer:<collector>:<hash>` fingerprint /scan-triage already tags with, so
-   * the board has one convention for "this proposal was already made" (anton-9qwq).
+   * Stable dedup key, label-safe: `<namespace>:<kind>:<hash of subjectKey>`. Hashed rather than
+   * spelled out because a cluster's key spans every member — an id list grows past what belongs in a
+   * bd label. Mirrors the `stringer:<collector>:<hash>` fingerprint /scan-triage already tags with,
+   * so the board has one convention for "this proposal was already made" (anton-9qwq).
    */
   fingerprint: string;
   /** The readable key the fingerprint hashes — kept for debugging and for tests to assert against. */
@@ -97,6 +196,13 @@ export interface GardenerDetection {
   target?: string;
   /** Set exactly when `move` is `retire` — which of bd's three retirement verbs this asks for. */
   retireAs?: RetireVerb;
+  /**
+   * The move's non-bead parameter, set exactly when its kind declares a {@link DetailShape} — today
+   * a `reprioritize`'s target priority, as `P0`…`P4`. Part of the fingerprinted identity: two
+   * priorities for one bead are two different asks, and collapsing them would let the first one
+   * approved suppress the second forever.
+   */
+  detail?: string;
   /** One line: what is wrong and what the move would do. The proposal's title material. */
   summary: string;
   /**
@@ -107,9 +213,6 @@ export interface GardenerDetection {
   evidence: string[];
 }
 
-/** The label namespace every gardener fingerprint lives in. */
-export const GARDENER_LABEL_PREFIX = "gardener";
-
 /** How much of the digest the fingerprint carries — collision-safe at board scale, label-short. */
 const FINGERPRINT_HASH_LENGTH = 12;
 
@@ -119,6 +222,7 @@ export interface DetectionInput {
   subjects: string[];
   target?: string;
   retireAs?: RetireVerb;
+  detail?: string;
   summary: string;
   evidence: string[];
 }
@@ -133,7 +237,7 @@ export interface DetectionInput {
  * first one approved suppress the second forever.
  */
 export function makeDetection(input: DetectionInput): GardenerDetection {
-  const canonical = CANONICAL_MOVE[input.kind];
+  const canonical = KINDS[input.kind];
   if (canonical.move !== input.move || canonical.retireAs !== input.retireAs) {
     // Fail loud at emission rather than filing a bead nobody can approve: apply reads the plan back
     // against this same table, so a detector that drifts from it would put proposals on the board
@@ -142,45 +246,74 @@ export function makeDetection(input: DetectionInput): GardenerDetection {
       `${input.kind} is a ${canonical.move}${canonical.retireAs ? `/${canonical.retireAs}` : ""} detection, not ${input.move}${input.retireAs ? `/${input.retireAs}` : ""}`,
     );
   }
+  const detailError = detailViolation(input.kind, input.detail);
+  if (detailError) throw new Error(detailError);
   const subjects = [...input.subjects].sort();
-  const subjectKey = detectionSubjectKey(input.kind, subjects, input.target);
+  const subjectKey = detectionSubjectKey(input.kind, subjects, input.target, input.detail);
   return {
     kind: input.kind,
     move: input.move,
-    fingerprint: gardenerFingerprint(input.kind, subjectKey),
+    fingerprint: proposalFingerprint(input.kind, subjectKey),
     subjectKey,
     subjects,
     ...(input.target ? { target: input.target } : {}),
     ...(input.retireAs ? { retireAs: input.retireAs } : {}),
+    ...(input.detail ? { detail: input.detail } : {}),
     summary: input.summary,
     evidence: input.evidence,
   };
 }
 
 /**
+ * Why this kind cannot carry this `detail`, or undefined when the pair is legal. Required exactly
+ * where {@link KINDS} declares a shape and forbidden everywhere else — the same all-or-nothing
+ * invariant `retireAs` holds, and for the same reason: a move whose parameter is missing has no safe
+ * default, and one carrying a parameter nothing reads is a plan whose identity says more than its
+ * execution does.
+ */
+function detailViolation(kind: GardenerDetectionKind, detail: string | undefined): string | undefined {
+  const shape = KINDS[kind].detail;
+  if (!shape) {
+    return detail === undefined ? undefined : `${kind} takes no detail, but "${detail}" was given`;
+  }
+  if (detail === undefined) return `${kind} requires a ${shape} detail`;
+  return DETAIL_PATTERN[shape].test(detail)
+    ? undefined
+    : `"${detail}" is not a ${shape} (expected ${DETAIL_PATTERN[shape]})`;
+}
+
+/**
  * What a detection is ABOUT, as one readable string: the kind, its subjects (sorted, so two patrols
- * that walk the board in different orders agree), and whatever it points at. The identity the
- * fingerprint hashes — and the thing apply RECOMPUTES from a proposal's own fields, so a bead whose
- * subjects or target were edited after emission no longer matches its label.
+ * that walk the board in different orders agree), whatever it points at, and the move's parameter
+ * when it takes one. The identity the fingerprint hashes — and the thing apply RECOMPUTES from a
+ * proposal's own fields, so a bead whose subjects, target or detail were edited after emission no
+ * longer matches its label.
  */
 export function detectionSubjectKey(
   kind: GardenerDetectionKind,
   subjects: string[],
   target?: string,
+  detail?: string,
 ): string {
   const sorted = [...subjects].sort();
-  return `${kind}:${sorted.join("+")}` + (target ? `>${target}` : "");
+  return (
+    `${kind}:${sorted.join("+")}` + (target ? `>${target}` : "") + (detail ? `#${detail}` : "")
+  );
 }
 
-/** `gardener:<kind>:<hash>` — the label a proposal bead carries so a re-run recognises its own work. */
-export function gardenerFingerprint(kind: GardenerDetectionKind, subjectKey: string): string {
+/**
+ * `<namespace>:<kind>:<hash>` — the label a proposal bead carries so a re-run recognises its own
+ * work. The namespace comes from the KIND rather than from the caller, so the gardener cannot file
+ * under `pm:` (or the reverse) even by mistake, and the two producers can never collide on a hash.
+ */
+export function proposalFingerprint(kind: GardenerDetectionKind, subjectKey: string): string {
   const hash = createHash("sha1").update(subjectKey).digest("hex").slice(0, FINGERPRINT_HASH_LENGTH);
-  return `${GARDENER_LABEL_PREFIX}:${kind}:${hash}`;
+  return `${namespaceOf(kind)}:${kind}:${hash}`;
 }
 
-/** The fingerprint label's exact shape, so an unrelated `gardener:`-ish label is never mistaken for one. */
+/** A fingerprint label's exact shape, so an unrelated `pm:`-ish label is never mistaken for one. */
 const FINGERPRINT_LABEL = new RegExp(
-  `^${GARDENER_LABEL_PREFIX}:[a-z-]+:[0-9a-f]{${FINGERPRINT_HASH_LENGTH}}$`,
+  `^(?:${PROPOSAL_NAMESPACES.join("|")}):[a-z-]+:[0-9a-f]{${FINGERPRINT_HASH_LENGTH}}$`,
 );
 
 /**
@@ -206,6 +339,10 @@ export function isProposalBead(bead: { labels?: string[] }): boolean {
  * the human deciding; THIS is what the apply step reads — the move as data, written in the same
  * `bd create` as the bead itself, so approving one never depends on parsing a description a person
  * is free to edit.
+ *
+ * ONE key for both producers, despite the name it was born with: apply has a single reader, and a
+ * per-namespace key would fork it into two that must never disagree. The plan's own `kind` already
+ * says which producer filed it ({@link namespaceOf}).
  */
 export const GARDENER_PLAN_KEY = "gardener";
 
@@ -234,6 +371,8 @@ export interface GardenerPlan {
   subjects: string[];
   target?: string;
   retireAs?: RetireVerb;
+  /** The move's non-bead parameter — see {@link GardenerDetection.detail}. */
+  detail?: string;
 }
 
 /** The plan half of a detection — what rides on the proposal bead as metadata. */
@@ -245,10 +384,17 @@ export function planOf(detection: GardenerDetection): GardenerPlan {
     subjects: detection.subjects,
     ...(detection.target ? { target: detection.target } : {}),
     ...(detection.retireAs ? { retireAs: detection.retireAs } : {}),
+    ...(detection.detail ? { detail: detection.detail } : {}),
   };
 }
 
-const GARDENER_MOVES: readonly GardenerMove[] = ["reparent", "link", "retire"];
+const GARDENER_MOVES: readonly GardenerMove[] = [
+  "reparent",
+  "link",
+  "retire",
+  "reprioritize",
+  "split",
+];
 const RETIRE_VERBS: readonly RetireVerb[] = ["close", "supersede", "defer"];
 
 /**
@@ -298,14 +444,26 @@ export function parseGardenerPlan(value: unknown): GardenerPlan | undefined {
     return undefined;
   }
 
+  const detail = raw.detail;
+  if (detail !== undefined && (typeof detail !== "string" || !detail)) return undefined;
+  // Required exactly where the kind declares a shape, forbidden elsewhere, and matching that shape:
+  // the same bar `makeDetection` holds the emitter to, re-applied to a metadata blob a human can
+  // edit. A `reprioritize` whose detail is not a priority has nothing to write.
+  if (detailViolation(kind as GardenerDetectionKind, detail as string | undefined)) return undefined;
+
   // The move must be the one this kind means, and the identity must be the one these fields hash to.
-  const canonical = CANONICAL_MOVE[kind as GardenerDetectionKind];
+  const canonical = KINDS[kind as GardenerDetectionKind];
   if (canonical.move !== move || canonical.retireAs !== (move === "retire" ? retireAs : undefined)) {
     return undefined;
   }
-  const recomputed = gardenerFingerprint(
+  const recomputed = proposalFingerprint(
     kind as GardenerDetectionKind,
-    detectionSubjectKey(kind as GardenerDetectionKind, subjects as string[], target as string | undefined),
+    detectionSubjectKey(
+      kind as GardenerDetectionKind,
+      subjects as string[],
+      target as string | undefined,
+      detail as string | undefined,
+    ),
   );
   if (recomputed !== fingerprint) return undefined;
 
@@ -316,6 +474,7 @@ export function parseGardenerPlan(value: unknown): GardenerPlan | undefined {
     subjects: subjects as string[],
     ...(target ? { target: target as string } : {}),
     ...(move === "retire" ? { retireAs: retireAs as RetireVerb } : {}),
+    ...(detail ? { detail: detail as string } : {}),
   };
 }
 

@@ -53,14 +53,19 @@ import {
   fingerprintLabelOf,
   GARDENER_OBSERVED_AT_KEY,
   isProposalBead,
+  namespaceOf,
+  priorityOf,
   proposalPlanOf,
   type GardenerDetectionKind,
   type GardenerPlan,
 } from "./detections";
 import { impliesOrdering } from "./relink";
 
-/** The `notes` prefix every gardener apply writes under — one line, like anton's other job notes. */
-const NOTE_PREFIX = "gardener";
+/**
+ * The `notes` prefix an apply writes under — one line, like anton's other job notes, and named for
+ * the producer whose proposal it is so a reader can tell a patrol's note from a judgment pass's.
+ */
+const notePrefix = (plan: GardenerPlan): string => namespaceOf(plan.kind);
 
 /** What every step carries about the bead it writes to, whatever the verb. */
 interface StepSubject {
@@ -100,29 +105,56 @@ export type ApplyStep =
        */
       parentClaim: string;
     })
-  | (StepSubject & { verb: "link"; blocker: string })
-  | (StepSubject & TicketOwner & RetireEvidence & { verb: "close"; reason: string })
-  | (StepSubject & TicketOwner & RetireEvidence & { verb: "supersede"; replacement: string })
-  | (StepSubject & TicketOwner & RetireEvidence & { verb: "defer" });
+  | (StepSubject & {
+      verb: "link";
+      blocker: string;
+      /**
+       * Which ask drew this edge. Carried because the two link kinds rest on DIFFERENT evidence: an
+       * `implied-order` reads a phrase in one of the beads' bodies, so the write re-derives it under
+       * the pair's locks ({@link assertOrderingStated}); a `missing-order` is the product master's
+       * own judgment, which no board read can restate — holding it to the phrase check would refuse
+       * it forever.
+       */
+      kind: GardenerDetectionKind;
+    })
+  | (StepSubject &
+      EvidenceFence & {
+        verb: "reprioritize";
+        /**
+         * bd priority, 0 (critical) … 4 (lowest) — parsed from the plan's `P<n>` detail. Carries no
+         * undo, unlike a re-parent: a priority proposal names exactly one bead, so its single step
+         * is the whole move and a failure leaves nothing written (see {@link rollbackSteps}).
+         */
+        priority: number;
+      })
+  | (StepSubject & TicketOwner & EvidenceFence & { verb: "close"; reason: string })
+  | (StepSubject & TicketOwner & EvidenceFence & { verb: "supersede"; replacement: string })
+  | (StepSubject & TicketOwner & EvidenceFence & { verb: "defer" });
 
 /**
- * What a RETIREMENT's evidence rests on, carried forward so the locked re-read can re-ask it — the
- * {@link StepSubject.claim} treatment for the one precondition no board read re-derives.
+ * What a CONTENT-derived move's evidence rests on, carried forward so the locked re-read can re-ask
+ * it — the {@link StepSubject.claim} treatment for the one precondition no board read re-derives.
  *
- * Every other bar a retirement holds its subject to is a fact about the board's CURRENT shape:
+ * Every other bar such a move holds its subject to is a fact about the board's CURRENT shape:
  * status, liveness, claim, ticket set, open descendants. The premise is not — it is "nobody has
- * rewritten this bead since the patrol read it" ({@link premiseTouched}), and `planRetire` asks it
+ * rewritten this bead since the pass read it" ({@link premiseTouched}), and the decision asks it
  * of the route's snapshot, which is already seconds old when the first bd write spawns. An edit
  * landing in that window rescopes the work while leaving every other bar untouched, so without this
- * the close/defer/supersede goes ahead on evidence the edit falsified.
+ * the write goes ahead on evidence the edit falsified.
  *
- * The kind (not the resolved premise) so the write re-derives through the same `RETIRE_PREMISE` the
- * decision used, and the observation stamp verbatim so both readings date against the same fence.
- * Unlike the topology re-checks, this one is a NARROWING rather than a serialization: an operator's
- * `bd update` takes no in-process lock, so the window it closes is snapshot→lock, not lock→write.
+ * Carried by the retirements and by `reprioritize`: all four rest on a reading of what the bead IS
+ * — silence, a match against a twin, a commit that shipped it, a judgment of what it is worth — and
+ * none of those survives a rewrite. The topology verbs (`reparent`, `link`) carry none, because
+ * their whole claim is re-derivable from a fresh board read.
+ *
+ * The kind (not the resolved premise) so the write re-derives through the same
+ * {@link EVIDENCE_PREMISE} the decision used, and the observation stamp verbatim so both readings
+ * date against the same fence. Unlike the topology re-checks, this one is a NARROWING rather than a
+ * serialization: an operator's `bd update` takes no in-process lock, so the window it closes is
+ * snapshot→lock, not lock→write.
  */
-interface RetireEvidence {
-  /** The detection kind whose premise this rests on — {@link RETIRE_PREMISE}'s key. */
+interface EvidenceFence {
+  /** The detection kind whose premise this rests on — {@link EVIDENCE_PREMISE}'s key. */
   kind: GardenerDetectionKind;
   /** The moment the patrol observed the board — {@link ApplyMoment.observedAtMs}, carried as-is. */
   observedAtMs: number | undefined;
@@ -200,6 +232,16 @@ export function planApply(plan: GardenerPlan, board: Bead[], at: ApplyMoment): A
       return planLink(plan, index, at);
     case "retire":
       return planRetire(plan, index, at);
+    case "reprioritize":
+      return planReprioritize(plan, index, at);
+    case "split":
+      // The one move anton never runs. Decomposing a ticket writes new contracts — `/shape`'s work,
+      // and a human's call — so the proposal carries the sketch and the evidence, and settling it is
+      // a DECLINE. Refusing here rather than at emission is what keeps the ask on the board.
+      return {
+        status: "refuse",
+        reason: `splitting ${list(plan.subjects)} means writing new contracts, which anton will not do on its own — decompose it with \`/shape\` (the proposal's sketch is the starting point) and decline this proposal`,
+      };
   }
 }
 
@@ -350,8 +392,68 @@ function planLink(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): Apply
 
   return {
     status: "apply",
-    steps: [{ verb: "link", id, claim: runClaimOf(blocked), blocker: plan.target }],
+    steps: [{ verb: "link", id, claim: runClaimOf(blocked), blocker: plan.target, kind: plan.kind }],
     summary: `recorded that ${plan.target} blocks ${id}`,
+  };
+}
+
+/**
+ * A priority change (anton-d2sx) — the one move that rewrites a FIELD rather than the graph.
+ *
+ * It holds the subject to the same bars every other move does — on the board, open, not mid-run,
+ * not claimed since the filing. What it does NOT need is the stranding and ancestry machinery the
+ * graph verbs carry: a priority touches one field on one bead and moves nothing, so nothing can be
+ * left hanging by it.
+ *
+ * The evidence fence matters more here than anywhere else, and settles LAST: a priority is what
+ * anyone editing a bead is most likely to touch by hand, and the pass's judgment was made about the
+ * bead as it read that night. A subject already AT the asked-for priority settles before the fence
+ * is consulted — the outcome is the board's state whoever put it there, and refusing over a stamp
+ * would leave the ask open forever on a board that already agrees with it.
+ */
+function planReprioritize(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): ApplyDecision {
+  const { nowMs } = at;
+  const [id] = plan.subjects;
+  if (plan.subjects.length !== 1 || !id) {
+    return { status: "refuse", reason: "a priority proposal names exactly one bead" };
+  }
+  const priority = priorityOf(plan);
+  if (priority === undefined) {
+    return { status: "refuse", reason: "this proposal names no priority to move the bead to" };
+  }
+  const subject = index.byId.get(id);
+  if (!subject) return { status: "refuse", reason: missing(id) };
+  if (subject.priority === priority) {
+    return { status: "settled", summary: `${id} is already at priority ${plan.detail}` };
+  }
+  if (!isOpenWork(subject)) {
+    return {
+      status: "refuse",
+      reason: `${id} is ${settledWord(subject)} — a priority would rank nothing`,
+    };
+  }
+  if (isInFlight(subject, nowMs)) {
+    return { status: "refuse", reason: inFlightReason(subject, nowMs, DOING.reprioritize) };
+  }
+  const claimed = claimedSinceFiling(subject, at, DOING.reprioritize, CLAIM_COST.subject);
+  if (claimed) return { status: "refuse", reason: claimed };
+  const touched = premiseTouched(subject, EVIDENCE_PREMISE[plan.kind], at.observedAtMs);
+  if (touched) return { status: "refuse", reason: touched };
+
+  const from = typeof subject.priority === "number" ? `from P${subject.priority} ` : "";
+  return {
+    status: "apply",
+    steps: [
+      {
+        verb: "reprioritize",
+        id,
+        claim: runClaimOf(subject),
+        priority,
+        kind: plan.kind,
+        observedAtMs: at.observedAtMs,
+      },
+    ],
+    summary: `moved ${id} ${from}to ${plan.detail}`,
   };
 }
 
@@ -414,7 +516,7 @@ function planRetire(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): App
   // is the one thing a fresh board read cannot confirm: it shows the bead as it IS, never as it was
   // edited. Re-confirmed against the filing stamp so approving a months-old ask cannot settle a bead
   // that has since been written out from under its own evidence.
-  const touched = premiseTouched(subject, RETIRE_PREMISE[plan.kind], at.observedAtMs);
+  const touched = premiseTouched(subject, EVIDENCE_PREMISE[plan.kind], at.observedAtMs);
   if (touched) return { status: "refuse", reason: touched };
   // Settling a bead that still has open work under it strands that work: the children stay in the
   // ready set with a parent no run will ever reach — the unreachable state `detectContainerOrphans`
@@ -432,7 +534,7 @@ function planRetire(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): App
 
   // Whatever the verb, the write rests on the same two beads: the subject, and the run target whose
   // ticket set it rides (absent when it rides none). Both are re-read under their own locks, and so
-  // is the premise the checks above just cleared (see {@link RetireEvidence}).
+  // is the premise the checks above just cleared (see {@link EvidenceFence}).
   const on = {
     id,
     claim: runClaimOf(subject),
@@ -464,7 +566,7 @@ function planRetire(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): App
       // reads as landed work, which a rewrite leaves untouched.
       const survivorTouched = premiseTouched(
         survivor,
-        RETIRE_PREMISE[plan.kind]?.twin,
+        EVIDENCE_PREMISE[plan.kind]?.twin,
         at.observedAtMs,
       );
       if (survivorTouched) return { status: "refuse", reason: survivorTouched };
@@ -591,25 +693,25 @@ function linkPremiseGone(
   return orderingUnstated(blockedId, plan.target);
 }
 
-/** What a retirement's evidence says a bead still IS, and what retiring against it anyway gets wrong. */
-interface RetirePremise {
+/** What a move's evidence says a bead still IS, and what writing against it anyway gets wrong. */
+interface EvidencePremise {
   /** The bead the evidence describes — read as "still …". */
   still: string;
-  /** The harm of retiring against a bead that is no longer it — read as "and …". */
+  /** The harm of writing against a bead that is no longer it — read as "and …". */
   harm: string;
   /**
    * The same claim about the bead the plan POINTS AT, for evidence that is a MATCH BETWEEN TWO beads
    * rather than a fact about the subject alone. Absent where the ask rests on the subject only —
    * `stale` measures silence and `shipped-orphan` a commit, and neither names a live counterpart.
    */
-  twin?: RetirePremise;
+  twin?: EvidencePremise;
 }
 
 /**
- * What each detection claims about the subject AS THE PATROL FOUND IT — the one premise a plan cannot
+ * What each detection claims about the subject AS THE PASS FOUND IT — the one premise a plan cannot
  * restate, because it is a fact about a moment rather than about the board now. Every kind is listed
- * so adding one without deciding whether an edit falsifies it is a type error; the re-parent and link
- * kinds carry no entry because their whole claim IS re-derivable from the fresh board (see
+ * so adding one without deciding whether an edit falsifies it is a type error; the topology kinds
+ * carry no entry because their whole claim IS re-derivable from the fresh board (see
  * {@link reparentPremiseGone} and {@link linkPremiseGone}).
  *
  * All three retirements are fenced, not just `stale`: each measured something about the bead's
@@ -618,11 +720,20 @@ interface RetirePremise {
  * A commit is immutable, but the bead it shipped is not: work added after it landed would be settled
  * as delivered. Refusing is loud and a human re-decides; settling a rescoped bead loses that work
  * silently.
+ *
+ * The product master's kinds are fenced for the same reason and one more: its evidence is a JUDGMENT
+ * about what a bead is worth, read from the bead's own contract and its run history. A rewrite is
+ * exactly how a bead stops being the one that was judged, and unlike the gardener's mechanical
+ * claims nothing here can be re-derived at approve time — so the stamp is the only thing standing
+ * between a months-old opinion and a bead somebody has since rescoped.
  */
-const RETIRE_PREMISE: Record<GardenerDetectionKind, RetirePremise | undefined> = {
+const EVIDENCE_PREMISE: Record<GardenerDetectionKind, EvidencePremise | undefined> = {
   "container-orphan": undefined,
   "parentless-cluster": undefined,
   "implied-order": undefined,
+  "missing-order": undefined,
+  // A split is never applied (see `planApply`), so nothing here can act on a stale premise.
+  oversized: undefined,
   stale: {
     still: "the untouched bead the ask describes",
     harm: "deferring it now would park work somebody has since picked back up",
@@ -643,12 +754,20 @@ const RETIRE_PREMISE: Record<GardenerDetectionKind, RetirePremise | undefined> =
     still: "the bead the commit behind this ask shipped",
     harm: "closing it as shipped now would record a landing for work that may have been rescoped since",
   },
+  mispriority: {
+    still: "the bead whose contract and history this ranking was judged from",
+    harm: "re-ranking it now would apply a judgment made about work that has since been rewritten",
+  },
+  "low-value": {
+    still: "the low-value bead the evidence describes",
+    harm: "deferring it now would park work somebody has since given a reason to keep",
+  },
 };
 
 /**
  * Why this bead is no longer the one its retirement proposal describes, or undefined — asked of the
  * SUBJECT under the kind's own premise, and of a supersede's survivor under that premise's
- * {@link RetirePremise.twin}. `undefined` premise means the ask makes no filing-time claim about
+ * {@link EvidencePremise.twin}. `undefined` premise means the ask makes no filing-time claim about
  * this bead, so nothing here can go stale.
  *
  * Confirmed against the moment the patrol looked rather than by re-deriving the detection, because
@@ -656,12 +775,12 @@ const RETIRE_PREMISE: Record<GardenerDetectionKind, RetirePremise | undefined> =
  * and it is the only half of that evidence a board read can answer at all.
  *
  * Asked TWICE per retirement: once by `planRetire` against the route's snapshot, and again against
- * the re-read taken under the bead's own write lock (see {@link RetireEvidence}), because an edit
+ * the re-read taken under the bead's own write lock (see {@link EvidenceFence}), because an edit
  * landing between those two moments leaves every other bar the write holds untouched.
  */
 function premiseTouched(
   bead: Bead,
-  premise: RetirePremise | undefined,
+  premise: EvidencePremise | undefined,
   observedAtMs: number | undefined,
 ): string | undefined {
   if (!premise) return undefined;
@@ -717,7 +836,7 @@ export async function applyProposal(
   board: Bead[],
 ): Promise<ApplyResult> {
   if (!isProposalBead(proposal)) {
-    throw new ProposalApplyError("unusable", `${proposal.id} is not a gardener proposal`);
+    throw new ProposalApplyError("unusable", `${proposal.id} is not a proposal bead`);
   }
   if (proposal.status === "closed") {
     throw new ProposalApplyError(
@@ -740,10 +859,10 @@ export async function applyProposal(
       // like every other write this module makes to a proposal — the refusal still notes the bead.
       throw await attachFailure(
         repo,
-        proposal.id,
+        proposal,
         new ProposalApplyError(
           "unusable",
-          `${proposal.id} carries no readable gardener move — it cannot be applied; apply it by hand and decline it`,
+          `${proposal.id} carries no readable proposal move — it cannot be applied; apply it by hand and decline it`,
         ),
       );
     }
@@ -793,7 +912,7 @@ async function applyApproved(
   if (decision.status === "refuse") {
     throw await attachFailure(
       repo,
-      proposal.id,
+      proposal,
       new ProposalApplyError("refused", `cannot apply ${proposal.id}: ${decision.reason}`),
     );
   }
@@ -809,7 +928,7 @@ async function applyApproved(
       if (drifted) {
         throw await attachFailure(
           repo,
-          proposal.id,
+          proposal,
           new ProposalApplyError("refused", `cannot apply ${proposal.id}: ${drifted}`),
         );
       }
@@ -833,7 +952,7 @@ async function applyApproved(
     const stale = e instanceof SubjectMovedError && changed.length === 0;
     throw await attachFailure(
       repo,
-      proposal.id,
+      proposal,
       new ProposalApplyError(
         stale ? "refused" : "failed",
         stale
@@ -859,7 +978,7 @@ async function settleProposal(
   summary: string,
   changed: ApplyStep[],
 ): Promise<ApplyResult> {
-  await beads.note(repo, proposalId, `${NOTE_PREFIX}: applied — ${summary}.`);
+  await beads.note(repo, proposalId, `${notePrefix(plan)}: applied — ${summary}.`);
   await beads.close(repo, proposalId, `applied: ${summary}`);
   return { proposalId, plan, summary, changed: changed.map((s) => s.id) };
 }
@@ -915,8 +1034,12 @@ export function declineNote(proposal: Bead): string | undefined {
   if (!fingerprint) return undefined;
   // The `abandoned` label IS the suppression, so undoing a decline means dropping that label — not
   // reopening the bead, which would leave it suppressed and confuse the next reader.
+  //
+  // The producer comes off the fingerprint rather than off a plan: a proposal whose metadata is
+  // unreadable can still be declined, and telling the operator which pass will stop asking is the
+  // whole content of the note.
   return (
-    `${NOTE_PREFIX}: declined — the patrol will not file \`${fingerprint}\` again. ` +
+    `${fingerprint.split(":")[0]}: declined — this pass will not file \`${fingerprint}\` again. ` +
     `Remove the \`${LABELS.abandoned}\` label to let it ask once more.`
   );
 }
@@ -930,6 +1053,7 @@ class SubjectMovedError extends Error {}
 const DOING: Record<ApplyStep["verb"], string> = {
   reparent: "moving it",
   link: "recording it as blocked",
+  reprioritize: "re-ranking it",
   close: "retiring it",
   supersede: "retiring it",
   defer: "retiring it",
@@ -961,14 +1085,15 @@ function counterpartOf(step: ApplyStep): string | undefined {
 }
 
 /**
- * The filing-time premise a RETIREMENT rests on, or absent for the verbs that make no claim about a
- * bead's contents. See {@link RetireEvidence} for why the step has to carry it at all.
+ * The filing-time premise a CONTENT-derived move rests on, or absent for the topology verbs that
+ * make no claim about a bead's contents. See {@link EvidenceFence} for why the step carries it.
  */
-function evidenceOf(step: ApplyStep): RetireEvidence | undefined {
+function evidenceOf(step: ApplyStep): EvidenceFence | undefined {
   switch (step.verb) {
     case "close":
     case "supersede":
     case "defer":
+    case "reprioritize":
       return { kind: step.kind, observedAtMs: step.observedAtMs };
     default:
       return undefined;
@@ -1057,7 +1182,10 @@ async function applyStep(repo: string, step: ApplyStep): Promise<boolean> {
       const doing = `before re-parenting under ${step.parent}`;
       assertHomeIsCard(step.parent, await lockedBoard(repo, doing));
     }
-    if (step.verb === "link") {
+    // Only the kind whose evidence IS a body phrase. A `missing-order` ask rests on the product
+    // master's judgment, which nothing on the board restates — re-deriving it here would refuse
+    // every one of them (see the `kind` field on the link step).
+    if (step.verb === "link" && step.kind === "implied-order") {
       const doing = `before recording ${step.blocker} as ${step.id}'s blocker`;
       assertOrderingStated(step.id, step.blocker, await lockedBoard(repo, doing));
     }
@@ -1079,7 +1207,13 @@ async function applyStep(repo: string, step: ApplyStep): Promise<boolean> {
  * earlier, by `planApply`'s `settled` branch, and never becomes a step at all.
  */
 function alreadySatisfied(step: ApplyStep, subject: Bead): boolean {
-  return step.verb === "reparent" && (beads.parentOf(subject) ?? "") === step.parent;
+  if (step.verb === "reparent") return (beads.parentOf(subject) ?? "") === step.parent;
+  // A priority somebody set by hand between the decision and this lock is the same reasoning: the
+  // board already says what the ask wanted, so there is no write to make — and, crucially, none to
+  // undo. `subjectMoved` deliberately lets such a subject through (a re-ranked bead is not a bead
+  // that moved out from under the plan), so without this the no-op would join the rollback prefix.
+  if (step.verb === "reprioritize") return subject.priority === step.priority;
+  return false;
 }
 
 /**
@@ -1239,9 +1373,12 @@ function subjectMoved(step: ApplyStep, subject: Bead | undefined, nowMs: number)
   // a rescoping edit leaves status, liveness and claim exactly as the plan found them. `planRetire`
   // asked it of the route's snapshot; re-asked here against the read taken under this bead's own
   // lock, so an edit landing in that window refuses instead of being settled as delivered.
-  const evidence = evidenceOf(step);
+  // …but not when the board already reads as applied. Setting the asked-for priority BY HAND is
+  // itself a write since the filing, so an unguarded fence would refuse the very state the ask
+  // wanted — the same reason `planReprioritize` settles before it consults the premise.
+  const evidence = alreadySatisfied(step, subject) ? undefined : evidenceOf(step);
   if (evidence) {
-    const touched = premiseTouched(subject, RETIRE_PREMISE[evidence.kind], evidence.observedAtMs);
+    const touched = premiseTouched(subject, EVIDENCE_PREMISE[evidence.kind], evidence.observedAtMs);
     if (touched) return touched;
   }
   // A re-parent is the one verb whose subject can move WITHOUT changing status: another approval or
@@ -1281,7 +1418,7 @@ function counterpartMoved(
       // close the last live copy of it.
       return (
         survivorUnusable(counterpart, step.id) ??
-        premiseTouched(counterpart, RETIRE_PREMISE[step.kind]?.twin, step.observedAtMs)
+        premiseTouched(counterpart, EVIDENCE_PREMISE[step.kind]?.twin, step.observedAtMs)
       );
     default:
       return undefined;
@@ -1322,6 +1459,11 @@ async function runStep(repo: string, step: ApplyStep): Promise<void> {
     case "link":
       // `bd link a b` = b blocks a, which is the direction the detection states.
       await beads.link(repo, step.id, step.blocker, "blocks");
+      return;
+    case "reprioritize":
+      // Priority alone — no `currentLabels`, so `buildUpdateArgs` diffs no managed prefix and the
+      // bead's `approved` / `stage:*` / `source:*` labels are untouched by the write.
+      await beads.update(repo, step.id, { priority: step.priority });
       return;
     case "close":
       await beads.close(repo, step.id, step.reason);
@@ -1422,13 +1564,16 @@ async function rollbackSteps(repo: string, applied: ApplyStep[]): Promise<string
  */
 async function attachFailure(
   repo: string,
-  proposalId: string,
+  proposal: Bead,
   error: ProposalApplyError,
 ): Promise<ProposalApplyError> {
+  // Off the fingerprint, not off a plan: the one failure that reaches here with NO readable plan is
+  // exactly the one whose note matters most.
+  const prefix = fingerprintLabelOf(proposal)?.split(":")[0] ?? "proposal";
   try {
-    await beads.note(repo, proposalId, `${NOTE_PREFIX}: apply FAILED — ${oneLine(error.message)}`);
+    await beads.note(repo, proposal.id, `${prefix}: apply FAILED — ${oneLine(error.message)}`);
   } catch (e) {
-    console.error(`[gardener] could not attach the apply failure to ${proposalId}`, e);
+    console.error(`[${prefix}] could not attach the apply failure to ${proposal.id}`, e);
   }
   return error;
 }
@@ -1478,7 +1623,7 @@ const toBdStampGrid = (ms: number): number => Math.floor(ms / 1000) * 1000;
 
 /** The close reason a retirement writes — evidence lives on the proposal, so this stays one line. */
 function closeReason(plan: GardenerPlan): string {
-  return `closed by an approved gardener proposal (${plan.kind})`;
+  return `closed by an approved ${notePrefix(plan)} proposal (${plan.kind})`;
 }
 
 const missing = (id: string): string =>

@@ -264,6 +264,16 @@ export interface ProjectSettings {
    * a project configures is what the triaging agent actually applies.
    */
   scanSeverity?: ScanSeverityOverrides;
+  /**
+   * Operator-editable reasoning prompt for the product-master pass (anton-d2sx), mirroring
+   * {@link reviewFixPrompt}: it replaces anton's shipped `product-master` contract, and anton
+   * appends the board context and the report protocol beneath it. Empty = shipped default.
+   *
+   * Only the JUDGMENT is overridable. What the pass may propose, and the wire format anton parses
+   * its answer from, stay anton's — see `lib/pm/context.ts`. Only consulted by the `product-master`
+   * schedule, which is off by default.
+   */
+  productMasterPrompt?: string;
 }
 
 /** A resolved verify gate (anton-3oh8): a stable label (for logs/errors) + the shell command. */
@@ -352,6 +362,21 @@ export function resolveReviewConfig(settings: ProjectSettings): ReviewConfig {
         }
       : {}),
   };
+}
+
+/** A project's resolved product-master configuration (anton-d2sx) — never partial. */
+export interface ProductMasterConfig {
+  /** Operator prompt replacing anton's shipped contract; absent → the shipped `product-master` skill. */
+  prompt?: string;
+}
+
+/**
+ * The product-master pass's settings with defaults applied. A seam of its own, tiny as it is, so the
+ * prompt builder reads the same "empty means shipped default" rule the settings API writes — the
+ * pattern `resolveReviewConfig` establishes for every swappable contract.
+ */
+export function resolveProductMasterConfig(settings: ProjectSettings): ProductMasterConfig {
+  return { prompt: settings.productMasterPrompt?.trim() || undefined };
 }
 
 /**

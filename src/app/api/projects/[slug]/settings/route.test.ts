@@ -255,6 +255,46 @@ describe("settings route — agents allowlist + autonomy (anton-46w)", () => {
 });
 
 /**
+ * The product-master pass's prompt override (anton-d2sx) — the settings precedence pattern applied to
+ * the one automation whose behaviour is a reasoning contract. Only the JUDGMENT is swappable; the
+ * board context and the wire format stay anton's, which is what the pass's own suite asserts.
+ */
+describe("settings route — product-master prompt (anton-d2sx)", () => {
+  beforeEach(async () => {
+    tdb = makeTestDb();
+    await tdb.db.insert(schema.projects).values({
+      id: "p1",
+      slug: "tmp",
+      name: "tmp",
+      repoPath: "/tmp/p1",
+    });
+  });
+
+  it("persists an override and restores it, so the pass runs the operator's contract", async () => {
+    const res = await PATCH(patchReq({ productMasterPrompt: "Rank by revenue." }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.productMasterPrompt).toBe("Rank by revenue.");
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.productMasterPrompt).toBe("Rank by revenue.");
+  });
+
+  it('"" / null clears it back to the shipped-default absence', async () => {
+    await PATCH(patchReq({ productMasterPrompt: "Rank by revenue." }), ctx("tmp"));
+    const res = await PATCH(patchReq({ productMasterPrompt: "" }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.productMasterPrompt).toBeUndefined();
+    expect("productMasterPrompt" in persisted()).toBe(false);
+  });
+
+  it("rejects a non-string and an over-long prompt", async () => {
+    expect((await PATCH(patchReq({ productMasterPrompt: 42 }), ctx("tmp"))).status).toBe(400);
+    const long = "x".repeat(8001);
+    expect((await PATCH(patchReq({ productMasterPrompt: long }), ctx("tmp"))).status).toBe(400);
+  });
+});
+
+/**
  * Per-project self-review settings (anton-of1m): the gate's on/off flag, the swapped reviewer
  * (validated against discoverAgents like the allowlist), the prompt override (mirroring
  * reviewFixPrompt), and the bounded round cap.

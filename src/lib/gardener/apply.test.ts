@@ -19,7 +19,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { LABELS, type Bead } from "../beads/bd";
 import {
   detectionSubjectKey,
-  gardenerFingerprint,
+  proposalFingerprint,
   parseGardenerPlan,
   type GardenerPlan,
 } from "./detections";
@@ -108,6 +108,8 @@ vi.mock("../beads/bd", async () => {
       close: (_cwd: string, id: string, reason?: string) => record("close", id, reason ?? ""),
       supersede: (_cwd: string, id: string, w: string) => record("supersede", id, w),
       defer: (_cwd: string, id: string) => record("defer", id),
+      update: (_cwd: string, id: string, patch: { priority?: number }) =>
+        record("update", id, `P${patch.priority}`),
       note: (_cwd: string, id: string, text: string) => record("note", id, text),
     },
   };
@@ -125,6 +127,11 @@ const REPO = "/tmp/gardener-apply";
 function apply(proposal: Bead, board: Bead[]) {
   snapshot = board;
   return applyProposal(REPO, proposal, board);
+}
+
+/** {@link apply} with the proposal itself on the board — every apply re-reads it under its lock. */
+function applyWith(proposal: Bead, board: Bead[]) {
+  return apply(proposal, [...board, proposal]);
 }
 
 // ── fixture builders ──
@@ -174,9 +181,9 @@ const edged = (from: string, to: string): Bead[] =>
 function planFor(input: Omit<GardenerPlan, "fingerprint">): GardenerPlan {
   return {
     ...input,
-    fingerprint: gardenerFingerprint(
+    fingerprint: proposalFingerprint(
       input.kind,
-      detectionSubjectKey(input.kind, input.subjects, input.target),
+      detectionSubjectKey(input.kind, input.subjects, input.target, input.detail),
     ),
   };
 }
@@ -425,7 +432,9 @@ describe("planApply — what an approval means against the board as it now is", 
     expect(decide(LINK, board)).toEqual({
       status: "apply",
       summary: "recorded that anton-bb blocks anton-aa",
-      steps: [{ verb: "link", id: "anton-aa", claim: "", blocker: "anton-bb" }],
+      steps: [
+        { verb: "link", id: "anton-aa", claim: "", blocker: "anton-bb", kind: "implied-order" },
+      ],
     });
   });
 
@@ -1684,7 +1693,7 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
 
   it("refuses a bead that is not a proposal, and one that already settled", async () => {
     const plain = bead("anton-x");
-    await expect(apply(plain, [plain])).rejects.toThrow(/not a gardener proposal/);
+    await expect(apply(plain, [plain])).rejects.toThrow(/not a proposal bead/);
 
     const settled = proposalFor(REPARENT, { status: "closed" });
     await expect(apply(settled, [settled])).rejects.toThrow(/already settled/);
@@ -1709,5 +1718,110 @@ describe("declining — the board's own memory of a no", () => {
 
   it("has nothing to say about a bead that is not a proposal", () => {
     expect(declineNote(bead("anton-x"))).toBeUndefined();
+  });
+});
+
+/**
+ * The product master's two new moves (anton-d2sx), applied through the same machinery.
+ *
+ * `reprioritize` is the first verb that rewrites a FIELD rather than the graph, so it earns its own
+ * bars: the priority must be part of the plan's identity (a hand-edited P0 must not ride a P3's
+ * fingerprint), a board that already agrees must SETTLE rather than write twice, and the evidence
+ * fence must not refuse the very state the ask wanted. `split` is the opposite case — a proposal
+ * anton deliberately cannot run, which has to refuse with an answer rather than a shrug.
+ */
+describe("the product master's moves", () => {
+  const MISPRIORITY = planFor({
+    kind: "mispriority",
+    move: "reprioritize",
+    subjects: ["anton-a"],
+    detail: "P1",
+  });
+  const KILL = planFor({
+    kind: "low-value",
+    move: "retire",
+    retireAs: "defer",
+    subjects: ["anton-a"],
+  });
+  const SPLIT = planFor({ kind: "oversized", move: "split", subjects: ["anton-a"] });
+  const ORDER = planFor({
+    kind: "missing-order",
+    move: "link",
+    subjects: ["anton-aa"],
+    target: "anton-bb",
+  });
+
+  it("writes the priority the plan names, and closes the proposal as applied", async () => {
+    const subject = cold("anton-a", { priority: 3 });
+    const result = await applyWith(proposalFor(MISPRIORITY), [subject]);
+    expect(calls).toEqual([
+      "update anton-a P1",
+      "note anton-p1 pm: applied — moved anton-a from P3 to P1.",
+      "close anton-p1 applied: moved anton-a from P3 to P1",
+    ]);
+    expect(result.changed).toEqual(["anton-a"]);
+  });
+
+  it("settles rather than writing when the board already carries the asked-for priority", async () => {
+    // Warm on purpose: setting it by hand IS a write since the filing, and the evidence fence must
+    // not turn the outcome the ask wanted into a refusal.
+    await applyWith(proposalFor(MISPRIORITY), [warm("anton-a", { priority: 1 })]);
+    expect(calls.filter((c) => c.startsWith("update"))).toEqual([]);
+    expect(calls).toContain("close anton-p1 applied: anton-a is already at priority P1");
+  });
+
+  it("refuses a priority judgment about a bead somebody has since rewritten", async () => {
+    const err = (await applyWith(proposalFor(MISPRIORITY), [warm("anton-a", { priority: 3 })]).catch(
+      (e) => e,
+    )) as InstanceType<typeof ProposalApplyError>;
+    expect(err.failure).toBe("refused");
+    expect(err.message).toMatch(/written to since this proposal was filed/);
+    expect(calls.filter((c) => c.startsWith("update"))).toEqual([]);
+  });
+
+  it("refuses to re-rank a bead a run has claimed since the filing", async () => {
+    const claimed = warm("anton-a", { priority: 3, status: "in_progress", assignee: "runner-1" });
+    const err = (await applyWith(proposalFor(MISPRIORITY), [claimed]).catch((e) => e)) as InstanceType<
+      typeof ProposalApplyError
+    >;
+    expect(err.failure).toBe("refused");
+    expect(calls.filter((c) => c.startsWith("update"))).toEqual([]);
+  });
+
+  // The fingerprint is what binds the ask a human read to the write anton runs. Without the detail
+  // in the hash, editing `P3` to `P0` on the bead would keep the label valid and change the write.
+  it("invalidates a plan whose priority was edited after it was filed", () => {
+    const tampered = { ...MISPRIORITY, detail: "P0" };
+    expect(parseGardenerPlan(tampered)).toBeUndefined();
+    expect(parseGardenerPlan(MISPRIORITY)).toEqual(MISPRIORITY);
+  });
+
+  it("defers a kill rather than closing it — a judgment call must stay reversible", async () => {
+    await applyWith(proposalFor(KILL), [cold("anton-a")]);
+    expect(calls[0]).toBe("defer anton-a");
+    expect(calls.some((c) => c.startsWith("close anton-a"))).toBe(false);
+  });
+
+  it("records the ordering edge a missing-order ask names, with no body phrase to re-derive", async () => {
+    // Unlike the gardener's `implied-order`, this ask rests on the pass's judgment rather than on a
+    // phrase in the bead — so apply must not hold it to the phrase check that kind carries.
+    const decision = planApply(ORDER, [bead("anton-aa"), bead("anton-bb")], {
+      nowMs: NOW,
+      observedAtMs: Date.parse(FILED),
+    });
+    expect(decision.status).toBe("apply");
+    await applyWith(proposalFor(ORDER), [bead("anton-aa"), bead("anton-bb")]);
+    expect(calls[0]).toBe("link anton-aa anton-bb blocks");
+  });
+
+  it("refuses a split with an answer, because anton will not write new contracts on its own", async () => {
+    const err = (await applyWith(proposalFor(SPLIT), [bead("anton-a")]).catch((e) => e)) as InstanceType<
+      typeof ProposalApplyError
+    >;
+    expect(err.failure).toBe("refused");
+    expect(err.message).toMatch(/\/shape/);
+    expect(err.message).toMatch(/decline this proposal/);
+    // Nothing but the refusal note: the board is untouched.
+    expect(calls.filter((c) => !c.startsWith("note"))).toEqual([]);
   });
 });
