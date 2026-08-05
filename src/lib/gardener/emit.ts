@@ -542,7 +542,7 @@ export async function arbitrateEmission(
   try {
     await pull(repo);
   } catch (e) {
-    return skip(`could not re-read the board after publishing (${errorText(e)})`);
+    return skip(`could not sync the board after publishing (${errorText(e)})`);
   }
   let board: Bead[];
   try {

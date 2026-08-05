@@ -75,6 +75,7 @@ vi.mock("../beads/bd", async () => {
 
 const {
   MAX_PROPOSALS_PER_PASS,
+  NO_REMOTE_SKIP,
   PROPOSAL_LABELS,
   PartialEmissionError,
   arbitrateEmission,
@@ -553,12 +554,14 @@ describe("two patrols racing over one synced board", () => {
 
     const arbitrated = await arbitrateEmission(REPO, created, deps);
 
-    expect(arbitrated.skipped).toContain("no remote");
+    // Exact, not a substring: gardener.ts tells this skip from a real failure by `!== NO_REMOTE_SKIP`,
+    // so a reworded string that still reads "no remote" would silently disconnect that comparison.
+    expect(arbitrated.skipped).toBe(NO_REMOTE_SKIP);
     expect(deps.sleep).not.toHaveBeenCalled();
     expect(deps.board).not.toHaveBeenCalled();
   });
 
-  it("leaves both twins standing when the board could not be published or re-read", async () => {
+  it("leaves both twins standing when the board could not be published, synced or read back", async () => {
     // Fails OPEN: duplicate noise the next patrol folds is cheap; withdrawing an ask on the strength
     // of a board read we could not trust is not.
     const created = (await patrol()).created;
@@ -570,6 +573,12 @@ describe("two patrols racing over one synced board", () => {
         throw new Error("dolt push exploded");
       },
     });
+    const unsynced = await arbitrateEmission(REPO, created, {
+      ...synced(board),
+      pull: async () => {
+        throw new Error("dolt pull exploded");
+      },
+    });
     const unreadable = await arbitrateEmission(REPO, created, {
       ...synced(board),
       board: async () => {
@@ -578,6 +587,7 @@ describe("two patrols racing over one synced board", () => {
     });
 
     expect(unpublished.skipped).toContain("dolt push exploded");
+    expect(unsynced.skipped).toContain("dolt pull exploded");
     expect(unreadable.skipped).toContain("bd list exploded");
     expect(closeMock).not.toHaveBeenCalled();
   });
