@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import type { Bead } from "@/lib/beads/types";
-import { reviewTrajectory } from "@/lib/review-trajectory";
+import { RECENT_SCORED_TARGETS, reviewTrajectory } from "@/lib/review-trajectory";
 import { ReviewTrendPill } from "@/components/board/review-trend-pill";
 
 afterEach(cleanup);
@@ -85,6 +85,22 @@ describe("ReviewTrendPill", () => {
     renderPill(many.slice(0, 3));
     open();
     expect(screen.queryByText("targets scored in all")).toBeNull();
+  });
+
+  it("lets a full window widen the pill instead of drawing over its border", () => {
+    const full = Array.from({ length: RECENT_SCORED_TARGETS }, (_, i) =>
+      scored(`anton-${i}`, 8, `2026-08-${String(i + 1).padStart(2, "0")}T00:00:00Z`),
+    );
+    const { container } = renderPill(full);
+    const sparkline = container.querySelector('[role="img"]') as HTMLElement;
+
+    expect(sparkline.querySelectorAll("[title]")).toHaveLength(RECENT_SCORED_TARGETS);
+    // Every column holds a minimum width, so the window needs more room than the pill's baseline
+    // w-12 (48px): 8 columns at 6px plus 7 gaps at 4px is 76px. jsdom does no layout, so the
+    // guarantee is asserted where it lives — min-w-min, which lets the series push the pill wider
+    // rather than overflow it.
+    expect(sparkline.className).toContain("min-w-min");
+    expect(RECENT_SCORED_TARGETS * 6 + (RECENT_SCORED_TARGETS - 1) * 4).toBeGreaterThan(48);
   });
 
   it("closes on Escape", () => {
