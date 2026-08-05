@@ -15,6 +15,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { beads } from "../beads/bd";
+import { parseTicketNotes } from "../beads/notes";
 import * as schema from "../db/schema";
 import { getJob, park } from "./queue";
 import { resetOperatorCache } from "../operator";
@@ -132,6 +133,16 @@ process.exit(0);`),
       const log = readFileSync(session.logPath!, "utf8");
       expect(log).toContain("[anton-result] blocked — acceptance criteria contradict");
       expect(log).toContain("[agent-blocked]");
+
+      // The board says WHY (anton-vqql): the note carries the agent's own reason plus the evidence
+      // behind it — session, branch, short sha — so the operator decides from the ticket instead of
+      // hunting down this session log. Exactly ONE machine note; the blob is line-delimited.
+      const machineNotes = parseTicketNotes(blocked.notes).filter((n) => n.source === "system");
+      const blockNote = machineNotes.at(-1)!;
+      expect(blockNote.text).toContain("acceptance criteria contradict the existing API");
+      expect(blockNote.text).toContain(`session ${session.id}`);
+      expect(blockNote.text).toContain(`committed on anton/${epicSb} @ `);
+      expect(blockNote.text).not.toContain("\n");
 
       // Downstream ticket never dispatched; no PR; epic never advanced to in-review.
       const skipped = await beads.show(repo, skippedId);

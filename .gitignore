@@ -53,3 +53,7 @@ anton.db-*
 
 # Prebuilt release bundles (anton-1xp) — built in CI, never committed
 dist/
+
+# Claude Code isolation worktrees (anton-bqge) — a second checkout of the whole tree lands here;
+# committing one would re-walk it on every scan and duplicate-flag the entire codebase.
+.claude/worktrees/
