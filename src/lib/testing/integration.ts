@@ -59,6 +59,27 @@ export interface BdRepo {
 }
 
 /**
+ * `git init --bare` a sandbox remote that accepts `bd dolt push` the way a real host does.
+ *
+ * `receive.unpackLimit = 0` is the load-bearing part: below that limit `git receive-pack` unpacks a
+ * push with `unpack-objects`, which cannot resolve a THIN pack's deltas and dies with "unresolved
+ * deltas left after unpacking". Dolt pushes small packs delta'd against objects the bare remote may
+ * not hold, so a push occasionally dies there and leaves `refs/dolt/data` pointing at nothing —
+ * poisoning every later push to that remote and reddening whole suites downstream of the first
+ * casualty. Zero forces `index-pack --fix-thin` instead, which completes thin packs; GitHub and
+ * friends already index-pack every push, so this makes the sandbox match production rather than
+ * papering over a real failure.
+ *
+ * `-b main` pins the bare HEAD to refs/heads/main so clones of this remote check out main;
+ * otherwise hosts whose default branch is `master` leave a clone on an unborn `master` and
+ * `git push origin main` fails with "src refspec main does not match any".
+ */
+export function initBareRemote(path: string): void {
+  execFileSync("git", ["init", "--bare", "-q", "-b", "main", path], { stdio: "ignore" });
+  execFileSync("git", ["-C", path, "config", "receive.unpackLimit", "0"], { stdio: "ignore" });
+}
+
+/**
  * Create a temp working repo with `git init` + `bd init --skip-hooks`, ready for `beads.*` calls.
  *
  * `opts.bare` additionally creates a bare remote and wires it as both the git `origin` and bd's
@@ -77,10 +98,7 @@ export function makeBdRepo(opts: { bare?: boolean; initialCommit?: boolean } = {
   let bare: string | undefined;
   if (opts.bare) {
     bare = join(dir, "remote.git");
-    // `-b main` pins the bare HEAD to refs/heads/main so clones of this remote check out main;
-    // otherwise hosts whose default branch is `master` leave a clone on an unborn `master` and
-    // `git push origin main` fails with "src refspec main does not match any".
-    execFileSync("git", ["init", "--bare", "-q", "-b", "main", bare], { stdio: "ignore" });
+    initBareRemote(bare);
   }
 
   g(["init", "-q", "-b", "main"]);
