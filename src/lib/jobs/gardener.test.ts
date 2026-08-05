@@ -24,6 +24,7 @@ import type {
   OrphanBead,
   DepCycle,
   StaleOpts,
+  SyncOutcome,
 } from "../beads/bd";
 import { GARDENER_OBSERVED_AT_KEY } from "../gardener/detections";
 import { getHygieneReport, getHygieneReportForJob } from "../hygiene";
@@ -39,6 +40,8 @@ const orphansMock = vi.fn<(cwd: string) => Promise<OrphanBead[]>>();
 const cyclesMock = vi.fn<(cwd: string) => Promise<DepCycle[]>>();
 const duplicatesMock = vi.fn<(cwd: string) => Promise<DuplicateGroup[]>>();
 const listMock = vi.fn<(cwd: string, extra?: string[]) => Promise<Bead[]>>();
+const showMock = vi.fn<(cwd: string, id: string) => Promise<Bead>>();
+const closeMock = vi.fn<(cwd: string, id: string, reason?: string) => Promise<string>>();
 const createMock =
   vi.fn<
     (
@@ -73,6 +76,8 @@ vi.mock("../beads/bd", async () => {
       depCycles: trace("depCycles", (...a: [string]) => cyclesMock(...a)),
       duplicateGroups: trace("duplicateGroups", (...a: [string]) => duplicatesMock(...a)),
       list: trace("list", (...a: [string, string[]?]) => listMock(...a)),
+      show: trace("show", (...a: [string, string]) => showMock(...a)),
+      close: trace("close", (...a: [string, string, string?]) => closeMock(...a)),
       create: trace(
         "create",
         (...a: [string, { title: string; labels?: string[]; metadata?: Record<string, unknown> }]) =>
@@ -94,6 +99,15 @@ let t: TestDb;
 let projectId: string;
 const nudge = vi.fn();
 
+/**
+ * The emission-arbitration seam: the patrol publishes its proposals and re-reads the board to
+ * withdraw a twin another machine filed for the same claim. Stubbed here for the same reason the
+ * nudge is — the pass's outside world — with a settle that costs no wall-clock and a default of
+ * "no remote", the truthful answer for a board that has no second patrol to race.
+ */
+const pushMock = vi.fn<(cwd: string) => Promise<SyncOutcome>>();
+const arbitration = { push: (...a: [string]) => pushMock(...a), sleep: async () => {} };
+
 function bead(id: string, o: Partial<Bead> = {}): Bead {
   return { id, title: id, status: "open", issue_type: "task", ...o };
 }
@@ -104,7 +118,7 @@ function runPatrol(): Promise<string> {
     db: t.db,
     clock,
     type: "gardener",
-    handler: ({ db, clock: c }) => makeGardenerHandler({ db, clock: c, nudge }),
+    handler: ({ db, clock: c }) => makeGardenerHandler({ db, clock: c, nudge, arbitration }),
     projectId,
   });
 }
@@ -133,6 +147,11 @@ beforeEach(async () => {
   cyclesMock.mockResolvedValue([]);
   duplicatesMock.mockResolvedValue([]);
   listMock.mockResolvedValue([]);
+  // Fails closed: an unreadable bead makes every fold stand down, so only a case that stages a twin
+  // can produce one.
+  showMock.mockRejectedValue(new Error("no such bead"));
+  closeMock.mockResolvedValue("");
+  pushMock.mockResolvedValue("not-wired");
   createMock.mockImplementation(async () => "p-1");
 });
 
@@ -266,7 +285,7 @@ describe("gardener patrol", () => {
       db: t.db,
       clock: { now: () => nowMs },
       type: "gardener",
-      handler: ({ db, clock: c }) => makeGardenerHandler({ db, clock: c, nudge }),
+      handler: ({ db, clock: c }) => makeGardenerHandler({ db, clock: c, nudge, arbitration }),
     });
     const jobId = await runner.enqueue({ type: "gardener", projectId, payload: { projectId } });
 
@@ -336,6 +355,71 @@ describe("gardener patrol", () => {
       "create",
     ]);
     expect(nudge).toHaveBeenCalledWith({ id: projectId, repoPath: REPO });
+  });
+
+  it("withdraws its own proposal when another machine had already filed the same claim", async () => {
+    // The cross-machine race (anton-x4ks): suppression read a working set the rival's create had not
+    // synced into, so the claim reached the board twice. The pass publishes, re-reads, and folds its
+    // own twin — a day before the next patrol would have.
+    orphansMock.mockResolvedValue([
+      { id: "t-4", title: "shipped", status: "open", latestCommit: "abc1234" },
+    ]);
+    /** The board once both creates propagated: p-0 the rival's (filed first), p-1 ours. */
+    const boardNow = (): Bead[] => {
+      const [, draft] = createMock.mock.calls[0] ?? [];
+      const shipped = bead("t-4", { title: "shipped" });
+      if (!draft) return [shipped];
+      const twin = (id: string) => bead(id, { title: draft.title, labels: draft.labels });
+      return [shipped, twin("p-0"), twin("p-1")];
+    };
+    listMock.mockImplementation(async () => boardNow());
+    showMock.mockImplementation(async (_cwd, id) => {
+      const found = boardNow().find((b) => b.id === id);
+      if (!found) throw new Error(`no such bead: ${id}`);
+      return found;
+    });
+    pushMock.mockResolvedValue("synced");
+
+    const jobId = await runPatrol();
+    await expectJobStatus(t.db, jobId, "done");
+
+    expect(pushMock).toHaveBeenCalledWith(REPO);
+    expect(closeMock).toHaveBeenCalledTimes(1);
+    const [, closedId, reason] = closeMock.mock.calls[0];
+    expect(closedId).toBe("p-1"); // ours: the total order both machines compute keeps p-0
+    expect(reason).toContain("p-0");
+    // The withdrawal is a board write like any other — the other machines have to see it.
+    expect(nudge).toHaveBeenCalledWith({ id: projectId, repoPath: REPO });
+  });
+
+  it("files its proposal and leaves it alone on a board with no remote", async () => {
+    // Nothing to race, so the pass must not pay a propagation wait or a re-read for a rival that
+    // structurally cannot exist.
+    orphansMock.mockResolvedValue([
+      { id: "t-4", title: "shipped", status: "open", latestCommit: "abc1234" },
+    ]);
+    listMock.mockResolvedValue([bead("t-4", { title: "shipped" })]);
+
+    await expectJobStatus(t.db, await runPatrol(), "done");
+
+    expect(createMock).toHaveBeenCalledTimes(1);
+    expect(pushMock).toHaveBeenCalledWith(REPO);
+    expect(closeMock).not.toHaveBeenCalled();
+    expect(calls.filter((c) => c === "list")).toHaveLength(1); // no post-settle re-read
+  });
+
+  it("keeps the pass green when arbitration cannot publish", async () => {
+    // Fails open: a duplicate the next patrol folds must never cost this pass the proposal it filed.
+    orphansMock.mockResolvedValue([
+      { id: "t-4", title: "shipped", status: "open", latestCommit: "abc1234" },
+    ]);
+    listMock.mockResolvedValue([bead("t-4", { title: "shipped" })]);
+    pushMock.mockRejectedValue(new Error("dolt push exploded"));
+
+    await expectJobStatus(t.db, await runPatrol(), "done");
+
+    expect(createMock).toHaveBeenCalledTimes(1);
+    expect(closeMock).not.toHaveBeenCalled();
   });
 
   it("fences the premise before the hygiene evidence its proposals rest on", async () => {
@@ -427,7 +511,7 @@ describe("gardener patrol", () => {
       db: t.db,
       clock,
       type: "gardener",
-      handler: ({ db, clock: c }) => makeGardenerHandler({ db, clock: c, nudge }),
+      handler: ({ db, clock: c }) => makeGardenerHandler({ db, clock: c, nudge, arbitration }),
     });
     const jobId = await runner.enqueue({ type: "gardener", projectId, payload: { projectId } });
     listMock.mockImplementation(async () => {
@@ -449,7 +533,7 @@ describe("gardener patrol", () => {
       db: t.db,
       clock,
       type: "gardener",
-      handler: ({ db, clock: c }) => makeGardenerHandler({ db, clock: c, nudge }),
+      handler: ({ db, clock: c }) => makeGardenerHandler({ db, clock: c, nudge, arbitration }),
       payload: { projectId },
     });
 

@@ -22,8 +22,10 @@
  *      (misfiled work, missing ordering edges, retirement candidates) become approvable proposal
  *      beads, deduplicated by fingerprint so a nightly patrol over an unfixed board asks once — and,
  *      for the duplicates only overlapping patrols on different machines can create, folded back to
- *      one ask before new ones are filed. This tier writes to PROPOSALS alone: applying one is an
- *      approval away (anton-1t3n), so nothing here touches the beads a proposal is about.
+ *      one ask before new ones are filed and arbitrated again right after, so a twin filed by
+ *      another machine is withdrawn within seconds rather than at the next patrol. This tier writes
+ *      to PROPOSALS alone: applying one is an approval away (anton-1t3n), so nothing here touches
+ *      the beads a proposal is about.
  *
  * The board is PULLED first and NUDGED after — the patrol reads the shared board and writes to it,
  * so it must not act on a working set that is a sync heartbeat behind (an epic whose child another
@@ -41,10 +43,14 @@ import { loadAllIssues } from "../beads/issues";
 import { nudgeSync, type NudgeTarget } from "../beads/sync-nudge";
 import { detectBoard } from "../gardener/detect";
 import {
+  arbitrateEmission,
   emitProposals,
   MAX_PROPOSALS_PER_PASS,
+  NO_REMOTE_SKIP,
   PartialEmissionError,
   reconcileDuplicateProposals,
+  type ArbitrationResult,
+  type EmissionArbitrationDeps,
   type EmissionResult,
 } from "../gardener/emit";
 import {
@@ -73,6 +79,12 @@ export interface GardenerDeps {
    * uses (immediate coalesced push + durable sync-push backstop).
    */
   nudge?: (project: NudgeTarget) => void;
+  /**
+   * The emission-arbitration seam — the sync verbs and the settle window a pass uses to withdraw a
+   * twin another machine filed. Injectable for the same reason `nudge` is: staging a rival patrol
+   * needs neither a real remote nor a real propagation wait. Defaults to the live bd seam.
+   */
+  arbitration?: EmissionArbitrationDeps;
 }
 
 /**
@@ -301,7 +313,7 @@ export function makeGardenerHandler(deps: GardenerDeps): JobHandler {
     // second. Folding the twins here is the only place that duplication is ever undone — see
     // gardener/emit.ts. Best-effort by design: a failed fold is noise the next patrol retries, not a
     // reason to cost this pass its proposals.
-    const reconciled = await reconcileDuplicateProposals(repo, board, ctx.signal);
+    const reconciled = await reconcileDuplicateProposals(repo, board, { signal: ctx.signal });
     if (reconciled.folded.length > 0) {
       console.log(
         `[gardener] ${projectId}: folded ${reconciled.folded.length} duplicate proposal(s) ` +
@@ -343,10 +355,60 @@ export function makeGardenerHandler(deps: GardenerDeps): JobHandler {
       }
     };
 
+    // Publish what this pass filed and withdraw the twin a patrol on another machine filed for the
+    // same claim — the run-lease arbitration applied to emission (gardener/emit.ts). Without it a
+    // duplicate only ever goes away when the NEXT patrol reconciles, which on a nightly schedule
+    // leaves an operator a whole day to act on one ask twice. Best-effort like every other fold: it
+    // reports why it stood down rather than costing the pass anything.
+    const arbitrate = async (emission: EmissionResult) => {
+      if (emission.created.length === 0) return;
+      const arbitrated = await arbitrateEmission(repo, emission.created, {
+        ...deps.arbitration,
+        signal: ctx.signal,
+      }).catch((e): ArbitrationResult => {
+        // Never the pass's failure, and never a stopped pass's REPORTED failure either: the
+        // proposals stand, and the next patrol folds whatever this could not.
+        console.error(`[gardener] ${projectId}: emission arbitration failed`, e);
+        return { folded: [], held: [], failed: [], skipped: "arbitration itself failed" };
+      });
+      if (arbitrated.folded.length > 0) {
+        console.log(
+          `[gardener] ${projectId}: withdrew ${arbitrated.folded.length} proposal(s) another ` +
+            `patrol had already filed (${arbitrated.folded.map((f) => `${f.id}→${f.into}`).join(", ")})`,
+        );
+        nudge({ id: project.id, repoPath: repo });
+      }
+      // A twin left standing is a duplicate an operator can still see, so it is never silent —
+      // whether arbitration stood down, ran into a held twin, or failed its close. The one silent
+      // case is a board with no remote: nothing can have filed the claim twice there, so saying
+      // "duplicates left" every pass would be noise about an impossible state.
+      const unjudged = arbitrated.skipped && arbitrated.skipped !== NO_REMOTE_SKIP;
+      if (unjudged || arbitrated.held.length > 0 || arbitrated.failed.length > 0) {
+        console.log(
+          `[gardener] ${projectId}: emission arbitration left duplicates for the next patrol` +
+            `${unjudged ? ` — ${arbitrated.skipped}` : ""}` +
+            `${arbitrated.held.length > 0 ? ` (held: ${arbitrated.held.join(", ")})` : ""}` +
+            `${arbitrated.failed.length > 0 ? ` (failed: ${arbitrated.failed.join(", ")})` : ""}`,
+        );
+      }
+    };
+
     try {
-      report(await emitProposals(repo, { board, detections, observedAtMs, signal: ctx.signal }));
+      const emission = await emitProposals(repo, {
+        board,
+        detections,
+        observedAtMs,
+        signal: ctx.signal,
+      });
+      report(emission);
+      await arbitrate(emission);
     } catch (e) {
-      if (e instanceof PartialEmissionError) report(e.result);
+      // The proposals a stopped pass DID file are on the board like any other, so they get the same
+      // arbitration — a pass that parked on its third create must not leave the first two doubled.
+      if (e instanceof PartialEmissionError) {
+        report(e.result);
+        await arbitrate(e.result);
+      }
       throw e;
     }
   };
