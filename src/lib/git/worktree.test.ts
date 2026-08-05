@@ -137,24 +137,50 @@ suite("worktree manager (real git)", () => {
     expect(existsSync(join(wt.path, "node_modules"))).toBe(false);
   });
 
-  it("warm: true runs the pinned setup command inside the worktree", async () => {
+  it("warm: true runs the pinned setup command inside the worktree and stamps it complete", async () => {
     process.env[WARM_COMMAND_ENV] = "mkdir -p node_modules && echo warmed > node_modules/.warm";
     try {
       const wt = await createWorktree({ repoPath: repo, branch: "anton/run-warm-pinned", warm: true });
       expect(readFileSync(join(wt.path, "node_modules", ".warm"), "utf8").trim()).toBe("warmed");
+      expect(existsSync(join(wt.path, "node_modules", ".anton-warm"))).toBe(true);
     } finally {
       delete process.env[WARM_COMMAND_ENV];
     }
   });
 
   // Warming is an accelerator, not a gate: an install anton can't complete must not lose the run.
-  it("a failing setup command is logged, not fatal", async () => {
-    process.env[WARM_COMMAND_ENV] = "echo 'registry unreachable' >&2; exit 3";
+  // The half-written node_modules it leaves behind must NOT be stamped — that's what stops the next
+  // run from mistaking a partial install for a warm one.
+  it("a failing setup command is logged, not fatal, and leaves no completion stamp", async () => {
+    process.env[WARM_COMMAND_ENV] = "mkdir -p node_modules; echo 'registry unreachable' >&2; exit 3";
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       const wt = await createWorktree({ repoPath: repo, branch: "anton/run-warm-fails", warm: true });
       expect(existsSync(wt.path)).toBe(true);
       expect(warn.mock.calls.flat().join(" ")).toContain("registry unreachable");
+      expect(existsSync(join(wt.path, "node_modules"))).toBe(true);
+      expect(existsSync(join(wt.path, "node_modules", ".anton-warm"))).toBe(false);
+    } finally {
+      warn.mockRestore();
+      delete process.env[WARM_COMMAND_ENV];
+    }
+  });
+
+  // An operator's kill must not sit behind a 10-minute install holding the run's concurrency slot.
+  it("an aborted install returns promptly and is non-fatal", async () => {
+    process.env[WARM_COMMAND_ENV] = "sleep 600";
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const aborted = new AbortController();
+    aborted.abort();
+    try {
+      const wt = await createWorktree({
+        repoPath: repo,
+        branch: "anton/run-warm-aborted",
+        warm: true,
+        signal: aborted.signal,
+      });
+      expect(existsSync(wt.path)).toBe(true);
+      expect(warn.mock.calls.flat().join(" ")).toContain("warming");
     } finally {
       warn.mockRestore();
       delete process.env[WARM_COMMAND_ENV];
@@ -267,21 +293,37 @@ describe("resolveWarmCommand", () => {
     expect(resolveWarmCommand(fixture({ "go.mod": "module tmp" }), env, isExec)).toBeNull();
   });
 
-  // The reuse path: a resumed run gets its existing worktree back and must not reinstall.
-  it("skips the install when node_modules is newer than the lockfile", () => {
-    const dir = fixture({ "bun.lock": "{}" });
+  /** A worktree whose deps carry a completion stamp, as a finished install leaves behind. */
+  function stamped(dir: string): string {
     mkdirSync(join(dir, "node_modules"));
+    writeFileSync(join(dir, "node_modules", ".anton-warm"), "bun install --frozen-lockfile\n");
+    return dir;
+  }
+
+  // The reuse path: a resumed run gets its existing worktree back and must not reinstall.
+  it("skips the install when a completed install is newer than the lockfile", () => {
+    const dir = stamped(fixture({ "bun.lock": "{}" }));
     const old = new Date(Date.now() - 60_000);
     utimesSync(join(dir, "bun.lock"), old, old);
 
     expect(resolveWarmCommand(dir, env, isExec)).toBeNull();
   });
 
-  it("installs again when the lockfile is newer than node_modules", () => {
+  it("installs again when the lockfile is newer than the completed install", () => {
+    const dir = stamped(fixture({ "bun.lock": "{}" }));
+    const stale = new Date(Date.now() - 60_000);
+    utimesSync(join(dir, "node_modules", ".anton-warm"), stale, stale);
+
+    expect(resolveWarmCommand(dir, env, isExec)?.file).toBe(`${BIN}/bun`);
+  });
+
+  // The partial-install trap: a killed install leaves node_modules NEWER than the lockfile, so a
+  // directory-mtime check would call the half-populated tree current and hand the run broken deps.
+  it("installs again when node_modules is newer but no install ever completed", () => {
     const dir = fixture({ "bun.lock": "{}" });
     mkdirSync(join(dir, "node_modules"));
-    const stale = new Date(Date.now() - 60_000);
-    utimesSync(join(dir, "node_modules"), stale, stale);
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(join(dir, "bun.lock"), old, old);
 
     expect(resolveWarmCommand(dir, env, isExec)?.file).toBe(`${BIN}/bun`);
   });

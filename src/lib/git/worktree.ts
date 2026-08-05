@@ -10,7 +10,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, statSync } from "node:fs";
 import { delimiter, dirname, join, resolve, sep } from "node:path";
-import { mkdir, readFile, realpath, rm } from "node:fs/promises";
+import { mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { extraBinDirs, findOnPath, isExecutableFile } from "../bin";
 
 const execFileAsync = promisify(execFile);
@@ -72,8 +72,10 @@ export async function createWorktree(opts: {
   branch: string;
   baseBranch?: string;
   warm?: boolean;
+  /** Abort an in-flight install so an operator's kill doesn't hold the run's slot for the full warm timeout. */
+  signal?: AbortSignal;
 }): Promise<Worktree> {
-  const { repoPath, branch, warm } = opts;
+  const { repoPath, branch, warm, signal } = opts;
 
   const existing = await findWorktree(repoPath, branch);
   // A registration can outlive its checkout: `git worktree list` reports an administrative record,
@@ -81,7 +83,7 @@ export async function createWorktree(opts: {
   // cwd to `spawn`, which fails as ENOENT naming the *executable* — an error that reads as a
   // missing `claude` binary and sends debugging in entirely the wrong direction. Verify on disk.
   if (existing && existsSync(existing.path)) {
-    if (warm) await warmWorktree(existing);
+    if (warm) await warmWorktree(existing, signal);
     return existing;
   }
   // Drop the stale record so `git worktree add` below isn't rejected as "already registered".
@@ -101,7 +103,7 @@ export async function createWorktree(opts: {
   // tmp dirs on macOS otherwise make repeat lookups return a different-looking path).
   const resolvedPath = await realpath(path);
   const wt: Worktree = { path: resolvedPath, branch, baseBranch, repoPath };
-  if (warm) await warmWorktree(wt);
+  if (warm) await warmWorktree(wt, signal);
   return wt;
 }
 
@@ -177,10 +179,11 @@ export interface WarmCommand {
 
 /**
  * The project-setup command `worktreePath` needs, or null when there is nothing to run. Null covers
- * every "no-op when nothing is needed" case: warming turned off, no recognized lockfile, deps
- * already newer than the lockfile (a resumed run reusing its worktree), or no package manager on
- * the search path. Exported as the single testable seam — the shell-out itself is a one-liner; `env`
- * and `isExec` are injectable so the decision can be tested without a machine's real toolchain.
+ * every "no-op when nothing is needed" case: warming turned off, no recognized lockfile, a completed
+ * install already newer than the lockfile (a resumed run reusing its worktree), or no package
+ * manager on the search path. Exported as the single testable seam — the shell-out itself is a
+ * one-liner; `env` and `isExec` are injectable so the decision can be tested without a machine's
+ * real toolchain.
  */
 export function resolveWarmCommand(
   worktreePath: string,
@@ -213,13 +216,25 @@ export function resolveWarmCommand(
   return { file, args: [...install.args], label: `${install.bin} ${install.args.join(" ")}` };
 }
 
-/** True when `node_modules` is missing or predates the lockfile — otherwise the deps are current. */
+/**
+ * Written by {@link warmWorktree} only after an install exits 0. Living inside `node_modules` ties
+ * its lifetime to the tree it vouches for: `rm -rf node_modules` takes the proof with it.
+ */
+const WARM_STAMP = ".anton-warm";
+
+/**
+ * True unless a COMPLETED install is on record newer than the lockfile. The stamp, not `node_modules`
+ * itself, is the witness: an install killed partway (OOM, SIGKILL, dropped network) has already
+ * written into `node_modules`, so its mtime is newer than the lockfile and a directory-mtime check
+ * would call the half-populated tree current — surfacing later as `Cannot find module` inside a
+ * supposedly pre-warmed worktree, with no further warming attempt.
+ */
 function installNeeded(worktreePath: string, lockfile: string): boolean {
   try {
-    const deps = statSync(join(worktreePath, "node_modules")).mtimeMs;
-    return deps < statSync(join(worktreePath, lockfile)).mtimeMs;
+    const warmed = statSync(join(worktreePath, "node_modules", WARM_STAMP)).mtimeMs;
+    return warmed < statSync(join(worktreePath, lockfile)).mtimeMs;
   } catch {
-    return true; // no node_modules (the fresh-worktree case) or an unreadable stat → install
+    return true; // no stamp (fresh worktree, partial install, pre-stamp worktree) → install
   }
 }
 
@@ -234,7 +249,7 @@ function installNeeded(worktreePath: string, lockfile: string): boolean {
  * required, and an install anton can't complete (private registry, no network) must not be able to
  * lose an otherwise-good run.
  */
-async function warmWorktree(wt: Worktree): Promise<void> {
+async function warmWorktree(wt: Worktree, signal?: AbortSignal): Promise<void> {
   const cmd = resolveWarmCommand(wt.path);
   if (!cmd) return;
 
@@ -246,7 +261,11 @@ async function warmWorktree(wt: Worktree): Promise<void> {
       // Postinstall scripts shell out to node/git themselves; hand them the same augmented path the
       // package manager was resolved against, not the daemon's minimal one.
       env: { ...process.env, PATH: [process.env.PATH ?? "", ...extraBinDirs()].filter(Boolean).join(delimiter) },
+      // An operator's kill must not be stuck behind a 10-minute install; aborting degrades into the
+      // logged, non-fatal path below, exactly like a registry timeout.
+      signal,
     });
+    await stampWarmed(wt.path, cmd.label);
   } catch (err) {
     const e = err as { stderr?: string; message?: string };
     const detail = (e.stderr?.trim() || e.message || String(err)).slice(-2000);
@@ -254,6 +273,19 @@ async function warmWorktree(wt: Worktree): Promise<void> {
       `[worktree] warming ${wt.path} with \`${cmd.label}\` failed — the run continues, but its first ` +
         `step may fail on missing dependencies: ${detail}`,
     );
+  }
+}
+
+/**
+ * Record that the install completed, so the next run can tell a finished tree from a half-written
+ * one. Best-effort: a setup command that installs nothing into `node_modules` leaves nowhere to
+ * write, and the only cost of a missing stamp is warming again.
+ */
+async function stampWarmed(worktreePath: string, label: string): Promise<void> {
+  try {
+    await writeFile(join(worktreePath, "node_modules", WARM_STAMP), `${label}\n`);
+  } catch {
+    // no node_modules / read-only tree → next warm re-runs the install
   }
 }
 

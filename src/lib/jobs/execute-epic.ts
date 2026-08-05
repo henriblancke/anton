@@ -927,6 +927,9 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         branch,
         baseBranch: freshBase,
         warm: true,
+        // A cold install can run for minutes; without the job's signal an operator's kill would wait
+        // it out, holding the run's concurrency slot the whole time.
+        signal: ctx.signal,
       });
       await updateRun(db, clock, runId, {
         worktreePath: worktree.path,
