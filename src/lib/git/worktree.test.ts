@@ -2,15 +2,27 @@
  * Real-git round-trip for the worktree manager (anton-dzh.2): create/warm/find/remove against a
  * temp repo. Skipped when `git` isn't installed.
  */
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createWorktree,
   findWorktree,
   removeWorktree,
+  resolveWarmCommand,
+  WARM_COMMAND_ENV,
+  WARM_ENV,
   worktreePathFor,
   WORKTREES_ROOT_ENV,
 } from "./worktree";
@@ -44,6 +56,10 @@ suite("worktree manager (real git)", () => {
     execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: repo });
     execFileSync("git", ["config", "user.name", "anton-test"], { cwd: repo });
     writeFileSync(join(repo, "README.md"), "# tmp\n");
+    // A lockfile in every checkout, so the warm cases below run against a worktree that really does
+    // look installable — proving the vitest guard, not an absent lockfile, is what skips the install.
+    writeFileSync(join(repo, "package.json"), '{ "name": "tmp", "private": true }\n');
+    writeFileSync(join(repo, "bun.lock"), "{}\n");
     execFileSync("git", ["add", "."], { cwd: repo });
     execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: repo });
   });
@@ -111,11 +127,38 @@ suite("worktree manager (real git)", () => {
     expect(existsSync(second.path)).toBe(true);
   });
 
-  it("warm: true does not throw and is fast (no-op)", async () => {
+  // The guard the unit suite below asserts on, exercised end-to-end: `warm: true` under vitest must
+  // never shell out to a real package manager, however installable the checkout looks.
+  it("warm: true is a no-op under vitest even with a lockfile present", async () => {
     const branch = "anton/run-warm";
-    await expect(
-      createWorktree({ repoPath: repo, branch, warm: true }),
-    ).resolves.toBeDefined();
+    const wt = await createWorktree({ repoPath: repo, branch, warm: true });
+
+    expect(existsSync(join(wt.path, "bun.lock"))).toBe(true);
+    expect(existsSync(join(wt.path, "node_modules"))).toBe(false);
+  });
+
+  it("warm: true runs the pinned setup command inside the worktree", async () => {
+    process.env[WARM_COMMAND_ENV] = "mkdir -p node_modules && echo warmed > node_modules/.warm";
+    try {
+      const wt = await createWorktree({ repoPath: repo, branch: "anton/run-warm-pinned", warm: true });
+      expect(readFileSync(join(wt.path, "node_modules", ".warm"), "utf8").trim()).toBe("warmed");
+    } finally {
+      delete process.env[WARM_COMMAND_ENV];
+    }
+  });
+
+  // Warming is an accelerator, not a gate: an install anton can't complete must not lose the run.
+  it("a failing setup command is logged, not fatal", async () => {
+    process.env[WARM_COMMAND_ENV] = "echo 'registry unreachable' >&2; exit 3";
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const wt = await createWorktree({ repoPath: repo, branch: "anton/run-warm-fails", warm: true });
+      expect(existsSync(wt.path)).toBe(true);
+      expect(warn.mock.calls.flat().join(" ")).toContain("registry unreachable");
+    } finally {
+      warn.mockRestore();
+      delete process.env[WARM_COMMAND_ENV];
+    }
   });
 
   it("findWorktree returns the worktree after creation, null for unknown branch", async () => {
@@ -177,5 +220,100 @@ suite("worktree manager (real git)", () => {
 
     expect(existsSync(join(arbitraryPath, "keep.txt"))).toBe(true);
     rmSync(arbitraryPath, { recursive: true, force: true });
+  });
+});
+
+/**
+ * Warming's whole decision (anton-8i5), tested without git and without a package manager: `env` and
+ * `isExec` are injected, so these cases assert what anton WOULD run rather than running it.
+ */
+describe("resolveWarmCommand", () => {
+  const BIN = "/fake/bin";
+  /** Only the fake bin dir holds executables, so detection never picks up the host's real toolchain. */
+  const isExec = (p: string) => p.startsWith(`${BIN}/`);
+  const env = { PATH: BIN };
+  const dirs: string[] = [];
+
+  afterEach(() => {
+    for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+
+  /** A worktree-shaped temp dir containing `files` (name → contents). */
+  function fixture(files: Record<string, string> = {}): string {
+    const dir = mkdtempSync(join(tmpdir(), "anton-warm-"));
+    dirs.push(dir);
+    for (const [name, body] of Object.entries(files)) writeFileSync(join(dir, name), body);
+    return dir;
+  }
+
+  it("detects a frozen install per lockfile", () => {
+    expect(resolveWarmCommand(fixture({ "bun.lock": "{}" }), env, isExec)).toEqual({
+      file: `${BIN}/bun`,
+      args: ["install", "--frozen-lockfile"],
+      label: "bun install --frozen-lockfile",
+    });
+    expect(resolveWarmCommand(fixture({ "pnpm-lock.yaml": "" }), env, isExec)?.args).toEqual([
+      "install",
+      "--frozen-lockfile",
+    ]);
+    expect(resolveWarmCommand(fixture({ "yarn.lock": "" }), env, isExec)?.file).toBe(`${BIN}/yarn`);
+    expect(resolveWarmCommand(fixture({ "package-lock.json": "{}" }), env, isExec)).toMatchObject({
+      file: `${BIN}/npm`,
+      args: ["ci"],
+    });
+  });
+
+  it("is a no-op for a repo with no recognized lockfile", () => {
+    expect(resolveWarmCommand(fixture({ "go.mod": "module tmp" }), env, isExec)).toBeNull();
+  });
+
+  // The reuse path: a resumed run gets its existing worktree back and must not reinstall.
+  it("skips the install when node_modules is newer than the lockfile", () => {
+    const dir = fixture({ "bun.lock": "{}" });
+    mkdirSync(join(dir, "node_modules"));
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(join(dir, "bun.lock"), old, old);
+
+    expect(resolveWarmCommand(dir, env, isExec)).toBeNull();
+  });
+
+  it("installs again when the lockfile is newer than node_modules", () => {
+    const dir = fixture({ "bun.lock": "{}" });
+    mkdirSync(join(dir, "node_modules"));
+    const stale = new Date(Date.now() - 60_000);
+    utimesSync(join(dir, "node_modules"), stale, stale);
+
+    expect(resolveWarmCommand(dir, env, isExec)?.file).toBe(`${BIN}/bun`);
+  });
+
+  // Structural guard: unit tests must stay deterministic and never shell out to a real installer.
+  it("never detects an install under vitest", () => {
+    expect(resolveWarmCommand(fixture({ "bun.lock": "{}" }), { ...env, VITEST: "true" }, isExec)).toBeNull();
+  });
+
+  it("runs the pinned command instead — including under vitest, which is how tests inject a fake", () => {
+    const pinned = { ...env, VITEST: "true", [WARM_COMMAND_ENV]: "echo hi" };
+
+    expect(resolveWarmCommand(fixture({ "bun.lock": "{}" }), pinned, isExec)).toEqual({
+      file: "sh",
+      args: ["-c", "echo hi"],
+      label: "echo hi",
+    });
+  });
+
+  it("honors the opt-out over both detection and the pinned command", () => {
+    const off = { ...env, [WARM_ENV]: "off", [WARM_COMMAND_ENV]: "echo hi" };
+
+    expect(resolveWarmCommand(fixture({ "bun.lock": "{}" }), off, isExec)).toBeNull();
+  });
+
+  it("warns and skips when the package manager isn't on the search path", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(resolveWarmCommand(fixture({ "bun.lock": "{}" }), env, () => false)).toBeNull();
+      expect(warn.mock.calls.flat().join(" ")).toContain("no 'bun' on the search path");
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
