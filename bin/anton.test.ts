@@ -491,6 +491,36 @@ describe("launcher skill lists match the runtime's", () => {
   });
 });
 
+// A release bundle symlinks `anton` straight at $RUNTIME/bin/anton.mjs, so every `../src` module the
+// launcher statically imports must also be in build-bundle.mjs's hand-maintained copy list. Forget
+// one and EVERY command — setup, doctor, start, board-check — dies at module load with
+// ERR_MODULE_NOT_FOUND. npm installs are immune (package.json `files` ships all of `src`), so only
+// this assertion stands between a new launcher import and a broken release.
+describe("launcher's src imports are all in the release bundle", () => {
+  /** The cwd-rooted paths build-bundle.mjs copies into the stage, as repo-relative POSIX paths. */
+  function bundledPaths(): string[] {
+    const script = readFileSync(join(REPO_ROOT, "scripts", "build-bundle.mjs"), "utf8");
+    const block = script.match(/for \(const rel of \[\n([\s\S]*?)\n\s*\]\) \{/);
+    expect(block, "build-bundle.mjs no longer has a multi-line `for (const rel of [...])` copy list").toBeTruthy();
+    return [...(block?.[1] ?? "").matchAll(/join\(([^)]*)\)|^\s*"([^"]+)",/gm)]
+      .map(([, args, bare]) => bare ?? [...args.matchAll(/"([^"]+)"/g)].map((m) => m[1]).join("/"))
+      .filter(Boolean);
+  }
+
+  it("every ../src module bin/anton.mjs imports is copied by build-bundle.mjs", () => {
+    const bundled = bundledPaths();
+    const imports = [...readFileSync(CLI, "utf8").matchAll(/(?:from|import\()\s*"\.\.\/(src\/[^"]+)"/g)].map(
+      (m) => m[1],
+    );
+
+    expect(imports.length).toBeGreaterThan(0);
+    for (const spec of imports) {
+      const covered = bundled.some((p) => p === spec || spec.startsWith(`${p}/`));
+      expect(covered, `${spec} is imported by bin/anton.mjs but missing from build-bundle.mjs`).toBe(true);
+    }
+  });
+});
+
 describe("provisionAgentsSkills (into a temp ~/.claude)", () => {
   let claudeRoot: string;
   const skillPath = (name: string) => join(claudeRoot, "skills", name, "SKILL.md");
