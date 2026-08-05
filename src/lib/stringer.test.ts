@@ -110,6 +110,19 @@ describe("scan", () => {
     expect(result.collectorFailures).toEqual([]);
   });
 
+  it("excludes in-repo agent worktrees, so a nested checkout isn't walked as a second tree", async () => {
+    const argvDump = join(dir, "argv.json");
+    process.env[STRINGER_BIN_ENV] = writeFakeStringer(argvDump, []);
+
+    await scan({ repoPath: "/repo", scanFile: join(dir, "s.json") });
+
+    // Claude Code checks isolation worktrees out at `.claude/worktrees/<name>/`; walking one made
+    // 56% of the 2026-08-05 scan phantom clones of the real tree (anton-bqge).
+    expect(DEFAULT_SCAN_EXCLUDES).toContain(".claude/**");
+    const globs = argvOf(argvDump)[argvOf(argvDump).indexOf("--exclude") + 1].split(",");
+    expect(globs).toContain(".claude/**");
+  });
+
   it("appends caller-supplied excludes after the defaults", async () => {
     const argvDump = join(dir, "argv.json");
     process.env[STRINGER_BIN_ENV] = writeFakeStringer(argvDump, []);

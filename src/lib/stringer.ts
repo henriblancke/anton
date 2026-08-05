@@ -67,10 +67,17 @@ export const DEFAULT_SCAN_EXCLUDES = [
   ".tox/**",
   ".cache/**",
   "coverage/**",
-  // vcs / anton's own state
+  // vcs / agent tool state
   ".git/**",
   ".anton/**",
   ".beads/**",
+  // Claude Code's `isolation: worktree` checks a SECOND copy of the whole tree out at
+  // `.claude/worktrees/<name>/`, inside the repo. Walking it double-counts every file: the
+  // 2026-08-05 scan spent 118 of its 211 signals reporting src/x as a clone of
+  // .claude/worktrees/tier-invariants/src/x, burying the real findings and inflating the health
+  // totals against a repo twice its actual size. Excluded whole (like .anton/**) — it is agent
+  // state, not source. anton's own run worktrees live OUTSIDE the repo and were never the leak.
+  ".claude/**",
 ];
 
 /**
