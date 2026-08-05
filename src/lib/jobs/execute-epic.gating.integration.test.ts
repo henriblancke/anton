@@ -16,6 +16,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { beads } from "../beads/bd";
+import { parseTicketNotes } from "../beads/notes";
 import * as schema from "../db/schema";
 import { getJob, park, resumeJob } from "./queue";
 import { resetOperatorCache } from "../operator";
@@ -705,6 +706,14 @@ process.exit(0);`),
       expect(blocked.status).toBe("blocked");
       expect(blocked.assignee ?? null).toBeNull();
       expect(blocked.labels ?? []).not.toContain("stage:implementing");
+
+      // The note says what happened and names its evidence (anton-vqql). Nothing was committed, so
+      // it says so rather than pointing at a sha that doesn't exist. One line, one machine note.
+      const noteText = parseTicketNotes(blocked.notes).filter((n) => n.source === "system").at(-1)!
+        .text;
+      expect(noteText).toContain("run made no changes");
+      expect(noteText).toMatch(/session \S+, nothing committed on anton\//);
+      expect(noteText).not.toContain("undefined");
 
       // The downstream ticket was never dispatched — still open, never claimed or closed.
       const skipped = await beads.show(repo, skippedId);

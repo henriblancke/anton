@@ -1625,16 +1625,18 @@ async function runTicket(args: {
   const ticketCtx: StepContext = { ...run, ctx: ticketRunCtx, tickets: [ticket], session };
 
   let committed = false;
+  // The agent's machine-readable self-report (anton-j5i8) — `delivered` or `blocked — <reason>`,
+  // already recorded on the session log by the dispatching step. It CORROBORATES the
+  // delivery-evidence gate below, never replaces it; a missing/unparseable line (null) simply
+  // falls through to it. Declared OUTSIDE the try so the catch can put the agent's own reason on
+  // the bead note (anton-vqql) — a block the operator reads on the board instead of reconstructing
+  // from the session log.
+  let selfReport: AntonResult | null = null;
   try {
     // The ticket phase of the walk (anton-lnkt): the formula's steps up to and including its commit,
     // in formula order, each dispatched through the registry against THIS ticket. The walk replaces
     // the order these ran in, never the guards around them — the delivery-evidence gate below is
     // still what decides whether the ticket is done.
-    // The agent's machine-readable self-report (anton-j5i8) — `delivered` or `blocked — <reason>`,
-    // already recorded on the session log by the dispatching step. It CORROBORATES the
-    // delivery-evidence gate below, never replaces it; a missing/unparseable line (null) simply
-    // falls through to it.
-    let selfReport: AntonResult | null = null;
     for (const { step: cooked, definition } of args.steps) {
       // Every step boundary is a lease checkpoint, exactly as every ticket boundary is.
       run.assertLeaseHeld?.();
@@ -1834,18 +1836,26 @@ async function runTicket(args: {
     if (!isUsageLimitError(e)) {
       if (committed || noDelivery || agentBlocked) {
         await safe(() => beads.setStatus(repo, ticket.id, "blocked"));
+        // The tip this ticket's work landed on — the operator's route from the note straight to the
+        // diff. Best-effort and only when something was committed: an unreadable worktree costs the
+        // sha, never the note.
+        const head = committed
+          ? await readWorktreeState(worktreePath)
+              .then((s) => s.head)
+              .catch(() => undefined)
+          : undefined;
         await safe(() =>
           beads.note(
             repo,
             ticket.id,
-            noDelivery
-              ? `anton: run made no changes (clean agent exit, zero diff) — nothing was delivered; ` +
-                  `needs a human to implement it or fix the ticket, then resume the run`
-              : agentBlocked
-                ? `anton: the agent self-reported ANTON-RESULT: blocked and committed only partial ` +
-                    `work — it declared the ticket incomplete; needs a human to finish or re-scope it, ` +
-                    `then resume the run`
-                : `anton: run failed after committing work — needs review`,
+            ticketBlockNote({
+              kind: noDelivery ? "no-delivery" : agentBlocked ? "agent-blocked" : "post-commit",
+              selfReport,
+              error: e,
+              sessionId,
+              branch: run.branch,
+              head,
+            }),
           ),
         );
       } else {
@@ -2452,6 +2462,89 @@ function selfReportSuffix(selfReport: AntonResult | null): string {
   return selfReport.outcome === "delivered"
     ? ` The agent self-reported ANTON-RESULT: delivered — a false success on an unchanged tree.`
     : ` The agent self-reported ${formatAntonResult(selfReport)}, corroborating the block.`;
+}
+
+/**
+ * How much of an agent's reason (or a failure's error text) one block note may carry. The note is a
+ * board-level summary, not a transcript: enough to decide from, and bounded so a runaway message
+ * can't bloat the bead's append-only notes blob. The session log still holds the full text.
+ */
+const BLOCK_NOTE_DETAIL_CHARS = 400;
+
+/**
+ * Flatten to a SINGLE line and cap. Machine notes live one-per-line in the notes blob
+ * (beads/notes.ts), so an un-flattened multi-line reason would parse back as several notes — the
+ * later lines attributed to anton with no context at all.
+ */
+function blockNoteDetail(text: string): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  if (!flat) return "";
+  return flat.length > BLOCK_NOTE_DETAIL_CHARS
+    ? `${flat.slice(0, BLOCK_NOTE_DETAIL_CHARS).trimEnd()}…`
+    : flat;
+}
+
+export type TicketBlockKind = "no-delivery" | "agent-blocked" | "post-commit";
+
+/**
+ * The operator-facing note left on a ticket the run blocked (anton-vqql).
+ *
+ * Every category used to write one static string, so two tickets blocked for entirely different
+ * causes got byte-identical notes and the only route to the difference was finding the run, finding
+ * the session, and reading its log. The reason the agent already stated on its `ANTON-RESULT:
+ * blocked` line — and the error behind a post-commit failure — belong on the bead, next to the
+ * evidence that backs them: the session, and the branch + short sha when work was committed.
+ *
+ * Exactly one line by construction: the reason is flattened and capped, so `parseTicketNotes` reads
+ * it back as one machine note. A missing or unparseable self-report degrades to the category text
+ * alone — never an empty quote, never the string "undefined".
+ */
+export function ticketBlockNote(args: {
+  kind: TicketBlockKind;
+  /** The agent's parsed `ANTON-RESULT` line, when it emitted one. */
+  selfReport: AntonResult | null;
+  /** The error that halted the ticket — what a post-commit failure has to say for itself. */
+  error?: unknown;
+  sessionId: string;
+  branch: string;
+  /** The committed tip, full sha; absent when this ticket committed nothing. */
+  head?: string;
+}): string {
+  const { kind, sessionId, branch, head } = args;
+  const reason = blockNoteDetail(args.selfReport?.reason ?? "");
+  // A reason that flattens to nothing is NO reason — drop it, so the rendering falls back to the
+  // category text rather than trailing an empty quote or a dangling dash.
+  const selfReport = args.selfReport && { ...args.selfReport, reason: reason || undefined };
+  const failure = blockNoteDetail(errorText(args.error));
+
+  const body =
+    kind === "no-delivery"
+      ? `run made no changes (clean agent exit, zero diff) — nothing was delivered; needs a human ` +
+        `to implement it or fix the ticket, then resume the run.` +
+        selfReportSuffix(selfReport)
+      : kind === "agent-blocked"
+        ? `the agent self-reported ANTON-RESULT: blocked and committed only partial work — it ` +
+          `declared the ticket incomplete${reason ? `: "${reason}"` : ` (no reason given)`}; needs ` +
+          `a human to finish or re-scope it, then resume the run.`
+        : `run failed after committing work — needs review.` +
+          (failure ? ` It failed with: ${failure}` : "");
+
+  const evidence = head
+    ? `session ${sessionId}, committed on ${branch} @ ${head.slice(0, 7)}`
+    : `session ${sessionId}, nothing committed on ${branch}`;
+  return blockNoteOneLine(`anton: ${body} [${evidence}]`);
+}
+
+/** The error's own words, or "" when there are none worth repeating. */
+function errorText(error: unknown): string {
+  if (error === undefined || error === null) return "";
+  const text = error instanceof Error ? error.message : String(error);
+  return text === "undefined" || text === "null" ? "" : text;
+}
+
+/** Last-resort flatten of the whole composed note — the blob is line-delimited, so this is a hard invariant. */
+function blockNoteOneLine(note: string): string {
+  return note.replace(/\s+/g, " ").trim();
 }
 
 /**

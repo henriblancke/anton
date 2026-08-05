@@ -5,7 +5,7 @@
  */
 import { describe, expect, it } from "vitest";
 import type { Bead, Gate } from "../beads/bd";
-import { formatHumanNote } from "../beads/notes";
+import { formatHumanNote, parseTicketNotes } from "../beads/notes";
 import { PoisonEpic } from "./errors";
 import {
   claudeResumeDecision,
@@ -15,6 +15,7 @@ import {
   reviewParkMessage,
   runTargetDrift,
   splitFormulaPhases,
+  ticketBlockNote,
   ticketSetDrift,
 } from "./execute-epic";
 import { runTickets } from "../ticket-view";
@@ -409,6 +410,118 @@ describe("reviewParkMessage (anton-3apm)", () => {
     expect(out).not.toContain("the findings are on the bead;");
     expect(out).toContain("AC-2 is not implemented");
     expect(out).toContain("Resolve them (or correct the ticket), then resume the run.");
+  });
+});
+
+/**
+ * anton-vqql: a blocked ticket's note has to say WHY. The agent's reason is already parsed and
+ * logged; these cases pin it to the bead, alongside the evidence an operator would otherwise dig
+ * for — and pin the invariant that keeps the notes blob parseable: exactly one line per note.
+ */
+describe("ticketBlockNote (anton-vqql)", () => {
+  const HEAD = "0123456789abcdef0123456789abcdef01234567";
+  const note = (over: Partial<Parameters<typeof ticketBlockNote>[0]> = {}) =>
+    ticketBlockNote({
+      kind: "agent-blocked",
+      selfReport: { outcome: "blocked", reason: "the migration this depends on does not exist yet" },
+      sessionId: "sess-1",
+      branch: "anton/anton-e1",
+      head: HEAD,
+      ...over,
+    });
+
+  /** What an operator's board actually shows: the blob parsed back into attributed entries. */
+  const parsed = (text: string) => parseTicketNotes(text);
+
+  it("carries the agent's stated reason on the agent-blocked note", () => {
+    const out = note();
+    expect(out).toContain(`"the migration this depends on does not exist yet"`);
+    expect(out).toContain("self-reported ANTON-RESULT: blocked");
+  });
+
+  it("names its evidence — session, and the branch + short sha of the committed work", () => {
+    expect(note()).toContain("[session sess-1, committed on anton/anton-e1 @ 0123456]");
+  });
+
+  it("says nothing was committed when the tree was empty", () => {
+    const out = note({ kind: "no-delivery", selfReport: null, head: undefined });
+    expect(out).toContain("[session sess-1, nothing committed on anton/anton-e1]");
+  });
+
+  it("reads a `delivered` claim on an empty tree as the false success it is", () => {
+    const out = note({ kind: "no-delivery", selfReport: { outcome: "delivered" }, head: undefined });
+    expect(out).toContain("run made no changes");
+    expect(out).toContain("self-reported ANTON-RESULT: delivered — a false success on an unchanged tree");
+  });
+
+  it("carries a `blocked` self-report onto the no-delivery note too", () => {
+    const out = note({
+      kind: "no-delivery",
+      selfReport: { outcome: "blocked", reason: "the acceptance criteria contradict each other" },
+      head: undefined,
+    });
+    expect(out).toContain("the acceptance criteria contradict each other");
+    expect(out).toContain("corroborating the block");
+  });
+
+  it("carries the underlying error on a post-commit failure instead of a bare 'needs review'", () => {
+    const out = note({ kind: "post-commit", selfReport: null, error: new Error("push rejected: non-fast-forward") });
+    expect(out).toContain("run failed after committing work");
+    expect(out).toContain("It failed with: push rejected: non-fast-forward");
+  });
+
+  it("degrades to the category text when the ANTON-RESULT line was missing or unparseable", () => {
+    // Never an empty quote, never the string "undefined" — the two ways a naive interpolation
+    // turns a missing reason into noise on the board.
+    for (const out of [
+      note({ selfReport: null }),
+      note({ selfReport: { outcome: "blocked" } }),
+      note({ selfReport: { outcome: "blocked", reason: "   " } }),
+      note({ kind: "no-delivery", selfReport: { outcome: "blocked", reason: "   " }, head: undefined }),
+      note({ kind: "post-commit", selfReport: null, error: undefined }),
+    ]) {
+      expect(out).not.toContain('""');
+      expect(out).not.toContain("undefined");
+      expect(out).not.toContain("null");
+    }
+    expect(note({ selfReport: null })).toContain("declared the ticket incomplete (no reason given)");
+    expect(note({ kind: "post-commit", selfReport: null })).toContain("needs review");
+  });
+
+  it("flattens a multi-line reason into ONE machine note", () => {
+    const out = note({
+      selfReport: {
+        outcome: "blocked",
+        reason: "criterion 3 is impossible:\n  - the API has no such field\n  - and no migration adds one",
+      },
+    });
+    expect(out).not.toContain("\n");
+    const entries = parsed(out);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ source: "system", author: "anton" });
+    expect(entries[0]!.text).toContain("the API has no such field - and no migration adds one");
+  });
+
+  it("caps an overlong reason, still as ONE machine note, keeping the evidence", () => {
+    const out = note({ selfReport: { outcome: "blocked", reason: "x".repeat(5_000) } });
+    expect(out.length).toBeLessThan(900);
+    expect(out).toContain("…");
+    expect(out).toContain("[session sess-1, committed on anton/anton-e1 @ 0123456]");
+    expect(parsed(out)).toHaveLength(1);
+  });
+
+  it("keeps a note appended after a human note attributed to anton, not swallowed into it", () => {
+    // The blob is append-only: a machine note that leaked a newline would be re-read as a second,
+    // context-free entry — or worse, as body of the human note above it.
+    const blob = [
+      formatHumanNote("finish the migration first", "Henri", new Date("2026-08-05T00:00:00.000Z")),
+      note(),
+    ].join("\n");
+    const entries = parsed(blob);
+    expect(entries).toHaveLength(2);
+    expect(entries[0]).toMatchObject({ source: "human", author: "Henri" });
+    expect(entries[1]).toMatchObject({ source: "system", author: "anton" });
+    expect(entries[1]!.text).toContain("the migration this depends on does not exist yet");
   });
 });
 
