@@ -183,7 +183,9 @@ describe("parsePmReport", () => {
 
   it("does not fall back to an earlier draft when the final block is broken", () => {
     const text = `${report(`{"proposals":[]}`)}\n\n${report(`{"proposals":[{`)}`;
-    expect(parsePmReport(text).ok).toBe(false);
+    // A block that tried to be the report and failed IS the report — say WHICH way it broke, so a
+    // log reader can tell a garbled report from a session that emitted none.
+    expect(parsePmReport(text)).toEqual({ ok: false, violation: "malformed-proposals" });
   });
 });
 
@@ -264,6 +266,13 @@ describe("detectionsFor", () => {
       "a bead blocking itself",
       claim({ kind: "order", blockedBy: "anton-a" }),
       /cannot block itself/,
+    ],
+    [
+      // A proposal is open work, so nothing above catches it — but it closes the moment the founder
+      // answers it, and the edge outlives it. The subject would wait forever on a settled ask.
+      "an ordering against a proposal bead",
+      claim({ kind: "order", blockedBy: "anton-prop" }),
+      /is a proposal, not work/,
     ],
     [
       // A deferred bead is still OPEN work, so nothing above this catches it — and a kill applies as

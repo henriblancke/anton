@@ -29,7 +29,7 @@
  */
 import { beads, type Bead } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
-import { stampMsOf } from "../gardener/board-index";
+import { isOpenWork, stampMsOf } from "../gardener/board-index";
 import { nudgeSync, type NudgeTarget } from "../beads/sync-nudge";
 import { runClaude } from "../claude/driver";
 import type { GardenerDetection } from "../gardener/detections";
@@ -225,7 +225,11 @@ export function makeProductMasterHandler(deps: ProductMasterDeps): JobHandler {
       // Every claim is checked against the board it was made about before it becomes a bead. A
       // rejection is LOGGED, never swallowed: a pass whose claims were all refused would otherwise
       // be indistinguishable from a pass that found a healthy board.
-      const { detections, rejected } = detectionsFor(report.claims, board, clock.now());
+      // Checked against `observedAtMs`, the stamp of the read the claims were made about — not a
+      // fresh clock. A session runs for many minutes, and dating the in-flight check now would let a
+      // bead whose run-lease expired mid-session pass as a free subject: a proposal racing a run that
+      // was live when the judgment was made.
+      const { detections, rejected } = detectionsFor(report.claims, board, observedAtMs);
       for (const { claim, reason } of rejected) {
         const line = `[product-master] REFUSED a ${claim.kind} claim about ${claim.bead}: ${reason}`;
         await appendSessionLog(logPath, `${line}\n`);
@@ -261,8 +265,11 @@ async function scoreSeries(
   logPath: string,
   slug: string,
 ): Promise<Map<string, number[]> | undefined> {
+  // Open work only: the board context renders scores for open, non-proposal beads, so a closed or
+  // abandoned bead that carries a `review-score:` label would spend one of the cap's bd spawns on a
+  // series the session never sees — and push an open bead's history out of the window to do it.
   const reviewed = board
-    .filter((b) => reviewScoreOf(b) !== undefined)
+    .filter((b) => isOpenWork(b) && reviewScoreOf(b) !== undefined)
     .sort((a, b) => (stampMsOf(b) ?? 0) - (stampMsOf(a) ?? 0))
     .slice(0, MAX_HYDRATED_SCORE_SERIES);
   if (reviewed.length === 0) return undefined;

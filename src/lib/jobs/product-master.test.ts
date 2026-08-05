@@ -70,7 +70,9 @@ const { makeProductMasterHandler } = await import("./product-master");
 
 const NOW = Date.parse("2026-08-04T12:00:00Z");
 const REPO = "/tmp/product-master-repo";
-const clock: Clock = { now: () => NOW };
+/** Movable so a test can let wall-clock time pass DURING the session, as a real pass does. */
+let nowMs = NOW;
+const clock: Clock = { now: () => nowMs };
 
 let t: TestDb;
 let projectId: string;
@@ -78,6 +80,8 @@ const nudge = vi.fn();
 /** The prompt the last dispatched session was handed — asserted on for the appended board context. */
 let dispatched: RunClaudeOptions | undefined;
 let sessionText = "";
+/** Runs while the session is "thinking" — where a test makes time pass mid-pass. */
+let duringSession: (() => void) | undefined;
 
 function bead(id: string, o: Partial<Bead> = {}): Bead {
   return { id, title: id, status: "open", issue_type: "task", priority: 2, ...o };
@@ -100,6 +104,7 @@ const claim = (o: Record<string, unknown> = {}): string =>
 
 const fakeClaude = async (opts: RunClaudeOptions): Promise<ClaudeResult> => {
   dispatched = opts;
+  duringSession?.();
   return { ok: true, text: sessionText } as ClaudeResult;
 };
 
@@ -128,6 +133,8 @@ beforeEach(async () => {
 
   writes.length = 0;
   dispatched = undefined;
+  duringSession = undefined;
+  nowMs = NOW;
   nudge.mockClear();
   sessionText = report(`{"proposals":[]}`);
   pullMock.mockResolvedValue(undefined);
@@ -251,6 +258,19 @@ describe("product-master pass", () => {
     expect(writes).toEqual([]);
   });
 
+  // A session runs for many minutes. Checking its claims against the clock AFTER it answers would
+  // read a lease that was live at the read as expired, and file a proposal racing that very run.
+  it("checks the claims against the board it read, not against the clock the session finished at", async () => {
+    listMock.mockResolvedValue([bead("anton-a", { labels: [LABELS.runLease(NOW + 600_000, "abc")] })]);
+    sessionText = report(claim());
+    duringSession = () => {
+      nowMs = NOW + 20 * 60_000; // the lease expired while the session was thinking
+    };
+
+    await expectJobStatus(t.db, await runPass(), "done");
+    expect(writes).toEqual([]);
+  });
+
   // The one confusion this job is built to prevent. An unreadable report means anton learned
   // nothing; recording it as "no proposals" would publish a clean board the pass never saw.
   it.each([
@@ -283,6 +303,18 @@ describe("product-master pass", () => {
 
     await expectJobStatus(t.db, await runPass(), "done");
     expect(dispatched?.prompt).toContain("review scores 7,4,3");
+  });
+
+  // The hydration budget is small and the board context only renders open work: a settled bead that
+  // still carries its score label must not spend a slot the session will never see the result of.
+  it("spends its score-series budget on open work only", async () => {
+    listMock.mockResolvedValue([
+      bead("anton-done", { status: "closed", labels: ["review-score:2"] }),
+      bead("anton-a", { labels: ["review-score:3"] }),
+    ]);
+
+    await expectJobStatus(t.db, await runPass(), "done");
+    expect(showWithCommentsMock.mock.calls.map(([, id]) => id)).toEqual(["anton-a"]);
   });
 
   it("keeps its judgment when a bead's review history will not load", async () => {

@@ -447,7 +447,9 @@ export function parsePmReport(text: string | undefined): PmReportResult {
       parsed = JSON.parse(blocks[i][1]);
     } catch {
       // A block that tried to be the report and failed IS the report — a malformed one.
-      if (/"proposals"\s*:/.test(blocks[i][1])) return { ok: false, violation: "no-report" };
+      if (/"proposals"\s*:/.test(blocks[i][1])) {
+        return { ok: false, violation: "malformed-proposals" };
+      }
       continue;
     }
     if (typeof parsed !== "object" || parsed === null || !("proposals" in parsed)) continue;
@@ -588,6 +590,12 @@ function orderRefusal(claim: PmClaim, index: BoardIndex): string | undefined {
   if (blockerId === claim.bead) return `${claim.bead} cannot block itself`;
   const blocker = index.byId.get(blockerId);
   if (!blocker) return `${blockerId} is not on the board`;
+  // A proposal is open work, so `isOpenWork` waves it through — but it closes when the founder
+  // approves or declines it, and the `blocks` edge outlives it. The subject would sit queue-blocked
+  // behind an ask that no longer exists, with nothing left to land and unblock it.
+  if (isProposalBead(blocker)) {
+    return `${blockerId} is a proposal, not work — the edge would outlive it and leave ${claim.bead} blocked forever`;
+  }
   if (!isOpenWork(blocker)) return `${blockerId} has already landed, so the edge would constrain nothing`;
   if (index.hasBlocksEdge(claim.bead, blockerId)) {
     return `the board already records an ordering between ${claim.bead} and ${blockerId}`;
