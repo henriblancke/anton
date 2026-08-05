@@ -129,6 +129,12 @@ export function skillDigest(dir) {
  * none. Only a refresh may act on it, and safely: a "pristine" verdict means the whole directory
  * hashes to the stamp some release wrote, which no user-added file could survive, so on that path
  * every extra file is provably a previous bundle's leftover rather than the user's.
+ *
+ * `extra` deliberately does NOT bear on "current", which is judged on the bundled files alone: a
+ * note the user drops into a skill directory is not drift, and counting it as such would warn about
+ * — and permanently exclude from refresh — a copy whose every shipped file is byte-identical. Once
+ * a later release does drift such a copy, the added file breaks the destination digest and it
+ * classifies "modified", which is the correct verdict then.
  */
 export function skillState(srcDir, destDir) {
   const bundled = readSkillStamp(srcDir);
@@ -139,7 +145,7 @@ export function skillState(srcDir, destDir) {
   const shipped = new Set(listFiles(srcDir));
   const drifted = [...shipped].filter((rel) => !sameBytes(join(srcDir, rel), join(destDir, rel)));
   const extra = listFiles(destDir).filter((rel) => !shipped.has(rel) && !IGNORED_FILES.has(basename(rel)));
-  if (drifted.length === 0 && extra.length === 0) return { state: "current", bundled, installed, drifted, extra };
+  if (drifted.length === 0) return { state: "current", bundled, installed, drifted, extra };
   if (installed === null) return { state: "unstamped", bundled, installed, drifted, extra };
   const pristine = installed === skillDigest(destDir);
   return { state: pristine ? "outdated" : "modified", bundled, installed, drifted, extra };

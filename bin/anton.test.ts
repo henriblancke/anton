@@ -624,9 +624,9 @@ describe("provisionAgentsSkills (into a temp ~/.claude)", () => {
     expect((await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT })).stale).toEqual([]);
   });
 
-  // The mirror case: an extra file anton cannot prove it wrote. A user who ADDS a file breaks the
-  // digest, so the copy classifies modified — left alone, never pruned.
-  it("leaves a user-added file alone and does not call the copy refreshable", async () => {
+  // The mirror case: an extra file anton cannot prove it wrote. Dropping a note into a skill dir is
+  // not drift — every shipped file is still byte-identical — so it stays silent and never pruned.
+  it("leaves a user-added file alone without calling the copy drifted", async () => {
     claudeRoot = await mkdtemp(join(tmpdir(), "anton-claude-"));
     await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
     const dest = join(claudeRoot, "skills", "bd");
@@ -635,8 +635,28 @@ describe("provisionAgentsSkills (into a temp ~/.claude)", () => {
     const r = await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
 
     expect(r.refreshed).toEqual([]);
+    expect(r.stale).toEqual([]);
+    expect(r.skipped).toBe(INSTALLED_SKILLS.length);
+    expect(await readFile(join(dest, "my-notes.md"), "utf8")).toBe("# mine\n");
+  });
+
+  // …and once a real release difference arrives, that added file is what proves the copy is not
+  // anton's to overwrite: it breaks the destination digest, so the copy is edited, not refreshable.
+  it("treats a copy carrying a user-added file as edited once it actually drifts", async () => {
+    claudeRoot = await mkdtemp(join(tmpdir(), "anton-claude-"));
+    await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
+    const dest = join(claudeRoot, "skills", "bd");
+    // A pristine copy of some other release — drift anton would refresh — that the user then adds a
+    // file to. Seeding BEFORE the note is what makes it the user's file rather than that release's.
+    seedOtherRelease(dest, "# the pre-tier conventions\n");
+    writeFileSync(join(dest, "my-notes.md"), "# mine\n");
+
+    const r = await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
+
+    expect(r.refreshed).toEqual([]);
     expect(r.stale).toEqual(["bd"]);
     expect(await readFile(join(dest, "my-notes.md"), "utf8")).toBe("# mine\n");
+    expect(await readFile(skillPath("bd"), "utf8")).toContain("# the pre-tier conventions");
   });
 
   it("never auto-refreshes a copy carrying local edits", async () => {
