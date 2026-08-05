@@ -77,6 +77,7 @@ const {
   MAX_PROPOSALS_PER_PASS,
   PROPOSAL_LABELS,
   PartialEmissionError,
+  arbitrateEmission,
   emitProposals,
   planEmission,
   planReconciliation,
@@ -440,9 +441,159 @@ describe("duplicate proposals from overlapping patrols", () => {
     const controller = new AbortController();
     controller.abort();
 
-    const result = await reconcileDuplicateProposals(REPO, board, controller.signal);
+    const result = await reconcileDuplicateProposals(REPO, board, { signal: controller.signal });
 
     expect(result.folded).toEqual([]);
+    expect(closeMock).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The race itself (anton-x4ks), staged at this seam: TWO patrols emit against ONE synced board,
+ * neither seeing the other's create, and each then arbitrates its own pass. What must come out is a
+ * single standing ask per fingerprint — and it must come out that way whichever patrol arbitrates,
+ * and however many of them do, because both compute the survivor from the same total order.
+ */
+describe("two patrols racing over one synced board", () => {
+  const fingerprint = () => detect(MISPARENTED)[0].fingerprint;
+
+  /** One machine's pass over the shared board. Neither sees the other's create — that is the race. */
+  const patrol = () => emitProposals(REPO, { board: MISPARENTED, detections: detect(MISPARENTED) });
+
+  /** The board once both machines' creates have propagated — what each one's re-read hands back. */
+  const afterSync = (): Bead[] => {
+    const board = [...MISPARENTED, ...createdBeads];
+    for (const b of board) liveBeads.set(b.id, b);
+    return board;
+  };
+
+  /** The sync seam, staged: publishing lands, the settle costs nothing, the re-read sees `board`. */
+  const synced = (board: Bead[]) => ({
+    push: vi.fn(async () => "synced" as const),
+    pull: vi.fn(async () => undefined),
+    board: vi.fn(async () => board),
+    sleep: vi.fn(async () => undefined),
+  });
+
+  /** Proposals for `fingerprint` still standing on the board, by id. */
+  const standing = (fp: string): string[] =>
+    [...liveBeads.values()]
+      .filter((b) => (b.labels ?? []).includes(fp) && b.status === "open")
+      .map((b) => b.id)
+      .sort();
+
+  it("withdraws the loser, so one claim leaves one ask standing", async () => {
+    const a = await patrol();
+    const b = await patrol();
+    // The premise: suppression could not refuse the second create, so the claim IS on the board twice.
+    expect(a.created[0].fingerprint).toBe(b.created[0].fingerprint);
+    expect(standing(fingerprint())).toEqual([]);
+    const board = afterSync();
+    expect(standing(fingerprint())).toEqual(["anton-p1", "anton-p2"]);
+
+    const arbitrated = await arbitrateEmission(REPO, b.created, synced(board));
+
+    expect(arbitrated.folded).toEqual([{ id: "anton-p2", into: "anton-p1" }]);
+    expect(arbitrated.skipped).toBeUndefined();
+    expect(standing(fingerprint())).toEqual(["anton-p1"]);
+  });
+
+  it("publishes this pass's proposals before judging whether they lost", async () => {
+    // A proposal no other machine can read cannot have lost a race there — withdrawing it on that
+    // board read would retract the only copy of the ask anyone has.
+    const created = (await patrol()).created;
+    const deps = synced(afterSync());
+
+    await arbitrateEmission(REPO, created, deps);
+
+    expect(deps.push).toHaveBeenCalledWith(REPO);
+    expect(deps.push.mock.invocationCallOrder[0]).toBeLessThan(
+      deps.board.mock.invocationCallOrder[0],
+    );
+    expect(deps.sleep).toHaveBeenCalled(); // the rival's push needs a window to land
+  });
+
+  it("converges on the SAME survivor when both machines arbitrate", async () => {
+    const a = await patrol();
+    const b = await patrol();
+    const board = afterSync();
+
+    // Sequential, not concurrent, on purpose: the second arbitration must read the first one's fold
+    // and stand down rather than close the survivor in retaliation.
+    const first = await arbitrateEmission(REPO, a.created, synced(board));
+    const second = await arbitrateEmission(REPO, b.created, synced(board));
+
+    expect(first.folded).toEqual([{ id: "anton-p2", into: "anton-p1" }]);
+    expect(second.folded).toEqual([]);
+    expect(standing(fingerprint())).toEqual(["anton-p1"]);
+    expect(closeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("answers only for the claims this pass filed", async () => {
+    // A duplicate this pass did not file is the NEXT patrol's opening move (it reconciles the whole
+    // board before emitting) — arbitration must not widen into a general sweep on its own board read.
+    const created = (await patrol()).created;
+    const other = reparent({ subjects: ["anton-elsewhere"] });
+    const twins = [
+      bead("anton-x1", { labels: [other.fingerprint, ...PROPOSAL_LABELS] }),
+      bead("anton-x2", { labels: [other.fingerprint, ...PROPOSAL_LABELS] }),
+    ];
+    const board = [...afterSync(), ...twins];
+    for (const b of twins) liveBeads.set(b.id, b);
+
+    const arbitrated = await arbitrateEmission(REPO, created, synced(board));
+
+    expect(arbitrated.folded).toEqual([]);
+    expect(standing(other.fingerprint)).toEqual(["anton-x1", "anton-x2"]);
+  });
+
+  it("stands down on a board with no remote — there is no second patrol to race", async () => {
+    const created = (await patrol()).created;
+    const deps = { ...synced(afterSync()), push: vi.fn(async () => "not-wired" as const) };
+
+    const arbitrated = await arbitrateEmission(REPO, created, deps);
+
+    expect(arbitrated.skipped).toContain("no remote");
+    expect(deps.sleep).not.toHaveBeenCalled();
+    expect(deps.board).not.toHaveBeenCalled();
+  });
+
+  it("leaves both twins standing when the board could not be published or re-read", async () => {
+    // Fails OPEN: duplicate noise the next patrol folds is cheap; withdrawing an ask on the strength
+    // of a board read we could not trust is not.
+    const created = (await patrol()).created;
+    const board = afterSync();
+
+    const unpublished = await arbitrateEmission(REPO, created, {
+      ...synced(board),
+      push: async () => {
+        throw new Error("dolt push exploded");
+      },
+    });
+    const unreadable = await arbitrateEmission(REPO, created, {
+      ...synced(board),
+      board: async () => {
+        throw new Error("bd list exploded");
+      },
+    });
+
+    expect(unpublished.skipped).toContain("dolt push exploded");
+    expect(unreadable.skipped).toContain("bd list exploded");
+    expect(closeMock).not.toHaveBeenCalled();
+  });
+
+  it("writes nothing when the patrol is cancelled, or when the pass filed nothing", async () => {
+    const created = (await patrol()).created;
+    const controller = new AbortController();
+    controller.abort();
+    const deps = synced(afterSync());
+
+    const cancelled = await arbitrateEmission(REPO, created, { ...deps, signal: controller.signal });
+    const idle = await arbitrateEmission(REPO, [], deps);
+
+    expect(cancelled.skipped).toContain("cancelled");
+    expect(idle.skipped).toContain("filed no proposals");
+    expect(deps.push).not.toHaveBeenCalled();
     expect(closeMock).not.toHaveBeenCalled();
   });
 });

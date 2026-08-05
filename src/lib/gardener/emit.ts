@@ -11,8 +11,10 @@
  *     runs nightly over an unfixed board asks once, not thirty times. (Mirrors the
  *     `stringer:<collector>:<hash>` convention /scan-triage dedups against.) Suppression cannot be
  *     the whole answer, though: it reads the LOCAL working set, so two patrols on different machines
- *     can both miss a fingerprint neither has pushed yet and file the same ask twice — see
- *     {@link reconcileDuplicateProposals} for the other half.
+ *     can both miss a fingerprint neither has pushed yet and file the same ask twice. Two things
+ *     undo that: {@link arbitrateEmission} publishes the pass's own claims and withdraws the loser
+ *     seconds later, and {@link reconcileDuplicateProposals} folds whatever that missed the next
+ *     time a patrol runs.
  *   • DECLINED STAYS DECLINED. Suppression keys on "not settled", not on "open": an abandoned
  *     proposal — anton's won't-do outcome (LABELS.abandoned) — suppresses forever, which is what
  *     makes declining meaningful. A PLAINLY closed proposal (one that was applied, anton-1t3n) does
@@ -24,8 +26,9 @@
  *
  * Applying an approved proposal is anton-1t3n's job; nothing here mutates a subject bead.
  */
-import { beads, LABELS, type Bead } from "../beads/bd";
+import { beads, CLAIM_SETTLE_MS, LABELS, type Bead, type SyncOutcome } from "../beads/bd";
 import { withBeadWriteLocks } from "../beads/claim-lock";
+import { loadAllIssues } from "../beads/issues";
 import { isClaimed, isOpenWork } from "./board-index";
 import {
   concernedBeads,
@@ -295,14 +298,21 @@ export interface DuplicateProposals {
  *
  * The survivor is picked by a TOTAL order both machines compute alike, so two patrols reconciling
  * the same board concurrently converge on the same bead rather than folding each other away.
+ *
+ * `only` narrows the fold to named claims — what {@link arbitrateEmission} passes so a pass's own
+ * arbitration answers for the proposals it just filed and nothing else.
  */
-export function planReconciliation(board: Bead[]): DuplicateProposals[] {
+export function planReconciliation(
+  board: Bead[],
+  only?: ReadonlySet<string>,
+): DuplicateProposals[] {
   const groups = new Map<string, Bead[]>();
   for (const bead of board) {
     const fingerprint = fingerprintLabelOf(bead);
     // Open only: a declined twin is a recorded answer and a plainly-closed one is already folded or
     // applied — neither is a second ask standing on the board.
     if (!fingerprint || !isProposalBead(bead) || !isOpenWork(bead)) continue;
+    if (only && !only.has(fingerprint)) continue;
     const group = groups.get(fingerprint);
     if (group) group.push(bead);
     else groups.set(fingerprint, [bead]);
@@ -348,6 +358,13 @@ export interface ReconcileResult {
   failed: string[];
 }
 
+export interface ReconcileOptions {
+  /** The patrol's cancel signal, checked between closes. */
+  signal?: AbortSignal;
+  /** Fold only these claims. Omitted, every duplicate on the board is in scope. */
+  fingerprints?: ReadonlySet<string>;
+}
+
 /**
  * Fold this board's duplicate proposals into one ask each.
  *
@@ -373,11 +390,12 @@ export interface ReconcileResult {
 export async function reconcileDuplicateProposals(
   repo: string,
   board: Bead[],
-  signal?: AbortSignal,
+  options: ReconcileOptions = {},
 ): Promise<ReconcileResult> {
+  const { signal, fingerprints } = options;
   const result: ReconcileResult = { folded: [], held: [], failed: [] };
 
-  for (const duplicate of planReconciliation(board)) {
+  for (const duplicate of planReconciliation(board, fingerprints)) {
     result.held.push(...duplicate.held);
     for (const id of duplicate.fold) {
       // Between every close, like the emission loop: a cancelled patrol must stop writing, and what
@@ -408,6 +426,137 @@ export async function reconcileDuplicateProposals(
   }
 
   return result;
+}
+
+// ── arbitrating this pass's own claims (anton-x4ks) ──
+
+/**
+ * How long an emission settles before it judges its own board read. Reused verbatim from the
+ * verified-claim protocol ({@link CLAIM_SETTLE_MS}), and for the identical reason: concluding "ours
+ * is the only proposal for this claim" from the ABSENCE of a twin is a decision made on absence,
+ * which is unreliable on an eventually-consistent board — a machine that filed the same instant may
+ * not have propagated yet. Comfortably above sync round-trip latency, and paid once per pass that
+ * actually filed something.
+ */
+export const EMISSION_SETTLE_MS = CLAIM_SETTLE_MS;
+
+/**
+ * The one stand-down that means "no twin can exist" rather than "a twin may be standing": a board
+ * with no remote is not shared, so nothing could have filed the claim twice. Exported so a caller
+ * can tell it from the skips that DO leave duplicate noise for the next patrol.
+ */
+export const NO_REMOTE_SKIP = "the board has no remote — no second patrol to race";
+
+/** The seam arbitration drives, injectable so a test can stage two patrols without a real remote. */
+export interface EmissionArbitrationDeps {
+  /**
+   * Publish this pass's proposals. Defaults to `beads.push` rather than `beads.sync` for two
+   * reasons: it RESOLVES the outcome, so "this board has no remote" is knowable rather than
+   * guessed, and it never grows the unpushed backlog — the write nudge that fired for the same
+   * creates already counted them, and both share the per-repo coalescer so neither doubles a push.
+   */
+  push?: (cwd: string) => Promise<SyncOutcome>;
+  pull?: (cwd: string) => Promise<unknown>;
+  /** The post-settle board read — every status, like the patrol's own (see jobs/gardener.ts). */
+  board?: (cwd: string) => Promise<Bead[]>;
+  sleep?: (ms: number) => Promise<void>;
+  settleMs?: number;
+  signal?: AbortSignal;
+}
+
+export interface ArbitrationResult extends ReconcileResult {
+  /**
+   * Why no arbitration ran, when none did. Never silence: a skipped arbitration means a twin may be
+   * standing that only the NEXT patrol will fold, and a reader has to be able to tell that from a
+   * pass that arbitrated and found nothing.
+   */
+  skipped?: string;
+}
+
+const sleepMs = (ms: number): Promise<void> =>
+  new Promise((resolve) => {
+    const t = setTimeout(resolve, ms);
+    if (typeof t.unref === "function") t.unref();
+  });
+
+const errorText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
+/**
+ * Converge the claims THIS pass filed down to one proposal each — the run-lease arbitration pattern
+ * (anton-jz1, and `beads.claimVerified`) applied to emission: publish, settle, re-read, and fold the
+ * loser when another machine's twin is there.
+ *
+ * Why it is needed at all: `planEmission` suppresses a fingerprint already on the board, but that
+ * read is a snapshot and the `bd create` it guards is a separate write, so suppression is only
+ * atomic within ONE patrol. bd has no uniqueness constraint on a label and no cross-process
+ * conditional write (anton-od4), so nothing can refuse the second create. What CAN be done is decide
+ * the winner afterwards, and do it fast: {@link reconcileDuplicateProposals} already folds twins,
+ * but only when the next patrol runs — a nightly schedule leaves an operator a whole day to act on
+ * an ask the board is carrying twice. Arbitrating here shrinks that to the settle window.
+ *
+ * It NARROWS the race rather than closing it, which is the honest limit of every anton claim: a
+ * rival whose push has not landed by the time we re-read is invisible, and both machines keep their
+ * proposal. That costs a duplicate the next patrol folds — never a lost ask, because the survivor is
+ * chosen by the same total order on both machines ({@link planReconciliation}), so two arbitrations
+ * running at once fold the same loser instead of folding each other away.
+ *
+ * Fails OPEN, every step: an unpublishable or unreadable board yields `skipped` and leaves both
+ * twins standing. Duplicate noise the next patrol clears is the cheap outcome; withdrawing an ask on
+ * the strength of a board read we could not trust is the expensive one.
+ */
+export async function arbitrateEmission(
+  repo: string,
+  created: readonly EmittedProposal[],
+  deps: EmissionArbitrationDeps = {},
+): Promise<ArbitrationResult> {
+  const skip = (skipped: string): ArbitrationResult => ({
+    folded: [],
+    held: [],
+    failed: [],
+    skipped,
+  });
+  if (created.length === 0) return skip("this pass filed no proposals");
+  if (deps.signal?.aborted) return skip("the patrol was cancelled");
+
+  const push = deps.push ?? beads.push;
+  const pull = deps.pull ?? beads.pull;
+  const readBoard = deps.board ?? loadAllIssues;
+  const sleep = deps.sleep ?? sleepMs;
+
+  // Publish first, and not only so the twin's machine can see ours: a proposal no other machine can
+  // read cannot lose a race there, so an unpublished pass that withdrew its own ask would retract
+  // the only copy of it anyone has.
+  let outcome: SyncOutcome;
+  try {
+    outcome = await push(repo);
+  } catch (e) {
+    return skip(`could not publish this pass's proposals (${errorText(e)})`);
+  }
+  // A board with no remote has no second machine to race, so waiting out a propagation window it
+  // cannot have would stall every single-machine patrol for nothing.
+  if (outcome === "not-wired") return skip(NO_REMOTE_SKIP);
+
+  await sleep(deps.settleMs ?? EMISSION_SETTLE_MS);
+  if (deps.signal?.aborted) return skip("the patrol was cancelled");
+
+  try {
+    await pull(repo);
+  } catch (e) {
+    return skip(`could not re-read the board after publishing (${errorText(e)})`);
+  }
+  let board: Bead[];
+  try {
+    board = await readBoard(repo);
+  } catch (e) {
+    return skip(`could not read the board back after publishing (${errorText(e)})`);
+  }
+
+  // Scoped to the claims this pass filed: arbitration answers for its OWN creates, and the patrol
+  // already folded everything else on the board before it filed them.
+  return reconcileDuplicateProposals(repo, board, {
+    signal: deps.signal,
+    fingerprints: new Set(created.map((p) => p.fingerprint)),
+  });
 }
 
 // ── the proposal's prose (pure) ──
