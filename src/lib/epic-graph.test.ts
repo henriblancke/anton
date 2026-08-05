@@ -153,6 +153,27 @@ describe("computeEpicGraph", () => {
     expect(node(deduped, "E1").blockedBy).toEqual(["E2"]);
   });
 
+  it("keeps edge pairs distinct when ids would collide under naive concatenation", () => {
+    // ("E1 X", "E2") and ("E1", "X E2") concatenate to the same string under any plain
+    // delimiter the ids themselves may contain — the dedupe key must survive that.
+    const g = graphOf([
+      epic("E1 X", { dependencies: [blocks("E1 X", "E2")] }),
+      epic("E2"),
+      epic("E1", { dependencies: [blocks("E1", "X E2")] }),
+      epic("X E2"),
+    ]);
+
+    expect(g.edges).toHaveLength(2);
+    expect(g.edges).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ from: "E1 X", to: "E2" }),
+        expect.objectContaining({ from: "E1", to: "X E2" }),
+      ]),
+    );
+    expect(node(g, "E1 X").blockedBy).toEqual(["E2"]);
+    expect(node(g, "E1").blockedBy).toEqual(["X E2"]);
+  });
+
   it("ignores related, discovered-from, and parent-child — only blocks orders epics", () => {
     const g = graphOf([
       epic("E1", {
