@@ -253,6 +253,28 @@ export async function reconcileInterruptedRuns(
 }
 
 /**
+ * A project's most recently active runs, newest first (anton-d2sx). db-injectable and strictly
+ * read-only, unlike {@link listRuns}, which reads the shared anton.db for the UI — this one is asked
+ * by a background job, which must see the connection its caller injected.
+ *
+ * "How did the last few attempts go" is the one input a ranking judgment cannot get from the board:
+ * a bead looks identical whether the runs against it landed or parked.
+ */
+export async function listRecentRuns(
+  db: AntonDb,
+  projectId: string,
+  limit: number,
+): Promise<RunSummary[]> {
+  const rows = await db
+    .select()
+    .from(schema.runs)
+    .where(eq(schema.runs.projectId, projectId))
+    .orderBy(desc(schema.runs.updatedAt))
+    .limit(limit);
+  return rows.map(toSummary);
+}
+
+/**
  * Every run of a project in the given statuses, oldest activity first (anton-4ks0). The read the
  * run-health sweep detects over — `updatedAt` on a settled run is when it settled, so ordering by
  * it puts the most-stalled work first. db-injectable; strictly read-only.

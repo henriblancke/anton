@@ -174,6 +174,46 @@ describe("the proposal bead", () => {
     expect(draft.description).toContain(detection.fingerprint);
   });
 
+  // Two producers, one machinery (anton-d2sx). The bead has to SAY which pass raised it — a founder
+  // reads a mechanical hygiene ask and a product judgment very differently — and the `source:` label
+  // is what /scan-triage arbitrates across when it dedups (board-context.ts).
+  it("introduces itself as the producer whose kind it is", () => {
+    const pm = proposalDraft(
+      makeDetection({
+        kind: "low-value",
+        move: "retire",
+        retireAs: "defer",
+        subjects: ["anton-dead"],
+        summary: "nothing wants this",
+        evidence: ["scored 3 twice"],
+      }),
+    );
+    expect(pm.title).toBe("Product master: defer anton-dead");
+    expect(pm.labels).toContain("source:pm");
+    expect(pm.description).toContain("Filed by the product-master pass");
+
+    const gardener = proposalDraft(reparent());
+    expect(gardener.title).toMatch(/^Gardener: /);
+    expect(gardener.labels).toContain("source:gardener");
+    expect(gardener.description).toContain("Filed by the gardener patrol");
+  });
+
+  it("tells a SPLIT's reader that approving is refused and declining is what settles it", () => {
+    const draft = proposalDraft(
+      makeDetection({
+        kind: "oversized",
+        move: "split",
+        subjects: ["anton-big"],
+        summary: "three concerns in one ticket",
+        evidence: ["proposed ticket 1: the API half", "proposed ticket 2: the UI half"],
+      }),
+    );
+    // A card promising a move that Approve always refuses is worse than the bead it is about.
+    expect(draft.description).toMatch(/Approve is refused/);
+    expect(draft.description).toMatch(/`\/shape`/);
+    expect(draft.acceptance).toMatch(/DECLINED/);
+  });
+
   it("carries its MOVE as metadata, so applying it never has to parse the prose (anton-1t3n)", () => {
     const detection = reparent();
     const draft = proposalDraft(detection);

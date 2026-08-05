@@ -23,6 +23,7 @@ export type ScheduledJobType = Extract<
   | "unstick"
   | "gate-check"
   | "gardener"
+  | "product-master"
 >;
 
 export type ScheduleRow = typeof schema.schedules.$inferSelect;
@@ -169,6 +170,12 @@ export async function listSchedules(projectId: string): Promise<ScheduleSummary[
  * flag). An operator who never asked for a patrol should not find work closed on their board — so
  * arming it is a deliberate act, and the report it produces is what earns the trust to leave it on.
  *
+ * product-master (anton-d2sx) ships disabled for both of the gardener's reasons and a third: it is
+ * the only schedule that spends a claude session on judgment rather than on mechanism, and every
+ * proposal it files spends a founder's attention. It runs WEEKLY rather than nightly because that is
+ * the natural cadence of the question — "what matters next" does not change between two Tuesdays on
+ * a board a nightly pass would find identical, and re-asking it daily is how the pass becomes noise.
+ *
  * gate-check (anton-286r) is armed by default and runs often, because it is the ONLY thing that
  * resumes a run parked on a gate: shipping it off would strand gated work indefinitely, and its
  * idle cost is two bd reads per slot on a project with no gates. The cadence is the wait's
@@ -186,6 +193,7 @@ export const DEFAULT_SCHEDULES: Array<{
   { type: "unstick", cron: "10 * * * *" }, // act on the sweep's findings, 10 min after it
   { type: "gate-check", cron: "*/10 * * * *" }, // close satisfied gates + resume their work
   { type: "gardener", cron: "0 5 * * *", enabled: false }, // board hygiene patrol daily 05:00; opt-in
+  { type: "product-master", cron: "0 6 * * 1", enabled: false }, // product judgment weekly, Mon 06:00; opt-in
 ];
 
 /**

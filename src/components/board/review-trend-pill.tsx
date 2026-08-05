@@ -76,6 +76,9 @@ export function ReviewTrendPill({
         <span>
           review <span className="font-mono text-foreground">{average.toFixed(1)}</span>
         </span>
+        {/* w-12 is the width a short series is STRETCHED to, so a two-run project still gets a
+            readable pill — not a cap. A full window needs more than that, and takes it: the pill
+            grows with the series rather than letting its bars run over the border. */}
         <ScoreSparkline points={points} className="h-3.5 w-12 shrink-0" />
       </button>
 

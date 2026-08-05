@@ -35,25 +35,34 @@ import {
   fingerprintLabelOf,
   GARDENER_OBSERVED_AT_KEY,
   GARDENER_PLAN_KEY,
+  isManualProposal,
   isProposalBead,
+  namespaceOf,
   planOf,
   type GardenerDetection,
   type GardenerPlan,
+  type ProposalNamespace,
 } from "./detections";
 
-/** `source:` provenance every proposal carries — the `source:stringer` convention, one namespace over. */
-export const GARDENER_SOURCE = "gardener";
-
 /**
- * The labels every proposal carries besides its fingerprint. No `agent:` on purpose: a proposal is a
- * decision, not work an agent implements — the move is applied mechanically through the beads seam.
+ * The labels every proposal carries besides its fingerprint and its `source:<producer>` — which is
+ * the `source:stringer` convention, one namespace over, and is added per-producer in
+ * {@link proposalDraft}. No `agent:` on purpose: a proposal is a decision, not work an agent
+ * implements — the move is applied mechanically through the beads seam.
  */
-export const PROPOSAL_LABELS: readonly string[] = [
-  "domain:eng",
-  "risk:low",
-  "size:S",
-  `source:${GARDENER_SOURCE}`,
-];
+export const PROPOSAL_LABELS: readonly string[] = ["domain:eng", "risk:low", "size:S"];
+
+/** How each producer introduces itself on the beads it files — title prefix and provenance. */
+const PRODUCER: Record<ProposalNamespace, { title: string; filedBy: string }> = {
+  gardener: {
+    title: "Gardener",
+    filedBy: "the gardener patrol from a `%kind%` board-shape detection (anton-e42l)",
+  },
+  pm: {
+    title: "Product master",
+    filedBy: "the product-master pass from a `%kind%` product judgment (anton-d2sx)",
+  },
+};
 
 /**
  * How many proposals ONE pass may file. A board that has never been tended can yield dozens at once,
@@ -168,10 +177,11 @@ export function proposalDraft(
   detection: GardenerDetection,
   observedAtMs?: number,
 ): ProposalDraft {
+  const namespace = namespaceOf(detection.kind);
   return {
-    title: `Gardener: ${moveClause(detection)}`,
+    title: `${PRODUCER[namespace].title}: ${moveClause(detection)}`,
     type: "task",
-    labels: [detection.fingerprint, ...PROPOSAL_LABELS],
+    labels: [detection.fingerprint, ...PROPOSAL_LABELS, `source:${namespace}`],
     acceptance: acceptanceOf(detection),
     description: descriptionOf(detection),
     deps: concernedBeads(detection).map((id) => `discovered-from:${id}`),
@@ -576,6 +586,12 @@ function moveClause(detection: GardenerDetection): string {
         return `supersede ${subjects} with ${detection.target ?? "the bead that replaced it"}`;
       }
       return detection.retireAs === "defer" ? `defer ${subjects}` : `close ${subjects}`;
+    case "reprioritize":
+      return `move ${subjects} to ${detection.detail ?? "a different priority"}`;
+    case "split":
+      return `split ${subjects} into separate tickets`;
+    case "unapprove":
+      return `fix ${subjects} or withdraw its approval`;
   }
 }
 
@@ -607,25 +623,39 @@ function appliedState(detection: GardenerDetection): string {
       return detection.retireAs === "defer"
         ? `${subjects} ${is} deferred — out of the ready set, contract intact`
         : `${subjects} ${is} closed with a reason naming the work that shipped it`;
+    case "reprioritize":
+      return `${subjects} ${is} at priority ${detection.detail}, so ranked pickup reaches ${detection.subjects.length === 1 ? "it" : "them"} in that order`;
+    case "split":
+      return `${subjects} ${is} replaced by the separate tickets sketched below, each with its own contract`;
+    case "unapprove":
+      // Both outcomes are stated, because both settle this ask: repairing the gaps is the OTHER
+      // answer, and approving after a repair records that rather than stripping the label off work
+      // that is sound again (see apply.ts `planUnapprove`).
+      return `${subjects} either meets the approve gate again, or no longer carries \`approved\` — with a note on the bead naming the gaps that withdrew it`;
   }
 }
 
-/**
- * Does this proposal name a move anton can run, or only a question a human can answer? A container
- * orphan with no single open feature home files WITHOUT a target on purpose (see reparent.ts) — the
- * ask is real, but the answer is a choice, so apply refuses it by design. The bead has to SAY that:
- * a card that reads "approving it applies the move" while Approve always refuses is worse than the
- * misfiled bead it is about.
- */
-function isManual(detection: GardenerDetection): boolean {
-  return detection.move === "reparent" && !detection.target;
-}
+/** How a MANUAL proposal (see {@link isManualProposal}) tells its reader to settle it. */
+const MANUAL_INSTRUCTIONS: Partial<Record<GardenerDetection["move"], string[]>> = {
+  reparent: [
+    "This bead is a DECISION only a human can make: no single home was obvious, so the proposal",
+    "names none and **Approve is refused**. Pick a board card (the Evidence lists what is open",
+    "under the container), move it by hand with `bd update <id> --parent <card>`, then DECLINE",
+    "this proposal — declining is what settles it and stops the patrol re-asking.",
+  ],
+  split: [
+    "This bead is a DECISION only a human can make: decomposing a ticket writes new contracts, which",
+    "is `/shape`'s work, so **Approve is refused**. Run `/shape` (or split it by hand) using the",
+    "sketch below as a starting point, then DECLINE this proposal — declining is what settles it and",
+    "stops the pass re-asking.",
+  ],
+};
 
 function acceptanceOf(detection: GardenerDetection): string {
   return [
     `- [ ] ${appliedState(detection)}`,
-    "- [ ] no other bead is re-parented, linked or retired — the move above is the whole change",
-    isManual(detection)
+    "- [ ] no other bead is re-parented, linked, reprioritized, retired or unapproved — the move above is the whole change",
+    isManualProposal(detection)
       ? "- [ ] this proposal is DECLINED once the move is made by hand — approving it is refused, so declining is what settles it"
       : "- [ ] this proposal is closed with a note naming what changed",
   ].join("\n");
@@ -640,14 +670,9 @@ function descriptionOf(detection: GardenerDetection): string {
     ...detection.evidence.map((line) => `- ${line}`),
     "",
     "## Context",
-    `Filed by the gardener patrol from a \`${detection.kind}\` board-shape detection (anton-e42l).`,
-    ...(isManual(detection)
-      ? [
-          "This bead is a DECISION only a human can make: no single home was obvious, so the proposal",
-          "names none and **Approve is refused**. Pick a board card (the Evidence lists what is open",
-          "under the container), move it by hand with `bd update <id> --parent <card>`, then DECLINE",
-          "this proposal — declining is what settles it and stops the patrol re-asking.",
-        ]
+    `Filed by ${PRODUCER[namespaceOf(detection.kind)].filedBy.replace("%kind%", detection.kind)}.`,
+    ...(isManualProposal(detection)
+      ? (MANUAL_INSTRUCTIONS[detection.move] ?? [])
       : [
           "This bead is a DECISION, not implementation work: approving it applies the move through the",
           "beads seam, declining it records the reason.",
@@ -656,6 +681,7 @@ function descriptionOf(detection: GardenerDetection): string {
     `- move: \`${detection.move}\`${detection.retireAs ? ` (\`${detection.retireAs}\`)` : ""}`,
     `- subjects: ${detection.subjects.join(", ")}`,
     ...(detection.target ? [`- target: ${detection.target}`] : []),
+    ...(detection.detail ? [`- to: ${detection.detail}`] : []),
     `- fingerprint: \`${detection.fingerprint}\` — while this bead is open, or once it is declined,`,
     "  the patrol makes this claim no second time",
     "",
