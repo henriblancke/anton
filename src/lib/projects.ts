@@ -679,7 +679,7 @@ function logBeadsConfig(repoPath: string, result: BeadsConfigResult): void {
  */
 function doltPushFailureWarning(
   repoPath: string,
-  dolt: { firstPublish?: boolean; pushAttempts?: number },
+  dolt: Pick<NonNullable<BeadsConfigResult["doltSync"]>, "firstPublish" | "pushAttempts">,
 ): string {
   if (dolt.firstPublish) {
     return (
