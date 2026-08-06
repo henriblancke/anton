@@ -78,7 +78,12 @@ describe("POST /api/projects/[slug]/epics/[epicId]/rework", () => {
     reworkTicket.mockResolvedValue(RESULT);
   });
 
-  afterEach(() => vi.clearAllMocks());
+  // restoreAllMocks too: a console spy must not survive a failed assertion and silence the rest of
+  // the file — clearAllMocks drops call history but leaves the mocked implementation in place.
+  afterEach(() => {
+    vi.clearAllMocks();
+    vi.restoreAllMocks();
+  });
 
   describe("200 — the rework applied", () => {
     it("returns the domain result, against the project the slug resolved to", async () => {
@@ -128,7 +133,6 @@ describe("POST /api/projects/[slug]/epics/[epicId]/rework", () => {
       expect(res.status).toBe(500);
       expect((await res.json()).error).toBe("bd: database is locked");
       expect(logged).toHaveBeenCalled();
-      logged.mockRestore();
     });
 
     it("500s with a generic message when the throw carries none", async () => {
@@ -140,7 +144,6 @@ describe("POST /api/projects/[slug]/epics/[epicId]/rework", () => {
       expect(res.status).toBe(500);
       expect((await res.json()).error).toBe("Failed to send the ticket back");
       expect(logged).toHaveBeenCalled();
-      logged.mockRestore();
     });
 
     it("404s an unknown project slug before the domain runs at all", async () => {

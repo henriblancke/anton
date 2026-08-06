@@ -62,7 +62,12 @@ describe("GET /api/projects/[slug]/epics/[epicId]/review", () => {
     showWithComments.mockResolvedValue(target([]));
   });
 
-  afterEach(() => vi.clearAllMocks());
+  // restoreAllMocks too: a console spy must not survive a failed assertion and silence the rest of
+  // the file — clearAllMocks drops call history but leaves the mocked implementation in place.
+  afterEach(() => {
+    vi.clearAllMocks();
+    vi.restoreAllMocks();
+  });
 
   describe("200 — the report as the panel renders it", () => {
     it("returns every round, the latest score, and the findings still open", async () => {
@@ -146,7 +151,6 @@ describe("GET /api/projects/[slug]/epics/[epicId]/review", () => {
       expect(res.status).toBe(500);
       expect((await res.json()).error).toBe("Could not read the review report");
       expect(logged).toHaveBeenCalled();
-      logged.mockRestore();
     });
   });
 });
