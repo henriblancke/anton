@@ -709,6 +709,28 @@ describe("gardener patrol · shadow mode", () => {
     expect(calls).toEqual([...READS, "create", "list"]);
   });
 
+  it("dates the fence on bd's one-second grid, so a same-second write reads as the tie apply refuses", async () => {
+    // The shadow holds the pass's raw wall-clock reading; the armed path reads its fence back off
+    // the proposal bead, where `observedAtOf` has floored it to bd's whole-second stamp grid. Left
+    // unfloored here, a subject written in the SAME second as the read orders as "before the
+    // observation" and shadows as WOULD APPLY — permission for a move the approval refuses.
+    now = NOW + 500; // the patrol reads the board 500ms into the second bd stamps as NOW
+    const sameSecond = bead("t-4", { title: "shipped", updated_at: new Date(NOW).toISOString() });
+    listMock.mockResolvedValue([sameSecond]);
+
+    await expectJobStatus(t.db, await runPatrol(), "done");
+
+    const plan = parseGardenerPlan(createMock.mock.calls[0][1].metadata?.gardener) as GardenerPlan;
+    // What the armed apply decides against the same board — its fence already on the grid.
+    const armed = realPlanApply(plan, [sameSecond], { nowMs: now, observedAtMs: NOW });
+    expect(armed.status).toBe("refuse");
+    expect(await sessionLog()).toContain(
+      `SHADOW p-1 (shipped-orphan) retire/close t-4 — WOULD REFUSE: ` +
+        `${armed.status === "refuse" ? armed.reason : ""}\n`,
+    );
+    expect(closeMock).not.toHaveBeenCalled();
+  });
+
   it("shadows nothing for a kind left at propose — and opens no session to say so", async () => {
     await arm({ stale: "shadow" }); // armed, but not the kind this patrol files
 

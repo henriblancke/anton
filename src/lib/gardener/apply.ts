@@ -1784,8 +1784,15 @@ function msOf(value: unknown): number | undefined {
   return Number.isFinite(at) ? at : undefined;
 }
 
-/** bd stamps beads at whole seconds; the fence is floored to match — see {@link writtenSinceFiling}. */
-const toBdStampGrid = (ms: number): number => Math.floor(ms / 1000) * 1000;
+/**
+ * bd stamps beads at whole seconds; the fence is floored to match — see {@link writtenSinceFiling}.
+ *
+ * Exported because anything that builds an {@link ApplyMoment} from a raw wall-clock reading rather
+ * than from a proposal bead — the shadow pass — has to floor it through THIS function, or it decides
+ * a same-second write on a finer grid than the armed path and reports permission the armed path
+ * would refuse.
+ */
+export const toBdStampGrid = (ms: number): number => Math.floor(ms / 1000) * 1000;
 
 /** The close reason a retirement writes — evidence lives on the proposal, so this stays one line. */
 function closeReason(plan: GardenerPlan): string {

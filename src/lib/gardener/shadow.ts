@@ -19,7 +19,7 @@
  */
 import type { Bead } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
-import { planApply, type ApplyMoment } from "./apply";
+import { planApply, toBdStampGrid, type ApplyMoment } from "./apply";
 import { autonomyFor, type ProposalAutonomyPolicy } from "./autonomy";
 import {
   planOf,
@@ -105,7 +105,15 @@ export async function shadowProposals(input: ShadowInput): Promise<ShadowRecord[
     return [];
   }
 
-  const at = { nowMs: input.nowMs, observedAtMs: input.observedAtMs };
+  // Floored to bd's stamp grid exactly as `observedAtOf` floors the armed path's fence. The armed
+  // path reads its stamp back off the proposal bead; the shadow holds the pass's raw wall-clock
+  // reading, which still carries milliseconds — and an unfloored fence orders a same-second write as
+  // "before the observation" where the armed path sees the tie it fails closed on. Same grid, same
+  // verdict; otherwise the shadow promises an apply the approval would refuse.
+  const at: ApplyMoment = {
+    nowMs: input.nowMs,
+    observedAtMs: input.observedAtMs === undefined ? undefined : toBdStampGrid(input.observedAtMs),
+  };
   const records: ShadowRecord[] = [];
   for (const { proposal, plan } of targets) {
     if (input.signal?.aborted) break;
