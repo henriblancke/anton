@@ -58,4 +58,8 @@ describe("pageLabelFromPath", () => {
   it("labels the roadmap route rather than falling back to Board", () => {
     expect(pageLabelFromPath("/projects/acme/roadmap")).toBe("Roadmap");
   });
+
+  it("labels the health route rather than falling back to Board", () => {
+    expect(pageLabelFromPath("/projects/acme/health")).toBe("Health");
+  });
 });

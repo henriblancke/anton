@@ -86,6 +86,28 @@ export function SettingsIcon({ className }: { className?: string }) {
   );
 }
 
+/** A pulse line — the Health page reads the codebase's vitals rather than the board's columns, so
+ * it earns its own glyph instead of borrowing RunsIcon's arrow or ScanHealthPanel's radar dot. */
+export function HealthIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 16 16"
+      className={className}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.3}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M2 8.5h2.4l1.4-3.8 2.2 7.2 1.4-3.4h2.7" />
+      <circle cx="12.7" cy="8.5" r="1" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
 export function JobsIcon({ className }: { className?: string }) {
   return (
     <svg
