@@ -26,7 +26,10 @@ export async function startShapeSession(slug: string, description: string): Prom
     { description: description || undefined },
     "shape session failed",
   );
-  const { sessionId } = (await res.json()) as { sessionId: string };
+  // A 200 without an id would leave the surface frozen on the composer while a live pty on the
+  // server has no id anyone can track or kill — better to fail loudly and let the caller toast.
+  const { sessionId } = (await res.json()) as { sessionId?: string };
+  if (!sessionId) throw new Error("shape session failed: no session id in response");
   return sessionId;
 }
 

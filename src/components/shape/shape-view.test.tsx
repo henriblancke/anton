@@ -129,6 +129,25 @@ describe("ShapeView", () => {
     expect(screen.getByRole("button", { name: "Start shaping" })).toBeTruthy();
   });
 
+  it("keeps the composer when the route answers 200 without a session id", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(json({}));
+    vi.stubGlobal("fetch", fetchMock);
+    renderView();
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Describe an epic" }), {
+      target: { value: SEED },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Start shaping" }));
+
+    // Without the guard the start silently "succeeds" with no id: no toast, no terminal, and the
+    // founder is left staring at the composer wondering why nothing happened.
+    await waitFor(() => expect(error).toHaveBeenCalledTimes(1));
+    expect(screen.queryByTestId("pty")).toBeNull();
+    expect(screen.getByRole("button", { name: "Start shaping" }).hasAttribute("disabled")).toBe(
+      false,
+    );
+  });
+
   it("kills the pty when the surface unmounts before the session id comes back", async () => {
     let landStart: (res: Response) => void = () => {};
     const fetchMock = vi
