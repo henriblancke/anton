@@ -7,9 +7,9 @@ import { HYGIENE_LABELS, findingBeadIds, housekeepingSummary, hygieneFindings } 
 /**
  * The `housekeeping`-severity findings — real, but nothing downstream is wrong today (contract gaps,
  * staleness, shipped-not-closed, duplicates). Collapsed behind a summary line with a Show/Hide
- * disclosure, exactly as `AttentionStrip` folds them on the board: a strip where everything is loud
- * is a strip an operator learns to skip, and this page inherits that restraint rather than un-fold
- * everything just because it has more room.
+ * disclosure: a surface where everything is loud is a surface an operator learns to skip, and this
+ * page inherits that restraint from the board strip it came out of (anton-4qf3) rather than
+ * un-folding everything just because it has more room.
  *
  * Renders nothing when there is none — the same "say nothing it hasn't earned" rule as every other
  * section here.

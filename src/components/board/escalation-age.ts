@@ -20,7 +20,7 @@ export function stuckFor(ms: number): string {
  * clock read here would give those two renders two different answers whenever a stall crossed a
  * minute boundary between them, which React reports as a hydration mismatch. Callers with no clock
  * to offer (the server pass, the pre-hydration pass) get the sweep's frozen age, which is server
- * data and therefore identical on both sides. See StuckFor in attention-strip.tsx.
+ * data and therefore identical on both sides. See StuckFor in escalation-strip.tsx.
  */
 export function escalationAge(escalation: EscalationView, nowMs?: number): string {
   if (nowMs === undefined || !escalation.since) return stuckFor(escalation.ageMs);

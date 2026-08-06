@@ -1,7 +1,8 @@
 /**
- * The Health page's data (anton-ue90.1 split): everything `AttentionStrip` demoted off the board —
- * hygiene's attention/housekeeping findings, the worst review score, the patrol's applied actions,
- * and the codebase scan trend — assembled for the read-only report at `/projects/[slug]/health`.
+ * The Health page's data (anton-4qf3 split): everything the board's old attention strip carried until
+ * it was cut down to escalations alone (`EscalationStrip`) — hygiene's attention/housekeeping
+ * findings, the worst review score, the patrol's applied actions, and the codebase scan trend —
+ * assembled for the read-only report at `/projects/[slug]/health`.
  *
  * This composes {@link getBoard}'s existing reads and {@link openEscalations} rather than re-deriving
  * anything: bead filtering and the epic/card assembly stay owned by lib/board.ts, severity and order

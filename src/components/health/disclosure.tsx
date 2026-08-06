@@ -4,9 +4,10 @@ import { useId, useState, type ReactNode } from "react";
 import { ChevronDownIcon, ChevronRightIcon } from "lucide-react";
 
 /**
- * The Show/Hide fold the Housekeeping section collapses behind, exactly as `AttentionStrip` does on
- * the board — housekeeping is real but costs nothing until someone looks, so it reports as a summary
- * line with a disclosure rather than as rows competing with "Worth a look" for attention.
+ * The Show/Hide fold the Housekeeping section collapses behind — housekeeping is real but costs
+ * nothing until someone looks, so it reports as a summary line with a disclosure rather than as rows
+ * competing with "Worth a look" for attention. The board folded it the same way before the
+ * health-page split (anton-4qf3) moved housekeeping here; the board no longer carries it at all.
  *
  * Takes its content as `children` rather than a list prop: the rows themselves (bead links included)
  * are rendered by the Server Component that owns this disclosure, so the client boundary here is
