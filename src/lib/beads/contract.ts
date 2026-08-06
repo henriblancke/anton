@@ -337,6 +337,15 @@ export const ACCEPTANCE_KEYS = ["acceptance", "acceptancecriteria"];
  * cannot drift apart.
  */
 export const ACCEPTANCE_HEADING = "Acceptance Criteria";
+
+/**
+ * The epic tier's rubric spelling every WRITER emits — an epic's definition of done lives under
+ * `## Success Criteria`, not `## Acceptance` ({@link acceptanceKeysOf}). Same reason as
+ * {@link ACCEPTANCE_HEADING}: `bd create --validate` rejects an epic without it, and `bd lint`
+ * reports it missing, so an epic anton writes for itself would otherwise show up as a permanent
+ * hygiene finding on its own attention strip.
+ */
+export const SUCCESS_HEADING = "Success Criteria";
 export const SUCCESS_KEYS = ["successcriteria", "success", ...ACCEPTANCE_KEYS];
 
 /** The headings that hold an epic's outcome: what the formula pours (`## Goal`), plus the name the

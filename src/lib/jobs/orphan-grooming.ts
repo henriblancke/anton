@@ -9,7 +9,7 @@
  * epic each time. Idempotent — a ticket already parented is no longer an orphan, so re-runs are safe.
  */
 import { beads, LABELS, type Bead } from "../beads/bd";
-import { isTicketTier } from "../beads/contract";
+import { isTicketTier, SUCCESS_HEADING } from "../beads/contract";
 import { getProjectById } from "../projects";
 import { PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
@@ -28,6 +28,23 @@ export interface OrphanGroomingDeps {
 
 /** Marks the epic this job creates/reuses to bucket orphans (so runs are idempotent). */
 export const ORPHAN_EPIC_LABEL = LABELS.source("orphan-grooming");
+
+export const ORPHAN_EPIC_TITLE = "Loose tickets — needs triage";
+
+/**
+ * The grooming epic's body. anton writes this bead for itself, so it must satisfy the same epic
+ * contract anton enforces on everyone else — `## Goal` plus the epic tier's `## Success Criteria`
+ * ({@link SUCCESS_HEADING}). Spelled `## Acceptance` it is an epic bd's own validator refuses, and
+ * gardener's lint sweep would file a permanent hygiene finding against it on every run.
+ */
+export const ORPHAN_EPIC_DESCRIPTION = [
+  "## Goal",
+  "Bucket for orphaned tickets (no parent epic) collected by anton's orphan-grooming job.",
+  "Review, split into real epics, and approve — or close what isn't worth doing.",
+  "",
+  `## ${SUCCESS_HEADING}`,
+  "- [ ] Every ticket here is triaged: moved to a real epic or closed.",
+].join("\n");
 
 /** Set of bead ids that are the child in a parent-child edge (i.e. have a parent). */
 function parentedIds(all: Bead[]): Set<string> {
@@ -96,16 +113,9 @@ export function makeOrphanGroomingHandler(deps: OrphanGroomingDeps): JobHandler 
 
     if (!epicId) {
       epicId = await beads.create(repo, {
-        title: "Loose tickets — needs triage",
+        title: ORPHAN_EPIC_TITLE,
         type: "epic",
-        description: [
-          "## Goal",
-          "Bucket for orphaned tickets (no parent epic) collected by anton's orphan-grooming job.",
-          "Review, split into real epics, and approve — or close what isn't worth doing.",
-          "",
-          "## Acceptance",
-          "- [ ] Every ticket here is triaged: moved to a real epic or closed.",
-        ].join("\n"),
+        description: ORPHAN_EPIC_DESCRIPTION,
       });
       await beads.tag(repo, epicId, [ORPHAN_EPIC_LABEL]);
     }
