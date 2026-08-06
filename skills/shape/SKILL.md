@@ -1,6 +1,6 @@
 ---
 name: shape
-version: 578d10574552
+version: 1ee53194bc2e
 description: >-
   The compiler. Turn a fuzzy idea into a validated feature — one PR anton's execution runtime can
   pick up — attached to its product epic, with child tickets under it. Runs forcing questions,
@@ -175,7 +175,7 @@ and run the check:
 bd list --status all --json --limit 0 \
   | jq -r '.[] | select(.status != "closed") | "\(.id)\t\(.issue_type)\tparent=\(.parent // "-")"'
 anton board-check            # non-zero exit = a dead bead; fix it before confirming
-bd lint                      # the contract sections, per bead — `--graph` skips `--validate`
+bd lint                      # the rubric section only, per bead — `--graph` skips `--validate`
 ```
 
 Then assert the five invariants out loud against what you just printed, naming counts:

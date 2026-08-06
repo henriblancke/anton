@@ -17,6 +17,11 @@
  *    tier is cooked by bd and created with `--validate` — the forcing function that makes the
  *    heading un-revertable (anton-szul): `bd lint` passes either spelling, so only `--validate`
  *    reddens when the shipped formula stops satisfying bd.
+ * 5. **…and what bd's validator does NOT agree to.** Its scope is that one heading, nothing more: a
+ *    body of only the rubric passes, and so does a skeleton whose every var is still the formula's
+ *    TODO prompt. skills/bd/SKILL.md is loaded verbatim into /shape and /scan-triage, so selling
+ *    `--validate` as a contract check ships TODO-stub beads; these two tests keep the sentence
+ *    honest, and name anton's own gate as the thing that actually refuses them.
  */
 import { execFileSync } from "node:child_process";
 import { afterAll, beforeAll, expect, it } from "vitest";
@@ -63,7 +68,8 @@ describeBd("bead formula (real bd · cook + create)", () => {
     return JSON.parse(execFileSync("bd", args, { cwd: repo, encoding: "utf8" }));
   };
 
-  /** `bd create --validate` — bd judging the cooked description by its OWN required sections. */
+  /** `bd create --validate` — bd judging the cooked description by its OWN required section: the
+   * rubric heading, and (per the two tests at the end) nothing else. */
   const createValidated = (type: string, description: string): string =>
     JSON.parse(
       execFileSync(
@@ -126,6 +132,28 @@ describeBd("bead formula (real bd · cook + create)", () => {
     expect(() =>
       createValidated(type, description.replace("## Acceptance Criteria", "## Acceptance")),
     ).toThrow(/Acceptance Criteria/);
+  });
+
+  // What `--validate` does NOT check. skills/bd/SKILL.md is instruction text anton loads verbatim
+  // into /shape and /scan-triage, and it once told an agent the flag "refuses a body missing the
+  // sections that type requires" — so a green `--validate` read as a complete contract and TODO-stub
+  // beads shipped to the board, to be caught only at the approve gate. bd's real scope is the ONE
+  // rubric heading: everything else is anton's own gate, below.
+  it("accepts a body that is nothing BUT the rubric heading", () => {
+    expect(createValidated("task", "## Acceptance Criteria\n- [ ] the rubric is the whole body")).toMatch(
+      /\S/,
+    );
+  });
+
+  it("accepts a cooked-but-unfilled skeleton that anton's contract gate refuses", async () => {
+    // Every var left at its `TODO —` default: the exact bead the skill elsewhere calls worse than an
+    // absent rubric. bd creates it; validateBeadContract blocks it.
+    const skeleton = renderBeadSkeleton(await loadBeadFormula(repo), "ticket", {});
+    expect(skeleton.description).toContain("TODO —");
+
+    const id = createValidated(skeleton.type, skeleton.description);
+    const bead = await beads.show(repo, id);
+    expect(validateBeadContract(bead).filter((v) => v.severity === "blocking")).not.toEqual([]);
   });
 
   it("materialises a ticket that reads back contract-conformant", async () => {

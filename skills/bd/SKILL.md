@@ -1,6 +1,6 @@
 ---
 name: bd
-version: 8f45c182d5b2
+version: 124cae45c200
 description: >-
   Conventions for how anton writes to the beads board (bd). The single place bd usage is
   defined, so /shape and /scan-triage stay consistent and beads stays swappable. Shaping is the
@@ -138,9 +138,12 @@ execution drives:   ready → in-progress → review → done   (and park/unpark
 
 A feature or ticket is not `shaped` until its **description** contains `## Goal`,
 `## Acceptance Criteria` (checkable boxes), `## Context`, `## Out of scope`, `## Verify` — all five,
-in that order, in the one field. Without these the executor has no spec. `/shape` and
-`/scan-triage` enforce it; `bd create --validate` refuses a body missing them and `bd lint` re-checks
-the Acceptance/Success sections after the fact.
+in that order, in the one field. Without these the executor has no spec.
+
+**bd checks one of the five, not five.** `bd create --validate` and `bd lint` both look for the
+rubric heading alone. The other four — Goal, Context, Out of scope, Verify — are enforced by
+`/shape`, `/scan-triage`, and anton's own contract gate at approve time. Nothing bd says green
+means the contract is complete.
 
 An epic is read, not executed, so it carries less: a one-line outcome, Success Criteria its
 features add up to, and its `area:` label.
@@ -195,9 +198,13 @@ returns only `description`. `--context` is the worse of the two: verified on bd 
 a trailing `## Context` to the description, landing it after `## Verify` and inverting the formula's
 order for every downstream reader.
 
-`--validate` is the create-time gate: it refuses a body missing the sections that type requires, so
-a half-filled contract never reaches the board. Put it on every `bd create` — it costs nothing when
-the body is right, and it is the one thing that catches a cooked-but-unfilled skeleton early.
+`--validate` gates the **rubric heading only** — `## Acceptance Criteria` on a task/bug/feature,
+`## Success Criteria` on an epic. Verified on bd 1.1.2: a body of nothing but that heading is
+accepted, and so is a cooked skeleton whose every var is still `TODO — …`. Put it on every
+`bd create` — it costs nothing and it is what makes the heading spelling un-revertable — but never
+read a green `--validate` as a filled contract. The other four sections, and a rubric still holding
+the formula's prompt, are yours to fill here; `/shape`, `/scan-triage` and anton's contract gate
+catch them later, at approve time, where the fix costs a round trip.
 
 Then label and link (below). Run `bd lint <id>` too — it re-checks Acceptance Criteria (`task`,
 `bug`, `feature`) / Success Criteria (`epic`) after the fact, which is what covers the `--graph`

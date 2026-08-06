@@ -215,6 +215,18 @@ describe("required skill assets", () => {
       expect(bd).toMatch(/Never put a heredoc inside command substitution/);
     });
 
+    // Instruction text an agent ACTS on: overstate bd's validator and a green `--validate` reads as
+    // a filled contract, so TODO-stub beads reach the board and only the approve gate catches them.
+    // bd 1.1.2 checks the rubric heading and nothing else (formula.integration.test.ts pins it).
+    it("bd scopes `--validate` to the rubric heading and denies it proves a contract", () => {
+      expect(bd).toMatch(/`--validate` gates the \*\*rubric heading only\*\*/);
+      expect(bd).toMatch(/never\s+read a green `--validate` as a filled contract/);
+      expect(bd).toMatch(/\*\*bd checks one of the five, not five\.\*\*/);
+      // The claims that were wrong — bd accepts both bodies they promise it refuses.
+      expect(bd).not.toMatch(/refuses a body missing/);
+      expect(bd).not.toMatch(/catches a cooked-but-unfilled skeleton/);
+    });
+
     it("shape escalates an unattachable feature instead of orphaning it", () => {
       expect(shape).toMatch(/ask the user/i);
       expect(shape).toMatch(/Never leave a feature parentless/);
