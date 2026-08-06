@@ -13,6 +13,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -23,6 +24,7 @@ import {
   DEFAULT_DIFF_PATCH_CHARS,
   diffAgainstBase,
   findOpenPullRequest,
+  gitCommonDir,
   listDirBlobsAtRev,
   lookupOpenPullRequest,
   markPullRequestDraft,
@@ -344,6 +346,46 @@ suite("worktreeHasCommitFor (real git)", () => {
 
   it("returns false in a repo with no matching commit (fresh cross-machine worktree)", async () => {
     expect(await worktreeHasCommitFor(repo, "anton-jz1.2")).toBe(false);
+  });
+});
+
+suite("gitCommonDir (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-commondir-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("resolves a LINKED worktree to the repository's shared ref store, not its own admin dir", async () => {
+    // The property the review sandbox rests on (anton-t6tu): every anton run works in a linked
+    // worktree, and the branch a rogue reviewer would plant lands in the SHARED dir. Answering with
+    // `<common>/worktrees/<name>` would deny a directory nobody attacks and leave `refs/heads` open.
+    const linked = join(sandbox, "wt");
+    g(["worktree", "add", "-q", linked, "-b", "anton/gate1"]);
+
+    expect(await gitCommonDir(linked)).toBe(join(realpathSync(repo), ".git"));
+  });
+
+  it("answers with an absolute path even when asked from a subdirectory", async () => {
+    // `--git-common-dir` alone is relative to the cwd git was run in, and a relative deny rule is a
+    // deny rule pointed somewhere else.
+    mkdirSync(join(repo, "src"));
+    expect(await gitCommonDir(join(repo, "src"))).toBe(join(realpathSync(repo), ".git"));
   });
 });
 

@@ -646,6 +646,31 @@ describe("runReviewGate — sessions", () => {
     // The fixer is an implementer: the project's own hooks apply to the code it writes.
     expect(calls[1].settingSources).toBeUndefined();
   });
+
+  it("sandboxes the reviewer's shell with the repository's ref store denied (anton-t6tu)", async () => {
+    // The half no tool-name filter reaches: `Bash` stays, and a shell writes bytes without any of
+    // the denied tools — `printf <sha> > <repo>/.git/refs/heads/anton/<future-bead>` plants a branch
+    // `createWorktree` later adopts, leaving this worktree byte-identical. Only OS-level containment
+    // closes it, so the dispatch has to CARRY the sandbox settings, not merely be entitled to them.
+    const { result, calls } = gate([report(4, [BLOCKING]), "fixed", report(9, [])]);
+    await result;
+
+    const commonDir = execFileSync("git", ["-C", dir, "rev-parse", "--path-format=absolute", "--git-common-dir"])
+      .toString()
+      .trim();
+    for (const review of [calls[0], calls[2]]) {
+      const { sandbox } = JSON.parse(review.settingsJson!);
+      expect(sandbox.enabled).toBe(true);
+      expect(sandbox.failIfUnavailable).toBe(true);
+      expect(sandbox.allowUnsandboxedCommands).toBe(false);
+      // The ref store, in both the form git reports and the form anton configured — on macOS a temp
+      // path reaches the kernel symlink-resolved, and a deny rule only bites the path it names.
+      expect(sandbox.filesystem.denyWrite).toContain(commonDir);
+      expect(sandbox.filesystem.denyWrite).toContain(join(dir, ".git"));
+    }
+    // The fixer commits its work through git: sandboxing it out of the ref store would break the round.
+    expect(calls[1].settingsJson).toBeUndefined();
+  });
 });
 
 describe("runReviewGate — the run-lease is re-asserted between dispatches", () => {
