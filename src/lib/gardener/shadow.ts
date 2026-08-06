@@ -67,11 +67,18 @@ export interface ShadowInput {
   /** Where the record lands. The session log, so the jobs page shows it with no new surface. */
   log: (chunk: string) => Promise<void>;
   signal?: AbortSignal;
-  /** Injectable board read, so a test can shadow without a live bd. Defaults to the fresh read. */
-  loadBoard?: (repo: string) => Promise<Bead[]>;
 }
 
-/** The proposals this policy would shadow — the manual-move floor already applied by `autonomyFor`. */
+/**
+ * The proposals this policy would shadow — the manual-move floor already applied by `autonomyFor`.
+ *
+ * `apply` is deliberately NOT shadowed: an armed kind is meant to be written, not described, so
+ * routing it here would report a move as hypothetical that the pass is trusted to make. The armed
+ * path does not exist yet (anton-lmps ships the shadow half), so until it does, a kind set to
+ * `apply` — reachable only by a direct settings API call, since the UI offers the radio disabled —
+ * behaves as `propose`. That is the safe direction to be wrong in: it files the ask and writes
+ * nothing.
+ */
 function shadowable(
   created: EmittedProposal[],
   policy: ProposalAutonomyPolicy,
@@ -94,10 +101,9 @@ export async function shadowProposals(input: ShadowInput): Promise<ShadowRecord[
   const targets = shadowable(input.created, input.policy);
   if (targets.length === 0 || input.signal?.aborted) return [];
 
-  const load = input.loadBoard ?? ((repo: string) => loadAllIssues(repo));
   let board: Bead[];
   try {
-    board = await load(input.repo);
+    board = await loadAllIssues(input.repo);
   } catch (e) {
     // The read is the shadow's whole input, so losing it loses every record — but it costs the pass
     // nothing else, because a shadow has nothing to leave half-done.
