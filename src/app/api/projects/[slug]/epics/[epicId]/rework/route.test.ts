@@ -139,6 +139,7 @@ describe("POST /api/projects/[slug]/epics/[epicId]/rework", () => {
 
       expect(res.status).toBe(500);
       expect((await res.json()).error).toBe("Failed to send the ticket back");
+      expect(logged).toHaveBeenCalled();
       logged.mockRestore();
     });
 
