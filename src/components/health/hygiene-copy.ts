@@ -1,9 +1,14 @@
 /**
- * The hygiene-finding vocabulary the Health page's sections share (anton-ue90.1 split), copied
- * rather than imported from `components/board/attention-strip.tsx`: that file is owned by the board
- * split and its labels are private to it, so the wording is kept in step by hand — both surfaces
- * describe the same six {@link HygieneFindingKind}s and must read the same way wherever a finding
- * shows up.
+ * The hygiene-finding vocabulary — the words an operator reads for each of the six
+ * {@link HygieneFindingKind}s, and the summary line that folds them into a count.
+ *
+ * This module is the ONLY owner of that copy. The board used to carry a second, hand-synced set in
+ * its attention strip; the health-page split (anton-4qf3) left the board with escalations alone, so
+ * hygiene wording no longer has a second home to drift against. Anything that grows a hygiene
+ * surface later imports from here rather than restating the labels.
+ *
+ * Copy only — severity and order belong to `rankAttention` (lib/attention.ts), which decides what is
+ * worth a look and what is housekeeping. This file never re-ranks anything.
  */
 import type { AttentionItem } from "@/lib/attention";
 import type { HygieneFinding, HygieneFindingKind } from "@/lib/types";

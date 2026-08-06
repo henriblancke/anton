@@ -5,8 +5,11 @@ import { HealthBeadLink } from "./bead-link";
 /**
  * What the patrol CHANGED on its own authority this pass — as opposed to what it found and left for
  * a human (that's "Worth a look"/"Housekeeping"). A count of what changed is not a report an operator
- * can act on, so this names the epics it closed rather than just how many, mirroring the board's own
- * `AppliedEpics`/`appliedSummary` (`components/board/attention-strip.tsx`).
+ * can act on, so this names the epics it closed rather than just how many.
+ *
+ * The board used to carry this as a line in its attention strip; the health-page split (anton-4qf3)
+ * left the board with escalations alone, so this section is now the only place the patrol's own
+ * writes are reported. If it doesn't say a bead changed under the operator, nothing does.
  *
  * Renders nothing when the patrol neither closed anything nor repaired a blocked row — "applied
  * nothing" is not worth a panel of its own.

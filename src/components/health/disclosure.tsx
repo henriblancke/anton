@@ -35,11 +35,14 @@ export function Disclosure({ summary, children }: { summary: ReactNode; children
           {open ? "Hide" : "Show"}
         </button>
       </div>
-      {open ? (
-        <div id={bodyId} className="pt-1">
-          {children}
-        </div>
-      ) : null}
+      {/* Always mounted, hidden when closed, rather than conditionally rendered: `aria-controls`
+          above points at this id, and an id that isn't in the DOM is a dangling reference for any
+          assistive tech that dereferences it eagerly (ARIA 1.2 permits the forward reference, but
+          permitting it is not the same as every AT implementation handling it). Keeping it mounted
+          also means the fold never unmounts its children, so nested state survives a toggle. */}
+      <div id={bodyId} hidden={!open} className="pt-1">
+        {children}
+      </div>
     </div>
   );
 }

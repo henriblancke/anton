@@ -34,9 +34,12 @@ describe("HousekeepingSection", () => {
       />,
     );
     expect(screen.getByText("2 contract gaps · 1 stale")).toBeTruthy();
-    expect(screen.queryByText("lint on anton-a")).toBeNull();
+    // The fold stays MOUNTED and `hidden` rather than unmounting (so the button's `aria-controls`
+    // never dangles), so "folded" is asserted as not-exposed, not as absent from the DOM.
+    expect(screen.getByText("lint on anton-a").closest("[hidden]")).not.toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: /show/i }));
+    expect(screen.getByText("lint on anton-a").closest("[hidden]")).toBeNull();
     expect(screen.getByText("lint on anton-a")).toBeTruthy();
     expect(screen.getByText("lint on anton-b")).toBeTruthy();
     expect(screen.getByText("stale-open on anton-c")).toBeTruthy();
@@ -45,8 +48,8 @@ describe("HousekeepingSection", () => {
   it("hides the list again on Hide", () => {
     render(<HousekeepingSection items={[item("orphan", "anton-a")]} />);
     fireEvent.click(screen.getByRole("button", { name: /show/i }));
-    expect(screen.getByText("orphan on anton-a")).toBeTruthy();
+    expect(screen.getByText("orphan on anton-a").closest("[hidden]")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: /hide/i }));
-    expect(screen.queryByText("orphan on anton-a")).toBeNull();
+    expect(screen.getByText("orphan on anton-a").closest("[hidden]")).not.toBeNull();
   });
 });
