@@ -615,3 +615,70 @@ describe("settings route — per-label pipeline variants (anton-aa3m)", () => {
     }
   });
 });
+
+/**
+ * Per-kind proposal autonomy (anton-nbyy): the policy round-trips, merges per kind, and a submission
+ * naming a kind or a level anton doesn't know 400s rather than persisting an entry that would
+ * silently resolve back to `propose`.
+ */
+describe("settings route — proposal autonomy policy (anton-nbyy)", () => {
+  beforeEach(async () => {
+    tdb = makeTestDb();
+    await tdb.db.insert(schema.projects).values({
+      id: "p1",
+      slug: "tmp",
+      name: "tmp",
+      repoPath: "/tmp/p1",
+    });
+  });
+
+  it("persists no key for a zero-config project — propose everywhere is an absence", async () => {
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.proposalAutonomy).toBeUndefined();
+    expect("proposalAutonomy" in persisted()).toBe(false);
+  });
+
+  it("PATCH persists a policy, and GET restores it after a reload", async () => {
+    const proposalAutonomy = { stale: "shadow", "shipped-orphan": "apply" };
+    const res = await PATCH(patchReq({ proposalAutonomy }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.proposalAutonomy).toEqual(proposalAutonomy);
+    expect(persisted().proposalAutonomy).toEqual(proposalAutonomy);
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.proposalAutonomy).toEqual(proposalAutonomy);
+  });
+
+  it("merges per kind, so a client that sends one kind can't disarm the others", async () => {
+    await PATCH(patchReq({ proposalAutonomy: { stale: "shadow" } }), ctx("tmp"));
+    const res = await PATCH(patchReq({ proposalAutonomy: { "low-value": "shadow" } }), ctx("tmp"));
+    expect((await res.json()).settings.proposalAutonomy).toEqual({
+      stale: "shadow",
+      "low-value": "shadow",
+    });
+  });
+
+  it("rejects an unknown kind or an unknown level, without persisting", async () => {
+    await PATCH(patchReq({ proposalAutonomy: { stale: "shadow" } }), ctx("tmp"));
+    for (const bad of [
+      { "kind-from-the-future": "shadow" }, // not a detection kind
+      { stale: "armed" }, // not one of the three levels
+      { stale: true },
+      ["stale"],
+      "shadow",
+    ]) {
+      const res = await PATCH(patchReq({ proposalAutonomy: bad }), ctx("tmp"));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/proposalAutonomy/);
+    }
+    expect(persisted().proposalAutonomy).toEqual({ stale: "shadow" });
+  });
+
+  it('"" / null clears the policy back to propose everywhere (key removed)', async () => {
+    await PATCH(patchReq({ proposalAutonomy: { stale: "shadow" } }), ctx("tmp"));
+    const res = await PATCH(patchReq({ proposalAutonomy: null }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.proposalAutonomy).toBeUndefined();
+    expect("proposalAutonomy" in persisted()).toBe(false);
+  });
+});

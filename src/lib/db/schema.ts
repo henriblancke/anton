@@ -340,18 +340,30 @@ export const escalations = sqliteTable(
 );
 
 /** Claude sessions — for history, diagnostics, and xterm attach. */
-export const sessions = sqliteTable("sessions", {
-  id: text("id").primaryKey(),
-  projectId: text("project_id").notNull().references(() => projects.id),
-  runId: text("run_id").references(() => runs.id),
-  // shape | execute | review-fix | interactive
-  kind: text("kind").notNull(),
-  beadId: text("bead_id"),
-  status: text("status").notNull().default("running"),
-  logPath: text("log_path"),
-  // Claude's own session id (from the stream-json result / system-init event), persisted so a
-  // transient mid-stream death can be retried with `claude --resume <id>` (anton-juar).
-  claudeSessionId: text("claude_session_id"),
-  startedAt: ts("started_at").notNull().default(now),
-  endedAt: ts("ended_at"),
-});
+export const sessions = sqliteTable(
+  "sessions",
+  {
+    id: text("id").primaryKey(),
+    projectId: text("project_id").notNull().references(() => projects.id),
+    runId: text("run_id").references(() => runs.id),
+    // The queue job that opened this session (anton-lmps). The runner's in-memory live handle only
+    // answers for a job running on THIS instance, so without this column a settled job's output is
+    // unreachable — a nightly gardener/product-master pass writes no run row, and its log would exist
+    // only as a file on disk. Project deletion clears sessions before jobs, so the FK never blocks it.
+    jobId: text("job_id").references(() => jobs.id),
+    // shape | execute | review-fix | interactive
+    kind: text("kind").notNull(),
+    beadId: text("bead_id"),
+    status: text("status").notNull().default("running"),
+    logPath: text("log_path"),
+    // Claude's own session id (from the stream-json result / system-init event), persisted so a
+    // transient mid-stream death can be retried with `claude --resume <id>` (anton-juar).
+    claudeSessionId: text("claude_session_id"),
+    startedAt: ts("started_at").notNull().default(now),
+    endedAt: ts("ended_at"),
+  },
+  (table) => [
+    // Serves the jobs page's "which session did each of these rows open" read (one IN per page).
+    index("sessions_job_idx").on(table.jobId),
+  ],
+);

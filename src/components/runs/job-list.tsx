@@ -61,6 +61,7 @@ export function JobList({
   jobs,
   slug,
   liveJobs,
+  jobSessions,
 }: {
   jobs: JobSummary[];
   slug: string;
@@ -69,6 +70,11 @@ export function JobList({
    * (anton-gjhu), sessionId gates View live output (anton-x10l).
    */
   liveJobs?: Record<string, LiveJobInfo>;
+  /**
+   * jobId → the session that job opened, read from the durable link (anton-lmps). Survives the job
+   * settling, which the live handle does not — this is what makes a finished pass's log readable.
+   */
+  jobSessions?: Record<string, string>;
 }) {
   // Confirmed kills, held here rather than per row so the bulk bar and the per-row button write to
   // the same place. Only ever grown from a 200 — a refused kill leaves the job's own status.
@@ -143,6 +149,7 @@ export function JobList({
             job={job}
             slug={slug}
             live={liveJobs?.[job.id]}
+            loggedSessionId={jobSessions?.[job.id]}
             killed={killedIds.has(job.id)}
             onKilled={() => markKilled([job.id])}
             selectable={selectableIds.includes(job.id)}
@@ -198,6 +205,7 @@ function JobRow({
   job,
   slug,
   live,
+  loggedSessionId,
   killed,
   onKilled,
   selectable,
@@ -208,6 +216,8 @@ function JobRow({
   job: JobSummary;
   slug: string;
   live?: LiveJobInfo;
+  /** The session this job durably recorded — the only handle a settled job has (anton-lmps). */
+  loggedSessionId?: string;
   /** Confirmed cancelled by the server (per-row or bulk) — the row shows `cancelled` at once. */
   killed: boolean;
   onKilled: () => void;
@@ -223,14 +233,21 @@ function JobRow({
   // Live output viewer under this row (anton-x10l) — read-only tail of the job's session log.
   const [outputOpen, setOutputOpen] = useState(false);
   const liveCwd = live?.cwd;
+  // Which log the viewer opens. The live handle answers only while the job runs here; the durable
+  // link answers afterwards, so a nightly gardener/product-master pass an operator reads at 09:00 is
+  // as inspectable as one caught mid-flight.
+  const sessionId = (job.status === "running" ? live?.sessionId : undefined) ?? loggedSessionId;
+  // A running job is still writing to its log; a settled one's is a replay.
+  const following = job.status === "running";
 
   // Job settled while the terminal was open (an RSC refresh dropped the live handle, e.g. after a
   // confirmed kill) → drop the session during render (React's "adjusting state when props change"
   // pattern) so the teardown effect below fires and a later resume can't resurrect a dead session.
   if (investigateSession && !liveCwd) setInvestigateSession(null);
-  // Same for the output panel: without this, a settled job leaves outputOpen=true and a later
-  // resume with a fresh sessionId would silently reopen the panel without a user click.
-  if (outputOpen && !live?.sessionId) setOutputOpen(false);
+  // Same for the output panel: without this, a job whose session handle went away leaves
+  // outputOpen=true and a later resume with a fresh sessionId would silently reopen the panel
+  // without a user click.
+  if (outputOpen && !sessionId) setOutputOpen(false);
 
   // The row owns the investigate pty's lifetime: dropping the session — Close, the job settling
   // out from under the terminal, or this row unmounting — must kill the pty, because unmounting
@@ -258,8 +275,9 @@ function JobRow({
   // Investigate needs a job that's still running here with a reported cwd — the map only carries
   // those, and a local kill drops the action immediately.
   const investigable = !killed && job.status === "running" && Boolean(live?.cwd);
-  // View live output needs a running job whose handler reported a session — same locality rules.
-  const observable = !killed && job.status === "running" && Boolean(live?.sessionId);
+  // Output needs a session to read: the running job's reported one, or the one the job recorded
+  // before it settled. A killed row shows the kill first — its log is one refresh away.
+  const observable = !killed && Boolean(sessionId);
 
   return (
     <li className="flex flex-col">
@@ -299,7 +317,7 @@ function JobRow({
             </span>
           </div>
         </button>
-        {(resumable || active) && (
+        {(resumable || active || observable) && (
           <div
             className="flex shrink-0 items-center gap-1.5"
             onClick={(e) => e.stopPropagation()}
@@ -308,7 +326,7 @@ function JobRow({
             {observable && !outputOpen && (
               <Button size="xs" variant="outline" onClick={() => setOutputOpen(true)}>
                 <ScrollTextIcon aria-hidden="true" />
-                View live output
+                {following ? "View live output" : "View output"}
               </Button>
             )}
             {investigable && !investigateSession && (
@@ -329,10 +347,11 @@ function JobRow({
 
       {open && <JobDetail job={job} status={status} />}
 
-      {outputOpen && live?.sessionId && (
+      {outputOpen && sessionId && (
         <JobOutputPanel
           slug={slug}
-          sessionId={live.sessionId}
+          sessionId={sessionId}
+          live={following}
           onClose={() => setOutputOpen(false)}
         />
       )}
