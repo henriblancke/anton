@@ -58,6 +58,10 @@ describe("HealthReport", () => {
 
   it("always renders the vitals rail, even with nothing to report", () => {
     render(<HealthReport slug="anton" health={health()} />);
-    expect(screen.getByText(/answered on the board/)).toBeTruthy();
+    // Anchored on the rail's headings and its back-link, which render unconditionally — NOT on the
+    // stopped-run copy, which varies with the count (see HealthRail's zero case).
+    expect(screen.getByText("On the board")).toBeTruthy();
+    expect(screen.getByText("Last checked")).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Back to board" })).toBeTruthy();
   });
 });

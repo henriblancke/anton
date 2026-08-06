@@ -91,4 +91,13 @@ describe("HealthRail", () => {
       "/projects/anton",
     );
   });
+
+  it("drops the redirection clause when nothing is stopped", () => {
+    render(<HealthRail slug="anton" health={baseHealth({ stoppedCount: 0 })} />);
+    // The block still renders — this rail always does — but "answered on the board, not here"
+    // would imply work is waiting there, which is the opposite of what a zero count means.
+    expect(screen.getByText("No stopped runs.")).toBeTruthy();
+    expect(screen.queryByText(/answered on the board/)).toBeNull();
+    expect(screen.getByRole("link", { name: "Back to board" })).toBeTruthy();
+  });
 });

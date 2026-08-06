@@ -148,9 +148,19 @@ export function HealthRail({ slug, health }: { slug: string; health: ProjectHeal
       </RailBlock>
 
       <RailBlock title="On the board">
+        {/* "answered on the board, not here" is a redirection, so it is only said when there is
+            something to redirect: at zero it would imply work is waiting somewhere else, which is
+            the opposite of what the count means. The block itself still renders — this rail is the
+            one thing on the page that always does, and "nothing is stopped" is worth saying. */}
         <p className="text-muted-foreground">
-          {stoppedCount} stopped {stoppedCount === 1 ? "run" : "runs"} — answered on the board, not
-          here.
+          {stoppedCount > 0 ? (
+            <>
+              {stoppedCount} stopped {stoppedCount === 1 ? "run" : "runs"} — answered on the board,
+              not here.
+            </>
+          ) : (
+            "No stopped runs."
+          )}
         </p>
         <Link
           href={`/projects/${slug}`}
