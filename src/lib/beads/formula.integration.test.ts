@@ -11,6 +11,9 @@
  *    board all judge beads read from `bd list --json`, on the strength of it carrying every home
  *    the contract lives in — description and `acceptance_criteria` — whenever they are non-empty
  *    (ticket-view.ts). That is a property of bd's output, so only a real bd can pin it.
+ * 4. **bd's own validator agrees.** anton reads either spelling of the rubric heading; bd does not
+ *    (`bd create --validate` demands `## Acceptance Criteria` on a task/feature, `## Success
+ *    Criteria` on an epic), so which spelling the formula cooks is a fact only bd can settle.
  */
 import { execFileSync } from "node:child_process";
 import { afterAll, beforeAll, expect, it } from "vitest";
@@ -51,6 +54,14 @@ describeBd("bead formula (real bd · cook + create)", () => {
     return JSON.parse(execFileSync("bd", args, { cwd: repo, encoding: "utf8" }));
   };
 
+  /** `bd create --validate` — bd judging the cooked description by its OWN required sections. */
+  const createValidated = (type: string, description: string): string =>
+    execFileSync(
+      "bd",
+      ["create", VARS.title, "--type", type, "--description", description, "--validate", "--json"],
+      { cwd: repo, encoding: "utf8", stdio: "pipe" },
+    );
+
   beforeAll(() => {
     bdRepo = makeBdRepo();
     repo = bdRepo.repo;
@@ -72,6 +83,25 @@ describeBd("bead formula (real bd · cook + create)", () => {
     for (const tier of ["epic", "feature", "ticket"] as BeadTier[]) {
       expect(cooked.get(tier)?.trim(), tier).toBe(renderBeadSkeleton(formula, tier, VARS).description);
     }
+  });
+
+  // Why the rubric heading is spelled bd's way (anton-dji7). anton's own reader takes either
+  // spelling, so only bd can say which one bd wants: `--validate` refuses a task/feature whose
+  // description has no `## Acceptance Criteria`, and the negative case pins that the flag is
+  // actually judging rather than passing everything.
+  it.each(["epic", "feature", "ticket"] as BeadTier[])(
+    "cooks a %s that bd's own `--validate` accepts",
+    async (tier) => {
+      const skeleton = renderBeadSkeleton(await loadBeadFormula(repo), tier, VARS);
+      expect(() => createValidated(skeleton.type, skeleton.description)).not.toThrow();
+    },
+  );
+
+  it("proves `--validate` refuses the heading anton used to cook", async () => {
+    const { type, description } = renderBeadSkeleton(await loadBeadFormula(repo), "ticket", VARS);
+    expect(() =>
+      createValidated(type, description.replace("## Acceptance Criteria", "## Acceptance")),
+    ).toThrow(/Acceptance Criteria/);
   });
 
   it("materialises a ticket that reads back contract-conformant", async () => {

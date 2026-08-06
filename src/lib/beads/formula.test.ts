@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { validateBeadContract } from "./contract";
+import { ACCEPTANCE_HEADING, validateBeadContract } from "./contract";
 import {
   BEAD_FORMULA_FILENAME,
   bundledBeadFormulaPath,
@@ -76,9 +76,13 @@ describe("the shipped bead formula", () => {
     const formula = await load();
     for (const tier of ["feature", "ticket"] as BeadTier[]) {
       const { description } = renderBeadSkeleton(formula, tier);
-      for (const section of ["Goal", "Acceptance", "Context", "Out of scope", "Verify"]) {
+      for (const section of ["Goal", ACCEPTANCE_HEADING, "Context", "Out of scope", "Verify"]) {
         expect(description, tier).toContain(`## ${section}`);
       }
+      // The rubric heading is pinned to bd's own spelling (anton-dji7): `bd create --validate` and
+      // `bd lint` demand "Acceptance Criteria" on a task/feature, so the bare `## Acceptance` we
+      // used to cook — which anton's own reader still accepts — would fail bd's.
+      expect(description, tier).not.toMatch(/^## Acceptance\s*$/m);
     }
   });
 
