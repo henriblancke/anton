@@ -1,0 +1,239 @@
+// @vitest-environment jsdom
+/**
+ * The Automation schedule table (anton-ue90.4), tested at its own boundary (anton-8t1f).
+ *
+ * The claim under test is that every cell reads from the schedule row and nothing else: a cadence
+ * phrase, a countdown or a last-run age that disagreed with the row that actually fires would be
+ * worse than a blank column. The cadence cell carries most of that weight — it is the only control
+ * here that opens an editor, and it has to stay honest whether the row is on a preset, on a
+ * hand-written expression, off, or not created yet.
+ */
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+
+import {
+  AutomationTable,
+  type AutomationScheduleState,
+  type AutomationSpec,
+} from "@/components/settings/automation-table";
+
+afterEach(cleanup);
+
+const NOW_SEC = () => Math.floor(Date.now() / 1000);
+
+const AUTOMATIONS: AutomationSpec[] = [
+  {
+    id: "nightly-stringer",
+    label: "nightly-stringer",
+    description: "mines the repo for work",
+    group: "Board maintenance",
+  },
+  { id: "run-health", label: "run-health", description: "watches live runs", group: "Run health" },
+  {
+    id: "unstick",
+    label: "unstick",
+    description: "nudges stalled runs",
+    dependsOn: "run-health",
+    group: "Run health",
+  },
+];
+
+const DEFAULT_CRONS: Record<string, string> = {
+  "nightly-stringer": "0 3 * * *",
+  "run-health": "0 * * * *",
+  unstick: "10 * * * *",
+};
+
+/** Every automation gets a row, so the table renders the same shape the settings page passes in. */
+function renderTable(overrides: Record<string, Partial<AutomationScheduleState>> = {}) {
+  const state: Record<string, AutomationScheduleState> = {};
+  for (const automation of AUTOMATIONS) {
+    state[automation.id] = {
+      enabled: false,
+      cron: DEFAULT_CRONS[automation.id],
+      ...overrides[automation.id],
+    };
+  }
+  const onCronChange = vi.fn<(id: string, cron: string) => void>();
+  const onToggle = vi.fn<(id: string, next: boolean) => void>();
+  render(
+    <AutomationTable
+      automations={AUTOMATIONS}
+      state={state}
+      defaultCrons={DEFAULT_CRONS}
+      onCronChange={onCronChange}
+      onToggle={onToggle}
+    />,
+  );
+  return { onCronChange, onToggle };
+}
+
+const cadenceButton = (id = "nightly-stringer") =>
+  screen.getByRole("button", { name: `${id} cadence` });
+const openEditor = (id?: string) => fireEvent.click(cadenceButton(id));
+const setCadence = () => screen.getByRole("button", { name: "Set cadence" });
+const editorIsOpen = () => screen.queryByRole("button", { name: "Set cadence" }) !== null;
+
+describe("the cadence cell", () => {
+  it("reads a known preset as its phrase, with the expression behind it", () => {
+    renderTable({ "nightly-stringer": { cron: "*/30 * * * *" } });
+    const button = cadenceButton();
+
+    expect(button.textContent).toContain("Every 30 minutes");
+    // The phrase is what an operator scans; the exact expression stays one hover away.
+    expect(button.getAttribute("title")).toBe("*/30 * * * *");
+  });
+
+  it("reads a hand-written expression as itself rather than inventing a phrase", () => {
+    // Lists and ranges are outside the preset vocabulary. Describing `0 0,12 * * 1-5` as anything
+    // but its own text would be a guess, and the cadence it names is not one the picker can spell.
+    renderTable({ "nightly-stringer": { cron: "0 0,12 * * 1-5" } });
+    expect(cadenceButton().textContent).toContain("0 0,12 * * 1-5");
+  });
+
+  it("flags a cadence faster than the threshold on the row, not only in the editor", () => {
+    // The editor is only open while someone is choosing; the dot is the state they left behind.
+    renderTable({ "nightly-stringer": { cron: "*/2 * * * *" } });
+    expect(cadenceButton().querySelector("[aria-hidden='true']")).not.toBeNull();
+    expect(cadenceButton("run-health").querySelector("[aria-hidden='true']")).toBeNull();
+  });
+
+  it("stays readable and editable while the automation is off", () => {
+    renderTable({ "nightly-stringer": { enabled: false, cron: "*/30 * * * *" } });
+    expect(cadenceButton().textContent).toContain("Every 30 minutes");
+
+    // Off is not the same as unconfigurable — the cadence a disabled automation would run at is
+    // exactly what an operator sets before turning it on.
+    openEditor();
+    expect(editorIsOpen()).toBe(true);
+  });
+
+  it("shows the cadence an automation with no row yet would be created at", () => {
+    renderTable({ "nightly-stringer": { enabled: null, cron: DEFAULT_CRONS["nightly-stringer"] } });
+    expect(cadenceButton().textContent).toContain("Daily at 03:00");
+    expect(screen.getAllByText("not scheduled").length).toBe(AUTOMATIONS.length);
+  });
+
+  it("opens the editor in a popover and reports it through aria", () => {
+    renderTable();
+    const button = cadenceButton();
+    expect(button.getAttribute("aria-expanded")).toBe("false");
+    expect(editorIsOpen()).toBe(false);
+
+    openEditor();
+    expect(button.getAttribute("aria-expanded")).toBe("true");
+    expect(document.getElementById(button.getAttribute("aria-controls")!)).not.toBeNull();
+  });
+
+  it("hands the committed cadence back, keyed by automation", () => {
+    const { onCronChange } = renderTable({ "run-health": { cron: "0 * * * *" } });
+    openEditor("run-health");
+    fireEvent.click(screen.getByRole("button", { name: "Daily" }));
+    fireEvent.click(setCadence());
+
+    expect(onCronChange).toHaveBeenCalledWith("run-health", "0 3 * * *");
+    // Committing is the end of the interaction — the popover goes away with it.
+    expect(editorIsOpen()).toBe(false);
+  });
+
+  it("edits one row's cadence without touching another's", () => {
+    renderTable({
+      "nightly-stringer": { cron: "*/30 * * * *" },
+      "run-health": { cron: "0 * * * *" },
+    });
+    openEditor();
+    expect(screen.getAllByRole("button", { name: "Set cadence" })).toHaveLength(1);
+    expect(cadenceButton("run-health").textContent).toContain("Hourly, on the hour");
+  });
+
+  it("closes on Escape and on a click genuinely outside it", () => {
+    renderTable();
+    openEditor();
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(editorIsOpen()).toBe(false);
+
+    openEditor();
+    fireEvent.mouseDown(document.body);
+    expect(editorIsOpen()).toBe(false);
+  });
+
+  it("does not read picking a time inside the editor as clicking away", () => {
+    // The editor's pickers portal their menus outside this subtree, so "outside the popover" and
+    // "outside the editor" are different places. Untested, a picker that stopped carrying the
+    // marker the guard keys on would silently bin the draft on every click.
+    renderTable();
+    openEditor();
+    fireEvent.click(screen.getByRole("button", { name: "Daily" }));
+    fireEvent.click(screen.getByLabelText("Hour"));
+    const option = screen.getAllByRole("option")[0];
+    expect(document.querySelector("[data-slot='select-positioner']")?.contains(option)).toBe(true);
+
+    fireEvent.mouseDown(option);
+    expect(editorIsOpen()).toBe(true);
+  });
+
+  it("discards an uncommitted draft when the popover is dismissed", () => {
+    const { onCronChange } = renderTable({ "nightly-stringer": { cron: "*/30 * * * *" } });
+    openEditor();
+    fireEvent.click(screen.getByRole("button", { name: "Hourly" }));
+    fireEvent.mouseDown(document.body);
+
+    expect(onCronChange).not.toHaveBeenCalled();
+    expect(cadenceButton().textContent).toContain("Every 30 minutes");
+  });
+});
+
+describe("the automation rows", () => {
+  it("counts how many automations are running", () => {
+    renderTable({ "run-health": { enabled: true } });
+    expect(screen.getByText(`1 of ${AUTOMATIONS.length} running`)).toBeTruthy();
+  });
+
+  it("groups the rows so several automations read as a few concerns", () => {
+    renderTable();
+    for (const group of ["Board maintenance", "Run health"]) {
+      expect(screen.getByRole("columnheader", { name: group })).toBeTruthy();
+    }
+    // Delivery has no rows here — an empty group heading would be a column with nothing under it.
+    expect(screen.queryByRole("columnheader", { name: "Delivery" })).toBeNull();
+  });
+
+  it("counts down to the next run, with the exact instant one hover away", () => {
+    const at = NOW_SEC() + 2 * 3600 + 60;
+    renderTable({ "nightly-stringer": { enabled: true, nextRunAt: at } });
+    expect(screen.getByText("in 2h")).toBeTruthy();
+    expect(screen.getByText("in 2h").getAttribute("title")).toBeTruthy();
+  });
+
+  it("says an automation is not scheduled while it is off, even with a stored next run", () => {
+    // A disabled row keeps its nextRunAt in the database; printing it would promise a fire that
+    // the scheduler will never make.
+    renderTable({
+      "nightly-stringer": { enabled: false, nextRunAt: NOW_SEC() + 3600 },
+    });
+    expect(screen.getAllByText("not scheduled").length).toBe(AUTOMATIONS.length);
+  });
+
+  it("says an automation has never run rather than leaving the column blank", () => {
+    renderTable({ "nightly-stringer": { lastRunAt: NOW_SEC() - 3 * 3600 - 60 } });
+    expect(screen.getByText("3h ago")).toBeTruthy();
+    expect(screen.getAllByText("never").length).toBe(AUTOMATIONS.length - 1);
+  });
+
+  it("says which automations are idle because the one that feeds them is off", () => {
+    // unstick acts on run-health's findings. With the producer off it is not broken, it is idle —
+    // and without saying so the row reads as a failure.
+    renderTable({ "run-health": { enabled: false } });
+    expect(screen.getByText(/idle until run-health is on/)).toBeTruthy();
+
+    cleanup();
+    renderTable({ "run-health": { enabled: true } });
+    expect(screen.getByText(/fed by run-health/)).toBeTruthy();
+  });
+
+  it("hands a toggle back as the state the operator asked for", () => {
+    const { onToggle } = renderTable({ "run-health": { enabled: false } });
+    fireEvent.click(screen.getByRole("switch", { name: "run-health" }));
+    expect(onToggle).toHaveBeenCalledWith("run-health", true);
+  });
+});
