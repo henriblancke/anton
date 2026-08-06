@@ -66,6 +66,13 @@ interface EditableSettings {
   agents?: string[];
   autonomy?: boolean;
   conventionalCommits?: boolean;
+  /**
+   * How far a pass may go with the proposals it files, per detection kind (anton-nbyy). Only the
+   * kinds moved off `propose` are stored. Typed loosely on purpose: this mirror must survive a blob
+   * a human hand-edited or an older anton wrote, and {@link resolveProposalAutonomy} floors anything
+   * it can't read back to `propose` rather than rendering it.
+   */
+  proposalAutonomy?: Record<string, string>;
   /** Budget-aware execution master-switch (anton-7mpv.1); off by default. Gates the knobs below. */
   budgetAware?: boolean;
   /** Operator budget policy (anton-egrg); only the two exposed knobs round-trip through this form. */
@@ -95,6 +102,148 @@ const REVIEW_LOW_SCORE_ROUNDS_MAX = 5;
 // Mirror DEFAULT_PROJECT_BUDGET_POLICY (src/lib/projects.ts) for the two operator-facing knobs.
 const DEFAULT_DAYTIME_RESERVE_PCT = 15;
 const DEFAULT_WEEKLY_TARGET_PCT = 90;
+
+/**
+ * How far a pass may go with a proposal it files, mirrored from PROPOSAL_AUTONOMY_LEVELS
+ * (src/lib/gardener/autonomy.ts) — least autonomous first, which is the order the control offers
+ * them in, so "further right is more autonomous" reads the same in the type and on screen.
+ */
+const AUTONOMY_LEVELS = ["propose", "shadow", "apply"] as const;
+
+type ProposalAutonomy = (typeof AUTONOMY_LEVELS)[number];
+
+const AUTONOMY_LEVEL_HINT: Record<ProposalAutonomy, string> = {
+  propose: "files it on the board and stops · you approve it",
+  shadow: "also records what applying it would have done — and still writes nothing",
+  apply: "writes the move to the board unattended",
+};
+
+/**
+ * Why `apply` is offered but never selectable yet. It exists in the type so the shape settles once,
+ * but no pass can perform the write today — arming a kind that would quietly keep proposing is the
+ * one thing this control must not let an operator believe they did.
+ */
+const APPLY_UNAVAILABLE = "arrives with armed writes · nothing can perform the write yet";
+
+/** One detection kind as the founder meets it: what its move does, and whether it can be armed. */
+interface AutonomyKindSpec {
+  /** A GardenerDetectionKind (src/lib/gardener/detections.ts). */
+  id: string;
+  /** What approving it WRITES — the move in the founder's terms, not the detector's. */
+  does: string;
+  /**
+   * Why this kind can never be armed at all. Set only where the move has no mechanical answer, and
+   * it mirrors autonomyFor's hard floor: the control is pinned at `propose` rather than offering a
+   * level the pass would silently ignore.
+   */
+  blocked?: string;
+}
+
+/**
+ * The eleven kinds grouped by REVERSIBILITY — the whole design of the control (anton-nbyy).
+ *
+ * A flat list makes arming `implied-order` and arming `shipped-orphan` look like the same decision,
+ * and they are nothing alike: one adds an edge a single write removes, the other writes "this
+ * shipped" into the board's history. Each group therefore states both halves — what the move does
+ * and how a wrong one is taken back — so the founder who arms this never has to read the source to
+ * know what a mistake costs. Ordered cheapest-mistake first.
+ */
+const AUTONOMY_GROUPS: {
+  id: string;
+  title: string;
+  /** What the moves in this group do to the board. */
+  does: string;
+  /** How a wrong one is undone — the property the grouping is actually by. */
+  undo: string;
+  /** A per-PROPOSAL floor inside this group that no setting can lift. */
+  floor?: string;
+  kinds: AutonomyKindSpec[];
+}[] = [
+  {
+    id: "reversible",
+    title: "Undone by one write",
+    does: "Moves a bead in the graph, or rewrites one field: a parent, a blocks edge, a priority.",
+    undo: "One bd write puts it back, and nothing is recorded as having happened.",
+    floor:
+      "A re-parent filed without a target names no home — the ask is “which feature?”, and only " +
+      "you can answer it. Those are never applied, whatever this says.",
+    kinds: [
+      {
+        id: "container-orphan",
+        does: "re-parents a bead hanging off a container epic under the feature that carries it",
+      },
+      {
+        id: "parentless-cluster",
+        does: "re-parents loose beads under the one card that is obviously their home",
+      },
+      { id: "implied-order", does: "adds the blocks edge two beads' bodies already state" },
+      { id: "missing-order", does: "adds the blocks edge one top-tier bead needs on another" },
+      { id: "mispriority", does: "rewrites one bead's priority to the one the evidence supports" },
+    ],
+  },
+  {
+    id: "dequeued",
+    title: "Takes work out of the queue",
+    does: "The bead and its contract survive untouched; what changes is that nothing picks it up next.",
+    undo: "bd undefer puts a deferred bead straight back. A withdrawn approval returns only when you approve it again.",
+    kinds: [
+      { id: "stale", does: "defers a bead untouched far past the threshold for its status" },
+      { id: "low-value", does: "defers work the evidence no longer supports — the kill" },
+      {
+        id: "degraded-approval",
+        does: "withdraws approved from work that has stopped clearing the approve gate",
+      },
+    ],
+  },
+  {
+    id: "history",
+    title: "Writes history",
+    does: "Closes the bead — and a close is a claim about what happened: shipped-orphan writes “this shipped”, superseded writes “that one replaced it”.",
+    undo: "Reopening is one write, but the close stays in the board's history and in every report already taken from it.",
+    kinds: [
+      { id: "superseded", does: "closes a bead as superseded, pointing at the twin that landed" },
+      { id: "shipped-orphan", does: "closes a bead a commit already shipped" },
+    ],
+  },
+  {
+    id: "manual",
+    title: "Nothing to arm",
+    does: "No mechanical move exists. The ask is filed with its evidence and waits on a judgment only you can make.",
+    undo: "Nothing to undo: approving one is refused, and declining is what records your answer.",
+    kinds: [
+      {
+        id: "oversized",
+        does: "asks for a decomposition, and sketches one",
+        blocked: "a split writes new contracts — /shape's work, and your call",
+      },
+    ],
+  },
+];
+
+/** Every kind the control renders, in the order the groups declare them. */
+const AUTONOMY_KINDS = AUTONOMY_GROUPS.flatMap((g) => g.kinds);
+
+/**
+ * The stored overrides as a full per-kind policy — the same "never partial" shape
+ * resolveProposalAutonomyPolicy produces on the server, so the form and the passes agree on what an
+ * absent entry means.
+ *
+ * Unreadable entries fall back to `propose` rather than rendering, and a kind the floor pins there
+ * ({@link AutonomyKindSpec.blocked}) is pinned here too: a hand-edited blob that armed `oversized`
+ * must not show as armed when autonomyFor would answer `propose` for it anyway.
+ */
+function resolveProposalAutonomy(
+  stored: Record<string, string> | undefined,
+): Record<string, ProposalAutonomy> {
+  return Object.fromEntries(
+    AUTONOMY_KINDS.map((kind) => {
+      const value = stored?.[kind.id];
+      const armable =
+        !kind.blocked && (AUTONOMY_LEVELS as readonly string[]).includes(value ?? "");
+      return [kind.id, armable ? (value as ProposalAutonomy) : "propose"];
+    }),
+  );
+}
 
 /** Default model options for the headless claude driver. Empty value = the CLI's own default. */
 const MODELS: { value: string; label: string; hint?: string }[] = [
@@ -167,6 +316,12 @@ const SECTIONS = [
     label: "Automation",
     group: "On a schedule",
     dirtyKeys: ["productMasterPrompt"],
+  },
+  {
+    id: "proposals",
+    label: "Proposal autonomy",
+    group: "On a schedule",
+    dirtyKeys: ["proposalAutonomy"],
   },
   { id: "danger", label: "Danger zone", group: "Irreversible", dirtyKeys: [] },
 ] as const;
@@ -444,6 +599,11 @@ export function SettingsView({
     (settings.formulaVariants ?? []).map((v, i) => ({ id: `v${i}`, ...v })),
   );
   const nextVariantId = useRef(variantRows.length);
+  // Per-kind proposal autonomy (anton-nbyy), held RESOLVED rather than as the sparse override map
+  // the server stores: the control has to render a level for every kind, and "absent" is not one.
+  const [proposalAutonomy, setProposalAutonomy] = useState(() =>
+    resolveProposalAutonomy(settings.proposalAutonomy),
+  );
   const [saving, setSaving] = useState(false);
 
   /**
@@ -460,6 +620,7 @@ export function SettingsView({
    * Against {@link baseline}, not the `settings` prop — the prop is the SSR snapshot and never
    * moves, so a save would leave every indicator here stuck on.
    */
+  const savedAutonomy = resolveProposalAutonomy(baseline.proposalAutonomy);
   const dirty: Record<string, boolean> = {
     model: model !== (baseline.model ?? ""),
     agents: !sameIds(
@@ -497,6 +658,11 @@ export function SettingsView({
       reviewMinScore !== (baseline.reviewMinScore ?? DEFAULT_REVIEW_MIN_SCORE) ||
       reviewLowScoreRounds !==
         (baseline.reviewLowScoreRounds ?? DEFAULT_REVIEW_LOW_SCORE_ROUNDS),
+    // Resolved on both sides: the baseline holds only the kinds an operator armed, so comparing the
+    // raw maps would read the shipped default as an edit on every render.
+    proposalAutonomy: AUTONOMY_KINDS.some(
+      (kind) => proposalAutonomy[kind.id] !== savedAutonomy[kind.id],
+    ),
   };
   const dirtySections = SECTIONS.filter((s) => s.dirtyKeys.some((key) => dirty[key]));
 
@@ -698,6 +864,10 @@ export function SettingsView({
           // Only the two exposed knobs; the server deep-merges into the stored policy, so knobs
           // set via the API (dayWindow, minSessionHeadroomPct, …) survive a save from this form.
           budgetPolicy: { daytimeReservePct, weeklyTargetPct },
+          // Every kind this build renders, at its resolved level. Explicit `propose` entries and
+          // not omissions: the server merges per kind, so an omitted kind keeps whatever it held —
+          // which is how disarming one would silently fail to persist.
+          proposalAutonomy,
         }),
       });
       const body = (await res.json().catch(() => null)) as {
@@ -1455,6 +1625,67 @@ export function SettingsView({
           </section>
           )}
 
+          {/* Proposal autonomy (anton-nbyy) — how far a pass may go with what it files, per kind.
+              Grouped by REVERSIBILITY rather than by producer: the gardener's shipped-orphan close
+              and its implied-order link come out of the same pass and are nothing alike to get
+              wrong, and a flat list of eleven kinds hides exactly that. */}
+          {active === "proposals" && (
+          <section className="flex max-w-2xl flex-col gap-3.5">
+            <div className="flex items-baseline gap-2.5">
+              <h2 className="text-[15px] font-semibold">Proposal autonomy</h2>
+              <span className="text-xs text-subtle">
+                how far a pass may go with what it finds, per kind
+              </span>
+            </div>
+
+            <div className="flex flex-col gap-1.5 rounded-[10px] border border-border bg-card px-3 py-2.5">
+              {AUTONOMY_LEVELS.map((level) => (
+                <div key={level} className="flex items-baseline gap-2.5">
+                  <span className="w-14 shrink-0 font-mono text-[10.5px] text-primary">{level}</span>
+                  <span className="text-[11px] text-subtle">
+                    {AUTONOMY_LEVEL_HINT[level]}
+                    {level === "apply" && ` · unavailable — ${APPLY_UNAVAILABLE}`}
+                  </span>
+                </div>
+              ))}
+            </div>
+
+            {AUTONOMY_GROUPS.map((group) => (
+              <div
+                key={group.id}
+                role="group"
+                aria-labelledby={`autonomy-group-${group.id}`}
+                className="flex flex-col gap-2.5 rounded-[10px] border border-border bg-card px-3 py-3"
+              >
+                <div className="flex flex-col gap-1">
+                  <span id={`autonomy-group-${group.id}`} className="text-[12.5px] font-medium">
+                    {group.title}
+                  </span>
+                  <span className="text-[11px] text-subtle">{group.does}</span>
+                  <span className="text-[11px] text-subtle">
+                    <span className="text-muted-foreground">Undone by</span> {group.undo}
+                  </span>
+                </div>
+
+                <div className="flex flex-col divide-y divide-border/60">
+                  {group.kinds.map((kind) => (
+                    <AutonomyRow
+                      key={kind.id}
+                      kind={kind}
+                      value={proposalAutonomy[kind.id]}
+                      onChange={(level) =>
+                        setProposalAutonomy((prev) => ({ ...prev, [kind.id]: level }))
+                      }
+                    />
+                  ))}
+                </div>
+
+                {group.floor && <span className="text-[11px] text-subtle">{group.floor}</span>}
+              </div>
+            ))}
+          </section>
+          )}
+
           {/* Danger zone */}
           {active === "danger" && (
           <section className="flex max-w-2xl flex-col gap-3.5">
@@ -1660,6 +1891,87 @@ function CountField({
       />
       <span className="text-[11px] text-subtle">{hint}</span>
     </label>
+  );
+}
+
+/**
+ * One detection kind's autonomy row (anton-nbyy): what approving it writes, and how far this project
+ * lets a pass go with it. A kind the floor pins at `propose` says so in the row rather than being
+ * left out — an operator has to be able to see that anton knows about `oversized` and why it is not
+ * on offer, which a silently absent row cannot tell them.
+ */
+function AutonomyRow({
+  kind,
+  value,
+  onChange,
+}: {
+  kind: AutonomyKindSpec;
+  value: ProposalAutonomy;
+  onChange: (level: ProposalAutonomy) => void;
+}) {
+  return (
+    <div className="flex items-center gap-3 py-2 first:pt-0 last:pb-0">
+      <div className="flex min-w-0 flex-col gap-0.5">
+        <span className="font-mono text-[11.5px]">{kind.id}</span>
+        <span className="text-[11px] text-subtle">{kind.does}</span>
+        {kind.blocked && (
+          <span className="text-[11px] text-risk-med">not armable · {kind.blocked}</span>
+        )}
+      </div>
+      <span className="ml-auto shrink-0">
+        <AutonomyChoice kind={kind} value={value} onChange={onChange} />
+      </span>
+    </div>
+  );
+}
+
+/**
+ * The three levels as a segmented radio group, least autonomous first.
+ *
+ * Real radios rather than a `<select>`: three options whose whole point is that one is further along
+ * a scale than the next read better side by side, and this is the shape that can show `apply`
+ * DISABLED with its reason instead of hiding it — an operator who can't see the level exists has no
+ * way to know what is coming, and one offered a level the pass ignores is worse off still.
+ */
+function AutonomyChoice({
+  kind,
+  value,
+  onChange,
+}: {
+  kind: AutonomyKindSpec;
+  value: ProposalAutonomy;
+  onChange: (level: ProposalAutonomy) => void;
+}) {
+  return (
+    <fieldset className="flex gap-0.5 rounded-[9px] border border-border bg-background/40 p-0.5">
+      <legend className="sr-only">{kind.id} autonomy</legend>
+      {AUTONOMY_LEVELS.map((level) => {
+        // The kind's own floor outranks the level's availability: `oversized` is not armable at all,
+        // so saying "apply arrives later" about it would promise something that is never coming.
+        const unavailable = kind.blocked ?? (level === "apply" ? APPLY_UNAVAILABLE : undefined);
+        return (
+          <label
+            key={level}
+            title={unavailable ?? AUTONOMY_LEVEL_HINT[level]}
+            className={cn("block", unavailable ? "cursor-not-allowed" : "cursor-pointer")}
+          >
+            <input
+              type="radio"
+              name={`autonomy-${kind.id}`}
+              className="peer sr-only"
+              value={level}
+              checked={value === level}
+              disabled={Boolean(unavailable)}
+              onChange={() => onChange(level)}
+              aria-label={`${kind.id} · ${level}`}
+            />
+            <span className="block rounded-[7px] px-2 py-1 font-mono text-[10.5px] text-muted-foreground transition-colors peer-checked:bg-primary/15 peer-checked:text-primary peer-focus-visible:ring-2 peer-focus-visible:ring-primary/50 peer-disabled:text-subtle peer-disabled:opacity-50">
+              {level}
+            </span>
+          </label>
+        );
+      })}
+    </fieldset>
   );
 }
 
