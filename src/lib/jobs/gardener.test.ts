@@ -641,7 +641,8 @@ describe("gardener patrol · shadow mode", () => {
   });
 
   it("lands the record on a session the jobs page already knows how to show", async () => {
-    await expectJobStatus(t.db, await runPatrol(), "done");
+    const jobId = await runPatrol();
+    await expectJobStatus(t.db, jobId, "done");
 
     const [session] = await t.db.select().from(schema.sessions);
     expect(session.kind).toBe("gardener");
@@ -649,6 +650,10 @@ describe("gardener patrol · shadow mode", () => {
     // Settled, not left running: the patrol is over, and a session stuck on "running" reads as a
     // pass still in flight.
     expect(session.status).toBe("done");
+    // Linked to the job that opened it. The patrol opens its session in its last seconds and the
+    // runner's live handle dies with the job, so WITHOUT this row the record a founder reads the
+    // morning after a 03:00 pass is a .log file on disk with no route to it from the jobs page.
+    expect(session.jobId).toBe(jobId);
   });
 
   it("names the move's counterpart — a move recorded without its other end is not a record", async () => {

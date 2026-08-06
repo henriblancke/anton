@@ -216,13 +216,21 @@ export function makeGardenerHandler(deps: GardenerDeps): JobHandler {
     /**
      * The patrol's session log, opened on FIRST WRITE. The gardener runs no claude session, so a row
      * exists only for a pass that has something to say — today, its shadow records (anton-lmps) —
-     * and a nightly patrol with nothing to shadow leaves no empty session behind. Reported live so
-     * the jobs page tails it through the surface every other job's output already uses.
+     * and a nightly patrol with nothing to shadow leaves no empty session behind.
+     *
+     * Linked to the job BOTH ways: `ctx.report` for the live tail while the pass runs, and `jobId` on
+     * the row for after it settles. The durable link is the one that matters here — this patrol opens
+     * its session in its last few seconds, so a nightly pass is settled long before anyone looks, and
+     * the live handle is gone by then.
      */
     let session: JobSession | undefined;
     const log = async (chunk: string): Promise<void> => {
       if (!session) {
-        session = await startJobSession(db, clock, { projectId, kind: "gardener" });
+        session = await startJobSession(db, clock, {
+          projectId,
+          kind: "gardener",
+          jobId: ctx.jobId,
+        });
         ctx.report({ sessionId: session.sessionId });
       }
       await appendSessionLog(session.logPath, chunk);

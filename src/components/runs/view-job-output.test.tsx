@@ -128,3 +128,60 @@ describe("JobList view-live-output affordance", () => {
     expect(screen.getByRole("button", { name: /view live output/i })).toBeDefined();
   });
 });
+
+/**
+ * anton-lmps: the durable half. A gardener or product-master pass writes no run row and opens its
+ * session in its final seconds — by the time a founder reads the board the next morning the job has
+ * settled and the runner's live handle is gone. The jobs page is the surface those passes' output
+ * (their shadow records) is promised on, so the row has to keep offering it after the job ends.
+ */
+describe("JobList settled-job output affordance", () => {
+  it("offers View output on a settled job that recorded a session, wired to that session", () => {
+    render(
+      <JobList
+        jobs={[job("done")]}
+        slug="anton"
+        jobSessions={{ "job-done": "sess-nightly" }}
+      />,
+    );
+
+    // Not "live": the pass is over, and the viewer is replaying rather than following.
+    expect(screen.queryByRole("button", { name: /view live output/i })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /^view output$/i }));
+
+    expect(screen.getByTestId("run-terminal").getAttribute("data-session-id")).toBe("sess-nightly");
+  });
+
+  it.each<JobStatus>(["queued", "parked", "failed", "cancelled"])(
+    "offers the recorded session on a %s job too — a pass that ended badly is the one worth reading",
+    (status) => {
+      render(
+        <JobList
+          jobs={[job(status)]}
+          slug="anton"
+          jobSessions={{ [`job-${status}`]: "sess-1" }}
+        />,
+      );
+      expect(screen.getByRole("button", { name: /^view output$/i })).toBeDefined();
+    },
+  );
+
+  it("prefers the live session over the recorded one while the job is still running", () => {
+    render(
+      <JobList
+        jobs={[job("running")]}
+        slug="anton"
+        liveJobs={{ "job-running": { sessionId: "sess-live" } }}
+        jobSessions={{ "job-running": "sess-recorded" }}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /view live output/i }));
+    expect(screen.getByTestId("run-terminal").getAttribute("data-session-id")).toBe("sess-live");
+  });
+
+  it("offers nothing for a job that recorded no session", () => {
+    render(<JobList jobs={[job("done")]} slug="anton" jobSessions={{ other: "sess-1" }} />);
+    expect(screen.queryByRole("button", { name: /view output/i })).toBeNull();
+  });
+});

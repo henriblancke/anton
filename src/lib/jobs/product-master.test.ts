@@ -405,6 +405,17 @@ describe("product-master pass · shadow mode", () => {
     expect(writes).toEqual(["create Product master: defer anton-a"]);
   });
 
+  it("lands the record on a session the settled job still points at", async () => {
+    const jobId = await runPass();
+    await expectJobStatus(t.db, jobId, "done");
+
+    const [session] = await t.db.select().from(schema.sessions);
+    // The pass writes no run row and the runner's live handle dies with the job, so this link is
+    // the jobs page's only route to a finished pass's log — the shadow records included.
+    expect(session.jobId).toBe(jobId);
+    expect(session.status).toBe("done");
+  });
+
   it("carries planApply's refusal verbatim — the reason is what an operator arms on", async () => {
     // Somebody rewrote the bead while the session was judging it, so the evidence the proposal rests
     // on is stale by the time the shadow decides. That gap is the whole reason the shadow re-reads

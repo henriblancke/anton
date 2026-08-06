@@ -108,9 +108,12 @@ export function makeProductMasterHandler(deps: ProductMasterDeps): JobHandler {
     const repo = project.repoPath;
     const settings = await getProjectSettings(db, projectId);
 
+    // `jobId` is the durable half of the link: this pass writes no run row, so once it settles the
+    // jobs page is the only route to its log — including the shadow records (anton-lmps).
     const { sessionId, logPath, onEvent } = await startJobSession(db, clock, {
       projectId,
       kind: "product-master",
+      jobId: ctx.jobId,
     });
     // Live handle (anton-susu): this job writes no run row, and it runs claude in the project repo
     // itself — no worktree, because nothing it does touches code.
