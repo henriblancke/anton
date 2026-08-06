@@ -14,9 +14,12 @@
  * 4. **bd's own validator agrees.** anton reads either spelling of the rubric heading; bd does not
  *    (`bd create --validate` demands `## Acceptance Criteria` on a task/feature, `## Success
  *    Criteria` on an epic), so which spelling the formula cooks is a fact only bd can settle. Every
- *    tier is cooked by bd and created with `--validate` — the forcing function that makes the
- *    heading un-revertable (anton-szul): `bd lint` passes either spelling, so only `--validate`
- *    reddens when the shipped formula stops satisfying bd.
+ *    tier is cooked by bd, created with `--validate`, and then linted — together the forcing
+ *    function that makes the heading un-revertable (anton-szul). `--validate` is the sharper of the
+ *    two: it refuses the create outright, judging the very description the formula ships. `bd lint`
+ *    rejects the bare spelling too (measured on bd 1.1.2, which exits 1 with "Missing: ## Acceptance
+ *    Criteria"), and is pinned alongside it because it is the only rubric check that reaches beads
+ *    made the `--graph` way, which `--validate` skips entirely (skills/bd/SKILL.md).
  * 5. **…and what bd's validator does NOT agree to.** Its scope is that one heading, nothing more: a
  *    body of only the rubric passes, and so does a skeleton whose every var is still the formula's
  *    TODO prompt. skills/bd/SKILL.md is loaded verbatim into /shape and /scan-triage, so selling
@@ -79,6 +82,11 @@ describeBd("bead formula (real bd · cook + create)", () => {
       ),
     ).id;
 
+  /** `bd lint` — the same rubric judged after the fact. Exits non-zero on a finding, so a passing
+   * lint is simply "does not throw". */
+  const lint = (id: string): string =>
+    execFileSync("bd", ["lint", id], { cwd: repo, encoding: "utf8", stdio: "pipe" });
+
   /** What bd itself cooked, per tier — the description AND the bd type each tier materialises as. */
   let cooked: Map<string, CookedStep>;
 
@@ -119,19 +127,51 @@ describeBd("bead formula (real bd · cook + create)", () => {
   // output rather than anton's renderer: what ships is the formula, so the thing that must satisfy
   // `--validate` is what bd cooks from it — respelling the heading back reddens all three tiers.
   it.each(["epic", "feature", "ticket"] as BeadTier[])(
-    "cooks a %s that bd's own `--validate` accepts onto the board",
+    "cooks a %s that bd's own `--validate` and `bd lint` both accept onto the board",
     (tier) => {
       const { type, description } = cookedTier(tier);
-      expect(createValidated(type, description)).toMatch(/\S/);
+      const id = createValidated(type, description);
+      expect(id).toMatch(/\S/);
+      // Both of bd's rubric checks, not just the one on the create path: `--validate` never runs on
+      // the `--graph` path the skill prescribes, so lint is what guards a bead created that way.
+      expect(() => lint(id)).not.toThrow();
     },
   );
 
-  // …and the negative case pins that the flag is actually judging rather than passing everything.
+  // …and the negative cases pin that both checks actually judge rather than pass everything.
   it("proves `--validate` refuses the heading anton used to cook", () => {
     const { type, description } = cookedTier("ticket");
     expect(() =>
       createValidated(type, description.replace("## Acceptance Criteria", "## Acceptance")),
     ).toThrow(/Acceptance Criteria/);
+  });
+
+  it("proves `bd lint` refuses that heading too — the check the `--graph` path leans on", () => {
+    const { type, description } = cookedTier("ticket");
+    const bare = description.replace("## Acceptance Criteria", "## Acceptance");
+    // Created WITHOUT `--validate`, standing in for the bead a `--graph` plan lands: that path skips
+    // validation entirely, so lint is the only thing between it and a rubric-less bead.
+    const id = JSON.parse(
+      execFileSync("bd", ["create", VARS.title, "--type", type, "--description", bare, "--json"], {
+        cwd: repo,
+        encoding: "utf8",
+        stdio: "pipe",
+      }),
+    ).id as string;
+
+    // bd signals a finding only through the exit code and prints the reason on stdout, so assert on
+    // both — a bare `.toThrow()` would pass for any failure, including a mistyped id.
+    const findings = (() => {
+      try {
+        lint(id);
+        return null;
+      } catch (e) {
+        return (e as { stdout?: string }).stdout ?? "";
+      }
+    })();
+
+    expect(findings, "bd lint accepted the bare heading").not.toBeNull();
+    expect(findings).toContain("Missing: ## Acceptance Criteria");
   });
 
   // What `--validate` does NOT check. skills/bd/SKILL.md is instruction text anton loads verbatim
