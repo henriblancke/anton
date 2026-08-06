@@ -13,6 +13,9 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import * as schema from "../db/schema";
 import { makeTestDb, type TestDb } from "../db/testing";
@@ -26,7 +29,12 @@ import type {
   StaleOpts,
   SyncOutcome,
 } from "../beads/bd";
-import { GARDENER_OBSERVED_AT_KEY } from "../gardener/detections";
+import type { ApplyDecision, ApplyMoment } from "../gardener/apply";
+import {
+  GARDENER_OBSERVED_AT_KEY,
+  parseGardenerPlan,
+  type GardenerPlan,
+} from "../gardener/detections";
 import { getHygieneReport, getHygieneReportForJob } from "../hygiene";
 import { driveJob, expectJobStatus, makeJobRunner } from "@/lib/testing/jobs";
 import type { Clock } from "./queue";
@@ -87,6 +95,24 @@ vi.mock("../beads/bd", async () => {
   };
 });
 
+/**
+ * The decision seam, spied rather than replaced: shadow mode's whole claim is that it asks the SAME
+ * `planApply` an approval asks, so the default is the real one and only the "it threw" case swaps it.
+ */
+const planApplyMock =
+  vi.fn<(plan: GardenerPlan, board: Bead[], at: ApplyMoment) => ApplyDecision>();
+
+vi.mock("../gardener/apply", async () => {
+  const actual = await vi.importActual<typeof import("../gardener/apply")>("../gardener/apply");
+  return {
+    ...actual,
+    planApply: (...a: [GardenerPlan, Bead[], ApplyMoment]) => planApplyMock(...a),
+  };
+});
+
+const { planApply: realPlanApply } =
+  await vi.importActual<typeof import("../gardener/apply")>("../gardener/apply");
+
 const { makeGardenerHandler, STALE_IN_PROGRESS_DAYS, STALE_OPEN_DAYS } = await import("./gardener");
 
 const NOW = 1_700_000_000_000;
@@ -123,7 +149,26 @@ function runPatrol(): Promise<string> {
   });
 }
 
+/** Arm a kind at a level for this project — the operator's stored autonomy policy (anton-nbyy). */
+async function arm(overrides: Record<string, string>): Promise<void> {
+  await t.db
+    .update(schema.projects)
+    .set({ settingsJson: JSON.stringify({ proposalAutonomy: overrides }) });
+}
+
+/** The patrol's session log, or "" for a pass that never opened one. */
+async function sessionLog(): Promise<string> {
+  const [row] = await t.db.select().from(schema.sessions);
+  return row?.logPath ? readFileSync(row.logPath, "utf8") : "";
+}
+
+let sessionsDir: string;
+let priorSessionsRoot: string | undefined;
+
 beforeEach(async () => {
+  sessionsDir = mkdtempSync(join(tmpdir(), "anton-gardener-"));
+  priorSessionsRoot = process.env.ANTON_SESSIONS_ROOT;
+  process.env.ANTON_SESSIONS_ROOT = join(sessionsDir, "sessions");
   t = makeTestDb();
   projectId = randomUUID();
   await t.db.insert(schema.projects).values({
@@ -135,6 +180,7 @@ beforeEach(async () => {
   });
 
   calls.length = 0;
+  planApplyMock.mockImplementation(realPlanApply);
   now = NOW;
   nudge.mockClear();
   // A clean board by default; each test seeds only the rot it is about.
@@ -158,6 +204,9 @@ beforeEach(async () => {
 afterEach(() => {
   t.close();
   vi.clearAllMocks();
+  if (priorSessionsRoot === undefined) delete process.env.ANTON_SESSIONS_ROOT;
+  else process.env.ANTON_SESSIONS_ROOT = priorSessionsRoot;
+  rmSync(sessionsDir, { recursive: true, force: true });
 });
 
 describe("gardener patrol", () => {
@@ -540,5 +589,156 @@ describe("gardener patrol", () => {
     const job = await expectJobStatus(t.db, jobId, "parked");
     expect(job.attempts).toBe(1);
     expect(calls).toEqual([]);
+  });
+});
+
+/**
+ * Shadow mode (anton-lmps): the patrol says what arming a kind WOULD have done, and writes nothing
+ * to say it.
+ *
+ * The trace below is the evidence. `calls` is every bd verb the pass made, so "the shadow added one
+ * READ and no write" is an assertion rather than a claim — and the refusal case checks the logged
+ * reason against `planApply`'s own string, because an operator arms a kind on the strength of those
+ * words and a paraphrase is anton deciding for them.
+ */
+describe("gardener patrol · shadow mode", () => {
+  /** The orphan bd's report names and the patrol proposes retiring: shipped by a commit, still open. */
+  const ORPHAN = { id: "t-4", title: "shipped", status: "open", latestCommit: "abc1234" };
+  /** Untouched since well before the patrol read the board, so the premise fence still holds. */
+  const cold = bead("t-4", { title: "shipped", updated_at: "2023-01-01T00:00:00Z" });
+
+  /** The reads and the ONE create a patrol makes, plus the shadow's fresh board read at the end. */
+  const READS = [
+    "pull",
+    "epicCloseEligible",
+    "recomputeBlocked",
+    "lintReport",
+    "staleList",
+    "staleList",
+    "orphansList",
+    "depCycles",
+    "duplicateGroups",
+    "list",
+  ];
+
+  beforeEach(async () => {
+    orphansMock.mockResolvedValue([ORPHAN]);
+    listMock.mockResolvedValue([cold]);
+    await arm({ "shipped-orphan": "shadow" });
+  });
+
+  it("records the move it would have applied, and writes nothing to record it", async () => {
+    await expectJobStatus(t.db, await runPatrol(), "done");
+
+    // The proposal, the kind, the verb and the subject — the whole ask, without opening the bead.
+    expect(await sessionLog()).toContain(
+      "[gardener] SHADOW p-1 (shipped-orphan) retire/close t-4 — WOULD APPLY: closed t-4 as shipped\n",
+    );
+    // One create (the proposal) and one extra read (the fresh board the shadow decided against).
+    // Nothing else: t-4 is never closed, deferred or updated by a pass that only says what it would do.
+    expect(calls).toEqual([...READS, "create", "list"]);
+    expect(closeMock).not.toHaveBeenCalled();
+  });
+
+  it("lands the record on a session the jobs page already knows how to show", async () => {
+    await expectJobStatus(t.db, await runPatrol(), "done");
+
+    const [session] = await t.db.select().from(schema.sessions);
+    expect(session.kind).toBe("gardener");
+    expect(session.projectId).toBe(projectId);
+    // Settled, not left running: the patrol is over, and a session stuck on "running" reads as a
+    // pass still in flight.
+    expect(session.status).toBe("done");
+  });
+
+  it("names the move's counterpart — a move recorded without its other end is not a record", async () => {
+    // A duplicate whose twin already landed: the ask is "supersede t-6 BY t-5", and the survivor is
+    // half of what an operator is deciding about.
+    const member = (id: string, status = "open") => ({
+      id,
+      title: "same title",
+      status,
+      references: 0,
+      isMergeTarget: false,
+    });
+    orphansMock.mockResolvedValue([]);
+    duplicatesMock.mockResolvedValue([
+      {
+        title: "same title",
+        target: "t-5",
+        sources: ["t-6"],
+        members: [member("t-5", "closed"), member("t-6")],
+      },
+    ]);
+    listMock.mockResolvedValue([
+      bead("t-5", { status: "closed", updated_at: "2023-01-01T00:00:00Z" }),
+      bead("t-6", { updated_at: "2023-01-01T00:00:00Z" }),
+    ]);
+    await arm({ superseded: "shadow" });
+
+    await expectJobStatus(t.db, await runPatrol(), "done");
+
+    expect(await sessionLog()).toContain(
+      "SHADOW p-1 (superseded) retire/supersede t-6 → t-5 — WOULD APPLY:",
+    );
+    expect(closeMock).not.toHaveBeenCalled();
+  });
+
+  it("carries planApply's refusal verbatim — the reason is what an operator arms on", async () => {
+    // A bead with no write stamp: the premise fence cannot prove it went untouched since the read,
+    // so apply refuses. The point is not WHICH refusal — it is that the log carries the real one.
+    listMock.mockResolvedValue([bead("t-4", { title: "shipped" })]);
+
+    await expectJobStatus(t.db, await runPatrol(), "done");
+
+    const plan = parseGardenerPlan(createMock.mock.calls[0][1].metadata?.gardener) as GardenerPlan;
+    const decision = realPlanApply(plan, [bead("t-4", { title: "shipped" })], {
+      nowMs: NOW,
+      observedAtMs: NOW,
+    });
+    expect(decision.status).toBe("refuse");
+    expect(await sessionLog()).toContain(
+      `SHADOW p-1 (shipped-orphan) retire/close t-4 — WOULD REFUSE: ` +
+        `${decision.status === "refuse" ? decision.reason : ""}\n`,
+    );
+    expect(calls).toEqual([...READS, "create", "list"]);
+  });
+
+  it("shadows nothing for a kind left at propose — and opens no session to say so", async () => {
+    await arm({ stale: "shadow" }); // armed, but not the kind this patrol files
+
+    await expectJobStatus(t.db, await runPatrol(), "done");
+
+    expect(createMock).toHaveBeenCalledTimes(1);
+    expect(calls).toEqual([...READS, "create"]); // no second board read: nothing to decide
+    expect(await t.db.select().from(schema.sessions)).toEqual([]);
+  });
+
+  it("keeps the pass green when planApply throws — the proposals are the work, the shadow is not", async () => {
+    planApplyMock.mockImplementation(() => {
+      throw new Error("indexBoard exploded");
+    });
+
+    await expectJobStatus(t.db, await runPatrol(), "done");
+
+    expect(await sessionLog()).toContain(
+      "SHADOW p-1 (shipped-orphan) retire/close t-4 — COULD NOT SHADOW: indexBoard exploded\n",
+    );
+    expect(createMock).toHaveBeenCalledTimes(1); // the proposal still stands
+  });
+
+  it("keeps the pass green when the shadow's own board read fails", async () => {
+    // The patrol's own read succeeds; the shadow's fresh one does not. Losing the record must not
+    // cost the pass the proposal it just filed.
+    let reads = 0;
+    listMock.mockImplementation(async () => {
+      if (++reads > 1) throw new Error("bd list exploded");
+      return [cold];
+    });
+
+    await expectJobStatus(t.db, await runPatrol(), "done");
+
+    expect(await sessionLog()).toContain("SHADOW could not read the board");
+    expect(createMock).toHaveBeenCalledTimes(1);
   });
 });

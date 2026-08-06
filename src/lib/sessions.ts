@@ -22,6 +22,11 @@ export type SessionKind =
   | "orphan-grooming"
   /** A scheduled product-master pass (anton-d2sx) — judgment in, proposal beads out. */
   | "product-master"
+  /**
+   * A gardener patrol (anton-3nv7) that had something to say. The patrol runs no claude session, so
+   * a row exists only for a pass with output to carry — today, its shadow records (anton-lmps).
+   */
+  | "gardener"
   | "interactive";
 export type SessionStatus = "running" | "done" | "failed";
 

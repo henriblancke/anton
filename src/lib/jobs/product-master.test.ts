@@ -12,11 +12,16 @@
  *   • the fingerprints are anton's, so a second pass over an unfixed board asks once.
  */
 import { randomUUID } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { driveJob, expectJobStatus } from "@/lib/testing/jobs";
 import type { Bead } from "../beads/bd";
 import { LABELS } from "../beads/bd";
+import type { ApplyDecision, ApplyMoment } from "../gardener/apply";
+import { parseGardenerPlan, type GardenerPlan } from "../gardener/detections";
 import * as schema from "../db/schema";
 import { makeTestDb, type TestDb } from "../db/testing";
 import type { ClaudeResult, RunClaudeOptions } from "../claude/driver";
@@ -65,6 +70,24 @@ function trap(verb: string, id: string): Promise<never> {
   writes.push(`${verb} ${id}`);
   return Promise.reject(new Error(`the pass must not ${verb} ${id}`));
 }
+
+/**
+ * The decision seam, spied rather than replaced: shadow mode's whole claim is that it asks the SAME
+ * `planApply` an approval asks, so the default is the real one and only the "it threw" case swaps it.
+ */
+const planApplyMock =
+  vi.fn<(plan: GardenerPlan, board: Bead[], at: ApplyMoment) => ApplyDecision>();
+
+vi.mock("../gardener/apply", async () => {
+  const actual = await vi.importActual<typeof import("../gardener/apply")>("../gardener/apply");
+  return {
+    ...actual,
+    planApply: (...a: [GardenerPlan, Bead[], ApplyMoment]) => planApplyMock(...a),
+  };
+});
+
+const { planApply: realPlanApply } =
+  await vi.importActual<typeof import("../gardener/apply")>("../gardener/apply");
 
 const { makeProductMasterHandler } = await import("./product-master");
 
@@ -120,7 +143,19 @@ function runPass(): Promise<string> {
   });
 }
 
+/** The pass's session log — where every line an operator reads about this pass lands. */
+async function sessionLog(): Promise<string> {
+  const [row] = await t.db.select().from(schema.sessions);
+  return row?.logPath ? readFileSync(row.logPath, "utf8") : "";
+}
+
+let sessionsDir: string;
+let priorSessionsRoot: string | undefined;
+
 beforeEach(async () => {
+  sessionsDir = mkdtempSync(join(tmpdir(), "anton-product-master-"));
+  priorSessionsRoot = process.env.ANTON_SESSIONS_ROOT;
+  process.env.ANTON_SESSIONS_ROOT = join(sessionsDir, "sessions");
   t = makeTestDb();
   projectId = randomUUID();
   await t.db.insert(schema.projects).values({
@@ -132,6 +167,7 @@ beforeEach(async () => {
   });
 
   writes.length = 0;
+  planApplyMock.mockImplementation(realPlanApply);
   dispatched = undefined;
   duringSession = undefined;
   nowMs = NOW;
@@ -147,6 +183,9 @@ beforeEach(async () => {
 afterEach(() => {
   t.close();
   vi.clearAllMocks();
+  if (priorSessionsRoot === undefined) delete process.env.ANTON_SESSIONS_ROOT;
+  else process.env.ANTON_SESSIONS_ROOT = priorSessionsRoot;
+  rmSync(sessionsDir, { recursive: true, force: true });
 });
 
 describe("product-master pass", () => {
@@ -329,5 +368,81 @@ describe("product-master pass", () => {
   it("pulls the board before judging it, so it never re-raises another machine's ask", async () => {
     await expectJobStatus(t.db, await runPass(), "done");
     expect(pullMock).toHaveBeenCalledWith(REPO);
+  });
+});
+
+/**
+ * Shadow mode (anton-lmps): the pass says what arming a kind WOULD have done with the proposal it
+ * just filed, and writes nothing to say it.
+ *
+ * The same code the gardener patrol shadows through, so the record reads identically from both
+ * producers — and `writes` stays the evidence that the only board write is still the create.
+ */
+describe("product-master pass · shadow mode", () => {
+  /** Untouched since well before the pass read the board, so the premise fence still holds. */
+  const cold = bead("anton-a", { updated_at: "2026-01-01T00:00:00Z" });
+
+  /** Arm a kind at a level for this project — the operator's stored autonomy policy (anton-nbyy). */
+  const arm = (overrides: Record<string, string>) =>
+    t.db
+      .update(schema.projects)
+      .set({ settingsJson: JSON.stringify({ proposalAutonomy: overrides }) });
+
+  beforeEach(async () => {
+    sessionText = report(claim());
+    listMock.mockResolvedValue([cold]);
+    await arm({ "low-value": "shadow" });
+  });
+
+  it("records the move it would have applied, and files nothing else to record it", async () => {
+    await expectJobStatus(t.db, await runPass(), "done");
+
+    expect(await sessionLog()).toContain(
+      "[product-master] SHADOW anton-p1 (low-value) retire/defer anton-a — " +
+        "WOULD APPLY: deferred anton-a out of the ready set\n",
+    );
+    // The proposal create is still the pass's ONLY board write: a shadowed defer defers nothing.
+    expect(writes).toEqual(["create Product master: defer anton-a"]);
+  });
+
+  it("carries planApply's refusal verbatim — the reason is what an operator arms on", async () => {
+    // Somebody rewrote the bead while the session was judging it, so the evidence the proposal rests
+    // on is stale by the time the shadow decides. That gap is the whole reason the shadow re-reads
+    // the board; the point here is that the log carries apply's real words for it.
+    const rewritten = bead("anton-a", { updated_at: "2026-08-04T13:00:00Z" });
+    let reads = 0;
+    listMock.mockImplementation(async () => [++reads > 1 ? rewritten : cold]);
+
+    await expectJobStatus(t.db, await runPass(), "done");
+
+    const plan = parseGardenerPlan(createMock.mock.calls[0][1].metadata?.gardener) as GardenerPlan;
+    const decision = realPlanApply(plan, [rewritten], { nowMs: NOW, observedAtMs: NOW });
+    expect(decision.status).toBe("refuse");
+    expect(await sessionLog()).toContain(
+      `WOULD REFUSE: ${decision.status === "refuse" ? decision.reason : ""}\n`,
+    );
+    expect(writes).toEqual(["create Product master: defer anton-a"]);
+  });
+
+  it("shadows nothing for a kind left at propose", async () => {
+    await arm({ stale: "shadow" }); // armed, but not the kind this pass files
+
+    await expectJobStatus(t.db, await runPass(), "done");
+
+    expect(writes).toEqual(["create Product master: defer anton-a"]);
+    expect(await sessionLog()).not.toContain("SHADOW");
+  });
+
+  it("keeps the pass green when planApply throws — the proposal is the work, the shadow is not", async () => {
+    planApplyMock.mockImplementation(() => {
+      throw new Error("indexBoard exploded");
+    });
+
+    await expectJobStatus(t.db, await runPass(), "done");
+
+    expect(await sessionLog()).toContain(
+      "SHADOW anton-p1 (low-value) retire/defer anton-a — COULD NOT SHADOW: indexBoard exploded\n",
+    );
+    expect(writes).toEqual(["create Product master: defer anton-a"]);
   });
 });

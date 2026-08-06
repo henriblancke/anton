@@ -39,6 +39,7 @@ import {
   PartialEmissionError,
   type EmissionResult,
 } from "../gardener/emit";
+import { shadowProposals } from "../gardener/shadow";
 import {
   buildProductMasterPrompt,
   detectionsFor,
@@ -47,7 +48,7 @@ import {
   type PmBoardInput,
 } from "../pm/context";
 import { revalidateApprovals } from "../pm/revalidate";
-import { getProjectById, getProjectSettings } from "../projects";
+import { getProjectById, getProjectSettings, resolveAutonomyPolicy } from "../projects";
 import { reviewReportOf } from "../review-report";
 import { listRecentRuns } from "../runs";
 import { appendSessionLog, endSession, startJobSession } from "../sessions";
@@ -152,13 +153,39 @@ export function makeProductMasterHandler(deps: ProductMasterDeps): JobHandler {
         }
       };
 
+      // How far this project lets a filed proposal go, per kind (anton-nbyy). Read once: a policy
+      // change mid-pass must not have the two tiers shadowing under different rules.
+      const policy = resolveAutonomyPolicy(settings);
+
+      /**
+       * What the armed pass WOULD have done with what this tier just filed (anton-lmps). Runs against
+       * a board read fresh at this moment, exactly as an approval would, and writes nothing — so a
+       * shadow that fails is a line in the log rather than a failed pass.
+       */
+      const shadow = (emission: EmissionResult) =>
+        shadowProposals({
+          repo,
+          created: emission.created,
+          policy,
+          observedAtMs,
+          nowMs: clock.now(),
+          producer: "[product-master]",
+          log: (chunk) => appendSessionLog(logPath, chunk),
+          signal: ctx.signal,
+        });
+
       /** File one tier's detections, reporting whatever landed before a failure rather than losing it. */
       const file = async (detections: GardenerDetection[]): Promise<void> => {
         ctx.signal.throwIfAborted();
         try {
-          logEmission(
-            await emitProposals(repo, { board, detections, observedAtMs, signal: ctx.signal }),
-          );
+          const emission = await emitProposals(repo, {
+            board,
+            detections,
+            observedAtMs,
+            signal: ctx.signal,
+          });
+          logEmission(emission);
+          await shadow(emission);
         } catch (e) {
           // Whatever landed before a create failed is real board state living only in the local
           // working set — report and propagate it, or a pass that parks leaves the proposals that DID
