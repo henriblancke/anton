@@ -2,10 +2,11 @@
 /**
  * End-to-end proof of anton-bz1w's acceptance: replay three consecutive scans through the REAL
  * nightly-stringer handler + REAL runner (fake `stringer` writing a canned scan, fake `claude`
- * standing in for /scan-triage), then read the stored summaries back and RENDER the board panel off
- * them — the delta a founder actually sees has to survive the whole path, not just the unit that
- * computes it. Three, not two: the first pass is a baseline scan of the whole repo, so the first
- * comparison a founder may be shown is the third point. Skipped without bd + git.
+ * standing in for /scan-triage), then read the stored summaries back and RENDER the Health page
+ * surfaces off them (`CodebaseSignalsSection` + `HealthRail`, `components/health/`) — the delta a
+ * founder actually sees has to survive the whole path, not just the unit that computes it. Three,
+ * not two: the first pass is a baseline scan of the whole repo, so the first comparison a founder
+ * may be shown is the third point. Skipped without bd + git.
  */
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -20,7 +21,8 @@ import * as schema from "@/lib/db/schema";
 import { getJob, type Clock } from "@/lib/jobs/queue";
 import { makeNightlyStringerHandler } from "@/lib/jobs/nightly-stringer";
 import { listScanSummaries, scanHealth } from "@/lib/scan-health";
-import { ScanHealthPanel } from "@/components/board/scan-health-panel";
+import { CodebaseSignalsSection } from "@/components/health/codebase-signals-section";
+import { HealthRail } from "@/components/health/health-rail";
 
 class FakeClock implements Clock {
   constructor(private t: number) {}
@@ -215,14 +217,30 @@ process.stdin.on('end',()=>{
     expect(health.latest.id).toBe(third.id);
     expect(health.delta?.total).toBe(-2);
 
-    // 3. And what the founder actually reads: the charted delta, on the panel.
-    render(<ScanHealthPanel health={health} />);
+    // 3. And what the founder actually reads: the severity split on the Health page's own section,
+    //    and the charted delta on its vitals rail — the two surfaces that replaced the old panel.
+    render(
+      <>
+        <CodebaseSignalsSection scanHealth={health} />
+        <HealthRail
+          slug="sandbox"
+          health={{
+            worthALook: [],
+            housekeeping: [],
+            hygiene: undefined,
+            scanHealth: health,
+            trajectory: undefined,
+            stoppedCount: 0,
+          }}
+        />
+      </>,
+    );
+    expect(screen.getByText("1 low")).toBeTruthy();
     expect(screen.getByText(/−2 vs previous scan/)).toBeTruthy();
     expect(screen.getByTitle(/arriving more slowly/)).toBeTruthy();
     const chartLabel = screen.getByRole("img").getAttribute("aria-label")!;
     expect(chartLabel).toContain("3 (1 critical, 2 low)");
     expect(chartLabel).toContain("1 (1 low)");
-    expect(screen.getByText("1 low")).toBeTruthy();
   });
 
   it("hands the triage prompt this project's severity mapping", () => {

@@ -44,9 +44,8 @@ import { BoardGroupingToggle } from "@/components/board/board-grouping-toggle";
 import { EpicLaneView, LaneStageStrip } from "@/components/board/epic-lane";
 import { useBoardGrouping } from "@/lib/use-board-grouping";
 import { SyncStatusBadge } from "@/components/board/sync-status-badge";
-import { AttentionStrip } from "@/components/board/attention-strip";
-import { ReviewTrendPill } from "@/components/board/review-trend-pill";
-import { ScanHealthPanel } from "@/components/board/scan-health-panel";
+import { EscalationStrip } from "@/components/board/escalation-strip";
+import { HealthPill } from "@/components/board/health-pill";
 import { Button } from "@/components/ui/button";
 import { TicketDialog } from "@/components/ticket/ticket-dialog";
 
@@ -68,9 +67,10 @@ export function EpicBoard({
   slug: string;
   initialBoard: Board | null;
   /**
-   * Open escalations, server-rendered by the page (anton-ue90.1). They are merged with the polled
-   * hygiene report into one ranked strip, so they have to reach the same component — and they are
-   * answered by an action that reloads the page, so they don't need the board's poll.
+   * Open escalations, server-rendered by the page (anton-ue90.1). They are the only signal that
+   * still gets a band above the board — hygiene, review trend, and housekeeping moved to the Health
+   * page (anton-ue90.3) — and they're answered by an action that reloads the page, so they don't
+   * need the board's poll.
    */
   escalations?: EscalationView[];
   /** Project budget-aware flag (anton-y2ue): when on, cards offer Approve (immediate) vs Queue (paced). */
@@ -308,27 +308,22 @@ export function EpicBoard({
             ))}
           </select>
         </label>
-        {/* A trend is not an alert, so it sits on the toolbar rather than in a band of its own; the
-            attention strip below promotes only a rework-band worst score into a row. */}
-        <ReviewTrendPill slug={slug} trajectory={board.reviewTrajectory} />
+        {/* Hygiene, the review trend, and the scan trend all live on the Health page now
+            (anton-ue90.3) — this pill is their one doorway from the toolbar, sized and positioned
+            like the sync badge it sits beside rather than opening a popover of its own. It rides
+            the board payload so its count refreshes on the same 304-friendly poll as the cards. */}
+        <HealthPill
+          slug={slug}
+          hygiene={board.hygiene}
+          trajectory={board.reviewTrajectory}
+          scanHealth={board.scanHealth}
+        />
         <SyncStatusBadge sync={board.sync} />
       </div>
-      {/* Inside the board, not on the page: hygiene and the trend ride the board payload, so they
-          refresh on the same 304-friendly poll as the cards instead of going stale until a reload.
-          Escalations come from the page's server render — they are answered by an action that
-          reloads, not by a poll. A finding's bead opens the same detail dialog the standalone chips
-          use. */}
-      <AttentionStrip
-        slug={slug}
-        escalations={escalations}
-        hygiene={board.hygiene}
-        trajectory={board.reviewTrajectory}
-        onOpenBead={setOpenTicketId}
-      />
-      {/* The strip above says what needs answering on the board; this looks OUTWARD at the codebase
-          itself. A trend is not an alert, so it stays a single line below the strip rather than
-          competing with it for the operator's attention. */}
-      <ScanHealthPanel health={board.scanHealth} />
+      {/* The one band that still needs a DECISION about a card below it, not just a look. Escalations
+          come from the page's server render — they are answered by an action that reloads, not by a
+          poll — so they don't ride the board payload the way hygiene/trend/scan health used to. */}
+      <EscalationStrip slug={slug} escalations={escalations} />
       {lanes ? (
         // The lanes share one horizontal scroller so every lane's stage columns line up under the
         // single stage strip, at any width.
