@@ -1,6 +1,6 @@
 ---
 name: shape
-version: d108191d663d
+version: 578d10574552
 description: >-
   The compiler. Turn a fuzzy idea into a validated feature — one PR anton's execution runtime can
   pick up — attached to its product epic, with child tickets under it. Runs forcing questions,
@@ -135,19 +135,20 @@ mechanically; `bd children <epic-id>` does not (it prints titles, not tiers).
 For every feature and ticket, the description MUST contain, or it is not `shaped`:
 
 ```
-## Goal          one sentence: outcome + why
-## Acceptance    - [ ] concrete, checkable
-                 - [ ] concrete, checkable
-## Context       touches: <files/areas> ; follow pattern in <file>
-                 product decision: .product/decisions/<file>#anchor  (when relevant)
-## Out of scope  - explicit non-goals
-## Verify        the tests that prove it; what to add
+## Goal                one sentence: outcome + why
+## Acceptance Criteria - [ ] concrete, checkable
+                       - [ ] concrete, checkable
+## Context             touches: <files/areas> ; follow pattern in <file>
+                       product decision: .product/decisions/<file>#anchor  (when relevant)
+## Out of scope        - explicit non-goals
+## Verify              the tests that prove it; what to add
 ```
 
-Don't retype that shape from memory — **pour it from the project's bead formula**
+Don't retype that shape from memory — **cook it from the project's bead formula**
 (`bd cook anton-bead --mode=runtime --var …`, see the `bd` skill). The formula holds one step per
 tier and the sections come with it, so your job is filling them, not remembering them. Its `{{var}}`
-defaults are prompts: a bead that ships with a `TODO —` line in it is not shaped.
+defaults are prompts: a bead that ships with a `TODO —` line in it is not shaped. **All five
+sections ride in the description** — never `--acceptance`, never `--context`.
 
 Set labels (`domain:`, `risk:`, `agent:`, `size:`) per the `bd` skill's conventions, plus one
 `area:` on the epic. Set dependency edges: `parent-child` from ticket to feature and from feature
@@ -174,7 +175,7 @@ and run the check:
 bd list --status all --json --limit 0 \
   | jq -r '.[] | select(.status != "closed") | "\(.id)\t\(.issue_type)\tparent=\(.parent // "-")"'
 anton board-check            # non-zero exit = a dead bead; fix it before confirming
-bd lint                      # the contract sections, per bead
+bd lint                      # the contract sections, per bead — `--graph` skips `--validate`
 ```
 
 Then assert the five invariants out loud against what you just printed, naming counts:

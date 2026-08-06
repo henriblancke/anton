@@ -205,9 +205,13 @@ describe("required skill assets", () => {
       expect(bd).toMatch(/parent_key/);
       expect(bd).toMatch(/--dry-run/);
       // Verified on bd 1.1.2: the graph plan has no acceptance field, and `## Acceptance` alone
-      // fails `bd lint` — one heading satisfies both readers.
-      expect(bd).toMatch(/There is no acceptance field/);
-      expect(bd).toMatch(/`## Acceptance Criteria`\*\* — the one spelling/);
+      // fails `bd lint` — one heading satisfies both readers. Stated as the rule the whole skill
+      // follows (the description carries the contract), not as a `--graph`-only exception.
+      expect(bd).toMatch(/A node has no acceptance field, and none is needed/);
+      expect(bd).toMatch(/the description carries the rubric here/);
+      expect(bd).toMatch(/`## Acceptance Criteria`\*\*;\s+that is the one spelling/);
+      // `--validate` is silently ignored on this path, so `bd lint` is the only backstop here.
+      expect(bd).toMatch(/`--validate` does not reach the `--graph` path/);
       expect(bd).toMatch(/Never put a heredoc inside command substitution/);
     });
 

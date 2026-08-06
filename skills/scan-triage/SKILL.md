@@ -1,6 +1,6 @@
 ---
 name: scan-triage
-version: 09b5155b79f6
+version: 04d2a77f77db
 description: >-
   Turn a stringer scan into a small set of well-formed beads, protecting queue quality. Reads
   stringer signal output, dedupes across every automated producer (stringer/gardener/pm
@@ -230,18 +230,19 @@ Every feature and ticket created must satisfy the bead contract (see the `bd` sk
 carries less — a one-line outcome, Success Criteria, and its `area:`:
 
 ```
-## Goal        one line: the risk/debt and why it matters (cite the signal)
-## Acceptance  - [ ] concrete, verifiable fix (e.g. "no OSV-2026-xxxx in lockfile")
-## Context     touches: <file:line from the signal>; remediation: <stringer suggestion>
-              routed: <parent-id|none> — <why THIS parent>
-## Out of scope- unrelated cleanup
-## Verify      the check that proves it (test, re-scan clean, lockfile diff)
+## Goal                one line: the risk/debt and why it matters (cite the signal)
+## Acceptance Criteria - [ ] concrete, verifiable fix (e.g. "no OSV-2026-xxxx in lockfile")
+## Context             touches: <file:line from the signal>; remediation: <stringer suggestion>
+                       routed: <parent-id|none> — <why THIS parent>
+## Out of scope        - unrelated cleanup
+## Verify              the check that proves it (test, re-scan clean, lockfile diff)
 ```
 
-Pour that shape from the project's bead formula rather than retyping it —
-`bd cook anton-bead --mode=runtime --var goal='…' …`, then `bd create --description` from the cooked
-step for the tier you're creating (`feature` for the cluster, `ticket` for its children; see the
-`bd` skill). Fill every var: an unfilled `TODO —` default is not a triaged bead, and a fabricated
+Cook that shape from the project's bead formula rather than retyping it —
+`bd cook anton-bead --mode=runtime --var goal='…' …`, then create from the cooked step for the tier
+you're creating (`feature` for the cluster, `ticket` for its children). **The description carries
+all five sections and nothing lives in `--acceptance` or `--context`** — the `bd` skill has the one
+command. Fill every var: an unfilled `TODO —` default is not a triaged bead, and a fabricated
 Acceptance box is worse than none.
 
 **Every created bead records its routing decision** on its own `## Context`, as one `routed:` line
