@@ -95,13 +95,32 @@ describe("draftFromDetail", () => {
 });
 
 describe("stripContractSections", () => {
-  it("removes the Goal and Acceptance blocks and trims the remainder", () => {
-    const desc = "## Goal\n\ng\n\n## Acceptance\n\na\n\n## Out of scope\n\nnothing";
-    expect(stripContractSections(desc)).toBe("## Out of scope\n\nnothing");
-  });
+  // Both spellings, because the board holds beads written before anton-dji7 renamed the heading:
+  // strip has to claim either or an old bead's criteria would survive into `body` and be written
+  // twice on the next save.
+  it.each(["Acceptance", "Acceptance Criteria"])(
+    "removes the Goal and `## %s` blocks and trims the remainder",
+    (heading) => {
+      const desc = `## Goal\n\ng\n\n## ${heading}\n\na\n\n## Out of scope\n\nnothing`;
+      expect(stripContractSections(desc)).toBe("## Out of scope\n\nnothing");
+    },
+  );
 
-  it("returns '' when the description is only Goal + Acceptance", () => {
-    expect(stripContractSections("## Goal\n\ng\n\n## Acceptance\n\na")).toBe("");
+  it.each(["Acceptance", "Acceptance Criteria"])(
+    "returns '' when the description is only Goal + `## %s`",
+    (heading) => {
+      expect(stripContractSections(`## Goal\n\ng\n\n## ${heading}\n\na`)).toBe("");
+    },
+  );
+
+  // The trap anton-dji7 exists to close: composing under the canonical heading and stripping it
+  // again must be a fixed point, or every dialog save would rename the section back or duplicate it.
+  it("is stable across a compose → strip → compose round trip", () => {
+    const draft: TicketDraft = { ...base, goal: "g", acceptance: "- [ ] a", body: "## Verify\n\ntests" };
+    const composed = composeDescription(draft);
+    expect(composed).toContain("## Acceptance Criteria\n\n- [ ] a");
+    expect(stripContractSections(composed)).toBe(draft.body);
+    expect(composeDescription({ ...draft, body: stripContractSections(composed) })).toBe(composed);
   });
 });
 
@@ -165,7 +184,7 @@ describe("contract editing", () => {
   it("emits both description and acceptance when the contract changes", () => {
     const patch = diffTicketPatch(original, { ...original, acceptance: "- [ ] new item" });
     expect(patch.acceptance).toBe("- [ ] new item");
-    expect(patch.description).toContain("## Acceptance\n\n- [ ] new item");
+    expect(patch.description).toContain("## Acceptance Criteria\n\n- [ ] new item");
   });
 
   it("does not touch the contract when only a label changes", () => {
@@ -188,7 +207,7 @@ describe("contract editing", () => {
     expect(patch.acceptance).toBe("- [ ] A\n- [ ] B");
   });
 
-  it("promotes a legacy field-only acceptance into a ## Acceptance section on first edit", () => {
+  it("promotes a legacy field-only acceptance into a ## Acceptance Criteria section on first edit", () => {
     const legacy = draftFromDetail({
       id: "x",
       title: "t",
@@ -204,7 +223,7 @@ describe("contract editing", () => {
     const patch = diffTicketPatch(legacy, { ...legacy, goal: "Do it better" });
     const bead = asBead({ description: patch.description, acceptance: legacy.acceptance });
     expect(parseAcceptance(bead)).toBe("field-only criteria");
-    expect(patch.description).toContain("## Acceptance\n\nfield-only criteria");
+    expect(patch.description).toContain("## Acceptance Criteria\n\nfield-only criteria");
   });
 
   it("composeDescription omits empty sections", () => {

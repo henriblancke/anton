@@ -106,6 +106,19 @@ describeBd("orphan-grooming e2e (real handler · real bd)", () => {
     expect(parentOf(childTicket)).toBe(realEpic);
   });
 
+  it("writes a grooming epic bd's own lint accepts", async () => {
+    // gardener turns every `bd lint` violation into a hygiene finding, so an epic anton writes for
+    // itself with a ticket's `## Acceptance` would file a standing finding against anton on every
+    // sweep. bd is the authority here, not our reader — which accepts both spellings.
+    const board = await beads.list(repo, ["--status", "all"]);
+    const groomingEpic = board.find(
+      (b) => beads.isEpic(b) && (b.labels?.includes(ORPHAN_EPIC_LABEL) ?? false),
+    )!;
+
+    const report = await beads.lintReport(repo, { status: "all" });
+    expect(report.violations.find((v) => v.id === groomingEpic.id)).toBeUndefined();
+  });
+
   it("is idempotent — a second run with no new orphans reuses the epic and adds nothing", async () => {
     const before = await beads.list(repo, ["--status", "all"]);
     const epicCountBefore = before.filter((b) => beads.isEpic(b)).length;

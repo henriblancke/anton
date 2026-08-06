@@ -3,10 +3,10 @@
  * (`skills/<name>/SKILL.md`) exist and are well-formed, so a `/shape` run — and anton's own jobs —
  * have full operating context from anton's assets alone, with no loom/plugin dependency.
  */
-import { existsSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { dirname, join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
-import { INSTALLED_SKILLS, REQUIRED_SKILLS, loadSkill, skillPath } from "./prompt";
+import { INSTALLED_SKILLS, REQUIRED_SKILLS, SKILLS_DIR, loadSkill, skillPath } from "./prompt";
 import { stripFrontmatter } from "./agent-prompt";
 import { readSkillStamp, skillDigest } from "./skill-stamp.mjs";
 
@@ -205,10 +205,26 @@ describe("required skill assets", () => {
       expect(bd).toMatch(/parent_key/);
       expect(bd).toMatch(/--dry-run/);
       // Verified on bd 1.1.2: the graph plan has no acceptance field, and `## Acceptance` alone
-      // fails `bd lint` — one heading satisfies both readers.
-      expect(bd).toMatch(/There is no acceptance field/);
-      expect(bd).toMatch(/`## Acceptance Criteria`\*\* — the one spelling/);
+      // fails `bd lint` — one heading satisfies both readers. Stated as the rule the whole skill
+      // follows (the description carries the contract), not as a `--graph`-only exception.
+      expect(bd).toMatch(/A node has no acceptance field, and none is needed/);
+      expect(bd).toMatch(/the description carries the rubric here/);
+      expect(bd).toMatch(/`## Acceptance Criteria`\*\*;\s+that is the one spelling/);
+      // `--validate` is silently ignored on this path, so `bd lint` is the only backstop here.
+      expect(bd).toMatch(/`--validate` does not reach the `--graph` path/);
       expect(bd).toMatch(/Never put a heredoc inside command substitution/);
+    });
+
+    // Instruction text an agent ACTS on: overstate bd's validator and a green `--validate` reads as
+    // a filled contract, so TODO-stub beads reach the board and only the approve gate catches them.
+    // bd 1.1.2 checks the rubric heading and nothing else (formula.integration.test.ts pins it).
+    it("bd scopes `--validate` to the rubric heading and denies it proves a contract", () => {
+      expect(bd).toMatch(/`--validate` gates the \*\*rubric heading only\*\*/);
+      expect(bd).toMatch(/never\s+read a green `--validate` as a filled contract/);
+      expect(bd).toMatch(/\*\*bd checks one of the five, not five\.\*\*/);
+      // The claims that were wrong — bd accepts both bodies they promise it refuses.
+      expect(bd).not.toMatch(/refuses a body missing/);
+      expect(bd).not.toMatch(/catches a cooked-but-unfilled skeleton/);
     });
 
     it("shape escalates an unattachable feature instead of orphaning it", () => {
@@ -487,4 +503,56 @@ describe("required skill assets", () => {
       }
     });
   });
+});
+
+/**
+ * Every `skills/**\/SKILL.md`, found by walking the asset dir rather than by reading
+ * {@link INSTALLED_SKILLS} — a skill added to the tree before it is wired into the registered set
+ * must still be linted.
+ */
+function everySkillFile(): string[] {
+  const root = join(process.cwd(), SKILLS_DIR);
+  return readdirSync(root, { recursive: true, encoding: "utf8" })
+    .filter((rel) => rel.endsWith("SKILL.md"))
+    .map((rel) => join(root, rel))
+    .sort();
+}
+
+/**
+ * The `bd create` invocations inside FENCED blocks, with `\`-continuations folded so a flag on a
+ * wrapped line still belongs to its command. Only fenced code is scanned: every skill also states
+ * the prohibition in prose, and that sentence must not read as a violation of itself.
+ */
+function bdCreateExamples(raw: string): string[] {
+  return [...raw.matchAll(/^```[^\n]*\n([\s\S]*?)^```/gm)]
+    .flatMap((m) => m[1].replace(/\\\n\s*/g, " ").split("\n"))
+    .filter((line) => /\bbd create\b/.test(line));
+}
+
+// One prescription, one shape (anton-szul). The contract lives in the description and nowhere else:
+// `--acceptance` and `--context` write bd's own side fields, splitting it across two homes that
+// `bd show --json` doesn't join — and `--context` appends its section AFTER `## Verify`, inverting
+// the formula's order for every downstream reader. The prose said so for three weeks while a worked
+// example still passed the flags. An example is what gets copied, so the example is what gets linted.
+describe("worked `bd create` examples", () => {
+  const files = everySkillFile();
+
+  it("walks every shipped SKILL.md", () => {
+    expect(files).toEqual(expect.arrayContaining(INSTALLED_SKILLS.map((n) => skillPath(n))));
+  });
+
+  it("finds examples to lint — the scan must not pass by matching nothing", () => {
+    expect(files.flatMap((f) => bdCreateExamples(readFileSync(f, "utf8")))).not.toEqual([]);
+  });
+
+  for (const file of files) {
+    const rel = relative(process.cwd(), file);
+    it(`${rel} splits no bead's contract onto --acceptance / --context`, () => {
+      for (const cmd of bdCreateExamples(readFileSync(file, "utf8"))) {
+        expect(cmd, `${rel}: the description carries the whole contract`).not.toMatch(
+          /--(acceptance|context)\b/,
+        );
+      }
+    });
+  }
 });

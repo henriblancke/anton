@@ -304,7 +304,13 @@ describe("follow-up", () => {
     expect(opts.type).toBe("task");
     expect(opts.deps).toEqual(["parent-child:feat"]);
     // Every section the bead contract judges, or the approve route refuses the follow-up it just made.
-    for (const section of ["## Goal", "## Acceptance", "## Context", "## Out of scope", "## Verify"]) {
+    for (const section of [
+      "## Goal",
+      "## Acceptance Criteria",
+      "## Context",
+      "## Out of scope",
+      "## Verify",
+    ]) {
       expect(opts.description).toContain(section);
     }
     expect(linkMock).toHaveBeenCalledWith("/repo", "anton-new", "t1", "discovered-from");

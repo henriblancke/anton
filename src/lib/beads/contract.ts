@@ -17,8 +17,8 @@
  *    the description, see docs/runbooks/bead-contract-conformance.md); there is no `context` field
  *    in `--json`. `acceptance_criteria`
  *    (bd's own field, rendered "Success Criteria" for an epic) is the one genuinely separate home —
- *    and beads edited through the ticket dialog also keep it as `## Acceptance` in the description,
- *    so either home satisfies it.
+ *    and beads edited through the ticket dialog also keep it as `## Acceptance Criteria` in the
+ *    description, so either home satisfies it.
  * 2. bd OMITS empty fields from `--json` rather than emitting `""` — a bead created with no
  *    description comes back with no `description` key at all. So an absent field cannot be read as
  *    "the section is there, we just didn't fetch it"; on a bead that came from a bd read it is a
@@ -328,6 +328,24 @@ const TICKET_RULES: SectionRule[] = [
 ];
 
 export const ACCEPTANCE_KEYS = ["acceptance", "acceptancecriteria"];
+
+/**
+ * The spelling every WRITER emits (anton-dji7). Reading stays permissive — {@link ACCEPTANCE_KEYS}
+ * accepts the bare `## Acceptance` still on older beads — but `bd create --validate` and `bd lint`
+ * only recognise `## Acceptance Criteria` for a task/feature, so a bead anton writes must use it or
+ * bd's own tooling calls it unshaped. One constant so the formula, the ticket dialog, and rework
+ * cannot drift apart.
+ */
+export const ACCEPTANCE_HEADING = "Acceptance Criteria";
+
+/**
+ * The epic tier's rubric spelling every WRITER emits — an epic's definition of done lives under
+ * `## Success Criteria`, not `## Acceptance` ({@link acceptanceKeysOf}). Same reason as
+ * {@link ACCEPTANCE_HEADING}: `bd create --validate` rejects an epic without it, and `bd lint`
+ * reports it missing, so an epic anton writes for itself would otherwise show up as a permanent
+ * hygiene finding on its own attention strip.
+ */
+export const SUCCESS_HEADING = "Success Criteria";
 export const SUCCESS_KEYS = ["successcriteria", "success", ...ACCEPTANCE_KEYS];
 
 /** The headings that hold an epic's outcome: what the formula pours (`## Goal`), plus the name the

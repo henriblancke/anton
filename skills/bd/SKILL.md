@@ -1,6 +1,6 @@
 ---
 name: bd
-version: 611de3178ff3
+version: 124cae45c200
 description: >-
   Conventions for how anton writes to the beads board (bd). The single place bd usage is
   defined, so /shape and /scan-triage stay consistent and beads stays swappable. Shaping is the
@@ -136,14 +136,19 @@ execution drives:   ready → in-progress → review → done   (and park/unpark
 
 ## The bead contract
 
-A feature or ticket is not `shaped` until its description contains `## Goal`, `## Acceptance`
-(checkable boxes), `## Context`, `## Out of scope`, `## Verify`. Without these the executor has no
-spec. `/shape` and `/scan-triage` enforce it; `bd lint` checks the Acceptance/Success sections.
+A feature or ticket is not `shaped` until its **description** contains `## Goal`,
+`## Acceptance Criteria` (checkable boxes), `## Context`, `## Out of scope`, `## Verify` — all five,
+in that order, in the one field. Without these the executor has no spec.
+
+**bd checks one of the five, not five.** `bd create --validate` and `bd lint` both look for the
+rubric heading alone. The other four — Goal, Context, Out of scope, Verify — are enforced by
+`/shape`, `/scan-triage`, and anton's own contract gate at approve time. Nothing bd says green
+means the contract is complete.
 
 An epic is read, not executed, so it carries less: a one-line outcome, Success Criteria its
 features add up to, and its `area:` label.
 
-## The bead formula — pour the skeleton, don't retype it
+## The bead formula — cook the skeleton, don't retype it
 
 The contract's shape is **structural**, not something you re-derive from these headings each time.
 The project ships it as a beads formula at `.beads/formulas/anton-bead.formula.json` (installed by
@@ -159,8 +164,8 @@ bd cook anton-bead --mode=runtime \
 # → JSON; take .steps[] | select(.id=="ticket") | .description as the bead description
 ```
 
-Then materialise with the ordinary `bd create` below (`--description` from the cooked step,
-`--acceptance` mirroring the same text into bd's own field).
+Then materialise with the ordinary `bd create` below: the cooked step's `description`, whole, and
+nothing beside it. **The description is the only place the contract lives** — see the next section.
 
 **Cook it; never pour it.** `bd mol pour` materialises a molecule whose ROOT is
 `issue_type=molecule` — not one of the three tiers — so anton's board walks straight past it.
@@ -171,30 +176,39 @@ the run against the wrong thing.
 
 ## Create a shaped feature or ticket
 
-Map the bead contract to native fields; put `Goal`, `Out of scope`, and `Verify` in the
-description (markdown), Acceptance and Context in their own fields. Same shape at both tiers —
-`--type feature` for the run target, `--type task` (or `bug`/`chore`) for its children:
+**The description carries the whole contract — every section, in the formula's order.** Cook the
+body, write it to a file, pass it as the description. Same shape at both tiers — `--type feature`
+for the run target, `--type task` (or `bug`/`chore`) for its children:
 
 ```bash
-bd create "Add CSV export button" \
-  --type task \
-  --acceptance $'- [ ] button on /reports exports current view as CSV\n- [ ] respects active filters' \
-  --context "touches: app/reports/*, lib/csv.ts; follow pattern in app/reports/pdf.ts" \
-  --body-file - <<'EOF'
-## Goal
-Let users export the reports view to CSV so they can share numbers. Requested by 3 users.
+bd cook anton-bead --mode=runtime \
+  --var goal='Let users export the reports view to CSV so they can share numbers. Requested by 3 users.' \
+  --var acceptance=$'- [ ] button on /reports exports current view as CSV\n- [ ] respects active filters' \
+  --var context='touches: app/reports/*, lib/csv.ts; follow pattern in app/reports/pdf.ts' \
+  --var out_of_scope='- no new columns; no server-side generation' \
+  --var verify='unit test lib/csv.ts formatting; e2e: click export → file downloads' \
+  | jq -r '.steps[] | select(.id == "ticket") | .description' > /tmp/bead.md
 
-## Out of scope
-- no new columns; no server-side generation
-
-## Verify
-- unit test lib/csv.ts formatting; e2e: click export → file downloads
-EOF
+bd create "Add CSV export button" --type task --validate --body-file /tmp/bead.md
 ```
 
-Then label and link (below). Run `bd lint <id>` — it enforces Acceptance Criteria (`task`, `bug`,
-`feature`) / Success Criteria (`epic`); `/shape` and `/scan-triage` enforce the rest of the
-contract.
+**Never `--acceptance` or `--context`.** They write bd's own side fields, which splits the contract
+across two places the reader has to join — and `bd show --json`, the projection most consumers read,
+returns only `description`. `--context` is the worse of the two: verified on bd 1.1.2, it *appends*
+a trailing `## Context` to the description, landing it after `## Verify` and inverting the formula's
+order for every downstream reader.
+
+`--validate` gates the **rubric heading only** — `## Acceptance Criteria` on a task/bug/feature,
+`## Success Criteria` on an epic. Verified on bd 1.1.2: a body of nothing but that heading is
+accepted, and so is a cooked skeleton whose every var is still `TODO — …`. Put it on every
+`bd create` — it costs nothing and it is what makes the heading spelling un-revertable — but never
+read a green `--validate` as a filled contract. The other four sections, and a rubric still holding
+the formula's prompt, are yours to fill here; `/shape`, `/scan-triage` and anton's contract gate
+catch them later, at approve time, where the fix costs a round trip.
+
+Then label and link (below). Run `bd lint <id>` too — it re-checks Acceptance Criteria (`task`,
+`bug`, `feature`) / Success Criteria (`epic`) after the fact, which is what covers the `--graph`
+path `--validate` does not reach. `/shape` and `/scan-triage` enforce the rest of the contract.
 
 ## Epic → feature → tickets — create the tree in ONE call
 
@@ -209,7 +223,7 @@ cat > /tmp/plan.json <<'EOF'
   "nodes": [
     {"key": "e", "title": "Reports are shareable outside the app", "type": "epic",
      "labels": ["area:reports"],
-     "description": "## Outcome\nReports leave the app in a format customers open.\n\n## Success Criteria\n- [ ] every report view exports"},
+     "description": "## Goal\nReports leave the app in a format customers open.\n\n## Success Criteria\n- [ ] every report view exports"},
 
     {"key": "f", "title": "CSV export", "type": "feature", "parent_key": "e",
      "labels": ["domain:eng", "risk:low", "size:S"],
@@ -226,6 +240,7 @@ EOF
 
 bd create --graph /tmp/plan.json --dry-run   # read the tree back BEFORE writing it
 bd create --graph /tmp/plan.json             # prints key → real id for every node
+bd lint                                      # the rubric check --validate can't do here (see below)
 ```
 
 The plan schema, verified on bd 1.1.2 — **unknown fields are dropped with only a warning**, so read
@@ -234,17 +249,23 @@ the warnings:
 - node: `key` (plan-local handle), `title`, `type`, `parent_key` (another node) or `parent_id` (an
   existing bead), `description`, `labels`, `priority`, `assignee`, `metadata`.
 - edge: `from_key`/`from_id`, `to_key`/`to_id`, `type` (`blocks`, `related`, `discovered-from`).
-- **There is no acceptance field.** `--graph` cannot set `acceptance_criteria`, so write the rubric
-  into the description under the heading **`## Acceptance Criteria`** — the one spelling both
-  `bd lint` and anton's contract read. (Bare `## Acceptance` satisfies anton and fails `bd lint`.)
+- **A node has no acceptance field, and none is needed** — the description carries the rubric here
+  exactly as it does on the single-create path above. Spell the heading **`## Acceptance Criteria`**;
+  that is the one spelling both `bd lint` and anton's contract read, and bare `## Acceptance`
+  satisfies anton while failing `bd lint`.
+
+**`--validate` does not reach the `--graph` path** (verified on bd 1.1.2: a node whose description
+carries only `## Acceptance` is created without complaint, `--validate` or not). That makes the two
+checks in the block above non-optional here — `--dry-run` to read the tree back, and `bd lint`
+afterwards, the only thing that catches a missing rubric on a graph-created bead.
 
 Parentage rides `parent_key`; there is no `bd link` step, and no shell variable to lose.
 
 ### If you are creating beads one at a time anyway
 
 ```bash
-FEAT_ID=$(bd create "CSV export" --type feature --description "$(cat body.md)" --silent)
-bd create "Add export button" --type task --parent "$FEAT_ID" ...   # --parent, not a second bd link
+FEAT_ID=$(bd create "CSV export" --type feature --validate --body-file body.md --silent)
+bd create "Add export button" --type task --validate --body-file t1.md --parent "$FEAT_ID"
 ```
 
 - `--silent` prints only the id — that is how you capture one. Don't parse the human output.
@@ -277,7 +298,8 @@ bd children <epic-id>                      # the full tree under an epic
 `bd tag` takes **one** label per call, so set the set at create time and use `bd update` to patch:
 
 ```bash
-bd create ... --labels domain:eng,risk:low,agent:nextjs,size:S
+bd create "Add export button" --type task --validate --body-file t1.md \
+  --labels domain:eng,risk:low,agent:nextjs,size:S
 bd update <id> --add-label risk:high --add-label agent:supabase   # repeatable
 bd tag <epic-id> area:reports           # one label; epic tier only, exactly one value
 # /scan-triage also tags: source:stringer  stringer:<collector>:<hash>  (dedup fingerprint)
@@ -430,4 +452,6 @@ contract. But their **entities** (a customer, competitor, content calendar) live
   avoid asking. Ask the user.
 - Don't build a tree with N sequential `bd create`/`bd link` calls when `bd create --graph` writes it
   in one, and never nest a heredoc inside `$( )`.
+- Don't split the contract across bd's side fields — no `--acceptance`, no `--context`. The cooked
+  description carries all five sections, and `--context` appends its own out-of-order copy.
 - Don't call `bd children` a verification. It shows titles; the tiers are what you're checking.

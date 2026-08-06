@@ -21,6 +21,7 @@
  */
 import { beads, LABELS, type Bead } from "./beads/bd";
 import { withBeadWriteLock } from "./beads/claim-lock";
+import { ACCEPTANCE_HEADING } from "./beads/contract";
 import { refreshAllIssues } from "./beads/issues";
 import { formatHumanNote, parseTicketNotes } from "./beads/notes";
 import { nudgeSync } from "./beads/sync-nudge";
@@ -405,7 +406,7 @@ function followUpDescription(args: {
     `## Goal`,
     summary,
     ``,
-    `## Acceptance`,
+    `## ${ACCEPTANCE_HEADING}`,
     `- [ ] ${summary}`,
     `- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply`,
     ``,
