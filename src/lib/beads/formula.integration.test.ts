@@ -13,7 +13,10 @@
  *    (ticket-view.ts). That is a property of bd's output, so only a real bd can pin it.
  * 4. **bd's own validator agrees.** anton reads either spelling of the rubric heading; bd does not
  *    (`bd create --validate` demands `## Acceptance Criteria` on a task/feature, `## Success
- *    Criteria` on an epic), so which spelling the formula cooks is a fact only bd can settle.
+ *    Criteria` on an epic), so which spelling the formula cooks is a fact only bd can settle. Every
+ *    tier is cooked by bd and created with `--validate` — the forcing function that makes the
+ *    heading un-revertable (anton-szul): `bd lint` passes either spelling, so only `--validate`
+ *    reddens when the shipped formula stops satisfying bd.
  */
 import { execFileSync } from "node:child_process";
 import { afterAll, beforeAll, expect, it } from "vitest";
@@ -44,7 +47,13 @@ describeBd("bead formula (real bd · cook + create)", () => {
     success_criteria: "- [ ] every report view exports",
   };
 
-  const cook = (): { steps: Array<{ id: string; description: string }> } => {
+  interface CookedStep {
+    id: string;
+    type: string;
+    description: string;
+  }
+
+  const cook = (): { steps: CookedStep[] } => {
     const args = [
       "cook",
       BEAD_FORMULA_NAME,
@@ -56,18 +65,31 @@ describeBd("bead formula (real bd · cook + create)", () => {
 
   /** `bd create --validate` — bd judging the cooked description by its OWN required sections. */
   const createValidated = (type: string, description: string): string =>
-    execFileSync(
-      "bd",
-      ["create", VARS.title, "--type", type, "--description", description, "--validate", "--json"],
-      { cwd: repo, encoding: "utf8", stdio: "pipe" },
-    );
+    JSON.parse(
+      execFileSync(
+        "bd",
+        ["create", VARS.title, "--type", type, "--description", description, "--validate", "--json"],
+        { cwd: repo, encoding: "utf8", stdio: "pipe" },
+      ),
+    ).id;
+
+  /** What bd itself cooked, per tier — the description AND the bd type each tier materialises as. */
+  let cooked: Map<string, CookedStep>;
 
   beforeAll(() => {
     bdRepo = makeBdRepo();
     repo = bdRepo.repo;
     // The install step `anton init` / addProject runs — proving bd itself discovers what we ship.
     expect(ensureBeadFormula(`${repo}/.beads`).status).toBe("installed");
+    cooked = new Map(cook().steps.map((s) => [s.id, { ...s, description: s.description.trim() }]));
   });
+
+  /** The cooked step for `tier`, failing loud rather than validating an `undefined` description. */
+  const cookedTier = (tier: BeadTier): CookedStep => {
+    const step = cooked.get(tier);
+    expect(step, `bd cook emitted no \`${tier}\` step`).toBeDefined();
+    return step!;
+  };
 
   afterAll(() => bdRepo.cleanup());
 
@@ -78,27 +100,29 @@ describeBd("bead formula (real bd · cook + create)", () => {
 
   it("renders byte-identically to `bd cook --mode=runtime`", async () => {
     const formula = await loadBeadFormula(repo);
-    const cooked = new Map(cook().steps.map((s) => [s.id, s.description]));
 
     for (const tier of ["epic", "feature", "ticket"] as BeadTier[]) {
-      expect(cooked.get(tier)?.trim(), tier).toBe(renderBeadSkeleton(formula, tier, VARS).description);
+      expect(cookedTier(tier).description, tier).toBe(
+        renderBeadSkeleton(formula, tier, VARS).description,
+      );
     }
   });
 
-  // Why the rubric heading is spelled bd's way (anton-dji7). anton's own reader takes either
-  // spelling, so only bd can say which one bd wants: `--validate` refuses a task/feature whose
-  // description has no `## Acceptance Criteria`, and the negative case pins that the flag is
-  // actually judging rather than passing everything.
+  // Why the rubric heading is spelled bd's way (anton-dji7, pinned by anton-szul). anton's own
+  // reader takes either spelling, so only bd can say which one bd wants. Driven off bd's OWN cooked
+  // output rather than anton's renderer: what ships is the formula, so the thing that must satisfy
+  // `--validate` is what bd cooks from it — respelling the heading back reddens all three tiers.
   it.each(["epic", "feature", "ticket"] as BeadTier[])(
-    "cooks a %s that bd's own `--validate` accepts",
-    async (tier) => {
-      const skeleton = renderBeadSkeleton(await loadBeadFormula(repo), tier, VARS);
-      expect(() => createValidated(skeleton.type, skeleton.description)).not.toThrow();
+    "cooks a %s that bd's own `--validate` accepts onto the board",
+    (tier) => {
+      const { type, description } = cookedTier(tier);
+      expect(createValidated(type, description)).toMatch(/\S/);
     },
   );
 
-  it("proves `--validate` refuses the heading anton used to cook", async () => {
-    const { type, description } = renderBeadSkeleton(await loadBeadFormula(repo), "ticket", VARS);
+  // …and the negative case pins that the flag is actually judging rather than passing everything.
+  it("proves `--validate` refuses the heading anton used to cook", () => {
+    const { type, description } = cookedTier("ticket");
     expect(() =>
       createValidated(type, description.replace("## Acceptance Criteria", "## Acceptance")),
     ).toThrow(/Acceptance Criteria/);
