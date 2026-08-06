@@ -60,5 +60,5 @@ export function killShapeSession(slug: string, sessionId: string): void {
 
 /** Turns a thrown call into toast text: the route's message when it gave one, else the fallback. */
 export function errorMessage(err: unknown, fallback: string): string {
-  return (err as Error).message || fallback;
+  return err instanceof Error ? err.message || fallback : fallback;
 }

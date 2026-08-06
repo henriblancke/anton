@@ -129,6 +129,32 @@ describe("ShapeView", () => {
     expect(screen.getByRole("button", { name: "Start shaping" })).toBeTruthy();
   });
 
+  it("kills the pty when the surface unmounts before the session id comes back", async () => {
+    let landStart: (res: Response) => void = () => {};
+    const fetchMock = vi
+      .fn()
+      .mockImplementationOnce(() => new Promise<Response>((resolve) => (landStart = resolve)))
+      .mockResolvedValue(json({}));
+    vi.stubGlobal("fetch", fetchMock);
+    renderView();
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Describe an epic" }), {
+      target: { value: SEED },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Start shaping" }));
+
+    // The founder navigates away while the pty is still spawning: the session id arrives with
+    // nothing left to hold it, so the surface has to tear the pty down on its way out.
+    cleanup();
+    landStart(json({ sessionId: "s-1" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    const [ptyUrl, ptyInit] = fetchMock.mock.calls[1]!;
+    expect(ptyUrl).toBe("/api/projects/anton/sessions/s-1/pty");
+    expect(ptyInit.method).toBe("DELETE");
+    expect(error).not.toHaveBeenCalled();
+  });
+
   it("gates Send on the epic contract and names what is missing", async () => {
     await startShaping(vi.fn().mockResolvedValue(json({ sessionId: "s-1" })));
 
