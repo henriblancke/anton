@@ -6,6 +6,7 @@ import {
   getIssueSnapshot,
   invalidateIssueSnapshot,
   issueSnapshotVersion,
+  readIssueSnapshot,
   refreshIssueSnapshot,
   resetIssueSnapshots,
 } from "./snapshot";
@@ -133,6 +134,33 @@ describe("issue snapshots", () => {
         1,
       ),
     ).resolves.toEqual([bead("old")]);
+  });
+
+  it("serves a cold load that raced a local write instead of an empty board", async () => {
+    let resolveCold!: (value: Bead[]) => void;
+    const coldLoader = vi.fn(
+      () => new Promise<Bead[]>((resolve) => (resolveCold = resolve)),
+    );
+    const read = readIssueSnapshot("/repo", coldLoader, 0);
+
+    // The write lands while the only load is in flight: the generation guard will refuse to cache
+    // that result, but the read still asked for a board and one was successfully loaded.
+    invalidateIssueSnapshot("/repo", true);
+    resolveCold([bead("loaded")]);
+
+    // Version 1: the write bumped it, the discarded load did not.
+    await expect(read).resolves.toEqual({
+      beads: [bead("loaded")],
+      version: 1,
+    });
+
+    // …and the guard still holds: the raced load did not repopulate the cache, so the next
+    // non-blocking read has no retained board to serve and loads afresh.
+    const nextLoader = vi.fn(async () => [bead("fresh")]);
+    await expect(
+      getIssueSnapshot("/repo", nextLoader, 1, { blockOnPendingWrite: false }),
+    ).resolves.toEqual([bead("fresh")]);
+    expect(nextLoader).toHaveBeenCalledTimes(1);
   });
 
   it("keeps a pre-write loader from repopulating post-write data", async () => {

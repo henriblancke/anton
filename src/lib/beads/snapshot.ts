@@ -206,8 +206,11 @@ export async function readIssueSnapshot(
     }
     return { beads: retained, version: entry.version };
   }
-  await refreshIssueSnapshot(cwd, loader, now);
-  return { beads: entry.beads ?? [], version: entry.version };
+  // Take the loader's own result, not just the cache: when a write invalidates mid-flight the
+  // generation guard refuses to repopulate the cache but still hands the loaded board back here —
+  // reading `entry.beads` alone would serve a successful load as an empty board.
+  const loaded = await refreshIssueSnapshot(cwd, loader, now);
+  return { beads: entry.beads ?? loaded, version: entry.version };
 }
 
 /** Start a freshness probe without making the caller wait for embedded Dolt. */
