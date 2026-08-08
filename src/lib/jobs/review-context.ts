@@ -779,6 +779,10 @@ function carriedAdvisorySection(advisories: ReviewFinding[]): string[] {
  * implementation-oriented agent swapped in as reviewer is still told not to write: a reviewer that
  * repairs what it finds and then reports clean would ship its verdict and lose its fix — the branch
  * anton pushes is the one it just judged, and the gate discards any edit made under a review.
+ *
+ * The closing paragraph names the OS-level sandbox (anton-t6tu) for one reason: the boundary is
+ * enforced whether or not the reviewer knows about it, and a reviewer that doesn't would read its
+ * own blocked write as a defect in the run and report a blocking finding that parks it.
  */
 function readOnlySection(): string[] {
   return [
@@ -795,6 +799,10 @@ function readOnlySection(): string[] {
     `already above: the diff, the changed-file list, and the beads. Reading, searching, and running`,
     `the project's own read-only checks (tests, type-check, lint) is expected — just leave the tree`,
     `exactly as you found it.`,
+    ``,
+    `Your shell is SANDBOXED: commands may write inside this worktree and to \`$TMPDIR\`, and nowhere`,
+    `else. A command that fails on a write outside them has hit that boundary, not a defect in this`,
+    `run — do not report it as a finding, and do not try to work around it.`,
     ``,
   ];
 }
