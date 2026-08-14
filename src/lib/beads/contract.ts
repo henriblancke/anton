@@ -714,6 +714,13 @@ function areaViolations(bead: Bead): ContractViolation[] {
 /**
  * A section the FORM question asks about, and every heading that answers it in the description.
  * `preamble` marks the one section whose text may also sit ahead of the first heading.
+ *
+ * `keys` are the GATE's reading keys, aliases included, on purpose: the question is which HOME
+ * carries the contract — the description or bd's field (anton-9dda) — not how a heading is spelled.
+ * A bead whose rubric sits under the older `## Acceptance` does carry its spec in the markdown, and
+ * naming it a missing section would report a gap the description does not have. Canonical spelling
+ * is the WRITERS' rule ({@link ACCEPTANCE_HEADING}, {@link SUCCESS_HEADING}), enforced at every
+ * place a bead is written — the formula, the ticket dialog, rework, orphan grooming.
  */
 interface FormRule {
   section: ContractSection;
