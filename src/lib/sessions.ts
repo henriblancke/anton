@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 import { appendFile, mkdir, open, stat } from "node:fs/promises";
 import { watch } from "node:fs";
 import { dirname, join } from "node:path";
-import { desc, eq } from "drizzle-orm";
+import { desc, eq, inArray } from "drizzle-orm";
 import type { ClaudeEvent } from "./claude/driver";
 import { getDb, schema } from "./db";
 import type { AntonDb, Clock } from "./jobs/queue";
@@ -22,6 +22,11 @@ export type SessionKind =
   | "orphan-grooming"
   /** A scheduled product-master pass (anton-d2sx) — judgment in, proposal beads out. */
   | "product-master"
+  /**
+   * A gardener patrol (anton-3nv7) that had something to say. The patrol runs no claude session, so
+   * a row exists only for a pass with output to carry — today, its shadow records (anton-lmps).
+   */
+  | "gardener"
   | "interactive";
 export type SessionStatus = "running" | "done" | "failed";
 
@@ -41,6 +46,8 @@ export interface CreateSessionInput {
   id: string;
   projectId: string;
   runId?: string;
+  /** Queue job that opened this session — what makes its log reachable once the job settles. */
+  jobId?: string;
   kind: SessionKind;
   beadId?: string;
   logPath?: string;
@@ -55,6 +62,7 @@ export async function createSession(
     id: input.id,
     projectId: input.projectId,
     runId: input.runId,
+    jobId: input.jobId,
     kind: input.kind,
     beadId: input.beadId,
     status: "running",
@@ -103,6 +111,12 @@ export interface StartJobSessionInput {
   projectId: string;
   kind: SessionKind;
   runId?: string;
+  /**
+   * The queue job this session belongs to (`ctx.jobId`). Pass it for any job whose output the jobs
+   * page is the surface for — the runner's live handle is dropped the moment the job settles, so an
+   * unlinked session is unreachable from there afterwards (anton-lmps).
+   */
+  jobId?: string;
   beadId?: string;
 }
 
@@ -169,6 +183,27 @@ export async function listSessions(projectId: string, runId?: string): Promise<S
     ? eq(schema.sessions.runId, runId)
     : eq(schema.sessions.projectId, projectId);
   return db.select().from(schema.sessions).where(where).orderBy(desc(schema.sessions.startedAt));
+}
+
+/**
+ * The session each of these jobs opened, newest first per job (shared anton.db read path — for the
+ * jobs page). This is the DURABLE answer the runner's in-memory live handle cannot give: a settled
+ * job reports nothing, so without this a finished pass's log — the gardener's shadow record among
+ * them — would be a file on disk with no route to it. A job that opened several sessions resolves to
+ * its latest, which is the one an operator opening the row is looking for.
+ */
+export async function sessionIdsByJob(jobIds: string[]): Promise<Record<string, string>> {
+  if (jobIds.length === 0) return {};
+  const rows = await getDb()
+    .select({ id: schema.sessions.id, jobId: schema.sessions.jobId })
+    .from(schema.sessions)
+    .where(inArray(schema.sessions.jobId, jobIds))
+    .orderBy(desc(schema.sessions.startedAt));
+  const byJob: Record<string, string> = {};
+  for (const row of rows) {
+    if (row.jobId && !(row.jobId in byJob)) byJob[row.jobId] = row.id;
+  }
+  return byJob;
 }
 
 /** A single session by id (shared anton.db read path — for run detail + log stream). */

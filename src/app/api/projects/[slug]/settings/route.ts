@@ -13,6 +13,7 @@ import {
   REVIEW_MIN_SCORE_RANGE,
   budgetPolicySchema,
   formulaVariantsSchema,
+  proposalAutonomySchema,
   runHealthThresholdsSchema,
   scanSeverityPolicySchema,
   getProjectSettingsBySlug,
@@ -370,6 +371,28 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
         return NextResponse.json({ error: `Invalid scanSeverity: ${detail}` }, { status: 400 });
       }
       patch.scanSeverity = parsed.data;
+    }
+  }
+
+  if ("proposalAutonomy" in body) {
+    const raw = (body as Record<string, unknown>).proposalAutonomy;
+    // "" / null → clear (every kind back to `propose`). Otherwise validate strictly: an unknown kind
+    // or an unknown level 400s rather than persisting an entry that would silently resolve back to
+    // `propose` — an operator who thinks they armed a kind and didn't is the one failure this
+    // setting cannot afford. Deep-merged per kind by updateProjectSettings.
+    if (raw == null || raw === "") {
+      patch.proposalAutonomy = undefined;
+    } else {
+      const parsed = proposalAutonomySchema.safeParse(raw);
+      if (!parsed.success) {
+        const issue = parsed.error.issues[0];
+        const detail = issue ? `${issue.path.join(".") || "policy"}: ${issue.message}` : "invalid";
+        return NextResponse.json(
+          { error: `Invalid proposalAutonomy: ${detail}` },
+          { status: 400 },
+        );
+      }
+      patch.proposalAutonomy = parsed.data;
     }
   }
 

@@ -7,6 +7,7 @@ import type { LiveJobInfo } from "@/lib/jobs/runner";
 import { jobsQueryString, normalizeJobFilters } from "@/lib/jobs-filters";
 import { countJobs, listJobsPaged } from "@/lib/jobs-view";
 import { countRuns } from "@/lib/runs";
+import { sessionIdsByJob } from "@/lib/sessions";
 import { PAGE_SIZE, resolvePage } from "@/lib/pagination";
 import { SectionTabs } from "@/components/runs/section-tabs";
 import { Pagination } from "@/components/runs/pagination";
@@ -56,6 +57,11 @@ export default async function ProjectJobsPage({
       .filter(([, live]) => Boolean(live.sessionId || live.cwd)),
   );
 
+  // The durable session link (anton-lmps), which is what a SETTLED job has instead of a live handle:
+  // a gardener or product-master pass writes no run row, so without this its log — the shadow
+  // records among it — would be readable only while the pass was still running.
+  const jobSessions = await sessionIdsByJob(jobs.map((job) => job.id));
+
   return (
     <div className="flex flex-1 flex-col">
       <header className="flex h-14 shrink-0 items-center gap-2 border-b border-border px-6">
@@ -77,7 +83,12 @@ export default async function ProjectJobsPage({
             <JobsEmptyState slug={slug} filtered />
           ) : (
             <>
-              <JobList jobs={jobs} slug={slug} liveJobs={liveJobs} />
+              <JobList
+                jobs={jobs}
+                slug={slug}
+                liveJobs={liveJobs}
+                jobSessions={jobSessions}
+              />
               <Pagination
                 basePath={`/projects/${slug}/jobs${jobsQueryString(filters)}`}
                 page={current}

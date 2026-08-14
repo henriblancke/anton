@@ -4,7 +4,8 @@
  * `[type] text` log lines its onEvent appender writes (including the fail-soft catch), so the
  * three jobs can't drift apart again.
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import Database from "better-sqlite3";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
@@ -12,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 
-import { makeTestDb, type TestDb } from "./db/testing";
+import { applyMigrationsTo, makeTestDb, type TestDb } from "./db/testing";
 import { schema } from "./db";
 import type { Clock } from "./jobs/queue";
 import { sessionLogPath, startJobSession } from "./sessions";
@@ -75,6 +76,22 @@ describe("startJobSession", () => {
     });
   });
 
+  it("records the job that opened the session, so a settled job still points at its log", async () => {
+    await tdb.db.insert(schema.jobs).values({ id: "job-1", type: "gardener", projectId });
+
+    const { sessionId } = await startJobSession(tdb.db, clock, {
+      projectId,
+      kind: "gardener",
+      jobId: "job-1",
+    });
+
+    const [row] = await tdb.db
+      .select()
+      .from(schema.sessions)
+      .where(eq(schema.sessions.id, sessionId));
+    expect(row.jobId).toBe("job-1");
+  });
+
   it("onEvent appends `[type] text` lines (bare `[type]` when the event has no text)", async () => {
     const { logPath, onEvent } = await startJobSession(tdb.db, clock, {
       projectId,
@@ -102,5 +119,80 @@ describe("startJobSession", () => {
     // Give the swallowed rejection a tick to surface if the catch were missing (vitest would
     // fail the test on an unhandled rejection).
     await new Promise((r) => setTimeout(r, 20));
+  });
+});
+
+/**
+ * The jobs page's read (anton-lmps). It is the whole reason the link is persisted: the runner's live
+ * handle is dropped when a job settles, so a finished gardener/product-master pass — the one whose
+ * shadow record an operator reads the next morning — has nothing else pointing at its log.
+ */
+describe("sessionIdsByJob", () => {
+  let workDir: string;
+
+  beforeAll(async () => {
+    workDir = mkdtempSync(join(tmpdir(), "anton-session-links-"));
+    process.env.ANTON_DB = join(workDir, "anton.db");
+    const setup = new Database(process.env.ANTON_DB);
+    applyMigrationsTo(setup);
+    setup.close();
+
+    // getDb() is lazy, so setting ANTON_DB above is enough — no module re-import needed.
+    const { getDb, schema: dbSchema } = await import("./db");
+    const db = getDb();
+    await db
+      .insert(dbSchema.projects)
+      .values({ id: "p1", slug: "p1", name: "p1", repoPath: workDir });
+    await db.insert(dbSchema.jobs).values([
+      { id: "gardener-job", type: "gardener", projectId: "p1", status: "done" },
+      { id: "resumed-job", type: "product-master", projectId: "p1", status: "done" },
+      { id: "silent-job", type: "gardener", projectId: "p1", status: "done" },
+    ]);
+    await db.insert(dbSchema.sessions).values([
+      {
+        id: "s-gardener",
+        projectId: "p1",
+        jobId: "gardener-job",
+        kind: "gardener",
+        status: "done",
+        startedAt: new Date(1_700_000_000_000),
+      },
+      // A job that ran twice: the operator opening the row wants the latest attempt's log.
+      {
+        id: "s-first",
+        projectId: "p1",
+        jobId: "resumed-job",
+        kind: "product-master",
+        status: "done",
+        startedAt: new Date(1_700_000_000_000),
+      },
+      {
+        id: "s-latest",
+        projectId: "p1",
+        jobId: "resumed-job",
+        kind: "product-master",
+        status: "done",
+        startedAt: new Date(1_700_000_060_000),
+      },
+      // Unlinked (a session predating the link, or one opened outside a job) — never attributed.
+      { id: "s-loose", projectId: "p1", kind: "interactive", status: "done" },
+    ]);
+  });
+
+  afterAll(() => {
+    rmSync(workDir, { recursive: true, force: true });
+  });
+
+  it("resolves each job to its latest session, and a job that opened none to nothing", async () => {
+    const { sessionIdsByJob } = await import("./sessions");
+    expect(await sessionIdsByJob(["gardener-job", "resumed-job", "silent-job"])).toEqual({
+      "gardener-job": "s-gardener",
+      "resumed-job": "s-latest",
+    });
+  });
+
+  it("asks nothing of the DB for an empty page", async () => {
+    const { sessionIdsByJob } = await import("./sessions");
+    expect(await sessionIdsByJob([])).toEqual({});
   });
 });

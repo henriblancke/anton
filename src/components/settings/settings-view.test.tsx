@@ -4,10 +4,11 @@
  * inputs seed from a persisted policy (round-trip in), and Save PATCHes the edited values back.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { toast } from "sonner";
 
 import { SettingsView } from "@/components/settings/settings-view";
+import { GARDENER_DETECTION_KINDS } from "@/lib/gardener/detections";
 import type { Project } from "@/lib/types";
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn() }) }));
@@ -785,6 +786,152 @@ describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
     await waitFor(() => expect(patches(fetchMock)).toHaveLength(1));
     expect(body(fetchMock)).toEqual({ type: "gardener", enabled: true });
     await waitFor(() => expect(toast.success).toHaveBeenCalledWith("gardener enabled"));
+  });
+});
+
+describe("SettingsView proposal autonomy (anton-3mqq)", () => {
+  showing("proposals");
+
+  const KINDS: readonly string[] = GARDENER_DETECTION_KINDS;
+
+  const choice = (kind: string, level: string) =>
+    screen.getByRole("radio", { name: `${kind} · ${level}` }) as HTMLInputElement;
+
+  const groupBox = (title: string) => screen.getByRole("group", { name: title });
+
+  it("renders every kind at propose, the shipped default", () => {
+    renderView({});
+    for (const kind of KINDS) {
+      expect(choice(kind, "propose").checked).toBe(true);
+      expect(choice(kind, "shadow").checked).toBe(false);
+    }
+  });
+
+  it("renders exactly the kinds the detector knows about", () => {
+    // The panel's catalogue is a hand-maintained mirror of GARDENER_DETECTION_KINDS (this module
+    // never imports server code), so it can drift the moment a kind is added. Asserted against the
+    // real list rather than a copy of it: a new kind with no row would otherwise ship as a policy
+    // the operator cannot see, silently stuck at whatever a settings blob happened to hold.
+    renderView({});
+    const rendered = screen
+      .getAllByRole("radio")
+      .map((r) => r.getAttribute("aria-label")?.split(" · ")[0])
+      .filter((kind, i, all) => all.indexOf(kind) === i);
+    expect(rendered.sort()).toEqual([...KINDS].sort());
+  });
+
+  it("groups the kinds by reversibility, and says how each group is undone", () => {
+    renderView({});
+
+    // The point of the grouping: a link and a close are not the same decision, so they are not in
+    // the same box — and each box states what it does and what taking it back costs.
+    const reversible = groupBox("Undone by one write");
+    expect(within(reversible).getByRole("radio", { name: "implied-order · propose" })).toBeTruthy();
+    expect(within(reversible).queryByRole("radio", { name: "shipped-orphan · propose" })).toBeNull();
+    expect(within(reversible).getByText(/One bd write puts it back/)).toBeTruthy();
+
+    const dequeued = groupBox("Takes work out of the queue");
+    expect(within(dequeued).getByRole("radio", { name: "stale · propose" })).toBeTruthy();
+    expect(within(dequeued).getByText(/bd undefer puts a deferred bead straight back/)).toBeTruthy();
+
+    // A close is the one move that writes a claim about what happened — said in the group, so the
+    // founder never has to read the source to know a shipped-orphan closes.
+    const history = groupBox("Writes history");
+    expect(within(history).getByRole("radio", { name: "shipped-orphan · propose" })).toBeTruthy();
+    expect(within(history).getByText(/stays in the board's history/)).toBeTruthy();
+  });
+
+  it("shows split as not armable, with the reason, rather than offering it", () => {
+    renderView({});
+    const manual = groupBox("Nothing to arm");
+
+    expect(within(manual).getByRole("radio", { name: "oversized · propose" })).toBeTruthy();
+    expect(within(manual).getByText(/a split writes new contracts/)).toBeTruthy();
+    // Every level disabled, not just apply: autonomyFor answers `propose` for a split whatever the
+    // policy says, so an offered `shadow` would be a setting the pass silently ignores.
+    for (const level of ["propose", "shadow", "apply"]) {
+      expect(choice("oversized", level).disabled).toBe(true);
+    }
+  });
+
+  it("says a targetless re-parent is never applied, whatever the kind is set to", () => {
+    renderView({});
+    // Per-proposal, not per-kind: a container-orphan WITH a home is applicable, so the kind stays
+    // armable and the floor is stated where both re-parent kinds live.
+    expect(
+      within(groupBox("Undone by one write")).getByText(/never applied, whatever this says/),
+    ).toBeTruthy();
+    expect(choice("container-orphan", "shadow").disabled).toBe(false);
+  });
+
+  it("offers apply but never lets it be picked, and says why", () => {
+    renderView({});
+    for (const kind of KINDS) {
+      expect(choice(kind, "apply").disabled).toBe(true);
+    }
+    expect(screen.getByText(/arrives with armed writes/)).toBeTruthy();
+    expect(choice("stale", "shadow").disabled).toBe(false);
+  });
+
+  it("seeds the control from a persisted policy (round-trip in)", () => {
+    renderView({ proposalAutonomy: { stale: "shadow", "shipped-orphan": "shadow" } });
+
+    expect(choice("stale", "shadow").checked).toBe(true);
+    expect(choice("shipped-orphan", "shadow").checked).toBe(true);
+    // Untouched kinds stay at the shipped default rather than inheriting a neighbour's level.
+    expect(choice("mispriority", "propose").checked).toBe(true);
+  });
+
+  it("floors a stored level the kind can never reach back to propose", () => {
+    // A hand-edited blob can name anything. Showing `oversized` as armed when autonomyFor would
+    // answer `propose` for it is the one lie this control cannot tell.
+    renderView({ proposalAutonomy: { oversized: "apply", stale: "nonsense" } });
+    expect(choice("oversized", "propose").checked).toBe(true);
+    expect(choice("stale", "propose").checked).toBe(true);
+  });
+
+  it("PATCHes the whole policy on Save (round-trip out)", () => {
+    const fetchMock = stubFetch();
+    renderView({});
+
+    const save = () => screen.getByRole("button", { name: /save changes/i }) as HTMLButtonElement;
+    expect(save().disabled).toBe(true);
+
+    fireEvent.click(choice("stale", "shadow"));
+    expect(save().disabled).toBe(false);
+    expect(screen.getByText("proposal autonomy")).toBeTruthy();
+
+    fireEvent.click(save());
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.proposalAutonomy.stale).toBe("shadow");
+    // Explicit `propose` for the rest: the server merges per kind, so an omitted kind would keep
+    // whatever it already held — which is how disarming one would silently fail to persist.
+    expect(body.proposalAutonomy["shipped-orphan"]).toBe("propose");
+    expect(Object.keys(body.proposalAutonomy).sort()).toEqual([...KINDS].sort());
+  });
+
+  it("survives a reload: what was saved comes back armed", () => {
+    // The reload the operator actually performs — the page re-renders from the stored row.
+    const { unmount } = renderView({});
+    fireEvent.click(choice("low-value", "shadow"));
+    unmount();
+
+    renderView({ proposalAutonomy: { "low-value": "shadow" } });
+    expect(choice("low-value", "shadow").checked).toBe(true);
+    expect((screen.getByRole("button", { name: /save changes/i }) as HTMLButtonElement).disabled).toBe(
+      true,
+    );
+  });
+
+  it("disarming a kind is a save, not a no-op", () => {
+    const fetchMock = stubFetch();
+    renderView({ proposalAutonomy: { stale: "shadow" } });
+
+    fireEvent.click(choice("stale", "propose"));
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.proposalAutonomy.stale).toBe("propose");
   });
 });
 

@@ -14,6 +14,13 @@ import { getDb, schema } from "./db";
 import { removeWorktree } from "./git/worktree";
 import { FORMULA_NAME_PATTERN, configureBeadsForRepo } from "./beads/config.mjs";
 import { DEFAULT_BUDGET_POLICY, type BudgetPolicy } from "./jobs/budget";
+import { GARDENER_DETECTION_KINDS } from "./gardener/detections";
+import {
+  PROPOSAL_AUTONOMY_LEVELS,
+  resolveProposalAutonomyPolicy,
+  type ProposalAutonomyOverrides,
+  type ProposalAutonomyPolicy,
+} from "./gardener/autonomy";
 import {
   DEFAULT_SCAN_SEVERITY_POLICY,
   resolveScanSeverityPolicy,
@@ -274,6 +281,18 @@ export interface ProjectSettings {
    * schedule, which is off by default.
    */
   productMasterPrompt?: string;
+  /**
+   * How far a pass may go with the proposals it files, per detection kind (anton-nbyy). Absent → the
+   * shipped {@link DEFAULT_PROPOSAL_AUTONOMY_POLICY} (`propose` for everything, i.e. no behaviour
+   * change); a stored value need only carry the kinds the operator armed. Validated with
+   * {@link proposalAutonomySchema} at the API boundary and resolved through
+   * {@link resolveAutonomyPolicy}, which drops entries anton no longer recognises rather than
+   * failing a pass over a hand-edited settings blob.
+   *
+   * Distinct from {@link autonomy}, which is the run-execution master switch. This one is about board
+   * state a pass proposes; that one is about whether approved epics execute at all.
+   */
+  proposalAutonomy?: ProposalAutonomyOverrides;
 }
 
 /** A resolved verify gate (anton-3oh8): a stable label (for logs/errors) + the shell command. */
@@ -377,6 +396,28 @@ export interface ProductMasterConfig {
  */
 export function resolveProductMasterConfig(settings: ProjectSettings): ProductMasterConfig {
   return { prompt: settings.productMasterPrompt?.trim() || undefined };
+}
+
+/**
+ * Per-kind proposal autonomy as submitted (anton-nbyy). Keyed by the detection kinds and valued by
+ * the levels the policy module owns, so a kind added to `detections.ts` is accepted here the moment
+ * it exists rather than after someone remembers to widen a second list. Partial (an operator arms
+ * one kind at a time) and strict about both halves: an unknown kind or an unknown level 400s instead
+ * of persisting a policy that would silently resolve back to `propose`.
+ */
+export const proposalAutonomySchema = z.partialRecord(
+  z.enum(GARDENER_DETECTION_KINDS),
+  z.enum(PROPOSAL_AUTONOMY_LEVELS),
+);
+
+/**
+ * How far each detection kind's proposals may go for this project — the shipped policy with the
+ * operator's overrides applied, never partial. The single seam the passes read, so "absent means
+ * propose" and the split/targetless-reparent floor can't drift between the gardener and the product
+ * master.
+ */
+export function resolveAutonomyPolicy(settings: ProjectSettings): ProposalAutonomyPolicy {
+  return resolveProposalAutonomyPolicy(settings.proposalAutonomy);
 }
 
 /**
@@ -648,6 +689,11 @@ export async function updateProjectSettings(
     // Same reasoning, one level down: the merge is per SEVERITY, and each severity's rule carries
     // both knobs (the schema requires it), so re-weighting `critical` can't half-write `high`.
     else if (k === "scanSeverity") next.scanSeverity = { ...current.scanSeverity, ...(v as object) };
+    // Per KIND, for the same reason: a client that renders only the kinds it knows must not disarm
+    // the ones it didn't send. Setting a kind back to `propose` is an explicit value, not an absence.
+    else if (k === "proposalAutonomy") {
+      next.proposalAutonomy = { ...current.proposalAutonomy, ...(v as object) };
+    }
     else (next as Record<string, unknown>)[k] = v;
   }
   await db

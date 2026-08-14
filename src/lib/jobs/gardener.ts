@@ -52,7 +52,9 @@ import {
   type ArbitrationResult,
   type EmissionArbitrationDeps,
   type EmissionResult,
+  type EmittedProposal,
 } from "../gardener/emit";
+import { shadowProposals } from "../gardener/shadow";
 import {
   completeHygieneReport,
   startHygieneReport,
@@ -60,7 +62,8 @@ import {
   type HygieneActions,
   type HygieneFinding,
 } from "../hygiene";
-import { getProjectById } from "../projects";
+import { getProjectById, getProjectSettings, resolveAutonomyPolicy } from "../projects";
+import { appendSessionLog, endSession, startJobSession, type JobSession } from "../sessions";
 import { PoisonError } from "./errors";
 import { systemClock, type AntonDb, type Clock } from "./queue";
 import type { JobContext, JobHandler } from "./runner";
@@ -206,6 +209,35 @@ export function makeGardenerHandler(deps: GardenerDeps): JobHandler {
     const project = await getProjectById(db, projectId);
     if (!project) throw new PoisonError(`project ${projectId} not found`);
     const repo = project.repoPath;
+    // How far this project lets a filed proposal go, per kind (anton-nbyy) — read once, so a policy
+    // edit mid-patrol cannot have one proposal shadowed under a rule the next one is not.
+    const policy = resolveAutonomyPolicy(await getProjectSettings(db, projectId));
+
+    /**
+     * The patrol's session log, opened on FIRST WRITE. The gardener runs no claude session, so a row
+     * exists only for a pass that has something to say — today, its shadow records (anton-lmps) —
+     * and a nightly patrol with nothing to shadow leaves no empty session behind.
+     *
+     * Linked to the job BOTH ways: `ctx.report` for the live tail while the pass runs, and `jobId` on
+     * the row for after it settles. The durable link is the one that matters here — this patrol opens
+     * its session in its last few seconds, so a nightly pass is settled long before anyone looks, and
+     * the live handle is gone by then.
+     */
+    let session: JobSession | undefined;
+    const log = async (chunk: string): Promise<void> => {
+      if (!session) {
+        session = await startJobSession(db, clock, {
+          projectId,
+          kind: "gardener",
+          jobId: ctx.jobId,
+        });
+        ctx.report({ sessionId: session.sessionId });
+      }
+      await appendSessionLog(session.logPath, chunk);
+    };
+    const closeSession = async (status: "done" | "failed"): Promise<void> => {
+      if (session) await endSession(db, clock, session.sessionId, status);
+    };
 
     // Pull first: the patrol's writes are derived from what it reads, and the local Dolt working set
     // can be a sync heartbeat behind. Best-effort — an unreachable remote must not cost the project
@@ -360,8 +392,8 @@ export function makeGardenerHandler(deps: GardenerDeps): JobHandler {
     // duplicate only ever goes away when the NEXT patrol reconciles, which on a nightly schedule
     // leaves an operator a whole day to act on one ask twice. Best-effort like every other fold: it
     // reports why it stood down rather than costing the pass anything.
-    const arbitrate = async (emission: EmissionResult) => {
-      if (emission.created.length === 0) return;
+    const arbitrate = async (emission: EmissionResult): Promise<Set<string>> => {
+      if (emission.created.length === 0) return new Set();
       const arbitrated = await arbitrateEmission(repo, emission.created, {
         ...deps.arbitration,
         signal: ctx.signal,
@@ -391,7 +423,27 @@ export function makeGardenerHandler(deps: GardenerDeps): JobHandler {
             `${arbitrated.failed.length > 0 ? ` (failed: ${arbitrated.failed.join(", ")})` : ""}`,
         );
       }
+      return new Set(arbitrated.folded.map((f) => f.id));
     };
+
+    /**
+     * What the armed patrol WOULD have done with what it just filed (anton-lmps) — decided against a
+     * board read fresh at this moment, exactly as an approval would, and writing nothing.
+     *
+     * Runs AFTER arbitration and skips what it withdrew: a proposal folded into another machine's
+     * twin is a closed ask, and shadowing it would report on a question nobody is being asked.
+     */
+    const shadow = (created: EmittedProposal[], withdrawn: Set<string>) =>
+      shadowProposals({
+        repo,
+        created: created.filter((p) => !withdrawn.has(p.id)),
+        policy,
+        observedAtMs,
+        nowMs: clock.now(),
+        producer: "[gardener]",
+        log,
+        signal: ctx.signal,
+      });
 
     try {
       const emission = await emitProposals(repo, {
@@ -401,15 +453,19 @@ export function makeGardenerHandler(deps: GardenerDeps): JobHandler {
         signal: ctx.signal,
       });
       report(emission);
-      await arbitrate(emission);
+      await shadow(emission.created, await arbitrate(emission));
     } catch (e) {
       // The proposals a stopped pass DID file are on the board like any other, so they get the same
       // arbitration — a pass that parked on its third create must not leave the first two doubled.
+      // Not shadowed, though: the pass is failing and will retry, and its commentary is worth less
+      // than getting the beads that landed onto the other machines.
       if (e instanceof PartialEmissionError) {
         report(e.result);
         await arbitrate(e.result);
       }
+      await closeSession("failed");
       throw e;
     }
+    await closeSession("done");
   };
 }
