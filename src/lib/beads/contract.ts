@@ -760,8 +760,8 @@ const EPIC_FORM_RULES: readonly FormRule[] = [
  * {@link isContractJudged} accepts. A rate must divide by that, exactly as the contract rate does.
  */
 export function contractFormGaps(bead: Bead): ContractSection[] {
+  if (!isContractJudged(bead)) return [];
   const tier = tierOf(bead);
-  if (tier === "exempt" || !isContractReadable(bead)) return [];
 
   const description = typeof bead.description === "string" ? bead.description : "";
   const sections = sectionsOf(description, contractKeysOf(tier));

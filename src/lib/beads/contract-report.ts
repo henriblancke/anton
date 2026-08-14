@@ -249,7 +249,8 @@ export function formatContractReport(report: ContractReport, label = ""): string
     lines.push(
       "",
       "FORM — sections the description itself does not carry. Never blocking, never in the exit code:",
-      "the gate reads acceptance from bd's field too, so these beads approve and run as they are.",
+      "the gate reads acceptance from bd's field too, so a form gap alone never withholds a run — but a",
+      "bead listed BLOCKING above is refused all the same.",
       "",
     );
     for (const row of report.form.rows) {
