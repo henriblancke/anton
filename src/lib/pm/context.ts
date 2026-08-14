@@ -166,6 +166,7 @@ export function formatPmBoardContext(input: PmBoardInput): string {
     `board you have — you cannot run \`bd\`, and nothing you write reaches it. Judge from this.`,
     ``,
     ...targetsSection(split, index, input),
+    ...containersSection(split, index, input),
     ...looseSection(split, index, input),
     ...proposalsSection(input.board),
     ...runsSection(input.runs ?? []),
@@ -178,6 +179,12 @@ interface PmBoardSplit {
   targets: Bead[];
   /** The open working-layer beads a given target carries, at any depth. */
   ticketsOf(id: string): Bead[];
+  /**
+   * The open epics that GROUP run targets rather than being one. Kept apart from `targets` because
+   * anton never runs them — but they are the homes everything else hangs off, and an epic the pass
+   * cannot see is one it can never weigh a feature against.
+   */
+  containers: Bead[];
   /** Open work no runnable target carries — nothing will ship it as it stands. */
   loose: Bead[];
 }
@@ -203,6 +210,7 @@ function partitionBoard(index: BoardIndex): PmBoardSplit {
   }
 
   const tickets = new Map<string, Bead[]>();
+  const containers: Bead[] = [];
   const loose: Bead[] = [];
   for (const bead of index.all) {
     if (!isOpenWork(bead) || isProposalBead(bead) || targetIds.has(bead.id)) continue;
@@ -213,7 +221,9 @@ function partitionBoard(index: BoardIndex): PmBoardSplit {
       const carried = tickets.get(owner.id);
       if (carried) carried.push(bead);
       else tickets.set(owner.id, [bead]);
-    } else if (!beads.isContainer(bead, index.all)) {
+    } else if (index.isContainer(bead)) {
+      containers.push(bead);
+    } else {
       loose.push(bead);
     }
   }
@@ -221,6 +231,7 @@ function partitionBoard(index: BoardIndex): PmBoardSplit {
   return {
     targets: targets.sort(byPriorityThenId),
     ticketsOf: (id) => (tickets.get(id) ?? []).sort(byPriorityThenId),
+    containers: containers.sort(byPriorityThenId),
     loose: loose.sort(byPriorityThenId),
   };
 }
@@ -238,7 +249,8 @@ function targetsSection(split: PmBoardSplit, index: BoardIndex, input: PmBoardIn
     ``,
     `Each block is one run target — the unit anton actually runs — followed by the tickets it`,
     `carries. A block with no tickets under it runs as a single ticket, itself. \`blocked by\` is a`,
-    `\`blocks\` edge the graph already records.`,
+    `\`blocks\` edge the graph already records; \`under\` is the bead's parent — the home it hangs off`,
+    `today.`,
     ``,
   ];
   for (const target of shown) {
@@ -263,6 +275,41 @@ function targetsSection(split: PmBoardSplit, index: BoardIndex, input: PmBoardIn
 }
 
 /**
+ * The epics that group run targets rather than being one. They run nothing themselves — anton runs
+ * the features beneath them — so they are absent from every other section, which left the pass with
+ * a board whose homes were invisible: it could see that a feature exists without ever seeing the
+ * epics it might belong under, and a home nothing shows is a home nothing can weigh.
+ */
+function containersSection(split: PmBoardSplit, index: BoardIndex, input: PmBoardInput): string[] {
+  if (split.containers.length === 0) return [];
+  const shown = split.containers.slice(0, MAX_CARDS);
+  const lines = [
+    `### Container epics`,
+    ``,
+    `These GROUP run targets rather than being one, so anton never runs them directly and they carry`,
+    `no tickets of their own. They are the homes the work above hangs off — judge them as groupings,`,
+    `not as work to rank.`,
+    ``,
+    ...shown.map((epic) => beadLine(epic, index, input, "", [carriesOf(epic, split, index)])),
+  ];
+  if (split.containers.length > shown.length) {
+    lines.push(
+      ``,
+      `${split.containers.length - shown.length} further container epic(s) are NOT shown — this list is`,
+      `capped at ${MAX_CARDS}, lowest priority first.`,
+    );
+  }
+  lines.push(``);
+  return lines;
+}
+
+/** How much a container actually holds — an epic grouping nothing reads very differently from one grouping nine. */
+const carriesOf = (epic: Bead, split: PmBoardSplit, index: BoardIndex): string => {
+  const held = split.targets.filter((t) => t.id !== epic.id && index.isAncestor(epic.id, t.id));
+  return `${held.length} open run target(s) beneath it`;
+};
+
+/**
  * Open working-layer beads no run target carries. Shown because they are still work the project is
  * holding — and flagged as unowned, because "give this a home" is the GARDENER's proposal, not this
  * pass's: without the flag a ranking judgment made about them would silently duplicate that ask.
@@ -281,13 +328,21 @@ function looseSection(split: PmBoardSplit, index: BoardIndex, input: PmBoardInpu
 }
 
 /** One bead as the pass reads it: everything a ranking, sizing or value judgment rests on. */
-function beadLine(bead: Bead, index: BoardIndex, input: PmBoardInput, indent: string): string {
+function beadLine(
+  bead: Bead,
+  index: BoardIndex,
+  input: PmBoardInput,
+  indent: string,
+  extras: (string | undefined)[] = [],
+): string {
   const facts = [
     `[${bead.issue_type ?? "task"}]`,
     `P${bead.priority ?? "?"}`,
     sizeOf(bead),
     ageOf(bead, input.now),
+    homeOf(bead, index),
     blockedByOf(bead, index),
+    ...extras,
     scoresOf(bead, input.scores),
     isInFlight(bead, input.now) ? "IN FLIGHT — a run owns it, do not propose against it" : undefined,
     beads.isDeferred(bead) ? "deferred" : undefined,
@@ -303,6 +358,20 @@ const sizeOf = (bead: Bead): string | undefined => {
 const ageOf = (bead: Bead, nowMs: number): string | undefined => {
   const days = ageInDays(bead, nowMs);
   return days === undefined ? undefined : `${days}d since last write`;
+};
+
+/**
+ * Where the bead hangs today, named rather than implied by the nesting: a feature's epic, a ticket's
+ * card. Rendered with the parent's TITLE because an id alone does not say what a home is for, and the
+ * only judgment worth making about a home is whether the work belongs in it.
+ */
+const homeOf = (bead: Bead, index: BoardIndex): string | undefined => {
+  const parentId = beads.parentOf(bead);
+  if (!parentId) return undefined;
+  const parent = index.byId.get(parentId);
+  // A parent absent from a full-board read is a dangling pointer; naming the id is still the truth.
+  if (!parent) return `under ${parentId} (not on the board)`;
+  return `under ${parent.id} "${oneLine(parent.title ?? "")}"`;
 };
 
 const blockedByOf = (bead: Bead, index: BoardIndex): string | undefined => {

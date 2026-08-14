@@ -91,9 +91,77 @@ describe("formatPmBoardContext", () => {
       now: NOW,
     });
     expect(sectionOf(text, "Run targets")).toContain("- anton-child [feature]");
-    // The container itself is a grouping shell, so it is neither a run target nor loose work.
-    expect(text).not.toContain("anton-cont ");
+    // The container groups run targets rather than being one, so it is neither a target nor work.
+    expect(sectionOf(text, "Run targets")).not.toContain("- anton-cont ");
     expect(sectionOf(text, "Work no run target carries")).toContain("- anton-orphan");
+  });
+
+  // A home claim the pass cannot see is a home claim it cannot make: grouped rendering alone says
+  // WHERE a bead sits in this prompt, never where it sits on the board.
+  it("names the epic a run target hangs off, id and title both", () => {
+    const text = formatPmBoardContext({
+      board: [
+        bead("anton-home", { issue_type: "epic", title: "Payments rails" }),
+        bead("anton-under", { issue_type: "feature", parent: "anton-home" }),
+      ],
+      now: NOW,
+    });
+    expect(sectionOf(text, "Run targets")).toContain(
+      `- anton-under [feature] · P2 · under anton-home "Payments rails"`,
+    );
+  });
+
+  it("names the card that carries each ticket, at any depth", () => {
+    const text = formatPmBoardContext({
+      board: [...board, bead("anton-sub", { parent: "anton-tick" })],
+      now: NOW,
+    });
+    const targets = sectionOf(text, "Run targets");
+    expect(targets).toMatch(/ {2}- anton-tick [^\n]*under anton-feat "anton-feat"/);
+    // The nesting shows anton-sub under the feature that RUNS it; only the line says what holds it.
+    expect(targets).toMatch(/ {2}- anton-sub [^\n]*under anton-tick "anton-tick"/);
+  });
+
+  it("shows a container epic that runs nothing of its own, since it is still a candidate home", () => {
+    const text = formatPmBoardContext({
+      board: [
+        bead("anton-cont", { issue_type: "epic", title: "Billing" }),
+        bead("anton-child", { issue_type: "feature", parent: "anton-cont" }),
+        bead("anton-empty", { issue_type: "epic", title: "Growth", parent: "anton-cont" }),
+        bead("anton-shell", { issue_type: "feature", parent: "anton-empty" }),
+      ],
+      now: NOW,
+    });
+    const homes = sectionOf(text, "Container epics");
+    // Counted transitively: anton-shell rides anton-empty, and anton-empty rides anton-cont.
+    expect(homes).toMatch(/- anton-cont \[epic\][^\n]*2 open run target\(s\) beneath it/);
+    expect(homes).toMatch(/- anton-empty \[epic\][^\n]*1 open run target\(s\) beneath it/);
+    // Nested containers are homes too, and carry their own parentage.
+    expect(homes).toMatch(/- anton-empty \[epic\][^\n]*under anton-cont "Billing"/);
+  });
+
+  it("truncates the containers and each card's tickets rather than losing them silently", () => {
+    const crowded = [
+      bead("anton-card", { issue_type: "feature" }),
+      ...Array.from({ length: 15 }, (_, i) => bead(`anton-t${i}`, { parent: "anton-card" })),
+      ...Array.from({ length: 80 }, (_, i) => [
+        bead(`anton-c${String(i).padStart(2, "0")}`, { issue_type: "epic" }),
+        bead(`anton-cf${String(i).padStart(2, "0")}`, {
+          issue_type: "feature",
+          parent: `anton-c${String(i).padStart(2, "0")}`,
+        }),
+      ]).flat(),
+    ];
+    const text = formatPmBoardContext({ board: crowded, now: NOW });
+    expect(text).toContain("…and 3 more ticket(s) under anton-card, not shown");
+    expect(text).toMatch(/20 further container epic\(s\) are NOT shown/);
+    expect(sectionOf(text, "Container epics").split("\n").filter((l) => l.startsWith("- "))).toHaveLength(60);
+  });
+
+  it("keeps the pass on one board it cannot write to", () => {
+    const text = formatPmBoardContext({ board, now: NOW });
+    expect(text).toContain("It is the only");
+    expect(text).toContain("board you have — you cannot run `bd`");
   });
 
   it("carries the review-score SERIES, which no board read alone can produce", () => {
