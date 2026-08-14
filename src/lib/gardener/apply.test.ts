@@ -267,6 +267,15 @@ const inReview = (id: string): Bead => bead(id, { labels: ["stage:in-review"] })
 /** A feature card with an open ticket under it — a legal re-parent home. */
 const CARD = bead("anton-card", { issue_type: "feature" });
 
+/** The tier ABOVE a card: an epic, which may only carry cards once it already groups one. */
+const EPIC = bead("anton-epic", { issue_type: "epic" });
+
+/** What makes {@link EPIC} a container — an epic groups cards the moment a feature lands under it. */
+const GROUPED = child("anton-f1", EPIC.id, { issue_type: "feature" });
+
+/** A card as the SUBJECT of a move rather than its home: the tier whose home is an epic. */
+const FEATURE = bead("anton-feat", { issue_type: "feature" });
+
 /**
  * The run target a retirement subject can ride as a TICKET. A grouped run publishes ONE lease, on
  * this bead — its tickets carry no liveness signal of their own — so this is where "a run is already
@@ -571,6 +580,45 @@ describe("planApply — what an approval means against the board as it now is", 
       const container = bead("anton-card", { issue_type: "epic" });
       const board = [container, child("anton-f", container.id, { issue_type: "feature" }), bead("anton-a")];
       expect(refusal(decide(REPARENT, board))).toMatch(/not a board card/);
+    });
+
+    // The tier taxonomy asks for A HOME ONE TIER UP (`epic → feature → ticket`), so which home is
+    // legal depends on what is being moved: the working layer wants the card that runs it, a CARD
+    // wants the container epic that groups it. One question for both refused every card move.
+    describe("a home one tier up — the bar depends on the subject's tier", () => {
+      const move = (subject: string, target: string): GardenerPlan =>
+        planFor({ kind: "container-orphan", move: "reparent", subjects: [subject], target });
+
+      it("moves a card under the container epic that groups it", () => {
+        const board = [EPIC, GROUPED, FEATURE];
+        expect(decide(move(FEATURE.id, EPIC.id), board)).toMatchObject({ status: "apply" });
+      });
+
+      it("refuses a card under a feature — both are run targets, so it would ship twice", () => {
+        expect(refusal(decide(move(FEATURE.id, CARD.id), [CARD, FEATURE]))).toMatch(
+          /anton-card is not an epic .*feature-under-non-epic/,
+        );
+      });
+
+      // An epic that groups no cards is a run target itself, and renders as a card: landing a
+      // feature under it cancels its own run and strands whatever tickets it carries.
+      it("refuses a card under an epic that groups none — the move would demote it", () => {
+        const board = [EPIC, FEATURE, child("anton-t1", EPIC.id)];
+        expect(refusal(decide(move(FEATURE.id, EPIC.id), board))).toMatch(
+          /anton-epic is not a container epic .*ticket-under-container-epic/,
+        );
+      });
+
+      it("refuses a working-layer bead under a container epic — it would ride no card", () => {
+        const board = [EPIC, GROUPED, bead("anton-a")];
+        expect(refusal(decide(move("anton-a", EPIC.id), board))).toMatch(
+          /anton-epic is not a board card/,
+        );
+      });
+
+      it("still moves a working-layer bead under a board card", () => {
+        expect(decide(move("anton-a", CARD.id), [CARD, bead("anton-a")]).status).toBe("apply");
+      });
     });
 
     // The home is written to as surely as the subject is, just indirectly: a run that has already
@@ -1128,6 +1176,30 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     });
     expect(calls).toEqual([
       `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-epic is no longer a board card — re-parenting under it would leave the work riding no card, which is the state this proposal is about`,
+    ]);
+  });
+
+  // The mirror image, one tier up: an epic stops being a CONTAINER the instant its last feature
+  // leaves, and that move takes this same epic's write lock as its own subject's old home. Left with
+  // the snapshot, a card lands under an epic that is now a run target in its own right — demoting it
+  // out of its own run, which is the harm the tier bar exists to prevent.
+  it("refuses a home that stopped being a container epic since the snapshot", async () => {
+    const plan = planFor({
+      kind: "container-orphan",
+      move: "reparent",
+      subjects: [FEATURE.id],
+      target: EPIC.id,
+    });
+    const proposal = proposalFor(plan);
+    // The one feature that made it a container is re-parented away between the snapshot and this
+    // write, leaving the epic grouping nothing.
+    liveBeads.set(GROUPED.id, bead(GROUPED.id, { issue_type: "feature" }));
+
+    await expect(apply(proposal, [EPIC, GROUPED, FEATURE, proposal])).rejects.toMatchObject({
+      failure: "refused",
+    });
+    expect(calls).toEqual([
+      `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-epic is no longer a container epic — it groups no cards, so it is a run target in its own right, and landing anton-feat under it would demote it: its own run is cancelled and any ticket it carries is left beneath a card nothing will reach (\`ticket-under-container-epic\`)`,
     ]);
   });
 

@@ -245,16 +245,22 @@ function planReparent(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): A
   }
   const target = index.byId.get(plan.target);
   if (!target) return { status: "refuse", reason: missing(plan.target) };
-  const unusable = homeRefusal(target, index, at);
+  const unusable = homeRefusal(plan, target, index, at);
   if (unusable) return { status: "refuse", reason: unusable };
   return reparentSteps(plan, target, index, at);
 }
 
 /**
- * Why work cannot be hung under this home at all, or undefined — the bars that hold for the whole
- * cluster, asked once before any subject is looked at.
+ * Why work cannot be hung under this home at all, or undefined — the bars asked once, before any
+ * subject is MOVED. The first two hold for the whole cluster; the tier bar is asked of each subject
+ * in turn, because which home the taxonomy demands depends on what is being moved.
  */
-function homeRefusal(target: Bead, index: BoardIndex, at: ApplyMoment): string | undefined {
+function homeRefusal(
+  plan: GardenerPlan,
+  target: Bead,
+  index: BoardIndex,
+  at: ApplyMoment,
+): string | undefined {
   // The home's own state — settled, or owned by a run. Shared with the under-lock re-check in
   // `applyStep`, so the snapshot decision and the write refuse the same home for the same reason.
   //
@@ -267,10 +273,17 @@ function homeRefusal(target: Bead, index: BoardIndex, at: ApplyMoment): string |
     homeUnusable(target, at.nowMs) ??
     claimedSinceFiling(target, at, "hanging work under it", CLAIM_COST.home);
   if (gone) return gone;
-  // The same bar the detector proposes against: a home must be a BOARD CARD, or the move recreates
-  // the very state (work riding no card) the proposal exists to fix.
-  if (index.cards.ids.has(target.id)) return undefined;
-  return `${target.id} is not a board card — re-parenting under it would leave the work riding no card, which is the state this proposal is about`;
+  // Then the tier the taxonomy demands of a home, asked SUBJECT BY SUBJECT: a working-layer bead
+  // wants the board card that runs it, a card wants the container epic that groups it, and one
+  // cluster's members need not sit in the same tier.
+  for (const id of plan.subjects) {
+    const subject = index.byId.get(id);
+    // A subject that has left the board is `reparentSubject`'s refusal to name, not this one's.
+    if (!subject) continue;
+    const wrongTier = homeWrongTier(subject, target, index, HOME_STANDING.snapshot);
+    if (wrongTier) return wrongTier;
+  }
+  return undefined;
 }
 
 /** One step per subject that still has to move — the whole cluster, or the first refusal it hits. */
@@ -1067,6 +1080,54 @@ export function homeUnusable(home: Bead, nowMs: number): string | undefined {
   }
   if (isInFlight(home, nowMs)) return inFlightReason(home, nowMs, "hanging more work under it");
   return undefined;
+}
+
+/**
+ * How a home refusal DATES itself. The snapshot decision states a fact about the board it was handed;
+ * the write states a CHANGE, because the decision already cleared this very bar. One word, and it is
+ * the whole difference between the two readings of {@link homeWrongTier}.
+ */
+export const HOME_STANDING = { snapshot: "is not", locked: "is no longer" } as const;
+
+type HomeStanding = (typeof HOME_STANDING)[keyof typeof HOME_STANDING];
+
+/**
+ * Why the tier taxonomy will not let this home carry THIS subject, or undefined.
+ *
+ * The rule is not "cards only" but A HOME ONE TIER UP — `epic → feature → task|bug|chore`
+ * (beads/tiers.mjs): a working-layer bead wants the board card that runs it, and a CARD wants the
+ * container epic that groups it. Asking the card question of both is what refused every card move
+ * outright, and asking neither is what would write a move `anton board-check` then reports as a
+ * blocking violation.
+ *
+ * A card's home has to be a CONTAINER epic rather than any epic. An epic that groups no cards yet is
+ * a run target in its own right (`beads.isRunTarget`) and renders as a card, so landing a card under
+ * it demotes it: its own run is cancelled, and whatever tickets it carries are left beneath a card
+ * nothing will reach — `ticket-under-container-epic`, arrived at by approving a proposal. An epic
+ * that already groups cards plays that role, so the move is a pure addition to it.
+ *
+ * A subject that is NEITHER — a container epic, a `learning` — keeps the strictest bar, the board
+ * card anton required before this. Nothing proposes moving one, and inventing a tier for it here
+ * would be guessing.
+ *
+ * Shared by the snapshot decision and the under-lock re-check like every other bar in this module,
+ * so the write cannot hold a home to a laxer tier than the decision held it to.
+ */
+export function homeWrongTier(
+  subject: Bead,
+  home: Bead,
+  index: BoardIndex,
+  standing: HomeStanding,
+): string | undefined {
+  if (!index.cards.ids.has(subject.id)) {
+    if (index.cards.ids.has(home.id)) return undefined;
+    return `${home.id} ${standing} a board card — re-parenting under it would leave the work riding no card, which is the state this proposal is about`;
+  }
+  if (index.isContainer(home)) return undefined;
+  if (!beads.isEpic(home)) {
+    return `${home.id} ${standing} an epic and ${subject.id} is a board card — a card hangs off an epic and nothing else (\`feature-under-non-epic\`); both are run targets, so the move would ship the same work twice`;
+  }
+  return `${home.id} ${standing} a container epic — it groups no cards, so it is a run target in its own right, and landing ${subject.id} under it would demote it: its own run is cancelled and any ticket it carries is left beneath a card nothing will reach (\`ticket-under-container-epic\`)`;
 }
 
 /**

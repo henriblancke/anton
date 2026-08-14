@@ -27,7 +27,9 @@ import {
   EVIDENCE_PREMISE,
   home,
   homeClaimed,
+  HOME_STANDING,
   homeUnusable,
+  homeWrongTier,
   inFlightReason,
   list,
   missing,
@@ -138,14 +140,15 @@ function lockedBeads(step: ApplyStep): string[] {
  * The body is the checks in the order they have to run, each named for what it refuses. Four of them
  * buy a whole board read rather than trusting the snapshot: whether the subject still rides the
  * TICKET SET the step captured ({@link assertOwnerUnchanged}), whether a bead about to be SETTLED
- * still has open work under it ({@link assertNothingStranded}), whether a re-parent's home is still a
- * BOARD CARD ({@link assertHomeIsCard}), and whether the board still STATES the ordering a link rests
- * on ({@link assertOrderingStated}). All four earn it the same way — the write that flips the answer
- * is itself a locked write on a bead this step holds. Attaching work under a bead, and moving a bead
- * onto another card, are both re-parents, which take those beads' locks as subject and home; the one
- * home that can STOP being a card is a legacy epic, which stops the moment a feature lands under it —
- * that same locked write; and a link's evidence sits on the PAIR, whose bodies are edited under these
- * very locks (`ticket-detail.ts` `updateTicket`). So those writes genuinely order against each other.
+ * still has open work under it ({@link assertNothingStranded}), whether a re-parent's home is still
+ * the TIER its subject demands ({@link assertHomeFitsSubject}), and whether the board still STATES
+ * the ordering a link rests on ({@link assertOrderingStated}). All four earn it the same way — the
+ * write that flips the answer is itself a locked write on a bead this step holds. Attaching work
+ * under a bead, and moving a bead onto another card, are both re-parents, which take those beads'
+ * locks as subject and home; an epic's tier turns entirely on its feature children — it stops being
+ * a card, or stops being a container, the moment one lands under it or leaves it, that same locked
+ * write; and a link's evidence sits on the PAIR, whose bodies are edited under these very locks
+ * (`ticket-detail.ts` `updateTicket`). So those writes genuinely order against each other.
  * The rest of the board-wide topology stays with the snapshot — whether the edge closes a cycle —
  * because it rests on beads no lock taken here covers, so re-deriving it would buy a whole board
  * read and still guarantee nothing.
@@ -207,7 +210,7 @@ async function assertRetirementHolds(repo: string, step: ApplyStep): Promise<voi
 async function assertHomeHolds(repo: string, step: ApplyStep): Promise<void> {
   if (step.verb !== "reparent") return;
   const doing = `before re-parenting under ${step.parent}`;
-  assertHomeIsCard(step.parent, await lockedBoard(repo, doing));
+  assertHomeFitsSubject(step, await lockedBoard(repo, doing));
 }
 
 /**
@@ -332,23 +335,32 @@ function assertNothingStranded(id: string, board: BoardIndex): void {
 }
 
 /**
- * Refuse to hang work under a home that is no longer a BOARD CARD, judged from a board read taken
- * INSIDE the home's write lock rather than from the approval's snapshot.
+ * Refuse to hang work under a home the tier taxonomy will not let carry this SUBJECT — judged from a
+ * board read taken INSIDE the home's write lock rather than from the approval's snapshot, and
+ * through the same {@link homeWrongTier} the decision used.
  *
  * `planReparent` asks the same question of the snapshot, and against a lone approval that is enough.
- * What it cannot see is a CONCURRENT one: the only home that can stop being a card is a legacy epic,
- * and it stops the instant a FEATURE lands under it — a re-parent that takes this very epic's write
- * lock as its own home (see {@link applyStep}). So the two orders are already serialized, and
- * re-asking here is what makes the ordering mean something. Without it, both pass against snapshots
- * taken before either wrote, and this step attaches its subject directly to what is now a container
- * epic — work riding no card and reachable by no run, which is the state the proposal exists to fix.
+ * What it cannot see is a CONCURRENT one — and one write flips either tier: a legacy epic stops
+ * being a board card, and an epic stops being a container, the instant a FEATURE lands under it or
+ * leaves it, which is a re-parent taking this very epic's write lock as its own home or subject (see
+ * {@link applyStep}). So the two orders are already serialized, and re-asking here is what makes the
+ * ordering mean something. Without it, both pass against snapshots taken before either wrote, and
+ * this step lands its subject one tier off: work attached directly to a container epic, riding no
+ * card and reachable by no run — the state the proposal exists to fix — or a card hung under an epic
+ * the move demotes out of its own run.
  */
-function assertHomeIsCard(parentId: string, board: BoardIndex): void {
-  if (!board.cards.ids.has(parentId)) {
-    throw new SubjectMovedError(
-      `${parentId} is no longer a board card — re-parenting under it would leave the work riding no card, which is the state this proposal is about`,
-    );
-  }
+function assertHomeFitsSubject(
+  step: Extract<ApplyStep, { verb: "reparent" }>,
+  board: BoardIndex,
+): void {
+  // Both ends were re-read under their own locks already; these guard the whole-board read
+  // disagreeing with them, and say so the same way every other missing bead here does.
+  const subject = board.byId.get(step.id);
+  if (!subject) throw new SubjectMovedError(missing(step.id));
+  const home = board.byId.get(step.parent);
+  if (!home) throw new SubjectMovedError(missing(step.parent));
+  const wrongTier = homeWrongTier(subject, home, board, HOME_STANDING.locked);
+  if (wrongTier) throw new SubjectMovedError(wrongTier);
 }
 
 /**
