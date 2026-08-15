@@ -18,7 +18,13 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
 
-import { describeBd, makeBdRepo, saveEnv, type BdRepo } from "@/lib/testing/integration";
+import {
+  describeBd,
+  makeBdRepo,
+  nextBdSecond,
+  saveEnv,
+  type BdRepo,
+} from "@/lib/testing/integration";
 import { driveJob, expectJobStatus } from "@/lib/testing/jobs";
 import { beads, type Bead } from "../beads/bd";
 import { resetIssueSnapshots } from "../beads/snapshot";
@@ -97,6 +103,12 @@ describeBd("gardener armed pass e2e (real handler · real bd)", () => {
       defaultBranch: "main",
       settingsJson: JSON.stringify({ proposalAutonomy: { "shipped-orphan": "apply" } }),
     });
+
+    // The subject was written a heartbeat ago, and this pass both files the ask and applies it: an
+    // apply is only allowed when the subject's write can be ordered BEFORE the board read behind it
+    // (apply-plan.ts `writtenSinceFiling`), which a shared stamp second makes impossible. A real
+    // patrol judges commits from hours ago; only this fixture is fast enough to tie.
+    await nextBdSecond();
 
     await expectJobStatus(tdb.db, await runPatrol(), "done");
     afterFirst = await boardBytes();
