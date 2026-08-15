@@ -26,9 +26,11 @@
  * hangs on a gate, so both verbs close the gate as well as acting on the work. Resume is
  * resolve-and-resume — "I did it, carry on" — and closes the gate FIRST, because execute-epic
  * re-reads the board and a run enqueued against an open gate simply parks on the same wait again. For
- * the same reason it resumes only once the gate it closed was the LAST thing holding the target (see
- * {@link stillBlocked}); a second wait still open means the founder's answer ends that one wait and
- * nothing more.
+ * the same reason it resumes only once the whole board says the target may run — the automatic path's
+ * own dispatch rule, not a subset of it (see {@link heldBack}); anything else still holding it means
+ * the founder's answer ends that one wait and nothing more. A resume that DOES land marks the gate
+ * handed back ({@link markGateResumed}), because a closed gate is otherwise re-dispatched by
+ * gate-check forever.
  * Abandon closes the gate LAST, after the bead: a gate that closes over an open bead hands the work
  * straight back to gate-check's own resume, which is the opposite of an abandon. Either way the gate
  * must close, because it is not on the bead's lifecycle — left open it keeps `detectOpenHumanGates`
@@ -50,9 +52,10 @@ import { beads, isMissingBeadError } from "./beads/bd";
 import { loadAllIssues } from "./beads/issues";
 import { nudgeSync } from "./beads/sync-nudge";
 import { getEscalation, settleEscalation, toEscalationView } from "./escalations";
-import { openBlockersOf } from "./jobs/gate-targets";
+import { GATE_RESUMED_LABEL, undispatchableReason } from "./jobs/gate-targets";
 import { cancelJob, resumeJob, resumeStalledEpic, runIsLiveForTarget } from "./jobs/service";
 import { getJob, systemClock } from "./jobs/queue";
+import { resolveOperator } from "./operator";
 import { settleParkedRun } from "./runs";
 import { MAX_ABANDON_REASON_CHARS } from "./types";
 import type { Bead } from "./beads/bd";
@@ -390,47 +393,83 @@ async function answerGateWait(
   }
   await resolveGate(project, gateId, gateReason(view, action));
   if (!target) return "gate-resolved";
-  if (await stillBlocked(project, target)) return "gate-still-blocked";
+  const held = await heldBack(project, target);
+  if (held) {
+    const note =
+      `[unstick] gate resolved on ${target}, but ${held.reason} — not resuming; gate-check ` +
+      `dispatches it once the board reads clear`;
+    // A board that didn't answer is an anomaly worth the louder level; a board that answered "not
+    // yet" is the feature working.
+    if (held.unread) console.warn(note);
+    else console.info(note);
+    return "gate-still-blocked";
+  }
   // Reuses the automatic path's own verb, so a resolve-and-resume and a gate-check resume of the
   // same target are the same idempotent call — whichever lands second is absorbed as a no-op.
-  return resumeStalledEpic(project.id, target);
+  const outcome = await resumeStalledEpic(project.id, target);
+  await markGateResumed(project, gateId);
+  return outcome;
 }
 
 /**
- * Is anything OTHER than the gate just closed still holding this target? A target can carry two open
- * human gates, or one gate plus an ordinary `blocks` edge — and each of those raises its own
- * escalation naming the SAME run target. Answering one and resuming would enqueue work execute-epic
- * then refuses: it re-checks the target's blockers at job start and PARKS on the ones still open,
- * turning an intentional wait into a job needing another human answer. The automatic path tests
- * exactly this before dispatching (`isDispatchableTarget`); this is that rule on the manual path.
+ * Why the board says this target must NOT be re-enqueued after the gate closed — undefined when it
+ * may be. The whole dispatch rule, not just the blockers: a target can carry a second open human
+ * gate, but it can equally be unapproved, abandoned, already in review, or claimed by another
+ * operator, and each of those raises the very same "waiting on you" row. Resuming any of them
+ * enqueues work execute-epic then refuses at job start — a poison job for work the founder never
+ * approved, or a run queued on a machine that doesn't own it. So the manual path applies the
+ * automatic path's own predicate ({@link undispatchableReason}), rather than a looser subset of it.
+ *
+ * Liveness is judged upstream instead ({@link readTargetState}), which exempts THIS escalation's own
+ * stalled run — the lease clause of the automatic rule cannot tell that leftover from a foreign
+ * holder, and would refuse the resume being asked for.
  *
  * Holding is not a lost resume: the gate is closed and unmarked, which is precisely what gate-check's
- * `plainGateResumes` dispatches once the last blocker lands. So the wait ends when the founder says it
- * does, and the run starts when the board says it may.
+ * `plainGateResumes` dispatches once the board clears — on whichever machine may run it. So the wait
+ * ends when the founder says it does, and the run starts when the board says it may.
  *
- * FAILS SAFE to blocked — a board read that didn't land proves nothing about the way being clear, and
- * every blocker helper reads an unknown blocker as open. The cost of being wrong that way is one pass
- * of delay; the other way is a parked job.
+ * FAILS SAFE to held — a board read that didn't land proves nothing about the way being clear. The
+ * cost of being wrong that way is one pass of delay; the other way is a parked job.
  */
-async function stillBlocked(project: Project, target: string): Promise<boolean> {
+async function heldBack(project: Project, target: string): Promise<HeldBack | undefined> {
   // `loadAllIssues`, not a bare `bd list`: bd omits gate beads from ordinary listings, and a second
   // gate is exactly the blocker this question exists for — an unread one would answer "clear".
   const board = await loadAllIssues(project.repoPath, { strictGates: true }).catch(() => undefined);
   const bead = board?.find((b) => b.id === target);
-  if (!board || !bead) {
-    console.warn(
-      `[unstick] could not confirm ${target} is unblocked after resolving its gate — not resuming; ` +
-        `gate-check dispatches it once the board reads clear`,
-    );
-    return true;
+  if (!board || !bead) return { reason: "its board row could not be read", unread: true };
+  const reason = undispatchableReason(board, bead, await resolveOperator());
+  return reason ? { reason } : undefined;
+}
+
+/** Why the resume is held, and whether that answer came from the board or from failing to read it. */
+interface HeldBack {
+  reason: string;
+  unread?: boolean;
+}
+
+/**
+ * Mark the gate as handed back, exactly as gate-check's `dispatchReleased` does after its own
+ * dispatch — and for the same reason: a resolved gate stays on its bead FOREVER, so an unmarked one
+ * is re-dispatched by `plainGateResumes` on every later pass. Unmarked, a resume the founder made
+ * here would be re-run every ten minutes, retrying a run that has since parked or failed on the exact
+ * failure the founder was answering.
+ *
+ * Only after the resume LANDS. A resume that was held back, or that threw, leaves the gate unmarked
+ * on purpose: that closed-and-unmarked gate is what makes those cases gate-check's to recover (see
+ * the module note).
+ *
+ * A failed mark is logged, not thrown — the resume happened, and failing the action would report
+ * otherwise. The cost is one redundant gate-check dispatch, which `resumeEpic` absorbs; the same
+ * trade gate-check itself makes. The mark is a SHARED-board write, so it is pushed like the gate
+ * close it follows: unpushed, a second anton reading this board re-dispatches anyway.
+ */
+async function markGateResumed(project: Project, gateId: string): Promise<void> {
+  try {
+    await beads.tag(project.repoPath, gateId, [GATE_RESUMED_LABEL]);
+    nudgeSync(project, "gate-resumed");
+  } catch (e) {
+    console.error(`[unstick] failed to mark gate ${gateId} as handed back:`, e);
   }
-  const blockers = openBlockersOf(board, bead);
-  if (blockers.length === 0) return false;
-  console.info(
-    `[unstick] gate resolved on ${target}, but it is still blocked by ${blockers.join(", ")} — ` +
-      `not resuming; gate-check dispatches it once they clear`,
-  );
-  return true;
 }
 
 /** What bd records on the gate: which answer ended the wait, traceable back to the row that asked. */

@@ -12,6 +12,7 @@ import { eq } from "drizzle-orm";
 
 import { makeFileDb, type FileDb } from "@/lib/testing/integration";
 import { LABELS, type Bead } from "./beads/bd";
+import { GATE_RESUMED_LABEL } from "./jobs/gate-targets";
 import type { RunHealthFinding } from "./run-health";
 import type { Project } from "./types";
 
@@ -58,6 +59,7 @@ vi.mock("./abandon", async () => {
 const beadsPull = vi.fn<(repoPath: string) => Promise<void>>();
 const beadsShow = vi.fn<(repoPath: string, id: string) => Promise<Bead>>();
 const gateResolve = vi.fn<(repoPath: string, id: string, reason?: string) => Promise<string>>();
+const beadsTag = vi.fn<(repoPath: string, id: string, labels: string[]) => Promise<unknown>>();
 vi.mock("./beads/bd", async () => {
   const actual = await vi.importActual<typeof import("./beads/bd")>("./beads/bd");
   return {
@@ -67,9 +69,17 @@ vi.mock("./beads/bd", async () => {
       pull: (...args: [string]) => beadsPull(...args),
       show: (...args: [string, string]) => beadsShow(...args),
       gateResolve: (...args: [string, string, string?]) => gateResolve(...args),
+      tag: (...args: [string, string, string[]]) => beadsTag(...args),
     },
   };
 });
+
+// The ownership half of the dispatch rule reads this machine's identity; pinned so a test box's git
+// config can't decide whether a claimed target is "ours".
+vi.mock("./operator", () => ({
+  resolveOperator: async () => "alice",
+  resetOperatorCache: () => {},
+}));
 
 // The blocker re-check a resolve-and-resume runs before it re-queues anything reads the whole board.
 // Stubbed to a board where the gate just closed was the last thing holding the target, so each test
@@ -132,11 +142,16 @@ beforeEach(() => {
   beadsPull.mockResolvedValue(undefined);
   beadsShow.mockResolvedValue(bead());
   gateResolve.mockResolvedValue("✓ Gate resolved");
+  beadsTag.mockResolvedValue(undefined);
   loadAllIssues.mockResolvedValue([bead()]);
 });
 
-/** The epic bead the re-check reads the run-lease off; unlabelled means nobody is running it. */
-function bead(labels: string[] = []): Bead {
+/**
+ * The epic bead the re-check reads the run-lease off; no run-lease label means nobody is running it.
+ * Approved by default because that is what a run target anton would dispatch looks like — the gate
+ * resume applies the automatic path's full dispatch rule, which refuses unapproved work.
+ */
+function bead(labels: string[] = [LABELS.approved]): Bead {
   return { id: "anton-e1", title: "epic", status: "open", labels } as Bead;
 }
 
@@ -911,6 +926,107 @@ describe("actOnEscalation — a wait on a person", () => {
     expect(rowOf(escalation.id)).toMatchObject({ status: "resolved", resolution: "resumed" });
   });
 
+  it("refuses to resume work the founder never approved", async () => {
+    // A human gate can be hung on ANY bead, so this row can name an unapproved run target — and
+    // execute-epic's own claim check refuses one, which would turn the founder's click into a poison
+    // job. The wait still ends; the run waits for the approval.
+    loadAllIssues.mockResolvedValue([{ ...bead([]) } as Bead]);
+    const escalation = await openGateWait();
+
+    expect(await actOnEscalation(project, escalation.id, "resume")).toMatchObject({
+      ok: true,
+      detail: "gate-still-blocked",
+    });
+    expect(gateResolve).toHaveBeenCalled();
+    expect(resumeStalledEpic).not.toHaveBeenCalled();
+    expect(beadsTag).not.toHaveBeenCalled();
+  });
+
+  it("refuses to resume a target another operator holds", async () => {
+    // The board is shared but jobs are machine-local: queueing here would race the machine that
+    // actually claimed the work. Its own gate-check picks the closed, unmarked gate up instead.
+    loadAllIssues.mockResolvedValue([{ ...bead(), assignee: "bob" } as Bead]);
+
+    expect(await actOnEscalation(project, (await openGateWait()).id, "resume")).toMatchObject({
+      ok: true,
+      detail: "gate-still-blocked",
+    });
+    expect(resumeStalledEpic).not.toHaveBeenCalled();
+  });
+
+  it("refuses to resume a target whose PR is already in review", async () => {
+    // Its implementation is done; a fresh execute-epic reaches the PR short-circuit and exits, while
+    // the merge path owns what happens next.
+    loadAllIssues.mockResolvedValue([bead([LABELS.approved, LABELS.stage("in-review")])]);
+
+    expect(await actOnEscalation(project, (await openGateWait()).id, "resume")).toMatchObject({
+      ok: true,
+      detail: "gate-still-blocked",
+    });
+    expect(resumeStalledEpic).not.toHaveBeenCalled();
+  });
+
+  it("marks the gate handed back once the resume lands, and pushes the mark", async () => {
+    // A resolved gate stays on its bead forever, so without the marker gate-check's `plainGateResumes`
+    // re-dispatches this same target every ten minutes — re-running a resume the founder made once.
+    await actOnEscalation(project, (await openGateWait()).id, "resume");
+
+    expect(beadsTag).toHaveBeenCalledWith(project.repoPath, "g-1", [GATE_RESUMED_LABEL]);
+    expect(beadsTag.mock.invocationCallOrder[0]).toBeGreaterThan(
+      resumeStalledEpic.mock.invocationCallOrder[0]!,
+    );
+    expect(nudgeSync).toHaveBeenCalledWith(project, "gate-resumed");
+  });
+
+  it("leaves the gate unmarked when the resume was held back", async () => {
+    // The unmarked gate IS the recovery: gate-check dispatches it once the remaining blocker lands.
+    loadAllIssues.mockResolvedValue([
+      {
+        ...bead(),
+        dependencies: [{ issue_id: "anton-e1", depends_on_id: "g-2", type: "blocks" }],
+      } as Bead,
+      { id: "g-2", title: "Gate: human", issue_type: "gate", status: "open" } as Bead,
+    ]);
+
+    await actOnEscalation(project, (await openGateWait()).id, "resume");
+
+    expect(beadsTag).not.toHaveBeenCalled();
+  });
+
+  it("leaves the gate unmarked when the resume failed", async () => {
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    resumeStalledEpic.mockRejectedValue(new Error("runner refused: project is being deleted"));
+
+    await expect(
+      actOnEscalation(project, (await openGateWait()).id, "resume"),
+    ).rejects.toThrow("runner refused");
+
+    // Marking here would strand the work: the resume never landed, and the mark is what stops
+    // gate-check from being the thing that recovers it.
+    expect(beadsTag).not.toHaveBeenCalled();
+    logged.mockRestore();
+  });
+
+  it("reports the resume as done even when the mark could not be written", async () => {
+    // The resume LANDED. Failing the action would claim otherwise; the cost of an unwritten mark is
+    // one redundant gate-check dispatch, which `resumeEpic` absorbs.
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    beadsTag.mockRejectedValue(new Error("bd: database is locked"));
+
+    expect(await actOnEscalation(project, (await openGateWait()).id, "resume")).toMatchObject({
+      ok: true,
+      detail: "enqueued",
+    });
+    expect(logged.mock.calls[0]?.[0]).toContain("g-1");
+    logged.mockRestore();
+  });
+
+  it("does not mark the gate on abandon — the work is closed, not handed back", async () => {
+    await actOnEscalation(project, (await openGateWait()).id, "abandon");
+
+    expect(beadsTag).not.toHaveBeenCalled();
+  });
+
   it("holds the resume when the board read that would clear it fails", async () => {
     // An unread board is no evidence the way is clear, and every blocker helper reads an unknown
     // blocker as open. Costs one gate-check pass of delay; resuming costs a parked job.
@@ -1044,16 +1160,18 @@ describe("actOnEscalation — a wait on a person", () => {
     );
   });
 
-  it("pushes nothing when the gate was already settled by someone else", async () => {
-    // bd refused and the gate is closed anyway: no write of ours landed, so there is nothing here to
-    // propagate — whoever closed it owns pushing it.
+  it("pushes no CLOSE when the gate was already settled by someone else", async () => {
+    // bd refused and the gate is closed anyway: no close of ours landed, so there is nothing of the
+    // close to propagate — whoever closed it owns pushing it. The hand-back mark is ours either way,
+    // and the resume it records happened here.
     gateResolve.mockRejectedValue(new Error("bd: gate already resolved"));
     showsGateAs(closedGate());
 
     expect(await actOnEscalation(project, (await openGateWait()).id, "resume")).toMatchObject({
       ok: true,
     });
-    expect(nudgeSync).not.toHaveBeenCalled();
+    expect(nudgeSync).not.toHaveBeenCalledWith(project, "gate-resolve");
+    expect(nudgeSync.mock.calls).toEqual([[project, "gate-resumed"]]);
   });
 
   it("still refuses when the board says another machine picked the work back up", async () => {

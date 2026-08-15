@@ -57,6 +57,7 @@ describeBd("resolve-and-resume against a real human gate", () => {
   let raiseEscalation: typeof import("./escalations").raiseEscalation;
   let actOnEscalation: typeof import("./escalation-actions").actOnEscalation;
   let resetIssueSnapshots: typeof import("./beads/snapshot").resetIssueSnapshots;
+  let GATE_RESUMED_LABEL: typeof import("./jobs/gate-targets").GATE_RESUMED_LABEL;
 
   const HOUR = 3_600_000;
   const clock = { now: () => Date.now() };
@@ -73,15 +74,24 @@ describeBd("resolve-and-resume against a real human gate", () => {
   const statusOf = (id: string): string =>
     (JSON.parse(bd(["show", id, "--json"])) as { status: string }[])[0]!.status;
 
+  const labelsOf = (id: string): string[] =>
+    (JSON.parse(bd(["show", id, "--json"])) as { labels?: string[] }[])[0]!.labels ?? [];
+
   interface GatedWork {
     target: string;
     ticket: string;
     gate: string;
   }
 
-  /** What `bd gate create --blocks <ticket>` leaves behind: a run target, its ticket, and the wait. */
+  /**
+   * What `bd gate create --blocks <ticket>` leaves behind: a run target, its ticket, and the wait.
+   * The target is APPROVED — the resume applies the automatic path's full dispatch rule, which
+   * refuses work the founder never approved.
+   */
   function seedGatedWork(): GatedWork {
-    const target = createdId(bd(["create", "ship the thing", "--type", "feature", "--json"]));
+    const target = createdId(
+      bd(["create", "ship the thing", "--type", "feature", "--label", "approved", "--json"]),
+    );
     const ticket = createdId(
       bd(["create", "do the thing", "--type", "task", "--deps", `parent-child:${target}`, "--json"]),
     );
@@ -133,6 +143,7 @@ describeBd("resolve-and-resume against a real human gate", () => {
     ({ raiseEscalation } = await import("./escalations"));
     ({ actOnEscalation } = await import("./escalation-actions"));
     ({ resetIssueSnapshots } = await import("./beads/snapshot"));
+    ({ GATE_RESUMED_LABEL } = await import("./jobs/gate-targets"));
 
     project = {
       id: "p1",
@@ -170,8 +181,14 @@ describeBd("resolve-and-resume against a real human gate", () => {
     expect(a.ok ? b : a).toEqual({ ok: false, reason: "not-open" });
     expect(statusOf(work.gate)).toBe("closed");
     expect(resumeStalledEpic.mock.calls).toEqual([[project.id, work.target]]);
-    // The close is a board write like any other: the losing click pushes nothing, the winner must.
-    expect(nudgeSync.mock.calls).toEqual([[project, "gate-resolve"]]);
+    // A resolved gate stays on its bead forever, so the hand-back marker is what stops gate-check
+    // re-dispatching this same target on every later pass.
+    expect(labelsOf(work.gate)).toContain(GATE_RESUMED_LABEL);
+    // Both are board writes like any other: the losing click pushes nothing, the winner pushes each.
+    expect(nudgeSync.mock.calls).toEqual([
+      [project, "gate-resolve"],
+      [project, "gate-resumed"],
+    ]);
     expect(rowOf(escalation.id)).toMatchObject({ status: "resolved", resolution: "resumed" });
   });
 
@@ -218,6 +235,9 @@ describeBd("resolve-and-resume against a real human gate", () => {
     expect(statusOf(work.gate)).toBe("closed");
     expect(statusOf(second)).not.toBe("closed");
     expect(resumeStalledEpic).not.toHaveBeenCalled();
+    // Unmarked on purpose: that closed-and-unmarked gate is exactly what gate-check dispatches once
+    // the second wait clears, so holding here defers the run rather than losing it.
+    expect(labelsOf(work.gate)).not.toContain(GATE_RESUMED_LABEL);
     expect(rowOf(escalation.id)).toMatchObject({ status: "resolved", resolution: "resumed" });
   });
 
@@ -231,9 +251,10 @@ describeBd("resolve-and-resume against a real human gate", () => {
       "runner refused",
     );
 
-    // The row is spent, but nothing is stranded: the gate is closed over runnable work, which is
-    // exactly what gate-check's `plainGateResumes` dispatches on its next pass.
+    // The row is spent, but nothing is stranded: the gate is closed over runnable work AND unmarked,
+    // which is exactly what gate-check's `plainGateResumes` dispatches on its next pass.
     expect(statusOf(work.gate)).toBe("closed");
+    expect(labelsOf(work.gate)).not.toContain(GATE_RESUMED_LABEL);
     expect(statusOf(work.ticket)).not.toBe("closed");
     expect(rowOf(escalation.id)).toMatchObject({ status: "resolved", resolution: "resumed" });
     expect(logged.mock.calls[0]?.[0]).toContain(escalation.id);

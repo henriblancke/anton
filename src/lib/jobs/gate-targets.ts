@@ -12,9 +12,10 @@
  *     bead, which never appears there before or after it closes.
  *   • {@link mergedGateTargets} — the in-review targets whose `gh:pr` merge wait has closed.
  *
- * They share one dispatchability rule ({@link isDispatchableTarget} / {@link isResumableTarget}), and
- * that sharing is load-bearing: the three paths read the same board, so a target the founder never
- * approved — or one another operator holds — must be refused identically by all of them.
+ * They share one dispatchability rule ({@link isDispatchableTarget}, whose board-derived half
+ * {@link undispatchableReason} the MANUAL resolve-and-resume applies too), and that sharing is
+ * load-bearing: every path reads the same board, so a target the founder never approved — or one
+ * another operator holds — must be refused identically by all of them.
  */
 import { beads, LABELS, type Bead, type GatedMolecule } from "../beads/bd";
 import { isPipelineArtifact } from "../beads/contract";
@@ -84,19 +85,26 @@ export function runTargetAbove(board: Bead[], startId: string): Bead | undefined
 }
 
 /**
- * May this pass re-dispatch `target`? Approval is the load-bearing check: discovery comes from the
- * board, so a gate someone hung on unapproved work must never turn into a run — the founder decides
- * what executes, and a gate closing is not that decision. The rest is hygiene: finished or abandoned
- * work isn't resumed, and a target carrying an UNEXPIRED run-lease is already executing somewhere
- * (possibly another machine, which the local job table cannot see).
+ * Why the target's own row says it may not run, ignoring both the board around it and run-liveness —
+ * the clauses {@link isResumableTarget} and {@link undispatchableReason} share. Approval is the
+ * load-bearing one: discovery comes from the board, so a gate someone hung on unapproved work must
+ * never turn into a run — the founder decides what executes, and a gate closing is not that
+ * decision. The rest is hygiene: finished or abandoned work isn't resumed.
+ */
+function unrunnableReason(target: Bead): string | undefined {
+  if (!beads.isApproved(target)) return "it is not approved";
+  if (beads.isAbandoned(target)) return "it was abandoned";
+  if (target.status === "closed") return "it is closed";
+  return undefined;
+}
+
+/**
+ * May this pass re-dispatch `target`? Its own row must allow it ({@link unrunnableReason}), and it
+ * must carry no UNEXPIRED run-lease — one that does is already executing somewhere (possibly another
+ * machine, which the local job table cannot see).
  */
 export function isResumableTarget(target: Bead, nowMs: number): boolean {
-  return (
-    beads.isApproved(target) &&
-    !beads.isAbandoned(target) &&
-    target.status !== "closed" &&
-    !beads.isRunLive(target, nowMs)
-  );
+  return unrunnableReason(target) === undefined && !beads.isRunLive(target, nowMs);
 }
 
 /**
@@ -104,11 +112,8 @@ export function isResumableTarget(target: Bead, nowMs: number): boolean {
  * (epic/feature) takes them from the epic-graph rollup plus the standalone prerequisites the rollup
  * drops, a standalone task/bug from its own `blocks` edges. Anything looser here would dispatch work
  * execute-epic then refuses, turning a wait into a parked job a human has to clear.
- *
- * Exported because the MANUAL resolve-and-resume runs the identical risk: closing one of a target's
- * two gates and re-enqueueing it parks the run just the same (see escalation-actions.ts).
  */
-export function openBlockersOf(board: Bead[], target: Bead): string[] {
+function openBlockersOf(board: Bead[], target: Bead): string[] {
   return isUnit(target)
     ? [
         ...(computeEpicGraph(board).epics.find((n) => n.id === target.id)?.blockedBy ?? []),
@@ -118,7 +123,8 @@ export function openBlockersOf(board: Bead[], target: Bead): string[] {
 }
 
 /**
- * The full test both resume halves apply to a target a closed gate names. Beyond resumability:
+ * Why a target a closed gate names may not be re-dispatched, by every clause ONE BOARD READ answers
+ * — undefined when it may. Beyond the target's own row ({@link unrunnableReason}):
  *
  *   • the target is THIS OPERATOR'S (unclaimed, or claimed by it) — the anton-zoh test. The board is
  *     SHARED and this schedule is machine-local, so every instance sees the same gate close;
@@ -132,8 +138,30 @@ export function openBlockersOf(board: Bead[], target: Bead): string[] {
  *     pass would resume and re-park it. Holding costs nothing: the entry is still there when the
  *     blocker lands. (A closed gate is `done`, so it never counts against its own release.)
  *
+ * Exported because the MANUAL resolve-and-resume runs every one of those risks identically (see
+ * escalation-actions.ts): a target the founder never approved, one another operator holds, one
+ * already in review, or one a SECOND gate still blocks is no more runnable because a human clicked
+ * than because a gate closed. Run-liveness is deliberately NOT here — the manual path judges that
+ * against the stalled run's OWN lease, which `isRunLive` cannot tell from a foreign holder and would
+ * refuse the very resume being asked for. The reason is prose so a refusal can say WHICH clause held
+ * it: a resume that reports nothing is indistinguishable from one that never ran.
+ *
  * Blockers last: the rollup is a whole-board walk, and the cheap tests reject most targets first.
  */
+export function undispatchableReason(
+  board: Bead[],
+  target: Bead,
+  operator: string | undefined,
+): string | undefined {
+  const unrunnable = unrunnableReason(target);
+  if (unrunnable) return unrunnable;
+  if (!ownedByOperator(target, operator)) return `it is claimed by ${target.assignee}`;
+  if (hasLabel(target, IN_REVIEW)) return "its PR is in review";
+  const blockers = openBlockersOf(board, target);
+  return blockers.length > 0 ? `it is still blocked by ${blockers.join(", ")}` : undefined;
+}
+
+/** The full test every resume half applies: the board allows it AND no run holds it right now. */
 function isDispatchableTarget(
   board: Bead[],
   target: Bead,
@@ -141,10 +169,7 @@ function isDispatchableTarget(
   operator: string | undefined,
 ): boolean {
   return (
-    isResumableTarget(target, nowMs) &&
-    ownedByOperator(target, operator) &&
-    !hasLabel(target, IN_REVIEW) &&
-    openBlockersOf(board, target).length === 0
+    !beads.isRunLive(target, nowMs) && undispatchableReason(board, target, operator) === undefined
   );
 }
 
