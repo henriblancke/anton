@@ -249,8 +249,11 @@ export function formatContractReport(report: ContractReport, label = ""): string
     lines.push(
       "",
       "FORM — sections the description itself does not carry. Never blocking, never in the exit code:",
-      "the gate reads acceptance from bd's field too, so a form gap alone never withholds a run — but a",
-      "bead listed BLOCKING above is refused all the same.",
+      "the gate reads acceptance from bd's field too, so a form gap alone never withholds a run" +
+        // The BLOCKING caveat only reads as one when there is a BLOCKING list above to point at; on a
+        // clean board it contradicts the "No violations" headline the operator just read.
+        (report.blocking > 0 ? " — but a" : "."),
+      ...(report.blocking > 0 ? ["bead listed BLOCKING above is refused all the same."] : []),
       "",
     );
     for (const row of report.form.rows) {

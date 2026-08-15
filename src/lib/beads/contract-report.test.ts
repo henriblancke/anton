@@ -308,6 +308,16 @@ describe("formatContractReport", () => {
     expect(text).toContain("No violations.");
     expect(text).toContain("form     0/1 descriptions carry every section (0%)");
     expect(text).toContain("anton-a  [task/open]");
+    expect(text).toContain("a form gap alone never withholds a run.");
+    expect(text).not.toContain("BLOCKING above");
+  });
+
+  it("keeps the BLOCKING caveat only when a bead is listed BLOCKING above", () => {
+    const text = formatContractReport(
+      buildContractReport([ticket({ id: "anton-a", acceptance_criteria: undefined })]),
+    );
+    expect(text).toContain("BLOCKING 1 across 1 bead(s)");
+    expect(text).toContain("bead listed BLOCKING above is refused all the same.");
   });
 
   it("says nothing about form when every description carries the contract", () => {
