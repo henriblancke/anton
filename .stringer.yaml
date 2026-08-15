@@ -1,0 +1,16 @@
+# stringer config for this repo. Read from the repo root on every scan, including the nightly
+# `stringer scan --delta` anton drives (src/lib/stringer.ts) — which runs from anton's own cwd, not
+# the repo's, and still picks this up.
+#
+# Only what this repo's conventions make stringer wrong about goes here. Everything else stays at
+# stringer's defaults; the scan's build/cache excludes are anton's DEFAULT_SCAN_EXCLUDES.
+collectors:
+  patterns:
+    # `*.fixture.ts` is a TEST-SUPPORT module: the shared seam and fixture builders the adjacent
+    # `*.test.ts` suites are written against (e.g. gardener/apply.fixture.ts, exercised by all three
+    # apply suites). It has no suite of its own BY DESIGN, so `missing-tests` reports it as a testless
+    # module every full scan — a false signal the triage then has to spend a bead deciding about.
+    # Globs match on the basename, so this reaches fixtures at any depth (a `**/`-prefixed pattern
+    # would silently match nothing — same dialect as the scan's --exclude).
+    exclude_patterns:
+      - "*.fixture.ts"
