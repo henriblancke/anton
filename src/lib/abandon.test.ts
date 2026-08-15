@@ -9,6 +9,7 @@ const abandonAllMock = vi.fn();
 const noteMock = vi.fn();
 const cancelRunMock = vi.fn();
 const runIsLiveMock = vi.fn<(projectId: string, epicBeadId: string) => boolean>();
+const pullMock = vi.fn();
 
 vi.mock("./beads/bd", async () => {
   const actual = await vi.importActual<typeof import("./beads/bd")>("./beads/bd");
@@ -20,6 +21,7 @@ vi.mock("./beads/bd", async () => {
       list: (...args: unknown[]) => listMock(...args),
       abandonAll: (...args: unknown[]) => abandonAllMock(...args),
       note: (...args: unknown[]) => noteMock(...args),
+      pull: (...args: unknown[]) => pullMock(...args),
       sync: vi.fn().mockResolvedValue(undefined),
     },
   };
@@ -133,6 +135,7 @@ describe("abandonTicket cascade", () => {
     noteMock.mockReset().mockResolvedValue(undefined);
     cancelRunMock.mockReset().mockResolvedValue(false);
     runIsLiveMock.mockReset().mockReturnValue(false);
+    pullMock.mockReset().mockResolvedValue(undefined);
   });
 
   /** The route hit by a direct API call on a feature id — the path the UI's epic deep-link skips. */
@@ -394,6 +397,7 @@ describe("abandonTicket with requireStopped", () => {
     noteMock.mockReset().mockResolvedValue(undefined);
     cancelRunMock.mockReset().mockResolvedValue(false);
     runIsLiveMock.mockReset().mockReturnValue(false);
+    pullMock.mockReset().mockResolvedValue(undefined);
   });
 
   it("refuses at the cancel boundary when the run restarted, writing nothing", async () => {
@@ -534,6 +538,54 @@ describe("abandonTicket with requireStopped", () => {
 
       expect(cancelRunMock.mock.calls).toEqual([["p1", "feature-new"]]);
       expect(soleAbandonedIds()).toEqual(["t1"]);
+      // The plain abandon reads no lease, so it pays no pull.
+      expect(pullMock).not.toHaveBeenCalled();
+    });
+
+    // bd answers `list`/`show` from the LOCAL Dolt working set, and the caller's pull is several
+    // awaits back (a gate close, the escalation settle). Without a pull of its own this boundary
+    // derives the FORMER run target, finds no lease on it, and closes the ticket underneath the
+    // reparented target's live foreign run.
+    it("pulls first, so the reparent it judges is the one the remote already has", async () => {
+      const under = (parent: string) => makeBead({ id: "t1", parent });
+      const boardWith = (ticket: Bead) => [
+        makeBead({ id: "feature-old", issue_type: "feature", parent: "epic" }),
+        makeBead({
+          id: "feature-new",
+          issue_type: "feature",
+          parent: "epic",
+          labels: [liveLease("run-elsewhere")],
+        }),
+        ticket,
+      ];
+      // The mirror only learns of the move — and so of the lease that matters — through the pull.
+      let pulled = false;
+      pullMock.mockImplementation(async () => {
+        pulled = true;
+      });
+      showMock.mockImplementation(async () => under(pulled ? "feature-new" : "feature-old"));
+      listMock.mockImplementation(async () => boardWith(under(pulled ? "feature-new" : "feature-old")));
+
+      await expect(
+        abandonTicket(project, "t1", "won't do", { requireStopped: true }),
+      ).rejects.toThrow(/another machine/);
+      expect(abandonAllMock).not.toHaveBeenCalled();
+      expect(cancelRunMock).not.toHaveBeenCalled();
+    });
+
+    // Fail closed, like readTargetState and gateDispatch on the same read: an unread board is not a
+    // clear one, and nothing has been written yet, so refusing costs only a retry.
+    it("refuses when the pull fails — an unread board can't rule out a foreign run", async () => {
+      reparented([]);
+      pullMock.mockRejectedValue(new Error("remote unreachable"));
+
+      await expect(
+        abandonTicket(project, "t1", "won't do", { requireStopped: true }),
+      ).rejects.toThrow(/shared board could not be re-read/);
+      // Refused before it read anything off the stale mirror, let alone wrote.
+      expect(showMock).not.toHaveBeenCalled();
+      expect(listMock).not.toHaveBeenCalled();
+      expect(abandonAllMock).not.toHaveBeenCalled();
     });
   });
 });

@@ -115,7 +115,8 @@ interface StoppedWork {
  * not always the ancestor the caller's own lease check froze, and a run holding the new one is
  * invisible to the machine-local job table. So the shared board's run-lease is re-read on whatever
  * this abandon actually kills — the target and every cascaded descendant — off the same board read
- * the cascade is planned from.
+ * the cascade is planned from, which {@link refreshSharedBoard} pulls first so both the parentage
+ * and the lease are the remote's current answer rather than the local mirror's.
  *
  * Refusing before any write, rather than skipping the cancel, is deliberate: closing the bead while
  * its agent keeps running is the same wrong answer one step later.
@@ -178,6 +179,34 @@ async function stopDescendantRuns(
 }
 
 const messageOf = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
+/**
+ * Refresh shared state before an abandon that judges another machine's run-lease (anton-mivh).
+ *
+ * `requireStopped` is a statement about CURRENT shared state, and the board read it rests on is
+ * local: bd answers `list`/`show` from the Dolt working set, which trails the remote by a sync
+ * heartbeat. The caller's own pull ({@link readTargetState in escalation-actions}) is several awaits
+ * back — a gate close, the escalation settle — so a reparent-plus-run that landed elsewhere inside
+ * that window is invisible to the read below. {@link runTargetOf} would then derive the FORMER
+ * target, find no lease on it, and let the abandon close the ticket underneath the new target's live
+ * foreign run. Pulling HERE is what makes the boundary check answer for the board as it is, the same
+ * pull `gateDispatch` makes before its own last-look liveness read.
+ *
+ * FAILS CLOSED, exactly as both of those reads do: a pull that didn't land leaves shared state
+ * unread, which is not evidence of a clear board. Nothing has been written at this point, so refusing
+ * costs a retry — the escalation route maps it to 409 with its message. A workspace with no remote
+ * resolves the pull rather than rejecting, so a single-machine board never reaches this.
+ */
+async function refreshSharedBoard(repo: string, id: string): Promise<void> {
+  try {
+    await beads.pull(repo);
+  } catch (e) {
+    throw new NotAbandonableError(
+      `the shared board could not be re-read before abandoning ${id} (${messageOf(e)}) — so a run ` +
+        `on another machine can't be ruled out; nothing was written, try again`,
+    );
+  }
+}
 
 /**
  * The write locks an abandon settles under: the target plus every bead its cascade closes. The
@@ -295,13 +324,17 @@ export async function abandonTicket(
 ): Promise<TicketDetail> {
   const why = requireReason(reason);
   const repo = project.repoPath;
+  const stopped = opts?.requireStopped === true ? { ownRunId: opts.ownRunId } : undefined;
+  // Before the reads, not after: parentage and the run-lease are both read off the board below, and
+  // `stopped` needs BOTH as the remote has them now (see {@link refreshSharedBoard}). The plain
+  // abandon reads no lease and kills what it finds, so it pays no pull.
+  if (stopped) await refreshSharedBoard(repo, id);
   const bead = await beads.show(repo, id); // 404 guard — bd throws on an unknown id
   assertOpen(bead, "Ticket");
 
   // Labels hydrated (no --skip-labels): the run-lease `requireStopped` reads lives on them.
   const listArgs = ["--status", "all"];
   const board = await beads.list(repo, listArgs);
-  const stopped = opts?.requireStopped === true ? { ownRunId: opts.ownRunId } : undefined;
   await stopRun(project.id, runTargetOf(bead, board), board, stopped);
   const descendants = await stopDescendantRuns(project, bead, board, stopped);
 
