@@ -54,6 +54,9 @@ vi.mock("../beads/bd", async () => {
     beads: {
       ...actual.beads,
       pull: (...a: [string]) => pullMock(...a),
+      // The armed walk AWAITS its publish (gardener/armed.ts), so this seam is load-bearing here:
+      // unstubbed it would shell out to a real `bd dolt push` from a unit suite.
+      push: async () => "synced" as const,
       list: (...a: [string, string[]?]) => listMock(...a),
       showWithComments: (...a: [string, string]) => showWithCommentsMock(...a),
       show: (...a: [string, string]) => showMock(...a),

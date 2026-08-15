@@ -1,11 +1,11 @@
 /**
- * The armed walk's CANCEL contract (anton-4ab3), over a stubbed board.
+ * The armed walk's CANCEL and PUBLISH contracts (anton-4ab3), over a stubbed board.
  *
  * Everything else about this walk is exercised through the real handler (jobs/gardener.test.ts
- * "gardener patrol · armed"). What needs a seam of its own is the one path a job runner cannot be
- * asked to produce on demand: an abort arriving mid-walk, and specifically INSIDE the pull that
- * precedes an unattended write. Two things must hold, and each is a way the armed path could do
- * quiet harm:
+ * "gardener patrol · armed"). What needs a seam of its own is what a job runner cannot be asked to
+ * produce on demand: an abort arriving mid-walk — specifically inside one of the two long reads that
+ * precede an unattended write — and a push the shared remote refuses. Two things must hold about the
+ * first, and each is a way the armed path could do quiet harm:
  *
  *   • THE CANCEL PROPAGATES. A walk that resolved normally would let the pass be recorded as one
  *     that finished (jobs/runner.ts) — and no later pass re-decides these proposals, because their
@@ -23,11 +23,17 @@ import type { EmittedProposal } from "./emit";
 import { passRecordCounts, readPassRecords } from "./record";
 
 const pullMock = vi.fn<(cwd: string) => Promise<void>>();
+/** The awaited publish: the only thing that can tell an unattended write from a stranded one. */
+const pushMock = vi.fn<(cwd: string) => Promise<"synced" | "not-wired">>();
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
   return {
     ...actual,
-    beads: { ...actual.beads, pull: (...a: [string]) => pullMock(...a) },
+    beads: {
+      ...actual.beads,
+      pull: (...a: [string]) => pullMock(...a),
+      push: (...a: [string]) => pushMock(...a),
+    },
   };
 });
 
@@ -92,6 +98,7 @@ beforeEach(() => {
   vi.spyOn(console, "error").mockImplementation(() => {});
   log.mockResolvedValue(undefined);
   pullMock.mockResolvedValue(undefined);
+  pushMock.mockResolvedValue("synced");
   // The board reads only ever reach the seam below, so the proposal just has to be findable.
   loadMock.mockImplementation(async () => filed(3).map(({ id }) => ({ id, title: id, status: "open" })));
   applyMock.mockImplementation(async (_repo, proposal) => ({
@@ -128,6 +135,31 @@ describe("armed walk · cancelled", () => {
     // And never silently — the asks that stay open are named, by count and by id.
     expect(recorded()).toContain("APPLY stopped — the pass was cancelled");
     expect(recorded()).toContain("2 armed proposal(s) stay open as ordinary asks (p-1, p-2)");
+  });
+
+  it("propagates a cancel that arrives INSIDE the board read, without applying the proposal it precedes", async () => {
+    // The pull's twin, one await further in. `loadAllIssues` is a second bd call over the whole
+    // board, and the loop's last check lands BEFORE it — so a cancel arriving here was invisible
+    // until apply had already closed, deferred or reparented the subject.
+    const controller = new AbortController();
+    loadMock.mockImplementation(async () => {
+      controller.abort();
+      return filed(3).map(({ id }) => ({ id, title: id, status: "open" }) as Bead);
+    });
+
+    await expect(walk(filed(2), controller.signal)).rejects.toThrow();
+
+    expect(applyMock).not.toHaveBeenCalled();
+    // The attempt was bought before the read, so it is given its outcome rather than left as an
+    // `APPLYING` line that sends a founder to the board to find out whether anything moved.
+    expect(recorded()).toContain(
+      "— COULD NOT APPLY: the pass was cancelled before the board was touched",
+    );
+    expect(recorded()).toContain("1 armed proposal(s) stay open as ordinary asks (p-2)");
+    expect(passRecordCounts(readPassRecords(recorded()))).toMatchObject({
+      unrecorded: 0,
+      "apply-failed": 1,
+    });
   });
 
   it("resolves an attempt the cancel caught between its reservation and its write", async () => {
@@ -179,5 +211,78 @@ describe("armed walk · cancelled", () => {
     });
 
     await expect(walk(filed(1), controller.signal)).rejects.toBe(reason);
+  });
+});
+
+/**
+ * The other half of an UNATTENDED write: it is not made until another machine can see it.
+ *
+ * Two anton machines can each clear their pre-apply pull before either publishes — the bead locks
+ * serialize inside one process only — so the loser's push can fail on a divergence Dolt cannot
+ * merge. The fire-and-forget nudge every other anton write uses cannot report that, because a human
+ * made those writes and is watching the request; here the record is the only witness there is.
+ */
+describe("armed walk · publish", () => {
+  const running = (): AbortSignal => new AbortController().signal;
+
+  it("says the moves it recorded are still on this machine when the publish fails", async () => {
+    pushMock.mockRejectedValue(new Error("bd dolt push failed: conflict in issues"));
+
+    const result = await walk(filed(2), running());
+
+    // The applies stand — they are real local board state, and the durable sync retry the nudge
+    // enqueued is what lands them. What must not stand is a record claiming a move the shared
+    // board never received.
+    expect(result.records.map((r) => r.outcome)).toEqual(["applied", "applied"]);
+    const summary = readPassRecords(recorded());
+    expect(passRecordCounts(summary).applied).toBe(2);
+    // A NOTE, not a seventh proposal: it is the pass's correction to the counts above it, so it
+    // renders beside them (components/runs/pass-record.tsx) rather than as an ask of its own.
+    expect(summary.notes).toContainEqual(
+      expect.stringContaining("APPLY could not publish this pass's board writes"),
+    );
+    expect(summary.notes.join("\n")).toContain("(p-1, p-2)");
+    expect(summary.notes.join("\n")).toContain("conflict in issues");
+  });
+
+  it("stays silent when the publish lands", async () => {
+    await walk(filed(2), running());
+
+    expect(pushMock).toHaveBeenCalledWith(REPO);
+    expect(readPassRecords(recorded()).notes).toEqual([]);
+  });
+
+  it("publishes nothing, and says nothing, for a walk that attempted nothing", async () => {
+    // Nothing armed: no records, so no board write to publish and no push to pay for.
+    await applyArmedProposals({
+      repo: REPO,
+      created: filed(2),
+      policy: resolveProposalAutonomyPolicy({ "shipped-orphan": "propose" }),
+      producer: "[gardener]",
+      log,
+      nudge,
+      signal: running(),
+    });
+
+    expect(nudge).not.toHaveBeenCalled();
+    expect(pushMock).not.toHaveBeenCalled();
+  });
+
+  it("publishes what a CANCELLED walk wrote, and reports a publish it could not prove", async () => {
+    // A cancel is not a rollback, so the writes behind it owe the same publish — and the same
+    // answer about whether it landed.
+    const controller = new AbortController();
+    applyMock.mockImplementationOnce(async (_repo, proposal) => {
+      controller.abort();
+      return { summary: `closed the subject of ${proposal.id} as shipped`, changed: ["t-1"] };
+    });
+    pushMock.mockRejectedValue(new Error("bd dolt push failed: remote unreachable"));
+
+    await expect(walk(filed(3), controller.signal)).rejects.toThrow();
+
+    expect(pushMock).toHaveBeenCalledWith(REPO);
+    expect(readPassRecords(recorded()).notes).toContainEqual(
+      expect.stringContaining("APPLY could not publish this pass's board writes"),
+    );
   });
 });

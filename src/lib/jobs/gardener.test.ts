@@ -79,6 +79,10 @@ vi.mock("../beads/bd", async () => {
     beads: {
       ...actual.beads,
       pull: trace("pull", (...a: [string]) => pullMock(...a)),
+      // The armed walk AWAITS its publish (gardener/armed.ts), so this seam is load-bearing here:
+      // unstubbed it would shell out to a real `bd dolt push` from a unit suite. Deliberately NOT
+      // traced: `calls` is the evidence for which BOARD verbs a patrol used, and a sync is not one.
+      push: async () => "synced" as const,
       epicCloseEligible: trace("epicCloseEligible", (...a: [string, { apply?: boolean }?]) =>
         epicCloseMock(...a),
       ),

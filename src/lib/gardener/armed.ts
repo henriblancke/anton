@@ -22,6 +22,12 @@
  *     checkout's working set. A subject another machine moved in that window reads as untouched
  *     here, so apply's evidence checks would authorize an unattended write against a board that has
  *     already moved on, and the nudge would publish it.
+ *   • AN AWAITED PUBLISH. Every other anton write nudges propagation and returns — a human made it
+ *     and can see it fail. Here the pass is the only witness, and two machines can each clear their
+ *     pre-apply pull before either pushes, so the loser's push can fail on a divergence it cannot
+ *     merge. The nudge still runs (it counts the backlog and enqueues the durable retry that parks
+ *     for a human); what is added is an answer, so the record never reports APPLIED for a move the
+ *     shared board never received.
  *   • A SPEND WRITTEN BEFORE THE WRITE IT PAYS FOR. The cap is reconstructed from these very record
  *     lines by the next attempt of the same job (jobs/pass-budget.ts), so each apply reserves its
  *     line first and records the outcome after: an attempt that cannot be written is never made, and
@@ -179,17 +185,42 @@ export async function applyArmedProposals(input: ArmedInput): Promise<ArmedResul
   };
 
   /**
-   * Publish what the walk DID write, whichever way it ended. A cancelled walk owes this as much as a
-   * finished one: the applies behind the cancel are real board writes, and one no other machine can
-   * see is half a write.
+   * Publish what the walk DID write, whichever way it ended, and say so when it did not land. A
+   * cancelled walk owes this as much as a finished one: the applies behind the cancel are real board
+   * writes, and one no other machine can see is half a write.
+   *
+   * AWAITED, unlike every other propagation anton nudges (beads/sync-nudge.ts). Those follow a write
+   * a human just made and is watching; these were made with nobody there, and this record is the
+   * only place they are ever seen. Two machines can each finish their pre-apply pull before either
+   * publishes — the bead locks serialize within ONE process — so the loser's push can fail on a
+   * conflict it cannot merge, and a walk that only fired the nudge would report APPLIED for a move
+   * the shared board never received. The nudge still runs first: it is what counts the write into
+   * the unpushed backlog and enqueues the durable retry that parks for a human on exhaustion. This
+   * only adds the answer an unattended pass cannot get from a fire-and-forget call.
    */
-  const publish = (): void => {
+  const publish = async (): Promise<void> => {
     if (records.length === 0) return;
     // Once, on the way out, whatever the outcomes were: a REFUSAL writes too (apply attaches its
     // reason to the proposal), and the nudge coalesces per repo — so a pass that happened to write
     // nothing costs a no-op push, while one that moved a bead never leaves it on this machine alone.
     input.nudge();
     console.log(`${input.producer} ${summaryOf(records)}`);
+    const unpublished = await pushFailure(input.repo);
+    if (!unpublished) return;
+    // The record's own correction, in the one place a founder reads the pass: what is written above
+    // as APPLIED happened HERE and has not reached the shared board. Shaped as a pass note (no
+    // `(kind)` group), so it lands beside the counts rather than as a seventh proposal (record.ts).
+    const applied = records.filter((r) => r.outcome === "applied").map((r) => r.proposal);
+    await write(
+      input,
+      `APPLY could not publish this pass's board writes — ` +
+        (applied.length > 0
+          ? `the ${applied.length} move(s) recorded above (${applied.join(", ")}) are on this ` +
+            `machine only`
+          : `what this pass wrote is on this machine only`) +
+        ` until the sync retry lands them, and another machine's board does not yet show them ` +
+        `— ${unpublished}`,
+    );
   };
 
   /** Cancelled mid-walk: name what stays open, publish what landed, and propagate the abort. */
@@ -198,7 +229,7 @@ export async function applyArmedProposals(input: ArmedInput): Promise<ArmedResul
     untried: Array<{ proposal: EmittedProposal }>,
   ): Promise<never> => {
     await write(input, stop("the pass was cancelled", untried));
-    publish();
+    await publish();
     throw signal.reason;
   };
 
@@ -249,27 +280,30 @@ export async function applyArmedProposals(input: ArmedInput): Promise<ArmedResul
       );
       break;
     }
-    // The last await before the board is touched, so it gets the last check. The attempt is bought
-    // and stays bought — the cap is spent on a reservation, not on a write — but it is given its
-    // outcome rather than left standing as an `APPLYING` line nobody can resolve: here anton KNOWS
-    // nothing was written, and a reservation with no outcome tells a founder to go and look.
+    // The last check this loop can make; the board read INSIDE applyOne gets the one on its far
+    // side. The attempt is bought and stays bought — the cap is spent on a reservation, not on a
+    // write — but it is given its outcome rather than left standing as an `APPLYING` line nobody
+    // can resolve: here anton KNOWS nothing was written, and a reservation with no outcome tells a
+    // founder to go and look.
     if (input.signal?.aborted) {
-      const unmade: ArmedRecord = {
-        ...base,
-        outcome: "error",
-        detail: "the pass was cancelled before the board was touched — nothing was applied",
-      };
+      const unmade = unmadeOf(base);
       records.push(unmade);
       await write(input, lineOf(unmade));
       return cancelled(input.signal, attempts.slice(i + 1));
     }
 
-    const record = await applyOne(input, base);
+    const { record, stopped } = await applyOne(input, base);
     records.push(record);
+    const recorded = await write(input, lineOf(record));
+    // A cancel that landed inside applyOne's board read. Nothing was written — its outcome line says
+    // so — and the rest of the walk is the pass being STOPPED, never a walk that finished. Ahead of
+    // the recording check below: a cancel is not an outcome, and a log that also failed does not
+    // turn one into a pass that ran to the end.
+    if (stopped && input.signal) return cancelled(input.signal, attempts.slice(i + 1));
     // The outcome supersedes the reservation (record.ts). Losing it costs the record what the write
     // DID, never the fact that it happened — but a log that has started refusing writes is no longer
     // one this pass can account against, so it stops here rather than reserving into it again.
-    if (await write(input, lineOf(record))) continue;
+    if (recorded) continue;
     stop(
       `the outcome of ${proposal.id} could not be recorded — the attempt itself is on the record, ` +
         `but what it did to the board is not`,
@@ -278,7 +312,7 @@ export async function applyArmedProposals(input: ArmedInput): Promise<ArmedResul
     break;
   }
 
-  publish();
+  await publish();
   return { records, attempted: records.length, deferred: held };
 }
 
@@ -342,6 +376,17 @@ function reservationOf(ask: ArmedAsk): string {
 }
 
 /**
+ * The outcome a reservation gets when a cancel arrives before the board is touched — the one case
+ * where anton can say for certain that nothing was written. Recorded as an `error` because from the
+ * board's side it is an ask this pass attempted and did not settle.
+ */
+const unmadeOf = (base: ArmedAsk): ArmedRecord => ({
+  ...base,
+  outcome: "error",
+  detail: "the pass was cancelled before the board was touched — nothing was applied",
+});
+
+/**
  * Refresh the shared board, or say why this apply may not proceed.
  *
  * `beads.pull` RESOLVES for a workspace with no Dolt remote — a board with nowhere to be stale
@@ -359,6 +404,36 @@ async function pullFailure(repo: string): Promise<string | undefined> {
 }
 
 /**
+ * Publish this pass's writes, or say why they are still only on this machine.
+ *
+ * `beads.push` is the one sync entry point that ANSWERS: it rejects on a real push failure (a
+ * divergence the pull could not merge, auth, an unreachable remote) and resolves for a workspace
+ * with no Dolt remote, because nowhere to publish to is not a failure to publish (beads/bd.ts). It
+ * is the durable job's pass on purpose — the write-nudge fired just before it already counted this
+ * work into the unpushed backlog, and a second counting pass would report one stranded write as
+ * two. Both route through the per-repo coalescer, so the two can never overlap (beads GH#2466).
+ *
+ * Failing here does NOT fail the pass: the board writes happened, the record above is what says so,
+ * and the durable sync-push job the nudge enqueued keeps retrying and parks for a human on
+ * exhaustion. What this buys is that the record never claims a move the shared board cannot see.
+ */
+async function pushFailure(repo: string): Promise<string | undefined> {
+  try {
+    await beads.push(repo);
+    return undefined;
+  } catch (e) {
+    return messageOf(e);
+  }
+}
+
+/** One attempt's outcome, and whether the walk that made it is still running. */
+interface ArmedAttempt {
+  record: ArmedRecord;
+  /** The pass was cancelled between the board read and apply's first mutation — nothing was written. */
+  stopped?: boolean;
+}
+
+/**
  * One proposal, applied against a board read FRESH for it — as the approve route reads one per
  * approval, and for a reason a shared snapshot could not answer: an earlier apply in this same loop
  * may have moved a bead this one rests on. Fresh across MACHINES too: the caller pulls the shared
@@ -366,26 +441,43 @@ async function pullFailure(repo: string): Promise<string | undefined> {
  *
  * Total. A {@link ProposalApplyError} is the board's answer or a rolled-back write, and anything
  * else is a bd that broke; both leave the proposal open with the reason on it, and neither stops the
- * loop.
+ * loop. A CANCEL is the exception the caller re-raises, and it comes back as `stopped` rather than
+ * as a throw so the two failure kinds never have to be told apart by identity.
  */
-async function applyOne(input: ArmedInput, base: ArmedAsk): Promise<ArmedRecord> {
+async function applyOne(input: ArmedInput, base: ArmedAsk): Promise<ArmedAttempt> {
   const proposalId = base.proposal;
   try {
     const board = await loadAllIssues(input.repo);
+    // The board read is a bd CLI call over every issue — the last await before apply's FIRST
+    // mutation, and the one the caller's checks cannot cover: a cancel arriving inside it would
+    // otherwise not be seen until this proposal had been closed, deferred or reparented. Checked
+    // here rather than by making apply itself abortable: apply's writes roll back as a unit, and
+    // an abort mid-move is a partial move nobody asked for. Not applying at all is the safe answer.
+    if (input.signal?.aborted) return { record: unmadeOf(base), stopped: true };
     const proposal = board.find((b) => b.id === proposalId);
     if (!proposal) {
       // Filed minutes ago and already gone: another machine's patrol withdrew it as a duplicate, or
       // a human declined it. Either way the ask has been answered by someone else and is not ours.
-      return { ...base, outcome: "error", detail: "it is no longer on the board — nothing was applied" };
+      return {
+        record: {
+          ...base,
+          outcome: "error",
+          detail: "it is no longer on the board — nothing was applied",
+        },
+      };
     }
     const applied = await applyProposal(input.repo, proposal, board, "policy");
-    return { ...base, outcome: "applied", detail: applied.summary, changed: applied.changed };
+    return {
+      record: { ...base, outcome: "applied", detail: applied.summary, changed: applied.changed },
+    };
   } catch (e) {
     // `refused`/`unusable` are the board declining — the ordinary outcome for an ask whose premise
     // moved. `failed` is a write that broke and was rolled back, which is anton's failure, not a
     // verdict, and reads as one in the log.
     const refused = e instanceof ProposalApplyError && e.failure !== "failed";
-    return { ...base, outcome: refused ? "refused" : "error", detail: messageOf(e) };
+    return {
+      record: { ...base, outcome: refused ? "refused" : "error", detail: messageOf(e) },
+    };
   }
 }
 

@@ -96,7 +96,12 @@ export function PassRecordChips({ summary }: { summary: PassRecordSummary }) {
           {counts[group.key]} {group.label}
         </span>
       ))}
-      {summary.notes.length > 0 && summary.records.length === 0 && (
+      {/* Never conditioned on the pass having no records: the notes that matter most — the write cap
+          holding proposals back, writes that never reached the shared board — are exactly the ones
+          that coexist with applies, and a pass that both moved beads AND held some back is the row
+          an operator most needs pulled open. No note is routine (a clean pass has none), so this
+          chip never becomes noise the eye learns to skip. */}
+      {summary.notes.length > 0 && (
         <span className="rounded-full border border-risk-med/30 bg-risk-med/10 px-1.5 py-0.5 font-mono text-[10px] text-risk-med">
           {summary.notes.length} note{summary.notes.length === 1 ? "" : "s"}
         </span>
