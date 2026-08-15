@@ -112,12 +112,25 @@ export function passRecordLine(line: PassRecordLine): string {
  * longer on the board — nothing was applied") from being mistaken for the verdict separator. The
  * `(kind)` group is what tells a record from the pass's other APPLY/SHADOW lines: "APPLY held back
  * 3 armed proposal(s)" has no parenthesised kind in that position and falls through to a note.
+ *
+ * The producer is spelled out rather than matched as "anything in brackets", and both patterns below
+ * share the list. A product-master pass streams a claude transcript into the same log, and an
+ * `[assistant]` line that happens to be shaped like a record IS shaped like one — the only thing that
+ * separates a write anton made from a sentence a model wrote is which pass claims to have made it.
  */
 const RECORD_LINE =
-  /^\[([^\]]+)\]\s+(APPLY|SHADOW)\s+(\S+)\s+\(([^)]+)\)\s+(\S+)\s+([^—]+?)\s+—\s+([A-Z][A-Z ]*?):\s*(.*)$/;
+  /^\[(gardener|product-master)\]\s+(APPLY|SHADOW)\s+(\S+)\s+\(([^)]+)\)\s+(\S+)\s+([^—]+?)\s+—\s+([A-Z][A-Z ]*?):\s*(.*)$/;
 
 /** Any line one of the passes wrote about applying or shadowing, record or not. */
-const PASS_LINE = /^\[([^\]]+)\]\s+((?:APPLY|SHADOW)\b.*)$/;
+const PASS_LINE = /^\[(gardener|product-master)\]\s+((?:APPLY|SHADOW)\b.*)$/;
+
+/**
+ * Is this a line {@link readPassRecords} would read? The filter a whole-log scan applies so a
+ * megabyte of claude transcript is streamed past rather than held in memory (jobs/pass-records.ts).
+ */
+export function isPassLogLine(line: string): boolean {
+  return PASS_LINE.test(line.trimEnd());
+}
 
 function outcomeOf(mode: PassRecordMode, verdict: string): PassRecordOutcome {
   const verdicts: Record<string, PassRecordOutcome> =

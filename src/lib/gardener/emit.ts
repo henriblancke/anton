@@ -81,8 +81,10 @@ export const MAX_PROPOSALS_PER_PASS = 10;
  * nobody chose — a different question, which deserves a smaller answer. Three is a night's tidying;
  * a board that wants more than that in one pass is a board an operator should be looking at.
  *
- * The overflow is not lost and not applied later by stealth: it stays open as an ordinary ask, and
- * the next pass re-decides it against the board this pass's own writes just left.
+ * The overflow is not lost and not applied later by stealth: it stays open as an ordinary ask that
+ * a human approves or declines. No later pass re-decides it — suppression keys on the fingerprint
+ * an open proposal already carries, so the ask standing on the board is what keeps it from being
+ * re-filed, and the armed walk only ever visits the proposals its own pass just created.
  */
 export const MAX_APPLIES_PER_PASS = 3;
 

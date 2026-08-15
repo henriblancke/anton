@@ -67,7 +67,7 @@ async function applyProposalResponse(
   board: Bead[],
 ): Promise<NextResponse> {
   try {
-    const applied = await applyProposal(project.repoPath, proposal, board);
+    const applied = await applyProposal(project.repoPath, proposal, board, "approval");
     // The move landed locally; propagate it like every other operator write (immediate coalesced
     // push + the durable backstop), off the response path.
     nudgeSync({ id: project.id, repoPath: project.repoPath }, "approve");

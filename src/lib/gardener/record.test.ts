@@ -192,6 +192,19 @@ describe("readPassRecords", () => {
     expect(summary.notes).toEqual([]);
   });
 
+  it("ignores a foreign line that is shaped EXACTLY like a record", () => {
+    // The near-miss above is caught by position; this one is not. A model asked to reason about the
+    // pass's own log can reproduce a record verbatim, and the only thing separating a write anton
+    // made from a sentence a model wrote is which producer claims to have made it — so the producer
+    // is the check. Neither a record nor a note: attributing a board write to "assistant" is worse
+    // than dropping the line, and counting it as a note would cost the pass its clean bill.
+    const summary = readPassRecords(logged("assistant", APPLIED) + logged("claude", SHADOWED));
+
+    expect(summary.records).toEqual([]);
+    expect(summary.notes).toEqual([]);
+    expect(isCleanPass(summary)).toBe(true);
+  });
+
   it("reads an unrecognised verdict as a failure, never as a write", () => {
     // This reader is one anton behind whatever wrote the log whenever another machine ran a newer
     // build. Guessing that an unknown word meant "applied" is the one wrong answer available.

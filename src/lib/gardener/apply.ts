@@ -114,12 +114,16 @@ export type ApplyActor = "approval" | "policy";
  * Throws {@link ProposalApplyError} on every failure — and attaches the reason to the proposal as a
  * note first, so the bead a human comes back to says why it is still open. The one thing this never
  * does is close a proposal whose move did not land.
+ *
+ * `actor` has no default on purpose. It is the one field that says whether a human chose this, and a
+ * default would let a future caller write "somebody approved this" onto a bead nobody was asked
+ * about — the exact claim this function exists to keep honest.
  */
 export async function applyProposal(
   repo: string,
   proposal: Bead,
   board: Bead[],
-  actor: ApplyActor = "approval",
+  actor: ApplyActor,
 ): Promise<ApplyResult> {
   if (!isProposalBead(proposal)) {
     throw new ProposalApplyError("unusable", `${proposal.id} is not a proposal bead`);

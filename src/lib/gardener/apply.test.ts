@@ -219,8 +219,8 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     setSnapshot(board); // the winner's close lands on this board, and is what the loser then reads
 
     const [winner, loser] = await Promise.allSettled([
-      applyProposal(REPO, proposal, board),
-      applyProposal(REPO, proposal, board),
+      applyProposal(REPO, proposal, board, "approval"),
+      applyProposal(REPO, proposal, board, "approval"),
     ]);
 
     expect(winner.status).toBe("fulfilled");

@@ -122,14 +122,24 @@ export function makeProductMasterHandler(deps: ProductMasterDeps): JobHandler {
       const board = await loadAllIssues(repo);
       await ctx.heartbeat();
 
-      // One filer for both tiers: same board, same fence, own emission each — so the judgment pass is
-      // entitled to its full ten proposals whether or not approvals have rotted.
+      // One filer for both tiers: one board, one fence, own emission each — so the judgment pass is
+      // entitled to its full ten proposals whether or not approvals have rotted. It carries the
+      // snapshot rather than taking it, because an armed apply replaces it (see `snapshot`).
       const file = makeProposalFiler(scope, { board, observedAtMs });
 
       await file(await revalidationTier(scope, board, observedAtMs));
       await ctx.heartbeat();
 
-      const boardInput = await collectBoardInput(scope, { db, board, observedAtMs });
+      // The board tier 1 LEFT, not the one it found: armed at `apply`, revalidation withdraws
+      // approvals, and a session judging the pre-write picture would reason about beads this same
+      // pass had already changed — with its claims then eligible for unattended application. The
+      // filer re-reads only when a write actually landed, so the ordinary pass costs no second read.
+      const judged = file.snapshot();
+      const boardInput = await collectBoardInput(scope, {
+        db,
+        board: judged.board,
+        observedAtMs: judged.observedAtMs,
+      });
       await ctx.heartbeat();
 
       const claims = await judgeBoard(scope, {
@@ -139,7 +149,13 @@ export function makeProductMasterHandler(deps: ProductMasterDeps): JobHandler {
         onEvent: session.onEvent,
       });
 
-      await file(await acceptClaims(scope, { claims, board, observedAtMs }));
+      await file(
+        await acceptClaims(scope, {
+          claims,
+          board: judged.board,
+          observedAtMs: judged.observedAtMs,
+        }),
+      );
 
       await session.end("done");
     } catch (e) {

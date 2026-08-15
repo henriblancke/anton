@@ -9,8 +9,11 @@
  * and an approve does not:
  *
  *   • A WRITE CAP ({@link MAX_APPLIES_PER_PASS}), which is a different budget from the one that
- *     bounds emission. The overflow is not deferred work — it stays open as an ordinary ask, logged
- *     by count and by id, and the next pass re-decides it against the board this one just left.
+ *     bounds emission. The overflow is not deferred work and no later pass picks it up: the
+ *     proposal is already on the board, so the fingerprint suppression that stops it being re-filed
+ *     also stops it being re-decided — and this walk only ever visits what its own pass just filed.
+ *     It stays open as an ordinary ask, logged by count and by id, waiting for a human approval.
+ *     Hitting the cap is the signal that this board wants somebody to look at it.
  *   • AN ACTOR. Every apply here is made with nobody watching, so it is recorded as `policy` and the
  *     proposal's closing note says so (see apply.ts `ApplyActor`).
  *
@@ -117,13 +120,18 @@ export async function applyArmedProposals(input: ArmedInput): Promise<ArmedResul
   // tell "that was all of it" from "we stopped at three" — by count AND by id, so the asks the cap
   // held back are answerable without diffing the board against the log.
   if (held.length > 0) {
-    // The cap is named as the PASS's, never as this call's remaining budget: the product-master
-    // pass spends one budget across two tiers, and "applies at most 0" would read as a broken
-    // setting rather than as a pass that had already spent its writes.
+    // The cap is named as the PASS's, never as this call's remaining budget alone: the
+    // product-master pass spends one budget across two tiers, and "applies at most 0" would read as
+    // a broken setting rather than as a pass that had already spent its writes. What an earlier
+    // tier spent is named ALONGSIDE it, so "held back 4 — one pass applies at most 3" never reads
+    // as a cap that should have let a fourth through.
+    const spent = MAX_APPLIES_PER_PASS - limit;
     await write(
       input,
       `APPLY held back ${held.length} armed proposal(s) — one pass applies at most ` +
-        `${MAX_APPLIES_PER_PASS}; they stay open as ordinary asks (${held.join(", ")})`,
+        `${MAX_APPLIES_PER_PASS}` +
+        (spent > 0 ? `, and ${spent} of those were already spent earlier in this pass` : "") +
+        `; they stay open as ordinary asks (${held.join(", ")})`,
     );
   }
 

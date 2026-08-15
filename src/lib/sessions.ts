@@ -5,7 +5,8 @@
  */
 import { randomUUID } from "node:crypto";
 import { appendFile, mkdir, open, stat } from "node:fs/promises";
-import { watch } from "node:fs";
+import { createReadStream, watch } from "node:fs";
+import { createInterface } from "node:readline";
 import { dirname, join } from "node:path";
 import { desc, eq, inArray } from "drizzle-orm";
 import type { ClaudeEvent } from "./claude/driver";
@@ -223,33 +224,56 @@ export async function sessionsByJob(jobIds: string[]): Promise<Record<string, Jo
   return byJob;
 }
 
+/** How many matched lines one scan keeps. Far above any real pass; a backstop, not a policy. */
+export const MAX_SCANNED_LOG_LINES = 500;
+
+export interface ScannedLogLines {
+  lines: string[];
+  /** The scan stopped at {@link MAX_SCANNED_LOG_LINES}. Never silent — the caller says so. */
+  truncated: boolean;
+}
+
 /**
- * The tail of a session log, capped.
+ * Every line of a session log that `keep` accepts — the WHOLE file, streamed.
  *
- * Capped rather than whole because one caller reads these on every render of the jobs page and a
- * product-master pass logs a full claude transcript above its record — and tail rather than head
- * because the record is the LAST thing a pass writes. A log that is gone (a disposable `.anton`
- * cleared out from under the row) reads as empty: the record is commentary, and a page that threw
- * over a missing one would cost the operator the job list itself.
+ * Whole rather than tailed, because a pass's records are not all at the end of its log: the
+ * product-master pass writes its revalidation tier's APPLY lines BEFORE it streams a claude
+ * transcript that can run to megabytes, so a tail window drops precisely the unattended writes the
+ * record exists to show — and the page would then call that a clean pass. Streaming is what makes
+ * reading it all affordable: the transcript is decoded and dropped line by line, and only what
+ * `keep` accepts is ever held.
+ *
+ * A log that is gone (a disposable `.anton` cleared out from under the row) reads as empty: the
+ * record is commentary, and a page that threw over a missing one would cost the operator the job
+ * list itself.
  */
-export async function readSessionLogTail(
+export async function readSessionLogLines(
   logPath: string,
-  maxBytes = 256 * 1024,
-): Promise<string> {
+  keep: (line: string) => boolean,
+  maxLines = MAX_SCANNED_LOG_LINES,
+): Promise<ScannedLogLines> {
+  const lines: string[] = [];
+  let truncated = false;
   try {
-    const size = (await stat(logPath)).size;
-    const offset = Math.max(0, size - maxBytes);
-    const handle = await open(logPath, "r");
+    const stream = createReadStream(logPath, { encoding: "utf8" });
+    const reader = createInterface({ input: stream, crlfDelay: Infinity });
     try {
-      const buf = Buffer.alloc(size - offset);
-      await handle.read(buf, 0, buf.length, offset);
-      return buf.toString("utf8");
+      for await (const line of reader) {
+        if (!keep(line)) continue;
+        if (lines.length >= maxLines) {
+          truncated = true;
+          break;
+        }
+        lines.push(line);
+      }
     } finally {
-      await handle.close();
+      reader.close();
+      stream.destroy();
     }
   } catch {
-    return "";
+    // Whatever was read before the file went away is still the honest half of the answer.
   }
+  return { lines, truncated };
 }
 
 /** A single session by id (shared anton.db read path — for run detail + log stream). */

@@ -559,12 +559,56 @@ describe("product-master pass · armed", () => {
     expect(writes.filter((w) => w.startsWith("untag "))).toHaveLength(3);
     expect(writes).not.toContain("defer anton-a");
     const log = await sessionLog();
+    // The cap names the PASS's budget and what tier 1 already spent of it, so "held back 1 — one
+    // pass applies at most 3" never reads as a cap that should have let this one through.
     expect(log).toContain(
-      "APPLY held back 1 armed proposal(s) — one pass applies at most 3; " +
-        "they stay open as ordinary asks (anton-p4)",
+      "APPLY held back 1 armed proposal(s) — one pass applies at most 3, and 3 of those were " +
+        "already spent earlier in this pass; they stay open as ordinary asks (anton-p4)",
     );
     // Held back is an ask still standing, not a write deferred to later in the same pass.
     expect(writes).not.toContain("close anton-p4");
+  });
+
+  it("judges the board tier 1 LEFT, not the one it found", async () => {
+    // Revalidation armed at `apply` withdraws approvals BEFORE the session runs. Handed the
+    // pre-write snapshot, the session would reason about a board this same pass had already
+    // changed — and its claims are then eligible for unattended application in tier 2.
+    const rotted = [
+      bead("anton-x1", { issue_type: "epic", labels: [LABELS.approved] }),
+      bead("anton-f1", { issue_type: "feature", parent: "anton-x1" }),
+    ];
+    // Stands in for everything tier 1's writes leave behind: only a board read AFTER the unapprove
+    // can carry it.
+    const afterTheWrite = bead("anton-late", { title: "landed while tier 1 was writing" });
+    let wroteTier1 = false;
+    boardIs(() => [cold, ...rotted, ...(wroteTier1 ? [afterTheWrite] : [])]);
+    await arm({ "low-value": "apply", "degraded-approval": "apply" });
+    writeVerbMock.mockImplementation(async (verb) => {
+      if (verb === "untag") wroteTier1 = true;
+      return "";
+    });
+
+    await expectJobStatus(t.db, await runPass(), "done");
+
+    expect(writes).toContain("untag anton-x1");
+    expect(dispatched?.prompt).toContain("anton-late");
+  });
+
+  it("judges the board it read when tier 1 wrote nothing — no second read for a quiet tier", async () => {
+    // The re-read is bought by a WRITE, not by a tier running: a pass whose tier 1 found nothing
+    // pays for one board read, as it did before anything was armed.
+    const listCalls = () => listMock.mock.calls.length;
+    let atDispatch = 0;
+    duringSession = () => {
+      atDispatch = listCalls();
+    };
+    // Nothing armed at all, so no apply and no write.
+    await arm({});
+
+    await expectJobStatus(t.db, await runPass(), "done");
+
+    expect(writes).toEqual(["create Product master: defer anton-a"]);
+    expect(atDispatch).toBe(1);
   });
 
   it("keeps the pass green when an apply blows up, and leaves the ask standing", async () => {

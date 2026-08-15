@@ -40,7 +40,10 @@ let sessions: Record<string, JobSessionLink> = {};
 let logs: Record<string, string> = {};
 vi.mock("@/lib/sessions", () => ({
   sessionsByJob: async () => sessions,
-  readSessionLogTail: async (logPath: string) => logs[logPath] ?? "",
+  readSessionLogLines: async (logPath: string, keep: (line: string) => boolean) => ({
+    lines: (logs[logPath] ?? "").split("\n").filter(keep),
+    truncated: false,
+  }),
 }));
 
 function job(id: string, type: JobType): JobSummary {

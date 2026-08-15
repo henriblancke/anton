@@ -14,6 +14,8 @@
  * building them.
  */
 import { LABELS, type Bead } from "../beads/bd";
+// Type-only: erased at build, so it does not load apply.ts ahead of a suite's `vi.mock`.
+import type { ApplyActor } from "./apply";
 import {
   detectionSubjectKey,
   proposalFingerprint,
@@ -133,16 +135,20 @@ export function resetSeam(): void {
  * primes {@link liveBeads} for the bead it wants to move under the apply.
  *
  * The module is pulled in lazily so the suite's `vi.mock` is in place before apply.ts binds `beads`.
+ *
+ * `actor` is named at every call rather than defaulted, for the reason `applyProposal` requires it:
+ * a test that means "a human approved this" and a test that means "a policy did" must not be the
+ * same call, or the attribution the note carries goes unasserted.
  */
-export async function apply(proposal: Bead, board: Bead[]) {
+export async function apply(proposal: Bead, board: Bead[], actor: ApplyActor = "approval") {
   setSnapshot(board);
   const { applyProposal } = await import("./apply");
-  return applyProposal(REPO, proposal, board);
+  return applyProposal(REPO, proposal, board, actor);
 }
 
 /** {@link apply} with the proposal itself on the board — every apply re-reads it under its lock. */
-export function applyWith(proposal: Bead, board: Bead[]) {
-  return apply(proposal, [...board, proposal]);
+export function applyWith(proposal: Bead, board: Bead[], actor: ApplyActor = "approval") {
+  return apply(proposal, [...board, proposal], actor);
 }
 
 // ── fixture builders ──

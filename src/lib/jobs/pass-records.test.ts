@@ -1,10 +1,10 @@
 /**
  * The seam between a pass's session log and the jobs page (anton-hzce).
  *
- * The one rule worth a suite of its own: a pass job ALWAYS gets an entry. A gardener patrol over a
- * clean board deliberately opens no session at all, so "no log" is the ordinary shape of a quiet
- * night — and a missing entry would render as a row whose record failed to load rather than as the
- * clean pass it was.
+ * The one rule worth a suite of its own: a COMPLETED pass job always gets an entry. A gardener
+ * patrol over a clean board deliberately opens no session at all, so "no log" is the ordinary shape
+ * of a quiet night — and a missing entry would render as a row whose record failed to load rather
+ * than as the clean pass it was. A pass that never finished is the opposite claim, and gets none.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { isPassJob, passRecordsByJob } from "./pass-records";
-import type { JobType } from "./queue";
+import type { JobStatus, JobType } from "./queue";
 
 let workDir: string;
 
@@ -34,7 +34,7 @@ afterAll(() => {
   rmSync(workDir, { recursive: true, force: true });
 });
 
-const job = (id: string, type: JobType) => ({ id, type });
+const job = (id: string, type: JobType, status: JobStatus = "done") => ({ id, type, status });
 
 describe("isPassJob", () => {
   it("is the two job types that file proposals, and nothing else", () => {
@@ -66,10 +66,56 @@ describe("passRecordsByJob", () => {
     expect(records.pm1.records.map((r) => r.detail)).toEqual(["t-9 moved"]);
   });
 
-  it("gives a pass that opened no session an empty record, not no record", async () => {
-    const records = await passRecordsByJob([job("quiet", "gardener")], {});
+  it("gives a COMPLETED pass that opened no session an empty record, not no record", async () => {
+    const records = await passRecordsByJob([job("quiet", "gardener", "done")], {});
 
     expect(records.quiet).toEqual({ records: [], notes: [] });
+  });
+
+  // "No session" means "nothing to say" only for a pass that reached the end. A gardener job that
+  // dies mid-`applySafeVerbs` never opens its deferred session either, and rendering "Clean pass —
+  // nothing applied, shadowed or refused" over that is the one lie this record exists to prevent.
+  it("says nothing about a pass that has not completed and opened no session", async () => {
+    const records = await passRecordsByJob(
+      [
+        job("waiting", "gardener", "queued"),
+        job("mid-flight", "product-master", "running"),
+        job("broke", "gardener", "failed"),
+        job("stopped", "gardener", "cancelled"),
+        job("stuck", "product-master", "parked"),
+      ],
+      {},
+    );
+
+    expect(Object.keys(records)).toEqual([]);
+  });
+
+  it("reads the record of an unfinished pass that DID open a session", async () => {
+    const records = await passRecordsByJob([job("broke", "gardener", "failed")], {
+      broke: { id: "s-broke", logPath: logFile("broke.log", APPLIED) },
+    });
+
+    expect(records.broke.records.map((r) => r.outcome)).toEqual(["applied"]);
+  });
+
+  // The product-master pass writes its revalidation tier's APPLY lines BEFORE it streams a claude
+  // transcript, so anything reading only the end of the log drops an unattended write and calls the
+  // pass clean. The transcript here is comfortably past the old 256KB tail window.
+  it("finds a record buried under a transcript far longer than any tail window", async () => {
+    const transcript = "[assistant] thinking out loud, at length\n".repeat(20_000);
+    const records = await passRecordsByJob([job("pm2", "product-master")], {
+      pm2: {
+        id: "s-pm2",
+        logPath: logFile(
+          "pm2.log",
+          "[product-master] APPLY p-1 (degraded-approval) unapprove t-1 — APPLIED: withdrew t-1\n" +
+            transcript +
+            "[product-master] 0 claim(s) reported, 0 accepted\n",
+        ),
+      },
+    });
+
+    expect(records.pm2.records.map((r) => r.proposal)).toEqual(["p-1"]);
   });
 
   it("survives a log the row points at but the disk no longer has", async () => {

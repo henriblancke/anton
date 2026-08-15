@@ -201,3 +201,65 @@ describe("sessionsByJob", () => {
     expect(await sessionsByJob([])).toEqual({});
   });
 });
+
+/**
+ * The whole-log scan the jobs page reads a pass's record through (anton-hzce). Whole rather than
+ * tailed because a product-master pass writes its revalidation tier's records BEFORE it streams a
+ * claude transcript — a tail window drops exactly the unattended writes the record exists to show.
+ */
+describe("readSessionLogLines", () => {
+  let scanDir: string;
+
+  const write = (name: string, contents: string): string => {
+    const path = join(scanDir, name);
+    writeFileSync(path, contents);
+    return path;
+  };
+
+  const keepPass = (line: string) => line.startsWith("[product-master]");
+
+  beforeAll(() => {
+    scanDir = mkdtempSync(join(tmpdir(), "anton-log-scan-"));
+  });
+
+  afterAll(() => {
+    rmSync(scanDir, { recursive: true, force: true });
+  });
+
+  it("finds a line at the HEAD of a log far longer than any tail window", async () => {
+    const { readSessionLogLines } = await import("./sessions");
+    const path = write(
+      "buried.log",
+      "[product-master] APPLY p-1 (degraded-approval) unapprove t-1 — APPLIED: withdrew t-1\n" +
+        "[assistant] a transcript comfortably past 256KB\n".repeat(20_000) +
+        "[product-master] 0 claim(s) reported\n",
+    );
+
+    expect(await readSessionLogLines(path, keepPass)).toEqual({
+      lines: [
+        "[product-master] APPLY p-1 (degraded-approval) unapprove t-1 — APPLIED: withdrew t-1",
+        "[product-master] 0 claim(s) reported",
+      ],
+      truncated: false,
+    });
+  });
+
+  it("says so when it stops at the cap, rather than truncating quietly", async () => {
+    const { readSessionLogLines } = await import("./sessions");
+    const path = write("many.log", "[product-master] APPLIED something\n".repeat(10));
+
+    expect(await readSessionLogLines(path, keepPass, 3)).toEqual({
+      lines: Array(3).fill("[product-master] APPLIED something"),
+      truncated: true,
+    });
+  });
+
+  it("reads a log the disk no longer has as empty — `.anton` is disposable", async () => {
+    const { readSessionLogLines } = await import("./sessions");
+
+    expect(await readSessionLogLines(join(scanDir, "gone.log"), keepPass)).toEqual({
+      lines: [],
+      truncated: false,
+    });
+  });
+});

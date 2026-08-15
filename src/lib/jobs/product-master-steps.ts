@@ -9,6 +9,7 @@
  * identically whichever tier raised it.
  */
 import type { Bead } from "../beads/bd";
+import { loadAllIssues } from "../beads/issues";
 import type { RunClaudeOptions, runClaude } from "../claude/driver";
 import { applyArmedProposals } from "../gardener/armed";
 import type { GardenerDetection } from "../gardener/detections";
@@ -73,24 +74,37 @@ function reportEmission(scope: PassScope, emission: EmissionResult): void {
   }
 }
 
+/** A tier's filer, plus the snapshot the tier AFTER it must judge. */
+export interface ProposalFiler {
+  (detections: GardenerDetection[]): Promise<void>;
+  /**
+   * The board as this filer now holds it. Re-read whenever an armed apply moved a bead, because a
+   * pass that judged its own writes' premise would be reading a board it had already changed.
+   */
+  snapshot(): ProposalFilerInput;
+}
+
 /**
  * File one tier's detections, reporting whatever landed before a failure rather than losing it.
  *
- * Returned as a closure because both tiers file against the SAME board snapshot and fence — the two
- * are entitled to their own emission (so they cannot cap each other out) but never to their own
- * premise. The WRITE cap is the opposite: it is spent from one budget across both tiers, because it
- * bounds what this PASS may do to the board unattended, not what a tier may (anton-4ab3).
+ * Returned as a closure because both tiers file against ONE snapshot and fence — the two are
+ * entitled to their own emission (so they cannot cap each other out) but never to their own premise.
+ * The WRITE cap is the opposite: it is spent from one budget across both tiers, because it bounds
+ * what this PASS may do to the board unattended, not what a tier may (anton-4ab3).
+ *
+ * That snapshot is re-read — once, and only when an armed apply actually moved a bead — so the
+ * "one premise" the tiers share is always the board this pass has LEFT. Tier 1 armed at `apply`
+ * withdraws approvals, and a judgment session handed the pre-write picture would reason about beads
+ * its own pass had just unapproved, with its claims then eligible for unattended application.
  */
-export function makeProposalFiler(
-  scope: PassScope,
-  input: ProposalFilerInput,
-): (detections: GardenerDetection[]) => Promise<void> {
-  const { board, observedAtMs } = input;
+export function makeProposalFiler(scope: PassScope, input: ProposalFilerInput): ProposalFiler {
   const repo = scope.project.repoPath;
+  let snapshot = input;
   let writeBudget = MAX_APPLIES_PER_PASS;
 
-  return async (detections: GardenerDetection[]): Promise<void> => {
+  const file = async (detections: GardenerDetection[]): Promise<void> => {
     scope.ctx.signal.throwIfAborted();
+    const { board, observedAtMs } = snapshot;
     try {
       const emission = await emitProposals(repo, {
         board,
@@ -126,6 +140,14 @@ export function makeProposalFiler(
         limit: writeBudget,
       });
       writeBudget -= applied.attempted;
+      // A bead moved, so the premise every later tier files against has moved with it. Re-read
+      // rather than patch: the apply's own fresh-board reads are the authority on what the writes
+      // left, and re-deriving it from `changed` would be a second, quieter answer. The fence is
+      // re-stamped alongside it — it dates THIS read, and a proposal filed later carrying the older
+      // stamp would let apply date its premise checks against a board two writes ago.
+      if (applied.records.some((record) => record.changed.length > 0)) {
+        snapshot = { board: await loadAllIssues(repo), observedAtMs: scope.clock.now() };
+      }
     } catch (e) {
       // Whatever landed before a create failed is real board state living only in the local working
       // set — report and propagate it, or a pass that parks leaves the proposals that DID file
@@ -134,6 +156,9 @@ export function makeProposalFiler(
       throw e;
     }
   };
+
+  file.snapshot = (): ProposalFilerInput => snapshot;
+  return file;
 }
 
 /**
