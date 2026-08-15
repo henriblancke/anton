@@ -2,10 +2,10 @@ import Link from "next/link";
 
 import type {
   PassRecord,
-  PassRecordOutcome,
+  PassRecordGroup,
   PassRecordSummary,
 } from "@/lib/gardener/record";
-import { isCleanPass, passRecordCounts } from "@/lib/gardener/record";
+import { isCleanPass, passRecordCounts, passRecordGroup } from "@/lib/gardener/record";
 import { cn } from "@/lib/utils";
 
 /**
@@ -20,9 +20,15 @@ import { cn } from "@/lib/utils";
  * is a link, so the evidence is one click from the record.
  */
 
-/** Outcome order, worst-consequence first — an unattended WRITE is what a reader came for. */
-const OUTCOMES: {
-  key: PassRecordOutcome;
+/**
+ * Group order, worst-consequence first — an unattended WRITE is what a reader came for.
+ *
+ * A failed APPLY and a failed SHADOW are separate rows on purpose: only the first attempted a board
+ * write, so a shadow that could not be evaluated must never be described as one that may have been
+ * rolled back (see `passRecordGroup`).
+ */
+const GROUPS: {
+  key: PassRecordGroup;
   label: string;
   text: string;
   chip: string;
@@ -43,11 +49,18 @@ const OUTCOMES: {
     blurb: "the board declined the move — the ask is still open, with the reason on it",
   },
   {
-    key: "error",
+    key: "apply-failed",
     label: "could not apply",
     text: "text-risk-high",
     chip: "border-risk-high/30 bg-risk-high/10 text-risk-high",
     blurb: "anton failed to decide or the write was rolled back — nothing landed",
+  },
+  {
+    key: "shadow-failed",
+    label: "could not shadow",
+    text: "text-risk-med",
+    chip: "border-risk-med/30 bg-risk-med/10 text-risk-med",
+    blurb: "anton could not work out what it would do — no write was attempted",
   },
   {
     key: "shadowed",
@@ -67,12 +80,12 @@ export function PassRecordChips({ summary }: { summary: PassRecordSummary }) {
   const counts = passRecordCounts(summary);
   return (
     <span className="flex shrink-0 items-center gap-1.5">
-      {OUTCOMES.filter((outcome) => counts[outcome.key] > 0).map((outcome) => (
+      {GROUPS.filter((group) => counts[group.key] > 0).map((group) => (
         <span
-          key={outcome.key}
-          className={cn("rounded-full border px-1.5 py-0.5 font-mono text-[10px]", outcome.chip)}
+          key={group.key}
+          className={cn("rounded-full border px-1.5 py-0.5 font-mono text-[10px]", group.chip)}
         >
-          {counts[outcome.key]} {outcome.label}
+          {counts[group.key]} {group.label}
         </span>
       ))}
       {summary.notes.length > 0 && summary.records.length === 0 && (
@@ -93,7 +106,7 @@ export function PassRecordPanel({
   slug: string;
 }) {
   const counts = passRecordCounts(summary);
-  const groups = OUTCOMES.filter((outcome) => counts[outcome.key] > 0);
+  const groups = GROUPS.filter((group) => counts[group.key] > 0);
 
   return (
     <section className="flex flex-col gap-2" aria-label="Proposals">
@@ -110,17 +123,17 @@ export function PassRecordPanel({
         </p>
       ) : (
         <div className="flex flex-col gap-2.5">
-          {groups.map((outcome) => (
-            <div key={outcome.key} className="flex flex-col gap-1">
+          {groups.map((group) => (
+            <div key={group.key} className="flex flex-col gap-1">
               <div className="flex items-baseline gap-2">
-                <span className={cn("font-mono text-[11px]", outcome.text)}>
-                  {counts[outcome.key]} {outcome.label}
+                <span className={cn("font-mono text-[11px]", group.text)}>
+                  {counts[group.key]} {group.label}
                 </span>
-                <span className="text-[10.5px] text-subtle">{outcome.blurb}</span>
+                <span className="text-[10.5px] text-subtle">{group.blurb}</span>
               </div>
               <ul className="flex flex-col gap-1">
                 {summary.records
-                  .filter((record) => record.outcome === outcome.key)
+                  .filter((record) => passRecordGroup(record) === group.key)
                   .map((record, i) => (
                     <PassRecordEntry
                       key={`${record.proposal}-${record.mode}-${i}`}

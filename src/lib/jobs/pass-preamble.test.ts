@@ -151,6 +151,22 @@ describe("deferPassSession", () => {
     expect(ctx.reported).toEqual([{ sessionId: row.id }]);
   });
 
+  it("opens the log file WITH the row, so a missing log can only mean a broken log", async () => {
+    // What a retry's write budget reads (pass-budget.ts): a session row with no log behind it is a
+    // log store that broke — the moment an apply's record goes unwritten — and never an attempt
+    // that simply had nothing to say. That attempt opens no row at all.
+    await enqueue("job-8");
+    const session = deferPassSession(t.db, clock, {
+      ctx: fakeJobContext({ jobId: "job-8" }),
+      projectId,
+      kind: "gardener",
+    });
+
+    await session.log("");
+
+    expect(sessionText((await sessionRow()).logPath)).toBe("");
+  });
+
   it("settles failed for a pass that broke after it had spoken", async () => {
     await enqueue("job-1");
     const session = deferPassSession(t.db, clock, {

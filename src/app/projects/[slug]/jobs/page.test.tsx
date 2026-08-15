@@ -216,6 +216,25 @@ describe("jobs page — what each pass applied, shadowed and refused", () => {
     expect(record().queryByText(/^1 refused$/)).toBeNull();
   });
 
+  it("separates a shadow that broke from an apply that broke — one of them touched the board", async () => {
+    // A shadow that could not be evaluated attempted no write at all. Calling it "could not apply"
+    // — under a blurb about a write that may have been rolled back — describes an event that never
+    // happened, and sends a founder looking for a board change nobody made.
+    jobs = [
+      pass(
+        "g1",
+        "gardener",
+        "[gardener] SHADOW p-4 (mispriority) repriority t-9 — COULD NOT SHADOW: board unreadable\n",
+      ),
+    ];
+    await renderPage();
+    expand("gardener");
+
+    expect(record().getByText("1 could not shadow")).toBeTruthy();
+    expect(record().queryByText(/could not apply/)).toBeNull();
+    expect(record().getByText(/no write was attempted/)).toBeTruthy();
+  });
+
   it("says nothing about a job that files no proposals", async () => {
     jobs = [pass("e1", "execute-epic", APPLIED)];
     await renderPage();

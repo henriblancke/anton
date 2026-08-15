@@ -82,85 +82,91 @@ export function makeGardenerHandler(deps: GardenerDeps): JobHandler {
      * and a nightly patrol with nothing to shadow leaves no empty session behind.
      */
     const session = deferPassSession(db, clock, { ctx, projectId, kind: "gardener" });
-    const scope: PassScope = {
-      project: { id: project.id, repoPath: repo },
-      slug: project.slug,
-      // How far this project lets a filed proposal go, per kind (anton-nbyy) — read once, so a
-      // policy edit mid-patrol cannot have one proposal shadowed under a rule the next one is not.
-      policy: resolveAutonomyPolicy(await getProjectSettings(db, projectId)),
-      // What earlier attempts of THIS job already applied comes off the cap: a patrol that died
-      // after its writes is retried under the same job id, and a fresh cap per attempt would let
-      // one scheduled patrol apply several caps' worth unattended. Read here, before the patrol
-      // writes a line, so this attempt's own log cannot count against it.
-      applyBudget: await remainingApplyBudget({
-        db,
-        jobId: ctx.jobId,
-        producer: "[gardener]",
-        log: session.log,
-      }),
-      clock,
-      ctx,
-      nudge,
-      log: session.log,
-    };
 
-    await pullBoard(repo, (e) => console.error(`[gardener] board pull failed for ${repo}`, e));
-
-    // ── tier 1: the safe verbs ──
-    const applied = await applySafeVerbs(repo, ctx);
-
-    // Record the writes BEFORE the (fallible) report tier, on a row that stays invisible until the
-    // findings land. Both verbs are idempotent, so a retry after a report-verb failure closes
-    // nothing — without this the published report would say "closed 0 epics" for a patrol that did
-    // close work. Re-opening the same job id merges the attempts, so `actions` below is what this
-    // PATROL did, not just this attempt (hygiene.ts).
-    const { id: reportId, actions } = await startHygieneReport(db, clock, {
-      projectId,
-      jobId: ctx.jobId,
-      actions: applied,
-    });
-
-    // Propagate the writes before the (slower) report tier: what this patrol closed is what other
-    // machines most need, and a report-verb failure below must not strand it locally. Gated on what
-    // THIS attempt wrote — an idle patrol pushing every slot would make a clean board the noisiest
-    // thing on the remote, and a retry that changed nothing has nothing new to push.
-    if (applied.closedEpics.length > 0 || applied.rowsRecomputed > 0) {
-      console.log(
-        `[gardener] ${projectId}: closed ${applied.closedEpics.length} epic(s)` +
-          `${applied.closedEpics.length ? ` (${applied.closedEpics.join(", ")})` : ""}, ` +
-          `recomputed ${applied.rowsRecomputed} blocked row(s)`,
-      );
-      nudge(scope.project);
-    }
-
-    // ── tier 2: the report verbs (read-only) ──
-    //
-    // The premise fence opens HERE, before the first read this pass judges from — not just before
-    // tier 3's board snapshot. A retirement's evidence IS a hygiene finding (retire.ts reads the
-    // stale and duplicate rows), so a fence stamped after these verbs would date an edit that landed
-    // mid-report as already observed, and approval would settle a bead against a premise that edit
-    // falsified. Stamped BEFORE rather than after for the same reason at every read: a bead written
-    // while one is in flight may or may not be in its result, and the earlier fence dates it as
-    // unseen — a refusal at approve time, which is the safe direction. This is what apply compares
-    // "has this moved since we asked" against; the proposals' own `created_at` land later, once the
-    // sequential creates in tier 3 run.
-    const observedAtMs = clock.now();
-    const findings = await collectFindings(repo, ctx);
-
-    // Nothing above is guaranteed to notice a cancel — `heartbeat` doesn't inspect the signal and
-    // the bd reads settle on their own — so publishing is gated here explicitly: a cancelled patrol
-    // must not present a half-collected report as this run's answer. Its actions row survives,
-    // unpublished, and a resume of the same job completes it.
-    ctx.signal.throwIfAborted();
-    await completeHygieneReport(db, clock, reportId, findings);
-
-    console.log(`[gardener] ${projectId}: ${summarizeReport({ actions, findings })}`);
-
-    // ── tier 3: proposals (anton-9qwq) ──
-    //
-    // After the report is published, so a failure filing proposals costs the pass its judgment tier
-    // and not its findings.
+    // Settled on EVERY exit path, not just the proposal tier's. The budget read below opens the row
+    // itself when an earlier attempt spent part of the cap (it writes a note), so any throw between
+    // there and the end of the patrol — a report verb, a cancel — would otherwise strand a session
+    // row reading "running" forever. `end` is a no-op for a patrol that never opened one, so a
+    // blanket settle costs a clean board nothing.
     try {
+      const scope: PassScope = {
+        project: { id: project.id, repoPath: repo },
+        slug: project.slug,
+        // How far this project lets a filed proposal go, per kind (anton-nbyy) — read once, so a
+        // policy edit mid-patrol cannot have one proposal shadowed under a rule the next one is not.
+        policy: resolveAutonomyPolicy(await getProjectSettings(db, projectId)),
+        // What earlier attempts of THIS job already applied comes off the cap: a patrol that died
+        // after its writes is retried under the same job id, and a fresh cap per attempt would let
+        // one scheduled patrol apply several caps' worth unattended. Read here, before the patrol
+        // writes a line, so this attempt's own log cannot count against it.
+        applyBudget: await remainingApplyBudget({
+          db,
+          jobId: ctx.jobId,
+          producer: "[gardener]",
+          log: session.log,
+        }),
+        clock,
+        ctx,
+        nudge,
+        log: session.log,
+      };
+
+      await pullBoard(repo, (e) => console.error(`[gardener] board pull failed for ${repo}`, e));
+
+      // ── tier 1: the safe verbs ──
+      const applied = await applySafeVerbs(repo, ctx);
+
+      // Record the writes BEFORE the (fallible) report tier, on a row that stays invisible until the
+      // findings land. Both verbs are idempotent, so a retry after a report-verb failure closes
+      // nothing — without this the published report would say "closed 0 epics" for a patrol that did
+      // close work. Re-opening the same job id merges the attempts, so `actions` below is what this
+      // PATROL did, not just this attempt (hygiene.ts).
+      const { id: reportId, actions } = await startHygieneReport(db, clock, {
+        projectId,
+        jobId: ctx.jobId,
+        actions: applied,
+      });
+
+      // Propagate the writes before the (slower) report tier: what this patrol closed is what other
+      // machines most need, and a report-verb failure below must not strand it locally. Gated on what
+      // THIS attempt wrote — an idle patrol pushing every slot would make a clean board the noisiest
+      // thing on the remote, and a retry that changed nothing has nothing new to push.
+      if (applied.closedEpics.length > 0 || applied.rowsRecomputed > 0) {
+        console.log(
+          `[gardener] ${projectId}: closed ${applied.closedEpics.length} epic(s)` +
+            `${applied.closedEpics.length ? ` (${applied.closedEpics.join(", ")})` : ""}, ` +
+            `recomputed ${applied.rowsRecomputed} blocked row(s)`,
+        );
+        nudge(scope.project);
+      }
+
+      // ── tier 2: the report verbs (read-only) ──
+      //
+      // The premise fence opens HERE, before the first read this pass judges from — not just before
+      // tier 3's board snapshot. A retirement's evidence IS a hygiene finding (retire.ts reads the
+      // stale and duplicate rows), so a fence stamped after these verbs would date an edit that landed
+      // mid-report as already observed, and approval would settle a bead against a premise that edit
+      // falsified. Stamped BEFORE rather than after for the same reason at every read: a bead written
+      // while one is in flight may or may not be in its result, and the earlier fence dates it as
+      // unseen — a refusal at approve time, which is the safe direction. This is what apply compares
+      // "has this moved since we asked" against; the proposals' own `created_at` land later, once the
+      // sequential creates in tier 3 run.
+      const observedAtMs = clock.now();
+      const findings = await collectFindings(repo, ctx);
+
+      // Nothing above is guaranteed to notice a cancel — `heartbeat` doesn't inspect the signal and
+      // the bd reads settle on their own — so publishing is gated here explicitly: a cancelled patrol
+      // must not present a half-collected report as this run's answer. Its actions row survives,
+      // unpublished, and a resume of the same job completes it.
+      ctx.signal.throwIfAborted();
+      await completeHygieneReport(db, clock, reportId, findings);
+
+      console.log(`[gardener] ${projectId}: ${summarizeReport({ actions, findings })}`);
+
+      // ── tier 3: proposals (anton-9qwq) ──
+      //
+      // After the report is published, so a failure filing proposals costs the pass its judgment tier
+      // and not its findings.
       await fileGardenerProposals(scope, { findings, observedAtMs, arbitration: deps.arbitration });
     } catch (e) {
       await session.end("failed");

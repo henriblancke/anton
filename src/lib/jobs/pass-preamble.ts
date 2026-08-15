@@ -17,6 +17,7 @@ import type { ProposalAutonomyPolicy } from "../gardener/autonomy";
 import { getProjectById } from "../projects";
 import {
   appendSessionLog,
+  createSessionLog,
   endSession,
   startJobSession,
   type JobSession,
@@ -115,6 +116,13 @@ async function openRow(db: AntonDb, clock: Clock, input: PassSessionInput): Prom
     kind: input.kind,
     jobId: input.ctx.jobId,
   });
+  // The log is created WITH the row, so a pass session with no log file can only mean the log store
+  // broke. That is what lets a retry tell "the earlier attempt had nothing to say" from "its account
+  // was never written", and fail closed on the second (jobs/pass-budget.ts). Best-effort: a pass
+  // whose log is unwritable still runs — it just applies nothing unattended on the next attempt.
+  await createSessionLog(session.logPath).catch((e) =>
+    console.warn(`[${input.kind}] could not open the session log at ${session.logPath}`, e),
+  );
   input.ctx.report(
     input.cwd ? { sessionId: session.sessionId, cwd: input.cwd } : { sessionId: session.sessionId },
   );

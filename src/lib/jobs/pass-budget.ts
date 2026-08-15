@@ -13,14 +13,18 @@
  * this job written" — agreeing until the day one of them is not updated. Every attempted apply
  * writes exactly one APPLY record line, which is what the cap counts.
  *
- * Fails CLOSED. An attempt whose log will not read spent an unknown amount, so this attempt applies
- * nothing — the safe direction for a write nobody is watching, and it says so rather than quietly
- * arming. A log that was never created is the opposite and ordinary case: an attempt that wrote no
- * line applied no proposal. The one gap is a log write that itself failed (armed.ts `write` is
- * best-effort), which undercounts — the record says so in the attempt's own log.
+ * Fails CLOSED, and on the same evidence either way. An attempt whose log will not read spent an
+ * unknown amount, so this attempt applies nothing — the safe direction for a write nobody is
+ * watching, and it says so rather than quietly arming. A MISSING log is that same answer, not a
+ * quiet attempt: a pass opens its log with its session row (jobs/pass-preamble.ts), so a row with no
+ * log behind it is a log store that broke, which is exactly when an apply's record goes unwritten.
+ * An attempt that genuinely had nothing to say opened no row at all and is not read here.
+ *
+ * A partial log — created, then failing mid-append — is the residue this cannot see, and it
+ * undercounts by whatever it lost. The producer bounds that from the other end: a pass whose record
+ * line will not write stops applying (gardener/armed.ts), so at most one write per attempt can go
+ * unaccounted rather than a whole fresh allowance.
  */
-import { stat } from "node:fs/promises";
-
 import { MAX_APPLIES_PER_PASS } from "../gardener/emit";
 import { isPassLogLine, readPassRecords } from "../gardener/record";
 import { jobSessionLogPaths, readSessionLogLines } from "../sessions";
@@ -69,16 +73,8 @@ export async function remainingApplyBudget(input: ApplyBudgetInput): Promise<num
   return remaining;
 }
 
-/** One attempt's spend, or `undefined` when its log cannot say. */
+/** One attempt's spend, or `undefined` when its log cannot say — a missing log included. */
 async function attemptSpend(logPath: string): Promise<number | undefined> {
-  // A log that was never created belongs to an attempt that wrote no line at all — and an apply is
-  // recorded as it happens, so an attempt with nothing to say applied nothing.
-  const wrote = await stat(logPath).then(
-    () => true,
-    () => false,
-  );
-  if (!wrote) return 0;
-
   const { lines, unreadable } = await readSessionLogLines(logPath, isPassLogLine);
   if (unreadable) return undefined;
   const { records } = readPassRecords(lines.join("\n"));

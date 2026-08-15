@@ -14,7 +14,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -325,6 +325,41 @@ describe("gardener patrol", () => {
     const job = await expectJobStatus(t.db, jobId, "queued"); // retried, not settled
     expect(job.lastError).toContain("bd orphans");
     expect(await getHygieneReport(t.db, projectId)).toBeUndefined();
+  });
+
+  it("settles the session a failed pass opened before it ever reached the proposals", async () => {
+    // The write-budget read opens the row itself when an earlier attempt spent part of the cap — it
+    // writes a note saying so. Anything that throws after that (a report verb here) has to settle
+    // the row, or the jobs page shows a session "running" under a job that stopped hours ago.
+    const runner = makeJobRunner({
+      db: t.db,
+      clock,
+      type: "gardener",
+      handler: ({ db, clock: c }) => makeGardenerHandler({ db, clock: c, nudge, arbitration }),
+    });
+    const jobId = await runner.enqueue({ type: "gardener", projectId, payload: { projectId } });
+    const logPath = join(sessionsDir, "prior-attempt.log");
+    writeFileSync(
+      logPath,
+      "[gardener] APPLY p-9 (shipped-orphan) retire/close t-9 — APPLIED: closed t-9 as shipped\n",
+    );
+    await t.db.insert(schema.sessions).values({
+      id: "s-prior",
+      projectId,
+      jobId,
+      kind: "gardener",
+      status: "failed",
+      logPath,
+      startedAt: new Date(NOW - 60_000),
+    });
+    orphansMock.mockRejectedValue(new Error("bd orphans: output was not JSON"));
+
+    expect(await runner.tickOnce()).toBe(1);
+    await runner.whenIdle();
+    await expectJobStatus(t.db, jobId, "queued"); // retried, not settled
+
+    const opened = (await t.db.select().from(schema.sessions)).filter((s) => s.id !== "s-prior");
+    expect(opened.map((s) => s.status)).toEqual(["failed"]);
   });
 
   it("publishes what the FIRST attempt closed, even though the retry closes nothing", async () => {
@@ -988,6 +1023,31 @@ describe("gardener patrol · armed", () => {
     const summary = log.mock.calls.map(([line]) => String(line)).find((l) => l.includes("refused"));
     expect(summary).toBe("[gardener] 1 refused");
     log.mockRestore();
+  });
+
+  it("stops applying once its record will not write — spending a cap it cannot count", async () => {
+    // The record IS the accounting: a retry of this job reconstructs what earlier attempts spent
+    // from these lines (pass-budget.ts). A pass whose log will not take them has already made one
+    // board write nothing can see, and spending the rest of the cap on top of it is how one
+    // scheduled patrol ends up applying several caps' worth across its attempts.
+    const blocked = join(sessionsDir, "not-a-directory");
+    writeFileSync(blocked, "");
+    process.env.ANTON_SESSIONS_ROOT = join(blocked, "sessions");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const subjects = ["t-1", "t-2", "t-3"];
+    orphansMock.mockResolvedValue(subjects.map(orphan));
+    boardIs(() => subjects.map(cold));
+
+    await expectJobStatus(t.db, await runPatrol(), "done");
+
+    // One subject moved, not three: the pass applied, failed to record it, and stopped.
+    expect(closedIds().filter((id) => subjects.includes(id))).toHaveLength(1);
+    expect(error.mock.calls.map((args) => args.join(" ")).join("\n")).toContain(
+      "stopped applying — the record for",
+    );
+    warn.mockRestore();
+    error.mockRestore();
   });
 
   it("keeps the pass green when an apply blows up, and still writes the ones behind it", async () => {

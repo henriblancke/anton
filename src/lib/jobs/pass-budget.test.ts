@@ -119,12 +119,24 @@ describe("remainingApplyBudget", () => {
   });
 
   it("gives the full cap to a job whose earlier attempt never wrote a line", async () => {
-    // The ordinary shape of an attempt that died early: the session row stands, but nothing was
-    // ever appended — and an apply is recorded as it happens, so it applied nothing.
-    await attempt("s-1", undefined, 1_700_000_000_000);
+    // The ordinary shape of an attempt that died early: its log was opened with its session row and
+    // nothing was ever appended — and an apply is recorded as it happens, so it applied nothing.
+    await attempt("s-1", "", 1_700_000_000_000);
 
     expect(await budget()).toBe(MAX_APPLIES_PER_PASS);
     expect(logged).toEqual([]);
+  });
+
+  it("applies NOTHING when an earlier attempt's session row has no log behind it", async () => {
+    // A pass opens its log WITH its row (pass-preamble.ts), so a row with no log is a log store that
+    // broke — which is exactly the moment an apply's record goes unwritten. Reading that as "the
+    // attempt was quiet" is what would hand this retry a fresh allowance over writes already made.
+    await attempt("s-1", undefined, 1_700_000_000_000);
+
+    expect(await budget()).toBe(0);
+    expect(logged.join("")).toContain(
+      "left a session log anton could not read, so what it applied unattended is unknown",
+    );
   });
 
   it("applies NOTHING when an earlier attempt's log will not read", async () => {

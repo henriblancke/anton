@@ -69,7 +69,10 @@ export interface ArmedResult {
    * The product-master pass files two tiers through one filer, and the cap is per pass, not per tier.
    */
   attempted: number;
-  /** Armed proposals the cap held back. Still open, and still ordinary asks. */
+  /**
+   * Armed proposals this call did not apply — held back by the cap, or left untried because the
+   * record could no longer be written. Still open, and still ordinary asks.
+   */
   deferred: string[];
 }
 
@@ -136,13 +139,29 @@ export async function applyArmedProposals(input: ArmedInput): Promise<ArmedResul
   }
 
   const records: ArmedRecord[] = [];
-  for (const { proposal, plan } of targets.slice(0, limit)) {
+  const attempts = targets.slice(0, limit);
+  for (const [i, { proposal, plan }] of attempts.entries()) {
     // Between every apply, not once up front: each one is a board write, and a cancel arriving
     // mid-loop has to stop the rest rather than let a cancelled pass finish every armed move.
     if (input.signal?.aborted) break;
     const record = await applyOne(input, proposal.id, plan);
     records.push(record);
-    await write(input, lineOf(record));
+    if (await write(input, lineOf(record))) continue;
+
+    // The record IS the accounting: a retry of this job reconstructs what earlier attempts spent
+    // from these very lines (jobs/pass-budget.ts), so a write that fails leaves an unattended board
+    // write nothing can see. The pass stops applying at that point rather than spending more of a
+    // cap it can no longer count — one unaccounted write is the bound, not a whole fresh allowance.
+    const untried = attempts.slice(i + 1).map((target) => target.proposal.id);
+    held.push(...untried);
+    console.error(
+      `${input.producer} stopped applying — the record for ${proposal.id} could not be written, so ` +
+        `this pass can no longer account for what it spends` +
+        (untried.length > 0
+          ? `; ${untried.length} armed proposal(s) stay open as ordinary asks (${untried.join(", ")})`
+          : ""),
+    );
+    break;
   }
 
   if (records.length > 0) {
@@ -261,14 +280,21 @@ function summaryOf(records: ArmedRecord[]): string {
 /**
  * Best-effort, like the shadow's: a session log that will not take a write must not fail the pass —
  * but it is never silent either, or a broken log store reads as a pass that applied nothing.
+ *
+ * Reports whether the line landed, because for an apply that answer is not cosmetic: it is whether
+ * the spend was recorded at all (see the loop above).
  */
 async function write(
   input: Pick<ArmedInput, "producer" | "log">,
   line: string,
-): Promise<void> {
-  await input.log(`${input.producer} ${line}\n`).catch((e) => {
-    console.warn(`${input.producer} could not record an apply — ${messageOf(e)}: ${line}`);
-  });
+): Promise<boolean> {
+  return input.log(`${input.producer} ${line}\n`).then(
+    () => true,
+    (e) => {
+      console.warn(`${input.producer} could not record an apply — ${messageOf(e)}: ${line}`);
+      return false;
+    },
+  );
 }
 
 const messageOf = (e: unknown): string => (e instanceof Error ? e.message : String(e));

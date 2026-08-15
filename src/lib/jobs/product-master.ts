@@ -93,29 +93,33 @@ export function makeProductMasterHandler(deps: ProductMasterDeps): JobHandler {
       cwd: repo,
     });
     const log = session.log;
-    const scope: PassScope = {
-      project: { id: project.id, repoPath: repo },
-      slug: project.slug,
-      // Read once: a policy change mid-pass must not have the two tiers shadowing under different
-      // rules (anton-nbyy).
-      policy: resolveAutonomyPolicy(settings),
-      // What earlier attempts of THIS job already applied comes off the cap: the runner retries a
-      // pass that died after its writes under the same job id, and a fresh cap per attempt would
-      // let one scheduled pass apply several caps' worth unattended. Read before the pass writes
-      // anything, so this attempt's own (empty) log cannot count against it.
-      applyBudget: await remainingApplyBudget({
-        db,
-        jobId: ctx.jobId,
-        producer: "[product-master]",
-        log,
-      }),
-      clock,
-      ctx,
-      nudge,
-      log,
-    };
 
+    // The row exists from here on, so everything that can throw settles it — the budget read
+    // included. A pass whose db read failed before the first tier would otherwise leave a session
+    // reading "running" with no job behind it.
     try {
+      const scope: PassScope = {
+        project: { id: project.id, repoPath: repo },
+        slug: project.slug,
+        // Read once: a policy change mid-pass must not have the two tiers shadowing under different
+        // rules (anton-nbyy).
+        policy: resolveAutonomyPolicy(settings),
+        // What earlier attempts of THIS job already applied comes off the cap: the runner retries a
+        // pass that died after its writes under the same job id, and a fresh cap per attempt would
+        // let one scheduled pass apply several caps' worth unattended. Read before the pass writes
+        // anything, so this attempt's own (empty) log cannot count against it.
+        applyBudget: await remainingApplyBudget({
+          db,
+          jobId: ctx.jobId,
+          producer: "[product-master]",
+          log,
+        }),
+        clock,
+        ctx,
+        nudge,
+        log,
+      };
+
       // Pull first, as every board-derived write does: this checkout's Dolt state can be a sync
       // heartbeat behind, and a proposal another machine filed is a fingerprint this pass would
       // otherwise re-raise.

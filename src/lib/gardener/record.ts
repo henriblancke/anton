@@ -182,15 +182,30 @@ export function readPassRecords(log: string): PassRecordSummary {
   return { records, notes };
 }
 
-/** How many proposals landed in each outcome — the counts the record leads with. */
-export function passRecordCounts(summary: PassRecordSummary): Record<PassRecordOutcome, number> {
-  const counts: Record<PassRecordOutcome, number> = {
+/**
+ * How a READER groups the records — finer than {@link PassRecordOutcome} in exactly one place, and
+ * for one reason: an `error` means two different things depending on which half of the pass wrote
+ * it. An apply that broke was a real write, rolled back; a shadow that broke never attempted one, so
+ * telling a founder their board "could not apply" it — a write that may have been rolled back —
+ * describes an event that never happened.
+ */
+export type PassRecordGroup = Exclude<PassRecordOutcome, "error"> | "apply-failed" | "shadow-failed";
+
+export function passRecordGroup(record: PassRecord): PassRecordGroup {
+  if (record.outcome !== "error") return record.outcome;
+  return record.mode === "apply" ? "apply-failed" : "shadow-failed";
+}
+
+/** How many proposals landed in each group — the counts the record leads with. */
+export function passRecordCounts(summary: PassRecordSummary): Record<PassRecordGroup, number> {
+  const counts: Record<PassRecordGroup, number> = {
     applied: 0,
     shadowed: 0,
     refused: 0,
-    error: 0,
+    "apply-failed": 0,
+    "shadow-failed": 0,
   };
-  for (const record of summary.records) counts[record.outcome] += 1;
+  for (const record of summary.records) counts[passRecordGroup(record)] += 1;
   return counts;
 }
 

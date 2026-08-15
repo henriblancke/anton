@@ -102,6 +102,16 @@ export async function setSessionClaudeId(
     .where(eq(schema.sessions.id, id));
 }
 
+/**
+ * Create a session's log file, empty. Called where the row is opened so the two come into being
+ * together: a session row whose log is MISSING then means the log store broke, not that the session
+ * had nothing to say — the distinction a pass's write budget fails closed on (jobs/pass-budget.ts).
+ */
+export async function createSessionLog(logPath: string): Promise<void> {
+  await mkdir(dirname(logPath), { recursive: true });
+  await (await open(logPath, "a")).close();
+}
+
 /** Append a chunk to a session log, creating the parent dir on first write. */
 export async function appendSessionLog(logPath: string, chunk: string): Promise<void> {
   await mkdir(dirname(logPath), { recursive: true });

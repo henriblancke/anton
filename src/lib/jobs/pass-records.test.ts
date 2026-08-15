@@ -100,6 +100,25 @@ describe("passRecordsByJob", () => {
     expect(records.broke.records.map((r) => r.outcome)).toEqual(["applied"]);
   });
 
+  // The same claim as the no-session case, and it has to fail the same way: a product-master pass
+  // that is still judging has a session log full of transcript and no record line in it yet. An
+  // empty summary there would render "Clean pass" under a job whose judgment has not finished — or,
+  // worse, under one that failed after opening its session but before deciding anything.
+  it("says nothing about an unfinished pass whose log holds no record yet", async () => {
+    const records = await passRecordsByJob(
+      [job("mid-flight", "product-master", "running"), job("broke-early", "gardener", "failed")],
+      {
+        "mid-flight": {
+          id: "s-mid",
+          logPaths: [logFile("mid.log", "[assistant] still reading the board\n")],
+        },
+        "broke-early": { id: "s-early", logPaths: [logFile("early.log", "")] },
+      },
+    );
+
+    expect(Object.keys(records)).toEqual([]);
+  });
+
   // The product-master pass writes its revalidation tier's APPLY lines BEFORE it streams a claude
   // transcript, so anything reading only the end of the log drops an unattended write and calls the
   // pass clean. The transcript here is comfortably past the old 256KB tail window.

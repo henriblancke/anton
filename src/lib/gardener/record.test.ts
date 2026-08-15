@@ -12,6 +12,7 @@ import { describe, expect, it } from "vitest";
 import {
   isCleanPass,
   passRecordCounts,
+  passRecordGroup,
   passRecordLine,
   readPassRecords,
   type PassRecordLine,
@@ -122,7 +123,27 @@ describe("readPassRecords", () => {
     const summary = readPassRecords(log);
 
     // Conflating them would tell a founder the board declined when in fact anton failed mid-write.
-    expect(passRecordCounts(summary)).toEqual({ applied: 0, shadowed: 0, refused: 1, error: 1 });
+    expect(passRecordCounts(summary)).toEqual({
+      applied: 0,
+      shadowed: 0,
+      refused: 1,
+      "apply-failed": 1,
+      "shadow-failed": 0,
+    });
+  });
+
+  it("counts a shadow that broke apart from an apply that broke", async () => {
+    // Both are `error`, and only one of them touched the board: an apply that broke was a write,
+    // rolled back, while a shadow that broke never attempted one. A reader told "could not apply"
+    // about the second would go looking for a write that was never made.
+    const log =
+      logged("gardener", { ...APPLIED, verdict: "COULD NOT APPLY", detail: "bd exploded" }) +
+      logged("gardener", { ...SHADOWED, verdict: "COULD NOT SHADOW", detail: "board unreadable" });
+    const summary = readPassRecords(log);
+
+    expect(summary.records.map(passRecordGroup)).toEqual(["apply-failed", "shadow-failed"]);
+    expect(passRecordCounts(summary)["apply-failed"]).toBe(1);
+    expect(passRecordCounts(summary)["shadow-failed"]).toBe(1);
   });
 
   it("counts every shadow verdict as shadowed — nothing was written on any of them", () => {

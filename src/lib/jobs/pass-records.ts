@@ -8,7 +8,12 @@
  * gardener patrol over a clean board deliberately leaves no session row behind (pass-preamble.ts
  * `deferPassSession`) and a missing entry would render as a broken row rather than as a quiet pass.
  */
-import { isPassLogLine, readPassRecords, type PassRecordSummary } from "../gardener/record";
+import {
+  isCleanPass,
+  isPassLogLine,
+  readPassRecords,
+  type PassRecordSummary,
+} from "../gardener/record";
 import { readSessionLogLines, type JobSessionLink } from "../sessions";
 import type { JobStatus, JobType } from "./queue";
 
@@ -34,11 +39,15 @@ export interface PassJob {
  * at most a page's worth of files, and reading them in series would put the jobs list behind every
  * one of them.
  *
- * A pass with no session gets an entry only when it COMPLETED. A queued pass has not started, a
- * running one has not finished, and a failed one may have died before its deferred session was ever
- * opened (mid-`applySafeVerbs`, mid-`collectFindings`) — calling any of those a clean pass would put
- * "nothing applied, shadowed or refused" under a job that never reached the point of deciding. They
- * get no entry at all, and the row renders without a record panel.
+ * SILENCE is a result only for a pass that COMPLETED — and that holds whether the silence is a
+ * missing session or a session log with nothing on it. A queued pass has not started, a running one
+ * has not finished, and a failed one may have died before it reached the point of deciding
+ * (mid-`applySafeVerbs`, mid-`collectFindings`) or before its deferred session was ever opened;
+ * calling any of those a clean pass would put "nothing applied, shadowed or refused" under a job
+ * that has not answered yet. They get no entry at all, and the row renders without a record panel.
+ *
+ * An unfinished pass that DID record something keeps its entry: those writes are on the board
+ * whatever the job goes on to do, which is the one thing this record exists to show.
  */
 export async function passRecordsByJob(
   jobs: readonly PassJob[],
@@ -48,10 +57,9 @@ export async function passRecordsByJob(
   const summaries = await Promise.all(
     passes.map(async (job): Promise<[string, PassRecordSummary] | undefined> => {
       const logPaths = sessions[job.id]?.logPaths ?? [];
-      if (logPaths.length === 0) {
-        return job.status === COMPLETED ? [job.id, { records: [], notes: [] }] : undefined;
-      }
-      return [job.id, await readAttempts(logPaths)];
+      const summary = logPaths.length > 0 ? await readAttempts(logPaths) : { records: [], notes: [] };
+      if (isCleanPass(summary) && job.status !== COMPLETED) return undefined;
+      return [job.id, summary];
     }),
   );
   return Object.fromEntries(summaries.filter((entry) => entry !== undefined));
