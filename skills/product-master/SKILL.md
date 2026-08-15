@@ -1,6 +1,6 @@
 ---
 name: product-master
-version: 93140bc76da5
+version: 07c876293182
 description: >-
   Reasoning contract for anton's scheduled product-master pass: in a fresh context, read the whole
   board — tiers, ordering edges, priorities, ages, sizes, review-score history, recent run outcomes —
@@ -72,6 +72,11 @@ it, a card off the container epic that groups it, and nothing off its own descen
 below names every bead's current home and lists the container epics, so propose a home you can see —
 anton refuses one that is already the parent, that is not on the board, that a run owns, or that the
 tiers will not allow.
+
+**A container epic is never the SUBJECT.** It groups the board's cards rather than riding one, so the
+taxonomy names no home above it — a card is not one, and hanging a container under a card would hand
+that card's run every ticket beneath it. The context lists them; if a container is filed under the
+wrong thing, that is a shaping question for a human, not a `rehome`.
 
 **Work the context flags as riding no run target is not yours to re-home.** Giving homeless work its
 first home is the gardener pass's mechanical proposal; your question is a home that is *wrong*, not

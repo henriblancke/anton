@@ -22,13 +22,19 @@ const NOW = Date.parse("2026-08-04T12:00:00Z");
 /** A report block exactly as the protocol demands it — the shape every parse case varies from. */
 const report = (body: string): string => `Here is what I found.\n\n\`\`\`json\n${body}\n\`\`\``;
 
-const claim = (o: Partial<PmClaim> = {}): PmClaim => ({
-  kind: "kill",
-  bead: "anton-a",
-  summary: "nothing wants this any more",
-  evidence: ["three reviews at 3, 2, 2"],
-  ...o,
-});
+/**
+ * A claim of any kind: the `kill` shape — the only one needing no per-kind field — with the case's
+ * own overrides spread over it. The assertion is what a factory over a discriminated union costs;
+ * each call site names the field its kind requires.
+ */
+const claim = (o: Partial<PmClaim> = {}): PmClaim =>
+  ({
+    kind: "kill",
+    bead: "anton-a",
+    summary: "nothing wants this any more",
+    evidence: ["three reviews at 3, 2, 2"],
+    ...o,
+  }) as PmClaim;
 
 describe("formatPmBoardContext", () => {
   const board = [

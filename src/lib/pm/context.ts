@@ -49,26 +49,43 @@ export const CLAIM_KINDS = {
 
 export type ClaimKind = keyof typeof CLAIM_KINDS;
 
-/** One judgment the session reported, before anything has checked it against the board. */
-export interface PmClaim {
-  kind: ClaimKind;
+/** What every claim carries whatever it asks for. */
+interface PmClaimBase {
   /** The bead the claim is about. */
   bead: string;
-  /** `reprioritize` only: the priority the bead should carry, as `P0`…`P4`. */
-  priority?: string;
-  /** `order` only: the bead that has to land first. */
-  blockedBy?: string;
-  /**
-   * `rehome` only: the bead the subject should hang under — the epic a feature belongs to, or the
-   * card that should carry a ticket. One field for both cases, because they are one claim about one
-   * relation; which tier is legal is the board's answer, not the session's ({@link rehomeRefusal}).
-   */
-  home?: string;
-  /** `split` only: the decomposition sketch, one line per proposed ticket. */
-  pieces?: string[];
   summary: string;
   evidence: string[];
 }
+
+/** `reprioritize`: the priority the bead should carry, as `P0`…`P4`. */
+export type PmClaimReprioritize = PmClaimBase & { kind: "reprioritize"; priority: string };
+/** `order`: the bead that has to land first. */
+export type PmClaimOrder = PmClaimBase & { kind: "order"; blockedBy: string };
+/**
+ * `rehome`: the bead the subject should hang under — the epic a feature belongs to, or the card that
+ * should carry a ticket. One field for both cases, because they are one claim about one relation;
+ * which tier is legal is the board's answer, not the session's ({@link rehomeRefusal}).
+ */
+export type PmClaimRehome = PmClaimBase & { kind: "rehome"; home: string };
+/** `split`: the decomposition sketch, one line per proposed ticket. */
+export type PmClaimSplit = PmClaimBase & { kind: "split"; pieces: string[] };
+/** `kill`: the ask is the bead itself, so the evidence is all there is. */
+export type PmClaimKill = PmClaimBase & { kind: "kill" };
+
+/**
+ * One judgment the session reported, before anything has checked it against the board.
+ *
+ * A union rather than one shape with optional fields, because the per-kind field is what the claim
+ * IS: a `rehome` without a home has nothing anton could write. {@link toClaim} is the only producer
+ * and refuses an entry missing it, so every reader downstream sees the guarantee at its own site
+ * instead of inheriting it from a call site two files away.
+ */
+export type PmClaim =
+  | PmClaimReprioritize
+  | PmClaimOrder
+  | PmClaimRehome
+  | PmClaimSplit
+  | PmClaimKill;
 
 /**
  * How a pass broke the protocol. Deliberately NOT folded into "no proposals": a session that never
@@ -581,30 +598,30 @@ function toClaim(entry: unknown): PmClaim | undefined {
   const evidence = lines(raw.evidence);
   if (!evidence?.length) return undefined;
 
-  const claim: PmClaim = { kind: kind as ClaimKind, bead, summary, evidence };
-  switch (claim.kind) {
+  const base: PmClaimBase = { bead, summary, evidence };
+  switch (kind as ClaimKind) {
     case "reprioritize": {
       const priority = str(raw.priority);
       if (!priority || !/^P[0-4]$/.test(priority)) return undefined;
-      return { ...claim, priority };
+      return { ...base, kind: "reprioritize", priority };
     }
     case "order": {
       const blockedBy = str(raw.blockedBy);
-      return blockedBy ? { ...claim, blockedBy } : undefined;
+      return blockedBy ? { ...base, kind: "order", blockedBy } : undefined;
     }
     case "rehome": {
       // A home claim names two beads, and the second is the whole content of the ask: "this is
       // misfiled" with no home to move it to has nothing anton could ever write.
       const home = str(raw.home);
-      return home ? { ...claim, home } : undefined;
+      return home ? { ...base, kind: "rehome", home } : undefined;
     }
     case "split": {
       const pieces = lines(raw.pieces);
       // Two is the smallest decomposition there is; one "piece" is the ticket restated.
-      return pieces && pieces.length >= 2 ? { ...claim, pieces } : undefined;
+      return pieces && pieces.length >= 2 ? { ...base, kind: "split", pieces } : undefined;
     }
     case "kill":
-      return claim;
+      return { ...base, kind: "kill" };
   }
 }
 
@@ -638,7 +655,9 @@ export function detectionsFor(claims: PmClaim[], board: Bead[], nowMs: number): 
   const rejected: RejectedClaim[] = [];
 
   for (const claim of claims) {
-    const refusal = subjectRefusal(claim, index, nowMs) ?? kindRefusal(claim, index, nowMs);
+    const checked = subjectChecked(claim, index, nowMs);
+    const refusal =
+      "refusal" in checked ? checked.refusal : kindRefusal(claim, checked.subject, index, nowMs);
     if (refusal) {
       rejected.push({ claim, reason: refusal });
       continue;
@@ -648,39 +667,51 @@ export function detectionsFor(claims: PmClaim[], board: Bead[], nowMs: number): 
   return { detections, rejected };
 }
 
-/** Why this claim's SUBJECT cannot carry a proposal at all — the bars every kind shares. */
-function subjectRefusal(claim: PmClaim, index: BoardIndex, nowMs: number): string | undefined {
+/**
+ * The claim's SUBJECT, or why it cannot carry a proposal at all — the bars every kind shares.
+ *
+ * Returns the bead rather than a boolean so every bar downstream HOLDS the thing those bars proved
+ * exists, instead of looking it up again and asserting the guarantee a caller established.
+ */
+function subjectChecked(
+  claim: PmClaim,
+  index: BoardIndex,
+  nowMs: number,
+): { subject: Bead } | { refusal: string } {
   const subject = index.byId.get(claim.bead);
-  if (!subject) return `${claim.bead} is not on the board`;
-  if (isProposalBead(subject)) return `${claim.bead} is itself a proposal, not work`;
-  if (!isOpenWork(subject)) return `${claim.bead} is already settled`;
-  if (isInFlight(subject, nowMs)) return `${claim.bead} is mid-run — a proposal would race the run`;
-  return undefined;
+  if (!subject) return { refusal: `${claim.bead} is not on the board` };
+  if (isProposalBead(subject)) return { refusal: `${claim.bead} is itself a proposal, not work` };
+  if (!isOpenWork(subject)) return { refusal: `${claim.bead} is already settled` };
+  if (isInFlight(subject, nowMs)) {
+    return { refusal: `${claim.bead} is mid-run — a proposal would race the run` };
+  }
+  return { subject };
 }
 
 /** Why this claim's own move cannot stand, or undefined. */
-function kindRefusal(claim: PmClaim, index: BoardIndex, nowMs: number): string | undefined {
+function kindRefusal(
+  claim: PmClaim,
+  subject: Bead,
+  index: BoardIndex,
+  nowMs: number,
+): string | undefined {
   switch (claim.kind) {
-    case "reprioritize": {
-      const current = index.byId.get(claim.bead)?.priority;
-      return current !== undefined && `P${current}` === claim.priority
+    case "reprioritize":
+      return subject.priority !== undefined && `P${subject.priority}` === claim.priority
         ? `${claim.bead} is already at ${claim.priority}`
         : undefined;
-    }
     case "order":
       return orderRefusal(claim, index);
     case "rehome":
-      return rehomeRefusal(claim, index, nowMs);
-    // A deferred bead is still OPEN work, so `subjectRefusal` waves it through — but a kill applies as
+      return rehomeRefusal(claim, subject, index, nowMs);
+    // A deferred bead is still OPEN work, so `subjectChecked` waves it through — but a kill applies as
     // `defer`, and `planRetire` settles an already-deferred subject without writing anything. Left
     // unchecked the ask reaches the board, costs a founder a decision, and settles as a no-op. The
     // gardener's stale detector excludes deferred beads for this exact reason (gardener/retire.ts).
-    case "kill": {
-      const subject = index.byId.get(claim.bead);
-      return subject && beads.isDeferred(subject)
+    case "kill":
+      return beads.isDeferred(subject)
         ? `${claim.bead} is already deferred — killing it again would change nothing`
         : undefined;
-    }
     default:
       return undefined;
   }
@@ -693,8 +724,8 @@ function kindRefusal(claim: PmClaim, index: BoardIndex, nowMs: number): string |
  * no ask: it sits on the board asking a founder to approve something anton will refuse, until
  * somebody declines it by hand (the anton-wsap failure mode).
  */
-function orderRefusal(claim: PmClaim, index: BoardIndex): string | undefined {
-  const blockerId = claim.blockedBy as string;
+function orderRefusal(claim: PmClaimOrder, index: BoardIndex): string | undefined {
+  const blockerId = claim.blockedBy;
   if (blockerId === claim.bead) return `${claim.bead} cannot block itself`;
   const blocker = index.byId.get(blockerId);
   if (!blocker) return `${blockerId} is not on the board`;
@@ -728,10 +759,13 @@ function orderRefusal(claim: PmClaim, index: BoardIndex): string | undefined {
  * filing check and the approve check cannot disagree about which homes the taxonomy allows — a
  * ticket hangs off the card that runs it, a card off the container epic that groups it.
  */
-function rehomeRefusal(claim: PmClaim, index: BoardIndex, nowMs: number): string | undefined {
-  const homeId = claim.home as string;
-  // `subjectRefusal` has already proved the subject is on the board and free to write to.
-  const subject = index.byId.get(claim.bead) as Bead;
+function rehomeRefusal(
+  claim: PmClaimRehome,
+  subject: Bead,
+  index: BoardIndex,
+  nowMs: number,
+): string | undefined {
+  const homeId = claim.home;
   if (homeId === claim.bead) return `${claim.bead} cannot be its own home`;
   if ((beads.parentOf(subject) ?? "") === homeId) {
     return `${claim.bead} already hangs under ${homeId} — the move would write nothing`;
@@ -817,7 +851,7 @@ function detectionFor(claim: PmClaim): GardenerDetection {
         // without a decomposition asks a founder to do the thinking the pass was run to do.
         evidence: [
           ...claim.evidence,
-          ...(claim.pieces ?? []).map((piece, i) => `proposed ticket ${i + 1}: ${piece}`),
+          ...claim.pieces.map((piece, i) => `proposed ticket ${i + 1}: ${piece}`),
         ],
       });
     case "kill":
