@@ -133,10 +133,6 @@ export const SCAN_HEALTH_WINDOW = 14;
 /** Insertion order, newest first — the tiebreak for two scans landing inside the same second. */
 const NEWEST_FIRST = sql`rowid desc`;
 
-function secDate(ms: number): Date {
-  return new Date(Math.floor(ms / 1000) * 1000);
-}
-
 function toEpoch(value: unknown): number {
   if (value instanceof Date) return Math.floor(value.getTime() / 1000);
   return Number(value ?? 0);
@@ -284,199 +280,394 @@ async function findScanSummaryByJob(
 }
 
 /**
+ * WHICH WINDOW a later attempt scanned — the one question every correction in
+ * {@link reconcileAttempt} reads off. The point names both ends of its own
+ * ({@link ScanSummary.deltaStateBefore}, {@link ScanSummary.deltaState}), so a rescan that REPLAYED
+ * the point's window and one that CONTINUED past it can't be confused. Neither moves where the
+ * window opens, so that end is written once and never corrected.
+ */
+interface AttemptWindow {
+  /**
+   * The attempt ran stringer, so `--delta`'s state has advanced past the one the point publishes and
+   * the retained value is a claim nothing holds — including where anton could not identify the state
+   * the attempt left, which clears the point's rather than leaving a stale one.
+   *
+   * Requires the point to name where its own window ENDED: absent, nothing can be proven contiguous,
+   * and advancing to the retry's state would hand the next scan a baseline to measure from while the
+   * counts it would be differenced against silently exclude the retry's window.
+   */
+  rescanned: boolean;
+  /** {@link attemptReplays} — the retry re-measured the window this point already holds. */
+  replays: boolean;
+  /** {@link attemptAbuts} — the retry measured the window that starts where this point's ends. */
+  abuts: boolean;
+  /** Contiguous AND an arrival rate: the only case where two windows' counts sum. */
+  folds: boolean;
+}
+
+/**
+ * The retry measured from exactly where this point's window OPENS, so it rescanned that window
+ * whole. That is the ordinary shape of a retry, not an oddity: a pass that dies before triage hands
+ * its window back (src/lib/jobs/nightly-stringer.ts), precisely so the retry rescans it rather than
+ * closing green over untriaged findings.
+ *
+ * A pass that ESTABLISHED the baseline replays the same way and names neither end: its window opens
+ * at no baseline at all, so handing it back DELETES stringer's state file (lib/stringer) and the
+ * retry scanned the whole repo from absent again. Both ends must be an OBSERVED baseline scan
+ * ({@link ScanSummary.baselineScan}) — a missing `before` on a basis anton never identified is not
+ * evidence the window reopened where this one did.
+ */
+function attemptReplays(existing: ScanSummary, attempt: DeltaState | undefined): boolean {
+  const reopened = attempt?.before !== undefined && attempt.before === existing.deltaStateBefore;
+  const rebaselined =
+    attempt?.baselineScan === true &&
+    attempt.before === undefined &&
+    existing.baselineScan === true &&
+    existing.deltaStateBefore === undefined;
+  return reopened || rebaselined;
+}
+
+/**
+ * The retry measured from exactly the state this point ended at: proof its window starts where the
+ * point's ends, and the only case where their counts can be one measurement. This is the shape of a
+ * pass that already triaged and then died — nothing was handed back, so the retry scanned the next
+ * window along.
+ */
+function attemptAbuts(existing: ScanSummary, attempt: DeltaState | undefined): boolean {
+  return attempt?.before !== undefined && attempt.before === existing.deltaState;
+}
+
+/**
+ * A point whose counts are a whole-repo STANDING TOTAL never folds, however cleanly the windows
+ * abut. `--delta` reports what stringer newly OBSERVED, never what was REMOVED, so a standing total
+ * plus the arrivals since it is an upper bound rather than the repo at the retry's end: 100
+ * outstanding, 20 fixed and 3 arrived is 83 in the repo, and 103 is a quantity nobody measured. The
+ * retained total IS a measurement — the repo as that scan saw it — so it stands, and the retry's
+ * window goes uncounted. The hole costs the trend nothing it could have used: a standing total is
+ * charted apart from the arrival columns and licenses no subtraction, so those arrivals were never
+ * going to move a trend line, where inflating the column misstates the one thing it does say.
+ * Folding is the same class of claim as subtracting and takes the same proof — `baselineScan ===
+ * false`, an arrival rate, where two abutting windows' arrivals sum EXACTLY. (A standing total still
+ * abuts for {@link publishedState}: the state it hands on can be consumed into no wrong number,
+ * since both the delta and the fold demand that same proof of it.) A REPLAY needs no such guard: it
+ * never adds to a total, it replaces one measured over the same window — and a point that names
+ * where its window opens read a baseline off the repo to begin with, which is what makes it
+ * incremental (`lib/stringer`).
+ */
+function classifyAttempt(existing: ScanSummary, input: SaveScanSummaryInput): AttemptWindow {
+  const attempt = input.deltaState;
+  const replays = attemptReplays(existing, attempt);
+  // A replay wins the tie a point whose window opened and closed on the same state would otherwise
+  // create — nothing was consumed there, so there is no second window to add.
+  const abuts = !replays && attemptAbuts(existing, attempt);
+  return {
+    rescanned: attempt !== undefined && existing.deltaState !== undefined,
+    replays,
+    abuts,
+    folds: abuts && existing.baselineScan === false,
+  };
+}
+
+/**
+ * THE WINDOW THE POINT MEASURED. A retry that ran stringer again consumed a window of its own, and
+ * those signals are gone from stringer's baseline — no later scan will ever report them. Dropping
+ * them would leave a hole in the series exactly where a pass was slow (a long quota backoff is where
+ * the retry's window is most likely to be a real day's arrivals, not an empty re-check). So when the
+ * windows ABUT, fold its counts in and the point measures the whole pass, start to finish. Without
+ * that proof of contiguity there is no union to count: a retry that re-established the baseline
+ * emitted a standing total, which double-counts the retained signals.
+ *
+ * A REPLAY re-measured everything this point holds, plus whatever arrived during the backoff, so its
+ * numbers SUPERSEDE the retained ones. Adding them instead would double-count the window; keeping
+ * the retained ones would strand a real day's arrivals. A replay can also come back LOWER (fixed in
+ * the meantime), which is a fact about the repo and belongs on the point.
+ */
+function reconciledCounts(
+  existing: ScanSummary,
+  input: SaveScanSummaryInput,
+  attemptWindow: AttemptWindow,
+): ScanCounts {
+  if (attemptWindow.replays) return input.counts;
+  return attemptWindow.folds ? addCounts(existing.counts, input.counts) : existing.counts;
+}
+
+/**
+ * COMPLETENESS. A folded window brings its collector outages with it, so the failures add — the
+ * union is whole only if BOTH attempts ran every collector. A replay re-measured the whole window,
+ * so its collectors alone decide whether the point is whole.
+ */
+function reconciledFailures(
+  existing: ScanSummary,
+  input: SaveScanSummaryInput,
+  attemptWindow: AttemptWindow,
+): number {
+  if (attemptWindow.replays) return input.collectorFailures ?? 0;
+  return existing.collectorFailures + (attemptWindow.folds ? (input.collectorFailures ?? 0) : 0);
+}
+
+/**
+ * TRIAGE. An outcome covers the WINDOW it triaged, not the point. An attempt that consumed no window
+ * of its own reported on the retained signals, so it backfills a report the first attempt never got
+ * out. An attempt carrying a window of its own reported on THAT window: it joins the first attempt's
+ * outcome when its signals folded in, and is dropped when they didn't — nothing on the point is what
+ * it triaged. A replay triaged the point's whole window, so its report is the point's, and the
+ * retained one described a measurement that no longer stands however it came out.
+ */
+function reconciledTriage(
+  existing: ScanSummary,
+  input: SaveScanSummaryInput,
+  attemptWindow: AttemptWindow,
+): TriageOutcome | undefined {
+  if (attemptWindow.replays) return input.triage;
+  // A scan window of its own is what makes this attempt's report someone else's.
+  const backfill = input.deltaState === undefined && !existing.triage ? input.triage : undefined;
+  const retained = existing.triage ?? backfill;
+  const folded = attemptWindow.folds ? input.triage : undefined;
+  // The point keeps an outcome only while every window it counts has one: a point whose nine folded
+  // signals include seven nobody reported on stays "not reported", rather than showing all nine
+  // triaged into the two beads the last two produced. An empty window is covered by nobody having
+  // triaged it, since there was nothing there to triage.
+  const covered =
+    (retained !== undefined || existing.counts.total === 0) &&
+    (!attemptWindow.folds || folded !== undefined || input.counts.total === 0);
+  return covered ? addTriage(retained, folded) : undefined;
+}
+
+/**
+ * THE BASELINE THE POINT LEAVES: a value to publish, `null` to clear it, `undefined` to leave it
+ * alone. The retry scanned again, so the state the first attempt published is stale. What replaces
+ * it depends on whether the windows ABUT. They do, and the state the retry left is where the next
+ * window honestly starts: the point publishes it and the next nightly measures an honest delta from
+ * it — where keeping the stale one would leave that scan unable to prove comparability, suppressing
+ * a delta that was there to be had. They don't, and the retry consumed a window this point counts
+ * nothing of: publishing where that window ended would sell the next scan a contiguity proof across
+ * the hole, and it would difference its arrivals against counts from an unrelated window — a trend
+ * move nothing in the codebase caused. So the point publishes NO baseline at all. Absent is "nothing
+ * after this point can be proven contiguous", which is exactly true of a point with a gap behind it.
+ *
+ * A replay re-measured the whole window, so where it ended is where the point ends.
+ */
+function publishedState(
+  input: SaveScanSummaryInput,
+  attemptWindow: AttemptWindow,
+): string | null | undefined {
+  if (attemptWindow.replays) return input.deltaState?.after ?? null;
+  if (!attemptWindow.rescanned) return undefined;
+  return attemptWindow.abuts ? (input.deltaState?.after ?? null) : null;
+}
+
+/**
+ * The point the delta was measured against hasn't moved, so however these counts moved — widened by
+ * a fold, re-measured by a replay over the same starting baseline — the stored delta moves with them
+ * ({@link extendDelta}). Dropped when the point is an undercount, which is not comparable in either
+ * direction — the same rule {@link saveScanSummary} applies across adjacent scans. A point that HAD
+ * none stays without one even where the retry made it whole again: the predecessor's counts are not
+ * in hand here, and understating comparability costs a delta where inventing one would cost the
+ * trend.
+ */
+function reconciledDelta(
+  existing: ScanSummary,
+  counts: ScanCounts,
+  collectorFailures: number,
+): ScanDelta | undefined {
+  if (collectorFailures > 0) return undefined;
+  if (!existing.delta || sameCounts(counts, existing.counts)) return existing.delta;
+  return extendDelta(existing.delta, computeDelta(counts, existing.counts));
+}
+
+/** The point after a later attempt folded in — every fact {@link reconcileAttempt} can move. */
+interface Reconciled {
+  counts: ScanCounts;
+  collectorFailures: number;
+  triage: TriageOutcome | undefined;
+  /** What the point now publishes as the baseline it left — see {@link publishedState}. */
+  left: string | null | undefined;
+  delta: ScanDelta | undefined;
+}
+
+/** Which of them actually moved — nothing else is written, and none moving writes nothing at all. */
+interface Moved {
+  counts: boolean;
+  failures: boolean;
+  triage: boolean;
+  state: boolean;
+}
+
+function movedBy(existing: ScanSummary, next: Reconciled): Moved {
+  return {
+    // Every axis: a replay can re-measure the same total over a different split, and the chart draws
+    // both. A fold only ever grows the counts, so this reads as "grew" there.
+    counts: !sameCounts(next.counts, existing.counts),
+    failures: next.collectorFailures !== existing.collectorFailures,
+    triage: !sameTriage(next.triage, existing.triage),
+    state: next.left !== undefined && next.left !== existing.deltaState,
+  };
+}
+
+async function writeReconciled(
+  db: AntonDb,
+  existing: ScanSummary,
+  next: Reconciled,
+  moved: Moved,
+): Promise<void> {
+  await db
+    .update(schema.scanSummaries)
+    .set({
+      ...(moved.triage
+        ? { beadsCreated: next.triage?.created ?? null, beadsDeduped: next.triage?.deduped ?? null }
+        : {}),
+      ...(moved.state ? { deltaState: next.left } : {}),
+      ...(moved.failures ? { collectorFailures: next.collectorFailures } : {}),
+      ...(moved.counts
+        ? {
+            totalSignals: next.counts.total,
+            bySeverityJson: JSON.stringify(next.counts.bySeverity),
+            byClassJson: JSON.stringify(next.counts.byClass),
+          }
+        : {}),
+      ...(next.delta === existing.delta
+        ? {}
+        : { deltaJson: next.delta ? JSON.stringify(next.delta) : null }),
+    })
+    .where(eq(schema.scanSummaries.id, existing.id));
+}
+
+/** The reconciled row as the caller sees it, without a re-read. */
+function mergeReconciled(existing: ScanSummary, next: Reconciled, moved: Moved): ScanSummary {
+  const reconciled: ScanSummary = {
+    ...existing,
+    counts: next.counts,
+    collectorFailures: next.collectorFailures,
+  };
+  if (next.delta) reconciled.delta = next.delta;
+  else delete reconciled.delta;
+  if (next.triage) reconciled.triage = next.triage;
+  else delete reconciled.triage;
+  if (moved.state) {
+    if (next.left === null) delete reconciled.deltaState;
+    else reconciled.deltaState = next.left;
+  }
+  return reconciled;
+}
+
+/**
  * A later attempt adds only what the first one died before knowing, and corrects what it
  * invalidated.
  *
- * WHICH WINDOW THE RETRY SCANNED decides all of it, and the point names both ends of its own
- * ({@link ScanSummary.deltaStateBefore}, {@link ScanSummary.deltaState}) so the two cases can't be
- * confused:
- *
- * - A REPLAY — the retry measured from where this point's window OPENS. That is the ordinary shape
- *   of a retry, not an oddity: a pass that dies before triage hands its window back
- *   (src/lib/jobs/nightly-stringer.ts), precisely so the retry rescans it rather than closing green
- *   over untriaged findings. So the retry re-measured everything this point holds, plus whatever
- *   arrived during the backoff, and its numbers SUPERSEDE the retained ones wholesale — counts,
- *   triage, collector failures, and the baseline it left. Adding them instead would double-count the
- *   window; keeping the retained ones would strand a real day's arrivals and the successful triage
- *   report that came with them. A replay's re-measurement can also come back LOWER (fixed in the
- *   meantime), which is a fact about the repo and belongs on the point. A pass that ESTABLISHED the
- *   baseline replays the same way, and names neither end: its window opens at no baseline at all, so
- *   handing it back deletes the state file and the retry scanned the whole repo from absent again.
- *   That is read off what both attempts OBSERVED ({@link ScanSummary.baselineScan}), never off a
- *   missing `before` — an unidentified basis is not evidence of a window that reopened here.
- * - A CONTINUATION — the retry measured from where this point's window CLOSES, so the two windows
- *   abut and its signals fold in below. This is the shape of a pass that already triaged and then
- *   died: nothing was handed back, so the retry scanned the next window along.
- *
- * Neither moves where the window opens, so that end is written once and never corrected.
- *
- * For a continuation, four facts about the point move:
- *
- * - THE WINDOW IT MEASURED: a retry that ran stringer again consumed a window of its own, and those
- *   signals are gone from stringer's baseline — no later scan will ever report them. Dropping them
- *   would leave a hole in the series exactly where a pass was slow (a long quota backoff is where
- *   the retry's window is most likely to be a real day's arrivals, not an empty re-check). So when
- *   the retry measured arrivals since exactly the baseline this point publishes, the two windows
- *   ABUT: fold its counts in, and the point measures the whole pass, start to finish. The stored
- *   delta widens with them ({@link extendDelta}) — the point it was measured against hasn't moved.
- *   Without that proof of contiguity there is no union to count: a retry that re-established the
- *   baseline emitted a standing total, which double-counts the retained signals. The point's own
- *   counts must be an arrival rate too ({@link ScanSummary.baselineScan} `=== false`) — see below.
- * - TRIAGE: an outcome covers the WINDOW it triaged, not the point. An attempt that consumed no
- *   window of its own reported on the retained signals, so it backfills a report the first attempt
- *   never got out. An attempt carrying a window of its own reported on THAT window: it joins the
- *   first attempt's outcome when its signals folded in above, and is dropped when they didn't —
- *   nothing on the point is what it triaged. The point keeps an outcome only while every window it
- *   counts has one: a point whose nine folded signals include seven nobody reported on stays "not
- *   reported", rather than showing all nine triaged into the two beads the last two produced.
- * - COMPLETENESS: a folded window brings its collector outages with it, so the failures add — the
- *   union is whole only if BOTH attempts ran every collector. A point that just became an undercount
- *   also drops its delta: differencing it against a whole predecessor measures the outage rather than
- *   the repo, the same rule {@link saveScanSummary} applies across adjacent scans.
- * - THE BASELINE IT LEFT: the retry scanned again, so stringer's `--delta` state has advanced past
- *   the one the first attempt published, and the stale value is a claim nothing holds. What replaces
- *   it depends on whether the windows ABUT. They do, and the state the retry left is where the next
- *   window honestly starts: the point publishes it and the next nightly measures an honest delta from
- *   it — where keeping the stale one would leave that scan unable to prove comparability, suppressing
- *   a delta that was there to be had. They don't, and the retry consumed a window this point counts
- *   nothing of: publishing where that window ended would sell the next scan a contiguity proof across
- *   the hole, and it would difference its arrivals against counts from an unrelated window — a trend
- *   move nothing in the codebase caused. So the point publishes NO baseline at all. Absent is
- *   "nothing after this point can be proven contiguous", which is exactly true of a point with a gap
- *   behind it.
- *
- * A point whose counts are a whole-repo STANDING TOTAL never folds, however cleanly the windows abut.
- * `--delta` reports what stringer newly OBSERVED, never what was REMOVED, so a standing total plus
- * the arrivals since it is an upper bound rather than the repo at the retry's end: 100 outstanding,
- * 20 fixed and 3 arrived is 83 in the repo, and 103 is a quantity nobody measured. The retained total
- * IS a measurement — the repo as that scan saw it — so it stands, and the retry's window goes
- * uncounted. The hole costs the trend nothing it could have used: a standing total is charted apart
- * from the arrival columns and licenses no subtraction, so those arrivals were never going to move a
- * trend line, where inflating the column misstates the one thing it does say. Folding is the same
- * class of claim as subtracting and takes the same proof — `baselineScan === false`, an arrival rate,
- * where two abutting windows' arrivals sum EXACTLY. (A standing total still abuts for the correction
- * above: the state it hands on can be consumed into no wrong number, since both the delta and the
- * fold demand that same proof of it.) A REPLAY needs no such guard: it never adds to a total, it
- * replaces one measured over the same window — and a point that names where its window opens read a
- * baseline off the repo to begin with, which is what makes it incremental (`lib/stringer`).
- *
- * Both the fold and the correction need the point to name where its own window ENDED
- * ({@link ScanSummary.deltaState}). Absent, nothing can be proven contiguous — and advancing to the
- * retry's state would then hand the next scan a baseline to measure from while the counts it would
- * be differenced against silently exclude the retry's window.
+ * {@link classifyAttempt} decides which window the attempt scanned; each step below is that one
+ * decision applied to a single fact about the point — what it measured ({@link reconciledCounts}),
+ * who triaged it ({@link reconciledTriage}), whether it is whole ({@link reconciledFailures}), and
+ * where its window now ends ({@link publishedState}).
  */
 async function reconcileAttempt(
   db: AntonDb,
   existing: ScanSummary,
   input: SaveScanSummaryInput,
 ): Promise<ScanSummary> {
-  // `deltaState` present at all means this attempt ran stringer, so the state moved — including to a
-  // baseline anton could not identify, which clears the point's rather than leaving a stale claim.
-  const rescanned = input.deltaState !== undefined && existing.deltaState !== undefined;
-  // Exactly where this point's own window OPENS: the retry rescanned it whole (the failure path
-  // handed it back), so its measurement replaces the retained one rather than joining it. A pass
-  // that ESTABLISHED the baseline opens at no baseline at all — handing that window back DELETES
-  // stringer's state file (lib/stringer), so the retry scanned from absent again and re-measured the
-  // same whole repo. Both ends must be an OBSERVED baseline scan: a missing `before` on a basis
-  // anton never identified is not evidence the window reopened where this one did.
-  const replays =
-    (input.deltaState?.before !== undefined &&
-      input.deltaState.before === existing.deltaStateBefore) ||
-    (input.deltaState?.baselineScan === true &&
-      input.deltaState.before === undefined &&
-      existing.baselineScan === true &&
-      existing.deltaStateBefore === undefined);
-  // Exactly the state this point ended at: proof the retry's window starts where the point's ends,
-  // and the only case where their counts can be one measurement. A replay wins the tie a point whose
-  // window opened and closed on the same state would otherwise create — nothing was consumed there,
-  // so there is no second window to add.
-  const abuts =
-    !replays &&
-    input.deltaState?.before !== undefined &&
-    input.deltaState.before === existing.deltaState;
-  // Contiguity alone is not enough: only an ARRIVAL RATE may absorb a later window's arrivals, since
-  // `--delta` never reports what was fixed and a standing total would inflate instead. See above.
-  const folds = abuts && existing.baselineScan === false;
-  // Publishable behind a replay (it re-measured the whole window, so where it ended is where the
-  // point ends) or a contiguous retry. A non-abutting one leaves a window nothing here counts, so
-  // the point names no baseline: see above.
-  const left = replays
-    ? (input.deltaState?.after ?? null)
-    : rescanned
-      ? (abuts ? (input.deltaState?.after ?? null) : null)
-      : undefined;
-  const advanced = left !== undefined && left !== existing.deltaState;
-  const counts = replays
-    ? input.counts
-    : folds
-      ? addCounts(existing.counts, input.counts)
-      : existing.counts;
-  // Every axis: a replay can re-measure the same total over a different split, and the chart draws
-  // both. A fold only ever grows the counts, so this reads as "grew" there.
-  const countsChanged = !sameCounts(counts, existing.counts);
-  // A replay re-measured the whole window, so its collectors decide whether the point is whole; a
-  // fold adds a window, and only a folded one is part of this point's measurement.
-  const collectorFailures = replays
-    ? (input.collectorFailures ?? 0)
-    : existing.collectorFailures + (folds ? (input.collectorFailures ?? 0) : 0);
-  const failuresChanged = collectorFailures !== existing.collectorFailures;
+  const attemptWindow = classifyAttempt(existing, input);
+  const counts = reconciledCounts(existing, input, attemptWindow);
+  const collectorFailures = reconciledFailures(existing, input, attemptWindow);
+  const next: Reconciled = {
+    counts,
+    collectorFailures,
+    triage: reconciledTriage(existing, input, attemptWindow),
+    left: publishedState(input, attemptWindow),
+    delta: reconciledDelta(existing, counts, collectorFailures),
+  };
 
-  // A scan window of its own is what makes this attempt's report someone else's — see above.
-  const backfill = input.deltaState === undefined && !existing.triage ? input.triage : undefined;
-  const retained = existing.triage ?? backfill;
-  const folded = folds ? input.triage : undefined;
-  // Every window the point counts needs its own report, or the point has none: an empty window is
-  // covered by nobody having triaged it, since there was nothing there to triage.
-  const covered =
-    (retained !== undefined || existing.counts.total === 0) &&
-    (!folds || folded !== undefined || input.counts.total === 0);
-  // A replay triaged the point's whole window, so its report is the point's — and the retained one
-  // described a measurement that no longer stands, however it came out.
-  const triage = replays ? input.triage : covered ? addTriage(retained, folded) : undefined;
-  const triageChanged = !sameTriage(triage, existing.triage);
-  if (!triageChanged && !advanced && !countsChanged && !failuresChanged) return existing;
+  const moved = movedBy(existing, next);
+  if (!moved.counts && !moved.failures && !moved.triage && !moved.state) return existing;
 
-  // The point the delta was measured against hasn't moved, so however these counts moved — widened
-  // by a fold, re-measured by a replay over the same starting baseline — the stored delta moves with
-  // them. Dropped when the point is an undercount, which is not comparable in either direction. A
-  // point that HAD none stays without one even where the retry made it whole again: the predecessor's
-  // counts are not in hand here, and understating comparability costs a delta where inventing one
-  // would cost the trend.
-  const delta =
-    collectorFailures > 0
-      ? undefined
-      : countsChanged && existing.delta
-        ? extendDelta(existing.delta, computeDelta(counts, existing.counts))
-        : existing.delta;
-  await db
-    .update(schema.scanSummaries)
-    .set({
-      ...(triageChanged
-        ? { beadsCreated: triage?.created ?? null, beadsDeduped: triage?.deduped ?? null }
-        : {}),
-      ...(advanced ? { deltaState: left } : {}),
-      ...(failuresChanged ? { collectorFailures } : {}),
-      ...(countsChanged
-        ? {
-            totalSignals: counts.total,
-            bySeverityJson: JSON.stringify(counts.bySeverity),
-            byClassJson: JSON.stringify(counts.byClass),
-          }
-        : {}),
-      ...(delta === existing.delta ? {} : { deltaJson: delta ? JSON.stringify(delta) : null }),
-    })
-    .where(eq(schema.scanSummaries.id, existing.id));
+  await writeReconciled(db, existing, next, moved);
+  return mergeReconciled(existing, next, moved);
+}
 
-  const reconciled: ScanSummary = { ...existing, counts, collectorFailures };
-  if (delta) reconciled.delta = delta;
-  else delete reconciled.delta;
-  if (triage) reconciled.triage = triage;
-  else delete reconciled.triage;
-  if (advanced) {
-    if (left === null) delete reconciled.deltaState;
-    else reconciled.deltaState = left;
-  }
-  return reconciled;
+/**
+ * This scan against the point it lands on top of. Comparable ONLY when this scan measured arrivals
+ * since exactly the baseline that point left, and that point measured an arrival rate itself. A scan
+ * with no baseline to measure against emits everything in the repo — a standing total, not the
+ * arrival rate every incremental point measures — and subtracting the two charts a move that never
+ * happened (a 100-signal baseline after one quiet night reads "+99, debt pouring in"). Counting
+ * predecessors can't tell them apart (anton-3flx): stringer's baseline lives in the REPO while this
+ * series lives in a disposable anton.db, so either is reset without the other — a rebuilt anton.db
+ * would suppress two honest deltas, and a re-established baseline mid-series would sail straight
+ * through the count and chart a regression.
+ *
+ * A scan that lost a collector is not comparable either, in either direction: its total covers only
+ * the collectors that survived, so differencing it against a scan built from another set measures
+ * the outage rather than the repo — a collector dying reads as "problems arriving more slowly" and
+ * its recovery as a regression. Both adjacent scans must be whole.
+ */
+function comparableDelta(
+  input: SaveScanSummaryInput,
+  previous: ScanSummary | undefined,
+): ScanDelta | undefined {
+  const consumed = input.deltaState?.before;
+  const whole = (input.collectorFailures ?? 0) === 0 && previous?.collectorFailures === 0;
+  // Two conditions, not one: the windows must be contiguous (this scan measured from exactly where
+  // that point's ended) AND the point must hold an arrival rate of its own. `baselineScan === false`
+  // is that proof — absent is an unidentified basis, which is not evidence of one.
+  return consumed && whole && previous?.deltaState === consumed && previous?.baselineScan === false
+    ? computeDelta(input.counts, previous.counts)
+    : undefined;
+}
+
+/** This pass as a point on the series, delta already decided ({@link comparableDelta}). */
+function newScanSummary(
+  clock: Clock,
+  input: SaveScanSummaryInput,
+  delta: ScanDelta | undefined,
+): ScanSummary {
+  // Recorded by every scan that left a state anton could read, a baseline scan included: it says
+  // where the next window STARTS, which is as true of a whole-repo pass as of an incremental one —
+  // and dropping it left a retry of a baseline pass unable to prove its own window abutted, so a
+  // real day's arrivals were stranded (see reconcileAttempt). What it does NOT do is license a
+  // subtraction: `baselineScan` decides that.
+  const deltaState = input.deltaState?.after;
+  // Where this point's window OPENS, recorded so a retry's rescan is legible: measuring from here
+  // again means the failure path handed the window back and the retry REPLAYED it, where measuring
+  // from `deltaState` means it scanned the next window along (see reconcileAttempt).
+  const deltaStateBefore = input.deltaState?.before;
+  // Recorded rather than re-derived at read time: the same fact keeps the trend from scaling
+  // incremental columns against a whole-repo total long after the baseline itself is gone. Taken as
+  // the scan OBSERVED it rather than inferred from a missing `before` — a scan whose basis anton
+  // couldn't identify is unknown, and outlining it as a baseline would claim a measurement nobody made.
+  const baselineScan = input.deltaState?.baselineScan;
+  return {
+    id: randomUUID(),
+    projectId: input.projectId,
+    ...(input.jobId ? { jobId: input.jobId } : {}),
+    ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+    generatedAt: Math.floor(clock.now() / 1000),
+    counts: input.counts,
+    ...(delta ? { delta } : {}),
+    ...(deltaState ? { deltaState } : {}),
+    ...(deltaStateBefore ? { deltaStateBefore } : {}),
+    ...(baselineScan === undefined ? {} : { baselineScan }),
+    ...(input.triage ? { triage: input.triage } : {}),
+    collectorFailures: input.collectorFailures ?? 0,
+  };
+}
+
+async function insertScanSummary(db: AntonDb, summary: ScanSummary): Promise<void> {
+  await db.insert(schema.scanSummaries).values({
+    id: summary.id,
+    projectId: summary.projectId,
+    jobId: summary.jobId ?? null,
+    sessionId: summary.sessionId ?? null,
+    // The summary's own second-resolution stamp, so the row and the object it came from agree.
+    generatedAt: new Date(summary.generatedAt * 1000),
+    totalSignals: summary.counts.total,
+    bySeverityJson: JSON.stringify(summary.counts.bySeverity),
+    byClassJson: JSON.stringify(summary.counts.byClass),
+    deltaJson: summary.delta ? JSON.stringify(summary.delta) : null,
+    deltaState: summary.deltaState ?? null,
+    deltaStateBefore: summary.deltaStateBefore ?? null,
+    baselineScan: summary.baselineScan ?? null,
+    beadsCreated: summary.triage?.created ?? null,
+    beadsDeduped: summary.triage?.deduped ?? null,
+    collectorFailures: summary.collectorFailures,
+  });
 }
 
 /**
@@ -501,77 +692,9 @@ export async function saveScanSummary(
     if (already) return reconcileAttempt(db, already, input);
   }
 
-  // Comparable ONLY when this scan measured arrivals since exactly the baseline the previous point
-  // left, and that point measured an arrival rate itself. A scan with no baseline to measure against
-  // emits everything in the repo — a standing total, not the arrival rate every incremental point
-  // measures — and subtracting the two charts a move that never happened (a 100-signal baseline
-  // after one quiet night reads "+99, debt pouring in"). Counting predecessors can't tell them
-  // apart (anton-3flx): stringer's baseline lives in the
-  // REPO while this series lives in a disposable anton.db, so either is reset without the other —
-  // a rebuilt anton.db would suppress two honest deltas, and a re-established baseline mid-series
-  // would sail straight through the count and chart a regression.
-  //
-  // A scan that lost a collector is not comparable either, in either direction: its total covers only
-  // the collectors that survived, so differencing it against a scan built from another set measures
-  // the outage rather than the repo — a collector dying reads as "problems arriving more slowly" and
-  // its recovery as a regression. Both adjacent scans must be whole.
-  const consumed = input.deltaState?.before;
-  const [previous] = await listScanSummaries(db, input.projectId, 1);
-  const whole = (input.collectorFailures ?? 0) === 0 && previous?.collectorFailures === 0;
-  // Two conditions, not one: the windows must be contiguous (this scan measured from exactly where
-  // that point's ended) AND the point must hold an arrival rate of its own. `baselineScan === false`
-  // is that proof — absent is an unidentified basis, which is not evidence of one.
-  const delta =
-    consumed && whole && previous?.deltaState === consumed && previous?.baselineScan === false
-      ? computeDelta(input.counts, previous.counts)
-      : undefined;
-  // Recorded by every scan that left a state anton could read, a baseline scan included: it says
-  // where the next window STARTS, which is as true of a whole-repo pass as of an incremental one —
-  // and dropping it left a retry of a baseline pass unable to prove its own window abutted, so a
-  // real day's arrivals were stranded (see reconcileAttempt). What it does NOT do is license a
-  // subtraction: `baselineScan` above decides that.
-  const deltaState = input.deltaState?.after;
-  // Where this point's window OPENS, recorded so a retry's rescan is legible: measuring from here
-  // again means the failure path handed the window back and the retry REPLAYED it, where measuring
-  // from `deltaState` means it scanned the next window along (see reconcileAttempt).
-  const deltaStateBefore = consumed;
-  // Recorded rather than re-derived at read time: the same fact keeps the trend from scaling
-  // incremental columns against a whole-repo total long after the baseline itself is gone. Taken as
-  // the scan OBSERVED it rather than inferred from a missing `before` — a scan whose basis anton
-  // couldn't identify is unknown, and outlining it as a baseline would claim a measurement nobody made.
-  const baselineScan = input.deltaState?.baselineScan;
-  const summary: ScanSummary = {
-    id: randomUUID(),
-    projectId: input.projectId,
-    ...(input.jobId ? { jobId: input.jobId } : {}),
-    ...(input.sessionId ? { sessionId: input.sessionId } : {}),
-    generatedAt: Math.floor(clock.now() / 1000),
-    counts: input.counts,
-    ...(delta ? { delta } : {}),
-    ...(deltaState ? { deltaState } : {}),
-    ...(deltaStateBefore ? { deltaStateBefore } : {}),
-    ...(baselineScan === undefined ? {} : { baselineScan }),
-    ...(input.triage ? { triage: input.triage } : {}),
-    collectorFailures: input.collectorFailures ?? 0,
-  };
-
-  await db.insert(schema.scanSummaries).values({
-    id: summary.id,
-    projectId: summary.projectId,
-    jobId: summary.jobId ?? null,
-    sessionId: summary.sessionId ?? null,
-    generatedAt: secDate(clock.now()),
-    totalSignals: summary.counts.total,
-    bySeverityJson: JSON.stringify(summary.counts.bySeverity),
-    byClassJson: JSON.stringify(summary.counts.byClass),
-    deltaJson: delta ? JSON.stringify(delta) : null,
-    deltaState: deltaState ?? null,
-    deltaStateBefore: deltaStateBefore ?? null,
-    baselineScan: baselineScan ?? null,
-    beadsCreated: summary.triage?.created ?? null,
-    beadsDeduped: summary.triage?.deduped ?? null,
-    collectorFailures: summary.collectorFailures,
-  });
+  const previous = await getLatestScanSummary(db, input.projectId);
+  const summary = newScanSummary(clock, input, comparableDelta(input, previous));
+  await insertScanSummary(db, summary);
   await pruneScanSummaries(db, summary.projectId);
   return summary;
 }
