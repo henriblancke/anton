@@ -743,6 +743,15 @@ function rehomeRefusal(claim: PmClaim, index: BoardIndex, nowMs: number): string
   if (isClaimed(subject)) {
     return `${claim.bead} is held by ${runClaimOf(subject)} — that run is shipping it under its current home, so moving it now would leave the bead and the work it ships in two different places`;
   }
+  // The rest of that half, and the one no per-bead signal can reach: a grouped run publishes ONE
+  // lease, on the CARD its tickets hang under, and cascades an assignee only to the tickets it has
+  // already reached. So a ticket that run has SELECTED but not yet started carries no lease and no
+  // claim — both bars above read it as free work. Moving it out of that set now takes a bead out of
+  // a set the run already chose, and the run aborts when its claim reaches it.
+  const owner = ticketOwnerOf(index, subject);
+  if (owner && (isInFlight(owner, nowMs) || isClaimed(owner))) {
+    return `${claim.bead} rides ${owner.id}'s ticket set and a run owns ${owner.id} — that run has already selected the tickets it will work through, so moving one out from under it now would abort it or strand the work it ships`;
+  }
   const home = index.byId.get(homeId);
   if (!home) return `${homeId} is not on the board`;
   // A proposal is open work, so `isOpenWork` waves it through — but it is a bead ABOUT the board,

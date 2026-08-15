@@ -14,6 +14,7 @@
  */
 import { approvalGaps, formatApprovalGaps, type ApprovalGap } from "../approval-gate";
 import { beads, LABELS, type Bead } from "../beads/bd";
+import { isTicketTier } from "../beads/contract";
 import {
   indexBoard,
   isInFlight,
@@ -65,6 +66,7 @@ export type ApplyStep =
    * ({@link EVIDENCE_PREMISE}).
    */
   | (StepSubject &
+      TicketOwner &
       EvidenceFence & {
         verb: "reparent";
         parent: string;
@@ -155,17 +157,20 @@ export interface EvidenceFence {
 }
 
 /**
- * The run target whose TICKET SET a retirement's subject rides, or absent when the subject is its
- * own run target — its own claim is then the check — or hangs under nothing that runs.
+ * The run target whose TICKET SET the subject rides, or absent when the subject is its own run
+ * target — its own claim is then the check — or hangs under nothing that runs.
  *
- * Carried by the retirement verbs alone because they are the ones that take the bead AWAY: a run
- * that has selected this ticket aborts when its claim reaches a bead the board has since closed,
- * deferred or superseded. The run target is where the only liveness signal lives (see
- * {@link ticketOwnerOf}), so it is locked and re-judged alongside the subject.
+ * Carried by every verb that takes the bead OUT of that set: the retirements settle it, and a
+ * RE-PARENT hands it to another target. Either way a run that has selected this ticket is left
+ * shipping a bead its set no longer holds — it aborts when its claim reaches it, or, worse for a
+ * move, the commit lands in the old card's PR while the bead hangs off the new one. The run target
+ * is where the only liveness signal lives (see {@link ticketOwnerOf}), so it is locked and re-judged
+ * alongside the subject.
  *
  * `claim` is the owner's run claim when the step was decided, re-compared under the owner's own
  * write lock exactly like {@link StepSubject.claim} — and, like a re-parent's `parentClaim`, only
- * ever a claim that PREDATES the filing, because `planRetire` refuses an owner claimed since.
+ * ever a claim that PREDATES the filing, because both planners refuse an owner claimed since
+ * ({@link ticketSetBusy}).
  */
 export interface TicketOwner {
   owner?: { id: string; claim: string };
@@ -344,6 +349,9 @@ function reparentSubject(
     parent: home.id,
     undoParent: currentParent,
     parentClaim: runClaimOf(home),
+    // The set the subject is LEAVING — the third bead this move rests on, locked and re-judged with
+    // the other two (see {@link TicketOwner}).
+    owner: ownerRef(ticketOwnerOf(index, subject)),
     kind: plan.kind,
     observedAtMs: at.observedAtMs,
   };
@@ -360,6 +368,9 @@ function reparentBarred(
   if (!isOpenWork(subject)) {
     return `${subject.id} is ${settledWord(subject)} — the board moved on since this was proposed`;
   }
+  // The subject's own signals, then the ticket set it rides — the half no per-bead signal shows, and
+  // the one a MOVE raids exactly as a retirement does (see {@link ticketSetBusy}).
+  //
   // Then the premise, at whichever end of the move states one. A `misfiled` claim is a MATCH between
   // two contracts — this bead belongs under that home — so a rewrite of either falsifies it, and no
   // board read restates the judgment the way `reparentPremiseGone` restates the gardener's. Asked
@@ -368,6 +379,7 @@ function reparentBarred(
   // forever against a board that already agrees with it.
   const busy =
     subjectBusy(subject, at, DOING.reparent) ??
+    ticketSetBusy(index, subject, at, movingTicket(subject.id)) ??
     reparentPremiseGone(plan, subject, index) ??
     premiseTouched(subject, EVIDENCE_PREMISE[plan.kind], at.observedAtMs) ??
     premiseTouched(home, EVIDENCE_PREMISE[plan.kind]?.twin, at.observedAtMs);
@@ -730,7 +742,7 @@ function retirementBarred(
   // that has since been written out from under its own evidence.
   const reason =
     subjectBusy(subject, at, "retiring it") ??
-    ticketSetBusy(index, subject, at) ??
+    ticketSetBusy(index, subject, at, retiringTicket(subject.id)) ??
     premiseTouched(subject, EVIDENCE_PREMISE[plan.kind], at.observedAtMs) ??
     wouldStrand(plan, subject, index);
   return reason ? { status: "refuse", reason } : undefined;
@@ -741,14 +753,23 @@ function retirementBarred(
  * own signals cannot answer.
  *
  * A grouped run publishes ONE lease, on the run target its tickets hang under, so a ticket that run
- * has selected but not yet reached carries no lease, no PR ref and no claim of its own — retiring it
- * would take a bead out of a live run's ticket set, and the run aborts when its claim reaches a bead
- * the board no longer holds.
+ * has selected but not yet reached carries no lease, no PR ref and no claim of its own — taking it
+ * out of that set would raid a live run, and the run aborts when its claim reaches a bead the board
+ * no longer holds.
+ *
+ * Asked by every move that takes the bead out: a retirement settles it, and a RE-PARENT hands it to
+ * another target, which leaves the run shipping a commit for a bead that now belongs to a different
+ * card. `doing` is which of the two, so the refusal names the move a founder is looking at.
  */
-function ticketSetBusy(index: BoardIndex, subject: Bead, at: ApplyMoment): string | undefined {
+function ticketSetBusy(
+  index: BoardIndex,
+  subject: Bead,
+  at: ApplyMoment,
+  doing: string,
+): string | undefined {
   const owner = ticketOwnerOf(index, subject);
   if (!owner) return undefined;
-  return subjectBusy(owner, at, retiringTicket(subject.id), CLAIM_COST.ticketSet);
+  return subjectBusy(owner, at, doing, CLAIM_COST.ticketSet);
 }
 
 /**
@@ -1148,9 +1169,9 @@ type HomeStanding = (typeof HOME_STANDING)[keyof typeof HOME_STANDING];
  * nothing will reach — `ticket-under-container-epic`, arrived at by approving a proposal. An epic
  * that already groups cards plays that role, so the move is a pure addition to it.
  *
- * A subject that is NEITHER — a container epic, a `learning` — keeps the strictest bar, the board
- * card anton required before this. Nothing proposes moving one, and inventing a tier for it here
- * would be guessing.
+ * A subject that is NEITHER tier is refused outright ({@link subjectOffTaxonomy}) rather than held to
+ * the working layer's bar, because "not a board card" is as true of a container epic as it is of a
+ * ticket — and the taxonomy has no tier above a container to move one INTO.
  *
  * Shared by the snapshot decision and the under-lock re-check like every other bar in this module,
  * so the write cannot hold a home to a laxer tier than the decision held it to.
@@ -1162,6 +1183,8 @@ export function homeWrongTier(
   standing: HomeStanding,
 ): string | undefined {
   if (!index.cards.ids.has(subject.id)) {
+    const unhomeable = subjectOffTaxonomy(subject, index, standing);
+    if (unhomeable) return unhomeable;
     if (index.cards.ids.has(home.id)) return undefined;
     return `${home.id} ${standing} a board card — re-parenting under it would leave the work riding no card, which is the state this proposal is about`;
   }
@@ -1170,6 +1193,31 @@ export function homeWrongTier(
     return `${home.id} ${standing} an epic and ${subject.id} is a board card — a card hangs off an epic and nothing else (\`feature-under-non-epic\`); both are run targets, so the move would ship the same work twice`;
   }
   return `${home.id} ${standing} a container epic — it groups no cards, so it is a run target in its own right, and landing ${subject.id} under it would demote it: its own run is cancelled and any ticket it carries is left beneath a card nothing will reach (\`ticket-under-container-epic\`)`;
+}
+
+/**
+ * Why the taxonomy names no home for this SUBJECT at all, or undefined — the half of the tier
+ * question that has to be asked positively, because every bar around it reads "not a board card" and
+ * that is true of a container epic and a `learning` as surely as it is of a ticket.
+ *
+ * No detector proposes moving one; a product-master report can, and it is untrusted input. Left to
+ * the working layer's bar, a container epic named as the subject and a feature as its home would be
+ * accepted, and after approval `boardCards.cardOf` would walk THROUGH the container and attribute
+ * every ticket beneath it to that feature's run — tickets nobody shaped for it, dispatched into its
+ * worktree and closed on its PR.
+ */
+function subjectOffTaxonomy(
+  subject: Bead,
+  index: BoardIndex,
+  standing: HomeStanding,
+): string | undefined {
+  if (index.isContainer(subject)) {
+    return `${subject.id} ${standing} a bead a card can carry — it is a container epic, which GROUPS the board's cards rather than riding one, so hanging it under a card would hand that card's run every ticket beneath it (\`boardCards.cardOf\` walks straight through)`;
+  }
+  if (!isTicketTier(subject)) {
+    return `${subject.id} is a ${subject.issue_type ?? "bead"}, which is neither a board card nor working-layer work — the tier taxonomy (\`epic → feature → task|bug|chore\`) names no home for it, so nothing here can say where it belongs`;
+  }
+  return undefined;
 }
 
 /**
@@ -1259,6 +1307,13 @@ const NO_SURVIVOR = "this proposal names no bead that superseded it";
 
 /** What a retirement is doing to the RUN that holds the subject's ticket set, as a refusal reads. */
 export const retiringTicket = (id: string): string => `retiring ${id} out of its ticket set`;
+
+/** The same, for the move that takes a ticket out of that set by handing it to another target. */
+export const movingTicket = (id: string): string => `moving ${id} out of its ticket set`;
+
+/** Which of the two a step's verb reads as — the one phrasing every ticket-set refusal shares. */
+export const takingTicket = (verb: ApplyStep["verb"], id: string): string =>
+  verb === "reparent" ? movingTicket(id) : retiringTicket(id);
 
 /** The one phrasing both readings of the link premise refuse with — snapshot and under-lock alike. */
 export const orderingUnstated = (blockedId: string, blockerId: string): string =>

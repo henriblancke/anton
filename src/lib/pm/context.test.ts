@@ -464,6 +464,31 @@ describe("detectionsFor", () => {
         () => rehome("anton-t-held", rightCard.id),
         /anton-t-held is held by runner-3/,
       ],
+      // The rest of that bar, and the half no per-bead signal reaches: a grouped run publishes ONE
+      // lease, on the card, and cascades an assignee only to the tickets it has already reached — so
+      // a ticket it has SELECTED carries neither, and both checks above read it as free work.
+      [
+        "a bead whose card a run is shipping",
+        () => rehome("anton-t-riding", rightCard.id),
+        /rides anton-live's ticket set and a run owns anton-live/,
+      ],
+      [
+        "a bead whose card a run has claimed but not yet leased",
+        () => rehome("anton-t-selected", rightCard.id),
+        /rides anton-held's ticket set and a run owns anton-held/,
+      ],
+      // The SUBJECT end of the tier taxonomy. A report is untrusted input, and every bar around this
+      // one reads "not a board card" — which a container epic satisfies as surely as a ticket does.
+      [
+        "a container epic, which groups the board's cards rather than riding one",
+        () => rehome(container.id, rightCard.id),
+        /anton-epic is not a bead a card can carry/,
+      ],
+      [
+        "a bead type the taxonomy names no home for",
+        () => rehome("anton-learn", rightCard.id),
+        /anton-learn is a learning, which is neither a board card nor working-layer work/,
+      ],
       // The tier taxonomy, asked through apply's own homeWrongTier so the filing check and the
       // approve check cannot disagree about which homes are legal.
       [
@@ -507,6 +532,10 @@ describe("detectionsFor", () => {
           status: "in_progress",
           assignee: "runner-3",
         }),
+        // Two tickets a run has SELECTED but not reached: every signal lives on the card above them.
+        bead("anton-t-riding", { parent: "anton-live" }),
+        bead("anton-t-selected", { parent: "anton-held" }),
+        bead("anton-learn", { issue_type: "learning" }),
       ];
       const { detections, rejected } = detectionsFor([bad()], full, NOW);
       expect(detections).toEqual([]);

@@ -36,9 +36,9 @@ import {
   namesSome,
   orderingUnstated,
   premiseTouched,
-  retiringTicket,
   settledWord,
   survivorUnusable,
+  takingTicket,
   unapproveNote,
   type ApplyStep,
   type EvidenceFence,
@@ -52,7 +52,7 @@ export class SubjectMovedError extends Error {}
 /** The verbs that SETTLE the subject — the ones that would strand whatever still hangs under it. */
 const SETTLING: ReadonlySet<ApplyStep["verb"]> = new Set(["close", "supersede"]);
 
-/** The verbs that take the subject OUT of whatever run's ticket set it rides. */
+/** The verbs that SETTLE the subject out of whatever run's ticket set it rides. */
 const RETIRING: ReadonlySet<ApplyStep["verb"]> = new Set(["close", "supersede", "defer"]);
 
 /**
@@ -98,15 +98,17 @@ function evidenceOf(step: ApplyStep): EvidenceFence | undefined {
 }
 
 /**
- * The run target whose ticket set a RETIREMENT would take its subject out of, when it rides one. Not
- * written to and not pointed at — but the run that owns it is the one this write can abort, and the
- * only place that run is visible (see {@link TicketOwner}), so it is locked and re-judged too.
+ * The run target whose ticket set this step would take its subject out of, when it rides one —
+ * settled by a retirement, handed to another target by a re-parent. Not written to and not pointed
+ * at, but the run that owns it is the one this write can abort, and the only place that run is
+ * visible (see {@link TicketOwner}), so it is locked and re-judged too.
  */
 function ownerOf(step: ApplyStep): TicketOwner["owner"] {
   switch (step.verb) {
     case "close":
     case "supersede":
     case "defer":
+    case "reparent":
       return step.owner;
     default:
       return undefined;
@@ -136,9 +138,11 @@ function lockedBeads(step: ApplyStep): string[] {
  * the subject — a run claiming the HOME between the decision and the write has already selected its
  * tickets, so work attached now rides along unrun and is stranded when that run settles the card.
  * The ticket OWNER earns its lock the same way, from the other direction: a run picks its target up
- * on this very chain, so either its claim lands first and this read refuses, or this retirement
- * lands first and the run's own post-lease re-confirmation sees its ticket set move (execute-epic
- * step 1c) and retries — rather than aborting mid-flight on a bead the board no longer holds.
+ * on this very chain, so either its claim lands first and this read refuses, or the write lands
+ * first and the run's own post-lease re-confirmation sees its ticket set move (execute-epic step 1c)
+ * and retries — rather than aborting mid-flight on a bead the board no longer holds. A re-parent
+ * holds it too: handing a ticket to another card takes it out of that set exactly as retiring it
+ * does, and leaves the run's commit landing in a PR for a bead that now belongs elsewhere.
  *
  * The body is the checks in the order they have to run, each named for what it refuses. Four of them
  * buy a whole board read rather than trusting the snapshot: whether the subject still rides the
@@ -209,11 +213,15 @@ async function assertRetirementHolds(repo: string, step: ApplyStep): Promise<voi
   if (SETTLING.has(step.verb)) assertNothingStranded(step.id, board);
 }
 
-/** What a RE-PARENT owes the home it is about to hang work under. */
+/**
+ * What a RE-PARENT owes the two run targets it sits between: the home it is about to hang work
+ * under, and the ticket set it is taking that work out of.
+ */
 async function assertHomeHolds(repo: string, step: ApplyStep): Promise<void> {
   if (step.verb !== "reparent") return;
-  const doing = `before re-parenting under ${step.parent}`;
-  assertHomeFitsSubject(step, await lockedBoard(repo, doing));
+  const board = await lockedBoard(repo, `before re-parenting under ${step.parent}`);
+  assertOwnerUnchanged(step, board);
+  assertHomeFitsSubject(step, board);
 }
 
 /**
@@ -286,16 +294,16 @@ async function lockedBoard(repo: string, doing: string): Promise<BoardIndex> {
 }
 
 /**
- * Refuse a retirement whose subject has changed hands since the decision, judged from a board read
- * taken INSIDE the subject's write lock.
+ * Refuse a step whose subject has changed hands since the decision, judged from a board read taken
+ * INSIDE the subject's write lock.
  *
  * {@link ownerStarted} re-reads the owner the STEP captured and asks whether a run has started on it.
- * Neither it nor {@link subjectMoved} — which compares parents for a re-parent alone — can see the
- * other half: a re-parent approval landing in this window moves the subject under a DIFFERENT run
- * target, one this step holds no lock on and never re-reads, so retiring it here takes a ticket out
- * of a live run the decision never looked at, and that run aborts when its claim reaches the bead.
- * Re-derived through the same {@link ticketOwnerOf} the decision used, so the write cannot hold
- * ownership to a different bar than `planRetire` held the snapshot to.
+ * Neither it nor {@link subjectMoved} — which compares the subject's OWN parent, for a re-parent
+ * alone — can see the other half: a re-parent approval landing in this window can move an ANCESTOR
+ * of the subject under a different run target, one this step holds no lock on and never re-reads, so
+ * taking the ticket out here raids a live run the decision never looked at, and that run aborts when
+ * its claim reaches the bead. Re-derived through the same {@link ticketOwnerOf} the decision used, so
+ * the write cannot hold ownership to a different bar than the planner held the snapshot to.
  *
  * Refused on the IDENTITY change alone rather than on the newcomer's liveness: nothing locks the new
  * owner, so any liveness read of it would be racing the very claim this serialization exists to
@@ -309,7 +317,7 @@ function assertOwnerUnchanged(step: ApplyStep, board: BoardIndex): void {
   const was = ownerOf(step)?.id;
   if (now === was) return;
   throw new SubjectMovedError(
-    `${step.id} now rides ${ticketSet(now)} rather than ${ticketSet(was)} — the run target it hangs under changed since this proposal was decided, so ${retiringTicket(step.id)} would act on a ticket set this approval never looked at`,
+    `${step.id} now rides ${ticketSet(now)} rather than ${ticketSet(was)} — the run target it hangs under changed since this proposal was decided, so ${takingTicket(step.verb, step.id)} would act on a ticket set this approval never looked at`,
   );
 }
 
@@ -538,10 +546,10 @@ function counterpartMoved(
 }
 
 /**
- * Why a run has started on the target whose ticket set this retirement's subject rides, or
- * undefined. Judged by the same two bars `planRetire` held the snapshot to — a live run, and a claim
- * taken in the window before a lease exists to see — so the write cannot pass an owner the decision
- * would have refused.
+ * Why a run has started on the target whose ticket set this step's subject rides, or undefined.
+ * Judged by the same two bars the planner held the snapshot to — a live run, and a claim taken in
+ * the window before a lease exists to see — so the write cannot pass an owner the decision would
+ * have refused.
  *
  * An owner that has LEFT the board is no obstacle: nothing is running a ticket set that no longer
  * exists, and the subject's own re-read already covers what became of it.
@@ -557,10 +565,11 @@ function ownerStarted(
   nowMs: number,
 ): string | undefined {
   if (!live) return undefined;
-  if (isInFlight(live, nowMs)) return inFlightReason(live, nowMs, retiringTicket(step.id));
+  const doing = takingTicket(step.verb, step.id);
+  if (isInFlight(live, nowMs)) return inFlightReason(live, nowMs, doing);
   const claim = runClaimOf(live);
   if (!claim || claim === owner.claim) return undefined;
-  return `${live.id} was claimed by ${claim} since this proposal was decided — that run has already selected the tickets it will work through, so ${retiringTicket(step.id)} would abort it when its claim reaches a bead the board no longer holds`;
+  return `${live.id} was claimed by ${claim} since this proposal was decided — that run has already selected the tickets it will work through, so ${doing} would abort it when its claim reaches a bead the board no longer holds`;
 }
 
 /** The bd verb each step resolves to — the only place this module spawns a write. */
