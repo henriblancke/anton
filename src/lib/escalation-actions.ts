@@ -23,7 +23,12 @@
  * all and would sit on the board forever.
  *
  * A wait on a PERSON (`needs-human`) is the one stall whose answer is not really about the run: it
- * hangs on a gate, so both verbs close the gate as well as acting on the work. Resume is
+ * hangs on a gate, so both verbs close the gate as well as acting on the work. WHICH work that is,
+ * the frozen snapshot cannot say — a gate outlives a reparent — so neither verb's liveness veto is
+ * applied to the ancestor it froze; each re-derives its own target and re-reads the lease there
+ * ({@link gateDispatch} for the resume, `abandonTicket`'s `requireStopped` for the abandon), which is
+ * also what stops a run on the bead the gate LEFT from vetoing an answer it has nothing to do with.
+ * Resume is
  * resolve-and-resume — "I did it, carry on" — and closes the gate FIRST, because execute-epic
  * re-reads the board and a run enqueued against an open gate simply parks on the same wait again. For
  * the same reason it re-derives from the live board WHICH target the gate now releases, and resumes
@@ -157,14 +162,22 @@ export async function actOnEscalation(
   // the lease re-check costs a bd pull.
   if (target) {
     const epicBeadId = view.epicBeadId ?? target;
+    // Liveness is judged on the ancestor this escalation FROZE, which is evidence only while that
+    // ancestor is still what the verb acts on. For a wait on a PERSON it need not be: the gate blocks
+    // a BEAD, and reparenting moves the run target above it while the row sits on the panel — so a run
+    // starting on the bead the gate LEFT would veto BOTH answers, leaving a wait that offers no
+    // dismiss unanswerable until unrelated work stopped. The veto moves rather than being dropped:
+    // each verb re-derives its live target and re-reads the lease there ({@link gateDispatch} for the
+    // resume, `abandonTicket`'s `requireStopped` for the abandon — see {@link actOnBead}).
+    const judgeFrozenLease = !gateId;
     // Re-run AFTER the board read as well as before it: `readTargetState` awaits a bd pull that can
     // take seconds, and a resume that lands inside that window republishes the stalled run's own id
     // — which the lease check exempts as this escalation's own leftover. Checked before it too
     // because it is one indexed read and refusing early spares the pull entirely.
     const abandonWouldKillLiveWork = () =>
-      action === "abandon" && restartedLocally(project.id, epicBeadId);
+      judgeFrozenLease && action === "abandon" && restartedLocally(project.id, epicBeadId);
     if (abandonWouldKillLiveWork()) return { ok: false, reason: "contested" };
-    const state = await readTargetState(project, view, target);
+    const state = await readTargetState(project, view, target, judgeFrozenLease);
     if (state === "contested" || abandonWouldKillLiveWork()) {
       return { ok: false, reason: "contested" };
     }
@@ -254,7 +267,9 @@ export async function actOnEscalation(
  * Every call here is a SNAPSHOT: the settle, and the bd reads inside the abandon, all await after it.
  * It refuses early and cheaply; the answer that actually gates the destruction is the one
  * `abandonTicket`'s `requireStopped` makes at the cancel boundary itself — this read plus the shared
- * lease, on the run target the abandon re-derives rather than the ancestor frozen here.
+ * lease, on the run target the abandon re-derives rather than the ancestor frozen here. Which is why
+ * a wait on a person skips this read entirely (see the call site): there the two beads routinely
+ * differ, so the boundary check is not an extra half but the only one that can answer.
  */
 function restartedLocally(projectId: string, epicBeadId: string): boolean {
   return runIsLiveForTarget(projectId, epicBeadId);
@@ -296,6 +311,9 @@ async function readBead(repoPath: string, id: string): Promise<BeadRead> {
  *     An abandon executes under whatever run target sits above its ticket NOW — a different bead once
  *     the board has been reparented — so its own `requireStopped` boundary re-reads the lease on that
  *     one (see `stopRun`); this check is the cheap early half, not the whole of it.
+ *     `judgeLease` is how a caller says the frozen ancestor is NOT what its verb acts on — a wait on a
+ *     person, whose target is re-derived after the settle — and the lease read is skipped rather than
+ *     answered off a pointer the gate has outlived (see the call site).
  *   • The work SETTLED — the bead was deleted, or closed by hand. Then the verb has nothing left to
  *     act on: a resume hands execute-epic a bead it either can only park back on with
  *     `bead ... not found`, turning an intentional deletion into a poison job, or runs work that was
@@ -324,6 +342,7 @@ async function readTargetState(
   project: Project,
   view: EscalationView,
   target: string,
+  judgeLease: boolean,
 ): Promise<TargetState> {
   const pulled = await beads.pull(project.repoPath).then(
     () => true,
@@ -343,20 +362,23 @@ async function readTargetState(
   // for a stale PR or a dead lease (both name a run target — `inReviewTargets` classifies with
   // `isRunTarget`, and only run targets ever carry a lease). `target` is the fallback for a finding
   // that recorded no epic at all, and the common case where the two coincide costs no second read.
-  const epicBeadId = view.epicBeadId ?? target;
-  const holder = epicBeadId === target ? acted : await readBead(project.repoPath, epicBeadId);
-  if (holder === "unreadable") return "unverified";
-  // A gone EPIC carries no lease — and that is evidence, not a failed read — so an abandon of its
-  // (existing) ticket is still worth doing.
-  if (holder !== "missing") {
-    const nowMs = systemClock.now();
-    const live = view.runId
-      ? beads.foreignRunLeaseLive(holder, nowMs, view.runId)
-      : beads.isRunLive(holder, nowMs);
-    if (live) return "contested";
+  if (judgeLease) {
+    const epicBeadId = view.epicBeadId ?? target;
+    const holder = epicBeadId === target ? acted : await readBead(project.repoPath, epicBeadId);
+    if (holder === "unreadable") return "unverified";
+    // A gone EPIC carries no lease — and that is evidence, not a failed read — so an abandon of its
+    // (existing) ticket is still worth doing.
+    if (holder !== "missing") {
+      const nowMs = systemClock.now();
+      const live = view.runId
+        ? beads.foreignRunLeaseLive(holder, nowMs, view.runId)
+        : beads.isRunLive(holder, nowMs);
+      if (live) return "contested";
+    }
   }
-  // Every read landed — but a lease another machine published seconds ago reaches this mirror only
-  // through the pull, so without one "no live lease" is an unread answer, not a clear board.
+  // Every read landed — but a write another machine made seconds ago (the lease, or the close that
+  // settled this work) reaches this mirror only through the pull, so without one "nothing has changed"
+  // is an unread answer, not a clear board.
   return pulled ? "clear" : "unverified";
 }
 

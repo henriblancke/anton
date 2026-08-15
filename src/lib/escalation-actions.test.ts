@@ -1499,17 +1499,43 @@ describe("actOnEscalation — a wait on a person", () => {
     expect(nudgeSync.mock.calls).toEqual([[project, "gate-resumed"]]);
   });
 
-  it("still refuses when the board says another machine picked the work back up", async () => {
-    beadsShow.mockResolvedValue(bead([LABELS.runLease(Date.now() + HOUR, "run-elsewhere")]));
+  it("does not veto the resume on a run holding the ancestor the gate LEFT", async () => {
+    // The reparent case the frozen pointer gets backwards: `anton-e1` is running again, but the gated
+    // ticket moved to `anton-e2` and that run has nothing to do with this wait. Vetoing on it would
+    // refuse the founder's answer — with no dismiss offered on a wait for a person — until unrelated
+    // work stopped. The live target is the one that decides, and it is clear (anton-mivh).
+    const leased = () => bead([LABELS.runLease(Date.now() + HOUR, "run-elsewhere")]);
+    beadsShow.mockImplementation(async (_repo, id) => (id === "anton-e1" ? leased() : bead()));
+    // The same rows the lease read sees, so the two halves cannot be read as disagreeing boards.
+    loadAllIssues.mockResolvedValue(
+      reparentedBoard().map((b) => (b.id === "anton-e1" ? leased() : b)),
+    );
     const escalation = await openGateWait();
 
-    expect(await actOnEscalation(project, escalation.id, "resume")).toEqual({
-      ok: false,
-      reason: "contested",
+    expect(await actOnEscalation(project, escalation.id, "resume")).toMatchObject({
+      ok: true,
+      detail: "enqueued",
     });
-    // Nothing was touched: the gate is the founder's to close once, not on every stale click.
-    expect(gateResolve).not.toHaveBeenCalled();
-    expect(rowOf(escalation.id)?.status).toBe("open");
+    expect(resumeStalledEpic).toHaveBeenCalledWith("p1", "anton-e2");
+    expect(gateResolve).toHaveBeenCalled();
+  });
+
+  it("does not veto the abandon on a LOCAL run of that ancestor either", async () => {
+    // The same pointer, the machine-local half: an execute-epic running `anton-e1` is not the run this
+    // abandon would kill once the ticket hangs elsewhere. `abandonTicket` re-derives the target and
+    // refuses at the cancel boundary if THAT one is live (see the RunRestartedError case below).
+    seedExecuteEpicJob("running");
+    loadAllIssues.mockResolvedValue(reparentedBoard());
+    const escalation = await openGateWait();
+
+    expect(await actOnEscalation(project, escalation.id, "abandon")).toMatchObject({
+      ok: true,
+      detail: "abandoned",
+    });
+    expect(abandonTicket).toHaveBeenCalledWith(project, "anton-t9", expect.any(String), {
+      requireStopped: true,
+      ownRunId: undefined,
+    });
   });
 
   it("refuses a dismiss — settling the row over an open gate just re-raises it", async () => {
