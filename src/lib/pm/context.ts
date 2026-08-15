@@ -16,7 +16,7 @@
  * gardener's own detectors produce, after checking every claim against the board it was made about.
  */
 import { beads, labelValueOf, type Bead } from "../beads/bd";
-import { goalBody, isPipelineArtifact, preambleOf } from "../beads/contract";
+import { goalBody, isAuthoredBody, isPipelineArtifact, preambleOf } from "../beads/contract";
 import { loadSkill } from "../claude/prompt";
 import { homeWrongTier, HOME_STANDING } from "../gardener/apply-plan";
 import {
@@ -410,10 +410,18 @@ function beadLines(
  * Its `## Goal` where the bead states one, else the description's opening prose: an unshaped bead
  * still says something about itself, and a reader that knew only the heading rendered nothing at all
  * for it. Excerpted rather than quoted whole — see {@link MAX_GOAL_CHARS}.
+ *
+ * AUTHORED text only ({@link isAuthoredBody}). `goalBody` returns the formula's `TODO — …` prompt
+ * when nothing is written, because a view must show the operator the placeholder its "no goal yet"
+ * marker is about — but this line is quoted to the pass as the bead's own contract text and as the
+ * only evidence a home claim may rest on, so rendering the scaffold would let a home be proposed on
+ * words the approval gate itself treats as missing. Omitted instead, which reads correctly: a bead
+ * with no `goal:` line has stated nothing to match.
  */
 const goalOf = (bead: Bead): string | undefined => {
   const description = typeof bead.description === "string" ? bead.description : "";
-  const text = oneLine(goalBody(bead) ?? preambleOf(description));
+  const authored = [goalBody(bead), preambleOf(description)].find(isAuthoredBody);
+  const text = oneLine(authored ?? "");
   if (!text) return undefined;
   return text.length > MAX_GOAL_CHARS ? `${text.slice(0, MAX_GOAL_CHARS)}…` : text;
 };
@@ -834,6 +842,15 @@ function rehomeRefusal(
   if (currentHome === homeId) {
     return `${claim.bead} already hangs under ${homeId} — the move would write nothing`;
   }
+  // The same no-op one tier out, and the one the context now invites: bd nesting runs to any depth,
+  // so under `feature → task → subtask` the subtask already ships in the FEATURE's run and its PR,
+  // and its line names that feature as `shipped by`. A claim citing that line proposes the card the
+  // work already rides — which moves nothing between runs and only flattens nesting somebody meant.
+  // A `rehome` is a claim that the work would ship in the WRONG card; here nothing is misfiled.
+  const owner = ticketOwnerOf(index, subject);
+  if (owner?.id === homeId) {
+    return `${claim.bead} already ships under ${homeId} — it hangs inside that run's ticket set today, so the move would flatten nesting somebody meant rather than change what ships it`;
+  }
   // The subject's half of "a run owns it". `subjectRefusal` asks only `isInFlight`, which cannot see
   // a claim: a run working a ticket writes the assignee and `in_progress` onto it while the run-lease
   // lives on the CARD above, so the ticket reads as free work there. Moved out of that run's ticket
@@ -846,7 +863,6 @@ function rehomeRefusal(
   // already reached. So a ticket that run has SELECTED but not yet started carries no lease and no
   // claim — both bars above read it as free work. Moving it out of that set now takes a bead out of
   // a set the run already chose, and the run aborts when its claim reaches it.
-  const owner = ticketOwnerOf(index, subject);
   if (owner && (isInFlight(owner, nowMs) || isClaimed(owner))) {
     return `${claim.bead} rides ${owner.id}'s ticket set and a run owns ${owner.id} — that run has already selected the tickets it will work through, so moving one out from under it now would abort it or strand the work it ships`;
   }

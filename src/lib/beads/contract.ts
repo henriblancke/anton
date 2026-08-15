@@ -272,6 +272,19 @@ function bodyState(raw: string): SectionState {
   return lines.every((l) => !l.fenced && PROMPT_LINE.test(l.text)) ? "prompt" : "written";
 }
 
+/**
+ * Did an author WRITE this body, or is it still the formula's TODO prompt (or nothing at all)?
+ *
+ * The public half of {@link bodyState}, for readers that quote a contract section back as the bead's
+ * own words. {@link acceptanceBody} and {@link goalBody} deliberately return the prompt when nothing
+ * is written — a view must show the placeholder beside its "no rubric yet" marker — but a reader that
+ * REASONS from the text needs the same distinction the gate makes, or it treats scaffolding the
+ * approval gate calls missing as something the bead stated.
+ */
+export function isAuthoredBody(body: string | undefined): boolean {
+  return typeof body === "string" && bodyState(body) === "written";
+}
+
 /** How one section's gap reads, at either state it can be in. */
 interface SectionGap {
   section: ContractSection;

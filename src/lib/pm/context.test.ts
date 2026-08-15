@@ -190,6 +190,25 @@ describe("formatPmBoardContext", () => {
     );
   });
 
+  // `goalBody` returns the formula's TODO prompt when nothing is authored, so a scaffolded bead has
+  // stated nothing — while the prompt tells the pass every `goal:` line is the bead's own contract
+  // text and the only evidence a home claim may rest on. Rendering the placeholder would let a home
+  // be proposed on words the approval gate itself treats as missing.
+  it("renders no goal for a bead still carrying the formula's TODO prompt", () => {
+    const text = formatPmBoardContext({
+      board: [
+        bead("anton-todo", {
+          issue_type: "feature",
+          description: "## Goal\n\nTODO — what does this make true?\n\n## Success Criteria\n\n- [ ]",
+        }),
+      ],
+      now: NOW,
+    });
+    const targets = sectionOf(text, "Run targets");
+    expect(targets).toContain("- anton-todo [feature]");
+    expect(targets.split("\n").some((l) => l.trim().startsWith("goal:"))).toBe(false);
+  });
+
   it("cuts a long goal rather than carrying a whole contract per bead", () => {
     const text = formatPmBoardContext({
       board: [
@@ -530,6 +549,14 @@ describe("detectionsFor", () => {
         () => rehome(ticket.id, wrongCard.id),
         /already hangs under anton-card1/,
       ],
+      // The same no-op one tier out. A nested ticket already ships in the run of the card above its
+      // parent, and its line names that card as `shipped by` — the very evidence such a claim cites.
+      // The move changes no run; it only flattens nesting somebody meant.
+      [
+        "the card that already ships a nested ticket",
+        () => rehome("anton-t-nested", wrongCard.id),
+        /anton-t-nested already ships under anton-card1/,
+      ],
       ["a home that is not on the board", () => rehome(ticket.id, "anton-ghost"), /not on the board/],
       // The SUBJECT end of "which pass owns this ask". A parentless task/bug is a RUN TARGET, so it
       // renders as one rather than in the loose section, and nothing else here stops a claim that
@@ -625,6 +652,8 @@ describe("detectionsFor", () => {
           status: "in_progress",
           assignee: "runner-3",
         }),
+        // A subtask filed under a ticket: `feature → task → subtask`, shipped by the card at the top.
+        bead("anton-t-nested", { parent: ticket.id }),
         // Two tickets a run has SELECTED but not reached: every signal lives on the card above them.
         bead("anton-t-riding", { parent: "anton-live" }),
         bead("anton-t-selected", { parent: "anton-held" }),
