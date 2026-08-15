@@ -37,6 +37,17 @@ afterEach(() => {
 });
 
 describe("JobsFilters", () => {
+  // The shared FilterSelect (anton-xhm4) composes these ids from a per-bar prefix; the jobs bar is
+  // the only one whose option list carries its own empty entry, so no "All" option is prepended.
+  it("keeps the job-scoped select ids and its own leading option", () => {
+    render(<JobsFilters />);
+    expect(statusSelect().id).toBe("job-filter-status");
+    expect(typeSelect().id).toBe("job-filter-type");
+    expect(
+      [...statusSelect().options].filter((option) => option.value === "").map((o) => o.text),
+    ).toEqual(["Active"]);
+  });
+
   it("selects Active and All types when the URL carries no filter", () => {
     render(<JobsFilters />);
     expect(statusSelect().value).toBe("");
