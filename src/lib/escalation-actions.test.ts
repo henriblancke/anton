@@ -1018,6 +1018,20 @@ describe("actOnEscalation — a wait on a person", () => {
     expect(gateResolve).not.toHaveBeenCalled();
     expect(rowOf(escalation.id)?.status).toBe("open");
   });
+
+  it("refuses a dismiss — settling the row over an open gate just re-raises it", async () => {
+    // The panel offers no Dismiss here, but a direct POST bypasses the panel: settled as dismissed,
+    // the gate is still open, so the next sweep raises this same wait and the board bounces
+    // "Waiting on you" forever with no server-side way to end it.
+    const escalation = await openGateWait();
+
+    expect(await actOnEscalation(project, escalation.id, "dismiss")).toEqual({
+      ok: false,
+      reason: "not-dismissable",
+    });
+    expect(rowOf(escalation.id)?.status).toBe("open");
+    expect(gateResolve).not.toHaveBeenCalled();
+  });
 });
 
 describe("actOnEscalation — scoping", () => {

@@ -21,9 +21,10 @@ export const dynamic = "force-dynamic";
  * settle half of it. See escalation-actions.ts for the ordering that makes it safe.
  *
  * 409 covers "already settled" (someone else clicked first), "nothing to act on" (a finding that
- * names neither a bead nor a job), "contested" (another machine is running the work now), and
- * "unverified" (bd couldn't confirm whether one is) — in each case the request was valid but the
- * state refuses it.
+ * names neither a bead nor a job), "contested" (another machine is running the work now),
+ * "unverified" (bd couldn't confirm whether one is), and a `dismiss` on a wait for a person (which
+ * would settle the row over a still-open gate) — in each case the request was valid but the state
+ * refuses it.
  */
 export const POST = withProject<{ slug: string; escalationId: string }>(
   async (request, { project, params }) => {
@@ -67,6 +68,8 @@ const FAILURE_MESSAGES = {
   "not-found": "Escalation not found",
   "not-open": "This escalation has already been settled",
   "no-target": "This escalation names no ticket or job to act on",
+  "not-dismissable":
+    "A wait on a person can't be dismissed — the gate would stay open and the next sweep would raise it again. Resolve it (you did the thing) or abandon the work",
   contested: "Another machine has picked this work back up — it is running again, so nothing was changed",
   unverified:
     "anton could not read the shared board, so it can't rule out another machine running this work — nothing was changed. Try again once bd can reach the remote",

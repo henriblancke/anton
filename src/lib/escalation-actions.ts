@@ -30,7 +30,9 @@
  * straight back to gate-check's own resume, which is the opposite of an abandon. Either way the gate
  * must close, because it is not on the bead's lifecycle — left open it keeps `detectOpenHumanGates`
  * raising this same escalation every sweep, against work that has since been settled. Dismiss is
- * deliberately NOT offered: a wait on a person is not something to acknowledge and leave open.
+ * deliberately NOT offered — and refused here, not merely hidden in the panel: a wait on a person is
+ * not something to acknowledge and leave open, and a dismissal that left the gate open would settle
+ * the row into a board that raises it again on the next sweep, forever.
  *
  * `dismiss` is the third answer, and the honest one for a STALE PR: the work is already delivered
  * and open for review, so execute-epic's PR short-circuit makes a resume a no-op — it would settle
@@ -64,6 +66,9 @@ export function isEscalationAction(value: unknown): value is EscalationAction {
  *   • `not-open`   — someone already settled it (409).
  *   • `no-target`  — the finding names neither a bead/epic nor a job, so there is nothing to resume
  *                    or abandon (409).
+ *   • `not-dismissable`
+ *                  — a wait on a PERSON, which dismissing cannot settle: the gate stays open and the
+ *                    next sweep raises the same row again (409).
  *   • `contested`  — the work was picked back up since the stall was raised, here or on another
  *                    machine (409).
  *   • `unverified` — bd could not confirm CURRENT shared state (the pull or a bead read failed), so
@@ -74,6 +79,7 @@ export type EscalationActionFailure =
   | "not-found"
   | "not-open"
   | "no-target"
+  | "not-dismissable"
   | "contested"
   | "unverified";
 
@@ -105,6 +111,11 @@ export async function actOnEscalation(
 
   // Dismiss settles the row and nothing else, so it needs no target and can't fail half-way.
   if (action === "dismiss") {
+    // Except on a wait for a PERSON, where settling the row alone settles nothing: the gate stays
+    // open, `detectOpenHumanGates` sees it on the very next sweep, and the board bounces the same
+    // "Waiting on you" row forever. The panel offers no Dismiss there (see the module note); this is
+    // that rule where it is enforceable, since a direct POST never passes through the panel.
+    if (view.kind === "needs-human") return { ok: false, reason: "not-dismissable" };
     if (!(await settleEscalation(db, systemClock, escalationId, "dismissed"))) {
       return { ok: false, reason: "not-open" };
     }
