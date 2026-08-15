@@ -5,17 +5,19 @@
  * reason, closed bead, live lease, attempts still on the clock).
  */
 import { describe, expect, it } from "vitest";
-import type { Bead } from "../beads/bd";
+import type { Bead, Gate } from "../beads/bd";
 import { LABELS } from "../beads/bd";
 import {
   detectDeadLeases,
   detectExhaustedJobs,
+  detectOpenHumanGates,
   detectParkedRuns,
   detectStalePrs,
   inReviewTargets,
   settledExecuteEpicJobsByEpic,
   type InReviewPr,
 } from "./run-health";
+import { sortFindings } from "../run-health";
 import type { RunRow } from "../runs";
 import type { JobRow } from "./queue";
 
@@ -334,6 +336,128 @@ describe("detectExhaustedJobs", () => {
     );
     expect(finding).toMatchObject({ kind: "exhausted-job", jobId: "j-1", beadId: undefined });
     expect(finding.reason).toContain("sync-push");
+  });
+});
+
+describe("detectOpenHumanGates", () => {
+  /** A gate bead as `bd gate list --json` returns it — reason INSIDE the description, as bd stores it. */
+  function gate(id: string, o: Partial<Gate> = {}): Gate {
+    return {
+      id,
+      title: "Gate: human",
+      status: "open",
+      issue_type: "gate",
+      await_type: "human",
+      description: "Ad-hoc gate blocking t-1\n\nReason: needs a design call",
+      created_at: new Date(NOW - 3 * HOUR).toISOString(),
+      ...o,
+    };
+  }
+
+  /** A ticket gated under a feature — the shape a resume has to climb out of. */
+  const gatedBoard = (gateId = "g-1"): Bead[] => [
+    bead("f-1", { issue_type: "feature" }),
+    bead("t-1", {
+      issue_type: "task",
+      parent: "f-1",
+      dependencies: [{ issue_id: "t-1", depends_on_id: gateId, type: "blocks" }],
+    }),
+  ];
+
+  it("reports an open human gate, with its reason, its age, and what it blocks", () => {
+    const [finding, ...rest] = detectOpenHumanGates([gate("g-1")], gatedBoard(), NOW);
+
+    expect(rest).toEqual([]);
+    expect(finding).toMatchObject({
+      kind: "needs-human",
+      key: "needs-human:g-1",
+      gateId: "g-1",
+      // The bead the wait is ON, and the bead a resume would re-enqueue — the feature above it,
+      // never the gated ticket, which anton never dispatches on its own.
+      beadId: "t-1",
+      targetBeadId: "f-1",
+    });
+    expect(finding.reason).toContain("needs a design call");
+    expect(finding.since).toBe(NOW - 3 * HOUR);
+    expect(finding.ageMs).toBe(3 * HOUR);
+  });
+
+  it("says so plainly when the gate carries no reason, rather than reporting nothing", () => {
+    const bare = gate("g-1", { description: "Ad-hoc gate blocking t-1" });
+
+    const [finding] = detectOpenHumanGates([bare], gatedBoard(), NOW);
+
+    expect(finding).toMatchObject({ kind: "needs-human", gateId: "g-1" });
+    expect(finding.reason).toContain("no reason recorded");
+  });
+
+  it("ignores a closed gate — that wait is over", () => {
+    expect(detectOpenHumanGates([gate("g-1", { status: "closed" })], gatedBoard(), NOW)).toEqual([]);
+  });
+
+  it("ignores the gates bd resolves by itself — only a human gate needs a human", () => {
+    const machine: Gate[] = [
+      gate("g-timer", { await_type: "timer" }),
+      gate("g-run", { await_type: "gh:run" }),
+      gate("g-pr", { await_type: "gh:pr" }),
+    ];
+    expect(detectOpenHumanGates(machine, gatedBoard("g-timer"), NOW)).toEqual([]);
+  });
+
+  it("still reports a gate whose blocked bead has no run target above it", () => {
+    // A gated step of a poured molecule: `runTargetAbove` stops at the plumbing, so anton has
+    // nothing to re-enqueue — but a person is still being waited on, which is the whole finding.
+    const board = [
+      bead("m-1", { issue_type: "molecule" }),
+      bead("s-1", {
+        issue_type: "task",
+        parent: "m-1",
+        dependencies: [{ issue_id: "s-1", depends_on_id: "g-1", type: "blocks" }],
+      }),
+    ];
+
+    const [finding] = detectOpenHumanGates([gate("g-1")], board, NOW);
+
+    expect(finding).toMatchObject({ kind: "needs-human", beadId: "s-1" });
+    expect(finding.targetBeadId).toBeUndefined();
+  });
+
+  it("still reports a gate whose blocked bead this board read doesn't carry", () => {
+    const [finding] = detectOpenHumanGates([gate("g-1")], [], NOW);
+    expect(finding).toMatchObject({ kind: "needs-human", gateId: "g-1" });
+    expect(finding.beadId).toBeUndefined();
+    expect(finding.targetBeadId).toBeUndefined();
+  });
+
+  it("reads a gate with no timestamp as new, not as a 1970 stall", () => {
+    const [finding] = detectOpenHumanGates(
+      [gate("g-1", { created_at: undefined })],
+      gatedBoard(),
+      NOW,
+    );
+    expect(finding.since).toBe(NOW);
+    expect(finding.ageMs).toBe(0);
+  });
+
+  it("serializes identically over two sweeps of unchanged state, whatever order bd lists gates in", () => {
+    const gates = [gate("g-2"), gate("g-1")];
+    const board = gatedBoard();
+
+    const first = sortFindings(detectOpenHumanGates(gates, board, NOW));
+    const second = sortFindings(detectOpenHumanGates([...gates].reverse(), board, NOW));
+
+    expect(first.map((f) => f.key)).toEqual(["needs-human:g-1", "needs-human:g-2"]);
+    expect(JSON.stringify(second)).toEqual(JSON.stringify(first));
+  });
+
+  it("keeps the key stable as the wait ages, so one wait is one escalation", () => {
+    // The sweep re-runs on a schedule and the escalation table dedupes on this key alone — a key
+    // that moved with the clock (or with the age in the reason) would raise a fresh escalation
+    // every single pass.
+    const later = sortFindings(detectOpenHumanGates([gate("g-1")], gatedBoard(), NOW + 12 * HOUR));
+
+    expect(later.map((f) => f.key)).toEqual(["needs-human:g-1"]);
+    expect(later[0].ageMs).toBe(15 * HOUR);
   });
 });
 

@@ -20,8 +20,15 @@ import type { AntonDb, Clock } from "./jobs/queue";
  *   • `stale-pr`      — an in-review target whose open PR has had no activity past the threshold.
  *   • `dead-lease`    — a bead still carrying an expired run-lease with no live job behind it.
  *   • `exhausted-job` — a job settled parked/failed having spent its whole attempt budget.
+ *   • `needs-human`   — an OPEN human gate: a wait only a person can end, which by construction
+ *     nothing in anton will ever close on its own.
  */
-export type RunHealthFindingKind = "parked-run" | "stale-pr" | "dead-lease" | "exhausted-job";
+export type RunHealthFindingKind =
+  | "parked-run"
+  | "stale-pr"
+  | "dead-lease"
+  | "exhausted-job"
+  | "needs-human";
 
 export interface RunHealthFinding {
   kind: RunHealthFindingKind;
@@ -42,6 +49,14 @@ export interface RunHealthFinding {
   jobId?: string;
   prNumber?: number;
   prUrl?: string;
+  /** The gate the wait hangs on (`needs-human`) — what a human resolves to end it. */
+  gateId?: string;
+  /**
+   * The RUN TARGET above `beadId` — what a resume re-enqueues, which for a gated ticket is the
+   * feature/epic anton actually runs, not the ticket itself. Absent when nothing above the bead is
+   * a run target (pipeline plumbing, or a gate hung on a bead the board no longer carries).
+   */
+  targetBeadId?: string;
 }
 
 export interface RunHealthReport {

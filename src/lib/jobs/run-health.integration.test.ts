@@ -45,6 +45,10 @@ describeBd("run-health e2e (real handler · real bd)", () => {
   let deadLeaseEpic: string;
   /** A healthy epic: no lease, no PR, nothing to say about it. */
   let healthyEpic: string;
+  /** An open human gate on `gatedTicket` — the needs-human subject, under the epic a resume runs. */
+  let humanGate: string;
+  let gatedEpic: string;
+  let gatedTicket: string;
   let parkedRunId: string;
   let exhaustedJobId: string;
 
@@ -95,6 +99,28 @@ describeBd("run-health e2e (real handler · real bd)", () => {
       title: "Nothing wrong here",
       type: "epic",
       description: "## Goal\nx",
+    });
+
+    gatedEpic = await beads.create(repo, {
+      title: "Waiting on the founder",
+      type: "epic",
+      description: "## Goal\nx",
+    });
+    // The gate hangs on the TICKET, which is the only shape bd allows (it refuses a gate on an
+    // epic: "epics can only block other epics") and the one that proves the climb — a resume
+    // re-enqueues the epic above it, never the ticket.
+    gatedTicket = await beads.create(repo, {
+      title: "Blocked until the founder looks",
+      type: "task",
+      acceptance: "- [ ] x",
+      deps: [`parent-child:${gatedEpic}`],
+    });
+    // The real thing, through bd: a gate bead is ABSENT from `bd list --status all`, so this also
+    // proves the sweep sources gates from the listing that carries them.
+    humanGate = await beads.gateCreate(repo, {
+      blocks: gatedTicket,
+      type: "human",
+      reason: "the founder wants to see the design first",
     });
 
     tdb = makeTestDb();
@@ -178,6 +204,17 @@ describeBd("run-health e2e (real handler · real bd)", () => {
     const exhausted = findingsByKind(report!.findings, "exhausted-job");
     expect(exhausted).toHaveLength(1);
     expect(exhausted[0]).toMatchObject({ jobId: exhaustedJobId, beadId: healthyEpic });
+
+    const human = findingsByKind(report!.findings, "needs-human");
+    expect(human).toHaveLength(1);
+    // Gate, the ticket it blocks, and the run target a resume would re-enqueue — the epic above it.
+    expect(human[0]).toMatchObject({
+      key: `needs-human:${humanGate}`,
+      gateId: humanGate,
+      beadId: gatedTicket,
+      targetBeadId: gatedEpic,
+    });
+    expect(human[0].reason).toContain("the founder wants to see the design first");
 
     // The healthy epic is the control: it appears in no finding at all.
     expect(report!.findings.some((f) => f.kind === "dead-lease" && f.beadId === healthyEpic)).toBe(

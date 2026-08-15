@@ -15,6 +15,7 @@ const ESCALATION_LABELS: Record<RunHealthFindingKind, string> = {
   "stale-pr": "Stale PR",
   "dead-lease": "Dead lease",
   "exhausted-job": "Retries spent",
+  "needs-human": "Waiting on you",
 };
 
 /**

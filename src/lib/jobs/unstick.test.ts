@@ -796,6 +796,30 @@ describe("non-resumable parks produce exactly one escalation and no enqueue", ()
     expect(escalationRows().map((r) => r.jobId).sort()).toEqual(["j-10", "j-9"]);
   });
 
+  it("points a human-gate escalation at the RUN TARGET, not the ticket the gate blocks", async () => {
+    // The resume button acts on `epicBeadId`, and jobs are keyed by run target — pointing it at the
+    // gated ticket would enqueue work execute-epic never dispatches on its own.
+    await seedReport({
+      kind: "needs-human",
+      key: "needs-human:g-1",
+      reason: "waiting on a human 3h: the founder wants to see the design first",
+      since: NOW - 3 * HOUR,
+      ageMs: 3 * HOUR,
+      gateId: "g-1",
+      beadId: "t-1",
+      targetBeadId: "e-2",
+    });
+
+    expect(await sweep()).toMatchObject({ findings: 1, resumed: 0, escalated: 1, held: 0 });
+    expect(escalationRows()[0]).toMatchObject({
+      findingKey: "needs-human:g-1",
+      kind: "needs-human",
+      beadId: "t-1", // where the wait is visible on the board — and where the note lands
+      epicBeadId: "e-2",
+    });
+    expect(jobRows()).toEqual([]); // a human gate is never auto-resumed
+  });
+
   it("raises a fresh escalation once a resolved one no longer covers the stall", async () => {
     // The open-only partial index is what allows this: a stall that recurs after the founder settled
     // it must be able to reach them again rather than being silenced by its own history.

@@ -677,14 +677,15 @@ async function exhaustedJobStillStuck(
 
 /**
  * The epic an escalation's resume button would target. For a parked run that's the run's epic (the
- * finding names the ticket, but jobs are keyed by epic); otherwise the finding's own bead, which for
- * a stale PR or a dead lease IS the run target.
+ * finding names the ticket, but jobs are keyed by epic); otherwise the run target the detector
+ * resolved, falling back to the finding's own bead — which for a stale PR or a dead lease IS the
+ * run target.
  */
 function epicBeadIdFor(finding: RunHealthFinding, ctx: UnstickContext): string | undefined {
   if (finding.kind === "parked-run" && finding.runId) {
     return ctx.parkedRuns.get(finding.runId)?.epicBeadId;
   }
-  return finding.beadId;
+  return finding.targetBeadId ?? finding.beadId;
 }
 
 /**
