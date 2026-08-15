@@ -73,11 +73,9 @@ export interface ShadowInput {
  * The proposals this policy would shadow — the manual-move floor already applied by `autonomyFor`.
  *
  * `apply` is deliberately NOT shadowed: an armed kind is meant to be written, not described, so
- * routing it here would report a move as hypothetical that the pass is trusted to make. The armed
- * path does not exist yet (anton-lmps ships the shadow half), so until it does, a kind set to
- * `apply` — reachable only by a direct settings API call, since the UI offers the radio disabled —
- * behaves as `propose`. That is the safe direction to be wrong in: it files the ask and writes
- * nothing.
+ * routing it here would report a move as hypothetical that the pass is about to make for real. That
+ * branch is armed.ts's (anton-4ab3), and the two levels are disjoint by construction — a kind
+ * resolves to exactly one of them, so no proposal is ever both described and applied.
  */
 function shadowable(
   created: EmittedProposal[],

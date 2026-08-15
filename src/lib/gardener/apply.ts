@@ -92,11 +92,24 @@ export interface ApplyResult {
 }
 
 /**
+ * WHO applied a proposal (anton-4ab3) — the one thing an unattended write owes a reader that an
+ * approve does not.
+ *
+ * `approval` is a human on the approve route: somebody read the ask and said yes. `policy` is a
+ * scheduled pass writing under the project's proposal autonomy (anton-nbyy): nobody was asked. The
+ * two leave the same board move and are not the same event, so the note says which one this was —
+ * a founder who finds a bead moved overnight must be able to tell "I approved this last week" from
+ * "the policy I set does this".
+ */
+export type ApplyActor = "approval" | "policy";
+
+/**
  * Apply an approved proposal and close it with a note of what changed.
  *
  * `board` is the caller's FRESH `--status all` read (the approve route forces one before it decides
- * anything): every precondition is judged against it, so a proposal filed against a board that has
- * since moved refuses instead of acting on last night's picture.
+ * anything; the armed pass takes one per proposal): every precondition is judged against it, so a
+ * proposal filed against a board that has since moved refuses instead of acting on last night's
+ * picture.
  *
  * Throws {@link ProposalApplyError} on every failure — and attaches the reason to the proposal as a
  * note first, so the bead a human comes back to says why it is still open. The one thing this never
@@ -106,6 +119,7 @@ export async function applyProposal(
   repo: string,
   proposal: Bead,
   board: Bead[],
+  actor: ApplyActor = "approval",
 ): Promise<ApplyResult> {
   if (!isProposalBead(proposal)) {
     throw new ProposalApplyError("unusable", `${proposal.id} is not a proposal bead`);
@@ -138,7 +152,7 @@ export async function applyProposal(
         ),
       );
     }
-    return applyApproved(repo, proposal, plan, board);
+    return applyApproved(repo, proposal, plan, board, actor);
   });
 }
 
@@ -148,6 +162,7 @@ async function applyApproved(
   proposal: Bead,
   plan: GardenerPlan,
   board: Bead[],
+  actor: ApplyActor,
 ): Promise<ApplyResult> {
   await assertStillOpen(repo, proposal);
   // Dated from the proposal the approver read, not from the live re-read: its observation stamp is
@@ -163,9 +178,9 @@ async function applyApproved(
     );
   }
   if (decision.status === "settled") {
-    return settleUnwritten(repo, proposal, plan, decision.summary, at);
+    return settleUnwritten(repo, proposal, plan, decision.summary, at, actor);
   }
-  return applySteps(repo, proposal, plan, decision.steps, decision.summary);
+  return applySteps(repo, proposal, plan, decision.steps, decision.summary, actor);
 }
 
 /**
@@ -216,6 +231,7 @@ function settleUnwritten(
   plan: GardenerPlan,
   summary: string,
   at: ApplyMoment,
+  actor: ApplyActor,
 ): Promise<ApplyResult> {
   return withBeadWriteLocks(repo, affectedBeads(plan), async () => {
     const drifted = await settledDrifted(repo, plan, at);
@@ -226,7 +242,7 @@ function settleUnwritten(
         new ProposalApplyError("refused", `cannot apply ${proposal.id}: ${drifted}`),
       );
     }
-    return settleProposal(repo, proposal.id, plan, summary, []);
+    return settleProposal(repo, proposal.id, plan, summary, [], actor);
   });
 }
 
@@ -243,6 +259,7 @@ async function applySteps(
   plan: GardenerPlan,
   steps: ApplyStep[],
   summary: string,
+  actor: ApplyActor,
 ): Promise<ApplyResult> {
   const changed: ApplyStep[] = [];
   try {
@@ -252,7 +269,7 @@ async function applySteps(
   } catch (e) {
     throw await attachFailure(repo, proposal, await stepFailure(repo, proposal.id, changed, e));
   }
-  return settleProposal(repo, proposal.id, plan, summary, changed);
+  return settleProposal(repo, proposal.id, plan, summary, changed, actor);
 }
 
 /**
@@ -285,10 +302,27 @@ async function settleProposal(
   plan: GardenerPlan,
   summary: string,
   changed: ApplyStep[],
+  actor: ApplyActor,
 ): Promise<ApplyResult> {
-  await beads.note(repo, proposalId, `${notePrefix(plan)}: applied — ${summary}.`);
+  await beads.note(repo, proposalId, appliedNote(plan, summary, actor));
   await beads.close(repo, proposalId, `applied: ${summary}`);
   return { proposalId, plan, summary, changed: changed.map((s) => s.id) };
+}
+
+/**
+ * The note a settled proposal keeps — and, for a policy apply, the only place the board says nobody
+ * was asked.
+ *
+ * The unattended wording names the SETTING rather than just the fact, because that is what a reader
+ * has to act on: the answer to "why did this move overnight" is a kind armed at `apply`, and the
+ * note is where they find which one to change.
+ */
+function appliedNote(plan: GardenerPlan, summary: string, actor: ApplyActor): string {
+  const prefix = notePrefix(plan);
+  return actor === "policy"
+    ? `${prefix}: applied by POLICY — ${summary}. Nobody approved this: this project's proposal ` +
+        `autonomy for \`${plan.kind}\` is set to apply.`
+    : `${prefix}: applied — ${summary}.`;
 }
 
 /** Every bead a plan's outcome rests on: the subjects it acts on, plus the bead it points at. */

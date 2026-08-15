@@ -4,7 +4,8 @@
  *
  * Four properties carry this job, and each is a way it could silently do harm:
  *   • the session gets no way to write. The board writes anton makes are proposal CREATES and
- *     nothing else, whatever the session reports.
+ *     nothing else, whatever the session reports — until an operator arms a kind by hand, which is
+ *     the last describe here (anton-4ab3) and the only path to any other verb.
  *   • a healthy board files nothing, and a BROKEN pass is not a healthy board: an unreadable report
  *     fails the job rather than publishing a clean bill of health nobody reached.
  *   • a claim the board refuses is reported, not dropped — a pass whose every claim was refused must
@@ -30,6 +31,8 @@ import type { Clock } from "./queue";
 const pullMock = vi.fn<(cwd: string) => Promise<void>>();
 const listMock = vi.fn<(cwd: string, extra?: string[]) => Promise<Bead[]>>();
 const showWithCommentsMock = vi.fn<(cwd: string, id: string) => Promise<Bead>>();
+/** Only an ARMED apply re-reads a bead under its write lock; every other pass answers from `list`. */
+const showMock = vi.fn<(cwd: string, id: string) => Promise<Bead>>();
 const createMock = vi.fn<(cwd: string, opts: ProposalCreate) => Promise<string>>();
 
 interface ProposalCreate {
@@ -52,23 +55,33 @@ vi.mock("../beads/bd", async () => {
       pull: (...a: [string]) => pullMock(...a),
       list: (...a: [string, string[]?]) => listMock(...a),
       showWithComments: (...a: [string, string]) => showWithCommentsMock(...a),
+      show: (...a: [string, string]) => showMock(...a),
       create: (cwd: string, opts: ProposalCreate) => {
         writes.push(`create ${opts.title}`);
         return createMock(cwd, opts);
       },
-      // Named so a pass that reached for one fails loudly rather than silently mutating the board.
-      close: (_c: string, id: string) => trap("close", id),
-      defer: (_c: string, id: string) => trap("defer", id),
-      update: (_c: string, id: string) => trap("update", id),
-      reparent: (_c: string, id: string) => trap("reparent", id),
-      link: (_c: string, id: string) => trap("link", id),
+      // Recorded, and by default REFUSED — see `writeVerbMock`.
+      close: (_c: string, id: string) => wrote("close", id),
+      defer: (_c: string, id: string) => wrote("defer", id),
+      update: (_c: string, id: string) => wrote("update", id),
+      reparent: (_c: string, id: string) => wrote("reparent", id),
+      link: (_c: string, id: string) => wrote("link", id),
+      note: (_c: string, id: string) => wrote("note", id),
+      untag: (_c: string, id: string) => wrote("untag", id),
     },
   };
 });
 
-function trap(verb: string, id: string): Promise<never> {
+/**
+ * Every write verb a pass can only reach through an ARMED apply (anton-4ab3). Recorded either way,
+ * so `writes` stays the whole record of what the pass did to the board — and rejecting by default,
+ * so a pass that reaches for one with nothing armed fails loudly instead of quietly mutating.
+ */
+const writeVerbMock = vi.fn<(verb: string, id: string) => Promise<string>>();
+
+function wrote(verb: string, id: string): Promise<string> {
   writes.push(`${verb} ${id}`);
-  return Promise.reject(new Error(`the pass must not ${verb} ${id}`));
+  return writeVerbMock(verb, id);
 }
 
 /**
@@ -167,6 +180,9 @@ beforeEach(async () => {
   });
 
   writes.length = 0;
+  writeVerbMock.mockImplementation((verb, id) =>
+    Promise.reject(new Error(`the pass must not ${verb} ${id}`)),
+  );
   planApplyMock.mockImplementation(realPlanApply);
   dispatched = undefined;
   duringSession = undefined;
@@ -176,6 +192,7 @@ beforeEach(async () => {
   pullMock.mockResolvedValue(undefined);
   listMock.mockResolvedValue([bead("anton-a")]);
   showWithCommentsMock.mockImplementation(async (_c, id) => bead(id, { comments: [] }));
+  showMock.mockRejectedValue(new Error("no such bead"));
   let n = 0;
   createMock.mockImplementation(async () => `anton-p${++n}`);
 });
@@ -455,5 +472,114 @@ describe("product-master pass · shadow mode", () => {
       "SHADOW anton-p1 (low-value) retire/defer anton-a — COULD NOT SHADOW: indexBoard exploded\n",
     );
     expect(writes).toEqual(["create Product master: defer anton-a"]);
+  });
+});
+
+/**
+ * ARMED mode (anton-4ab3): the pass APPLIES what it just filed for a kind an operator armed, through
+ * the same `applyProposal` the approve route calls — and through the SAME loop the gardener patrol
+ * applies with, so the record reads identically from both producers.
+ *
+ * `writes` stays the whole record of what the pass did to the board, so each case here says exactly
+ * which verbs an arming bought — and the default rejection on every one of them stays in force for
+ * every other suite in this file.
+ */
+describe("product-master pass · armed", () => {
+  /** Untouched since well before the pass read the board, so the premise fence still holds. */
+  const cold = bead("anton-a", { updated_at: "2026-01-01T00:00:00Z" });
+
+  /** The proposals this pass has filed so far, as the board hands them back. */
+  const filed = (): Bead[] =>
+    createMock.mock.calls.map(([, draft], i) =>
+      bead(`anton-p${i + 1}`, {
+        title: draft.title,
+        labels: draft.labels,
+        metadata: draft.metadata,
+        created_at: new Date(nowMs).toISOString(),
+      }),
+    );
+
+  /** Every read answers with these beads plus whatever the pass has filed about them. */
+  function boardIs(subjects: () => Bead[]): void {
+    const board = () => [...subjects(), ...filed()];
+    listMock.mockImplementation(async () => board());
+    showMock.mockImplementation(async (_c, id) => {
+      const found = board().find((b) => b.id === id);
+      if (!found) throw new Error(`no such bead: ${id}`);
+      return found;
+    });
+  }
+
+  /** Arm a kind at a level for this project — the operator's stored autonomy policy (anton-nbyy). */
+  const arm = (overrides: Record<string, string>) =>
+    t.db
+      .update(schema.projects)
+      .set({ settingsJson: JSON.stringify({ proposalAutonomy: overrides }) });
+
+  beforeEach(async () => {
+    sessionText = report(claim());
+    boardIs(() => [cold]);
+    await arm({ "low-value": "apply" });
+  });
+
+  it("applies what it filed, names POLICY as the actor, and records it as the patrol does", async () => {
+    writeVerbMock.mockResolvedValue("");
+
+    await expectJobStatus(t.db, await runPass(), "done");
+
+    // The whole loop in the order it runs: file the ask, make the move, say who made it, settle.
+    expect(writes).toEqual([
+      "create Product master: defer anton-a",
+      "defer anton-a",
+      "note anton-p1",
+      "close anton-p1",
+    ]);
+    // Byte-identical in shape to the gardener's line (gardener.test.ts) — one loop, two producers.
+    expect(await sessionLog()).toContain(
+      "[product-master] APPLY anton-p1 (low-value) retire/defer anton-a — " +
+        "APPLIED: deferred anton-a out of the ready set\n",
+    );
+    expect(nudge).toHaveBeenCalledWith({ id: projectId, repoPath: REPO });
+  });
+
+  it("spends ONE write cap across both tiers — the budget is the pass's, not the tier's", async () => {
+    // Approval rot files ahead of the session (anton-xg5y), so tier 1 can spend the whole cap before
+    // tier 2 has filed anything. A per-tier cap would let one pass write twice what it may.
+    const degraded = [1, 2, 3].flatMap((n) => [
+      bead(`anton-x${n}`, { issue_type: "epic", labels: [LABELS.approved] }),
+      bead(`anton-f${n}`, { issue_type: "feature", parent: `anton-x${n}` }),
+    ]);
+    boardIs(() => [cold, ...degraded]);
+    await arm({ "low-value": "apply", "degraded-approval": "apply" });
+    writeVerbMock.mockResolvedValue("");
+
+    await expectJobStatus(t.db, await runPass(), "done");
+
+    // Three unapproves — the cap — and NOT the fourth armed move the session asked for.
+    expect(writes.filter((w) => w.startsWith("untag "))).toHaveLength(3);
+    expect(writes).not.toContain("defer anton-a");
+    const log = await sessionLog();
+    expect(log).toContain(
+      "APPLY held back 1 armed proposal(s) — one pass applies at most 3; " +
+        "they stay open as ordinary asks (anton-p4)",
+    );
+    // Held back is an ask still standing, not a write deferred to later in the same pass.
+    expect(writes).not.toContain("close anton-p4");
+  });
+
+  it("keeps the pass green when an apply blows up, and leaves the ask standing", async () => {
+    writeVerbMock.mockImplementation((verb) =>
+      verb === "defer" ? Promise.reject(new Error("bd defer exploded")) : Promise.resolve(""),
+    );
+
+    await expectJobStatus(t.db, await runPass(), "done");
+
+    expect(await sessionLog()).toContain(
+      "APPLY anton-p1 (low-value) retire/defer anton-a — COULD NOT APPLY: applying anton-p1 failed",
+    );
+    // The proposal is never settled by a move that did not land — it keeps the failure as a note and
+    // waits for a human, exactly as a failed approval does.
+    expect(writes).toContain("note anton-p1");
+    expect(writes).not.toContain("close anton-p1");
   });
 });

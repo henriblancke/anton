@@ -10,11 +10,14 @@
  * again right after, so a twin filed by another machine is withdrawn within seconds rather than at
  * the next patrol.
  *
- * This tier writes to PROPOSALS alone: applying one is an approval away (anton-1t3n), so nothing
- * here touches the beads a proposal is about.
+ * This tier writes to PROPOSALS alone, with ONE exception the operator has to arm by hand: a kind
+ * set to `apply` (anton-nbyy) is applied by the pass itself, through the same `applyProposal` the
+ * approve route calls and under its own write cap (anton-4ab3). At every other level applying one is
+ * an approval away (anton-1t3n) and nothing here touches the beads a proposal is about.
  */
 import type { Bead } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
+import { applyArmedProposals } from "../gardener/armed";
 import { detectBoard } from "../gardener/detect";
 import {
   arbitrateEmission,
@@ -164,24 +167,37 @@ async function withdrawTwins(
 /**
  * What the armed patrol WOULD have done with what it just filed (anton-lmps) — decided against a
  * board read fresh at this moment, exactly as an approval would, and writing nothing.
- *
- * Runs AFTER arbitration and skips what it withdrew: a proposal folded into another machine's twin
- * is a closed ask, and shadowing it would report on a question nobody is being asked.
  */
 function shadow(
   scope: PassScope,
   created: EmittedProposal[],
-  withdrawn: Set<string>,
   observedAtMs: number,
 ): Promise<unknown> {
   return shadowProposals({
     repo: scope.project.repoPath,
-    created: created.filter((p) => !withdrawn.has(p.id)),
+    created,
     policy: scope.policy,
     observedAtMs,
     nowMs: scope.clock.now(),
     producer: "[gardener]",
     log: scope.log,
+    signal: scope.ctx.signal,
+  });
+}
+
+/**
+ * What an ARMED patrol does with the same proposals (anton-4ab3): applies the ones whose kind the
+ * operator armed, through the function the approve route calls, capped and recorded as a policy
+ * write. Disjoint from the shadow above — a kind is one level, never both.
+ */
+function armed(scope: PassScope, created: EmittedProposal[]): Promise<unknown> {
+  return applyArmedProposals({
+    repo: scope.project.repoPath,
+    created,
+    policy: scope.policy,
+    producer: "[gardener]",
+    log: scope.log,
+    nudge: () => scope.nudge(scope.project),
     signal: scope.ctx.signal,
   });
 }
@@ -231,7 +247,12 @@ export async function fileGardenerProposals(
     });
     reportEmission(scope, emission);
     const withdrawn = await withdrawTwins(scope, emission, input.arbitration);
-    await shadow(scope, emission.created, withdrawn, input.observedAtMs);
+    // Both settlement paths run AFTER arbitration and over what it left standing: a proposal folded
+    // into another machine's twin is a closed ask, and shadowing — let alone applying — it would act
+    // on a question nobody is being asked.
+    const standing = emission.created.filter((p) => !withdrawn.has(p.id));
+    await shadow(scope, standing, input.observedAtMs);
+    await armed(scope, standing);
   } catch (e) {
     // The proposals a stopped pass DID file are on the board like any other, so they get the same
     // arbitration — a pass that parked on its third create must not leave the first two doubled. Not

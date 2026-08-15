@@ -5,13 +5,16 @@
  * The pass has TWO tiers and only one of them needs a session: {@link revalidationTier} is a FACT
  * (the approve gate's own validator, re-run over the snapshot), while {@link judgeBoard} and
  * {@link acceptClaims} are the judgment. Both file through the same {@link makeProposalFiler}, so a
- * proposal is fingerprinted, capped and shadowed identically whichever tier raised it.
+ * proposal is fingerprinted, capped, shadowed and — for a kind the operator armed — applied
+ * identically whichever tier raised it.
  */
 import type { Bead } from "../beads/bd";
 import type { RunClaudeOptions, runClaude } from "../claude/driver";
+import { applyArmedProposals } from "../gardener/armed";
 import type { GardenerDetection } from "../gardener/detections";
 import {
   emitProposals,
+  MAX_APPLIES_PER_PASS,
   MAX_PROPOSALS_PER_PASS,
   PartialEmissionError,
   type EmissionResult,
@@ -75,7 +78,8 @@ function reportEmission(scope: PassScope, emission: EmissionResult): void {
  *
  * Returned as a closure because both tiers file against the SAME board snapshot and fence — the two
  * are entitled to their own emission (so they cannot cap each other out) but never to their own
- * premise.
+ * premise. The WRITE cap is the opposite: it is spent from one budget across both tiers, because it
+ * bounds what this PASS may do to the board unattended, not what a tier may (anton-4ab3).
  */
 export function makeProposalFiler(
   scope: PassScope,
@@ -83,6 +87,7 @@ export function makeProposalFiler(
 ): (detections: GardenerDetection[]) => Promise<void> {
   const { board, observedAtMs } = input;
   const repo = scope.project.repoPath;
+  let writeBudget = MAX_APPLIES_PER_PASS;
 
   return async (detections: GardenerDetection[]): Promise<void> => {
     scope.ctx.signal.throwIfAborted();
@@ -107,6 +112,20 @@ export function makeProposalFiler(
         log: scope.log,
         signal: scope.ctx.signal,
       });
+      // And what an ARMED pass does with them (anton-4ab3) — the same walk, one branch further,
+      // through the function the approve route calls. Disjoint from the shadow above: a kind is one
+      // autonomy level, never both.
+      const applied = await applyArmedProposals({
+        repo,
+        created: emission.created,
+        policy: scope.policy,
+        producer: "[product-master]",
+        log: scope.log,
+        nudge: () => scope.nudge(scope.project),
+        signal: scope.ctx.signal,
+        limit: writeBudget,
+      });
+      writeBudget -= applied.attempted;
     } catch (e) {
       // Whatever landed before a create failed is real board state living only in the local working
       // set — report and propagate it, or a pass that parks leaves the proposals that DID file

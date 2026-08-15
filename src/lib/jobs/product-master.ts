@@ -8,10 +8,11 @@
  * applied on approval and suppressed on decline (anton-9qwq / anton-1t3n).
  *
  * The split of labour is the design. The SESSION judges and nothing else — it has no `bd`, no shell,
- * and no writes of any kind, so "this pass never mutates the board" is a property of how it is
+ * and no writes of any kind, so "the session never mutates the board" is a property of how it is
  * dispatched rather than a promise in a prompt. anton owns everything mechanical: reading the board,
- * checking each claim against it, hashing the fingerprints, capping the pass, filing the beads. An
- * LLM cannot be a hash function, and one wrong digit files a duplicate ask forever.
+ * checking each claim against it, hashing the fingerprints, capping the pass, filing the beads — and
+ * applying the ones whose kind the operator armed (anton-4ab3), under a cap of its own. An LLM
+ * cannot be a hash function, and one wrong digit files a duplicate ask forever.
  *
  * Off by default: the schedule is seeded disabled (schedules.ts). A pass costs a claude session and
  * spends a founder's attention on every proposal it files, so arming it is a deliberate act.

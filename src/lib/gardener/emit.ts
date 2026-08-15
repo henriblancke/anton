@@ -73,6 +73,20 @@ const PRODUCER: Record<ProposalNamespace, { title: string; filedBy: string }> = 
 export const MAX_PROPOSALS_PER_PASS = 10;
 
 /**
+ * How many proposals ONE pass may APPLY unattended (anton-4ab3) — a different budget from
+ * {@link MAX_PROPOSALS_PER_PASS}, and deliberately smaller.
+ *
+ * That cap bounds a founder's ATTENTION: ten asks is a readable morning, and being wrong costs a
+ * longer list. This one bounds unattended WRITES to the board, where being wrong costs board state
+ * nobody chose — a different question, which deserves a smaller answer. Three is a night's tidying;
+ * a board that wants more than that in one pass is a board an operator should be looking at.
+ *
+ * The overflow is not lost and not applied later by stealth: it stays open as an ordinary ask, and
+ * the next pass re-decides it against the board this pass's own writes just left.
+ */
+export const MAX_APPLIES_PER_PASS = 3;
+
+/**
  * Fingerprints the board says NOT to propose again: every proposal still open, plus every one
  * declined (abandoned). A plainly-closed proposal is absent deliberately — see the module header.
  */

@@ -16,7 +16,9 @@
  *      duplicates, retiring stale work and relinking orphans are judgment moves that need a human
  *      (anton-bci0 "Out of scope"), and the seam deliberately has no wrapper for `--auto-merge`.
  *   3. PROPOSALS (gardener-proposals.ts, anton-9qwq) — the judgment tier: what the report can only
- *      describe becomes an approvable proposal bead.
+ *      describe becomes an approvable proposal bead. A kind the operator has ARMED (anton-nbyy) is
+ *      then applied by the pass itself, capped, through the approve route's own `applyProposal`
+ *      (anton-4ab3); everything else waits for a human.
  *
  * The board is PULLED first and NUDGED after — the patrol reads the shared board and writes to it,
  * so it must not act on a working set that is a sync heartbeat behind (an epic whose child another
