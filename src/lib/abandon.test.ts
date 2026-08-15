@@ -573,6 +573,55 @@ describe("abandonTicket with requireStopped", () => {
       expect(cancelRunMock).not.toHaveBeenCalled();
     });
 
+    // The boundary check runs before the cascade's write locks are acquired, and a gardener re-parent
+    // takes the lock of the bead it MOVES — so a move landing in that gap is invisible to it. The
+    // locked re-read judges the target the board actually holds now, not the one the plan derived.
+    it("refuses on a re-parent that lands between the boundary check and the lock", async () => {
+      const under = (parent: string) => makeBead({ id: "t1", parent });
+      const boardWith = (ticket: Bead) => [
+        makeBead({ id: "feature-old", issue_type: "feature", parent: "epic" }),
+        makeBead({
+          id: "feature-new",
+          issue_type: "feature",
+          parent: "epic",
+          labels: [liveLease("run-elsewhere")],
+        }),
+        ticket,
+      ];
+      // Quiet under feature-old when the abandon is planned; under the running feature-new by the
+      // time it holds the locks.
+      showMock
+        .mockResolvedValueOnce(under("feature-old"))
+        .mockResolvedValue(under("feature-new"));
+      listMock
+        .mockResolvedValueOnce(boardWith(under("feature-old")))
+        .mockResolvedValue(boardWith(under("feature-new")));
+
+      await expect(
+        abandonTicket(project, "t1", "won't do", { requireStopped: true }),
+      ).rejects.toThrow(/another machine/);
+      expect(abandonAllMock).not.toHaveBeenCalled();
+    });
+
+    it("settles a re-parent onto a QUIET target — a move is not by itself a live run", async () => {
+      const under = (parent: string) => makeBead({ id: "t1", parent });
+      const boardWith = (ticket: Bead) => [
+        makeBead({ id: "feature-old", issue_type: "feature", parent: "epic" }),
+        makeBead({ id: "feature-new", issue_type: "feature", parent: "epic" }),
+        ticket,
+      ];
+      showMock
+        .mockResolvedValueOnce(under("feature-old"))
+        .mockResolvedValue(under("feature-new"));
+      listMock
+        .mockResolvedValueOnce(boardWith(under("feature-old")))
+        .mockResolvedValue(boardWith(under("feature-new")));
+
+      await abandonTicket(project, "t1", "won't do", { requireStopped: true });
+
+      expect(soleAbandonedIds()).toEqual(["t1"]);
+    });
+
     // Fail closed, like readTargetState and gateDispatch on the same read: an unread board is not a
     // clear one, and nothing has been written yet, so refusing costs only a retry.
     it("refuses when the pull fails — an unread board can't rule out a foreign run", async () => {

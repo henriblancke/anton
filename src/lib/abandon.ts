@@ -9,6 +9,7 @@ import { withBeadWriteLocks } from "./beads/claim-lock";
 import { descendantsOf } from "./beads/subtree";
 import { nudgeSync } from "./beads/sync-nudge";
 import { declineNote } from "./gardener/apply";
+import { systemClock } from "./jobs/queue";
 import { cancelRunForTarget, runIsLiveForTarget } from "./jobs/service";
 import { freshDetail } from "./ticket-detail";
 import type { Bead } from "./beads/bd";
@@ -121,6 +122,9 @@ interface StoppedWork {
  * Refusing before any write, rather than skipping the cancel, is deliberate: closing the bead while
  * its agent keeps running is the same wrong answer one step later.
  *
+ * Re-run under the cascade's write locks as well (see {@link assertStillStopped}), because the
+ * parentage this target is derived from can move in the gap between here and the lock.
+ *
  * The check is a boundary, not a lock, and deliberately so: a resume landing between it and the last
  * bd write is caught one layer down instead. execute-epic re-reads the board when it dispatches and
  * returns cleanly on an abandoned target, and filters abandoned tickets out of every run — the same
@@ -146,7 +150,9 @@ async function stopRun(
   // runTargetOf's dangling-parent fallback.
   const target = board.find((b) => b.id === targetId);
   if (!target) return;
-  const nowMs = Date.now();
+  // The same clock every other lease check reads (escalation-actions, gate-targets) — one injectable
+  // source of "now", so a lease is never judged live here and expired one module over.
+  const nowMs = systemClock.now();
   const foreign = stopped.ownRunId
     ? beads.foreignRunLeaseLive(target, nowMs, stopped.ownRunId)
     : beads.isRunLive(target, nowMs);
@@ -237,6 +243,51 @@ async function rereadLocked(repo: string, id: string): Promise<Bead> {
 }
 
 /**
+ * The board, re-read from inside the cascade's write locks — the single read every locked re-check
+ * below judges, so the cascade and the run-lease can never disagree about what the board holds.
+ * Fails the abandon rather than settling blind, for the same reason {@link rereadLocked} does.
+ */
+async function listLocked(repo: string, targetId: string, listArgs: string[]): Promise<Bead[]> {
+  try {
+    return await beads.list(repo, listArgs);
+  } catch (e) {
+    throw new NotAbandonableError(
+      `the board under ${targetId} could not be re-read under its write lock (${messageOf(e)}) — nothing was written; try again`,
+    );
+  }
+}
+
+/**
+ * Re-run the stopped-work boundary against the LOCKED board (anton-mivh).
+ *
+ * {@link stopRun}'s pre-lock check judged the run target derived from a board read taken before this
+ * abandon held any lock, and a re-parent is exactly what invalidates it: the gardener takes the write
+ * lock of the bead it MOVES, which is this target, so a move landing in that gap either shows up in
+ * the read this guards or queues behind the whole settle. {@link assertCascadeUnchanged} does not
+ * cover it — that watches the work BENEATH the target, while this is the target itself moving, and a
+ * ticket re-parented under a newly running feature would otherwise be closed beneath that live run.
+ *
+ * Only for a `requireStopped` abandon, whose entire precondition is that nothing is executing: with
+ * `stopped` set {@link stopRun} cancels nothing, so this is a pure re-check that either passes or
+ * refuses before the first bd write. A plain abandon kills what it finds, and the window left after
+ * its own boundary check is the one execute-epic's dispatch-time re-read absorbs.
+ */
+async function assertStillStopped(
+  projectId: string,
+  target: Bead,
+  board: Bead[],
+  stopped: StoppedWork | undefined,
+): Promise<void> {
+  if (!stopped) return;
+  await stopRun(projectId, runTargetOf(target, board), board, stopped);
+  for (const descendant of openDescendants(board, target.id)) {
+    if (beads.isRunTarget(descendant, board)) {
+      await stopRun(projectId, descendant.id, board, stopped);
+    }
+  }
+}
+
+/**
  * Refuse an abandon whose cascade moved between the snapshot it was planned from and the locks it
  * now holds (anton-e42l).
  *
@@ -252,20 +303,7 @@ async function rereadLocked(repo: string, id: string): Promise<Bead> {
  * is one this abandon holds no lock on, so closing it would race the very writes this serializes
  * against. Nothing has been written yet, so a retry re-plans against the board it just saw.
  */
-async function assertCascadeUnchanged(
-  repo: string,
-  target: Bead,
-  descendants: Bead[],
-  listArgs: string[],
-): Promise<void> {
-  let board: Bead[];
-  try {
-    board = await beads.list(repo, listArgs);
-  } catch (e) {
-    throw new NotAbandonableError(
-      `the board under ${target.id} could not be re-read under its write lock (${messageOf(e)}) — nothing was written; try again`,
-    );
-  }
+function assertCascadeUnchanged(target: Bead, descendants: Bead[], board: Bead[]): void {
   const before = new Set(descendants.map((d) => d.id));
   const after = openDescendants(board, target.id);
   const afterIds = new Set(after.map((b) => b.id));
@@ -353,8 +391,13 @@ export async function abandonTicket(
   // the same reason the apply re-reads: the checks above judged a snapshot taken before whoever held
   // the lock ran.
   await withBeadWriteLocks(repo, cascadeLocks(bead, descendants), async () => {
-    assertOpen(await rereadLocked(repo, id), "Ticket");
-    await assertCascadeUnchanged(repo, bead, descendants, listArgs);
+    const locked = await rereadLocked(repo, id);
+    assertOpen(locked, "Ticket");
+    const lockedBoard = await listLocked(repo, id, listArgs);
+    assertCascadeUnchanged(bead, descendants, lockedBoard);
+    // The LOCKED bead, not the pre-lock snapshot: its parent is what the run target is derived from,
+    // and a re-parent is precisely what this re-check exists to catch (see assertStillStopped).
+    await assertStillStopped(project.id, locked, lockedBoard, stopped);
     // The ticket and its cascade settle as one unit — every close in a single bd transaction, the
     // ticket last (see beads.abandonAll).
     await beads.abandonAll(repo, cascadeEntries(bead, descendants, why));
@@ -434,7 +477,7 @@ export async function abandonEpic(
   // or it queues behind this settle and its own home re-check refuses.
   await withBeadWriteLocks(repo, cascadeLocks(epic, descendants), async () => {
     assertOpen(await rereadLocked(repo, epicId), "Epic");
-    await assertCascadeUnchanged(repo, epic, descendants, listArgs);
+    assertCascadeUnchanged(epic, descendants, await listLocked(repo, epicId, listArgs));
     // The epic and its whole cascade settle as one unit — every close in a single bd transaction,
     // the epic last (see beads.abandonAll), so no state exists in which the epic reads as settled
     // above still-open orphaned children.

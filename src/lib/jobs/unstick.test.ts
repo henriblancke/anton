@@ -16,14 +16,18 @@ import { makeTestDb, type TestDb } from "../db/testing";
 import { LABELS, type Bead, type Gate } from "../beads/bd";
 import type { PrActivity } from "../git/pr";
 import { saveRunHealthReport, type RunHealthFinding } from "../run-health";
+import { blockedByPoison } from "./errors";
 import type { Clock } from "./queue";
 
 const listMock = vi.fn<(cwd: string, extra?: string[]) => Promise<Bead[]>>();
 const noteMock = vi.fn<(cwd: string, id: string, text: string) => Promise<void>>();
 const syncMock = vi.fn<(cwd: string) => Promise<void>>();
 const pullMock = vi.fn<(cwd: string) => Promise<void>>();
-/** The open gates the pass re-reads before escalating a `needs-human` finding. */
-const gateListMock = vi.fn<(cwd: string) => Promise<Gate[]>>();
+/**
+ * The gates the pass re-reads: open-only before escalating a `needs-human` finding, and `--all` when
+ * it has to tell whether a poison-parked job's blocker was a human gate at all.
+ */
+const gateListMock = vi.fn<(cwd: string, opts?: { all?: boolean }) => Promise<Gate[]>>();
 
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
@@ -35,7 +39,7 @@ vi.mock("../beads/bd", async () => {
       note: (...args: [string, string, string]) => noteMock(...args),
       sync: (...args: [string]) => syncMock(...args),
       pull: (...args: [string]) => pullMock(...args),
-      gateList: (...args: [string]) => gateListMock(...args),
+      gateList: (...args: [string, { all?: boolean }?]) => gateListMock(...args),
     },
   };
 });
@@ -974,6 +978,124 @@ describe("non-resumable parks produce exactly one escalation and no enqueue", ()
     expect(await sweep()).toMatchObject({ escalated: 1 });
     expect(escalationRows().filter((r) => r.status === "open")).toHaveLength(1);
     expect(escalationRows()).toHaveLength(2);
+  });
+});
+
+// A sweep from BEFORE the dedupe raised both halves of one wait: the gate, and the job that
+// poison-parked on it. Suppression retires the finding, never the row — so without reconciliation the
+// "retries spent" escalation outlives the gate for good, carrying an Abandon that would cancel work
+// the gate is merely waiting on.
+describe("a legacy exhausted-job escalation that is really a gate's wait", () => {
+  /** The row such a sweep left behind: an open `exhausted-job` on a blocked-run poison park. */
+  function seedGateBlockedEscalation(jobId: string, ...blockers: string[]): void {
+    const reason =
+      "execute-epic job parked without retrying (permanent failure): " +
+      blockedByPoison("e-9", blockers).message;
+    t.db
+      .insert(schema.escalations)
+      .values({
+        id: `esc-${jobId}`,
+        projectId: "p1",
+        findingKey: `exhausted-job:${jobId}`,
+        kind: "exhausted-job",
+        reason,
+        beadId: "e-9",
+        jobId,
+        since: secDate(NOW - 4 * HOUR),
+        evidenceJson: JSON.stringify({ kind: "exhausted-job", jobId, reason }),
+        status: "open",
+        raisedAt: secDate(NOW - 4 * HOUR),
+        updatedAt: secDate(NOW - 4 * HOUR),
+      })
+      .run();
+  }
+
+  /** `gate list` answers the two questions differently: open-only by default, everything on `--all`. */
+  function gates(open: Gate[], all: Gate[]): void {
+    gateListMock.mockImplementation(async (_cwd, opts) => (opts?.all ? all : open));
+  }
+
+  it("retires the row while the gate is still open — the gate wait already carries it", async () => {
+    seedGateBlockedEscalation("j-9", "g-1");
+    await seedReport(); // suppressed: the sweep reports the gate, never the job
+
+    expect(await sweep()).toMatchObject({ findings: 0, settled: 1 });
+    expect(escalationRows()[0]).toMatchObject({ status: "resolved", resolution: "dismissed" });
+    // Idempotent, like every other verb here.
+    expect(await sweep()).toMatchObject({ settled: 0 });
+  });
+
+  it("retires the row once the gate has been answered, when nothing reports it any more", async () => {
+    // The other end of the gate's life: it resolved, gate-check resumed the job, and the sweep has
+    // nothing to report — but only a listing that outlives the gate can say the blocker WAS a gate.
+    gates([], [{ ...openGate("g-1"), status: "closed" }]);
+    seedGateBlockedEscalation("j-9", "g-1");
+    await seedReport();
+
+    expect(await sweep()).toMatchObject({ settled: 1 });
+    expect(escalationRows()[0]).toMatchObject({ status: "resolved", resolution: "dismissed" });
+  });
+
+  it("keeps a row whose job is ALSO held by an ordinary prerequisite", async () => {
+    // Answering the gate won't free that job, and nothing else would ever surface it.
+    seedGateBlockedEscalation("j-9", "g-1", "anton-dep");
+    await seedReport();
+
+    expect(await sweep()).toMatchObject({ settled: 0 });
+    expect(escalationRows()[0]).toMatchObject({ status: "open" });
+  });
+
+  it("keeps a row the report still carries — a job parked after its gate was answered", async () => {
+    // The sweep reports that one again (nothing suppresses it), so retiring it here would settle and
+    // re-raise the same stall every pass.
+    seedJob("j-9", { status: "parked", attempts: 1, lastError: "poison: blocked" });
+    await seedReport({
+      kind: "exhausted-job",
+      key: "exhausted-job:j-9",
+      reason: "execute-epic job parked without retrying (permanent failure): blocked",
+      since: NOW - 4 * HOUR,
+      ageMs: 4 * HOUR,
+      jobId: "j-9",
+      beadId: "e-9",
+    });
+    seedGateBlockedEscalation("j-9", "g-1");
+
+    expect(await sweep()).toMatchObject({ settled: 0, held: 1 });
+    expect(escalationRows()[0]).toMatchObject({ status: "open" });
+  });
+
+  it("keeps every row when the full gate list can't be read", async () => {
+    // Fails OPEN, like every other re-check here: bd's silence is no evidence the row is a duplicate.
+    gateListMock.mockRejectedValue(new Error("bd exploded"));
+    seedGateBlockedEscalation("j-9", "g-1");
+    await seedReport();
+
+    expect(await sweep()).toMatchObject({ settled: 0 });
+    expect(escalationRows()[0]).toMatchObject({ status: "open" });
+  });
+
+  it("leaves an ordinary exhausted-job row alone — it names no blockers at all", async () => {
+    t.db
+      .insert(schema.escalations)
+      .values({
+        id: "esc-plain",
+        projectId: "p1",
+        findingKey: "exhausted-job:j-8",
+        kind: "exhausted-job",
+        reason: "execute-epic job parked after 3/3 attempts: tests failed",
+        jobId: "j-8",
+        since: secDate(NOW - 4 * HOUR),
+        evidenceJson: "{}",
+        status: "open",
+        raisedAt: secDate(NOW - 4 * HOUR),
+        updatedAt: secDate(NOW - 4 * HOUR),
+      })
+      .run();
+    await seedReport();
+
+    expect(await sweep()).toMatchObject({ settled: 0 });
+    expect(escalationRows()[0]).toMatchObject({ status: "open" });
+    expect(gateListMock).not.toHaveBeenCalled(); // no candidate, so no gate read either
   });
 });
 

@@ -50,7 +50,7 @@ import {
   toEscalationView,
   type EscalationRow,
 } from "../escalations";
-import { PoisonError } from "./errors";
+import { poisonBlockerIds, PoisonError } from "./errors";
 import {
   activeExecuteEpicId,
   activeExecuteEpicKeys,
@@ -447,7 +447,10 @@ export interface UnstickSummary {
   resumed: number;
   escalated: number;
   held: number;
-  /** Open escalations retired because the stall they asked about ended (see {@link settleEndedGateWaits}). */
+  /**
+   * Open escalations retired because the stall they asked about ended, or was never theirs to ask
+   * about (see {@link settleEndedGateWaits} and {@link settleGateBlockedJobWaits}).
+   */
   settled: number;
 }
 
@@ -484,10 +487,24 @@ export async function unstickPass(
   // it is precisely the report a resolved gate produces. No report at all means the run-health sweep
   // has never run here (it ships off by default), and with no open wait either there is nothing to
   // act on: not an error, just an idle pass.
-  const gateWaits = (await listOpenEscalations(db, projectId)).filter(
-    (row) => row.kind === "needs-human",
+  const openRows = await listOpenEscalations(db, projectId);
+  const gateWaits = openRows.filter((row) => row.kind === "needs-human");
+  // The same problem one kind over: an `exhausted-job` row raised for a job that poison-parked ON a
+  // human gate, back before the sweep deduped the two halves of that one wait
+  // (`withoutGateBlockedJobs`). Suppression retires the FINDING, never the row it already raised, so
+  // without this the "retries spent" escalation outlives the gate for good. Candidates are the rows
+  // the current report no longer carries: a row still reported is either a genuine stall or one the
+  // loop below re-raises anyway, and settling it here would churn it settle-raise every pass.
+  const reportedKeys = new Set(findings.map((f) => f.key));
+  const blockedJobWaits = openRows.filter(
+    (row) =>
+      row.kind === "exhausted-job" &&
+      !reportedKeys.has(row.findingKey) &&
+      poisonBlockerIds(row.reason) !== undefined,
   );
-  if (findings.length === 0 && gateWaits.length === 0) return summary;
+  if (findings.length === 0 && gateWaits.length === 0 && blockedJobWaits.length === 0) {
+    return summary;
+  }
 
   // Pull BEFORE reading the board, exactly as the runner's `liveRunCheck` does: the local Dolt
   // working set trails the shared remote by a sync heartbeat, so a run-lease another machine renewed
@@ -564,6 +581,11 @@ export async function unstickPass(
       board,
       nowMs: ctx.nowMs,
     });
+    await heartbeat();
+  }
+
+  if (blockedJobWaits.length > 0) {
+    summary.settled += await settleGateBlockedJobWaits(db, clock, repoPath, blockedJobWaits);
     await heartbeat();
   }
 
@@ -765,6 +787,67 @@ async function settleEndedGateWaits(
     console.log(
       `[unstick] settled escalation ${wait.id} (${wait.findingKey}): the gate has since been ` +
         `resolved or removed`,
+    );
+  }
+  return settled;
+}
+
+/**
+ * Every HUMAN gate this repo has, open or resolved (`gate list --all`) — undefined when bd could not
+ * answer. Read separately from the open list the rest of the pass uses, because the question here is
+ * the other one: not "is this gate still waiting" but "was this blocker a human gate at all", which
+ * only a listing that survives the gate's own resolution can answer.
+ */
+async function readHumanGateIds(repoPath: string): Promise<Set<string> | undefined> {
+  try {
+    const gates = await beads.gateList(repoPath, { all: true });
+    return new Set(
+      gates.filter((g) => g.issue_type === "gate" && g.await_type === "human").map((g) => g.id),
+    );
+  } catch (e) {
+    console.error(
+      "[unstick] could not re-read the full gate list; keeping every open exhausted-job escalation",
+      e,
+    );
+    return undefined;
+  }
+}
+
+/**
+ * Retire the `exhausted-job` rows that are a human gate's wait wearing a second face.
+ *
+ * A gate hung on work whose job was already queued poison-parks that job on the gate, and a sweep
+ * from before the dedupe (`withoutGateBlockedJobs`) raised BOTH halves as escalations. Suppression
+ * only stops the finding being reported again — the row it already raised is now invisible to every
+ * re-check the pass makes, so it sits on the board forever as a "Retries spent" failure carrying an
+ * Abandon that would cancel work the gate is merely waiting on.
+ *
+ * Settled when EVERY blocker the park names is a human gate, which covers both ends of the gate's
+ * life: while it is open the `needs-human` row carries the wait, and once it is answered the wait is
+ * over and gate-check resumes the job. A job also held by an ordinary prerequisite is left alone —
+ * that outlives the gate, and nothing else would surface it. So is a job still parked after its gate
+ * was answered: the sweep reports that one again, so it never reaches this list at all.
+ *
+ * `dismissed`, like {@link settleEndedGateWaits}: the row is retired because it was never a stall of
+ * its own, not because anton acted on it. Fails OPEN on an unreadable gate list, for the same reason.
+ */
+async function settleGateBlockedJobWaits(
+  db: AntonDb,
+  clock: Clock,
+  repoPath: string,
+  waits: EscalationRow[],
+): Promise<number> {
+  const humanGateIds = await readHumanGateIds(repoPath);
+  if (!humanGateIds) return 0;
+  let settled = 0;
+  for (const wait of waits) {
+    const blockers = poisonBlockerIds(wait.reason);
+    if (!blockers?.every((id) => humanGateIds.has(id))) continue;
+    if (!(await settleEscalation(db, clock, wait.id, "dismissed"))) continue;
+    settled += 1;
+    console.log(
+      `[unstick] settled escalation ${wait.id} (${wait.findingKey}): the job it reports is parked ` +
+        `on a human gate, which carries that wait on its own`,
     );
   }
   return settled;
