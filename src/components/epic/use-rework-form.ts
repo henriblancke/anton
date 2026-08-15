@@ -34,6 +34,8 @@ export interface ReworkFormModel {
   report: ReviewReport | null;
   /** Why the report couldn't be read — shown in place of the findings, never blocking the submit. */
   reportError: string | null;
+  /** The report is still in flight — distinguishes "not read yet" from "read, no findings". */
+  reportLoading: boolean;
   findings: ReviewFinding[];
   isSelected: (key: string) => boolean;
   toggleFinding: (key: string) => void;
@@ -58,7 +60,7 @@ export function useReworkForm({
   const candidates = reworkCandidates(tickets);
   const [draft, setDraft] = useState<ReworkDraft>(() => initialDraft(candidates));
   const [selected, setSelected] = useState<ReadonlySet<string>>(() => new Set<string>());
-  const { report, reportError } = useReviewReport(slug, targetId, given);
+  const { report, reportError, reportLoading } = useReviewReport(slug, targetId, given);
   const { submitting, send } = useReworkSubmit(slug, targetId, (result) => {
     onReworked?.(result);
     onClose();
@@ -73,6 +75,7 @@ export function useReworkForm({
     patch: (fields) => setDraft((prev) => ({ ...prev, ...fields })),
     report,
     reportError,
+    reportLoading,
     findings,
     isSelected: (key) => selected.has(key),
     toggleFinding: (key) => setSelected((prev) => toggleKey(prev, key)),
@@ -84,10 +87,19 @@ export function useReworkForm({
   };
 }
 
+/** A finished read, tagged with the target it answers — the tag is what makes it stale or current. */
+interface ReportRead {
+  target: string;
+  report: ReviewReport | null;
+  error: string | null;
+}
+
 /** The target's self-review, read once per open unless the page already handed it down. */
 function useReviewReport(slug: string, targetId: string, given?: ReviewReport) {
-  const [fetched, setFetched] = useState<ReviewReport | null>(null);
-  const [reportError, setReportError] = useState<string | null>(null);
+  // One state for the whole read, so "still in flight" is derived from its absence rather than
+  // tracked by a second flag the effect would have to flip.
+  const [read, setRead] = useState<ReportRead | null>(null);
+  const target = `${slug}/${targetId}`;
 
   useEffect(() => {
     if (given) return; // handed down by the page that already loaded it
@@ -95,19 +107,26 @@ function useReviewReport(slug: string, targetId: string, given?: ReviewReport) {
     void (async () => {
       try {
         const report = await getReviewReport(slug, targetId);
-        if (!cancelled) setFetched(report);
+        if (!cancelled) setRead({ target, report, error: null });
       } catch (err) {
         // A missing report never blocks the action — the founder can still write instructions by
         // hand, which is exactly what this replaces.
-        if (!cancelled) setReportError(errorMessage(err, "Couldn't load the review report"));
+        if (!cancelled) {
+          setRead({ target, report: null, error: errorMessage(err, "Couldn't load the review report") });
+        }
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [slug, targetId, given]);
+  }, [slug, targetId, target, given]);
 
-  return { report: given ?? fetched, reportError };
+  const settled = read?.target === target ? read : null;
+  return {
+    report: given ?? settled?.report ?? null,
+    reportError: settled?.error ?? null,
+    reportLoading: !given && !settled,
+  };
 }
 
 /** The send-back itself. Failure keeps the dialog open so the typed instructions survive a retry. */

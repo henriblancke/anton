@@ -133,7 +133,12 @@ function ReworkForm(options: ReworkFormOptions) {
 
       <FindingsField
         findings={form.findings}
-        emptyNote={form.reportError ?? "This run's review left no findings on the board."}
+        emptyNote={
+          form.reportError ??
+          (form.reportLoading
+            ? "Loading findings…"
+            : "This run's review left no findings on the board.")
+        }
         isSelected={form.isSelected}
         onToggle={form.toggleFinding}
       />
