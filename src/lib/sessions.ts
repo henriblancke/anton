@@ -118,6 +118,24 @@ export async function appendSessionLog(logPath: string, chunk: string): Promise<
   await appendFile(logPath, chunk);
 }
 
+/**
+ * One claude event as log lines — EVERY physical line prefixed with its `[type]`, not just the first.
+ *
+ * A model's text runs to many lines, and the passes read their own records back out of this same log
+ * (gardener/record.ts), where the only thing separating a write anton made from a sentence a model
+ * wrote is the producer in front of it. Prefixing the event as a whole would leave every line after
+ * the first bare — so an assistant that types `[product-master] APPLY …`, by accident or out of bead
+ * text somebody wrote to be read this way, would have it read back as a real unattended board write
+ * and counted against the pass's write cap (jobs/pass-budget.ts).
+ */
+export function sessionEventLines(type: string, text?: string): string {
+  if (!text) return `[${type}]\n`;
+  const lines = text.split("\n");
+  // A trailing newline is the writer's own line break, not an empty line the reader has to see.
+  if (lines.at(-1) === "") lines.pop();
+  return lines.map((line) => (line ? `[${type}] ${line}\n` : `[${type}]\n`)).join("");
+}
+
 export interface StartJobSessionInput {
   projectId: string;
   kind: SessionKind;
@@ -134,7 +152,10 @@ export interface StartJobSessionInput {
 export interface JobSession {
   sessionId: string;
   logPath: string;
-  /** Streams claude events to the session log as `[type] text` lines; fail-soft on write errors. */
+  /**
+   * Streams claude events to the session log as `[type] text` lines — one per physical line of the
+   * event ({@link sessionEventLines}); fail-soft on write errors.
+   */
   onEvent: (e: ClaudeEvent) => void;
 }
 
@@ -152,8 +173,7 @@ export async function startJobSession(
   const logPath = sessionLogPath(sessionId);
   await createSession(db, clock, { id: sessionId, logPath, ...input });
   const onEvent = (e: ClaudeEvent) => {
-    const line = e.text ? `[${e.type}] ${e.text}\n` : `[${e.type}]\n`;
-    void appendSessionLog(logPath, line).catch(() => {});
+    void appendSessionLog(logPath, sessionEventLines(e.type, e.text)).catch(() => {});
   };
   return { sessionId, logPath, onEvent };
 }

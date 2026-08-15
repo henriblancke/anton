@@ -38,6 +38,7 @@ import {
   parseGardenerPlan,
   type GardenerPlan,
 } from "../gardener/detections";
+import { passRecordCounts, readPassRecords } from "../gardener/record";
 import { getHygieneReport, getHygieneReportForJob } from "../hygiene";
 import { driveJob, expectJobStatus, makeJobRunner } from "@/lib/testing/jobs";
 import type { Clock } from "./queue";
@@ -881,6 +882,14 @@ describe("gardener patrol · armed", () => {
   const applyLines = async (): Promise<string[]> =>
     (await sessionLog()).split("\n").filter((l) => l.includes("APPLY "));
 
+  /**
+   * What the pass ENDED UP recording about one move. Each apply writes twice — the `APPLYING` line
+   * that buys the write against the cap, then its outcome (gardener/armed.ts) — so the last line
+   * mentioning a move is the verdict, and the first is the reservation for it.
+   */
+  const outcomeOf = (lines: string[], move: string): string =>
+    lines.filter((l) => l.includes(move)).at(-1) ?? "";
+
   /** Which proposal a line is about — the ids are hash-ordered, so no case may assume one. */
   const proposalIn = (line = ""): string => line.match(/p-\d+/)?.[0] ?? "";
   const closedIds = (): string[] => closeMock.mock.calls.map(([, id]) => id);
@@ -914,6 +923,28 @@ describe("gardener patrol · armed", () => {
     expect(nudge).toHaveBeenCalledWith({ id: projectId, repoPath: REPO });
   });
 
+  it("buys the write before it makes it — the spend is recorded ahead of the board", async () => {
+    // The next attempt of this job reconstructs the cap from these lines (pass-budget.ts), so an
+    // apply recorded AFTER its board write leaves a window in which the move is real and the record
+    // is not: a retry landing in it spends a cap this pass has already spent.
+    orphansMock.mockResolvedValue([orphan("t-4")]);
+    boardIs(() => [cold("t-4")]);
+    let logAtWrite = "";
+    closeMock.mockImplementation(async (_cwd, id) => {
+      if (id === "t-4" && !logAtWrite) logAtWrite = await sessionLog();
+      return "";
+    });
+
+    await expectJobStatus(t.db, await runPatrol(), "done");
+
+    expect(logAtWrite).toContain("[gardener] APPLY p-1 (shipped-orphan) retire/close t-4 — APPLYING:");
+    // And the outcome supersedes it, so the record reads as one apply rather than two.
+    expect(passRecordCounts(readPassRecords(await sessionLog()))).toMatchObject({
+      applied: 1,
+      unrecorded: 0,
+    });
+  });
+
   it("applies only the armed kind, and leaves the same pass's other ask standing", async () => {
     // Two kinds in ONE pass, armed differently. The levels are disjoint by construction — a kind
     // resolves to exactly one of them — but nothing pins that within a pass until one files both:
@@ -926,7 +957,7 @@ describe("gardener patrol · armed", () => {
     await expectJobStatus(t.db, await runPatrol(), "done");
 
     expect(createMock).toHaveBeenCalledTimes(2); // one ask per kind
-    const applied = (await applyLines()).find((l) => l.includes("retire/close t-4")) ?? "";
+    const applied = outcomeOf(await applyLines(), "retire/close t-4");
     expect(applied).toContain("— APPLIED: closed t-4 as shipped");
     const shadowed =
       (await sessionLog()).split("\n").find((l) => l.includes("SHADOW ") && l.includes("(stale)")) ??
@@ -982,12 +1013,10 @@ describe("gardener patrol · armed", () => {
     await expectJobStatus(t.db, await runPatrol(), "done");
 
     const lines = await applyLines();
-    const refused = lines.find((l) => l.includes("retire/close t-4"));
+    const refused = outcomeOf(lines, "retire/close t-4");
     expect(refused).toContain("— REFUSED: cannot apply");
     // The board declining one ask must not cost the pass the next: the run holds t-4, not t-7.
-    expect(lines.find((l) => l.includes("retire/close t-7"))).toContain(
-      "— APPLIED: closed t-7 as shipped",
-    );
+    expect(outcomeOf(lines, "retire/close t-7")).toContain("— APPLIED: closed t-7 as shipped");
     expect(closedIds()).toContain("t-7");
     expect(closedIds()).not.toContain("t-4");
     // The ask survives with the reason on it, so the human who decides about a bead a run took finds
@@ -1025,11 +1054,11 @@ describe("gardener patrol · armed", () => {
     log.mockRestore();
   });
 
-  it("stops applying once its record will not write — spending a cap it cannot count", async () => {
+  it("applies nothing at all once its record will not write — a cap it cannot count", async () => {
     // The record IS the accounting: a retry of this job reconstructs what earlier attempts spent
-    // from these lines (pass-budget.ts). A pass whose log will not take them has already made one
-    // board write nothing can see, and spending the rest of the cap on top of it is how one
-    // scheduled patrol ends up applying several caps' worth across its attempts.
+    // from these lines (pass-budget.ts). A pass whose log will not take them cannot make a write it
+    // can account for — and unaccounted writes are how one scheduled patrol ends up applying
+    // several caps' worth across its attempts.
     const blocked = join(sessionsDir, "not-a-directory");
     writeFileSync(blocked, "");
     process.env.ANTON_SESSIONS_ROOT = join(blocked, "sessions");
@@ -1041,10 +1070,12 @@ describe("gardener patrol · armed", () => {
 
     await expectJobStatus(t.db, await runPatrol(), "done");
 
-    // One subject moved, not three: the pass applied, failed to record it, and stopped.
-    expect(closedIds().filter((id) => subjects.includes(id))).toHaveLength(1);
+    // NOTHING moved: the attempt is bought with its record line, so a log that will not take one
+    // stops the pass before the board write rather than after it. There is no window in which a
+    // subject has moved and no line accounts for it.
+    expect(closedIds().filter((id) => subjects.includes(id))).toHaveLength(0);
     expect(error.mock.calls.map((args) => args.join(" ")).join("\n")).toContain(
-      "stopped applying — the record for",
+      "stopped applying — the attempt at",
     );
     warn.mockRestore();
     error.mockRestore();
@@ -1063,10 +1094,8 @@ describe("gardener patrol · armed", () => {
     const lines = await applyLines();
     // Whichever order the two are attempted in, one broken apply is one broken apply: it is a line
     // in the log, not a failed patrol and not a skipped queue behind it.
-    expect(lines.find((l) => l.includes("retire/close t-4"))).toContain(
-      "— COULD NOT APPLY: applying",
-    );
-    expect(lines.find((l) => l.includes("retire/close t-7"))).toContain("— APPLIED:");
+    expect(outcomeOf(lines, "retire/close t-4")).toContain("— COULD NOT APPLY: applying");
+    expect(outcomeOf(lines, "retire/close t-7")).toContain("— APPLIED:");
     expect(closedIds()).toContain("t-7");
   });
 });

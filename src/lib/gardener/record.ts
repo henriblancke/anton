@@ -20,15 +20,26 @@
 /** Which half of the pass wrote the line: a real write, or the description of one. */
 export type PassRecordMode = "apply" | "shadow";
 
-/** What a reader counts a line as. `error` is anton failing to decide, never the board refusing. */
-export type PassRecordOutcome = "applied" | "shadowed" | "refused" | "error";
+/**
+ * What a reader counts a line as. `error` is anton failing to decide, never the board refusing —
+ * and `unrecorded` is neither: the attempt is on the record and its RESULT never reached the log,
+ * so the board is the only evidence of what landed.
+ */
+export type PassRecordOutcome = "applied" | "shadowed" | "refused" | "error" | "unrecorded";
 
 /**
  * The verdicts an APPLY line can carry. `REFUSED` is the board declining — the ordinary answer for an
  * ask whose premise moved — while `COULD NOT APPLY` is a write that broke and was rolled back, and a
  * founder acts on those two very differently.
+ *
+ * `APPLYING` is written BEFORE the board is touched, so the attempt is on the record even if the
+ * outcome line never lands (gardener/armed.ts): the record is what a retry reconstructs the pass's
+ * write budget from (jobs/pass-budget.ts), and a spend written afterwards is, for the window in
+ * between, a board write nothing can see. The outcome line for the same proposal supersedes it — one
+ * left standing counts as neither an apply nor a failure, because nobody knows which it was.
  */
 export const APPLY_VERDICTS = {
+  APPLYING: "unrecorded",
   APPLIED: "applied",
   REFUSED: "refused",
   "COULD NOT APPLY": "error",
@@ -153,10 +164,17 @@ function splitTarget(raw: string): { subjects: string[]; target?: string } {
  * Total over the log: anything that is not one of this pass's APPLY/SHADOW lines — the claude
  * transcript a product-master pass logs above its record, a half-written final line — is skipped
  * rather than guessed at.
+ *
+ * An APPLY writes TWICE about one proposal — the `APPLYING` reservation, then its outcome — so the
+ * later line SUPERSEDES the earlier in place. That is what makes one proposal one record however the
+ * pass fared: the page shows the outcome rather than both halves of it, and the write budget counts
+ * the attempt once rather than twice (jobs/pass-budget.ts). Keyed by producer as well as proposal,
+ * for the reason the line itself is: two passes are two accounts.
  */
 export function readPassRecords(log: string): PassRecordSummary {
   const records: PassRecord[] = [];
   const notes: string[] = [];
+  const applies = new Map<string, number>();
   for (const raw of log.split("\n")) {
     const line = raw.trimEnd();
     const match = RECORD_LINE.exec(line);
@@ -167,7 +185,7 @@ export function readPassRecords(log: string): PassRecordSummary {
     }
     const [, producer, token, proposal, kind, verb, rest, verdict, detail] = match;
     const mode: PassRecordMode = token === "APPLY" ? "apply" : "shadow";
-    records.push({
+    const record: PassRecord = {
       producer,
       mode,
       proposal,
@@ -177,7 +195,18 @@ export function readPassRecords(log: string): PassRecordSummary {
       verdict,
       outcome: outcomeOf(mode, verdict),
       detail,
-    });
+    };
+    if (mode === "shadow") {
+      records.push(record);
+      continue;
+    }
+    const key = `${producer} ${proposal}`;
+    const at = applies.get(key);
+    if (at !== undefined) records[at] = record;
+    else {
+      applies.set(key, records.length);
+      records.push(record);
+    }
   }
   return { records, notes };
 }
@@ -202,6 +231,7 @@ export function passRecordCounts(summary: PassRecordSummary): Record<PassRecordG
     applied: 0,
     shadowed: 0,
     refused: 0,
+    unrecorded: 0,
     "apply-failed": 0,
     "shadow-failed": 0,
   };

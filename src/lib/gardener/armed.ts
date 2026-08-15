@@ -16,6 +16,10 @@
  *     Hitting the cap is the signal that this board wants somebody to look at it.
  *   • AN ACTOR. Every apply here is made with nobody watching, so it is recorded as `policy` and the
  *     proposal's closing note says so (see apply.ts `ApplyActor`).
+ *   • A SPEND WRITTEN BEFORE THE WRITE IT PAYS FOR. The cap is reconstructed from these very record
+ *     lines by the next attempt of the same job (jobs/pass-budget.ts), so each apply reserves its
+ *     line first and records the outcome after: an attempt that cannot be written is never made, and
+ *     the cap can never be spent twice by a job that dies between the board write and its record.
  *
  * Total over its proposals, like the shadow walk: a refusal is the board declining and leaves the
  * ask open with the reason already noted on it, an error is anton failing to decide, and NEITHER
@@ -140,26 +144,49 @@ export async function applyArmedProposals(input: ArmedInput): Promise<ArmedResul
 
   const records: ArmedRecord[] = [];
   const attempts = targets.slice(0, limit);
+  /** Stop applying, saying WHY and naming what is left standing — the cap's other silent failure. */
+  const stop = (why: string, untried: Array<{ proposal: EmittedProposal }>): void => {
+    const ids = untried.map((target) => target.proposal.id);
+    held.push(...ids);
+    console.error(
+      `${input.producer} stopped applying — ${why}` +
+        (ids.length > 0
+          ? `; ${ids.length} armed proposal(s) stay open as ordinary asks (${ids.join(", ")})`
+          : ""),
+    );
+  };
+
   for (const [i, { proposal, plan }] of attempts.entries()) {
     // Between every apply, not once up front: each one is a board write, and a cancel arriving
     // mid-loop has to stop the rest rather than let a cancelled pass finish every armed move.
     if (input.signal?.aborted) break;
-    const record = await applyOne(input, proposal.id, plan);
-    records.push(record);
-    if (await write(input, lineOf(record))) continue;
 
-    // The record IS the accounting: a retry of this job reconstructs what earlier attempts spent
-    // from these very lines (jobs/pass-budget.ts), so a write that fails leaves an unattended board
-    // write nothing can see. The pass stops applying at that point rather than spending more of a
-    // cap it can no longer count — one unaccounted write is the bound, not a whole fresh allowance.
-    const untried = attempts.slice(i + 1).map((target) => target.proposal.id);
-    held.push(...untried);
-    console.error(
-      `${input.producer} stopped applying — the record for ${proposal.id} could not be written, so ` +
-        `this pass can no longer account for what it spends` +
-        (untried.length > 0
-          ? `; ${untried.length} armed proposal(s) stay open as ordinary asks (${untried.join(", ")})`
-          : ""),
+    // The spend is recorded BEFORE the board is touched, never after. The record IS the accounting —
+    // a retry of this job reconstructs what earlier attempts spent from these very lines
+    // (jobs/pass-budget.ts) — so an apply whose line is written afterwards is, for the window in
+    // between, an unattended board write nothing can see, and a retry landing in that window gets a
+    // cap it has already spent. Reserving first turns the one failure that cost the cap its meaning
+    // into a pass that simply never applied: no line, no write.
+    const base = baseOf(proposal.id, plan);
+    if (!(await write(input, reservationOf(base)))) {
+      stop(
+        `the attempt at ${proposal.id} could not be recorded, so this pass did not make it — it ` +
+          `can no longer account for what it spends`,
+        attempts.slice(i),
+      );
+      break;
+    }
+
+    const record = await applyOne(input, base);
+    records.push(record);
+    // The outcome supersedes the reservation (record.ts). Losing it costs the record what the write
+    // DID, never the fact that it happened — but a log that has started refusing writes is no longer
+    // one this pass can account against, so it stops here rather than reserving into it again.
+    if (await write(input, lineOf(record))) continue;
+    stop(
+      `the outcome of ${proposal.id} could not be recorded — the attempt itself is on the record, ` +
+        `but what it did to the board is not`,
+      attempts.slice(i + 1),
     );
     break;
   }
@@ -201,6 +228,38 @@ export async function reportUnsettledProposals(input: {
   await write(input, line);
 }
 
+/** The whole ask, as both lines about it carry it — the reservation and the outcome that follows. */
+type ArmedAsk = Omit<ArmedRecord, "outcome" | "detail">;
+
+function baseOf(proposalId: string, plan: GardenerPlan): ArmedAsk {
+  return {
+    proposal: proposalId,
+    kind: plan.kind,
+    move: plan.move,
+    ...(plan.retireAs ? { retireAs: plan.retireAs } : {}),
+    subjects: plan.subjects,
+    ...(plan.target ? { target: plan.target } : {}),
+    changed: [],
+  };
+}
+
+/**
+ * The line that BUYS the write, put down before it. Worded for the case where it is the last word on
+ * this proposal — the outcome line supersedes it everywhere else (record.ts) — so it says what a
+ * founder finding it standing alone has to do: the ask was attempted, and the board is the only
+ * place that now says how it went.
+ */
+function reservationOf(ask: ArmedAsk): string {
+  return passRecordLine({
+    mode: "apply",
+    ...ask,
+    verdict: "APPLYING",
+    detail:
+      "attempted unattended — if no outcome line follows, this pass could not record how it went; " +
+      "the subject on the board is the only evidence",
+  });
+}
+
 /**
  * One proposal, applied against a board read FRESH for it — as the approve route reads one per
  * approval, and for a reason a shared snapshot could not answer: an earlier apply in this same loop
@@ -210,20 +269,8 @@ export async function reportUnsettledProposals(input: {
  * else is a bd that broke; both leave the proposal open with the reason on it, and neither stops the
  * loop.
  */
-async function applyOne(
-  input: ArmedInput,
-  proposalId: string,
-  plan: GardenerPlan,
-): Promise<ArmedRecord> {
-  const base = {
-    proposal: proposalId,
-    kind: plan.kind,
-    move: plan.move,
-    ...(plan.retireAs ? { retireAs: plan.retireAs } : {}),
-    subjects: plan.subjects,
-    ...(plan.target ? { target: plan.target } : {}),
-    changed: [] as string[],
-  };
+async function applyOne(input: ArmedInput, base: ArmedAsk): Promise<ArmedRecord> {
+  const proposalId = base.proposal;
   try {
     const board = await loadAllIssues(input.repo);
     const proposal = board.find((b) => b.id === proposalId);

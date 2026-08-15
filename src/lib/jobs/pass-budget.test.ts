@@ -98,6 +98,20 @@ describe("remainingApplyBudget", () => {
     expect(await budget()).toBe(0);
   });
 
+  it("counts a reserved apply ONCE, and counts one whose outcome never landed at all", async () => {
+    // An apply buys its line before it touches the board and records the outcome after
+    // (gardener/armed.ts). Counting the pair twice would cost a retry a write it never made; missing
+    // the lone reservation would hand it a cap the attempt before it had already spent — the write
+    // is on the board whether or not anything got to say how it went.
+    await attempt(
+      "s-1",
+      applyLine(1, "APPLYING") + applyLine(1) + applyLine(2, "APPLYING"),
+      1_700_000_000_000,
+    );
+
+    expect(await budget()).toBe(MAX_APPLIES_PER_PASS - 2);
+  });
+
   it("ignores what a pass only described — a shadow writes nothing to spend", async () => {
     await attempt(
       "s-1",

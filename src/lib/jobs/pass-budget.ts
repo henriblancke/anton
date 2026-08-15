@@ -10,8 +10,9 @@
  *
  * Reconstructed rather than persisted, for the reason the record itself is (gardener/record.ts): the
  * log IS the account of what a pass did, so a second store would be a second answer to "how much has
- * this job written" — agreeing until the day one of them is not updated. Every attempted apply
- * writes exactly one APPLY record line, which is what the cap counts.
+ * this job written" — agreeing until the day one of them is not updated. Every attempted apply is one
+ * APPLY record — reserved before the board is touched and superseded by its outcome afterwards, which
+ * the reader collapses back into one — and that is what the cap counts.
  *
  * Fails CLOSED, and on the same evidence either way. An attempt whose log will not read spent an
  * unknown amount, so this attempt applies nothing — the safe direction for a write nobody is
@@ -20,10 +21,11 @@
  * log behind it is a log store that broke, which is exactly when an apply's record goes unwritten.
  * An attempt that genuinely had nothing to say opened no row at all and is not read here.
  *
- * A partial log — created, then failing mid-append — is the residue this cannot see, and it
- * undercounts by whatever it lost. The producer bounds that from the other end: a pass whose record
- * line will not write stops applying (gardener/armed.ts), so at most one write per attempt can go
- * unaccounted rather than a whole fresh allowance.
+ * A partial log — created, then failing mid-append — cannot cost this an apply it should have
+ * counted, because the producer buys each write with its record BEFORE making it and stops the
+ * moment one will not write (gardener/armed.ts): a line that never landed is an apply that never
+ * happened. The residue runs the other way, and safely — a reserved line whose apply then died
+ * mid-flight is counted as spent, which is what a cap on ATTEMPTS means.
  */
 import { MAX_APPLIES_PER_PASS } from "../gardener/emit";
 import { isPassLogLine, readPassRecords } from "../gardener/record";

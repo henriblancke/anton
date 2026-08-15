@@ -25,7 +25,8 @@ import { cn } from "@/lib/utils";
  *
  * A failed APPLY and a failed SHADOW are separate rows on purpose: only the first attempted a board
  * write, so a shadow that could not be evaluated must never be described as one that may have been
- * rolled back (see `passRecordGroup`).
+ * rolled back (see `passRecordGroup`). An apply whose OUTCOME never reached the log is a third row
+ * for the same reason — "nothing landed" is the one thing nobody can say about it.
  */
 const GROUPS: {
   key: PassRecordGroup;
@@ -40,6 +41,13 @@ const GROUPS: {
     text: "text-stage-done",
     chip: "border-stage-done/30 bg-stage-done/10 text-stage-done",
     blurb: "written to the board unattended, under this project's proposal autonomy",
+  },
+  {
+    key: "unrecorded",
+    label: "outcome not recorded",
+    text: "text-risk-high",
+    chip: "border-risk-high/30 bg-risk-high/10 text-risk-high",
+    blurb: "the write was attempted and its result never reached the log — check the subject itself",
   },
   {
     key: "refused",

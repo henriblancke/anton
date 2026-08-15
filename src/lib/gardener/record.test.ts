@@ -117,9 +117,11 @@ describe("readPassRecords", () => {
   });
 
   it("counts an apply that BROKE apart from one the board refused", () => {
+    // Two proposals, not one: a second line about the SAME proposal is that apply's outcome
+    // superseding its own reservation, which is a different property (proved below).
     const log =
       logged("gardener", { ...APPLIED, verdict: "REFUSED", detail: "premise moved" }) +
-      logged("gardener", { ...APPLIED, verdict: "COULD NOT APPLY", detail: "bd exploded" });
+      logged("gardener", { ...APPLIED, proposal: "p-5", verdict: "COULD NOT APPLY", detail: "bd exploded" });
     const summary = readPassRecords(log);
 
     // Conflating them would tell a founder the board declined when in fact anton failed mid-write.
@@ -127,9 +129,54 @@ describe("readPassRecords", () => {
       applied: 0,
       shadowed: 0,
       refused: 1,
+      unrecorded: 0,
       "apply-failed": 1,
       "shadow-failed": 0,
     });
+  });
+
+  it("lets an outcome supersede the reservation that bought it — one apply, one record", async () => {
+    // An apply writes twice about one proposal: the line that reserves it against the pass's cap,
+    // then what the board actually did. Read as two, the page would report a write nobody made and
+    // the write budget would charge a retry for an apply that never happened.
+    const summary = readPassRecords(
+      logged("gardener", { ...APPLIED, verdict: "APPLYING", detail: "attempted unattended" }) +
+        logged("gardener", APPLIED),
+    );
+
+    expect(summary.records).toHaveLength(1);
+    expect(summary.records[0].verdict).toBe("APPLIED");
+    expect(passRecordCounts(summary).applied).toBe(1);
+  });
+
+  it("keeps a reservation with no outcome behind it as neither a write nor a failure", async () => {
+    // The one thing nobody can say about this proposal is what happened to it: anton started the
+    // write and never got to record how it went, so the bead itself is the only evidence. Counting
+    // it as applied invents a move; counting it as failed denies one that may well have landed.
+    const summary = readPassRecords(
+      logged("gardener", { ...APPLIED, verdict: "APPLYING", detail: "attempted unattended" }),
+    );
+
+    expect(summary.records[0].outcome).toBe("unrecorded");
+    expect(summary.records.map(passRecordGroup)).toEqual(["unrecorded"]);
+    expect(passRecordCounts(summary).applied).toBe(0);
+    expect(passRecordCounts(summary)["apply-failed"]).toBe(0);
+  });
+
+  it("supersedes per proposal and per producer, never across them", async () => {
+    // Two passes are two accounts, and one pass applies several proposals: collapsing either would
+    // lose a real unattended write.
+    const summary = readPassRecords(
+      logged("gardener", { ...APPLIED, verdict: "APPLYING", detail: "attempted" }) +
+        logged("product-master", { ...APPLIED, verdict: "APPLYING", detail: "attempted" }) +
+        logged("gardener", { ...APPLIED, proposal: "p-9" }),
+    );
+
+    expect(summary.records.map((r) => [r.producer, r.proposal, r.verdict])).toEqual([
+      ["gardener", "p-1", "APPLYING"],
+      ["product-master", "p-1", "APPLYING"],
+      ["gardener", "p-9", "APPLIED"],
+    ]);
   });
 
   it("counts a shadow that broke apart from an apply that broke", async () => {
