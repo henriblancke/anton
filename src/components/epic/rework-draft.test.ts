@@ -80,9 +80,21 @@ describe("isDraftComplete", () => {
 describe("findingKey / toggleKey", () => {
   it("separates findings that differ only in severity, location or note", () => {
     const keys = new Set(
-      [BLOCKING, ADVISORY, { ...BLOCKING, severity: "advisory" as const }].map(findingKey),
+      [
+        BLOCKING,
+        { ...BLOCKING, severity: "advisory" as const },
+        { ...BLOCKING, location: "src/b.ts:12" },
+        { ...BLOCKING, note: "no undefined guard" },
+      ].map(findingKey),
     );
-    expect(keys.size).toBe(3);
+    expect(keys.size).toBe(4);
+  });
+
+  it("keeps two findings apart when a location carries the separator", () => {
+    // Ticking either of a colliding pair would submit both, so the fields may not run together.
+    expect(findingKey({ severity: "blocking", location: "src/a b.ts:1", note: "fails" })).not.toBe(
+      findingKey({ severity: "blocking", location: "src/a", note: "b.ts:1 fails" }),
+    );
   });
 
   it("toggles without mutating the set it was handed", () => {

@@ -29,9 +29,14 @@ export function initialDraft(candidates: Ticket[]): ReworkDraft {
   return { ticketId: candidates[0]?.id ?? "", mode: "reopen", summary: "", instructions: "" };
 }
 
-/** Stable identity for a finding across renders — location + note, which is what makes two distinct. */
+/**
+ * Stable identity for a finding across renders — severity, location and note, which is what makes
+ * two distinct. NUL-delimited (as elsewhere in the codebase) because a location may contain spaces:
+ * a separator the fields can themselves contain would let two findings collide onto one key, and a
+ * shared key means ticking one submits both.
+ */
 export function findingKey(f: ReviewFinding): string {
-  return `${f.severity} ${f.location} ${f.note}`;
+  return `${f.severity}\0${f.location}\0${f.note}`;
 }
 
 export function toggleKey(keys: ReadonlySet<string>, key: string): Set<string> {
