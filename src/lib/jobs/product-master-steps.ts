@@ -11,7 +11,7 @@
 import type { Bead } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
 import type { RunClaudeOptions, runClaude } from "../claude/driver";
-import { applyArmedProposals } from "../gardener/armed";
+import { applyArmedProposals, reportUnsettledProposals } from "../gardener/armed";
 import type { GardenerDetection } from "../gardener/detections";
 import {
   emitProposals,
@@ -145,14 +145,30 @@ export function makeProposalFiler(scope: PassScope, input: ProposalFilerInput): 
       // left, and re-deriving it from `changed` would be a second, quieter answer. The fence is
       // re-stamped alongside it — it dates THIS read, and a proposal filed later carrying the older
       // stamp would let apply date its premise checks against a board two writes ago.
+      //
+      // Stamped BEFORE the read, exactly as the pass's first read stamps it: a write landing while
+      // the read is in flight is absent from the board it returns, and a fence taken afterwards
+      // would claim anton had observed it — which is the one direction that matters, because a
+      // proposal armed at `apply` then passes `writtenSinceFiling` on evidence nobody ever saw.
       if (applied.records.some((record) => record.changed.length > 0)) {
-        snapshot = { board: await loadAllIssues(repo), observedAtMs: scope.clock.now() };
+        const observedAtMs = scope.clock.now();
+        snapshot = { board: await loadAllIssues(repo), observedAtMs };
       }
     } catch (e) {
       // Whatever landed before a create failed is real board state living only in the local working
       // set — report and propagate it, or a pass that parks leaves the proposals that DID file
-      // invisible to every other machine.
-      if (e instanceof PartialEmissionError) reportEmission(scope, e.result);
+      // invisible to every other machine. They are neither shadowed nor applied: a half-failed
+      // emission is the wrong moment to start writing unattended, and the retry cannot settle them
+      // either (their fingerprints now suppress the re-file), so the gap is stated rather than left
+      // to read as a clean pass.
+      if (e instanceof PartialEmissionError) {
+        reportEmission(scope, e.result);
+        await reportUnsettledProposals({
+          created: e.result.created,
+          producer: "[product-master]",
+          log: scope.log,
+        });
+      }
       throw e;
     }
   };

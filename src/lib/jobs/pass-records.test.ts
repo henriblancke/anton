@@ -118,13 +118,18 @@ describe("passRecordsByJob", () => {
     expect(records.pm2.records.map((r) => r.proposal)).toEqual(["p-1"]);
   });
 
-  it("survives a log the row points at but the disk no longer has", async () => {
-    // `.anton` is disposable — an operator who cleared it must still get the jobs list.
+  it("survives a log the row points at but the disk no longer has — and says the read failed", async () => {
+    // `.anton` is disposable — an operator who cleared it must still get the jobs list. But an
+    // empty summary here would render as "Clean pass" over a pass whose only record of an
+    // unattended write is the file we just failed to read, so the failure is the answer.
     const records = await passRecordsByJob([job("g2", "gardener")], {
       g2: { id: "s-g2", logPath: join(workDir, "never-written.log") },
     });
 
-    expect(records.g2).toEqual({ records: [], notes: [] });
+    expect(records.g2.records).toEqual([]);
+    expect(records.g2.notes).toEqual([
+      "this pass's session log could not be read — whatever it applied, shadowed or refused is not recorded here",
+    ]);
   });
 
   it("says nothing about jobs that file no proposals", async () => {

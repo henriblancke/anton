@@ -556,6 +556,34 @@ describe("gardener patrol", () => {
     expect(nudge).toHaveBeenCalledWith({ id: projectId, repoPath: REPO });
   });
 
+  it("says the proposals that landed will never be settled, rather than leaving a clean record", async () => {
+    // The retry cannot pick them up: the fingerprints of what DID file now suppress the re-file, so
+    // the shadow and armed walks never see them again and an armed kind is silently skipped for the
+    // rest of that proposal's life. Neither is written out of a failing pass — but an operator who
+    // armed a kind and finds an untouched bead must be able to tell "the policy refused it" from
+    // "the policy never reached it".
+    await arm({ "shipped-orphan": "apply" });
+    orphansMock.mockResolvedValue([
+      { id: "t-4", title: "shipped", status: "open", latestCommit: "abc1234" },
+      { id: "t-5", title: "also shipped", status: "open", latestCommit: "def5678" },
+    ]);
+    listMock.mockResolvedValue([
+      bead("t-4", { title: "shipped" }),
+      bead("t-5", { title: "also shipped" }),
+    ]);
+    createMock.mockImplementationOnce(async () => "p-1").mockImplementationOnce(async () => {
+      throw new Error("bd create exploded");
+    });
+
+    await expectJobStatus(t.db, await runPatrol(), "queued");
+
+    const log = await sessionLog();
+    expect(log).toContain("[gardener] APPLY skipped for 1 filed proposal(s)");
+    expect(log).toContain("no later pass re-decides them (p-1)");
+    // Said, not done: a pass whose board writes are already failing does not start applying.
+    expect(closeMock).not.toHaveBeenCalled();
+  });
+
   it("files nothing for a patrol cancelled while it read the board", async () => {
     // `ctx.heartbeat()` does not inspect the signal, so a cancel arriving during the judgment
     // tier's board read is invisible until the check that guards the first write.
@@ -849,6 +877,32 @@ describe("gardener patrol · armed", () => {
     );
     // An unattended write no other machine can see is half a write.
     expect(nudge).toHaveBeenCalledWith({ id: projectId, repoPath: REPO });
+  });
+
+  it("applies only the armed kind, and leaves the same pass's other ask standing", async () => {
+    // Two kinds in ONE pass, armed differently. The levels are disjoint by construction — a kind
+    // resolves to exactly one of them — but nothing pins that within a pass until one files both:
+    // a policy that leaked across kinds would write a bead the operator only asked to be shown.
+    await arm({ "shipped-orphan": "apply", stale: "shadow" });
+    orphansMock.mockResolvedValue([orphan("t-4")]);
+    staleMock.mockImplementation(async (_cwd, opts) => (opts?.status === "open" ? [cold("t-9")] : []));
+    boardIs(() => [cold("t-4"), cold("t-9")]);
+
+    await expectJobStatus(t.db, await runPatrol(), "done");
+
+    expect(createMock).toHaveBeenCalledTimes(2); // one ask per kind
+    const applied = (await applyLines()).find((l) => l.includes("retire/close t-4")) ?? "";
+    expect(applied).toContain("— APPLIED: closed t-4 as shipped");
+    const shadowed =
+      (await sessionLog()).split("\n").find((l) => l.includes("SHADOW ") && l.includes("(stale)")) ??
+      "";
+    expect(shadowed).toContain("retire/defer t-9");
+
+    // The armed kind settled both ends — its subject and its ask. The shadowed one settled neither:
+    // t-9 is untouched and its proposal is still an open ask waiting for a human.
+    expect(closedIds()).toEqual(["t-4", proposalIn(applied)]);
+    expect(proposalIn(shadowed)).not.toBe("");
+    expect(closedIds()).not.toContain(proposalIn(shadowed));
   });
 
   it("stops at the write cap, and the overflow stays open as an ordinary ask — named", async () => {

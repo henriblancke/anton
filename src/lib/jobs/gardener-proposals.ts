@@ -17,7 +17,7 @@
  */
 import type { Bead } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
-import { applyArmedProposals } from "../gardener/armed";
+import { applyArmedProposals, reportUnsettledProposals } from "../gardener/armed";
 import { detectBoard } from "../gardener/detect";
 import {
   arbitrateEmission,
@@ -255,12 +255,20 @@ export async function fileGardenerProposals(
     await armed(scope, standing);
   } catch (e) {
     // The proposals a stopped pass DID file are on the board like any other, so they get the same
-    // arbitration — a pass that parked on its third create must not leave the first two doubled. Not
-    // shadowed, though: the pass is failing and will retry, and its commentary is worth less than
-    // getting the beads that landed onto the other machines.
+    // arbitration — a pass that parked on its third create must not leave the first two doubled.
+    // Neither shadowed nor applied, though: the pass is failing and will retry, and neither its
+    // commentary nor an unattended write out of a half-failed emission is worth more than getting
+    // the beads that landed onto the other machines. The retry will not settle them either — their
+    // fingerprints now suppress the re-file — so it is SAID rather than left to be inferred from a
+    // pass record that would otherwise read as clean.
     if (e instanceof PartialEmissionError) {
       reportEmission(scope, e.result);
-      await withdrawTwins(scope, e.result, input.arbitration);
+      const withdrawn = await withdrawTwins(scope, e.result, input.arbitration);
+      await reportUnsettledProposals({
+        created: e.result.created.filter((p) => !withdrawn.has(p.id)),
+        producer: "[gardener]",
+        log: scope.log,
+      });
     }
     throw e;
   }

@@ -241,6 +241,7 @@ describe("readSessionLogLines", () => {
         "[product-master] 0 claim(s) reported",
       ],
       truncated: false,
+      unreadable: false,
     });
   });
 
@@ -251,15 +252,20 @@ describe("readSessionLogLines", () => {
     expect(await readSessionLogLines(path, keepPass, 3)).toEqual({
       lines: Array(3).fill("[product-master] APPLIED something"),
       truncated: true,
+      unreadable: false,
     });
   });
 
-  it("reads a log the disk no longer has as empty — `.anton` is disposable", async () => {
+  // Empty rather than thrown, because `.anton` is disposable and the record is commentary — but
+  // FLAGGED, because a caller that renders silence as "this pass wrote nothing" would otherwise
+  // publish a clean bill of health for a log it never read.
+  it("reads a log the disk no longer has as empty, and says the read failed", async () => {
     const { readSessionLogLines } = await import("./sessions");
 
     expect(await readSessionLogLines(join(scanDir, "gone.log"), keepPass)).toEqual({
       lines: [],
       truncated: false,
+      unreadable: true,
     });
   });
 });

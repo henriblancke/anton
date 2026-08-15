@@ -138,6 +138,23 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     ]);
   });
 
+  it("names POLICY on the note when nobody was asked — the same move, a different event", async () => {
+    const proposal = proposalFor(REPARENT);
+
+    const result = await apply(proposal, [CARD, bead("anton-a"), proposal], "policy");
+
+    // The board move is identical to the approved one above, which is exactly why the note has to
+    // differ: it is the only place the board records that nobody approved this, and which setting
+    // did — the first thing a founder who finds a bead moved overnight goes looking for.
+    expect(result.changed).toEqual(["anton-a"]);
+    expect(calls).toEqual([
+      "reparent anton-a anton-card",
+      `note ${proposal.id} gardener: applied by POLICY — re-parented anton-a under anton-card. ` +
+        "Nobody approved this: this project's proposal autonomy for `container-orphan` is set to apply.",
+      `close ${proposal.id} applied: re-parented anton-a under anton-card`,
+    ]);
+  });
+
   it("closes a proposal the board already satisfied WITHOUT touching a subject bead", async () => {
     const proposal = proposalFor(REPARENT);
     const result = await apply(proposal, [CARD, child("anton-a", CARD.id), proposal]);

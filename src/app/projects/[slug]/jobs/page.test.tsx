@@ -43,6 +43,7 @@ vi.mock("@/lib/sessions", () => ({
   readSessionLogLines: async (logPath: string, keep: (line: string) => boolean) => ({
     lines: (logs[logPath] ?? "").split("\n").filter(keep),
     truncated: false,
+    unreadable: !(logPath in logs),
   }),
 }));
 
@@ -167,6 +168,19 @@ describe("jobs page — what each pass applied, shadowed and refused", () => {
 
     expect(record().queryByText(/Clean pass/)).toBeNull();
     expect(record().getByText(/held back 2 armed proposal\(s\)/)).toBeTruthy();
+  });
+
+  it("never calls a pass clean when its log could not be read", async () => {
+    // The session row stands but its disposable log is gone. Silence here is not a result: this
+    // record is the only view of an unattended write, so a failed read must read as a failed read
+    // rather than as a pass that wrote nothing.
+    jobs = [job("g1", "gardener")];
+    sessions["g1"] = { id: "s-g1", logPath: "/logs/vanished.log" };
+    await renderPage();
+    expand("gardener");
+
+    expect(record().queryByText(/Clean pass/)).toBeNull();
+    expect(record().getByText(/session log could not be read/)).toBeTruthy();
   });
 
   it("separates a write that broke from a move the board declined", async () => {

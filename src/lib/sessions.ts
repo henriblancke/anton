@@ -231,6 +231,12 @@ export interface ScannedLogLines {
   lines: string[];
   /** The scan stopped at {@link MAX_SCANNED_LOG_LINES}. Never silent — the caller says so. */
   truncated: boolean;
+  /**
+   * The file could not be read, or not to the end — it is gone, or the read failed part-way. What
+   * came back is an honest partial answer, never a complete one, and a caller that renders silence
+   * as a result has to be able to tell the two apart.
+   */
+  unreadable: boolean;
 }
 
 /**
@@ -243,9 +249,11 @@ export interface ScannedLogLines {
  * reading it all affordable: the transcript is decoded and dropped line by line, and only what
  * `keep` accepts is ever held.
  *
- * A log that is gone (a disposable `.anton` cleared out from under the row) reads as empty: the
+ * A log that is gone (a disposable `.anton` cleared out from under the row) does not throw: the
  * record is commentary, and a page that threw over a missing one would cost the operator the job
- * list itself.
+ * list itself. It is not silent either — it comes back {@link ScannedLogLines.unreadable}, because
+ * "this pass wrote nothing" and "we could not read what it wrote" are opposite answers, and only one
+ * of them is a clean pass.
  */
 export async function readSessionLogLines(
   logPath: string,
@@ -254,6 +262,7 @@ export async function readSessionLogLines(
 ): Promise<ScannedLogLines> {
   const lines: string[] = [];
   let truncated = false;
+  let unreadable = false;
   try {
     const stream = createReadStream(logPath, { encoding: "utf8" });
     const reader = createInterface({ input: stream, crlfDelay: Infinity });
@@ -271,9 +280,11 @@ export async function readSessionLogLines(
       stream.destroy();
     }
   } catch {
-    // Whatever was read before the file went away is still the honest half of the answer.
+    // Whatever was read before the file went away is still the honest half of the answer — flagged
+    // as the half it is, so no caller mistakes it for the whole.
+    unreadable = true;
   }
-  return { lines, truncated };
+  return { lines, truncated, unreadable };
 }
 
 /** A single session by id (shared anton.db read path — for run detail + log stream). */

@@ -63,8 +63,18 @@ export async function passRecordsByJob(
  * only the end of the log would drop an unattended write and call the pass clean.
  */
 async function readLog(logPath: string): Promise<PassRecordSummary> {
-  const { lines, truncated } = await readSessionLogLines(logPath, isPassLogLine);
+  const { lines, truncated, unreadable } = await readSessionLogLines(logPath, isPassLogLine);
   const summary = readPassRecords(lines.join("\n"));
+  if (unreadable) {
+    // The one silence that is NOT a result: the session row stands but its disposable log is gone
+    // or would not read, so an empty summary here would render as "Clean pass" over a pass that may
+    // have written to the board unattended — the only UI record of which is the file we just failed
+    // to read.
+    summary.notes.push(
+      `this pass's session log could not be read${lines.length > 0 ? " to the end" : ""} — ` +
+        `whatever it applied, shadowed or refused is not recorded here`,
+    );
+  }
   if (truncated) {
     // Never a silent cap, for the same reason the write cap is not one: a record that shows some of
     // a pass's writes reads exactly like one that shows all of them.

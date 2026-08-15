@@ -136,9 +136,12 @@ export function resetSeam(): void {
  *
  * The module is pulled in lazily so the suite's `vi.mock` is in place before apply.ts binds `beads`.
  *
- * `actor` is named at every call rather than defaulted, for the reason `applyProposal` requires it:
- * a test that means "a human approved this" and a test that means "a policy did" must not be the
- * same call, or the attribution the note carries goes unasserted.
+ * `actor` defaults to `approval` because that is the caller nearly every case here stands in for —
+ * the approve route — and the note it writes is asserted verbatim in `apply.test.ts` ("applied —
+ * …"). The default is deliberate, NOT a stand-in for the production requirement: `applyProposal`
+ * itself takes no default, so no caller outside these suites can leave the attribution unsaid. A
+ * case that means "a policy did this" passes `"policy"` explicitly, and the note it produces is
+ * pinned there too, so a wrong label is a failing test rather than a quiet one.
  */
 export async function apply(proposal: Bead, board: Bead[], actor: ApplyActor = "approval") {
   setSnapshot(board);

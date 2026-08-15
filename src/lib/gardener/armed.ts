@@ -156,6 +156,33 @@ export async function applyArmedProposals(input: ArmedInput): Promise<ArmedResul
 }
 
 /**
+ * Say that proposals a pass FILED will never be settled: emission failed part-way, so neither the
+ * shadow nor the armed walk ran over them, and no later pass picks them up — the fingerprint that
+ * stops a filed claim being re-filed also stops it being re-decided.
+ *
+ * The pass writes nothing for them on purpose. Its board writes are already failing, and applying
+ * unattended out of a failure path is the last moment to start trusting them; leaving the asks open
+ * for a human is the safe direction. What is NOT safe is doing it silently — an operator who armed a
+ * kind and finds an untouched bead has to be able to tell "the policy refused it" from "the policy
+ * never got to it". Shaped as a pass note (no `(kind)` group), so the jobs-page record carries it
+ * instead of calling the pass clean.
+ */
+export async function reportUnsettledProposals(input: {
+  created: EmittedProposal[];
+  producer: string;
+  log: (chunk: string) => Promise<void>;
+}): Promise<void> {
+  if (input.created.length === 0) return;
+  const ids = input.created.map((p) => p.id);
+  const line =
+    `APPLY skipped for ${ids.length} filed proposal(s) — this pass failed part-way through ` +
+    `filing, so neither the shadow nor the armed walk reached them; they stay open as ordinary ` +
+    `asks and no later pass re-decides them (${ids.join(", ")})`;
+  console.warn(`${input.producer} ${line}`);
+  await write(input, line);
+}
+
+/**
  * One proposal, applied against a board read FRESH for it — as the approve route reads one per
  * approval, and for a reason a shared snapshot could not answer: an earlier apply in this same loop
  * may have moved a bead this one rests on.
@@ -226,7 +253,10 @@ function summaryOf(records: ArmedRecord[]): string {
  * Best-effort, like the shadow's: a session log that will not take a write must not fail the pass —
  * but it is never silent either, or a broken log store reads as a pass that applied nothing.
  */
-async function write(input: ArmedInput, line: string): Promise<void> {
+async function write(
+  input: Pick<ArmedInput, "producer" | "log">,
+  line: string,
+): Promise<void> {
   await input.log(`${input.producer} ${line}\n`).catch((e) => {
     console.warn(`${input.producer} could not record an apply — ${messageOf(e)}: ${line}`);
   });
