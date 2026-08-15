@@ -566,6 +566,15 @@ describe("detectionsFor", () => {
         () => rehome("anton-standalone", rightCard.id),
         /hangs under nothing — giving homeless work its first home is the gardener's proposal/,
       ],
+      // The rest of that ask. A ticket under a container epic HAS a parent, so the bar above waves
+      // it through — but no run target carries it, the context renders it as work nothing ships, and
+      // the gardener's container-orphan detector already proposes this move under its own
+      // fingerprint.
+      [
+        "a bead whose home runs nothing — the gardener's container-orphan ask, not this pass's",
+        () => rehome("anton-t-orphan", rightCard.id),
+        /no run target carries anton-t-orphan — it hangs under anton-epic, which runs nothing/,
+      ],
       ["the bead itself", () => rehome(ticket.id, ticket.id), /cannot be its own home/],
       ["a home that has settled", () => rehome(ticket.id, "anton-shut"), /already settled/],
       ["a home a run is shipping", () => rehome(ticket.id, "anton-live"), /mid-run/],
@@ -660,6 +669,9 @@ describe("detectionsFor", () => {
         bead("anton-learn", { issue_type: "learning" }),
         // A parentless bug: its own run target, and homeless — anton runs it exactly as it stands.
         bead("anton-standalone", { issue_type: "bug", priority: 0 }),
+        // A ticket hanging straight off the container epic: it has a home, but no card ancestor, so
+        // no run reaches it — the state `detectContainerOrphans` owns.
+        bead("anton-t-orphan", { parent: container.id }),
       ];
       const { detections, rejected } = detectionsFor([bad()], full, NOW);
       expect(detections).toEqual([]);

@@ -900,6 +900,16 @@ function rehomeRefusal(
   if (!currentHome) {
     return `${claim.bead} hangs under nothing — giving homeless work its first home is the gardener's proposal, not this pass's`;
   }
+  // The rest of that ask, for work whose home is present but runs nothing: a ticket under a
+  // CONTAINER epic has a parent, so the bar above waves it through, yet no run target carries it —
+  // the loose section renders it under "work no run target carries" and tells the pass not to move
+  // it, because `detectContainerOrphans` proposes this exact move already. Filing it here too gives
+  // one move two fingerprints, so the founder who declined the gardener's ask meets it again under a
+  // pm id. Asked through `isRunTarget` — the same split the context was built on — so a card, whose
+  // owner is legitimately absent because it IS the run, still moves.
+  if (!owner && !beads.isRunTarget(subject, index.all)) {
+    return `no run target carries ${claim.bead} — it hangs under ${currentHome}, which runs nothing, so putting it where a run can reach it is the gardener's proposal, not this pass's`;
+  }
   return undefined;
 }
 
