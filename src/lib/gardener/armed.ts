@@ -30,7 +30,9 @@
  * Total over its proposals, like the shadow walk: a refusal is the board declining and leaves the
  * ask open with the reason already noted on it, an error is anton failing to decide, and NEITHER
  * costs the pass the proposals behind it. A patrol that could not apply its second ask must still
- * apply its third — the alternative is one unlucky bead freezing the whole armed path.
+ * apply its third — the alternative is one unlucky bead freezing the whole armed path. A CANCEL is
+ * the one thing that is not an outcome: it is the pass being stopped, so it is re-thrown rather than
+ * returned, and re-checked after every await that precedes a write.
  *
  * Shared by both producers on purpose (gardener-proposals.ts, product-master-steps.ts): a
  * per-producer copy would be two answers to "how much may a pass write, and how does it say so".
@@ -118,15 +120,23 @@ function armed(
 }
 
 /**
- * Apply what this pass filed, for the kinds armed at `apply`. Never throws — an armed proposal that
- * cannot be applied is a line in the log and an ask still standing on the board.
+ * Apply what this pass filed, for the kinds armed at `apply`. Throws for exactly one reason — the
+ * pass was CANCELLED (see the checks below) — and for no other: an armed proposal that cannot be
+ * applied is a line in the log and an ask still standing on the board.
  *
  * The cap counts ATTEMPTS, not successful writes: it bounds how much unattended work one pass does,
  * and a pass that refused ten in a row has still spent ten applies' worth of board reads and locks.
  */
 export async function applyArmedProposals(input: ArmedInput): Promise<ArmedResult> {
+  // A cancel PROPAGATES, here and at every check below — it is never a normal return. The runner
+  // reads a handler that resolves as a pass that finished (jobs/runner.ts), and no later pass
+  // revisits these proposals: they are already on the board, so the fingerprint suppression that
+  // stops them being re-filed also stops them being re-decided. A cancelled walk that resolved
+  // would publish that as a clean pass over asks nothing will ever settle. Emission stops the same
+  // way, for the same reason (emit.ts `PartialEmissionError`).
+  input.signal?.throwIfAborted();
   const targets = armed(input.created, input.policy);
-  if (targets.length === 0 || input.signal?.aborted) return nothing();
+  if (targets.length === 0) return nothing();
 
   const limit = Math.max(0, input.limit ?? MAX_APPLIES_PER_PASS);
   const held = targets.slice(limit).map(({ proposal }) => proposal.id);
@@ -168,10 +178,34 @@ export async function applyArmedProposals(input: ArmedInput): Promise<ArmedResul
     return line;
   };
 
+  /**
+   * Publish what the walk DID write, whichever way it ended. A cancelled walk owes this as much as a
+   * finished one: the applies behind the cancel are real board writes, and one no other machine can
+   * see is half a write.
+   */
+  const publish = (): void => {
+    if (records.length === 0) return;
+    // Once, on the way out, whatever the outcomes were: a REFUSAL writes too (apply attaches its
+    // reason to the proposal), and the nudge coalesces per repo — so a pass that happened to write
+    // nothing costs a no-op push, while one that moved a bead never leaves it on this machine alone.
+    input.nudge();
+    console.log(`${input.producer} ${summaryOf(records)}`);
+  };
+
+  /** Cancelled mid-walk: name what stays open, publish what landed, and propagate the abort. */
+  const cancelled = async (
+    signal: AbortSignal,
+    untried: Array<{ proposal: EmittedProposal }>,
+  ): Promise<never> => {
+    await write(input, stop("the pass was cancelled", untried));
+    publish();
+    throw signal.reason;
+  };
+
   for (const [i, { proposal, plan }] of attempts.entries()) {
     // Between every apply, not once up front: each one is a board write, and a cancel arriving
     // mid-loop has to stop the rest rather than let a cancelled pass finish every armed move.
-    if (input.signal?.aborted) break;
+    if (input.signal?.aborted) return cancelled(input.signal, attempts.slice(i));
 
     // The shared board, refreshed for THIS apply — for the same reason the board read below is a
     // fresh one per proposal, one step further out: the read that follows only re-reads this
@@ -194,6 +228,11 @@ export async function applyArmedProposals(input: ArmedInput): Promise<ArmedResul
       );
       break;
     }
+    // The pull is the loop's longest await, and a cancel arriving inside it would otherwise not be
+    // seen until this proposal had already been applied — an unattended write out of a pass an
+    // operator (or the no-progress timeout) has stopped. Checked BEFORE the reservation, so a
+    // cancel here costs the cap nothing.
+    if (input.signal?.aborted) return cancelled(input.signal, attempts.slice(i));
 
     // The spend is recorded BEFORE the board is touched, never after. The record IS the accounting —
     // a retry of this job reconstructs what earlier attempts spent from these very lines
@@ -210,6 +249,20 @@ export async function applyArmedProposals(input: ArmedInput): Promise<ArmedResul
       );
       break;
     }
+    // The last await before the board is touched, so it gets the last check. The attempt is bought
+    // and stays bought — the cap is spent on a reservation, not on a write — but it is given its
+    // outcome rather than left standing as an `APPLYING` line nobody can resolve: here anton KNOWS
+    // nothing was written, and a reservation with no outcome tells a founder to go and look.
+    if (input.signal?.aborted) {
+      const unmade: ArmedRecord = {
+        ...base,
+        outcome: "error",
+        detail: "the pass was cancelled before the board was touched — nothing was applied",
+      };
+      records.push(unmade);
+      await write(input, lineOf(unmade));
+      return cancelled(input.signal, attempts.slice(i + 1));
+    }
 
     const record = await applyOne(input, base);
     records.push(record);
@@ -225,13 +278,7 @@ export async function applyArmedProposals(input: ArmedInput): Promise<ArmedResul
     break;
   }
 
-  if (records.length > 0) {
-    // Once, on the way out, whatever the outcomes were: a REFUSAL writes too (apply attaches its
-    // reason to the proposal), and the nudge coalesces per repo — so a pass that happened to write
-    // nothing costs a no-op push, while one that moved a bead never leaves it on this machine alone.
-    input.nudge();
-    console.log(`${input.producer} ${summaryOf(records)}`);
-  }
+  publish();
   return { records, attempted: records.length, deferred: held };
 }
 
