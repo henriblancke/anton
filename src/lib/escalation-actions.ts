@@ -29,8 +29,9 @@
  * the same reason it re-derives from the live board WHICH target the gate now releases, and resumes
  * only once that board says it may run — the automatic path's own dispatch rule, not a subset of it
  * (see {@link gateDispatch}); anything else still holding it means the founder's answer ends that one
- * wait and nothing more. A resume that DOES land marks the gate handed back ({@link markGateResumed}),
- * because a closed gate is otherwise re-dispatched by gate-check forever.
+ * wait and nothing more. A resume that DOES land marks handed back ({@link markGatesResumed}) EVERY
+ * closed gate that target now covers, not just the one answered, because a closed gate left unmarked
+ * is re-dispatched by gate-check forever.
  * Abandon closes the gate LAST, after the bead: a gate that closes over an open bead hands the work
  * straight back to gate-check's own resume, which is the opposite of an abandon. Either way the gate
  * must close, because it is not on the bead's lifecycle — left open it keeps `detectOpenHumanGates`
@@ -54,6 +55,7 @@ import { nudgeSync } from "./beads/sync-nudge";
 import { getEscalation, settleEscalation, toEscalationView } from "./escalations";
 import {
   beadBlockedByGate,
+  gatesReleasingTarget,
   GATE_RESUMED_LABEL,
   runTargetAbove,
   undispatchableReason,
@@ -420,18 +422,19 @@ async function answerGateWait(
   // Reuses the automatic path's own verb, so a resolve-and-resume and a gate-check resume of the
   // same target are the same idempotent call — whichever lands second is absorbed as a no-op.
   const outcome = await resumeStalledEpic(project.id, dispatch.target);
-  await markGateResumed(project, gateId);
+  await markGatesResumed(project, dispatch.gates);
   return outcome;
 }
 
 /**
  * What the resolve-and-resume does next, decided against the LIVE board:
- *   • `run`     — this is the run target the gate now releases, and the board says it may run.
+ *   • `run`     — this is the run target the gate now releases, and the board says it may run. `gates`
+ *                 is every closed gate that one run hands back (see {@link markGatesResumed}).
  *   • `hold`    — it may not, and why (with `unread` when the board itself is what didn't answer).
  *   • `nothing` — the gate no longer releases anything anton runs, so there is nothing to resume.
  */
 type GateDispatch =
-  | { verdict: "run"; target: string }
+  | { verdict: "run"; target: string; gates: string[] }
   | { verdict: "hold"; target: string; reason: string; unread?: boolean }
   | { verdict: "nothing" };
 
@@ -495,32 +498,52 @@ async function gateDispatch(
   if (target.id !== frozen && beads.isRunLive(target, systemClock.now())) {
     return { verdict: "hold", target: target.id, reason: "another machine is running it" };
   }
-  return { verdict: "run", target: target.id };
+  // The answered gate is included whatever the board says about it: the resolve landed before this
+  // read, and a gate that maps to no bead at all (the frozen fallback above) is covered by this run
+  // just the same.
+  const covered = gatesReleasingTarget(board, target.id).map((gate) => gate.id);
+  return {
+    verdict: "run",
+    target: target.id,
+    gates: covered.includes(gateId) ? covered : [gateId, ...covered],
+  };
 }
 
 /**
- * Mark the gate as handed back, exactly as gate-check's `dispatchReleased` does after its own
+ * Mark the gates as handed back, exactly as gate-check's `dispatchReleased` does after its own
  * dispatch — and for the same reason: a resolved gate stays on its bead FOREVER, so an unmarked one
  * is re-dispatched by `plainGateResumes` on every later pass. Unmarked, a resume the founder made
  * here would be re-run every ten minutes, retrying a run that has since parked or failed on the exact
  * failure the founder was answering.
  *
- * Only after the resume LANDS. A resume that was held back, or that threw, leaves the gate unmarked
+ * EVERY gate the resumed target covers, not only the one the founder answered ({@link
+ * gatesReleasingTarget}). Two waits on one target are answered one at a time — the first closes and
+ * holds, the second closes and runs — so the run this marks is the one that releases both. The
+ * automatic path reaches the same end state by dispatching once per gate and marking each; marking
+ * only the second here would leave the first closed and unmarked over work that is now running.
+ *
+ * Only after the resume LANDS. A resume that was held back, or that threw, leaves the gates unmarked
  * on purpose: that closed-and-unmarked gate is what makes those cases gate-check's to recover (see
  * the module note).
  *
  * A failed mark is logged, not thrown — the resume happened, and failing the action would report
  * otherwise. The cost is one redundant gate-check dispatch, which `resumeEpic` absorbs; the same
- * trade gate-check itself makes. The mark is a SHARED-board write, so it is pushed like the gate
- * close it follows: unpushed, a second anton reading this board re-dispatches anyway.
+ * trade gate-check itself makes. The marks are SHARED-board writes, so they are pushed like the gate
+ * close they follow: unpushed, a second anton reading this board re-dispatches anyway.
  */
-async function markGateResumed(project: Project, gateId: string): Promise<void> {
-  try {
-    await beads.tag(project.repoPath, gateId, [GATE_RESUMED_LABEL]);
-    nudgeSync(project, "gate-resumed");
-  } catch (e) {
-    console.error(`[unstick] failed to mark gate ${gateId} as handed back:`, e);
+async function markGatesResumed(project: Project, gateIds: string[]): Promise<void> {
+  let marked = false;
+  for (const gateId of gateIds) {
+    try {
+      await beads.tag(project.repoPath, gateId, [GATE_RESUMED_LABEL]);
+      marked = true;
+    } catch (e) {
+      console.error(`[unstick] failed to mark gate ${gateId} as handed back:`, e);
+    }
   }
+  // One nudge for the batch — a push carries whatever landed, and a batch where every write failed
+  // has nothing to propagate.
+  if (marked) nudgeSync(project, "gate-resumed");
 }
 
 /** What bd records on the gate: which answer ended the wait, traceable back to the row that asked. */

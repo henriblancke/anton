@@ -234,6 +234,27 @@ export function plainGateResumes(
     .filter((resume): resume is PlainGateResume => resume.target !== undefined);
 }
 
+/**
+ * Every closed-and-unmarked gate whose release maps to `targetId` — the set ONE resume of that target
+ * covers, and therefore the set that resume must mark.
+ *
+ * {@link plainGateResumes} is deliberately not deduped by target, so when two gates block the same
+ * target the automatic pass dispatches it twice and marks BOTH. The manual resolve-and-resume
+ * (escalation-actions.ts) dispatches once, so without this it would mark only the gate the founder
+ * answered: the other one is closed, unmarked, and re-dispatched by the very next pass — retrying a
+ * run that has since parked or failed, behind the escalation/retry decision's back.
+ *
+ * No dispatchability test, unlike {@link releasedTarget}: the caller has already decided this target
+ * runs, and a gate is covered by that run whether or not the board would have started it.
+ */
+export function gatesReleasingTarget(board: Bead[], targetId: string): Bead[] {
+  return board.filter((gate) => {
+    if (!isPlainResumeGate(gate)) return false;
+    const blocked = beadBlockedByGate(board, gate.id);
+    return blocked !== undefined && runTargetAbove(board, blocked.id)?.id === targetId;
+  });
+}
+
 /** The bead a `bd ready --gated` entry speaks for — its ready step, or the molecule it names. */
 function gatedEntryTarget(board: Bead[], entry: GatedMolecule): Bead | undefined {
   const startId = entry.ready_step?.id ?? entry.molecule_id;

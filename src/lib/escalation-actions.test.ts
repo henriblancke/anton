@@ -978,6 +978,82 @@ describe("actOnEscalation — a wait on a person", () => {
     expect(nudgeSync).toHaveBeenCalledWith(project, "gate-resumed");
   });
 
+  /**
+   * Two human gates over ONE run target, answered one at a time: the first close held the resume (the
+   * second gate was still open) and left its gate closed-and-unmarked on purpose, so by the time the
+   * founder answers `g-1` the board carries `g-0` closed and unmarked as well. `g-2` hangs over a
+   * different target and is nobody's to mark here.
+   */
+  function twoGatesOverOneTarget(): Bead[] {
+    const ticket = (id: string, gateId: string, parent: string): Bead =>
+      ({
+        id,
+        title: "ticket",
+        status: "open",
+        issue_type: "task",
+        parent,
+        dependencies: [{ issue_id: id, depends_on_id: gateId, type: "blocks" }],
+      }) as Bead;
+    const gate = (id: string): Bead =>
+      ({ id, title: "Gate: human", issue_type: "gate", status: "closed" }) as Bead;
+    const target = (id: string, title: string): Bead =>
+      ({
+        id,
+        title,
+        status: "open",
+        issue_type: "feature",
+        labels: [LABELS.approved],
+      }) as Bead;
+    return [
+      ticket("anton-t9", "g-1", "anton-e1"),
+      ticket("anton-t8", "g-0", "anton-e1"),
+      ticket("anton-t7", "g-2", "anton-e2"),
+      target("anton-e1", "epic"),
+      target("anton-e2", "other work"),
+      gate("g-1"),
+      gate("g-0"),
+      gate("g-2"),
+    ];
+  }
+
+  it("marks EVERY closed gate the resumed target covers, not just the one answered", async () => {
+    // Answering the second of two waits on one target is what finally releases it — so the run this
+    // starts covers the first gate too. Marking only `g-1` would leave `g-0` closed and unmarked over
+    // running work, and gate-check's `plainGateResumes` would resume the target again the moment that
+    // run parked or failed — behind the escalation/retry decision's back.
+    loadAllIssues.mockResolvedValue(twoGatesOverOneTarget());
+
+    expect(await actOnEscalation(project, (await openGateWait()).id, "resume")).toMatchObject({
+      ok: true,
+      detail: "enqueued",
+    });
+    expect(resumeStalledEpic).toHaveBeenCalledTimes(1);
+    expect(beadsTag).toHaveBeenCalledWith(project.repoPath, "g-1", [GATE_RESUMED_LABEL]);
+    expect(beadsTag).toHaveBeenCalledWith(project.repoPath, "g-0", [GATE_RESUMED_LABEL]);
+    // A gate over other work is released by that work's own resume, not by this one.
+    expect(beadsTag).not.toHaveBeenCalledWith(project.repoPath, "g-2", [GATE_RESUMED_LABEL]);
+    // One push for the batch — the marks travel together.
+    expect(nudgeSync.mock.calls.filter(([, r]) => r === "gate-resumed")).toHaveLength(1);
+  });
+
+  it("marks the gates it could when one of the marks fails", async () => {
+    // Each mark is independent: a bd failure on one must not strand the others unmarked, which would
+    // hand gate-check the re-dispatch this whole marker exists to prevent.
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    loadAllIssues.mockResolvedValue(twoGatesOverOneTarget());
+    beadsTag.mockImplementation(async (_repo, id) => {
+      if (id === "g-1") throw new Error("bd: database is locked");
+    });
+
+    expect(await actOnEscalation(project, (await openGateWait()).id, "resume")).toMatchObject({
+      ok: true,
+      detail: "enqueued",
+    });
+    expect(beadsTag).toHaveBeenCalledWith(project.repoPath, "g-0", [GATE_RESUMED_LABEL]);
+    expect(logged.mock.calls[0]?.[0]).toContain("g-1");
+    logged.mockRestore();
+  });
+
   it("leaves the gate unmarked when the resume was held back", async () => {
     // The unmarked gate IS the recovery: gate-check dispatches it once the remaining blocker lands.
     loadAllIssues.mockResolvedValue([
