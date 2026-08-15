@@ -16,7 +16,7 @@
  * gardener's own detectors produce, after checking every claim against the board it was made about.
  */
 import { beads, labelValueOf, type Bead } from "../beads/bd";
-import { isPipelineArtifact } from "../beads/contract";
+import { goalBody, isPipelineArtifact, preambleOf } from "../beads/contract";
 import { loadSkill } from "../claude/prompt";
 import { homeWrongTier, HOME_STANDING } from "../gardener/apply-plan";
 import {
@@ -155,6 +155,12 @@ export const MAX_CARDS = 60;
 export const MAX_TICKETS_PER_CARD = 12;
 /** How many recent runs the outcome section carries. */
 export const MAX_RUNS = 20;
+/**
+ * How much of one bead's stated goal rides along. Enough to weigh two contracts against each other,
+ * far short of quoting them: the cap is per bead and the board is capped at hundreds, so the whole
+ * contract of every bead is a prompt nothing could read.
+ */
+export const MAX_GOAL_CHARS = 240;
 /** How many score rounds one bead's series shows, newest last. */
 export const MAX_SCORE_ROUNDS = 6;
 
@@ -277,14 +283,21 @@ function targetsSection(split: PmBoardSplit, index: BoardIndex, input: PmBoardIn
     `Each block is one run target — the unit anton actually runs — followed by the tickets it`,
     `carries. A block with no tickets under it runs as a single ticket, itself. \`blocked by\` is a`,
     `\`blocks\` edge the graph already records; \`under\` is the bead's parent — the home it hangs off`,
-    `today.`,
+    `today — and \`shipped by\` names the run target that carries it when that is not the same bead.`,
+    `Nesting runs to any depth here: a ticket filed under another ticket ships in the same run and`,
+    `the same PR, so it is filed legitimately, not misfiled.`,
+    ``,
+    `\`goal:\` is what the bead states about itself, in its own words, cut at ${MAX_GOAL_CHARS} characters — the`,
+    `rest of its contract (Context, Acceptance, Verify) is NOT in this prompt, so never read a cut`,
+    `line as the whole of what a bead is for. It is also the only evidence a home judgment may rest`,
+    `on: a bead with no \`goal:\` line has stated nothing to match, however suggestive its title.`,
     ``,
   ];
   for (const target of shown) {
-    lines.push(beadLine(target, index, input, ""));
+    lines.push(...beadLines(target, index, input, ""));
     const tickets = split.ticketsOf(target.id);
     for (const ticket of tickets.slice(0, MAX_TICKETS_PER_CARD)) {
-      lines.push(beadLine(ticket, index, input, "  "));
+      lines.push(...beadLines(ticket, index, input, "  "));
     }
     const dropped = tickets.length - MAX_TICKETS_PER_CARD;
     if (dropped > 0) lines.push(`  - …and ${dropped} more ticket(s) under ${target.id}, not shown`);
@@ -317,7 +330,7 @@ function containersSection(split: PmBoardSplit, index: BoardIndex, input: PmBoar
     `no tickets of their own. They are the homes the work above hangs off — judge them as groupings,`,
     `not as work to rank.`,
     ``,
-    ...shown.map((epic) => beadLine(epic, index, input, "", [carriesOf(epic, split, index)])),
+    ...shown.flatMap((epic) => beadLines(epic, index, input, "", [carriesOf(epic, split, index)])),
   ];
   if (split.containers.length > shown.length) {
     lines.push(
@@ -351,33 +364,59 @@ function looseSection(split: PmBoardSplit, index: BoardIndex, input: PmBoardInpu
     `first home is the gardener pass's proposal, not yours — do not \`rehome\` them; rank, split or`,
     `kill them only on their own merits.`,
     ``,
-    ...split.loose.slice(0, MAX_CARDS).map((b) => beadLine(b, index, input, "")),
+    ...split.loose.slice(0, MAX_CARDS).flatMap((b) => beadLines(b, index, input, "")),
     ``,
   ];
 }
 
-/** One bead as the pass reads it: everything a ranking, sizing or value judgment rests on. */
-function beadLine(
+/**
+ * One bead as the pass reads it: the facts a ranking, sizing or value judgment rests on, and — on
+ * its own second line — what the bead says it is FOR ({@link goalOf}).
+ */
+function beadLines(
   bead: Bead,
   index: BoardIndex,
   input: PmBoardInput,
   indent: string,
   extras: (string | undefined)[] = [],
-): string {
+): string[] {
   const facts = [
     `[${bead.issue_type ?? "task"}]`,
     `P${bead.priority ?? "?"}`,
     sizeOf(bead),
     ageOf(bead, input.now),
     homeOf(bead, index),
+    shippedBy(bead, index),
     blockedByOf(bead, index),
     ...extras,
     scoresOf(bead, input.scores),
     ownedBy(bead, input.now),
     beads.isDeferred(bead) ? "deferred" : undefined,
   ].filter((f): f is string => f !== undefined);
-  return `${indent}- ${bead.id} ${facts.join(" · ")} — ${oneLine(bead.title ?? "")}`;
+  const lines = [`${indent}- ${bead.id} ${facts.join(" · ")} — ${oneLine(bead.title ?? "")}`];
+  const goal = goalOf(bead);
+  if (goal) lines.push(`${indent}  goal: ${goal}`);
+  return lines;
 }
+
+/**
+ * What the bead states it is FOR, in its own words — the one contract field a home judgment cannot
+ * be made without.
+ *
+ * The pass is required to match two beads' CONTRACTS and forbidden to judge a home from their names
+ * (skills/product-master/SKILL.md: "naming is not evidence"), so a context carrying only titles left
+ * it two answers and both were wrong — omit every home claim, or guess from the shape of the words.
+ *
+ * Its `## Goal` where the bead states one, else the description's opening prose: an unshaped bead
+ * still says something about itself, and a reader that knew only the heading rendered nothing at all
+ * for it. Excerpted rather than quoted whole — see {@link MAX_GOAL_CHARS}.
+ */
+const goalOf = (bead: Bead): string | undefined => {
+  const description = typeof bead.description === "string" ? bead.description : "";
+  const text = oneLine(goalBody(bead) ?? preambleOf(description));
+  if (!text) return undefined;
+  return text.length > MAX_GOAL_CHARS ? `${text.slice(0, MAX_GOAL_CHARS)}…` : text;
+};
 
 /**
  * "A run owns this", in both halves — a published lease, and the claim a lease has not caught up to
@@ -407,14 +446,36 @@ const ageOf = (bead: Bead, nowMs: number): string | undefined => {
  * Where the bead hangs today, named rather than implied by the nesting: a feature's epic, a ticket's
  * card. Rendered with the parent's TITLE because an id alone does not say what a home is for, and the
  * only judgment worth making about a home is whether the work belongs in it.
+ *
+ * A bead with NO parent says so in those words rather than rendering blank. `rehome` is a claim about
+ * a home that is WRONG and anton refuses one about a bead that has none ({@link rehomeRefusal}) —
+ * first homes are the gardener's ask. The loose section says that for the work IT covers, but a
+ * parentless task/bug is a run target and renders as one, so silence there read as a home the pass
+ * had merely not been told.
  */
-const homeOf = (bead: Bead, index: BoardIndex): string | undefined => {
+const homeOf = (bead: Bead, index: BoardIndex): string => {
   const parentId = beads.parentOf(bead);
-  if (!parentId) return undefined;
+  // Parenthesised, not em-dashed: the em dash is what separates the facts from the title.
+  if (!parentId) return `under nothing (no home to be the wrong one)`;
   const parent = index.byId.get(parentId);
   // A parent absent from a full-board read is a dangling pointer; naming the id is still the truth.
   if (!parent) return `under ${parentId} (not on the board)`;
   return `under ${parent.id} "${oneLine(parent.title ?? "")}"`;
+};
+
+/**
+ * The run target that will actually SHIP this bead, whenever that is not its own parent — resolved
+ * through {@link ticketOwnerOf}, the same attribution the runner and the board use.
+ *
+ * bd nesting runs to any depth: under `feature → task → subtask` the subtask rides the FEATURE's run
+ * and its PR. Its parent is therefore a bead no `rehome` could ever name as a home (a ticket's home
+ * must be a card, {@link homeWrongTier}) — so a line showing only the parent read as a ticket hanging
+ * off a non-card, and the repair for that appearance is a proposal to flatten nesting somebody meant.
+ */
+const shippedBy = (bead: Bead, index: BoardIndex): string | undefined => {
+  const owner = ticketOwnerOf(index, bead);
+  if (!owner || owner.id === beads.parentOf(bead)) return undefined;
+  return `shipped by ${owner.id} "${oneLine(owner.title ?? "")}"`;
 };
 
 const blockedByOf = (bead: Bead, index: BoardIndex): string | undefined => {
@@ -523,7 +584,9 @@ export function pmReportFormatSection(): string {
     `  belongs to, or the card that should carry a ticket. One kind for both. anton refuses a home`,
     `  that is already the parent, that is not on the board, that a run owns, and one the tier`,
     `  taxonomy will not let carry this bead: a ticket hangs off a board card, a card off a container`,
-    `  epic (an epic that already groups cards), and nothing hangs off its own descendant.`,
+    `  epic (an epic that already groups cards), and nothing hangs off its own descendant. It also`,
+    `  refuses a SUBJECT the context shows as hanging \`under nothing\`: this claim is about a home`,
+    `  that is wrong, and a first home is the gardener pass's ask.`,
     `- \`"split"\` — \`pieces\`: the decomposition sketch, one short line per proposed ticket, at least`,
     `  two. A split with no sketch is not actionable and anton drops it.`,
     `- \`"kill"\` — no extra field. Approving it DEFERS the bead: out of the ready set, contract`,
@@ -767,7 +830,8 @@ function rehomeRefusal(
 ): string | undefined {
   const homeId = claim.home;
   if (homeId === claim.bead) return `${claim.bead} cannot be its own home`;
-  if ((beads.parentOf(subject) ?? "") === homeId) {
+  const currentHome = beads.parentOf(subject);
+  if (currentHome === homeId) {
     return `${claim.bead} already hangs under ${homeId} — the move would write nothing`;
   }
   // The subject's half of "a run owns it". `subjectRefusal` asks only `isInFlight`, which cannot see
@@ -806,7 +870,21 @@ function rehomeRefusal(
   if (index.isAncestor(claim.bead, homeId)) {
     return `${homeId} sits under ${claim.bead} — the move would make the subtree its own ancestor`;
   }
-  return homeWrongTier(subject, home, index, HOME_STANDING.snapshot);
+  const wrongTier = homeWrongTier(subject, home, index, HOME_STANDING.snapshot);
+  if (wrongTier) return wrongTier;
+  // Last, so it never masks a stronger fault: a container epic and a `learning` are both naturally
+  // parentless, and each is refused above for the reason it will still be refused for once somebody
+  // gives it a home — the taxonomy names no home for it at all.
+  //
+  // A `rehome` is a claim about a home that is WRONG; a FIRST home is the gardener's mechanical ask,
+  // and this pass is told to leave it alone. The context's "no run target carries this" section says
+  // so for the work IT covers — but a parentless task/bug is a RUN TARGET and renders as one, so
+  // nothing else here stops a claim that demotes a standalone run (often the most urgent bead on the
+  // board) into somebody else's child ticket, cancelling the run it would have had.
+  if (!currentHome) {
+    return `${claim.bead} hangs under nothing — giving homeless work its first home is the gardener's proposal, not this pass's`;
+  }
+  return undefined;
 }
 
 /** The detection one accepted claim becomes — the shape both emission and apply already speak. */

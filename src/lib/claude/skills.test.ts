@@ -436,7 +436,11 @@ describe("required skill assets", () => {
     // boundary it replaced is the real one: homeless work is still the gardener's.
     it("permits the home claim while keeping homeless work with the gardener", () => {
       expect(body).toMatch(/Parentage is not wholly theirs/);
-      expect(body).toMatch(/riding no run target is not yours to re-home/i);
+      expect(body).toMatch(/Work with no home is not yours to re-home/i);
+      // Both shapes homelessness renders in — a parentless task/bug is a RUN TARGET, so it is never
+      // listed among the work no run target carries and only its own line says it has no home.
+      expect(body).toMatch(/riding no run target/i);
+      expect(body).toMatch(/under nothing/i);
     });
 
     // A home claim reads two contracts against each other; the shape of the words is not evidence.

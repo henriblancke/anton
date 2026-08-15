@@ -1,6 +1,6 @@
 ---
 name: product-master
-version: 07c876293182
+version: 0ec41d03e1d1
 description: >-
   Reasoning contract for anton's scheduled product-master pass: in a fresh context, read the whole
   board — tiers, ordering edges, priorities, ages, sizes, review-score history, recent run outcomes —
@@ -62,9 +62,11 @@ and the bead it should hang under. One class covers both, because it is one clai
 
 The evidence bar is the two beads' **own contracts**, exactly as an ordering edge's is. A home claim
 is a match: what the home says it is for, and what the subject says it delivers — the goal an epic
-states and the goal a feature achieves, the surface a card owns and the surface a ticket edits. Quote
-those. **Naming is not evidence**: two beads whose titles share a word are not related, and a bead
-that "feels like billing" is a hunch. If the only case you can make is the shape of the words, say
+states and the goal a feature achieves, the surface a card owns and the surface a ticket edits. The
+context renders each bead's `goal:` line — its own contract text, excerpted — and that is what you
+quote. **Naming is not evidence**: two beads whose titles share a word are not related, and a bead
+that "feels like billing" is a hunch. A bead with no `goal:` line has stated nothing to match, so
+there is no claim to make about it. If the only case you can make is the shape of the words, say
 nothing.
 
 Where the work may go is the board's answer, not yours: a ticket hangs off the board card that runs
@@ -73,14 +75,20 @@ below names every bead's current home and lists the container epics, so propose 
 anton refuses one that is already the parent, that is not on the board, that a run owns, or that the
 tiers will not allow.
 
+`under` names the bead's direct parent; `shipped by` names the run target that carries it when the
+two differ. Nesting runs to any depth, so a ticket filed under another ticket still ships in that
+run's worktree and PR — a legitimate home, not a misfiling. Do not propose flattening one.
+
 **A container epic is never the SUBJECT.** It groups the board's cards rather than riding one, so the
 taxonomy names no home above it — a card is not one, and hanging a container under a card would hand
 that card's run every ticket beneath it. The context lists them; if a container is filed under the
 wrong thing, that is a shaping question for a human, not a `rehome`.
 
-**Work the context flags as riding no run target is not yours to re-home.** Giving homeless work its
-first home is the gardener pass's mechanical proposal; your question is a home that is *wrong*, not
-one that is *missing*.
+**Work with no home is not yours to re-home.** Giving homeless work its first home is the gardener
+pass's mechanical proposal; your question is a home that is *wrong*, not one that is *missing*. That
+covers both shapes the context shows it in: work it flags as riding no run target, and any bead whose
+line reads `under nothing` — including a standalone task or bug, which runs on its own and would be
+demoted into somebody else's ticket by the move. anton refuses either claim.
 
 ### `split` — one ticket is carrying several jobs
 

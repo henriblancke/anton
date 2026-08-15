@@ -11,7 +11,13 @@
 import { describe, expect, it } from "vitest";
 import type { Bead } from "../beads/bd";
 import { LABELS } from "../beads/bd";
-import { detectionsFor, formatPmBoardContext, parsePmReport, type PmClaim } from "./context";
+import {
+  detectionsFor,
+  formatPmBoardContext,
+  MAX_GOAL_CHARS,
+  parsePmReport,
+  type PmClaim,
+} from "./context";
 
 function bead(id: string, o: Partial<Bead> = {}): Bead {
   return { id, title: id, status: "open", issue_type: "task", priority: 2, ...o };
@@ -126,6 +132,79 @@ describe("formatPmBoardContext", () => {
     expect(targets).toMatch(/ {2}- anton-tick [^\n]*under anton-feat "anton-feat"/);
     // The nesting shows anton-sub under the feature that RUNS it; only the line says what holds it.
     expect(targets).toMatch(/ {2}- anton-sub [^\n]*under anton-tick "anton-tick"/);
+  });
+
+  // A nested ticket's PARENT is a bead no rehome could ever name as a home (a ticket's home must be
+  // a card), so a line showing only the parent reads as a ticket hanging off a non-card — and the
+  // repair for that appearance is a proposal to flatten nesting somebody meant.
+  it("names the run target that ships a nested ticket, not just the ticket above it", () => {
+    const text = formatPmBoardContext({
+      board: [...board, bead("anton-sub", { parent: "anton-tick" })],
+      now: NOW,
+    });
+    const targets = sectionOf(text, "Run targets");
+    expect(targets).toMatch(
+      / {2}- anton-sub [^\n]*under anton-tick "anton-tick" · shipped by anton-feat "anton-feat"/,
+    );
+    // Said only where it adds something: a ticket hanging straight off its own run target repeats it.
+    expect(targets).not.toMatch(/ {2}- anton-tick [^\n]*shipped by/);
+  });
+
+  // `rehome` is a claim about a home that is WRONG, and anton refuses one about a bead with none.
+  // A parentless task/bug is a RUN TARGET, so it renders here rather than in the loose section that
+  // says as much — silence on its line read as a home the pass had merely not been told.
+  it("says outright when a run target hangs under nothing at all", () => {
+    const text = formatPmBoardContext({
+      board: [...board, bead("anton-bug", { issue_type: "bug", priority: 0 })],
+      now: NOW,
+    });
+    expect(sectionOf(text, "Run targets")).toContain(
+      "- anton-bug [bug] · P0 · under nothing (no home to be the wrong one)",
+    );
+  });
+
+  // Without the contract text the pass is left judging homes by their names, which its own contract
+  // forbids: it must either omit every home claim or guess from the shape of the words.
+  it("carries what each bead states it is for, subjects and candidate homes alike", () => {
+    const text = formatPmBoardContext({
+      board: [
+        bead("anton-home", {
+          issue_type: "epic",
+          title: "Billing",
+          description: "## Goal\n\nOwn every surface that charges a customer.\n\n## Success Criteria\n\n- billed",
+        }),
+        bead("anton-card", { issue_type: "feature", parent: "anton-home" }),
+        bead("anton-loose", {
+          issue_type: "feature",
+          // No `## Goal`: an unshaped bead still says something about itself.
+          description: "Retry a failed card charge before we drop the subscription.",
+        }),
+      ],
+      now: NOW,
+    });
+    expect(sectionOf(text, "Container epics")).toContain(
+      "goal: Own every surface that charges a customer.",
+    );
+    expect(sectionOf(text, "Run targets")).toContain(
+      "goal: Retry a failed card charge before we drop the subscription.",
+    );
+  });
+
+  it("cuts a long goal rather than carrying a whole contract per bead", () => {
+    const text = formatPmBoardContext({
+      board: [
+        bead("anton-long", {
+          issue_type: "feature",
+          description: `## Goal\n\n${"word ".repeat(200)}`,
+        }),
+      ],
+      now: NOW,
+    });
+    const goal = text.split("\n").find((l) => l.trim().startsWith("goal:")) ?? "";
+    expect(goal).toHaveLength(`  goal: `.length + MAX_GOAL_CHARS + 1);
+    expect(goal.endsWith("…")).toBe(true);
+    // The cut is only honest if the pass is told the rest of the contract is not in the prompt.
+    expect(text).toContain("is NOT in this prompt");
   });
 
   it("shows a container epic that runs nothing of its own, since it is still a candidate home", () => {
@@ -452,6 +531,14 @@ describe("detectionsFor", () => {
         /already hangs under anton-card1/,
       ],
       ["a home that is not on the board", () => rehome(ticket.id, "anton-ghost"), /not on the board/],
+      // The SUBJECT end of "which pass owns this ask". A parentless task/bug is a RUN TARGET, so it
+      // renders as one rather than in the loose section, and nothing else here stops a claim that
+      // demotes a standalone run into somebody else's child ticket. First homes are the gardener's.
+      [
+        "a bead that hangs under nothing — a first home is the gardener's ask, not this pass's",
+        () => rehome("anton-standalone", rightCard.id),
+        /hangs under nothing — giving homeless work its first home is the gardener's proposal/,
+      ],
       ["the bead itself", () => rehome(ticket.id, ticket.id), /cannot be its own home/],
       ["a home that has settled", () => rehome(ticket.id, "anton-shut"), /already settled/],
       ["a home a run is shipping", () => rehome(ticket.id, "anton-live"), /mid-run/],
@@ -542,6 +629,8 @@ describe("detectionsFor", () => {
         bead("anton-t-riding", { parent: "anton-live" }),
         bead("anton-t-selected", { parent: "anton-held" }),
         bead("anton-learn", { issue_type: "learning" }),
+        // A parentless bug: its own run target, and homeless — anton runs it exactly as it stands.
+        bead("anton-standalone", { issue_type: "bug", priority: 0 }),
       ];
       const { detections, rejected } = detectionsFor([bad()], full, NOW);
       expect(detections).toEqual([]);
