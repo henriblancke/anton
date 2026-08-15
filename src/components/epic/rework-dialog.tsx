@@ -1,7 +1,6 @@
 "use client";
 
-import { useEffect, useId, useState } from "react";
-import { toast } from "sonner";
+import { useId } from "react";
 
 import {
   MAX_REWORK_INSTRUCTIONS_CHARS,
@@ -20,6 +19,8 @@ import {
   DialogDescription,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { findingKey } from "@/components/epic/rework-draft";
+import { useReworkForm, type ReworkFormOptions } from "@/components/epic/use-rework-form";
 
 export interface ReworkDialogProps {
   slug: string;
@@ -87,97 +88,12 @@ export function ReworkDialog({
   );
 }
 
-function ReworkForm({
-  slug,
-  targetId,
-  tickets,
-  report: given,
-  onClose,
-  onReworked,
-}: {
-  slug: string;
-  targetId: string;
-  tickets: Ticket[];
-  report?: ReviewReport;
-  onClose: () => void;
-  onReworked?: (result: ReworkResult) => void;
-}) {
-  // Abandoned tickets are out of every run, so sending one back would produce work nothing picks up.
-  const candidates = tickets.filter((t) => !t.abandoned);
-  const [ticketId, setTicketId] = useState(candidates[0]?.id ?? "");
-  const [mode, setMode] = useState<ReworkMode>("reopen");
-  const [summary, setSummary] = useState("");
-  const [instructions, setInstructions] = useState("");
-  const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [fetched, setFetched] = useState<ReviewReport | null>(null);
-  const [reportError, setReportError] = useState<string | null>(null);
-  const [submitting, setSubmitting] = useState(false);
+/** A render of `useReworkForm` — the behaviour lives there, the consequences are spelled out here. */
+function ReworkForm(options: ReworkFormOptions) {
+  const form = useReworkForm(options);
   const ids = useId();
-  const report = given ?? fetched;
 
-  useEffect(() => {
-    if (given) return; // handed down by the page that already loaded it
-    let cancelled = false;
-    async function load() {
-      try {
-        const res = await fetch(`/api/projects/${slug}/epics/${targetId}/review`);
-        if (!res.ok) throw new Error(`Couldn't load the review report (${res.status})`);
-        const data = (await res.json()) as { report: ReviewReport };
-        if (!cancelled) setFetched(data.report);
-      } catch (err) {
-        // A missing report never blocks the action — the founder can still write instructions by
-        // hand, which is exactly what this replaces.
-        if (!cancelled) setReportError(err instanceof Error ? err.message : "Couldn't load the review report");
-      }
-    }
-    void load();
-    return () => {
-      cancelled = true;
-    };
-  }, [slug, targetId, given]);
-
-  const findings = report?.findings ?? [];
-  const canSubmit = !!ticketId && summary.trim().length > 0 && instructions.trim().length > 0 && !submitting;
-
-  async function submit() {
-    if (!canSubmit) return;
-    setSubmitting(true);
-    try {
-      const res = await fetch(`/api/projects/${slug}/epics/${targetId}/rework`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          ticketId,
-          mode,
-          summary: summary.trim(),
-          instructions: instructions.trim(),
-          findings: findings.filter((f) => selected.has(findingKey(f))),
-        }),
-      });
-      if (!res.ok) {
-        const body = (await res.json().catch(() => null)) as { error?: string } | null;
-        throw new Error(body?.error ?? `Sending it back failed (${res.status})`);
-      }
-      const { result } = (await res.json()) as { result: ReworkResult };
-      toast.success(
-        !result.applied
-          ? `Already sent back — ${result.reworkedId} carries these instructions`
-          : result.mode === "reopen"
-            ? `${result.ticketId} reopened with instructions`
-            : `Follow-up ${result.reworkedId} created from ${result.ticketId}`,
-        result.warning ? { description: result.warning } : undefined,
-      );
-      onReworked?.(result);
-      onClose();
-    } catch (err) {
-      // Stay open on failure so the typed instructions survive a retry (a 409 clears on its own).
-      toast.error(err instanceof Error ? err.message : "Sending it back failed");
-    } finally {
-      setSubmitting(false);
-    }
-  }
-
-  if (candidates.length === 0) {
+  if (form.candidates.length === 0) {
     return (
       <p className="py-2 text-[12.5px] text-muted-foreground">
         This run has no live tickets to send back.
@@ -187,138 +103,281 @@ function ReworkForm({
 
   return (
     <div className="flex flex-col gap-4">
-      {report && report.score !== undefined && (
-        <p className="text-[12px] text-muted-foreground">
-          Latest self-review: <span className="font-mono text-foreground">{report.score}/10</span> over{" "}
-          {report.rounds.length} round{report.rounds.length === 1 ? "" : "s"}.
-        </p>
+      <ScoreLine report={form.report} />
+
+      <TicketField
+        id={`${ids}-ticket`}
+        value={form.draft.ticketId}
+        candidates={form.candidates}
+        onChange={(ticketId) => form.patch({ ticketId })}
+      />
+
+      <ModeField
+        name={`${ids}-mode`}
+        mode={form.draft.mode}
+        onSelect={(mode) => form.patch({ mode })}
+      />
+
+      <SummaryField
+        id={`${ids}-summary`}
+        mode={form.draft.mode}
+        value={form.draft.summary}
+        onChange={(summary) => form.patch({ summary })}
+      />
+
+      <InstructionsField
+        id={`${ids}-instructions`}
+        value={form.draft.instructions}
+        onChange={(instructions) => form.patch({ instructions })}
+      />
+
+      <FindingsField
+        findings={form.findings}
+        emptyNote={
+          form.reportError ??
+          (form.reportLoading
+            ? "Loading findings…"
+            : "This run's review left no findings on the board.")
+        }
+        isSelected={form.isSelected}
+        onToggle={form.toggleFinding}
+      />
+
+      <FormActions
+        canSubmit={form.canSubmit}
+        submitting={form.submitting}
+        onCancel={options.onClose}
+        onSubmit={form.submit}
+      />
+    </div>
+  );
+}
+
+/** What the self-review settled on — the context that makes sending it back a considered call. */
+function ScoreLine({ report }: { report: ReviewReport | null }) {
+  if (!report || report.score === undefined) return null;
+  return (
+    <p className="text-[12px] text-muted-foreground">
+      Latest self-review: <span className="font-mono text-foreground">{report.score}/10</span> over{" "}
+      {report.rounds.length} round{report.rounds.length === 1 ? "" : "s"}.
+    </p>
+  );
+}
+
+function TicketField({
+  id,
+  value,
+  candidates,
+  onChange,
+}: {
+  id: string;
+  value: string;
+  candidates: Ticket[];
+  onChange: (ticketId: string) => void;
+}) {
+  return (
+    <div className="flex flex-col gap-1.5">
+      <label htmlFor={id} className="text-[11px] text-subtle">
+        Ticket
+      </label>
+      <select
+        id={id}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="h-8 rounded-lg border border-border bg-card px-2.5 text-[12.5px] text-foreground outline-none focus:border-primary/60"
+      >
+        {candidates.map((t) => (
+          <option key={t.id} value={t.id}>
+            {t.id} — {t.title}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
+}
+
+function ModeField({
+  name,
+  mode,
+  onSelect,
+}: {
+  name: string;
+  mode: ReworkMode;
+  onSelect: (mode: ReworkMode) => void;
+}) {
+  return (
+    <fieldset className="flex flex-col gap-1.5">
+      <legend className="text-[11px] text-subtle">What happened</legend>
+      <ModeOption
+        name={name}
+        value="reopen"
+        checked={mode === "reopen"}
+        onSelect={onSelect}
+        title="Acceptance not met"
+        detail="The same ticket reopens and runs again, carrying a reason. Its earlier scores stay on the rounds that produced them."
+      />
+      <ModeOption
+        name={name}
+        value="follow-up"
+        checked={mode === "follow-up"}
+        onSelect={onSelect}
+        title="Acceptance met — iterate"
+        detail="A new ticket is created, linked discovered-from this one, so the work that shipped keeps its score."
+      />
+    </fieldset>
+  );
+}
+
+/** One line: a reopen's reason, or the follow-up's title — the mode decides which it becomes. */
+function SummaryField({
+  id,
+  mode,
+  value,
+  onChange,
+}: {
+  id: string;
+  mode: ReworkMode;
+  value: string;
+  onChange: (summary: string) => void;
+}) {
+  return (
+    <div className="flex flex-col gap-1.5">
+      <label htmlFor={id} className="text-[11px] text-subtle">
+        {mode === "reopen" ? "Reason (one line)" : "Follow-up title"}
+      </label>
+      <input
+        id={id}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        maxLength={MAX_REWORK_SUMMARY_CHARS}
+        placeholder={
+          mode === "reopen" ? "Why this isn't actually done" : "What the next pass should deliver"
+        }
+        className="h-8 rounded-lg border border-border bg-card px-2.5 text-[12.5px] text-foreground outline-none placeholder:text-subtle focus:border-primary/60"
+      />
+    </div>
+  );
+}
+
+function InstructionsField({
+  id,
+  value,
+  onChange,
+}: {
+  id: string;
+  value: string;
+  onChange: (instructions: string) => void;
+}) {
+  return (
+    <div className="flex flex-col gap-1.5">
+      <label htmlFor={id} className="text-[11px] text-subtle">
+        Fix instructions
+      </label>
+      <textarea
+        id={id}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        maxLength={MAX_REWORK_INSTRUCTIONS_CHARS}
+        rows={4}
+        placeholder="What the implementer should do differently…"
+        className="w-full resize-y rounded-lg border border-border bg-card px-3 py-2.5 text-[12.5px] leading-relaxed text-foreground outline-none placeholder:text-subtle focus:border-primary/60"
+      />
+      <span className="text-[10px] text-subtle">
+        Lands as a note on the bead — the implementer reads it when it picks the ticket up.
+      </span>
+    </div>
+  );
+}
+
+function FindingsField({
+  findings,
+  emptyNote,
+  isSelected,
+  onToggle,
+}: {
+  findings: ReviewFinding[];
+  emptyNote: string;
+  isSelected: (key: string) => boolean;
+  onToggle: (key: string) => void;
+}) {
+  return (
+    <fieldset className="flex flex-col gap-1.5">
+      <legend className="text-[11px] text-subtle">Findings to attach</legend>
+      {findings.length === 0 ? (
+        <p className="text-[11.5px] text-subtle">{emptyNote}</p>
+      ) : (
+        <ul className="flex flex-col gap-1">
+          {findings.map((f) => {
+            const key = findingKey(f);
+            return (
+              <li key={key}>
+                <FindingOption
+                  finding={f}
+                  checked={isSelected(key)}
+                  onToggle={() => onToggle(key)}
+                />
+              </li>
+            );
+          })}
+        </ul>
       )}
+    </fieldset>
+  );
+}
 
-      <div className="flex flex-col gap-1.5">
-        <label htmlFor={`${ids}-ticket`} className="text-[11px] text-subtle">
-          Ticket
-        </label>
-        <select
-          id={`${ids}-ticket`}
-          value={ticketId}
-          onChange={(e) => setTicketId(e.target.value)}
-          className="h-8 rounded-lg border border-border bg-card px-2.5 text-[12.5px] text-foreground outline-none focus:border-primary/60"
+function FindingOption({
+  finding,
+  checked,
+  onToggle,
+}: {
+  finding: ReviewFinding;
+  checked: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-border/60 bg-card px-2.5 py-2 text-[12px] leading-snug hover:border-border">
+      <input type="checkbox" className="mt-0.5" checked={checked} onChange={onToggle} />
+      <span className="min-w-0">
+        <span
+          className={cn(
+            "mr-1.5 font-mono text-[10px] uppercase",
+            finding.severity === "blocking" ? "text-risk-high" : "text-subtle",
+          )}
         >
-          {candidates.map((t) => (
-            <option key={t.id} value={t.id}>
-              {t.id} — {t.title}
-            </option>
-          ))}
-        </select>
-      </div>
-
-      <fieldset className="flex flex-col gap-1.5">
-        <legend className="text-[11px] text-subtle">What happened</legend>
-        <ModeOption
-          name={`${ids}-mode`}
-          value="reopen"
-          checked={mode === "reopen"}
-          onSelect={setMode}
-          title="Acceptance not met"
-          detail="The same ticket reopens and runs again, carrying a reason. Its earlier scores stay on the rounds that produced them."
-        />
-        <ModeOption
-          name={`${ids}-mode`}
-          value="follow-up"
-          checked={mode === "follow-up"}
-          onSelect={setMode}
-          title="Acceptance met — iterate"
-          detail="A new ticket is created, linked discovered-from this one, so the work that shipped keeps its score."
-        />
-      </fieldset>
-
-      <div className="flex flex-col gap-1.5">
-        <label htmlFor={`${ids}-summary`} className="text-[11px] text-subtle">
-          {mode === "reopen" ? "Reason (one line)" : "Follow-up title"}
-        </label>
-        <input
-          id={`${ids}-summary`}
-          value={summary}
-          onChange={(e) => setSummary(e.target.value)}
-          maxLength={MAX_REWORK_SUMMARY_CHARS}
-          placeholder={
-            mode === "reopen" ? "Why this isn't actually done" : "What the next pass should deliver"
-          }
-          className="h-8 rounded-lg border border-border bg-card px-2.5 text-[12.5px] text-foreground outline-none placeholder:text-subtle focus:border-primary/60"
-        />
-      </div>
-
-      <div className="flex flex-col gap-1.5">
-        <label htmlFor={`${ids}-instructions`} className="text-[11px] text-subtle">
-          Fix instructions
-        </label>
-        <textarea
-          id={`${ids}-instructions`}
-          value={instructions}
-          onChange={(e) => setInstructions(e.target.value)}
-          maxLength={MAX_REWORK_INSTRUCTIONS_CHARS}
-          rows={4}
-          placeholder="What the implementer should do differently…"
-          className="w-full resize-y rounded-lg border border-border bg-card px-3 py-2.5 text-[12.5px] leading-relaxed text-foreground outline-none placeholder:text-subtle focus:border-primary/60"
-        />
-        <span className="text-[10px] text-subtle">
-          Lands as a note on the bead — the implementer reads it when it picks the ticket up.
+          {finding.severity}
         </span>
-      </div>
+        <span className="font-mono text-[11px] text-muted-foreground">{finding.location}</span>
+        <span className="block text-foreground/85">{finding.note}</span>
+      </span>
+    </label>
+  );
+}
 
-      <fieldset className="flex flex-col gap-1.5">
-        <legend className="text-[11px] text-subtle">Findings to attach</legend>
-        {findings.length === 0 ? (
-          <p className="text-[11.5px] text-subtle">
-            {reportError ?? "This run's review left no findings on the board."}
-          </p>
-        ) : (
-          <ul className="flex flex-col gap-1">
-            {findings.map((f) => {
-              const key = findingKey(f);
-              return (
-                <li key={key}>
-                  <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-border/60 bg-card px-2.5 py-2 text-[12px] leading-snug hover:border-border">
-                    <input
-                      type="checkbox"
-                      className="mt-0.5"
-                      checked={selected.has(key)}
-                      onChange={() => setSelected((prev) => toggle(prev, key))}
-                    />
-                    <span className="min-w-0">
-                      <span
-                        className={cn(
-                          "mr-1.5 font-mono text-[10px] uppercase",
-                          f.severity === "blocking" ? "text-risk-high" : "text-subtle",
-                        )}
-                      >
-                        {f.severity}
-                      </span>
-                      <span className="font-mono text-[11px] text-muted-foreground">{f.location}</span>
-                      <span className="block text-foreground/85">{f.note}</span>
-                    </span>
-                  </label>
-                </li>
-              );
-            })}
-          </ul>
-        )}
-      </fieldset>
-
-      <div className="flex justify-end gap-2">
-        <Button type="button" size="sm" variant="ghost" onClick={onClose} disabled={submitting}>
-          Cancel
-        </Button>
-        <Button
-          type="button"
-          size="sm"
-          onClick={submit}
-          disabled={!canSubmit}
-          title={canSubmit ? undefined : "A reason and fix instructions are required"}
-        >
-          {submitting ? "Sending back…" : "Send back"}
-        </Button>
-      </div>
+function FormActions({
+  canSubmit,
+  submitting,
+  onCancel,
+  onSubmit,
+}: {
+  canSubmit: boolean;
+  submitting: boolean;
+  onCancel: () => void;
+  onSubmit: () => void;
+}) {
+  return (
+    <div className="flex justify-end gap-2">
+      <Button type="button" size="sm" variant="ghost" onClick={onCancel} disabled={submitting}>
+        Cancel
+      </Button>
+      <Button
+        type="button"
+        size="sm"
+        onClick={onSubmit}
+        disabled={!canSubmit}
+        title={canSubmit ? undefined : "A reason and fix instructions are required"}
+      >
+        {submitting ? "Sending back…" : "Send back"}
+      </Button>
     </div>
   );
 }
@@ -359,15 +418,4 @@ function ModeOption({
       </span>
     </label>
   );
-}
-
-/** Stable identity for a finding across renders — location + note, which is what makes two distinct. */
-function findingKey(f: ReviewFinding): string {
-  return `${f.severity} ${f.location} ${f.note}`;
-}
-
-function toggle(prev: Set<string>, key: string): Set<string> {
-  const next = new Set(prev);
-  if (!next.delete(key)) next.add(key);
-  return next;
 }
