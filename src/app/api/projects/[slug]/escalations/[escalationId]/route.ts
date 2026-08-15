@@ -15,6 +15,11 @@ export const dynamic = "force-dynamic";
  * on one code path. Returns the remaining open escalations so the board panel re-renders from the
  * response instead of racing a refetch against the write.
  *
+ * The verb set does not grow with the stall class: `resume` on a wait for a PERSON is
+ * resolve-and-resume — it closes the gate and then re-enqueues the run target — because that is one
+ * decision ("I did it, carry on") and splitting it into two requests would leave the founder able to
+ * settle half of it. See escalation-actions.ts for the ordering that makes it safe.
+ *
  * 409 covers "already settled" (someone else clicked first), "nothing to act on" (a finding that
  * names neither a bead nor a job), "contested" (another machine is running the work now), and
  * "unverified" (bd couldn't confirm whether one is) — in each case the request was valid but the

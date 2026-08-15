@@ -116,6 +116,28 @@ function StuckFor({ escalation }: { escalation: EscalationView }) {
   return <>stuck {escalationAge(escalation, hydrated ? mountedAt : undefined)}</>;
 }
 
+/**
+ * What the row's buttons act on. A wait on a person is answered on its GATE — that is the stall, and
+ * closing it is a settling move whether or not anton has a run to re-queue behind it.
+ */
+function actionTarget(escalation: EscalationView): "work" | "job" | "gate" {
+  if (escalation.kind === "needs-human" && escalation.gateId) return "gate";
+  if (escalation.beadId === undefined && escalation.epicBeadId === undefined) return "job";
+  return "work";
+}
+
+/**
+ * Whether the row's primary verb has anything to act on. A gate wait needs only the gate: it may
+ * block work anton doesn't run at all (a molecule step, someone else's bead), and the person is
+ * being waited on either way.
+ */
+function canResume(escalation: EscalationView): boolean {
+  if (escalation.kind === "needs-human") return escalation.gateId !== undefined;
+  // A stale PR waits on a reviewer, so a resume would settle the row and change nothing.
+  if (escalation.kind === "stale-pr") return false;
+  return escalation.epicBeadId !== undefined || escalation.jobId !== undefined;
+}
+
 /** One escalation, with the affordance the founder answers it with: Resume, Dismiss, or Abandon. */
 function EscalationRow({ slug, escalation }: { slug: string; escalation: EscalationView }) {
   return (
@@ -163,19 +185,16 @@ function EscalationRow({ slug, escalation }: { slug: string; escalation: Escalat
           open for review, so re-running the epic changes nothing about the PR (execute-epic
           short-circuits on an open one) — the row would settle and the next sweep would raise it
           again. What it needs is a reviewer, which is the founder's move, and the PR link above
-          is how they take it. */}
+          is how they take it. Dismiss is offered THERE and nowhere else: a wait on a person is
+          not something to acknowledge and leave open, so its answers are resolve-and-resume (the
+          founder did the thing) or abandon (they won't). */}
       <EscalationActions
         slug={slug}
         escalationId={escalation.id}
-        canResume={
-          escalation.kind !== "stale-pr" &&
-          (escalation.epicBeadId !== undefined || escalation.jobId !== undefined)
-        }
+        canResume={canResume(escalation)}
         canDismiss={escalation.kind === "stale-pr"}
         canAbandon={escalation.beadId !== undefined || escalation.jobId !== undefined}
-        target={
-          escalation.beadId === undefined && escalation.epicBeadId === undefined ? "job" : "work"
-        }
+        target={actionTarget(escalation)}
       />
     </>
   );

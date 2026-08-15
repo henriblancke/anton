@@ -134,6 +134,24 @@ describe("EscalationStrip", () => {
     expect(screen.getByText("Resume")).toBeTruthy();
   });
 
+  it("answers a wait on a person with resolve-and-resume, and never with Dismiss", () => {
+    // Dismiss would settle the row while leaving the gate open — an acknowledged wait that nothing
+    // ends, re-raised on every sweep. Abandon stays: "I'm not doing this" is a real answer.
+    renderStrip([escalation({ kind: "needs-human", gateId: "g-1", runId: undefined })]);
+    expect(screen.getByText("Resolve & resume")).toBeTruthy();
+    expect(screen.queryByText("Dismiss")).toBeNull();
+    expect(screen.getByText("Abandon")).toBeTruthy();
+  });
+
+  it("still offers the resolve when the gate blocks work anton doesn't run", () => {
+    // No run target above the gated bead, so there is nothing to re-enqueue — but the person is
+    // still being waited on, and only they can end it.
+    renderStrip([
+      escalation({ kind: "needs-human", gateId: "g-1", epicBeadId: undefined, runId: undefined }),
+    ]);
+    expect(screen.getByText("Resolve & resume")).toBeTruthy();
+  });
+
   it("offers job-level answers for a stall that names no bead at all", () => {
     renderStrip([
       escalation({

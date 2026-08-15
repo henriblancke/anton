@@ -820,6 +820,24 @@ describe("non-resumable parks produce exactly one escalation and no enqueue", ()
     expect(jobRows()).toEqual([]); // a human gate is never auto-resumed
   });
 
+  it("names NO run target for a gate hung on work anton doesn't run", async () => {
+    // A founder can gate anything — a molecule step, a bead this board read doesn't carry — and the
+    // detector reports that wait with no `targetBeadId`. Falling back to the gated bead would point
+    // resolve-and-resume at something execute-epic cannot run; empty lets it close the gate and stop.
+    await seedReport({
+      kind: "needs-human",
+      key: "needs-human:g-2",
+      reason: "waiting on a human 1h: no reason recorded on the gate",
+      since: NOW - HOUR,
+      ageMs: HOUR,
+      gateId: "g-2",
+      beadId: "step-3",
+    });
+
+    expect(await sweep()).toMatchObject({ findings: 1, escalated: 1 });
+    expect(escalationRows()[0]).toMatchObject({ beadId: "step-3", epicBeadId: null });
+  });
+
   it("raises a fresh escalation once a resolved one no longer covers the stall", async () => {
     // The open-only partial index is what allows this: a stall that recurs after the founder settled
     // it must be able to reach them again rather than being silenced by its own history.

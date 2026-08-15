@@ -22,6 +22,16 @@
  * list's own resume/cancel. Without that last path such an escalation would have no settling move at
  * all and would sit on the board forever.
  *
+ * A wait on a PERSON (`needs-human`) is the one stall whose answer is not really about the run: it
+ * hangs on a gate, so both verbs close the gate as well as acting on the work. Resume is
+ * resolve-and-resume — "I did it, carry on" — and closes the gate FIRST, because execute-epic
+ * re-reads the board and a run enqueued against an open gate simply parks on the same wait again.
+ * Abandon closes the gate LAST, after the bead: a gate that closes over an open bead hands the work
+ * straight back to gate-check's own resume, which is the opposite of an abandon. Either way the gate
+ * must close, because it is not on the bead's lifecycle — left open it keeps `detectOpenHumanGates`
+ * raising this same escalation every sweep, against work that has since been settled. Dismiss is
+ * deliberately NOT offered: a wait on a person is not something to acknowledge and leave open.
+ *
  * `dismiss` is the third answer, and the honest one for a STALE PR: the work is already delivered
  * and open for review, so execute-epic's PR short-circuit makes a resume a no-op — it would settle
  * the escalation while changing nothing about the PR, and the next sweep would raise it again. What
@@ -100,10 +110,19 @@ export async function actOnEscalation(
     return { ok: true, action, escalation: view, detail: "dismissed" };
   }
 
+  // The gate a wait on a person hangs on. Both verbs close it (see the module note), and it is a
+  // settling move in its own right: a gate can block work anton doesn't run, and that wait still
+  // ends when the person says it does.
+  const gateId = view.gateId;
+
   const target = action === "resume" ? view.epicBeadId : view.beadId;
   // No bead to act on falls back to the job the stall named — an alert with no settling move is an
   // alert that trains the operator to ignore the panel.
-  if (!target && !view.jobId) return { ok: false, reason: "no-target" };
+  if (!target && !view.jobId && !gateId) return { ok: false, reason: "no-target" };
+
+  // The work the verb still has to act on, once the board has been re-read: cleared when the work
+  // settled itself since the sweep froze this stall, which for a gate wait leaves the gate.
+  let liveTarget = target;
 
   // The escalation froze the stall as the sweep saw it; a bead-backed verb is applied later, by
   // hand. Re-check that the work is still stopped first — before the settle, so a refusal leaves the
@@ -133,11 +152,18 @@ export async function actOnEscalation(
     // strand this escalation with no move that could ever retire it, and the detail says plainly
     // which way the work ended and that nothing was restarted.
     if (state === "gone" || state === "closed") {
-      if (!(await settleEscalation(db, systemClock, escalationId, "dismissed"))) {
-        return { ok: false, reason: "not-open" };
+      // A wait on a person outlives the work it blocked: the gate is still open, and only a person
+      // closes it. So a gate wait falls through to the settle and the act below with nothing left to
+      // resume or abandon — otherwise the gate would keep raising this escalation forever, and every
+      // answer to it would report "nothing to act on".
+      if (!gateId) {
+        if (!(await settleEscalation(db, systemClock, escalationId, "dismissed"))) {
+          return { ok: false, reason: "not-open" };
+        }
+        const detail = state === "gone" ? "target-gone" : "target-closed";
+        return { ok: true, action, escalation: view, detail };
       }
-      const detail = state === "gone" ? "target-gone" : "target-closed";
-      return { ok: true, action, escalation: view, detail };
+      liveTarget = undefined;
     }
   }
 
@@ -146,10 +172,14 @@ export async function actOnEscalation(
     return { ok: false, reason: "not-open" };
   }
 
+  const apply = (): Promise<string> => {
+    if (gateId) return answerGateWait(project, action, view, gateId, liveTarget);
+    if (liveTarget) return actOnBead(project, action, view, liveTarget);
+    return actOnJob(project.id, action, view.jobId!);
+  };
+
   try {
-    const detail = target
-      ? await actOnBead(project, action, view, target)
-      : await actOnJob(project.id, action, view.jobId!);
+    const detail = await apply();
     return { ok: true, action, escalation: view, detail };
   } catch (e) {
     // The abandon's own boundary check caught a resume that landed after the settle: it refused
@@ -165,7 +195,9 @@ export async function actOnEscalation(
     }
     // Settled but not acted: the route answers 500, and the row is already gone from the panel, so
     // this line is the only place the two halves of that state meet. The stall itself isn't lost —
-    // it is still in the next run-health report, which raises it again.
+    // it is still in the next run-health report, which raises it again. A gate wait whose resolve
+    // landed and whose resume then failed is recovered by the other pass instead: a closed gate over
+    // runnable work is precisely what gate-check's `plainGateResumes` dispatches.
     console.error(
       `[unstick] escalation ${escalationId} was settled as ${resolutionOf(action)} but the ` +
         `${action} failed — the stall is unchanged and re-surfaces on the next run-health sweep`,
@@ -311,6 +343,65 @@ async function actOnBead(
   await abandonTicket(project, target, reason, { requireStopped: true });
   await settleAbandonedWork(project.id, view, reason);
   return "abandoned";
+}
+
+/**
+ * Both answers to a wait on a person — the founder's "I did it, carry on" and their "this isn't
+ * happening" — which share one act: closing the gate. Neither answer is complete without it (see the
+ * module note), and the ORDER around the work is what makes each of them mean what it says.
+ *
+ * Resume closes the gate first: execute-epic re-reads the board, so a run enqueued while the gate is
+ * still open just parks on the same wait. Abandon closes it last: a gate that closes over a still-open
+ * bead is exactly what gate-check's `plainGateResumes` dispatches, so it would hand the work back at
+ * the moment the founder said to stop.
+ *
+ * `target` is absent when the gate blocks nothing anton runs — a molecule step, a bead this board read
+ * doesn't carry — or when that work settled itself since the sweep. Closing the gate is then the whole
+ * answer: the wait was on the person either way.
+ */
+async function answerGateWait(
+  project: Project,
+  action: EscalationAction,
+  view: EscalationView,
+  gateId: string,
+  target?: string,
+): Promise<string> {
+  if (action === "abandon") {
+    const detail = target ? await actOnBead(project, action, view, target) : undefined;
+    await resolveGate(project.repoPath, gateId, gateReason(view, action));
+    return detail ?? "gate-resolved";
+  }
+  await resolveGate(project.repoPath, gateId, gateReason(view, action));
+  if (!target) return "gate-resolved";
+  // Reuses the automatic path's own verb, so a resolve-and-resume and a gate-check resume of the
+  // same target are the same idempotent call — whichever lands second is absorbed as a no-op.
+  return resumeStalledEpic(project.id, target);
+}
+
+/** What bd records on the gate: which answer ended the wait, traceable back to the row that asked. */
+function gateReason(view: EscalationView, action: EscalationAction): string {
+  const verb = action === "abandon" ? "the work was abandoned" : "resolved";
+  return `Wait ended from the anton board (${verb}) — escalation ${view.id.slice(0, 8)}`;
+}
+
+/**
+ * Close the gate, treating one that is already closed as done rather than as a failure.
+ *
+ * Measured on bd 1.1.2: `bd gate resolve` is idempotent — resolving a closed gate exits 0 — so the
+ * ordinary "someone got there first" case (the founder ran `bd gate resolve` themselves, another
+ * operator clicked, another machine synced it in) needs no special handling at all. What DOES fail is
+ * a gate that no longer exists, and that is the same end state: the wait is over. So a failure is
+ * re-judged against the gate itself, and only kept when the gate is provably still there and still
+ * open — or when bd could not answer, which proves nothing either way (see {@link BeadRead}).
+ */
+async function resolveGate(repoPath: string, gateId: string, reason: string): Promise<void> {
+  try {
+    await beads.gateResolve(repoPath, gateId, reason);
+  } catch (e) {
+    const gate = await readBead(repoPath, gateId);
+    if (gate === "missing" || (gate !== "unreadable" && gate.status === "closed")) return;
+    throw e;
+  }
 }
 
 /**

@@ -164,6 +164,35 @@ describe("EscalationActions — what the escalation can support", () => {
     );
   });
 
+  it("names the gate, not the run, when the wait is on a person", async () => {
+    // "Resume" would misdescribe it: the founder is answering "I did the thing you asked", and the
+    // re-queue is the consequence, not the decision.
+    const fetchMock = stubFetch({ action: "resume", detail: "enqueued" });
+    mount({ target: "gate" });
+
+    expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Resolve & resume" }));
+
+    await waitFor(() => expect(refresh).toHaveBeenCalled());
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/projects/anton/escalations/esc-1",
+      expect.objectContaining({ body: JSON.stringify({ action: "resume" }) }),
+    );
+  });
+
+  it("says plainly when closing the gate was the whole answer", async () => {
+    stubFetch({ action: "resume", detail: "gate-resolved" });
+    mount({ target: "gate" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Resolve & resume" }));
+
+    await waitFor(() =>
+      expect(success).toHaveBeenCalledWith(
+        "Gate closed — the wait is over; there was no run left to restart",
+      ),
+    );
+  });
+
   it("locks both buttons while a decision is in flight, so one click means one action", async () => {
     stubFetch({ action: "resume", detail: "enqueued" });
     mount();

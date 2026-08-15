@@ -40,6 +40,11 @@ export interface EscalationView {
   beadId?: string;
   /** The epic a resume re-enqueues — jobs are keyed by epic, not by the ticket that stalled. */
   epicBeadId?: string;
+  /**
+   * The human gate a `needs-human` wait hangs on — what resolve-and-resume closes (see
+   * escalation-actions.ts). Absent on every other kind: nothing else stalls on a gate.
+   */
+  gateId?: string;
   runId?: string;
   jobId?: string;
   prNumber?: number;
@@ -87,6 +92,8 @@ export function toEscalationView(row: EscalationRow): EscalationView {
     reason: row.reason,
     beadId: row.beadId ?? undefined,
     epicBeadId: row.epicBeadId ?? undefined,
+    // No column of its own: the gate is evidence the detector recorded, like the PR pointers below.
+    gateId: typeof evidence.gateId === "string" ? evidence.gateId : undefined,
     runId: row.runId ?? undefined,
     jobId: row.jobId ?? undefined,
     prNumber: typeof evidence.prNumber === "number" ? evidence.prNumber : undefined,

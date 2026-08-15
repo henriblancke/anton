@@ -680,11 +680,18 @@ async function exhaustedJobStillStuck(
  * finding names the ticket, but jobs are keyed by epic); otherwise the run target the detector
  * resolved, falling back to the finding's own bead — which for a stale PR or a dead lease IS the
  * run target.
+ *
+ * NO fallback for a human gate, which is the one kind whose bead is arbitrary: a founder may hang
+ * one on a molecule step or on anything else anton never dispatches, and `detectOpenHumanGates`
+ * reports that wait with no `targetBeadId` precisely because there is no run target above it.
+ * Falling back would point the resume at a bead execute-epic cannot run; leaving it undefined lets
+ * resolve-and-resume close the gate and stop there (see escalation-actions.ts).
  */
 function epicBeadIdFor(finding: RunHealthFinding, ctx: UnstickContext): string | undefined {
   if (finding.kind === "parked-run" && finding.runId) {
     return ctx.parkedRuns.get(finding.runId)?.epicBeadId;
   }
+  if (finding.kind === "needs-human") return finding.targetBeadId;
   return finding.targetBeadId ?? finding.beadId;
 }
 
