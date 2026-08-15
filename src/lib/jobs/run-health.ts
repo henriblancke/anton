@@ -25,7 +25,7 @@ import {
 } from "../projects";
 import { listRunsByStatus, type RunRow } from "../runs";
 import { saveRunHealthReport, type RunHealthFinding } from "../run-health";
-import { PoisonError } from "./errors";
+import { poisonBlockerIds, PoisonError } from "./errors";
 import { beadBlockedByGate, runTargetAbove } from "./gate-targets";
 import {
   activeExecuteEpicKeys,
@@ -329,6 +329,33 @@ export function detectOpenHumanGates(
   return findings;
 }
 
+/**
+ * Drop the `exhausted-job` findings that are the SAME wait an open human gate already reports.
+ *
+ * A gate hung on work whose execute-epic job was ALREADY queued poison-parks that job on the gate
+ * (execute-epic's readiness re-check), so the sweep sees the stall twice: once as the gate, once as
+ * the job that refused to start because of it. Reported both ways it raises two escalations for one
+ * wait — and only the gate row is reconciled when the wait ends, so the "retries spent" row survives
+ * as a false failure with a stale Abandon on it long after the run resumed.
+ *
+ * The gate wait is the RIGHT half to keep: it names what a human actually does about it, and its
+ * resolve-and-resume restarts the parked job on the way through.
+ *
+ * Suppressed only when EVERY blocker the park names is one of those gates. A job also held back by
+ * an ordinary prerequisite outlives the gate being answered, and nothing else would surface it.
+ */
+export function withoutGateBlockedJobs(findings: RunHealthFinding[]): RunHealthFinding[] {
+  const openGateIds = new Set(
+    findings.flatMap((f) => (f.kind === "needs-human" && f.gateId ? [f.gateId] : [])),
+  );
+  if (openGateIds.size === 0) return findings;
+  return findings.filter((finding) => {
+    if (finding.kind !== "exhausted-job") return true;
+    const blockers = poisonBlockerIds(finding.reason);
+    return !blockers?.every((id) => openGateIds.has(id));
+  });
+}
+
 /** The `epicBeadId` a job payload targets, so an exhausted job links to the work it stranded. */
 function epicBeadIdOf(payloadJson: string | null): string | undefined {
   try {
@@ -392,7 +419,9 @@ export function makeRunHealthHandler(deps: RunHealthDeps): JobHandler {
       activeExecuteEpicKeys(db),
     ]);
 
-    const findings: RunHealthFinding[] = [
+    // Deduped across detectors before anything acts on them: a job that poison-parked ON one of
+    // these gates is that gate's wait, not a second stall (see {@link withoutGateBlockedJobs}).
+    const findings: RunHealthFinding[] = withoutGateBlockedJobs([
       ...detectParkedRuns(
         parkedRuns,
         nowMs,
@@ -406,7 +435,7 @@ export function makeRunHealthHandler(deps: RunHealthDeps): JobHandler {
       }),
       ...detectExhaustedJobs(settledJobs, maxAttempts, nowMs),
       ...detectOpenHumanGates(gates, board, nowMs),
-    ];
+    ]);
 
     await ctx.heartbeat();
     findings.push(

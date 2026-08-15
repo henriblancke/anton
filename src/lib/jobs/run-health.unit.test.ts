@@ -15,9 +15,12 @@ import {
   detectStalePrs,
   inReviewTargets,
   settledExecuteEpicJobsByEpic,
+  withoutGateBlockedJobs,
   type InReviewPr,
 } from "./run-health";
-import { sortFindings } from "../run-health";
+import { blockedByPoison } from "./errors";
+import { POISON_PARK_PREFIX } from "./runner";
+import { sortFindings, type RunHealthFinding } from "../run-health";
 import type { RunRow } from "../runs";
 import type { JobRow } from "./queue";
 
@@ -482,5 +485,67 @@ describe("inReviewTargets", () => {
       bead("feat", { issue_type: "feature", parent: "container" }),
     ];
     expect(inReviewTargets(board)).toEqual([]);
+  });
+});
+
+describe("withoutGateBlockedJobs", () => {
+  /** The park a run takes when execute-epic's readiness re-check finds an open blocker. */
+  function blockedPark(...blockers: string[]): JobRow {
+    return job("j-1", {
+      attempts: 1,
+      lastError: `${POISON_PARK_PREFIX} ${blockedByPoison("e-1", blockers).message}`,
+    });
+  }
+
+  const gateWait = (gateId: string): RunHealthFinding => ({
+    kind: "needs-human",
+    key: `needs-human:${gateId}`,
+    reason: "waiting on a human 3h: needs a design call",
+    since: NOW - 3 * HOUR,
+    ageMs: 3 * HOUR,
+    gateId,
+  });
+
+  it("drops the job a gate poison-parked — one wait must not raise two escalations", () => {
+    // A gate hung after the job was queued parks it on that gate, so both detectors see the SAME
+    // stall. Reported twice, resolve-and-resume settles only the gate row and leaves the "retries
+    // spent" one open as a false failure with a stale Abandon on it.
+    const findings = [
+      ...detectExhaustedJobs([blockedPark("g-1")], 3, NOW),
+      gateWait("g-1"),
+    ];
+    expect(withoutGateBlockedJobs(findings).map((f) => f.kind)).toEqual(["needs-human"]);
+  });
+
+  it("keeps a job also held by an ordinary prerequisite — answering the gate won't free it", () => {
+    const findings = [
+      ...detectExhaustedJobs([blockedPark("g-1", "anton-dep")], 3, NOW),
+      gateWait("g-1"),
+    ];
+    expect(withoutGateBlockedJobs(findings).map((f) => f.kind)).toEqual([
+      "exhausted-job",
+      "needs-human",
+    ]);
+  });
+
+  it("keeps a job blocked by a DIFFERENT gate than the one waiting on a human", () => {
+    const findings = [...detectExhaustedJobs([blockedPark("g-2")], 3, NOW), gateWait("g-1")];
+    expect(withoutGateBlockedJobs(findings)).toHaveLength(2);
+  });
+
+  it("keeps every other poison park — only a blocker refusal is the gate's own wait", () => {
+    const other = job("j-2", {
+      attempts: 1,
+      lastError: `${POISON_PARK_PREFIX} agent 'svelte' is disabled for this project`,
+    });
+    const findings = [...detectExhaustedJobs([other], 3, NOW), gateWait("g-1")];
+    expect(withoutGateBlockedJobs(findings)).toHaveLength(2);
+  });
+
+  it("reports the blocked job again once the gate is gone — nothing else surfaces it", () => {
+    // The mirror case: a gate resolved off-board (`bd gate resolve`) with no resume leaves the job
+    // parked, and with no gate wait left to speak for it the finding has to come back.
+    const findings = detectExhaustedJobs([blockedPark("g-1")], 3, NOW);
+    expect(withoutGateBlockedJobs(findings).map((f) => f.kind)).toEqual(["exhausted-job"]);
   });
 });
