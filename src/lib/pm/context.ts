@@ -356,11 +356,25 @@ function beadLine(
     blockedByOf(bead, index),
     ...extras,
     scoresOf(bead, input.scores),
-    isInFlight(bead, input.now) ? "IN FLIGHT — a run owns it, do not propose against it" : undefined,
+    ownedBy(bead, input.now),
     beads.isDeferred(bead) ? "deferred" : undefined,
   ].filter((f): f is string => f !== undefined);
   return `${indent}- ${bead.id} ${facts.join(" · ")} — ${oneLine(bead.title ?? "")}`;
 }
+
+/**
+ * "A run owns this", in both halves — a published lease, and the claim a lease has not caught up to
+ * yet. Shown because a proposal against either is refused at filing time ({@link subjectRefusal},
+ * {@link rehomeRefusal}); a session that cannot see the claim spends its judgment on asks the board
+ * will throw away.
+ */
+const ownedBy = (bead: Bead, nowMs: number): string | undefined => {
+  if (isInFlight(bead, nowMs)) return "IN FLIGHT — a run owns it, do not propose against it";
+  if (isClaimed(bead)) {
+    return `CLAIMED by ${runClaimOf(bead)} — a run has picked it up, do not propose against it`;
+  }
+  return undefined;
+};
 
 const sizeOf = (bead: Bead): string | undefined => {
   const size = labelValueOf(bead.labels, "size");
@@ -721,6 +735,13 @@ function rehomeRefusal(claim: PmClaim, index: BoardIndex, nowMs: number): string
   if (homeId === claim.bead) return `${claim.bead} cannot be its own home`;
   if ((beads.parentOf(subject) ?? "") === homeId) {
     return `${claim.bead} already hangs under ${homeId} — the move would write nothing`;
+  }
+  // The subject's half of "a run owns it". `subjectRefusal` asks only `isInFlight`, which cannot see
+  // a claim: a run working a ticket writes the assignee and `in_progress` onto it while the run-lease
+  // lives on the CARD above, so the ticket reads as free work there. Moved out of that run's ticket
+  // set, its commit lands in the old card's PR while the bead hangs off the new one, open and unrun.
+  if (isClaimed(subject)) {
+    return `${claim.bead} is held by ${runClaimOf(subject)} — that run is shipping it under its current home, so moving it now would leave the bead and the work it ships in two different places`;
   }
   const home = index.byId.get(homeId);
   if (!home) return `${homeId} is not on the board`;

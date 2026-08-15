@@ -198,6 +198,17 @@ describe("formatPmBoardContext", () => {
     expect(formatPmBoardContext({ board: [live], now: NOW })).toContain("IN FLIGHT");
   });
 
+  // The other half of "a run owns it": a claim the run-lease has not caught up to. No liveness signal
+  // sees it, so without the flag the pass reads a ticket a machine is working as free work.
+  it("marks work a run has claimed but not yet leased", () => {
+    const held = bead("anton-held", {
+      issue_type: "feature",
+      status: "in_progress",
+      assignee: "runner-7",
+    });
+    expect(formatPmBoardContext({ board: [held], now: NOW })).toContain("CLAIMED by runner-7");
+  });
+
   it("says what a cap dropped, so absence never reads as an empty board", () => {
     const many = Array.from({ length: 80 }, (_, i) =>
       bead(`anton-f${String(i).padStart(2, "0")}`, { issue_type: "feature" }),
@@ -444,6 +455,15 @@ describe("detectionsFor", () => {
         /is held by runner-7/,
       ],
       ["a home that is itself a proposal", () => rehome(ticket.id, "anton-prop"), /is a proposal/],
+      // The SUBJECT end of the same bar. A run working a ticket writes the assignee and
+      // `in_progress` onto it while the run-lease lives on the card above, so `subjectRefusal`'s
+      // liveness check waves it through — and a move out of that run's ticket set lands the commit
+      // in the old card's PR while the bead hangs off the new one.
+      [
+        "a bead a run has claimed but not yet leased",
+        () => rehome("anton-t-held", rightCard.id),
+        /anton-t-held is held by runner-3/,
+      ],
       // The tier taxonomy, asked through apply's own homeWrongTier so the filing check and the
       // approve check cannot disagree about which homes are legal.
       [
@@ -481,6 +501,12 @@ describe("detectionsFor", () => {
         }),
         bead("anton-prop", { issue_type: "feature", labels: ["pm:low-value:0123456789ab"] }),
         bead("anton-lone", { issue_type: "epic" }),
+        // A ticket a run has picked up: the claim lives on it, the lease on the card it rides.
+        bead("anton-t-held", {
+          parent: wrongCard.id,
+          status: "in_progress",
+          assignee: "runner-3",
+        }),
       ];
       const { detections, rejected } = detectionsFor([bad()], full, NOW);
       expect(detections).toEqual([]);
