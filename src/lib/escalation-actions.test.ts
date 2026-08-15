@@ -1140,6 +1140,84 @@ describe("actOnEscalation — a wait on a person", () => {
     expect(beadsTag).toHaveBeenCalledWith(project.repoPath, "g-1", [GATE_RESUMED_LABEL]);
   });
 
+  /** bd's answer for the frozen ancestor, with every other bead reading as the ordinary epic. */
+  function showsFrozenEpicAs(answer: Bead | Error) {
+    beadsShow.mockImplementation(async (_repo, id) => {
+      if (id !== "anton-e1") return bead();
+      if (answer instanceof Error) throw answer;
+      return answer;
+    });
+  }
+
+  it("resumes the bead's new home when the ancestor the sweep froze was DELETED", async () => {
+    // The reparenting case the pre-settle read hides: the frozen `epicBeadId` is gone, so that half
+    // reads "nothing left to act on" — while the gate's own `blocks` edge still names a ticket whose
+    // new home anton runs. Deciding from the settled pointer would resolve the gate and restart
+    // nothing, which is not what "Resolve & resume" says it does.
+    showsFrozenEpicAs(
+      Object.assign(new Error("Command failed"), {
+        stderr: 'Error: no issue found matching "anton-e1"\n',
+      }),
+    );
+    loadAllIssues.mockResolvedValue(reparentedBoard().filter((b) => b.id !== "anton-e1"));
+
+    expect(await actOnEscalation(project, (await openGateWait()).id, "resume")).toMatchObject({
+      ok: true,
+      detail: "enqueued",
+    });
+    expect(resumeStalledEpic).toHaveBeenCalledWith("p1", "anton-e2");
+    expect(beadsTag).toHaveBeenCalledWith(project.repoPath, "g-1", [GATE_RESUMED_LABEL]);
+  });
+
+  it("resumes it when that ancestor was CLOSED by hand too — same dropped pointer", async () => {
+    showsFrozenEpicAs({ ...bead(), status: "closed" } as Bead);
+    loadAllIssues.mockResolvedValue(
+      reparentedBoard().map((b) => (b.id === "anton-e1" ? ({ ...b, status: "closed" } as Bead) : b)),
+    );
+
+    expect(await actOnEscalation(project, (await openGateWait()).id, "resume")).toMatchObject({
+      ok: true,
+      detail: "enqueued",
+    });
+    expect(resumeStalledEpic).toHaveBeenCalledWith("p1", "anton-e2");
+    expect(resumeStalledEpic).not.toHaveBeenCalledWith("p1", "anton-e1");
+  });
+
+  it("re-derives even when the sweep could map the gate to no run target at all", async () => {
+    // `epicBeadId` is empty by construction when the sweep's board read found nothing anton runs
+    // above the gated bead. A reparent since then is exactly what gives it one, and the gate's own
+    // edge is the only pointer to it either way.
+    loadAllIssues.mockResolvedValue(reparentedBoard());
+    const escalation = await openGateWait({ epicBeadId: undefined });
+
+    expect(await actOnEscalation(project, escalation.id, "resume")).toMatchObject({
+      ok: true,
+      detail: "enqueued",
+    });
+    expect(resumeStalledEpic).toHaveBeenCalledWith("p1", "anton-e2");
+    expect(beadsTag).toHaveBeenCalledWith(project.repoPath, "g-1", [GATE_RESUMED_LABEL]);
+  });
+
+  it("applies that same dispatch rule to the new home when the frozen one is gone", async () => {
+    // A re-derived target is not a licence to run it: the board's own predicate still decides, and a
+    // dropped pointer leaves nothing to fall back on that could say otherwise.
+    showsFrozenEpicAs(
+      Object.assign(new Error("Command failed"), {
+        stderr: 'Error: no issue found matching "anton-e1"\n',
+      }),
+    );
+    loadAllIssues.mockResolvedValue(
+      reparentedBoard({ labels: [] }).filter((b) => b.id !== "anton-e1"),
+    );
+
+    expect(await actOnEscalation(project, (await openGateWait()).id, "resume")).toMatchObject({
+      ok: true,
+      detail: "gate-still-blocked",
+    });
+    expect(resumeStalledEpic).not.toHaveBeenCalled();
+    expect(beadsTag).not.toHaveBeenCalled();
+  });
+
   it("applies the dispatch rule to the target the gate moved to, not the one it left", async () => {
     // The frozen ancestor is approved and clear; the bead's new home is not. Reading approval off the
     // stale pointer would enqueue work the founder never approved.

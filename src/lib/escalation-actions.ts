@@ -180,9 +180,11 @@ export async function actOnEscalation(
     // which way the work ended and that nothing was restarted.
     if (state === "gone" || state === "closed") {
       // A wait on a person outlives the work it blocked: the gate is still open, and only a person
-      // closes it. So a gate wait falls through to the settle and the act below with nothing left to
-      // resume or abandon — otherwise the gate would keep raising this escalation forever, and every
-      // answer to it would report "nothing to act on".
+      // closes it. So a gate wait falls through to the settle and the act below — otherwise the gate
+      // would keep raising this escalation forever, and every answer to it would report "nothing to
+      // act on". What is dropped here is the FROZEN pointer, not the answer: the gate is still a live
+      // pointer of its own, so the resume re-derives what it releases now (see {@link gateDispatch}),
+      // which after a reparent is a run target this settled ancestor says nothing about.
       if (!gateId) {
         if (!(await settleEscalation(db, systemClock, escalationId, "dismissed"))) {
           return { ok: false, reason: "not-open" };
@@ -382,11 +384,13 @@ async function actOnBead(
  * bead is exactly what gate-check's `plainGateResumes` dispatches, so it would hand the work back at
  * the moment the founder said to stop.
  *
- * `target` is absent when the gate blocks nothing anton runs — a molecule step, a bead this board read
- * doesn't carry — or when that work settled itself since the sweep. Closing the gate is then the whole
- * answer: the wait was on the person either way. When it IS present it is the escalation's frozen
- * pointer, so the resume asks the live board which target the gate releases now ({@link gateDispatch})
- * before enqueueing anything.
+ * `target` is the escalation's frozen pointer and only ever a HINT: absent when the gate blocks nothing
+ * anton runs — a molecule step, a bead this board read doesn't carry — and dropped when that work
+ * settled itself since the sweep. Either way the resume still asks the live board which target the gate
+ * releases NOW ({@link gateDispatch}) before deciding there is nothing to restart: the gate's own
+ * `blocks` edge outlives the ancestor the sweep froze, so a bead reparented out from under a since-closed
+ * epic still has a run target, and that is the one this answer releases. Closing the gate is the whole
+ * answer only when that read finds nothing — the wait was on the person either way.
  */
 async function answerGateWait(
   project: Project,
@@ -401,7 +405,6 @@ async function answerGateWait(
     return detail ?? "gate-resolved";
   }
   await resolveGate(project, gateId, gateReason(view, action));
-  if (!target) return "gate-resolved";
   const dispatch = await gateDispatch(project, gateId, target);
   if (dispatch.verdict === "nothing") {
     console.info(
@@ -410,8 +413,9 @@ async function answerGateWait(
     return "gate-resolved";
   }
   if (dispatch.verdict === "hold") {
+    const on = dispatch.target ? ` on ${dispatch.target}` : "";
     const note =
-      `[unstick] gate resolved on ${dispatch.target}, but ${dispatch.reason} — not resuming; ` +
+      `[unstick] gate resolved${on}, but ${dispatch.reason} — not resuming; ` +
       `gate-check dispatches it once the board reads clear`;
     // A board that didn't answer is an anomaly worth the louder level; a board that answered "not
     // yet" is the feature working.
@@ -430,12 +434,14 @@ async function answerGateWait(
  * What the resolve-and-resume does next, decided against the LIVE board:
  *   • `run`     — this is the run target the gate now releases, and the board says it may run. `gates`
  *                 is every closed gate that one run hands back (see {@link markGatesResumed}).
- *   • `hold`    — it may not, and why (with `unread` when the board itself is what didn't answer).
+ *   • `hold`    — it may not, and why (with `unread` when the board itself is what didn't answer). The
+ *                 target is unnamed when the board went unread AND the escalation left no pointer to
+ *                 name it by.
  *   • `nothing` — the gate no longer releases anything anton runs, so there is nothing to resume.
  */
 type GateDispatch =
   | { verdict: "run"; target: string; gates: string[] }
-  | { verdict: "hold"; target: string; reason: string; unread?: boolean }
+  | { verdict: "hold"; target?: string; reason: string; unread?: boolean }
   | { verdict: "nothing" };
 
 /**
@@ -453,7 +459,12 @@ type GateDispatch =
  * The frozen target stands in only when this read cannot map the gate to a bead at all — no mapping
  * means gate-check has nothing to release either, so deferring would strand the founder's answer
  * rather than hand it on. A mapping that lands on NO run target IS an answer (the gate was moved onto
- * work anton doesn't run), and holds nothing back.
+ * work anton doesn't run), and holds nothing back. And it may be absent altogether — the escalation
+ * named no run target, or the one it named has since been deleted or closed by hand — which is
+ * exactly why this read runs even then: the gate's `blocks` edge outlives that ancestor, so a bead
+ * reparented off a settled epic still has a run target above it, and reading the settled pointer as
+ * proof there is nothing to restart would drop the founder's resume. With no mapping AND no pointer
+ * there is provably nothing to run — an answer too, not an unread board.
  *
  * Then the whole dispatch rule, not just the blockers: a target can carry a second open human gate,
  * but it can equally be unapproved, abandoned, already in review, or claimed by another operator, and
@@ -482,7 +493,7 @@ type GateDispatch =
 async function gateDispatch(
   project: Project,
   gateId: string,
-  frozen: string,
+  frozen?: string,
 ): Promise<GateDispatch> {
   const unread = { verdict: "hold", target: frozen, unread: true } as const;
   // Pull before reading, exactly as {@link readTargetState} and the runner's own `liveRunCheck` do:
@@ -500,9 +511,12 @@ async function gateDispatch(
   if (!board) return { ...unread, reason: "its board could not be read" };
 
   const blocked = beadBlockedByGate(board, gateId);
-  const target = blocked ? runTargetAbove(board, blocked.id) : board.find((b) => b.id === frozen);
+  const frozenRow = frozen ? board.find((b) => b.id === frozen) : undefined;
+  const target = blocked ? runTargetAbove(board, blocked.id) : frozenRow;
   if (!target) {
-    return blocked
+    // A gate this board DOES map has answered the question itself, and so has one with no frozen
+    // pointer left to fall back on. Only a pointer the board could not confirm is an unread board.
+    return blocked || !frozen
       ? { verdict: "nothing" }
       : { ...unread, reason: "its board row could not be read" };
   }
