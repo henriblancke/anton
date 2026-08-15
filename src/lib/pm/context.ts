@@ -307,7 +307,8 @@ function targetsSection(split: PmBoardSplit, index: BoardIndex, input: PmBoardIn
     lines.push(
       ``,
       `${split.targets.length - shown.length} further run target(s) are NOT shown — this list is capped at`,
-      `${MAX_CARDS}, lowest priority first. Do not read their absence as "the board holds nothing else".`,
+      `${MAX_CARDS}, most urgent (P0) first — the ones dropped are the LEAST urgent. Do not read their`,
+      `absence as "the board holds nothing else".`,
     );
   }
   lines.push(``);
@@ -336,7 +337,7 @@ function containersSection(split: PmBoardSplit, index: BoardIndex, input: PmBoar
     lines.push(
       ``,
       `${split.containers.length - shown.length} further container epic(s) are NOT shown — this list is`,
-      `capped at ${MAX_CARDS}, lowest priority first.`,
+      `capped at ${MAX_CARDS}, most urgent (P0) first — the ones dropped are the LEAST urgent.`,
     );
   }
   lines.push(``);

@@ -22,6 +22,7 @@ import {
   runClaimOf,
   stampMsOf,
   ticketOwnerOf,
+  ticketPathOf,
   type BoardIndex,
 } from "./board-index";
 import {
@@ -382,6 +383,7 @@ function reparentBarred(
     ticketSetBusy(index, subject, at, movingTicket(subject.id)) ??
     reparentPremiseGone(plan, subject, index) ??
     premiseTouched(subject, EVIDENCE_PREMISE[plan.kind], at.observedAtMs) ??
+    carrierMoved(plan, subject, home, index, at) ??
     premiseTouched(home, EVIDENCE_PREMISE[plan.kind]?.twin, at.observedAtMs);
   if (busy) return busy;
   // A parent that sits UNDER one of the subjects would make the subtree its own ancestor.
@@ -970,6 +972,46 @@ function reparentPremiseGone(
   const card = index.cards.cardOf(subject);
   if (!card) return undefined;
   return `${subject.id} now rides board card ${card} — it was given a home since this proposal was filed, so moving it under ${plan.target} would overwrite that newer decision`;
+}
+
+/**
+ * Why nothing confirms the subject still rides the CARD its home was judged against, or undefined.
+ *
+ * bd nesting runs to any depth, so under `feature A → task P → subtask T` the card that ships T is
+ * A, reached THROUGH P. Re-homing P under another feature hands the whole subtree to that feature
+ * while leaving T's own parent and write stamp untouched — so every bar around this one waves the
+ * move through: the fence reads T's stamp and sees nothing, `ticketSetBusy` re-derives the NEW card
+ * from the fresh board and refuses only if a run holds it, and the step then records that same
+ * newcomer as its own baseline, which is what the under-lock re-check (apply-steps.ts
+ * `assertOwnerUnchanged`) compares against. The stale opinion lands on top of a subtree-level rehome
+ * nobody re-judged.
+ *
+ * The plan carries no filing-time card to compare against, so the identity is PROVEN from the fence
+ * rather than recalled: an ancestor's home moves by a `bd update --parent` on that ancestor, so a
+ * path whose every bead predates the observation is a path the subject still reaches the same card
+ * through. Undated fails closed, like every other reading of the fence.
+ *
+ * Asked of the fenced kinds alone — `misfiled`, in practice. The gardener's two re-parents claim
+ * "no board card carries this at all", which {@link reparentPremiseGone} re-derives in full from the
+ * fresh board and which an ancestor's move therefore cannot falsify unnoticed.
+ */
+function carrierMoved(
+  plan: GardenerPlan,
+  subject: Bead,
+  home: Bead,
+  index: BoardIndex,
+  at: ApplyMoment,
+): string | undefined {
+  if (!EVIDENCE_PREMISE[plan.kind]) return undefined;
+  for (const through of ticketPathOf(index, subject)) {
+    const since = writtenSinceFiling(through, at.observedAtMs);
+    if (since === false) continue; // this ancestor predates the filing, so the subtree has not moved
+    const reached = `${subject.id} reaches the card that ships it through ${through.id}`;
+    return since === undefined
+      ? `${reached}, which carries no write stamp this proposal's filing can be ordered against — nothing confirms it still rides the card ${home.id} was chosen against`
+      : `${reached}, and ${through.id} has been written to since this proposal was filed — re-homing that subtree moves ${subject.id} without touching it, so filing it under ${home.id} now could overwrite a newer decision about which card ships the work`;
+  }
+  return undefined;
 }
 
 /**

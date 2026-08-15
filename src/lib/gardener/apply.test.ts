@@ -949,6 +949,40 @@ describe("planApply — what an approval means against the board as it now is", 
           summary: "anton-a already sits under anton-card",
         });
       });
+
+      // bd nesting runs to any depth, so the card that SHIPS the subject can be its grandparent —
+      // and re-homing the bead in between hands the whole subtree to another card while leaving the
+      // subject's own parent and stamp untouched. Every other bar re-derives ownership from the
+      // fresh board and so records that newcomer as its own baseline; the PATH's stamps are the only
+      // thing that dates the subtree's move against the filing.
+      describe("whose subject reaches its card through another bead", () => {
+        const via = (extra: Partial<Bead> = {}): Bead => child("anton-mid", wrongHome.id, extra);
+        const nested = (mid: Bead): Bead[] => [
+          home(),
+          wrongHome,
+          mid,
+          child("anton-a", mid.id, { updated_at: "2025-01-01T00:00:00Z" }),
+        ];
+
+        it("moves it while the whole path predates the filing", () => {
+          const decision = decide(MISFILED, nested(via({ updated_at: "2025-01-01T00:00:00Z" })));
+          expect(decision.status).toBe("apply");
+        });
+
+        it("refuses when the bead in between was written after the filing", () => {
+          expect(
+            reason(decide(MISFILED, nested(via({ updated_at: "2026-07-15T00:00:00Z" })))),
+          ).toMatch(
+            /anton-a reaches the card that ships it through anton-mid, and anton-mid has been written to since this proposal was filed/,
+          );
+        });
+
+        it("refuses when nothing dates the bead in between against the filing", () => {
+          expect(reason(decide(MISFILED, nested(via())))).toMatch(
+            /anton-a reaches the card that ships it through anton-mid, which carries no write stamp/,
+          );
+        });
+      });
     });
 
     // An `implied-order` ask rests on ONE piece of evidence — a body phrase on one end of the pair —
