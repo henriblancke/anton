@@ -26,11 +26,11 @@
  * hangs on a gate, so both verbs close the gate as well as acting on the work. Resume is
  * resolve-and-resume — "I did it, carry on" — and closes the gate FIRST, because execute-epic
  * re-reads the board and a run enqueued against an open gate simply parks on the same wait again. For
- * the same reason it resumes only once the whole board says the target may run — the automatic path's
- * own dispatch rule, not a subset of it (see {@link heldBack}); anything else still holding it means
- * the founder's answer ends that one wait and nothing more. A resume that DOES land marks the gate
- * handed back ({@link markGateResumed}), because a closed gate is otherwise re-dispatched by
- * gate-check forever.
+ * the same reason it re-derives from the live board WHICH target the gate now releases, and resumes
+ * only once that board says it may run — the automatic path's own dispatch rule, not a subset of it
+ * (see {@link gateDispatch}); anything else still holding it means the founder's answer ends that one
+ * wait and nothing more. A resume that DOES land marks the gate handed back ({@link markGateResumed}),
+ * because a closed gate is otherwise re-dispatched by gate-check forever.
  * Abandon closes the gate LAST, after the bead: a gate that closes over an open bead hands the work
  * straight back to gate-check's own resume, which is the opposite of an abandon. Either way the gate
  * must close, because it is not on the bead's lifecycle — left open it keeps `detectOpenHumanGates`
@@ -52,7 +52,12 @@ import { beads, isMissingBeadError } from "./beads/bd";
 import { loadAllIssues } from "./beads/issues";
 import { nudgeSync } from "./beads/sync-nudge";
 import { getEscalation, settleEscalation, toEscalationView } from "./escalations";
-import { GATE_RESUMED_LABEL, undispatchableReason } from "./jobs/gate-targets";
+import {
+  beadBlockedByGate,
+  GATE_RESUMED_LABEL,
+  runTargetAbove,
+  undispatchableReason,
+} from "./jobs/gate-targets";
 import { cancelJob, resumeJob, resumeStalledEpic, runIsLiveForTarget } from "./jobs/service";
 import { getJob, systemClock } from "./jobs/queue";
 import { resolveOperator } from "./operator";
@@ -377,7 +382,9 @@ async function actOnBead(
  *
  * `target` is absent when the gate blocks nothing anton runs — a molecule step, a bead this board read
  * doesn't carry — or when that work settled itself since the sweep. Closing the gate is then the whole
- * answer: the wait was on the person either way.
+ * answer: the wait was on the person either way. When it IS present it is the escalation's frozen
+ * pointer, so the resume asks the live board which target the gate releases now ({@link gateDispatch})
+ * before enqueueing anything.
  */
 async function answerGateWait(
   project: Project,
@@ -393,36 +400,69 @@ async function answerGateWait(
   }
   await resolveGate(project, gateId, gateReason(view, action));
   if (!target) return "gate-resolved";
-  const held = await heldBack(project, target);
-  if (held) {
+  const dispatch = await gateDispatch(project, gateId, target);
+  if (dispatch.verdict === "nothing") {
+    console.info(
+      `[unstick] gate ${gateId} resolved, but it no longer releases anything anton runs — not resuming`,
+    );
+    return "gate-resolved";
+  }
+  if (dispatch.verdict === "hold") {
     const note =
-      `[unstick] gate resolved on ${target}, but ${held.reason} — not resuming; gate-check ` +
-      `dispatches it once the board reads clear`;
+      `[unstick] gate resolved on ${dispatch.target}, but ${dispatch.reason} — not resuming; ` +
+      `gate-check dispatches it once the board reads clear`;
     // A board that didn't answer is an anomaly worth the louder level; a board that answered "not
     // yet" is the feature working.
-    if (held.unread) console.warn(note);
+    if (dispatch.unread) console.warn(note);
     else console.info(note);
     return "gate-still-blocked";
   }
   // Reuses the automatic path's own verb, so a resolve-and-resume and a gate-check resume of the
   // same target are the same idempotent call — whichever lands second is absorbed as a no-op.
-  const outcome = await resumeStalledEpic(project.id, target);
+  const outcome = await resumeStalledEpic(project.id, dispatch.target);
   await markGateResumed(project, gateId);
   return outcome;
 }
 
 /**
- * Why the board says this target must NOT be re-enqueued after the gate closed — undefined when it
- * may be. The whole dispatch rule, not just the blockers: a target can carry a second open human
- * gate, but it can equally be unapproved, abandoned, already in review, or claimed by another
- * operator, and each of those raises the very same "waiting on you" row. Resuming any of them
- * enqueues work execute-epic then refuses at job start — a poison job for work the founder never
- * approved, or a run queued on a machine that doesn't own it. So the manual path applies the
- * automatic path's own predicate ({@link undispatchableReason}), rather than a looser subset of it.
+ * What the resolve-and-resume does next, decided against the LIVE board:
+ *   • `run`     — this is the run target the gate now releases, and the board says it may run.
+ *   • `hold`    — it may not, and why (with `unread` when the board itself is what didn't answer).
+ *   • `nothing` — the gate no longer releases anything anton runs, so there is nothing to resume.
+ */
+type GateDispatch =
+  | { verdict: "run"; target: string }
+  | { verdict: "hold"; target: string; reason: string; unread?: boolean }
+  | { verdict: "nothing" };
+
+/**
+ * WHICH target the closed gate releases, and whether the board lets it run.
  *
- * Liveness is judged upstream instead ({@link readTargetState}), which exempts THIS escalation's own
- * stalled run — the lease clause of the automatic rule cannot tell that leftover from a foreign
- * holder, and would refuse the resume being asked for.
+ * Re-derived rather than taken from the escalation's frozen `epicBeadId`, because a gate blocks a
+ * BEAD and the thing anton runs for that bead is whatever run target sits above it NOW. Reparenting
+ * is a supported move (the gardener's apply steps, `beads.reparent`), so the ancestor the sweep froze
+ * can have stopped being the run target while this row sat on the panel. Resuming it would run the
+ * wrong feature and then mark the gate handed back — and since gate-check skips a marked gate, the
+ * bead's real run target would never be released at all. So the mapping is recomputed with the
+ * automatic path's own two helpers ({@link beadBlockedByGate} → {@link runTargetAbove}), and the mark
+ * that follows a landed resume belongs to whatever they name.
+ *
+ * The frozen target stands in only when this read cannot map the gate to a bead at all — no mapping
+ * means gate-check has nothing to release either, so deferring would strand the founder's answer
+ * rather than hand it on. A mapping that lands on NO run target IS an answer (the gate was moved onto
+ * work anton doesn't run), and holds nothing back.
+ *
+ * Then the whole dispatch rule, not just the blockers: a target can carry a second open human gate,
+ * but it can equally be unapproved, abandoned, already in review, or claimed by another operator, and
+ * each of those raises the very same "waiting on you" row. Resuming any of them enqueues work
+ * execute-epic then refuses at job start — a poison job for work the founder never approved, or a run
+ * queued on a machine that doesn't own it. So the manual path applies the automatic path's own
+ * predicate ({@link undispatchableReason}), rather than a looser subset of it.
+ *
+ * Liveness is judged upstream ({@link readTargetState}) for the target the escalation named, which
+ * exempts THIS escalation's own stalled run — the lease clause of the automatic rule cannot tell that
+ * leftover from a foreign holder, and would refuse the resume being asked for. A target the board has
+ * MOVED the gate to carries no such leftover, so its lease is checked here.
  *
  * Holding is not a lost resume: the gate is closed and unmarked, which is precisely what gate-check's
  * `plainGateResumes` dispatches once the board clears — on whichever machine may run it. So the wait
@@ -431,20 +471,31 @@ async function answerGateWait(
  * FAILS SAFE to held — a board read that didn't land proves nothing about the way being clear. The
  * cost of being wrong that way is one pass of delay; the other way is a parked job.
  */
-async function heldBack(project: Project, target: string): Promise<HeldBack | undefined> {
+async function gateDispatch(
+  project: Project,
+  gateId: string,
+  frozen: string,
+): Promise<GateDispatch> {
   // `loadAllIssues`, not a bare `bd list`: bd omits gate beads from ordinary listings, and a second
   // gate is exactly the blocker this question exists for — an unread one would answer "clear".
   const board = await loadAllIssues(project.repoPath, { strictGates: true }).catch(() => undefined);
-  const bead = board?.find((b) => b.id === target);
-  if (!board || !bead) return { reason: "its board row could not be read", unread: true };
-  const reason = undispatchableReason(board, bead, await resolveOperator());
-  return reason ? { reason } : undefined;
-}
+  const unread = { verdict: "hold", target: frozen, unread: true } as const;
+  if (!board) return { ...unread, reason: "its board could not be read" };
 
-/** Why the resume is held, and whether that answer came from the board or from failing to read it. */
-interface HeldBack {
-  reason: string;
-  unread?: boolean;
+  const blocked = beadBlockedByGate(board, gateId);
+  const target = blocked ? runTargetAbove(board, blocked.id) : board.find((b) => b.id === frozen);
+  if (!target) {
+    return blocked
+      ? { verdict: "nothing" }
+      : { ...unread, reason: "its board row could not be read" };
+  }
+
+  const reason = undispatchableReason(board, target, await resolveOperator());
+  if (reason) return { verdict: "hold", target: target.id, reason };
+  if (target.id !== frozen && beads.isRunLive(target, systemClock.now())) {
+    return { verdict: "hold", target: target.id, reason: "another machine is running it" };
+  }
+  return { verdict: "run", target: target.id };
 }
 
 /**

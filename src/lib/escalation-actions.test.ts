@@ -1021,6 +1021,101 @@ describe("actOnEscalation — a wait on a person", () => {
     logged.mockRestore();
   });
 
+  /**
+   * The board after the gated ticket was reparented — a supported move (the gardener, `beads.reparent`)
+   * that the escalation's frozen `epicBeadId` cannot follow. The gate's own `blocks` edge stays on the
+   * ticket, so the run target above it is the only live answer to "what does closing this release?".
+   */
+  function reparentedBoard(newHome: Partial<Bead> = {}): Bead[] {
+    return [
+      {
+        id: "anton-t9",
+        title: "ticket",
+        status: "open",
+        issue_type: "task",
+        parent: "anton-e2",
+        dependencies: [{ issue_id: "anton-t9", depends_on_id: "g-1", type: "blocks" }],
+      } as Bead,
+      {
+        id: "anton-e2",
+        title: "its new home",
+        status: "open",
+        issue_type: "feature",
+        labels: [LABELS.approved],
+        ...newHome,
+      } as Bead,
+      { id: "g-1", title: "Gate: human", issue_type: "gate", status: "closed" } as Bead,
+      bead(),
+    ];
+  }
+
+  it("resumes the target the gated bead hangs under NOW, not the frozen ancestor", async () => {
+    // Reparenting between the sweep and the click moves the run: resuming the frozen ancestor would
+    // run the wrong feature AND mark the gate, which is exactly what stops gate-check from ever
+    // releasing the real one.
+    loadAllIssues.mockResolvedValue(reparentedBoard());
+
+    expect(await actOnEscalation(project, (await openGateWait()).id, "resume")).toMatchObject({
+      ok: true,
+      detail: "enqueued",
+    });
+    expect(resumeStalledEpic).toHaveBeenCalledWith("p1", "anton-e2");
+    expect(resumeStalledEpic).not.toHaveBeenCalledWith("p1", "anton-e1");
+    expect(beadsTag).toHaveBeenCalledWith(project.repoPath, "g-1", [GATE_RESUMED_LABEL]);
+  });
+
+  it("applies the dispatch rule to the target the gate moved to, not the one it left", async () => {
+    // The frozen ancestor is approved and clear; the bead's new home is not. Reading approval off the
+    // stale pointer would enqueue work the founder never approved.
+    loadAllIssues.mockResolvedValue(reparentedBoard({ labels: [] }));
+
+    expect(await actOnEscalation(project, (await openGateWait()).id, "resume")).toMatchObject({
+      ok: true,
+      detail: "gate-still-blocked",
+    });
+    expect(resumeStalledEpic).not.toHaveBeenCalled();
+    expect(beadsTag).not.toHaveBeenCalled();
+  });
+
+  it("holds a moved target another machine is already running", async () => {
+    // The upstream lease check judged the FROZEN target, where a live lease can be this escalation's
+    // own leftover. On a bead the gate moved to there is no such leftover to exempt.
+    loadAllIssues.mockResolvedValue(
+      reparentedBoard({ labels: [LABELS.approved, LABELS.runLease(Date.now() + HOUR, "run-far")] }),
+    );
+
+    expect(await actOnEscalation(project, (await openGateWait()).id, "resume")).toMatchObject({
+      ok: true,
+      detail: "gate-still-blocked",
+    });
+    expect(resumeStalledEpic).not.toHaveBeenCalled();
+    expect(beadsTag).not.toHaveBeenCalled();
+  });
+
+  it("resumes nothing when the gated bead was moved under work anton never dispatches", async () => {
+    // A molecule step's gates are bd's to sequence, so there is no run target above it — and no
+    // recovery to preserve either, which is why the wait simply ends.
+    loadAllIssues.mockResolvedValue([
+      {
+        id: "anton-t9",
+        title: "step",
+        status: "open",
+        issue_type: "task",
+        parent: "m-1",
+        dependencies: [{ issue_id: "anton-t9", depends_on_id: "g-1", type: "blocks" }],
+      } as Bead,
+      { id: "m-1", title: "poured molecule", issue_type: "molecule", status: "open" } as Bead,
+      bead(),
+    ]);
+
+    expect(await actOnEscalation(project, (await openGateWait()).id, "resume")).toMatchObject({
+      ok: true,
+      detail: "gate-resolved",
+    });
+    expect(resumeStalledEpic).not.toHaveBeenCalled();
+    expect(beadsTag).not.toHaveBeenCalled();
+  });
+
   it("does not mark the gate on abandon — the work is closed, not handed back", async () => {
     await actOnEscalation(project, (await openGateWait()).id, "abandon");
 

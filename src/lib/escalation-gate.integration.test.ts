@@ -241,6 +241,28 @@ describeBd("resolve-and-resume against a real human gate", () => {
     expect(rowOf(escalation.id)).toMatchObject({ status: "resolved", resolution: "resumed" });
   });
 
+  it("resumes the target the ticket hangs under NOW, after a reparent", async () => {
+    // Reparenting is a supported move (the gardener, `bd update --parent`), and the escalation's
+    // frozen `epicBeadId` cannot follow it. Resuming the ancestor would run the wrong feature and
+    // then mark the gate — after which gate-check skips it, so the ticket's real run target would
+    // never be released at all.
+    const work = seedGatedWork();
+    const escalation = await raise(work);
+    const newHome = createdId(
+      bd(["create", "ship it here instead", "--type", "feature", "--label", "approved", "--json"]),
+    );
+    bd(["update", work.ticket, "--parent", newHome]);
+    resetIssueSnapshots();
+
+    expect(await actOnEscalation(project, escalation.id, "resume")).toMatchObject({
+      ok: true,
+      detail: "enqueued",
+    });
+    expect(resumeStalledEpic.mock.calls).toEqual([[project.id, newHome]]);
+    expect(statusOf(work.gate)).toBe("closed");
+    expect(labelsOf(work.gate)).toContain(GATE_RESUMED_LABEL);
+  });
+
   it("leaves a resolve whose resume failed logged, and the work re-raisable", async () => {
     const logged = vi.spyOn(console, "error").mockImplementation(() => {});
     resumeStalledEpic.mockRejectedValue(new Error("runner refused: project is being deleted"));
