@@ -965,6 +965,31 @@ describe("gardener patrol · armed", () => {
     ).toBe(true);
   });
 
+  it("summarises an all-refused pass as refusals, never as 'applied 0'", async () => {
+    // The console line is what an operator greps the morning after a 03:00 pass. A board that
+    // declined every ask is the armed path WORKING; leading with "applied 0 proposal(s)
+    // unattended" reads at a glance like a setting that never took.
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    orphansMock.mockResolvedValue([orphan("t-4")]);
+    const leased = bead("t-4", {
+      updated_at: "2023-01-01T00:00:00Z",
+      assignee: "runner-1",
+      labels: [LABELS.runLease(Date.now() + 600_000, "run-9")],
+    });
+    let claimed = false;
+    boardIs(() => {
+      const subjects = [claimed ? leased : cold("t-4")];
+      claimed = true;
+      return subjects;
+    });
+
+    await expectJobStatus(t.db, await runPatrol(), "done");
+
+    const summary = log.mock.calls.map(([line]) => String(line)).find((l) => l.includes("refused"));
+    expect(summary).toBe("[gardener] 1 refused");
+    log.mockRestore();
+  });
+
   it("keeps the pass green when an apply blows up, and still writes the ones behind it", async () => {
     orphansMock.mockResolvedValue([orphan("t-4"), orphan("t-7")]);
     boardIs(() => [cold("t-4"), cold("t-7")]);

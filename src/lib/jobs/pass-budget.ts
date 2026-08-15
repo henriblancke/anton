@@ -1,0 +1,93 @@
+/**
+ * What is LEFT of a pass's unattended write cap, given the attempts of the same job that ran before
+ * it (anton-4ab3 / anton-zy7f).
+ *
+ * The cap ({@link MAX_APPLIES_PER_PASS}) bounds what one PASS may do to the board with nobody
+ * watching — and a pass is a job, not an attempt. A pass that applied three proposals and then died
+ * in the judgment tier is retried by the runner under the same job id; handing that retry a fresh
+ * cap would let one scheduled pass apply three more, and an operator who armed a kind would find six
+ * beads moved by a cap that says three.
+ *
+ * Reconstructed rather than persisted, for the reason the record itself is (gardener/record.ts): the
+ * log IS the account of what a pass did, so a second store would be a second answer to "how much has
+ * this job written" — agreeing until the day one of them is not updated. Every attempted apply
+ * writes exactly one APPLY record line, which is what the cap counts.
+ *
+ * Fails CLOSED. An attempt whose log will not read spent an unknown amount, so this attempt applies
+ * nothing — the safe direction for a write nobody is watching, and it says so rather than quietly
+ * arming. A log that was never created is the opposite and ordinary case: an attempt that wrote no
+ * line applied no proposal. The one gap is a log write that itself failed (armed.ts `write` is
+ * best-effort), which undercounts — the record says so in the attempt's own log.
+ */
+import { stat } from "node:fs/promises";
+
+import { MAX_APPLIES_PER_PASS } from "../gardener/emit";
+import { isPassLogLine, readPassRecords } from "../gardener/record";
+import { jobSessionLogPaths, readSessionLogLines } from "../sessions";
+import type { AntonDb } from "./queue";
+
+export interface ApplyBudgetInput {
+  db: AntonDb;
+  /** The queue job this pass is an attempt of — the unit the cap belongs to. */
+  jobId: string;
+  /** The producer's log prefix, e.g. `[gardener]`. */
+  producer: string;
+  /** Where the note lands, when there is one: the pass's session log, as every record line does. */
+  log: (chunk: string) => Promise<void>;
+}
+
+/**
+ * How much of the cap this pass may still spend. Call it ONCE, before the pass applies anything:
+ * every earlier attempt's log is complete by then, and this attempt's own is still empty.
+ */
+export async function remainingApplyBudget(input: ApplyBudgetInput): Promise<number> {
+  const paths = await jobSessionLogPaths(input.db, input.jobId);
+  if (paths.length === 0) return MAX_APPLIES_PER_PASS;
+
+  const spends = await Promise.all(paths.map(attemptSpend));
+  if (spends.some((spend) => spend === undefined)) {
+    await note(
+      input,
+      `an earlier attempt of this job left a session log anton could not read, so what it applied ` +
+        `unattended is unknown — this attempt applies nothing and every armed proposal it files ` +
+        `stays open as an ordinary ask`,
+    );
+    return 0;
+  }
+
+  const spent = spends.reduce((total: number, spend) => total + (spend ?? 0), 0);
+  if (spent === 0) return MAX_APPLIES_PER_PASS;
+  const remaining = Math.max(0, MAX_APPLIES_PER_PASS - spent);
+  // Never a silent cap, exactly as the per-pass hold-back is not one: an operator looking at a
+  // retry that applied one proposal has to be able to tell "that was all it found" from "its
+  // earlier attempt had already spent the rest".
+  await note(
+    input,
+    `earlier attempt(s) of this job already applied ${spent} proposal(s) unattended — one pass ` +
+      `applies at most ${MAX_APPLIES_PER_PASS}, so this attempt may apply ${remaining}`,
+  );
+  return remaining;
+}
+
+/** One attempt's spend, or `undefined` when its log cannot say. */
+async function attemptSpend(logPath: string): Promise<number | undefined> {
+  // A log that was never created belongs to an attempt that wrote no line at all — and an apply is
+  // recorded as it happens, so an attempt with nothing to say applied nothing.
+  const wrote = await stat(logPath).then(
+    () => true,
+    () => false,
+  );
+  if (!wrote) return 0;
+
+  const { lines, unreadable } = await readSessionLogLines(logPath, isPassLogLine);
+  if (unreadable) return undefined;
+  const { records } = readPassRecords(lines.join("\n"));
+  return records.filter((record) => record.mode === "apply").length;
+}
+
+/** Shaped as a pass note (an `APPLY` line with no `(kind)` group), so the jobs page carries it. */
+async function note(input: ApplyBudgetInput, line: string): Promise<void> {
+  await input.log(`${input.producer} APPLY budget: ${line}\n`).catch((e) => {
+    console.warn(`${input.producer} could not record the write budget: ${line}`, e);
+  });
+}

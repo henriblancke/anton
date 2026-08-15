@@ -45,6 +45,13 @@ export interface PassScope {
   slug: string;
   /** How far this project lets a filed proposal go, per kind (anton-nbyy). */
   policy: ProposalAutonomyPolicy;
+  /**
+   * What is left of this PASS's unattended write cap — the full cap less whatever earlier attempts
+   * of the same job already applied (jobs/pass-budget.ts). Read once for the same reason `policy`
+   * is, and threaded through every tier: the cap bounds what one pass writes, not what one tier or
+   * one attempt does.
+   */
+  applyBudget: number;
   clock: Clock;
   ctx: JobContext;
   /** Propagate a board write to the other machines. */

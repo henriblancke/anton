@@ -189,6 +189,9 @@ function shadow(
  * What an ARMED patrol does with the same proposals (anton-4ab3): applies the ones whose kind the
  * operator armed, through the function the approve route calls, capped and recorded as a policy
  * write. Disjoint from the shadow above — a kind is one level, never both.
+ *
+ * Capped by what is left of the PASS's budget, not by a fresh cap: a patrol the runner retried has
+ * already spent whatever its earlier attempt applied (pass-budget.ts).
  */
 function armed(scope: PassScope, created: EmittedProposal[]): Promise<unknown> {
   return applyArmedProposals({
@@ -199,6 +202,7 @@ function armed(scope: PassScope, created: EmittedProposal[]): Promise<unknown> {
     log: scope.log,
     nudge: () => scope.nudge(scope.project),
     signal: scope.ctx.signal,
+    limit: scope.applyBudget,
   });
 }
 

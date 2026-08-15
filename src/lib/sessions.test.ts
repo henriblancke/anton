@@ -191,9 +191,21 @@ describe("sessionsByJob", () => {
   it("resolves each job to its latest session, and a job that opened none to nothing", async () => {
     const { sessionsByJob } = await import("./sessions");
     expect(await sessionsByJob(["gardener-job", "resumed-job", "silent-job"])).toEqual({
-      "gardener-job": { id: "s-gardener", logPath: "/logs/s-gardener.log" },
-      "resumed-job": { id: "s-latest", logPath: "/logs/s-latest.log" },
+      "gardener-job": { id: "s-gardener", logPaths: ["/logs/s-gardener.log"] },
+      // Every attempt's log, oldest first — an attempt that applied proposals unattended and then
+      // failed is a board write the newest session's log says nothing about.
+      "resumed-job": { id: "s-latest", logPaths: ["/logs/s-first.log", "/logs/s-latest.log"] },
     });
+  });
+
+  it("gives one job's logs to a handler that has to know what its earlier attempts did", async () => {
+    const { getDb } = await import("./db");
+    const { jobSessionLogPaths } = await import("./sessions");
+    expect(await jobSessionLogPaths(getDb(), "resumed-job")).toEqual([
+      "/logs/s-first.log",
+      "/logs/s-latest.log",
+    ]);
+    expect(await jobSessionLogPaths(getDb(), "silent-job")).toEqual([]);
   });
 
   it("asks nothing of the DB for an empty page", async () => {

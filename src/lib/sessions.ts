@@ -186,27 +186,48 @@ export async function listSessions(projectId: string, runId?: string): Promise<S
   return db.select().from(schema.sessions).where(where).orderBy(desc(schema.sessions.startedAt));
 }
 
-/** A job's durable handle on the session it opened: what to stream, and what to read. */
+/** A job's durable handle on the sessions it opened: what to stream, and what to read. */
 export interface JobSessionLink {
+  /** The LATEST session — the attempt an operator opening the row is looking at. */
   id: string;
-  /** Where the log lives. Absent on a row written before the column, or by a caller that passed none. */
-  logPath?: string;
+  /**
+   * Where every attempt's log lives, OLDEST FIRST. A job that retried opened one session per
+   * attempt, and each holds only what that attempt did: an attempt that applied proposals
+   * unattended and then failed is a write nobody can see if the reader keeps the newest log alone.
+   * Empty for a row written before the column, or by a caller that passed no path.
+   */
+  logPaths: string[];
 }
 
 /**
- * The session each of these jobs opened, newest first per job (shared anton.db read path — for the
- * jobs page). This is the DURABLE answer the runner's in-memory live handle cannot give: a settled
- * job reports nothing, so without this a finished pass's log — the gardener's shadow record among
- * them — would be a file on disk with no route to it. A job that opened several sessions resolves to
- * its latest, which is the one an operator opening the row is looking for.
+ * The sessions each of these jobs opened (shared anton.db read path — for the jobs page). This is the
+ * DURABLE answer the runner's in-memory live handle cannot give: a settled job reports nothing, so
+ * without this a finished pass's log — the gardener's shadow record among them — would be a file on
+ * disk with no route to it.
  *
- * Carries the log PATH as well as the id because the jobs page does two things with one session: it
- * streams the log on demand (by id, through the SSE route) and reads the pass's record out of it
- * server-side (anton-hzce). One query, so the two can never answer about different sessions.
+ * Carries the log PATHS as well as the id because the jobs page does two things with one job: it
+ * streams the latest session's log on demand (by id, through the SSE route) and reads the pass's
+ * whole record out of the logs server-side (anton-hzce). One query, so the two can never answer
+ * about different sessions — and every ATTEMPT's log, because a retried job's record is all of them.
  */
 export async function sessionsByJob(jobIds: string[]): Promise<Record<string, JobSessionLink>> {
+  return linksByJob(getDb(), jobIds);
+}
+
+/**
+ * One job's session logs, oldest first — the db-injectable half, for a handler that has to know what
+ * the attempts BEFORE it already did (jobs/pass-budget.ts).
+ */
+export async function jobSessionLogPaths(db: AntonDb, jobId: string): Promise<string[]> {
+  return (await linksByJob(db, [jobId]))[jobId]?.logPaths ?? [];
+}
+
+async function linksByJob(
+  db: AntonDb,
+  jobIds: string[],
+): Promise<Record<string, JobSessionLink>> {
   if (jobIds.length === 0) return {};
-  const rows = await getDb()
+  const rows = await db
     .select({
       id: schema.sessions.id,
       jobId: schema.sessions.jobId,
@@ -217,9 +238,11 @@ export async function sessionsByJob(jobIds: string[]): Promise<Record<string, Jo
     .orderBy(desc(schema.sessions.startedAt));
   const byJob: Record<string, JobSessionLink> = {};
   for (const row of rows) {
-    if (row.jobId && !(row.jobId in byJob)) {
-      byJob[row.jobId] = { id: row.id, logPath: row.logPath ?? undefined };
-    }
+    if (!row.jobId) continue;
+    // Newest first out of the query: the first row per job is the one to stream, and each older
+    // attempt's log goes in FRONT of the list so the record reads in the order the pass wrote it.
+    const link = (byJob[row.jobId] ??= { id: row.id, logPaths: [] });
+    if (row.logPath) link.logPaths.unshift(row.logPath);
   }
   return byJob;
 }

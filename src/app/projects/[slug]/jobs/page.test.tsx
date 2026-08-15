@@ -54,7 +54,7 @@ function job(id: string, type: JobType): JobSummary {
 /** Point a job at a session whose log holds `log`. */
 function pass(id: string, type: JobType, log: string): JobSummary {
   const logPath = `/logs/${id}.log`;
-  sessions[id] = { id: `s-${id}`, logPath };
+  sessions[id] = { id: `s-${id}`, logPaths: [logPath] };
   logs[logPath] = log;
   return job(id, type);
 }
@@ -154,6 +154,23 @@ describe("jobs page — what each pass applied, shadowed and refused", () => {
     expect(record().getByText("Clean pass — nothing applied, shadowed or refused.")).toBeTruthy();
   });
 
+  it("shows what an EARLIER attempt applied, not just the retry that succeeded", async () => {
+    // A pass that applied a proposal unattended and then failed is retried under the same job id,
+    // opening a second session. The writes of the first attempt are on the board either way — a
+    // record that showed only the newest session would render the whole job as a clean pass.
+    jobs = [job("g1", "gardener")];
+    sessions["g1"] = { id: "s-latest", logPaths: ["/logs/first.log", "/logs/latest.log"] };
+    logs["/logs/first.log"] = APPLIED;
+    logs["/logs/latest.log"] = SHADOWED;
+
+    await renderPage();
+    expand("gardener");
+
+    expect(record().queryByText(/Clean pass/)).toBeNull();
+    expect(record().getByText("closed t-4 as shipped", { exact: false })).toBeTruthy();
+    expect(record().getByText("set t-9 to P1", { exact: false })).toBeTruthy();
+  });
+
   it("never calls a pass clean when the write cap held proposals back", async () => {
     jobs = [
       pass(
@@ -175,7 +192,7 @@ describe("jobs page — what each pass applied, shadowed and refused", () => {
     // record is the only view of an unattended write, so a failed read must read as a failed read
     // rather than as a pass that wrote nothing.
     jobs = [job("g1", "gardener")];
-    sessions["g1"] = { id: "s-g1", logPath: "/logs/vanished.log" };
+    sessions["g1"] = { id: "s-g1", logPaths: ["/logs/vanished.log"] };
     await renderPage();
     expand("gardener");
 

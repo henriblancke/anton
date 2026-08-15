@@ -50,14 +50,16 @@ describe("passRecordsByJob", () => {
     const records = await passRecordsByJob(
       [job("g1", "gardener"), job("pm1", "product-master")],
       {
-        g1: { id: "s-g1", logPath: logFile("g1.log", APPLIED) },
+        g1: { id: "s-g1", logPaths: [logFile("g1.log", APPLIED)] },
         pm1: {
           id: "s-pm1",
-          logPath: logFile(
-            "pm1.log",
-            "[assistant] thinking out loud\n" +
-              "[product-master] SHADOW p-2 (low-value) retire/defer t-9 — WOULD REFUSE: t-9 moved\n",
-          ),
+          logPaths: [
+            logFile(
+              "pm1.log",
+              "[assistant] thinking out loud\n" +
+                "[product-master] SHADOW p-2 (low-value) retire/defer t-9 — WOULD REFUSE: t-9 moved\n",
+            ),
+          ],
         },
       },
     );
@@ -92,7 +94,7 @@ describe("passRecordsByJob", () => {
 
   it("reads the record of an unfinished pass that DID open a session", async () => {
     const records = await passRecordsByJob([job("broke", "gardener", "failed")], {
-      broke: { id: "s-broke", logPath: logFile("broke.log", APPLIED) },
+      broke: { id: "s-broke", logPaths: [logFile("broke.log", APPLIED)] },
     });
 
     expect(records.broke.records.map((r) => r.outcome)).toEqual(["applied"]);
@@ -106,12 +108,14 @@ describe("passRecordsByJob", () => {
     const records = await passRecordsByJob([job("pm2", "product-master")], {
       pm2: {
         id: "s-pm2",
-        logPath: logFile(
-          "pm2.log",
-          "[product-master] APPLY p-1 (degraded-approval) unapprove t-1 — APPLIED: withdrew t-1\n" +
-            transcript +
-            "[product-master] 0 claim(s) reported, 0 accepted\n",
-        ),
+        logPaths: [
+          logFile(
+            "pm2.log",
+            "[product-master] APPLY p-1 (degraded-approval) unapprove t-1 — APPLIED: withdrew t-1\n" +
+              transcript +
+              "[product-master] 0 claim(s) reported, 0 accepted\n",
+          ),
+        ],
       },
     });
 
@@ -123,7 +127,7 @@ describe("passRecordsByJob", () => {
     // empty summary here would render as "Clean pass" over a pass whose only record of an
     // unattended write is the file we just failed to read, so the failure is the answer.
     const records = await passRecordsByJob([job("g2", "gardener")], {
-      g2: { id: "s-g2", logPath: join(workDir, "never-written.log") },
+      g2: { id: "s-g2", logPaths: [join(workDir, "never-written.log")] },
     });
 
     expect(records.g2.records).toEqual([]);
@@ -132,10 +136,47 @@ describe("passRecordsByJob", () => {
     ]);
   });
 
+  // A retried job opens one session per attempt, and each log holds only that attempt's writes. An
+  // attempt that applied a proposal unattended and then failed is a board write like any other —
+  // reading the newest log alone would hide it behind a clean retry.
+  it("reads every attempt of a job as one record, oldest first", async () => {
+    const records = await passRecordsByJob([job("pm3", "product-master")], {
+      pm3: {
+        id: "s-latest",
+        logPaths: [
+          logFile(
+            "pm3-first.log",
+            "[product-master] APPLY p-1 (degraded-approval) unapprove t-1 — APPLIED: withdrew t-1\n",
+          ),
+          logFile(
+            "pm3-latest.log",
+            "[product-master] SHADOW p-2 (low-value) retire/defer t-9 — WOULD APPLY: defer t-9\n",
+          ),
+        ],
+      },
+    });
+
+    expect(records.pm3.records.map((r) => r.proposal)).toEqual(["p-1", "p-2"]);
+    expect(records.pm3.records.map((r) => r.outcome)).toEqual(["applied", "shadowed"]);
+  });
+
+  it("names the attempt a note came from once a job has more than one", async () => {
+    const records = await passRecordsByJob([job("pm4", "product-master")], {
+      pm4: {
+        id: "s-latest",
+        logPaths: [join(workDir, "gone.log"), logFile("pm4-latest.log", "")],
+      },
+    });
+
+    expect(records.pm4.notes).toEqual([
+      "attempt 1 of 2: this pass's session log could not be read — whatever it applied, shadowed or refused is not recorded here",
+    ]);
+  });
+
   it("says nothing about jobs that file no proposals", async () => {
     const records = await passRecordsByJob(
       [job("e1", "execute-epic"), job("g3", "gardener")],
-      { e1: { id: "s-e1", logPath: logFile("e1.log", APPLIED) }, g3: { id: "s-g3" } },
+      { e1: { id: "s-e1", logPaths: [logFile("e1.log", APPLIED)] }, g3: { id: "s-g3", logPaths: [] } },
     );
 
     expect(Object.keys(records)).toEqual(["g3"]);

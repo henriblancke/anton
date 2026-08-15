@@ -47,31 +47,50 @@ export async function passRecordsByJob(
   const passes = jobs.filter((job) => isPassJob(job.type));
   const summaries = await Promise.all(
     passes.map(async (job): Promise<[string, PassRecordSummary] | undefined> => {
-      const logPath = sessions[job.id]?.logPath;
-      if (!logPath) {
+      const logPaths = sessions[job.id]?.logPaths ?? [];
+      if (logPaths.length === 0) {
         return job.status === COMPLETED ? [job.id, { records: [], notes: [] }] : undefined;
       }
-      return [job.id, await readLog(logPath)];
+      return [job.id, await readAttempts(logPaths)];
     }),
   );
   return Object.fromEntries(summaries.filter((entry) => entry !== undefined));
 }
 
 /**
- * One pass's record, scanned out of its whole log rather than its tail: the product-master pass
+ * A job's whole record — EVERY attempt's log, oldest first, read as one account.
+ *
+ * A retry opens a new session, so the newest log holds only what the last attempt did. An attempt
+ * that applied proposals unattended and then failed would otherwise vanish behind a clean retry,
+ * which is the one thing this record exists to prevent: the writes are on the board either way.
+ */
+async function readAttempts(logPaths: string[]): Promise<PassRecordSummary> {
+  const attempts = await Promise.all(logPaths.map((path, i) => readLog(path, i, logPaths.length)));
+  return {
+    records: attempts.flatMap((attempt) => attempt.records),
+    notes: attempts.flatMap((attempt) => attempt.notes),
+  };
+}
+
+/**
+ * One attempt's record, scanned out of its whole log rather than its tail: the product-master pass
  * writes its revalidation tier's APPLY lines ahead of the claude transcript, so anything that read
  * only the end of the log would drop an unattended write and call the pass clean.
+ *
+ * Notes name their attempt once a job has more than one, because "the log could not be read" means
+ * something different when the other three attempts read fine.
  */
-async function readLog(logPath: string): Promise<PassRecordSummary> {
+async function readLog(logPath: string, index: number, of: number): Promise<PassRecordSummary> {
   const { lines, truncated, unreadable } = await readSessionLogLines(logPath, isPassLogLine);
   const summary = readPassRecords(lines.join("\n"));
+  const attempt = of > 1 ? `attempt ${index + 1} of ${of}: ` : "";
   if (unreadable) {
     // The one silence that is NOT a result: the session row stands but its disposable log is gone
     // or would not read, so an empty summary here would render as "Clean pass" over a pass that may
     // have written to the board unattended — the only UI record of which is the file we just failed
     // to read.
     summary.notes.push(
-      `this pass's session log could not be read${lines.length > 0 ? " to the end" : ""} — ` +
+      `${attempt}this pass's session log could not be read${lines.length > 0 ? " to the end" : ""} — ` +
         `whatever it applied, shadowed or refused is not recorded here`,
     );
   }
@@ -79,8 +98,8 @@ async function readLog(logPath: string): Promise<PassRecordSummary> {
     // Never a silent cap, for the same reason the write cap is not one: a record that shows some of
     // a pass's writes reads exactly like one that shows all of them.
     summary.notes.push(
-      `this pass wrote more record lines than the jobs page reads — ${lines.length} shown; ` +
-        `open the session log for the rest`,
+      `${attempt}this pass wrote more record lines than the jobs page reads — ${lines.length} ` +
+        `shown; open the session log for the rest`,
     );
   }
   return summary;

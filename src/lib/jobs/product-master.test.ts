@@ -13,12 +13,13 @@
  *   • the fingerprints are anton's, so a second pass over an unfixed board asks once.
  */
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ne } from "drizzle-orm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { driveJob, expectJobStatus } from "@/lib/testing/jobs";
+import { driveJob, expectJobStatus, makeJobRunner } from "@/lib/testing/jobs";
 import type { Bead } from "../beads/bd";
 import { LABELS } from "../beads/bd";
 import type { ApplyDecision, ApplyMoment } from "../gardener/apply";
@@ -569,6 +570,62 @@ describe("product-master pass · armed", () => {
     expect(writes).not.toContain("close anton-p4");
   });
 
+  it("shares ONE write cap with the earlier attempts of the same job", async () => {
+    // The runner retries a pass that died after its writes under the same job id, and each attempt
+    // opens its own session. A fresh cap per attempt would let one scheduled pass apply several
+    // caps' worth unattended — the exact failure the cap exists to prevent.
+    writeVerbMock.mockResolvedValue("");
+    const runner = makeJobRunner({
+      db: t.db,
+      clock,
+      type: "product-master",
+      handler: ({ db, clock: c }) =>
+        makeProductMasterHandler({ db, clock: c, nudge, runClaude: fakeClaude }),
+    });
+    const jobId = await runner.enqueue({
+      type: "product-master",
+      projectId,
+      payload: { projectId },
+    });
+    const spentPath = join(sessionsDir, "first-attempt.log");
+    writeFileSync(
+      spentPath,
+      [1, 2, 3]
+        .map(
+          (n) =>
+            `[product-master] APPLY anton-q${n} (low-value) retire/defer anton-b${n} — ` +
+            `APPLIED: deferred anton-b${n}\n`,
+        )
+        .join(""),
+    );
+    await t.db.insert(schema.sessions).values({
+      id: "s-first-attempt",
+      projectId,
+      jobId,
+      kind: "product-master",
+      status: "failed",
+      logPath: spentPath,
+      startedAt: new Date(NOW - 60_000),
+    });
+
+    expect(await runner.tickOnce()).toBe(1);
+    await runner.whenIdle();
+    await expectJobStatus(t.db, jobId, "done");
+
+    // The ask is filed as always; what the earlier attempt spent is what stops it being applied.
+    expect(writes).toEqual(["create Product master: defer anton-a"]);
+    const [row] = await t.db
+      .select()
+      .from(schema.sessions)
+      .where(ne(schema.sessions.id, "s-first-attempt"));
+    const log = readFileSync(row.logPath as string, "utf8");
+    expect(log).toContain(
+      "APPLY budget: earlier attempt(s) of this job already applied 3 proposal(s) unattended — " +
+        "one pass applies at most 3, so this attempt may apply 0",
+    );
+    expect(log).toContain("APPLY held back 1 armed proposal(s)");
+  });
+
   it("judges the board tier 1 LEFT, not the one it found", async () => {
     // Revalidation armed at `apply` withdraws approvals BEFORE the session runs. Handed the
     // pre-write snapshot, the session would reason about a board this same pass had already
@@ -591,6 +648,32 @@ describe("product-master pass · armed", () => {
     await expectJobStatus(t.db, await runPass(), "done");
 
     expect(writes).toContain("untag anton-x1");
+    expect(dispatched?.prompt).toContain("anton-late");
+  });
+
+  it("re-reads after an apply that SETTLED without touching the subject", async () => {
+    // Another actor made the move between this pass's read and its apply. `applyProposal` finds the
+    // board already says what the ask wanted, so it closes this pass's proposal and writes nothing
+    // (`changed: []`) — and BOTH the subject and the ask are now other than the snapshot holds.
+    // Judging tier 2 against it would reason about a pre-move bead and a proposal that is closed.
+    const child = bead("anton-f1", { issue_type: "feature", parent: "anton-x1" });
+    const approved = bead("anton-x1", { issue_type: "epic", labels: [LABELS.approved] });
+    const withdrawn = bead("anton-x1", { issue_type: "epic" });
+    // Stands in for everything the other actor's write left behind: only a board read AFTER the
+    // apply settled can carry it.
+    const afterTheMove = bead("anton-late", { title: "landed while the other actor was writing" });
+    let reads = 0;
+    boardIs(() =>
+      ++reads > 1 ? [cold, withdrawn, child, afterTheMove] : [cold, approved, child],
+    );
+    await arm({ "low-value": "apply", "degraded-approval": "apply" });
+    writeVerbMock.mockResolvedValue("");
+
+    await expectJobStatus(t.db, await runPass(), "done");
+
+    // The pass touched the subject not at all — it only settled the ask about it.
+    expect(writes).not.toContain("untag anton-x1");
+    expect(writes).toContain("close anton-p1");
     expect(dispatched?.prompt).toContain("anton-late");
   });
 

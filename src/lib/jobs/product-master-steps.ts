@@ -15,7 +15,6 @@ import { applyArmedProposals, reportUnsettledProposals } from "../gardener/armed
 import type { GardenerDetection } from "../gardener/detections";
 import {
   emitProposals,
-  MAX_APPLIES_PER_PASS,
   MAX_PROPOSALS_PER_PASS,
   PartialEmissionError,
   type EmissionResult,
@@ -89,8 +88,9 @@ export interface ProposalFiler {
  *
  * Returned as a closure because both tiers file against ONE snapshot and fence — the two are
  * entitled to their own emission (so they cannot cap each other out) but never to their own premise.
- * The WRITE cap is the opposite: it is spent from one budget across both tiers, because it bounds
- * what this PASS may do to the board unattended, not what a tier may (anton-4ab3).
+ * The WRITE cap is the opposite: it is spent from one budget across both tiers — and across the
+ * attempts of the same job (`scope.applyBudget`, pass-budget.ts) — because it bounds what this PASS
+ * may do to the board unattended, not what a tier or an attempt may (anton-4ab3).
  *
  * That snapshot is re-read — once, and only when an armed apply actually moved a bead — so the
  * "one premise" the tiers share is always the board this pass has LEFT. Tier 1 armed at `apply`
@@ -100,7 +100,7 @@ export interface ProposalFiler {
 export function makeProposalFiler(scope: PassScope, input: ProposalFilerInput): ProposalFiler {
   const repo = scope.project.repoPath;
   let snapshot = input;
-  let writeBudget = MAX_APPLIES_PER_PASS;
+  let writeBudget = scope.applyBudget;
 
   const file = async (detections: GardenerDetection[]): Promise<void> => {
     scope.ctx.signal.throwIfAborted();
@@ -140,17 +140,22 @@ export function makeProposalFiler(scope: PassScope, input: ProposalFilerInput): 
         limit: writeBudget,
       });
       writeBudget -= applied.attempted;
-      // A bead moved, so the premise every later tier files against has moved with it. Re-read
+      // An apply LANDED, so the premise every later tier files against has moved with it. Re-read
       // rather than patch: the apply's own fresh-board reads are the authority on what the writes
       // left, and re-deriving it from `changed` would be a second, quieter answer. The fence is
       // re-stamped alongside it — it dates THIS read, and a proposal filed later carrying the older
       // stamp would let apply date its premise checks against a board two writes ago.
       //
+      // On the OUTCOME, never on `changed`: an apply that finds the move already made writes
+      // nothing to the subject (`changed: []`) but still closes this pass's proposal — and it was
+      // another actor that moved the subject, so the snapshot is stale on both counts. Judging tier
+      // 2 against it would reason about a pre-move bead and an ask that no longer stands.
+      //
       // Stamped BEFORE the read, exactly as the pass's first read stamps it: a write landing while
       // the read is in flight is absent from the board it returns, and a fence taken afterwards
       // would claim anton had observed it — which is the one direction that matters, because a
       // proposal armed at `apply` then passes `writtenSinceFiling` on evidence nobody ever saw.
-      if (applied.records.some((record) => record.changed.length > 0)) {
+      if (applied.records.some((record) => record.outcome === "applied")) {
         const observedAtMs = scope.clock.now();
         snapshot = { board: await loadAllIssues(repo), observedAtMs };
       }

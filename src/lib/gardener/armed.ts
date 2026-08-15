@@ -236,13 +236,22 @@ function lineOf(record: ArmedRecord): string {
   return passRecordLine({ mode: "apply", ...record, verdict: VERDICT[record.outcome] });
 }
 
-/** The console line an operator greps the morning after a 03:00 pass. */
+/**
+ * The console line an operator greps the morning after a 03:00 pass.
+ *
+ * "applied 0" is left OUT rather than written as a zero: a pass whose asks the board all refused is
+ * the armed path working, and leading with "applied 0 proposal(s) unattended" reads at a glance like
+ * a setting that failed to take. There is always at least one clause — the caller only summarises a
+ * pass that attempted something.
+ */
 function summaryOf(records: ArmedRecord[]): string {
   const of = (outcome: ArmedOutcome) => records.filter((r) => r.outcome === outcome);
   const applied = of("applied");
   const clauses = [
-    `applied ${applied.length} proposal(s) unattended` +
-      (applied.length > 0 ? ` (${applied.map((r) => r.proposal).join(", ")})` : ""),
+    applied.length > 0
+      ? `applied ${applied.length} proposal(s) unattended ` +
+        `(${applied.map((r) => r.proposal).join(", ")})`
+      : undefined,
     of("refused").length > 0 ? `${of("refused").length} refused` : undefined,
     of("error").length > 0 ? `${of("error").length} could not be applied` : undefined,
   ].filter((clause): clause is string => clause !== undefined);

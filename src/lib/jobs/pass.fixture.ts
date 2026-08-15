@@ -11,6 +11,7 @@
  * Test-only.
  */
 import { resolveProposalAutonomyPolicy } from "../gardener/autonomy";
+import { MAX_APPLIES_PER_PASS } from "../gardener/emit";
 import type { PassScope } from "./pass-preamble";
 import type { Clock } from "./queue";
 import type { JobContext } from "./runner";
@@ -64,6 +65,9 @@ export function fakeScope(repo: string, overrides: Partial<PassScope> = {}): Fak
     project: { id: "project-1", repoPath: repo },
     slug: "sandbox",
     policy: resolveProposalAutonomyPolicy(undefined),
+    // A first attempt: nothing of the write cap spent yet. A suite that wants a retry's budget
+    // overrides it.
+    applyBudget: MAX_APPLIES_PER_PASS,
     clock,
     nudge: (project) => nudged.push(project),
     log: async (chunk) => {
