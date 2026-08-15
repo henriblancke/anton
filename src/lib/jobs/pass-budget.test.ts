@@ -148,9 +148,7 @@ describe("remainingApplyBudget", () => {
     await attempt("s-1", undefined, 1_700_000_000_000);
 
     expect(await budget()).toBe(0);
-    expect(logged.join("")).toContain(
-      "left a session log anton could not read, so what it applied unattended is unknown",
-    );
+    expect(logged.join("")).toContain("a session log of this job could not be read");
   });
 
   it("applies NOTHING when an earlier attempt's log will not read", async () => {
@@ -160,8 +158,18 @@ describe("remainingApplyBudget", () => {
     await attempt("s-1", undefined, 1_700_000_000_000);
 
     expect(await budget()).toBe(0);
-    expect(logged.join("")).toContain(
-      "left a session log anton could not read, so what it applied unattended is unknown",
-    );
+    expect(logged.join("")).toContain("a session log of this job could not be read");
+  });
+
+  it("never blames an EARLIER attempt for a log that can only be this attempt's own", async () => {
+    // A pass that opens its session up front (product-master) is already in this read, so the only
+    // unreadable log a FIRST attempt can find is its own. The answer is the same one — a log store
+    // broken now is one this attempt could not record its own writes against either — but a note
+    // that invents an earlier attempt sends an operator looking for a pass that never ran.
+    await attempt("s-current", undefined, 1_700_000_000_000);
+
+    expect(await budget()).toBe(0);
+    expect(logged.join("")).not.toContain("earlier attempt");
+    expect(logged.join("")).toContain("this attempt's own included");
   });
 });

@@ -21,6 +21,11 @@
  * log behind it is a log store that broke, which is exactly when an apply's record goes unwritten.
  * An attempt that genuinely had nothing to say opened no row at all and is not read here.
  *
+ * That unreadable log may be THIS attempt's own — a pass that opens its session up front
+ * (product-master) is already in the read by the time this runs — and the answer does not change: a
+ * log store broken now is one this attempt could not have accounted its own writes against either.
+ * Only the note has to stay honest about whose log it is, and it names neither.
+ *
  * A partial log — created, then failing mid-append — cannot cost this an apply it should have
  * counted, because the producer buys each write with its record BEFORE making it and stops the
  * moment one will not write (gardener/armed.ts): a line that never landed is an apply that never
@@ -44,7 +49,8 @@ export interface ApplyBudgetInput {
 
 /**
  * How much of the cap this pass may still spend. Call it ONCE, before the pass applies anything:
- * every earlier attempt's log is complete by then, and this attempt's own is still empty.
+ * every earlier attempt's log is complete by then, and this attempt's own — present already for a
+ * pass that opens its session up front — is still empty, so it counts as the zero it is.
  */
 export async function remainingApplyBudget(input: ApplyBudgetInput): Promise<number> {
   const paths = await jobSessionLogPaths(input.db, input.jobId);
@@ -54,9 +60,10 @@ export async function remainingApplyBudget(input: ApplyBudgetInput): Promise<num
   if (spends.some((spend) => spend === undefined)) {
     await note(
       input,
-      `an earlier attempt of this job left a session log anton could not read, so what it applied ` +
-        `unattended is unknown — this attempt applies nothing and every armed proposal it files ` +
-        `stays open as an ordinary ask`,
+      `a session log of this job could not be read — this attempt's own included, since a pass ` +
+        `opens its log with its session row — so what has been applied unattended under it is ` +
+        `unknown; this attempt applies nothing and every armed proposal it files stays open as an ` +
+        `ordinary ask`,
     );
     return 0;
   }

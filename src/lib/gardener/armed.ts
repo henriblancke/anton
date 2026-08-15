@@ -16,6 +16,12 @@
  *     Hitting the cap is the signal that this board wants somebody to look at it.
  *   • AN ACTOR. Every apply here is made with nobody watching, so it is recorded as `policy` and the
  *     proposal's closing note says so (see apply.ts `ApplyActor`).
+ *   • A PULL BEFORE EVERY APPLY, and a stop when it fails. The pass pulled once before it read
+ *     (jobs/pass-preamble.ts), but that pull is old by the time this loop runs — a product-master
+ *     pass spends its whole judgment session in between — and a board read only ever re-reads THIS
+ *     checkout's working set. A subject another machine moved in that window reads as untouched
+ *     here, so apply's evidence checks would authorize an unattended write against a board that has
+ *     already moved on, and the nudge would publish it.
  *   • A SPEND WRITTEN BEFORE THE WRITE IT PAYS FOR. The cap is reconstructed from these very record
  *     lines by the next attempt of the same job (jobs/pass-budget.ts), so each apply reserves its
  *     line first and records the outcome after: an attempt that cannot be written is never made, and
@@ -29,6 +35,7 @@
  * Shared by both producers on purpose (gardener-proposals.ts, product-master-steps.ts): a
  * per-producer copy would be two answers to "how much may a pass write, and how does it say so".
  */
+import { beads } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
 import { applyProposal, ProposalApplyError } from "./apply";
 import { autonomyFor, type ProposalAutonomyPolicy } from "./autonomy";
@@ -144,22 +151,49 @@ export async function applyArmedProposals(input: ArmedInput): Promise<ArmedResul
 
   const records: ArmedRecord[] = [];
   const attempts = targets.slice(0, limit);
-  /** Stop applying, saying WHY and naming what is left standing — the cap's other silent failure. */
-  const stop = (why: string, untried: Array<{ proposal: EmittedProposal }>): void => {
+  /**
+   * Stop applying, saying WHY and naming what is left standing — the cap's other silent failure.
+   * The console always gets it; the line is RETURNED so a caller whose log is still healthy can put
+   * it on the record too (the one below cannot — writing the record is what failed).
+   */
+  const stop = (why: string, untried: Array<{ proposal: EmittedProposal }>): string => {
     const ids = untried.map((target) => target.proposal.id);
     held.push(...ids);
-    console.error(
-      `${input.producer} stopped applying — ${why}` +
-        (ids.length > 0
-          ? `; ${ids.length} armed proposal(s) stay open as ordinary asks (${ids.join(", ")})`
-          : ""),
-    );
+    const line =
+      `APPLY stopped — ${why}` +
+      (ids.length > 0
+        ? `; ${ids.length} armed proposal(s) stay open as ordinary asks (${ids.join(", ")})`
+        : "");
+    console.error(`${input.producer} ${line}`);
+    return line;
   };
 
   for (const [i, { proposal, plan }] of attempts.entries()) {
     // Between every apply, not once up front: each one is a board write, and a cancel arriving
     // mid-loop has to stop the rest rather than let a cancelled pass finish every armed move.
     if (input.signal?.aborted) break;
+
+    // The shared board, refreshed for THIS apply — for the same reason the board read below is a
+    // fresh one per proposal, one step further out: the read that follows only re-reads this
+    // checkout, so a subject another machine moved since the pass's own pull reads as untouched and
+    // apply's premise checks pass on evidence that is no longer true.
+    //
+    // Fails CLOSED, unlike the pass-level pull (jobs/pass-preamble.ts): that one costs a pass its
+    // freshness on reads nobody writes from, while this is the last thing between a stale premise
+    // and an unattended board write. The asks behind it stay open rather than being tried against
+    // the same stale board — the remote is unreachable for all of them, not just this one.
+    const stale = await pullFailure(input.repo);
+    if (stale) {
+      await write(
+        input,
+        stop(
+          `the shared board could not be pulled before ${proposal.id}, so anton cannot tell ` +
+            `whether another machine has already moved what this would write — ${stale}`,
+          attempts.slice(i),
+        ),
+      );
+      break;
+    }
 
     // The spend is recorded BEFORE the board is touched, never after. The record IS the accounting —
     // a retry of this job reconstructs what earlier attempts spent from these very lines
@@ -261,9 +295,27 @@ function reservationOf(ask: ArmedAsk): string {
 }
 
 /**
+ * Refresh the shared board, or say why this apply may not proceed.
+ *
+ * `beads.pull` RESOLVES for a workspace with no Dolt remote — a board with nowhere to be stale
+ * against is fresh by definition — and rejects on every failure that can leave this checkout behind
+ * one: auth, an unreachable remote, a real divergence (beads/bd.ts `runDoltSync`). So a rejection
+ * here means exactly "anton cannot establish that it is looking at the current board".
+ */
+async function pullFailure(repo: string): Promise<string | undefined> {
+  try {
+    await beads.pull(repo);
+    return undefined;
+  } catch (e) {
+    return messageOf(e);
+  }
+}
+
+/**
  * One proposal, applied against a board read FRESH for it — as the approve route reads one per
  * approval, and for a reason a shared snapshot could not answer: an earlier apply in this same loop
- * may have moved a bead this one rests on.
+ * may have moved a bead this one rests on. Fresh across MACHINES too: the caller pulls the shared
+ * board immediately before this runs, so the read below carries what other machines have written.
  *
  * Total. A {@link ProposalApplyError} is the board's answer or a rolled-back write, and anything
  * else is a bd that broke; both leave the proposal open with the reason on it, and neither stops the

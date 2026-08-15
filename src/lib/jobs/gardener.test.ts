@@ -1075,9 +1075,34 @@ describe("gardener patrol · armed", () => {
     // subject has moved and no line accounts for it.
     expect(closedIds().filter((id) => subjects.includes(id))).toHaveLength(0);
     expect(error.mock.calls.map((args) => args.join(" ")).join("\n")).toContain(
-      "stopped applying — the attempt at",
+      "APPLY stopped — the attempt at",
     );
     warn.mockRestore();
+    error.mockRestore();
+  });
+
+  it("applies nothing once the shared board cannot be pulled — a premise it cannot trust", async () => {
+    // The pass pulled once, before it read (pass-preamble.ts), and a board read only ever re-reads
+    // THIS checkout: a subject another machine moved since then reads as untouched, and apply would
+    // authorize the unattended write against it — then publish it with the nudge. Fail closed, as
+    // the whole armed path does, and leave the asks standing for a human.
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    pullMock.mockRejectedValue(new Error("remote unreachable"));
+    orphansMock.mockResolvedValue([orphan("t-4"), orphan("t-7")]);
+    boardIs(() => [cold("t-4"), cold("t-7")]);
+
+    await expectJobStatus(t.db, await runPatrol(), "done");
+
+    // Both asks were filed and NEITHER was applied: no subject closed, no proposal settled.
+    expect(createMock).toHaveBeenCalledTimes(2);
+    expect(closedIds()).toEqual([]);
+    // Never silently: the reason and what stays open land on the record the jobs page shows.
+    const stopped = (await applyLines()).find((l) => l.includes("stopped")) ?? "";
+    expect(stopped).toContain("the shared board could not be pulled before");
+    expect(stopped).toContain("2 armed proposal(s) stay open as ordinary asks");
+    // The cap is unspent: the stop lands BEFORE the line that buys an attempt against it, so a
+    // retry of this job inherits the whole cap rather than paying for writes never made.
+    expect((await applyLines()).some((l) => l.includes("APPLYING"))).toBe(false);
     error.mockRestore();
   });
 
