@@ -26,7 +26,10 @@ import {
   CLUSTER,
   cold,
   DEFER,
+  EPIC,
   failOn,
+  FEATURE,
+  GROUPED,
   landed,
   leased,
   LINK,
@@ -34,6 +37,7 @@ import {
   listByFlags,
   liveBeads,
   liveBoard,
+  MISFILED,
   onWrite,
   ordered,
   planFor,
@@ -161,6 +165,30 @@ describe("under the write lock — what a decided step re-asks before it lands",
     ]);
   });
 
+  // The mirror image, one tier up: an epic stops being a CONTAINER the instant its last feature
+  // leaves, and that move takes this same epic's write lock as its own subject's old home. Left with
+  // the snapshot, a card lands under an epic that is now a run target in its own right — demoting it
+  // out of its own run, which is the harm the tier bar exists to prevent.
+  it("refuses a home that stopped being a container epic since the snapshot", async () => {
+    const plan = planFor({
+      kind: "container-orphan",
+      move: "reparent",
+      subjects: [FEATURE.id],
+      target: EPIC.id,
+    });
+    const proposal = proposalFor(plan);
+    // The one feature that made it a container is re-parented away between the snapshot and this
+    // write, leaving the epic grouping nothing.
+    liveBeads.set(GROUPED.id, bead(GROUPED.id, { issue_type: "feature" }));
+
+    await expect(apply(proposal, [EPIC, GROUPED, FEATURE, proposal])).rejects.toMatchObject({
+      failure: "refused",
+    });
+    expect(calls).toEqual([
+      `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-epic is no longer a container epic — it groups no cards, so it is a run target in its own right, and landing anton-feat under it would demote it: its own run is cancelled and any ticket it carries is left beneath a card nothing will reach (\`ticket-under-container-epic\`)`,
+    ]);
+  });
+
   it("refuses a blocker that landed, and a survivor that reopened, under the write lock", async () => {
     const link = proposalFor(LINK);
     liveBeads.set("anton-bb", bead("anton-bb", { status: "closed" }));
@@ -267,6 +295,27 @@ describe("under the write lock — what a decided step re-asks before it lands",
     ).rejects.toMatchObject({ failure: "refused" });
     expect(calls).toEqual([
       `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-b has been written to since this proposal was filed — it is no longer the landed twin whose contents this bead matched, and superseding onto it now could retire the only copy of that work still open`,
+    ]);
+  });
+
+  // The home claim's two ends, re-asked against reads taken INSIDE the write locks. The snapshot
+  // decision cleared both, and it is already stale when the first write spawns — an edit landing in
+  // that window leaves status, liveness, claim and tier exactly as the plan found them, so nothing
+  // else under the lock objects.
+  it.each([
+    ["subject", "anton-a", "the bead whose contract this home was chosen for"],
+    ["home", CARD.id, "the home whose contract this bead was judged to belong under"],
+  ])("refuses a misfiled move whose %s was rewritten after the snapshot", async (_end, id, still) => {
+    const proposal = proposalFor(MISFILED);
+    const home = cold(CARD.id, { issue_type: "feature" });
+    const subject = child("anton-a", "anton-card9", { updated_at: "2025-01-01T00:00:00Z" });
+    liveBeads.set(id, warm(id, id === CARD.id ? { issue_type: "feature" } : { parent: "anton-card9" }));
+
+    await expect(
+      apply(proposal, [home, bead("anton-card9", { issue_type: "feature" }), subject, proposal]),
+    ).rejects.toMatchObject({ failure: "refused" });
+    expect(calls).toEqual([
+      expect.stringContaining(`${id} has been written to since this proposal was filed — it is no longer ${still}`),
     ]);
   });
 
@@ -391,6 +440,24 @@ describe("under the write lock — what a decided step re-asks before it lands",
         `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-a now rides anton-other's ticket set rather than anton-run's ticket set — the run target it hangs under changed since this proposal was decided, so retiring anton-a out of its ticket set would act on a ticket set this approval never looked at`,
       ]);
     }
+  });
+
+  // A re-parent raids a ticket set exactly as a retirement does — it hands the bead to another card
+  // — so it locks the card the subject is LEAVING and re-reads it too. The pickup queues on that
+  // same per-bead chain, so either the claim lands before this read or it queues behind the write.
+  it("refuses to move a ticket out of a card a run claimed AFTER the snapshot", async () => {
+    const proposal = proposalFor(MISFILED);
+    const from = bead("anton-card9", { issue_type: "feature" });
+    liveBeads.set(from.id, { ...from, assignee: "runner-7", status: "in_progress" });
+
+    const board = [cold(CARD.id, { issue_type: "feature" }), from, cold("anton-a", { parent: from.id })];
+    await expect(apply(proposal, [...board, proposal])).rejects.toMatchObject({
+      failure: "refused",
+    });
+    expect(calls.some((c) => c.startsWith("reparent"))).toBe(false);
+    expect(calls[0]).toMatch(
+      /anton-card9 was claimed by runner-7 since this proposal was decided .* moving anton-a out of its ticket set/,
+    );
   });
 
   // The same gap from the other side: a subject that rode NO ticket set when the plan was made, and

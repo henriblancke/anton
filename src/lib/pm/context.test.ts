@@ -11,7 +11,13 @@
 import { describe, expect, it } from "vitest";
 import type { Bead } from "../beads/bd";
 import { LABELS } from "../beads/bd";
-import { detectionsFor, formatPmBoardContext, parsePmReport, type PmClaim } from "./context";
+import {
+  detectionsFor,
+  formatPmBoardContext,
+  MAX_GOAL_CHARS,
+  parsePmReport,
+  type PmClaim,
+} from "./context";
 
 function bead(id: string, o: Partial<Bead> = {}): Bead {
   return { id, title: id, status: "open", issue_type: "task", priority: 2, ...o };
@@ -22,13 +28,19 @@ const NOW = Date.parse("2026-08-04T12:00:00Z");
 /** A report block exactly as the protocol demands it — the shape every parse case varies from. */
 const report = (body: string): string => `Here is what I found.\n\n\`\`\`json\n${body}\n\`\`\``;
 
-const claim = (o: Partial<PmClaim> = {}): PmClaim => ({
-  kind: "kill",
-  bead: "anton-a",
-  summary: "nothing wants this any more",
-  evidence: ["three reviews at 3, 2, 2"],
-  ...o,
-});
+/**
+ * A claim of any kind: the `kill` shape — the only one needing no per-kind field — with the case's
+ * own overrides spread over it. The assertion is what a factory over a discriminated union costs;
+ * each call site names the field its kind requires.
+ */
+const claim = (o: Partial<PmClaim> = {}): PmClaim =>
+  ({
+    kind: "kill",
+    bead: "anton-a",
+    summary: "nothing wants this any more",
+    evidence: ["three reviews at 3, 2, 2"],
+    ...o,
+  }) as PmClaim;
 
 describe("formatPmBoardContext", () => {
   const board = [
@@ -91,9 +103,169 @@ describe("formatPmBoardContext", () => {
       now: NOW,
     });
     expect(sectionOf(text, "Run targets")).toContain("- anton-child [feature]");
-    // The container itself is a grouping shell, so it is neither a run target nor loose work.
-    expect(text).not.toContain("anton-cont ");
+    // The container groups run targets rather than being one, so it is neither a target nor work.
+    expect(sectionOf(text, "Run targets")).not.toContain("- anton-cont ");
     expect(sectionOf(text, "Work no run target carries")).toContain("- anton-orphan");
+  });
+
+  // A home claim the pass cannot see is a home claim it cannot make: grouped rendering alone says
+  // WHERE a bead sits in this prompt, never where it sits on the board.
+  it("names the epic a run target hangs off, id and title both", () => {
+    const text = formatPmBoardContext({
+      board: [
+        bead("anton-home", { issue_type: "epic", title: "Payments rails" }),
+        bead("anton-under", { issue_type: "feature", parent: "anton-home" }),
+      ],
+      now: NOW,
+    });
+    expect(sectionOf(text, "Run targets")).toContain(
+      `- anton-under [feature] · P2 · under anton-home "Payments rails"`,
+    );
+  });
+
+  it("names the card that carries each ticket, at any depth", () => {
+    const text = formatPmBoardContext({
+      board: [...board, bead("anton-sub", { parent: "anton-tick" })],
+      now: NOW,
+    });
+    const targets = sectionOf(text, "Run targets");
+    expect(targets).toMatch(/ {2}- anton-tick [^\n]*under anton-feat "anton-feat"/);
+    // The nesting shows anton-sub under the feature that RUNS it; only the line says what holds it.
+    expect(targets).toMatch(/ {2}- anton-sub [^\n]*under anton-tick "anton-tick"/);
+  });
+
+  // A nested ticket's PARENT is a bead no rehome could ever name as a home (a ticket's home must be
+  // a card), so a line showing only the parent reads as a ticket hanging off a non-card — and the
+  // repair for that appearance is a proposal to flatten nesting somebody meant.
+  it("names the run target that ships a nested ticket, not just the ticket above it", () => {
+    const text = formatPmBoardContext({
+      board: [...board, bead("anton-sub", { parent: "anton-tick" })],
+      now: NOW,
+    });
+    const targets = sectionOf(text, "Run targets");
+    expect(targets).toMatch(
+      / {2}- anton-sub [^\n]*under anton-tick "anton-tick" · shipped by anton-feat "anton-feat"/,
+    );
+    // Said only where it adds something: a ticket hanging straight off its own run target repeats it.
+    expect(targets).not.toMatch(/ {2}- anton-tick [^\n]*shipped by/);
+  });
+
+  // `rehome` is a claim about a home that is WRONG, and anton refuses one about a bead with none.
+  // A parentless task/bug is a RUN TARGET, so it renders here rather than in the loose section that
+  // says as much — silence on its line read as a home the pass had merely not been told.
+  it("says outright when a run target hangs under nothing at all", () => {
+    const text = formatPmBoardContext({
+      board: [...board, bead("anton-bug", { issue_type: "bug", priority: 0 })],
+      now: NOW,
+    });
+    expect(sectionOf(text, "Run targets")).toContain(
+      "- anton-bug [bug] · P0 · under nothing (no home to be the wrong one)",
+    );
+  });
+
+  // Without the contract text the pass is left judging homes by their names, which its own contract
+  // forbids: it must either omit every home claim or guess from the shape of the words.
+  it("carries what each bead states it is for, subjects and candidate homes alike", () => {
+    const text = formatPmBoardContext({
+      board: [
+        bead("anton-home", {
+          issue_type: "epic",
+          title: "Billing",
+          description: "## Goal\n\nOwn every surface that charges a customer.\n\n## Success Criteria\n\n- billed",
+        }),
+        bead("anton-card", { issue_type: "feature", parent: "anton-home" }),
+        bead("anton-loose", {
+          issue_type: "feature",
+          // No `## Goal`: an unshaped bead still says something about itself.
+          description: "Retry a failed card charge before we drop the subscription.",
+        }),
+      ],
+      now: NOW,
+    });
+    expect(sectionOf(text, "Container epics")).toContain(
+      "goal: Own every surface that charges a customer.",
+    );
+    expect(sectionOf(text, "Run targets")).toContain(
+      "goal: Retry a failed card charge before we drop the subscription.",
+    );
+  });
+
+  // `goalBody` returns the formula's TODO prompt when nothing is authored, so a scaffolded bead has
+  // stated nothing — while the prompt tells the pass every `goal:` line is the bead's own contract
+  // text and the only evidence a home claim may rest on. Rendering the placeholder would let a home
+  // be proposed on words the approval gate itself treats as missing.
+  it("renders no goal for a bead still carrying the formula's TODO prompt", () => {
+    const text = formatPmBoardContext({
+      board: [
+        bead("anton-todo", {
+          issue_type: "feature",
+          description: "## Goal\n\nTODO — what does this make true?\n\n## Success Criteria\n\n- [ ]",
+        }),
+      ],
+      now: NOW,
+    });
+    const targets = sectionOf(text, "Run targets");
+    expect(targets).toContain("- anton-todo [feature]");
+    expect(targets.split("\n").some((l) => l.trim().startsWith("goal:"))).toBe(false);
+  });
+
+  it("cuts a long goal rather than carrying a whole contract per bead", () => {
+    const text = formatPmBoardContext({
+      board: [
+        bead("anton-long", {
+          issue_type: "feature",
+          description: `## Goal\n\n${"word ".repeat(200)}`,
+        }),
+      ],
+      now: NOW,
+    });
+    const goal = text.split("\n").find((l) => l.trim().startsWith("goal:")) ?? "";
+    expect(goal).toHaveLength(`  goal: `.length + MAX_GOAL_CHARS + 1);
+    expect(goal.endsWith("…")).toBe(true);
+    // The cut is only honest if the pass is told the rest of the contract is not in the prompt.
+    expect(text).toContain("is NOT in this prompt");
+  });
+
+  it("shows a container epic that runs nothing of its own, since it is still a candidate home", () => {
+    const text = formatPmBoardContext({
+      board: [
+        bead("anton-cont", { issue_type: "epic", title: "Billing" }),
+        bead("anton-child", { issue_type: "feature", parent: "anton-cont" }),
+        bead("anton-empty", { issue_type: "epic", title: "Growth", parent: "anton-cont" }),
+        bead("anton-shell", { issue_type: "feature", parent: "anton-empty" }),
+      ],
+      now: NOW,
+    });
+    const homes = sectionOf(text, "Container epics");
+    // Counted transitively: anton-shell rides anton-empty, and anton-empty rides anton-cont.
+    expect(homes).toMatch(/- anton-cont \[epic\][^\n]*2 open run target\(s\) beneath it/);
+    expect(homes).toMatch(/- anton-empty \[epic\][^\n]*1 open run target\(s\) beneath it/);
+    // Nested containers are homes too, and carry their own parentage.
+    expect(homes).toMatch(/- anton-empty \[epic\][^\n]*under anton-cont "Billing"/);
+  });
+
+  it("truncates the containers and each card's tickets rather than losing them silently", () => {
+    const crowded = [
+      bead("anton-card", { issue_type: "feature" }),
+      ...Array.from({ length: 15 }, (_, i) => bead(`anton-t${i}`, { parent: "anton-card" })),
+      ...Array.from({ length: 80 }, (_, i) => [
+        bead(`anton-c${String(i).padStart(2, "0")}`, { issue_type: "epic" }),
+        bead(`anton-cf${String(i).padStart(2, "0")}`, {
+          issue_type: "feature",
+          parent: `anton-c${String(i).padStart(2, "0")}`,
+        }),
+      ]).flat(),
+    ];
+    const text = formatPmBoardContext({ board: crowded, now: NOW });
+    expect(text).toContain("…and 3 more ticket(s) under anton-card, not shown");
+    expect(text).toMatch(/20 further container epic\(s\) are NOT shown/);
+    expect(sectionOf(text, "Container epics").split("\n").filter((l) => l.startsWith("- "))).toHaveLength(60);
+  });
+
+  it("keeps the pass on one board it cannot write to", () => {
+    const text = formatPmBoardContext({ board, now: NOW });
+    expect(text).toContain("It is the only");
+    expect(text).toContain("board you have — you cannot run `bd`");
   });
 
   it("carries the review-score SERIES, which no board read alone can produce", () => {
@@ -130,6 +302,17 @@ describe("formatPmBoardContext", () => {
     expect(formatPmBoardContext({ board: [live], now: NOW })).toContain("IN FLIGHT");
   });
 
+  // The other half of "a run owns it": a claim the run-lease has not caught up to. No liveness signal
+  // sees it, so without the flag the pass reads a ticket a machine is working as free work.
+  it("marks work a run has claimed but not yet leased", () => {
+    const held = bead("anton-held", {
+      issue_type: "feature",
+      status: "in_progress",
+      assignee: "runner-7",
+    });
+    expect(formatPmBoardContext({ board: [held], now: NOW })).toContain("CLAIMED by runner-7");
+  });
+
   it("says what a cap dropped, so absence never reads as an empty board", () => {
     const many = Array.from({ length: 80 }, (_, i) =>
       bead(`anton-f${String(i).padStart(2, "0")}`, { issue_type: "feature" }),
@@ -150,6 +333,20 @@ describe("parsePmReport", () => {
     });
   });
 
+  it("reads a home claim as the subject and the home it names", () => {
+    const result = parsePmReport(
+      report(
+        `{"proposals":[{"kind":"rehome","bead":"anton-a","home":"anton-epic","summary":"s","evidence":["e"]}]}`,
+      ),
+    );
+    expect(result).toEqual({
+      ok: true,
+      claims: [
+        { kind: "rehome", bead: "anton-a", home: "anton-epic", summary: "s", evidence: ["e"] },
+      ],
+    });
+  });
+
   it("reads an EMPTY list as the healthy answer, not as a failure", () => {
     expect(parsePmReport(report(`{"proposals":[]}`))).toEqual({ ok: true, claims: [] });
   });
@@ -164,6 +361,9 @@ describe("parsePmReport", () => {
     ["a reprioritize with no priority", report(`{"proposals":[{"kind":"reprioritize","bead":"a","summary":"s","evidence":["e"]}]}`)],
     ["a reprioritize with a bogus priority", report(`{"proposals":[{"kind":"reprioritize","bead":"a","priority":"P9","summary":"s","evidence":["e"]}]}`)],
     ["a split with a single piece", report(`{"proposals":[{"kind":"split","bead":"a","pieces":["one"],"summary":"s","evidence":["e"]}]}`)],
+    // A home claim names two beads, and "this is misfiled" without the second names no move at all.
+    ["a rehome with no home", report(`{"proposals":[{"kind":"rehome","bead":"a","summary":"s","evidence":["e"]}]}`)],
+    ["a rehome whose home is blank", report(`{"proposals":[{"kind":"rehome","bead":"a","home":"  ","summary":"s","evidence":["e"]}]}`)],
     ["evidence-free judgment", report(`{"proposals":[{"kind":"kill","bead":"a","summary":"s","evidence":[]}]}`)],
   ])("refuses %s rather than reading it as a healthy board", (_label, text) => {
     const result = parsePmReport(text);
@@ -305,6 +505,179 @@ describe("detectionsFor", () => {
     expect(detections).toEqual([]);
     expect(rejected).toHaveLength(1);
     expect(rejected[0].reason).toMatch(reason);
+  });
+
+  // The home claim (anton-02po). One kind covers both tiers, so the accepted cases and the refusals
+  // are asserted over a board that carries both shapes: a ticket under the wrong card, and a card
+  // under the wrong epic.
+  describe("a home claim", () => {
+    /** The epic that already groups a card, so it is a container and may carry another. */
+    const container = bead("anton-epic", { issue_type: "epic" });
+    const grouped = bead("anton-f1", { issue_type: "feature", parent: container.id });
+    /** Two cards: the wrong home a ticket rides today, and the right one. */
+    const wrongCard = bead("anton-card1", { issue_type: "feature" });
+    const rightCard = bead("anton-card2", { issue_type: "feature" });
+    const ticket = bead("anton-t", { parent: wrongCard.id });
+    /** A card whose own home is the wrong epic — the other half of the same claim. */
+    const strayCard = bead("anton-stray", { issue_type: "feature", parent: "anton-other-epic" });
+    const otherEpic = bead("anton-other-epic", { issue_type: "epic" });
+
+    const board = [container, grouped, wrongCard, rightCard, ticket, strayCard, otherEpic];
+
+    const rehome = (bead: string, home: string): PmClaim =>
+      claim({ kind: "rehome", bead, home, summary: "it belongs over there" });
+
+    it("moves a ticket to another card, and a card to the epic that groups it", () => {
+      const { detections, rejected } = detectionsFor(
+        [rehome(ticket.id, rightCard.id), rehome(strayCard.id, container.id)],
+        board,
+        NOW,
+      );
+      expect(rejected).toEqual([]);
+      expect(detections.map((d) => [d.kind, d.move, d.subjects, d.target])).toEqual([
+        ["misfiled", "reparent", [ticket.id], rightCard.id],
+        ["misfiled", "reparent", [strayCard.id], container.id],
+      ]);
+      // The home is part of the claim's identity: two homes for one bead are two different asks.
+      expect(detections[0].subjectKey).toBe(`misfiled:${ticket.id}>${rightCard.id}`);
+      expect(detections[0].fingerprint.split(":")[0]).toBe("pm");
+    });
+
+    it.each([
+      [
+        "the home the bead already hangs under",
+        () => rehome(ticket.id, wrongCard.id),
+        /already hangs under anton-card1/,
+      ],
+      // The same no-op one tier out. A nested ticket already ships in the run of the card above its
+      // parent, and its line names that card as `shipped by` — the very evidence such a claim cites.
+      // The move changes no run; it only flattens nesting somebody meant.
+      [
+        "the card that already ships a nested ticket",
+        () => rehome("anton-t-nested", wrongCard.id),
+        /anton-t-nested already ships under anton-card1/,
+      ],
+      ["a home that is not on the board", () => rehome(ticket.id, "anton-ghost"), /not on the board/],
+      // The SUBJECT end of "which pass owns this ask". A parentless task/bug is a RUN TARGET, so it
+      // renders as one rather than in the loose section, and nothing else here stops a claim that
+      // demotes a standalone run into somebody else's child ticket. First homes are the gardener's.
+      [
+        "a bead that hangs under nothing — a first home is the gardener's ask, not this pass's",
+        () => rehome("anton-standalone", rightCard.id),
+        /hangs under nothing — giving homeless work its first home is the gardener's proposal/,
+      ],
+      // The rest of that ask. A ticket under a container epic HAS a parent, so the bar above waves
+      // it through — but no run target carries it, the context renders it as work nothing ships, and
+      // the gardener's container-orphan detector already proposes this move under its own
+      // fingerprint.
+      [
+        "a bead whose home runs nothing — the gardener's container-orphan ask, not this pass's",
+        () => rehome("anton-t-orphan", rightCard.id),
+        /no run target carries anton-t-orphan — it hangs under anton-epic, which runs nothing/,
+      ],
+      ["the bead itself", () => rehome(ticket.id, ticket.id), /cannot be its own home/],
+      ["a home that has settled", () => rehome(ticket.id, "anton-shut"), /already settled/],
+      ["a home a run is shipping", () => rehome(ticket.id, "anton-live"), /mid-run/],
+      [
+        "a home a run has claimed but not yet leased",
+        () => rehome(ticket.id, "anton-held"),
+        /is held by runner-7/,
+      ],
+      ["a home that is itself a proposal", () => rehome(ticket.id, "anton-prop"), /is a proposal/],
+      // The SUBJECT end of the same bar. A run working a ticket writes the assignee and
+      // `in_progress` onto it while the run-lease lives on the card above, so `subjectRefusal`'s
+      // liveness check waves it through — and a move out of that run's ticket set lands the commit
+      // in the old card's PR while the bead hangs off the new one.
+      [
+        "a bead a run has claimed but not yet leased",
+        () => rehome("anton-t-held", rightCard.id),
+        /anton-t-held is held by runner-3/,
+      ],
+      // The rest of that bar, and the half no per-bead signal reaches: a grouped run publishes ONE
+      // lease, on the card, and cascades an assignee only to the tickets it has already reached — so
+      // a ticket it has SELECTED carries neither, and both checks above read it as free work.
+      [
+        "a bead whose card a run is shipping",
+        () => rehome("anton-t-riding", rightCard.id),
+        /rides anton-live's ticket set and a run owns anton-live/,
+      ],
+      [
+        "a bead whose card a run has claimed but not yet leased",
+        () => rehome("anton-t-selected", rightCard.id),
+        /rides anton-held's ticket set and a run owns anton-held/,
+      ],
+      // The SUBJECT end of the tier taxonomy. A report is untrusted input, and every bar around this
+      // one reads "not a board card" — which a container epic satisfies as surely as a ticket does.
+      [
+        "a container epic, which groups the board's cards rather than riding one",
+        () => rehome(container.id, rightCard.id),
+        /anton-epic is not a bead a card can carry/,
+      ],
+      [
+        "a bead type the taxonomy names no home for",
+        () => rehome("anton-learn", rightCard.id),
+        /anton-learn is a learning, which is neither a board card nor working-layer work/,
+      ],
+      // The tier taxonomy, asked through apply's own homeWrongTier so the filing check and the
+      // approve check cannot disagree about which homes are legal.
+      [
+        "a ticket under something that is not a board card",
+        () => rehome(ticket.id, container.id),
+        /is not a board card/,
+      ],
+      [
+        "a card under a card",
+        () => rehome(strayCard.id, rightCard.id),
+        /a card hangs off an epic and nothing else/,
+      ],
+      [
+        "a card under an epic that groups no cards — the move would demote it out of its own run",
+        () => rehome(strayCard.id, "anton-lone"),
+        /is not a container epic/,
+      ],
+      [
+        "a home that sits under the bead being moved",
+        () => rehome(wrongCard.id, ticket.id),
+        /would make the subtree its own ancestor/,
+      ],
+    ])("refuses %s, and says why rather than dropping it", (_label, bad, reason) => {
+      const full = [
+        ...board,
+        bead("anton-shut", { issue_type: "feature", status: "closed" }),
+        bead("anton-live", {
+          issue_type: "feature",
+          labels: [LABELS.runLease(NOW + 600_000, "abc")],
+        }),
+        bead("anton-held", {
+          issue_type: "feature",
+          status: "in_progress",
+          assignee: "runner-7",
+        }),
+        bead("anton-prop", { issue_type: "feature", labels: ["pm:low-value:0123456789ab"] }),
+        bead("anton-lone", { issue_type: "epic" }),
+        // A ticket a run has picked up: the claim lives on it, the lease on the card it rides.
+        bead("anton-t-held", {
+          parent: wrongCard.id,
+          status: "in_progress",
+          assignee: "runner-3",
+        }),
+        // A subtask filed under a ticket: `feature → task → subtask`, shipped by the card at the top.
+        bead("anton-t-nested", { parent: ticket.id }),
+        // Two tickets a run has SELECTED but not reached: every signal lives on the card above them.
+        bead("anton-t-riding", { parent: "anton-live" }),
+        bead("anton-t-selected", { parent: "anton-held" }),
+        bead("anton-learn", { issue_type: "learning" }),
+        // A parentless bug: its own run target, and homeless — anton runs it exactly as it stands.
+        bead("anton-standalone", { issue_type: "bug", priority: 0 }),
+        // A ticket hanging straight off the container epic: it has a home, but no card ancestor, so
+        // no run reaches it — the state `detectContainerOrphans` owns.
+        bead("anton-t-orphan", { parent: container.id }),
+      ];
+      const { detections, rejected } = detectionsFor([bad()], full, NOW);
+      expect(detections).toEqual([]);
+      expect(rejected).toHaveLength(1);
+      expect(rejected[0].reason).toMatch(reason);
+    });
   });
 
   it("keeps the good claims when one in the batch is refused", () => {

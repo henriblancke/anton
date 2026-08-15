@@ -270,6 +270,15 @@ export const inReview = (id: string): Bead => bead(id, { labels: ["stage:in-revi
 /** A feature card with an open ticket under it — a legal re-parent home. */
 export const CARD = bead("anton-card", { issue_type: "feature" });
 
+/** The tier ABOVE a card: an epic, which may only carry cards once it already groups one. */
+export const EPIC = bead("anton-epic", { issue_type: "epic" });
+
+/** What makes {@link EPIC} a container — an epic groups cards the moment a feature lands under it. */
+export const GROUPED = child("anton-f1", EPIC.id, { issue_type: "feature" });
+
+/** A card as the SUBJECT of a move rather than its home: the tier whose home is an epic. */
+export const FEATURE = bead("anton-feat", { issue_type: "feature" });
+
 /**
  * The run target a retirement subject can ride as a TICKET. A grouped run publishes ONE lease, on
  * this bead — its tickets carry no liveness signal of their own — so this is where "a run is already
@@ -300,6 +309,18 @@ export const CLUSTER = planFor({
   kind: "parentless-cluster",
   move: "reparent",
   subjects: ["anton-a", "anton-b"],
+  target: CARD.id,
+});
+
+/**
+ * The product master's re-parent (anton-02po): a bead whose home is WRONG rather than missing. Its
+ * subject already rides a card, which is exactly what the gardener's two kinds refuse — so it is the
+ * one re-parent whose premise no board read restates, and the evidence fence is what stands in.
+ */
+export const MISFILED = planFor({
+  kind: "misfiled",
+  move: "reparent",
+  subjects: ["anton-a"],
   target: CARD.id,
 });
 
