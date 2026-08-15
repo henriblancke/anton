@@ -252,8 +252,9 @@ export async function actOnEscalation(
  * stopped work, and stays abandonable.
  *
  * Every call here is a SNAPSHOT: the settle, and the bd reads inside the abandon, all await after it.
- * It refuses early and cheaply; the answer that actually gates the destruction is the identical read
- * `abandonTicket`'s `requireStopped` makes at the cancel boundary itself.
+ * It refuses early and cheaply; the answer that actually gates the destruction is the one
+ * `abandonTicket`'s `requireStopped` makes at the cancel boundary itself — this read plus the shared
+ * lease, on the run target the abandon re-derives rather than the ancestor frozen here.
  */
 function restartedLocally(projectId: string, epicBeadId: string): boolean {
   return runIsLiveForTarget(projectId, epicBeadId);
@@ -290,8 +291,11 @@ async function readBead(repoPath: string, id: string): Promise<BeadRead> {
  *
  *   • Someone else picked the stall back up. Jobs and runs are machine-local, so the run-lease on the
  *     epic bead is the only record of that. Applying the stale button then resumes work already in
- *     flight — or, worse, abandons it, and `abandonTicket` reads only the bead's own status, so
- *     nothing downstream catches it.
+ *     flight — or, worse, abandons it.
+ *     Judged HERE against the ancestor the escalation froze, which is the one a resume re-enqueues.
+ *     An abandon executes under whatever run target sits above its ticket NOW — a different bead once
+ *     the board has been reparented — so its own `requireStopped` boundary re-reads the lease on that
+ *     one (see `stopRun`); this check is the cheap early half, not the whole of it.
  *   • The work SETTLED — the bead was deleted, or closed by hand. Then the verb has nothing left to
  *     act on: a resume hands execute-epic a bead it either can only park back on with
  *     `bead ... not found`, turning an intentional deletion into a poison job, or runs work that was
@@ -369,7 +373,13 @@ async function actOnBead(
   // abandon re-reads liveness where it would actually kill the run and refuses there instead (see
   // {@link restartedLocally}), so a resume landing in that window is answered with a
   // `RunRestartedError` and an untouched board rather than a cancelled job and a closed bead.
-  await abandonTicket(project, target, reason, { requireStopped: true });
+  //
+  // That boundary is also the only check that sees the run target this abandon ACTUALLY kills: the
+  // lease check above judged the escalation's frozen ancestor, and a bead reparented since (the
+  // gardener's apply, `beads.reparent`) executes under a different one — which the abandon re-derives
+  // and this machine's job table cannot speak for. So it re-reads the shared lease there too, with
+  // `ownRunId` exempting the stalled run's own leftover exactly as {@link readTargetState} does.
+  await abandonTicket(project, target, reason, { requireStopped: true, ownRunId: view.runId });
   await settleAbandonedWork(project.id, view, reason);
   return "abandoned";
 }
@@ -382,7 +392,10 @@ async function actOnBead(
  * Resume closes the gate first: execute-epic re-reads the board, so a run enqueued while the gate is
  * still open just parks on the same wait. Abandon closes it last: a gate that closes over a still-open
  * bead is exactly what gate-check's `plainGateResumes` dispatches, so it would hand the work back at
- * the moment the founder said to stop.
+ * the moment the founder said to stop. That order is also what keeps the gate safe from a stale
+ * abandon: a wait on a person can sit here for days, long enough for its bead to be reparented under
+ * a run target another machine now holds, and `abandonTicket`'s `requireStopped` refuses on that
+ * target's live lease (see `stopRun`) — before the bead is closed and therefore before the gate is.
  *
  * `target` is the escalation's frozen pointer and only ever a HINT: absent when the gate blocks nothing
  * anton runs — a molecule step, a bead this board read doesn't carry — and dropped when that work

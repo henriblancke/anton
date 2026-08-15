@@ -23,7 +23,7 @@ const abandonTicket =
       project: Project,
       id: string,
       reason: string,
-      opts?: { requireStopped?: boolean },
+      opts?: { requireStopped?: boolean; ownRunId?: string },
     ) => Promise<unknown>
   >();
 const resumeJob = vi.fn<(projectId: string, jobId: string) => Promise<boolean>>();
@@ -631,8 +631,12 @@ describe("actOnEscalation — the work was picked back up elsewhere", () => {
 
     await actOnEscalation(project, escalation.id, "abandon");
 
+    // `ownRunId` carries the exemption down with it: the checks above read the lease through the
+    // stalled run's own leftover, and the boundary check must read it the same way — the run target
+    // it re-derives is not the ancestor judged here (anton-mivh).
     expect(abandonTicket).toHaveBeenCalledWith(project, "anton-t9", expect.any(String), {
       requireStopped: true,
+      ownRunId: "r-1",
     });
   });
 
@@ -1403,6 +1407,36 @@ describe("actOnEscalation — a wait on a person", () => {
       gateResolve.mock.invocationCallOrder[0]!,
     );
     expect(gateResolve).toHaveBeenCalledWith(project.repoPath, "g-1", expect.any(String));
+  });
+
+  it("gives the abandon no own-run exemption — a wait on a person names no run of ours", async () => {
+    // `detectOpenHumanGates` records no runId, so there is no leftover lease of ours for the
+    // boundary check to mistake for a holder: every live lease it finds is another machine's.
+    await actOnEscalation(project, (await openGateWait()).id, "abandon");
+
+    expect(abandonTicket).toHaveBeenCalledWith(project, "anton-t9", expect.any(String), {
+      requireStopped: true,
+      ownRunId: undefined,
+    });
+  });
+
+  it("leaves the gate OPEN when the abandon refuses on a run another machine holds", async () => {
+    // The frozen ancestor the pre-settle lease check judged is not the run target the abandon
+    // executes under once the bead has been reparented — only `abandonTicket`'s own boundary sees
+    // that one. It refuses before the bead closes, and the gate close that follows never runs, so
+    // the wait is still on the board for the next sweep to raise (anton-mivh).
+    const logged = vi.spyOn(console, "warn").mockImplementation(() => {});
+    abandonTicket.mockRejectedValue(
+      new RunRestartedError("anton-e2", "is being executed on another machine"),
+    );
+    const escalation = await openGateWait();
+
+    expect(await actOnEscalation(project, escalation.id, "abandon")).toEqual({
+      ok: false,
+      reason: "contested",
+    });
+    expect(gateResolve).not.toHaveBeenCalled();
+    logged.mockRestore();
   });
 
   it("logs a resolve that landed with a resume that didn't, and leaves it recoverable", async () => {

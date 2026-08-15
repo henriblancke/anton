@@ -31,11 +31,12 @@ export class NotAbandonableError extends Error {
  * Thrown when an abandon that was decided against STOPPED work (`requireStopped`) finds a live run at
  * the instant it would have killed it. A `NotAbandonableError` so every route already mapping that to
  * 409 keeps working, and its own class so the escalation path can tell this apart from a bead that
- * was merely already closed.
+ * was merely already closed. `held` names WHERE the run is, because the two cases are answered
+ * differently by the operator: work restarted here is theirs to stop, work on another machine is not.
  */
 export class RunRestartedError extends NotAbandonableError {
-  constructor(targetId: string) {
-    super(`${targetId} is executing again — this abandon applies to work that had stopped`);
+  constructor(targetId: string, held = "is executing again") {
+    super(`${targetId} ${held} — this abandon applies to work that had stopped`);
     this.name = "RunRestartedError";
   }
 }
@@ -91,12 +92,30 @@ function runTargetOf(bead: Bead, board: Bead[]): string {
 }
 
 /**
+ * The precondition of an abandon decided against work the caller had observed STOPPED. `ownRunId` is
+ * that stopped run: its own leftover lease is not a foreign holder (see `beads.foreignRunLeaseLive`),
+ * so an abandon of a PARKED run — whose lease can still be unexpired — isn't refused by its own
+ * evidence. Absent when the stall named no run of its own (a wait on a person), where every live
+ * lease is another machine's.
+ */
+interface StoppedWork {
+  ownRunId?: string;
+}
+
+/**
  * Stop the run executing `targetId` — or, when the abandon was decided against work that had already
  * STOPPED, refuse at the instant the kill would land. The liveness read and the destructive act share
  * one boundary here, which is the only precondition that can tie the cancel to the stopped work it was
  * decided against: a caller's earlier snapshot goes stale across every await between it and this line
  * (a bd pull, an escalation settle), and by then the cancel has no way to tell a run that never
  * stopped from one an operator restarted in the meantime.
+ *
+ * BOTH machines' answers, because `targetId` is derived HERE (see {@link runTargetOf}) and the caller
+ * could not have judged it: reparenting is a supported move, so the run target above a ticket now is
+ * not always the ancestor the caller's own lease check froze, and a run holding the new one is
+ * invisible to the machine-local job table. So the shared board's run-lease is re-read on whatever
+ * this abandon actually kills — the target and every cascaded descendant — off the same board read
+ * the cascade is planned from.
  *
  * Refusing before any write, rather than skipping the cancel, is deliberate: closing the bead while
  * its agent keeps running is the same wrong answer one step later.
@@ -109,12 +128,28 @@ function runTargetOf(bead: Bead, board: Bead[]): string {
  * window at the cost of a global mutable reservation on the resume path, whose own failure mode —
  * a leaked entry that blocks every future resume of the target — is worse than what it prevents.
  */
-async function stopRun(projectId: string, targetId: string, requireStopped: boolean): Promise<void> {
-  if (!requireStopped) {
+async function stopRun(
+  projectId: string,
+  targetId: string,
+  board: Bead[],
+  stopped: StoppedWork | undefined,
+): Promise<void> {
+  if (!stopped) {
     await cancelRunForTarget(projectId, targetId);
     return;
   }
   if (runIsLiveForTarget(projectId, targetId)) throw new RunRestartedError(targetId);
+  // A target this board doesn't carry carries no lease either — a run publishes its lease on the
+  // bead, so a bead the read answered for by omission is evidence of no holder, not a failed read
+  // (the same rule readTargetState applies to a missing lease-holder). Only reachable at all through
+  // runTargetOf's dangling-parent fallback.
+  const target = board.find((b) => b.id === targetId);
+  if (!target) return;
+  const nowMs = Date.now();
+  const foreign = stopped.ownRunId
+    ? beads.foreignRunLeaseLive(target, nowMs, stopped.ownRunId)
+    : beads.isRunLive(target, nowMs);
+  if (foreign) throw new RunRestartedError(targetId, "is being executed on another machine");
 }
 
 /**
@@ -131,12 +166,12 @@ async function stopDescendantRuns(
   project: Project,
   target: Bead,
   board: Bead[],
-  requireStopped: boolean,
+  stopped: StoppedWork | undefined,
 ): Promise<Bead[]> {
   const descendants = openDescendants(board, target.id);
   for (const descendant of descendants) {
     if (beads.isRunTarget(descendant, board)) {
-      await stopRun(project.id, descendant.id, requireStopped);
+      await stopRun(project.id, descendant.id, board, stopped);
     }
   }
   return descendants;
@@ -245,8 +280,9 @@ function cascadeEntries(target: Bead, descendants: Bead[], why: string): Array<{
  * settled run target. A leaf ticket has no descendants, so it costs one board read and nothing else.
  *
  * `requireStopped` inverts the kill for a caller that decided against work it had observed STOPPED —
- * an escalation's abandon: a live run then means the decision is stale, so nothing is cancelled or
- * closed and `RunRestartedError` is thrown (see {@link stopRun}).
+ * an escalation's abandon: a run live on EITHER machine then means the decision is stale, so nothing
+ * is cancelled or closed and `RunRestartedError` is thrown (see {@link stopRun}). `ownRunId` exempts
+ * the stopped run's own leftover lease from that (see {@link StoppedWork}).
  *
  * Throws on an unknown id (bd's own error → 404), an empty/oversized reason (→ 400), or an
  * already-closed ticket (NotAbandonableError → 409).
@@ -255,18 +291,19 @@ export async function abandonTicket(
   project: Project,
   id: string,
   reason: string,
-  opts?: { requireStopped?: boolean },
+  opts?: { requireStopped?: boolean; ownRunId?: string },
 ): Promise<TicketDetail> {
   const why = requireReason(reason);
   const repo = project.repoPath;
   const bead = await beads.show(repo, id); // 404 guard — bd throws on an unknown id
   assertOpen(bead, "Ticket");
 
+  // Labels hydrated (no --skip-labels): the run-lease `requireStopped` reads lives on them.
   const listArgs = ["--status", "all"];
   const board = await beads.list(repo, listArgs);
-  const requireStopped = opts?.requireStopped === true;
-  await stopRun(project.id, runTargetOf(bead, board), requireStopped);
-  const descendants = await stopDescendantRuns(project, bead, board, requireStopped);
+  const stopped = opts?.requireStopped === true ? { ownRunId: opts.ownRunId } : undefined;
+  await stopRun(project.id, runTargetOf(bead, board), board, stopped);
+  const descendants = await stopDescendantRuns(project, bead, board, stopped);
 
   // Abandoning a gardener PROPOSAL is a DECLINE (anton-1t3n): the `abandoned` label it just gained
   // is what stops the patrol re-filing the same claim, so say that on the bead — the suppression is
@@ -344,7 +381,8 @@ export async function abandonEpic(
 
   // --skip-labels (bd 1.1.0): the cascade only inspects parent, status and type — openDescendants
   // walks the subtree, isRunTarget classifies it — so skipping label hydration keeps this
-  // full-board read lean.
+  // full-board read lean. Safe only because this path never passes `stopped`, whose lease check
+  // reads exactly those labels (see stopRun).
   const listArgs = ["--status", "all", "--skip-labels"];
   const all = await beads.list(repo, listArgs);
 
@@ -355,7 +393,7 @@ export async function abandonEpic(
   // work the board now calls won't-do. The epic's own id is cancelled too: a legacy (non-container)
   // epic is its own run target.
   await cancelRunForTarget(project.id, epicId);
-  const descendants = await stopDescendantRuns(project, epic, all, false);
+  const descendants = await stopDescendantRuns(project, epic, all, undefined);
 
   // Under the cascade's write locks, re-read and re-derived inside them, exactly as abandonTicket
   // settles: a gardener re-parent attaching work anywhere beneath this epic takes those same locks,

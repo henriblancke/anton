@@ -459,4 +459,81 @@ describe("abandonTicket with requireStopped", () => {
     expect(cancelRunMock.mock.calls).toEqual([["p1", "feature"]]);
     expect(soleAbandonedIds()).toEqual(["t1"]);
   });
+
+  // The caller's own lease check judges the ancestor the escalation FROZE; this boundary judges the
+  // run target the abandon re-derives. Reparenting is a supported move, so after one the two are
+  // different beads and only the read here can see a run holding the new one — the local job table
+  // never can (anton-mivh).
+  describe("against a run on ANOTHER machine", () => {
+    const liveLease = (owner: string) => `run-lease:${Date.now() + 60_000}:${owner}`;
+
+    /** feature-new carries `labels`; the ticket sits under it, not under the frozen `feature-old`. */
+    const reparented = (labels: string[]) => {
+      const ticket = makeBead({ id: "t1", parent: "feature-new" });
+      showMock.mockResolvedValue(ticket);
+      listMock.mockResolvedValue([
+        makeBead({ id: "feature-old", issue_type: "feature", parent: "epic" }),
+        makeBead({ id: "feature-new", issue_type: "feature", parent: "epic", labels }),
+        ticket,
+      ]);
+    };
+
+    it("refuses on the re-derived target's live lease, writing nothing", async () => {
+      reparented([liveLease("run-elsewhere")]);
+
+      await expect(
+        abandonTicket(project, "t1", "won't do", { requireStopped: true }),
+      ).rejects.toThrow(/another machine/);
+      expect(abandonAllMock).not.toHaveBeenCalled();
+      expect(cancelRunMock).not.toHaveBeenCalled();
+    });
+
+    it("proceeds past the stalled run's OWN leftover lease — that is the work being abandoned", async () => {
+      reparented([liveLease("run-stalled")]);
+
+      await abandonTicket(project, "t1", "won't do", {
+        requireStopped: true,
+        ownRunId: "run-stalled",
+      });
+
+      expect(soleAbandonedIds()).toEqual(["t1"]);
+    });
+
+    it("proceeds past an EXPIRED lease — a crashed machine holds nothing", async () => {
+      reparented([`run-lease:${Date.now() - 1_000}:run-elsewhere`]);
+
+      await abandonTicket(project, "t1", "won't do", { requireStopped: true });
+
+      expect(soleAbandonedIds()).toEqual(["t1"]);
+    });
+
+    it("refuses when it is a CASCADED descendant another machine is executing", async () => {
+      const epic = makeBead({ id: "epic", issue_type: "epic" });
+      showMock.mockResolvedValue(epic);
+      listMock.mockResolvedValue([
+        epic,
+        makeBead({
+          id: "feature",
+          issue_type: "feature",
+          parent: "epic",
+          labels: [liveLease("run-elsewhere")],
+        }),
+        makeBead({ id: "t1", parent: "feature" }),
+      ]);
+
+      await expect(
+        abandonTicket(project, "epic", "won't do", { requireStopped: true }),
+      ).rejects.toThrow(RunRestartedError);
+      expect(abandonAllMock).not.toHaveBeenCalled();
+    });
+
+    it("ignores a foreign lease when the option is absent — an explicit abandon kills what it finds", async () => {
+      reparented([liveLease("run-elsewhere")]);
+
+      await abandonTicket(project, "t1", "obsolete");
+
+      expect(cancelRunMock.mock.calls).toEqual([["p1", "feature-new"]]);
+      expect(soleAbandonedIds()).toEqual(["t1"]);
+    });
+  });
 });
