@@ -5,10 +5,10 @@ import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { SearchIcon } from "lucide-react";
 
 import type { TicketFilters, TicketRow } from "@/lib/types";
-import { cn } from "@/lib/utils";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
+import { FilterSelect, type FilterSelectOption } from "@/components/ui/filter-select";
 import {
   TICKET_FILTER_FIELDS,
   filtersFromSearchParams,
@@ -20,13 +20,11 @@ import {
   type TicketFilterField,
 } from "@/components/tickets/tickets-utils";
 
-type SelectOption = { value: string; label: string };
-
 function optionsForField(
   field: TicketFilterField,
   tickets: TicketRow[],
   epicOptions: EpicOption[],
-): SelectOption[] {
+): FilterSelectOption[] {
   if (field.options) return field.options;
   const key = field.key;
   if (key === "epic") {
@@ -37,11 +35,6 @@ function optionsForField(
   }
   return [];
 }
-
-const selectClassName = cn(
-  "h-8 min-w-24 rounded-lg border border-border bg-card px-2 text-xs text-foreground outline-none transition-colors",
-  "focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50",
-);
 
 export function TicketsFilters({ tickets }: { tickets: TicketRow[] }) {
   const router = useRouter();
@@ -118,8 +111,11 @@ export function TicketsFilters({ tickets }: { tickets: TicketRow[] }) {
       {TICKET_FILTER_FIELDS.map((field) => (
         <FilterSelect
           key={field.key}
+          idPrefix="ticket-filter"
           field={field.key}
           label={field.label}
+          emptyLabel={field.label}
+          wrapperClassName="flex flex-col gap-1"
           value={filters[field.key] ?? ""}
           options={optionsForField(field, tickets, epicOptions)}
           onChange={(value) => handleFieldChange(field.key, value)}
@@ -131,42 +127,6 @@ export function TicketsFilters({ tickets }: { tickets: TicketRow[] }) {
           Clear all
         </Button>
       )}
-    </div>
-  );
-}
-
-function FilterSelect({
-  field,
-  label,
-  value,
-  options,
-  onChange,
-}: {
-  field: string;
-  label: string;
-  value: string;
-  options: { value: string; label: string }[];
-  onChange: (value: string) => void;
-}) {
-  const id = `ticket-filter-${field}`;
-  return (
-    <div className="flex flex-col gap-1">
-      <Label htmlFor={id} className="sr-only">
-        {label}
-      </Label>
-      <select
-        id={id}
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-        className={selectClassName}
-      >
-        <option value="">{label}</option>
-        {options.map((option) => (
-          <option key={option.value} value={option.value}>
-            {option.label}
-          </option>
-        ))}
-      </select>
     </div>
   );
 }
