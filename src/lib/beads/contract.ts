@@ -167,8 +167,10 @@ function sectionsOf(description: string, keys: ReadonlySet<string>): Map<string,
 }
 
 /** The description text ahead of the first heading — an epic whose outcome is written as a bare
- * line rather than under `## Goal` still states one, and must not be faulted for it. */
-function preambleOf(description: string): string {
+ * line rather than under `## Goal` still states one, and must not be faulted for it. Exported for
+ * the readers that must render what an UNSHAPED bead says about itself (pm/context.ts): a ticket
+ * with no `## Goal` still has a contract, and a reader blind to this home shows it as blank. */
+export function preambleOf(description: string): string {
   const lines: string[] = [];
   for (const { text, heading } of scanMarkdown(description)) {
     if (heading) break;
@@ -268,6 +270,19 @@ function bodyState(raw: string): SectionState {
   const lines = contentLines(raw);
   if (lines.length === 0) return "absent";
   return lines.every((l) => !l.fenced && PROMPT_LINE.test(l.text)) ? "prompt" : "written";
+}
+
+/**
+ * Did an author WRITE this body, or is it still the formula's TODO prompt (or nothing at all)?
+ *
+ * The public half of {@link bodyState}, for readers that quote a contract section back as the bead's
+ * own words. {@link acceptanceBody} and {@link goalBody} deliberately return the prompt when nothing
+ * is written — a view must show the placeholder beside its "no rubric yet" marker — but a reader that
+ * REASONS from the text needs the same distinction the gate makes, or it treats scaffolding the
+ * approval gate calls missing as something the bead stated.
+ */
+export function isAuthoredBody(body: string | undefined): boolean {
+  return typeof body === "string" && bodyState(body) === "written";
 }
 
 /** How one section's gap reads, at either state it can be in. */

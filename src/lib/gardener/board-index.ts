@@ -232,17 +232,40 @@ export function isClaimed(bead: Bead): boolean {
  * without ever being a board card.
  */
 export function ticketOwnerOf(index: BoardIndex, bead: Bead): Bead | undefined {
+  return ticketAncestry(index, bead).owner;
+}
+
+/**
+ * The ancestors this bead reaches its run target THROUGH — every strict ancestor the walk passes
+ * before it lands on one, or, when nothing above the bead runs, the whole chain it climbed. Empty
+ * when the bead hangs directly off its run target or is one itself.
+ *
+ * bd nesting runs to any depth, so a `feature → task → subtask` subtask reaches its card through the
+ * task. Those in-between beads are where ownership can change WITHOUT the bead itself being written
+ * to — re-homing one hands the whole subtree to another card — which is the one thing a fence read
+ * off the bead's own stamp cannot see (see apply-plan.ts `carrierMoved`).
+ */
+export function ticketPathOf(index: BoardIndex, bead: Bead): Bead[] {
+  return ticketAncestry(index, bead).through;
+}
+
+/** The walk both readings share: what the bead climbs through, and the run target it lands on. */
+function ticketAncestry(index: BoardIndex, bead: Bead): { through: Bead[]; owner?: Bead } {
+  const through: Bead[] = [];
   const seen = new Set<string>();
   let current: Bead | undefined = bead;
   while (current && !seen.has(current.id)) {
     // Plumbing coordinates work rather than running it, and nothing above it runs this bead either.
-    if (isPipelineArtifact(current)) return undefined;
-    if (beads.isRunTarget(current, index.all)) return current.id === bead.id ? undefined : current;
+    if (isPipelineArtifact(current)) return { through };
+    if (beads.isRunTarget(current, index.all)) {
+      return current.id === bead.id ? { through } : { through, owner: current };
+    }
+    if (current.id !== bead.id) through.push(current);
     seen.add(current.id);
     const parent = beads.parentOf(current);
     current = parent ? index.byId.get(parent) : undefined;
   }
-  return undefined;
+  return { through };
 }
 
 /** bd's last-write stamp, falling back to creation — a bead carrying neither is simply undated. */

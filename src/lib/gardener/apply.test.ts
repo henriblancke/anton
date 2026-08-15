@@ -267,6 +267,15 @@ const inReview = (id: string): Bead => bead(id, { labels: ["stage:in-review"] })
 /** A feature card with an open ticket under it — a legal re-parent home. */
 const CARD = bead("anton-card", { issue_type: "feature" });
 
+/** The tier ABOVE a card: an epic, which may only carry cards once it already groups one. */
+const EPIC = bead("anton-epic", { issue_type: "epic" });
+
+/** What makes {@link EPIC} a container — an epic groups cards the moment a feature lands under it. */
+const GROUPED = child("anton-f1", EPIC.id, { issue_type: "feature" });
+
+/** A card as the SUBJECT of a move rather than its home: the tier whose home is an epic. */
+const FEATURE = bead("anton-feat", { issue_type: "feature" });
+
 /**
  * The run target a retirement subject can ride as a TICKET. A grouped run publishes ONE lease, on
  * this bead — its tickets carry no liveness signal of their own — so this is where "a run is already
@@ -297,6 +306,18 @@ const CLUSTER = planFor({
   kind: "parentless-cluster",
   move: "reparent",
   subjects: ["anton-a", "anton-b"],
+  target: CARD.id,
+});
+
+/**
+ * The product master's re-parent (anton-02po): a bead whose home is WRONG rather than missing. Its
+ * subject already rides a card, which is exactly what the gardener's two kinds refuse — so it is the
+ * one re-parent whose premise no board read restates, and the evidence fence is what stands in.
+ */
+const MISFILED = planFor({
+  kind: "misfiled",
+  move: "reparent",
+  subjects: ["anton-a"],
   target: CARD.id,
 });
 
@@ -398,7 +419,9 @@ describe("planApply — what an approval means against the board as it now is", 
       summary: "re-parented anton-a, anton-b under anton-card",
       steps: [
         // `claim`/`parentClaim` empty — neither end of the move is owned by a run, which is the
-        // pair the write re-checks under the locks it takes on both.
+        // pair the write re-checks under the locks it takes on both. The fence rides along for the
+        // ONE re-parent kind a fresh board read cannot re-derive (`misfiled`); this one carries no
+        // premise, so it changes nothing here.
         {
           verb: "reparent",
           id: "anton-a",
@@ -406,6 +429,8 @@ describe("planApply — what an approval means against the board as it now is", 
           parent: "anton-card",
           undoParent: "anton-container",
           parentClaim: "",
+          kind: "parentless-cluster",
+          observedAtMs: Date.parse(FILED),
         },
         // A parentless subject undoes to bd's detach form, not to some invented parent.
         {
@@ -415,6 +440,8 @@ describe("planApply — what an approval means against the board as it now is", 
           parent: "anton-card",
           undoParent: "",
           parentClaim: "",
+          kind: "parentless-cluster",
+          observedAtMs: Date.parse(FILED),
         },
       ],
     });
@@ -571,6 +598,63 @@ describe("planApply — what an approval means against the board as it now is", 
       const container = bead("anton-card", { issue_type: "epic" });
       const board = [container, child("anton-f", container.id, { issue_type: "feature" }), bead("anton-a")];
       expect(refusal(decide(REPARENT, board))).toMatch(/not a board card/);
+    });
+
+    // The tier taxonomy asks for A HOME ONE TIER UP (`epic → feature → ticket`), so which home is
+    // legal depends on what is being moved: the working layer wants the card that runs it, a CARD
+    // wants the container epic that groups it. One question for both refused every card move.
+    describe("a home one tier up — the bar depends on the subject's tier", () => {
+      const move = (subject: string, target: string): GardenerPlan =>
+        planFor({ kind: "container-orphan", move: "reparent", subjects: [subject], target });
+
+      it("moves a card under the container epic that groups it", () => {
+        const board = [EPIC, GROUPED, FEATURE];
+        expect(decide(move(FEATURE.id, EPIC.id), board)).toMatchObject({ status: "apply" });
+      });
+
+      it("refuses a card under a feature — both are run targets, so it would ship twice", () => {
+        expect(refusal(decide(move(FEATURE.id, CARD.id), [CARD, FEATURE]))).toMatch(
+          /anton-card is not an epic .*feature-under-non-epic/,
+        );
+      });
+
+      // An epic that groups no cards is a run target itself, and renders as a card: landing a
+      // feature under it cancels its own run and strands whatever tickets it carries.
+      it("refuses a card under an epic that groups none — the move would demote it", () => {
+        const board = [EPIC, FEATURE, child("anton-t1", EPIC.id)];
+        expect(refusal(decide(move(FEATURE.id, EPIC.id), board))).toMatch(
+          /anton-epic is not a container epic .*ticket-under-container-epic/,
+        );
+      });
+
+      it("refuses a working-layer bead under a container epic — it would ride no card", () => {
+        const board = [EPIC, GROUPED, bead("anton-a")];
+        expect(refusal(decide(move("anton-a", EPIC.id), board))).toMatch(
+          /anton-epic is not a board card/,
+        );
+      });
+
+      it("still moves a working-layer bead under a board card", () => {
+        expect(decide(move("anton-a", CARD.id), [CARD, bead("anton-a")]).status).toBe("apply");
+      });
+
+      // The SUBJECT end of the same taxonomy, which has to be asked positively: every bar around it
+      // reads "not a board card", and a container epic satisfies that as surely as a ticket does. A
+      // product-master report naming one is untrusted input, and left to the working layer's bar the
+      // move is accepted — after which `cardOf` walks THROUGH the container and hands that card's run
+      // every ticket beneath it.
+      it("refuses a container epic as the SUBJECT — no card can carry one", () => {
+        expect(refusal(decide(move(EPIC.id, CARD.id), [EPIC, GROUPED, CARD]))).toMatch(
+          /anton-epic is not a bead a card can carry — it is a container epic/,
+        );
+      });
+
+      it("refuses a subject the taxonomy names no home for at all", () => {
+        const learning = bead("anton-l", { issue_type: "learning" });
+        expect(refusal(decide(move(learning.id, CARD.id), [CARD, learning]))).toMatch(
+          /anton-l is a learning, which is neither a board card nor working-layer work/,
+        );
+      });
     });
 
     // The home is written to as surely as the subject is, just indirectly: a run that has already
@@ -800,6 +884,105 @@ describe("planApply — what an approval means against the board as it now is", 
     // so it is still the fix rather than a decision to preserve.
     it("still re-homes a subject moved under something that is not a card", () => {
       expect(decide(REPARENT, [CARD, child("anton-a", "anton-container")]).status).toBe("apply");
+    });
+
+    // The `misfiled` half of the same verb (anton-02po). Its subject rides a perfectly good card —
+    // that IS the claim — so the card check above would refuse every one of them; what stands in is
+    // the evidence fence, asked at BOTH ends because a home claim is a match between two contracts.
+    describe("a misfiled home claim", () => {
+      /** The card the subject rides today: a real board card, which is what makes it misfiled. */
+      const wrongHome = bead("anton-card9", { issue_type: "feature" });
+      const subject = (extra: Partial<Bead> = {}): Bead =>
+        child("anton-a", wrongHome.id, { updated_at: "2025-01-01T00:00:00Z", ...extra });
+      const home = (extra: Partial<Bead> = {}): Bead =>
+        cold(CARD.id, { issue_type: "feature", ...extra });
+
+      it("moves a subject that already rides a card, which the gardener's kinds refuse", () => {
+        const board = [home(), wrongHome, subject()];
+        expect(decide(MISFILED, board).status).toBe("apply");
+        // Same board, the gardener's claim: "no card carries this" is re-derivable and now false.
+        expect(reason(decide(REPARENT, board))).toMatch(/now rides board card anton-card9/);
+      });
+
+      it("refuses when the subject was rewritten after the filing", () => {
+        expect(reason(decide(MISFILED, [home(), wrongHome, subject(warm("anton-a"))]))).toMatch(
+          /no longer the bead whose contract this home was chosen for/,
+        );
+        expect(reason(decide(MISFILED, [home(), wrongHome, child("anton-a", wrongHome.id)]))).toMatch(
+          /no write stamp/,
+        );
+      });
+
+      // The HOME's end of the match, and the one nothing else notices: every other bar asks whether
+      // the home is still open, unclaimed and the right tier, all of which a rewrite leaves intact.
+      it("refuses when the HOME was rewritten after the filing", () => {
+        expect(
+          reason(decide(MISFILED, [warm(CARD.id, { issue_type: "feature" }), wrongHome, subject()])),
+        ).toMatch(/no longer the home whose contract this bead was judged to belong under/);
+      });
+
+      // The card the subject is LEAVING is a run target too, and the only place a run over it is
+      // visible: a ticket that run selected but has not yet reached carries no lease, no PR ref and
+      // no claim of its own. Moving it out now leaves the run's commit landing in the old card's PR
+      // while the bead hangs off the new one — the same raid a retirement makes, by another verb.
+      it("refuses to move a ticket out of the ticket set of a card a run owns", () => {
+        const live = { ...wrongHome, labels: [LABELS.runLease(NOW + 60_000, "run-9")] };
+        expect(reason(decide(MISFILED, [home(), live, subject()]))).toMatch(
+          /anton-card9 is mid-run .* moving anton-a out of its ticket set/,
+        );
+        const claimed = warm(wrongHome.id, {
+          issue_type: "feature",
+          assignee: "runner-7",
+          status: "in_progress",
+        });
+        expect(reason(decide(MISFILED, [home(), claimed, subject()]))).toMatch(
+          /anton-card9 is held by runner-7 .* moving anton-a out of its ticket set/,
+        );
+      });
+
+      // The outcome the ask wanted, put there by hand, is still the outcome — and re-homing a bead
+      // is itself a write since the filing, so a fence asked before the settle check would refuse
+      // the one answer the proposal most wants.
+      it("settles a subject somebody has already moved home, fence or no fence", () => {
+        expect(decide(MISFILED, [home(), warm("anton-a", { parent: CARD.id })])).toEqual({
+          status: "settled",
+          summary: "anton-a already sits under anton-card",
+        });
+      });
+
+      // bd nesting runs to any depth, so the card that SHIPS the subject can be its grandparent —
+      // and re-homing the bead in between hands the whole subtree to another card while leaving the
+      // subject's own parent and stamp untouched. Every other bar re-derives ownership from the
+      // fresh board and so records that newcomer as its own baseline; the PATH's stamps are the only
+      // thing that dates the subtree's move against the filing.
+      describe("whose subject reaches its card through another bead", () => {
+        const via = (extra: Partial<Bead> = {}): Bead => child("anton-mid", wrongHome.id, extra);
+        const nested = (mid: Bead): Bead[] => [
+          home(),
+          wrongHome,
+          mid,
+          child("anton-a", mid.id, { updated_at: "2025-01-01T00:00:00Z" }),
+        ];
+
+        it("moves it while the whole path predates the filing", () => {
+          const decision = decide(MISFILED, nested(via({ updated_at: "2025-01-01T00:00:00Z" })));
+          expect(decision.status).toBe("apply");
+        });
+
+        it("refuses when the bead in between was written after the filing", () => {
+          expect(
+            reason(decide(MISFILED, nested(via({ updated_at: "2026-07-15T00:00:00Z" })))),
+          ).toMatch(
+            /anton-a reaches the card that ships it through anton-mid, and anton-mid has been written to since this proposal was filed/,
+          );
+        });
+
+        it("refuses when nothing dates the bead in between against the filing", () => {
+          expect(reason(decide(MISFILED, nested(via())))).toMatch(
+            /anton-a reaches the card that ships it through anton-mid, which carries no write stamp/,
+          );
+        });
+      });
     });
 
     // An `implied-order` ask rests on ONE piece of evidence — a body phrase on one end of the pair —
@@ -1131,6 +1314,30 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     ]);
   });
 
+  // The mirror image, one tier up: an epic stops being a CONTAINER the instant its last feature
+  // leaves, and that move takes this same epic's write lock as its own subject's old home. Left with
+  // the snapshot, a card lands under an epic that is now a run target in its own right — demoting it
+  // out of its own run, which is the harm the tier bar exists to prevent.
+  it("refuses a home that stopped being a container epic since the snapshot", async () => {
+    const plan = planFor({
+      kind: "container-orphan",
+      move: "reparent",
+      subjects: [FEATURE.id],
+      target: EPIC.id,
+    });
+    const proposal = proposalFor(plan);
+    // The one feature that made it a container is re-parented away between the snapshot and this
+    // write, leaving the epic grouping nothing.
+    liveBeads.set(GROUPED.id, bead(GROUPED.id, { issue_type: "feature" }));
+
+    await expect(apply(proposal, [EPIC, GROUPED, FEATURE, proposal])).rejects.toMatchObject({
+      failure: "refused",
+    });
+    expect(calls).toEqual([
+      `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-epic is no longer a container epic — it groups no cards, so it is a run target in its own right, and landing anton-feat under it would demote it: its own run is cancelled and any ticket it carries is left beneath a card nothing will reach (\`ticket-under-container-epic\`)`,
+    ]);
+  });
+
   it("refuses a blocker that landed, and a survivor that reopened, under the write lock", async () => {
     const link = proposalFor(LINK);
     liveBeads.set("anton-bb", bead("anton-bb", { status: "closed" }));
@@ -1237,6 +1444,27 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     ).rejects.toMatchObject({ failure: "refused" });
     expect(calls).toEqual([
       `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-b has been written to since this proposal was filed — it is no longer the landed twin whose contents this bead matched, and superseding onto it now could retire the only copy of that work still open`,
+    ]);
+  });
+
+  // The home claim's two ends, re-asked against reads taken INSIDE the write locks. The snapshot
+  // decision cleared both, and it is already stale when the first write spawns — an edit landing in
+  // that window leaves status, liveness, claim and tier exactly as the plan found them, so nothing
+  // else under the lock objects.
+  it.each([
+    ["subject", "anton-a", "the bead whose contract this home was chosen for"],
+    ["home", CARD.id, "the home whose contract this bead was judged to belong under"],
+  ])("refuses a misfiled move whose %s was rewritten after the snapshot", async (_end, id, still) => {
+    const proposal = proposalFor(MISFILED);
+    const home = cold(CARD.id, { issue_type: "feature" });
+    const subject = child("anton-a", "anton-card9", { updated_at: "2025-01-01T00:00:00Z" });
+    liveBeads.set(id, warm(id, id === CARD.id ? { issue_type: "feature" } : { parent: "anton-card9" }));
+
+    await expect(
+      apply(proposal, [home, bead("anton-card9", { issue_type: "feature" }), subject, proposal]),
+    ).rejects.toMatchObject({ failure: "refused" });
+    expect(calls).toEqual([
+      expect.stringContaining(`${id} has been written to since this proposal was filed — it is no longer ${still}`),
     ]);
   });
 
@@ -1409,6 +1637,24 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
         `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-a now rides anton-other's ticket set rather than anton-run's ticket set — the run target it hangs under changed since this proposal was decided, so retiring anton-a out of its ticket set would act on a ticket set this approval never looked at`,
       ]);
     }
+  });
+
+  // A re-parent raids a ticket set exactly as a retirement does — it hands the bead to another card
+  // — so it locks the card the subject is LEAVING and re-reads it too. The pickup queues on that
+  // same per-bead chain, so either the claim lands before this read or it queues behind the write.
+  it("refuses to move a ticket out of a card a run claimed AFTER the snapshot", async () => {
+    const proposal = proposalFor(MISFILED);
+    const from = bead("anton-card9", { issue_type: "feature" });
+    liveBeads.set(from.id, { ...from, assignee: "runner-7", status: "in_progress" });
+
+    const board = [cold(CARD.id, { issue_type: "feature" }), from, cold("anton-a", { parent: from.id })];
+    await expect(apply(proposal, [...board, proposal])).rejects.toMatchObject({
+      failure: "refused",
+    });
+    expect(calls.some((c) => c.startsWith("reparent"))).toBe(false);
+    expect(calls[0]).toMatch(
+      /anton-card9 was claimed by runner-7 since this proposal was decided .* moving anton-a out of its ticket set/,
+    );
   });
 
   // The same gap from the other side: a subject that rode NO ticket set when the plan was made, and

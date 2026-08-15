@@ -171,8 +171,8 @@ async function cascadeSubtree(repo: string, epicId: string): Promise<Bead[]> {
  * that step's locked re-read and its write — destroying the home mid-move, while the step still
  * reported success and its proposal closed as applied over a subject that no longer exists.
  * Serialized, the delete either lands first — and the step's own locked home re-check refuses
- * (`assertHomeIsCard`: a deleted bead is no board card) — or it waits behind the move and then sees
- * the newcomer in the re-derived subtree below.
+ * (`assertHomeFitsSubject`: a deleted bead is no home at all) — or it waits behind the move and
+ * then sees the newcomer in the re-derived subtree below.
  *
  * The subtree is re-derived inside the locks and a CHANGED one refuses, because the lock set was
  * chosen from a snapshot: `bd delete --cascade` erases whatever hangs beneath the epic at write

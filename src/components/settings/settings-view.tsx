@@ -140,7 +140,7 @@ interface AutonomyKindSpec {
 }
 
 /**
- * The eleven kinds grouped by REVERSIBILITY — the whole design of the control (anton-nbyy).
+ * Every detection kind grouped by REVERSIBILITY — the whole design of the control (anton-nbyy).
  *
  * A flat list makes arming `implied-order` and arming `shipped-orphan` look like the same decision,
  * and they are nothing alike: one adds an edge a single write removes, the other writes "this
@@ -179,6 +179,10 @@ const AUTONOMY_GROUPS: {
       { id: "implied-order", does: "adds the blocks edge two beads' bodies already state" },
       { id: "missing-order", does: "adds the blocks edge one top-tier bead needs on another" },
       { id: "mispriority", does: "rewrites one bead's priority to the one the evidence supports" },
+      {
+        id: "misfiled",
+        does: "re-parents a bead whose home is the wrong one under the epic or card its contract belongs to",
+      },
     ],
   },
   {
