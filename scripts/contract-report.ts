@@ -10,6 +10,11 @@
  * Read-only: it never writes a bead. Repair is authoring work — the report says WHICH sections are
  * missing, never what belongs in them.
  *
+ * It also prints the FORM rate over the same denominator (anton-5ltn): what share of those beads
+ * carry the contract in the description itself, rather than in bd's acceptance field. That is a
+ * producer-quality reading, not a run verdict — the exit code stays keyed to blocking Acceptance
+ * gaps alone.
+ *
  * This is only the CLI shell: board resolution and exit code. The judgement lives in
  * `@/lib/beads/contract` (shared with the gate) and the tally in `@/lib/beads/contract-report`.
  */

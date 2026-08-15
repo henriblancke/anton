@@ -1479,6 +1479,41 @@ describe("anton board-check (bd stubbed on PATH)", () => {
     expect(r.status).toBe(1);
   });
 
+  // The form rate belongs to `bun scripts/contract-report.ts` alone (anton-5ltn). board-check judges
+  // TIERS, and its advisory stream stays that signal: the board carries ~104 beads whose rubric lives
+  // only in bd's field, and printing those here would bury the handful of tier faults this command
+  // exists to show. One board described two ways — the output may not move.
+  it("says nothing about description form, however the beads are written", async () => {
+    const SHAPED = [
+      "## Goal",
+      "Ship it.",
+      "## Acceptance Criteria",
+      "- [ ] it works",
+      "## Context",
+      "touches: nothing",
+      "## Out of scope",
+      "- the other thing",
+      "## Verify",
+      "- a test covers it",
+    ].join("\n");
+    // A lone ticket under a feature: an ADVISORY tier fault, so the stream under test is non-empty.
+    const board = [
+      { id: "e1", issue_type: "epic", status: "open" },
+      { id: "f1", issue_type: "feature", status: "open", parent: "e1" },
+      { id: "t1", issue_type: "task", status: "open", parent: "f1" },
+    ];
+    const described = board.map((b) => ({ ...b, description: SHAPED }));
+    // The drifted shape: same beads, rubric in bd's field only and no contract sections at all.
+    const drifted = board.map((b) => ({ ...b, acceptance_criteria: "- [ ] it works" }));
+
+    const formed = runCheck(await fakeBd(described));
+    const bare = runCheck(await fakeBd(drifted));
+    expect(formed.stdout).toContain("[feature-under-ticket-budget]");
+    expect(bare.stdout).toBe(formed.stdout);
+    expect(bare.status).toBe(0);
+    expect(formed.status).toBe(0);
+  });
+
   // The ENOENT is on `error`, never on `stderr` — reporting stderr alone printed a bare failure and
   // left a user without bd installed nothing to act on.
   it("says bd is missing rather than failing with an empty reason", () => {
