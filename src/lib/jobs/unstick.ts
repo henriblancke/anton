@@ -43,8 +43,11 @@ import { getRunHealthReport, type RunHealthFinding } from "../run-health";
 import { listRunsByStatus, type RunRow } from "../runs";
 import { detectExhaustedJobs, detectOpenHumanGates, detectStalePrs } from "./run-health";
 import {
+  listOpenEscalations,
   markEscalationNoted,
   raiseEscalation,
+  settleEscalation,
+  toEscalationView,
   type EscalationRow,
 } from "../escalations";
 import { PoisonError } from "./errors";
@@ -349,8 +352,9 @@ export function classifyFinding(
     // A wait BY DESIGN — and the one stall a person ends without touching anton at all (`bd gate
     // resolve`, or answering a different escalation on the same gate). The sweep runs on the hour and
     // this pass at :10, so a gate answered inside that gap would otherwise raise "Waiting on you" for
-    // a wait that already ended. Nothing retires that row afterwards either: later reports simply
-    // omit the finding, leaving the false request open until a human clears it by hand.
+    // a wait that already ended. The mirror case — a gate answered AFTER the row was raised, which
+    // this hold can never see because later reports omit the finding entirely — is retired by
+    // {@link settleEndedGateWaits}.
     case "needs-human":
       return ctx.stillStuck(finding)
         ? escalate(finding.reason)
@@ -443,6 +447,8 @@ export interface UnstickSummary {
   resumed: number;
   escalated: number;
   held: number;
+  /** Open escalations retired because the stall they asked about ended (see {@link settleEndedGateWaits}). */
+  settled: number;
 }
 
 /**
@@ -466,13 +472,22 @@ export async function unstickPass(
   const readPrActivity = deps.readPrActivity ?? getPrActivity;
   const { projectId, repoPath } = opts;
   const heartbeat = opts.heartbeat ?? (async () => {});
-  const summary: UnstickSummary = { findings: 0, resumed: 0, escalated: 0, held: 0 };
+  const summary: UnstickSummary = { findings: 0, resumed: 0, escalated: 0, held: 0, settled: 0 };
 
   const report = await getRunHealthReport(db, projectId);
-  // No report means the run-health sweep has never run for this project (it ships off by default),
-  // so there is nothing to act on — not an error, just an idle pass.
-  if (!report || report.findings.length === 0) return summary;
-  summary.findings = report.findings.length;
+  const findings = report?.findings ?? [];
+  summary.findings = findings.length;
+
+  // An open gate wait OUTLIVES the report that raised it: once the gate is answered the sweep simply
+  // stops reporting the finding, so the loop below never visits it again and the row would keep
+  // claiming a wait that ended. Reconciling those is why an empty report is not yet an idle pass —
+  // it is precisely the report a resolved gate produces. No report at all means the run-health sweep
+  // has never run here (it ships off by default), and with no open wait either there is nothing to
+  // act on: not an error, just an idle pass.
+  const gateWaits = (await listOpenEscalations(db, projectId)).filter(
+    (row) => row.kind === "needs-human",
+  );
+  if (findings.length === 0 && gateWaits.length === 0) return summary;
 
   // Pull BEFORE reading the board, exactly as the runner's `liveRunCheck` does: the local Dolt
   // working set trails the shared remote by a sync heartbeat, so a run-lease another machine renewed
@@ -530,23 +545,30 @@ export async function unstickPass(
     await primeLatestJob(run.epicBeadId);
   }
   // A dead lease reads the same row for its cancellation guard; there the bead IS the epic.
-  for (const finding of report.findings) {
+  for (const finding of findings) {
     if (finding.kind === "dead-lease" && finding.beadId) await primeLatestJob(finding.beadId);
   }
 
   // Same reason again, but ONE read for every gate finding: `gate list` answers all of them at once,
   // and gate beads are absent from the ordinary board read above (see the sweep's own two reads).
-  if (report.findings.some((f) => f.kind === "needs-human")) {
+  // The same read answers both halves of a gate wait's lifecycle — whether to raise one, and whether
+  // an already-raised one is still waiting on anybody.
+  const gateFindings = findings.filter((f) => f.kind === "needs-human");
+  if (gateFindings.length > 0 || gateWaits.length > 0) {
     const openGates = await readOpenGates(repoPath);
-    for (const finding of report.findings) {
-      if (finding.kind !== "needs-human") continue;
-      stillStuck.set(finding.key, gateStillOpen(finding, openGates, board, ctx.nowMs));
+    for (const finding of gateFindings) {
+      stillStuck.set(finding.key, gateStillOpen(finding.gateId, openGates, board, ctx.nowMs));
     }
+    summary.settled = await settleEndedGateWaits(db, clock, gateWaits, {
+      openGates,
+      board,
+      nowMs: ctx.nowMs,
+    });
     await heartbeat();
   }
 
   // Same reason, one gh/job read per stale-pr / exhausted-job finding.
-  for (const finding of report.findings) {
+  for (const finding of findings) {
     if (finding.kind === "stale-pr") {
       stillStuck.set(
         finding.key,
@@ -570,7 +592,7 @@ export async function unstickPass(
   }
 
   let wroteBeads = false;
-  for (const finding of report.findings) {
+  for (const finding of findings) {
     // Stop acting the moment the job is cancelled or times out. Everything already done stands —
     // both verbs are idempotent, so the next pass picks up exactly where this one left off.
     opts.signal?.throwIfAborted();
@@ -682,11 +704,11 @@ async function readOpenGates(repoPath: string): Promise<Gate[] | undefined> {
 }
 
 /**
- * Does a `needs-human` finding still hold? Its gate is the one stall a person can end outside anton
- * entirely, and the report is up to a sweep old, so escalating without re-reading asks the founder to
- * answer a wait they already answered. Worse than a stale nag: nothing settles that row afterwards —
- * later reports just omit the finding, while the escalation it opened stays open until a human clears
- * it by hand.
+ * Is this gate still waiting on somebody? A human gate is the one stall a person can end outside
+ * anton entirely, and the report is up to a sweep old, so escalating without re-reading asks the
+ * founder to answer a wait they already answered. Asked of a FINDING before raising a row, and of an
+ * open row's own gate before retiring it (see {@link settleEndedGateWaits}) — one question, one
+ * answer, so a wait can never be raised on one rule and retired on another.
  *
  * Judged by the sweep's OWN detector, so the two can never drift on what an open human gate is. A
  * gate absent from the open list was resolved or deleted, which end the wait alike — and both are
@@ -694,15 +716,58 @@ async function readOpenGates(repoPath: string): Promise<Gate[] | undefined> {
  * or synced in.
  */
 function gateStillOpen(
-  finding: RunHealthFinding,
+  gateId: string | undefined,
   openGates: Gate[] | undefined,
   board: Bead[],
   nowMs: number,
 ): boolean {
-  if (!openGates || !finding.gateId) return true;
-  const gate = openGates.find((g) => g.id === finding.gateId);
+  if (!openGates || !gateId) return true;
+  const gate = openGates.find((g) => g.id === gateId);
   if (!gate) return false;
   return detectOpenHumanGates([gate], board, nowMs).length > 0;
+}
+
+/**
+ * Retire the open gate waits whose gate has since been answered, and report how many. The re-check
+ * above only covers the window BEFORE a wait is raised; this covers the far longer one after, and it
+ * is the only thing that does. Once the gate closes, the sweep stops reporting the finding
+ * altogether — so no later pass re-checks it, and the escalation sits on the board asking a founder
+ * to answer a wait they already ended. A `needs-human` row is also the one kind the panel offers no
+ * Dismiss on (a wait on a person is not something to acknowledge and leave open), so nothing else
+ * can retire it: the two answers it does offer would resolve an already-closed gate and restart work
+ * nobody asked to restart.
+ *
+ * Settled as `dismissed` — the resolution for a stall that ended without anton acting. The wait was
+ * answered off-board (`bd gate resolve`, another operator, another machine), so claiming it was
+ * resumed or abandoned here would record a decision nobody made. This is a settle only: the gate is
+ * already closed and the work it blocked, if any, is gate-check's to pick up exactly as it would be
+ * for a gate closed by hand.
+ *
+ * Fails OPEN on an unreadable gate list, the same posture as {@link gateStillOpen}: bd's silence is
+ * no evidence a wait ended, and the next pass reconciles it anyway. The settle is the same status
+ * CAS a founder's click takes, so a click landing in this window still wins exactly once.
+ */
+async function settleEndedGateWaits(
+  db: AntonDb,
+  clock: Clock,
+  waits: EscalationRow[],
+  live: { openGates: Gate[] | undefined; board: Bead[]; nowMs: number },
+): Promise<number> {
+  if (!live.openGates) return 0;
+  let settled = 0;
+  for (const wait of waits) {
+    // The gate id lives in the evidence blob, not a column of its own — read it the way the panel
+    // does, so a row whose evidence can't be parsed keeps its wait rather than losing it silently.
+    const { gateId } = toEscalationView(wait);
+    if (gateStillOpen(gateId, live.openGates, live.board, live.nowMs)) continue;
+    if (!(await settleEscalation(db, clock, wait.id, "dismissed"))) continue;
+    settled += 1;
+    console.log(
+      `[unstick] settled escalation ${wait.id} (${wait.findingKey}): the gate has since been ` +
+        `resolved or removed`,
+    );
+  }
+  return settled;
 }
 
 /**
@@ -802,7 +867,8 @@ export function makeUnstickHandler(deps: UnstickDeps): JobHandler {
     );
     console.log(
       `[unstick] ${project.slug}: ${summary.findings} findings — ` +
-        `${summary.resumed} resumed, ${summary.escalated} escalated, ${summary.held} held`,
+        `${summary.resumed} resumed, ${summary.escalated} escalated, ${summary.held} held, ` +
+        `${summary.settled} settled`,
     );
   };
 }

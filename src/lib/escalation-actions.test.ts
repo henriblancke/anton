@@ -904,6 +904,29 @@ describe("actOnEscalation — a wait on a person", () => {
     expect(rowOf(escalation.id)).toMatchObject({ status: "resolved", resolution: "resumed" });
   });
 
+  it("closes the gate on abandon too when the blocked bead has since been deleted", async () => {
+    // The mirror of the resume above, through the same empty-target path: with nothing left to close,
+    // the gate IS the whole answer. A tightened guard on the gate branch would otherwise silently
+    // turn this into "nothing to act on" with the wait still open.
+    beadsShow.mockImplementation(async (_repo, id) => {
+      if (id === "anton-t9") {
+        throw Object.assign(new Error("Command failed"), {
+          stderr: 'Error: no issue found matching "anton-t9"\n',
+        });
+      }
+      return bead();
+    });
+    const escalation = await openGateWait();
+
+    expect(await actOnEscalation(project, escalation.id, "abandon")).toMatchObject({
+      ok: true,
+      detail: "gate-resolved",
+    });
+    expect(gateResolve).toHaveBeenCalledWith(project.repoPath, "g-1", expect.any(String));
+    expect(abandonTicket).not.toHaveBeenCalled();
+    expect(rowOf(escalation.id)).toMatchObject({ status: "resolved", resolution: "abandoned" });
+  });
+
   it("abandons the bead FIRST and closes the gate second", async () => {
     // The other order hands the work straight back: a gate that closes over an open bead is exactly
     // what gate-check's own resume dispatches.

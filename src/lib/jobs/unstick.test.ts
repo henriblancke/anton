@@ -881,6 +881,73 @@ describe("non-resumable parks produce exactly one escalation and no enqueue", ()
     expect(noteMock).not.toHaveBeenCalled();
   });
 
+  it("retires an OPEN gate wait once the gate is answered, even though the report has moved on", async () => {
+    // The window the pre-raise re-check can't see: the founder answers AFTER the row was raised, so
+    // the next sweep simply omits the finding and no later pass ever visits it again. Without this
+    // the board would show "Waiting on you" for a wait that ended, and the only answers offered
+    // would resolve an already-closed gate and restart work nobody asked to restart.
+    await seedHumanGateReport("g-1");
+    expect(await sweep()).toMatchObject({ escalated: 1, settled: 0 });
+
+    gateListMock.mockResolvedValue([openGate("g-2")]);
+    await seedReport(); // the gate is answered: the sweep no longer reports it at all
+
+    expect(await sweep()).toMatchObject({ findings: 0, settled: 1 });
+    expect(escalationRows()[0]).toMatchObject({ status: "resolved", resolution: "dismissed" });
+    // Idempotent, like every other verb here: the second pass has nothing left to settle.
+    expect(await sweep()).toMatchObject({ findings: 0, settled: 0 });
+  });
+
+  it("retires an open gate wait whose gate was resolved rather than deleted", async () => {
+    // `bd gate list` defaults to open gates, but a resolved one that still shows up is over just the
+    // same — judged by the sweep's own detector, so the two can't drift on what an open wait is.
+    await seedHumanGateReport("g-1");
+    await sweep();
+
+    gateListMock.mockResolvedValue([{ ...openGate("g-1"), status: "closed" }]);
+    await seedReport();
+
+    expect(await sweep()).toMatchObject({ settled: 1 });
+    expect(escalationRows()[0]).toMatchObject({ status: "resolved", resolution: "dismissed" });
+  });
+
+  it("keeps an open gate wait when the gate list can't be read", async () => {
+    // Fails OPEN both ways: bd's silence is no evidence a wait ended, so the row stays on the board
+    // and the next pass reconciles it.
+    await seedHumanGateReport("g-1");
+    await sweep();
+
+    gateListMock.mockRejectedValue(new Error("bd exploded"));
+    await seedReport();
+
+    expect(await sweep()).toMatchObject({ settled: 0 });
+    expect(escalationRows()[0]).toMatchObject({ status: "open" });
+  });
+
+  it("leaves an open gate wait alone while its gate is still waiting on somebody", async () => {
+    await seedHumanGateReport("g-1");
+    await sweep();
+    await seedReport();
+
+    expect(await sweep()).toMatchObject({ findings: 0, settled: 0 });
+    expect(escalationRows()[0]).toMatchObject({ status: "open" });
+  });
+
+  it("settles nothing for escalations of other kinds, whatever the gates say", async () => {
+    // Only a `needs-human` row hangs on a gate; a parked run's escalation is answered by the founder
+    // and must never be retired by an unrelated gate resolving.
+    seedParkedRun("r-2", "e-2", "agent exited 1");
+    await seedReport(parkedRunFinding("r-2", "e-2", "parked 4h ago: agent exited 1"));
+    await sweep();
+
+    gateListMock.mockResolvedValue([]);
+    await seedReport();
+
+    expect(await sweep()).toMatchObject({ findings: 0, settled: 0 });
+    expect(escalationRows()[0]).toMatchObject({ status: "open" });
+    expect(gateListMock).toHaveBeenCalledTimes(0); // no gate wait open, so no gate read either
+  });
+
   it("escalates on the report's word when the gate list can't be read", async () => {
     // Fails OPEN, like the PR and job re-checks: an unreadable board is no evidence a wait ended, and
     // a missed escalation strands the very human this finding exists to find.
@@ -987,7 +1054,7 @@ describe("a mixed report", () => {
 describe("an idle pass", () => {
   it("does nothing at all when the sweep has never run for this project", async () => {
     // run-health ships off by default, so "no report" is the normal state, not an error.
-    expect(await sweep()).toEqual({ findings: 0, resumed: 0, escalated: 0, held: 0 });
+    expect(await sweep()).toEqual({ findings: 0, resumed: 0, escalated: 0, held: 0, settled: 0 });
     expect(jobRows()).toEqual([]);
     expect(listMock).not.toHaveBeenCalled();
   });
