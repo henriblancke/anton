@@ -18,6 +18,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { LABELS } from "../beads/bd";
 import {
   apply,
+  applyWith,
   bead,
   calls,
   CARD,
@@ -515,20 +516,49 @@ describe("under the write lock — what a decided step re-asks before it lands",
     }
   });
 
+  // Each verb re-reads its OWN subject, so a case carries the board that subject lives on: a link is
+  // asked of the `anton-aa`/`anton-bb` pair its ordering evidence is written on, not the `anton-a`
+  // the other two move. The refusal is asserted by REASON, because a subject the board never carried
+  // refuses too — on "no longer on the board" — and would pass a bare `failure: "refused"` while
+  // proving nothing about the settlement this case is here for.
   it("refuses a subject that settled after the snapshot, per verb", async () => {
-    for (const [plan, gone] of [
-      [REPARENT, bead("anton-a", { status: "closed" })],
-      [LINK, bead("anton-a", { labels: [LABELS.abandoned], status: "closed" })],
-      [CLOSE, undefined], // left the board entirely
+    const settled = "— the board moved on since this was proposed";
+    for (const [plan, id, gone, board, why] of [
+      [
+        REPARENT,
+        "anton-a",
+        bead("anton-a", { status: "closed" }),
+        [CARD, bead("anton-a")],
+        `anton-a is closed ${settled}`,
+      ],
+      [
+        LINK,
+        "anton-aa",
+        ordered(bead("anton-aa", { labels: [LABELS.abandoned], status: "closed" })),
+        [ordered(), bead("anton-bb")],
+        `anton-aa is abandoned ${settled}`,
+      ],
+      // …and the same subject gone from the board entirely, which bd answers as a failed `show`
+      // rather than an absent bead — so the refusal names the READ, not a vanishing. Its snapshot
+      // self is `cold`, because a retirement re-asks its own premise here too: a subject with no
+      // write stamp refuses on that instead, before the re-read this case is about.
+      [
+        CLOSE,
+        "anton-a",
+        undefined,
+        [cold("anton-a")],
+        "anton-a could not be re-read before applying the move (bd show: no such issue anton-a) — nothing was written",
+      ],
     ] as const) {
       calls.length = 0;
       liveBeads.clear();
-      liveBeads.set("anton-a", gone);
+      liveBeads.set(id, gone);
       const proposal = proposalFor(plan);
-      await expect(
-        apply(proposal, [CARD, bead("anton-a"), bead("anton-b"), proposal]),
-      ).rejects.toMatchObject({ failure: "refused" });
-      expect(calls.filter((c) => !c.startsWith("note"))).toEqual([]);
+      await expect(applyWith(proposal, [...board])).rejects.toMatchObject({ failure: "refused" });
+      // The note is the whole record: the reason it refused for, and no write beside it.
+      expect(calls).toEqual([
+        `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: ${why}`,
+      ]);
     }
   });
 });
