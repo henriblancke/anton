@@ -25,7 +25,10 @@
  * A wait on a PERSON (`needs-human`) is the one stall whose answer is not really about the run: it
  * hangs on a gate, so both verbs close the gate as well as acting on the work. Resume is
  * resolve-and-resume — "I did it, carry on" — and closes the gate FIRST, because execute-epic
- * re-reads the board and a run enqueued against an open gate simply parks on the same wait again.
+ * re-reads the board and a run enqueued against an open gate simply parks on the same wait again. For
+ * the same reason it resumes only once the gate it closed was the LAST thing holding the target (see
+ * {@link stillBlocked}); a second wait still open means the founder's answer ends that one wait and
+ * nothing more.
  * Abandon closes the gate LAST, after the bead: a gate that closes over an open bead hands the work
  * straight back to gate-check's own resume, which is the opposite of an abandon. Either way the gate
  * must close, because it is not on the bead's lifecycle — left open it keeps `detectOpenHumanGates`
@@ -44,8 +47,10 @@
 import { getDb } from "./db";
 import { abandonTicket, RunRestartedError } from "./abandon";
 import { beads, isMissingBeadError } from "./beads/bd";
+import { loadAllIssues } from "./beads/issues";
 import { nudgeSync } from "./beads/sync-nudge";
 import { getEscalation, settleEscalation, toEscalationView } from "./escalations";
+import { openBlockersOf } from "./jobs/gate-targets";
 import { cancelJob, resumeJob, resumeStalledEpic, runIsLiveForTarget } from "./jobs/service";
 import { getJob, systemClock } from "./jobs/queue";
 import { settleParkedRun } from "./runs";
@@ -385,9 +390,47 @@ async function answerGateWait(
   }
   await resolveGate(project, gateId, gateReason(view, action));
   if (!target) return "gate-resolved";
+  if (await stillBlocked(project, target)) return "gate-still-blocked";
   // Reuses the automatic path's own verb, so a resolve-and-resume and a gate-check resume of the
   // same target are the same idempotent call — whichever lands second is absorbed as a no-op.
   return resumeStalledEpic(project.id, target);
+}
+
+/**
+ * Is anything OTHER than the gate just closed still holding this target? A target can carry two open
+ * human gates, or one gate plus an ordinary `blocks` edge — and each of those raises its own
+ * escalation naming the SAME run target. Answering one and resuming would enqueue work execute-epic
+ * then refuses: it re-checks the target's blockers at job start and PARKS on the ones still open,
+ * turning an intentional wait into a job needing another human answer. The automatic path tests
+ * exactly this before dispatching (`isDispatchableTarget`); this is that rule on the manual path.
+ *
+ * Holding is not a lost resume: the gate is closed and unmarked, which is precisely what gate-check's
+ * `plainGateResumes` dispatches once the last blocker lands. So the wait ends when the founder says it
+ * does, and the run starts when the board says it may.
+ *
+ * FAILS SAFE to blocked — a board read that didn't land proves nothing about the way being clear, and
+ * every blocker helper reads an unknown blocker as open. The cost of being wrong that way is one pass
+ * of delay; the other way is a parked job.
+ */
+async function stillBlocked(project: Project, target: string): Promise<boolean> {
+  // `loadAllIssues`, not a bare `bd list`: bd omits gate beads from ordinary listings, and a second
+  // gate is exactly the blocker this question exists for — an unread one would answer "clear".
+  const board = await loadAllIssues(project.repoPath, { strictGates: true }).catch(() => undefined);
+  const bead = board?.find((b) => b.id === target);
+  if (!board || !bead) {
+    console.warn(
+      `[unstick] could not confirm ${target} is unblocked after resolving its gate — not resuming; ` +
+        `gate-check dispatches it once the board reads clear`,
+    );
+    return true;
+  }
+  const blockers = openBlockersOf(board, bead);
+  if (blockers.length === 0) return false;
+  console.info(
+    `[unstick] gate resolved on ${target}, but it is still blocked by ${blockers.join(", ")} — ` +
+      `not resuming; gate-check dispatches it once they clear`,
+  );
+  return true;
 }
 
 /** What bd records on the gate: which answer ended the wait, traceable back to the row that asked. */

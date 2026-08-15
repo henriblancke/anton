@@ -20,6 +20,8 @@ const ACTION_DETAIL: Record<string, string> = {
   "job-restarted": "Not stopped — the job is running again, so it was left alone",
   dismissed: "Dismissed — anton raises it again if it's still stuck at the next sweep",
   "gate-resolved": "Gate closed — the wait is over; there was no run left to restart",
+  "gate-still-blocked":
+    "Gate closed — this work is still held by another blocker, so anton starts it once that clears",
   "target-gone": "Nothing to act on — this work was deleted from the board, so the alert is cleared",
   "target-closed": "Nothing to act on — this work is already closed, so the alert is cleared",
 };

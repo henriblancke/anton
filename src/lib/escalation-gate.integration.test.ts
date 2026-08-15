@@ -189,6 +189,38 @@ describeBd("resolve-and-resume against a real human gate", () => {
     expect(rowOf(escalation.id)).toMatchObject({ status: "resolved", resolution: "resumed" });
   });
 
+  it("closes the answered gate but holds the resume while a second gate is still open", async () => {
+    // The real shape of the bug this guards: two waits on one target raise two rows naming the SAME
+    // run target, so answering one and resuming enqueues work execute-epic refuses at job start —
+    // it re-reads the board, sees the other gate, and PARKS. The founder's answer still lands on the
+    // gate they answered; the run is left to gate-check, which dispatches when the last one clears.
+    const work = seedGatedWork();
+    const second = createdId(
+      bd([
+        "gate",
+        "create",
+        "--blocks",
+        work.ticket,
+        "--type",
+        "human",
+        "--reason",
+        "legal has to sign off too",
+        "--json",
+      ]),
+    );
+    resetIssueSnapshots();
+    const escalation = await raise(work);
+
+    expect(await actOnEscalation(project, escalation.id, "resume")).toMatchObject({
+      ok: true,
+      detail: "gate-still-blocked",
+    });
+    expect(statusOf(work.gate)).toBe("closed");
+    expect(statusOf(second)).not.toBe("closed");
+    expect(resumeStalledEpic).not.toHaveBeenCalled();
+    expect(rowOf(escalation.id)).toMatchObject({ status: "resolved", resolution: "resumed" });
+  });
+
   it("leaves a resolve whose resume failed logged, and the work re-raisable", async () => {
     const logged = vi.spyOn(console, "error").mockImplementation(() => {});
     resumeStalledEpic.mockRejectedValue(new Error("runner refused: project is being deleted"));

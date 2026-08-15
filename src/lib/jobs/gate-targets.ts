@@ -104,8 +104,11 @@ export function isResumableTarget(target: Bead, nowMs: number): boolean {
  * (epic/feature) takes them from the epic-graph rollup plus the standalone prerequisites the rollup
  * drops, a standalone task/bug from its own `blocks` edges. Anything looser here would dispatch work
  * execute-epic then refuses, turning a wait into a parked job a human has to clear.
+ *
+ * Exported because the MANUAL resolve-and-resume runs the identical risk: closing one of a target's
+ * two gates and re-enqueueing it parks the run just the same (see escalation-actions.ts).
  */
-function openBlockersOf(board: Bead[], target: Bead): string[] {
+export function openBlockersOf(board: Bead[], target: Bead): string[] {
   return isUnit(target)
     ? [
         ...(computeEpicGraph(board).epics.find((n) => n.id === target.id)?.blockedBy ?? []),
