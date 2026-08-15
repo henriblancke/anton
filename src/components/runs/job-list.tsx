@@ -10,7 +10,10 @@ import type { JobStatus, JobSummary } from "@/lib/jobs-view";
 // Type-only for the same reason: runner.ts is server-only, but its LiveJobInfo shape is exactly
 // what the page resolves per running job.
 import type { LiveJobInfo } from "@/lib/jobs/runner";
+// Pure string→data, no server deps — see src/lib/gardener/record.ts.
+import type { PassRecordSummary } from "@/lib/gardener/record";
 import { cn } from "@/lib/utils";
+import { PassRecordChips, PassRecordPanel } from "@/components/runs/pass-record";
 import { Button } from "@/components/ui/button";
 import { fmtDuration } from "@/components/runs/run-view-utils";
 import { ResumeJobButton } from "@/components/runs/resume-job-button";
@@ -62,6 +65,7 @@ export function JobList({
   slug,
   liveJobs,
   jobSessions,
+  passRecords,
 }: {
   jobs: JobSummary[];
   slug: string;
@@ -75,6 +79,12 @@ export function JobList({
    * settling, which the live handle does not — this is what makes a finished pass's log readable.
    */
   jobSessions?: Record<string, string>;
+  /**
+   * jobId → what that pass applied, shadowed and refused (anton-hzce). Present for every gardener /
+   * product-master job on the page — including the ones that recorded nothing, which is what lets a
+   * quiet patrol render as a clean pass rather than as a row with the record missing.
+   */
+  passRecords?: Record<string, PassRecordSummary>;
 }) {
   // Confirmed kills, held here rather than per row so the bulk bar and the per-row button write to
   // the same place. Only ever grown from a 200 — a refused kill leaves the job's own status.
@@ -150,6 +160,7 @@ export function JobList({
             slug={slug}
             live={liveJobs?.[job.id]}
             loggedSessionId={jobSessions?.[job.id]}
+            passRecord={passRecords?.[job.id]}
             killed={killedIds.has(job.id)}
             onKilled={() => markKilled([job.id])}
             selectable={selectableIds.includes(job.id)}
@@ -206,6 +217,7 @@ function JobRow({
   slug,
   live,
   loggedSessionId,
+  passRecord,
   killed,
   onKilled,
   selectable,
@@ -218,6 +230,8 @@ function JobRow({
   live?: LiveJobInfo;
   /** The session this job durably recorded — the only handle a settled job has (anton-lmps). */
   loggedSessionId?: string;
+  /** This pass's record, for a gardener / product-master job (anton-hzce). */
+  passRecord?: PassRecordSummary;
   /** Confirmed cancelled by the server (per-row or bulk) — the row shows `cancelled` at once. */
   killed: boolean;
   onKilled: () => void;
@@ -316,6 +330,9 @@ function JobRow({
               {job.lastError ? ` · ${job.lastError}` : ""}
             </span>
           </div>
+          {/* An unattended write has to be visible without expanding anything — a founder scanning
+              the list is the first reader this record has. */}
+          {passRecord && <PassRecordChips summary={passRecord} />}
         </button>
         {(resumable || active || observable) && (
           <div
@@ -345,7 +362,7 @@ function JobRow({
         </div>
       </div>
 
-      {open && <JobDetail job={job} status={status} />}
+      {open && <JobDetail job={job} status={status} slug={slug} passRecord={passRecord} />}
 
       {outputOpen && sessionId && (
         <JobOutputPanel
@@ -368,7 +385,17 @@ function JobRow({
   );
 }
 
-function JobDetail({ job, status }: { job: JobSummary; status: JobStatus }) {
+function JobDetail({
+  job,
+  status,
+  slug,
+  passRecord,
+}: {
+  job: JobSummary;
+  status: JobStatus;
+  slug: string;
+  passRecord?: PassRecordSummary;
+}) {
   const rows: Array<[string, string]> = [
     ["Job ID", job.id],
     ["Type", job.type],
@@ -390,6 +417,7 @@ function JobDetail({ job, status }: { job: JobSummary; status: JobStatus }) {
           </div>
         ))}
       </dl>
+      {passRecord && <PassRecordPanel summary={passRecord} slug={slug} />}
       {job.lastError && (
         <div className="flex flex-col gap-1">
           <span className="font-mono text-[10px] tracking-[0.05em] text-subtle uppercase">

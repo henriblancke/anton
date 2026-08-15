@@ -33,6 +33,7 @@ import {
   type RetireVerb,
 } from "./detections";
 import { MAX_APPLIES_PER_PASS, type EmittedProposal } from "./emit";
+import { passRecordLine, type ApplyVerdict } from "./record";
 
 /** What the pass did with one armed proposal — `error` is anton failing, never the board refusing. */
 export type ArmedOutcome = "applied" | "refused" | "error";
@@ -188,7 +189,8 @@ async function applyOne(
   }
 }
 
-const VERDICT: Record<ArmedOutcome, string> = {
+/** Typed through record.ts's vocabulary, so a reworded verdict is a type error, not a silent one. */
+const VERDICT: Record<ArmedOutcome, ApplyVerdict> = {
   applied: "APPLIED",
   refused: "REFUSED",
   error: "COULD NOT APPLY",
@@ -196,12 +198,7 @@ const VERDICT: Record<ArmedOutcome, string> = {
 
 /** One line per proposal, shaped like the shadow's so a mixed pass reads as one list. */
 function lineOf(record: ArmedRecord): string {
-  const verb = record.retireAs ? `${record.move}/${record.retireAs}` : record.move;
-  const counterpart = record.target ? ` → ${record.target}` : "";
-  return (
-    `APPLY ${record.proposal} (${record.kind}) ${verb} ` +
-    `${record.subjects.join(", ")}${counterpart} — ${VERDICT[record.outcome]}: ${record.detail}`
-  );
+  return passRecordLine({ mode: "apply", ...record, verdict: VERDICT[record.outcome] });
 }
 
 /** The console line an operator greps the morning after a 03:00 pass. */

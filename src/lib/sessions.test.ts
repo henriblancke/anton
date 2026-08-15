@@ -125,9 +125,11 @@ describe("startJobSession", () => {
 /**
  * The jobs page's read (anton-lmps). It is the whole reason the link is persisted: the runner's live
  * handle is dropped when a job settles, so a finished gardener/product-master pass — the one whose
- * shadow record an operator reads the next morning — has nothing else pointing at its log.
+ * shadow record an operator reads the next morning — has nothing else pointing at its log. The path
+ * rides along with the id (anton-hzce) because the page both streams that log and reads the pass's
+ * record out of it, and one query is what stops the two from answering about different sessions.
  */
-describe("sessionIdsByJob", () => {
+describe("sessionsByJob", () => {
   let workDir: string;
 
   beforeAll(async () => {
@@ -155,6 +157,7 @@ describe("sessionIdsByJob", () => {
         jobId: "gardener-job",
         kind: "gardener",
         status: "done",
+        logPath: "/logs/s-gardener.log",
         startedAt: new Date(1_700_000_000_000),
       },
       // A job that ran twice: the operator opening the row wants the latest attempt's log.
@@ -164,6 +167,7 @@ describe("sessionIdsByJob", () => {
         jobId: "resumed-job",
         kind: "product-master",
         status: "done",
+        logPath: "/logs/s-first.log",
         startedAt: new Date(1_700_000_000_000),
       },
       {
@@ -172,6 +176,7 @@ describe("sessionIdsByJob", () => {
         jobId: "resumed-job",
         kind: "product-master",
         status: "done",
+        logPath: "/logs/s-latest.log",
         startedAt: new Date(1_700_000_060_000),
       },
       // Unlinked (a session predating the link, or one opened outside a job) — never attributed.
@@ -184,15 +189,15 @@ describe("sessionIdsByJob", () => {
   });
 
   it("resolves each job to its latest session, and a job that opened none to nothing", async () => {
-    const { sessionIdsByJob } = await import("./sessions");
-    expect(await sessionIdsByJob(["gardener-job", "resumed-job", "silent-job"])).toEqual({
-      "gardener-job": "s-gardener",
-      "resumed-job": "s-latest",
+    const { sessionsByJob } = await import("./sessions");
+    expect(await sessionsByJob(["gardener-job", "resumed-job", "silent-job"])).toEqual({
+      "gardener-job": { id: "s-gardener", logPath: "/logs/s-gardener.log" },
+      "resumed-job": { id: "s-latest", logPath: "/logs/s-latest.log" },
     });
   });
 
   it("asks nothing of the DB for an empty page", async () => {
-    const { sessionIdsByJob } = await import("./sessions");
-    expect(await sessionIdsByJob([])).toEqual({});
+    const { sessionsByJob } = await import("./sessions");
+    expect(await sessionsByJob([])).toEqual({});
   });
 });

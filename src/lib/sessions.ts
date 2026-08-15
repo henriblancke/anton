@@ -185,25 +185,71 @@ export async function listSessions(projectId: string, runId?: string): Promise<S
   return db.select().from(schema.sessions).where(where).orderBy(desc(schema.sessions.startedAt));
 }
 
+/** A job's durable handle on the session it opened: what to stream, and what to read. */
+export interface JobSessionLink {
+  id: string;
+  /** Where the log lives. Absent on a row written before the column, or by a caller that passed none. */
+  logPath?: string;
+}
+
 /**
  * The session each of these jobs opened, newest first per job (shared anton.db read path — for the
  * jobs page). This is the DURABLE answer the runner's in-memory live handle cannot give: a settled
  * job reports nothing, so without this a finished pass's log — the gardener's shadow record among
  * them — would be a file on disk with no route to it. A job that opened several sessions resolves to
  * its latest, which is the one an operator opening the row is looking for.
+ *
+ * Carries the log PATH as well as the id because the jobs page does two things with one session: it
+ * streams the log on demand (by id, through the SSE route) and reads the pass's record out of it
+ * server-side (anton-hzce). One query, so the two can never answer about different sessions.
  */
-export async function sessionIdsByJob(jobIds: string[]): Promise<Record<string, string>> {
+export async function sessionsByJob(jobIds: string[]): Promise<Record<string, JobSessionLink>> {
   if (jobIds.length === 0) return {};
   const rows = await getDb()
-    .select({ id: schema.sessions.id, jobId: schema.sessions.jobId })
+    .select({
+      id: schema.sessions.id,
+      jobId: schema.sessions.jobId,
+      logPath: schema.sessions.logPath,
+    })
     .from(schema.sessions)
     .where(inArray(schema.sessions.jobId, jobIds))
     .orderBy(desc(schema.sessions.startedAt));
-  const byJob: Record<string, string> = {};
+  const byJob: Record<string, JobSessionLink> = {};
   for (const row of rows) {
-    if (row.jobId && !(row.jobId in byJob)) byJob[row.jobId] = row.id;
+    if (row.jobId && !(row.jobId in byJob)) {
+      byJob[row.jobId] = { id: row.id, logPath: row.logPath ?? undefined };
+    }
   }
   return byJob;
+}
+
+/**
+ * The tail of a session log, capped.
+ *
+ * Capped rather than whole because one caller reads these on every render of the jobs page and a
+ * product-master pass logs a full claude transcript above its record — and tail rather than head
+ * because the record is the LAST thing a pass writes. A log that is gone (a disposable `.anton`
+ * cleared out from under the row) reads as empty: the record is commentary, and a page that threw
+ * over a missing one would cost the operator the job list itself.
+ */
+export async function readSessionLogTail(
+  logPath: string,
+  maxBytes = 256 * 1024,
+): Promise<string> {
+  try {
+    const size = (await stat(logPath)).size;
+    const offset = Math.max(0, size - maxBytes);
+    const handle = await open(logPath, "r");
+    try {
+      const buf = Buffer.alloc(size - offset);
+      await handle.read(buf, 0, buf.length, offset);
+      return buf.toString("utf8");
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return "";
+  }
 }
 
 /** A single session by id (shared anton.db read path — for run detail + log stream). */

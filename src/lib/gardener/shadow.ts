@@ -29,6 +29,7 @@ import {
   type RetireVerb,
 } from "./detections";
 import type { EmittedProposal } from "./emit";
+import { passRecordLine, type ShadowVerdict } from "./record";
 
 /** What the shadow decided for one proposal — `error` is anton failing to decide, never a verdict. */
 export type ShadowOutcome = "apply" | "settled" | "refuse" | "error";
@@ -155,7 +156,8 @@ function decide(
   }
 }
 
-const VERDICT: Record<ShadowOutcome, string> = {
+/** Typed through record.ts's vocabulary, so a reworded verdict is a type error, not a silent one. */
+const VERDICT: Record<ShadowOutcome, ShadowVerdict> = {
   apply: "WOULD APPLY",
   settled: "ALREADY SETTLED",
   refuse: "WOULD REFUSE",
@@ -164,12 +166,7 @@ const VERDICT: Record<ShadowOutcome, string> = {
 
 /** One line per proposal, so a pass's whole shadow reads as a list in the session log. */
 function lineOf(record: ShadowRecord): string {
-  const verb = record.retireAs ? `${record.move}/${record.retireAs}` : record.move;
-  const counterpart = record.target ? ` → ${record.target}` : "";
-  return (
-    `SHADOW ${record.proposal} (${record.kind}) ${verb} ` +
-    `${record.subjects.join(", ")}${counterpart} — ${VERDICT[record.outcome]}: ${record.detail}`
-  );
+  return passRecordLine({ mode: "shadow", ...record, verdict: VERDICT[record.outcome] });
 }
 
 /**
