@@ -1,6 +1,7 @@
 /**
- * Unit tests for the machine-readable outcome parser (anton-j5i8): delivered / blocked / missing,
- * plus the last-line-wins and mid-prose-ignored rules the harness cross-check depends on.
+ * Unit tests for the machine-readable outcome parser (anton-j5i8): delivered / blocked /
+ * needs-human / missing, plus the last-line-wins and mid-prose-ignored rules the harness
+ * cross-check depends on.
  */
 import { describe, expect, it } from "vitest";
 import { formatAntonResult, parseAntonResult } from "./anton-result";
@@ -30,6 +31,57 @@ describe("parseAntonResult", () => {
 
   it("parses a blocked line with no reason", () => {
     expect(parseAntonResult("ANTON-RESULT: blocked")).toEqual({ outcome: "blocked" });
+  });
+
+  it("parses a needs-human line with an ask", () => {
+    expect(parseAntonResult("ANTON-RESULT: needs-human — needs a Stripe API key")).toEqual({
+      outcome: "needs-human",
+      reason: "needs a Stripe API key",
+    });
+  });
+
+  it("parses a needs-human line with no ask", () => {
+    expect(parseAntonResult("ANTON-RESULT: needs-human")).toEqual({ outcome: "needs-human" });
+  });
+
+  it("accepts every separator before the needs-human ask", () => {
+    for (const line of [
+      "ANTON-RESULT: needs-human — click deploy in the dashboard",
+      "ANTON-RESULT: needs-human – click deploy in the dashboard",
+      "ANTON-RESULT: needs-human - click deploy in the dashboard",
+      "ANTON-RESULT: needs-human: click deploy in the dashboard",
+      "ANTON-RESULT: needs-human click deploy in the dashboard",
+    ]) {
+      expect(parseAntonResult(line)).toEqual({
+        outcome: "needs-human",
+        reason: "click deploy in the dashboard",
+      });
+    }
+  });
+
+  it("is case-insensitive on the needs-human token", () => {
+    expect(parseAntonResult("anton-result: Needs-Human — approve the account")).toEqual({
+      outcome: "needs-human",
+      reason: "approve the account",
+    });
+  });
+
+  it("ignores a needs-human mention buried mid-sentence (must start the line)", () => {
+    expect(
+      parseAntonResult("If I cannot proceed I emit ANTON-RESULT: needs-human — a credential."),
+    ).toBeNull();
+  });
+
+  it("takes the LAST result line when a run corrects itself to needs-human", () => {
+    const text = [
+      "ANTON-RESULT: delivered",
+      "on reflection, the last step needs an account only a person can create:",
+      "ANTON-RESULT: needs-human — someone must create the Vercel project",
+    ].join("\n");
+    expect(parseAntonResult(text)).toEqual({
+      outcome: "needs-human",
+      reason: "someone must create the Vercel project",
+    });
   });
 
   it("takes the LAST result line when several appear", () => {
@@ -70,6 +122,10 @@ describe("formatAntonResult", () => {
       "blocked — no migration",
     );
     expect(formatAntonResult({ outcome: "blocked" })).toBe("blocked — (no reason given)");
+    expect(formatAntonResult({ outcome: "needs-human", reason: "needs a Stripe key" })).toBe(
+      "needs-human — needs a Stripe key",
+    );
+    expect(formatAntonResult({ outcome: "needs-human" })).toBe("needs-human — (no ask given)");
     expect(formatAntonResult(null)).toContain("no ANTON-RESULT line");
   });
 });
