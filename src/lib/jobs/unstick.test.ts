@@ -13,7 +13,7 @@ import { eq } from "drizzle-orm";
 
 import * as schema from "../db/schema";
 import { makeTestDb, type TestDb } from "../db/testing";
-import { LABELS, type Bead } from "../beads/bd";
+import { LABELS, type Bead, type Gate } from "../beads/bd";
 import type { PrActivity } from "../git/pr";
 import { saveRunHealthReport, type RunHealthFinding } from "../run-health";
 import type { Clock } from "./queue";
@@ -22,6 +22,8 @@ const listMock = vi.fn<(cwd: string, extra?: string[]) => Promise<Bead[]>>();
 const noteMock = vi.fn<(cwd: string, id: string, text: string) => Promise<void>>();
 const syncMock = vi.fn<(cwd: string) => Promise<void>>();
 const pullMock = vi.fn<(cwd: string) => Promise<void>>();
+/** The open gates the pass re-reads before escalating a `needs-human` finding. */
+const gateListMock = vi.fn<(cwd: string) => Promise<Gate[]>>();
 
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
@@ -33,6 +35,7 @@ vi.mock("../beads/bd", async () => {
       note: (...args: [string, string, string]) => noteMock(...args),
       sync: (...args: [string]) => syncMock(...args),
       pull: (...args: [string]) => pullMock(...args),
+      gateList: (...args: [string]) => gateListMock(...args),
     },
   };
 });
@@ -67,6 +70,18 @@ function openEpic(id: string): Bead {
   return { id, title: id, status: "open", issue_type: "epic", labels: [] };
 }
 
+/** An open human gate as `bd gate list` returns it — still waiting on a person. */
+function openGate(id: string): Gate {
+  return {
+    id,
+    title: `Ad-hoc gate ${id}`,
+    status: "open",
+    issue_type: "gate",
+    await_type: "human",
+    created_at: new Date(NOW - 3 * HOUR).toISOString(),
+  };
+}
+
 /** The live PR the pass re-reads before escalating a `stale-pr` finding. Idle by default. */
 const prActivityMock =
   vi.fn<(repo: string, number: number, signal?: AbortSignal) => Promise<PrActivity>>();
@@ -95,6 +110,9 @@ beforeEach(() => {
   noteMock.mockResolvedValue(undefined);
   syncMock.mockResolvedValue(undefined);
   pullMock.mockResolvedValue(undefined);
+  // Every gate these tests reference, still open. The pass re-reads the open gates before escalating
+  // a `needs-human` finding, so a gate missing from this list reads as RESOLVED and settles the wait.
+  gateListMock.mockResolvedValue(["g-1", "g-2"].map(openGate));
   prActivityMock.mockResolvedValue(prActivity());
   getJobMock.mockImplementation(realGetJob);
 });
@@ -168,6 +186,19 @@ function seedExhaustedJobReport(...jobIds: string[]): Promise<void> {
       beadId: "e-9",
     })),
   );
+}
+
+function seedHumanGateReport(gateId: string): Promise<void> {
+  return seedReport({
+    kind: "needs-human",
+    key: `needs-human:${gateId}`,
+    reason: "waiting on a human 3h: the founder wants to see the design first",
+    since: NOW - 3 * HOUR,
+    ageMs: 3 * HOUR,
+    gateId,
+    beadId: "t-1",
+    targetBeadId: "e-2",
+  });
 }
 
 function parkedRunFinding(runId: string, beadId: string, reason: string): RunHealthFinding {
@@ -836,6 +867,28 @@ describe("non-resumable parks produce exactly one escalation and no enqueue", ()
 
     expect(await sweep()).toMatchObject({ findings: 1, escalated: 1 });
     expect(escalationRows()[0]).toMatchObject({ beadId: "step-3", epicBeadId: null });
+  });
+
+  it("holds a human-gate finding whose gate was resolved between the sweep and now", async () => {
+    // The sweep runs on the hour and this pass at :10, so a founder who answers inside that gap would
+    // otherwise get "Waiting on you" for a wait they already ended — and nothing retires it: later
+    // reports just omit the finding while the escalation it opened stays on the board.
+    gateListMock.mockResolvedValue([openGate("g-2")]);
+    await seedHumanGateReport("g-1");
+
+    expect(await sweep()).toMatchObject({ findings: 1, escalated: 0, held: 1 });
+    expect(escalationRows()).toEqual([]);
+    expect(noteMock).not.toHaveBeenCalled();
+  });
+
+  it("escalates on the report's word when the gate list can't be read", async () => {
+    // Fails OPEN, like the PR and job re-checks: an unreadable board is no evidence a wait ended, and
+    // a missed escalation strands the very human this finding exists to find.
+    gateListMock.mockRejectedValue(new Error("bd exploded"));
+    await seedHumanGateReport("g-1");
+
+    expect(await sweep()).toMatchObject({ findings: 1, escalated: 1, held: 0 });
+    expect(escalationRows()[0]).toMatchObject({ findingKey: "needs-human:g-1" });
   });
 
   it("raises a fresh escalation once a resolved one no longer covers the stall", async () => {

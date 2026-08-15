@@ -206,6 +206,23 @@ describe("EscalationStrip", () => {
     expect(screen.getByText("Resolve & resume")).toBeTruthy();
   });
 
+  it("still offers the abandon when the gate blocks work that isn't on the board", () => {
+    // No bead and no job to close — but "I'm not going to do this" is an answer to the wait, and
+    // closing the gate is the whole of it. Without this the only button is resolve-and-resume, which
+    // records the founder's refusal as a resolution.
+    renderStrip([
+      escalation({
+        kind: "needs-human",
+        gateId: "g-1",
+        beadId: undefined,
+        epicBeadId: undefined,
+        runId: undefined,
+        jobId: undefined,
+      }),
+    ]);
+    expect(screen.getByText("Abandon")).toBeTruthy();
+  });
+
   it("offers job-level answers for a stall that names no bead at all", () => {
     renderStrip([
       escalation({

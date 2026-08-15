@@ -31,7 +31,7 @@
  *     run ownership is cross-machine state, and a stale local mirror of it can only be wrong in the
  *     direction that double-runs.
  */
-import { beads, type Bead } from "../beads/bd";
+import { beads, type Bead, type Gate } from "../beads/bd";
 import { getPrActivity, type PrActivity } from "../git/pr";
 import {
   DEFAULT_MAX_RETRIES,
@@ -41,7 +41,7 @@ import {
 } from "../projects";
 import { getRunHealthReport, type RunHealthFinding } from "../run-health";
 import { listRunsByStatus, type RunRow } from "../runs";
-import { detectExhaustedJobs, detectStalePrs } from "./run-health";
+import { detectExhaustedJobs, detectOpenHumanGates, detectStalePrs } from "./run-health";
 import {
   markEscalationNoted,
   raiseEscalation,
@@ -138,11 +138,11 @@ export interface UnstickContext {
    */
   epicCancelled: (epicBeadId: string) => boolean;
   /**
-   * Whether a `stale-pr` / `exhausted-job` finding STILL satisfies the detector that raised it,
-   * re-checked against the live PR and job rows (see {@link revalidate}). Those two kinds carry no
+   * Whether a `stale-pr` / `exhausted-job` / `needs-human` finding STILL satisfies the detector that
+   * raised it, re-checked against the live PR, job row, and gate list. Those three kinds carry no
    * other live handle in this context — a run row or a bead — so without this the pass would
-   * escalate a PR that merged, or a job an operator resumed, in the window between the sweep and
-   * now. Prefetched, because the classifier stays synchronous and pure.
+   * escalate a PR that merged, a job an operator resumed, or a gate the founder answered, in the
+   * window between the sweep and now. Prefetched, because the classifier stays synchronous and pure.
    */
   stillStuck: (finding: RunHealthFinding) => boolean;
 }
@@ -346,6 +346,16 @@ export function classifyFinding(
         ? escalate(finding.reason)
         : hold("the job has since been resumed or settled");
 
+    // A wait BY DESIGN — and the one stall a person ends without touching anton at all (`bd gate
+    // resolve`, or answering a different escalation on the same gate). The sweep runs on the hour and
+    // this pass at :10, so a gate answered inside that gap would otherwise raise "Waiting on you" for
+    // a wait that already ended. Nothing retires that row afterwards either: later reports simply
+    // omit the finding, leaving the false request open until a human clears it by hand.
+    case "needs-human":
+      return ctx.stillStuck(finding)
+        ? escalate(finding.reason)
+        : hold("the gate has since been resolved or removed");
+
     default:
       return escalate(finding.reason);
   }
@@ -524,6 +534,17 @@ export async function unstickPass(
     if (finding.kind === "dead-lease" && finding.beadId) await primeLatestJob(finding.beadId);
   }
 
+  // Same reason again, but ONE read for every gate finding: `gate list` answers all of them at once,
+  // and gate beads are absent from the ordinary board read above (see the sweep's own two reads).
+  if (report.findings.some((f) => f.kind === "needs-human")) {
+    const openGates = await readOpenGates(repoPath);
+    for (const finding of report.findings) {
+      if (finding.kind !== "needs-human") continue;
+      stillStuck.set(finding.key, gateStillOpen(finding, openGates, board, ctx.nowMs));
+    }
+    await heartbeat();
+  }
+
   // Same reason, one gh/job read per stale-pr / exhausted-job finding.
   for (const finding of report.findings) {
     if (finding.kind === "stale-pr") {
@@ -643,6 +664,45 @@ async function stalePrStillStuck(
     );
     return true;
   }
+}
+
+/**
+ * The project's OPEN gates (bd's `gate list` default), or undefined when bd could not answer. That
+ * undefined fails OPEN in {@link gateStillOpen}, the same posture as the other two re-checks: an
+ * unreadable board is no evidence a wait ended, and a missed escalation strands the human the sweep
+ * exists to find.
+ */
+async function readOpenGates(repoPath: string): Promise<Gate[] | undefined> {
+  try {
+    return await beads.gateList(repoPath);
+  } catch (e) {
+    console.error("[unstick] could not re-read the gate list; escalating on the report's word", e);
+    return undefined;
+  }
+}
+
+/**
+ * Does a `needs-human` finding still hold? Its gate is the one stall a person can end outside anton
+ * entirely, and the report is up to a sweep old, so escalating without re-reading asks the founder to
+ * answer a wait they already answered. Worse than a stale nag: nothing settles that row afterwards —
+ * later reports just omit the finding, while the escalation it opened stays open until a human clears
+ * it by hand.
+ *
+ * Judged by the sweep's OWN detector, so the two can never drift on what an open human gate is. A
+ * gate absent from the open list was resolved or deleted, which end the wait alike — and both are
+ * evidence even on an untrusted board, since either could only reach this mirror by being made here
+ * or synced in.
+ */
+function gateStillOpen(
+  finding: RunHealthFinding,
+  openGates: Gate[] | undefined,
+  board: Bead[],
+  nowMs: number,
+): boolean {
+  if (!openGates || !finding.gateId) return true;
+  const gate = openGates.find((g) => g.id === finding.gateId);
+  if (!gate) return false;
+  return detectOpenHumanGates([gate], board, nowMs).length > 0;
 }
 
 /**

@@ -196,6 +196,16 @@ function canResume(escalation: EscalationView): boolean {
   return escalation.epicBeadId !== undefined || escalation.jobId !== undefined;
 }
 
+/**
+ * Whether the row's abandon has anything to act on. Same rule as {@link canResume} for a gate wait,
+ * and for the same reason: "I'm not going to do this" ends the wait even when the gate blocks work
+ * anton never runs, because closing the gate is the whole answer there.
+ */
+function canAbandon(escalation: EscalationView): boolean {
+  if (escalation.kind === "needs-human" && escalation.gateId !== undefined) return true;
+  return escalation.beadId !== undefined || escalation.jobId !== undefined;
+}
+
 /** One escalation, with the affordance the founder answers it with: Resume, Dismiss, or Abandon. */
 function EscalationRow({ slug, escalation }: { slug: string; escalation: EscalationView }) {
   const request = isRequest(escalation);
@@ -254,7 +264,7 @@ function EscalationRow({ slug, escalation }: { slug: string; escalation: Escalat
         escalationId={escalation.id}
         canResume={canResume(escalation)}
         canDismiss={escalation.kind === "stale-pr"}
-        canAbandon={escalation.beadId !== undefined || escalation.jobId !== undefined}
+        canAbandon={canAbandon(escalation)}
         target={actionTarget(escalation)}
       />
     </>
