@@ -1154,8 +1154,8 @@ describe("actOnEscalation — a wait on a person", () => {
   });
 
   it("holds a moved target another machine is already running", async () => {
-    // The upstream lease check judged the FROZEN target, where a live lease can be this escalation's
-    // own leftover. On a bead the gate moved to there is no such leftover to exempt.
+    // The upstream lease check judged the FROZEN target, so a bead the gate moved to was never
+    // checked at all until this one — and a reparent can hand the gate to work already in flight.
     loadAllIssues.mockResolvedValue(
       reparentedBoard({ labels: [LABELS.approved, LABELS.runLease(Date.now() + HOUR, "run-far")] }),
     );
@@ -1164,6 +1164,48 @@ describe("actOnEscalation — a wait on a person", () => {
       ok: true,
       detail: "gate-still-blocked",
     });
+    expect(resumeStalledEpic).not.toHaveBeenCalled();
+    expect(beadsTag).not.toHaveBeenCalled();
+  });
+
+  it("holds when another machine claimed the target while the gate was closing", async () => {
+    // The pre-settle check cleared this target, but a gate close and a board load happen before
+    // anything is enqueued — and every anton sharing this board sees the same closed gate, so its
+    // gate-check can dispatch inside that window. Enqueueing anyway hands this machine a second
+    // execute-epic that can only retry behind the foreign lease.
+    loadAllIssues.mockResolvedValue([
+      bead([LABELS.approved, LABELS.runLease(Date.now() + HOUR, "run-far")]),
+    ]);
+
+    expect(await actOnEscalation(project, (await openGateWait()).id, "resume")).toMatchObject({
+      ok: true,
+      detail: "gate-still-blocked",
+    });
+    expect(resumeStalledEpic).not.toHaveBeenCalled();
+    // Closed and unmarked is the recovery: gate-check dispatches it once that run lets go.
+    expect(beadsTag).not.toHaveBeenCalled();
+  });
+
+  it("pulls again before the dispatch read — the local mirror predates the gate close", async () => {
+    await actOnEscalation(project, (await openGateWait()).id, "resume");
+
+    // Twice: once for the pre-settle check, once here. A lease published on another machine since
+    // that first pull reaches this mirror through the second one or not at all.
+    expect(beadsPull).toHaveBeenCalledTimes(2);
+    expect(beadsPull.mock.invocationCallOrder[1]).toBeLessThan(
+      loadAllIssues.mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it("holds when THAT pull didn't land — an unrefreshed mirror can't rule a foreign run out", async () => {
+    beadsPull.mockResolvedValueOnce(undefined).mockRejectedValue(new Error("dolt pull: unreachable"));
+
+    expect(await actOnEscalation(project, (await openGateWait()).id, "resume")).toMatchObject({
+      ok: true,
+      detail: "gate-still-blocked",
+    });
+    // The wait still ended — that half is the founder's answer and it landed.
+    expect(gateResolve).toHaveBeenCalled();
     expect(resumeStalledEpic).not.toHaveBeenCalled();
     expect(beadsTag).not.toHaveBeenCalled();
   });

@@ -462,10 +462,15 @@ type GateDispatch =
  * queued on a machine that doesn't own it. So the manual path applies the automatic path's own
  * predicate ({@link undispatchableReason}), rather than a looser subset of it.
  *
- * Liveness is judged upstream ({@link readTargetState}) for the target the escalation named, which
- * exempts THIS escalation's own stalled run — the lease clause of the automatic rule cannot tell that
- * leftover from a foreign holder, and would refuse the resume being asked for. A target the board has
- * MOVED the gate to carries no such leftover, so its lease is checked here.
+ * Liveness is re-judged HERE, on whatever target this read names — not only upstream ({@link
+ * readTargetState}). That check ran a gate close and a board load ago, and this is the last look
+ * before anything is enqueued: another anton sharing this board sees the same closed gate, and its
+ * gate-check dispatches from the same rule, so the target can have been claimed inside that window.
+ * Missing it enqueues a second execute-epic for work already running elsewhere — one that can only
+ * retry behind the foreign lease and sit queued or parked until someone clears it. No exemption for
+ * the frozen target, unlike upstream: a wait on a PERSON names no run of its own (`detectOpenHumanGates`
+ * records no `runId`), so there is no leftover lease of ours to mistake for a holder — every live
+ * lease here is another machine's, whether the gate stayed put or the board moved it.
  *
  * Holding is not a lost resume: the gate is closed and unmarked, which is precisely what gate-check's
  * `plainGateResumes` dispatches once the board clears — on whichever machine may run it. So the wait
@@ -479,10 +484,19 @@ async function gateDispatch(
   gateId: string,
   frozen: string,
 ): Promise<GateDispatch> {
+  const unread = { verdict: "hold", target: frozen, unread: true } as const;
+  // Pull before reading, exactly as {@link readTargetState} and the runner's own `liveRunCheck` do:
+  // the local Dolt working set trails the shared remote by a sync heartbeat, so a lease another
+  // machine published while the gate was closing reads as absent here and the check below would
+  // answer "clear" on an unread board. A pull that didn't land is that same unread board.
+  const pulled = await beads.pull(project.repoPath).then(
+    () => true,
+    () => false,
+  );
+  if (!pulled) return { ...unread, reason: "the shared board could not be re-read" };
   // `loadAllIssues`, not a bare `bd list`: bd omits gate beads from ordinary listings, and a second
   // gate is exactly the blocker this question exists for — an unread one would answer "clear".
   const board = await loadAllIssues(project.repoPath, { strictGates: true }).catch(() => undefined);
-  const unread = { verdict: "hold", target: frozen, unread: true } as const;
   if (!board) return { ...unread, reason: "its board could not be read" };
 
   const blocked = beadBlockedByGate(board, gateId);
@@ -495,7 +509,7 @@ async function gateDispatch(
 
   const reason = undispatchableReason(board, target, await resolveOperator());
   if (reason) return { verdict: "hold", target: target.id, reason };
-  if (target.id !== frozen && beads.isRunLive(target, systemClock.now())) {
+  if (beads.isRunLive(target, systemClock.now())) {
     return { verdict: "hold", target: target.id, reason: "another machine is running it" };
   }
   // The answered gate is included whatever the board says about it: the resolve landed before this
