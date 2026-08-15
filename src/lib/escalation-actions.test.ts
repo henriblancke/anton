@@ -71,6 +71,12 @@ vi.mock("./beads/bd", async () => {
   };
 });
 
+// Closing a gate is a board write, so it must reach teammates like every other one (anton-nowq).
+const nudgeSync = vi.fn<(project: Project, label?: string) => void>();
+vi.mock("./beads/sync-nudge", () => ({
+  nudgeSync: (...args: [Project, string?]) => nudgeSync(...args),
+}));
+
 let fileDb: FileDb;
 let actOnEscalation: typeof import("./escalation-actions").actOnEscalation;
 let isEscalationAction: typeof import("./escalation-actions").isEscalationAction;
@@ -957,6 +963,47 @@ describe("actOnEscalation — a wait on a person", () => {
     expect(rowOf(escalation.id)).toMatchObject({ status: "resolved", resolution: "resumed" });
     expect(logged.mock.calls[0]?.[0]).toContain(escalation.id);
     logged.mockRestore();
+  });
+
+  it("pushes the closed gate to the shared board", async () => {
+    // The close lands in the local Dolt working set and heartbeats are pull-only, so without this
+    // teammates keep seeing the wait open — and keep raising this same escalation against it.
+    await actOnEscalation(project, (await openGateWait()).id, "resume");
+
+    expect(nudgeSync).toHaveBeenCalledWith(project, "gate-resolve");
+    expect(nudgeSync.mock.invocationCallOrder[0]).toBeGreaterThan(
+      gateResolve.mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it("pushes it even when the gate blocks nothing anton runs", async () => {
+    // The case with no other cover at all: no run target means no downstream board write, so this
+    // nudge is the ONLY thing that ever gets the resolution off this machine.
+    const escalation = await openGateWait({ epicBeadId: undefined });
+
+    expect(await actOnEscalation(project, escalation.id, "resume")).toMatchObject({ ok: true });
+    expect(nudgeSync).toHaveBeenCalledWith(project, "gate-resolve");
+  });
+
+  it("pushes the abandon's gate close too — the abandon's own nudge fired before it", async () => {
+    await actOnEscalation(project, (await openGateWait()).id, "abandon");
+
+    expect(nudgeSync).toHaveBeenCalledWith(project, "gate-resolve");
+    expect(nudgeSync.mock.invocationCallOrder[0]).toBeGreaterThan(
+      gateResolve.mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it("pushes nothing when the gate was already settled by someone else", async () => {
+    // bd refused and the gate is closed anyway: no write of ours landed, so there is nothing here to
+    // propagate — whoever closed it owns pushing it.
+    gateResolve.mockRejectedValue(new Error("bd: gate already resolved"));
+    showsGateAs(closedGate());
+
+    expect(await actOnEscalation(project, (await openGateWait()).id, "resume")).toMatchObject({
+      ok: true,
+    });
+    expect(nudgeSync).not.toHaveBeenCalled();
   });
 
   it("still refuses when the board says another machine picked the work back up", async () => {

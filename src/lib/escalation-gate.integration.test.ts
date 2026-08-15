@@ -28,6 +28,13 @@ import type { Project } from "./types";
 
 const resumeStalledEpic = vi.fn<(projectId: string, epicBeadId: string) => Promise<string>>();
 
+// The push itself is sync-nudge's own suite; stubbed here so the temp repo (which has no remote)
+// isn't shelling `bd dolt sync` after every close. What this suite asserts is that it is asked for.
+const nudgeSync = vi.fn<(project: Project, label?: string) => void>();
+vi.mock("./beads/sync-nudge", () => ({
+  nudgeSync: (...args: [Project, string?]) => nudgeSync(...args),
+}));
+
 vi.mock("./jobs/service", async () => {
   const { activeExecuteEpicId } =
     await vi.importActual<typeof import("./jobs/queue")>("./jobs/queue");
@@ -163,6 +170,8 @@ describeBd("resolve-and-resume against a real human gate", () => {
     expect(a.ok ? b : a).toEqual({ ok: false, reason: "not-open" });
     expect(statusOf(work.gate)).toBe("closed");
     expect(resumeStalledEpic.mock.calls).toEqual([[project.id, work.target]]);
+    // The close is a board write like any other: the losing click pushes nothing, the winner must.
+    expect(nudgeSync.mock.calls).toEqual([[project, "gate-resolve"]]);
     expect(rowOf(escalation.id)).toMatchObject({ status: "resolved", resolution: "resumed" });
   });
 

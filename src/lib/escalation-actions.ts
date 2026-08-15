@@ -42,6 +42,7 @@
 import { getDb } from "./db";
 import { abandonTicket, RunRestartedError } from "./abandon";
 import { beads, isMissingBeadError } from "./beads/bd";
+import { nudgeSync } from "./beads/sync-nudge";
 import { getEscalation, settleEscalation, toEscalationView } from "./escalations";
 import { cancelJob, resumeJob, resumeStalledEpic, runIsLiveForTarget } from "./jobs/service";
 import { getJob, systemClock } from "./jobs/queue";
@@ -368,10 +369,10 @@ async function answerGateWait(
 ): Promise<string> {
   if (action === "abandon") {
     const detail = target ? await actOnBead(project, action, view, target) : undefined;
-    await resolveGate(project.repoPath, gateId, gateReason(view, action));
+    await resolveGate(project, gateId, gateReason(view, action));
     return detail ?? "gate-resolved";
   }
-  await resolveGate(project.repoPath, gateId, gateReason(view, action));
+  await resolveGate(project, gateId, gateReason(view, action));
   if (!target) return "gate-resolved";
   // Reuses the automatic path's own verb, so a resolve-and-resume and a gate-check resume of the
   // same target are the same idempotent call — whichever lands second is absorbed as a no-op.
@@ -393,15 +394,24 @@ function gateReason(view: EscalationView, action: EscalationAction): string {
  * a gate that no longer exists, and that is the same end state: the wait is over. So a failure is
  * re-judged against the gate itself, and only kept when the gate is provably still there and still
  * open — or when bd could not answer, which proves nothing either way (see {@link BeadRead}).
+ *
+ * The close lands in the LOCAL Dolt working set, so it is pushed like every other operator board
+ * write (anton-nowq): heartbeats are pull-only, and nothing else here covers this one — the abandon's
+ * own nudge fires BEFORE this write, and a gate blocking work anton doesn't run has no other write at
+ * all. Unpushed, teammates keep seeing the wait open and their next sweep raises this same escalation
+ * against a question the founder already answered.
  */
-async function resolveGate(repoPath: string, gateId: string, reason: string): Promise<void> {
+async function resolveGate(project: Project, gateId: string, reason: string): Promise<void> {
   try {
-    await beads.gateResolve(repoPath, gateId, reason);
+    await beads.gateResolve(project.repoPath, gateId, reason);
   } catch (e) {
-    const gate = await readBead(repoPath, gateId);
+    const gate = await readBead(project.repoPath, gateId);
+    // No write of ours landed, so there is nothing of ours to propagate: a gate already gone or
+    // already closed was settled by whoever got there first, and pushing it is theirs.
     if (gate === "missing" || (gate !== "unreadable" && gate.status === "closed")) return;
     throw e;
   }
+  nudgeSync(project, "gate-resolve");
 }
 
 /**
