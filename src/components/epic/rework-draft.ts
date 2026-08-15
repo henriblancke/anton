@@ -1,0 +1,74 @@
+import type { ReviewFinding, ReworkMode, ReworkResult, Ticket } from "@/lib/types";
+
+/**
+ * What the founder fills in before sending a ticket back — one draft rather than a state hook per
+ * field, because the four are only ever read together, at submit.
+ */
+export interface ReworkDraft {
+  ticketId: string;
+  mode: ReworkMode;
+  summary: string;
+  instructions: string;
+}
+
+/** The rework route's body: the draft, trimmed, plus the findings the founder ticked. */
+export interface ReworkPayload {
+  ticketId: string;
+  mode: ReworkMode;
+  summary: string;
+  instructions: string;
+  findings: ReviewFinding[];
+}
+
+/** Abandoned tickets are out of every run, so sending one back would produce work nothing picks up. */
+export function reworkCandidates(tickets: Ticket[]): Ticket[] {
+  return tickets.filter((t) => !t.abandoned);
+}
+
+export function initialDraft(candidates: Ticket[]): ReworkDraft {
+  return { ticketId: candidates[0]?.id ?? "", mode: "reopen", summary: "", instructions: "" };
+}
+
+/** Stable identity for a finding across renders — location + note, which is what makes two distinct. */
+export function findingKey(f: ReviewFinding): string {
+  return `${f.severity} ${f.location} ${f.note}`;
+}
+
+export function toggleKey(keys: ReadonlySet<string>, key: string): Set<string> {
+  const next = new Set(keys);
+  if (!next.delete(key)) next.add(key);
+  return next;
+}
+
+/**
+ * Both text fields carry the whole point of the send-back — a reason nobody can act on is worse
+ * than no rework at all — so neither may be blank.
+ */
+export function isDraftComplete(draft: ReworkDraft): boolean {
+  return !!draft.ticketId && draft.summary.trim().length > 0 && draft.instructions.trim().length > 0;
+}
+
+export function reworkPayload(
+  draft: ReworkDraft,
+  findings: ReviewFinding[],
+  selected: ReadonlySet<string>,
+): ReworkPayload {
+  return {
+    ticketId: draft.ticketId,
+    mode: draft.mode,
+    summary: draft.summary.trim(),
+    instructions: draft.instructions.trim(),
+    findings: findings.filter((f) => selected.has(findingKey(f))),
+  };
+}
+
+/**
+ * What the founder is told landed. A double-submit reports the bead the FIRST request produced —
+ * saying "reopened" twice would claim a write that never happened.
+ */
+export function reworkOutcomeMessage(result: ReworkResult): string {
+  if (!result.applied) return `Already sent back — ${result.reworkedId} carries these instructions`;
+  return result.mode === "reopen"
+    ? `${result.ticketId} reopened with instructions`
+    : `Follow-up ${result.reworkedId} created from ${result.ticketId}`;
+}
