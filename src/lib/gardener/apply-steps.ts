@@ -78,8 +78,10 @@ function counterpartOf(step: ApplyStep): string | undefined {
  * The filing-time premise a CONTENT-derived move rests on, or absent for the verbs that make no claim
  * about a bead's contents. See {@link EvidenceFence} for why the step carries it.
  *
- * `link` is here for its `missing-order` half alone; an `implied-order` resolves to no premise in
- * {@link EVIDENCE_PREMISE} and is re-derived from the board instead ({@link assertOrderingStated}).
+ * `link` is here for its `missing-order` half alone and `reparent` for its `misfiled` half alone; an
+ * `implied-order` and the gardener's two re-parents resolve to no premise in
+ * {@link EVIDENCE_PREMISE} and are re-derived from the board instead ({@link assertOrderingStated},
+ * apply-plan.ts `reparentPremiseGone`).
  */
 function evidenceOf(step: ApplyStep): EvidenceFence | undefined {
   switch (step.verb) {
@@ -88,6 +90,7 @@ function evidenceOf(step: ApplyStep): EvidenceFence | undefined {
     case "defer":
     case "reprioritize":
     case "link":
+    case "reparent":
       return { kind: step.kind, observedAtMs: step.observedAtMs };
     default:
       return undefined;
@@ -465,11 +468,11 @@ function claimMoved(step: ApplyStep, subject: Bead, nowMs: number): string | und
 
 /**
  * Why an edit has falsified the evidence this step rests on, or undefined. A retirement, a
- * re-ranking and a `missing-order` all rest on a claim about the subject's CONTENTS that every other
- * check is blind to — a rescoping edit leaves status, liveness and claim exactly as the plan found
- * them. Each planner asked it of the route's snapshot; re-asked here against the read taken under
- * this bead's own lock, so an edit landing in that window refuses instead of being settled as
- * delivered.
+ * re-ranking, a `missing-order` and a `misfiled` all rest on a claim about the subject's CONTENTS
+ * that every other check is blind to — a rescoping edit leaves status, liveness and claim exactly as
+ * the plan found them. Each planner asked it of the route's snapshot; re-asked here against the read
+ * taken under this bead's own lock, so an edit landing in that window refuses instead of being
+ * settled as delivered.
  *
  * …but not when the board already reads as applied. Setting the asked-for priority BY HAND is itself
  * a write since the filing, so an unguarded fence would refuse the very state the ask wanted — the
@@ -509,7 +512,15 @@ function counterpartMoved(
   if (!counterpart) return missing(id);
   switch (step.verb) {
     case "reparent":
-      return homeUnusable(counterpart, nowMs) ?? homeClaimed(step, counterpart);
+      // The home's end of a `misfiled` match, re-asked under its own lock for the reason the
+      // subject's is: the bars above ask only whether the home is still open, unclaimed and the
+      // right tier, all of which a rewrite leaves untouched — and filing work under a home that has
+      // since become something else is the misfiling the ask was raised to fix.
+      return (
+        homeUnusable(counterpart, nowMs) ??
+        homeClaimed(step, counterpart) ??
+        premiseTouched(counterpart, EVIDENCE_PREMISE[step.kind]?.twin, step.observedAtMs)
+      );
     case "link":
       return blockerUnusable(counterpart, step.id);
     case "supersede":

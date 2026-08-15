@@ -55,26 +55,37 @@ interface StepSubject {
 
 /** One board write an approved proposal resolves to, with whatever it takes to undo it. */
 export type ApplyStep =
-  | (StepSubject & {
-      verb: "reparent";
-      parent: string;
-      /** The parent to restore on rollback; `""` is bd's detach form, for a bead that had none. */
-      undoParent: string;
-      /**
-       * The run claim the HOME carried when this step was decided, or `""` — {@link StepSubject.claim}
-       * for the other end of the move, re-compared under the home's own write lock.
-       *
-       * Same blind spot as the subject's, and worse consequences: a run that claimed the home in the
-       * window before its lease is published reads as unowned to {@link isInFlight}, and it has
-       * already selected the tickets it will work through — so work attached now rides along unrun
-       * and is stranded the moment that run settles the card.
-       *
-       * Only ever a claim that PREDATES the filing: `planReparent` refuses a home claimed since (see
-       * {@link claimedSinceFiling}), which is what stops a newcomer's claim from being recorded here
-       * as its own baseline and then compared against itself under the lock.
-       */
-      parentClaim: string;
-    })
+  /**
+   * The two re-parent classes rest on DIFFERENT evidence, exactly as the two link kinds do, and
+   * {@link EvidenceFence.kind} is what tells them apart under the lock: the gardener's
+   * `container-orphan` / `parentless-cluster` claim "no board card carries this", which a fresh read
+   * restates in full ({@link reparentPremiseGone}); a `misfiled` is the product master's reading of
+   * which home two beads' contracts call for, which no board read restates — holding it to the card
+   * check would refuse it forever, so it is fenced on the observation stamp instead
+   * ({@link EVIDENCE_PREMISE}).
+   */
+  | (StepSubject &
+      EvidenceFence & {
+        verb: "reparent";
+        parent: string;
+        /** The parent to restore on rollback; `""` is bd's detach form, for a bead that had none. */
+        undoParent: string;
+        /**
+         * The run claim the HOME carried when this step was decided, or `""` —
+         * {@link StepSubject.claim} for the other end of the move, re-compared under the home's own
+         * write lock.
+         *
+         * Same blind spot as the subject's, and worse consequences: a run that claimed the home in
+         * the window before its lease is published reads as unowned to {@link isInFlight}, and it
+         * has already selected the tickets it will work through — so work attached now rides along
+         * unrun and is stranded the moment that run settles the card.
+         *
+         * Only ever a claim that PREDATES the filing: `planReparent` refuses a home claimed since
+         * (see {@link claimedSinceFiling}), which is what stops a newcomer's claim from being
+         * recorded here as its own baseline and then compared against itself under the lock.
+         */
+        parentClaim: string;
+      })
   /**
    * The two link kinds rest on DIFFERENT evidence, and {@link EvidenceFence.kind} is what tells them
    * apart under the lock: an `implied-order` reads a phrase in one of the beads' bodies, so the write
@@ -122,12 +133,13 @@ export type ApplyStep =
  * landing in that window rescopes the work while leaving every other bar untouched, so without this
  * the write goes ahead on evidence the edit falsified.
  *
- * Carried by the retirements, by `reprioritize` and by `link`: each rests on a reading of what the
- * bead IS — silence, a match against a twin, a commit that shipped it, a judgment of what it is
- * worth or of what has to land before it — and none of those survives a rewrite. `reparent` carries
- * none, and neither does the `implied-order` half of `link`, because their whole claim is
- * re-derivable from a fresh board read; a link step still carries the fence so the ONE kind that
- * isn't ({@link EVIDENCE_PREMISE}'s `missing-order`) is guarded rather than trusted.
+ * Carried by every verb but `unapprove`: each rests on a reading of what the bead IS — silence, a
+ * match against a twin, a commit that shipped it, a judgment of what it is worth, of what has to
+ * land before it, or of which home its contract calls for — and none of those survives a rewrite.
+ * The gardener's own re-parents and the `implied-order` half of `link` carry no PREMISE, because
+ * their whole claim is re-derivable from a fresh board read; both steps carry the fence all the
+ * same, so the kinds that aren't ({@link EVIDENCE_PREMISE}'s `missing-order` and `misfiled`) are
+ * guarded rather than trusted.
  *
  * The kind (not the resolved premise) so the write re-derives through the same
  * {@link EVIDENCE_PREMISE} the decision used, and the observation stamp verbatim so both readings
@@ -332,6 +344,8 @@ function reparentSubject(
     parent: home.id,
     undoParent: currentParent,
     parentClaim: runClaimOf(home),
+    kind: plan.kind,
+    observedAtMs: at.observedAtMs,
   };
 }
 
@@ -346,8 +360,17 @@ function reparentBarred(
   if (!isOpenWork(subject)) {
     return `${subject.id} is ${settledWord(subject)} — the board moved on since this was proposed`;
   }
+  // Then the premise, at whichever end of the move states one. A `misfiled` claim is a MATCH between
+  // two contracts — this bead belongs under that home — so a rewrite of either falsifies it, and no
+  // board read restates the judgment the way `reparentPremiseGone` restates the gardener's. Asked
+  // here rather than in `homeRefusal` so a subject somebody has already moved home SETTLES: the
+  // outcome the ask wanted is the board's state, and refusing over a stamp would leave it open
+  // forever against a board that already agrees with it.
   const busy =
-    subjectBusy(subject, at, "moving it") ?? reparentPremiseGone(plan, subject, index);
+    subjectBusy(subject, at, DOING.reparent) ??
+    reparentPremiseGone(plan, subject, index) ??
+    premiseTouched(subject, EVIDENCE_PREMISE[plan.kind], at.observedAtMs) ??
+    premiseTouched(home, EVIDENCE_PREMISE[plan.kind]?.twin, at.observedAtMs);
   if (busy) return busy;
   // A parent that sits UNDER one of the subjects would make the subtree its own ancestor.
   if (index.isAncestor(subject.id, home.id)) {
@@ -901,23 +924,28 @@ function claimedSinceFiling(
 }
 
 /**
- * Why the subject no longer has the parent shape its detection was based on, or undefined. Both
- * re-parent kinds rest on one claim about where the bead sits — NO BOARD CARD CARRIES IT, whether it
- * hangs off a container epic (`container-orphan`) or off nothing at all (`parentless-cluster`) — so
- * that claim is re-derived from the fresh board rather than from a filing-time parent the plan would
- * have to carry.
+ * Why the subject no longer has the parent shape its detection was based on, or undefined. The
+ * GARDENER's two re-parent kinds rest on one claim about where the bead sits — NO BOARD CARD CARRIES
+ * IT, whether it hangs off a container epic (`container-orphan`) or off nothing at all
+ * (`parentless-cluster`) — so that claim is re-derived from the fresh board rather than from a
+ * filing-time parent the plan would have to carry.
  *
  * A bead somebody has since given a card has already been answered, by a decision newer than the one
  * being approved. Nothing downstream can object on its own: the step records that newer parent as
  * its own `undoParent`, and the under-lock re-check compares against that same value. Judged on the
  * CARD rather than the raw parent because that is what the move is for — a bead moved under another
  * container is still as unreachable as the proposal says, and re-homing it is still the fix.
+ *
+ * Asked of those two kinds ALONE. A `misfiled` subject rides a perfectly good card already — that is
+ * the whole claim — so holding it to this bar would refuse every one of them; its premise is the
+ * evidence fence instead ({@link EVIDENCE_PREMISE}).
  */
 function reparentPremiseGone(
   plan: GardenerPlan,
   subject: Bead,
   index: BoardIndex,
 ): string | undefined {
+  if (plan.kind !== "container-orphan" && plan.kind !== "parentless-cluster") return undefined;
   const card = index.cards.cardOf(subject);
   if (!card) return undefined;
   return `${subject.id} now rides board card ${card} — it was given a home since this proposal was filed, so moving it under ${plan.target} would overwrite that newer decision`;
@@ -969,10 +997,11 @@ export interface EvidencePremise {
  * topology kinds carry no entry because their whole claim IS re-derivable from the fresh board (see
  * {@link reparentPremiseGone} and {@link linkPremiseGone}).
  *
- * `missing-order` is topology too and still fenced, because that re-derivation is what it lacks:
- * {@link linkPremiseGone} and apply-steps.ts `assertOrderingStated` both answer only for
- * `implied-order`, the kind whose evidence is a body phrase. The product master's ordering claim is
- * a judgment, so no board read restates it and the stamp is the only thing left standing between it
+ * `missing-order` and `misfiled` are topology too and still fenced, because that re-derivation is
+ * what they lack: {@link linkPremiseGone} answers only for `implied-order`, whose evidence is a body
+ * phrase, and {@link reparentPremiseGone} only for the gardener's two, whose evidence is "no card
+ * carries this". The product master's ordering and home claims are judgments about what two beads
+ * are FOR, so no board read restates them and the stamp is the only thing left standing between them
  * and a bead somebody has since rewritten.
  *
  * All three retirements are fenced, not just `stale`: each measured something about the bead's
@@ -1021,6 +1050,19 @@ export const EVIDENCE_PREMISE: Record<GardenerDetectionKind, EvidencePremise | u
   mispriority: {
     still: "the bead whose contract and history this ranking was judged from",
     harm: "re-ranking it now would apply a judgment made about work that has since been rewritten",
+  },
+  misfiled: {
+    still: "the bead whose contract this home was chosen for",
+    harm: "moving it now would file work somebody has since rescoped under a home chosen for the version it replaced",
+    // A home claim is a MATCH between two contracts, so an edit to EITHER end falsifies it — and the
+    // home's end is the one nothing else here notices: every remaining bar asks only whether the
+    // home is still open, unclaimed and the right tier, all of which a rewrite leaves untouched. So
+    // without this the move lands under an epic that has since become about something else, which is
+    // the misfiling the ask was raised to fix.
+    twin: {
+      still: "the home whose contract this bead was judged to belong under",
+      harm: "hanging work under it now would file that work beneath a home that has since become something else",
+    },
   },
   "low-value": {
     still: "the low-value bead the evidence describes",

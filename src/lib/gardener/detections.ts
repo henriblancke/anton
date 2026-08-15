@@ -66,6 +66,12 @@ export type GardenerMove =
  * The product master's — PRODUCT judgment, reported by a fresh-context session (anton-d2sx):
  *   • `mispriority`         — the bead's priority contradicts what the board says it is worth.
  *   • `missing-order`       — one top-tier bead has to land before another and no edge says so.
+ *   • `misfiled`            — a bead hangs under the wrong home: a feature under the wrong epic, or a
+ *                             ticket under the wrong card. ONE kind for both, because it is one claim
+ *                             about one relation — and the gardener's re-parents cannot see it, since
+ *                             both of theirs fire on work riding NO card, never on a home that is
+ *                             merely wrong. Which home is right is a reading of what two beads are
+ *                             about, so it is judgment rather than topology.
  *   • `oversized`           — one ticket carries several concerns, with a decomposition sketch.
  *   • `low-value`           — work whose value the evidence no longer supports: kill it.
  *   • `degraded-approval`   — approved work that has since stopped clearing the approve gate. The one
@@ -82,6 +88,7 @@ export type GardenerDetectionKind =
   | "shipped-orphan"
   | "mispriority"
   | "missing-order"
+  | "misfiled"
   | "oversized"
   | "low-value"
   | "degraded-approval";
@@ -95,6 +102,7 @@ export const GARDENER_DETECTION_KINDS: readonly GardenerDetectionKind[] = [
   "shipped-orphan",
   "mispriority",
   "missing-order",
+  "misfiled",
   "oversized",
   "low-value",
   "degraded-approval",
@@ -154,6 +162,7 @@ export const KINDS: Record<GardenerDetectionKind, KindSpec> = {
   "shipped-orphan": { namespace: "gardener", move: "retire", retireAs: "close" },
   mispriority: { namespace: "pm", move: "reprioritize", detail: "priority" },
   "missing-order": { namespace: "pm", move: "link" },
+  misfiled: { namespace: "pm", move: "reparent" },
   oversized: { namespace: "pm", move: "split" },
   "low-value": { namespace: "pm", move: "retire", retireAs: "defer" },
   "degraded-approval": { namespace: "pm", move: "unapprove" },

@@ -18,11 +18,14 @@
 import { beads, labelValueOf, type Bead } from "../beads/bd";
 import { isPipelineArtifact } from "../beads/contract";
 import { loadSkill } from "../claude/prompt";
+import { homeWrongTier, HOME_STANDING } from "../gardener/apply-plan";
 import {
   ageInDays,
   indexBoard,
+  isClaimed,
   isInFlight,
   isOpenWork,
+  runClaimOf,
   ticketOwnerOf,
   type BoardIndex,
 } from "../gardener/board-index";
@@ -39,6 +42,7 @@ import type { RunSummary } from "../runs";
 export const CLAIM_KINDS = {
   reprioritize: "mispriority",
   order: "missing-order",
+  rehome: "misfiled",
   split: "oversized",
   kill: "low-value",
 } as const;
@@ -54,6 +58,12 @@ export interface PmClaim {
   priority?: string;
   /** `order` only: the bead that has to land first. */
   blockedBy?: string;
+  /**
+   * `rehome` only: the bead the subject should hang under — the epic a feature belongs to, or the
+   * card that should carry a ticket. One field for both cases, because they are one claim about one
+   * relation; which tier is legal is the board's answer, not the session's ({@link rehomeRefusal}).
+   */
+  home?: string;
   /** `split` only: the decomposition sketch, one line per proposed ticket. */
   pieces?: string[];
   summary: string;
@@ -311,16 +321,18 @@ const carriesOf = (epic: Bead, split: PmBoardSplit, index: BoardIndex): string =
 
 /**
  * Open working-layer beads no run target carries. Shown because they are still work the project is
- * holding — and flagged as unowned, because "give this a home" is the GARDENER's proposal, not this
- * pass's: without the flag a ranking judgment made about them would silently duplicate that ask.
+ * holding — and flagged as unowned, because "give this a FIRST home" is the GARDENER's proposal, not
+ * this pass's: without the flag a ranking judgment made about them would silently duplicate that
+ * ask, and so would a `rehome` claim, whose question is a home that is WRONG rather than missing.
  */
 function looseSection(split: PmBoardSplit, index: BoardIndex, input: PmBoardInput): string[] {
   if (split.loose.length === 0) return [];
   return [
     `### Work no run target carries`,
     ``,
-    `These ride no run target, so nothing will ship them as they stand. Re-homing them is the`,
-    `gardener pass's proposal, not yours — rank, split or kill them only on their own merits.`,
+    `These ride no run target, so nothing will ship them as they stand. Giving homeless work its`,
+    `first home is the gardener pass's proposal, not yours — do not \`rehome\` them; rank, split or`,
+    `kill them only on their own merits.`,
     ``,
     ...split.loose.slice(0, MAX_CARDS).map((b) => beadLine(b, index, input, "")),
     ``,
@@ -476,6 +488,11 @@ export function pmReportFormatSection(): string {
     `  differ from the one the board context shows.`,
     `- \`"order"\` — \`blockedBy\`: the id of the bead that has to land FIRST. This is the other half of`,
     `  reprioritizing: it records an ordering the graph is missing rather than changing a number.`,
+    `- \`"rehome"\` — \`home\`: the id of the bead this one should hang under — the epic a feature`,
+    `  belongs to, or the card that should carry a ticket. One kind for both. anton refuses a home`,
+    `  that is already the parent, that is not on the board, that a run owns, and one the tier`,
+    `  taxonomy will not let carry this bead: a ticket hangs off a board card, a card off a container`,
+    `  epic (an epic that already groups cards), and nothing hangs off its own descendant.`,
     `- \`"split"\` — \`pieces\`: the decomposition sketch, one short line per proposed ticket, at least`,
     `  two. A split with no sketch is not actionable and anton drops it.`,
     `- \`"kill"\` — no extra field. Approving it DEFERS the bead: out of the ready set, contract`,
@@ -561,6 +578,12 @@ function toClaim(entry: unknown): PmClaim | undefined {
       const blockedBy = str(raw.blockedBy);
       return blockedBy ? { ...claim, blockedBy } : undefined;
     }
+    case "rehome": {
+      // A home claim names two beads, and the second is the whole content of the ask: "this is
+      // misfiled" with no home to move it to has nothing anton could ever write.
+      const home = str(raw.home);
+      return home ? { ...claim, home } : undefined;
+    }
     case "split": {
       const pieces = lines(raw.pieces);
       // Two is the smallest decomposition there is; one "piece" is the ticket restated.
@@ -601,7 +624,7 @@ export function detectionsFor(claims: PmClaim[], board: Bead[], nowMs: number): 
   const rejected: RejectedClaim[] = [];
 
   for (const claim of claims) {
-    const refusal = subjectRefusal(claim, index, nowMs) ?? kindRefusal(claim, index);
+    const refusal = subjectRefusal(claim, index, nowMs) ?? kindRefusal(claim, index, nowMs);
     if (refusal) {
       rejected.push({ claim, reason: refusal });
       continue;
@@ -622,7 +645,7 @@ function subjectRefusal(claim: PmClaim, index: BoardIndex, nowMs: number): strin
 }
 
 /** Why this claim's own move cannot stand, or undefined. */
-function kindRefusal(claim: PmClaim, index: BoardIndex): string | undefined {
+function kindRefusal(claim: PmClaim, index: BoardIndex, nowMs: number): string | undefined {
   switch (claim.kind) {
     case "reprioritize": {
       const current = index.byId.get(claim.bead)?.priority;
@@ -632,6 +655,8 @@ function kindRefusal(claim: PmClaim, index: BoardIndex): string | undefined {
     }
     case "order":
       return orderRefusal(claim, index);
+    case "rehome":
+      return rehomeRefusal(claim, index, nowMs);
     // A deferred bead is still OPEN work, so `subjectRefusal` waves it through — but a kill applies as
     // `defer`, and `planRetire` settles an already-deferred subject without writing anything. Left
     // unchecked the ask reaches the board, costs a founder a decision, and settles as a no-op. The
@@ -679,6 +704,47 @@ function orderRefusal(claim: PmClaim, index: BoardIndex): string | undefined {
   return undefined;
 }
 
+/**
+ * Why this bead cannot be hung under the home the claim names, or undefined — every reason apply
+ * would refuse the move later, asked at filing time for the same reason {@link orderRefusal} is: an
+ * ask that can only ever fail sits on the board asking a founder to approve something anton will
+ * refuse, until somebody declines it by hand (the anton-wsap failure mode).
+ *
+ * The tier bar is asked through apply's own {@link homeWrongTier} rather than a copy of it, so the
+ * filing check and the approve check cannot disagree about which homes the taxonomy allows — a
+ * ticket hangs off the card that runs it, a card off the container epic that groups it.
+ */
+function rehomeRefusal(claim: PmClaim, index: BoardIndex, nowMs: number): string | undefined {
+  const homeId = claim.home as string;
+  // `subjectRefusal` has already proved the subject is on the board and free to write to.
+  const subject = index.byId.get(claim.bead) as Bead;
+  if (homeId === claim.bead) return `${claim.bead} cannot be its own home`;
+  if ((beads.parentOf(subject) ?? "") === homeId) {
+    return `${claim.bead} already hangs under ${homeId} — the move would write nothing`;
+  }
+  const home = index.byId.get(homeId);
+  if (!home) return `${homeId} is not on the board`;
+  // A proposal is open work, so `isOpenWork` waves it through — but it is a bead ABOUT the board,
+  // not part of its shape, and it closes the moment the founder answers it. Work hung under one
+  // would be left beneath a settled ask nothing will ever run.
+  if (isProposalBead(home)) return `${homeId} is a proposal, not a home`;
+  if (!isOpenWork(home)) {
+    return `${homeId} is already settled — hanging work under it would leave it riding a home nothing will run`;
+  }
+  // Both halves of "a run owns it": a published lease, and the pickup window before one exists. A run
+  // that already selected the tickets it will work through would carry the newcomer along unrun.
+  if (isInFlight(home, nowMs)) {
+    return `${homeId} is mid-run — hanging work under it would race the run that owns it`;
+  }
+  if (isClaimed(home)) {
+    return `${homeId} is held by ${runClaimOf(home)} — that run has already selected the tickets it will work through, so work hung under it now would ride along unrun`;
+  }
+  if (index.isAncestor(claim.bead, homeId)) {
+    return `${homeId} sits under ${claim.bead} — the move would make the subtree its own ancestor`;
+  }
+  return homeWrongTier(subject, home, index, HOME_STANDING.snapshot);
+}
+
 /** The detection one accepted claim becomes — the shape both emission and apply already speak. */
 function detectionFor(claim: PmClaim): GardenerDetection {
   switch (claim.kind) {
@@ -697,6 +763,17 @@ function detectionFor(claim: PmClaim): GardenerDetection {
         move: "link",
         subjects: [claim.bead],
         target: claim.blockedBy,
+        summary: claim.summary,
+        evidence: claim.evidence,
+      });
+    case "rehome":
+      return makeDetection({
+        kind: CLAIM_KINDS.rehome,
+        move: "reparent",
+        subjects: [claim.bead],
+        // Always a target, never the gardener's targetless "which feature?" ask: the session that
+        // makes a home claim has already named the home, and one without it never parses.
+        target: claim.home,
         summary: claim.summary,
         evidence: claim.evidence,
       });

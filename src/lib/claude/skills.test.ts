@@ -421,13 +421,28 @@ describe("required skill assets", () => {
       expect(body).toMatch(/what should die/i);
     });
 
-    it("names exactly the three claim classes the runtime can file", () => {
+    it("names exactly the four claim classes the runtime can file", () => {
       // Drift here is silent-but-fatal: a class anton has no detection kind for is dropped at
       // validation, so the pass would spend its judgment on asks nobody ever sees.
       expect(body).toMatch(/`reprioritize`/);
+      expect(body).toMatch(/`rehome`/);
       expect(body).toMatch(/`split`/);
       expect(body).toMatch(/`kill`/);
-      expect(body).toMatch(/Exactly three classes/);
+      expect(body).toMatch(/Exactly four classes/);
+    });
+
+    // The contract used to tell the session in as many words that parentage was the gardener's and
+    // to stay out of it, which suppressed the `rehome` kind no matter what the code supported. The
+    // boundary it replaced is the real one: homeless work is still the gardener's.
+    it("permits the home claim while keeping homeless work with the gardener", () => {
+      expect(body).toMatch(/Parentage is not wholly theirs/);
+      expect(body).toMatch(/riding no run target is not yours to re-home/i);
+    });
+
+    // A home claim reads two contracts against each other; the shape of the words is not evidence.
+    it("holds a home claim to the two beads' own contracts, not to naming", () => {
+      expect(body).toMatch(/The evidence bar is the two beads' \*\*own contracts\*\*/);
+      expect(body).toMatch(/\*\*Naming is not evidence\*\*/);
     });
 
     it("states that the pass proposes and never writes", () => {

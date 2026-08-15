@@ -53,6 +53,7 @@ export const DEFAULT_PROPOSAL_AUTONOMY_POLICY: ProposalAutonomyPolicy = {
   "shipped-orphan": "propose",
   mispriority: "propose",
   "missing-order": "propose",
+  misfiled: "propose",
   oversized: "propose",
   "low-value": "propose",
   "degraded-approval": "propose",

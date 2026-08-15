@@ -218,6 +218,20 @@ describe("parsePmReport", () => {
     });
   });
 
+  it("reads a home claim as the subject and the home it names", () => {
+    const result = parsePmReport(
+      report(
+        `{"proposals":[{"kind":"rehome","bead":"anton-a","home":"anton-epic","summary":"s","evidence":["e"]}]}`,
+      ),
+    );
+    expect(result).toEqual({
+      ok: true,
+      claims: [
+        { kind: "rehome", bead: "anton-a", home: "anton-epic", summary: "s", evidence: ["e"] },
+      ],
+    });
+  });
+
   it("reads an EMPTY list as the healthy answer, not as a failure", () => {
     expect(parsePmReport(report(`{"proposals":[]}`))).toEqual({ ok: true, claims: [] });
   });
@@ -232,6 +246,9 @@ describe("parsePmReport", () => {
     ["a reprioritize with no priority", report(`{"proposals":[{"kind":"reprioritize","bead":"a","summary":"s","evidence":["e"]}]}`)],
     ["a reprioritize with a bogus priority", report(`{"proposals":[{"kind":"reprioritize","bead":"a","priority":"P9","summary":"s","evidence":["e"]}]}`)],
     ["a split with a single piece", report(`{"proposals":[{"kind":"split","bead":"a","pieces":["one"],"summary":"s","evidence":["e"]}]}`)],
+    // A home claim names two beads, and "this is misfiled" without the second names no move at all.
+    ["a rehome with no home", report(`{"proposals":[{"kind":"rehome","bead":"a","summary":"s","evidence":["e"]}]}`)],
+    ["a rehome whose home is blank", report(`{"proposals":[{"kind":"rehome","bead":"a","home":"  ","summary":"s","evidence":["e"]}]}`)],
     ["evidence-free judgment", report(`{"proposals":[{"kind":"kill","bead":"a","summary":"s","evidence":[]}]}`)],
   ])("refuses %s rather than reading it as a healthy board", (_label, text) => {
     const result = parsePmReport(text);
@@ -373,6 +390,103 @@ describe("detectionsFor", () => {
     expect(detections).toEqual([]);
     expect(rejected).toHaveLength(1);
     expect(rejected[0].reason).toMatch(reason);
+  });
+
+  // The home claim (anton-02po). One kind covers both tiers, so the accepted cases and the refusals
+  // are asserted over a board that carries both shapes: a ticket under the wrong card, and a card
+  // under the wrong epic.
+  describe("a home claim", () => {
+    /** The epic that already groups a card, so it is a container and may carry another. */
+    const container = bead("anton-epic", { issue_type: "epic" });
+    const grouped = bead("anton-f1", { issue_type: "feature", parent: container.id });
+    /** Two cards: the wrong home a ticket rides today, and the right one. */
+    const wrongCard = bead("anton-card1", { issue_type: "feature" });
+    const rightCard = bead("anton-card2", { issue_type: "feature" });
+    const ticket = bead("anton-t", { parent: wrongCard.id });
+    /** A card whose own home is the wrong epic — the other half of the same claim. */
+    const strayCard = bead("anton-stray", { issue_type: "feature", parent: "anton-other-epic" });
+    const otherEpic = bead("anton-other-epic", { issue_type: "epic" });
+
+    const board = [container, grouped, wrongCard, rightCard, ticket, strayCard, otherEpic];
+
+    const rehome = (bead: string, home: string): PmClaim =>
+      claim({ kind: "rehome", bead, home, summary: "it belongs over there" });
+
+    it("moves a ticket to another card, and a card to the epic that groups it", () => {
+      const { detections, rejected } = detectionsFor(
+        [rehome(ticket.id, rightCard.id), rehome(strayCard.id, container.id)],
+        board,
+        NOW,
+      );
+      expect(rejected).toEqual([]);
+      expect(detections.map((d) => [d.kind, d.move, d.subjects, d.target])).toEqual([
+        ["misfiled", "reparent", [ticket.id], rightCard.id],
+        ["misfiled", "reparent", [strayCard.id], container.id],
+      ]);
+      // The home is part of the claim's identity: two homes for one bead are two different asks.
+      expect(detections[0].subjectKey).toBe(`misfiled:${ticket.id}>${rightCard.id}`);
+      expect(detections[0].fingerprint.split(":")[0]).toBe("pm");
+    });
+
+    it.each([
+      [
+        "the home the bead already hangs under",
+        () => rehome(ticket.id, wrongCard.id),
+        /already hangs under anton-card1/,
+      ],
+      ["a home that is not on the board", () => rehome(ticket.id, "anton-ghost"), /not on the board/],
+      ["the bead itself", () => rehome(ticket.id, ticket.id), /cannot be its own home/],
+      ["a home that has settled", () => rehome(ticket.id, "anton-shut"), /already settled/],
+      ["a home a run is shipping", () => rehome(ticket.id, "anton-live"), /mid-run/],
+      [
+        "a home a run has claimed but not yet leased",
+        () => rehome(ticket.id, "anton-held"),
+        /is held by runner-7/,
+      ],
+      ["a home that is itself a proposal", () => rehome(ticket.id, "anton-prop"), /is a proposal/],
+      // The tier taxonomy, asked through apply's own homeWrongTier so the filing check and the
+      // approve check cannot disagree about which homes are legal.
+      [
+        "a ticket under something that is not a board card",
+        () => rehome(ticket.id, container.id),
+        /is not a board card/,
+      ],
+      [
+        "a card under a card",
+        () => rehome(strayCard.id, rightCard.id),
+        /a card hangs off an epic and nothing else/,
+      ],
+      [
+        "a card under an epic that groups no cards — the move would demote it out of its own run",
+        () => rehome(strayCard.id, "anton-lone"),
+        /is not a container epic/,
+      ],
+      [
+        "a home that sits under the bead being moved",
+        () => rehome(wrongCard.id, ticket.id),
+        /would make the subtree its own ancestor/,
+      ],
+    ])("refuses %s, and says why rather than dropping it", (_label, bad, reason) => {
+      const full = [
+        ...board,
+        bead("anton-shut", { issue_type: "feature", status: "closed" }),
+        bead("anton-live", {
+          issue_type: "feature",
+          labels: [LABELS.runLease(NOW + 600_000, "abc")],
+        }),
+        bead("anton-held", {
+          issue_type: "feature",
+          status: "in_progress",
+          assignee: "runner-7",
+        }),
+        bead("anton-prop", { issue_type: "feature", labels: ["pm:low-value:0123456789ab"] }),
+        bead("anton-lone", { issue_type: "epic" }),
+      ];
+      const { detections, rejected } = detectionsFor([bad()], full, NOW);
+      expect(detections).toEqual([]);
+      expect(rejected).toHaveLength(1);
+      expect(rejected[0].reason).toMatch(reason);
+    });
   });
 
   it("keeps the good claims when one in the batch is refused", () => {

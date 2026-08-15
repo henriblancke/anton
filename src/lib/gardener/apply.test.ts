@@ -309,6 +309,18 @@ const CLUSTER = planFor({
   target: CARD.id,
 });
 
+/**
+ * The product master's re-parent (anton-02po): a bead whose home is WRONG rather than missing. Its
+ * subject already rides a card, which is exactly what the gardener's two kinds refuse — so it is the
+ * one re-parent whose premise no board read restates, and the evidence fence is what stands in.
+ */
+const MISFILED = planFor({
+  kind: "misfiled",
+  move: "reparent",
+  subjects: ["anton-a"],
+  target: CARD.id,
+});
+
 const LINK = planFor({
   kind: "implied-order",
   move: "link",
@@ -407,7 +419,9 @@ describe("planApply — what an approval means against the board as it now is", 
       summary: "re-parented anton-a, anton-b under anton-card",
       steps: [
         // `claim`/`parentClaim` empty — neither end of the move is owned by a run, which is the
-        // pair the write re-checks under the locks it takes on both.
+        // pair the write re-checks under the locks it takes on both. The fence rides along for the
+        // ONE re-parent kind a fresh board read cannot re-derive (`misfiled`); this one carries no
+        // premise, so it changes nothing here.
         {
           verb: "reparent",
           id: "anton-a",
@@ -415,6 +429,8 @@ describe("planApply — what an approval means against the board as it now is", 
           parent: "anton-card",
           undoParent: "anton-container",
           parentClaim: "",
+          kind: "parentless-cluster",
+          observedAtMs: Date.parse(FILED),
         },
         // A parentless subject undoes to bd's detach form, not to some invented parent.
         {
@@ -424,6 +440,8 @@ describe("planApply — what an approval means against the board as it now is", 
           parent: "anton-card",
           undoParent: "",
           parentClaim: "",
+          kind: "parentless-cluster",
+          observedAtMs: Date.parse(FILED),
         },
       ],
     });
@@ -848,6 +866,52 @@ describe("planApply — what an approval means against the board as it now is", 
     // so it is still the fix rather than a decision to preserve.
     it("still re-homes a subject moved under something that is not a card", () => {
       expect(decide(REPARENT, [CARD, child("anton-a", "anton-container")]).status).toBe("apply");
+    });
+
+    // The `misfiled` half of the same verb (anton-02po). Its subject rides a perfectly good card —
+    // that IS the claim — so the card check above would refuse every one of them; what stands in is
+    // the evidence fence, asked at BOTH ends because a home claim is a match between two contracts.
+    describe("a misfiled home claim", () => {
+      /** The card the subject rides today: a real board card, which is what makes it misfiled. */
+      const wrongHome = bead("anton-card9", { issue_type: "feature" });
+      const subject = (extra: Partial<Bead> = {}): Bead =>
+        child("anton-a", wrongHome.id, { updated_at: "2025-01-01T00:00:00Z", ...extra });
+      const home = (extra: Partial<Bead> = {}): Bead =>
+        cold(CARD.id, { issue_type: "feature", ...extra });
+
+      it("moves a subject that already rides a card, which the gardener's kinds refuse", () => {
+        const board = [home(), wrongHome, subject()];
+        expect(decide(MISFILED, board).status).toBe("apply");
+        // Same board, the gardener's claim: "no card carries this" is re-derivable and now false.
+        expect(reason(decide(REPARENT, board))).toMatch(/now rides board card anton-card9/);
+      });
+
+      it("refuses when the subject was rewritten after the filing", () => {
+        expect(reason(decide(MISFILED, [home(), wrongHome, subject(warm("anton-a"))]))).toMatch(
+          /no longer the bead whose contract this home was chosen for/,
+        );
+        expect(reason(decide(MISFILED, [home(), wrongHome, child("anton-a", wrongHome.id)]))).toMatch(
+          /no write stamp/,
+        );
+      });
+
+      // The HOME's end of the match, and the one nothing else notices: every other bar asks whether
+      // the home is still open, unclaimed and the right tier, all of which a rewrite leaves intact.
+      it("refuses when the HOME was rewritten after the filing", () => {
+        expect(
+          reason(decide(MISFILED, [warm(CARD.id, { issue_type: "feature" }), wrongHome, subject()])),
+        ).toMatch(/no longer the home whose contract this bead was judged to belong under/);
+      });
+
+      // The outcome the ask wanted, put there by hand, is still the outcome — and re-homing a bead
+      // is itself a write since the filing, so a fence asked before the settle check would refuse
+      // the one answer the proposal most wants.
+      it("settles a subject somebody has already moved home, fence or no fence", () => {
+        expect(decide(MISFILED, [home(), warm("anton-a", { parent: CARD.id })])).toEqual({
+          status: "settled",
+          summary: "anton-a already sits under anton-card",
+        });
+      });
     });
 
     // An `implied-order` ask rests on ONE piece of evidence — a body phrase on one end of the pair —
@@ -1309,6 +1373,27 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     ).rejects.toMatchObject({ failure: "refused" });
     expect(calls).toEqual([
       `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-b has been written to since this proposal was filed — it is no longer the landed twin whose contents this bead matched, and superseding onto it now could retire the only copy of that work still open`,
+    ]);
+  });
+
+  // The home claim's two ends, re-asked against reads taken INSIDE the write locks. The snapshot
+  // decision cleared both, and it is already stale when the first write spawns — an edit landing in
+  // that window leaves status, liveness, claim and tier exactly as the plan found them, so nothing
+  // else under the lock objects.
+  it.each([
+    ["subject", "anton-a", "the bead whose contract this home was chosen for"],
+    ["home", CARD.id, "the home whose contract this bead was judged to belong under"],
+  ])("refuses a misfiled move whose %s was rewritten after the snapshot", async (_end, id, still) => {
+    const proposal = proposalFor(MISFILED);
+    const home = cold(CARD.id, { issue_type: "feature" });
+    const subject = child("anton-a", "anton-card9", { updated_at: "2025-01-01T00:00:00Z" });
+    liveBeads.set(id, warm(id, id === CARD.id ? { issue_type: "feature" } : { parent: "anton-card9" }));
+
+    await expect(
+      apply(proposal, [home, bead("anton-card9", { issue_type: "feature" }), subject, proposal]),
+    ).rejects.toMatchObject({ failure: "refused" });
+    expect(calls).toEqual([
+      expect.stringContaining(`${id} has been written to since this proposal was filed — it is no longer ${still}`),
     ]);
   });
 
