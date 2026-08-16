@@ -37,8 +37,11 @@ vi.mock("../beads/bd", async () => {
   };
 });
 
-const loadMock = vi.fn<(cwd: string) => Promise<Bead[]>>();
-vi.mock("../beads/issues", () => ({ loadAllIssues: (...a: [string]) => loadMock(...a) }));
+const loadMock =
+  vi.fn<(cwd: string, opts?: { strictGates?: boolean }) => Promise<Bead[]>>();
+vi.mock("../beads/issues", () => ({
+  loadAllIssues: (...a: [string, { strictGates?: boolean }?]) => loadMock(...a),
+}));
 
 /** The apply seam: the armed walk reimplements none of it, so the walk's own tests stub it whole. */
 const applyMock =
@@ -277,6 +280,46 @@ describe("armed walk · cancelled", () => {
     });
 
     await expect(walk(filed(1), controller.signal)).rejects.toBe(reason);
+  });
+});
+
+/**
+ * The pre-write read, and why it is the STRICT one (anton-ve2r).
+ *
+ * bd omits gate beads from every ordinary listing while carrying the `blocks` edge a gate puts on the
+ * bead it gates, and a blocker absent from the list reads as still open everywhere (epic-graph.ts).
+ * That fail-safe inverts here: an approved target's own `gh:pr` gate would read as a real blocker, a
+ * `blocked` approval gap, and `degraded-approval` armed at `apply` would strip the label off sound
+ * work with nobody watching. A board anton cannot see whole must refuse the apply, not authorise it.
+ */
+describe("armed walk · a board it cannot see whole", () => {
+  const running = (): AbortSignal => new AbortController().signal;
+
+  it("reads the gates with the board, so a gate it cannot see is never an unknown blocker", async () => {
+    await walk(filed(1), running());
+
+    expect(loadMock).toHaveBeenCalledWith(REPO, { strictGates: true });
+  });
+
+  it("leaves the ask open when the gate listing fails, rather than applying against a partial board", async () => {
+    loadMock.mockRejectedValueOnce(new Error("bd list --type gate failed: database is locked"));
+
+    const result = await walk(filed(2), running());
+
+    // Nothing written for the proposal whose read failed — and the walk carries on to the next ask,
+    // because a read that failed once is this proposal's outcome, not the pass's.
+    expect(applyMock).toHaveBeenCalledTimes(1);
+    expect(applyMock).toHaveBeenCalledWith(
+      REPO,
+      expect.objectContaining({ id: "p-2" }),
+      expect.any(AbortSignal),
+    );
+    expect(result.records.map((r) => r.outcome)).toEqual(["error", "applied"]);
+    expect(result.records[0]).toMatchObject({ changed: [] });
+    expect(recorded()).toContain(
+      "— COULD NOT APPLY: the board could not be read completely before applying",
+    );
+    expect(recorded()).toContain("database is locked");
   });
 });
 

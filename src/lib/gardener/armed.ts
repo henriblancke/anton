@@ -44,7 +44,7 @@
  * Shared by both producers on purpose (gardener-proposals.ts, product-master-steps.ts): a
  * per-producer copy would be two answers to "how much may a pass write, and how does it say so".
  */
-import { beads } from "../beads/bd";
+import { beads, type Bead } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
 import { applyProposal, ProposalApplyError } from "./apply";
 import { messageOf } from "./apply-steps";
@@ -470,6 +470,28 @@ const cancelledMidApply = (signal: AbortSignal | undefined, e: unknown): boolean
   signal?.aborted === true && e === signal.reason;
 
 /**
+ * The board this apply is decided against — GATE-COMPLETE, or not at all.
+ *
+ * `strictGates`, unlike a page render's read (beads/issues.ts): bd omits gate beads from every
+ * ordinary listing while carrying the `blocks` edge a gate puts on the bead it gates, and every
+ * blocker helper reads a blocker absent from the list as still open (epic-graph.ts, fail-safe). Fail-
+ * safe is the wrong direction HERE, because this read authorises an unattended write: a gate listing
+ * that fails leaves an approved target's own `gh:pr` merge gate reading as a real blocker, which is a
+ * `blocked` approval gap (approval-gate.ts) — exactly the premise a `degraded-approval` ask needs
+ * to strip the `approved` label off sound work with nobody watching. So a board anton cannot see
+ * whole refuses the apply and leaves the ask standing, rather than answering it from a partial view.
+ */
+async function readBoardForApply(repo: string): Promise<Bead[]> {
+  try {
+    return await loadAllIssues(repo, { strictGates: true });
+  } catch (e) {
+    throw new Error(
+      `the board could not be read completely before applying (${messageOf(e)}) — nothing was applied`,
+    );
+  }
+}
+
+/**
  * One proposal, applied against a board read FRESH for it — as the approve route reads one per
  * approval, and for a reason a shared snapshot could not answer: an earlier apply in this same loop
  * may have moved a bead this one rests on. Fresh across MACHINES too: the caller pulls the shared
@@ -484,7 +506,7 @@ const cancelledMidApply = (signal: AbortSignal | undefined, e: unknown): boolean
 async function applyOne(input: ArmedInput, base: ArmedAsk): Promise<ArmedAttempt> {
   const proposalId = base.proposal;
   try {
-    const board = await loadAllIssues(input.repo);
+    const board = await readBoardForApply(input.repo);
     // The board read is a bd CLI call over every issue, and the loop's own last check lands before
     // it: a cancel arriving inside it would otherwise not be seen until this proposal had been
     // closed, deferred or reparented. The awaits BEYOND it — apply's write lock and its re-read of
