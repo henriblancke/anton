@@ -94,13 +94,44 @@ function board(...beadsOnBoard: Bead[]): void {
   listMock.mockResolvedValue(beadsOnBoard);
 }
 
+const INSTRUCTIONS = "Add a test that fails without the null guard.";
+
 const input = (over: Partial<Parameters<typeof reworkTicket>[2]> = {}) => ({
   ticketId: "t1",
   mode: "reopen" as const,
   summary: "the API is still untested",
-  instructions: "Add a test that fails without the null guard.",
+  instructions: INSTRUCTIONS,
   ...over,
 });
+
+/**
+ * The instruction note an earlier attempt's follow-up carries. The dedupe compares it, so a bead
+ * with the same title but different instructions is a different request rather than a duplicate.
+ */
+function followUpNote(args: {
+  targetId: string;
+  originId: string;
+  summary: string;
+  redirected?: boolean;
+}): string {
+  return reworkNoteBody({
+    mode: "follow-up",
+    instructions: INSTRUCTIONS,
+    findings: [],
+    redirected: false,
+    ...args,
+  });
+}
+
+/** Serve that note from `bd show` — `bd list` doesn't carry notes, so the dedupe re-reads the bead. */
+function showsWithNote(id: string, body: string): void {
+  const base = showMock.getMockImplementation()!;
+  showMock.mockImplementation(async (cwd, beadId) =>
+    beadId === id
+      ? makeBead({ id, notes: formatHumanNote(body, "founder", new Date()) })
+      : base(cwd, beadId),
+  );
+}
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -396,10 +427,43 @@ describe("follow-up", () => {
         dependencies: [{ issue_id: "already", depends_on_id: "t1", type: "discovered-from" }],
       }),
     );
+    showsWithNote(
+      "already",
+      followUpNote({ targetId: "feat", originId: "t1", summary: "Harden the retry path" }),
+    );
+
     const result = await reworkTicket(project, "feat", followUp());
     expect(result).toMatchObject({ applied: false, reworkedId: "already" });
     expect(createMock).not.toHaveBeenCalled();
     expect(noteMock).not.toHaveBeenCalled();
+  });
+
+  it("is NOT a duplicate when the bead with that title carries different instructions", async () => {
+    // Same title, same origin — but the note on it is another request's. Reusing it would report
+    // instructions that are nowhere on the bead and hand the implementer the earlier ones.
+    board(
+      feature(),
+      ticketA(),
+      makeBead({
+        id: "already",
+        title: "Harden the retry path",
+        parent: "feat",
+        dependencies: [{ issue_id: "already", depends_on_id: "t1", type: "discovered-from" }],
+      }),
+    );
+    showsWithNote(
+      "already",
+      followUpNote({
+        targetId: "feat",
+        originId: "t1",
+        summary: "Harden the retry path",
+      }).replace(INSTRUCTIONS, "Something the founder asked for last week."),
+    );
+
+    const result = await reworkTicket(project, "feat", followUp());
+
+    expect(result).toMatchObject({ applied: true, reworkedId: "anton-new" });
+    expect(createMock).toHaveBeenCalled();
   });
 
   it("still applies when the existing follow-up was closed — that iteration is over", async () => {
@@ -548,6 +612,10 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
           dependencies: [{ issue_id: "already", depends_on_id: "solo", type: "discovered-from" }],
         }),
       );
+      showsWithNote(
+        "already",
+        followUpNote({ targetId: "solo", originId: "solo", summary: "Harden the retry path" }),
+      );
 
       const result = await reworkTicket(project, "solo", soloFollowUp());
 
@@ -572,6 +640,10 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
         id === "feat"
           ? makeBead({ id, issue_type: "feature", metadata: { pr: "gh-42" } })
           : makeBead({ id, status: "closed" }),
+      );
+      showsWithNote(
+        "already",
+        followUpNote({ targetId: "feat", originId: "t1", summary: "Harden the retry path" }),
       );
       prStateMock.mockResolvedValue("open");
 
@@ -636,6 +708,10 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
 
     it("detaches a follow-up an earlier attempt left under the target — a merged target runs nothing", async () => {
       withFollowUpUnderTarget({ parent: "feat" });
+      showsWithNote(
+        "already",
+        followUpNote({ targetId: "feat", originId: "t1", summary: "Harden the retry path" }),
+      );
 
       const result = await reworkTicket(project, "feat", followUp());
 
@@ -652,12 +728,46 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
 
     it("detaches on a REDIRECTED reopen too — the same stranded child, reached the other way", async () => {
       withFollowUpUnderTarget({ parent: "feat", title: "the API is still untested" });
+      showsWithNote(
+        "already",
+        followUpNote({
+          targetId: "feat",
+          originId: "t1",
+          summary: "the API is still untested",
+          redirected: true,
+        }),
+      );
+
       await reworkTicket(project, "feat", input());
       expect(reparentMock).toHaveBeenCalledWith("/repo", "already", "");
     });
 
+    it("never carries a redirected reopen on an ORDINARY follow-up of the same title", async () => {
+      // The two say opposite things about whether the original's acceptance stood, so reusing one
+      // for the other would tell the founder the redirect landed on a bead that says it was met.
+      withFollowUpUnderTarget({ title: "the API is still untested" });
+      showsWithNote(
+        "already",
+        followUpNote({ targetId: "feat", originId: "t1", summary: "the API is still untested" }),
+      );
+
+      const result = await reworkTicket(project, "feat", input());
+
+      expect(result).toMatchObject({ mode: "follow-up", reworkedId: "anton-new", applied: true });
+      expect(noteMock).toHaveBeenCalledWith(
+        "/repo",
+        "anton-new",
+        expect.stringContaining("has already merged"),
+        "founder",
+      );
+    });
+
     it("touches a follow-up that is already its own run target not at all", async () => {
       withFollowUpUnderTarget();
+      showsWithNote(
+        "already",
+        followUpNote({ targetId: "feat", originId: "t1", summary: "Harden the retry path" }),
+      );
 
       const result = await reworkTicket(project, "feat", followUp());
 
@@ -687,15 +797,33 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
       expect(untagMock).not.toHaveBeenCalledWith("/repo", "feat", expect.anything());
     });
 
-    it("records the race on the target — the instructions already landed, so it can't be silent", async () => {
+    it("writes NOTHING — the merge invalidates the mode itself, not just the retire", async () => {
       mergesMidFlight();
 
       await expect(reworkTicket(project, "feat", input())).rejects.toThrow(/send the ticket back/i);
 
-      const noted = noteMock.mock.calls.map((c) => [c[1], c[2] as string] as const);
-      expect(noted.find(([id]) => id === "feat")?.[1]).toContain("LEFT in place");
-      // ...and the send-back itself is on the ticket, which is what the retry finds already done.
-      expect(noted.some(([id]) => id === "t1")).toBe(true);
+      // The re-read gates the mode's writes too, so the ticket is left exactly as its run left it:
+      // closed, still wearing its stage labels, with no instruction note steering a run that will
+      // never happen. Landing the reopen and then refusing would strand it — nothing rolls a reopen
+      // back, and the retry redirects the fix onto its own target.
+      expect(noteMock).not.toHaveBeenCalled();
+      expect(reopenMock).not.toHaveBeenCalled();
+      expect(untagMock).not.toHaveBeenCalled();
+      expect(createMock).not.toHaveBeenCalled();
+    });
+
+    it("503s instead, when `gh` goes unreadable between the two reads", async () => {
+      // Unreadable is not merged: the remedy is fixing `gh`, not sending the ticket back — and
+      // either way nothing may be written on a PR anton can no longer prove is live.
+      targetWithPr("open");
+      prStateMock.mockReset();
+      prStateMock.mockResolvedValueOnce("open").mockResolvedValue("unknown");
+
+      await expect(reworkTicket(project, "feat", input())).rejects.toBeInstanceOf(
+        ReworkUnavailableError,
+      );
+      expect(noteMock).not.toHaveBeenCalled();
+      expect(clearPrRefMock).not.toHaveBeenCalled();
     });
 
     it("re-reads the state rather than trusting the pre-lock one", async () => {
@@ -703,7 +831,7 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
       await expect(reworkTicket(project, "feat", input())).rejects.toBeInstanceOf(
         ReworkConflictError,
       );
-      expect(prStateMock).toHaveBeenCalledTimes(2); // once to decide the mode, once to write
+      expect(prStateMock).toHaveBeenCalledTimes(2); // once to decide the mode, once before writing
     });
 
     /**
