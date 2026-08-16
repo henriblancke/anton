@@ -123,14 +123,23 @@ function followUpNote(args: {
   });
 }
 
-/** Serve that note from `bd show` — `bd list` doesn't carry notes, so the dedupe re-reads the bead. */
-function showsWithNote(id: string, body: string): void {
+/**
+ * Serve that note from `bd show` — `bd list` doesn't carry notes, so the dedupe re-reads the bead.
+ * The re-read otherwise mirrors what the board holds, because that is what bd returns; `over` is how
+ * a case makes the fresh read DISAGREE with the snapshot (a concurrent move landing between them).
+ */
+function showsWithNote(id: string, body: string, over: Partial<Bead> = {}): void {
   const base = showMock.getMockImplementation()!;
-  showMock.mockImplementation(async (cwd, beadId) =>
-    beadId === id
-      ? makeBead({ id, notes: formatHumanNote(body, "founder", new Date()) })
-      : base(cwd, beadId),
-  );
+  showMock.mockImplementation(async (cwd, beadId) => {
+    if (beadId !== id) return base(cwd, beadId);
+    const onBoard = (await listMock()).find((b) => b.id === id);
+    return makeBead({
+      ...onBoard,
+      id,
+      notes: formatHumanNote(body, "founder", new Date()),
+      ...over,
+    });
+  });
 }
 
 beforeEach(() => {
@@ -679,8 +688,11 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
       expect(retirePrRefMock).not.toHaveBeenCalled();
     });
 
-    it("still retires on a repeat whose follow-up IS parented under the target", async () => {
-      // The half-applied send-back this retry exists to finish: the note landed, the reset didn't.
+    /**
+     * The half-applied send-back a retry exists to finish: the note landed, the reset didn't. The
+     * board snapshot parents the follow-up under the target; `freshOver` is what the re-read says.
+     */
+    function repeatUnderOpenPr(freshOver: Partial<Bead> = {}): void {
       board(
         makeBead({ id: "feat", issue_type: "feature", metadata: { pr: "gh-42" } }),
         ticketA(),
@@ -699,14 +711,18 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
       showsWithNote(
         "already",
         followUpNote({ targetId: "feat", originId: "t1", summary: "Harden the retry path" }),
+        freshOver,
       );
       prStateMock.mockResolvedValue("open");
+    }
 
-      const result = await reworkTicket(
-        project,
-        "feat",
-        input({ mode: "follow-up" as const, summary: "Harden the retry path" }),
-      );
+    const repeatFollowUp = () =>
+      input({ mode: "follow-up" as const, summary: "Harden the retry path" });
+
+    it("still retires on a repeat whose follow-up IS parented under the target", async () => {
+      repeatUnderOpenPr();
+
+      const result = await reworkTicket(project, "feat", repeatFollowUp());
 
       expect(result.applied).toBe(false);
       expect(retirePrRefMock).toHaveBeenCalledWith(
@@ -714,6 +730,19 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
         expect.objectContaining({ id: "feat" }),
         "gh-42",
       );
+    });
+
+    it("retires nothing when the follow-up moved out from under the target since the board read", async () => {
+      // The snapshot the dedupe searched still parents it under `feat`; the re-read under the lock
+      // says it was moved (a gardener reparent landing in between). Deciding on the snapshot would
+      // strip the merge gate off a target whose next run no longer carries the fix.
+      repeatUnderOpenPr({ parent: undefined });
+
+      const result = await reworkTicket(project, "feat", repeatFollowUp());
+
+      expect(retirePrRefMock).not.toHaveBeenCalled();
+      expect(untagMock).not.toHaveBeenCalled();
+      expect(result.pipeline).toBeUndefined();
     });
   });
 

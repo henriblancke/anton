@@ -880,6 +880,12 @@ async function noteOrigin(
  * unfinished remains of their first.
  */
 interface FollowUpMatch {
+  /**
+   * The `bd show` re-read, never the board snapshot the candidate came from. {@link applyFollowUp}
+   * decides parentage off this bead — whether the follow-up is stranded under a merged target, and
+   * whether the target's PR gate may be retired — and a concurrent reparent (the gardener's, say)
+   * makes the snapshot say "still under the target" about a bead that has already moved.
+   */
   bead: Bead;
   /** The creation sequence stopped before its note — this request finishes it ({@link applyFollowUp}). */
   partial: boolean;
@@ -904,8 +910,8 @@ async function existingFollowUp(
   let partial: Bead | undefined;
   for (const candidate of candidates) {
     const fresh = await beads.show(repo, candidate.id);
-    if (hasHumanNote(fresh, body)) return { bead: candidate, partial: false };
-    if (!partial && !hasAnyHumanNote(fresh)) partial = candidate;
+    if (hasHumanNote(fresh, body)) return { bead: fresh, partial: false };
+    if (!partial && !hasAnyHumanNote(fresh)) partial = fresh;
   }
   return partial ? { bead: partial, partial: true } : undefined;
 }
