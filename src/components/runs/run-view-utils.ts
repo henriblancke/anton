@@ -1,6 +1,15 @@
 /**
- * Pure helpers for the run-detail view (anton-qbz.2/.3). Extracted so the terminal-attach rule and
- * time formatting are unit-testable without a browser/jsdom (the view itself renders xterm).
+ * The run view's shared vocabulary and pure helpers (anton-qbz.2/.3). Two jobs:
+ *
+ * 1. It is the single declaration of the run shape and its statuses. `src/lib/runs.ts` imports
+ *    these rather than re-declaring them (anton-f3qj) — the dependency points server -> client-safe,
+ *    never the reverse, so a client module can name a run without dragging better-sqlite3 into the
+ *    browser bundle. Nothing here may import a node builtin, a server-only package, or anything
+ *    from `src/lib` — the whole server layer is denied, since lint cannot follow the transitive
+ *    hop from an innocent-looking `@/lib/*` to the db. Enforced by the `no-restricted-imports`
+ *    override for this file in `eslint.config.mjs`, pinned by `run-view-utils.boundary.test.ts`.
+ * 2. The terminal-attach rule and time formatting live here so they are unit-testable without a
+ *    browser/jsdom (the view itself renders xterm).
  */
 
 export type RunStatus = "queued" | "running" | "parked" | "done" | "failed";
@@ -18,8 +27,38 @@ export interface SessionSummary {
   endedAt?: number;
 }
 
-/** Run statuses that are still in flight — drives polling + the "live" terminal label. */
-export const ACTIVE_RUN_STATUSES: RunStatus[] = ["queued", "running", "parked"];
+/** A run as the list view and the runs API surface it. */
+export interface RunSummary {
+  id: string;
+  epicBeadId: string;
+  ticketBeadId?: string;
+  worktreePath?: string;
+  branch?: string;
+  model?: string;
+  agentTag?: string;
+  status: RunStatus;
+  attempts: number;
+  startedAt?: number;
+  endedAt?: number;
+  updatedAt: number;
+}
+
+/** Full run summary including its lease/error/pipeline, for the run meta grid. */
+export interface RunDetail extends RunSummary {
+  leaseExpiresAt?: number;
+  error?: string;
+  /** The pipeline this run walked — the formula file it was read from (anton-aa3m). */
+  formula?: string;
+  /** The bead label that selected that pipeline; absent ⇒ the project/bundled default. */
+  formulaVariant?: string;
+}
+
+/**
+ * Run statuses that are still in flight. One list, two readings that are the same predicate: the
+ * view polls and labels the terminal "live" for these, and the runner treats exactly these as
+ * resumable when it looks for an open run to rejoin rather than starting a duplicate.
+ */
+export const ACTIVE_RUN_STATUSES: readonly RunStatus[] = ["queued", "running", "parked"];
 
 export function isActiveRun(status: RunStatus): boolean {
   return ACTIVE_RUN_STATUSES.includes(status);
