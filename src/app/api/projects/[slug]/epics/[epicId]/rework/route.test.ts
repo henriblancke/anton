@@ -1,6 +1,6 @@
 /**
  * Route test for POST /api/projects/[slug]/epics/[epicId]/rework — the surface that sends a ticket
- * back. What is under test is the HTTP CONTRACT the rework dialog codes against: the five-way status
+ * back. What is under test is the HTTP CONTRACT the rework dialog codes against: the six-way status
  * mapping the domain's error classes are folded onto, and the body shaping done before they can run.
  *
  * The domain verb (`reworkTicket`) is stubbed — what it does to the board is `rework.ts`'s own suite
@@ -39,6 +39,7 @@ const {
   ReworkInvalidError,
   ReworkNotAllowedError,
   ReworkNotFoundError,
+  ReworkUnavailableError,
 } = await import("@/lib/rework");
 
 const post = (slug: string, epicId: string, body?: unknown) =>
@@ -113,6 +114,7 @@ describe("POST /api/projects/[slug]/epics/[epicId]/rework", () => {
       [422, ReworkNotAllowedError, "anton-t9 is not part of anton-e1's run"],
       [400, ReworkInvalidError, "Fix instructions are required"],
       [404, ReworkNotFoundError, "Ticket anton-e1 not found on the board"],
+      [503, ReworkUnavailableError, "anton can't read the state of anton-e1's pull request"],
     ])("answers %i with the error's own message", async (status, Err, message) => {
       reworkTicket.mockRejectedValue(new Err(message));
 

@@ -79,8 +79,34 @@ export type ReworkMode = "reopen" | "follow-up";
 export const MAX_REWORK_SUMMARY_CHARS = 200;
 export const MAX_REWORK_INSTRUCTIONS_CHARS = 2000;
 
+/**
+ * What a send-back had to do about the target's ALREADY-OPENED pull request (anton-leit). A run
+ * target whose PR is live finishes as already-complete on its next attempt (execute-epic's step 0a
+ * short-circuit), so without one of these two moves the reworked bead would sit open forever with no
+ * run path back. Absent when nothing stood in the way — no PR, one that was closed unmerged (the
+ * state a recovery run already re-opens), or a follow-up that came out as its own run target and so
+ * never waits on the target's PR at all.
+ */
+export interface ReworkPipeline {
+  /**
+   * `retired` — the PR is still OPEN, so the target's finished-run marker was cleared and the target
+   * re-runs: the next run picks up on the same branch and updates that same PR.
+   * `shipped` — the PR MERGED, so the work is on the base branch and can't be un-shipped. The
+   * send-back became its OWN run target instead of re-running the merged one.
+   */
+  outcome: "retired" | "shipped";
+  /** The pull request that decided it. */
+  pr: string;
+  /** True when a requested `reopen` became a standalone follow-up because the PR had already merged. */
+  redirected: boolean;
+}
+
 /** What a rework settled — the bead that will re-run, and whether this request is what created it. */
 export interface ReworkResult {
+  /**
+   * How the send-back actually landed. It is the requested {@link ReworkMode} except after a MERGE,
+   * where a `reopen` becomes a `follow-up` — see {@link ReworkPipeline}.
+   */
   mode: ReworkMode;
   /** The ticket the founder sent back. */
   ticketId: string;
@@ -93,11 +119,8 @@ export interface ReworkResult {
    * the second time, and `reworkedId` still names the bead the first one produced.
    */
   applied: boolean;
-  /**
-   * Why the reworked bead will NOT be picked up by the target's next run as things stand — today,
-   * only an open PR, whose run short-circuits as complete. Absent when the path is clear.
-   */
-  warning?: string;
+  /** What was done about the target's already-opened PR so this send-back can actually run. */
+  pipeline?: ReworkPipeline;
 }
 
 /** The board's shared type language — the three tiers of

@@ -511,6 +511,48 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         // Closed-without-merging ref → stale. Fall through to recover the epic: the foreign-lease gate
         // and general lease adoption below run as usual (nothing adopted here so `finally` owns only what
         // the recovery path takes), the closed tickets are skipped, and step 5 re-opens the PR.
+      } else {
+        // 0a, the other half of the same question. A send-back RETIRED a PR off this target
+        //     (anton-leit) and that PR has since merged. The retire took the ref off on purpose —
+        //     this run is the one it exists to let through — but it left the PR named on the bead
+        //     (beads.retirePrRef), and a merge landing in that window changes the answer
+        //     completely: the work is on
+        //     the base branch now, a squash-merge left none of the tickets' `<id>:` commit subjects
+        //     to recognise it by, and executing would re-dispatch shipped work onto a branch whose
+        //     PR is closed. rework refuses exactly this (resolvePipeline: merged work comes back as
+        //     its own target), so a merge that beat the rerun must not get in through the back door.
+        //     PARK for the founder, whose call it is: the fix belongs on a new run target, which a
+        //     fresh send-back now produces (resolvePipeline reads the retired pointer too).
+        //     Only consulted when there is no live ref — a re-stamped one is the live answer and
+        //     clears this pointer (beads.setPrRef) — and only when one was actually retired, so the
+        //     ordinary run pays no `gh` call. An UNREADABLE state retries, exactly as the live-ref
+        //     branch above does and for the same reason: `unknown` is proof of nothing, so letting it
+        //     fall through to execute would re-dispatch shipped work whenever the retired PR had in
+        //     fact merged — the corruption this branch exists to prevent, now decided by a `gh`
+        //     outage. Running is not the cheap fallback it looks like either: `gh` is a hard
+        //     dependency of the run (step 5 opens/updates the PR), so a run that cannot read it
+        //     cannot finish. COUNTING (a plain throw), so a transient outage self-heals within the
+        //     retry budget and a permanent one parks for a human instead of retrying forever.
+        const retiredPr = beads.getRetiredPrRef(leaseTarget);
+        if (retiredPr) {
+          const retiredState = await pullRequestState(repo, retiredPr);
+          if (retiredState === "unknown") {
+            throw new Error(
+              `${epicBeadId} was sent back with ${retiredPr} still open, and that pull request's ` +
+                `state can't be read (gh unavailable or the ref is unparseable) — retrying rather ` +
+                `than re-running a target whose work may already have merged; a transient gh outage ` +
+                `self-heals within the retry budget, a permanently-unreadable ref parks for a human`,
+            );
+          }
+          if (retiredState === "merged") {
+            throw new PoisonEpic(
+              `${epicBeadId} was sent back with ${retiredPr} still open, but that pull request has ` +
+                `merged since — its work is on the base branch, so re-running this target would ` +
+                `re-dispatch shipped tickets. Send the ticket back again: anton reads ${retiredPr} as ` +
+                `merged now and carries the fix as its own run target instead.`,
+            );
+          }
+        }
       }
 
       // 0a-bis. Re-run the job-start readiness gate against the freshly-pulled board (anton-jz1).

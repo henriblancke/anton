@@ -71,6 +71,12 @@ const REVIEW_SCORE_PREFIX = "review-score:";
 export const GH_PR_REF = /^gh-\d+$/i;
 
 /**
+ * Metadata key holding the PR a send-back retired off a bead (anton-leit) — see
+ * {@link beads.retirePrRef}. Deliberately NOT `pr`: nothing may read it as a live pointer.
+ */
+const RETIRED_PR_KEY = "retiredPr";
+
+/**
  * Parse a `run-lease:<expiry>[:<owner>]` label into its expiry (ms epoch) and optional owner (the
  * publishing run's id, anton-jz1). `expiry` is undefined for a malformed/non-numeric value. A label
  * with no `:<owner>` suffix (legacy format, or a liveness-only publish) parses `owner: undefined`.
@@ -2332,9 +2338,13 @@ export const beads = {
    * Write the PR pointer to `metadata.pr` — the single seam anton uses for the PR link (anton-is7x).
    * Keeping it out of `external_ref` frees that field for tracker integrations; every read goes
    * through getPrRef, every write through here, so no call site touches `external_ref` for PRs.
+   *
+   * Any RETIRED pointer ({@link retirePrRef}) is dropped in the same write: that key exists only to
+   * name the PR a bead no longer points at, so a live pointer makes it stale by definition — and
+   * leaving both would have two channels answering "which PR is this bead's?".
    */
   setPrRef: (cwd: string, id: string, ref: string) =>
-    bdWrite(cwd, ["update", id, "--set-metadata", `pr=${ref}`]),
+    bdWrite(cwd, ["update", id, "--set-metadata", `pr=${ref}`, "--unset-metadata", RETIRED_PR_KEY]),
 
   /**
    * Read a bead's PR pointer through the seam (anton-is7x). `metadata.pr` is authoritative; until the
@@ -2347,6 +2357,42 @@ export const beads = {
     if (typeof pr === "string" && pr) return pr;
     const ref = b.external_ref;
     return ref && GH_PR_REF.test(ref) ? ref : undefined;
+  },
+
+  /**
+   * RETIRE a bead's PR pointer (anton-leit): the live pointer comes off and the same PR lands on
+   * `metadata.retiredPr`, in ONE atomic `bd update`. What a send-back does to a target it is putting
+   * back in front of a runner — the bead must stop reading as in-review (every surface derives that
+   * from {@link getPrRef}, and execute-epic's step 0a finishes an attempt on it), while the PR it
+   * just came off stays reachable from the bead: that link is the only way a later reader — or
+   * {@link getRetiredPrRef}'s callers — can tell a target whose PR merged after the retire from one
+   * that never had a PR at all.
+   *
+   * Both live channels are cleared, because {@link getPrRef} reads both: unsetting `metadata.pr`
+   * alone would leave a legacy `gh-*` external_ref readable and the bead would still look in-review.
+   * A NON-`gh-` external_ref (a tracker URL) is left untouched for the same reason getPrRef ignores
+   * it. Takes the bead rather than an id because that decision is a property of its current state.
+   */
+  retirePrRef: (cwd: string, bead: Bead, ref: string) =>
+    bdWrite(cwd, [
+      "update",
+      bead.id,
+      "--unset-metadata",
+      "pr",
+      "--set-metadata",
+      `${RETIRED_PR_KEY}=${ref}`,
+      ...(bead.external_ref && GH_PR_REF.test(bead.external_ref) ? ["--external-ref", ""] : []),
+    ]),
+
+  /**
+   * The PR a send-back retired off this bead ({@link retirePrRef}), if any. Never a live pointer —
+   * {@link setPrRef} drops this key — so a reader that wants "the PR this bead is in review on"
+   * must keep asking {@link getPrRef}, and this answers the different question: "which PR did the
+   * run that finished this bead open, before the send-back put it back to work?"
+   */
+  getRetiredPrRef: (b: Bead): string | undefined => {
+    const pr = b.metadata?.[RETIRED_PR_KEY];
+    return typeof pr === "string" && pr ? pr : undefined;
   },
 
   /**

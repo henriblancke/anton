@@ -11,6 +11,7 @@ import {
   reworkCandidates,
   reworkOutcomeMessage,
   reworkPayload,
+  reworkPipelineMessage,
   toggleKey,
   type ReworkDraft,
 } from "@/components/epic/rework-draft";
@@ -133,5 +134,42 @@ describe("reworkOutcomeMessage", () => {
     expect(reworkOutcomeMessage(result({ applied: false }))).toBe(
       "Already sent back — t-1 carries these instructions",
     );
+  });
+});
+
+describe("reworkPipelineMessage", () => {
+  it("stays silent when no pull request stood in the way", () => {
+    expect(reworkPipelineMessage(result())).toBeUndefined();
+  });
+
+  it("says the open PR is reused, not replaced — otherwise the founder expects a second one", () => {
+    const message = reworkPipelineMessage(
+      result({ pipeline: { outcome: "retired", pr: "gh-42", redirected: false } }),
+    );
+    expect(message).toContain("gh-42");
+    expect(message).toContain("same branch");
+  });
+
+  it("says a merged PR sent the work to its own target, and that it needs approving", () => {
+    const message = reworkPipelineMessage(
+      result({
+        mode: "follow-up",
+        reworkedId: "new-1",
+        pipeline: { outcome: "shipped", pr: "gh-42", redirected: false },
+      }),
+    );
+    expect(message).toContain("new-1");
+    expect(message).toContain("approve it to run");
+  });
+
+  it("names the redirect, so a founder who chose 'acceptance not met' isn't quietly overruled", () => {
+    const message = reworkPipelineMessage(
+      result({
+        mode: "follow-up",
+        reworkedId: "new-1",
+        pipeline: { outcome: "shipped", pr: "gh-42", redirected: true },
+      }),
+    );
+    expect(message).toContain("acceptance being unmet");
   });
 });

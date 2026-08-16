@@ -5,6 +5,7 @@ import {
   ReworkInvalidError,
   ReworkNotAllowedError,
   ReworkNotFoundError,
+  ReworkUnavailableError,
   type ReworkInput,
 } from "@/lib/rework";
 import type { ReviewFinding } from "@/lib/jobs/review-context";
@@ -44,6 +45,11 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
     }
     if (err instanceof ReworkNotFoundError) {
       return NextResponse.json({ error: err.message }, { status: 404 });
+    }
+    // 503, not 500: the request is fine and nothing here is broken — `gh` couldn't answer what the
+    // target's PR did, and a retry once it can will succeed unchanged (anton-leit).
+    if (err instanceof ReworkUnavailableError) {
+      return NextResponse.json({ error: err.message }, { status: 503 });
     }
     const message = err instanceof Error ? err.message : "Failed to send the ticket back";
     console.error(`[rework] ${params.epicId} failed`, err);
