@@ -171,6 +171,11 @@ function lockedBeads(step: ApplyStep): string[] {
  * subject and close the proposal over it regardless. So it is re-checked HERE, under the locks and
  * with no await left between it and the write — before the write, never after: a step that has
  * spawned its bd call is a write this process can no longer un-decide.
+ *
+ * The NO-OP return needs the same checkpoint, for a reason the write's own does not cover: it sits
+ * on the far side of those very awaits, and returning "wrote nothing" unchecked is what lets the
+ * caller settle the ask (apply.ts `settleProposal`) over a pass that was already stopped. Writing
+ * nothing is not the same as having nothing left to stop.
  */
 export async function applyStep(
   repo: string,
@@ -178,7 +183,10 @@ export async function applyStep(
   signal?: AbortSignal,
 ): Promise<boolean> {
   return withBeadWriteLocks(repo, lockedBeads(step), async () => {
-    if (await lockedSubjectSatisfied(repo, step)) return false;
+    if (await lockedSubjectSatisfied(repo, step)) {
+      signal?.throwIfAborted();
+      return false;
+    }
     await assertCounterpartUnmoved(repo, step);
     await assertOwnerIdle(repo, step);
     await assertRetirementHolds(repo, step);

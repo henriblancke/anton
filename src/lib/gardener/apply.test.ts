@@ -301,6 +301,28 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     expect(calls).toEqual([]);
   });
 
+  // The third way past that checkpoint: a step the board already satisfied returns before it, having
+  // waited on the very same locks and re-read. Writing nothing is not having nothing left to stop —
+  // the settlement's note and close are still ahead, and would close the ask over a stopped pass.
+  it("stops on a cancel that arrives while a step the board already satisfied is re-read", async () => {
+    const proposal = proposalFor(REPARENT);
+    const stopped = new Error("the pass ran out of time");
+    const controller = new AbortController();
+    // Another approval landed the same move between the snapshot and this apply's per-bead lock, so
+    // the step has nothing to write — and the cancel lands in the re-read that discovers it.
+    liveBeads.set("anton-a", child("anton-a", CARD.id));
+    onShow = (id) => {
+      if (id === "anton-a") controller.abort(stopped);
+    };
+
+    await expect(
+      apply(proposal, [CARD, bead("anton-a"), proposal], "policy", controller.signal),
+    ).rejects.toBe(stopped);
+
+    // Not the move (somebody else's already), and not the settlement closing the ask over it.
+    expect(calls).toEqual([]);
+  });
+
   // The other half of that contract, and the reason the window closes at the FIRST write: the steps
   // roll back as a unit, so a cancel honoured mid-move would leave a partial apply nobody asked for.
   // Here the cancel lands in the second subject's under-lock re-read — the same kind of await the

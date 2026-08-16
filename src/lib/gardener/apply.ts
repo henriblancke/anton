@@ -346,6 +346,10 @@ async function applySteps(
     if (cancelled(signal, e)) throw e;
     throw await attachFailure(repo, proposal, await stepFailure(repo, proposal.id, changed, e));
   }
+  // The last word, for the case every step above wrote nothing: the settlement is itself a pair of
+  // writes, and releasing the per-bead locks is one more await past the final step's own checkpoint.
+  // Free only while `changed` is empty, for the reason the window closes at the first write.
+  if (changed.length === 0) signal?.throwIfAborted();
   return settleProposal(repo, proposal, plan, summary, changed, actor);
 }
 
