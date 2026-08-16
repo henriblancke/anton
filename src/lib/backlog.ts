@@ -94,19 +94,53 @@ export function knownAreas(all: Bead[]): string[] {
 
 
 /**
- * The epics a draft feature may attach to: every live epic, titled and sorted the way the picker
+ * A legacy epic anton is currently running as a target of its own — approved, or claimed and in
+ * flight. It has no `feature` children yet, so landing one turns it into a container mid-flight
+ * (`beads.isContainer`): execute-epic's `isRunTarget` gate then poison-parks the queued run, and an
+ * in-review one drops out of review-fix's sweep with its PR left unfinished. An epic that already
+ * groups features is not at risk — it was never the run target.
+ */
+function isInFlightRunTarget(epic: Bead, board: Bead[]): boolean {
+  return (
+    !beads.isContainer(epic, board) && (beads.isApproved(epic) || epic.status === "in_progress")
+  );
+}
+
+/**
+ * Why this bead may not parent a new feature, or undefined when it may. ONE predicate behind both
+ * the picker and the submit-time re-check, so a target the picker refuses to offer can never be
+ * written by a page that rendered before the board moved — the shape page is long-lived, and
+ * another machine can close, abandon, or approve an epic while the founder is still typing.
+ */
+function ineligibleReason(bead: Bead, board: Bead[]): string | undefined {
+  if (!beads.isEpic(bead)) return `${bead.id} is a ${bead.issue_type ?? "bead"}, not an epic`;
+  // Abandoned first: it is also closed, but "won't do" is a different answer than "shipped".
+  if (beads.isAbandoned(bead)) return `epic ${bead.id} was abandoned — pick another`;
+  if (bead.status === "closed") return `epic ${bead.id} is closed — pick another`;
+  if (isInFlightRunTarget(bead, board)) {
+    return `epic ${bead.id} is approved and running as its own target — a feature under it would strand that run`;
+  }
+  return undefined;
+}
+
+/**
+ * The epics a draft feature may attach to: every eligible epic, titled and sorted the way the picker
  * lists them. Closed and abandoned epics are out — attaching new work to a finished outcome is
- * never the right answer, and an abandoned one is a won't-do decision.
+ * never the right answer, and an abandoned one is a won't-do decision — as are epics anton is
+ * already running as run targets of their own (see {@link isInFlightRunTarget}).
  */
 export function epicChoices(all: Bead[]): EpicChoice[] {
   const looseByEpic = new Map<string, number>();
   for (const bead of all) {
     if (!TICKET_TYPES.has(bead.issue_type ?? "")) continue;
+    // Settled tickets strand nothing — they already shipped or were dropped — so counting them
+    // would warn the founder off the very epic their feature belongs under.
+    if (bead.status === "closed" || beads.isAbandoned(bead)) continue;
     const parent = beads.parentOf(bead);
     if (parent) looseByEpic.set(parent, (looseByEpic.get(parent) ?? 0) + 1);
   }
   return all
-    .filter((b) => beads.isEpic(b) && b.status !== "closed" && !beads.isAbandoned(b))
+    .filter((b) => ineligibleReason(b, all) === undefined)
     .map((epic) => ({
       id: epic.id,
       title: epic.title,
@@ -214,17 +248,18 @@ export async function createDraftEpic(project: Project, draft: EpicDraft): Promi
   });
 }
 
-/** The chosen epic must still be an epic on the board — a stale pick must not parent a feature
- * under a task, and a vanished one must not create a dangling edge bd would reject mid-write. */
+/** The chosen epic must still be eligible on a FRESH board read, by the same rule the picker offered
+ * it under ({@link ineligibleReason}) — a stale pick must not parent a feature under a task, under
+ * an outcome that has since closed, or under a run already in flight, and a vanished one must not
+ * create a dangling edge bd would reject mid-write. */
 async function resolveExistingEpic(project: Project, id: string): Promise<string> {
   const chosen = id.trim();
   if (!chosen) throw new DraftEpicError("no epic chosen — a feature must attach to one");
   const all = await allIssues(project.repoPath);
   const bead = all.find((b) => b.id === chosen);
   if (!bead) throw new DraftEpicError(`epic ${chosen} is not on the board`);
-  if (!beads.isEpic(bead)) {
-    throw new DraftEpicError(`${chosen} is a ${bead.issue_type ?? "bead"}, not an epic`);
-  }
+  const reason = ineligibleReason(bead, all);
+  if (reason) throw new DraftEpicError(reason);
   return chosen;
 }
 
@@ -234,7 +269,8 @@ async function resolveExistingEpic(project: Project, id: string): Promise<string
  * "Send to backlog", and it is deliberately the only shape this path can produce, so the UI producer
  * and the `/shape` CLI producer agree on what a run target is.
  *
- * Both skeletons are rendered and judged BEFORE any bead exists, so a contract refusal can never
+ * Both skeletons are judged BEFORE any bead exists — the feature's here, the epic's inside
+ * {@link createDraftEpic}, which validates ahead of its own write — so a contract refusal can never
  * leave a half-written tree. What remains unatomic is the pair of bd writes: bd's `--graph` plan is
  * the atomic form and `beads.create` does not speak it, so a failing feature write can strand a
  * just-created epic — named in the error rather than swallowed, because a silent orphan on the
@@ -247,13 +283,6 @@ export async function createDraftFeature(
   const target = draft.epic;
   const feature = await buildFeatureSkeleton(project, draft.feature);
   assertContract(draft.feature.title.trim(), feature, []);
-  // The epic is rendered up front for the same reason: a faulted epic must refuse the commit, not
-  // surface after the feature already landed parentless.
-  if (target.kind === "new") {
-    assertContract(target.epic.title.trim(), await buildEpicSkeleton(project, target.epic), [
-      `area:${target.epic.area.trim()}`,
-    ]);
-  }
 
   const epicId =
     target.kind === "new"

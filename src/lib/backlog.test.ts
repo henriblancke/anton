@@ -247,6 +247,45 @@ describe("createDraftFeature — what the Add-work commit lands", () => {
     expect(create).not.toHaveBeenCalled();
   });
 
+  // The board can move while the shape page is open, so the picker's eligibility rule is re-checked
+  // against a fresh read at submit — otherwise a stale selection writes exactly what the picker
+  // refuses to offer.
+  it.each([
+    ["closed", bead({ id: "p-1", issue_type: "epic", status: "closed" }), "closed"],
+    ["abandoned", bead({ id: "p-1", issue_type: "epic", labels: ["abandoned"] }), "abandoned"],
+    [
+      "approved and running as its own target",
+      bead({ id: "p-1", issue_type: "epic", labels: ["approved"] }),
+      "strand that run",
+    ],
+  ])("refuses an epic that went %s after the page rendered", async (_state, epic, message) => {
+    boardIs(epic);
+    const create = vi.spyOn(beads, "create");
+
+    const rejection = await createDraftFeature(project(), {
+      feature: FEATURE,
+      epic: { kind: "existing", id: "p-1" },
+    }).then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+    expect(rejection).toBeInstanceOf(DraftEpicError);
+    expect(rejection?.message).toContain(message);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("still accepts an approved epic that already groups features — it is not the run target", async () => {
+    boardIs(
+      bead({ id: "p-1", issue_type: "epic", labels: ["approved"] }),
+      bead({ id: "p-2", issue_type: "feature", parent: "p-1" }),
+    );
+    vi.spyOn(beads, "create").mockResolvedValue("p-9");
+
+    await expect(
+      createDraftFeature(project(), { feature: FEATURE, epic: { kind: "existing", id: "p-1" } }),
+    ).resolves.toMatchObject({ id: "p-9", epicId: "p-1" });
+  });
+
   // The contract gate throws BEFORE any bd write: a placeholder draft never becomes a bead the
   // board would immediately flag as unapprovable, and never strands a half-written tree.
   it("rejects prompt-only acceptance criteria before writing anything", async () => {
@@ -351,6 +390,32 @@ describe("epicChoices", () => {
       bead({ id: "p-5", issue_type: "task", parent: "p-4" }),
     ]);
     expect(choices).toEqual([{ id: "p-1", title: "Legacy", area: undefined, looseTickets: 2 }]);
+  });
+
+  // A shipped or dropped ticket strands nothing, so warning about it would steer the founder away
+  // from the epic their feature actually belongs under.
+  it("ignores settled tickets in the loose-ticket count", () => {
+    const choices = epicChoices([
+      bead({ id: "p-1", issue_type: "epic", title: "Legacy" }),
+      bead({ id: "p-2", issue_type: "task", parent: "p-1", status: "closed" }),
+      bead({ id: "p-3", issue_type: "bug", parent: "p-1", status: "closed", labels: ["abandoned"] }),
+      bead({ id: "p-4", issue_type: "task", parent: "p-1" }),
+    ]);
+    expect(choices).toEqual([{ id: "p-1", title: "Legacy", area: undefined, looseTickets: 1 }]);
+  });
+
+  // Landing a feature under a legacy epic anton is already running turns it into a container
+  // mid-flight: its queued run is poison-parked, an in-review one strands its PR.
+  it("drops epics anton is already running as targets of their own", () => {
+    const choices = epicChoices([
+      bead({ id: "p-1", issue_type: "epic", title: "Approved", labels: ["approved"] }),
+      bead({ id: "p-2", issue_type: "epic", title: "Claimed", status: "in_progress" }),
+      bead({ id: "p-3", issue_type: "epic", title: "Backlog" }),
+      // Approved but already a container — features run beneath it, so it is not the run target.
+      bead({ id: "p-4", issue_type: "epic", title: "Grouping", labels: ["approved"] }),
+      bead({ id: "p-5", issue_type: "feature", parent: "p-4" }),
+    ]);
+    expect(choices.map((c) => c.id)).toEqual(["p-3", "p-4"]);
   });
 });
 
