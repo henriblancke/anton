@@ -135,12 +135,20 @@ export type ApplyActor = "approval" | "policy";
  * `actor` has no default on purpose. It is the one field that says whether a human chose this, and a
  * default would let a future caller write "somebody approved this" onto a bead nobody was asked
  * about — the exact claim this function exists to keep honest.
+ *
+ * `signal` is an unattended caller's cancel (gardener/armed.ts), and the ONE thing it may do is stop
+ * this apply before its first mutation — see the checkpoint in {@link applyApproved}. It is never
+ * consulted once a step has run: the steps roll back as a unit, and abandoning them half-written is
+ * a board state nobody asked for. Cancelling throws the signal's own `reason` rather than a
+ * {@link ProposalApplyError}, because a stopped pass is not the board declining: it earns no note on
+ * the proposal and no verdict in the record.
  */
 export async function applyProposal(
   repo: string,
   proposal: Bead,
   board: Bead[],
   actor: ApplyActor,
+  signal?: AbortSignal,
 ): Promise<ApplyResult> {
   if (!isProposalBead(proposal)) {
     throw new ProposalApplyError("unusable", `${proposal.id} is not a proposal bead`);
@@ -173,7 +181,7 @@ export async function applyProposal(
         ),
       );
     }
-    return applyApproved(repo, proposal, plan, board, actor);
+    return applyApproved(repo, proposal, plan, board, actor, signal);
   });
 }
 
@@ -184,8 +192,17 @@ async function applyApproved(
   plan: GardenerPlan,
   board: Bead[],
   actor: ApplyActor,
+  signal?: AbortSignal,
 ): Promise<ApplyResult> {
   await assertStillOpen(repo, proposal);
+  // The last moment a cancel is free, and the one an unattended caller cannot check for itself:
+  // acquiring the proposal's write lock and re-reading it under that lock are both awaits on the far
+  // side of the caller's own final check, and a cancel arriving in either would otherwise not be
+  // seen until the subject had been moved and the proposal closed over it — an unattended write out
+  // of a pass that was already stopped. Nothing has been written yet, so stopping costs only the
+  // attempt: the ask stays open for a human or a later pass. Checked once, HERE — every await after
+  // this one is a mutation or sits between mutations, where not-applying is no longer an option.
+  signal?.throwIfAborted();
   // Dated from the proposal the approver read, not from the live re-read: its observation stamp is
   // the moment the patrol judged the board, which is what every "has this moved since we asked"
   // check compares to.

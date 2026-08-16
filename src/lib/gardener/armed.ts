@@ -38,7 +38,8 @@
  * costs the pass the proposals behind it. A patrol that could not apply its second ask must still
  * apply its third — the alternative is one unlucky bead freezing the whole armed path. A CANCEL is
  * the one thing that is not an outcome: it is the pass being stopped, so it is re-thrown rather than
- * returned, and re-checked after every await that precedes a write.
+ * returned, and re-checked after every await that precedes a write — including, through the signal
+ * this walk hands to apply, the two INSIDE it: the proposal's write lock and its re-read under it.
  *
  * Shared by both producers on purpose (gardener-proposals.ts, product-master-steps.ts): a
  * per-producer copy would be two answers to "how much may a pass write, and how does it say so".
@@ -451,9 +452,21 @@ async function pushFailure(repo: string): Promise<string | undefined> {
 /** One attempt's outcome, and whether the walk that made it is still running. */
 interface ArmedAttempt {
   record: ArmedRecord;
-  /** The pass was cancelled between the board read and apply's first mutation — nothing was written. */
+  /** The pass was cancelled before apply's first mutation — nothing was written. */
   stopped?: boolean;
 }
+
+/**
+ * Was this throw the pass being CANCELLED, or an apply failing?
+ *
+ * Told apart by the reason's own IDENTITY: `throwIfAborted` throws the signal's `reason` object
+ * itself, so no board answer and no broken bd can impersonate one. The two mean opposite things to
+ * this walk — a cancel wrote nothing and stops it, while every other throw is this proposal's
+ * outcome and the walk carries on to the next ask — and guessing from `signal.aborted` alone would
+ * report a genuine failure as "nothing was applied" whenever a cancel happened to land beside it.
+ */
+const cancelledMidApply = (signal: AbortSignal | undefined, e: unknown): boolean =>
+  signal?.aborted === true && e === signal.reason;
 
 /**
  * One proposal, applied against a board read FRESH for it — as the approve route reads one per
@@ -464,18 +477,19 @@ interface ArmedAttempt {
  * Total. A {@link ProposalApplyError} is the board's answer, a rolled-back write, or a move that
  * landed and could not be settled, and anything else is a bd that broke; all of them leave the
  * proposal open with the reason on it, and none stops the loop. A CANCEL is the exception the caller
- * re-raises, and it comes back as `stopped` rather than as a throw so the two failure kinds never
- * have to be told apart by identity.
+ * re-raises, and it comes back as `stopped` rather than as a throw, so the loop never has to sort a
+ * stopped pass from a failed apply by inspecting what was thrown.
  */
 async function applyOne(input: ArmedInput, base: ArmedAsk): Promise<ArmedAttempt> {
   const proposalId = base.proposal;
   try {
     const board = await loadAllIssues(input.repo);
-    // The board read is a bd CLI call over every issue — the last await before apply's FIRST
-    // mutation, and the one the caller's checks cannot cover: a cancel arriving inside it would
-    // otherwise not be seen until this proposal had been closed, deferred or reparented. Checked
-    // here rather than by making apply itself abortable: apply's writes roll back as a unit, and
-    // an abort mid-move is a partial move nobody asked for. Not applying at all is the safe answer.
+    // The board read is a bd CLI call over every issue, and the loop's own last check lands before
+    // it: a cancel arriving inside it would otherwise not be seen until this proposal had been
+    // closed, deferred or reparented. The awaits BEYOND it — apply's write lock and its re-read of
+    // the proposal under that lock — are covered by the signal handed to apply itself, which stops
+    // on the far side of both and before its first mutation. Only there, and never deeper: apply's
+    // writes roll back as a unit, so an abort mid-move is a partial move nobody asked for.
     if (input.signal?.aborted) return { record: unmadeOf(base), stopped: true };
     const proposal = board.find((b) => b.id === proposalId);
     if (!proposal) {
@@ -489,11 +503,14 @@ async function applyOne(input: ArmedInput, base: ArmedAsk): Promise<ArmedAttempt
         },
       };
     }
-    const applied = await applyProposal(input.repo, proposal, board, "policy");
+    const applied = await applyProposal(input.repo, proposal, board, "policy", input.signal);
     return {
       record: { ...base, outcome: "applied", detail: applied.summary, changed: applied.changed },
     };
   } catch (e) {
+    // The cancel apply saw under its own lock: the pass was stopped after this walk's last check and
+    // before anything was mutated, so it is the walk ending, not this ask's answer.
+    if (cancelledMidApply(input.signal, e)) return { record: unmadeOf(base), stopped: true };
     const failure = e instanceof ProposalApplyError ? e : undefined;
     return {
       record: {

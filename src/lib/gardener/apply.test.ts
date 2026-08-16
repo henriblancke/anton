@@ -32,6 +32,7 @@ import {
   listBoard,
   liveBeads,
   NOW,
+  onWrite,
   planFor,
   proposalFor,
   record,
@@ -44,6 +45,9 @@ import {
   warm,
 } from "./apply.fixture";
 
+/** Fires on every `bd show` — how a case stages something arriving DURING the under-lock re-read. */
+let onShow: ((id: string) => void) | undefined;
+
 // Every reference to the seam sits INSIDE a wrapper: vitest hoists this factory above the imports
 // above, so touching one while building the object would read it before it is initialised.
 vi.mock("../beads/bd", async () => {
@@ -52,7 +56,10 @@ vi.mock("../beads/bd", async () => {
     ...actual,
     beads: {
       ...actual.beads,
-      show: (_cwd: string, id: string) => showBead(id),
+      show: (_cwd: string, id: string) => {
+        onShow?.(id);
+        return showBead(id);
+      },
       list: (_cwd: string, extra: string[] = []) => listBoard(extra),
       reparent: (_cwd: string, id: string, parent: string) => record("reparent", id, parent),
       link: (_cwd: string, a: string, b: string, type: string) => record("link", a, b, type),
@@ -69,7 +76,10 @@ vi.mock("../beads/bd", async () => {
 
 const { ProposalApplyError, applyProposal, declineNote, planApply } = await import("./apply");
 
-beforeEach(resetSeam);
+beforeEach(() => {
+  resetSeam();
+  onShow = undefined;
+});
 
 describe("the plan a proposal carries — read strictly, because it decides what gets mutated", () => {
   it("accepts what the emitter writes and nothing else", () => {
@@ -225,6 +235,50 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
       message: expect.stringContaining("could not be re-read"),
     });
     expect(calls).toEqual([]);
+  });
+
+  // The unattended caller's cancel (gardener/armed.ts). Its own last check lands BEFORE this
+  // function, so the proposal's write lock and the re-read under it are both awaits only apply can
+  // see: a cancel arriving in either has to stop the apply, not be noticed once the subject has
+  // been moved and the ask closed over it.
+  it("stops on a cancel that arrives during the under-lock re-read, writing nothing", async () => {
+    const proposal = proposalFor(REPARENT);
+    const stopped = new Error("the runner stopped this pass");
+    const controller = new AbortController();
+    onShow = (id) => {
+      if (id === proposal.id) controller.abort(stopped);
+    };
+
+    // The signal's own reason, not a ProposalApplyError: the caller re-raises it as the pass being
+    // stopped, and a verdict-shaped throw would be recorded as this ask's answer instead.
+    await expect(
+      apply(proposal, [CARD, bead("anton-a"), proposal], "policy", controller.signal),
+    ).rejects.toBe(stopped);
+
+    // The pass being stopped is not the board declining: no move, and no refusal noted on the ask.
+    expect(calls).toEqual([]);
+  });
+
+  // The other half of that contract, and the reason the check is made exactly once: the steps roll
+  // back as a unit, so a cancel honoured mid-move would leave a partial apply nobody asked for.
+  it("ignores a cancel that arrives once a step has landed — the move is finished and settled", async () => {
+    const proposal = proposalFor(CLUSTER);
+    const controller = new AbortController();
+    onWrite((call) => {
+      if (call.startsWith("reparent")) controller.abort();
+    });
+
+    const result = await apply(
+      proposal,
+      [CARD, bead("anton-a"), bead("anton-b"), proposal],
+      "policy",
+      controller.signal,
+    );
+
+    expect(result.changed).toEqual(["anton-a", "anton-b"]);
+    expect(calls).toContain(
+      `close ${proposal.id} applied: re-parented anton-a, anton-b under anton-card`,
+    );
   });
 
   // The interleave the proposal lock exists for: two approvals of one CLUSTER, whose per-subject

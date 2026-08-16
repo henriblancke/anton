@@ -143,10 +143,15 @@ export function resetSeam(): void {
  * case that means "a policy did this" passes `"policy"` explicitly, and the note it produces is
  * pinned there too, so a wrong label is a failing test rather than a quiet one.
  */
-export async function apply(proposal: Bead, board: Bead[], actor: ApplyActor = "approval") {
+export async function apply(
+  proposal: Bead,
+  board: Bead[],
+  actor: ApplyActor = "approval",
+  signal?: AbortSignal,
+) {
   setSnapshot(board);
   const { applyProposal } = await import("./apply");
-  return applyProposal(REPO, proposal, board, actor);
+  return applyProposal(REPO, proposal, board, actor, signal);
 }
 
 /** {@link apply} with the proposal itself on the board — every apply re-reads it under its lock. */

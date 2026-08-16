@@ -413,7 +413,7 @@ const AUTOMATIONS: AutomationSpec[] = [
   {
     id: "gardener",
     label: "gardener",
-    description: "hygiene patrol · closes done epics, reports the rest",
+    description: "hygiene patrol · closes done epics · proposes the rest, applies what you armed",
     group: "Board maintenance",
   },
   {
@@ -438,7 +438,7 @@ const AUTOMATIONS: AutomationSpec[] = [
   {
     id: "product-master",
     label: "product-master",
-    description: "product judgment · proposes reprioritize / split / kill, never applies",
+    description: "product judgment · proposes reprioritize / split / kill · applies what you armed",
     group: "Board maintenance",
   },
   {
@@ -1630,11 +1630,25 @@ export function SettingsView({
                 aria-label="Product-master prompt"
                 className="w-full resize-y rounded-lg border border-border bg-card px-3 py-2.5 font-mono text-[12px] leading-relaxed text-foreground outline-none placeholder:text-subtle focus:border-primary/60"
               />
+              {/* The session and the PASS are two different things, and only one of them can write
+                  (anton-4ab3). Said here because this is where an operator decides what the
+                  judgment may do: the claude session has no `bd` and reaches no board, but the pass
+                  that carries its answer applies any kind armed at `apply` — so "it only proposes"
+                  is true of the session and false of the pass. */}
               <span className="text-[11px] text-subtle">
                 The reasoning contract for the product-master pass. anton appends the board (tiers,
                 ordering edges, priorities, ages, sizes, review scores, recent runs) and the report
-                format beneath it — the pass emits proposals only and never writes to the board.
-                Empty = shipped default. {productMasterPrompt.length}/8000
+                format beneath it. The claude session judges and can never write — it has no board
+                access — but the pass then files what it proposed and applies whatever kind you
+                armed at <span className="font-mono">apply</span> in{" "}
+                <button
+                  type="button"
+                  onClick={() => showSection("proposals")}
+                  className="text-primary underline-offset-2 hover:underline"
+                >
+                  Proposal autonomy
+                </button>
+                . Empty = shipped default. {productMasterPrompt.length}/8000
               </span>
             </div>
           </section>

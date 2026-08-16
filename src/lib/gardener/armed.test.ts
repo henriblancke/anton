@@ -41,12 +41,22 @@ const loadMock = vi.fn<(cwd: string) => Promise<Bead[]>>();
 vi.mock("../beads/issues", () => ({ loadAllIssues: (...a: [string]) => loadMock(...a) }));
 
 /** The apply seam: the armed walk reimplements none of it, so the walk's own tests stub it whole. */
-const applyMock = vi.fn<(repo: string, proposal: Bead) => Promise<{ summary: string; changed: string[] }>>();
+const applyMock =
+  vi.fn<
+    (
+      repo: string,
+      proposal: Bead,
+      signal?: AbortSignal,
+    ) => Promise<{ summary: string; changed: string[] }>
+  >();
 vi.mock("./apply", async () => {
   const actual = await vi.importActual<typeof import("./apply")>("./apply");
   return {
     ...actual,
-    applyProposal: (...a: [string, Bead, Bead[], string]) => applyMock(a[0], a[1]),
+    // The signal is forwarded, not dropped: apply's own cancel checkpoint is the only thing that
+    // covers the awaits on ITS side of this seam (its write lock, and the re-read under it).
+    applyProposal: (...a: [string, Bead, Bead[], string, AbortSignal | undefined]) =>
+      applyMock(a[0], a[1], a[4]),
   };
 });
 
@@ -162,6 +172,60 @@ describe("armed walk · cancelled", () => {
       unrecorded: 0,
       "apply-failed": 1,
     });
+  });
+
+  it("propagates a cancel apply saw under its own write lock, having written nothing", async () => {
+    // The window on the far side of this seam: the walk's last check lands before `applyProposal`,
+    // which then awaits the proposal's write lock and re-reads it under that lock. A cancel arriving
+    // in either is invisible here — the walk would resolve as a pass that finished while the apply
+    // it authorised moved the subject and closed the ask over it.
+    const stopped = new Error("the runner stopped this job");
+    const controller = new AbortController();
+    applyMock.mockImplementation(async (_repo, _proposal, signal) => {
+      controller.abort(stopped);
+      signal?.throwIfAborted(); // apply's own checkpoint, before its first mutation (apply.ts)
+      throw new Error("unreachable: apply must stop at its cancel checkpoint");
+    });
+
+    await expect(walk(filed(2), controller.signal)).rejects.toBe(stopped);
+
+    // The signal REACHED apply — the checkpoint above is worth nothing if the walk keeps it.
+    expect(applyMock).toHaveBeenCalledTimes(1);
+    expect(applyMock).toHaveBeenCalledWith(
+      REPO,
+      expect.objectContaining({ id: "p-1" }),
+      controller.signal,
+    );
+    expect(recorded()).toContain(
+      "— COULD NOT APPLY: the pass was cancelled before the board was touched",
+    );
+    expect(recorded()).toContain("1 armed proposal(s) stay open as ordinary asks (p-2)");
+    expect(passRecordCounts(readPassRecords(recorded()))).toMatchObject({
+      unrecorded: 0,
+      "apply-failed": 1,
+    });
+  });
+
+  it("still reports an apply that FAILED while the cancel was landing beside it", async () => {
+    // Why the cancel is told apart by the reason's identity and not by `signal.aborted`: a pass
+    // stopped while an apply was breaking must still say what that apply did to the board. Filed as
+    // "nothing was written", the move below — which LANDED — would vanish from the record.
+    const stopped = new Error("the runner stopped this job");
+    const controller = new AbortController();
+    applyMock.mockImplementation(async () => {
+      controller.abort(stopped);
+      throw new ProposalApplyError(
+        "unsettled",
+        "applying p-1 could not be settled: the move LANDED (t-1) and was not rolled back",
+        ["t-1"],
+      );
+    });
+
+    await expect(walk(filed(2), controller.signal)).rejects.toBe(stopped);
+
+    expect(recorded()).toContain("— APPLIED BUT NOT SETTLED:");
+    expect(recorded()).toContain("the move LANDED (t-1)");
+    expect(recorded()).toContain("1 armed proposal(s) stay open as ordinary asks (p-2)");
   });
 
   it("resolves an attempt the cancel caught between its reservation and its write", async () => {
