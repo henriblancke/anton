@@ -39,7 +39,8 @@
  * apply its third — the alternative is one unlucky bead freezing the whole armed path. A CANCEL is
  * the one thing that is not an outcome: it is the pass being stopped, so it is re-thrown rather than
  * returned, and re-checked after every await that precedes a write — including, through the signal
- * this walk hands to apply, the two INSIDE it: the proposal's write lock and its re-read under it.
+ * this walk hands to apply, the ones INSIDE it: the proposal's write lock, its re-read under that
+ * lock, and the locks and board reads a decided move spends on its way to its first write.
  *
  * Shared by both producers on purpose (gardener-proposals.ts, product-master-steps.ts): a
  * per-producer copy would be two answers to "how much may a pass write, and how does it say so".
@@ -532,9 +533,10 @@ async function applyOne(input: ArmedInput, base: ArmedAsk): Promise<ArmedAttempt
     const board = await readBoardForApply(input.repo);
     // The board read is a bd CLI call over every issue, and the loop's own last check lands before
     // it: a cancel arriving inside it would otherwise not be seen until this proposal had been
-    // closed, deferred or reparented. The awaits BEYOND it — apply's write lock and its re-read of
-    // the proposal under that lock — are covered by the signal handed to apply itself, which stops
-    // on the far side of both and before its first mutation. Only there, and never deeper: apply's
+    // closed, deferred or reparented. The awaits BEYOND it — apply's write lock, its re-read of the
+    // proposal under that lock, and the per-bead locks and board reads its decided move spends
+    // before writing — are covered by the signal handed to apply itself, which stops on the far side
+    // of all of them and before its first mutation. Only up to there, and never deeper: apply's
     // writes roll back as a unit, so an abort mid-move is a partial move nobody asked for.
     if (input.signal?.aborted) return { record: unmadeOf(base), stopped: true };
     const proposal = board.find((b) => b.id === proposalId);

@@ -162,8 +162,21 @@ function lockedBeads(step: ApplyStep): string[] {
  *
  * Answers whether this step LANDED a write, which is not the same as whether it succeeded: see
  * {@link alreadySatisfied}.
+ *
+ * `signal` is an unattended caller's cancel, and apply.ts hands it here for the FIRST step alone —
+ * the only one that can still stop for free. Everything above the write is an await: acquiring the
+ * locks, re-reading the subject, its counterpart and its owner, and up to a whole board read per
+ * topology check. A cancel arriving in any of them is a pass an operator (or the no-progress
+ * timeout) already stopped, and honouring it only at the caller's checkpoint would let it move a
+ * subject and close the proposal over it regardless. So it is re-checked HERE, under the locks and
+ * with no await left between it and the write — before the write, never after: a step that has
+ * spawned its bd call is a write this process can no longer un-decide.
  */
-export async function applyStep(repo: string, step: ApplyStep): Promise<boolean> {
+export async function applyStep(
+  repo: string,
+  step: ApplyStep,
+  signal?: AbortSignal,
+): Promise<boolean> {
   return withBeadWriteLocks(repo, lockedBeads(step), async () => {
     if (await lockedSubjectSatisfied(repo, step)) return false;
     await assertCounterpartUnmoved(repo, step);
@@ -171,7 +184,9 @@ export async function applyStep(repo: string, step: ApplyStep): Promise<boolean>
     await assertRetirementHolds(repo, step);
     await assertHomeHolds(repo, step);
     await assertEvidenceHolds(repo, step);
-    await runStep(repo, await lockedWrite(repo, step));
+    const write = await lockedWrite(repo, step);
+    signal?.throwIfAborted();
+    await runStep(repo, write);
     return true;
   });
 }

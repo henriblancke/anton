@@ -139,11 +139,17 @@ export type ApplyActor = "approval" | "policy";
  * about — the exact claim this function exists to keep honest.
  *
  * `signal` is an unattended caller's cancel (gardener/armed.ts), and the ONE thing it may do is stop
- * this apply before its first mutation — see the checkpoint in {@link applyApproved}. It is never
- * consulted once a step has run: the steps roll back as a unit, and abandoning them half-written is
- * a board state nobody asked for. Cancelling throws the signal's own `reason` rather than a
- * {@link ProposalApplyError}, because a stopped pass is not the board declining: it earns no note on
- * the proposal and no verdict in the record.
+ * this apply before its FIRST mutation. That is checked at every point where nothing has been
+ * written and the next await is the write: on entry to {@link applyApproved}, and again immediately
+ * before the first write itself — under the locks that write takes (apply-steps.ts `applyStep`), and
+ * under the affected beads' locks on the path that only settles ({@link settleUnwritten}). One check
+ * would not do: a decided apply spends locks and several whole-board reads getting from the first
+ * checkpoint to the write, and a cancel landing in that window would otherwise not be seen until the
+ * subject had been moved and the proposal closed over it. It is never consulted once a step has run:
+ * the steps roll back as a unit, and abandoning them half-written is a board state nobody asked for.
+ * Cancelling throws the signal's own `reason` rather than a {@link ProposalApplyError}, because a
+ * stopped pass is not the board declining: it earns no note on the proposal and no verdict in the
+ * record.
  */
 export async function applyProposal(
   repo: string,
@@ -197,13 +203,14 @@ async function applyApproved(
   signal?: AbortSignal,
 ): Promise<ApplyResult> {
   await assertStillOpen(repo, proposal);
-  // The last moment a cancel is free, and the one an unattended caller cannot check for itself:
-  // acquiring the proposal's write lock and re-reading it under that lock are both awaits on the far
-  // side of the caller's own final check, and a cancel arriving in either would otherwise not be
-  // seen until the subject had been moved and the proposal closed over it — an unattended write out
-  // of a pass that was already stopped. Nothing has been written yet, so stopping costs only the
-  // attempt: the ask stays open for a human or a later pass. Checked once, HERE — every await after
-  // this one is a mutation or sits between mutations, where not-applying is no longer an option.
+  // The first of the two moments a cancel is free, and the one an unattended caller cannot check for
+  // itself: acquiring the proposal's write lock and re-reading it under that lock are both awaits on
+  // the far side of the caller's own final check, and a cancel arriving in either would otherwise not
+  // be seen until the subject had been moved and the proposal closed over it — an unattended write
+  // out of a pass that was already stopped. Nothing has been written yet, so stopping costs only the
+  // attempt: the ask stays open for a human or a later pass. Not the LAST such moment, though: the
+  // write itself is still several locks and board reads away, so each path below re-checks under
+  // those locks with nothing left between the check and its first write.
   signal?.throwIfAborted();
   // Dated from the proposal the approver read, not from the live re-read: its observation stamp is
   // the moment the patrol judged the board, which is what every "has this moved since we asked"
@@ -218,10 +225,20 @@ async function applyApproved(
     );
   }
   if (decision.status === "settled") {
-    return settleUnwritten(repo, proposal, plan, decision.summary, at, actor);
+    return settleUnwritten(repo, proposal, plan, decision.summary, at, actor, signal);
   }
-  return applySteps(repo, proposal, plan, decision.steps, decision.summary, actor);
+  return applySteps(repo, proposal, plan, decision.steps, decision.summary, actor, signal);
 }
+
+/**
+ * Was this throw the pass being CANCELLED rather than an apply failing? Told apart by the reason's
+ * own IDENTITY — `throwIfAborted` throws the signal's `reason` object itself — so no bd error and no
+ * board refusal can impersonate one, and a genuine failure that happens to land beside a cancel is
+ * still reported as this ask's answer (gardener/armed.ts `cancelledMidApply` reads it the same way
+ * from the outside).
+ */
+const cancelled = (signal: AbortSignal | undefined, e: unknown): boolean =>
+  signal?.aborted === true && e === signal.reason;
 
 /**
  * Refuse unless the proposal is still open, judged from a read taken under its own write lock.
@@ -264,6 +281,11 @@ async function assertStillOpen(repo: string, proposal: Bead): Promise<void> {
  * it is taken. Re-confirm it under those beads' own write locks, and settle the proposal inside
  * them, so a subject moved away or an edge dropped after the route's refresh cannot leave this
  * proposal closed as applied over a board that no longer holds the state its summary names.
+ *
+ * This path runs no step, so it is where the {@link applyStep} checkpoint would never fire — and it
+ * still writes: the settlement's note and close ARE mutations, on the far side of the affected
+ * beads' locks and a whole-board re-read. So the cancel is honoured once more here, immediately
+ * before them.
  */
 function settleUnwritten(
   repo: string,
@@ -272,6 +294,7 @@ function settleUnwritten(
   summary: string,
   at: ApplyMoment,
   actor: ApplyActor,
+  signal?: AbortSignal,
 ): Promise<ApplyResult> {
   return withBeadWriteLocks(repo, affectedBeads(plan), async () => {
     const drifted = await settledDrifted(repo, plan, at);
@@ -282,6 +305,7 @@ function settleUnwritten(
         new ProposalApplyError("refused", `cannot apply ${proposal.id}: ${drifted}`),
       );
     }
+    signal?.throwIfAborted();
     return settleProposal(repo, proposal, plan, summary, [], actor);
   });
 }
@@ -292,6 +316,12 @@ function settleUnwritten(
  * Only steps that actually WROTE are collected: a step the board already satisfied is not ours to
  * roll back (see apply-steps.ts `alreadySatisfied`), and `changed` is both the rollback prefix and
  * what the proposal reports as touched.
+ *
+ * `changed` is also what decides whether a cancel is still free. The signal reaches the step's own
+ * pre-write checkpoint only while nothing has landed; once a member of a cluster has written, the
+ * move has BEGUN and the rest of it runs to completion, because these steps roll back as a unit and
+ * a cancel honoured mid-cluster is a partial apply nobody asked for. A step that wrote nothing —
+ * one the board already satisfied — has not begun anything, so it does not close the window.
  */
 async function applySteps(
   repo: string,
@@ -300,13 +330,20 @@ async function applySteps(
   steps: ApplyStep[],
   summary: string,
   actor: ApplyActor,
+  signal?: AbortSignal,
 ): Promise<ApplyResult> {
   const changed: ApplyStep[] = [];
   try {
     for (const step of steps) {
-      if (await applyStep(repo, step)) changed.push(step);
+      if (await applyStep(repo, step, changed.length === 0 ? signal : undefined)) {
+        changed.push(step);
+      }
     }
   } catch (e) {
+    // A cancel is the pass being stopped, not this ask being answered, so it propagates as the
+    // signal's own reason: no rollback (it can only fire with nothing written), no failure note on
+    // the proposal, and no verdict in the record.
+    if (cancelled(signal, e)) throw e;
     throw await attachFailure(repo, proposal, await stepFailure(repo, proposal.id, changed, e));
   }
   return settleProposal(repo, proposal, plan, summary, changed, actor);

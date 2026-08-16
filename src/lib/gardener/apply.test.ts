@@ -262,8 +262,66 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     expect(calls).toEqual([]);
   });
 
-  // The other half of that contract, and the reason the check is made exactly once: the steps roll
-  // back as a unit, so a cancel honoured mid-move would leave a partial apply nobody asked for.
+  // The gap that check alone leaves: a DECIDED move is still several awaits from writing anything —
+  // the step's own per-bead locks, its re-reads, and a whole board read for the topology bars — so a
+  // job timeout firing in that window would move the subject and close the ask over it. The last
+  // word belongs to a check taken under those locks, with nothing left between it and the write.
+  it("stops on a cancel that arrives during a step's under-lock board read, writing nothing", async () => {
+    const proposal = proposalFor(REPARENT);
+    const stopped = new Error("the pass ran out of time");
+    const controller = new AbortController();
+    listByFlags(() => {
+      controller.abort(stopped);
+      return Promise.resolve(liveBoard());
+    });
+
+    await expect(
+      apply(proposal, [CARD, bead("anton-a"), proposal], "policy", controller.signal),
+    ).rejects.toBe(stopped);
+
+    // Neither the move nor a refusal noted on the ask: a stopped pass is not the board declining.
+    expect(calls).toEqual([]);
+  });
+
+  // The already-applied path runs no step, so the checkpoint above never fires for it — and it still
+  // WRITES: its note and close sit behind the affected beads' locks and a whole board re-read.
+  it("stops on a cancel that arrives while confirming an already-applied board, settling nothing", async () => {
+    const proposal = proposalFor(REPARENT);
+    const stopped = new Error("the pass ran out of time");
+    const controller = new AbortController();
+    listByFlags(() => {
+      controller.abort(stopped);
+      return Promise.resolve(liveBoard());
+    });
+
+    await expect(
+      apply(proposal, [CARD, child("anton-a", CARD.id), proposal], "policy", controller.signal),
+    ).rejects.toBe(stopped);
+
+    expect(calls).toEqual([]);
+  });
+
+  // The other half of that contract, and the reason the window closes at the FIRST write: the steps
+  // roll back as a unit, so a cancel honoured mid-move would leave a partial apply nobody asked for.
+  // Here the cancel lands in the second subject's under-lock re-read — the same kind of await the
+  // case above stops on, but after a write, where stopping would strand a half-moved cluster.
+  it("ignores a cancel that arrives in a later cluster step's re-read — the move is already begun", async () => {
+    const proposal = proposalFor(CLUSTER);
+    const controller = new AbortController();
+    onShow = (id) => {
+      if (id === "anton-b") controller.abort();
+    };
+
+    const result = await apply(
+      proposal,
+      [CARD, bead("anton-a"), bead("anton-b"), proposal],
+      "policy",
+      controller.signal,
+    );
+
+    expect(result.changed).toEqual(["anton-a", "anton-b"]);
+  });
+
   it("ignores a cancel that arrives once a step has landed — the move is finished and settled", async () => {
     const proposal = proposalFor(CLUSTER);
     const controller = new AbortController();
