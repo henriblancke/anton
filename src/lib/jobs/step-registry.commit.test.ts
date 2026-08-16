@@ -199,6 +199,42 @@ suite("commitStep (real git)", () => {
     expect((raised as Error).message).toContain(BRANCH);
   });
 
+  // "HEAD is different" is not "HEAD moved forward". A reset moves it exactly as visibly while
+  // DELETING commits — on a multi-ticket run, an earlier ticket's, whose bead is already closed.
+  it("parks when the agent reset the run's branch backward", async () => {
+    write("earlier.ts", "export const earlier = 1;\n");
+    selfCommit("anton-earlier: an earlier ticket's work");
+    const started = head();
+    g(["reset", "--hard", "-q", "HEAD~1"]);
+
+    let raised: unknown;
+    await commitStep(context({ ticketStartHead: started })).catch((e) => {
+      raised = e;
+    });
+
+    expect(isPoisonError(raised)).toBe(true);
+    expect((raised as Error).message).toContain("no longer contains the commit the ticket started from");
+    // The marker must NOT have been written: nothing here is a delivery.
+    expect(await worktreeHasCommitFor(repo, ticket.id)).toBe(false);
+  });
+
+  it("parks when the agent rewrote the branch's history in place", async () => {
+    write("a.ts", "export const a = 1;\n");
+    selfCommit("anton-earlier: an earlier ticket's work");
+    const started = head();
+    write("a.ts", "export const a = 2;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "--amend", "-m", "anton-earlier: an earlier ticket's work, rewritten"]);
+
+    let raised: unknown;
+    await commitStep(context({ ticketStartHead: started })).catch((e) => {
+      raised = e;
+    });
+
+    expect(isPoisonError(raised)).toBe(true);
+    expect((raised as Error).message).toContain("reset, amended or rebased");
+  });
+
   it("parks when the agent committed onto a detached HEAD", async () => {
     const started = head();
     g(["checkout", "-q", "--detach"]);

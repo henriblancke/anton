@@ -342,6 +342,32 @@ export async function commitAll(
 }
 
 /**
+ * True when `ancestor` is reachable from `descendant` — i.e. the branch only moved FORWARD between
+ * them, adding commits without dropping or rewriting any.
+ *
+ * `step:commit` asks this before adopting work an agent committed itself: a moved HEAD is delivery
+ * only if the commit the ticket started from is still on the branch. A `git reset --hard HEAD~1` or
+ * an amend moves HEAD just as visibly while REMOVING history — on a multi-ticket run, possibly an
+ * earlier ticket's commits — and adopting that would open a PR missing work anton has already
+ * closed the bead for.
+ *
+ * Only git's own "no" (exit 1) is an answer; anything else propagates rather than reading as one.
+ */
+export async function isAncestor(
+  worktreePath: string,
+  ancestor: string,
+  descendant: string,
+): Promise<boolean> {
+  try {
+    await git(worktreePath, ["merge-base", "--is-ancestor", ancestor, descendant]);
+    return true;
+  } catch (e) {
+    if (exitedWith(e, 1)) return false;
+    throw e;
+  }
+}
+
+/**
  * Record an EMPTY commit — a marker that carries a message and no diff.
  *
  * The one caller is `step:commit` adopting work an agent committed itself. Those commits are real

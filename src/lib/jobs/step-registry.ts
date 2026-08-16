@@ -42,6 +42,7 @@ import { buildExecutionSystemPrompt } from "../claude/system-prompt";
 import {
   commitAll,
   commitMarker,
+  isAncestor,
   openPullRequest,
   readWorktreeState,
   worktreeHasCommitFor,
@@ -352,17 +353,21 @@ export async function reviewStep(ctx: StepContext): Promise<StepResultWith<"revi
  * worktree is reused on resume, so the next run finds the work already done, reports `blocked` for
  * the honest reason, and is read as corroborating the very block it contradicts.
  *
- * So HEAD is consulted whenever the index is empty, and three cases fall out:
+ * So HEAD is consulted whenever the index is empty, and four cases fall out:
  *
  * 1. **HEAD stood still** — nothing was delivered. The gate's original verdict, unchanged.
- * 2. **HEAD moved on the run's branch** — the agent committed its own work. That IS delivery, and
- *    it is already where the PR push will find it. Adopted, with a marker commit recording the
- *    ticket attribution the agent's own subjects lack (see {@link commitMarker}).
- * 3. **HEAD moved somewhere else** — a branch of the agent's own, or a detached HEAD. The commits
- *    are real but unreachable: anton pushes the run's branch BY NAME, so they would never reach the
- *    PR while every later step read them as present. Poison, so a human moves them back by hand
- *    rather than a retry burying them deeper — the same call {@link runReviewGate} makes for a
- *    review fix that wanders off-branch.
+ * 2. **HEAD moved FORWARD on the run's branch** — the agent committed its own work. That IS
+ *    delivery, and it is already where the PR push will find it. Adopted, with a marker commit
+ *    recording the ticket attribution the agent's own subjects lack (see {@link commitMarker}).
+ * 3. **HEAD left the run's branch** — a branch of the agent's own, or a detached HEAD. Any commits
+ *    there are unreachable: anton pushes the run's branch BY NAME, so they would never reach the PR
+ *    while every later step read them as present. Poison, so a human moves them back by hand rather
+ *    than a retry burying them deeper — the same call {@link runReviewGate} makes for a review fix
+ *    that wanders off-branch.
+ * 4. **HEAD moved but the branch no longer contains where the ticket started** — a `reset --hard`,
+ *    an amend, a rebase. HEAD moves exactly as visibly as case 2 while history is REMOVED, so
+ *    "different HEAD" alone would adopt it and, on a multi-ticket run, open a PR missing an earlier
+ *    ticket's commits that anton has already closed the bead for. Poison.
  */
 export async function commitStep(ctx: StepContext): Promise<StepResultWith<"committed">> {
   const { committed } = await commitAll(ctx.worktreePath, commitMessage(ctx));
@@ -383,12 +388,27 @@ export async function commitStep(ctx: StepContext): Promise<StepResultWith<"comm
   }
 
   const subject = stepSubject(ctx);
+  // Deliberately worded for BOTH ways this fires — the agent committed off-branch, and the agent
+  // merely checked something else out. The park note is read by a human who has to work out which.
   if (state.ref !== `refs/heads/${ctx.branch}`) {
     throw new PoisonEpic(
-      `${subject.id} committed its work onto ${state.ref ? `${state.ref}` : `a detached HEAD (${state.head})`}, ` +
-        `not the run's ${ctx.branch}. Parked instead of retried — anton pushes the run's branch by name, so ` +
-        `those commits would never reach the PR while every later step read them as delivered. Move them onto ` +
-        `${ctx.branch} by hand, then resume the run`,
+      `${subject.id} left HEAD on ${state.ref ? state.ref : `a detached HEAD (${state.head})`} instead of ` +
+        `the run's ${ctx.branch}. Parked instead of retried — anton pushes the run's branch by name, so any ` +
+        `commits made there would never reach the PR while every later step read them as delivered. If there ` +
+        `are commits, move them onto ${ctx.branch} by hand, then resume the run`,
+    );
+  }
+
+  // A moved HEAD is delivery only if the branch still CONTAINS where this ticket started. A
+  // `reset --hard`, an amend or a rebase moves it just as visibly while dropping history — on a
+  // multi-ticket run, an earlier ticket's commits, whose bead anton has already closed.
+  if (!(await isAncestor(ctx.worktreePath, ctx.ticketStartHead, state.head))) {
+    throw new PoisonEpic(
+      `${subject.id} left ${ctx.branch} at ${state.head}, which no longer contains the commit the ticket ` +
+        `started from (${ctx.ticketStartHead}) — history was reset, amended or rebased rather than added to. ` +
+        `Parked instead of retried: work this run already committed and closed beads for may be gone, so ` +
+        `adopting this as a delivery would open a PR missing it. Reconcile the branch by hand, then resume ` +
+        `the run`,
     );
   }
 
