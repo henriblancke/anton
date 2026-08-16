@@ -135,6 +135,27 @@ describe("armed walk · cancelled", () => {
     await expect(walk(filed(2), controller.signal)).rejects.toThrow();
     // Not one board read, let alone a write: the pass is over before it starts.
     expect(applyMock).not.toHaveBeenCalled();
+    expect(loadMock).not.toHaveBeenCalled();
+  });
+
+  it("names the armed asks a cancel caught between the creates and the walk", async () => {
+    // The one window a caller cannot report for itself: emission SUCCEEDED, the abort landed, the
+    // shadow returned early on it, and this walk is the first thing to see it. Throwing here without
+    // a word would leave the proposals just filed neither applied nor named, while their own
+    // fingerprints stop any later pass re-deciding them — so the ask an operator armed would sit
+    // open under a pass record that never mentions it.
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(walk(filed(2), controller.signal)).rejects.toThrow();
+
+    expect(recorded()).toContain("APPLY stopped — the pass was cancelled");
+    expect(recorded()).toContain("2 armed proposal(s) stay open as ordinary asks (p-1, p-2)");
+    // Nothing was written, so there is nothing to publish: a walk that stopped before its first
+    // apply must not push or count itself into the unpushed backlog.
+    expect(nudge).not.toHaveBeenCalled();
+    expect(pushMock).not.toHaveBeenCalled();
+    expect(recorded()).not.toContain("APPLYING");
   });
 
   it("propagates a cancel that arrives INSIDE the pull, without applying the proposal it preceded", async () => {

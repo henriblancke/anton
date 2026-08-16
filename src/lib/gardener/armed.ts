@@ -172,15 +172,24 @@ function armed(
  * and a pass that refused ten in a row has still spent ten applies' worth of board reads and locks.
  */
 export async function applyArmedProposals(input: ArmedInput): Promise<ArmedResult> {
-  // A cancel PROPAGATES, here and at every check below — it is never a normal return. The runner
-  // reads a handler that resolves as a pass that finished (jobs/runner.ts), and no later pass
-  // revisits these proposals: they are already on the board, so the fingerprint suppression that
-  // stops them being re-filed also stops them being re-decided. A cancelled walk that resolved
-  // would publish that as a clean pass over asks nothing will ever settle. Emission stops the same
-  // way, for the same reason (emit.ts `PartialEmissionError`).
-  input.signal?.throwIfAborted();
   const targets = armed(input.created, input.policy);
-  if (targets.length === 0) return nothing();
+  // Nothing armed: no walk for a cancel to stop, and no ask this pass leaves standing. The abort
+  // still PROPAGATES — here and at every check below, it is never a normal return. The runner reads
+  // a handler that resolves as a pass that finished (jobs/runner.ts), and no later pass revisits
+  // these proposals: they are already on the board, so the fingerprint suppression that stops them
+  // being re-filed also stops them being re-decided. A cancelled walk that resolved would publish
+  // that as a clean pass over asks nothing will ever settle. Emission stops the same way, for the
+  // same reason (emit.ts `PartialEmissionError`).
+  if (targets.length === 0) {
+    input.signal?.throwIfAborted();
+    return nothing();
+  }
+  // With armed asks in hand the cancel is NOT short-circuited here: a pass stopped between its
+  // creates and this walk — the window where the caller's shadow returns early and this call is the
+  // first thing to see the abort — would otherwise throw naming nothing, and the proposals it just
+  // filed would be neither applied nor reported while their fingerprints stop any later pass
+  // re-deciding them. So it falls through to the loop's own first check, which stops before any
+  // board read and records what stays open, exactly as a cancel arriving one iteration later does.
 
   const limit = Math.max(0, input.limit ?? MAX_APPLIES_PER_PASS);
   const held = targets.slice(limit).map(({ proposal }) => proposal.id);
