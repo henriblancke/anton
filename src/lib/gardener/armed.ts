@@ -47,6 +47,7 @@
 import { beads } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
 import { applyProposal, ProposalApplyError } from "./apply";
+import { messageOf } from "./apply-steps";
 import { autonomyFor, type ProposalAutonomyPolicy } from "./autonomy";
 import {
   planOf,
@@ -599,6 +600,11 @@ function summaryOf(records: ArmedRecord[]): string {
  *
  * Reports whether the line landed, because for an apply that answer is not cosmetic: it is whether
  * the spend was recorded at all (see the loop above).
+ *
+ * Every caller hands it ONE physical line: the reader matches a record and a note per line
+ * (record.ts), so a continuation is not truncated text — it is a dropped reason. That is why the
+ * failures interpolated here come through `messageOf`, which collapses a multi-line bd error (a
+ * Dolt diff in a push rejection) back into one.
  */
 async function write(
   input: Pick<ArmedInput, "producer" | "log">,
@@ -612,5 +618,3 @@ async function write(
     },
   );
 }
-
-const messageOf = (e: unknown): string => (e instanceof Error ? e.message : String(e));

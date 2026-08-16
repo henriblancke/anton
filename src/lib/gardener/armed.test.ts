@@ -440,3 +440,40 @@ describe("armed walk · publish", () => {
     );
   });
 });
+
+/**
+ * A sync failure is MULTI-LINE where it matters most: bd hands back the Dolt output it failed on, and
+ * the reason a founder needs is at the END of it. The reader matches one record and one note per
+ * physical line (record.ts), so an uncollapsed message does not read as wrapped text — every
+ * continuation is dropped, leaving a note that says the board could not be pulled and never says why.
+ */
+describe("armed walk · a sync failure the note must carry whole", () => {
+  const running = (): AbortSignal => new AbortController().signal;
+
+  const multiLine = (headline: string) =>
+    new Error(`${headline}\n  diverged from origin/main\n  hint: pull before pushing`);
+
+  it("keeps a multi-line push failure on one line, reason and all", async () => {
+    pushMock.mockRejectedValue(multiLine("bd dolt push failed"));
+
+    await walk(filed(1), running());
+
+    const note = readPassRecords(recorded()).notes.find((n) =>
+      n.startsWith("APPLY could not publish"),
+    );
+    expect(note).toContain("bd dolt push failed diverged from origin/main hint: pull before pushing");
+  });
+
+  it("keeps a multi-line pull failure on one line, so the stop names what stopped it", async () => {
+    pullMock.mockRejectedValue(multiLine("bd dolt pull failed"));
+
+    const result = await walk(filed(2), running());
+
+    // Fails closed: nothing is applied against a board anton cannot prove is current.
+    expect(applyMock).not.toHaveBeenCalled();
+    expect(result.records).toEqual([]);
+    const note = readPassRecords(recorded()).notes.find((n) => n.includes("could not be pulled"));
+    expect(note).toContain("bd dolt pull failed diverged from origin/main hint: pull before pushing");
+    expect(note).toContain("(p-1, p-2)");
+  });
+});
