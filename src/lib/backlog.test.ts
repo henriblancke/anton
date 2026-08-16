@@ -13,8 +13,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bead } from "./beads/types";
 import type { Project } from "./types";
 
-const { boardRef } = vi.hoisted(() => ({ boardRef: { current: [] as Bead[] } }));
-vi.mock("./beads/issues", () => ({ allIssues: async () => boardRef.current }));
+const { boardRef, allIssues, refreshAllIssues } = vi.hoisted(() => {
+  const boardRef = { current: [] as Bead[] };
+  return {
+    boardRef,
+    allIssues: vi.fn(async () => boardRef.current),
+    refreshAllIssues: vi.fn(async () => boardRef.current),
+  };
+});
+vi.mock("./beads/issues", () => ({ allIssues, refreshAllIssues }));
 
 import { beads } from "./beads/bd";
 import {
@@ -73,12 +80,16 @@ const bead = (over: Partial<Bead> & { id: string }): Bead => ({
   ...over,
 });
 
-/** The board `allIssues` answers with for the epic resolution + picker tests. */
+/** The board the issue reads answer with for the epic resolution + picker tests. */
 function boardIs(...list: Bead[]): void {
   boardRef.current = list;
 }
 
-beforeEach(() => boardIs());
+beforeEach(() => {
+  boardIs();
+  allIssues.mockClear();
+  refreshAllIssues.mockClear();
+});
 
 describe("buildEpicSkeleton", () => {
   it("renders an epic the contract validator passes with zero violations", async () => {
@@ -272,6 +283,19 @@ describe("createDraftFeature — what the Add-work commit lands", () => {
     expect(rejection).toBeInstanceOf(DraftEpicError);
     expect(rejection?.message).toContain(message);
     expect(create).not.toHaveBeenCalled();
+  });
+
+  // The warm snapshot the picker rendered from is the very thing that can be stale here — serving it
+  // back would re-check eligibility against the same answer that produced the stale selection.
+  it("re-checks eligibility against an uncached read, never the warm snapshot", async () => {
+    boardIs(bead({ id: "p-1", issue_type: "epic" }));
+    vi.spyOn(beads, "create").mockResolvedValue("p-9");
+    const target = project();
+
+    await createDraftFeature(target, { feature: FEATURE, epic: { kind: "existing", id: "p-1" } });
+
+    expect(refreshAllIssues).toHaveBeenCalledWith(target.repoPath);
+    expect(allIssues).not.toHaveBeenCalled();
   });
 
   it("still accepts an approved epic that already groups features — it is not the run target", async () => {

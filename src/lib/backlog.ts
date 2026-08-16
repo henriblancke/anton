@@ -1,7 +1,7 @@
 import { beads, labelValueOf, type Bead } from "./beads/bd";
 import { validateBeadContract, type ContractViolation } from "./beads/contract";
 import { beadSkeleton, type BeadSkeleton } from "./beads/formula";
-import { allIssues } from "./beads/issues";
+import { allIssues, refreshAllIssues } from "./beads/issues";
 import type { Project } from "./types";
 
 /**
@@ -251,11 +251,18 @@ export async function createDraftEpic(project: Project, draft: EpicDraft): Promi
 /** The chosen epic must still be eligible on a FRESH board read, by the same rule the picker offered
  * it under ({@link ineligibleReason}) — a stale pick must not parent a feature under a task, under
  * an outcome that has since closed, or under a run already in flight, and a vanished one must not
- * create a dangling edge bd would reject mid-write. */
+ * create a dangling edge bd would reject mid-write.
+ *
+ * `refreshAllIssues`, not `allIssues`: the warm snapshot the picker rendered from is exactly what
+ * this gate must not trust. It serves retained beads for up to ISSUE_SNAPSHOT_MAX_AGE_MS — and even
+ * once invalidated it answers with the retained board while refreshing behind the request — so the
+ * shape page's own warming would let this accept an epic another machine has since closed,
+ * abandoned, or approved as a standalone run target. The same reason approve/claim/move force a
+ * fresh read before they decide. */
 async function resolveExistingEpic(project: Project, id: string): Promise<string> {
   const chosen = id.trim();
   if (!chosen) throw new DraftEpicError("no epic chosen — a feature must attach to one");
-  const all = await allIssues(project.repoPath);
+  const all = await refreshAllIssues(project.repoPath);
   const bead = all.find((b) => b.id === chosen);
   if (!bead) throw new DraftEpicError(`epic ${chosen} is not on the board`);
   const reason = ineligibleReason(bead, all);
