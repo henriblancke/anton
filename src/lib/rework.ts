@@ -89,6 +89,14 @@ export class ReworkUnavailableError extends Error {}
 const INHERITED_LABEL_PREFIXES = ["agent:", "domain:", "risk:", "size:", "area:"];
 
 /**
+ * The stage labels a finished run leaves behind, which every send-back strips: `stage:in-review`
+ * makes the bead resume-SKIPPED (ticket-view's `resumeSkipped`) and `stage:implementing` makes it
+ * derive as in-progress on every board surface. One list, because {@link retireFinishedRun} has to
+ * put back exactly what it took off.
+ */
+const RUN_STAGE_LABELS: string[] = [LABELS.stage("implementing"), LABELS.stage("in-review")];
+
+/**
  * Apply a rework to one ticket of a run target.
  *
  * Idempotent by construction rather than by token: a repeat of the same request finds its own note
@@ -166,7 +174,7 @@ export async function reworkTicket(
   // correct against a target nothing else is moving. Deduped for a standalone target, where the
   // ticket IS the target.
   const findings = input.findings ?? [];
-  const { result, runsUnderTarget, retire } = await withBeadWriteLocks(
+  const { result, runsUnderTarget, retire, reconciled } = await withBeadWriteLocks(
     project.repoPath,
     [ticket.id, target.id],
     async () => {
@@ -193,8 +201,9 @@ export async function reworkTicket(
   // Fire-and-forget, like every other board write behind a route: the writes already landed locally
   // and the run reads local state, so don't block the response on a slow/unreachable remote. The
   // retire counts as a write of its own — it can land on the repeat that finished a half-applied
-  // send-back, whose mode step wrote nothing. A raced retire wrote its own record of the race.
-  if (result.applied || retire.outcome === "retired" || retire.outcome === "raced") {
+  // send-back, whose mode step wrote nothing. A raced retire wrote its own record of the race, and a
+  // reconcile ({@link AppliedRework}) moved a bead on a request that was otherwise a no-op.
+  if (result.applied || reconciled || retire.outcome === "retired" || retire.outcome === "raced") {
     nudgeSync(project, "rework");
   }
   // The PR stopped being open under the request (see {@link retireFinishedRun}). The instructions
@@ -204,7 +213,7 @@ export async function reworkTicket(
   if (retire.outcome === "raced") {
     throw new ReworkConflictError(
       `${target.id}'s pull request (${retire.pr}) stopped being open (${retire.state}) while this ` +
-        `send-back was applying, so its finished-run marker was left in place rather than cleared ` +
+        `send-back was applying, so its finished-run marker is still in place rather than cleared ` +
         `off a PR anton can no longer prove is live. The instructions are on ${result.reworkedId}; ` +
         `send the ticket back again and anton will re-read the PR — if it merged, the fix runs as ` +
         `its own target instead.`,
@@ -225,6 +234,13 @@ export async function reworkTicket(
 interface AppliedRework {
   result: ReworkResult;
   runsUnderTarget: boolean;
+  /**
+   * A board write this request made that its own mode didn't ask for — reconciling a follow-up an
+   * earlier attempt left in a shape the target's PR has since invalidated ({@link applyFollowUp}).
+   * Reported separately because it lands on a request that is otherwise a no-op, and a write that
+   * isn't synced is a write another machine never sees.
+   */
+  reconciled?: boolean;
 }
 
 /**
@@ -343,11 +359,15 @@ type RetireResult =
  * finalization path (`finalizablePr`, jobs/gate-targets.ts) and a `stage:in-review` label nothing
  * will ever take off again.
  *
- * The state is RE-READ from `gh` here as well, for the one race the bead locks cannot order: the
- * locks serialize anton's writes, not GitHub's merges, so the PR that was open at
- * {@link resolvePipeline} may have merged since. Clearing a MERGED PR's ref would un-gate its own
- * finalization and re-dispatch shipped work, so a state that is no longer `open` retires nothing and
- * says so — the caller turns that into a 409 the founder can act on.
+ * The state is RE-READ from `gh` here as well — twice, for the one race the bead locks cannot order:
+ * the locks serialize anton's writes, not GitHub's merges, so the PR that was open at
+ * {@link resolvePipeline} may merge before these writes, or WHILE they land. Clearing a MERGED PR's
+ * ref would un-gate its own finalization (`finalizablePr` needs the ref AND `stage:in-review`) and
+ * re-dispatch shipped work, so a state that is no longer `open` retires nothing: caught before the
+ * writes, nothing is written; caught after them, they are rolled back ({@link restoreFinishedRun}).
+ * Either way the caller turns it into a 409 the founder can act on. The read that survives is the
+ * last one, so what remains open is a merge landing after it — no write of ours follows, and no
+ * client-side check can order that against GitHub.
  *
  * An `anton:` note, not a human one: this is bookkeeping about a PR, and a human note is inlined
  * verbatim into the next implementer's prompt (`humanNotesPromptBlock`) where it would read as a
@@ -362,22 +382,27 @@ async function retireFinishedRun(project: Project, target: Bead): Promise<Retire
   if (!pr) return { outcome: "already-retired" };
   const state = await pullRequestState(repo, pr);
   if (state !== "open") {
-    // Recorded on the target rather than only raised, because the mode's writes have already landed:
-    // a reader looking at a bead sent back to a merged PR needs to see why it wasn't retired.
-    await beads.note(
-      repo,
-      target.id,
-      `anton: rework — ${pr} was open when this send-back was decided but reads as ${state} now, so ` +
-        `the finished-run marker was LEFT in place. Send the ticket back again: anton re-reads the ` +
-        `PR and, if it merged, carries the fix as its own run target instead.`,
-    );
+    await noteRace(repo, target.id, pr, state, false);
     return { outcome: "raced", pr, state };
   }
-  await beads.untag(repo, target.id, [LABELS.stage("implementing"), LABELS.stage("in-review")]);
+
+  const stages = RUN_STAGE_LABELS.filter((l) => fresh.labels?.includes(l));
+  await beads.untag(repo, target.id, RUN_STAGE_LABELS);
   if (fresh.status === "closed") {
     await beads.reopen(repo, target.id, "rework: sent back for another round");
   }
   await beads.clearPrRef(repo, fresh);
+
+  // The same question again, now that the writes have landed: a merge that arrived while they were
+  // applying passed the check above and would otherwise be reported as a clean retire — over a
+  // target that has already lost the ref and the label its own merge finalizes through. So the
+  // retire is verified, not assumed, and an answer that changed undoes it.
+  const settled = await pullRequestState(repo, pr);
+  if (settled !== "open") {
+    await restoreFinishedRun(repo, fresh, pr, stages);
+    await noteRace(repo, target.id, pr, settled, true);
+    return { outcome: "raced", pr, state: settled };
+  }
   await beads.note(
     repo,
     target.id,
@@ -386,6 +411,56 @@ async function retireFinishedRun(project: Project, target: Bead): Promise<Retire
       `a second one.`,
   );
   return { outcome: "retired" };
+}
+
+/**
+ * Put back exactly what {@link retireFinishedRun}'s three writes took off, when the PR they were
+ * predicated on merged underneath them. The ORDER is the recovery story again, mirrored: the PR ref
+ * goes back FIRST because it is the only one of the three that cannot be re-derived from the board —
+ * lose it and the merged PR is unreachable from the bead by a reader, by `finalizablePr`, and by the
+ * next send-back ({@link resolvePipeline} returns nothing without it). A rollback that fails part-way
+ * therefore leaves the marker that brings a retry back here.
+ *
+ * `setPrRef` writes `metadata.pr`, the channel {@link beads.getPrRef} reads first, so the bead reads
+ * as in-review again even where `clearPrRef` also emptied a legacy `gh-` external_ref — which the
+ * one-time migration (anton-ftar) is moving onto `metadata.pr` regardless.
+ */
+async function restoreFinishedRun(
+  repo: string,
+  fresh: Bead,
+  pr: string,
+  stages: string[],
+): Promise<void> {
+  await beads.setPrRef(repo, fresh.id, pr);
+  if (fresh.status === "closed") {
+    await beads.close(repo, fresh.id, `rework: retire rolled back — ${pr} merged as it was applying`);
+  }
+  if (stages.length > 0) await beads.tag(repo, fresh.id, stages);
+}
+
+/**
+ * Record the lost race on the target itself, rather than only raising it: the mode's writes have
+ * already landed, so a reader looking at a bead sent back to a merged PR needs to see why its target
+ * wasn't retired — and whether a half-applied retire was undone.
+ */
+async function noteRace(
+  repo: string,
+  targetId: string,
+  pr: string,
+  state: PullRequestState,
+  rolledBack: boolean,
+): Promise<void> {
+  await beads.note(
+    repo,
+    targetId,
+    `anton: rework — ${pr} was open when this send-back was decided but reads as ${state} now, so ` +
+      (rolledBack
+        ? `the retire that had already begun was rolled back and the finished-run marker was LEFT in ` +
+          `place. `
+        : `the finished-run marker was LEFT in place. `) +
+      `Send the ticket back again: anton re-reads the PR and, if it merged, carries the fix as its ` +
+      `own run target instead.`,
+  );
 }
 
 /**
@@ -428,11 +503,9 @@ async function applyReopen(
   if (fresh.status === "closed") {
     await beads.reopen(repo, ticket.id, `rework: ${summary}`);
   }
-  // The stage labels describe the run that just finished with this bead. Left on, `stage:in-review`
-  // makes a standalone target resume-SKIPPED (ticket-view's `resumeSkipped`) — the run would walk
-  // straight past the ticket it was just told to redo — and `stage:implementing` makes a reopened
-  // bead derive as in-progress on every board surface.
-  await beads.untag(repo, ticket.id, [LABELS.stage("implementing"), LABELS.stage("in-review")]);
+  // The stage labels describe the run that just finished with this bead — see RUN_STAGE_LABELS for
+  // what each one costs the ticket it is left on.
+  await beads.untag(repo, ticket.id, RUN_STAGE_LABELS);
   return {
     result: { mode: "reopen", ticketId: ticket.id, reworkedId: ticket.id, note: body, applied: true },
     runsUnderTarget: true,
@@ -454,7 +527,8 @@ async function applyReopen(
  *
  * A SHIPPED target (its PR merged, {@link resolvePipeline}) is parented nowhere for a second reason:
  * its next run has nothing left to execute, so a child of it would never be dispatched either. The
- * follow-up carries the work as a run target of its own.
+ * follow-up carries the work as a run target of its own — and one an EARLIER attempt already parented
+ * under the target is moved there too, because a merge can land between the two attempts.
  */
 async function applyFollowUp(
   project: Project,
@@ -467,7 +541,8 @@ async function applyFollowUp(
 ): Promise<AppliedRework> {
   const repo = project.repoPath;
   const author = await resolveAuthor();
-  const shipped = pipeline?.outcome === "shipped";
+  const shippedPr = pipeline?.outcome === "shipped" ? pipeline.pr : undefined;
+  const shipped = shippedPr !== undefined;
   const body = reworkNoteBody({
     mode: "follow-up",
     targetId: target.id,
@@ -484,6 +559,25 @@ async function applyFollowUp(
   const all = await refreshAllIssues(repo);
   const existing = existingFollowUp(all, ticket.id, summary);
   if (existing) {
+    // A follow-up created UNDER the target before its PR merged is stranded there: the merged target
+    // has no run left to dispatch it, and a child task is not a run target of its own, so nothing
+    // would ever pick it up. That is exactly the shape the instructed retry lands in — the 409 says
+    // "send it back again", and this pass reads the PR as merged. So the parentage is reconciled to
+    // what this request would have created had it gone first (parentless, {@link resolvePipeline}),
+    // rather than the founder being told a stranded child "carries the next pass as its own run
+    // target". The bead keeps its Context section, which a founder may have edited; the note is the
+    // record of the move.
+    const stranded = shippedPr !== undefined && beads.parentOf(existing) === target.id;
+    if (stranded) {
+      await beads.reparent(repo, existing.id, "");
+      await beads.note(
+        repo,
+        existing.id,
+        `anton: rework — ${target.id}'s pull request (${shippedPr}) merged after this follow-up was ` +
+          `created under it, so it was detached and is its own run target now — approve it to run. ` +
+          `Its Context section still names the parent it was created under.`,
+      );
+    }
     return {
       result: {
         mode: "follow-up",
@@ -492,9 +586,10 @@ async function applyFollowUp(
         note: body,
         applied: false,
       },
-      // Read off the bead the winner actually created, so the repeat that finishes a half-applied
-      // send-back retires on exactly the same condition the first request would have.
-      runsUnderTarget: beads.parentOf(existing) === target.id,
+      // Read off the bead the winner actually created — as reconciled above — so the repeat that
+      // finishes a half-applied send-back retires on exactly the condition that holds now.
+      runsUnderTarget: !shipped && beads.parentOf(existing) === target.id,
+      reconciled: stranded,
     };
   }
 
@@ -567,8 +662,7 @@ function inheritedLabels(ticket: Bead): string[] {
 
 /** Stage labels a reopen strips — one still on the bead means this rework's untag hasn't run yet. */
 function hasStageLabel(bead: Bead): boolean {
-  const stages: string[] = [LABELS.stage("implementing"), LABELS.stage("in-review")];
-  return (bead.labels ?? []).some((l) => stages.includes(l));
+  return (bead.labels ?? []).some((l) => RUN_STAGE_LABELS.includes(l));
 }
 
 /** Is this exact instruction already on the bead as a human note? Half of the double-submit guard. */
