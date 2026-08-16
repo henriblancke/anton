@@ -474,9 +474,14 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     const child = await beads.create(repo, { title: "Its ticket", type: "task", acceptance: "- [ ] it works" });
     await beads.link(repo, child, epic, "parent-child");
 
-    // Released once the route has read the board and passed its run-target gate. `request.json()` is
-    // the first thing the handler does AFTER that gate, so reading the body is the signal that the
-    // stale verdict now exists — the precise window this test has to open.
+    // Synchronization: `request.json()` must fire AFTER `refreshAllIssues` (route.ts:132) populates
+    // `allBeads`. The pre-lock gate answers from that snapshot, so releasing the feature write only
+    // once the route has ALREADY read the board is what makes the gate see a non-container — leaving
+    // the in-lock `loadAllIssues` as the only thing that can catch the now-container, which is the
+    // path this test exists to cover. `readApprovalBody` (route.ts:215) sits after both the read and
+    // the gate, which makes it a usable signal — but the load-bearing dependency is the board read.
+    // Released before the gate, the feature would land first, the PRE-lock gate would 422 it, and
+    // this test would pass without exercising the in-lock re-check at all.
     let gatesPassed!: () => void;
     const gatesDone = new Promise<void>((resolve) => (gatesPassed = resolve));
 
