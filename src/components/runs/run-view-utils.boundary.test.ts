@@ -46,4 +46,11 @@ describe("the client-safe module's import boundary", () => {
     const source = "import { useState } from 'react';\nexport const x = useState;\n";
     expect(await importErrors(source)).toEqual([]);
   });
+
+  // A `lib` segment in a package's subpath is not this repo's server layer; reporting it as one
+  // would be a nonsensical error at an import that never touches `src/lib`.
+  it("allows a third-party package whose subpath contains lib", async () => {
+    const source = "import { x } from 'some-package/lib/types';\nexport const y = x;\n";
+    expect(await importErrors(source)).toEqual([]);
+  });
 });

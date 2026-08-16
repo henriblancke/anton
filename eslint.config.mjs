@@ -1,4 +1,5 @@
 import { builtinModules } from "node:module";
+import { posix as path } from "node:path";
 import { defineConfig, globalIgnores } from "eslint/config";
 import nextVitals from "eslint-config-next/core-web-vitals";
 import nextTs from "eslint-config-next/typescript";
@@ -22,6 +23,26 @@ const SERVER_LAYER_IMPORT_MESSAGE =
   "src/lib is the server layer — importing any of it can pull better-sqlite3 into the browser bundle transitively. The dependency points server -> client-safe: declare the shape here and let src/lib import it, never the reverse.";
 
 const CLIENT_SAFE_MODULES = ["src/components/runs/run-view-utils.ts"];
+
+const SERVER_LAYER_DIR = "src/lib";
+
+/**
+ * Every spelling of `src/lib` reachable from a client-safe module: the `@/lib` alias, plus the
+ * relative path from each module's own directory. Derived per module rather than globbed as
+ * `**\/lib` — that shape also matches a third-party `some-package/lib/x`, which would report a
+ * server-layer violation for an import that has nothing to do with the server layer. Deriving it
+ * keeps the guard exhaustive as the list above grows, whatever depth a module sits at.
+ */
+const SERVER_LAYER_PATTERNS = [
+  ...new Set([
+    "@/lib",
+    "@/lib/**",
+    ...CLIENT_SAFE_MODULES.flatMap((file) => {
+      const relative = path.relative(path.dirname(file), SERVER_LAYER_DIR);
+      return [relative, `${relative}/**`];
+    }),
+  ]),
+];
 
 /**
  * `builtinModules` reflects whichever runtime runs ESLint — under Node it omits Bun's `bun:*`
@@ -66,8 +87,7 @@ const eslintConfig = defineConfig([
               message: SERVER_ONLY_IMPORT_MESSAGE,
             },
             {
-              // Both spellings of the server layer: the `@/lib` alias and any relative path into it.
-              group: ["@/lib", "@/lib/**", "**/lib", "**/lib/**"],
+              group: SERVER_LAYER_PATTERNS,
               message: SERVER_LAYER_IMPORT_MESSAGE,
             },
           ],
