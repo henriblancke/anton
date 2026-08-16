@@ -57,8 +57,16 @@ import {
 import { MAX_APPLIES_PER_PASS, type EmittedProposal } from "./emit";
 import { passRecordLine, type ApplyVerdict } from "./record";
 
-/** What the pass did with one armed proposal — `error` is anton failing, never the board refusing. */
-export type ArmedOutcome = "applied" | "refused" | "error";
+/**
+ * What the pass did with one armed proposal — `error` is anton failing, never the board refusing.
+ *
+ * `unsettled` is the one outcome that is BOTH a write and a failure: the move landed and the ask that
+ * authorised it could not be closed (apply.ts `settleProposal`), so the board moved unattended and the
+ * proposal is still standing over it. It is never folded into `error` — that verdict promises a board
+ * nothing landed on, and reporting a bead this pass moved under it is the record's one unforgivable
+ * lie, the more so because the open proposal's fingerprint stops any later pass re-deciding it.
+ */
+export type ArmedOutcome = "applied" | "unsettled" | "refused" | "error";
 
 /**
  * One armed proposal's outcome, as data — the same shape the shadow record carries, so the two read
@@ -77,9 +85,22 @@ export interface ArmedRecord {
   outcome: ArmedOutcome;
   /** The apply's summary, or its refusal/failure reason VERBATIM. */
   detail: string;
-  /** The beads the write actually touched. Empty for a refusal, and for an already-applied board. */
+  /**
+   * The beads the write actually touched. Empty for a refusal, and for an already-applied board —
+   * but NOT for every failure: a settlement that broke after its steps landed reports what stayed
+   * written (apply.ts `ProposalApplyError.changed`).
+   */
   changed: string[];
 }
+
+/**
+ * Did this apply reach the BOARD? Both outcomes that did — the settled write, and the one whose
+ * proposal could not be closed over it. Answered once here rather than by each caller re-deriving
+ * which outcomes wrote, because getting it wrong is silent: a pass that reasons on `applied` alone
+ * carries on against a snapshot the unsettled move has already invalidated.
+ */
+export const movedTheBoard = (record: ArmedRecord): boolean =>
+  record.outcome === "applied" || record.outcome === "unsettled";
 
 export interface ArmedResult {
   records: ArmedRecord[];
@@ -210,7 +231,7 @@ export async function applyArmedProposals(input: ArmedInput): Promise<ArmedResul
     // The record's own correction, in the one place a founder reads the pass: what is written above
     // as APPLIED happened HERE and has not reached the shared board. Shaped as a pass note (no
     // `(kind)` group), so it lands beside the counts rather than as a seventh proposal (record.ts).
-    const applied = records.filter((r) => r.outcome === "applied").map((r) => r.proposal);
+    const applied = records.filter(movedTheBoard).map((r) => r.proposal);
     await write(
       input,
       `APPLY could not publish this pass's board writes — ` +
@@ -439,10 +460,11 @@ interface ArmedAttempt {
  * may have moved a bead this one rests on. Fresh across MACHINES too: the caller pulls the shared
  * board immediately before this runs, so the read below carries what other machines have written.
  *
- * Total. A {@link ProposalApplyError} is the board's answer or a rolled-back write, and anything
- * else is a bd that broke; both leave the proposal open with the reason on it, and neither stops the
- * loop. A CANCEL is the exception the caller re-raises, and it comes back as `stopped` rather than
- * as a throw so the two failure kinds never have to be told apart by identity.
+ * Total. A {@link ProposalApplyError} is the board's answer, a rolled-back write, or a move that
+ * landed and could not be settled, and anything else is a bd that broke; all of them leave the
+ * proposal open with the reason on it, and none stops the loop. A CANCEL is the exception the caller
+ * re-raises, and it comes back as `stopped` rather than as a throw so the two failure kinds never
+ * have to be told apart by identity.
  */
 async function applyOne(input: ArmedInput, base: ArmedAsk): Promise<ArmedAttempt> {
   const proposalId = base.proposal;
@@ -472,18 +494,26 @@ async function applyOne(input: ArmedInput, base: ArmedAsk): Promise<ArmedAttempt
     };
   } catch (e) {
     // `refused`/`unusable` are the board declining — the ordinary outcome for an ask whose premise
-    // moved. `failed` is a write that broke and was rolled back, which is anton's failure, not a
-    // verdict, and reads as one in the log.
-    const refused = e instanceof ProposalApplyError && e.failure !== "failed";
-    return {
-      record: { ...base, outcome: refused ? "refused" : "error", detail: messageOf(e) },
-    };
+    // moved. `failed` is a write that broke, which is anton's failure, not a verdict, and reads as
+    // one in the log.
+    //
+    // …unless it broke SETTLING what the steps had already written, and then the beads it left moved
+    // ride on the error (apply.ts `settleProposal`). Those are real unattended board writes, and a
+    // record that filed them under a verdict promising a rolled-back board would tell a founder
+    // nothing happened to beads this pass moved — while the open proposal's fingerprint keeps any
+    // later pass from re-deciding it. So the write is what names the outcome, not the failure class.
+    const failure = e instanceof ProposalApplyError ? e : undefined;
+    const changed = failure?.changed ?? [];
+    const refused = failure !== undefined && failure.failure !== "failed";
+    const outcome: ArmedOutcome = refused ? "refused" : changed.length > 0 ? "unsettled" : "error";
+    return { record: { ...base, outcome, detail: messageOf(e), changed } };
   }
 }
 
 /** Typed through record.ts's vocabulary, so a reworded verdict is a type error, not a silent one. */
 const VERDICT: Record<ArmedOutcome, ApplyVerdict> = {
   applied: "APPLIED",
+  unsettled: "APPLIED BUT NOT SETTLED",
   refused: "REFUSED",
   error: "COULD NOT APPLY",
 };
@@ -504,10 +534,17 @@ function lineOf(record: ArmedRecord): string {
 function summaryOf(records: ArmedRecord[]): string {
   const of = (outcome: ArmedOutcome) => records.filter((r) => r.outcome === outcome);
   const applied = of("applied");
+  const unsettled = of("unsettled");
   const clauses = [
     applied.length > 0
       ? `applied ${applied.length} proposal(s) unattended ` +
         `(${applied.map((r) => r.proposal).join(", ")})`
+      : undefined,
+    // Spelled out rather than counted: it is the clause that sends somebody to the board, because
+    // the move is on it and the ask that authorised it is still open.
+    unsettled.length > 0
+      ? `moved the board for ${unsettled.length} proposal(s) that could NOT be settled and stay ` +
+        `open (${unsettled.map((r) => r.proposal).join(", ")})`
       : undefined,
     of("refused").length > 0 ? `${of("refused").length} refused` : undefined,
     of("error").length > 0 ? `${of("error").length} could not be applied` : undefined,

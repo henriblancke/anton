@@ -27,6 +27,10 @@ import { cn } from "@/lib/utils";
  * write, so a shadow that could not be evaluated must never be described as one that may have been
  * rolled back (see `passRecordGroup`). An apply whose OUTCOME never reached the log is a third row
  * for the same reason — "nothing landed" is the one thing nobody can say about it.
+ *
+ * An apply that landed and could not SETTLE its proposal leads, ahead of the clean ones: it is both
+ * an unattended write and an ask still standing, so it is the only row that asks the reader to do
+ * something.
  */
 const GROUPS: {
   key: PassRecordGroup;
@@ -35,6 +39,14 @@ const GROUPS: {
   chip: string;
   blurb: string;
 }[] = [
+  {
+    key: "unsettled",
+    label: "applied, not settled",
+    text: "text-risk-high",
+    chip: "border-risk-high/30 bg-risk-high/10 text-risk-high",
+    blurb:
+      "the move landed and its proposal could not be closed — the ask is still open over a board that already carries it; approving it settles it without writing anything",
+  },
   {
     key: "applied",
     label: "applied",

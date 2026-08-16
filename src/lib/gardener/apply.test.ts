@@ -25,6 +25,7 @@ import {
   CLUSTER,
   cold,
   DEFER,
+  failOn,
   FILED,
   inReview,
   leased,
@@ -259,6 +260,53 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
 
     expect(result.changed).toEqual(["anton-b"]);
     expect(calls.filter((c) => c.startsWith("reparent"))).toEqual(["reparent anton-b anton-card"]);
+  });
+
+  // The settlement is the LAST thing an apply does and the one pair of writes nothing can undo: by
+  // the time it runs, every step has landed. A failure that reported an untouched board would tell
+  // the armed pass — whose record is the only witness an unattended write ever gets — that nothing
+  // moved, over beads it had just moved (gardener/armed.ts).
+  it("reports the move it left standing when the proposal cannot be settled", async () => {
+    const proposal = proposalFor(REPARENT);
+    failOn.set(`note:${proposal.id}`, 1);
+
+    const err = await apply(proposal, [CARD, bead("anton-a"), proposal], "policy").catch((e) => e);
+
+    expect(err).toBeInstanceOf(ProposalApplyError);
+    expect(err.failure).toBe("failed");
+    expect(err.changed).toEqual(["anton-a"]);
+    expect(err.message).toContain("the move LANDED (anton-a) and was not rolled back");
+    // Left standing, not undone: a re-parent is the only verb a rollback could reach, and the ask
+    // converges anyway — approving it reads the board as already applied and settles it.
+    expect(calls.filter((c) => c.startsWith("reparent"))).toEqual(["reparent anton-a anton-card"]);
+    expect(err.message).toContain("approving it again settles it without writing anything");
+    // And the still-open proposal says why it is still open, as every other failure here does.
+    expect(calls.at(-1)).toContain(`note ${proposal.id} gardener: apply FAILED`);
+  });
+
+  it("says the same when the note landed and only the CLOSE failed", async () => {
+    // The half that leaves the bead claiming to be applied while it is still open — the reason the
+    // record has to carry the move rather than the failure class alone.
+    const proposal = proposalFor(REPARENT);
+    failOn.set(`close:${proposal.id}`, 1);
+
+    const err = await apply(proposal, [CARD, bead("anton-a"), proposal]).catch((e) => e);
+
+    expect(err.failure).toBe("failed");
+    expect(err.changed).toEqual(["anton-a"]);
+  });
+
+  it("has no board write to report when a settlement over an already-applied board fails", async () => {
+    // The settled path writes nothing to a subject, so there is nothing for a caller to record as
+    // moved — an empty `changed` is the honest answer, not a missing one.
+    const proposal = proposalFor(REPARENT);
+    failOn.set(`note:${proposal.id}`, 1);
+
+    const err = await apply(proposal, [CARD, child("anton-a", CARD.id), proposal]).catch((e) => e);
+
+    expect(err.failure).toBe("failed");
+    expect(err.changed).toEqual([]);
+    expect(err.message).toContain("the board already carried the move, so nothing was written");
   });
 
   it("refuses a stale plan without writing anything, and notes why on the proposal", async () => {

@@ -127,11 +127,33 @@ describe("readPassRecords", () => {
     // Conflating them would tell a founder the board declined when in fact anton failed mid-write.
     expect(passRecordCounts(summary)).toEqual({
       applied: 0,
+      unsettled: 0,
       shadowed: 0,
       refused: 1,
       unrecorded: 0,
       "apply-failed": 1,
       "shadow-failed": 0,
+    });
+  });
+
+  it("counts an apply that LANDED and could not be settled apart from one that broke", () => {
+    // The third member of that family, and the one neither of the others may absorb: the move is on
+    // the board and its ask is still open. `APPLIED` would hide the standing proposal; `COULD NOT
+    // APPLY` promises a board nothing landed on, and would hide a bead a pass moved unattended.
+    const summary = readPassRecords(
+      logged("gardener", {
+        ...APPLIED,
+        verdict: "APPLIED BUT NOT SETTLED",
+        detail: "the move LANDED (t-4) and was not rolled back, but the proposal could not be closed",
+      }),
+    );
+
+    expect(summary.records[0].outcome).toBe("unsettled");
+    expect(summary.records.map(passRecordGroup)).toEqual(["unsettled"]);
+    expect(passRecordCounts(summary)).toMatchObject({
+      unsettled: 1,
+      applied: 0,
+      "apply-failed": 0,
     });
   });
 

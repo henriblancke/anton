@@ -51,6 +51,8 @@ vi.mock("./apply", async () => {
 });
 
 const { applyArmedProposals } = await import("./armed");
+/** The real class — the mock above spreads the actual module, so `changed` behaves as it ships. */
+const { ProposalApplyError } = await import("./apply");
 
 const REPO = "/tmp/armed-repo";
 /** Only `shipped-orphan` is armed, and it is the only kind these fixtures file. */
@@ -211,6 +213,66 @@ describe("armed walk · cancelled", () => {
     });
 
     await expect(walk(filed(1), controller.signal)).rejects.toBe(reason);
+  });
+});
+
+/**
+ * The apply that LANDED and could not close its own ask (apply.ts `settleProposal`): the one failure
+ * that is also a board write.
+ *
+ * Recorded as `COULD NOT APPLY` with no subjects, it would be the record's worst lie — that verdict
+ * promises a board nothing landed on, and here the pass moved a bead unattended. Nothing corrects it
+ * later, either: the proposal stays open, and an open proposal's fingerprint is exactly what stops a
+ * later pass re-filing, and so re-deciding, the same claim.
+ */
+describe("armed walk · a move that could not be settled", () => {
+  const running = (): AbortSignal => new AbortController().signal;
+
+  /** apply's own answer when its steps landed and the proposal's own close did not. */
+  const unsettled = (subject: string) =>
+    new ProposalApplyError(
+      "failed",
+      `applying p-1 could not be settled: the move LANDED (${subject}) and was not rolled back`,
+      [subject],
+    );
+
+  it("records the bead it moved, rather than a board nothing happened to", async () => {
+    applyMock.mockRejectedValueOnce(unsettled("t-1"));
+
+    const result = await walk(filed(2), running());
+
+    expect(result.records[0]).toMatchObject({ outcome: "unsettled", changed: ["t-1"] });
+    expect(recorded()).toContain("— APPLIED BUT NOT SETTLED: applying p-1 could not be settled");
+    // Counted apart from a clean apply AND from a failed one: the board moved and the ask is open,
+    // so a founder has something to do about it that neither of the other two asks of them.
+    expect(passRecordCounts(readPassRecords(recorded()))).toMatchObject({
+      unsettled: 1,
+      applied: 1,
+      "apply-failed": 0,
+    });
+  });
+
+  it("keeps applying what is behind it — one unlucky bead never freezes the armed path", async () => {
+    applyMock.mockRejectedValueOnce(unsettled("t-1"));
+
+    const result = await walk(filed(3), running());
+
+    expect(applyMock).toHaveBeenCalledTimes(3);
+    expect(result.records.map((r) => r.outcome)).toEqual(["unsettled", "applied", "applied"]);
+    expect(result.deferred).toEqual([]);
+  });
+
+  it("names it among the writes stranded on this machine when the publish fails", async () => {
+    // It IS a board write, so it owes the same correction as a settled one — a note naming only the
+    // clean applies would leave this move reading as published to the shared board.
+    applyMock.mockRejectedValueOnce(unsettled("t-1"));
+    pushMock.mockRejectedValue(new Error("bd dolt push failed: conflict in issues"));
+
+    await walk(filed(2), running());
+
+    const notes = readPassRecords(recorded()).notes.join("\n");
+    expect(notes).toContain("APPLY could not publish this pass's board writes");
+    expect(notes).toContain("(p-1, p-2)");
   });
 });
 

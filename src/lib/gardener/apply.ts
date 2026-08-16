@@ -69,13 +69,24 @@ export type ApplyFailure =
   | "unusable"
   /** Preconditions no longer hold. Nothing was written; a human re-decides. */
   | "refused"
-  /** A bd write failed mid-flight. Whatever landed was rolled back; the proposal stays open. */
+  /**
+   * A bd write failed mid-flight. Whatever landed was rolled back — EXCEPT when what failed was the
+   * SETTLEMENT, which runs after every step and has nothing left to undo them with (see
+   * {@link settleProposal}); there the writes stand and ride on the error's `changed`. The proposal
+   * stays open either way.
+   */
   | "failed";
 
 export class ProposalApplyError extends Error {
   constructor(
     readonly failure: ApplyFailure,
     message: string,
+    /**
+     * The board writes this failure LEFT STANDING, so a caller can record what actually moved.
+     * Non-empty for exactly one failure — a settlement that broke after its steps landed — because
+     * every other one either wrote nothing or rolled back what it wrote.
+     */
+    readonly changed: string[] = [],
   ) {
     super(message);
     this.name = "ProposalApplyError";
@@ -246,7 +257,7 @@ function settleUnwritten(
         new ProposalApplyError("refused", `cannot apply ${proposal.id}: ${drifted}`),
       );
     }
-    return settleProposal(repo, proposal.id, plan, summary, [], actor);
+    return settleProposal(repo, proposal, plan, summary, [], actor);
   });
 }
 
@@ -273,7 +284,7 @@ async function applySteps(
   } catch (e) {
     throw await attachFailure(repo, proposal, await stepFailure(repo, proposal.id, changed, e));
   }
-  return settleProposal(repo, proposal.id, plan, summary, changed, actor);
+  return settleProposal(repo, proposal, plan, summary, changed, actor);
 }
 
 /**
@@ -299,18 +310,57 @@ async function stepFailure(
  * was answered, and only a DECLINE suppresses the fingerprint (see the module header). Always under
  * the lock the whole application holds, so no second approve can be part-way through the same steps
  * while this one declares them done.
+ *
+ * These two writes are the LAST an apply makes and the one pair that cannot fail quietly: by the time
+ * they run every step has landed, so a settlement that breaks leaves board moves with no settled
+ * proposal answering for them. It is REPORTED rather than undone — {@link ProposalApplyError} carries
+ * the beads that stayed written, and both callers record them (the armed pass in gardener/armed.ts,
+ * the route in its 500) instead of describing an untouched board. See {@link unsettled} for why the
+ * rollback is not the answer here.
  */
 async function settleProposal(
   repo: string,
-  proposalId: string,
+  proposal: Bead,
   plan: GardenerPlan,
   summary: string,
   changed: ApplyStep[],
   actor: ApplyActor,
 ): Promise<ApplyResult> {
-  await beads.note(repo, proposalId, appliedNote(plan, summary, actor));
-  await beads.close(repo, proposalId, `applied: ${summary}`);
-  return { proposalId, plan, summary, changed: changed.map((s) => s.id) };
+  const written = changed.map((s) => s.id);
+  try {
+    await beads.note(repo, proposal.id, appliedNote(plan, summary, actor));
+    await beads.close(repo, proposal.id, `applied: ${summary}`);
+  } catch (e) {
+    throw await attachFailure(repo, proposal, unsettled(proposal.id, written, e));
+  }
+  return { proposalId: proposal.id, plan, summary, changed: written };
+}
+
+/**
+ * The failure that leaves a proposal OPEN over a board that already carries its move.
+ *
+ * NOT rolled back, and the wording is what makes that honest. Only a re-parent can be undone at all
+ * (apply-steps.ts `rollbackSteps` strands every other verb), so undoing a move the board wanted
+ * because a note or a close failed would trade a state that converges for one a human has to
+ * reconstruct: the ask left standing is the state approving it again SETTLES — `planApply` re-decides
+ * against the live board, reads it as already applied, and closes the proposal writing nothing
+ * ({@link settleUnwritten}).
+ *
+ * So the error says three things a caller has to be able to repeat: what stayed written, that the ask
+ * is still open, and what closes it.
+ */
+function unsettled(proposalId: string, changed: string[], e: unknown): ProposalApplyError {
+  const landed =
+    changed.length > 0
+      ? `the move LANDED (${changed.join(", ")}) and was not rolled back`
+      : `the board already carried the move, so nothing was written`;
+  return new ProposalApplyError(
+    "failed",
+    `applying ${proposalId} could not be settled: ${landed}, but the proposal itself could not be ` +
+      `closed (${messageOf(e)}) — it stays open over a board that already holds its move, and ` +
+      `approving it again settles it without writing anything`,
+    changed,
+  );
 }
 
 /**

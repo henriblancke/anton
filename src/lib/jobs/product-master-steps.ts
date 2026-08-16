@@ -11,7 +11,7 @@
 import type { Bead } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
 import type { RunClaudeOptions, runClaude } from "../claude/driver";
-import { applyArmedProposals, reportUnsettledProposals } from "../gardener/armed";
+import { applyArmedProposals, movedTheBoard, reportUnsettledProposals } from "../gardener/armed";
 import type { GardenerDetection } from "../gardener/detections";
 import {
   emitProposals,
@@ -151,11 +151,15 @@ export function makeProposalFiler(scope: PassScope, input: ProposalFilerInput): 
       // another actor that moved the subject, so the snapshot is stale on both counts. Judging tier
       // 2 against it would reason about a pre-move bead and an ask that no longer stands.
       //
+      // Every outcome that REACHED the board counts, through the walk's own predicate — a move whose
+      // proposal could not be settled left the subject just as moved as a settled one did, and
+      // reading `applied` alone would hand tier 2 a snapshot the board has already left behind.
+      //
       // Stamped BEFORE the read, exactly as the pass's first read stamps it: a write landing while
       // the read is in flight is absent from the board it returns, and a fence taken afterwards
       // would claim anton had observed it — which is the one direction that matters, because a
       // proposal armed at `apply` then passes `writtenSinceFiling` on evidence nobody ever saw.
-      if (applied.records.some((record) => record.outcome === "applied")) {
+      if (applied.records.some(movedTheBoard)) {
         const observedAtMs = scope.clock.now();
         snapshot = { board: await loadAllIssues(repo), observedAtMs };
       }

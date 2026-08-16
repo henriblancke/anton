@@ -41,6 +41,20 @@ describe("PassRecordChips", () => {
     expect(html).toContain("1 note");
   });
 
+  it("chips a move that landed and could not be settled apart from a clean apply", () => {
+    // Folded into "applied" it would read as a finished ask; folded into "could not apply" it would
+    // read as a board nothing happened to. It is both, and it is the only chip asking the founder to
+    // act — the proposal is still open over a board that already carries its move.
+    const unsettled =
+      "[gardener] APPLY p-2 (shipped-orphan) retire/close t-2 — APPLIED BUT NOT SETTLED: the move " +
+      "LANDED (t-2) and was not rolled back, but the proposal could not be closed";
+    const html = chips([APPLIED(1), unsettled].join("\n"));
+
+    expect(html).toContain("1 applied, not settled");
+    expect(html).toContain("1 applied");
+    expect(html).not.toContain("could not apply");
+  });
+
   it("pluralises the notes chip", () => {
     const unpublished =
       "[gardener] APPLY could not publish this pass's board writes — the 1 move(s) recorded " +

@@ -24,13 +24,29 @@ export type PassRecordMode = "apply" | "shadow";
  * What a reader counts a line as. `error` is anton failing to decide, never the board refusing —
  * and `unrecorded` is neither: the attempt is on the record and its RESULT never reached the log,
  * so the board is the only evidence of what landed.
+ *
+ * `unsettled` is the pair of them: the move LANDED and the proposal that authorised it could not be
+ * closed, so the board carries the write and the ask is still standing over it. Counted apart from
+ * both — a founder acts on it (approving the open proposal settles it), and folding it into `error`
+ * would promise them a board nothing happened to.
  */
-export type PassRecordOutcome = "applied" | "shadowed" | "refused" | "error" | "unrecorded";
+export type PassRecordOutcome =
+  | "applied"
+  | "unsettled"
+  | "shadowed"
+  | "refused"
+  | "error"
+  | "unrecorded";
 
 /**
  * The verdicts an APPLY line can carry. `REFUSED` is the board declining — the ordinary answer for an
  * ask whose premise moved — while `COULD NOT APPLY` is a write that broke and was rolled back, and a
  * founder acts on those two very differently.
+ *
+ * `APPLIED BUT NOT SETTLED` is the third of that family and the one neither of the others may absorb:
+ * the move is ON the board and its proposal could not be closed (gardener/apply.ts `settleProposal`).
+ * Saying `APPLIED` would hide an ask still standing; saying `COULD NOT APPLY` would hide a bead the
+ * pass moved unattended.
  *
  * `APPLYING` is written BEFORE the board is touched, so the attempt is on the record even if the
  * outcome line never lands (gardener/armed.ts): the record is what a retry reconstructs the pass's
@@ -41,6 +57,7 @@ export type PassRecordOutcome = "applied" | "shadowed" | "refused" | "error" | "
 export const APPLY_VERDICTS = {
   APPLYING: "unrecorded",
   APPLIED: "applied",
+  "APPLIED BUT NOT SETTLED": "unsettled",
   REFUSED: "refused",
   "COULD NOT APPLY": "error",
 } as const satisfies Record<string, PassRecordOutcome>;
@@ -229,6 +246,7 @@ export function passRecordGroup(record: PassRecord): PassRecordGroup {
 export function passRecordCounts(summary: PassRecordSummary): Record<PassRecordGroup, number> {
   const counts: Record<PassRecordGroup, number> = {
     applied: 0,
+    unsettled: 0,
     shadowed: 0,
     refused: 0,
     unrecorded: 0,
