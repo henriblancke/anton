@@ -95,10 +95,10 @@ export function makeGardenerHandler(deps: GardenerDeps): JobHandler {
         // How far this project lets a filed proposal go, per kind (anton-nbyy) — read once, so a
         // policy edit mid-patrol cannot have one proposal shadowed under a rule the next one is not.
         policy: resolveAutonomyPolicy(await getProjectSettings(db, projectId)),
-        // What earlier attempts of THIS job already applied comes off the cap: a patrol that died
-        // after its writes is retried under the same job id, and a fresh cap per attempt would let
-        // one scheduled patrol apply several caps' worth unattended. Read here, before the patrol
-        // writes a line, so this attempt's own log cannot count against it.
+        // What earlier attempts of THIS job already tried to apply comes off the cap: a patrol that
+        // died after its writes is retried under the same job id, and a fresh cap per attempt would
+        // let one scheduled patrol apply several caps' worth unattended. Read here, before the
+        // patrol writes a line, so this attempt's own log cannot count against it.
         applyBudget: await remainingApplyBudget({
           db,
           jobId: ctx.jobId,

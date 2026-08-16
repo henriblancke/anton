@@ -104,10 +104,10 @@ export function makeProductMasterHandler(deps: ProductMasterDeps): JobHandler {
         // Read once: a policy change mid-pass must not have the two tiers shadowing under different
         // rules (anton-nbyy).
         policy: resolveAutonomyPolicy(settings),
-        // What earlier attempts of THIS job already applied comes off the cap: the runner retries a
-        // pass that died after its writes under the same job id, and a fresh cap per attempt would
-        // let one scheduled pass apply several caps' worth unattended. Read before the pass writes
-        // anything, so this attempt's own (empty) log cannot count against it.
+        // What earlier attempts of THIS job already tried to apply comes off the cap: the runner
+        // retries a pass that died after its writes under the same job id, and a fresh cap per
+        // attempt would let one scheduled pass apply several caps' worth unattended. Read before
+        // the pass writes anything, so this attempt's own (empty) log cannot count against it.
         applyBudget: await remainingApplyBudget({
           db,
           jobId: ctx.jobId,

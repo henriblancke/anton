@@ -74,9 +74,16 @@ export async function remainingApplyBudget(input: ApplyBudgetInput): Promise<num
   // Never a silent cap, exactly as the per-pass hold-back is not one: an operator looking at a
   // retry that applied one proposal has to be able to tell "that was all it found" from "its
   // earlier attempt had already spent the rest".
+  //
+  // Spelled as ATTEMPTS, because that is what was counted: a refusal and a write that broke cost
+  // the cap the same as a bead that moved, so a note claiming this many proposals were APPLIED
+  // would send an operator hunting board moves a refused attempt never made. What actually landed
+  // is a per-proposal question, and the record answers it verdict by verdict.
   await note(
     input,
-    `earlier attempt(s) of this job already applied ${spent} proposal(s) unattended — one pass ` +
+    `earlier attempt(s) of this job already spent ${spent} of the unattended write budget on ` +
+      `apply attempts — the cap counts attempts, so some may have been refused or have failed ` +
+      `rather than moved the board; this job's record carries each one's verdict — one pass ` +
       `applies at most ${MAX_APPLIES_PER_PASS}, so this attempt may apply ${remaining}`,
   );
   return remaining;

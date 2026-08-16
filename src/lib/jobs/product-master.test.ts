@@ -623,8 +623,10 @@ describe("product-master pass · armed", () => {
       .where(ne(schema.sessions.id, "s-first-attempt"));
     const log = readFileSync(row.logPath as string, "utf8");
     expect(log).toContain(
-      "APPLY budget: earlier attempt(s) of this job already applied 3 proposal(s) unattended — " +
-        "one pass applies at most 3, so this attempt may apply 0",
+      "APPLY budget: earlier attempt(s) of this job already spent 3 of the unattended write " +
+        "budget on apply attempts — the cap counts attempts, so some may have been refused or " +
+        "have failed rather than moved the board; this job's record carries each one's verdict " +
+        "— one pass applies at most 3, so this attempt may apply 0",
     );
     expect(log).toContain("APPLY held back 1 armed proposal(s)");
   });

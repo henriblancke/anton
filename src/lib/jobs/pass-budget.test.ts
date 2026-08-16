@@ -75,15 +75,32 @@ describe("remainingApplyBudget", () => {
     expect(logged).toEqual([]);
   });
 
-  it("takes what earlier attempts applied off the cap, and says so", async () => {
+  it("takes what earlier attempts spent off the cap, and says so", async () => {
     await attempt("s-1", applyLine(1) + applyLine(2), 1_700_000_000_000);
 
     expect(await budget()).toBe(MAX_APPLIES_PER_PASS - 2);
     // Never a silent cap: a retry that applied one has to read apart from one that found one.
     expect(logged.join("")).toContain(
-      "[product-master] APPLY budget: earlier attempt(s) of this job already applied 2 " +
-        "proposal(s) unattended — one pass applies at most 3, so this attempt may apply 1",
+      "[product-master] APPLY budget: earlier attempt(s) of this job already spent 2 of the " +
+        "unattended write budget on apply attempts — the cap counts attempts, so some may have " +
+        "been refused or have failed rather than moved the board; this job's record carries " +
+        "each one's verdict — one pass applies at most 3, so this attempt may apply 1",
     );
+  });
+
+  it("never reports a spend of refused or failed attempts as a board move", async () => {
+    // The note is what an operator audits a retry against, and it is written off a count of
+    // ATTEMPTS: every apply here was declined or broke before writing, so a note saying two
+    // proposals were applied would send them looking for beads that never moved.
+    await attempt(
+      "s-1",
+      applyLine(1, "REFUSED") + applyLine(2, "COULD NOT APPLY"),
+      1_700_000_000_000,
+    );
+
+    expect(await budget()).toBe(MAX_APPLIES_PER_PASS - 2);
+    expect(logged.join("")).toContain("spent 2 of the unattended write budget on apply attempts");
+    expect(logged.join("")).not.toContain("already applied");
   });
 
   it("counts what the cap counts — every ATTEMPT to apply, however the board answered", async () => {
