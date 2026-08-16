@@ -118,7 +118,8 @@ function ineligibleReason(bead: Bead, board: Bead[]): string | undefined {
   if (beads.isAbandoned(bead)) return `epic ${bead.id} was abandoned — pick another`;
   if (bead.status === "closed") return `epic ${bead.id} is closed — pick another`;
   if (isInFlightRunTarget(bead, board)) {
-    return `epic ${bead.id} is approved and running as its own target — a feature under it would strand that run`;
+    const state = beads.isApproved(bead) ? "approved and running" : "claimed and running";
+    return `epic ${bead.id} is ${state} as its own target — a feature under it would strand that run`;
   }
   return undefined;
 }

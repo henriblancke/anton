@@ -267,7 +267,12 @@ describe("createDraftFeature — what the Add-work commit lands", () => {
     [
       "approved and running as its own target",
       bead({ id: "p-1", issue_type: "epic", labels: ["approved"] }),
-      "strand that run",
+      "approved and running",
+    ],
+    [
+      "claimed and running as its own target",
+      bead({ id: "p-1", issue_type: "epic", status: "in_progress" }),
+      "claimed and running",
     ],
   ])("refuses an epic that went %s after the page rendered", async (_state, epic, message) => {
     boardIs(epic);
