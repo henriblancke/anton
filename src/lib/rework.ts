@@ -28,7 +28,7 @@ import { ACCEPTANCE_HEADING } from "./beads/contract";
 import { refreshAllIssues } from "./beads/issues";
 import { formatHumanNote, parseTicketNotes } from "./beads/notes";
 import { nudgeSync } from "./beads/sync-nudge";
-import { pullRequestState } from "./git/ops";
+import { pullRequestState, type PullRequestState } from "./git/ops";
 import { runIsLiveForTarget } from "./jobs/service";
 import type { ReviewFinding } from "./jobs/review-context";
 import { resolveOperator } from "./operator";
@@ -61,7 +61,12 @@ export class ReworkInvalidError extends Error {}
 /** The bead exists but this rework can't apply to it (422): not a run target, not one of its tickets. */
 export class ReworkNotAllowedError extends Error {}
 
-/** A run is executing this target right now, so sending its work back would race it (409). */
+/**
+ * The target moved under this request, so the send-back would race it (409). Two ways that happens:
+ * a run is executing the target right now ({@link assertNoLiveRun}), or its pull request stopped
+ * being open while the writes were landing ({@link retireFinishedRun}). Both are answered the same
+ * way — look again and send it back — which is what makes them one status.
+ */
 export class ReworkConflictError extends Error {}
 
 /** Nothing on the board answers to that id (404). */
@@ -146,7 +151,14 @@ export async function reworkTicket(
   assertNoLiveRun(project.id, target);
 
   // What the target's own pull request allows, decided BEFORE any write: it can override the mode.
-  const pipeline = await resolvePipeline(project.repoPath, target, input.mode);
+  // Asked only when the answer can change something. A follow-up on a target that is NOT a board
+  // card comes out parentless either way ({@link applyFollowUp}) — its own run target, which this
+  // target's PR neither carries nor gates — so consulting `gh` there would let an unreachable
+  // GitHub (503, {@link ReworkUnavailableError}) block a send-back that never needed it.
+  const needsPipeline = input.mode === "reopen" || isBoardCard(target, all);
+  const pipeline = needsPipeline
+    ? await resolvePipeline(project.repoPath, target, input.mode)
+    : undefined;
   const mode = pipeline?.redirected ? "follow-up" : input.mode;
 
   // Both beads' write locks, taken together in sorted order (withBeadWriteLocks): the mode's writes
@@ -154,7 +166,7 @@ export async function reworkTicket(
   // correct against a target nothing else is moving. Deduped for a standalone target, where the
   // ticket IS the target.
   const findings = input.findings ?? [];
-  const { result, runsUnderTarget, retired } = await withBeadWriteLocks(
+  const { result, runsUnderTarget, retire } = await withBeadWriteLocks(
     project.repoPath,
     [ticket.id, target.id],
     async () => {
@@ -170,19 +182,34 @@ export async function reworkTicket(
       // died before the reset, and a repeat that reported "already sent back" over a still
       // short-circuiting target would be the very false green this exists to remove. Idempotent — a
       // target whose ref is already gone has nothing left to retire.
-      const retired =
+      const retire: RetireResult =
         pipeline?.outcome === "retired" && applied.runsUnderTarget
           ? await retireFinishedRun(project, target)
-          : false;
-      return { ...applied, retired };
+          : { outcome: "not-attempted" };
+      return { ...applied, retire };
     },
   );
 
   // Fire-and-forget, like every other board write behind a route: the writes already landed locally
   // and the run reads local state, so don't block the response on a slow/unreachable remote. The
   // retire counts as a write of its own — it can land on the repeat that finished a half-applied
-  // send-back, whose mode step wrote nothing.
-  if (result.applied || retired) nudgeSync(project, "rework");
+  // send-back, whose mode step wrote nothing. A raced retire wrote its own record of the race.
+  if (result.applied || retire.outcome === "retired" || retire.outcome === "raced") {
+    nudgeSync(project, "rework");
+  }
+  // The PR stopped being open under the request (see {@link retireFinishedRun}). The instructions
+  // landed; only the retire was refused — and reporting "run it again" over a target whose marker is
+  // still in place would be the false green this whole path exists to remove. So it fails loud, with
+  // the one thing that fixes it: send it back again, and the fresh read decides the mode correctly.
+  if (retire.outcome === "raced") {
+    throw new ReworkConflictError(
+      `${target.id}'s pull request (${retire.pr}) stopped being open (${retire.state}) while this ` +
+        `send-back was applying, so its finished-run marker was left in place rather than cleared ` +
+        `off a PR anton can no longer prove is live. The instructions are on ${result.reworkedId}; ` +
+        `send the ticket back again and anton will re-read the PR — if it merged, the fix runs as ` +
+        `its own target instead.`,
+    );
+  }
   // `retired` is a claim about a write, so it is reported only where that write was the plan. A
   // follow-up that runs as its own target had nothing standing in its way, and saying "run it again"
   // over an untouched target would point the founder at a run that short-circuits.
@@ -260,6 +287,10 @@ function assertNoLiveRun(projectId: string, target: Bead): void {
  *
  * A CLOSED-unmerged ref is left exactly as it is: step 0a already falls through it, and review-fix
  * leaves it on the bead on purpose so a recovery run can find its way back to that PR.
+ *
+ * Read here, before the locks, so a slow `gh` isn't held across every other write to these beads —
+ * and re-read at the write itself ({@link retireFinishedRun}), because a merge landing in between is
+ * the one thing no lock of ours can order.
  */
 async function resolvePipeline(
   repo: string,
@@ -284,36 +315,69 @@ async function resolvePipeline(
 }
 
 /**
+ * What {@link retireFinishedRun} settled. `not-attempted` is the caller's own default for the modes
+ * that never reach it, so one value answers "did anything happen to the target?".
+ */
+type RetireResult =
+  | { outcome: "retired" | "already-retired" | "not-attempted" }
+  /** The PR stopped being open between {@link resolvePipeline} and the writes — nothing was retired. */
+  | { outcome: "raced"; pr: string; state: PullRequestState };
+
+/**
  * Retire the finished run cycle recorded on the target, so its next run executes instead of
  * short-circuiting. Called only when the reworked bead will run under this target — otherwise these
  * writes cost the still-open PR its merge gate and buy nothing. Three writes, each idempotent:
  *
- *   • the PR ref comes OFF (`clearPrRef`) — the marker step 0a reads as "another run already
- *     finished this". The PR itself is untouched and un-notified: the next run pushes to the same
- *     branch and re-stamps this very ref, so the founder keeps one PR and one review thread.
  *   • `stage:in-review` comes off, because the target is going back to implementing — and while it
  *     is on, review-fix's sweep and gate-check's merge finalization both still treat the target as
  *     one theirs to close out.
  *   • a closed target is reopened, or nothing would dispatch it at all.
+ *   • the PR ref comes OFF (`clearPrRef`) — the marker step 0a reads as "another run already
+ *     finished this". The PR itself is untouched and un-notified: the next run pushes to the same
+ *     branch and re-stamps this very ref, so the founder keeps one PR and one review thread.
+ *
+ * That ORDER is the recovery story, not a style choice. The ref is the only marker that brings a
+ * retry back here ({@link resolvePipeline} returns nothing without it), so it is cleared LAST: a
+ * failure part-way leaves the ref in place and the next send-back re-enters and finishes the
+ * remaining writes. Clearing it first — as this did — would strand a target with no ref, no
+ * finalization path (`finalizablePr`, jobs/gate-targets.ts) and a `stage:in-review` label nothing
+ * will ever take off again.
+ *
+ * The state is RE-READ from `gh` here as well, for the one race the bead locks cannot order: the
+ * locks serialize anton's writes, not GitHub's merges, so the PR that was open at
+ * {@link resolvePipeline} may have merged since. Clearing a MERGED PR's ref would un-gate its own
+ * finalization and re-dispatch shipped work, so a state that is no longer `open` retires nothing and
+ * says so — the caller turns that into a 409 the founder can act on.
  *
  * An `anton:` note, not a human one: this is bookkeeping about a PR, and a human note is inlined
  * verbatim into the next implementer's prompt (`humanNotesPromptBlock`) where it would read as a
- * steer. Written only when a ref was actually cleared, so a repeat send-back adds no second line.
- *
- * Returns whether it wrote anything — false on the repeat that finds the cycle already retired.
+ * steer. Written only on a round that actually changed something, so a repeat adds no second line.
  */
-async function retireFinishedRun(project: Project, target: Bead): Promise<boolean> {
+async function retireFinishedRun(project: Project, target: Bead): Promise<RetireResult> {
   const repo = project.repoPath;
   // Re-read under the lock, like the reopen path re-reads its bead: the pre-lock snapshot was taken
   // before a rival request could already have retired this cycle.
   const fresh = await beads.show(repo, target.id);
   const pr = beads.getPrRef(fresh);
-  if (!pr) return false;
-  await beads.clearPrRef(repo, fresh);
+  if (!pr) return { outcome: "already-retired" };
+  const state = await pullRequestState(repo, pr);
+  if (state !== "open") {
+    // Recorded on the target rather than only raised, because the mode's writes have already landed:
+    // a reader looking at a bead sent back to a merged PR needs to see why it wasn't retired.
+    await beads.note(
+      repo,
+      target.id,
+      `anton: rework — ${pr} was open when this send-back was decided but reads as ${state} now, so ` +
+        `the finished-run marker was LEFT in place. Send the ticket back again: anton re-reads the ` +
+        `PR and, if it merged, carries the fix as its own run target instead.`,
+    );
+    return { outcome: "raced", pr, state };
+  }
   await beads.untag(repo, target.id, [LABELS.stage("implementing"), LABELS.stage("in-review")]);
   if (fresh.status === "closed") {
     await beads.reopen(repo, target.id, "rework: sent back for another round");
   }
+  await beads.clearPrRef(repo, fresh);
   await beads.note(
     repo,
     target.id,
@@ -321,7 +385,7 @@ async function retireFinishedRun(project: Project, target: Bead): Promise<boolea
       `runs again. The next run continues on the same branch and updates ${pr} rather than opening ` +
       `a second one.`,
   );
-  return true;
+  return { outcome: "retired" };
 }
 
 /**

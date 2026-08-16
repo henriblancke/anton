@@ -409,6 +409,13 @@ describe("follow-up", () => {
   });
 });
 
+/** When `mock` was called with `id` as its bead argument — for asserting the order of two writes. */
+function orderOfCallOn(mock: ReturnType<typeof vi.fn>, id: string): number {
+  const index = mock.mock.calls.findIndex((c) => c[1] === id);
+  expect(index).toBeGreaterThanOrEqual(0);
+  return mock.mock.invocationCallOrder[index];
+}
+
 describe("pipeline: the target's own pull request (anton-leit)", () => {
   it("reports no pipeline work when nothing stands between the bead and the next run", async () => {
     const result = await reworkTicket(project, "feat", input());
@@ -445,6 +452,20 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
       );
       await reworkTicket(project, "feat", input());
       expect(reopenMock).toHaveBeenCalledWith("/repo", "feat", expect.stringContaining("rework"));
+    });
+
+    it("clears the ref LAST, so a write that fails part-way leaves a retry a way back in", async () => {
+      showMock.mockImplementation(async (_cwd, id) =>
+        makeBead({ id, status: "closed", metadata: id === "feat" ? { pr: "gh-42" } : undefined }),
+      );
+
+      await reworkTicket(project, "feat", input());
+
+      // The ref is the ONLY marker that brings a retry back into the retire (resolvePipeline reads
+      // it), so untag/reopen have to be durable before it goes.
+      const clearedAt = clearPrRefMock.mock.invocationCallOrder[0];
+      expect(orderOfCallOn(untagMock, "feat")).toBeLessThan(clearedAt);
+      expect(orderOfCallOn(reopenMock, "feat")).toBeLessThan(clearedAt);
     });
 
     it("retires nothing twice: a repeat finds the ref already gone", async () => {
@@ -577,6 +598,89 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
       expect(clearPrRefMock).not.toHaveBeenCalled();
       expect(untagMock).not.toHaveBeenCalled();
     });
+  });
+
+  describe("the PR merges under the request", () => {
+    /** Open when the mode was decided, merged by the time the retire is about to write. */
+    function mergesMidFlight(): void {
+      targetWithPr("open");
+      prStateMock.mockReset();
+      prStateMock.mockResolvedValueOnce("open").mockResolvedValue("merged");
+    }
+
+    it("retires nothing — clearing a merged PR's ref would un-gate its own finalization", async () => {
+      mergesMidFlight();
+
+      await expect(reworkTicket(project, "feat", input())).rejects.toBeInstanceOf(
+        ReworkConflictError,
+      );
+
+      expect(clearPrRefMock).not.toHaveBeenCalled();
+      // The target keeps `stage:in-review` too: it is what gate-check finalizes the merge through.
+      expect(untagMock).not.toHaveBeenCalledWith("/repo", "feat", expect.anything());
+    });
+
+    it("records the race on the target — the instructions already landed, so it can't be silent", async () => {
+      mergesMidFlight();
+
+      await expect(reworkTicket(project, "feat", input())).rejects.toThrow(/send the ticket back/i);
+
+      const noted = noteMock.mock.calls.map((c) => [c[1], c[2] as string] as const);
+      expect(noted.find(([id]) => id === "feat")?.[1]).toContain("LEFT in place");
+      // ...and the send-back itself is on the ticket, which is what the retry finds already done.
+      expect(noted.some(([id]) => id === "t1")).toBe(true);
+    });
+
+    it("re-reads the state rather than trusting the pre-lock one", async () => {
+      mergesMidFlight();
+      await expect(reworkTicket(project, "feat", input())).rejects.toBeInstanceOf(
+        ReworkConflictError,
+      );
+      expect(prStateMock).toHaveBeenCalledTimes(2); // once to decide the mode, once to write
+    });
+  });
+
+  it("never asks gh when the follow-up is its own run target either way", async () => {
+    // A standalone task's follow-up comes out parentless whatever its PR did, so an unreachable
+    // `gh` must not 503 a send-back whose answer it cannot change.
+    board(
+      makeBead({
+        id: "solo",
+        title: "Standalone",
+        issue_type: "task",
+        labels: ["approved", "stage:in-review"],
+        metadata: { pr: "gh-42" },
+      }),
+    );
+    prStateMock.mockRejectedValue(new Error("gh is not installed"));
+
+    const result = await reworkTicket(
+      project,
+      "solo",
+      input({ ticketId: "solo", mode: "follow-up" as const, summary: "Harden the retry path" }),
+    );
+
+    expect(prStateMock).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ mode: "follow-up", applied: true });
+    expect(result.pipeline).toBeUndefined();
+    expect(createMock.mock.calls[0][1].deps).toBeUndefined();
+  });
+
+  it("still asks gh for a REOPEN on that same standalone target — its PR decides the mode", async () => {
+    board(
+      makeBead({
+        id: "solo",
+        title: "Standalone",
+        issue_type: "task",
+        labels: ["approved", "stage:in-review"],
+        metadata: { pr: "gh-42" },
+      }),
+    );
+    prStateMock.mockResolvedValue("unknown");
+
+    await expect(
+      reworkTicket(project, "solo", input({ ticketId: "solo" })),
+    ).rejects.toBeInstanceOf(ReworkUnavailableError);
   });
 
   it("leaves a CLOSED-unmerged ref alone — that ref is what a recovery run follows back", async () => {
