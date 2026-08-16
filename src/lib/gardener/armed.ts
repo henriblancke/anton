@@ -90,20 +90,31 @@ export interface ArmedRecord {
   detail: string;
   /**
    * The beads the write actually touched. Empty for a refusal, and for an already-applied board —
-   * but NOT for every failure: a settlement that broke after its steps landed reports what stayed
-   * written (apply.ts `ProposalApplyError.changed`).
+   * but NOT for every failure: both a settlement that broke after its steps landed and a rollback
+   * that could not put every write back report what stayed written (apply.ts
+   * `ProposalApplyError.changed`).
    */
   changed: string[];
 }
 
 /**
- * Did this apply reach the BOARD? Both outcomes that did — the settled write, and the one whose
- * proposal could not be closed over it. Answered once here rather than by each caller re-deriving
- * which outcomes wrote, because getting it wrong is silent: a pass that reasons on `applied` alone
- * carries on against a snapshot the unsettled move has already invalidated.
+ * Did this apply reach the BOARD? Three ways it can have, and the verdict alone names only two of
+ * them: the settled write, the one whose proposal could not be closed over it, and — recorded as the
+ * `error` that promises a rolled-back board — a failure whose ROLLBACK could not put every write back
+ * (apply.ts `stepFailure`). That third is why `changed` is consulted as well as the outcome: an
+ * incomplete rollback leaves beads moved, and reading the verdict alone would carry the pass on
+ * against a snapshot those writes have already invalidated and leave them out of the note that says
+ * what is stranded on this machine.
+ *
+ * As WELL as, never instead of: an `unsettled` over a board that already carried the move writes
+ * nothing (apply.ts `settleUnwritten`), so the failure kind is the only thing that says the ask still
+ * stands over a moved board.
+ *
+ * Answered once here rather than by each caller re-deriving which outcomes wrote, because getting it
+ * wrong is silent.
  */
 export const movedTheBoard = (record: ArmedRecord): boolean =>
-  record.outcome === "applied" || record.outcome === "unsettled";
+  record.outcome === "applied" || record.outcome === "unsettled" || record.changed.length > 0;
 
 export interface ArmedResult {
   records: ArmedRecord[];
@@ -562,7 +573,8 @@ async function applyOne(input: ArmedInput, base: ArmedAsk): Promise<ArmedAttempt
  *
  * `refused`/`unusable` are the board declining — the ordinary outcome for an ask whose premise moved.
  * `failed` is a write that broke and was rolled back, which is anton's failure, not a verdict, and
- * reads as one in the log.
+ * reads as one in the log. When that rollback could not finish, the beads it left moved ride in
+ * `changed` and {@link movedTheBoard} counts the record as a write regardless of this verdict.
  *
  * `unsettled` is the one that is also a board write: the move stands and the ask above it could not be
  * closed (apply.ts `settleProposal`). Taken from the failure KIND rather than from `changed`, because

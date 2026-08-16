@@ -87,10 +87,12 @@ export class ProposalApplyError extends Error {
     readonly failure: ApplyFailure,
     message: string,
     /**
-     * The board writes this failure LEFT STANDING, so a caller can record what actually moved. Only
-     * an `unsettled` failure ever carries any — every other one wrote nothing or rolled back what it
-     * wrote — and even that one is EMPTY when the board already held the move, which is why the
-     * failure KIND, not this list, is what says the ask still stands over a moved board.
+     * The board writes this failure LEFT STANDING, so a caller can record what actually moved. Two
+     * failures carry any: an `unsettled` one, whose steps landed and whose proposal could not be
+     * closed over them, and a `failed` one whose ROLLBACK could not put every write back (see
+     * {@link stepFailure}) — a `refused` wrote nothing at all. Neither list is what says the ask
+     * still stands over a moved board: an `unsettled` over a board that already held the move is
+     * empty, so that is the failure KIND's job.
      */
     readonly changed: string[] = [],
   ) {
@@ -314,6 +316,10 @@ async function applySteps(
  * Roll the applied prefix back and say what the failure WAS. A subject that moved under us is the
  * board refusing, not a bd write breaking — but only while nothing has landed yet. Once a prefix is
  * written the outcome is a partial apply that was rolled back, which is `failed` whatever tripped it.
+ *
+ * "Rolled back" is not always the whole truth, which is why the survivors ride along: an undo the
+ * board would not take leaves those beads moved (apply-steps.ts `rollbackSteps`), and a `failed` that
+ * reported none of them would tell an unattended caller its board is exactly where it left it.
  */
 async function stepFailure(
   repo: string,
@@ -325,7 +331,11 @@ async function stepFailure(
   const stale = e instanceof SubjectMovedError && changed.length === 0;
   return stale
     ? new ProposalApplyError("refused", `cannot apply ${proposalId}: ${messageOf(e)}`)
-    : new ProposalApplyError("failed", `applying ${proposalId} failed: ${messageOf(e)}${rollback}`);
+    : new ProposalApplyError(
+        "failed",
+        `applying ${proposalId} failed: ${messageOf(e)}${rollback.report}`,
+        rollback.survivors,
+      );
 }
 
 /**

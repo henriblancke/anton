@@ -18,6 +18,7 @@ import {
   apply,
   applyWith,
   bead,
+  blockedBy,
   calls,
   CARD,
   child,
@@ -30,7 +31,9 @@ import {
   inReview,
   leased,
   listBoard,
+  listByFlags,
   liveBeads,
+  liveBoard,
   NOW,
   onWrite,
   planFor,
@@ -650,6 +653,30 @@ describe("the product master's moves", () => {
       )) as InstanceType<typeof ProposalApplyError>;
       expect(err.failure).toBe("refused");
       expect(err.message).toMatch(/meets the approve gate again/);
+      expect(calls.filter((c) => !c.startsWith("note anton-p1"))).toEqual([]);
+    });
+
+    // The gate re-derived above is the LAST authorizing read this move makes, and bd keeps gate beads
+    // out of every ordinary listing while carrying the `blocks` edge they put on the bead they gate
+    // (anton-ve2r). A gate listing that failed would leave that edge reading as an open blocker — a
+    // `blocked` approval gap — so a target whose approval was repaired since the snapshot would lose
+    // the label to a partial view of the board. The read is strict for exactly that: it fails closed.
+    it("refuses when the gate listing fails, rather than reading a missing gate as a blocker", async () => {
+      // A dangling blocks edge is what makes `loadAllIssues` reach for the gate listing at all.
+      const board = [degraded(), blockedBy("anton-z", "anton-gate")];
+      listByFlags(async (extra) => {
+        if (extra.includes("gate")) throw new Error("bd list --type gate failed: database is locked");
+        return liveBoard();
+      });
+
+      const err = (await applyWith(proposalFor(UNAPPROVE), board).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("refused");
+      expect(err.message).toMatch(/the board could not be re-read before withdrawing the approval/);
+      expect(err.message).toContain("database is locked");
+      // The ask stays open and the label stays on: a board anton cannot see whole authorises nothing.
       expect(calls.filter((c) => !c.startsWith("note anton-p1"))).toEqual([]);
     });
   });

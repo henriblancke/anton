@@ -63,7 +63,7 @@ vi.mock("./apply", async () => {
   };
 });
 
-const { applyArmedProposals } = await import("./armed");
+const { applyArmedProposals, movedTheBoard } = await import("./armed");
 /** The real class — the mock above spreads the actual module, so `changed` behaves as it ships. */
 const { ProposalApplyError } = await import("./apply");
 
@@ -450,6 +450,67 @@ describe("armed walk · a move that could not be settled", () => {
     const notes = readPassRecords(recorded()).notes.join("\n");
     expect(notes).toContain("APPLY could not publish this pass's board writes");
     expect(notes).toContain("(p-1, p-2)");
+  });
+});
+
+/**
+ * The OTHER failure that is also a board write: a cluster re-parent whose rollback could not put
+ * every step back (apply.ts `stepFailure`, apply-steps.ts `rollbackSteps`).
+ *
+ * It is recorded as `COULD NOT APPLY`, which promises a rolled-back board — correct for the failure
+ * class, and a lie about the beads the undo could not reach. Those are readable only off `changed`,
+ * so a walk that reasoned on the verdict alone would hand the next tier a snapshot the surviving move
+ * already invalidated and leave that move out of the note naming what is stranded on this machine.
+ */
+describe("armed walk · a rollback that could not finish", () => {
+  const running = (): AbortSignal => new AbortController().signal;
+
+  /** apply's answer when a later cluster member failed and an earlier one would not come back. */
+  const halfRolledBack = (subject: string) =>
+    new ProposalApplyError(
+      "failed",
+      `applying p-1 failed: bd reparent exploded — ROLLBACK INCOMPLETE: ${subject} could not be ` +
+        `restored — a human has to settle it`,
+      [subject],
+    );
+
+  it("records the bead the rollback left moved, under the verdict that says the write broke", async () => {
+    applyMock.mockRejectedValueOnce(halfRolledBack("t-1"));
+
+    const result = await walk(filed(2), running());
+
+    expect(result.records[0]).toMatchObject({ outcome: "error", changed: ["t-1"] });
+    expect(movedTheBoard(result.records[0])).toBe(true);
+    expect(recorded()).toContain("— COULD NOT APPLY: applying p-1 failed");
+    expect(recorded()).toContain("ROLLBACK INCOMPLETE");
+  });
+
+  it("names it among the writes stranded on this machine when the publish fails", async () => {
+    applyMock.mockRejectedValueOnce(halfRolledBack("t-1"));
+    pushMock.mockRejectedValue(new Error("bd dolt push failed: conflict in issues"));
+
+    await walk(filed(2), running());
+
+    const notes = readPassRecords(recorded()).notes.join("\n");
+    expect(notes).toContain("APPLY could not publish this pass's board writes");
+    expect(notes).toContain("(p-1, p-2)");
+  });
+
+  it("still reports an untouched board when the rollback DID put everything back", async () => {
+    // The ordinary half-applied cluster: nothing survives the undo, so nothing is owed a publish and
+    // the next tier's snapshot is still good.
+    applyMock.mockRejectedValueOnce(
+      new ProposalApplyError(
+        "failed",
+        "applying p-1 failed: bd reparent exploded — the 1 write(s) already made were rolled " +
+          "back, so the board is unchanged",
+      ),
+    );
+
+    const result = await walk(filed(1), running());
+
+    expect(result.records[0]).toMatchObject({ outcome: "error", changed: [] });
+    expect(movedTheBoard(result.records[0])).toBe(false);
   });
 });
 

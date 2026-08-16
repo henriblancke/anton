@@ -425,9 +425,19 @@ function assertStillDegraded(id: string, board: BoardIndex): ApprovalGap[] {
  * here treats a failed read as a refusal. On such a bd a sound approval would refuse forever;
  * `loadAllIssues` falls back to merging the open and closed listings instead. Callers phrase their
  * own refusal for the read that genuinely fails.
+ *
+ * GATE-COMPLETE, for the reason the armed pass's own pre-apply read is (gardener/armed.ts
+ * `readBoardForApply`) — and this is the read that comes AFTER it, under the locks, with nothing
+ * between it and the write. bd omits gate beads from every ordinary listing while carrying the
+ * `blocks` edge a gate puts on the bead it gates, and every blocker helper reads a blocker absent
+ * from the list as still open (epic-graph.ts). Degrading is right for a page render and wrong here:
+ * a gate listing that fails leaves an approved target's own `gh:pr` merge gate reading as a real
+ * blocker, which is a `blocked` approval gap — so {@link assertStillDegraded} would find gaps that
+ * were repaired and strip the `approved` label off sound work, unattended. Failing the read closed
+ * costs nothing extra, because every caller here already refuses on a read it could not make.
  */
 export function readWholeBoard(repo: string): Promise<Bead[]> {
-  return loadAllIssues(repo);
+  return loadAllIssues(repo, { strictGates: true });
 }
 
 /** A bead read from inside its own write lock. A read that FAILED is never a bead that vanished. */
@@ -619,21 +629,44 @@ interface RollbackOutcome {
   overtaken: string[];
 }
 
+/** What a rollback left behind: the clause the failure reports, and the beads it did not put back. */
+export interface RollbackResult {
+  /** The clause the apply failure ends on. */
+  report: string;
+  /**
+   * Every bead this rollback left somewhere other than where the apply found it — stranded, adopted,
+   * or overtaken. Carried as data as well as prose because the failure that ends here is reported as
+   * `failed`, the one verdict that promises an unchanged board: a caller reading the verdict alone
+   * would tell a founder nothing moved over beads this checkout has moved and cannot un-move, and
+   * would go on reasoning against a snapshot those writes already invalidated (gardener/armed.ts
+   * `movedTheBoard`). `overtaken` counts for the same reason the other two do — our write landed
+   * locally, and another one landing on top of it does not put the bead back.
+   */
+  survivors: string[];
+}
+
 /**
- * Undo the steps that DID land when a later one failed, newest first, and report the outcome as a
- * clause for the error. Only a cluster re-parent is ever multi-step, so this is the one shape that
- * can strand a half-applied move; every other move fails with nothing written.
+ * Undo the steps that DID land when a later one failed, newest first, and report the outcome — as a
+ * clause for the error, and as the beads that stayed moved. Only a cluster re-parent is ever
+ * multi-step, so this is the one shape that can strand a half-applied move; every other move fails
+ * with nothing written.
  *
  * A rollback that itself fails is named in the error rather than swallowed: the board is then in a
  * state a human has to look at, and saying so is the whole point of failing loud.
  */
-export async function rollbackSteps(repo: string, applied: ApplyStep[]): Promise<string> {
-  if (applied.length === 0) return " — nothing had been written";
+export async function rollbackSteps(
+  repo: string,
+  applied: ApplyStep[],
+): Promise<RollbackResult> {
+  if (applied.length === 0) return { report: " — nothing had been written", survivors: [] };
   const outcome: RollbackOutcome = { stranded: [], adopted: [], overtaken: [] };
   for (const step of [...applied].reverse()) {
     await rollbackStep(repo, step, outcome);
   }
-  return rollbackReport(applied.length, outcome);
+  return {
+    report: rollbackReport(applied.length, outcome),
+    survivors: [...outcome.stranded, ...outcome.adopted, ...outcome.overtaken],
+  };
 }
 
 /**
