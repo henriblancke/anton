@@ -220,13 +220,14 @@ describe("the automation rows", () => {
     expect(screen.getAllByText("never").length).toBe(AUTOMATIONS.length - 1);
   });
 
+  // unstick acts on run-health's findings. With the producer off it is not broken, it is idle —
+  // and without saying so the row reads as a failure.
   it("says which automations are idle because the one that feeds them is off", () => {
-    // unstick acts on run-health's findings. With the producer off it is not broken, it is idle —
-    // and without saying so the row reads as a failure.
     renderTable({ "run-health": { enabled: false } });
     expect(screen.getByText(/idle until run-health is on/)).toBeTruthy();
+  });
 
-    cleanup();
+  it("says which automations are fed once the one that feeds them is on", () => {
     renderTable({ "run-health": { enabled: true } });
     expect(screen.getByText(/fed by run-health/)).toBeTruthy();
   });
