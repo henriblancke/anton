@@ -22,7 +22,9 @@ type CreateOpts = {
 };
 const createMock = vi.fn<(cwd: string, opts: CreateOpts) => Promise<string>>();
 const linkMock = vi.fn();
+const clearPrRefMock = vi.fn();
 const runIsLiveMock = vi.fn<(projectId: string, targetId: string) => boolean>();
+const prStateMock = vi.fn<(repo: string, ref: string) => Promise<string>>();
 
 vi.mock("./beads/bd", async () => {
   const actual = await vi.importActual<typeof import("./beads/bd")>("./beads/bd");
@@ -37,12 +39,17 @@ vi.mock("./beads/bd", async () => {
       untag: (...args: unknown[]) => untagMock(...args),
       create: (...args: unknown[]) => createMock(...(args as [string, CreateOpts])),
       link: (...args: unknown[]) => linkMock(...args),
+      clearPrRef: (...args: unknown[]) => clearPrRefMock(...args),
     },
   };
 });
 
 vi.mock("./jobs/service", () => ({
   runIsLiveForTarget: (...args: [string, string]) => runIsLiveMock(...args),
+}));
+
+vi.mock("./git/ops", () => ({
+  pullRequestState: (...args: [string, string]) => prStateMock(...args),
 }));
 
 vi.mock("./beads/sync-nudge", () => ({ nudgeSync: vi.fn() }));
@@ -56,6 +63,7 @@ const {
   ReworkInvalidError,
   ReworkNotAllowedError,
   ReworkNotFoundError,
+  ReworkUnavailableError,
 } = await import("./rework");
 
 const project: Project = {
@@ -91,8 +99,24 @@ beforeEach(() => {
   runIsLiveMock.mockReturnValue(false);
   createMock.mockResolvedValue("anton-new");
   showMock.mockImplementation(async (_cwd, id) => makeBead({ id, status: "closed" }));
+  // No PR on the target unless a case puts one there, so `pullRequestState` is never consulted.
+  prStateMock.mockResolvedValue("unknown");
   board(feature(), ticketA(), ticketB());
 });
+
+/**
+ * A board whose feature target carries a PR ref, plus what `gh` reports that PR's state to be. The
+ * ref is on the `show` read too — the retire re-reads the target under the lock and decides there.
+ */
+function targetWithPr(state: "open" | "merged" | "closed" | "unknown", ref = "gh-42"): void {
+  board(makeBead({ id: "feat", issue_type: "feature", metadata: { pr: ref } }), ticketA(), ticketB());
+  showMock.mockImplementation(async (_cwd, id) =>
+    id === "feat"
+      ? makeBead({ id, issue_type: "feature", status: "open", metadata: { pr: ref } })
+      : makeBead({ id, status: "closed" }),
+  );
+  prStateMock.mockResolvedValue(state);
+}
 
 describe("validation", () => {
   it("refuses an empty summary or empty instructions", async () => {
@@ -385,18 +409,98 @@ describe("follow-up", () => {
   });
 });
 
-describe("pipeline warning", () => {
-  it("says so when an open PR will make the target's next run short-circuit", async () => {
-    board(
-      makeBead({ id: "feat", issue_type: "feature", metadata: { pr: "gh-42" } }),
-      ticketA(),
-    );
+describe("pipeline: the target's own pull request (anton-leit)", () => {
+  it("reports no pipeline work when nothing stands between the bead and the next run", async () => {
     const result = await reworkTicket(project, "feat", input());
-    expect(result.warning).toContain("gh-42");
+    expect(result.pipeline).toBeUndefined();
+    expect(prStateMock).not.toHaveBeenCalled();
+    expect(clearPrRefMock).not.toHaveBeenCalled();
   });
 
-  it("stays silent when nothing stands between the bead and the next run", async () => {
+  describe("PR still open", () => {
+    beforeEach(() => targetWithPr("open"));
+
+    it("retires the target's finished-run marker, so its next run executes instead of short-circuiting", async () => {
+      const result = await reworkTicket(project, "feat", input());
+
+      expect(result.pipeline).toEqual({ outcome: "retired", pr: "gh-42", redirected: false });
+      // The PR ref is what execute-epic step 0a reads as "another run already finished this".
+      expect(clearPrRefMock).toHaveBeenCalledWith("/repo", expect.objectContaining({ id: "feat" }));
+      // ...and in-review is what keeps review-fix/gate-check treating it as theirs to close out.
+      expect(untagMock).toHaveBeenCalledWith("/repo", "feat", [
+        "stage:implementing",
+        "stage:in-review",
+      ]);
+    });
+
+    it("leaves the requested mode alone — the branch and the PR are still there to run onto", async () => {
+      const result = await reworkTicket(project, "feat", input());
+      expect(result).toMatchObject({ mode: "reopen", reworkedId: "t1" });
+      expect(createMock).not.toHaveBeenCalled();
+    });
+
+    it("reopens a target that is closed, or nothing would dispatch the ticket at all", async () => {
+      showMock.mockImplementation(async (_cwd, id) =>
+        makeBead({ id, status: "closed", metadata: id === "feat" ? { pr: "gh-42" } : undefined }),
+      );
+      await reworkTicket(project, "feat", input());
+      expect(reopenMock).toHaveBeenCalledWith("/repo", "feat", expect.stringContaining("rework"));
+    });
+
+    it("retires nothing twice: a repeat finds the ref already gone", async () => {
+      // The re-read under the lock is what decides, so a target already retired writes nothing more.
+      showMock.mockImplementation(async (_cwd, id) => makeBead({ id, status: "open" }));
+      await reworkTicket(project, "feat", input());
+      expect(clearPrRefMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("PR merged", () => {
+    beforeEach(() => targetWithPr("merged"));
+
+    it("redirects a reopen into a follow-up run target — merged work can't be un-shipped", async () => {
+      const result = await reworkTicket(project, "feat", input());
+
+      expect(result).toMatchObject({ mode: "follow-up", reworkedId: "anton-new", applied: true });
+      expect(result.pipeline).toEqual({ outcome: "shipped", pr: "gh-42", redirected: true });
+      expect(reopenMock).not.toHaveBeenCalled();
+    });
+
+    it("creates the follow-up PARENTLESS even under a board card — the merged target has no run left", async () => {
+      await reworkTicket(project, "feat", input({ mode: "follow-up" as const }));
+      const opts = createMock.mock.calls[0][1];
+      expect(opts.deps).toBeUndefined();
+      expect(opts.description).toContain("its own run target");
+    });
+
+    it("says on both beads why the fix moved rather than reopening shipped work", async () => {
+      await reworkTicket(project, "feat", input());
+      const noted = noteMock.mock.calls.map((c) => [c[1], c[2] as string] as const);
+      expect(noted.find(([id]) => id === "anton-new")?.[1]).toContain("has already merged");
+      expect(noted.find(([id]) => id === "t1")?.[1]).toContain("acceptance unmet");
+    });
+
+    it("leaves the merged target exactly as it shipped — ref, status and stage labels intact", async () => {
+      await reworkTicket(project, "feat", input());
+      expect(clearPrRefMock).not.toHaveBeenCalled();
+      expect(untagMock).not.toHaveBeenCalled();
+    });
+  });
+
+  it("leaves a CLOSED-unmerged ref alone — that ref is what a recovery run follows back", async () => {
+    targetWithPr("closed");
     const result = await reworkTicket(project, "feat", input());
-    expect(result.warning).toBeUndefined();
+    expect(result.pipeline).toBeUndefined();
+    expect(clearPrRefMock).not.toHaveBeenCalled();
+    expect(result.mode).toBe("reopen");
+  });
+
+  it("refuses rather than guesses when the PR state can't be read, writing nothing", async () => {
+    targetWithPr("unknown");
+    await expect(reworkTicket(project, "feat", input())).rejects.toBeInstanceOf(
+      ReworkUnavailableError,
+    );
+    expect(noteMock).not.toHaveBeenCalled();
+    expect(createMock).not.toHaveBeenCalled();
   });
 });

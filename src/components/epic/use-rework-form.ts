@@ -10,6 +10,7 @@ import {
   reworkCandidates,
   reworkOutcomeMessage,
   reworkPayload,
+  reworkPipelineMessage,
   toggleKey,
   type ReworkDraft,
   type ReworkPayload,
@@ -137,9 +138,12 @@ function useReworkSubmit(slug: string, targetId: string, onDone: (result: Rework
     setSubmitting(true);
     try {
       const result = await postRework(slug, targetId, payload);
+      // The pipeline line is the founder's only notice that the target's PR changed what runs next,
+      // so it rides along as the toast's description rather than being left to the bead notes.
+      const pipeline = reworkPipelineMessage(result);
       toast.success(
         reworkOutcomeMessage(result),
-        result.warning ? { description: result.warning } : undefined,
+        pipeline ? { description: pipeline, duration: 10_000 } : undefined,
       );
       onDone(result);
     } catch (err) {

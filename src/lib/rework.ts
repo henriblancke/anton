@@ -18,13 +18,17 @@
  * Both paths land the instructions as a HUMAN note, because that is the channel the dispatch prompt
  * already reads (`humanNotesPromptBlock`, lib/jobs/step-registry.ts) — so the implementer that picks
  * the bead up next is shown the steer without a new prompt seam.
+ *
+ * Neither path means anything unless the target can RUN again, which is what the target's own pull
+ * request decides (anton-leit) — see {@link resolvePipeline}.
  */
 import { beads, LABELS, type Bead } from "./beads/bd";
-import { withBeadWriteLock } from "./beads/claim-lock";
+import { withBeadWriteLocks } from "./beads/claim-lock";
 import { ACCEPTANCE_HEADING } from "./beads/contract";
 import { refreshAllIssues } from "./beads/issues";
 import { formatHumanNote, parseTicketNotes } from "./beads/notes";
 import { nudgeSync } from "./beads/sync-nudge";
+import { pullRequestState } from "./git/ops";
 import { runIsLiveForTarget } from "./jobs/service";
 import type { ReviewFinding } from "./jobs/review-context";
 import { resolveOperator } from "./operator";
@@ -34,6 +38,7 @@ import {
   MAX_REWORK_SUMMARY_CHARS,
   type Project,
   type ReworkMode,
+  type ReworkPipeline,
   type ReworkResult,
 } from "./types";
 
@@ -63,6 +68,13 @@ export class ReworkConflictError extends Error {}
 export class ReworkNotFoundError extends Error {}
 
 /**
+ * The target's PR state can't be read, so how to send this back can't be decided (503). Whether that
+ * PR merged is the difference between re-running the target and opening the work as its own target,
+ * and guessing either way strands the send-back — so it fails loud instead.
+ */
+export class ReworkUnavailableError extends Error {}
+
+/**
  * Labels a follow-up inherits from the ticket it came from. Routing, not state: `agent:` decides
  * which specialist the run dispatches (and which the agent gate checks), and the rest are the
  * shaping metadata the board filters and sorts on. Everything else is deliberately NOT copied —
@@ -76,9 +88,9 @@ const INHERITED_LABEL_PREFIXES = ["agent:", "domain:", "risk:", "size:", "area:"
  *
  * Idempotent by construction rather than by token: a repeat of the same request finds its own note
  * already on a bead already in the state it wanted (reopen) or its own follow-up already linked
- * (follow-up) and writes nothing, so a double-click leaves one note and one bead. The check and the
- * write are serialized on the ticket's own write lock, which is what makes that hold for two
- * requests in flight at once.
+ * (follow-up) and writes nothing, so a double-click leaves one note and one bead. Every check and
+ * its write are serialized on the ticket's AND the target's write locks, which is what makes that
+ * hold for two requests in flight at once.
  */
 export async function reworkTicket(
   project: Project,
@@ -133,17 +145,39 @@ export async function reworkTicket(
   // reach) and the cross-machine run-lease on the target (the only evidence another host is on it).
   assertNoLiveRun(project.id, target);
 
-  const result = await withBeadWriteLock(project.repoPath, ticket.id, () =>
-    input.mode === "reopen"
-      ? applyReopen(project, target, ticket, summary, instructions, input.findings ?? [])
-      : applyFollowUp(project, target, ticket, summary, instructions, input.findings ?? []),
+  // What the target's own pull request allows, decided BEFORE any write: it can override the mode.
+  const pipeline = await resolvePipeline(project.repoPath, target, input.mode);
+  const mode = pipeline?.redirected ? "follow-up" : input.mode;
+
+  // Both beads' write locks, taken together in sorted order (withBeadWriteLocks): the mode's writes
+  // land on the ticket while the pipeline reset below lands on the TARGET, and the reset is only
+  // correct against a target nothing else is moving. Deduped for a standalone target, where the
+  // ticket IS the target.
+  const findings = input.findings ?? [];
+  const { result, retired } = await withBeadWriteLocks(
+    project.repoPath,
+    [ticket.id, target.id],
+    async () => {
+      const applied =
+        mode === "reopen"
+          ? await applyReopen(project, target, ticket, summary, instructions, findings)
+          : await applyFollowUp(project, target, ticket, summary, instructions, findings, pipeline);
+      // Attempted even on a no-op double submit: the first request may have written the note and
+      // died before the reset, and a repeat that reported "already sent back" over a still
+      // short-circuiting target would be the very false green this exists to remove. Idempotent — a
+      // target whose ref is already gone has nothing left to retire.
+      const retired =
+        pipeline?.outcome === "retired" ? await retireFinishedRun(project, target) : false;
+      return { result: applied, retired };
+    },
   );
 
   // Fire-and-forget, like every other board write behind a route: the writes already landed locally
-  // and the run reads local state, so don't block the response on a slow/unreachable remote.
-  if (result.applied) nudgeSync(project, "rework");
-  const warning = pipelineWarning(target);
-  return { ...result, ...(warning ? { warning } : {}) };
+  // and the run reads local state, so don't block the response on a slow/unreachable remote. The
+  // retire counts as a write of its own — it can land on the repeat that finished a half-applied
+  // send-back, whose mode step wrote nothing.
+  if (result.applied || retired) nudgeSync(project, "rework");
+  return { ...result, ...(pipeline ? { pipeline } : {}) };
 }
 
 /**
@@ -180,18 +214,89 @@ function assertNoLiveRun(projectId: string, target: Bead): void {
 }
 
 /**
- * Why the reworked bead will sit idle despite being open, when it will. A run target whose PR is
- * already open finishes as complete on its next attempt (execute-epic step 0a short-circuits on a
- * live PR ref), so the bead would wait for a PR nobody told the founder about. Say so rather than
- * promise a pickup that can't happen.
+ * Give the send-back a run path back past the target's own pull request (anton-leit).
+ *
+ * execute-epic's step 0a finishes an attempt as already-complete the moment the target carries a PR
+ * ref whose PR is LIVE — open or merged. That is right for a resume and fatal for a rework: without
+ * this, the reopened (or newly parented) bead sits open forever behind a PR nobody is going to
+ * re-open it for. The two live states need opposite answers, so the state is READ, never assumed:
+ *
+ *   • OPEN — the work is on the branch and the PR is still the founder's merge gate. Retire the
+ *     target's finished-run marker ({@link retireFinishedRun}) and let it run again on that same
+ *     branch: the closed siblings' commits are right there, so they stay skipped, and the PR step
+ *     REUSES the open PR (openPullRequest) and refreshes its body with the new round.
+ *   • MERGED — the work is on the base branch, so there is nothing to re-run: a fresh worktree
+ *     branches off a base that already contains it, and a squash-merge leaves none of the tickets'
+ *     `<id>:` commit subjects behind — so execute-epic's commit-presence check would read every
+ *     closed sibling as missing and re-dispatch already-shipped work. Merged work can't be
+ *     un-shipped, so the send-back becomes its OWN run target instead (a parentless follow-up),
+ *     which runs on its own branch and opens its own PR. A requested `reopen` is REDIRECTED there —
+ *     reported, not silent — because reopening a bead whose work merged promises a run that can only
+ *     go wrong.
+ *
+ * A CLOSED-unmerged ref is left exactly as it is: step 0a already falls through it, and review-fix
+ * leaves it on the bead on purpose so a recovery run can find its way back to that PR.
  */
-function pipelineWarning(target: Bead): string | undefined {
+async function resolvePipeline(
+  repo: string,
+  target: Bead,
+  mode: ReworkMode,
+): Promise<ReworkPipeline | undefined> {
   const pr = beads.getPrRef(target);
   if (!pr) return undefined;
-  return (
-    `${target.id} still has an open pull request (${pr}) — its next run finishes as already-complete ` +
-    `while that PR is live, so merge or close it before re-running the target`
+  const state = await pullRequestState(repo, pr);
+  // Unknown is proof of nothing, and the two live states are handled oppositely — so refuse rather
+  // than pick one. Same judgement execute-epic makes at step 0a, where an unreadable ref retries.
+  if (state === "unknown") {
+    throw new ReworkUnavailableError(
+      `anton can't read the state of ${target.id}'s pull request (${pr}) — whether it merged decides ` +
+        `whether this ticket re-runs on the target or comes back as its own, so it won't guess; ` +
+        `check that \`gh\` is installed and authenticated, then send it back again`,
+    );
+  }
+  if (state === "merged") return { outcome: "shipped", pr, redirected: mode === "reopen" };
+  if (state === "open") return { outcome: "retired", pr, redirected: false };
+  return undefined;
+}
+
+/**
+ * Retire the finished run cycle recorded on the target, so its next run executes instead of
+ * short-circuiting. Three writes, each idempotent:
+ *
+ *   • the PR ref comes OFF (`clearPrRef`) — the marker step 0a reads as "another run already
+ *     finished this". The PR itself is untouched and un-notified: the next run pushes to the same
+ *     branch and re-stamps this very ref, so the founder keeps one PR and one review thread.
+ *   • `stage:in-review` comes off, because the target is going back to implementing — and while it
+ *     is on, review-fix's sweep and gate-check's merge finalization both still treat the target as
+ *     one theirs to close out.
+ *   • a closed target is reopened, or nothing would dispatch it at all.
+ *
+ * An `anton:` note, not a human one: this is bookkeeping about a PR, and a human note is inlined
+ * verbatim into the next implementer's prompt (`humanNotesPromptBlock`) where it would read as a
+ * steer. Written only when a ref was actually cleared, so a repeat send-back adds no second line.
+ *
+ * Returns whether it wrote anything — false on the repeat that finds the cycle already retired.
+ */
+async function retireFinishedRun(project: Project, target: Bead): Promise<boolean> {
+  const repo = project.repoPath;
+  // Re-read under the lock, like the reopen path re-reads its bead: the pre-lock snapshot was taken
+  // before a rival request could already have retired this cycle.
+  const fresh = await beads.show(repo, target.id);
+  const pr = beads.getPrRef(fresh);
+  if (!pr) return false;
+  await beads.clearPrRef(repo, fresh);
+  await beads.untag(repo, target.id, [LABELS.stage("implementing"), LABELS.stage("in-review")]);
+  if (fresh.status === "closed") {
+    await beads.reopen(repo, target.id, "rework: sent back for another round");
+  }
+  await beads.note(
+    repo,
+    target.id,
+    `anton: rework — ${pr} is still open, so this target's finished-run marker was cleared and it ` +
+      `runs again. The next run continues on the same branch and updates ${pr} rather than opening ` +
+      `a second one.`,
   );
+  return true;
 }
 
 /**
@@ -248,6 +353,10 @@ async function applyReopen(
  * Under a standalone task/bug it would become a ticket of NO run — `boardCards` only cards epics and
  * features, so nothing would ever dispatch it — so there it is created parentless, which makes it a
  * run target in its own right, claimable and approvable like any other standalone item.
+ *
+ * A SHIPPED target (its PR merged, {@link resolvePipeline}) is parented nowhere for a second reason:
+ * its next run has nothing left to execute, so a child of it would never be dispatched either. The
+ * follow-up carries the work as a run target of its own.
  */
 async function applyFollowUp(
   project: Project,
@@ -256,9 +365,11 @@ async function applyFollowUp(
   summary: string,
   instructions: string,
   findings: ReviewFinding[],
+  pipeline?: ReworkPipeline,
 ): Promise<ReworkResult> {
   const repo = project.repoPath;
   const author = await resolveAuthor();
+  const shipped = pipeline?.outcome === "shipped";
   const body = reworkNoteBody({
     mode: "follow-up",
     targetId: target.id,
@@ -266,6 +377,7 @@ async function applyFollowUp(
     instructions,
     findings,
     originId: ticket.id,
+    redirected: pipeline?.redirected ?? false,
   });
 
   // Re-read the board UNDER the lock, like the reopen path re-reads the bead: the pre-lock snapshot
@@ -283,11 +395,17 @@ async function applyFollowUp(
     };
   }
 
-  const parentId = isBoardCard(target, all) ? target.id : undefined;
+  const parentId = !shipped && isBoardCard(target, all) ? target.id : undefined;
   const followUpId = await beads.create(repo, {
     title: summary,
     type: "task",
-    description: followUpDescription({ summary, ticket, targetId: target.id, parentId }),
+    description: followUpDescription({
+      summary,
+      ticket,
+      targetId: target.id,
+      parentId,
+      pipeline,
+    }),
     labels: inheritedLabels(ticket),
     ...(parentId ? { deps: [`parent-child:${parentId}`] } : {}),
   });
@@ -296,13 +414,20 @@ async function applyFollowUp(
   // see and link, rather than an instruction on a bead nothing points at.
   await beads.link(repo, followUpId, ticket.id, "discovered-from");
   await beads.note(repo, followUpId, formatHumanNote(body, author, new Date()), author || undefined);
-  // The original keeps its score and its status; all it gains is a pointer to what its review produced.
+  // The original keeps its score and its status; all it gains is a pointer to what its review
+  // produced. A REDIRECTED send-back says something different on purpose — the founder judged the
+  // acceptance unmet, and this bead is closed only because its work merged, so claiming it stands
+  // would put words in their mouth.
   await beads.note(
     repo,
     ticket.id,
     formatHumanNote(
-      `Follow-up ${followUpId} was opened from this ticket's review — its acceptance stands; the ` +
-        `next iteration is tracked there.`,
+      pipeline?.redirected
+        ? `Follow-up ${followUpId} was opened from this ticket's review — the founder judged its ` +
+          `acceptance unmet, but ${pipeline.pr} had already merged, so the fix runs there as its ` +
+          `own target rather than reopening work that has shipped.`
+        : `Follow-up ${followUpId} was opened from this ticket's review — its acceptance stands; the ` +
+          `next iteration is tracked there.`,
       author,
       new Date(),
     ),
@@ -366,9 +491,13 @@ export function reworkNoteBody(args: {
   findings: ReviewFinding[];
   /** For a follow-up: the ticket this bead was discovered from. */
   originId?: string;
+  /** A reopen the merged target redirected into a follow-up ({@link ReworkPipeline}). */
+  redirected?: boolean;
 }): string {
-  const head =
-    args.mode === "reopen"
+  const head = args.redirected
+    ? `Rework — acceptance not met on ${args.originId}, but ${args.targetId} has already merged, so ` +
+      `the fix runs here rather than reopening shipped work: ${args.summary}`
+    : args.mode === "reopen"
       ? `Rework — acceptance not met. Sent back from ${args.targetId}'s self-review: ${args.summary}`
       : `Follow-up on ${args.originId} — its acceptance stands; ${args.targetId}'s self-review ` +
         `prompted another pass: ${args.summary}`;
@@ -400,8 +529,17 @@ function followUpDescription(args: {
   ticket: Bead;
   targetId: string;
   parentId?: string;
+  pipeline?: ReworkPipeline;
 }): string {
-  const { summary, ticket, targetId, parentId } = args;
+  const { summary, ticket, targetId, parentId, pipeline } = args;
+  const provenance = pipeline?.redirected
+    ? `Discovered from ${ticket.id} — ${ticket.title}. The founder judged its acceptance unmet, but ` +
+      `${targetId}'s pull request (${pipeline.pr}) had already merged, so this bead carries the fix ` +
+      `instead of reopening work that has shipped. The founder's instructions and the findings they ` +
+      `selected are the human note on this bead.`
+    : `Discovered from ${ticket.id} — ${ticket.title}. That ticket's acceptance was met and it keeps ` +
+      `its review score; this bead carries the next iteration ${targetId}'s self-review prompted. ` +
+      `The founder's instructions and the findings they selected are the human note on this bead.`;
   return [
     `## Goal`,
     summary,
@@ -411,9 +549,7 @@ function followUpDescription(args: {
     `- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply`,
     ``,
     `## Context`,
-    `Discovered from ${ticket.id} — ${ticket.title}. That ticket's acceptance was met and it keeps ` +
-      `its review score; this bead carries the next iteration ${targetId}'s self-review prompted. ` +
-      `The founder's instructions and the findings they selected are the human note on this bead.`,
+    provenance,
     parentId
       ? `It runs as a ticket of ${parentId}, in that target's next run.`
       : `It is its own run target — approve it to run.`,

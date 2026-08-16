@@ -77,3 +77,25 @@ export function reworkOutcomeMessage(result: ReworkResult): string {
     ? `${result.ticketId} reopened with instructions`
     : `Follow-up ${result.reworkedId} created from ${result.ticketId}`;
 }
+
+/**
+ * What happened to the target's pull request, and therefore what runs next (anton-leit). This is
+ * the half of the outcome the founder cannot infer from the bead: a send-back on a target whose PR
+ * is live has no run path back until anton makes one, so what it made is said out loud. Undefined
+ * when there was no PR in the way — the ordinary case needs no explanation.
+ */
+export function reworkPipelineMessage(result: ReworkResult): string | undefined {
+  const pipeline = result.pipeline;
+  if (!pipeline) return undefined;
+  if (pipeline.outcome === "retired") {
+    return (
+      `${pipeline.pr} is still open, so this target's finished-run marker was cleared — run it again ` +
+      `and the next round pushes to the same branch and updates that PR.`
+    );
+  }
+  return (
+    `${pipeline.pr} has already merged, so that work can't be reopened` +
+    (pipeline.redirected ? " despite the acceptance being unmet" : "") +
+    `. ${result.reworkedId} carries the next pass as its own run target — approve it to run.`
+  );
+}

@@ -2266,6 +2266,23 @@ export const beads = {
   },
 
   /**
+   * Drop a bead's PR pointer (anton-leit) — the inverse of {@link setPrRef}, through the same seam.
+   *
+   * Both channels are cleared, because {@link getPrRef} reads both: unsetting `metadata.pr` alone
+   * would leave a legacy `gh-*` external_ref readable and the bead would still look in-review. A
+   * NON-`gh-` external_ref (a tracker URL) is left untouched for the same reason getPrRef ignores it.
+   * Takes the bead rather than an id because that decision is a property of its current state.
+   */
+  clearPrRef: (cwd: string, bead: Bead) =>
+    bdWrite(cwd, [
+      "update",
+      bead.id,
+      "--unset-metadata",
+      "pr",
+      ...(bead.external_ref && GH_PR_REF.test(bead.external_ref) ? ["--external-ref", ""] : []),
+    ]),
+
+  /**
    * One-time cutover primitive (anton-ftar): move a legacy `gh-*` external_ref onto `metadata.pr`
    * and clear external_ref in a SINGLE atomic `bd update` — no partial state to recover from. Only
    * ever called for gh- shaped refs (see planPrRefMigration), so a tracker URL in external_ref is
