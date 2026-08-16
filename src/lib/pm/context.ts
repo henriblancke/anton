@@ -186,8 +186,12 @@ export interface PmBoardInput {
  *
  * The pass runs unattended on a cron, so a board read it skips or truncates costs a proposal made
  * about half a board. It is also deliberately the ONLY board the session sees: it has no `bd`, which
- * is what makes "this pass never writes to the board" a property of the session rather than a promise
- * in a prompt.
+ * is what makes "this session never writes to the board" a property of the session rather than a
+ * promise in a prompt.
+ *
+ * That promise covers the SESSION and not the pass around it. The judgment reaches no board; the pass
+ * that carries its answer files what it proposed and applies the kinds an operator armed at `apply`
+ * (gardener/armed.ts) — so "it only proposes" is true here and false one level up.
  */
 export function formatPmBoardContext(input: PmBoardInput): string {
   const index = indexBoard(input.board);

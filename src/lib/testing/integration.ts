@@ -160,6 +160,36 @@ export function removeTempRepo(dir: string, rm: typeof rmSync = rmSync): void {
   }
 }
 
+// ── bd's one-second stamp grid ──
+
+/**
+ * The moment every bd write made up to `nowMs` is stamped STRICTLY BELOW — `round(nowMs) + 1.05s`.
+ *
+ * bd ROUNDS write stamps to whole seconds rather than truncating, so a write landing at `S.6` is
+ * stamped `S+1` — a second AHEAD of the clock it landed on. Clearing the next boundary is therefore
+ * not enough: the target is taken from `round(nowMs)`, the highest stamp a completed write can
+ * already hold, plus a full second and a hair of slack.
+ *
+ * Exported separately from {@link nextBdSecond} so the arithmetic is testable without sleeping.
+ */
+export function settledAfterBdWrites(nowMs: number): number {
+  return Math.round(nowMs / 1_000) * 1_000 + 1_050;
+}
+
+/**
+ * Wait until every bd write already made can be ORDERED against what happens next.
+ *
+ * Anything comparing two bd stamps at one-second resolution reads an equal pair as unorderable and
+ * fails closed — a subject written in the same second a patrol read the board cannot be shown to
+ * predate that read, so the gardener's evidence fence refuses the move (apply-plan.ts
+ * `writtenSinceFiling`). Real passes judge writes made hours earlier; only a fixture is fast enough
+ * to collide, so the wait belongs in the fixtures — not in a looser rule.
+ */
+export function nextBdSecond(): Promise<void> {
+  const target = settledAfterBdWrites(Date.now());
+  return new Promise((resolve) => setTimeout(resolve, target - Date.now()));
+}
+
 // ── temp file-backed anton.db ──
 
 export interface FileDb {

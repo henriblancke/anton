@@ -29,6 +29,7 @@ import {
   type RetireVerb,
 } from "./detections";
 import type { EmittedProposal } from "./emit";
+import { passRecordLine, type ShadowVerdict } from "./record";
 
 /** What the shadow decided for one proposal — `error` is anton failing to decide, never a verdict. */
 export type ShadowOutcome = "apply" | "settled" | "refuse" | "error";
@@ -73,11 +74,9 @@ export interface ShadowInput {
  * The proposals this policy would shadow — the manual-move floor already applied by `autonomyFor`.
  *
  * `apply` is deliberately NOT shadowed: an armed kind is meant to be written, not described, so
- * routing it here would report a move as hypothetical that the pass is trusted to make. The armed
- * path does not exist yet (anton-lmps ships the shadow half), so until it does, a kind set to
- * `apply` — reachable only by a direct settings API call, since the UI offers the radio disabled —
- * behaves as `propose`. That is the safe direction to be wrong in: it files the ask and writes
- * nothing.
+ * routing it here would report a move as hypothetical that the pass is about to make for real. That
+ * branch is armed.ts's (anton-4ab3), and the two levels are disjoint by construction — a kind
+ * resolves to exactly one of them, so no proposal is ever both described and applied.
  */
 function shadowable(
   created: EmittedProposal[],
@@ -157,7 +156,8 @@ function decide(
   }
 }
 
-const VERDICT: Record<ShadowOutcome, string> = {
+/** Typed through record.ts's vocabulary, so a reworded verdict is a type error, not a silent one. */
+const VERDICT: Record<ShadowOutcome, ShadowVerdict> = {
   apply: "WOULD APPLY",
   settled: "ALREADY SETTLED",
   refuse: "WOULD REFUSE",
@@ -166,12 +166,7 @@ const VERDICT: Record<ShadowOutcome, string> = {
 
 /** One line per proposal, so a pass's whole shadow reads as a list in the session log. */
 function lineOf(record: ShadowRecord): string {
-  const verb = record.retireAs ? `${record.move}/${record.retireAs}` : record.move;
-  const counterpart = record.target ? ` → ${record.target}` : "";
-  return (
-    `SHADOW ${record.proposal} (${record.kind}) ${verb} ` +
-    `${record.subjects.join(", ")}${counterpart} — ${VERDICT[record.outcome]}: ${record.detail}`
-  );
+  return passRecordLine({ mode: "shadow", ...record, verdict: VERDICT[record.outcome] });
 }
 
 /**

@@ -864,13 +864,58 @@ describe("SettingsView proposal autonomy (anton-3mqq)", () => {
     expect(choice("container-orphan", "shadow").disabled).toBe(false);
   });
 
-  it("offers apply but never lets it be picked, and says why", () => {
+  it("lets apply be picked on every armable kind (anton-hzce)", () => {
+    // The passes can perform the write now (anton-4ab3), so the level is real. The only thing still
+    // off the table is a kind autonomyFor pins at propose whatever the policy says.
     renderView({});
-    for (const kind of KINDS) {
-      expect(choice(kind, "apply").disabled).toBe(true);
+    for (const kind of KINDS.filter((k) => k !== "oversized")) {
+      expect(choice(kind, "apply").disabled).toBe(false);
     }
-    expect(screen.getByText(/arrives with armed writes/)).toBeTruthy();
-    expect(choice("stale", "shadow").disabled).toBe(false);
+    expect(choice("oversized", "apply").disabled).toBe(true);
+  });
+
+  it("states what arming apply costs in each group, not once for all of them", () => {
+    // The whole point of the boxes: arming a link and arming a close are not the same decision, so
+    // a single blanket warning at the top would flatten exactly the difference they exist to show.
+    renderView({});
+
+    expect(
+      within(groupBox("Undone by one write")).getByText(/the cheapest group to arm first/),
+    ).toBeTruthy();
+    expect(
+      within(groupBox("Takes work out of the queue")).getByText(
+        /work stops being picked up while you sleep/,
+      ),
+    ).toBeTruthy();
+    expect(
+      within(groupBox("Writes history")).getByText(/the claim it writes outlives the undo/),
+    ).toBeTruthy();
+  });
+
+  it("says where an unattended write is recorded, at the moment one is armed", () => {
+    // An applied proposal closes as it is filed, so it never stands on the board as an ask. An
+    // operator arming a kind has to be told where the evidence will be before they arm it.
+    renderView({});
+    const jobs = screen.getByRole("link", { name: "Jobs page" });
+    expect(jobs.getAttribute("href")).toBe("/projects/tmp/jobs");
+  });
+
+  it("arming a kind at apply round-trips through the save", () => {
+    const fetchMock = stubFetch();
+    renderView({});
+
+    fireEvent.click(choice("stale", "apply"));
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.proposalAutonomy.stale).toBe("apply");
+  });
+
+  it("survives a reload: a kind armed at apply comes back armed", () => {
+    renderView({ proposalAutonomy: { stale: "apply" } });
+
+    expect(choice("stale", "apply").checked).toBe(true);
+    expect(choice("stale", "propose").checked).toBe(false);
   });
 
   it("seeds the control from a persisted policy (round-trip in)", () => {

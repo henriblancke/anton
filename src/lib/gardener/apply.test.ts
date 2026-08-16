@@ -18,6 +18,7 @@ import {
   apply,
   applyWith,
   bead,
+  blockedBy,
   calls,
   CARD,
   child,
@@ -25,12 +26,16 @@ import {
   CLUSTER,
   cold,
   DEFER,
+  failOn,
   FILED,
   inReview,
   leased,
   listBoard,
+  listByFlags,
   liveBeads,
+  liveBoard,
   NOW,
+  onWrite,
   planFor,
   proposalFor,
   record,
@@ -43,6 +48,9 @@ import {
   warm,
 } from "./apply.fixture";
 
+/** Fires on every `bd show` — how a case stages something arriving DURING the under-lock re-read. */
+let onShow: ((id: string) => void) | undefined;
+
 // Every reference to the seam sits INSIDE a wrapper: vitest hoists this factory above the imports
 // above, so touching one while building the object would read it before it is initialised.
 vi.mock("../beads/bd", async () => {
@@ -51,7 +59,10 @@ vi.mock("../beads/bd", async () => {
     ...actual,
     beads: {
       ...actual.beads,
-      show: (_cwd: string, id: string) => showBead(id),
+      show: (_cwd: string, id: string) => {
+        onShow?.(id);
+        return showBead(id);
+      },
       list: (_cwd: string, extra: string[] = []) => listBoard(extra),
       reparent: (_cwd: string, id: string, parent: string) => record("reparent", id, parent),
       link: (_cwd: string, a: string, b: string, type: string) => record("link", a, b, type),
@@ -68,7 +79,10 @@ vi.mock("../beads/bd", async () => {
 
 const { ProposalApplyError, applyProposal, declineNote, planApply } = await import("./apply");
 
-beforeEach(resetSeam);
+beforeEach(() => {
+  resetSeam();
+  onShow = undefined;
+});
 
 describe("the plan a proposal carries — read strictly, because it decides what gets mutated", () => {
   it("accepts what the emitter writes and nothing else", () => {
@@ -134,6 +148,23 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     expect(calls).toEqual([
       "reparent anton-a anton-card",
       `note ${proposal.id} gardener: applied — re-parented anton-a under anton-card.`,
+      `close ${proposal.id} applied: re-parented anton-a under anton-card`,
+    ]);
+  });
+
+  it("names POLICY on the note when nobody was asked — the same move, a different event", async () => {
+    const proposal = proposalFor(REPARENT);
+
+    const result = await apply(proposal, [CARD, bead("anton-a"), proposal], "policy");
+
+    // The board move is identical to the approved one above, which is exactly why the note has to
+    // differ: it is the only place the board records that nobody approved this, and which setting
+    // did — the first thing a founder who finds a bead moved overnight goes looking for.
+    expect(result.changed).toEqual(["anton-a"]);
+    expect(calls).toEqual([
+      "reparent anton-a anton-card",
+      `note ${proposal.id} gardener: applied by POLICY — re-parented anton-a under anton-card. ` +
+        "Nobody approved this: this project's proposal autonomy for `container-orphan` is set to apply.",
       `close ${proposal.id} applied: re-parented anton-a under anton-card`,
     ]);
   });
@@ -209,6 +240,130 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     expect(calls).toEqual([]);
   });
 
+  // The unattended caller's cancel (gardener/armed.ts). Its own last check lands BEFORE this
+  // function, so the proposal's write lock and the re-read under it are both awaits only apply can
+  // see: a cancel arriving in either has to stop the apply, not be noticed once the subject has
+  // been moved and the ask closed over it.
+  it("stops on a cancel that arrives during the under-lock re-read, writing nothing", async () => {
+    const proposal = proposalFor(REPARENT);
+    const stopped = new Error("the runner stopped this pass");
+    const controller = new AbortController();
+    onShow = (id) => {
+      if (id === proposal.id) controller.abort(stopped);
+    };
+
+    // The signal's own reason, not a ProposalApplyError: the caller re-raises it as the pass being
+    // stopped, and a verdict-shaped throw would be recorded as this ask's answer instead.
+    await expect(
+      apply(proposal, [CARD, bead("anton-a"), proposal], "policy", controller.signal),
+    ).rejects.toBe(stopped);
+
+    // The pass being stopped is not the board declining: no move, and no refusal noted on the ask.
+    expect(calls).toEqual([]);
+  });
+
+  // The gap that check alone leaves: a DECIDED move is still several awaits from writing anything —
+  // the step's own per-bead locks, its re-reads, and a whole board read for the topology bars — so a
+  // job timeout firing in that window would move the subject and close the ask over it. The last
+  // word belongs to a check taken under those locks, with nothing left between it and the write.
+  it("stops on a cancel that arrives during a step's under-lock board read, writing nothing", async () => {
+    const proposal = proposalFor(REPARENT);
+    const stopped = new Error("the pass ran out of time");
+    const controller = new AbortController();
+    listByFlags(() => {
+      controller.abort(stopped);
+      return Promise.resolve(liveBoard());
+    });
+
+    await expect(
+      apply(proposal, [CARD, bead("anton-a"), proposal], "policy", controller.signal),
+    ).rejects.toBe(stopped);
+
+    // Neither the move nor a refusal noted on the ask: a stopped pass is not the board declining.
+    expect(calls).toEqual([]);
+  });
+
+  // The already-applied path runs no step, so the checkpoint above never fires for it — and it still
+  // WRITES: its note and close sit behind the affected beads' locks and a whole board re-read.
+  it("stops on a cancel that arrives while confirming an already-applied board, settling nothing", async () => {
+    const proposal = proposalFor(REPARENT);
+    const stopped = new Error("the pass ran out of time");
+    const controller = new AbortController();
+    listByFlags(() => {
+      controller.abort(stopped);
+      return Promise.resolve(liveBoard());
+    });
+
+    await expect(
+      apply(proposal, [CARD, child("anton-a", CARD.id), proposal], "policy", controller.signal),
+    ).rejects.toBe(stopped);
+
+    expect(calls).toEqual([]);
+  });
+
+  // The third way past that checkpoint: a step the board already satisfied returns before it, having
+  // waited on the very same locks and re-read. Writing nothing is not having nothing left to stop —
+  // the settlement's note and close are still ahead, and would close the ask over a stopped pass.
+  it("stops on a cancel that arrives while a step the board already satisfied is re-read", async () => {
+    const proposal = proposalFor(REPARENT);
+    const stopped = new Error("the pass ran out of time");
+    const controller = new AbortController();
+    // Another approval landed the same move between the snapshot and this apply's per-bead lock, so
+    // the step has nothing to write — and the cancel lands in the re-read that discovers it.
+    liveBeads.set("anton-a", child("anton-a", CARD.id));
+    onShow = (id) => {
+      if (id === "anton-a") controller.abort(stopped);
+    };
+
+    await expect(
+      apply(proposal, [CARD, bead("anton-a"), proposal], "policy", controller.signal),
+    ).rejects.toBe(stopped);
+
+    // Not the move (somebody else's already), and not the settlement closing the ask over it.
+    expect(calls).toEqual([]);
+  });
+
+  // The other half of that contract, and the reason the window closes at the FIRST write: the steps
+  // roll back as a unit, so a cancel honoured mid-move would leave a partial apply nobody asked for.
+  // Here the cancel lands in the second subject's under-lock re-read — the same kind of await the
+  // case above stops on, but after a write, where stopping would strand a half-moved cluster.
+  it("ignores a cancel that arrives in a later cluster step's re-read — the move is already begun", async () => {
+    const proposal = proposalFor(CLUSTER);
+    const controller = new AbortController();
+    onShow = (id) => {
+      if (id === "anton-b") controller.abort();
+    };
+
+    const result = await apply(
+      proposal,
+      [CARD, bead("anton-a"), bead("anton-b"), proposal],
+      "policy",
+      controller.signal,
+    );
+
+    expect(result.changed).toEqual(["anton-a", "anton-b"]);
+  });
+
+  it("ignores a cancel that arrives once a step has landed — the move is finished and settled", async () => {
+    const proposal = proposalFor(CLUSTER);
+    const controller = new AbortController();
+    onWrite((call) => {
+      if (call.startsWith("reparent")) controller.abort();
+    });
+
+    const result = await apply(
+      proposal,
+      [CARD, bead("anton-a"), bead("anton-b"), proposal],
+      "policy",
+      controller.signal,
+    );
+
+    expect(result.changed).toEqual(["anton-a", "anton-b"]);
+    expect(calls).toContain(
+      `close ${proposal.id} applied: re-parented anton-a, anton-b under anton-card`,
+    );
+  });
+
   // The interleave the proposal lock exists for: two approvals of one CLUSTER, whose per-subject
   // locks are released between steps. Unserialized, the loser could restore a subject to its stale
   // `undoParent` while the winner closed the proposal — a settled proposal claiming a move the board
@@ -219,8 +374,8 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     setSnapshot(board); // the winner's close lands on this board, and is what the loser then reads
 
     const [winner, loser] = await Promise.allSettled([
-      applyProposal(REPO, proposal, board),
-      applyProposal(REPO, proposal, board),
+      applyProposal(REPO, proposal, board, "approval"),
+      applyProposal(REPO, proposal, board, "approval"),
     ]);
 
     expect(winner.status).toBe("fulfilled");
@@ -242,6 +397,55 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
 
     expect(result.changed).toEqual(["anton-b"]);
     expect(calls.filter((c) => c.startsWith("reparent"))).toEqual(["reparent anton-b anton-card"]);
+  });
+
+  // The settlement is the LAST thing an apply does and the one pair of writes nothing can undo: by
+  // the time it runs, every step has landed. A failure that reported an untouched board would tell
+  // the armed pass — whose record is the only witness an unattended write ever gets — that nothing
+  // moved, over beads it had just moved (gardener/armed.ts).
+  it("reports the move it left standing when the proposal cannot be settled", async () => {
+    const proposal = proposalFor(REPARENT);
+    failOn.set(`note:${proposal.id}`, 1);
+
+    const err = await apply(proposal, [CARD, bead("anton-a"), proposal], "policy").catch((e) => e);
+
+    expect(err).toBeInstanceOf(ProposalApplyError);
+    expect(err.failure).toBe("unsettled");
+    expect(err.changed).toEqual(["anton-a"]);
+    expect(err.message).toContain("the move LANDED (anton-a) and was not rolled back");
+    // Left standing, not undone: a re-parent is the only verb a rollback could reach, and the ask
+    // converges anyway — approving it reads the board as already applied and settles it.
+    expect(calls.filter((c) => c.startsWith("reparent"))).toEqual(["reparent anton-a anton-card"]);
+    expect(err.message).toContain("approving it again settles it without writing anything");
+    // And the still-open proposal says why it is still open, as every other failure here does.
+    expect(calls.at(-1)).toContain(`note ${proposal.id} gardener: apply FAILED`);
+  });
+
+  it("says the same when the note landed and only the CLOSE failed", async () => {
+    // The half that leaves the bead claiming to be applied while it is still open — the reason the
+    // record has to carry the move rather than the failure class alone.
+    const proposal = proposalFor(REPARENT);
+    failOn.set(`close:${proposal.id}`, 1);
+
+    const err = await apply(proposal, [CARD, bead("anton-a"), proposal]).catch((e) => e);
+
+    expect(err.failure).toBe("unsettled");
+    expect(err.changed).toEqual(["anton-a"]);
+  });
+
+  it("has no board write to report when a settlement over an already-applied board fails", async () => {
+    // The settled path writes nothing to a subject, so there is nothing for a caller to record as
+    // moved — an empty `changed` is the honest answer, not a missing one. Which is exactly why the
+    // failure KIND has to carry the verdict: the board holds the move and the ask is still open over
+    // it, and a caller reading `changed` alone would report a board nothing happened to.
+    const proposal = proposalFor(REPARENT);
+    failOn.set(`note:${proposal.id}`, 1);
+
+    const err = await apply(proposal, [CARD, child("anton-a", CARD.id), proposal]).catch((e) => e);
+
+    expect(err.failure).toBe("unsettled");
+    expect(err.changed).toEqual([]);
+    expect(err.message).toContain("the board already carried the move, so nothing was written");
   });
 
   it("refuses a stale plan without writing anything, and notes why on the proposal", async () => {
@@ -529,6 +733,30 @@ describe("the product master's moves", () => {
       )) as InstanceType<typeof ProposalApplyError>;
       expect(err.failure).toBe("refused");
       expect(err.message).toMatch(/meets the approve gate again/);
+      expect(calls.filter((c) => !c.startsWith("note anton-p1"))).toEqual([]);
+    });
+
+    // The gate re-derived above is the LAST authorizing read this move makes, and bd keeps gate beads
+    // out of every ordinary listing while carrying the `blocks` edge they put on the bead they gate
+    // (anton-ve2r). A gate listing that failed would leave that edge reading as an open blocker — a
+    // `blocked` approval gap — so a target whose approval was repaired since the snapshot would lose
+    // the label to a partial view of the board. The read is strict for exactly that: it fails closed.
+    it("refuses when the gate listing fails, rather than reading a missing gate as a blocker", async () => {
+      // A dangling blocks edge is what makes `loadAllIssues` reach for the gate listing at all.
+      const board = [degraded(), blockedBy("anton-z", "anton-gate")];
+      listByFlags(async (extra) => {
+        if (extra.includes("gate")) throw new Error("bd list --type gate failed: database is locked");
+        return liveBoard();
+      });
+
+      const err = (await applyWith(proposalFor(UNAPPROVE), board).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("refused");
+      expect(err.message).toMatch(/the board could not be re-read before withdrawing the approval/);
+      expect(err.message).toContain("database is locked");
+      // The ask stays open and the label stays on: a board anton cannot see whole authorises nothing.
       expect(calls.filter((c) => !c.startsWith("note anton-p1"))).toEqual([]);
     });
   });

@@ -316,7 +316,7 @@ describeBd("product-master pass e2e (real handler · real bd)", () => {
     ) as Bead;
     expect(proposalPlanOf(proposal)).toMatchObject({ kind: "low-value", retireAs: "defer" });
 
-    const result = await applyProposal(repo, proposal, await loadAllIssues(repo));
+    const result = await applyProposal(repo, proposal, await loadAllIssues(repo), "approval");
     expect(result.changed).toEqual([doomed]);
 
     // Deferred, not closed: a product judgment must stay reversible with `bd undefer`.
@@ -375,7 +375,7 @@ describeBd("product-master pass e2e (real handler · real bd)", () => {
     // Still a proposal, not a write: nothing moved until the founder approved it.
     expect(beads.parentOf(await beads.show(repo, misfiled))).toBe(wrongCard);
 
-    const result = await applyProposal(repo, proposal, await loadAllIssues(repo));
+    const result = await applyProposal(repo, proposal, await loadAllIssues(repo), "approval");
     expect(result.changed).toEqual([misfiled]);
 
     expect(beads.parentOf(await beads.show(repo, misfiled))).toBe(rightCard);

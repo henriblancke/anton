@@ -644,8 +644,27 @@ describe("rolling back a cluster that failed part-way — the board must end unc
     // The SECOND write to anton-a is its undo — fail that too, and the board is left half-moved.
     failOn.set("reparent:anton-a", 2);
 
-    await expect(apply(proposal, board)).rejects.toThrow(/ROLLBACK INCOMPLETE/);
+    const err = await apply(proposal, board).catch((e) => e);
+
+    expect(err.message).toMatch(/ROLLBACK INCOMPLETE/);
+    // The prose is for the human; the DATA is for the unattended caller. This failure is recorded as
+    // `COULD NOT APPLY` — the one verdict that promises an unchanged board — so a walk reading the
+    // verdict alone would carry on against a snapshot anton-a's surviving move already invalidated,
+    // and leave it out of the note naming what is stranded on this machine (gardener/armed.ts).
+    expect(err.failure).toBe("failed");
+    expect(err.changed).toEqual(["anton-a"]);
     expect(calls.some((c) => c.startsWith(`close ${proposal.id}`))).toBe(false);
+  });
+
+  it("reports no surviving write when the rollback put every one of them back", async () => {
+    const proposal = proposalFor(CLUSTER);
+    const board = [CARD, child("anton-a", "anton-old"), bead("anton-b"), proposal];
+    failOn.set("reparent:anton-b", 1);
+
+    const err = await apply(proposal, board).catch((e) => e);
+
+    expect(err.failure).toBe("failed");
+    expect(err.changed).toEqual([]);
   });
 
   // The rollback's other end: an early cluster member lands, a run starts on the HOME and confirms
@@ -723,9 +742,15 @@ describe("rolling back a cluster that failed part-way — the board must end unc
       liveBeads.set("anton-b", undefined);
     });
 
-    await expect(apply(proposal, board)).rejects.toThrow(
+    const err = await apply(proposal, board).catch((e) => e);
+
+    expect(err.message).toMatch(
       /ROLLBACK INCOMPLETE: anton-b could not be restored; anton-a was left where another write has since moved it/,
     );
+    // Both ride on the failure too. An overtaken bead is as unrestored as a stranded one — our write
+    // landed in this checkout and a newer one on top of it does not put the bead back — so a caller
+    // that skipped it would under-report what this machine has to publish and re-read.
+    expect(err.changed).toEqual(["anton-b", "anton-a"]);
 
     // Neither was written to twice: no blind restore, no clobbering the newer move.
     expect(calls.filter((c) => c.startsWith("reparent"))).toEqual([

@@ -14,6 +14,8 @@
  * building them.
  */
 import { LABELS, type Bead } from "../beads/bd";
+// Type-only: erased at build, so it does not load apply.ts ahead of a suite's `vi.mock`.
+import type { ApplyActor } from "./apply";
 import {
   detectionSubjectKey,
   proposalFingerprint,
@@ -133,16 +135,28 @@ export function resetSeam(): void {
  * primes {@link liveBeads} for the bead it wants to move under the apply.
  *
  * The module is pulled in lazily so the suite's `vi.mock` is in place before apply.ts binds `beads`.
+ *
+ * `actor` defaults to `approval` because that is the caller nearly every case here stands in for —
+ * the approve route — and the note it writes is asserted verbatim in `apply.test.ts` ("applied —
+ * …"). The default is deliberate, NOT a stand-in for the production requirement: `applyProposal`
+ * itself takes no default, so no caller outside these suites can leave the attribution unsaid. A
+ * case that means "a policy did this" passes `"policy"` explicitly, and the note it produces is
+ * pinned there too, so a wrong label is a failing test rather than a quiet one.
  */
-export async function apply(proposal: Bead, board: Bead[]) {
+export async function apply(
+  proposal: Bead,
+  board: Bead[],
+  actor: ApplyActor = "approval",
+  signal?: AbortSignal,
+) {
   setSnapshot(board);
   const { applyProposal } = await import("./apply");
-  return applyProposal(REPO, proposal, board);
+  return applyProposal(REPO, proposal, board, actor, signal);
 }
 
 /** {@link apply} with the proposal itself on the board — every apply re-reads it under its lock. */
-export function applyWith(proposal: Bead, board: Bead[]) {
-  return apply(proposal, [...board, proposal]);
+export function applyWith(proposal: Bead, board: Bead[], actor: ApplyActor = "approval") {
+  return apply(proposal, [...board, proposal], actor);
 }
 
 // ── fixture builders ──

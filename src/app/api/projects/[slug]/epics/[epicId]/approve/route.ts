@@ -49,8 +49,12 @@ async function readApprovalBody(
   }
 }
 
-/** HTTP status per apply failure: the caller's mistake, the board's, or ours. */
-const APPLY_STATUS = { unusable: 422, refused: 409, failed: 500 } as const;
+/**
+ * HTTP status per apply failure: the caller's mistake, the board's, or ours. `unsettled` is ours too
+ * — the move is on the board and only its proposal could not be closed, and the error text is what
+ * tells the operator that approving it again settles it.
+ */
+const APPLY_STATUS = { unusable: 422, refused: 409, failed: 500, unsettled: 500 } as const;
 
 /**
  * Approve a gardener proposal: apply its board move and close it (anton-1t3n). Never enqueues a run
@@ -67,7 +71,7 @@ async function applyProposalResponse(
   board: Bead[],
 ): Promise<NextResponse> {
   try {
-    const applied = await applyProposal(project.repoPath, proposal, board);
+    const applied = await applyProposal(project.repoPath, proposal, board, "approval");
     // The move landed locally; propagate it like every other operator write (immediate coalesced
     // push + the durable backstop), off the response path.
     nudgeSync({ id: project.id, repoPath: project.repoPath }, "approve");

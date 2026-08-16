@@ -7,7 +7,8 @@ import type { LiveJobInfo } from "@/lib/jobs/runner";
 import { jobsQueryString, normalizeJobFilters } from "@/lib/jobs-filters";
 import { countJobs, listJobsPaged } from "@/lib/jobs-view";
 import { countRuns } from "@/lib/runs";
-import { sessionIdsByJob } from "@/lib/sessions";
+import { passRecordsByJob } from "@/lib/jobs/pass-records";
+import { sessionsByJob } from "@/lib/sessions";
 import { PAGE_SIZE, resolvePage } from "@/lib/pagination";
 import { SectionTabs } from "@/components/runs/section-tabs";
 import { Pagination } from "@/components/runs/pagination";
@@ -60,7 +61,15 @@ export default async function ProjectJobsPage({
   // The durable session link (anton-lmps), which is what a SETTLED job has instead of a live handle:
   // a gardener or product-master pass writes no run row, so without this its log — the shadow
   // records among it — would be readable only while the pass was still running.
-  const jobSessions = await sessionIdsByJob(jobs.map((job) => job.id));
+  const sessions = await sessionsByJob(jobs.map((job) => job.id));
+  const jobSessions = Object.fromEntries(
+    Object.entries(sessions).map(([jobId, session]) => [jobId, session.id]),
+  );
+
+  // What each pass APPLIED, shadowed and refused (anton-hzce), read out of that same log. An
+  // auto-applied proposal is closed the moment it is filed, so it never stands on the board as an
+  // open ask — without this the founder's first evidence of an unattended write is a bead that moved.
+  const passRecords = await passRecordsByJob(jobs, sessions);
 
   return (
     <div className="flex flex-1 flex-col">
@@ -88,6 +97,7 @@ export default async function ProjectJobsPage({
                 slug={slug}
                 liveJobs={liveJobs}
                 jobSessions={jobSessions}
+                passRecords={passRecords}
               />
               <Pagination
                 basePath={`/projects/${slug}/jobs${jobsQueryString(filters)}`}

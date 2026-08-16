@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
   ArrowRightIcon,
@@ -115,15 +116,8 @@ type ProposalAutonomy = (typeof AUTONOMY_LEVELS)[number];
 const AUTONOMY_LEVEL_HINT: Record<ProposalAutonomy, string> = {
   propose: "files it on the board and stops · you approve it",
   shadow: "also records what applying it would have done — and still writes nothing",
-  apply: "writes the move to the board unattended",
+  apply: "writes the move to the board unattended · nobody is asked",
 };
-
-/**
- * Why `apply` is offered but never selectable yet. It exists in the type so the shape settles once,
- * but no pass can perform the write today — arming a kind that would quietly keep proposing is the
- * one thing this control must not let an operator believe they did.
- */
-const APPLY_UNAVAILABLE = "arrives with armed writes · nothing can perform the write yet";
 
 /** One detection kind as the founder meets it: what its move does, and whether it can be armed. */
 interface AutonomyKindSpec {
@@ -155,6 +149,14 @@ const AUTONOMY_GROUPS: {
   does: string;
   /** How a wrong one is undone — the property the grouping is actually by. */
   undo: string;
+  /**
+   * What ARMING this group at `apply` costs (anton-hzce). Stated per group rather than once at the
+   * top, because the whole reason these boxes exist is that the cost is not the same in each: the
+   * decision an operator is making when they arm a link is not the decision they make when they arm
+   * a close, and a single blanket warning would flatten exactly that difference. Absent where there
+   * is nothing to arm.
+   */
+  armed?: string;
   /** A per-PROPOSAL floor inside this group that no setting can lift. */
   floor?: string;
   kinds: AutonomyKindSpec[];
@@ -164,6 +166,9 @@ const AUTONOMY_GROUPS: {
     title: "Undone by one write",
     does: "Moves a bead in the graph, or rewrites one field: a parent, a blocks edge, a priority.",
     undo: "One bd write puts it back, and nothing is recorded as having happened.",
+    armed:
+      "Armed, a pass re-shapes the graph overnight without asking. A wrong one costs you the one " +
+      "write that puts it back — the cheapest group to arm first.",
     floor:
       "A re-parent filed without a target names no home — the ask is “which feature?”, and only " +
       "you can answer it. Those are never applied, whatever this says.",
@@ -190,6 +195,9 @@ const AUTONOMY_GROUPS: {
     title: "Takes work out of the queue",
     does: "The bead and its contract survive untouched; what changes is that nothing picks it up next.",
     undo: "bd undefer puts a deferred bead straight back. A withdrawn approval returns only when you approve it again.",
+    armed:
+      "Armed, work stops being picked up while you sleep. Nothing is lost, but a wrong one is a " +
+      "week the bead sat still — and you only find it by reading the record.",
     kinds: [
       { id: "stale", does: "defers a bead untouched far past the threshold for its status" },
       { id: "low-value", does: "defers work the evidence no longer supports — the kill" },
@@ -204,6 +212,9 @@ const AUTONOMY_GROUPS: {
     title: "Writes history",
     does: "Closes the bead — and a close is a claim about what happened: shipped-orphan writes “this shipped”, superseded writes “that one replaced it”.",
     undo: "Reopening is one write, but the close stays in the board's history and in every report already taken from it.",
+    armed:
+      "Armed, a pass closes beads with nobody watching, and the claim it writes outlives the undo. " +
+      "Arm this last, on a project whose shadow record you have actually read.",
     kinds: [
       { id: "superseded", does: "closes a bead as superseded, pointing at the twin that landed" },
       { id: "shipped-orphan", does: "closes a bead a commit already shipped" },
@@ -402,7 +413,7 @@ const AUTOMATIONS: AutomationSpec[] = [
   {
     id: "gardener",
     label: "gardener",
-    description: "hygiene patrol · closes done epics, reports the rest",
+    description: "hygiene patrol · closes done epics · proposes the rest, applies what you armed",
     group: "Board maintenance",
   },
   {
@@ -427,7 +438,7 @@ const AUTOMATIONS: AutomationSpec[] = [
   {
     id: "product-master",
     label: "product-master",
-    description: "product judgment · proposes reprioritize / split / kill, never applies",
+    description: "product judgment · proposes reprioritize / split / kill · applies what you armed",
     group: "Board maintenance",
   },
   {
@@ -1619,11 +1630,25 @@ export function SettingsView({
                 aria-label="Product-master prompt"
                 className="w-full resize-y rounded-lg border border-border bg-card px-3 py-2.5 font-mono text-[12px] leading-relaxed text-foreground outline-none placeholder:text-subtle focus:border-primary/60"
               />
+              {/* The session and the PASS are two different things, and only one of them can write
+                  (anton-4ab3). Said here because this is where an operator decides what the
+                  judgment may do: the claude session has no `bd` and reaches no board, but the pass
+                  that carries its answer applies any kind armed at `apply` — so "it only proposes"
+                  is true of the session and false of the pass. */}
               <span className="text-[11px] text-subtle">
                 The reasoning contract for the product-master pass. anton appends the board (tiers,
                 ordering edges, priorities, ages, sizes, review scores, recent runs) and the report
-                format beneath it — the pass emits proposals only and never writes to the board.
-                Empty = shipped default. {productMasterPrompt.length}/8000
+                format beneath it. The claude session judges and can never write — it has no board
+                access — but the pass then files what it proposed and applies whatever kind you
+                armed at <span className="font-mono">apply</span> in{" "}
+                <button
+                  type="button"
+                  onClick={() => showSection("proposals")}
+                  className="text-primary underline-offset-2 hover:underline"
+                >
+                  Proposal autonomy
+                </button>
+                . Empty = shipped default. {productMasterPrompt.length}/8000
               </span>
             </div>
           </section>
@@ -1646,12 +1671,22 @@ export function SettingsView({
               {AUTONOMY_LEVELS.map((level) => (
                 <div key={level} className="flex items-baseline gap-2.5">
                   <span className="w-14 shrink-0 font-mono text-[10.5px] text-primary">{level}</span>
-                  <span className="text-[11px] text-subtle">
-                    {AUTONOMY_LEVEL_HINT[level]}
-                    {level === "apply" && ` · unavailable — ${APPLY_UNAVAILABLE}`}
-                  </span>
+                  <span className="text-[11px] text-subtle">{AUTONOMY_LEVEL_HINT[level]}</span>
                 </div>
               ))}
+              {/* Where the writes show up (anton-hzce). An applied proposal closes the moment it is
+                  filed, so it never stands on the board as an ask — an operator arming a kind here
+                  has to be told, at the moment they arm it, where the evidence will be. */}
+              <span className="text-[11px] text-subtle">
+                Every unattended write is recorded on its pass&apos;s row on the{" "}
+                <Link
+                  href={`/projects/${project.slug}/jobs`}
+                  className="text-primary underline-offset-2 hover:underline"
+                >
+                  Jobs page
+                </Link>
+                , with the reason for anything it refused.
+              </span>
             </div>
 
             {AUTONOMY_GROUPS.map((group) => (
@@ -1669,6 +1704,11 @@ export function SettingsView({
                   <span className="text-[11px] text-subtle">
                     <span className="text-muted-foreground">Undone by</span> {group.undo}
                   </span>
+                  {group.armed && (
+                    <span className="text-[11px] text-risk-med">
+                      <span className="font-mono">apply</span> {group.armed}
+                    </span>
+                  )}
                 </div>
 
                 <div className="flex flex-col divide-y divide-border/60">
@@ -1933,9 +1973,9 @@ function AutonomyRow({
  * The three levels as a segmented radio group, least autonomous first.
  *
  * Real radios rather than a `<select>`: three options whose whole point is that one is further along
- * a scale than the next read better side by side, and this is the shape that can show `apply`
- * DISABLED with its reason instead of hiding it — an operator who can't see the level exists has no
- * way to know what is coming, and one offered a level the pass ignores is worse off still.
+ * a scale than the next read better side by side, and this is the shape that can show a kind the
+ * floor pins DISABLED with its reason instead of hiding it — an operator offered a level the pass
+ * silently ignores is worse off than one who can see why it isn't on offer.
  */
 function AutonomyChoice({
   kind,
@@ -1946,35 +1986,34 @@ function AutonomyChoice({
   value: ProposalAutonomy;
   onChange: (level: ProposalAutonomy) => void;
 }) {
+  // Only the kind's own floor takes a level off the table now that the passes can write
+  // (anton-4ab3): `oversized` has no mechanical move, so EVERY level is pinned for it — offering it
+  // `shadow` would be a setting the pass silently ignores.
+  const unavailable = kind.blocked;
   return (
     <fieldset className="flex gap-0.5 rounded-[9px] border border-border bg-background/40 p-0.5">
       <legend className="sr-only">{kind.id} autonomy</legend>
-      {AUTONOMY_LEVELS.map((level) => {
-        // The kind's own floor outranks the level's availability: `oversized` is not armable at all,
-        // so saying "apply arrives later" about it would promise something that is never coming.
-        const unavailable = kind.blocked ?? (level === "apply" ? APPLY_UNAVAILABLE : undefined);
-        return (
-          <label
-            key={level}
-            title={unavailable ?? AUTONOMY_LEVEL_HINT[level]}
-            className={cn("block", unavailable ? "cursor-not-allowed" : "cursor-pointer")}
-          >
-            <input
-              type="radio"
-              name={`autonomy-${kind.id}`}
-              className="peer sr-only"
-              value={level}
-              checked={value === level}
-              disabled={Boolean(unavailable)}
-              onChange={() => onChange(level)}
-              aria-label={`${kind.id} · ${level}`}
-            />
-            <span className="block rounded-[7px] px-2 py-1 font-mono text-[10.5px] text-muted-foreground transition-colors peer-checked:bg-primary/15 peer-checked:text-primary peer-focus-visible:ring-2 peer-focus-visible:ring-primary/50 peer-disabled:text-subtle peer-disabled:opacity-50">
-              {level}
-            </span>
-          </label>
-        );
-      })}
+      {AUTONOMY_LEVELS.map((level) => (
+        <label
+          key={level}
+          title={unavailable ?? AUTONOMY_LEVEL_HINT[level]}
+          className={cn("block", unavailable ? "cursor-not-allowed" : "cursor-pointer")}
+        >
+          <input
+            type="radio"
+            name={`autonomy-${kind.id}`}
+            className="peer sr-only"
+            value={level}
+            checked={value === level}
+            disabled={Boolean(unavailable)}
+            onChange={() => onChange(level)}
+            aria-label={`${kind.id} · ${level}`}
+          />
+          <span className="block rounded-[7px] px-2 py-1 font-mono text-[10.5px] text-muted-foreground transition-colors peer-checked:bg-primary/15 peer-checked:text-primary peer-focus-visible:ring-2 peer-focus-visible:ring-primary/50 peer-disabled:text-subtle peer-disabled:opacity-50">
+            {level}
+          </span>
+        </label>
+      ))}
     </fieldset>
   );
 }
