@@ -274,6 +274,13 @@ describe("createDraftFeature — what the Add-work commit lands", () => {
       bead({ id: "p-1", issue_type: "epic", status: "in_progress" }),
       "claimed and running",
     ],
+    // A human reservation on a standalone epic is the same hazard one step earlier: converting it to
+    // a container leaves an assignee the claim route (isRunTarget 422) can no longer release.
+    [
+      "reserved by a human claim",
+      bead({ id: "p-1", issue_type: "epic", assignee: "ada" }),
+      "reserved by ada",
+    ],
   ])("refuses an epic that went %s after the page rendered", async (_state, epic, message) => {
     boardIs(epic);
     const create = vi.spyOn(beads, "create");
@@ -445,6 +452,21 @@ describe("epicChoices", () => {
       bead({ id: "p-5", issue_type: "feature", parent: "p-4" }),
     ]);
     expect(choices.map((c) => c.id)).toEqual(["p-3", "p-4"]);
+  });
+
+  // An open, unapproved epic someone has reserved is still a run target of its own: converting it to
+  // a container strands the reservation on a bead the claim route refuses to release, while the new
+  // feature lands unclaimed for anyone else to take.
+  it("drops standalone epics a human has reserved, keeping ones that already group features", () => {
+    const choices = epicChoices([
+      bead({ id: "p-1", issue_type: "epic", title: "Reserved", assignee: "ada" }),
+      // Whitespace is bd's "unclaimed" (ownerOf), not a holder.
+      bead({ id: "p-2", issue_type: "epic", title: "Blank claim", assignee: "  " }),
+      // Reserved but already a container — the assignee was never on a run target here.
+      bead({ id: "p-3", issue_type: "epic", title: "Grouping", assignee: "ada" }),
+      bead({ id: "p-4", issue_type: "feature", parent: "p-3" }),
+    ]);
+    expect(choices.map((c) => c.id)).toEqual(["p-2", "p-3"]);
   });
 });
 

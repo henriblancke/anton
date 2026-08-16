@@ -1,4 +1,5 @@
 import { beads, labelValueOf, type Bead } from "./beads/bd";
+import { ownerOf } from "./beads/claim";
 import { validateBeadContract, type ContractViolation } from "./beads/contract";
 import { beadSkeleton, type BeadSkeleton } from "./beads/formula";
 import { allIssues, refreshAllIssues } from "./beads/issues";
@@ -94,16 +95,24 @@ export function knownAreas(all: Bead[]): string[] {
 
 
 /**
- * A legacy epic anton is currently running as a target of its own — approved, or claimed and in
- * flight. It has no `feature` children yet, so landing one turns it into a container mid-flight
- * (`beads.isContainer`): execute-epic's `isRunTarget` gate then poison-parks the queued run, and an
- * in-review one drops out of review-fix's sweep with its PR left unfinished. An epic that already
+ * Why a legacy epic is spoken for as a run target of its own, or undefined when it is free. It has
+ * no `feature` children yet, so landing one turns it into a container (`beads.isContainer`) and
+ * whatever holds it loses its target: execute-epic's `isRunTarget` gate poison-parks a queued run,
+ * an in-review one drops out of review-fix's sweep with its PR left unfinished, and a human
+ * reservation becomes unreleasable — the claim route 422s a container, so the assignee is stuck on a
+ * bead nothing runs while the new feature lands unclaimed for anyone to take. An epic that already
  * groups features is not at risk — it was never the run target.
  */
-function isInFlightRunTarget(epic: Bead, board: Bead[]): boolean {
-  return (
-    !beads.isContainer(epic, board) && (beads.isApproved(epic) || epic.status === "in_progress")
-  );
+function spokenForReason(epic: Bead, board: Bead[]): string | undefined {
+  if (beads.isContainer(epic, board)) return undefined;
+  const strandsRun = (state: string) =>
+    `epic ${epic.id} is ${state} as its own target — a feature under it would strand that run`;
+  if (beads.isApproved(epic)) return strandsRun("approved and running");
+  if (epic.status === "in_progress") return strandsRun("claimed and running");
+  const owner = ownerOf(epic);
+  return owner
+    ? `epic ${epic.id} is reserved by ${owner} as its own target — a feature under it would leave that claim unreleasable; release it first`
+    : undefined;
 }
 
 /**
@@ -117,18 +126,14 @@ function ineligibleReason(bead: Bead, board: Bead[]): string | undefined {
   // Abandoned first: it is also closed, but "won't do" is a different answer than "shipped".
   if (beads.isAbandoned(bead)) return `epic ${bead.id} was abandoned — pick another`;
   if (bead.status === "closed") return `epic ${bead.id} is closed — pick another`;
-  if (isInFlightRunTarget(bead, board)) {
-    const state = beads.isApproved(bead) ? "approved and running" : "claimed and running";
-    return `epic ${bead.id} is ${state} as its own target — a feature under it would strand that run`;
-  }
-  return undefined;
+  return spokenForReason(bead, board);
 }
 
 /**
  * The epics a draft feature may attach to: every eligible epic, titled and sorted the way the picker
  * lists them. Closed and abandoned epics are out — attaching new work to a finished outcome is
- * never the right answer, and an abandoned one is a won't-do decision — as are epics anton is
- * already running as run targets of their own (see {@link isInFlightRunTarget}).
+ * never the right answer, and an abandoned one is a won't-do decision — as are epics already spoken
+ * for as run targets of their own (see {@link spokenForReason}).
  */
 export function epicChoices(all: Bead[]): EpicChoice[] {
   const looseByEpic = new Map<string, number>();
