@@ -4,8 +4,10 @@
  * 1. It is the single declaration of the run shape and its statuses. `src/lib/runs.ts` imports
  *    these rather than re-declaring them (anton-f3qj) — the dependency points server -> client-safe,
  *    never the reverse, so a client module can name a run without dragging better-sqlite3 into the
- *    browser bundle. Nothing here may import a node builtin or a db module — enforced by the
- *    `no-restricted-imports` override for this file in `eslint.config.mjs`.
+ *    browser bundle. Nothing here may import a node builtin, a server-only package, or anything
+ *    from `src/lib` — the whole server layer is denied, since lint cannot follow the transitive
+ *    hop from an innocent-looking `@/lib/*` to the db. Enforced by the `no-restricted-imports`
+ *    override for this file in `eslint.config.mjs`, pinned by `run-view-utils.boundary.test.ts`.
  * 2. The terminal-attach rule and time formatting live here so they are unit-testable without a
  *    browser/jsdom (the view itself renders xterm).
  */

@@ -12,6 +12,15 @@ import nextTs from "eslint-config-next/typescript";
 const SERVER_ONLY_IMPORT_MESSAGE =
   "This module is client-safe and is bundled for the browser — it may not import node builtins, the db, or server-only packages. Declare the shape here and do the server work in src/lib.";
 
+/**
+ * `src/lib` is the server layer, and lint can only see the edge in front of it — never the
+ * transitive one behind it. So the whole directory is off limits rather than an enumerated list of
+ * today's server entry points, which would go stale the first time a new one lands: `@/lib/runs`
+ * looks innocent at the import site but reaches better-sqlite3 two hops in.
+ */
+const SERVER_LAYER_IMPORT_MESSAGE =
+  "src/lib is the server layer — importing any of it can pull better-sqlite3 into the browser bundle transitively. The dependency points server -> client-safe: declare the shape here and let src/lib import it, never the reverse.";
+
 const CLIENT_SAFE_MODULES = ["src/components/runs/run-view-utils.ts"];
 
 const eslintConfig = defineConfig([
@@ -36,16 +45,13 @@ const eslintConfig = defineConfig([
           paths: builtinModules.map((name) => ({ name, message: SERVER_ONLY_IMPORT_MESSAGE })),
           patterns: [
             {
-              group: [
-                "node:*",
-                "better-sqlite3",
-                "node-pty",
-                "drizzle-orm",
-                "drizzle-orm/*",
-                "**/lib/db",
-                "**/lib/db/*",
-              ],
+              group: ["node:*", "better-sqlite3", "node-pty", "drizzle-orm", "drizzle-orm/*"],
               message: SERVER_ONLY_IMPORT_MESSAGE,
+            },
+            {
+              // Both spellings of the server layer: the `@/lib` alias and any relative path into it.
+              group: ["@/lib", "@/lib/**", "**/lib", "**/lib/**"],
+              message: SERVER_LAYER_IMPORT_MESSAGE,
             },
           ],
         },
