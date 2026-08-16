@@ -24,6 +24,7 @@ const { boardRef, allIssues, refreshAllIssues } = vi.hoisted(() => {
 vi.mock("./beads/issues", () => ({ allIssues, refreshAllIssues }));
 
 import { beads } from "./beads/bd";
+import { withBeadWriteLock } from "./beads/claim-lock";
 import {
   buildEpicSkeleton,
   buildFeatureSkeleton,
@@ -308,6 +309,44 @@ describe("createDraftFeature — what the Add-work commit lands", () => {
 
     expect(refreshAllIssues).toHaveBeenCalledWith(target.repoPath);
     expect(allIssues).not.toHaveBeenCalled();
+  });
+
+  // The re-check is a read, so on its own it only narrows the window: an approve or a claim landing
+  // between it and the child write still converts a live run target into a container behind its
+  // runner's back. Both halves therefore run on the epic's write chain — the one approve and claim
+  // queue on — so nothing can move the epic between the verdict and the write it authorized.
+  it("holds the epic's write lock across the re-check and the child write", async () => {
+    boardIs(bead({ id: "p-1", issue_type: "epic" }));
+    const target = project();
+    const order: string[] = [];
+
+    let checking!: () => void;
+    const checkStarted = new Promise<void>((resolve) => (checking = resolve));
+    refreshAllIssues.mockImplementationOnce(async () => {
+      checking();
+      return boardRef.current;
+    });
+    // The write is given real duration on purpose: an approve queued mid-check runs within
+    // microtasks when nothing orders it, so a zero-cost write would let this pass unlocked.
+    vi.spyOn(beads, "create").mockImplementation(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      order.push("create");
+      return "p-9";
+    });
+
+    const commit = createDraftFeature(target, {
+      feature: FEATURE,
+      epic: { kind: "existing", id: "p-1" },
+    });
+    // Queued while the commit sits mid-check: unlocked, this approve would run in that very window.
+    await checkStarted;
+    const approve = withBeadWriteLock(target.repoPath, "p-1", async () => {
+      order.push("approve");
+    });
+
+    await expect(commit).resolves.toMatchObject({ id: "p-9", epicId: "p-1" });
+    await approve;
+    expect(order).toEqual(["create", "approve"]);
   });
 
   it("still accepts an approved epic that already groups features — it is not the run target", async () => {

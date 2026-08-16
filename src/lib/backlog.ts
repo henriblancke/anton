@@ -1,5 +1,6 @@
 import { beads, labelValueOf, type Bead } from "./beads/bd";
 import { ownerOf } from "./beads/claim";
+import { withBeadWriteLock } from "./beads/claim-lock";
 import { validateBeadContract, type ContractViolation } from "./beads/contract";
 import { beadSkeleton, type BeadSkeleton } from "./beads/formula";
 import { allIssues, refreshAllIssues } from "./beads/issues";
@@ -264,16 +265,16 @@ export async function createDraftEpic(project: Project, draft: EpicDraft): Promi
  * once invalidated it answers with the retained board while refreshing behind the request — so the
  * shape page's own warming would let this accept an epic another machine has since closed,
  * abandoned, or approved as a standalone run target. The same reason approve/claim/move force a
- * fresh read before they decide. */
-async function resolveExistingEpic(project: Project, id: string): Promise<string> {
-  const chosen = id.trim();
-  if (!chosen) throw new DraftEpicError("no epic chosen — a feature must attach to one");
+ * fresh read before they decide.
+ *
+ * Call this only while holding the epic's write lock: a verdict is worth exactly as long as nothing
+ * can move the epic before the child write it authorizes (see {@link createDraftFeature}). */
+async function assertEpicEligible(project: Project, epicId: string): Promise<void> {
   const all = await refreshAllIssues(project.repoPath);
-  const bead = all.find((b) => b.id === chosen);
-  if (!bead) throw new DraftEpicError(`epic ${chosen} is not on the board`);
+  const bead = all.find((b) => b.id === epicId);
+  if (!bead) throw new DraftEpicError(`epic ${epicId} is not on the board`);
   const reason = ineligibleReason(bead, all);
   if (reason) throw new DraftEpicError(reason);
-  return chosen;
 }
 
 /**
@@ -288,6 +289,18 @@ async function resolveExistingEpic(project: Project, id: string): Promise<string
  * the atomic form and `beads.create` does not speak it, so a failing feature write can strand a
  * just-created epic — named in the error rather than swallowed, because a silent orphan on the
  * roadmap is worse than a loud one.
+ *
+ * Attaching to an EXISTING epic takes that epic's write lock across BOTH the eligibility re-check
+ * and the child write — the same per-bead chain approve and claim queue on (beads/claim-lock.ts).
+ * The re-check alone is not enough: it answers from a read, and an approval or a claim landing
+ * between that read and `beads.create` turns a live standalone run target into a container behind
+ * its own runner's back — execute-epic's `isRunTarget` gate poison-parks the queued run, and a human
+ * claim becomes unreleasable because the claim route 422s a container. Under the lock the two
+ * outcomes are the only ones left: the approval lands first and the re-check refuses the draft, or
+ * the feature lands first and the approval decides against a board that already holds it.
+ *
+ * A NEW epic needs no such window closed — it is minted by this very call, so there is no run to
+ * strand and nothing has been handed its id yet.
  */
 export async function createDraftFeature(
   project: Project,
@@ -297,24 +310,30 @@ export async function createDraftFeature(
   const feature = await buildFeatureSkeleton(project, draft.feature);
   assertContract(draft.feature.title.trim(), feature, []);
 
-  const epicId =
-    target.kind === "new"
-      ? await createDraftEpic(project, target.epic)
-      : await resolveExistingEpic(project, target.id);
+  const attach = async (epicId: string, epicCreated: boolean): Promise<CreatedFeature> => {
+    try {
+      const id = await beads.create(project.repoPath, {
+        title: draft.feature.title.trim(),
+        type: feature.type,
+        description: feature.description,
+        // Mirrored into bd's own field so `bd lint` and the board card read the same criteria the
+        // description states — the same pairing the epic write makes.
+        acceptance: feature.acceptance,
+        deps: [`parent-child:${epicId}`],
+      });
+      return { id, epicId, epicCreated };
+    } catch (err) {
+      const stray = epicCreated ? ` — epic ${epicId} was created and is now empty` : "";
+      throw new Error(`${(err as Error).message}${stray}`);
+    }
+  };
 
-  try {
-    const id = await beads.create(project.repoPath, {
-      title: draft.feature.title.trim(),
-      type: feature.type,
-      description: feature.description,
-      // Mirrored into bd's own field so `bd lint` and the board card read the same criteria the
-      // description states — the same pairing the epic write makes.
-      acceptance: feature.acceptance,
-      deps: [`parent-child:${epicId}`],
-    });
-    return { id, epicId, epicCreated: target.kind === "new" };
-  } catch (err) {
-    const stray = target.kind === "new" ? ` — epic ${epicId} was created and is now empty` : "";
-    throw new Error(`${(err as Error).message}${stray}`);
-  }
+  if (target.kind === "new") return attach(await createDraftEpic(project, target.epic), true);
+
+  const epicId = target.id.trim();
+  if (!epicId) throw new DraftEpicError("no epic chosen — a feature must attach to one");
+  return withBeadWriteLock(project.repoPath, epicId, async () => {
+    await assertEpicEligible(project, epicId);
+    return attach(epicId, false);
+  });
 }

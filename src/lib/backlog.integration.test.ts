@@ -90,7 +90,9 @@ describeBd("Add-work commit (real bd · feature under an epic)", () => {
   });
 
   it("attaches a second feature to the epic already on the board", async () => {
-    const epicId = (await board()).find((b) => b.issue_type === "epic")!.id;
+    const epic = (await board()).find((b) => b.issue_type === "epic");
+    if (!epic) throw new Error("expected the epic the first case created to still be on the board");
+    const epicId = epic.id;
 
     const created = await createDraftFeature(project, {
       feature: { ...FEATURE, title: "Export a report view to PDF" },
