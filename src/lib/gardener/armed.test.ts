@@ -94,6 +94,9 @@ const log = vi.fn<(chunk: string) => Promise<void>>();
 const nudge = vi.fn();
 /** Everything the pass recorded, as one string — the record a founder reads on the jobs page. */
 const recorded = (): string => log.mock.calls.map(([chunk]) => chunk).join("");
+/** The walk's console line — the OTHER surface, and the one an operator greps after a 03:00 pass. */
+const consoleSummary = (): string =>
+  vi.mocked(console.log).mock.calls.map((args) => args.join(" ")).join("\n");
 
 function walk(created: EmittedProposal[], signal: AbortSignal) {
   return applyArmedProposals({
@@ -111,6 +114,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.spyOn(console, "log").mockImplementation(() => {});
   vi.spyOn(console, "error").mockImplementation(() => {});
+  // A record that will not take a write warns rather than throwing (armed.ts `write`).
+  vi.spyOn(console, "warn").mockImplementation(() => {});
   log.mockResolvedValue(undefined);
   pullMock.mockResolvedValue(undefined);
   pushMock.mockResolvedValue("synced");
@@ -506,6 +511,26 @@ describe("armed walk · a rollback that could not finish", () => {
     expect(notes).toContain("(p-1, p-2)");
   });
 
+  it("names it apart from a clean failure in the console summary, not under one 'could not' count", async () => {
+    // The Jobs page already shows the two apart (`stranded` vs `apply-failed`); the console is the
+    // other surface an unattended pass is audited on, and one clause for both tells the operator
+    // grepping it at 03:00 that nothing landed over a board this pass part-moved.
+    applyMock.mockRejectedValueOnce(halfRolledBack("t-1"));
+    applyMock.mockRejectedValueOnce(
+      new ProposalApplyError("failed", "applying p-2 failed: the writes were rolled back"),
+    );
+
+    await walk(filed(3), running());
+
+    const summary = consoleSummary();
+    expect(summary).toContain("could NOT roll back 1 proposal(s)");
+    expect(summary).toContain("(p-1)");
+    // And the rollback that DID finish keeps its own clause — the two never merge into "2 could
+    // not be applied", which is the reading that loses the part-moved board.
+    expect(summary).toContain("1 could not be applied");
+    expect(summary).not.toContain("2 could not be applied");
+  });
+
   it("still reports an untouched board when the rollback DID put everything back", async () => {
     // The ordinary half-applied cluster: nothing survives the undo, so nothing is owed a publish and
     // the next tier's snapshot is still good.
@@ -558,6 +583,61 @@ describe("armed walk · publish", () => {
     );
     expect(summary.notes.join("\n")).toContain("(p-1, p-2)");
     expect(summary.notes.join("\n")).toContain("conflict in issues");
+  });
+
+  /** The session log refusing exactly the correction — the counts above it landed fine. */
+  const logRefusing = (marker: string) =>
+    log.mockImplementation(async (chunk: string) => {
+      if (chunk.includes(marker)) throw new Error("session log store is unavailable");
+    });
+
+  it("fails the pass when the note saying the moves are unpublished cannot be recorded", async () => {
+    // Both halves failed: the moves are on this machine only, and the record still calls them
+    // APPLIED. Resolving here would file a pass that finished over a record that lies about the
+    // shared board — and nothing later corrects it, because no pass re-decides a filed proposal.
+    pushMock.mockRejectedValue(new Error("bd dolt push failed: conflict in issues"));
+    logRefusing("could not publish");
+
+    await expect(walk(filed(2), running())).rejects.toThrow(
+      /claims moves the shared board has not received/,
+    );
+
+    // The applies themselves stand — a failed pass is not a rollback, and the durable sync retry the
+    // nudge enqueued is still what lands them.
+    expect(applyMock).toHaveBeenCalledTimes(2);
+    expect(nudge).toHaveBeenCalled();
+    expect(recorded()).toContain("— APPLIED: closed the subject of p-1 as shipped");
+  });
+
+  it("does not fail a pass that moved nothing, however the note went", async () => {
+    // Every ask refused: the pass wrote reasons onto its own proposals and touched no subject, so an
+    // unpublished note is worth the console warning and not a failed pass. Failing here would park
+    // the armed path over the outcome that IS the armed path working.
+    applyMock.mockRejectedValue(
+      new ProposalApplyError("refused", "applying p-1 was refused: the premise moved"),
+    );
+    pushMock.mockRejectedValue(new Error("bd dolt push failed: conflict in issues"));
+    logRefusing("could not publish");
+
+    const result = await walk(filed(2), running());
+
+    expect(result.records.map((r) => r.outcome)).toEqual(["refused", "refused"]);
+  });
+
+  it("lets the cancel win when a stopped walk cannot record the note either", async () => {
+    // Two failures at once, and the abort is the louder one: the runner reads its reason to record a
+    // stopped pass rather than a done one, and swapping it for the log failure would file a
+    // guillotined pass as an ordinary error the runner retries against a board it never re-reads.
+    const reason = new Error("the runner stopped this job");
+    const controller = new AbortController();
+    applyMock.mockImplementationOnce(async (_repo, proposal) => {
+      controller.abort(reason);
+      return { summary: `closed the subject of ${proposal.id} as shipped`, changed: ["t-1"] };
+    });
+    pushMock.mockRejectedValue(new Error("bd dolt push failed: remote unreachable"));
+    logRefusing("could not publish");
+
+    await expect(walk(filed(2), controller.signal)).rejects.toBe(reason);
   });
 
   it("stays silent when the publish lands", async () => {

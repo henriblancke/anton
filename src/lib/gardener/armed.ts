@@ -163,9 +163,10 @@ function armed(
 }
 
 /**
- * Apply what this pass filed, for the kinds armed at `apply`. Throws for exactly one reason — the
- * pass was CANCELLED (see the checks below) — and for no other: an armed proposal that cannot be
- * applied is a line in the log and an ask still standing on the board.
+ * Apply what this pass filed, for the kinds armed at `apply`. Throws for two reasons and no others:
+ * the pass was CANCELLED (see the checks below), or it made unattended moves it could neither
+ * publish nor report ({@link stranding}). An armed proposal that cannot be APPLIED is neither — it
+ * is a line in the log and an ask still standing on the board.
  *
  * The cap counts ATTEMPTS, not successful writes: it bounds how much unattended work one pass does,
  * and a pass that refused ten in a row has still spent ten applies' worth of board reads and locks.
@@ -234,21 +235,23 @@ export async function applyArmedProposals(input: ArmedInput): Promise<ArmedResul
    * the shared board never received. The nudge still runs first: it is what counts the write into
    * the unpushed backlog and enqueues the durable retry that parks for a human on exhaustion. This
    * only adds the answer an unattended pass cannot get from a fire-and-forget call.
+   *
+   * Returns the correction it could NOT record, and only for stranded moves — see {@link stranding}.
    */
-  const publish = async (): Promise<void> => {
-    if (records.length === 0) return;
+  const publish = async (): Promise<string | undefined> => {
+    if (records.length === 0) return undefined;
     // Once, on the way out, whatever the outcomes were: a REFUSAL writes too (apply attaches its
     // reason to the proposal), and the nudge coalesces per repo — so a pass that happened to write
     // nothing costs a no-op push, while one that moved a bead never leaves it on this machine alone.
     input.nudge();
     console.log(`${input.producer} ${summaryOf(records)}`);
     const unpublished = await pushFailure(input.repo);
-    if (!unpublished) return;
+    if (!unpublished) return undefined;
     // The record's own correction, in the one place a founder reads the pass: what is written above
     // as APPLIED happened HERE and has not reached the shared board. Shaped as a pass note (no
     // `(kind)` group), so it lands beside the counts rather than as a seventh proposal (record.ts).
     const applied = records.filter(movedTheBoard).map((r) => r.proposal);
-    await write(
+    const recorded = await write(
       input,
       `APPLY could not publish this pass's board writes — ` +
         (applied.length > 0
@@ -258,6 +261,7 @@ export async function applyArmedProposals(input: ArmedInput): Promise<ArmedResul
         ` until the sync retry lands them, and another machine's board does not yet show them ` +
         `— ${unpublished}`,
     );
+    return recorded ? undefined : stranding(applied, unpublished);
   };
 
   /** Cancelled mid-walk: name what stays open, publish what landed, and propagate the abort. */
@@ -266,6 +270,9 @@ export async function applyArmedProposals(input: ArmedInput): Promise<ArmedResul
     untried: Array<{ proposal: EmittedProposal }>,
   ): Promise<never> => {
     await write(input, stop("the pass was cancelled", untried));
+    // The unrecorded correction is dropped rather than raised: the cancel is already the louder
+    // answer — the runner records a stopped pass, never a clean one — and swapping the abort reason
+    // for a log failure would file a guillotined pass as an ordinary error.
     await publish();
     throw signal.reason;
   };
@@ -349,7 +356,7 @@ export async function applyArmedProposals(input: ArmedInput): Promise<ArmedResul
     break;
   }
 
-  await publish();
+  const unrecorded = await publish();
   // The one cancel window with no next iteration to catch it: the signal aborted after the last
   // proposal cleared its checkpoints — inside apply's own write, its outcome line, or the awaited
   // publish above. Returning here would hand the runner a handler that RESOLVED, which it records as
@@ -361,7 +368,32 @@ export async function applyArmedProposals(input: ArmedInput): Promise<ArmedResul
     await write(input, stop("the pass was cancelled", []));
     throw input.signal.reason;
   }
+  // Fails the pass, and this is the only thing besides a cancel that does. Every other broken write
+  // this walk survives costs the record a DETAIL; this one costs it the correction that makes the
+  // rest true, and there is no third place the gap could surface — the record says APPLIED, the
+  // shared board has not got it, and a resolved handler is filed as a pass that finished. So the
+  // pass fails instead: the runner retries it, and a log that keeps refusing parks it for a human
+  // (jobs/runner.ts), which is the audience an unpublished unattended write was always for.
+  if (unrecorded) throw new Error(unrecorded);
   return { records, attempted: records.length, deferred: held };
+}
+
+/**
+ * The failure a pass cannot be allowed to finish over: unattended moves that reached THIS board,
+ * never reached the shared one, and whose correction the record refused.
+ *
+ * Only for moves. A pass whose asks the board all refused wrote reasons onto its own proposals and
+ * nothing else — an unpublished note is worth the console warning `write` already made, not a failed
+ * pass — while a MOVE the record still calls `APPLIED` is the record lying about the board, which is
+ * the one thing this walk's awaited publish exists to prevent.
+ */
+function stranding(applied: string[], unpublished: string): string | undefined {
+  if (applied.length === 0) return undefined;
+  return (
+    `the armed pass applied ${applied.length} proposal(s) (${applied.join(", ")}) that could not be ` +
+    `published (${unpublished}), and the note saying so could not be recorded — the pass record ` +
+    `claims moves the shared board has not received, so the pass is failed rather than filed as done`
+  );
 }
 
 /**
@@ -463,7 +495,9 @@ async function pullFailure(repo: string): Promise<string | undefined> {
  *
  * Failing here does NOT fail the pass: the board writes happened, the record above is what says so,
  * and the durable sync-push job the nudge enqueued keeps retrying and parks for a human on
- * exhaustion. What this buys is that the record never claims a move the shared board cannot see.
+ * exhaustion. What this buys is that the record never claims a move the shared board cannot see —
+ * which is why failing to RECORD that answer does fail the pass ({@link stranding}): the correction
+ * is the whole point of asking, and an unpublished move nothing says is unpublished is the lie back.
  */
 async function pushFailure(repo: string): Promise<string | undefined> {
   try {
@@ -608,6 +642,18 @@ const VERDICT: Record<ArmedOutcome, ApplyVerdict> = {
 };
 
 /**
+ * The failure that MOVED the board: a `failed` apply whose ROLLBACK could not put every write back
+ * (apply.ts `stepFailure`). It rides under the `error` outcome because the apply did fail, so the
+ * beads it left standing are readable only off `changed`.
+ *
+ * Named once because two surfaces answer off it — the verdict a record line is written under and the
+ * clause the console summary greps as — and a founder who reads "could not apply" on one and "part-
+ * moved" on the other has no way to tell which is lying.
+ */
+const strandedWrite = (record: ArmedRecord): boolean =>
+  record.outcome === "error" && record.changed.length > 0;
+
+/**
  * The verdict this record is WRITTEN under — the outcome's, except for the one failure that moved
  * the board.
  *
@@ -618,7 +664,7 @@ const VERDICT: Record<ArmedOutcome, ApplyVerdict> = {
  * would say "nothing landed" over beads this pass moved and cannot un-move.
  */
 function verdictOf(record: ArmedRecord): ApplyVerdict {
-  if (record.outcome === "error" && record.changed.length > 0) return "COULD NOT ROLL BACK";
+  if (strandedWrite(record)) return "COULD NOT ROLL BACK";
   return VERDICT[record.outcome];
 }
 
@@ -639,6 +685,12 @@ function summaryOf(records: ArmedRecord[]): string {
   const of = (outcome: ArmedOutcome) => records.filter((r) => r.outcome === outcome);
   const applied = of("applied");
   const unsettled = of("unsettled");
+  // The `error` outcome covers two boards, and the Jobs page already shows them apart (`stranded` vs
+  // `apply-failed`, via {@link verdictOf}). One clause for both would hand the console — the surface
+  // an operator greps at 03:00 — the reading that verdict exists to prevent: a rollback that left
+  // beads moved counted as a failure nothing landed from.
+  const stranded = of("error").filter(strandedWrite);
+  const failed = of("error").filter((r) => !strandedWrite(r));
   const clauses = [
     applied.length > 0
       ? `applied ${applied.length} proposal(s) unattended ` +
@@ -653,7 +705,13 @@ function summaryOf(records: ArmedRecord[]): string {
         `stay open (${unsettled.map((r) => r.proposal).join(", ")})`
       : undefined,
     of("refused").length > 0 ? `${of("refused").length} refused` : undefined,
-    of("error").length > 0 ? `${of("error").length} could not be applied` : undefined,
+    // Spelled out with its ids, like the unsettled clause and for the same reason: the board is
+    // part-moved and no later pass undoes it, so this is the clause that sends somebody to look.
+    stranded.length > 0
+      ? `could NOT roll back ${stranded.length} proposal(s) — the board is part-moved and needs a ` +
+        `human (${stranded.map((r) => r.proposal).join(", ")})`
+      : undefined,
+    failed.length > 0 ? `${failed.length} could not be applied` : undefined,
   ].filter((clause): clause is string => clause !== undefined);
   return clauses.join(", ");
 }
