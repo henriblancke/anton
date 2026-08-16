@@ -39,7 +39,14 @@ import { formatAntonResult, parseAntonResult, type AntonResult } from "../claude
 import { runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
 import { loadSkill } from "../claude/prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
-import { commitAll, openPullRequest, type PullRequest } from "../git/ops";
+import {
+  commitAll,
+  commitMarker,
+  openPullRequest,
+  readWorktreeState,
+  worktreeHasCommitFor,
+  type PullRequest,
+} from "../git/ops";
 import { resolveVerifyGates, type ProjectSettings } from "../projects";
 import { ANTON_REPO_URL } from "../repo";
 import {
@@ -161,6 +168,19 @@ export interface StepContext {
    * ONE session across several steps — as execute-epic does per ticket — keeps doing so.
    */
   session?: JobSession;
+  /**
+   * The worktree's HEAD when THIS ticket started, read before any of its steps ran.
+   *
+   * `step:commit` needs it to tell the two states an empty index can mean apart: an agent that
+   * changed nothing, and an agent that committed its own work. Only HEAD separates them, and only a
+   * per-ticket anchor makes the question answerable — on a multi-ticket run the branch already
+   * carries earlier tickets' commits, so "HEAD is ahead of the base" is true whether or not THIS
+   * ticket did anything.
+   *
+   * Absent when the caller could not read it (or invoked a handler directly): `step:commit` then
+   * falls back to the index alone, which is exactly the behaviour that predates this field.
+   */
+  ticketStartHead?: string;
   /** Re-assert the cross-machine run-lease; throws when it has lapsed (anton-jz1). */
   assertLeaseHeld?: () => void;
   /**
@@ -322,13 +342,76 @@ export async function reviewStep(ctx: StepContext): Promise<StepResultWith<"revi
  * `step:commit` — commit whatever the run changed. An empty tree is reported as `ok: false`, never
  * as a quiet success: a clean agent exit that left no diff delivered nothing, and git is the run's
  * evidence of record.
+ *
+ * "Empty tree" means the ticket produced NOTHING — not merely that the index was empty when this
+ * step ran (anton-8t1f). The base contract tells the agent not to commit, but agents do it anyway,
+ * and a self-committed ticket leaves the same empty index as one that did nothing at all. Reading
+ * the index alone then discards real, gate-passed work: the delivery-evidence gate blocks the
+ * ticket, halts the epic and parks the job as poison, writing "nothing landed" onto a board while
+ * the branch carries the commits that say otherwise. Worse, the state is self-reinforcing — the
+ * worktree is reused on resume, so the next run finds the work already done, reports `blocked` for
+ * the honest reason, and is read as corroborating the very block it contradicts.
+ *
+ * So HEAD is consulted whenever the index is empty, and three cases fall out:
+ *
+ * 1. **HEAD stood still** — nothing was delivered. The gate's original verdict, unchanged.
+ * 2. **HEAD moved on the run's branch** — the agent committed its own work. That IS delivery, and
+ *    it is already where the PR push will find it. Adopted, with a marker commit recording the
+ *    ticket attribution the agent's own subjects lack (see {@link commitMarker}).
+ * 3. **HEAD moved somewhere else** — a branch of the agent's own, or a detached HEAD. The commits
+ *    are real but unreachable: anton pushes the run's branch BY NAME, so they would never reach the
+ *    PR while every later step read them as present. Poison, so a human moves them back by hand
+ *    rather than a retry burying them deeper — the same call {@link runReviewGate} makes for a
+ *    review fix that wanders off-branch.
  */
 export async function commitStep(ctx: StepContext): Promise<StepResultWith<"committed">> {
   const { committed } = await commitAll(ctx.worktreePath, commitMessage(ctx));
+  if (committed) return { ok: true, detail: "committed", facts: { committed: true } };
+
+  // No anchor to compare against: fall back to the index alone. The pre-anton-8t1f behaviour, kept
+  // deliberately — a missing anchor must not be able to manufacture the false success the gate
+  // exists to catch.
+  if (!ctx.ticketStartHead) {
+    return { ok: false, detail: "nothing to commit (zero diff)", facts: { committed: false } };
+  }
+
+  // `commitAll` just ran `git add -A` here, so git is demonstrably working: a read that fails now is
+  // a real fault and propagates, rather than being absorbed into a delivery verdict either way.
+  const state = await readWorktreeState(ctx.worktreePath);
+  if (state.head === ctx.ticketStartHead) {
+    return { ok: false, detail: "nothing to commit (zero diff)", facts: { committed: false } };
+  }
+
+  const subject = stepSubject(ctx);
+  if (state.ref !== `refs/heads/${ctx.branch}`) {
+    throw new PoisonEpic(
+      `${subject.id} committed its work onto ${state.ref ? `${state.ref}` : `a detached HEAD (${state.head})`}, ` +
+        `not the run's ${ctx.branch}. Parked instead of retried — anton pushes the run's branch by name, so ` +
+        `those commits would never reach the PR while every later step read them as delivered. Move them onto ` +
+        `${ctx.branch} by hand, then resume the run`,
+    );
+  }
+
+  // The agent's commits keep their own subjects, so `worktreeHasCommitFor` cannot see this ticket in
+  // them and a resume would re-run it onto a tree with nothing left to do. The marker is what makes
+  // the work discoverable under the ticket's own id — and it is skipped when the agent happened to
+  // write a conforming subject itself, so nothing is recorded twice.
+  const attributed = await worktreeHasCommitFor(ctx.worktreePath, subject.id);
+  if (!attributed) {
+    await commitMarker(
+      ctx.worktreePath,
+      `${subject.id}: ${subject.title}\n\n` +
+        `The implementing agent committed this ticket's work itself, against the operating contract ` +
+        `("anton commits your working-tree changes"). Its commits are the delivery and are left as they ` +
+        `are; this empty commit records the ticket they belong to, which their own subjects do not.`,
+    );
+  }
   return {
-    ok: committed,
-    detail: committed ? "committed" : "nothing to commit (zero diff)",
-    facts: { committed },
+    ok: true,
+    detail: attributed
+      ? "the agent committed its own work — adopted as delivered"
+      : "the agent committed its own work — adopted as delivered, ticket attribution recorded",
+    facts: { committed: true },
   };
 }
 

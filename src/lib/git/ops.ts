@@ -321,6 +321,10 @@ function exitedWith(error: unknown, code: number): boolean {
 /**
  * Stage everything in the worktree and commit. Returns `{ committed: false }` when there is
  * nothing to commit (claude made no changes) — the caller decides whether that's acceptable.
+ *
+ * An empty index is NOT proof that nothing was delivered: an agent that committed its own work
+ * (against the base contract, but it happens) leaves exactly the same empty index. Only HEAD tells
+ * the two apart — see `commitStep`, which is the caller that has to.
  */
 export async function commitAll(
   worktreePath: string,
@@ -335,6 +339,18 @@ export async function commitAll(
     await git(worktreePath, ["commit", "-m", message]);
     return { committed: true };
   }
+}
+
+/**
+ * Record an EMPTY commit — a marker that carries a message and no diff.
+ *
+ * The one caller is `step:commit` adopting work an agent committed itself. Those commits are real
+ * and keep their own messages, but they don't carry the `<ticketId>:` subject that
+ * {@link worktreeHasCommitFor} reads, so without a marker a resume cannot see that the ticket's
+ * work is already on the branch and re-runs it — onto a tree where there is nothing left to do.
+ */
+export async function commitMarker(worktreePath: string, message: string): Promise<void> {
+  await git(worktreePath, ["commit", "--allow-empty", "-m", message]);
 }
 
 export async function hasRemote(repoPath: string, name = "origin"): Promise<boolean> {
