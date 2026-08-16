@@ -119,9 +119,9 @@ function EpicSection({
           tickets stop being claimable. Worth saying before the write, not after. */}
       {chosen && chosen.looseTickets > 0 && (
         <p className="text-[11px] leading-snug text-amber-600 dark:text-amber-400">
-          {chosen.looseTickets} ticket{chosen.looseTickets === 1 ? "" : "s"} hang directly off this
-          epic. Landing a feature here makes it a container, and those tickets stop being runnable —
-          re-home them under a feature from the board.
+          {chosen.looseTickets === 1 ? "1 ticket hangs" : `${chosen.looseTickets} tickets hang`}{" "}
+          directly off this epic. Landing a feature here makes it a container, and those tickets stop
+          being runnable — re-home them under a feature from the board.
         </p>
       )}
 

@@ -231,7 +231,7 @@ describe("interpolation", () => {
   });
 
   it("does not count a var referenced only in the step title — the skeleton never emits it", () => {
-    // `renderBeadSkeleton` renders description + mirrored acceptance only; `createDraftEpic` uses
+    // `renderBeadSkeleton` renders description + mirrored acceptance only; the Add-work commit uses
     // the draft's own title. A `{{outcome}}` living solely in `step.title` is still discarded.
     const doc = JSON.stringify({
       formula: "anton-bead",

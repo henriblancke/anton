@@ -73,7 +73,7 @@ describe("POST /backlog", () => {
     expect(createDraftFeature).toHaveBeenCalledWith(project, draft);
   });
 
-  it.each(["goal", "acceptance", "context", "outOfScope", "verify"] as const)(
+  it.each(["title", "goal", "acceptance", "context", "outOfScope", "verify"] as const)(
     "rejects a draft missing the feature's %s — the contract is not optional here",
     async (field) => {
       const res = await post({ ...DRAFT, feature: { ...FEATURE, [field]: "" } });
@@ -94,7 +94,7 @@ describe("POST /backlog", () => {
     expect(createDraftFeature).not.toHaveBeenCalled();
   });
 
-  it.each(["goal", "successCriteria"] as const)(
+  it.each(["title", "goal", "successCriteria"] as const)(
     "rejects a NEW epic missing its %s",
     async (field) => {
       const res = await post({

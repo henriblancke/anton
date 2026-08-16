@@ -1,4 +1,4 @@
-import { beads, labelValueOf, type Bead } from "./beads/bd";
+import { beads, labelValueOf, type Bead, type GraphPlanNode } from "./beads/bd";
 import { ownerOf } from "./beads/claim";
 import { withBeadWriteLock } from "./beads/claim-lock";
 import { validateBeadContract, type ContractViolation } from "./beads/contract";
@@ -231,28 +231,30 @@ function assertContract(title: string, skeleton: BeadSkeleton, labels: string[])
 }
 
 /**
- * Create the open, unapproved epic bead from an accepted draft and return its id. No `approved`
- * label + open status → the board derives `backlog`. Bead writes go through `bd` (DESIGN.md §3).
+ * Render and judge the open, unapproved epic an accepted draft shapes, as the graph-plan node that
+ * lands it. No `approved` label + open status → the board derives `backlog`.
  *
- * The rendered skeleton is judged with the contract validator BEFORE the bead exists. A non-empty
+ * The rendered skeleton is judged with the contract validator BEFORE any bead exists. A non-empty
  * field can still be a placeholder ("- [ ] TODO — decide later"), which the validator classifies
  * as unwritten — creating that bead would land it instantly contract-blocked and unapprovable,
  * the opposite of this path's by-construction guarantee. Refusing here keeps the founder in the
  * form, where the fix is one edit away.
  */
-export async function createDraftEpic(project: Project, draft: EpicDraft): Promise<string> {
+async function draftEpicNode(
+  project: Project,
+  draft: EpicDraft,
+  key: string,
+): Promise<GraphPlanNode> {
   const skeleton = await buildEpicSkeleton(project, draft);
   const labels = [`area:${draft.area.trim()}`];
   assertContract(draft.title.trim(), skeleton, labels);
-  return beads.create(project.repoPath, {
+  return {
+    key,
     title: draft.title.trim(),
     type: skeleton.type,
     description: skeleton.description,
-    // The description is the canonical home of the contract; the mirror is what `bd lint` and the
-    // board card read (parseAcceptance falls through to this field for an epic).
-    acceptance: skeleton.acceptance,
     labels,
-  });
+  };
 }
 
 /** The chosen epic must still be eligible on a FRESH board read, by the same rule the picker offered
@@ -267,12 +269,13 @@ export async function createDraftEpic(project: Project, draft: EpicDraft): Promi
  * a standalone run target. But `refreshAllIssues` is no better HERE, because a refresh whose
  * generation is bumped mid-flight (any other bd write to this repo) discards what it loaded and
  * answers with the RETAINED board instead (beads/snapshot.ts) — last-good data is right for a view
- * and wrong for a gate that is about to write. It cuts both ways: a retained board can hide the
- * approval this gate exists to catch, and on a NEW epic it can predate the epic's own creation and
- * refuse a perfectly good draft. The approve route's in-lock verdict reads raw for the same reason.
+ * and wrong for a gate that is about to write: a retained board can hide the very approval this gate
+ * exists to catch. The approve route's in-lock verdict reads raw for the same reason.
  *
- * Call this only while holding the epic's write lock: a verdict is worth exactly as long as nothing
- * can move the epic before the child write it authorizes (see {@link createDraftFeature}). */
+ * Only the EXISTING-epic path needs this: a NEW epic lands in the same atomic plan as its child, so
+ * there is no board state to re-judge. Call it only while holding the epic's write lock — a verdict
+ * is worth exactly as long as nothing can move the epic before the child write it authorizes (see
+ * {@link createDraftFeature}). */
 async function assertEpicEligible(project: Project, epicId: string): Promise<void> {
   const all = await loadAllIssues(project.repoPath);
   const bead = all.find((b) => b.id === epicId);
@@ -281,78 +284,82 @@ async function assertEpicEligible(project: Project, epicId: string): Promise<voi
   if (reason) throw new DraftEpicError(reason);
 }
 
+/** Plan-local handles for the epic+feature tree a NEW-epic draft lands in one write. */
+const EPIC_KEY = "epic";
+const FEATURE_KEY = "feature";
+
 /**
  * Create the open, unapproved FEATURE bead from an accepted draft, attached to its epic (anton-h1ds).
  * The feature — not the epic — is what anton runs: one worktree, one PR. This is the one write behind
  * "Send to backlog", and it is deliberately the only shape this path can produce, so the UI producer
  * and the `/shape` CLI producer agree on what a run target is.
  *
- * Both skeletons are judged BEFORE any bead exists — the feature's here, the epic's inside
- * {@link createDraftEpic}, which validates ahead of its own write — so a contract refusal can never
- * leave a half-written tree. What remains unatomic is the pair of bd writes: bd's `--graph` plan is
- * the atomic form and `beads.create` does not speak it, so a failing feature write can strand a
- * just-created epic — named in the error rather than swallowed, because a silent orphan on the
- * roadmap is worse than a loud one.
+ * Every skeleton is judged BEFORE any bead exists — the feature's here, the epic's inside
+ * {@link draftEpicNode} — so a contract refusal can never leave a half-written tree.
  *
- * EITHER epic — chosen or just minted — takes that epic's write lock across BOTH the eligibility
- * re-check and the child write: the same per-bead chain approve and claim queue on
- * (beads/claim-lock.ts). The re-check alone is not enough: it answers from a read, and an approval
- * or a claim landing between that read and `beads.create` turns a live standalone run target into a
- * container behind its own runner's back — execute-epic's `isRunTarget` gate poison-parks the queued
- * run, and a human claim becomes unreleasable because the claim route 422s a container. Under the
- * lock the two outcomes are the only ones left: the approval lands first and the re-check refuses
- * the draft (loudly, naming the epic), or the feature lands first and the approval refuses. Both
- * halves are needed — the approve route takes its own run-target verdict INSIDE this same lock,
- * because a check it made before queuing on the lock says nothing about the board it is about to
- * write to.
+ * The two shapes of draft need two different guarantees, and each takes the one bd actually offers:
  *
- * A NEW epic gets the same treatment rather than a "the window is too small to hit" argument: it is
- * childless — and therefore a run target of its own — from the instant `bd create` returns until the
- * feature lands, and it is on the shared board for that whole interval even though this call has yet
- * to hand anyone its id. Two writes cannot be made atomic here (see above), so the reachable states
- * are made safe instead, and one invariant covers both shapes.
+ * **A NEW epic goes in ONE write**, as a `bd create --graph` plan ({@link beads.createGraph}). Two
+ * sequential creates cannot be made atomic, and the failure was not hypothetical: a feature write
+ * that timed out or was refused left the epic it had just minted permanently on the roadmap with
+ * nothing under it, and the founder's unchanged retry minted a second one beside it. The plan also
+ * closes the window this path used to have to defend with a lock — a just-minted childless epic is a
+ * run target of its own, so between the two writes another machine could approve or claim it and
+ * have the feature strand that run. bd rolls the whole plan back on any failure, so the epic is
+ * never on the shared board without its child and there is no window to defend.
+ *
+ * **An EXISTING epic takes that epic's write lock** across both the eligibility re-check and the
+ * child write — the same per-bead chain approve and claim queue on (beads/claim-lock.ts). The
+ * re-check alone is not enough: it answers from a read, and an approval or a claim landing between
+ * that read and the write turns a live standalone run target into a container behind its own
+ * runner's back — execute-epic's `isRunTarget` gate poison-parks the queued run, and a human claim
+ * becomes unreleasable because the claim route 422s a container. Under the lock the two outcomes are
+ * the only ones left: the approval lands first and the re-check refuses the draft (naming the epic),
+ * or the feature lands first and the approval refuses. Both halves are needed — the approve route
+ * takes its own run-target verdict INSIDE this same lock, because a check it made before queuing on
+ * the lock says nothing about the board it is about to write to.
  */
 export async function createDraftFeature(
   project: Project,
   draft: ShapeDraft,
 ): Promise<CreatedFeature> {
   const target = draft.epic;
+  const title = draft.feature.title.trim();
   const feature = await buildFeatureSkeleton(project, draft.feature);
-  assertContract(draft.feature.title.trim(), feature, []);
+  assertContract(title, feature, []);
 
-  const attach = (epicId: string): Promise<string> =>
-    beads.create(project.repoPath, {
-      title: draft.feature.title.trim(),
-      type: feature.type,
-      description: feature.description,
-      // Mirrored into bd's own field so `bd lint` and the board card read the same criteria the
-      // description states — the same pairing the epic write makes.
-      acceptance: feature.acceptance,
-      deps: [`parent-child:${epicId}`],
+  if (target.kind === "new") {
+    const epicNode = await draftEpicNode(project, target.epic, EPIC_KEY);
+    const ids = await beads.createGraph(project.repoPath, {
+      nodes: [
+        epicNode,
+        {
+          key: FEATURE_KEY,
+          title,
+          type: feature.type,
+          description: feature.description,
+          parent_key: EPIC_KEY,
+        },
+      ],
     });
-
-  /** Re-judge the epic and hang the feature off it, both on the epic's write chain. */
-  const commit = async (epicId: string, epicCreated: boolean): Promise<CreatedFeature> => {
-    try {
-      const id = await withBeadWriteLock(project.repoPath, epicId, async () => {
-        await assertEpicEligible(project, epicId);
-        return attach(epicId);
-      });
-      return { id, epicId, epicCreated };
-    } catch (err) {
-      // Nothing landed under an epic this call minted moments ago — whether the re-check refused it
-      // or bd failed the write, it is now on the roadmap with nothing under it. Name it: a silent
-      // orphan is worse than a loud one. The error CLASS is preserved so the route still answers a
-      // refused draft with "pick another epic" rather than a 500.
-      if (!epicCreated) throw err;
-      const message = `${(err as Error).message} — epic ${epicId} was created and is now empty`;
-      throw err instanceof DraftEpicError ? new DraftEpicError(message) : new Error(message);
-    }
-  };
-
-  if (target.kind === "new") return commit(await createDraftEpic(project, target.epic), true);
+    return { id: ids[FEATURE_KEY]!, epicId: ids[EPIC_KEY]!, epicCreated: true };
+  }
 
   const epicId = target.id.trim();
   if (!epicId) throw new DraftEpicError("no epic chosen — a feature must attach to one");
-  return commit(epicId, false);
+
+  const id = await withBeadWriteLock(project.repoPath, epicId, async () => {
+    await assertEpicEligible(project, epicId);
+    return beads.create(project.repoPath, {
+      title,
+      type: feature.type,
+      description: feature.description,
+      // Mirrored into bd's own field so `bd lint` and the board card read the same criteria the
+      // description states. The graph path above has no such field and needs none — the plan schema
+      // carries only the description, which is the home both readers check first.
+      acceptance: feature.acceptance,
+      deps: [`parent-child:${epicId}`],
+    });
+  });
+  return { id, epicId, epicCreated: false };
 }

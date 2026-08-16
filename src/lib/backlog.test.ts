@@ -29,7 +29,6 @@ import { withBeadWriteLock } from "./beads/claim-lock";
 import {
   buildEpicSkeleton,
   buildFeatureSkeleton,
-  createDraftEpic,
   createDraftFeature,
   DraftContractError,
   DraftEpicError,
@@ -95,26 +94,23 @@ beforeEach(() => {
 });
 
 /**
- * Stand in for `bd create`, landing each created bead on the mocked board the eligibility re-check
- * then reads — the property that matters for the NEW-epic path, whose re-check runs against an epic
- * this same call minted. `over` decorates the bead the Nth call creates.
+ * Stand in for `bd create --graph`, landing every planned node on the mocked board and answering
+ * bd's key → id map. Keeps the whole plan atomic the way bd is: one call, all or nothing.
  */
-function createLands(...over: Array<Partial<Bead>>) {
+function graphLands() {
   let n = 0;
-  return vi.spyOn(beads, "create").mockImplementation(async (_cwd, opts) => {
-    const id = `p-${10 + n}`;
-    boardRef.current = [
-      ...boardRef.current,
-      bead({
-        id,
-        title: opts.title,
-        issue_type: opts.type,
-        labels: opts.labels,
-        ...over[n],
-      }),
-    ];
-    n += 1;
-    return id;
+  return vi.spyOn(beads, "createGraph").mockImplementation(async (_cwd, plan) => {
+    const ids: Record<string, string> = {};
+    for (const node of plan.nodes) {
+      const id = `p-${10 + n}`;
+      n += 1;
+      ids[node.key] = id;
+      boardRef.current = [
+        ...boardRef.current,
+        bead({ id, title: node.title, issue_type: node.type, labels: node.labels }),
+      ];
+    }
+    return ids;
   });
 }
 
@@ -229,8 +225,12 @@ describe("createDraftFeature — what the Add-work commit lands", () => {
     });
   });
 
-  it("creates the epic first when the founder shapes one, then hangs the feature off it", async () => {
-    const create = createLands();
+  // The whole tree goes in ONE bd write. Two sequential creates cannot be made atomic, and the
+  // failure was not hypothetical: a feature write that timed out stranded the epic it had just
+  // minted, and the unchanged retry minted a second one beside it (codex review, PR #151).
+  it("shapes a new epic and its feature as one atomic graph plan, never two writes", async () => {
+    const createGraph = graphLands();
+    const create = vi.spyOn(beads, "create");
 
     const created = await createDraftFeature(project(), {
       feature: FEATURE,
@@ -238,14 +238,23 @@ describe("createDraftFeature — what the Add-work commit lands", () => {
     });
 
     expect(created).toEqual({ id: "p-11", epicId: "p-10", epicCreated: true });
-    expect(create.mock.calls[0]![1]).toMatchObject({
-      type: "epic",
-      labels: ["area:reports"],
-    });
-    expect(create.mock.calls[1]![1]).toMatchObject({
-      type: "feature",
-      deps: ["parent-child:p-10"],
-    });
+    expect(createGraph).toHaveBeenCalledTimes(1);
+    expect(create).not.toHaveBeenCalled();
+    expect(createGraph.mock.calls[0]![1].nodes).toEqual([
+      expect.objectContaining({ key: "epic", type: "epic", labels: ["area:reports"] }),
+      expect.objectContaining({ key: "feature", type: "feature", parent_key: "epic" }),
+    ]);
+  });
+
+  // bd rolls a failed plan back whole, so a rejection means nothing landed — no orphan epic to name,
+  // and the founder's unchanged retry is the right next move rather than a duplicate-maker.
+  it("leaves no epic behind when the graph write fails", async () => {
+    vi.spyOn(beads, "createGraph").mockRejectedValueOnce(new Error("bd exploded"));
+
+    await expect(
+      createDraftFeature(project(), { feature: FEATURE, epic: { kind: "new", epic: EPIC } }),
+    ).rejects.toThrow("bd exploded");
+    expect(boardRef.current).toEqual([]);
   });
 
   it("refuses a draft that names no epic — never a parentless feature", async () => {
@@ -375,67 +384,26 @@ describe("createDraftFeature — what the Add-work commit lands", () => {
     expect(order).toEqual(["create", "approve"]);
   });
 
-  // A just-minted epic is childless — a run target of its own — from the instant `bd create` returns,
-  // and it is on the shared board for the whole interval before the feature lands. So it gets the
-  // same lock, not a "nobody has its id yet" argument (codex review, PR #151).
-  it("holds the write lock of an epic it just created, too", async () => {
+  // The NEW-epic path needs no lock and no re-check: the epic is never on the shared board without
+  // its child, so there is no childless window for an approve or a claim to land in. Reading the
+  // board at all here would only be a chance to refuse a draft for something the plan makes
+  // unreachable.
+  it("neither locks nor re-reads the board for an epic it creates in the same plan", async () => {
     const target = project();
-    const order: string[] = [];
-
-    let checking!: () => void;
-    const checkStarted = new Promise<void>((resolve) => (checking = resolve));
-    loadAllIssues.mockImplementationOnce(async () => {
-      checking();
-      return boardRef.current;
-    });
-    vi.spyOn(beads, "create")
-      .mockImplementationOnce(async () => {
-        boardIs(bead({ id: "p-10", issue_type: "epic" }));
-        return "p-10";
-      })
-      // The feature write is given real duration on purpose: an approve queued mid-check runs
-      // within microtasks when nothing orders it, so a zero-cost write would pass unlocked.
-      .mockImplementationOnce(async () => {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-        order.push("feature");
-        return "p-11";
-      });
-
-    const commit = createDraftFeature(target, {
-      feature: FEATURE,
-      epic: { kind: "new", epic: EPIC },
-    });
-    // Queued while the commit sits mid-check — the window an approval of the childless epic would
-    // otherwise land in, labelling it `approved` for a runner the feature is about to strand.
-    await checkStarted;
-    const approve = withBeadWriteLock(target.repoPath, "p-10", async () => {
-      order.push("approve");
+    graphLands();
+    const locked: string[] = [];
+    // Held for the whole commit: a path that queued on the epic's chain would deadlock behind this.
+    const held = withBeadWriteLock(target.repoPath, "p-10", async () => {
+      locked.push("holder");
+      await new Promise((resolve) => setTimeout(resolve, 20));
     });
 
-    await expect(commit).resolves.toMatchObject({ id: "p-11", epicId: "p-10", epicCreated: true });
-    await approve;
-    expect(order).toEqual(["feature", "approve"]);
-  });
-
-  // The other order: the approval won the lock, so the epic it minted is now a live run target and
-  // a feature under it would strand that run. The draft is refused — and because that epic exists
-  // only because of this request, the refusal has to name it rather than leave a silent orphan.
-  it("refuses to containerize an epic approved while its own commit waited for the lock", async () => {
-    const create = createLands({ labels: ["approved"] });
-
-    const rejection = await createDraftFeature(project(), {
-      feature: FEATURE,
-      epic: { kind: "new", epic: EPIC },
-    }).then(
-      () => undefined,
-      (e: unknown) => e as Error,
-    );
-
-    expect(rejection).toBeInstanceOf(DraftEpicError);
-    expect(rejection?.message).toContain("approved and running");
-    expect(rejection?.message).toContain("p-10 was created and is now empty");
-    // Refused before the child write: the epic write is the only one that landed.
-    expect(create).toHaveBeenCalledTimes(1);
+    await expect(
+      createDraftFeature(target, { feature: FEATURE, epic: { kind: "new", epic: EPIC } }),
+    ).resolves.toMatchObject({ id: "p-11", epicId: "p-10", epicCreated: true });
+    expect(loadAllIssues).not.toHaveBeenCalled();
+    await held;
+    expect(locked).toEqual(["holder"]);
   });
 
   it("still accepts an approved epic that already groups features — it is not the run target", async () => {
@@ -465,61 +433,44 @@ describe("createDraftFeature — what the Add-work commit lands", () => {
     expect(create).not.toHaveBeenCalled();
   });
 
-  it("rejects a faulted NEW epic before the feature or the epic is written", async () => {
-    const create = vi.spyOn(beads, "create");
-
-    await expect(
-      createDraftFeature(project(), {
-        feature: FEATURE,
-        epic: { kind: "new", epic: { ...EPIC, successCriteria: "- [ ] TODO — decide later" } },
-      }),
-    ).rejects.toThrow(DraftContractError);
-    expect(create).not.toHaveBeenCalled();
-  });
-
-  it("names the epic it just created when the feature write fails, so no orphan is silent", async () => {
-    vi.spyOn(beads, "create")
-      .mockImplementationOnce(async () => {
-        boardIs(bead({ id: "p-10", issue_type: "epic" }));
-        return "p-10";
-      })
-      .mockRejectedValueOnce(new Error("bd exploded"));
-
-    const rejection = await createDraftFeature(project(), {
-      feature: FEATURE,
-      epic: { kind: "new", epic: EPIC },
-    }).then(
-      () => undefined,
-      (e: unknown) => e as Error,
-    );
-    expect(rejection?.message).toContain("bd exploded");
-    expect(rejection?.message).toContain("p-10");
-  });
 });
 
-describe("createDraftEpic — the contract gate ahead of bead creation", () => {
+// The epic half is judged with the same validator, and — like the feature's — ahead of the single
+// write that would land it, so a placeholder draft never becomes a bead the board immediately flags
+// as unapprovable.
+describe("the NEW epic's contract gate, ahead of the graph write", () => {
+  const shapeEpic = (over: Partial<typeof EPIC>) => {
+    const createGraph = vi.spyOn(beads, "createGraph");
+    return createDraftFeature(tempProject(), {
+      feature: FEATURE,
+      epic: { kind: "new", epic: { ...EPIC, ...over } },
+    }).then(
+      () => {
+        throw new Error("expected the draft to be refused");
+      },
+      (e: unknown) => {
+        expect(createGraph).not.toHaveBeenCalled();
+        return e as DraftContractError;
+      },
+    );
+  };
+
   it("rejects criteria that are still a TODO prompt — the bead would land contract-blocked", async () => {
-    await expect(
-      createDraftEpic(tempProject(), { ...EPIC, successCriteria: "- [ ] TODO — decide later" }),
-    ).rejects.toThrow(DraftContractError);
+    await expect(shapeEpic({ successCriteria: "- [ ] TODO — decide later" })).resolves.toBeInstanceOf(
+      DraftContractError,
+    );
   });
 
   it("rejects a prompt-only goal too — Add-work lands zero-violation beads by construction", async () => {
-    await expect(
-      createDraftEpic(tempProject(), { ...EPIC, goal: "TODO — the outcome, one line" }),
-    ).rejects.toThrow(DraftContractError);
+    await expect(shapeEpic({ goal: "TODO — the outcome, one line" })).resolves.toBeInstanceOf(
+      DraftContractError,
+    );
   });
 
   it("names the gap in the error so the route's 422 tells the founder what to fix", async () => {
-    const rejection = await createDraftEpic(tempProject(), {
-      ...EPIC,
-      successCriteria: "- [ ] TODO — decide later",
-    }).then(
-      () => undefined,
-      (e: unknown) => e as DraftContractError,
-    );
-    expect(rejection?.violations.map((v) => v.section)).toEqual(["Success Criteria"]);
-    expect(rejection?.message).toContain("Success Criteria");
+    const rejection = await shapeEpic({ successCriteria: "- [ ] TODO — decide later" });
+    expect(rejection.violations.map((v) => v.section)).toEqual(["Success Criteria"]);
+    expect(rejection.message).toContain("Success Criteria");
   });
 });
 

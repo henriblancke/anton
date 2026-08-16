@@ -115,4 +115,42 @@ describeBd("Add-work commit (real bd · feature under an epic)", () => {
     ).rejects.toThrow(DraftEpicError);
     expect((await board()).length).toBe(before);
   });
+
+  // The property the NEW-epic path buys by going through one `bd create --graph` plan instead of two
+  // creates: a failure anywhere in the tree leaves NOTHING behind, so the founder's unchanged retry
+  // is safe. Only a real bd can prove the rollback — the failure is forced with a `parent_id` the
+  // board does not hold, which bd resolves mid-write, AFTER the first node would have landed.
+  it("rolls the whole plan back when a node fails mid-write — no orphan epic", async () => {
+    const before = await board();
+    // A well-formed id in THIS repo's prefix that names nothing: bd rejects an off-prefix id up
+    // front, which would prove the cheap validation path instead of the mid-write rollback.
+    const absent = `${before[0]!.id.split("-")[0]}-absent`;
+    const rejection = await beads
+      .createGraph(bdRepo.repo, {
+        nodes: [
+          {
+            key: "epic",
+            title: "An epic no failed plan may leave behind",
+            type: "epic",
+            description: "## Goal\n\nAn outcome.\n\n## Success Criteria\n\n- [ ] observable",
+          },
+          {
+            key: "feature",
+            title: "A feature under a parent that is not there",
+            type: "feature",
+            parent_id: absent,
+            description: "## Goal\n\nA change.\n\n## Acceptance Criteria\n\n- [ ] checkable",
+          },
+        ],
+      })
+      .then(
+        () => undefined,
+        (e: unknown) => e as Error,
+      );
+
+    // bd reports a plan failure as JSON on stdout while exiting non-zero, so the reason has to be
+    // lifted off there or the caller gets a bare "Command failed".
+    expect(rejection?.message).toContain(absent);
+    expect((await board()).map((b) => b.id).sort()).toEqual(before.map((b) => b.id).sort());
+  });
 });
