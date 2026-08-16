@@ -702,6 +702,18 @@ async function deletionPatch(
   }
 }
 
+/**
+ * The repository's SHARED git directory, as an absolute path — `<repo>/.git` for the main checkout
+ * and for every linked worktree cut from it.
+ *
+ * This is the ref store {@link readWorktreeState} deliberately cannot see: a planted
+ * `refs/heads/anton/<bead>` lives here, leaves the worktree byte-identical, and `createWorktree`
+ * later ADOPTS it. The review sandbox denies writes to exactly this path (jobs/review-sandbox).
+ */
+export async function gitCommonDir(worktreePath: string): Promise<string> {
+  return git(worktreePath, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+}
+
 /** A worktree's checked-out branch and committed tip plus its working-tree dirt — the fingerprint a read-only phase guards. */
 export interface WorktreeState {
   head: string;

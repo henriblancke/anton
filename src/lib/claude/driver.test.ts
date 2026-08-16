@@ -684,6 +684,37 @@ describe("runClaude", () => {
     expect(argv).not.toContain("--setting-sources");
   });
 
+  it("passes settingsJson through as --settings, and omits the flag when unset (anton-t6tu)", async () => {
+    // How the review gate imposes its Bash sandbox: `--settings` outranks the user, project and
+    // local settings files, so neither the machine's config nor the branch under review can relax
+    // the containment the reviewer runs under.
+    const dumpPath = join(dir, "settings-argv-dump.json");
+    const path = join(dir, "settings-argv-claude");
+    writeFileSync(
+      path,
+      [
+        "#!/usr/bin/env node",
+        "const fs = require('node:fs');",
+        `fs.writeFileSync(${JSON.stringify(dumpPath)}, JSON.stringify(process.argv.slice(2)));`,
+        "process.stdout.write(JSON.stringify({ type: 'result', is_error: false, session_id: 'sess-set', result: 'ok' }) + '\\n');",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    chmodSync(path, 0o755);
+    process.env[CLAUDE_BIN_ENV] = path;
+
+    const sandbox = JSON.stringify({ sandbox: { enabled: true, filesystem: { denyWrite: ["/repos/anton/.git"] } } });
+    await runClaude({ cwd: dir, prompt: "review the diff", settingsJson: sandbox });
+    let argv = JSON.parse(readFileSync(dumpPath, "utf8")) as string[];
+    // One argv entry, unsplit — a settings payload mangled into several would be silently ignored.
+    expect(argv[argv.indexOf("--settings") + 1]).toBe(sandbox);
+
+    await runClaude({ cwd: dir, prompt: "implement the ticket" });
+    argv = JSON.parse(readFileSync(dumpPath, "utf8")) as string[];
+    expect(argv).not.toContain("--settings");
+  });
+
   it("delivers the task prompt on stdin and the system prompt via --append-system-prompt-file, with neither on argv (anton-14tj)", async () => {
     // The whole point of anton-14tj: no bead/contract text may land on the child's command line, so
     // `ps` during an autonomous run reveals neither. A fake that echoes its stdin and the contents of

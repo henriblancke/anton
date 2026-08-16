@@ -70,6 +70,19 @@ export interface RunClaudeOptions {
    */
   settingSources?: Array<"user" | "project" | "local">;
   /**
+   * Extra settings for THIS session (`--settings`), as a JSON string.
+   *
+   * Ranks above the user, project and local settings files — only an administrator's managed
+   * settings outrank it — so it is the one channel that can impose a setting neither the machine's
+   * config nor the branch under review can undo. That precedence is what makes it usable as a
+   * GUARD rather than a default; see `reviewSandboxSettings` in jobs/review-sandbox, which uses it
+   * to sandbox the reviewer's filesystem.
+   *
+   * Passed on argv (Claude Code accepts a JSON string as well as a file path), unlike the prompt
+   * and system prompt: these are machine paths and flags, not bead or contract text (anton-14tj).
+   */
+  settingsJson?: string;
+  /**
    * Resume an existing Claude session (`--resume <id>`) instead of starting fresh (anton-juar).
    * Set on a retry after a transient mid-stream death: the run continues with the full in-session
    * conversation, so `prompt` should be a brief continuation, not the whole ticket spec again.
@@ -330,6 +343,7 @@ export async function runClaude(opts: RunClaudeOptions): Promise<ClaudeResult> {
   if (opts.settingSources && opts.settingSources.length > 0) {
     args.push("--setting-sources", opts.settingSources.join(","));
   }
+  if (opts.settingsJson) args.push("--settings", opts.settingsJson);
 
   const runPromise = new Promise<ClaudeResult>((resolve, reject) => {
     const child = spawn(bin, args, {
