@@ -318,6 +318,17 @@ const FEATURE_KEY = "feature";
  * or the feature lands first and the approval refuses. Both halves are needed — the approve route
  * takes its own run-target verdict INSIDE this same lock, because a check it made before queuing on
  * the lock says nothing about the board it is about to write to.
+ *
+ * That lock orders writes made in THIS process only, so two anton instances sharing a board can
+ * still interleave this re-check with the other's approval. Nothing here closes that: the board is
+ * a per-machine Dolt DB whose writes merge at sync, not a store offering a conditional write, so
+ * there is no CAS to take (anton-od4). The residue is answered where the merge first becomes
+ * observable instead of guessed at here — every run re-derives its target's shape off the freshly
+ * pulled board and poison-parks an epic that gained a feature child (execute-epic's 0a-ter gate and
+ * its `runTargetDrift`), so the losing side stops loudly, naming the epic, rather than executing a
+ * feature nobody approved. Rolling the feature back after sync would be the worse trade: it deletes
+ * the founder's shaped work on a race whose "after" a distributed board never defines, and the
+ * rollback races the same way.
  */
 export async function createDraftFeature(
   project: Project,
