@@ -26,6 +26,10 @@ describe("the client-safe module's import boundary", () => {
   it.each([
     ["a node builtin", "import { readFileSync } from 'node:fs';"],
     ["a bare node builtin", "import { readFileSync } from 'fs';"],
+    // Bun builtins are absent from `builtinModules` when ESLint runs under Node, so they need
+    // their own pattern — `bun:sqlite` in the browser bundle breaks just as loudly as `node:fs`.
+    ["a bun builtin", "import { Database } from 'bun:sqlite';"],
+    ["the bun namespace", "import { file } from 'bun';"],
     ["a server-only package", "import Database from 'better-sqlite3';"],
     ["the db module", "import { db } from '@/lib/db';"],
     ["a db submodule", "import { runs } from '@/lib/db/schema';"],

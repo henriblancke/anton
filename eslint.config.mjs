@@ -23,6 +23,15 @@ const SERVER_LAYER_IMPORT_MESSAGE =
 
 const CLIENT_SAFE_MODULES = ["src/components/runs/run-view-utils.ts"];
 
+/**
+ * `builtinModules` reflects whichever runtime runs ESLint — under Node it omits Bun's `bun:*`
+ * builtins, under Bun it includes them. The patterns below name them explicitly, so drop them here
+ * to keep the guard exhaustive and the report identical either way.
+ */
+const NODE_BUILTIN_PATHS = builtinModules.filter(
+  (name) => name !== "bun" && !name.startsWith("bun:"),
+);
+
 const eslintConfig = defineConfig([
   ...nextVitals,
   ...nextTs,
@@ -42,10 +51,18 @@ const eslintConfig = defineConfig([
       "no-restricted-imports": [
         "error",
         {
-          paths: builtinModules.map((name) => ({ name, message: SERVER_ONLY_IMPORT_MESSAGE })),
+          paths: NODE_BUILTIN_PATHS.map((name) => ({ name, message: SERVER_ONLY_IMPORT_MESSAGE })),
           patterns: [
             {
-              group: ["node:*", "better-sqlite3", "node-pty", "drizzle-orm", "drizzle-orm/*"],
+              group: [
+                "node:*",
+                "bun",
+                "bun:*",
+                "better-sqlite3",
+                "node-pty",
+                "drizzle-orm",
+                "drizzle-orm/*",
+              ],
               message: SERVER_ONLY_IMPORT_MESSAGE,
             },
             {
