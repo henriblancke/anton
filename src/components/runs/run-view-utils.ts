@@ -4,7 +4,8 @@
  * 1. It is the single declaration of the run shape and its statuses. `src/lib/runs.ts` imports
  *    these rather than re-declaring them (anton-f3qj) — the dependency points server -> client-safe,
  *    never the reverse, so a client module can name a run without dragging better-sqlite3 into the
- *    browser bundle. Nothing here may import a node builtin or a db module.
+ *    browser bundle. Nothing here may import a node builtin or a db module — enforced by the
+ *    `no-restricted-imports` override for this file in `eslint.config.mjs`.
  * 2. The terminal-attach rule and time formatting live here so they are unit-testable without a
  *    browser/jsdom (the view itself renders xterm).
  */
@@ -55,7 +56,7 @@ export interface RunDetail extends RunSummary {
  * view polls and labels the terminal "live" for these, and the runner treats exactly these as
  * resumable when it looks for an open run to rejoin rather than starting a duplicate.
  */
-export const ACTIVE_RUN_STATUSES: RunStatus[] = ["queued", "running", "parked"];
+export const ACTIVE_RUN_STATUSES: readonly RunStatus[] = ["queued", "running", "parked"];
 
 export function isActiveRun(status: RunStatus): boolean {
   return ACTIVE_RUN_STATUSES.includes(status);
