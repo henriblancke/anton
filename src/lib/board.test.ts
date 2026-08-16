@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bead } from "./beads/bd";
 import { STAGES } from "./types";
+import type { ScanHealth } from "./scan-health";
 import type { HygieneReport, Project } from "./types";
 
 const listMock = vi.fn();
@@ -30,6 +31,23 @@ vi.mock("./hygiene", async () => {
   };
 });
 
+// Same seam, same reason, for the nightly stringer's scan series: the board folds the latest scan
+// into its payload and freshness token, so an unstubbed read here reaches the real anton.db —
+// whatever the developer's last nightly left behind locally, and a schema-less file CI creates on
+// the spot (the read then degrades to "never scanned" and logs, which is what made these suites
+// print SqliteError noise on a green run). `scanHealth` is what the project has been scanned with,
+// and every test here runs un-scanned.
+let scanHealth: ScanHealth | undefined;
+
+vi.mock("./scan-health", async () => {
+  const actual = await vi.importActual<typeof import("./scan-health")>("./scan-health");
+  return {
+    ...actual,
+    latestScanHealth: async () => scanHealth,
+    latestScanHealthVersion: async () => actual.scanHealthVersion(scanHealth),
+  };
+});
+
 const { deriveStage, getBoard, getBoardVersion } = await import("./board");
 const { resetIssueSnapshots } = await import("./beads/snapshot");
 const { contractBlocks, validateBeadContract } = await import("./beads/contract");
@@ -38,6 +56,7 @@ beforeEach(() => {
   resetIssueSnapshots();
   listMock.mockReset();
   hygieneReport = undefined;
+  scanHealth = undefined;
 });
 
 function makeBead(overrides: Partial<Bead> & { id: string; title: string }): Bead {
