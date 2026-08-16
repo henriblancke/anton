@@ -160,7 +160,7 @@ function executeEpicIdInStatuses(
   tx: Pick<AntonDb, "select">,
   projectId: string,
   epicBeadId: string,
-  statuses: readonly string[],
+  statuses: readonly JobStatus[],
 ): string | undefined {
   return firstJobId(
     tx,
