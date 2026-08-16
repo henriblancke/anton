@@ -15,6 +15,9 @@ export default defineConfig({
     // `.tsx` too: an e2e whose acceptance is what the BOARD renders (anton-bz1w) drives the real
     // job and then renders the panel off what it stored, so the suite is both bd-backed and JSX.
     include: ["src/**/*.integration.test.ts", "src/**/*.integration.test.tsx"],
+    // The same database guard the unit config installs. These suites build their own temp anton.db
+    // via `makeFileDb`, which assigns ANTON_DB inside the test file and so wins over this default.
+    setupFiles: ["./vitest.setup.ts"],
     // Generous, UNIFORM headroom: each case shells out to bd/Dolt/git many times, so under load (or
     // a busy CI runner) a normally-15s e2e case can spike well past a tight limit. Integration tests
     // rely on this single ceiling rather than scattered per-`it` literals — a per-test timeout would

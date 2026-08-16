@@ -17,6 +17,9 @@ export default defineConfig({
     environment: "node",
     include: ["src/**/*.test.ts", "src/**/*.test.tsx", "bin/**/*.test.ts"],
     exclude: [...configDefaults.exclude, "**/*.integration.test.ts", "**/*.integration.test.tsx"],
+    // Points ANTON_DB at a throwaway temp db so no suite can reach the real one by omission — see
+    // the file for why that is worth a global. Shared with the integration config.
+    setupFiles: ["./vitest.setup.ts"],
     // A handful of non-integration suites still touch a temp sqlite db; keep vitest's 5s default
     // comfortably clear of that under load.
     testTimeout: 60_000,
