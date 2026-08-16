@@ -11,8 +11,10 @@
  * Markdown only — it knows nothing of the contract's sections, tiers, or verdicts (contract.ts).
  */
 
-/** An ATX heading: up to 3 leading spaces, 1-6 `#`, the text, optional closing `#`s (CommonMark). */
-const HEADING = /^ {0,3}(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$/;
+/** An ATX heading: up to 3 leading spaces, 1-6 `#`, the text, optional closing `#`s (CommonMark).
+ * The marker is followed by whitespace OR the end of the line: a bare `#` is an empty heading, and
+ * reading it as text let a section holding nothing but one pass the gate as authored. */
+const HEADING = /^ {0,3}(#{1,6})(?:[ \t]+(.*?)[ \t]*#*[ \t]*)?$/;
 
 /** An opening or closing code fence: up to 3 leading spaces, then 3+ backticks or tildes. */
 const FENCE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
@@ -150,7 +152,7 @@ function fenceDelimiter(state: ScanState, text: string): boolean {
 const headingOf = (text: string): Heading | undefined => {
   const match = HEADING.exec(text);
   if (!match) return undefined;
-  return { depth: match[1].length, key: slug(match[2]) };
+  return { depth: match[1].length, key: slug(match[2] ?? "") };
 };
 
 function scanLine(state: ScanState, text: string): ScannedLine {
