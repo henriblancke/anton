@@ -297,7 +297,9 @@ async function assertEpicEligible(project: Project, epicId: string): Promise<voi
  * its own runner's back — execute-epic's `isRunTarget` gate poison-parks the queued run, and a human
  * claim becomes unreleasable because the claim route 422s a container. Under the lock the two
  * outcomes are the only ones left: the approval lands first and the re-check refuses the draft, or
- * the feature lands first and the approval decides against a board that already holds it.
+ * the feature lands first and the approval refuses. Both halves are needed — the approve route takes
+ * its own run-target verdict INSIDE this same lock, because a check it made before queuing on the
+ * lock says nothing about the board it is about to write to.
  *
  * A NEW epic needs no such window closed — it is minted by this very call, so there is no run to
  * strand and nothing has been handed its id yet.
