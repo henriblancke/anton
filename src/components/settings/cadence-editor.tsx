@@ -65,26 +65,26 @@ function stepOf(presetId: CadencePresetId): number {
   return MINUTE_STEPS.includes(step as (typeof MINUTE_STEPS)[number]) ? step : 15;
 }
 
+/**
+ * Minute 0 is the plain hourly preset; any other minute is the parameterised one. Keeping that
+ * split here means the stored expression is byte-identical to what the preset picker produced.
+ */
+function cronForHourly(minute: number): string {
+  return minute === 0 ? cronForPreset("hourly") : cronForPreset("hourly-at", { minute });
+}
+
+/** The expression each frequency stands for — one entry per member, so the set can't drift. */
+const CRON_FOR: Record<Frequency, (draft: Draft) => string | null> = {
+  minutes: (d) => cronForPreset(`every-${d.step}-minutes` as CadencePresetId),
+  hourly: (d) => cronForHourly(d.parts.minute),
+  daily: (d) => cronForPreset("daily", d.parts),
+  weekly: (d) => cronForPreset("weekly", d.parts),
+  custom: (d) => d.expression.trim() || null,
+};
+
 /** The expression a draft stands for, or null while a raw one doesn't parse. */
 function cronForDraft(draft: Draft): string | null {
-  switch (draft.frequency) {
-    case "minutes":
-      return cronForPreset(`every-${draft.step}-minutes` as CadencePresetId);
-    // Minute 0 is the plain hourly preset; any other minute is the parameterised one. Keeping that
-    // split here means the stored expression is byte-identical to what the preset picker produced.
-    case "hourly":
-      return draft.parts.minute === 0
-        ? cronForPreset("hourly")
-        : cronForPreset("hourly-at", { minute: draft.parts.minute });
-    case "daily":
-      return cronForPreset("daily", draft.parts);
-    case "weekly":
-      return cronForPreset("weekly", draft.parts);
-    case "custom": {
-      const expr = draft.expression.trim();
-      return expr ? expr : null;
-    }
-  }
+  return CRON_FOR[draft.frequency](draft);
 }
 
 interface Draft {
@@ -103,6 +103,18 @@ function draftFor(cron: string): Draft {
     parts: selection.parts,
     expression: cron,
   };
+}
+
+/**
+ * Switching frequency keeps every field the operator already set — "Daily at 06:30" → Weekly reads
+ * "Weekly on Monday at 06:30" rather than silently resetting the time. Moving to `custom` seeds the
+ * box with the expression the current draft stands for, so it is an escape hatch rather than a
+ * blank page.
+ */
+function withFrequency(draft: Draft, frequency: Frequency): Draft {
+  const expression =
+    frequency === "custom" ? (cronForDraft(draft) ?? draft.expression) : draft.expression;
+  return { ...draft, frequency, expression };
 }
 
 /** What the operator will see happen, and why they can't commit it when they can't. */
@@ -140,6 +152,31 @@ function pad(value: number): string {
 }
 
 /**
+ * The draft, the moves the editor can make on it, and the two answers derived from it: the
+ * expression it stands for and what that expression would do. They live together because they are
+ * one derivation — the preview is only ever of `next`, and `storable` is only ever the two of them
+ * agreeing.
+ */
+function useCadenceDraft(cron: string) {
+  const [draft, setDraft] = useState<Draft>(() => draftFor(cron));
+  const next = cronForDraft(draft);
+  const preview = useMemo(() => previewOf(next), [next]);
+
+  return {
+    draft,
+    next,
+    preview,
+    /** The expression Set cadence would store, or null while there is nothing valid and new. */
+    storable: next && next !== cron && !("error" in preview) ? next : null,
+    patch: (changes: Partial<Draft>) => setDraft((d) => ({ ...d, ...changes })),
+    patchParts: (changes: Partial<CadenceParts>) =>
+      setDraft((d) => ({ ...d, parts: { ...d.parts, ...changes } })),
+    chooseFrequency: (frequency: Frequency) => setDraft((d) => withFrequency(d, frequency)),
+    resetTo: (expr: string) => setDraft(draftFor(expr)),
+  };
+}
+
+/**
  * The cadence editor (anton-ue90.5) — frequency, then that frequency's fields, then what will
  * actually happen, before anything is committed.
  *
@@ -168,34 +205,12 @@ export function CadenceEditor({
   onCommit: (cron: string) => void;
   onClose: () => void;
 }) {
-  const [draft, setDraft] = useState<Draft>(() => draftFor(cron));
-
-  const next = cronForDraft(draft);
-  const preview = useMemo(() => previewOf(next), [next]);
-  const error = "error" in preview ? preview.error : null;
-  const unchanged = next === cron;
-
-  function patchParts(patch: Partial<CadenceParts>) {
-    setDraft((d) => ({ ...d, parts: { ...d.parts, ...patch } }));
-  }
-
-  /**
-   * Switching frequency keeps every field the operator already set — "Daily at 06:30" → Weekly reads
-   * "Weekly on Monday at 06:30" rather than silently resetting the time. Moving to `custom` seeds the
-   * box with the expression the current draft stands for, so it is an escape hatch rather than a
-   * blank page.
-   */
-  function chooseFrequency(frequency: Frequency) {
-    setDraft((d) => ({
-      ...d,
-      frequency,
-      expression: frequency === "custom" ? (cronForDraft(d) ?? d.expression) : d.expression,
-    }));
-  }
+  const { draft, next, preview, storable, patch, patchParts, chooseFrequency, resetTo } =
+    useCadenceDraft(cron);
 
   function commit() {
-    if (!next || error || unchanged) return;
-    onCommit(next);
+    if (!storable) return;
+    onCommit(storable);
     onClose();
   }
 
@@ -206,121 +221,221 @@ export function CadenceEditor({
         <span className="truncate font-mono text-[11px] text-subtle">{label}</span>
       </div>
 
-      <div
-        role="group"
-        aria-label="Frequency"
-        className="flex overflow-hidden rounded-lg border border-border"
-      >
-        {FREQUENCIES.map((frequency) => (
-          <button
-            key={frequency}
-            type="button"
-            aria-pressed={draft.frequency === frequency}
-            onClick={() => chooseFrequency(frequency)}
-            className={cn(
-              "flex-1 border-r border-border px-2 py-1.5 text-[11.5px] text-muted-foreground transition-colors last:border-r-0 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none",
-              draft.frequency === frequency && "bg-secondary font-medium text-foreground",
-            )}
-          >
-            {FREQUENCY_LABELS[frequency]}
-          </button>
-        ))}
-      </div>
+      <FrequencyPicker value={draft.frequency} onChange={chooseFrequency} />
 
-      {draft.frequency === "minutes" && (
-        <FieldRow lead="every">
-          <NumberSelect
-            label="Minutes between runs"
-            value={draft.step}
-            options={[...MINUTE_STEPS]}
-            format={(v) => String(v)}
-            onChange={(step) => setDraft((d) => ({ ...d, step }))}
-          />
-          <span className="text-[12px] text-muted-foreground">minutes</span>
-        </FieldRow>
-      )}
+      <FrequencyFields
+        draft={draft}
+        label={label}
+        invalid={"error" in preview}
+        onPatch={patch}
+        onPatchParts={patchParts}
+      />
 
-      {draft.frequency === "hourly" && (
-        <FieldRow lead="at">
-          <span className="text-[12px] text-muted-foreground">:</span>
-          <NumberSelect
-            label="Minute"
-            value={draft.parts.minute}
-            options={MINUTES}
-            format={pad}
-            onChange={(minute) => patchParts({ minute })}
-          />
-          <span className="text-[12px] text-muted-foreground">past every hour</span>
-        </FieldRow>
-      )}
+      <RunPreview preview={preview} />
 
-      {(draft.frequency === "daily" || draft.frequency === "weekly") && (
-        <FieldRow lead={draft.frequency === "weekly" ? "on" : "at"}>
-          {draft.frequency === "weekly" && (
-            <>
-              <NumberSelect
-                label="Day of week"
-                value={draft.parts.weekday}
-                options={WEEKDAY_LABELS.map((_, i) => i)}
-                format={(v) => WEEKDAY_LABELS[v]}
-                onChange={(weekday) => patchParts({ weekday })}
-                className="w-28"
-              />
-              <span className="text-[12px] text-muted-foreground">at</span>
-            </>
+      <EditorFooter
+        next={next}
+        atDefault={cron === defaultCron && next === defaultCron}
+        storable={storable !== null}
+        onReset={() => resetTo(defaultCron)}
+        onCommit={commit}
+      />
+    </div>
+  );
+}
+
+function FrequencyPicker({
+  value,
+  onChange,
+}: {
+  value: Frequency;
+  onChange: (frequency: Frequency) => void;
+}) {
+  return (
+    <div
+      role="group"
+      aria-label="Frequency"
+      className="flex overflow-hidden rounded-lg border border-border"
+    >
+      {FREQUENCIES.map((frequency) => (
+        <button
+          key={frequency}
+          type="button"
+          aria-pressed={value === frequency}
+          onClick={() => onChange(frequency)}
+          className={cn(
+            "flex-1 border-r border-border px-2 py-1.5 text-[11.5px] text-muted-foreground transition-colors last:border-r-0 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none",
+            value === frequency && "bg-secondary font-medium text-foreground",
           )}
-          <NumberSelect
-            label="Hour"
-            value={draft.parts.hour}
-            options={HOURS}
-            format={pad}
-            onChange={(hour) => patchParts({ hour })}
-          />
-          <span className="text-[12px] text-muted-foreground">:</span>
-          <NumberSelect
-            label="Minute"
-            value={draft.parts.minute}
-            options={MINUTES}
-            format={pad}
-            onChange={(minute) => patchParts({ minute })}
-          />
-          <span className="text-[11px] text-subtle">local</span>
-        </FieldRow>
-      )}
+        >
+          {FREQUENCY_LABELS[frequency]}
+        </button>
+      ))}
+    </div>
+  );
+}
 
-      {draft.frequency === "custom" && (
-        <div className="flex flex-col gap-1.5">
-          <Input
-            value={draft.expression}
-            onChange={(e) => setDraft((d) => ({ ...d, expression: e.target.value }))}
-            aria-label={`${label} cron expression`}
-            // The primitive renders the invalid border/ring off aria-invalid.
-            aria-invalid={error ? true : undefined}
-            spellCheck={false}
-            placeholder="*/15 * * * *"
-            className="font-mono text-[12px]"
-          />
-          <span className="font-mono text-[10.5px] text-subtle">
-            minute hour day-of-month month day-of-week
-          </span>
-        </div>
-      )}
+interface FieldsProps {
+  draft: Draft;
+  /** The automation's name — the raw-expression box has to say which cadence it belongs to. */
+  label: string;
+  invalid: boolean;
+  onPatch: (changes: Partial<Draft>) => void;
+  onPatchParts: (changes: Partial<CadenceParts>) => void;
+}
 
-      {/* What will actually happen. A cadence is only obviously wrong once you can see it fire. */}
+/** The inputs each frequency owns — one entry per member, alongside {@link CRON_FOR}. */
+const FIELDS_FOR: Record<Frequency, (props: FieldsProps) => React.ReactNode> = {
+  minutes: ({ draft, onPatch }) => (
+    <StepField value={draft.step} onChange={(step) => onPatch({ step })} />
+  ),
+  hourly: ({ draft, onPatchParts }) => (
+    <HourlyMinuteField value={draft.parts.minute} onChange={(minute) => onPatchParts({ minute })} />
+  ),
+  daily: ({ draft, onPatchParts }) => (
+    <TimeOfDayFields weekly={false} parts={draft.parts} onChange={onPatchParts} />
+  ),
+  weekly: ({ draft, onPatchParts }) => (
+    <TimeOfDayFields weekly parts={draft.parts} onChange={onPatchParts} />
+  ),
+  custom: ({ draft, label, invalid, onPatch }) => (
+    <CronField
+      label={label}
+      value={draft.expression}
+      invalid={invalid}
+      onChange={(expression) => onPatch({ expression })}
+    />
+  ),
+};
+
+/** Only the chosen frequency's own inputs exist — the others are not disabled, they are absent. */
+function FrequencyFields(props: FieldsProps) {
+  return FIELDS_FOR[props.draft.frequency](props);
+}
+
+function StepField({ value, onChange }: { value: number; onChange: (step: number) => void }) {
+  return (
+    <FieldRow lead="every">
+      <NumberSelect
+        label="Minutes between runs"
+        value={value}
+        options={[...MINUTE_STEPS]}
+        format={(v) => String(v)}
+        onChange={onChange}
+      />
+      <span className="text-[12px] text-muted-foreground">minutes</span>
+    </FieldRow>
+  );
+}
+
+function HourlyMinuteField({
+  value,
+  onChange,
+}: {
+  value: number;
+  onChange: (minute: number) => void;
+}) {
+  return (
+    <FieldRow lead="at">
+      <span className="text-[12px] text-muted-foreground">:</span>
+      <NumberSelect label="Minute" value={value} options={MINUTES} format={pad} onChange={onChange} />
+      <span className="text-[12px] text-muted-foreground">past every hour</span>
+    </FieldRow>
+  );
+}
+
+/** Daily and weekly are the same row of clock fields; weekly just names a day in front of them. */
+function TimeOfDayFields({
+  weekly,
+  parts,
+  onChange,
+}: {
+  weekly: boolean;
+  parts: CadenceParts;
+  onChange: (changes: Partial<CadenceParts>) => void;
+}) {
+  return (
+    <FieldRow lead={weekly ? "on" : "at"}>
+      {weekly && (
+        <>
+          <NumberSelect
+            label="Day of week"
+            value={parts.weekday}
+            options={WEEKDAY_LABELS.map((_, i) => i)}
+            format={(v) => WEEKDAY_LABELS[v]}
+            onChange={(weekday) => onChange({ weekday })}
+            className="w-28"
+          />
+          <span className="text-[12px] text-muted-foreground">at</span>
+        </>
+      )}
+      <NumberSelect
+        label="Hour"
+        value={parts.hour}
+        options={HOURS}
+        format={pad}
+        onChange={(hour) => onChange({ hour })}
+      />
+      <span className="text-[12px] text-muted-foreground">:</span>
+      <NumberSelect
+        label="Minute"
+        value={parts.minute}
+        options={MINUTES}
+        format={pad}
+        onChange={(minute) => onChange({ minute })}
+      />
+      <span className="text-[11px] text-subtle">local</span>
+    </FieldRow>
+  );
+}
+
+function CronField({
+  label,
+  value,
+  invalid,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  invalid: boolean;
+  onChange: (expression: string) => void;
+}) {
+  return (
+    <div className="flex flex-col gap-1.5">
+      <Input
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        aria-label={`${label} cron expression`}
+        // The primitive renders the invalid border/ring off aria-invalid.
+        aria-invalid={invalid ? true : undefined}
+        spellCheck={false}
+        placeholder="*/15 * * * *"
+        className="font-mono text-[12px]"
+      />
+      <span className="font-mono text-[10.5px] text-subtle">
+        minute hour day-of-month month day-of-week
+      </span>
+    </div>
+  );
+}
+
+/** What will actually happen. A cadence is only obviously wrong once you can see it fire. */
+function RunPreview({ preview }: { preview: Preview }) {
+  return (
+    <>
       <div className="flex flex-col gap-1 rounded-[10px] border border-border bg-secondary/50 px-3 py-2">
-        {error ? (
-          <span className="text-[11.5px] text-risk-high">{error}</span>
+        {"error" in preview ? (
+          <span className="text-[11.5px] text-risk-high">{preview.error}</span>
         ) : (
           <>
             <span className="font-mono text-[10px] tracking-[0.1em] text-subtle uppercase">
               Next {PREVIEW_RUNS} runs
             </span>
-            {"runs" in preview &&
-              preview.runs.map((at) => (
-                <span key={at} className="font-mono text-[11.5px] tabular-nums text-foreground">
-                  {formatInstant(at)}
-                </span>
-              ))}
+            {preview.runs.map((at) => (
+              <span key={at} className="font-mono text-[11.5px] tabular-nums text-foreground">
+                {formatInstant(at)}
+              </span>
+            ))}
           </>
         )}
       </div>
@@ -333,27 +448,40 @@ export function CadenceEditor({
           one spends budget whether or not there is anything to do.
         </p>
       )}
+    </>
+  );
+}
 
-      <div className="flex items-center gap-2 border-t border-border pt-2.5">
-        <span
-          className="truncate font-mono text-[10.5px] text-subtle"
-          title={next ? describeCron(next) : undefined}
-        >
-          {next ?? "—"}
-        </span>
-        <span className="flex-1" />
-        <Button
-          size="sm"
-          variant="ghost"
-          onClick={() => setDraft(draftFor(defaultCron))}
-          disabled={cron === defaultCron && next === defaultCron}
-        >
-          Reset
-        </Button>
-        <Button size="sm" onClick={commit} disabled={!!error || unchanged}>
-          Set cadence
-        </Button>
-      </div>
+function EditorFooter({
+  next,
+  atDefault,
+  storable,
+  onReset,
+  onCommit,
+}: {
+  /** The expression the draft stands for, staged and not yet stored. */
+  next: string | null;
+  /** Whether the stored cadence and the draft are both already the automation's default. */
+  atDefault: boolean;
+  storable: boolean;
+  onReset: () => void;
+  onCommit: () => void;
+}) {
+  return (
+    <div className="flex items-center gap-2 border-t border-border pt-2.5">
+      <span
+        className="truncate font-mono text-[10.5px] text-subtle"
+        title={next ? describeCron(next) : undefined}
+      >
+        {next ?? "—"}
+      </span>
+      <span className="flex-1" />
+      <Button size="sm" variant="ghost" onClick={onReset} disabled={atDefault}>
+        Reset
+      </Button>
+      <Button size="sm" onClick={onCommit} disabled={!storable}>
+        Set cadence
+      </Button>
     </div>
   );
 }
