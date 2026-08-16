@@ -272,6 +272,48 @@ describe("armed walk · cancelled", () => {
     expect(nudge).toHaveBeenCalledTimes(1);
   });
 
+  it("propagates a cancel that lands after the LAST apply, which no next iteration would see", async () => {
+    // The window on the far side of the walk: the final proposal cleared every checkpoint, so the
+    // abort arrives with no iteration left to observe it. Resolving here would hand the runner a
+    // handler that finished — and it settles a resolved handler as success even when its own
+    // no-progress timer fired the abort (jobs/runner.ts), so a guillotined pass would be recorded as
+    // done rather than retried.
+    const stopped = new Error("the runner stopped this job");
+    const controller = new AbortController();
+    applyMock.mockImplementation(async (_repo, proposal) => {
+      controller.abort(stopped);
+      return { summary: `closed the subject of ${proposal.id} as shipped`, changed: ["t-1"] };
+    });
+
+    await expect(walk(filed(1), controller.signal)).rejects.toBe(stopped);
+
+    // The apply is kept, published, and recorded: a cancel is not a rollback, and nothing is left
+    // standing to name — the stop line carries no open asks because the walk had none left.
+    expect(recorded()).toContain("— APPLIED: closed the subject of p-1 as shipped");
+    expect(recorded()).toContain("APPLY stopped — the pass was cancelled");
+    expect(recorded()).not.toContain("stay open as ordinary asks");
+    expect(nudge).toHaveBeenCalledTimes(1);
+    expect(passRecordCounts(readPassRecords(recorded()))).toMatchObject({ unrecorded: 0 });
+  });
+
+  it("propagates a cancel that arrives INSIDE the awaited publish", async () => {
+    // The walk's last await, and the longest one after the final write: a cancel landing in the push
+    // is invisible to every check that precedes it.
+    const stopped = new Error("the runner stopped this job");
+    const controller = new AbortController();
+    pushMock.mockImplementation(async () => {
+      controller.abort(stopped);
+      return "synced";
+    });
+
+    await expect(walk(filed(1), controller.signal)).rejects.toBe(stopped);
+
+    // Published before it propagates — the applies behind a cancel are still owed their push.
+    expect(pushMock).toHaveBeenCalledTimes(1);
+    expect(recorded()).toContain("— APPLIED: closed the subject of p-1 as shipped");
+    expect(recorded()).toContain("APPLY stopped — the pass was cancelled");
+  });
+
   it("throws the abort reason, so the runner records the pass as stopped rather than done", async () => {
     const reason = new Error("the runner stopped this job");
     const controller = new AbortController();

@@ -337,6 +337,17 @@ export async function applyArmedProposals(input: ArmedInput): Promise<ArmedResul
   }
 
   await publish();
+  // The one cancel window with no next iteration to catch it: the signal aborted after the last
+  // proposal cleared its checkpoints — inside apply's own write, its outcome line, or the awaited
+  // publish above. Returning here would hand the runner a handler that RESOLVED, which it records as
+  // a pass that finished even when its own no-progress timer fired the abort (jobs/runner.ts), so a
+  // guillotined pass would be settled as done rather than retried. The records stand — those applies
+  // are real and already on the log, and a cancel is not a rollback — but the pass is stopped, and
+  // the record says so before the reason propagates.
+  if (input.signal?.aborted) {
+    await write(input, stop("the pass was cancelled", []));
+    throw input.signal.reason;
+  }
   return { records, attempted: records.length, deferred: held };
 }
 
