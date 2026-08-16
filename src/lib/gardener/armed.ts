@@ -60,11 +60,12 @@ import { passRecordLine, type ApplyVerdict } from "./record";
 /**
  * What the pass did with one armed proposal — `error` is anton failing, never the board refusing.
  *
- * `unsettled` is the one outcome that is BOTH a write and a failure: the move landed and the ask that
- * authorised it could not be closed (apply.ts `settleProposal`), so the board moved unattended and the
- * proposal is still standing over it. It is never folded into `error` — that verdict promises a board
- * nothing landed on, and reporting a bead this pass moved under it is the record's one unforgivable
- * lie, the more so because the open proposal's fingerprint stops any later pass re-deciding it.
+ * `unsettled` is the one outcome that is BOTH a write and a failure: the board holds the move — this
+ * pass's, or one another actor had already made — and the ask that authorised it could not be closed
+ * (apply.ts `settleProposal`), so the proposal is still standing over it. It is never folded into
+ * `error` — that verdict promises a board nothing landed on, and reporting a moved bead under it is
+ * the record's one unforgivable lie, the more so because the open proposal's fingerprint stops any
+ * later pass re-deciding it.
  */
 export type ArmedOutcome = "applied" | "unsettled" | "refused" | "error";
 
@@ -493,20 +494,41 @@ async function applyOne(input: ArmedInput, base: ArmedAsk): Promise<ArmedAttempt
       record: { ...base, outcome: "applied", detail: applied.summary, changed: applied.changed },
     };
   } catch (e) {
-    // `refused`/`unusable` are the board declining — the ordinary outcome for an ask whose premise
-    // moved. `failed` is a write that broke, which is anton's failure, not a verdict, and reads as
-    // one in the log.
-    //
-    // …unless it broke SETTLING what the steps had already written, and then the beads it left moved
-    // ride on the error (apply.ts `settleProposal`). Those are real unattended board writes, and a
-    // record that filed them under a verdict promising a rolled-back board would tell a founder
-    // nothing happened to beads this pass moved — while the open proposal's fingerprint keeps any
-    // later pass from re-deciding it. So the write is what names the outcome, not the failure class.
     const failure = e instanceof ProposalApplyError ? e : undefined;
-    const changed = failure?.changed ?? [];
-    const refused = failure !== undefined && failure.failure !== "failed";
-    const outcome: ArmedOutcome = refused ? "refused" : changed.length > 0 ? "unsettled" : "error";
-    return { record: { ...base, outcome, detail: messageOf(e), changed } };
+    return {
+      record: {
+        ...base,
+        outcome: outcomeOf(failure),
+        detail: messageOf(e),
+        changed: failure?.changed ?? [],
+      },
+    };
+  }
+}
+
+/**
+ * The verdict a failed apply earns.
+ *
+ * `refused`/`unusable` are the board declining — the ordinary outcome for an ask whose premise moved.
+ * `failed` is a write that broke and was rolled back, which is anton's failure, not a verdict, and
+ * reads as one in the log.
+ *
+ * `unsettled` is the one that is also a board write: the move stands and the ask above it could not be
+ * closed (apply.ts `settleProposal`). Taken from the failure KIND rather than from `changed`, because
+ * the settlement of an already-applied board writes nothing — so the beads it left moved cannot tell
+ * that case from an apply that never reached the board. Filing it under a verdict that promises a
+ * rolled-back board would tell a founder nothing happened while the proposal's own fingerprint keeps
+ * any later pass from re-deciding it, and nobody would ever settle the still-open ask.
+ */
+function outcomeOf(failure: ProposalApplyError | undefined): ArmedOutcome {
+  if (!failure) return "error";
+  switch (failure.failure) {
+    case "unsettled":
+      return "unsettled";
+    case "failed":
+      return "error";
+    default:
+      return "refused";
   }
 }
 
@@ -541,10 +563,12 @@ function summaryOf(records: ArmedRecord[]): string {
         `(${applied.map((r) => r.proposal).join(", ")})`
       : undefined,
     // Spelled out rather than counted: it is the clause that sends somebody to the board, because
-    // the move is on it and the ask that authorised it is still open.
+    // the move is on it and the ask that authorised it is still open. Worded off the ASK rather than
+    // off this pass's writes — the board may have been carrying the move before the pass ran — since
+    // what an operator has to do about it is the same either way.
     unsettled.length > 0
-      ? `moved the board for ${unsettled.length} proposal(s) that could NOT be settled and stay ` +
-        `open (${unsettled.map((r) => r.proposal).join(", ")})`
+      ? `could NOT settle ${unsettled.length} proposal(s) whose move the board now holds — they ` +
+        `stay open (${unsettled.map((r) => r.proposal).join(", ")})`
       : undefined,
     of("refused").length > 0 ? `${of("refused").length} refused` : undefined,
     of("error").length > 0 ? `${of("error").length} could not be applied` : undefined,

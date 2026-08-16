@@ -28,8 +28,23 @@ import { PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
 import type { JobContext } from "./runner";
 
-/** One-line error text for a pass's log. */
-export const messageOf = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+/**
+ * One-line error text for a pass's log — collapsed, never merely quoted.
+ *
+ * A pass reads its own record back out of the log it writes this into (gardener/record.ts), where the
+ * only thing separating a write anton made from a sentence a model wrote is the producer in front of
+ * it. Interpolating a message into `[product-master] …` prefixes its FIRST physical line and leaves
+ * every continuation bare, and the messages that reach here carry model-authored text verbatim (a
+ * session that reported an error embeds its own `result.text`). So a continuation shaped like
+ * `[product-master] APPLY p-1 (stale) defer t-1 — APPLIED: …` would read back as a real unattended
+ * board write and be charged to the pass's write cap (jobs/pass-budget.ts).
+ *
+ * Collapsing is the fix rather than re-prefixing: this producer's own prefix is one of the two the
+ * parser trusts, so putting it in front of every line would MAKE a record line out of a bare `APPLY …`
+ * a model wrote. One physical line beginning `[producer] ERROR:` is neither a record nor a note.
+ */
+export const messageOf = (e: unknown): string =>
+  (e instanceof Error ? e.message : String(e)).replace(/\s+/g, " ").trim();
 
 /**
  * What every step of a pass shares: where it runs, when it runs, and how it speaks. Assembled once

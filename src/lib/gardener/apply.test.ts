@@ -273,7 +273,7 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     const err = await apply(proposal, [CARD, bead("anton-a"), proposal], "policy").catch((e) => e);
 
     expect(err).toBeInstanceOf(ProposalApplyError);
-    expect(err.failure).toBe("failed");
+    expect(err.failure).toBe("unsettled");
     expect(err.changed).toEqual(["anton-a"]);
     expect(err.message).toContain("the move LANDED (anton-a) and was not rolled back");
     // Left standing, not undone: a re-parent is the only verb a rollback could reach, and the ask
@@ -292,19 +292,21 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
 
     const err = await apply(proposal, [CARD, bead("anton-a"), proposal]).catch((e) => e);
 
-    expect(err.failure).toBe("failed");
+    expect(err.failure).toBe("unsettled");
     expect(err.changed).toEqual(["anton-a"]);
   });
 
   it("has no board write to report when a settlement over an already-applied board fails", async () => {
     // The settled path writes nothing to a subject, so there is nothing for a caller to record as
-    // moved — an empty `changed` is the honest answer, not a missing one.
+    // moved — an empty `changed` is the honest answer, not a missing one. Which is exactly why the
+    // failure KIND has to carry the verdict: the board holds the move and the ask is still open over
+    // it, and a caller reading `changed` alone would report a board nothing happened to.
     const proposal = proposalFor(REPARENT);
     failOn.set(`note:${proposal.id}`, 1);
 
     const err = await apply(proposal, [CARD, child("anton-a", CARD.id), proposal]).catch((e) => e);
 
-    expect(err.failure).toBe("failed");
+    expect(err.failure).toBe("unsettled");
     expect(err.changed).toEqual([]);
     expect(err.message).toContain("the board already carried the move, so nothing was written");
   });

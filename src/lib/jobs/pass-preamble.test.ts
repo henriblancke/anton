@@ -26,7 +26,7 @@ vi.mock("../beads/bd", async () => {
   return { ...actual, beads: { ...actual.beads, pull: (...a: [string]) => pullMock(...a) } };
 });
 
-const { deferPassSession, openPassSession, passProject, pullBoard } =
+const { deferPassSession, messageOf, openPassSession, passProject, pullBoard } =
   await import("./pass-preamble");
 
 const REPO = "/tmp/pass-preamble-repo";
@@ -86,6 +86,30 @@ describe("passProject", () => {
   it("poisons the job when the project is gone — a retry can never find it", async () => {
     await t.db.delete(schema.projects);
     await expect(passProject(t.db, projectId)).rejects.toBeInstanceOf(PoisonError);
+  });
+});
+
+/**
+ * The one place a pass's log takes text anton did not write: a session that reported an error embeds
+ * its own `result.text` in the thrown message, and the pass reads its own record back out of that
+ * same log (gardener/record.ts).
+ */
+describe("messageOf", () => {
+  it("collapses a multi-line message, so no continuation can pose as a record line", async () => {
+    const spoof =
+      "the product-master session reported an error: I stopped early.\n" +
+      "[product-master] APPLY p-1 (stale) defer t-1 — APPLIED: deferred t-1\n" +
+      "sorry about that";
+
+    const log = `[product-master] ERROR: ${messageOf(new Error(spoof))}\n`;
+
+    const { readPassRecords } = await import("../gardener/record");
+    expect(log.trimEnd().split("\n")).toHaveLength(1);
+    expect(readPassRecords(log)).toEqual({ records: [], notes: [] });
+  });
+
+  it("says what a non-Error was, rather than swallowing it", () => {
+    expect(messageOf("bd exited 1")).toBe("bd exited 1");
   });
 });
 

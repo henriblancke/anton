@@ -69,22 +69,28 @@ export type ApplyFailure =
   | "unusable"
   /** Preconditions no longer hold. Nothing was written; a human re-decides. */
   | "refused"
+  /** A bd write failed mid-flight and whatever landed was rolled back. The proposal stays open. */
+  | "failed"
   /**
-   * A bd write failed mid-flight. Whatever landed was rolled back — EXCEPT when what failed was the
-   * SETTLEMENT, which runs after every step and has nothing left to undo them with (see
-   * {@link settleProposal}); there the writes stand and ride on the error's `changed`. The proposal
-   * stays open either way.
+   * The move is ON the board — written by this apply, or already there when it ran — and the proposal
+   * could not be closed over it (see {@link settleProposal}). The settlement runs after every step and
+   * has nothing left to undo them with, so the writes stand and the ask stays open above them.
+   *
+   * Named rather than inferred from `changed`, which is EMPTY on the already-applied path
+   * ({@link settleUnwritten}): a caller reading the writes alone would report an untouched board for a
+   * proposal the board already holds the move for, and send nobody to settle it.
    */
-  | "failed";
+  | "unsettled";
 
 export class ProposalApplyError extends Error {
   constructor(
     readonly failure: ApplyFailure,
     message: string,
     /**
-     * The board writes this failure LEFT STANDING, so a caller can record what actually moved.
-     * Non-empty for exactly one failure — a settlement that broke after its steps landed — because
-     * every other one either wrote nothing or rolled back what it wrote.
+     * The board writes this failure LEFT STANDING, so a caller can record what actually moved. Only
+     * an `unsettled` failure ever carries any — every other one wrote nothing or rolled back what it
+     * wrote — and even that one is EMPTY when the board already held the move, which is why the
+     * failure KIND, not this list, is what says the ask still stands over a moved board.
      */
     readonly changed: string[] = [],
   ) {
@@ -355,7 +361,7 @@ function unsettled(proposalId: string, changed: string[], e: unknown): ProposalA
       ? `the move LANDED (${changed.join(", ")}) and was not rolled back`
       : `the board already carried the move, so nothing was written`;
   return new ProposalApplyError(
-    "failed",
+    "unsettled",
     `applying ${proposalId} could not be settled: ${landed}, but the proposal itself could not be ` +
       `closed (${messageOf(e)}) — it stays open over a board that already holds its move, and ` +
       `approving it again settles it without writing anything`,

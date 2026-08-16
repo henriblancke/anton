@@ -231,9 +231,20 @@ describe("armed walk · a move that could not be settled", () => {
   /** apply's own answer when its steps landed and the proposal's own close did not. */
   const unsettled = (subject: string) =>
     new ProposalApplyError(
-      "failed",
+      "unsettled",
       `applying p-1 could not be settled: the move LANDED (${subject}) and was not rolled back`,
       [subject],
+    );
+
+  /**
+   * The same failure over a board that ALREADY carried the move: `planApply` read it as settled, so
+   * the settlement wrote nothing to any subject and `changed` is empty (apply.ts `settleUnwritten`).
+   */
+  const unsettledUnwritten = () =>
+    new ProposalApplyError(
+      "unsettled",
+      "applying p-1 could not be settled: the board already carried the move, so nothing was " +
+        "written, but the proposal itself could not be closed",
     );
 
   it("records the bead it moved, rather than a board nothing happened to", async () => {
@@ -248,6 +259,23 @@ describe("armed walk · a move that could not be settled", () => {
     expect(passRecordCounts(readPassRecords(recorded()))).toMatchObject({
       unsettled: 1,
       applied: 1,
+      "apply-failed": 0,
+    });
+  });
+
+  it("still reports an open ask when the settlement wrote nothing at all", async () => {
+    // Zero changed steps is NOT "nothing landed": another actor had already made the move, the board
+    // carries it, and the proposal is still standing over it. Read off `changed` this would record as
+    // `COULD NOT APPLY` — the Jobs page would say nothing landed instead of sending the operator to
+    // settle the still-open ask, and no later pass re-decides it (its fingerprint suppresses the file).
+    applyMock.mockRejectedValueOnce(unsettledUnwritten());
+
+    const result = await walk(filed(1), running());
+
+    expect(result.records[0]).toMatchObject({ outcome: "unsettled", changed: [] });
+    expect(recorded()).toContain("— APPLIED BUT NOT SETTLED: applying p-1 could not be settled");
+    expect(passRecordCounts(readPassRecords(recorded()))).toMatchObject({
+      unsettled: 1,
       "apply-failed": 0,
     });
   });
