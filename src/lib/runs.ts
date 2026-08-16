@@ -5,30 +5,23 @@
 import { and, count, desc, eq, inArray, isNotNull } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import type { AntonDb, Clock } from "./jobs/queue";
+import {
+  ACTIVE_RUN_STATUSES,
+  type RunDetail,
+  type RunStatus,
+  type RunSummary,
+} from "@/components/runs/run-view-utils";
 
-export type RunStatus = "queued" | "running" | "parked" | "done" | "failed";
-/** Statuses a run can be in while still resumable (not terminal). */
-const OPEN_RUN_STATUSES: RunStatus[] = ["queued", "running", "parked"];
+/**
+ * The run vocabulary is declared once, in the client-safe module, and imported here — never the
+ * reverse (anton-f3qj). Re-exported so server callers keep asking `@/lib/runs` for it.
+ */
+export type { RunDetail, RunStatus, RunSummary };
 
 export type RunRow = typeof schema.runs.$inferSelect;
 
 function secDate(ms: number): Date {
   return new Date(Math.floor(ms / 1000) * 1000);
-}
-
-export interface RunSummary {
-  id: string;
-  epicBeadId: string;
-  ticketBeadId?: string;
-  worktreePath?: string;
-  branch?: string;
-  model?: string;
-  agentTag?: string;
-  status: RunStatus;
-  attempts: number;
-  startedAt?: number;
-  endedAt?: number;
-  updatedAt: number;
 }
 
 function toEpoch(value: unknown): number | undefined {
@@ -85,16 +78,6 @@ export async function listRunsPaged(
     .limit(opts.limit)
     .offset(opts.offset);
   return rows.map(toSummary);
-}
-
-/** Full run summary including its lease/error/attempts, for the run meta grid. */
-export interface RunDetail extends RunSummary {
-  leaseExpiresAt?: number;
-  error?: string;
-  /** The pipeline this run walked — the formula file it was read from (anton-aa3m). */
-  formula?: string;
-  /** The bead label that selected that pipeline; absent ⇒ the project/bundled default. */
-  formulaVariant?: string;
 }
 
 export async function getRunDetail(
@@ -355,7 +338,7 @@ export async function findOpenRunForEpic(
       and(
         eq(schema.runs.projectId, projectId),
         eq(schema.runs.epicBeadId, epicBeadId),
-        inArray(schema.runs.status, OPEN_RUN_STATUSES),
+        inArray(schema.runs.status, ACTIVE_RUN_STATUSES),
       ),
     )
     .orderBy(desc(schema.runs.updatedAt))

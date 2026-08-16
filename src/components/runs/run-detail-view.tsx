@@ -9,41 +9,19 @@ import { Button } from "@/components/ui/button";
 import { CopyButton } from "@/components/ui/copy-button";
 import { agentDotClass } from "@/components/board/board-utils";
 import { RunTerminal } from "@/components/runs/run-terminal";
+// The run shape, status types and pure helpers all come from run-view-utils — never from
+// `@/lib/runs`, which would pull better-sqlite3 into the browser bundle.
 import {
   fmtDuration,
   formatRunPipeline,
   isActiveRun,
   pickAttachSession,
   timelineOrder,
+  type RunDetail,
   type RunStatus,
   type SessionStatus,
   type SessionSummary,
 } from "@/components/runs/run-view-utils";
-
-/**
- * Local mirror of the run-detail API's run shape. Defined here (not imported from `@/lib/runs`) so
- * this client module never pulls better-sqlite3 into the browser bundle — same guard settings-view
- * uses. Session/status types + the pure helpers live in run-view-utils (unit-tested).
- */
-interface RunDetail {
-  id: string;
-  epicBeadId: string;
-  ticketBeadId?: string;
-  worktreePath?: string;
-  branch?: string;
-  model?: string;
-  agentTag?: string;
-  status: RunStatus;
-  attempts: number;
-  leaseExpiresAt?: number;
-  error?: string;
-  /** The pipeline this run walked, and the label that selected it (anton-aa3m). */
-  formula?: string;
-  formulaVariant?: string;
-  startedAt?: number;
-  endedAt?: number;
-  updatedAt: number;
-}
 
 const RUN_STATUS_STYLE: Record<RunStatus, { dot: string; text: string; pulse?: boolean }> = {
   running: { dot: "bg-stage-implementing", text: "text-stage-implementing", pulse: true },
