@@ -29,6 +29,11 @@ export type PassRecordMode = "apply" | "shadow";
  * closed, so the board carries the write and the ask is still standing over it. Counted apart from
  * both — a founder acts on it (approving the open proposal settles it), and folding it into `error`
  * would promise them a board nothing happened to.
+ *
+ * `stranded` is the same lie from the other side: the write BROKE, and the rollback could not put
+ * every bead back (apply-steps.ts `rollbackSteps`). It is an `error` in every other respect and is
+ * still counted apart from one, because `error` is the verdict that promises an unchanged board —
+ * and this is the one failure that moved it.
  */
 export type PassRecordOutcome =
   | "applied"
@@ -36,6 +41,7 @@ export type PassRecordOutcome =
   | "shadowed"
   | "refused"
   | "error"
+  | "stranded"
   | "unrecorded";
 
 /**
@@ -47,6 +53,12 @@ export type PassRecordOutcome =
  * the move is ON the board and its proposal could not be closed (gardener/apply.ts `settleProposal`).
  * Saying `APPLIED` would hide an ask still standing; saying `COULD NOT APPLY` would hide a bead the
  * pass moved unattended.
+ *
+ * `COULD NOT ROLL BACK` is the fourth, and it exists for the same reason: a write that broke and
+ * whose undo could not reach every bead it had already moved (apply.ts `stepFailure`). The beads it
+ * left standing ride in `ProposalApplyError.changed`, which the LINE cannot carry — so without a
+ * verdict of its own the record would file a moved board under the one verdict that promises an
+ * untouched one, and the Jobs page could not tell it from a rollback that finished.
  *
  * `APPLYING` is written BEFORE the board is touched, so the attempt is on the record even if the
  * outcome line never lands (gardener/armed.ts): the record is what a retry reconstructs the pass's
@@ -60,6 +72,7 @@ export const APPLY_VERDICTS = {
   "APPLIED BUT NOT SETTLED": "unsettled",
   REFUSED: "refused",
   "COULD NOT APPLY": "error",
+  "COULD NOT ROLL BACK": "stranded",
 } as const satisfies Record<string, PassRecordOutcome>;
 
 /**
@@ -247,6 +260,7 @@ export function passRecordCounts(summary: PassRecordSummary): Record<PassRecordG
   const counts: Record<PassRecordGroup, number> = {
     applied: 0,
     unsettled: 0,
+    stranded: 0,
     shadowed: 0,
     refused: 0,
     unrecorded: 0,

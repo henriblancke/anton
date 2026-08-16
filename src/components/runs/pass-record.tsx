@@ -28,9 +28,10 @@ import { cn } from "@/lib/utils";
  * rolled back (see `passRecordGroup`). An apply whose OUTCOME never reached the log is a third row
  * for the same reason — "nothing landed" is the one thing nobody can say about it.
  *
- * An apply that landed and could not SETTLE its proposal leads, ahead of the clean ones: it is both
- * an unattended write and an ask still standing, so it is the only row that asks the reader to do
- * something.
+ * The two rows that ask the reader to DO something lead, ahead of the clean ones — both are an
+ * unattended write with an ask still standing over it. A write whose rollback could not finish leads
+ * even those: the ask is open over a board anton left half-moved and cannot un-move, so it is the one
+ * row a human has to settle by hand.
  */
 const GROUPS: {
   key: PassRecordGroup;
@@ -39,6 +40,14 @@ const GROUPS: {
   chip: string;
   blurb: string;
 }[] = [
+  {
+    key: "stranded",
+    label: "applied in part, not rolled back",
+    text: "text-risk-high",
+    chip: "border-risk-high/30 bg-risk-high/10 text-risk-high",
+    blurb:
+      "the write broke and the undo could not reach every bead it had already moved — the board is part-moved with its ask still open, and the reason names what a human has to settle",
+  },
   {
     key: "unsettled",
     label: "applied, not settled",
@@ -73,7 +82,8 @@ const GROUPS: {
     label: "could not apply",
     text: "text-risk-high",
     chip: "border-risk-high/30 bg-risk-high/10 text-risk-high",
-    blurb: "anton failed to decide or the write was rolled back — nothing landed",
+    blurb:
+      "anton failed to decide or the write was rolled back in full — nothing landed; a rollback that could not finish is counted apart",
   },
   {
     key: "shadow-failed",

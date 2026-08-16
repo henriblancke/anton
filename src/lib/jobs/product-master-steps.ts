@@ -161,7 +161,10 @@ export function makeProposalFiler(scope: PassScope, input: ProposalFilerInput): 
       // proposal armed at `apply` then passes `writtenSinceFiling` on evidence nobody ever saw.
       if (applied.records.some(movedTheBoard)) {
         const observedAtMs = scope.clock.now();
-        snapshot = { board: await loadAllIssues(repo), observedAtMs };
+        // Strict on the gates, like the pass's first read (product-master.ts): this snapshot is the
+        // premise the tier after it files from, and a gate listing that failed would read every
+        // resolved gate as an open blocker.
+        snapshot = { board: await loadAllIssues(repo, { strictGates: true }), observedAtMs };
       }
     } catch (e) {
       // Whatever landed before a create failed is real board state living only in the local working

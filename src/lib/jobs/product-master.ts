@@ -134,7 +134,14 @@ export function makeProductMasterHandler(deps: ProductMasterDeps): JobHandler {
       // safe direction: a bead written while the read is in flight dates as unseen, which costs a
       // refusal at approve time rather than a write against falsified evidence (see gardener.ts).
       const observedAtMs = clock.now();
-      const board = await loadAllIssues(repo);
+      // STRICT on the gate listing, as every job read is (beads/issues.ts): bd omits gate beads from
+      // ordinary listings while the `blocks` edges they put on the beads they gate stay, so a gate
+      // listing that failed leaves every RESOLVED gate reading as an open blocker. That is a
+      // `blocked` approval gap, which is exactly the premise tier 1 files a `degraded-approval` ask
+      // from — a transient bd failure would put an ask in front of a founder against work whose gate
+      // has actually cleared. Failing the read instead is an ordinary pass retry, and it holds the
+      // filing path to the same bar the apply path already reads at (gardener/armed.ts).
+      const board = await loadAllIssues(repo, { strictGates: true });
       await ctx.heartbeat();
 
       // One filer for both tiers: one board, one fence, own emission each — so the judgment pass is

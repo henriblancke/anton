@@ -128,6 +128,7 @@ describe("readPassRecords", () => {
     expect(passRecordCounts(summary)).toEqual({
       applied: 0,
       unsettled: 0,
+      stranded: 0,
       shadowed: 0,
       refused: 1,
       unrecorded: 0,
@@ -213,6 +214,28 @@ describe("readPassRecords", () => {
     expect(summary.records.map(passRecordGroup)).toEqual(["apply-failed", "shadow-failed"]);
     expect(passRecordCounts(summary)["apply-failed"]).toBe(1);
     expect(passRecordCounts(summary)["shadow-failed"]).toBe(1);
+  });
+
+  it("counts a rollback that could not finish apart from one that did", async () => {
+    // Both applies BROKE, and only one of them left the board moved. Folded together, the page would
+    // tell a founder "nothing landed" over beads anton moved unattended and cannot un-move — the
+    // whole reason this record exists (gardener/armed.ts `verdictOf`).
+    const log =
+      logged("gardener", {
+        ...APPLIED,
+        verdict: "COULD NOT ROLL BACK",
+        detail: "applying p-1 failed: bd exploded — ROLLBACK INCOMPLETE: t-4 could not be restored",
+      }) +
+      logged("gardener", {
+        ...APPLIED,
+        proposal: "p-9",
+        verdict: "COULD NOT APPLY",
+        detail: "applying p-9 failed: bd exploded — the 1 write(s) were rolled back",
+      });
+    const summary = readPassRecords(log);
+
+    expect(summary.records.map(passRecordGroup)).toEqual(["stranded", "apply-failed"]);
+    expect(passRecordCounts(summary)).toMatchObject({ stranded: 1, "apply-failed": 1, applied: 0 });
   });
 
   it("counts every shadow verdict as shadowed — nothing was written on any of them", () => {

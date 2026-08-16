@@ -98,13 +98,14 @@ export interface ArmedRecord {
 }
 
 /**
- * Did this apply reach the BOARD? Three ways it can have, and the verdict alone names only two of
- * them: the settled write, the one whose proposal could not be closed over it, and — recorded as the
- * `error` that promises a rolled-back board — a failure whose ROLLBACK could not put every write back
+ * Did this apply reach the BOARD? Three ways it can have, and the outcome alone names only two of
+ * them: the settled write, the one whose proposal could not be closed over it, and — carried as the
+ * `error` that stands for a broken write — a failure whose ROLLBACK could not put every write back
  * (apply.ts `stepFailure`). That third is why `changed` is consulted as well as the outcome: an
- * incomplete rollback leaves beads moved, and reading the verdict alone would carry the pass on
+ * incomplete rollback leaves beads moved, and reading the outcome alone would carry the pass on
  * against a snapshot those writes have already invalidated and leave them out of the note that says
- * what is stranded on this machine.
+ * what is stranded on this machine. It is the same test {@link verdictOf} writes the record under,
+ * so what the log says and what the pass believes cannot drift.
  *
  * As WELL as, never instead of: an `unsettled` over a board that already carried the move writes
  * nothing (apply.ts `settleUnwritten`), so the failure kind is the only thing that says the ask still
@@ -574,7 +575,8 @@ async function applyOne(input: ArmedInput, base: ArmedAsk): Promise<ArmedAttempt
  * `refused`/`unusable` are the board declining — the ordinary outcome for an ask whose premise moved.
  * `failed` is a write that broke and was rolled back, which is anton's failure, not a verdict, and
  * reads as one in the log. When that rollback could not finish, the beads it left moved ride in
- * `changed` and {@link movedTheBoard} counts the record as a write regardless of this verdict.
+ * `changed`, {@link movedTheBoard} counts the record as a write, and the LINE says so under its own
+ * verdict (see {@link verdictOf}) — the outcome stays `error` because the apply did fail.
  *
  * `unsettled` is the one that is also a board write: the move stands and the ask above it could not be
  * closed (apply.ts `settleProposal`). Taken from the failure KIND rather than from `changed`, because
@@ -603,9 +605,24 @@ const VERDICT: Record<ArmedOutcome, ApplyVerdict> = {
   error: "COULD NOT APPLY",
 };
 
+/**
+ * The verdict this record is WRITTEN under — the outcome's, except for the one failure that moved
+ * the board.
+ *
+ * A `failed` apply whose rollback left beads standing is recorded as `error`, and `COULD NOT APPLY`
+ * promises a board nothing landed on. The survivors are in `changed`, which the record line cannot
+ * carry (record.ts is one line per proposal), so the reader would have had no way to tell this from
+ * a rollback that finished — and the Jobs page, the surface a founder audits an unattended write on,
+ * would say "nothing landed" over beads this pass moved and cannot un-move.
+ */
+function verdictOf(record: ArmedRecord): ApplyVerdict {
+  if (record.outcome === "error" && record.changed.length > 0) return "COULD NOT ROLL BACK";
+  return VERDICT[record.outcome];
+}
+
 /** One line per proposal, shaped like the shadow's so a mixed pass reads as one list. */
 function lineOf(record: ArmedRecord): string {
-  return passRecordLine({ mode: "apply", ...record, verdict: VERDICT[record.outcome] });
+  return passRecordLine({ mode: "apply", ...record, verdict: verdictOf(record) });
 }
 
 /**

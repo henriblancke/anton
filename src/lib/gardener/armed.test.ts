@@ -457,10 +457,12 @@ describe("armed walk · a move that could not be settled", () => {
  * The OTHER failure that is also a board write: a cluster re-parent whose rollback could not put
  * every step back (apply.ts `stepFailure`, apply-steps.ts `rollbackSteps`).
  *
- * It is recorded as `COULD NOT APPLY`, which promises a rolled-back board — correct for the failure
- * class, and a lie about the beads the undo could not reach. Those are readable only off `changed`,
- * so a walk that reasoned on the verdict alone would hand the next tier a snapshot the surviving move
- * already invalidated and leave that move out of the note naming what is stranded on this machine.
+ * `COULD NOT APPLY` promises a rolled-back board, so this earns a verdict of its own: the beads the
+ * undo could not reach are readable only off `changed`, which the record line cannot carry, and a
+ * reader that saw the failure alone would be told nothing landed over a board anton part-moved. The
+ * same `changed` is what keeps the pass itself honest — it must not hand the next tier a snapshot the
+ * surviving move already invalidated, nor leave that move out of the note naming what is stranded on
+ * this machine.
  */
 describe("armed walk · a rollback that could not finish", () => {
   const running = (): AbortSignal => new AbortController().signal;
@@ -474,15 +476,23 @@ describe("armed walk · a rollback that could not finish", () => {
       [subject],
     );
 
-  it("records the bead the rollback left moved, under the verdict that says the write broke", async () => {
+  it("records the bead the rollback left moved, under a verdict that does not promise an untouched board", async () => {
     applyMock.mockRejectedValueOnce(halfRolledBack("t-1"));
 
     const result = await walk(filed(2), running());
 
     expect(result.records[0]).toMatchObject({ outcome: "error", changed: ["t-1"] });
     expect(movedTheBoard(result.records[0])).toBe(true);
-    expect(recorded()).toContain("— COULD NOT APPLY: applying p-1 failed");
+    expect(recorded()).toContain("— COULD NOT ROLL BACK: applying p-1 failed");
     expect(recorded()).toContain("ROLLBACK INCOMPLETE");
+    // And the reader groups it apart from the apply that WAS rolled back: the Jobs page is the only
+    // surface an unattended write is audited on, and "could not apply" reads there as "nothing
+    // landed".
+    expect(passRecordCounts(readPassRecords(recorded()))).toMatchObject({
+      stranded: 1,
+      "apply-failed": 0,
+      applied: 1,
+    });
   });
 
   it("names it among the writes stranded on this machine when the publish fails", async () => {
@@ -511,6 +521,11 @@ describe("armed walk · a rollback that could not finish", () => {
 
     expect(result.records[0]).toMatchObject({ outcome: "error", changed: [] });
     expect(movedTheBoard(result.records[0])).toBe(false);
+    expect(recorded()).toContain("— COULD NOT APPLY: applying p-1 failed");
+    expect(passRecordCounts(readPassRecords(recorded()))).toMatchObject({
+      stranded: 0,
+      "apply-failed": 1,
+    });
   });
 });
 

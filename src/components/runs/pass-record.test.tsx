@@ -55,6 +55,22 @@ describe("PassRecordChips", () => {
     expect(html).not.toContain("could not apply");
   });
 
+  it("chips a rollback that could not finish apart from one that put everything back", () => {
+    // The chip row is the glance a founder audits an unattended pass on. Both applies broke, and
+    // only the first left the board moved — under one "could not apply" chip they would be told
+    // nothing landed over a bead anton part-moved and cannot un-move.
+    const stranded =
+      "[gardener] APPLY p-2 (cluster) reparent t-2 → t-9 — COULD NOT ROLL BACK: applying p-2 " +
+      "failed: bd exploded — ROLLBACK INCOMPLETE: t-2 could not be restored";
+    const rolledBack =
+      "[gardener] APPLY p-3 (cluster) reparent t-3 → t-9 — COULD NOT APPLY: applying p-3 failed: " +
+      "bd exploded — the 1 write(s) already made were rolled back, so the board is unchanged";
+    const html = chips([stranded, rolledBack].join("\n"));
+
+    expect(html).toContain("1 applied in part, not rolled back");
+    expect(html).toContain("1 could not apply");
+  });
+
   it("pluralises the notes chip", () => {
     const unpublished =
       "[gardener] APPLY could not publish this pass's board writes — the 1 move(s) recorded " +
