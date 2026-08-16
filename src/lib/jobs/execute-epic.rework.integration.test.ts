@@ -225,6 +225,50 @@ describeBd("execute-epic e2e — a send-back's run path back (real handler · re
     }
   });
 
+  it("a retired PR that MERGES before the rerun parks it, rather than re-dispatching shipped work", async () => {
+    const bugId = await targetInReview("Open PR, sent back, then merged");
+
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = ghReporting(binDir, "gh-open-then-merged-leit", "OPEN", 42);
+    try {
+      const result = await reworkTicket(project, bugId, {
+        ticketId: bugId,
+        mode: "reopen",
+        summary: "The backoff cap is still missing",
+        instructions: "Bound the retry backoff at 30s and cover it with a test.",
+      });
+      expect(result.pipeline).toEqual({ outcome: "retired", pr: "gh-42", redirected: false });
+      // The retire took the live pointer off — but left the PR named on the bead, which is the only
+      // thing that can tell this target apart from one that never had a PR at all.
+      const retired = await beads.show(repo, bugId);
+      expect(beads.getPrRef(retired)).toBeUndefined();
+      expect(beads.getRetiredPrRef(retired)).toBe("gh-42");
+
+      // The founder merges gh-42 anyway, before the run the send-back released gets its slot.
+      process.env.ANTON_GH_BIN = ghReporting(binDir, "gh-merged-after-retire-leit", "MERGED", null);
+      await resetPerCaseState(tdb);
+      const job = await driveEpicRun(makeEpicRunner(ctx), { projectId, epicBeadId: bugId });
+
+      // Its work is on the base branch now, so running would re-dispatch shipped tickets onto a
+      // closed PR's branch. Park for the founder instead, naming the PR and the way back.
+      const parked = await expectJobStatus(tdb.db, job, "parked");
+      expect(parked.lastError).toContain("gh-42");
+      expect(parked.lastError).toMatch(/merged/);
+      expect(await sessionBeads()).not.toContain(bugId);
+      // ...and a fresh send-back now reads that same pointer and carries the fix as its own target.
+      const followUp = await reworkTicket(project, bugId, {
+        ticketId: bugId,
+        mode: "reopen",
+        summary: "The backoff cap is still missing",
+        instructions: "Bound the retry backoff at 30s and cover it with a test.",
+      });
+      expect(followUp.pipeline).toEqual({ outcome: "shipped", pr: "gh-42", redirected: true });
+      expect(followUp.reworkedId).not.toBe(bugId);
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+    }
+  });
+
   it("a FOLLOW-UP off an open-PR target runs as its own target, leaving that PR's target intact", async () => {
     const bugId = await targetInReview("Open PR, follow-up");
 

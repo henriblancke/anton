@@ -22,7 +22,7 @@ type CreateOpts = {
 };
 const createMock = vi.fn<(cwd: string, opts: CreateOpts) => Promise<string>>();
 const linkMock = vi.fn();
-const clearPrRefMock = vi.fn();
+const retirePrRefMock = vi.fn();
 const setPrRefMock = vi.fn();
 const tagMock = vi.fn();
 const closeMock = vi.fn();
@@ -43,7 +43,7 @@ vi.mock("./beads/bd", async () => {
       untag: (...args: unknown[]) => untagMock(...args),
       create: (...args: unknown[]) => createMock(...(args as [string, CreateOpts])),
       link: (...args: unknown[]) => linkMock(...args),
-      clearPrRef: (...args: unknown[]) => clearPrRefMock(...args),
+      retirePrRef: (...args: unknown[]) => retirePrRefMock(...args),
       setPrRef: (...args: unknown[]) => setPrRefMock(...args),
       tag: (...args: unknown[]) => tagMock(...args),
       close: (...args: unknown[]) => closeMock(...args),
@@ -479,6 +479,53 @@ describe("follow-up", () => {
     );
     await expect(reworkTicket(project, "feat", followUp())).resolves.toMatchObject({ applied: true });
   });
+
+  describe("an earlier attempt that died mid-creation", () => {
+    /** A follow-up of the ticket, by id — the same title and `discovered-from` edge every attempt writes. */
+    const followUpBead = (id: string) =>
+      makeBead({
+        id,
+        title: "Harden the retry path",
+        parent: "feat",
+        dependencies: [{ issue_id: id, depends_on_id: "t1", type: "discovered-from" }],
+      });
+
+    /** Created and linked by a previous attempt, but carrying no note — the `bd note` never landed. */
+    function halfCreated(...rest: Bead[]): void {
+      board(feature(), ticketA(), followUpBead("already"), ...rest);
+    }
+
+    it("finishes it instead of opening a second follow-up beside it", async () => {
+      // `bd create` and `bd link` landed, `bd note` failed. On the note alone the retry would reject
+      // this bead and create a duplicate — two discovered-from beads a founder can approve twice.
+      halfCreated();
+
+      const result = await reworkTicket(project, "feat", followUp());
+
+      expect(createMock).not.toHaveBeenCalled();
+      expect(result).toMatchObject({ reworkedId: "already", applied: true });
+      const noted = noteMock.mock.calls.map((c) => [c[1], c[2] as string] as const);
+      // Both writes the dead attempt still owed: the instructions, then the origin's pointer.
+      expect(noted.map(([id]) => id)).toEqual(["already", "t1"]);
+      expect(noted[0][1]).toContain(INSTRUCTIONS);
+      expect(noted[1][1]).toContain("already");
+    });
+
+    it("prefers the bead that carries THIS request's note over an unfinished one", async () => {
+      // Two candidates: a founder's completed follow-up and the remains of another attempt. Adopting
+      // the unfinished one would write a second copy of instructions the board already carries.
+      halfCreated(followUpBead("done"));
+      showsWithNote(
+        "done",
+        followUpNote({ targetId: "feat", originId: "t1", summary: "Harden the retry path" }),
+      );
+
+      const result = await reworkTicket(project, "feat", followUp());
+
+      expect(result).toMatchObject({ reworkedId: "done", applied: false });
+      expect(noteMock).not.toHaveBeenCalled();
+    });
+  });
 });
 
 /** When `mock` was called with `id` as its bead argument — for asserting the order of two writes. */
@@ -493,7 +540,7 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
     const result = await reworkTicket(project, "feat", input());
     expect(result.pipeline).toBeUndefined();
     expect(prStateMock).not.toHaveBeenCalled();
-    expect(clearPrRefMock).not.toHaveBeenCalled();
+    expect(retirePrRefMock).not.toHaveBeenCalled();
   });
 
   describe("PR still open", () => {
@@ -504,7 +551,11 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
 
       expect(result.pipeline).toEqual({ outcome: "retired", pr: "gh-42", redirected: false });
       // The PR ref is what execute-epic step 0a reads as "another run already finished this".
-      expect(clearPrRefMock).toHaveBeenCalledWith("/repo", expect.objectContaining({ id: "feat" }));
+      expect(retirePrRefMock).toHaveBeenCalledWith(
+        "/repo",
+        expect.objectContaining({ id: "feat" }),
+        "gh-42",
+      );
       // ...and in-review is what keeps review-fix/gate-check treating it as theirs to close out.
       expect(untagMock).toHaveBeenCalledWith("/repo", "feat", [
         "stage:implementing",
@@ -535,7 +586,7 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
 
       // The ref is the ONLY marker that brings a retry back into the retire (resolvePipeline reads
       // it), so untag/reopen have to be durable before it goes.
-      const clearedAt = clearPrRefMock.mock.invocationCallOrder[0];
+      const clearedAt = retirePrRefMock.mock.invocationCallOrder[0];
       expect(orderOfCallOn(untagMock, "feat")).toBeLessThan(clearedAt);
       expect(orderOfCallOn(reopenMock, "feat")).toBeLessThan(clearedAt);
     });
@@ -544,7 +595,7 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
       const result = await reworkTicket(project, "feat", input());
 
       // Once to decide the mode, once before the writes, once after them — the last read is the one
-      // that can catch a merge landing while `untag`/`reopen`/`clearPrRef` were applying.
+      // that can catch a merge landing while `untag`/`reopen`/`retirePrRef` were applying.
       expect(prStateMock).toHaveBeenCalledTimes(3);
       expect(result.pipeline).toEqual({ outcome: "retired", pr: "gh-42", redirected: false });
       expect(setPrRefMock).not.toHaveBeenCalled();
@@ -554,7 +605,7 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
       // The re-read under the lock is what decides, so a target already retired writes nothing more.
       showMock.mockImplementation(async (_cwd, id) => makeBead({ id, status: "open" }));
       await reworkTicket(project, "feat", input());
-      expect(clearPrRefMock).not.toHaveBeenCalled();
+      expect(retirePrRefMock).not.toHaveBeenCalled();
     });
 
     it("retires for a follow-up too, when the board card parents it into that same next run", async () => {
@@ -562,7 +613,11 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
 
       expect(createMock.mock.calls[0][1].deps).toEqual(["parent-child:feat"]);
       expect(result.pipeline).toEqual({ outcome: "retired", pr: "gh-42", redirected: false });
-      expect(clearPrRefMock).toHaveBeenCalledWith("/repo", expect.objectContaining({ id: "feat" }));
+      expect(retirePrRefMock).toHaveBeenCalledWith(
+        "/repo",
+        expect.objectContaining({ id: "feat" }),
+        "gh-42",
+      );
     });
   });
 
@@ -595,7 +650,7 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
       // Parentless: `boardCards` never cards a task, so this bead is its own run target and the
       // target's next run would have nothing of the fix to carry.
       expect(createMock.mock.calls[0][1].deps).toBeUndefined();
-      expect(clearPrRefMock).not.toHaveBeenCalled();
+      expect(retirePrRefMock).not.toHaveBeenCalled();
       expect(untagMock).not.toHaveBeenCalled();
       expect(reopenMock).not.toHaveBeenCalled();
       // ...so there is no pipeline work to report either: "run it again" would point the founder at
@@ -621,7 +676,7 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
 
       expect(result).toMatchObject({ applied: false, reworkedId: "already" });
       expect(result.pipeline).toBeUndefined();
-      expect(clearPrRefMock).not.toHaveBeenCalled();
+      expect(retirePrRefMock).not.toHaveBeenCalled();
     });
 
     it("still retires on a repeat whose follow-up IS parented under the target", async () => {
@@ -654,7 +709,11 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
       );
 
       expect(result.applied).toBe(false);
-      expect(clearPrRefMock).toHaveBeenCalledWith("/repo", expect.objectContaining({ id: "feat" }));
+      expect(retirePrRefMock).toHaveBeenCalledWith(
+        "/repo",
+        expect.objectContaining({ id: "feat" }),
+        "gh-42",
+      );
     });
   });
 
@@ -685,7 +744,7 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
 
     it("leaves the merged target exactly as it shipped — ref, status and stage labels intact", async () => {
       await reworkTicket(project, "feat", input());
-      expect(clearPrRefMock).not.toHaveBeenCalled();
+      expect(retirePrRefMock).not.toHaveBeenCalled();
       expect(untagMock).not.toHaveBeenCalled();
     });
 
@@ -792,7 +851,7 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
         ReworkConflictError,
       );
 
-      expect(clearPrRefMock).not.toHaveBeenCalled();
+      expect(retirePrRefMock).not.toHaveBeenCalled();
       // The target keeps `stage:in-review` too: it is what gate-check finalizes the merge through.
       expect(untagMock).not.toHaveBeenCalledWith("/repo", "feat", expect.anything());
     });
@@ -823,7 +882,7 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
         ReworkUnavailableError,
       );
       expect(noteMock).not.toHaveBeenCalled();
-      expect(clearPrRefMock).not.toHaveBeenCalled();
+      expect(retirePrRefMock).not.toHaveBeenCalled();
     });
 
     it("re-reads the state rather than trusting the pre-lock one", async () => {
@@ -837,9 +896,9 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
     /**
      * Still open at the mode decision AND at the retire's own check — merged only once the three
      * writes had landed. The window no lock can order: `gh` said open, then GitHub merged while
-     * `untag`/`reopen`/`clearPrRef` were applying.
+     * `untag`/`reopen`/`retirePrRef` were applying.
      */
-    function mergesDuringTheWrites(): void {
+    function mergesDuringTheWrites(settled: "merged" | "unknown" = "merged"): void {
       targetWithPr("open");
       showMock.mockImplementation(async (_cwd, id) =>
         id === "feat"
@@ -850,13 +909,14 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
               labels: ["stage:in-review"],
               metadata: { pr: "gh-42" },
             })
-          : makeBead({ id, status: "closed" }),
+          : // The reworked ticket as its run left it: closed, still wearing the run's stage label.
+            makeBead({ id, status: "closed", labels: ["stage:in-review"] }),
       );
       prStateMock.mockReset();
       prStateMock
         .mockResolvedValueOnce("open")
         .mockResolvedValueOnce("open")
-        .mockResolvedValue("merged");
+        .mockResolvedValue(settled);
     }
 
     it("rolls the retire back — a merged target keeps the ref and label it finalizes through", async () => {
@@ -867,7 +927,11 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
       );
 
       // The writes did land this time (the check before them saw an open PR)...
-      expect(clearPrRefMock).toHaveBeenCalledWith("/repo", expect.objectContaining({ id: "feat" }));
+      expect(retirePrRefMock).toHaveBeenCalledWith(
+        "/repo",
+        expect.objectContaining({ id: "feat" }),
+        "gh-42",
+      );
       // ...and every one of them was put back: without this the merged PR has no ref and no
       // `stage:in-review`, so `finalizablePr` can never finalize it and the target re-runs shipped work.
       expect(setPrRefMock).toHaveBeenCalledWith("/repo", "feat", "gh-42");
@@ -892,6 +956,66 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
       );
       // `stage:implementing` was never on the bead; putting it back would invent a state.
       expect(tagMock).toHaveBeenCalledWith("/repo", "feat", ["stage:in-review"]);
+    });
+
+    it("rolls the reopened CHILD back too — the target's rollback never reaches it", async () => {
+      // On a grouped target the mode reopened a bead of its own. Left reopened and stage-stripped
+      // under a merged target, nothing dispatches it — and the retry this 409 instructs opens a
+      // standalone follow-up, so nothing repairs it either.
+      mergesDuringTheWrites();
+
+      await expect(reworkTicket(project, "feat", input())).rejects.toBeInstanceOf(
+        ReworkConflictError,
+      );
+
+      // The reopen did land (the check before the writes saw an open PR)...
+      expect(reopenMock).toHaveBeenCalledWith("/repo", "t1", "rework: the API is still untested");
+      expect(untagMock).toHaveBeenCalledWith("/repo", "t1", ["stage:implementing", "stage:in-review"]);
+      // ...and both of its writes were put back, on the ticket, not just on the target.
+      expect(closeMock).toHaveBeenCalledWith("/repo", "t1", expect.stringContaining("rolled back"));
+      expect(tagMock).toHaveBeenCalledWith("/repo", "t1", ["stage:in-review"]);
+    });
+
+    it("records the rollback under the instructions it left on that child", async () => {
+      // bd notes are append-only, so the founder's words stay. A closed ticket wearing a send-back
+      // that apparently did nothing is what the record underneath them explains.
+      mergesDuringTheWrites();
+      await expect(reworkTicket(project, "feat", input())).rejects.toBeInstanceOf(
+        ReworkConflictError,
+      );
+      const noted = noteMock.mock.calls.filter((c) => c[1] === "t1").map((c) => c[2] as string);
+      expect(noted[0]).toContain(INSTRUCTIONS); // the human note the reopen wrote
+      expect(noted[1]).toContain("rolled back");
+    });
+
+    it("reports the ticket that went back with the target, so the founder knows what to look at", async () => {
+      mergesDuringTheWrites();
+      await expect(reworkTicket(project, "feat", input())).rejects.toThrow(/feat and t1/);
+    });
+
+    it("503s rather than 409s when `gh` goes unreadable across the writes", async () => {
+      // Unreadable is not merged. The writes still come off — nothing may stand on a read anton
+      // can't make — but "if it merged, the fix runs as its own target" would be advice about a
+      // race that may never have happened, and the actual remedy is `gh`.
+      mergesDuringTheWrites("unknown");
+
+      await expect(reworkTicket(project, "feat", input())).rejects.toBeInstanceOf(
+        ReworkUnavailableError,
+      );
+
+      // Rolled back exactly as a confirmed merge is: an unverified retire is not one to stand behind.
+      expect(setPrRefMock).toHaveBeenCalledWith("/repo", "feat", "gh-42");
+      expect(tagMock).toHaveBeenCalledWith("/repo", "feat", ["stage:in-review"]);
+      expect(closeMock).toHaveBeenCalledWith("/repo", "t1", expect.stringContaining("rolled back"));
+    });
+
+    it("names `gh`, not a merge, in the 503 it raises", async () => {
+      mergesDuringTheWrites("unknown");
+      await expect(reworkTicket(project, "feat", input())).rejects.toThrow(/gh[\s\S]*authenticated/);
+      const noted = noteMock.mock.calls.filter((c) => c[1] === "feat").map((c) => c[2] as string);
+      expect(noted.join("\n")).toContain("could no longer be read");
+      // ...and never the merged wording, which would send the founder after the wrong fix.
+      expect(noted.some((n) => n.includes("reads as merged"))).toBe(false);
     });
 
     it("records on the target that the half-applied retire was undone", async () => {
@@ -943,7 +1067,11 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
         reworkTicket(project, "solo", input({ ticketId: "solo" })),
       ).rejects.toBeInstanceOf(ReworkConflictError);
 
-      expect(clearPrRefMock).toHaveBeenCalledWith("/repo", expect.objectContaining({ id: "solo" }));
+      expect(retirePrRefMock).toHaveBeenCalledWith(
+        "/repo",
+        expect.objectContaining({ id: "solo" }),
+        "gh-42",
+      );
       expect(setPrRefMock).toHaveBeenCalledWith("/repo", "solo", "gh-42");
       // The status and the label the mode's own reopen took off go back too. Restoring the
       // post-reopen state instead would leave the merged original open and untagged — invisible to
@@ -954,6 +1082,54 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
         expect.stringContaining("rolled back"),
       );
       expect(tagMock).toHaveBeenCalledWith("/repo", "solo", ["stage:in-review"]);
+    });
+  });
+
+  describe("a PR an EARLIER send-back already retired", () => {
+    /**
+     * The board a retire leaves behind: no live ref, and the PR it came off named on the bead. What
+     * happens next depends on that PR, which can merge in the window before the rerun re-stamps it.
+     */
+    function retiredPr(state: "open" | "merged" | "unknown"): void {
+      const target = () =>
+        makeBead({ id: "feat", issue_type: "feature", metadata: { retiredPr: "gh-42" } });
+      board(target(), ticketA(), ticketB());
+      showMock.mockImplementation(async (_cwd, id) =>
+        id === "feat" ? target() : makeBead({ id, status: "closed" }),
+      );
+      prStateMock.mockResolvedValue(state);
+    }
+
+    it("redirects a second send-back once that PR has MERGED", async () => {
+      // Without the retired pointer this reads as a bead with no PR at all: an ordinary reopen,
+      // promising a run on a base branch that already carries the work.
+      retiredPr("merged");
+
+      const result = await reworkTicket(project, "feat", input());
+
+      expect(result.pipeline).toEqual({ outcome: "shipped", pr: "gh-42", redirected: true });
+      expect(result).toMatchObject({ mode: "follow-up", reworkedId: "anton-new" });
+      expect(createMock.mock.calls[0][1].deps).toBeUndefined(); // its own run target
+      expect(reopenMock).not.toHaveBeenCalled();
+    });
+
+    it("has nothing to retire while it is still open — the marker is already off the bead", async () => {
+      retiredPr("open");
+
+      const result = await reworkTicket(project, "feat", input());
+
+      expect(result).toMatchObject({ mode: "reopen", reworkedId: "t1", applied: true });
+      expect(result.pipeline).toBeUndefined();
+      expect(retirePrRefMock).not.toHaveBeenCalled();
+      expect(untagMock).not.toHaveBeenCalledWith("/repo", "feat", expect.anything());
+    });
+
+    it("refuses rather than guesses when that PR can't be read", async () => {
+      retiredPr("unknown");
+      await expect(reworkTicket(project, "feat", input())).rejects.toBeInstanceOf(
+        ReworkUnavailableError,
+      );
+      expect(noteMock).not.toHaveBeenCalled();
     });
   });
 
@@ -1004,7 +1180,7 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
     targetWithPr("closed");
     const result = await reworkTicket(project, "feat", input());
     expect(result.pipeline).toBeUndefined();
-    expect(clearPrRefMock).not.toHaveBeenCalled();
+    expect(retirePrRefMock).not.toHaveBeenCalled();
     expect(result.mode).toBe("reopen");
   });
 
