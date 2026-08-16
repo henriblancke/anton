@@ -20,6 +20,7 @@ import type { DepEdge, DepType, Epic, Stage, Ticket } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { layoutGraphNodes, type GraphLayoutNode } from "@/components/epic/graph-layout";
 import { orientEdge } from "@/components/epic/dependency-graph-model";
+import { REACT_FLOW_CONTROLS_THEME_CLASS } from "@/components/epic/graph-theme";
 
 const STAGE_VAR: Record<Stage, string> = {
   backlog: "var(--stage-backlog)",
@@ -41,16 +42,7 @@ const REACT_FLOW_CHROME_CLASS = [
   "[&_.react-flow__controls]:border-border",
   "[&_.react-flow__controls]:bg-card",
   "[&_.react-flow__controls]:shadow-none",
-  // Theme the Controls through ReactFlow's own CSS variables. ReactFlow only applies its dark
-  // palette under `.react-flow.dark` (a class we never set — the app toggles dark on an ancestor),
-  // so its light defaults (white button, grey border) otherwise leak into dark mode. Driving the
-  // vars here follows the app theme in both modes; the button glyph is an <svg fill="currentColor">,
-  // so the button *color* var (not `fill`) is what makes the icon visible.
-  "[--xy-controls-button-background-color:var(--color-card)]",
-  "[--xy-controls-button-background-color-hover:var(--color-muted)]",
-  "[--xy-controls-button-color:var(--color-foreground)]",
-  "[--xy-controls-button-color-hover:var(--color-foreground)]",
-  "[--xy-controls-button-border-color:var(--color-border)]",
+  REACT_FLOW_CONTROLS_THEME_CLASS,
 ].join(" ");
 
 interface EpicNodeData extends Record<string, unknown> {
