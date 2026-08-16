@@ -154,7 +154,7 @@ export async function reworkTicket(
   // correct against a target nothing else is moving. Deduped for a standalone target, where the
   // ticket IS the target.
   const findings = input.findings ?? [];
-  const { result, retired } = await withBeadWriteLocks(
+  const { result, runsUnderTarget, retired } = await withBeadWriteLocks(
     project.repoPath,
     [ticket.id, target.id],
     async () => {
@@ -162,13 +162,19 @@ export async function reworkTicket(
         mode === "reopen"
           ? await applyReopen(project, target, ticket, summary, instructions, findings)
           : await applyFollowUp(project, target, ticket, summary, instructions, findings, pipeline);
+      // Only retire when the instructions landed on a bead THIS target's run will dispatch: a
+      // parentless follow-up is its own run target, so clearing the target's ref and `stage:in-review`
+      // would strip the merge gate off a PR that is still open — and hand the claimer a target whose
+      // work is already on the branch — to unblock a run that was never going to carry the fix.
       // Attempted even on a no-op double submit: the first request may have written the note and
       // died before the reset, and a repeat that reported "already sent back" over a still
       // short-circuiting target would be the very false green this exists to remove. Idempotent — a
       // target whose ref is already gone has nothing left to retire.
       const retired =
-        pipeline?.outcome === "retired" ? await retireFinishedRun(project, target) : false;
-      return { result: applied, retired };
+        pipeline?.outcome === "retired" && applied.runsUnderTarget
+          ? await retireFinishedRun(project, target)
+          : false;
+      return { ...applied, retired };
     },
   );
 
@@ -177,7 +183,21 @@ export async function reworkTicket(
   // retire counts as a write of its own — it can land on the repeat that finished a half-applied
   // send-back, whose mode step wrote nothing.
   if (result.applied || retired) nudgeSync(project, "rework");
-  return { ...result, ...(pipeline ? { pipeline } : {}) };
+  // `retired` is a claim about a write, so it is reported only where that write was the plan. A
+  // follow-up that runs as its own target had nothing standing in its way, and saying "run it again"
+  // over an untouched target would point the founder at a run that short-circuits.
+  const reported = pipeline?.outcome === "retired" && !runsUnderTarget ? undefined : pipeline;
+  return { ...result, ...(reported ? { pipeline: reported } : {}) };
+}
+
+/**
+ * An applied rework, plus the one thing the pipeline reset needs to know: does the bead now carrying
+ * the instructions run under THIS target? Only then does retiring the target's finished-run marker
+ * ({@link retireFinishedRun}) actually put the work back in front of a runner.
+ */
+interface AppliedRework {
+  result: ReworkResult;
+  runsUnderTarget: boolean;
 }
 
 /**
@@ -224,7 +244,11 @@ function assertNoLiveRun(projectId: string, target: Bead): void {
  *   • OPEN — the work is on the branch and the PR is still the founder's merge gate. Retire the
  *     target's finished-run marker ({@link retireFinishedRun}) and let it run again on that same
  *     branch: the closed siblings' commits are right there, so they stay skipped, and the PR step
- *     REUSES the open PR (openPullRequest) and refreshes its body with the new round.
+ *     REUSES the open PR (openPullRequest) and refreshes its body with the new round. Retiring is
+ *     conditional on the send-back actually landing in that run, which only the mode decides — see
+ *     `runsUnderTarget` ({@link AppliedRework}). A follow-up on a standalone target comes out
+ *     PARENTLESS ({@link applyFollowUp}) and is its own run target, so this target's run would not
+ *     carry the fix and its open PR stays exactly as it is.
  *   • MERGED — the work is on the base branch, so there is nothing to re-run: a fresh worktree
  *     branches off a base that already contains it, and a squash-merge leaves none of the tickets'
  *     `<id>:` commit subjects behind — so execute-epic's commit-presence check would read every
@@ -261,7 +285,8 @@ async function resolvePipeline(
 
 /**
  * Retire the finished run cycle recorded on the target, so its next run executes instead of
- * short-circuiting. Three writes, each idempotent:
+ * short-circuiting. Called only when the reworked bead will run under this target — otherwise these
+ * writes cost the still-open PR its merge gate and buy nothing. Three writes, each idempotent:
  *
  *   • the PR ref comes OFF (`clearPrRef`) — the marker step 0a reads as "another run already
  *     finished this". The PR itself is untouched and un-notified: the next run pushes to the same
@@ -312,7 +337,7 @@ async function applyReopen(
   summary: string,
   instructions: string,
   findings: ReviewFinding[],
-): Promise<ReworkResult> {
+): Promise<AppliedRework> {
   const repo = project.repoPath;
   const author = await resolveAuthor();
   const body = reworkNoteBody({ mode: "reopen", targetId: target.id, summary, instructions, findings });
@@ -324,8 +349,12 @@ async function applyReopen(
   // re-closed the ticket) would skip the reopen and leave the bead closed while the founder is told
   // it went back.
   const fresh = await beads.show(repo, ticket.id);
+  // A reopen always runs under the target: the ticket was checked to be one of its run members.
   if (hasHumanNote(fresh, body) && fresh.status !== "closed" && !hasStageLabel(fresh)) {
-    return { mode: "reopen", ticketId: ticket.id, reworkedId: ticket.id, note: body, applied: false };
+    return {
+      result: { mode: "reopen", ticketId: ticket.id, reworkedId: ticket.id, note: body, applied: false },
+      runsUnderTarget: true,
+    };
   }
 
   const note = formatHumanNote(body, author, new Date());
@@ -340,7 +369,10 @@ async function applyReopen(
   // straight past the ticket it was just told to redo — and `stage:implementing` makes a reopened
   // bead derive as in-progress on every board surface.
   await beads.untag(repo, ticket.id, [LABELS.stage("implementing"), LABELS.stage("in-review")]);
-  return { mode: "reopen", ticketId: ticket.id, reworkedId: ticket.id, note: body, applied: true };
+  return {
+    result: { mode: "reopen", ticketId: ticket.id, reworkedId: ticket.id, note: body, applied: true },
+    runsUnderTarget: true,
+  };
 }
 
 /**
@@ -352,7 +384,9 @@ async function applyReopen(
  * card (a feature or a non-container epic) it becomes another ticket of that target's next run.
  * Under a standalone task/bug it would become a ticket of NO run — `boardCards` only cards epics and
  * features, so nothing would ever dispatch it — so there it is created parentless, which makes it a
- * run target in its own right, claimable and approvable like any other standalone item.
+ * run target in its own right, claimable and approvable like any other standalone item. That same
+ * choice is what `runsUnderTarget` reports, because a parentless follow-up gives the target's own
+ * run nothing to carry and so must not retire its open PR ({@link resolvePipeline}).
  *
  * A SHIPPED target (its PR merged, {@link resolvePipeline}) is parented nowhere for a second reason:
  * its next run has nothing left to execute, so a child of it would never be dispatched either. The
@@ -366,7 +400,7 @@ async function applyFollowUp(
   instructions: string,
   findings: ReviewFinding[],
   pipeline?: ReworkPipeline,
-): Promise<ReworkResult> {
+): Promise<AppliedRework> {
   const repo = project.repoPath;
   const author = await resolveAuthor();
   const shipped = pipeline?.outcome === "shipped";
@@ -387,11 +421,16 @@ async function applyFollowUp(
   const existing = existingFollowUp(all, ticket.id, summary);
   if (existing) {
     return {
-      mode: "follow-up",
-      ticketId: ticket.id,
-      reworkedId: existing.id,
-      note: body,
-      applied: false,
+      result: {
+        mode: "follow-up",
+        ticketId: ticket.id,
+        reworkedId: existing.id,
+        note: body,
+        applied: false,
+      },
+      // Read off the bead the winner actually created, so the repeat that finishes a half-applied
+      // send-back retires on exactly the same condition the first request would have.
+      runsUnderTarget: beads.parentOf(existing) === target.id,
     };
   }
 
@@ -433,7 +472,10 @@ async function applyFollowUp(
     ),
     author || undefined,
   );
-  return { mode: "follow-up", ticketId: ticket.id, reworkedId: followUpId, note: body, applied: true };
+  return {
+    result: { mode: "follow-up", ticketId: ticket.id, reworkedId: followUpId, note: body, applied: true },
+    runsUnderTarget: parentId === target.id,
+  };
 }
 
 /**

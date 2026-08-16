@@ -453,6 +453,98 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
       await reworkTicket(project, "feat", input());
       expect(clearPrRefMock).not.toHaveBeenCalled();
     });
+
+    it("retires for a follow-up too, when the board card parents it into that same next run", async () => {
+      const result = await reworkTicket(project, "feat", input({ mode: "follow-up" as const }));
+
+      expect(createMock.mock.calls[0][1].deps).toEqual(["parent-child:feat"]);
+      expect(result.pipeline).toEqual({ outcome: "retired", pr: "gh-42", redirected: false });
+      expect(clearPrRefMock).toHaveBeenCalledWith("/repo", expect.objectContaining({ id: "feat" }));
+    });
+  });
+
+  describe("PR still open, but the send-back runs as its OWN target", () => {
+    /** A standalone task target carrying a live PR ref — where a follow-up comes out parentless. */
+    function standaloneWithOpenPr(...rest: Bead[]): void {
+      const solo = () =>
+        makeBead({
+          id: "solo",
+          title: "Standalone",
+          issue_type: "task",
+          labels: ["approved", "stage:in-review"],
+          metadata: { pr: "gh-42" },
+        });
+      board(solo(), ...rest);
+      showMock.mockImplementation(async (_cwd, id) =>
+        id === "solo" ? solo() : makeBead({ id, status: "closed" }),
+      );
+      prStateMock.mockResolvedValue("open");
+    }
+
+    const soloFollowUp = () =>
+      input({ ticketId: "solo", mode: "follow-up" as const, summary: "Harden the retry path" });
+
+    it("leaves the target's ref, stage and status alone — its open PR is still the merge gate", async () => {
+      standaloneWithOpenPr();
+
+      const result = await reworkTicket(project, "solo", soloFollowUp());
+
+      // Parentless: `boardCards` never cards a task, so this bead is its own run target and the
+      // target's next run would have nothing of the fix to carry.
+      expect(createMock.mock.calls[0][1].deps).toBeUndefined();
+      expect(clearPrRefMock).not.toHaveBeenCalled();
+      expect(untagMock).not.toHaveBeenCalled();
+      expect(reopenMock).not.toHaveBeenCalled();
+      // ...so there is no pipeline work to report either: "run it again" would point the founder at
+      // a target whose run still short-circuits, and whose work is already on the branch.
+      expect(result.pipeline).toBeUndefined();
+      expect(result).toMatchObject({ mode: "follow-up", reworkedId: "anton-new", applied: true });
+    });
+
+    it("retires nothing on the repeat either — the follow-up it finds is parentless too", async () => {
+      standaloneWithOpenPr(
+        makeBead({
+          id: "already",
+          title: "Harden the retry path",
+          dependencies: [{ issue_id: "already", depends_on_id: "solo", type: "discovered-from" }],
+        }),
+      );
+
+      const result = await reworkTicket(project, "solo", soloFollowUp());
+
+      expect(result).toMatchObject({ applied: false, reworkedId: "already" });
+      expect(result.pipeline).toBeUndefined();
+      expect(clearPrRefMock).not.toHaveBeenCalled();
+    });
+
+    it("still retires on a repeat whose follow-up IS parented under the target", async () => {
+      // The half-applied send-back this retry exists to finish: the note landed, the reset didn't.
+      board(
+        makeBead({ id: "feat", issue_type: "feature", metadata: { pr: "gh-42" } }),
+        ticketA(),
+        makeBead({
+          id: "already",
+          title: "Harden the retry path",
+          parent: "feat",
+          dependencies: [{ issue_id: "already", depends_on_id: "t1", type: "discovered-from" }],
+        }),
+      );
+      showMock.mockImplementation(async (_cwd, id) =>
+        id === "feat"
+          ? makeBead({ id, issue_type: "feature", metadata: { pr: "gh-42" } })
+          : makeBead({ id, status: "closed" }),
+      );
+      prStateMock.mockResolvedValue("open");
+
+      const result = await reworkTicket(
+        project,
+        "feat",
+        input({ mode: "follow-up" as const, summary: "Harden the retry path" }),
+      );
+
+      expect(result.applied).toBe(false);
+      expect(clearPrRefMock).toHaveBeenCalledWith("/repo", expect.objectContaining({ id: "feat" }));
+    });
   });
 
   describe("PR merged", () => {

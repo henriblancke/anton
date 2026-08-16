@@ -225,6 +225,45 @@ describeBd("execute-epic e2e — a send-back's run path back (real handler · re
     }
   });
 
+  it("a FOLLOW-UP off an open-PR target runs as its own target, leaving that PR's target intact", async () => {
+    const bugId = await targetInReview("Open PR, follow-up");
+
+    const okGh = process.env.ANTON_GH_BIN!;
+    // OPEN is what rework reads off gh-42; the follow-up's own branch carries no PR, so its run
+    // opens one of its own rather than landing back on the target's.
+    process.env.ANTON_GH_BIN = ghReporting(binDir, "gh-open-followup-leit", "OPEN", null);
+    try {
+      const result = await reworkTicket(project, bugId, {
+        ticketId: bugId,
+        mode: "follow-up",
+        summary: "Cap the retry backoff",
+        instructions: "Bound the retry backoff at 30s and cover it with a test.",
+      });
+
+      // A standalone target's follow-up is parentless — its own run target — so this target's next
+      // run was never going to carry the fix. Retiring here would strip the merge gate off a PR
+      // that is still open and hand the claimer work already sitting on its branch.
+      expect(result.pipeline).toBeUndefined();
+      const untouched = await beads.show(repo, bugId);
+      expect(beads.getPrRef(untouched)).toBe("gh-42");
+      expect(untouched.labels ?? []).toContain("stage:in-review");
+
+      await beads.approve(repo, result.reworkedId);
+      await resetPerCaseState(tdb);
+      const job = await driveEpicRun(makeEpicRunner(ctx), {
+        projectId,
+        epicBeadId: result.reworkedId,
+      });
+
+      // The fix still has a run path — on the follow-up's own branch and its own pull request.
+      await expectJobStatus(tdb.db, job, "done");
+      expect(await sessionBeads()).toContain(result.reworkedId);
+      expect(beads.getPrRef(await beads.show(repo, result.reworkedId))).toBe("gh-99");
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+    }
+  });
+
   it("refuses rather than guesses when `gh` can't say what the target's PR did", async () => {
     const bugId = await targetInReview("Unreadable PR");
 

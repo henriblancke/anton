@@ -83,8 +83,9 @@ export const MAX_REWORK_INSTRUCTIONS_CHARS = 2000;
  * What a send-back had to do about the target's ALREADY-OPENED pull request (anton-leit). A run
  * target whose PR is live finishes as already-complete on its next attempt (execute-epic's step 0a
  * short-circuit), so without one of these two moves the reworked bead would sit open forever with no
- * run path back. Absent when nothing stood in the way — no PR, or one that was closed unmerged (the
- * state a recovery run already re-opens).
+ * run path back. Absent when nothing stood in the way — no PR, one that was closed unmerged (the
+ * state a recovery run already re-opens), or a follow-up that came out as its own run target and so
+ * never waits on the target's PR at all.
  */
 export interface ReworkPipeline {
   /**
