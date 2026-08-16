@@ -1614,18 +1614,28 @@ async function runTicket(args: {
         }, timeoutMs)
       : null;
   if (deadline && typeof deadline.unref === "function") deadline.unref();
-  // Best-effort: an unreadable baseline costs the rollback, not the timeout — the ticket is still
-  // stopped and blocked, and the run reports that its partial work had to be left in place.
-  const baseline = deadline
-    ? await readWorktreeState(worktreePath).catch(() => null)
-    : null;
+  // Read unconditionally, because two steps of the ticket need it and only one of them is the
+  // timeout: `step:commit` compares HEAD against this baseline to tell an agent that changed
+  // nothing from one that committed its own work (anton-8t1f), and that question is asked on every
+  // ticket, not just the ones running under a deadline.
+  //
+  // Best-effort either way: an unreadable baseline costs the rollback, not the timeout — the ticket
+  // is still stopped and blocked, and the run reports that its partial work had to be left in
+  // place. `step:commit` likewise falls back to reading the index alone.
+  const baseline = await readWorktreeState(worktreePath).catch(() => null);
 
   // This ticket's step context: the run's, narrowed to this ticket. The session is opened HERE and
   // handed in, so one session still covers the whole ticket — dispatch, gates and commit — exactly
   // as before. The claude driver is built per step below, so a resumed session is told which step it
   // is continuing.
   const ticketRunCtx = { ...ctx, signal: ticketAbort.signal };
-  const ticketCtx: StepContext = { ...run, ctx: ticketRunCtx, tickets: [ticket], session };
+  const ticketCtx: StepContext = {
+    ...run,
+    ctx: ticketRunCtx,
+    tickets: [ticket],
+    session,
+    ...(baseline ? { ticketStartHead: baseline.head } : {}),
+  };
 
   let committed = false;
   // The agent's machine-readable self-report (anton-j5i8) — `delivered` or `blocked — <reason>`,

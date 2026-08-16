@@ -321,6 +321,10 @@ function exitedWith(error: unknown, code: number): boolean {
 /**
  * Stage everything in the worktree and commit. Returns `{ committed: false }` when there is
  * nothing to commit (claude made no changes) — the caller decides whether that's acceptable.
+ *
+ * An empty index is NOT proof that nothing was delivered: an agent that committed its own work
+ * (against the base contract, but it happens) leaves exactly the same empty index. Only HEAD tells
+ * the two apart — see `commitStep`, which is the caller that has to.
  */
 export async function commitAll(
   worktreePath: string,
@@ -335,6 +339,44 @@ export async function commitAll(
     await git(worktreePath, ["commit", "-m", message]);
     return { committed: true };
   }
+}
+
+/**
+ * True when `ancestor` is reachable from `descendant` — i.e. the branch only moved FORWARD between
+ * them, adding commits without dropping or rewriting any.
+ *
+ * `step:commit` asks this before adopting work an agent committed itself: a moved HEAD is delivery
+ * only if the commit the ticket started from is still on the branch. A `git reset --hard HEAD~1` or
+ * an amend moves HEAD just as visibly while REMOVING history — on a multi-ticket run, possibly an
+ * earlier ticket's commits — and adopting that would open a PR missing work anton has already
+ * closed the bead for.
+ *
+ * Only git's own "no" (exit 1) is an answer; anything else propagates rather than reading as one.
+ */
+export async function isAncestor(
+  worktreePath: string,
+  ancestor: string,
+  descendant: string,
+): Promise<boolean> {
+  try {
+    await git(worktreePath, ["merge-base", "--is-ancestor", ancestor, descendant]);
+    return true;
+  } catch (e) {
+    if (exitedWith(e, 1)) return false;
+    throw e;
+  }
+}
+
+/**
+ * Record an EMPTY commit — a marker that carries a message and no diff.
+ *
+ * The one caller is `step:commit` adopting work an agent committed itself. Those commits are real
+ * and keep their own messages, but they don't carry the `<ticketId>:` subject that
+ * {@link worktreeHasCommitFor} reads, so without a marker a resume cannot see that the ticket's
+ * work is already on the branch and re-runs it — onto a tree where there is nothing left to do.
+ */
+export async function commitMarker(worktreePath: string, message: string): Promise<void> {
+  await git(worktreePath, ["commit", "--allow-empty", "-m", message]);
 }
 
 export async function hasRemote(repoPath: string, name = "origin"): Promise<boolean> {
