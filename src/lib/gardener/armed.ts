@@ -245,6 +245,19 @@ export async function applyArmedProposals(input: ArmedInput): Promise<ArmedResul
    * the unpushed backlog and enqueues the durable retry that parks for a human on exhaustion. This
    * only adds the answer an unattended pass cannot get from a fire-and-forget call.
    *
+   * What that answer does NOT buy is that the premise still held. `beads.push` PULLS before it
+   * pushes (beads/bd.ts `runDoltSync`), and Dolt merges a concurrent write to a DIFFERENT column of
+   * the same bead rather than conflicting on it — only a same-cell divergence rejects. So a machine
+   * that touched a subject after this apply's pre-apply pull can land beside the move and the push
+   * still succeeds: the walk decided on evidence its own publication has just superseded.
+   *
+   * The merged board is not re-decided against, because no answer read there could be acted on. The
+   * move is already on the shared board; this pass's own write bumps the very `updated_at` the
+   * evidence fence dates against (apply.ts `observedAtOf`), so the other machine's write cannot be
+   * told from ours; and bd offers no cross-machine compare-and-set that could have refused instead.
+   * Un-writing an applied move unattended would rest on weaker evidence than the move it undid. What
+   * is left is a merge a human reads off the subject — which the record above names by id.
+   *
    * Returns the correction it could NOT record, and only for stranded moves — see {@link stranding}.
    */
   const publish = async (): Promise<string | undefined> => {
