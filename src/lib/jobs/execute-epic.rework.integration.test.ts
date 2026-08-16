@@ -16,6 +16,7 @@ import { beads } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
 import * as schema from "../db/schema";
 import { resetOperatorCache } from "../operator";
+import { getJob } from "./queue";
 import { describeBd } from "@/lib/testing/integration";
 import { expectJobStatus } from "@/lib/testing/jobs";
 import { reworkTicket } from "../rework";
@@ -264,6 +265,42 @@ describeBd("execute-epic e2e — a send-back's run path back (real handler · re
       });
       expect(followUp.pipeline).toEqual({ outcome: "shipped", pr: "gh-42", redirected: true });
       expect(followUp.reworkedId).not.toBe(bugId);
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+    }
+  });
+
+  it("a retired PR whose state can't be READ retries too, rather than running on a guess", async () => {
+    const bugId = await targetInReview("Open PR, sent back, then unreadable");
+
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = ghReporting(binDir, "gh-open-then-broken-leit", "OPEN", 42);
+    try {
+      await reworkTicket(project, bugId, {
+        ticketId: bugId,
+        mode: "reopen",
+        summary: "The backoff cap is still missing",
+        instructions: "Bound the retry backoff at 30s and cover it with a test.",
+      });
+      expect(beads.getRetiredPrRef(await beads.show(repo, bugId))).toBe("gh-42");
+
+      // `gh` goes away before the rerun gets its slot. Unknown is proof of nothing: if gh-42 in fact
+      // merged, executing re-dispatches shipped work — so the run must retry, not fall through.
+      process.env.ANTON_GH_BIN = writeBin(binDir, "gh-broken-after-retire-leit", `process.exit(1);`);
+      await resetPerCaseState(tdb);
+      const job = await driveEpicRun(makeEpicRunner(ctx), { projectId, epicBeadId: bugId });
+
+      // A COUNTING failure (rescheduled, run row failed), and no agent was dispatched for the
+      // target — proof it bailed at step 0a rather than anywhere downstream.
+      expect((await getJob(tdb.db, job))?.status).not.toBe("done");
+      const runsForBug = (await tdb.db.select().from(schema.runs)).filter(
+        (r) => r.epicBeadId === bugId,
+      );
+      expect(runsForBug.some((r) => r.status === "failed")).toBe(true);
+      expect(runsForBug.some((r) => r.status === "done")).toBe(false);
+      expect(await sessionBeads()).not.toContain(bugId);
+      // The pointer is untouched, so a later attempt (or a readable `gh`) still decides correctly.
+      expect(beads.getRetiredPrRef(await beads.show(repo, bugId))).toBe("gh-42");
     } finally {
       process.env.ANTON_GH_BIN = okGh;
     }

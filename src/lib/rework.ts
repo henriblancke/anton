@@ -553,18 +553,22 @@ async function retireFinishedRun(
  * the PR the retire was predicated on stopped being provably open underneath it. That is the
  * retire's three writes, and on a STANDALONE target the mode's own reopen too, because there the
  * ticket is the target and both sets of writes moved the same bead. The ORDER is the recovery story
- * again, mirrored: the PR ref goes back FIRST because it is the pointer every consumer reads first —
- * `finalizablePr`, every in-review surface, and {@link resolvePipeline}, which answers `retired`
- * only for a LIVE ref.
+ * again, mirrored: the live PR ref goes back LAST, because it is the mark that makes a target
+ * DISPATCHABLE as a finished one — `finalizablePr` and every in-review surface read it first — and
+ * nothing else here can be retried once it is exposed. Retiring it is the write a retry re-enters
+ * ({@link resolvePipeline} answers `retired` only for a live ref); RESTORING it is not, because by
+ * then the PR reads as merged, which resolves to `shipped` and redirects the retry into a standalone
+ * follow-up. So restoring it ahead of the status and label would publish a target that is live-ref
+ * in-review, still open, and stage-less, with nothing left that ever completes the rollback.
  *
- * That buys recovery for the two writes AFTER it: a rollback that fails at `close` or `tag` leaves
- * the ref in place, so a retry re-enters {@link retireFinishedRun}, reads the PR as merged and
- * carries the fix as its own target. A `setPrRef` that fails is recoverable too, because the retire
- * MOVED the pointer rather than deleting it ({@link beads.retirePrRef}): the bead still names the PR
- * on its retired key, so the next send-back reads it there and redirects, and a reader can still
- * follow the bead to where its work went. What that half-rolled-back bead loses until then is its
- * in-review shape — no live ref, no stage label — so it can be re-dispatched by an ordinary run, and
- * a reader building on this must not assume the ordering makes every failure invisible.
+ * Ordering it last is what makes the two writes BEFORE it recoverable instead. Each leaves the
+ * target in the shape the retire itself produces — no live ref, the PR still named on its retired
+ * key ({@link beads.retirePrRef}) — which is a state the rest of the system already reads
+ * correctly: an ordinary run parks on it rather than re-dispatching shipped work (execute-epic step
+ * 0a reads the retired pointer), the next send-back redirects the fix onto its own target, and a
+ * reader can still follow the bead to where its work went. A failure at `tag` alone leaves the
+ * target closed — terminal, and out of every dispatch path — so the residue is a missing stage
+ * label on a bead nothing will run.
  *
  * `setPrRef` writes `metadata.pr`, the channel {@link beads.getPrRef} reads first, so the bead reads
  * as in-review again even where the retire also emptied a legacy `gh-` external_ref — which the
@@ -577,11 +581,11 @@ async function restoreFinishedRun(
   stages: string[],
   state: PullRequestState,
 ): Promise<void> {
-  await beads.setPrRef(repo, before.id, pr);
   if (before.status === "closed") {
     await beads.close(repo, before.id, `rework: retire rolled back — ${settledPhrase(pr, state)}`);
   }
   if (stages.length > 0) await beads.tag(repo, before.id, stages);
+  await beads.setPrRef(repo, before.id, pr);
 }
 
 /**

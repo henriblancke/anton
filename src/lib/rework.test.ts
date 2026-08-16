@@ -939,14 +939,30 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
       expect(closeMock).toHaveBeenCalledWith("/repo", "feat", expect.stringContaining("rolled back"));
     });
 
-    it("restores the ref FIRST — it is the only mark that can't be re-derived from the board", async () => {
+    it("restores the ref LAST — exposing it early strands a rollback nothing re-enters", async () => {
+      // A retry never re-enters the retire once the ref is back: the PR reads as merged, which
+      // resolves to `shipped`. So a close/tag that failed AFTER the ref would leave the target
+      // live-ref in-review, open and stage-less forever. Failing BEFORE it leaves the retired shape,
+      // which execute-epic parks on and the next send-back redirects.
       mergesDuringTheWrites();
       await expect(reworkTicket(project, "feat", input())).rejects.toBeInstanceOf(
         ReworkConflictError,
       );
       const refAt = setPrRefMock.mock.invocationCallOrder[0];
-      expect(refAt).toBeLessThan(closeMock.mock.invocationCallOrder[0]);
-      expect(refAt).toBeLessThan(tagMock.mock.invocationCallOrder[0]);
+      expect(refAt).toBeGreaterThan(closeMock.mock.invocationCallOrder[0]);
+      expect(refAt).toBeGreaterThan(tagMock.mock.invocationCallOrder[0]);
+    });
+
+    it("leaves the ref retired when the status restore fails, rather than half-rolling-back", async () => {
+      // The invariant the order buys, stated as behaviour: if the rollback can't put the target's
+      // own state back, it must not publish the live ref over a target that never got it back.
+      mergesDuringTheWrites();
+      closeMock.mockRejectedValueOnce(new Error("bd close failed"));
+
+      await expect(reworkTicket(project, "feat", input())).rejects.toThrow(/bd close failed/);
+
+      expect(setPrRefMock).not.toHaveBeenCalled();
+      expect(retirePrRefMock).toHaveBeenCalled();
     });
 
     it("only re-tags the stage labels the target actually carried", async () => {

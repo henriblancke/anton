@@ -525,17 +525,33 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         //     fresh send-back now produces (resolvePipeline reads the retired pointer too).
         //     Only consulted when there is no live ref — a re-stamped one is the live answer and
         //     clears this pointer (beads.setPrRef) — and only when one was actually retired, so the
-        //     ordinary run pays no `gh` call. An UNREADABLE state is left to run: unlike the live-ref
-        //     case there is no completed run to mistake it for, and the founder has explicitly asked
-        //     for this one, so a `gh` outage must not park every send-back's rerun.
+        //     ordinary run pays no `gh` call. An UNREADABLE state retries, exactly as the live-ref
+        //     branch above does and for the same reason: `unknown` is proof of nothing, so letting it
+        //     fall through to execute would re-dispatch shipped work whenever the retired PR had in
+        //     fact merged — the corruption this branch exists to prevent, now decided by a `gh`
+        //     outage. Running is not the cheap fallback it looks like either: `gh` is a hard
+        //     dependency of the run (step 5 opens/updates the PR), so a run that cannot read it
+        //     cannot finish. COUNTING (a plain throw), so a transient outage self-heals within the
+        //     retry budget and a permanent one parks for a human instead of retrying forever.
         const retiredPr = beads.getRetiredPrRef(leaseTarget);
-        if (retiredPr && (await pullRequestState(repo, retiredPr)) === "merged") {
-          throw new PoisonEpic(
-            `${epicBeadId} was sent back with ${retiredPr} still open, but that pull request has ` +
-              `merged since — its work is on the base branch, so re-running this target would ` +
-              `re-dispatch shipped tickets. Send the ticket back again: anton reads ${retiredPr} as ` +
-              `merged now and carries the fix as its own run target instead.`,
-          );
+        if (retiredPr) {
+          const retiredState = await pullRequestState(repo, retiredPr);
+          if (retiredState === "unknown") {
+            throw new Error(
+              `${epicBeadId} was sent back with ${retiredPr} still open, and that pull request's ` +
+                `state can't be read (gh unavailable or the ref is unparseable) — retrying rather ` +
+                `than re-running a target whose work may already have merged; a transient gh outage ` +
+                `self-heals within the retry budget, a permanently-unreadable ref parks for a human`,
+            );
+          }
+          if (retiredState === "merged") {
+            throw new PoisonEpic(
+              `${epicBeadId} was sent back with ${retiredPr} still open, but that pull request has ` +
+                `merged since — its work is on the base branch, so re-running this target would ` +
+                `re-dispatch shipped tickets. Send the ticket back again: anton reads ${retiredPr} as ` +
+                `merged now and carries the fix as its own run target instead.`,
+            );
+          }
         }
       }
 
