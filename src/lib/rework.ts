@@ -178,9 +178,18 @@ export async function reworkTicket(
     project.repoPath,
     [ticket.id, target.id],
     async () => {
-      // The PR the mode was decided against, re-read before ANY write — see
-      // {@link assertPrStillOpen}. Same guard the retire runs under, so it always precedes it.
-      if (pipeline?.outcome === "retired") await assertPrStillOpen(project.repoPath, target.id);
+      // The target as it stands before ANY write of this request, and the PR the mode was decided
+      // against re-read off it — see {@link assertPrStillOpen}. Same guard the retire runs under, so
+      // it always precedes it. The snapshot is taken HERE rather than inside {@link
+      // retireFinishedRun} because on a standalone target the ticket IS the target: the mode's
+      // writes below reopen it and strip its stage labels, so a snapshot taken after them would roll
+      // the retire back onto that already-reopened state and leave a merged original open, untagged
+      // and outside its own merge finalization.
+      let targetBeforeWrites: Bead | undefined;
+      if (pipeline?.outcome === "retired") {
+        targetBeforeWrites = await beads.show(project.repoPath, target.id);
+        await assertPrStillOpen(project.repoPath, targetBeforeWrites);
+      }
       const applied =
         mode === "reopen"
           ? await applyReopen(project, target, ticket, summary, instructions, findings)
@@ -194,8 +203,8 @@ export async function reworkTicket(
       // short-circuiting target would be the very false green this exists to remove. Idempotent — a
       // target whose ref is already gone has nothing left to retire.
       const retire: RetireResult =
-        pipeline?.outcome === "retired" && applied.runsUnderTarget
-          ? await retireFinishedRun(project, target)
+        pipeline?.outcome === "retired" && applied.runsUnderTarget && targetBeforeWrites
+          ? await retireFinishedRun(project, targetBeforeWrites)
           : { outcome: "not-attempted" };
       return { ...applied, retire };
     },
@@ -341,19 +350,23 @@ async function resolvePipeline(
  * state is re-read here — under the lock, ahead of the mode's writes — and not only inside
  * {@link retireFinishedRun}, which runs after them. Checking it there alone checked it too late: a
  * reopen had already written its note, reopened the ticket and stripped its stage labels by the time
- * the race was caught, the 409 took none of that back (the rollback only restores the TARGET), and
- * the instructed retry then opened a standalone follow-up while the original ticket stayed reopened
- * under a merged target that will never dispatch it.
+ * the race was caught, and on a GROUPED target the rollback reaches none of that — it restores the
+ * target, and the reopened bead is one of its children — so the instructed retry opened a standalone
+ * follow-up while the original ticket stayed reopened under a merged target that will never dispatch
+ * it.
  *
  * Nothing has been written when this refuses, so it records nothing on the board: the target is
  * exactly as its run left it, and the retry decides the mode against a PR that has stopped moving.
  * The window it cannot close is the one no client-side check can — a merge landing between this read
- * and the writes that follow it — which is what the post-write verify and its rollback are for.
+ * and the writes that follow it — which is what the post-write verify and its rollback are for. The
+ * rollback covers that window on a standalone target because it restores the pre-write snapshot the
+ * caller takes alongside this read ({@link restoreFinishedRun}).
  */
-async function assertPrStillOpen(repo: string, targetId: string): Promise<void> {
-  // The ref as it is NOW: a rival request that already retired this cycle leaves nothing to
-  // invalidate, and the retire below will report it as `already-retired`.
-  const pr = beads.getPrRef(await beads.show(repo, targetId));
+async function assertPrStillOpen(repo: string, target: Bead): Promise<void> {
+  // The ref as it is NOW — the caller's under-the-lock read, not the pre-lock snapshot: a rival
+  // request that already retired this cycle leaves nothing to invalidate, and the retire below will
+  // report it as `already-retired`.
+  const pr = beads.getPrRef(target);
   if (!pr) return;
   const state = await pullRequestState(repo, pr);
   if (state === "open") return;
@@ -361,14 +374,14 @@ async function assertPrStillOpen(repo: string, targetId: string): Promise<void> 
   // rather than reporting a race that may not have happened ({@link resolvePipeline} judges alike).
   if (state === "unknown") {
     throw new ReworkUnavailableError(
-      `anton could no longer read the state of ${targetId}'s pull request (${pr}) as this send-back ` +
+      `anton could no longer read the state of ${target.id}'s pull request (${pr}) as this send-back ` +
         `was about to be applied, so nothing was written — whether it merged decides how the ticket ` +
         `comes back, and it won't guess; check that \`gh\` is installed and authenticated, then send ` +
         `it back again`,
     );
   }
   throw new ReworkConflictError(
-    `${targetId}'s pull request (${pr}) stopped being open (${state}) while this send-back was ` +
+    `${target.id}'s pull request (${pr}) stopped being open (${state}) while this send-back was ` +
       `being applied, so nothing was written — sending work back to a target whose PR has merged ` +
       `would reopen a ticket nothing will run again. Send the ticket back again and anton will ` +
       `re-read the PR — if it merged, the fix runs as its own target instead.`,
@@ -416,22 +429,27 @@ type RetireResult =
  * The read that survives is the last one, so what remains open is a merge landing after it — no
  * write of ours follows, and no client-side check can order that against GitHub.
  *
+ * Two reads of the target, because the two questions differ. What still NEEDS writing is asked of
+ * the board as it is now (`fresh`) — on a standalone target the mode's reopen has already done half
+ * of this. What a rollback must PUT BACK is the caller's pre-write snapshot (`before`), taken ahead
+ * of the mode's writes: on that same standalone target `fresh` is the reopened, untagged bead, so
+ * restoring it would leave a merged original open and outside its own merge finalization.
+ *
  * An `anton:` note, not a human one: this is bookkeeping about a PR, and a human note is inlined
  * verbatim into the next implementer's prompt (`humanNotesPromptBlock`) where it would read as a
  * steer. Written only on a round that actually changed something, so a repeat adds no second line.
  */
-async function retireFinishedRun(project: Project, target: Bead): Promise<RetireResult> {
+async function retireFinishedRun(project: Project, before: Bead): Promise<RetireResult> {
   const repo = project.repoPath;
-  // Re-read under the lock, like the reopen path re-reads its bead: the pre-lock snapshot was taken
-  // before a rival request could already have retired this cycle.
-  const fresh = await beads.show(repo, target.id);
+  // Re-read after the mode's writes: what is left to do is a question about the board as it is now.
+  const fresh = await beads.show(repo, before.id);
   const pr = beads.getPrRef(fresh);
   if (!pr) return { outcome: "already-retired" };
 
-  const stages = RUN_STAGE_LABELS.filter((l) => fresh.labels?.includes(l));
-  await beads.untag(repo, target.id, RUN_STAGE_LABELS);
+  const stages = RUN_STAGE_LABELS.filter((l) => before.labels?.includes(l));
+  await beads.untag(repo, before.id, RUN_STAGE_LABELS);
   if (fresh.status === "closed") {
-    await beads.reopen(repo, target.id, "rework: sent back for another round");
+    await beads.reopen(repo, before.id, "rework: sent back for another round");
   }
   await beads.clearPrRef(repo, fresh);
 
@@ -441,13 +459,13 @@ async function retireFinishedRun(project: Project, target: Bead): Promise<Retire
   // retire is verified, not assumed, and an answer that changed undoes it.
   const settled = await pullRequestState(repo, pr);
   if (settled !== "open") {
-    await restoreFinishedRun(repo, fresh, pr, stages);
-    await noteRace(repo, target.id, pr, settled);
+    await restoreFinishedRun(repo, before, pr, stages);
+    await noteRace(repo, before.id, pr, settled);
     return { outcome: "raced", pr, state: settled };
   }
   await beads.note(
     repo,
-    target.id,
+    before.id,
     `anton: rework — ${pr} is still open, so this target's finished-run marker was cleared and it ` +
       `runs again. The next run continues on the same branch and updates ${pr} rather than opening ` +
       `a second one.`,
@@ -456,8 +474,10 @@ async function retireFinishedRun(project: Project, target: Bead): Promise<Retire
 }
 
 /**
- * Put back exactly what {@link retireFinishedRun}'s three writes took off, when the PR they were
- * predicated on merged underneath them. The ORDER is the recovery story again, mirrored: the PR ref
+ * Put the target back to `before` — the state it was in before this request wrote anything — when
+ * the PR the retire was predicated on merged underneath it. That is the retire's three writes, and
+ * on a STANDALONE target the mode's own reopen too, because there the ticket is the target and both
+ * sets of writes moved the same bead. The ORDER is the recovery story again, mirrored: the PR ref
  * goes back FIRST because it is the only one of the three that cannot be re-derived from the board —
  * lose it and the merged PR is unreachable from the bead by a reader, by `finalizablePr`, and by the
  * next send-back ({@link resolvePipeline} returns nothing without it).
@@ -477,21 +497,26 @@ async function retireFinishedRun(project: Project, target: Bead): Promise<Retire
  */
 async function restoreFinishedRun(
   repo: string,
-  fresh: Bead,
+  before: Bead,
   pr: string,
   stages: string[],
 ): Promise<void> {
-  await beads.setPrRef(repo, fresh.id, pr);
-  if (fresh.status === "closed") {
-    await beads.close(repo, fresh.id, `rework: retire rolled back — ${pr} merged as it was applying`);
+  await beads.setPrRef(repo, before.id, pr);
+  if (before.status === "closed") {
+    await beads.close(
+      repo,
+      before.id,
+      `rework: retire rolled back — ${pr} merged as it was applying`,
+    );
   }
-  if (stages.length > 0) await beads.tag(repo, fresh.id, stages);
+  if (stages.length > 0) await beads.tag(repo, before.id, stages);
 }
 
 /**
- * Record the lost race on the target itself, rather than only raising it: the mode's writes have
- * already landed and the retire's were applied and undone, so a reader looking at a bead sent back
- * to a merged PR needs to see why its target still wears the finished-run marker.
+ * Record the lost race on the target itself, rather than only raising it: the instructions have
+ * already landed and everything this send-back did to the TARGET was applied and undone, so a reader
+ * looking at a bead sent back to a merged PR needs to see why it still wears the finished-run
+ * marker — and, on a standalone target, why its own status went back with it.
  */
 async function noteRace(
   repo: string,
@@ -503,9 +528,9 @@ async function noteRace(
     repo,
     targetId,
     `anton: rework — ${pr} was open when this send-back was decided but reads as ${state} now, so ` +
-      `the retire that had already begun was rolled back and the finished-run marker was LEFT in ` +
-      `place. Send the ticket back again: anton re-reads the PR and, if it merged, carries the fix ` +
-      `as its own run target instead.`,
+      `the writes it had already applied to this bead were rolled back and the finished-run marker ` +
+      `was LEFT in place. Send the ticket back again: anton re-reads the PR and, if it merged, ` +
+      `carries the fix as its own run target instead.`,
   );
 }
 

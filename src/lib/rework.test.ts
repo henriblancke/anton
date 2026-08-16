@@ -904,6 +904,57 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
       // ...and no line claiming the marker was cleared, which is what the founder would act on.
       expect(noted.some(([id, text]) => id === "feat" && text.includes("was cleared"))).toBe(false);
     });
+
+    /**
+     * The same mid-write merge on a STANDALONE target, where the ticket IS the target: the reopen
+     * moves the very bead the retire's rollback has to put back. The fake board reflects that — once
+     * the mode has written, `show` reports the reopened, untagged bead.
+     */
+    function standaloneMergesDuringTheWrites(): void {
+      const solo = (over: Partial<Bead>): Bead =>
+        makeBead({
+          id: "solo",
+          title: "Standalone",
+          issue_type: "task",
+          status: "closed",
+          labels: ["approved", "stage:in-review"],
+          metadata: { pr: "gh-42" },
+          ...over,
+        });
+      board(solo({}));
+      let reopened = false;
+      reopenMock.mockImplementation(async () => {
+        reopened = true;
+      });
+      showMock.mockImplementation(async () =>
+        reopened ? solo({ status: "open", labels: ["approved"] }) : solo({}),
+      );
+      prStateMock.mockReset();
+      prStateMock
+        .mockResolvedValueOnce("open")
+        .mockResolvedValueOnce("open")
+        .mockResolvedValue("merged");
+    }
+
+    it("rolls a standalone target back to what its RUN left, not to what this send-back made of it", async () => {
+      standaloneMergesDuringTheWrites();
+
+      await expect(
+        reworkTicket(project, "solo", input({ ticketId: "solo" })),
+      ).rejects.toBeInstanceOf(ReworkConflictError);
+
+      expect(clearPrRefMock).toHaveBeenCalledWith("/repo", expect.objectContaining({ id: "solo" }));
+      expect(setPrRefMock).toHaveBeenCalledWith("/repo", "solo", "gh-42");
+      // The status and the label the mode's own reopen took off go back too. Restoring the
+      // post-reopen state instead would leave the merged original open and untagged — invisible to
+      // `finalizablePr`, and the instructed retry only opens a follow-up, so nothing repairs it.
+      expect(closeMock).toHaveBeenCalledWith(
+        "/repo",
+        "solo",
+        expect.stringContaining("rolled back"),
+      );
+      expect(tagMock).toHaveBeenCalledWith("/repo", "solo", ["stage:in-review"]);
+    });
   });
 
   it("never asks gh when the follow-up is its own run target either way", async () => {
