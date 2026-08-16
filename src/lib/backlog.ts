@@ -5,15 +5,12 @@ import { allIssues } from "./beads/issues";
 import type { Project } from "./types";
 
 /**
- * A shaping draft the founder accepts in the Add-work UI. The fields are exactly the epic's contract
- * (skills/bd/SKILL.md): an epic is READ, not executed, so it carries an outcome, the Success Criteria
- * its features add up to, and the one `area:` label the roadmap groups by — nothing else.
- *
- * They are all required rather than optional because this is the whole point of anton-8mnr: the
- * Add-work path produces a bead the contract validator passes BY CONSTRUCTION. An optional field here
- * would just re-open the gap the board then has to flag.
+ * The epic half of an Add-work draft — the contract an epic carries (skills/bd/SKILL.md): an epic is
+ * READ, not executed, so it holds an outcome, the Success Criteria its features add up to, and the
+ * one `area:` label the roadmap groups by. Only filled when the founder creates the epic here rather
+ * than attaching to one already on the board.
  */
-export interface ShapeDraft {
+export interface EpicDraft {
   title: string;
   /** The outcome, in one line a stakeholder would recognise — the epic's `## Goal`. */
   goal: string;
@@ -22,6 +19,64 @@ export interface ShapeDraft {
   /** The product surface this outcome advances, without the `area:` prefix. */
   area: string;
 }
+
+/**
+ * The feature half — what Add-work actually lands (anton-h1ds). A `feature` is the run target: one
+ * worktree, one PR (docs/design/2026-07-26-tier-and-linear-ux.md), so the draft carries the five
+ * contract sections a run and its self-review read, and nothing about grouping.
+ *
+ * Every field is required rather than optional because that is this path's whole promise: the bead
+ * is rendered from the project's bead formula and passes `validateBeadContract` BY CONSTRUCTION. An
+ * optional field would just re-open the gap the board then has to flag.
+ */
+export interface FeatureDraft {
+  title: string;
+  goal: string;
+  acceptance: string;
+  context: string;
+  outOfScope: string;
+  verify: string;
+}
+
+/**
+ * Where the feature attaches. There is no third case on purpose: a feature with no epic runs fine
+ * and appears on no roadmap, so the producer refuses rather than committing one parentless
+ * (skills/bd/SKILL.md, invariant 4).
+ */
+export type EpicTarget =
+  | { kind: "existing"; id: string }
+  | { kind: "new"; epic: EpicDraft };
+
+/** A shaping draft the founder accepts in the Add-work UI: one feature, and the epic above it. */
+export interface ShapeDraft {
+  feature: FeatureDraft;
+  epic: EpicTarget;
+}
+
+/** What the commit created — the feature, its epic, and whether that epic is new to the board. */
+export interface CreatedFeature {
+  id: string;
+  epicId: string;
+  epicCreated: boolean;
+}
+
+/** One selectable epic in the Add-work picker. */
+export interface EpicChoice {
+  id: string;
+  title: string;
+  /** The epic's product surface, when it carries one — shown so a near-match is spotted. */
+  area?: string;
+  /**
+   * Ticket children hanging directly off this epic. A feature landing here turns it into a
+   * container, and a ticket under a container epic never runs — nothing claims it
+   * (skills/bd/SKILL.md, invariant 1). The picker warns; it does not refuse, because re-homing
+   * those tickets is board surgery, not part of filing one feature.
+   */
+  looseTickets: number;
+}
+
+/** bd types that make up the working layer — the tickets a container epic would strand. */
+const TICKET_TYPES = new Set(["task", "bug", "chore"]);
 
 /**
  * The `area:` values already in use on the board, sorted — what the Add-work form suggests. Offering
@@ -37,21 +92,65 @@ export function knownAreas(all: Bead[]): string[] {
   return [...areas].sort();
 }
 
-/** The board's `area:` vocabulary, off the warm issue snapshot the board already reads. */
-export async function getKnownAreas(project: Project): Promise<string[]> {
-  return knownAreas(await allIssues(project.repoPath));
+
+/**
+ * The epics a draft feature may attach to: every live epic, titled and sorted the way the picker
+ * lists them. Closed and abandoned epics are out — attaching new work to a finished outcome is
+ * never the right answer, and an abandoned one is a won't-do decision.
+ */
+export function epicChoices(all: Bead[]): EpicChoice[] {
+  const looseByEpic = new Map<string, number>();
+  for (const bead of all) {
+    if (!TICKET_TYPES.has(bead.issue_type ?? "")) continue;
+    const parent = beads.parentOf(bead);
+    if (parent) looseByEpic.set(parent, (looseByEpic.get(parent) ?? 0) + 1);
+  }
+  return all
+    .filter((b) => beads.isEpic(b) && b.status !== "closed" && !beads.isAbandoned(b))
+    .map((epic) => ({
+      id: epic.id,
+      title: epic.title,
+      area: labelValueOf(epic.labels, "area"),
+      looseTickets: looseByEpic.get(epic.id) ?? 0,
+    }))
+    .sort((a, b) => a.title.localeCompare(b.title) || a.id.localeCompare(b.id));
+}
+
+/** Everything the Add-work panel offers, derived from ONE board read — the warm issue snapshot the
+ * board already holds, so no extra bd spawn: the epics a feature may attach to, and the `area:`
+ * vocabulary a new epic should reuse. */
+export async function getDraftOptions(
+  project: Project,
+): Promise<{ areas: string[]; epics: EpicChoice[] }> {
+  const all = await allIssues(project.repoPath);
+  return { areas: knownAreas(all), epics: epicChoices(all) };
 }
 
 /**
  * Render a draft through the project's bead formula (`.beads/formulas/anton-bead.formula.json`,
  * anton's bundled copy as fallback). The shape is structural — the sections come from the formula,
- * not from this function remembering which headings an epic carries.
+ * not from this function remembering which headings a tier carries.
  */
-export function buildEpicSkeleton(project: Project, draft: ShapeDraft): Promise<BeadSkeleton> {
+export function buildEpicSkeleton(project: Project, draft: EpicDraft): Promise<BeadSkeleton> {
   return beadSkeleton(project.repoPath, "epic", {
     title: draft.title,
     outcome: draft.goal,
     success_criteria: draft.successCriteria,
+  });
+}
+
+/** The same, for the feature tier — the five sections a run and its self-review read. */
+export function buildFeatureSkeleton(
+  project: Project,
+  draft: FeatureDraft,
+): Promise<BeadSkeleton> {
+  return beadSkeleton(project.repoPath, "feature", {
+    title: draft.title,
+    goal: draft.goal,
+    acceptance: draft.acceptance,
+    context: draft.context,
+    out_of_scope: draft.outOfScope,
+    verify: draft.verify,
   });
 }
 
@@ -64,6 +163,33 @@ export class DraftContractError extends Error {
 }
 
 /**
+ * A draft that names no usable epic — none chosen, or one the board no longer holds as an epic. The
+ * route maps this to a 400: it is a question for the founder, not a bd failure, and the answer is
+ * one selection away.
+ */
+export class DraftEpicError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DraftEpicError";
+  }
+}
+
+/** Judge a rendered skeleton before any bead exists, and refuse the whole commit if it falls short. */
+function assertContract(title: string, skeleton: BeadSkeleton, labels: string[]): void {
+  const rendered: Bead = {
+    id: "draft",
+    title,
+    status: "open",
+    issue_type: skeleton.type,
+    description: skeleton.description,
+    acceptance_criteria: skeleton.acceptance,
+    labels,
+  };
+  const violations = validateBeadContract(rendered);
+  if (violations.length > 0) throw new DraftContractError(violations);
+}
+
+/**
  * Create the open, unapproved epic bead from an accepted draft and return its id. No `approved`
  * label + open status → the board derives `backlog`. Bead writes go through `bd` (DESIGN.md §3).
  *
@@ -73,19 +199,10 @@ export class DraftContractError extends Error {
  * the opposite of this path's by-construction guarantee. Refusing here keeps the founder in the
  * form, where the fix is one edit away.
  */
-export async function createDraftEpic(project: Project, draft: ShapeDraft): Promise<string> {
+export async function createDraftEpic(project: Project, draft: EpicDraft): Promise<string> {
   const skeleton = await buildEpicSkeleton(project, draft);
-  const rendered: Bead = {
-    id: "draft",
-    title: draft.title.trim(),
-    status: "open",
-    issue_type: skeleton.type,
-    description: skeleton.description,
-    acceptance_criteria: skeleton.acceptance,
-    labels: [`area:${draft.area.trim()}`],
-  };
-  const violations = validateBeadContract(rendered);
-  if (violations.length > 0) throw new DraftContractError(violations);
+  const labels = [`area:${draft.area.trim()}`];
+  assertContract(draft.title.trim(), skeleton, labels);
   return beads.create(project.repoPath, {
     title: draft.title.trim(),
     type: skeleton.type,
@@ -93,6 +210,69 @@ export async function createDraftEpic(project: Project, draft: ShapeDraft): Prom
     // The description is the canonical home of the contract; the mirror is what `bd lint` and the
     // board card read (parseAcceptance falls through to this field for an epic).
     acceptance: skeleton.acceptance,
-    labels: [`area:${draft.area.trim()}`],
+    labels,
   });
+}
+
+/** The chosen epic must still be an epic on the board — a stale pick must not parent a feature
+ * under a task, and a vanished one must not create a dangling edge bd would reject mid-write. */
+async function resolveExistingEpic(project: Project, id: string): Promise<string> {
+  const chosen = id.trim();
+  if (!chosen) throw new DraftEpicError("no epic chosen — a feature must attach to one");
+  const all = await allIssues(project.repoPath);
+  const bead = all.find((b) => b.id === chosen);
+  if (!bead) throw new DraftEpicError(`epic ${chosen} is not on the board`);
+  if (!beads.isEpic(bead)) {
+    throw new DraftEpicError(`${chosen} is a ${bead.issue_type ?? "bead"}, not an epic`);
+  }
+  return chosen;
+}
+
+/**
+ * Create the open, unapproved FEATURE bead from an accepted draft, attached to its epic (anton-h1ds).
+ * The feature — not the epic — is what anton runs: one worktree, one PR. This is the one write behind
+ * "Send to backlog", and it is deliberately the only shape this path can produce, so the UI producer
+ * and the `/shape` CLI producer agree on what a run target is.
+ *
+ * Both skeletons are rendered and judged BEFORE any bead exists, so a contract refusal can never
+ * leave a half-written tree. What remains unatomic is the pair of bd writes: bd's `--graph` plan is
+ * the atomic form and `beads.create` does not speak it, so a failing feature write can strand a
+ * just-created epic — named in the error rather than swallowed, because a silent orphan on the
+ * roadmap is worse than a loud one.
+ */
+export async function createDraftFeature(
+  project: Project,
+  draft: ShapeDraft,
+): Promise<CreatedFeature> {
+  const target = draft.epic;
+  const feature = await buildFeatureSkeleton(project, draft.feature);
+  assertContract(draft.feature.title.trim(), feature, []);
+  // The epic is rendered up front for the same reason: a faulted epic must refuse the commit, not
+  // surface after the feature already landed parentless.
+  if (target.kind === "new") {
+    assertContract(target.epic.title.trim(), await buildEpicSkeleton(project, target.epic), [
+      `area:${target.epic.area.trim()}`,
+    ]);
+  }
+
+  const epicId =
+    target.kind === "new"
+      ? await createDraftEpic(project, target.epic)
+      : await resolveExistingEpic(project, target.id);
+
+  try {
+    const id = await beads.create(project.repoPath, {
+      title: draft.feature.title.trim(),
+      type: feature.type,
+      description: feature.description,
+      // Mirrored into bd's own field so `bd lint` and the board card read the same criteria the
+      // description states — the same pairing the epic write makes.
+      acceptance: feature.acceptance,
+      deps: [`parent-child:${epicId}`],
+    });
+    return { id, epicId, epicCreated: target.kind === "new" };
+  } catch (err) {
+    const stray = target.kind === "new" ? ` — epic ${epicId} was created and is now empty` : "";
+    throw new Error(`${(err as Error).message}${stray}`);
+  }
 }

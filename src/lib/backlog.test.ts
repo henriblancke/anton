@@ -1,23 +1,39 @@
 /**
- * The Add-work commit path (anton-8mnr). The epic it lands is rendered from the project's bead
- * formula, so what these assert is the promise the board depends on: a draft the founder accepts
- * becomes a bead `validateBeadContract` passes with ZERO violations — no separate repair pass, no
- * "unshaped" badge on a bead anton itself just created.
+ * The Add-work commit path (anton-8mnr, anton-h1ds). What lands is a `feature` under an epic — the
+ * tier anton runs — rendered from the project's bead formula. So what these assert is the promise
+ * the board depends on: a draft the founder accepts becomes beads `validateBeadContract` passes with
+ * ZERO violations, parented, with no separate repair pass and no "unshaped" badge on a bead anton
+ * itself just created. A draft naming no epic never reaches bd at all.
  */
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { buildEpicSkeleton, createDraftEpic, DraftContractError, knownAreas } from "./backlog";
-import { validateBeadContract } from "./beads/contract";
-import { projectBeadFormulaPath } from "./beads/formula";
 import type { Bead } from "./beads/types";
 import type { Project } from "./types";
+
+const { boardRef } = vi.hoisted(() => ({ boardRef: { current: [] as Bead[] } }));
+vi.mock("./beads/issues", () => ({ allIssues: async () => boardRef.current }));
+
+import { beads } from "./beads/bd";
+import {
+  buildEpicSkeleton,
+  buildFeatureSkeleton,
+  createDraftEpic,
+  createDraftFeature,
+  DraftContractError,
+  DraftEpicError,
+  epicChoices,
+  knownAreas,
+} from "./backlog";
+import { validateBeadContract } from "./beads/contract";
+import { projectBeadFormulaPath } from "./beads/formula";
 
 const temps: string[] = [];
 afterEach(() => {
   for (const dir of temps.splice(0)) rmSync(dir, { recursive: true, force: true });
+  vi.restoreAllMocks();
 });
 
 /** A project whose repo has no `.beads/formulas/` — so it resolves anton's bundled asset. */
@@ -35,43 +51,66 @@ function tempProject(): Project {
   };
 }
 
-const DRAFT = {
+const EPIC = {
   title: "Reports are shareable outside the app",
   goal: "Every report view leaves the app in a format a customer can open.",
   successCriteria: "- [ ] every report view exports to CSV and PDF",
   area: "reports",
 };
 
+const FEATURE = {
+  title: "Export a report view to CSV",
+  goal: "A customer can take a report out of the app as CSV.",
+  acceptance: "- [ ] every report view has a working CSV export button",
+  context: "touches: src/app/reports; follow the pattern in src/lib/export.ts",
+  outOfScope: "- PDF export, which is its own feature",
+  verify: "unit test on the serializer, route test on the download",
+};
+
+const bead = (over: Partial<Bead> & { id: string }): Bead => ({
+  title: over.title ?? "t",
+  status: "open",
+  ...over,
+});
+
+/** The board `allIssues` answers with for the epic resolution + picker tests. */
+function boardIs(...list: Bead[]): void {
+  boardRef.current = list;
+}
+
+beforeEach(() => boardIs());
+
 describe("buildEpicSkeleton", () => {
   it("renders an epic the contract validator passes with zero violations", async () => {
     const project = tempProject();
-    const skeleton = await buildEpicSkeleton(project, DRAFT);
+    const skeleton = await buildEpicSkeleton(project, EPIC);
 
-    const bead: Bead = {
-      id: "x-1",
-      title: DRAFT.title,
-      status: "open",
-      issue_type: skeleton.type,
-      description: skeleton.description,
-      acceptance_criteria: skeleton.acceptance,
-      labels: [`area:${DRAFT.area}`],
-      created_at: "2026-07-29T00:00:00Z",
-    };
-    expect(validateBeadContract(bead)).toEqual([]);
+    expect(
+      validateBeadContract({
+        id: "x-1",
+        title: EPIC.title,
+        status: "open",
+        issue_type: skeleton.type,
+        description: skeleton.description,
+        acceptance_criteria: skeleton.acceptance,
+        labels: [`area:${EPIC.area}`],
+        created_at: "2026-07-29T00:00:00Z",
+      }),
+    ).toEqual([]);
   });
 
   it("puts the outcome under `## Goal` so the board card can read it", async () => {
-    const { description } = await buildEpicSkeleton(tempProject(), DRAFT);
+    const { description } = await buildEpicSkeleton(tempProject(), EPIC);
     expect(description).toContain("## Goal");
-    expect(description).toContain(DRAFT.goal);
+    expect(description).toContain(EPIC.goal);
     expect(description).toContain("## Success Criteria");
     // The founder filled every field, so no prompt survives into the bead.
     expect(description).not.toContain("TODO");
   });
 
   it("mirrors the success criteria into bd's own acceptance field", async () => {
-    const skeleton = await buildEpicSkeleton(tempProject(), DRAFT);
-    expect(skeleton.acceptance).toBe(DRAFT.successCriteria);
+    const skeleton = await buildEpicSkeleton(tempProject(), EPIC);
+    expect(skeleton.acceptance).toBe(EPIC.successCriteria);
     expect(skeleton.type).toBe("epic");
   });
 
@@ -91,29 +130,183 @@ describe("buildEpicSkeleton", () => {
       }),
     );
 
-    const { description } = await buildEpicSkeleton(project, DRAFT);
+    const { description } = await buildEpicSkeleton(project, EPIC);
     expect(description).toContain("## House rule");
   });
 });
 
+describe("buildFeatureSkeleton", () => {
+  it("renders a feature the contract validator passes with zero violations", async () => {
+    const skeleton = await buildFeatureSkeleton(tempProject(), FEATURE);
+
+    expect(skeleton.type).toBe("feature");
+    expect(
+      validateBeadContract({
+        id: "x-2",
+        title: FEATURE.title,
+        status: "open",
+        issue_type: skeleton.type,
+        description: skeleton.description,
+        acceptance_criteria: skeleton.acceptance,
+        created_at: "2026-08-16T00:00:00Z",
+      }),
+    ).toEqual([]);
+  });
+
+  it("carries all five sections the run and its self-review read", async () => {
+    const { description, acceptance } = await buildFeatureSkeleton(tempProject(), FEATURE);
+    for (const heading of [
+      "## Goal",
+      "## Acceptance Criteria",
+      "## Context",
+      "## Out of scope",
+      "## Verify",
+    ]) {
+      expect(description).toContain(heading);
+    }
+    expect(description).toContain(FEATURE.outOfScope);
+    expect(description).not.toContain("TODO");
+    expect(acceptance).toBe(FEATURE.acceptance);
+  });
+});
+
+describe("createDraftFeature — what the Add-work commit lands", () => {
+  const project = () => tempProject();
+
+  it("creates a FEATURE parented to the chosen epic, not an epic of its own", async () => {
+    boardIs(bead({ id: "p-1", issue_type: "epic", title: "Reports are shareable" }));
+    const create = vi.spyOn(beads, "create").mockResolvedValue("p-9");
+
+    const created = await createDraftFeature(project(), {
+      feature: FEATURE,
+      epic: { kind: "existing", id: "p-1" },
+    });
+
+    expect(created).toEqual({ id: "p-9", epicId: "p-1", epicCreated: false });
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(create.mock.calls[0]![1]).toMatchObject({
+      type: "feature",
+      deps: ["parent-child:p-1"],
+      acceptance: FEATURE.acceptance,
+    });
+  });
+
+  it("creates the epic first when the founder shapes one, then hangs the feature off it", async () => {
+    const create = vi
+      .spyOn(beads, "create")
+      .mockResolvedValueOnce("p-10")
+      .mockResolvedValueOnce("p-11");
+
+    const created = await createDraftFeature(project(), {
+      feature: FEATURE,
+      epic: { kind: "new", epic: EPIC },
+    });
+
+    expect(created).toEqual({ id: "p-11", epicId: "p-10", epicCreated: true });
+    expect(create.mock.calls[0]![1]).toMatchObject({
+      type: "epic",
+      labels: ["area:reports"],
+    });
+    expect(create.mock.calls[1]![1]).toMatchObject({
+      type: "feature",
+      deps: ["parent-child:p-10"],
+    });
+  });
+
+  it("refuses a draft that names no epic — never a parentless feature", async () => {
+    const create = vi.spyOn(beads, "create");
+    await expect(
+      createDraftFeature(project(), { feature: FEATURE, epic: { kind: "existing", id: "  " } }),
+    ).rejects.toThrow(DraftEpicError);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("refuses an epic the board no longer holds, naming it", async () => {
+    boardIs(bead({ id: "p-1", issue_type: "epic" }));
+    const create = vi.spyOn(beads, "create");
+
+    const rejection = await createDraftFeature(project(), {
+      feature: FEATURE,
+      epic: { kind: "existing", id: "p-404" },
+    }).then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+    expect(rejection).toBeInstanceOf(DraftEpicError);
+    expect(rejection?.message).toContain("p-404");
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("refuses to parent a feature under a bead that is not an epic", async () => {
+    boardIs(bead({ id: "p-2", issue_type: "feature" }));
+    const create = vi.spyOn(beads, "create");
+
+    await expect(
+      createDraftFeature(project(), { feature: FEATURE, epic: { kind: "existing", id: "p-2" } }),
+    ).rejects.toThrow(DraftEpicError);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  // The contract gate throws BEFORE any bd write: a placeholder draft never becomes a bead the
+  // board would immediately flag as unapprovable, and never strands a half-written tree.
+  it("rejects prompt-only acceptance criteria before writing anything", async () => {
+    boardIs(bead({ id: "p-1", issue_type: "epic" }));
+    const create = vi.spyOn(beads, "create");
+
+    await expect(
+      createDraftFeature(project(), {
+        feature: { ...FEATURE, acceptance: "- [ ] TODO — decide later" },
+        epic: { kind: "existing", id: "p-1" },
+      }),
+    ).rejects.toThrow(DraftContractError);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("rejects a faulted NEW epic before the feature or the epic is written", async () => {
+    const create = vi.spyOn(beads, "create");
+
+    await expect(
+      createDraftFeature(project(), {
+        feature: FEATURE,
+        epic: { kind: "new", epic: { ...EPIC, successCriteria: "- [ ] TODO — decide later" } },
+      }),
+    ).rejects.toThrow(DraftContractError);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("names the epic it just created when the feature write fails, so no orphan is silent", async () => {
+    vi.spyOn(beads, "create")
+      .mockResolvedValueOnce("p-10")
+      .mockRejectedValueOnce(new Error("bd exploded"));
+
+    const rejection = await createDraftFeature(project(), {
+      feature: FEATURE,
+      epic: { kind: "new", epic: EPIC },
+    }).then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+    expect(rejection?.message).toContain("bd exploded");
+    expect(rejection?.message).toContain("p-10");
+  });
+});
+
 describe("createDraftEpic — the contract gate ahead of bead creation", () => {
-  // Both rejections throw BEFORE beads.create, so no bd repo is needed: the whole point is that a
-  // placeholder draft never becomes a bead the board would immediately flag as unapprovable.
   it("rejects criteria that are still a TODO prompt — the bead would land contract-blocked", async () => {
     await expect(
-      createDraftEpic(tempProject(), { ...DRAFT, successCriteria: "- [ ] TODO — decide later" }),
+      createDraftEpic(tempProject(), { ...EPIC, successCriteria: "- [ ] TODO — decide later" }),
     ).rejects.toThrow(DraftContractError);
   });
 
   it("rejects a prompt-only goal too — Add-work lands zero-violation beads by construction", async () => {
     await expect(
-      createDraftEpic(tempProject(), { ...DRAFT, goal: "TODO — the outcome, one line" }),
+      createDraftEpic(tempProject(), { ...EPIC, goal: "TODO — the outcome, one line" }),
     ).rejects.toThrow(DraftContractError);
   });
 
   it("names the gap in the error so the route's 422 tells the founder what to fix", async () => {
     const rejection = await createDraftEpic(tempProject(), {
-      ...DRAFT,
+      ...EPIC,
       successCriteria: "- [ ] TODO — decide later",
     }).then(
       () => undefined,
@@ -124,21 +317,58 @@ describe("createDraftEpic — the contract gate ahead of bead creation", () => {
   });
 });
 
+describe("epicChoices", () => {
+  it("offers the live epics, titled and sorted, with their area", () => {
+    expect(
+      epicChoices([
+        bead({ id: "p-2", issue_type: "epic", title: "Reports", labels: ["area:reports"] }),
+        bead({ id: "p-1", issue_type: "epic", title: "Billing", labels: ["area:billing"] }),
+        bead({ id: "p-3", issue_type: "feature", title: "A feature" }),
+      ]),
+    ).toEqual([
+      { id: "p-1", title: "Billing", area: "billing", looseTickets: 0 },
+      { id: "p-2", title: "Reports", area: "reports", looseTickets: 0 },
+    ]);
+  });
+
+  it("drops closed and abandoned epics — new work never attaches to a finished outcome", () => {
+    const choices = epicChoices([
+      bead({ id: "p-1", issue_type: "epic", title: "Done", status: "closed" }),
+      bead({ id: "p-2", issue_type: "epic", title: "Dropped", labels: ["abandoned"] }),
+      bead({ id: "p-3", issue_type: "epic", title: "Live" }),
+    ]);
+    expect(choices.map((c) => c.id)).toEqual(["p-3"]);
+  });
+
+  // A ticket under a container epic never runs, so the picker has to be able to warn: landing a
+  // feature here is what turns those tickets into dead beads.
+  it("counts the tickets hanging directly off each epic", () => {
+    const choices = epicChoices([
+      bead({ id: "p-1", issue_type: "epic", title: "Legacy" }),
+      bead({ id: "p-2", issue_type: "task", parent: "p-1" }),
+      bead({ id: "p-3", issue_type: "bug", parent: "p-1" }),
+      bead({ id: "p-4", issue_type: "feature", parent: "p-1" }),
+      bead({ id: "p-5", issue_type: "task", parent: "p-4" }),
+    ]);
+    expect(choices).toEqual([{ id: "p-1", title: "Legacy", area: undefined, looseTickets: 2 }]);
+  });
+});
+
 describe("knownAreas", () => {
-  const bead = (labels: string[]): Bead => ({ id: "x", title: "t", status: "open", labels });
+  const labelled = (labels: string[]): Bead => ({ id: "x", title: "t", status: "open", labels });
 
   it("collects the board's area: vocabulary, deduped and sorted", () => {
     expect(
       knownAreas([
-        bead(["area:reports", "domain:eng"]),
-        bead(["area:billing"]),
-        bead(["area:reports"]),
-        bead([]),
+        labelled(["area:reports", "domain:eng"]),
+        labelled(["area:billing"]),
+        labelled(["area:reports"]),
+        labelled([]),
       ]),
     ).toEqual(["billing", "reports"]);
   });
 
   it("is empty on a board with no epics tagged yet", () => {
-    expect(knownAreas([bead(["domain:eng"])])).toEqual([]);
+    expect(knownAreas([labelled(["domain:eng"])])).toEqual([]);
   });
 });

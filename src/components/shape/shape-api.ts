@@ -4,7 +4,7 @@
  * one failure shape — the route's own `error` message when it sends one, a status-carrying fallback
  * when it doesn't — and so the panes are left sequencing UI rather than fetches.
  */
-import type { ShapeDraftFields } from "./shape-draft";
+import { draftBody, type ShapeDraftFields } from "./shape-draft";
 
 async function postOrThrow(url: string, body: unknown, failure: string): Promise<Response> {
   const res = await fetch(url, {
@@ -33,18 +33,12 @@ export async function startShapeSession(slug: string, description: string): Prom
   return sessionId;
 }
 
-/** Creates the open, unapproved epic bead from the accepted draft. */
-export async function createBacklogEpic(slug: string, fields: ShapeDraftFields): Promise<void> {
-  await postOrThrow(
-    `/api/projects/${slug}/backlog`,
-    {
-      title: fields.title.trim(),
-      goal: fields.goal.trim(),
-      successCriteria: fields.successCriteria.trim(),
-      area: fields.area.trim(),
-    },
-    "create failed",
-  );
+/** Creates the open, unapproved feature bead from the accepted draft, under the epic it names. */
+export async function createBacklogFeature(
+  slug: string,
+  fields: ShapeDraftFields,
+): Promise<void> {
+  await postOrThrow(`/api/projects/${slug}/backlog`, draftBody(fields), "create failed");
 }
 
 /**
