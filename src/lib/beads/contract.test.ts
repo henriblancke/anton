@@ -144,6 +144,16 @@ describe("validateBeadContract — ticket tier (task / bug / chore / feature)", 
     expect(validateBeadContract(ticket({ acceptance_criteria: "- [ ] it works" }))).toEqual([]);
   });
 
+  it("treats a section holding only a bare heading marker as unwritten", () => {
+    // `###` alone renders as an empty heading — scaffolding over nothing. Reading the marker as
+    // content passed the blocking gate on a section stating no definition of done.
+    const bead = ticket({
+      acceptance_criteria: undefined,
+      description: [DESCRIPTION, "", "## Acceptance", "###"].join("\n"),
+    });
+    expect(summarize(bead)).toEqual([["Acceptance", "blocking"]]);
+  });
+
   it("treats a section holding only a thematic break as unwritten", () => {
     // `---` renders as a rule, not text — counting it as content let approval and execution
     // proceed with no definition of done.

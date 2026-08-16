@@ -18,13 +18,17 @@ describe("isHeading", () => {
     expect(isHeading("## Goal ##")).toBe(true); // optional closing sequence
     expect(isHeading("#\tGoal")).toBe(true);
     expect(isHeading("# ")).toBe(true); // a heading with no text is still a heading
+    // A bare marker ends the opening sequence at the line's end — still an (empty) heading, so a
+    // section holding nothing but one holds no content.
+    expect(isHeading("#")).toBe(true);
+    expect(isHeading("###")).toBe(true);
   });
 
   it("rejects what only looks like one", () => {
     expect(isHeading("####### Goal")).toBe(false); // seven `#` is not a heading in CommonMark
+    expect(isHeading("#######")).toBe(false); // nor is a bare run of seven
     expect(isHeading("#Goal")).toBe(false); // no space after the marker
     expect(isHeading("    # Goal")).toBe(false); // four spaces is an indented code block
-    expect(isHeading("#")).toBe(false);
     expect(isHeading("Goal")).toBe(false);
   });
 });

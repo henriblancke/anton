@@ -13,7 +13,7 @@ const chains = (): Map<string, Promise<unknown>> =>
   ] ?? new Map();
 
 const chainKeys = (repoPath: string) =>
-  [...chains().keys()].filter((key) => key.startsWith(repoPath));
+  [...chains().keys()].filter((key) => key.startsWith(`${repoPath}\0`));
 
 /** A fresh repo path per case: the chain map is process-wide, so keys are what isolates the tests. */
 let repos = 0;
