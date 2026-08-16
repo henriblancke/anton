@@ -10,13 +10,15 @@
  */
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
-import { actAs, executeEpicJobs, setupApproveSuite, type ApproveSuiteCtx } from "../approve.fixture";
-import { describeBd } from "@/lib/testing/integration";
+import { actAs, ctx, executeEpicJobs, setupApproveSuite, type ApproveSuiteCtx } from "../approve.fixture";
+import { describeBd, jsonRequest } from "@/lib/testing/integration";
 
 let fileDb: ApproveSuiteCtx["fileDb"];
 let bdRepo: ApproveSuiteCtx["bdRepo"];
 let repo: string;
 let approve: ApproveSuiteCtx["approve"];
+// The raw handler, for the one case that needs a hand-built request rather than `approve()`.
+let POST: ApproveSuiteCtx["POST"];
 let beads: ApproveSuiteCtx["beads"];
 let resetOperatorCache: ApproveSuiteCtx["resetOperatorCache"];
 
@@ -34,6 +36,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
       bdRepo,
       repo,
       approve,
+      POST,
       beads,
       resetOperatorCache,
       blocked,
@@ -391,7 +394,10 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
   it("spends at most two bd reads on a normal approve", async () => {
     // A target the operator already owns (the UI's Force run / re-approve): the CAS finds the
     // assignee already where it wants it, so the whole request is one forced `bd list` for the
-    // readiness gate plus the CAS's one under-lock re-read — no board refresh, no ownership `show`.
+    // readiness gate plus one under-lock re-read — no board refresh after the write, no ownership
+    // `show`. The under-lock read is a `bd list` rather than a `bd show` because it re-judges the
+    // board SHAPE (has a feature child landed under this target?), not just the assignee — and the
+    // CAS reuses it, so re-validating the shape costs no extra spawn.
     actAs("anton-test");
     const epic = await beads.create(repo, { title: "Read-economy epic", type: "epic", acceptance: "- [ ] it works" });
     const child = await beads.create(repo, { title: "Read-economy epic child", type: "task", acceptance: "- [ ] it works" });
@@ -414,7 +420,9 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
       const res = await approve(epic);
       expect(res.status).toBe(200);
       expect(readsAtWrite).toBeLessThanOrEqual(2);
-      expect(listSpy).toHaveBeenCalledTimes(1); // the readiness gate; the board build reuses it
+      // The readiness gate + the under-lock re-check; the board build reuses the first, and the CAS
+      // reuses the second, so re-validating the shape adds no `bd show` before the write.
+      expect(listSpy).toHaveBeenCalledTimes(2);
     } finally {
       tagSpy.mockRestore();
       listSpy.mockRestore();
@@ -427,11 +435,13 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     expect(bead.assignee).toBe("anton-test");
   });
 
-  it("reads once for the gate and never re-reads the board after the write", async () => {
+  it("reads for the gate and the lock, and never re-reads the board after the write", async () => {
     // An unclaimed target additionally pays the CAS write chain (assign + its post-write verify
     // read), which is the claim guard and stays. What must NOT come back is a second forced `bd list`
-    // for the response: the write flags the snapshot pendingWrite, so the client's next poll blocks
+    // for the RESPONSE: the write flags the snapshot pendingWrite, so the client's next poll blocks
     // on a fresh read anyway — and the 200 body still carries the just-written approval + assignee.
+    // The two lists both sit BEFORE the write: the readiness gate, then the under-lock shape
+    // re-check the approval's correctness rests on.
     actAs("anton-test");
     const epic = await beads.create(repo, { title: "Read-economy unclaimed", type: "epic", acceptance: "- [ ] it works" });
     const child = await beads.create(repo, { title: "Read-economy unclaimed child", type: "task", acceptance: "- [ ] it works" });
@@ -445,10 +455,64 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
       const { item } = await res.json();
       expect(item.approved).toBe(true);
       expect(item.assignee).toBe("anton-test");
-      expect(listSpy).toHaveBeenCalledTimes(1);
+      expect(listSpy).toHaveBeenCalledTimes(2);
     } finally {
       listSpy.mockRestore();
       syncSpy.mockRestore();
     }
+  });
+
+  // The half of the container race the pre-lock gate cannot cover (codex review, PR #151). The
+  // Add-work commit (lib/backlog.ts `createDraftFeature`) attaches a feature to an existing epic
+  // while holding that epic's write lock — the SAME lock approval takes. When the feature wins the
+  // lock, approval's pre-lock run-target verdict is already stale by the time it writes, so the
+  // verdict has to be re-taken inside the lock or a container gets labelled `approved` and enqueued
+  // for a runner that can only poison-park it.
+  it("422s a target that became a container while the approval waited for the lock", async () => {
+    actAs("anton-test");
+    const epic = await beads.create(repo, { title: "Containerized mid-approval", type: "epic", acceptance: "- [ ] it works" });
+    const child = await beads.create(repo, { title: "Its ticket", type: "task", acceptance: "- [ ] it works" });
+    await beads.link(repo, child, epic, "parent-child");
+
+    // Synchronization: `request.json()` must fire AFTER `refreshAllIssues` (route.ts:132) populates
+    // `allBeads`. The pre-lock gate answers from that snapshot, so releasing the feature write only
+    // once the route has ALREADY read the board is what makes the gate see a non-container — leaving
+    // the in-lock `loadAllIssues` as the only thing that can catch the now-container, which is the
+    // path this test exists to cover. `readApprovalBody` (route.ts:215) sits after both the read and
+    // the gate, which makes it a usable signal — but the load-bearing dependency is the board read.
+    // Released before the gate, the feature would land first, the PRE-lock gate would 422 it, and
+    // this test would pass without exercising the in-lock re-check at all.
+    let gatesPassed!: () => void;
+    const gatesDone = new Promise<void>((resolve) => (gatesPassed = resolve));
+
+    // The Add-work commit's half of the race, holding the lock FIRST so the approval queues behind it.
+    const { withBeadWriteLock } = await import("@/lib/beads/claim-lock");
+    const featureLanded = withBeadWriteLock(repo, epic, async () => {
+      await gatesDone;
+      return beads.create(repo, {
+        title: "Feature that containerizes it",
+        type: "feature",
+        acceptance: "- [ ] it works",
+        deps: [`parent-child:${epic}`],
+      });
+    });
+
+    const request = jsonRequest("POST");
+    Object.defineProperty(request, "json", {
+      value: async () => {
+        gatesPassed();
+        await featureLanded;
+        return {};
+      },
+    });
+
+    const res = await POST(request, ctx("approvy", epic));
+    await featureLanded;
+
+    expect(res.status).toBe(422);
+    expect((await res.json()).error).toMatch(/container epic/);
+    // Refused before the write: no label, no enqueue — the feature under it is the run target now.
+    expect(beads.isApproved(await beads.show(repo, epic))).toBe(false);
+    expect(await executeEpicJobs(epic)).toHaveLength(0);
   });
 });

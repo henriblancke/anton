@@ -4,6 +4,9 @@
  * anton reads/writes here and never duplicates that state in anton.db. See DESIGN.md §3.
  */
 import { spawn } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { githubRepoSlug } from "../git/remote";
 import { resolveBdBin } from "./bd-bin";
@@ -2007,6 +2010,48 @@ async function runClaimVerified(
     : { ok: true, bead: verified };
 }
 
+/**
+ * One node of a `bd create --graph` plan, in bd 1.1.2's schema (skills/bd/SKILL.md). Deliberately
+ * narrower than bd's — anton only ever plans a tree of typed, contract-carrying beads — because bd
+ * DROPS an unknown field with a warning rather than failing, so a typo'd key would land a bead
+ * silently missing what the caller meant to set. There is no acceptance field and none is needed:
+ * the rubric rides the description, the home `bd lint` and contract.ts's `acceptanceBody` both read.
+ */
+export interface GraphPlanNode {
+  /** Plan-local handle — how `parent_key` refers to this node, and the key its id comes back under. */
+  key: string;
+  title: string;
+  type: "epic" | "feature" | "task" | "bug" | "chore";
+  /** The whole contract markdown, exactly as `create`'s `description` takes it. */
+  description?: string;
+  labels?: string[];
+  /** Parent within this same plan — the form that makes a tree atomic (no `bd link` step). */
+  parent_key?: string;
+  /** Parent already on the board, for a plan that grafts onto an existing tree. */
+  parent_id?: string;
+}
+
+/** A whole tree, written in one bd call — see {@link beads.createGraph}. */
+export interface GraphPlan {
+  nodes: GraphPlanNode[];
+}
+
+/**
+ * The reason a graph plan was refused. bd prints a plan failure as `{"error": …}` on STDOUT while
+ * exiting non-zero (measured on 1.1.2 — stderr carries only the unknown-field warnings), so the
+ * generic "Command failed" message {@link bd} builds from stderr would name no cause at all.
+ */
+function graphPlanError(err: unknown): string | undefined {
+  const stdout = (err as { stdout?: unknown }).stdout;
+  if (typeof stdout !== "string") return undefined;
+  try {
+    const parsed = JSON.parse(stdout) as { error?: unknown };
+    return typeof parsed.error === "string" ? parsed.error : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export const beads = {
   /**
    * Truly claimable work (excludes in_progress/blocked/deferred). `--limit 0` = unlimited:
@@ -2211,6 +2256,45 @@ export const beads = {
     const bead = Array.isArray(parsed) ? parsed[0] : parsed;
     if (!bead?.id) throw new Error("bd create: could not parse bead id from output");
     return bead.id as string;
+  },
+
+  /**
+   * Create a whole tree in ONE bd write (`bd create --graph`), answering plan key → real bead id.
+   *
+   * This is the atomic form, and therefore the only correct one for a multi-bead write. N sequential
+   * {@link beads.create} calls fail halfway and strand whatever already landed (skills/bd/SKILL.md):
+   * the retry then renumbers around the orphans instead of replacing them. Measured on bd 1.1.2, a
+   * plan that fails MID-write — a `parent_id` the board does not hold, so the failure comes after the
+   * first node — rolls the whole plan back and leaves the board byte-identical; up-front schema
+   * faults (an unknown `type`) never reach a write at all. Both mean the same thing to a caller: a
+   * rejection here created nothing, so the retry is the unchanged plan.
+   *
+   * bd reads the plan from a FILE, not stdin, so one is written to a private temp dir and removed
+   * whatever the outcome — a plan carries the founder's draft prose, which has no business outliving
+   * the call in `$TMPDIR`.
+   *
+   * Every planned key is asserted present in the answer: bd drops an unknown node field with only a
+   * warning, and a schema that drifts under us must fail loud here rather than hand back an id map
+   * with a hole in it that a caller would read as `undefined`.
+   */
+  async createGraph(cwd: string, plan: GraphPlan): Promise<Record<string, string>> {
+    const dir = mkdtempSync(join(tmpdir(), "anton-bd-graph-"));
+    try {
+      const file = join(dir, "plan.json");
+      writeFileSync(file, JSON.stringify(plan));
+      const out = await bdWrite(cwd, ["create", "--graph", file, "--json"]).catch((err: unknown) => {
+        const reason = graphPlanError(err) ?? (err as Error).message;
+        throw new Error(`bd create --graph: ${reason}`);
+      });
+      const ids = (JSON.parse(out) as { ids?: Record<string, string> }).ids ?? {};
+      const missing = plan.nodes.filter((n) => !ids[n.key]).map((n) => n.key);
+      if (missing.length > 0) {
+        throw new Error(`bd create --graph: no id came back for node(s) ${missing.join(", ")}`);
+      }
+      return ids;
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   },
 
   // `bd tag` takes a single label; use the repeatable --add-label/--remove-label instead.

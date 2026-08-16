@@ -39,18 +39,19 @@ function Composer({
     <div className="flex min-h-0 flex-1 flex-col p-5 sm:p-6">
       <div className="font-mono text-[12.5px] leading-relaxed">
         <div className="text-stage-done">
-          ● claude · describe the work — I&apos;ll shape it into an epic
+          ● claude · describe the work — I&apos;ll shape it into a feature
         </div>
         <div className="mt-2 text-muted-foreground">
-          Tell me what you want built. I&apos;ll ask a few forcing questions, then help you draft an
-          epic with a clear goal and proposed tickets. Accept it and it lands in backlog.
+          Tell me what you want built. I&apos;ll ask a few forcing questions, then help you draft a
+          feature — one PR&apos;s worth — and pick the epic it belongs to. Accept it and it lands in
+          backlog.
         </div>
       </div>
       <textarea
         value={description}
         onChange={(e) => onChange(e.target.value)}
-        placeholder="Describe an epic to shape…"
-        aria-label="Describe an epic"
+        placeholder="Describe the work to shape…"
+        aria-label="Describe the work"
         rows={5}
         className="mt-5 min-h-0 flex-1 resize-none rounded-md border border-border bg-background p-3 font-mono text-[12.5px] text-foreground placeholder:text-subtle focus:border-primary/50 focus:outline-none"
         onKeyDown={(e) => handleStartChord(e, canStart, onStart)}
