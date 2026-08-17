@@ -116,6 +116,13 @@ export interface ScanSummary {
   triage?: TriageOutcome;
   /** Collectors that died mid-scan — every one is a hole in the counts above (see lib/stringer). */
   collectorFailures: number;
+  /**
+   * The commit the scanned tree held (anton-qor2) — what makes this point a measurement of a
+   * NAMED tree rather than of whatever the checkout happened to be. Absent on rows written before
+   * it was recorded, and on a point whose measurement no longer names one tree (see
+   * {@link reconcileAttempt}).
+   */
+  scannedSha?: string;
 }
 
 /**
@@ -255,6 +262,8 @@ export interface SaveScanSummaryInput {
   collectorFailures?: number;
   /** The baselines the scan consumed and left, as `lib/stringer` read them — what makes a delta honest. */
   deltaState?: DeltaState;
+  /** The commit the scanned tree held — see {@link ScanSummary.scannedSha}. */
+  scannedSha?: string;
 }
 
 /**
@@ -475,6 +484,24 @@ function reconciledDelta(
   return extendDelta(existing.delta, computeDelta(counts, existing.counts));
 }
 
+/**
+ * THE TREE THE POINT NAMES. A SHA describes the measurement, so it moves exactly when the
+ * measurement does: a replay re-measured this window against the tree the retry checked out, and a
+ * fold extends the point to the window that tree ended, so both name it. An attempt whose signals
+ * were dropped left the retained measurement standing, tree included.
+ *
+ * A moved measurement whose tree anton could not name CLEARS the SHA (`null`) rather than keeping
+ * the old one: a point holding a tree it no longer measured is the precise claim this column exists
+ * to make impossible.
+ */
+function reconciledTree(
+  input: SaveScanSummaryInput,
+  attemptWindow: AttemptWindow,
+): string | null | undefined {
+  if (!attemptWindow.replays && !attemptWindow.folds) return undefined;
+  return input.scannedSha ?? null;
+}
+
 /** The point after a later attempt folded in — every fact {@link reconcileAttempt} can move. */
 interface Reconciled {
   counts: ScanCounts;
@@ -482,6 +509,8 @@ interface Reconciled {
   triage: TriageOutcome | undefined;
   /** What the point now publishes as the baseline it left — see {@link publishedState}. */
   left: string | null | undefined;
+  /** The tree the point now names — see {@link reconciledTree}. */
+  tree: string | null | undefined;
   delta: ScanDelta | undefined;
 }
 
@@ -491,10 +520,12 @@ interface Moved {
   failures: boolean;
   triage: boolean;
   state: boolean;
+  tree: boolean;
 }
 
 function movedBy(existing: ScanSummary, next: Reconciled): Moved {
   return {
+    tree: next.tree !== undefined && (next.tree ?? undefined) !== existing.scannedSha,
     // Every axis: a replay can re-measure the same total over a different split, and the chart draws
     // both. A fold only ever grows the counts, so this reads as "grew" there.
     counts: !sameCounts(next.counts, existing.counts),
@@ -517,6 +548,7 @@ async function writeReconciled(
         ? { beadsCreated: next.triage?.created ?? null, beadsDeduped: next.triage?.deduped ?? null }
         : {}),
       ...(moved.state ? { deltaState: next.left } : {}),
+      ...(moved.tree ? { scannedSha: next.tree } : {}),
       ...(moved.failures ? { collectorFailures: next.collectorFailures } : {}),
       ...(moved.counts
         ? {
@@ -547,6 +579,10 @@ function mergeReconciled(existing: ScanSummary, next: Reconciled, moved: Moved):
     if (next.left === null) delete reconciled.deltaState;
     else reconciled.deltaState = next.left;
   }
+  if (moved.tree) {
+    if (next.tree === null) delete reconciled.scannedSha;
+    else reconciled.scannedSha = next.tree;
+  }
   return reconciled;
 }
 
@@ -572,11 +608,14 @@ async function reconcileAttempt(
     collectorFailures,
     triage: reconciledTriage(existing, input, attemptWindow),
     left: publishedState(input, attemptWindow),
+    tree: reconciledTree(input, attemptWindow),
     delta: reconciledDelta(existing, counts, collectorFailures),
   };
 
   const moved = movedBy(existing, next);
-  if (!moved.counts && !moved.failures && !moved.triage && !moved.state) return existing;
+  if (!moved.counts && !moved.failures && !moved.triage && !moved.state && !moved.tree) {
+    return existing;
+  }
 
   await writeReconciled(db, existing, next, moved);
   return mergeReconciled(existing, next, moved);
@@ -646,6 +685,9 @@ function newScanSummary(
     ...(baselineScan === undefined ? {} : { baselineScan }),
     ...(input.triage ? { triage: input.triage } : {}),
     collectorFailures: input.collectorFailures ?? 0,
+    // The tree these counts describe. Written at insert and only moved with the measurement itself
+    // (see {@link reconciledTree}) — a point names the tree it measured or names none.
+    ...(input.scannedSha ? { scannedSha: input.scannedSha } : {}),
   };
 }
 
@@ -667,6 +709,7 @@ async function insertScanSummary(db: AntonDb, summary: ScanSummary): Promise<voi
     beadsCreated: summary.triage?.created ?? null,
     beadsDeduped: summary.triage?.deduped ?? null,
     collectorFailures: summary.collectorFailures,
+    scannedSha: summary.scannedSha ?? null,
   });
 }
 
@@ -773,6 +816,7 @@ function toSummary(row: typeof schema.scanSummaries.$inferSelect): ScanSummary {
     ...(row.baselineScan === null ? {} : { baselineScan: row.baselineScan }),
     ...(triage ? { triage } : {}),
     collectorFailures: row.collectorFailures,
+    ...(row.scannedSha ? { scannedSha: row.scannedSha } : {}),
   };
 }
 
@@ -826,6 +870,12 @@ export interface ScanHealthPoint {
    */
   incomplete?: boolean;
   triage?: TriageOutcome;
+  /**
+   * The commit the scanned tree held — see {@link ScanSummary.scannedSha}. Rendered so a column
+   * names the tree it measured: a scan of a checkout behind its remote looks exactly like a scan of
+   * the shipped code otherwise, and the trend that follows is about a tree nobody works on.
+   */
+  sha?: string;
 }
 
 /** The board's view of the series — oldest → newest, because a trend is read left to right. */
@@ -850,6 +900,7 @@ function toPoint(summary: ScanSummary): ScanHealthPoint {
     ...(summary.baselineScan ? { baseline: true } : {}),
     ...(summary.collectorFailures > 0 ? { incomplete: true } : {}),
     ...(summary.triage ? { triage: summary.triage } : {}),
+    ...(summary.scannedSha ? { sha: summary.scannedSha } : {}),
   };
 }
 
@@ -902,14 +953,22 @@ function countsStamp(counts: ScanCounts): string {
  * single count. The remaining value a retry rewrites — the baseline the point left — is bookkeeping
  * the board never renders, so stamping the visible mutable fields keeps the poll 304-friendly while
  * still moving when there is something new to render.
+ *
+ * The scanned tree is stamped for the same reason as the counts: a replay can re-measure the same
+ * window against a DIFFERENT checkout and come back with an identical split, and the section names
+ * the tree — so without it the board would keep 304ing over a point that now describes another commit.
  */
 function scanVersion(
   id: string,
   counts: ScanCounts,
   triage: TriageOutcome | undefined,
   collectorFailures: number,
+  scannedSha: string | null | undefined,
 ): string {
-  return `${id}:${countsStamp(counts)}:${collectorFailures}${triage ? `:${triage.created}:${triage.deduped}` : ""}`;
+  return (
+    `${id}:${countsStamp(counts)}:${collectorFailures}` +
+    `${triage ? `:${triage.created}:${triage.deduped}` : ""}${scannedSha ? `:${scannedSha}` : ""}`
+  );
 }
 
 /** The series' identity for the board's refresh token. */
@@ -917,7 +976,7 @@ export function scanHealthVersion(health: ScanHealth | undefined): string {
   if (!health) return NO_SCAN_HEALTH;
   const { latest } = health;
   const counts = { total: latest.total, bySeverity: latest.bySeverity, byClass: health.byClass };
-  return scanVersion(latest.id, counts, latest.triage, health.collectorFailures);
+  return scanVersion(latest.id, counts, latest.triage, health.collectorFailures, latest.sha);
 }
 
 /**
@@ -936,6 +995,7 @@ export async function latestScanHealthVersion(projectId: string): Promise<string
       beadsCreated: schema.scanSummaries.beadsCreated,
       beadsDeduped: schema.scanSummaries.beadsDeduped,
       collectorFailures: schema.scanSummaries.collectorFailures,
+      scannedSha: schema.scanSummaries.scannedSha,
     })
     .from(schema.scanSummaries)
     .where(eq(schema.scanSummaries.projectId, projectId))
@@ -948,7 +1008,7 @@ export async function latestScanHealthVersion(projectId: string): Promise<string
     bySeverity: parseCounts(row.bySeverityJson, emptySeverityCounts()),
     byClass: parseCounts(row.byClassJson, emptyClassCounts()),
   };
-  return scanVersion(row.id, counts, rowTriage(row), row.collectorFailures);
+  return scanVersion(row.id, counts, rowTriage(row), row.collectorFailures, row.scannedSha);
 }
 
 /** One-line summary for the job log: what this scan found, and how it moved. */
@@ -967,5 +1027,8 @@ export function summarizeScanLine(summary: ScanSummary): string {
   const triage = summary.triage
     ? `; triage created ${summary.triage.created}, deduped ${summary.triage.deduped}`
     : "";
-  return `${summary.counts.total} signal(s)${split ? ` (${split})` : ""}; ${delta}${triage}`;
+  // The tree, named on the line itself: a scan of a stale checkout otherwise reads exactly like a
+  // scan of the shipped code (anton-qor2).
+  const tree = summary.scannedSha ? ` at ${summary.scannedSha.slice(0, 8)}` : "";
+  return `${summary.counts.total} signal(s)${split ? ` (${split})` : ""}${tree}; ${delta}${triage}`;
 }

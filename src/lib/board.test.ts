@@ -814,6 +814,9 @@ describe("getBoard excludes pipeline plumbing (gate + molecule)", () => {
     const built = await card();
     expect(built.blockedBy).toEqual(["gate-adhoc"]);
     expect(built.ready).toBe(false);
+    // The per-child verdict agrees: the gate holds the run's only ticket.
+    expect(built.childReadiness).toBe("blocked");
+    expect(built.blockedChildren).toEqual(["task-1"]);
   });
 
   it("releases it the moment the gate resolves — a gate is a wait, not a permanent blocker", async () => {
@@ -825,6 +828,37 @@ describe("getBoard excludes pipeline plumbing (gate + molecule)", () => {
     const built = await card();
     expect(built.blockedBy).toEqual([]);
     expect(built.ready).toBe(true);
+    // Same fail-safe, same permanence, one derivation over: the per-child readiness must be built
+    // over the gate-carrying list too, or the card dims and approve 409s with an EMPTY blocker list
+    // — a refusal with nothing on screen to explain it.
+    expect(built.childReadiness).toBe("ready");
+    expect(built.readyChildren).toEqual(["task-1"]);
+    expect(built.blockedChildren).toEqual([]);
+  });
+
+  it("never reports a target held by its OWN gh:pr merge gate — that is waiting on itself", async () => {
+    // anton arms this gate on every run target when it opens the target's PR, and bd leaves it open
+    // forever when that PR is closed unmerged. `isOwnMergeWait` can only recognise it from the gate
+    // BEAD, so without gates in the read every in-review card reads blocked and the Force/recovery
+    // run the unmerged PR needs is refused permanently.
+    listMock.mockResolvedValue([
+      makeBead({
+        id: "feat-1",
+        title: "Ship the exporter",
+        issue_type: "feature",
+        labels: ["stage:in-review"],
+        dependencies: [{ issue_id: "feat-1", depends_on_id: "gate-pr", type: "blocks" }],
+      }),
+      makeBead({ id: "task-1", title: "Write the exporter", parent: "feat-1" }),
+      // `await_type` rides on the Gate shape bd's `--type gate` listing carries, not on Bead.
+      { ...makeBead({ id: "gate-pr", title: "Gate: gh:pr", issue_type: "gate" }), await_type: "gh:pr" },
+    ]);
+
+    const board = await getBoard(project);
+    const built = board.columns["in-review"].find((e) => e.id === "feat-1")!;
+    expect(built.blockedBy).toEqual([]);
+    expect(built.childReadiness).toBe("ready");
+    expect(built.readyChildren).toEqual(["task-1"]);
   });
 
   it("pays a second `--type gate` read only when an edge points at a bead the listing omits", async () => {

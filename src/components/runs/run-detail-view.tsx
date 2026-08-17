@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { TriangleAlertIcon } from "lucide-react";
 
+import { DISPLAY_LOCALE } from "@/lib/time";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { CopyButton } from "@/components/ui/copy-button";
@@ -31,9 +32,15 @@ const RUN_STATUS_STYLE: Record<RunStatus, { dot: string; text: string; pulse?: b
   done: { dot: "bg-stage-done", text: "text-stage-done" },
 };
 
+/**
+ * Not hydration-sensitive today — the run arrives from a `useEffect` fetch, so nothing here is
+ * server-rendered — but it uses {@link DISPLAY_LOCALE} anyway: the property that makes it safe is
+ * one refactor to a server-fetched prop away from being false, and the convention shouldn't depend
+ * on re-deriving it.
+ */
 function fmtTime(epoch?: number): string {
   if (!epoch) return "—";
-  return new Date(epoch * 1000).toLocaleString(undefined, {
+  return new Date(epoch * 1000).toLocaleString(DISPLAY_LOCALE, {
     month: "short",
     day: "numeric",
     hour: "2-digit",

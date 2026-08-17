@@ -7,6 +7,7 @@ import type { Epic } from "@/lib/types";
 import { EpicCard } from "@/components/board/epic-card";
 
 function makeEpic(over: Partial<Epic> = {}): Epic {
+  const ready = over.ready ?? true;
   return {
     id: "anton-1",
     title: "Resumable crawl checkpoints",
@@ -17,7 +18,11 @@ function makeEpic(over: Partial<Epic> = {}): Epic {
     createdAt: "2026-07-20T00:00:00.000Z",
     createdBy: null,
     blockedBy: [],
-    ready: true,
+    ready,
+    // Mirrors toEpic's own fallback: a fixture that says only `ready: false` means fully blocked.
+    childReadiness: ready ? "ready" : "blocked",
+    readyChildren: [],
+    blockedChildren: [],
     rank: 0,
     priority: 2,
     abandoned: false,
@@ -109,6 +114,49 @@ describe("EpicCard contract marking", () => {
     expect(html).not.toContain("spec gap");
     expect(html).not.toContain("needs ");
     expect(html).not.toContain('disabled=""');
+  });
+});
+
+describe("EpicCard readiness (anton-zztt)", () => {
+  // The partially-gated shape the executor now runs: one ticket held by a blocker outside the run,
+  // two the run can dispatch immediately. `ready`/`blockedBy` still read the coarse target-level
+  // rollup, so the card must be driven by the per-child verdict, not by them.
+  const partial = () =>
+    makeEpic({
+      ready: false,
+      blockedBy: ["anton-9"],
+      childReadiness: "partially-blocked",
+      readyChildren: ["anton-2", "anton-3"],
+      blockedChildren: ["anton-4"],
+    });
+
+  it("reads a partially-gated target as N/M ready, keeps it lit, and still offers Approve", () => {
+    const html = renderToStaticMarkup(<EpicCard slug="anton" epic={partial()} />);
+    expect(html).toContain("partially blocked · 2/3 ready");
+    // Named, so the operator knows which ticket is waiting rather than just that something is.
+    expect(html).toContain("anton-4");
+    expect(html).toContain(">Approve<");
+    // Neither the dead-stop chip nor the dimming: this run starts now.
+    expect(html).not.toContain("blocked by anton-9");
+    expect(html).not.toContain("opacity-60");
+  });
+
+  it("still reads a fully blocked target as blocked, dimmed, with no Approve", () => {
+    const html = renderToStaticMarkup(
+      <EpicCard
+        slug="anton"
+        epic={makeEpic({
+          ready: false,
+          blockedBy: ["anton-9"],
+          childReadiness: "blocked",
+          blockedChildren: ["anton-4"],
+        })}
+      />,
+    );
+    expect(html).toContain("blocked by anton-9");
+    expect(html).toContain("opacity-60");
+    expect(html).not.toContain("partially blocked");
+    expect(html).not.toContain(">Approve<");
   });
 });
 

@@ -26,7 +26,13 @@ import { beads } from "./beads/bd";
 import { contractGaps, formatContractGaps } from "./beads/contract";
 import { formatStructureViolations, structureGaps } from "./beads/structure";
 import type { Bead } from "./beads/types";
-import { computeEpicGraph, epicStandaloneBlockers, isUnit, standaloneBlockers } from "./epic-graph";
+import {
+  computeEpicGraph,
+  epicStandaloneBlockers,
+  isUnit,
+  standaloneBlockers,
+  type EpicGraphNode,
+} from "./epic-graph";
 import { boardCards, contractGatedBeads, isRunTicket, type BoardCards } from "./ticket-view";
 
 /** Which of approval's four promises a target has stopped keeping. */
@@ -54,7 +60,7 @@ export function makeApprovalGate(board: Bead[]): ApprovalGate {
   const cards = boardCards(board);
   const tickets = ticketIndex(board, cards);
   const graph = computeEpicGraph(board);
-  const unitBlockers = new Map(graph.epics.map((node) => [node.id, node.blockedBy]));
+  const unitNodes = new Map(graph.epics.map((node) => [node.id, node]));
 
   return {
     gapsFor: (target) => [
@@ -76,7 +82,7 @@ export function makeApprovalGate(board: Bead[]): ApprovalGate {
           message: formatStructureViolations([violation]),
         }),
       ),
-      ...blockedGap(target, board, unitBlockers),
+      ...blockedGap(target, board, unitNodes),
     ],
   };
 }
@@ -142,10 +148,17 @@ function runnableGap(target: Bead, board: Bead[]): ApprovalGap[] {
 }
 
 /**
- * The target's open blockers, derived the way the approve route derives them: for a graph unit
- * (epic/feature) the epic-graph rollup PLUS the parentless prerequisites that rollup drops
- * (`epicStandaloneBlockers`); for a standalone task/bug — which carries no node in the graph at all —
- * its own `blocks` edges.
+ * Whether a worker could still start this target, asked exactly as the approve route asks it
+ * (route.ts). For a graph unit (epic/feature) that is the rollup's PER-CHILD verdict, not its
+ * target-level blocker list: one cross-run-gated tail child leaves the rest of the run dispatchable,
+ * so a `partially-blocked` target is approvable and running (issue #58). Judging it on the coarse
+ * rollup here would file a `degraded-approval` on every such target each product-master pass, and
+ * approving that proposal would strip the `approved` label off a run that was starting fine. Only
+ * `blocked` — zero dispatchable tickets — is a gap. A standalone task/bug carries no node in the
+ * graph and has no children to be partial about, so it stays gated on its own `blocks` edges.
+ *
+ * The blockers are still derived for the MESSAGE — the rollup plus the parentless prerequisites it
+ * drops (`epicStandaloneBlockers`) — so a refusal names what the operator is waiting on.
  *
  * One gap, not one per blocker: "this cannot start yet" is a single fact about the target, and
  * splitting it would file the same ask once per edge.
@@ -153,16 +166,19 @@ function runnableGap(target: Bead, board: Bead[]): ApprovalGap[] {
 function blockedGap(
   target: Bead,
   board: Bead[],
-  unitBlockers: Map<string, string[]>,
+  unitNodes: Map<string, EpicGraphNode>,
 ): ApprovalGap[] {
+  const unit = isUnit(target) ? unitNodes.get(target.id) : undefined;
   const open = isUnit(target)
-    ? [...(unitBlockers.get(target.id) ?? []), ...epicStandaloneBlockers(board, target.id)]
+    ? [...(unit?.blockedBy ?? []), ...epicStandaloneBlockers(board, target.id)]
     : standaloneBlockers(board, target.id);
-  if (open.length === 0) return [];
-  return [
-    {
-      rule: "blocked",
-      message: `${target.id} → blocked by ${open.join(", ")} — approval is the run trigger, and a worker cannot start it until those land`,
-    },
-  ];
+  // A unit absent from the graph (a board read that doesn't carry it) has no per-child verdict to
+  // read, so it falls back to the coarse list rather than silently reading as runnable.
+  const runnable = unit ? unit.childReadiness !== "blocked" : open.length === 0;
+  if (runnable) return [];
+  const why =
+    open.length > 0
+      ? `blocked by ${open.join(", ")} — approval is the run trigger, and a worker cannot start it until those land`
+      : "blocked: every ticket it would run is held by an open blocker — approval is the run trigger, and there is nothing here a worker could pick up";
+  return [{ rule: "blocked", message: `${target.id} → ${why}` }];
 }

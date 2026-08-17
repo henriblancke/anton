@@ -159,6 +159,51 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     expect(beads.isApproved(await beads.show(repo, dependent))).toBe(true);
   });
 
+  // anton-zztt: a target-level blocker roll-up can't tell "one gated tail child" from "nothing can
+  // run", so a single cross-run-gated child used to make the whole run unapprovable while its
+  // independent siblings sat idle (issue #58). Approval now gates on the per-child verdict.
+  it("approves a partially-gated epic — one child is held, the rest can run", async () => {
+    const epic = await beads.create(repo, { title: "Partly gated epic", type: "epic", acceptance: "- [ ] it works" });
+    const runnable = await beads.create(repo, { title: "Independent ticket", type: "task", acceptance: "- [ ] it works" });
+    const held = await beads.create(repo, { title: "Gated ticket", type: "task", acceptance: "- [ ] it works" });
+    await beads.link(repo, runnable, epic, "parent-child");
+    await beads.link(repo, held, epic, "parent-child");
+
+    // The gate: another run target's open ticket, so the block is genuinely cross-run.
+    const prereq = await beads.create(repo, { title: "Prerequisite epic", type: "epic", acceptance: "- [ ] it works" });
+    const prereqChild = await beads.create(repo, { title: "Prerequisite ticket", type: "task", acceptance: "- [ ] it works" });
+    await beads.link(repo, prereqChild, prereq, "parent-child");
+    await beads.link(repo, held, prereqChild, "blocks");
+
+    const res = await approve(epic);
+    expect(res.status).toBe(200);
+    expect((await res.json()).jobId).toBeTruthy();
+    expect(beads.isApproved(await beads.show(repo, epic))).toBe(true);
+  });
+
+  it("409s a run target whose every ticket is held, and does not approve it", async () => {
+    // The other half of the same verdict: zero runnable tickets is still a dead card. Approving it
+    // would enqueue a run with nothing to dispatch.
+    const epic = await beads.create(repo, { title: "Fully gated epic", type: "epic", acceptance: "- [ ] it works" });
+    const first = await beads.create(repo, { title: "Gated ticket A", type: "task", acceptance: "- [ ] it works" });
+    const second = await beads.create(repo, { title: "Gated ticket B", type: "task", acceptance: "- [ ] it works" });
+    await beads.link(repo, first, epic, "parent-child");
+    await beads.link(repo, second, epic, "parent-child");
+
+    const prereq = await beads.create(repo, { title: "Prerequisite epic (all)", type: "epic", acceptance: "- [ ] it works" });
+    const prereqChild = await beads.create(repo, { title: "Prerequisite ticket (all)", type: "task", acceptance: "- [ ] it works" });
+    await beads.link(repo, prereqChild, prereq, "parent-child");
+    await beads.link(repo, first, prereqChild, "blocks");
+    await beads.link(repo, second, prereqChild, "blocks");
+
+    const res = await approve(epic);
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toMatch(/blocked by/i);
+    expect(body.error).toContain(prereq);
+    expect(beads.isApproved(await beads.show(repo, epic))).toBe(false);
+  });
+
   it("enqueues a real epic with no blockers and applies the approved label", async () => {
     const epic = await beads.create(repo, { title: "Free epic", type: "epic", acceptance: "- [ ] it works" });
     const child = await beads.create(repo, { title: "Free epic child", type: "task", acceptance: "- [ ] it works" });

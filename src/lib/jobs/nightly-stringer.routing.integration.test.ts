@@ -146,7 +146,9 @@ describeBd("nightly-stringer routing replay (real handler · real bd · stored s
       .some((e) => e.type === type && ((e.from === from && e.to === to) || (e.from === to && e.to === from)));
 
   beforeAll(async () => {
-    bdRepo = makeBdRepo({ initialCommit: true });
+    // `bare`: the pass refreshes the checkout against origin before it scans and stands down when
+    // it can't (anton-qor2), so a remote-less sandbox would park this replay.
+    bdRepo = makeBdRepo({ bare: true, initialCommit: true });
     sandbox = bdRepo.dir;
     repo = bdRepo.repo;
     const binDir = join(sandbox, "bin");

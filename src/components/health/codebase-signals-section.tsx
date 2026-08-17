@@ -45,6 +45,17 @@ export function CodebaseSignalsSection({ scanHealth }: { scanHealth: ScanHealth 
         </h2>
         <span className="text-xs text-subtle">
           scanned <RelativeTime iso={iso(latest.at)} />
+          {latest.sha ? (
+            // Which tree these numbers describe (anton-qor2). A scan of a checkout behind its
+            // remote reads exactly like a scan of the shipped code without it, and the debt it
+            // reports may already be merged away.
+            <>
+              {" at "}
+              <span className="font-mono text-muted-foreground" title={`commit ${latest.sha}`}>
+                {latest.sha.slice(0, 8)}
+              </span>
+            </>
+          ) : null}
         </span>
       </div>
 

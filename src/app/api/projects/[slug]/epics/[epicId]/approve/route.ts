@@ -227,20 +227,31 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // the epic-graph rollup (epic→epic + cross-epic child blocks) PLUS any parentless standalone
   // (task/bug) prerequisite the rollup DROPS (epicStandaloneBlockers) — otherwise an epic that
   // depends on an open standalone item would read ready. For a standalone target the rollup never
-  // carries it, so derive from its own `blocks` edges. Two consumers below: the readiness gate (a
-  // fresh approval enqueues immediately, so a still-blocked target must be rejected before we
-  // label + enqueue work `bd ready` would keep blocked), and the take-over enqueue at the end (which
-  // only fires when nothing is open).
+  // carries it, so derive from its own `blocks` edges. Two consumers below: the standalone half of
+  // the readiness gate (a fresh approval enqueues immediately, so a still-blocked target must be
+  // rejected before we label + enqueue work `bd ready` would keep blocked), and the refusal message,
+  // which names what the operator is waiting on.
   const openBlockers = epic
     ? [...epic.blockedBy, ...epicStandaloneBlockers(allBeads, epicId)]
     : standaloneBlockers(allBeads, epicId);
+  // Whether this request can actually start work. `openBlockers` is a target-level roll-up: it fires
+  // on ANY open blocker under the target, so one gated tail child made the whole run unapprovable
+  // while its independent siblings sat idle (issue #58). The rollup's per-child verdict answers the
+  // question that actually matters — is there a ticket this run could dispatch right now — so a
+  // partially-gated target approves and runs its ready children, and only a target with ZERO of them
+  // is refused. A standalone task/bug (epic-of-one) carries no such verdict and has no children to
+  // be partial about: it stays gated on its own open blockers.
+  const runnable = epic ? epic.childReadiness !== "blocked" : openBlockers.length === 0;
   // A pure take-over bypasses this gate — it only reassigns the reservation and enqueues no run that
   // would start blocked work (see the enqueue gate at the end) — so a target that gained a blocker
   // AFTER its original approval stays transferable to a new owner rather than stranded with the old.
-  if (!takeOver && openBlockers.length > 0) {
-    const message = epic
-      ? `Epic is blocked by ${openBlockers.join(", ")}`
-      : `${epicId} is blocked by ${openBlockers.join(", ")}`;
+  if (!takeOver && !runnable) {
+    const message =
+      openBlockers.length > 0
+        ? epic
+          ? `Epic is blocked by ${openBlockers.join(", ")}`
+          : `${epicId} is blocked by ${openBlockers.join(", ")}`
+        : `${epicId} is blocked: every ticket it would run is held by an open blocker`;
     return NextResponse.json({ error: message }, { status: 409 });
   }
 
@@ -257,9 +268,9 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // enqueues nothing (the enqueue gate at the end skips it) — it only moves the reservation — so
   // refusing it on a contract gap would strand an approved target with its previous owner over a
   // section no run of ours is about to read. The condition mirrors that enqueue gate exactly: a
-  // non-take-over always enqueues (a blocked one already 409'd above), a take-over only when
-  // nothing is open.
-  const willEnqueue = !takeOver || openBlockers.length === 0;
+  // non-take-over always enqueues (an unrunnable one already 409'd above), a take-over only when the
+  // target has work it can actually start.
+  const willEnqueue = !takeOver || runnable;
   const blocking = willEnqueue ? contractGaps(contractGated, "blocking") : [];
   if (blocking.length > 0) {
     return NextResponse.json(
@@ -464,10 +475,10 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   //    job and reuses it (returns no new id), so a parked prior run stays resumable rather than
   //    shadowed by a duplicate.
   //
-  //    Skip the take-over enqueue when the target is currently blocked: a take-over bypasses the
-  //    readiness gate above (to stay transferable), but starting blocked work is exactly what that
-  //    gate prevents — the runner would only park it. The operator force-runs it once the blocker
-  //    clears, matching a fresh approval's own blocker rejection.
+  //    Skip the take-over enqueue when the target has nothing it can start: a take-over bypasses the
+  //    readiness gate above (to stay transferable), but starting fully blocked work is exactly what
+  //    that gate prevents — the runner would only park it. The operator force-runs it once the
+  //    blocker clears, matching a fresh approval's own refusal.
   //
   // Best-effort — approving must still succeed even if the runner enqueue hiccups.
   // The autonomy master-switch (anton-y3l) gates at *claim* in the runner instead, so with autonomy

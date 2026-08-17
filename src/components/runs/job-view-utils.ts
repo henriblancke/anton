@@ -11,6 +11,7 @@ import type { JobStatus, JobSummary } from "@/lib/jobs-view";
 // Type-only for the same reason: runner.ts is server-only, but its LiveJobInfo shape is exactly
 // what the page resolves per running job.
 import type { LiveJobInfo } from "@/lib/jobs/runner";
+import { DISPLAY_LOCALE } from "@/lib/time";
 
 export const JOB_STATUS_STYLE: Record<JobStatus, { dot: string; text: string; pulse?: boolean }> = {
   running: { dot: "bg-stage-implementing", text: "text-stage-implementing", pulse: true },
@@ -38,10 +39,14 @@ export function relativeTime(epoch?: number): string {
   return `${Math.floor(s / 86400)}d ago`;
 }
 
-/** Absolute local timestamp for the detail panel. */
+/**
+ * Absolute timestamp for the detail panel, in the host's timezone but anton's canonical locale.
+ * Hydration-sensitive: the Jobs page is a Server Component that hands this client list its rows, so
+ * these strings are server-rendered before the browser ever formats them.
+ */
 export function absTime(epoch?: number): string {
   if (!epoch) return "—";
-  return new Date(epoch * 1000).toLocaleString();
+  return new Date(epoch * 1000).toLocaleString(DISPLAY_LOCALE);
 }
 
 /**
