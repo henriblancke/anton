@@ -477,6 +477,141 @@ process.exit(0);`),
     expect((await beads.show(repo, blockedTicket)).status).toBe("open");
   });
 
+  it("runs a partially-gated target's ready children, holds the cross-run one, and parks (anton-1two)", async () => {
+    // issue #58: a run target is dispatched per TICKET, so one child waiting on another run must not
+    // stall the children nothing holds. The run does the runnable work now, never dispatches the
+    // held child (the issue #46 false-success guard: its premise hasn't landed), and parks with the
+    // tail rather than opening a PR that advertises a feature missing part of itself. The resume
+    // after the blocker lands runs the tail into the SAME branch and opens the one PR.
+    const target = await beads.create(repo, {
+      title: "Partially gated feature",
+      type: "feature",
+      acceptance: "work file exists",
+      description: "## Goal\nPG",
+    });
+    await beads.approve(repo, target);
+    const upstream = await beads.create(repo, {
+      title: "Upstream feature",
+      type: "feature",
+      acceptance: "work file exists",
+    });
+    const ready = createTicket(repo, { title: "Independent ticket", parent: target });
+    const heldTicket = createTicket(repo, { title: "Cross-run gated ticket", parent: target });
+    const upstreamTicket = createTicket(repo, { title: "Upstream ticket", parent: upstream });
+    // The blocker lives in ANOTHER run target, so it only lands when that target's PR merges — the
+    // one shape this run cannot produce for itself.
+    await beads.link(repo, heldTicket, upstreamTicket, "blocks");
+
+    const invLog = join(sandbox, "partial-gate-inv.jsonl");
+    const loggingClaude = writeBin(
+      binDir,
+      "claude-partial-gate",
+      fakeClaudeReadingStdin(`const m=prompt.match(/Ticket: (\\S+)/);
+fs.appendFileSync(${JSON.stringify(invLog)},(m?m[1]:'unknown')+'\\n');
+fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work '+Date.now()+'\\n');
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+e({type:'system',subtype:'init',session_id:'spg'});
+e({type:'result',subtype:'success',result:'done',session_id:'spg',num_turns:1,is_error:false});
+process.exit(0);`),
+    );
+
+    const runner = makeEpicRunner(ctx);
+
+    process.env.ANTON_CLAUDE_BIN = loggingClaude;
+    try {
+      const jobId = await driveEpicRun(runner, { projectId, epicBeadId: target });
+
+      // Parked (poison, recoverable) naming the held ticket and the UNIT that ships its blocker.
+      const job = await getJob(tdb.db, jobId);
+      expect(job?.status).toBe("parked");
+      expect(job?.lastError).toContain(heldTicket);
+      expect(job?.lastError).toContain(upstream);
+      expect(job?.lastError).toMatch(/blocked by/i);
+
+      // The independent ticket RAN and committed — the whole point: it is not held by anything.
+      expect(readFileSync(invLog, "utf8")).toContain(ready);
+      expect((await beads.show(repo, ready)).status).toBe("closed");
+
+      // The held ticket was never dispatched, never closed, and its cascade reservation is handed
+      // back — nothing about it may read as delivered.
+      expect(readFileSync(invLog, "utf8")).not.toContain(heldTicket);
+      const stillHeld = await beads.show(repo, heldTicket);
+      expect(stillHeld.status).toBe("open");
+      expect(stillHeld.assignee ?? null).toBeNull();
+
+      // No partial PR, and the target stays out of review — one target, one PR, opened whole.
+      const parkedTarget = await beads.show(repo, target);
+      expect(beads.getPrRef(parkedTarget) ?? null).toBeNull();
+      expect(parkedTarget.labels ?? []).not.toContain("stage:in-review");
+      // The RUN is parked, not failed: its commit is on the branch and the resume continues in this
+      // same row and worktree.
+      const parkedRun = (await tdb.db.select().from(schema.runs)).find(
+        (r) => r.epicBeadId === target,
+      )!;
+      expect(parkedRun.status).toBe("parked");
+      expect(parkedRun.error).toContain(heldTicket);
+
+      // The blocker lands (its ticket AND the target that ships it) → resume → the tail runs into
+      // the same branch and the single PR opens.
+      await beads.close(repo, upstreamTicket);
+      await beads.close(repo, upstream);
+      expect(await resumeJob(tdb.db, clock, jobId)).toBe(true);
+      await tickToIdle(runner);
+
+      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+      expect((await beads.show(repo, heldTicket)).status).toBe("closed");
+      const done = await beads.show(repo, target);
+      expect(done.labels ?? []).toContain("stage:in-review");
+      expect(beads.getPrRef(done) ?? null).not.toBeNull();
+
+      // The tail ran on the resume, and the already-committed ticket was NOT re-dispatched.
+      const invoked = readFileSync(invLog, "utf8").trim().split("\n").filter(Boolean);
+      expect(invoked).toContain(heldTicket);
+      expect(invoked.filter((id) => id === ready)).toHaveLength(1);
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+    }
+  });
+
+  it("parks before any dispatch when EVERY child is cross-run gated (anton-1two)", async () => {
+    // The other side of the same rule: per-child dispatch only relaxes the gate while some child can
+    // actually start. With none, the run is refused pre-flight exactly as before — no worktree, no
+    // claim, no agent — so a target whose whole subtree waits on another run never half-executes.
+    const target = await beads.create(repo, {
+      title: "Fully gated feature",
+      type: "feature",
+      acceptance: "work file exists",
+      description: "## Goal\nFG",
+    });
+    await beads.approve(repo, target);
+    const upstream = await beads.create(repo, {
+      title: "Upstream feature two",
+      type: "feature",
+      acceptance: "work file exists",
+    });
+    const upstreamTicket = createTicket(repo, { title: "Upstream ticket two", parent: upstream });
+    const gated1 = createTicket(repo, { title: "Gated one", parent: target });
+    const gated2 = createTicket(repo, { title: "Gated two", parent: target });
+    await beads.link(repo, gated1, upstreamTicket, "blocks");
+    await beads.link(repo, gated2, upstreamTicket, "blocks");
+
+    const runner = makeEpicRunner(ctx);
+    const jobId = await driveEpicRun(runner, { projectId, epicBeadId: target });
+
+    const job = await getJob(tdb.db, jobId);
+    expect(job?.status).toBe("parked");
+    expect(job?.lastError).toContain(upstream);
+    // Pre-flight: no run row at all, and neither ticket was claimed.
+    expect(
+      (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === target),
+    ).toBeUndefined();
+    for (const id of [gated1, gated2]) {
+      const t = await beads.show(repo, id);
+      expect(t.status).toBe("open");
+      expect(t.assignee ?? null).toBeNull();
+    }
+  });
+
   // anton-j9zs: the bead contract is a dispatch gate, not just a board mark. A ticket with no
   // Acceptance gives the agent no definition of done and self-review no rubric, so the run parks
   // rather than generating work nothing can judge. Same poison shape as the allowlist gate above.

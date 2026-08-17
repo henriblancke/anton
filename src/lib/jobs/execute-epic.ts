@@ -69,6 +69,7 @@ import {
 import { persistPartialReviewScores, persistReviewScores } from "./review-score";
 import {
   blockedByPoison,
+  blockedTailReason,
   isPoisonError,
   isRecoverableClaudeError,
   isUsageLimitError,
@@ -146,6 +147,81 @@ const RUN_LEASE_REFRESH_MS = 5 * 60_000;
  * without a real cross-machine lock — the asymmetric-read window the reviewer flagged.
  */
 const RUN_LEASE_SETTLE_MS = 2_000;
+
+/**
+ * What a run may actually start, over one board snapshot (anton-1two). A run target is dispatched
+ * PER TICKET, so "blocked" is not a property of the target: a ticket whose prerequisite ships in
+ * ANOTHER run is held, while its independent siblings are ordinary work the run does now. The
+ * rollup's per-child verdict (epic-graph `childReadiness`) is what tells those two apart — the
+ * target-level `blockedBy` conflates them, and a run that gated on it stalled a whole feature over
+ * one tail ticket (issue #58).
+ */
+export interface RunReadiness {
+  /** Open prerequisites of the target or of its tickets — what the park reason names. */
+  blockers: string[];
+  /** Ticket ids a blocker OUTSIDE this run holds; never dispatched this pass. */
+  gated: string[];
+  /** At least one ticket is dispatchable now — the only condition under which the run proceeds. */
+  runnable: boolean;
+}
+
+/**
+ * Read {@link RunReadiness} off a board snapshot, for the run target `targetId`.
+ *
+ * A GRAPH UNIT — every feature and every epic (epic-graph's isUnit) — takes its verdict from the
+ * epic-graph rollup, which is where cross-unit edges inferred from ticket-level `blocks` land;
+ * keying on isEpic alone would send a feature down the standalone path and miss every inferred
+ * blocker the approve route gates on. `targetIsUnit` is passed in rather than re-derived so a run
+ * judges every board it re-reads by the shape it started with.
+ *
+ * The BLOCKER list stays the coarse roll-up — it names what the operator is waiting on, and a unit
+ * also inherits any open standalone (parentless task/bug) prerequisite the rollup drops
+ * (epicStandaloneBlockers), the same gap the approve route closes. Only the DECISION is per-child.
+ *
+ * A standalone task/bug (epic-of-one) never appears in the rollup and has nothing to be partial
+ * about — it IS its own single ticket — so its own open `blocks` edges hold the whole run.
+ */
+export function runReadiness(
+  board: Bead[],
+  targetId: string,
+  targetIsUnit: boolean,
+): RunReadiness {
+  if (!targetIsUnit) {
+    const blockers = standaloneBlockers(board, targetId);
+    return {
+      blockers,
+      gated: blockers.length > 0 ? [targetId] : [],
+      runnable: blockers.length === 0,
+    };
+  }
+  const node = computeEpicGraph(board).epics.find((n) => n.id === targetId);
+  const blockers = [...(node?.blockedBy ?? []), ...epicStandaloneBlockers(board, targetId)];
+  return {
+    blockers,
+    gated: node?.blockedChildren ?? [],
+    // A unit always has a node; judging a missing one by its blockers is the fail-safe.
+    runnable: node ? node.childReadiness !== "blocked" : blockers.length === 0,
+  };
+}
+
+/** The park a run takes when NOTHING in it can start. */
+function blockedRunPoison(beadId: string, readiness: RunReadiness): PoisonEpic {
+  return readiness.blockers.length > 0
+    ? blockedByPoison(beadId, readiness.blockers)
+    : new PoisonEpic(
+        `${beadId} has no ticket it can start — every ticket it would run is held by an open ` +
+          `blocker outside this run; resume the run once they complete`,
+      );
+}
+
+/**
+ * The run ran every ticket it could and the rest are held by a prerequisite outside it (anton-1two).
+ * Poison (`PoisonEpic`), so the runner parks the JOB for a human rather than burning retries on a
+ * wait no retry shortens — and, like {@link ReviewBlockedError}, the RUN row is parked instead of
+ * failed: its tickets' commits are on the branch, and the resume that follows the blocker landing
+ * continues in this same row and worktree rather than reading as a crash.
+ */
+class BlockedTailError extends PoisonEpic {}
 
 export interface ExecuteEpicDeps {
   db: AntonDb;
@@ -229,36 +305,24 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     // resumed) when the abandon landed; a job that was RUNNING is cancelled by the abandon itself.
     if (beads.isAbandoned(target)) return;
 
-    // Compute the target's open blockers from a board snapshot. A GRAPH UNIT — every feature and
-    // every epic (epic-graph's isUnit) — takes its blockers from the epic-graph rollup, which is
-    // where cross-unit edges inferred from ticket-level `blocks` land; keying on isEpic alone would
-    // send a feature down the standalone path and miss every inferred blocker the approve route
-    // gates on. A standalone task/bug (epic-of-one) never appears in the rollup, so derive its
-    // blockers from its own `blocks` edges. A unit also inherits any open standalone (parentless
-    // task/bug) prerequisite that the rollup drops (epicStandaloneBlockers) — the same gap the
-    // approve route closes. Unit-ness is type-only (isUnit reads `issue_type`), so unlike the
-    // grouping shape it genuinely can't change across a pull — capture it here, while `target` is
-    // narrowed, and reuse it against the freshly-pulled board in step 0; `target` is a `let`
-    // reassigned there, so reading it inside this closure would widen back to `Bead | undefined`.
+    // Unit-ness is type-only (isUnit reads `issue_type`), so unlike the grouping shape it genuinely
+    // can't change across a pull — capture it here, while `target` is narrowed, and reuse it against
+    // the freshly-pulled board in step 0; `target` is a `let` reassigned there, so reading it inside
+    // this closure would widen back to `Bead | undefined`.
     const targetIsUnit = isUnit(target);
-    const computeBlockers = (board: Bead[]): string[] =>
-      targetIsUnit
-        ? [
-            ...(computeEpicGraph(board).epics.find((n) => n.id === epicBeadId)?.blockedBy ?? []),
-            ...epicStandaloneBlockers(board, epicBeadId),
-          ]
-        : standaloneBlockers(board, epicBeadId);
+    const computeReadiness = (board: Bead[]): RunReadiness =>
+      runReadiness(board, epicBeadId, targetIsUnit);
 
     // Re-check the same readiness gate the approval route enforces, now at job start. Approval only
     // guarantees readiness at approval time; between then and this lease a `blocks` edge could have
     // been added or pulled in via Dolt sync (a shared board), leaving this job queued behind a
-    // blocker that's no longer done. Derive from the fresh `all` read above and PARK if a blocker is
-    // open — starting still-blocked work would violate the sequence. Recoverable: once the blocker
+    // blocker that's no longer done. Derive from the fresh `all` read above and PARK if NOTHING can
+    // start — starting still-blocked work would violate the sequence. Recoverable: once the blocker
     // completes, resuming the parked job re-reads beads and passes this gate. Re-checked again in
     // step 0 after the cross-machine pull refreshes `all` (a blocker another machine pushed since
     // would be invisible to this pre-pull snapshot).
-    const blockers = computeBlockers(all);
-    if (blockers.length > 0) throw blockedByPoison(epicBeadId, blockers);
+    const readiness = computeReadiness(all);
+    if (!readiness.runnable) throw blockedRunPoison(epicBeadId, readiness);
 
     // A grouping target runs all its children into one PR; a leaf target IS its own single ticket
     // (an epic-of-one). The rest of the pipeline — worktree, per-ticket claude→tests→commit→close,
@@ -560,8 +624,12 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //     Checked AFTER the completion short-circuit (step 0a) so a genuinely-finished epic still
       //     takes the idempotent "done" path instead of parking, and BEFORE adopting/publishing any
       //     lease (below) so a park leaves nothing for `finally` to clear.
-      const freshBlockers = computeBlockers(all);
-      if (freshBlockers.length > 0) throw blockedByPoison(epicBeadId, freshBlockers);
+      //     This verdict is also what the ticket loop dispatches by (anton-1two), so the gate and the
+      //     dispatch can't disagree about which tickets a cross-run blocker holds: `gated` is read
+      //     from the same pulled board the loop iterates.
+      const freshReadiness = computeReadiness(all);
+      if (!freshReadiness.runnable) throw blockedRunPoison(epicBeadId, freshReadiness);
+      const gated = new Set(freshReadiness.gated);
 
       // 0a-ter. Re-derive the target's SHAPE against the freshly-pulled board. Runnability and
       //     grouping are properties of the whole BOARD, not of the bead: another machine can add or
@@ -1173,7 +1241,14 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
             `epic itself or give it work, then resume the run`,
         );
       }
-      for (const ticket of live) {
+      // A ticket a bead OUTSIDE this run still blocks is HELD, not run (anton-1two): its work depends
+      // on code that hasn't landed, so dispatching it would hand the agent a premise that doesn't
+      // exist yet — the false-success shape issue #46 is about. Its runnable siblings are independent
+      // work, so they run now (the readiness verdict above already refused a run with none of them),
+      // and the held tail parks the run after the loop rather than riding into the PR unrun.
+      const held = live.filter((t) => gated.has(t.id));
+      const dispatchable = live.filter((t) => !gated.has(t.id));
+      for (const ticket of dispatchable) {
         assertLeaseHeld(); // yield before starting a ticket if the shared lease has lapsed
         // A ticket marked done on the board — a closed epic child, or a standalone target moved to
         // stage:in-review — is only safe to SKIP if its commit is actually present on THIS
@@ -1262,6 +1337,27 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         await ctx.heartbeat();
       }
 
+      // A ticket ROLLED BACK by its budget contributed no commit (anton-t1mo), so it is not part of
+      // what this run delivered — read by the park below and by the run phase's ticket list.
+      const rolledBack = new Set(timedOut.filter((t) => !t.committed).map((t) => t.id));
+
+      // 4a. The held tail stops the run HERE (anton-1two) — after every runnable ticket has committed
+      //     and before anything speaks for the run as a whole. A run target ships ONE pull request
+      //     for its whole self, so opening it now would advertise a feature that is missing the
+      //     tickets a cross-run blocker held; closing them to make the set look whole would be the
+      //     same false success one ticket down. So park: the committed work stays on the branch, the
+      //     held tickets stay open and unrun, and the resume that follows the blocker landing walks
+      //     this same branch — skipping what already committed — and opens the single PR then.
+      if (held.length > 0) {
+        throw new BlockedTailError(
+          blockedTailReason(epicBeadId, {
+            blockers: freshReadiness.blockers,
+            held: held.map((t) => t.id),
+            ran: dispatchable.filter((t) => !rolledBack.has(t.id)).map((t) => t.id),
+          }),
+        );
+      }
+
       // 4b. The RUN phase of the walk (anton-lnkt): every formula step after the commit, in the
       //     order the project's formula puts them, dispatched through the same registry the ticket
       //     phase uses. These steps speak for the run as a whole — they read its whole diff and open
@@ -1272,7 +1368,6 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //     is dropped for the same reason (anton-t1mo) — leaving it in would put it in the PR body
       //     as delivered and hand the reviewer a diff it isn't in. One stopped AFTER its commit
       //     stays: its code is in the diff, so dropping it would hide work the reviewer must read.
-      const rolledBack = new Set(timedOut.filter((t) => !t.committed).map((t) => t.id));
       const delivered = live.filter((t) => !rolledBack.has(t.id));
 
       // Nothing survived, so this run has nothing to show (anton-t1mo). Absorbing the timeouts is
@@ -1529,6 +1624,11 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           status: "parked",
           error: `run-live-elsewhere${orphanNotice}`,
         });
+      } else if (e instanceof BlockedTailError) {
+        // Parked, not failed, for the same reason as a blocked review below: this run delivered the
+        // tickets it could and is waiting on work outside it, so the row must stay open for the
+        // resume to continue in (findOpenRunForEpic) rather than read as a crashed attempt.
+        await updateRun(db, clock, runId, { status: "parked", error: e.message });
       } else if (e instanceof ReviewBlockedError) {
         // Parked, not failed, and with no endedAt: the run is waiting on a human to resolve what the
         // gate refused on and resume it — the run history must not read like a crash. Resuming reuses
