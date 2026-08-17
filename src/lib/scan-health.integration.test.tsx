@@ -89,7 +89,9 @@ describeBd("scan health e2e (real handler · real bd · fake stringer/claude)", 
     });
 
   beforeAll(async () => {
-    bdRepo = makeBdRepo({ initialCommit: true });
+    // `bare`: the pass refreshes the checkout against origin before it scans and stands down when
+    // it can't (anton-qor2), so a remote-less sandbox would park every scan replayed here.
+    bdRepo = makeBdRepo({ bare: true, initialCommit: true });
     sandbox = bdRepo.dir;
     const binDir = join(sandbox, "bin");
     mkdirSync(binDir);
