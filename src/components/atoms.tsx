@@ -1,17 +1,19 @@
 import type { ReactNode } from "react";
-import { CircleSlashIcon, LockIcon, MoonIcon } from "lucide-react";
+import { CircleSlashIcon, LockIcon, LockOpenIcon, MoonIcon } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import type { Stage } from "@/lib/types";
 import { formatExactTime, formatRelativeTime } from "@/lib/time";
 import { STAGE_ACCENT_DOT, STAGE_LABELS } from "@/components/board/board-utils";
 
-type ChipTone = "neutral" | "risk-high" | "risk-med" | "blocked" | "pr" | "done";
+type ChipTone = "neutral" | "risk-high" | "risk-med" | "partial" | "blocked" | "pr" | "done";
 
 const CHIP_TONE: Record<ChipTone, string> = {
   neutral: "border-border bg-secondary text-muted-foreground",
   "risk-high": "border-risk-high/30 bg-risk-high/10 text-risk-high",
   "risk-med": "border-risk-med/28 bg-risk-med/10 text-risk-med",
+  // Amber, deliberately not the blocked rose: a partially-gated run still starts.
+  partial: "border-risk-med/30 bg-risk-med/10 text-risk-med",
   blocked: "border-blocked/30 bg-blocked/10 text-blocked",
   pr: "border-stage-in-review/30 bg-stage-in-review/10 text-stage-in-review",
   done: "border-stage-done/30 bg-stage-done/10 text-stage-done",
@@ -93,6 +95,32 @@ export function BlockedChip({ blockedBy }: { blockedBy: string[] }) {
     <MetaChip tone="blocked">
       <LockIcon className="size-2.5" aria-hidden="true" />
       <span title={`blocked by ${blockedBy.join(", ")}`}>{label}</span>
+    </MetaChip>
+  );
+}
+
+/**
+ * "partially blocked · N/M ready" chip — a run target whose work is only part-held (anton-zztt). The
+ * run starts on the M−N tickets nothing holds and parks the rest, so this is a progress signal, not
+ * a stop: an open padlock in amber, never the blocked rose, and the card it sits on stays lit and
+ * approvable. The held ticket ids ride in the title. Renders nothing once nothing is held.
+ */
+export function PartiallyBlockedChip({
+  ready,
+  total,
+  held,
+}: {
+  ready: number;
+  total: number;
+  held: string[];
+}) {
+  if (held.length === 0) return null;
+  return (
+    <MetaChip tone="partial">
+      <LockOpenIcon className="size-2.5" aria-hidden="true" />
+      <span title={`held by a blocker outside this run: ${held.join(", ")}`}>
+        {`partially blocked · ${ready}/${total} ready`}
+      </span>
     </MetaChip>
   );
 }

@@ -16,7 +16,15 @@ import {
   isTicketTier,
   type ContractStatus,
 } from "./beads/contract";
-import type { Epic, EpicCrumb, IssueType, Stage, StandaloneItem, Ticket } from "./types";
+import type {
+  ChildReadiness,
+  Epic,
+  EpicCrumb,
+  IssueType,
+  Stage,
+  StandaloneItem,
+  Ticket,
+} from "./types";
 
 /** Derived stage for a bead: closed → done; an `in-review` label or PR ref → in-review; an
  * in-progress status or `implementing` label → implementing; otherwise backlog. The PR pointer is
@@ -398,6 +406,15 @@ export interface ToEpicOptions {
   blockedBy?: string[];
   /** No open blockers. Defaults to ready (true) when the caller has no graph (e.g. epic-detail). */
   ready?: boolean;
+  /**
+   * Per-child readiness from computeEpicGraph (anton-nywj) — what tells a partially-gated target
+   * (some tickets held, at least one runnable) from a dead one. A caller with no graph omits all
+   * three: the verdict then degrades to the coarse `ready` flag and the child sets stay empty, so no
+   * surface can render an N-of-M it never derived.
+   */
+  childReadiness?: ChildReadiness;
+  readyChildren?: string[];
+  blockedChildren?: string[];
   /** Topological rank from the epic graph (0 = no blockers). Defaults to 0. */
   rank?: number;
   /** The product epic above this run target (parentEpicOf), for the swimlane grouping. */
@@ -444,6 +461,9 @@ export function toEpic(bead: Bead, opts: ToEpicOptions): Epic {
     ...(reviewScore !== undefined ? { reviewScore } : {}),
     blockedBy: opts.blockedBy ?? [],
     ready: opts.ready ?? true,
+    childReadiness: opts.childReadiness ?? ((opts.ready ?? true) ? "ready" : "blocked"),
+    readyChildren: opts.readyChildren ?? [],
+    blockedChildren: opts.blockedChildren ?? [],
     // Derived here, not passed in: contract conformance is a pure read of the beads, so every
     // surface that maps a run target gets the same judgement the approve route and the runner apply
     // — over the same set, target plus open tickets, not the target alone.

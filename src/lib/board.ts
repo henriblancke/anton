@@ -201,6 +201,13 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
       children,
       blockedBy,
       ready: blockedBy.length === 0,
+      // The finer verdict beside that coarse flag (anton-nywj): which of the run's tickets are
+      // actually held. It needs no standalone fold-back — the rollup gates an unattributable blocker
+      // on the blocker itself, exactly as epicStandaloneBlockers does — so it already answers for
+      // every blocker `blockedBy` above collects, one ticket at a time.
+      childReadiness: node?.childReadiness,
+      readyChildren: node?.readyChildren,
+      blockedChildren: node?.blockedChildren,
       rank: node?.rank ?? 0,
       // The product epic above this card — the key the board's epic swimlanes group on.
       epic: parentEpicOf(card, workBeads),

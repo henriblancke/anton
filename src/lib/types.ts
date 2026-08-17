@@ -3,6 +3,7 @@
  * Stages/approval/PR are derived from beads (see DESIGN.md §2/§3), not stored in anton.db.
  */
 import type { ContractStatus } from "./beads/contract";
+import type { ChildReadiness } from "./epic-graph";
 import type { TicketNote } from "./beads/notes";
 import type { HygieneReport } from "./hygiene";
 import type { ReviewTrajectory } from "./review-trajectory";
@@ -42,6 +43,11 @@ export type { ScanSeverity, SignalClass } from "./scan-severity";
 // lib/escalations and lib/run-health reach the database.
 export type { EscalationResolution, EscalationStatus, EscalationView } from "./escalations";
 export type { RunHealthFindingKind } from "./run-health";
+
+// The rollup's per-run-target child readiness, re-exported type-only for the same reason: the board
+// card renders the verdict, and a value import of lib/epic-graph would drag lib/beads into the
+// browser bundle.
+export type { ChildReadiness } from "./epic-graph";
 
 export type Stage = "backlog" | "implementing" | "in-review" | "done";
 export const STAGES: Stage[] = ["backlog", "implementing", "in-review", "done"];
@@ -184,6 +190,18 @@ export interface Epic {
   // Epic→epic dependency rollup from computeEpicGraph (epic-graph.ts), attached in board.ts.
   blockedBy: string[]; // epic ids that currently block this epic (open blockers); empty when ready
   ready: boolean; // no open blockers — mirrors what the runtime's bd-ready would actually pick up
+  /**
+   * How much of this run's work can actually start now (anton-nywj). `blockedBy`/`ready` above roll
+   * every child's block up to the target, so they can't tell "one gated tail child" from "nothing
+   * can run" — a target whose other tickets are independent reads fully blocked there while the
+   * executor would happily dispatch them (issue #58). This is the verdict the board and approve
+   * gate on. Falls back to the coarse `ready` flag on a surface built without the rollup.
+   */
+  childReadiness: ChildReadiness;
+  /** Ticket ids the run can dispatch now — the N of the card's "N/M ready". Empty without the rollup. */
+  readyChildren: string[];
+  /** Ticket ids an open blocker outside this run holds — the rest of that M. */
+  blockedChildren: string[];
   /**
    * How this card's bead measures against the bead contract, from the SAME validator approve and the
    * runner judge with (lib/beads/contract.ts) — so the board can never advertise as approvable a bead
