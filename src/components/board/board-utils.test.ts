@@ -7,6 +7,8 @@ import {
   boardEpicOptions,
   boardFiltersFromSearchParams,
   boardFiltersQueryString,
+  canStartRun,
+  childReadinessCounts,
   compareBacklogEpics,
   filterBoard,
   groupBoardByEpic,
@@ -33,6 +35,7 @@ function makeTicket(id: string, over: Partial<Ticket> = {}): Ticket {
 
 /** A ready, rank-0 backlog epic; override the dependency/sort fields per test. */
 function makeEpic(id: string, over: Partial<Epic> = {}): Epic {
+  const ready = over.ready ?? true;
   return {
     id,
     title: id,
@@ -43,7 +46,11 @@ function makeEpic(id: string, over: Partial<Epic> = {}): Epic {
     createdAt: "",
     createdBy: null,
     blockedBy: [],
-    ready: true,
+    ready,
+    // Mirrors toEpic's own fallback: a fixture that says only `ready: false` means fully blocked.
+    childReadiness: ready ? "ready" : "blocked",
+    readyChildren: [],
+    blockedChildren: [],
     rank: 0,
     priority: 4,
     abandoned: false,
@@ -65,6 +72,40 @@ describe("ticketProgress", () => {
     ];
     // The abandoned ticket neither inflates `done` nor holds the epic below 100%.
     expect(ticketProgress({ tickets })).toEqual({ done: 1, total: 1, pct: 100 });
+  });
+});
+
+describe("canStartRun", () => {
+  it("treats a partially-gated run target as startable, and only a fully blocked one as not", () => {
+    // The whole point of the per-child verdict (issue #58): one gated tail child must not hide
+    // Approve on a target whose other tickets the executor can dispatch right now.
+    const partial = makeEpic("partial", {
+      ready: false,
+      blockedBy: ["anton-blocker"],
+      childReadiness: "partially-blocked",
+      readyChildren: ["t1", "t2"],
+      blockedChildren: ["t3"],
+    });
+    expect(canStartRun(partial)).toBe(true);
+    expect(canStartRun(makeEpic("ready"))).toBe(true);
+    expect(canStartRun(makeEpic("blocked", { ready: false, blockedBy: ["anton-blocker"] }))).toBe(
+      false,
+    );
+  });
+});
+
+describe("childReadinessCounts", () => {
+  it("counts the run's dispatchable tickets against the total it would dispatch", () => {
+    const epic = makeEpic("partial", {
+      childReadiness: "partially-blocked",
+      readyChildren: ["t1", "t2"],
+      blockedChildren: ["t3"],
+    });
+    expect(childReadinessCounts(epic)).toEqual({ ready: 2, blocked: 1, total: 3 });
+  });
+
+  it("reports zeroes for a card built without the rollup, rather than inventing an N of M", () => {
+    expect(childReadinessCounts(makeEpic("no-graph"))).toEqual({ ready: 0, blocked: 0, total: 0 });
   });
 });
 

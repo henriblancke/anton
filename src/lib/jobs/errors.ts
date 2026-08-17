@@ -44,6 +44,12 @@ export class PoisonEpic extends PoisonError {}
 /** How a blocked-run park lists the beads holding the run back — and how it is read back. */
 const BLOCKED_BY = / is blocked by ([^—]+) — refusing to execute/;
 
+/** The clause {@link BLOCKED_BY} parses. Every blocked park is phrased through it, or the ids stop
+ * being readable back. */
+function blockedByClause(beadId: string, blockers: string[]): string {
+  return `${beadId} is blocked by ${blockers.join(", ")} — refusing to execute`;
+}
+
 /**
  * The poison a run parks on when a prerequisite is still open. Built here, next to its parser,
  * because that message is the ONLY durable record of WHICH beads held the run back: the run-health
@@ -53,8 +59,30 @@ const BLOCKED_BY = / is blocked by ([^—]+) — refusing to execute/;
  */
 export function blockedByPoison(beadId: string, blockers: string[]): PoisonEpic {
   return new PoisonEpic(
-    `${beadId} is blocked by ${blockers.join(", ")} — refusing to execute; ` +
-      `resume the run once the blocker(s) complete`,
+    `${blockedByClause(beadId, blockers)}; resume the run once the blocker(s) complete`,
+  );
+}
+
+/**
+ * The reason a run parks once it has run every ticket it could and the REST are held by a
+ * prerequisite outside this run (anton-1two). Lives beside {@link blockedByPoison} for the same
+ * reason and shares its clause: run-health must read the blocker ids back out of a partially-gated
+ * park exactly as it does an all-or-nothing one. Returns the text rather than an error so the caller
+ * can classify the park itself — this one stops a run whose earlier tickets already committed.
+ */
+export function blockedTailReason(
+  beadId: string,
+  args: { blockers: string[]; held: string[]; ran: string[] },
+): string {
+  const ran =
+    args.ran.length > 0
+      ? `${args.ran.length} ticket(s) that could run did (${args.ran.join(", ")}) and their commits ` +
+        `are on the branch, but no pull request opens until the whole run target is complete. `
+      : "";
+  return (
+    `${blockedByClause(beadId, args.blockers)} ${args.held.join(", ")} — ` +
+    `${ran}Resume the run once the blocker(s) complete and the held ticket(s) will run into this ` +
+    `same branch and its one pull request`
   );
 }
 

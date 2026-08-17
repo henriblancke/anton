@@ -4,15 +4,16 @@
  * exercised end-to-end in execute-epic.integration.test.ts.
  */
 import { describe, expect, it } from "vitest";
-import type { Bead, Gate } from "../beads/bd";
+import type { Bead, BeadDep, Gate } from "../beads/bd";
 import { formatHumanNote, parseTicketNotes } from "../beads/notes";
-import { PoisonEpic } from "./errors";
+import { blockedTailReason, poisonBlockerIds, PoisonEpic } from "./errors";
 import {
   claudeResumeDecision,
   continuationPrompt,
   inactiveAgentTickets,
   mergeGatePlan,
   reviewParkMessage,
+  runReadiness,
   runTargetDrift,
   splitFormulaPhases,
   ticketBlockNote,
@@ -133,6 +134,123 @@ describe("inactiveAgentTickets", () => {
       { id: "t-1", agent: "docker" },
       { id: "t-2", agent: "alembic" },
     ]);
+  });
+});
+
+/**
+ * anton-1two: the run gate is per TICKET, not per target. A target whose tail child waits on
+ * another run must still run the children nothing holds — the all-or-nothing verdict is what
+ * stalled a whole feature over one edge (issue #58) — while never dispatching the held one.
+ */
+describe("runReadiness — what a partially-gated run may start (anton-1two)", () => {
+  const feature = (id: string, extra: Partial<Bead> = {}): Bead =>
+    ({ id, title: id, status: "open", issue_type: "feature", ...extra }) as Bead;
+  const child = (id: string, parent: string, extra: Partial<Bead> = {}): Bead =>
+    ({ id, title: id, status: "open", issue_type: "task", parent, ...extra }) as Bead;
+  const standaloneTask = (id: string, extra: Partial<Bead> = {}): Bead =>
+    ({ id, title: id, status: "open", issue_type: "task", ...extra }) as Bead;
+  const blocks = (from: string, to: string): BeadDep => ({
+    issue_id: from,
+    depends_on_id: to,
+    type: "blocks",
+  });
+
+  /** F1 owns t-1 (independent) and t-2 (blocked by a ticket in the OTHER feature). */
+  const partiallyGated = (): Bead[] => [
+    feature("F1"),
+    feature("F2"),
+    child("t-1", "F1"),
+    child("t-2", "F1", { dependencies: [blocks("t-2", "t-9")] }),
+    child("t-9", "F2"),
+  ];
+
+  it("runs the independent children and holds only the cross-run-gated one", () => {
+    const r = runReadiness(partiallyGated(), "F1", true);
+    expect(r.runnable).toBe(true);
+    expect(r.gated).toEqual(["t-2"]);
+    // The blockers still name the UNIT that ships the blocking work, for the park reason.
+    expect(r.blockers).toEqual(["F2"]);
+  });
+
+  it("holds a child queued behind a gated sibling — inside-the-run ordering propagates", () => {
+    const board = [...partiallyGated(), child("t-3", "F1", { dependencies: [blocks("t-3", "t-2")] })];
+    const r = runReadiness(board, "F1", true);
+    expect(r.runnable).toBe(true);
+    expect(r.gated.sort()).toEqual(["t-2", "t-3"]);
+  });
+
+  it("refuses the run only when NO child can start", () => {
+    const board = [
+      feature("F1"),
+      feature("F2"),
+      child("t-1", "F1", { dependencies: [blocks("t-1", "t-9")] }),
+      child("t-2", "F1", { dependencies: [blocks("t-2", "t-9")] }),
+      child("t-9", "F2"),
+    ];
+    const r = runReadiness(board, "F1", true);
+    expect(r.runnable).toBe(false);
+    expect(r.gated.sort()).toEqual(["t-1", "t-2"]);
+  });
+
+  it("holds nothing once the blocker's run target is done", () => {
+    const board = [
+      feature("F1"),
+      feature("F2", { status: "closed" }),
+      child("t-1", "F1"),
+      child("t-2", "F1", { dependencies: [blocks("t-2", "t-9")] }),
+      child("t-9", "F2", { status: "closed" }),
+    ];
+    const r = runReadiness(board, "F1", true);
+    expect(r).toEqual({ blockers: [], gated: [], runnable: true });
+  });
+
+  it("keeps a standalone target all-or-nothing — it IS its own single ticket", () => {
+    const blocked = [
+      standaloneTask("s-1", { dependencies: [blocks("s-1", "s-2")] }),
+      standaloneTask("s-2"),
+    ];
+    expect(runReadiness(blocked, "s-1", false)).toEqual({
+      blockers: ["s-2"],
+      gated: ["s-1"],
+      runnable: false,
+    });
+    expect(runReadiness([standaloneTask("s-1")], "s-1", false)).toEqual({
+      blockers: [],
+      gated: [],
+      runnable: true,
+    });
+  });
+
+  it("lets a run whose tickets are all closed proceed — an empty set is not a blocked one", () => {
+    // The closed-PR recovery shape: nothing left to dispatch, only the agent-free PR step. Reading
+    // "no ready children" as blocked there would park a run that has nothing to wait for.
+    const board = [feature("F1"), child("t-1", "F1", { status: "closed" })];
+    expect(runReadiness(board, "F1", true).runnable).toBe(true);
+  });
+});
+
+describe("blockedTailReason — the park a held tail leaves behind (anton-1two)", () => {
+  const reason = blockedTailReason("F1", {
+    blockers: ["F2", "F3"],
+    held: ["t-2"],
+    ran: ["t-1"],
+  });
+
+  it("stays readable by the run-health parser, so a partial park reports its blockers too", () => {
+    expect(poisonBlockerIds(reason)).toEqual(["F2", "F3"]);
+  });
+
+  it("names what ran, what is held, and that no PR opens yet", () => {
+    expect(reason).toContain("t-2");
+    expect(reason).toContain("t-1");
+    expect(reason).toMatch(/no pull request opens/);
+    expect(reason).toMatch(/Resume the run once the blocker\(s\) complete/);
+  });
+
+  it("says nothing about committed work when the run had none to do", () => {
+    const nothingRan = blockedTailReason("F1", { blockers: ["F2"], held: ["t-2"], ran: [] });
+    expect(nothingRan).not.toMatch(/commits are on the branch/);
+    expect(poisonBlockerIds(nothingRan)).toEqual(["F2"]);
   });
 });
 

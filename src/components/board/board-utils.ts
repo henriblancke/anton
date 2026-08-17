@@ -233,6 +233,32 @@ export function ticketProgress(epic: { tickets: Ticket[] }): {
 }
 
 /**
+ * Can the operator start this run target now? A partially-gated target IS startable: the executor
+ * dispatches the tickets nothing holds and parks only the rest (issue #58), so hiding Approve on it
+ * would strand runnable work behind an unrelated blocker. Only a fully blocked target — zero
+ * runnable tickets — refuses. Reads the rollup's verdict, which is the same field the approve route
+ * gates on, so the card can never advertise a run approval will reject (or hide one it would take).
+ */
+export function canStartRun(epic: Pick<Epic, "childReadiness">): boolean {
+  return epic.childReadiness !== "blocked";
+}
+
+/**
+ * The N-of-M behind a partially-gated card: how many of the tickets this run would dispatch can
+ * start now, of how many in total. Counted off the rollup's own child sets so the badge can never
+ * disagree with the verdict it labels.
+ */
+export function childReadinessCounts(epic: Pick<Epic, "readyChildren" | "blockedChildren">): {
+  ready: number;
+  blocked: number;
+  total: number;
+} {
+  const ready = epic.readyChildren.length;
+  const blocked = epic.blockedChildren.length;
+  return { ready, blocked, total: ready + blocked };
+}
+
+/**
  * Dependency-aware backlog order, shared by the server board build (board.ts) and the client
  * optimistic reconcile so both agree on one order: ready epics first, then topological rank (a
  * blocker precedes what it blocks), then priority, then created-at, with id as a stable tiebreak.

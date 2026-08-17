@@ -53,6 +53,18 @@ const NODE_BUILTIN_PATHS = builtinModules.filter(
   (name) => name !== "bun" && !name.startsWith("bun:"),
 );
 
+/**
+ * The canonical display locale (anton-icda) is a repo-wide convention, and a convention nobody can
+ * see is one grep away from being re-broken. A `toLocale*` call with no locale is not "the user's
+ * locale" — it is the *server's* under SSR and the *browser's* after hydration, which is how a
+ * server-rendered client component ends up with two different strings for one timestamp.
+ */
+const HOST_LOCALE_MESSAGE =
+  "Format user-facing dates and times with DISPLAY_LOCALE from @/lib/time, not the host locale. Omitting the locale (or passing `undefined`) resolves to the server's locale during SSR and the browser's on the client, so anything that server-renders can hydrate to different text. See docs/ui-brief.md -> Foundations.";
+
+/** Every locale-sensitive `toLocale*` method — dates, times, and the string-case pair. */
+const HOST_LOCALE_CALL = "CallExpression[callee.property.name=/^toLocale/]";
+
 const eslintConfig = defineConfig([
   ...nextVitals,
   ...nextTs,
@@ -66,6 +78,19 @@ const eslintConfig = defineConfig([
     // Prebuilt release bundles (anton-1xp) — generated output, never linted.
     "dist/**",
   ]),
+  {
+    files: ["src/**/*.{ts,tsx}"],
+    rules: {
+      "no-restricted-syntax": [
+        "error",
+        { selector: `${HOST_LOCALE_CALL}[arguments.length=0]`, message: HOST_LOCALE_MESSAGE },
+        {
+          selector: `${HOST_LOCALE_CALL}[arguments.0.type="Identifier"][arguments.0.name="undefined"]`,
+          message: HOST_LOCALE_MESSAGE,
+        },
+      ],
+    },
+  },
   {
     files: CLIENT_SAFE_MODULES,
     rules: {

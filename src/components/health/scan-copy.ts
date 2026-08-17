@@ -10,6 +10,7 @@
  * panel without either pulling the other's rendering concerns along with it.
  */
 import { SCAN_SEVERITIES } from "@/lib/scan-severity";
+import { DISPLAY_LOCALE } from "@/lib/time";
 import type { ClassCounts, ScanHealth, ScanHealthPoint, SignalClass } from "@/lib/types";
 
 /** What each class of signal is, said the way a founder would say it. */
@@ -36,8 +37,14 @@ export function severitySplit(point: ScanHealthPoint): string {
   return parts.length > 0 ? parts.join(", ") : "no new signals";
 }
 
+/**
+ * Hydration-sensitive: this lands in {@link ScanTrend}'s column titles, and that "use client" chart
+ * is rendered with server-fetched props from the Health page and the board's health pill — so it
+ * server-renders, and a host-derived locale would hydrate to different text. Hence
+ * {@link DISPLAY_LOCALE}.
+ */
 export function shortDate(unixSeconds: number): string {
-  return new Date(unixSeconds * 1000).toLocaleDateString(undefined, {
+  return new Date(unixSeconds * 1000).toLocaleDateString(DISPLAY_LOCALE, {
     month: "short",
     day: "numeric",
   });

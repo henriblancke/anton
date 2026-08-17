@@ -13,6 +13,9 @@ function epic(id: string, over: Partial<EpicGraphNode> = {}): EpicGraphNode {
     blockedBy: [],
     ready: true,
     rank: 0,
+    readyChildren: [],
+    blockedChildren: [],
+    childReadiness: "ready",
     ...over,
   };
 }
