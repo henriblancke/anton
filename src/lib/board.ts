@@ -179,7 +179,14 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
 
   // Derive epic→epic dependency rollup once (blockedBy/ready/rank), so the board reflects the
   // readiness the runtime's bd-ready enforces. Degrades to a stable order on a cycle (epic-graph.ts).
-  const graphNodes = new Map(computeEpicGraph(workBeads).epics.map((n) => [n.id, n]));
+  //
+  // Over `allBeads`, not the pipeline-stripped `workBeads`: the rollup's per-child readiness reads a
+  // blocker missing from the list as still open (fail-safe), so stripping the gate beads would make
+  // every RESOLVED gate — and every in-review target's own `gh:pr` merge gate, which `isOwnMergeWait`
+  // can only recognise from the bead — read as a permanent open blocker, exactly the state
+  // loadAllIssues reads gates to prevent. It adds no node and no edge: `isUnit` rejects gate/molecule
+  // and the rollup attributes pipeline artifacts to no unit.
+  const graphNodes = new Map(computeEpicGraph(allBeads).epics.map((n) => [n.id, n]));
 
   for (const card of cardBeads) {
     const children = childrenByCard.get(card.id) ?? [];

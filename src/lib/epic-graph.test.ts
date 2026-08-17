@@ -399,6 +399,31 @@ describe("per-run-target child readiness", () => {
     expect(node(g, "FA").readyChildren).toEqual(["a1"]);
   });
 
+  it("releases a child whose only blocker is a RESOLVED gate — the gate bead must be in the read", () => {
+    // A `human` gate is a real wait, so it holds while open; `bd gate resolve` closes the bead and
+    // the hold ends. Both verdicts need the gate BEAD (loadAllIssues reads it via `--type gate`) —
+    // over a gate-stripped list the missing-blocker fail-safe would read it as open forever, and the
+    // run target would sit permanently blocked with nothing on the board to explain why.
+    const gate = (status: string): Bead =>
+      ({ id: "G", title: "Gate: human", status, issue_type: "gate", await_type: "human" }) as Bead;
+    const beadsOf = (g: Bead) => [
+      feature("FA"),
+      ticket("a1", "FA", { dependencies: [blocks("a1", "G")] }),
+      g,
+    ];
+
+    const open = graphOf(beadsOf(gate("open")));
+    expect(node(open, "FA").childReadiness).toBe("blocked");
+    expect(node(open, "FA").blockedChildren).toEqual(["a1"]);
+
+    const resolved = graphOf(beadsOf(gate("closed")));
+    expect(node(resolved, "FA").childReadiness).toBe("ready");
+    expect(node(resolved, "FA").readyChildren).toEqual(["a1"]);
+    // The gate is plumbing, not work: it carries no node and draws no edge either way.
+    expect(resolved.epics.map((n) => n.id)).toEqual(["FA"]);
+    expect(resolved.edges).toEqual([]);
+  });
+
   it("rolls a task under a feature up to the FEATURE, so the epic above reports no held work", () => {
     const g = graphOf([
       epic("E"),
