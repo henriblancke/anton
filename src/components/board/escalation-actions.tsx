@@ -20,8 +20,13 @@ const ACTION_DETAIL: Record<string, string> = {
   "job-restarted": "Not stopped — the job is running again, so it was left alone",
   dismissed: "Dismissed — anton raises it again if it's still stuck at the next sweep",
   "gate-resolved": "Gate closed — the wait is over; there was no run left to restart",
-  "gate-still-blocked":
-    "Gate closed — this work is still held by another blocker, so anton starts it once that clears",
+  // Names no blocker and promises no restart, deliberately. This ONE detail covers every reason the
+  // board refused the dispatch — unapproved, abandoned, claimed by another operator, already in
+  // review, held by a second gate, running on another machine, or a board that wouldn't read — and
+  // only one of those clears on its own. Naming "another blocker" sends a founder whose target is
+  // simply unapproved off to wait for something that was never going to happen. The route returns
+  // the real reason as `note`, printed underneath; this line is what stays true when there isn't one.
+  "gate-still-blocked": "Gate closed — the work isn't starting yet",
   "target-gone": "Nothing to act on — this work was deleted from the board, so the alert is cleared",
   "target-closed": "Nothing to act on — this work is already closed, so the alert is cleared",
 };
@@ -97,10 +102,16 @@ export function EscalationActions({
         body: JSON.stringify({ action }),
       });
       const body = (await res.json().catch(() => null)) as
-        | { error?: string; detail?: string }
+        | { error?: string; detail?: string; note?: string }
         | null;
       if (!res.ok) throw new Error(body?.error ?? `Request failed (${res.status})`);
-      toast.success(ACTION_DETAIL[body?.detail ?? ""] ?? FALLBACK_DETAIL[action]);
+      const said = ACTION_DETAIL[body?.detail ?? ""] ?? FALLBACK_DETAIL[action];
+      // The server's own prose for WHY, on the one detail whose line can't carry it (see
+      // `gate-still-blocked`). Already phrased as a clause — "it is not approved", "it is claimed by
+      // bob" — so it reads as a sentence here without reformatting. Branching rather than passing
+      // `undefined`: a toast with no reason should be the same one-argument call it always was.
+      if (body?.note) toast.success(said, { description: `Held because ${body.note}.` });
+      else toast.success(said);
       // The panel is server-rendered, so a refresh is what removes the settled row.
       router.refresh();
     } catch (err) {

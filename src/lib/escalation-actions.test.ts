@@ -924,6 +924,9 @@ describe("actOnEscalation — a wait on a person", () => {
     expect(await actOnEscalation(project, escalation.id, "resume")).toMatchObject({
       ok: true,
       detail: "gate-still-blocked",
+      // The one hold the panel's bare copy describes correctly — and it still names WHICH blocker,
+      // because "another blocker" left unnamed is not something the founder can go and clear.
+      note: "it is still blocked by g-2",
     });
     expect(gateResolve).toHaveBeenCalledWith(project.repoPath, "g-1", expect.any(String));
     expect(resumeStalledEpic).not.toHaveBeenCalled();
@@ -937,9 +940,13 @@ describe("actOnEscalation — a wait on a person", () => {
     loadAllIssues.mockResolvedValue([{ ...bead([]) } as Bead]);
     const escalation = await openGateWait();
 
+    // The reason travels WITH the detail. `gate-still-blocked` on its own reads as "a blocker will
+    // clear" — but nothing clears here until the founder approves the target, so a panel with only
+    // the detail to go on sends them off to wait for an event that never fires.
     expect(await actOnEscalation(project, escalation.id, "resume")).toMatchObject({
       ok: true,
       detail: "gate-still-blocked",
+      note: "it is not approved",
     });
     expect(gateResolve).toHaveBeenCalled();
     expect(resumeStalledEpic).not.toHaveBeenCalled();
@@ -954,6 +961,8 @@ describe("actOnEscalation — a wait on a person", () => {
     expect(await actOnEscalation(project, (await openGateWait()).id, "resume")).toMatchObject({
       ok: true,
       detail: "gate-still-blocked",
+      // Names the holder: this hold ends on another machine, not on anything here.
+      note: "it is claimed by bob",
     });
     expect(resumeStalledEpic).not.toHaveBeenCalled();
   });
@@ -966,6 +975,7 @@ describe("actOnEscalation — a wait on a person", () => {
     expect(await actOnEscalation(project, (await openGateWait()).id, "resume")).toMatchObject({
       ok: true,
       detail: "gate-still-blocked",
+      note: "its PR is in review",
     });
     expect(resumeStalledEpic).not.toHaveBeenCalled();
   });
@@ -973,7 +983,12 @@ describe("actOnEscalation — a wait on a person", () => {
   it("marks the gate handed back once the resume lands, and pushes the mark", async () => {
     // A resolved gate stays on its bead forever, so without the marker gate-check's `plainGateResumes`
     // re-dispatches this same target every ten minutes — re-running a resume the founder made once.
-    await actOnEscalation(project, (await openGateWait()).id, "resume");
+    // No `note` either: it exists to explain a HOLD, so a resume that LANDED carries none and the
+    // panel shows the plain success line with no stray "Held because …" under it.
+    expect(await actOnEscalation(project, (await openGateWait()).id, "resume")).toMatchObject({
+      ok: true,
+      note: undefined,
+    });
 
     expect(beadsTag).toHaveBeenCalledWith(project.repoPath, "g-1", [GATE_RESUMED_LABEL]);
     expect(beadsTag.mock.invocationCallOrder[0]).toBeGreaterThan(
@@ -1331,6 +1346,9 @@ describe("actOnEscalation — a wait on a person", () => {
     expect(await actOnEscalation(project, escalation.id, "resume")).toMatchObject({
       ok: true,
       detail: "gate-still-blocked",
+      // Reported as what it is. This hold is not a blocker at all — it is anton failing to read the
+      // board — and telling the founder to wait for it to "clear" hides a fault behind a feature.
+      note: "its board could not be read",
     });
     expect(gateResolve).toHaveBeenCalled();
     expect(resumeStalledEpic).not.toHaveBeenCalled();

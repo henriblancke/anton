@@ -104,8 +104,30 @@ export type EscalationActionFailure =
   | "unverified";
 
 export type EscalationActionResult =
-  | { ok: true; action: EscalationAction; escalation: EscalationView; detail: string }
+  | {
+      ok: true;
+      action: EscalationAction;
+      escalation: EscalationView;
+      detail: string;
+      note?: string;
+    }
   | { ok: false; reason: EscalationActionFailure };
+
+/**
+ * What an applied verb reports back. `detail` is the fixed key the panel has copy for; `note` is the
+ * prose behind it, carried only where that key alone would MISLEAD.
+ *
+ * Which today means the hold: `gate-still-blocked` covers a target that is unapproved, abandoned,
+ * claimed by another operator, already in review, blocked by a second gate, running on another
+ * machine, or on a board that wouldn't read — and only one of those is a blocker that clears on its
+ * own. One line of copy for all of them promises a recovery that mostly never comes. The reason is
+ * already prose for exactly this purpose ({@link undispatchableReason}), so it is handed on to the
+ * operator rather than left in the server log.
+ */
+interface Applied {
+  detail: string;
+  note?: string;
+}
 
 /** The abandon reason recorded on the bead — the escalation's own evidence, capped to bd's limit. */
 function abandonReason(escalation: EscalationView): string {
@@ -214,15 +236,15 @@ export async function actOnEscalation(
     return { ok: false, reason: "not-open" };
   }
 
-  const apply = (): Promise<string> => {
+  const apply = async (): Promise<Applied> => {
     if (gateId) return answerGateWait(project, action, view, gateId, liveTarget);
-    if (liveTarget) return actOnBead(project, action, view, liveTarget);
-    return actOnJob(project.id, action, view.jobId!);
+    if (liveTarget) return { detail: await actOnBead(project, action, view, liveTarget) };
+    return { detail: await actOnJob(project.id, action, view.jobId!) };
   };
 
   try {
-    const detail = await apply();
-    return { ok: true, action, escalation: view, detail };
+    const { detail, note } = await apply();
+    return { ok: true, action, escalation: view, detail, note };
   } catch (e) {
     // The abandon's own boundary check caught a resume that landed after the settle: it refused
     // before touching anything, so the run is still executing and the bead is still open. That is the
@@ -433,11 +455,11 @@ async function answerGateWait(
   view: EscalationView,
   gateId: string,
   target?: string,
-): Promise<string> {
+): Promise<Applied> {
   if (action === "abandon") {
     const detail = target ? await actOnBead(project, action, view, target) : undefined;
     await resolveGate(project, gateId, gateReason(view, action));
-    return detail ?? "gate-resolved";
+    return { detail: detail ?? "gate-resolved" };
   }
   await resolveGate(project, gateId, gateReason(view, action));
   const dispatch = await gateDispatch(project, gateId, target);
@@ -445,24 +467,28 @@ async function answerGateWait(
     console.info(
       `[unstick] gate ${gateId} resolved, but it no longer releases anything anton runs — not resuming`,
     );
-    return "gate-resolved";
+    return { detail: "gate-resolved" };
   }
   if (dispatch.verdict === "hold") {
     const on = dispatch.target ? ` on ${dispatch.target}` : "";
-    const note =
+    const line =
       `[unstick] gate resolved${on}, but ${dispatch.reason} — not resuming; ` +
       `gate-check dispatches it once the board reads clear`;
     // A board that didn't answer is an anomaly worth the louder level; a board that answered "not
     // yet" is the feature working.
-    if (dispatch.unread) console.warn(note);
-    else console.info(note);
-    return "gate-still-blocked";
+    if (dispatch.unread) console.warn(line);
+    else console.info(line);
+    // The reason goes back with the detail (see {@link Applied}), not just into this log. "Still
+    // blocked" is the only hold the panel's one line describes truthfully, and it is not the common
+    // one: a founder told the work resumes "once that clears" for a target they never approved is
+    // waiting on an event that never fires.
+    return { detail: "gate-still-blocked", note: dispatch.reason };
   }
   // Reuses the automatic path's own verb, so a resolve-and-resume and a gate-check resume of the
   // same target are the same idempotent call — whichever lands second is absorbed as a no-op.
   const outcome = await resumeStalledEpic(project.id, dispatch.target);
   await markGatesResumed(project, dispatch.gates);
-  return outcome;
+  return { detail: outcome };
 }
 
 /**

@@ -52,6 +52,9 @@ export const POST = withProject<{ slug: string; escalationId: string }>(
       return NextResponse.json({
         action: result.action,
         detail: result.detail,
+        // Sent only where the detail alone would mislead — today the gate hold, whose reason is the
+        // difference between "wait, it starts itself" and "approve it or nothing happens".
+        note: result.note,
         escalations: await openEscalations(project.id),
       });
     } catch (err) {
