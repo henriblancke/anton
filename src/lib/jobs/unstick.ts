@@ -513,7 +513,11 @@ export async function unstickPass(
   const blockedJobWaits = orphanRows.filter(
     (row) => row.kind === "exhausted-job" && poisonBlockerIds(row.reason) !== undefined,
   );
-  // Everything else: the general retirement, one live re-check per kind (see {@link settleEndedStalls}).
+  // The general retirement, one live re-check per kind (see {@link settleEndedStalls}). Gate-blocked
+  // rows stay in this set on purpose rather than being carved out: the gate path above retires one
+  // only while a gate still owns its whole wait, so this is the fallback for the job itself ending
+  // (resumed, vanished, or blocked by an ordinary prerequisite too) — without it those rows would
+  // have no re-check at all. Rows the gate path just settled are dropped below, not re-read.
   const endedStalls = orphanRows.filter((row) => row.kind !== "needs-human");
   if (findings.length === 0 && gateWaits.length === 0 && endedStalls.length === 0) {
     return summary;
@@ -598,8 +602,10 @@ export async function unstickPass(
     await heartbeat();
   }
 
+  let gateBlockedSettled: ReadonlySet<string> = new Set();
   if (blockedJobWaits.length > 0) {
-    summary.settled += await settleGateBlockedJobWaits(db, clock, repoPath, blockedJobWaits);
+    gateBlockedSettled = await settleGateBlockedJobWaits(db, clock, repoPath, blockedJobWaits);
+    summary.settled += gateBlockedSettled.size;
     await heartbeat();
   }
 
@@ -615,8 +621,10 @@ export async function unstickPass(
     signal: opts.signal,
   };
 
-  if (endedStalls.length > 0) {
-    summary.settled += await settleEndedStalls(db, clock, endedStalls, live);
+  // A row the gate path already retired needs no second live re-read to reach the same verdict.
+  const unsettledStalls = endedStalls.filter((row) => !gateBlockedSettled.has(row.id));
+  if (unsettledStalls.length > 0) {
+    summary.settled += await settleEndedStalls(db, clock, unsettledStalls, live);
   }
 
   // Same reason, one gh/job read per stale-pr / exhausted-job finding.
@@ -950,21 +958,24 @@ async function readHumanGateIds(repoPath: string): Promise<Set<string> | undefin
  *
  * `dismissed`, like {@link settleEndedGateWaits}: the row is retired because it was never a stall of
  * its own, not because anton acted on it. Fails OPEN on an unreadable gate list, for the same reason.
+ *
+ * Returns the ids it retired, so the general retirement — which keeps these rows as its fallback for
+ * the job itself ending — can skip the ones already decided here.
  */
 async function settleGateBlockedJobWaits(
   db: AntonDb,
   clock: Clock,
   repoPath: string,
   waits: EscalationRow[],
-): Promise<number> {
+): Promise<ReadonlySet<string>> {
+  const settled = new Set<string>();
   const humanGateIds = await readHumanGateIds(repoPath);
-  if (!humanGateIds) return 0;
-  let settled = 0;
+  if (!humanGateIds) return settled;
   for (const wait of waits) {
     const blockers = poisonBlockerIds(wait.reason);
     if (!blockers?.every((id) => humanGateIds.has(id))) continue;
     if (!(await settleEscalation(db, clock, wait.id, "dismissed"))) continue;
-    settled += 1;
+    settled.add(wait.id);
     console.log(
       `[unstick] settled escalation ${wait.id} (${wait.findingKey}): the job it reports is parked ` +
         `on a human gate, which carries that wait on its own`,

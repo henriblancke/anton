@@ -1280,6 +1280,9 @@ describe("open escalations are retired once the stall they report ends", () => {
 
     expect(await sweep()).toMatchObject({ findings: 0, settled: 0 });
     expect(escalationRows().map((r) => r.status)).toEqual(["open", "open"]);
+    // Idempotent in the other direction too: repeated passes over the same live stalls settle nothing.
+    expect(await sweep()).toMatchObject({ settled: 0 });
+    expect(escalationRows().map((r) => r.status)).toEqual(["open", "open"]);
   });
 
   it("keeps a stale-pr row the PR re-read can't reach — silence is no evidence a stall ended", async () => {
