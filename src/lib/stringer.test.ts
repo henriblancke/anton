@@ -602,7 +602,9 @@ describe("scan", () => {
       const result = await scan({ repoPath: repo, scanFile });
 
       expect(result.signals).toMatchObject([{ FilePath: "keep.bin", AntonSeverity: "medium" }]);
-      expect(result.untracked).toEqual({ dropped: 1, paths: ["phantom.db"] });
+      expect(result.untracked).toEqual({
+        dropped: [{ path: "phantom.db", kind: "large-binary", severity: "medium" }],
+      });
       // Same set on both sides of the seam: the health record counts `signals`, triage reads the file.
       const written = JSON.parse(readFileSync(scanFile, "utf8")) as {
         signals: { FilePath: string }[];
@@ -623,7 +625,7 @@ describe("scan", () => {
       const result = await scan({ repoPath: repo, scanFile });
 
       expect(result.signals).toHaveLength(2);
-      expect(result.untracked).toEqual({ dropped: 0, paths: [] });
+      expect(result.untracked).toEqual({ dropped: [] });
       expect(
         (JSON.parse(readFileSync(scanFile, "utf8")) as { FilePath: string }[]).map((s) => s.FilePath),
       ).toEqual(["keep.bin", "src/app.ts"]);
@@ -645,7 +647,45 @@ describe("scan", () => {
       const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
 
       expect(result.signals).toHaveLength(4);
-      expect(result.untracked.dropped).toBe(0);
+      expect(result.untracked.dropped).toEqual([]);
+    });
+
+    // How a collector SPELLS a path must not decide the drop: `src/../keep.bin` is absent from the
+    // index verbatim, but it is the same tracked file as `keep.bin` — matching literally would
+    // delete a real finding about a committed file.
+    it("resolves `./` and mid-path traversals before asking git", async () => {
+      const repo = initRepo({ "keep.bin": "committed", ".gitignore": "phantom.db\n" });
+      writeFileSync(join(repo, "phantom.db"), "local database", "utf8");
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        largeBinary("src/../keep.bin"),
+        largeBinary("./phantom.db"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/../keep.bin" }]);
+      expect(result.untracked.dropped).toEqual([
+        { path: "phantom.db", kind: "large-binary", severity: "medium" },
+      ]);
+    });
+
+    // The drop log is the only place a filtered finding still exists, so it has to carry what was
+    // lost: a gitignored file holding a secret must not read as one more stale-binary phantom.
+    it("records the kind and pre-filter severity of every drop", async () => {
+      const repo = initRepo({ ".gitignore": "phantom.db\nsecrets.env\n", "keep.bin": "committed" });
+      writeFileSync(join(repo, "phantom.db"), "local database", "utf8");
+      writeFileSync(join(repo, "secrets.env"), "TOKEN=1", "utf8");
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        largeBinary("phantom.db"),
+        { ...largeBinary("secrets.env"), Kind: "committed-secret", Tags: ["secret"] },
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.untracked.dropped).toEqual([
+        { path: "phantom.db", kind: "large-binary", severity: "medium" },
+        { path: "secrets.env", kind: "committed-secret", severity: "critical" },
+      ]);
     });
 
     // A filter that can't prove a file is untracked must under-filter rather than delete findings —
@@ -660,7 +700,7 @@ describe("scan", () => {
       const result = await scan({ repoPath: notARepo, scanFile: join(dir, "scan.json") });
 
       expect(result.signals).toHaveLength(1);
-      expect(result.untracked.dropped).toBe(0);
+      expect(result.untracked.dropped).toEqual([]);
       expect(result.untracked.unavailable).toBeTruthy();
     });
   });
@@ -760,22 +800,47 @@ describe("parseCollectorFailures", () => {
 // A silent filter is indistinguishable from a collector that found nothing, so every drop has to be
 // legible on the session that made it.
 describe("describeUntrackedFilter", () => {
-  it("names what disappeared, stays quiet when nothing did, and reports an unreadable index", () => {
-    expect(describeUntrackedFilter({ dropped: 0, paths: [] })).toBeUndefined();
+  const drop = (path: string, kind = "large-binary", severity = "medium") => ({
+    path,
+    kind,
+    severity,
+  });
 
-    const line = describeUntrackedFilter({ dropped: 2, paths: ["anton.db", "scratch/notes.bin"] });
+  it("names what disappeared, stays quiet when nothing did, and reports an unreadable index", () => {
+    expect(describeUntrackedFilter({ dropped: [] })).toBeUndefined();
+
+    const line = describeUntrackedFilter({
+      dropped: [drop("anton.db"), drop("scratch/notes.bin")],
+    });
     expect(line).toContain("dropped 2 signal(s)");
-    expect(line).toContain("anton.db, scratch/notes.bin");
+    expect(line).toContain("about 2 path(s)");
+    expect(line).toContain("anton.db (medium large-binary)");
+    expect(line).toContain("scratch/notes.bin (medium large-binary)");
 
     const many = describeUntrackedFilter({
-      dropped: 12,
-      paths: Array.from({ length: 12 }, (_, i) => `f${i}.db`),
+      dropped: Array.from({ length: 12 }, (_, i) => drop(`f${i}.db`)),
     });
     expect(many).toContain("(+2 more)");
 
-    const blind = describeUntrackedFilter({ dropped: 0, paths: [], unavailable: "not a git repo" });
+    const blind = describeUntrackedFilter({ dropped: [], unavailable: "not a git repo" });
     expect(blind).toContain("not a git repo");
     expect(blind).toContain("are counted this pass");
+  });
+
+  // Triage turns on WHAT vanished, not how much: a dropped secret has to be distinguishable from
+  // the stale-binary noise this filter exists to remove, even when they share a path.
+  it("names the severity and kind behind each dropped path", () => {
+    const line = describeUntrackedFilter({
+      dropped: [
+        drop("config/.env", "committed-secret", "critical"),
+        drop("config/.env", "large-binary"),
+        drop("anton.db"),
+      ],
+    });
+
+    expect(line).toContain("dropped 3 signal(s) about 2 path(s)");
+    expect(line).toContain("config/.env (critical committed-secret, medium large-binary)");
+    expect(line).toContain("anton.db (medium large-binary)");
   });
 });
 

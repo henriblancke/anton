@@ -137,7 +137,9 @@ describe.runIf(stringerAvailable())("scan of a repo holding an untracked binary"
       }),
     );
     expect(result.signals.map(filePathOf)).not.toContain("phantom.db");
-    expect(result.untracked.paths).toEqual(["phantom.db"]);
-    expect(result.untracked.dropped).toBeGreaterThan(0);
+    // Kind is stringer's to spell, so only the path is pinned — but every drop carries one, which
+    // is what keeps a filtered secret distinguishable from a filtered stale binary on the session.
+    expect(result.untracked.dropped.map((d) => d.path)).toEqual(["phantom.db"]);
+    expect(result.untracked.dropped.every((d) => d.kind && d.severity)).toBe(true);
   });
 });

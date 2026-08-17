@@ -11,8 +11,8 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import { readFile, writeFile, mkdir, rm } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, sep } from "node:path";
-import { annotateSignal, collectorOf, type ScanSignal } from "./scan-severity";
+import { dirname, isAbsolute, join, normalize, relative, sep } from "node:path";
+import { annotateSignal, collectorOf, severityOfSignal, type ScanSignal } from "./scan-severity";
 import { PoisonError } from "./jobs/errors";
 
 const execFileAsync = promisify(execFile);
@@ -411,12 +411,25 @@ function describeShape(parsed: unknown): string {
  */
 const TRACKED_ONLY_COLLECTORS = new Set(["githygiene"]);
 
-/** What the untracked filter did to this scan — the count is surfaced, never a silent drop. */
+/**
+ * One finding the filter removed. The path alone doesn't say what was lost — `githygiene` reports
+ * committed secrets beside stale binaries, so a drop is logged with what the signal CLAIMED and the
+ * severity it would have carried. An operator reading the session must be able to tell "routine
+ * hygiene noise" from "a secret anton stopped watching" without re-running the scan.
+ */
+export interface DroppedSignal {
+  /** The repo-relative path, as git would spell it. */
+  path: string;
+  /** stringer's `Kind` for the finding — its collector, when the signal named no kind. */
+  kind: string;
+  /** The severity the signal would have been counted at, derived before the drop. */
+  severity: string;
+}
+
+/** What the untracked filter did to this scan — every drop is surfaced, never silent. */
 export interface UntrackedFilter {
-  /** Signals dropped because git does not track the file they are about. */
-  dropped: number;
-  /** The distinct paths behind those drops, so a reader can see WHAT disappeared. */
-  paths: string[];
+  /** The signals dropped because git does not track the file they are about. */
+  dropped: DroppedSignal[];
   /**
    * Why git could not be asked, when it couldn't be. Nothing is dropped in that case: a filter that
    * can't prove a file is untracked must leave the signal in, so an unreadable repo under-filters
@@ -430,8 +443,11 @@ async function readTrackedPaths(repoPath: string): Promise<Set<string> | { unava
   try {
     // -z for the same reason git/ops.ts uses it: under core.quotePath a non-ASCII path comes back
     // C-quoted, and a mangled path would read as untracked and drop a real finding.
+    // 30s, not the scan's own budget: `ls-files` reads the index and returns in well under a second
+    // even on a huge monorepo, so anything near the deadline is git stuck (stale lock, dead NFS
+    // mount) — and a stuck git should surface fast rather than hold the scan slot for minutes.
     const { stdout } = await execFileAsync("git", ["-C", repoPath, "ls-files", "-z"], {
-      timeout: 120_000,
+      timeout: 30_000,
       maxBuffer: 64 * 1024 * 1024,
     });
     return new Set(stdout.split("\0").filter(Boolean));
@@ -448,9 +464,18 @@ async function readTrackedPaths(repoPath: string): Promise<Set<string> | { unava
 function repoRelativePath(repoPath: string, signal: ScanSignal): string | undefined {
   const raw = signal.FilePath ?? signal.filePath;
   if (typeof raw !== "string" || !raw) return undefined;
-  const rel = isAbsolute(raw) ? relative(repoPath, raw) : raw.replace(/^\.\//, "");
+  // normalize, not a `./` strip: it also collapses mid-path traversals, so a collector spelling a
+  // tracked file `src/../app.ts` matches the index instead of missing it and losing a real finding.
+  const rel = isAbsolute(raw) ? relative(repoPath, raw) : normalize(raw);
   if (!rel || rel === "." || rel === ".." || rel.startsWith(`..${sep}`)) return undefined;
   return rel;
+}
+
+/** What a signal says it found, falling back to its collector when it named no kind. */
+function kindOf(signal: ScanSignal): string {
+  const kind = signal.Kind ?? signal.kind;
+  if (typeof kind === "string" && kind) return kind;
+  return collectorOf(signal) || "unknown";
 }
 
 /**
@@ -486,27 +511,30 @@ async function dropUntrackedSignals(
     const path = repoRelativePath(repoPath, signal);
     if (path) candidates.set(signal, path);
   }
-  if (candidates.size === 0) return { kept: signals, untracked: { dropped: 0, paths: [] } };
+  if (candidates.size === 0) return { kept: signals, untracked: { dropped: [] } };
 
   const tracked = await readTrackedPaths(repoPath);
   if (!(tracked instanceof Set)) {
-    return { kept: signals, untracked: { dropped: 0, paths: [], ...tracked } };
+    return { kept: signals, untracked: { dropped: [], ...tracked } };
   }
 
-  const dropped = new Set<string>();
+  const dropped: DroppedSignal[] = [];
   const kept = signals.filter((signal) => {
     const path = candidates.get(signal);
     if (path === undefined || isTracked(tracked, path)) return true;
-    dropped.add(path);
+    dropped.push({ path, kind: kindOf(signal), severity: severityOfSignal(signal) });
     return false;
   });
-  return {
-    kept,
-    untracked: { dropped: signals.length - kept.length, paths: [...dropped] },
-  };
+  return { kept, untracked: { dropped } };
 }
 
-/** How many findings the untracked filter removed and from where; undefined when it removed none. */
+/**
+ * What the untracked filter removed, and what each drop CLAIMED; undefined when it removed nothing.
+ *
+ * Each path carries its findings' severity and kind, because that is what an operator triages on: a
+ * dropped `medium large-binary` is the phantom this filter exists for, a dropped `critical
+ * committed-secret` is anton going quiet about a leaked key and wants a look.
+ */
 export function describeUntrackedFilter(filter: UntrackedFilter): string | undefined {
   if (filter.unavailable) {
     return (
@@ -514,12 +542,20 @@ export function describeUntrackedFilter(filter: UntrackedFilter): string | undef
       `git does not track are counted this pass`
     );
   }
-  if (filter.dropped === 0) return undefined;
-  const shown = filter.paths.slice(0, 10);
-  const rest = filter.paths.length - shown.length;
+  if (filter.dropped.length === 0) return undefined;
+  const byPath = new Map<string, Set<string>>();
+  for (const { path, kind, severity } of filter.dropped) {
+    const kinds = byPath.get(path) ?? new Set<string>();
+    kinds.add(`${severity} ${kind}`);
+    byPath.set(path, kinds);
+  }
+  // "; " between paths, since each entry already spends ", " on its kinds.
+  const entries = [...byPath].map(([path, kinds]) => `${path} (${[...kinds].join(", ")})`);
+  const shown = entries.slice(0, 10);
+  const rest = entries.length - shown.length;
   return (
-    `dropped ${filter.dropped} signal(s) about ${filter.paths.length} path(s) git does not track: ` +
-    `${shown.join(", ")}${rest > 0 ? ` (+${rest} more)` : ""}`
+    `dropped ${filter.dropped.length} signal(s) about ${byPath.size} path(s) git does not track: ` +
+    `${shown.join("; ")}${rest > 0 ? ` (+${rest} more)` : ""}`
   );
 }
 
