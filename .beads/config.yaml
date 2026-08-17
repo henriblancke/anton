@@ -68,4 +68,4 @@ export.git-add: false
 # - github.token    → use GITHUB_TOKEN env var instead
 
 dolt.auto-push: false
-sync.remote: "git@github.com:henriblancke/anton.git"
+sync.remote: "git+ssh://git@github.com/henriblancke/anton.git"
