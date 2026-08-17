@@ -11,8 +11,8 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import { readFile, writeFile, mkdir, rm } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { annotateSignal, type ScanSignal } from "./scan-severity";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
+import { annotateSignal, collectorOf, type ScanSignal } from "./scan-severity";
 import { PoisonError } from "./jobs/errors";
 
 const execFileAsync = promisify(execFile);
@@ -163,6 +163,8 @@ export interface ScanResult {
   signals: ScanSignal[];
   /** Collectors that died during the scan — their signals are silently absent from the JSON. */
   collectorFailures: CollectorFailure[];
+  /** What the untracked-file filter removed from `signals` before anyone counted them. */
+  untracked: UntrackedFilter;
   /** Which baseline this scan measured against, and which one it left (see {@link DeltaState}). */
   deltaState: DeltaState;
   /**
@@ -367,13 +369,25 @@ const SIGNAL_ENVELOPE_KEYS = ["signals", "issues", "results"] as const;
  */
 export function extractSignals(parsed: unknown): ScanSignal[] | undefined {
   if (Array.isArray(parsed)) return parsed as ScanSignal[];
-  if (parsed && typeof parsed === "object") {
-    const o = parsed as Record<string, unknown>;
-    for (const key of SIGNAL_ENVELOPE_KEYS) {
-      if (Array.isArray(o[key])) return o[key] as ScanSignal[];
-    }
-  }
-  return undefined;
+  const key = envelopeKeyOf(parsed);
+  return key ? ((parsed as Record<string, unknown>)[key] as ScanSignal[]) : undefined;
+}
+
+/** Which key {@link extractSignals} read the signals out of; undefined for an array or a shape it can't read. */
+function envelopeKeyOf(parsed: unknown): (typeof SIGNAL_ENVELOPE_KEYS)[number] | undefined {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  const o = parsed as Record<string, unknown>;
+  return SIGNAL_ENVELOPE_KEYS.find((key) => Array.isArray(o[key]));
+}
+
+/**
+ * The scan file with a REPLACED signal list, in whatever shape it arrived in — so a filtered signal
+ * is gone from the file triage reads, not just from the array anton counted. Everything else the
+ * envelope carries (stringer's metadata) rides through untouched.
+ */
+function withSignals(parsed: unknown, signals: ScanSignal[]): unknown {
+  const key = envelopeKeyOf(parsed);
+  return key ? { ...(parsed as Record<string, unknown>), [key]: signals } : signals;
 }
 
 /** What the unrecognized output looked like, so an operator can tell a rename from a broken write. */
@@ -382,6 +396,131 @@ function describeShape(parsed: unknown): string {
   if (typeof parsed !== "object") return typeof parsed;
   const keys = Object.keys(parsed as Record<string, unknown>);
   return keys.length > 0 ? `object with keys: ${keys.join(", ")}` : "empty object";
+}
+
+/**
+ * Collectors whose findings are a claim about the REPOSITORY, so a file git doesn't track can't
+ * support one. `githygiene` reports large binaries, mixed line endings and conflict markers off the
+ * working tree, not the index: every scan of this repo flagged anton's own `anton.db` — gitignored
+ * three times over and unknown to `git ls-files` — as a medium-severity "large binary file",
+ * unactionable by construction and re-triaged every night (anton-j2zg).
+ *
+ * Deliberately not every collector: a `todos` or `patterns` finding is about the source in front of
+ * you and reads the same whether or not it is committed yet, and a signal naming no file at all is
+ * never in question. This drops only what git can positively contradict.
+ */
+const TRACKED_ONLY_COLLECTORS = new Set(["githygiene"]);
+
+/** What the untracked filter did to this scan — the count is surfaced, never a silent drop. */
+export interface UntrackedFilter {
+  /** Signals dropped because git does not track the file they are about. */
+  dropped: number;
+  /** The distinct paths behind those drops, so a reader can see WHAT disappeared. */
+  paths: string[];
+  /**
+   * Why git could not be asked, when it couldn't be. Nothing is dropped in that case: a filter that
+   * can't prove a file is untracked must leave the signal in, so an unreadable repo under-filters
+   * rather than silently deleting findings.
+   */
+  unavailable?: string;
+}
+
+/** Everything in the index, exactly as git spells it — or why anton couldn't ask. */
+async function readTrackedPaths(repoPath: string): Promise<Set<string> | { unavailable: string }> {
+  try {
+    // -z for the same reason git/ops.ts uses it: under core.quotePath a non-ASCII path comes back
+    // C-quoted, and a mangled path would read as untracked and drop a real finding.
+    const { stdout } = await execFileAsync("git", ["-C", repoPath, "ls-files", "-z"], {
+      timeout: 120_000,
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    return new Set(stdout.split("\0").filter(Boolean));
+  } catch (err) {
+    return { unavailable: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * A signal's path as git would spell it, or undefined when it isn't one git can be asked about:
+ * no path, the repo root itself (collectors spell it `.`), or a path outside the scanned repo.
+ * None of those is evidence of anything.
+ */
+function repoRelativePath(repoPath: string, signal: ScanSignal): string | undefined {
+  const raw = signal.FilePath ?? signal.filePath;
+  if (typeof raw !== "string" || !raw) return undefined;
+  const rel = isAbsolute(raw) ? relative(repoPath, raw) : raw.replace(/^\.\//, "");
+  if (!rel || rel === "." || rel === ".." || rel.startsWith(`..${sep}`)) return undefined;
+  return rel;
+}
+
+/**
+ * Whether git tracks this path. A path with tracked files UNDER it counts: a signal can name a
+ * directory, which is never itself in the index but is plainly part of the repo.
+ */
+function isTracked(tracked: Set<string>, path: string): boolean {
+  if (tracked.has(path)) return true;
+  const prefix = path.endsWith("/") ? path : `${path}/`;
+  for (const file of tracked) {
+    if (file.startsWith(prefix)) return true;
+  }
+  return false;
+}
+
+/**
+ * Drop the signals git contradicts, and say how many. Runs BEFORE annotation so the health record's
+ * severity counts and the triage prompt see one set — a filter applied downstream of either would
+ * leave the trend charting findings the agent never saw.
+ *
+ * Asks git rather than re-reading `.gitignore`: the index is the one answer that already accounts
+ * for negated patterns, nested ignore files, `core.excludesFile`, and files committed despite a
+ * matching rule. Only reached when a signal actually raises the question, so an ordinary scan pays
+ * no git call at all.
+ */
+async function dropUntrackedSignals(
+  repoPath: string,
+  signals: ScanSignal[],
+): Promise<{ kept: ScanSignal[]; untracked: UntrackedFilter }> {
+  const candidates = new Map<ScanSignal, string>();
+  for (const signal of signals) {
+    if (!TRACKED_ONLY_COLLECTORS.has(collectorOf(signal))) continue;
+    const path = repoRelativePath(repoPath, signal);
+    if (path) candidates.set(signal, path);
+  }
+  if (candidates.size === 0) return { kept: signals, untracked: { dropped: 0, paths: [] } };
+
+  const tracked = await readTrackedPaths(repoPath);
+  if (!(tracked instanceof Set)) {
+    return { kept: signals, untracked: { dropped: 0, paths: [], ...tracked } };
+  }
+
+  const dropped = new Set<string>();
+  const kept = signals.filter((signal) => {
+    const path = candidates.get(signal);
+    if (path === undefined || isTracked(tracked, path)) return true;
+    dropped.add(path);
+    return false;
+  });
+  return {
+    kept,
+    untracked: { dropped: signals.length - kept.length, paths: [...dropped] },
+  };
+}
+
+/** How many findings the untracked filter removed and from where; undefined when it removed none. */
+export function describeUntrackedFilter(filter: UntrackedFilter): string | undefined {
+  if (filter.unavailable) {
+    return (
+      `git could not be asked which files it tracks (${filter.unavailable}) — findings for files ` +
+      `git does not track are counted this pass`
+    );
+  }
+  if (filter.dropped === 0) return undefined;
+  const shown = filter.paths.slice(0, 10);
+  const rest = filter.paths.length - shown.length;
+  return (
+    `dropped ${filter.dropped} signal(s) about ${filter.paths.length} path(s) git does not track: ` +
+    `${shown.join(", ")}${rest > 0 ? ` (+${rest} more)` : ""}`
+  );
 }
 
 /**
@@ -397,8 +536,14 @@ function describeShape(parsed: unknown): string {
  * - **Triage labels the signal anton counted.** stringer emits no severity of its own; annotating
  *   here means the agent reads anton's derivation off the file instead of re-deriving one from the
  *   raw fields and drifting from the trend (see {@link annotateSignal}).
+ *
+ * It is also the one seam where a signal can still be dropped from BOTH readers at once — see
+ * {@link dropUntrackedSignals}.
  */
-async function readAnnotatedSignals(scanFile: string): Promise<ScanSignal[]> {
+async function readAnnotatedSignals(
+  scanFile: string,
+  repoPath: string,
+): Promise<{ signals: ScanSignal[]; untracked: UntrackedFilter }> {
   let parsed: unknown;
   try {
     const raw = await readFile(scanFile, "utf8");
@@ -428,9 +573,10 @@ async function readAnnotatedSignals(scanFile: string): Promise<ScanSignal[]> {
     );
   }
 
-  for (const signal of signals) annotateSignal(signal);
-  await writeFile(scanFile, JSON.stringify(parsed), "utf8");
-  return signals;
+  const { kept, untracked } = await dropUntrackedSignals(repoPath, signals);
+  for (const signal of kept) annotateSignal(signal);
+  await writeFile(scanFile, JSON.stringify(withSignals(parsed, kept)), "utf8");
+  return { signals: kept, untracked };
 }
 
 /**
@@ -495,9 +641,9 @@ export async function scan(opts: {
     throw await rejectWithBaselineRestored(toScanError(err, { timeoutMs }), unwind);
   }
 
-  let signals: ScanSignal[];
+  let read: { signals: ScanSignal[]; untracked: UntrackedFilter };
   try {
-    signals = await readAnnotatedSignals(opts.scanFile);
+    read = await readAnnotatedSignals(opts.scanFile, opts.repoPath);
   } catch (err) {
     // Refusing the output means refusing the whole pass, baseline included: the retry has to see the
     // same window this attempt consumed, or its findings are lost to a clean-looking rescan.
@@ -508,8 +654,9 @@ export async function scan(opts: {
   const baselineScan = classifyScanBasis(baseline, after);
   return {
     scanFile: opts.scanFile,
-    signals,
+    signals: read.signals,
     collectorFailures: parseCollectorFailures(stderr),
+    untracked: read.untracked,
     deltaState: {
       ...(before ? { before } : {}),
       ...(after ? { after } : {}),

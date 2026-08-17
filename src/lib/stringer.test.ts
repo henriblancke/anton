@@ -15,10 +15,12 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { execFileSync } from "node:child_process";
 import {
   DEFAULT_SCAN_EXCLUDES,
   STRINGER_BIN_ENV,
   describeCollectorFailure,
+  describeUntrackedFilter,
   extractSignals,
   formatTimeout,
   parseCollectorFailures,
@@ -559,6 +561,110 @@ describe("scan", () => {
     });
   });
 
+  // anton-j2zg: `githygiene` reads the WORKING TREE, so it flagged anton's own gitignored anton.db
+  // as a "large binary file" on every pass — a medium-severity finding nobody can act on, counted
+  // into the health record and re-triaged nightly. git's index is the arbiter.
+  describe("findings about files git does not track", () => {
+    /** A real git repo (inside `dir`, so the fake stringer binary is never one of its files). */
+    function initRepo(files: Record<string, string>): string {
+      const repo = join(dir, "repo");
+      mkdirSync(repo, { recursive: true });
+      const run = (...args: string[]) => execFileSync("git", ["-C", repo, ...args]);
+      run("init", "-q");
+      run("config", "user.email", "t@example.com");
+      run("config", "user.name", "test");
+      for (const [name, body] of Object.entries(files)) {
+        mkdirSync(join(repo, name, ".."), { recursive: true });
+        writeFileSync(join(repo, name), body, "utf8");
+      }
+      run("add", "-A");
+      run("commit", "-qm", "init");
+      return repo;
+    }
+
+    const largeBinary = (path: string) => ({
+      Source: "githygiene",
+      Kind: "large-binary",
+      FilePath: path,
+      Title: `Large binary file: ${path}`,
+      Tags: ["git-hygiene", "large-binary"],
+    });
+
+    it("drops the finding, keeps the count, and removes it from the file triage reads", async () => {
+      const repo = initRepo({ ".gitignore": "phantom.db\n", "keep.bin": "committed" });
+      writeFileSync(join(repo, "phantom.db"), "local database", "utf8");
+      const scanFile = join(dir, "scan.json");
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), {
+        signals: [largeBinary("phantom.db"), largeBinary("keep.bin")],
+        metadata: { total_count: 2 },
+      });
+
+      const result = await scan({ repoPath: repo, scanFile });
+
+      expect(result.signals).toMatchObject([{ FilePath: "keep.bin", AntonSeverity: "medium" }]);
+      expect(result.untracked).toEqual({ dropped: 1, paths: ["phantom.db"] });
+      // Same set on both sides of the seam: the health record counts `signals`, triage reads the file.
+      const written = JSON.parse(readFileSync(scanFile, "utf8")) as {
+        signals: { FilePath: string }[];
+        metadata: { total_count: number };
+      };
+      expect(written.signals.map((s) => s.FilePath)).toEqual(["keep.bin"]);
+      expect(written.metadata.total_count).toBe(2); // stringer's own envelope rides through untouched
+    });
+
+    it("leaves a scan whose flagged files are all tracked exactly as it was", async () => {
+      const repo = initRepo({ "keep.bin": "committed", "src/app.ts": "export {};\n" });
+      const scanFile = join(dir, "scan.json");
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        largeBinary("keep.bin"),
+        { ...largeBinary("src/app.ts"), Kind: "mixed-line-endings" },
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile });
+
+      expect(result.signals).toHaveLength(2);
+      expect(result.untracked).toEqual({ dropped: 0, paths: [] });
+      expect(
+        (JSON.parse(readFileSync(scanFile, "utf8")) as { FilePath: string }[]).map((s) => s.FilePath),
+      ).toEqual(["keep.bin", "src/app.ts"]);
+    });
+
+    // The filter drops only what git positively contradicts: a debt signal reads the same whether or
+    // not the file is committed yet, a directory is never in the index, and a signal naming no file
+    // is not a claim about the repo at all.
+    it("drops nothing it cannot contradict — other collectors, directories, pathless signals", async () => {
+      const repo = initRepo({ "src/app.ts": "export {};\n" });
+      writeFileSync(join(repo, "scratch.ts"), "// TODO: later\n", "utf8");
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        { Source: "todos", Kind: "todo", FilePath: "scratch.ts" },
+        { ...largeBinary("src"), Kind: "many-large-files" },
+        { ...largeBinary("."), Kind: "many-large-files" }, // the repo root, as collectors spell it
+        { Source: "githygiene", Kind: "merge-conflict" },
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(4);
+      expect(result.untracked.dropped).toBe(0);
+    });
+
+    // A filter that can't prove a file is untracked must under-filter rather than delete findings —
+    // and say why, so the extra medium signals aren't read as the repo suddenly getting worse.
+    it("counts everything and reports why when git cannot be asked", async () => {
+      const notARepo = join(dir, "loose");
+      mkdirSync(notARepo, { recursive: true });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        largeBinary("phantom.db"),
+      ]);
+
+      const result = await scan({ repoPath: notARepo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(1);
+      expect(result.untracked.dropped).toBe(0);
+      expect(result.untracked.unavailable).toBeTruthy();
+    });
+  });
+
   it("keeps a caller abort an AbortError rather than reporting a timeout", async () => {
     process.env[STRINGER_BIN_ENV] = writeScript("slow-stringer", ["setTimeout(() => {}, 60000);"]);
     const ac = new AbortController();
@@ -648,6 +754,28 @@ describe("parseCollectorFailures", () => {
         `time=2026-07-26T19:26:45Z level=INFO msg="collector complete" name=todos signals=1 duration=15ms`,
       ),
     ).toEqual([]);
+  });
+});
+
+// A silent filter is indistinguishable from a collector that found nothing, so every drop has to be
+// legible on the session that made it.
+describe("describeUntrackedFilter", () => {
+  it("names what disappeared, stays quiet when nothing did, and reports an unreadable index", () => {
+    expect(describeUntrackedFilter({ dropped: 0, paths: [] })).toBeUndefined();
+
+    const line = describeUntrackedFilter({ dropped: 2, paths: ["anton.db", "scratch/notes.bin"] });
+    expect(line).toContain("dropped 2 signal(s)");
+    expect(line).toContain("anton.db, scratch/notes.bin");
+
+    const many = describeUntrackedFilter({
+      dropped: 12,
+      paths: Array.from({ length: 12 }, (_, i) => `f${i}.db`),
+    });
+    expect(many).toContain("(+2 more)");
+
+    const blind = describeUntrackedFilter({ dropped: 0, paths: [], unavailable: "not a git repo" });
+    expect(blind).toContain("not a git repo");
+    expect(blind).toContain("are counted this pass");
   });
 });
 
