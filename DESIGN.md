@@ -96,6 +96,61 @@ visible to any machine, scotty, or foolery. anton reads/writes it via `bd` (neve
 These are inherently local (a worktree path or live lease is meaningless elsewhere), so they are
 never committed. `anton.db` is disposable — it can be rebuilt; the truth is in beads + git.
 
+### 3a. Board modes — embedded vs shared server
+
+The beads Dolt database runs one of two ways. **Embedded is the default and needs no
+configuration**; server mode is opt-in per project via `.beads/metadata.json`.
+
+| | **Embedded** (default) | **Server** |
+|---|---|---|
+| Where the DB lives | `.beads/embeddeddolt/<db>/` on each machine | one `dolt sql-server`, shared |
+| How machines agree | `bd dolt pull/push` over `refs/dolt/data` on the git remote | they all write the same database |
+| Offline | works | needs the server reachable |
+| Sync status badge | `synced` / `not-wired` / `failing` | `shared-server` |
+
+Mode is read from `.beads/metadata.json` (`dolt_mode`) by `src/lib/beads/board-mode.ts`.
+Anything unreadable, absent, or unrecognised resolves to **embedded** — the safe direction, since
+embedded merely syncs when it need not, whereas a wrong "server" verdict would silently disable a
+solo board's only propagation path.
+
+**Two behaviours branch on it:**
+
+1. **Sync is skipped entirely in server mode** (`runDoltSync`, `nudgeSync`). There is nothing to
+   reconcile when every writer shares one database — and the attempt does not merely waste work, it
+   fails: `bd dolt pull/push` executes *on the server*, and the `dolt-sql-server` image ships no ssh
+   client and no keys, so a `git+ssh://` remote is unreachable from there by construction. Claim
+   verification also skips its settle window, because a claim is visible to every other machine the
+   moment it commits.
+
+2. **Project-scoped `BEADS_DOLT_*` never survive a bd spawn** (`childEnv`). They are bd's
+   highest-priority config source, so anton's own connection settings — inherited from whatever
+   directory anton was launched in — would override the *target* project's `metadata.json` and point
+   it at the wrong database. Credentials (`BEADS_DOLT_PASSWORD`, `BEADS_DOLT_SERVER_TLS`) are
+   deliberately not stripped: they are shared across projects on a given server.
+
+**Configuring server mode.** Put connection details in `.beads/metadata.json` — never in the
+environment, for the reason above, and never in `.beads/config.yaml` (it is the lowest-priority
+source, and `bd config set dolt.mode` writes a nested block the rest of that file's flat dotted keys
+do not match):
+
+```json
+{
+  "dolt_mode": "server",
+  "dolt_server_host": "dolt.example.dev",
+  "dolt_server_port": 3306,
+  "dolt_server_user": "beads",
+  "dolt_database": "anton"
+}
+```
+
+Credentials come from the environment (`BEADS_DOLT_PASSWORD`, plus `BEADS_DOLT_SERVER_TLS=true`
+when the server sets `require_secure_transport`). `dolt_server_port` must stay in `metadata.json`
+despite bd's deprecation warning — without it bd dials port 0 against a remote host.
+
+On the first pass for a server-mode project anton runs `bd dolt test` once and, if the server is
+unreachable, records a failure naming the configured host/port and the ways out, rather than the
+raw `unreachable at 127.0.0.1:0 … dolt is not installed` that the underlying tools produce.
+
 ## 4. Background jobs + durability (the hard part)
 
 An in-process **job runner** in the Next server: a loop that leases queued/due jobs, runs them,

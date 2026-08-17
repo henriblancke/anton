@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { githubRepoSlug } from "../git/remote";
 import { resolveBdBin } from "./bd-bin";
+import { PROJECT_SCOPED_BD_ENV, isServerMode, readBoardMode } from "./board-mode";
 import { withBeadWriteLock } from "./claim-lock";
 import { isPipelineArtifact } from "./contract";
 import { invalidateIssueSnapshot } from "./snapshot";
@@ -352,6 +353,15 @@ interface BdOpts {
 function childEnv(overrides: Record<string, string | undefined>): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, ...overrides };
   for (const [key, value] of Object.entries(overrides)) if (value === undefined) delete env[key];
+  // Project-scoped BEADS_DOLT_* never survive the spawn (anton-ffmw.1). They are bd's
+  // HIGHEST-priority config source, so anton's own connection settings — inherited from whatever
+  // directory anton was launched in — would override the TARGET project's .beads/metadata.json and
+  // point it at the wrong database. Same failure shape as the ambient GH_REPO noted above, and it
+  // was caught in production only because bd refuses on a project-id mismatch:
+  //   PROJECT IDENTITY MISMATCH — refusing to connect
+  // Stripping them lets each project's own metadata.json decide, which is per-directory and so
+  // cannot leak. An explicit override still wins: callers that deliberately set one keep it.
+  for (const key of PROJECT_SCOPED_BD_ENV) if (!(key in overrides)) delete env[key];
   return env;
 }
 
@@ -387,7 +397,10 @@ async function bd(cwd: string, args: string[], opts?: BdOpts): Promise<string> {
       cwd,
       // POSIX: make bd the leader of a new process group so the whole tree is reachable as one.
       detached: process.platform !== "win32",
-      ...(opts?.env ? { env: childEnv(opts.env) } : {}),
+      // Always built through childEnv, even with no overrides: it is what strips the
+      // project-scoped BEADS_DOLT_* that would otherwise route this call at another
+      // project's database (anton-ffmw.1).
+      env: childEnv(opts?.env ?? {}),
     });
 
     if (opts?.stdin !== undefined) {
@@ -608,7 +621,15 @@ export function isFirstPublishPullOutput(output: string): boolean {
 // route handlers can load DIFFERENT compiled instances of this module (separate bundles), so a
 // plain module-level Map would leave routes reading an empty registry forever.
 
-export type SyncState = "unknown" | "not-wired" | "syncing" | "stalled" | "synced" | "failing";
+export type SyncState =
+  | "unknown"
+  | "not-wired"
+  | "syncing"
+  | "stalled"
+  | "synced"
+  | "failing"
+  /** Server mode: propagation is inherent, so there is no sync to run or report (anton-0tul). */
+  | "shared-server";
 
 export interface SyncStatus {
   state: SyncState;
@@ -763,7 +784,61 @@ export type SyncMode = "full" | "pull";
  */
 export type SyncRequest = SyncMode | "backstop" | "push";
 
-export type SyncOutcome = "synced" | "not-wired";
+export type SyncOutcome = "synced" | "not-wired" | "shared-server";
+
+/**
+ * Server-mode preflight (anton-eg46). Runs `bd dolt test` ONCE per repo per process, the first time
+ * a sync pass would have run, and throws an actionable error when the shared server is unreachable.
+ *
+ * Why it belongs here rather than at boot: it piggybacks on the heartbeat, so the failure lands in
+ * the sync-status registry the operator is already watching, and a server that comes back up is
+ * picked up on the next beat without a restart.
+ *
+ * Why the message names the host/port/database: the raw failure does not. A blocked direnv approval
+ * (which silently drops BEADS_DOLT_*) produced this, which names neither the configured target nor
+ * the real cause, and sends the reader off installing Dolt they do not need:
+ *
+ *   Dolt server unreachable at 127.0.0.1:0 and auto-start failed:
+ *   dolt is not installed (not found in PATH)
+ */
+const PREFLIGHTED_KEY = Symbol.for("anton.beads.preflight");
+
+/**
+ * Anchored on `globalThis` for the same cross-bundle reason as the status registry above: a route
+ * handler bundle and the instrumentation-started sync engine each load their own compiled copy of
+ * this module, and a plain module-level Set would give each one its own — turning "once per
+ * process" into "once per bundle" and re-running `bd dolt test` for every one of them.
+ */
+function preflightedSet(): Set<string> {
+  const g = globalThis as unknown as Record<symbol, Set<string> | undefined>;
+  return (g[PREFLIGHTED_KEY] ??= new Set());
+}
+
+/** Tests only — production preflights once per process by design. */
+export function resetServerPreflight(): void {
+  preflightedSet().clear();
+}
+
+export async function preflightSharedServer(cwd: string, exec: BdExec = bd): Promise<void> {
+  if (preflightedSet().has(cwd)) return;
+  const { host, port, database } = readBoardMode(cwd);
+  const target = `${host ?? "?"}:${port ?? "?"}${database ? `/${database}` : ""}`;
+  try {
+    await exec(cwd, ["dolt", "test"]);
+    // Recorded only on success, so a server that was down is retried on the next beat.
+    preflightedSet().add(cwd);
+  } catch (e) {
+    const err = e as Error & { stdout?: string; stderr?: string };
+    const output = `${err.stderr ?? ""}\n${err.stdout ?? ""}`.trim() || err.message;
+    throw new Error(
+      `shared Dolt server unreachable for ${cwd} (configured target ${target}). ` +
+        `Check the server is up and reachable, that .beads/metadata.json names the right ` +
+        `host/port, and that BEADS_DOLT_PASSWORD is set in this process — or set ` +
+        `dolt_mode back to "embedded" to work from the local copy. Underlying error: ${output}`,
+      { cause: e },
+    );
+  }
+}
 
 /**
  * One sync pass. Full mode: `bd dolt pull` (remote changes land locally, and pull-before-push
@@ -787,6 +862,18 @@ export async function runDoltSync(
   exec: BdExec = bd,
   mode: SyncMode = "full",
 ): Promise<SyncOutcome> {
+  // Server mode: there is nothing to reconcile, so this resolves without spawning bd at all
+  // (anton-0tul). Every writer is already on the one database, and the pull/push would run ON THE
+  // SERVER, which has no ssh client or keys and therefore cannot reach a git+ssh remote. Left
+  // enabled it fails on every heartbeat:
+  //   Error: failed to pull from origin/main: Error 1105 (HY000): command denied to user
+  // Distinct from "not-wired": that means a board with no propagation path and is worth surfacing;
+  // this means propagation is inherent and there is nothing to report.
+  if (isServerMode(cwd)) {
+    await preflightSharedServer(cwd, exec);
+    return "shared-server";
+  }
+
   const steps =
     mode === "pull"
       ? [["dolt", "pull"]]
@@ -858,7 +945,12 @@ export function createDoltSync(
   const start = (cwd: string, mode: SyncMode, newWork: boolean): Promise<SyncOutcome> => {
     recordStatus(cwd, { state: "syncing" });
     const p = runDoltSync(cwd, exec, mode).then((outcome) => {
-      if (outcome === "not-wired") {
+      if (outcome === "shared-server") {
+        // Every writer is already on the one database, so there is no backlog and nothing to
+        // reconcile — record the state and stop forcing full backstop passes (anton-0tul).
+        recordStatus(cwd, { state: "shared-server", lastError: null, unpushedCount: 0 });
+        reconciled.add(cwd);
+      } else if (outcome === "not-wired") {
         recordStatus(cwd, { state: "not-wired", lastError: null });
         reconciled.add(cwd); // no remote to reconcile against — stop forcing full backstop passes
       } else {
@@ -1978,7 +2070,10 @@ async function runClaimVerified(
   // 4/5. Settle, then re-pull — but only when there is a remote at all. A not-wired board has no
   //      second machine to race, so waiting out a propagation window it can't have would stall every
   //      single-machine pickup for nothing.
-  if (outcome !== "not-wired") {
+  // Only a real remote sync needs a settle window. A not-wired board has no second machine to
+  // race; a shared server has no propagation delay at all — the claim was visible to every other
+  // machine the moment it committed, so waiting would slow every pickup for nothing (anton-0tul).
+  if (outcome === "synced") {
     await sleep(settleMs);
     try {
       await pull(cwd);

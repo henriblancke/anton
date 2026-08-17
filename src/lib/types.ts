@@ -251,7 +251,14 @@ export interface StandaloneItem {
  * SyncStatus there — kept as a separate declaration so client components import types without the
  * server-only bd module. */
 export interface SyncStatusView {
-  state: "unknown" | "not-wired" | "syncing" | "stalled" | "synced" | "failing";
+  state:
+    | "unknown"
+    | "not-wired"
+    | "syncing"
+    | "stalled"
+    | "synced"
+    | "failing"
+    | "shared-server";
   /** ms epoch of the last successful pass (pull or push); null when never synced. */
   lastSyncedAt: number | null;
   /** ms epoch of the last successful push; null when nothing has been pushed yet. */
