@@ -70,6 +70,8 @@ describeBd("nightly-stringer e2e (real handler · real bd · fake stringer/claud
 const oi=a.indexOf('-o');const out=oi>=0?a[oi+1]:null;
 const n=Number(process.env.FAKE_STRINGER_SIGNALS||'0');
 const signals=Array.from({length:n},(_,i)=>({Source:'todo',Kind:'todo',FilePath:'x.ts',Line:i+1,Title:'TODO '+i}));
+// A githygiene finding about a file git does not track — anton drops it before anyone counts it.
+if(process.env.FAKE_STRINGER_UNTRACKED)signals.push({Source:'githygiene',Kind:'large-binary',FilePath:'phantom.db',Line:0,Title:'Large binary file: phantom.db (4.2 MB)'});
 if(out)fs.writeFileSync(out,JSON.stringify({signals,metadata:{}}));
 // Advance the --delta baseline on the way out, as the real stringer does: the window a scan saw
 // is gone from the next one unless the caller puts this file back.
@@ -210,6 +212,30 @@ process.stdin.on('end',()=>{
     // ...and the retry gets all the way to beads.
     expect((await getJob(tdb.db, await runScan()))?.status).toBe("done");
     expect((await beads.list(repo, ["--status", "all"])).length).toBe(beadsBefore + 2);
+  });
+
+  // anton-j2zg: a pass whose only finding was about a file git doesn't track must read as a
+  // FILTERED scan, not as a collector that found nothing — otherwise the phantom looks like health.
+  it("says on the session what it dropped for being untracked (anton-j2zg)", async () => {
+    process.env.FAKE_STRINGER_SIGNALS = "0";
+    process.env.FAKE_STRINGER_UNTRACKED = "1";
+    rmSync(join(sandbox, "claude-argv.jsonl"), { force: true });
+    const before = new Set((await tdb.db.select().from(schema.sessions)).map((s) => s.id));
+
+    let jobId: string;
+    try {
+      jobId = await runScan();
+    } finally {
+      delete process.env.FAKE_STRINGER_UNTRACKED;
+    }
+
+    expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+    // Nothing survived the filter, so triage never ran — and the log says why it had nothing.
+    expect(existsSync(join(sandbox, "claude-argv.jsonl"))).toBe(false);
+    const sessions = await tdb.db.select().from(schema.sessions);
+    const log = readFileSync(sessions.find((s) => !before.has(s.id))!.logPath!, "utf8");
+    expect(log).toContain("dropped 1 signal(s)");
+    expect(log).toContain("phantom.db");
   });
 
   it("warns on the session when a collector died, even with no signals to triage (anton-uspu)", async () => {

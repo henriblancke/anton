@@ -16,6 +16,7 @@ import { loadSkill } from "../claude/prompt";
 import { runClaude } from "../claude/driver";
 import {
   describeCollectorFailure,
+  describeUntrackedFilter,
   rejectWithBaselineRestored,
   scan,
   type DeltaState,
@@ -257,6 +258,18 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
         const detail = describeCollectorFailure(failure);
         await appendSessionLog(logPath, `[stringer] WARNING: ${detail}\n`);
         console.warn(`[nightly-stringer] ${project.slug}: ${detail}`);
+      }
+
+      // 1c. Signals dropped for naming a file git doesn't track (anton-j2zg). Said out loud, and
+      // before the early return: a pass whose only findings were phantoms must read as a filtered
+      // scan, not as a collector that found nothing.
+      const untrackedLine = describeUntrackedFilter(result.untracked);
+      if (untrackedLine) {
+        const prefix = result.untracked.unavailable ? "WARNING: " : "";
+        await appendSessionLog(logPath, `[stringer] ${prefix}${untrackedLine}\n`);
+        if (result.untracked.unavailable) {
+          console.warn(`[nightly-stringer] ${project.slug}: ${untrackedLine}`);
+        }
       }
 
       // 2. No new signals → nothing to triage. That's a success, not an error — and a real data
