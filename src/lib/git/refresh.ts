@@ -135,7 +135,17 @@ export async function refreshCheckout(
       return { ...at, drift: `fast-forwarding to origin/${branch} conflicted (${merged.conflicts.join(", ")})` };
     }
   } catch (e) {
-    return { ...at, drift: `fast-forwarding to origin/${branch} failed (${reason(e)})`, transient: true };
+    const msg = reason(e);
+    // A path the incoming commit adds and the tree already holds UNTRACKED is refused by git, not
+    // conflicted — `mergeIntoCurrent` finds no conflicted paths and rethrows here. That refusal is a
+    // state of the tree, permanent until a human moves the file, so it must not be retried: nightly
+    // attempts would burn the runner's budget and bury the one line naming the file to remove.
+    const collision = /would be overwritten by (merge|checkout)/.test(msg);
+    return {
+      ...at,
+      drift: `fast-forwarding to origin/${branch} failed (${msg})`,
+      ...(collision ? {} : { transient: true }),
+    };
   }
 
   try {

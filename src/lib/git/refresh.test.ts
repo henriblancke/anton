@@ -115,6 +115,24 @@ suite("refreshCheckout (real git)", () => {
     expect(head(repo)).toBe(shipped);
   });
 
+  it("reports an untracked file in the incoming commit's way as PERMANENT drift, not a retry", async () => {
+    commitAndPush(other, "shipped.ts", "export const shipped = true;\n");
+    // The one untracked shape that does block a fast-forward: the remote adds the exact path the
+    // tree already holds. Only a human moving the file clears it, so a retry would just burn the
+    // runner's attempt budget nightly.
+    writeFileSync(join(repo, "shipped.ts"), "scratch that happens to share the name\n");
+    const was = head(repo);
+
+    const refresh = await refreshCheckout(repo, "main");
+
+    expect(refresh.drift).toContain("fast-forwarding to origin/main failed");
+    // The file a human has to move must survive into the reason they read.
+    expect(refresh.drift).toContain("shipped.ts");
+    expect(refresh.transient).toBeUndefined();
+    expect(refresh.head).toBe(was);
+    expect(head(repo)).toBe(was);
+  });
+
   it("refuses a diverged checkout — reconciling it is a human's call", async () => {
     commitAndPush(other, "shipped.ts", "export const shipped = true;\n");
     writeFileSync(join(repo, "local.ts"), "export const local = true;\n");
