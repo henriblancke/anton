@@ -39,6 +39,8 @@ import {
   type TriageOutcome,
 } from "../scan-health";
 import { appendSessionLog, endSession, startJobSession } from "../sessions";
+import { refreshCheckout } from "../git/refresh";
+import type { Project } from "../types";
 import { PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
 import { systemClock } from "./queue";
@@ -99,6 +101,39 @@ async function readBoardContext(repoPath: string, logPath: string, slug: string)
   }
 }
 
+/**
+ * Fast-forward the project checkout onto its remote default branch and return the commit the scan
+ * will measure — or THROW, so the pass stands down before consuming its `--delta` window.
+ *
+ * Throwing is how "do not scan a stale tree" is enforced: the scan is what consumes the window, and
+ * anything short of a hard stop here leaves a later edit free to reintroduce the silent triage this
+ * exists to prevent. A checkout anton could not read or fetch is a plain error — the runner retries
+ * it, and the next attempt may well reach the remote. A dirty, diverged, or remote-less checkout is
+ * POISON: no retry changes it, only a human, and burning the attempt budget nightly would bury the
+ * one line that says what to fix (see {@link refreshCheckout} — anton never resolves it itself).
+ */
+async function bringCheckoutForward(project: Project, logPath: string): Promise<string> {
+  const refresh = await refreshCheckout(project.repoPath, project.defaultBranch);
+  if (!refresh.drift && refresh.head) {
+    if (refresh.advancedFrom) {
+      await appendSessionLog(
+        logPath,
+        `[stringer] checkout fast-forwarded ${refresh.advancedFrom} → ${refresh.head} ` +
+          `(origin/${project.defaultBranch})\n`,
+      );
+    }
+    return refresh.head;
+  }
+
+  const detail =
+    `checkout drift — ${refresh.drift ?? "git could not name the commit this checkout holds"}. ` +
+    `Standing down BEFORE the scan: nothing ran, so the --delta window is untouched and the next ` +
+    `pass still sees it. A scan here would measure a tree that is not what shipped`;
+  await appendSessionLog(logPath, `[stringer] ERROR: ${detail}\n`);
+  console.warn(`[nightly-stringer] ${project.slug}: ${detail}`);
+  throw refresh.transient ? new Error(detail) : new PoisonError(detail);
+}
+
 /** Build the runner handler bound to a db/clock. Register it as the "nightly-stringer" handler. */
 export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandler {
   const db = deps.db;
@@ -146,6 +181,7 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
           sessionId,
           counts,
           collectorFailures: opts.failures,
+          ...(scannedSha ? { scannedSha } : {}),
           ...(opts.deltaState ? { deltaState: opts.deltaState } : {}),
           ...(opts.triage ? { triage: opts.triage } : {}),
         });
@@ -161,6 +197,8 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
     let counts: ScanCounts | undefined;
     let collectorFailures = 0;
     let deltaState: DeltaState | undefined;
+    /** The commit the scan measured, once the checkout is known to be the tree that shipped. */
+    let scannedSha: string | undefined;
 
     /**
      * The scan's `--delta` unwind, and whether the pass got far enough to owe nothing to it.
@@ -179,9 +217,19 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
     let triaged = false;
 
     try {
+      // 0. Measure the tree that SHIPPED (anton-qor2). anton pulls the BOARD before it reads it but
+      //    never the checkout, so the scan ran against whatever the last human left: the 2026-08-06
+      //    nightly measured a tree 6 commits behind origin/main and spent 87% of its signals — and
+      //    its whole --delta window — on code merged away hours earlier.
+      //
+      //    A checkout anton cannot bring forward is NOT scanned. Standing down costs one night's
+      //    pass; scanning anyway costs the window (`--delta` consumes it) and re-files debt the repo
+      //    no longer carries. Nothing ran here, so the window is untouched and the next pass sees it.
+      scannedSha = await bringCheckoutForward(project, logPath);
+
       // 1. Scan the repo for new signals.
       const scanFile = scanFilePath(sessionId);
-      await appendSessionLog(logPath, `[stringer] scan --delta ${project.repoPath}\n`);
+      await appendSessionLog(logPath, `[stringer] scan --delta ${project.repoPath} @ ${scannedSha}\n`);
       const result = await scan({ repoPath: project.repoPath, scanFile, signal: ctx.signal });
       // Summarized from the signals the scan already parsed — the dispatch decision below and this
       // point on the trend must describe the same read, or the next delta is computed off a baseline
