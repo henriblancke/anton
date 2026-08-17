@@ -12,6 +12,7 @@ import type { JobStatus, JobSummary } from "@/lib/jobs-view";
 import type { LiveJobInfo } from "@/lib/jobs/runner";
 // Pure string→data, no server deps — see src/lib/gardener/record.ts.
 import type { PassRecordSummary } from "@/lib/gardener/record";
+import { DISPLAY_LOCALE } from "@/lib/time";
 import { cn } from "@/lib/utils";
 import { PassRecordChips, PassRecordPanel } from "@/components/runs/pass-record";
 import { Button } from "@/components/ui/button";
@@ -47,10 +48,14 @@ function relativeTime(epoch?: number): string {
   return `${Math.floor(s / 86400)}d ago`;
 }
 
-/** Absolute local timestamp for the detail panel. */
+/**
+ * Absolute timestamp for the detail panel, in the host's timezone but anton's canonical locale.
+ * Hydration-sensitive: the Jobs page is a Server Component that hands this client list its rows, so
+ * these strings are server-rendered before the browser ever formats them.
+ */
 function absTime(epoch?: number): string {
   if (!epoch) return "—";
-  return new Date(epoch * 1000).toLocaleString();
+  return new Date(epoch * 1000).toLocaleString(DISPLAY_LOCALE);
 }
 
 /**
