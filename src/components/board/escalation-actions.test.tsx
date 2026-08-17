@@ -65,6 +65,38 @@ describe("EscalationActions — resume", () => {
     );
   });
 
+  it("says WHY a gate hold isn't starting, rather than promising a blocker will clear", async () => {
+    // `gate-still-blocked` is one detail over many holds — unapproved, claimed elsewhere, already in
+    // review, a second gate, an unread board — and only one of them clears on its own. The line the
+    // founder reads must not tell them to sit and wait when the thing needed is their own approval,
+    // so the route's reason is shown underneath it.
+    stubFetch({ action: "resume", detail: "gate-still-blocked", note: "it is not approved" });
+    mount();
+
+    fireEvent.click(screen.getByRole("button", { name: "Resume" }));
+
+    await waitFor(() =>
+      expect(success).toHaveBeenCalledWith("Gate closed — the work isn't starting yet", {
+        description: "Held because it is not approved.",
+      }),
+    );
+  });
+
+  it("shows no reason line when the hold left none — the detail stands on its own", async () => {
+    // Guards the shape as much as the copy: every other detail is a one-argument call, so a stray
+    // second argument would put an empty "Held because ." under a toast that is simply good news.
+    stubFetch({ action: "resume", detail: "gate-resolved" });
+    mount();
+
+    fireEvent.click(screen.getByRole("button", { name: "Resume" }));
+
+    await waitFor(() =>
+      expect(success).toHaveBeenCalledWith(
+        "Gate closed — the wait is over; there was no run left to restart",
+      ),
+    );
+  });
+
   it("surfaces the server's reason when the escalation was already settled", async () => {
     stubFetch({ error: "This escalation has already been settled" }, 409);
     mount();
@@ -161,6 +193,35 @@ describe("EscalationActions — what the escalation can support", () => {
     fireEvent.click(screen.getByRole("button", { name: "Confirm stop" }));
     await waitFor(() =>
       expect(success).toHaveBeenCalledWith("Stopped — the job is cancelled and won't retry"),
+    );
+  });
+
+  it("names the gate, not the run, when the wait is on a person", async () => {
+    // "Resume" would misdescribe it: the founder is answering "I did the thing you asked", and the
+    // re-queue is the consequence, not the decision.
+    const fetchMock = stubFetch({ action: "resume", detail: "enqueued" });
+    mount({ target: "gate" });
+
+    expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Resolve & resume" }));
+
+    await waitFor(() => expect(refresh).toHaveBeenCalled());
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/projects/anton/escalations/esc-1",
+      expect.objectContaining({ body: JSON.stringify({ action: "resume" }) }),
+    );
+  });
+
+  it("says plainly when closing the gate was the whole answer", async () => {
+    stubFetch({ action: "resume", detail: "gate-resolved" });
+    mount({ target: "gate" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Resolve & resume" }));
+
+    await waitFor(() =>
+      expect(success).toHaveBeenCalledWith(
+        "Gate closed — the wait is over; there was no run left to restart",
+      ),
     );
   });
 

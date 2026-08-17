@@ -9,6 +9,7 @@ import { withBeadWriteLocks } from "./beads/claim-lock";
 import { descendantsOf } from "./beads/subtree";
 import { nudgeSync } from "./beads/sync-nudge";
 import { declineNote } from "./gardener/apply";
+import { systemClock } from "./jobs/queue";
 import { cancelRunForTarget, runIsLiveForTarget } from "./jobs/service";
 import { freshDetail } from "./ticket-detail";
 import type { Bead } from "./beads/bd";
@@ -31,11 +32,12 @@ export class NotAbandonableError extends Error {
  * Thrown when an abandon that was decided against STOPPED work (`requireStopped`) finds a live run at
  * the instant it would have killed it. A `NotAbandonableError` so every route already mapping that to
  * 409 keeps working, and its own class so the escalation path can tell this apart from a bead that
- * was merely already closed.
+ * was merely already closed. `held` names WHERE the run is, because the two cases are answered
+ * differently by the operator: work restarted here is theirs to stop, work on another machine is not.
  */
 export class RunRestartedError extends NotAbandonableError {
-  constructor(targetId: string) {
-    super(`${targetId} is executing again — this abandon applies to work that had stopped`);
+  constructor(targetId: string, held = "is executing again") {
+    super(`${targetId} ${held} — this abandon applies to work that had stopped`);
     this.name = "RunRestartedError";
   }
 }
@@ -91,6 +93,17 @@ function runTargetOf(bead: Bead, board: Bead[]): string {
 }
 
 /**
+ * The precondition of an abandon decided against work the caller had observed STOPPED. `ownRunId` is
+ * that stopped run: its own leftover lease is not a foreign holder (see `beads.foreignRunLeaseLive`),
+ * so an abandon of a PARKED run — whose lease can still be unexpired — isn't refused by its own
+ * evidence. Absent when the stall named no run of its own (a wait on a person), where every live
+ * lease is another machine's.
+ */
+interface StoppedWork {
+  ownRunId?: string;
+}
+
+/**
  * Stop the run executing `targetId` — or, when the abandon was decided against work that had already
  * STOPPED, refuse at the instant the kill would land. The liveness read and the destructive act share
  * one boundary here, which is the only precondition that can tie the cancel to the stopped work it was
@@ -98,8 +111,19 @@ function runTargetOf(bead: Bead, board: Bead[]): string {
  * (a bd pull, an escalation settle), and by then the cancel has no way to tell a run that never
  * stopped from one an operator restarted in the meantime.
  *
+ * BOTH machines' answers, because `targetId` is derived HERE (see {@link runTargetOf}) and the caller
+ * could not have judged it: reparenting is a supported move, so the run target above a ticket now is
+ * not always the ancestor the caller's own lease check froze, and a run holding the new one is
+ * invisible to the machine-local job table. So the shared board's run-lease is re-read on whatever
+ * this abandon actually kills — the target and every cascaded descendant — off the same board read
+ * the cascade is planned from, which {@link refreshSharedBoard} pulls first so both the parentage
+ * and the lease are the remote's current answer rather than the local mirror's.
+ *
  * Refusing before any write, rather than skipping the cancel, is deliberate: closing the bead while
  * its agent keeps running is the same wrong answer one step later.
+ *
+ * Re-run under the cascade's write locks as well (see {@link assertStillStopped}), because the
+ * parentage this target is derived from can move in the gap between here and the lock.
  *
  * The check is a boundary, not a lock, and deliberately so: a resume landing between it and the last
  * bd write is caught one layer down instead. execute-epic re-reads the board when it dispatches and
@@ -109,12 +133,30 @@ function runTargetOf(bead: Bead, board: Bead[]): string {
  * window at the cost of a global mutable reservation on the resume path, whose own failure mode —
  * a leaked entry that blocks every future resume of the target — is worse than what it prevents.
  */
-async function stopRun(projectId: string, targetId: string, requireStopped: boolean): Promise<void> {
-  if (!requireStopped) {
+async function stopRun(
+  projectId: string,
+  targetId: string,
+  board: Bead[],
+  stopped: StoppedWork | undefined,
+): Promise<void> {
+  if (!stopped) {
     await cancelRunForTarget(projectId, targetId);
     return;
   }
   if (runIsLiveForTarget(projectId, targetId)) throw new RunRestartedError(targetId);
+  // A target this board doesn't carry carries no lease either — a run publishes its lease on the
+  // bead, so a bead the read answered for by omission is evidence of no holder, not a failed read
+  // (the same rule readTargetState applies to a missing lease-holder). Only reachable at all through
+  // runTargetOf's dangling-parent fallback.
+  const target = board.find((b) => b.id === targetId);
+  if (!target) return;
+  // The same clock every other lease check reads (escalation-actions, gate-targets) — one injectable
+  // source of "now", so a lease is never judged live here and expired one module over.
+  const nowMs = systemClock.now();
+  const foreign = stopped.ownRunId
+    ? beads.foreignRunLeaseLive(target, nowMs, stopped.ownRunId)
+    : beads.isRunLive(target, nowMs);
+  if (foreign) throw new RunRestartedError(targetId, "is being executed on another machine");
 }
 
 /**
@@ -131,18 +173,46 @@ async function stopDescendantRuns(
   project: Project,
   target: Bead,
   board: Bead[],
-  requireStopped: boolean,
+  stopped: StoppedWork | undefined,
 ): Promise<Bead[]> {
   const descendants = openDescendants(board, target.id);
   for (const descendant of descendants) {
     if (beads.isRunTarget(descendant, board)) {
-      await stopRun(project.id, descendant.id, requireStopped);
+      await stopRun(project.id, descendant.id, board, stopped);
     }
   }
   return descendants;
 }
 
 const messageOf = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
+/**
+ * Refresh shared state before an abandon that judges another machine's run-lease (anton-mivh).
+ *
+ * `requireStopped` is a statement about CURRENT shared state, and the board read it rests on is
+ * local: bd answers `list`/`show` from the Dolt working set, which trails the remote by a sync
+ * heartbeat. The caller's own pull ({@link readTargetState in escalation-actions}) is several awaits
+ * back — a gate close, the escalation settle — so a reparent-plus-run that landed elsewhere inside
+ * that window is invisible to the read below. {@link runTargetOf} would then derive the FORMER
+ * target, find no lease on it, and let the abandon close the ticket underneath the new target's live
+ * foreign run. Pulling HERE is what makes the boundary check answer for the board as it is, the same
+ * pull `gateDispatch` makes before its own last-look liveness read.
+ *
+ * FAILS CLOSED, exactly as both of those reads do: a pull that didn't land leaves shared state
+ * unread, which is not evidence of a clear board. Nothing has been written at this point, so refusing
+ * costs a retry — the escalation route maps it to 409 with its message. A workspace with no remote
+ * resolves the pull rather than rejecting, so a single-machine board never reaches this.
+ */
+async function refreshSharedBoard(repo: string, id: string): Promise<void> {
+  try {
+    await beads.pull(repo);
+  } catch (e) {
+    throw new NotAbandonableError(
+      `the shared board could not be re-read before abandoning ${id} (${messageOf(e)}) — so a run ` +
+        `on another machine can't be ruled out; nothing was written, try again`,
+    );
+  }
+}
 
 /**
  * The write locks an abandon settles under: the target plus every bead its cascade closes. The
@@ -173,6 +243,51 @@ async function rereadLocked(repo: string, id: string): Promise<Bead> {
 }
 
 /**
+ * The board, re-read from inside the cascade's write locks — the single read every locked re-check
+ * below judges, so the cascade and the run-lease can never disagree about what the board holds.
+ * Fails the abandon rather than settling blind, for the same reason {@link rereadLocked} does.
+ */
+async function listLocked(repo: string, targetId: string, listArgs: string[]): Promise<Bead[]> {
+  try {
+    return await beads.list(repo, listArgs);
+  } catch (e) {
+    throw new NotAbandonableError(
+      `the board under ${targetId} could not be re-read under its write lock (${messageOf(e)}) — nothing was written; try again`,
+    );
+  }
+}
+
+/**
+ * Re-run the stopped-work boundary against the LOCKED board (anton-mivh).
+ *
+ * {@link stopRun}'s pre-lock check judged the run target derived from a board read taken before this
+ * abandon held any lock, and a re-parent is exactly what invalidates it: the gardener takes the write
+ * lock of the bead it MOVES, which is this target, so a move landing in that gap either shows up in
+ * the read this guards or queues behind the whole settle. {@link assertCascadeUnchanged} does not
+ * cover it — that watches the work BENEATH the target, while this is the target itself moving, and a
+ * ticket re-parented under a newly running feature would otherwise be closed beneath that live run.
+ *
+ * Only for a `requireStopped` abandon, whose entire precondition is that nothing is executing: with
+ * `stopped` set {@link stopRun} cancels nothing, so this is a pure re-check that either passes or
+ * refuses before the first bd write. A plain abandon kills what it finds, and the window left after
+ * its own boundary check is the one execute-epic's dispatch-time re-read absorbs.
+ */
+async function assertStillStopped(
+  projectId: string,
+  target: Bead,
+  board: Bead[],
+  stopped: StoppedWork | undefined,
+): Promise<void> {
+  if (!stopped) return;
+  await stopRun(projectId, runTargetOf(target, board), board, stopped);
+  for (const descendant of openDescendants(board, target.id)) {
+    if (beads.isRunTarget(descendant, board)) {
+      await stopRun(projectId, descendant.id, board, stopped);
+    }
+  }
+}
+
+/**
  * Refuse an abandon whose cascade moved between the snapshot it was planned from and the locks it
  * now holds (anton-e42l).
  *
@@ -188,20 +303,7 @@ async function rereadLocked(repo: string, id: string): Promise<Bead> {
  * is one this abandon holds no lock on, so closing it would race the very writes this serializes
  * against. Nothing has been written yet, so a retry re-plans against the board it just saw.
  */
-async function assertCascadeUnchanged(
-  repo: string,
-  target: Bead,
-  descendants: Bead[],
-  listArgs: string[],
-): Promise<void> {
-  let board: Bead[];
-  try {
-    board = await beads.list(repo, listArgs);
-  } catch (e) {
-    throw new NotAbandonableError(
-      `the board under ${target.id} could not be re-read under its write lock (${messageOf(e)}) — nothing was written; try again`,
-    );
-  }
+function assertCascadeUnchanged(target: Bead, descendants: Bead[], board: Bead[]): void {
   const before = new Set(descendants.map((d) => d.id));
   const after = openDescendants(board, target.id);
   const afterIds = new Set(after.map((b) => b.id));
@@ -245,8 +347,9 @@ function cascadeEntries(target: Bead, descendants: Bead[], why: string): Array<{
  * settled run target. A leaf ticket has no descendants, so it costs one board read and nothing else.
  *
  * `requireStopped` inverts the kill for a caller that decided against work it had observed STOPPED —
- * an escalation's abandon: a live run then means the decision is stale, so nothing is cancelled or
- * closed and `RunRestartedError` is thrown (see {@link stopRun}).
+ * an escalation's abandon: a run live on EITHER machine then means the decision is stale, so nothing
+ * is cancelled or closed and `RunRestartedError` is thrown (see {@link stopRun}). `ownRunId` exempts
+ * the stopped run's own leftover lease from that (see {@link StoppedWork}).
  *
  * Throws on an unknown id (bd's own error → 404), an empty/oversized reason (→ 400), or an
  * already-closed ticket (NotAbandonableError → 409).
@@ -255,18 +358,23 @@ export async function abandonTicket(
   project: Project,
   id: string,
   reason: string,
-  opts?: { requireStopped?: boolean },
+  opts?: { requireStopped?: boolean; ownRunId?: string },
 ): Promise<TicketDetail> {
   const why = requireReason(reason);
   const repo = project.repoPath;
+  const stopped = opts?.requireStopped === true ? { ownRunId: opts.ownRunId } : undefined;
+  // Before the reads, not after: parentage and the run-lease are both read off the board below, and
+  // `stopped` needs BOTH as the remote has them now (see {@link refreshSharedBoard}). The plain
+  // abandon reads no lease and kills what it finds, so it pays no pull.
+  if (stopped) await refreshSharedBoard(repo, id);
   const bead = await beads.show(repo, id); // 404 guard — bd throws on an unknown id
   assertOpen(bead, "Ticket");
 
+  // Labels hydrated (no --skip-labels): the run-lease `requireStopped` reads lives on them.
   const listArgs = ["--status", "all"];
   const board = await beads.list(repo, listArgs);
-  const requireStopped = opts?.requireStopped === true;
-  await stopRun(project.id, runTargetOf(bead, board), requireStopped);
-  const descendants = await stopDescendantRuns(project, bead, board, requireStopped);
+  await stopRun(project.id, runTargetOf(bead, board), board, stopped);
+  const descendants = await stopDescendantRuns(project, bead, board, stopped);
 
   // Abandoning a gardener PROPOSAL is a DECLINE (anton-1t3n): the `abandoned` label it just gained
   // is what stops the patrol re-filing the same claim, so say that on the bead — the suppression is
@@ -283,8 +391,13 @@ export async function abandonTicket(
   // the same reason the apply re-reads: the checks above judged a snapshot taken before whoever held
   // the lock ran.
   await withBeadWriteLocks(repo, cascadeLocks(bead, descendants), async () => {
-    assertOpen(await rereadLocked(repo, id), "Ticket");
-    await assertCascadeUnchanged(repo, bead, descendants, listArgs);
+    const locked = await rereadLocked(repo, id);
+    assertOpen(locked, "Ticket");
+    const lockedBoard = await listLocked(repo, id, listArgs);
+    assertCascadeUnchanged(bead, descendants, lockedBoard);
+    // The LOCKED bead, not the pre-lock snapshot: its parent is what the run target is derived from,
+    // and a re-parent is precisely what this re-check exists to catch (see assertStillStopped).
+    await assertStillStopped(project.id, locked, lockedBoard, stopped);
     // The ticket and its cascade settle as one unit — every close in a single bd transaction, the
     // ticket last (see beads.abandonAll).
     await beads.abandonAll(repo, cascadeEntries(bead, descendants, why));
@@ -344,7 +457,8 @@ export async function abandonEpic(
 
   // --skip-labels (bd 1.1.0): the cascade only inspects parent, status and type — openDescendants
   // walks the subtree, isRunTarget classifies it — so skipping label hydration keeps this
-  // full-board read lean.
+  // full-board read lean. Safe only because this path never passes `stopped`, whose lease check
+  // reads exactly those labels (see stopRun).
   const listArgs = ["--status", "all", "--skip-labels"];
   const all = await beads.list(repo, listArgs);
 
@@ -355,7 +469,7 @@ export async function abandonEpic(
   // work the board now calls won't-do. The epic's own id is cancelled too: a legacy (non-container)
   // epic is its own run target.
   await cancelRunForTarget(project.id, epicId);
-  const descendants = await stopDescendantRuns(project, epic, all, false);
+  const descendants = await stopDescendantRuns(project, epic, all, undefined);
 
   // Under the cascade's write locks, re-read and re-derived inside them, exactly as abandonTicket
   // settles: a gardener re-parent attaching work anywhere beneath this epic takes those same locks,
@@ -363,7 +477,7 @@ export async function abandonEpic(
   // or it queues behind this settle and its own home re-check refuses.
   await withBeadWriteLocks(repo, cascadeLocks(epic, descendants), async () => {
     assertOpen(await rereadLocked(repo, epicId), "Epic");
-    await assertCascadeUnchanged(repo, epic, descendants, listArgs);
+    assertCascadeUnchanged(epic, descendants, await listLocked(repo, epicId, listArgs));
     // The epic and its whole cascade settle as one unit — every close in a single bd transaction,
     // the epic last (see beads.abandonAll), so no state exists in which the epic reads as settled
     // above still-open orphaned children.

@@ -41,6 +41,38 @@ export class PoisonError extends Error {
  */
 export class PoisonEpic extends PoisonError {}
 
+/** How a blocked-run park lists the beads holding the run back — and how it is read back. */
+const BLOCKED_BY = / is blocked by ([^—]+) — refusing to execute/;
+
+/**
+ * The poison a run parks on when a prerequisite is still open. Built here, next to its parser,
+ * because that message is the ONLY durable record of WHICH beads held the run back: the run-health
+ * sweep reads the ids back out to tell a job stalled behind an open human gate — already reported as
+ * that gate's own wait — from one stalled on anything else. Reworded in one place only, the two
+ * would drift silently and the double escalation would come back.
+ */
+export function blockedByPoison(beadId: string, blockers: string[]): PoisonEpic {
+  return new PoisonEpic(
+    `${beadId} is blocked by ${blockers.join(", ")} — refusing to execute; ` +
+      `resume the run once the blocker(s) complete`,
+  );
+}
+
+/**
+ * The blocker ids a {@link blockedByPoison} park names, or undefined when the message is some other
+ * poison. Matched anywhere in the text so a caller can pass the park reason with the runner's
+ * `poison:` prefix — or a report finding's prose — still attached.
+ */
+export function poisonBlockerIds(parkMessage: string): string[] | undefined {
+  const match = BLOCKED_BY.exec(parkMessage);
+  if (!match) return undefined;
+  const ids = match[1]!
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean);
+  return ids.length > 0 ? ids : undefined;
+}
+
 /**
  * This run cannot safely proceed because it can't prove it exclusively holds the epic's live
  * run-lease (anton-jz1). Two triggers, same recovery:

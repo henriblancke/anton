@@ -352,6 +352,25 @@ describe("classifyFinding — an untrusted board fails CLOSED", () => {
 });
 
 describe("classifyFinding — the never-automatic kinds", () => {
+  it("escalates an open human gate — a wait by design still needs the person told", () => {
+    const verdict = classifyFinding(
+      finding({ kind: "needs-human", key: "needs-human:g-1", gateId: "g-1", beadId: "t-1" }),
+      ctx(),
+    );
+    expect(verdict.disposition).toBe("escalate");
+  });
+
+  it("holds a human gate resolved between the sweep and now — the wait already ended", () => {
+    // The escalation this would raise is unretirable: later reports simply omit the finding, so the
+    // false "Waiting on you" sits on the board until a human answers a question nobody is asking.
+    const verdict = classifyFinding(
+      finding({ kind: "needs-human", key: "needs-human:g-1", gateId: "g-1", beadId: "t-1" }),
+      ctx({ stillStuck: () => false }),
+    );
+    expect(verdict.disposition).toBe("hold");
+    expect(verdict.why).toContain("resolved");
+  });
+
   it.each(["stale-pr", "exhausted-job"] as const)(
     "escalates %s rather than retrying it",
     (kind) => {

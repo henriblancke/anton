@@ -68,6 +68,7 @@ import {
 } from "./review-gate";
 import { persistPartialReviewScores, persistReviewScores } from "./review-score";
 import {
+  blockedByPoison,
   isPoisonError,
   isRecoverableClaudeError,
   isUsageLimitError,
@@ -257,12 +258,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     // step 0 after the cross-machine pull refreshes `all` (a blocker another machine pushed since
     // would be invisible to this pre-pull snapshot).
     const blockers = computeBlockers(all);
-    if (blockers.length > 0) {
-      throw new PoisonEpic(
-        `${epicBeadId} is blocked by ${blockers.join(", ")} — refusing to execute; ` +
-          `resume the run once the blocker(s) complete`,
-      );
-    }
+    if (blockers.length > 0) throw blockedByPoison(epicBeadId, blockers);
 
     // A grouping target runs all its children into one PR; a leaf target IS its own single ticket
     // (an epic-of-one). The rest of the pipeline — worktree, per-ticket claude→tests→commit→close,
@@ -565,12 +561,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //     takes the idempotent "done" path instead of parking, and BEFORE adopting/publishing any
       //     lease (below) so a park leaves nothing for `finally` to clear.
       const freshBlockers = computeBlockers(all);
-      if (freshBlockers.length > 0) {
-        throw new PoisonEpic(
-          `${epicBeadId} is blocked by ${freshBlockers.join(", ")} — refusing to execute; ` +
-            `resume the run once the blocker(s) complete`,
-        );
-      }
+      if (freshBlockers.length > 0) throw blockedByPoison(epicBeadId, freshBlockers);
 
       // 0a-ter. Re-derive the target's SHAPE against the freshly-pulled board. Runnability and
       //     grouping are properties of the whole BOARD, not of the bead: another machine can add or
