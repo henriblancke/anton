@@ -471,9 +471,13 @@ async function answerGateWait(
   }
   if (dispatch.verdict === "hold") {
     const on = dispatch.target ? ` on ${dispatch.target}` : "";
+    // The suffix names what gate-check is actually waiting on: an unread board clears on the next
+    // read, every other hold clears only when its own condition does (approval, a claim, a second
+    // blocker). Promising "the board reads clear" for those sends the operator hunting a transient
+    // read problem instead of the thing that needs their attention.
     const line =
       `[unstick] gate resolved${on}, but ${dispatch.reason} — not resuming; ` +
-      `gate-check dispatches it once the board reads clear`;
+      `gate-check dispatches it once ${dispatch.unread ? "the board reads clear" : "the hold clears"}`;
     // A board that didn't answer is an anomaly worth the louder level; a board that answered "not
     // yet" is the feature working.
     if (dispatch.unread) console.warn(line);
