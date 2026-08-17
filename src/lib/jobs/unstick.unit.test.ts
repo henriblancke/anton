@@ -113,6 +113,21 @@ describe("classifyFinding — parked runs", () => {
     expect(verdict.why).toContain("cancelled");
   });
 
+  it("HOLDS a non-quota park whose epic an operator cancelled — a stop is not a judgment call", () => {
+    // The cancel settles the JOB; the run row stays parked with whatever error stopped it, so this
+    // finding comes back every sweep. Escalating it asks the founder to re-decide a stop they
+    // already made — and its Abandon would close a bead they may have left open on purpose.
+    const verdict = classifyFinding(
+      finding({ reason: "parked 4h ago: agent exited 1" }),
+      ctx({
+        parkedRuns: new Map([["r-1", run({ error: "agent exited 1" })]]),
+        epicCancelled: () => true,
+      }),
+    );
+    expect(verdict.disposition).toBe("hold");
+    expect(verdict.why).toContain("cancelled");
+  });
+
   it("escalates a park with any other reason — those are judgment calls", () => {
     const verdict = classifyFinding(
       finding({ reason: "parked 4h ago: agent exited 1" }),
