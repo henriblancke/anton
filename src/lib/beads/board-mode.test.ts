@@ -10,7 +10,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { runDoltSync } from "./bd";
+import { resetServerPreflight, runDoltSync } from "./bd";
 import { PROJECT_SCOPED_BD_ENV, isServerMode, readBoardMode, resetBoardModeCache } from "./board-mode";
 
 /** Mirrors bd.ts's internal BdExec seam; kept local so the test does not widen that module's API. */
@@ -31,6 +31,9 @@ function repo(metadata: Record<string, unknown> | null): string {
 
 afterEach(() => {
   resetBoardModeCache();
+  // The preflight registry is globalThis-anchored, so it outlives this file's module instance.
+  // Cleared here so one test's successful preflight can never satisfy another's.
+  resetServerPreflight();
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
@@ -83,10 +86,45 @@ describe("runDoltSync — server mode is a no-op (anton-0tul)", () => {
       calls.push(args);
       return "";
     };
-    // The preflight is the one permitted call; it is `dolt test`, never pull/commit/push.
+    // The preflight is the one permitted call; it is `dolt test`, never pull/commit/push. Asserted
+    // positively as well as negatively: without the `toContain`, silently dropping the preflight
+    // would still satisfy both `not.toContain`s.
     await expect(runDoltSync(dir, exec, "full")).resolves.toBe("shared-server");
+    expect(calls.map((a) => a.join(" "))).toContain("dolt test");
     expect(calls.map((a) => a.join(" "))).not.toContain("dolt pull");
+    expect(calls.map((a) => a.join(" "))).not.toContain("dolt commit");
     expect(calls.map((a) => a.join(" "))).not.toContain("dolt push");
+  });
+
+  // The "a server that comes back is picked up on the next beat" guarantee (anton-eg46). The
+  // mechanism is that the preflight records the cwd only on SUCCESS, so a failure leaves nothing
+  // cached and the next pass retries. Deliberately no resetServerPreflight() between the two calls
+  // — clearing the cache by hand would prove nothing about the retry.
+  it("retries the preflight on the next pass when the server was unreachable", async () => {
+    const dir = repo({ dolt_mode: "server", dolt_server_host: "h", dolt_server_port: 3306 });
+    let attempts = 0;
+    const exec: TestExec = async (_cwd: string, args: string[]) => {
+      if (args.join(" ") === "dolt test" && ++attempts === 1) {
+        throw new Error("dial tcp 127.0.0.1:3306: connection refused");
+      }
+      return "";
+    };
+    await expect(runDoltSync(dir, exec, "full")).rejects.toThrow(/unreachable/);
+    await expect(runDoltSync(dir, exec, "full")).resolves.toBe("shared-server");
+    expect(attempts).toBe(2);
+  });
+
+  // The other half of that contract: a SUCCESSFUL preflight is not repeated for the same repo.
+  it("preflights once per repo across passes once the server answers", async () => {
+    const dir = repo({ dolt_mode: "server", dolt_server_host: "h", dolt_server_port: 3306 });
+    let attempts = 0;
+    const exec: TestExec = async (_cwd: string, args: string[]) => {
+      if (args.join(" ") === "dolt test") attempts++;
+      return "";
+    };
+    await expect(runDoltSync(dir, exec, "full")).resolves.toBe("shared-server");
+    await expect(runDoltSync(dir, exec, "full")).resolves.toBe("shared-server");
+    expect(attempts).toBe(1);
   });
 
   it("still runs the full pull/commit/push in embedded mode", async () => {

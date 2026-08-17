@@ -801,20 +801,32 @@ export type SyncOutcome = "synced" | "not-wired" | "shared-server";
  *   Dolt server unreachable at 127.0.0.1:0 and auto-start failed:
  *   dolt is not installed (not found in PATH)
  */
-const preflighted = new Set<string>();
+const PREFLIGHTED_KEY = Symbol.for("anton.beads.preflight");
+
+/**
+ * Anchored on `globalThis` for the same cross-bundle reason as the status registry above: a route
+ * handler bundle and the instrumentation-started sync engine each load their own compiled copy of
+ * this module, and a plain module-level Set would give each one its own — turning "once per
+ * process" into "once per bundle" and re-running `bd dolt test` for every one of them.
+ */
+function preflightedSet(): Set<string> {
+  const g = globalThis as unknown as Record<symbol, Set<string> | undefined>;
+  return (g[PREFLIGHTED_KEY] ??= new Set());
+}
 
 /** Tests only — production preflights once per process by design. */
 export function resetServerPreflight(): void {
-  preflighted.clear();
+  preflightedSet().clear();
 }
 
 export async function preflightSharedServer(cwd: string, exec: BdExec = bd): Promise<void> {
-  if (preflighted.has(cwd)) return;
+  if (preflightedSet().has(cwd)) return;
   const { host, port, database } = readBoardMode(cwd);
   const target = `${host ?? "?"}:${port ?? "?"}${database ? `/${database}` : ""}`;
   try {
     await exec(cwd, ["dolt", "test"]);
-    preflighted.add(cwd);
+    // Recorded only on success, so a server that was down is retried on the next beat.
+    preflightedSet().add(cwd);
   } catch (e) {
     const err = e as Error & { stdout?: string; stderr?: string };
     const output = `${err.stderr ?? ""}\n${err.stdout ?? ""}`.trim() || err.message;
