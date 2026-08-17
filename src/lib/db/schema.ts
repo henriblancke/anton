@@ -272,6 +272,16 @@ export const scanSummaries = sqliteTable(
     beadsDeduped: integer("beads_deduped"),
     /** Collectors that died mid-scan: every one is a hole in the counts above. */
     collectorFailures: integer("collector_failures").notNull().default(0),
+    /**
+     * The commit the scanned working tree held (anton-qor2). NULL for rows written before it was
+     * tracked, or when git could not name one.
+     *
+     * A point on the trend is a measurement of a TREE, and until this was recorded nothing said
+     * which: the 2026-08-06 nightly measured a checkout 6 commits behind origin/main and the column
+     * it charted was indistinguishable from one measuring the shipped code. Stale is now visible on
+     * the point rather than inferred from a diff hours later.
+     */
+    scannedSha: text("scanned_sha"),
   },
   (table) => [
     // Serves "this project's last N scans" (and the prune) without a full scan.

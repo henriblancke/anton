@@ -123,6 +123,20 @@ describe("scan", () => {
     expect(globs).toContain(".claude/**");
   });
 
+  it("excludes anton's own database, a githygiene finding that recurs on every scan of this repo", async () => {
+    const argvDump = join(dir, "argv.json");
+    process.env[STRINGER_BIN_ENV] = writeFakeStringer(argvDump, []);
+
+    await scan({ repoPath: "/repo", scanFile: join(dir, "s.json") });
+
+    // anton.db sits at the repo root of the project anton runs FROM; `githygiene` walks the working
+    // tree, so a gitignored multi-megabyte SQLite file is reported as a large binary every night
+    // (anton-qor2). The glob also covers SQLite's -wal/-shm sidecars.
+    expect(DEFAULT_SCAN_EXCLUDES).toContain("anton.db*");
+    const globs = argvOf(argvDump)[argvOf(argvDump).indexOf("--exclude") + 1].split(",");
+    expect(globs).toContain("anton.db*");
+  });
+
   it("appends caller-supplied excludes after the defaults", async () => {
     const argvDump = join(dir, "argv.json");
     process.env[STRINGER_BIN_ENV] = writeFakeStringer(argvDump, []);

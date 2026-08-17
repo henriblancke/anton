@@ -94,6 +94,20 @@ describe("CodebaseSignalsSection", () => {
     expect(screen.getByText(/triaged into 2 beads · 1 deduped/)).toBeTruthy();
   });
 
+  it("names the tree the scan measured, abbreviated with the full sha on hover", () => {
+    const sha = "a338176aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const points = [{ ...point("a", 1_700_000_000, { low: 3 }), sha }];
+    render(<CodebaseSignalsSection scanHealth={health({ points })} />);
+    expect(screen.getByText("a338176a")).toBeTruthy();
+    expect(screen.getByTitle(`commit ${sha}`)).toBeTruthy();
+  });
+
+  it("claims no tree for a scan recorded before anton knew which one it measured", () => {
+    render(<CodebaseSignalsSection scanHealth={health()} />);
+    // Naming a commit is the whole point of the label — an absent sha must not render an empty one.
+    expect(screen.queryByTitle(/^commit /)).toBeNull();
+  });
+
   it("flags a scan whose collectors died — its counts are an undercount", () => {
     render(<CodebaseSignalsSection scanHealth={health({ collectorFailures: 1 })} />);
     expect(screen.getByText("1 collector failed")).toBeTruthy();

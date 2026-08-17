@@ -52,7 +52,9 @@ describeBd("nightly-stringer e2e (real handler · real bd · fake stringer/claud
     });
 
   beforeAll(async () => {
-    bdRepo = makeBdRepo({ initialCommit: true });
+    // `bare`: the pass refreshes the checkout against origin before it scans and stands down when
+    // it can't (anton-qor2), so a remote-less sandbox would park every case here.
+    bdRepo = makeBdRepo({ bare: true, initialCommit: true });
     sandbox = bdRepo.dir;
     repo = bdRepo.repo;
     binDir = join(sandbox, "bin");

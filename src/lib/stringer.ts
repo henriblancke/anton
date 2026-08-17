@@ -71,6 +71,12 @@ export const DEFAULT_SCAN_EXCLUDES = [
   ".git/**",
   ".anton/**",
   ".beads/**",
+  // anton's own database, which lives at the repo root of the project it is run FROM. It is
+  // gitignored and disposable, but `githygiene` walks the working tree rather than the index and
+  // reports it as a multi-megabyte "large binary file" on every single scan of anton's own repo —
+  // a finding that is never actionable and that triage pays for nightly. The `*` also covers
+  // SQLite's `-wal`/`-shm` sidecars, which are flagged the same way.
+  "anton.db*",
   // Claude Code's `isolation: worktree` checks a SECOND copy of the whole tree out at
   // `.claude/worktrees/<name>/`, inside the repo. Walking it double-counts every file: the
   // 2026-08-05 scan spent 118 of its 211 signals reporting src/x as a clone of
