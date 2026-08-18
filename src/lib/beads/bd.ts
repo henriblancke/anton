@@ -13,7 +13,7 @@ import { resolveBdBin } from "./bd-bin";
 import { PROJECT_SCOPED_BD_ENV, isServerMode, readBoardMode } from "./board-mode";
 import { withBeadWriteLock } from "./claim-lock";
 import { isPipelineArtifact } from "./contract";
-import { invalidateIssueSnapshot } from "./snapshot";
+import { invalidateIssueSnapshot, issueSnapshotRefreshInFlight } from "./snapshot";
 
 // Bead/BeadDep live in the leaf ./types module so snapshot.ts can share them without importing
 // bd.ts back (breaking the bd ↔ snapshot cycle, anton-mur). Re-exported here so every existing
@@ -944,7 +944,17 @@ export function createDoltSync(
   // "N unpushed" after N failed retries (anton-rn88 review).
   const start = (cwd: string, mode: SyncMode, newWork: boolean): Promise<SyncOutcome> => {
     recordStatus(cwd, { state: "syncing" });
-    const p = runDoltSync(cwd, exec, mode).then((outcome) => {
+    // Never start a pass on top of this process's OWN background board read (anton-3dpp). An
+    // embedded board is single-holder: `bd dolt pull` takes the repo's exclusive Dolt lock, and a
+    // `bd list` still holding it makes that pull FAIL rather than wait. The snapshot layer fires
+    // those reads deliberately un-awaited (so a UI read never waits behind Dolt) — including the one
+    // this very engine triggers when a pass ends and invalidates the snapshot — so without this the
+    // collision is self-inflicted and load-dependent: the busier the box, the longer the read runs
+    // and the wider the window. What it cost was never a lost sync alone; a run publishing its
+    // run-lease through this pass fails CLOSED on it and reschedules as "live elsewhere" when
+    // nothing was live anywhere. We wait for the read to be OVER, not for its beads, and only for
+    // one already in flight — a repo whose reads keep re-firing can still never starve a pass.
+    const record = (outcome: SyncOutcome): SyncOutcome => {
       if (outcome === "shared-server") {
         // Every writer is already on the one database, so there is no backlog and nothing to
         // reconcile — record the state and stop forcing full backstop passes (anton-0tul).
@@ -968,7 +978,11 @@ export function createDoltSync(
         if (mode === "full") reconciled.add(cwd); // a full pass pushed — the backlog is reconciled
       }
       return outcome;
-    });
+    };
+    const p = Promise.resolve(issueSnapshotRefreshInFlight(cwd))
+      .catch(() => {}) // a failed read is the reader's business; it still released the lock
+      .then(() => runDoltSync(cwd, exec, mode))
+      .then(record);
     running.set(cwd, p);
     // Bookkeeping only — callers hold `p` and see its rejection; this chain must not re-reject.
     void p
