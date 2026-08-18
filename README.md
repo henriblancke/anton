@@ -4,7 +4,14 @@
 
 <h1 align="center">anton</h1>
 
-<p align="center"><strong>Shape an idea into an epic, approve it, and let it ship itself.</strong></p>
+<p align="center"><strong>Shape an idea into a feature, approve it, and let it ship itself.</strong></p>
+
+anton is a local app that turns ideas — yours, or findings from scanning your code — into merged pull requests. You describe what you want and approve the plan; anton does the rest: it spins up an isolated git worktree, drives `claude` to write the code, runs your verify gates, reviews its own diff in a fresh context, opens the PR, and keeps working it until CI is green and reviewers are satisfied.
+
+- **You decide twice; anton does the rest.** Approve the work, merge the PR — everything between runs on its own.
+- **Nothing runs unapproved.** Every piece of work is a readable contract (Goal, Acceptance, Verify) you sign off before a line is written.
+- **Everything is visible.** A live board, streaming terminals, run history, review scores, a health page — and when something stalls, it surfaces as a decision for you, never a silent hang.
+- **Local and private.** anton runs on your machine and drives your local `claude`, `git`, `gh`, and `bd`. Nothing to sign up for, nothing leaves your machine.
 
 ## Get started
 
@@ -19,73 +26,79 @@ Then set it up and start the server:
 ```bash
 anton setup                    # check prereqs, migrate the DB, install skills & agents
 anton start                    # start the server → http://localhost:3000
-open http://localhost:3000     # add a repo, shape an epic, approve, watch it run
+open http://localhost:3000     # add a repo, shape a feature, approve, watch it run
 ```
 
 anton drives your local `claude`, `git`, `gh`, and `bd` — install those first ([Prerequisites](#prerequisites)). For how the bundle works and how to manage it see [Install](#install); to hack on anton itself, run it [from source](#from-source-contributors).
 
-## What is anton
-
-anton is a local app that takes an idea — or a finding from scanning your code — and turns it into work that gets done while you watch. You describe what you want; anton **shapes** it into an epic with concrete tickets and sets it aside for your OK. Once you **approve**, it runs each ticket **autonomously**: it spins up an isolated git worktree, drives `claude` to write the code, runs your tests, and opens a **pull request**. Then it keeps working the PR for you — when a reviewer asks for changes or CI goes red, it **auto review-fixes** until the PR is clean.
-
-The loop, in one line:
+## How it works
 
 ```
-shape → approve → autonomous run → PR → auto review-fix
+shape → approve → run (worktree → claude → verify gates → self-review) → PR → review-fix → merge
 ```
 
-You stay in control at exactly two points — approving the epic and merging the PR. Everything in between runs on its own.
+1. **Shape.** An interactive `/shape` session turns your idea into an **epic** (the product outcome) and **features** under it — each feature one PR's worth of work with Goal, Acceptance criteria, and tickets. It lands in **backlog**, unapproved.
+2. **Approve.** You read the contract and click **Approve** — or **Queue**, to pace the run against your Claude usage. anton only ever executes approved work.
+3. **Run.** One worktree, one PR. anton works the feature's tickets — `claude` implements (base contract + your seed prompt + the ticket's agent prompt), your verify gates check each step, and a fresh-context **self-review** scores the diff and fixes blocking findings — then it commits and opens the PR.
+4. **Review-fix.** A scheduled job watches the open PR: reviewer comments and failing checks are dispatched back to `claude`, pushed, and review re-requested until the PR is clean. You merge.
 
-> **Local, not deployed.** anton runs as a Next.js server on your machine and drives your local `claude`, `git`, `gh`, `bd`, and `stringer`. It is not a hosted service — there's nothing to sign up for and nothing leaves your machine. See [`DESIGN.md`](./DESIGN.md) for the full architecture.
+> **Local, not deployed.** anton runs as a Next.js server on your machine and drives your local `claude`, `git`, `gh`, `bd`, and `stringer`. See [`DESIGN.md`](./DESIGN.md) for the full architecture.
 
-## What it does
+**beads is the source of truth for work.** Epics, features, tickets, approval, stage, and the PR link all live in each repo's `.beads/` (queried via `bd`). Beads state syncs between machines via Dolt — `refs/dolt/data` on the git remote, configured by `anton setup` — so a fresh clone hydrates its board with `bd dolt pull`, not from files in the clone. The `.beads/*.jsonl` files are passive local exports for viewers: git-ignored, regenerated, and never the source of truth. anton's own SQLite (`anton.db`) holds only machine-local execution state: projects, runs, jobs, schedules, and sessions — it's disposable and git-ignored.
 
-The core loop:
-
-```
-Add a repo  →  /shape an epic (interactive)  →  it lands in "backlog"
-            →  you Approve the epic
-            →  anton runs it: worktree → claude (+ agent prompt) → tests → commit → PR
-            →  epic moves to "in-review" with a live terminal + PR link
-            →  review-fix watches the PR: resolves review comments + CI failures, pushes, re-requests review
-```
-
-Plus two scheduled background jobs, per project:
-
-- **nightly-stringer** — scans the repo for actionable signals (`stringer scan --delta`) and triages the few worth doing into well-formed beads.
-- **orphan-grooming** — buckets loose tickets (no parent epic) under a grooming epic so they become approvable work.
-
-**beads is the source of truth for work.** Epics, tickets, approval, stage, and the PR link all live in each repo's `.beads/` (queried via `bd`). Beads state syncs between machines via Dolt — `refs/dolt/data` on the git remote, configured by `anton setup` — so a fresh clone hydrates its board with `bd dolt pull`, not from files in the clone. The `.beads/*.jsonl` files are passive local exports for viewers: git-ignored, regenerated, and never the source of truth. anton's own SQLite (`anton.db`) holds only machine-local execution state: projects, runs, jobs, schedules, and sessions — it's disposable and git-ignored.
-
-## Feature walkthrough
+## Features
 
 ### The board
 
-![The epics board — four stage columns derived live from beads](docs/images/board.png)
+![The board — features moving through four stages, derived live from beads](docs/images/board.png)
 
-A project's home is a four-column board — **backlog → implementing → in-review → done** — with a live count on each column and a **live-synced** pill that shows the board is following beads in real time. Every stage is derived from beads at read time (an epic's tickets and its PR state decide where it sits), so the board is never a cache to reconcile: approve an epic in backlog and it moves right on its own as its runs land. In-review cards carry their PR number, and backlog cards expose the controls directly — **Approve** to start automation, or **Claim** to reserve an epic for yourself without approving it yet (**Release** to drop the claim). Loose bugs and tasks with no parent epic surface in their own **Standalone** lane so they're just as approvable as epics.
+A project's home: **backlog → implementing → in-review → done**, derived from beads at read time — never a cache to reconcile. Group by stage or by epic, filter by epic or area, search everything (`⌘K`). Cards carry their epic, agent, risk, size, review score, and PR; backlog cards expose **Approve**, **Queue**, and **Claim** directly. Loose bugs and tasks surface in a **Standalone** lane, just as approvable. A **health pill** and a **sync pill** keep the scan trend and board freshness in view.
 
-### Epic detail
+### Needs you
 
-![An epic's contract and its live dependency graph](docs/images/epic.png)
+![The Needs-you strip — stalls surfaced as decisions](docs/images/needs-you.png)
 
-Opening an epic shows its full contract — Goal, Acceptance, and child tickets with size labels — beside a live **dependency graph** of the ticket DAG (`blocks` / `part of` edges, laid out left→right). This is the review-and-approve gate from step 3 of the loop: you read exactly what anton will build before anything runs, then **Run epic** launches it (or **Open worktree** to inspect the isolated checkout).
+Nothing wedges silently. A parked run, a job out of retries, or a gate waiting on a human surfaces on the board as an escalation with the decision inline — **Resume** or **Abandon** — and disappears the moment it's settled.
+
+### Feature detail
+
+![A feature's contract, self-review rounds, and live dependency graph](docs/images/epic.png)
+
+The approval gate. A feature shows its full contract — Goal, Acceptance, tickets, PR — beside the live **dependency graph** of its ticket DAG. Below it, the **self-review** record: each round with its score and findings, so you can see what the reviewer flagged and what got fixed before the PR opened. **Send back** reworks a feature with your notes — even after its PR opened or merged. **Open worktree** drops you into the isolated checkout.
+
+### Roadmap
+
+![The roadmap — epics, priorities, areas, and shipped counts](docs/images/roadmap.png)
+
+The epic-level view: every product outcome with its priority, area, and features shipped. Epics can sync to **Linear** (`bd linear sync`) if you track them there too.
+
+### Health
+
+![The health page — patrol, scan trend, review trajectory](docs/images/health.png)
+
+How the codebase and the system are doing: **Worth a look** flags work that stalled (in progress but untouched for days), **Codebase signals** tracks each nightly scan — new signals by severity, what got triaged into beads, what was deduped — and **Housekeeping** counts contract gaps, stale claims, and shipped-but-open work. The sidebar holds the scan trend and the **review-score average** across recent runs.
 
 ### Tickets
 
-![The filterable tickets list across all epics](docs/images/tickets.png)
+![The filterable tickets index](docs/images/tickets.png)
 
-The tickets view is the flat, cross-epic index — every epic and ticket in the project with its id, parent epic, agent, risk, and size, filterable by any of those plus title, status, and type. It's the granular counterpart to the board: where the board tracks epics through stages, this is where you scan, filter, and drill into individual work items.
+The flat, cross-epic index: every epic, feature, and ticket with its id, epic, agent, claim, risk, and size — filterable by all of it plus title, status, type, and outcome. Where the board tracks features through stages, this is where you scan and drill in.
 
-### More views
+### Runs & jobs
 
-Three more views round out a project, in the left nav:
+![Run history — every worktree anton has executed](docs/images/runs.png)
 
-- **Dependencies** — the project-wide dependency graph across every epic and ticket, so you can see the whole DAG at once rather than one epic at a time.
-- **Runs** — every run anton has executed, each with its epic · ticket · agent, status (done / failed), and duration. Runs are the per-ticket unit of work: a worktree, a `claude` session, tests, a commit.
-- **Jobs** — the background job queue behind those runs — `execute-epic`, `review-fix`, and the scheduled jobs — showing what's running, queued, done, or parked, with attempts and timing. A stuck job can be **force-killed** here.
+**Runs** is the execution history — every worktree with its feature · ticket · agent, status, and duration. **Jobs** is the queue behind them — what's running, queued, done, or parked, with attempts, live output, an **Investigate** shortcut, and a **Force kill** for anything stuck.
 
-A global **usage pill** in the sidebar tracks your live Claude session and weekly limits at a glance (toggle with `ANTON_USAGE_PILL`).
+### The board tends itself
+
+Scheduled passes keep the queue healthy without you: **nightly-stringer** scans the repo and triages real signals into well-formed beads, **orphan-grooming** buckets loose tickets into approvable work, and a **product-master** pass reads the whole board and proposes reprioritizations, rehomes, splits, and kills. Every proposal is a bead you accept or decline — and per detection kind you dial autonomy from **propose** (file it and stop) through **shadow** (also record what applying would have done) to **apply** (write it, with an audit trail under Jobs).
+
+### The pipeline is yours
+
+The run pipeline is a bd formula at `.beads/formulas/anton-run.formula.toml` — git-tracked, project-owned, editable. **Pipeline variants** walk a different formula for beads carrying a label (say, a stricter pipeline for `risk:high`; first match wins). **Verify gates** (test, lint, typecheck, build) run in the worktree before every commit and before every review-fix push. Specialist **agent prompts** ride on `agent:` labels, and a **seed prompt** layers your conventions onto every run.
+
+Also in a project's nav: **Dependencies**, the project-wide DAG across every epic and ticket. In the sidebar: a live Claude **usage pill** (toggle with `ANTON_USAGE_PILL`) and the workspace switcher — anton drives as many repos as you point it at.
 
 ## Prerequisites
 
@@ -225,20 +238,19 @@ You stay in control at two points — approving the feature and merging the PR. 
 
 Each project has its own settings (under **Settings** for that project). Nothing here is required — sensible defaults apply when a field is empty.
 
-| Setting | What it controls |
+| Section | What it controls |
 |---------|------------------|
-| **Model** | Which model the headless `claude` driver uses for runs (Opus / Sonnet / Haiku / Fable, or **Default** to use `claude`'s own configured model). |
-| **Seed prompt** | Extra operator guidance layered onto the locked base contract for every run — conventions, things to avoid, where key files live. It customizes *how* epics are approached; it can't override the base contract. Empty = base + agent prompt only. |
-| **Review-fix prompt** | Overrides the default review-fix reasoning prompt (`skills/review-fix/SKILL.md`). anton appends the concrete PR context beneath it. Empty = the shipped default. |
-| **Verify gates** | The commands anton runs in a worktree to verify a ticket before committing — **test**, plus optional **lint**, **typecheck**, and **build**. Each is a shell command; a non-zero exit fails the ticket. Unset gates are skipped. |
-| **Active agents** | Which specialist agent prompts dispatch may assign. A run whose ticket needs a disabled agent is **parked** rather than silently run with the default. Empty (never set) = all discovered agents active. |
-| **Base branch** | The branch runs target and open their PRs against (defaults to the repo's detected default branch). |
-| **Conventional-commit PR titles** | When on, prefixes the epic PR title with a derived `<type>(<scope>): ` (bug→`fix`, epic/task→`feat`; scope = the `agent:` label). Off by default — the title stays `<title> (<id>)`. |
-| **Max concurrent runs** | How many worktrees run in parallel (1–6). |
-| **Job timeout / max retries** | Wall-clock limit for a single job attempt, and how many attempts before a job is parked for a human. |
-| **Autonomous execution** | Whether approved epics run without further prompting. When off, approval still enqueues the run but it waits until you turn autonomy back on. |
-
-The three background jobs (**review-fix**, **nightly-stringer**, **orphan-grooming**) can each be toggled on/off per project under **Automation**.
+| **General** | Name, repository path, base branch runs open PRs against, and which model the headless `claude` driver uses (Opus / Sonnet / Haiku / Fable, or **Default** for `claude`'s own configured model). |
+| **Active agents** | Which specialist agent prompts dispatch may assign. A ticket needing a disabled agent is **parked**, never silently run with the default. Empty (never set) = all discovered agents active. |
+| **Execution prompt** | Operator guidance layered onto the locked base contract for every run — conventions, pitfalls, where key files live. It customizes *how* work is approached; it can't override the base contract. |
+| **Pipeline variants** | Per-label pipeline overrides — beads carrying a matching label walk their own formula instead of `anton-run.formula.toml`; first match wins. |
+| **Concurrency & limits** | Parallel runs (1–6), job/ticket timeouts, retries before parking, conventional-commit PR titles, budget-aware pacing (enables **Queue**), and the **autonomous execution** switch — when off, approvals still enqueue but nothing runs. |
+| **Verify gates** | The commands that gate every commit — **test**, plus optional **lint**, **typecheck**, and **build**. Each is a shell command; a non-zero exit fails the ticket. Unset gates are skipped. |
+| **Self-review** | The pre-PR review gate — on by default, findings fixed in a bounded loop. Swap the reviewer for one of the project's agents or a custom prompt. |
+| **Review-fix** | Overrides the default review-fix reasoning prompt (`skills/review-fix/SKILL.md`). anton appends the concrete PR context beneath it. |
+| **Automation** | Every scheduled job's on/off and cadence (see [Default schedules](#default-schedules)), plus the product-master prompt override. |
+| **Proposal autonomy** | How far an automated pass may go with what it finds, per detection kind: **propose** / **shadow** / **apply**. Unattended writes are recorded under Jobs. |
+| **Danger zone** | Remove the project from anton (the repo and its beads are untouched). |
 
 ### Default schedules
 
@@ -247,8 +259,9 @@ Default per-project schedules are seeded on project creation:
 - **review-fix** — every 15 min (`*/15 * * * *`)
 - **nightly-stringer** — daily at 03:00 (`0 3 * * *`)
 - **orphan-grooming** — weekly, Mon 04:00 (`0 4 * * 1`)
+- **run-health** — hourly stall sweep (`0 * * * *`), off by default
 
-Edit the cron or disable any of them in project settings.
+More job types can be put on a cron under **Automation** — **gate-check** (settle waits on human gates), **unstick** (recover wedged jobs), **gardener** (board hygiene detections), and **product-master** (whole-board proposals). Edit the cadence or disable any of them in project settings.
 
 ## Configuration
 
