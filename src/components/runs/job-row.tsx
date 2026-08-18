@@ -154,7 +154,7 @@ export function JobRowActions({
   if (!isActionable(affordances)) return null;
 
   return (
-    <div className="flex shrink-0 items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
+    <div className="flex shrink-0 items-center gap-1.5">
       {affordances.resumable && <ResumeJobButton slug={slug} jobId={jobId} />}
       <ViewOutputAction affordances={affordances} panels={panels} />
       <InvestigateAction slug={slug} jobId={jobId} affordances={affordances} panels={panels} />
