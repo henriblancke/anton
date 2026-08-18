@@ -276,12 +276,18 @@ export function nextAction(
       // A run is live on another machine (anton-jz1). Retry after a cool-off, refunding the attempt:
       // it's not this job's failure and the foreign run may hold its lease for a long time, so it
       // must never park for a human — it re-checks liveness each time until the lease clears.
+      // KEEP the classified reason (anton-3dpp). "lease-held" covers two situations an operator has
+      // to tell apart: another machine demonstrably holds the lease, and this run could not PROVE it
+      // holds one (a board write/read that failed, so it fails closed). Both reschedule identically,
+      // so the row's text is the only place the difference can survive — dropping it left a job
+      // whose only record said "run live elsewhere" when nothing had read a foreign lease at all,
+      // undiagnosable here and in CI (the runner's logger is a no-op in tests).
       const runAtMs = nowMs + config.quotaCooloffMs;
       return {
         action: "reschedule",
         runAtMs,
         refundAttempt: true,
-        lastError: `run live elsewhere: retries at ${new Date(runAtMs).toISOString()}`,
+        lastError: `run live elsewhere: ${outcome.error} — retries at ${new Date(runAtMs).toISOString()}`,
       };
     }
     case "not-wired": {

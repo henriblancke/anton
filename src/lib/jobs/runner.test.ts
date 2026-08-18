@@ -88,6 +88,19 @@ describe("nextAction (pure durability policy)", () => {
     expect(a.refundAttempt).toBe(true);
   });
 
+  it("keeps the classified reason on the row a lease-held reschedule writes (anton-3dpp)", () => {
+    // Two very different situations reschedule identically: a foreign machine holding the lease, and
+    // a run that could not PROVE it holds one because its board write failed. The row's text is the
+    // only place that difference survives — a bare "run live elsewhere" reads as the first when it
+    // was the second, and sends an operator (or a CI reader) looking for a machine that never ran.
+    const unproven =
+      "epic-1 could not publish its run-lease to the shared board (bd dolt push failed) — parking";
+    const a = nextAction(CONFIG, { attempts: 1 }, { kind: "lease-held", error: unproven }, now);
+    if (a.action !== "reschedule") throw new Error("unreachable");
+    expect(a.lastError).toContain(unproven);
+    expect(a.lastError).toContain(new Date(now + CONFIG.quotaCooloffMs).toISOString());
+  });
+
   it("classifies RunAlreadyLiveError as a lease-held outcome (anton-jz1)", () => {
     expect(classifyError(new RunAlreadyLiveError("live on B"))).toEqual({
       kind: "lease-held",

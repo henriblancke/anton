@@ -19,6 +19,7 @@ import {
   unclaimableStatus,
   type Bead,
 } from "./bd";
+import { refreshIssueSnapshot, resetIssueSnapshots } from "./snapshot";
 
 const bead = (b: Partial<Bead>): Bead => ({ id: "x", title: "x", status: "open", ...b }) as Bead;
 
@@ -643,6 +644,54 @@ describe("createDoltSync", () => {
     release();
     await Promise.all([first, second, third]);
     expect(runs).toBe(2); // 3 requests → 1 running + 1 trailing
+  });
+
+  it("waits for an in-flight background board read before taking the Dolt lock (anton-3dpp)", async () => {
+    // An embedded board is single-holder: `bd dolt pull` FAILS (it does not queue) while a `bd list`
+    // still holds the repo's lock — and the snapshot layer fires those reads un-awaited, including
+    // one this engine itself triggers when a pass ends. A pass that starts on top of one is a
+    // self-inflicted failure, and a run publishing its lease through it parks as "live elsewhere".
+    resetIssueSnapshots();
+    let releaseRead!: () => void;
+    const read = new Promise<void>((r) => (releaseRead = r));
+    void refreshIssueSnapshot("/repo", async () => {
+      await read;
+      return [];
+    });
+
+    const spawned: string[] = [];
+    const sync = createDoltSync(async (_cwd, args) => {
+      spawned.push(args.join(" "));
+      return "";
+    });
+
+    const pass = sync("/repo");
+    // A full macrotask turn: without the guard the pass reaches `bd dolt pull` well inside this.
+    await new Promise((r) => setTimeout(r, 5));
+    expect(spawned).toEqual([]); // it must not have: the read still holds the lock
+
+    releaseRead();
+    await expect(pass).resolves.toBe("synced");
+    expect(spawned).toContain("dolt pull");
+    resetIssueSnapshots();
+  });
+
+  it("still runs its pass when the background read it waited on FAILED (anton-3dpp)", async () => {
+    // The read's rejection is the reader's business — it released the lock either way, so a failed
+    // board read must never swallow the push that publishes a run's work.
+    resetIssueSnapshots();
+    void refreshIssueSnapshot("/repo-read-fails", async () => {
+      throw new Error("bd list failed");
+    }).catch(() => {});
+
+    const spawned: string[] = [];
+    const sync = createDoltSync(async (_cwd, args) => {
+      spawned.push(args.join(" "));
+      return "";
+    });
+    await expect(sync("/repo-read-fails")).resolves.toBe("synced");
+    expect(spawned).toContain("dolt push");
+    resetIssueSnapshots();
   });
 
   it("does not coalesce across different repos", async () => {
