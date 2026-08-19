@@ -24,6 +24,7 @@ export type ScheduledJobType = Extract<
   | "gate-check"
   | "gardener"
   | "product-master"
+  | "board-picker"
 >;
 
 export type ScheduleRow = typeof schema.schedules.$inferSelect;
@@ -176,6 +177,13 @@ export async function listSchedules(projectId: string): Promise<ScheduleSummary[
  * the natural cadence of the question — "what matters next" does not change between two Tuesdays on
  * a board a nightly pass would find identical, and re-asking it daily is how the pass becomes noise.
  *
+ * board-picker (anton-albm) ships disabled for the gardener's reasons and the sharpest one yet: it is
+ * the only schedule that STARTS WORK on its own. Every other automation reports, repairs or resumes
+ * something a human already approved; this one writes `approved` itself. Arming it is the operator
+ * handing anton a standing approval, which can only ever be a deliberate act. It runs every ten
+ * minutes because it is mechanical — a board read and a ranking, no Claude session — so the cadence
+ * is only the latency between "the board says this is next" and the run starting.
+ *
  * gate-check (anton-286r) is armed by default and runs often, because it is the ONLY thing that
  * resumes a run parked on a gate: shipping it off would strand gated work indefinitely, and its
  * idle cost is two bd reads per slot on a project with no gates. The cadence is the wait's
@@ -194,6 +202,7 @@ export const DEFAULT_SCHEDULES: Array<{
   { type: "gate-check", cron: "*/10 * * * *" }, // close satisfied gates + resume their work
   { type: "gardener", cron: "0 5 * * *", enabled: false }, // board hygiene patrol daily 05:00; opt-in
   { type: "product-master", cron: "0 6 * * 1", enabled: false }, // product judgment weekly, Mon 06:00; opt-in
+  { type: "board-picker", cron: "*/10 * * * *", enabled: false }, // start the board's next target; opt-in
 ];
 
 /**

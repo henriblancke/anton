@@ -27,6 +27,7 @@ import { makeSyncPushHandler } from "./sync-push";
 import { makeRunHealthHandler } from "./run-health";
 import { makeUnstickHandler, resumeEpic, type ResumeOutcome } from "./unstick";
 import { makeGateCheckHandler } from "./gate-check";
+import { makeBoardPickerHandler } from "./board-picker";
 import { makeGardenerHandler } from "./gardener";
 import { makeProductMasterHandler } from "./product-master";
 import { JobRunner, type RunnerLogger, type RunningJobInfo } from "./runner";
@@ -162,6 +163,7 @@ export function getRunner(): JobRunner {
   runner.registerHandler("gate-check", makeGateCheckHandler({ db }));
   runner.registerHandler("gardener", makeGardenerHandler({ db }));
   runner.registerHandler("product-master", makeProductMasterHandler({ db }));
+  runner.registerHandler("board-picker", makeBoardPickerHandler());
   s.runner = runner;
   return runner;
 }

@@ -33,6 +33,7 @@ const DEFAULT_CRONS = {
   unstick: "10 * * * *",
   "gate-check": "*/10 * * * *",
   gardener: "0 5 * * *",
+  "board-picker": "*/10 * * * *",
 };
 
 function renderView(
@@ -564,10 +565,22 @@ describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
     expect(screen.getAllByText("never").length).toBeGreaterThan(0);
   });
 
+  it("ships the board-picker row off, at the cadence it would be created at", () => {
+    // Seeded disabled (schedules.ts) because arming it hands anton a standing approval to start
+    // work; the panel is where that choice is made, so the row must be visible while still off.
+    renderView({}, [], stringer());
+
+    expect(cadenceButton("board-picker").textContent).toContain("Every 10 minutes");
+    expect(screen.getByRole("switch", { name: "board-picker" }).getAttribute("aria-checked")).toBe(
+      "false",
+    );
+    expect(screen.getByText(/starts the board's next target/)).toBeTruthy();
+  });
+
   it("reads 'not scheduled' when the automation is off or has no row", () => {
     renderView({}, [], stringer({ enabled: false, nextRunAt: undefined }));
 
-    expect(screen.getAllByText("not scheduled").length).toBe(8);
+    expect(screen.getAllByText("not scheduled").length).toBe(9);
     // gardener has no row at all — it still shows the cadence it would be created at.
     expect(cadenceButton("gardener").textContent).toContain("Daily at 05:00");
   });
@@ -640,7 +653,7 @@ describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
     );
     try {
       // Rendered from the page's snapshot: due in a minute, and never run.
-      expect(screen.getAllByText("never").length).toBe(8);
+      expect(screen.getAllByText("never").length).toBe(9);
 
       // Arriving at the panel re-reads once — a hash switch is not a navigation, so the snapshot
       // this page was rendered with could be an hour old.
@@ -649,7 +662,7 @@ describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
       // Both time columns moved to what the server now holds...
       expect(screen.getByText("in 30m")).toBeTruthy();
       expect(screen.getByText("1m ago")).toBeTruthy();
-      expect(screen.getAllByText("never").length).toBe(7);
+      expect(screen.getAllByText("never").length).toBe(8);
       // ...while the cadence stayed the operator's, not the poll's.
       expect(cadenceButton().textContent).toContain("Every 30 minutes");
 

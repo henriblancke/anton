@@ -31,6 +31,7 @@ describe("describeCron", () => {
       "gate-check": "Every 10 minutes",
       gardener: "Daily at 05:00",
       "product-master": "Weekly on Monday at 06:00",
+      "board-picker": "Every 10 minutes",
     });
   });
 

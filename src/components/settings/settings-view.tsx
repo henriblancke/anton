@@ -459,6 +459,12 @@ const AUTOMATIONS: AutomationSpec[] = [
     group: "Run health",
   },
   {
+    id: "board-picker",
+    label: "board-picker",
+    description: "starts the board's next target · ranks by priority, unblocking value, age",
+    group: "Board maintenance",
+  },
+  {
     id: "product-master",
     label: "product-master",
     description: "product judgment · proposes reprioritize / split / kill · applies what you armed",
@@ -1807,7 +1813,7 @@ export function SettingsView({
           </section>
           )}
 
-          {/* Automation — full width, because seven schedules are records with identical fields and
+          {/* Automation — full width, because the schedules are records with identical fields and
               a table is how you compare them (anton-ue90.4). */}
           {active === "automation" && (
           <section className="flex flex-col gap-3.5">
