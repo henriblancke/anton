@@ -93,7 +93,7 @@ export function gitInit(dir: string, withOrigin: boolean) {
 // .beads/ files (config.yaml, dolt-remote state) so config.mjs's file-reading logic — configYamlHas,
 // the idempotency skips, the drift patch — sees a realistic workspace. This is the "inject exec" seam
 // applied at the process boundary rather than by forking config.mjs's spawnSync.
-export const FAKE_BD = [
+const FAKE_BD = [
   "#!/usr/bin/env node",
   'const fs = require("node:fs");',
   'const path = require("node:path");',
