@@ -392,10 +392,13 @@ async function erasedEdges(graph: Graph, files: string[]): Promise<string | unde
 }
 
 /**
- * Re-price a fan-out against runtime edges. The subtraction is off stringer's OWN count rather than
- * a recount of anton's: its graph is the one the threshold was set against (it counts relative
- * imports, and dedupes a module imported twice), so subtracting only the edges anton proved are
- * erased keeps the two numbers commensurable even where anton's parse is thinner than stringer's.
+ * Re-price a fan-out against runtime edges. The subtraction is off stringer's OWN count — its graph
+ * is the one the threshold was set against — but that count is a FLOOR, not a ceiling: its collector
+ * reads single-line statements only, so it misses a multi-line `import { … } from` entirely
+ * (measured: a module with 12 single-line imports reports `imports 12 modules`; the same 12 with 4
+ * wrapped reports nothing at all). Subtracting from a number that already undercounts prices a
+ * module below the fan-out it really has, so anton's own runtime count is the floor no correction
+ * may go under — and a module whose runtime edges alone clear the threshold is never dropped.
  */
 async function judgeFanOut(graph: Graph, signal: ScanSignal): Promise<Verdict> {
   const path = filePathOf(signal);
@@ -410,11 +413,14 @@ async function judgeFanOut(graph: Graph, signal: ScanSignal): Promise<Verdict> {
   for (const edge of edges.filter((e) => e.relative)) {
     byModule.set(edge.file, (byModule.get(edge.file) ?? true) && edge.typeOnly);
   }
-  const erased = [...byModule.values()].filter(Boolean).length;
+  const typeOnly = [...byModule.values()];
+  const erased = typeOnly.filter(Boolean).length;
   if (erased === 0) return KEEP;
+  const runtime = typeOnly.length - erased;
 
   const threshold = reportedThreshold(signal);
-  const value = Math.max(reported - erased, 0);
+  const value = Math.max(reported - erased, runtime);
+  if (value >= reported) return KEEP; // stringer's number already missed more than anton can subtract
   if (value <= threshold) {
     return {
       drop: true,

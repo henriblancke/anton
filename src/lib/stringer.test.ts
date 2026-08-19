@@ -872,6 +872,64 @@ describe("scan", () => {
       expect(written[0].Title).toBe("High coupling: src/hub imports 12 modules");
     });
 
+    /**
+     * stringer's collector reads single-line statements only — a wrapped `import { … } from` is
+     * missing from its count entirely (measured: 12 single-line imports report `imports 12
+     * modules`; the same 12 with 4 wrapped report nothing). So its number is a floor, and a
+     * subtraction off it can price a module below the fan-out it really has.
+     */
+    function undercountedHub(typeImports: number, values: number, wrapped: number) {
+      const files: Record<string, string> = {};
+      const lines: string[] = [];
+      for (let i = 0; i < typeImports; i += 1) {
+        files[`src/t${i}.ts`] = `export type T${i} = ${i};\n`;
+        lines.push(`import type { T${i} } from "./t${i}";`);
+      }
+      for (let i = 0; i < values; i += 1) {
+        files[`src/v${i}.ts`] = `export const v${i} = ${i};\n`;
+        lines.push(
+          i < wrapped ? `import {\n  v${i},\n} from "./v${i}";` : `import { v${i} } from "./v${i}";`,
+        );
+      }
+      files["src/hub.ts"] = `${lines.join("\n")}\nexport const all = [v0];\n`;
+      // What stringer would have counted: every single-line statement, the wrapped ones unseen.
+      return { files, counted: typeImports + values - wrapped };
+    }
+
+    it("keeps a fan-out stringer undercounted, rather than pricing it below its runtime edges", async () => {
+      const { files, counted } = undercountedHub(3, 12, 4);
+      const repo = writeRepo(files);
+      const scanFile = join(dir, "scan.json");
+      expect(counted).toBe(11); // stringer's view: 3 type-only + the 8 unwrapped value imports
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        fanOut("src/hub", counted),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile });
+
+      // 11 − 3 = 8 is below the threshold, but 12 modules are imported for a value: not a drop, and
+      // not a correction either — anton has nothing to subtract that stringer didn't already miss.
+      expect(result.coupling).toEqual({ dropped: [], recounted: [] });
+      expect((result.signals[0] as { Title: string }).Title).toBe(
+        "High coupling: src/hub imports 11 modules",
+      );
+    });
+
+    it("prices a drop off its own runtime count, not off stringer's subtraction", async () => {
+      const { files, counted } = undercountedHub(4, 9, 2);
+      const repo = writeRepo(files);
+      expect(counted).toBe(11); // 4 type-only + the 7 unwrapped value imports
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        fanOut("src/hub", counted),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      // 11 − 4 = 7 would understate it; 9 modules really are imported for a value, still under 10.
+      expect(result.coupling.dropped[0].reason).toContain("leaving 9 at runtime");
+    });
+
     // Under-filtering costs one triaged bead; over-filtering deletes an architecture finding nobody
     // hears about again. So anything anton cannot PROVE is erased rides through untouched.
     it("keeps every signal it cannot disprove", async () => {
