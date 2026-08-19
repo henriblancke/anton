@@ -17,7 +17,7 @@
  */
 import { readFile, stat } from "node:fs/promises";
 import { dirname, join, normalize, sep } from "node:path";
-import type { ScanSignal } from "./scan-severity";
+import { collectorOf, type ScanSignal } from "./scan-severity";
 
 /** The collector these rules are about; every other signal rides through untouched. */
 const COUPLING_COLLECTOR = "coupling";
@@ -84,8 +84,14 @@ interface ResolvedEdge {
  * Import/export statements as a formatter writes them: anchored at column 0, so a `*`-indented line
  * inside one of this codebase's long doc comments can't match, and bounded by the statement's own
  * `;`, so a non-import `export const …` can't run forward and swallow the next `from "…"`.
+ *
+ * The body may still cross lines — a wrapped `import { … } from` is one statement and one real edge
+ * — but never past the next line-start `import`/`export`, which starts a statement of its own. In a
+ * `semi:false` repo that bound is the only one there is: without it `export type Foo = number` runs
+ * forward into the value re-export below it, and {@link isTypeOnly} reads the pair as type-only.
  */
-const FROM_STATEMENT = /^(?:import|export)\b[^;]*?\bfrom\s*["']([^"']+)["']/gm;
+const FROM_STATEMENT =
+  /^(?:import|export)\b(?:(?!^(?:import|export)\b)[^;])*?\bfrom\s*["']([^"']+)["']/gm;
 /** `import "./side-effect"` — no bindings, always a runtime edge. */
 const SIDE_EFFECT_IMPORT = /^import\s*["']([^"']+)["']/gm;
 /** `import("./x")` / `require("./x")` — value edges wherever they appear, so not anchored. */
@@ -359,7 +365,7 @@ async function judgeCycle(graph: Graph, signal: ScanSignal): Promise<Verdict> {
   return {
     drop: true,
     reason:
-      `its ${modules.length} modules are joined only by type-only imports, erased at compile time` +
+      `no cycle survives among its ${modules.length} modules once type-only imports are erased` +
       `${erased ? ` (${erased})` : ""}`,
   };
 }
@@ -474,9 +480,7 @@ export async function filterCouplingSignals(
   repoPath: string,
   signals: ScanSignal[],
 ): Promise<{ kept: ScanSignal[]; coupling: CouplingFilter }> {
-  const relevant = signals.filter(
-    (signal) => (signal.Source ?? signal.source ?? "").toLowerCase() === COUPLING_COLLECTOR,
-  );
+  const relevant = signals.filter((signal) => collectorOf(signal) === COUPLING_COLLECTOR);
   if (relevant.length === 0) return { kept: signals, coupling: { dropped: [], recounted: [] } };
 
   const graph = importGraph(repoPath, await readAliases(repoPath));

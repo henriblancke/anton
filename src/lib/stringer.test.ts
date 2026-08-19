@@ -843,6 +843,43 @@ describe("scan", () => {
       expect(result.coupling.dropped).toMatchObject([{ path: "src/p" }]);
     });
 
+    // A `semi:false` repo has no `;` to end a statement on, so the only thing separating one from
+    // the next is the line-start keyword. Read without that bound, `export type …` runs forward into
+    // the value re-export below it and takes the whole pair for erased — dropping a real cycle.
+    it("reads one statement at a time in a repo that writes no semicolons", async () => {
+      const repo = writeRepo({
+        "src/a.ts": `export type Meta = number\n\nexport { b } from "./b"\n\nexport const a = 1\n`,
+        "src/b.ts": `import { a } from "./a"\n\nexport const b = () => a\n`,
+      });
+      const signal = cycle(["src/a", "src/b"]);
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [signal]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: signal.Title }]);
+      expect(result.coupling).toEqual({ dropped: [], recounted: [] });
+    });
+
+    // A cycle closed by `@/lib/x` is only visible if the alias resolver lands on the same file the
+    // compiler would: a resolver that misses turns a value edge into an unresolved specifier, and
+    // the cycle it was holding up is dropped as a phantom.
+    it("resolves `@/`-alias imports to the file they name on disk", async () => {
+      const repo = writeRepo({
+        "tsconfig.json": JSON.stringify({
+          compilerOptions: { baseUrl: ".", paths: { "@/*": ["./src/*"] } },
+        }),
+        "src/a.ts": `import { b } from "@/b";\nexport const a = () => b();\n`,
+        "src/b.ts": `import { a } from "@/a";\nexport const b = () => a;\n`,
+      });
+      const signal = cycle(["src/a", "src/b"]);
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [signal]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: signal.Title }]);
+      expect(result.coupling).toEqual({ dropped: [], recounted: [] });
+    });
+
     it("re-prices a surviving fan-out, so triage acts on the runtime number", async () => {
       const files: Record<string, string> = {};
       const lines: string[] = [];
