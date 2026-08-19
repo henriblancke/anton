@@ -1,6 +1,6 @@
 ---
 name: setup
-version: a512900c0630
+version: 01a8e2dafa66
 description: >-
   Scaffold a project so anton's skills have the `.product/` contract they read. Checks git + bd,
   runs `bd init` if `.beads/` is absent, detects the stack, generates `.product/` from anton's
@@ -121,12 +121,16 @@ To configure it, in the repo root:
    }
    ```
 
-   `bd dolt set host|port|user|database <value>` writes the same file if you prefer the CLI, but
-   there is no `bd` key for the mode — add `dolt_mode` by hand. Do **not** reach for
-   `bd config set dolt.mode server`: it reports success, writes a nested block into a file of flat
-   dotted keys, is bd's lowest-priority source, and has no effect (anton-4gd2). Keep
-   `dolt_server_port` even if bd warns it is deprecated — without it bd dials port 0 against a
-   remote host. This file is **committed**, so it must never hold a password.
+   `dolt_mode` must be written by hand: there is no `bd` key for the mode, and `bd config set
+   dolt.mode server` reports success while writing a nested block into a file of flat dotted keys,
+   from bd's lowest-priority source — it has no effect (anton-4gd2). Once the mode is set,
+   `bd dolt set host|port|user|database <value> --update-config` maintains the rest, writing both
+   this file and `.beads/config.yaml` (bd refuses that command outright while the board is still
+   embedded, so the mode genuinely comes first). anton's team-config enforcement runs exactly those
+   commands on `anton init` / adding the project, so the `dolt.*` team defaults in config.yaml stay
+   in step with metadata.json — and a required field you leave out is reported as an error, not
+   defaulted. Keep `dolt_server_port` even if bd warns it is deprecated — without it bd dials port 0
+   against a remote host. This file is **committed**, so it must never hold a password.
 
 2. **Put the password in the environment, scoped to the database user** —
    `BEADS_DOLT_PASSWORD_<USER>`, uppercased with non-alphanumeric runs folded to `_` (the user above
@@ -140,8 +144,11 @@ To configure it, in the repo root:
    at that database. anton strips those identity vars per spawn (`src/lib/beads/bd-env.ts`), but a
    `bd` you run by hand has no such protection.
 
-3. **Verify before trusting it.** `bd dolt show` must report `Mode: server` against the configured
-   host, and `bd dolt test` must connect. Then prove propagation the way the operator will use it:
+3. **Verify before trusting it.** `bd dolt show` must name the configured Host/Port/User/Database
+   and report a reachable server, and `bd dolt test` must connect. (Read the connection lines, not
+   the `Mode:` line — bd 1.1.2 prints `Mode: per-project` for a server-mode board and
+   `Mode: embedded (in-process Dolt engine)` for an embedded one; only the latter names the mode as
+   this skill does.) Then prove propagation the way the operator will use it:
    create a bead here, read it from a second machine pointed at the same server with no sync in
    between. If the connection fails, fix it now — anton's own preflight will otherwise surface it as
    a `failing` sync pill naming this host/port on the first heartbeat.
@@ -152,10 +159,11 @@ above, `bd import` them, then reconcile — `bd count`/`bd list` totals and a sp
 dependencies and labels — **before** anyone deletes the embedded copy. Keep that copy until the
 board has been verified on the server; it is also the fallback if the server goes away.
 
-One expected wart in server mode: the `refs/dolt/data` remote wiring from `bd init`/`anton init`
-stays in place and is simply inert — anton skips every sync pass for a server-mode board — but a
-`bd dolt push/pull` run by hand executes *on the server*, which has no git credentials, and fails
-with `command denied to user`. That is noise, not data risk (anton-0tul).
+One expected wart in server mode: `anton init` no longer wires a `refs/dolt/data` remote for a
+server-mode board, but one wired earlier (or by a bare `bd init`) stays in place and is simply inert
+— anton skips every sync pass for a server-mode board. A `bd dolt push/pull` run by hand still
+executes *on the server*, which has no git credentials, and fails with `command denied to user`.
+That is noise, not data risk (anton-0tul).
 
 ## 3. Detect the stack
 

@@ -1072,6 +1072,10 @@ function renderDoltSyncOutcome(dolt) {
     case "no-workspace":
       console.log(c.dim("  no .beads workspace at the package root — skipping."));
       return true;
+    case "server-mode":
+      // Not a degradation: a shared-server board has no refs/dolt/data to wire (anton-4gd2).
+      console.log(c.dim("  board is on a shared Dolt server — no refs/dolt/data remote to wire."));
+      return true;
     case "no-remote":
       console.log(c.red("  ✗ .beads exists but git has no `origin` remote — Dolt sync has nowhere to push."));
       console.log(c.dim("    Add one (git remote add origin <url>), then re-run `anton setup`."));
@@ -1357,6 +1361,9 @@ function renderDoltSync(sync) {
     case "no-workspace":
       console.log(c.yellow("! no .beads/ workspace — skipped Dolt remote wiring."));
       break;
+    case "server-mode":
+      console.log(c.dim("• board is on a shared Dolt server — no refs/dolt/data remote to wire."));
+      break;
     case "error":
       console.log(c.yellow(`! Dolt remote wiring failed: ${sync.detail}`));
       console.log(c.dim("  beads is configured; retry with `bd dolt remote add origin <url>` then `bd dolt push`."));
@@ -1429,7 +1436,10 @@ async function cmdInit(args = []) {
     return 1;
   }
   for (const e of beads.errors) console.log(c.yellow(`  ${e}`));
-  console.log(c.green("\n✓ beads team-config enforced.") + c.dim(` (${dir})`));
+  // Naming the profile makes the board's mode visible where it was applied — a server-mode repo
+  // enforces a connection, not the refs/dolt/data knobs, and the two shouldn't look alike.
+  const profile = beads.mode === "server" ? "shared Dolt server board" : "embedded board";
+  console.log(c.green("\n✓ beads team-config enforced.") + c.dim(` (${dir} — ${profile})`));
 
   // Dolt remote wiring outcome — render every status branch, matching cmdSetup (anton-43b).
   renderDoltSync(beads.doltSync);

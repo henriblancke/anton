@@ -307,7 +307,7 @@ Server mode is **opt-in, per project, and self-hosted** — the server is yours;
 
 The password goes in the environment anton runs in, scoped to that database user — `BEADS_DOLT_PASSWORD_BEADS` for the user above (`BEADS_DOLT_PASSWORD_<USER>`, uppercased, non-alphanumerics folded to `_`), or a bare `BEADS_DOLT_PASSWORD` if every project shares one account. Add `BEADS_DOLT_SERVER_TLS=true` when the server requires TLS. Set no other `BEADS_DOLT_*` variables in a shell you launch anton from: they outrank each project's own config, and a stray `BEADS_DOLT_SERVER_DATABASE` points *every* project at that one database.
 
-Check it with `bd dolt show` (it should report `Mode: server`) and `bd dolt test`. Moving an existing embedded board onto a server isn't automated yet — export it with `bd export`, point the project at the server, `bd import`, and reconcile the counts before deleting the local copy.
+Check it with `bd dolt show` — it should name the host, port, user, and database you configured and report the server reachable — and with `bd dolt test`. Moving an existing embedded board onto a server isn't automated yet — export it with `bd export`, point the project at the server, `bd import`, and reconcile the counts before deleting the local copy.
 
 Full behaviour, including what each mode does when the network or the server goes down, is in [`DESIGN.md` §3a](./DESIGN.md#3a-board-modes--embedded-vs-shared-server).
 

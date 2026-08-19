@@ -11,6 +11,12 @@
  * The correct team-config is the Dolt-first model (issues live in Dolt, synced over refs/dolt/data;
  * the JSONL is a passive export): dolt.auto-commit "on", export.auto false, export.git-add false, and
  * a .gitignore that keeps the derived exports + Dolt runtime state out of git.
+ *
+ * That is the EMBEDDED profile — the default. A board can instead live on one shared `dolt
+ * sql-server` (DESIGN.md §3a), where the refs/dolt/data knobs describe a sync channel that does not
+ * exist; there the team-config is the CONNECTION instead. Both profiles live below in
+ * `teamConfigKeys` / `SERVER_CONNECTION_KEYS`, selected by the mode this file reads from
+ * `.beads/metadata.json` (anton-4gd2).
  */
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -452,7 +458,43 @@ export function ensureBdConfig(dir, beadsDir, key, want) {
   return (r.status ?? 1) === 0 ? "set" : "failed";
 }
 
-/** The config.yaml keys anton's team-config enforces (Dolt-first model). `dolt.auto-push false`
+/**
+ * The board mode + connection a project declares in `.beads/metadata.json` — `embedded` (a Dolt
+ * database under `.beads/`, one copy per machine, reconciled over refs/dolt/data) or `server` (one
+ * shared `dolt sql-server` every machine reads and writes). See DESIGN.md §3a.
+ *
+ * metadata.json, not config.yaml or the environment: it is bd's per-directory source of truth, so it
+ * describes THIS project no matter which process asks or what that process was launched with. (The
+ * environment outranks it in bd's own precedence, which is exactly why anton scopes a bd spawn's env
+ * per project — see bd-env.ts, anton-ffmw.1.)
+ *
+ * Anything absent, unreadable, unparseable, or unrecognised resolves to `embedded`. That is the safe
+ * direction: embedded merely syncs when it need not, whereas a wrong "server" verdict would silently
+ * disable a solo board's only propagation path. Never throws — callers gate setup on it.
+ *
+ * The typed accessor `board-mode.ts` delegates here, so there is ONE parser of this file.
+ *
+ * @param {string} dir repo root (the directory containing `.beads/`)
+ * @returns {{ mode: "embedded"|"server", host?: string, port?: number, user?: string, database?: string }}
+ */
+export function readDoltMetadata(dir) {
+  try {
+    const meta = JSON.parse(readFileSync(join(dir, ".beads", "metadata.json"), "utf8"));
+    if (meta?.dolt_mode !== "server") return { mode: "embedded" };
+    return {
+      mode: "server",
+      host: typeof meta.dolt_server_host === "string" ? meta.dolt_server_host : undefined,
+      port: typeof meta.dolt_server_port === "number" ? meta.dolt_server_port : undefined,
+      user: typeof meta.dolt_server_user === "string" ? meta.dolt_server_user : undefined,
+      database: typeof meta.dolt_database === "string" ? meta.dolt_database : undefined,
+    };
+  } catch {
+    return { mode: "embedded" };
+  }
+}
+
+/** The config.yaml keys anton's team-config enforces on an EMBEDDED board — the default profile,
+ * and the Dolt-first model (see `teamConfigKeys` for the server-mode one). `dolt.auto-push false`
  * because anton owns push cadence (write-nudged full passes, pull-only heartbeats): bd 1.0.2
  * auto-pushes after every write once a remote named `origin` exists, which both double-pushes
  * and re-creates the concurrent-push manifest-corruption risk (beads GH#2466) anton avoids.
@@ -473,12 +515,91 @@ export function ensureBdConfig(dir, beadsDir, key, want) {
  * export.auto is still at its default (true), regenerate the JSONL snapshot as a side effect of its
  * own write. Disabling auto-export up front closes that window so the enforcement pass never emits
  * the very churn it exists to stop. */
-const CONFIG_KEYS = [
+export const EMBEDDED_CONFIG_KEYS = [
   ["export.auto", "false"],
   ["dolt.auto-commit", "on"],
   ["export.git-add", "false"],
   ["dolt.auto-push", "false"],
 ];
+
+/**
+ * The server-mode profile (anton-4gd2). Everything the embedded profile enforces about
+ * refs/dolt/data — `dolt.auto-push`, and the passive JSONL export that exists to back it
+ * (`export.auto`, `export.git-add`) — describes a sync channel a shared-server board does not have,
+ * so anton does not impose it: `bd dolt push/pull` runs ON THE SERVER, which cannot reach the git
+ * remote at all (DESIGN.md §3a). What survives is `dolt.auto-commit`: each write still becomes a
+ * Dolt commit, which is what gives the team a history on the shared database.
+ *
+ * Enforcement only ever ADDS keys, so a board moved from embedded keeps the export knobs it already
+ * carries — this is the profile for a project that has never been anything but server-mode.
+ */
+export const SERVER_CONFIG_KEYS = [["dolt.auto-commit", "on"]];
+
+/** The config.yaml keys enforced for `mode`. Embedded is the default and the fallback. */
+export function teamConfigKeys(mode) {
+  return mode === "server" ? SERVER_CONFIG_KEYS : EMBEDDED_CONFIG_KEYS;
+}
+
+/**
+ * The shared server's connection, as `bd dolt set <key>` names each field. Written from
+ * `.beads/metadata.json` (the per-directory truth) into `.beads/config.yaml` as `dolt.<key>`, so a
+ * teammate's clone inherits the target instead of being told to type it — config.yaml is bd's
+ * lowest-priority source, which is what makes it the right place for a team DEFAULT.
+ *
+ * `required` marks what a board cannot connect without: no host and no database is not a default to
+ * fall back on, it is a broken server config, and it is reported as an error rather than skipped.
+ * `port` is required for the same reason DESIGN.md §3a insists it stay in metadata.json despite bd's
+ * deprecation warning — absent it, bd dials port 0 against a remote host. `user` is optional: bd
+ * defaults to `root`, which is a real (if unadvisable) single-account setup.
+ */
+const SERVER_CONNECTION_KEYS = [
+  { key: "host", metaKey: "dolt_server_host", required: true },
+  { key: "port", metaKey: "dolt_server_port", required: true },
+  { key: "database", metaKey: "dolt_database", required: true },
+  { key: "user", metaKey: "dolt_server_user", required: false },
+];
+
+/**
+ * Publish the server-mode connection from `.beads/metadata.json` to `.beads/config.yaml` as the
+ * team-wide default, via bd's own primitive: `bd dolt set <key> <value> --update-config` (it writes
+ * BOTH files, keeping them from drifting apart). Idempotent — a key config.yaml already carries is
+ * not re-set, so a re-run is a true no-op.
+ *
+ * Server mode only. `bd dolt set` refuses outright in embedded mode ("not supported in embedded
+ * mode (no Dolt server)"), so calling it there would turn a healthy embedded board into a wall of
+ * failed steps.
+ *
+ * Returns one `{ name, status, detail? }` step per field:
+ * "already" | "set" | "failed" | "missing" (required, absent from metadata) | "unset" (optional).
+ *
+ * @param {string} dir repo root
+ * @param {string} beadsDir `<dir>/.beads`
+ * @param {{ host?: string, port?: number, user?: string, database?: string }} info from readDoltMetadata
+ * @param {{ exec?: (cmd: string, args: string[], timeoutMs?: number) => { status: number|null, stdout?: string, stderr?: string } }} [opts]
+ */
+export function ensureDoltConnection(dir, beadsDir, info, opts = {}) {
+  const localMs = budgetMs("bd");
+  const exec =
+    opts.exec ??
+    ((cmd, args, timeoutMs = localMs) =>
+      spawnSync(cmd, args, { cwd: dir, encoding: "utf8", timeout: timeoutMs, killSignal: SPAWN_KILL_SIGNAL }));
+
+  return SERVER_CONNECTION_KEYS.map(({ key, metaKey, required }) => {
+    const raw = info?.[key];
+    if (raw === undefined || raw === null || raw === "") {
+      // Named as the fix, not as the symptom: what to add, and where.
+      return required
+        ? { name: `dolt.${key}`, status: "missing", detail: `server mode declares no "${metaKey}" in .beads/metadata.json` }
+        : { name: `dolt.${key}`, status: "unset" };
+    }
+    const want = String(raw);
+    const name = `dolt.${key}=${want}`;
+    if (configYamlHas(beadsDir, `dolt.${key}`, want)) return { name, status: "already" };
+    const r = exec("bd", ["dolt", "set", key, want, "--update-config"], localMs);
+    if ((r.status ?? 1) === 0) return { name, status: "set" };
+    return { name, status: "failed", detail: failureDetail(r, localMs, `${r.stdout ?? ""}${r.stderr ?? ""}`) };
+  });
+}
 
 /**
  * The ONE reconciled `bd init` flag set shared by every anton init path — `configureBeadsForRepo`
@@ -557,6 +678,7 @@ export function isFirstPublishPullOutput(output) {
  *
  * Returns `{ status, ... }`:
  *   - { status: "no-workspace" }                — no `.beads/` (nothing to wire)
+ *   - { status: "server-mode" }                 — the board lives on a shared Dolt server (anton-4gd2)
  *   - { status: "no-remote" }                   — no declared/origin remote to use
  *   - { status: "already", url }                — Dolt `origin` already points here
  *   - { status: "configured", url, pulled, pushed, pushAttempts, firstPublish, pushOutput } — remote
@@ -586,6 +708,15 @@ export function configureBeadsDoltSync(opts = {}) {
       }));
 
   if (!existsSync(join(dir, ".beads"))) return { status: "no-workspace" };
+
+  // A shared-server board has no refs/dolt/data to wire, and the attempt does not merely waste work:
+  // `bd dolt push/pull` executes ON THE SERVER, whose image ships no ssh client and no keys, so a
+  // `git+ssh://` remote is unreachable from there by construction (DESIGN.md §3a). Skipping is the
+  // config, not a degradation — the runtime sync nudges are neutralized separately (anton-0tul).
+  if (readDoltMetadata(dir).mode === "server") {
+    emit("board is on a shared Dolt server — skipping refs/dolt/data remote wiring (nothing to reconcile).");
+    return { status: "server-mode" };
+  }
 
   // Remote choice is dynamic per project: a `sync.remote` declared in .beads/config.yaml (e.g. an
   // aws:// remote) wins over the git-origin fallback — anton drives whatever the project's beads
@@ -728,8 +859,12 @@ export function detectHooksManager(dir, priorHooksPath = null) {
  * rather than thrown — the caller decides how loud to be (the CLI prints each step; addProject logs
  * a summary) and a step failure never aborts the caller.
  *
+ * The steps that describe refs/dolt/data — hydrating a fresh clone, the enforced sync knobs, the
+ * remote wiring — are the EMBEDDED profile. A server-mode board (DESIGN.md §3a) gets its connection
+ * published as the team default instead; see `teamConfigKeys` / `ensureDoltConnection` (anton-4gd2).
+ *
  * Returns:
- *   { configured, skipped, reason?, ranInit, ranBootstrap, steps: [{name,status,detail?}], errors, hasBeads }
+ *   { configured, skipped, reason?, mode, ranInit, ranBootstrap, steps: [{name,status,detail?}], errors, hasBeads }
  *
  * When prereqs aren't met (no bd / not a git repo / no origin) it returns early with
  * `{ configured:false, skipped:true, reason, hasBeads }` and does nothing — so calling it on a plain
@@ -749,12 +884,18 @@ export function configureBeadsForRepo(dir, opts = {}) {
   const steps = [];
   const errors = [];
 
+  // Which profile applies. Read once, up front: every branch below is the same decision, and a
+  // repo with no `.beads/` yet reads as embedded — which is right, since `bd init` creates exactly
+  // that (server mode is opt-in, entered by editing metadata.json).
+  const { mode, ...connection } = readDoltMetadata(dir);
+
   const pre = beadsPrereqs(dir);
   if (!pre.ok) {
     return {
       configured: false,
       skipped: true,
       reason: pre.error.message,
+      mode,
       ranInit: false,
       steps,
       errors,
@@ -799,10 +940,16 @@ export function configureBeadsForRepo(dir, opts = {}) {
       const detail = failureDetail(r, initMs, r.stderr || r.stdout || "");
       steps.push({ name: "bd init", status: "failed", detail });
       errors.push(`bd init failed: ${detail}`);
-      return { configured: false, skipped: false, ranInit: false, steps, errors, hasBeads: existsSync(beadsDir) };
+      return { configured: false, skipped: false, mode, ranInit: false, steps, errors, hasBeads: existsSync(beadsDir) };
     }
     ranInit = true;
     steps.push({ name: "bd init", status: "ok" });
+  } else if (mode === "server") {
+    // A server-mode board keeps NO local Dolt DB — the database is the shared server — so the
+    // missing `.beads/dolt/` is the steady state here, not the fresh-clone signal it is on embedded.
+    // Bootstrapping would hydrate from refs/dolt/data, which this board does not use.
+    emit(".beads/ present and the board is on a shared Dolt server — enforcing team-config only (no bootstrap).");
+    steps.push({ name: "bd init", status: "already" });
   } else if (!hasLocalDoltDb(beadsDir)) {
     emit("bd bootstrap --non-interactive (fresh clone — hydrating the Dolt DB from origin)");
     // Hydrating a fresh clone pulls the whole board over refs/dolt/data — the long budget.
@@ -817,7 +964,7 @@ export function configureBeadsForRepo(dir, opts = {}) {
       const detail = failureDetail(r, bootstrapMs, r.stderr || r.stdout || "");
       steps.push({ name: "bd bootstrap", status: "failed", detail });
       errors.push(`bd bootstrap failed: ${detail}`);
-      return { configured: false, skipped: false, ranInit: false, steps, errors, hasBeads: existsSync(beadsDir) };
+      return { configured: false, skipped: false, mode, ranInit: false, steps, errors, hasBeads: existsSync(beadsDir) };
     }
     ranBootstrap = true;
     steps.push({ name: "bd bootstrap", status: "ok" });
@@ -839,8 +986,8 @@ export function configureBeadsForRepo(dir, opts = {}) {
     steps.push({ name: "bd init", status: "already" });
   }
 
-  // 2. Patch config.yaml idempotently (never clobber).
-  for (const [key, want] of CONFIG_KEYS) {
+  // 2. Patch config.yaml idempotently (never clobber), with the profile this board's mode calls for.
+  for (const [key, want] of teamConfigKeys(mode)) {
     const status = ensureBdConfig(dir, beadsDir, key, want);
     steps.push({ name: `${key}=${want}`, status });
     if (status === "failed") {
@@ -848,6 +995,21 @@ export function configureBeadsForRepo(dir, opts = {}) {
       errors.push(`could not set ${key}=${want}`);
     } else {
       emit(`${key}=${want} (${status})`);
+    }
+  }
+
+  // 2b. Server mode only: publish the connection as the team-wide default so a teammate's clone
+  //     inherits the target instead of being told to type it. A required field missing from
+  //     metadata.json is an ERROR, not a silence — the board cannot reach its server without it.
+  if (mode === "server") {
+    for (const step of ensureDoltConnection(dir, beadsDir, connection)) {
+      steps.push(step);
+      if (step.status === "missing" || step.status === "failed") {
+        emit(`${step.name} — ${step.detail}`);
+        errors.push(step.detail);
+      } else {
+        emit(`${step.name} (${step.status})`);
+      }
     }
   }
 
@@ -916,6 +1078,7 @@ export function configureBeadsForRepo(dir, opts = {}) {
   return {
     configured: true,
     skipped: false,
+    mode,
     ranInit,
     ranBootstrap,
     steps,

@@ -17,16 +17,19 @@
  *     projects.
  *
  * bd's own precedence is env > metadata.json > config.yaml. We deliberately read ONLY
- * `.beads/metadata.json` here: it is per-directory, so it describes *this* project no matter which
+ * `.beads/metadata.json`: it is per-directory, so it describes *this* project no matter which
  * process asks or what that process was launched with. Reading the environment instead would
  * reintroduce exactly the cross-project confusion this module exists to prevent.
  *
  * Absent/unreadable/unparseable metadata is reported as `embedded`. That is the historical
  * behaviour and the safe default: embedded mode syncs, and a spurious sync is noise, whereas
  * wrongly concluding "server" would silently disable a solo user's only propagation path.
+ *
+ * The parse itself lives in `config.mjs` — the same mode decides which team-config profile setup
+ * enforces, and one reader means the CLI and the server can never disagree about what a project is.
+ * This module owns the typed accessor and the per-process cache on top of it.
  */
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { readDoltMetadata } from "./config.mjs";
 
 export type BoardMode = "embedded" | "server";
 
@@ -76,22 +79,10 @@ export function readBoardMode(repoPath: string): BoardModeInfo {
   const hit = cache().get(repoPath);
   if (hit) return hit;
 
-  let info: BoardModeInfo = { mode: "embedded" };
-  try {
-    const raw = readFileSync(join(repoPath, ".beads", "metadata.json"), "utf8");
-    const meta = JSON.parse(raw) as Record<string, unknown>;
-    if (meta.dolt_mode === "server") {
-      info = {
-        mode: "server",
-        host: typeof meta.dolt_server_host === "string" ? meta.dolt_server_host : undefined,
-        port: typeof meta.dolt_server_port === "number" ? meta.dolt_server_port : undefined,
-        database: typeof meta.dolt_database === "string" ? meta.dolt_database : undefined,
-        user: typeof meta.dolt_server_user === "string" ? meta.dolt_server_user : undefined,
-      };
-    }
-  } catch {
-    // Fall through to embedded — see the module note on why that is the safe default.
-  }
+  const { mode, host, port, database, user } = readDoltMetadata(repoPath);
+  // Connection fields are dropped on an embedded board: they describe a server there is none of,
+  // and callers read their presence as "this is where the board lives".
+  const info: BoardModeInfo = mode === "server" ? { mode, host, port, database, user } : { mode: "embedded" };
 
   cache().set(repoPath, info);
   return info;

@@ -113,12 +113,14 @@ configuration**; server mode is opt-in per project via `.beads/metadata.json`.
 | Sync status badge | `synced` / `not-wired` / `failing` | `shared-server` |
 | Claim safety | advisory | advisory — **unchanged** |
 
-Mode is read from `.beads/metadata.json` (`dolt_mode`) by `src/lib/beads/board-mode.ts`.
+Mode is read from `.beads/metadata.json` (`dolt_mode`) — parsed in `src/lib/beads/config.mjs`
+(`readDoltMetadata`, the one reader, so the CLI and the server cannot disagree) and served to the
+app through `src/lib/beads/board-mode.ts`, which adds the typed accessor and a per-process cache.
 Anything unreadable, absent, or unrecognised resolves to **embedded** — the safe direction, since
 embedded merely syncs when it need not, whereas a wrong "server" verdict would silently disable a
 solo board's only propagation path.
 
-**Two behaviours branch on it:**
+**Three behaviours branch on it:**
 
 1. **Sync is skipped entirely in server mode** (`runDoltSync`, `nudgeSync`). There is nothing to
    reconcile when every writer shares one database — and the attempt does not merely waste work, it
@@ -139,10 +141,18 @@ solo board's only propagation path.
    An explicit `env` override at the call site beats both. `BEADS_DOLT_SERVER_TLS` is transport, not
    identity, and is left inherited.
 
+3. **Setup enforces the profile the mode calls for** (`configureBeadsForRepo`, anton-4gd2). Embedded
+   gets the Dolt-first sync knobs it always had — `export.auto`/`export.git-add` false,
+   `dolt.auto-commit` on, `dolt.auto-push` false — plus the refs/dolt/data remote wiring and, on a
+   fresh clone, `bd bootstrap`. Server mode gets the CONNECTION instead: none of the refs/dolt/data
+   knobs are imposed (`dolt.auto-commit` survives — a write still becomes a Dolt commit, which is the
+   team's history), no remote is wired, and no clone is bootstrapped, since a shared-server board
+   keeps no local database to hydrate.
+
 **Configuring server mode.** Put connection details in `.beads/metadata.json` — never in the
-environment, for the reason above, and never in `.beads/config.yaml` (it is the lowest-priority
-source, and `bd config set dolt.mode` writes a nested block the rest of that file's flat dotted keys
-do not match):
+environment, for the reason above. The **mode** lives there and nowhere else: `bd config set
+dolt.mode` reports success but writes a nested block into a file of flat dotted keys, from bd's
+lowest-priority source, and has no effect. Add `dolt_mode` by hand:
 
 ```json
 {
@@ -153,6 +163,13 @@ do not match):
   "dolt_database": "anton"
 }
 ```
+
+The **connection** is mirrored into `.beads/config.yaml` as a team-wide default — `dolt.host`,
+`dolt.port`, `dolt.user`, `dolt.database`, written by `bd dolt set <key> <value> --update-config`,
+which anton's team-config enforcement applies for you (`src/lib/beads/config.mjs`, anton-4gd2).
+metadata.json stays the truth anton reads; the mirror is what lets a clone that did not inherit one
+still find the server. It is enforcement, so a required field absent from metadata.json is reported
+as an error rather than defaulted.
 
 Credentials come from the environment, never from `metadata.json` — it is committed. Give each
 project's database user its own variable, `BEADS_DOLT_PASSWORD_<USER>` (uppercased, non-alphanumeric
