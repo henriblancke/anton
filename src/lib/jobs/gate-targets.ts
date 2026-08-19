@@ -139,7 +139,7 @@ function openBlockersOf(board: Bead[], target: Bead): string[] {
  *     blocker lands. (A closed gate is `done`, so it never counts against its own release.)
  *
  * Exported because the MANUAL resolve-and-resume runs every one of those risks identically (see
- * escalation-actions.ts): a target the founder never approved, one another operator holds, one
+ * escalation-gate.ts): a target the founder never approved, one another operator holds, one
  * already in review, or one a SECOND gate still blocks is no more runnable because a human clicked
  * than because a gate closed. Run-liveness is deliberately NOT here — the manual path judges that
  * against the stalled run's OWN lease, which `isRunLive` cannot tell from a foreign holder and would
@@ -240,7 +240,7 @@ export function plainGateResumes(
  *
  * {@link plainGateResumes} is deliberately not deduped by target, so when two gates block the same
  * target the automatic pass dispatches it twice and marks BOTH. The manual resolve-and-resume
- * (escalation-actions.ts) dispatches once, so without this it would mark only the gate the founder
+ * (escalation-gate.ts) dispatches once, so without this it would mark only the gate the founder
  * answered: the other one is closed, unmarked, and re-dispatched by the very next pass — retrying a
  * run that has since parked or failed, behind the escalation/retry decision's back.
  *

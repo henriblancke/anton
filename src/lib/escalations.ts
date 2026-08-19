@@ -49,7 +49,7 @@ export interface EscalationView {
   epicBeadId?: string;
   /**
    * The human gate a `needs-human` wait hangs on — what resolve-and-resume closes (see
-   * escalation-actions.ts). Absent on every other kind: nothing else stalls on a gate.
+   * escalation-gate.ts). Absent on every other kind: nothing else stalls on a gate.
    */
   gateId?: string;
   runId?: string;
