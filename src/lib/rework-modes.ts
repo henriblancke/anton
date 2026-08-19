@@ -328,6 +328,11 @@ export async function existingFollowUp(
   let partial: Bead | undefined;
   for (const candidate of followUpCandidates(all, ticketId, summary)) {
     const fresh = await beads.show(repo, candidate.id);
+    // The snapshot's "unsettled" rule, re-applied to the read the decision is actually made on: the
+    // lock covers the ticket and the target, not the follow-up, so a candidate can close between the
+    // two. A closed bead is nobody's follow-up — nothing dispatches it and its parentage no longer
+    // says anything — so matching one would report this send-back as already done and drop it.
+    if (fresh.status === "closed") continue;
     if (hasHumanNote(fresh, body)) return { bead: fresh, partial: false };
     partial ??= unfinishedCreation(fresh);
   }
@@ -351,6 +356,9 @@ function followUpCandidates(all: Bead[], ticketId: string, summary: string): Bea
 
 /** Is this bead linked `discovered-from` the ticket — the edge every follow-up is created with? */
 function isDiscoveredFrom(bead: Bead, ticketId: string): boolean {
+  // `issue_id` is the bead the edge is recorded ON, and a hydrated read (`--include-dependents`)
+  // can carry edges owned by other beads — so this is not the tautology it reads as. Without it, an
+  // edge pointing INTO this bead from the ticket would count as the follow-up's own link.
   return (bead.dependencies ?? []).some(
     (d) => d?.type === "discovered-from" && d.issue_id === bead.id && d.depends_on_id === ticketId,
   );

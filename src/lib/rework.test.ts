@@ -520,7 +520,14 @@ describe("follow-up", () => {
 
     /** Created and linked by a previous attempt, but carrying no note — the `bd note` never landed. */
     function halfCreated(...rest: Bead[]): void {
-      board(feature(), ticketA(), followUpBead("already"), ...rest);
+      const followUps = [followUpBead("already"), ...rest];
+      board(feature(), ticketA(), ...followUps);
+      // The re-read has to agree with the board that these are still OPEN: the generic stub closes
+      // every bead, and a closed candidate is nobody's follow-up.
+      const base = showMock.getMockImplementation()!;
+      showMock.mockImplementation(
+        async (cwd, id) => followUps.find((b) => b.id === id) ?? base(cwd, id),
+      );
     }
 
     it("finishes it instead of opening a second follow-up beside it", async () => {
@@ -1590,9 +1597,10 @@ describe("rework-pipeline", () => {
     expect(closeMock.mock.calls.map((c) => c[1])).toEqual(["feat", "t1"]);
     expect(tagMock.mock.calls.map((c) => c[1])).toEqual(["feat", "t1"]);
     expect(setPrRefMock).toHaveBeenCalledWith("/repo", "feat", "gh-42");
-    expect(setPrRefMock.mock.invocationCallOrder[0]).toBeLessThan(
-      closeMock.mock.invocationCallOrder[1],
-    );
+    const refAt = setPrRefMock.mock.invocationCallOrder[0];
+    expect(refAt).toBeGreaterThan(closeMock.mock.invocationCallOrder[0]);
+    expect(refAt).toBeGreaterThan(tagMock.mock.invocationCallOrder[0]);
+    expect(refAt).toBeLessThan(closeMock.mock.invocationCallOrder[1]);
     expect(noteMock.mock.calls.at(-1)?.[2]).toContain("gh-42 reads as merged now");
   });
 
@@ -1727,6 +1735,24 @@ describe("rework-modes", () => {
       bead: expect.objectContaining({ id: "done" }),
       partial: false,
     });
+  });
+
+  it("existingFollowUp skips a candidate closed between the snapshot and the re-read", async () => {
+    // The lock covers the ticket and the target, not the follow-up. A closed bead carrying this
+    // note is finished work, not this request's landing spot — matching it would report the
+    // send-back as already applied and leave nothing for anyone to pick up.
+    const body = "Follow-up on t1 — its acceptance stands";
+    const open = makeBead({
+      id: "shut",
+      title: "Harden the retry path",
+      dependencies: [{ issue_id: "shut", depends_on_id: "t1", type: "discovered-from" }],
+    });
+    board(open);
+    showsWithNote("shut", body, { status: "closed" });
+
+    await expect(
+      existingFollowUp("/repo", [open], "t1", "Harden the retry path", body),
+    ).resolves.toBeUndefined();
   });
 
   it("existingFollowUp adopts a bead with NO human note as this request's half-done work", async () => {
