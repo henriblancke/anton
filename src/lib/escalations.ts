@@ -28,6 +28,13 @@ export type EscalationStatus = "open" | "resolved";
  */
 export type EscalationResolution = "resumed" | "abandoned" | "dismissed";
 
+/**
+ * The verb side of {@link EscalationResolution} — what the founder clicked, before it is recorded as
+ * how the row was settled. It lives here rather than with the code that applies it so that every
+ * handler taking a verb can name one without importing back through escalation-actions.ts.
+ */
+export type EscalationAction = "resume" | "abandon" | "dismiss";
+
 export type EscalationRow = typeof schema.escalations.$inferSelect;
 
 /** One escalation as the board renders it — the finding's evidence plus its decision state. */
