@@ -7,7 +7,8 @@
  * The real service → escalation-actions → db stack runs over one in-memory anton.db, so the
  * project scoping assertion is a real query rather than a mocked call. Only the leaves that shell
  * out or execute work are stubbed — `bd` (pull/show, the cross-machine re-check) and the verbs
- * themselves — which is exactly the boundary src/lib/escalation-actions.test.ts already covers.
+ * themselves — which is exactly the boundary the `src/lib/escalation-actions.*.test.ts` suites
+ * already cover.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
