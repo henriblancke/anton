@@ -18,7 +18,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Bead } from "../beads/bd";
 import { makeDetection, type GardenerDetection } from "./detections";
-import { resolveProposalAutonomyPolicy } from "./autonomy";
+import {
+  emptyTrackRecord,
+  resolveProposalAutonomyPolicy,
+  type ProposalTrackRecord,
+} from "./autonomy";
 import type { EmittedProposal } from "./emit";
 import { passRecordCounts, readPassRecords } from "./record";
 
@@ -71,6 +75,16 @@ const REPO = "/tmp/armed-repo";
 /** Only `shipped-orphan` is armed, and it is the only kind these fixtures file. */
 const policy = resolveProposalAutonomyPolicy({ "shipped-orphan": "apply" });
 
+/**
+ * A record that has EARNED `shipped-orphan` (anton-m29g). These fixtures are about the walk's cancel
+ * and publish contracts, so the second gate is cleared here and exercised on its own in
+ * autonomy.test.ts — a `retire`/`close` is the dearest tier, hence the full twenty.
+ */
+const record: ProposalTrackRecord = {
+  ...emptyTrackRecord(),
+  "shipped-orphan": { settled: 20, applied: 20 },
+};
+
 /** A shipped-orphan ask about one subject — the simplest armed move there is. */
 function shippedOrphan(subject: string): GardenerDetection {
   return makeDetection({
@@ -103,6 +117,7 @@ function walk(created: EmittedProposal[], signal: AbortSignal) {
     repo: REPO,
     created,
     policy,
+    record,
     producer: "[gardener]",
     log,
     nudge,
@@ -674,12 +689,32 @@ describe("armed walk · publish", () => {
       repo: REPO,
       created: filed(2),
       policy: resolveProposalAutonomyPolicy({ "shipped-orphan": "propose" }),
+      record,
       producer: "[gardener]",
       log,
       nudge,
       signal: running(),
     });
 
+    expect(nudge).not.toHaveBeenCalled();
+    expect(pushMock).not.toHaveBeenCalled();
+  });
+
+  it("attempts nothing for an ARMED kind whose record has not earned it (anton-m29g)", async () => {
+    // The policy says `apply` and the walk still writes nothing: the earned floor answers before the
+    // policy is consulted, exactly as the manual floor does, so an unearned kind has no walk at all.
+    await applyArmedProposals({
+      repo: REPO,
+      created: filed(2),
+      policy,
+      record: emptyTrackRecord(),
+      producer: "[gardener]",
+      log,
+      nudge,
+      signal: running(),
+    });
+
+    expect(applyMock).not.toHaveBeenCalled();
     expect(nudge).not.toHaveBeenCalled();
     expect(pushMock).not.toHaveBeenCalled();
   });

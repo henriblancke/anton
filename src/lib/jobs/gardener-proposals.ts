@@ -18,6 +18,7 @@
 import type { Bead } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
 import { applyArmedProposals, reportUnsettledProposals } from "../gardener/armed";
+import type { ProposalTrackRecord } from "../gardener/autonomy";
 import { detectBoard } from "../gardener/detect";
 import {
   arbitrateEmission,
@@ -33,6 +34,7 @@ import {
   type ReconcileResult,
 } from "../gardener/emit";
 import { shadowProposals } from "../gardener/shadow";
+import { proposalTrackRecord } from "../gardener/track-record";
 import type { HygieneFinding } from "../hygiene";
 import type { PassScope } from "./pass-preamble";
 
@@ -172,11 +174,13 @@ function shadow(
   scope: PassScope,
   created: EmittedProposal[],
   observedAtMs: number,
+  record: ProposalTrackRecord,
 ): Promise<unknown> {
   return shadowProposals({
     repo: scope.project.repoPath,
     created,
     policy: scope.policy,
+    record,
     observedAtMs,
     nowMs: scope.clock.now(),
     producer: "[gardener]",
@@ -193,11 +197,16 @@ function shadow(
  * Capped by what is left of the PASS's budget, not by a fresh cap: a patrol the runner retried has
  * already spent whatever its earlier attempt applied (pass-budget.ts).
  */
-function armed(scope: PassScope, created: EmittedProposal[]): Promise<unknown> {
+function armed(
+  scope: PassScope,
+  created: EmittedProposal[],
+  record: ProposalTrackRecord,
+): Promise<unknown> {
   return applyArmedProposals({
     repo: scope.project.repoPath,
     created,
     policy: scope.policy,
+    record,
     producer: "[gardener]",
     log: scope.log,
     nudge: () => scope.nudge(scope.project),
@@ -227,6 +236,10 @@ export async function fileGardenerProposals(
   // park every pass without ever filing a proposal.
   ctx.signal.throwIfAborted();
   const board = await loadAllIssues(repo);
+  // What the founder has already decided about each kind (anton-m29g), off the read this pass just
+  // made. It is the second gate arming needs and no setting can lift it, so it is derived here —
+  // where the board is — rather than read again by the walks that consult it.
+  const record = proposalTrackRecord(board);
   const detections = detectBoard({
     board,
     hygiene: { findings: input.findings },
@@ -255,8 +268,8 @@ export async function fileGardenerProposals(
     // into another machine's twin is a closed ask, and shadowing — let alone applying — it would act
     // on a question nobody is being asked.
     const standing = emission.created.filter((p) => !withdrawn.has(p.id));
-    await shadow(scope, standing, input.observedAtMs);
-    await armed(scope, standing);
+    await shadow(scope, standing, input.observedAtMs, record);
+    await armed(scope, standing, record);
   } catch (e) {
     // The proposals a stopped pass DID file are on the board like any other, so they get the same
     // arbitration — a pass that parked on its third create must not leave the first two doubled.

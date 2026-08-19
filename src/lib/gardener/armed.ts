@@ -49,7 +49,11 @@ import { beads, type Bead } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
 import { applyProposal, ProposalApplyError } from "./apply";
 import { messageOf } from "./apply-steps";
-import { autonomyFor, type ProposalAutonomyPolicy } from "./autonomy";
+import {
+  autonomyFor,
+  type ProposalAutonomyPolicy,
+  type ProposalTrackRecord,
+} from "./autonomy";
 import {
   planOf,
   type GardenerDetectionKind,
@@ -137,6 +141,13 @@ export interface ArmedInput {
   /** What the pass just filed — applied in the order it was filed. */
   created: EmittedProposal[];
   policy: ProposalAutonomyPolicy;
+  /**
+   * What this board's settled proposals say about each kind (anton-m29g) — read off the caller's own
+   * snapshot, alongside the policy. It is the second gate arming needs and the one the setting cannot
+   * lift: a kind whose own proposals the founder keeps declining is not applied unattended, however
+   * cleanly it would shadow.
+   */
+  record: ProposalTrackRecord;
   /** The producer's log prefix, e.g. `[gardener]`. */
   producer: string;
   /** Where the record lands. The session log, so the jobs page shows it with no new surface. */
@@ -155,10 +166,11 @@ const nothing = (): ArmedResult => ({ records: [], attempted: 0, deferred: [] })
 function armed(
   created: EmittedProposal[],
   policy: ProposalAutonomyPolicy,
+  record: ProposalTrackRecord,
 ): Array<{ proposal: EmittedProposal; plan: GardenerPlan }> {
   return created.flatMap((proposal) => {
     const plan = planOf(proposal.detection);
-    return autonomyFor(plan.kind, plan, policy) === "apply" ? [{ proposal, plan }] : [];
+    return autonomyFor(plan.kind, plan, policy, record) === "apply" ? [{ proposal, plan }] : [];
   });
 }
 
@@ -172,7 +184,7 @@ function armed(
  * and a pass that refused ten in a row has still spent ten applies' worth of board reads and locks.
  */
 export async function applyArmedProposals(input: ArmedInput): Promise<ArmedResult> {
-  const targets = armed(input.created, input.policy);
+  const targets = armed(input.created, input.policy, input.record);
   // Nothing armed: no walk for a cancel to stop, and no ask this pass leaves standing. The abort
   // still PROPAGATES — here and at every check below, it is never a normal return. The runner reads
   // a handler that resolves as a pass that finished (jobs/runner.ts), and no later pass revisits

@@ -23,7 +23,12 @@ import { driveJob, expectJobStatus, makeJobRunner } from "@/lib/testing/jobs";
 import type { Bead } from "../beads/bd";
 import { LABELS } from "../beads/bd";
 import type { ApplyDecision, ApplyMoment } from "../gardener/apply";
-import { parseGardenerPlan, type GardenerPlan } from "../gardener/detections";
+import { EARNED_AUTONOMY_BARS } from "../gardener/autonomy";
+import {
+  parseGardenerPlan,
+  proposalFingerprint,
+  type GardenerPlan,
+} from "../gardener/detections";
 import * as schema from "../db/schema";
 import { makeTestDb, type TestDb } from "../db/testing";
 import type { ClaudeResult, RunClaudeOptions } from "../claude/driver";
@@ -503,9 +508,31 @@ describe("product-master pass · armed", () => {
       }),
     );
 
+  /**
+   * The settled-proposal record that has EARNED `low-value` (anton-m29g): the founder's own accepted
+   * kills, plainly closed and still carrying their fingerprints. A `retire`/`defer` is the middle
+   * tier, so this is the bar that one clears.
+   *
+   * Every board in this suite carries it, because these cases are about the armed WALK and the
+   * earned floor would otherwise decide all of them before the walk ran — the floor itself is
+   * exercised where it lives (gardener/autonomy.test.ts, gardener/track-record.test.ts) and against
+   * this handler by the one case below that reads a board without it.
+   */
+  const earned = (): Bead[] =>
+    (["low-value", "degraded-approval"] as const).flatMap((kind) =>
+      Array.from({ length: EARNED_AUTONOMY_BARS.dequeued.minSettled }, (_, i) =>
+        bead(`anton-rec-${kind}-${i}`, {
+          status: "closed",
+          labels: [proposalFingerprint(kind, `earned:${i}`)],
+          close_reason: `applied: settled a ${kind} ask`,
+          closed_at: "2026-01-01T00:00:00Z",
+        }),
+      ),
+    );
+
   /** Every read answers with these beads plus whatever the pass has filed about them. */
-  function boardIs(subjects: () => Bead[]): void {
-    const board = () => [...subjects(), ...filed()];
+  function boardIs(subjects: () => Bead[], record: () => Bead[] = earned): void {
+    const board = () => [...record(), ...subjects(), ...filed()];
     listMock.mockImplementation(async () => board());
     showMock.mockImplementation(async (_c, id) => {
       const found = board().find((b) => b.id === id);
@@ -544,6 +571,19 @@ describe("product-master pass · armed", () => {
         "APPLIED: deferred anton-a out of the ready set\n",
     );
     expect(nudge).toHaveBeenCalledWith({ id: projectId, repoPath: REPO });
+  });
+
+  it("applies nothing for an armed kind the board's own record has not earned (anton-m29g)", async () => {
+    // The setting says `apply` and the pass still writes nothing but the ask itself. The product
+    // master's kinds are JUDGMENT — whether a bead is really low-value is not a question a clean
+    // shadow can answer — so the founder's own verdicts are the only evidence there is.
+    boardIs(() => [cold], () => []);
+    writeVerbMock.mockResolvedValue("");
+
+    await expectJobStatus(t.db, await runPass(), "done");
+
+    expect(writes).toEqual(["create Product master: defer anton-a"]);
+    expect(await sessionLog()).not.toContain("APPLY anton-p1");
   });
 
   it("spends ONE write cap across both tiers — the budget is the pass's, not the tier's", async () => {

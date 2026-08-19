@@ -1,6 +1,10 @@
 import { notFound } from "next/navigation";
 
 import { getProjectBySlug, getProjectSettingsBySlug } from "@/lib/projects";
+import { allIssues } from "@/lib/beads/issues";
+import { earnedAutonomyOfKind, emptyTrackRecord } from "@/lib/gardener/autonomy";
+import { GARDENER_DETECTION_KINDS } from "@/lib/gardener/detections";
+import { proposalTrackRecord } from "@/lib/gardener/track-record";
 import { bundledAgentIds, discoverAgents } from "@/lib/agents-discovery";
 import { DEFAULT_SCHEDULES, listSchedules } from "@/lib/schedules";
 import { loadBaseSystemPrompt } from "@/lib/claude/system-prompt";
@@ -42,6 +46,21 @@ export default async function ProjectSettingsPage({
     bundledAgentIds().catch(() => []),
   ]);
 
+  // What this board's own settled proposals say about each kind (anton-m29g) — the second gate
+  // arming needs, and the one no setting lifts. Derived here rather than in the form because the
+  // form is a client module and the verdict is a fact about the board; it arrives as plain counts
+  // and a reason, so a locked control is never an unexplained disabled control. A board anton cannot
+  // read yields an empty record, which locks everything — the safe direction.
+  const record = await allIssues(project.repoPath)
+    .then(proposalTrackRecord)
+    .catch(() => emptyTrackRecord());
+  const earned = Object.fromEntries(
+    GARDENER_DETECTION_KINDS.map((kind) => {
+      const { applied, settled, eligible, reason } = earnedAutonomyOfKind(kind, record);
+      return [kind, { applied, settled, eligible, ...(reason ? { reason } : {}) }];
+    }),
+  );
+
   return (
     <SettingsView
       project={project}
@@ -51,6 +70,7 @@ export default async function ProjectSettingsPage({
       defaultCrons={defaultCrons}
       agents={agents}
       bundledIds={bundledIds}
+      earned={earned}
     />
   );
 }

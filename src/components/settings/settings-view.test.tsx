@@ -35,10 +35,30 @@ const DEFAULT_CRONS = {
   gardener: "0 5 * * *",
 };
 
+type Earned = Parameters<typeof SettingsView>[0]["earned"];
+
+/**
+ * The settled-proposal record the server hands in (anton-m29g). The default is the board every
+ * project starts on — nothing settled, so no kind has earned `apply` — because that is what the
+ * control has to render correctly first.
+ */
+const NO_RECORD: Earned = Object.fromEntries(
+  GARDENER_DETECTION_KINDS.map((kind) => [
+    kind,
+    { applied: 0, settled: 0, eligible: false, reason: "no settled proposals yet — apply unlocks at 10 settled with 80% applied" },
+  ]),
+);
+
+/** A record that has earned `apply` on every kind — for the tests that are about the POLICY. */
+const EARNED: Earned = Object.fromEntries(
+  GARDENER_DETECTION_KINDS.map((kind) => [kind, { applied: 30, settled: 30, eligible: true }]),
+);
+
 function renderView(
   settings: Parameters<typeof SettingsView>[0]["settings"] = {},
   agents: Parameters<typeof SettingsView>[0]["agents"] = [],
   schedules: Parameters<typeof SettingsView>[0]["schedules"] = [],
+  earned: Earned = NO_RECORD,
 ) {
   return render(
     <SettingsView
@@ -49,6 +69,7 @@ function renderView(
       defaultCrons={DEFAULT_CRONS}
       agents={agents}
       bundledIds={[]}
+      earned={earned}
     />,
   );
 }
@@ -864,14 +885,53 @@ describe("SettingsView proposal autonomy (anton-3mqq)", () => {
     expect(choice("container-orphan", "shadow").disabled).toBe(false);
   });
 
-  it("lets apply be picked on every armable kind (anton-hzce)", () => {
-    // The passes can perform the write now (anton-4ab3), so the level is real. The only thing still
-    // off the table is a kind autonomyFor pins at propose whatever the policy says.
-    renderView({});
+  it("lets apply be picked on every armable kind whose record has earned it (anton-hzce)", () => {
+    // The passes can perform the write now (anton-4ab3), so the level is real. What is still off the
+    // table is a kind autonomyFor pins at propose whatever the policy says.
+    renderView({}, [], [], EARNED);
     for (const kind of KINDS.filter((k) => k !== "oversized")) {
       expect(choice(kind, "apply").disabled).toBe(false);
     }
     expect(choice("oversized", "apply").disabled).toBe(true);
+  });
+
+  it("locks apply on a kind whose record has not earned it, WITH the counts and the reason", () => {
+    // The failure this floor exists to stop repeating is evidence printed and not read. A disabled
+    // control an operator cannot account for is exactly that failure, one surface over — so the row
+    // states what it is locked on and what would unlock it.
+    renderView({}, [], [], {
+      ...EARNED,
+      "parentless-cluster": {
+        applied: 3,
+        settled: 12,
+        eligible: false,
+        reason: "3/12 applied (25%) — apply unlocks at 10 settled with 80% applied",
+      },
+    });
+
+    expect(screen.getByText(/apply locked · 3\/12 applied \(25%\)/)).toBeTruthy();
+    expect(screen.getByText(/apply unlocks at 10 settled with 80% applied/)).toBeTruthy();
+    expect(choice("parentless-cluster", "apply").disabled).toBe(true);
+    // Only `apply` goes: `shadow` is how a record becomes readable in the first place and writes
+    // nothing, so gating it would lock the door and pocket the key.
+    expect(choice("parentless-cluster", "shadow").disabled).toBe(false);
+    expect(choice("parentless-cluster", "propose").disabled).toBe(false);
+    // Its neighbours are untouched — the record is per kind.
+    expect(choice("container-orphan", "apply").disabled).toBe(false);
+  });
+
+  it("locks every kind on the board as it stands — nothing has earned apply yet", () => {
+    renderView({});
+    for (const kind of KINDS) expect(choice(kind, "apply").disabled).toBe(true);
+    expect(screen.getAllByText(/no settled proposals yet/).length).toBe(KINDS.length - 1);
+  });
+
+  it("shows the record on a kind that CLEARS the bar, not only on one that does not", () => {
+    // A bar that speaks only when it refuses gives an operator no way to know it was consulted.
+    renderView({}, [], [], EARNED);
+    expect(screen.getAllByText(/record · 30\/30 applied — clears the bar/).length).toBe(
+      KINDS.length - 1,
+    );
   });
 
   it("states what arming apply costs in each group, not once for all of them", () => {
@@ -902,7 +962,7 @@ describe("SettingsView proposal autonomy (anton-3mqq)", () => {
 
   it("arming a kind at apply round-trips through the save", () => {
     const fetchMock = stubFetch();
-    renderView({});
+    renderView({}, [], [], EARNED);
 
     fireEvent.click(choice("stale", "apply"));
     fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
@@ -912,7 +972,7 @@ describe("SettingsView proposal autonomy (anton-3mqq)", () => {
   });
 
   it("survives a reload: a kind armed at apply comes back armed", () => {
-    renderView({ proposalAutonomy: { stale: "apply" } });
+    renderView({ proposalAutonomy: { stale: "apply" } }, [], [], EARNED);
 
     expect(choice("stale", "apply").checked).toBe(true);
     expect(choice("stale", "propose").checked).toBe(false);
@@ -930,9 +990,17 @@ describe("SettingsView proposal autonomy (anton-3mqq)", () => {
   it("floors a stored level the kind can never reach back to propose", () => {
     // A hand-edited blob can name anything. Showing `oversized` as armed when autonomyFor would
     // answer `propose` for it is the one lie this control cannot tell.
-    renderView({ proposalAutonomy: { oversized: "apply", stale: "nonsense" } });
+    renderView({ proposalAutonomy: { oversized: "apply", stale: "nonsense" } }, [], [], EARNED);
     expect(choice("oversized", "propose").checked).toBe(true);
     expect(choice("stale", "propose").checked).toBe(true);
+  });
+
+  it("floors a stored apply the RECORD has not earned back to propose (anton-m29g)", () => {
+    // Same lie, second floor: the pass resolves an unearned `apply` to `propose`, so a control
+    // showing it armed would be describing a write that never happens.
+    renderView({ proposalAutonomy: { stale: "apply" } });
+    expect(choice("stale", "propose").checked).toBe(true);
+    expect(choice("stale", "apply").checked).toBe(false);
   });
 
   it("PATCHes the whole policy on Save (round-trip out)", () => {

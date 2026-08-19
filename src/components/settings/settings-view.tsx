@@ -119,6 +119,27 @@ const AUTONOMY_LEVEL_HINT: Record<ProposalAutonomy, string> = {
   apply: "writes the move to the board unattended · nobody is asked",
 };
 
+/**
+ * One kind's settled-proposal record as the form receives it (anton-m29g) — plain counts and a
+ * reason, computed on the server (gardener/autonomy.ts `earnedAutonomyOfKind`) because this module
+ * never imports server code and the verdict is a fact about the board.
+ *
+ * The counts travel WITH the verdict on purpose. A control that is merely disabled is the failure
+ * this floor exists to stop repeating: the evidence for the nine bad re-parents was printed every
+ * time and read by nobody, so a locked `apply` has to say what it is locked on and what would
+ * unlock it, in the row, at the moment the founder is deciding.
+ */
+interface EarnedKind {
+  applied: number;
+  settled: number;
+  eligible: boolean;
+  /** Why apply is unavailable, with the counts and the bar. Absent exactly when eligible. */
+  reason?: string;
+}
+
+/** A kind with no record at all — what an unreadable board, or a board with no proposals, yields. */
+const NO_RECORD: EarnedKind = { applied: 0, settled: 0, eligible: false };
+
 /** One detection kind as the founder meets it: what its move does, and whether it can be armed. */
 interface AutonomyKindSpec {
   /** A GardenerDetectionKind (src/lib/gardener/detections.ts). */
@@ -243,19 +264,24 @@ const AUTONOMY_KINDS = AUTONOMY_GROUPS.flatMap((g) => g.kinds);
  * resolveProposalAutonomyPolicy produces on the server, so the form and the passes agree on what an
  * absent entry means.
  *
- * Unreadable entries fall back to `propose` rather than rendering, and a kind the floor pins there
- * ({@link AutonomyKindSpec.blocked}) is pinned here too: a hand-edited blob that armed `oversized`
- * must not show as armed when autonomyFor would answer `propose` for it anyway.
+ * Both of autonomyFor's floors are re-applied here, because the one lie this control cannot tell is
+ * showing a level the pass would ignore. An unreadable entry falls back to `propose`; a kind the
+ * manual floor pins there ({@link AutonomyKindSpec.blocked}) is pinned here too; and a stored
+ * `apply` on a kind whose record has not earned it reads back as `propose`, exactly as the pass
+ * resolves it.
  */
 function resolveProposalAutonomy(
   stored: Record<string, string> | undefined,
+  earned: Record<string, EarnedKind>,
 ): Record<string, ProposalAutonomy> {
   return Object.fromEntries(
     AUTONOMY_KINDS.map((kind) => {
       const value = stored?.[kind.id];
       const armable =
         !kind.blocked && (AUTONOMY_LEVELS as readonly string[]).includes(value ?? "");
-      return [kind.id, armable ? (value as ProposalAutonomy) : "propose"];
+      const level = armable ? (value as ProposalAutonomy) : "propose";
+      const locked = level === "apply" && !(earned[kind.id] ?? NO_RECORD).eligible;
+      return [kind.id, locked ? "propose" : level];
     }),
   );
 }
@@ -491,6 +517,7 @@ export function SettingsView({
   defaultCrons,
   agents,
   bundledIds,
+  earned,
 }: {
   project: Project;
   settings: EditableSettings;
@@ -504,6 +531,11 @@ export function SettingsView({
   agents: DiscoveredAgent[];
   /** Ids anton ships as bundled specialists — the only agents the allowlist gates. */
   bundledIds: string[];
+  /**
+   * Each kind's settled-proposal record and whether it has earned `apply` (anton-m29g), keyed by
+   * detection kind. Computed on the server off the board this project actually has.
+   */
+  earned: Record<string, EarnedKind>;
 }) {
   // Which panel is displayed. The URL hash IS the state — not a copy of it — so /settings#automation
   // lands where it says it will, a reload returns to the same place, and a link points at a section
@@ -617,7 +649,7 @@ export function SettingsView({
   // Per-kind proposal autonomy (anton-nbyy), held RESOLVED rather than as the sparse override map
   // the server stores: the control has to render a level for every kind, and "absent" is not one.
   const [proposalAutonomy, setProposalAutonomy] = useState(() =>
-    resolveProposalAutonomy(settings.proposalAutonomy),
+    resolveProposalAutonomy(settings.proposalAutonomy, earned),
   );
   const [saving, setSaving] = useState(false);
 
@@ -635,7 +667,7 @@ export function SettingsView({
    * Against {@link baseline}, not the `settings` prop — the prop is the SSR snapshot and never
    * moves, so a save would leave every indicator here stuck on.
    */
-  const savedAutonomy = resolveProposalAutonomy(baseline.proposalAutonomy);
+  const savedAutonomy = resolveProposalAutonomy(baseline.proposalAutonomy, earned);
   const dirty: Record<string, boolean> = {
     model: model !== (baseline.model ?? ""),
     agents: !sameIds(
@@ -1674,6 +1706,15 @@ export function SettingsView({
                   <span className="text-[11px] text-subtle">{AUTONOMY_LEVEL_HINT[level]}</span>
                 </div>
               ))}
+              {/* The second gate arming needs (anton-m29g), said once at the top rather than only in
+                  the row it locks: a founder who finds `apply` unavailable has to know it is a rule
+                  and not a bug, and what would lift it. */}
+              <span className="text-[11px] text-subtle">
+                <span className="font-mono text-primary">apply</span> also has to be EARNED. A kind
+                is armable only once your own accept/decline verdicts on its proposals support it —
+                a clean shadow week says the move would run, never that it was right. Each row shows
+                where that kind stands.
+              </span>
               {/* Where the writes show up (anton-hzce). An applied proposal closes the moment it is
                   filed, so it never stands on the board as an ask — an operator arming a kind here
                   has to be told, at the moment they arm it, where the evidence will be. */}
@@ -1716,6 +1757,7 @@ export function SettingsView({
                     <AutonomyRow
                       key={kind.id}
                       kind={kind}
+                      earned={earned[kind.id] ?? NO_RECORD}
                       value={proposalAutonomy[kind.id]}
                       onChange={(level) =>
                         setProposalAutonomy((prev) => ({ ...prev, [kind.id]: level }))
@@ -1939,17 +1981,20 @@ function CountField({
 }
 
 /**
- * One detection kind's autonomy row (anton-nbyy): what approving it writes, and how far this project
- * lets a pass go with it. A kind the floor pins at `propose` says so in the row rather than being
- * left out — an operator has to be able to see that anton knows about `oversized` and why it is not
- * on offer, which a silently absent row cannot tell them.
+ * One detection kind's autonomy row (anton-nbyy): what approving it writes, how far this project lets
+ * a pass go with it, and what its own proposals have earned (anton-m29g). A kind either floor pins at
+ * `propose` says so in the row rather than being left out — an operator has to be able to see that
+ * anton knows about `oversized`, or that `parentless-cluster` is locked on 3/12, which a silently
+ * absent row and a bare disabled control both fail to tell them.
  */
 function AutonomyRow({
   kind,
+  earned,
   value,
   onChange,
 }: {
   kind: AutonomyKindSpec;
+  earned: EarnedKind;
   value: ProposalAutonomy;
   onChange: (level: ProposalAutonomy) => void;
 }) {
@@ -1958,12 +2003,20 @@ function AutonomyRow({
       <div className="flex min-w-0 flex-col gap-0.5">
         <span className="font-mono text-[11.5px]">{kind.id}</span>
         <span className="text-[11px] text-subtle">{kind.does}</span>
-        {kind.blocked && (
+        {kind.blocked ? (
           <span className="text-[11px] text-risk-med">not armable · {kind.blocked}</span>
+        ) : earned.eligible ? (
+          // Said out loud on the way UP too: the counts are what an operator is arming ON, and a bar
+          // that only ever speaks when it refuses gives them no way to know it was consulted.
+          <span className="text-[11px] text-subtle">
+            record · {earned.applied}/{earned.settled} applied — clears the bar
+          </span>
+        ) : (
+          <span className="text-[11px] text-risk-med">apply locked · {earned.reason}</span>
         )}
       </div>
       <span className="ml-auto shrink-0">
-        <AutonomyChoice kind={kind} value={value} onChange={onChange} />
+        <AutonomyChoice kind={kind} earned={earned} value={value} onChange={onChange} />
       </span>
     </div>
   );
@@ -1979,21 +2032,28 @@ function AutonomyRow({
  */
 function AutonomyChoice({
   kind,
+  earned,
   value,
   onChange,
 }: {
   kind: AutonomyKindSpec;
+  earned: EarnedKind;
   value: ProposalAutonomy;
   onChange: (level: ProposalAutonomy) => void;
 }) {
-  // Only the kind's own floor takes a level off the table now that the passes can write
-  // (anton-4ab3): `oversized` has no mechanical move, so EVERY level is pinned for it — offering it
-  // `shadow` would be a setting the pass silently ignores.
-  const unavailable = kind.blocked;
+  // TWO floors take a level off the table, and they take different amounts. `oversized` has no
+  // mechanical move at all, so EVERY level is pinned for it — offering it `shadow` would be a
+  // setting the pass silently ignores. A kind whose record has not earned `apply` (anton-m29g) loses
+  // only that one: `shadow` is how the record becomes readable in the first place and writes
+  // nothing, so gating it would lock the door and pocket the key.
+  const pinned = kind.blocked;
+  const unearned = kind.blocked ? undefined : earned.eligible ? undefined : earned.reason;
   return (
     <fieldset className="flex gap-0.5 rounded-[9px] border border-border bg-background/40 p-0.5">
       <legend className="sr-only">{kind.id} autonomy</legend>
-      {AUTONOMY_LEVELS.map((level) => (
+      {AUTONOMY_LEVELS.map((level) => {
+        const unavailable = pinned ?? (level === "apply" ? unearned : undefined);
+        return (
         <label
           key={level}
           title={unavailable ?? AUTONOMY_LEVEL_HINT[level]}
@@ -2013,7 +2073,8 @@ function AutonomyChoice({
             {level}
           </span>
         </label>
-      ))}
+        );
+      })}
     </fieldset>
   );
 }
