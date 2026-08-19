@@ -39,7 +39,7 @@ const AUTOMATIONS: AutomationSpec[] = [
   {
     id: "board-picker",
     label: "board-picker",
-    description: "starts the board's next target · ranks by priority, unblocking value, age",
+    description: "ranks what could run next · records the plan · starts nothing yet",
     group: "Board maintenance",
   },
 ];
@@ -240,10 +240,12 @@ describe("the automation rows", () => {
   });
 
   it("says what the board-picker does and how often it would fire", () => {
-    // The one automation that STARTS work rather than reporting on it, so the row has to say so
-    // before the toggle is reached — an operator arming it is handing anton a standing approval.
+    // The pass decides only — it ranks the board and records the plan, and starts nothing. A row
+    // that promised a start would have an operator flip the switch and watch nothing happen, so the
+    // copy has to name the limit, not just the ambition.
     renderTable();
-    expect(screen.getByText(/starts the board's next target/)).toBeTruthy();
+    expect(screen.getByText(/ranks what could run next/)).toBeTruthy();
+    expect(screen.getByText(/starts nothing yet/)).toBeTruthy();
     expect(cadenceButton("board-picker").textContent).toContain("Every 10 minutes");
   });
 

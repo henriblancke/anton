@@ -163,7 +163,7 @@ export function getRunner(): JobRunner {
   runner.registerHandler("gate-check", makeGateCheckHandler({ db }));
   runner.registerHandler("gardener", makeGardenerHandler({ db }));
   runner.registerHandler("product-master", makeProductMasterHandler({ db }));
-  runner.registerHandler("board-picker", makeBoardPickerHandler());
+  runner.registerHandler("board-picker", makeBoardPickerHandler({ db }));
   s.runner = runner;
   return runner;
 }

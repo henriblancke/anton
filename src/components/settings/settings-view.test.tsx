@@ -566,15 +566,18 @@ describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
   });
 
   it("ships the board-picker row off, at the cadence it would be created at", () => {
-    // Seeded disabled (schedules.ts) because arming it hands anton a standing approval to start
-    // work; the panel is where that choice is made, so the row must be visible while still off.
+    // Seeded disabled (schedules.ts) because nothing an operator did not ask for should start
+    // running; the panel is where that choice is made, so the row must be visible while still off.
     renderView({}, [], stringer());
 
     expect(cadenceButton("board-picker").textContent).toContain("Every 10 minutes");
     expect(screen.getByRole("switch", { name: "board-picker" }).getAttribute("aria-checked")).toBe(
       "false",
     );
-    expect(screen.getByText(/starts the board's next target/)).toBeTruthy();
+    // The pass decides only. The row must promise the ranking and NOT a start, or arming it reads
+    // as autopilot and the operator waits for work that was never going to begin.
+    expect(screen.getByText(/ranks what could run next/)).toBeTruthy();
+    expect(screen.getByText(/starts nothing yet/)).toBeTruthy();
   });
 
   it("reads 'not scheduled' when the automation is off or has no row", () => {

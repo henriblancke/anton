@@ -1,19 +1,31 @@
 /**
- * board-picker job (anton-albm). The scheduled pass that reads the board and starts the next run
- * target on its own — the one automation that WRITES `approved` rather than acting on an approval a
- * human already gave. It is mechanical by design: a board read, the PRIME ranking, and the existing
- * idempotent enqueue path, with no Claude session on the tick (docs/plans/2026-08-18-002-feat-
- * autopilot-design.md — "an LLM cannot be a hash function").
+ * board-picker job (anton-albm). The scheduled pass that reads the board and decides what should run
+ * next — eligibility, then the standing policy, then the PRIME ranking — and records that decision
+ * as one plan per project.
  *
- * STUB. The decision module — eligibility → rank → start — lands in the next ticket; until then the
- * pass resolves without touching the board, and takes no deps because it uses none yet. Registering
- * it now is what makes the automation real to the operator: the schedule row is seeded (disabled, so
- * arming it stays a deliberate act) and a job type with NO handler parks as `not-wired` the moment
- * anyone turns it on. A no-op that completes is the honest shape for "armed, nothing to do yet":
- * listing is a view of the board and never a queue of events, so a slot that does nothing costs
- * nothing and loses nothing.
+ * It DECIDES ONLY. Nothing here writes to the board and nothing starts a run: the `approved` write,
+ * the auto-claim and the enqueue are the arming feature's (R1.5), which reads this plan rather than
+ * re-deriving it. What arming an operator does today buys is the ranking, kept fresh.
+ *
+ * Mechanical by design — a board read, a pure decision, one row. No Claude session on the tick
+ * (docs/plans/2026-08-18-002-feat-autopilot-design.md, D3: "an LLM cannot be a hash function"), which
+ * is what makes a ten-minute cadence cost nothing.
+ *
+ * Split the way gate-check is split from gate-targets: every fact that could change the answer lives
+ * in the pure decision (./picker-decision, over ./picker-targets and beads/rank), and this module
+ * owns only the two I/O ends — the board read and the write of the plan.
+ *
+ * IDEMPOTENT by construction. The plan is one row per project, replaced whole, so two overlapping
+ * passes leave one row saying the same thing rather than a queue of events; and an empty plan is the
+ * signal "decided, nothing to start", not "never ran".
  */
-import type { JobHandler } from "./runner";
+import { loadAllIssues } from "../beads/issues";
+import { saveBoardPickerPlan } from "../board-picker-plan";
+import { getProjectById } from "../projects";
+import { PoisonError } from "./errors";
+import { ADMIT_ALL_POLICY, decideBoardPickerPlan } from "./picker-decision";
+import { systemClock, type AntonDb, type Clock } from "./queue";
+import type { JobContext, JobHandler } from "./runner";
 
 /** What the scheduler enqueues for this type — the shape every scheduled job carries. */
 export interface BoardPickerPayload {
@@ -21,7 +33,38 @@ export interface BoardPickerPayload {
   scheduleId?: string;
 }
 
+export interface BoardPickerDeps {
+  db: AntonDb;
+  clock?: Clock;
+}
+
 /** Build the runner handler. Register it as the "board-picker" handler. */
-export function makeBoardPickerHandler(): JobHandler {
-  return async function boardPicker(): Promise<void> {};
+export function makeBoardPickerHandler(deps: BoardPickerDeps): JobHandler {
+  const db = deps.db;
+  const clock = deps.clock ?? systemClock;
+
+  return async function boardPicker(ctx: JobContext): Promise<void> {
+    const { projectId } = ctx.payload as BoardPickerPayload;
+    const project = await getProjectById(db, projectId);
+    if (!project) throw new PoisonError(`project ${projectId} not found`);
+
+    // Stamped BEFORE the read, so a bead written while `bd` was listing counts as having changed
+    // "since we looked" — the fence must err towards calling a plan stale, never towards missing a
+    // move it did not see.
+    const observedAtMs = clock.now();
+    // Read DIRECTLY rather than through the UI snapshot, and STRICT on the gate listing: a job that
+    // silently got a gate-less board would read every dangling gate edge as an open blocker and
+    // record a plan that excludes half the board as `blocked`. A rejection retries the pass instead.
+    const board = await loadAllIssues(project.repoPath, { strictGates: true });
+
+    const decision = decideBoardPickerPlan({
+      board,
+      policy: ADMIT_ALL_POLICY,
+      runtime: { observedAtMs },
+    });
+
+    // The job id goes on the row: "which pass decided this?" is the first question asked of a plan
+    // an operator disagrees with, and the job carries the logs that answer it.
+    await saveBoardPickerPlan(db, clock, { projectId, jobId: ctx.jobId, ...decision });
+  };
 }

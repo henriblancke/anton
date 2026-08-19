@@ -461,7 +461,7 @@ const AUTOMATIONS: AutomationSpec[] = [
   {
     id: "board-picker",
     label: "board-picker",
-    description: "starts the board's next target · ranks by priority, unblocking value, age",
+    description: "ranks what could run next · records the plan · starts nothing yet",
     group: "Board maintenance",
   },
   {
