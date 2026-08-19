@@ -46,6 +46,11 @@ export interface ScanSignal {
   filePath?: string | null;
   Kind?: string | null;
   kind?: string | null;
+  /** The one-line finding, as stringer phrases it — some collectors put the whole claim in it. */
+  Title?: string | null;
+  title?: string | null;
+  Description?: string | null;
+  description?: string | null;
   Priority?: number | string | null;
   priority?: number | string | null;
   /** Not emitted today; read first if a future stringer adds it, rather than guessing around it. */

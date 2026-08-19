@@ -143,3 +143,54 @@ describe.runIf(stringerAvailable())("scan of a repo holding an untracked binary"
     expect(result.untracked.dropped.every((d) => d.kind && d.severity)).toBe(true);
   });
 });
+
+/**
+ * anton-yvx9, against the real collector: `coupling` reads the source text, so an `import type` —
+ * which the compiler erases — closes a cycle for it exactly as a value import would. The 2026-08-18
+ * scan of this repo reported an 11-module cycle whose only link back was src/lib/types.ts, a pure
+ * type barrel. The unit suite can only prove anton drops what it was HANDED; this pins that stringer
+ * really does report such a cycle, and that anton really does drop that one and keep the real one.
+ */
+describe.runIf(stringerAvailable())("scan of a repo whose cycle is closed by a type import", () => {
+  let repo: string;
+
+  beforeEach(() => {
+    repo = mkdtempSync(join(tmpdir(), "anton-stringer-coupling-"));
+    mkdirSync(join(repo, "src"), { recursive: true });
+    const write = (name: string, lines: string[]) =>
+      writeFileSync(join(repo, "src", name), `${lines.join("\n")}\n`, "utf8");
+    // The phantom: `types` reaches `a` only through a type it re-exports, so nothing links them
+    // back at runtime.
+    write("types.ts", [`import type { A } from "./a";`, `export type { A };`, `export const STAGES = ["backlog"];`]);
+    write("a.ts", [`import { STAGES } from "./types";`, `export type A = number;`, `export const first = () => STAGES[0];`]);
+    // The real one: two value imports, and the cycle survives the compiler.
+    write("x.ts", [`import { y } from "./y";`, `export const x = () => y();`]);
+    write("y.ts", [`import { x } from "./x";`, `export const y = () => x;`]);
+    execFileSync("git", ["init", "-q", "."], { cwd: repo, stdio: "ignore" });
+    execFileSync("git", ["add", "-A"], { cwd: repo, stdio: "ignore" });
+    execFileSync(
+      "git",
+      ["-c", "user.email=test@anton", "-c", "user.name=anton test", "commit", "-qm", "init"],
+      { cwd: repo, stdio: "ignore" },
+    );
+  });
+
+  afterEach(() => {
+    rmSync(repo, { recursive: true, force: true });
+  });
+
+  it("keeps the value-import cycle and drops the one only the compiler can see", async () => {
+    const result = await scan({
+      repoPath: repo,
+      scanFile: join(repo, "out", "scan.json"),
+      delta: false,
+    });
+
+    const cycles = result.signals.filter((s) => s.Kind === "circular-dependency");
+    // Not vacuous: the real cycle IS reported, so the drop is anton's filter rather than a collector
+    // that found nothing in a four-file repo.
+    expect(cycles.map(filePathOf)).toEqual(["src/x"]);
+    expect(result.coupling.dropped.map((d) => d.path)).toEqual(["src/a"]);
+    expect(result.coupling.dropped[0].reason).toContain("type-only");
+  });
+});

@@ -13,6 +13,7 @@ import { promisify } from "node:util";
 import { readFile, writeFile, mkdir, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join, normalize, relative, sep } from "node:path";
 import { annotateSignal, collectorOf, severityOfSignal, type ScanSignal } from "./scan-severity";
+import { filterCouplingSignals, type CouplingFilter } from "./scan-coupling";
 import { PoisonError } from "./jobs/errors";
 
 const execFileAsync = promisify(execFile);
@@ -171,6 +172,11 @@ export interface ScanResult {
   collectorFailures: CollectorFailure[];
   /** What the untracked-file filter removed from `signals` before anyone counted them. */
   untracked: UntrackedFilter;
+  /**
+   * What the type-only filter removed from `signals`, and which fan-outs it re-priced, before anyone
+   * counted them (see {@link filterCouplingSignals}).
+   */
+  coupling: CouplingFilter;
   /** Which baseline this scan measured against, and which one it left (see {@link DeltaState}). */
   deltaState: DeltaState;
   /**
@@ -580,12 +586,12 @@ export function describeUntrackedFilter(filter: UntrackedFilter): string | undef
  *   raw fields and drifting from the trend (see {@link annotateSignal}).
  *
  * It is also the one seam where a signal can still be dropped from BOTH readers at once — see
- * {@link dropUntrackedSignals}.
+ * {@link dropUntrackedSignals} and {@link filterCouplingSignals}.
  */
 async function readAnnotatedSignals(
   scanFile: string,
   repoPath: string,
-): Promise<{ signals: ScanSignal[]; untracked: UntrackedFilter }> {
+): Promise<{ signals: ScanSignal[]; untracked: UntrackedFilter; coupling: CouplingFilter }> {
   let parsed: unknown;
   try {
     const raw = await readFile(scanFile, "utf8");
@@ -615,10 +621,13 @@ async function readAnnotatedSignals(
     );
   }
 
-  const { kept, untracked } = await dropUntrackedSignals(repoPath, signals);
+  const { kept: tracked, untracked } = await dropUntrackedSignals(repoPath, signals);
+  // Coupling last: it reads the source of the modules a signal names, so it should never be paid for
+  // a finding the index already contradicted.
+  const { kept, coupling } = await filterCouplingSignals(repoPath, tracked);
   for (const signal of kept) annotateSignal(signal);
   await writeFile(scanFile, JSON.stringify(withSignals(parsed, kept)), "utf8");
-  return { signals: kept, untracked };
+  return { signals: kept, untracked, coupling };
 }
 
 /**
@@ -683,7 +692,7 @@ export async function scan(opts: {
     throw await rejectWithBaselineRestored(toScanError(err, { timeoutMs }), unwind);
   }
 
-  let read: { signals: ScanSignal[]; untracked: UntrackedFilter };
+  let read: { signals: ScanSignal[]; untracked: UntrackedFilter; coupling: CouplingFilter };
   try {
     read = await readAnnotatedSignals(opts.scanFile, opts.repoPath);
   } catch (err) {
@@ -699,6 +708,7 @@ export async function scan(opts: {
     signals: read.signals,
     collectorFailures: parseCollectorFailures(stderr),
     untracked: read.untracked,
+    coupling: read.coupling,
     deltaState: {
       ...(before ? { before } : {}),
       ...(after ? { after } : {}),
