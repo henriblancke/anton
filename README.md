@@ -11,7 +11,7 @@ anton is a local app that turns ideas — yours, or findings from scanning your 
 - **You decide twice; anton does the rest.** Approve the work, merge the PR — everything between runs on its own.
 - **Nothing runs unapproved.** Every piece of work is a readable contract (Goal, Acceptance, Verify) you sign off before a line is written.
 - **Everything is visible.** A live board, streaming terminals, run history, review scores, a health page — and when something stalls, it surfaces as a decision for you, never a silent hang.
-- **Local and private.** anton runs on your machine and drives your local `claude`, `git`, `gh`, and `bd`. Nothing to sign up for, nothing leaves your machine.
+- **Local and private.** anton runs on your machine and drives your local `claude`, `git`, `gh`, and `bd`. Nothing to sign up for, nothing leaves your machine — unless you opt into a [shared board server](#board-modes--solo-or-team) you host yourself.
 
 ## Get started
 
@@ -44,7 +44,7 @@ shape → approve → run (worktree → claude → verify gates → self-review)
 
 > **Local, not deployed.** anton runs as a Next.js server on your machine and drives your local `claude`, `git`, `gh`, `bd`, and `stringer`. See [`DESIGN.md`](./DESIGN.md) for the full architecture.
 
-**beads is the source of truth for work.** Epics, features, tickets, approval, stage, and the PR link all live in each repo's `.beads/` (queried via `bd`). Beads state syncs between machines via Dolt — `refs/dolt/data` on the git remote, configured by `anton setup` — so a fresh clone hydrates its board with `bd dolt pull`, not from files in the clone. The `.beads/*.jsonl` files are passive local exports for viewers: git-ignored, regenerated, and never the source of truth. anton's own SQLite (`anton.db`) holds only machine-local execution state: projects, runs, jobs, schedules, and sessions — it's disposable and git-ignored.
+**beads is the source of truth for work.** Epics, features, tickets, approval, stage, and the PR link all live in each repo's `.beads/` (queried via `bd`). Beads state syncs between machines via Dolt — `refs/dolt/data` on the git remote, configured by `anton setup` — so a fresh clone hydrates its board with `bd dolt pull`, not from files in the clone. The `.beads/*.jsonl` files are passive local exports for viewers: git-ignored, regenerated, and never the source of truth. That per-machine copy is the default; a team can instead point a project at one shared Dolt server and skip syncing altogether — see [Board modes](#board-modes--solo-or-team). anton's own SQLite (`anton.db`) holds only machine-local execution state: projects, runs, jobs, schedules, and sessions — it's disposable and git-ignored.
 
 ## Features
 
@@ -279,6 +279,38 @@ Environment variables (all optional):
 | `ANTON_STRINGER_BIN` | `stringer` (on `PATH`) | override the `stringer` executable |
 | `ANTON_USAGE_PILL` | on | live Claude usage pill (`GET /api/usage`); set falsy (`0`/`false`/`off`) to disable |
 
+### Board modes — solo or team
+
+Each project's beads board runs one of two ways. **Embedded is the default and needs no configuration.**
+
+| | **Embedded** (default) | **Shared server** |
+|---|---|---|
+| Where the board lives | a Dolt database under `.beads/` on each machine | one `dolt sql-server` you host |
+| How machines agree | `bd dolt push/pull` over `refs/dolt/data` on the git remote | they read and write the same database |
+| Offline | works | needs the server reachable |
+| Sync pill | **Live** / **Not wired to shared remote** / **Sync failing** | **Shared server** |
+| Claims | advisory | advisory (unchanged) |
+
+Embedded is right for one person, or for teammates who can live with push/pull lag: your board is always there, and only propagation waits on the network. **Server mode** is for a small team that wants one board in real time — every machine writes the same database, so a bead created on one is visible on the others immediately and there is nothing to sync. The trade is the obvious one: there's no local copy, so while the server is unreachable that board is unavailable. anton fails loud about it (the sync pill goes `Sync failing`, naming the configured host and port) rather than quietly drifting.
+
+Server mode is **opt-in, per project, and self-hosted** — the server is yours; anton adds no service and no account. To turn it on, put the connection in the project's `.beads/metadata.json` (committed, so **never** a password):
+
+```json
+{
+  "dolt_mode": "server",
+  "dolt_server_host": "dolt.example.dev",
+  "dolt_server_port": 3306,
+  "dolt_server_user": "beads",
+  "dolt_database": "myproject"
+}
+```
+
+The password goes in the environment anton runs in, scoped to that database user — `BEADS_DOLT_PASSWORD_BEADS` for the user above (`BEADS_DOLT_PASSWORD_<USER>`, uppercased, non-alphanumerics folded to `_`), or a bare `BEADS_DOLT_PASSWORD` if every project shares one account. Add `BEADS_DOLT_SERVER_TLS=true` when the server requires TLS. Set no other `BEADS_DOLT_*` variables in a shell you launch anton from: they outrank each project's own config, and a stray `BEADS_DOLT_SERVER_DATABASE` points *every* project at that one database.
+
+Check it with `bd dolt show` (it should report `Mode: server`) and `bd dolt test`. Moving an existing embedded board onto a server isn't automated yet — export it with `bd export`, point the project at the server, `bd import`, and reconcile the counts before deleting the local copy.
+
+Full behaviour, including what each mode does when the network or the server goes down, is in [`DESIGN.md` §3a](./DESIGN.md#3a-board-modes--embedded-vs-shared-server).
+
 ## Troubleshooting
 
 **`anton setup`/`doctor` reports a MISSING required tool.** anton can't run without `git`, `bd`, `claude`, and node ≥ 20. Install the flagged tool, make sure it's on your `PATH`, and re-run `anton doctor` until every required row shows `found`. `gh` and `stringer` are optional — without `gh` you lose PRs and review-fix; without `stringer` you lose the nightly scan.
@@ -294,6 +326,8 @@ Then restart the server. (A node upgrade can break the ABI again — re-run the 
 **The UI boots but nothing executes.** Approved epics run only when the job runner is on. If you started with `ANTON_RUNNER=off`, the UI comes up but the runner and scheduler don't — restart without that variable so runs execute and scheduled jobs fire. Conversely, set `ANTON_RUNNER=off` when you *want* the UI without any background execution (e.g. inspecting state).
 
 **A run never opens a PR, or review-fix does nothing.** These need `gh` authenticated against the repo's remote. Check `gh auth status` and that the project's remote is reachable. review-fix also only acts once a PR exists and a reviewer has requested changes or a check has failed.
+
+**The sync pill says `Sync failing` on a shared-server board.** anton preflights the shared Dolt server and reports the configured host, port, and database in the error. Check that the server is up and reachable from this machine, that `.beads/metadata.json` names the right host/port/user, and that the password variable for that user (`BEADS_DOLT_PASSWORD_<USER>`, or `BEADS_DOLT_PASSWORD`) is set **in the environment anton itself was started from** — a `direnv` approval that never got granted is a common cause. No restart is needed once it's fixed: the next heartbeat picks the server back up. To keep working while the server is down, a machine that still has its old embedded database can set `dolt_mode` back to `"embedded"` — see [Board modes](#board-modes--solo-or-team).
 
 **`anton doctor` shows `anton.db not created`.** Run `anton setup` — it applies the Drizzle migrations that create/update `anton.db`. `anton.db` is disposable machine-local state; deleting it and re-running `anton setup` is a safe reset (your work lives in beads + git, not here).
 

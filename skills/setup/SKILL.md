@@ -1,6 +1,6 @@
 ---
 name: setup
-version: fde37cb616f4
+version: a512900c0630
 description: >-
   Scaffold a project so anton's skills have the `.product/` contract they read. Checks git + bd,
   runs `bd init` if `.beads/` is absent, detects the stack, generates `.product/` from anton's
@@ -87,6 +87,76 @@ Both belong under `.beads/` because git tracks that directory — only the JSONL
 runtime are ignored — so the project's bead shape and pipeline reach every clone and teammate.
 Confirm with `bd formula list` (it should list `anton-bead` and `anton-run`).
 
+### 2c. Board mode — embedded (default) or shared server
+
+Step 2 leaves the board **embedded**: a Dolt database under `.beads/` on this machine, shared with
+teammates by `bd dolt push/pull` over `refs/dolt/data` on the git remote. That is the default, it
+works offline, and **it needs nothing from you here** — skip the rest of this section unless the
+project asks for the alternative.
+
+**Server mode** points the project at one `dolt sql-server` that every machine reads and writes
+directly, so a team sees one board in real time with no push/pull lag. Offer it only when the
+project actually has that problem — teammates blocked on sync lag — because it trades offline
+tolerance for it: there is no local copy, so while the server is unreachable the board is
+unavailable. Both modes are described in DESIGN.md §3a, including the failure behaviour of each.
+
+**Never switch a project to server mode unasked.** It needs infrastructure the team runs (a
+reachable `dolt sql-server`, a database for this project, and a database user for it). Confirm those
+exist before touching config; if they don't, say so and stop — leaving the project embedded is the
+correct outcome, not a half-configured server.
+
+To configure it, in the repo root:
+
+1. **Write the connection in `.beads/metadata.json`** — the only file anton reads the mode from
+   (`src/lib/beads/board-mode.ts`), and per-directory, so it can describe this project no matter
+   which process asks:
+
+   ```json
+   {
+     "dolt_mode": "server",
+     "dolt_server_host": "dolt.example.dev",
+     "dolt_server_port": 3306,
+     "dolt_server_user": "beads",
+     "dolt_database": "<this project's database>"
+   }
+   ```
+
+   `bd dolt set host|port|user|database <value>` writes the same file if you prefer the CLI, but
+   there is no `bd` key for the mode — add `dolt_mode` by hand. Do **not** reach for
+   `bd config set dolt.mode server`: it reports success, writes a nested block into a file of flat
+   dotted keys, is bd's lowest-priority source, and has no effect (anton-4gd2). Keep
+   `dolt_server_port` even if bd warns it is deprecated — without it bd dials port 0 against a
+   remote host. This file is **committed**, so it must never hold a password.
+
+2. **Put the password in the environment, scoped to the database user** —
+   `BEADS_DOLT_PASSWORD_<USER>`, uppercased with non-alphanumeric runs folded to `_` (the user above
+   wants `BEADS_DOLT_PASSWORD_BEADS`). A bare `BEADS_DOLT_PASSWORD` still works as the fallback for
+   every project — the one-shared-account setup — but a per-user variable is what lets each project
+   have its own account. Add `BEADS_DOLT_SERVER_TLS=true` when the server sets
+   `require_secure_transport`.
+
+   Set **nothing else** `BEADS_DOLT_*` in a shell anton runs from. Env is bd's highest-priority
+   config source, so a stray `BEADS_DOLT_SERVER_DATABASE` in an `.envrc` points *every* project's bd
+   at that database. anton strips those identity vars per spawn (`src/lib/beads/bd-env.ts`), but a
+   `bd` you run by hand has no such protection.
+
+3. **Verify before trusting it.** `bd dolt show` must report `Mode: server` against the configured
+   host, and `bd dolt test` must connect. Then prove propagation the way the operator will use it:
+   create a bead here, read it from a second machine pointed at the same server with no sync in
+   between. If the connection fails, fix it now — anton's own preflight will otherwise surface it as
+   a `failing` sync pill naming this host/port on the first heartbeat.
+
+**Moving an existing embedded board onto a server is not automated yet** (anton-yvjd). Until it is,
+migrate deliberately: `bd export` the issues to JSONL, point the project at the server per the steps
+above, `bd import` them, then reconcile — `bd count`/`bd list` totals and a spot-check of
+dependencies and labels — **before** anyone deletes the embedded copy. Keep that copy until the
+board has been verified on the server; it is also the fallback if the server goes away.
+
+One expected wart in server mode: the `refs/dolt/data` remote wiring from `bd init`/`anton init`
+stays in place and is simply inert — anton skips every sync pass for a server-mode board — but a
+`bd dolt push/pull` run by hand executes *on the server*, which has no git credentials, and fails
+with `command denied to user`. That is noise, not data risk (anton-0tul).
+
 ## 3. Detect the stack
 
 Inspect the repo and infer what applies. This drives the PRODUCT `## Stack` line and which agents
@@ -151,6 +221,7 @@ Only add it if the user agrees. Never rewrite their existing agent instructions.
 
 ## 7. Report
 
-List what was **created** vs **skipped** (idempotency), the detected stack and which agents apply,
+List what was **created** vs **skipped** (idempotency), the board mode (**embedded** unless the
+project explicitly moved to a shared server in step 2c), the detected stack and which agents apply,
 and the next steps: run `/shape` to turn an idea into beads, then let anton's runtime execute the
 board. Fail loud on any precondition or `bd init` error — don't report success over a broken state.

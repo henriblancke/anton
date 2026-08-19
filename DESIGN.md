@@ -12,7 +12,9 @@ with multi-project support, an xterm, and durable background jobs.
 ## 1. What it is / isn't
 
 - **Local, not deployed.** Runs as a local Next.js server (like foolery/scotty). No Vercel
-  Workflow, no Cache Components — those solve serverless problems anton doesn't have.
+  Workflow, no Cache Components — those solve serverless problems anton doesn't have. The one
+  outbound exception is opt-in and self-hosted: a project may point its board at a shared Dolt
+  server you run ([§3a](#3a-board-modes--embedded-vs-shared-server)). anton itself still runs here.
 - **beads is the work source of truth.** Epics/tickets live in each project's `.beads/`
   (queried live via `bd --json`). anton's own SQLite (`anton.db`) holds app state: projects,
   runs, jobs, schedules, sessions, PR/worktree links.
@@ -72,7 +74,8 @@ how foolery works: it keeps no work DB — beads is the source of truth, shared 
 (`refs/dolt/data` on the git remote; the `.beads/*.jsonl` files are passive, git-ignored
 local exports); only machine-local config lives outside git.
 
-**Shareable/durable → beads (Dolt DB, synced via `refs/dolt/data`):**
+**Shareable/durable → beads (Dolt DB, synced via `refs/dolt/data` — or, opt-in, held on one shared
+`dolt sql-server`; see [§3a](#3a-board-modes--embedded-vs-shared-server)):**
 - epics/tickets and their Goal/Acceptance/Context/labels/deps
 - **approval** — a label on the epic (`approved`)
 - **stage** — labels (`stage:implementing` / `in-review`) as needed
@@ -103,10 +106,12 @@ configuration**; server mode is opt-in per project via `.beads/metadata.json`.
 
 | | **Embedded** (default) | **Server** |
 |---|---|---|
+| Who it's for | one machine, or teammates who tolerate push/pull lag | a small team wanting one real-time board |
 | Where the DB lives | `.beads/embeddeddolt/<db>/` on each machine | one `dolt sql-server`, shared |
 | How machines agree | `bd dolt pull/push` over `refs/dolt/data` on the git remote | they all write the same database |
 | Offline | works | needs the server reachable |
 | Sync status badge | `synced` / `not-wired` / `failing` | `shared-server` |
+| Claim safety | advisory | advisory — **unchanged** |
 
 Mode is read from `.beads/metadata.json` (`dolt_mode`) by `src/lib/beads/board-mode.ts`.
 Anything unreadable, absent, or unrecognised resolves to **embedded** — the safe direction, since
@@ -160,6 +165,37 @@ warning — without it bd dials port 0 against a remote host.
 On the first pass for a server-mode project anton runs `bd dolt test` once and, if the server is
 unreachable, records a failure naming the configured host/port and the ways out, rather than the
 raw `unreachable at 127.0.0.1:0 … dolt is not installed` that the underlying tools produce.
+
+**Connectivity — what each mode does when things break.** The trade is *offline tolerance* against
+*propagation delay*, and each mode fails in the shape you'd expect from where its data lives:
+
+- **Embedded** keeps a full copy per machine, so nothing about a red network stops you working: the
+  board reads and writes locally, and only *propagation* stalls. Committed-but-unpushed work is
+  counted rather than lost — the pill shows `failing · N unpushed`, and the heartbeat's backstop
+  pass keeps retrying the push until it lands. The cost is lag in the other direction: a teammate's
+  bead is invisible here until a `bd dolt pull` brings it over.
+- **Server** has no local copy, so reachability is not optional — every `bd` call needs the server,
+  and while it is down the board is down. That is the honest trade for zero propagation delay, and
+  it is why the failure is made loud: the preflight above names the configured host/port/database
+  and the fix, and the pill goes `failing` carrying that message. Writes error outright; reads keep
+  serving anton's retained in-memory board (a snapshot is marked stale, never blanked), so the pill
+  — not the board — is what tells you the data has stopped moving. A machine that still has its old
+  `.beads/embeddeddolt` directory can set `dolt_mode` back to `embedded` and keep working from it —
+  the escape hatch the preflight message points at — at the cost of rejoining the push/pull world
+  until the server is back.
+
+Recovery needs no restart in either mode: mode is cached per process, but reachability isn't, so a
+server that comes back is picked up on the next heartbeat.
+
+**Claim safety is unchanged — a claim stays advisory in both modes.** Server mode does not upgrade
+the soft-lock of §2, and nothing in this section should be read as a new guarantee. What it removes
+is *propagation delay*, not the *race*: the read-then-write window in `setAssigneeIfOwner` is
+serialized only within one anton process, so two anton servers — or a teammate's plain `bd` CLI —
+can still interleave read→assign→verify and both report success, exactly as they can on embedded.
+The claim simply becomes visible everywhere the instant it commits, which is why claim verification
+skips its settle window there. Double-*execution* is prevented by the run lease (§4), not by the
+claim; a hard cross-process CAS would need a new bd primitive and is deliberately not built
+(anton-od4, closed won't-fix).
 
 ## 4. Background jobs + durability (the hard part)
 
