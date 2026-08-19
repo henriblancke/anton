@@ -1023,7 +1023,7 @@ async function exhaustedJobStillStuck(
  * one on a molecule step or on anything else anton never dispatches, and `detectOpenHumanGates`
  * reports that wait with no `targetBeadId` precisely because there is no run target above it.
  * Falling back would point the resume at a bead execute-epic cannot run; leaving it undefined lets
- * resolve-and-resume close the gate and stop there (see escalation-actions.ts).
+ * resolve-and-resume close the gate and stop there (see escalation-gate.ts).
  */
 function epicBeadIdFor(finding: RunHealthFinding, ctx: UnstickContext): string | undefined {
   if (finding.kind === "parked-run" && finding.runId) {

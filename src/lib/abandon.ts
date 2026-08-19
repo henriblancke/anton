@@ -191,7 +191,7 @@ const messageOf = (e: unknown): string => (e instanceof Error ? e.message : Stri
  *
  * `requireStopped` is a statement about CURRENT shared state, and the board read it rests on is
  * local: bd answers `list`/`show` from the Dolt working set, which trails the remote by a sync
- * heartbeat. The caller's own pull ({@link readTargetState in escalation-actions}) is several awaits
+ * heartbeat. The caller's own pull ({@link readTargetState in escalation-work}) is several awaits
  * back — a gate close, the escalation settle — so a reparent-plus-run that landed elsewhere inside
  * that window is invisible to the read below. {@link runTargetOf} would then derive the FORMER
  * target, find no lease on it, and let the abandon close the ticket underneath the new target's live
